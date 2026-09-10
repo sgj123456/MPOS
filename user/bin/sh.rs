@@ -77,10 +77,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             continue;
         }
         // The exit code is the child's own business; a shell this small does
-        // not report it.
+        // not report it. A negative code is not a failure here - it is what a
+        // program killed by a signal leaves behind (a Ctrl-C'd child exits
+        // with -SIGINT), and only ECHILD means the wait itself went wrong.
         let code = sys::wait(pid);
-        if code < 0 {
-            let _ = sys::write_all(2, b"sh: wait failed\n");
+        if code == -10 {
         }
     }
 

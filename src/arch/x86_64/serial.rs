@@ -47,36 +47,34 @@ fn uart() -> Uart16550<uart_16550::backend::PioBackend> {
     unsafe { Uart16550::new_port(COM1_BASE_PORT) }.expect("COM1 base port invalid")
 }
 
-/// Which bytes the receiver will interrupt on. Re-asserted on every send
-/// because a write to the FIFO control register is what enables the FIFO, and
-/// enabling it clears whatever trigger level was set before.
+/// The console's line settings: the default eight bits, no parity, one stop
+/// bit, with one change that matters for a person at a keyboard.
+///
+/// The default FIFO trigger level is fourteen characters, which is right for a
+/// stream of bulk output and wrong for input: what someone types waits in the
+/// FIFO until the fourteenth character, or until a receive timeout this
+/// emulated UART does not raise. One hands over every character as it lands.
 fn console_config() -> Config {
     Config {
-        // The default trigger level is fourteen characters, which is right
-        // for a stream of bulk output and wrong for a person at a keyboard:
-        // what they type waits in the FIFO until the fourteenth character, or
-        // until a receive timeout this emulated UART does not raise. One is
-        // the console's answer - every character is handed over the moment it
-        // lands.
         fifo_trigger_level: Some(FifoTriggerLevel::One),
         ..Config::default()
     }
 }
 
 pub fn init() {
+    // The one place `init` is called. Re-running it to re-assert a setting
+    // would also re-write the interrupt enable register from the config, which
+    // knows nothing about the receive interrupt - so every console write would
+    // silently turn the keyboard off again.
     uart()
         .init(console_config())
         .expect("COM1 rejected the console line config");
 }
 
 pub fn write_bytes(bytes: &[u8]) {
-    let mut uart = uart();
-    // A write may have reset the FIFO control register, taking the interrupt
-    // trigger level with it. Setting it back is two port writes, and it is
-    // cheaper than a state machine that remembers whether it is still set.
-    uart.init(console_config())
-        .expect("COM1 rejected the console line config");
-    uart.send_bytes_exact(bytes);
+    // A fresh wrapper over the same port, with no init: the UART's registers
+    // are the state, and they are already set up.
+    uart().send_bytes_exact(bytes);
 }
 
 /// Ask the UART to interrupt on every byte that arrives, and unmask IRQ4.
@@ -102,16 +100,11 @@ pub fn drain_into_tty() {
     let mut lsr: Port<u8> = Port::new(COM1_LSR);
     // A bounded loop: a receiver stuck asserting "data ready" - broken
     // hardware, or a byte stream with no end - must not hang the handler.
-    let mut told = false;
     for _ in 0..MAX_DRAIN {
         // SAFETY: both registers are COM1's, and both reads have a side
         // effect the hardware defines: LSR clears the error flags, DATA takes
         // one byte out of the FIFO.
         let status = unsafe { lsr.read() };
-        if !told {
-            told = true;
-            serial_probe(status);
-        }
         if status & LSR::DATA_READY.bits() == 0 {
             break;
         }
@@ -124,18 +117,3 @@ pub fn drain_into_tty() {
 /// next one. The FIFO holds 16, so this is never reached with working
 /// hardware; it exists so the handler cannot spin forever if it does.
 const MAX_DRAIN: usize = 64;
-
-/// Temporary: report the line status the interrupt handler read.
-pub fn serial_probe(status: u8) {
-    let chars = [b'0' + (status >> 4), b'0' + (status & 0xf)];
-    let hex = |n: u8| if n < 10 { b'0' + n } else { b'a' + n - 10 };
-    let out = [b'[', hex(status >> 4), hex(status & 0xf), b']'];
-    let _ = chars;
-    let mut sink = [0u8; 4];
-    sink.copy_from_slice(&out);
-    let mut data: x86_64::instructions::port::Port<u8> =
-        x86_64::instructions::port::Port::new(0x3f8);
-    for b in sink {
-        unsafe { data.write(b) };
-    }
-}

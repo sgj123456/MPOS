@@ -63,13 +63,6 @@ pub fn set_masked(irq: u8, masked: bool) {
     }
 }
 
-/// The master PIC's current mask, for boot-time checks that an IRQ really is
-/// unmasked. Nothing in the kernel's own paths needs to read it back.
-pub fn irq_mask() -> u8 {
-    let mut port: Port<u8> = Port::new(PIC1_DATA);
-    unsafe { port.read() }
-}
-
 /// Non-specific EOI. Fine for a uniprocessor kernel without priority nesting.
 pub fn end_of_interrupt(irq: u8) {
     unsafe {

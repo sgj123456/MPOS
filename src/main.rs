@@ -524,8 +524,32 @@ fn reset_record() {
 /// would sit ahead of any LOW worker forever and starve it. Going off the ready
 /// queue lets every band make progress.
 fn drain() {
+    // Codes are collected here rather than waited on: a task that has exited
+    // keeps its slot until someone takes the code, and the milestone checks
+    // read theirs with `exit_code` instead of waiting for them.
     while sched::task_count() > sched::permanent_tasks() {
+        discard_codes();
         sched::sleep_ticks(1);
+    }
+}
+
+/// Wait until `id` has left an exit code, by polling rather than sleeping.
+///
+/// A kernel check has no parent link to be woken through - `spawn` starts
+/// tasks without one, and only a process's `wait` is woken by `exit` - so
+/// this naps a tick at a time until the code is there.
+fn wait_for_code(id: sched::TaskId) {
+    while sched::exit_code(id).is_none() {
+        sched::sleep_ticks(1);
+    }
+}
+
+/// Take every exit code nobody is going to ask for, so the slots they hold
+/// can be freed. A kernel check reads codes with `exit_code`, which does not
+/// consume; a process's `wait` takes the one it asked for.
+fn discard_codes() {
+    for slot in 2..sched::MAX_TASKS - 1 {
+        sched::discard_exit_code(sched::TaskId(slot));
     }
 }
 
@@ -1062,12 +1086,15 @@ fn m9() {
     println!("initramfs: /bin/hello is {} bytes of ELF", program.len());
 
     let id = sched::spawn_user(&program, Priority::NORMAL);
-    drain();
+    // Read the code before draining: a check reads with `exit_code`, which
+    // does not consume, and `drain` takes what nobody collected.
+    wait_for_code(id);
     assert_eq!(
         sched::exit_code(id),
         Some(HELLO_EXIT),
         "hello did not end with the exit code it chose"
     );
+    drain();
     assert_eq!(
         sched::task_count(),
         sched::permanent_tasks(),
@@ -1304,12 +1331,16 @@ fn m11() {
     let paused = sched::spawn(|| sched::pause(), Priority::NORMAL);
     sched::sleep_ticks(2);
     assert!(sched::send_signal(paused, SIGTERM));
-    drain();
+    // Polled, not blocked on: `exit` wakes the exiting task's *parent*, and
+    // these were started by the boot task through `spawn`, which leaves no
+    // parent link. Nothing would ever wake a sleeper here.
+    wait_for_code(paused);
     assert_eq!(
         sched::exit_code(paused),
         Some(-(SIGTERM as isize)),
         "SIGTERM did not end the paused task"
     );
+    drain();
 
     // One blocked on a pipe read that will never be satisfied.
     let mut fds = [0i32; 2];
@@ -1328,12 +1359,13 @@ fn m11() {
     );
     sched::sleep_ticks(2);
     assert!(sched::send_signal(blocked, SIGKILL));
-    drain();
+    wait_for_code(blocked);
     assert_eq!(
         sched::exit_code(blocked),
         Some(-(SIGKILL as isize)),
         "SIGKILL did not end the blocked reader"
     );
+    drain();
     // The victim's read fd stays in the global table; close the other end so
     // the pipe's counts stay consistent with reality.
     vfs::close(wfd).unwrap();
@@ -1346,8 +1378,9 @@ fn m11() {
         },
         Priority::NORMAL,
     );
-    drain();
+    wait_for_code(selfsent);
     assert_eq!(sched::exit_code(selfsent), Some(-(SIGTERM as isize)));
+    drain();
 
     // kill(pid, 0) is the existence probe; unknown pids answer ESRCH.
     assert_eq!(
@@ -1410,7 +1443,7 @@ fn m12() {
 
     // The wait the shell itself performs for its children, exercised here on
     // the shell: block until it exits, then read the code it left.
-    sched::block_until(|| sched::exit_code(sh).is_some());
+    wait_for_code(sh);
     let code = sched::exit_code(sh).expect("the shell exited");
     assert_eq!(code, 0, "the shell did not end cleanly: {code}");
     discard();
@@ -1429,10 +1462,8 @@ fn m12() {
 /// nobody ever takes is a record that lies to the next process to hold that
 /// pid - a `wait` would find a death that happened to somebody else.
 fn discard() {
+    discard_codes();
     drain();
-    for slot in 2..sched::MAX_TASKS - 1 {
-        sched::discard_exit_code(sched::TaskId(slot));
-    }
 }
 
 /// M13: a real system start. The checks above are the kernel proving itself;

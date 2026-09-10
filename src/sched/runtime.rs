@@ -358,9 +358,17 @@ impl Table {
         TaskId(slot)
     }
 
-    /// Free every task that has exited. Runs on the scheduler's stack, which is
-    /// the only place it is safe to do: the task that exited is not running any
-    /// more, but its stack is where it was.
+    /// Free every task that has exited and been collected.
+    ///
+    /// Runs on the scheduler's stack, which is the only place it is safe to
+    /// do: the task that exited is not running any more, but its stack is
+    /// where it was.
+    ///
+    /// A task whose exit code is still waiting to be taken keeps its slot - it
+    /// is the zombie a `wait` has not reached yet. Freeing it early would hand
+    /// the pid to a new task, and the parent asking for that pid would be told
+    /// about the wrong death. `discard_exit_code` is how a code nobody will
+    /// ever want is cleared, which lets the slot go.
     fn reap(&mut self) {
         for (slot, entry) in self.tasks.iter_mut().enumerate() {
             let Some(task) = entry else { continue };
@@ -372,6 +380,9 @@ impl Table {
                 self.current,
                 "reaping the task that is running"
             );
+            if exit_code_pending(TaskId(slot)) {
+                continue;
+            }
 
             // The address space first: if its CR3 is the one loaded, dropping
             // it switches back to the kernel's own before any page table is
@@ -576,6 +587,13 @@ pub fn try_spawn_user(
         if t.tasks.get(parent.0).and_then(Option::as_ref).is_some() {
             t.sched.wake(parent);
         }
+        // The console's interrupt belongs to the program now, not to the shell
+        // that started it: a shell which has spawned a command is waiting, and
+        // a Ctrl-C while it waits is aimed at the command.
+        let tty = crate::vfs::tty::global();
+        if tty.is_foreground(parent) {
+            tty.set_foreground(Some(id));
+        }
         Ok(id)
     })
 }
@@ -724,15 +742,37 @@ pub fn sleep_ticks(ticks: u64) {
 /// the condition already true and does nothing, or it finds this task in the
 /// sleep queue and wakes it. There is no third state to fall into.
 ///
-/// Use [`block_until_on`] when the condition is the task table itself.
-pub fn block_until(cond: impl Fn() -> bool) {
-    block_until_on(|_| cond())
+/// Block until `id` has an exit code to collect.
+///
+/// A named wait rather than a `block_until` closure because the condition is
+/// the retired-code list, and the second look below happens while `schedule`
+/// holds the task table: a closure calling `exit_code` would take its own
+/// critical section inside that one, and releasing the inner one would turn
+/// interrupts back on before the outer section is done.
+pub fn block_until_code(id: TaskId) {
+    loop {
+        if let Some(sig) = take_pending_signal() {
+            exit(-(sig as isize));
+        }
+        if exit_code(id).is_some() {
+            return;
+        }
+        schedule(|t| {
+            if exit_code(id).is_some() {
+                t.requeue_current();
+            } else {
+                let me = t.current;
+                let priority = t.task(me).priority;
+                t.sched.sleep(me, priority, u64::MAX);
+            }
+        });
+    }
 }
 
-/// Block until `parent` has a live child - the wait init's shell takes to
-/// arrive, asked of the table rather than of a count of tasks.
-pub fn block_until_child(parent: TaskId) {
-    block_until_on(|t| child_alive(t, parent))
+/// The condition runs with interrupts off and must be short. It reads shared
+/// state through its own borrow, which is the ordinary case.
+pub fn block_until(cond: impl Fn() -> bool) {
+    block_until_on(|_| cond())
 }
 
 /// [`block_until`] for a condition that reads the task table.
@@ -844,6 +884,12 @@ pub fn exit(code: isize) -> ! {
         let parent = t.task(id).parent;
         if let Some(parent) = parent {
             t.sched.wake(parent);
+            // The console goes back to the parent as the child leaves it: a
+            // shell waits, gets its prompt back, and reads again.
+            let tty = crate::vfs::tty::global();
+            if tty.foreground() == Some(id) {
+                tty.set_foreground(Some(parent));
+            }
         }
 
         // Its children outlive it, and a dead task cannot be anyone's parent -
@@ -913,7 +959,10 @@ pub fn wait_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
     // The condition is the table itself, so it is asked through the borrow
     // `block_until_on` already holds rather than taking one of its own.
     block_until_on(|t| any_child_code(t, parent).is_some());
-    with_table(|t| any_child_code(t, parent))
+    // Taken, not looked up again: a second lookup by pid would race the slot
+    // being handed to a new task, and the record would go to it instead.
+    let id = with_table(|t| any_child_code(t, parent))?.0;
+    take_exit_code(id).map(|code| (id, code))
 }
 
 /// The pid and code of the oldest of `parent`'s children to have exited and
@@ -961,6 +1010,17 @@ fn record_retired(id: TaskId, code: isize) {
         }
         retired.push((id, code));
     });
+}
+
+/// Whether a code is still waiting to be collected for `id`.
+fn exit_code_pending(id: TaskId) -> bool {
+    critical_section::with(|cs| {
+        RETIRED
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .any(|(retired, _)| *retired == id)
+    })
 }
 
 /// Forget every retired code recorded for `id`.
@@ -1012,20 +1072,6 @@ pub fn current_fds() -> Arc<FdTable> {
 /// is what this settles back to once everything a test started has been reaped.
 pub fn task_count() -> usize {
     with_table(|t| t.tasks.iter().filter(|slot| slot.is_some()).count())
-}
-
-/// Whether `id` names a live, un-exited task.
-///
-/// The question a starter asks about what it started: a task that exists and
-/// has not exited is one that is running or waiting to run, so whoever spawned
-/// it can stop holding its breath.
-pub fn is_alive(id: TaskId) -> bool {
-    with_table(|t| {
-        t.tasks
-            .get(id.0)
-            .and_then(Option::as_ref)
-            .is_some_and(|task| !task.exited)
-    })
 }
 
 /// Whether any child of `parent` is alive right now - what init's first shell

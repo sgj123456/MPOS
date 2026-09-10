@@ -198,11 +198,15 @@ impl Tty {
         drop((echo, action, waiters, foreground));
     }
 
-    /// Remember that `id` is the one waiting for input, so an interrupt has
-    /// somewhere to go. Cleared when that reader leaves: a process that is not
-    /// reading should not be interrupted for something a keyboard did.
+    /// Remember who an interrupt belongs to.
+    ///
+    /// Set while a task is reading, and moved to a child the moment its parent
+    /// spawns it: the shell is only the foreground between commands. Once it
+    /// has started a program and is waiting for it, a Ctrl-C is meant for the
+    /// program - that is the whole convention, and a `wait`ing shell that took
+    /// the interrupt itself would die where a real one prints a new prompt.
     #[cfg(target_os = "none")]
-    fn set_foreground(&self, id: Option<TaskId>) {
+    pub fn set_foreground(&self, id: Option<TaskId>) {
         critical_section::with(|cs| {
             *self.foreground.borrow(cs).borrow_mut() = id;
         });
@@ -211,6 +215,11 @@ impl Tty {
     /// Whether `id` is the task an interrupt from this tty would reach.
     pub fn is_foreground(&self, id: TaskId) -> bool {
         critical_section::with(|cs| *self.foreground.borrow(cs).borrow() == Some(id))
+    }
+
+    /// The task an interrupt would reach, if any.
+    pub fn foreground(&self) -> Option<TaskId> {
+        critical_section::with(|cs| *self.foreground.borrow(cs).borrow())
     }
 
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
@@ -234,9 +243,6 @@ impl Tty {
         critical_section::with(|cs| {
             self.waiters.borrow(cs).borrow_mut().retain(|&w| w != id);
         });
-        if self.is_foreground(id) {
-            self.set_foreground(None);
-        }
         got
     }
 

@@ -288,7 +288,7 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // another task's child, a pid that never existed - either left a
             // record behind or gets ECHILD.
             if crate::sched::is_child(id, me) {
-                crate::sched::block_until(|| crate::sched::exit_code(id).is_some());
+                crate::sched::block_until_code(id);
             }
             match crate::sched::take_exit_code(id) {
                 Some(code) => code,
