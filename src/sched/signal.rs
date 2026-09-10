@@ -40,7 +40,7 @@ pub fn take(set: &mut Pending) -> Option<u8> {
     Some(sig)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
 

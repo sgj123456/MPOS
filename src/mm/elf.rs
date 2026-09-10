@@ -144,7 +144,7 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::{MapFlags, parse};
     use alloc::vec::Vec;

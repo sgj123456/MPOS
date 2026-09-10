@@ -380,7 +380,7 @@ impl Pmm {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
     use crate::boot::{MAX_MEM_REGIONS, MemKind};

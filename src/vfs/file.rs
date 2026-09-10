@@ -247,7 +247,7 @@ pub fn dup2(old: RawFd, new: RawFd) -> VfsResult<RawFd> {
     current_table().dup2(old, new)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use alloc::sync::Arc;
 

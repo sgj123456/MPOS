@@ -165,7 +165,7 @@ fn image_phys(info: &BootInfo, virt: usize) -> usize {
     virt - info.kernel_virt_base + info.kernel_phys_base
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
     use crate::boot::{MAX_MEM_REGIONS, MemKind, MemRegion};

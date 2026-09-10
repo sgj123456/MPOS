@@ -161,7 +161,7 @@ fn split_last(path: &str) -> (&str, &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use alloc::{format, vec, vec::Vec};
 

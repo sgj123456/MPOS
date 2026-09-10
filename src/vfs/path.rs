@@ -45,7 +45,7 @@ pub fn components(path: &str) -> VfsResult<Components<'_>> {
     Ok(Components { rest: path })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use alloc::vec;
     use alloc::vec::Vec;

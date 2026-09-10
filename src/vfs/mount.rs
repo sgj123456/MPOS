@@ -195,7 +195,7 @@ pub fn resolve_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>
     STATIC.resolve_from(path, start)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use alloc::sync::Arc;
 
@@ -283,7 +283,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod cwd_tests {
     use alloc::sync::Arc;
 

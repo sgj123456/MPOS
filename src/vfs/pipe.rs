@@ -284,7 +284,7 @@ impl Inode for PipeEnd {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use alloc::vec;
 

@@ -447,7 +447,7 @@ fn expanded<'v>(line: &[u8], at: usize, lookup: Lookup<'v>) -> (&'v [u8], usize)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests;
 
 /// Append `bytes` to the word being rebuilt in `budget`.

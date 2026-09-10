@@ -1090,7 +1090,7 @@ impl Inode for Ext2Ino {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
     use alloc::string::String;
