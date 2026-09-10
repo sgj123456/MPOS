@@ -20,6 +20,7 @@ pub const LISTDIR: u64 = 12;
 pub const DUP2: u64 = 13;
 pub const CREATE: u64 = 14;
 pub const UNLINK: u64 = 15;
+pub const CHDIR: u64 = 16;
 
 /// The node kinds a LISTDIR buffer carries. One byte per entry, ahead of its
 /// NUL-terminated name. Kernel and `ls` read the same table, so the mapping

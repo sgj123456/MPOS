@@ -27,8 +27,8 @@ pub mod ramfs;
 pub mod tar;
 pub mod tty;
 
-pub use file::{File, RawFd, close, dup2, open, read, write};
-pub use mount::{global, mount, mount_root, resolve};
+pub use file::{File, RawFd, close, dup2, open, open_opt, read, write};
+pub use mount::{global, mount, mount_root, resolve, resolve_at};
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -169,4 +169,99 @@ pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
         }
         bytes.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// Split `path` into its parent directory and the name at the end - the two
+/// halves of every make-or-remove, since the name edge lives in the parent.
+/// `/f` is the root and `f`; a path with no slash has no parent here to name,
+/// and `.` and `..` are directories that already exist, not names to make.
+fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    let Some(slash) = trimmed.rfind('/') else {
+        return Err(VfsError::Invalid);
+    };
+    let name = &trimmed[slash + 1..];
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(VfsError::Invalid);
+    }
+    let parent = if slash == 0 { "/" } else { &trimmed[..slash] };
+    Ok((parent, name))
+}
+
+/// [`split_parent`](fn.split_parent.html) for a caller that carries a cwd:
+/// a bare relative name - no slash at all - has the cwd itself as its
+/// parent, which is exactly what `./name` spells. Only a caller with a cwd
+/// can say that; the kernel's own callers keep the strict split.
+fn split_parent_with_cwd(path: &str, has_cwd: bool) -> VfsResult<(&str, &str)> {
+    if !path.contains('/') {
+        // A bare name next to a cwd: "." from the cwd is the cwd.
+        return if has_cwd {
+            Ok((".", path))
+        } else {
+            Err(VfsError::Invalid)
+        };
+    }
+    split_parent(path)
+}
+
+/// Make an empty file at `path` and hand back the inode. `Exists` when the
+/// name is taken.
+pub fn create_file(path: &str) -> VfsResult<Arc<dyn Inode>> {
+    let (parent, name) = split_parent(path)?;
+    resolve(parent)?.create(name, NodeKind::File)
+}
+
+/// Remove the name `path`. `NoEntry` when nothing answers to it.
+pub fn unlink_path(path: &str) -> VfsResult<()> {
+    let (parent, name) = split_parent(path)?;
+    resolve(parent)?.unlink(name)
+}
+
+/// The same walks with a caller-supplied start for relative paths. `None`
+/// is the root, which is what every kernel caller means; a process passes
+/// its cwd, and absolute paths ignore it, as `/` must.
+pub fn resolve_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Arc<dyn Inode>> {
+    match start {
+        Some(dir) => resolve_at(path, dir),
+        None => resolve(path),
+    }
+}
+
+/// [`read_dir`](fn.read_dir.html) with a caller-supplied start.
+pub fn read_dir_opt(
+    path: &str,
+    start: Option<Arc<dyn Inode>>,
+) -> VfsResult<Vec<(String, NodeKind)>> {
+    resolve_opt(path, start)?.read_dir()
+}
+
+/// [`read_file`](fn.read_file.html) with a caller-supplied start.
+pub fn read_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Vec<u8>> {
+    let inode = resolve_opt(path, start)?;
+    if inode.metadata().kind != NodeKind::File {
+        return Err(VfsError::IsDir);
+    }
+    let file = File::new(inode);
+    let size = file.metadata().size as usize;
+    let mut bytes = Vec::with_capacity(size);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// [`create_file`](fn.create_file.html) with a caller-supplied start.
+pub fn create_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Arc<dyn Inode>> {
+    let (parent, name) = split_parent_with_cwd(path, start.is_some())?;
+    resolve_opt(parent, start)?.create(name, NodeKind::File)
+}
+
+/// [`unlink_path`](fn.unlink_path.html) with a caller-supplied start.
+pub fn unlink_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
+    let (parent, name) = split_parent_with_cwd(path, start.is_some())?;
+    resolve_opt(parent, start)?.unlink(name)
 }

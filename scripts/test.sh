@@ -29,7 +29,7 @@ esac
 
 MARKERS=("$@")
 if [[ ${#MARKERS[@]} -eq 0 ]]; then
-    MARKERS=("M0_OK" "M1_OK" "M2_OK" "M3_OK" "M4_OK" "M6_OK" "M7_OK" "M8_OK" "M9_OK" "M10_OK" "M11_OK" "M12_OK" "M13_OK")
+    MARKERS=("M0_OK" "M1_OK" "M2_OK" "M3_OK" "M4_OK" "M6_OK" "M7_OK" "M8_OK" "M9_OK" "M10_OK" "M11_OK" "M12_OK" "M13_OK" "M13_PIPE" "M13_REDIR" "M13_shell" "M14_1")
 fi
 
 mkdir -p build

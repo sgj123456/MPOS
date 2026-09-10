@@ -25,6 +25,7 @@ pub mod boot;
 pub mod console;
 pub mod mm;
 pub mod sched;
+pub mod shell;
 pub mod syscall;
 pub mod vfs;
 

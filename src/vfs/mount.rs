@@ -10,6 +10,7 @@
 //! The table is a plain instance, not a global, so tests can build isolated
 //! trees; the kernel's own table lives in [`STATIC`] behind the free functions.
 
+use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -47,6 +48,13 @@ impl Vfs {
             assert!(root.is_none(), "the root filesystem is already mounted");
             *root = Some(fs.root());
         });
+    }
+
+    /// The root inode, for the one caller that needs to start a walk from
+    /// "the beginning" without a path: a task whose cwd was never set.
+    pub fn root_inode(&self) -> Arc<dyn Inode> {
+        critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+            .expect("no root filesystem is mounted")
     }
 
     /// Mount `fs` at the directory named by `path`.
@@ -92,10 +100,38 @@ impl Vfs {
     pub fn resolve(&self, path: &str) -> VfsResult<Arc<dyn Inode>> {
         let start = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
             .ok_or(VfsError::NoRoot)?;
-        // The logical chain from `/` to the current node. Length 1 means "at
-        // the root", where `..` stays put as POSIX says it must.
+        self.resolve_from(path, start)
+    }
+
+    /// Walk `path` from `start` instead of the root - which is what a
+    /// relative path means, and why a process carrying a cwd needs this
+    /// rather than [`resolve`](Self::resolve).
+    ///
+    /// An absolute path ignores `start` entirely: `/` means the root, not
+    /// "wherever this happens to be". The mount crossing is the same walk as
+    /// ever, one node deeper in the tree.
+    pub fn resolve_from(&self, path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
+        let absolute = path.starts_with('/');
+        let start = if absolute {
+            critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+                .ok_or(VfsError::NoRoot)?
+        } else {
+            start
+        };
+        // The logical chain from the starting node. Length 1 means "at the
+        // start", where `..` stays put as POSIX says it must.
         let mut stack: Vec<Arc<dyn Inode>> = alloc::vec![start];
 
+        // A relative path is walked as the absolute path it names from where
+        // it starts, so the one `components` - which splits absolute paths -
+        // covers both. The joined form is owned, and lives for the walk.
+        let joined;
+        let path = if absolute {
+            path
+        } else {
+            joined = format!("/{path}");
+            joined.as_str()
+        };
         for comp in path::components(path)? {
             match comp {
                 "." => {}
@@ -151,6 +187,12 @@ pub fn mount(path: &str, fs: &dyn FileSystem) -> VfsResult<()> {
 /// Resolve `path` in the kernel's tree.
 pub fn resolve(path: &str) -> VfsResult<Arc<dyn Inode>> {
     STATIC.resolve(path)
+}
+
+/// Resolve `path` starting from `start` - a process's cwd. An absolute path
+/// ignores the start and begins at the root, as `/` must.
+pub fn resolve_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
+    STATIC.resolve_from(path, start)
 }
 
 #[cfg(test)]
@@ -238,5 +280,43 @@ mod tests {
         let vfs = Vfs::new();
         assert_eq!(vfs.resolve("/").err(), Some(VfsError::NoRoot));
         assert_eq!(vfs.mount("/", &*RamFs::new()).err(), Some(VfsError::NoRoot));
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use alloc::sync::Arc;
+
+    use super::Vfs;
+    use crate::vfs::NodeKind;
+    use crate::vfs::ramfs::RamFs;
+
+    #[test]
+    fn a_relative_path_starts_at_the_given_node() {
+        let vfs = Arc::new(Vfs::new());
+        vfs.mount_root(&*RamFs::new());
+        vfs.resolve("/")
+            .unwrap()
+            .create("bin", NodeKind::Dir)
+            .unwrap();
+        vfs.resolve("/bin")
+            .unwrap()
+            .create("cat", NodeKind::File)
+            .unwrap();
+        vfs.resolve("/")
+            .unwrap()
+            .create("etc", NodeKind::Dir)
+            .unwrap();
+
+        let bin = vfs.resolve("/bin").unwrap();
+        // "." from /bin is /bin.
+        let here = vfs.resolve_from(".", bin.clone()).unwrap();
+        assert!(Arc::ptr_eq(&here, &bin));
+
+        // A file relative to /bin resolves; one relative to the root does not
+        // exist there.
+        let cat = vfs.resolve_from("cat", bin.clone()).unwrap();
+        assert_eq!(cat.metadata().kind, NodeKind::File);
+        assert!(vfs.resolve_from("etc", bin).is_err(), "etc is not in /bin");
     }
 }

@@ -1398,8 +1398,13 @@ fn m11() {
 }
 
 /// The script the gate types at the shell, one byte at a time, as if typed.
-/// The last line's output is the milestone marker; the Ctrl-D after it ends
-/// the shell the way end of input ends any shell.
+///
+/// The marker lines are written so the *output* is greppable while the typed
+/// echo is not: single quotes come off in the parse, so the echo of
+/// `echo M13_'PIPE'` holds no `M13_PIPE`, and only a pipeline that really
+/// carried the bytes can print one. The same trick covers redirection,
+/// variables, and `$?` - each marker is a result, not a symptom of a command
+/// having been attempted.
 const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo hello from the shell\n",
     b"cat /etc/motd\n",
@@ -1408,6 +1413,13 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"true\n",
     b"false\n",
     b"echo M12_OK\n",
+    b"echo M13_'PIPE' | cat\n",
+    b"echo M13_'REDIR' > /tmp/gate.txt\n",
+    b"cat /tmp/gate.txt\n",
+    b"GATE=shell\n",
+    b"echo M13_$GATE\n",
+    b"false\n",
+    b"echo M14_$?\n",
     b"\x04",
 ];
 
@@ -1422,7 +1434,7 @@ const SHELL_SCRIPT: &[&[u8]] = &[
 fn m12() {
     let shell = vfs::read_file("/bin/sh").expect("the initramfs carries /bin/sh");
     let argv = alloc::vec![String::from("sh")];
-    let sh = sched::try_spawn_user(&shell, Priority::NORMAL, sched::current(), &argv)
+    let sh = sched::try_spawn_user(&shell, Priority::NORMAL, sched::current(), &argv, &[])
         .expect("the shell image loaded");
 
     sched::spawn(

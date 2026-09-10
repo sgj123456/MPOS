@@ -98,6 +98,36 @@ fn sys4(number: u64, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
     ret
 }
 
+/// Six arguments, the kernel's whole allowance: number in `rax`, then
+/// `rdi, rsi, rdx, r10, r8, r9`. The last two registers are why the block
+/// above stops at four - a call with five or six needs `r8` and `r9`, which
+/// nothing smaller does.
+#[allow(clippy::too_many_arguments)]
+fn sys6(
+    number: u64,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") number as isize => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
+            in("r9") a6,
+        );
+    }
+    ret
+}
+
 /// The process arguments, read out of the block the kernel laid on the stack.
 pub struct Args {
     pub argc: usize,
@@ -190,7 +220,24 @@ pub fn getpid() -> isize {
 /// The arguments cross as one NUL-separated blob in a fixed buffer; the
 /// kernel's cap is 512 bytes of blob and 16 strings.
 pub fn spawn(path: &[u8], args: &[&[u8]]) -> isize {
+    spawn_with(path, args, &[])
+}
+
+/// [`spawn`] with the child's descriptors laid out by the caller.
+///
+/// Each pair is (an fd of ours, the number it should have in the child), so
+/// `(pipe_read, 0)` gives the child its input from a pipe and `(file, 1)`
+/// sends its output to a file. The child is born with the standard three and
+/// then these, and with nothing else of ours - which is what makes a
+/// pipeline's end-of-file arrive.
+///
+/// At most `REDIRECT_MAX` pairs; more is EINVAL.
+pub fn spawn_with(path: &[u8], args: &[&[u8]], redirects: &[(i32, i32)]) -> isize {
     const BLOB_MAX: usize = 512;
+    const REDIRECT_MAX: usize = 8;
+    if redirects.len() > REDIRECT_MAX {
+        return -22; // EINVAL
+    }
     let mut blob = [0u8; BLOB_MAX];
     let mut n = 0usize;
     for arg in args {
@@ -202,19 +249,47 @@ pub fn spawn(path: &[u8], args: &[&[u8]]) -> isize {
         blob[n] = 0;
         n += 1;
     }
-    sys4(
+    // Laid out as the kernel reads it: two i32 per pair, (from, to) each.
+    let mut pairs = [0i32; REDIRECT_MAX * 2];
+    for (at, &(from, to)) in redirects.iter().enumerate() {
+        pairs[at * 2] = from;
+        pairs[at * 2 + 1] = to;
+    }
+    sys6(
         nr::SPAWN,
         path.as_ptr() as usize,
         path.len(),
         blob.as_ptr() as usize,
         n,
+        pairs.as_ptr() as usize,
+        redirects.len(),
     )
+}
+
+/// Open a pipe: `fds[0]` reads, `fds[1]` writes. Returns 0, or a negative
+/// errno. Both ends must be closed - the reader sees end of input only when
+/// every writer is gone.
+pub fn pipe(fds: &mut [i32; 2]) -> isize {
+    sys1(nr::PIPE, fds.as_mut_ptr() as usize)
 }
 
 /// Block until the child `pid` exits, and take its exit code. Negative on
 /// error - ECHILD for a pid that is not a child of ours.
 pub fn wait(pid: isize) -> isize {
-    sys1(nr::WAIT, pid as usize)
+    wait_flags(pid as usize, 0)
+}
+
+/// [`wait`](fn.wait.html) with flags. Bit 0 is WNOHANG: a child still running
+/// answers EAGAIN instead of blocking, which is how a shell collects
+/// background jobs without stopping for any of them.
+pub fn wait_flags(pid: usize, flags: usize) -> isize {
+    sys2(nr::WAIT, pid, flags)
+}
+
+/// Move this process to the directory `path` names. Relative paths start
+/// where the process already is; children inherit wherever this lands.
+pub fn chdir(path: &[u8]) -> isize {
+    sys2(nr::CHDIR, path.as_ptr() as usize, path.len())
 }
 
 /// List a directory into `buf`: per entry one kind byte (nr::kind), the name,

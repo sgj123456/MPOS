@@ -26,6 +26,9 @@ pub mod err {
     pub const EFAULT: isize = -14;
     pub const EBUSY: isize = -16;
     pub const EEXIST: isize = -17;
+    /// EAGAIN: try again later. What a `wait` that was asked not to block
+    /// answers when the child it was asked about is still running.
+    pub const EAGAIN: isize = -11;
     pub const ENOTDIR: isize = -20;
     pub const EISDIR: isize = -21;
     pub const EINVAL: isize = -22;
@@ -38,39 +41,6 @@ pub mod err {
 /// How many register arguments a syscall may pass.
 pub const ARG_COUNT: usize = 6;
 
-/// The directory a path names its last component in, and that component.
-///
-/// Everything above the last slash is the parent, which the caller resolves;
-/// what follows is the name to make or remove. `/f` is the root and `f`.
-///
-/// A name is never a path component - `.` and `..` name directories that
-/// already exist, and neither can be made or removed by this route. A path
-/// with no slash at all has no parent to speak of: there is no cwd to resolve
-/// it against, so it is refused rather than guessed at.
-///
-/// Returns the errno, not a VFS error, because it is only ever called to
-/// check an argument from ring 3.
-fn split_parent(path: &str) -> Result<(&str, &str), isize> {
-    let trimmed = path.trim_end_matches('/');
-    let Some(slash) = trimmed.rfind('/') else {
-        return Err(err::EINVAL);
-    };
-    let name = &trimmed[slash + 1..];
-    if name.is_empty() || name == "." || name == ".." {
-        return Err(err::EINVAL);
-    }
-    let parent = if slash == 0 { "/" } else { &trimmed[..slash] };
-    Ok((parent, name))
-}
-
-/// Run syscall number `nr` with the register arguments and return the result.
-///
-/// `from_user` says whether the gate was knocked on from ring 3, which decides
-/// how much a pointer argument can be trusted: a kernel task's pointers are
-/// kernel pointers, a user task's are only addresses until every page they
-/// touch has been walked in the caller's own tables.
-///
-/// `EXIT` never returns: the task ends inside the gate.
 #[cfg(target_os = "none")]
 pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
     use alloc::string::String;
@@ -128,6 +98,15 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
     // gets to ask for anything: the same rule as `block_until`, applied at the
     // other door into the kernel.
     crate::sched::deliver_pending_signal();
+
+    // Where a caller's relative paths start. A process carries a cwd; kernel
+    // callers have none, and always mean the root - which is what resolve
+    // does anyway, so they keep the plain forms.
+    let cwd = if from_user {
+        Some(crate::sched::current_cwd())
+    } else {
+        None
+    };
 
     match nr {
         nr::EXIT => crate::sched::exit(args[0] as isize),
@@ -224,7 +203,7 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
         nr::OPEN => {
             let (ptr, len) = (args[0], args[1]);
             match path_arg(ptr, len, from_user) {
-                Ok(path) => match crate::vfs::open(&path) {
+                Ok(path) => match crate::vfs::open_opt(&path, cwd.clone()) {
                     Ok(fd) => fd as isize,
                     Err(e) => err_of(e),
                 },
@@ -278,7 +257,40 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 argv.push(String::from(name));
             }
 
-            let bytes = match crate::vfs::read_file(&path) {
+            // What descriptors the child should be born holding, as pairs of
+            // i32: take the first from this process's table, install it at
+            // the second in the child's. This is the whole of redirection - a
+            // shell hands its pipe ends over here, because the child's table
+            // is built by the kernel and there is no moment in between for
+            // anybody else to reach it.
+            let mut redirects: Vec<crate::sched::Redirect> = Vec::new();
+            let (redir_ptr, redir_count) = (args[4], args[5]);
+            if redir_count > 0 {
+                const REDIRECT_MAX: usize = 8;
+                if redir_count > REDIRECT_MAX {
+                    return err::EINVAL;
+                }
+                let bytes = redir_count * 2 * size_of::<i32>();
+                if !buffer_ok(redir_ptr, bytes, false, from_user) {
+                    return err::EFAULT;
+                }
+                let pairs = unsafe {
+                    core::slice::from_raw_parts(redir_ptr as *const i32, redir_count * 2)
+                };
+                for pair in pairs.as_chunks::<2>().0 {
+                    let (from, to) = (pair[0], pair[1]);
+                    // Either number negative means the caller is confused:
+                    // descriptors are never negative, and quietly ignoring a
+                    // redirect would leave the child talking to the wrong
+                    // place.
+                    if from < 0 || to < 0 {
+                        return err::EBADF;
+                    }
+                    redirects.push((from, to));
+                }
+            }
+
+            let bytes = match crate::vfs::read_file_opt(&path, cwd.clone()) {
                 Ok(bytes) => bytes,
                 Err(e) => return err_of(e),
             };
@@ -287,19 +299,31 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 crate::sched::Priority::NORMAL,
                 crate::sched::current(),
                 &argv,
+                &redirects,
             ) {
                 Ok(id) => id.0 as isize,
                 Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
                 Err(crate::sched::SpawnError::ArgsTooBig) => err::EINVAL,
+                Err(crate::sched::SpawnError::BadFd) => err::EBADF,
             }
         }
         nr::WAIT => {
-            let pid = args[0];
+            let (pid, flags) = (args[0], args[1]);
+            // Bit 0: do not block. A shell reaping background jobs asks again
+            // and again, and a sleeper it cannot wake would hang the prompt.
+            const WNOHANG: usize = 1;
+            let no_hang = flags & WNOHANG != 0;
             let me = crate::sched::current();
             // -1 is POSIX's "any child", and it is what init wants: it starts
             // a shell, waits for whichever child ends, and starts another.
             // `usize::MAX` is how a negative of any width arrives here.
             if pid == usize::MAX {
+                if no_hang {
+                    return match crate::sched::poll_any_child(me) {
+                        Some((_id, code)) => code,
+                        None => err::EAGAIN,
+                    };
+                }
                 return match crate::sched::wait_any_child(me) {
                     Some((_id, code)) => code,
                     None => err::ECHILD,
@@ -312,11 +336,12 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // Only a live child of ours is worth blocking on. Anything else -
             // another task's child, a pid that never existed - either left a
             // record behind or gets ECHILD.
-            if crate::sched::is_child(id, me) {
+            if crate::sched::is_child(id, me) && !no_hang {
                 crate::sched::block_until_code(id);
             }
             match crate::sched::take_exit_code(id) {
                 Some(code) => code,
+                None if no_hang => err::EAGAIN,
                 None => err::ECHILD,
             }
         }
@@ -340,19 +365,13 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Ok(path) => path,
                 Err(e) => return e,
             };
-            let (parent, name) = match split_parent(&path) {
-                Ok(parts) => parts,
-                Err(e) => return e,
-            };
-            match crate::vfs::resolve(parent)
-                .and_then(|dir| dir.create(name, crate::vfs::NodeKind::File))
-            {
-                // The caller gets a descriptor, not the inode: a name it just
-                // made is one it almost always means to write.
-                Ok(_) => match crate::vfs::open(&path) {
-                    Ok(fd) => fd as isize,
-                    Err(e) => err_of(e),
-                },
+            if let Err(e) = crate::vfs::create_file_opt(&path, cwd.clone()) {
+                return err_of(e);
+            }
+            // The caller gets a descriptor, not the inode: a name it just
+            // made is one it almost always means to write.
+            match crate::vfs::open_opt(&path, cwd.clone()) {
+                Ok(fd) => fd as isize,
                 Err(e) => err_of(e),
             }
         }
@@ -361,12 +380,23 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Ok(path) => path,
                 Err(e) => return e,
             };
-            let (parent, name) = match split_parent(&path) {
-                Ok(parts) => parts,
+            match crate::vfs::unlink_opt(&path, cwd.clone()) {
+                Ok(()) => 0,
+                Err(e) => err_of(e),
+            }
+        }
+        nr::CHDIR => {
+            let path = match path_arg(args[0], args[1], from_user) {
+                Ok(path) => path,
                 Err(e) => return e,
             };
-            match crate::vfs::resolve(parent).and_then(|dir| dir.unlink(name)) {
-                Ok(()) => 0,
+            let start = crate::sched::current_cwd();
+            match crate::vfs::resolve_at(&path, start) {
+                Ok(dir) if dir.metadata().kind == crate::vfs::NodeKind::Dir => {
+                    crate::sched::set_cwd(dir);
+                    0
+                }
+                Ok(_) => err::ENOTDIR,
                 Err(e) => err_of(e),
             }
         }
@@ -376,7 +406,7 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Ok(path) => path,
                 Err(e) => return e,
             };
-            let entries = match crate::vfs::read_dir(&path) {
+            let entries = match crate::vfs::read_dir_opt(&path, cwd.clone()) {
                 Ok(entries) => entries,
                 Err(e) => return err_of(e),
             };
@@ -435,23 +465,7 @@ mod tests {
         assert_eq!(nr::DUP2, 13);
         assert_eq!(nr::CREATE, 14);
         assert_eq!(nr::UNLINK, 15);
-    }
-
-    #[test]
-    fn a_path_splits_into_the_directory_and_the_name() {
-        // Whatever comes after the last slash is the name; everything before
-        // it is a path to walk, and `/` is a path like any other.
-        assert_eq!(super::split_parent("/f"), Ok(("/", "f")));
-        assert_eq!(super::split_parent("/a/b"), Ok(("/a", "b")));
-        assert_eq!(super::split_parent("/a/b/"), Ok(("/a", "b")));
-        assert_eq!(super::split_parent("/a/b///"), Ok(("/a", "b")));
-
-        // A name is never a path component, and a path with no directory in
-        // it has no parent to name - there is no cwd to resolve it against.
-        assert_eq!(super::split_parent("f"), Err(super::err::EINVAL));
-        assert_eq!(super::split_parent("/"), Err(super::err::EINVAL));
-        assert_eq!(super::split_parent("/a/."), Err(super::err::EINVAL));
-        assert_eq!(super::split_parent("/a/.."), Err(super::err::EINVAL));
+        assert_eq!(nr::CHDIR, 16);
     }
 
     #[test]
@@ -461,6 +475,7 @@ mod tests {
         assert_eq!(err::ENOEXEC, -8);
         assert_eq!(err::EBADF, -9);
         assert_eq!(err::ECHILD, -10);
+        assert_eq!(err::EAGAIN, -11);
         assert_eq!(err::EFAULT, -14);
         assert_eq!(err::EBUSY, -16);
         assert_eq!(err::EEXIST, -17);

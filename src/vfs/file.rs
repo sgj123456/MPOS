@@ -136,6 +136,17 @@ impl FdTable {
     /// duplicate that is already where it was asked to go.
     pub fn dup2(&self, old: RawFd, new: RawFd) -> VfsResult<RawFd> {
         let file = self.get(old)?;
+        self.install_at(file, new)?;
+        Ok(new)
+    }
+
+    /// Put `file` at `new` in this table, dropping whatever was there.
+    ///
+    /// The cross-table half of [`dup2`](Self::dup2), and the whole of what
+    /// starting a process with a redirected descriptor needs: a child's table
+    /// is built fresh, and the descriptions it should hold live in whoever is
+    /// starting it.
+    pub fn install_at(&self, file: Arc<File>, new: RawFd) -> VfsResult<()> {
         let slot = usize::try_from(new).map_err(|_| VfsError::BadFd)?;
         critical_section::with(|cs| {
             let mut slots = self.slots.borrow(cs).borrow_mut();
@@ -144,7 +155,12 @@ impl FdTable {
             }
             slots[slot] = Some(file);
         });
-        Ok(new)
+        Ok(())
+    }
+
+    /// The description `fd` names, for handing to another table.
+    pub fn clone_at(&self, fd: RawFd) -> VfsResult<Arc<File>> {
+        self.get(fd)
     }
 }
 
@@ -191,6 +207,16 @@ pub fn init_standard(tty: Arc<dyn Inode>) {
 /// Resolve `path` and open a fresh description on it.
 pub fn open(path: &str) -> VfsResult<RawFd> {
     let inode = resolve(path)?;
+    Ok(current_table().install(Arc::new(File::new(inode))))
+}
+
+/// [`open`](fn.open.html) with a caller-supplied start for relative paths.
+/// `None` is the root, which is what every kernel caller means.
+pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
+    let inode = match start {
+        Some(dir) => super::resolve_at(path, dir)?,
+        None => resolve(path)?,
+    };
     Ok(current_table().install(Arc::new(File::new(inode))))
 }
 

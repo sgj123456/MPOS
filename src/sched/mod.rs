@@ -16,9 +16,9 @@ pub use policy::{Priority, TaskId};
 pub use runtime::spawn_init;
 #[cfg(target_os = "none")]
 pub use runtime::{
-    ARGS_BYTES_MAX, ARGV_MAX, INIT_PID, MAX_TASKS, STACK_ORDER, SpawnError, block_until,
-    block_until_code, current, current_fds, deliver_pending_signal, discard_exit_code, exit,
-    exit_code, has_live_child, init, is_child, pause, permanent_tasks, preempt, send_signal,
-    sleep_ticks, spawn, spawn_user, take_exit_code, task_count, try_spawn_user, wait_any_child,
-    wait_for_interrupt, wake, yield_now,
+    ARGS_BYTES_MAX, ARGV_MAX, INIT_PID, MAX_TASKS, Redirect, STACK_ORDER, SpawnError, block_until,
+    block_until_code, current, current_cwd, current_fds, deliver_pending_signal, discard_exit_code,
+    exit, exit_code, has_live_child, init, is_child, pause, permanent_tasks, poll_any_child,
+    preempt, send_signal, set_cwd, sleep_ticks, spawn, spawn_user, take_exit_code, task_count,
+    try_spawn_user, wait_any_child, wait_for_interrupt, wake, yield_now,
 };

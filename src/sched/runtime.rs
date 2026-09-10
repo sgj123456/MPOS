@@ -41,6 +41,7 @@ use crate::mm::vm::{MapFlags, Mapping};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{Priority, Scheduler, TaskId};
 use crate::sched::signal;
+use crate::vfs::RawFd;
 use crate::vfs::file::FdTable;
 
 /// How many tasks can exist at once. A hard limit rather than a grown
@@ -112,7 +113,15 @@ pub enum SpawnError {
     NotExecutable,
     /// The argument strings do not fit the initial stack.
     ArgsTooBig,
+    /// A descriptor the starter asked the child to be born with names nothing
+    /// in the starter's own table.
+    BadFd,
 }
+
+/// Where a descriptor taken from the starter's table goes in the child's:
+/// read `from` in the parent, install at `to` in the child. One pair is one
+/// redirection, which is how a shell hands a pipe end to the program it runs.
+pub type Redirect = (RawFd, RawFd);
 
 /// Exit codes, kept after the task is gone. The slot a task occupied is free
 /// for reuse the moment it is reaped, but the code it exited with can still be
@@ -188,6 +197,10 @@ struct Task {
     /// The descriptors this task's fd numbers index. Kernel tasks share the
     /// kernel's table; a process has one of its own.
     fds: Arc<FdTable>,
+    /// The directory relative paths name things from. `None` is the root,
+    /// which is where everyone starts; the VFS is mounted long after the
+    /// first tasks exist, so the root inode cannot be grabbed up front.
+    cwd: Option<Arc<dyn crate::vfs::Inode>>,
     /// The task that spawned this one in ring 3, if any. Its `wait` blocks on
     /// this task's exit; kernel-spawned tasks have none.
     parent: Option<TaskId>,
@@ -208,6 +221,7 @@ impl Task {
             user_frames: Vec::new(),
             signals: 0,
             fds: crate::vfs::file::kernel_fds(),
+            cwd: None,
             parent: None,
         }
     }
@@ -353,6 +367,7 @@ impl Table {
             user_frames: Vec::new(),
             signals: 0,
             fds: crate::vfs::file::kernel_fds(),
+            cwd: None,
             parent: None,
         });
         TaskId(slot)
@@ -467,7 +482,7 @@ pub fn spawn(body: impl FnOnce() + 'static, priority: Priority) -> TaskId {
 /// reaches into the kernel half is refused there, and every page placed here
 /// comes from frames this code allocates, never from the file's claims.
 pub fn spawn_user(bytes: &[u8], priority: Priority) -> TaskId {
-    try_spawn_user(bytes, priority, current(), &[])
+    try_spawn_user(bytes, priority, current(), &[], &[])
         .expect("spawn_user: not an ELF64 executable mpos can load")
 }
 
@@ -519,6 +534,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnErro
             user_frames: frames,
             signals: 0,
             fds: Arc::new(FdTable::with_standard(crate::vfs::tty::global())),
+            cwd: None,
             parent: None,
         });
         t.sched.push_ready(INIT_PID, Priority::NORMAL);
@@ -537,6 +553,7 @@ pub fn try_spawn_user(
     priority: Priority,
     parent: TaskId,
     argv: &[String],
+    redirects: &[Redirect],
 ) -> Result<TaskId, SpawnError> {
     assert!(
         STARTED.load(Ordering::Relaxed),
@@ -563,9 +580,21 @@ pub fn try_spawn_user(
         let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, true) };
 
         // A process's descriptors are its own from the first instruction: the
-        // standard three over the console, and nothing of anyone else's. What
-        // it closes is then its business, not the shell's.
+        // standard three over the console, and nothing of anyone else's - not
+        // even the starter's, which is why a pipe end has to be handed over
+        // explicitly. What it closes is then its business, not the shell's.
         let fds = Arc::new(FdTable::with_standard(crate::vfs::tty::global()));
+        // The child's table is fresh, so it inherits no descriptor the starter
+        // happened to be holding - a pipe's write end in the starter's own
+        // table, say. That is what makes a pipeline's end-of-file arrive: the
+        // reader sees the writers close because nobody else ever had one.
+        for &(from, to) in redirects {
+            let file = match t.task(parent).fds.clone_at(from) {
+                Ok(file) => file,
+                Err(_) => return Err(SpawnError::BadFd),
+            };
+            fds.install_at(file, to).map_err(|_| SpawnError::BadFd)?;
+        }
 
         t.tasks[slot] = Some(Task {
             context,
@@ -578,6 +607,7 @@ pub fn try_spawn_user(
             user_frames: frames,
             signals: 0,
             fds,
+            cwd: t.task(parent).cwd.clone(),
             parent: Some(parent),
         });
         let id = TaskId(slot);
@@ -804,6 +834,30 @@ fn block_until_on(cond: impl Fn(&Table) -> bool) {
             }
         });
     }
+}
+
+/// Take a child's exit code if one is waiting, and report `None` - not
+/// "keep waiting" - when it is not. The non-blocking half of `wait`: this is
+/// how a shell reaps jobs it started in the background without stopping for
+/// any of them.
+pub fn poll_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
+    with_table(|t| any_child_code(t, parent))
+        .and_then(|(id, _)| take_exit_code(id).map(|code| (id, code)))
+}
+
+/// The directory relative paths this task names things from, or the root
+/// when it has never asked to be anywhere else.
+pub fn current_cwd() -> Arc<dyn crate::vfs::Inode> {
+    with_table(|t| match &t.task(t.current).cwd {
+        Some(dir) => dir.clone(),
+        None => crate::vfs::global().root_inode(),
+    })
+}
+
+/// Move the running task's cwd to `dir`. Checked to be a directory by the
+/// caller; this only remembers.
+pub fn set_cwd(dir: Arc<dyn crate::vfs::Inode>) {
+    with_table(|t| t.task_mut(t.current).cwd = Some(dir));
 }
 
 /// Wait for a signal. With no handlers yet every signal is fatal, so nothing
