@@ -1,0 +1,41 @@
+[package]
+name = "mpos"
+version = "0.1.0"
+edition = "2024"
+
+# Machine-dependent crates are gated behind `target_os = "none"`. That keeps the
+# host build (cargo test --lib --target x86_64-unknown-linux-gnu) free of
+# bootloader, port-I/O and locking crates, and makes the arch-agnostic core of the
+# kernel - the frame allocator, the mapping plan, later the VFS and the
+# scheduler's policy code - testable with plain `cargo test`.
+[dependencies]
+# Used by the arch-agnostic mapping plan, so deliberately not target-gated.
+# Already in the tree as a dependency of `x86_64`.
+bitflags = "2.13"
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+
+# The host test build compiles the VFS too, which locks; `std` picks the stock
+# critical section for hosted targets.
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }
+
+# x86_64-only: Limine is the x86_64 bootloader, the 16550 driver talks to port
+# I/O, and the IDT's one-time init is the only spin::Once user.
+[target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
+limine = "0.6.5"
+uart_16550 = "0.8"
+spin = { version = "0.12", default-features = false, features = ["once", "lazy"] }
+x86_64 = { version = "0.15", default-features = false, features = [
+    "instructions",
+    "abi_x86_interrupt",
+] }
+
+[profile.dev]
+panic = "abort"
+debug = 2
+
+[profile.release]
+panic = "abort"
+lto = "thin"

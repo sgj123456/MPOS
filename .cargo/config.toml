@@ -1,0 +1,31 @@
+# Limine base revision 3 loads the kernel as a position-independent executable at
+# its own chosen higher-half base and applies the RELATIVE relocations itself.
+# These flags mirror the recipe Limine uses for its own reference kernel.
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# The target spec already sets `-mmx,-sse,...,-avx2,+soft-float` and
+# `disable-redzone`, so nothing here has to repeat it. That is what lets the
+# context switch save only the callee-saved general registers: there is no
+# vector state in use anywhere in the kernel, and no red zone for an interrupt
+# to land on. Adding `+soft-float` here would be rejected anyway - rustc does
+# not accept it through -Ctarget-feature.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=--script=arch/x86_64/linker.ld",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=-ztext",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "target-feature=+nofp,+nosimd",
+    "-C", "link-arg=--script=arch/aarch64/linker.ld",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=-ztext",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]

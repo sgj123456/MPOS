@@ -1,0 +1,121 @@
+//! Interrupt Descriptor Table and dispatch.
+//!
+//! Handlers use the `x86-interrupt` ABI (nightly-only), which lets the compiler
+//! emit the register save/restore and `iretq` itself. That composes with
+//! preemption: the clock handler can switch tasks without ever returning,
+//! because the trap frame stays on the interrupted task's own stack and unwinds
+//! normally whenever that task is resumed. Hand-written stubs would only buy
+//! control over the exact frame layout, which nothing here needs.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use spin::Once;
+use x86_64::registers::control::Cr2;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+
+use super::pic;
+
+static IDT: Once<InterruptDescriptorTable> = Once::new();
+
+static BREAKPOINTS_CAUGHT: AtomicU64 = AtomicU64::new(0);
+
+pub fn breakpoints_caught() -> u64 {
+    BREAKPOINTS_CAUGHT.load(Ordering::Relaxed)
+}
+
+pub fn init() {
+    let idt = IDT.call_once(|| {
+        let mut table = InterruptDescriptorTable::new();
+
+        table.divide_error.set_handler_fn(divide_error);
+        table.breakpoint.set_handler_fn(breakpoint);
+        table.invalid_opcode.set_handler_fn(invalid_opcode);
+        table.double_fault.set_handler_fn(double_fault);
+        table
+            .general_protection_fault
+            .set_handler_fn(general_protection);
+        table.page_fault.set_handler_fn(page_fault);
+        table.stack_segment_fault.set_handler_fn(stack_segment);
+        table
+            .segment_not_present
+            .set_handler_fn(segment_not_present);
+        table.alignment_check.set_handler_fn(alignment_check);
+
+        table[pic::IRQ0_VECTOR].set_handler_fn(timer);
+
+        super::syscall::register(&mut table);
+
+        table
+    });
+
+    idt.load();
+}
+
+pub fn enable() {
+    x86_64::instructions::interrupts::enable();
+}
+
+extern "x86-interrupt" fn timer(_frame: InterruptStackFrame) {
+    super::timer::tick();
+    // EOI before preempting: once the scheduler switches away this handler does
+    // not return until the task is resumed, and an unacknowledged PIC would
+    // block every interrupt until then.
+    pic::end_of_interrupt(0);
+    crate::sched::preempt();
+}
+
+/// Deliberately reachable from tests: `int3` must return here, not panic.
+extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
+    BREAKPOINTS_CAUGHT.fetch_add(1, Ordering::Relaxed);
+    crate::println!("caught #BP at rip {:#x}", frame.instruction_pointer);
+}
+
+extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
+    fatal("#DE divide error", &frame, 0)
+}
+
+extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
+    fatal("#UD invalid opcode", &frame, 0)
+}
+
+extern "x86-interrupt" fn stack_segment(frame: InterruptStackFrame, code: u64) {
+    fatal("#SS stack segment", &frame, code)
+}
+
+extern "x86-interrupt" fn segment_not_present(frame: InterruptStackFrame, code: u64) {
+    fatal("#NP segment not present", &frame, code)
+}
+
+extern "x86-interrupt" fn alignment_check(frame: InterruptStackFrame, code: u64) {
+    fatal("#AC alignment check", &frame, code)
+}
+
+extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
+    fatal("#GP general protection", &frame, code)
+}
+
+extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {
+    fatal("#DF double fault", &frame, code)
+}
+
+extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
+    let addr = Cr2::read().map_or(0, |a| a.as_u64());
+    crate::println!(
+        "\nKERNEL PANIC: #PF at {:#x} ({:?}) rip {:#x}",
+        addr,
+        code,
+        frame.instruction_pointer
+    );
+    crate::arch::qemu::exit(crate::arch::qemu::EXIT_FAILURE)
+}
+
+fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
+    crate::println!(
+        "\nKERNEL PANIC: {} code {:#x} rip {:#x} rsp {:#x}",
+        name,
+        code,
+        frame.instruction_pointer,
+        frame.stack_pointer
+    );
+    crate::arch::qemu::exit(crate::arch::qemu::EXIT_FAILURE)
+}
