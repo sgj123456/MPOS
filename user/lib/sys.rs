@@ -161,6 +161,18 @@ pub fn close(fd: i32) -> isize {
     sys1(nr::CLOSE, fd as usize)
 }
 
+/// Make an empty file at `path` and open it for writing. Returns the fd, or a
+/// negative errno - EEXIST when the name is taken, ENOENT when its directory
+/// is not there. Shell redirection unlinks first, which is what `>` means.
+pub fn create(path: &[u8]) -> isize {
+    sys2(nr::CREATE, path.as_ptr() as usize, path.len())
+}
+
+/// Remove the name `path`. ENOENT when nothing answers to it.
+pub fn unlink(path: &[u8]) -> isize {
+    sys2(nr::UNLINK, path.as_ptr() as usize, path.len())
+}
+
 /// Make `new` name what `old` names, closing whatever `new` named first.
 /// Returns `new`, or a negative errno - EBADF when `old` names nothing.
 pub fn dup2(old: i32, new: i32) -> isize {

@@ -38,6 +38,31 @@ pub mod err {
 /// How many register arguments a syscall may pass.
 pub const ARG_COUNT: usize = 6;
 
+/// The directory a path names its last component in, and that component.
+///
+/// Everything above the last slash is the parent, which the caller resolves;
+/// what follows is the name to make or remove. `/f` is the root and `f`.
+///
+/// A name is never a path component - `.` and `..` name directories that
+/// already exist, and neither can be made or removed by this route. A path
+/// with no slash at all has no parent to speak of: there is no cwd to resolve
+/// it against, so it is refused rather than guessed at.
+///
+/// Returns the errno, not a VFS error, because it is only ever called to
+/// check an argument from ring 3.
+fn split_parent(path: &str) -> Result<(&str, &str), isize> {
+    let trimmed = path.trim_end_matches('/');
+    let Some(slash) = trimmed.rfind('/') else {
+        return Err(err::EINVAL);
+    };
+    let name = &trimmed[slash + 1..];
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(err::EINVAL);
+    }
+    let parent = if slash == 0 { "/" } else { &trimmed[..slash] };
+    Ok((parent, name))
+}
+
 /// Run syscall number `nr` with the register arguments and return the result.
 ///
 /// `from_user` says whether the gate was knocked on from ring 3, which decides
@@ -307,6 +332,44 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Err(e) => err_of(e),
             }
         }
+        // The two ways ring 3 makes and unmakes a name. Both go through the
+        // parent directory, because that is where the edge lives: a file is
+        // reachable by name only as long as its directory says so.
+        nr::CREATE => {
+            let path = match path_arg(args[0], args[1], from_user) {
+                Ok(path) => path,
+                Err(e) => return e,
+            };
+            let (parent, name) = match split_parent(&path) {
+                Ok(parts) => parts,
+                Err(e) => return e,
+            };
+            match crate::vfs::resolve(parent)
+                .and_then(|dir| dir.create(name, crate::vfs::NodeKind::File))
+            {
+                // The caller gets a descriptor, not the inode: a name it just
+                // made is one it almost always means to write.
+                Ok(_) => match crate::vfs::open(&path) {
+                    Ok(fd) => fd as isize,
+                    Err(e) => err_of(e),
+                },
+                Err(e) => err_of(e),
+            }
+        }
+        nr::UNLINK => {
+            let path = match path_arg(args[0], args[1], from_user) {
+                Ok(path) => path,
+                Err(e) => return e,
+            };
+            let (parent, name) = match split_parent(&path) {
+                Ok(parts) => parts,
+                Err(e) => return e,
+            };
+            match crate::vfs::resolve(parent).and_then(|dir| dir.unlink(name)) {
+                Ok(()) => 0,
+                Err(e) => err_of(e),
+            }
+        }
         nr::LISTDIR => {
             let (ptr, len, buf, buf_len) = (args[0], args[1], args[2], args[3]);
             let path = match path_arg(ptr, len, from_user) {
@@ -370,6 +433,25 @@ mod tests {
         assert_eq!(nr::WAIT, 11);
         assert_eq!(nr::LISTDIR, 12);
         assert_eq!(nr::DUP2, 13);
+        assert_eq!(nr::CREATE, 14);
+        assert_eq!(nr::UNLINK, 15);
+    }
+
+    #[test]
+    fn a_path_splits_into_the_directory_and_the_name() {
+        // Whatever comes after the last slash is the name; everything before
+        // it is a path to walk, and `/` is a path like any other.
+        assert_eq!(super::split_parent("/f"), Ok(("/", "f")));
+        assert_eq!(super::split_parent("/a/b"), Ok(("/a", "b")));
+        assert_eq!(super::split_parent("/a/b/"), Ok(("/a", "b")));
+        assert_eq!(super::split_parent("/a/b///"), Ok(("/a", "b")));
+
+        // A name is never a path component, and a path with no directory in
+        // it has no parent to name - there is no cwd to resolve it against.
+        assert_eq!(super::split_parent("f"), Err(super::err::EINVAL));
+        assert_eq!(super::split_parent("/"), Err(super::err::EINVAL));
+        assert_eq!(super::split_parent("/a/."), Err(super::err::EINVAL));
+        assert_eq!(super::split_parent("/a/.."), Err(super::err::EINVAL));
     }
 
     #[test]
