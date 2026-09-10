@@ -25,6 +25,8 @@ use critical_section::Mutex;
 
 use super::{Inode, Metadata, NodeKind, VfsResult};
 use crate::sched::policy::TaskId;
+#[cfg(target_os = "none")]
+use crate::sched::signal::SIGINT;
 
 const BACKSPACE: u8 = 0x08;
 const LF: u8 = b'\n';
@@ -33,6 +35,21 @@ const DEL: u8 = 0x7f;
 /// Ctrl-D. On an empty line it ends input; mid-line it flushes what is typed,
 /// which is how a shell reads `cat` input without a trailing newline.
 const EOF_CHAR: u8 = 0x04;
+/// Ctrl-C: the terminal's interrupt, delivered as SIGINT to whatever is
+/// reading. It is not a character of the line, so it never enters one.
+const INTR_CHAR: u8 = 0x03;
+
+/// What one input byte asked for, beyond being edited into the line.
+///
+/// The discipline is pure: it decides *that* the interrupt was asked for, and
+/// leaves the sending to [`Tty`], which is the only thing that knows who to
+/// send it to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    None,
+    /// The foreground reader is to be interrupted.
+    Interrupt,
+}
 
 /// One completed input line. `Eof` is not bytes: it is the statement "input
 /// ended here", and a read over it reports 0.
@@ -60,8 +77,9 @@ impl LineDiscipline {
         }
     }
 
-    /// Feed one input byte, queueing whatever the console should echo.
-    pub fn receive(&mut self, byte: u8) {
+    /// Feed one input byte, queueing whatever the console should echo, and
+    /// report anything the byte asked for beyond editing.
+    pub fn receive(&mut self, byte: u8) -> Action {
         match byte {
             BACKSPACE | DEL => {
                 if self.pending.pop().is_some() {
@@ -80,6 +98,10 @@ impl LineDiscipline {
                     self.ready.push_back(Line::Data(line));
                 }
             }
+            // Not input at all: the terminal's own interrupt. The half-typed
+            // line is left alone, as a real terminal leaves it, because the
+            // reader is about to be killed rather than handed a line.
+            INTR_CHAR => return Action::Interrupt,
             0x20..=0x7e => {
                 self.pending.push(byte);
                 self.echo.push(byte);
@@ -88,6 +110,7 @@ impl LineDiscipline {
             // of the line rather than passing them through raw.
             _ => {}
         }
+        Action::None
     }
 
     fn complete_line(&mut self) {
@@ -125,6 +148,12 @@ pub struct Tty {
     /// Tasks blocked in [`Tty::read`]. A producer cannot name them, but the
     /// tty can: a completed line is worthless if the only reader stays asleep.
     waiters: Mutex<RefCell<Vec<TaskId>>>,
+    /// Who an interrupt belongs to: the last task to have asked this tty for
+    /// input, standing in for the foreground process group. There is no
+    /// process group yet, and a keyboard cannot say whose job a Ctrl-C is
+    /// aimed at, so the most recent reader is the best guess there is - and
+    /// the shell, waiting on a child, is not it.
+    foreground: Mutex<RefCell<Option<TaskId>>>,
 }
 
 impl Tty {
@@ -132,23 +161,26 @@ impl Tty {
         Tty {
             ld: Mutex::new(RefCell::new(LineDiscipline::new())),
             waiters: Mutex::new(RefCell::new(Vec::new())),
+            foreground: Mutex::new(RefCell::new(None)),
         }
     }
 
-    /// Feed one byte from the input side, show its echo, and wake any reader
-    /// the byte's effects can satisfy. Runs with interrupts off for the length
-    /// of the edit, which is nothing next to the byte's own arrival rate.
+    /// Feed one byte from the input side, show its echo, and act on what the
+    /// byte asked for: a completed line wakes the readers, and an interrupt
+    /// is delivered to whoever is reading. Runs with interrupts off for the
+    /// length of the edit, which is nothing next to the byte's arrival rate.
     pub fn receive_byte(&self, byte: u8) {
-        let (echo, waiters) = critical_section::with(|cs| {
+        let (echo, action, waiters, foreground) = critical_section::with(|cs| {
             let mut ld = self.ld.borrow(cs).borrow_mut();
-            ld.receive(byte);
+            let action = ld.receive(byte);
             let echo = ld.take_echo();
             let waiters = if ld.has_ready() {
                 core::mem::take(&mut *self.waiters.borrow(cs).borrow_mut())
             } else {
                 Vec::new()
             };
-            (echo, waiters)
+            let foreground = *self.foreground.borrow(cs).borrow();
+            (echo, action, waiters, foreground)
         });
         #[cfg(target_os = "none")]
         {
@@ -156,9 +188,29 @@ impl Tty {
             for id in waiters {
                 crate::sched::wake(id);
             }
+            if action == Action::Interrupt
+                && let Some(id) = foreground
+            {
+                crate::sched::send_signal(id, SIGINT);
+            }
         }
         #[cfg(not(target_os = "none"))]
-        drop((echo, waiters));
+        drop((echo, action, waiters, foreground));
+    }
+
+    /// Remember that `id` is the one waiting for input, so an interrupt has
+    /// somewhere to go. Cleared when that reader leaves: a process that is not
+    /// reading should not be interrupted for something a keyboard did.
+    #[cfg(target_os = "none")]
+    fn set_foreground(&self, id: Option<TaskId>) {
+        critical_section::with(|cs| {
+            *self.foreground.borrow(cs).borrow_mut() = id;
+        });
+    }
+
+    /// Whether `id` is the task an interrupt from this tty would reach.
+    pub fn is_foreground(&self, id: TaskId) -> bool {
+        critical_section::with(|cs| *self.foreground.borrow(cs).borrow() == Some(id))
     }
 
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
@@ -175,10 +227,16 @@ impl Tty {
         }
         let id = crate::sched::current();
         critical_section::with(|cs| self.waiters.borrow(cs).borrow_mut().push(id));
+        // While this task is reading, an interrupt typed at the console is
+        // meant for it - not for whatever waits on it.
+        self.set_foreground(Some(id));
         let got = self.read_blocking(buf);
         critical_section::with(|cs| {
             self.waiters.borrow(cs).borrow_mut().retain(|&w| w != id);
         });
+        if self.is_foreground(id) {
+            self.set_foreground(None);
+        }
         got
     }
 
@@ -270,12 +328,13 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{Line, LineDiscipline};
+    use super::{Action, Line, LineDiscipline};
 
     fn fed(bytes: &[u8]) -> LineDiscipline {
         let mut ld = LineDiscipline::new();
         for &b in bytes {
-            ld.receive(b);
+            let action = ld.receive(b);
+            assert_eq!(action, Action::None, "byte {b:#x} asked for an action");
         }
         ld
     }
@@ -343,8 +402,27 @@ mod tests {
     #[test]
     fn echo_drains_so_repeated_takes_do_not_repeat() {
         let mut ld = LineDiscipline::new();
-        ld.receive(b'x');
+        let _ = ld.receive(b'x');
         assert_eq!(ld.take_echo(), b"x");
         assert_eq!(ld.take_echo(), b"");
+    }
+
+    #[test]
+    fn ctrl_c_asks_for_an_interrupt_and_never_enters_the_line() {
+        let mut ld = LineDiscipline::new();
+        let _ = ld.receive(b'h');
+        let _ = ld.receive(b'i');
+
+        // The half-typed line is left where it was, as a terminal leaves it
+        // when the reader it belonged to is about to be killed.
+        assert_eq!(ld.receive(0x03), Action::Interrupt);
+        assert!(!ld.has_ready(), "an interrupt completes no line");
+        assert_eq!(ld.take_echo(), b"hi", "nothing is echoed for Ctrl-C");
+
+        // Typing on afterwards continues the same line, so a Ctrl-C that
+        // nobody was around to receive costs nothing.
+        let _ = ld.receive(b'!');
+        let _ = ld.receive(b'\n');
+        assert_eq!(lines(&mut ld), vec![Line::Data(b"hi!\n".to_vec())]);
     }
 }

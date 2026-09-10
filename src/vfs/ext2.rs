@@ -17,10 +17,12 @@
 //!
 //! Block mapping covers direct, single-indirect and double-indirect; a file
 //! that would need triple-indirect gets [`VfsError::FileTooBig`] rather than
-//! silent truncation. What is deliberately absent: unlink (the `Inode` trait
-//! has no remove yet), htree-indexed directories (refused rather than
-//! misparsed), permission checks (there is no identity to check against) and
-//! timestamps (preserved when an inode is rewritten, never updated).
+//! silent truncation. Removal is the mirror of that: `unlink` drops a name
+//! and gives the freed blocks and inode straight back to the bitmaps, so a
+//! filesystem can be left as it was found. What is deliberately absent:
+//! htree-indexed directories (refused rather than misparsed), permission
+//! checks (there is no identity to check against) and timestamps (preserved
+//! when an inode is rewritten, never updated).
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -439,6 +441,75 @@ impl Core {
         Err(VfsError::NoSpace)
     }
 
+    /// Give one block back to the group it came from: clear its bitmap bit,
+    /// put the free count back. The contents are left alone - ext2 promises
+    /// nothing about them, and [`Self::alloc_block`] zeroes a block before
+    /// anyone gets it.
+    fn free_block(&self, block: u64) {
+        let per_group = self.sb.blocks_per_group as u64;
+        let first = self.sb.first_data_block as u64;
+        let g = ((block - first) / per_group) as u32;
+        let bit = (block - first) % per_group;
+        let group = self.group(g);
+        self.update_block(group.block_bitmap, |page| {
+            page[(bit / 8) as usize] &= !(1u8 << (bit % 8));
+            true
+        });
+        self.bump_free(g, 1, 0);
+    }
+
+    /// Free every block `data` maps - the direct ones, then whatever the two
+    /// levels of indirection reach. The indirect blocks themselves go last,
+    /// once nothing points through them. A zero pointer is a hole: nothing
+    /// was ever allocated for it.
+    fn free_blocks_of(&self, data: &InodeData) {
+        let per_block = self.block_size() / 4;
+        for entry in &data.block[..DIRECT_BLOCKS] {
+            if *entry != 0 {
+                self.free_block(*entry as u64);
+            }
+        }
+        // Block 12 is single-indirect, block 13 double: same walk, one level
+        // apart, which is what the flag says.
+        for (double, indirect) in [(false, data.block[12]), (true, data.block[13])] {
+            if indirect != 0 {
+                self.free_indirect(indirect as u64, per_block, double);
+            }
+        }
+    }
+
+    /// Free what one indirect block points at, then the block itself. A
+    /// double-indirect points at indirect blocks rather than data, so its
+    /// contents are freed one level down: the same walk, one step deeper.
+    fn free_indirect(&self, block: u64, per_block: usize, double: bool) {
+        for i in 0..per_block {
+            let Some(target) = self.ptr_at(block, i) else {
+                continue;
+            };
+            if double {
+                self.free_indirect(target, per_block, false);
+            } else {
+                self.free_block(target);
+            }
+        }
+        self.free_block(block);
+    }
+
+    /// Release an inode whose last name is gone: its data blocks first, then
+    /// its bitmap bit. Each block puts its own count back as it goes, so
+    /// only the inode is counted here.
+    fn free_inode(&self, ino: u32) {
+        self.free_blocks_of(&self.read_inode(ino));
+        let g = (ino - 1) / self.sb.inodes_per_group;
+        let index = (ino - 1) % self.sb.inodes_per_group;
+        let group = self.group(g);
+        self.update_block(group.inode_bitmap, |page| {
+            page[(index / 8) as usize] &= !(1u8 << (index % 8));
+            true
+        });
+        self.bump_free(g, 0, 1);
+    }
+
     /// Block and offset of inode `ino` inside its group's inode table.
     fn inode_pos(&self, ino: u32) -> (u64, usize) {
         let index = (ino - 1) % self.sb.inodes_per_group;
@@ -628,6 +699,26 @@ impl Core {
         Ok(())
     }
 
+    /// Drop `name` from `dir` and report the inode it named. The entry's
+    /// space goes to the one before it, so the block stays walkable without a
+    /// hole in its middle; an entry with no predecessor is emptied instead,
+    /// which is the zero inode a walk skips and a later insert reuses.
+    fn dir_remove(&self, dir: &mut InodeData, name: &str) -> VfsResult<u32> {
+        self.dir_writable(dir)?;
+        let block_size = self.block_size();
+        for l in 0..dir.size as u64 / block_size as u64 {
+            let block = self
+                .bmap_lookup(dir, l)
+                .expect("a directory block was never mapped");
+            let mut found = None;
+            self.update_block(block, |page| dir_take(page, name, &mut found));
+            if let Some(ino) = found {
+                return Ok(ino);
+            }
+        }
+        Err(VfsError::NoEntry)
+    }
+
     fn dir_writable(&self, dir: &InodeData) -> VfsResult<()> {
         if dir.flags & INODE_INDEX_FL != 0 {
             return Err(VfsError::Unsupported);
@@ -754,6 +845,37 @@ fn dir_try_insert(page: &mut [u8], name: &str, child: u32, ftype: u8) -> bool {
     false
 }
 
+/// Take the entry called `name` out of one directory block, reporting the
+/// inode it named through `found`. Its bytes go to the entry in front of it,
+/// which is how ext2 keeps a block free of holes; one at the very front has
+/// nothing in front of it, so it is emptied in place instead.
+fn dir_take(page: &mut [u8], name: &str, found: &mut Option<u32>) -> bool {
+    let mut at = 0;
+    let mut prev: Option<usize> = None;
+    while at < page.len() {
+        let rec = le16(page, at + 4) as usize;
+        assert!(
+            rec >= DIRENT_HEADER && at + rec <= page.len(),
+            "corrupt ext2 directory: entry at {at} claims {rec} bytes"
+        );
+        let ino = le32(page, at);
+        if ino != 0 {
+            if &page[at + 8..at + 8 + page[at + 6] as usize] == name.as_bytes() {
+                *found = Some(ino);
+                match prev {
+                    // The predecessor's record grows over the whole gap.
+                    Some(p) => set16(page, p + 4, (at + rec - p) as u16),
+                    None => set32(page, at, 0),
+                }
+                return true;
+            }
+            prev = Some(at);
+        }
+        at += rec;
+    }
+    false
+}
+
 /// Initialise a fresh directory block with "." and "..", the latter taking
 /// the rest of the block.
 fn dir_init(page: &mut [u8], dir_ino: u32, parent_ino: u32) -> bool {
@@ -871,6 +993,34 @@ impl Inode for Ext2Ino {
         self.fs.write_inode(self.ino, &dir);
 
         Ok(self.wrap(child))
+    }
+
+    /// Remove `name` from this directory, freeing what it named if that was
+    /// the last name for it.
+    ///
+    /// Directories are refused: their link count is not just their name in
+    /// us but their own "." and every child's "..", so taking one apart is
+    /// the other half of an `rmdir` this filesystem does not have.
+    fn unlink(&self, name: &str) -> VfsResult<()> {
+        self.require_dir()?;
+        let mut dir = self.fs.read_inode(self.ino);
+        // Looked up before anything is touched, so a refusal leaves the
+        // directory exactly as it was.
+        let child = self.fs.dir_lookup(&dir, name)?.ok_or(VfsError::NoEntry)?;
+        let mut data = self.fs.read_inode(child);
+        if data.kind() == NodeKind::Dir {
+            return Err(VfsError::IsDir);
+        }
+        self.fs.dir_remove(&mut dir, name)?;
+        self.fs.write_inode(self.ino, &dir);
+
+        data.links -= 1;
+        if data.links == 0 {
+            self.fs.free_inode(child);
+        } else {
+            self.fs.write_inode(child, &data);
+        }
+        Ok(())
     }
 
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
@@ -1314,6 +1464,112 @@ mod tests {
         // A file lists nothing.
         let file = root.lookup("note").unwrap();
         assert_eq!(file.read_dir().unwrap_err(), VfsError::NotDir);
+    }
+
+    /// The image's own free counts, as the superblock reports them.
+    fn free_counts(dev: &MemDev) -> (u32, u32) {
+        critical_section::with(|cs| {
+            let disk = dev.bytes.borrow(cs).borrow();
+            (le32(&disk, 1024 + 12), le32(&disk, 1024 + 16))
+        })
+    }
+
+    #[test]
+    fn unlink_gives_the_name_the_blocks_and_the_inode_back() {
+        const LEN: usize = 20 * 1024; // 12 direct blocks + 8 through one indirect
+        let dev = Arc::new(format());
+        assert_eq!(free_counts(&dev), (115, 62));
+
+        let fs = mounted(dev.clone());
+        let root = fs.root();
+        let out = root.create("out.bin", NodeKind::File).expect("create");
+        let bytes: Vec<u8> = (0..LEN).map(pattern).collect();
+        assert_eq!(out.write_at(0, &bytes).unwrap(), LEN);
+        assert_eq!(free_counts(&dev), (115 - 21, 61), "20 data, one indirect");
+
+        root.unlink("out.bin").expect("unlink");
+        assert_eq!(
+            free_counts(&dev),
+            (115, 62),
+            "every block and the inode went back to the bitmaps"
+        );
+
+        drop(out);
+        drop(root);
+        drop(fs);
+        // A cold mount is the only witness that can tell the disk from the
+        // cache of the mount that did the writing.
+        let fs2 = mounted(dev);
+        assert_eq!(
+            fs2.root().lookup("out.bin").err(),
+            Some(VfsError::NoEntry),
+            "the name left the disk"
+        );
+    }
+
+    #[test]
+    fn a_removed_name_can_be_created_again() {
+        let dev = Arc::new(format());
+        let fs = mounted(dev);
+        let root = fs.root();
+        let file = root.create("scratch", NodeKind::File).expect("create");
+        assert_eq!(file.write_at(0, b"first").unwrap(), 5);
+        root.unlink("scratch").expect("unlink");
+
+        // What a second boot over the same image does: the create must not
+        // answer Exists, and the inode it is handed must be a clean one.
+        let again = root
+            .create("scratch", NodeKind::File)
+            .expect("create the same name again");
+        assert_eq!(again.metadata().size, 0, "the reused inode starts empty");
+        assert_eq!(read_all(&*again, 16), Vec::new());
+    }
+
+    #[test]
+    fn unlink_refuses_directories_and_unknown_names() {
+        let fs = mounted(Arc::new(format()));
+        let root = fs.root();
+        root.create("d", NodeKind::Dir).expect("create dir");
+        assert_eq!(root.unlink("d").err(), Some(VfsError::IsDir));
+        assert_eq!(root.unlink("nope").err(), Some(VfsError::NoEntry));
+
+        // Neither refusal touched anything.
+        root.lookup("d").expect("the directory is still there");
+        assert!(
+            root.read_dir()
+                .expect("list the root")
+                .contains(&(String::from("d"), NodeKind::Dir))
+        );
+    }
+
+    #[test]
+    fn directory_entry_removal_hands_the_space_to_the_entry_before() {
+        let mut page = [0u8; 64];
+        write_dirent(&mut page, 0, 2, 12, ".", FT_DIR);
+        write_dirent(&mut page, 12, 2, 24, "..", FT_DIR);
+        write_dirent(&mut page, 36, 7, 28, "gone", FT_REG);
+
+        let mut found = None;
+        assert!(dir_take(&mut page, "gone", &mut found));
+        assert_eq!(found, Some(7));
+        // ".." grew over the gap; "." never moved.
+        assert_eq!(le16(&page, 16), 52);
+        assert_eq!(le16(&page, 4), 12);
+        let mut found = None;
+        assert!(!dir_take(&mut page, "gone", &mut found), "it is gone");
+
+        // The first entry of a block has nothing before it, so it becomes a
+        // hole: the zero inode a walk skips and a later insert reuses.
+        let mut found = None;
+        assert!(dir_take(&mut page, ".", &mut found));
+        assert_eq!(found, Some(2));
+        assert_eq!(le32(&page, 0), 0);
+        let mut seen = Vec::new();
+        dir_walk(&page, |ino, _ft, name| {
+            seen.push((ino, String::from_utf8(name.to_vec()).expect("utf8")));
+            true
+        });
+        assert_eq!(seen, vec![(2u32, String::from(".."))]);
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub const CLOSE: u64 = 9;
 pub const SPAWN: u64 = 10;
 pub const WAIT: u64 = 11;
 pub const LISTDIR: u64 = 12;
+pub const DUP2: u64 = 13;
 
 /// The node kinds a LISTDIR buffer carries. One byte per entry, ahead of its
 /// NUL-terminated name. Kernel and `ls` read the same table, so the mapping

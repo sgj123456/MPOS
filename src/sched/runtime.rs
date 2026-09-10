@@ -25,6 +25,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{RefCell, UnsafeCell};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,7 @@ use crate::mm::vm::{MapFlags, Mapping};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{Priority, Scheduler, TaskId};
 use crate::sched::signal;
+use crate::vfs::file::FdTable;
 
 /// How many tasks can exist at once. A hard limit rather than a grown
 /// collection, for the reason given in the module docs.
@@ -61,9 +63,22 @@ const STACK_CANARY: u64 = 0x6d70_6f73_5f73_746b;
 /// that stack instead of getting one, so there is nothing of ours to free.
 const BOOT_SLOT: usize = 0;
 
-/// Slot 1 belongs to the scheduler. It is never queued and never exits; tasks
-/// reach it by switching to it.
-const SCHED_ID: TaskId = TaskId(1);
+/// The next slot after the boot task's. Slots below it stay empty rather than
+/// first come, first served, so a pid never depends on how many tasks the
+/// boot code happened to start: slot 1 is reserved for init, and the tests
+/// that ran before it still get pids they can assert on.
+///
+/// The top slot belongs to the scheduler, which is never queued and never
+/// exits; tasks reach it by switching to it. Why the top rather than 1: the
+/// first process the kernel starts is init, and a pid is a slot number, so
+/// init has to land on 1 - which is free exactly because the scheduler sits
+/// out of the way at the far end. See [`Table::alloc_slot`].
+const FIRST_ALLOC_SLOT: usize = 2;
+const SCHED_ID: TaskId = TaskId(MAX_TASKS - 1);
+
+/// The first user process the kernel starts: init, and the parent every
+/// orphan ends up with.
+pub const INIT_PID: TaskId = TaskId(1);
 
 /// Permanent tasks: the boot task and the scheduler. Anything above this count
 /// is a task the tests started and have not finished reaping.
@@ -101,10 +116,11 @@ pub enum SpawnError {
 
 /// Exit codes, kept after the task is gone. The slot a task occupied is free
 /// for reuse the moment it is reaped, but the code it exited with can still be
-/// wanted - a milestone check reads it one tick later, and a `wait` syscall
-/// will read it one day. Capped, with the oldest entries dropped.
+/// wanted - a milestone check reads it one tick later, and `wait` reads it
+/// once. Reading it takes it: a code belongs to the one caller that collects
+/// it, and anything left over is dropped oldest-first when the cap is reached.
 static RETIRED: Mutex<RefCell<Vec<(TaskId, isize)>>> = Mutex::new(RefCell::new(Vec::new()));
-const RETIRED_CAP: usize = 16;
+const RETIRED_CAP: usize = 32;
 
 /// `critical_section::Mutex` requires its contents to be `Send`, and the table
 /// holds task bodies - `Box<dyn FnOnce()>`, which is not. On one core there is
@@ -169,6 +185,9 @@ struct Task {
     /// Signals sent to this task and not yet delivered. There are no handlers
     /// yet, so delivery means the task dies at its next blocking point.
     signals: signal::Pending,
+    /// The descriptors this task's fd numbers index. Kernel tasks share the
+    /// kernel's table; a process has one of its own.
+    fds: Arc<FdTable>,
     /// The task that spawned this one in ring 3, if any. Its `wait` blocks on
     /// this task's exit; kernel-spawned tasks have none.
     parent: Option<TaskId>,
@@ -177,7 +196,7 @@ struct Task {
 impl Task {
     /// The boot task: already running, with no body left to start and no stack
     /// of ours beneath it. Its context is empty until it first switches away.
-    const fn adopted() -> Task {
+    fn adopted() -> Task {
         Task {
             context: Context::empty(),
             priority: Priority::NORMAL,
@@ -188,6 +207,7 @@ impl Task {
             user_entry: None,
             user_frames: Vec::new(),
             signals: 0,
+            fds: crate::vfs::file::kernel_fds(),
             parent: None,
         }
     }
@@ -283,10 +303,11 @@ impl Table {
         picked.map(|id| self.enter(id))
     }
 
+    /// Slot 1 is left free on purpose - it is init's pid - and the top slot is
+    /// the scheduler's. Everything between them is first come, first served.
     fn alloc_slot(&mut self) -> usize {
-        self.tasks
-            .iter()
-            .position(Option::is_none)
+        (FIRST_ALLOC_SLOT..MAX_TASKS - 1)
+            .find(|&slot| self.tasks[slot].is_none())
             .unwrap_or_else(|| panic!("all {MAX_TASKS} task slots are in use"))
     }
 
@@ -300,6 +321,20 @@ impl Table {
         interruptible: bool,
     ) -> TaskId {
         let slot = self.alloc_slot();
+        self.create_at(slot, body, priority, interruptible)
+    }
+
+    /// [`create`](Self::create) in a slot the caller names, for the one task
+    /// that cannot take whatever is free: the scheduler, whose slot is
+    /// reserved so that it never collides with a pid.
+    fn create_at(
+        &mut self,
+        slot: usize,
+        body: impl FnOnce() + 'static,
+        priority: Priority,
+        interruptible: bool,
+    ) -> TaskId {
+        assert!(self.tasks[slot].is_none(), "slot {slot} is already taken");
         drop_retired(TaskId(slot));
 
         let stack = Stack::new();
@@ -317,6 +352,7 @@ impl Table {
             user_entry: None,
             user_frames: Vec::new(),
             signals: 0,
+            fds: crate::vfs::file::kernel_fds(),
             parent: None,
         });
         TaskId(slot)
@@ -382,7 +418,10 @@ pub fn init() {
         // returns and it is entered by switching to it rather than by being
         // picked. It starts with interrupts off and stays that way: the only
         // place it enables them is the idle halt.
-        let id = t.create(scheduler_loop, Priority::CRITICAL, false);
+        //
+        // Its slot is named rather than allocated, because it must never take
+        // the slot init is going to be born in.
+        let id = t.create_at(SCHED_ID.0, scheduler_loop, Priority::CRITICAL, false);
         assert_eq!(
             id, SCHED_ID,
             "the scheduler did not land in its reserved slot"
@@ -421,6 +460,61 @@ pub fn spawn_user(bytes: &[u8], priority: Priority) -> TaskId {
         .expect("spawn_user: not an ELF64 executable mpos can load")
 }
 
+/// Start the very first user process: init, in the slot that makes it pid 1.
+///
+/// Nothing spawns it, so nothing is its parent until it has children of its
+/// own; the boot task keeps no link, because it has no `wait` to collect with
+/// and a record nobody reads is a record that lies to the next `wait`.
+pub fn spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnError> {
+    let id = try_spawn_init(bytes, argv)?;
+    assert_eq!(id, INIT_PID, "init did not land on pid 1");
+    Ok(id)
+}
+
+/// [`spawn_init`] without the pid assertion, so the loader can be exercised
+/// before the slot layout is taken as given.
+pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnError> {
+    assert!(
+        STARTED.load(Ordering::Relaxed),
+        "spawn_init() was called before sched::init()"
+    );
+    let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
+    let user_rsp = initial_stack_rsp(argv).ok_or(SpawnError::ArgsTooBig)?;
+
+    with_table(|t| {
+        let slot = INIT_PID.0;
+        assert!(
+            t.tasks[slot].is_none(),
+            "init's slot {slot} is already taken"
+        );
+        drop_retired(INIT_PID);
+        let stack = Stack::new();
+        let mut space = AddressSpace::new();
+        let (entry, frames, stack_top_frame) = load_user(&mut space, &image);
+        write_arg_block(stack_top_frame, user_rsp, argv);
+
+        // Safety: as in `create`, the stack was just allocated and nothing else
+        // can reach it, so the bootstrap state below its top is ours to write.
+        let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, true) };
+
+        t.tasks[slot] = Some(Task {
+            context,
+            priority: Priority::NORMAL,
+            stack: Some(stack),
+            exited: false,
+            body: None,
+            space: Some(space),
+            user_entry: Some((entry, user_rsp)),
+            user_frames: frames,
+            signals: 0,
+            fds: Arc::new(FdTable::with_standard(crate::vfs::tty::global())),
+            parent: None,
+        });
+        t.sched.push_ready(INIT_PID, Priority::NORMAL);
+        Ok(INIT_PID)
+    })
+}
+
 /// [`spawn_user`] with arguments and a parent: the process form the `spawn`
 /// syscall uses. `argv` is the full argument vector, `argv[0]` being the
 /// program name as POSIX frames it - it does not have to match `bytes`' path.
@@ -457,6 +551,11 @@ pub fn try_spawn_user(
         // can reach it, so the bootstrap state below its top is ours to write.
         let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, true) };
 
+        // A process's descriptors are its own from the first instruction: the
+        // standard three over the console, and nothing of anyone else's. What
+        // it closes is then its business, not the shell's.
+        let fds = Arc::new(FdTable::with_standard(crate::vfs::tty::global()));
+
         t.tasks[slot] = Some(Task {
             context,
             priority,
@@ -467,10 +566,16 @@ pub fn try_spawn_user(
             user_entry: Some((entry, user_rsp)),
             user_frames: frames,
             signals: 0,
+            fds,
             parent: Some(parent),
         });
         let id = TaskId(slot);
         t.sched.push_ready(id, priority);
+        // A parent waiting for a child wakes here, in the same critical
+        // section that made the condition true.
+        if t.tasks.get(parent.0).and_then(Option::as_ref).is_some() {
+            t.sched.wake(parent);
+        }
         Ok(id)
     })
 }
@@ -619,20 +724,36 @@ pub fn sleep_ticks(ticks: u64) {
 /// the condition already true and does nothing, or it finds this task in the
 /// sleep queue and wakes it. There is no third state to fall into.
 ///
-/// `cond` runs with interrupts off, so it must be short and must never block;
-/// taking a nested critical section to read shared state is expected.
+/// Use [`block_until_on`] when the condition is the task table itself.
 pub fn block_until(cond: impl Fn() -> bool) {
+    block_until_on(|_| cond())
+}
+
+/// Block until `parent` has a live child - the wait init's shell takes to
+/// arrive, asked of the table rather than of a count of tasks.
+pub fn block_until_child(parent: TaskId) {
+    block_until_on(|t| child_alive(t, parent))
+}
+
+/// [`block_until`] for a condition that reads the task table.
+///
+/// The condition is handed the table instead of reaching for it, because the
+/// second look below happens while `schedule` already holds it: a condition
+/// that took its own critical section there would nest one inside another, and
+/// the inner release would hand interrupts back before the outer section is
+/// done. Taking the borrow as a parameter makes the shared case the easy one.
+fn block_until_on(cond: impl Fn(&Table) -> bool) {
     loop {
         // Signals are checked before the condition on every pass, so a fatal
         // signal kills a blocked task even if what it waited for also arrived.
         if let Some(sig) = take_pending_signal() {
             exit(-(sig as isize));
         }
-        if cond() {
+        if with_table(|t| cond(t)) {
             return;
         }
         schedule(|t| {
-            if cond() {
+            if cond(t) {
                 t.requeue_current();
             } else {
                 // u64::MAX means "until someone wakes me": the deadline
@@ -705,15 +826,46 @@ fn take_pending_signal() -> Option<u8> {
 pub fn exit(code: isize) -> ! {
     schedule(|t| {
         let id = t.current;
+        if id == INIT_PID {
+            // The one process the system cannot lose. Init is what waits for
+            // everything else; with it gone there is nothing left to run the
+            // machine's programs, and nothing to hand orphans to. The kernel
+            // has no second init to start, so it says so and stops.
+            crate::println!("INIT_EXITED: the system has no init left");
+            crate::arch::halt();
+        }
         t.task_mut(id).exited = true;
         record_retired(id, code);
-        // The parent's `wait` reads the code recorded above; waking it here,
-        // in the same critical section, is what closes the lost-wakeup
-        // window - either the parent has not slept yet and will find the code
-        // on its next look, or it is in the sleep queue this wake empties.
+
+        // Whoever was waiting on this task as its parent is woken here, in
+        // the same critical section that made the condition true: either it
+        // has not slept yet and will find the code on its next look, or it is
+        // in the sleep queue this wake empties. There is no third state.
         let parent = t.task(id).parent;
         if let Some(parent) = parent {
             t.sched.wake(parent);
+        }
+
+        // Its children outlive it, and a dead task cannot be anyone's parent -
+        // nor wait for anyone. They go to init, which waits for everything.
+        // Init itself is exempt: it has no parent to lose.
+        if id != INIT_PID {
+            let orphans: Vec<TaskId> = t
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, task)| {
+                    let task = task.as_ref()?;
+                    (task.parent == Some(id) && !task.exited).then_some(TaskId(slot))
+                })
+                .collect();
+            let adopted = !orphans.is_empty();
+            for orphan in orphans {
+                t.task_mut(orphan).parent = Some(INIT_PID);
+            }
+            if adopted {
+                t.sched.wake(INIT_PID);
+            }
         }
     });
     unreachable!("an exited task is never picked again")
@@ -723,6 +875,11 @@ pub fn exit(code: isize) -> ! {
 ///
 /// Recorded at exit, not at reap: the reader may come a tick later, after the
 /// slot has already been freed and handed to someone else.
+///
+/// This is the kernel's look; it takes nothing, so a milestone can read the
+/// same code twice. A process collecting its child's status uses
+/// [`wait_any_child`], which consumes the record, and [`take_exit_code`] for
+/// the pid it named.
 pub fn exit_code(id: TaskId) -> Option<isize> {
     critical_section::with(|cs| {
         RETIRED
@@ -733,6 +890,67 @@ pub fn exit_code(id: TaskId) -> Option<isize> {
             .find(|(retired, _)| *retired == id)
             .map(|(_, code)| *code)
     })
+}
+
+/// Collect this process's `pid`'s exit code, consuming the record. `None` when
+/// no death has been recorded for that pid since its slot was last reused.
+pub fn take_exit_code(id: TaskId) -> Option<isize> {
+    critical_section::with(|cs| {
+        let mut retired = RETIRED.borrow(cs).borrow_mut();
+        let at = retired.iter().rposition(|(retired, _)| *retired == id)?;
+        Some(retired.remove(at).1)
+    })
+}
+
+/// Block the caller until one of its children exits, then take that child's
+/// pid and code. A child that is already gone is reaped from the records
+/// without blocking; with none gone, the caller sleeps and is woken by
+/// [`exit`]'s parent wake.
+///
+/// The caller must be a task: this is `wait`'s core, and nothing else calls
+/// it.
+pub fn wait_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
+    // The condition is the table itself, so it is asked through the borrow
+    // `block_until_on` already holds rather than taking one of its own.
+    block_until_on(|t| any_child_code(t, parent).is_some());
+    with_table(|t| any_child_code(t, parent))
+}
+
+/// The pid and code of the oldest of `parent`'s children to have exited and
+/// not yet been collected, written as a `NO_CODE` marker when the caller only
+/// wants to know that a child died.
+///
+/// Nothing is consumed here: `wait_any_child` holds the table while it looks,
+/// and the record is taken afterwards, by pid, in [`take_exit_code`]. A
+/// read-only look keeps this function usable from the `block_until` closure,
+/// which must not wake anyone.
+fn any_child_code(t: &Table, parent: TaskId) -> Option<(TaskId, isize)> {
+    critical_section::with(|cs| {
+        RETIRED
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(id, _)| {
+                // The slot is spoken for by a live task: the record describes
+                // an older tenant of the same number, so it is not this
+                // parent's business.
+                let free = t.tasks[id.0].is_none();
+                let ours = free
+                    || t.tasks[id.0]
+                        .as_ref()
+                        .is_some_and(|task| task.parent == Some(parent));
+                ours && *id != parent
+            })
+            .map(|(id, code)| (*id, *code))
+    })
+}
+
+/// Give up on a record nobody will ever collect, so it cannot be mistaken for
+/// a fresh death by the next `wait`. Used by the boot task for init, which it
+/// hands to the system and never reaps.
+pub fn discard_exit_code(id: TaskId) {
+    take_exit_code(id);
 }
 
 fn record_retired(id: TaskId, code: isize) {
@@ -777,10 +995,52 @@ pub fn current() -> TaskId {
     with_table(|t| t.current)
 }
 
+/// The descriptor table of the running task: what its fd numbers index.
+///
+/// Before [`init`] there is no running task to ask - the boot code is not one
+/// yet - so the kernel's shared table answers, the same way [`spawn`] refuses
+/// to guess before it could know.
+pub fn current_fds() -> Arc<FdTable> {
+    if !STARTED.load(Ordering::Relaxed) {
+        return crate::vfs::file::kernel_fds();
+    }
+    let id = current();
+    with_table(|t| t.task(id).fds.clone())
+}
+
 /// How many tasks are alive, counting the two permanent ones. [`PERMANENT_TASKS`]
 /// is what this settles back to once everything a test started has been reaped.
 pub fn task_count() -> usize {
     with_table(|t| t.tasks.iter().filter(|slot| slot.is_some()).count())
+}
+
+/// Whether `id` names a live, un-exited task.
+///
+/// The question a starter asks about what it started: a task that exists and
+/// has not exited is one that is running or waiting to run, so whoever spawned
+/// it can stop holding its breath.
+pub fn is_alive(id: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|task| !task.exited)
+    })
+}
+
+/// Whether any child of `parent` is alive right now - what init's first shell
+/// looks like from the boot task's side of the hand-over.
+pub fn has_live_child(parent: TaskId) -> bool {
+    with_table(|t| child_alive(t, parent))
+}
+
+/// [`has_live_child`] against a table the caller already holds.
+fn child_alive(t: &Table, parent: TaskId) -> bool {
+    t.tasks.iter().enumerate().any(|(slot, task)| {
+        task.as_ref().is_some_and(|task| {
+            !task.exited && task.parent == Some(parent) && TaskId(slot) != parent
+        })
+    })
 }
 
 pub const fn permanent_tasks() -> usize {
@@ -797,7 +1057,39 @@ pub fn preempt() {
     if !STARTED.load(Ordering::Relaxed) || current() == SCHED_ID {
         return;
     }
+    // A task that never blocks would otherwise never see a signal: the clock
+    // is the one thing guaranteed to run while it spins. Delivering here is
+    // legal for the same reason being preempted is - the trap frame is on the
+    // task's own stack, and `exit` leaves it the way `requeue_current` does.
+    deliver_pending_signal();
     schedule(Table::requeue_current);
+}
+
+/// End the running task if a fatal signal is waiting, at whichever of the two
+/// points a task can be interrupted from: a blocking call, or the clock.
+///
+/// A signal that arrives while the task is spinning in ring 3 is delivered by
+/// the next tick, so no program can outlast a `kill` by never making a
+/// syscall. Called from interrupt context, where it must not block.
+pub fn deliver_pending_signal() {
+    if let Some(sig) = take_pending_signal() {
+        exit(-(sig as isize));
+    }
+}
+
+/// Turn interrupts on and wait for the next one.
+///
+/// The only sanctioned way to stand still. A task resumed by [`schedule`] has
+/// interrupts off - the switch saves the flags after its own `cli` - so a
+/// busy loop parks this core deaf to its own clock, its own keyboard and every
+/// other line. This is `sti; hlt`: the `sti` lets the interrupt through, the
+/// `hlt` stops the core until it arrives, and `idle` takes interrupts back off
+/// before returning so the caller is in the state `with_table` expects.
+///
+/// For a task with nothing left to do, and for the scheduler when the ready
+/// queue is empty.
+pub fn wait_for_interrupt() {
+    idle();
 }
 
 /// The one path off a task's stack.
@@ -836,9 +1128,8 @@ fn scheduler_loop() {
 
         if !switched {
             // Nothing to run. Halt with interrupts on so the next tick wakes us,
-            // and let `idle` turn them back off before the table is touched
-            // again.
-            idle();
+            // and let it turn them back off before the table is touched again.
+            wait_for_interrupt();
         }
     }
 }

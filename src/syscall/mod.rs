@@ -99,6 +99,11 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
             .map_err(|_| err::EINVAL)
     }
 
+    // A signal that arrived while the task was running is delivered before it
+    // gets to ask for anything: the same rule as `block_until`, applied at the
+    // other door into the kernel.
+    crate::sched::deliver_pending_signal();
+
     match nr {
         nr::EXIT => crate::sched::exit(args[0] as isize),
         nr::READ => {
@@ -265,6 +270,16 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
         }
         nr::WAIT => {
             let pid = args[0];
+            let me = crate::sched::current();
+            // -1 is POSIX's "any child", and it is what init wants: it starts
+            // a shell, waits for whichever child ends, and starts another.
+            // `usize::MAX` is how a negative of any width arrives here.
+            if pid == usize::MAX {
+                return match crate::sched::wait_any_child(me) {
+                    Some((_id, code)) => code,
+                    None => err::ECHILD,
+                };
+            }
             if pid == 0 || pid >= crate::sched::MAX_TASKS {
                 return err::ECHILD;
             }
@@ -272,12 +287,24 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // Only a live child of ours is worth blocking on. Anything else -
             // another task's child, a pid that never existed - either left a
             // record behind or gets ECHILD.
-            if crate::sched::is_child(id, crate::sched::current()) {
+            if crate::sched::is_child(id, me) {
                 crate::sched::block_until(|| crate::sched::exit_code(id).is_some());
             }
-            match crate::sched::exit_code(id) {
+            match crate::sched::take_exit_code(id) {
                 Some(code) => code,
                 None => err::ECHILD,
+            }
+        }
+        nr::DUP2 => {
+            // Duplicating a descriptor onto a number already in use is the
+            // POSIX way to redirect: the target is closed first, silently.
+            let (old, new) = (args[0] as i32, args[1] as i32);
+            if new < 0 {
+                return err::EBADF;
+            }
+            match crate::vfs::dup2(old, new) {
+                Ok(fd) => fd as isize,
+                Err(e) => err_of(e),
             }
         }
         nr::LISTDIR => {
@@ -342,6 +369,7 @@ mod tests {
         assert_eq!(nr::SPAWN, 10);
         assert_eq!(nr::WAIT, 11);
         assert_eq!(nr::LISTDIR, 12);
+        assert_eq!(nr::DUP2, 13);
     }
 
     #[test]

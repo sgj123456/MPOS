@@ -42,6 +42,9 @@ pub fn init() {
         table.alignment_check.set_handler_fn(alignment_check);
 
         table[pic::IRQ0_VECTOR].set_handler_fn(timer);
+        // IRQ4 is COM1 on every PC that has one: the console's input arrives
+        // here, a byte at a time, once `serial::enable_rx` has asked for it.
+        table[pic::IRQ0_VECTOR + 4].set_handler_fn(serial);
 
         super::syscall::register(&mut table);
 
@@ -62,6 +65,20 @@ extern "x86-interrupt" fn timer(_frame: InterruptStackFrame) {
     // block every interrupt until then.
     pic::end_of_interrupt(0);
     crate::sched::preempt();
+}
+
+/// The console's input. Every byte the UART has goes through the line
+/// discipline, which echoes it and wakes whoever is reading fd 0.
+///
+/// Nothing here may switch tasks. It does not have to: `receive_byte` edits
+/// the line and calls `sched::wake`, which only moves a task between queues,
+/// and the task it wakes runs when this handler returns and the scheduler
+/// next gets a turn - not here, on the interrupt's own stack.
+extern "x86-interrupt" fn serial(_frame: InterruptStackFrame) {
+    super::serial::drain_into_tty();
+    // After the FIFO is empty, so a byte arriving during the drain is not
+    // lost behind an EOI that already went out.
+    pic::end_of_interrupt(4);
 }
 
 /// Deliberately reachable from tests: `int3` must return here, not panic.

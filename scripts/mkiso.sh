@@ -65,6 +65,9 @@ if [[ "$ARCH" == "x86_64" ]]; then
     cp -r "$ROOT/initramfs" "$ROOTFS"
     mkdir -p "$ROOTFS/bin"
     cp "$USERBIN"/* "$ROOTFS/bin/"
+    # The mountpoint devfs is mounted over. Git cannot hold an empty directory,
+    # so the tree cannot be trusted to carry it.
+    mkdir -p "$ROOTFS/dev"
 
     cp "$KERNEL"                             "$STAGE/mpos.elf"
     cp limine.conf                           "$STAGE/limine.conf"

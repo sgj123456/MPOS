@@ -25,8 +25,9 @@ use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
 /// The whole surface of a character device, in the only units that make sense
 /// for one: bytes in, bytes out.
 ///
-/// `read` returning 0 is end of input, matching the `Inode` contract; there is
-/// no blocking yet, so devices with nothing to say say so immediately.
+/// `read` returning 0 is end of input, matching the `Inode` contract. A
+/// device with nothing to say yet may block instead: the tty does, and it is
+/// the device's own business to decide, not this trait's.
 pub trait CharDevice: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> usize;
     fn write(&self, buf: &[u8]) -> usize;

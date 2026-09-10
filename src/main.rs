@@ -49,7 +49,11 @@ pub extern "C" fn _start() -> ! {
         stats.total * PAGE_SIZE / MIB
     );
 
-    kernel_main(&info)
+    kernel_main(&info);
+    // The system never stops booting: `kernel_main` ends parked in the boot
+    // task, with init and its shell running. If it ever returned, the stack
+    // underneath is the bootloader's and there is nothing left to do with it.
+    arch::halt()
 }
 
 fn banner(info: &BootInfo) {
@@ -70,7 +74,10 @@ fn banner(info: &BootInfo) {
     println!("allocatable: {} MiB", info.allocatable_bytes() / MIB);
 }
 
-fn kernel_main(info: &BootInfo) -> ! {
+/// The boot task's whole life: prove the kernel works, then hand the machine
+/// to init and stand aside. It ends inside `m13`, which parks the boot task
+/// rather than returning - a system that stops running itself is not a system.
+fn kernel_main(info: &BootInfo) {
     m0();
     m1();
     m2(info);
@@ -83,7 +90,7 @@ fn kernel_main(info: &BootInfo) -> ! {
     m10();
     m11();
     m12();
-    qemu::exit(qemu::EXIT_SUCCESS)
+    m13();
 }
 
 /// The global allocator works end to end.
@@ -928,8 +935,25 @@ fn m7() {
     println!("M7_OK");
 }
 
-/// Writes go out to the console. Nothing arrives until there is a keyboard
-/// driver, so reads are end of input rather than a silent hang.
+/// The console as the line discipline has it: a write is output, and a read
+/// blocks for the next complete line from the input side. This is the tty the
+/// standard descriptors point at, so a program can reach it by name as
+/// `/dev/tty` rather than only by the number it was born with.
+struct TtyDev;
+
+impl vfs::devfs::CharDevice for TtyDev {
+    fn read(&self, buf: &mut [u8]) -> usize {
+        vfs::tty::global().read(buf)
+    }
+
+    fn write(&self, buf: &[u8]) -> usize {
+        mpos::console::write_bytes(buf);
+        buf.len()
+    }
+}
+
+/// Writes go out to the console. Nothing arrives, so reads are end of input
+/// rather than a silent hang.
 struct ConsoleDev;
 
 impl vfs::devfs::CharDevice for ConsoleDev {
@@ -990,6 +1014,7 @@ fn m8(info: &BootInfo) {
 
     // Devices mount over the /dev directory the archive provided.
     let dev = vfs::devfs::DevFs::new();
+    dev.register("tty", Arc::new(TtyDev));
     dev.register("console", Arc::new(ConsoleDev));
     dev.register("null", Arc::new(NullDev));
     dev.register("zero", Arc::new(ZeroDev));
@@ -1112,7 +1137,7 @@ fn m10() {
 
     // A second mount over the same device starts with an empty cache, so the
     // only thing that can come back is what truly reached the disk.
-    let fs2 = vfs::ext2::Ext2Fs::mount(dev).expect("remount the ext2 image");
+    let fs2 = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("remount the ext2 image");
     let back = fs2
         .root()
         .lookup("written.bin")
@@ -1137,7 +1162,23 @@ fn m10() {
     let n = seed.read_at(0, &mut buf).expect("read seed.txt back");
     assert_eq!(&buf[..n], SEED);
 
-    println!("ext2: {LEN} bytes written through /mnt, verified on a cold remount");
+    // Leave the image as the build made it. The disk outlives this boot - it
+    // is a file in build/ - so a file left behind here is still there next
+    // time, and the create above would then answer Exists.
+    vfs::resolve("/mnt")
+        .unwrap()
+        .unlink("written.bin")
+        .expect("unlink /mnt/written.bin");
+    // The same witness as before, in reverse: only a cold mount can say the
+    // name left the disk and not merely the cache of the mount that wrote it.
+    let fs3 = vfs::ext2::Ext2Fs::mount(dev).expect("remount after the unlink");
+    assert_eq!(
+        fs3.root().lookup("written.bin").err(),
+        Some(vfs::VfsError::NoEntry),
+        "written.bin is still on the disk after the unlink"
+    );
+
+    println!("ext2: {LEN} bytes written through /mnt, verified on a cold remount and removed");
     println!("M10_OK");
 }
 
@@ -1372,13 +1413,80 @@ fn m12() {
     sched::block_until(|| sched::exit_code(sh).is_some());
     let code = sched::exit_code(sh).expect("the shell exited");
     assert_eq!(code, 0, "the shell did not end cleanly: {code}");
-    drain();
+    discard();
     assert_eq!(
         sched::task_count(),
         sched::permanent_tasks(),
         "a process the shell started was never reaped"
     );
     println!("shell: ran the script, read its end of input, exited {code}");
+}
+
+/// Wait for every task a milestone started, and forget the codes they left.
+///
+/// [`drain`] waits; this also clears the records, because a milestone reads
+/// its codes with `exit_code` rather than by collecting them, and a record
+/// nobody ever takes is a record that lies to the next process to hold that
+/// pid - a `wait` would find a death that happened to somebody else.
+fn discard() {
+    drain();
+    for slot in 2..sched::MAX_TASKS - 1 {
+        sched::discard_exit_code(sched::TaskId(slot));
+    }
+}
+
+/// M13: a real system start. The checks above are the kernel proving itself;
+/// this is the kernel handing the machine over.
+///
+/// /bin/init becomes pid 1 - the slot is reserved for it - and the boot task
+/// steps out of the way. Init starts the shell, waits for it, and starts
+/// another, so the prompt outlives any single shell. The console's input comes
+/// from the UART's own interrupt from here on, which is what makes the shell
+/// interactive rather than something the kernel types into.
+///
+/// The machine does not stop. [`kernel_main`] leaves the boot task parked, and
+/// the system runs until QEMU is told to quit.
+fn m13() {
+    let init = vfs::read_file("/bin/init").expect("the initramfs carries /bin/init");
+    let argv = alloc::vec![String::from("init")];
+    let pid = sched::spawn_init(&init, &argv).expect("the init image loaded");
+    assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
+    println!("mpos: handing the machine to /bin/init");
+
+    // Init is the system's now, not the boot task's: it is never reaped and
+    // never waited for here, so the boot task must not keep a claim on it.
+    sched::discard_exit_code(pid);
+
+    // Real input from here on. Everything before this point was typed by the
+    // kernel so the checks could be scripted; the shell at the end of the line
+    // is reading a keyboard.
+    arch::serial::enable_rx();
+    // Wait until init has a child of its own, which is the shell and the point
+    // at which the system is up. Polled rather than `block_until`: the waker
+    // for "a task was spawned" is the spawner's own parent link, and this is
+    // not it - init is nobody's child, so nothing would ever wake the boot
+    // task out of that sleep. A tick-long nap is cheap and cannot miss.
+    while !sched::has_live_child(pid) {
+        sched::sleep_ticks(1);
+    }
+    println!("M13_OK");
+    park()
+}
+
+/// Where the boot task spends the rest of the machine's life.
+///
+/// A task switched out of `schedule` resumes with interrupts off - that is the
+/// switch's contract - so a `yield_now` loop would park this task with the CPU
+/// deaf to its own clock and its own keyboard. `wait_for_interrupt` is the one
+/// place that hands them back.
+///
+/// Parking here costs the system one task slot and the boot task's turns: it
+/// never requeues itself, so init and the shell get the CPU. The clock still
+/// ticks and the keyboard still interrupts, which is the whole point.
+fn park() -> ! {
+    loop {
+        sched::wait_for_interrupt();
+    }
 }
 
 #[panic_handler]

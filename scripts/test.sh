@@ -29,7 +29,7 @@ esac
 
 MARKERS=("$@")
 if [[ ${#MARKERS[@]} -eq 0 ]]; then
-    MARKERS=("M0_OK" "M1_OK" "M2_OK" "M3_OK" "M4_OK" "M6_OK" "M7_OK" "M8_OK" "M9_OK" "M10_OK" "M11_OK" "M12_OK")
+    MARKERS=("M0_OK" "M1_OK" "M2_OK" "M3_OK" "M4_OK" "M6_OK" "M7_OK" "M8_OK" "M9_OK" "M10_OK" "M11_OK" "M12_OK" "M13_OK")
 fi
 
 mkdir -p build
@@ -88,6 +88,10 @@ for marker in "${MARKERS[@]}"; do
     fi
 done
 
+# From M13 on, the kernel does not exit: it hands the machine to init and
+# stays up, so the watchdog killing QEMU is how a passing run ends. What makes
+# it a pass is the markers, not the exit status - which is why the marker loop
+# above runs first and this only has to tell "up and running" from "stuck".
 case "$rc" in
     "$CLEAN_EXIT") ;;
     "$PANIC_EXIT")
@@ -95,8 +99,11 @@ case "$rc" in
         status=1
         ;;
     124 | 137)
-        echo "FAIL  QEMU hung and was killed by the ${TIMEOUT}s watchdog"
-        status=1
+        if [[ $status -ne 0 ]]; then
+            echo "FAIL  QEMU was stopped by the ${TIMEOUT}s watchdog with markers missing"
+        else
+            echo "PASS  the system stayed up until the ${TIMEOUT}s watchdog stopped it"
+        fi
         ;;
     *)
         echo "FAIL  unexpected QEMU exit status $rc"
@@ -107,6 +114,13 @@ esac
 if grep -qF 'KERNEL PANIC' "$LOG"; then
     echo "FAIL  kernel panicked"
     grep -A3 'KERNEL PANIC' "$LOG"
+    status=1
+fi
+
+# Init dying is not a panic, but it is the end of the system: the kernel halts
+# rather than run a machine with nobody to start programs on.
+if grep -qF 'INIT_EXITED' "$LOG"; then
+    echo "FAIL  init exited"
     status=1
 fi
 

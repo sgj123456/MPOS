@@ -11,11 +11,14 @@ pub mod signal;
 #[cfg(target_os = "none")]
 mod runtime;
 
-#[cfg(target_os = "none")]
 pub use policy::{Priority, TaskId};
 #[cfg(target_os = "none")]
+pub use runtime::spawn_init;
+#[cfg(target_os = "none")]
 pub use runtime::{
-    ARGS_BYTES_MAX, ARGV_MAX, MAX_TASKS, STACK_ORDER, SpawnError, block_until, current, exit,
-    exit_code, init, is_child, pause, permanent_tasks, preempt, send_signal, sleep_ticks, spawn,
-    spawn_user, task_count, try_spawn_user, wake, yield_now,
+    ARGS_BYTES_MAX, ARGV_MAX, INIT_PID, MAX_TASKS, STACK_ORDER, SpawnError, block_until,
+    block_until_child, current, current_fds, deliver_pending_signal, discard_exit_code, exit,
+    exit_code, has_live_child, init, is_alive, is_child, pause, permanent_tasks, preempt,
+    send_signal, sleep_ticks, spawn, spawn_user, take_exit_code, task_count, try_spawn_user,
+    wait_any_child, wait_for_interrupt, wake, yield_now,
 };

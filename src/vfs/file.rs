@@ -1,12 +1,14 @@
-//! Open file descriptions and the fd table.
+//! Open file descriptions and the fd tables that name them.
 //!
 //! A [`File`] pairs an inode with a cursor. It is the thing fds name; several
 //! fds can share one `File` (fork semantics, at M9), and several `File`s can
 //! share one inode (independent cursors over the same bytes).
 //!
-//! The table is one global array for now, because every task is a kernel task
-//! and every fd means the same thing. M9 gives processes tables of their own;
-//! the `File` type will not change.
+//! An fd number only means something next to the table it indexes, and that
+//! table belongs to a task: [`FdTable`] is one process's descriptors. A user
+//! process is born with a table of its own holding the standard three, so what
+//! it closes is its business alone; kernel tasks share one table, because they
+//! are all the same caller and hand fds to each other freely.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -54,85 +56,176 @@ impl File {
     }
 }
 
-/// One slot per fd; `None` is free. Slots are reused lowest-first, which is
-/// what the fd contract promises callers may assume.
-static FDS: Mutex<RefCell<Vec<Option<Arc<File>>>>> = Mutex::new(RefCell::new(Vec::new()));
+/// One process's descriptors: one slot per fd, `None` is free, and slots are
+/// reused lowest-first, which is what the fd contract promises callers may
+/// assume.
+pub struct FdTable {
+    slots: Mutex<RefCell<Vec<Option<Arc<File>>>>>,
+}
 
-fn alloc(file: Arc<File>) -> RawFd {
-    critical_section::with(|cs| {
-        let mut fds = FDS.borrow(cs).borrow_mut();
-        match fds.iter().position(Option::is_none) {
-            Some(slot) => {
-                fds[slot] = Some(file);
-                slot as RawFd
-            }
-            None => {
-                fds.push(Some(file));
-                (fds.len() - 1) as RawFd
-            }
+impl FdTable {
+    pub fn new() -> FdTable {
+        FdTable {
+            slots: Mutex::new(RefCell::new(Vec::new())),
         }
+    }
+
+    /// A table holding only the three descriptors every POSIX program assumes
+    /// it was born with: one description of the console each for input,
+    /// output and error.
+    pub fn with_standard(tty: Arc<dyn Inode>) -> FdTable {
+        let table = FdTable::new();
+        table.push_standard(tty);
+        table
+    }
+
+    /// Add fds 0, 1 and 2 over one inode. Without them the first `pipe()`
+    /// would be handed fd 0.
+    fn push_standard(&self, tty: Arc<dyn Inode>) {
+        for _ in 0..3 {
+            self.install(Arc::new(File::new(tty.clone())));
+        }
+    }
+
+    fn install(&self, file: Arc<File>) -> RawFd {
+        critical_section::with(|cs| {
+            let mut slots = self.slots.borrow(cs).borrow_mut();
+            match slots.iter().position(Option::is_none) {
+                Some(slot) => {
+                    slots[slot] = Some(file);
+                    slot as RawFd
+                }
+                None => {
+                    slots.push(Some(file));
+                    (slots.len() - 1) as RawFd
+                }
+            }
+        })
+    }
+
+    /// The description `fd` names. Cloned out rather than borrowed: a read can
+    /// block for a line, and no lock may be held while it does.
+    fn get(&self, fd: RawFd) -> VfsResult<Arc<File>> {
+        critical_section::with(|cs| {
+            self.slots
+                .borrow(cs)
+                .borrow()
+                .get(usize::try_from(fd).unwrap_or(usize::MAX))
+                .cloned()
+                .flatten()
+                .ok_or(VfsError::BadFd)
+        })
+    }
+
+    /// Release an fd. The description dies when the last fd naming it does.
+    pub fn close(&self, fd: RawFd) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            let mut slots = self.slots.borrow(cs).borrow_mut();
+            let slot = usize::try_from(fd).map_err(|_| VfsError::BadFd)?;
+            slots
+                .get_mut(slot)
+                .filter(|entry| entry.is_some())
+                .ok_or(VfsError::BadFd)?
+                .take();
+            Ok(())
+        })
+    }
+
+    /// Make `new` name what `old` names, closing whatever `new` named first.
+    /// Equal numbers are a successful no-op, which is how POSIX spells a
+    /// duplicate that is already where it was asked to go.
+    pub fn dup2(&self, old: RawFd, new: RawFd) -> VfsResult<RawFd> {
+        let file = self.get(old)?;
+        let slot = usize::try_from(new).map_err(|_| VfsError::BadFd)?;
+        critical_section::with(|cs| {
+            let mut slots = self.slots.borrow(cs).borrow_mut();
+            while slots.len() <= slot {
+                slots.push(None);
+            }
+            slots[slot] = Some(file);
+        });
+        Ok(new)
+    }
+}
+
+impl Default for FdTable {
+    fn default() -> FdTable {
+        FdTable::new()
+    }
+}
+
+/// The table every kernel task shares. Kernel code has no process identity,
+/// and one task handing an fd to another - a pipe end, in m11 - only works if
+/// the numbers mean the same thing on both sides.
+static KERNEL_FDS: Mutex<RefCell<Option<Arc<FdTable>>>> = Mutex::new(RefCell::new(None));
+
+pub fn kernel_fds() -> Arc<FdTable> {
+    critical_section::with(|cs| {
+        KERNEL_FDS
+            .borrow(cs)
+            .borrow_mut()
+            .get_or_insert_with(|| Arc::new(FdTable::new()))
+            .clone()
     })
 }
 
-fn take(fd: RawFd) -> VfsResult<Arc<File>> {
-    critical_section::with(|cs| {
-        FDS.borrow(cs)
-            .borrow()
-            .get(usize::try_from(fd).unwrap_or(usize::MAX))
-            .cloned()
-            .flatten()
-            .ok_or(VfsError::BadFd)
-    })
+/// The fd table of whoever is calling. On the machine that is the running
+/// task's; on the host, where there are no tasks, it is the kernel's.
+#[cfg(target_os = "none")]
+fn current_table() -> Arc<FdTable> {
+    crate::sched::current_fds()
+}
+
+#[cfg(not(target_os = "none"))]
+fn current_table() -> Arc<FdTable> {
+    kernel_fds()
+}
+
+/// Give the kernel's own table the standard descriptors: three open
+/// descriptions of the console tty, one cursor each. Call once, at start-up,
+/// before anything opens a file.
+pub fn init_standard(tty: Arc<dyn Inode>) {
+    kernel_fds().push_standard(tty);
 }
 
 /// Resolve `path` and open a fresh description on it.
 pub fn open(path: &str) -> VfsResult<RawFd> {
     let inode = resolve(path)?;
-    Ok(alloc(Arc::new(File::new(inode))))
-}
-
-/// Put the standard descriptors in the table: three open descriptions of the
-/// console tty, fds 0 through 2, one cursor each. Every POSIX program assumes
-/// they exist before it runs - and without them, the first `pipe()` would be
-/// handed fd 0. Call once, at start-up, before anything opens a file.
-pub fn init_standard(tty: Arc<dyn Inode>) {
-    for _ in 0..3 {
-        alloc(Arc::new(File::new(tty.clone())));
-    }
+    Ok(current_table().install(Arc::new(File::new(inode))))
 }
 
 /// Open a fresh description on an inode already in hand - a pipe end, whose
 /// channel is anonymous and has no name to resolve.
 pub fn open_inode(inode: Arc<dyn Inode>) -> RawFd {
-    alloc(Arc::new(File::new(inode)))
+    current_table().install(Arc::new(File::new(inode)))
 }
 
 /// Read at the description's cursor, advancing it.
 pub fn read(fd: RawFd, buf: &mut [u8]) -> VfsResult<usize> {
-    take(fd)?.read(buf)
+    current_table().get(fd)?.read(buf)
 }
 
 /// Write at the description's cursor, advancing it.
 pub fn write(fd: RawFd, buf: &[u8]) -> VfsResult<usize> {
-    take(fd)?.write(buf)
+    current_table().get(fd)?.write(buf)
 }
 
-/// Release an fd. The description dies when the last fd naming it does.
+/// Release an fd, in the caller's own table.
 pub fn close(fd: RawFd) -> VfsResult<()> {
-    critical_section::with(|cs| {
-        let mut fds = FDS.borrow(cs).borrow_mut();
-        let slot = usize::try_from(fd).map_err(|_| VfsError::BadFd)?;
-        fds.get_mut(slot)
-            .filter(|entry| entry.is_some())
-            .ok_or(VfsError::BadFd)?
-            .take();
-        Ok(())
-    })
+    current_table().close(fd)
+}
+
+/// Duplicate one descriptor onto another, in the caller's own table. Returns
+/// `new`, so the caller can use the result without a second look.
+pub fn dup2(old: RawFd, new: RawFd) -> VfsResult<RawFd> {
+    current_table().dup2(old, new)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{File, close, open, read, write};
+    use alloc::sync::Arc;
+
+    use super::{FdTable, File, close, open, read, write};
     use crate::vfs::ramfs::RamFs;
     use crate::vfs::{FileSystem, NodeKind, VfsError};
 
@@ -199,5 +292,54 @@ mod tests {
         assert_eq!(read(fd, &mut buf).unwrap_err(), VfsError::BadFd);
         assert_eq!(write(-1, b"x").unwrap_err(), VfsError::BadFd);
         assert_eq!(open("/nope").unwrap_err(), VfsError::NoEntry);
+    }
+
+    fn file_on(name: &str) -> Arc<File> {
+        let inode = RamFs::new().root().create(name, NodeKind::File).unwrap();
+        Arc::new(File::new(inode))
+    }
+
+    #[test]
+    fn numbers_mean_nothing_without_the_table_they_index() {
+        let a = FdTable::new();
+        let b = FdTable::new();
+        let fd = a.install(file_on("f"));
+
+        // The same number in another process's table names nothing at all.
+        assert_eq!(b.get(fd).err(), Some(VfsError::BadFd));
+        b.close(fd).unwrap_err();
+    }
+
+    #[test]
+    fn a_fresh_process_starts_with_the_standard_three() {
+        let table = FdTable::with_standard(RamFs::new().root());
+        for fd in 0..3 {
+            table.get(fd).expect("every process is born with fd {fd}");
+        }
+        assert_eq!(table.get(3).err(), Some(VfsError::BadFd));
+        // Whatever it opens next lands past them: without the standard three
+        // the first pipe would be handed fd 0.
+        assert_eq!(table.install(file_on("f")), 3);
+    }
+
+    #[test]
+    fn dup2_points_a_second_number_at_the_same_description() {
+        let table = FdTable::new();
+        let fd = table.install(file_on("f"));
+
+        assert_eq!(table.dup2(fd, 2).unwrap(), 2);
+        assert!(Arc::ptr_eq(&table.get(fd).unwrap(), &table.get(2).unwrap()));
+
+        // The two numbers are independent: closing one leaves the other.
+        table.close(fd).unwrap();
+        assert_eq!(table.get(fd).err(), Some(VfsError::BadFd));
+        assert!(table.get(2).is_ok());
+
+        // Duplicating onto itself is the no-op POSIX says it is, and a number
+        // that names nothing cannot be duplicated from.
+        assert_eq!(table.dup2(2, 2).unwrap(), 2);
+        assert!(table.get(2).is_ok());
+        assert_eq!(table.dup2(7, 1).err(), Some(VfsError::BadFd));
+        assert_eq!(table.get(1).err(), Some(VfsError::BadFd));
     }
 }

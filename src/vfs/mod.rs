@@ -27,7 +27,7 @@ pub mod ramfs;
 pub mod tar;
 pub mod tty;
 
-pub use file::{File, RawFd, close, open, read, write};
+pub use file::{File, RawFd, close, dup2, open, read, write};
 pub use mount::{global, mount, mount_root, resolve};
 
 use alloc::string::String;
@@ -102,6 +102,14 @@ pub trait Inode: Send + Sync {
     /// that cannot represent a kind returns [`VfsError::Unsupported`].
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
         let _ = (name, kind);
+        Err(VfsError::Unsupported)
+    }
+
+    /// Drop the child called `name` from this directory. The node it named
+    /// lives on while anything still names it; the last name going is what
+    /// frees it.
+    fn unlink(&self, name: &str) -> VfsResult<()> {
+        let _ = name;
         Err(VfsError::Unsupported)
     }
 

@@ -56,6 +56,19 @@ fn sys1(number: u64, a1: usize) -> isize {
     ret
 }
 
+fn sys2(number: u64, a1: usize, a2: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") number as isize => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+        );
+    }
+    ret
+}
+
 fn sys3(number: u64, a1: usize, a2: usize, a3: usize) -> isize {
     let ret: isize;
     unsafe {
@@ -146,6 +159,17 @@ pub fn open(path: &[u8]) -> isize {
 
 pub fn close(fd: i32) -> isize {
     sys1(nr::CLOSE, fd as usize)
+}
+
+/// Make `new` name what `old` names, closing whatever `new` named first.
+/// Returns `new`, or a negative errno - EBADF when `old` names nothing.
+pub fn dup2(old: i32, new: i32) -> isize {
+    sys2(nr::DUP2, old as usize, new as usize)
+}
+
+/// This process's id. Init uses it to say who it is; nothing else needs it.
+pub fn getpid() -> isize {
+    sys0(nr::GETPID)
 }
 
 /// Run the program at `path` with `args` - the full argument vector, argv[0]
