@@ -6,6 +6,7 @@ pub mod context;
 pub mod critical;
 pub mod gdt;
 pub mod idt;
+pub mod linux_syscall;
 pub mod paging;
 pub mod pic;
 pub mod syscall;
@@ -44,6 +45,7 @@ pub fn init_interrupts() {
     idt::init();
     pic::remap();
     timer::init();
+    linux_syscall::init();
 }
 
 pub fn halt() -> ! {

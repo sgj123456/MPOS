@@ -175,7 +175,7 @@ pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
 /// halves of every make-or-remove, since the name edge lives in the parent.
 /// `/f` is the root and `f`; a path with no slash has no parent here to name,
 /// and `.` and `..` are directories that already exist, not names to make.
-fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
+pub(crate) fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
     let trimmed = path.trim_end_matches('/');
     let Some(slash) = trimmed.rfind('/') else {
         return Err(VfsError::Invalid);

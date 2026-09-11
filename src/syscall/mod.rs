@@ -16,6 +16,10 @@
 /// The syscall numbers, in a file of their own so user programs can include it.
 pub mod nr;
 
+/// Linux x86_64 syscall number mapping.
+#[cfg(target_os = "none")]
+pub mod linux;
+
 /// File-related syscall handlers (READ, WRITE, OPEN, CLOSE, CREATE, UNLINK,
 /// LISTDIR, DUP2, CHDIR, PIPE).
 #[cfg(target_os = "none")]
@@ -42,10 +46,18 @@ pub mod err {
     pub const ENOTDIR: isize = -20;
     pub const EISDIR: isize = -21;
     pub const EINVAL: isize = -22;
+    pub const ENOMEM: isize = -12;
     pub const EFBIG: isize = -27;
     pub const ENOSPC: isize = -28;
+    pub const ERANGE: isize = -34;
     pub const EPIPE: isize = -32;
     pub const ENOSYS: isize = -38;
+    pub const EPERM: isize = -1;
+    pub const EOPNOTSUPP: isize = -95;
+    pub const ENOIOCTLCMD: isize = -515;
+    pub const EWOULDBLOCK: isize = -11;
+    pub const EINTR: isize = -4;
+    pub const ENOTTY: isize = -25;
 }
 
 /// How many register arguments a syscall may pass.
@@ -86,7 +98,11 @@ pub(crate) fn buffer_ok(buf: usize, len: usize, write: bool, from_user: bool) ->
 
 /// Parse a path argument from a (ptr, len) pair into an owned String.
 #[cfg(target_os = "none")]
-pub(crate) fn path_arg(ptr: usize, len: usize, from_user: bool) -> Result<alloc::string::String, isize> {
+pub(crate) fn path_arg(
+    ptr: usize,
+    len: usize,
+    from_user: bool,
+) -> Result<alloc::string::String, isize> {
     if len == 0 || len > MAX_PATH {
         return Err(err::EINVAL);
     }
@@ -132,6 +148,13 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
         _ => err::ENOSYS,
     }
+}
+
+/// Dispatch a Linux x86_64 syscall number.
+#[cfg(target_os = "none")]
+pub fn linux_dispatch(nr: u64, args: [usize; ARG_COUNT]) -> isize {
+    crate::sched::deliver_pending_signal();
+    linux::dispatch(nr, args)
 }
 
 #[cfg(all(test, not(target_os = "none")))]

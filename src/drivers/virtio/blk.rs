@@ -16,8 +16,8 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use crate::drivers::pci;
 use crate::blk::BlockDev;
+use crate::drivers::pci;
 use crate::mm::{self, PAGE_SIZE};
 
 const VENDOR_VIRTIO: u16 = 0x1af4;

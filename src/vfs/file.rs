@@ -41,6 +41,18 @@ impl File {
         self.inode.metadata()
     }
 
+    pub fn inode(&self) -> Arc<dyn Inode> {
+        self.inode.clone()
+    }
+
+    pub fn pos(&self) -> u64 {
+        self.pos.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pos(&self, new_pos: u64) {
+        self.pos.store(new_pos, Ordering::Relaxed);
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         let pos = self.pos.load(Ordering::Relaxed);
         let n = self.inode.read_at(pos, buf)?;
@@ -87,7 +99,7 @@ impl FdTable {
         }
     }
 
-    fn install(&self, file: Arc<File>) -> RawFd {
+    pub fn install(&self, file: Arc<File>) -> RawFd {
         critical_section::with(|cs| {
             let mut slots = self.slots.borrow(cs).borrow_mut();
             match slots.iter().position(Option::is_none) {
