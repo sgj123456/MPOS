@@ -7,10 +7,7 @@ pub mod critical;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
-pub mod pci;
 pub mod pic;
-pub mod qemu;
-pub mod serial;
 pub mod syscall;
 pub mod timer;
 

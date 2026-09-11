@@ -1,4 +1,9 @@
-//! Kernel console. Architecture-agnostic formatting over `arch::serial`.
+//! Kernel console — architecture-agnostic formatting over `arch::serial`.
+//!
+//! This module is a **kernel-wide service**, not a driver or a VFS component.
+//! It wraps the raw serial driver with interrupt-safe output and provides the
+//! `println!` macro. Callers include the kernel itself (`println!`), the TTY
+//! line discipline (echo output), and the syscall `write` handler.
 
 use core::fmt::{self, Write};
 
@@ -6,13 +11,13 @@ pub struct Console;
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        crate::arch::serial::write_bytes(s.as_bytes());
+        crate::drivers::serial::write_bytes(s.as_bytes());
         Ok(())
     }
 }
 
 pub fn init() {
-    crate::arch::serial::init();
+    crate::drivers::serial::init();
 }
 
 /// Write raw bytes on the console, as one uninterruptible chunk.
@@ -21,7 +26,7 @@ pub fn init() {
 /// arguments, and the same line-at-a-time exclusion as [`print_args`] so a
 /// preempted task cannot interleave into the middle of one.
 pub fn write_bytes(bytes: &[u8]) {
-    critical_section::with(|_| crate::arch::serial::write_bytes(bytes));
+    critical_section::with(|_| crate::drivers::serial::write_bytes(bytes));
 }
 
 #[doc(hidden)]

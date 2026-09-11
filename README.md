@@ -161,6 +161,8 @@ cargo build --target x86_64-unknown-none
 
 This script compiles the kernel, compiles each user program with `rustc` (standalone, static, `ET_EXEC`), assembles the initramfs tar, creates a bootable ISO supporting dual BIOS+UEFI El Torito boot, and formats an 8 MiB ext2 disk image.
 
+> **Note:** `third_party/limine/` holds the Limine bootloader binaries and is gitignored. It is populated automatically by `scripts/fetch-limine.sh` (called once before the first build). The directory is created with `mkdir -p` if absent.
+
 ### Cross-Architecture
 
 ```bash

@@ -23,9 +23,12 @@ pub mod blk;
 pub mod boot;
 #[cfg(target_os = "none")]
 pub mod console;
+#[cfg(target_os = "none")]
+pub mod drivers;
 pub mod mm;
 pub mod sched;
 pub mod shell;
+pub mod sync;
 pub mod syscall;
 pub mod vfs;
 

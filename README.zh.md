@@ -161,6 +161,8 @@ cargo build --target x86_64-unknown-none
 
 此脚本编译内核、用 `rustc` 编译每个用户程序（独立、静态、`ET_EXEC`）、组装 initramfs tar、创建支持 BIOS+UEFI 双 El Torito 引导的可引导 ISO，并格式化一个 8 MiB ext2 磁盘镜像。
 
+> **注意：** `third_party/limine/` 存放 Limine 引导加载器二进制文件，已被 gitignore。通过 `scripts/fetch-limine.sh` 自动填充（首次构建前运行一次）。若目录不存在，脚本会自动创建。
+
 ### 交叉架构
 
 ```bash

@@ -75,7 +75,7 @@ extern "x86-interrupt" fn timer(_frame: InterruptStackFrame) {
 /// and the task it wakes runs when this handler returns and the scheduler
 /// next gets a turn - not here, on the interrupt's own stack.
 extern "x86-interrupt" fn serial(_frame: InterruptStackFrame) {
-    super::serial::drain_into_tty();
+    crate::drivers::serial::drain_into_tty();
     // After the FIFO is empty, so a byte arriving during the drain is not
     // lost behind an EOI that already went out.
     pic::end_of_interrupt(4);
@@ -123,7 +123,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         code,
         frame.instruction_pointer
     );
-    crate::arch::qemu::exit(crate::arch::qemu::EXIT_FAILURE)
+    crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_FAILURE)
 }
 
 fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
@@ -134,5 +134,5 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
         frame.instruction_pointer,
         frame.stack_pointer
     );
-    crate::arch::qemu::exit(crate::arch::qemu::EXIT_FAILURE)
+    crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_FAILURE)
 }

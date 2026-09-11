@@ -23,6 +23,3 @@ pub trait BlockDev: Send + Sync {
     /// Write whole sectors from `buf`, under the same contract as [`read_at`].
     fn write_at(&self, offset: u64, buf: &[u8]);
 }
-
-#[cfg(target_os = "none")]
-pub mod virtio;

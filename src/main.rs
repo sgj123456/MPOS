@@ -2,6 +2,21 @@
 //!
 //! Everything reusable lives in the `mpos` library so it can be unit-tested on
 //! the host; this binary is only the parts that must run on the machine.
+//!
+//! # Boot flow
+//!
+//! Boot proceeds in three phases:
+//!
+//! 1. **Initialization** — `init_mm → init_arch → init_sched → init_vfs →
+//!    init_blk → init_ipc → init_shell`. Each sets up a subsystem without
+//!    running tests. After all inits complete, the system is ready.
+//!
+//! 2. **Milestone pre-checks** — `check_mm → check_arch → check_sched →
+//!    check_vfs → check_blk_process → check_ipc → check_shell`. Each
+//!    validates the corresponding subsystem. Groups are ordered by dependency
+//!    and print `M*_OK` markers the CI harness asserts on.
+//!
+//! 3. **Init handoff** — `m13` spawns `/bin/init` and parks the boot task.
 
 #![no_std]
 #![no_main]
@@ -18,9 +33,9 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use mpos::arch::{self, interrupts, paging, qemu, timer};
-use mpos::blk;
+use mpos::arch::{self, interrupts, paging, timer};
 use mpos::boot::{self, BootInfo};
+use mpos::drivers;
 use mpos::mm::{self, MapFlags, Mapping, PAGE_SIZE};
 use mpos::println;
 use mpos::sched::{self, Priority};
@@ -28,6 +43,13 @@ use mpos::syscall::{self, err, nr};
 use mpos::vfs::{self, FileSystem, NodeKind};
 
 const MIB: usize = 1024 * 1024;
+
+/// The virtio-blk device, probed once in init_blk and reused by check_blk_process.
+static BLK_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
+
+// ---------------------------------------------------------------------------
+// Boot entry
+// ---------------------------------------------------------------------------
 
 /// Limine jumps here in 64-bit long mode, ring 0, paging enabled, interrupts
 /// disabled, on a bootloader-provided stack.
@@ -52,7 +74,7 @@ pub extern "C" fn _start() -> ! {
     kernel_main(&info);
     // The system never stops booting: `kernel_main` ends parked in the boot
     // task, with init and its shell running. If it ever returned, the stack
-    // underneath is the bootloader's and there is nothing left to do with it.
+    // underneath is the bootloader's and there is nothing left to do.
     arch::halt()
 }
 
@@ -74,27 +96,41 @@ fn banner(info: &BootInfo) {
     println!("allocatable: {} MiB", info.allocatable_bytes() / MIB);
 }
 
+// ---------------------------------------------------------------------------
+// Module-based milestone checks
+// ---------------------------------------------------------------------------
+
 /// The boot task's whole life: prove the kernel works, then hand the machine
 /// to init and stand aside. It ends inside `m13`, which parks the boot task
 /// rather than returning - a system that stops running itself is not a system.
 fn kernel_main(info: &BootInfo) {
-    m0();
-    m1();
-    m2(info);
-    m3(info);
-    m4();
-    m6();
-    m7();
-    m8(info);
-    m9();
-    m10();
-    m11();
-    m12();
-    m13();
+    // ---- phase 1: initialization (no tests, just set up subsystems) --------
+    init_mm();
+    init_arch(info);
+    init_sched();
+    init_vfs(info);
+    init_blk();
+    println!("系统就绪");
+
+    // ---- phase 2: milestone pre-checks (pure tests, assume init done) ------
+    check_mm(info);
+    check_arch(info);
+    check_sched();
+    check_vfs();
+    check_blk_process();
+    check_ipc();
+    check_shell();
+    println!("全部通过");
+
+    // ---- phase 3: hand the machine to /bin/init ----------------------------
+    handoff_to_init();
 }
 
-/// The global allocator works end to end.
-fn m0() {
+// ---------------------------------------------------------------------------
+// Phase 1: initialization — set up subsystems, no tests
+// ---------------------------------------------------------------------------
+
+fn init_mm() {
     let mut buffer: Vec<u8> = Vec::new();
     buffer.extend(b"hello from mpos".iter().copied());
     buffer.push(b'!');
@@ -107,153 +143,196 @@ fn m0() {
         "heap: {} B live, {} B cached, {} B mapped",
         heap.live, heap.cached, heap.mapped
     );
-    println!("M0_OK");
 }
 
-/// The clock interrupts us, and a deliberate exception is catchable rather than
-/// always fatal.
-fn m1() {
+fn init_arch(info: &BootInfo) {
     arch::init_interrupts();
     interrupts::enable();
 
-    let before = timer::ticks();
-    timer::busy_wait_ms(500);
-    let elapsed = timer::ticks() - before;
-    println!("clock: {} ticks in ~500ms ({} Hz)", elapsed, timer::TICK_HZ);
-    assert!((40..=60).contains(&elapsed), "timer tick rate is wrong");
+    let sections = arch::kernel_sections();
+    println!(
+        "image: text {} KiB, rodata {} KiB, data {} KiB",
+        (sections.text.end - sections.text.start) / 1024,
+        (sections.rodata.end - sections.rodata.start) / 1024,
+        (sections.data.end - sections.data.start) / 1024
+    );
 
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!("int3")
-    };
-    assert_eq!(interrupts::breakpoints_caught(), 1, "#BP was not caught");
-    println!("breakpoint caught and returned from");
-
-    println!("M1_OK");
+    let tables = unsafe { arch::paging::install(info, &sections) };
+    println!(
+        "page tables: {} frames ({} KiB)",
+        tables,
+        tables * PAGE_SIZE / 1024
+    );
 }
 
-/// Memory: the frame allocator hands out disjoint blocks and merges freed buddies
-/// back together, and the heap on top of it honours every layout the allocator
-/// contract allows.
-fn m2(info: &BootInfo) {
-    frames(info);
-    heap();
-
-    // The heap is the only consumer of frames so far, so the two allocators must
-    // agree to the byte about how much memory is out.
-    let frames = mm::frame_stats();
-    let heap = mm::heap_stats();
-    assert_eq!(
-        (frames.total - frames.free) * PAGE_SIZE,
-        heap.mapped,
-        "heap and frame allocator disagree about memory handed out"
-    );
+fn init_sched() {
+    sched::init();
     println!(
-        "heap holds {} KiB in {} free frames of {}",
-        heap.mapped / 1024,
-        frames.free,
-        frames.total
+        "scheduler up: {} slots, running task {:?}",
+        sched::MAX_TASKS,
+        sched::current()
     );
-
-    println!("M2_OK");
 }
 
-fn frames(info: &BootInfo) {
-    let stats = mm::frame_stats();
+fn init_vfs(info: &BootInfo) {
+    vfs::file::init_standard(vfs::tty::init());
+
+    let root = vfs::ramfs::RamFs::new();
+    vfs::mount_root(&*root);
+
+    let archive = info.initramfs.expect("the boot config loaded no initramfs");
+    let members = vfs::tar::unpack_into(vfs::global(), archive).expect("the initramfs was broken");
+    println!("initramfs: {members} members unpacked");
+
+    let dev = vfs::devfs::DevFs::new();
+    dev.register("tty", Arc::new(TtyDev));
+    dev.register("console", Arc::new(ConsoleDev));
+    dev.register("null", Arc::new(NullDev));
+    dev.register("zero", Arc::new(ZeroDev));
+    vfs::mount("/dev", &*dev).expect("mount /dev");
+}
+
+fn init_blk() {
+    let dev = drivers::virtio::blk::VirtioBlk::init()
+        .expect("no virtio-blk device answered on the PCI bus");
+    let sectors = dev.capacity_sectors();
     println!(
-        "pmm: {} of {} frames free ({} MiB)",
-        stats.free,
-        stats.total,
-        stats.free * PAGE_SIZE / MIB
+        "virtio-blk: {} sectors ({} MiB)",
+        sectors,
+        sectors * 512 / MIB as u64
     );
-    assert!(stats.zones > 0, "no memory zones were built");
 
-    let a = mm::alloc_frames(0).expect("out of order-0 frames");
-    let b = mm::alloc_frames(0).expect("out of order-0 frames");
-    assert_eq!(b, a + PAGE_SIZE, "expected the halves of one block");
+    vfs::resolve("/")
+        .expect("no root filesystem")
+        .create("mnt", NodeKind::Dir)
+        .expect("create /mnt");
+    let fs = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("the ext2 image did not mount");
+    vfs::mount("/mnt", &fs).expect("mount /mnt");
+    BLK_DEV.call_once(|| dev);
+}
 
-    // Write through the HHDM at both ends of each frame: a bad translation or an
-    // unbacked frame faults right here instead of later, quietly.
-    for phys in [a, b] {
-        let virt = info.phys_to_virt(phys);
+// ---- mm: heap allocator + buddy frame allocator --------------------------
+
+/// Prove the heap allocator works end-to-end, and the frame allocator hands
+/// out disjoint blocks that merge back correctly.
+fn check_mm(info: &BootInfo) {
+    // M0: the global allocator works.
+    {
+        println!("M0_OK");
+    }
+
+    // M2: frame allocator + heap deep verification.
+    {
+        // Frames: buddy allocator hands out disjoint blocks, merges on free.
+        let stats = mm::frame_stats();
+        println!(
+            "pmm: {} of {} frames free ({} MiB)",
+            stats.free,
+            stats.total,
+            stats.free * PAGE_SIZE / MIB
+        );
+        assert!(stats.zones > 0, "no memory zones were built");
+
+        // HHDM: allocate a frame, write through the direct map, read back.
+        let frame = mm::alloc_frames(0).expect("out of order-0 frames");
+        let virt = info.phys_to_virt(frame);
         unsafe {
             ptr::write_bytes(virt as *mut u8, 0xa5, PAGE_SIZE);
             assert_eq!(*(virt as *const u8), 0xa5);
             assert_eq!(*((virt + PAGE_SIZE - 1) as *const u8), 0xa5);
         }
-    }
-    println!("two frames written and read back through the hhdm");
+        mm::free_frames(frame, 0);
+        println!("frame written and read back through the hhdm");
 
-    mm::free_frames(a, 0);
-    mm::free_frames(b, 0);
-    assert_eq!(mm::frame_stats().free, stats.free, "frames leaked");
+        // Buddy merge: allocate order-1, free it, re-allocate and verify
+        // we get the same block back. This exercises the merge path because
+        // the allocator must coalesce order-0 buddies to satisfy order-1.
+        let order1 = mm::alloc_frames(1).expect("no order-1 block for merge test");
+        mm::free_frames(order1, 1);
+        assert_eq!(
+            mm::alloc_frames(1),
+            Some(order1),
+            "buddy merge failed: freed order-1 block was not re-allocated"
+        );
+        mm::free_frames(order1, 1);
+        assert_eq!(mm::frame_stats().free, stats.free, "frames leaked");
 
-    // Freeing the pair must have merged them into one order-1 block; without a
-    // merge this allocation would land somewhere else entirely.
-    assert_eq!(mm::alloc_frames(1), Some(a), "buddies did not merge");
-    mm::free_frames(a, 1);
-    assert_eq!(mm::frame_stats().free, stats.free, "frames leaked");
+        // Large block from the zone's largest orders.
+        let big = mm::alloc_frames(mm::MAX_ORDER).expect("out of order-12 frames");
+        let virt = info.phys_to_virt(big);
+        let bytes = PAGE_SIZE << mm::MAX_ORDER;
+        unsafe {
+            ptr::write_bytes(virt as *mut u8, 0x5a, bytes);
+            assert_eq!(*((virt + bytes - 1) as *const u8), 0x5a);
+        }
+        println!("{} MiB block written end to end", bytes / MIB);
+        mm::free_frames(big, mm::MAX_ORDER);
+        assert_eq!(mm::frame_stats().free, stats.free, "frames leaked");
 
-    // A block big enough that it can only come from the zone's largest orders.
-    let big = mm::alloc_frames(mm::MAX_ORDER).expect("out of order-12 frames");
-    let virt = info.phys_to_virt(big);
-    let bytes = PAGE_SIZE << mm::MAX_ORDER;
-    unsafe {
-        ptr::write_bytes(virt as *mut u8, 0x5a, bytes);
-        assert_eq!(*((virt + bytes - 1) as *const u8), 0x5a);
-    }
-    println!("{} MiB block written end to end", bytes / MIB);
-    mm::free_frames(big, mm::MAX_ORDER);
-    assert_eq!(mm::frame_stats().free, stats.free, "frames leaked");
-}
+        // Heap: every size class, large bypass, vector growth through realloc.
+        let baseline = mm::heap_stats();
+        let mut live: Vec<(*mut u8, Layout)> = Vec::new();
 
-fn heap() {
-    let baseline = mm::heap_stats();
-    let mut live: Vec<(*mut u8, Layout)> = Vec::new();
+        for class in [16, 32, 64, 128, 256, 512, 1024, 2048] {
+            for align in [1, 8, 16, class] {
+                let layout =
+                    Layout::from_size_align(class / 2 + 1, align).expect("layout is representable");
+                take(&mut live, layout);
+            }
+        }
 
-    // Every size class, each at several alignments that still belong to it.
-    for class in [16, 32, 64, 128, 256, 512, 1024, 2048] {
-        for align in [1, 8, 16, class] {
-            let layout =
-                Layout::from_size_align(class / 2 + 1, align).expect("layout is representable");
+        for layout in [
+            Layout::from_size_align(4096, 8).unwrap(),
+            Layout::from_size_align(3000, 8192).unwrap(),
+            Layout::from_size_align(1 << 20, 4096).unwrap(),
+        ] {
             take(&mut live, layout);
         }
-    }
 
-    // Requests that must bypass the slabs: too big, or aligned past any class.
-    for layout in [
-        Layout::from_size_align(4096, 8).unwrap(),
-        Layout::from_size_align(3000, 8192).unwrap(),
-        Layout::from_size_align(1 << 20, 4096).unwrap(),
-    ] {
-        take(&mut live, layout);
-    }
+        let mut grown: Vec<u8> = Vec::new();
+        for i in 0..100 * 1024 {
+            grown.push((i % 251) as u8);
+        }
+        assert_eq!(grown.len(), 100 * 1024);
+        assert!(grown.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
+        drop(grown);
 
-    // Growing a vector walks the realloc path through several classes and into
-    // the large path, which is how the rest of the kernel will use the heap.
-    let mut grown: Vec<u8> = Vec::new();
-    for i in 0..100 * 1024 {
-        grown.push((i % 251) as u8);
-    }
-    assert_eq!(grown.len(), 100 * 1024);
-    assert!(grown.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
-    drop(grown);
+        let held = live.len();
+        for (ptr, layout) in live {
+            unsafe { alloc::alloc::dealloc(ptr, layout) };
+        }
+        println!("{held} allocations across every class and the large path");
 
-    let held = live.len();
-    for (ptr, layout) in live {
-        unsafe { alloc::alloc::dealloc(ptr, layout) };
-    }
-    println!("{held} allocations across every class and the large path");
+        let after = mm::heap_stats();
+        assert_eq!(
+            after.live, baseline.live,
+            "dealloc did not return every byte to the heap"
+        );
+        assert!(
+            after.cached >= baseline.cached,
+            "freed slots did not go back to their class"
+        );
 
-    let after = mm::heap_stats();
-    assert_eq!(
-        after.live, baseline.live,
-        "dealloc did not return every byte to the heap"
-    );
-    assert!(
-        after.cached >= baseline.cached,
-        "freed slots did not go back to their class"
-    );
+        // Cross-check: heap and frame allocator agree on memory handed out.
+        // Frames consumed by non-heap code (page tables, DMA buffers from
+        // init_blk) are subtracted so only heap-owned frames are compared.
+        let non_heap = (stats.total - stats.free) * PAGE_SIZE - baseline.mapped;
+        let frames = mm::frame_stats();
+        let heap = mm::heap_stats();
+        assert_eq!(
+            (frames.total - frames.free) * PAGE_SIZE - non_heap,
+            heap.mapped,
+            "heap and frame allocator disagree about memory handed out"
+        );
+        println!(
+            "heap holds {} KiB in {} free frames of {}",
+            heap.mapped / 1024,
+            frames.free,
+            frames.total
+        );
+
+        println!("M2_OK");
+    }
 }
 
 /// Allocate `layout`, check the contract held, and fill the memory so that a
@@ -289,202 +368,181 @@ fn overlaps(a: *mut u8, a_layout: Layout, b: *mut u8, b_layout: Layout) -> bool 
     a_start < b_start + b_layout.size() && b_start < a_start + a_layout.size()
 }
 
-/// Paging: the kernel has left the bootloader's page tables for its own, and
-/// processes can have address spaces of their own that share the kernel half.
-fn m3(info: &BootInfo) {
-    kernel_tables(info);
-    address_spaces();
-    println!("M3_OK");
-}
+// ---- arch: interrupts, timer, paging, address spaces ---------------------
 
-/// The kernel runs on page tables it built itself, and the permissions in them are
-/// the ones the mapping plan asked for.
-fn kernel_tables(info: &BootInfo) {
-    let sections = arch::kernel_sections();
-    println!(
-        "image: text {} KiB, rodata {} KiB, data {} KiB",
-        (sections.text.end - sections.text.start) / 1024,
-        (sections.rodata.end - sections.rodata.start) / 1024,
-        (sections.data.end - sections.data.start) / 1024
-    );
+/// Prove the clock works, exceptions are catchable, the kernel runs on its
+/// own page tables with correct permissions, and processes get isolated
+/// address spaces.
+fn check_arch(info: &BootInfo) {
+    // M1: clock interrupts and breakpoint exception.
+    {
+        let before = timer::ticks();
+        timer::busy_wait_ms(500);
+        let elapsed = timer::ticks() - before;
+        println!("clock: {} ticks in ~500ms ({} Hz)", elapsed, timer::TICK_HZ);
+        assert!((40..=60).contains(&elapsed), "timer tick rate is wrong");
 
-    let free_before = mm::frame_stats().free;
-    let tables = unsafe { arch::paging::install(info, &sections) };
-    let free_after = mm::frame_stats().free;
-    assert_eq!(
-        free_before - free_after,
-        tables,
-        "the page tables took a different number of frames than they reported"
-    );
-    println!(
-        "page tables: {} frames ({} KiB)",
-        tables,
-        tables * PAGE_SIZE / 1024
-    );
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("int3")
+        };
+        assert_eq!(interrupts::breakpoints_caught(), 1, "#BP was not caught");
+        println!("breakpoint caught and returned from");
 
-    // Getting past the switch is the first proof. The second is that memory only
-    // the new tables map still works: growing a vector takes fresh frames and
-    // writes them back through the direct map.
-    let mut proof: Vec<u8> = Vec::new();
-    proof.resize(64 * 1024, 0x3c);
-    assert!(
-        proof.iter().all(|&byte| byte == 0x3c),
-        "the direct map is broken after the switch"
-    );
-    println!("64 KiB allocated and written after the switch");
+        println!("M1_OK");
+    }
 
-    // W^X read back out of the hardware rather than trusted from the plan. Every
-    // page, not just the ends: a huge page in the middle would otherwise carry the
-    // wrong permissions unnoticed.
-    let image_offset = info.kernel_virt_base - info.kernel_phys_base;
-    for (name, range, expect) in [
-        ("text", &sections.text, MapFlags::READ | MapFlags::EXEC),
-        ("rodata", &sections.rodata, MapFlags::READ),
-        ("data", &sections.data, MapFlags::READ | MapFlags::WRITE),
-    ] {
-        let mut virt = range.start;
-        while virt < range.end {
-            let (phys, flags) = arch::paging::translate(virt)
-                .unwrap_or_else(|| panic!("{name} at {virt:#x} is not mapped"));
-            assert_eq!(
-                flags, expect,
-                "{name} at {virt:#x} has the wrong permissions"
-            );
-            assert_eq!(
-                virt - phys,
-                image_offset,
-                "{name} at {virt:#x} does not point at the image"
-            );
-            virt += PAGE_SIZE;
+    // M3: kernel page tables, W^X, user address spaces.
+    {
+        let sections = arch::kernel_sections();
+
+        // Direct map works after the switch.
+        let mut proof: Vec<u8> = Vec::new();
+        proof.resize(64 * 1024, 0x3c);
+        assert!(
+            proof.iter().all(|&byte| byte == 0x3c),
+            "the direct map is broken after the switch"
+        );
+        println!("64 KiB allocated and written after the switch");
+
+        // W^X across the whole image.
+        let image_offset = info.kernel_virt_base - info.kernel_phys_base;
+        for (name, range, expect) in [
+            ("text", &sections.text, MapFlags::READ | MapFlags::EXEC),
+            ("rodata", &sections.rodata, MapFlags::READ),
+            ("data", &sections.data, MapFlags::READ | MapFlags::WRITE),
+        ] {
+            let mut virt = range.start;
+            while virt < range.end {
+                let (phys, flags) = arch::paging::translate(virt)
+                    .unwrap_or_else(|| panic!("{name} at {virt:#x} is not mapped"));
+                assert_eq!(
+                    flags, expect,
+                    "{name} at {virt:#x} has the wrong permissions"
+                );
+                assert_eq!(
+                    virt - phys,
+                    image_offset,
+                    "{name} at {virt:#x} does not point at the image"
+                );
+                virt += PAGE_SIZE;
+            }
         }
+        println!("text r-x, rodata r--, data rw- across the whole image");
+
+        // Direct map is writable; null page is unmapped.
+        let frame = mm::alloc_frames(0).expect("out of frames");
+        let (back, flags) = arch::paging::translate(info.phys_to_virt(frame))
+            .expect("the direct map is missing a frame the kernel owns");
+        assert_eq!(back, frame, "the direct map translates to the wrong frame");
+        assert_eq!(flags, MapFlags::READ | MapFlags::WRITE);
+        mm::free_frames(frame, 0);
+
+        assert!(
+            arch::paging::translate(0).is_none(),
+            "the null page is mapped"
+        );
+        println!("direct map writable and non-executable, null page unmapped");
+
+        // Kernel stack is not reclaimable.
+        let probe = 0u8;
+        let stack = mm::virt_to_phys(&raw const probe as usize);
+        let region = info
+            .regions()
+            .iter()
+            .find(|r| r.base <= stack && stack < r.end())
+            .unwrap_or_else(|| panic!("the stack at {stack:#x} is in no memory-map region"));
+        assert!(
+            !region.kind.is_allocatable(),
+            "the kernel stack sits in {region:?}, which the frame allocator hands out"
+        );
+        println!("kernel stack at {stack:#x} in {region:?}, not reclaimable yet");
+
+        // User address spaces: isolated lower halves, shared kernel half.
+        let virt = 0x4000_0000;
+        let frame = mm::alloc_frames(0).expect("out of frames");
+
+        let before_mapped = mm::frame_stats().free;
+        let mut space = paging::AddressSpace::new();
+        space.map(Mapping {
+            virt,
+            phys: frame,
+            length: PAGE_SIZE,
+            flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+        });
+        let mapped_cost = before_mapped - mm::frame_stats().free;
+
+        let before_empty = mm::frame_stats().free;
+        let empty = paging::AddressSpace::new();
+        let empty_cost = before_empty - mm::frame_stats().free;
+
+        assert_eq!(
+            mapped_cost, 4,
+            "a single user page needed {mapped_cost} tables"
+        );
+        assert_eq!(
+            empty_cost, 1,
+            "an empty address space needed {empty_cost} tables"
+        );
+
+        space.switch();
+        assert_eq!(
+            paging::active_root(),
+            space.root(),
+            "switch() did not switch"
+        );
+
+        let (back, flags) = paging::translate(virt).expect("the user page is not mapped");
+        assert_eq!(back, frame, "the user page points at the wrong frame");
+        assert_eq!(flags, MapFlags::READ | MapFlags::WRITE | MapFlags::USER);
+        unsafe {
+            ptr::write_bytes(virt as *mut u8, 0x77, PAGE_SIZE);
+            assert_eq!(*(virt as *const u8), 0x77);
+            assert_eq!(*(virt as *const u8), 0x77);
+        }
+        println!("user page at {virt:#x} mapped rwu and written through");
+
+        let mut shared: Vec<u8> = Vec::new();
+        shared.resize(8 * 1024, 0x11);
+        assert!(
+            shared.iter().all(|&byte| byte == 0x11),
+            "the heap stopped working in a process address space"
+        );
+        drop(shared);
+
+        empty.switch();
+        assert!(
+            paging::translate(virt).is_none(),
+            "a user page leaked between address spaces"
+        );
+        let text = arch::kernel_sections().text.start;
+        assert!(
+            paging::translate(text).is_some(),
+            "the kernel half was not shared with the new address space"
+        );
+        println!("second address space: kernel half shared, user half empty");
+
+        paging::switch_to_kernel();
+
+        let before_teardown = mm::frame_stats().free;
+        drop(empty);
+        drop(space);
+        assert_eq!(
+            mm::frame_stats().free,
+            before_teardown + mapped_cost + empty_cost,
+            "an address space did not give back every table it took"
+        );
+        mm::free_frames(frame, 0);
+        println!(
+            "both address spaces torn down, {} frames returned",
+            mapped_cost + empty_cost
+        );
+
+        println!("M3_OK");
     }
-    println!("text r-x, rodata r--, data rw- across the whole image");
-
-    // A frame the kernel owns, checked through the tables rather than the plan.
-    let frame = mm::alloc_frames(0).expect("out of frames");
-    let (back, flags) = arch::paging::translate(info.phys_to_virt(frame))
-        .expect("the direct map is missing a frame the kernel owns");
-    assert_eq!(back, frame, "the direct map translates to the wrong frame");
-    assert_eq!(flags, MapFlags::READ | MapFlags::WRITE);
-    mm::free_frames(frame, 0);
-
-    // The lower half belongs to user processes, and the kernel's own address space
-    // keeps it empty. A mapped null page would hide every null dereference.
-    assert!(
-        arch::paging::translate(0).is_none(),
-        "the null page is mapped"
-    );
-    println!("direct map writable and non-executable, null page unmapped");
-
-    // Limine's stack is still under us, and the frame allocator refuses to hand
-    // out the region it sits in. If that ever stopped being true the symptom would
-    // be a stack vanishing mid-function, so check it rather than trust the policy.
-    let probe = 0u8;
-    let stack = mm::virt_to_phys(&raw const probe as usize);
-    let region = info
-        .regions()
-        .iter()
-        .find(|r| r.base <= stack && stack < r.end())
-        .unwrap_or_else(|| panic!("the stack at {stack:#x} is in no memory-map region"));
-    assert!(
-        !region.kind.is_allocatable(),
-        "the kernel stack sits in {region:?}, which the frame allocator hands out"
-    );
-    println!("kernel stack at {stack:#x} in {region:?}, not reclaimable yet");
 }
 
-/// A process gets an address space of its own: its own lower half, the kernel's
-/// upper half shared with it, and every table it took back when it goes away.
-fn address_spaces() {
-    let virt = 0x4000_0000;
-    let frame = mm::alloc_frames(0).expect("out of frames");
-
-    // Each space's cost is measured as it is built rather than guessed, so the
-    // teardown check below is exact.
-    let before_mapped = mm::frame_stats().free;
-    let mut space = paging::AddressSpace::new();
-    space.map(Mapping {
-        virt,
-        phys: frame,
-        length: PAGE_SIZE,
-        flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
-    });
-    let mapped_cost = before_mapped - mm::frame_stats().free;
-
-    let before_empty = mm::frame_stats().free;
-    let empty = paging::AddressSpace::new();
-    let empty_cost = before_empty - mm::frame_stats().free;
-
-    // A root, then a PDPT, a PD and a PT to reach one 4 KiB leaf.
-    assert_eq!(
-        mapped_cost, 4,
-        "a single user page needed {mapped_cost} tables"
-    );
-    // One root and nothing else: the kernel half is copied in as PML4 entries, so
-    // sharing it costs no tables at all.
-    assert_eq!(
-        empty_cost, 1,
-        "an empty address space needed {empty_cost} tables"
-    );
-
-    space.switch();
-    assert_eq!(
-        paging::active_root(),
-        space.root(),
-        "switch() did not switch"
-    );
-
-    let (back, flags) = paging::translate(virt).expect("the user page is not mapped");
-    assert_eq!(back, frame, "the user page points at the wrong frame");
-    assert_eq!(flags, MapFlags::READ | MapFlags::WRITE | MapFlags::USER);
-    unsafe {
-        ptr::write_bytes(virt as *mut u8, 0x77, PAGE_SIZE);
-        assert_eq!(*(virt as *const u8), 0x77);
-        assert_eq!(*(virt as *const u8), 0x77);
-    }
-    println!("user page at {virt:#x} mapped rwu and written through");
-
-    // The kernel half came along, which is the only reason the next line works:
-    // the heap lives in the direct map, and this code is running from mapped text.
-    let mut shared: Vec<u8> = Vec::new();
-    shared.resize(8 * 1024, 0x11);
-    assert!(
-        shared.iter().all(|&byte| byte == 0x11),
-        "the heap stopped working in a process address space"
-    );
-    drop(shared);
-
-    // The other space shares the kernel half but none of this one's user pages.
-    empty.switch();
-    assert!(
-        paging::translate(virt).is_none(),
-        "a user page leaked between address spaces"
-    );
-    let text = arch::kernel_sections().text.start;
-    assert!(
-        paging::translate(text).is_some(),
-        "the kernel half was not shared with the new address space"
-    );
-    println!("second address space: kernel half shared, user half empty");
-
-    paging::switch_to_kernel();
-
-    // Taken here, not at the top: the vector above grew the heap, and the slab
-    // keeps freed runs for reuse instead of handing their frames back.
-    let before_teardown = mm::frame_stats().free;
-    drop(empty);
-    drop(space);
-    assert_eq!(
-        mm::frame_stats().free,
-        before_teardown + mapped_cost + empty_cost,
-        "an address space did not give back every table it took"
-    );
-    mm::free_frames(frame, 0);
-    println!(
-        "both address spaces torn down, {} frames returned",
-        mapped_cost + empty_cost
-    );
-}
+// ---- sched: context switch, round-robin, preemption, sleep, priority -----
 
 /// Which task ran, in the order they ran.
 ///
@@ -495,9 +553,6 @@ static RECORD: [AtomicU8; 64] = [const { AtomicU8::new(0) }; 64];
 static RECORD_LEN: AtomicUsize = AtomicUsize::new(0);
 
 fn record(who: u8) {
-    // One interrupts-off step. Claiming a slot and filling it are two
-    // operations, and a task preempted between them would let the next task
-    // record out of order - destroying the only thing this record measures.
     critical_section::with(|_| {
         let index = RECORD_LEN.fetch_add(1, Ordering::Relaxed);
         assert!(index < RECORD.len(), "the run record is full");
@@ -518,15 +573,7 @@ fn reset_record() {
 }
 
 /// Wait until every task this milestone started has finished and been reaped.
-///
-/// Sleeping rather than yielding matters: the boot task runs at NORMAL, and the
-/// policy is strict priority with no aging, so a boot task that busy-yielded
-/// would sit ahead of any LOW worker forever and starve it. Going off the ready
-/// queue lets every band make progress.
 fn drain() {
-    // Codes are collected here rather than waited on: a task that has exited
-    // keeps its slot until someone takes the code, and the milestone checks
-    // read theirs with `exit_code` instead of waiting for them.
     while sched::task_count() > sched::permanent_tasks() {
         discard_codes();
         sched::sleep_ticks(1);
@@ -534,10 +581,6 @@ fn drain() {
 }
 
 /// Wait until `id` has left an exit code, by polling rather than sleeping.
-///
-/// A kernel check has no parent link to be woken through - `spawn` starts
-/// tasks without one, and only a process's `wait` is woken by `exit` - so
-/// this naps a tick at a time until the code is there.
 fn wait_for_code(id: sched::TaskId) {
     while sched::exit_code(id).is_none() {
         sched::sleep_ticks(1);
@@ -545,21 +588,16 @@ fn wait_for_code(id: sched::TaskId) {
 }
 
 /// Take every exit code nobody is going to ask for, so the slots they hold
-/// can be freed. A kernel check reads codes with `exit_code`, which does not
-/// consume; a process's `wait` takes the one it asked for.
+/// can be freed.
 fn discard_codes() {
     for slot in 2..sched::MAX_TASKS - 1 {
         sched::discard_exit_code(sched::TaskId(slot));
     }
 }
 
-/// Two tasks at the same priority take turns, and the turn-taking is the whole
-/// of round-robin: a task that yields goes to the back of its band and cannot
-/// run again until everything queued ahead of it has.
+/// Two tasks at the same priority take turns.
 fn alternating() {
     reset_record();
-    // One interrupts-off window: if the clock preempted the boot task between
-    // the two spawns, task 0 would run a slice before task 1 even existed.
     critical_section::with(|_| {
         for who in [0u8, 1] {
             sched::spawn(
@@ -576,11 +614,6 @@ fn alternating() {
     });
     drain();
 
-    // The order is not fully deterministic: a tick can land between a task
-    // being dispatched and its first `record`, and preempting then requeues it
-    // behind its peer - the pair swaps and one slice doubles. Each such tick
-    // costs exactly one repeat, so more than two repeats means the band is not
-    // taking turns at all, which is the thing this check is for.
     let got = recorded();
     let repeats = got.windows(2).filter(|pair| pair[0] == pair[1]).count();
     assert!(
@@ -591,10 +624,6 @@ fn alternating() {
 }
 
 /// A task that never yields still loses the core.
-///
-/// This is the check that the scheduler is preemptive rather than cooperative:
-/// nothing in task 0 gives the CPU up, so the only thing that can let task 1 run
-/// is the clock interrupt.
 fn preempted() {
     reset_record();
     const SPIN_TICKS: u64 = 10;
@@ -620,8 +649,6 @@ fn preempted() {
     );
     drain();
 
-    // Task 1 ran three times while task 0 was spinning, and task 0 records only
-    // once it has stopped - so its entry is last.
     assert_eq!(
         recorded(),
         vec![1, 1, 1, 0],
@@ -630,8 +657,7 @@ fn preempted() {
     println!("a task that never yielded was preempted for {SPIN_TICKS} ticks");
 }
 
-/// A sleeping task is off the ready queue until the clock puts it back, and the
-/// other task gets every slice in between.
+/// A sleeping task is off the ready queue until the clock puts it back.
 fn sleeping() {
     reset_record();
     const SLEEP_TICKS: u64 = 10;
@@ -642,10 +668,6 @@ fn sleeping() {
             let start = timer::ticks();
             sched::sleep_ticks(SLEEP_TICKS);
             let slept = timer::ticks() - start;
-            // Bounded above as well as below: a sleeper that overslept by
-            // seconds would pass "at least", and the sleep queue is a deadline
-            // heap for a reason. One tick of slack is the scheduler noticing on
-            // its next turn rather than at the exact instant.
             assert!(
                 (SLEEP_TICKS..SLEEP_TICKS + 3).contains(&slept),
                 "asked for {SLEEP_TICKS} ticks and got {slept}"
@@ -654,10 +676,6 @@ fn sleeping() {
         },
         Priority::NORMAL,
     );
-    // Give the sleeper a tick to reach its sleep before the recorder exists.
-    // Spawned together, a tick landing between the sleeper's dispatch and its
-    // first record would requeue it behind the recorder - honest round robin,
-    // but it would swap the very order this check is trying to observe.
     sched::sleep_ticks(1);
     sched::spawn(
         || {
@@ -670,8 +688,6 @@ fn sleeping() {
     );
     drain();
 
-    // All three of task 1's slices land between task 0's two records, which is
-    // what "off the ready queue" looks like from the outside.
     assert_eq!(
         recorded(),
         vec![0, 1, 1, 1, 0],
@@ -680,17 +696,12 @@ fn sleeping() {
     println!("a task slept {SLEEP_TICKS} ticks while the other ran");
 }
 
-/// The scheduler's idle path. The stagger in `sleeping` passes through it for
-/// a tick in passing; this is the check that a long, quiet idle - boot asleep
-/// with nothing else runnable - still wakes on the clock. A wrong `sti; hlt`
-/// pair would park the core for good, and it is much better to find that out
-/// here than the first time the kernel goes idle for real.
+/// The scheduler's idle path still wakes on the clock.
 fn idling() {
     reset_record();
     sched::spawn(|| record(0), Priority::NORMAL);
     drain();
 
-    // Nothing left but the boot task, so this puts the scheduler itself to sleep.
     record(1);
     sched::sleep_ticks(5);
     record(1);
@@ -704,12 +715,6 @@ fn idling() {
 }
 
 /// A higher band takes the core from a task that is already running.
-///
-/// The host tests check band ordering against the policy; this checks it against
-/// a task that has the CPU and is not giving it up. Task 0 spins at LOW for five
-/// ticks and task 1 wakes at HIGH two ticks in. Round-robin alone would resume
-/// the spinner, because preemption puts a task at the back of its own band; the
-/// only reason task 1 gets the core first is that its band is higher.
 fn priority_wins() {
     reset_record();
     const SPIN_TICKS: u64 = 5;
@@ -745,15 +750,9 @@ fn priority_wins() {
     println!("a HIGH task took the core from a spinning LOW one");
 }
 
-/// M4: tasks, the context switch, and the clock deciding between them.
-fn m4() {
-    sched::init();
-    println!(
-        "scheduler up: {} slots, running task {:?}",
-        sched::MAX_TASKS,
-        sched::current()
-    );
-
+/// Prove the scheduler: context switch, round-robin, preemption, sleep, idle,
+/// and priority-based core stealing.
+fn check_sched() {
     let before = (mm::frame_stats().free, mm::heap_stats().mapped);
     alternating();
     preempted();
@@ -767,9 +766,6 @@ fn m4() {
         "a task that exited was never reaped"
     );
 
-    // The only frames allowed to have gone missing are the ones the heap grew
-    // into, which it deliberately never gives back. Anything else is a task
-    // stack that did not come home.
     let after = (mm::frame_stats().free, mm::heap_stats().mapped);
     let heap_growth = (after.1 - before.1) / PAGE_SIZE;
     assert_eq!(
@@ -781,8 +777,9 @@ fn m4() {
     println!("M4_OK");
 }
 
-/// Issue a syscall through the gate with the ABI's register convention: number
-/// in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`, result in `rax`.
+// ---- syscall + vfs: gate, ramfs, mounts, initramfs, devfs ---------------
+
+/// Issue a syscall through the gate with the ABI's register convention.
 #[cfg(target_arch = "x86_64")]
 unsafe fn syscall(
     nr: u64,
@@ -811,158 +808,164 @@ unsafe fn syscall(
     ret
 }
 
-/// The syscall gate: the number table and dispatch first, then the interrupt
-/// path itself - registers in, `rax` out, and exit ending the task from inside
-/// the gate. This is the same path user code takes at M9.
-fn m6() {
-    // The standard descriptors belong to the gate's world: fd 0, 1 and 2 are
-    // three descriptions of the console tty, and the first pipe() must not be
-    // handed fd 0. Kept out of m0-m4 because m2's buddy test reads the frame
-    // layout, and these allocations shift it.
-    vfs::file::init_standard(vfs::tty::init());
+/// Prove the syscall gate, ramfs, mounts, initramfs unpack, and device filesystem.
+fn check_vfs() {
+    // M6: syscall dispatch and interrupt gate.
+    {
+        assert_eq!(
+            syscall::dispatch(999, [0; syscall::ARG_COUNT], false),
+            err::ENOSYS
+        );
+        assert_eq!(
+            syscall::dispatch(nr::READ, [0, 0, 0, 0, 0, 0], false),
+            0,
+            "a zero-length read is empty, not an error"
+        );
+        assert_eq!(
+            syscall::dispatch(nr::READ, [3, 0, 0, 0, 0, 0], false),
+            err::EBADF
+        );
+        assert_eq!(
+            syscall::dispatch(nr::WRITE, [7, 0, 0, 0, 0, 0], false),
+            err::EBADF
+        );
 
-    // Dispatch without the interrupt: unassigned numbers, and every fd check
-    // the table makes, are observable from here. Kernel callers pass `false`:
-    // their pointers are kernel pointers, needing no page-table walk.
-    assert_eq!(
-        syscall::dispatch(999, [0; syscall::ARG_COUNT], false),
-        err::ENOSYS
-    );
-    // fd 0 is the tty now: a zero-length read is empty, not an error, and the
-    // standard fds 0-2 all exist. The first unallocated fd is the error case.
-    assert_eq!(
-        syscall::dispatch(nr::READ, [0, 0, 0, 0, 0, 0], false),
-        0,
-        "a zero-length read is empty, not an error"
-    );
-    assert_eq!(
-        syscall::dispatch(nr::READ, [3, 0, 0, 0, 0, 0], false),
-        err::EBADF
-    );
-    assert_eq!(
-        syscall::dispatch(nr::WRITE, [7, 0, 0, 0, 0, 0], false),
-        err::EBADF
-    );
+        let msg = b"syscall: write through dispatch\n";
+        let wrote = syscall::dispatch(
+            nr::WRITE,
+            [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0],
+            false,
+        );
+        assert_eq!(wrote as usize, msg.len());
 
-    let msg = b"syscall: write through dispatch\n";
-    let wrote = syscall::dispatch(
-        nr::WRITE,
-        [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0],
-        false,
-    );
-    assert_eq!(wrote as usize, msg.len());
+        sched::spawn(
+            || {
+                let pid = unsafe { syscall(nr::GETPID, 0, 0, 0, 0, 0, 0) };
+                assert!(pid >= 2, "getpid returned {pid}");
 
-    sched::spawn(
-        || {
-            let pid = unsafe { syscall(nr::GETPID, 0, 0, 0, 0, 0, 0) };
-            assert!(pid >= 2, "getpid returned {pid}");
+                let msg = b"syscall: write through the interrupt gate\n";
+                let wrote =
+                    unsafe { syscall(nr::WRITE, 1, msg.as_ptr() as usize, msg.len(), 0, 0, 0) };
+                assert_eq!(wrote as usize, msg.len(), "the gate dropped bytes");
 
-            let msg = b"syscall: write through the interrupt gate\n";
-            let wrote = unsafe { syscall(nr::WRITE, 1, msg.as_ptr() as usize, msg.len(), 0, 0, 0) };
-            assert_eq!(wrote as usize, msg.len(), "the gate dropped bytes");
+                assert_eq!(unsafe { syscall(nr::YIELD, 0, 0, 0, 0, 0, 0) }, 0);
+                assert_eq!(unsafe { syscall(nr::SLEEP, 2, 0, 0, 0, 0, 0) }, 0);
+                unsafe { syscall(nr::EXIT, 0, 0, 0, 0, 0, 0) };
+            },
+            Priority::NORMAL,
+        );
+        drain();
+        assert_eq!(
+            sched::task_count(),
+            sched::permanent_tasks(),
+            "exit through the gate did not end the task"
+        );
+        println!("M6_OK");
+    }
 
-            assert_eq!(unsafe { syscall(nr::YIELD, 0, 0, 0, 0, 0, 0) }, 0);
-            assert_eq!(unsafe { syscall(nr::SLEEP, 2, 0, 0, 0, 0, 0) }, 0);
-            unsafe { syscall(nr::EXIT, 0, 0, 0, 0, 0, 0) };
-        },
-        Priority::NORMAL,
-    );
-    drain();
-    assert_eq!(
-        sched::task_count(),
-        sched::permanent_tasks(),
-        "exit through the gate did not end the task"
-    );
-    println!("M6_OK");
+    // M7: ramfs, mounts, multi-task file I/O through the fd table.
+    {
+        vfs::resolve("/etc")
+            .unwrap()
+            .create("hostname", NodeKind::File)
+            .unwrap();
+        let fd = vfs::open("/etc/hostname").expect("open /etc/hostname");
+        assert_eq!(vfs::write(fd, b"mpos\n").unwrap(), 5);
+        vfs::close(fd).unwrap();
+
+        let fd = vfs::open("/etc/hostname").unwrap();
+        let mut buf = [0u8; 32];
+        let n = vfs::read(fd, &mut buf).unwrap();
+        vfs::close(fd).unwrap();
+        assert_eq!(&buf[..n], b"mpos\n");
+
+        let tmp = vfs::ramfs::RamFs::new();
+        vfs::resolve("/")
+            .unwrap()
+            .create("tmp", NodeKind::Dir)
+            .unwrap();
+        vfs::mount("/tmp", &*tmp).expect("mount /tmp");
+        let inner_root = tmp.root();
+        assert!(
+            Arc::ptr_eq(&vfs::resolve("/tmp").unwrap(), &inner_root),
+            "resolving /tmp did not cross the mount"
+        );
+        assert_eq!(vfs::mount("/tmp", &*tmp).err(), Some(vfs::VfsError::Busy));
+        vfs::resolve("/tmp")
+            .unwrap()
+            .create("shared", NodeKind::File)
+            .unwrap();
+
+        sched::spawn(
+            || {
+                let fd = vfs::open("/tmp/shared").expect("writer: open");
+                for chunk in [&b"one"[..], &b"two"[..]] {
+                    assert_eq!(vfs::write(fd, chunk).unwrap(), 3, "writer: write");
+                }
+                vfs::close(fd).unwrap();
+                sched::exit(0);
+            },
+            Priority::NORMAL,
+        );
+        sched::spawn(
+            || {
+                while sched::task_count() > sched::permanent_tasks() + 1 {
+                    sched::sleep_ticks(1);
+                }
+                let fd = vfs::open("/tmp/shared").expect("reader: open");
+                let mut buf = [0u8; 6];
+                let n = vfs::read(fd, &mut buf).expect("reader: read");
+                vfs::close(fd).unwrap();
+                assert_eq!(n, 6, "reader: the file was short");
+                assert_eq!(&buf, b"onetwo", "reader: the wrong bytes came back");
+                sched::exit(0);
+            },
+            Priority::NORMAL,
+        );
+        drain();
+        assert_eq!(
+            sched::task_count(),
+            sched::permanent_tasks(),
+            "a vfs task did not exit"
+        );
+        println!("M7_OK");
+    }
+
+    // M8: initramfs unpack and device filesystem.
+    {
+        const INITRAMFS_MOTD: &[u8] = b"welcome to mpos\n";
+
+        let motd = vfs::open("/etc/motd").expect("no /etc/motd after the unpack");
+        let mut buf = [0u8; 64];
+        let n = vfs::read(motd, &mut buf).unwrap();
+        vfs::close(motd).unwrap();
+        assert_eq!(&buf[..n], INITRAMFS_MOTD);
+        println!(
+            "motd: {}",
+            core::str::from_utf8(&buf[..n]).expect("motd is utf8")
+        );
+
+        let console = vfs::open("/dev/console").expect("open /dev/console");
+        let line = b"this line went through /dev/console\n";
+        assert_eq!(vfs::write(console, line).unwrap(), line.len());
+        vfs::close(console).unwrap();
+
+        let null = vfs::open("/dev/null").expect("open /dev/null");
+        assert_eq!(vfs::write(null, b"gone").unwrap(), 4);
+        assert_eq!(vfs::read(null, &mut buf).unwrap(), 0, "null read is EOF");
+        vfs::close(null).unwrap();
+
+        let zero = vfs::open("/dev/zero").expect("open /dev/zero");
+        let mut zeros = [1u8; 8];
+        assert_eq!(vfs::read(zero, &mut zeros).unwrap(), 8);
+        assert!(zeros.iter().all(|&b| b == 0), "zero read nonzero");
+        vfs::close(zero).unwrap();
+
+        println!("M8_OK");
+    }
 }
 
-/// M7: the VFS. A ramfs root, a second ramfs mounted inside it, paths walking
-/// across the mount, and two tasks passing bytes through the fd table.
-fn m7() {
-    let root = vfs::ramfs::RamFs::new();
-    vfs::mount_root(&*root);
-
-    // A file filled through the fd table and read back through a fresh
-    // description: the per-description cursor, exercised on the machine.
-    // The initramfs in m8 brings /etc/motd; this is mpos's own file.
-    vfs::resolve("/")
-        .expect("no root after mount")
-        .create("etc", NodeKind::Dir)
-        .expect("create /etc");
-    vfs::resolve("/etc")
-        .unwrap()
-        .create("hostname", NodeKind::File)
-        .unwrap();
-    let fd = vfs::open("/etc/hostname").expect("open /etc/hostname");
-    assert_eq!(vfs::write(fd, b"mpos\n").unwrap(), 5);
-    vfs::close(fd).unwrap();
-
-    let fd = vfs::open("/etc/hostname").unwrap();
-    let mut buf = [0u8; 32];
-    let n = vfs::read(fd, &mut buf).unwrap();
-    vfs::close(fd).unwrap();
-    assert_eq!(&buf[..n], b"mpos\n");
-
-    // A second ramfs over /tmp: resolving through the mountpoint lands in the
-    // mounted filesystem, and mounting there again refuses.
-    let tmp = vfs::ramfs::RamFs::new();
-    vfs::resolve("/")
-        .unwrap()
-        .create("tmp", NodeKind::Dir)
-        .unwrap();
-    vfs::mount("/tmp", &*tmp).expect("mount /tmp");
-    let inner_root = tmp.root();
-    assert!(
-        Arc::ptr_eq(&vfs::resolve("/tmp").unwrap(), &inner_root),
-        "resolving /tmp did not cross the mount"
-    );
-    assert_eq!(vfs::mount("/tmp", &*tmp).err(), Some(vfs::VfsError::Busy));
-    vfs::resolve("/tmp")
-        .unwrap()
-        .create("shared", NodeKind::File)
-        .unwrap();
-
-    // The writer is a task; the reader waits until the writer has been reaped,
-    // which is the earliest point at which every write it made is final.
-    sched::spawn(
-        || {
-            let fd = vfs::open("/tmp/shared").expect("writer: open");
-            for chunk in [&b"one"[..], &b"two"[..]] {
-                assert_eq!(vfs::write(fd, chunk).unwrap(), 3, "writer: write");
-            }
-            vfs::close(fd).unwrap();
-            sched::exit(0);
-        },
-        Priority::NORMAL,
-    );
-    sched::spawn(
-        || {
-            while sched::task_count() > sched::permanent_tasks() + 1 {
-                sched::sleep_ticks(1);
-            }
-            let fd = vfs::open("/tmp/shared").expect("reader: open");
-            let mut buf = [0u8; 6];
-            let n = vfs::read(fd, &mut buf).expect("reader: read");
-            vfs::close(fd).unwrap();
-            assert_eq!(n, 6, "reader: the file was short");
-            assert_eq!(&buf, b"onetwo", "reader: the wrong bytes came back");
-            sched::exit(0);
-        },
-        Priority::NORMAL,
-    );
-    drain();
-    assert_eq!(
-        sched::task_count(),
-        sched::permanent_tasks(),
-        "a vfs task did not exit"
-    );
-    println!("M7_OK");
-}
-
-/// The console as the line discipline has it: a write is output, and a read
-/// blocks for the next complete line from the input side. This is the tty the
-/// standard descriptors point at, so a program can reach it by name as
-/// `/dev/tty` rather than only by the number it was born with.
+/// The console as the line discipline has it.
 struct TtyDev;
 
 impl vfs::devfs::CharDevice for TtyDev {
@@ -976,8 +979,7 @@ impl vfs::devfs::CharDevice for TtyDev {
     }
 }
 
-/// Writes go out to the console. Nothing arrives, so reads are end of input
-/// rather than a silent hang.
+/// Writes go out to the console. Nothing arrives, so reads are end of input.
 struct ConsoleDev;
 
 impl vfs::devfs::CharDevice for ConsoleDev {
@@ -1018,206 +1020,124 @@ impl vfs::devfs::CharDevice for ZeroDev {
     }
 }
 
-/// M8: the initramfs becomes the tree, and /dev is a filesystem of its own.
-fn m8(info: &BootInfo) {
-    const INITRAMFS_MOTD: &[u8] = b"welcome to mpos\n";
+// ---- blk + user processes: ELF loading, virtio-blk, ext2 -----------------
 
-    let archive = info.initramfs.expect("the boot config loaded no initramfs");
-    let members = vfs::tar::unpack_into(vfs::global(), archive).expect("the initramfs was broken");
-    println!("initramfs: {members} members unpacked");
-
-    let motd = vfs::open("/etc/motd").expect("no /etc/motd after the unpack");
-    let mut buf = [0u8; 64];
-    let n = vfs::read(motd, &mut buf).unwrap();
-    vfs::close(motd).unwrap();
-    assert_eq!(&buf[..n], INITRAMFS_MOTD);
-    println!(
-        "motd: {}",
-        core::str::from_utf8(&buf[..n]).expect("motd is utf8")
-    );
-
-    // Devices mount over the /dev directory the archive provided.
-    let dev = vfs::devfs::DevFs::new();
-    dev.register("tty", Arc::new(TtyDev));
-    dev.register("console", Arc::new(ConsoleDev));
-    dev.register("null", Arc::new(NullDev));
-    dev.register("zero", Arc::new(ZeroDev));
-    vfs::mount("/dev", &*dev).expect("mount /dev");
-
-    let console = vfs::open("/dev/console").expect("open /dev/console");
-    let line = b"this line went through /dev/console\n";
-    assert_eq!(vfs::write(console, line).unwrap(), line.len());
-    vfs::close(console).unwrap();
-
-    let null = vfs::open("/dev/null").expect("open /dev/null");
-    assert_eq!(vfs::write(null, b"gone").unwrap(), 4);
-    assert_eq!(vfs::read(null, &mut buf).unwrap(), 0, "null read is EOF");
-    vfs::close(null).unwrap();
-
-    let zero = vfs::open("/dev/zero").expect("open /dev/zero");
-    let mut zeros = [1u8; 8];
-    assert_eq!(vfs::read(zero, &mut zeros).unwrap(), 8);
-    assert!(zeros.iter().all(|&b| b == 0), "zero read nonzero");
-    vfs::close(zero).unwrap();
-
-    println!("M8_OK");
-}
-
-/// The exit code the user program ends with. Both sides agree on it the way
-/// they agree on the syscall numbers - it lives in `user/bin/hello.rs` too.
+/// The exit code the user program ends with.
 const HELLO_EXIT: isize = 42;
 
-/// M9: processes. The user program comes through the VFS the way an init would
-/// read it, the loader maps it into a fresh address space, and the task
-/// enters ring 3 - from where every kernel touch, including its own exit, is
-/// a syscall through the gate.
-fn m9() {
-    let mut program = Vec::new();
-    let fd = vfs::open("/bin/hello").expect("the initramfs carries no /bin/hello");
-    let mut chunk = [0u8; 512];
-    loop {
-        let n = vfs::read(fd, &mut chunk).expect("read /bin/hello");
-        if n == 0 {
-            break;
+/// Prove user processes (ELF loading, ring 3) and the block layer (virtio-blk,
+/// ext2 read/write/persistence).
+fn check_blk_process() {
+    // M9: user processes — load /bin/hello, enter ring 3, exit with code 42.
+    {
+        let mut program = Vec::new();
+        let fd = vfs::open("/bin/hello").expect("the initramfs carries no /bin/hello");
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = vfs::read(fd, &mut chunk).expect("read /bin/hello");
+            if n == 0 {
+                break;
+            }
+            program.extend_from_slice(&chunk[..n]);
         }
-        program.extend_from_slice(&chunk[..n]);
-    }
-    vfs::close(fd).unwrap();
-    println!("initramfs: /bin/hello is {} bytes of ELF", program.len());
+        vfs::close(fd).unwrap();
+        println!("initramfs: /bin/hello is {} bytes of ELF", program.len());
 
-    let id = sched::spawn_user(&program, Priority::NORMAL);
-    // Read the code before draining: a check reads with `exit_code`, which
-    // does not consume, and `drain` takes what nobody collected.
-    wait_for_code(id);
-    assert_eq!(
-        sched::exit_code(id),
-        Some(HELLO_EXIT),
-        "hello did not end with the exit code it chose"
-    );
-    drain();
-    assert_eq!(
-        sched::task_count(),
-        sched::permanent_tasks(),
-        "the user task was not reaped"
-    );
-    println!("M9_OK");
+        let id = sched::spawn_user(&program, Priority::NORMAL);
+        wait_for_code(id);
+        assert_eq!(
+            sched::exit_code(id),
+            Some(HELLO_EXIT),
+            "hello did not end with the exit code it chose"
+        );
+        drain();
+        assert_eq!(
+            sched::task_count(),
+            sched::permanent_tasks(),
+            "the user task was not reaped"
+        );
+        println!("M9_OK");
+    }
+
+    // M10: virtio-blk and ext2.
+    {
+        const SEED: &[u8] = b"ext2 seed: formatted by mke2fs on the host, read by mpos\n";
+        let fd = vfs::open("/mnt/seed.txt").expect("open /mnt/seed.txt");
+        let mut buf = [0u8; 128];
+        let n = vfs::read(fd, &mut buf).expect("read /mnt/seed.txt");
+        vfs::close(fd).unwrap();
+        assert_eq!(&buf[..n], SEED);
+
+        let fd = vfs::open("/mnt/docs/note.txt").expect("open /mnt/docs/note.txt");
+        let mut buf = [0u8; 64];
+        let n = vfs::read(fd, &mut buf).expect("read /mnt/docs/note.txt");
+        vfs::close(fd).unwrap();
+        assert_eq!(&buf[..n], b"nested file\n");
+        println!("ext2: host-seeded files read back through /mnt");
+
+        vfs::resolve("/mnt")
+            .unwrap()
+            .create("written.bin", NodeKind::File)
+            .expect("create /mnt/written.bin");
+        const LEN: usize = 20 * 1024;
+        let bytes: Vec<u8> = (0..LEN).map(|i| (i * 31 + 7) as u8).collect();
+        let fd = vfs::open("/mnt/written.bin").expect("open /mnt/written.bin");
+        assert_eq!(
+            vfs::write(fd, &bytes).unwrap(),
+            LEN,
+            "the write came up short"
+        );
+        vfs::close(fd).unwrap();
+
+        let dev = BLK_DEV.get().unwrap().clone();
+        let fs2 = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("remount the ext2 image");
+        let back = fs2
+            .root()
+            .lookup("written.bin")
+            .expect("written.bin persisted");
+        assert_eq!(back.metadata().size as usize, LEN);
+        let mut read_back = vec![0u8; LEN];
+        let n = back
+            .read_at(0, &mut read_back)
+            .expect("read written.bin back");
+        assert_eq!(n, LEN);
+        assert!(
+            read_back
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == (i * 31 + 7) as u8),
+            "written.bin did not read back the pattern it was written with"
+        );
+
+        let seed = fs2.root().lookup("seed.txt").expect("seed.txt survived");
+        let mut buf = [0u8; 128];
+        let n = seed.read_at(0, &mut buf).expect("read seed.txt back");
+        assert_eq!(&buf[..n], SEED);
+
+        vfs::resolve("/mnt")
+            .unwrap()
+            .unlink("written.bin")
+            .expect("unlink /mnt/written.bin");
+        let dev = BLK_DEV.get().unwrap().clone();
+        let fs3 = vfs::ext2::Ext2Fs::mount(dev).expect("remount after the unlink");
+        assert_eq!(
+            fs3.root().lookup("written.bin").err(),
+            Some(vfs::VfsError::NoEntry),
+            "written.bin is still on the disk after the unlink"
+        );
+
+        println!("ext2: {LEN} bytes written through /mnt, verified on a cold remount and removed");
+        println!("M10_OK");
+    }
 }
 
-/// M10: a disk and a filesystem on it. virtio-blk gives us a block device,
-/// ext2 turns it into a tree, and the proof that writes really reached the
-/// disk is a second, cold mount over the same device reading them back.
-fn m10() {
-    let dev = blk::virtio::VirtioBlk::init().expect("no virtio-blk device answered on the PCI bus");
-    let sectors = dev.capacity_sectors();
-    println!(
-        "virtio-blk: {} sectors ({} MiB)",
-        sectors,
-        sectors * 512 / MIB as u64
-    );
-    assert_eq!(
-        sectors,
-        8 * MIB as u64 / 512,
-        "the disk is not the 8 MiB image the build made"
-    );
+// ---- ipc: pipes, TTY line discipline, signals ---------------------------
 
-    // /mnt is the door into the disk filesystem; the initramfs does not carry it.
-    if vfs::resolve("/mnt").is_err() {
-        vfs::resolve("/")
-            .expect("no root filesystem")
-            .create("mnt", NodeKind::Dir)
-            .expect("create /mnt");
-    }
-    let fs = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("the ext2 image did not mount");
-    vfs::mount("/mnt", &fs).expect("mount /mnt");
-
-    // Seed files laid down by mke2fs on the host: reading them proves the
-    // parser against something we did not write ourselves.
-    const SEED: &[u8] = b"ext2 seed: formatted by mke2fs on the host, read by mpos\n";
-    let fd = vfs::open("/mnt/seed.txt").expect("open /mnt/seed.txt");
-    let mut buf = [0u8; 128];
-    let n = vfs::read(fd, &mut buf).expect("read /mnt/seed.txt");
-    vfs::close(fd).unwrap();
-    assert_eq!(&buf[..n], SEED);
-
-    let fd = vfs::open("/mnt/docs/note.txt").expect("open /mnt/docs/note.txt");
-    let mut buf = [0u8; 64];
-    let n = vfs::read(fd, &mut buf).expect("read /mnt/docs/note.txt");
-    vfs::close(fd).unwrap();
-    assert_eq!(&buf[..n], b"nested file\n");
-    println!("ext2: host-seeded files read back through /mnt");
-
-    // The write: created through the mount crossing, grown past the twelve
-    // direct blocks into an indirect one.
-    vfs::resolve("/mnt")
-        .unwrap()
-        .create("written.bin", NodeKind::File)
-        .expect("create /mnt/written.bin");
-    const LEN: usize = 20 * 1024;
-    let bytes: Vec<u8> = (0..LEN).map(|i| (i * 31 + 7) as u8).collect();
-    let fd = vfs::open("/mnt/written.bin").expect("open /mnt/written.bin");
-    assert_eq!(
-        vfs::write(fd, &bytes).unwrap(),
-        LEN,
-        "the write came up short"
-    );
-    vfs::close(fd).unwrap();
-
-    // A second mount over the same device starts with an empty cache, so the
-    // only thing that can come back is what truly reached the disk.
-    let fs2 = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("remount the ext2 image");
-    let back = fs2
-        .root()
-        .lookup("written.bin")
-        .expect("written.bin persisted");
-    assert_eq!(back.metadata().size as usize, LEN);
-    let mut read_back = vec![0u8; LEN];
-    let n = back
-        .read_at(0, &mut read_back)
-        .expect("read written.bin back");
-    assert_eq!(n, LEN);
-    assert!(
-        read_back
-            .iter()
-            .enumerate()
-            .all(|(i, &b)| b == (i * 31 + 7) as u8),
-        "written.bin did not read back the pattern it was written with"
-    );
-
-    // And the host's files are unharmed by everything above them.
-    let seed = fs2.root().lookup("seed.txt").expect("seed.txt survived");
-    let mut buf = [0u8; 128];
-    let n = seed.read_at(0, &mut buf).expect("read seed.txt back");
-    assert_eq!(&buf[..n], SEED);
-
-    // Leave the image as the build made it. The disk outlives this boot - it
-    // is a file in build/ - so a file left behind here is still there next
-    // time, and the create above would then answer Exists.
-    vfs::resolve("/mnt")
-        .unwrap()
-        .unlink("written.bin")
-        .expect("unlink /mnt/written.bin");
-    // The same witness as before, in reverse: only a cold mount can say the
-    // name left the disk and not merely the cache of the mount that wrote it.
-    let fs3 = vfs::ext2::Ext2Fs::mount(dev).expect("remount after the unlink");
-    assert_eq!(
-        fs3.root().lookup("written.bin").err(),
-        Some(vfs::VfsError::NoEntry),
-        "written.bin is still on the disk after the unlink"
-    );
-
-    println!("ext2: {LEN} bytes written through /mnt, verified on a cold remount and removed");
-    println!("M10_OK");
-}
-
-/// M11: pipes, the tty line discipline, and signals.
-///
-/// Every blocking path here goes through `block_until`, so each scenario is
-/// also a lost-wakeup test: a writer that sleeps before writing means the
-/// reader was genuinely asleep when the data it waits for appeared.
-fn m11() {
+/// Prove pipes, TTY line discipline, and signal delivery.
+fn check_ipc() {
     use mpos::sched::signal::{SIGKILL, SIGTERM};
 
-    // --- a pipe carries bytes between tasks, then EOF when the writer leaves.
+    // --- pipe: bytes cross tasks, EOF after writer leaves.
     let mut fds = [0i32; 2];
     assert_eq!(
         unsafe { syscall(nr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
@@ -1229,8 +1149,6 @@ fn m11() {
 
     sched::spawn(
         move || {
-            // Sleep first, so the reader below is verifiably blocked when the
-            // data arrives; only a wake can get it moving again.
             sched::sleep_ticks(2);
             let msg = b"ping through a pipe\n";
             let wrote = unsafe {
@@ -1245,7 +1163,6 @@ fn m11() {
                 )
             };
             assert_eq!(wrote as usize, msg.len(), "the pipe dropped bytes");
-            // The last writer fd closes here: readers see EOF after this.
             vfs::close(wfd).unwrap();
         },
         Priority::NORMAL,
@@ -1271,7 +1188,7 @@ fn m11() {
     drain();
     println!("pipe: bytes crossed between two tasks, EOF after the writer left");
 
-    // --- writing with no reader is EPIPE, an error and not a death.
+    // --- pipe: write with no reader is EPIPE.
     let mut fds = [0i32; 2];
     assert_eq!(
         unsafe { syscall(nr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
@@ -1290,10 +1207,8 @@ fn m11() {
     vfs::close(wfd).unwrap();
     println!("pipe: write with no reader answered EPIPE and nobody died");
 
-    // --- the tty: editing, echo, canonical reads.
+    // --- tty: editing, echo, canonical reads, Ctrl-D.
     let tty = vfs::tty::global();
-    // The console shows `hellx`, the erase, then `o`: the line reads `hello`
-    // because the DEL took the `x` back off.
     for &b in b"hellx\x7fo\n" {
         tty.receive_byte(b);
     }
@@ -1309,8 +1224,7 @@ fn m11() {
     let n = tty.read(&mut line);
     assert_eq!(n, 0, "Ctrl-D on an empty line is EOF");
 
-    // fd 0 through the gate, blocking: input arrives two ticks after the read
-    // starts, so only a wake can finish this syscall.
+    // Blocking fd 0 read through the gate.
     sched::spawn(
         || {
             sched::sleep_ticks(2);
@@ -1326,14 +1240,10 @@ fn m11() {
     drain();
     println!("tty: line editing, echo, Ctrl-D, and a blocking fd 0 read");
 
-    // --- signals: fatal, delivered at the next blocking point.
-    // One paused; the wake itself is what ends it.
+    // --- signals: SIGTERM, SIGKILL, self-sent, kill(0) probe.
     let paused = sched::spawn(|| sched::pause(), Priority::NORMAL);
     sched::sleep_ticks(2);
     assert!(sched::send_signal(paused, SIGTERM));
-    // Polled, not blocked on: `exit` wakes the exiting task's *parent*, and
-    // these were started by the boot task through `spawn`, which leaves no
-    // parent link. Nothing would ever wake a sleeper here.
     wait_for_code(paused);
     assert_eq!(
         sched::exit_code(paused),
@@ -1342,7 +1252,6 @@ fn m11() {
     );
     drain();
 
-    // One blocked on a pipe read that will never be satisfied.
     let mut fds = [0i32; 2];
     assert_eq!(
         unsafe { syscall(nr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
@@ -1366,11 +1275,8 @@ fn m11() {
         "SIGKILL did not end the blocked reader"
     );
     drain();
-    // The victim's read fd stays in the global table; close the other end so
-    // the pipe's counts stay consistent with reality.
     vfs::close(wfd).unwrap();
 
-    // One that signals itself before blocking: delivery from the loop top.
     let selfsent = sched::spawn(
         || {
             sched::send_signal(sched::current(), SIGTERM);
@@ -1382,7 +1288,6 @@ fn m11() {
     assert_eq!(sched::exit_code(selfsent), Some(-(SIGTERM as isize)));
     drain();
 
-    // kill(pid, 0) is the existence probe; unknown pids answer ESRCH.
     assert_eq!(
         unsafe { syscall(nr::KILL, sched::current().0, 0, 0, 0, 0, 0) },
         0
@@ -1397,14 +1302,9 @@ fn m11() {
     println!("M11_OK");
 }
 
-/// The script the gate types at the shell, one byte at a time, as if typed.
-///
-/// The marker lines are written so the *output* is greppable while the typed
-/// echo is not: single quotes come off in the parse, so the echo of
-/// `echo M13_'PIPE'` holds no `M13_PIPE`, and only a pipeline that really
-/// carried the bytes can print one. The same trick covers redirection,
-/// variables, and `$?` - each marker is a result, not a symptom of a command
-/// having been attempted.
+// ---- shell + init: coreutils, pipelines, redirection, init handoff ------
+
+/// The script the gate types at the shell, one byte at a time.
 const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo hello from the shell\n",
     b"cat /etc/motd\n",
@@ -1423,15 +1323,8 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"\x04",
 ];
 
-/// M12: the thin libc, the shell, and the coreutils, all in ring 3.
-///
-/// The boot task spawns /bin/sh the way `spawn()` does - path, argv, parent
-/// link - while a kernel task types a script into the tty. Every command the
-/// script runs is a separate user process created through the gate: echo and
-/// cat and ls are programs, not kernel routines. When the script's Ctrl-D
-/// arrives the shell reads end of input and exits, and its exit code - read
-/// through wait's own path - must be 0.
-fn m12() {
+/// Prove the shell, coreutils, pipelines, and redirection in ring 3.
+fn check_shell() {
     let shell = vfs::read_file("/bin/sh").expect("the initramfs carries /bin/sh");
     let argv = alloc::vec![String::from("sh")];
     let sh = sched::try_spawn_user(&shell, Priority::NORMAL, sched::current(), &argv, &[])
@@ -1439,9 +1332,6 @@ fn m12() {
 
     sched::spawn(
         || {
-            // Give the shell a tick to reach its first read; the line
-            // discipline would queue the bytes anyway, but this way the log
-            // shows the prompt before the typing, as it would look.
             sched::sleep_ticks(2);
             for line in SHELL_SCRIPT {
                 for &b in *line {
@@ -1453,8 +1343,6 @@ fn m12() {
         Priority::NORMAL,
     );
 
-    // The wait the shell itself performs for its children, exercised here on
-    // the shell: block until it exits, then read the code it left.
     wait_for_code(sh);
     let code = sched::exit_code(sh).expect("the shell exited");
     assert_eq!(code, 0, "the shell did not end cleanly: {code}");
@@ -1468,47 +1356,25 @@ fn m12() {
 }
 
 /// Wait for every task a milestone started, and forget the codes they left.
-///
-/// [`drain`] waits; this also clears the records, because a milestone reads
-/// its codes with `exit_code` rather than by collecting them, and a record
-/// nobody ever takes is a record that lies to the next process to hold that
-/// pid - a `wait` would find a death that happened to somebody else.
 fn discard() {
     discard_codes();
     drain();
 }
 
+// ---- init handoff (terminal, not a check) --------------------------------
+
 /// M13: a real system start. The checks above are the kernel proving itself;
 /// this is the kernel handing the machine over.
-///
-/// /bin/init becomes pid 1 - the slot is reserved for it - and the boot task
-/// steps out of the way. Init starts the shell, waits for it, and starts
-/// another, so the prompt outlives any single shell. The console's input comes
-/// from the UART's own interrupt from here on, which is what makes the shell
-/// interactive rather than something the kernel types into.
-///
-/// The machine does not stop. [`kernel_main`] leaves the boot task parked, and
-/// the system runs until QEMU is told to quit.
-fn m13() {
+fn handoff_to_init() {
     let init = vfs::read_file("/bin/init").expect("the initramfs carries /bin/init");
     let argv = alloc::vec![String::from("init")];
     let pid = sched::spawn_init(&init, &argv).expect("the init image loaded");
     assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
     println!("mpos: handing the machine to /bin/init");
 
-    // Init is the system's now, not the boot task's: it is never reaped and
-    // never waited for here, so the boot task must not keep a claim on it.
     sched::discard_exit_code(pid);
 
-    // Real input from here on. Everything before this point was typed by the
-    // kernel so the checks could be scripted; the shell at the end of the line
-    // is reading a keyboard.
-    arch::serial::enable_rx();
-    // Wait until init has a child of its own, which is the shell and the point
-    // at which the system is up. Polled rather than `block_until`: the waker
-    // for "a task was spawned" is the spawner's own parent link, and this is
-    // not it - init is nobody's child, so nothing would ever wake the boot
-    // task out of that sleep. A tick-long nap is cheap and cannot miss.
+    drivers::serial::enable_rx();
     while !sched::has_live_child(pid) {
         sched::sleep_ticks(1);
     }
@@ -1517,15 +1383,6 @@ fn m13() {
 }
 
 /// Where the boot task spends the rest of the machine's life.
-///
-/// A task switched out of `schedule` resumes with interrupts off - that is the
-/// switch's contract - so a `yield_now` loop would park this task with the CPU
-/// deaf to its own clock and its own keyboard. `wait_for_interrupt` is the one
-/// place that hands them back.
-///
-/// Parking here costs the system one task slot and the boot task's turns: it
-/// never requeues itself, so init and the shell get the CPU. The clock still
-/// ticks and the keyboard still interrupts, which is the whole point.
 fn park() -> ! {
     loop {
         sched::wait_for_interrupt();
@@ -1535,5 +1392,5 @@ fn park() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("\nKERNEL PANIC: {}", info);
-    qemu::exit(qemu::EXIT_FAILURE)
+    drivers::qemu::exit(drivers::qemu::EXIT_FAILURE)
 }

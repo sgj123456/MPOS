@@ -16,6 +16,16 @@
 /// The syscall numbers, in a file of their own so user programs can include it.
 pub mod nr;
 
+/// File-related syscall handlers (READ, WRITE, OPEN, CLOSE, CREATE, UNLINK,
+/// LISTDIR, DUP2, CHDIR, PIPE).
+#[cfg(target_os = "none")]
+pub mod fs;
+
+/// Process-related syscall handlers (EXIT, YIELD, GETPID, SLEEP, SPAWN, WAIT,
+/// KILL).
+#[cfg(target_os = "none")]
+pub mod proc;
+
 /// The errno values [`dispatch`] returns, already negated for `rax`.
 pub mod err {
     pub const ENOENT: isize = -2;
@@ -41,403 +51,85 @@ pub mod err {
 /// How many register arguments a syscall may pass.
 pub const ARG_COUNT: usize = 6;
 
+/// Upper bound on a single read or write.
+#[cfg(target_os = "none")]
+pub(crate) const MAX_IO: usize = 1 << 20;
+
+/// Maximum length of a path argument.
+#[cfg(target_os = "none")]
+pub(crate) const MAX_PATH: usize = 255;
+
+/// Map a VFS error onto the errno [`dispatch`] returns.
+#[cfg(target_os = "none")]
+pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
+    use crate::vfs::VfsError;
+    match e {
+        VfsError::NoEntry => err::ENOENT,
+        VfsError::NotDir => err::ENOTDIR,
+        VfsError::IsDir => err::EISDIR,
+        VfsError::Exists => err::EEXIST,
+        VfsError::Busy => err::EBUSY,
+        VfsError::BadFd => err::EBADF,
+        VfsError::NoRoot | VfsError::Invalid => err::EINVAL,
+        VfsError::NoSpace => err::ENOSPC,
+        VfsError::FileTooBig => err::EFBIG,
+        VfsError::BrokenPipe => err::EPIPE,
+        VfsError::Unsupported => err::ENOSYS,
+    }
+}
+
+/// Validate a user buffer: length within bounds and pages accessible.
+#[cfg(target_os = "none")]
+pub(crate) fn buffer_ok(buf: usize, len: usize, write: bool, from_user: bool) -> bool {
+    len <= MAX_IO && (!from_user || crate::arch::paging::user_accessible(buf, len, write))
+}
+
+/// Parse a path argument from a (ptr, len) pair into an owned String.
+#[cfg(target_os = "none")]
+pub(crate) fn path_arg(ptr: usize, len: usize, from_user: bool) -> Result<alloc::string::String, isize> {
+    if len == 0 || len > MAX_PATH {
+        return Err(err::EINVAL);
+    }
+    if !buffer_ok(ptr, len, false, from_user) {
+        return Err(err::EFAULT);
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    core::str::from_utf8(bytes)
+        .map(alloc::string::String::from)
+        .map_err(|_| err::EINVAL)
+}
+
 #[cfg(target_os = "none")]
 pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    use alloc::string::String;
-    use alloc::vec::Vec;
-
-    use crate::sched::TaskId;
-    use crate::vfs::VfsError;
-
-    // Upper bound on a single read or write, so a bad length is an error
-    // rather than a run off the end of memory.
-    const MAX_IO: usize = 1 << 20;
-
-    // Map a VFS error onto the errno `dispatch` returns. The kernel's own
-    // callers see the rich value; ring 3 sees only the number.
-    fn err_of(e: VfsError) -> isize {
-        match e {
-            VfsError::NoEntry => err::ENOENT,
-            VfsError::NotDir => err::ENOTDIR,
-            VfsError::IsDir => err::EISDIR,
-            VfsError::Exists => err::EEXIST,
-            VfsError::Busy => err::EBUSY,
-            VfsError::BadFd => err::EBADF,
-            VfsError::NoRoot | VfsError::Invalid => err::EINVAL,
-            VfsError::NoSpace => err::ENOSPC,
-            VfsError::FileTooBig => err::EFBIG,
-            VfsError::BrokenPipe => err::EPIPE,
-            VfsError::Unsupported => err::ENOSYS,
-        }
-    }
-
-    // Every buffer syscall starts the same way: trust the length no further
-    // than MAX_IO and, from user mode, no further than the caller's own page
-    // tables. `write` says whether the pages must be user-writable.
-    fn buffer_ok(buf: usize, len: usize, write: bool, from_user: bool) -> bool {
-        len <= MAX_IO && (!from_user || crate::arch::paging::user_accessible(buf, len, write))
-    }
-
-    // A path argument: bytes at (ptr, len), length-capped, owned text on the
-    // way out. Everything past this point trusts it as a path.
-    const MAX_PATH: usize = 255;
-    fn path_arg(ptr: usize, len: usize, from_user: bool) -> Result<String, isize> {
-        if len == 0 || len > MAX_PATH {
-            return Err(err::EINVAL);
-        }
-        if !buffer_ok(ptr, len, false, from_user) {
-            return Err(err::EFAULT);
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-        core::str::from_utf8(bytes)
-            .map(String::from)
-            .map_err(|_| err::EINVAL)
-    }
-
     // A signal that arrived while the task was running is delivered before it
-    // gets to ask for anything: the same rule as `block_until`, applied at the
-    // other door into the kernel.
+    // gets to ask for anything.
     crate::sched::deliver_pending_signal();
 
-    // Where a caller's relative paths start. A process carries a cwd; kernel
-    // callers have none, and always mean the root - which is what resolve
-    // does anyway, so they keep the plain forms.
-    let cwd = if from_user {
-        Some(crate::sched::current_cwd())
-    } else {
-        None
-    };
+    // Where a caller's relative paths start.
+    let cwd = crate::sched::current_cwd();
 
     match nr {
-        nr::EXIT => crate::sched::exit(args[0] as isize),
-        nr::READ => {
-            let (fd, buf, len) = (args[0], args[1], args[2]);
-            if !buffer_ok(buf, len, true, from_user) {
-                return if len > MAX_IO {
-                    err::EINVAL
-                } else {
-                    err::EFAULT
-                };
-            }
-            // An empty read touches no memory but still names an fd. fd 0 is
-            // the tty and blocks for a line; fd 1 and 2 are the console.
-            if len == 0 {
-                return match crate::vfs::read(fd as i32, &mut []) {
-                    Ok(_) => 0,
-                    Err(e) => err_of(e),
-                };
-            }
-            let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-            match crate::vfs::read(fd as i32, bytes) {
-                Ok(n) => n as isize,
-                Err(e) => err_of(e),
-            }
-        }
-        nr::WRITE => {
-            let (fd, buf, len) = (args[0], args[1], args[2]);
-            if !buffer_ok(buf, len, false, from_user) {
-                return if len > MAX_IO {
-                    err::EINVAL
-                } else {
-                    err::EFAULT
-                };
-            }
-            if len == 0 {
-                return match crate::vfs::write(fd as i32, &[]) {
-                    Ok(_) => 0,
-                    Err(e) => err_of(e),
-                };
-            }
-            let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-            match crate::vfs::write(fd as i32, bytes) {
-                Ok(n) => n as isize,
-                Err(e) => err_of(e),
-            }
-        }
-        nr::YIELD => {
-            crate::sched::yield_now();
-            0
-        }
-        nr::GETPID => crate::sched::current().0 as isize,
-        nr::SLEEP => {
-            let ms = args[0] as u64;
-            if ms == 0 {
-                return 0;
-            }
-            let ticks = (ms.saturating_mul(crate::arch::timer::TICK_HZ as u64) / 1000).max(1);
-            crate::sched::sleep_ticks(ticks);
-            0
-        }
-        nr::PIPE => {
-            // args[0] names two i32 slots: the read end, then the write end.
-            let out = args[0];
-            if out == 0 || !buffer_ok(out, 2 * core::mem::size_of::<i32>(), true, from_user) {
-                return err::EFAULT;
-            }
-            let (read_end, write_end) = crate::vfs::pipe::pair();
-            // The table hands out slots lowest-first, so the pair is adjacent -
-            // not that a correct caller may assume it.
-            let fds = [
-                crate::vfs::file::open_inode(read_end),
-                crate::vfs::file::open_inode(write_end),
-            ];
-            unsafe {
-                let slot = out as *mut i32;
-                slot.write(fds[0]);
-                slot.add(1).write(fds[1]);
-            }
-            0
-        }
-        nr::KILL => {
-            let (id, sig) = (args[0], args[1]);
-            if sig > 31 {
-                return err::EINVAL;
-            }
-            // sig 0 is the POSIX existence probe: nothing is delivered.
-            if crate::sched::send_signal(TaskId(id), sig as u8) {
-                0
-            } else {
-                err::ESRCH
-            }
-        }
-        nr::OPEN => {
-            let (ptr, len) = (args[0], args[1]);
-            match path_arg(ptr, len, from_user) {
-                Ok(path) => match crate::vfs::open_opt(&path, cwd.clone()) {
-                    Ok(fd) => fd as isize,
-                    Err(e) => err_of(e),
-                },
-                Err(e) => e,
-            }
-        }
-        nr::CLOSE => match crate::vfs::close(args[0] as i32) {
-            Ok(()) => 0,
-            Err(e) => err_of(e),
-        },
-        nr::SPAWN => {
-            let (path_ptr, path_len, blob_ptr, blob_len) = (args[0], args[1], args[2], args[3]);
-            let path = match path_arg(path_ptr, path_len, from_user) {
-                Ok(path) => path,
-                Err(e) => return e,
-            };
+        // -- process --
+        nr::EXIT => proc::handle_exit(args),
+        nr::YIELD => proc::handle_yield(),
+        nr::GETPID => proc::handle_getpid(),
+        nr::SLEEP => proc::handle_sleep(args),
+        nr::KILL => proc::handle_kill(args),
+        nr::SPAWN => proc::handle_spawn(args, from_user, &cwd),
+        nr::WAIT => proc::handle_wait(args),
 
-            // The argument blob is NUL-terminated strings packed back to
-            // back, argv[0] first. No blob means the program runs with just
-            // its own name, the way exec's argv contract starts every count.
-            let mut argv: Vec<String> = Vec::new();
-            if blob_ptr != 0 && blob_len != 0 {
-                if blob_len > crate::sched::ARGS_BYTES_MAX {
-                    return err::EINVAL;
-                }
-                if !buffer_ok(blob_ptr, blob_len, false, from_user) {
-                    return err::EFAULT;
-                }
-                let bytes = unsafe { core::slice::from_raw_parts(blob_ptr as *const u8, blob_len) };
-                let mut rest = bytes;
-                while !rest.is_empty() {
-                    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-                    let field = &rest[..end];
-                    match core::str::from_utf8(field) {
-                        // An empty field - a doubled NUL or a leading one -
-                        // is not an argument the loader can place.
-                        Ok(s) if !s.is_empty() => argv.push(String::from(s)),
-                        _ => return err::EINVAL,
-                    }
-                    if end == rest.len() {
-                        break;
-                    }
-                    rest = &rest[end + 1..];
-                }
-                if argv.len() > crate::sched::ARGV_MAX {
-                    return err::EINVAL;
-                }
-            }
-            if argv.is_empty() {
-                let name = path.rsplit('/').next().unwrap_or(&path);
-                argv.push(String::from(name));
-            }
+        // -- file system --
+        nr::READ => fs::handle_read(args, from_user),
+        nr::WRITE => fs::handle_write(args, from_user),
+        nr::OPEN => fs::handle_open(args, from_user, &cwd),
+        nr::CLOSE => fs::handle_close(args),
+        nr::CREATE => fs::handle_create(args, from_user, &cwd),
+        nr::UNLINK => fs::handle_unlink(args, from_user, &cwd),
+        nr::CHDIR => fs::handle_chdir(args, from_user),
+        nr::DUP2 => fs::handle_dup2(args),
+        nr::LISTDIR => fs::handle_listdir(args, from_user, &cwd),
+        nr::PIPE => fs::handle_pipe(args, from_user),
 
-            // What descriptors the child should be born holding, as pairs of
-            // i32: take the first from this process's table, install it at
-            // the second in the child's. This is the whole of redirection - a
-            // shell hands its pipe ends over here, because the child's table
-            // is built by the kernel and there is no moment in between for
-            // anybody else to reach it.
-            let mut redirects: Vec<crate::sched::Redirect> = Vec::new();
-            let (redir_ptr, redir_count) = (args[4], args[5]);
-            if redir_count > 0 {
-                const REDIRECT_MAX: usize = 8;
-                if redir_count > REDIRECT_MAX {
-                    return err::EINVAL;
-                }
-                let bytes = redir_count * 2 * size_of::<i32>();
-                if !buffer_ok(redir_ptr, bytes, false, from_user) {
-                    return err::EFAULT;
-                }
-                let pairs = unsafe {
-                    core::slice::from_raw_parts(redir_ptr as *const i32, redir_count * 2)
-                };
-                for pair in pairs.as_chunks::<2>().0 {
-                    let (from, to) = (pair[0], pair[1]);
-                    // Either number negative means the caller is confused:
-                    // descriptors are never negative, and quietly ignoring a
-                    // redirect would leave the child talking to the wrong
-                    // place.
-                    if from < 0 || to < 0 {
-                        return err::EBADF;
-                    }
-                    redirects.push((from, to));
-                }
-            }
-
-            let bytes = match crate::vfs::read_file_opt(&path, cwd.clone()) {
-                Ok(bytes) => bytes,
-                Err(e) => return err_of(e),
-            };
-            match crate::sched::try_spawn_user(
-                &bytes,
-                crate::sched::Priority::NORMAL,
-                crate::sched::current(),
-                &argv,
-                &redirects,
-            ) {
-                Ok(id) => id.0 as isize,
-                Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
-                Err(crate::sched::SpawnError::ArgsTooBig) => err::EINVAL,
-                Err(crate::sched::SpawnError::BadFd) => err::EBADF,
-            }
-        }
-        nr::WAIT => {
-            let (pid, flags) = (args[0], args[1]);
-            // Bit 0: do not block. A shell reaping background jobs asks again
-            // and again, and a sleeper it cannot wake would hang the prompt.
-            const WNOHANG: usize = 1;
-            let no_hang = flags & WNOHANG != 0;
-            let me = crate::sched::current();
-            // -1 is POSIX's "any child", and it is what init wants: it starts
-            // a shell, waits for whichever child ends, and starts another.
-            // `usize::MAX` is how a negative of any width arrives here.
-            if pid == usize::MAX {
-                if no_hang {
-                    return match crate::sched::poll_any_child(me) {
-                        Some((_id, code)) => code,
-                        None => err::EAGAIN,
-                    };
-                }
-                return match crate::sched::wait_any_child(me) {
-                    Some((_id, code)) => code,
-                    None => err::ECHILD,
-                };
-            }
-            if pid == 0 || pid >= crate::sched::MAX_TASKS {
-                return err::ECHILD;
-            }
-            let id = TaskId(pid);
-            // Only a live child of ours is worth blocking on. Anything else -
-            // another task's child, a pid that never existed - either left a
-            // record behind or gets ECHILD.
-            if crate::sched::is_child(id, me) && !no_hang {
-                crate::sched::block_until_code(id);
-            }
-            match crate::sched::take_exit_code(id) {
-                Some(code) => code,
-                None if no_hang => err::EAGAIN,
-                None => err::ECHILD,
-            }
-        }
-        nr::DUP2 => {
-            // Duplicating a descriptor onto a number already in use is the
-            // POSIX way to redirect: the target is closed first, silently.
-            let (old, new) = (args[0] as i32, args[1] as i32);
-            if new < 0 {
-                return err::EBADF;
-            }
-            match crate::vfs::dup2(old, new) {
-                Ok(fd) => fd as isize,
-                Err(e) => err_of(e),
-            }
-        }
-        // The two ways ring 3 makes and unmakes a name. Both go through the
-        // parent directory, because that is where the edge lives: a file is
-        // reachable by name only as long as its directory says so.
-        nr::CREATE => {
-            let path = match path_arg(args[0], args[1], from_user) {
-                Ok(path) => path,
-                Err(e) => return e,
-            };
-            if let Err(e) = crate::vfs::create_file_opt(&path, cwd.clone()) {
-                return err_of(e);
-            }
-            // The caller gets a descriptor, not the inode: a name it just
-            // made is one it almost always means to write.
-            match crate::vfs::open_opt(&path, cwd.clone()) {
-                Ok(fd) => fd as isize,
-                Err(e) => err_of(e),
-            }
-        }
-        nr::UNLINK => {
-            let path = match path_arg(args[0], args[1], from_user) {
-                Ok(path) => path,
-                Err(e) => return e,
-            };
-            match crate::vfs::unlink_opt(&path, cwd.clone()) {
-                Ok(()) => 0,
-                Err(e) => err_of(e),
-            }
-        }
-        nr::CHDIR => {
-            let path = match path_arg(args[0], args[1], from_user) {
-                Ok(path) => path,
-                Err(e) => return e,
-            };
-            let start = crate::sched::current_cwd();
-            match crate::vfs::resolve_at(&path, start) {
-                Ok(dir) if dir.metadata().kind == crate::vfs::NodeKind::Dir => {
-                    crate::sched::set_cwd(dir);
-                    0
-                }
-                Ok(_) => err::ENOTDIR,
-                Err(e) => err_of(e),
-            }
-        }
-        nr::LISTDIR => {
-            let (ptr, len, buf, buf_len) = (args[0], args[1], args[2], args[3]);
-            let path = match path_arg(ptr, len, from_user) {
-                Ok(path) => path,
-                Err(e) => return e,
-            };
-            let entries = match crate::vfs::read_dir_opt(&path, cwd.clone()) {
-                Ok(entries) => entries,
-                Err(e) => return err_of(e),
-            };
-
-            // Stream form: per entry one kind byte, the name, a NUL. A
-            // caller that passes a zero length gets the size it needs, so
-            // the buffer is never guessed at twice.
-            let mut stream = Vec::new();
-            for (name, kind) in &entries {
-                stream.push(match kind {
-                    crate::vfs::NodeKind::File => nr::kind::FILE,
-                    crate::vfs::NodeKind::Dir => nr::kind::DIR,
-                    crate::vfs::NodeKind::CharDev => nr::kind::CHARDEV,
-                });
-                stream.extend_from_slice(name.as_bytes());
-                stream.push(0);
-            }
-            if buf_len == 0 {
-                return stream.len() as isize;
-            }
-            if buf_len < stream.len() {
-                return err::EINVAL;
-            }
-            if !buffer_ok(buf, stream.len(), true, from_user) {
-                return err::EFAULT;
-            }
-            unsafe {
-                core::ptr::copy_nonoverlapping(stream.as_ptr(), buf as *mut u8, stream.len());
-            }
-            stream.len() as isize
-        }
         _ => err::ENOSYS,
     }
 }
@@ -448,7 +140,6 @@ mod tests {
 
     #[test]
     fn numbers_are_pinned() {
-        // The libc binds these literal values; renumbering is a breaking change.
         assert_eq!(nr::EXIT, 0);
         assert_eq!(nr::READ, 1);
         assert_eq!(nr::WRITE, 2);
