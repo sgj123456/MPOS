@@ -124,6 +124,7 @@ pub(super) fn handle_spawn(
         crate::sched::current(),
         &argv,
         &redirects,
+        &path,
     ) {
         Ok(id) => id.0 as isize,
         Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
@@ -175,41 +176,46 @@ pub(super) fn handle_getppid() -> isize {
 
 /// `execve(path, argv, envp)` — replace the current process image.
 ///
-/// This maps onto the existing `handle_spawn` with the same process.
+/// Linux shape: a NUL-terminated path, then NULL-terminated pointer arrays
+/// for argv and envp. mpos maps the call onto its loader as a documented
+/// approximation: the image is loaded as a new task that is a child of the
+/// caller, the new task's id comes back, and the caller keeps running - a
+/// real execve would replace the caller and never return. The child gets the
+/// caller's argv, and the spawned image's path is what `/proc/self/exe`
+/// reads through.
 pub(super) fn handle_execve(
     args: [usize; super::ARG_COUNT],
-    from_user: bool,
     cwd: &Arc<dyn crate::vfs::Inode>,
 ) -> isize {
-    // execve replaces the current process. We implement it by loading the ELF
-    // and mapping it into the current address space. For now, delegate to
-    // spawn which creates a new process — the caller's process continues.
-    // A full execve would need to tear down the current address space first.
-    //
-    // For coreutils, this is acceptable: each command runs as a separate process
-    // started by the shell.
-    let path_ptr = args[0];
-    let path_len = args[1];
-    match super::path_arg(path_ptr, path_len, from_user) {
-        Ok(path) => {
-            let bytes = match crate::vfs::read_file_opt(&path, Some(cwd.clone())) {
-                Ok(bytes) => bytes,
-                Err(e) => return super::err_of(e),
-            };
-            match crate::sched::try_spawn_user(
-                &bytes,
-                crate::sched::Priority::NORMAL,
-                crate::sched::current(),
-                &[],
-                &[],
-            ) {
-                Ok(id) => id.0 as isize,
-                Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
-                Err(crate::sched::SpawnError::ArgsTooBig) => err::EINVAL,
-                Err(crate::sched::SpawnError::BadFd) => err::EBADF,
-            }
-        }
-        Err(e) => e,
+    let path = match super::cstr_arg(args[0], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let mut argv = match super::argv_arg(args[1]) {
+        Ok(argv) => argv,
+        Err(e) => return e,
+    };
+    if argv.is_empty() {
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        argv.push(String::from(name));
+    }
+    // envp (args[2]) is accepted and ignored: mpos has no environment.
+    let bytes = match crate::vfs::read_file_opt(&path, Some(cwd.clone())) {
+        Ok(bytes) => bytes,
+        Err(e) => return super::err_of(e),
+    };
+    match crate::sched::try_spawn_user(
+        &bytes,
+        crate::sched::Priority::NORMAL,
+        crate::sched::current(),
+        &argv,
+        &[],
+        &path,
+    ) {
+        Ok(id) => id.0 as isize,
+        Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
+        Err(crate::sched::SpawnError::ArgsTooBig) => err::E2BIG,
+        Err(crate::sched::SpawnError::BadFd) => err::EBADF,
     }
 }
 
@@ -244,71 +250,321 @@ pub(super) fn handle_fork(_args: [usize; super::ARG_COUNT]) -> isize {
 }
 
 /// `brk(addr)` — change the program break (heap end).
-///
-/// If addr is 0, returns the current break. Otherwise sets the break and
-/// returns the new break. Minimal implementation that allocates pages on demand.
 pub(super) fn handle_brk(args: [usize; super::ARG_COUNT]) -> isize {
     let addr = args[0];
-    if addr == 0 {
-        // Return current program break (after BSS).
-        // We don't track this yet, return a reasonable default.
-        0x6000_0000
-    } else {
-        // Accept any request — stub that "succeeds".
-        addr as isize
-    }
+    crate::sched::brk(addr)
 }
 
-/// `mmap(addr, length, prot, flags, fd, offset)` — map files or anonymous memory.
+use crate::mm::vm::MapFlags;
+
+/// `mmap`'s flag bits, as Linux numbers them.
+const MAP_SHARED: usize = 0x01;
+const MAP_FIXED: usize = 0x10;
+const MAP_ANONYMOUS: usize = 0x20;
+/// `mprotect`'s protection bits.
+const PROT_WRITE: usize = 0x2;
+const PROT_EXEC: usize = 0x4;
+/// `mremap`'s flag bits: the move may go somewhere else, and the caller named
+/// where.
+const MREMAP_MAYMOVE: usize = 0x1;
+const MREMAP_FIXED: usize = 0x2;
+/// One past the highest address a process may map: the lower half of the
+/// canonical address space, which is where every user mapping lives.
+const USER_LIMIT: usize = 1 << 47;
+
+/// Where the next `mmap` that does not name an address starts looking. A
+/// process's own fixed mappings are skipped over rather than assumed away.
+static MMAP_CURSOR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0x8000_0000);
+
+/// `mmap(addr, length, prot, flags, fd, offset)` — map anonymous memory.
 ///
-/// Minimal implementation: for anonymous mappings, allocate pages and return.
-/// For file-backed mappings with fd=-1 (MAP_ANONYMOUS), allocate pages.
+/// Only anonymous private mappings exist: mpos has no file mappings, and a
+/// request for one is refused rather than answered with zeroed pages.
+///
+/// The address handling is Linux's, and two details of it are load-bearing for
+/// a real libc:
+///
+/// * `MAP_FIXED` *takes* the range. Whatever was mapped there is dropped first,
+///   so the call cannot fail because something was in the way. musl's mallocng
+///   depends on this: it claims the guard page of its heap by mapping
+///   `PROT_NONE` over the first page of a range it has just grown with `brk`.
+///   A kernel that refuses - or worse, asserts - breaks every musl program.
+/// * Without `MAP_FIXED` the address is only a hint, and a hint that is still
+///   in use is simply not taken: the mapping goes wherever there is room.
+///
+/// `PROT_NONE` maps the pages *present but unreachable from ring 3* rather than
+/// leaving them unmapped, so a later `mprotect` can hand them back with their
+/// contents intact.
 pub(super) fn handle_mmap(args: [usize; super::ARG_COUNT]) -> isize {
-    let (addr, length, _prot, flags, fd, _offset) =
+    use crate::mm::pframe::PAGE_SIZE;
+
+    let (addr, length, prot, flags, _fd, _offset) =
         (args[0], args[1], args[2], args[3], args[4] as i32, args[5]);
 
-    let map_anonymous: usize = 0x20;
-    let _map_private: usize = 0x02;
-    let _map_fixed: usize = 0x10;
+    let anon = flags & MAP_ANONYMOUS != 0;
+    let shared = flags & MAP_SHARED != 0;
+    let fixed = flags & MAP_FIXED != 0;
 
-    let anon = (flags & map_anonymous) != 0;
-    let _private = (flags & _map_private) != 0;
-
-    if !anon && fd >= 0 {
-        // File-backed mapping: not supported yet, return error.
-        return -super::err::ENOSYS;
+    if length == 0 {
+        return err::EINVAL;
+    }
+    // Anonymous is the only kind mpos can build: a file mapping would need a
+    // page cache to read the file through. The descriptor is ignored when the
+    // mapping is anonymous, as Linux ignores it.
+    if !anon {
+        return err::ENODEV;
+    }
+    // A shared anonymous mapping is a mapping two processes would have to see
+    // the same frames through, which mpos does not do yet.
+    if shared {
+        return err::ENOSYS;
     }
 
-    let pages = length.div_ceil(crate::mm::pframe::PAGE_SIZE);
-    let base = if addr != 0 {
-        addr // hint or fixed
-    } else {
-        // Let the kernel choose — use a fixed range for now.
-        0x2000_0000
+    let len = crate::mm::pframe::align_up(length, PAGE_SIZE);
+    // An address a process can actually use: inside the lower half, on a page
+    // boundary, and not wrapping.
+    let want = (addr != 0
+        && addr.is_multiple_of(PAGE_SIZE)
+        && addr.checked_add(len).is_some_and(|end| end < USER_LIMIT))
+    .then_some(addr);
+
+    let base = match (fixed, want) {
+        // Linux: a fixed request *takes* the range, replacing what is there.
+        (true, Some(addr)) => {
+            crate::sched::release_user_frames(crate::sched::unmap_user(addr, len));
+            addr
+        }
+        // A fixed request for an address that cannot be honoured is an error,
+        // not something to paper over by mapping elsewhere: the caller is
+        // relying on the address.
+        (true, None) => return err::EINVAL,
+        // Without `MAP_FIXED` the address is only a hint, and one that is
+        // already in use is simply not taken.
+        (false, Some(addr)) if crate::sched::user_range_free(addr, len) => addr,
+        _ => match free_range(len) {
+            Some(base) => base,
+            None => return err::ENOMEM,
+        },
     };
 
-    // Allocate physical frames and map them.
-    use crate::mm::pframe::PAGE_SIZE;
-    for _i in 0..pages {
+    // Readable is what a present page is; `USER` is what makes it reachable
+    // from ring 3 at all, and `PROT_NONE` is exactly the absence of that bit.
+    let mut mf = MapFlags::READ;
+    if prot & PROT_WRITE != 0 {
+        mf |= MapFlags::WRITE;
+    }
+    if prot & PROT_EXEC != 0 {
+        mf |= MapFlags::EXEC;
+    }
+    if prot != 0 {
+        mf |= MapFlags::USER;
+    }
+
+    for page in (base..base + len).step_by(PAGE_SIZE) {
+        // The pages of a replaced range are gone; these are fresh ones, zeroed
+        // as POSIX promises for anonymous memory.
         let frame = match crate::mm::alloc_frames(0) {
-            Some(f) => f,
-            None => return -super::err::ENOMEM,
+            Some(frame) => frame,
+            None => return err::ENOMEM,
         };
-        // Zero the frame.
-        unsafe {
-            let ptr = crate::mm::phys_to_virt(frame) as *mut u8;
-            core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
+        unsafe { core::ptr::write_bytes(crate::mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
+        if crate::sched::current_map_user(page, frame, mf) < 0 {
+            return err::ENOMEM;
         }
-        // Map into the current address space — we'd need the space to do this
-        // properly, but for now just return the virtual address.
     }
 
     base as isize
 }
 
-/// `munmap(addr, length)` — unmap memory.
-pub(super) fn handle_munmap(_args: [usize; super::ARG_COUNT]) -> isize {
-    // Stub: accept silently.
+/// `mremap(old, old_size, new_size, flags, new_address)` — resize or move a
+/// mapping.
+///
+/// The pages are the *same frames* before and after: a move re-maps them at the
+/// new address and takes the old address away, with nothing copied and nothing
+/// given back to the allocator. That is what lets a caller keep what a mapping
+/// held across the call, which is the whole point of asking.
+///
+/// Without `MREMAP_MAYMOVE` the mapping can only be resized where it is: a
+/// shrink always works, a grow works when the pages above are free, and
+/// anything else answers `ENOMEM`. That last answer is load-bearing: musl's
+/// `pthread_getattr_np` finds the bottom of a stack by probing with `mremap`
+/// and reading `ENOMEM` as "still inside the mapping" and a failure of any
+/// other kind as "here is the edge".
+pub(super) fn handle_mremap(args: [usize; super::ARG_COUNT]) -> isize {
+    use crate::mm::pframe::PAGE_SIZE;
+
+    let (old_addr, old_len, new_len, flags, new_addr) =
+        (args[0], args[1], args[2], args[3], args[4]);
+
+    if old_len == 0 || new_len == 0 || !old_addr.is_multiple_of(PAGE_SIZE) {
+        return err::EINVAL;
+    }
+    let old = crate::mm::pframe::align_up(old_len, PAGE_SIZE);
+    let new = crate::mm::pframe::align_up(new_len, PAGE_SIZE);
+    if old_addr
+        .checked_add(old)
+        .is_none_or(|end| end >= USER_LIMIT)
+    {
+        return err::EINVAL;
+    }
+    let may_move = flags & MREMAP_MAYMOVE != 0;
+    let to_fixed = flags & MREMAP_FIXED != 0;
+    // Linux: asking for a destination is asking to move there.
+    if to_fixed && !may_move {
+        return err::EINVAL;
+    }
+
+    // Every page has to be mapped: mremap moves mappings, and a hole has
+    // nothing in it to move. Whether each page is *reachable from ring 3* is
+    // kept, so a `PROT_NONE` page stays one after the move.
+    let mut frames = alloc::vec::Vec::new();
+    for page in (old_addr..old_addr + old).step_by(PAGE_SIZE) {
+        let Some(frame) = crate::sched::user_frame_at(page) else {
+            return err::EFAULT;
+        };
+        let reachable = crate::arch::paging::user_accessible(page, PAGE_SIZE, false);
+        frames.push((frame, reachable));
+    }
+
+    if !to_fixed {
+        // A shrink, or a grow into the pages just above.
+        if new <= old {
+            crate::sched::release_user_frames(crate::sched::unmap_user(old_addr + new, old - new));
+            return old_addr as isize;
+        }
+        if crate::sched::user_range_free(old_addr + old, new - old) {
+            return if add_pages(old_addr + old, new - old) {
+                old_addr as isize
+            } else {
+                err::ENOMEM
+            };
+        }
+        if !may_move {
+            return err::ENOMEM;
+        }
+    }
+
+    // Move: either into the range the caller named, which is taken the way
+    // `MAP_FIXED` takes one, or into the first free run big enough.
+    let dest = if to_fixed {
+        if new_addr % PAGE_SIZE != 0
+            || new_addr
+                .checked_add(new)
+                .is_none_or(|end| end >= USER_LIMIT)
+            // A destination overlapping the source would have its pages freed
+            // underneath the move. Linux allows it; this does not, and says so.
+            || new_addr < old_addr + old && old_addr < new_addr + new
+        {
+            return err::EINVAL;
+        }
+        crate::sched::release_user_frames(crate::sched::unmap_user(new_addr, new));
+        new_addr
+    } else {
+        match free_range(new) {
+            Some(dest) => dest,
+            None => return err::ENOMEM,
+        }
+    };
+
+    // The pages go down before the old ones come away, so a mapping that
+    // cannot be placed leaves the original intact rather than half moved.
+    for (index, (frame, reachable)) in frames.iter().enumerate() {
+        let mut mf = MapFlags::READ | MapFlags::WRITE;
+        if *reachable {
+            mf |= MapFlags::USER;
+        }
+        if !crate::sched::move_user_page(dest + index * PAGE_SIZE, *frame, mf) {
+            return err::ENOMEM;
+        }
+    }
+    if !add_pages(dest + old, new - old) {
+        return err::ENOMEM;
+    }
+    // The frames moved with the mapping, so this frees nothing.
+    crate::sched::unmap_user(old_addr, old);
+
+    dest as isize
+}
+
+/// Map `len` fresh, zeroed, process-owned pages at `virt`.
+fn add_pages(virt: usize, len: usize) -> bool {
+    use crate::mm::pframe::PAGE_SIZE;
+    for page in (virt..virt + len).step_by(PAGE_SIZE) {
+        let Some(frame) = crate::mm::alloc_frames(0) else {
+            return false;
+        };
+        unsafe { core::ptr::write_bytes(crate::mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
+        let flags = MapFlags::READ | MapFlags::WRITE | MapFlags::USER;
+        if crate::sched::current_map_user(page, frame, flags) < 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The first run of `len` bytes, page-aligned and below the user limit, that
+/// this process has nothing mapped in.
+fn free_range(len: usize) -> Option<usize> {
+    use crate::mm::pframe::PAGE_SIZE;
+    // One cursor for every process: it only ever moves forward, and skipping
+    // what a process has already taken keeps a later process from being handed
+    // an address someone else chose to fix a mapping at.
+    const CURSOR_START: usize = 0x8000_0000;
+    let mut candidate = MMAP_CURSOR
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .max(CURSOR_START);
+    loop {
+        let end = candidate.checked_add(len)?;
+        if end >= USER_LIMIT {
+            return None;
+        }
+        if crate::sched::user_range_free(candidate, len) {
+            MMAP_CURSOR.store(candidate + len, core::sync::atomic::Ordering::Relaxed);
+            return Some(candidate);
+        }
+        candidate = crate::mm::pframe::align_up(end, PAGE_SIZE);
+    }
+}
+
+/// `munmap(addr, length)` — drop mappings.
+///
+/// Linux rounds the range outwards to whole pages and ignores holes, which is
+/// what [`crate::sched::unmap_user`] does. The frames come back to the
+/// allocator because nothing can reach them once the entries are gone.
+pub(super) fn handle_munmap(args: [usize; super::ARG_COUNT]) -> isize {
+    let (addr, length) = (args[0], args[1]);
+    if !addr.is_multiple_of(crate::mm::pframe::PAGE_SIZE) || length == 0 {
+        return err::EINVAL;
+    }
+    crate::sched::release_user_frames(crate::sched::unmap_user(addr, length));
+    0
+}
+
+/// `mprotect(addr, len, prot)` — change what a range of pages permits.
+pub(super) fn handle_mprotect(args: [usize; super::ARG_COUNT]) -> isize {
+    use crate::mm::pframe::PAGE_SIZE;
+
+    let (addr, len, prot) = (args[0], args[1], args[2]);
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        return err::EINVAL;
+    }
+    let len = crate::mm::pframe::align_up(len, PAGE_SIZE);
+    if len == 0 {
+        return 0;
+    }
+
+    let mut mf = MapFlags::READ;
+    if prot & PROT_WRITE != 0 {
+        mf |= MapFlags::WRITE;
+    }
+    if prot & PROT_EXEC != 0 {
+        mf |= MapFlags::EXEC;
+    }
+    if prot != 0 {
+        mf |= MapFlags::USER;
+    }
+    crate::sched::protect_user(addr, len, mf);
     0
 }
 
@@ -426,4 +682,56 @@ pub(super) fn handle_futex(args: [usize; super::ARG_COUNT]) -> isize {
         1 => 0, // FUTEX_WAKE: stub — wake 0 threads
         _ => 0,
     }
+}
+
+/// `sched_getaffinity(pid, len, mask)` — which CPUs the caller may run on.
+///
+/// mpos schedules on one CPU, so the mask is always bit 0 and the answer is
+/// the CPU count Linux returns: 1. Bytes of the mask beyond the first word
+/// are zeroed, the way Linux clears what it does not fill.
+pub(super) fn handle_sched_getaffinity(args: [usize; super::ARG_COUNT]) -> isize {
+    let (_pid, len, mask) = (args[0], args[1], args[2]);
+    if len < core::mem::size_of::<u64>() {
+        return err::EINVAL;
+    }
+    if !super::buffer_ok(mask, len, true, true) {
+        return err::EFAULT;
+    }
+    unsafe {
+        (mask as *mut u64).write_volatile(1);
+        if len > core::mem::size_of::<u64>() {
+            core::ptr::write_bytes(
+                (mask + core::mem::size_of::<u64>()) as *mut u8,
+                0,
+                len - core::mem::size_of::<u64>(),
+            );
+        }
+    }
+    1
+}
+
+/// `set_robust_list(head, len)` — register the robust-futex list head.
+///
+/// The head's contents are never touched; Linux pins the size to
+/// `sizeof(struct robust_list_head)` = 24 and rejects anything else.
+pub(super) fn handle_set_robust_list(args: [usize; super::ARG_COUNT]) -> isize {
+    let (_head, len) = (args[0], args[1]);
+    if len != 24 {
+        return err::EINVAL;
+    }
+    0
+}
+
+/// `rseq(rseq, len, flags, sig)` — register the restartable-sequence block.
+///
+/// Registration succeeds and nothing is maintained afterwards: glibc only
+/// needs to get past startup, and whether the kernel updates `cpu_id` on
+/// preemption is out of scope. Linux rejects a length other than
+/// `sizeof(struct rseq)` = 32 and any flag but 0.
+pub(super) fn handle_rseq(args: [usize; super::ARG_COUNT]) -> isize {
+    let (_rseq, len, flags) = (args[0], args[1], args[2]);
+    if len != 32 || flags != 0 {
+        return err::EINVAL;
+    }
+    0
 }

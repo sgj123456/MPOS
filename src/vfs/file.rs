@@ -73,12 +73,17 @@ impl File {
 /// assume.
 pub struct FdTable {
     slots: Mutex<RefCell<Vec<Option<Arc<File>>>>>,
+    /// Per-descriptor flags - the `FD_CLOEXEC` word `fcntl(F_SETFD)` stores.
+    /// Indexed in lockstep with `slots`; a fresh description always starts
+    /// with no flags, including one that lands on a reused or duplicated fd.
+    fd_flags: Mutex<RefCell<Vec<u32>>>,
 }
 
 impl FdTable {
     pub fn new() -> FdTable {
         FdTable {
             slots: Mutex::new(RefCell::new(Vec::new())),
+            fd_flags: Mutex::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -102,13 +107,16 @@ impl FdTable {
     pub fn install(&self, file: Arc<File>) -> RawFd {
         critical_section::with(|cs| {
             let mut slots = self.slots.borrow(cs).borrow_mut();
+            let mut flags = self.fd_flags.borrow(cs).borrow_mut();
             match slots.iter().position(Option::is_none) {
                 Some(slot) => {
                     slots[slot] = Some(file);
+                    flags[slot] = 0;
                     slot as RawFd
                 }
                 None => {
                     slots.push(Some(file));
+                    flags.push(0);
                     (slots.len() - 1) as RawFd
                 }
             }
@@ -162,10 +170,13 @@ impl FdTable {
         let slot = usize::try_from(new).map_err(|_| VfsError::BadFd)?;
         critical_section::with(|cs| {
             let mut slots = self.slots.borrow(cs).borrow_mut();
+            let mut flags = self.fd_flags.borrow(cs).borrow_mut();
             while slots.len() <= slot {
                 slots.push(None);
+                flags.push(0);
             }
             slots[slot] = Some(file);
+            flags[slot] = 0;
         });
         Ok(())
     }
@@ -173,6 +184,33 @@ impl FdTable {
     /// The description `fd` names, for handing to another table.
     pub fn clone_at(&self, fd: RawFd) -> VfsResult<Arc<File>> {
         self.get(fd)
+    }
+
+    /// The flag word `fd` carries - what `fcntl(F_GETFD)` reads back.
+    pub fn fd_flags_get(&self, fd: RawFd) -> VfsResult<u32> {
+        self.get(fd)?;
+        Ok(critical_section::with(|cs| {
+            self.fd_flags
+                .borrow(cs)
+                .borrow()
+                .get(usize::try_from(fd).unwrap_or(usize::MAX))
+                .copied()
+                .unwrap_or(0)
+        }))
+    }
+
+    /// Store `fd`'s flag word - what `fcntl(F_SETFD)` writes.
+    pub fn fd_flags_set(&self, fd: RawFd, flags: u32) -> VfsResult<()> {
+        self.get(fd)?;
+        critical_section::with(|cs| {
+            let slot = usize::try_from(fd).map_err(|_| VfsError::BadFd)?;
+            let mut flag_words = self.fd_flags.borrow(cs).borrow_mut();
+            while flag_words.len() <= slot {
+                flag_words.push(0);
+            }
+            flag_words[slot] = flags;
+            Ok(())
+        })
     }
 }
 

@@ -44,6 +44,9 @@ pub mod err {
     /// answers when the child it was asked about is still running.
     pub const EAGAIN: isize = -11;
     pub const ENOTDIR: isize = -20;
+    /// ENODEV: no such device. What an `mmap` that asked for a mapping mpos
+    /// has no way to build - a file-backed one - is answered with.
+    pub const ENODEV: isize = -19;
     pub const EISDIR: isize = -21;
     pub const EINVAL: isize = -22;
     pub const ENOMEM: isize = -12;
@@ -58,6 +61,8 @@ pub mod err {
     pub const EWOULDBLOCK: isize = -11;
     pub const EINTR: isize = -4;
     pub const ENOTTY: isize = -25;
+    pub const E2BIG: isize = -7;
+    pub const ENAMETOOLONG: isize = -36;
 }
 
 /// How many register arguments a syscall may pass.
@@ -113,6 +118,69 @@ pub(crate) fn path_arg(
     core::str::from_utf8(bytes)
         .map(alloc::string::String::from)
         .map_err(|_| err::EINVAL)
+}
+
+/// Parse a NUL-terminated string argument - the Linux ABI's path shape - into
+/// an owned String.
+///
+/// The string's own NUL is the length word, so the kernel cannot know up
+/// front how far the caller means it to run. The scan therefore validates one
+/// page at a time and stops at the first terminator, which keeps a short
+/// string that ends inside its last mapped page from being rejected for the
+/// unmapped bytes beyond it. A string with no NUL within [`MAX_PATH`]
+/// characters answers `ENAMETOOLONG`, the errno Linux uses for exactly that.
+#[cfg(target_os = "none")]
+pub(crate) fn cstr_arg(ptr: usize, from_user: bool) -> Result<alloc::string::String, isize> {
+    if ptr == 0 {
+        return Err(err::EFAULT);
+    }
+    let mut bytes = alloc::vec::Vec::new();
+    let mut p = ptr;
+    loop {
+        // A page-table entry covers a whole page, so validating the first
+        // byte of one validates every byte of it.
+        if (p & 0xfff == 0 || p == ptr) && !buffer_ok(p, 1, false, from_user) {
+            return Err(err::EFAULT);
+        }
+        let b = unsafe { (p as *const u8).read_volatile() };
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+        if bytes.len() > MAX_PATH {
+            return Err(err::ENAMETOOLONG);
+        }
+        p += 1;
+    }
+    core::str::from_utf8(&bytes)
+        .map(alloc::string::String::from)
+        .map_err(|_| err::EINVAL)
+}
+
+/// Parse a NULL-terminated array of NUL-terminated strings - the Linux ABI's
+/// argv shape - into an owned vector. An absent array (`NULL`) is empty.
+#[cfg(target_os = "none")]
+pub(crate) fn argv_arg(ptr: usize) -> Result<alloc::vec::Vec<alloc::string::String>, isize> {
+    if ptr == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+    let mut out = alloc::vec::Vec::new();
+    let mut p = ptr;
+    loop {
+        if !buffer_ok(p, core::mem::size_of::<usize>(), false, true) {
+            return Err(err::EFAULT);
+        }
+        let entry = unsafe { (p as *const usize).read_volatile() };
+        if entry == 0 {
+            break;
+        }
+        if out.len() >= crate::sched::ARGV_MAX {
+            return Err(err::E2BIG);
+        }
+        out.push(cstr_arg(entry, true)?);
+        p += core::mem::size_of::<usize>();
+    }
+    Ok(out)
 }
 
 #[cfg(target_os = "none")]

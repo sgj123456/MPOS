@@ -2,6 +2,7 @@
 //!
 //! These are the numbers musl/glibc uses when calling `syscall(N, ...)`.
 
+pub const POLL: u64 = 7;
 pub const READ: u64 = 0;
 pub const WRITE: u64 = 1;
 pub const OPEN: u64 = 2;
@@ -12,6 +13,7 @@ pub const LSTAT: u64 = 6;
 pub const LSEEK: u64 = 8;
 pub const MMAP: u64 = 9;
 pub const MPROTECT: u64 = 10;
+pub const MREMAP: u64 = 25;
 pub const MUNMAP: u64 = 11;
 pub const BRK: u64 = 12;
 pub const RT_SIGACTION: u64 = 13;
@@ -41,7 +43,9 @@ pub const RENAMEAT: u64 = 82;
 pub const MKDIRAT: u64 = 83;
 pub const UNLINKAT: u64 = 87;
 pub const READLINKAT: u64 = 88;
+pub const READLINK: u64 = 89;
 pub const GETTIMEOFDAY: u64 = 96;
+pub const SET_ROBUST_LIST: u64 = 99;
 pub const GETUID: u64 = 102;
 pub const GETGID: u64 = 104;
 pub const SETUID: u64 = 105;
@@ -55,6 +59,7 @@ pub const GETDENTS64: u64 = 217;
 pub const GETTID: u64 = 186;
 pub const TKILL: u64 = 200;
 pub const FUTEX: u64 = 202;
+pub const SCHED_GETAFFINITY: u64 = 203;
 pub const SET_TID_ADDRESS: u64 = 218;
 pub const CLOCK_GETTIME: u64 = 228;
 pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -67,7 +72,11 @@ pub const PIPE2: u64 = 293;
 pub const PRLIMIT64: u64 = 302;
 pub const RENAMEAT2: u64 = 311;
 pub const GETRANDOM: u64 = 318;
+pub const STATX: u64 = 332;
+pub const RSEQ: u64 = 334;
 pub const ARCH_PRCTL: u64 = 158;
+pub const SIGALTSTACK: u64 = 131;
 pub const MADVISE: u64 = 28;
+pub const PPOLL: u64 = 271;
 pub const YIELD: u64 = 24; // Linux has no yield; used as placeholder
 pub const CLEANUP_AFTER_KTHREAD: u64 = 999;

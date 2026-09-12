@@ -223,6 +223,128 @@ impl AddressSpace {
         }
     }
 
+    /// Add one 4KiB user mapping, reporting a page that is already taken
+    /// instead of panicking.
+    ///
+    /// [`map`] asserts because the kernel's own plan is built once and is
+    /// disjoint by construction. A process's request is not: `MAP_FIXED` on an
+    /// address that already holds something is an ordinary thing for a libc to
+    /// do - musl's mallocng claims the guard page of its heap that way - so a
+    /// syscall handler has to be able to *answer* such a request, not take the
+    /// machine down with it.
+    pub fn try_map(&mut self, mapping: Mapping) -> Result<(), PageTaken> {
+        assert!(
+            mapping.length == PAGE_SIZE
+                && mapping.virt.is_multiple_of(PAGE_SIZE)
+                && mapping.phys.is_multiple_of(PAGE_SIZE),
+            "{mapping:?} is not a single whole page"
+        );
+        assert!(
+            mapping.end() <= USER_END,
+            "{mapping:?} reaches into the kernel half, which every address space shares"
+        );
+
+        let mut tables = unsafe {
+            OffsetPageTable::new(
+                &mut *(mm::phys_to_virt(self.root) as *mut PageTable),
+                VirtAddr::new(mm::hhdm_offset() as u64),
+            )
+        };
+        let mut pool = FramePool { frames: 0 };
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(mapping.virt as u64))
+            .expect("aligned page");
+        let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(mapping.phys as u64))
+            .expect("aligned frame");
+        match unsafe { tables.map_to(page, frame, page_flags(mapping.flags), &mut pool) } {
+            Ok(flush) => flush.ignore(),
+            Err(_) => return Err(PageTaken),
+        }
+
+        if self.root == active_root() {
+            activate(self.root);
+        }
+        Ok(())
+    }
+
+    /// Take back every 4KiB mapping that covers `virt..virt + len`, handing the
+    /// frames they pointed at back to the caller.
+    ///
+    /// Nothing is freed here, for the same reason [`Drop`] frees no frames: a
+    /// frame may already be on a list its owner keeps for the reaper, and
+    /// freeing it twice would hand one frame to two owners. Cleared entries
+    /// read as unmapped to the CPU and to [`phys_for_virt`] alike.
+    pub fn unmap(&mut self, virt: usize, len: usize) -> alloc::vec::Vec<usize> {
+        let mut dropped = alloc::vec::Vec::new();
+        if len == 0 {
+            return dropped;
+        }
+        assert!(
+            virt.checked_add(len).is_some_and(|end| end <= USER_END),
+            "unmapping {len:#x} bytes at {virt:#x} reaches the kernel half"
+        );
+
+        let mut tables = unsafe {
+            OffsetPageTable::new(
+                &mut *(mm::phys_to_virt(self.root) as *mut PageTable),
+                VirtAddr::new(mm::hhdm_offset() as u64),
+            )
+        };
+        for page in pages_of(virt, len).step_by(PAGE_SIZE) {
+            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(page as u64))
+                .expect("aligned page");
+            if let Ok((frame, flush)) = tables.unmap(page) {
+                // The whole hierarchy is refreshed by the CR3 write below when
+                // this is the live address space, so a per-page flush is waste.
+                flush.ignore();
+                dropped.push(frame.start_address().as_u64() as usize);
+            }
+        }
+
+        if self.root == active_root() {
+            activate(self.root);
+        }
+        dropped
+    }
+
+    /// Rewrite the permissions of the mappings that already cover
+    /// `virt..virt + len`, leaving their frames where they are.
+    ///
+    /// This is what makes `mprotect` mean something: `PROT_NONE` is mapped but
+    /// unreachable from ring 3, not unmapped, so the bytes survive a round trip
+    /// back to readable. Pages that are not mapped are skipped - there is
+    /// nothing to protect, and Linux would answer `ENOMEM` for the whole range.
+    pub fn protect(&mut self, virt: usize, len: usize, flags: MapFlags) {
+        if len == 0 {
+            return;
+        }
+        assert!(
+            virt.checked_add(len).is_some_and(|end| end <= USER_END),
+            "protecting {len:#x} bytes at {virt:#x} reaches the kernel half"
+        );
+
+        let mut tables = unsafe {
+            OffsetPageTable::new(
+                &mut *(mm::phys_to_virt(self.root) as *mut PageTable),
+                VirtAddr::new(mm::hhdm_offset() as u64),
+            )
+        };
+        for page in pages_of(virt, len).step_by(PAGE_SIZE) {
+            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(page as u64))
+                .expect("aligned page");
+            // An unmapped page is simply skipped: the walk fails and there is
+            // nothing to re-flag.
+            // Safety: the permissions of a live mapping may only change behind
+            // the CPU's back if the TLB is dropped afterwards, which the CR3
+            // write below does for the active address space. For any other
+            // space nothing is translating through these tables at all.
+            let _ = unsafe { tables.update_flags(page, page_flags(flags)) };
+        }
+
+        if self.root == active_root() {
+            activate(self.root);
+        }
+    }
+
     /// Make this the address space the CPU translates through.
     ///
     /// Safe because the kernel half is always shared and this code, its stack and
@@ -230,6 +352,25 @@ impl AddressSpace {
     /// the switch happens.
     pub fn switch(&self) {
         activate(self.root);
+    }
+
+    /// Translate a user virtual address through *this* address space's page
+    /// tables (not the active CR3) and return the physical frame it maps to.
+    /// Used by the ELF loader to apply relocations through the direct map.
+    pub fn phys_for_virt(&self, virt: usize) -> Option<usize> {
+        let mut table = self.root;
+        for level in (0..4).rev() {
+            let entry = table_entry(table, virt, level);
+            if entry & PRESENT == 0 {
+                return None;
+            }
+            let span = 1 << (12 + level * 9);
+            if level == 0 || entry & HUGE != 0 {
+                return Some(((entry & ADDR_MASK) | (virt & (span - 1)) as u64) as usize);
+            }
+            table = (entry & ADDR_MASK) as usize;
+        }
+        None
     }
 }
 
@@ -314,6 +455,23 @@ pub fn translate(virt: usize) -> Option<(usize, MapFlags)> {
     }
 
     unreachable!("a four-level walk ends in a leaf or in an absent entry")
+}
+
+/// A page a syscall asked to map was already spoken for. The kernel's own plan
+/// asserts on that instead (see [`AddressSpace::map`]): a collision there is a
+/// bug in the plan, while one here is an ordinary request from a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageTaken;
+
+/// The pages that cover `virt..virt + len`, lowest first and rounded
+/// outwards: a range that starts mid-page takes that whole page with it, which
+/// is what `munmap` and a `MAP_FIXED` replacement do to the pages they touch.
+fn pages_of(virt: usize, len: usize) -> core::ops::Range<usize> {
+    let first = align_down(virt, PAGE_SIZE);
+    let end = virt
+        .checked_add(len)
+        .map_or(first, |end| crate::mm::pframe::align_up(end, PAGE_SIZE));
+    first..end
 }
 
 /// Whether every byte of `start..start + len` is mapped for ring 3 in the

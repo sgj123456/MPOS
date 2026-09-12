@@ -205,82 +205,6 @@ pub(super) fn handle_pipe(args: [usize; super::ARG_COUNT], from_user: bool) -> i
 // Linux-compatible syscall handlers
 // ---------------------------------------------------------------------------
 
-/// Linux `fstat` / `newfstatat`: fill a minimal `stat` structure.
-///
-/// The struct layout matches `struct stat` on Linux x86_64.
-pub(super) fn handle_fstat(
-    args: [usize; super::ARG_COUNT],
-    from_user: bool,
-    cwd: &Arc<dyn crate::vfs::Inode>,
-) -> isize {
-    let (fd_or_dirfd, path_ptr, path_len, stat_buf) = (args[0], args[1], args[2], args[3]);
-
-    // newfstatat: dirfd + path + buf
-    // fstat: fd + buf (path_ptr=path_len=0 in our mapping)
-    let meta = if path_ptr != 0 || path_len != 0 {
-        // newfstatat — resolve path relative to dirfd
-        let _ = fd_or_dirfd;
-        let path = match super::path_arg(path_ptr, path_len, from_user) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
-            Ok(inode) => inode.metadata(),
-            Err(e) => return super::err_of(e),
-        }
-    } else {
-        // fstat — look up by fd
-        match crate::sched::current_fds().clone_at(fd_or_dirfd as i32) {
-            Ok(file) => file.metadata(),
-            Err(e) => return super::err_of(e),
-        }
-    };
-
-    if !super::buffer_ok(stat_buf, 144, true, from_user) {
-        return err::EFAULT;
-    }
-    write_stat(stat_buf, &meta);
-    0
-}
-
-/// Write a Linux `struct stat` (144 bytes on x86_64) to userspace.
-fn write_stat(buf: usize, meta: &crate::vfs::Metadata) {
-    let mode: u32 = match meta.kind {
-        crate::vfs::NodeKind::File => 0o100_644, // regular file rw-r--r--
-        crate::vfs::NodeKind::Dir => 0o040_755,  // directory rwxr-xr-x
-        crate::vfs::NodeKind::CharDev => 0o020_666,
-    };
-    let nlink: u64 = if meta.kind == crate::vfs::NodeKind::Dir {
-        2
-    } else {
-        1
-    };
-    let size = meta.size;
-    let blksize: i64 = 512;
-    let blocks: i64 = (size).div_ceil(512) as i64;
-
-    // Zero the whole struct.
-    unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, 144);
-    }
-
-    let s = buf as *mut u64;
-    unsafe {
-        // struct stat on x86_64 Linux:
-        *s.add(0) = meta.ino; // st_dev (use ino as dev too)
-        *s.add(1) = meta.ino; // st_ino
-        *s.add(2) = nlink; // st_nlink
-        *s.add(3) = mode as u64; // st_mode
-        *s.add(4) = 0; // st_uid
-        *s.add(5) = 0; // st_gid
-        *s.add(6) = 0; // st_rdev
-        *s.add(7) = size; // st_size
-        *s.add(8) = blksize as u64; // st_blksize
-        *s.add(9) = blocks as u64; // st_blocks
-        // Fields 10..14 are timestamps (atime, mtime, ctime) — left as zero.
-    }
-}
-
 /// `lseek(fd, offset, whence)`.
 pub(super) fn handle_lseek(args: [usize; super::ARG_COUNT]) -> isize {
     let (fd, offset, whence) = (args[0] as i32, args[1] as i64, args[2] as i32);
@@ -383,105 +307,6 @@ pub(super) fn handle_dup3(args: [usize; super::ARG_COUNT]) -> isize {
     }
 }
 
-/// `openat(dirfd, path, flags, mode)` — simplified: ignores flags/mode.
-pub(super) fn handle_openat(
-    args: [usize; super::ARG_COUNT],
-    from_user: bool,
-    cwd: &Arc<dyn crate::vfs::Inode>,
-) -> isize {
-    let (_dirfd, path_ptr, path_len, _flags) = (args[0], args[1], args[2], args[3]);
-    let path = match super::path_arg(path_ptr, path_len, from_user) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    match crate::vfs::open_opt(&path, Some(cwd.clone())) {
-        Ok(fd) => fd as isize,
-        Err(e) => super::err_of(e),
-    }
-}
-
-/// `unlinkat(dirfd, path, flags)` — simplified: AT_REMOVEDIR not supported.
-pub(super) fn handle_unlinkat(
-    args: [usize; super::ARG_COUNT],
-    from_user: bool,
-    cwd: &Arc<dyn crate::vfs::Inode>,
-) -> isize {
-    let (_dirfd, path_ptr, path_len, _flags) = (args[0], args[1], args[2], args[3]);
-    let path = match super::path_arg(path_ptr, path_len, from_user) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    match crate::vfs::unlink_opt(&path, Some(cwd.clone())) {
-        Ok(()) => 0,
-        Err(e) => super::err_of(e),
-    }
-}
-
-/// `mkdirat(dirfd, path, mode)` — mode ignored.
-pub(super) fn handle_mkdirat(
-    args: [usize; super::ARG_COUNT],
-    from_user: bool,
-    cwd: &Arc<dyn crate::vfs::Inode>,
-) -> isize {
-    let (_dirfd, path_ptr, path_len, _mode) = (args[0], args[1], args[2], args[3]);
-    let path = match super::path_arg(path_ptr, path_len, from_user) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let (parent, name) = match crate::vfs::split_parent(&path) {
-        Ok(p) => p,
-        Err(e) => return super::err_of(e),
-    };
-    let parent = match crate::vfs::resolve_opt(parent, Some(cwd.clone())) {
-        Ok(d) => d,
-        Err(e) => return super::err_of(e),
-    };
-    match parent.create(name, crate::vfs::NodeKind::Dir) {
-        Ok(_) => 0,
-        Err(e) => super::err_of(e),
-    }
-}
-
-/// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)` — simplified.
-pub(super) fn handle_renameat2(
-    args: [usize; super::ARG_COUNT],
-    from_user: bool,
-    cwd: &Arc<dyn crate::vfs::Inode>,
-) -> isize {
-    let (_old_dirfd, old_ptr, old_len, _new_dirfd, new_ptr, new_len) =
-        (args[0], args[1], args[2], args[3], args[4], args[5]);
-    let old_path = match super::path_arg(old_ptr, old_len, from_user) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let new_path = match super::path_arg(new_ptr, new_len, from_user) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    // Simple implementation: copy then unlink old.
-    let data = match crate::vfs::read_file_opt(&old_path, Some(cwd.clone())) {
-        Ok(d) => d,
-        Err(e) => return super::err_of(e),
-    };
-    if let Some(slash_pos) = new_path.rfind('/') {
-        let (parent_dir, _) = new_path.split_at(slash_pos);
-        let dir = match crate::vfs::resolve_opt(parent_dir, Some(cwd.clone())) {
-            Ok(d) => d,
-            Err(e) => return super::err_of(e),
-        };
-        let name = &new_path[slash_pos + 1..];
-        match dir.create(name, crate::vfs::NodeKind::File) {
-            Ok(inode) => {
-                let f = crate::vfs::File::new(inode);
-                let _ = f.write(&data);
-            }
-            Err(e) => return super::err_of(e),
-        }
-    }
-    let _ = crate::vfs::unlink_opt(&old_path, Some(cwd.clone()));
-    0
-}
-
 /// `getcwd(buf, size)` — write cwd path into buffer.
 pub(super) fn handle_getcwd(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
     let (buf, size) = (args[0], args[1]);
@@ -522,18 +347,6 @@ pub(super) fn handle_fchdir(args: [usize; super::ARG_COUNT]) -> isize {
     }
     crate::sched::set_cwd(file.inode());
     0
-}
-
-/// `fcntl(fd, cmd, arg)` — minimal: F_GETFL returns 0, F_SETFL is a no-op.
-pub(super) fn handle_fcntl(args: [usize; super::ARG_COUNT]) -> isize {
-    let (_fd, cmd, _arg) = (args[0], args[1], args[2]);
-    match cmd {
-        1 => 0, // F_GETFD
-        2 => 0, // F_SETFD
-        3 => 0, // F_GETFL
-        4 => 0, // F_SETFL
-        _ => 0,
-    }
 }
 
 /// `ioctl(fd, request, ...)` — handle terminal queries, stub the rest.

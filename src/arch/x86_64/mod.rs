@@ -48,6 +48,21 @@ pub fn init_interrupts() {
     linux_syscall::init();
 }
 
+/// Enable SSE/AVX for user processes.
+///
+/// The kernel itself is built with `soft-float` so it never touches XMM/YMM
+/// registers, but user binaries (musl, coreutils) expect SSE to work.  We set
+/// CR4.OSFXSR and CR4.OSXMMEXCPT so that SSE instructions do not #UD in ring 3.
+pub fn enable_user_sse() {
+    unsafe {
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4);
+        cr4 |= 1 << 9; // OSFXSR — enables SSE
+        cr4 |= 1 << 10; // OSXMMEXCPT — enables unmasked SSE exceptions
+        core::arch::asm!("mov cr4, {}", in(reg) cr4);
+    }
+}
+
 pub fn halt() -> ! {
     loop {
         // `hlt` with interrupts disabled parks the core until reset, which is

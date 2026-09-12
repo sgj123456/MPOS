@@ -62,7 +62,44 @@ extern "C" fn mpos_rust_syscall(regs: *mut Regs) -> usize {
     // caller came from ring 0 or ring 3 - and its low bits decide how much a
     // pointer argument can be trusted.
     let cs = unsafe { (core::ptr::from_mut(regs) as *const u64).add(11).read() } as usize;
-    syscall::dispatch(regs.rax as u64, args, cs & 3 == 3) as usize
+    let ret = syscall::dispatch(regs.rax as u64, args, cs & 3 == 3) as usize;
+    // TEMPORARY: catch the frame the iretq will consume being corrupted.
+    // Only a frame going back to ring 3 is checked in full: the pair that
+    // `iretq` will load has to be the user code and data selectors, or the
+    // return faults. A frame going back to ring 0 only has to carry the
+    // kernel CS - SS is not consulted in 64-bit mode, and the CPU may well
+    // have pushed whatever the last ring-3 return left in it.
+    let base = core::ptr::from_mut(regs) as *const u64;
+    let (rip, cs2, rfl, rsp, ss) = unsafe {
+        (
+            base.add(10).read(),
+            base.add(11).read(),
+            base.add(12).read(),
+            base.add(13).read(),
+            base.add(14).read(),
+        )
+    };
+    let (user_code, user_data) = crate::arch::gdt::user_selectors();
+    let (kern_code, _) = crate::arch::gdt::kernel_selectors();
+    let going_to_user = cs2 & 3 == 3;
+    let intact = if going_to_user {
+        cs2 == user_code.0 as u64 && ss == user_data.0 as u64
+    } else {
+        cs2 == kern_code.0 as u64
+    };
+    if !intact {
+        crate::println!(
+            "FRAME-CORRUPT nr={} rip={:#x} cs={:#x} rfl={:#x} rsp={:#x} ss={:#x} task={}",
+            regs.rax,
+            rip,
+            cs2,
+            rfl,
+            rsp,
+            ss,
+            crate::sched::current().0
+        );
+    }
+    ret
 }
 
 global_asm!(

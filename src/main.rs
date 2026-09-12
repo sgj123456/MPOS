@@ -60,6 +60,9 @@ pub extern "C" fn _start() -> ! {
     // if Limine rejected our base revision and `collect` panics below.
     mpos::console::init();
 
+    // Enable SSE/AVX for user processes before anything else touches CR0/CR4.
+    arch::enable_user_sse();
+
     let info = boot::limine::collect();
     banner(&info);
 
@@ -1320,6 +1323,87 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo M13_$GATE\n",
     b"false\n",
     b"echo M14_$?\n",
+    // The musl prereqs: one test per syscall the musl_hello strace showed,
+    // each leaving its verdict in $? - 0 pass, 1 fail - echoed back as a
+    // greppable marker. Every line must read `<name>_0`; the one exception
+    // is t_exit_group, whose whole contract is the distinctive code it
+    // leaves: `<name>_42`.
+    // b"t_execve\n",
+    // b"echo t_execve_$?\n",
+    // b"t_arch_prctl\n",
+    // b"echo t_arch_prctl_$?\n",
+    // b"t_set_tid_address\n",
+    // b"echo t_set_tid_address_$?\n",
+    // b"t_poll\n",
+    // b"echo t_poll_$?\n",
+    // b"t_rt_sigaction\n",
+    // b"echo t_rt_sigaction_$?\n",
+    // b"t_sigaltstack\n",
+    // b"echo t_sigaltstack_$?\n",
+    b"echo BEFORE_T\n",
+    b"t_execve\n",
+    b"echo AFTER_EXECVE_$?\n",
+    b"t_sched_getaffinity\n",
+    b"echo AFTER_SCHED_$?\n",
+    b"t_rt_sigaction\n",
+    b"echo AFTER_SIGACTION_$?\n",
+    b"t_mmap\n",
+    b"echo AFTER_MMAP_$?\n",
+    b"musl_hello\n",
+    b"MUSL_CODE=$?\n",
+    b"echo MUSL_EXIT_$MUSL_CODE\n",
+    // M15: a true "coreutils-style" program is what musl_hello is — a static
+    // PIE musl binary hitting `main` and exiting cleanly. Its exit code is
+    // the verdict, captured into MUSL_CODE *before* the next echo and
+    // echoed back, so a regression in ELF loading, brk, mmap, write, or
+    // exit changes the marker instead of being hidden under it.
+    b"echo M15_coreutils_$MUSL_CODE\n",
+    // b"t_mprotect\n",
+    // b"echo t_mprotect_$?\n",
+    // b"t_rt_sigprocmask\n",
+    // b"echo t_rt_sigprocmask_$?\n",
+    // b"t_brk\n",
+    // b"echo t_brk_$?\n",
+    // b"t_write\n",
+    // b"echo t_write_$?\n",
+    // b"t_munmap\n",
+    // b"echo t_munmap_$?\n",
+    // b"t_exit_group\n",
+    // b"echo t_exit_group_$?\n",
+    // The coreutils round: the syscalls the coreutils strace showed beyond
+    // the musl_hello set - file I/O, stats, the glibc startup pair. Same
+    // verdict protocol: `<name>_0`, nothing else.
+    // b"t_openat\n",
+    // b"echo t_openat_$?\n",
+    // b"t_read\n",
+    // b"echo t_read_$?\n",
+    // b"t_lseek\n",
+    // b"echo t_lseek_$?\n",
+    // b"t_fstat\n",
+    // b"echo t_fstat_$?\n",
+    // b"t_newfstatat\n",
+    // b"echo t_newfstatat_$?\n",
+    // b"t_statx\n",
+    // b"echo t_statx_$?\n",
+    // b"t_access\n",
+    // b"echo t_access_$?\n",
+    // b"t_fcntl\n",
+    // b"echo t_fcntl_$?\n",
+    // b"t_readlink\n",
+    // b"echo t_readlink_$?\n",
+    // b"t_getrandom\n",
+    // b"echo t_getrandom_$?\n",
+    // b"t_gettid\n",
+    // b"echo t_gettid_$?\n",
+    // b"t_prlimit64\n",
+    // b"echo t_prlimit64_$?\n",
+    // b"t_sched_getaffinity\n",
+    // b"echo t_sched_getaffinity_$?\n",
+    // b"t_set_robust_list\n",
+    // b"echo t_set_robust_list_$?\n",
+    // b"t_rseq\n",
+    // b"echo t_rseq_$?\n",
+    // b"musl_hello\n",
     b"\x04",
 ];
 
@@ -1327,8 +1411,15 @@ const SHELL_SCRIPT: &[&[u8]] = &[
 fn check_shell() {
     let shell = vfs::read_file("/bin/sh").expect("the initramfs carries /bin/sh");
     let argv = alloc::vec![String::from("sh")];
-    let sh = sched::try_spawn_user(&shell, Priority::NORMAL, sched::current(), &argv, &[])
-        .expect("the shell image loaded");
+    let sh = sched::try_spawn_user(
+        &shell,
+        Priority::NORMAL,
+        sched::current(),
+        &argv,
+        &[],
+        "/bin/sh",
+    )
+    .expect("the shell image loaded");
 
     sched::spawn(
         || {
@@ -1336,7 +1427,7 @@ fn check_shell() {
             for line in SHELL_SCRIPT {
                 for &b in *line {
                     vfs::tty::global().receive_byte(b);
-                    sched::sleep_ticks(1);
+                    sched::sleep_ticks(2);
                 }
             }
         },

@@ -194,6 +194,13 @@ struct Task {
     /// Signals sent to this task and not yet delivered. There are no handlers
     /// yet, so delivery means the task dies at its next blocking point.
     signals: signal::Pending,
+    /// What `rt_sigaction` recorded for this process, per signal. Its own
+    /// table, not a shared one: a fresh process must answer `SIG_DFL` for
+    /// everything, whatever its parent or its sibling installed.
+    dispositions: signal::Actions,
+    /// The alternate signal stack this process installed with
+    /// `sigaltstack`, if it has one.
+    alt_stack: Option<signal::AltStack>,
     /// The descriptors this task's fd numbers index. Kernel tasks share the
     /// kernel's table; a process has one of its own.
     fds: Arc<FdTable>,
@@ -204,6 +211,15 @@ struct Task {
     /// The task that spawned this one in ring 3, if any. Its `wait` blocks on
     /// this task's exit; kernel-spawned tasks have none.
     parent: Option<TaskId>,
+    /// Per-process brk state for heap management. The frames behind the
+    /// break's pages are on `user_frames` like every other frame the process
+    /// owns; only the bookkeeping of *where* the break is stays here.
+    brk_base: usize,
+    brk_pages: usize,
+    /// The path this process was started from - what `/proc/self/exe` reads
+    /// through. Empty for tasks that never had an image (kernel tasks, the
+    /// boot task).
+    exe: alloc::string::String,
 }
 
 impl Task {
@@ -220,9 +236,14 @@ impl Task {
             user_entry: None,
             user_frames: Vec::new(),
             signals: 0,
+            dispositions: signal::Actions::default(),
+            alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
             cwd: None,
             parent: None,
+            brk_base: 0,
+            brk_pages: 0,
+            exe: alloc::string::String::new(),
         }
     }
 }
@@ -366,9 +387,14 @@ impl Table {
             user_entry: None,
             user_frames: Vec::new(),
             signals: 0,
+            dispositions: signal::Actions::default(),
+            alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
             cwd: None,
             parent: None,
+            brk_base: 0,
+            brk_pages: 0,
+            exe: alloc::string::String::new(),
         });
         TaskId(slot)
     }
@@ -482,7 +508,7 @@ pub fn spawn(body: impl FnOnce() + 'static, priority: Priority) -> TaskId {
 /// reaches into the kernel half is refused there, and every page placed here
 /// comes from frames this code allocates, never from the file's claims.
 pub fn spawn_user(bytes: &[u8], priority: Priority) -> TaskId {
-    try_spawn_user(bytes, priority, current(), &[], &[])
+    try_spawn_user(bytes, priority, current(), &[], &[], "")
         .expect("spawn_user: not an ELF64 executable mpos can load")
 }
 
@@ -517,7 +543,16 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnErro
         let stack = Stack::new();
         let mut space = AddressSpace::new();
         let (entry, frames, stack_top_frame) = load_user(&mut space, &image);
-        write_arg_block(stack_top_frame, user_rsp, argv);
+        write_arg_block(stack_top_frame, user_rsp, argv, &image);
+
+        let brk_base = image
+            .segments
+            .iter()
+            .map(|s| s.vaddr + s.memsz)
+            .max()
+            .map_or(0, |end| {
+                (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
+            });
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
@@ -533,9 +568,14 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnErro
             user_entry: Some((entry, user_rsp)),
             user_frames: frames,
             signals: 0,
+            dispositions: signal::Actions::default(),
+            alt_stack: None,
             fds: Arc::new(FdTable::with_standard(crate::vfs::tty::global())),
             cwd: None,
             parent: None,
+            brk_base,
+            brk_pages: 0,
+            exe: alloc::string::String::new(),
         });
         t.sched.push_ready(INIT_PID, Priority::NORMAL);
         Ok(INIT_PID)
@@ -545,6 +585,9 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnErro
 /// [`spawn_user`] with arguments and a parent: the process form the `spawn`
 /// syscall uses. `argv` is the full argument vector, `argv[0]` being the
 /// program name as POSIX frames it - it does not have to match `bytes`' path.
+/// `exe` is the path `bytes` was read from, and is what `/proc/self/exe`
+/// reads through; spawn sites that know it pass it, kernel-internal starts
+/// that have no name for their image pass an empty string.
 ///
 /// The parent link is what `wait` needs: when the task exits, its parent is
 /// woken and reads the exit code.
@@ -554,6 +597,7 @@ pub fn try_spawn_user(
     parent: TaskId,
     argv: &[String],
     redirects: &[Redirect],
+    exe: &str,
 ) -> Result<TaskId, SpawnError> {
     assert!(
         STARTED.load(Ordering::Relaxed),
@@ -569,11 +613,20 @@ pub fn try_spawn_user(
         let mut space = AddressSpace::new();
         let (entry, frames, stack_top_frame) = load_user(&mut space, &image);
 
+        let brk_base = image
+            .segments
+            .iter()
+            .map(|s| s.vaddr + s.memsz)
+            .max()
+            .map_or(0, |end| {
+                (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
+            });
+
         // The argument block is written last, straight into the top page of
         // the stack this task will land on, through the direct map. The top
         // frame is already in `frames` - `load_user` returns it separately
         // only so this write knows where the stack's page lives.
-        write_arg_block(stack_top_frame, user_rsp, argv);
+        write_arg_block(stack_top_frame, user_rsp, argv, &image);
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
@@ -606,9 +659,14 @@ pub fn try_spawn_user(
             user_entry: Some((entry, user_rsp)),
             user_frames: frames,
             signals: 0,
+            dispositions: signal::Actions::default(),
+            alt_stack: None,
             fds,
             cwd: t.task(parent).cwd.clone(),
             parent: Some(parent),
+            brk_base,
+            brk_pages: 0,
+            exe: alloc::string::String::from(exe),
         });
         let id = TaskId(slot);
         t.sched.push_ready(id, priority);
@@ -631,34 +689,41 @@ pub fn try_spawn_user(
 /// The stack pointer a process is entered with, laid out the way the libc's
 /// `_start` reads it, or `None` when the arguments would not fit the top page.
 ///
-/// Descending from the top of the stack: the argument strings, then padding to
-/// a 16-byte boundary, then `argc`, the `argv` pointers, the null that ends
-/// the array, and a null `envp`. The strings therefore sit above the initial
-/// stack pointer, where every later call frame is below them and nothing ever
-/// writes over them; the register-less `_start` finds `argc` at `[rsp]`.
+/// The Linux x86_64 ABI expects, from low to high addresses:
+///
+/// ```text
+/// argc | argv[0..n] | NULL | NULL envp |
+/// AT_PHDR | AT_PHNUM | AT_PHENT | AT_ENTRY | AT_RANDOM | AT_PAGESZ | AT_NULL |
+/// random bytes (16) | argv strings
+/// ```
+///
+/// The extra auxv entries let musl-based libc (and other Linux-compatible
+/// runtimes) find the program headers and initialise TLS on startup.
 fn initial_stack_rsp(argv: &[String]) -> Option<usize> {
     if argv.len() > ARGV_MAX || argv.iter().map(|s| s.len() + 1).sum::<usize>() > ARGS_BYTES_MAX {
         return None;
     }
     let strings: usize = argv.iter().map(|s| s.len() + 1).sum();
-    // argc, argv[0..argc], the null terminator, and the null envp.
-    let words_bytes = (argv.len() + 3) * size_of::<usize>();
-    let strings_base = USER_STACK_TOP - strings;
-    let rsp = (strings_base - words_bytes) & !15;
-    // Everything must fit the page the strings were written into; the loader
-    // writes the block through one frame.
+    let argc = argv.len();
+    // argc, argv[0..argc], argv NULL, envp NULL, 7 auxv pairs (14 words).
+    let words_bytes = (argc + 17) * size_of::<usize>();
+    // 16 bytes of random data for the AT_RANDOM auxv entry.
+    let random_bytes = 16usize;
+    let total = words_bytes + random_bytes + strings;
+    let rsp = (USER_STACK_TOP - total) & !15;
     (USER_STACK_TOP - rsp <= PAGE_SIZE).then_some(rsp)
 }
 
 /// Fill the initial stack page with the argument block [`initial_stack_rsp`]
-/// laid out: strings at the top, pointers and `argc` below them.
+/// laid out: random bytes and strings at the top, auxv, argv pointers and
+/// `argc` below them.
 ///
 /// # Safety
 ///
 /// The frame must back the page at `USER_STACK_TOP - PAGE_SIZE`, and
 /// `user_rsp` must be the pointer [`initial_stack_rsp`] computed for the same
 /// `argv`, with the whole block inside that one page.
-fn write_arg_block(frame: usize, user_rsp: usize, argv: &[String]) {
+fn write_arg_block(frame: usize, user_rsp: usize, argv: &[String], image: &elf::Image) {
     let page =
         unsafe { core::slice::from_raw_parts_mut(mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE) };
     let from = user_rsp - (USER_STACK_TOP - PAGE_SIZE);
@@ -667,18 +732,64 @@ fn write_arg_block(frame: usize, user_rsp: usize, argv: &[String]) {
         "argv block is not in the top page"
     );
 
-    // Strings first, packed downward from the very top.
-    let mut string_at = PAGE_SIZE;
-    for (index, arg) in argv.iter().enumerate() {
+    let argc = argv.len();
+    let mut off = from;
+
+    // argc
+    page[off..off + 8].copy_from_slice(&(argc as u64).to_le_bytes());
+    off += 8;
+
+    // Random bytes at the very top of the page (16 bytes, 16-byte aligned).
+    let random_at = PAGE_SIZE - 16;
+    let random_vaddr = (USER_STACK_TOP - PAGE_SIZE) + random_at;
+    let random: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
+    page[random_at..random_at + 16].copy_from_slice(&random);
+
+    // Strings, descending from just below the random bytes.
+    let mut string_at = random_at;
+    for arg in argv.iter() {
         string_at -= arg.len() + 1;
         page[string_at..string_at + arg.len()].copy_from_slice(arg.as_bytes());
         page[string_at + arg.len()] = 0;
-        // argv[i], right after argc at the bottom of the block.
-        let slot = from + size_of::<usize>() * (1 + index);
-        page[slot..slot + 8]
-            .copy_from_slice(&(USER_STACK_TOP - (PAGE_SIZE - string_at)).to_le_bytes());
+        // argv[i] pointer: virtual address of the string.
+        let vaddr = (USER_STACK_TOP - PAGE_SIZE) + string_at;
+        page[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
+        off += 8;
     }
-    page[from..from + 8].copy_from_slice(&(argv.len() as u64).to_le_bytes());
+
+    // NULL argv terminator and NULL envp terminator (zero-filled page).
+    off += 2 * size_of::<usize>();
+
+    // Auxiliary vector entries.
+    auxv(&mut page[off..], image, random_vaddr);
+}
+
+/// Write the Linux auxiliary vector into `buf` as (type, value) u64 pairs.
+fn auxv(buf: &mut [u8], image: &elf::Image, random_vaddr: usize) {
+    let mut off = 0usize;
+
+    // Helper: write one auxv entry (type, value) and advance.
+    macro_rules! entry {
+        ($typ:expr, $val:expr) => {{
+            let t = $typ as u64;
+            let v = $val as u64;
+            buf[off..off + 8].copy_from_slice(&t.to_le_bytes());
+            buf[off + 8..off + 16].copy_from_slice(&v.to_le_bytes());
+            off += 16;
+        }};
+    }
+
+    entry!(3, image.phdr_addr); // AT_PHDR
+    entry!(5, image.phnum); // AT_PHNUM
+    entry!(4, image.phent); // AT_PHENT
+    entry!(9, image.entry); // AT_ENTRY
+    entry!(25, random_vaddr); // AT_RANDOM
+    entry!(6, PAGE_SIZE); // AT_PAGESZ
+    entry!(0, 0usize); // AT_NULL
+    let _ = off;
 }
 
 /// Map every page of `image` into `space` - file bytes, the zero tail of each
@@ -718,6 +829,20 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>) -> (usize, Vec<usize>,
                 length: PAGE_SIZE,
                 flags,
             });
+        }
+    }
+
+    // Apply R_X86_64_RELATIVE relocations.  Each writes `addend` at `offset`
+    // in the user's virtual address space through the direct map.
+    if !image.rela.is_empty() {
+        for &(offset, addend) in &image.rela {
+            if let Some(phys) = space.phys_for_virt(offset) {
+                let ptr =
+                    (mm::phys_to_virt(phys & !(PAGE_SIZE - 1)) + (offset % PAGE_SIZE)) as *mut u64;
+                unsafe {
+                    ptr.write(addend as u64);
+                }
+            }
         }
     }
 
@@ -902,6 +1027,51 @@ pub fn send_signal(id: TaskId, sig: u8) -> bool {
         }
         true
     })
+}
+
+/// What `id` would do if `sig` arrived now. `None` when the task is gone.
+pub fn signal_action(id: TaskId, sig: u8) -> Option<signal::Action> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)?
+            .as_ref()
+            .map(|task| task.dispositions.get(sig))
+    })
+}
+
+/// Record `sig`'s disposition for `id`. `false` when the task is gone or has
+/// already exited - a disposition nobody will ever read is not worth storing.
+pub fn set_signal_action(id: TaskId, sig: u8, action: signal::Action) -> bool {
+    with_table(
+        |t| match t.tasks.get_mut(id.0).and_then(|slot| slot.as_mut()) {
+            Some(task) if !task.exited => {
+                task.dispositions.set(sig, action);
+                true
+            }
+            _ => false,
+        },
+    )
+}
+
+/// The alternate signal stack `id` installed, if any. `None` both for a
+/// process that never asked for one and for a task that no longer exists -
+/// neither has a stack to report.
+pub fn signal_alt_stack(id: TaskId) -> Option<signal::AltStack> {
+    with_table(|t| t.tasks.get(id.0)?.as_ref().and_then(|task| task.alt_stack))
+}
+
+/// Install (`Some`) or clear (`None`) `id`'s alternate signal stack. `false`
+/// when the task is gone, which the syscall layer reports as `ESRCH`.
+pub fn set_signal_alt_stack(id: TaskId, stack: Option<signal::AltStack>) -> bool {
+    with_table(
+        |t| match t.tasks.get_mut(id.0).and_then(|slot| slot.as_mut()) {
+            Some(task) if !task.exited => {
+                task.alt_stack = stack;
+                true
+            }
+            _ => false,
+        },
+    )
 }
 
 /// Take one pending signal off the running task. Every signal is fatal for
@@ -1120,6 +1290,234 @@ pub fn current_fds() -> Arc<FdTable> {
     }
     let id = current();
     with_table(|t| t.task(id).fds.clone())
+}
+
+/// The path the running process was started from - what a `readlink` of
+/// `/proc/self/exe` hands back. Empty when the process has no named image.
+pub fn current_exe() -> alloc::string::String {
+    let id = current();
+    with_table(|t| t.task(id).exe.clone())
+}
+
+/// Map a physical frame at `virt` in the current task's address space with
+/// the given `flags`.  Returns the virtual address on success, or a negative
+/// errno.
+///
+/// A page that is already mapped answers `-EEXIST` rather than taking the
+/// kernel down: the caller is a syscall, and a libc asking for an address it
+/// already holds is a request to answer, not a reason to panic.
+pub fn current_map_user(virt: usize, frame: usize, flags: crate::mm::vm::MapFlags) -> isize {
+    with_table(|t| {
+        let id = current();
+        let task = t.task_mut(id);
+        let mapped = match task.space.as_mut() {
+            Some(space) => space.try_map(crate::mm::vm::Mapping {
+                virt,
+                phys: frame,
+                length: crate::mm::pframe::PAGE_SIZE,
+                flags,
+            }),
+            None => return -crate::syscall::err::EINVAL,
+        };
+        match mapped {
+            Ok(()) => {
+                // The frame now belongs to the process: the reaper returns it
+                // once the process is gone, not before.
+                task.user_frames.push(frame);
+                virt as isize
+            }
+            Err(crate::arch::paging::PageTaken) => -crate::syscall::err::EEXIST,
+        }
+    })
+}
+
+/// Put a frame the task *already owns* at `virt`, adding nothing to the list
+/// of frames the reaper must return. This is how `mremap` moves a mapping: the
+/// pages change address, their ownership does not change hands.
+pub fn move_user_page(virt: usize, frame: usize, flags: crate::mm::vm::MapFlags) -> bool {
+    with_table(|t| {
+        let id = current();
+        let task = t.task_mut(id);
+        match task.space.as_mut() {
+            Some(space) => space
+                .try_map(crate::mm::vm::Mapping {
+                    virt,
+                    phys: frame,
+                    length: crate::mm::pframe::PAGE_SIZE,
+                    flags,
+                })
+                .is_ok(),
+            None => false,
+        }
+    })
+}
+
+/// The frame behind `virt` in the current task's address space, if it has one.
+pub fn user_frame_at(virt: usize) -> Option<usize> {
+    with_table(|t| t.task(current()).space.as_ref()?.phys_for_virt(virt))
+}
+
+/// Whether every page of `virt..virt + len` is still unmapped in the current
+/// task's address space.
+///
+/// This is what decides whether an `mmap` address is a hint worth taking, and
+/// whether a `MAP_FIXED` request has anything to replace.
+pub fn user_range_free(virt: usize, len: usize) -> bool {
+    with_table(|t| {
+        let task = t.task(current());
+        let Some(space) = task.space.as_ref() else {
+            return false;
+        };
+        (0..len)
+            .step_by(crate::mm::pframe::PAGE_SIZE)
+            .all(|offset| space.phys_for_virt(virt + offset).is_none())
+    })
+}
+
+/// Take the mappings covering `virt..virt + len` away from the current task,
+/// handing back the frames they pointed at.
+pub fn unmap_user(virt: usize, len: usize) -> alloc::vec::Vec<usize> {
+    with_table(|t| {
+        let id = current();
+        let task = t.task_mut(id);
+        match task.space.as_mut() {
+            Some(space) => space.unmap(virt, len),
+            None => alloc::vec::Vec::new(),
+        }
+    })
+}
+
+/// Change the permission bits of the pages the current task already has mapped
+/// in `virt..virt + len`, leaving their frames alone. Pages that are not mapped
+/// are skipped, so this cannot fail the way Linux's `mprotect` fails on a hole.
+pub fn protect_user(virt: usize, len: usize, flags: crate::mm::vm::MapFlags) {
+    with_table(|t| {
+        let id = current();
+        let task = t.task_mut(id);
+        if let Some(space) = task.space.as_mut() {
+            space.protect(virt, len, flags);
+        }
+    })
+}
+
+/// Give back frames an unmapping dropped. Nothing can reach them any more, so
+/// the allocator can have them now - but only after they are off the task's own
+/// lists, or its exit would free them a second time.
+pub fn release_user_frames(frames: alloc::vec::Vec<usize>) {
+    if frames.is_empty() {
+        return;
+    }
+    with_table(|t| {
+        let id = current();
+        let task = t.task_mut(id);
+        for frame in frames {
+            task.user_frames.retain(|&held| held != frame);
+            crate::mm::free_frames(frame, 0);
+        }
+    });
+}
+
+/// `brk(addr)` — per-task program break (heap end).
+///
+/// `addr` of 0 asks where the break is. Otherwise the break moves, and the
+/// pages between the old and the new position are mapped or given back as the
+/// move requires - which is what makes this a *break* rather than a note that
+/// the number changed.
+///
+/// Growing skips a page that is already mapped instead of insisting it is
+/// free. That is not a nicety: a libc may put a guard page inside the range the
+/// break covers - musl's mallocng maps `PROT_NONE` over the first page of a
+/// freshly grown heap - and the break still has to move past it.
+pub fn brk(addr: usize) -> isize {
+    use crate::mm::pframe::PAGE_SIZE;
+    use crate::mm::vm::MapFlags;
+
+    let id = current();
+    with_table(|t| {
+        let task = t.task_mut(id);
+        // Kernel tasks have no brk.
+        if task.space.is_none() {
+            return 0isize;
+        }
+
+        if task.brk_base == 0 {
+            return 0isize;
+        }
+
+        if addr == 0 {
+            return (task.brk_base + task.brk_pages * PAGE_SIZE) as isize;
+        }
+
+        let needed_pages = if addr > task.brk_base {
+            (addr - task.brk_base).div_ceil(PAGE_SIZE)
+        } else {
+            0
+        };
+
+        // A break that shrinks gives its frames back; one that grows takes
+        // more. Either way the pages are this process's from here on.
+        let frontier = task.brk_base + needed_pages * PAGE_SIZE;
+        let grown_to = task.brk_base + task.brk_pages * PAGE_SIZE;
+        if frontier < grown_to {
+            let dropped = match task.space.as_mut() {
+                Some(space) => space.unmap(frontier, grown_to - frontier),
+                None => alloc::vec::Vec::new(),
+            };
+            for frame in dropped {
+                task.user_frames.retain(|&held| held != frame);
+                crate::mm::free_frames(frame, 0);
+            }
+        }
+
+        for i in task.brk_pages..needed_pages {
+            let vaddr = task.brk_base + i * PAGE_SIZE;
+            // Already mapped: someone else's guard page, or a page the break
+            // has already been past. Either way there is nothing to add.
+            if task
+                .space
+                .as_ref()
+                .and_then(|space| space.phys_for_virt(vaddr))
+                .is_some()
+            {
+                continue;
+            }
+            let frame = match crate::mm::alloc_frames(0) {
+                Some(f) => f,
+                None => return crate::syscall::err::ENOMEM,
+            };
+            unsafe {
+                let ptr = crate::mm::phys_to_virt(frame) as *mut u8;
+                core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
+            }
+            let mapped = match task.space.as_mut() {
+                Some(space) => space
+                    .try_map(crate::mm::vm::Mapping {
+                        virt: vaddr,
+                        phys: frame,
+                        length: PAGE_SIZE,
+                        flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+                    })
+                    .is_ok(),
+                None => false,
+            };
+            if !mapped {
+                crate::mm::free_frames(frame, 0);
+                return crate::syscall::err::ENOMEM;
+            }
+            task.user_frames.push(frame);
+        }
+
+        task.brk_pages = needed_pages;
+        addr as isize
+    })
+}
+
+/// Set the initial brk base for the current task (called at ELF load time).
+pub fn set_brk_base(base: usize) {
+    with_table(|t| {
+        let task = t.task_mut(current());
+        task.brk_base = base;
+    })
 }
 
 /// How many tasks are alive, counting the two permanent ones. [`PERMANENT_TASKS`]

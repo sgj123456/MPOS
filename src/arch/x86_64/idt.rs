@@ -88,26 +88,44 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
+    if user_fault_or_die(&frame) {
+        return;
+    }
     fatal("#DE divide error", &frame, 0)
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
+    if user_fault_or_die(&frame) {
+        return;
+    }
     fatal("#UD invalid opcode", &frame, 0)
 }
 
 extern "x86-interrupt" fn stack_segment(frame: InterruptStackFrame, code: u64) {
+    if user_fault_or_die(&frame) {
+        return;
+    }
     fatal("#SS stack segment", &frame, code)
 }
 
 extern "x86-interrupt" fn segment_not_present(frame: InterruptStackFrame, code: u64) {
+    if user_fault_or_die(&frame) {
+        return;
+    }
     fatal("#NP segment not present", &frame, code)
 }
 
 extern "x86-interrupt" fn alignment_check(frame: InterruptStackFrame, code: u64) {
+    if user_fault_or_die(&frame) {
+        return;
+    }
     fatal("#AC alignment check", &frame, code)
 }
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
+    if user_fault_or_die(&frame) {
+        return;
+    }
     fatal("#GP general protection", &frame, code)
 }
 
@@ -117,6 +135,13 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) ->
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let addr = Cr2::read().map_or(0, |a| a.as_u64());
+    let rip = frame.instruction_pointer.as_u64() as usize;
+    if rip < (1 << 47) {
+        crate::println!("user #PF at {:#x} code={:?} rip={:#x}", addr, code, rip);
+        crate::sched::send_signal(crate::sched::current(), 11);
+        crate::sched::preempt();
+        return;
+    }
     crate::println!(
         "\nKERNEL PANIC: #PF at {:#x} ({:?}) rip {:#x}",
         addr,
@@ -135,4 +160,16 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
         frame.stack_pointer
     );
     crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_FAILURE)
+}
+
+/// If the faulting rip is in the lower half (user mode), deliver SIGSEGV and
+/// return `true`.  Otherwise return `false` so the caller can panic.
+fn user_fault_or_die(frame: &InterruptStackFrame) -> bool {
+    let rip = frame.instruction_pointer.as_u64() as usize;
+    if rip < (1 << 47) {
+        crate::sched::send_signal(crate::sched::current(), 11); // SIGSEGV
+        crate::sched::preempt();
+        return true;
+    }
+    false
 }

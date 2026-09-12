@@ -65,6 +65,16 @@ if [[ "$ARCH" == "x86_64" ]]; then
     cp -r "$ROOT/initramfs" "$ROOTFS"
     mkdir -p "$ROOTFS/bin"
     cp "$USERBIN"/* "$ROOTFS/bin/"
+    # Cross-compiled musl coreutils (uutils) binary, when available.
+    MUSL_COREUTILS="/tmp/coreutils/target/x86_64-unknown-linux-musl/release/coreutils"
+    if [[ -f "$MUSL_COREUTILS" ]]; then
+        cp "$MUSL_COREUTILS" "$ROOTFS/bin/coreutils"
+    fi
+    # Cross-compiled musl hello world binary, when available.
+    MUSL_HELLO="/home/mp/musl_hello/target/x86_64-unknown-linux-musl/release/musl_hello"
+    if [[ -f "$MUSL_HELLO" ]]; then
+        cp "$MUSL_HELLO" "$ROOTFS/bin/musl_hello"
+    fi
     # The mountpoint devfs is mounted over. Git cannot hold an empty directory,
     # so the tree cannot be trusted to carry it.
     mkdir -p "$ROOTFS/dev"

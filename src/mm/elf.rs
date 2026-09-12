@@ -17,6 +17,15 @@ pub struct Image<'a> {
     pub entry: usize,
     /// The loadable segments, in file order.
     pub segments: Vec<Segment<'a>>,
+    /// Virtual address of the program header table (for AT_PHDR auxv).
+    pub phdr_addr: usize,
+    /// Number of program headers (for AT_PHNUM auxv).
+    pub phnum: usize,
+    /// Size of each program header entry (for AT_PHENT auxv).
+    pub phent: usize,
+    /// R_X86_64_RELATIVE relocations: (virtual address, addend).
+    /// The loader must write `addend` at `offset` after mapping segments.
+    pub rela: Vec<(usize, i64)>,
 }
 
 /// One `PT_LOAD` segment: file bytes to place at `vaddr`, zero-filled out to
@@ -41,9 +50,19 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u8 = 1;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
+
+// Dynamic section tags.
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+
+// Relocation type for R_X86_64_RELATIVE.
+const R_X86_64_RELATIVE: u64 = 8;
 
 /// The size the loader needs a program header to be: everything up to and
 /// including `p_memsz`, the last field it reads.
@@ -78,9 +97,12 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     if bytes[4] != ELFCLASS64 || bytes[5] != ELFDATA2LSB || bytes[6] != EV_CURRENT {
         return None;
     }
-    // Only fixed-address images: a `ET_DYN` would need a base chosen at load
-    // time and relocations applied, and nothing produces one here yet.
-    if u16_at(bytes, 16)? != ET_EXEC {
+    // Accept ET_EXEC (fixed-address) and ET_DYN (static-pie). Both are
+    // statically linked and need no relocation processing: ET_DYN segments
+    // have vaddrs that are absolute (base 0 for static-pie), so the loader
+    // can map them directly.
+    let e_type = u16_at(bytes, 16)?;
+    if e_type != ET_EXEC && e_type != ET_DYN {
         return None;
     }
     let entry = u64_at(bytes, 24)?;
@@ -92,17 +114,25 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     }
 
     let mut segments = Vec::new();
+    // Raw program header data kept for dynamic-section parsing below.
+    let mut dyn_data: Option<&[u8]> = None;
+
     for index in 0..phnum {
         let at = phoff.checked_add(index.checked_mul(phentsize)?)?;
         let header = bytes.get(at..at.checked_add(phentsize)?)?;
-        if u32_at(header, 0)? != PT_LOAD {
-            continue;
-        }
+        let ptype = u32_at(header, 0)?;
         let pflags = u32_at(header, 4)?;
         let offset = u64_at(header, 8)? as usize;
         let vaddr = u64_at(header, 16)? as usize;
         let filesz = u64_at(header, 32)? as usize;
         let memsz = u64_at(header, 40)? as usize;
+
+        if ptype == PT_DYNAMIC {
+            dyn_data = bytes.get(offset..offset.checked_add(filesz)?);
+        }
+        if ptype != PT_LOAD {
+            continue;
+        }
 
         // The file image cannot be longer than the memory image: bytes past
         // `memsz` would have nowhere to live, and a header claiming so is
@@ -138,10 +168,107 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     if entry as usize >= USER_LIMIT {
         return None;
     }
+
+    // --- R_X86_64_RELATIVE relocations ---
+    // For static-pie ET_DYN binaries the dynamic section lists RELA entries
+    // that the runtime linker would process.  We only handle the simple
+    // R_X86_64_RELATIVE kind (write `addend` at `offset`).
+    let bytes_start = bytes.as_ptr() as usize;
+    let rela = extract_rela(bytes, bytes_start, &segments, dyn_data);
+
+    // Compute the virtual address of the program header table.  For both
+    // ET_EXEC and ET_DYN the table lives inside the first PT_LOAD segment
+    // (file offset 0), so the virtual address is base + e_phoff.
+    let phdr_addr = segments.first().map_or(0, |s| s.vaddr + phoff);
     Some(Image {
         entry: entry as usize,
         segments,
+        phdr_addr,
+        phnum,
+        phent: phentsize,
+        rela,
     })
+}
+
+/// Convert a virtual address to a file offset by finding the PT_LOAD segment
+/// that contains it.  Returns `None` if no segment covers `vaddr`.
+fn vaddr_to_offset(segments: &[Segment<'_>], vaddr: usize, bytes_start: usize) -> Option<usize> {
+    for seg in segments {
+        if vaddr >= seg.vaddr && vaddr < seg.vaddr + seg.memsz {
+            let delta = vaddr - seg.vaddr;
+            // seg.data is a subslice of the original `bytes`, so its starting
+            // position in the file is the segment's file offset.
+            let seg_file_offset = seg.data.as_ptr() as usize - bytes_start;
+            return Some(seg_file_offset + delta);
+        }
+    }
+    None
+}
+
+/// Read the DYNAMIC section and extract R_X86_64_RELATIVE relocations.
+fn extract_rela<'a>(
+    bytes: &[u8],
+    bytes_start: usize,
+    segments: &[Segment<'a>],
+    dyn_data: Option<&'a [u8]>,
+) -> Vec<(usize, i64)> {
+    let Some(dyn_data) = dyn_data else {
+        return Vec::new();
+    };
+
+    // Parse dynamic entries (each: i64 tag + u64 val = 16 bytes).
+    let mut rela_vaddr: Option<u64> = None;
+    let mut rela_size: Option<u64> = None;
+    let mut rela_ent: u64 = 24; // default ELF64_Rela size
+
+    let mut off = 0;
+    while off + 16 <= dyn_data.len() {
+        let tag = i64::from_le_bytes(dyn_data[off..off + 8].try_into().unwrap());
+        let val = u64::from_le_bytes(dyn_data[off + 8..off + 16].try_into().unwrap());
+        if tag == 0 {
+            break; // DT_NULL
+        }
+        match tag as u64 {
+            DT_RELA => rela_vaddr = Some(val),
+            DT_RELASZ => rela_size = Some(val),
+            DT_RELAENT => rela_ent = val,
+            _ => {}
+        }
+        off += 16;
+    }
+
+    let (rela_vaddr, rela_size) = match (rela_vaddr, rela_size) {
+        (Some(v), Some(s)) => (v as usize, s as usize),
+        _ => return Vec::new(),
+    };
+    if rela_ent == 0 || rela_size == 0 {
+        return Vec::new();
+    }
+
+    // Convert the RELA virtual address to a file offset.
+    let file_offset = match vaddr_to_offset(segments, rela_vaddr, bytes_start) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    let entry_size = rela_ent as usize;
+    let count = rela_size / entry_size;
+
+    let mut rela = Vec::new();
+    for i in 0..count {
+        let base = file_offset + i * entry_size;
+        if base + 24 > bytes.len() {
+            break;
+        }
+        let r_offset = u64_at(bytes, base).unwrap_or(0) as usize;
+        let r_info = u64_at(bytes, base + 8).unwrap_or(0);
+        let r_addend =
+            i64::from_le_bytes(bytes[base + 16..base + 24].try_into().unwrap_or([0u8; 8]));
+        let r_type = r_info & 0xff; // lower 8 bits
+        if r_type == R_X86_64_RELATIVE {
+            rela.push((r_offset, r_addend));
+        }
+    }
+    rela
 }
 
 #[cfg(all(test, not(target_os = "none")))]
@@ -244,7 +371,7 @@ mod tests {
 
         let mut dynamic = good.clone();
         dynamic[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
-        assert!(parse(&dynamic).is_none(), "a PIE needs a load-time base");
+        assert!(parse(&dynamic).is_some(), "a static-pie binary is accepted");
 
         // File bytes longer than the memory image have nowhere to live.
         let mut oversized = good.clone();

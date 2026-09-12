@@ -1,4 +1,5 @@
-//! The signal numbers and the pending-bit arithmetic.
+//! The signal numbers, the pending-bit arithmetic, and each process's
+//! dispositions.
 //!
 //! Delivery is the runtime's business; this module is only the vocabulary, kept
 //! on its own so host tests can pin the numbers and the bit math without a
@@ -6,9 +7,12 @@
 //! (SIGPIPE on a broken pipe) and what a process could be told (SIGINT,
 //! SIGTERM, SIGKILL). More arrive with the tty's foreground-process concept.
 //!
-//! Every signal here is fatal by default. There are no handlers yet - kernel
-//! tasks have no user frame to return to - so "delivered" and "dies of" are
-//! the same thing for now.
+//! Every signal here is fatal by default. A disposition can be *recorded*
+//! (`rt_sigaction`) but not yet *honoured*: no user frame is ever built for a
+//! handler, so "delivered" and "dies of" are still the same thing. Recording
+//! them is not busywork - it is what lets a query answer `SIG_DFL` with a
+//! zeroed struct, and later what lets a handler become real without changing
+//! the syscall's shape.
 
 /// Interrupt from the keyboard, once there is a keyboard.
 pub const SIGINT: u8 = 2;
@@ -18,6 +22,77 @@ pub const SIGPIPE: u8 = 13;
 pub const SIGTERM: u8 = 15;
 /// Termination, the kind that cannot be caught, blocked or ignored.
 pub const SIGKILL: u8 = 9;
+/// Stop, the other kind that cannot be caught.
+pub const SIGSTOP: u8 = 19;
+
+/// How many signal numbers a process can hold a disposition for. `Pending` is
+/// a `u32`, so 1..=31 are the numbers this kernel can name at all; the zero
+/// slot is left in so a signal number indexes its own entry.
+pub const SIGNALS: usize = 32;
+
+/// One signal's disposition, in the shape `rt_sigaction` reads and writes.
+///
+/// The zero value is `SIG_DFL` with no flags, no restorer and an empty mask -
+/// which is exactly what a query of an untouched disposition has to report, so
+/// a fresh process can simply start with zeroed slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Action {
+    /// `SIG_DFL` (0), `SIG_IGN` (1), or a user-mode function address.
+    pub handler: usize,
+    /// `SA_*` bits. Kept verbatim: the kernel itself acts on none of them yet.
+    pub flags: usize,
+    /// Where musl's trampoline lives, handed back to a handler that runs.
+    pub restorer: usize,
+    /// The mask a handler would run under.
+    pub mask: u64,
+}
+
+/// A process's dispositions, indexed by signal number.
+#[derive(Clone, Copy, Debug)]
+pub struct Actions([Action; SIGNALS]);
+
+impl Default for Actions {
+    fn default() -> Actions {
+        Actions([Action::default(); SIGNALS])
+    }
+}
+
+impl Actions {
+    /// What would happen if `sig` arrived now. Signals the kernel cannot name
+    /// answer `SIG_DFL`, which is the truth about them too.
+    pub fn get(&self, sig: u8) -> Action {
+        self.0.get(sig as usize).copied().unwrap_or_default()
+    }
+
+    /// Record a disposition. Out-of-range numbers are silently ignored: the
+    /// callers validate first, and there is no slot to write.
+    pub fn set(&mut self, sig: u8, action: Action) {
+        if let Some(slot) = self.0.get_mut(sig as usize) {
+            *slot = action;
+        }
+    }
+}
+
+/// Whether `sig` can have a disposition at all: Linux refuses signal 0, the
+/// numbers above 31, and the two the kernel reserves for itself.
+pub fn catchable(sig: usize) -> bool {
+    (1..SIGNALS).contains(&sig) && sig != SIGKILL as usize && sig != SIGSTOP as usize
+}
+
+/// The alternate stack `sigaltstack` installs, if any.
+///
+/// `sp` is the region's base, as the caller gave it - not its top, which is
+/// where a stack pointer would start. Nothing switches to it yet: a handler
+/// would have to be about to run, and none ever is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AltStack {
+    pub sp: usize,
+    pub size: usize,
+}
+
+/// The smallest alternate stack Linux accepts; a smaller one could not hold a
+/// signal frame, and Linux answers `ENOMEM` rather than truncating it.
+pub const MINSIGSTKSZ: usize = 2048;
 
 /// A pending-signal set: one bit per signal number.
 pub type Pending = u32;
