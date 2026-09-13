@@ -132,9 +132,17 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) ->
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
-    let addr = Cr2::read().map_or(0, |a| a.as_u64());
+    let addr = Cr2::read().map_or(0, |a| a.as_u64()) as usize;
     let rip = frame.instruction_pointer.as_u64() as usize;
+
+    // User fault in the lower half: try COW first, then deliver SIGSEGV.
     if rip < (1 << 47) {
+        // Write fault with COW bit set: resolve by copying the page.
+        if code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+            && crate::sched::resolve_cow_fault(addr)
+        {
+            return; // Instruction retries and succeeds.
+        }
         crate::println!("user #PF at {:#x} code={:?} rip={:#x}", addr, code, rip);
         crate::sched::send_signal(crate::sched::current(), 11);
         crate::sched::preempt();

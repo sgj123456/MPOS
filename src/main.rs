@@ -795,7 +795,7 @@ unsafe fn syscall(
     a5: usize,
     a6: usize,
 ) -> isize {
-    syscall::linux_dispatch(nr, [a1, a2, a3, a4, a5, a6], false)
+    syscall::linux_dispatch(nr, [a1, a2, a3, a4, a5, a6], false, core::ptr::null_mut())
 }
 
 /// Prove the syscall gate, ramfs, mounts, initramfs unpack, and device filesystem.
@@ -804,20 +804,20 @@ fn check_vfs() {
     {
         // Probe a number beyond the table: 999 is now CLEANUP_AFTER_KTHREAD.
         assert_eq!(
-            syscall::linux_dispatch(1024, [0; syscall::ARG_COUNT], false),
+            syscall::linux_dispatch(1024, [0; syscall::ARG_COUNT], false, core::ptr::null_mut()),
             err::ENOSYS
         );
         assert_eq!(
-            syscall::linux_dispatch(lnr::READ, [0, 0, 0, 0, 0, 0], false),
+            syscall::linux_dispatch(lnr::READ, [0, 0, 0, 0, 0, 0], false, core::ptr::null_mut()),
             0,
             "a zero-length read is empty, not an error"
         );
         assert_eq!(
-            syscall::linux_dispatch(lnr::READ, [3, 0, 0, 0, 0, 0], false),
+            syscall::linux_dispatch(lnr::READ, [3, 0, 0, 0, 0, 0], false, core::ptr::null_mut()),
             err::EBADF
         );
         assert_eq!(
-            syscall::linux_dispatch(lnr::WRITE, [7, 0, 0, 0, 0, 0], false),
+            syscall::linux_dispatch(lnr::WRITE, [7, 0, 0, 0, 0, 0], false, core::ptr::null_mut()),
             err::EBADF
         );
 
@@ -826,6 +826,7 @@ fn check_vfs() {
             lnr::WRITE,
             [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0],
             false,
+            core::ptr::null_mut(),
         );
         assert_eq!(wrote as usize, msg.len());
 
@@ -834,7 +835,7 @@ fn check_vfs() {
         // dispatch takes the task down.
         sched::spawn(
             || {
-                let pid = syscall::linux_dispatch(lnr::GETPID, [0; syscall::ARG_COUNT], false);
+                let pid = syscall::linux_dispatch(lnr::GETPID, [0; syscall::ARG_COUNT], false, core::ptr::null_mut());
                 assert!(pid >= 2, "getpid returned {pid}");
 
                 let msg = b"syscall: write through dispatch in a spawned task\n";
@@ -842,11 +843,12 @@ fn check_vfs() {
                     lnr::WRITE,
                     [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0],
                     false,
+                    core::ptr::null_mut(),
                 );
                 assert_eq!(wrote as usize, msg.len(), "dispatch dropped bytes");
 
                 assert_eq!(
-                    syscall::linux_dispatch(lnr::SCHED_YIELD, [0; syscall::ARG_COUNT], false),
+                    syscall::linux_dispatch(lnr::SCHED_YIELD, [0; syscall::ARG_COUNT], false, core::ptr::null_mut()),
                     0
                 );
                 // 2 ms, 1 byte, 0 padding — a request for the handler to
@@ -856,11 +858,12 @@ fn check_vfs() {
                     syscall::linux_dispatch(
                         lnr::NANOSLEEP,
                         [req.as_ptr() as usize, 0, 0, 0, 0, 0],
-                        false
+                        false,
+                        core::ptr::null_mut(),
                     ),
                     0
                 );
-                syscall::linux_dispatch(lnr::EXIT_GROUP, [0, 0, 0, 0, 0, 0], false);
+                syscall::linux_dispatch(lnr::EXIT_GROUP, [0, 0, 0, 0, 0, 0], false, core::ptr::null_mut());
             },
             Priority::NORMAL,
         );

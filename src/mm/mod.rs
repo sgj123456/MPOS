@@ -55,15 +55,49 @@ pub fn virt_to_phys(virt: usize) -> usize {
 }
 
 /// Allocate `2^order` contiguous physical frames, aligned to their own size.
+/// Single-page allocations start with a reference count of 1.
 #[cfg(target_os = "none")]
 pub fn alloc_frames(order: usize) -> Option<usize> {
-    critical_section::with(|cs| PMM.borrow(cs).borrow_mut().alloc(order))
+    let phys = critical_section::with(|cs| PMM.borrow(cs).borrow_mut().alloc(order))?;
+    if order == 0 {
+        critical_section::with(|cs| PMM.borrow(cs).borrow_mut().set_refcount_1(phys));
+    }
+    Some(phys)
 }
 
 /// Return frames allocated by [`alloc_frames`] with the same order.
+/// For order-0 (single page) allocations, the reference count is decremented
+/// first; the frame is only returned to the buddy allocator when no owners
+/// remain.
 #[cfg(target_os = "none")]
 pub fn free_frames(phys: usize, order: usize) {
+    if order == 0 {
+        let should_free =
+            critical_section::with(|cs| PMM.borrow(cs).borrow_mut().free_frame_ref(phys));
+        if !should_free {
+            return;
+        }
+    }
     critical_section::with(|cs| PMM.borrow(cs).borrow_mut().free(phys, order))
+}
+
+/// The reference count of a single page. Returns 0 for untracked pages.
+#[cfg(target_os = "none")]
+pub fn frame_refcount(phys: usize) -> u32 {
+    critical_section::with(|cs| PMM.borrow(cs).borrow().refcount(phys))
+}
+
+/// Increment the reference count of a single page (fork shares a frame).
+#[cfg(target_os = "none")]
+pub fn clone_frame_ref(phys: usize) {
+    critical_section::with(|cs| PMM.borrow(cs).borrow_mut().clone_frame_ref(phys))
+}
+
+/// Decrement the reference count. Returns `true` when the frame should be
+/// freed back to the buddy allocator (refcount hit 0).
+#[cfg(target_os = "none")]
+pub fn free_frame_ref(phys: usize) -> bool {
+    critical_section::with(|cs| PMM.borrow(cs).borrow_mut().free_frame_ref(phys))
 }
 
 /// [`alloc_frames`], returned at the address the kernel can actually use.

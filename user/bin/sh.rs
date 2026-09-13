@@ -8,10 +8,7 @@
 //! file, and `name=value` on its own remembers a variable for `$name` later.
 //!
 //! Linux ABI: each command is a `fork()` then `execve()` in the child, with
-//! `pipe2()` and `dup2()` threading redirections between. On mpos `fork(2)`
-//! answers ENOSYS today, so a pipeline without it cannot work - the shell
-//! falls back to `execve()` directly, which replaces the shell with the
-//! command (so a multi-command line is broken until fork lands).
+//! `pipe2()` and `dup2()` threading redirections between.
 //!
 //! The quiet contract holds: the shell prints nothing unless something went
 //! wrong, or unless someone asks what happened (`$?`).
@@ -75,7 +72,11 @@ impl Shell {
             status: [0u8; 12],
             status_len: 1,
             code: 0,
-            here: { let mut h = [0u8; 128]; h[0] = b'/'; h },
+            here: {
+                let mut h = [0u8; 128];
+                h[0] = b'/';
+                h
+            },
             here_len: 1,
         }
     }
@@ -211,9 +212,14 @@ impl Shell {
 /// Build the argv layout `execve(2)` takes: argv[0] is the program name,
 /// then the words, then a NULL. Each slot is a `*const u8` to a NUL-
 /// terminated string, kept in a stack buffer the shell owns.
-fn make_argv(name: &[u8], words: &[&[u8]], argv: &mut [*const u8; 16], strs: &mut [[u8; 32]; 16]) -> usize {
+fn make_argv(
+    name: &[u8],
+    words: &[&[u8]],
+    argv: &mut [*const u8; 16],
+    strs: &mut [[u8; 32]; 16],
+) -> usize {
     let mut count = 0usize;
-    let mut copy_in = |slot: &mut [u8; 32], src: &[u8]| {
+    let copy_in = |slot: &mut [u8; 32], src: &[u8]| {
         let n = src.len().min(31);
         slot[..n].copy_from_slice(&src[..n]);
         slot[n] = 0;
@@ -358,27 +364,12 @@ fn run_line(sh: &mut Shell, line: &[u8]) {
         }
     }
 
-    // No fork on mpos yet. Run the first command in-place via execve and
-    // report the error; the shell can at least answer the prompt again.
     let first = &commands[0];
-    let mut path = [0u8; 80];
     let name = first.name();
+    let mut path = [0u8; 80];
     path[..5].copy_from_slice(b"/bin/");
     path[5..5 + name.len()].copy_from_slice(name);
-
-    // If a redirection is wanted, build it on the fd table first.
-    if let Some(redir_path) = first.redirect_out {
-        let fd = redirect_to(redir_path);
-        if fd < 0 {
-            let _ = lin::write_all(2, b"sh: cannot write ");
-            let _ = lin::write_all(2, redir_path);
-            let _ = lin::write_all(2, b"\n");
-            sh.set_status(1);
-            return;
-        }
-        let _ = lin::dup2(fd as i32, 1);
-        let _ = lin::close(fd as i32);
-    }
+    path[5 + name.len()] = 0;
 
     let argv_words = first.argv();
     let mut argv_buf: [*const u8; 16] = [core::ptr::null(); 16];
@@ -386,20 +377,35 @@ fn run_line(sh: &mut Shell, line: &[u8]) {
     let _ = make_argv(name, &argv_words[1..], &mut argv_buf, &mut strs);
     let envp: [*const u8; 1] = [core::ptr::null()];
 
-    // On mpos `execve` cannot swap this task's image, so it starts the
-    // program as a child and answers its pid. Waiting for that child is
-    // what makes the shell survive the command and read the next line -
-    // and what makes `$?` the command's real exit status.
-    let pid = lin::execve(path.as_ptr(), argv_buf.as_ptr(), envp.as_ptr());
+    // Fork: the child does execve, the parent waits.
+    let pid = lin::fork();
     if pid < 0 {
-        let _ = lin::write_all(2, b"sh: ");
-        let _ = lin::write_all(2, name);
-        let _ = lin::write_all(2, b": cannot run\n");
+        let _ = lin::write_all(2, b"sh: fork failed\n");
         sh.set_status(1);
         return;
     }
-    let code = lin::wait4(pid as usize, core::ptr::null_mut(), 0);
-    sh.set_status(if code < 0 { 1 } else { code });
+
+    if pid == 0 {
+        // Child: apply redirections, then exec.
+        if let Some(redir_path) = first.redirect_out {
+            let fd = redirect_to(redir_path);
+            if fd >= 0 {
+                let _ = lin::dup2(fd as i32, 1);
+                let _ = lin::close(fd as i32);
+            }
+        }
+        let _ = lin::execve(path.as_ptr(), argv_buf.as_ptr(), envp.as_ptr());
+        // If execve returns, it failed.
+        let _ = lin::write_all(2, b"sh: ");
+        let _ = lin::write_all(2, name);
+        let _ = lin::write_all(2, b": cannot run\n");
+        lin::exit_group(1);
+    }
+
+    // Parent: wait for the child.
+    let mut status: i32 = 0;
+    let _ = lin::wait4(pid as usize, &mut status as *mut i32, 0);
+    sh.set_status(status as isize);
 }
 
 /// The shell's own commands.
@@ -427,7 +433,10 @@ fn builtin(sh: &mut Shell, argv: &[&[u8]]) -> Option<isize> {
             Some(0)
         }
         b"exit" => {
-            let code = argv.get(1).and_then(|v| decimal(v)).unwrap_or(sh.last_status());
+            let code = argv
+                .get(1)
+                .and_then(|v| decimal(v))
+                .unwrap_or(sh.last_status());
             lin::exit_group(code as i32);
         }
         _ => None,

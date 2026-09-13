@@ -279,6 +279,13 @@ impl Buddy {
 pub struct Pmm {
     zones: [Buddy; MAX_ZONES],
     zone_count: usize,
+    /// Reference counts for copy-on-write support. Maps the physical address of
+    /// a single page (order-0) to the number of owners it has. A freshly
+    /// allocated page starts at 1; fork increments it; free decrements it and
+    /// only returns the frame to the buddy allocator when it reaches 0.
+    ///
+    /// `Option` because `BTreeMap::new()` is not `const`; `init` fills it in.
+    refcounts: Option<alloc::collections::BTreeMap<usize, u32>>,
 }
 
 impl Pmm {
@@ -286,7 +293,54 @@ impl Pmm {
         Self {
             zones: [Buddy::empty(); MAX_ZONES],
             zone_count: 0,
+            refcounts: None,
         }
+    }
+
+    fn refcounts(&mut self) -> &mut alloc::collections::BTreeMap<usize, u32> {
+        self.refcounts
+            .get_or_insert_with(alloc::collections::BTreeMap::new)
+    }
+
+    /// The reference count of a single page. Returns 0 for pages not tracked
+    /// (including multi-page blocks, which are never COW-shared).
+    pub fn refcount(&self, phys: usize) -> u32 {
+        self.refcounts
+            .as_ref()
+            .and_then(|rc| rc.get(&phys).copied())
+            .unwrap_or(0)
+    }
+
+    /// Increment the reference count of a single page. Called when fork shares
+    /// a frame with the child. The page must have been previously allocated.
+    pub fn clone_frame_ref(&mut self, phys: usize) {
+        let rc = self.refcounts();
+        match rc.get_mut(&phys) {
+            Some(count) => *count += 1,
+            None => {
+                rc.insert(phys, 2);
+            }
+        }
+    }
+
+    /// Decrement the reference count of a single page. Returns `true` when the
+    /// count reached zero and the frame should be returned to the buddy
+    /// allocator, `false` when other owners still hold it.
+    pub fn free_frame_ref(&mut self, phys: usize) -> bool {
+        let rc = self.refcounts();
+        if let Some(count) = rc.get_mut(&phys) {
+            *count -= 1;
+            if *count == 0 {
+                rc.remove(&phys);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Record that a freshly allocated page has exactly one owner.
+    pub fn set_refcount_1(&mut self, phys: usize) {
+        self.refcounts().insert(phys, 1);
     }
 
     /// Build a zone per allocatable region of the memory map.

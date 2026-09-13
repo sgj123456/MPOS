@@ -54,7 +54,7 @@ if [[ "$ARCH" == "x86_64" ]]; then
     for src in "$ROOT"/user/bin/*.rs; do
         name="$(basename "$src" .rs)"
         case "$name" in
-            cat|echo|false|hello|t_stdargs|true)
+            cat|echo|false|hello|t_stdargs|true|ls|sleep)
                 rustc --edition 2024 \
                     --target x86_64-unknown-linux-musl \
                     -C target-feature=+crt-static \

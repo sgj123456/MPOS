@@ -18,7 +18,7 @@ fn main() -> ExitCode {
 
     if names.peek().is_none() {
         // No operands: stdin is the file, as POSIX says.
-        let mut stdin = io::stdin();
+        let stdin = io::stdin();
         failed = copy_to(&mut stdin.lock(), &mut out).is_err();
     } else {
         for name in names {
@@ -36,7 +36,11 @@ fn main() -> ExitCode {
 
     // A write that only reached the buffer is not a write yet.
     failed |= out.flush().is_err();
-    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// One reader to stdout, until end of input or the first real error. A short

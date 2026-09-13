@@ -153,7 +153,8 @@ extern "C" fn rust_syscall(regs: *mut Regs) -> usize {
     // One number space - Linux x86_64 - serves every call. The gate is only
     // ever entered from ring 3 (a `syscall` at ring 0 would load a user CS
     // and fault), so every call here is from user.
-    syscall::linux_dispatch(regs.rax as u64, args, true) as usize
+    let regs_ptr = regs as *mut Regs as *mut ();
+    syscall::linux_dispatch(regs.rax as u64, args, true, regs_ptr) as usize
 }
 
 global_asm!(

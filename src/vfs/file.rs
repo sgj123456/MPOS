@@ -22,6 +22,9 @@ use super::{Inode, Metadata, VfsError, VfsResult, resolve};
 /// What an fd number is.
 pub type RawFd = i32;
 
+/// The `FD_CLOEXEC` flag bit: close this descriptor on `execve`.
+pub const FD_CLOEXEC: u32 = 1;
+
 /// An open file description: an inode plus where the next read/write lands.
 pub struct File {
     inode: Arc<dyn Inode>,

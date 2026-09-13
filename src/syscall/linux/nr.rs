@@ -28,6 +28,7 @@ pub const DUP: u64 = 32;
 pub const DUP2: u64 = 33;
 pub const NANOSLEEP: u64 = 35;
 pub const GETPID: u64 = 39;
+pub const CLONE: u64 = 56;
 pub const FORK: u64 = 57;
 pub const VFORK: u64 = 58;
 pub const EXECVE: u64 = 59;
@@ -86,3 +87,14 @@ pub const MADVISE: u64 = 28;
 pub const PPOLL: u64 = 271;
 pub const SCHED_YIELD: u64 = 24; // sched_yield(2)
 pub const CLEANUP_AFTER_KTHREAD: u64 = 999;
+
+// clone() flag bits (subset needed for pthreads and shell).
+pub const CLONE_VM: usize = 0x0000_0100;
+pub const CLONE_FS: usize = 0x0000_0200;
+pub const CLONE_FILES: usize = 0x0000_0400;
+pub const CLONE_SIGHAND: usize = 0x0000_0800;
+pub const CLONE_PARENT: usize = 0x0008_0000;
+pub const CLONE_THREAD: usize = 0x0010_0000;
+pub const CLONE_SETTLS: usize = 0x0020_0000;
+pub const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+pub const CLONE_CHILD_SETTID: usize = 0x0100_0000;

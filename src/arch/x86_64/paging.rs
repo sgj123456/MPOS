@@ -37,6 +37,7 @@ use crate::mm::{self, PAGE_SIZE};
 const PRESENT: u64 = 1;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
+const COW_BIT: u64 = 1 << 9; // Available bit on x86_64 (not used by hardware)
 const HUGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
 /// Bits 12..=51 hold the address of the next table or of the page itself.
@@ -352,6 +353,211 @@ impl AddressSpace {
     /// the switch happens.
     pub fn switch(&self) {
         activate(self.root);
+    }
+
+    /// Map a page as copy-on-write: present and readable from ring 3, but
+    /// not writable. The COW bit marks it for the page fault handler.
+    pub fn map_cow(&mut self, virt: usize, phys: usize, flags: MapFlags) {
+        // Remove WRITE; the COW fault handler will restore it on copy.
+        let mut cow_flags = flags;
+        cow_flags.remove(MapFlags::WRITE);
+
+        let mut tables = unsafe {
+            OffsetPageTable::new(
+                &mut *(mm::phys_to_virt(self.root) as *mut PageTable),
+                VirtAddr::new(mm::hhdm_offset() as u64),
+            )
+        };
+
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(virt as u64))
+            .expect("aligned page for COW");
+        let frame =
+            PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(phys as u64))
+                .expect("aligned frame for COW");
+
+        let mut flags = page_flags(cow_flags);
+        flags |= PageTableFlags::from_bits_truncate(COW_BIT);
+
+        match unsafe { tables.map_to(page, frame, flags, &mut FramePool { frames: 0 }) } {
+            Ok(flush) => flush.ignore(),
+            Err(_) => panic!("COW map failed at {virt:#x}"),
+        }
+
+        if self.root == active_root() {
+            activate(self.root);
+        }
+    }
+
+    /// Resolve a copy-on-write fault: allocate a fresh frame, copy the
+    /// contents, update the mapping to writable (clearing the COW bit), and
+    /// return the old physical frame so the caller can decrement its refcount.
+    ///
+    /// Returns `Some(old_phys)` on success, `None` if the page is not COW.
+    pub fn resolve_cow(&mut self, virt: usize) -> Option<usize> {
+        let aligned_virt = crate::mm::pframe::align_down(virt, crate::mm::PAGE_SIZE);
+
+        // Read the current PTE to find the physical frame and check COW.
+        let entry = self.read_pte(aligned_virt)?;
+        if entry & COW_BIT == 0 {
+            return None;
+        }
+        let old_phys = (entry & ADDR_MASK) as usize;
+
+        // Allocate a fresh frame and copy.
+        let new_phys = mm::alloc_frames(0)?;
+        let src = unsafe {
+            core::slice::from_raw_parts(mm::phys_to_virt(old_phys) as *const u8, crate::mm::PAGE_SIZE)
+        };
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(mm::phys_to_virt(new_phys) as *mut u8, crate::mm::PAGE_SIZE)
+        };
+        dst.copy_from_slice(src);
+
+        // Re-map with WRITE, without COW bit.
+        let mut flags = MapFlags::READ | MapFlags::WRITE | MapFlags::USER;
+        if entry & NO_EXECUTE != 0 {
+            // Preserve NX: if the original had no-execute, keep it off the
+            // user-visible flags (it maps to !EXEC).
+        } else {
+            flags |= MapFlags::EXEC;
+        }
+        // If the original was not user-accessible, don't make it so.
+        if entry & USER == 0 {
+            flags.remove(MapFlags::USER);
+        }
+
+        self.remap_page(aligned_virt, new_phys, flags);
+
+        Some(old_phys)
+    }
+
+    /// Read the raw PTE entry for a virtual address by walking the page tables.
+    /// Returns the raw entry value, or `None` if any level is not present.
+    fn read_pte(&self, virt: usize) -> Option<u64> {
+        let mut table = self.root;
+        for level in (0..4).rev() {
+            let entry = table_entry(table, virt, level);
+            if entry & PRESENT == 0 {
+                return None;
+            }
+            if level == 0 || entry & HUGE != 0 {
+                return Some(entry);
+            }
+            table = (entry & ADDR_MASK) as usize;
+        }
+        None
+    }
+
+    /// Re-map a single 4KiB page: remove the old mapping and install a new one
+    /// with different flags/physical address. Used by `resolve_cow` and will be
+    /// used by `exec_replace`.
+    fn remap_page(&mut self, virt: usize, new_phys: usize, flags: MapFlags) {
+        let mut tables = unsafe {
+            OffsetPageTable::new(
+                &mut *(mm::phys_to_virt(self.root) as *mut PageTable),
+                VirtAddr::new(mm::hhdm_offset() as u64),
+            )
+        };
+
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(virt as u64))
+            .expect("aligned page for remap");
+
+        // Unmap the old entry (we don't care about the old frame here — the
+        // caller manages refcounts).
+        if let Ok((_, flush)) = tables.unmap(page) {
+            flush.ignore();
+        }
+
+        // Map the new frame.
+        let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(new_phys as u64))
+            .expect("aligned frame for remap");
+        match unsafe {
+            tables.map_to(page, frame, page_flags(flags), &mut FramePool { frames: 0 })
+        } {
+            Ok(flush) => flush.ignore(),
+            Err(_) => panic!("remap_page failed at {virt:#x}"),
+        }
+
+        if self.root == active_root() {
+            activate(self.root);
+        }
+    }
+
+    /// Walk every user-space 4KiB page in the lower half and call `f` with
+    /// `(virt, phys, flags)` for each one. Used by fork to duplicate the
+    /// address space.
+    pub fn walk_user_pages(
+        &self,
+        mut f: impl FnMut(usize, usize, MapFlags),
+    ) {
+        self.walk_level(self.root, 3, 0, &mut f);
+    }
+
+    /// Set the COW bit on the PTE for `virt`. The page must already be mapped.
+    /// Used by fork after `protect` strips WRITE: the PTE still has the old
+    /// flags, and this adds the COW marker.
+    pub fn set_cow_bit(&self, virt: usize) {
+        let aligned_virt = crate::mm::pframe::align_down(virt, crate::mm::PAGE_SIZE);
+        let mut table = self.root;
+        for level in (0..4).rev() {
+            let offset = (aligned_virt >> (12 + level * 9)) & 0x1ff;
+            let entry_ptr = mm::phys_to_virt(table) + offset * 8;
+            let entry = unsafe { (entry_ptr as *mut u64).read_volatile() };
+            if entry & PRESENT == 0 {
+                return;
+            }
+            if level == 0 || entry & HUGE != 0 {
+                // Set the COW bit and clear WRITE.
+                let new = (entry | COW_BIT) & !WRITABLE;
+                unsafe { (entry_ptr as *mut u64).write_volatile(new) };
+                if self.root == active_root() {
+                    activate(self.root);
+                }
+                return;
+            }
+            table = (entry & ADDR_MASK) as usize;
+        }
+    }
+
+    fn walk_level(
+        &self,
+        table: usize,
+        level: u32,
+        base: usize,
+        f: &mut impl FnMut(usize, usize, MapFlags),
+    ) {
+        for index in 0..ENTRIES {
+            let entry = entry_at(table, index);
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            let addr = base | (index << (12 + level * 9));
+
+            // Only walk the lower half (user space).
+            if addr >= USER_END {
+                continue;
+            }
+
+            if level == 0 || entry & HUGE != 0 {
+                // Leaf: this is a mapped page.
+                let phys = (entry & ADDR_MASK) as usize;
+                let mut flags = MapFlags::empty();
+                if entry & WRITABLE != 0 {
+                    flags |= MapFlags::WRITE;
+                }
+                if entry & USER != 0 {
+                    flags |= MapFlags::USER;
+                }
+                if entry & NO_EXECUTE == 0 {
+                    flags |= MapFlags::EXEC;
+                }
+                f(addr, phys, flags);
+            } else {
+                // Non-leaf: descend.
+                let child = (entry & ADDR_MASK) as usize;
+                self.walk_level(child, level - 1, addr, f);
+            }
+        }
     }
 
     /// Translate a user virtual address through *this* address space's page

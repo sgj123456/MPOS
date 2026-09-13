@@ -1791,6 +1791,271 @@ fn schedule(prepare: impl FnOnce(&mut Table)) {
     });
 }
 
+/// Create a child process: duplicate the calling task's address space with
+/// copy-on-write, clone its file descriptor table, and return 0 in the child
+/// and the child's pid in the parent.
+///
+/// The address space duplication is COW: every page in both parent and child
+/// is marked read-only with a COW bit. The first write to any shared page
+/// triggers a page fault that allocates a fresh frame, copies the contents,
+/// and restores write permission — giving each process its own copy at the
+/// moment it diverges.
+pub fn fork() -> isize {
+    // Phase 1: Collect all parent state under one immutable borrow, then
+    // release it before any mutations.
+    let (parent_id, parent_entry, parent_priority, parent_fds, parent_cwd, parent_cwd_path, parent_exe, parent_brk_base, parent_brk_pages, parent_mmap_cursor, parent_pages) = with_table(|t| {
+        let parent_id = t.current;
+        let parent = t.task(parent_id);
+        let parent_entry = parent.user_entry;
+        let parent_priority = parent.priority;
+        let parent_fds = Arc::clone(&parent.fds);
+        let parent_cwd = parent.cwd.clone();
+        let parent_cwd_path = parent.cwd_path.clone();
+        let parent_exe = parent.exe.clone();
+        let parent_brk_base = parent.brk_base;
+        let parent_brk_pages = parent.brk_pages;
+        let parent_mmap_cursor = parent.mmap_cursor;
+
+        // Collect the parent's user page mappings. We need to do this while
+        // holding the borrow, then release it before calling into AddressSpace.
+        let mut parent_pages = Vec::new();
+        if let Some(space) = &parent.space {
+            space.walk_user_pages(|virt, phys, flags| {
+                parent_pages.push((virt, phys, flags));
+            });
+        }
+        (parent_id, parent_entry, parent_priority, parent_fds, parent_cwd, parent_cwd_path, parent_exe, parent_brk_base, parent_brk_pages, parent_mmap_cursor, parent_pages)
+    });
+
+    // If the parent has no address space, this is invalid.
+    if parent_entry.is_none() {
+        return crate::syscall::err::EINVAL;
+    }
+
+    // Phase 2: Allocate a slot and build the child state.
+    let (child_id,) = with_table(|t| {
+        let slot = t.alloc_slot();
+        drop_retired(TaskId(slot));
+
+        let stack = Stack::new();
+        let context = unsafe {
+            context::bootstrap(stack.top(), fork_child_entry, slot, true)
+        };
+
+        // Create the child's address space by sharing all parent pages COW.
+        let mut child_space = AddressSpace::new();
+        let mut child_frames = Vec::new();
+
+        for &(virt, phys, _flags) in &parent_pages {
+            // Increment refcount — two address spaces now own this frame.
+            crate::mm::clone_frame_ref(phys);
+            child_frames.push(phys);
+            // Map in the child as COW (read-only, COW bit set).
+            child_space.map_cow(virt, phys, _flags);
+        }
+
+        // Make the parent's writable pages COW too. We need to reach the
+        // parent's AddressSpace through the task table. We cannot hold the
+        // immutable borrow from phase 1 across this, so re-borrow.
+        if let Some(parent_space) = &mut t.task_mut(parent_id).space {
+            for &(virt, _phys, flags) in &parent_pages {
+                if flags.contains(MapFlags::WRITE) {
+                    parent_space.protect(virt, crate::mm::PAGE_SIZE, MapFlags::READ | MapFlags::USER);
+                    parent_space.set_cow_bit(virt);
+                }
+            }
+        }
+
+        t.tasks[slot] = Some(Task {
+            context,
+            priority: parent_priority,
+            stack: Some(stack),
+            exited: false,
+            body: None,
+            space: Some(child_space),
+            user_entry: parent_entry,
+            user_frames: child_frames,
+            signals: 0,
+            dispositions: signal::Actions::default(),
+            alt_stack: None,
+            fds: parent_fds.clone(),
+            cwd: parent_cwd,
+            cwd_path: parent_cwd_path,
+            parent: Some(parent_id),
+            brk_base: parent_brk_base,
+            brk_pages: parent_brk_pages,
+            mmap_cursor: parent_mmap_cursor,
+            exe: parent_exe,
+        });
+
+        let child_id = TaskId(slot);
+        t.sched.push_ready(child_id, parent_priority);
+        t.sched.wake(parent_id);
+        (child_id,)
+    });
+
+    child_id.0 as isize
+}
+
+/// Entry point for a forked child process. Called from the trampoline with
+/// the task slot in `rdi`. Sets RAX=0 (child's return value from fork)
+/// and enters user mode at the parent's entry point with the parent's
+/// user stack pointer.
+extern "C" fn fork_child_entry(slot: usize) -> ! {
+    let (entry, user_rsp) = with_table(|t| {
+        let task = t.task(TaskId(slot));
+        task.user_entry.expect("fork child has no user_entry")
+    });
+    // Enter user mode. The child's kernel stack is fresh (from bootstrap),
+    // so there is no trap frame to modify. Instead, we set up the iretq
+    // to land at `entry` with `user_rsp`, and RAX will be 0 because the
+    // syscall return path writes the return value to RAX — but since
+    // this is a fresh task entry, not a syscall return, we need to ensure
+    // RAX=0 explicitly.
+    //
+    // The trick: `enter_user` does an iretq which sets all user registers.
+    // We set RAX by putting 0 in the right place on the stack before iretq,
+    // but `enter_user` builds its own frame. Instead, use a wrapper that
+    // sets RAX then calls enter_user.
+    unsafe { enter_user_fork(entry, user_rsp) };
+}
+
+/// Enter user mode with RAX=0 for the fork child. Same as `enter_user`
+/// but pushes RAX=0 as the return value.
+unsafe fn enter_user_fork(entry: usize, user_rsp: usize) -> ! {
+    const RFLAGS_RESERVED: usize = 1 << 1;
+    const RFLAGS_INTERRUPT_FLAG: usize = 1 << 9;
+
+    let (code, data) = crate::arch::gdt::user_selectors();
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            // Build the iretq frame: SS, RSP, RFLAGS, CS, RIP.
+            "push {data}",
+            "push {stack}",
+            "push {flags}",
+            "push {code}",
+            "push {entry}",
+            // The iretq will pop these into SS, RSP, RFLAGS, CS, RIP.
+            // RAX is set to 0 by the caller before we get here — but we
+            // are called from Rust, so RAX is whatever the compiler chose.
+            // Zero it explicitly before iretq.
+            "xor eax, eax",
+            "iretq",
+            data = in(reg) data.0 as usize,
+            stack = in(reg) user_rsp,
+            flags = in(reg) RFLAGS_RESERVED | RFLAGS_INTERRUPT_FLAG,
+            code = in(reg) code.0 as usize,
+            entry = in(reg) entry,
+            options(noreturn),
+        );
+    }
+}
+
+/// Replace the current process's image with a new ELF binary. Tears down the
+/// old address space, loads the new ELF segments, resets process state, and
+/// returns `(entry_point, user_rsp)` so the syscall stub can patch its return
+/// frame and enter the new image on `sysretq`.
+///
+/// This does **not** modify the register frame itself — the caller (syscall
+/// dispatch) does that.
+pub fn exec_replace(
+    bytes: &[u8],
+    argv: &[String],
+    env: &[String],
+    exe: &str,
+) -> Result<(usize, usize), SpawnError> {
+    let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
+    let user_rsp = initial_stack_rsp(argv, env, exe).ok_or(SpawnError::ArgsTooBig)?;
+
+    with_table(|t| {
+        let id = t.current;
+        let task = t.task_mut(id);
+
+        // --- Tear down old address space ---
+        // Drop the old AddressSpace (frees lower-half page tables).
+        if let Some(old_space) = task.space.take() {
+            drop(old_space);
+        }
+        // Free all old user frames (decrement refcounts).
+        for frame in task.user_frames.drain(..) {
+            // For COW frames, decrement the refcount; only truly free when
+            // it reaches 0.
+            if crate::mm::free_frame_ref(frame) {
+                crate::mm::free_frames(frame, 0);
+            }
+        }
+
+        // --- Build new address space ---
+        let mut space = AddressSpace::new();
+        let (entry, frames, stack_top_frame) = load_user(&mut space, &image);
+
+        let brk_base = image
+            .segments
+            .iter()
+            .map(|s| s.vaddr + s.memsz)
+            .max()
+            .map_or(0, |end| {
+                (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
+            });
+
+        write_arg_block(stack_top_frame, user_rsp, argv, env, exe, &image);
+
+        // --- Reset process state ---
+        task.space = Some(space);
+        task.user_entry = Some((entry, user_rsp));
+        task.user_frames = frames;
+        task.brk_base = brk_base;
+        task.brk_pages = 0;
+        task.mmap_cursor = crate::syscall::MMAP_BASE;
+        task.exe = alloc::string::String::from(exe);
+
+        // Reset signal dispositions to SIG_DFL (POSIX requirement).
+        task.dispositions = signal::Actions::default();
+        task.alt_stack = None;
+        task.signals = 0;
+
+        // Close O_CLOEXEC file descriptors.
+        {
+            use crate::vfs::file::FD_CLOEXEC;
+            let fds = &task.fds;
+            // Collect fds to close (can't modify while iterating).
+            let mut to_close = alloc::vec::Vec::new();
+            for fd in 0..1024i32 {
+                if let Ok(flags) = fds.fd_flags_get(fd) {
+                    if flags & FD_CLOEXEC != 0 {
+                        to_close.push(fd);
+                    }
+                }
+            }
+            for fd in to_close {
+                let _ = fds.close(fd);
+            }
+        }
+
+        Ok((entry, user_rsp))
+    })
+}
+
+/// Resolve a COW (copy-on-write) page fault for the current task.
+/// If the faulting address is in the current task's address space and has the
+/// COW bit set, copies the page, remaps it writable, and returns `true`.
+/// Returns `false` if the fault cannot be resolved as COW.
+pub fn resolve_cow_fault(virt: usize) -> bool {
+    with_table(|t| {
+        let id = t.current;
+        if let Some(ref mut task) = t.tasks[id.0] {
+            if let Some(ref mut space) = task.space {
+                space.resolve_cow(virt).is_some()
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    })
+}
+
 /// Run `f` on the task table with interrupts off.
 ///
 /// `f` must not switch tasks. See the module docs for why that is a rule rather

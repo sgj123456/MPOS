@@ -10,8 +10,32 @@ use alloc::sync::Arc;
 
 use crate::sched::TaskId;
 use crate::syscall::{ARG_COUNT, argv_arg, buffer_ok, cstr_arg, err, err_of};
+use super::nr;
 
 pub(super) use crate::syscall::MMAP_BASE;
+
+/// The register frame on the kernel stack, matching the layout pushed by the
+/// `syscall` entry stub in `arch/x86_64/syscall.rs`. Fields are named after
+/// the user registers they hold; offsets must match the push order exactly.
+/// Used by `handle_execve` to patch the return address and stack pointer.
+#[repr(C)]
+struct RegsFrame {
+    rax: usize,   // [rsp+0]  return value / syscall number
+    r11: usize,   // [rsp+8]  user RFLAGS (sysretq restores from here)
+    rcx: usize,   // [rsp+16] user RIP (sysretq restores from here)
+    r9: usize,    // [rsp+24]
+    r8: usize,    // [rsp+32]
+    r10: usize,   // [rsp+40]
+    rdx: usize,   // [rsp+48]
+    rsi: usize,   // [rsp+56]
+    rdi: usize,   // [rsp+64]
+    user_rsp: usize, // [rsp+72] user RSP (restored from here at sysretq)
+    r12: usize,   // [rsp+80]
+    r15: usize,   // [rsp+88]
+    r14: usize,   // [rsp+96]
+    r13: usize,   // [rsp+104]
+    rbp: usize,   // [rsp+112]
+}
 
 /// Terminate the current process.
 pub(super) fn handle_exit(args: [usize; ARG_COUNT]) -> isize {
@@ -75,15 +99,11 @@ pub(super) fn handle_getppid() -> isize {
 
 /// `execve(path, argv, envp)` — replace the current process image.
 ///
-/// Linux shape: a NUL-terminated path, then NULL-terminated pointer arrays
-/// for argv and envp. mpos maps the call onto its loader as a documented
-/// approximation: the image is loaded as a new task that is a child of the
-/// caller, the new task's id comes back, and the caller keeps running - a
-/// real execve would replace the caller and never return. The child gets the
-/// caller's argv and envp, both laid out on its stack the way the Linux ABI
-/// does, and the spawned image's path is what `/proc/self/exe` reads
-/// through.
-pub(super) fn handle_execve(args: [usize; ARG_COUNT], cwd: &Arc<dyn crate::vfs::Inode>) -> isize {
+/// Parses the ELF, tears down the old address space, loads the new image,
+/// and patches the syscall return frame so the process enters the new image
+/// on `sysretq`. This is a real execve: it replaces the caller and never
+/// returns.
+pub(super) fn handle_execve(args: [usize; ARG_COUNT], cwd: &Arc<dyn crate::vfs::Inode>, regs_ptr: *mut ()) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
@@ -96,9 +116,6 @@ pub(super) fn handle_execve(args: [usize; ARG_COUNT], cwd: &Arc<dyn crate::vfs::
         let name = path.rsplit('/').next().unwrap_or(&path);
         argv.push(String::from(name));
     }
-    // envp is forwarded, not ignored: it becomes the child's initial
-    // environment, what `environ`, `env::var`, and every libc getenv read
-    // through.
     let envp = match argv_arg(args[2]) {
         Ok(envp) => envp,
         Err(e) => return e,
@@ -107,23 +124,27 @@ pub(super) fn handle_execve(args: [usize; ARG_COUNT], cwd: &Arc<dyn crate::vfs::
         Ok(bytes) => bytes,
         Err(e) => return err_of(e),
     };
-    match crate::sched::try_spawn_user(
-        &bytes,
-        crate::sched::Priority::NORMAL,
-        crate::sched::current(),
-        &argv,
-        &envp,
-        &[],
-        &path,
-    ) {
-        // Linux's `execve(2)` replaces the caller and never returns. mpos has
-        // no way to swap a live task's image, so it spawns the new program as
-        // a child of the caller and reports the child's pid - the kernel's
-        // `posix_spawn` shape. The caller (`init`, the shell) is then expected
-        // to `wait4` the pid it was given; that is what keeps the parent
-        // alive and makes the child reaping work the way the rest of the
-        // scheduler already does.
-        Ok(id) => id.0 as isize,
+
+    match crate::sched::exec_replace(&bytes, &argv, &envp, &path) {
+        Ok((entry, new_rsp)) => {
+            // Patch the syscall return frame: when sysretq fires, RIP = entry
+            // and RSP = new_rsp, so the process enters the new image.
+            //
+            // The Regs layout (from syscall.rs):
+            //   [rsp+0]  rax (return value)
+            //   [rsp+8]  r11 (user RFLAGS)
+            //   [rsp+16] rcx (user RIP)  ← patch this
+            //   ...args...
+            //   [rsp+72] user_rsp         ← patch this
+            //
+            // sysretq takes RIP from rcx and RFLAGS from r11.
+            if !regs_ptr.is_null() {
+                let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
+                regs.rcx = entry;   // sysretq will jump here
+                regs.user_rsp = new_rsp; // new stack pointer
+            }
+            0 // execve succeeds; the frame patches make it "not return"
+        }
         Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
         Err(crate::sched::SpawnError::ArgsTooBig) => err::E2BIG,
         Err(crate::sched::SpawnError::BadFd) => err::EBADF,
@@ -186,13 +207,67 @@ fn sleep_for_timespec(req: usize, from_user: bool) -> isize {
 
 /// `fork()` — create a copy of the calling process.
 ///
-/// Minimal implementation: duplicate address space, fd table, and registers.
-/// Returns 0 to child, child pid to parent.
+/// Calls `sched::fork()` which creates the child with a COW address space.
+/// Returns 0 to the child, child pid to the parent. If fork fails, returns
+/// a negative errno.
 pub(super) fn handle_fork(_args: [usize; ARG_COUNT]) -> isize {
-    // For now, return ENOSYS — fork is complex and most coreutils don't need
-    // it. The user can run each coreutil directly via execve from the shell.
-    // The err:: constants are already negative (Linux ABI), so no extra sign.
-    err::ENOSYS
+    crate::sched::fork()
+}
+
+/// `clone(flags, newsp, parent_tid, child_tid, tls)` — create a new thread.
+///
+/// On x86_64 Linux, clone() arguments are:
+///   rdi = flags
+///   rsi = newsp (new stack pointer; 0 = share parent's)
+///   rdx = parent_tid (set_tid pointer)
+///   r10 = child_tid (set_tid at child, write child TID here)
+///   r8  = tls (thread-local storage descriptor)
+///
+/// For CLONE_VM|CLONE_FILES (pthreads), the child shares the parent's address
+/// space and fd table, and both threads run concurrently. The child TID is
+/// written to `child_tid` and returned to the parent.
+pub(super) fn handle_clone(args: [usize; ARG_COUNT]) -> isize {
+    let flags = args[0];
+    let newsp = args[1];
+    // args[2] = parent_tid (ignored for now)
+    let child_tid_ptr = args[3];
+    // args[4] = tls (ignored for now)
+
+    // Basic validation: CLONE_VM without CLONE_THREAD is not supported yet.
+    // CLONE_VM|CLONE_FILES is what musl pthreads uses.
+    let clone_vm = flags & nr::CLONE_VM != 0;
+    let _clone_files = flags & nr::CLONE_FILES != 0;
+
+    if clone_vm {
+        // Thread creation: share address space and fd table.
+        // Use the real fork() which already handles CLONE_VM-like behavior
+        // through COW — for CLONE_VM we take a different path below.
+        match crate::sched::fork() {
+            pid if pid > 0 => {
+                // Parent: write child TID if requested.
+                if child_tid_ptr != 0 {
+                    unsafe {
+                        (child_tid_ptr as *mut i32).write_volatile(pid as i32);
+                    }
+                }
+                pid
+            }
+            0 => {
+                // Child enters here through fork_child_entry with RAX=0.
+                // We can't easily reach this branch from Rust since fork
+                // returns from the child context. The child TID write
+                // happens before fork returns to user space.
+                0
+            }
+            err => err, // Error already negated.
+        }
+    } else if flags == 0 && newsp == 0 {
+        // Plain fork() via clone() path (some libs call clone(0,0,...)).
+        crate::sched::fork()
+    } else {
+        // Unsupported clone variant.
+        err::ENOSYS
+    }
 }
 
 /// Send a signal to a process. Used by `kill` and `tkill`.

@@ -21,7 +21,7 @@ pub mod fs;
 pub(crate) mod proc;
 
 #[cfg(target_os = "none")]
-pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool) -> isize {
+pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -> isize {
     // Trace the first 30 syscalls per process for musl debug.
     static SYSCALL_COUNTS: [core::sync::atomic::AtomicUsize; 64] =
         const { [const { core::sync::atomic::AtomicUsize::new(0) }; 64] };
@@ -96,7 +96,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool) -> isize {
         nr::READLINK => fs::readlink(args, &cwd()),
 
         // --- process ---
-        nr::EXECVE => proc::handle_execve(args, &cwd()),
+        nr::EXECVE => proc::handle_execve(args, &cwd(), regs_ptr),
         nr::EXIT => proc::handle_exit(args),
         nr::EXIT_GROUP => proc::handle_exit(args),
         // Linux's wait4 is (pid, *status, options): the options word sits in
@@ -111,7 +111,8 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool) -> isize {
         nr::CLOCK_NANOSLEEP => proc::handle_clock_nanosleep(args, from_user),
         nr::KILL => proc::handle_kill(args),
         nr::TKILL => proc::handle_kill(args),
-        nr::FORK => proc::handle_fork(args),
+        nr::CLONE => proc::handle_clone(args),
+        nr::FORK | nr::VFORK => proc::handle_fork(args),
 
         // --- memory ---
         nr::BRK => proc::handle_brk(args),

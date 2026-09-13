@@ -166,10 +166,19 @@ pub(crate) fn argv_arg(ptr: usize) -> Result<alloc::vec::Vec<alloc::string::Stri
 /// `syscall` gate from ring 3 (the normal case) and `false` when the
 /// kernel is calling a handler on its own behalf: the gate validates
 /// user pointers, and the kernel's own buffers do not need that walk.
+///
+/// `regs_ptr` is the raw pointer to the register frame on the kernel
+/// stack, used by execve to patch the return address and stack pointer
+/// so the process enters the new image on `sysretq`.
 #[cfg(target_os = "none")]
-pub fn linux_dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
+pub fn linux_dispatch(
+    nr: u64,
+    args: [usize; ARG_COUNT],
+    from_user: bool,
+    regs_ptr: *mut (),
+) -> isize {
     crate::sched::deliver_pending_signal();
-    linux::dispatch(nr, args, from_user)
+    linux::dispatch(nr, args, from_user, regs_ptr)
 }
 
 #[cfg(all(test, not(target_os = "none")))]
