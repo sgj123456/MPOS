@@ -1,10 +1,10 @@
 //! t_access - one test for access, which the strace shows the dynamic
 //! loader using to probe /etc/ld.so.preload (answered -1 ENOENT).
 //!
-//! Pinned here: an existing file is reachable for R_OK (answer 0) and a
-//! path that does not exist answers ENOENT - which is exactly the loader's
-//! expected outcome. The kernel currently answers 0 to everything; the
-//! ENOENT check marks that gap. R/W/X bit distinctions are out of scope.
+//! Pinned here: an existing file is reachable for R_OK, W_OK, X_OK and
+//! F_OK alike - one user, every permission bit set - a directory is
+//! reachable for R_OK, and a path that does not exist answers ENOENT,
+//! which is exactly the loader's expected outcome.
 
 #![no_std]
 #![no_main]
@@ -15,6 +15,7 @@ mod lin;
 use core::panic::PanicInfo;
 
 static MOTD: [u8; 10] = *b"/etc/motd\0";
+static BIN: [u8; 5] = *b"/bin\0";
 static NO_SUCH: [u8; 9] = *b"/no/such\0";
 
 #[unsafe(no_mangle)]
@@ -26,6 +27,39 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"an existing file is readable",
+        r,
+        0,
+    );
+
+    // One user, no permission bits: every mode probes as reachable.
+    let r = lin::access(&MOTD, lin::W_OK);
+    lin::check_eq(
+        &mut failed,
+        b"an existing file answers W_OK",
+        r,
+        0,
+    );
+
+    let r = lin::access(&MOTD, lin::X_OK);
+    lin::check_eq(
+        &mut failed,
+        b"an existing file answers X_OK",
+        r,
+        0,
+    );
+
+    let r = lin::access(&MOTD, lin::F_OK);
+    lin::check_eq(
+        &mut failed,
+        b"an existing file answers F_OK",
+        r,
+        0,
+    );
+
+    let r = lin::access(&BIN, lin::R_OK);
+    lin::check_eq(
+        &mut failed,
+        b"a directory is readable",
         r,
         0,
     );

@@ -782,7 +782,9 @@ fn check_sched() {
 
 // ---- syscall + vfs: gate, ramfs, mounts, initramfs, devfs ---------------
 
-/// Issue a syscall through the gate with the ABI's register convention.
+/// Issue an mpos syscall: one entry into [`syscall::mpos_dispatch`], the same
+/// path the `syscall` gate drives for ring 3, called here from the kernel's
+/// own checks with `from_user` false.
 #[cfg(target_arch = "x86_64")]
 unsafe fn syscall(
     nr: u64,
@@ -793,67 +795,64 @@ unsafe fn syscall(
     a5: usize,
     a6: usize,
 ) -> isize {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            in("rdx") a3,
-            in("r10") a4,
-            in("r8") a5,
-            in("r9") a6,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    ret
+    syscall::mpos_dispatch(nr, [a1, a2, a3, a4, a5, a6], false)
 }
 
 /// Prove the syscall gate, ramfs, mounts, initramfs unpack, and device filesystem.
 fn check_vfs() {
-    // M6: syscall dispatch and interrupt gate.
+    // M6: syscall dispatch and the fd table.
     {
         assert_eq!(
-            syscall::dispatch(999, [0; syscall::ARG_COUNT], false),
+            syscall::mpos_dispatch(999, [0; syscall::ARG_COUNT], false),
             err::ENOSYS
         );
         assert_eq!(
-            syscall::dispatch(nr::READ, [0, 0, 0, 0, 0, 0], false),
+            syscall::mpos_dispatch(nr::READ, [0, 0, 0, 0, 0, 0], false),
             0,
             "a zero-length read is empty, not an error"
         );
         assert_eq!(
-            syscall::dispatch(nr::READ, [3, 0, 0, 0, 0, 0], false),
+            syscall::mpos_dispatch(nr::READ, [3, 0, 0, 0, 0, 0], false),
             err::EBADF
         );
         assert_eq!(
-            syscall::dispatch(nr::WRITE, [7, 0, 0, 0, 0, 0], false),
+            syscall::mpos_dispatch(nr::WRITE, [7, 0, 0, 0, 0, 0], false),
             err::EBADF
         );
 
         let msg = b"syscall: write through dispatch\n";
-        let wrote = syscall::dispatch(
+        let wrote = syscall::mpos_dispatch(
             nr::WRITE,
             [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0],
             false,
         );
         assert_eq!(wrote as usize, msg.len());
 
+        // The same dispatch, run inside a real task: getpid answers this
+        // task's id, yield and sleep suspend and resume it, and exit through
+        // dispatch takes the task down.
         sched::spawn(
             || {
-                let pid = unsafe { syscall(nr::GETPID, 0, 0, 0, 0, 0, 0) };
+                let pid = syscall::mpos_dispatch(nr::GETPID, [0; syscall::ARG_COUNT], false);
                 assert!(pid >= 2, "getpid returned {pid}");
 
-                let msg = b"syscall: write through the interrupt gate\n";
-                let wrote =
-                    unsafe { syscall(nr::WRITE, 1, msg.as_ptr() as usize, msg.len(), 0, 0, 0) };
-                assert_eq!(wrote as usize, msg.len(), "the gate dropped bytes");
+                let msg = b"syscall: write through dispatch in a spawned task\n";
+                let wrote = syscall::mpos_dispatch(
+                    nr::WRITE,
+                    [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0],
+                    false,
+                );
+                assert_eq!(wrote as usize, msg.len(), "dispatch dropped bytes");
 
-                assert_eq!(unsafe { syscall(nr::YIELD, 0, 0, 0, 0, 0, 0) }, 0);
-                assert_eq!(unsafe { syscall(nr::SLEEP, 2, 0, 0, 0, 0, 0) }, 0);
-                unsafe { syscall(nr::EXIT, 0, 0, 0, 0, 0, 0) };
+                assert_eq!(
+                    syscall::mpos_dispatch(nr::YIELD, [0; syscall::ARG_COUNT], false),
+                    0
+                );
+                assert_eq!(
+                    syscall::mpos_dispatch(nr::SLEEP, [2, 0, 0, 0, 0, 0], false),
+                    0
+                );
+                syscall::mpos_dispatch(nr::EXIT, [0, 0, 0, 0, 0, 0], false);
             },
             Priority::NORMAL,
         );
@@ -861,7 +860,7 @@ fn check_vfs() {
         assert_eq!(
             sched::task_count(),
             sched::permanent_tasks(),
-            "exit through the gate did not end the task"
+            "exit through dispatch did not end the task"
         );
         println!("M6_OK");
     }
@@ -1323,41 +1322,121 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo M13_$GATE\n",
     b"false\n",
     b"echo M14_$?\n",
-    // The musl prereqs: one test per syscall the musl_hello strace showed,
-    // each leaving its verdict in $? - 0 pass, 1 fail - echoed back as a
-    // greppable marker. Every line must read `<name>_0`; the one exception
-    // is t_exit_group, whose whole contract is the distinctive code it
-    // leaves: `<name>_42`.
-    // b"t_execve\n",
-    // b"echo t_execve_$?\n",
-    // b"t_arch_prctl\n",
-    // b"echo t_arch_prctl_$?\n",
-    // b"t_set_tid_address\n",
-    // b"echo t_set_tid_address_$?\n",
-    // b"t_poll\n",
-    // b"echo t_poll_$?\n",
-    // b"t_rt_sigaction\n",
-    // b"echo t_rt_sigaction_$?\n",
-    // b"t_sigaltstack\n",
-    // b"echo t_sigaltstack_$?\n",
-    b"echo BEFORE_T\n",
-    b"t_execve\n",
-    b"echo AFTER_EXECVE_$?\n",
+    // The conformance suite: one test per syscall, each leaving its verdict
+    // in $? - 0 pass, 1 fail - echoed back as a greppable marker. Every line
+    // must read `<name>_0`; the one exception is t_exit_group, whose whole
+    // contract is the distinctive code it leaves: `<name>_42`.
+    //
+    // Process identity first (cheap, no filesystem side effects), then file
+    // I/O, then the fs namespace mutators (each cleans up after itself), then
+    // memory, then signals/time, then the exec/fork pair that replaces or
+    // multiplies the running process.
+    b"t_getpid\n",
+    b"echo t_getpid_$?\n",
+    b"t_gettid\n",
+    b"echo t_gettid_$?\n",
+    b"t_getuid\n",
+    b"echo t_getuid_$?\n",
+    b"t_uname\n",
+    b"echo t_uname_$?\n",
+    b"t_arch_prctl\n",
+    b"echo t_arch_prctl_$?\n",
+    b"t_getrandom\n",
+    b"echo t_getrandom_$?\n",
     b"t_sched_getaffinity\n",
-    b"echo AFTER_SCHED_$?\n",
-    b"t_rt_sigaction\n",
-    b"echo AFTER_SIGACTION_$?\n",
+    b"echo t_sched_getaffinity_$?\n",
+    b"t_set_robust_list\n",
+    b"echo t_set_robust_list_$?\n",
+    b"t_rseq\n",
+    b"echo t_rseq_$?\n",
+    b"t_set_tid_address\n",
+    b"echo t_set_tid_address_$?\n",
+    b"t_openat\n",
+    b"echo t_openat_$?\n",
+    b"t_read\n",
+    b"echo t_read_$?\n",
+    b"t_write\n",
+    b"echo t_write_$?\n",
+    b"t_lseek\n",
+    b"echo t_lseek_$?\n",
+    b"t_readv\n",
+    b"echo t_readv_$?\n",
+    b"t_writev\n",
+    b"echo t_writev_$?\n",
+    b"t_fstat\n",
+    b"echo t_fstat_$?\n",
+    b"t_newfstatat\n",
+    b"echo t_newfstatat_$?\n",
+    b"t_statx\n",
+    b"echo t_statx_$?\n",
+    b"t_access\n",
+    b"echo t_access_$?\n",
+    b"t_faccessat\n",
+    b"echo t_faccessat_$?\n",
+    b"t_readlink\n",
+    b"echo t_readlink_$?\n",
+    b"t_fcntl\n",
+    b"echo t_fcntl_$?\n",
+    b"t_dup\n",
+    b"echo t_dup_$?\n",
+    b"t_dup2\n",
+    b"echo t_dup2_$?\n",
+    b"t_dup3\n",
+    b"echo t_dup3_$?\n",
+    b"t_ioctl\n",
+    b"echo t_ioctl_$?\n",
+    b"t_getdents64\n",
+    b"echo t_getdents64_$?\n",
+    b"t_pipe2\n",
+    b"echo t_pipe2_$?\n",
+    b"t_mkdirat\n",
+    b"echo t_mkdirat_$?\n",
+    b"t_renameat2\n",
+    b"echo t_renameat2_$?\n",
+    b"t_unlinkat\n",
+    b"echo t_unlinkat_$?\n",
+    b"t_getcwd\n",
+    b"echo t_getcwd_$?\n",
+    b"t_chdir\n",
+    b"echo t_chdir_$?\n",
+    b"t_brk\n",
+    b"echo t_brk_$?\n",
     b"t_mmap\n",
-    b"echo AFTER_MMAP_$?\n",
-    b"musl_hello\n",
-    b"MUSL_CODE=$?\n",
-    b"echo MUSL_EXIT_$MUSL_CODE\n",
-    // M15: a true "coreutils-style" program is what musl_hello is — a static
-    // PIE musl binary hitting `main` and exiting cleanly. Its exit code is
-    // the verdict, captured into MUSL_CODE *before* the next echo and
-    // echoed back, so a regression in ELF loading, brk, mmap, write, or
-    // exit changes the marker instead of being hidden under it.
-    b"echo M15_coreutils_$MUSL_CODE\n",
+    b"echo t_mmap_$?\n",
+    b"t_mprotect\n",
+    b"echo t_mprotect_$?\n",
+    b"t_munmap\n",
+    b"echo t_munmap_$?\n",
+    b"t_mremap\n",
+    b"echo t_mremap_$?\n",
+    b"t_madvise\n",
+    b"echo t_madvise_$?\n",
+    b"t_rt_sigaction\n",
+    b"echo t_rt_sigaction_$?\n",
+    b"t_rt_sigprocmask\n",
+    b"echo t_rt_sigprocmask_$?\n",
+    b"t_sigaltstack\n",
+    b"echo t_sigaltstack_$?\n",
+    b"t_kill\n",
+    b"echo t_kill_$?\n",
+    b"t_clock_gettime\n",
+    b"echo t_clock_gettime_$?\n",
+    b"t_nanosleep\n",
+    b"echo t_nanosleep_$?\n",
+    b"t_poll\n",
+    b"echo t_poll_$?\n",
+    b"t_prlimit64\n",
+    b"echo t_prlimit64_$?\n",
+    b"t_futex\n",
+    b"echo t_futex_$?\n",
+    b"t_exit_group\n",
+    b"echo t_exit_group_$?\n",
+    b"t_execve\n",
+    b"echo t_execve_$?\n",
+    b"t_fork\n",
+    b"echo t_fork_$?\n",
+    b"t_wait4\n",
+    b"echo t_wait4_$?\n",
     // b"t_mprotect\n",
     // b"echo t_mprotect_$?\n",
     // b"t_rt_sigprocmask\n",
@@ -1371,7 +1450,7 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     // b"t_exit_group\n",
     // b"echo t_exit_group_$?\n",
     // The coreutils round: the syscalls the coreutils strace showed beyond
-    // the musl_hello set - file I/O, stats, the glibc startup pair. Same
+    // the musl startup set - file I/O, stats, the glibc startup pair. Same
     // verdict protocol: `<name>_0`, nothing else.
     // b"t_openat\n",
     // b"echo t_openat_$?\n",
@@ -1403,7 +1482,6 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     // b"echo t_set_robust_list_$?\n",
     // b"t_rseq\n",
     // b"echo t_rseq_$?\n",
-    // b"musl_hello\n",
     b"\x04",
 ];
 

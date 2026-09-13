@@ -183,8 +183,11 @@ pub(crate) fn argv_arg(ptr: usize) -> Result<alloc::vec::Vec<alloc::string::Stri
     Ok(out)
 }
 
+/// Dispatch an mpos syscall number - the kernel's own table, the numbers in
+/// [`nr`]. Linux numbers go to [`linux_dispatch`]; the `syscall` gate tells
+/// the two apart by the "mpos" tag in the number's top 32 bits.
 #[cfg(target_os = "none")]
-pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
+pub fn mpos_dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
     // A signal that arrived while the task was running is delivered before it
     // gets to ask for anything.
     crate::sched::deliver_pending_signal();
@@ -218,7 +221,9 @@ pub fn dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
 }
 
-/// Dispatch a Linux x86_64 syscall number.
+/// Dispatch a Linux x86_64 syscall number - the numbers a musl binary
+/// speaks, in `src/syscall/linux/nr.rs`. mpos's own numbers go to
+/// [`mpos_dispatch`].
 #[cfg(target_os = "none")]
 pub fn linux_dispatch(nr: u64, args: [usize; ARG_COUNT]) -> isize {
     crate::sched::deliver_pending_signal();

@@ -112,15 +112,21 @@ pub(super) fn handle_unlink(
 }
 
 /// Change working directory.
+///
+/// Relative components are normalized against the task's cwd *path* and then
+/// resolved absolutely: `..` above the cwd needs the way the cwd was named,
+/// which the inode walk alone cannot answer (it has no parent edges). The
+/// normalized path is also what gets recorded, so the inode and the path stay
+/// the same directory.
 pub(super) fn handle_chdir(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
     let path = match super::path_arg(args[0], args[1], from_user) {
         Ok(path) => path,
         Err(e) => return e,
     };
-    let start = crate::sched::current_cwd();
-    match crate::vfs::resolve_at(&path, start) {
+    let canonical = normalize_path(&path, &crate::sched::current_cwd_path());
+    match crate::vfs::resolve(&canonical) {
         Ok(dir) if dir.metadata().kind == crate::vfs::NodeKind::Dir => {
-            crate::sched::set_cwd(dir);
+            adopt_cwd(dir, canonical);
             0
         }
         Ok(_) => err::ENOTDIR,
@@ -206,26 +212,38 @@ pub(super) fn handle_pipe(args: [usize; super::ARG_COUNT], from_user: bool) -> i
 // ---------------------------------------------------------------------------
 
 /// `lseek(fd, offset, whence)`.
+///
+/// The result offset must land inside the file's address space: a whence that
+/// is not one of the three, or an arithmetic that would land before byte 0,
+/// answers `EINVAL` rather than wrapping.
 pub(super) fn handle_lseek(args: [usize; super::ARG_COUNT]) -> isize {
     let (fd, offset, whence) = (args[0] as i32, args[1] as i64, args[2] as i32);
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
         Err(e) => return super::err_of(e),
     };
-    let new_pos: u64 = match whence {
-        0 => offset as u64,                                    // SEEK_SET
-        1 => file.pos().wrapping_add(offset as u64),           // SEEK_CUR
-        2 => file.metadata().size.wrapping_add(offset as u64), // SEEK_END
-        _ => return err::EINVAL,
+    let cur = file.pos() as i64;
+    let size = file.metadata().size as i64;
+    let new_pos = match whence {
+        0 => Some(offset),             // SEEK_SET
+        1 => cur.checked_add(offset),  // SEEK_CUR
+        2 => size.checked_add(offset), // SEEK_END
+        _ => None,
     };
-    if offset < 0 && whence != 2 && (offset.unsigned_abs() > file.pos()) {
-        return err::EINVAL;
+    match new_pos {
+        Some(pos) if pos >= 0 => {
+            file.set_pos(pos as u64);
+            pos as isize
+        }
+        _ => err::EINVAL,
     }
-    file.set_pos(new_pos);
-    new_pos as isize
 }
 
 /// `getdents64(fd, buf, len)` — Linux directory listing format.
+///
+/// The descriptor's position counts entries already handed out: each call
+/// resumes where the last stopped and answers 0 once every entry is gone,
+/// which is what makes a `readdir` loop terminate.
 pub(super) fn handle_getdents64(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
     let (fd, buf, buf_len) = (args[0] as i32, args[1], args[2]);
     if !super::buffer_ok(buf, buf_len, true, from_user) {
@@ -240,6 +258,10 @@ pub(super) fn handle_getdents64(args: [usize; super::ARG_COUNT], from_user: bool
         Ok(e) => e,
         Err(e) => return super::err_of(e),
     };
+    let start = file.pos() as usize;
+    if start >= entries.len() {
+        return 0;
+    }
 
     // Linux getdents64 format:
     //   u64 d_ino
@@ -248,7 +270,7 @@ pub(super) fn handle_getdents64(args: [usize; super::ARG_COUNT], from_user: bool
     //   u8  d_type
     //   u8  d_name[] (NUL-terminated, padded to 8-byte alignment)
     let mut offset = 0usize;
-    for (idx, (name, kind)) in entries.iter().enumerate() {
+    for (idx, (name, kind)) in entries.iter().enumerate().skip(start) {
         let reclen = (19 + name.len() + 1 + 7) & !7; // header 18 bytes + name + NUL, aligned
         if offset + reclen > buf_len {
             if offset == 0 {
@@ -277,6 +299,7 @@ pub(super) fn handle_getdents64(args: [usize; super::ARG_COUNT], from_user: bool
             base.add(19 + name_bytes.len()).write_volatile(0);
         }
         offset += reclen;
+        file.set_pos((idx + 1) as u64);
     }
     offset as isize
 }
@@ -291,10 +314,15 @@ pub(super) fn handle_dup(args: [usize; super::ARG_COUNT]) -> isize {
     crate::sched::current_fds().install(file) as isize
 }
 
-/// `dup3(oldfd, newfd, flags)` — like dup2 but with flags (O_CLOEXEC ignored).
+/// `dup3(oldfd, newfd, flags)` — like dup2 but with flags.
+///
+/// `O_CLOEXEC` is the one flag the descriptor-flag word can hold and the one
+/// Linux accepts here; anything else answers `EINVAL`, and `oldfd == newfd`
+/// is `EINVAL` too, both as Linux spells them.
 pub(super) fn handle_dup3(args: [usize; super::ARG_COUNT]) -> isize {
-    let (old, new, _flags) = (args[0] as i32, args[1] as i32, args[2] as i32);
-    if old == new {
+    const O_CLOEXEC: i32 = 0o200_0000;
+    let (old, new, flags) = (args[0] as i32, args[1] as i32, args[2] as i32);
+    if old == new || flags & !O_CLOEXEC != 0 {
         return err::EINVAL;
     }
     let file = match crate::sched::current_fds().clone_at(old) {
@@ -307,14 +335,90 @@ pub(super) fn handle_dup3(args: [usize; super::ARG_COUNT]) -> isize {
     }
 }
 
+/// The normalized absolute path `path` names, relative components resolved
+/// against `base`. `.` drops out, `..` pops one component, and repeated
+/// slashes collapse - the shape `getcwd` owes and `chdir` remembers.
+pub(super) fn normalize_path(path: &str, base: &str) -> alloc::string::String {
+    let joined = if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else if base.ends_with('/') {
+        alloc::format!("{base}{path}")
+    } else {
+        alloc::format!("{base}/{path}")
+    };
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for component in joined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return alloc::string::String::from("/");
+    }
+    let mut out = alloc::string::String::new();
+    for part in parts {
+        out.push('/');
+        out.push_str(part);
+    }
+    out
+}
+
+/// Remember `dir` as the running task's cwd and `path` as the way it was
+/// named - the pair `chdir`, `fchdir` keep consistent for `getcwd`.
+fn adopt_cwd(dir: Arc<dyn crate::vfs::Inode>, path: alloc::string::String) {
+    crate::sched::set_cwd(dir);
+    crate::sched::set_cwd_path(path);
+}
+
+/// The path the VFS root would have to walk to reach `target`, or `None`
+/// when no walk finds it. `fchdir` is handed a descriptor, not a path, so
+/// the way back has to be searched for.
+fn path_of(target: &Arc<dyn crate::vfs::Inode>) -> Option<alloc::string::String> {
+    use crate::vfs::NodeKind;
+    fn walk(
+        dir: &Arc<dyn crate::vfs::Inode>,
+        prefix: &str,
+        target: &Arc<dyn crate::vfs::Inode>,
+        depth: usize,
+    ) -> Option<alloc::string::String> {
+        if Arc::ptr_eq(dir, target) {
+            return Some(alloc::string::String::from(prefix));
+        }
+        if depth == 0 {
+            return None;
+        }
+        for (name, kind) in dir.read_dir().ok()? {
+            if kind != NodeKind::Dir {
+                continue;
+            }
+            let child = if prefix == "/" {
+                alloc::format!("/{name}")
+            } else {
+                alloc::format!("{prefix}/{name}")
+            };
+            if let Ok(inode) = crate::vfs::resolve(&child)
+                && let Some(found) = walk(&inode, &child, target, depth - 1)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let root = crate::vfs::global().root_inode();
+    walk(&root, "/", target, 16)
+}
+
 /// `getcwd(buf, size)` — write cwd path into buffer.
 pub(super) fn handle_getcwd(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
     let (buf, size) = (args[0], args[1]);
     if !super::buffer_ok(buf, size, true, from_user) || size < 2 {
         return err::EINVAL;
     }
-    let cwd = crate::sched::current_cwd();
-    let path = build_path(&cwd);
+    let path = crate::sched::current_cwd_path();
     if path.len() + 1 > size {
         return err::ERANGE;
     }
@@ -323,16 +427,6 @@ pub(super) fn handle_getcwd(args: [usize; super::ARG_COUNT], from_user: bool) ->
         *((buf + path.len()) as *mut u8) = 0;
     }
     buf as isize
-}
-
-fn build_path(inode: &Arc<dyn crate::vfs::Inode>) -> alloc::string::String {
-    // Walk up the tree from root to find the path. Simple approach:
-    // just return "/" for now — full path resolution needs parent pointers.
-    let meta = inode.metadata();
-    if meta.ino == 1 {
-        return alloc::string::String::from("/");
-    }
-    alloc::string::String::from("/")
 }
 
 /// `fchdir(fd)` — change cwd to the directory named by fd.
@@ -345,7 +439,12 @@ pub(super) fn handle_fchdir(args: [usize; super::ARG_COUNT]) -> isize {
     if file.metadata().kind != crate::vfs::NodeKind::Dir {
         return err::ENOTDIR;
     }
-    crate::sched::set_cwd(file.inode());
+    let inode = file.inode();
+    // The descriptor carries no path, so the name getcwd will report has to
+    // be searched for; a directory the walk cannot find (an unmounted tree)
+    // has no honest answer better than "/".
+    let path = path_of(&inode).unwrap_or_else(|| alloc::string::String::from("/"));
+    adopt_cwd(inode, path);
     0
 }
 

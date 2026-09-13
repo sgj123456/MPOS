@@ -1,4 +1,4 @@
-//! t_set_tid_address - one test for set_tid_address, which musl_hello's
+//! t_set_tid_address - one test for set_tid_address, which a musl binary's
 //! strace calls right after arch_prctl: musl's __init_tp registers the main
 //! thread's clear-child-tid slot and uses the return value as the thread
 //! id.

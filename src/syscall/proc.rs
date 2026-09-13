@@ -170,8 +170,12 @@ pub(super) fn handle_wait(args: [usize; super::ARG_COUNT]) -> isize {
 // ---------------------------------------------------------------------------
 
 /// Get the parent process ID.
+///
+/// The task table records who spawned whom in ring 3, so the answer is real:
+/// the spawner's id, or 0 for init and the tasks nobody spawned - which is
+/// also what Linux reports for init.
 pub(super) fn handle_getppid() -> isize {
-    crate::sched::current().0 as isize / 2 // simplified: no real parent tracking
+    crate::sched::parent_of(crate::sched::current()).map_or(0, |parent| parent.0 as isize)
 }
 
 /// `execve(path, argv, envp)` — replace the current process image.
@@ -220,16 +224,50 @@ pub(super) fn handle_execve(
 }
 
 /// `nanosleep(req, rem)` — req is a `struct timespec { tv_sec, tv_nsec }`.
+///
+/// The request is validated the way Linux validates it: the caller's `req`
+/// must be readable and `tv_nsec` must stay below a billion. `rem` is never
+/// written — nothing interrupts the sleep, and Linux writes the remaining
+/// time only when it does.
 pub(super) fn handle_nanosleep(args: [usize; super::ARG_COUNT]) -> isize {
     let req = args[0];
     if req == 0 {
         return 0;
     }
-    // Read seconds and nanoseconds from userspace timespec.
+    sleep_for_timespec(req)
+}
+
+/// `clock_nanosleep(clk_id, flags, req, rem)`.
+///
+/// The relative form (flags = 0) sleeps exactly as `nanosleep` does, whatever
+/// clock it names: mpos keeps one clock. `TIMER_ABSTIME` has no absolute time
+/// to be measured against and answers `EINVAL` rather than sleeping the wrong
+/// duration.
+pub(super) fn handle_clock_nanosleep(args: [usize; super::ARG_COUNT]) -> isize {
+    const TIMER_ABSTIME: usize = 0x1;
+    let (_clk_id, flags, req) = (args[0], args[1], args[2]);
+    if flags & TIMER_ABSTIME != 0 {
+        return err::EINVAL;
+    }
+    if req == 0 {
+        return 0;
+    }
+    sleep_for_timespec(req)
+}
+
+/// Sleep out the `struct timespec` at `req`, with Linux's validation: the
+/// pointer must be readable and `tv_nsec` must stay below a second.
+fn sleep_for_timespec(req: usize) -> isize {
+    if !super::buffer_ok(req, 16, false, true) {
+        return err::EFAULT;
+    }
     unsafe {
         let tv_sec = (req as *const i64).read_volatile() as u64;
         let tv_nsec = ((req + 8) as *const i64).read_volatile() as u64;
-        let total_ms = tv_sec * 1000 + tv_nsec / 1_000_000;
+        if tv_nsec >= 1_000_000_000 {
+            return err::EINVAL;
+        }
+        let total_ms = tv_sec.saturating_mul(1000) + tv_nsec / 1_000_000;
         if total_ms == 0 {
             return 0;
         }
@@ -244,15 +282,31 @@ pub(super) fn handle_nanosleep(args: [usize; super::ARG_COUNT]) -> isize {
 /// Minimal implementation: duplicate address space, fd table, and registers.
 /// Returns 0 to child, child pid to parent.
 pub(super) fn handle_fork(_args: [usize; super::ARG_COUNT]) -> isize {
-    // For now, return -ENOSYS — fork is complex and most coreutils don't need it.
-    // The user can run each coreutil directly via execve from the shell.
-    -super::err::ENOSYS
+    // For now, return ENOSYS — fork is complex and most coreutils don't need
+    // it. The user can run each coreutil directly via execve from the shell.
+    // The err:: constants are already negative (Linux ABI), so no extra sign.
+    super::err::ENOSYS
 }
 
 /// `brk(addr)` — change the program break (heap end).
 pub(super) fn handle_brk(args: [usize; super::ARG_COUNT]) -> isize {
     let addr = args[0];
-    crate::sched::brk(addr)
+    let result = crate::sched::brk(addr);
+    // Trace first few BRK calls per process for musl debug.
+    static BRK_COUNTS: [core::sync::atomic::AtomicUsize; 64] =
+        const { [const { core::sync::atomic::AtomicUsize::new(0) }; 64] };
+    let pid = crate::sched::current().0;
+    let n = BRK_COUNTS[pid].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 8 {
+        crate::println!(
+            "[brk #{}] pid={} req={:#x} -> {:#x}",
+            n,
+            pid,
+            addr,
+            result as usize
+        );
+    }
+    result
 }
 
 use crate::mm::vm::MapFlags;
@@ -272,10 +326,15 @@ const MREMAP_FIXED: usize = 0x2;
 /// canonical address space, which is where every user mapping lives.
 const USER_LIMIT: usize = 1 << 47;
 
-/// Where the next `mmap` that does not name an address starts looking. A
-/// process's own fixed mappings are skipped over rather than assumed away.
-static MMAP_CURSOR: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0x8000_0000);
+/// Base address for user mmap: where every process's mmap cursor starts.
+///
+/// The cursor only moves downward from here, so the mmap region grows from the
+/// top of the address space toward the program image. That shape - heap low,
+/// huge hole, mmap high - is what Linux gives a static program, and musl's
+/// allocator notices the difference: it sizes its regions from what the kernel
+/// hands back, and a base in the low gigabytes makes those regions collide with
+/// the break.
+pub const MMAP_BASE: usize = 0x0000_7f00_0000_0000;
 
 /// `mmap(addr, length, prot, flags, fd, offset)` — map anonymous memory.
 ///
@@ -322,6 +381,20 @@ pub(super) fn handle_mmap(args: [usize; super::ARG_COUNT]) -> isize {
     }
 
     let len = crate::mm::pframe::align_up(length, PAGE_SIZE);
+
+    // Debug: trace large mmap requests that could indicate a bogus allocation.
+    if len > 1024 * 1024 {
+        crate::println!(
+            "[mmap] size={:#x} ({} KiB), addr={:#x}, prot={:#x}, flags={:#x}, fd={}, offset={:#x}",
+            len,
+            len / 1024,
+            addr,
+            prot,
+            flags,
+            _fd,
+            _offset
+        );
+    }
     // An address a process can actually use: inside the lower half, on a page
     // boundary, and not wrapping.
     let want = (addr != 0
@@ -342,8 +415,11 @@ pub(super) fn handle_mmap(args: [usize; super::ARG_COUNT]) -> isize {
         // Without `MAP_FIXED` the address is only a hint, and one that is
         // already in use is simply not taken.
         (false, Some(addr)) if crate::sched::user_range_free(addr, len) => addr,
-        _ => match free_range(len) {
-            Some(base) => base,
+        _ => match free_range(len, crate::sched::get_mmap_cursor()) {
+            Some((base, new_cursor)) => {
+                crate::sched::set_mmap_cursor(new_cursor);
+                base
+            }
             None => return err::ENOMEM,
         },
     };
@@ -461,8 +537,11 @@ pub(super) fn handle_mremap(args: [usize; super::ARG_COUNT]) -> isize {
         crate::sched::release_user_frames(crate::sched::unmap_user(new_addr, new));
         new_addr
     } else {
-        match free_range(new) {
-            Some(dest) => dest,
+        match free_range(new, crate::sched::get_mmap_cursor()) {
+            Some((dest, new_cursor)) => {
+                crate::sched::set_mmap_cursor(new_cursor);
+                dest
+            }
             None => return err::ENOMEM,
         }
     };
@@ -503,27 +582,25 @@ fn add_pages(virt: usize, len: usize) -> bool {
     true
 }
 
-/// The first run of `len` bytes, page-aligned and below the user limit, that
+/// The first run of `len` bytes, page-aligned and below the mmap base, that
 /// this process has nothing mapped in.
-fn free_range(len: usize) -> Option<usize> {
+///
+/// The search runs downward and the cursor is the *bottom* of the last mapping
+/// placed: the next anonymous mapping goes just below the previous one, which
+/// is the direction Linux's mmap region grows in. `cursor` is the per-process
+/// mmap cursor; the returned value is the updated cursor to store back.
+fn free_range(len: usize, cursor: usize) -> Option<(usize, usize)> {
     use crate::mm::pframe::PAGE_SIZE;
-    // One cursor for every process: it only ever moves forward, and skipping
-    // what a process has already taken keeps a later process from being handed
-    // an address someone else chose to fix a mapping at.
-    const CURSOR_START: usize = 0x8000_0000;
-    let mut candidate = MMAP_CURSOR
-        .load(core::sync::atomic::Ordering::Relaxed)
-        .max(CURSOR_START);
+
+    // A stale cursor from an old layout can only ever sit above the base; the
+    // clamp keeps the first placement of every process at the top.
+    let mut top = cursor.min(MMAP_BASE);
     loop {
-        let end = candidate.checked_add(len)?;
-        if end >= USER_LIMIT {
-            return None;
+        let bottom = top.checked_sub(len)? & !(PAGE_SIZE - 1);
+        if crate::sched::user_range_free(bottom, len) {
+            return Some((bottom, bottom));
         }
-        if crate::sched::user_range_free(candidate, len) {
-            MMAP_CURSOR.store(candidate + len, core::sync::atomic::Ordering::Relaxed);
-            return Some(candidate);
-        }
-        candidate = crate::mm::pframe::align_up(end, PAGE_SIZE);
+        top = bottom;
     }
 }
 
@@ -575,7 +652,7 @@ pub(super) fn handle_clock_gettime(args: [usize; super::ARG_COUNT]) -> isize {
     let (clk_id, tp) = (args[0], args[1]);
     let _ = clk_id;
     if tp == 0 {
-        return 0;
+        return err::EFAULT;
     }
     // Return a fixed time based on the timer tick count.
     let ticks = crate::arch::timer::ticks();
@@ -589,18 +666,38 @@ pub(super) fn handle_clock_gettime(args: [usize; super::ARG_COUNT]) -> isize {
     0
 }
 
+/// `gettimeofday(tv, tz)` — wall time as `struct timeval { tv_sec, tv_usec }`.
+///
+/// The same tick the `clock_gettime` family reports, in the microsecond unit
+/// this call's struct spells: a `tv_usec` that stayed at nanosecond scale
+/// would answer a million-fold too much to every caller that trusts it.
+pub(super) fn handle_gettimeofday(args: [usize; super::ARG_COUNT]) -> isize {
+    let tv = args[0];
+    if tv == 0 {
+        return err::EFAULT;
+    }
+    let ticks = crate::arch::timer::ticks();
+    let freq = crate::arch::timer::TICK_HZ as u64;
+    let secs = ticks / freq;
+    let usecs = (ticks % freq) * (1_000_000 / freq);
+    unsafe {
+        (tv as *mut i64).write_volatile(secs as i64);
+        ((tv + 8) as *mut i64).write_volatile(usecs as i64);
+    }
+    0
+}
+
 /// `uname(buf)` — write system name/version info.
 ///
-/// `buf` points to a `struct utsname` (416 bytes total, five 65-byte strings
-/// plus a 65-byte version and 65-byte release).
+/// `buf` points to a `struct utsname`: six 65-byte NUL-terminated strings -
+/// sysname, nodename, release, version, machine, domainname - 390 bytes in
+/// all, which is the size every caller passes and the size this validates.
 pub(super) fn handle_uname(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
     let buf = args[0];
-    let size = 416; // sizeof(struct utsname)
+    let size = 390; // 6 fields × 65 bytes
     if !super::buffer_ok(buf, size, true, from_user) {
         return err::EFAULT;
     }
-    // Write five 65-byte NUL-terminated strings: sysname, nodename, release,
-    // version, machine.
     unsafe {
         let base = buf as *mut u8;
         // All fields zeroed first.
@@ -616,6 +713,7 @@ pub(super) fn handle_uname(args: [usize; super::ARG_COUNT], from_user: bool) -> 
         write_str(130, "0.1.0"); // release
         write_str(195, "0.1.0"); // version
         write_str(260, "x86_64"); // machine
+        write_str(325, "(none)"); // domainname
     }
     0
 }
@@ -650,8 +748,14 @@ pub(super) fn handle_getrandom(args: [usize; super::ARG_COUNT], from_user: bool)
 /// `prlimit64(pid, resource, new_limit, old_limit)` — get/set resource limits.
 ///
 /// Minimal: return hard-coded defaults for RLIMIT_STACK and RLIMIT_NOFILE.
+/// A resource number past `RLIM_NLIMITS` is `EINVAL`, the errno Linux uses
+/// for one it has no table row for.
 pub(super) fn handle_prlimit64(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
+    const RLIM_NLIMITS: usize = 16;
     let (_pid, resource, _new_ptr, old_ptr) = (args[0], args[1], args[2], args[3]);
+    if resource >= RLIM_NLIMITS {
+        return err::EINVAL;
+    }
     if old_ptr == 0 {
         return 0;
     }

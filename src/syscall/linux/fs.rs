@@ -41,18 +41,47 @@ fn mode_of(meta: &Metadata) -> u32 {
     }
 }
 
-/// `open(path, flags, mode)` - the flags/mode pair is accepted and ignored,
-/// as for every open here: opens are read/write-capable and nothing is
-/// inherited across an exec that does not happen.
+/// O_CREAT: make the named file when it is not there already. With O_EXCL
+/// it refuses instead of replacing; on its own it opens whatever is there.
+const O_CREAT: usize = 0o100;
+const O_EXCL: usize = 0o400;
+
+/// `open`/`openat` shared tail: open the path, and on a miss with `O_CREAT`
+/// make the file first, then open it.
+fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
+    // O_EXCL refuses to open a name that is already there, whatever it names.
+    if flags & O_CREAT != 0
+        && flags & O_EXCL != 0
+        && crate::vfs::resolve_opt(path, Some(base.clone())).is_ok()
+    {
+        return err::EEXIST;
+    }
+    match crate::vfs::open_opt(path, Some(base.clone())) {
+        Ok(fd) => fd as isize,
+        Err(crate::vfs::VfsError::NoEntry) if flags & O_CREAT != 0 => {
+            // O_EXCL names an existing file EEXIST; a missing directory, no
+            // space: the create error is the answer, not a retry.
+            if let Err(e) = crate::vfs::create_file_opt(path, Some(base.clone())) {
+                return err_of(e);
+            }
+            match crate::vfs::open_opt(path, Some(base)) {
+                Ok(fd) => fd as isize,
+                Err(e) => err_of(e),
+            }
+        }
+        Err(e) => err_of(e),
+    }
+}
+
+/// `open(path, flags, mode)` - the mode is ignored, as for every open here:
+/// opens are read/write-capable and nothing is inherited across an exec that
+/// does not happen.
 pub(super) fn open(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
-    match crate::vfs::open_opt(&path, Some(cwd.clone())) {
-        Ok(fd) => fd as isize,
-        Err(e) => err_of(e),
-    }
+    open_linux(&path, args[1], cwd.clone())
 }
 
 /// `openat(dirfd, path, flags, mode)`.
@@ -65,10 +94,7 @@ pub(super) fn openat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
-    match crate::vfs::open_opt(&path, Some(base)) {
-        Ok(fd) => fd as isize,
-        Err(e) => err_of(e),
-    }
+    open_linux(&path, args[2], base)
 }
 
 /// `fstat(fd, buf)` - the fd's description, not a path, is what is statted.
@@ -125,7 +151,12 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
+    // An empty path names the descriptor, but only when the caller said so:
+    // Linux requires AT_EMPTY_PATH and answers ENOENT for the unannounced form.
     let meta = if path.is_empty() {
+        if _flags & AT_EMPTY_PATH == 0 {
+            return err::ENOENT;
+        }
         match crate::sched::current_fds().clone_at(dirfd) {
             Ok(file) => file.metadata(),
             Err(e) => return err_of(e),
@@ -188,14 +219,20 @@ pub(super) fn faccessat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
 }
 
 /// `chdir(path)`.
-pub(super) fn chdir(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+///
+/// Relative components are normalized against the task's cwd *path* and then
+/// resolved absolutely: `..` above the cwd needs the way the cwd was named,
+/// which the inode walk alone cannot answer (it has no parent edges).
+pub(super) fn chdir(args: [usize; ARG_COUNT]) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
-    match crate::vfs::resolve_at(&path, cwd.clone()) {
+    let canonical = super::super::fs::normalize_path(&path, &crate::sched::current_cwd_path());
+    match crate::vfs::resolve(&canonical) {
         Ok(dir) if dir.metadata().kind == NodeKind::Dir => {
             crate::sched::set_cwd(dir);
+            crate::sched::set_cwd_path(canonical);
             0
         }
         Ok(_) => err::ENOTDIR,
@@ -245,7 +282,21 @@ pub(super) fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 }
 
 /// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)`.
+///
+/// `RENAME_NOREPLACE` refuses to take a name that is already taken; the
+/// exchange and whiteout forms have no implementation underneath and answer
+/// `EINVAL`, as Linux does for a flag combination it cannot serve.
 pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    const RENAME_NOREPLACE: usize = 0x1;
+    const RENAME_EXCHANGE: usize = 0x2;
+    const RENAME_WHITEOUT: usize = 0x4;
+
+    let flags = args[4];
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
+        || flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
+    {
+        return err::EINVAL;
+    }
     let old_base = match base_of(args[0] as i32, cwd) {
         Ok(base) => base,
         Err(e) => return e,
@@ -254,11 +305,11 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         Ok(path) => path,
         Err(e) => return e,
     };
-    let new_base = match base_of(args[3] as i32, cwd) {
+    let new_base = match base_of(args[2] as i32, cwd) {
         Ok(base) => base,
         Err(e) => return e,
     };
-    let new_path = match cstr_arg(args[4], true) {
+    let new_path = match cstr_arg(args[3], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
@@ -278,8 +329,12 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
     };
     let inode = match dir.create(name, NodeKind::File) {
         Ok(inode) => inode,
-        // Renaming onto an existing file replaces it: resolve and overwrite.
+        // Renaming onto an existing file replaces it - unless the caller
+        // asked for NOREPLACE, which is the one flag that protects the name.
         Err(crate::vfs::VfsError::Exists) => {
+            if flags & RENAME_NOREPLACE != 0 {
+                return err::EEXIST;
+            }
             match crate::vfs::resolve_opt(&new_path, Some(new_base)) {
                 Ok(inode) => inode,
                 Err(e) => return err_of(e),
@@ -329,7 +384,8 @@ pub(super) fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
 ///
 /// `F_GETFD`/`F_SETFD` round-trip through the fd table: startup code probes
 /// them and reads back what it wrote. `F_GETFL` answers `O_RDONLY` - opens
-/// here are untyped - and `F_SETFL` accepts and forgets.
+/// here are untyped - and `F_SETFL` accepts and forgets. A command Linux has
+/// no meaning for answers `EINVAL`, not success.
 pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
@@ -353,7 +409,7 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
             }
         }
         F_GETFL | F_SETFL => 0,
-        _ => 0,
+        _ => err::EINVAL,
     }
 }
 

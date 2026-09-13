@@ -1,4 +1,4 @@
-//! t_rt_sigaction - one test for rt_sigaction, of which the musl_hello
+//! t_rt_sigaction - one test for rt_sigaction, of which a musl binary's
 //! strace shows four calls on the way up:
 //!
 //! - a query of the untouched SIGSEGV and SIGBUS dispositions
@@ -86,6 +86,51 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"installing the SIGBUS handler succeeds",
         r,
         0,
+    );
+
+    // The refusal set the man page fixes: signal 0 is not a signal,
+    // SIGKILL/SIGSTOP cannot be given a disposition by anyone, and 32 is
+    // the first real-time number past the 0..=31 this kernel can name.
+    let r = lin::rt_sigaction(0, core::ptr::null(), core::ptr::null_mut());
+    lin::check_eq(&mut failed, b"rt_sigaction on signal 0 is EINVAL", r, lin::EINVAL);
+    let r = lin::rt_sigaction(
+        lin::SIGKILL,
+        core::ptr::null(),
+        core::ptr::null_mut(),
+    );
+    lin::check_eq(
+        &mut failed,
+        b"rt_sigaction on SIGKILL is EINVAL",
+        r,
+        lin::EINVAL,
+    );
+    let r = lin::rt_sigaction(
+        lin::SIGSTOP,
+        core::ptr::null(),
+        core::ptr::null_mut(),
+    );
+    lin::check_eq(
+        &mut failed,
+        b"rt_sigaction on SIGSTOP is EINVAL",
+        r,
+        lin::EINVAL,
+    );
+    let r = lin::rt_sigaction(32, core::ptr::null(), core::ptr::null_mut());
+    lin::check_eq(
+        &mut failed,
+        b"rt_sigaction on the first unnumbered RT signal is EINVAL",
+        r,
+        lin::EINVAL,
+    );
+
+    // A non-zero act pointer that names no mapping must be EFAULT, not a
+    // crash: the kernel validates before it reads.
+    let r = lin::rt_sigaction(lin::SIGPIPE, 1usize as *const lin::SigAction, core::ptr::null_mut());
+    lin::check_eq(
+        &mut failed,
+        b"an unreadable act pointer is EFAULT",
+        r,
+        lin::EFAULT,
     );
 
     lin::done(failed)

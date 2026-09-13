@@ -120,6 +120,15 @@ impl Inode for RamDir {
         })
     }
 
+    /// Drop the name edge. The node the name pointed at lives on while any
+    /// open descriptor or other edge holds it; the name is free at once.
+    fn unlink(&self, name: &str) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            let mut entries = self.entries.borrow(cs).borrow_mut();
+            entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)
+        })
+    }
+
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
         critical_section::with(|cs| {
             let entries = self.entries.borrow(cs).borrow();
@@ -235,6 +244,25 @@ mod tests {
         // A file has no entries to list.
         let file = root.lookup("a").unwrap();
         assert_eq!(file.read_dir().unwrap_err(), VfsError::NotDir);
+    }
+
+    #[test]
+    fn unlink_removes_the_name_and_frees_it_for_reuse() {
+        let fs = RamFs::new();
+        let root = fs.root();
+        let file = root.create("f", NodeKind::File).unwrap();
+        file.write_at(0, b"x").unwrap();
+
+        root.unlink("f").unwrap();
+        assert_eq!(root.lookup("f").err(), Some(VfsError::NoEntry));
+        // The name is gone but the node survives behind the Arc, writable.
+        assert_eq!(file.write_at(0, b"y").unwrap(), 1);
+        // The freed name can be created again, as a fresh node.
+        let fresh = root.create("f", NodeKind::File).unwrap();
+        assert!(!Arc::ptr_eq(&file, &fresh));
+        // Removing a name that is not there answers NoEntry.
+        assert_eq!(root.unlink("f").err(), None);
+        assert_eq!(root.unlink("gone").err(), Some(VfsError::NoEntry));
     }
 
     #[test]

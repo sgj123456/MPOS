@@ -98,7 +98,7 @@ Each milestone proves the current subsystem correct before the next is built.
 | **M2** | Frames & Heap | Buddy allocator hands out non-overlapping blocks; slab heap satisfies all layouts; both agree on memory usage |
 | **M3** | Paging | Kernel runs on its own page tables; whole image W^X verified; processes get independent address spaces sharing the kernel half |
 | **M4** | Scheduler | Round-robin, preemption, sleep, idle, priority-based core stealing all work |
-| **M6** | Syscalls | `int 0x80` gate dispatches correctly; fd checks work; exit through the gate ends the task |
+| **M6** | Syscalls | `syscall` gate dispatches correctly; fd checks work; exit through dispatch ends the task |
 | **M7** | VFS | ramfs root, mounted sub-filesystems, multi-task file I/O through the fd table |
 | **M8** | Initramfs & devfs | tar unpacking, `/dev/tty`, `/dev/console`, `/dev/null`, `/dev/zero` |
 | **M9** | Processes | ELF loaded into a new address space; enter Ring 3; exit code round-trip verified |
@@ -205,7 +205,9 @@ Runs the full pipeline:
 
 ## 📡 Syscalls
 
-MPOS exposes 17 syscalls through the `int 0x80` gate:
+MPOS exposes 17 syscalls through the one `syscall` gate. mpos numbers are
+tagged with `mpos` in the top 32 bits of `rax` so they cannot collide with the
+Linux x86_64 numbers a musl binary issues raw:
 
 | # | Call | Description |
 |:-:|------|-------------|

@@ -46,8 +46,6 @@ pub fn init() {
         // here, a byte at a time, once `serial::enable_rx` has asked for it.
         table[pic::IRQ0_VECTOR + 4].set_handler_fn(serial);
 
-        super::syscall::register(&mut table);
-
         table
     });
 

@@ -1,4 +1,4 @@
-//! t_mmap - one test for mmap, of which the musl_hello strace shows three
+//! t_mmap - one test for mmap, of which a musl strace shows three
 //! anonymous mappings on the way up:
 //!
 //! - a 12288-byte RW region with MAP_STACK, the alt stack Rust std reserves
@@ -11,6 +11,14 @@
 //! arrives zeroed, and the writable regions take writes. Whether PROT_NONE
 //! actually faults on access needs fault delivery and is deliberately not
 //! probed.
+//!
+//! The refusals the man page fixes are pinned too - a zero length, a file-backed
+//! request, a shared anonymous mapping, and a MAP_FIXED that is unaligned or
+//! past the user limit - along with the full shape of the address argument: a
+//! free hint is honoured exactly, a hint already in use is ignored, and
+//! MAP_FIXED takes its range and arrives freshly zeroed. On this raw syscall
+//! surface an errno comes back as the negated return, Linux's own convention;
+//! MAP_FAILED is what a libc wrapper builds from it.
 
 #![no_std]
 #![no_main]
@@ -24,6 +32,8 @@ use core::panic::PanicInfo;
 /// region, and the kernel's mmap bump (0x80000000).
 const GUARD: usize = 0x5000_0000;
 const PATTERN: u64 = 0x1234_5678_9abc_def0;
+/// `MAP_SHARED`, which lin.rs does not name but the refusal test needs.
+const MAP_SHARED: usize = 0x01;
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
@@ -100,6 +110,165 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         &mut failed,
         b"it does not overlap the earlier mapping",
         !(page >= stack && page < stack + 12288),
+    );
+
+    // The refusals the man page fixes. The errno arrives as the negated
+    // return, Linux's raw-syscall convention.
+    let r = lin::mmap(
+        0,
+        0,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    lin::check_eq(&mut failed, b"a zero length answers EINVAL", r, lin::EINVAL);
+
+    let r = lin::mmap(
+        0,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE,
+        -1,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"a file-backed request without MAP_ANONYMOUS answers ENODEV",
+        r,
+        lin::ENODEV,
+    );
+
+    let r = lin::mmap(
+        0,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        MAP_SHARED | lin::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"MAP_SHARED|MAP_ANONYMOUS answers ENOSYS",
+        r,
+        lin::ENOSYS,
+    );
+
+    let r = lin::mmap(
+        0x5000_0123,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | lin::MAP_FIXED,
+        -1,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"MAP_FIXED to an unaligned address answers EINVAL",
+        r,
+        lin::EINVAL,
+    );
+
+    let r = lin::mmap(
+        0x8000_0000_0000_0000,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | lin::MAP_FIXED,
+        -1,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"MAP_FIXED past the user limit answers EINVAL",
+        r,
+        lin::EINVAL,
+    );
+
+    // A hint with nothing mapped in the way is honoured exactly.
+    let hinted = lin::mmap(
+        0x5000_4000,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"a free hint is honoured exactly",
+        hinted,
+        0x5000_4000,
+    );
+
+    // A hint that is already in use is ignored: the mapping goes wherever
+    // there is room, which cannot be the hinted page.
+    let owner = lin::mmap(
+        0x5000_6000,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | lin::MAP_FIXED,
+        -1,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the busy hint's owner maps fixed",
+        owner,
+        0x5000_6000,
+    );
+    let elsewhere = lin::mmap(
+        0x5000_6000,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    lin::check_true(
+        &mut failed,
+        b"a busy hint is ignored for a page-aligned map elsewhere",
+        elsewhere != lin::MAP_FAILED
+            && elsewhere > 0
+            && elsewhere as usize % 4096 == 0
+            && !(elsewhere >= 0x5000_6000 && elsewhere < 0x5000_7000),
+    );
+
+    // MAP_FIXED takes the range: whatever was mapped there is dropped and
+    // fresh zeroed pages go down in its place.
+    let taken = lin::mmap(
+        0x5000_8000,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | lin::MAP_FIXED,
+        -1,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the range MAP_FIXED will take maps fixed",
+        taken,
+        0x5000_8000,
+    );
+    unsafe { (0x5000_8000 as *mut u64).write_volatile(PATTERN) };
+    let again = lin::mmap(
+        0x5000_8000,
+        4096,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | lin::MAP_FIXED,
+        -1,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"MAP_FIXED over a live mapping still answers the address",
+        again,
+        0x5000_8000,
+    );
+    let back = unsafe { (0x5000_8000 as *const u64).read_volatile() };
+    lin::check_true(
+        &mut failed,
+        b"the taken range arrives freshly zeroed",
+        back == 0,
     );
 
     lin::done(failed)

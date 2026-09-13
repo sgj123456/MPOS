@@ -1,21 +1,22 @@
 //! The Linux-ABI test harness for the `t_*` programs under `user/bin`.
 //!
-//! mpos serves two syscall surfaces. The compact `int 0x80` ABI of
-//! `user/lib/sys.rs` carries mpos's own numbers; the `syscall`-instruction
-//! ABI of `src/syscall/linux/` carries Linux x86_64 numbers and is what musl
-//! binaries - `musl_hello` in particular - speak. These tests target the
-//! second surface, so the stubs here issue real `syscall` instructions with
+//! mpos serves two syscall surfaces, both through the one `syscall` gate:
+//! the compact ABI of `user/lib/sys.rs` carries mpos's own numbers tagged
+//! with "mpos" in the top 32 bits, and the ABI of `src/syscall/linux/`
+//! carries Linux x86_64 numbers raw and is what musl binaries speak. These
+//! tests target the second surface, so the
+//! stubs here issue real `syscall` instructions with
 //! Linux numbers taken straight from the kernel's
 //! `src/syscall/linux/nr.rs`: kernel and tests cannot disagree about a
 //! number without one of them failing to build.
 //!
-//! Scope of every check: exactly the contract the `musl_hello` strace shows.
-//! Where the strace hands the kernel an out-pointer (old sigaction, old
-//! altstack, ...), the test seeds it with sentinels and requires the kernel
-//! to have overwritten them - a query that answers 0 but writes nothing
-//! hands musl uninitialized memory, which is a bug, not support. What the
-//! strace does not exercise - fault enforcement, real signal delivery,
-//! alt-stack switching on a fault - no test claims.
+//! Scope of every check: the aspects each syscall's man page pins - the
+//! success shape, the errno for every refusal the kernel claims to make,
+//! and the edge cases the ABI fixes (zero-length buffers, sentinel-seeded
+//! out-parameters, lowest-free-fd, flag validation). Where the man page's
+//! answer would need a mechanism mpos does not have - symlink resolution,
+//! signal delivery, cross-process shared mappings - the test pins the
+//! documented mpos approximation instead, and the doc comment says which.
 //!
 //! Verdict protocol: one `ok:` or `FAIL:` line per check, a final `PASS` or
 //! `FAILED` line, exit 0 when everything passed, 1 when anything failed,
@@ -170,11 +171,23 @@ fn sys6(number: u64, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: 
 
 pub const EPERM: isize = -1;
 pub const ENOENT: isize = -2;
+pub const ESRCH: isize = -3;
+pub const EINTR: isize = -4;
+pub const E2BIG: isize = -7;
+pub const ENOEXEC: isize = -8;
 pub const EBADF: isize = -9;
+pub const ECHILD: isize = -10;
 pub const EAGAIN: isize = -11;
 pub const ENOMEM: isize = -12;
 pub const EFAULT: isize = -14;
+pub const EEXIST: isize = -17;
+pub const ENODEV: isize = -19;
+pub const ENOTDIR: isize = -20;
+pub const EISDIR: isize = -21;
 pub const EINVAL: isize = -22;
+pub const ENOTTY: isize = -25;
+pub const ENOSPC: isize = -28;
+pub const ERANGE: isize = -34;
 pub const ENOSYS: isize = -38;
 
 // ---------------------------------------------------------------------------
@@ -222,22 +235,69 @@ pub const ARCH_GET_GS: usize = 0x1004;
 
 /// openat: paths are relative to the caller's cwd.
 pub const AT_FDCWD: i32 = -100;
+/// fstatat/statx by descriptor: an empty path names the dirfd itself.
+pub const AT_EMPTY_PATH: usize = 0x1000;
+/// unlinkat: the path is a directory to be removed.
+pub const AT_REMOVEDIR: usize = 0x200;
 pub const O_RDONLY: usize = 0;
+pub const O_WRONLY: usize = 1;
+pub const O_RDWR: usize = 2;
 pub const O_CLOEXEC: usize = 0x8000_0;
 /// descriptor flags for F_GETFD/F_SETFD.
 pub const F_GETFD: i32 = 1;
 pub const F_SETFD: i32 = 2;
+pub const F_GETFL: i32 = 3;
+pub const F_SETFL: i32 = 4;
 pub const FD_CLOEXEC: usize = 1;
 /// access modes.
+pub const F_OK: usize = 0;
 pub const R_OK: usize = 4;
+pub const W_OK: usize = 2;
+pub const X_OK: usize = 1;
 
 /// lseek origins.
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
 pub const SEEK_END: i32 = 2;
 
+/// renameat2 flag bits.
+pub const RENAME_NOREPLACE: usize = 0x1;
+pub const RENAME_EXCHANGE: usize = 0x2;
+
+/// getdents64 d_type values.
+pub const DT_DIR: u8 = 4;
+pub const DT_CHR: u8 = 2;
+pub const DT_REG: u8 = 8;
+
+/// ioctl requests.
+pub const TIOCGWINSZ: usize = 0x5413;
+pub const TCGETS: usize = 0x5401;
+pub const TCSETS: usize = 0x5402;
+
+/// wait4/waitpid options.
+pub const WNOHANG: usize = 1;
+
+/// signals beyond the three the strace showed.
+pub const SIGTERM: i32 = 15;
+pub const SIGKILL: i32 = 9;
+pub const SIGSTOP: i32 = 19;
+
+/// clock ids.
+pub const CLOCK_REALTIME: usize = 0;
+pub const CLOCK_MONOTONIC: usize = 1;
+
+/// madvise advice values.
+pub const MADV_NORMAL: usize = 0;
+pub const MADV_SEQUENTIAL: usize = 1;
+pub const MADV_DONTNEED: usize = 4;
+
+/// futex operations.
+pub const FUTEX_WAIT: usize = 0;
+pub const FUTEX_WAKE: usize = 1;
+
 /// prlimit64 resources.
 pub const RLIMIT_STACK: i32 = 3;
+pub const RLIMIT_NOFILE: i32 = 5;
 pub const RLIM64_INFINITY: u64 = u64::MAX;
 
 /// file type bits of st_mode / stx_mode.
@@ -372,6 +432,68 @@ pub struct StackT {
 // Syscall wrappers. Thin on purpose: each names the Linux number once and
 // nothing else.
 // ---------------------------------------------------------------------------
+
+/// One `struct iovec`: base pointer and length, as readv/writev scatter.
+#[repr(C)]
+pub struct Iovec {
+    pub base: *mut u8,
+    pub len: usize,
+}
+
+/// `struct timespec` as the ABI lays it out: seconds, nanoseconds.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimeSpec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+/// `struct timeval`: seconds, microseconds.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+/// `struct winsize` for TIOCGWINSZ.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Winsize {
+    pub ws_row: u16,
+    pub ws_col: u16,
+    pub ws_xpixel: u16,
+    pub ws_ypixel: u16,
+}
+
+/// `struct utsname`, six 65-byte fields: 390 bytes.
+#[repr(C)]
+pub struct Utsname {
+    pub bytes: [u8; 390],
+}
+
+impl Utsname {
+    pub fn new() -> Self {
+        Utsname { bytes: [0; 390] }
+    }
+
+    /// Field `i` as bytes up to (not including) its NUL.
+    pub fn field(&self, i: usize) -> &[u8] {
+        let start = i * 65;
+        let end = start + 65;
+        let stop = self.bytes[start..end]
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(end, |p| start + p);
+        &self.bytes[start..stop]
+    }
+}
+
+impl Default for Utsname {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub fn write(fd: i32, buf: &[u8]) -> isize {
     sys3(nr::WRITE, fd as usize, buf.as_ptr() as usize, buf.len())
@@ -592,6 +714,225 @@ pub fn set_robust_list(head: *const RobustListHead, len: usize) -> isize {
 /// Register this thread's restartable-sequence block and signature.
 pub fn rseq(rseq: *mut Rseq, len: usize, flags: usize, sig: u32) -> isize {
     sys4(nr::RSEQ, rseq as usize, len, flags, sig as usize)
+}
+
+/// Duplicate a descriptor onto the lowest free number.
+pub fn dup(oldfd: i32) -> isize {
+    sys1(nr::DUP, oldfd as usize)
+}
+
+/// Duplicate `oldfd` onto `newfd`, closing whatever `newfd` named.
+pub fn dup2(oldfd: i32, newfd: i32) -> isize {
+    sys2(nr::DUP2, oldfd as usize, newfd as usize)
+}
+
+/// [`dup2`] with flags - `O_CLOEXEC` is the one Linux accepts.
+pub fn dup3(oldfd: i32, newfd: i32, flags: usize) -> isize {
+    sys3(nr::DUP3, oldfd as usize, newfd as usize, flags)
+}
+
+/// Create a pipe; `flags` carries `O_CLOEXEC` and friends.
+pub fn pipe2(fds: &mut [i32; 2], flags: usize) -> isize {
+    sys2(nr::PIPE2, fds.as_mut_ptr() as usize, flags)
+}
+
+/// Remove `path` relative to `dirfd`; `AT_REMOVEDIR` removes a directory.
+pub fn unlinkat(dirfd: i32, path: &[u8], flags: usize) -> isize {
+    sys3(nr::UNLINKAT, dirfd as usize, path.as_ptr() as usize, flags)
+}
+
+/// Make a directory at `path` relative to `dirfd`; mode is ignored.
+pub fn mkdirat(dirfd: i32, path: &[u8], mode: usize) -> isize {
+    sys3(nr::MKDIRAT, dirfd as usize, path.as_ptr() as usize, mode)
+}
+
+/// Rename `old` to `new`, both relative to their dirfds; `flags` carries
+/// `RENAME_NOREPLACE` and friends.
+pub fn renameat2(
+    olddirfd: i32,
+    old: &[u8],
+    newdirfd: i32,
+    new: &[u8],
+    flags: usize,
+) -> isize {
+    sys6(
+        nr::RENAMEAT2,
+        olddirfd as usize,
+        old.as_ptr() as usize,
+        newdirfd as usize,
+        new.as_ptr() as usize,
+        flags,
+        0,
+    )
+}
+
+/// Check reachability of `path` relative to `dirfd`.
+pub fn faccessat(dirfd: i32, path: &[u8], mode: usize) -> isize {
+    sys3(nr::FACCESSAT, dirfd as usize, path.as_ptr() as usize, mode)
+}
+
+/// Write the cwd path into `buf`, NUL-terminated; the return is the buffer.
+pub fn getcwd(buf: &mut [u8]) -> isize {
+    sys2(nr::GETCWD, buf.as_mut_ptr() as usize, buf.len())
+}
+
+/// Move to the directory `path` names; relative paths start at the cwd.
+pub fn chdir(path: &[u8]) -> isize {
+    sys1(nr::CHDIR, path.as_ptr() as usize)
+}
+
+/// Move to the directory the descriptor names.
+pub fn fchdir(fd: i32) -> isize {
+    sys1(nr::FCHDIR, fd as usize)
+}
+
+/// Scatter read: fill each iovec in turn, stopping early at end-of-file.
+pub fn readv(fd: i32, iov: &mut [Iovec]) -> isize {
+    sys3(nr::READV, fd as usize, iov.as_mut_ptr() as usize, iov.len())
+}
+
+/// Scatter write: write each iovec in turn.
+pub fn writev(fd: i32, iov: &[Iovec]) -> isize {
+    sys3(nr::WRITEV, fd as usize, iov.as_ptr() as usize, iov.len())
+}
+
+/// Read directory entries in the Linux getdents64 format into `buf`.
+pub fn getdents64(fd: i32, buf: &mut [u8]) -> isize {
+    sys3(nr::GETDENTS64, fd as usize, buf.as_mut_ptr() as usize, buf.len())
+}
+
+/// One parsed getdents64 record: the fields callers branch on.
+pub struct Dirent64<'a> {
+    pub d_ino: u64,
+    pub d_off: u64,
+    pub d_type: u8,
+    pub name: &'a [u8],
+}
+
+/// Parse the first record of a getdents64 buffer, with its length.
+///
+/// The record count is whatever the caller can walk with this: `d_reclen`
+/// steps record to record until the byte count the syscall returned runs out.
+pub fn parse_dirent64(buf: &[u8]) -> Option<(Dirent64<'_>, usize)> {
+    if buf.len() < 19 {
+        return None;
+    }
+    let d_ino = u64::from_le_bytes(buf[0..8].try_into().ok()?);
+    let d_off = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+    let reclen = u16::from_le_bytes(buf[16..18].try_into().ok()?) as usize;
+    if reclen < 19 || reclen > buf.len() {
+        return None;
+    }
+    let d_type = buf[18];
+    let name = &buf[19..reclen];
+    let stop = name.iter().position(|&b| b == 0)?;
+    Some((
+        Dirent64 {
+            d_ino,
+            d_off,
+            d_type,
+            name: &name[..stop],
+        },
+        reclen,
+    ))
+}
+
+/// Device ioctl: `TIOCGWINSZ`, `TCGETS`, and friends.
+pub fn ioctl(fd: i32, request: usize, arg: usize) -> isize {
+    sys3(nr::IOCTL, fd as usize, request, arg)
+}
+
+/// `uname(buf)`: fill the six 65-byte fields of `struct utsname`.
+pub fn uname(buf: &mut Utsname) -> isize {
+    sys1(nr::UNAME, buf.bytes.as_mut_ptr() as usize)
+}
+
+/// `clock_gettime(clk_id, tp)`.
+pub fn clock_gettime(clk_id: usize, tp: &mut TimeSpec) -> isize {
+    sys2(nr::CLOCK_GETTIME, clk_id, tp as *mut TimeSpec as usize)
+}
+
+/// `gettimeofday(tv, tz)`.
+pub fn gettimeofday(tv: &mut TimeVal) -> isize {
+    sys2(nr::GETTIMEOFDAY, tv as *mut TimeVal as usize, 0)
+}
+
+/// `nanosleep(req, rem)`.
+pub fn nanosleep(req: &TimeSpec, rem: &mut TimeSpec) -> isize {
+    sys2(
+        nr::NANOSLEEP,
+        req as *const TimeSpec as usize,
+        rem as *mut TimeSpec as usize,
+    )
+}
+
+/// `clock_nanosleep(clk_id, flags, req, rem)`.
+pub fn clock_nanosleep(clk_id: usize, flags: usize, req: &TimeSpec, rem: &mut TimeSpec) -> isize {
+    sys4(
+        nr::CLOCK_NANOSLEEP,
+        clk_id,
+        flags,
+        req as *const TimeSpec as usize,
+        rem as *mut TimeSpec as usize,
+    )
+}
+
+/// `kill(pid, sig)`: signal 0 probes for liveness.
+pub fn kill(pid: i32, sig: i32) -> isize {
+    sys2(nr::KILL, pid as usize, sig as usize)
+}
+
+/// The id of whoever spawned this process, 0 when there is none.
+pub fn getppid() -> isize {
+    sys0(nr::GETPPID)
+}
+
+/// `getuid`, and its gid/euid/egid siblings: 0, always, on a one-user kernel.
+pub fn getuid() -> isize {
+    sys0(nr::GETUID)
+}
+
+pub fn getgid() -> isize {
+    sys0(nr::GETGID)
+}
+
+pub fn geteuid() -> isize {
+    sys0(nr::GETEUID)
+}
+
+pub fn getegid() -> isize {
+    sys0(nr::GETEGID)
+}
+
+/// `mremap(old, old_size, new_size, flags, new_address)`.
+pub fn mremap(
+    old_addr: usize,
+    old_len: usize,
+    new_len: usize,
+    flags: usize,
+    new_addr: usize,
+) -> isize {
+    sys5(nr::MREMAP, old_addr, old_len, new_len, flags, new_addr)
+}
+
+/// `MREMAP_MAYMOVE`: the mapping may be moved to satisfy the resize.
+pub const MREMAP_MAYMOVE: usize = 0x1;
+/// `MREMAP_FIXED`: move to exactly the address named in the fifth argument.
+pub const MREMAP_FIXED: usize = 0x2;
+
+/// `madvise(addr, len, advice)` - accepted and answered 0.
+pub fn madvise(addr: usize, len: usize, advice: usize) -> isize {
+    sys3(nr::MADVISE, addr, len, advice)
+}
+
+/// `futex(uaddr, op, val)`: the WAIT/WAKE pair musl's locks lean on.
+pub fn futex(uaddr: *mut i32, op: usize, val: i32) -> isize {
+    sys3(nr::FUTEX, uaddr as usize, op, val as usize)
+}
+
+/// `fork()` - mpos does not have one; the number answers ENOSYS.
+pub fn fork() -> isize {
+    sys0(nr::FORK)
 }
 
 // ---------------------------------------------------------------------------

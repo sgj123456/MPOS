@@ -208,6 +208,10 @@ struct Task {
     /// which is where everyone starts; the VFS is mounted long after the
     /// first tasks exist, so the root inode cannot be grabbed up front.
     cwd: Option<Arc<dyn crate::vfs::Inode>>,
+    /// The path `cwd` was reached by, as the caller spelled it out - what
+    /// `getcwd` reports. `None` means "never left /", which is the truth for
+    /// every task that has not asked to be anywhere else.
+    cwd_path: Option<alloc::string::String>,
     /// The task that spawned this one in ring 3, if any. Its `wait` blocks on
     /// this task's exit; kernel-spawned tasks have none.
     parent: Option<TaskId>,
@@ -216,6 +220,10 @@ struct Task {
     /// owns; only the bookkeeping of *where* the break is stays here.
     brk_base: usize,
     brk_pages: usize,
+    /// Per-process mmap cursor: where the next `mmap(MAP_ANONYMOUS)` that
+    /// does not name an address starts looking. Each process starts at
+    /// `MMAP_BASE` and only moves forward; no other process shares this.
+    mmap_cursor: usize,
     /// The path this process was started from - what `/proc/self/exe` reads
     /// through. Empty for tasks that never had an image (kernel tasks, the
     /// boot task).
@@ -240,9 +248,11 @@ impl Task {
             alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
             cwd: None,
+            cwd_path: None,
             parent: None,
             brk_base: 0,
             brk_pages: 0,
+            mmap_cursor: crate::syscall::proc::MMAP_BASE,
             exe: alloc::string::String::new(),
         }
     }
@@ -391,9 +401,11 @@ impl Table {
             alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
             cwd: None,
+            cwd_path: None,
             parent: None,
             brk_base: 0,
             brk_pages: 0,
+            mmap_cursor: crate::syscall::proc::MMAP_BASE,
             exe: alloc::string::String::new(),
         });
         TaskId(slot)
@@ -572,9 +584,11 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnErro
             alt_stack: None,
             fds: Arc::new(FdTable::with_standard(crate::vfs::tty::global())),
             cwd: None,
+            cwd_path: None,
             parent: None,
             brk_base,
             brk_pages: 0,
+            mmap_cursor: crate::syscall::proc::MMAP_BASE,
             exe: alloc::string::String::new(),
         });
         t.sched.push_ready(INIT_PID, Priority::NORMAL);
@@ -627,6 +641,27 @@ pub fn try_spawn_user(
         // frame is already in `frames` - `load_user` returns it separately
         // only so this write knows where the stack's page lives.
         write_arg_block(stack_top_frame, user_rsp, argv, &image);
+        crate::println!(
+            "[SPAWN] pid-slot={} argv={:?} rsp={:#x} top_frame={:#x}",
+            slot,
+            argv,
+            user_rsp,
+            stack_top_frame
+        );
+        // TEMP DEBUG: prove the page tables map the argc slot to the frame the
+        // argument block was written into.
+        let pte_phys = space.phys_for_virt(user_rsp);
+        crate::println!(
+            "[PTECHK] translate({:#x}) = {:#x} (expect {:#x}) {}",
+            user_rsp,
+            pte_phys.map(|p| p & !(PAGE_SIZE - 1)).unwrap_or(0),
+            stack_top_frame,
+            if pte_phys.map(|p| p & !(PAGE_SIZE - 1)) == Some(stack_top_frame) {
+                "OK"
+            } else {
+                "MISMATCH"
+            }
+        );
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
@@ -663,9 +698,11 @@ pub fn try_spawn_user(
             alt_stack: None,
             fds,
             cwd: t.task(parent).cwd.clone(),
+            cwd_path: t.task(parent).cwd_path.clone(),
             parent: Some(parent),
             brk_base,
             brk_pages: 0,
+            mmap_cursor: crate::syscall::proc::MMAP_BASE,
             exe: alloc::string::String::from(exe),
         });
         let id = TaskId(slot);
@@ -693,7 +730,7 @@ pub fn try_spawn_user(
 ///
 /// ```text
 /// argc | argv[0..n] | NULL | NULL envp |
-/// AT_PHDR | AT_PHNUM | AT_PHENT | AT_ENTRY | AT_RANDOM | AT_PAGESZ | AT_NULL |
+/// AT_PHDR | AT_PHNUM | AT_PHENT | AT_ENTRY | AT_RANDOM | AT_PAGESZ | AT_BASE | AT_NULL |
 /// random bytes (16) | argv strings
 /// ```
 ///
@@ -705,8 +742,8 @@ fn initial_stack_rsp(argv: &[String]) -> Option<usize> {
     }
     let strings: usize = argv.iter().map(|s| s.len() + 1).sum();
     let argc = argv.len();
-    // argc, argv[0..argc], argv NULL, envp NULL, 7 auxv pairs (14 words).
-    let words_bytes = (argc + 17) * size_of::<usize>();
+    // argc, argv[0..argc], argv NULL, envp NULL, 8 auxv pairs (16 words).
+    let words_bytes = (argc + 19) * size_of::<usize>();
     // 16 bytes of random data for the AT_RANDOM auxv entry.
     let random_bytes = 16usize;
     let total = words_bytes + random_bytes + strings;
@@ -765,6 +802,24 @@ fn write_arg_block(frame: usize, user_rsp: usize, argv: &[String], image: &elf::
 
     // Auxiliary vector entries.
     auxv(&mut page[off..], image, random_vaddr);
+
+    // TEMP DEBUG: read the block back through the direct map and prove the
+    // write landed: argc, argv[0..2] pointers, first auxv type, and the
+    // page-table translation of the argc slot.
+    let rb_argc = usize::from_le_bytes(page[from..from + 8].try_into().unwrap());
+    let rb_argv0 = usize::from_le_bytes(page[from + 8..from + 16].try_into().unwrap());
+    let rb_aux0 = usize::from_le_bytes(
+        page[from + 8 + argc * 8 + 16..from + 16 + argc * 8 + 16]
+            .try_into()
+            .unwrap(),
+    );
+    crate::println!(
+        "[ARGBLK] argc={} argv0={:#x} aux0={:#x} str0={:?}",
+        rb_argc,
+        rb_argv0,
+        rb_aux0,
+        core::str::from_utf8(&page[PAGE_SIZE - 8..PAGE_SIZE])
+    );
 }
 
 /// Write the Linux auxiliary vector into `buf` as (type, value) u64 pairs.
@@ -788,6 +843,7 @@ fn auxv(buf: &mut [u8], image: &elf::Image, random_vaddr: usize) {
     entry!(9, image.entry); // AT_ENTRY
     entry!(25, random_vaddr); // AT_RANDOM
     entry!(6, PAGE_SIZE); // AT_PAGESZ
+    entry!(7, 0usize); // AT_BASE (0 = no dynamic linker)
     entry!(0, 0usize); // AT_NULL
     let _ = off;
 }
@@ -983,6 +1039,29 @@ pub fn current_cwd() -> Arc<dyn crate::vfs::Inode> {
 /// caller; this only remembers.
 pub fn set_cwd(dir: Arc<dyn crate::vfs::Inode>) {
     with_table(|t| t.task_mut(t.current).cwd = Some(dir));
+}
+
+/// The path the running task's cwd was reached by, or "/" when it has never
+/// moved - the answer `getcwd` owes its caller.
+pub fn current_cwd_path() -> alloc::string::String {
+    with_table(|t| {
+        t.task(t.current)
+            .cwd_path
+            .clone()
+            .unwrap_or_else(|| alloc::string::String::from("/"))
+    })
+}
+
+/// Remember the path the running task's cwd was reached by. The caller
+/// normalizes it; this only stores.
+pub fn set_cwd_path(path: alloc::string::String) {
+    with_table(|t| t.task_mut(t.current).cwd_path = Some(path));
+}
+
+/// The task `id` was spawned by, when it has one in ring 3. This is what
+/// `getppid` reads through.
+pub fn parent_of(id: TaskId) -> Option<TaskId> {
+    with_table(|t| t.tasks.get(id.0)?.as_ref().and_then(|task| task.parent))
 }
 
 /// Wait for a signal. With no handlers yet every signal is fatal, so nothing
@@ -1457,6 +1536,12 @@ pub fn brk(addr: usize) -> isize {
         // A break that shrinks gives its frames back; one that grows takes
         // more. Either way the pages are this process's from here on.
         let frontier = task.brk_base + needed_pages * PAGE_SIZE;
+        // The heap may not walk into the mmap region: between the two lies the
+        // hole that gives the address space its Linux shape. A break that far
+        // up is a runaway allocation, not a request to honor.
+        if frontier >= crate::syscall::proc::MMAP_BASE {
+            return crate::syscall::err::ENOMEM;
+        }
         let grown_to = task.brk_base + task.brk_pages * PAGE_SIZE;
         if frontier < grown_to {
             let dropped = match task.space.as_mut() {
@@ -1517,6 +1602,22 @@ pub fn set_brk_base(base: usize) {
     with_table(|t| {
         let task = t.task_mut(current());
         task.brk_base = base;
+    })
+}
+
+/// Get the mmap cursor for the current task.
+pub fn get_mmap_cursor() -> usize {
+    with_table(|t| {
+        let task = t.task(current());
+        task.mmap_cursor
+    })
+}
+
+/// Set the mmap cursor for the current task.
+pub fn set_mmap_cursor(cursor: usize) {
+    with_table(|t| {
+        let task = t.task_mut(current());
+        task.mmap_cursor = cursor;
     })
 }
 
@@ -1647,6 +1748,12 @@ extern "C" fn task_entry(slot: usize) -> ! {
     if let Some((entry, user_rsp)) = user {
         // One way door: the kernel stack this task arrived on stays behind as
         // nothing but the trap target, and the reaper eventually frees it.
+        crate::println!(
+            "[ENTER] slot={} entry={:#x} rsp={:#x}",
+            slot,
+            entry,
+            user_rsp
+        );
         unsafe { context::enter_user(entry, user_rsp) };
     }
     panic!("task {slot} has neither a body nor a user image")

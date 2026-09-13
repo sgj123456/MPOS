@@ -30,15 +30,21 @@ global_asm!(
     "    ud2",
 );
 
-/// The gate's register convention: number in `rax`, arguments in
-/// `rdi, rsi, rdx, r10`, result in `rax`. The kernel side preserves every
-/// register but `rax`, so nothing needs naming as clobbered.
+/// The `syscall` gate carries both ABIs on one entry, so mpos's own numbers
+/// cannot ride in raw: 0-16 collide with Linux's read/write/open. Every stub
+/// tags the number with "mpos" in the top 32 bits; the kernel strips the tag
+/// and dispatches to the compact table. `syscall` itself destroys rcx and
+/// r11, so the stubs name them as outputs.
+const MPOS_TAG: u64 = 0x6D70_6F73 << 32; // "mpos"
+
 fn sys0(number: u64) -> isize {
     let ret: isize;
     unsafe {
         asm!(
-            "int 0x80",
-            inlateout("rax") number as isize => ret,
+            "syscall",
+            inlateout("rax") (MPOS_TAG | number) as isize => ret,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
         );
     }
     ret
@@ -48,9 +54,11 @@ fn sys1(number: u64, a1: usize) -> isize {
     let ret: isize;
     unsafe {
         asm!(
-            "int 0x80",
-            inlateout("rax") number as isize => ret,
+            "syscall",
+            inlateout("rax") (MPOS_TAG | number) as isize => ret,
             in("rdi") a1,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
         );
     }
     ret
@@ -60,10 +68,12 @@ fn sys2(number: u64, a1: usize, a2: usize) -> isize {
     let ret: isize;
     unsafe {
         asm!(
-            "int 0x80",
-            inlateout("rax") number as isize => ret,
+            "syscall",
+            inlateout("rax") (MPOS_TAG | number) as isize => ret,
             in("rdi") a1,
             in("rsi") a2,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
         );
     }
     ret
@@ -73,11 +83,13 @@ fn sys3(number: u64, a1: usize, a2: usize, a3: usize) -> isize {
     let ret: isize;
     unsafe {
         asm!(
-            "int 0x80",
-            inlateout("rax") number as isize => ret,
+            "syscall",
+            inlateout("rax") (MPOS_TAG | number) as isize => ret,
             in("rdi") a1,
             in("rsi") a2,
             in("rdx") a3,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
         );
     }
     ret
@@ -87,12 +99,14 @@ fn sys4(number: u64, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
     let ret: isize;
     unsafe {
         asm!(
-            "int 0x80",
-            inlateout("rax") number as isize => ret,
+            "syscall",
+            inlateout("rax") (MPOS_TAG | number) as isize => ret,
             in("rdi") a1,
             in("rsi") a2,
             in("rdx") a3,
             in("r10") a4,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
         );
     }
     ret
@@ -115,14 +129,16 @@ fn sys6(
     let ret: isize;
     unsafe {
         asm!(
-            "int 0x80",
-            inlateout("rax") number as isize => ret,
+            "syscall",
+            inlateout("rax") (MPOS_TAG | number) as isize => ret,
             in("rdi") a1,
             in("rsi") a2,
             in("rdx") a3,
             in("r10") a4,
             in("r8") a5,
             in("r9") a6,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
         );
     }
     ret

@@ -50,13 +50,27 @@ if [[ "$ARCH" == "x86_64" ]]; then
     mkdir -p "$USERBIN"
     for src in "$ROOT"/user/bin/*.rs; do
         name="$(basename "$src" .rs)"
-        rustc --edition 2024 -C panic=abort \
-            --target x86_64-unknown-none \
-            -C relocation-model=static \
-            -C link-arg=--image-base=0x400000 \
-            -C link-arg=--gc-sections \
-            -o "$USERBIN/$name" \
-            "$src" || exit 1
+        case "$name" in
+            true|false|hello)
+                rustc --edition 2024 \
+                    --target x86_64-unknown-linux-musl \
+                    -C target-feature=+crt-static \
+                    -C relocation-model=static \
+                    -C link-arg=-no-pie \
+                    -C link-arg=-Wl,-z,norelro \
+                    -o "$USERBIN/$name" \
+                    "$src" || exit 1
+                ;;
+            *)
+                rustc --edition 2024 -C panic=abort \
+                    --target x86_64-unknown-none \
+                    -C relocation-model=static \
+                    -C link-arg=--image-base=0x400000 \
+                    -C link-arg=--gc-sections \
+                    -o "$USERBIN/$name" \
+                    "$src" || exit 1
+                ;;
+        esac
     done
 
     # The root filesystem: the initramfs tree plus the built programs, so the
@@ -69,11 +83,6 @@ if [[ "$ARCH" == "x86_64" ]]; then
     MUSL_COREUTILS="/tmp/coreutils/target/x86_64-unknown-linux-musl/release/coreutils"
     if [[ -f "$MUSL_COREUTILS" ]]; then
         cp "$MUSL_COREUTILS" "$ROOTFS/bin/coreutils"
-    fi
-    # Cross-compiled musl hello world binary, when available.
-    MUSL_HELLO="/home/mp/musl_hello/target/x86_64-unknown-linux-musl/release/musl_hello"
-    if [[ -f "$MUSL_HELLO" ]]; then
-        cp "$MUSL_HELLO" "$ROOTFS/bin/musl_hello"
     fi
     # The mountpoint devfs is mounted over. Git cannot hold an empty directory,
     # so the tree cannot be trusted to carry it.

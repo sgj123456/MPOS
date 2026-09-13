@@ -3,8 +3,9 @@
 //!
 //! Pinned here on a real file: SEEK_END reports the size, SEEK_SET and
 //! SEEK_CUR report and move the absolute position, a full re-read from 0
-//! hands the whole file back, and a bogus whence answers EINVAL. Negative
-//! offsets and cross-checks against other fds are out of scope.
+//! hands the whole file back, and a bogus whence answers EINVAL. The edges
+//! are pinned too: a seek that would land before byte 0 answers EINVAL for
+//! all three origins, and a descriptor that does not exist answers EBADF.
 
 #![no_std]
 #![no_main]
@@ -66,15 +67,42 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         );
 
         let r = lin::lseek(fd as i32, 0, 5);
+        lin::check_eq(&mut failed, b"an unknown whence answers EINVAL", r, lin::EINVAL);
+
+        // Negative landings: every origin that would end before byte 0.
+        let r = lin::lseek(fd as i32, -1, lin::SEEK_SET);
+        lin::check_eq(&mut failed, b"SEEK_SET to -1 answers EINVAL", r, lin::EINVAL);
+
+        let r = lin::lseek(fd as i32, 0, lin::SEEK_END);
+        lin::check_eq(&mut failed, b"SEEK_END(0) parks at the size", r, total as isize);
+        let r = lin::lseek(fd as i32, -1, lin::SEEK_CUR);
         lin::check_eq(
             &mut failed,
-            b"an unknown whence answers EINVAL",
+            b"SEEK_CUR(-1) from the end lands on size - 1",
+            r,
+            total as isize - 1,
+        );
+        let r = lin::lseek(fd as i32, -1_000_000, lin::SEEK_CUR);
+        lin::check_eq(
+            &mut failed,
+            b"SEEK_CUR far before byte 0 answers EINVAL",
             r,
             lin::EINVAL,
         );
 
+        let r = lin::lseek(fd as i32, -(total as isize), lin::SEEK_END);
+        lin::check_eq(&mut failed, b"SEEK_END(-size) rewinds to 0", r, 0);
+
         let _ = lin::close(fd as i32);
     }
+
+    let r = lin::lseek(99, 0, lin::SEEK_SET);
+    lin::check_eq(
+        &mut failed,
+        b"a descriptor that does not exist answers EBADF",
+        r,
+        lin::EBADF,
+    );
 
     lin::done(failed)
 }

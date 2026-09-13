@@ -14,6 +14,26 @@ pub mod fs;
 
 #[cfg(target_os = "none")]
 pub fn dispatch(nr: u64, args: [usize; 6]) -> isize {
+    // Trace the first 30 syscalls per process for musl debug.
+    static SYSCALL_COUNTS: [core::sync::atomic::AtomicUsize; 64] =
+        const { [const { core::sync::atomic::AtomicUsize::new(0) }; 64] };
+    let pid = crate::sched::current().0;
+    let n = SYSCALL_COUNTS[pid].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 30 {
+        crate::println!(
+            "[syscall #{}] pid={} nr={} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+            n,
+            pid,
+            nr,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5]
+        );
+    }
+
     match nr {
         // --- file I/O: Linux argument shapes ---
         nr::READ => super::fs::handle_read(args, true),
@@ -27,13 +47,22 @@ pub fn dispatch(nr: u64, args: [usize; 6]) -> isize {
         nr::LSEEK => super::fs::handle_lseek(args),
         nr::GETDENTS64 => super::fs::handle_getdents64(args, true),
         nr::DUP => super::fs::handle_dup(args),
+        nr::DUP2 => super::fs::handle_dup2(args),
         nr::DUP3 => super::fs::handle_dup3(args),
-        nr::PIPE2 => super::fs::handle_pipe(args, true),
+        nr::PIPE => super::fs::handle_pipe(args, true),
+        nr::PIPE2 => {
+            const O_CLOEXEC: usize = 0o200_0000;
+            if args[1] & !O_CLOEXEC != 0 {
+                err::EINVAL
+            } else {
+                super::fs::handle_pipe(args, true)
+            }
+        }
         nr::UNLINKAT => fs::unlinkat(args, &cwd()),
         nr::MKDIRAT => fs::mkdirat(args, &cwd()),
         nr::RENAMEAT2 => fs::renameat2(args, &cwd()),
         nr::GETCWD => super::fs::handle_getcwd(args, true),
-        nr::CHDIR => fs::chdir(args, &cwd()),
+        nr::CHDIR => fs::chdir(args),
         nr::FCHDIR => super::fs::handle_fchdir(args),
         nr::FCNTL => fs::fcntl(args),
         nr::IOCTL => super::fs::handle_ioctl(args, true),
@@ -47,12 +76,16 @@ pub fn dispatch(nr: u64, args: [usize; 6]) -> isize {
         nr::EXECVE => super::proc::handle_execve(args, &cwd()),
         nr::EXIT => super::proc::handle_exit(args),
         nr::EXIT_GROUP => super::proc::handle_exit(args),
-        nr::WAIT4 => super::proc::handle_wait(args),
+        // Linux's wait4 is (pid, *status, options): the options word sits in
+        // slot 2, where mpos's own wait keeps none. Reshape before reusing the
+        // handler, or the status pointer is read as the flags.
+        nr::WAIT4 => super::proc::handle_wait([args[0], args[2], 0, 0, 0, 0]),
         nr::GETPID => super::proc::handle_getpid(),
         nr::GETTID => super::proc::handle_getpid(),
         nr::GETPPID => super::proc::handle_getppid(),
         nr::YIELD => super::proc::handle_yield(),
-        nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => super::proc::handle_nanosleep(args),
+        nr::NANOSLEEP => super::proc::handle_nanosleep(args),
+        nr::CLOCK_NANOSLEEP => super::proc::handle_clock_nanosleep(args),
         nr::KILL => super::proc::handle_kill(args),
         nr::TKILL => super::proc::handle_kill(args),
         nr::FORK => super::proc::handle_fork(args),
@@ -69,12 +102,12 @@ pub fn dispatch(nr: u64, args: [usize; 6]) -> isize {
         nr::POLL | nr::PPOLL => fs::poll(args),
         nr::SIGALTSTACK => sigaltstack(args),
         nr::CLOCK_GETTIME => super::proc::handle_clock_gettime(args),
-        nr::GETTIMEOFDAY => super::proc::handle_clock_gettime(args),
+        nr::GETTIMEOFDAY => super::proc::handle_gettimeofday(args),
         nr::UNAME => super::proc::handle_uname(args, true),
         nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => 0,
         nr::SETUID | nr::SETGID | nr::SETEUID | nr::SETSID => err::EPERM,
         nr::RT_SIGACTION => sigaction(args),
-        nr::RT_SIGPROCMASK => 0, // stub: success
+        nr::RT_SIGPROCMASK => rt_sigprocmask(args),
         nr::RT_SIGRETURN => 0,
         nr::ARCH_PRCTL => handle_arch_prctl(args),
         nr::GETRANDOM => super::proc::handle_getrandom(args, true),
@@ -169,6 +202,36 @@ fn sigaction(args: [usize; 6]) -> isize {
 /// `SS_DISABLE`, the `ss_flags` bit that says "there is no alternate stack".
 const SS_DISABLE: i32 = 2;
 
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)`.
+///
+/// mpos keeps no per-process mask - every signal is delivered the moment it
+/// arrives - so a change is validated and then forgotten, and every query
+/// reports an empty mask. The validation is still real: Linux refuses an
+/// unknown `how`, a `sigsetsize` other than the ABI's 8, a `set` that cannot
+/// be read, and an `oldset` that cannot be written. A query must *write* its
+/// answer - a fresh process owes its caller zeros, not the sentinels it
+/// happened to have there.
+fn rt_sigprocmask(args: [usize; 6]) -> isize {
+    const SIG_SETMASK: usize = 2;
+    let (how, set, old, sigsetsize) = (args[0], args[1], args[2], args[3]);
+    if sigsetsize != 8 {
+        return err::EINVAL;
+    }
+    if how > SIG_SETMASK {
+        return err::EINVAL;
+    }
+    if set != 0 && !super::buffer_ok(set, 8, false, true) {
+        return err::EFAULT;
+    }
+    if old != 0 {
+        if !super::buffer_ok(old, 8, true, true) {
+            return err::EFAULT;
+        }
+        unsafe { (old as *mut u64).write_volatile(0) };
+    }
+    0
+}
+
 /// The 24-byte `stack_t` of the Linux x86_64 ABI.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -196,6 +259,11 @@ fn sigaltstack(args: [usize; 6]) -> isize {
             return err::EFAULT;
         }
         let incoming = unsafe { core::ptr::read(ss as *const UserStackT) };
+        // Linux refuses a flag word with bits it does not know before it
+        // looks at anything else.
+        if incoming.ss_flags & !SS_DISABLE != 0 {
+            return err::EINVAL;
+        }
         if incoming.ss_flags & SS_DISABLE != 0 {
             if !crate::sched::set_signal_alt_stack(id, None) {
                 return err::ESRCH;
@@ -238,57 +306,56 @@ fn sigaltstack(args: [usize; 6]) -> isize {
     0
 }
 
+/// `arch_prctl(code, addr)`.
+///
+/// The SET forms load the base register straight from `addr`; the GET forms
+/// write the base into `*(u64 *)addr` and answer 0, which is the shape the
+/// man page and every libc wrapper agree on - a base returned in `rax`
+/// instead would leave the caller reading whatever its buffer already held.
 fn handle_arch_prctl(args: [usize; 6]) -> isize {
     let (cmd, addr) = (args[0], args[1]);
-    unsafe {
-        match cmd {
-            ARCH_SET_FS => {
-                core::arch::asm!(
-                    "wrmsr",
-                    in("ecx") MSR_FS_BASE,
-                    in("eax") addr as u32,
-                    in("edx") (addr >> 32) as u32,
-                );
-                0
-            }
-            ARCH_SET_GS => {
-                core::arch::asm!(
-                    "wrmsr",
-                    in("ecx") MSR_GS_BASE,
-                    in("eax") addr as u32,
-                    in("edx") (addr >> 32) as u32,
-                );
-                0
-            }
-            ARCH_GET_FS => {
-                let mut lo: u32;
-                let mut hi: u32;
-                core::arch::asm!(
-                    "rdmsr",
-                    in("ecx") MSR_FS_BASE,
-                    out("eax") lo,
-                    out("edx") hi,
-                );
-                let val = ((hi as usize) << 32) | (lo as usize);
-                if val == 0 {
-                    0 // no FS base set yet
+    match cmd {
+        ARCH_SET_GS | ARCH_SET_FS => {
+            let (msr, value) = (
+                if cmd == ARCH_SET_FS {
+                    MSR_FS_BASE
                 } else {
-                    val as isize
-                }
+                    MSR_GS_BASE
+                },
+                addr,
+            );
+            unsafe {
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") msr,
+                    in("eax") value as u32,
+                    in("edx") (value >> 32) as u32,
+                );
             }
-            ARCH_GET_GS => {
-                let mut lo: u32;
-                let mut hi: u32;
+            0
+        }
+        ARCH_GET_FS | ARCH_GET_GS => {
+            let msr = if cmd == ARCH_GET_FS {
+                MSR_FS_BASE
+            } else {
+                MSR_GS_BASE
+            };
+            let (mut lo, mut hi): (u32, u32);
+            unsafe {
                 core::arch::asm!(
                     "rdmsr",
-                    in("ecx") MSR_GS_BASE,
+                    in("ecx") msr,
                     out("eax") lo,
                     out("edx") hi,
                 );
-                let val = ((hi as usize) << 32) | (lo as usize);
-                if val == 0 { 0 } else { val as isize }
             }
-            _ => err::EINVAL,
+            if !super::buffer_ok(addr, 8, true, true) {
+                return err::EFAULT;
+            }
+            let val = ((hi as u64) << 32) | (lo as u64);
+            unsafe { (addr as *mut u64).write_volatile(val) };
+            0
         }
+        _ => err::EINVAL,
     }
 }

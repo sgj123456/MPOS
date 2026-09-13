@@ -13,6 +13,10 @@ edition = "2024"
 # Already in the tree as a dependency of `x86_64`.
 bitflags = "2.13"
 
+# The ELF loader parses user images with the same crate on the host (for the
+# unit tests) and in the kernel, so this is also not target-gated.
+elf = { version = "0.8", default-features = false, features = ["alloc"] }
+
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = { version = "1.2", features = ["restore-state-bool"] }
 

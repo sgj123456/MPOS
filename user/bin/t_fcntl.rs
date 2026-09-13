@@ -2,10 +2,11 @@
 //! (`fcntl(0, F_GETFD) = 0` and friends in the strace).
 //!
 //! Pinned here: F_GETFD on a live descriptor answers the descriptor's flag
-//! word (fresh: 0), F_SETFD stores FD_CLOEXEC and F_GETFD reads it back,
-//! and a descriptor that does not exist answers EBADF. A stub that
-//! answers 0 to everything fails the roundtrip by design - "accept and
-//! forget" is not flag storage.
+//! word (fresh: 0), F_SETFD stores FD_CLOEXEC and F_GETFD reads it back and
+//! clears it again, F_GETFL answers O_RDONLY (opens here are untyped, so 0),
+//! a command the kernel has no meaning for answers EINVAL, and a descriptor
+//! that does not exist answers EBADF. A stub that answers 0 to everything
+//! fails the roundtrip by design - "accept and forget" is not flag storage.
 
 #![no_std]
 #![no_main]
@@ -44,8 +45,48 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::FD_CLOEXEC as isize,
     );
 
+    let r = lin::fcntl(1, lin::F_SETFD, 0xFFFF_FFFF);
+    lin::check_eq(
+        &mut failed,
+        b"F_SETFD with bits beyond FD_CLOEXEC answers EINVAL",
+        r,
+        lin::EINVAL,
+    );
+
+    let r = lin::fcntl(1, lin::F_GETFD, 0);
+    lin::check_eq(
+        &mut failed,
+        b"the refused F_SETFD changed nothing",
+        r,
+        lin::FD_CLOEXEC as isize,
+    );
+
     let r = lin::fcntl(1, lin::F_SETFD, 0);
     lin::check_eq(&mut failed, b"F_SETFD clears the flag again", r, 0);
+
+    let r = lin::fcntl(1, lin::F_GETFD, 0);
+    lin::check_eq(
+        &mut failed,
+        b"F_GETFD confirms the cleared flag word",
+        r,
+        0,
+    );
+
+    let r = lin::fcntl(1, lin::F_GETFL, 0);
+    lin::check_eq(
+        &mut failed,
+        b"F_GETFL answers O_RDONLY (0) for an untyped open",
+        r,
+        0,
+    );
+
+    let r = lin::fcntl(1, 999, 0);
+    lin::check_eq(
+        &mut failed,
+        b"an unknown command answers EINVAL",
+        r,
+        lin::EINVAL,
+    );
 
     let r = lin::fcntl(-1, lin::F_GETFD, 0);
     lin::check_eq(

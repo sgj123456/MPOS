@@ -98,7 +98,7 @@ mpos/
 | **M2** | 帧与堆 | 伙伴分配器分出不重叠的块；Slab 堆满足所有布局；两者对内存使用量一致 |
 | **M3** | 分页 | 内核运行在自己的页表上；整个镜像 W^X 验证；进程获得独立地址空间并共享内核半区 |
 | **M4** | 调度器 | 轮转调度、抢占、休眠、空闲、基于优先级的核窃取全部工作 |
-| **M6** | 系统调用 | `int 0x80` 门正确分发；fd 检查工作；通过门的 exit 结束任务 |
+| **M6** | 系统调用 | `syscall` 门正确分发；fd 检查工作；通过 dispatch 的 exit 结束任务 |
 | **M7** | VFS | ramfs 根、挂载子文件系统、通过 fd 表的多任务文件 I/O |
 | **M8** | Initramfs 与 devfs | tar 解包、`/dev/tty`、`/dev/console`、`/dev/null`、`/dev/zero` |
 | **M9** | 进程 | ELF 加载到新地址空间；进入 Ring 3；退出码往返验证 |
@@ -205,7 +205,7 @@ cargo test --lib --target x86_64-unknown-linux-gnu
 
 ## 📡 系统调用
 
-mpos 通过 `int 0x80` 门暴露 17 个系统调用：
+mpos 通过唯一的 `syscall` 门暴露 17 个系统调用。mpos 号在 `rax` 高 32 位带有 `mpos` tag，避免与 musl 二进制直接裸发的 Linux x86_64 号冲突：
 
 | # | 调用 | 描述 |
 |:-:|------|------|

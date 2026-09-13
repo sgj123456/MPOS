@@ -7,6 +7,10 @@
 //! writes on both of its pages, and shrinking returns the smaller break.
 //! (Linux leaves the freed tail mapped or not as it pleases; only the
 //! return value is pinned.)
+//!
+//! Added pins: re-growing after the shrink answers the request, a byte
+//! written at the old break still reads back, and brk asked for the same
+//! address twice answers it both times.
 
 #![no_std]
 #![no_main]
@@ -58,6 +62,36 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"shrinking returns the smaller break",
         end,
         cur + 4096,
+    );
+
+    // Re-growing after the shrink answers the request: the pages are this
+    // process's from here on, whatever happened to them in between.
+    let end = lin::brk(want as usize);
+    lin::check_eq(
+        &mut failed,
+        b"re-growing after the shrink returns the request",
+        end,
+        want,
+    );
+
+    // A byte at the old break - the address brk(NULL) first reported -
+    // writes and reads like any other.
+    const BYTE: u8 = 0x5A;
+    unsafe { (cur as *mut u8).write_volatile(BYTE) };
+    let back = unsafe { (cur as *const u8).read_volatile() };
+    lin::check_true(
+        &mut failed,
+        b"a byte at the old break still writes and reads",
+        back == BYTE,
+    );
+
+    // Asking for the same break twice answers it both times.
+    let same1 = lin::brk(want as usize);
+    let same2 = lin::brk(want as usize);
+    lin::check_true(
+        &mut failed,
+        b"brk at the same address answers it, twice",
+        same1 >= want && same2 >= want,
     );
 
     lin::done(failed)
