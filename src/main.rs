@@ -39,7 +39,7 @@ use mpos::drivers;
 use mpos::mm::{self, MapFlags, Mapping, PAGE_SIZE};
 use mpos::println;
 use mpos::sched::{self, Priority};
-use mpos::syscall::{self, err, nr};
+use mpos::syscall::{self, err, linux::nr as lnr};
 use mpos::vfs::{self, FileSystem, NodeKind};
 
 const MIB: usize = 1024 * 1024;
@@ -782,9 +782,9 @@ fn check_sched() {
 
 // ---- syscall + vfs: gate, ramfs, mounts, initramfs, devfs ---------------
 
-/// Issue an mpos syscall: one entry into [`syscall::mpos_dispatch`], the same
-/// path the `syscall` gate drives for ring 3, called here from the kernel's
-/// own checks with `from_user` false.
+/// Issue a Linux x86_64 syscall: one entry into [`syscall::linux_dispatch`],
+/// the same path the `syscall` gate drives for ring 3, called here from the
+/// kernel's own checks with `from_user` false.
 #[cfg(target_arch = "x86_64")]
 unsafe fn syscall(
     nr: u64,
@@ -795,34 +795,35 @@ unsafe fn syscall(
     a5: usize,
     a6: usize,
 ) -> isize {
-    syscall::mpos_dispatch(nr, [a1, a2, a3, a4, a5, a6], false)
+    syscall::linux_dispatch(nr, [a1, a2, a3, a4, a5, a6], false)
 }
 
 /// Prove the syscall gate, ramfs, mounts, initramfs unpack, and device filesystem.
 fn check_vfs() {
     // M6: syscall dispatch and the fd table.
     {
+        // Probe a number beyond the table: 999 is now CLEANUP_AFTER_KTHREAD.
         assert_eq!(
-            syscall::mpos_dispatch(999, [0; syscall::ARG_COUNT], false),
+            syscall::linux_dispatch(1024, [0; syscall::ARG_COUNT], false),
             err::ENOSYS
         );
         assert_eq!(
-            syscall::mpos_dispatch(nr::READ, [0, 0, 0, 0, 0, 0], false),
+            syscall::linux_dispatch(lnr::READ, [0, 0, 0, 0, 0, 0], false),
             0,
             "a zero-length read is empty, not an error"
         );
         assert_eq!(
-            syscall::mpos_dispatch(nr::READ, [3, 0, 0, 0, 0, 0], false),
+            syscall::linux_dispatch(lnr::READ, [3, 0, 0, 0, 0, 0], false),
             err::EBADF
         );
         assert_eq!(
-            syscall::mpos_dispatch(nr::WRITE, [7, 0, 0, 0, 0, 0], false),
+            syscall::linux_dispatch(lnr::WRITE, [7, 0, 0, 0, 0, 0], false),
             err::EBADF
         );
 
         let msg = b"syscall: write through dispatch\n";
-        let wrote = syscall::mpos_dispatch(
-            nr::WRITE,
+        let wrote = syscall::linux_dispatch(
+            lnr::WRITE,
             [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0],
             false,
         );
@@ -833,26 +834,33 @@ fn check_vfs() {
         // dispatch takes the task down.
         sched::spawn(
             || {
-                let pid = syscall::mpos_dispatch(nr::GETPID, [0; syscall::ARG_COUNT], false);
+                let pid = syscall::linux_dispatch(lnr::GETPID, [0; syscall::ARG_COUNT], false);
                 assert!(pid >= 2, "getpid returned {pid}");
 
                 let msg = b"syscall: write through dispatch in a spawned task\n";
-                let wrote = syscall::mpos_dispatch(
-                    nr::WRITE,
+                let wrote = syscall::linux_dispatch(
+                    lnr::WRITE,
                     [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0],
                     false,
                 );
                 assert_eq!(wrote as usize, msg.len(), "dispatch dropped bytes");
 
                 assert_eq!(
-                    syscall::mpos_dispatch(nr::YIELD, [0; syscall::ARG_COUNT], false),
+                    syscall::linux_dispatch(lnr::SCHED_YIELD, [0; syscall::ARG_COUNT], false),
                     0
                 );
+                // 2 ms, 1 byte, 0 padding — a request for the handler to
+                // exercise, not to time precisely.
+                let req: [u64; 2] = [0, 2_000_000];
                 assert_eq!(
-                    syscall::mpos_dispatch(nr::SLEEP, [2, 0, 0, 0, 0, 0], false),
+                    syscall::linux_dispatch(
+                        lnr::NANOSLEEP,
+                        [req.as_ptr() as usize, 0, 0, 0, 0, 0],
+                        false
+                    ),
                     0
                 );
-                syscall::mpos_dispatch(nr::EXIT, [0, 0, 0, 0, 0, 0], false);
+                syscall::linux_dispatch(lnr::EXIT_GROUP, [0, 0, 0, 0, 0, 0], false);
             },
             Priority::NORMAL,
         );
@@ -1142,7 +1150,7 @@ fn check_ipc() {
     // --- pipe: bytes cross tasks, EOF after writer leaves.
     let mut fds = [0i32; 2];
     assert_eq!(
-        unsafe { syscall(nr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
+        unsafe { syscall(lnr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
         0,
         "pipe() failed"
     );
@@ -1155,7 +1163,7 @@ fn check_ipc() {
             let msg = b"ping through a pipe\n";
             let wrote = unsafe {
                 syscall(
-                    nr::WRITE,
+                    lnr::WRITE,
                     wfd as usize,
                     msg.as_ptr() as usize,
                     msg.len(),
@@ -1173,7 +1181,7 @@ fn check_ipc() {
     let mut buf = [0u8; 64];
     let got = unsafe {
         syscall(
-            nr::READ,
+            lnr::READ,
             rfd as usize,
             buf.as_mut_ptr() as usize,
             buf.len(),
@@ -1193,7 +1201,7 @@ fn check_ipc() {
     // --- pipe: write with no reader is EPIPE.
     let mut fds = [0i32; 2];
     assert_eq!(
-        unsafe { syscall(nr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
+        unsafe { syscall(lnr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
         0
     );
     let (rfd, wfd) = (fds[0], fds[1]);
@@ -1204,7 +1212,7 @@ fn check_ipc() {
         Priority::NORMAL,
     );
     drain();
-    let rc = unsafe { syscall(nr::WRITE, wfd as usize, b"x".as_ptr() as usize, 1, 0, 0, 0) };
+    let rc = unsafe { syscall(lnr::WRITE, wfd as usize, b"x".as_ptr() as usize, 1, 0, 0, 0) };
     assert_eq!(rc, err::EPIPE, "a write to a readerless pipe must be EPIPE");
     vfs::close(wfd).unwrap();
     println!("pipe: write with no reader answered EPIPE and nobody died");
@@ -1236,7 +1244,17 @@ fn check_ipc() {
         },
         Priority::NORMAL,
     );
-    let n = unsafe { syscall(nr::READ, 0, line.as_mut_ptr() as usize, line.len(), 0, 0, 0) };
+    let n = unsafe {
+        syscall(
+            lnr::READ,
+            0,
+            line.as_mut_ptr() as usize,
+            line.len(),
+            0,
+            0,
+            0,
+        )
+    };
     assert_eq!(n as usize, b"slow\n".len());
     assert_eq!(&line[..n as usize], b"slow\n");
     drain();
@@ -1256,7 +1274,7 @@ fn check_ipc() {
 
     let mut fds = [0i32; 2];
     assert_eq!(
-        unsafe { syscall(nr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
+        unsafe { syscall(lnr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) },
         0
     );
     let (rfd, wfd) = (fds[0], fds[1]);
@@ -1291,14 +1309,17 @@ fn check_ipc() {
     drain();
 
     assert_eq!(
-        unsafe { syscall(nr::KILL, sched::current().0, 0, 0, 0, 0, 0) },
+        unsafe { syscall(lnr::KILL, sched::current().0, 0, 0, 0, 0, 0) },
         0
     );
     assert_eq!(
-        unsafe { syscall(nr::KILL, 9999, SIGTERM as usize, 0, 0, 0, 0) },
+        unsafe { syscall(lnr::KILL, 9999, SIGTERM as usize, 0, 0, 0, 0) },
         err::ESRCH
     );
-    assert_eq!(unsafe { syscall(nr::KILL, 0, 32, 0, 0, 0, 0) }, err::EINVAL);
+    assert_eq!(
+        unsafe { syscall(lnr::KILL, 0, 32, 0, 0, 0, 0) },
+        err::EINVAL
+    );
     println!("signals: SIGTERM, SIGKILL, and the kill(0) probe behave");
 
     println!("M11_OK");
@@ -1437,6 +1458,14 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo t_fork_$?\n",
     b"t_wait4\n",
     b"echo t_wait4_$?\n",
+    // t_stdargs pins the Linux startup contract from the std side: a musl
+    // binary's Rust `env::args()` reads back the argument block the kernel
+    // laid out, with no mpos libc in the way. It is the only test that runs a
+    // whole libc runtime of its own, and its first `malloc` is what caught the
+    // `syscall` entry clobbering r12 - which turned `argc` into a stack
+    // address and asked the kernel for a 24 GiB mapping.
+    b"t_stdargs one two three\n",
+    b"echo STDARGS_$?\n",
     // b"t_mprotect\n",
     // b"echo t_mprotect_$?\n",
     // b"t_rt_sigprocmask\n",
@@ -1495,6 +1524,7 @@ fn check_shell() {
         sched::current(),
         &argv,
         &[],
+        &[],
         "/bin/sh",
     )
     .expect("the shell image loaded");
@@ -1537,13 +1567,16 @@ fn discard() {
 fn handoff_to_init() {
     let init = vfs::read_file("/bin/init").expect("the initramfs carries /bin/init");
     let argv = alloc::vec![String::from("init")];
-    let pid = sched::spawn_init(&init, &argv).expect("the init image loaded");
+    let pid = sched::spawn_init(&init, &argv, &[]).expect("the init image loaded");
     assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
     println!("mpos: handing the machine to /bin/init");
 
     sched::discard_exit_code(pid);
 
     drivers::serial::enable_rx();
+    // init starts the shell with `execve`, which on mpos spawns it as a child
+    // and reports the pid; init then waits. So a child appearing under init is
+    // exactly the "the shell is up" signal.
     while !sched::has_live_child(pid) {
         sched::sleep_ticks(1);
     }

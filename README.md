@@ -64,12 +64,13 @@ mpos/
 │   ├── boot/                # Boot protocol translation (Limine)
 │   └── shell/               # Shell syntax parser (no_std, zero-allocation)
 ├── user/
-│   ├── lib/sys.rs           # Slim libc (syscall wrappers)
+│   ├── lib/lin.rs           # Slim libc (syscall wrappers)
 │   └── bin/                 # User programs
 │       ├── init.rs          # PID 1: restarts shell, reaps orphans
 │       ├── sh.rs            # Shell with pipes and redirection
-│       ├── hello.rs         # Ring 3 proof of concept
-│       ├── ls.rs, cat.rs, echo.rs, sleep.rs, true.rs, false.rs
+│       ├── ls.rs, sleep.rs  # mpos-native: `#![no_std]`, slim libc
+│       ├── cat.rs, echo.rs  # Linux: rustc-built for musl, on Rust `std`
+│       ├── hello.rs, true.rs, false.rs, t_stdargs.rs
 ├── scripts/
 │   ├── mkiso.sh             # Build kernel, user programs, ISO, and disk image
 │   ├── run.sh               # Launch in QEMU

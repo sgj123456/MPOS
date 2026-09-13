@@ -1,36 +1,31 @@
-//! The system-call surface: a number table the libc will pin, and the dispatch
-//! that turns a register block into a call.
+//! The system-call surface: Linux x86_64 numbers and the dispatch that turns
+//! a register block into a call.
 //!
-//! The numbers are mpos's own. POSIX fixes interfaces, not numbers, so the
-//! table is free to stay small and dense. The register convention, though, is
-//! worth borrowing: number in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`,
-//! result in `rax`. `rcx` and `r11` are deliberately absent from the argument
-//! list because x86_64's `syscall` instruction destroys them, so a later move
-//! from the interrupt gate to that instruction cannot break the convention.
-//! Errors come back as negative errno values in `rax`.
+//! The register convention is the Linux one: number in `rax`, arguments in
+//! `rdi, rsi, rdx, r10, r8, r9`, result in `rax`. `rcx` and `r11` are
+//! deliberately absent from the argument list because x86_64's `syscall`
+//! instruction destroys them, so a later move from the interrupt gate to
+//! that instruction cannot break the convention. Errors come back as
+//! negative errno values in `rax`.
 //!
-//! The table itself is arch-agnostic and unit-tested on the host. [`dispatch`]
-//! runs the handlers, which need a console and a scheduler under them, so it
-//! only exists on the machine.
+//! The dispatch runs the handlers, which need a console and a scheduler
+//! under them, so it only exists on the machine.
 
-/// The syscall numbers, in a file of their own so user programs can include it.
-pub mod nr;
-
-/// Linux x86_64 syscall number mapping.
+/// Linux x86_64 syscall number mapping and POSIX handlers.
 #[cfg(target_os = "none")]
 pub mod linux;
 
-/// File-related syscall handlers (READ, WRITE, OPEN, CLOSE, CREATE, UNLINK,
-/// LISTDIR, DUP2, CHDIR, PIPE).
-#[cfg(target_os = "none")]
-pub mod fs;
+/// Base address for user mmap: where every process's mmap cursor starts.
+///
+/// The cursor only moves downward from here, so the mmap region grows from
+/// the top of the address space toward the program image. That shape -
+/// heap low, huge hole, mmap high - is what Linux gives a static program,
+/// and musl's allocator notices the difference: it sizes its regions from
+/// what the kernel hands back, and a base in the low gigabytes makes those
+/// regions collide with the break.
+pub const MMAP_BASE: usize = 0x0000_7f00_0000_0000;
 
-/// Process-related syscall handlers (EXIT, YIELD, GETPID, SLEEP, SPAWN, WAIT,
-/// KILL).
-#[cfg(target_os = "none")]
-pub mod proc;
-
-/// The errno values [`dispatch`] returns, already negated for `rax`.
+/// The errno values [`linux::dispatch`] returns, already negated for `rax`.
 pub mod err {
     pub const ENOENT: isize = -2;
     pub const ESRCH: isize = -3;
@@ -76,7 +71,7 @@ pub(crate) const MAX_IO: usize = 1 << 20;
 #[cfg(target_os = "none")]
 pub(crate) const MAX_PATH: usize = 255;
 
-/// Map a VFS error onto the errno [`dispatch`] returns.
+/// Map a VFS error onto the errno [`linux::dispatch`] returns.
 #[cfg(target_os = "none")]
 pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
     use crate::vfs::VfsError;
@@ -99,25 +94,6 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
 #[cfg(target_os = "none")]
 pub(crate) fn buffer_ok(buf: usize, len: usize, write: bool, from_user: bool) -> bool {
     len <= MAX_IO && (!from_user || crate::arch::paging::user_accessible(buf, len, write))
-}
-
-/// Parse a path argument from a (ptr, len) pair into an owned String.
-#[cfg(target_os = "none")]
-pub(crate) fn path_arg(
-    ptr: usize,
-    len: usize,
-    from_user: bool,
-) -> Result<alloc::string::String, isize> {
-    if len == 0 || len > MAX_PATH {
-        return Err(err::EINVAL);
-    }
-    if !buffer_ok(ptr, len, false, from_user) {
-        return Err(err::EFAULT);
-    }
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    core::str::from_utf8(bytes)
-        .map(alloc::string::String::from)
-        .map_err(|_| err::EINVAL)
 }
 
 /// Parse a NUL-terminated string argument - the Linux ABI's path shape - into
@@ -183,77 +159,22 @@ pub(crate) fn argv_arg(ptr: usize) -> Result<alloc::vec::Vec<alloc::string::Stri
     Ok(out)
 }
 
-/// Dispatch an mpos syscall number - the kernel's own table, the numbers in
-/// [`nr`]. Linux numbers go to [`linux_dispatch`]; the `syscall` gate tells
-/// the two apart by the "mpos" tag in the number's top 32 bits.
-#[cfg(target_os = "none")]
-pub fn mpos_dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    // A signal that arrived while the task was running is delivered before it
-    // gets to ask for anything.
-    crate::sched::deliver_pending_signal();
-
-    // Where a caller's relative paths start.
-    let cwd = crate::sched::current_cwd();
-
-    match nr {
-        // -- process --
-        nr::EXIT => proc::handle_exit(args),
-        nr::YIELD => proc::handle_yield(),
-        nr::GETPID => proc::handle_getpid(),
-        nr::SLEEP => proc::handle_sleep(args),
-        nr::KILL => proc::handle_kill(args),
-        nr::SPAWN => proc::handle_spawn(args, from_user, &cwd),
-        nr::WAIT => proc::handle_wait(args),
-
-        // -- file system --
-        nr::READ => fs::handle_read(args, from_user),
-        nr::WRITE => fs::handle_write(args, from_user),
-        nr::OPEN => fs::handle_open(args, from_user, &cwd),
-        nr::CLOSE => fs::handle_close(args),
-        nr::CREATE => fs::handle_create(args, from_user, &cwd),
-        nr::UNLINK => fs::handle_unlink(args, from_user, &cwd),
-        nr::CHDIR => fs::handle_chdir(args, from_user),
-        nr::DUP2 => fs::handle_dup2(args),
-        nr::LISTDIR => fs::handle_listdir(args, from_user, &cwd),
-        nr::PIPE => fs::handle_pipe(args, from_user),
-
-        _ => err::ENOSYS,
-    }
-}
-
 /// Dispatch a Linux x86_64 syscall number - the numbers a musl binary
-/// speaks, in `src/syscall/linux/nr.rs`. mpos's own numbers go to
-/// [`mpos_dispatch`].
+/// speaks, in `src/syscall/linux/nr.rs`.
+///
+/// `from_user` is `true` when the dispatch was reached through the
+/// `syscall` gate from ring 3 (the normal case) and `false` when the
+/// kernel is calling a handler on its own behalf: the gate validates
+/// user pointers, and the kernel's own buffers do not need that walk.
 #[cfg(target_os = "none")]
-pub fn linux_dispatch(nr: u64, args: [usize; ARG_COUNT]) -> isize {
+pub fn linux_dispatch(nr: u64, args: [usize; ARG_COUNT], from_user: bool) -> isize {
     crate::sched::deliver_pending_signal();
-    linux::dispatch(nr, args)
+    linux::dispatch(nr, args, from_user)
 }
 
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
-    use super::{err, nr};
-
-    #[test]
-    fn numbers_are_pinned() {
-        assert_eq!(nr::EXIT, 0);
-        assert_eq!(nr::READ, 1);
-        assert_eq!(nr::WRITE, 2);
-        assert_eq!(nr::YIELD, 3);
-        assert_eq!(nr::GETPID, 4);
-        assert_eq!(nr::SLEEP, 5);
-        assert_eq!(nr::PIPE, 6);
-        assert_eq!(nr::KILL, 7);
-        assert_eq!(nr::OPEN, 8);
-        assert_eq!(nr::CLOSE, 9);
-        assert_eq!(nr::SPAWN, 10);
-        assert_eq!(nr::WAIT, 11);
-        assert_eq!(nr::LISTDIR, 12);
-        assert_eq!(nr::DUP2, 13);
-        assert_eq!(nr::CREATE, 14);
-        assert_eq!(nr::UNLINK, 15);
-        assert_eq!(nr::CHDIR, 16);
-    }
+    use super::err;
 
     #[test]
     fn errors_match_the_errno_values_they_name() {

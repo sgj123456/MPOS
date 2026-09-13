@@ -252,7 +252,7 @@ impl Task {
             parent: None,
             brk_base: 0,
             brk_pages: 0,
-            mmap_cursor: crate::syscall::proc::MMAP_BASE,
+            mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
         }
     }
@@ -405,7 +405,7 @@ impl Table {
             parent: None,
             brk_base: 0,
             brk_pages: 0,
-            mmap_cursor: crate::syscall::proc::MMAP_BASE,
+            mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
         });
         TaskId(slot)
@@ -520,7 +520,7 @@ pub fn spawn(body: impl FnOnce() + 'static, priority: Priority) -> TaskId {
 /// reaches into the kernel half is refused there, and every page placed here
 /// comes from frames this code allocates, never from the file's claims.
 pub fn spawn_user(bytes: &[u8], priority: Priority) -> TaskId {
-    try_spawn_user(bytes, priority, current(), &[], &[], "")
+    try_spawn_user(bytes, priority, current(), &[], &[], &[], "")
         .expect("spawn_user: not an ELF64 executable mpos can load")
 }
 
@@ -529,21 +529,21 @@ pub fn spawn_user(bytes: &[u8], priority: Priority) -> TaskId {
 /// Nothing spawns it, so nothing is its parent until it has children of its
 /// own; the boot task keeps no link, because it has no `wait` to collect with
 /// and a record nobody reads is a record that lies to the next `wait`.
-pub fn spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnError> {
-    let id = try_spawn_init(bytes, argv)?;
+pub fn spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<TaskId, SpawnError> {
+    let id = try_spawn_init(bytes, argv, env)?;
     assert_eq!(id, INIT_PID, "init did not land on pid 1");
     Ok(id)
 }
 
 /// [`spawn_init`] without the pid assertion, so the loader can be exercised
 /// before the slot layout is taken as given.
-pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnError> {
+pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<TaskId, SpawnError> {
     assert!(
         STARTED.load(Ordering::Relaxed),
         "spawn_init() was called before sched::init()"
     );
     let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
-    let user_rsp = initial_stack_rsp(argv).ok_or(SpawnError::ArgsTooBig)?;
+    let user_rsp = initial_stack_rsp(argv, env, "").ok_or(SpawnError::ArgsTooBig)?;
 
     with_table(|t| {
         let slot = INIT_PID.0;
@@ -555,7 +555,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnErro
         let stack = Stack::new();
         let mut space = AddressSpace::new();
         let (entry, frames, stack_top_frame) = load_user(&mut space, &image);
-        write_arg_block(stack_top_frame, user_rsp, argv, &image);
+        write_arg_block(stack_top_frame, user_rsp, argv, env, "", &image);
 
         let brk_base = image
             .segments
@@ -588,7 +588,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnErro
             parent: None,
             brk_base,
             brk_pages: 0,
-            mmap_cursor: crate::syscall::proc::MMAP_BASE,
+            mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
         });
         t.sched.push_ready(INIT_PID, Priority::NORMAL);
@@ -599,7 +599,10 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String]) -> Result<TaskId, SpawnErro
 /// [`spawn_user`] with arguments and a parent: the process form the `spawn`
 /// syscall uses. `argv` is the full argument vector, `argv[0]` being the
 /// program name as POSIX frames it - it does not have to match `bytes`' path.
-/// `exe` is the path `bytes` was read from, and is what `/proc/self/exe`
+/// `env` is the environment vector, laid out on the child's stack the way the
+/// Linux ABI does: `envp` follows the argv NULL, and is what a libc's
+/// `environ` and Rust's `env::var` read through. `exe` is the path `bytes`
+/// was read from, and is what `/proc/self/exe`
 /// reads through; spawn sites that know it pass it, kernel-internal starts
 /// that have no name for their image pass an empty string.
 ///
@@ -610,6 +613,7 @@ pub fn try_spawn_user(
     priority: Priority,
     parent: TaskId,
     argv: &[String],
+    env: &[String],
     redirects: &[Redirect],
     exe: &str,
 ) -> Result<TaskId, SpawnError> {
@@ -618,7 +622,7 @@ pub fn try_spawn_user(
         "spawn_user() was called before sched::init()"
     );
     let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
-    let user_rsp = initial_stack_rsp(argv).ok_or(SpawnError::ArgsTooBig)?;
+    let user_rsp = initial_stack_rsp(argv, env, exe).ok_or(SpawnError::ArgsTooBig)?;
 
     with_table(|t| {
         let slot = t.alloc_slot();
@@ -640,7 +644,7 @@ pub fn try_spawn_user(
         // the stack this task will land on, through the direct map. The top
         // frame is already in `frames` - `load_user` returns it separately
         // only so this write knows where the stack's page lives.
-        write_arg_block(stack_top_frame, user_rsp, argv, &image);
+        write_arg_block(stack_top_frame, user_rsp, argv, env, exe, &image);
         crate::println!(
             "[SPAWN] pid-slot={} argv={:?} rsp={:#x} top_frame={:#x}",
             slot,
@@ -702,7 +706,7 @@ pub fn try_spawn_user(
             parent: Some(parent),
             brk_base,
             brk_pages: 0,
-            mmap_cursor: crate::syscall::proc::MMAP_BASE,
+            mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::from(exe),
         });
         let id = TaskId(slot);
@@ -729,38 +733,70 @@ pub fn try_spawn_user(
 /// The Linux x86_64 ABI expects, from low to high addresses:
 ///
 /// ```text
-/// argc | argv[0..n] | NULL | NULL envp |
-/// AT_PHDR | AT_PHNUM | AT_PHENT | AT_ENTRY | AT_RANDOM | AT_PAGESZ | AT_BASE | AT_NULL |
-/// random bytes (16) | argv strings
+/// argc | argv[0..n] | NULL | envp[0..n] | NULL |
+/// AT_PHDR | AT_PHENT | AT_PHNUM | AT_PAGESZ | AT_BASE | AT_ENTRY |
+/// AT_UID | AT_EUID | AT_GID | AT_EGID | AT_HWCAP | AT_CLKTCK |
+/// AT_SECURE | AT_RANDOM | AT_EXECFN | AT_NULL |
+/// random bytes (16) | envp strings | argv strings
 /// ```
 ///
-/// The extra auxv entries let musl-based libc (and other Linux-compatible
-/// runtimes) find the program headers and initialise TLS on startup.
-fn initial_stack_rsp(argv: &[String]) -> Option<usize> {
-    if argv.len() > ARGV_MAX || argv.iter().map(|s| s.len() + 1).sum::<usize>() > ARGS_BYTES_MAX {
+/// The auxv entries let musl-based libc (and other Linux-compatible
+/// runtimes) find the program headers, initialise TLS and the stack guard,
+/// and answer `getuid`/`sysconf` without a syscall. This is the layout Rust
+/// std's `env::args()` and `env::var()` read through: a libc `main` receives
+/// `(argc, argv, envp)` off this block, and `environ` points at the `envp`
+/// array above it.
+const AUXV_WORDS: usize = 32; // 16 (type, value) pairs, AT_NULL included.
+
+fn initial_stack_rsp(argv: &[String], env: &[String], exe: &str) -> Option<usize> {
+    let arg_bytes: usize = argv.iter().map(|s| s.len() + 1).sum();
+    let env_bytes: usize = env.iter().map(|s| s.len() + 1).sum();
+    // The AT_EXECFN string: its own copy when the caller knows the path,
+    // nothing extra when argv[0] can serve, a lone NUL when neither exists.
+    let execfn_bytes: usize = if !exe.is_empty() {
+        exe.len() + 1
+    } else if argv.is_empty() {
+        1
+    } else {
+        0
+    };
+    if argv.len() > ARGV_MAX || arg_bytes + env_bytes + execfn_bytes > ARGS_BYTES_MAX {
         return None;
     }
-    let strings: usize = argv.iter().map(|s| s.len() + 1).sum();
     let argc = argv.len();
-    // argc, argv[0..argc], argv NULL, envp NULL, 8 auxv pairs (16 words).
-    let words_bytes = (argc + 19) * size_of::<usize>();
+    let envc = env.len();
+    // argc, argv[0..argc] + NULL, envp[0..envc] + NULL, auxv.
+    let words_bytes = (1 + argc + 1 + envc + 1 + AUXV_WORDS) * size_of::<usize>();
     // 16 bytes of random data for the AT_RANDOM auxv entry.
     let random_bytes = 16usize;
-    let total = words_bytes + random_bytes + strings;
+    let total = words_bytes + random_bytes + arg_bytes + env_bytes + execfn_bytes;
     let rsp = (USER_STACK_TOP - total) & !15;
     (USER_STACK_TOP - rsp <= PAGE_SIZE).then_some(rsp)
 }
 
 /// Fill the initial stack page with the argument block [`initial_stack_rsp`]
-/// laid out: random bytes and strings at the top, auxv, argv pointers and
-/// `argc` below them.
+/// laid out: random bytes and strings at the top, auxv, envp and argv
+/// pointers and `argc` below them.
 ///
 /// # Safety
 ///
 /// The frame must back the page at `USER_STACK_TOP - PAGE_SIZE`, and
 /// `user_rsp` must be the pointer [`initial_stack_rsp`] computed for the same
-/// `argv`, with the whole block inside that one page.
-fn write_arg_block(frame: usize, user_rsp: usize, argv: &[String], image: &elf::Image) {
+/// `argv` and `env`, with the whole block inside that one page.
+///
+/// `exe` is the execution path the `AT_EXECFN` entry points at, the string a
+/// libc derives `progname` from by scanning it for NUL. It must be
+/// NUL-terminated somewhere in the block: an `argv`-empty spawn with no path
+/// of its own falls back to an empty string, never to the random bytes, or
+/// the scan walks off the stack.
+fn write_arg_block(
+    frame: usize,
+    user_rsp: usize,
+    argv: &[String],
+    env: &[String],
+    exe: &str,
+    image: &elf::Image,
+) {
     let page =
         unsafe { core::slice::from_raw_parts_mut(mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE) };
     let from = user_rsp - (USER_STACK_TOP - PAGE_SIZE);
@@ -785,45 +821,91 @@ fn write_arg_block(frame: usize, user_rsp: usize, argv: &[String], image: &elf::
     ];
     page[random_at..random_at + 16].copy_from_slice(&random);
 
-    // Strings, descending from just below the random bytes.
+    // Strings, descending from just below the random bytes: argv first, then
+    // the environment, then the AT_EXECFN path.
     let mut string_at = random_at;
-    for arg in argv.iter() {
+    let mut argv0_vaddr = 0usize;
+    for (i, arg) in argv.iter().enumerate() {
         string_at -= arg.len() + 1;
         page[string_at..string_at + arg.len()].copy_from_slice(arg.as_bytes());
         page[string_at + arg.len()] = 0;
         // argv[i] pointer: virtual address of the string.
         let vaddr = (USER_STACK_TOP - PAGE_SIZE) + string_at;
+        if i == 0 {
+            argv0_vaddr = vaddr;
+        }
         page[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
         off += 8;
     }
+    // NULL argv terminator (zero-filled page).
+    off += size_of::<usize>();
 
-    // NULL argv terminator and NULL envp terminator (zero-filled page).
-    off += 2 * size_of::<usize>();
+    for var in env.iter() {
+        string_at -= var.len() + 1;
+        page[string_at..string_at + var.len()].copy_from_slice(var.as_bytes());
+        page[string_at + var.len()] = 0;
+        let vaddr = (USER_STACK_TOP - PAGE_SIZE) + string_at;
+        page[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
+        off += 8;
+    }
+    // NULL envp terminator (zero-filled page).
+    off += size_of::<usize>();
+
+    // The AT_EXECFN string: the path the program was executed through when
+    // the caller knew it, argv[0] itself when it did not, and an empty
+    // string when neither exists - the block must never point the libc's
+    // progname scan at unterminated data.
+    let execfn_vaddr = if !exe.is_empty() {
+        string_at -= exe.len() + 1;
+        page[string_at..string_at + exe.len()].copy_from_slice(exe.as_bytes());
+        page[string_at + exe.len()] = 0;
+        (USER_STACK_TOP - PAGE_SIZE) + string_at
+    } else if argv0_vaddr != 0 {
+        argv0_vaddr
+    } else {
+        string_at -= 1;
+        page[string_at] = 0;
+        (USER_STACK_TOP - PAGE_SIZE) + string_at
+    };
 
     // Auxiliary vector entries.
-    auxv(&mut page[off..], image, random_vaddr);
+    let aux_at = off;
+    auxv(&mut page[off..], image, random_vaddr, execfn_vaddr);
 
     // TEMP DEBUG: read the block back through the direct map and prove the
-    // write landed: argc, argv[0..2] pointers, first auxv type, and the
-    // page-table translation of the argc slot.
+    // write landed: argc, argv[0] pointer, first auxv type, and argv[0]'s own
+    // string - followed through the pointer, not taken from the page's last
+    // bytes, which are the random block and never valid UTF-8. Reading those
+    // instead is what made this line report a `Utf8Error` for a block that was
+    // perfectly good.
     let rb_argc = usize::from_le_bytes(page[from..from + 8].try_into().unwrap());
     let rb_argv0 = usize::from_le_bytes(page[from + 8..from + 16].try_into().unwrap());
-    let rb_aux0 = usize::from_le_bytes(
-        page[from + 8 + argc * 8 + 16..from + 16 + argc * 8 + 16]
-            .try_into()
-            .unwrap(),
-    );
+    let rb_aux0 = usize::from_le_bytes(page[aux_at..aux_at + 8].try_into().unwrap());
+    let base = USER_STACK_TOP - PAGE_SIZE;
+    let str0 = if (base..USER_STACK_TOP).contains(&rb_argv0) {
+        let tail = &page[rb_argv0 - base..];
+        let len = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        core::str::from_utf8(&tail[..len])
+    } else {
+        Ok("<no argv[0]>")
+    };
     crate::println!(
         "[ARGBLK] argc={} argv0={:#x} aux0={:#x} str0={:?}",
         rb_argc,
         rb_argv0,
         rb_aux0,
-        core::str::from_utf8(&page[PAGE_SIZE - 8..PAGE_SIZE])
+        str0
     );
 }
 
 /// Write the Linux auxiliary vector into `buf` as (type, value) u64 pairs.
-fn auxv(buf: &mut [u8], image: &elf::Image, random_vaddr: usize) {
+///
+/// The ids are the Linux `AT_*` numbers, so a Linux-built libc reads the
+/// vector without translation: program headers for TLS setup, page size and
+/// clock tick for `sysconf`, the identity fields for `getuid`-style calls,
+/// and 16 random bytes at `random_vaddr` for the stack guard. `execfn` is
+/// the virtual address of `argv[0]`'s string, what `AT_EXECFN` points at.
+fn auxv(buf: &mut [u8], image: &elf::Image, random_vaddr: usize, execfn: usize) {
     let mut off = 0usize;
 
     // Helper: write one auxv entry (type, value) and advance.
@@ -838,12 +920,20 @@ fn auxv(buf: &mut [u8], image: &elf::Image, random_vaddr: usize) {
     }
 
     entry!(3, image.phdr_addr); // AT_PHDR
-    entry!(5, image.phnum); // AT_PHNUM
     entry!(4, image.phent); // AT_PHENT
-    entry!(9, image.entry); // AT_ENTRY
-    entry!(25, random_vaddr); // AT_RANDOM
+    entry!(5, image.phnum); // AT_PHNUM
     entry!(6, PAGE_SIZE); // AT_PAGESZ
     entry!(7, 0usize); // AT_BASE (0 = no dynamic linker)
+    entry!(9, image.entry); // AT_ENTRY
+    entry!(11, 0usize); // AT_UID
+    entry!(12, 0usize); // AT_EUID
+    entry!(13, 0usize); // AT_GID
+    entry!(14, 0usize); // AT_EGID
+    entry!(16, 0usize); // AT_HWCAP
+    entry!(17, 100usize); // AT_CLKTCK
+    entry!(23, 0usize); // AT_SECURE (0 = not setuid)
+    entry!(25, random_vaddr); // AT_RANDOM
+    entry!(31, execfn); // AT_EXECFN
     entry!(0, 0usize); // AT_NULL
     let _ = off;
 }
@@ -1539,7 +1629,7 @@ pub fn brk(addr: usize) -> isize {
         // The heap may not walk into the mmap region: between the two lies the
         // hole that gives the address space its Linux shape. A break that far
         // up is a runaway allocation, not a request to honor.
-        if frontier >= crate::syscall::proc::MMAP_BASE {
+        if frontier >= crate::syscall::MMAP_BASE {
             return crate::syscall::err::ENOMEM;
         }
         let grown_to = task.brk_base + task.brk_pages * PAGE_SIZE;

@@ -9,11 +9,11 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::syscall::{ARG_COUNT, buffer_ok, cstr_arg, err, err_of};
+use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
 use crate::vfs::{Inode, Metadata, NodeKind};
 
 /// `openat`'s magic dirfd: the path is relative to the caller's cwd.
-const AT_FDCWD: i32 = -100;
+pub(super) const AT_FDCWD: i32 = -100;
 /// `fstatat` by descriptor: an empty path names the dirfd itself.
 const AT_EMPTY_PATH: usize = 0x1000;
 
@@ -228,16 +228,47 @@ pub(super) fn chdir(args: [usize; ARG_COUNT]) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
-    let canonical = super::super::fs::normalize_path(&path, &crate::sched::current_cwd_path());
+    let canonical = normalize_path(&path, &crate::sched::current_cwd_path());
     match crate::vfs::resolve(&canonical) {
         Ok(dir) if dir.metadata().kind == NodeKind::Dir => {
-            crate::sched::set_cwd(dir);
-            crate::sched::set_cwd_path(canonical);
+            adopt_cwd(dir, canonical);
             0
         }
         Ok(_) => err::ENOTDIR,
         Err(e) => err_of(e),
     }
+}
+
+/// The normalized absolute path `path` names, relative components resolved
+/// against `base`. `.` drops out, `..` pops one component, repeated slashes
+/// collapse — the shape `getcwd` owes and `chdir` remembers.
+fn normalize_path(path: &str, base: &str) -> alloc::string::String {
+    let joined = if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else if base.ends_with('/') {
+        alloc::format!("{base}{path}")
+    } else {
+        alloc::format!("{base}/{path}")
+    };
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for component in joined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return alloc::string::String::from("/");
+    }
+    let mut out = alloc::string::String::new();
+    for part in parts {
+        out.push('/');
+        out.push_str(part);
+    }
+    out
 }
 
 /// `unlinkat(dirfd, path, flags)` - `AT_REMOVEDIR` is accepted and ignored:
@@ -477,4 +508,401 @@ fn write_stat(buf: usize, meta: &Metadata) -> isize {
         // Timestamps (offsets 72..120) stay 0: no clock is kept per inode.
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// File-descriptor calls: the syscalls whose argument is an fd, not a path.
+// These are the same shape every libc hands its wrappers: (fd, ...) and
+// nothing more.
+// ---------------------------------------------------------------------------
+
+/// `read(2)` — read up to `buf.len()` bytes from `fd` into `buf`.
+pub(super) fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, buf, len) = (args[0], args[1], args[2]);
+    if !buffer_ok(buf, len, true, from_user) {
+        return if len > MAX_IO {
+            err::EINVAL
+        } else {
+            err::EFAULT
+        };
+    }
+    if len == 0 {
+        return match crate::vfs::read(fd as i32, &mut []) {
+            Ok(_) => 0,
+            Err(e) => err_of(e),
+        };
+    }
+    let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+    match crate::vfs::read(fd as i32, bytes) {
+        Ok(n) => n as isize,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `write(2)` — write `buf` to `fd`.
+pub(super) fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, buf, len) = (args[0], args[1], args[2]);
+    if !buffer_ok(buf, len, false, from_user) {
+        return if len > MAX_IO {
+            err::EINVAL
+        } else {
+            err::EFAULT
+        };
+    }
+    if len == 0 {
+        return match crate::vfs::write(fd as i32, &[]) {
+            Ok(_) => 0,
+            Err(e) => err_of(e),
+        };
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+    match crate::vfs::write(fd as i32, bytes) {
+        Ok(n) => n as isize,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `close(2)` — close `fd`.
+pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
+    match crate::vfs::close(args[0] as i32) {
+        Ok(()) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `lseek(fd, offset, whence)` — move the file position.
+///
+/// `whence` is `SEEK_SET` (0), `SEEK_CUR` (1), `SEEK_END` (2). Anything
+/// else, or a position that would land before byte 0, is `EINVAL` rather
+/// than wrapping — the same refusal the man page spells out.
+pub(super) fn handle_lseek(args: [usize; ARG_COUNT]) -> isize {
+    let (fd, offset, whence) = (args[0] as i32, args[1] as i64, args[2] as i32);
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    let cur = file.pos() as i64;
+    let size = file.metadata().size as i64;
+    let new_pos = match whence {
+        0 => Some(offset),
+        1 => cur.checked_add(offset),
+        2 => size.checked_add(offset),
+        _ => None,
+    };
+    match new_pos {
+        Some(pos) if pos >= 0 => {
+            file.set_pos(pos as u64);
+            pos as isize
+        }
+        _ => err::EINVAL,
+    }
+}
+
+/// `getdents64(fd, buf, len)` — Linux directory listing format.
+pub(super) fn handle_getdents64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, buf, buf_len) = (args[0] as i32, args[1], args[2]);
+    if !buffer_ok(buf, buf_len, true, from_user) {
+        return err::EFAULT;
+    }
+
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    let entries = match file.inode().read_dir() {
+        Ok(e) => e,
+        Err(e) => return err_of(e),
+    };
+    let start = file.pos() as usize;
+    if start >= entries.len() {
+        return 0;
+    }
+
+    // Linux getdents64 format:
+    //   u64 d_ino, u64 d_off, u16 d_reclen, u8 d_type, u8 d_name[NUL] (8-aligned).
+    let mut offset = 0usize;
+    for (idx, (name, kind)) in entries.iter().enumerate().skip(start) {
+        let reclen = (19 + name.len() + 1 + 7) & !7;
+        if offset + reclen > buf_len {
+            if offset == 0 {
+                return err::EINVAL;
+            }
+            break;
+        }
+        let d_type = match kind {
+            crate::vfs::NodeKind::File => 8,
+            crate::vfs::NodeKind::Dir => 4,
+            crate::vfs::NodeKind::CharDev => 2,
+        };
+        unsafe {
+            let base = (buf + offset) as *mut u8;
+            (base as *mut u64).write_volatile(idx as u64 + 1);
+            ((base.add(8)) as *mut u64).write_volatile((idx + 1) as u64);
+            ((base.add(16)) as *mut u16).write_volatile(reclen as u16);
+            base.add(18).write_volatile(d_type);
+            let name_bytes = name.as_bytes();
+            core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), base.add(19), name_bytes.len());
+            base.add(19 + name_bytes.len()).write_volatile(0);
+        }
+        offset += reclen;
+        file.set_pos((idx + 1) as u64);
+    }
+    offset as isize
+}
+
+/// `dup(oldfd)` — duplicate onto the lowest free fd.
+pub(super) fn handle_dup(args: [usize; ARG_COUNT]) -> isize {
+    let old = args[0] as i32;
+    let file = match crate::sched::current_fds().clone_at(old) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    crate::sched::current_fds().install(file) as isize
+}
+
+/// `dup2(oldfd, newfd)` — make `newfd` name what `oldfd` names.
+pub(super) fn handle_dup2(args: [usize; ARG_COUNT]) -> isize {
+    let (old, new) = (args[0] as i32, args[1] as i32);
+    if new < 0 {
+        return err::EBADF;
+    }
+    match crate::vfs::dup2(old, new) {
+        Ok(fd) => fd as isize,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `dup3(oldfd, newfd, flags)` — `dup2` with `O_CLOEXEC`.
+///
+/// `old == new` is `EINVAL`, the only flag accepted is `O_CLOEXEC`, anything
+/// else is `EINVAL`.
+pub(super) fn handle_dup3(args: [usize; ARG_COUNT]) -> isize {
+    const O_CLOEXEC: i32 = 0o200_0000;
+    let (old, new, flags) = (args[0] as i32, args[1] as i32, args[2] as i32);
+    if old == new || flags & !O_CLOEXEC != 0 {
+        return err::EINVAL;
+    }
+    let file = match crate::sched::current_fds().clone_at(old) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    match crate::sched::current_fds().install_at(file, new) {
+        Ok(()) => new as isize,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `pipe(fds)` — write `[read_end, write_end]` into `fds`.
+pub(super) fn handle_pipe(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let out = args[0];
+    if out == 0 || !buffer_ok(out, 2 * core::mem::size_of::<i32>(), true, from_user) {
+        return err::EFAULT;
+    }
+    let (read_end, write_end) = crate::vfs::pipe::pair();
+    let fds = [
+        crate::vfs::file::open_inode(read_end),
+        crate::vfs::file::open_inode(write_end),
+    ];
+    unsafe {
+        let slot = out as *mut i32;
+        slot.write(fds[0]);
+        slot.add(1).write(fds[1]);
+    }
+    0
+}
+
+/// `getcwd(buf, size)` — write cwd path into buffer.
+pub(super) fn handle_getcwd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (buf, size) = (args[0], args[1]);
+    if !buffer_ok(buf, size, true, from_user) || size < 2 {
+        return err::EINVAL;
+    }
+    let path = crate::sched::current_cwd_path();
+    if path.len() + 1 > size {
+        return err::ERANGE;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(path.as_ptr(), buf as *mut u8, path.len());
+        *((buf + path.len()) as *mut u8) = 0;
+    }
+    buf as isize
+}
+
+/// `fchdir(fd)` — change cwd to the directory the descriptor names.
+pub(super) fn handle_fchdir(args: [usize; ARG_COUNT]) -> isize {
+    let fd = args[0] as i32;
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    if file.metadata().kind != crate::vfs::NodeKind::Dir {
+        return err::ENOTDIR;
+    }
+    let inode = file.inode();
+    let path = path_of(&inode).unwrap_or_else(|| alloc::string::String::from("/"));
+    adopt_cwd(inode, path);
+    0
+}
+
+/// `ioctl(fd, request, arg)` — terminal queries, stub the rest.
+pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (_fd, request) = (args[0] as i32, args[1] as u32);
+    match request {
+        0x5413 => {
+            // TIOCGWINSZ: report 80x25.
+            let buf = args[2];
+            if buffer_ok(buf, 8, true, from_user) {
+                unsafe {
+                    (buf as *mut u16).write_volatile(25);
+                    (buf as *mut u16).add(1).write_volatile(80);
+                    (buf as *mut u16).add(2).write_volatile(0);
+                    (buf as *mut u16).add(3).write_volatile(0);
+                }
+                0
+            } else {
+                err::EFAULT
+            }
+        }
+        0x5401 => {
+            // TCGETS: minimal termios, all zeroed.
+            let buf = args[2];
+            if buffer_ok(buf, 60, true, from_user) {
+                unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 60) };
+                0
+            } else {
+                err::EFAULT
+            }
+        }
+        0x5402 => 0, // TCSETS
+        _ => err::ENOTTY,
+    }
+}
+
+/// `writev(fd, iov, iovcnt)` — scatter write.
+pub(super) fn handle_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, iov_ptr, iov_cnt) = (args[0] as i32, args[1], args[2]);
+    if iov_cnt > 1024 {
+        return err::EINVAL;
+    }
+    let iov_size = 16;
+    if !buffer_ok(iov_ptr, iov_cnt * iov_size, false, from_user) {
+        return err::EFAULT;
+    }
+
+    let mut total: isize = 0;
+    for i in 0..iov_cnt {
+        let base = iov_ptr + i * iov_size;
+        let (ptr, len): (usize, usize) = unsafe {
+            (
+                (base as *const usize).read(),
+                ((base + 8) as *const usize).read(),
+            )
+        };
+        if len == 0 {
+            continue;
+        }
+        if !buffer_ok(ptr, len, false, from_user) {
+            return err::EFAULT;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+        match crate::vfs::write(fd, bytes) {
+            Ok(n) => total += n as isize,
+            Err(e) => {
+                if total > 0 {
+                    return total;
+                }
+                return err_of(e);
+            }
+        }
+    }
+    total
+}
+
+/// `readv(fd, iov, iovcnt)` — scatter read.
+pub(super) fn handle_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, iov_ptr, iov_cnt) = (args[0] as i32, args[1], args[2]);
+    if iov_cnt > 1024 {
+        return err::EINVAL;
+    }
+    let iov_size = 16;
+    if !buffer_ok(iov_ptr, iov_cnt * iov_size, false, from_user) {
+        return err::EFAULT;
+    }
+
+    let mut total: isize = 0;
+    for i in 0..iov_cnt {
+        let base = iov_ptr + i * iov_size;
+        let (ptr, len): (usize, usize) = unsafe {
+            (
+                (base as *const usize).read(),
+                ((base + 8) as *const usize).read(),
+            )
+        };
+        if len == 0 {
+            continue;
+        }
+        if !buffer_ok(ptr, len, true, from_user) {
+            return err::EFAULT;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+        match crate::vfs::read(fd, bytes) {
+            Ok(n) => {
+                total += n as isize;
+                if n < len {
+                    break;
+                }
+            }
+            Err(e) => {
+                if total > 0 {
+                    return total;
+                }
+                return err_of(e);
+            }
+        }
+    }
+    total
+}
+
+/// Walk `/` looking for the path that reaches `target`. Used by `fchdir` to
+/// give the new cwd a name `getcwd` can read back.
+fn path_of(target: &Arc<dyn Inode>) -> Option<alloc::string::String> {
+    use crate::vfs::NodeKind;
+    fn walk(
+        dir: &Arc<dyn Inode>,
+        prefix: &str,
+        target: &Arc<dyn Inode>,
+        depth: usize,
+    ) -> Option<alloc::string::String> {
+        if Arc::ptr_eq(dir, target) {
+            return Some(alloc::string::String::from(prefix));
+        }
+        if depth == 0 {
+            return None;
+        }
+        for (name, kind) in dir.read_dir().ok()? {
+            if kind != NodeKind::Dir {
+                continue;
+            }
+            let child = if prefix == "/" {
+                alloc::format!("/{name}")
+            } else {
+                alloc::format!("{prefix}/{name}")
+            };
+            if let Ok(inode) = crate::vfs::resolve(&child)
+                && let Some(found) = walk(&inode, &child, target, depth - 1)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let root = crate::vfs::global().root_inode();
+    walk(&root, "/", target, 16)
+}
+
+/// Record the cwd inode + path together, so `getcwd` reads back the path
+/// the user wrote.
+fn adopt_cwd(dir: Arc<dyn Inode>, path: alloc::string::String) {
+    crate::sched::set_cwd(dir);
+    crate::sched::set_cwd_path(path);
 }

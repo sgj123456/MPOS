@@ -48,23 +48,43 @@ unsafe impl Sync for TssCell {}
 
 static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
 
-/// The top of the current task's kernel stack, mirrored from `RSP0` so the
-/// `syscall` fast path - which the CPU does *not* switch onto a kernel stack
-/// the way an interrupt does - can find it without touching the TSS. The
-/// `syscall` entry reads this through `IA32_KERNEL_GS_BASE` after `swapgs`;
-/// `set_kernel_stack` keeps it in lock-step with `RSP0` on every dispatch.
-struct RspCell(UnsafeCell<usize>);
+/// The two words the `syscall` entry needs before it has anything else: a
+/// kernel stack to push on, and somewhere to put a register while it gets
+/// there. Both are reached through `IA32_KERNEL_GS_BASE`, which a `swapgs`
+/// swaps for the user's GS base - so this is what the entry stub sees as
+/// `gs:[0]` and `gs:[8]`, at exactly those offsets (`repr(C)`, and the entry
+/// stub spells them as numbers).
+#[repr(C)]
+struct EntryScratch {
+    /// Top of the current task's kernel stack, mirrored from `RSP0` so the
+    /// `syscall` fast path - which the CPU does *not* switch onto a kernel
+    /// stack the way an interrupt does - can find it without touching the TSS.
+    /// `set_kernel_stack` keeps it in lock-step with `RSP0` on every dispatch.
+    kernel_rsp: UnsafeCell<usize>,
+    /// The entry stub's parking slot. `syscall` switches no stack, so the
+    /// caller's RSP has to outlive the load that moves the CPU onto the kernel
+    /// one - and it has to do so *without a register*: every general-purpose
+    /// register at that point holds a caller value the syscall ABI promises to
+    /// return unchanged, `r12` included. Borrowing one of them corrupts user
+    /// code that kept a live value there across the call.
+    entry_rsp: UnsafeCell<usize>,
+}
 
-// Safety: one core. Every write happens inside the scheduler with interrupts
-// off; the `syscall` entry's read is a single `mov` in the same core's ring 0.
-unsafe impl Sync for RspCell {}
+// Safety: one core - the same assumption the TSS above rests on. Every write
+// to `kernel_rsp` happens inside the scheduler with interrupts off; the entry
+// stub's own write to `entry_rsp` and its read back are one uninterrupted
+// stretch of the same core's ring 0, because `syscall` enters with IF clear.
+unsafe impl Sync for EntryScratch {}
 
-static CURRENT_KERNEL_RSP: RspCell = RspCell(UnsafeCell::new(0));
+static ENTRY_SCRATCH: EntryScratch = EntryScratch {
+    kernel_rsp: UnsafeCell::new(0),
+    entry_rsp: UnsafeCell::new(0),
+};
 
-/// The address `IA32_KERNEL_GS_BASE` points at. A `swapgs` in the `syscall`
-/// entry swaps this for the user's GS base, exposing `CURRENT_KERNEL_RSP`.
-pub fn current_kernel_rsp_addr() -> u64 {
-    &CURRENT_KERNEL_RSP as *const RspCell as u64
+/// The address `IA32_KERNEL_GS_BASE` points at: what a `swapgs` in the
+/// `syscall` entry swaps the user's GS base for.
+pub fn entry_scratch_addr() -> u64 {
+    &ENTRY_SCRATCH as *const EntryScratch as u64
 }
 
 pub fn init() {
@@ -113,7 +133,7 @@ pub fn set_kernel_stack(top: usize) {
         tss.privilege_stack_table[0] = VirtAddr::new(top as u64);
         // Keep the `syscall` fast path's view of the kernel stack in step with
         // the TSS; `swapgs` in the entry exposes this to kernel code.
-        *CURRENT_KERNEL_RSP.0.get() = top;
+        *ENTRY_SCRATCH.kernel_rsp.get() = top;
     }
 }
 

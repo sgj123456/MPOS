@@ -1,24 +1,32 @@
 //! init: the first process, and the last one standing.
 //!
-//! It has one job - keep a shell available. It starts /bin/sh, waits for it to
-//! end, and starts another, forever. That is what makes the machine usable the
-//! way a real one is: the shell can crash, or be ended with Ctrl-D, and the
-//! next prompt appears instead of the system stopping.
+//! It has one job - keep a shell available. The Linux shape is `fork` then
+//! `execve` in the child and `wait4` in the parent. On mpos `fork(2)` answers
+//! ENOSYS, and `execve` cannot swap a live task's image, so `execve` here is
+//! the kernel's spawn shape: it starts /bin/sh as a *child* of init and
+//! answers the child's pid. init then waits for that child and starts another
+//! when it ends - which is what makes the machine keep a shell up.
 //!
 //! It is also where every orphan ends up: when a process's parent dies first,
-//! the kernel hands its children to init, and init reaps them here. That is
-//! why the wait below asks for *any* child rather than for the shell by pid.
+//! the kernel hands its children to init, and init reaps them here.
+//!
+//! musl programs that statically link and use their own `__libc_start_main`
+//! expect `AT_PHDR`, `AT_RANDOM`, `AT_EXECFN`, `AT_BASE`, and the rest of
+//! the Linux auxv - mpos lays those out the way Linux does, which is what
+//! makes execve from a musl-built shell into another musl-built program work.
 
 #![no_std]
 #![no_main]
 
-#[path = "../lib/sys.rs"]
-mod sys;
+#[path = "../lib/lin.rs"]
+mod lin;
 
 use core::panic::PanicInfo;
 
 /// Where the shell lives. There is no PATH yet, so this is the whole name.
-const SHELL: &[u8] = b"/bin/sh";
+/// NUL-terminated: `execve` on the other side walks until it finds a NUL, and
+/// a Rust `&[u8]` slice carries no terminator of its own.
+const SHELL: &[u8] = b"/bin/sh\0";
 
 /// How long to wait before trying the shell again, and how far that wait may
 /// grow. A shell that cannot be started at all would otherwise be retried in a
@@ -31,14 +39,19 @@ const RETRY_MAX_MS: usize = 8000;
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     banner();
 
+    // The argv the shell sees: argv[0] is its own name, what every libc's
+    // program_invocation_short_name reads.
+    let argv: [*const u8; 2] = [b"sh\0".as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 1] = [core::ptr::null()];
+
     let mut backoff = RETRY_MS;
     loop {
-        let pid = sys::spawn(SHELL, &[b"sh"]);
+        let pid = lin::execve(SHELL.as_ptr(), argv.as_ptr(), envp.as_ptr());
         if pid < 0 {
-            let _ = sys::write_all(2, b"init: cannot start ");
-            let _ = sys::write_all(2, SHELL);
-            let _ = sys::write_all(2, b"\n");
-            sys::sleep_ms(backoff);
+            let _ = lin::write_all(2, b"init: cannot start ");
+            let _ = lin::write_all(2, SHELL);
+            let _ = lin::write_all(2, b"\n");
+            sleep_ms(backoff);
             backoff = (backoff * 2).min(RETRY_MAX_MS);
             continue;
         }
@@ -48,19 +61,33 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
         // -1 is "any child": the shell, or one of the orphans the kernel has
         // handed over, so they are reaped rather than piling up as records.
-        let _ = sys::wait(-1);
-        let _ = sys::write_all(2, b"init: shell exited, starting another\n");
+        let _ = lin::wait4(usize::MAX, core::ptr::null_mut(), 0);
+        let _ = lin::write_all(2, b"init: shell exited, starting another\n");
     }
+}
+
+/// Sleep for `ms` milliseconds through `nanosleep(2)`.
+fn sleep_ms(ms: usize) {
+    let ts = lin::TimeSpec {
+        tv_sec: (ms / 1000) as i64,
+        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
+    };
+    let mut rem = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let _ = lin::nanosleep(&ts, &mut rem);
 }
 
 /// The one line init prints for itself, so a boot log shows who pid 1 is.
 fn banner() {
-    let _ = sys::write_all(1, b"mpos init: pid ");
+    let _ = lin::write_all(1, b"mpos init: pid ");
     let mut digits = [0u8; 8];
-    let _ = sys::write_all(1, &decimal(sys::getpid(), &mut digits));
-    let _ = sys::write_all(1, b", starting ");
-    let _ = sys::write_all(1, SHELL);
-    let _ = sys::write_all(1, b"\n");
+    let _ = lin::write_all(1, &decimal(lin::getpid() as isize, &mut digits));
+    let _ = lin::write_all(1, b", starting ");
+    // SHELL carries a NUL for execve's benefit; the banner wants the name.
+    let _ = lin::write_all(1, &SHELL[..SHELL.len() - 1]);
+    let _ = lin::write_all(1, b"\n");
 }
 
 /// `value` in decimal, written back to front into `buf`. The largest pid
@@ -81,5 +108,5 @@ fn decimal(value: isize, buf: &mut [u8; 8]) -> &[u8] {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    sys::abort()
+    lin::die(b"init: panicked\n")
 }

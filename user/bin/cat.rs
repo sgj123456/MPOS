@@ -1,57 +1,55 @@
 //! cat: every file named on the command line, in order, to fd 1. With no
 //! arguments it copies stdin, the way the manual says.
+//!
+//! A Rust `std` program, built for `x86_64-unknown-linux-musl`: `std::fs`,
+//! `std::io` and `std::env` reach the kernel through musl, over the Linux
+//! startup contract the kernel lays out for any Linux binary. Nothing here
+//! knows mpos exists - which is the point of the std-built programs in this
+//! directory, and what `t_stdargs` pins from the other side.
 
-#![no_std]
-#![no_main]
+use std::fs::File;
+use std::io::{self, ErrorKind, Read, Write};
+use std::process::ExitCode;
 
-#[path = "../lib/sys.rs"]
-mod sys;
-
-use core::panic::PanicInfo;
-
-#[unsafe(no_mangle)]
-extern "C" fn mpos_user_main(argc: usize, argv: *const *const u8) -> ! {
-    let args = sys::Args { argc, argv };
+fn main() -> ExitCode {
+    let mut out = io::stdout().lock();
+    let mut names = std::env::args_os().skip(1).peekable();
     let mut failed = false;
 
-    if argc <= 1 {
-        failed = copy(0) < 0;
+    if names.peek().is_none() {
+        // No operands: stdin is the file, as POSIX says.
+        let mut stdin = io::stdin();
+        failed = copy_to(&mut stdin.lock(), &mut out).is_err();
     } else {
-        for i in 1..argc {
-            let name = args.get(i);
-            let fd = sys::open(name);
-            if fd < 0 {
-                let _ = sys::write_all(2, b"cat: ");
-                let _ = sys::write_all(2, name);
-                let _ = sys::write_all(2, b": cannot open\n");
-                failed = true;
-                continue;
+        for name in names {
+            match File::open(&name) {
+                Ok(mut file) => failed |= copy_to(&mut file, &mut out).is_err(),
+                Err(_) => {
+                    // The operand is reported as it was given: a name that is
+                    // not valid UTF-8 is still a name.
+                    let _ = writeln!(io::stderr(), "cat: {}: cannot open", name.to_string_lossy());
+                    failed = true;
+                }
             }
-            if copy(fd) < 0 {
-                failed = true;
-            }
-            let _ = sys::close(fd as i32);
         }
     }
 
-    sys::exit(if failed { 1 } else { 0 });
+    // A write that only reached the buffer is not a write yet.
+    failed |= out.flush().is_err();
+    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
-/// stdin to stdout for one descriptor, until end of input or error.
-fn copy(fd: isize) -> isize {
-    let mut buf = [0u8; 256];
+/// One reader to stdout, until end of input or the first real error. A short
+/// read is not the end - only a zero-length one is, which is what a pipe hands
+/// back once its write end is gone.
+fn copy_to(input: &mut impl Read, out: &mut impl Write) -> io::Result<()> {
+    let mut buf = [0u8; 4096];
     loop {
-        let n = sys::read(fd as i32, &mut buf);
-        if n <= 0 {
-            return n;
-        }
-        if sys::write_all(1, &buf[..n as usize]) < 0 {
-            return -1;
+        match input.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => out.write_all(&buf[..n])?,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
-}
-
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
-    sys::abort()
 }

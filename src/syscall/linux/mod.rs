@@ -1,9 +1,10 @@
-//! Linux x86_64 syscall number mapping and new POSIX handlers.
+//! Linux x86_64 syscall number mapping and POSIX handlers.
 //!
 //! When a program compiled for Linux (`x86_64-unknown-linux-musl`) runs on
 //! mpos, it enters through the `syscall` instruction with Linux numbers.
-//! This module maps those numbers onto the existing mpos handlers where
-//! possible and implements the rest.
+//! This module maps those numbers onto handlers in [`super::proc`]
+//! (Linux-compatible memory/process/time calls) and [`fs`] (path-carrying
+//! calls in Linux argument shapes).
 
 pub mod nr;
 
@@ -12,8 +13,15 @@ pub mod nr;
 #[cfg(target_os = "none")]
 pub mod fs;
 
+/// Linux-compatible memory and process handlers (mmap/munmap/mremap/brk,
+/// execve/exit/wait, getpid/kill, nanosleep, ...). Kept here at the same
+/// level as `fs` so the dispatch can reach both without the deleted custom
+/// modules they used to share a parent with.
 #[cfg(target_os = "none")]
-pub fn dispatch(nr: u64, args: [usize; 6]) -> isize {
+pub(crate) mod proc;
+
+#[cfg(target_os = "none")]
+pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool) -> isize {
     // Trace the first 30 syscalls per process for musl debug.
     static SYSCALL_COUNTS: [core::sync::atomic::AtomicUsize; 64] =
         const { [const { core::sync::atomic::AtomicUsize::new(0) }; 64] };
@@ -36,87 +44,102 @@ pub fn dispatch(nr: u64, args: [usize; 6]) -> isize {
 
     match nr {
         // --- file I/O: Linux argument shapes ---
-        nr::READ => super::fs::handle_read(args, true),
-        nr::WRITE => super::fs::handle_write(args, true),
+        nr::READ => fs::handle_read(args, from_user),
+        nr::WRITE => fs::handle_write(args, from_user),
         nr::OPEN => fs::open(args, &cwd()),
         nr::OPENAT => fs::openat(args, &cwd()),
-        nr::CLOSE => super::fs::handle_close(args),
+        nr::CLOSE => fs::handle_close(args),
         nr::FSTAT => fs::fstat(args),
         nr::NEWFSTATAT => fs::newfstatat(args, &cwd()),
         nr::STATX => fs::statx(args, &cwd()),
-        nr::LSEEK => super::fs::handle_lseek(args),
-        nr::GETDENTS64 => super::fs::handle_getdents64(args, true),
-        nr::DUP => super::fs::handle_dup(args),
-        nr::DUP2 => super::fs::handle_dup2(args),
-        nr::DUP3 => super::fs::handle_dup3(args),
-        nr::PIPE => super::fs::handle_pipe(args, true),
+        nr::LSEEK => fs::handle_lseek(args),
+        nr::GETDENTS64 => fs::handle_getdents64(args, from_user),
+        nr::DUP => fs::handle_dup(args),
+        nr::DUP2 => fs::handle_dup2(args),
+        nr::DUP3 => fs::handle_dup3(args),
+        nr::PIPE => fs::handle_pipe(args, from_user),
         nr::PIPE2 => {
             const O_CLOEXEC: usize = 0o200_0000;
             if args[1] & !O_CLOEXEC != 0 {
                 err::EINVAL
             } else {
-                super::fs::handle_pipe(args, true)
+                fs::handle_pipe(args, from_user)
             }
         }
         nr::UNLINKAT => fs::unlinkat(args, &cwd()),
+        // The legacy path forms, man(2) conventions musl/glibc call: each is
+        // its *at equivalent at the caller's cwd.
+        nr::UNLINK => fs::unlinkat([fs::AT_FDCWD as usize, args[0], 0, 0, 0, 0], &cwd()),
+        nr::MKDIR => fs::mkdirat([fs::AT_FDCWD as usize, args[0], args[1], 0, 0, 0], &cwd()),
+        nr::RENAME => fs::renameat2(
+            [
+                fs::AT_FDCWD as usize,
+                args[0],
+                fs::AT_FDCWD as usize,
+                args[1],
+                0,
+                0,
+            ],
+            &cwd(),
+        ),
         nr::MKDIRAT => fs::mkdirat(args, &cwd()),
         nr::RENAMEAT2 => fs::renameat2(args, &cwd()),
-        nr::GETCWD => super::fs::handle_getcwd(args, true),
+        nr::GETCWD => fs::handle_getcwd(args, from_user),
         nr::CHDIR => fs::chdir(args),
-        nr::FCHDIR => super::fs::handle_fchdir(args),
+        nr::FCHDIR => fs::handle_fchdir(args),
         nr::FCNTL => fs::fcntl(args),
-        nr::IOCTL => super::fs::handle_ioctl(args, true),
-        nr::WRITEV => super::fs::handle_writev(args, true),
-        nr::READV => super::fs::handle_readv(args, true),
+        nr::IOCTL => fs::handle_ioctl(args, from_user),
+        nr::WRITEV => fs::handle_writev(args, from_user),
+        nr::READV => fs::handle_readv(args, from_user),
         nr::ACCESS => fs::access(args, &cwd()),
         nr::FACCESSAT => fs::faccessat(args, &cwd()),
         nr::READLINK => fs::readlink(args, &cwd()),
 
         // --- process ---
-        nr::EXECVE => super::proc::handle_execve(args, &cwd()),
-        nr::EXIT => super::proc::handle_exit(args),
-        nr::EXIT_GROUP => super::proc::handle_exit(args),
+        nr::EXECVE => proc::handle_execve(args, &cwd()),
+        nr::EXIT => proc::handle_exit(args),
+        nr::EXIT_GROUP => proc::handle_exit(args),
         // Linux's wait4 is (pid, *status, options): the options word sits in
         // slot 2, where mpos's own wait keeps none. Reshape before reusing the
         // handler, or the status pointer is read as the flags.
-        nr::WAIT4 => super::proc::handle_wait([args[0], args[2], 0, 0, 0, 0]),
-        nr::GETPID => super::proc::handle_getpid(),
-        nr::GETTID => super::proc::handle_getpid(),
-        nr::GETPPID => super::proc::handle_getppid(),
-        nr::YIELD => super::proc::handle_yield(),
-        nr::NANOSLEEP => super::proc::handle_nanosleep(args),
-        nr::CLOCK_NANOSLEEP => super::proc::handle_clock_nanosleep(args),
-        nr::KILL => super::proc::handle_kill(args),
-        nr::TKILL => super::proc::handle_kill(args),
-        nr::FORK => super::proc::handle_fork(args),
+        nr::WAIT4 => proc::handle_wait([args[0], args[2], 0, 0, 0, 0]),
+        nr::GETPID => proc::handle_getpid(),
+        nr::GETTID => proc::handle_getpid(),
+        nr::GETPPID => proc::handle_getppid(),
+        nr::SCHED_YIELD => proc::handle_yield(),
+        nr::NANOSLEEP => proc::handle_nanosleep(args, from_user),
+        nr::CLOCK_NANOSLEEP => proc::handle_clock_nanosleep(args, from_user),
+        nr::KILL => proc::handle_kill(args),
+        nr::TKILL => proc::handle_kill(args),
+        nr::FORK => proc::handle_fork(args),
 
         // --- memory ---
-        nr::BRK => super::proc::handle_brk(args),
-        nr::MMAP => super::proc::handle_mmap(args),
-        nr::MUNMAP => super::proc::handle_munmap(args),
-        nr::MPROTECT => super::proc::handle_mprotect(args),
-        nr::MREMAP => super::proc::handle_mremap(args),
+        nr::BRK => proc::handle_brk(args),
+        nr::MMAP => proc::handle_mmap(args),
+        nr::MUNMAP => proc::handle_munmap(args),
+        nr::MPROTECT => proc::handle_mprotect(args),
+        nr::MREMAP => proc::handle_mremap(args),
         nr::MADVISE => 0, // stub: success
 
         // --- stubs ---
         nr::POLL | nr::PPOLL => fs::poll(args),
         nr::SIGALTSTACK => sigaltstack(args),
-        nr::CLOCK_GETTIME => super::proc::handle_clock_gettime(args),
-        nr::GETTIMEOFDAY => super::proc::handle_gettimeofday(args),
-        nr::UNAME => super::proc::handle_uname(args, true),
+        nr::CLOCK_GETTIME => proc::handle_clock_gettime(args),
+        nr::GETTIMEOFDAY => proc::handle_gettimeofday(args),
+        nr::UNAME => proc::handle_uname(args, true),
         nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => 0,
         nr::SETUID | nr::SETGID | nr::SETEUID | nr::SETSID => err::EPERM,
         nr::RT_SIGACTION => sigaction(args),
         nr::RT_SIGPROCMASK => rt_sigprocmask(args),
         nr::RT_SIGRETURN => 0,
         nr::ARCH_PRCTL => handle_arch_prctl(args),
-        nr::GETRANDOM => super::proc::handle_getrandom(args, true),
-        nr::PRLIMIT64 => super::proc::handle_prlimit64(args, true),
-        nr::FUTEX => super::proc::handle_futex(args),
-        nr::SET_TID_ADDRESS => super::proc::handle_getpid(),
-        nr::SCHED_GETAFFINITY => super::proc::handle_sched_getaffinity(args),
-        nr::SET_ROBUST_LIST => super::proc::handle_set_robust_list(args),
-        nr::RSEQ => super::proc::handle_rseq(args),
+        nr::GETRANDOM => proc::handle_getrandom(args, true),
+        nr::PRLIMIT64 => proc::handle_prlimit64(args, true),
+        nr::FUTEX => proc::handle_futex(args),
+        nr::SET_TID_ADDRESS => proc::handle_getpid(),
+        nr::SCHED_GETAFFINITY => proc::handle_sched_getaffinity(args),
+        nr::SET_ROBUST_LIST => proc::handle_set_robust_list(args),
+        nr::RSEQ => proc::handle_rseq(args),
         nr::CLEANUP_AFTER_KTHREAD => 0,
 
         _ => super::err::ENOSYS,

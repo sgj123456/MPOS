@@ -1,3 +1,6 @@
 /target
 /build
 /third_party/limine
+
+.Trash-0/
+.workbuddy/

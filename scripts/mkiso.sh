@@ -43,15 +43,18 @@ if [[ "$ARCH" == "x86_64" ]]; then
     # The user programs: compiled standalone with rustc rather than through
     # cargo, so they do not inherit the kernel's linker script. Statically
     # linked at a fixed base - exactly the ET_EXEC image the kernel's loader
-    # accepts. Each includes the kernel's syscall table by path, so the two
-    # can never disagree about a number; the shared libc in user/lib comes
-    # along the same way.
+    # accepts. Two kinds live here, and the case below picks between them: the
+    # mpos-native programs, which include the kernel's syscall table by path so
+    # the two can never disagree about a number and take the shared libc in
+    # user/lib along the same way; and the Linux ones, which are built for musl
+    # and reach the kernel through a real libc's own startup - those are the
+    # programs that hold the Linux ABI honest.
     USERBIN="$STAGE/userbin"
     mkdir -p "$USERBIN"
     for src in "$ROOT"/user/bin/*.rs; do
         name="$(basename "$src" .rs)"
         case "$name" in
-            true|false|hello)
+            cat|echo|false|hello|t_stdargs|true)
                 rustc --edition 2024 \
                     --target x86_64-unknown-linux-musl \
                     -C target-feature=+crt-static \

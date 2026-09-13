@@ -16,6 +16,12 @@
 //! register block the dispatch wants, calls Rust, stores the result back
 //! over the saved `rax`, and `sysretq` restores the rest itself.
 //!
+//! What it must not do is borrow a register: the Linux ABI leaves rbp, rbx,
+//! r12-r15 and RSP to user code, so the stack switch parks the caller's RSP in
+//! the `swapgs` scratch instead of in r12 - see [`super::gdt`]'s
+//! `EntryScratch`. A libc is entitled to keep a live value in r12 across a
+//! `syscall`, and one that does gets that value back unchanged.
+//!
 //! FMASK clears IF on the way in, so the gate runs with interrupts off until
 //! the handler yields or sleeps - the same contract the clock handler keeps:
 //! a task that switches away inside the gate resumes with interrupts off and
@@ -69,12 +75,12 @@ pub fn init() {
         // MSR_KERNEL_GS_BASE (0xC0000102): what `swapgs` installs as GS.base on
         // the way in. The entry stub runs before it has a stack, so the only
         // way to find one is through an MSR - and this is the one `swapgs`
-        // swaps in. It points at `gdt::CURRENT_KERNEL_RSP`, whose first
-        // quadword `set_kernel_stack` keeps equal to TSS.RSP0, so `mov rsp,
-        // gs:[0]` lands on the running task's kernel stack. Writing it is
-        // mandatory: with KERNEL_GS_BASE still zero, `swapgs` leaves GS.base
-        // at zero and the `gs:[0]` load faults on the null page.
-        let krsp = super::gdt::current_kernel_rsp_addr();
+        // swaps in. It points at the entry scratch, whose first quadword
+        // `set_kernel_stack` keeps equal to TSS.RSP0, so `mov rsp, gs:[0]`
+        // lands on the running task's kernel stack. Writing it is mandatory:
+        // with KERNEL_GS_BASE still zero, `swapgs` leaves GS.base at zero and
+        // the `gs:[0]` load faults on the null page.
+        let krsp = super::gdt::entry_scratch_addr();
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xC000_0102u32,
@@ -115,10 +121,13 @@ use crate::syscall;
 ///
 /// Layout matches the entry stub's push order exactly: the last push (rax, the
 /// syscall number) sits at offset 0, so the return value patches with one
-/// `mov [rsp]`. The stub restores the block by symmetric pops, so every field
-/// order here must equal the push order. `user_rsp` is the caller's RSP that
-/// `syscall` left in the register (the CPU switches no stack for `syscall`),
-/// recovered after the kernel-stack switch so `sysretq` returns to it.
+/// `mov [rsp]`. Every field order here must equal the push order, because the
+/// stub reads the frame back by offset where it cannot pop. `user_rsp` is the
+/// caller's RSP that `syscall` left in the register (the CPU switches no stack
+/// for `syscall`), parked and recovered by the stub itself - `sysretq` takes
+/// the return address from rcx and the flags from r11 and nothing at all for
+/// the stack. `r12` sits where the stub pushed it: a saved caller value, not
+/// scratch.
 #[repr(C)]
 struct Regs {
     rax: usize,
@@ -131,35 +140,20 @@ struct Regs {
     rsi: usize,
     rdi: usize,
     user_rsp: usize,
+    r12: usize,
     r15: usize,
     r14: usize,
     r13: usize,
     rbp: usize,
 }
 
-/// One `syscall` gate serves both number spaces, so mpos's own numbers -
-/// whose small values collide with Linux's read/write/open - cannot ride in
-/// raw. User code tags them with "mpos" in the top 32 bits (see
-/// user/lib/sys.rs); the tag is stripped here before anything downstream,
-/// dispatch included, sees the plain number.
-const MPOS_SYSCALL_TAG: usize = 0x6D70_6F73; // "mpos"
-
 extern "C" fn rust_syscall(regs: *mut Regs) -> usize {
     let regs = unsafe { &mut *regs };
     let args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9];
-    // The tagged calls are mpos numbers: strip the tag up front so the
-    // dispatch below works with the plain number. The gate is only ever
-    // entered from ring 3 - `syscall` at ring 0 would load a user CS and
-    // fault - so every call here is from user.
-    let mpos_number = regs.rax >> 32 == MPOS_SYSCALL_TAG;
-    if mpos_number {
-        regs.rax &= 0xFFFF_FFFF;
-    }
-    if mpos_number {
-        syscall::mpos_dispatch(regs.rax as u64, args, true) as usize
-    } else {
-        syscall::linux_dispatch(regs.rax as u64, args) as usize
-    }
+    // One number space - Linux x86_64 - serves every call. The gate is only
+    // ever entered from ring 3 (a `syscall` at ring 0 would load a user CS
+    // and fault), so every call here is from user.
+    syscall::linux_dispatch(regs.rax as u64, args, true) as usize
 }
 
 global_asm!(
@@ -167,26 +161,39 @@ global_asm!(
     ".globl syscall_entry",
     ".p2align 4",
     "syscall_entry:",
-    // `syscall` saved user RIP in rcx and user RFLAGS in r11, but unlike an
-    // interrupt it did NOT switch RSP to a kernel stack. The CPU is now in
-    // ring 0 still running on the caller's RSP. Capture that RSP in r12, then
-    // `swapgs`/`mov rsp, gs:[0]` moves onto the current task's kernel stack
-    // (CURRENT_KERNEL_RSP, kept in lock-step with TSS.RSP0 by set_kernel_stack)
-    // before we push anything - a timer interrupt mid-syscall would otherwise
-    // fault on the way back. The second `swapgs` restores the user's GS base.
-    "    mov  r12, rsp",      // r12 = user RSP (syscall left it untouched)
+    // `syscall` saved the caller's RIP in rcx and RFLAGS in r11, but unlike an
+    // interrupt it did NOT switch RSP to a kernel stack: the CPU is still in
+    // ring 0, running on the caller's RSP. Park that RSP in the entry scratch
+    // and move onto the current task's kernel stack (whose top lives in the
+    // scratch's first word, kept in lock-step with TSS.RSP0 by
+    // `set_kernel_stack`) before pushing anything - a timer interrupt
+    // mid-syscall would otherwise fault on the way back.
+    //
+    // The switch needs one register it may overwrite, and it may not borrow
+    // any of the caller's: r12 included, because it is callee-saved on both
+    // the SysV and the Linux syscall ABI, and a libc keeps live values in it
+    // across a `syscall`. So r12 is parked in the scratch's second word, read
+    // back as the frame records it, and the *value* in r12 becomes the
+    // caller's RSP - the one register the stub is free to reuse once its old
+    // contents are somewhere safe. Store and reload both happen between the
+    // two `swapgs`es, with interrupts still off (`syscall` enters with IF
+    // clear), so nothing else can observe the slot.
     "    swapgs",
-    "    mov  rsp, gs:[0]",   // rsp = current kernel stack top
-    "    swapgs",             // user GS base restored
+    "    mov  qword ptr gs:[8], r12", // park the caller's r12
+    "    mov  r12, rsp",      // r12 = the caller's RSP
+    "    mov  rsp, qword ptr gs:[0]", // rsp = current kernel stack top
     // Preserve every register the Linux x86_64 syscall ABI promises to keep:
-    // rbp, r13, r14, r15, and the user RSP (in r12). Then the args and the
-    // two `syscall`-stashed values. rax (the number) is pushed last, so it
-    // sits at offset 0 and the return value patches with one `mov [rsp]`.
+    // rbp, r12-r15, rbx (which this stub never touches), and the caller's RSP.
+    // Then the args and the two `syscall`-stashed values. rax (the number) is
+    // pushed last, so it sits at offset 0 and the return value patches with
+    // one `mov [rsp]`.
     "    push rbp",
     "    push r13",
     "    push r14",
     "    push r15",
-    "    push r12",           // user RSP
+    "    push qword ptr gs:[8]", // the caller's r12, read back through the kernel GS
+    "    push r12",           // the caller's RSP
+    "    swapgs",             // user GS base restored
     "    push rdi",
     "    push rsi",
     "    push rdx",
@@ -200,7 +207,10 @@ global_asm!(
     "    mov  rdi, rbp",
     "    and  rsp, -16",
     "    call {rust_entry}",
-    // rax = return value. Patch the rax slot, then restore symmetrically.
+    // rax = return value. Patch the rax slot, then pop back the half of the
+    // frame the stub never wrote to: the six registers and the two
+    // `syscall`-stashed values, leaving rsp on the slot that holds the
+    // caller's RSP.
     "    mov  rsp, rbp",
     "    mov  [rsp], rax",
     "    pop  rax",           // return value
@@ -212,12 +222,17 @@ global_asm!(
     "    pop  rdx",
     "    pop  rsi",
     "    pop  rdi",
-    "    pop  r12",           // r12 = user RSP
-    "    pop  r15",
-    "    pop  r14",
-    "    pop  r13",
-    "    pop  rbp",
-    "    mov  rsp, r12",      // back to the caller's RSP
+    // What is left of the frame is read by offset rather than popped: the word
+    // that carries the stack pointer is the one a `pop` would need a spare
+    // register for. The caller's RSP sits at [rsp]; above it are the two
+    // registers the stub did borrow - r12, parked while the stack switch used
+    // it, and rbp, which held the frame base - and r13-r15, which never left
+    // their registers at all. The frame itself is abandoned here: `sysretq`
+    // takes the return address from rcx and the flags from r11, and the stack
+    // is already the caller's.
+    "    mov  rbp, [rsp + 40]", // the caller's rbp
+    "    mov  r12, [rsp + 8]",  // the caller's r12
+    "    mov  rsp, [rsp]",      // back to the caller's RSP
     "    sysretq",
     rust_entry = sym rust_syscall,
 );

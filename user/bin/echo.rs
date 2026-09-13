@@ -1,40 +1,31 @@
 //! echo: its arguments, one space apart, one newline at the end.
+//!
+//! A Rust `std` program, built for `x86_64-unknown-linux-musl`: `std::env`
+//! reads the argument block through musl's startup, and `std::io` writes to fd
+//! 1. Nothing here knows mpos exists - which is what the shell's `echo` lines
+//! and the std programs beside this one make checkable.
 
-#![no_std]
-#![no_main]
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::process::ExitCode;
 
-#[path = "../lib/sys.rs"]
-mod sys;
-
-use core::panic::PanicInfo;
-
-#[unsafe(no_mangle)]
-extern "C" fn mpos_user_main(argc: usize, argv: *const *const u8) -> ! {
-    let args = sys::Args { argc, argv };
-
-    // The kernel caps the whole argv at 512 bytes; without the terminators
-    // the joined line always fits one fixed buffer with room to spare.
-    let mut out = [0u8; 512];
-    let mut n = 0usize;
-    for i in 1..argc {
-        if i > 1 {
-            out[n] = b' ';
-            n += 1;
+fn main() -> ExitCode {
+    // Operands are bytes, not `String`s: the shell hands over whatever it was
+    // given, and a word that is not valid UTF-8 is still a word to echo.
+    let mut line = Vec::new();
+    for (index, arg) in std::env::args_os().enumerate().skip(1) {
+        if index > 1 {
+            line.push(b' ');
         }
-        let arg = args.get(i);
-        out[n..n + arg.len()].copy_from_slice(arg);
-        n += arg.len();
+        line.extend_from_slice(arg.as_bytes());
     }
-    out[n] = b'\n';
-    n += 1;
+    line.push(b'\n');
 
-    if sys::write_all(1, &out[..n]) < 0 {
-        sys::exit(1);
+    let mut out = io::stdout().lock();
+    let written = out.write_all(&line).and_then(|()| out.flush());
+    if written.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
-    sys::exit(0);
-}
-
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
-    sys::abort()
 }

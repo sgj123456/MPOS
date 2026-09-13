@@ -1,14 +1,20 @@
-//! Process-related syscall handlers: EXIT, YIELD, GETPID, SLEEP, SPAWN, WAIT, KILL.
+//! Linux-compatible syscall handlers. Memory: `mmap`, `munmap`, `mremap`,
+//! `mprotect`, `brk`. Time: `nanosleep`, `clock_nanosleep`, `clock_gettime`,
+//! `gettimeofday`. Identity: `getpid`, `gettid`, `getppid`, `kill`/`tkill`.
+//! Process: `execve`, `exit`/`exit_group`, `wait4`, `fork` (clone), `uname`,
+//! `getrandom`, `prlimit64`, `futex`, `sched_getaffinity`, `set_robust_list`,
+//! `rseq`.
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
-use super::err;
 use crate::sched::TaskId;
+use crate::syscall::{ARG_COUNT, argv_arg, buffer_ok, cstr_arg, err, err_of};
+
+pub(super) use crate::syscall::MMAP_BASE;
 
 /// Terminate the current process.
-pub(super) fn handle_exit(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_exit(args: [usize; ARG_COUNT]) -> isize {
     crate::sched::exit(args[0] as isize);
 }
 
@@ -23,123 +29,16 @@ pub(super) fn handle_getpid() -> isize {
     crate::sched::current().0 as isize
 }
 
-/// Sleep for N milliseconds.
-pub(super) fn handle_sleep(args: [usize; super::ARG_COUNT]) -> isize {
-    let ms = args[0] as u64;
-    if ms == 0 {
-        return 0;
-    }
-    let ticks = (ms.saturating_mul(crate::arch::timer::TICK_HZ as u64) / 1000).max(1);
-    crate::sched::sleep_ticks(ticks);
-    0
-}
-
-/// Send a signal to a process.
-pub(super) fn handle_kill(args: [usize; super::ARG_COUNT]) -> isize {
-    let (id, sig) = (args[0], args[1]);
-    if sig > 31 {
-        return err::EINVAL;
-    }
-    if crate::sched::send_signal(TaskId(id), sig as u8) {
-        0
-    } else {
-        err::ESRCH
-    }
-}
-
-/// Load and execute a program.
-pub(super) fn handle_spawn(
-    args: [usize; super::ARG_COUNT],
-    from_user: bool,
-    cwd: &Arc<dyn crate::vfs::Inode>,
-) -> isize {
-    let (path_ptr, path_len, blob_ptr, blob_len) = (args[0], args[1], args[2], args[3]);
-    let path = match super::path_arg(path_ptr, path_len, from_user) {
-        Ok(path) => path,
-        Err(e) => return e,
-    };
-
-    // The argument blob is NUL-terminated strings packed back to back.
-    let mut argv: Vec<String> = Vec::new();
-    if blob_ptr != 0 && blob_len != 0 {
-        if blob_len > crate::sched::ARGS_BYTES_MAX {
-            return err::EINVAL;
-        }
-        if !super::buffer_ok(blob_ptr, blob_len, false, from_user) {
-            return err::EFAULT;
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(blob_ptr as *const u8, blob_len) };
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-            let field = &rest[..end];
-            match core::str::from_utf8(field) {
-                Ok(s) if !s.is_empty() => argv.push(String::from(s)),
-                _ => return err::EINVAL,
-            }
-            if end == rest.len() {
-                break;
-            }
-            rest = &rest[end + 1..];
-        }
-        if argv.len() > crate::sched::ARGV_MAX {
-            return err::EINVAL;
-        }
-    }
-    if argv.is_empty() {
-        let name = path.rsplit('/').next().unwrap_or(&path);
-        argv.push(String::from(name));
-    }
-
-    // File descriptor redirections: pairs of (from, to).
-    let mut redirects: Vec<crate::sched::Redirect> = Vec::new();
-    let (redir_ptr, redir_count) = (args[4], args[5]);
-    if redir_count > 0 {
-        const REDIRECT_MAX: usize = 8;
-        if redir_count > REDIRECT_MAX {
-            return err::EINVAL;
-        }
-        let bytes = redir_count * 2 * size_of::<i32>();
-        if !super::buffer_ok(redir_ptr, bytes, false, from_user) {
-            return err::EFAULT;
-        }
-        let pairs =
-            unsafe { core::slice::from_raw_parts(redir_ptr as *const i32, redir_count * 2) };
-        for pair in pairs.as_chunks::<2>().0 {
-            let (from, to) = (pair[0], pair[1]);
-            if from < 0 || to < 0 {
-                return err::EBADF;
-            }
-            redirects.push((from, to));
-        }
-    }
-
-    let bytes = match crate::vfs::read_file_opt(&path, Some(cwd.clone())) {
-        Ok(bytes) => bytes,
-        Err(e) => return super::err_of(e),
-    };
-    match crate::sched::try_spawn_user(
-        &bytes,
-        crate::sched::Priority::NORMAL,
-        crate::sched::current(),
-        &argv,
-        &redirects,
-        &path,
-    ) {
-        Ok(id) => id.0 as isize,
-        Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
-        Err(crate::sched::SpawnError::ArgsTooBig) => err::EINVAL,
-        Err(crate::sched::SpawnError::BadFd) => err::EBADF,
-    }
-}
-
-/// Wait for a child process.
-pub(super) fn handle_wait(args: [usize; super::ARG_COUNT]) -> isize {
+/// `wait4(pid, status_ptr, options)`. Linux writes the status through
+/// `*status`; mpos returns the exit code directly - the kernel-side
+/// reshape in `linux::dispatch` makes this consistent with the rest of the
+/// wait4 family.
+pub(super) fn handle_wait(args: [usize; ARG_COUNT]) -> isize {
     let (pid, flags) = (args[0], args[1]);
     const WNOHANG: usize = 1;
     let no_hang = flags & WNOHANG != 0;
     let me = crate::sched::current();
-    if pid == usize::MAX {
+    if pid == usize::MAX || pid == -1i32 as usize {
         if no_hang {
             return match crate::sched::poll_any_child(me) {
                 Some((_id, code)) => code,
@@ -165,10 +64,6 @@ pub(super) fn handle_wait(args: [usize; super::ARG_COUNT]) -> isize {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Linux-compatible syscall handlers
-// ---------------------------------------------------------------------------
-
 /// Get the parent process ID.
 ///
 /// The task table records who spawned whom in ring 3, so the answer is real:
@@ -185,17 +80,15 @@ pub(super) fn handle_getppid() -> isize {
 /// approximation: the image is loaded as a new task that is a child of the
 /// caller, the new task's id comes back, and the caller keeps running - a
 /// real execve would replace the caller and never return. The child gets the
-/// caller's argv, and the spawned image's path is what `/proc/self/exe`
-/// reads through.
-pub(super) fn handle_execve(
-    args: [usize; super::ARG_COUNT],
-    cwd: &Arc<dyn crate::vfs::Inode>,
-) -> isize {
-    let path = match super::cstr_arg(args[0], true) {
+/// caller's argv and envp, both laid out on its stack the way the Linux ABI
+/// does, and the spawned image's path is what `/proc/self/exe` reads
+/// through.
+pub(super) fn handle_execve(args: [usize; ARG_COUNT], cwd: &Arc<dyn crate::vfs::Inode>) -> isize {
+    let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
-    let mut argv = match super::argv_arg(args[1]) {
+    let mut argv = match argv_arg(args[1]) {
         Ok(argv) => argv,
         Err(e) => return e,
     };
@@ -203,19 +96,33 @@ pub(super) fn handle_execve(
         let name = path.rsplit('/').next().unwrap_or(&path);
         argv.push(String::from(name));
     }
-    // envp (args[2]) is accepted and ignored: mpos has no environment.
+    // envp is forwarded, not ignored: it becomes the child's initial
+    // environment, what `environ`, `env::var`, and every libc getenv read
+    // through.
+    let envp = match argv_arg(args[2]) {
+        Ok(envp) => envp,
+        Err(e) => return e,
+    };
     let bytes = match crate::vfs::read_file_opt(&path, Some(cwd.clone())) {
         Ok(bytes) => bytes,
-        Err(e) => return super::err_of(e),
+        Err(e) => return err_of(e),
     };
     match crate::sched::try_spawn_user(
         &bytes,
         crate::sched::Priority::NORMAL,
         crate::sched::current(),
         &argv,
+        &envp,
         &[],
         &path,
     ) {
+        // Linux's `execve(2)` replaces the caller and never returns. mpos has
+        // no way to swap a live task's image, so it spawns the new program as
+        // a child of the caller and reports the child's pid - the kernel's
+        // `posix_spawn` shape. The caller (`init`, the shell) is then expected
+        // to `wait4` the pid it was given; that is what keeps the parent
+        // alive and makes the child reaping work the way the rest of the
+        // scheduler already does.
         Ok(id) => id.0 as isize,
         Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
         Err(crate::sched::SpawnError::ArgsTooBig) => err::E2BIG,
@@ -229,12 +136,12 @@ pub(super) fn handle_execve(
 /// must be readable and `tv_nsec` must stay below a billion. `rem` is never
 /// written — nothing interrupts the sleep, and Linux writes the remaining
 /// time only when it does.
-pub(super) fn handle_nanosleep(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_nanosleep(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let req = args[0];
     if req == 0 {
         return 0;
     }
-    sleep_for_timespec(req)
+    sleep_for_timespec(req, from_user)
 }
 
 /// `clock_nanosleep(clk_id, flags, req, rem)`.
@@ -243,7 +150,7 @@ pub(super) fn handle_nanosleep(args: [usize; super::ARG_COUNT]) -> isize {
 /// clock it names: mpos keeps one clock. `TIMER_ABSTIME` has no absolute time
 /// to be measured against and answers `EINVAL` rather than sleeping the wrong
 /// duration.
-pub(super) fn handle_clock_nanosleep(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_clock_nanosleep(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const TIMER_ABSTIME: usize = 0x1;
     let (_clk_id, flags, req) = (args[0], args[1], args[2]);
     if flags & TIMER_ABSTIME != 0 {
@@ -252,13 +159,13 @@ pub(super) fn handle_clock_nanosleep(args: [usize; super::ARG_COUNT]) -> isize {
     if req == 0 {
         return 0;
     }
-    sleep_for_timespec(req)
+    sleep_for_timespec(req, from_user)
 }
 
 /// Sleep out the `struct timespec` at `req`, with Linux's validation: the
 /// pointer must be readable and `tv_nsec` must stay below a second.
-fn sleep_for_timespec(req: usize) -> isize {
-    if !super::buffer_ok(req, 16, false, true) {
+fn sleep_for_timespec(req: usize, from_user: bool) -> isize {
+    if !buffer_ok(req, 16, false, from_user) {
         return err::EFAULT;
     }
     unsafe {
@@ -281,15 +188,28 @@ fn sleep_for_timespec(req: usize) -> isize {
 ///
 /// Minimal implementation: duplicate address space, fd table, and registers.
 /// Returns 0 to child, child pid to parent.
-pub(super) fn handle_fork(_args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_fork(_args: [usize; ARG_COUNT]) -> isize {
     // For now, return ENOSYS — fork is complex and most coreutils don't need
     // it. The user can run each coreutil directly via execve from the shell.
     // The err:: constants are already negative (Linux ABI), so no extra sign.
-    super::err::ENOSYS
+    err::ENOSYS
+}
+
+/// Send a signal to a process. Used by `kill` and `tkill`.
+pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
+    let (id, sig) = (args[0], args[1]);
+    if sig > 31 {
+        return err::EINVAL;
+    }
+    if crate::sched::send_signal(TaskId(id), sig as u8) {
+        0
+    } else {
+        err::ESRCH
+    }
 }
 
 /// `brk(addr)` — change the program break (heap end).
-pub(super) fn handle_brk(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_brk(args: [usize; ARG_COUNT]) -> isize {
     let addr = args[0];
     let result = crate::sched::brk(addr);
     // Trace first few BRK calls per process for musl debug.
@@ -326,16 +246,6 @@ const MREMAP_FIXED: usize = 0x2;
 /// canonical address space, which is where every user mapping lives.
 const USER_LIMIT: usize = 1 << 47;
 
-/// Base address for user mmap: where every process's mmap cursor starts.
-///
-/// The cursor only moves downward from here, so the mmap region grows from the
-/// top of the address space toward the program image. That shape - heap low,
-/// huge hole, mmap high - is what Linux gives a static program, and musl's
-/// allocator notices the difference: it sizes its regions from what the kernel
-/// hands back, and a base in the low gigabytes makes those regions collide with
-/// the break.
-pub const MMAP_BASE: usize = 0x0000_7f00_0000_0000;
-
 /// `mmap(addr, length, prot, flags, fd, offset)` — map anonymous memory.
 ///
 /// Only anonymous private mappings exist: mpos has no file mappings, and a
@@ -355,7 +265,7 @@ pub const MMAP_BASE: usize = 0x0000_7f00_0000_0000;
 /// `PROT_NONE` maps the pages *present but unreachable from ring 3* rather than
 /// leaving them unmapped, so a later `mprotect` can hand them back with their
 /// contents intact.
-pub(super) fn handle_mmap(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_mmap(args: [usize; ARG_COUNT]) -> isize {
     use crate::mm::pframe::PAGE_SIZE;
 
     let (addr, length, prot, flags, _fd, _offset) =
@@ -467,7 +377,7 @@ pub(super) fn handle_mmap(args: [usize; super::ARG_COUNT]) -> isize {
 /// `pthread_getattr_np` finds the bottom of a stack by probing with `mremap`
 /// and reading `ENOMEM` as "still inside the mapping" and a failure of any
 /// other kind as "here is the edge".
-pub(super) fn handle_mremap(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
     use crate::mm::pframe::PAGE_SIZE;
 
     let (old_addr, old_len, new_len, flags, new_addr) =
@@ -609,7 +519,7 @@ fn free_range(len: usize, cursor: usize) -> Option<(usize, usize)> {
 /// Linux rounds the range outwards to whole pages and ignores holes, which is
 /// what [`crate::sched::unmap_user`] does. The frames come back to the
 /// allocator because nothing can reach them once the entries are gone.
-pub(super) fn handle_munmap(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_munmap(args: [usize; ARG_COUNT]) -> isize {
     let (addr, length) = (args[0], args[1]);
     if !addr.is_multiple_of(crate::mm::pframe::PAGE_SIZE) || length == 0 {
         return err::EINVAL;
@@ -619,7 +529,7 @@ pub(super) fn handle_munmap(args: [usize; super::ARG_COUNT]) -> isize {
 }
 
 /// `mprotect(addr, len, prot)` — change what a range of pages permits.
-pub(super) fn handle_mprotect(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_mprotect(args: [usize; ARG_COUNT]) -> isize {
     use crate::mm::pframe::PAGE_SIZE;
 
     let (addr, len, prot) = (args[0], args[1], args[2]);
@@ -648,7 +558,7 @@ pub(super) fn handle_mprotect(args: [usize; super::ARG_COUNT]) -> isize {
 /// `clock_gettime(clk_id, tp)` — get time.
 ///
 /// `tp` points to a `struct timespec { tv_sec, tv_nsec }`.
-pub(super) fn handle_clock_gettime(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     let (clk_id, tp) = (args[0], args[1]);
     let _ = clk_id;
     if tp == 0 {
@@ -671,7 +581,7 @@ pub(super) fn handle_clock_gettime(args: [usize; super::ARG_COUNT]) -> isize {
 /// The same tick the `clock_gettime` family reports, in the microsecond unit
 /// this call's struct spells: a `tv_usec` that stayed at nanosecond scale
 /// would answer a million-fold too much to every caller that trusts it.
-pub(super) fn handle_gettimeofday(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
     let tv = args[0];
     if tv == 0 {
         return err::EFAULT;
@@ -692,10 +602,10 @@ pub(super) fn handle_gettimeofday(args: [usize; super::ARG_COUNT]) -> isize {
 /// `buf` points to a `struct utsname`: six 65-byte NUL-terminated strings -
 /// sysname, nodename, release, version, machine, domainname - 390 bytes in
 /// all, which is the size every caller passes and the size this validates.
-pub(super) fn handle_uname(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
+pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let buf = args[0];
     let size = 390; // 6 fields × 65 bytes
-    if !super::buffer_ok(buf, size, true, from_user) {
+    if !buffer_ok(buf, size, true, from_user) {
         return err::EFAULT;
     }
     unsafe {
@@ -721,12 +631,12 @@ pub(super) fn handle_uname(args: [usize; super::ARG_COUNT], from_user: bool) -> 
 /// `getrandom(buf, len, flags)` — fill buffer with random bytes.
 ///
 /// Uses the timer tick as a simple pseudo-random source.
-pub(super) fn handle_getrandom(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
+pub(super) fn handle_getrandom(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (buf, len, _flags) = (args[0], args[1], args[2]);
     if len == 0 {
         return 0;
     }
-    if !super::buffer_ok(buf, len, true, from_user) {
+    if !buffer_ok(buf, len, true, from_user) {
         return err::EFAULT;
     }
     let tick = crate::arch::timer::ticks();
@@ -750,7 +660,7 @@ pub(super) fn handle_getrandom(args: [usize; super::ARG_COUNT], from_user: bool)
 /// Minimal: return hard-coded defaults for RLIMIT_STACK and RLIMIT_NOFILE.
 /// A resource number past `RLIM_NLIMITS` is `EINVAL`, the errno Linux uses
 /// for one it has no table row for.
-pub(super) fn handle_prlimit64(args: [usize; super::ARG_COUNT], from_user: bool) -> isize {
+pub(super) fn handle_prlimit64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const RLIM_NLIMITS: usize = 16;
     let (_pid, resource, _new_ptr, old_ptr) = (args[0], args[1], args[2], args[3]);
     if resource >= RLIM_NLIMITS {
@@ -759,7 +669,7 @@ pub(super) fn handle_prlimit64(args: [usize; super::ARG_COUNT], from_user: bool)
     if old_ptr == 0 {
         return 0;
     }
-    if !super::buffer_ok(old_ptr, 16, true, from_user) {
+    if !buffer_ok(old_ptr, 16, true, from_user) {
         return err::EFAULT;
     }
     // struct rlimit64 { rlim_cur, rlim_max } — both u64.
@@ -779,7 +689,7 @@ pub(super) fn handle_prlimit64(args: [usize; super::ARG_COUNT], from_user: bool)
 /// `futex(uaddr, op, val, ...)` — basic futex support for threading.
 ///
 /// Minimal: only supports FUTEX_WAIT with immediate return (no actual blocking).
-pub(super) fn handle_futex(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
     let (_uaddr, op, _val) = (args[0], args[1], args[2]);
     match op & 0xf {
         0 => 0, // FUTEX_WAIT: stub — just return 0
@@ -793,12 +703,12 @@ pub(super) fn handle_futex(args: [usize; super::ARG_COUNT]) -> isize {
 /// mpos schedules on one CPU, so the mask is always bit 0 and the answer is
 /// the CPU count Linux returns: 1. Bytes of the mask beyond the first word
 /// are zeroed, the way Linux clears what it does not fill.
-pub(super) fn handle_sched_getaffinity(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_sched_getaffinity(args: [usize; ARG_COUNT]) -> isize {
     let (_pid, len, mask) = (args[0], args[1], args[2]);
     if len < core::mem::size_of::<u64>() {
         return err::EINVAL;
     }
-    if !super::buffer_ok(mask, len, true, true) {
+    if !buffer_ok(mask, len, true, true) {
         return err::EFAULT;
     }
     unsafe {
@@ -818,7 +728,7 @@ pub(super) fn handle_sched_getaffinity(args: [usize; super::ARG_COUNT]) -> isize
 ///
 /// The head's contents are never touched; Linux pins the size to
 /// `sizeof(struct robust_list_head)` = 24 and rejects anything else.
-pub(super) fn handle_set_robust_list(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_set_robust_list(args: [usize; ARG_COUNT]) -> isize {
     let (_head, len) = (args[0], args[1]);
     if len != 24 {
         return err::EINVAL;
@@ -832,7 +742,7 @@ pub(super) fn handle_set_robust_list(args: [usize; super::ARG_COUNT]) -> isize {
 /// needs to get past startup, and whether the kernel updates `cpu_id` on
 /// preemption is out of scope. Linux rejects a length other than
 /// `sizeof(struct rseq)` = 32 and any flag but 0.
-pub(super) fn handle_rseq(args: [usize; super::ARG_COUNT]) -> isize {
+pub(super) fn handle_rseq(args: [usize; ARG_COUNT]) -> isize {
     let (_rseq, len, flags) = (args[0], args[1], args[2]);
     if len != 32 || flags != 0 {
         return err::EINVAL;

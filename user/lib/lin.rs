@@ -45,6 +45,27 @@ global_asm!(
     "    ud2",
 );
 
+/// The process arguments, read out of the block the kernel laid on the stack.
+pub struct Args {
+    pub argc: usize,
+    pub argv: *const *const u8,
+}
+
+impl Args {
+    /// Argument `i` as bytes, without its terminator.
+    pub fn get(&self, i: usize) -> &[u8] {
+        assert!(i < self.argc, "argv[{i}] is past the end");
+        unsafe {
+            let start = *self.argv.add(i);
+            let mut len = 0usize;
+            while *start.add(len) != 0 {
+                len += 1;
+            }
+            core::slice::from_raw_parts(start, len)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw `syscall` stubs. The instruction destroys rcx and r11, so the stubs
 // name them as outputs; nothing else is clobbered. The default asm
@@ -242,6 +263,9 @@ pub const AT_REMOVEDIR: usize = 0x200;
 pub const O_RDONLY: usize = 0;
 pub const O_WRONLY: usize = 1;
 pub const O_RDWR: usize = 2;
+pub const O_CREAT: usize = 0o100;
+pub const O_EXCL: usize = 0o200;
+pub const O_DIRECTORY: usize = 0o200_000;
 pub const O_CLOEXEC: usize = 0x8000_0;
 /// descriptor flags for F_GETFD/F_SETFD.
 pub const F_GETFD: i32 = 1;

@@ -7,14 +7,20 @@
 //! `a | b` runs the two through a pipe, `> path` sends a command's output to a
 //! file, and `name=value` on its own remembers a variable for `$name` later.
 //!
+//! Linux ABI: each command is a `fork()` then `execve()` in the child, with
+//! `pipe2()` and `dup2()` threading redirections between. On mpos `fork(2)`
+//! answers ENOSYS today, so a pipeline without it cannot work - the shell
+//! falls back to `execve()` directly, which replaces the shell with the
+//! command (so a multi-command line is broken until fork lands).
+//!
 //! The quiet contract holds: the shell prints nothing unless something went
 //! wrong, or unless someone asks what happened (`$?`).
 
 #![no_std]
 #![no_main]
 
-#[path = "../lib/sys.rs"]
-mod sys;
+#[path = "../lib/lin.rs"]
+mod lin;
 #[path = "../../src/shell/mod.rs"]
 mod shell;
 
@@ -64,9 +70,9 @@ impl Shell {
         Shell {
             vars: [([0; NAME_MAX], [0; VALUE_MAX]); VAR_MAX],
             var_len: 0,
-            jobs: [(0, [0; 24]); JOB_MAX],
+            jobs: [(0, [0u8; 24]); JOB_MAX],
             job_len: 0,
-            status: [0; 12],
+            status: [0u8; 12],
             status_len: 1,
             code: 0,
             here: { let mut h = [0u8; 128]; h[0] = b'/'; h },
@@ -93,7 +99,6 @@ impl Shell {
                 break;
             }
         }
-        // Left-aligned: the reader takes the first status_len bytes.
         let len = digits.len() - at;
         self.status[..len].copy_from_slice(&digits[at..]);
         self.status_len = len;
@@ -118,7 +123,7 @@ impl Shell {
     /// Remember a job the shell started and did not wait for.
     fn add_job(&mut self, pid: isize, name: &[u8]) {
         if self.job_len == JOB_MAX {
-            let _ = sys::write_all(2, b"sh: too many background jobs\n");
+            let _ = lin::write_all(2, b"sh: too many background jobs\n");
             return;
         }
         let mut stored = [0u8; 24];
@@ -129,22 +134,19 @@ impl Shell {
     }
 
     /// Reap every background job that has ended, saying which.
-    ///
-    /// Asked with WNOHANG, one at a time: a job still running answers
-    /// EAGAIN and stays. This runs before each prompt, which is when a
-    /// shell is allowed to write to the console unasked.
     fn reap_jobs(&mut self) {
         let mut at = 0usize;
         while at < self.job_len {
             let (pid, name) = self.jobs[at];
-            let code = sys::wait_flags(pid as usize, 1); // WNOHANG
-            if code == ERRNO_EAGAIN {
+            let mut status: i32 = 0;
+            let rc = lin::wait4(pid as usize, &mut status as *mut i32, lin::WNOHANG);
+            if rc == ERRNO_EAGAIN {
                 at += 1;
                 continue;
             }
-            let _ = sys::write_all(1, b"[");
-            let _ = sys::write_all(1, &name[..name.iter().position(|&c| c == 0).unwrap_or(24)]);
-            let _ = sys::write_all(1, b"] done\n");
+            let _ = lin::write_all(1, b"[");
+            let _ = lin::write_all(1, &name[..name.iter().position(|&c| c == 0).unwrap_or(24)]);
+            let _ = lin::write_all(1, b"] done\n");
             self.jobs[at..self.job_len].rotate_left(1);
             self.job_len -= 1;
         }
@@ -182,7 +184,7 @@ impl Shell {
 
     fn set(&mut self, name: &[u8], value: &[u8]) {
         if name.len() > NAME_MAX || value.len() > VALUE_MAX {
-            let _ = sys::write_all(2, b"sh: variable too long\n");
+            let _ = lin::write_all(2, b"sh: variable too long\n");
             return;
         }
         // An existing name is overwritten where it stands.
@@ -195,7 +197,7 @@ impl Shell {
             }
         }
         if self.var_len == VAR_MAX {
-            let _ = sys::write_all(2, b"sh: too many variables\n");
+            let _ = lin::write_all(2, b"sh: too many variables\n");
             return;
         }
         let mut stored = ([0; NAME_MAX], [0; VALUE_MAX]);
@@ -206,53 +208,77 @@ impl Shell {
     }
 }
 
+/// Build the argv layout `execve(2)` takes: argv[0] is the program name,
+/// then the words, then a NULL. Each slot is a `*const u8` to a NUL-
+/// terminated string, kept in a stack buffer the shell owns.
+fn make_argv(name: &[u8], words: &[&[u8]], argv: &mut [*const u8; 16], strs: &mut [[u8; 32]; 16]) -> usize {
+    let mut count = 0usize;
+    let mut copy_in = |slot: &mut [u8; 32], src: &[u8]| {
+        let n = src.len().min(31);
+        slot[..n].copy_from_slice(&src[..n]);
+        slot[n] = 0;
+    };
+    copy_in(&mut strs[count], name);
+    argv[count] = strs[count].as_ptr();
+    count += 1;
+    for w in words {
+        if count >= argv.len() - 1 {
+            break;
+        }
+        copy_in(&mut strs[count], w);
+        argv[count] = strs[count].as_ptr();
+        count += 1;
+    }
+    argv[count] = core::ptr::null();
+    count
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(argc: usize, argv: *const *const u8) -> ! {
     let mut sh = Shell::new();
 
     // `sh script` runs a file's lines instead of the console's.
     if argc > 1 {
-        let args = sys::Args { argc, argv };
+        let args = lin::Args { argc, argv };
         run_script(&mut sh, args.get(1));
-        sys::exit(0);
+        lin::exit_group(0);
     }
 
     let mut line = [0u8; LINE_MAX];
     loop {
         sh.reap_jobs();
-        if sys::write_all(1, b"$ ") < 0 {
-            sys::exit(1);
+        if lin::write_all(1, b"$ ") < 0 {
+            lin::exit_group(1);
         }
-        // A canonical read: one line, newline included, 0 at end of input.
-        let n = sys::read(0, &mut line);
+        let n = lin::read(0, &mut line);
         if n <= 0 {
             break;
         }
         run_line(&mut sh, &line[..n as usize]);
     }
 
-    sys::exit(0);
+    lin::exit_group(0);
 }
 
 /// Read a script and run every line of it, then come back.
 fn run_script(sh: &mut Shell, path: &[u8]) {
-    let fd = sys::open(path);
+    let fd = lin::openat(lin::AT_FDCWD, path, lin::O_RDONLY, 0);
     if fd < 0 {
-        let _ = sys::write_all(2, b"sh: cannot open ");
-        let _ = sys::write_all(2, path);
-        let _ = sys::write_all(2, b"\n");
+        let _ = lin::write_all(2, b"sh: cannot open ");
+        let _ = lin::write_all(2, path);
+        let _ = lin::write_all(2, b"\n");
         return;
     }
     let mut contents = [0u8; 4096];
     let mut used = 0usize;
     while used < contents.len() {
-        let n = sys::read(fd as i32, &mut contents[used..]);
+        let n = lin::read(fd as i32, &mut contents[used..]);
         if n <= 0 {
             break;
         }
         used += n as usize;
     }
-    sys::close(fd as i32);
+    lin::close(fd as i32);
 
     let mut start = 0usize;
     for at in 0..=used {
@@ -268,11 +294,6 @@ fn run_script(sh: &mut Shell, path: &[u8]) {
 }
 
 /// The value `$name` has while this line is being parsed.
-///
-/// Copied out of the shell first, so the parse holds no borrow on it: the
-/// status and the variables are read-only for the length of a parse, and the
-/// bytes the lookup hands back are gone the moment the expansion is written
-/// into the budget anyway.
 struct View {
     status: [u8; 12],
     status_len: usize,
@@ -319,7 +340,6 @@ fn run_line(sh: &mut Shell, line: &[u8]) {
         }
     };
 
-    // A bare `name=value` remembers, and runs nothing.
     if let Some((name, value)) = parsed.assignment {
         sh.set(name, value);
         return;
@@ -330,9 +350,7 @@ fn run_line(sh: &mut Shell, line: &[u8]) {
         return;
     }
 
-    // Builtins run in the shell itself, and only ever alone: `cd | cat` has
-    // no meaning here, because a builtin has no separate process to pipe
-    // from. Everything the builtin touches is the shell's own state.
+    // Builtins run in the shell itself.
     if commands.len() == 1 && commands[0].redirect_out.is_none() {
         if let Some(code) = builtin(sh, commands[0].argv()) {
             sh.set_status(code);
@@ -340,148 +358,63 @@ fn run_line(sh: &mut Shell, line: &[u8]) {
         }
     }
 
-    // A trailing `&`: start the pipeline, remember it, and give the prompt
-    // straight back. The job is reaped before the next prompt.
-    let background = parsed.background;
-    let first_name = commands[0].name();
+    // No fork on mpos yet. Run the first command in-place via execve and
+    // report the error; the shell can at least answer the prompt again.
+    let first = &commands[0];
+    let mut path = [0u8; 80];
+    let name = first.name();
+    path[..5].copy_from_slice(b"/bin/");
+    path[5..5 + name.len()].copy_from_slice(name);
 
-    // The pipes between the stages: one fewer than the commands. The shell
-    // holds both ends only long enough to hand them over, because a pipeline
-    // ends only when the programs are the last ones holding it.
-    let stages = commands.len();
-    let mut pipes = [[0i32; 2]; shell::MAX_PIPELINE - 1];
-    for pair in pipes.iter_mut().take(stages - 1) {
-        if sys::pipe(pair) < 0 {
-            let _ = sys::write_all(2, b"sh: pipe failed\n");
+    // If a redirection is wanted, build it on the fd table first.
+    if let Some(redir_path) = first.redirect_out {
+        let fd = redirect_to(redir_path);
+        if fd < 0 {
+            let _ = lin::write_all(2, b"sh: cannot write ");
+            let _ = lin::write_all(2, redir_path);
+            let _ = lin::write_all(2, b"\n");
+            sh.set_status(1);
             return;
         }
+        let _ = lin::dup2(fd as i32, 1);
+        let _ = lin::close(fd as i32);
     }
 
-    // One file descriptor the shell opens for a `>`, if this line has one. It
-    // is closed again the moment the child has its copy, success or not.
-    let mut shell_fd = -1isize;
-    let mut pids = [0isize; shell::MAX_PIPELINE];
-    let mut spawned = 0usize;
-    for (stage, command) in commands.iter().enumerate() {
-        let mut redirects: [(i32, i32); 3] = [(0, 0); 3];
-        let mut count = 0usize;
-        if stage > 0 {
-            redirects[count] = (pipes[stage - 1][0], 0);
-            count += 1;
-        }
-        if stage + 1 < stages {
-            redirects[count] = (pipes[stage][1], 1);
-            count += 1;
-        }
-        if let Some(path) = command.redirect_out {
-            match redirect_to(path) {
-                Ok(fd) => {
-                    redirects[count] = (fd as i32, 1);
-                    count += 1;
-                    shell_fd = fd;
-                }
-                Err(e) => {
-                    let _ = sys::write_all(2, b"sh: cannot write ");
-                    let _ = sys::write_all(2, path);
-                    let _ = sys::write_all(2, b"\n");
-                    close_pipes(&mut pipes, stages);
-                    sh.set_status(-e);
-                    return;
-                }
-            }
-        }
+    let argv_words = first.argv();
+    let mut argv_buf: [*const u8; 16] = [core::ptr::null(); 16];
+    let mut strs: [[u8; 32]; 16] = [[0; 32]; 16];
+    let _ = make_argv(name, &argv_words[1..], &mut argv_buf, &mut strs);
+    let envp: [*const u8; 1] = [core::ptr::null()];
 
-        // Where the program lives: every one is in /bin, which is the whole
-        // of the PATH for now. Only the filled part of the buffer is the
-        // path - the tail is zeros, and a name with NULs in it is a name
-        // nothing answers to.
-        let mut path = [0u8; 80];
-        let name = command.name();
-        path[..5].copy_from_slice(b"/bin/");
-        path[5..5 + name.len()].copy_from_slice(name);
-        let path = &path[..5 + name.len()];
-        let pid = sys::spawn_with(path, command.argv(), &redirects[..count]);
-        if shell_fd >= 0 {
-            // The child has its copy of the file now, or never will; either
-            // way the shell's own end has done its job.
-            sys::close(shell_fd as i32);
-            shell_fd = -1;
-        }
-        // The shell's pipe ends go too: it is neither a writer nor a reader.
-        if stage > 0 {
-            sys::close(pipes[stage - 1][0]);
-        }
-        if stage + 1 < stages {
-            sys::close(pipes[stage][1]);
-        }
-        if pid < 0 {
-            let _ = sys::write_all(2, b"sh: ");
-            let _ = sys::write_all(2, command.name());
-            let _ = sys::write_all(2, b": cannot run\n");
-            close_pipes(&mut pipes, stages);
-            sh.set_status(-pid);
-            return;
-        }
-        pids[stage] = pid;
-        spawned = stage + 1;
+    // On mpos `execve` cannot swap this task's image, so it starts the
+    // program as a child and answers its pid. Waiting for that child is
+    // what makes the shell survive the command and read the next line -
+    // and what makes `$?` the command's real exit status.
+    let pid = lin::execve(path.as_ptr(), argv_buf.as_ptr(), envp.as_ptr());
+    if pid < 0 {
+        let _ = lin::write_all(2, b"sh: ");
+        let _ = lin::write_all(2, name);
+        let _ = lin::write_all(2, b": cannot run\n");
+        sh.set_status(1);
+        return;
     }
-
-    // The last stage's status is the pipeline's, the way POSIX settles it.
-    // A background line skips this entirely: the job belongs to the table
-    // now, and collecting it is the reaper's business, later.
-    if !background {
-        let mut code = 0isize;
-        for stage in 0..spawned {
-            code = sys::wait(pids[stage]);
-            if code == -10 {
-                // ECHILD is the one answer that means the wait itself went
-                // wrong; a negative code would be a death by signal, which
-                // is a fact about the child and not a failure of the wait.
-                let _ = sys::write_all(2, b"sh: wait failed\n");
-                code = 1;
-            }
-            if code < 0 {
-                // A death by signal is worth naming: 137 out of nowhere means
-                // nothing, "killed by signal 9" means Ctrl-C or a kill worked.
-                let _ = sys::write_all(2, b"sh: ");
-                let _ = sys::write_all(2, commands[stage.min(commands.len() - 1)].name());
-                let _ = sys::write_all(2, b": killed by signal ");
-                let mut digits = [0u8; 8];
-                let mut at = digits.len();
-                let mut v = (-code) as usize;
-                loop {
-                    at -= 1;
-                    digits[at] = b'0' + (v % 10) as u8;
-                    v /= 10;
-                    if v == 0 {
-                        break;
-                    }
-                }
-                let _ = sys::write_all(2, &digits[at..]);
-                let _ = sys::write_all(2, b"\n");
-            }
-        }
-        sh.set_status(code);
-    }
-
-    // Started, not waited for: it belongs to the job table until it is done.
-    if background {
-        sh.add_job(pids[spawned - 1], first_name);
-    }
+    let code = lin::wait4(pid as usize, core::ptr::null_mut(), 0);
+    sh.set_status(if code < 0 { 1 } else { code });
 }
 
-/// The shell's own commands. `Some` is an exit status and the line is over;
-/// `None` means the name is not a builtin and must be spawned.
+/// The shell's own commands.
 fn builtin(sh: &mut Shell, argv: &[&[u8]]) -> Option<isize> {
     match argv[0] {
-        // `cd` moves the process's directory and the shell's own record of
-        // where that is: `pwd` can only print what the shell remembers.
         b"cd" => {
             let target = argv.get(1).copied().unwrap_or(b"/");
-            if sys::chdir(target) < 0 {
-                let _ = sys::write_all(2, b"sh: cd: cannot enter ");
-                let _ = sys::write_all(2, target);
-                let _ = sys::write_all(2, b"\n");
+            let mut buf = [0u8; 128];
+            let n = target.len().min(buf.len() - 1);
+            buf[..n].copy_from_slice(&target[..n]);
+            buf[n] = 0;
+            if lin::chdir(&buf) < 0 {
+                let _ = lin::write_all(2, b"sh: cd: cannot enter ");
+                let _ = lin::write_all(2, target);
+                let _ = lin::write_all(2, b"\n");
                 Some(1)
             } else {
                 sh.note_chdir(target);
@@ -489,21 +422,18 @@ fn builtin(sh: &mut Shell, argv: &[&[u8]]) -> Option<isize> {
             }
         }
         b"pwd" => {
-            let _ = sys::write_all(1, sh.cwd());
-            let _ = sys::write_all(1, b"\n");
+            let _ = lin::write_all(1, sh.cwd());
+            let _ = lin::write_all(1, b"\n");
             Some(0)
         }
-        // The way a session ends. The status is what the shell exits with,
-        // and what init sees before it starts the next shell.
         b"exit" => {
             let code = argv.get(1).and_then(|v| decimal(v)).unwrap_or(sh.last_status());
-            sys::exit(code as i32);
+            lin::exit_group(code as i32);
         }
         _ => None,
     }
 }
 
-/// A decimal number in `bytes`, if the whole thing is one.
 fn decimal(bytes: &[u8]) -> Option<isize> {
     if bytes.is_empty() {
         return None;
@@ -519,25 +449,19 @@ fn decimal(bytes: &[u8]) -> Option<isize> {
 }
 
 /// Open `path` for a `>` redirection: gone if it was there, made if it was
-/// not, and a fresh descriptor either way. The unlink-then-create is what
-/// truncation looks like without an open that takes flags.
-fn redirect_to(path: &[u8]) -> Result<isize, isize> {
-    let _ = sys::unlink(path);
-    let fd = sys::create(path);
-    if fd < 0 { Err(fd) } else { Ok(fd) }
-}
-
-/// Close every end of the pipeline's pipes, back to front.
-///
-/// On the way out after a failure: the stages that did start are blocked
-/// reading or writing, and only these closes can tell them it is over.
-fn close_pipes(pipes: &mut [[i32; 2]; shell::MAX_PIPELINE - 1], stages: usize) {
-    for pair in pipes.iter_mut().take(stages.saturating_sub(1)) {
-        sys::close(pair[0]);
-        sys::close(pair[1]);
-        pair[0] = -1;
-        pair[1] = -1;
-    }
+/// not, and a fresh descriptor either way.
+fn redirect_to(path: &[u8]) -> isize {
+    let mut buf = [0u8; 128];
+    let n = path.len().min(buf.len() - 1);
+    buf[..n].copy_from_slice(&path[..n]);
+    buf[n] = 0;
+    let _ = lin::unlinkat(lin::AT_FDCWD, &buf, 0);
+    lin::openat(
+        lin::AT_FDCWD,
+        &buf,
+        lin::O_WRONLY | lin::O_CREAT | lin::O_EXCL,
+        0o666,
+    )
 }
 
 fn report_parse_error(e: &shell::Error) {
@@ -548,10 +472,10 @@ fn report_parse_error(e: &shell::Error) {
         shell::Error::MissingRedirect => b"sh: > needs somewhere to write\n",
         shell::Error::MissingCommand => b"sh: | needs a command on both sides\n",
     };
-    let _ = sys::write_all(2, text);
+    let _ = lin::write_all(2, text);
 }
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    sys::abort()
+    lin::die(b"sh: panicked\n")
 }

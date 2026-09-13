@@ -39,10 +39,16 @@ pub const FCNTL: u64 = 72;
 pub const GETCWD: u64 = 79;
 pub const CHDIR: u64 = 80;
 pub const FCHDIR: u64 = 81;
-pub const RENAMEAT: u64 = 82;
-pub const MKDIRAT: u64 = 83;
-pub const UNLINKAT: u64 = 87;
-pub const READLINKAT: u64 = 88;
+/// The legacy path calls - `rename(2)`, `mkdir(2)`, `unlink(2)` - are what
+/// musl/glibc call for the plain names; each is its `*at` equivalent at
+/// `AT_FDCWD`, which the dispatch reshapes.
+pub const RENAME: u64 = 82;
+pub const MKDIR: u64 = 83;
+pub const UNLINK: u64 = 87;
+pub const RENAMEAT: u64 = 264;
+pub const MKDIRAT: u64 = 258;
+pub const UNLINKAT: u64 = 263;
+pub const READLINKAT: u64 = 267;
 pub const READLINK: u64 = 89;
 pub const GETTIMEOFDAY: u64 = 96;
 pub const SET_ROBUST_LIST: u64 = 99;
@@ -70,7 +76,7 @@ pub const FACCESSAT: u64 = 269;
 pub const DUP3: u64 = 292;
 pub const PIPE2: u64 = 293;
 pub const PRLIMIT64: u64 = 302;
-pub const RENAMEAT2: u64 = 311;
+pub const RENAMEAT2: u64 = 316;
 pub const GETRANDOM: u64 = 318;
 pub const STATX: u64 = 332;
 pub const RSEQ: u64 = 334;
@@ -78,5 +84,5 @@ pub const ARCH_PRCTL: u64 = 158;
 pub const SIGALTSTACK: u64 = 131;
 pub const MADVISE: u64 = 28;
 pub const PPOLL: u64 = 271;
-pub const YIELD: u64 = 24; // Linux has no yield; used as placeholder
+pub const SCHED_YIELD: u64 = 24; // sched_yield(2)
 pub const CLEANUP_AFTER_KTHREAD: u64 = 999;
