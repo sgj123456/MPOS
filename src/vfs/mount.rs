@@ -10,7 +10,9 @@
 //! The table is a plain instance, not a global, so tests can build isolated
 //! trees; the kernel's own table lives in [`STATIC`] behind the free functions.
 
+use alloc::collections::VecDeque;
 use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -19,6 +21,10 @@ use critical_section::Mutex;
 
 use super::path;
 use super::{FileSystem, Inode, NodeKind, VfsError, VfsResult};
+
+/// How many links one resolution may follow before it is called a cycle.
+/// Linux's own limit is 40.
+const SYMLINK_HOPS: usize = 40;
 
 /// One active mount: `at` is the directory inode in the parent filesystem,
 /// `root` is the root of the mounted one.
@@ -118,10 +124,6 @@ impl Vfs {
         } else {
             start
         };
-        // The logical chain from the starting node. Length 1 means "at the
-        // start", where `..` stays put as POSIX says it must.
-        let mut stack: Vec<Arc<dyn Inode>> = alloc::vec![start];
-
         // A relative path is walked as the absolute path it names from where
         // it starts, so the one `components` - which splits absolute paths -
         // covers both. The joined form is owned, and lives for the walk.
@@ -132,31 +134,127 @@ impl Vfs {
             joined = format!("/{path}");
             joined.as_str()
         };
-        for comp in path::components(path)? {
-            match comp {
-                "." => {}
-                // POSIX: `/..` is `/`, so the last entry never pops.
-                ".." => {
-                    if stack.len() > 1 {
-                        stack.pop();
+
+        // The names still to walk. Owned, because meeting a link rewrites what
+        // is left: the link's target goes in front of the names that followed
+        // it, and the whole thing is walked again.
+        let mut todo: VecDeque<String> = path::components(path)?
+            .map(String::from)
+            .collect::<Vec<_>>()
+            .into();
+        // Where the walk restarts from, which a link's target can move: an
+        // absolute target goes back to the root, a relative one stays beside
+        // the link it came from.
+        let mut base = start;
+        let mut hops = 0;
+
+        loop {
+            // The logical chain from `base`. Length 1 means "at `base`", where
+            // `..` stays put as POSIX says it must.
+            let mut stack: Vec<Arc<dyn Inode>> = alloc::vec![base.clone()];
+            let mut met_link = false;
+
+            while let Some(comp) = todo.pop_front() {
+                match comp.as_str() {
+                    "." => {}
+                    // POSIX: `/..` is `/`, so the last entry never pops.
+                    ".." => {
+                        if stack.len() > 1 {
+                            stack.pop();
+                        }
+                    }
+                    name => {
+                        let here = stack.last().expect("the stack is never empty").clone();
+                        let child = here.lookup(name)?;
+                        let child = critical_section::with(|cs| {
+                            let mounts = self.mounts.borrow(cs).borrow();
+                            match mounts.iter().find(|m| Arc::ptr_eq(&m.at, &child)) {
+                                Some(m) => m.root.clone(),
+                                None => child,
+                            }
+                        });
+                        if child.metadata().kind == NodeKind::Symlink {
+                            // Splice the target in front of whatever was still
+                            // to come and start over. `here`, not the link, is
+                            // what a relative target is relative to.
+                            let target = child.readlink()?;
+                            // `components` only splits absolute paths, so a
+                            // relative target is walked as the absolute path
+                            // it names from `here` - which is what makes it
+                            // relative to the link's own directory.
+                            let owned;
+                            let walk = if target.starts_with('/') {
+                                target.as_str()
+                            } else {
+                                owned = format!("/{target}");
+                                owned.as_str()
+                            };
+                            let mut next: VecDeque<String> = path::components(walk)?
+                                .map(String::from)
+                                .collect::<Vec<_>>()
+                                .into();
+                            next.extend(todo);
+                            todo = next;
+                            base = if target.starts_with('/') {
+                                critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+                                    .ok_or(VfsError::NoRoot)?
+                            } else {
+                                here
+                            };
+                            met_link = true;
+                            break;
+                        }
+                        stack.push(child);
                     }
                 }
-                name => {
-                    let here = stack.last().expect("the stack is never empty");
-                    let child = here.lookup(name)?;
-                    let child = critical_section::with(|cs| {
-                        let mounts = self.mounts.borrow(cs).borrow();
-                        match mounts.iter().find(|m| Arc::ptr_eq(&m.at, &child)) {
-                            Some(m) => m.root.clone(),
-                            None => child,
-                        }
-                    });
-                    stack.push(child);
-                }
+            }
+
+            if !met_link {
+                return Ok(stack.pop().expect("the stack is never empty"));
+            }
+            // ELOOP: a link chain this long is a cycle, and walking it any
+            // further would just be a slower way to hang.
+            hops += 1;
+            if hops > SYMLINK_HOPS {
+                return Err(VfsError::Invalid);
             }
         }
+    }
 
-        Ok(stack.pop().expect("the stack is never empty"))
+    /// The directory holding `path`, and the name within it - without following
+    /// a link the name turns out to name.
+    ///
+    /// This is the shape `readlink`, `symlink`, `unlink` and `mount` need: they
+    /// all act on the *name*, and a resolver that followed it would hand back
+    /// what the name points at instead of the name itself.
+    pub fn resolve_parent(&self, path: &str) -> VfsResult<(Arc<dyn Inode>, String)> {
+        let start = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+            .ok_or(VfsError::NoRoot)?;
+        self.resolve_parent_from(path, start)
+    }
+
+    /// [`resolve_parent`](Self::resolve_parent) from `start` rather than the
+    /// root, which is what a relative path in a process with a cwd needs.
+    pub fn resolve_parent_from(
+        &self,
+        path: &str,
+        start: Arc<dyn Inode>,
+    ) -> VfsResult<(Arc<dyn Inode>, String)> {
+        let (parent_path, name) = split_last(path);
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(VfsError::Invalid);
+        }
+        let parent = self.resolve_from(parent_path, start)?;
+        Ok((parent, String::from(name)))
+    }
+}
+
+/// Split `/a/b/c` into `/a/b` and `c`; `/a` into `/` and `a`.
+fn split_last(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(i) => (if i == 0 { "/" } else { &trimmed[..i] }, &trimmed[i + 1..]),
+        None => (".", trimmed),
     }
 }
 
@@ -280,6 +378,84 @@ mod tests {
         let vfs = Vfs::new();
         assert_eq!(vfs.resolve("/").err(), Some(VfsError::NoRoot));
         assert_eq!(vfs.mount("/", &*RamFs::new()).err(), Some(VfsError::NoRoot));
+    }
+    /// Build `/bin/busybox` as a file and `/bin/ls`, `/bin/sh` as links to it -
+    /// the shape a busybox rootfs is made of.
+    fn tree_with_busybox() -> Arc<Vfs> {
+        let vfs = tree_with_root();
+        let bin = vfs
+            .resolve("/")
+            .unwrap()
+            .create("bin", NodeKind::Dir)
+            .unwrap();
+        let busybox = bin.create("busybox", NodeKind::File).unwrap();
+        busybox.write_at(0, b"busybox").unwrap();
+        bin.symlink("ls", "/bin/busybox").unwrap();
+        bin.symlink("sh", "busybox").unwrap();
+        vfs
+    }
+
+    #[test]
+    fn resolution_follows_an_absolute_and_a_relative_link() {
+        let vfs = tree_with_busybox();
+        let busybox = vfs.resolve("/bin/busybox").unwrap();
+
+        let ls = vfs.resolve("/bin/ls").unwrap();
+        assert!(
+            Arc::ptr_eq(&ls, &busybox),
+            "an absolute link was not followed"
+        );
+        // A relative link is relative to the directory holding it, not to the
+        // root and not to the caller.
+        let sh = vfs.resolve("/bin/sh").unwrap();
+        assert!(
+            Arc::ptr_eq(&sh, &busybox),
+            "a relative link was not followed"
+        );
+        assert_eq!(ls.metadata().kind, NodeKind::File);
+    }
+
+    #[test]
+    fn a_link_in_the_middle_of_a_path_is_followed() {
+        let vfs = tree_with_busybox();
+        vfs.resolve("/")
+            .unwrap()
+            .symlink("binlink", "/bin")
+            .unwrap();
+        let busybox = vfs.resolve("/bin/busybox").unwrap();
+        // The names after the link still have to be walked once it resolves.
+        assert!(Arc::ptr_eq(&vfs.resolve("/binlink/ls").unwrap(), &busybox));
+        assert!(vfs.resolve("/binlink/../bin/sh").is_ok());
+    }
+
+    #[test]
+    fn a_link_cycle_is_an_error_and_not_a_hang() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        root.symlink("a", "b").unwrap();
+        root.symlink("b", "a").unwrap();
+        assert_eq!(vfs.resolve("/a").err(), Some(VfsError::Invalid));
+    }
+
+    #[test]
+    fn resolve_parent_names_the_link_itself() {
+        let vfs = tree_with_busybox();
+        let (parent, name) = vfs.resolve_parent("/bin/ls").unwrap();
+        assert_eq!(name, "ls");
+        // The link, not what it points at: this is what readlink needs.
+        let link = parent.lookup(&name).unwrap();
+        assert_eq!(link.metadata().kind, NodeKind::Symlink);
+        assert_eq!(link.readlink().unwrap(), "/bin/busybox");
+    }
+
+    #[test]
+    fn readlink_on_a_file_that_is_not_a_link_is_an_error() {
+        let vfs = tree_with_busybox();
+        let (parent, name) = vfs.resolve_parent("/bin/busybox").unwrap();
+        assert_eq!(
+            parent.lookup(&name).unwrap().readlink().err(),
+            Some(VfsError::Invalid)
+        );
     }
 }
 

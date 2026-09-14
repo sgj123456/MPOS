@@ -18,6 +18,8 @@
 pub const SIGINT: u8 = 2;
 /// Write on a pipe with no one left to read it.
 pub const SIGPIPE: u8 = 13;
+/// The clock a program asked for: `alarm`, `setitimer(ITIMER_REAL)`.
+pub const SIGALRM: u8 = 14;
 /// Termination, the polite kind.
 pub const SIGTERM: u8 = 15;
 /// Termination, the kind that cannot be caught, blocked or ignored.
@@ -29,6 +31,45 @@ pub const SIGSTOP: u8 = 19;
 /// a `u32`, so 1..=31 are the numbers this kernel can name at all; the zero
 /// slot is left in so a signal number indexes its own entry.
 pub const SIGNALS: usize = 32;
+
+/// The two dispositions that are not a function address: take the default
+/// action, or do nothing at all.
+pub const SIG_DFL: usize = 0;
+pub const SIG_IGN: usize = 1;
+
+/// `SA_*` bits the kernel acts on rather than merely records.
+///
+/// `SA_RESTORER` is not optional on x86_64 - a handler cannot return on its
+/// own, and musl passes the trampoline address that leads back to the kernel
+/// through `rt_sigreturn` in this field.
+pub const SA_RESTORER: usize = 0x0400_0000;
+pub const SA_ONSTACK: usize = 0x0800_0000;
+pub const SA_NODEFER: usize = 0x4000_0000;
+pub const SA_RESETHAND: usize = 0x8000_0000;
+
+/// The bytes of `struct rt_sigframe` on x86_64, which is what the kernel
+/// pushes on a handler's stack:
+///
+/// ```text
+///   0  char *pretcode      the restorer - where the handler returns to
+///   8  struct ucontext     uc_flags, uc_link, stack_t, sigcontext, sigmask
+/// 312  struct siginfo      signo, errno, code, and a lot of padding
+/// ```
+///
+/// The three parts are laid out the way the Linux ABI lays them out, because
+/// the libc's `__restore_rt` trampoline is what reads them back: it issues
+/// `rt_sigreturn` with `rsp` pointing just past `pretcode`, and the kernel
+/// finds the saved registers at a fixed offset from there.
+pub const SIGFRAME_BYTES: usize = 440;
+/// Offset of `uc_mcontext` (a `struct sigcontext`) inside the frame - that is,
+/// `sizeof(char *) + sizeof(unsigned long) + sizeof(uc_link) + sizeof(stack_t)`.
+pub const SIGFRAME_UCONTEXT: usize = 8;
+/// Offset of the `struct sigcontext` within the `ucontext`.
+pub const UCONTEXT_MCONTEXT: usize = 40;
+/// Offset of the saved signal mask within the `ucontext`.
+pub const UCONTEXT_SIGMASK: usize = 296;
+/// Offset of the `struct siginfo` within the frame.
+pub const SIGFRAME_SIGINFO: usize = 312;
 
 /// One signal's disposition, in the shape `rt_sigaction` reads and writes.
 ///
@@ -54,6 +95,36 @@ pub struct Actions([Action; SIGNALS]);
 impl Default for Actions {
     fn default() -> Actions {
         Actions([Action::default(); SIGNALS])
+    }
+}
+
+impl Action {
+    /// Take the default action: terminate. Every signal this kernel names is
+    /// fatal by default, so "default" and "die of it" are the same thing.
+    pub fn is_default(&self) -> bool {
+        self.handler == SIG_DFL
+    }
+
+    /// Discard the signal.
+    pub fn is_ignore(&self) -> bool {
+        self.handler == SIG_IGN
+    }
+
+    /// Calls `self.handler`. Every address above `SIG_IGN` is one, since the
+    /// two sentinels are 0 and 1.
+    pub fn is_handler(&self) -> bool {
+        self.handler > SIG_IGN
+    }
+
+    /// The mask a handler runs under: what the caller had blocked, plus what
+    /// the disposition asks for, plus the signal itself - which cannot arrive
+    /// again while it is being handled unless `SA_NODEFER` says otherwise.
+    pub fn handler_mask(&self, sig: u8, blocked: Pending) -> Pending {
+        let mut mask = blocked | self.mask as Pending;
+        if self.flags & SA_NODEFER == 0 {
+            mask |= bit(sig);
+        }
+        mask
     }
 }
 

@@ -58,6 +58,43 @@ pub mod err {
     pub const ENOTTY: isize = -25;
     pub const E2BIG: isize = -7;
     pub const ENAMETOOLONG: isize = -36;
+    // --- socket family ---
+    /// EMSGSIZE: a datagram is larger than the socket can carry as one packet.
+    pub const EMSGSIZE: isize = -90;
+    /// EDESTADDRREQ: a send on an unconnected datagram socket named no address.
+    pub const EDESTADDRREQ: isize = -89;
+    /// ENOTSOCK: the descriptor names something that is not a socket.
+    pub const ENOTSOCK: isize = -88;
+    /// ENOPROTOOPT: the option level or name is not one the kernel knows.
+    pub const ENOPROTOOPT: isize = -92;
+    /// EPROTONOSUPPORT: the protocol number does not match the socket type.
+    pub const EPROTONOSUPPORT: isize = -93;
+    /// ESOCKTNOSUPPORT: the socket type itself is one the kernel does not know.
+    pub const ESOCKTNOSUPPORT: isize = -94;
+    /// EAFNOSUPPORT: the address family is not one this kernel speaks. What
+    /// musl's syslog gets for its `AF_UNIX` probe, so it falls back to writing
+    /// the console directly.
+    pub const EAFNOSUPPORT: isize = -97;
+    /// EADDRINUSE: the local address is already bound by another socket.
+    pub const EADDRINUSE: isize = -98;
+    /// EADDRNOTAVAIL: the requested local address cannot be assigned here.
+    pub const EADDRNOTAVAIL: isize = -99;
+    /// ENETDOWN: the network interface is not up.
+    pub const ENETDOWN: isize = -100;
+    /// ENOTCONN: the socket is not connected, and the call needs it to be.
+    pub const ENOTCONN: isize = -107;
+    /// EISCONN: the socket is already connected, and `connect` was asked again.
+    pub const EISCONN: isize = -106;
+    /// ESHUTDOWN: the socket has been shut down for that direction.
+    pub const ESHUTDOWN: isize = -108;
+    /// ETIMEDOUT: the peer never answered in time.
+    pub const ETIMEDOUT: isize = -110;
+    /// ECONNREFUSED: the peer reset the connection attempt.
+    pub const ECONNREFUSED: isize = -111;
+    /// EALREADY: a nonblocking connect is still in flight.
+    pub const EALREADY: isize = -114;
+    /// EINPROGRESS: a nonblocking connect has been started and is not done.
+    pub const EINPROGRESS: isize = -115;
 }
 
 /// How many register arguments a syscall may pass.
@@ -86,7 +123,10 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::NoSpace => err::ENOSPC,
         VfsError::FileTooBig => err::EFBIG,
         VfsError::BrokenPipe => err::EPIPE,
-        VfsError::Unsupported => err::ENOSYS,
+        VfsError::Unsupported => {
+            crate::println!("DBG err_of Unsupported -> ENOSYS");
+            err::ENOSYS
+        }
     }
 }
 
@@ -177,8 +217,23 @@ pub fn linux_dispatch(
     from_user: bool,
     regs_ptr: *mut (),
 ) -> isize {
-    crate::sched::deliver_pending_signal();
-    linux::dispatch(nr, args, from_user, regs_ptr)
+    // Fire an interval timer that came due while the task was in ring 3. The
+    // clock covers a spinning task and the scheduler covers an idle core;
+    // this covers the third state - a task in and out of syscalls - so no
+    // caller waits a whole slice past its deadline.
+    crate::sched::check_itimer();
+    let ret = linux::dispatch(nr, args, from_user, regs_ptr);
+    // Signals are delivered here rather than before the call: a handler has to
+    // see the *result* of the syscall it interrupted, and the result does not
+    // exist until the call has returned. Jumping into a handler means
+    // rewriting the frame the task will `sysretq` through, which is why this
+    // is also the only delivery point that can run one that needs a frame.
+    if linux::deliver_signal(regs_ptr, ret) {
+        // The interrupted call's value belongs to the handler now: it is on
+        // the frame, waiting for `rt_sigreturn` to put it back.
+        return 0;
+    }
+    ret
 }
 
 #[cfg(all(test, not(target_os = "none")))]

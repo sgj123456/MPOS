@@ -721,6 +721,7 @@ impl Core {
 
     fn dir_writable(&self, dir: &InodeData) -> VfsResult<()> {
         if dir.flags & INODE_INDEX_FL != 0 {
+            crate::println!("DBG ext2 dir_writable flags={:#x}", dir.flags);
             return Err(VfsError::Unsupported);
         }
         Ok(())

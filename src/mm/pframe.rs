@@ -48,9 +48,26 @@ pub(crate) const fn align_down(value: usize, align: usize) -> usize {
     value & !(align - 1)
 }
 
-/// Bytes of metadata needed to manage `frames` frames.
+/// Where a zone's per-frame state bytes begin, relative to `meta`.
+const STATE_OFF: usize = align_up(HEAD_BYTES, META_ALIGN);
+
+/// Where a zone's per-frame reference counts begin, relative to `meta`. The
+/// counts are `u16`, so the array starts on an even byte even when the state
+/// array above it has an odd number of frames.
+const fn rc_offset(frames: usize) -> usize {
+    align_up(STATE_OFF + frames, core::mem::align_of::<u16>())
+}
+
+/// Bytes of metadata needed to manage `frames` frames: the free-list heads, one
+/// state byte per frame, and one reference count per frame.
+///
+/// The reference counts live *here* rather than in a heap-allocated map on
+/// purpose. The frame allocator runs before the heap exists and the heap grows
+/// by calling into it, so any allocation the allocator itself performs would
+/// re-enter the heap's own borrow and deadlock it. Carving the counts out of
+/// the memory being managed keeps the allocator free of every other subsystem.
 pub const fn metadata_bytes(frames: usize) -> usize {
-    align_up(HEAD_BYTES, META_ALIGN) + frames
+    rc_offset(frames) + frames * core::mem::size_of::<u16>()
 }
 
 /// Buddy allocator over one contiguous run of frames.
@@ -103,6 +120,13 @@ impl Buddy {
             zone.set_head(order, NIL);
         }
         unsafe { core::ptr::write_bytes(zone.state_ptr(), 0, frames) };
+        unsafe {
+            core::ptr::write_bytes(
+                zone.rc_ptr() as *mut u8,
+                0,
+                frames * core::mem::size_of::<u16>(),
+            )
+        };
 
         let mut frame = 0;
         while frame < frames {
@@ -147,7 +171,13 @@ impl Buddy {
             self.push(frame + (1 << block), block);
         }
 
-        Some(self.pbase + (frame << PAGE_SHIFT))
+        let phys = self.pbase + (frame << PAGE_SHIFT);
+        // A single page starts life owned by exactly one caller; a larger block
+        // is never shared page-by-page, so its counts stay clear.
+        if order == 0 {
+            self.set_refcount(phys, 1);
+        }
+        Some(phys)
     }
 
     /// Return a block previously handed out by `alloc` with the same `order`.
@@ -162,6 +192,12 @@ impl Buddy {
             "free of a block outside this zone"
         );
         debug_assert!(self.state(frame) == 0, "double free of frame {frame}");
+
+        // The block is no longer anybody's: clear the one count that mattered so
+        // a later allocation of this page starts from a clean slate.
+        if order == 0 {
+            self.set_refcount(phys, 0);
+        }
 
         let mut order = order;
         while order < MAX_ORDER {
@@ -245,7 +281,65 @@ impl Buddy {
     }
 
     fn state_ptr(&self) -> *mut u8 {
-        unsafe { (self.meta as *mut u8).add(align_up(HEAD_BYTES, META_ALIGN)) }
+        unsafe { (self.meta as *mut u8).add(STATE_OFF) }
+    }
+
+    /// The zone's per-frame reference counts, indexed by frame number.
+    fn rc_ptr(&self) -> *mut u16 {
+        unsafe { (self.meta as *mut u8).add(rc_offset(self.frames)) as *mut u16 }
+    }
+
+    fn frame_of(&self, phys: usize) -> usize {
+        (phys - self.pbase) >> PAGE_SHIFT
+    }
+
+    /// How many owners a single page has. Pages the zone does not own read as
+    /// zero, which is also what a never-shared page reads as before its count
+    /// is seeded.
+    pub fn refcount(&self, phys: usize) -> u16 {
+        if !self.contains(phys) {
+            return 0;
+        }
+        unsafe { self.rc_ptr().add(self.frame_of(phys)).read() }
+    }
+
+    /// Write a frame's reference count outright. Used to seed a fresh page at
+    /// one and to clear it when the page goes back to the free lists.
+    pub fn set_refcount(&mut self, phys: usize, count: u16) {
+        if !self.contains(phys) {
+            return;
+        }
+        unsafe { self.rc_ptr().add(self.frame_of(phys)).write(count) };
+    }
+
+    /// Record that one more owner now holds `phys` - what a fork does with every
+    /// page it shares with its child.
+    pub fn share(&mut self, phys: usize) {
+        if !self.contains(phys) {
+            return;
+        }
+        let at = unsafe { self.rc_ptr().add(self.frame_of(phys)) };
+        let count = unsafe { at.read() };
+        unsafe { at.write(count.saturating_add(1)) };
+    }
+
+    /// Drop one owner. Answers `true` when the last one is gone and the frame
+    /// may be returned to the buddy allocator, `false` while others hold it.
+    pub fn unshare(&mut self, phys: usize) -> bool {
+        if !self.contains(phys) {
+            // Not ours to track: report it as free so the caller's second half
+            // still hands it back rather than leaking it.
+            return true;
+        }
+        let at = unsafe { self.rc_ptr().add(self.frame_of(phys)) };
+        let count = unsafe { at.read() };
+        if count > 1 {
+            unsafe { at.write(count - 1) };
+            false
+        } else {
+            unsafe { at.write(0) };
+            true
+        }
     }
 
     fn state(&self, frame: usize) -> u8 {
@@ -279,13 +373,6 @@ impl Buddy {
 pub struct Pmm {
     zones: [Buddy; MAX_ZONES],
     zone_count: usize,
-    /// Reference counts for copy-on-write support. Maps the physical address of
-    /// a single page (order-0) to the number of owners it has. A freshly
-    /// allocated page starts at 1; fork increments it; free decrements it and
-    /// only returns the frame to the buddy allocator when it reaches 0.
-    ///
-    /// `Option` because `BTreeMap::new()` is not `const`; `init` fills it in.
-    refcounts: Option<alloc::collections::BTreeMap<usize, u32>>,
 }
 
 impl Pmm {
@@ -293,33 +380,27 @@ impl Pmm {
         Self {
             zones: [Buddy::empty(); MAX_ZONES],
             zone_count: 0,
-            refcounts: None,
         }
     }
 
-    fn refcounts(&mut self) -> &mut alloc::collections::BTreeMap<usize, u32> {
-        self.refcounts
-            .get_or_insert_with(alloc::collections::BTreeMap::new)
+    /// Which zone owns `phys`, if any. Zones are few (one per usable region), so
+    /// the linear scan is cheaper than any index would be.
+    fn zone_index(&self, phys: usize) -> Option<usize> {
+        (0..self.zone_count).find(|&index| self.zones[index].contains(phys))
     }
 
-    /// The reference count of a single page. Returns 0 for pages not tracked
-    /// (including multi-page blocks, which are never COW-shared).
+    /// The reference count of a single page. Returns 0 for pages no zone owns,
+    /// including the interior of a multi-page block, which is never COW-shared.
     pub fn refcount(&self, phys: usize) -> u32 {
-        self.refcounts
-            .as_ref()
-            .and_then(|rc| rc.get(&phys).copied())
-            .unwrap_or(0)
+        self.zone_index(phys)
+            .map_or(0, |index| self.zones[index].refcount(phys) as u32)
     }
 
     /// Increment the reference count of a single page. Called when fork shares
     /// a frame with the child. The page must have been previously allocated.
     pub fn clone_frame_ref(&mut self, phys: usize) {
-        let rc = self.refcounts();
-        match rc.get_mut(&phys) {
-            Some(count) => *count += 1,
-            None => {
-                rc.insert(phys, 2);
-            }
+        if let Some(index) = self.zone_index(phys) {
+            self.zones[index].share(phys);
         }
     }
 
@@ -327,20 +408,8 @@ impl Pmm {
     /// count reached zero and the frame should be returned to the buddy
     /// allocator, `false` when other owners still hold it.
     pub fn free_frame_ref(&mut self, phys: usize) -> bool {
-        let rc = self.refcounts();
-        if let Some(count) = rc.get_mut(&phys) {
-            *count -= 1;
-            if *count == 0 {
-                rc.remove(&phys);
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Record that a freshly allocated page has exactly one owner.
-    pub fn set_refcount_1(&mut self, phys: usize) {
-        self.refcounts().insert(phys, 1);
+        self.zone_index(phys)
+            .is_none_or(|index| self.zones[index].unshare(phys))
     }
 
     /// Build a zone per allocatable region of the memory map.

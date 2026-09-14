@@ -22,19 +22,22 @@ static LINE: &[u8; 9] = b"via fd40\n";
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t_dup2\n");
     let mut failed = false;
+    // Which number the lowest free descriptor is depends on what this process
+    // inherited, so measure it rather than assuming 3.
+    let base = lin::free_fd();
 
     let a = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the file opens on fd 3", a, 3);
+    lin::check_eq(&mut failed, b"the file opens on the lowest free fd", a, base);
 
     let r = lin::dup2(1, 5);
     lin::check_eq(&mut failed, b"dup2(stdout, 5) returns 5", r, 5);
 
-    let r = lin::dup2(3, 3);
+    let r = lin::dup2(base as i32, base as i32);
     lin::check_eq(
         &mut failed,
-        b"dup2(3, 3) on an open fd is the no-op that returns 3",
+        b"dup2(fd, fd) on an open fd is the no-op that returns it",
         r,
-        3,
+        base,
     );
 
     let r = lin::dup2(1, 40);
@@ -55,7 +58,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"closing fd 40 succeeds", r, 0);
 
     let _ = lin::close(a as i32);
-    let r = lin::dup2(3, 6);
+    let r = lin::dup2(base as i32, base as i32 + 3);
     lin::check_eq(
         &mut failed,
         b"an oldfd that is not open answers EBADF",

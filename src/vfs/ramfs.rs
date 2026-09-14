@@ -72,6 +72,26 @@ impl Inode for RamFile {
 }
 
 /// A directory: name edges, aka the dentries of this filesystem.
+/// A symbolic link: nothing but the path it stands for.
+struct RamSymlink {
+    ino: Ino,
+    target: String,
+}
+
+impl Inode for RamSymlink {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::Symlink,
+            size: self.target.len() as u64,
+        }
+    }
+
+    fn readlink(&self) -> VfsResult<String> {
+        Ok(self.target.clone())
+    }
+}
+
 struct RamDir {
     ino: Ino,
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
@@ -109,7 +129,25 @@ impl Inode for RamDir {
             }),
             // No device registry exists yet; devfs brings real ones at M8.
             NodeKind::CharDev => return Err(VfsError::Unsupported),
+            // A link is made with `Inode::symlink`, which carries the one thing
+            // a link cannot exist without: what it points at.
+            NodeKind::Symlink => return Err(VfsError::Unsupported),
         };
+        critical_section::with(|cs| {
+            let mut entries = self.entries.borrow(cs).borrow_mut();
+            if entries.contains_key(name) {
+                return Err(VfsError::Exists);
+            }
+            entries.insert(String::from(name), node.clone());
+            Ok(node)
+        })
+    }
+
+    fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+        let node: Arc<dyn Inode> = Arc::new(RamSymlink {
+            ino: fresh_ino(),
+            target: String::from(target),
+        });
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             if entries.contains_key(name) {

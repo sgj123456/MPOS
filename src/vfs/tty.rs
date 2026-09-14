@@ -1,10 +1,19 @@
 //! The tty: a line discipline between the machine's input and its readers.
 //!
 //! Bytes arrive one at a time - today from whoever calls [`Tty::receive_byte`],
-//! tomorrow from a serial interrupt - and editing happens here, not in the
-//! reader: backspace, CR-to-LF, and Ctrl-D end-of-file are all resolved before
-//! a read returns. That makes [`Tty::read`] canonical in the POSIX sense: one
-//! read, one line, the newline included.
+//! tomorrow from a serial interrupt - and what happens to them depends on the
+//! settings in [`Termios`]: in canonical mode they are edited into a line here
+//! and a read takes a whole line; in raw mode they go straight to the reader,
+//! which is how a shell does its own editing and how arrow keys reach it as
+//! the sequences a terminal actually sent.
+//!
+//! Editing is more than backspace. The cursor moves through the line, arrows
+//! walk the history, and keys arrive as escape sequences - `ESC [ D` for left,
+//! `ESC [ 3 ~` for delete, `ESC O A` for up - which have to be recognised as
+//! one key rather than as four typed characters. Sequences with no editing
+//! meaning, including a terminal's answers to what a shell asked it (`ESC[6n`
+//! gets `ESC[41;5R` back), are dropped rather than typed: that is the
+//! difference between a working arrow key and a prompt full of `[41;5R`.
 //!
 //! [`LineDiscipline`] is the pure state machine and runs under `cargo test` on
 //! the host. [`Tty`] owns one under a mutex, echoes to the console as bytes are
@@ -18,26 +27,37 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use critical_section::Mutex;
 
-use super::{Inode, Metadata, NodeKind, VfsResult};
+use super::termios::{
+    ECHO, ECHOCTL, ICANON, ICRNL, IEXTEN, IGNCR, INLCR, ISIG, ISTRIP, IXON, Termios, VEOF, VERASE,
+    VINTR, VKILL, VLNEXT, VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VWERASE,
+};
+use super::{Inode, Metadata, NodeKind, Ready, VfsResult};
 use crate::sched::policy::TaskId;
 #[cfg(target_os = "none")]
 use crate::sched::signal::SIGINT;
 
-const BACKSPACE: u8 = 0x08;
 const LF: u8 = b'\n';
 const CR: u8 = b'\r';
-const DEL: u8 = 0x7f;
-/// Ctrl-D. On an empty line it ends input; mid-line it flushes what is typed,
-/// which is how a shell reads `cat` input without a trailing newline.
-const EOF_CHAR: u8 = 0x04;
-/// Ctrl-C: the terminal's interrupt, delivered as SIGINT to whatever is
-/// reading. It is not a character of the line, so it never enters one.
-const INTR_CHAR: u8 = 0x03;
+/// The other key terminals send for erase. `VERASE` is `0x7f`, but a terminal
+/// in raw mode may send `^H` instead, and both mean the same thing to whoever
+/// is typing.
+const BACKSPACE: u8 = 0x08;
+
+/// How many entered lines the up arrow can walk back through.
+const HISTORY_MAX: usize = 64;
+/// How many bytes of an escape sequence's parameters are gathered before the
+/// sequence is given up as a mistake.
+const CSI_MAX: usize = 16;
+/// How much of the current output line is remembered for redrawing. A prompt
+/// fits comfortably; a program that prints a screenful without a newline does
+/// not need to be replayed by the editor.
+const PROMPT_MAX: usize = 128;
 
 /// What one input byte asked for, beyond being edited into the line.
 ///
@@ -51,73 +71,972 @@ pub enum Action {
     Interrupt,
 }
 
-/// One completed input line. `Eof` is not bytes: it is the statement "input
-/// ended here", and a read over it reports 0.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Line {
-    Data(Vec<u8>),
-    Eof,
+/// Where an escape sequence has got to. Anything other than [`Ground`](Self::Ground)
+/// means bytes are being gathered into a key, not typed into a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Esc {
+    Ground,
+    /// Saw `ESC`.
+    Start,
+    /// Saw `ESC [`: control sequence, parameters being gathered.
+    Csi,
+    /// Saw `ESC O`: single-shift, one byte left to read.
+    Ss3,
+    /// Saw `ESC ]`: an operating-system command, ended by BEL.
+    Osc,
+    /// A sequence that swallows exactly one more byte - a character-set
+    /// choice, or a string control's terminator.
+    One,
+}
+
+/// A key that is not a character: what the arrow, editing and keypad keys
+/// send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    Delete,
+    PageUp,
+    PageDown,
+}
+
+/// Where the cursor is on the screen, as far as this kernel can tell.
+///
+/// A shell asks the terminal where the cursor is (`ESC[6n`) before it draws
+/// anything, and waits for the answer before it reads another key. Nobody
+/// answers a question asked into a serial port unless the line discipline
+/// does - so it keeps enough of a display in mind to answer, and lets the
+/// host terminal do the drawing.
+#[derive(Clone, Copy, Debug)]
+struct Screen {
+    row: usize,
+    col: usize,
+    rows: usize,
+    cols: usize,
+}
+
+impl Screen {
+    const fn new() -> Screen {
+        Screen {
+            row: 0,
+            col: 0,
+            rows: 25,
+            cols: 80,
+        }
+    }
+
+    fn put(&mut self) {
+        self.col += 1;
+        if self.col >= self.cols {
+            self.col = 0;
+            self.newline();
+        }
+    }
+
+    fn newline(&mut self) {
+        if self.row + 1 < self.rows {
+            self.row += 1;
+        }
+        self.col = 0;
+    }
+
+    fn left(&mut self, n: usize) {
+        self.col = self.col.saturating_sub(n);
+    }
+
+    fn right(&mut self, n: usize) {
+        self.col = (self.col + n).min(self.cols - 1);
+    }
+
+    fn up(&mut self, n: usize) {
+        self.row = self.row.saturating_sub(n);
+    }
+
+    fn down(&mut self, n: usize) {
+        self.row = (self.row + n).min(self.rows - 1);
+    }
+
+    /// Tab stops every eight columns, which is where every terminal puts them.
+    fn tab(&mut self) {
+        self.col = ((self.col / 8) + 1) * 8;
+        if self.col >= self.cols {
+            self.col = self.cols - 1;
+        }
+    }
 }
 
 /// The editing state machine: input bytes in through [`receive`](Self::receive),
 /// completed lines and console echo out.
-#[derive(Default)]
 pub struct LineDiscipline {
+    /// Bytes waiting for a reader. Canonical mode only ever queues whole
+    /// lines; a reader is free to take less than one.
+    out: VecDeque<u8>,
+    /// The terminal's own answers, kept apart from typed input.
+    ///
+    /// A shell asks where the cursor is and then reads - greedily, taking
+    /// everything that is there. An answer queued behind it would come back
+    /// in the same read as the beginning of the next command, and a reader
+    /// that reaches past the answer for the keys after it loses them. So an
+    /// answer travels on its own, and is read on its own.
+    answer: VecDeque<u8>,
+    /// A read taken over this reports 0: the end of input, which is not a
+    /// character and never becomes one.
+    eof: bool,
+    /// The line being typed, and where the cursor stands within it.
     pending: Vec<u8>,
-    ready: VecDeque<Line>,
+    cursor: usize,
+    /// What the console should show, since the last drain.
     echo: Vec<u8>,
+    /// The settings that decide everything above.
+    tio: Termios,
+    /// Where an escape sequence has got to.
+    esc: Esc,
+    /// The parameter bytes of a `CSI` sequence in flight: `ESC [ 1 ; 5 A`.
+    csi: Vec<u8>,
+    /// Taken literally rather than as a control character: set by `^V`.
+    literal: bool,
+    /// Lines already entered, newest last, for the up and down arrows.
+    history: Vec<Vec<u8>>,
+    /// Which history line is on screen, if one is.
+    hist_at: Option<usize>,
+    /// The line being typed when the up arrow was first pressed, so coming
+    /// back down past the newest history returns it.
+    stash: Vec<u8>,
+    /// What has been printed on the current output line - the shell's prompt,
+    /// in practice. Redrawing the input line means printing it again, and a
+    /// discipline that only sees its own echo has no other way to know it.
+    prompt: Vec<u8>,
+    /// Where an escape sequence in the *output* has got to, so the prompt
+    /// recorder swallows the whole sequence instead of storing a stray `[`.
+    out_esc: Esc,
+    /// The parameters of an output sequence in flight, for the ones whose
+    /// numbers mean something - a cursor move, or a question.
+    out_params: Vec<u8>,
+    /// Where the cursor stands, to answer a shell that asks.
+    screen: Screen,
+}
+
+impl Default for LineDiscipline {
+    fn default() -> LineDiscipline {
+        LineDiscipline::new()
+    }
 }
 
 impl LineDiscipline {
     pub const fn new() -> LineDiscipline {
         LineDiscipline {
+            out: VecDeque::new(),
+            answer: VecDeque::new(),
+            eof: false,
             pending: Vec::new(),
-            ready: VecDeque::new(),
+            cursor: 0,
             echo: Vec::new(),
+            tio: Termios::console_default(),
+            esc: Esc::Ground,
+            csi: Vec::new(),
+            literal: false,
+            history: Vec::new(),
+            hist_at: None,
+            stash: Vec::new(),
+            prompt: Vec::new(),
+            out_esc: Esc::Ground,
+            out_params: Vec::new(),
+            screen: Screen::new(),
         }
     }
 
     /// Feed one input byte, queueing whatever the console should echo, and
     /// report anything the byte asked for beyond editing.
     pub fn receive(&mut self, byte: u8) -> Action {
-        match byte {
-            BACKSPACE | DEL => {
-                if self.pending.pop().is_some() {
-                    // Erase on a terminal: step back, blank, step back again.
-                    self.echo.extend_from_slice(b"\x08 \x08");
-                }
+        // Mid-sequence, a byte belongs to the sequence. Raw mode never gets
+        // here: it hands every byte over unexamined.
+        if self.esc != Esc::Ground {
+            self.esc_byte(byte);
+            return Action::None;
+        }
+        if self.literal {
+            self.literal = false;
+            self.insert(byte);
+            return Action::None;
+        }
+
+        // Signals first: an interrupt is not a character of any line, and it
+        // reaches the reader whether the terminal is cooked or raw.
+        if self.tio.lflag & ISIG != 0 {
+            if byte == self.tio.cc[VINTR] {
+                self.echo_control(b'^', b'C');
+                return Action::Interrupt;
             }
-            CR | LF => self.complete_line(),
-            EOF_CHAR => {
+            // No SIGQUIT and no job control yet: the keys are recognised so
+            // they do not become input, and then have nothing to do.
+            if byte == self.tio.cc[VQUIT] || byte == self.tio.cc[VSUSP] {
+                return Action::None;
+            }
+        }
+        // Flow control is between the terminal and the line, not part of it.
+        if self.tio.iflag & IXON != 0 && (byte == self.tio.cc[VSTOP] || byte == self.tio.cc[VSTART])
+        {
+            return Action::None;
+        }
+
+        let mut byte = byte;
+        if self.tio.iflag & ISTRIP != 0 {
+            byte &= 0x7f;
+        }
+        if byte == CR {
+            if self.tio.iflag & IGNCR != 0 {
+                return Action::None;
+            }
+            if self.tio.iflag & ICRNL != 0 {
+                byte = LF;
+            }
+        } else if byte == LF && self.tio.iflag & INLCR != 0 {
+            byte = CR;
+        }
+
+        if self.tio.lflag & ICANON == 0 {
+            self.raw(byte);
+            return Action::None;
+        }
+        self.canonical(byte)
+    }
+
+    /// Raw input: the byte is the reader's problem, editing included.
+    fn raw(&mut self, byte: u8) {
+        self.out.push_back(byte);
+        if self.echo_on() {
+            self.echo.push(byte);
+        }
+    }
+
+    /// One byte of a line being typed.
+    fn canonical(&mut self, byte: u8) -> Action {
+        let eof = self.tio.cc[VEOF];
+        let erase = self.tio.cc[VERASE];
+        let kill = self.tio.cc[VKILL];
+        let werase = self.tio.cc[VWERASE];
+        let reprint = self.tio.cc[VREPRINT];
+        let lnext = self.tio.cc[VLNEXT];
+        match byte {
+            b'\x1b' if self.tio.lflag & IEXTEN != 0 => {
+                self.esc = Esc::Start;
+                Action::None
+            }
+            LF => {
+                self.complete_line();
+                Action::None
+            }
+            // Without `ICRNL` a CR is an ordinary character; with it, this is
+            // never reached, because the byte was turned into a LF above.
+            CR => {
+                self.insert(CR);
+                Action::None
+            }
+            // Tab, which a shell takes as completion and a line takes as
+            // itself: it is not an editing key, so it belongs in the line.
+            0x09 => {
+                self.insert(0x09);
+                Action::None
+            }
+            b if b == eof => {
                 // Mid-line: flush without the newline. Empty: end of input.
                 if self.pending.is_empty() {
-                    self.ready.push_back(Line::Eof);
+                    self.eof = true;
                 } else {
-                    self.echo.push(LF);
-                    let line = core::mem::take(&mut self.pending);
-                    self.ready.push_back(Line::Data(line));
+                    self.flush();
                 }
+                Action::None
             }
-            // Not input at all: the terminal's own interrupt. The half-typed
-            // line is left alone, as a real terminal leaves it, because the
-            // reader is about to be killed rather than handed a line.
-            INTR_CHAR => return Action::Interrupt,
-            0x20..=0x7e => {
-                self.pending.push(byte);
-                self.echo.push(byte);
+            b if b == erase || b == BACKSPACE => {
+                self.backspace();
+                Action::None
             }
-            // Other control bytes have no editing meaning yet; keep them out
-            // of the line rather than passing them through raw.
-            _ => {}
+            b if b == kill => {
+                self.kill_line();
+                Action::None
+            }
+            b if b == werase => {
+                self.erase_word();
+                Action::None
+            }
+            b if b == reprint => {
+                self.echo.push(CR);
+                self.redraw();
+                Action::None
+            }
+            b if b == lnext => {
+                self.literal = true;
+                Action::None
+            }
+            // The keys a real line editor offers. A shell that runs in raw
+            // mode brings its own; these are for the one this kernel edits.
+            // The control characters termios can name are matched above, so
+            // these are the ones it cannot: a program that moves ^D elsewhere
+            // gets 0x04 as an ordinary byte rather than a surprise.
+            0x01 => {
+                self.go_home();
+                Action::None
+            } // ^A
+            0x02 => self.go_left(), // ^B
+            0x05 => {
+                self.go_end();
+                Action::None
+            } // ^E
+            0x06 => self.go_right(), // ^F
+            0x0b => {
+                self.kill_to_end();
+                Action::None
+            } // ^K
+            0x0c => self.clear_screen(), // ^L
+            0x0e => self.history_next(), // ^N
+            0x10 => self.history_prev(), // ^P
+            0x14 => {
+                self.transpose();
+                Action::None
+            } // ^T
+            // Printable, and the bytes of a UTF-8 character beyond ASCII.
+            b if b >= 0x20 && b != 0x7f => {
+                self.insert(b);
+                Action::None
+            }
+            // Any other control byte has no editing meaning; keep it out of
+            // the line rather than passing it through raw.
+            _ => Action::None,
+        }
+    }
+
+    // --- editing the line ---
+
+    fn insert(&mut self, byte: u8) {
+        if self.cursor >= self.pending.len() {
+            self.pending.push(byte);
+        } else {
+            self.pending.insert(self.cursor, byte);
+        }
+        self.cursor += 1;
+        if self.echo_on() {
+            self.echo.push(byte);
+            // Typed into the middle: everything after the cursor has to be
+            // pushed along on screen, and the cursor put back where it was.
+            if self.cursor < self.pending.len() {
+                self.echo.extend_from_slice(&self.pending[self.cursor..]);
+                self.echo_left(self.pending.len() - self.cursor);
+            }
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        self.pending.remove(self.cursor);
+        if self.echo_on() {
+            if self.cursor == self.pending.len() {
+                // Erase on a terminal: step back, blank, step back again.
+                self.echo.extend_from_slice(b"\x08 \x08");
+            } else {
+                self.redraw();
+            }
+        }
+    }
+
+    /// Delete under the cursor, which is what the Delete key does - the key
+    /// `erase` is not, since that one deletes behind it.
+    fn delete_at_cursor(&mut self) {
+        if self.cursor >= self.pending.len() {
+            return;
+        }
+        self.pending.remove(self.cursor);
+        if self.echo_on() {
+            // DCH: delete one character under the cursor, closing the gap.
+            self.echo.extend_from_slice(b"\x1b[P");
+        }
+    }
+
+    fn kill_line(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.pending.clear();
+        self.cursor = 0;
+        if self.echo_on() {
+            self.redraw();
+        }
+    }
+
+    fn kill_to_end(&mut self) {
+        if self.cursor >= self.pending.len() {
+            return;
+        }
+        self.pending.truncate(self.cursor);
+        if self.echo_on() {
+            self.echo.extend_from_slice(b"\x1b[K");
+        }
+    }
+
+    /// `^W`: the word behind the cursor, and the spaces in front of it.
+    fn erase_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let mut end = self.cursor;
+        while end > 0 && self.pending[end - 1] == b' ' {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && self.pending[start - 1] != b' ' {
+            start -= 1;
+        }
+        self.pending.drain(start..self.cursor);
+        self.cursor = start;
+        if self.echo_on() {
+            self.redraw();
+        }
+    }
+
+    /// `^T`: swap the two characters behind the cursor.
+    fn transpose(&mut self) {
+        if self.cursor < 2 || self.cursor > self.pending.len() {
+            return;
+        }
+        self.pending.swap(self.cursor - 2, self.cursor - 1);
+        if self.echo_on() {
+            self.redraw();
+        }
+    }
+
+    fn go_left(&mut self) -> Action {
+        if self.cursor == 0 {
+            return Action::None;
+        }
+        self.cursor -= 1;
+        if self.echo_on() {
+            self.echo.extend_from_slice(b"\x1b[D");
         }
         Action::None
     }
 
+    fn go_right(&mut self) -> Action {
+        if self.cursor >= self.pending.len() {
+            return Action::None;
+        }
+        self.cursor += 1;
+        if self.echo_on() {
+            self.echo.extend_from_slice(b"\x1b[C");
+        }
+        Action::None
+    }
+
+    fn go_home(&mut self) -> Action {
+        if self.cursor == 0 {
+            return Action::None;
+        }
+        self.cursor = 0;
+        if self.echo_on() {
+            self.echo.push(CR);
+            self.echo_right(self.prompt.len());
+        }
+        Action::None
+    }
+
+    fn go_end(&mut self) -> Action {
+        if self.cursor >= self.pending.len() {
+            return Action::None;
+        }
+        let n = self.pending.len() - self.cursor;
+        self.cursor = self.pending.len();
+        if self.echo_on() {
+            self.echo_right(n);
+        }
+        Action::None
+    }
+
+    fn clear_screen(&mut self) -> Action {
+        if self.echo_on() {
+            self.echo.extend_from_slice(b"\x1b[2J\x1b[H");
+            self.redraw();
+        }
+        Action::None
+    }
+
+    // --- history ---
+
+    fn history_prev(&mut self) -> Action {
+        if self.history.is_empty() {
+            return Action::None;
+        }
+        if self.hist_at.is_none() {
+            self.stash = self.pending.clone();
+            self.hist_at = Some(self.history.len());
+        }
+        let at = self.hist_at.unwrap_or(self.history.len());
+        if at == 0 {
+            return Action::None;
+        }
+        self.hist_at = Some(at - 1);
+        self.pending = self.history[at - 1].clone();
+        self.cursor = self.pending.len();
+        self.redraw();
+        Action::None
+    }
+
+    fn history_next(&mut self) -> Action {
+        let at = match self.hist_at {
+            Some(at) => at,
+            None => return Action::None,
+        };
+        if at + 1 < self.history.len() {
+            self.hist_at = Some(at + 1);
+            self.pending = self.history[at + 1].clone();
+        } else {
+            // Past the newest: back to what was being typed before.
+            self.hist_at = None;
+            self.pending = core::mem::take(&mut self.stash);
+        }
+        self.cursor = self.pending.len();
+        self.redraw();
+        Action::None
+    }
+
+    fn remember(&mut self, line: &[u8]) {
+        if line.is_empty() || self.history.last().map(Vec::as_slice) == Some(line) {
+            return;
+        }
+        self.history.push(line.to_vec());
+        if self.history.len() > HISTORY_MAX {
+            self.history.remove(0);
+        }
+    }
+
+    // --- completing input ---
+
     fn complete_line(&mut self) {
         self.pending.push(LF);
-        self.echo.push(LF);
+        if self.echo_on() {
+            self.echo.push(LF);
+        }
         let line = core::mem::take(&mut self.pending);
-        self.ready.push_back(Line::Data(line));
+        self.cursor = 0;
+        self.hist_at = None;
+        self.remember(&line[..line.len() - 1]);
+        self.out.extend(line.iter().copied());
+    }
+
+    /// `^D` mid-line: hand over what is typed, without a newline.
+    fn flush(&mut self) {
+        if self.echo_on() {
+            self.echo.push(LF);
+        }
+        let line = core::mem::take(&mut self.pending);
+        self.cursor = 0;
+        self.hist_at = None;
+        self.remember(&line);
+        self.out.extend(line);
+    }
+
+    // --- echo ---
+
+    fn echo_on(&self) -> bool {
+        self.tio.lflag & ECHO != 0
+    }
+
+    /// Show `^C` for the key that interrupted, the way a terminal does, so the
+    /// line on screen still matches what was typed.
+    fn echo_control(&mut self, first: u8, second: u8) {
+        if self.echo_on() && self.tio.lflag & ECHOCTL != 0 {
+            self.echo.push(first);
+            self.echo.push(second);
+            self.echo.push(LF);
+        }
+    }
+
+    fn echo_left(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.echo.extend_from_slice(b"\x1b[");
+        self.echo.extend_from_slice(Self::decimal(n).as_slice());
+        self.echo.push(b'D');
+    }
+
+    fn echo_right(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.echo.extend_from_slice(b"\x1b[");
+        self.echo.extend_from_slice(Self::decimal(n).as_slice());
+        self.echo.push(b'C');
+    }
+
+    fn decimal(mut n: usize) -> Vec<u8> {
+        let mut digits = [0u8; 8];
+        let mut at = digits.len();
+        if n == 0 {
+            return vec![b'0'];
+        }
+        while n > 0 {
+            at -= 1;
+            digits[at] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        digits[at..].to_vec()
+    }
+
+    /// Put the line on screen again from the prompt onwards - after a history
+    /// move, a word erased mid-line, or a `^L`.
+    fn redraw(&mut self) {
+        if !self.echo_on() {
+            return;
+        }
+        self.echo.push(CR);
+        self.echo.extend_from_slice(&self.prompt);
+        // EL: erase to the end of the line, so a shorter line leaves nothing
+        // of the longer one behind it.
+        self.echo.extend_from_slice(b"\x1b[K");
+        self.echo.extend_from_slice(&self.pending);
+        let back = self.pending.len() - self.cursor;
+        self.echo_left(back);
+    }
+
+    // --- escape sequences ---
+
+    fn esc_byte(&mut self, byte: u8) {
+        match self.esc {
+            Esc::Ground => {}
+            Esc::Start => match byte {
+                b'[' => {
+                    self.esc = Esc::Csi;
+                    self.csi.clear();
+                }
+                b'O' => self.esc = Esc::Ss3,
+                b']' => self.esc = Esc::Osc,
+                // A character-set choice: `ESC ( B`. One byte, no meaning here.
+                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => self.esc = Esc::One,
+                b'P' | b'X' | b'^' | b'_' => self.esc = Esc::Osc,
+                // `ESC ESC` starts over, anything else is not a sequence after
+                // all: drop it and carry on with the next byte.
+                b'\x1b' => {}
+                _ => self.esc = Esc::Ground,
+            },
+            Esc::Csi => match byte {
+                // Parameters and intermediates: `1`, `;`, `5`, `?`.
+                0x20..=0x3f => {
+                    if self.csi.len() < CSI_MAX {
+                        self.csi.push(byte);
+                    }
+                }
+                // The final byte ends the sequence and says what key it was.
+                0x40..=0x7e => {
+                    let params = core::mem::take(&mut self.csi);
+                    self.esc = Esc::Ground;
+                    if let Some(key) = Self::csi_key(byte, &params) {
+                        self.apply(key);
+                    }
+                }
+                // A control byte mid-sequence: the sequence is nonsense.
+                _ => {
+                    self.csi.clear();
+                    self.esc = Esc::Ground;
+                }
+            },
+            Esc::Ss3 => {
+                self.esc = Esc::Ground;
+                if let Some(key) = Self::ss3_key(byte) {
+                    self.apply(key);
+                }
+            }
+            Esc::Osc => {
+                // Ended by BEL, or by `ESC \`.
+                if byte == 0x07 {
+                    self.esc = Esc::Ground;
+                } else if byte == b'\x1b' {
+                    self.esc = Esc::One;
+                }
+            }
+            Esc::One => self.esc = Esc::Ground,
+        }
+    }
+
+    /// What key a `CSI` sequence was, if it was a key at all.
+    ///
+    /// A modifier comes as an extra parameter - `ESC [ 1 ; 5 C` is Ctrl-right -
+    /// and is ignored: a shifted arrow is still the arrow, which is what
+    /// whoever held the modifier meant to press.
+    fn csi_key(final_byte: u8, params: &[u8]) -> Option<Key> {
+        let (first, _modifier) = Self::params(params);
+        match final_byte {
+            b'A' => Some(Key::Up),
+            b'B' => Some(Key::Down),
+            b'C' => Some(Key::Right),
+            b'D' => Some(Key::Left),
+            b'E' => Some(Key::Down),
+            b'H' => Some(Key::Home),
+            b'F' => Some(Key::End),
+            b'P' => Some(Key::Delete),
+            b'~' => match first {
+                1 | 7 => Some(Key::Home),
+                3 => Some(Key::Delete),
+                4 | 8 => Some(Key::End),
+                5 => Some(Key::PageUp),
+                6 => Some(Key::PageDown),
+                _ => None,
+            },
+            // Everything else - a cursor position report, a mode set, a
+            // question answered - is not a key, and is not typed either.
+            _ => None,
+        }
+    }
+
+    /// What key an `ESC O` sequence was: the same arrows, in the mode an
+    /// application asks a terminal to use.
+    fn ss3_key(byte: u8) -> Option<Key> {
+        match byte {
+            b'A' => Some(Key::Up),
+            b'B' => Some(Key::Down),
+            b'C' => Some(Key::Right),
+            b'D' => Some(Key::Left),
+            b'H' => Some(Key::Home),
+            b'F' => Some(Key::End),
+            _ => None,
+        }
+    }
+
+    /// The first and last numeric parameters of a sequence. A parameter left
+    /// out - `ESC [ ; 5 A` - means its default, which for these is 1, and a
+    /// bare `ESC [ A` is the same as `ESC [ 1 A`.
+    fn params(bytes: &[u8]) -> (usize, usize) {
+        let mut nums = [1usize; 4];
+        let mut count = 0usize;
+        let mut cur: Option<usize> = None;
+        for &b in bytes {
+            if b.is_ascii_digit() {
+                let d = (b - b'0') as usize;
+                cur = Some(cur.unwrap_or(0) * 10 + d);
+            } else if count < nums.len() {
+                nums[count] = cur.take().unwrap_or(1);
+                count += 1;
+            } else {
+                cur = None;
+            }
+        }
+        if count < nums.len() {
+            nums[count] = cur.take().unwrap_or(1);
+            count += 1;
+        }
+        let first = nums[0];
+        let last = nums[count.saturating_sub(1)];
+        (first, if last == 0 { 1 } else { last })
+    }
+
+    fn apply(&mut self, key: Key) {
+        match key {
+            Key::Up => {
+                self.history_prev();
+            }
+            Key::Down => {
+                self.history_next();
+            }
+            Key::Left => {
+                self.go_left();
+            }
+            Key::Right => {
+                self.go_right();
+            }
+            Key::Home => {
+                self.go_home();
+            }
+            Key::End => {
+                self.go_end();
+            }
+            Key::Delete => self.delete_at_cursor(),
+            // No scrolling buffer to page through yet.
+            Key::PageUp | Key::PageDown => {}
+        }
+    }
+
+    // --- the reader's side ---
+
+    /// Record what went out on the console, so a redrawn input line can be put
+    /// back where the prompt left it.
+    ///
+    /// Only what is printed while nothing is being typed is worth keeping:
+    /// once there is a line being edited, the rest of the output line is the
+    /// editor's own echo and would be replayed twice.
+    ///
+    /// Returns what `write_at` should put on the wire instead of the caller's
+    /// buffer: the same bytes minus the device-status questions this line
+    /// discipline answers itself. `None` - the common case - means forward
+    /// everything untouched.
+    pub fn note_output(&mut self, bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+        // A question the discipline answers itself must not also reach the
+        // wire: whatever real terminal sits beyond it would answer too, and
+        // that second answer comes back as typed input - the ghost `R` a
+        // fresh prompt showed, parsed and half-echoed by the shell.
+        let mut swallowed: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        // Where the sequence in flight began: byte 0 when it began in an
+        // earlier call, the ESC's own index once this call has seen it.
+        let mut seq_start = if self.out_esc != Esc::Ground {
+            Some(0usize)
+        } else {
+            None
+        };
+        for (i, &b) in bytes.iter().enumerate() {
+            match (self.out_esc, b) {
+                // An OSC ends on BEL, or on `ESC \`.
+                (Esc::Osc, 0x07) => self.out_esc = Esc::Ground,
+                (Esc::Osc, 0x1b) => self.out_esc = Esc::One,
+                (Esc::Osc, _) => {}
+                (_, 0x1b) => {
+                    self.out_esc = Esc::Start;
+                    self.out_params.clear();
+                    seq_start = Some(i);
+                }
+                (Esc::Start, b'[') => {
+                    self.out_esc = Esc::Csi;
+                    self.out_params.clear();
+                }
+                (Esc::Start, b']' | b'P' | b'X') => self.out_esc = Esc::Osc,
+                // A character-set choice: `ESC ( B`, one byte more.
+                (Esc::Start, 0x20..=0x2f) => self.out_esc = Esc::One,
+                (Esc::Start, _) => self.out_esc = Esc::Ground,
+                // Parameters and intermediates; the sequence ends on the
+                // final byte, which is anything from `@` to `~`.
+                (Esc::Csi, 0x20..=0x3f) => {
+                    if self.out_params.len() < CSI_MAX {
+                        self.out_params.push(b);
+                    }
+                }
+                (Esc::Csi, _) => {
+                    let params = core::mem::take(&mut self.out_params);
+                    self.out_esc = Esc::Ground;
+                    if b == b'n'
+                        && matches!(params.first(), Some(b'5') | Some(b'6'))
+                        && let Some(start) = seq_start
+                    {
+                        swallowed.push((start, i + 1));
+                    }
+                    seq_start = None;
+                    self.output_csi(b, &params);
+                }
+                (Esc::One, _) => self.out_esc = Esc::Ground,
+                (Esc::Ground, LF) => {
+                    self.prompt.clear();
+                    self.screen.newline();
+                }
+                (Esc::Ground, CR) => {
+                    self.prompt.clear();
+                    self.screen.col = 0;
+                }
+                (Esc::Ground, 0x08) => {
+                    self.prompt.pop();
+                    self.screen.left(1);
+                }
+                (Esc::Ground, 0x09) => self.screen.tab(),
+                // A bell says nothing and moves nothing.
+                (Esc::Ground, 0x07) => {}
+                (Esc::Ground, _) if self.pending.is_empty() && self.prompt.len() < PROMPT_MAX => {
+                    self.prompt.push(b);
+                    self.screen.put();
+                }
+                _ => self.screen.put(),
+            }
+        }
+        if swallowed.is_empty() {
+            return None;
+        }
+        let mut out = alloc::vec::Vec::with_capacity(bytes.len());
+        let mut at = 0usize;
+        for (start, end) in swallowed {
+            out.extend_from_slice(&bytes[at..start]);
+            at = end;
+        }
+        out.extend_from_slice(&bytes[at..]);
+        Some(out)
+    }
+
+    /// One finished output sequence: move the cursor this line discipline is
+    /// pretending to have, or answer the question the sequence asked.
+    fn output_csi(&mut self, final_byte: u8, params: &[u8]) {
+        let (first, second) = Self::params(params);
+        match final_byte {
+            b'A' => self.screen.up(first),
+            b'B' | b'e' => self.screen.down(first),
+            b'C' | b'a' => self.screen.right(first),
+            b'D' => self.screen.left(first),
+            b'E' => {
+                self.screen.down(first);
+                self.screen.col = 0;
+            }
+            b'F' => {
+                self.screen.up(first);
+                self.screen.col = 0;
+            }
+            b'G' | b'`' => self.screen.col = first.saturating_sub(1),
+            b'd' => self.screen.row = first.saturating_sub(1),
+            b'H' | b'f' => {
+                self.screen.row = first.saturating_sub(1);
+                self.screen.col = second.saturating_sub(1);
+            }
+            // Erasing. `2J` clears the screen and homes the cursor, which is
+            // what a `clear` sends and what `^L` asks for.
+            b'J' => {
+                if first >= 2 {
+                    self.screen.row = 0;
+                    self.screen.col = 0;
+                }
+            }
+            b'K' => {}
+            b'n' => {
+                // A question. `5n` asks whether the terminal is there; `6n`
+                // asks where the cursor is, and a shell waits for the answer
+                // before it reads another key - so the answer goes back the
+                // way a terminal's would: as input.
+                if first == 5 {
+                    self.answer(b"\x1b[0n");
+                } else if first == 6 {
+                    self.answer(b"\x1b[");
+                    let row = Self::decimal(self.screen.row + 1);
+                    self.answer(&row);
+                    self.answer(b";");
+                    let col = Self::decimal(self.screen.col + 1);
+                    self.answer(&col);
+                    self.answer(b"R");
+                }
+            }
+            // Everything else - colours, modes, scrolling regions - is drawn
+            // by the host terminal and costs the cursor nothing.
+            _ => {}
+        }
+    }
+
+    /// Reply the way a terminal replies: on the input side.
+    fn answer(&mut self, bytes: &[u8]) {
+        self.answer.extend(bytes.iter().copied());
+    }
+
+    pub fn termios(&self) -> Termios {
+        self.tio
+    }
+
+    pub fn set_termios(&mut self, tio: Termios) {
+        let was_canonical = self.tio.lflag & ICANON != 0;
+        self.tio = tio;
+        // A sequence in flight belonged to the settings that were.
+        self.esc = Esc::Ground;
+        self.csi.clear();
+        self.literal = false;
+        // What was being typed belongs to whoever reads next, not to the mode
+        // that was: a shell switching out of canonical mode mid-keystroke
+        // would otherwise leave the start of the line behind it, and read a
+        // command with its first characters missing.
+        if was_canonical && !self.pending.is_empty() {
+            self.flush();
+        }
     }
 
     /// The echo queued since the last drain.
@@ -126,19 +1045,58 @@ impl LineDiscipline {
     }
 
     pub fn has_ready(&self) -> bool {
-        !self.ready.is_empty()
+        if !self.answer.is_empty() || self.eof {
+            return true;
+        }
+        if self.tio.lflag & ICANON != 0 {
+            !self.out.is_empty()
+        } else {
+            // Raw, and `VMIN` is how many bytes a read waits for. One is the
+            // usual answer, and zero would make every read return nothing at
+            // all, which reads as end-of-file, so one it is.
+            self.out.len() >= self.tio.cc[VMIN].max(1) as usize
+        }
     }
 
-    /// Take one completed line, in at most `want` bytes of it. A longer line
-    /// stays queued minus the part taken, so the next read continues it.
-    pub fn take_line(&mut self, want: usize) -> Option<Line> {
-        match self.ready.pop_front() {
-            Some(Line::Data(bytes)) if bytes.len() > want => {
-                self.ready.push_front(Line::Data(bytes[want..].to_vec()));
-                Some(Line::Data(bytes[..want].to_vec()))
-            }
-            other => other,
+    /// Take what a read asked for: at most `want` bytes, and in canonical
+    /// mode at most one line, because that is what a canonical read means.
+    ///
+    /// `None` means nothing is ready yet - not the same as the empty slice,
+    /// which is the end of input. The end of input comes last: `^D` after a
+    /// half-typed line hands the line over first, and reports the end only
+    /// once there is nothing left to read.
+    pub fn take(&mut self, want: usize) -> Option<Vec<u8>> {
+        // An answer is read on its own: never together with what was typed
+        // after it, which a greedy reader would take and then lose.
+        if !self.answer.is_empty() {
+            let n = self.answer.len().min(want);
+            return Some(self.answer.drain(..n).collect());
         }
+        if self.out.is_empty() {
+            if self.eof {
+                self.eof = false;
+                return Some(Vec::new());
+            }
+            return None;
+        }
+        let take = if self.tio.lflag & ICANON != 0 {
+            // Up to and including the newline, but never more than asked for.
+            let upto = self
+                .out
+                .iter()
+                .position(|&b| b == LF)
+                .map_or(self.out.len(), |i| i + 1);
+            upto.min(want)
+        } else {
+            self.out.len().min(want)
+        };
+        Some(self.out.drain(..take).collect())
+    }
+
+    /// The line being edited, for tests and for anyone who must draw it.
+    #[cfg(test)]
+    fn line(&self) -> Vec<u8> {
+        self.pending.clone()
     }
 }
 
@@ -188,38 +1146,59 @@ impl Tty {
             for id in waiters {
                 crate::sched::wake(id);
             }
+            // The interrupt goes to the foreground *process group*, not to the
+            // one program reading: a pipeline is three processes and one job,
+            // and Ctrl-C is aimed at the job. It is also what keeps the shell
+            // alive - a shell sitting in `wait` has left the foreground group,
+            // so the signal never reaches it.
             if action == Action::Interrupt
-                && let Some(id) = foreground
+                && let Some(pgid) = foreground
             {
-                crate::sched::send_signal(id, SIGINT);
+                crate::sched::send_signal_group(pgid, SIGINT);
             }
         }
         #[cfg(not(target_os = "none"))]
         drop((echo, action, waiters, foreground));
     }
 
-    /// Remember who an interrupt belongs to.
+    /// Remember which process group an interrupt belongs to.
     ///
-    /// Set while a task is reading, and moved to a child the moment its parent
-    /// spawns it: the shell is only the foreground between commands. Once it
-    /// has started a program and is waiting for it, a Ctrl-C is meant for the
-    /// program - that is the whole convention, and a `wait`ing shell that took
-    /// the interrupt itself would die where a real one prints a new prompt.
+    /// A shell claims this for each job it starts and takes it back when the
+    /// job finishes - through `TIOCSPGRP`, exactly as on Linux. A `wait`ing
+    /// shell is therefore not in the foreground group, and a Ctrl-C aimed at a
+    /// running command does not reach it: that is the whole convention, and a
+    /// shell that took the interrupt itself would die where a real one prints
+    /// a new prompt.
     #[cfg(target_os = "none")]
-    pub fn set_foreground(&self, id: Option<TaskId>) {
+    pub fn set_foreground(&self, pgid: Option<TaskId>) {
         critical_section::with(|cs| {
-            *self.foreground.borrow(cs).borrow_mut() = id;
+            *self.foreground.borrow(cs).borrow_mut() = pgid;
         });
     }
 
-    /// Whether `id` is the task an interrupt from this tty would reach.
+    /// Whether `id` is in the group an interrupt from this tty would reach.
+    #[cfg(target_os = "none")]
     pub fn is_foreground(&self, id: TaskId) -> bool {
-        critical_section::with(|cs| *self.foreground.borrow(cs).borrow() == Some(id))
+        let Some(pgid) = self.foreground() else {
+            return false;
+        };
+        crate::sched::pgid_of(id) == Some(pgid)
     }
 
-    /// The task an interrupt would reach, if any.
+    /// The process group an interrupt would reach, if any.
     pub fn foreground(&self) -> Option<TaskId> {
         critical_section::with(|cs| *self.foreground.borrow(cs).borrow())
+    }
+
+    /// What the terminal is set to. `TCGETS` reads this.
+    pub fn termios(&self) -> Termios {
+        critical_section::with(|cs| self.ld.borrow(cs).borrow().termios())
+    }
+
+    /// Set what the terminal is. `TCSETS` and its two flushing cousins write
+    /// this; there is no output queue to drain, so all three do the same.
+    pub fn set_termios(&self, tio: Termios) {
+        critical_section::with(|cs| self.ld.borrow(cs).borrow_mut().set_termios(tio));
     }
 
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
@@ -227,8 +1206,9 @@ impl Tty {
         critical_section::with(|cs| self.ld.borrow(cs).borrow().has_ready())
     }
 
-    /// Blocking canonical read: at most one line, or 0 once input has ended.
-    /// Never errors; the size is what the syscall returns.
+    /// Blocking read: in canonical mode at most one line, in raw mode as much
+    /// as is there, and 0 once input has ended. Never errors; the size is
+    /// what the syscall returns.
     #[cfg(target_os = "none")]
     pub fn read(&self, buf: &mut [u8]) -> usize {
         if buf.is_empty() {
@@ -237,8 +1217,10 @@ impl Tty {
         let id = crate::sched::current();
         critical_section::with(|cs| self.waiters.borrow(cs).borrow_mut().push(id));
         // While this task is reading, an interrupt typed at the console is
-        // meant for it - not for whatever waits on it.
-        self.set_foreground(Some(id));
+        // meant for its process group - not for whatever waits on it. A shell
+        // that has claimed the terminal with `TIOCSPGRP` has already said who
+        // that is; this is the same answer for a program that never asks.
+        self.set_foreground(Some(crate::sched::pgid_of(id).unwrap_or(id)));
         let got = self.read_blocking(buf);
         critical_section::with(|cs| {
             self.waiters.borrow(cs).borrow_mut().retain(|&w| w != id);
@@ -260,16 +1242,12 @@ impl Tty {
     fn read_blocking(&self, buf: &mut [u8]) -> usize {
         loop {
             crate::sched::block_until(|| self.has_ready());
-            let line =
-                critical_section::with(|cs| self.ld.borrow(cs).borrow_mut().take_line(buf.len()));
-            match line {
-                Some(Line::Data(bytes)) => {
-                    buf[..bytes.len()].copy_from_slice(&bytes);
-                    return bytes.len();
-                }
-                Some(Line::Eof) => return 0,
-                // Another reader took the line first; wait for the next one.
-                None => {}
+            let got = critical_section::with(|cs| self.ld.borrow(cs).borrow_mut().take(buf.len()));
+            // `None` means another reader took it first; wait for the next one.
+            if let Some(bytes) = got {
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                return n;
             }
         }
     }
@@ -316,13 +1294,70 @@ impl Inode for Tty {
         }
     }
 
+    /// Termios ioctls are answered by the device, and a descriptor only says
+    /// which device it is by handing back the inode it points at.
+    fn as_tty(&self) -> Option<&Tty> {
+        Some(self)
+    }
+
+    fn poll_ready(&self) -> Ready {
+        Ready {
+            // A completed line is what a read takes. Bytes still being typed
+            // are not readable yet: canonical mode holds them until Enter.
+            read: self.has_ready(),
+            write: true,
+        }
+    }
+
+    /// Join the list `receive_byte` wakes when a line completes. Without this a
+    /// `poll` on the console would sleep through the very keystrokes it is
+    /// waiting for - the wake goes to this list, not to the sleep queue.
+    fn poll_subscribe(&self, id: TaskId) {
+        critical_section::with(|cs| {
+            let mut waiters = self.waiters.borrow(cs).borrow_mut();
+            if !waiters.contains(&id) {
+                waiters.push(id);
+            }
+        });
+    }
+
+    fn poll_unsubscribe(&self, id: TaskId) {
+        critical_section::with(|cs| {
+            self.waiters.borrow(cs).borrow_mut().retain(|&w| w != id);
+        });
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         Ok(self.read(buf))
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
         #[cfg(target_os = "none")]
-        crate::console::write_bytes(buf);
+        {
+            // Output can be input: a shell that asks where the cursor is gets
+            // its answer here, and a reader waiting on that answer has to be
+            // woken exactly as if the bytes had been typed.
+            let (forwarded, waiters) = critical_section::with(|cs| {
+                let mut ld = self.ld.borrow(cs).borrow_mut();
+                let forwarded = ld.note_output(buf);
+                let waiters = if ld.has_ready() {
+                    core::mem::take(&mut *self.waiters.borrow(cs).borrow_mut())
+                } else {
+                    Vec::new()
+                };
+                (forwarded, waiters)
+            });
+            // What the discipline answered itself does not travel on: the
+            // question would only be asked twice, once of a real terminal
+            // whose reply has nowhere useful to go.
+            match forwarded {
+                Some(bytes) => crate::console::write_bytes(&bytes),
+                None => crate::console::write_bytes(buf),
+            }
+            for id in waiters {
+                crate::sched::wake(id);
+            }
+        }
         #[cfg(not(target_os = "none"))]
         let _ = buf;
         Ok(buf.len())
@@ -334,7 +1369,8 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{Action, Line, LineDiscipline};
+    use super::{Action, Key, LineDiscipline};
+    use crate::vfs::termios::{ECHO, ECHOCTL, ICANON, ICRNL, ISIG, VERASE, VMIN};
 
     fn fed(bytes: &[u8]) -> LineDiscipline {
         let mut ld = LineDiscipline::new();
@@ -345,10 +1381,10 @@ mod tests {
         ld
     }
 
-    fn lines(ld: &mut LineDiscipline) -> Vec<Line> {
+    fn lines(ld: &mut LineDiscipline) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        while let Some(line) = ld.take_line(64) {
-            out.push(line);
+        while let Some(bytes) = ld.take(64) {
+            out.push(bytes);
         }
         out
     }
@@ -358,7 +1394,7 @@ mod tests {
         let mut ld = fed(b"hi\r");
         assert_eq!(ld.take_echo(), b"hi\n");
         // CR is Enter; the completed line carries the newline a reader expects.
-        assert_eq!(lines(&mut ld), vec![Line::Data(b"hi\n".to_vec())]);
+        assert_eq!(lines(&mut ld), vec![b"hi\n".to_vec()]);
         assert!(!ld.has_ready());
     }
 
@@ -366,43 +1402,42 @@ mod tests {
     fn backspace_edits_the_pending_line_and_its_echo() {
         let mut ld = fed(b"ab\x7fc\n");
         assert_eq!(ld.take_echo(), b"ab\x08 \x08c\n");
-        assert_eq!(lines(&mut ld), vec![Line::Data(b"ac\n".to_vec())]);
+        assert_eq!(lines(&mut ld), vec![b"ac\n".to_vec()]);
 
         // Backspacing an empty line edits nothing and echoes nothing.
         let mut ld = fed(b"\x08\n");
         assert_eq!(ld.take_echo(), b"\n");
-        assert_eq!(lines(&mut ld), vec![Line::Data(b"\n".to_vec())]);
+        assert_eq!(lines(&mut ld), vec![b"\n".to_vec()]);
     }
 
     #[test]
     fn ctrl_d_on_an_empty_line_is_eof_and_mid_line_is_a_flush() {
         let mut ld = fed(b"hi\n\x04");
-        assert_eq!(
-            lines(&mut ld),
-            vec![Line::Data(b"hi\n".to_vec()), Line::Eof]
-        );
+        assert_eq!(lines(&mut ld), vec![b"hi\n".to_vec(), Vec::new()]);
 
         // A flush carries no newline: the reader gets the half-typed line as-is.
         let mut ld = fed(b"hi\x04");
-        assert_eq!(lines(&mut ld), vec![Line::Data(b"hi".to_vec())]);
+        assert_eq!(lines(&mut ld), vec![b"hi".to_vec()]);
         assert!(!ld.has_ready());
     }
 
     #[test]
     fn a_read_takes_at_most_one_line_and_longer_lines_continue() {
         let mut ld = fed(b"abcdef\n");
-        assert_eq!(ld.take_line(3), Some(Line::Data(b"abc".to_vec())));
+        assert_eq!(ld.take(3), Some(b"abc".to_vec()));
         assert!(ld.has_ready(), "the rest of the line is still queued");
-        assert_eq!(ld.take_line(3), Some(Line::Data(b"def".to_vec())));
-        assert_eq!(ld.take_line(3), Some(Line::Data(b"\n".to_vec())));
-        assert_eq!(ld.take_line(3), None);
+        assert_eq!(ld.take(3), Some(b"def".to_vec()));
+        assert_eq!(ld.take(3), Some(b"\n".to_vec()));
+        assert_eq!(ld.take(3), None);
     }
 
     #[test]
     fn control_bytes_without_editing_meaning_are_dropped() {
         let mut ld = fed(b"\x01\x02x\n");
+        // ^A and ^B move the cursor rather than being typed, and at the start
+        // of an empty line there is nowhere to move, so nothing is echoed.
         assert_eq!(ld.take_echo(), b"x\n");
-        assert_eq!(lines(&mut ld), vec![Line::Data(b"x\n".to_vec())]);
+        assert_eq!(lines(&mut ld), vec![b"x\n".to_vec()]);
     }
 
     #[test]
@@ -423,12 +1458,376 @@ mod tests {
         // when the reader it belonged to is about to be killed.
         assert_eq!(ld.receive(0x03), Action::Interrupt);
         assert!(!ld.has_ready(), "an interrupt completes no line");
-        assert_eq!(ld.take_echo(), b"hi", "nothing is echoed for Ctrl-C");
+        assert_eq!(
+            ld.take_echo(),
+            b"hi^C\n",
+            "the interrupt is shown, not typed"
+        );
 
         // Typing on afterwards continues the same line, so a Ctrl-C that
         // nobody was around to receive costs nothing.
         let _ = ld.receive(b'!');
         let _ = ld.receive(b'\n');
-        assert_eq!(lines(&mut ld), vec![Line::Data(b"hi!\n".to_vec())]);
+        assert_eq!(lines(&mut ld), vec![b"hi!\n".to_vec()]);
+    }
+
+    // --- arrow keys and friends: the point of the whole exercise ---
+
+    #[test]
+    fn arrow_keys_are_one_key_each_and_not_four_characters() {
+        let mut ld = fed(b"ls");
+        for &b in b"\x1b[D" {
+            assert_eq!(ld.receive(b), Action::None);
+        }
+        assert_eq!(
+            ld.line(),
+            b"ls".to_vec(),
+            "left moved the cursor, not the text"
+        );
+        let _ = ld.receive(b'x');
+        // Typed between the two characters: `lxs`.
+        assert_eq!(ld.line(), b"lxs".to_vec());
+
+        let _ = ld.receive(b'\n');
+        assert_eq!(
+            lines(&mut ld),
+            vec![b"lxs\n".to_vec()],
+            "no `[`, `D` or ESC reached the line"
+        );
+    }
+
+    #[test]
+    fn a_modified_arrow_still_just_moves_the_cursor() {
+        // `ESC [ 1 ; 3 C`: Alt-right. The modifier is not typed either.
+        let mut ld = fed(b"ab");
+        for &b in b"\x1b[1;3C" {
+            let _ = ld.receive(b);
+        }
+        let _ = ld.receive(b'!');
+        assert_eq!(ld.line(), b"ab!".to_vec());
+    }
+
+    #[test]
+    fn the_delete_key_removes_under_the_cursor() {
+        let mut ld = fed(b"abc");
+        for &b in b"\x1b[D\x1b[D" {
+            let _ = ld.receive(b);
+        }
+        for &b in b"\x1b[3~" {
+            let _ = ld.receive(b);
+        }
+        assert_eq!(ld.line(), b"ac".to_vec());
+    }
+
+    #[test]
+    fn a_cursor_position_report_is_not_typed() {
+        // A shell asks `ESC[6n`; the terminal answers `ESC[41;5R`. That answer
+        // is for the shell, never for the line - and used to arrive as
+        // `[41;5R` typed at the prompt.
+        let mut ld = LineDiscipline::new();
+        for &b in b"\x1b[41;5R" {
+            assert_eq!(ld.receive(b), Action::None);
+        }
+        assert_eq!(ld.line(), Vec::<u8>::new());
+        assert!(!ld.has_ready());
+    }
+
+    #[test]
+    fn modified_and_ss3_arrows_are_still_arrows() {
+        let mut ld = fed(b"ab");
+        // Ctrl-left: `ESC [ 1 ; 5 D`.
+        for &b in b"\x1b[1;5D" {
+            let _ = ld.receive(b);
+        }
+        let _ = ld.receive(b'X');
+        assert_eq!(ld.line(), b"aXb".to_vec());
+
+        // Application cursor mode: `ESC O C` is right, `ESC O A` is up.
+        let mut ld = fed(b"ab");
+        for &b in b"\x1bOC" {
+            let _ = ld.receive(b);
+        }
+        let _ = ld.receive(b'Z');
+        assert_eq!(ld.line(), b"abZ".to_vec());
+    }
+
+    #[test]
+    fn up_and_down_walk_the_history() {
+        let mut ld = fed(b"one\n");
+        let _ = lines(&mut ld);
+        let mut ld = {
+            ld.receive(b't');
+            ld.receive(b'w');
+            ld.receive(b'o');
+            ld.receive(b'\n');
+            ld
+        };
+        let _ = lines(&mut ld);
+        let _ = ld.take_echo();
+
+        // Up: the last line comes back.
+        for &b in b"\x1b[A" {
+            let _ = ld.receive(b);
+        }
+        assert_eq!(ld.line(), b"two".to_vec());
+
+        // Up again: the one before it.
+        for &b in b"\x1b[A" {
+            let _ = ld.receive(b);
+        }
+        assert_eq!(ld.line(), b"one".to_vec());
+
+        // Down twice returns to what was being typed: nothing.
+        for &b in b"\x1b[B" {
+            let _ = ld.receive(b);
+        }
+        assert_eq!(ld.line(), b"two".to_vec());
+        for &b in b"\x1b[B" {
+            let _ = ld.receive(b);
+        }
+        assert_eq!(ld.line(), Vec::<u8>::new());
+
+        let _ = ld.receive(b'\n');
+        assert_eq!(lines(&mut ld), vec![b"\n".to_vec()], "history is not input");
+    }
+
+    #[test]
+    fn history_keeps_what_was_being_typed_when_up_was_pressed() {
+        let mut ld = fed(b"first\n");
+        let _ = lines(&mut ld);
+        ld.receive(b'p');
+        ld.receive(b'a');
+        ld.receive(b'r');
+        ld.receive(b't');
+        for &b in b"\x1b[A" {
+            ld.receive(b);
+        }
+        assert_eq!(ld.line(), b"first".to_vec());
+        for &b in b"\x1b[B" {
+            ld.receive(b);
+        }
+        assert_eq!(
+            ld.line(),
+            b"part".to_vec(),
+            "down came back to the half-typed line"
+        );
+    }
+
+    #[test]
+    fn the_emacs_keys_edit_the_line() {
+        // ^A home, ^E end, ^K kill to end, ^U kill whole line, ^W a word.
+        let mut ld = fed(b"hello world");
+        ld.receive(0x01); // ^A
+        ld.receive(0x0e); // ^N: nothing below, no history yet
+        assert_eq!(ld.line(), b"hello world".to_vec());
+
+        let mut ld = fed(b"hello world");
+        for _ in 0..5 {
+            ld.receive(0x02); // ^B, back five
+        }
+        ld.receive(0x0b); // ^K
+        assert_eq!(ld.line(), b"hello ".to_vec());
+
+        let mut ld = fed(b"one two three");
+        ld.receive(0x17); // ^W
+        assert_eq!(ld.line(), b"one two ".to_vec());
+
+        let mut ld = fed(b"anything");
+        ld.receive(0x15); // ^U
+        assert_eq!(ld.line(), Vec::<u8>::new());
+    }
+
+    // --- termios: what a shell asks for is what it gets ---
+
+    fn raw_ld() -> LineDiscipline {
+        let mut ld = LineDiscipline::new();
+        let mut tio = ld.termios();
+        tio.lflag &= !(ICANON | ECHO);
+        tio.cc[VMIN] = 1;
+        ld.set_termios(tio);
+        ld
+    }
+
+    #[test]
+    fn raw_mode_hands_over_every_byte_including_escape_sequences() {
+        let mut ld = raw_ld();
+        for &b in b"\x1b[A" {
+            assert_eq!(ld.receive(b), Action::None);
+        }
+        // Not edited, not echoed, and the arrow is the reader's to interpret.
+        assert_eq!(ld.take_echo(), b"");
+        assert_eq!(ld.take(8), Some(b"\x1b[A".to_vec()));
+    }
+
+    #[test]
+    fn raw_mode_reads_are_not_held_until_a_newline() {
+        let mut ld = raw_ld();
+        ld.receive(b'l');
+        assert!(ld.has_ready(), "one byte is enough when VMIN is one");
+        assert_eq!(ld.take(8), Some(b"l".to_vec()));
+        // ^D is an ordinary byte here, not the end of input.
+        ld.receive(0x04);
+        assert_eq!(ld.take(8), Some(b"\x04".to_vec()));
+    }
+
+    #[test]
+    fn raw_mode_still_interrupts_on_ctrl_c() {
+        let mut ld = raw_ld();
+        assert!(ld.termios().lflag & ISIG != 0, "raw is not deaf to ^C");
+        assert_eq!(ld.receive(0x03), Action::Interrupt);
+        assert_eq!(ld.take(8), None, "the byte was not input");
+    }
+
+    #[test]
+    fn turning_echo_off_stops_the_echo() {
+        let mut ld = LineDiscipline::new();
+        let mut tio = ld.termios();
+        tio.lflag &= !ECHO;
+        ld.set_termios(tio);
+        ld.receive(b'x');
+        ld.receive(b'\n');
+        assert_eq!(ld.take_echo(), b"");
+        assert_eq!(ld.take(8), Some(b"x\n".to_vec()));
+    }
+
+    #[test]
+    fn echoctl_is_what_shows_the_interrupt_and_can_be_turned_off() {
+        let mut ld = LineDiscipline::new();
+        let mut tio = ld.termios();
+        tio.lflag &= !ECHOCTL;
+        ld.set_termios(tio);
+        assert_eq!(ld.receive(0x03), Action::Interrupt);
+        assert_eq!(ld.take_echo(), b"");
+    }
+
+    #[test]
+    fn the_erase_character_is_what_termios_says_it_is() {
+        let mut ld = LineDiscipline::new();
+        let mut tio = ld.termios();
+        tio.cc[VERASE] = 0x08;
+        ld.set_termios(tio);
+        ld.receive(b'a');
+        ld.receive(b'b');
+        ld.receive(0x08);
+        assert_eq!(ld.line(), b"a".to_vec());
+    }
+
+    #[test]
+    fn icrnl_makes_enter_a_newline_and_can_be_turned_off() {
+        let mut ld = LineDiscipline::new();
+        ld.receive(b'a');
+        ld.receive(b'\r');
+        assert_eq!(ld.take(8), Some(b"a\n".to_vec()));
+
+        let mut ld = LineDiscipline::new();
+        let mut tio = ld.termios();
+        tio.iflag &= !ICRNL;
+        ld.set_termios(tio);
+        ld.receive(b'a');
+        ld.receive(b'\r');
+        // CR is a character of the line now, not its end: nothing is ready to
+        // be read, which is exactly what `stty -icrnl` does to a terminal.
+        assert!(!ld.has_ready());
+        assert_eq!(ld.line(), b"a\r".to_vec());
+        ld.receive(b'\n');
+        assert_eq!(ld.take(8), Some(b"a\r\n".to_vec()));
+    }
+
+    #[test]
+    fn the_prompt_is_remembered_and_replayed_when_the_line_is_redrawn() {
+        let mut ld = LineDiscipline::new();
+        ld.note_output(b"/ # ");
+        ld.receive(b'l');
+        ld.receive(b's');
+        let _ = ld.take_echo();
+        // A redraw has to put the line back after the prompt, not at column 0.
+        ld.receive(0x15); // ^U
+        assert_eq!(ld.take_echo(), b"\r/ # \x1b[K");
+    }
+
+    #[test]
+    fn a_cursor_position_query_is_answered_on_the_input_side() {
+        // What a shell sends before it draws anything, and waits for.
+        let mut ld = LineDiscipline::new();
+        ld.note_output(b"/ # ");
+        ld.note_output(b"\x1b[6n");
+        // One-based, and the cursor is four characters along: row 1, column 5.
+        assert_eq!(ld.take(16), Some(b"\x1b[1;5R".to_vec()));
+
+        // It is input, so a reader waiting for it is woken by it.
+        assert!(!ld.has_ready(), "the answer is read once");
+    }
+
+    #[test]
+    fn the_cursor_answers_where_it_actually_is() {
+        let mut ld = LineDiscipline::new();
+        ld.note_output(b"a line\n");
+        ld.note_output(b"xy");
+        ld.note_output(b"\x1b[6n");
+        assert_eq!(ld.take(16), Some(b"\x1b[2;3R".to_vec()));
+    }
+
+    #[test]
+    fn a_device_status_query_gets_the_terminals_ok() {
+        let mut ld = LineDiscipline::new();
+        ld.note_output(b"\x1b[5n");
+        assert_eq!(ld.take(16), Some(b"\x1b[0n".to_vec()));
+    }
+
+    #[test]
+    fn output_escape_sequences_are_not_mistaken_for_a_prompt() {
+        let mut ld = LineDiscipline::new();
+        ld.note_output(b"\x1b[32m");
+        ld.note_output(b"$ ");
+        ld.receive(b'x');
+        let _ = ld.take_echo();
+        ld.receive(0x15);
+        assert_eq!(
+            ld.take_echo(),
+            b"\r$ \x1b[K",
+            "the colour sequence is not part of the prompt"
+        );
+    }
+
+    #[test]
+    fn csi_parameters_are_read_from_both_ends() {
+        assert_eq!(LineDiscipline::params(b""), (1, 1));
+        assert_eq!(LineDiscipline::params(b"3"), (3, 3));
+        assert_eq!(LineDiscipline::params(b"1;5"), (1, 5));
+        assert_eq!(LineDiscipline::params(b";2"), (1, 2));
+    }
+
+    #[test]
+    fn a_bare_escape_and_a_ruined_sequence_are_dropped() {
+        let mut ld = LineDiscipline::new();
+        ld.receive(b'\x1b');
+        ld.receive(b'x'); // not a sequence after all: both bytes dropped
+        assert_eq!(ld.line(), Vec::<u8>::new());
+
+        // A sequence that never ends - too many parameters to be a key - is
+        // given up on rather than left hanging over the next thing typed.
+        let mut ld = LineDiscipline::new();
+        for &b in b"\x1b[" {
+            ld.receive(b);
+        }
+        for _ in 0..40 {
+            ld.receive(b'9');
+            ld.receive(b';');
+        }
+        ld.receive(b'A');
+        assert_eq!(ld.line(), Vec::<u8>::new());
+        // And the next line typed is unaffected.
+        ld.receive(b'o');
+        ld.receive(b'k');
+        assert_eq!(ld.line(), b"ok".to_vec());
+    }
+
+    #[test]
+    fn keys_are_decoded_from_their_sequences() {
+        assert_eq!(LineDiscipline::csi_key(b'A', b""), Some(Key::Up));
+        assert_eq!(LineDiscipline::csi_key(b'~', b"3"), Some(Key::Delete));
+        assert_eq!(LineDiscipline::csi_key(b'~', b"5"), Some(Key::PageUp));
+        assert_eq!(LineDiscipline::csi_key(b'R', b"41;5"), None);
+        assert_eq!(LineDiscipline::ss3_key(b'H'), Some(Key::Home));
     }
 }

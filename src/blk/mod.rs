@@ -11,6 +11,8 @@
 //! a return value, because on this kernel a failing disk means the run is over
 //! - the milestone gate asserts on the panic message.
 
+pub mod part;
+
 pub trait BlockDev: Send + Sync {
     /// Device capacity, in 512-byte sectors.
     fn capacity_sectors(&self) -> u64;

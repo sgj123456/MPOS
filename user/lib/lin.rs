@@ -292,6 +292,7 @@ pub const RENAME_EXCHANGE: usize = 0x2;
 pub const DT_DIR: u8 = 4;
 pub const DT_CHR: u8 = 2;
 pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 10;
 
 /// ioctl requests.
 pub const TIOCGWINSZ: usize = 0x5413;
@@ -617,11 +618,38 @@ pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -
     sys3(nr::EXECVE, path as usize, argv as usize, envp as usize)
 }
 
-/// Wait for a child. Linux returns the child's pid and encodes the exit
-/// code in `*status`; mpos returns the exit code directly - the tests pin
-/// whichever side of that divergence the syscall under test needs.
+/// Wait for a child: `pid` names it (`-1` or `0` means any child), `status`
+/// receives the encoded exit and may be null, and `options` carries `WNOHANG`.
+/// Returns the child's pid, or a negative errno.
 pub fn wait4(pid: usize, status: *mut i32, options: usize) -> isize {
     sys4(nr::WAIT4, pid, status as usize, options, 0)
+}
+
+/// `waitpid(pid, status, options)` - the same call under its other name.
+pub fn waitpid(pid: usize, status: *mut i32, options: usize) -> isize {
+    wait4(pid, status, options)
+}
+
+/// `WIFEXITED`: the child ended by calling `exit`.
+pub fn wifexited(status: i32) -> bool {
+    (status & 0x7f) == 0
+}
+
+/// `WEXITSTATUS`: the low byte of the code the child passed to `exit`. Only
+/// meaningful when [`wifexited`] holds.
+pub fn wexitstatus(status: i32) -> i32 {
+    (status >> 8) & 0xff
+}
+
+/// `WIFSIGNALED`: the child was killed by a signal rather than exiting.
+pub fn wifsignaled(status: i32) -> bool {
+    ((status & 0x7f) + 1) >> 1 > 0
+}
+
+/// `WTERMSIG`: the signal that killed the child. Only meaningful when
+/// [`wifsignaled`] holds.
+pub fn wtermsig(status: i32) -> i32 {
+    status & 0x7f
 }
 
 /// Read up to `buf.len()` bytes from an open descriptor.
@@ -743,6 +771,21 @@ pub fn rseq(rseq: *mut Rseq, len: usize, flags: usize, sig: u32) -> isize {
 /// Duplicate a descriptor onto the lowest free number.
 pub fn dup(oldfd: i32) -> isize {
     sys1(nr::DUP, oldfd as usize)
+}
+
+/// The descriptor the next `open` will hand back: the lowest free one.
+///
+/// Discovered, not assumed. A process inherits whatever its parent had open -
+/// mpos's own shell hands over exactly 0, 1 and 2, but a real one like Alpine's
+/// ash keeps a descriptor of its own, and 3 is then taken. A test that wants
+/// "the lowest free fd" has to ask which one that is, or it is really asserting
+/// which shell started it.
+pub fn free_fd() -> isize {
+    let fd = dup(1);
+    if fd >= 0 {
+        close(fd as i32);
+    }
+    fd
 }
 
 /// Duplicate `oldfd` onto `newfd`, closing whatever `newfd` named.
@@ -954,9 +997,29 @@ pub fn futex(uaddr: *mut i32, op: usize, val: i32) -> isize {
     sys3(nr::FUTEX, uaddr as usize, op, val as usize)
 }
 
-/// `fork()` - mpos does not have one; the number answers ENOSYS.
+/// `fork()`: the caller is duplicated. Returns 0 in the child and the child's
+/// pid in the parent, and both come back here.
 pub fn fork() -> isize {
     sys0(nr::FORK)
+}
+
+/// `clone(flags, child_stack, parent_tid, child_tid, tls)`: `fork` with the
+/// caller naming what the child shares instead of copying.
+pub fn clone(
+    flags: usize,
+    child_stack: usize,
+    parent_tid: *mut i32,
+    child_tid: *mut i32,
+    tls: usize,
+) -> isize {
+    sys5(
+        nr::CLONE,
+        flags,
+        child_stack,
+        parent_tid as usize,
+        child_tid as usize,
+        tls,
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -5,7 +5,8 @@
 //! Pinned here: the Linux argument shape - dirfd, NUL-terminated path,
 //! flags, mode, with no length word; AT_FDCWD relative opens; real-dirfd
 //! opens (and EBADF / ENOTDIR for dirfds that are not directories); the
-//! lowest-free-fd guarantee (0-2 taken, so 3); O_CREAT making a missing
+//! lowest-free-fd guarantee, measured rather than assumed to be 3; O_CREAT
+//! making a missing
 //! file and O_CREAT|O_EXCL answering EEXIST for one that is there; close
 //! and its fd reuse; and ENOENT for a path that does not exist.
 
@@ -33,6 +34,7 @@ static mut BUF: [u8; 64] = [0; 64];
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t_openat\n");
     let mut failed = false;
+    let base = lin::free_fd();
 
     let fd = lin::openat(
         lin::AT_FDCWD,
@@ -42,9 +44,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_eq(
         &mut failed,
-        b"openat(AT_FDCWD) hands out the lowest free fd (3)",
+        b"openat(AT_FDCWD) hands out the lowest free fd",
         fd,
-        3,
+        base,
     );
 
     let r = lin::close(fd as i32);
@@ -55,7 +57,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         &mut failed,
         b"the closed fd is reused for the next open",
         fd,
-        3,
+        base,
     );
     let _ = lin::close(fd as i32);
 
@@ -69,9 +71,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // A real dirfd: /bin names a directory, and "sh" resolves inside it.
     let binfd = lin::openat(lin::AT_FDCWD, &BIN, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"open /bin gives a directory fd", binfd, 3);
+    lin::check_eq(&mut failed, b"open /bin gives a directory fd", binfd, base);
     let shfd = lin::openat(binfd as i32, &SH, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"openat(binfd, \"sh\") opens", shfd, 4);
+    lin::check_eq(&mut failed, b"openat(binfd, \"sh\") opens", shfd, base + 1);
     let buf = unsafe { core::slice::from_raw_parts_mut(&raw mut BUF as *mut u8, 64) };
     let n = lin::read(shfd as i32, buf);
     lin::check_true(&mut failed, b"the sh image reads back bytes", n > 0);
@@ -97,7 +99,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let _ = lin::close(fd as i32);
 
     let fd = lin::openat(lin::AT_FDCWD, &NEW, O_CREAT | lin::O_RDWR, 0o644);
-    lin::check_eq(&mut failed, b"O_CREAT makes the missing file", fd, 3);
+    lin::check_eq(&mut failed, b"O_CREAT makes the missing file", fd, base);
     let r = lin::openat(lin::AT_FDCWD, &NEW, O_CREAT | O_EXCL | lin::O_RDWR, 0o644);
     lin::check_eq(
         &mut failed,

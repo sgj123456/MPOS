@@ -16,9 +16,24 @@ bitflags = "2.13"
 # The ELF loader parses user images with the same crate on the host (for the
 # unit tests) and in the kernel, so this is also not target-gated.
 elf = { version = "0.8", default-features = false, features = ["alloc"] }
+virtio-drivers = "0.13"
 
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = { version = "1.2", features = ["restore-state-bool"] }
+# The TCP/IP stack: ARP, IPv4, ICMP, UDP and TCP with retransmission and
+# window management are upstream's problem now, not this kernel's. The
+# feature set is exactly what QEMU's user network needs - Ethernet framing,
+# IPv4, and the two socket types musl's resolver and apk speak - and
+# deliberately nothing else: no std, no log, no IPv6, no DNS (musl resolves
+# in userland over ordinary UDP sockets).
+smoltcp = { version = "0.13", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-udp",
+    "socket-tcp",
+    "auto-icmp-echo-reply",
+] }
 
 # The host test build compiles the VFS too, which locks; `std` picks the stock
 # critical section for hosted targets.

@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 use elf::ElfBytes;
 use elf::abi::{
-    DT_RELA, DT_RELAENT, DT_RELASZ, ET_DYN, ET_EXEC, PF_W, PF_X, PT_DYNAMIC, PT_LOAD,
+    DT_RELA, DT_RELAENT, DT_RELASZ, ET_DYN, ET_EXEC, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD,
     R_X86_64_RELATIVE,
 };
 use elf::dynamic::Dyn;
@@ -40,6 +40,15 @@ pub struct Image<'a> {
     /// R_X86_64_RELATIVE relocations: (virtual address, addend).
     /// The loader must write `addend` at `offset` after mapping segments.
     pub rela: Vec<(usize, i64)>,
+    /// The program interpreter this image asks to be started through, as a
+    /// path: `/lib/ld-musl-x86_64.so.1` for anything linked against musl
+    /// dynamically. Its presence is what makes an image dynamically linked;
+    /// `None` means the image is complete on its own and is entered directly.
+    ///
+    /// The loader does not act on this - it is a path into the filesystem, and
+    /// this module has never heard of one. It reports it so that the caller,
+    /// which does have a filesystem, can load what the image points at.
+    pub interp: Option<Vec<u8>>,
 }
 
 /// One `PT_LOAD` segment: file bytes to place at `vaddr`, zero-filled out to
@@ -87,11 +96,17 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
 
     let mut segments = Vec::new();
     let mut dyn_data: Option<&[u8]> = None;
+    let mut interp_data: Option<&[u8]> = None;
     for phdr in file.segments()?.iter() {
         if phdr.p_type == PT_DYNAMIC {
             // The dynamic entries the relocation pass reads below come from
             // the PT_DYNAMIC segment, the loader's authoritative source.
             dyn_data = file.segment_data(&phdr).ok();
+        }
+        if phdr.p_type == PT_INTERP {
+            // A NUL-terminated path to the interpreter. More than one such
+            // segment is malformed, and the first is as good an answer as any.
+            interp_data = interp_data.or_else(|| file.segment_data(&phdr).ok());
         }
         if phdr.p_type != PT_LOAD {
             continue;
@@ -144,6 +159,15 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     // ET_EXEC and ET_DYN the table lives inside the first PT_LOAD segment
     // (file offset 0), so the virtual address is base + e_phoff.
     let phdr_addr = segments.first().map_or(0, |s| s.vaddr + phoff as usize);
+    // The path loses its terminator here and keeps nothing else: the caller
+    // hands it to the filesystem, which wants the name, not the padding.
+    let interp = interp_data.and_then(|bytes| {
+        let end = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(bytes.len());
+        (!bytes[..end].is_empty()).then(|| Vec::from(&bytes[..end]))
+    });
     Some(Image {
         entry: entry as usize,
         segments,
@@ -151,6 +175,7 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
         phnum: file.ehdr.e_phnum as usize,
         phent: file.ehdr.e_phentsize as usize,
         rela,
+        interp,
     })
 }
 
@@ -267,6 +292,7 @@ mod tests {
     }
 
     const PT_LOAD: u32 = 1;
+    const PT_INTERP: u32 = 3;
     const PT_NOTE: u32 = 4;
 
     #[test]
@@ -343,5 +369,47 @@ mod tests {
     fn a_segment_past_the_lower_half_is_refused() {
         let bytes = elf(0x1000, &[(PT_LOAD, 6, (1 << 47) + 0x1000, 0x100, b"x")]);
         assert!(parse(&bytes).is_none(), "the kernel half is not loadable");
+    }
+
+    #[test]
+    fn a_static_image_names_no_interpreter() {
+        let bytes = elf(0x400_078, &[(PT_LOAD, 6, 0x400_000, 0x120, b"program")]);
+        assert_eq!(parse(&bytes).expect("parses").interp, None);
+    }
+
+    #[test]
+    fn a_dynamic_image_reports_the_interpreter_it_asks_for() {
+        // The path is stored NUL-terminated and is reported without the
+        // terminator, since the caller hands it to the filesystem.
+        let path = b"/lib/ld-musl-x86_64.so.1\0";
+        let bytes = elf(
+            0x1000,
+            &[
+                (PT_INTERP, 4, 0x200, path.len() as u64, path),
+                (PT_LOAD, 5, 0x1000, 0x100, b"code"),
+            ],
+        );
+
+        let image = parse(&bytes).expect("parses");
+        assert_eq!(
+            image.interp.as_deref(),
+            Some(&b"/lib/ld-musl-x86_64.so.1"[..])
+        );
+        // The interpreter is a note to the loader, not something to map: it
+        // has no vaddr of its own and must not turn into a segment.
+        assert_eq!(image.segments.len(), 1);
+        assert_eq!(image.segments[0].vaddr, 0x1000);
+    }
+
+    #[test]
+    fn an_empty_interpreter_path_is_not_an_interpreter() {
+        let bytes = elf(
+            0x1000,
+            &[
+                (PT_INTERP, 4, 0x200, 1, b"\0"),
+                (PT_LOAD, 5, 0x1000, 0x100, b"code"),
+            ],
+        );
+        assert_eq!(parse(&bytes).expect("parses").interp, None);
     }
 }

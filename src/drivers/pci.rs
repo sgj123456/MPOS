@@ -68,6 +68,16 @@ impl Func {
         read16(self.bus, self.slot, self.func, 0x02)
     }
 
+    /// The bus, device and function this entry names.
+    ///
+    /// For a caller that has to hand the address to someone else: the
+    /// `virtio-drivers` transport walks the configuration space itself, and
+    /// asks for the three numbers rather than for anything this module
+    /// decided about the device.
+    pub fn bdf(&self) -> (u8, u8, u8) {
+        (self.bus, self.slot, self.func)
+    }
+
     /// Base I/O port of BAR0, which must be a port-mapped BAR. `None` means
     /// the BAR is memory-mapped and this driver cannot drive the device.
     pub fn io_bar0(&self) -> Option<u16> {

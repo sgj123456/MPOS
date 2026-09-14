@@ -21,6 +21,7 @@ static LINE: &[u8; 9] = b"replaced\n";
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t_dup3\n");
     let mut failed = false;
+    let base = lin::free_fd();
 
     let r = lin::dup3(1, 5, 0);
     lin::check_eq(&mut failed, b"dup3(stdout, 5, 0) returns 5", r, 5);
@@ -52,19 +53,19 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let _ = lin::close(6);
 
     let a = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the file opens on fd 3", a, 3);
+    lin::check_eq(&mut failed, b"the file opens on the lowest free fd", a, base);
 
     let r = lin::dup3(1, 3, 0);
     lin::check_eq(
         &mut failed,
-        b"dup3 onto the open fd 3 replaces it",
+        b"dup3 onto the open file fd replaces it",
         r,
         3,
     );
     let n = lin::write(3, LINE);
     lin::check_eq(
         &mut failed,
-        b"fd 3 now writes to the console, every byte",
+        b"the replaced fd now writes to the console, every byte",
         n,
         LINE.len() as isize,
     );

@@ -29,7 +29,27 @@ esac
 
 MARKERS=("$@")
 if [[ ${#MARKERS[@]} -eq 0 ]]; then
-    MARKERS=("M0_OK" "M1_OK" "M2_OK" "M3_OK" "M4_OK" "M6_OK" "M7_OK" "M8_OK" "M9_OK" "M10_OK" "M11_OK" "M12_OK" "M13_OK" "M13_PIPE" "M13_REDIR" "M13_shell" "M14_1")
+    MARKERS=("M0_OK" "M1_OK" "M2_OK" "M3_OK" "M4_OK" "M6_OK" "M7_OK" "M8_OK" "M9_OK" "M10_OK" "M11_OK" "M12_OK" "M13_OK" "M13_PIPE" "M13_REDIR" "M13_shell" "STDARGS_OK" "APK_OK" "M14_1")
+    # Every conformance test the shell script runs, asserted by its own
+    # verdict. The milestone markers above say the *system* came up; these
+    # say each ABI test passed - without them a `t_*` regression fails
+    # quietly inside a green gate, because the suite's verdicts only ever
+    # reached the serial log. The one exception is t_exit_group, whose
+    # whole contract is the exit code it leaves.
+    CONF=("t_getpid" "t_gettid" "t_getuid" "t_uname" "t_arch_prctl" "t_getrandom" \
+        "t_sched_getaffinity" "t_set_robust_list" "t_rseq" "t_set_tid_address" \
+        "t_openat" "t_read" "t_write" "t_lseek" "t_readv" "t_writev" "t_fstat" \
+        "t_newfstatat" "t_statx" "t_access" "t_faccessat" "t_readlink" "t_fcntl" \
+        "t_dup" "t_dup2" "t_dup3" "t_ioctl" "t_getdents64" "t_pipe2" "t_mkdirat" \
+        "t_renameat2" "t_unlinkat" "t_getcwd" "t_chdir" "t_brk" "t_mmap" \
+        "t_mprotect" "t_munmap" "t_mremap" "t_madvise" "t_rt_sigaction" \
+        "t_rt_sigprocmask" "t_sigaltstack" "t_kill" "t_clock_gettime" \
+        "t_nanosleep" "t_poll" "t_prlimit64" "t_futex" "t_execve" "t_fork" \
+        "t_wait4" "t_clone")
+    for t in "${CONF[@]}"; do
+        MARKERS+=("${t}_0")
+    done
+    MARKERS+=("t_exit_group_42" "STDSPAWN_0")
 fi
 
 mkdir -p build
@@ -60,9 +80,9 @@ if ! cargo test --lib --target "$HOST_TARGET"; then
     exit 1
 fi
 
-if ! PROFILE="$PROFILE" "$ROOT/scripts/mkiso.sh" >/dev/null; then
+if ! PROFILE="$PROFILE" "$ROOT/scripts/mkdisk.sh" >/dev/null; then
     echo "FAIL  kernel packaging failed; refusing to test a stale image"
-    PROFILE="$PROFILE" "$ROOT/scripts/mkiso.sh" 2>&1 | tail -30
+    PROFILE="$PROFILE" "$ROOT/scripts/mkdisk.sh" 2>&1 | tail -30
     exit 1
 fi
 

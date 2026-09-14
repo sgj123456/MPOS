@@ -1,11 +1,16 @@
 //! t_dup - one test for dup, the fd-table copy musl's startup and the
 //! shell's redirections lean on.
 //!
-//! Pinned here: dup hands back the lowest free descriptor (0-2 taken, so
-//! 3), and the duplicate names the *same* open file description - one
-//! cursor moved through one fd is visible through the other, which is what
-//! makes `cat a b > out` append instead of overwrite. A descriptor that
-//! does not exist answers EBADF.
+//! Pinned here: dup hands back the lowest free descriptor, and the duplicate
+//! names the *same* open file description - one cursor moved through one fd is
+//! visible through the other, which is what makes `cat a b > out` append
+//! instead of overwrite. A descriptor that does not exist answers EBADF.
+//!
+//! "Lowest free" is measured, not assumed to be 3. A process inherits whatever
+//! descriptors its parent had: under mpos's own shell that is 0-2 and nothing
+//! else, but a real shell like Alpine's ash holds one of its own, and the
+//! kernel answering 4 when 3 is taken is correct. What this pins is that dup
+//! and open agree on the same next number.
 
 #![no_std]
 #![no_main]
@@ -22,20 +27,21 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t_dup\n");
     let mut failed = false;
 
+    // What the lowest free descriptor is, discovered rather than assumed: dup
+    // and open must both answer it.
     let d = lin::dup(1);
-    lin::check_eq(
+    lin::check_true(
         &mut failed,
-        b"dup(stdout) hands out the lowest free fd (3)",
-        d,
-        3,
+        b"dup(stdout) hands out a free fd",
+        d >= 3,
     );
     let _ = lin::close(d as i32);
 
     let a = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the file opens on fd 3", a, 3);
+    lin::check_eq(&mut failed, b"the file opens on the fd dup had", a, d);
 
     let b = lin::dup(a as i32);
-    lin::check_eq(&mut failed, b"dup lands on the next free fd (4)", b, 4);
+    lin::check_eq(&mut failed, b"dup lands on the next free fd", b, d + 1);
 
     let r = lin::lseek(a as i32, 2, lin::SEEK_SET);
     lin::check_eq(&mut failed, b"lseek through the original reports 2", r, 2);

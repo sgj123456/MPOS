@@ -8,33 +8,272 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 
+use super::nr;
 use crate::sched::TaskId;
 use crate::syscall::{ARG_COUNT, argv_arg, buffer_ok, cstr_arg, err, err_of};
-use super::nr;
 
 pub(super) use crate::syscall::MMAP_BASE;
 
 /// The register frame on the kernel stack, matching the layout pushed by the
 /// `syscall` entry stub in `arch/x86_64/syscall.rs`. Fields are named after
 /// the user registers they hold; offsets must match the push order exactly.
-/// Used by `handle_execve` to patch the return address and stack pointer.
+/// [`handle_execve`] patches the return address and stack pointer through it,
+/// and [`handle_fork`] reads the whole thing to rebuild the child's register
+/// file.
 #[repr(C)]
 struct RegsFrame {
-    rax: usize,   // [rsp+0]  return value / syscall number
-    r11: usize,   // [rsp+8]  user RFLAGS (sysretq restores from here)
-    rcx: usize,   // [rsp+16] user RIP (sysretq restores from here)
-    r9: usize,    // [rsp+24]
-    r8: usize,    // [rsp+32]
-    r10: usize,   // [rsp+40]
-    rdx: usize,   // [rsp+48]
-    rsi: usize,   // [rsp+56]
-    rdi: usize,   // [rsp+64]
-    user_rsp: usize, // [rsp+72] user RSP (restored from here at sysretq)
-    r12: usize,   // [rsp+80]
-    r15: usize,   // [rsp+88]
-    r14: usize,   // [rsp+96]
-    r13: usize,   // [rsp+104]
-    rbp: usize,   // [rsp+112]
+    rax: usize,      // [rsp+0]   return value / syscall number
+    r11: usize,      // [rsp+8]   user RFLAGS (sysretq restores from here)
+    rcx: usize,      // [rsp+16]  user RIP (sysretq restores from here)
+    r9: usize,       // [rsp+24]
+    r8: usize,       // [rsp+32]
+    r10: usize,      // [rsp+40]
+    rdx: usize,      // [rsp+48]
+    rsi: usize,      // [rsp+56]
+    rdi: usize,      // [rsp+64]
+    user_rsp: usize, // [rsp+72]  user RSP (restored from here at sysretq)
+    r12: usize,      // [rsp+80]
+    r15: usize,      // [rsp+88]
+    r14: usize,      // [rsp+96]
+    r13: usize,      // [rsp+104]
+    rbx: usize,      // [rsp+112]
+    rbp: usize,      // [rsp+120]
+}
+
+// ---- signals: the frame a handler runs on -------------------------------
+//
+// A handler cannot be entered by a `jmp`: it has to be able to `ret` back into
+// the kernel, and the kernel has to be able to restore a register file that no
+// longer exists by then. Both halves of that are a structure written on the
+// process's own stack and read back by `rt_sigreturn`, in a layout the libc's
+// trampoline knows by heart. Everything below is that layout.
+
+/// Byte offsets of the fields of `struct sigcontext`, in the Linux x86_64
+/// order. They are not a choice: `__restore_rt` hands the structure back to
+/// `rt_sigreturn`, and this kernel reads the saved registers from exactly
+/// where the libc expects them to be.
+mod sc {
+    pub const R8: usize = 0;
+    pub const R9: usize = 8;
+    pub const R10: usize = 16;
+    pub const R12: usize = 32;
+    pub const R13: usize = 40;
+    pub const R14: usize = 48;
+    pub const R15: usize = 56;
+    pub const RDI: usize = 64;
+    pub const RSI: usize = 72;
+    pub const RBP: usize = 80;
+    pub const RBX: usize = 88;
+    pub const RDX: usize = 96;
+    pub const RAX: usize = 104;
+    pub const RSP: usize = 120;
+    pub const RIP: usize = 128;
+    pub const EFLAGS: usize = 136;
+    /// The structure is padded out to here, whatever this kernel fills in.
+    pub const BYTES: usize = 256;
+}
+
+/// `SI_USER`: the signal came from `kill`, not from the hardware. It is what a
+/// handler reads out of `si_code` to tell a deliberate signal from a fault.
+const SI_USER: i32 = 0;
+
+fn put_word(bytes: &mut [u8], at: usize, value: usize) {
+    bytes[at..at + 8].copy_from_slice(&(value as u64).to_le_bytes());
+}
+
+fn get_word(bytes: &[u8], at: usize) -> usize {
+    usize::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// Write the frame a handler will run on and point the task at it.
+///
+/// Returns `false` when the frame cannot be written - the stack is not mapped,
+/// or not writable - which leaves the caller to take the default action rather
+/// than to lose the signal.
+fn build_frame(
+    regs_ptr: *mut (),
+    sig: u8,
+    action: &crate::sched::signal::Action,
+    ret: isize,
+) -> bool {
+    use crate::sched::signal::{
+        SA_ONSTACK, SA_RESETHAND, SA_RESTORER, SIGFRAME_BYTES, SIGFRAME_SIGINFO, SIGFRAME_UCONTEXT,
+        UCONTEXT_MCONTEXT, UCONTEXT_SIGMASK,
+    };
+
+    let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
+
+    // A handler runs on the process's own stack, unless the disposition asked
+    // for the alternate one. Either way the frame goes just below where the
+    // stack pointer was: the interrupted code gets its memory back untouched
+    // when the handler returns.
+    let mut sp = regs.user_rsp;
+    let alt = crate::sched::signal_alt_stack(crate::sched::current());
+    if action.flags & SA_ONSTACK != 0
+        && let Some(stack) = alt
+    {
+        sp = stack.sp + stack.size;
+    }
+
+    // A function is entered with its return address at `rsp % 16 == 8`; a
+    // handler is entered the same way, with the restorer standing in for the
+    // `call` that would have put it there.
+    let frame = ((sp - SIGFRAME_BYTES) & !15) - 8;
+
+    let mut bytes = [0u8; SIGFRAME_BYTES];
+    // The restorer - where the handler's `ret` goes. Without it the handler
+    // would return into whatever it found on the stack, and the process could
+    // never leave the handler at all.
+    if action.flags & SA_RESTORER == 0 || action.restorer == 0 {
+        // The ABI makes this field mandatory on x86_64; a disposition without
+        // one cannot be run.
+        return false;
+    }
+    put_word(&mut bytes, 0, action.restorer);
+
+    // The saved register file. `rax` is the value the interrupted syscall
+    // returned, which is what `rt_sigreturn` puts back.
+    let mcontext = SIGFRAME_UCONTEXT + UCONTEXT_MCONTEXT;
+    put_word(&mut bytes, mcontext + sc::R8, regs.r8);
+    put_word(&mut bytes, mcontext + sc::R9, regs.r9);
+    put_word(&mut bytes, mcontext + sc::R10, regs.r10);
+    put_word(&mut bytes, mcontext + sc::R12, regs.r12);
+    put_word(&mut bytes, mcontext + sc::R13, regs.r13);
+    put_word(&mut bytes, mcontext + sc::R14, regs.r14);
+    put_word(&mut bytes, mcontext + sc::R15, regs.r15);
+    put_word(&mut bytes, mcontext + sc::RDI, regs.rdi);
+    put_word(&mut bytes, mcontext + sc::RSI, regs.rsi);
+    put_word(&mut bytes, mcontext + sc::RBP, regs.rbp);
+    put_word(&mut bytes, mcontext + sc::RBX, regs.rbx);
+    put_word(&mut bytes, mcontext + sc::RDX, regs.rdx);
+    put_word(&mut bytes, mcontext + sc::RAX, ret as usize);
+    // rcx and r11 were destroyed by the `syscall` that is being interrupted:
+    // the CPU puts the return address in rcx and the flags in r11 on the way
+    // in, so there is nothing of the caller's left to save.
+    put_word(&mut bytes, mcontext + sc::RSP, regs.user_rsp);
+    put_word(&mut bytes, mcontext + sc::RIP, regs.rcx);
+    put_word(&mut bytes, mcontext + sc::EFLAGS, regs.r11);
+
+    // `uc_stack` describes the alternate stack, as the handler will see it
+    // through `sigaltstack(NULL, ...)`.
+    let stack_at = SIGFRAME_UCONTEXT + 16;
+    if let Some(stack) = alt {
+        put_word(&mut bytes, stack_at, stack.sp);
+        put_word(&mut bytes, stack_at + 16, stack.size);
+    }
+
+    // The mask to put back on the way out - what the process had blocked when
+    // the signal arrived.
+    let blocked = crate::sched::current_blocked();
+    put_word(
+        &mut bytes,
+        SIGFRAME_UCONTEXT + UCONTEXT_SIGMASK,
+        blocked as usize,
+    );
+
+    // A `siginfo_t`: signo, errno, code. Everything else a `kill` has to say
+    // is in the first three fields.
+    bytes[SIGFRAME_SIGINFO..SIGFRAME_SIGINFO + 4].copy_from_slice(&(sig as i32).to_le_bytes());
+    bytes[SIGFRAME_SIGINFO + 8..SIGFRAME_SIGINFO + 12].copy_from_slice(&SI_USER.to_le_bytes());
+
+    if !crate::sched::write_user(frame, &bytes) {
+        return false;
+    }
+
+    // Enter the handler with the three arguments the ABI gives it: the signal
+    // number, a `siginfo_t`, and the `ucontext` to hand back.
+    regs.rcx = action.handler;
+    regs.user_rsp = frame;
+    regs.rdi = sig as usize;
+    regs.rsi = frame + SIGFRAME_SIGINFO;
+    regs.rdx = frame + SIGFRAME_UCONTEXT;
+
+    crate::sched::set_current_blocked(action.handler_mask(sig, blocked));
+    if action.flags & SA_RESETHAND != 0 {
+        crate::sched::reset_disposition(sig);
+    }
+    true
+}
+
+/// Run a pending signal's handler, or take its default action.
+///
+/// Called on the way out of every syscall, holding the register frame the task
+/// will `sysretq` through. That frame is why this is the place: entering a
+/// handler means rewriting the task's whole return context, and a syscall is
+/// the only moment the kernel has it in a form it can both read and write.
+/// The clock can deliver a signal with no handler, but not one with a handler,
+/// for exactly this reason.
+///
+/// Returns `true` when a handler was entered, so the caller can report a
+/// reassuring zero to the interrupted call instead of its own return value -
+/// which is now the handler's to see when it returns.
+pub(super) fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
+    if regs_ptr.is_null() {
+        return false;
+    }
+    let Some(sig) = crate::sched::take_deliverable_signal() else {
+        return false;
+    };
+    let action = crate::sched::current_disposition(sig);
+    if action.is_ignore() {
+        return false;
+    }
+    if action.is_default() || !build_frame(regs_ptr, sig, &action, ret) {
+        // Nothing to run, or nowhere to put the frame - and the default action
+        // for every signal this kernel names is to die of it, with the number
+        // in the exit code so the parent can tell which one it was.
+        crate::sched::exit(-(sig as isize));
+    }
+    true
+}
+
+/// `rt_sigreturn` — the trampoline's call, and the only way out of a handler.
+///
+/// The libc's `__restore_rt` is entered by the handler's `ret`, so `rsp` has
+/// already moved past the restorer word; the frame therefore starts eight
+/// bytes below where this call finds the stack pointer.
+pub(super) fn handle_rt_sigreturn(regs_ptr: *mut ()) -> isize {
+    use crate::sched::signal::{SIGFRAME_UCONTEXT, UCONTEXT_MCONTEXT, UCONTEXT_SIGMASK};
+
+    if regs_ptr.is_null() {
+        return err::EFAULT;
+    }
+    let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
+    let frame = regs.user_rsp.wrapping_sub(8);
+    let mcontext = frame + SIGFRAME_UCONTEXT + UCONTEXT_MCONTEXT;
+
+    let mut bytes = [0u8; sc::BYTES];
+    if !crate::sched::read_user(mcontext, &mut bytes) {
+        return err::EFAULT;
+    }
+
+    regs.r8 = get_word(&bytes, sc::R8);
+    regs.r9 = get_word(&bytes, sc::R9);
+    regs.r10 = get_word(&bytes, sc::R10);
+    regs.r12 = get_word(&bytes, sc::R12);
+    regs.r13 = get_word(&bytes, sc::R13);
+    regs.r14 = get_word(&bytes, sc::R14);
+    regs.r15 = get_word(&bytes, sc::R15);
+    regs.rdi = get_word(&bytes, sc::RDI);
+    regs.rsi = get_word(&bytes, sc::RSI);
+    regs.rbp = get_word(&bytes, sc::RBP);
+    regs.rbx = get_word(&bytes, sc::RBX);
+    regs.rdx = get_word(&bytes, sc::RDX);
+    // `sysretq` takes the return address from rcx and the flags from r11, and
+    // no saved value can go there: whatever the process had in them before the
+    // `syscall` was destroyed by the instruction itself.
+    regs.rcx = get_word(&bytes, sc::RIP);
+    regs.user_rsp = get_word(&bytes, sc::RSP);
+    // Interrupts have to be on when the process resumes; everything else about
+    // the flags is the process's own business.
+    regs.r11 = get_word(&bytes, sc::EFLAGS) | 0x200;
+
+    let mut mask = [0u8; 8];
+    if crate::sched::read_user(frame + SIGFRAME_UCONTEXT + UCONTEXT_SIGMASK, &mut mask) {
+        crate::sched::set_current_blocked(u32::from_le_bytes(mask[..4].try_into().unwrap()));
+    }
+
+    get_word(&bytes, sc::RAX) as isize
 }
 
 /// Terminate the current process.
@@ -53,38 +292,101 @@ pub(super) fn handle_getpid() -> isize {
     crate::sched::current().0 as isize
 }
 
-/// `wait4(pid, status_ptr, options)`. Linux writes the status through
-/// `*status`; mpos returns the exit code directly - the kernel-side
-/// reshape in `linux::dispatch` makes this consistent with the rest of the
-/// wait4 family.
-pub(super) fn handle_wait(args: [usize; ARG_COUNT]) -> isize {
-    let (pid, flags) = (args[0], args[1]);
+/// `wait4(pid, status, options)` — collect a child's exit.
+///
+/// Linux's contract, which this follows: the *return value* is the pid of the
+/// child that was collected (or a negative errno), and the exit is described by
+/// the word written through `status`. That split is what lets a shell tell "a
+/// child exited with status 3" from "no child exited yet".
+///
+/// `status` is encoded the way every libc's `WIFEXITED`/`WEXITSTATUS` read it: a
+/// normal exit puts its low byte in bits 15:8, and a death by signal puts the
+/// signal number in bits 6:0. A `status` of 0 is legal and means "not
+/// interested", which is what init passes when it only wants children reaped.
+///
+/// Which child is named follows the man page:
+/// * `pid > 0` - that child;
+/// * `pid == 0` - any child in the caller's process group; mpos has no process
+///   groups, so this widens to "any child", as does `pid == -1`;
+/// * any other negative pid - the same, since the group it names does not exist.
+///
+/// `WNOHANG` is honoured as Linux defines it: a child that has not exited yet is
+/// answered with 0, not an error, and only a caller with no child at all gets
+/// `ECHILD`.
+pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const WNOHANG: usize = 1;
-    let no_hang = flags & WNOHANG != 0;
+    let (pid, status, options) = (args[0] as isize, args[1], args[2]);
     let me = crate::sched::current();
-    if pid == usize::MAX || pid == -1i32 as usize {
-        if no_hang {
-            return match crate::sched::poll_any_child(me) {
-                Some((_id, code)) => code,
-                None => err::EAGAIN,
-            };
-        }
-        return match crate::sched::wait_any_child(me) {
-            Some((_id, code)) => code,
+    let no_hang = options & WNOHANG != 0;
+
+    // Every child: the pid == -1 form, and every other group form this kernel
+    // cannot tell apart for lack of process groups.
+    if pid <= 0 {
+        let collected = if no_hang {
+            crate::sched::poll_any_child(me)
+        } else {
+            crate::sched::wait_any_child(me)
+        };
+        return match collected {
+            Some((id, code)) => finish_wait(id, code, status, from_user),
+            // Nothing to report: an error only when there is nobody left to
+            // wait for, and otherwise the "none exited yet" zero.
+            None if no_hang && crate::sched::has_children(me) => 0,
             None => err::ECHILD,
         };
     }
-    if pid == 0 || pid >= crate::sched::MAX_TASKS {
+
+    // A named child. The bound keeps a wild pid from indexing the table.
+    if pid as usize >= crate::sched::MAX_TASKS {
         return err::ECHILD;
     }
-    let id = TaskId(pid);
-    if crate::sched::is_child(id, me) && !no_hang {
-        crate::sched::block_until_code(id);
+    let id = TaskId(pid as usize);
+
+    // A code already on file means the child is a zombie: it is collected now,
+    // blocking or not.
+    if let Some(code) = crate::sched::take_exit_code(id) {
+        return finish_wait(id, code, status, from_user);
     }
+    if !crate::sched::is_child(id, me) {
+        return err::ECHILD;
+    }
+    if no_hang {
+        return 0;
+    }
+
+    crate::sched::block_until_code(id);
     match crate::sched::take_exit_code(id) {
-        Some(code) => code,
-        None if no_hang => err::EAGAIN,
+        Some(code) => finish_wait(id, code, status, from_user),
         None => err::ECHILD,
+    }
+}
+
+/// The two outputs of a successful `wait`: the child's pid as the return value,
+/// and the exit encoded into `*status`. A null `status` is "not interested" and
+/// writes nothing, which is what the man page says.
+fn finish_wait(id: TaskId, code: isize, status: usize, from_user: bool) -> isize {
+    if status != 0 {
+        if !buffer_ok(status, 4, true, from_user) {
+            return err::EFAULT;
+        }
+        unsafe { (status as *mut i32).write_volatile(wait_status(code)) };
+    }
+    id.0 as isize
+}
+
+/// Encode an exit the way `WIFEXITED` and friends decode it.
+///
+/// mpos records a death by signal as the negated signal number, because that is
+/// the shape the rest of the kernel wants; the word Linux reports is different,
+/// so the sign is what carries the distinction here.
+fn wait_status(code: isize) -> i32 {
+    if code < 0 {
+        // Killed by a signal: its number fills the low byte. The core-dump bit
+        // stays clear - mpos writes no core files.
+        (-code & 0x7f) as i32
+    } else {
+        // A normal exit: the low byte of the code, in bits 15:8.
+        ((code & 0xff) << 8) as i32
     }
 }
 
@@ -103,7 +405,11 @@ pub(super) fn handle_getppid() -> isize {
 /// and patches the syscall return frame so the process enters the new image
 /// on `sysretq`. This is a real execve: it replaces the caller and never
 /// returns.
-pub(super) fn handle_execve(args: [usize; ARG_COUNT], cwd: &Arc<dyn crate::vfs::Inode>, regs_ptr: *mut ()) -> isize {
+pub(super) fn handle_execve(
+    args: [usize; ARG_COUNT],
+    cwd: &Arc<dyn crate::vfs::Inode>,
+    regs_ptr: *mut (),
+) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
@@ -140,7 +446,7 @@ pub(super) fn handle_execve(args: [usize; ARG_COUNT], cwd: &Arc<dyn crate::vfs::
             // sysretq takes RIP from rcx and RFLAGS from r11.
             if !regs_ptr.is_null() {
                 let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
-                regs.rcx = entry;   // sysretq will jump here
+                regs.rcx = entry; // sysretq will jump here
                 regs.user_rsp = new_rsp; // new stack pointer
             }
             0 // execve succeeds; the frame patches make it "not return"
@@ -148,6 +454,10 @@ pub(super) fn handle_execve(args: [usize; ARG_COUNT], cwd: &Arc<dyn crate::vfs::
         Err(crate::sched::SpawnError::NotExecutable) => err::ENOEXEC,
         Err(crate::sched::SpawnError::ArgsTooBig) => err::E2BIG,
         Err(crate::sched::SpawnError::BadFd) => err::EBADF,
+        // Linux reports a missing or unloadable interpreter as "the file was
+        // not found", not as a malformed executable: the program itself was
+        // fine, and it is the path it names that could not be followed.
+        Err(crate::sched::SpawnError::NoInterpreter) => err::ENOENT,
     }
 }
 
@@ -205,103 +515,464 @@ fn sleep_for_timespec(req: usize, from_user: bool) -> isize {
     0
 }
 
-/// `fork()` — create a copy of the calling process.
+/// `fork()` — duplicate the calling process.
 ///
-/// Calls `sched::fork()` which creates the child with a COW address space.
-/// Returns 0 to the child, child pid to the parent. If fork fails, returns
-/// a negative errno.
-pub(super) fn handle_fork(_args: [usize; ARG_COUNT]) -> isize {
-    crate::sched::fork()
+/// The child returns 0 from this call and the parent gets the child's pid; both
+/// carry on from the instruction after the `syscall`. `regs_ptr` is the gate's
+/// register frame, and it is the whole reason this handler needs it: the child
+/// must resume with exactly the caller's registers, so the kernel has to
+/// reconstruct that file and hand it to the new task.
+///
+/// A null frame means the call did not come through the `syscall` gate (the
+/// kernel's own in-process tests, for instance), and there is no register file
+/// to resume from; that is an honest `EINVAL` rather than a half-made child.
+///
+/// `vfork` reaches this same handler and is answered as a `fork`. That is a
+/// divergence in one visible respect only: Linux suspends the calling process
+/// until the child execs or exits, and this does not. Everything else holds - the
+/// child is a real process with its own image, and the `fork`-then-`execve` pair
+/// every `vfork` user writes behaves identically. Suspending the parent is a
+/// scheduling feature for an optimisation this kernel does not make (there is no
+/// page-table sharing to avoid), so there is nothing to gain by faking it.
+pub(super) fn handle_fork(_args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
+    let ctx = match user_context(regs_ptr, 0) {
+        Some(ctx) => ctx,
+        None => return err::EINVAL,
+    };
+    crate::sched::fork(&ctx)
 }
 
-/// `clone(flags, newsp, parent_tid, child_tid, tls)` — create a new thread.
+/// Build the ring-3 register file a process would resume with, from the syscall
+/// gate's frame, with `rax` set to `rax` - zero for a fork child, and the new
+/// image's entry value for an `execve` that has nothing else to restore.
 ///
-/// On x86_64 Linux, clone() arguments are:
-///   rdi = flags
-///   rsi = newsp (new stack pointer; 0 = share parent's)
-///   rdx = parent_tid (set_tid pointer)
-///   r10 = child_tid (set_tid at child, write child TID here)
-///   r8  = tls (thread-local storage descriptor)
-///
-/// For CLONE_VM|CLONE_FILES (pthreads), the child shares the parent's address
-/// space and fd table, and both threads run concurrently. The child TID is
-/// written to `child_tid` and returned to the parent.
-pub(super) fn handle_clone(args: [usize; ARG_COUNT]) -> isize {
-    let flags = args[0];
-    let newsp = args[1];
-    // args[2] = parent_tid (ignored for now)
-    let child_tid_ptr = args[3];
-    // args[4] = tls (ignored for now)
-
-    // Basic validation: CLONE_VM without CLONE_THREAD is not supported yet.
-    // CLONE_VM|CLONE_FILES is what musl pthreads uses.
-    let clone_vm = flags & nr::CLONE_VM != 0;
-    let _clone_files = flags & nr::CLONE_FILES != 0;
-
-    if clone_vm {
-        // Thread creation: share address space and fd table.
-        // Use the real fork() which already handles CLONE_VM-like behavior
-        // through COW — for CLONE_VM we take a different path below.
-        match crate::sched::fork() {
-            pid if pid > 0 => {
-                // Parent: write child TID if requested.
-                if child_tid_ptr != 0 {
-                    unsafe {
-                        (child_tid_ptr as *mut i32).write_volatile(pid as i32);
-                    }
-                }
-                pid
-            }
-            0 => {
-                // Child enters here through fork_child_entry with RAX=0.
-                // We can't easily reach this branch from Rust since fork
-                // returns from the child context. The child TID write
-                // happens before fork returns to user space.
-                0
-            }
-            err => err, // Error already negated.
-        }
-    } else if flags == 0 && newsp == 0 {
-        // Plain fork() via clone() path (some libs call clone(0,0,...)).
-        crate::sched::fork()
-    } else {
-        // Unsupported clone variant.
-        err::ENOSYS
+/// Returns `None` when there is no frame: a call made outside the gate has no
+/// registers to name.
+fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::arch::context::UserContext> {
+    if regs_ptr.is_null() {
+        return None;
     }
+    let regs = unsafe { &*(regs_ptr as *const RegsFrame) };
+    let (code, data) = crate::arch::gdt::user_selectors();
+    Some(crate::arch::context::UserContext {
+        // `syscall` parked the return address in rcx and the caller's flags in
+        // r11; those two are what an `iretq` needs to reproduce the state the
+        // instruction left behind.
+        rip: regs.rcx,
+        rsp: regs.user_rsp,
+        rflags: regs.r11,
+        rax,
+        rbx: regs.rbx,
+        rbp: regs.rbp,
+        cs: code.0 as usize,
+        ss: data.0 as usize,
+        r12: regs.r12,
+        r13: regs.r13,
+        r14: regs.r14,
+        r15: regs.r15,
+        rdi: regs.rdi,
+        rsi: regs.rsi,
+        rdx: regs.rdx,
+        r8: regs.r8,
+        r9: regs.r9,
+        r10: regs.r10,
+    })
 }
 
-/// Send a signal to a process. Used by `kill` and `tkill`.
+/// `clone(flags, child_stack, parent_tid, child_tid, tls)` — create a process or
+/// a thread.
+///
+/// On x86_64 the arguments arrive as: `rdi` = flags, `rsi` = the child's stack,
+/// `rdx` = where the parent wants the child's tid written, `r10` = where the
+/// child wants its own tid written, `r8` = the child's TLS descriptor.
+///
+/// The call is `fork` with knobs: `fork` is `clone` with a zero flag word, and
+/// each set bit names a part of the caller the child should *share* instead of
+/// copying. The flag word is checked the way Linux checks it - an unknown bit,
+/// or a combination whose pieces need each other (`CLONE_THREAD` implies
+/// `CLONE_SIGHAND`, which implies `CLONE_VM`), is `EINVAL` before anything is
+/// created.
+///
+/// A process-shaped request - anything without `CLONE_THREAD` - is built here in
+/// full: the child returns from the call with 0 in `rax` on the stack the caller
+/// chose, with the tid writes and the TLS the flags name. `CLONE_THREAD` asks for
+/// a thread, and the scheduler refuses that one with `ENOSYS`: a shared address
+/// space needs reference counting this kernel's owned-by-one-task address spaces
+/// do not have, and a child that only *looks* like a thread would be worse than
+/// an honest refusal. `CLONE_VM` without `CLONE_THREAD` is the spawn shape and is
+/// honoured - see [`crate::sched::clone`].
+#[allow(clippy::too_many_lines)]
+pub(super) fn handle_clone(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
+    let (flags, child_stack, parent_tid, child_tid, tls) =
+        (args[0], args[1], args[2], args[3], args[4]);
+
+    // The low byte of the flag word is not a flag: it is the *signal* the
+    // parent should be sent when the child exits, which is why a word like
+    // `CLONE_VM|CLONE_VFORK|SIGCHLD` - exactly what a libc's `posix_spawn`
+    // passes - has a plain signal number mixed into it. Linux masks the byte off
+    // before testing the rest, and so must this: reading `SIGCHLD` (0x11) as an
+    // unknown flag bit would refuse every `posix_spawn` in the system.
+    const CSIGNAL: usize = 0x0000_00ff;
+    let exit_signal = flags & CSIGNAL;
+    let flags = flags & !CSIGNAL;
+
+    // The bits this kernel understands. Anything else is a request from a
+    // kernel newer than this one, and honouring it half-way would be worse than
+    // refusing it.
+    const KNOWN: usize = nr::CLONE_VM
+        | nr::CLONE_FS
+        | nr::CLONE_FILES
+        | nr::CLONE_SIGHAND
+        | nr::CLONE_VFORK
+        | nr::CLONE_PARENT
+        | nr::CLONE_THREAD
+        | nr::CLONE_SYSVSEM
+        | nr::CLONE_SETTLS
+        | nr::CLONE_PARENT_SETTID
+        | nr::CLONE_CHILD_CLEARTID
+        | nr::CLONE_CHILD_SETTID;
+    if flags & !KNOWN != 0 {
+        return err::EINVAL;
+    }
+    // A signal number that names nothing is not a request to deliver anything;
+    // Linux refuses it, and so does this - silently accepting it would hide a
+    // caller's mistake behind a working call.
+    if exit_signal > 31 {
+        return err::EINVAL;
+    }
+    // A fork child is announced by its parent's `wait`, not by a signal, so the
+    // exit signal is accepted and not acted on. `wait4` is how every caller in
+    // this system collects a child; the byte is kept in the ABI rather than
+    // honoured because there is no delivery path a shell could not get from
+    // waiting anyway.
+    let _ = exit_signal;
+    // The dependency chain Linux enforces: a thread shares its creator's signal
+    // handlers and address space, and a signal-handler table can only be shared
+    // by processes that also share memory.
+    if flags & nr::CLONE_THREAD != 0
+        && (flags & nr::CLONE_SIGHAND == 0 || flags & nr::CLONE_VM == 0)
+    {
+        return err::EINVAL;
+    }
+    if flags & nr::CLONE_SIGHAND != 0 && flags & nr::CLONE_VM == 0 {
+        return err::EINVAL;
+    }
+    // A tid must land somewhere; a flag that asks for the write without a place
+    // to put it is refused rather than ignored.
+    if flags & nr::CLONE_PARENT_SETTID != 0 && parent_tid == 0 {
+        return err::EINVAL;
+    }
+    if flags & (nr::CLONE_CHILD_SETTID | nr::CLONE_CHILD_CLEARTID) != 0 && child_tid == 0 {
+        return err::EINVAL;
+    }
+    // Both tid pointers, when present, must be writable in the caller.
+    if flags & nr::CLONE_PARENT_SETTID != 0 && !buffer_ok(parent_tid, 4, true, true) {
+        return err::EFAULT;
+    }
+    if flags & (nr::CLONE_CHILD_SETTID | nr::CLONE_CHILD_CLEARTID) != 0
+        && !buffer_ok(child_tid, 4, true, true)
+    {
+        return err::EFAULT;
+    }
+
+    let ctx = match user_context(regs_ptr, 0) {
+        Some(ctx) => ctx,
+        None => return err::EINVAL,
+    };
+
+    // A thread's stack is its own, so `child_stack` picks where it starts; a
+    // process ignores the argument and returns from the call on its own stack,
+    // exactly as `fork` does.
+    let request = crate::sched::CloneRequest {
+        flags,
+        child_stack,
+        child_tid,
+        tls,
+    };
+    let child = crate::sched::clone(&ctx, request);
+    if child < 0 {
+        return child;
+    }
+
+    // CLONE_PARENT_SETTID: the child's tid goes into the *parent's* memory, so
+    // the write happens here, before the child has run.
+    if flags & nr::CLONE_PARENT_SETTID != 0 {
+        unsafe { (parent_tid as *mut i32).write_volatile(child as i32) };
+    }
+    child
+}
+
+/// Send a signal to a process, or to a whole process group. Used by `kill` and
+/// `tkill`.
+///
+/// Linux reads the id's *sign*: a positive value names one process, -1 names
+/// every process the caller may signal (which this kernel reads as the
+/// caller's own group), any other negative value names a group by number, and
+/// zero names the caller's group. A shell leans on the negative case to stop a
+/// job - and on the signal-0 case, which delivers nothing and only asks
+/// whether the target is there.
 pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
-    let (id, sig) = (args[0], args[1]);
+    let (id, sig) = (args[0] as isize, args[1]);
     if sig > 31 {
         return err::EINVAL;
     }
-    if crate::sched::send_signal(TaskId(id), sig as u8) {
-        0
-    } else {
-        err::ESRCH
+    let delivered = match id {
+        n if n < 0 => {
+            let pgid = if n == -1 {
+                crate::sched::current_pgid()
+            } else {
+                TaskId(n.unsigned_abs())
+            };
+            crate::sched::send_signal_group(pgid, sig as u8)
+        }
+        0 => crate::sched::send_signal_group(crate::sched::current_pgid(), sig as u8),
+        n => crate::sched::send_signal(TaskId(n as usize), sig as u8),
+    };
+    if delivered { 0 } else { err::ESRCH }
+}
+
+/// `setpgid(pid, pgid)` — move a task into a process group. A `pgid` of zero
+/// means "the group led by `pid`", and both `pid` and `pgid` of zero are just
+/// the caller.
+pub(super) fn handle_setpgid(args: [usize; ARG_COUNT]) -> isize {
+    let (pid, pgid) = (args[0] as isize, args[1] as isize);
+    let me = crate::sched::current();
+    let target = match pid {
+        0 => me,
+        n if n > 0 => TaskId(n as usize),
+        _ => return err::EINVAL,
+    };
+    let group = match pgid {
+        0 => target,
+        n if n > 0 => TaskId(n as usize),
+        _ => return err::EINVAL,
+    };
+    let r = crate::sched::set_pgid(target, group);
+    crate::println!("[SETPGID] pid={pid} pgid={pgid} -> {r}");
+    r
+}
+
+/// `getpgid(pid)` and `getpgrp()` — which group a task is in.
+pub(super) fn handle_getpgid(args: [usize; ARG_COUNT]) -> isize {
+    let pid = args[0] as isize;
+    let target = match pid {
+        0 => crate::sched::current(),
+        n if n > 0 => TaskId(n as usize),
+        _ => return err::EINVAL,
+    };
+    match crate::sched::pgid_of(target) {
+        Some(pgid) => pgid.0 as isize,
+        None => err::ESRCH,
     }
+}
+
+// ---- init's own calls: reboot, sigtimedwait, umask, sendfile -------------
+//
+// None of these had a handler while the machine was handed straight to a
+// test script, and the first thing that ran after the handover - busybox
+// init - asked for all of them within a second of starting.
+
+/// The `cmd` words of `reboot(2)`, Linux x86_64. They are magic numbers, not
+/// flag bits, and each is its own sentence.
+const RB_DISABLE_CAD: usize = 0x0000_0000;
+const RB_ENABLE_CAD: usize = 0x89ab_cdef;
+const RB_AUTOBOOT: usize = 0x0123_4567;
+const RB_HALT_SYSTEM: usize = 0xcdef_0123;
+const RB_POWER_OFF: usize = 0x4321_fedc;
+
+/// `reboot(cmd)` — what init asks of the machine.
+///
+/// The two policy words (ctrl-alt-del's disposition) are recorded nowhere and
+/// answered with success, because this kernel has no console keyboard to wire
+/// them to and nobody else reads them back. The three stop words end the
+/// machine: QEMU's debug exit is the closest thing to a reset this
+/// environment has, and `-no-reboot` turns it into a clean shutdown either
+/// way. Anything else is refused, as Linux refuses it.
+pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
+    let cmd = args[0];
+    match cmd {
+        RB_DISABLE_CAD | RB_ENABLE_CAD => 0,
+        RB_AUTOBOOT | RB_HALT_SYSTEM | RB_POWER_OFF => {
+            crate::println!("mpos: reboot(0x{cmd:x}) - handing the machine back");
+            crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_SUCCESS);
+        }
+        _ => err::EINVAL,
+    }
+}
+
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — wait for one signal
+/// from a set and consume it without running any handler.
+///
+/// This is the door a daemon's main loop walks through: busybox init blocks
+/// everything but SIGCHLD and parks here, so a child's exit is noticed the
+/// moment the signal arrives rather than on a poll timer. Two kernel-side
+/// rules give it its shape. The signal is taken straight off the pending
+/// set: no disposition is consulted, which is what lets a daemon eat its own
+/// SIGTERM. And the two unblockable signals are silently stripped from the
+/// set, as Linux does: init waits on a full set minus SIGCHLD, which names
+/// them both, and refusing the call would stop init from ever running.
+///
+/// A NULL timeout waits forever; a zero one checks and answers `EAGAIN`.
+/// A fatal signal that arrives from *outside* the set still kills the waiter
+/// on each pass, exactly as `block_until` does for every blocking call.
+pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const SI_USER: i32 = 0;
+    /// The bytes of `siginfo_t` on x86_64.
+    const SIGINFO_BYTES: usize = 128;
+
+    let (set_ptr, info, timeout, sigsetsize) = (args[0], args[1], args[2], args[3]);
+    if sigsetsize != 8 {
+        return err::EINVAL;
+    }
+    let mut wanted = 0u32;
+    if set_ptr != 0 {
+        if !buffer_ok(set_ptr, 8, true, from_user) {
+            return err::EFAULT;
+        }
+        wanted = unsafe { (set_ptr as *const u32).read_volatile() };
+    }
+    let wanted = wanted
+        & !(crate::sched::signal::bit(crate::sched::signal::SIGKILL))
+        & !(crate::sched::signal::bit(crate::sched::signal::SIGSTOP));
+
+    // The timeout is a `struct timespec`, read to a tick deadline. A zero
+    // deadline is "check once" - the sleeps below never run and `EAGAIN`
+    // comes back the first time round.
+    let deadline = if timeout != 0 {
+        if !buffer_ok(timeout, 16, true, from_user) {
+            return err::EFAULT;
+        }
+        let sec = unsafe { (timeout as *const i64).read_volatile() };
+        let nsec = unsafe { ((timeout + 8) as *const i64).read_volatile() };
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return err::EINVAL;
+        }
+        let ms = sec.saturating_mul(1_000) + nsec / 1_000_000;
+        Some(crate::arch::timer::ticks() + ms as u64 * crate::arch::timer::TICK_HZ as u64 / 1_000)
+    } else {
+        None
+    };
+
+    loop {
+        if let Some(sig) = crate::sched::take_signal_in_set(wanted) {
+            if info != 0 {
+                if !buffer_ok(info, SIGINFO_BYTES, false, from_user) {
+                    return err::EFAULT;
+                }
+                unsafe {
+                    core::ptr::write_bytes(info as *mut u8, 0, SIGINFO_BYTES);
+                    (info as *mut i32).write_volatile(sig as i32); // si_signo
+                    ((info + 8) as *mut i32).write_volatile(SI_USER); // si_code
+                }
+            }
+            return sig as isize;
+        }
+        if let Some(sig) = crate::sched::take_fatal_signal() {
+            crate::sched::exit(-(sig as isize));
+        }
+        if let Some(end) = deadline
+            && crate::arch::timer::ticks() >= end
+        {
+            return err::EAGAIN;
+        }
+        crate::sched::sleep_ticks(1);
+    }
+}
+
+/// The file-creation mask, `0o022` the way init leaves it.
+static CREATION_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0o022);
+
+/// `umask(mask)` — set the creation mask, and report what it was. No path
+/// records permission bits yet, so the mask is kept and handed back only;
+/// init's `umask(0o22)` still gets the answer it expects.
+pub(super) fn handle_umask(args: [usize; ARG_COUNT]) -> isize {
+    use core::sync::atomic::Ordering;
+    let old = CREATION_MASK.swap(args[0] as u32 & 0o7777, Ordering::Relaxed);
+    old as isize
+}
+
+/// `sendfile(out, in, offset, count)` — copy bytes between descriptors in the
+/// kernel. The in-descriptor must be a file (anything `read_at` reaches); the
+/// out-descriptor gets the bytes wherever a `write` would put them.
+///
+/// `offset` is an in-out `loff_t *`: NULL uses and advances the in-file's own
+/// cursor, otherwise the position lives in the caller's word. The one caller
+/// on this system asks for a short copy from a file to the console, and that
+/// is the shape this serves.
+pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (out_fd, in_fd, offset_ptr, count) = (args[0] as i32, args[1] as i32, args[2], args[3]);
+    let fds = crate::sched::current_fds();
+    let out = match fds.clone_at(out_fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let input = match fds.clone_at(in_fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    if count == 0 {
+        return 0;
+    }
+
+    let mut pos: u64 = if offset_ptr != 0 {
+        if !buffer_ok(offset_ptr, 8, true, from_user) {
+            return err::EFAULT;
+        }
+        unsafe { (offset_ptr as *const u64).read_volatile() }
+    } else {
+        input.pos()
+    };
+
+    let mut sent: usize = 0;
+    let mut chunk = [0u8; 4096];
+    while sent < count {
+        let want = (count - sent).min(chunk.len());
+        let read = if offset_ptr != 0 {
+            input.inode().read_at(pos, &mut chunk[..want])
+        } else {
+            input.read(&mut chunk[..want])
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(e) => {
+                if sent > 0 {
+                    break;
+                }
+                return err_of(e);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let w = match out.write(&chunk[..n]) {
+            Ok(w) => w,
+            Err(e) => {
+                if sent > 0 {
+                    break;
+                }
+                return err_of(e);
+            }
+        };
+        if w == 0 {
+            break;
+        }
+        pos += w as u64;
+        sent += w;
+    }
+
+    if offset_ptr != 0 {
+        if !buffer_ok(offset_ptr, 8, false, from_user) {
+            return err::EFAULT;
+        }
+        unsafe { (offset_ptr as *mut u64).write_volatile(pos) };
+    }
+    sent as isize
 }
 
 /// `brk(addr)` — change the program break (heap end).
 pub(super) fn handle_brk(args: [usize; ARG_COUNT]) -> isize {
     let addr = args[0];
-    let result = crate::sched::brk(addr);
-    // Trace first few BRK calls per process for musl debug.
-    static BRK_COUNTS: [core::sync::atomic::AtomicUsize; 64] =
-        const { [const { core::sync::atomic::AtomicUsize::new(0) }; 64] };
-    let pid = crate::sched::current().0;
-    let n = BRK_COUNTS[pid].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n < 8 {
-        crate::println!(
-            "[brk #{}] pid={} req={:#x} -> {:#x}",
-            n,
-            pid,
-            addr,
-            result as usize
-        );
-    }
-    result
+    crate::sched::brk(addr)
 }
 
 use crate::mm::vm::MapFlags;
@@ -321,10 +992,15 @@ const MREMAP_FIXED: usize = 0x2;
 /// canonical address space, which is where every user mapping lives.
 const USER_LIMIT: usize = 1 << 47;
 
-/// `mmap(addr, length, prot, flags, fd, offset)` — map anonymous memory.
+/// `mmap(addr, length, prot, flags, fd, offset)` — map memory, from a file or
+/// from nothing.
 ///
-/// Only anonymous private mappings exist: mpos has no file mappings, and a
-/// request for one is refused rather than answered with zeroed pages.
+/// A file mapping is read in at the moment it is made: the pages are private
+/// copies of what the file held, and nothing tracks the file afterwards. That
+/// is the whole of `MAP_PRIVATE` for a reader, and it is what the dynamic
+/// linker needs - it maps a shared object read-only, parses it, and then
+/// `mprotect`s the pieces it wants writable. A writer's shared mapping is a
+/// different contract, and mpos does not keep one.
 ///
 /// The address handling is Linux's, and two details of it are load-bearing for
 /// a real libc:
@@ -343,7 +1019,7 @@ const USER_LIMIT: usize = 1 << 47;
 pub(super) fn handle_mmap(args: [usize; ARG_COUNT]) -> isize {
     use crate::mm::pframe::PAGE_SIZE;
 
-    let (addr, length, prot, flags, _fd, _offset) =
+    let (addr, length, prot, flags, fd, offset) =
         (args[0], args[1], args[2], args[3], args[4] as i32, args[5]);
 
     let anon = flags & MAP_ANONYMOUS != 0;
@@ -353,33 +1029,33 @@ pub(super) fn handle_mmap(args: [usize; ARG_COUNT]) -> isize {
     if length == 0 {
         return err::EINVAL;
     }
-    // Anonymous is the only kind mpos can build: a file mapping would need a
-    // page cache to read the file through. The descriptor is ignored when the
-    // mapping is anonymous, as Linux ignores it.
-    if !anon {
-        return err::ENODEV;
-    }
-    // A shared anonymous mapping is a mapping two processes would have to see
-    // the same frames through, which mpos does not do yet.
+    // A shared mapping is one two processes would have to see the same frames
+    // through, which mpos does not do yet - whether the frames came from a
+    // file or from nothing.
     if shared {
-        return err::ENOSYS;
+        let ret = err::ENOSYS;
+        crate::println!("DBG mmap SHARED len={} fd={} ret={}", length, fd, ret);
+        return ret;
     }
+
+    // What the mapping is filled from. The descriptor is ignored when the
+    // mapping is anonymous, as Linux ignores it.
+    let backing = if anon {
+        None
+    } else {
+        // The offset of a file mapping is a page number, not a byte count, so
+        // one that is not page-aligned has no meaning to honour.
+        if !offset.is_multiple_of(PAGE_SIZE) {
+            return err::EINVAL;
+        }
+        match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) => Some(file),
+            Err(_) => return err::EBADF,
+        }
+    };
 
     let len = crate::mm::pframe::align_up(length, PAGE_SIZE);
 
-    // Debug: trace large mmap requests that could indicate a bogus allocation.
-    if len > 1024 * 1024 {
-        crate::println!(
-            "[mmap] size={:#x} ({} KiB), addr={:#x}, prot={:#x}, flags={:#x}, fd={}, offset={:#x}",
-            len,
-            len / 1024,
-            addr,
-            prot,
-            flags,
-            _fd,
-            _offset
-        );
-    }
     // An address a process can actually use: inside the lower half, on a page
     // boundary, and not wrapping.
     let want = (addr != 0
@@ -424,12 +1100,34 @@ pub(super) fn handle_mmap(args: [usize; ARG_COUNT]) -> isize {
 
     for page in (base..base + len).step_by(PAGE_SIZE) {
         // The pages of a replaced range are gone; these are fresh ones, zeroed
-        // as POSIX promises for anonymous memory.
+        // as POSIX promises for anonymous memory and as the tail of a file
+        // mapping promises past the end of the file.
         let frame = match crate::mm::alloc_frames(0) {
             Some(frame) => frame,
             None => return err::ENOMEM,
         };
-        unsafe { core::ptr::write_bytes(crate::mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
+        let dest = unsafe {
+            core::slice::from_raw_parts_mut(crate::mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE)
+        };
+        dest.fill(0);
+
+        if let Some(file) = &backing {
+            // Copy what the file has for this page. A short read ends the
+            // copy rather than failing it: the last page of a mapping is
+            // rarely full, and the zeros already there are the right answer
+            // for the rest.
+            let inode = file.inode();
+            let start = offset + (page - base);
+            let mut done = 0;
+            while done < PAGE_SIZE {
+                match inode.read_at((start + done) as u64, &mut dest[done..]) {
+                    Ok(0) => break,
+                    Ok(n) => done += n,
+                    Err(_) => break,
+                }
+            }
+        }
+
         if crate::sched::current_map_user(page, frame, mf) < 0 {
             return err::ENOMEM;
         }
@@ -627,6 +1325,144 @@ pub(super) fn handle_mprotect(args: [usize; ARG_COUNT]) -> isize {
         mf |= MapFlags::USER;
     }
     crate::sched::protect_user(addr, len, mf);
+    0
+}
+
+/// The x86_64 `struct itimerval`: two `struct timeval`s - `it_value` first,
+/// `it_interval` second - 32 bytes in all.
+const ITIMERVAL_SIZE: usize = 32;
+
+/// Write `snapshot` out as a `struct itimerval`, zeroed for a disarmed one.
+/// Second granularity is what the kernel's clock supports, so the usec
+/// fields stay zero.
+/// # Safety
+/// `at` must be a writable user address for 32 bytes, as the callers checked.
+unsafe fn write_itimerval(at: usize, snapshot: Option<crate::sched::ItimerSnapshot>) {
+    let (value, interval) = match snapshot {
+        Some(s) => (s.remaining_ticks, s.interval_ticks),
+        None => (0, 0),
+    };
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    let words: [u64; 4] = [value * 1000 / hz, 0, interval * 1000 / hz, 0];
+    unsafe {
+        for (n, word) in words.iter().enumerate() {
+            (at as *mut u64).add(n).write_volatile(*word);
+        }
+    }
+}
+
+/// `setitimer(which, new_value, old_value)`.
+///
+/// Only `ITIMER_REAL` ever fires: it counts the wall-clock ticks the board
+/// actually has. The virtual and profiling timers would need per-task CPU
+/// accounting, which does not exist yet, so they are installed and read
+/// back faithfully but never expire - the shape a caller that probes and
+/// then cancels cannot distinguish from the real thing.
+pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
+    let (which, new_ptr, old_ptr) = (args[0], args[1], args[2]);
+    if which > crate::sched::ITIMER_PROF {
+        return err::EINVAL;
+    }
+    if old_ptr != 0 && !buffer_ok(old_ptr, ITIMERVAL_SIZE, true, true) {
+        return err::EFAULT;
+    }
+    let (value_ticks, interval_ticks) = if new_ptr == 0 {
+        // A NULL new_value is Linux's spelling of "just tell me the old one".
+        (0, 0)
+    } else {
+        if !buffer_ok(new_ptr, ITIMERVAL_SIZE, false, true) {
+            return err::EFAULT;
+        }
+        unsafe {
+            let word = |n: usize| (new_ptr as *const u64).add(n).read_volatile();
+            let (vsec, vusec, isec, iusec) = (word(0), word(1), word(2), word(3));
+            if vusec >= 1_000_000 || iusec >= 1_000_000 {
+                return err::EINVAL;
+            }
+            let value_ms = vsec * 1000 + vusec.div_ceil(1000);
+            let interval_ms = isec * 1000 + iusec.div_ceil(1000);
+            let hz = crate::arch::timer::TICK_HZ as u64;
+            (value_ms * hz / 1000, interval_ms * hz / 1000)
+        }
+    };
+    let new = if value_ticks == 0 {
+        // A zero it_value disarms, exactly as the man page words it.
+        None
+    } else {
+        Some(crate::sched::ItimerState {
+            interval_ticks,
+            deadline: crate::arch::timer::ticks() + value_ticks.max(1),
+        })
+    };
+    let old = crate::sched::itimer_swap(which, new);
+    if old_ptr != 0 {
+        unsafe { write_itimerval(old_ptr, old) };
+    }
+    0
+}
+
+/// `getitimer(which, curr_value)`.
+pub(super) fn handle_getitimer(args: [usize; ARG_COUNT]) -> isize {
+    let (which, ptr) = (args[0], args[1]);
+    if which > crate::sched::ITIMER_PROF {
+        return err::EINVAL;
+    }
+    if !buffer_ok(ptr, ITIMERVAL_SIZE, true, true) {
+        return err::EFAULT;
+    }
+    unsafe { write_itimerval(ptr, crate::sched::itimer_snapshot(which)) };
+    0
+}
+
+/// `alarm(seconds)`.
+///
+/// The one-shot spelling of `setitimer(ITIMER_REAL)`. The answer is the time
+/// the previous alarm had left, rounded up to seconds as the man page words
+/// it - zero when no alarm was set.
+pub(super) fn handle_alarm(args: [usize; ARG_COUNT]) -> isize {
+    let seconds = args[0] as u64;
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    let new = if seconds == 0 {
+        None
+    } else {
+        Some(crate::sched::ItimerState {
+            interval_ticks: 0,
+            deadline: crate::arch::timer::ticks() + (seconds * hz).max(1),
+        })
+    };
+    match crate::sched::itimer_swap(crate::sched::ITIMER_REAL, new) {
+        Some(s) if s.remaining_ticks > 0 => s.remaining_ticks.div_ceil(hz) as isize,
+        _ => 0,
+    }
+}
+
+/// `sysinfo(info)` - fill the 112-byte Linux x86_64 `struct sysinfo`.
+///
+/// The numbers come from counters the kernel keeps anyway: uptime from the
+/// tick count, memory from the frame allocator, the process count from the
+/// task table. Loads, swap and the high-memory halves report zero - nobody
+/// here measures them.
+pub(super) fn handle_sysinfo(args: [usize; ARG_COUNT]) -> isize {
+    let buf = args[0];
+    const SYSINFO_SIZE: usize = 112;
+    if !buffer_ok(buf, SYSINFO_SIZE, true, true) {
+        return err::EFAULT;
+    }
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    let ticks = crate::arch::timer::ticks();
+    let stats = crate::mm::frame_stats();
+    let page = 4096u64;
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, SYSINFO_SIZE);
+        let word = |offset: usize| (buf + offset) as *mut u64;
+        word(0).write_volatile(ticks / hz); // uptime
+        word(32).write_volatile(stats.total as u64 * page); // totalram
+        word(40).write_volatile(stats.free as u64 * page); // freeram
+        (buf as *mut u16)
+            .add(40)
+            .write_volatile(crate::sched::task_count() as u16); // procs
+        (buf as *mut u32).add(26).write_volatile(1); // mem_unit: bytes
+    }
     0
 }
 

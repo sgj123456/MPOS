@@ -134,15 +134,28 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) ->
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let addr = Cr2::read().map_or(0, |a| a.as_u64()) as usize;
     let rip = frame.instruction_pointer.as_u64() as usize;
+    // The top of the canonical lower half: everything a process may map.
+    let user_address = addr < (1 << 47);
 
-    // User fault in the lower half: try COW first, then deliver SIGSEGV.
+    // A write to a copy-on-write page is resolved whoever made it. Usually that
+    // is ring 3 writing its own variable after a `fork`, but it is just as often
+    // ring 0: every syscall that fills a user buffer - `uname`, `getrandom`,
+    // `clock_gettime`, the `CLONE_CHILD_SETTID` write - lands on the same shared
+    // page, and the page must split for the kernel's write exactly as it would
+    // for the process's own. Refusing it here would take the machine down over
+    // an operation Linux performs without a second thought.
+    if user_address
+        && code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+        && crate::sched::resolve_cow_fault(addr)
+    {
+        return; // The faulting instruction retries and succeeds.
+    }
+
+    // Anything else at a user address is the process's own fault to bear. The
+    // `rip` test keeps this from claiming a kernel fault that merely named a
+    // user address: a ring-0 dereference of a bad user pointer is a kernel bug,
+    // not a signal to deliver.
     if rip < (1 << 47) {
-        // Write fault with COW bit set: resolve by copying the page.
-        if code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
-            && crate::sched::resolve_cow_fault(addr)
-        {
-            return; // Instruction retries and succeeds.
-        }
         crate::println!("user #PF at {:#x} code={:?} rip={:#x}", addr, code, rip);
         crate::sched::send_signal(crate::sched::current(), 11);
         crate::sched::preempt();

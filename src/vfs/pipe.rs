@@ -22,7 +22,7 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 
-use super::{Inode, Metadata, NodeKind, VfsError, VfsResult};
+use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
 
 /// Writes up to this many bytes never split across a blocking point, which is
@@ -239,6 +239,46 @@ impl Drop for PipeEnd {
 }
 
 impl Inode for PipeEnd {
+    fn poll_ready(&self) -> Ready {
+        critical_section::with(|cs| {
+            let st = self.state.borrow(cs).borrow();
+            Ready {
+                // Data waiting, or the end of it: with no writers left, a read
+                // answers 0 rather than waiting, and that is readable too.
+                read: !st.data.is_empty() || st.writers == 0,
+                // Room for something, or a write that is about to fail: with no
+                // readers left, a write answers EPIPE rather than waiting.
+                write: st.readers == 0 || st.data.len() < CAPACITY,
+            }
+        })
+    }
+
+    fn poll_subscribe(&self, id: TaskId) {
+        critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            let queue = if self.writing {
+                &mut st.waiting_writers
+            } else {
+                &mut st.waiting_readers
+            };
+            if !queue.contains(&id) {
+                queue.push(id);
+            }
+        });
+    }
+
+    fn poll_unsubscribe(&self, id: TaskId) {
+        critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            let queue = if self.writing {
+                &mut st.waiting_writers
+            } else {
+                &mut st.waiting_readers
+            };
+            queue.retain(|&w| w != id);
+        });
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0,

@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use critical_section::Mutex;
 
-use crate::arch::context::{self, Context};
+use crate::arch::context::{self, Context, UserContext};
 use crate::arch::gdt;
 use crate::arch::paging::{self, AddressSpace};
 use crate::arch::{idle, timer};
@@ -41,8 +41,9 @@ use crate::mm::vm::{MapFlags, Mapping};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{Priority, Scheduler, TaskId};
 use crate::sched::signal;
+use crate::syscall::linux::nr;
 use crate::vfs::RawFd;
-use crate::vfs::file::FdTable;
+use crate::vfs::file::{FdTable, File};
 
 /// How many tasks can exist at once. A hard limit rather than a grown
 /// collection, for the reason given in the module docs.
@@ -104,6 +105,17 @@ const USER_STACK_PAGES: usize = 16;
 pub const ARGV_MAX: usize = 16;
 pub const ARGS_BYTES_MAX: usize = 512;
 
+/// Where a dynamically linked program's interpreter is loaded.
+///
+/// It cannot go at zero with the program: an interpreter is position
+/// independent, its segments count from zero, and mapping it there would land
+/// it on top of the program's own first pages. Linux gives it a high address
+/// out of the way of everything; this is the same idea placed for *this*
+/// layout, which has no room at the top - the stack ends at 1 GiB, the mmap
+/// region grows down from 0x7f00_0000_0000, and 1.75 GiB is the widest gap
+/// left between them.
+const INTERP_BASE: usize = 0x0000_0000_7000_0000;
+
 /// Why a user image refused to spawn. The syscall layer maps these onto
 /// errnos; nothing here panics, because a bad path from ring 3 is not a
 /// kernel bug.
@@ -116,6 +128,10 @@ pub enum SpawnError {
     /// A descriptor the starter asked the child to be born with names nothing
     /// in the starter's own table.
     BadFd,
+    /// The image asked for a program interpreter - a dynamically linked
+    /// binary - and the path it named is not on the filesystem, or is not an
+    /// image that can be loaded.
+    NoInterpreter,
 }
 
 /// Where a descriptor taken from the starter's table goes in the child's:
@@ -130,6 +146,32 @@ pub type Redirect = (RawFd, RawFd);
 /// it, and anything left over is dropped oldest-first when the cap is reached.
 static RETIRED: Mutex<RefCell<Vec<(TaskId, isize)>>> = Mutex::new(RefCell::new(Vec::new()));
 const RETIRED_CAP: usize = 32;
+
+/// Descriptions an exited process held, waiting to be dropped.
+///
+/// [`Table::release_exited`] runs with the task table borrowed, and dropping a
+/// description can wake whoever was blocked on it - which needs the table. So
+/// the files are parked here and dropped by the scheduler, which is the one
+/// place that holds no borrow while still running often enough that a released
+/// pipe reaches its reader promptly.
+static RELEASE: Mutex<RefCell<Vec<alloc::vec::Vec<Arc<File>>>>> =
+    Mutex::new(RefCell::new(Vec::new()));
+
+fn queue_release(files: alloc::vec::Vec<Arc<File>>) {
+    critical_section::with(|cs| RELEASE.borrow(cs).borrow_mut().push(files));
+}
+
+/// Drop whatever exited processes have handed over. Called by the scheduler
+/// outside its borrow of the task table.
+fn drain_release() {
+    loop {
+        let next = critical_section::with(|cs| RELEASE.borrow(cs).borrow_mut().pop());
+        match next {
+            Some(files) => drop(files),
+            None => break,
+        }
+    }
+}
 
 /// `critical_section::Mutex` requires its contents to be `Send`, and the table
 /// holds task bodies - `Box<dyn FnOnce()>`, which is not. On one core there is
@@ -172,6 +214,32 @@ impl Stack {
     }
 }
 
+/// Which of the three interval timers a `setitimer` call names. The numbers
+/// are the ABI's own: `ITIMER_REAL`, `ITIMER_VIRTUAL`, `ITIMER_PROF`, in
+/// that order.
+pub const ITIMER_REAL: usize = 0;
+pub const ITIMER_VIRTUAL: usize = 1;
+pub const ITIMER_PROF: usize = 2;
+
+/// One armed interval timer: when it fires and what it reloads to.
+#[derive(Clone, Copy)]
+pub struct ItimerState {
+    /// The reload value in ticks. A one-shot timer has none; a periodic one
+    /// reloads from where it was due, so a late check skips rather than
+    /// queues the periods it missed.
+    pub interval_ticks: u64,
+    /// The absolute tick the timer fires at.
+    pub deadline: u64,
+}
+
+/// What `getitimer` reports about one timer: its reload value and the time
+/// left on it, in ticks.
+#[derive(Clone, Copy)]
+pub struct ItimerSnapshot {
+    pub interval_ticks: u64,
+    pub remaining_ticks: u64,
+}
+
 struct Task {
     /// Must stay put for as long as the task exists.
     context: Context,
@@ -187,13 +255,21 @@ struct Task {
     /// Where a user task's first dispatch goes: the entry point and the stack
     /// `enter_user` hands the CPU. Kernel tasks have none.
     user_entry: Option<(usize, usize)>,
+    /// Where a *forked* child's first dispatch goes: the parent's ring-3
+    /// register file at the moment of the call, with `rax` set to zero. A
+    /// child resumes mid-program rather than at the entry point, so it needs
+    /// a whole register file where a freshly spawned task needs one address.
+    user_resume: Option<UserContext>,
     /// Physical frames behind the user mappings - program pages and stack.
     /// Dropping the address space frees its tables but never these, so the
     /// reaper returns them by hand.
     user_frames: Vec<usize>,
-    /// Signals sent to this task and not yet delivered. There are no handlers
-    /// yet, so delivery means the task dies at its next blocking point.
+    /// Signals sent to this task and not yet delivered.
     signals: signal::Pending,
+    /// The signals this task has blocked with `rt_sigprocmask`. A blocked
+    /// signal stays pending until it is unblocked, which is what makes a
+    /// critical section able to say "not now" and be obeyed.
+    blocked: signal::Pending,
     /// What `rt_sigaction` recorded for this process, per signal. Its own
     /// table, not a shared one: a fresh process must answer `SIG_DFL` for
     /// everything, whatever its parent or its sibling installed.
@@ -215,6 +291,15 @@ struct Task {
     /// The task that spawned this one in ring 3, if any. Its `wait` blocks on
     /// this task's exit; kernel-spawned tasks have none.
     parent: Option<TaskId>,
+    /// The process group this task belongs to, named by its leader's id.
+    ///
+    /// It is what a terminal's interrupt is aimed at: Ctrl-C is not sent to
+    /// the process reading the keyboard, it is sent to the *group* the
+    /// foreground job lives in, which is why a pipeline of three programs all
+    /// stop together and the shell that started them does not. A task inherits
+    /// its parent's group, so `setpgid(0, 0)` in a child - which is what a
+    /// shell does before `exec` - is the whole of what makes that job separate.
+    pgid: TaskId,
     /// Per-process brk state for heap management. The frames behind the
     /// break's pages are on `user_frames` like every other frame the process
     /// owns; only the bookkeeping of *where* the break is stays here.
@@ -228,6 +313,19 @@ struct Task {
     /// through. Empty for tasks that never had an image (kernel tasks, the
     /// boot task).
     exe: alloc::string::String,
+    /// Where a child created by `clone(CLONE_CHILD_SETTID)` writes its own tid
+    /// before it first runs. Zero when nothing was asked for.
+    child_tid: usize,
+    /// The thread-local storage base (FS) this task runs with. Per task, not
+    /// per CPU: two processes each with their own TLS would otherwise overwrite
+    /// each other's on every dispatch. `arch_prctl(ARCH_SET_FS)` and
+    /// `clone(CLONE_SETTLS)` are what move it.
+    tls: usize,
+    /// The three interval timers `setitimer` arms, indexed by the ABI's
+    /// `which`. `ITIMER_REAL` really expires - it counts the wall-clock
+    /// ticks the board has; the other two are recorded but never fire, for
+    /// want of per-task CPU accounting.
+    itimers: [Option<ItimerState>; 3],
 }
 
 impl Task {
@@ -242,18 +340,24 @@ impl Task {
             body: None,
             space: None,
             user_entry: None,
+            user_resume: None,
             user_frames: Vec::new(),
             signals: 0,
+            blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
             cwd: None,
             cwd_path: None,
             parent: None,
+            pgid: TaskId(0),
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
+            child_tid: 0,
+            tls: 0,
+            itimers: [None; 3],
         }
     }
 }
@@ -306,7 +410,8 @@ impl Table {
     }
 
     /// Aim the CPU at the task that is about to run: its address space under
-    /// CR3, its kernel stack under `RSP0` for traps from ring 3.
+    /// CR3, its kernel stack under `RSP0` for traps from ring 3, and its TLS
+    /// base under FS.
     fn prepare(&mut self, id: TaskId) {
         let task = self.task(id);
         let root = match &task.space {
@@ -317,6 +422,10 @@ impl Table {
         if let Some(stack) = &task.stack {
             gdt::set_kernel_stack(stack.top());
         }
+        // FS.base is one register for the whole CPU, so every task that wants
+        // its own thread-local storage has to reinstall it here. A process with
+        // none gets a cleared base, which is the state a fresh image starts in.
+        unsafe { write_msr(MSR_FS_BASE, task.tls as u64) };
     }
 
     /// Put the running task at the back of its own band. This is a yield, and it
@@ -339,9 +448,49 @@ impl Table {
         self.enter(SCHED_ID)
     }
 
-    /// The scheduler's whole turn: bury the dead, move the clock on, choose.
-    /// `None` means there is nothing to run and the caller should idle.
+    /// Fire every interval timer whose deadline has passed.
+    ///
+    /// Firing is signal-add plus wake - the exact shape `send_signal` uses:
+    /// the bit lands in the task's pending set, and a task parked in a
+    /// `block_until` is pulled out of the sleep queue so it can act on it.
+    /// A periodic timer reloads from where it was due, coalescing any
+    /// periods a late check skipped; a one-shot disarms.
+    fn check_itimers(&mut self) {
+        let now = timer::ticks();
+        for (i, slot) in self.tasks.iter_mut().enumerate() {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+            if task.exited {
+                continue;
+            }
+            let Some(state) = task.itimers[ITIMER_REAL].as_ref() else {
+                continue;
+            };
+            if now < state.deadline {
+                continue;
+            }
+            let interval = state.interval_ticks;
+            signal::add(&mut task.signals, signal::SIGALRM);
+            self.sched.wake(TaskId(i));
+            match task.itimers[ITIMER_REAL].as_mut() {
+                Some(st) if interval > 0 => {
+                    let mut next = st.deadline + interval;
+                    while next <= now {
+                        next += interval;
+                    }
+                    st.deadline = next;
+                }
+                _ => task.itimers[ITIMER_REAL] = None,
+            }
+        }
+    }
+
+    /// The scheduler's whole turn: fire timers, bury the dead, move the
+    /// clock on, choose. `None` means there is nothing to run and the caller
+    /// should idle.
     fn next_turn(&mut self) -> Option<(*mut Context, *const Context)> {
+        self.check_itimers();
         self.reap();
         self.sched.advance(timer::ticks());
         let picked = self.sched.pick();
@@ -395,18 +544,24 @@ impl Table {
             body: Some(Box::new(body)),
             space: None,
             user_entry: None,
+            user_resume: None,
             user_frames: Vec::new(),
             signals: 0,
+            blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
             cwd: None,
             cwd_path: None,
             parent: None,
+            pgid: TaskId(0),
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
+            child_tid: 0,
+            tls: 0,
+            itimers: [None; 3],
         });
         TaskId(slot)
     }
@@ -422,7 +577,62 @@ impl Table {
     /// the pid to a new task, and the parent asking for that pid would be told
     /// about the wrong death. `discard_exit_code` is how a code nobody will
     /// ever want is cleared, which lets the slot go.
+    /// Give back everything an exited process owned, at its exit rather than at
+    /// its reap.
+    ///
+    /// A process stops needing its memory and its descriptors the moment it
+    /// stops running. Releasing them only once its parent has collected its exit
+    /// code would leave a zombie holding every pipe it ever wrote to open, and
+    /// whoever is reading the other end would wait for an end-of-file that
+    /// cannot arrive until the parent gets round to waiting - which, for the
+    /// second stage of a pipeline, is exactly the order that deadlocks.
+    ///
+    /// What stays is the slot: a zombie still has a pid, a parent, and a code
+    /// for that parent to read. Only the stack goes, and only in [`Self::reap`].
+    fn release_exited(&mut self) {
+        for entry in self.tasks.iter_mut() {
+            let Some(task) = entry else { continue };
+            if !task.exited {
+                continue;
+            }
+
+            // The address space first: if its CR3 is the one loaded, dropping
+            // it switches back to the kernel's own before any page table is
+            // freed. The drop frees tables only, so the frames the mappings
+            // pointed at come back separately below.
+            drop(task.space.take());
+            for frame in task.user_frames.drain(..) {
+                // A frame shared by a copy-on-write fork is released, not
+                // freed: the process that still maps it owns it now.
+                if mm::free_frame_ref(frame) {
+                    mm::free_frames(frame, 0);
+                }
+            }
+
+            // The descriptors are handed over rather than dropped: dropping a
+            // pipe end wakes whoever was blocked on it, and this runs with the
+            // task table borrowed. The scheduler drops them once it is out.
+            //
+            // Only a table this task owns outright is its to close. Every
+            // kernel task starts on the one shared table, and emptying that
+            // would close the console out from under all the others - the
+            // table is shared, so the descriptors do not belong to the task
+            // that happened to exit first.
+            if Arc::strong_count(&task.fds) == 1 {
+                let files = task.fds.take_all();
+                if !files.is_empty() {
+                    // Sockets go down with the process that held their last
+                    // reference - before the batch is parked for dropping,
+                    // while the counts still say who owns them.
+                    crate::net::socket::close_sockets_at_exit(&files);
+                    queue_release(files);
+                }
+            }
+        }
+    }
+
     fn reap(&mut self) {
+        self.release_exited();
         for (slot, entry) in self.tasks.iter_mut().enumerate() {
             let Some(task) = entry else { continue };
             if !task.exited {
@@ -435,15 +645,6 @@ impl Table {
             );
             if exit_code_pending(TaskId(slot)) {
                 continue;
-            }
-
-            // The address space first: if its CR3 is the one loaded, dropping
-            // it switches back to the kernel's own before any page table is
-            // freed. The drop frees tables only, so the frames the mappings
-            // pointed at come back separately below.
-            drop(task.space.take());
-            for frame in task.user_frames.drain(..) {
-                mm::free_frames(frame, 0);
             }
 
             let stack = task
@@ -554,8 +755,18 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         drop_retired(INIT_PID);
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        let (entry, frames, stack_top_frame) = load_user(&mut space, &image);
-        write_arg_block(stack_top_frame, user_rsp, argv, env, "", &image);
+        // init is the kernel's own program and statically linked, so there is
+        // no interpreter to read: a filesystem is not even up yet.
+        let loaded = load_user(&mut space, &image, None);
+        write_arg_block(
+            loaded.stack_top,
+            user_rsp,
+            argv,
+            env,
+            "",
+            &image,
+            loaded.base,
+        );
 
         let brk_base = image
             .segments
@@ -577,19 +788,27 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             exited: false,
             body: None,
             space: Some(space),
-            user_entry: Some((entry, user_rsp)),
-            user_frames: frames,
+            user_entry: Some((loaded.entry, user_rsp)),
+            user_resume: None,
+            user_frames: loaded.frames,
             signals: 0,
+            blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds: Arc::new(FdTable::with_standard(crate::vfs::tty::global())),
             cwd: None,
             cwd_path: None,
             parent: None,
+            // init leads the first process group, so a command started
+            // before any job control exists still has a group to land in.
+            pgid: INIT_PID,
             brk_base,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
+            child_tid: 0,
+            tls: 0,
+            itimers: [None; 3],
         });
         t.sched.push_ready(INIT_PID, Priority::NORMAL);
         Ok(INIT_PID)
@@ -629,7 +848,11 @@ pub fn try_spawn_user(
         drop_retired(TaskId(slot));
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        let (entry, frames, stack_top_frame) = load_user(&mut space, &image);
+        // Every caller of this reaches it with bytes it read from the
+        // filesystem itself, and none of them has a second path to read: the
+        // spawn sites in the kernel start static programs. A dynamic one
+        // arrives through `execve`, which does the interpreter lookup.
+        let loaded = load_user(&mut space, &image, None);
 
         let brk_base = image
             .segments
@@ -642,29 +865,16 @@ pub fn try_spawn_user(
 
         // The argument block is written last, straight into the top page of
         // the stack this task will land on, through the direct map. The top
-        // frame is already in `frames` - `load_user` returns it separately
-        // only so this write knows where the stack's page lives.
-        write_arg_block(stack_top_frame, user_rsp, argv, env, exe, &image);
-        crate::println!(
-            "[SPAWN] pid-slot={} argv={:?} rsp={:#x} top_frame={:#x}",
-            slot,
+        // frame is already in `loaded.frames` - `load_user` reports it
+        // separately only so this write knows where the stack's page lives.
+        write_arg_block(
+            loaded.stack_top,
+            user_rsp,
             argv,
-            user_rsp,
-            stack_top_frame
-        );
-        // TEMP DEBUG: prove the page tables map the argc slot to the frame the
-        // argument block was written into.
-        let pte_phys = space.phys_for_virt(user_rsp);
-        crate::println!(
-            "[PTECHK] translate({:#x}) = {:#x} (expect {:#x}) {}",
-            user_rsp,
-            pte_phys.map(|p| p & !(PAGE_SIZE - 1)).unwrap_or(0),
-            stack_top_frame,
-            if pte_phys.map(|p| p & !(PAGE_SIZE - 1)) == Some(stack_top_frame) {
-                "OK"
-            } else {
-                "MISMATCH"
-            }
+            env,
+            exe,
+            &image,
+            loaded.base,
         );
 
         // Safety: as in `create`, the stack was just allocated and nothing else
@@ -695,19 +905,25 @@ pub fn try_spawn_user(
             exited: false,
             body: None,
             space: Some(space),
-            user_entry: Some((entry, user_rsp)),
-            user_frames: frames,
+            user_entry: Some((loaded.entry, user_rsp)),
+            user_resume: None,
+            user_frames: loaded.frames,
             signals: 0,
+            blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds,
             cwd: t.task(parent).cwd.clone(),
             cwd_path: t.task(parent).cwd_path.clone(),
             parent: Some(parent),
+            pgid: t.task(parent).pgid,
             brk_base,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::from(exe),
+            child_tid: 0,
+            tls: 0,
+            itimers: [None; 3],
         });
         let id = TaskId(slot);
         t.sched.push_ready(id, priority);
@@ -720,8 +936,12 @@ pub fn try_spawn_user(
         // that started it: a shell which has spawned a command is waiting, and
         // a Ctrl-C while it waits is aimed at the command.
         let tty = crate::vfs::tty::global();
+        // A new task joins the foreground as part of its group, which is the
+        // group it inherited - so for the ordinary case this changes nothing
+        // and only records that the group is the thing that matters.
         if tty.is_foreground(parent) {
-            tty.set_foreground(Some(id));
+            let pgid = t.task(id).pgid;
+            tty.set_foreground(Some(pgid));
         }
         Ok(id)
     })
@@ -796,6 +1016,7 @@ fn write_arg_block(
     env: &[String],
     exe: &str,
     image: &elf::Image,
+    at_base: usize,
 ) {
     let page =
         unsafe { core::slice::from_raw_parts_mut(mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE) };
@@ -869,33 +1090,7 @@ fn write_arg_block(
     };
 
     // Auxiliary vector entries.
-    let aux_at = off;
-    auxv(&mut page[off..], image, random_vaddr, execfn_vaddr);
-
-    // TEMP DEBUG: read the block back through the direct map and prove the
-    // write landed: argc, argv[0] pointer, first auxv type, and argv[0]'s own
-    // string - followed through the pointer, not taken from the page's last
-    // bytes, which are the random block and never valid UTF-8. Reading those
-    // instead is what made this line report a `Utf8Error` for a block that was
-    // perfectly good.
-    let rb_argc = usize::from_le_bytes(page[from..from + 8].try_into().unwrap());
-    let rb_argv0 = usize::from_le_bytes(page[from + 8..from + 16].try_into().unwrap());
-    let rb_aux0 = usize::from_le_bytes(page[aux_at..aux_at + 8].try_into().unwrap());
-    let base = USER_STACK_TOP - PAGE_SIZE;
-    let str0 = if (base..USER_STACK_TOP).contains(&rb_argv0) {
-        let tail = &page[rb_argv0 - base..];
-        let len = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-        core::str::from_utf8(&tail[..len])
-    } else {
-        Ok("<no argv[0]>")
-    };
-    crate::println!(
-        "[ARGBLK] argc={} argv0={:#x} aux0={:#x} str0={:?}",
-        rb_argc,
-        rb_argv0,
-        rb_aux0,
-        str0
-    );
+    auxv(&mut page[off..], image, at_base, random_vaddr, execfn_vaddr);
 }
 
 /// Write the Linux auxiliary vector into `buf` as (type, value) u64 pairs.
@@ -905,7 +1100,12 @@ fn write_arg_block(
 /// clock tick for `sysconf`, the identity fields for `getuid`-style calls,
 /// and 16 random bytes at `random_vaddr` for the stack guard. `execfn` is
 /// the virtual address of `argv[0]`'s string, what `AT_EXECFN` points at.
-fn auxv(buf: &mut [u8], image: &elf::Image, random_vaddr: usize, execfn: usize) {
+///
+/// `at_base` is where the program interpreter was loaded, and is the one
+/// entry a dynamically linked program cannot do without: it is how the
+/// interpreter finds itself, since nothing told it where it was put. Zero
+/// means the program is static.
+fn auxv(buf: &mut [u8], image: &elf::Image, at_base: usize, random_vaddr: usize, execfn: usize) {
     let mut off = 0usize;
 
     // Helper: write one auxv entry (type, value) and advance.
@@ -923,7 +1123,7 @@ fn auxv(buf: &mut [u8], image: &elf::Image, random_vaddr: usize, execfn: usize) 
     entry!(4, image.phent); // AT_PHENT
     entry!(5, image.phnum); // AT_PHNUM
     entry!(6, PAGE_SIZE); // AT_PAGESZ
-    entry!(7, 0usize); // AT_BASE (0 = no dynamic linker)
+    entry!(7, at_base); // AT_BASE (0 = no dynamic linker)
     entry!(9, image.entry); // AT_ENTRY
     entry!(11, 0usize); // AT_UID
     entry!(12, 0usize); // AT_EUID
@@ -938,16 +1138,37 @@ fn auxv(buf: &mut [u8], image: &elf::Image, random_vaddr: usize, execfn: usize) 
     let _ = off;
 }
 
-/// Map every page of `image` into `space` - file bytes, the zero tail of each
-/// segment past them, and the user stack - and hand back the entry point along
-/// with the physical frames the reaper must return, the stack's top frame
-/// last, separate.
-fn load_user(space: &mut AddressSpace, image: &Image<'_>) -> (usize, Vec<usize>, usize) {
-    let mut frames = Vec::new();
+/// Where the pieces of a loaded program ended up, which is what the initial
+/// stack has to describe to the libc that reads it.
+struct Loaded {
+    /// The address control is transferred to. With an interpreter this is the
+    /// interpreter's entry point rather than the program's: the interpreter
+    /// is what finishes setting the process up, and it finds the program
+    /// through `AT_ENTRY`.
+    entry: usize,
+    /// The interpreter's load address, reported on the initial stack as
+    /// `AT_BASE`. Zero when the program is static, which is what the ABI uses
+    /// to mean "there is no interpreter".
+    base: usize,
+    /// Every frame that was mapped for this process, for the reaper to give
+    /// back when it exits.
+    frames: Vec<usize>,
+    /// The frame holding the top page of the stack, where the argument block
+    /// is written.
+    stack_top: usize,
+}
 
+/// Map every page of `image` into `space` at `base` - file bytes, the zero
+/// tail of each segment past them - and record the frames as it goes.
+///
+/// `base` is the load address. It is zero for the program itself, whose
+/// headers name absolute addresses, and [`INTERP_BASE`] for an interpreter,
+/// which is position independent and must not land on the program.
+fn map_image(space: &mut AddressSpace, image: &Image<'_>, base: usize, frames: &mut Vec<usize>) {
     for segment in &image.segments {
-        let first = pframe::align_down(segment.vaddr, PAGE_SIZE);
-        let limit = pframe::align_up(segment.vaddr + segment.memsz, PAGE_SIZE);
+        let vaddr = base + segment.vaddr;
+        let first = pframe::align_down(vaddr, PAGE_SIZE);
+        let limit = pframe::align_up(vaddr + segment.memsz, PAGE_SIZE);
         for page in (first..limit).step_by(PAGE_SIZE) {
             let frame = mm::alloc_frames(0).expect("out of frames for a user page");
             frames.push(frame);
@@ -960,12 +1181,12 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>) -> (usize, Vec<usize>,
             dest.fill(0);
             // The slice of the file this page carries; everything beyond it up
             // to `memsz` stays zero, which is what .bss is.
-            let file_end = segment.vaddr + segment.data.len();
-            let from = page.max(segment.vaddr);
+            let file_end = vaddr + segment.data.len();
+            let from = page.max(vaddr);
             let to = (page + PAGE_SIZE).min(file_end);
             if from < to {
                 dest[from - page..to - page]
-                    .copy_from_slice(&segment.data[from - segment.vaddr..to - segment.vaddr]);
+                    .copy_from_slice(&segment.data[from - vaddr..to - vaddr]);
             }
             let mut flags = MapFlags::READ | MapFlags::USER;
             flags.insert(segment.flags & (MapFlags::WRITE | MapFlags::EXEC));
@@ -977,22 +1198,50 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>) -> (usize, Vec<usize>,
             });
         }
     }
+}
 
-    // Apply R_X86_64_RELATIVE relocations.  Each writes `addend` at `offset`
-    // in the user's virtual address space through the direct map.
-    if !image.rela.is_empty() {
-        for &(offset, addend) in &image.rela {
-            if let Some(phys) = space.phys_for_virt(offset) {
-                let ptr =
-                    (mm::phys_to_virt(phys & !(PAGE_SIZE - 1)) + (offset % PAGE_SIZE)) as *mut u64;
-                unsafe {
-                    ptr.write(addend as u64);
-                }
+/// Apply `image`'s R_X86_64_RELATIVE relocations, each writing `addend` at
+/// `offset` through the direct map.
+///
+/// Only the program gets this treatment; an interpreter relocates itself from
+/// `AT_BASE` before it does anything else, and a second pass here would be
+/// doing a libc's job with a different idea of where it starts.
+fn apply_rela(space: &AddressSpace, image: &Image<'_>) {
+    for &(offset, addend) in &image.rela {
+        if let Some(phys) = space.phys_for_virt(offset) {
+            let ptr =
+                (mm::phys_to_virt(phys & !(PAGE_SIZE - 1)) + (offset % PAGE_SIZE)) as *mut u64;
+            unsafe {
+                ptr.write(addend as u64);
             }
         }
     }
+}
 
-    let mut stack_top_frame = 0;
+/// Lay out a program - and its interpreter, when it has one - in `space`, map
+/// the user stack, and report where everything landed.
+///
+/// The interpreter is loaded first and at [`INTERP_BASE`]; the program follows
+/// at the addresses its own headers name. Nothing here tries to link the two
+/// together beyond handing over `AT_BASE`, `AT_PHDR` and `AT_ENTRY` on the
+/// initial stack: resolving symbols, mapping shared libraries and jumping to
+/// the program's entry is the interpreter's whole purpose, and a kernel that
+/// did any of it would be guessing at a contract it is not party to.
+fn load_user(space: &mut AddressSpace, image: &Image<'_>, interp: Option<&Image<'_>>) -> Loaded {
+    let mut frames = Vec::new();
+
+    let base = match interp {
+        Some(interp) => {
+            map_image(space, interp, INTERP_BASE, &mut frames);
+            INTERP_BASE
+        }
+        None => 0,
+    };
+
+    map_image(space, image, 0, &mut frames);
+    apply_rela(space, image);
+
+    let mut stack_top = 0;
     for index in 0..USER_STACK_PAGES {
         let frame = mm::alloc_frames(0).expect("out of frames for the user stack");
         frames.push(frame);
@@ -1009,11 +1258,24 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>) -> (usize, Vec<usize>,
             flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
         });
         if index == 0 {
-            stack_top_frame = frame;
+            stack_top = frame;
         }
     }
 
-    (image.entry, frames, stack_top_frame)
+    // Control goes to the interpreter when there is one, and to the program
+    // otherwise. The interpreter's own entry is a vaddr in a shared object,
+    // so it only means anything once the base is added.
+    let entry = match interp {
+        Some(interp) => INTERP_BASE + interp.entry,
+        None => image.entry,
+    };
+
+    Loaded {
+        entry,
+        base,
+        frames,
+        stack_top,
+    }
 }
 
 /// Give up the rest of this slice and go to the back of the band.
@@ -1052,7 +1314,7 @@ pub fn sleep_ticks(ticks: u64) {
 /// interrupts back on before the outer section is done.
 pub fn block_until_code(id: TaskId) {
     loop {
-        if let Some(sig) = take_pending_signal() {
+        if let Some(sig) = take_fatal_signal() {
             exit(-(sig as isize));
         }
         if exit_code(id).is_some() {
@@ -1087,7 +1349,7 @@ fn block_until_on(cond: impl Fn(&Table) -> bool) {
     loop {
         // Signals are checked before the condition on every pass, so a fatal
         // signal kills a blocked task even if what it waited for also arrived.
-        if let Some(sig) = take_pending_signal() {
+        if let Some(sig) = take_fatal_signal() {
             exit(-(sig as isize));
         }
         if with_table(|t| cond(t)) {
@@ -1114,6 +1376,16 @@ fn block_until_on(cond: impl Fn(&Table) -> bool) {
 pub fn poll_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
     with_table(|t| any_child_code(t, parent))
         .and_then(|(id, _)| take_exit_code(id).map(|code| (id, code)))
+}
+
+/// Whether `parent` has a child at all - one still running, or one that has
+/// exited and is waiting to be collected.
+///
+/// `wait` needs the distinction to tell `WNOHANG`'s two "nothing to report"
+/// answers apart: a child that has simply not exited yet is a 0, while having no
+/// child at all is `ECHILD`.
+pub fn has_children(parent: TaskId) -> bool {
+    with_table(|t| child_alive(t, parent) || any_child_code(t, parent).is_some())
 }
 
 /// The directory relative paths this task names things from, or the root
@@ -1198,6 +1470,81 @@ pub fn send_signal(id: TaskId, sig: u8) -> bool {
     })
 }
 
+/// The process group the running task belongs to.
+pub fn current_pgid() -> TaskId {
+    with_table(|t| t.task(t.current).pgid)
+}
+
+/// The group `id` is in, or `None` when the task is gone.
+pub fn pgid_of(id: TaskId) -> Option<TaskId> {
+    with_table(|t| t.tasks.get(id.0)?.as_ref().map(|task| task.pgid))
+}
+
+/// Everyone in a process group, for a signal that has to reach all of them at
+/// once - which is what makes Ctrl-C stop a whole pipeline rather than one
+/// program of it.
+pub fn group_members(pgid: TaskId) -> alloc::vec::Vec<TaskId> {
+    with_table(|t| {
+        t.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.as_ref()
+                    .is_some_and(|task| task.pgid == pgid && !task.exited)
+            })
+            .map(|(slot, _)| TaskId(slot))
+            .collect()
+    })
+}
+
+/// Send `sig` to every member of a process group. Answers whether it reached
+/// anyone, which is what `kill` reports for a group.
+pub fn send_signal_group(pgid: TaskId, sig: u8) -> bool {
+    let mut delivered = false;
+    for id in group_members(pgid) {
+        delivered |= send_signal(id, sig);
+    }
+    delivered
+}
+
+/// `setpgid(pid, pgid)` — put a task into a process group, creating the group
+/// when the caller names the task's own id.
+///
+/// Linux's rules, less the session half: the target has to exist, the group
+/// has to exist or be the target itself, and the caller may only move itself
+/// or one of its own children. The one that matters in practice is a shell
+/// calling `setpgid(0, 0)` in a freshly forked child, which is what gives a
+/// job a group of its own to be signalled through.
+pub fn set_pgid(id: TaskId, pgid: TaskId) -> isize {
+    with_table(|t| {
+        let Some(target) = t.tasks.get(id.0).and_then(Option::as_ref) else {
+            return crate::syscall::err::ESRCH;
+        };
+        let (parent, leader_of) = (target.parent, target.pgid);
+        if pgid.0 >= MAX_TASKS {
+            return crate::syscall::err::EPERM;
+        }
+        // A caller may move itself, or a child that has not yet exec'd - and
+        // the second is the case a shell actually uses.
+        if id != t.current && parent != Some(t.current) {
+            return crate::syscall::err::ESRCH;
+        }
+        // A group leader cannot leave the group it leads: the group is named
+        // after it, and there would be nothing left to name.
+        if leader_of == id && id != pgid {
+            return crate::syscall::err::EPERM;
+        }
+        // The group must already exist - either because this task is about to
+        // become its leader, or because somebody is in it.
+        let exists = pgid == id || t.tasks.iter().flatten().any(|task| task.pgid == pgid);
+        if !exists {
+            return crate::syscall::err::EPERM;
+        }
+        t.task_mut(id).pgid = pgid;
+        0
+    })
+}
+
 /// What `id` would do if `sig` arrived now. `None` when the task is gone.
 pub fn signal_action(id: TaskId, sig: u8) -> Option<signal::Action> {
     with_table(|t| {
@@ -1243,14 +1590,168 @@ pub fn set_signal_alt_stack(id: TaskId, stack: Option<signal::AltStack>) -> bool
     )
 }
 
-/// Take one pending signal off the running task. Every signal is fatal for
-/// now, so the caller exits; when handlers arrive this grows a disposition
-/// check and only fatal signals come back.
-fn take_pending_signal() -> Option<u8> {
+/// Take one pending signal off the running task, skipping the ones it has
+/// blocked: a blocked signal stays pending until it is unblocked, which is the
+/// whole reason `rt_sigprocmask` exists.
+///
+/// Signals whose disposition is `SIG_IGN` are dropped here rather than
+/// reported, since there is nothing anyone could do with them.
+pub fn take_deliverable_signal() -> Option<u8> {
     with_table(|t| {
         let id = t.current;
-        signal::take(&mut t.task_mut(id).signals)
+        let task = t.task_mut(id);
+        let mut ready = task.signals & !task.blocked;
+        while let Some(sig) = signal::take(&mut ready) {
+            if task.dispositions.get(sig).is_ignore() {
+                continue;
+            }
+            task.signals &= !signal::bit(sig);
+            return Some(sig);
+        }
+        None
     })
+}
+
+/// Take one pending signal off the running task if it is in `mask`, whatever
+/// its disposition says, and drop it from the pending set.
+///
+/// This is the `sigtimedwait` half of the signal machinery, and it is
+/// deliberately different from [`take_deliverable_signal`]: a signal consumed
+/// here never runs a handler and never takes its default action - not even for
+/// `SIGKILL`, whose whole point is that it cannot be caught anywhere else. A
+/// blocked signal in `mask` is exactly the one that can be waited for, which
+/// is what makes `sigwait` work.
+pub fn take_signal_in_set(mask: signal::Pending) -> Option<u8> {
+    with_table(|t| {
+        let id = t.current;
+        let task = t.task_mut(id);
+        let mut ready = task.signals & mask;
+        match signal::take(&mut ready) {
+            Some(sig) => {
+                task.signals &= !signal::bit(sig);
+                Some(sig)
+            }
+            None => None,
+        }
+    })
+}
+
+/// Take a pending signal that has to end the task, wherever it happens to be.
+///
+/// This is what a blocked task can act on by itself: the default action for
+/// every signal this kernel names is to die of it. A signal with a handler is
+/// left pending - it needs the register frame on the way out of a syscall to
+/// run on, and a task sitting in a blocking call has not reached one yet.
+pub fn take_fatal_signal() -> Option<u8> {
+    with_table(|t| {
+        let id = t.current;
+        let task = t.task_mut(id);
+        let mut ready = task.signals & !task.blocked;
+        while let Some(sig) = signal::take(&mut ready) {
+            // Read from a copy, so a signal that is skipped stays pending.
+            if task.dispositions.get(sig).is_handler() {
+                continue;
+            }
+            task.signals &= !signal::bit(sig);
+            return Some(sig);
+        }
+        None
+    })
+}
+
+/// What the running task would do about `sig`.
+pub fn current_disposition(sig: u8) -> signal::Action {
+    with_table(|t| t.task(t.current).dispositions.get(sig))
+}
+
+/// Forget a disposition, putting it back to `SIG_DFL`. `SA_RESETHAND` asks
+/// for exactly this the moment a handler is entered, which is what keeps a
+/// one-shot handler re-entrant-safe.
+pub fn reset_disposition(sig: u8) {
+    with_table(|t| {
+        let id = t.current;
+        let mut actions = t.task(id).dispositions;
+        actions.set(sig, signal::Action::default());
+        t.task_mut(id).dispositions = actions;
+    });
+}
+
+/// The signals the running task has blocked.
+pub fn current_blocked() -> signal::Pending {
+    with_table(|t| t.task(t.current).blocked)
+}
+
+/// Replace the running task's blocked set. `rt_sigprocmask` and the return
+/// from a handler are its two callers.
+pub fn set_current_blocked(mask: signal::Pending) {
+    with_table(|t| {
+        let id = t.current;
+        t.task_mut(id).blocked = mask;
+    });
+}
+
+/// The address a process's user virtual address translates to, if it may be
+/// reached from ring 3 - and copied first when it is only copy-on-write.
+///
+/// The copy matters for anything the kernel writes into a process: a signal
+/// frame written into a page two processes still share would appear in both
+/// of them, and the one that did not take the signal would find its stack
+/// rewritten underneath it.
+fn user_byte_address(virt: usize, write: bool) -> Option<usize> {
+    let page = crate::mm::pframe::align_down(virt, crate::mm::PAGE_SIZE);
+    if write && crate::arch::paging::is_cow_page(page) && !resolve_cow_fault(page) {
+        return None;
+    }
+    let (phys, flags) = crate::arch::paging::translate(virt)?;
+    if !flags.contains(MapFlags::USER) {
+        return None;
+    }
+    if write && !flags.contains(MapFlags::WRITE) {
+        return None;
+    }
+    Some(phys)
+}
+
+/// Write `bytes` into the running process at `virt`, one page at a time.
+///
+/// Returns `false` if any part of the range is not a page the process could
+/// write itself - which is what makes an unmapped stack a refused signal
+/// rather than a kernel panic.
+pub fn write_user(virt: usize, bytes: &[u8]) -> bool {
+    let mut done = 0;
+    while done < bytes.len() {
+        let at = virt + done;
+        let page_end =
+            crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
+        let chunk = core::cmp::min(page_end - at, bytes.len() - done);
+        let Some(phys) = user_byte_address(at, true) else {
+            return false;
+        };
+        let dest =
+            unsafe { core::slice::from_raw_parts_mut(mm::phys_to_virt(phys) as *mut u8, chunk) };
+        dest.copy_from_slice(&bytes[done..done + chunk]);
+        done += chunk;
+    }
+    true
+}
+
+/// Read `bytes` from the running process at `virt`, one page at a time.
+pub fn read_user(virt: usize, bytes: &mut [u8]) -> bool {
+    let mut done = 0;
+    while done < bytes.len() {
+        let at = virt + done;
+        let page_end =
+            crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
+        let chunk = core::cmp::min(page_end - at, bytes.len() - done);
+        let Some(phys) = user_byte_address(at, false) else {
+            return false;
+        };
+        let src =
+            unsafe { core::slice::from_raw_parts(mm::phys_to_virt(phys) as *const u8, chunk) };
+        bytes[done..done + chunk].copy_from_slice(src);
+        done += chunk;
+    }
+    true
 }
 
 /// End the running task with an exit code. Its slot and stack are freed by the
@@ -1277,11 +1778,15 @@ pub fn exit(code: isize) -> ! {
         let parent = t.task(id).parent;
         if let Some(parent) = parent {
             t.sched.wake(parent);
-            // The console goes back to the parent as the child leaves it: a
-            // shell waits, gets its prompt back, and reads again.
+            // The console goes back to the parent's group as the child leaves
+            // it: a shell waits, gets its prompt back, and reads again. A
+            // job-controlled shell has already taken the terminal back with
+            // `TIOCSPGRP` by then - this is the same answer arrived at without
+            // it, for the programs that never ask.
             let tty = crate::vfs::tty::global();
-            if tty.foreground() == Some(id) {
-                tty.set_foreground(Some(parent));
+            let left = t.task(id).pgid;
+            if tty.foreground() == Some(left) {
+                tty.set_foreground(Some(t.task(parent).pgid));
             }
         }
 
@@ -1711,6 +2216,44 @@ pub fn set_mmap_cursor(cursor: usize) {
     })
 }
 
+/// The base of the running task's thread-local storage - `FS.base`, which is
+/// what `arch_prctl(ARCH_GET_FS)` reports and what every `%fs:` access in ring 3
+/// goes through.
+pub fn current_tls() -> usize {
+    with_table(|t| t.task(current()).tls)
+}
+
+/// Move the running task's TLS base, both in its own record and in the register
+/// the CPU is using. `arch_prctl(ARCH_SET_FS)` and `clone(CLONE_SETTLS)` are the
+/// two ways in.
+pub fn set_current_tls(base: usize) {
+    with_table(|t| {
+        let id = t.current;
+        t.task_mut(id).tls = base;
+    });
+    // Stored per task as well, because `prepare` reinstalls it on every
+    // dispatch: a bare register write here would survive only until the next
+    // switch.
+    unsafe { write_msr(MSR_FS_BASE, base as u64) };
+}
+
+/// `IA32_FS_BASE`: where ring 3's `%fs:` segment starts.
+const MSR_FS_BASE: u32 = 0xC000_0100;
+
+/// Write one model-specific register. The two halves go in separately because
+/// `wrmsr` takes them in `eax` and `edx`.
+unsafe fn write_msr(msr: u32, value: u64) {
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// How many tasks are alive, counting the two permanent ones. [`PERMANENT_TASKS`]
 /// is what this settles back to once everything a test started has been reaped.
 pub fn task_count() -> usize {
@@ -1742,10 +2285,52 @@ pub const fn permanent_tasks() -> usize {
 /// running. The scheduler is resumed by tasks handing over to it, never by being
 /// picked, so preempting it would leave it suspended halfway through a switch it
 /// had already committed to.
+/// Fire any interval timer whose deadline has passed, waking its sleeper.
+///
+/// Three call sites because the CPU can be in three places when a deadline
+/// comes due: the clock interrupting a task (preempt), the scheduler idling
+/// (next_turn), and the syscall gate. Missing one would leave a caller that
+/// only ever does one of the three waiting forever.
+pub fn check_itimer() {
+    if !STARTED.load(Ordering::Relaxed) {
+        return;
+    }
+    with_table(|t| t.check_itimers());
+}
+
+/// Install `new` as the running task's timer `which`, reporting what was
+/// there - the value-plus-interval pair `setitimer`'s old_value wants.
+pub fn itimer_swap(which: usize, new: Option<ItimerState>) -> Option<ItimerSnapshot> {
+    with_table(|t| {
+        let task = t.task_mut(t.current);
+        let old = task.itimers[which];
+        task.itimers[which] = new;
+        old.map(|state| ItimerSnapshot {
+            interval_ticks: state.interval_ticks,
+            remaining_ticks: state.deadline.saturating_sub(timer::ticks()),
+        })
+    })
+}
+
+/// Read the running task's timer `which` without disturbing it.
+pub fn itimer_snapshot(which: usize) -> Option<ItimerSnapshot> {
+    with_table(|t| {
+        let state = t.task(t.current).itimers[which].as_ref()?;
+        Some(ItimerSnapshot {
+            interval_ticks: state.interval_ticks,
+            remaining_ticks: state.deadline.saturating_sub(timer::ticks()),
+        })
+    })
+}
+
 pub fn preempt() {
     if !STARTED.load(Ordering::Relaxed) || current() == SCHED_ID {
         return;
     }
+    // An interval timer that came due while the task spun in ring 3 fires
+    // here, on the clock that is guaranteed to run - which also wakes a task
+    // parked in a blocking wait past its deadline.
+    check_itimer();
     // A task that never blocks would otherwise never see a signal: the clock
     // is the one thing guaranteed to run while it spins. Delivering here is
     // legal for the same reason being preempted is - the trap frame is on the
@@ -1754,14 +2339,21 @@ pub fn preempt() {
     schedule(Table::requeue_current);
 }
 
-/// End the running task if a fatal signal is waiting, at whichever of the two
-/// points a task can be interrupted from: a blocking call, or the clock.
+/// End the running task if a fatal signal is waiting, at the one point a task
+/// can be interrupted from without a register file to build on: the clock.
 ///
-/// A signal that arrives while the task is spinning in ring 3 is delivered by
+/// A signal that arrives while the task is spinning in ring 3 is acted on by
 /// the next tick, so no program can outlast a `kill` by never making a
 /// syscall. Called from interrupt context, where it must not block.
+///
+/// Signals that cannot be finished here are left alone rather than dropped:
+/// one with a handler needs the task's register file to build a frame on, and
+/// the syscall return path is the only place that has one - so it goes back
+/// into the pending set, where the next syscall the task makes will find it.
+/// A signal the task has blocked is not even looked at: that is what blocking
+/// means.
 pub fn deliver_pending_signal() {
-    if let Some(sig) = take_pending_signal() {
+    if let Some(sig) = take_fatal_signal() {
         exit(-(sig as isize));
     }
 }
@@ -1791,22 +2383,78 @@ fn schedule(prepare: impl FnOnce(&mut Table)) {
     });
 }
 
-/// Create a child process: duplicate the calling task's address space with
-/// copy-on-write, clone its file descriptor table, and return 0 in the child
-/// and the child's pid in the parent.
+/// Create a child process: a copy of the calling one, resuming from the very
+/// `fork` call that made it.
 ///
-/// The address space duplication is COW: every page in both parent and child
-/// is marked read-only with a COW bit. The first write to any shared page
-/// triggers a page fault that allocates a fresh frame, copies the contents,
-/// and restores write permission — giving each process its own copy at the
-/// moment it diverges.
-pub fn fork() -> isize {
+/// Linux's contract, exactly: the child comes back from `fork` with 0 in `rax`,
+/// the parent comes back with the child's pid, and both carry on from the
+/// instruction after the `syscall`. `state` is the parent's ring-3 register file
+/// captured at the gate; the copy the child resumes with differs in `rax`
+/// alone.
+///
+/// The address space is duplicated copy-on-write: both processes start out
+/// sharing every frame with the writable pages marked read-only and a COW bit
+/// set. The first write on either side faults, allocates a private frame, copies
+/// the page, and restores write permission - so each process ends up with its own
+/// copy at the moment it actually diverges, and never before.
+///
+/// The file descriptor table is inherited, not copied: the child gets the same
+/// `Arc<FdTable>` the parent holds, which is what a shell's `execve` after
+/// `fork` needs. A `CLONE_FILES`-style split is the job of `clone`, not `fork`.
+pub fn fork(state: &UserContext) -> isize {
+    spawn_copy(state, CloneRequest::default())
+}
+
+/// What a `clone` asks for beyond "a copy of me": which flags, where the child's
+/// stack is, where the child should record its own tid, and what TLS it runs
+/// with.
+///
+/// A default request is a plain `fork`: no flags, the caller's own stack, no tid
+/// write, the caller's TLS.
+#[derive(Clone, Copy, Default)]
+pub struct CloneRequest {
+    pub flags: usize,
+    pub child_stack: usize,
+    pub child_tid: usize,
+    pub tls: usize,
+}
+
+/// Create a process that is a copy of the calling one, resuming from the very
+/// call that made it.
+///
+/// This is the shared heart of `fork` and `clone`: `fork` is this with a default
+/// request, and `clone` is this with the caller's flags filled in.
+///
+/// The address space is duplicated copy-on-write: both processes start out
+/// sharing every frame with the writable pages marked read-only and a COW bit
+/// set. The first write on either side faults, allocates a private frame, copies
+/// the page, and restores write permission - so each process ends up with its own
+/// copy at the moment it actually diverges, and never before.
+///
+/// The descriptor table is *copied*, not shared: the child names the same open
+/// files under the same numbers, which is what a shell's `dup2`-then-`execve`
+/// after a `fork` needs - and what it needs is for the parent's own `close` to
+/// stay on the parent's side of the fork.
+fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
     // Phase 1: Collect all parent state under one immutable borrow, then
     // release it before any mutations.
-    let (parent_id, parent_entry, parent_priority, parent_fds, parent_cwd, parent_cwd_path, parent_exe, parent_brk_base, parent_brk_pages, parent_mmap_cursor, parent_pages) = with_table(|t| {
+    let (
+        parent_id,
+        parent_has_space,
+        parent_priority,
+        parent_fds,
+        parent_cwd,
+        parent_cwd_path,
+        parent_exe,
+        parent_brk_base,
+        parent_brk_pages,
+        parent_mmap_cursor,
+        parent_tls,
+        parent_pages,
+    ) = with_table(|t| {
         let parent_id = t.current;
         let parent = t.task(parent_id);
-        let parent_entry = parent.user_entry;
+        let parent_has_space = parent.space.is_some();
         let parent_priority = parent.priority;
         let parent_fds = Arc::clone(&parent.fds);
         let parent_cwd = parent.cwd.clone();
@@ -1815,6 +2463,7 @@ pub fn fork() -> isize {
         let parent_brk_base = parent.brk_base;
         let parent_brk_pages = parent.brk_pages;
         let parent_mmap_cursor = parent.mmap_cursor;
+        let parent_tls = parent.tls;
 
         // Collect the parent's user page mappings. We need to do this while
         // holding the borrow, then release it before calling into AddressSpace.
@@ -1824,45 +2473,76 @@ pub fn fork() -> isize {
                 parent_pages.push((virt, phys, flags));
             });
         }
-        (parent_id, parent_entry, parent_priority, parent_fds, parent_cwd, parent_cwd_path, parent_exe, parent_brk_base, parent_brk_pages, parent_mmap_cursor, parent_pages)
+        (
+            parent_id,
+            parent_has_space,
+            parent_priority,
+            parent_fds,
+            parent_cwd,
+            parent_cwd_path,
+            parent_exe,
+            parent_brk_base,
+            parent_brk_pages,
+            parent_mmap_cursor,
+            parent_tls,
+            parent_pages,
+        )
     });
 
-    // If the parent has no address space, this is invalid.
-    if parent_entry.is_none() {
-        return crate::syscall::err::EINVAL;
+    // A task with no address space has no image to copy: `fork` from a kernel
+    // task is meaningless, and Linux answers ENOMEM for a process it cannot
+    // duplicate.
+    if !parent_has_space {
+        return crate::syscall::err::ENOMEM;
     }
 
     // Phase 2: Allocate a slot and build the child state.
-    let (child_id,) = with_table(|t| {
+    let child_id = with_table(|t| {
         let slot = t.alloc_slot();
         drop_retired(TaskId(slot));
 
         let stack = Stack::new();
-        let context = unsafe {
-            context::bootstrap(stack.top(), fork_child_entry, slot, true)
-        };
+        // Interrupts stay off in the child until its `iretq` restores the
+        // parent's RFLAGS: a fork child resumes inside a syscall gate, and the
+        // gate runs with IF clear. Enabling them any earlier would let the clock
+        // fire on a task that has not reached user mode yet.
+        let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
 
         // Create the child's address space by sharing all parent pages COW.
         let mut child_space = AddressSpace::new();
         let mut child_frames = Vec::new();
 
-        for &(virt, phys, _flags) in &parent_pages {
-            // Increment refcount — two address spaces now own this frame.
+        for &(virt, phys, flags) in &parent_pages {
+            // Two address spaces now own this frame; the count keeps it alive
+            // until the last of them lets go.
             crate::mm::clone_frame_ref(phys);
             child_frames.push(phys);
-            // Map in the child as COW (read-only, COW bit set).
-            child_space.map_cow(virt, phys, _flags);
+            // Map it in the child as COW: read-only for now, with the COW bit
+            // marking it for the fault handler.
+            child_space.map_cow(virt, phys, flags);
         }
 
-        // Make the parent's writable pages COW too. We need to reach the
-        // parent's AddressSpace through the task table. We cannot hold the
-        // immutable borrow from phase 1 across this, so re-borrow.
+        // Make the parent's writable pages COW too, or the child's copy would be
+        // the only read-only one and the parent would write straight into a frame
+        // the child is also reading. Re-borrow: the phase-1 borrow is long gone.
+        //
+        // A page the walk reported as already COW is left alone: it is shared
+        // with an older sibling and is protected already. Re-protecting it is
+        // harmless, but the walk reported it without `WRITE`, so a test for
+        // writability alone would skip it and leave the *parent* writable while
+        // the child's copy stays read-only - which is the bug this whole dance
+        // exists to avoid.
         if let Some(parent_space) = &mut t.task_mut(parent_id).space {
             for &(virt, _phys, flags) in &parent_pages {
-                if flags.contains(MapFlags::WRITE) {
-                    parent_space.protect(virt, crate::mm::PAGE_SIZE, MapFlags::READ | MapFlags::USER);
-                    parent_space.set_cow_bit(virt);
+                if flags.contains(MapFlags::COW) || !flags.contains(MapFlags::WRITE) {
+                    continue;
                 }
+                // Keep everything the page had except write permission: hardening
+                // it to `READ | USER` would silently take away execute on a page
+                // that is both, and a COW copy made from it later would stay
+                // non-executable forever.
+                parent_space.protect(virt, crate::mm::PAGE_SIZE, flags & !MapFlags::WRITE);
+                parent_space.set_cow_bit(virt);
             }
         }
 
@@ -1873,83 +2553,57 @@ pub fn fork() -> isize {
             exited: false,
             body: None,
             space: Some(child_space),
-            user_entry: parent_entry,
+            // The child does not start at the entry point: it returns from the
+            // `fork` that made it, so it carries a whole register file instead.
+            user_entry: None,
+            user_resume: Some(UserContext {
+                // A thread starts on the stack `clone` handed it; a process
+                // comes back from the call on the stack its parent was using.
+                rsp: if request.child_stack != 0 {
+                    request.child_stack
+                } else {
+                    state.rsp
+                },
+                ..*state
+            }),
             user_frames: child_frames,
             signals: 0,
+            blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
-            fds: parent_fds.clone(),
+            fds: Arc::new(parent_fds.duplicate()),
             cwd: parent_cwd,
             cwd_path: parent_cwd_path,
             parent: Some(parent_id),
+            pgid: t.task(parent_id).pgid,
             brk_base: parent_brk_base,
             brk_pages: parent_brk_pages,
             mmap_cursor: parent_mmap_cursor,
             exe: parent_exe,
+            // `CLONE_CHILD_SETTID` parks the child's tid where the child can
+            // read it; without the flag there is nothing to record.
+            child_tid: if request.flags & nr::CLONE_CHILD_SETTID != 0 {
+                request.child_tid
+            } else {
+                0
+            },
+            // `CLONE_SETTLS` names a TLS descriptor for the child alone;
+            // otherwise the child inherits the caller's.
+            tls: if request.flags & nr::CLONE_SETTLS != 0 {
+                request.tls
+            } else {
+                parent_tls
+            },
+            itimers: [None; 3],
         });
 
         let child_id = TaskId(slot);
         t.sched.push_ready(child_id, parent_priority);
         t.sched.wake(parent_id);
-        (child_id,)
+        child_id
     });
 
     child_id.0 as isize
-}
-
-/// Entry point for a forked child process. Called from the trampoline with
-/// the task slot in `rdi`. Sets RAX=0 (child's return value from fork)
-/// and enters user mode at the parent's entry point with the parent's
-/// user stack pointer.
-extern "C" fn fork_child_entry(slot: usize) -> ! {
-    let (entry, user_rsp) = with_table(|t| {
-        let task = t.task(TaskId(slot));
-        task.user_entry.expect("fork child has no user_entry")
-    });
-    // Enter user mode. The child's kernel stack is fresh (from bootstrap),
-    // so there is no trap frame to modify. Instead, we set up the iretq
-    // to land at `entry` with `user_rsp`, and RAX will be 0 because the
-    // syscall return path writes the return value to RAX — but since
-    // this is a fresh task entry, not a syscall return, we need to ensure
-    // RAX=0 explicitly.
-    //
-    // The trick: `enter_user` does an iretq which sets all user registers.
-    // We set RAX by putting 0 in the right place on the stack before iretq,
-    // but `enter_user` builds its own frame. Instead, use a wrapper that
-    // sets RAX then calls enter_user.
-    unsafe { enter_user_fork(entry, user_rsp) };
-}
-
-/// Enter user mode with RAX=0 for the fork child. Same as `enter_user`
-/// but pushes RAX=0 as the return value.
-unsafe fn enter_user_fork(entry: usize, user_rsp: usize) -> ! {
-    const RFLAGS_RESERVED: usize = 1 << 1;
-    const RFLAGS_INTERRUPT_FLAG: usize = 1 << 9;
-
-    let (code, data) = crate::arch::gdt::user_selectors();
-    unsafe {
-        core::arch::asm!(
-            "cli",
-            // Build the iretq frame: SS, RSP, RFLAGS, CS, RIP.
-            "push {data}",
-            "push {stack}",
-            "push {flags}",
-            "push {code}",
-            "push {entry}",
-            // The iretq will pop these into SS, RSP, RFLAGS, CS, RIP.
-            // RAX is set to 0 by the caller before we get here — but we
-            // are called from Rust, so RAX is whatever the compiler chose.
-            // Zero it explicitly before iretq.
-            "xor eax, eax",
-            "iretq",
-            data = in(reg) data.0 as usize,
-            stack = in(reg) user_rsp,
-            flags = in(reg) RFLAGS_RESERVED | RFLAGS_INTERRUPT_FLAG,
-            code = in(reg) code.0 as usize,
-            entry = in(reg) entry,
-            options(noreturn),
-        );
-    }
 }
 
 /// Replace the current process's image with a new ELF binary. Tears down the
@@ -1968,6 +2622,22 @@ pub fn exec_replace(
     let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
     let user_rsp = initial_stack_rsp(argv, env, exe).ok_or(SpawnError::ArgsTooBig)?;
 
+    // A dynamically linked program names the interpreter that has to run
+    // before it does. That is a path into the filesystem, and this is the only
+    // place with both the path and the authority to follow it - which is why
+    // the interpreter is read here rather than inside the loader.
+    let interp_bytes = match &image.interp {
+        Some(path) => {
+            let path = core::str::from_utf8(path).map_err(|_| SpawnError::NotExecutable)?;
+            Some(crate::vfs::read_file(path).map_err(|_| SpawnError::NoInterpreter)?)
+        }
+        None => None,
+    };
+    let interp = match &interp_bytes {
+        Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
+        None => None,
+    };
+
     with_table(|t| {
         let id = t.current;
         let task = t.task_mut(id);
@@ -1977,18 +2647,23 @@ pub fn exec_replace(
         if let Some(old_space) = task.space.take() {
             drop(old_space);
         }
-        // Free all old user frames (decrement refcounts).
+        // Give every page the old image owned back. `free_frames` does the
+        // reference-count half itself, so a page a `fork` shared is only
+        // returned to the allocator by whichever process drops the last claim.
         for frame in task.user_frames.drain(..) {
-            // For COW frames, decrement the refcount; only truly free when
-            // it reaches 0.
-            if crate::mm::free_frame_ref(frame) {
-                crate::mm::free_frames(frame, 0);
-            }
+            crate::mm::free_frames(frame, 0);
         }
+        // The task is about to be a *new* program: it is no longer a fork child
+        // waiting to resume its parent's call, and a fresh image starts with no
+        // TLS and no tid to record.
+        task.user_resume = None;
+        task.child_tid = 0;
+        task.tls = 0;
+        unsafe { write_msr(MSR_FS_BASE, 0) };
 
         // --- Build new address space ---
         let mut space = AddressSpace::new();
-        let (entry, frames, stack_top_frame) = load_user(&mut space, &image);
+        let loaded = load_user(&mut space, &image, interp.as_ref());
 
         let brk_base = image
             .segments
@@ -1999,12 +2674,29 @@ pub fn exec_replace(
                 (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
             });
 
-        write_arg_block(stack_top_frame, user_rsp, argv, env, exe, &image);
+        write_arg_block(
+            loaded.stack_top,
+            user_rsp,
+            argv,
+            env,
+            exe,
+            &image,
+            loaded.base,
+        );
 
         // --- Reset process state ---
+        //
+        // The new root is recorded in the task *before* the CPU is pointed at
+        // it, and that order is load-bearing. A clock tick landing between the
+        // two would send the dispatcher to `prepare`, which reads the task's
+        // space to decide what to load - and a task still holding the address
+        // space it has just dropped would be aimed at freed tables. Recording
+        // first means the worst a tick can do is load the new root slightly
+        // early, which is where the process is going anyway.
+        let new_root = space.root();
         task.space = Some(space);
-        task.user_entry = Some((entry, user_rsp));
-        task.user_frames = frames;
+        task.user_entry = Some((loaded.entry, user_rsp));
+        task.user_frames = loaded.frames;
         task.brk_base = brk_base;
         task.brk_pages = 0;
         task.mmap_cursor = crate::syscall::MMAP_BASE;
@@ -2022,10 +2714,10 @@ pub fn exec_replace(
             // Collect fds to close (can't modify while iterating).
             let mut to_close = alloc::vec::Vec::new();
             for fd in 0..1024i32 {
-                if let Ok(flags) = fds.fd_flags_get(fd) {
-                    if flags & FD_CLOEXEC != 0 {
-                        to_close.push(fd);
-                    }
+                if let Ok(flags) = fds.fd_flags_get(fd)
+                    && flags & FD_CLOEXEC != 0
+                {
+                    to_close.push(fd);
                 }
             }
             for fd in to_close {
@@ -2033,26 +2725,53 @@ pub fn exec_replace(
             }
         }
 
-        Ok((entry, user_rsp))
+        // Point the CPU at the new image. Dropping the old address space left it
+        // on the kernel's tables - a drop must, since it is about to free the
+        // hierarchy the CPU is walking - and the kernel's tables do not map the
+        // program's entry point. Nothing will call `prepare` for this task
+        // either: it is not being dispatched, it is simply continuing, and the
+        // next thing it does is `sysretq` into the image that was just loaded.
+        paging::switch_to_root(new_root);
+
+        Ok((loaded.entry, user_rsp))
     })
 }
 
-/// Resolve a COW (copy-on-write) page fault for the current task.
-/// If the faulting address is in the current task's address space and has the
-/// COW bit set, copies the page, remaps it writable, and returns `true`.
-/// Returns `false` if the fault cannot be resolved as COW.
+/// Resolve a copy-on-write page fault for the current task.
+///
+/// If the faulting address is mapped with the COW bit, the page is copied: the
+/// task gets a private frame, the old one keeps its other owners. The frame
+/// lists have to follow, or the new frame leaks and the old one is freed too many
+/// times - so the old frame is swapped for the new in this task's list, and the
+/// old frame's owner count is dropped by one.
+///
+/// Returns `false` if the fault cannot be resolved as COW, leaving the caller to
+/// deliver SIGSEGV.
 pub fn resolve_cow_fault(virt: usize) -> bool {
     with_table(|t| {
         let id = t.current;
-        if let Some(ref mut task) = t.tasks[id.0] {
-            if let Some(ref mut space) = task.space {
-                space.resolve_cow(virt).is_some()
-            } else {
-                false
-            }
+        let Some(task) = t.tasks[id.0].as_mut() else {
+            return false;
+        };
+        let Some(space) = task.space.as_mut() else {
+            return false;
+        };
+        let Some((old_phys, new_phys)) = space.resolve_cow(virt) else {
+            return false;
+        };
+
+        // The page the task now owns is `new_phys`; `old_phys` is one claim
+        // lighter and may be free.
+        if let Some(slot) = task.user_frames.iter_mut().find(|f| **f == old_phys) {
+            *slot = new_phys;
         } else {
-            false
+            // A page outside the tracked list (the ELF loader's mappings are all
+            // tracked, so this is unreachable in practice); record the new frame
+            // so at least one of the pair is ever given back.
+            task.user_frames.push(new_phys);
         }
+        crate::mm::free_frames(old_phys, 0);
+        true
     })
 }
 
@@ -2080,6 +2799,10 @@ fn scheduler_loop() {
             }
         });
 
+        // Outside the borrow above: dropping a description can wake a task, and
+        // waking needs the table this loop just let go of.
+        drain_release();
+
         if !switched {
             // Nothing to run. Halt with interrupts on so the next tick wakes us,
             // and let it turn them back off before the table is touched again.
@@ -2088,17 +2811,78 @@ fn scheduler_loop() {
     }
 }
 
+/// The `clone(2)` half of the process API.
+///
+/// `fork` is `clone` with a zero flag word; this is the same copy with the
+/// caller's requests honoured. The flag word has already been validated by the
+/// syscall layer, so what is left here is the part the flags decide.
+///
+/// A *thread* is the one thing this cannot build. `CLONE_THREAD` means the child
+/// shares the caller's address space and signal handlers - which is what makes a
+/// shared variable a shared variable - and this kernel's address space belongs
+/// to exactly one task: two owners would free each other's frames on the way
+/// out. Sharing one honestly needs reference-counted page tables, so a thread is
+/// refused with `ENOSYS` rather than answered with a child that only looks like
+/// one and would break the first time two threads touched the same word.
+///
+/// `CLONE_VM` *without* `CLONE_THREAD` is a different request, and it is the one
+/// a libc actually makes: `posix_spawn` clones with `CLONE_VM|CLONE_VFORK`, and
+/// the child's entire job is to `execve` immediately. Such a child only ever
+/// *reads* the caller's memory - the path, the argument vector, the file-action
+/// list - and reading is exactly what a copy-on-write image and a shared one do
+/// identically. So the spawn shape is answered with a copy: the contract the
+/// caller asked for, met precisely, with no shared page tables to reference-count
+/// and no way for the child to outlive the address space it came from.
+///
+/// `CLONE_VFORK` is accepted and not acted on. Linux suspends the parent until
+/// the child execs; with a private copy of memory there is nothing the parent
+/// could corrupt by continuing, so suspending it would buy nothing - and every
+/// `CLONE_VFORK` caller in practice (`posix_spawn`) waits on the child itself.
+pub fn clone(state: &UserContext, request: CloneRequest) -> isize {
+    if request.flags & nr::CLONE_THREAD != 0 {
+        crate::println!("DBG clone CLONE_THREAD flags={:#x}", request.flags);
+        return crate::syscall::err::ENOSYS;
+    }
+    spawn_copy(state, request)
+}
+
 /// Where a fresh task's stack first lands. The arch trampoline calls this with
 /// the task's slot number in the first argument register; the body it should
-/// run, or the user image it should enter, is still in the table.
+/// run, the register file it should resume, or the user image it should enter is
+/// still in the table.
 extern "C" fn task_entry(slot: usize) -> ! {
-    let (body, user) = with_table(|t| {
+    let (body, user, resume, child_tid) = with_table(|t| {
         let task = t.task_mut(TaskId(slot));
-        (task.body.take(), task.user_entry.take())
+        // The resume state is *borrowed*, not taken: `resume_user` never
+        // returns, and the task's slot - and so the state inside it - stays put
+        // for as long as the task exists. Copying it onto this stack would be
+        // pointless work for a door that only opens one way.
+        let resume = task
+            .user_resume
+            .as_ref()
+            .map_or(core::ptr::null(), |state| state as *const UserContext);
+        (
+            task.body.take(),
+            task.user_entry.take(),
+            resume,
+            task.child_tid,
+        )
     });
     if let Some(body) = body {
         body();
         exit(0);
+    }
+    if !resume.is_null() {
+        // `clone(CLONE_CHILD_SETTID)` asked for the child's own tid to be
+        // waiting where the child can read it. This runs on the child's address
+        // space - the dispatcher has already loaded it - so the write lands
+        // exactly where the caller asked.
+        if child_tid != 0 {
+            unsafe { (child_tid as *mut i32).write_volatile(slot as i32) };
+        }
+        // A forked child: come back from the `fork` call its parent made, with
+        // `rax` zero. One way door, exactly as below.
+        unsafe { context::resume_user(resume) };
     }
     if let Some((entry, user_rsp)) = user {
         // One way door: the kernel stack this task arrived on stays behind as

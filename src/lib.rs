@@ -26,8 +26,11 @@ pub mod console;
 #[cfg(target_os = "none")]
 pub mod drivers;
 pub mod mm;
+/// The network stack, and the socket syscalls over it. Host builds skip it:
+/// its tests are the conformance programs that run on the machine.
+#[cfg(target_os = "none")]
+pub mod net;
 pub mod sched;
-pub mod shell;
 pub mod sync;
 pub mod syscall;
 pub mod vfs;

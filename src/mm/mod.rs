@@ -38,6 +38,42 @@ static HHDM: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATOR: heap::KernelHeap = heap::KernelHeap::empty();
 
 #[cfg(target_os = "none")]
+/// Where a device's registers get mapped.
+///
+/// The bootloader's direct map covers physical memory and nothing else, and a
+/// PCI BAR is not memory: it is a range of addresses that answers to a device.
+/// Devices therefore get a window of their own, above the user half and below
+/// the kernel's own image, handed out a mapping at a time and never reused -
+/// a device's registers are reachable for as long as the machine is up, so
+/// there is nothing to recycle.
+#[cfg(target_os = "none")]
+pub const MMIO_BASE: usize = 0xffff_ffff_4000_0000;
+/// One past the end of the window: 1 GiB of address space, which is room for
+/// every BAR a machine could plausibly have.
+#[cfg(target_os = "none")]
+const MMIO_LIMIT: usize = 0xffff_ffff_8000_0000;
+
+/// The next free byte in that window.
+#[cfg(target_os = "none")]
+static MMIO_NEXT: AtomicUsize = AtomicUsize::new(MMIO_BASE);
+
+/// Map a device's registers into the kernel half and return the address they
+/// can be reached through.
+///
+/// Called once per BAR, at the moment a driver decides it wants the device.
+#[cfg(target_os = "none")]
+pub fn map_mmio(phys: usize, len: usize) -> usize {
+    let len = pframe::align_up(len, PAGE_SIZE);
+    let virt = MMIO_NEXT.fetch_add(len, Ordering::Relaxed);
+    assert!(
+        virt + len <= MMIO_LIMIT,
+        "out of room for device registers: {len} bytes at {phys:#x}"
+    );
+    crate::arch::paging::map_mmio(virt, phys, len);
+    virt
+}
+
+#[cfg(target_os = "none")]
 pub fn phys_to_virt(phys: usize) -> usize {
     phys + HHDM.load(Ordering::Relaxed)
 }
@@ -55,14 +91,11 @@ pub fn virt_to_phys(virt: usize) -> usize {
 }
 
 /// Allocate `2^order` contiguous physical frames, aligned to their own size.
-/// Single-page allocations start with a reference count of 1.
+/// A single-page allocation comes back with a reference count of one, already
+/// recorded by the zone that handed it out.
 #[cfg(target_os = "none")]
 pub fn alloc_frames(order: usize) -> Option<usize> {
-    let phys = critical_section::with(|cs| PMM.borrow(cs).borrow_mut().alloc(order))?;
-    if order == 0 {
-        critical_section::with(|cs| PMM.borrow(cs).borrow_mut().set_refcount_1(phys));
-    }
-    Some(phys)
+    critical_section::with(|cs| PMM.borrow(cs).borrow_mut().alloc(order))
 }
 
 /// Return frames allocated by [`alloc_frames`] with the same order.

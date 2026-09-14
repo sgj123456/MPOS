@@ -16,13 +16,18 @@ pub use policy::{Priority, TaskId};
 pub use runtime::spawn_init;
 #[cfg(target_os = "none")]
 pub use runtime::{
-    ARGS_BYTES_MAX, ARGV_MAX, INIT_PID, MAX_TASKS, Redirect, STACK_ORDER, SpawnError, block_until,
-    block_until_code, brk, current, current_cwd, current_cwd_path, current_exe, current_fds,
-    current_map_user, deliver_pending_signal, discard_exit_code, exit, exit_code, exec_replace,
-    fork, get_mmap_cursor, has_live_child, init, is_child, move_user_page, parent_of, pause,
-    permanent_tasks, poll_any_child, preempt, protect_user, release_user_frames, resolve_cow_fault,
-    send_signal, set_brk_base, set_cwd, set_cwd_path, set_mmap_cursor, set_signal_action,
+    ARGS_BYTES_MAX, ARGV_MAX, CloneRequest, INIT_PID, ITIMER_PROF, ITIMER_REAL, ITIMER_VIRTUAL,
+    ItimerSnapshot, ItimerState, MAX_TASKS, Redirect, STACK_ORDER, SpawnError, block_until,
+    block_until_code, brk, check_itimer, clone, current, current_blocked, current_cwd,
+    current_cwd_path, current_disposition, current_exe, current_fds, current_map_user,
+    current_pgid, current_tls, deliver_pending_signal, discard_exit_code, exec_replace, exit,
+    exit_code, fork, get_mmap_cursor, group_members, has_children, has_live_child, init, is_child,
+    itimer_snapshot, itimer_swap, move_user_page, parent_of, pause, permanent_tasks, pgid_of,
+    poll_any_child, preempt, protect_user, read_user, release_user_frames, reset_disposition,
+    resolve_cow_fault, send_signal, send_signal_group, set_brk_base, set_current_blocked,
+    set_current_tls, set_cwd, set_cwd_path, set_mmap_cursor, set_pgid, set_signal_action,
     set_signal_alt_stack, signal_action, signal_alt_stack, sleep_ticks, spawn, spawn_user,
-    take_exit_code, task_count, try_spawn_user, unmap_user, user_frame_at, user_range_free,
-    wait_any_child, wait_for_interrupt, wake, yield_now,
+    take_deliverable_signal, take_exit_code, take_fatal_signal, take_signal_in_set, task_count,
+    try_spawn_user, unmap_user, user_frame_at, user_range_free, wait_any_child, wait_for_interrupt,
+    wake, write_user, yield_now,
 };

@@ -128,6 +128,53 @@ fn activate(root: usize) {
 }
 
 /// The root frame of the address space the CPU is translating through.
+/// Map a device's registers into the kernel half, which every address space
+/// shares.
+///
+/// The bootloader's direct map covers physical memory and nothing else, and a
+/// PCI BAR is not memory - it is a range of addresses that answers to a
+/// device. Reaching one takes a mapping of its own, and it has to go in the
+/// kernel half because a device is not per-process: [`AddressSpace::map`]
+/// refuses to touch that half, correctly, and this is the one path that does.
+///
+/// `virt` is chosen by the caller and must already be free; `phys` and `len`
+/// come from the BAR. Device registers are mapped a page at a time rather than
+/// with huge pages, because a BAR is not obliged to be aligned to one and
+/// because a 2 MiB mapping of them would reach past the device into whatever
+/// sits beside it.
+pub fn map_mmio(virt: usize, phys: usize, len: usize) {
+    assert!(
+        virt >= USER_END && virt.is_multiple_of(crate::mm::pframe::PAGE_SIZE),
+        "an MMIO window belongs above the user half, page-aligned"
+    );
+    assert!(len > 0, "mapping a device's registers of zero length");
+
+    let root = kernel_root();
+    let mut tables = unsafe {
+        OffsetPageTable::new(
+            &mut *(mm::phys_to_virt(root) as *mut PageTable),
+            VirtAddr::new(mm::hhdm_offset() as u64),
+        )
+    };
+    let mut pool = FramePool { frames: 0 };
+    install_mapping(
+        &mut tables,
+        Mapping {
+            virt,
+            phys,
+            length: len,
+            // Deliberately without `USER`: a device's registers must not be
+            // reachable from ring 3, whatever else a process manages to map.
+            flags: MapFlags::READ | MapFlags::WRITE,
+        },
+        &mut pool,
+    );
+    // The tables are live the moment they are written, but the TLB is not, and
+    // a stale entry for one of these addresses is the worst kind of stale: it
+    // would send a device's read to whatever was there before.
+    activate(root);
+}
+
 pub fn active_root() -> usize {
     Cr3::read().0.start_address().as_u64() as usize
 }
@@ -357,7 +404,18 @@ impl AddressSpace {
 
     /// Map a page as copy-on-write: present and readable from ring 3, but
     /// not writable. The COW bit marks it for the page fault handler.
+    ///
+    /// Only a page that is *logically writable* gets the COW bit. A read-only
+    /// page - a program's text, a `PROT_READ` mapping - is shared as it stands:
+    /// neither process may write it, so there is nothing to copy, and marking
+    /// it COW would quietly turn a write that should fault into a private copy.
+    ///
+    /// A page that came from a walk of an already-forked space carries `COW`
+    /// instead of `WRITE`: it is writable, just not written yet. Sharing it
+    /// without re-marking it would leave the new space with a page that is
+    /// read-only and unresolvable.
     pub fn map_cow(&mut self, virt: usize, phys: usize, flags: MapFlags) {
+        let writable = flags.contains(MapFlags::WRITE) || flags.contains(MapFlags::COW);
         // Remove WRITE; the COW fault handler will restore it on copy.
         let mut cow_flags = flags;
         cow_flags.remove(MapFlags::WRITE);
@@ -371,12 +429,13 @@ impl AddressSpace {
 
         let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(virt as u64))
             .expect("aligned page for COW");
-        let frame =
-            PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(phys as u64))
-                .expect("aligned frame for COW");
+        let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(phys as u64))
+            .expect("aligned frame for COW");
 
         let mut flags = page_flags(cow_flags);
-        flags |= PageTableFlags::from_bits_truncate(COW_BIT);
+        if writable {
+            flags |= PageTableFlags::from_bits_truncate(COW_BIT);
+        }
 
         match unsafe { tables.map_to(page, frame, flags, &mut FramePool { frames: 0 }) } {
             Ok(flush) => flush.ignore(),
@@ -388,12 +447,14 @@ impl AddressSpace {
         }
     }
 
-    /// Resolve a copy-on-write fault: allocate a fresh frame, copy the
-    /// contents, update the mapping to writable (clearing the COW bit), and
-    /// return the old physical frame so the caller can decrement its refcount.
+    /// Resolve a copy-on-write fault: allocate a fresh frame, copy the contents,
+    /// update the mapping to writable (clearing the COW bit), and report both
+    /// frames.
     ///
-    /// Returns `Some(old_phys)` on success, `None` if the page is not COW.
-    pub fn resolve_cow(&mut self, virt: usize) -> Option<usize> {
+    /// The pair matters because the frame lists have to follow along: the caller
+    /// now owns `new` instead of `old`, and `old` has one fewer owner. Returns
+    /// `None` if the page is not COW.
+    pub fn resolve_cow(&mut self, virt: usize) -> Option<(usize, usize)> {
         let aligned_virt = crate::mm::pframe::align_down(virt, crate::mm::PAGE_SIZE);
 
         // Read the current PTE to find the physical frame and check COW.
@@ -406,10 +467,16 @@ impl AddressSpace {
         // Allocate a fresh frame and copy.
         let new_phys = mm::alloc_frames(0)?;
         let src = unsafe {
-            core::slice::from_raw_parts(mm::phys_to_virt(old_phys) as *const u8, crate::mm::PAGE_SIZE)
+            core::slice::from_raw_parts(
+                mm::phys_to_virt(old_phys) as *const u8,
+                crate::mm::PAGE_SIZE,
+            )
         };
         let dst = unsafe {
-            core::slice::from_raw_parts_mut(mm::phys_to_virt(new_phys) as *mut u8, crate::mm::PAGE_SIZE)
+            core::slice::from_raw_parts_mut(
+                mm::phys_to_virt(new_phys) as *mut u8,
+                crate::mm::PAGE_SIZE,
+            )
         };
         dst.copy_from_slice(src);
 
@@ -428,7 +495,7 @@ impl AddressSpace {
 
         self.remap_page(aligned_virt, new_phys, flags);
 
-        Some(old_phys)
+        Some((old_phys, new_phys))
     }
 
     /// Read the raw PTE entry for a virtual address by walking the page tables.
@@ -471,9 +538,8 @@ impl AddressSpace {
         // Map the new frame.
         let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(new_phys as u64))
             .expect("aligned frame for remap");
-        match unsafe {
-            tables.map_to(page, frame, page_flags(flags), &mut FramePool { frames: 0 })
-        } {
+        match unsafe { tables.map_to(page, frame, page_flags(flags), &mut FramePool { frames: 0 }) }
+        {
             Ok(flush) => flush.ignore(),
             Err(_) => panic!("remap_page failed at {virt:#x}"),
         }
@@ -486,10 +552,7 @@ impl AddressSpace {
     /// Walk every user-space 4KiB page in the lower half and call `f` with
     /// `(virt, phys, flags)` for each one. Used by fork to duplicate the
     /// address space.
-    pub fn walk_user_pages(
-        &self,
-        mut f: impl FnMut(usize, usize, MapFlags),
-    ) {
+    pub fn walk_user_pages(&self, mut f: impl FnMut(usize, usize, MapFlags)) {
         self.walk_level(self.root, 3, 0, &mut f);
     }
 
@@ -550,6 +613,15 @@ impl AddressSpace {
                 }
                 if entry & NO_EXECUTE == 0 {
                     flags |= MapFlags::EXEC;
+                }
+                // Report a copy-on-write page as writable-but-protected, not as
+                // simply read-only. A caller that reads only `WRITE` still sees
+                // the page as it stands; one that is duplicating the space - and
+                // `fork` is the only one - needs the marker, or it would share
+                // the frame a second time without protecting it again and the
+                // next write would fault with nothing to resolve it.
+                if entry & COW_BIT != 0 {
+                    flags |= MapFlags::COW;
                 }
                 f(addr, phys, flags);
             } else {
@@ -634,7 +706,10 @@ fn free_below(table: usize, level: u32) {
 pub fn translate(virt: usize) -> Option<(usize, MapFlags)> {
     let (root, _) = Cr3::read();
     let mut table = root.start_address().as_u64() as usize;
-    let mut flags = MapFlags::all();
+    // The four permission bits only. `COW` is a state the fault handler cares
+    // about, not something the CPU enforces, and starting from `all()` would
+    // report every page as copy-on-write.
+    let mut flags = MapFlags::PERM;
 
     for level in (0..4).rev() {
         let entry = table_entry(table, virt, level);
@@ -700,12 +775,45 @@ pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
         let Some((_, flags)) = translate(page) else {
             return false;
         };
-        if !flags.contains(MapFlags::USER) || (write && !flags.contains(MapFlags::WRITE)) {
+        if !flags.contains(MapFlags::USER) {
+            return false;
+        }
+        // A page the process is entitled to write counts as writable whether or
+        // not its write bit is set. A copy-on-write page is mapped read-only on
+        // purpose: the write it catches is answered by the fault handler, not
+        // refused, so the permission is real and only the page's *state* says
+        // otherwise. Reading the bit and stopping there would turn every syscall
+        // that fills a user buffer - `read`, `uname`, `getrandom`, the status
+        // word of a `wait` - into an `EFAULT` for any process that has forked,
+        // which is every process a shell starts.
+        if write && !flags.contains(MapFlags::WRITE) && !is_cow_page(page) {
             return false;
         }
         page += PAGE_SIZE;
     }
     true
+}
+
+/// Whether the page holding `virt` carries the copy-on-write bit: present, and
+/// marked as shared-until-written.
+///
+/// Only the leaf entry is consulted, because only the leaf is where the bit is
+/// ever set: [`AddressSpace::map_cow`] and its sibling `set_cow_bit` both write
+/// it there, and the fault handler reads it back from the same place.
+pub fn is_cow_page(virt: usize) -> bool {
+    let (root, _) = Cr3::read();
+    let mut table = root.start_address().as_u64() as usize;
+    for level in (0..4).rev() {
+        let entry = table_entry(table, virt, level);
+        if entry & PRESENT == 0 {
+            return false;
+        }
+        if level == 0 || entry & HUGE != 0 {
+            return entry & COW_BIT != 0;
+        }
+        table = (entry & ADDR_MASK) as usize;
+    }
+    false
 }
 
 /// One entry of a page table, read through the direct map.

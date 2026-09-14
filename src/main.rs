@@ -16,7 +16,7 @@
 //!    validates the corresponding subsystem. Groups are ordered by dependency
 //!    and print `M*_OK` markers the CI harness asserts on.
 //!
-//! 3. **Init handoff** — `m13` spawns `/bin/init` and parks the boot task.
+//! 3. **Init handoff** — `m13` spawns `/sbin/init` and parks the boot task.
 
 #![no_std]
 #![no_main]
@@ -34,13 +34,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use mpos::arch::{self, interrupts, paging, timer};
+use mpos::blk;
 use mpos::boot::{self, BootInfo};
 use mpos::drivers;
 use mpos::mm::{self, MapFlags, Mapping, PAGE_SIZE};
 use mpos::println;
 use mpos::sched::{self, Priority};
 use mpos::syscall::{self, err, linux::nr as lnr};
-use mpos::vfs::{self, FileSystem, NodeKind};
+use mpos::vfs::{self, FileSystem, Inode, NodeKind};
 
 const MIB: usize = 1024 * 1024;
 
@@ -125,7 +126,8 @@ fn kernel_main(info: &BootInfo) {
     check_shell();
     println!("全部通过");
 
-    // ---- phase 3: hand the machine to /bin/init ----------------------------
+    // ---- phase 3: hand the machine to /sbin/init ----------------------------
+    init_net();
     handoff_to_init();
 }
 
@@ -177,6 +179,26 @@ fn init_sched() {
     );
 }
 
+/// The named child of `dir`, made if it is not there and reused if it is.
+///
+/// The kernel's checks were written against a root filesystem of their own
+/// making, where every name they wanted was free. Alpine's tree is not obliged
+/// to leave those gaps: it has its own `/etc/hostname` and its own `/tmp`, and
+/// both already hold something. The checks want a file to write through, not a
+/// file that was not there before - so they pick names Alpine does not use.
+fn ensure_child(dir: &Arc<dyn Inode>, name: &str, kind: NodeKind) -> Arc<dyn Inode> {
+    match dir.lookup(name) {
+        Ok(child) => child,
+        Err(_) => dir.create(name, kind).expect("create the scratch file"),
+    }
+}
+
+/// The Alpine release the root filesystem is built from, as
+/// `/etc/alpine-release` spells it. Kept in step with `scripts/fetch-alpine.sh`
+/// by hand: the kernel asserts on it, so a silent version bump in the packaging
+/// shows up here rather than as a userland that is not the one that was tested.
+const ALPINE_RELEASE: &str = "3.24.0";
+
 fn init_vfs(info: &BootInfo) {
     vfs::file::init_standard(vfs::tty::init());
 
@@ -190,6 +212,10 @@ fn init_vfs(info: &BootInfo) {
     let dev = vfs::devfs::DevFs::new();
     dev.register("tty", Arc::new(TtyDev));
     dev.register("console", Arc::new(ConsoleDev));
+    // The serial port's traditional name, spelled as a second path to the
+    // same line discipline: a getty on ttyS0 and one on the console would
+    // otherwise be two names for a fight over one keyboard.
+    dev.register("ttyS0", Arc::new(TtyDev));
     dev.register("null", Arc::new(NullDev));
     dev.register("zero", Arc::new(ZeroDev));
     vfs::mount("/dev", &*dev).expect("mount /dev");
@@ -205,10 +231,21 @@ fn init_blk() {
         sectors * 512 / MIB as u64
     );
 
-    vfs::resolve("/")
-        .expect("no root filesystem")
-        .create("mnt", NodeKind::Dir)
-        .expect("create /mnt");
+    // The disk carries a partition table now - a bootloader, a kernel and
+    // this filesystem all live on it - so the filesystem has to be found
+    // inside a partition rather than assumed to start at byte zero.
+    let dev = blk::part::find_filesystem(dev).expect("no ext2 filesystem on the disk");
+    println!(
+        "ext2: filesystem on a {}-sector partition",
+        dev.capacity_sectors()
+    );
+
+    // The root filesystem is Alpine's, so /mnt is already there. Make it only
+    // when it is missing: a real tree is not obliged to leave a gap for us.
+    let root = vfs::resolve("/").expect("no root filesystem");
+    if root.lookup("mnt").is_err() {
+        root.create("mnt", NodeKind::Dir).expect("create /mnt");
+    }
     let fs = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("the ext2 image did not mount");
     vfs::mount("/mnt", &fs).expect("mount /mnt");
     BLK_DEV.call_once(|| dev);
@@ -488,44 +525,54 @@ fn check_arch(info: &BootInfo) {
             "an empty address space needed {empty_cost} tables"
         );
 
-        space.switch();
-        assert_eq!(
-            paging::active_root(),
-            space.root(),
-            "switch() did not switch"
-        );
+        // The two switches below move CR3 behind the scheduler's back: the
+        // boot task has no `space` of its own, so a clock tick landing inside
+        // this block would send the dispatcher's `prepare` to switch straight
+        // back to the kernel root - and the assert would see a half-done
+        // switch, which it did, one boot in ten. Nothing in here sleeps, so
+        // holding interrupts off for the block is just the truth about what
+        // it needs. exec_replace has the same shape and is already safe: it
+        // records the task's new space before pointing CR3 at it.
+        critical_section::with(|_| {
+            space.switch();
+            assert_eq!(
+                paging::active_root(),
+                space.root(),
+                "switch() did not switch"
+            );
 
-        let (back, flags) = paging::translate(virt).expect("the user page is not mapped");
-        assert_eq!(back, frame, "the user page points at the wrong frame");
-        assert_eq!(flags, MapFlags::READ | MapFlags::WRITE | MapFlags::USER);
-        unsafe {
-            ptr::write_bytes(virt as *mut u8, 0x77, PAGE_SIZE);
-            assert_eq!(*(virt as *const u8), 0x77);
-            assert_eq!(*(virt as *const u8), 0x77);
-        }
-        println!("user page at {virt:#x} mapped rwu and written through");
+            let (back, flags) = paging::translate(virt).expect("the user page is not mapped");
+            assert_eq!(back, frame, "the user page points at the wrong frame");
+            assert_eq!(flags, MapFlags::READ | MapFlags::WRITE | MapFlags::USER);
+            unsafe {
+                ptr::write_bytes(virt as *mut u8, 0x77, PAGE_SIZE);
+                assert_eq!(*(virt as *const u8), 0x77);
+                assert_eq!(*(virt as *const u8), 0x77);
+            }
+            println!("user page at {virt:#x} mapped rwu and written through");
 
-        let mut shared: Vec<u8> = Vec::new();
-        shared.resize(8 * 1024, 0x11);
-        assert!(
-            shared.iter().all(|&byte| byte == 0x11),
-            "the heap stopped working in a process address space"
-        );
-        drop(shared);
+            let mut shared: Vec<u8> = Vec::new();
+            shared.resize(8 * 1024, 0x11);
+            assert!(
+                shared.iter().all(|&byte| byte == 0x11),
+                "the heap stopped working in a process address space"
+            );
+            drop(shared);
 
-        empty.switch();
-        assert!(
-            paging::translate(virt).is_none(),
-            "a user page leaked between address spaces"
-        );
-        let text = arch::kernel_sections().text.start;
-        assert!(
-            paging::translate(text).is_some(),
-            "the kernel half was not shared with the new address space"
-        );
-        println!("second address space: kernel half shared, user half empty");
+            empty.switch();
+            assert!(
+                paging::translate(virt).is_none(),
+                "a user page leaked between address spaces"
+            );
+            let text = arch::kernel_sections().text.start;
+            assert!(
+                paging::translate(text).is_some(),
+                "the kernel half was not shared with the new address space"
+            );
+            println!("second address space: kernel half shared, user half empty");
 
-        paging::switch_to_kernel();
+            paging::switch_to_kernel();
+        });
 
         let before_teardown = mm::frame_stats().free;
         drop(empty);
@@ -835,7 +882,12 @@ fn check_vfs() {
         // dispatch takes the task down.
         sched::spawn(
             || {
-                let pid = syscall::linux_dispatch(lnr::GETPID, [0; syscall::ARG_COUNT], false, core::ptr::null_mut());
+                let pid = syscall::linux_dispatch(
+                    lnr::GETPID,
+                    [0; syscall::ARG_COUNT],
+                    false,
+                    core::ptr::null_mut(),
+                );
                 assert!(pid >= 2, "getpid returned {pid}");
 
                 let msg = b"syscall: write through dispatch in a spawned task\n";
@@ -848,7 +900,12 @@ fn check_vfs() {
                 assert_eq!(wrote as usize, msg.len(), "dispatch dropped bytes");
 
                 assert_eq!(
-                    syscall::linux_dispatch(lnr::SCHED_YIELD, [0; syscall::ARG_COUNT], false, core::ptr::null_mut()),
+                    syscall::linux_dispatch(
+                        lnr::SCHED_YIELD,
+                        [0; syscall::ARG_COUNT],
+                        false,
+                        core::ptr::null_mut()
+                    ),
                     0
                 );
                 // 2 ms, 1 byte, 0 padding — a request for the handler to
@@ -863,7 +920,12 @@ fn check_vfs() {
                     ),
                     0
                 );
-                syscall::linux_dispatch(lnr::EXIT_GROUP, [0, 0, 0, 0, 0, 0], false, core::ptr::null_mut());
+                syscall::linux_dispatch(
+                    lnr::EXIT_GROUP,
+                    [0, 0, 0, 0, 0, 0],
+                    false,
+                    core::ptr::null_mut(),
+                );
             },
             Priority::NORMAL,
         );
@@ -878,25 +940,23 @@ fn check_vfs() {
 
     // M7: ramfs, mounts, multi-task file I/O through the fd table.
     {
-        vfs::resolve("/etc")
-            .unwrap()
-            .create("hostname", NodeKind::File)
-            .unwrap();
-        let fd = vfs::open("/etc/hostname").expect("open /etc/hostname");
+        ensure_child(
+            &vfs::resolve("/etc").unwrap(),
+            "mpos-hostname",
+            NodeKind::File,
+        );
+        let fd = vfs::open("/etc/mpos-hostname").expect("open /etc/mpos-hostname");
         assert_eq!(vfs::write(fd, b"mpos\n").unwrap(), 5);
         vfs::close(fd).unwrap();
 
-        let fd = vfs::open("/etc/hostname").unwrap();
+        let fd = vfs::open("/etc/mpos-hostname").unwrap();
         let mut buf = [0u8; 32];
         let n = vfs::read(fd, &mut buf).unwrap();
         vfs::close(fd).unwrap();
         assert_eq!(&buf[..n], b"mpos\n");
 
         let tmp = vfs::ramfs::RamFs::new();
-        vfs::resolve("/")
-            .unwrap()
-            .create("tmp", NodeKind::Dir)
-            .unwrap();
+        ensure_child(&vfs::resolve("/").unwrap(), "tmp", NodeKind::Dir);
         vfs::mount("/tmp", &*tmp).expect("mount /tmp");
         let inner_root = tmp.root();
         assert!(
@@ -904,6 +964,8 @@ fn check_vfs() {
             "resolving /tmp did not cross the mount"
         );
         assert_eq!(vfs::mount("/tmp", &*tmp).err(), Some(vfs::VfsError::Busy));
+        // Inside the freshly mounted filesystem, so nothing of Alpine's is here
+        // to collide with - it is a new root, not the tree behind the mount.
         vfs::resolve("/tmp")
             .unwrap()
             .create("shared", NodeKind::File)
@@ -946,16 +1008,36 @@ fn check_vfs() {
 
     // M8: initramfs unpack and device filesystem.
     {
-        const INITRAMFS_MOTD: &[u8] = b"welcome to mpos\n";
-
-        let motd = vfs::open("/etc/motd").expect("no /etc/motd after the unpack");
+        // The proof that the archive unpacked used to be "the motd says what we
+        // put in it". The root filesystem is Alpine's now, so the motd is
+        // Alpine's - and the stronger claim is that a file no one but Alpine
+        // ships is there with exactly the release it was fetched at.
         let mut buf = [0u8; 64];
+        let release = vfs::open("/etc/alpine-release")
+            .expect("the unpacked tree carries no /etc/alpine-release");
+        let n = vfs::read(release, &mut buf).unwrap();
+        vfs::close(release).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&buf[..n])
+                .expect("alpine-release is utf8")
+                .trim(),
+            ALPINE_RELEASE,
+            "the unpacked tree is not the Alpine release that was packaged"
+        );
+
+        // And the motd is readable, which is what this check always really
+        // cared about: a file's contents came out of the archive intact.
+        let motd = vfs::open("/etc/motd").expect("no /etc/motd after the unpack");
         let n = vfs::read(motd, &mut buf).unwrap();
         vfs::close(motd).unwrap();
-        assert_eq!(&buf[..n], INITRAMFS_MOTD);
+        assert!(n > 0, "the unpacked /etc/motd is empty");
         println!(
             "motd: {}",
-            core::str::from_utf8(&buf[..n]).expect("motd is utf8")
+            core::str::from_utf8(&buf[..n])
+                .expect("motd is utf8")
+                .lines()
+                .next()
+                .unwrap_or("")
         );
 
         let console = vfs::open("/dev/console").expect("open /dev/console");
@@ -1346,6 +1428,11 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo M13_$GATE\n",
     b"false\n",
     b"echo M14_$?\n",
+    // A background job: the line ends in `&`, so the shell must answer 0
+    // straight away rather than wait - and the child must still be collected,
+    // which the job list does before the next prompt.
+    b"sleep 1 &\n",
+    b"echo M13_BG_$?\n",
     // The conformance suite: one test per syscall, each leaving its verdict
     // in $? - 0 pass, 1 fail - echoed back as a greppable marker. Every line
     // must read `<name>_0`; the one exception is t_exit_group, whose whole
@@ -1461,6 +1548,8 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo t_fork_$?\n",
     b"t_wait4\n",
     b"echo t_wait4_$?\n",
+    b"t_clone\n",
+    b"echo t_clone_$?\n",
     // t_stdargs pins the Linux startup contract from the std side: a musl
     // binary's Rust `env::args()` reads back the argument block the kernel
     // laid out, with no mpos libc in the way. It is the only test that runs a
@@ -1469,6 +1558,14 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     // address and asked the kernel for a 24 GiB mapping.
     b"t_stdargs one two three\n",
     b"echo STDARGS_$?\n",
+    b"t_stdspawn\n",
+    b"echo STDSPAWN_$?\n",
+    // apk is the one program on the image that is linked against musl's
+    // *shared* libc, so running it exercises two things nothing else does:
+    // the kernel loading a program interpreter named by PT_INTERP, and a
+    // shared object arriving through a file `mmap`. It is also the only
+    // milestone here that is a real Alpine program rather than one of ours.
+    b"apk --version > /dev/null && echo APK_OK\n",
     // b"t_mprotect\n",
     // b"echo t_mprotect_$?\n",
     // b"t_rt_sigprocmask\n",
@@ -1538,7 +1635,7 @@ fn check_shell() {
             for line in SHELL_SCRIPT {
                 for &b in *line {
                     vfs::tty::global().receive_byte(b);
-                    sched::sleep_ticks(2);
+                    sched::sleep_ticks(1);
                 }
             }
         },
@@ -1565,21 +1662,34 @@ fn discard() {
 
 // ---- init handoff (terminal, not a check) --------------------------------
 
+/// Bring the network stack up, after every milestone check has run and the
+/// task count is back to baseline: the polling task spawned here is
+/// permanent, and the checks' `drain` would otherwise wait on it forever.
+fn init_net() {
+    if mpos::net::init() {
+        mpos::net::spawn_service();
+        println!("net: virtio-net up at 10.0.2.15/24, gateway 10.0.2.2");
+    } else {
+        println!("net: no virtio-net device on the bus; sockets answer ENETDOWN");
+    }
+}
+
 /// M13: a real system start. The checks above are the kernel proving itself;
 /// this is the kernel handing the machine over.
 fn handoff_to_init() {
-    let init = vfs::read_file("/bin/init").expect("the initramfs carries /bin/init");
+    let init = vfs::read_file("/sbin/init").expect("the initramfs carries /sbin/init");
     let argv = alloc::vec![String::from("init")];
     let pid = sched::spawn_init(&init, &argv, &[]).expect("the init image loaded");
     assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
-    println!("mpos: handing the machine to /bin/init");
+    println!("mpos: handing the machine to /sbin/init");
 
     sched::discard_exit_code(pid);
 
     drivers::serial::enable_rx();
-    // init starts the shell with `execve`, which on mpos spawns it as a child
-    // and reports the pid; init then waits. So a child appearing under init is
-    // exactly the "the shell is up" signal.
+    // init forks, execve's the shell in the child, and waits. So a child
+    // appearing under init is exactly the "the shell is up" signal - and init
+    // itself staying alive is what makes that a shell and not a machine with
+    // nobody left to start programs.
     while !sched::has_live_child(pid) {
         sched::sleep_ticks(1);
     }

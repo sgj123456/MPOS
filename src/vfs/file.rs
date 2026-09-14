@@ -25,10 +25,20 @@ pub type RawFd = i32;
 /// The `FD_CLOEXEC` flag bit: close this descriptor on `execve`.
 pub const FD_CLOEXEC: u32 = 1;
 
+/// The `O_NONBLOCK` open flag, as `fcntl(F_SETFL)` stores it: an operation
+/// that would block answers `EAGAIN` instead. The only flag with teeth here -
+/// a datagram socket that refuses to wait is exactly what a DNS resolver's
+/// timeout loop is built on.
+pub const O_NONBLOCK: u32 = 0o4000;
+
 /// An open file description: an inode plus where the next read/write lands.
 pub struct File {
     inode: Arc<dyn Inode>,
     pos: AtomicU64,
+    /// The open flags `fcntl(F_GETFL/F_SETFL)` report. Only [`O_NONBLOCK`]
+    /// changes behavior; the rest are stored so a caller reads back what it
+    /// wrote.
+    status: core::sync::atomic::AtomicU32,
 }
 
 impl File {
@@ -37,6 +47,7 @@ impl File {
         File {
             inode,
             pos: AtomicU64::new(0),
+            status: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -46,6 +57,16 @@ impl File {
 
     pub fn inode(&self) -> Arc<dyn Inode> {
         self.inode.clone()
+    }
+
+    /// The open flag word, as `fcntl(F_GETFL)` reports it.
+    pub fn status(&self) -> u32 {
+        self.status.load(Ordering::Relaxed)
+    }
+
+    /// Replace the open flag word, as `fcntl(F_SETFL)` does.
+    pub fn set_status(&self, flags: u32) {
+        self.status.store(flags, Ordering::Relaxed);
     }
 
     pub fn pos(&self) -> u64 {
@@ -99,12 +120,60 @@ impl FdTable {
         table
     }
 
+    /// Hand over every description the table holds, leaving it empty.
+    ///
+    /// This is what a process exit does with its descriptors. The table itself
+    /// has to stay - a zombie still has a slot, and its pid still has to answer
+    /// `wait` - but nothing the process had open may stay open: a pipe whose
+    /// write end outlived its writer never reports end-of-file, and the reader
+    /// at the other end waits forever.
+    ///
+    /// The descriptions are *returned*, not dropped. Dropping one can wake
+    /// whoever was blocked on it, and the caller may be holding locks that wake
+    /// would need; the returned vector is dropped by whoever is safe to do it.
+    pub fn take_all(&self) -> alloc::vec::Vec<Arc<File>> {
+        critical_section::with(|cs| {
+            let files: alloc::vec::Vec<Arc<File>> = self
+                .slots
+                .borrow(cs)
+                .borrow_mut()
+                .drain(..)
+                .flatten()
+                .collect();
+            self.fd_flags.borrow(cs).borrow_mut().clear();
+            files
+        })
+    }
+
     /// Add fds 0, 1 and 2 over one inode. Without them the first `pipe()`
     /// would be handed fd 0.
     fn push_standard(&self, tty: Arc<dyn Inode>) {
         for _ in 0..3 {
             self.install(Arc::new(File::new(tty.clone())));
         }
+    }
+
+    /// A copy of this table: the same numbers naming the same open file
+    /// descriptions, with the same per-descriptor flags.
+    ///
+    /// This is what `fork` gives a child, and the distinction it draws is the
+    /// whole of POSIX's inheritance rule. The *descriptions* are shared - both
+    /// processes read and write through one open file, sharing one file
+    /// position - but the *numbering* is not: closing fd 3 in the parent must
+    /// not close it in the child, and a `dup2` on one side must not move the
+    /// other. Handing the child the same `Arc<FdTable>` would make all of that
+    /// leak across, and a shell's pipeline - which is nothing but `dup2` and
+    /// `close` on both sides of a fork - would close the parent's own pipe ends
+    /// out from under it.
+    pub fn duplicate(&self) -> FdTable {
+        let copy = FdTable::new();
+        critical_section::with(|cs| {
+            let slots = self.slots.borrow(cs).borrow();
+            let flags = self.fd_flags.borrow(cs).borrow();
+            *copy.slots.borrow(cs).borrow_mut() = slots.clone();
+            *copy.fd_flags.borrow(cs).borrow_mut() = flags.clone();
+        });
+        copy
     }
 
     pub fn install(&self, file: Arc<File>) -> RawFd {
@@ -123,6 +192,29 @@ impl FdTable {
                     (slots.len() - 1) as RawFd
                 }
             }
+        })
+    }
+
+    /// [`install`](Self::install) with a floor: the descriptor handed back is
+    /// the lowest free one at or above `at`, which is what `fcntl(F_DUPFD)`
+    /// promises. A free slot below the floor is left alone - the caller asked
+    /// for a number it can keep out of the way of something else.
+    pub fn install_at_least(&self, file: Arc<File>, at: RawFd) -> VfsResult<RawFd> {
+        critical_section::with(|cs| {
+            let mut slots = self.slots.borrow(cs).borrow_mut();
+            let mut flags = self.fd_flags.borrow(cs).borrow_mut();
+            let at = (at.max(0)) as usize;
+            let slot = (at..slots.len())
+                .find(|&slot| slots[slot].is_none())
+                .unwrap_or(slots.len());
+            if slot == slots.len() {
+                slots.push(Some(file));
+                flags.push(0);
+            } else {
+                slots[slot] = Some(file);
+                flags[slot] = 0;
+            }
+            Ok(slot as RawFd)
         })
     }
 

@@ -58,20 +58,21 @@ mpos/
 │   │   ├── devfs.rs         # 设备文件系统（/dev/tty、/dev/null 等）
 │   │   ├── ext2.rs          # 可读写 ext2 实现
 │   │   ├── pipe.rs          # 管道实现
-│   │   └── tty.rs           # TTY 行规程（规范模式）
+│   │   ├── tty.rs           # 行规程：规范模式、原始模式、方向键等转义键
+│   │   └── termios.rs       # struct termios 与控制台默认值
 │   ├── syscall/             # 系统调用门（17 个调用）
-│   ├── blk/                 # 块设备层（virtio-blk）
+│   ├── blk/                 # 块设备层（virtio-blk）+ 分区表扫描
 │   ├── boot/                # 引导协议转换（Limine）
-│   └── shell/               # Shell 语法解析器（no_std，零分配）
+│   └── （没有 Shell 模块：/bin/sh 是 Alpine 的 ash）
 ├── user/
 │   ├── lib/sys.rs           # 精简 libc（系统调用封装）
 │   └── bin/                 # 用户程序
 │       ├── init.rs          # PID 1：重启 Shell、回收孤儿进程
-│       ├── sh.rs            # 支持管道和重定向的 Shell
-│       ├── hello.rs         # Ring 3 概念验证
-│       ├── ls.rs、cat.rs、echo.rs、sleep.rs、true.rs、false.rs
+│       ├── hello.rs         # Ring 3 概念验证（M12）
+│       └── t_*.rs           # ABI 一致性测试，每个文件一类系统调用
 ├── scripts/
-│   ├── mkiso.sh             # 构建内核、用户程序、ISO 和磁盘镜像
+│   ├── mkdisk.sh            # 构建内核、用户程序与可引导磁盘镜像
+│   ├── mkfat.py             # 手工写出 EFI 系统分区的 FAT32
 │   ├── run.sh               # 在 QEMU 中启动
 │   └── test.sh              # 完整 CI 流程
 ├── arch/x86_64/linker.ld    # 位置无关链接脚本
@@ -105,7 +106,7 @@ mpos/
 | **M10** | 块设备与 ext2 | virtio-blk 检测；ext2 挂载、读取主机种子文件、通过 /mnt 写入、冷挂载验证 |
 | **M11** | 管道、TTY、信号 | 管道字节传输和 EOF；TTY 行编辑、回显、Ctrl-D；SIGTERM、SIGKILL、kill(0) 探测 |
 | **M12** | Shell 与核心工具 | Shell、echo、cat、ls、true、false、sleep——全部运行在 Ring 3 |
-| **M13** | Init 移交 | `/bin/init` 成为 PID 1；Shell 通过 UART 中断变为交互式 |
+| **M13** | Init 移交 | `/sbin/init` 成为 PID 1；Shell 通过 UART 中断变为交互式 |
 | **M14** | 退出状态 | Shell `$?` 携带上一条命令的退出码 |
 
 ---
@@ -116,7 +117,10 @@ mpos/
 
 - **Rust nightly**（包含 `rust-src`、`rustfmt`、`clippy`）
 - **QEMU**（x86_64 或 aarch64）
-- **mkisofs** / **xorriso**（用于创建 ISO）
+- **OVMF** —— QEMU 用它替代 SeaBIOS 的 UEFI 固件
+  （`/usr/share/OVMF/x64/OVMF_CODE.4m.fd`）
+- **python3** —— `scripts/mkfat.py` 无需 loop 设备即可写出 FAT32 卷
+- **parted** —— 划分镜像的 GPT 分区表
 - **mke2fs** / **e2fsprogs**（用于创建 ext2 磁盘镜像）
 
 ```bash
@@ -135,7 +139,7 @@ rustup target add x86_64-unknown-none aarch64-unknown-none --toolchain nightly
 ./scripts/fetch-limine.sh
 
 # 2. 构建内核、用户程序和可引导 ISO
-./scripts/mkiso.sh
+./scripts/mkdisk.sh
 
 # 3. 在 QEMU 中启动
 ./scripts/run.sh
@@ -153,13 +157,20 @@ rustup target add x86_64-unknown-none aarch64-unknown-none --toolchain nightly
 cargo build --target x86_64-unknown-none
 ```
 
-### 完整镜像（ISO + 磁盘）
+### 完整镜像（单张磁盘）
 
 ```bash
-./scripts/mkiso.sh
+./scripts/mkdisk.sh
 ```
 
-此脚本编译内核、用 `rustc` 编译每个用户程序（独立、静态、`ET_EXEC`）、组装 initramfs tar、创建支持 BIOS+UEFI 双 El Torito 引导的可引导 ISO，并格式化一个 8 MiB ext2 磁盘镜像。
+此脚本编译内核、用 `rustc` 编译每个用户程序（独立、静态、`ET_EXEC`）、把 Alpine minirootfs 打成 initramfs tar，最终组装成一张带分区表的磁盘镜像 `build/linux-x86_64.img`，整个系统都在里面：
+
+| 分区 | 类型 | 内容 |
+| --- | --- | --- |
+| 1，`ESP` | FAT32，128 MiB | `EFI/BOOT/BOOTX64.EFI`（Limine）、`limine.conf`、`boot/mpos.elf`、`boot/initramfs.tar` |
+| 2，`root` | ext2，8 MiB | 内核挂载为 `/mnt` 的种子文件 |
+
+QEMU 直接在 OVMF 下启动它：不需要 ISO、不需要光驱、宿主上也不需要 loop 设备 —— 这正是 FAT32 卷由 `mkfat.py` 逐字节写出、而不是 `mkfs.vfat` 加挂载的原因。
 
 > **注意：** `third_party/limine/` 存放 Limine 引导加载器二进制文件，已被 gitignore。通过 `scripts/fetch-limine.sh` 自动填充（首次构建前运行一次）。若目录不存在，脚本会自动创建。
 
@@ -196,9 +207,9 @@ cargo test --lib --target x86_64-unknown-linux-gnu
 1. `cargo fmt --check`
 2. `cargo clippy`（内核和主机目标）
 3. `cargo test --lib`（主机）
-4. 通过 `mkiso.sh` 构建
+4. 通过 `mkdisk.sh` 构建
 5. 在 QEMU 中启动并捕获串口日志
-6. 断言里程碑标记（`M0_OK` 到 `M13_OK`）
+6. 断言里程碑标记（`M0_OK` 到 `M13_OK`、`APK_OK`）
 7. 检查 `KERNEL PANIC` 或 `INIT_EXITED`
 
 ---

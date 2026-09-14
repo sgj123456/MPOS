@@ -20,21 +20,24 @@ static mut BUF: [u8; 16] = [0; 16];
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t_pipe2\n");
     let mut failed = false;
+    // Which number the lowest free descriptor is depends on what this process
+    // inherited: a shell may hold one of its own. Ask, rather than assume 3.
+    let base = lin::free_fd();
 
     let mut fds: [i32; 2] = [-1; 2];
     let r = lin::pipe2(&mut fds, 0);
     lin::check_eq(&mut failed, b"pipe2 with no flags succeeds", r, 0);
     lin::check_eq(
         &mut failed,
-        b"the read end is the lowest free fd (3)",
+        b"the read end is the lowest free fd",
         fds[0] as isize,
-        3,
+        base,
     );
     lin::check_eq(
         &mut failed,
-        b"the write end is the next free fd (4)",
+        b"the write end is the next free fd",
         fds[1] as isize,
-        4,
+        base + 1,
     );
 
     let n = lin::write(fds[1], b"ping");
@@ -65,7 +68,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_true(
         &mut failed,
         b"the new pair again takes the two lowest free fds",
-        fds[0] == 3 && fds[1] == 4,
+        fds[0] as isize == base && fds[1] as isize == base + 1,
     );
 
     let r = lin::close(fds[1]);

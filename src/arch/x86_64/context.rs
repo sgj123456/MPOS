@@ -163,6 +163,95 @@ pub unsafe fn switch(from: *mut Context, to: *const Context) {
     unsafe { mpos_context_switch(from, to) }
 }
 
+/// The ring-3 machine state a process resumes with.
+///
+/// A forked child does not re-enter its program at the entry point: it comes
+/// back from the very `fork` call its parent made, one instruction past the
+/// `syscall`. The kernel therefore has to hand it the parent's register file
+/// exactly as the gate left it, with a single difference - `rax` is zero, the
+/// value that tells a program it is the child. This struct *is* that register
+/// file, ordered so the assembly in [`resume_user`] can load it by offset.
+///
+/// `rcx` and `r11` are deliberately absent. `syscall` itself overwrites both,
+/// the ABI declares them clobbered, and `iretq` takes their roles over: RIP and
+/// RFLAGS are fields of the interrupt frame instead.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserContext {
+    pub rip: usize,
+    pub rsp: usize,
+    pub rflags: usize,
+    pub rax: usize,
+    pub rbx: usize,
+    pub rbp: usize,
+    pub cs: usize,
+    pub ss: usize,
+    pub r12: usize,
+    pub r13: usize,
+    pub r14: usize,
+    pub r15: usize,
+    pub rdi: usize,
+    pub rsi: usize,
+    pub rdx: usize,
+    pub r8: usize,
+    pub r9: usize,
+    pub r10: usize,
+}
+
+unsafe extern "C" {
+    /// Never returns: the `iretq` at its end leaves this call frame for good.
+    fn mpos_resume_user(state: *const UserContext) -> !;
+}
+
+/// Enter ring 3 with the register file `state` describes - the child half of
+/// `fork`.
+///
+/// Like [`enter_user`], this call frame is abandoned: the only ways out of the
+/// new process are the syscall gate and the interrupt handlers, which return to
+/// user mode through their own frames.
+///
+/// # Safety
+///
+/// `state` must describe a live user image: `rip` executable in the active
+/// address space, `rsp` writable by ring 3, and `cs`/`ss` the user selectors.
+/// The caller must not need its kernel stack for anything but traps afterwards.
+pub unsafe fn resume_user(state: *const UserContext) -> ! {
+    unsafe { mpos_resume_user(state) }
+}
+
+global_asm!(
+    // rdi: the `UserContext` to enter ring 3 with.
+    ".globl mpos_resume_user",
+    ".p2align 4",
+    "mpos_resume_user:",
+    // Build the `iretq` frame first, in the order the instruction pops it:
+    // SS, RSP, RFLAGS, CS, RIP. Reading each word straight out of the struct
+    // keeps the register file working from a single pointer, with no scratch
+    // register borrowed from the state being restored.
+    "    cli",
+    "    push qword ptr [rdi + 56]", // ss
+    "    push qword ptr [rdi + 8]",  // rsp
+    "    push qword ptr [rdi + 16]", // rflags
+    "    push qword ptr [rdi + 48]", // cs
+    "    push qword ptr [rdi + 0]",  // rip
+    // Then the general registers. rdi is loaded last because until that line
+    // it is the only handle on the struct.
+    "    mov rax, [rdi + 24]",
+    "    mov rbx, [rdi + 32]",
+    "    mov rbp, [rdi + 40]",
+    "    mov r12, [rdi + 64]",
+    "    mov r13, [rdi + 72]",
+    "    mov r14, [rdi + 80]",
+    "    mov r15, [rdi + 88]",
+    "    mov rsi, [rdi + 104]",
+    "    mov rdx, [rdi + 112]",
+    "    mov r8,  [rdi + 120]",
+    "    mov r9,  [rdi + 128]",
+    "    mov r10, [rdi + 136]",
+    "    mov rdi, [rdi + 96]",
+    "    iretq",
+);
+
 global_asm!(
     // rdi: where to leave the caller's stack pointer.
     // rsi: where the next task's stack pointer was left.

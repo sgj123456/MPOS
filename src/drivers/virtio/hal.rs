@@ -1,0 +1,91 @@
+//! The bridge between the `virtio-drivers` crate and this kernel.
+//!
+//! The crate is written against a [`Hal`] - a host abstraction layer - because
+//! it cannot know how the kernel it lives in hands out memory or reaches a
+//! device's registers. Everything it asks for, it asks for here, and every
+//! answer is short because of what this kernel already is:
+//!
+//! * There is a direct map of all physical memory, so a physical address is a
+//!   virtual address with a constant added, and one helper in each direction
+//!   answers both `mmio_phys_to_virt` and `share`.
+//! * There is no IOMMU and no bounce buffering, so a buffer anywhere in the
+//!   kernel's own memory is already visible to the device: `share` computes an
+//!   address and `unshare` does nothing at all.
+//!
+//! A kernel with an IOMMU, or one that had to copy buffers into a region a
+//! device could reach, would have real work to do in those two. This one does
+//! not, and pretending otherwise would only add a layer that cannot fail.
+
+use core::ptr::NonNull;
+
+use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction, PciRoot};
+use virtio_drivers::{BufferDirection, Hal, PhysAddr};
+
+use crate::drivers::pci;
+use crate::mm::{self, PAGE_SIZE};
+
+/// The `Hal` implementation the virtio devices are built on.
+pub struct HalImpl;
+
+unsafe impl Hal for HalImpl {
+    fn dma_alloc(pages: usize, _direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
+        let order = pages.next_power_of_two().trailing_zeros() as usize;
+        let phys = mm::alloc_frames(order).expect("out of frames for a virtio DMA allocation");
+        let virt = mm::phys_to_virt(phys) as *mut u8;
+        // Zeroed, as the crate requires: the descriptor tables the device
+        // reads before the driver has written anything are this memory.
+        unsafe { core::ptr::write_bytes(virt, 0, pages * PAGE_SIZE) };
+        (
+            phys as PhysAddr,
+            NonNull::new(virt).expect("the direct map is never null"),
+        )
+    }
+
+    unsafe fn dma_dealloc(paddr: PhysAddr, _vaddr: NonNull<u8>, pages: usize) -> i32 {
+        let order = pages.next_power_of_two().trailing_zeros() as usize;
+        mm::free_frames(paddr as usize, order);
+        0
+    }
+
+    unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
+        // A BAR is not memory, so the direct map does not reach it: this is a
+        // window of the kernel half mapped on demand, one mapping per BAR.
+        NonNull::new(mm::map_mmio(paddr as usize, size) as *mut u8)
+            .expect("an MMIO window is never null")
+    }
+
+    unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
+        mm::virt_to_phys(buffer.as_ptr() as *mut u8 as usize) as PhysAddr
+    }
+
+    unsafe fn unshare(_paddr: PhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
+        // Nothing was copied, so nothing has to be copied back.
+    }
+}
+
+/// PCI configuration space, through the I/O ports this kernel already speaks.
+///
+/// The crate ships an MMIO implementation for the enhanced configuration
+/// mechanism, and none for the port-based one that every x86_64 machine has
+/// and that this kernel's PCI layer was already built on - so this is the
+/// dozen lines that let the crate's PCI transport use it.
+pub struct IoCam;
+
+impl ConfigurationAccess for IoCam {
+    fn read_word(&self, df: DeviceFunction, register: u8) -> u32 {
+        pci::read32(df.bus, df.device, df.function, register)
+    }
+
+    fn write_word(&mut self, df: DeviceFunction, register: u8, data: u32) {
+        pci::write32(df.bus, df.device, df.function, register, data)
+    }
+
+    unsafe fn unsafe_clone(&self) -> Self {
+        IoCam
+    }
+}
+
+/// A PCI root complex over [`IoCam`].
+pub fn pci_root() -> PciRoot<IoCam> {
+    PciRoot::new(IoCam)
+}

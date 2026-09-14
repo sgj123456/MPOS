@@ -16,13 +16,32 @@ use crate::mm::pframe::{PAGE_SIZE, align_down, align_up};
 bitflags! {
     /// Page permissions. A bit that is absent is a restriction: no `WRITE` means
     /// read-only, no `EXEC` means not executable, no `USER` means kernel-only.
+    ///
+    /// `COW` is not a hardware permission: it says the mapping is *logically*
+    /// writable but has been downgraded to read-only so that `fork` can share
+    /// the frame. It travels with `WRITE` rather than replacing it when a walk
+    /// reports a page, because a fork has to know the difference between a page
+    /// neither process may ever write - program text - and one that is merely
+    /// waiting for its first write to be copied.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct MapFlags: u8 {
         const READ  = 1 << 0;
         const WRITE = 1 << 1;
         const EXEC  = 1 << 2;
         const USER  = 1 << 3;
+        const COW   = 1 << 4;
     }
+}
+
+impl MapFlags {
+    /// The four bits that are real page permissions. `COW` is deliberately not
+    /// among them: a walk of the hardware bits reports what the CPU enforces,
+    /// and a copy-on-write page is enforced as read-only whether or not it will
+    /// later be copied. Callers that need the state ask for it by name.
+    pub const PERM: MapFlags = MapFlags::READ
+        .union(MapFlags::WRITE)
+        .union(MapFlags::EXEC)
+        .union(MapFlags::USER);
 }
 
 impl fmt::Debug for MapFlags {
@@ -36,6 +55,9 @@ impl fmt::Debug for MapFlags {
         }
         if self.contains(MapFlags::USER) {
             write!(f, "u")?;
+        }
+        if self.contains(MapFlags::COW) {
+            write!(f, "c")?;
         }
         Ok(())
     }

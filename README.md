@@ -58,21 +58,21 @@ mpos/
 │   │   ├── devfs.rs         # Device file system (/dev/tty, /dev/null, etc.)
 │   │   ├── ext2.rs          # Read/write ext2 implementation
 │   │   ├── pipe.rs          # Pipe implementation
-│   │   └── tty.rs           # TTY line discipline (canonical mode)
+│   │   ├── tty.rs           # Line discipline: canonical, raw, escape keys
+│   │   └── termios.rs       # struct termios and the console's defaults
 │   ├── syscall/             # Syscall gate (17 calls)
-│   ├── blk/                 # Block device layer (virtio-blk)
+│   ├── blk/                 # Block device layer (virtio-blk) + partition scan
 │   ├── boot/                # Boot protocol translation (Limine)
-│   └── shell/               # Shell syntax parser (no_std, zero-allocation)
+│   └── (no shell: /bin/sh is Alpine's ash)
 ├── user/
 │   ├── lib/lin.rs           # Slim libc (syscall wrappers)
 │   └── bin/                 # User programs
 │       ├── init.rs          # PID 1: restarts shell, reaps orphans
-│       ├── sh.rs            # Shell with pipes and redirection
-│       ├── ls.rs, sleep.rs  # mpos-native: `#![no_std]`, slim libc
-│       ├── cat.rs, echo.rs  # Linux: rustc-built for musl, on Rust `std`
-│       ├── hello.rs, true.rs, false.rs, t_stdargs.rs
+│       ├── hello.rs         # The M12 sample program
+│       └── t_*.rs           # ABI conformance tests, one syscall family each
 ├── scripts/
-│   ├── mkiso.sh             # Build kernel, user programs, ISO, and disk image
+│   ├── mkdisk.sh            # Build kernel, user programs, and the boot disk
+│   ├── mkfat.py             # Write the EFI system partition's FAT32 by hand
 │   ├── run.sh               # Launch in QEMU
 │   └── test.sh              # Full CI pipeline
 ├── arch/x86_64/linker.ld    # Position-independent linker script
@@ -106,7 +106,7 @@ Each milestone proves the current subsystem correct before the next is built.
 | **M10** | Block Device & ext2 | virtio-blk detection; ext2 mount, read host-seeded files, write via /mnt, cold-mount verification |
 | **M11** | Pipes, TTY, Signals | Pipe byte transfer and EOF; TTY line editing, echo, Ctrl-D; SIGTERM, SIGKILL, kill(0) probe |
 | **M12** | Shell & Core Utils | Shell, echo, cat, ls, true, false, sleep—all running in Ring 3 |
-| **M13** | Init Handoff | `/bin/init` becomes PID 1; shell becomes interactive via UART interrupts |
+| **M13** | Init Handoff | `/sbin/init` becomes PID 1; shell becomes interactive via UART interrupts |
 | **M14** | Exit Status | Shell `$?` carries the exit code of the previous command |
 
 ---
@@ -117,8 +117,11 @@ Each milestone proves the current subsystem correct before the next is built.
 
 - **Rust nightly** (with `rust-src`, `rustfmt`, `clippy`)
 - **QEMU** (x86_64 or aarch64)
-- **mkisofs** / **xorriso** (for creating the ISO)
-- **mke2fs** / **e2fsprogs** (for creating the ext2 disk image)
+- **OVMF** — the UEFI firmware QEMU boots instead of SeaBIOS
+  (`/usr/share/OVMF/x64/OVMF_CODE.4m.fd`)
+- **python3** — `scripts/mkfat.py` builds the FAT32 volume without a loop device
+- **parted** — lays down the GPT the image is partitioned with
+- **mke2fs** / **e2fsprogs** (for creating the ext2 data partition)
 
 ```bash
 # Install Rust nightly and required components
@@ -135,8 +138,8 @@ rustup target add x86_64-unknown-none aarch64-unknown-none --toolchain nightly
 # 1. Fetch the Limine bootloader (once only)
 ./scripts/fetch-limine.sh
 
-# 2. Build the kernel, user programs, and bootable ISO
-./scripts/mkiso.sh
+# 2. Build the kernel, user programs, and the bootable disk image
+./scripts/mkdisk.sh
 
 # 3. Launch in QEMU
 ./scripts/run.sh
@@ -154,13 +157,20 @@ The kernel will boot, run the M0–M13 milestone verification, and then drop int
 cargo build --target x86_64-unknown-none
 ```
 
-### Full Image (ISO + Disk)
+### Full Image (Disk)
 
 ```bash
-./scripts/mkiso.sh
+./scripts/mkdisk.sh
 ```
 
-This script compiles the kernel, compiles each user program with `rustc` (standalone, static, `ET_EXEC`), assembles the initramfs tar, creates a bootable ISO supporting dual BIOS+UEFI El Torito boot, and formats an 8 MiB ext2 disk image.
+This script compiles the kernel, compiles each user program with `rustc` (standalone, static, `ET_EXEC`), packs Alpine's minirootfs into an initramfs tar, and assembles one partitioned disk image - `build/linux-x86_64.img` - holding the whole system:
+
+| Partition | Kind | Holds |
+| --- | --- | --- |
+| 1, `ESP` | FAT32, 128 MiB | `EFI/BOOT/BOOTX64.EFI` (Limine), `limine.conf`, `boot/mpos.elf`, `boot/initramfs.tar` |
+| 2, `root` | ext2, 8 MiB | the seed files the kernel mounts as `/mnt` |
+
+QEMU boots it directly under OVMF: no ISO, no optical drive, and no loop device on the host - which is why the FAT32 volume is written byte by byte by `mkfat.py` rather than by `mkfs.vfat` plus a mount.
 
 > **Note:** `third_party/limine/` holds the Limine bootloader binaries and is gitignored. It is populated automatically by `scripts/fetch-limine.sh` (called once before the first build). The directory is created with `mkdir -p` if absent.
 
@@ -197,9 +207,9 @@ Runs the full pipeline:
 1. `cargo fmt --check`
 2. `cargo clippy` (kernel and host targets)
 3. `cargo test --lib` (host)
-4. Build via `mkiso.sh`
+4. Build via `mkdisk.sh`
 5. Launch in QEMU and capture the serial log
-6. Assert milestone markers (`M0_OK` through `M13_OK`)
+6. Assert milestone markers (`M0_OK` through `M13_OK`, `APK_OK`)
 7. Check for `KERNEL PANIC` or `INIT_EXITED`
 
 ---

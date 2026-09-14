@@ -144,6 +144,7 @@ struct Regs {
     r15: usize,
     r14: usize,
     r13: usize,
+    rbx: usize,
     rbp: usize,
 }
 
@@ -184,11 +185,14 @@ global_asm!(
     "    mov  r12, rsp",      // r12 = the caller's RSP
     "    mov  rsp, qword ptr gs:[0]", // rsp = current kernel stack top
     // Preserve every register the Linux x86_64 syscall ABI promises to keep:
-    // rbp, r12-r15, rbx (which this stub never touches), and the caller's RSP.
+    // rbp, rbx, r12-r15 (which this stub never touches), and the caller's RSP.
     // Then the args and the two `syscall`-stashed values. rax (the number) is
     // pushed last, so it sits at offset 0 and the return value patches with
-    // one `mov [rsp]`.
+    // one `mov [rsp]`. rbx is saved rather than merely left alone because
+    // `fork` has to reconstruct the child's whole register file from this
+    // frame, and a register the frame does not carry cannot be reconstructed.
     "    push rbp",
+    "    push rbx",
     "    push r13",
     "    push r14",
     "    push r15",
@@ -225,14 +229,24 @@ global_asm!(
     "    pop  rdi",
     // What is left of the frame is read by offset rather than popped: the word
     // that carries the stack pointer is the one a `pop` would need a spare
-    // register for. The caller's RSP sits at [rsp]; above it are the two
-    // registers the stub did borrow - r12, parked while the stack switch used
-    // it, and rbp, which held the frame base - and r13-r15, which never left
-    // their registers at all. The frame itself is abandoned here: `sysretq`
-    // takes the return address from rcx and the flags from r11, and the stack
-    // is already the caller's.
-    "    mov  rbp, [rsp + 40]", // the caller's rbp
+    // register for. The caller's RSP sits at [rsp]; above it are the registers
+    // the stub pushed to get out of the caller's way - r12, parked while the
+    // stack switch used it; r15/r14/r13, which never left their registers at
+    // all; and rbx and rbp, saved above them. The frame itself is abandoned
+    // here: `sysretq` takes the return address from rcx and the flags from r11,
+    // and the stack is already the caller's.
+    "    mov  rbx, [rsp + 40]", // the caller's rbx
+    "    mov  rbp, [rsp + 48]", // the caller's rbp
     "    mov  r12, [rsp + 8]",  // the caller's r12
+    // r13-r15 are pushed so a frame reader can see them, and until now they
+    // were never popped back: nothing in the stub touches them, so leaving the
+    // registers alone was the same thing. It is not the same thing any more,
+    // because `rt_sigreturn` rewrites them in the frame and expects the
+    // rewrite to take effect - a handler that clobbers r13 would otherwise
+    // return to code that had lost it.
+    "    mov  r15, [rsp + 16]",
+    "    mov  r14, [rsp + 24]",
+    "    mov  r13, [rsp + 32]",
     "    mov  rsp, [rsp]",      // back to the caller's RSP
     "    sysretq",
     rust_entry = sym rust_syscall,

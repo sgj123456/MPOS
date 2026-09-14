@@ -25,9 +25,10 @@ pub mod path;
 pub mod pipe;
 pub mod ramfs;
 pub mod tar;
+pub mod termios;
 pub mod tty;
 
-pub use file::{File, RawFd, close, dup2, open, open_opt, read, write};
+pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
 pub use mount::{global, mount, mount_root, resolve, resolve_at};
 
 use alloc::string::String;
@@ -44,6 +45,37 @@ pub enum NodeKind {
     Dir,
     /// A character device: reads and writes go to a driver, not storage.
     CharDev,
+    /// A symbolic link: a name holding another path, followed by resolution
+    /// and *not* by whoever asks for the link itself. A whole userspace can be
+    /// built out of these - Alpine's `/bin` is one busybox and three hundred
+    /// names pointing at it.
+    Symlink,
+}
+
+/// What a descriptor can do right now, for `poll(2)`.
+///
+/// `read` is "a read would not block", which includes end-of-file: a pipe whose
+/// last writer has gone is readable, and reading it is what reports the end.
+/// `write` is "a write would not block", which on a pipe whose last reader has
+/// gone is also true - the write is what reports `EPIPE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ready {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl Ready {
+    /// Everything: the answer for a node that never blocks, which is most of
+    /// them. A regular file is always readable and always writable.
+    pub const ALL: Ready = Ready {
+        read: true,
+        write: true,
+    };
+    /// Nothing: a pipe with no data and a writer still attached.
+    pub const NONE: Ready = Ready {
+        read: false,
+        write: false,
+    };
 }
 
 /// The facts about a node that outlive any particular open of it.
@@ -123,6 +155,69 @@ pub trait Inode: Send + Sync {
     /// Write at an absolute offset, extending as needed. Returns bytes stored.
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         let _ = (offset, buf);
+        Err(VfsError::Unsupported)
+    }
+
+    /// The tty this node is, if it is one.
+    ///
+    /// A device is more than the bytes it reads and writes: `TCGETS` and
+    /// `TCSETS` ask the terminal itself, and a descriptor can only say which
+    /// terminal by handing back the node it points at. Everything else is not
+    /// a terminal, and the termios ioctls answer `ENOTTY` for it.
+    fn as_tty(&self) -> Option<&crate::vfs::tty::Tty> {
+        None
+    }
+
+    /// The network-stack handle this node carries, if it is a socket.
+    ///
+    /// Sockets have no filesystem storage behind them - they are anonymous
+    /// channels that happen to use descriptors - so they do not fit any of
+    /// the methods above. What they need is a way for the syscall layer,
+    /// holding nothing but an `Arc<dyn Inode>`, to ask: is this a socket, and
+    /// if so, which one? Zero is "not a socket"; the socket registry in
+    /// `net` numbers its entries from one.
+    fn socket_handle(&self) -> usize {
+        0
+    }
+
+    /// What this node can do without blocking, for `poll(2)`.
+    ///
+    /// The default is "everything": a node that never blocks - a file, a
+    /// directory, a device that always has an answer - is always ready. Only
+    /// the nodes that can make a caller wait say otherwise.
+    fn poll_ready(&self) -> Ready {
+        Ready::ALL
+    }
+
+    /// Ask to be woken when this node may have become ready, and stop asking.
+    ///
+    /// `poll` calls this before it sleeps and the matching `unsubscribe` after,
+    /// on every node it was asked about. The default does nothing, which is
+    /// right for a node that is always ready: there is no event to miss.
+    fn poll_subscribe(&self, id: crate::sched::policy::TaskId) {
+        let _ = id;
+    }
+
+    fn poll_unsubscribe(&self, id: crate::sched::policy::TaskId) {
+        let _ = id;
+    }
+
+    /// Where a symbolic link points. Anything that is not a link answers
+    /// [`VfsError::Invalid`], which is what turns into `EINVAL` from
+    /// `readlink(2)` - the error Linux gives for reading a non-link.
+    ///
+    /// The target is a path in the filesystem's own terms, not a resolved one:
+    /// `bin/ls` may point at `/bin/busybox` or at `busybox`, and which of the
+    /// two it is decides how it resolves. Only the filesystem knows.
+    fn readlink(&self) -> VfsResult<String> {
+        Err(VfsError::Invalid)
+    }
+
+    /// Name a new symbolic link in this directory. Separate from [`Inode::create`]
+    /// because a link is made of a target, not just a kind - there is nothing
+    /// useful to create without one.
+    fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+        let _ = (name, target);
         Err(VfsError::Unsupported)
     }
 

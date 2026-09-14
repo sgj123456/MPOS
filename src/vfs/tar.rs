@@ -24,6 +24,9 @@ pub const BLOCK: usize = 512;
 pub enum EntryKind {
     File,
     Dir,
+    /// A symbolic link. Its `data` is not contents: it is the path the link
+    /// stands for, taken from the ustar `linkname` field.
+    Symlink,
 }
 
 /// One member of the archive. `data` borrows the archive.
@@ -59,6 +62,7 @@ impl<'a> Iterator for Entries<'a> {
         let kind = match header[156] {
             b'0' | b'\0' => EntryKind::File,
             b'5' => EntryKind::Dir,
+            b'2' => EntryKind::Symlink,
             _ => {
                 self.rest = &[];
                 return None;
@@ -83,6 +87,13 @@ impl<'a> Iterator for Entries<'a> {
             path.strip_suffix('/').unwrap_or(path)
         } else {
             path
+        };
+        // A link carries no contents: its target is the `linkname` field, and
+        // `size` is zero. Reuse `data` so the unpacker needs no second case.
+        let data = if kind == EntryKind::Symlink {
+            str_field(&header[157..257])?.as_bytes()
+        } else {
+            data
         };
         Some(Entry { path, kind, data })
     }
@@ -121,6 +132,15 @@ pub fn unpack_into(vfs: &Vfs, archive: &[u8]) -> VfsResult<usize> {
                 }
                 let file = parent.create(name, NodeKind::File)?;
                 file.write_at(0, entry.data)?;
+            }
+            EntryKind::Symlink => {
+                let (parent_path, name) = split_last(&path);
+                let parent = ensure_dir(vfs, parent_path)?;
+                if parent.lookup(name).is_ok() {
+                    return Err(VfsError::Exists);
+                }
+                let target = core::str::from_utf8(entry.data).map_err(|_| VfsError::Invalid)?;
+                parent.symlink(name, target)?;
             }
         }
         count += 1;
@@ -185,6 +205,18 @@ mod tests {
         let pad = data.len().div_ceil(BLOCK) * BLOCK - data.len();
         out.extend(core::iter::repeat_n(0u8, pad));
         out
+    }
+
+    /// A link member: the target lives in `linkname`, not in the data blocks.
+    fn link_member(path: &str, target: &str) -> Vec<u8> {
+        let mut header = [0u8; BLOCK];
+        header[..path.len()].copy_from_slice(path.as_bytes());
+        header[124..135].copy_from_slice(b"00000000000");
+        header[156] = b'2';
+        header[157..157 + target.len()].copy_from_slice(target.as_bytes());
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        Vec::from(header.as_slice())
     }
 
     fn tree() -> Vfs {
@@ -284,5 +316,26 @@ mod tests {
             super::unpack_into(&vfs, &archive).err(),
             Some(VfsError::Exists)
         );
+    }
+
+    /// A link member's target is the `linkname` field, never the data blocks -
+    /// which for a link are empty. Unpacking one has to produce something
+    /// resolution will follow, or a busybox `/bin` arrives as an empty file.
+    #[test]
+    fn unpack_creates_links_that_resolution_follows() {
+        let mut archive = member("bin/busybox", b'0', b"busybox");
+        archive.extend(link_member("bin/ls", "/bin/busybox"));
+        archive.extend(link_member("bin/sh", "busybox"));
+        let vfs = tree();
+        assert_eq!(super::unpack_into(&vfs, &archive).unwrap(), 3);
+
+        let busybox = vfs.resolve("/bin/busybox").unwrap();
+        assert_eq!(busybox.metadata().kind, NodeKind::File);
+        for name in ["ls", "sh"] {
+            assert!(
+                alloc::sync::Arc::ptr_eq(&vfs.resolve(&format!("/bin/{name}")).unwrap(), &busybox),
+                "/bin/{name} is not a working link to busybox"
+            );
+        }
     }
 }

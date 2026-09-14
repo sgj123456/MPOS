@@ -24,9 +24,10 @@ static mut WHOLE: [u8; 4096] = [0; 4096];
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t_readv\n");
     let mut failed = false;
+    let base = lin::free_fd();
 
     let fd = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the file opens on fd 3", fd, 3);
+    lin::check_eq(&mut failed, b"the file opens on the lowest free fd", fd, base);
 
     let mut iov = [
         lin::Iovec {

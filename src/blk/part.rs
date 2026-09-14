@@ -1,0 +1,345 @@
+//! Finding a filesystem on a partitioned disk.
+//!
+//! The kernel used to be handed a bare image: whatever the block device
+//! held *was* the ext2 filesystem, starting at byte zero. It is handed a real
+//! disk now - one with a GPT on it, holding a bootloader, a kernel and this
+//! filesystem side by side - so it has to read the partition table before it
+//! can find the filesystem at all.
+//!
+//! Only what that needs is implemented. There is no partition enumeration for
+//! anyone else to use, no `ioctl` to expose it, and no writing: the table is
+//! read once at boot, and the partition that carries an ext2 superblock is
+//! wrapped in [`Window`] and handed to the filesystem. A device that already
+//! starts with a superblock - an unpartitioned image, which the host tests
+//! still build - is accepted as it stands, so both shapes boot.
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use crate::blk::BlockDev;
+
+/// Bytes a logical sector, which is the unit every offset here is counted in.
+const SECTOR: u64 = 512;
+
+/// Where the ext2 superblock sits inside a filesystem, and the offset of the
+/// `s_magic` field within it. Both come from the on-disk format and are the
+/// cheapest way to recognise one filesystem among several.
+const SUPERBLOCK: u64 = 1024;
+const SUPERBLOCK_MAGIC: usize = 56;
+const EXT2_MAGIC: u16 = 0xEF53;
+
+/// One GPT partition entry, and the offset of the fields inside it.
+const GPT_ENTRY_SIZE: usize = 128;
+
+/// A partition of `inner`: the same sectors, seen from a new origin.
+///
+/// Every offset a filesystem computes is relative to its own partition, so a
+/// window is all the indirection there is between ext2 and the disk.
+pub struct Window {
+    inner: Arc<dyn BlockDev>,
+    /// Byte offset of the partition's first sector on the underlying device.
+    base: u64,
+    sectors: u64,
+}
+
+impl Window {
+    pub fn new(inner: Arc<dyn BlockDev>, start_lba: u64, sectors: u64) -> Window {
+        Window {
+            inner,
+            base: start_lba * SECTOR,
+            sectors,
+        }
+    }
+}
+
+impl BlockDev for Window {
+    fn capacity_sectors(&self) -> u64 {
+        self.sectors
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) {
+        self.inner.read_at(self.base + offset, buf);
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) {
+        self.inner.write_at(self.base + offset, buf);
+    }
+}
+
+/// The filesystem on `dev`, as a device scoped to whichever partition holds
+/// it.
+///
+/// `dev` is returned unchanged when the superblock is already at the front of
+/// the device: an image with no partition table is still a disk this kernel
+/// knows how to read, and the milestone that formats one should not have to
+/// learn about GPT to pass.
+pub fn find_filesystem(dev: Arc<dyn BlockDev>) -> Option<Arc<dyn BlockDev>> {
+    if has_ext2(dev.as_ref(), 0) {
+        return Some(dev);
+    }
+    for (start, sectors) in partitions(dev.as_ref()) {
+        if start.checked_add(sectors)? > dev.capacity_sectors() {
+            continue;
+        }
+        if has_ext2(dev.as_ref(), start * SECTOR) {
+            return Some(Arc::new(Window::new(dev, start, sectors)));
+        }
+    }
+    None
+}
+
+/// Whether an ext2 superblock begins `at` bytes into the device.
+fn has_ext2(dev: &dyn BlockDev, at: u64) -> bool {
+    let mut buf = [0u8; SECTOR as usize];
+    // A device too short to hold the field cannot hold the filesystem either,
+    // and reading past the end is a driver panic rather than an error.
+    if at + SUPERBLOCK + SUPERBLOCK_MAGIC as u64 + 2 > dev.capacity_sectors() * SECTOR {
+        return false;
+    }
+    dev.read_at(at + SUPERBLOCK, &mut buf);
+    u16::from_le_bytes([buf[SUPERBLOCK_MAGIC], buf[SUPERBLOCK_MAGIC + 1]]) == EXT2_MAGIC
+}
+
+/// The `(first_lba, sectors)` of every entry in the partition table, in table
+/// order, or nothing at all if there is no table to read.
+fn partitions(dev: &dyn BlockDev) -> Vec<(u64, u64)> {
+    let mut mbr = [0u8; SECTOR as usize];
+    if dev.capacity_sectors() < 2 {
+        return Vec::new();
+    }
+    dev.read_at(0, &mut mbr);
+    // The signature is what makes the first sector a partition table rather
+    // than the first sector of something else.
+    if mbr[510] != 0x55 || mbr[511] != 0xAA {
+        return Vec::new();
+    }
+
+    // A protective MBR - one whose first entry claims the whole disk as type
+    // 0xEE - is the marker that a GPT follows.
+    if mbr[446 + 4] == 0xEE {
+        return gpt_entries(dev);
+    }
+    mbr_entries(&mbr)
+}
+
+/// The four entries of a classic MBR, skipping the empty ones.
+fn mbr_entries(mbr: &[u8; SECTOR as usize]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for index in 0..4 {
+        let at = 446 + index * 16;
+        let start = u32::from_le_bytes(mbr[at + 8..at + 12].try_into().unwrap()) as u64;
+        let length = u32::from_le_bytes(mbr[at + 12..at + 16].try_into().unwrap()) as u64;
+        if start != 0 && length != 0 {
+            out.push((start, length));
+        }
+    }
+    out
+}
+
+/// The partition entries the GPT header points at.
+///
+/// The header lives in the second sector, and it names an array of entries
+/// that is usually large enough to need several reads - the trait hands out
+/// at most a page at a time - so the array is walked in pages.
+fn gpt_entries(dev: &dyn BlockDev) -> Vec<(u64, u64)> {
+    let mut header = [0u8; SECTOR as usize];
+    dev.read_at(SECTOR, &mut header);
+    if &header[0..8] != b"EFI PART" {
+        return Vec::new();
+    }
+
+    let table_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as u64;
+    let stride = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+    // The spec fixes the stride at 128 and requires a power of two no smaller
+    // than that; anything else is a table this reader does not understand,
+    // and guessing at the layout would read partition boundaries out of the
+    // middle of another field.
+    if stride < GPT_ENTRY_SIZE || !stride.is_power_of_two() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut page = [0u8; crate::mm::PAGE_SIZE];
+    let mut done = 0u64;
+    let total = count * stride as u64;
+    while done < total {
+        let want = core::cmp::min(page.len() as u64, total - done) as usize;
+        // Reads are whole sectors, so the last page of a table that does not
+        // end on a sector boundary is rounded up rather than short.
+        let want = want.div_ceil(SECTOR as usize) * SECTOR as usize;
+        let buf = &mut page[..want];
+        dev.read_at(table_lba * SECTOR + done, buf);
+
+        for entry in buf.chunks_exact(stride) {
+            // An all-zero type GUID is an entry nobody has claimed.
+            if entry[0..16].iter().all(|&byte| byte == 0) {
+                continue;
+            }
+            let first = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+            let last = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+            if first == 0 || last < first {
+                continue;
+            }
+            out.push((first, last - first + 1));
+        }
+        done += want as u64;
+    }
+    out
+}
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use core::cell::RefCell;
+    use critical_section::Mutex;
+
+    /// An in-memory disk, so a table and the filesystems on it can be laid
+    /// out and then read back the way boot reads them.
+    struct Fake {
+        bytes: Mutex<RefCell<Vec<u8>>>,
+        sectors: u64,
+    }
+
+    impl Fake {
+        fn new(sectors: u64) -> Fake {
+            Fake {
+                bytes: Mutex::new(RefCell::new(vec![0u8; (sectors * SECTOR) as usize])),
+                sectors,
+            }
+        }
+
+        fn put(&self, at: u64, bytes: &[u8]) {
+            critical_section::with(|cs| {
+                let mut disk = self.bytes.borrow(cs).borrow_mut();
+                let at = at as usize;
+                disk[at..at + bytes.len()].copy_from_slice(bytes);
+            });
+        }
+
+        fn put_ext2(&self, lba: u64) {
+            // Just enough of a superblock for the magic to be there.
+            let mut sb = [0u8; SECTOR as usize];
+            sb[SUPERBLOCK_MAGIC..SUPERBLOCK_MAGIC + 2].copy_from_slice(&EXT2_MAGIC.to_le_bytes());
+            self.put(lba * SECTOR + SUPERBLOCK, &sb);
+        }
+    }
+
+    impl BlockDev for Fake {
+        fn capacity_sectors(&self) -> u64 {
+            self.sectors
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) {
+            critical_section::with(|cs| {
+                let disk = self.bytes.borrow(cs).borrow();
+                let at = offset as usize;
+                buf.copy_from_slice(&disk[at..at + buf.len()]);
+            });
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) {
+            critical_section::with(|cs| {
+                let mut disk = self.bytes.borrow(cs).borrow_mut();
+                let at = offset as usize;
+                disk[at..at + buf.len()].copy_from_slice(buf);
+            });
+        }
+    }
+
+    /// Lay a GPT over `disk`, with one entry per `(start, sectors)`.
+    fn write_gpt(disk: &Fake, entries: &[(u64, u64)]) {
+        let mut mbr = [0u8; SECTOR as usize];
+        // Protective MBR: one entry of type 0xEE covering the disk.
+        mbr[446 + 4] = 0xEE;
+        mbr[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        mbr[446 + 12..446 + 16].copy_from_slice(&(disk.sectors as u32).to_le_bytes());
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        disk.put(0, &mbr);
+
+        let mut header = [0u8; SECTOR as usize];
+        header[0..8].copy_from_slice(b"EFI PART");
+        header[72..80].copy_from_slice(&2u64.to_le_bytes()); // entries at LBA 2
+        header[80..84].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        header[84..88].copy_from_slice(&(GPT_ENTRY_SIZE as u32).to_le_bytes());
+        disk.put(SECTOR, &header);
+
+        for (index, &(start, sectors)) in entries.iter().enumerate() {
+            let at = 2 * SECTOR + (index * GPT_ENTRY_SIZE) as u64;
+            let mut entry = [0u8; GPT_ENTRY_SIZE];
+            entry[0] = 0xAF; // a type GUID, so the entry is not empty
+            entry[32..40].copy_from_slice(&start.to_le_bytes());
+            entry[40..48].copy_from_slice(&(start + sectors - 1).to_le_bytes());
+            disk.put(at, &entry);
+        }
+    }
+
+    #[test]
+    fn an_unpartitioned_image_is_passed_through_untouched() {
+        let disk = Fake::new(64);
+        disk.put_ext2(0);
+        let found = find_filesystem(Arc::new(disk)).expect("the filesystem is at the front");
+        assert_eq!(found.capacity_sectors(), 64);
+    }
+
+    #[test]
+    fn the_partition_holding_the_superblock_is_the_one_that_is_opened() {
+        // A boot partition with no filesystem at all, then the data one.
+        let disk = Fake::new(4096);
+        write_gpt(&disk, &[(1, 2048), (2049, 2047)]);
+        disk.put_ext2(2049);
+
+        let found = find_filesystem(Arc::new(disk)).expect("the second partition mounts");
+        assert_eq!(found.capacity_sectors(), 2047);
+
+        // Reading through the window lands inside the partition, not at the
+        // front of the disk: the superblock the window sees is the one that
+        // was written there.
+        let mut buf = [0u8; SECTOR as usize];
+        found.read_at(SUPERBLOCK, &mut buf);
+        assert_eq!(
+            u16::from_le_bytes([buf[SUPERBLOCK_MAGIC], buf[SUPERBLOCK_MAGIC + 1]]),
+            EXT2_MAGIC
+        );
+    }
+
+    #[test]
+    fn a_table_with_no_filesystem_opens_nothing() {
+        let disk = Fake::new(4096);
+        write_gpt(&disk, &[(1, 2048)]);
+        assert!(find_filesystem(Arc::new(disk)).is_none());
+    }
+
+    #[test]
+    fn an_mbr_partition_table_is_read_too() {
+        let disk = Fake::new(4096);
+        let mut mbr = [0u8; SECTOR as usize];
+        mbr[446 + 4] = 0x83; // Linux filesystem
+        mbr[446 + 8..446 + 12].copy_from_slice(&100u32.to_le_bytes());
+        mbr[446 + 12..446 + 16].copy_from_slice(&500u32.to_le_bytes());
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        disk.put(0, &mbr);
+        disk.put_ext2(100);
+
+        let found = find_filesystem(Arc::new(disk)).expect("the MBR entry mounts");
+        assert_eq!(found.capacity_sectors(), 500);
+    }
+
+    #[test]
+    fn a_partition_running_past_the_end_is_ignored() {
+        let disk = Fake::new(1024);
+        write_gpt(&disk, &[(1, 4096)]);
+        disk.put_ext2(1);
+        // The superblock is where a partition would be, but the entry claims
+        // sectors the device does not have - so the whole disk is not ext2
+        // either, and nothing mounts.
+        assert!(find_filesystem(Arc::new(disk)).is_none());
+    }
+
+    #[test]
+    fn a_device_with_no_table_and_no_superblock_opens_nothing() {
+        let disk = Fake::new(64);
+        assert!(find_filesystem(Arc::new(disk)).is_none());
+    }
+}

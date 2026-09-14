@@ -132,11 +132,14 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         -1,
         0,
     );
+    // The man page's ENODEV is what a *valid* descriptor on an unmappable
+    // filesystem earns. An fd that names nothing - -1 here - is checked
+    // first: real Linux answers EBADF, and this kernel follows that order.
     lin::check_eq(
         &mut failed,
-        b"a file-backed request without MAP_ANONYMOUS answers ENODEV",
+        b"a file-backed request over a bad fd answers EBADF",
         r,
-        lin::ENODEV,
+        lin::EBADF,
     );
 
     let r = lin::mmap(
