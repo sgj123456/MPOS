@@ -76,6 +76,13 @@ fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
     };
     match opened {
         Ok(fd) => {
+            // TEMP DIAGNOSTIC: musl futimens later hands back a fd shaped
+            // `0x3FFFFFE0 | slot` - see whether the open that minted it
+            // already returned that shape. O_CREAT-only so the console
+            // flood of ordinary opens stays readable.
+            if flags & O_CREAT != 0 {
+                crate::println!("DBG open_linux O_CREAT path={} ret={}", path, fd);
+            }
             // `O_CLOEXEC` is part of the open flags, not a property of the file:
             // it says the descriptor must not survive the next `execve`. Left
             // unrecorded, an inherited descriptor keeps a pipe or a lock open
@@ -343,20 +350,11 @@ pub(super) fn faccessat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
 pub(super) fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     if args[1] == 0 {
         // futimens shape: the fd names the file, timestamps are not kept.
-        // TEMP DIAGNOSTIC: the fd argument arrives as a near-stack address
-        // (0x3FFFFFE3 on an otherwise healthy run) - dump all six argument
-        // slots to see which register musl actually parked the fd in.
-        crate::println!(
-            "DBG utimensat a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-            args[0], args[1], args[2], args[3], args[4], args[5]
-        );
         let fd = args[0] as u32 as i32;
-        let ret = match crate::sched::current_fds().clone_at(fd) {
+        return match crate::sched::current_fds().clone_at(fd) {
             Ok(_) => 0,
             Err(e) => err_of(e),
         };
-        crate::println!("DBG utimensat futimens fd={:#x} ret={}", fd, ret);
-        return ret;
     }
     let base = match base_of(args[0] as i32, cwd) {
         Ok(base) => base,

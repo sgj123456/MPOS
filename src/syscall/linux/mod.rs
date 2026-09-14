@@ -150,6 +150,11 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::POLL | nr::PPOLL => fs::poll(args),
         nr::SELECT => fs::select(args),
         nr::UTIMENSAT => fs::utimensat(args, &cwd()),
+        // `utimes(path, tv)` names no dirfd and carries a timeval struct -
+        // which is moot, since timestamps are not kept. It lands on the same
+        // path-led answer utimensat gives. (x86_64 has no `utime` number:
+        // musl routes that one through utimensat itself.)
+        nr::UTIMES => fs::utimensat([fs::AT_FDCWD as usize, args[0], args[1], 0, 0, 0], &cwd()),
         nr::SIGALTSTACK => sigaltstack(args),
         nr::GETITIMER => proc::handle_getitimer(args),
         nr::SETITIMER => proc::handle_setitimer(args),
