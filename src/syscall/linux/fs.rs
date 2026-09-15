@@ -47,6 +47,11 @@ fn mode_of(meta: &Metadata) -> u32 {
 /// it refuses instead of replacing; on its own it opens whatever is there.
 const O_CREAT: usize = 0o100;
 const O_EXCL: usize = 0o400;
+/// `O_TRUNC`: an existing file is emptied as part of the open. Without it a
+/// writer that reopens a name it wrote before keeps whatever tail was longer
+/// than what it writes now - the new bytes followed by the old ones, with
+/// nothing reporting it.
+const O_TRUNC: usize = 0o1000;
 const O_CLOEXEC: usize = 0o200_0000;
 /// `AT_SYMLINK_NOFOLLOW`: name the link itself, not what it points at.
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
@@ -54,6 +59,9 @@ const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 /// `open`/`openat` shared tail: open the path, and on a miss with `O_CREAT`
 /// make the file first, then open it.
 fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
+    // Resolved before the base moves into `open_opt`, and used only if what
+    // comes back is a directory.
+    let label = recoverable_path(path, &base);
     // O_EXCL refuses to open a name that is already there, whatever it names.
     if flags & O_CREAT != 0
         && flags & O_EXCL != 0
@@ -67,7 +75,6 @@ fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
             // O_EXCL names an existing file EEXIST; a missing directory, no
             // space: the create error is the answer, not a retry.
             if let Err(e) = crate::vfs::create_file_opt(path, Some(base.clone())) {
-                crate::println!("DBG open create path={} err={:?}", path, e);
                 return err_of(e);
             }
             crate::vfs::open_opt(path, Some(base))
@@ -76,12 +83,14 @@ fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
     };
     match opened {
         Ok(fd) => {
-            // TEMP DIAGNOSTIC: musl futimens later hands back a fd shaped
-            // `0x3FFFFFE0 | slot` - see whether the open that minted it
-            // already returned that shape. O_CREAT-only so the console
-            // flood of ordinary opens stays readable.
-            if flags & O_CREAT != 0 {
-                crate::println!("DBG open_linux O_CREAT path={} ret={}", path, fd);
+            // A directory description remembers the path it was opened by, so
+            // a later `fchdir` can give the cwd a name `getcwd` reads back.
+            // Files are left unlabelled: only a directory can be a cwd.
+            if let Some(label) = label
+                && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+                && file.metadata().kind == crate::vfs::NodeKind::Dir
+            {
+                file.set_label(label);
             }
             // `O_CLOEXEC` is part of the open flags, not a property of the file:
             // it says the descriptor must not survive the next `execve`. Left
@@ -90,9 +99,36 @@ fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
             if flags & O_CLOEXEC != 0 {
                 let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
             }
+            // `O_TRUNC` empties an existing file as part of the open, which is
+            // what a writer that reopens a name is promising: what it writes
+            // now is the whole file. Without it, `wget -O page.html` over a
+            // longer page leaves the new page followed by the old one's tail.
+            if flags & O_TRUNC != 0
+                && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+            {
+                let inode = file.inode();
+                if inode.metadata().kind == crate::vfs::NodeKind::File {
+                    let _ = inode.truncate(0);
+                }
+            }
             fd as isize
         }
         Err(e) => err_of(e),
+    }
+}
+
+/// The absolute path `path` names, when this is an open whose spelling can be
+/// recovered: an absolute path, or a relative one taken against the cwd. A
+/// relative path resolved against some other directory descriptor names a file
+/// the walk from `/` would have to search for, so it is left unnamed and
+/// `fchdir` falls back to searching.
+fn recoverable_path(path: &str, base: &Arc<dyn Inode>) -> Option<alloc::string::String> {
+    if path.starts_with('/') {
+        Some(normalize_path(path, "/"))
+    } else if Arc::ptr_eq(base, &crate::sched::current_cwd()) {
+        Some(normalize_path(path, &crate::sched::current_cwd_path()))
+    } else {
+        None
     }
 }
 
@@ -162,31 +198,47 @@ pub(super) fn flock(args: [usize; ARG_COUNT]) -> isize {
 /// `ftruncate(fd, length)` - the resize `wget` asks of its output before it
 /// writes and `apk`'s fetcher asks of its temp file after it does.
 ///
-/// A real truncate would rewrite the tail block and the inode size; this
-/// kernel's writers already grow the file as they write and `O_TRUNC`
-/// handles the empty-out case at open, so the honest minimum here is the
-/// descriptor check plus success: the callers' next act is to write over
-/// whatever prefix they cared about, and nothing they do afterwards reads
-/// the difference. The fd is validated because that error is the one the
-/// caller can actually branch on.
+/// The resize is real, and has to be: a shorter file keeps no tail. A writer
+/// that only overwrites from the front - and `O_TRUNC` that only forgets to
+/// matter - leaves the new bytes followed by whatever the old file had that
+/// the new one does not, which is a corrupt file nothing complains about.
 pub(super) fn ftruncate(args: [usize; ARG_COUNT]) -> isize {
-    if let Err(e) = crate::sched::current_fds().clone_at(args[0] as i32) {
-        return err_of(e);
+    let length = args[1] as isize;
+    if length < 0 {
+        return err::EINVAL;
     }
-    0
+    let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    // Linux refuses to resize anything but a regular file, and `EINVAL` is
+    // what a caller reads as "this descriptor is not that": a pipe, a
+    // terminal, a socket.
+    if file.metadata().kind != NodeKind::File {
+        return err::EINVAL;
+    }
+    match file.inode().truncate(length as u64) {
+        Ok(()) => 0,
+        Err(e) => err_of(e),
+    }
 }
 
 /// `truncate(path, length)` - `ftruncate` by name instead of descriptor.
-/// The path is resolved because ENOENT is the error a caller expects from a
-/// missing file; the size change itself is not kept, for the same reasons
-/// [`ftruncate`] gives.
 pub(super) fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let length = args[1] as isize;
+    if length < 0 {
+        return err::EINVAL;
+    }
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
-    match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
-        Ok(_) => 0,
+    let inode = match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
+        Ok(inode) => inode,
+        Err(e) => return err_of(e),
+    };
+    match inode.truncate(length as u64) {
+        Ok(()) => 0,
         Err(e) => err_of(e),
     }
 }
@@ -502,16 +554,25 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         Ok(d) => d,
         Err(e) => return err_of(e),
     };
-    let (parent_dir, name) = match new_path.rsplit_once('/') {
-        Some((parent, name)) => (if parent.is_empty() { "/" } else { parent }, name),
-        None => ("/", new_path.as_str()),
+    // Where the new name goes. A path with a slash names its own parent; a
+    // bare name has none, and the directory it is created in is the one the
+    // caller pointed at - `newdirfd`, or the cwd when that is `AT_FDCWD`.
+    // Treating a bare name as rooted at `/` is what put apk's fetched index in
+    // the root directory: `renameat(dfd, "INDEX.part", dfd, "INDEX")` created
+    // `/INDEX` instead of `/var/cache/apk/INDEX`, and the next `apk update`
+    // could not find the index it had already downloaded.
+    let (dir, name) = match new_path.rsplit_once('/') {
+        Some((parent, name)) => {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            match crate::vfs::resolve_opt(parent, Some(new_base.clone())) {
+                Ok(d) => (d, alloc::string::String::from(name)),
+                Err(e) => return err_of(e),
+            }
+        }
+        None => (new_base.clone(), new_path.clone()),
     };
-    let dir = match crate::vfs::resolve_opt(parent_dir, Some(new_base.clone())) {
-        Ok(d) => d,
-        Err(e) => return err_of(e),
-    };
-    let inode = match dir.create(name, NodeKind::File) {
-        Ok(inode) => inode,
+    let (inode, replacing) = match dir.create(&name, NodeKind::File) {
+        Ok(inode) => (inode, false),
         // Renaming onto an existing file replaces it - unless the caller
         // asked for NOREPLACE, which is the one flag that protects the name.
         Err(crate::vfs::VfsError::Exists) => {
@@ -519,12 +580,25 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
                 return err::EEXIST;
             }
             match crate::vfs::resolve_opt(&new_path, Some(new_base)) {
-                Ok(inode) => inode,
+                Ok(inode) => (inode, true),
                 Err(e) => return err_of(e),
             }
         }
         Err(e) => return err_of(e),
     };
+    // Replacing means replacing: the name ends up on a file whose contents
+    // are the source's, and *only* the source's. Writing over the target from
+    // offset zero would leave whatever tail was longer than the source, so
+    // the file would be the source followed by the old file's leftovers - and
+    // a plain `rename` over a longer name is the ordinary way a cache, a log
+    // or a download directory replaces what it had.
+    //
+    // Only when there was something there to replace: a name that was just
+    // created is already empty, and filesystems are not obliged to offer a
+    // resize at all.
+    if replacing && let Err(e) = inode.truncate(0) {
+        return err_of(e);
+    }
     if crate::vfs::File::new(inode).write(&data).is_err() {
         return err::ENOSPC;
     }
@@ -686,10 +760,66 @@ const POLLNVAL: i16 = 0x020;
 /// through the node's own wakeup list, so the arrival that ends the wait is
 /// the same arrival that would have ended a blocking read.
 ///
-/// A negative timeout waits forever; zero does not wait at all; anything else
-/// is milliseconds, rounded up to a clock tick.
+/// `poll` and `ppoll` are the same wait in different clocks, and the difference
+/// is not cosmetic: `poll`'s timeout is a millisecond count and a negative one
+/// means "forever", while `ppoll`'s is a `struct timespec *` and a null one
+/// means the same. Read a pointer as a count and the wait is measured in
+/// centuries - which is exactly the hang this split fixes, because `ppoll` is
+/// the call rustix makes and therefore the call every Rust program here makes.
 pub(super) fn poll(args: [usize; ARG_COUNT]) -> isize {
-    let (fds, nfds, timeout_ms) = (args[0], args[1], args[2] as i64);
+    let timeout_ms = args[2] as i64;
+    let deadline = (timeout_ms >= 0).then(|| deadline_in_ticks(timeout_ms as u64));
+    poll_wait(args, deadline)
+}
+
+/// `ppoll(fds, nfds, timeout, sigmask, sigsetsize)`.
+///
+/// The signal mask is ignored: this kernel delivers signals on the way out of
+/// a syscall rather than by interrupting one, so there is nothing for a
+/// temporary mask to hold back.
+pub(super) fn ppoll(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let deadline = match ppoll_deadline(args[2], from_user) {
+        Ok(deadline) => deadline,
+        Err(e) => return e,
+    };
+    poll_wait(args, deadline)
+}
+
+/// The instant a `ppoll` timeout names. `Ok(None)` is "wait forever", which is
+/// what a null pointer asks for.
+fn ppoll_deadline(tsp: usize, from_user: bool) -> Result<Option<u64>, isize> {
+    if tsp == 0 {
+        return Ok(None);
+    }
+    if !buffer_ok(tsp, 16, false, from_user) {
+        return Err(err::EFAULT);
+    }
+    let (sec, nsec) = unsafe {
+        let at = |offset: usize| (tsp + offset) as *const u64;
+        (at(0).read_volatile(), at(8).read_volatile())
+    };
+    if nsec >= 1_000_000_000 {
+        return Err(err::EINVAL);
+    }
+    // A deadline further out than this is a clock that has gone wrong, not a
+    // request; Linux clamps instead of refusing, and so does the arithmetic
+    // here - the tick count saturates rather than wrapping into the past.
+    let ms = sec
+        .saturating_mul(1000)
+        .saturating_add(nsec.div_ceil(1_000_000));
+    Ok(Some(deadline_in_ticks(ms)))
+}
+
+/// `ms` from now, in ticks.
+fn deadline_in_ticks(ms: u64) -> u64 {
+    let ticks = ms.saturating_mul(crate::arch::timer::TICK_HZ as u64) / 1000;
+    crate::arch::timer::ticks().saturating_add(ticks)
+}
+
+/// The wait [`poll`] and [`ppoll`] are both made of, with the timeout already
+/// turned into the instant it names.
+fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
+    let (fds, nfds) = (args[0], args[1]);
     if nfds == 0 {
         return 0;
     }
@@ -719,13 +849,6 @@ pub(super) fn poll(args: [usize; ARG_COUNT]) -> isize {
         }
         nodes.push(node);
     }
-
-    let deadline = if timeout_ms < 0 {
-        None
-    } else {
-        let ticks = timeout_ms as u64 * crate::arch::timer::TICK_HZ as u64 / 1000;
-        Some(crate::arch::timer::ticks() + ticks)
-    };
 
     let ready = loop {
         let count = check_ready(fds, &nodes);
@@ -819,7 +942,28 @@ fn watch_ready(watch: &SelectWatch) -> (bool, bool) {
 ///
 /// The except set is validated and cleared but never answered: it reports
 /// out-of-band data, and nothing here generates any.
+/// `pselect6(2)` — `select` with a nanosecond timeout and a signal mask.
+///
+/// The sixth argument is a signal mask Linux swaps in atomically for the
+/// duration of the wait. Nothing here runs a handler during a wait, and a
+/// single-threaded caller cannot have one delivered either, so the mask is
+/// read for validity and not acted on: the wait is the same wait.
+pub(super) fn pselect6(args: [usize; ARG_COUNT]) -> isize {
+    // A mask pointer that is not null names a `sigset_t`; the size word
+    // musl passes alongside is not in this call's arguments.
+    select_inner(args, true)
+}
+
+/// `select(2)` — the microsecond-timeout original.
 pub(super) fn select(args: [usize; ARG_COUNT]) -> isize {
+    select_inner(args, false)
+}
+
+/// The whole of `select`, with `timespec` selecting which shape `args[4]`
+/// points at: `pselect6` hands a `timespec` (nanoseconds), `select` a
+/// `timeval` (microseconds). Everything else - the sets, the wait, the
+/// write-back - is one behaviour, so they share it rather than repeat it.
+fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
     let (nfds_arg, readfds, writefds, exceptfds, tvp) =
         (args[0], args[1], args[2], args[3], args[4]);
     if (nfds_arg as i64) < 0 || nfds_arg > FD_SETSIZE {
@@ -883,16 +1027,22 @@ pub(super) fn select(args: [usize; ARG_COUNT]) -> isize {
     let deadline = if tvp == 0 {
         None
     } else {
-        let (sec, usec) = unsafe {
+        // Both shapes lead with seconds and follow with a sub-second field:
+        // microseconds for `select`, nanoseconds for `pselect6`. The field
+        // is validated against its own unit before it is folded into
+        // milliseconds, which is the resolution the wait below works in.
+        let (sec, frac) = unsafe {
             let at = |offset: usize| (tvp + offset) as *const u64;
             (at(0).read_volatile(), at(8).read_volatile())
         };
-        if sec >= (1 << 43) || usec >= 1_000_000 {
-            // Beyond a few centuries, or not microseconds: a corrupted
-            // timeval. Linux clamps; a bounded answer beats wrapping.
+        let unit = if timespec { 1_000_000 } else { 1_000 };
+        if sec >= (1 << 43) || frac >= unit * 1_000 {
+            // Beyond a few centuries, or a sub-second field that does not
+            // fit its unit: a corrupted timeout. Linux clamps; a bounded
+            // answer beats wrapping.
             return err::EINVAL;
         }
-        let ms = sec * 1000 + usec.div_ceil(1000);
+        let ms = sec * 1000 + frac.div_ceil(unit);
         let ticks = ms * crate::arch::timer::TICK_HZ as u64 / 1000;
         Some(crate::arch::timer::ticks() + ticks)
     };
@@ -1329,7 +1479,13 @@ pub(super) fn handle_fchdir(args: [usize; ARG_COUNT]) -> isize {
         return err::ENOTDIR;
     }
     let inode = file.inode();
-    let path = path_of(&inode).unwrap_or_else(|| alloc::string::String::from("/"));
+    // The name the description was opened by is exact; the search is only for
+    // a directory arrived at some other way - an inherited descriptor, or one
+    // opened before names were recorded at all.
+    let path = file
+        .label()
+        .or_else(|| path_of(&inode))
+        .unwrap_or_else(|| alloc::string::String::from("/"));
     adopt_cwd(inode, path);
     0
 }
@@ -1580,15 +1736,24 @@ pub(super) fn handle_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     total
 }
 
-/// Walk `/` looking for the path that reaches `target`. Used by `fchdir` to
-/// give the new cwd a name `getcwd` can read back.
+/// Walk `/` looking for a path that reaches `target` - the fallback `fchdir`
+/// uses for a directory whose descriptor never recorded a name.
+///
+/// The visit budget is the real bound, not the depth: a tree search that has
+/// looked at this many directories has left the region where an answer is
+/// plausible, and a caller waiting on `fchdir` is owed one either way.
 fn path_of(target: &Arc<dyn Inode>) -> Option<alloc::string::String> {
     use crate::vfs::NodeKind;
+
+    const MAX_DEPTH: usize = 16;
+    const MAX_VISITS: usize = 4096;
+
     fn walk(
         dir: &Arc<dyn Inode>,
         prefix: &str,
         target: &Arc<dyn Inode>,
         depth: usize,
+        visits: &mut usize,
     ) -> Option<alloc::string::String> {
         if Arc::ptr_eq(dir, target) {
             return Some(alloc::string::String::from(prefix));
@@ -1597,16 +1762,23 @@ fn path_of(target: &Arc<dyn Inode>) -> Option<alloc::string::String> {
             return None;
         }
         for (name, kind) in dir.read_dir().ok()? {
-            if kind != NodeKind::Dir {
+            // `.` and `..` lead back to directories already on the path being
+            // built. Following them spends the whole depth budget on a name
+            // like `/./././etc`, which is how this search used to fail.
+            if kind != NodeKind::Dir || name == "." || name == ".." {
                 continue;
             }
+            if *visits == 0 {
+                return None;
+            }
+            *visits -= 1;
             let child = if prefix == "/" {
                 alloc::format!("/{name}")
             } else {
                 alloc::format!("{prefix}/{name}")
             };
             if let Ok(inode) = crate::vfs::resolve(&child)
-                && let Some(found) = walk(&inode, &child, target, depth - 1)
+                && let Some(found) = walk(&inode, &child, target, depth - 1, visits)
             {
                 return Some(found);
             }
@@ -1614,7 +1786,8 @@ fn path_of(target: &Arc<dyn Inode>) -> Option<alloc::string::String> {
         None
     }
     let root = crate::vfs::global().root_inode();
-    walk(&root, "/", target, 16)
+    let mut visits = MAX_VISITS;
+    walk(&root, "/", target, MAX_DEPTH, &mut visits)
 }
 
 /// Record the cwd inode + path together, so `getcwd` reads back the path
@@ -1622,4 +1795,235 @@ fn path_of(target: &Arc<dyn Inode>) -> Option<alloc::string::String> {
 fn adopt_cwd(dir: Arc<dyn Inode>, path: alloc::string::String) {
     crate::sched::set_cwd(dir);
     crate::sched::set_cwd_path(path);
+}
+
+// ---------------------------------------------------------------------------
+// The calls an ordinary libc reaches for
+// ---------------------------------------------------------------------------
+
+/// Run `body` with `fd`'s position moved to `offset`, and put the position
+/// back whatever happens.
+///
+/// The offset read/write pair is `read`/`write` at a position the caller
+/// names instead of the one the descriptor carries - which is why it does
+/// not disturb that position: a `pread` between two `read`s must leave the
+/// second one where the first left off. Restoring on every path, error
+/// included, is the whole of the promise.
+fn at_position<R>(fd: i32, offset: i64, body: impl FnOnce() -> R) -> R {
+    let file = crate::sched::current_fds().clone_at(fd);
+    let saved = file.as_ref().map(|f| f.pos()).ok();
+    if let (Ok(file), Ok(offset)) = (&file, u64::try_from(offset)) {
+        file.set_pos(offset);
+    }
+    let result = body();
+    if let (Ok(file), Some(pos)) = (&file, saved) {
+        file.set_pos(pos);
+    }
+    result
+}
+
+/// `pread64(fd, buf, count, offset)` — read at a position without moving it.
+pub(super) fn handle_pread64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, buf, len, offset) = (args[0] as i32, args[1], args[2], args[3] as i64);
+    // A negative offset is not a position; `EOVERFLOW`-shaped nonsense is
+    // still just `EINVAL` to the caller that wrote it.
+    if offset < 0 {
+        return err::EINVAL;
+    }
+    if !buffer_ok(buf, len, true, from_user) {
+        return if len > MAX_IO {
+            err::EINVAL
+        } else {
+            err::EFAULT
+        };
+    }
+    if !crate::sched::current_fds().clone_at(fd).is_ok() {
+        return err::EBADF;
+    }
+    at_position(fd, offset, || {
+        let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+        match crate::vfs::read(fd, bytes) {
+            Ok(n) => n as isize,
+            Err(e) => err_of(e),
+        }
+    })
+}
+
+/// `pwrite64(fd, buf, count, offset)` — write at a position without moving it.
+pub(super) fn handle_pwrite64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, buf, len, offset) = (args[0] as i32, args[1], args[2], args[3] as i64);
+    if offset < 0 {
+        return err::EINVAL;
+    }
+    if !buffer_ok(buf, len, false, from_user) {
+        return if len > MAX_IO {
+            err::EINVAL
+        } else {
+            err::EFAULT
+        };
+    }
+    if !crate::sched::current_fds().clone_at(fd).is_ok() {
+        return err::EBADF;
+    }
+    at_position(fd, offset, || {
+        let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+        match crate::vfs::write(fd, bytes) {
+            Ok(n) => n as isize,
+            Err(e) => err_of(e),
+        }
+    })
+}
+
+/// `preadv(fd, iov, iovcnt, offset)` / `pwritev`: the vectored pair at a
+/// position. Same position discipline as the scalar pair, same loop as
+/// `readv`/`writev` - the offset is the only thing added.
+fn io_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool) -> isize {
+    let (fd, offset) = (args[0] as i32, args[3] as i64);
+    if offset < 0 {
+        return err::EINVAL;
+    }
+    if !crate::sched::current_fds().clone_at(fd).is_ok() {
+        return err::EBADF;
+    }
+    at_position(fd, offset, || {
+        if writing {
+            handle_writev(args, from_user)
+        } else {
+            handle_readv(args, from_user)
+        }
+    })
+}
+
+/// `preadv(2)` — vectored read at a position.
+pub(super) fn handle_preadv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    io_at_position(args, from_user, false)
+}
+
+/// `pwritev(2)` — vectored write at a position.
+pub(super) fn handle_pwritev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    io_at_position(args, from_user, true)
+}
+
+/// `fsync(fd)` / `fdatasync(fd)` — flush a descriptor to its storage.
+///
+/// Every write here already reached its storage, so there is nothing to
+/// flush: ramfs and ext2 write through, and a socket has no storage at all.
+/// What the call still owes the caller is the argument check - and Linux
+/// answers `EINVAL` for a descriptor bound to something that cannot be
+/// synchronized, which is a pipe, a terminal or a socket.
+pub(super) fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
+    let fd = args[0] as i32;
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    match file.metadata().kind {
+        NodeKind::File | NodeKind::Dir | NodeKind::Symlink => 0,
+        NodeKind::CharDev => err::EINVAL,
+    }
+}
+
+/// `chmod(2)` / `fchmod(2)` — set permission bits.
+///
+/// There is one user and no permission checks anywhere in this kernel, so
+/// every mode is satisfiable and the call is a shape check: the descriptor
+/// or the path has to exist. The bits are not remembered, which is the same
+/// answer a caller gets on a filesystem mounted without them.
+pub(super) fn handle_chmod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let (path, _mode) = (args[0], args[1]);
+    let path = match cstr_arg(path, true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `fchmod(2)` — the same, by descriptor.
+pub(super) fn handle_fchmod(args: [usize; ARG_COUNT]) -> isize {
+    match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `chown(2)` / `fchown(2)` — set owner and group. One user, no groups:
+/// the call is accepted for anything that exists, as `chmod` is.
+pub(super) fn handle_chown(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let path = match cstr_arg(args[0], true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `fchown(2)` — the same, by descriptor.
+pub(super) fn handle_fchown(args: [usize; ARG_COUNT]) -> isize {
+    match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)` — a second name
+/// for one inode.
+///
+/// The VFS has no link count: every node has one name, and `unlink` drops
+/// the node with it. Linux answers `EPERM` when the filesystem does not
+/// support hard links, which is exactly this, so a caller's fallback -
+/// copy the file - is what it would do on a filesystem that cannot link.
+pub(super) fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let old_base = match base_of(args[0] as i32, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let old_path = match cstr_arg(args[1], true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_base = match base_of(args[2] as i32, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let new_path = match cstr_arg(args[3], true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // Both names have to exist as paths for the request to be a request:
+    // a link to a missing file is ENOENT, not EPERM.
+    if crate::vfs::resolve_opt(&old_path, Some(old_base)).is_err() {
+        return err::ENOENT;
+    }
+    let _ = (new_base, new_path);
+    err::EPERM
+}
+
+/// `mknod(path, mode, dev)` — create a device or FIFO node.
+///
+/// There are no device nodes to create outside devfs, and a caller without
+/// CAP_MKNOD gets `EPERM` for it on Linux too.
+pub(super) fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let path = match cstr_arg(args[0], true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let _ = (path, cwd);
+    err::EPERM
+}
+
+/// `fadvise64(fd, offset, len, advice)` — a hint about coming access.
+///
+/// Nothing here reads ahead or caches evictable pages, so every advice is
+/// accepted and does nothing - which is what Linux does for the advices it
+/// does not act on. The descriptor still has to be real.
+pub(super) fn handle_fadvise64(args: [usize; ARG_COUNT]) -> isize {
+    match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
 }

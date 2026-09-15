@@ -53,6 +53,16 @@ impl BlockDev for VirtioBlk {
             "virtio-blk read {offset:#x}+{} breaks the sector contract",
             buf.len()
         );
+        // The device answers an out-of-range request with a bare I/O error
+        // that says nothing about which part of it was wrong. Refuse it here,
+        // where the window is still visible.
+        let first = offset / SECTOR;
+        let count = buf.len() as u64 / SECTOR;
+        assert!(
+            first + count <= self.sectors,
+            "virtio-blk read of {count} sectors at {first} runs past the {}-sector device",
+            self.sectors
+        );
         critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
             device

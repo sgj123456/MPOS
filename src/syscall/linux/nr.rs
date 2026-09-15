@@ -150,6 +150,57 @@ pub const PPOLL: u64 = 271;
 pub const SCHED_YIELD: u64 = 24; // sched_yield(2)
 pub const CLEANUP_AFTER_KTHREAD: u64 = 999;
 
+// --- the calls a real libc reaches for that were missing -------------------
+//
+// Each number below is the x86_64 one from the syscall table. The list is
+// what an ordinary static musl binary asks for across a `apk update`: the
+// offset read/write pair, the metadata setters, the wall clock, `waitid` and
+// the resource reports. They are here because the answer to each used to be
+// ENOSYS, which turns a program's ordinary control flow into an error path.
+pub const PREAD64: u64 = 17;
+pub const PWRITE64: u64 = 18;
+pub const PREADV: u64 = 295;
+pub const PWRITEV: u64 = 296;
+/// `fsync(2)` / `fdatasync(2)`: flush a descriptor's dirty data.
+pub const FSYNC: u64 = 74;
+pub const FDATASYNC: u64 = 75;
+pub const CHMOD: u64 = 90;
+pub const FCHMOD: u64 = 91;
+pub const CHOWN: u64 = 92;
+pub const FCHOWN: u64 = 93;
+/// `mknod(2)`: create a filesystem node. mpos has no device nodes.
+pub const MKNOD: u64 = 133;
+/// `link(2)` / `linkat(2)`: a second name for an inode.
+pub const LINK: u64 = 86;
+pub const LINKAT: u64 = 265;
+/// `time(2)`: seconds since the epoch, the original spelling of the clock.
+pub const TIME: u64 = 201;
+/// `times(2)`: this process's CPU time, in clock ticks.
+pub const TIMES: u64 = 100;
+/// `getrusage(2)`: resource use for self or for reaped children.
+pub const GETRUSAGE: u64 = 98;
+/// `clock_getres(2)`: the resolution a clock can actually deliver.
+pub const CLOCK_GETRES: u64 = 229;
+/// `waitid(2)`: the modern wait - one child, named by id type, with an
+/// `siginfo_t` instead of a bare status word.
+pub const WAITID: u64 = 247;
+/// The legacy rlimit pair; `prlimit64` is the one musl prefers, but old
+/// binaries and busybox applets still ask by these numbers.
+pub const GETRLIMIT: u64 = 160;
+pub const SETRLIMIT: u64 = 161;
+/// `pselect6(2)`: `select` with a signal mask and a nanosecond timeout.
+pub const PSELECT6: u64 = 270;
+/// `fadvise64(2)`: a hint about future access. Nothing here prefetches, so
+/// every advice is accepted and ignored - which is what Linux does for the
+/// advice it does not act on.
+pub const FADVISE64: u64 = 221;
+/// `get_robust_list(2)`: the read half of the robust-futex list. Threads
+/// are not implemented, so there is no list to hand back.
+pub const GET_ROBUST_LIST: u64 = 274;
+/// `membarrier(2)`: a memory barrier across the machine. Single core, so
+/// the barrier is what a compiler fence already gives.
+pub const MEMBARRIER: u64 = 324;
+
 // `clone(2)` flag bits, as the Linux x86_64 ABI numbers them. Each one names a
 // part of the caller that the child **shares** instead of copying; a zero flag
 // word is therefore plain `fork`.

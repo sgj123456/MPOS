@@ -30,6 +30,10 @@ pub mod mm;
 /// its tests are the conformance programs that run on the machine.
 #[cfg(target_os = "none")]
 pub mod net;
+/// The kernel's random source, which `/dev/urandom` and `getrandom(2)` both
+/// read. Not target-gated: it runs on the host so its tests can prove the one
+/// property that matters - that two reads are not the same bytes.
+pub mod rand;
 pub mod sched;
 pub mod sync;
 pub mod syscall;

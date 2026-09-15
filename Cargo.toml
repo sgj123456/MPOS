@@ -1,3 +1,15 @@
+# One workspace for the whole system: the kernel and every program that runs
+# on it. The kernel stays the root package, so the plain `cargo build`,
+# `cargo test` and `cargo clippy` the scripts have always run keep meaning
+# "the kernel" - `default-members` says so explicitly, because a workspace
+# without it would build the user programs for the host too, and they are
+# built for musl.
+[workspace]
+members = ["user"]
+# "." is the kernel - the root package, which is a member without being
+# listed in `members`.
+default-members = ["."]
+
 [package]
 name = "mpos"
 version = "0.1.0"
@@ -17,6 +29,14 @@ bitflags = "2.13"
 # unit tests) and in the kernel, so this is also not target-gated.
 elf = { version = "0.8", default-features = false, features = ["alloc"] }
 virtio-drivers = "0.13"
+
+# The kernel's random source: a ChaCha20 stream, which `/dev/urandom` and
+# `getrandom(2)` both draw from. The pure-Rust implementation is used rather
+# than a hand-written cipher - this is the one place in the kernel where being
+# subtly wrong is invisible until it is a security bug. `no_std` at the default
+# feature set, and `rand_core` supplies the `SeedableRng`/`RngCore` traits.
+rand_chacha = { version = "0.9", default-features = false }
+rand_core = { version = "0.9", default-features = false }
 
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = { version = "1.2", features = ["restore-state-bool"] }
@@ -58,3 +78,8 @@ debug = 2
 [profile.release]
 panic = "abort"
 lto = "thin"
+# The user programs are built release even for a debug image, and a musl
+# binary carrying debug info runs to ~9 MB - four of which do not fit in the
+# ESP. Stripping costs nothing here: a conformance test either prints its
+# verdict or it does not, and nobody debugs it through a symbol table.
+strip = true

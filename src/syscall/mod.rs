@@ -81,6 +81,10 @@ pub mod err {
     pub const EADDRNOTAVAIL: isize = -99;
     /// ENETDOWN: the network interface is not up.
     pub const ENETDOWN: isize = -100;
+    /// ENETUNREACH: the network named is not reachable from here. What the
+    /// IPv6 stub answers at `connect`, so a caller walking a getaddrinfo
+    /// list falls through to the IPv4 answer the way Linux lets it.
+    pub const ENETUNREACH: isize = -101;
     /// ENOTCONN: the socket is not connected, and the call needs it to be.
     pub const ENOTCONN: isize = -107;
     /// EISCONN: the socket is already connected, and `connect` was asked again.
@@ -123,10 +127,7 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::NoSpace => err::ENOSPC,
         VfsError::FileTooBig => err::EFBIG,
         VfsError::BrokenPipe => err::EPIPE,
-        VfsError::Unsupported => {
-            crate::println!("DBG err_of Unsupported -> ENOSYS");
-            err::ENOSYS
-        }
+        VfsError::Unsupported => err::ENOSYS,
     }
 }
 

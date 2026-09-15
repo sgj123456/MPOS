@@ -999,8 +999,16 @@ const USER_LIMIT: usize = 1 << 47;
 /// copies of what the file held, and nothing tracks the file afterwards. That
 /// is the whole of `MAP_PRIVATE` for a reader, and it is what the dynamic
 /// linker needs - it maps a shared object read-only, parses it, and then
-/// `mprotect`s the pieces it wants writable. A writer's shared mapping is a
-/// different contract, and mpos does not keep one.
+/// `mprotect`s the pieces it wants writable.
+///
+/// `MAP_SHARED` is served by that same read-in whenever a file backs the
+/// mapping. A reader cannot tell the two apart - no write of its lands back
+/// in the file either way - and real programs reach for the shared spelling
+/// for plain reads: apk's index reader maps the fetched `APKINDEX` with
+/// `MAP_SHARED` and refuses the whole update when the kernel says that is
+/// unimplemented. Only the anonymous shape is refused, because that is the
+/// one whose contract - two processes watching each other's writes through
+/// shared frames - mpos genuinely does not keep.
 ///
 /// The address handling is Linux's, and two details of it are load-bearing for
 /// a real libc:
@@ -1029,13 +1037,12 @@ pub(super) fn handle_mmap(args: [usize; ARG_COUNT]) -> isize {
     if length == 0 {
         return err::EINVAL;
     }
-    // A shared mapping is one two processes would have to see the same frames
-    // through, which mpos does not do yet - whether the frames came from a
-    // file or from nothing.
-    if shared {
-        let ret = err::ENOSYS;
-        crate::println!("DBG mmap SHARED len={} fd={} ret={}", length, fd, ret);
-        return ret;
+    // A shared *anonymous* mapping is the one shape this kernel cannot keep:
+    // two processes seeing the same frames through. A shared *file* mapping
+    // for a reader is indistinguishable from the private read-in below, and
+    // apk's index reader depends on being served one.
+    if shared && anon {
+        return err::ENOSYS;
     }
 
     // What the mapping is filled from. The descriptor is ignored when the
@@ -1469,16 +1476,43 @@ pub(super) fn handle_sysinfo(args: [usize; ARG_COUNT]) -> isize {
 /// `clock_gettime(clk_id, tp)` — get time.
 ///
 /// `tp` points to a `struct timespec { tv_sec, tv_nsec }`.
+///
+/// Two clocks are distinguished the way Linux draws the line: the REALTIME
+/// family answers with wall time - the RTC's boot anchor plus the tick count -
+/// and everything monotonic answers with uptime alone. The distinction is the
+/// contract TLS libraries live on: certificate validity is checked against
+/// REALTIME and must see the calendar, while monotonic callers must never see
+/// that anchor jump under them.
 pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
+    const CLOCK_MONOTONIC: usize = 1;
+    const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+    const CLOCK_THREAD_CPUTIME_ID: usize = 3;
+    const CLOCK_MONOTONIC_RAW: usize = 4;
+    const CLOCK_MONOTONIC_COARSE: usize = 6;
+    const CLOCK_BOOTTIME: usize = 7;
     let (clk_id, tp) = (args[0], args[1]);
-    let _ = clk_id;
     if tp == 0 {
         return err::EFAULT;
     }
-    // Return a fixed time based on the timer tick count.
+    // Return the tick count, anchored to the RTC's wall time for the
+    // REALTIME clocks.
     let ticks = crate::arch::timer::ticks();
     let freq = crate::arch::timer::TICK_HZ as u64;
-    let secs = ticks / freq;
+    let monotonic = matches!(
+        clk_id,
+        CLOCK_MONOTONIC
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME
+    );
+    let wall = if monotonic {
+        0
+    } else {
+        crate::arch::rtc::boot_epoch()
+    };
+    let secs = wall + ticks / freq;
     let nsecs = (ticks % freq) * (1_000_000_000 / freq);
     unsafe {
         (tp as *mut i64).write_volatile(secs as i64);
@@ -1497,9 +1531,11 @@ pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
     if tv == 0 {
         return err::EFAULT;
     }
+    // gettimeofday has no monotonic variant - every caller wants the wall
+    // clock, so the RTC anchor rides along here unconditionally.
     let ticks = crate::arch::timer::ticks();
     let freq = crate::arch::timer::TICK_HZ as u64;
-    let secs = ticks / freq;
+    let secs = crate::arch::rtc::boot_epoch() + ticks / freq;
     let usecs = (ticks % freq) * (1_000_000 / freq);
     unsafe {
         (tv as *mut i64).write_volatile(secs as i64);
@@ -1539,9 +1575,12 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     0
 }
 
-/// `getrandom(buf, len, flags)` — fill buffer with random bytes.
+/// `getrandom(buf, len, flags)` — fill `buf` with random bytes.
 ///
-/// Uses the timer tick as a simple pseudo-random source.
+/// The same stream `/dev/urandom` reads from. `GRND_RANDOM` and
+/// `GRND_NONBLOCK` are accepted and ignored: there is one generator, it is
+/// always ready, and it never blocks - which is the behaviour both flags are
+/// asking about.
 pub(super) fn handle_getrandom(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (buf, len, _flags) = (args[0], args[1], args[2]);
     if len == 0 {
@@ -1550,19 +1589,10 @@ pub(super) fn handle_getrandom(args: [usize; ARG_COUNT], from_user: bool) -> isi
     if !buffer_ok(buf, len, true, from_user) {
         return err::EFAULT;
     }
-    let tick = crate::arch::timer::ticks();
-    // Simple PRNG: xorshift64 seeded from the tick counter.
-    let mut state = tick;
-    unsafe {
-        let dst = buf as *mut u8;
-        for i in 0..len {
-            // xorshift64
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            dst.add(i).write_volatile(state as u8);
-        }
-    }
+    // Filled straight into the caller's buffer: a kernel buffer here would be
+    // a heap allocation per call for a request that is usually 32 bytes.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+    crate::rand::fill(out);
     len as isize
 }
 
@@ -1659,4 +1689,269 @@ pub(super) fn handle_rseq(args: [usize; ARG_COUNT]) -> isize {
         return err::EINVAL;
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// The calls an ordinary libc reaches for
+// ---------------------------------------------------------------------------
+
+/// `time(tloc)` — seconds since the epoch.
+///
+/// The original spelling of the clock, and the one a program that only
+/// wants `now` still reaches for: `date(1)`, a TLS library's first sanity
+/// check, a log line. Same wall clock `clock_gettime(CLOCK_REALTIME)`
+/// answers - the RTC anchor plus uptime. `tloc`, when given, is written
+/// through as well as returned, which is the shape the man page specifies.
+pub(super) fn handle_time(args: [usize; ARG_COUNT]) -> isize {
+    let tloc = args[0];
+    let secs = crate::arch::rtc::boot_epoch()
+        + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64;
+    if tloc != 0 {
+        if !buffer_ok(tloc, 8, true, true) {
+            return err::EFAULT;
+        }
+        unsafe {
+            (tloc as *mut i64).write_volatile(secs as i64);
+        }
+    }
+    secs as isize
+}
+
+/// `times(buf)` — this process's CPU time, in clock ticks.
+///
+/// `struct tms { clock_t tms_utime, tms_stime, tms_cutime, tms_cstime; }`.
+/// This kernel does not account CPU time per task - a task runs whenever it
+/// is scheduled and nothing clocks it - so all four report zero, which is
+/// what a system with no accounting says. The returned value is the tick
+/// count since boot: elapsed time, the thing the call is also specified to
+/// hand back for a caller doing its own arithmetic.
+pub(super) fn handle_times(args: [usize; ARG_COUNT]) -> isize {
+    let buf = args[0];
+    if buf == 0 {
+        return crate::arch::timer::ticks() as isize;
+    }
+    if !buffer_ok(buf, 32, true, true) {
+        return err::EFAULT;
+    }
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, 32);
+    }
+    crate::arch::timer::ticks() as isize
+}
+
+/// `getrusage(who, usage)` — resource use for self or for reaped children.
+///
+/// `struct rusage` leads with two `timeval`s of CPU time and follows with
+/// fourteen `long` counters. None of it is measured here, so the struct is
+/// zeroed and handed back - an honest "nothing spent" rather than a number
+/// invented to look plausible. `RUSAGE_CHILDREN` is answered the same way.
+pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
+    const RUSAGE_SELF: usize = 0;
+    const RUSAGE_CHILDREN: usize = -1isize as usize;
+    const RUSAGE_SIZE: usize = 144; // 2 timevals + 14 longs
+    let (who, usage) = (args[0], args[1]);
+    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN {
+        return err::EINVAL;
+    }
+    if !buffer_ok(usage, RUSAGE_SIZE, true, true) {
+        return err::EFAULT;
+    }
+    unsafe {
+        core::ptr::write_bytes(usage as *mut u8, 0, RUSAGE_SIZE);
+    }
+    0
+}
+
+/// `clock_getres(clk_id, res)` — the resolution a clock can deliver.
+///
+/// `struct timespec { tv_sec, tv_nsec }`. The tick counter is the only
+/// source of time there is, so the honest resolution is one tick - a
+/// caller that asks is told what it will actually get, rather than the
+/// nanosecond a modern Linux advertises. An unknown clock id is `EINVAL`.
+pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
+    const CLOCK_REALTIME: usize = 0;
+    const CLOCK_MONOTONIC: usize = 1;
+    const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+    const CLOCK_THREAD_CPUTIME_ID: usize = 3;
+    const CLOCK_MONOTONIC_RAW: usize = 4;
+    const CLOCK_REALTIME_COARSE: usize = 5;
+    const CLOCK_MONOTONIC_COARSE: usize = 6;
+    const CLOCK_BOOTTIME: usize = 7;
+    let (clk_id, res) = (args[0], args[1]);
+    if !matches!(
+        clk_id,
+        CLOCK_REALTIME
+            | CLOCK_MONOTONIC
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_REALTIME_COARSE
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME
+    ) {
+        return err::EINVAL;
+    }
+    if res != 0 {
+        if !buffer_ok(res, 16, true, true) {
+            return err::EFAULT;
+        }
+        let hz = crate::arch::timer::TICK_HZ as u64;
+        unsafe {
+            (res as *mut i64).write_volatile(0);
+            ((res + 8) as *mut i64).write_volatile((1_000_000_000 / hz) as i64);
+        }
+    }
+    0
+}
+
+/// `waitid(idtype, id, infop, options, rusage)` — wait for one child and
+/// describe it as a `siginfo_t`.
+///
+/// The modern wait: instead of a pid and a packed status word, `WEXITED`
+/// and friends say which transitions count and the child arrives as an
+/// info record - `si_pid`, `si_status`, and a `si_code` saying whether it
+/// exited, was killed, or was stopped. `WNOHANG` answers zero with
+/// `si_pid` cleared when no child is ready, which is how a caller polls
+/// without blocking.
+pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
+    const P_ALL: usize = 0;
+    const P_PID: usize = 1;
+    const WNOHANG: usize = 1;
+    const WEXITED: usize = 4;
+    const SIGCHLD: i32 = 17;
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    /// `sizeof(siginfo_t)`: 128 bytes, the whole struct on x86_64.
+    const SIGINFO_BYTES: usize = 128;
+
+    let (idtype, _id, infop, options) = (args[0], args[1] as isize, args[2], args[3]);
+    if idtype != P_ALL && idtype != P_PID {
+        return err::EINVAL;
+    }
+    if !buffer_ok(infop, SIGINFO_BYTES, true, true) {
+        return err::EFAULT;
+    }
+    // Nothing asked for means nothing to report - not a blank wait.
+    if options & WEXITED == 0 {
+        unsafe {
+            core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
+        }
+        return 0;
+    }
+
+    let me = crate::sched::current();
+    let collected = crate::sched::poll_any_child(me);
+    let (pid, code) = match collected {
+        Some(found) => found,
+        None if options & WNOHANG != 0 => {
+            // A poll that found nobody: success, with si_pid cleared so the
+            // caller can tell "no child yet" from "this child".
+            unsafe {
+                core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
+            }
+            return 0;
+        }
+        None => {
+            // Blocking, so wait for somebody. `poll_any_child` already
+            // reported nobody ready; park until one of them finishes.
+            match crate::sched::wait_any_child(me) {
+                Some(found) => found,
+                None => return err::ECHILD,
+            }
+        }
+    };
+
+    let (si_code, status) = if code < 0 {
+        (CLD_KILLED, -code)
+    } else {
+        (CLD_EXITED, code)
+    };
+    unsafe {
+        core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
+        (infop as *mut i32).write_volatile(SIGCHLD); // si_signo
+        ((infop + 8) as *mut i32).write_volatile(si_code); // si_code
+        ((infop + 16) as *mut i32).write_volatile(pid.0 as i32); // si_pid
+        ((infop + 24) as *mut i32).write_volatile(status as i32); // si_status
+    }
+    0
+}
+
+/// The resource limits `prlimit64` answers, in the 32-bit-`rlim_t` structure
+/// the legacy pair uses. Same eight resources, same numbers: only the call
+/// that reports them is older.
+fn rlimit_of(resource: usize, out: usize, from_user: bool) -> isize {
+    const RLIM_NLIMITS: usize = 16;
+    if resource >= RLIM_NLIMITS {
+        return err::EINVAL;
+    }
+    if out == 0 {
+        return 0;
+    }
+    if !buffer_ok(out, 16, true, from_user) {
+        return err::EFAULT;
+    }
+    let (cur, max): (u64, u64) = match resource {
+        3 => (8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_STACK
+        5 => (1024, 1_048_576),                  // RLIMIT_NOFILE
+        7 => (4096, 4096),                       // RLIMIT_NPROC
+        _ => (u64::MAX, u64::MAX),
+    };
+    unsafe {
+        (out as *mut u64).write_volatile(cur);
+        ((out + 8) as *mut u64).write_volatile(max);
+    }
+    0
+}
+
+/// `getrlimit(resource, rlim)` — read one resource limit.
+pub(super) fn handle_getrlimit(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    rlimit_of(args[0], args[1], from_user)
+}
+
+/// `setrlimit(resource, rlim)` — set one resource limit.
+///
+/// The limits are advisory answers, not enforced ones, so a set is accepted
+/// for any resource in range and changes nothing - the same contract
+/// `prlimit64` has had. Out-of-range is `EINVAL`, an unwritable pointer
+/// `EFAULT`.
+pub(super) fn handle_setrlimit(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const RLIM_NLIMITS: usize = 16;
+    let (resource, rlim) = (args[0], args[1]);
+    if resource >= RLIM_NLIMITS {
+        return err::EINVAL;
+    }
+    if rlim != 0 && !buffer_ok(rlim, 16, false, from_user) {
+        return err::EFAULT;
+    }
+    0
+}
+
+/// `membarrier(cmd, flags, cpu_id)` — a memory barrier across the machine.
+///
+/// One core, no preemption between a load and a store a user program could
+/// observe, so every command is already satisfied: the answer is success,
+/// the way Linux answers for commands it can carry out. An unknown command
+/// is `EINVAL`.
+pub(super) fn handle_membarrier(args: [usize; ARG_COUNT]) -> isize {
+    /// MEMBARRIER_CMD_QUERY and the two barriers a musl caller asks for.
+    const CMD_QUERY: usize = 0;
+    const CMD_GLOBAL: usize = 1;
+    const CMD_PRIVATE_EXPEDITED: usize = 8;
+    match args[0] {
+        CMD_QUERY => 0, // no flags are needed, so nothing is reported
+        CMD_GLOBAL | CMD_PRIVATE_EXPEDITED => 0,
+        _ => err::EINVAL,
+    }
+}
+
+/// `get_robust_list(pid, head, len)` — the read half of the robust-futex
+/// list.
+///
+/// Threads are not implemented, so no process has a list, and Linux
+/// answers `ENOSYS` for a kernel built without the call. The write half
+/// still accepts a registration, which is what a glibc that probes the
+/// pair needs to get past startup.
+pub(super) fn handle_get_robust_list(args: [usize; ARG_COUNT]) -> isize {
+    let _ = args;
+    err::ENOSYS
 }

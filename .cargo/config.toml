@@ -29,3 +29,17 @@ rustflags = [
     "-C", "link-arg=-ztext",
     "-C", "link-arg=-zmax-page-size=0x1000",
 ]
+
+# The user programs: ordinary Rust binaries for musl, which is the libc this
+# kernel's Linux ABI is written against. They are **statically** linked and
+# non-PIE because the loader has no PT_INTERP support and only accepts the
+# ET_EXEC shape - a dynamically linked or position-independent program is
+# refused before its first instruction, which is why the whole userland used
+# to be built by hand with rustc and these same flags.
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-no-pie",
+    "-C", "link-arg=-Wl,-z,norelro",
+]

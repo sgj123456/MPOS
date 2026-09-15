@@ -28,7 +28,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{RefCell, UnsafeCell};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use critical_section::Mutex;
 
@@ -49,10 +49,15 @@ use crate::vfs::file::{FdTable, File};
 /// collection, for the reason given in the module docs.
 pub const MAX_TASKS: usize = 64;
 
-/// Task stacks are `2^STACK_ORDER` pages. 16 KiB is what Linux gives a kernel
-/// thread, and it has to hold the trap frames that stack up above a task the
-/// clock preempted.
-pub const STACK_ORDER: usize = 2;
+/// Task stacks are `2^STACK_ORDER` pages. 64 KiB, because the kernel stack has
+/// to hold the trap frames that stack up above a task the clock preempted
+/// *and* whatever the deepest syscall path needs - and `execve` is by far the
+/// deepest: it reads a whole program image, hands it to a parser, and builds a
+/// new address space underneath all of that. A debug build's frames are large
+/// enough that 16 KiB - Linux's own figure, measured on optimised code - is
+/// not enough for it, and the symptom is the worst kind: the overflow eats the
+/// fault handler's own frame, so the machine triple-faults with nothing said.
+pub const STACK_ORDER: usize = 4;
 const STACK_SIZE: usize = PAGE_SIZE << STACK_ORDER;
 
 /// Written at the bottom of every stack, which is where a runaway task arrives
@@ -85,6 +90,11 @@ pub const INIT_PID: TaskId = TaskId(1);
 /// Permanent tasks: the boot task and the scheduler. Anything above this count
 /// is a task the tests started and have not finished reaping.
 const PERMANENT_TASKS: usize = 2;
+
+/// Tasks started as permanent since boot - see [`spawn_permanent`]. Kept apart
+/// from the constant because it changes at runtime, and [`permanent_tasks`] is
+/// the sum of the two.
+static PERMANENT_EXTRA: AtomicUsize = AtomicUsize::new(0);
 
 /// Set once [`init`] has built the table. Before that the clock still ticks but
 /// [`preempt`] has nothing to switch to and must leave the running code alone,
@@ -745,6 +755,17 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
     );
     let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
     let user_rsp = initial_stack_rsp(argv, env, "").ok_or(SpawnError::ArgsTooBig)?;
+    // Whether init has an interpreter depends on which init it is. The kernel
+    // used to start its own program, statically linked, when the initramfs was
+    // the root and no filesystem was up to read a loader from. The machine now
+    // hands over to the root filesystem's init - and on this userland that is
+    // a link to busybox, which is dynamically linked. Both cases are the same
+    // call: an image that names no interpreter reads none.
+    let interp_bytes = interpreter_bytes(&image)?;
+    let interp = match &interp_bytes {
+        Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
+        None => None,
+    };
 
     with_table(|t| {
         let slot = INIT_PID.0;
@@ -755,9 +776,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         drop_retired(INIT_PID);
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        // init is the kernel's own program and statically linked, so there is
-        // no interpreter to read: a filesystem is not even up yet.
-        let loaded = load_user(&mut space, &image, None);
+        let loaded = load_user(&mut space, &image, interp.as_ref());
         write_arg_block(
             loaded.stack_top,
             user_rsp,
@@ -842,17 +861,25 @@ pub fn try_spawn_user(
     );
     let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
     let user_rsp = initial_stack_rsp(argv, env, exe).ok_or(SpawnError::ArgsTooBig)?;
+    // The interpreter, found the same way `execve` finds it. This used to pass
+    // none, on the assumption that only `execve` starts dynamic programs -
+    // which held only while every program the kernel started itself was static.
+    // Alpine's userland is dynamically linked, so the shell the milestones hand
+    // the machine to is one of them, and a dynamic program started at its own
+    // entry point runs before its relocations are applied: the first call
+    // through the GOT jumps to nothing.
+    let interp_bytes = interpreter_bytes(&image)?;
+    let interp = match &interp_bytes {
+        Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
+        None => None,
+    };
 
     with_table(|t| {
         let slot = t.alloc_slot();
         drop_retired(TaskId(slot));
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        // Every caller of this reaches it with bytes it read from the
-        // filesystem itself, and none of them has a second path to read: the
-        // spawn sites in the kernel start static programs. A dynamic one
-        // arrives through `execve`, which does the interpreter lookup.
-        let loaded = load_user(&mut space, &image, None);
+        let loaded = load_user(&mut space, &image, interp.as_ref());
 
         let brk_base = image
             .segments
@@ -1216,6 +1243,32 @@ fn apply_rela(space: &AddressSpace, image: &Image<'_>) {
             }
         }
     }
+}
+
+/// The interpreter an image names, read from the filesystem - `None` when it
+/// names none.
+///
+/// A dynamically linked program does not run by itself: the kernel maps the
+/// loader it names, hands over `AT_BASE`, `AT_PHDR` and `AT_ENTRY` on the
+/// initial stack, and starts the loader instead of the program. Both of the
+/// ways a program starts need that - the `execve` that replaces one process
+/// with another, and the kernel's own spawn, which starts init and the shell
+/// the milestones test with - so the lookup lives here rather than in either
+/// of them.
+///
+/// The bytes come back unparsed because the parsed [`Image`] borrows from
+/// them; the caller keeps the bytes alive for as long as it holds the image.
+fn interpreter_bytes(image: &Image<'_>) -> Result<Option<Vec<u8>>, SpawnError> {
+    let Some(path) = &image.interp else {
+        return Ok(None);
+    };
+    let path = core::str::from_utf8(path).map_err(|_| SpawnError::NotExecutable)?;
+    // A missing or unreadable interpreter reads as "the file was not found":
+    // the program itself was fine, and what could not be followed is the path
+    // it names.
+    crate::vfs::read_file(path)
+        .map(Some)
+        .map_err(|_| SpawnError::NoInterpreter)
 }
 
 /// Lay out a program - and its interpreter, when it has one - in `space`, map
@@ -2275,8 +2328,23 @@ fn child_alive(t: &Table, parent: TaskId) -> bool {
     })
 }
 
-pub const fn permanent_tasks() -> usize {
-    PERMANENT_TASKS
+/// How many tasks are alive forever, and so are not something a `drain` should
+/// wait for: the boot task, the scheduler, and everything started as permanent.
+///
+/// The count has to move, not be a constant: the network service is a task that
+/// never exits and is started at a time of the boot code's choosing, and a
+/// `drain` that kept the old figure would wait on it forever.
+pub fn permanent_tasks() -> usize {
+    PERMANENT_TASKS + PERMANENT_EXTRA.load(Ordering::Relaxed)
+}
+
+/// Start a task that is meant to run for the machine's whole life, and count it
+/// as one. [`permanent_tasks`] is what tells the boot code's `drain` which
+/// tasks are never going to finish.
+pub fn spawn_permanent(f: impl FnOnce() + Send + 'static, priority: Priority) -> TaskId {
+    let id = spawn(f, priority);
+    PERMANENT_EXTRA.fetch_add(1, Ordering::Relaxed);
+    id
 }
 
 /// Called from the clock interrupt: the running task has used its slice.
@@ -2626,13 +2694,7 @@ pub fn exec_replace(
     // before it does. That is a path into the filesystem, and this is the only
     // place with both the path and the authority to follow it - which is why
     // the interpreter is read here rather than inside the loader.
-    let interp_bytes = match &image.interp {
-        Some(path) => {
-            let path = core::str::from_utf8(path).map_err(|_| SpawnError::NotExecutable)?;
-            Some(crate::vfs::read_file(path).map_err(|_| SpawnError::NoInterpreter)?)
-        }
-        None => None,
-    };
+    let interp_bytes = interpreter_bytes(&image)?;
     let interp = match &interp_bytes {
         Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
         None => None,
@@ -2840,7 +2902,6 @@ fn scheduler_loop() {
 /// `CLONE_VFORK` caller in practice (`posix_spawn`) waits on the child itself.
 pub fn clone(state: &UserContext, request: CloneRequest) -> isize {
     if request.flags & nr::CLONE_THREAD != 0 {
-        crate::println!("DBG clone CLONE_THREAD flags={:#x}", request.flags);
         return crate::syscall::err::ENOSYS;
     }
     spawn_copy(state, request)

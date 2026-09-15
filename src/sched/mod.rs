@@ -26,8 +26,8 @@ pub use runtime::{
     poll_any_child, preempt, protect_user, read_user, release_user_frames, reset_disposition,
     resolve_cow_fault, send_signal, send_signal_group, set_brk_base, set_current_blocked,
     set_current_tls, set_cwd, set_cwd_path, set_mmap_cursor, set_pgid, set_signal_action,
-    set_signal_alt_stack, signal_action, signal_alt_stack, sleep_ticks, spawn, spawn_user,
-    take_deliverable_signal, take_exit_code, take_fatal_signal, take_signal_in_set, task_count,
-    try_spawn_user, unmap_user, user_frame_at, user_range_free, wait_any_child, wait_for_interrupt,
-    wake, write_user, yield_now,
+    set_signal_alt_stack, signal_action, signal_alt_stack, sleep_ticks, spawn, spawn_permanent,
+    spawn_user, take_deliverable_signal, take_exit_code, take_fatal_signal, take_signal_in_set,
+    task_count, try_spawn_user, unmap_user, user_frame_at, user_range_free, wait_any_child,
+    wait_for_interrupt, wake, write_user, yield_now,
 };

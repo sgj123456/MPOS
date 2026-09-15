@@ -29,7 +29,7 @@ pub mod termios;
 pub mod tty;
 
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
-pub use mount::{global, mount, mount_root, resolve, resolve_at};
+pub use mount::{global, mount, mount_root, pivot_root, resolve, resolve_at, unmount};
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -158,6 +158,21 @@ pub trait Inode: Send + Sync {
         Err(VfsError::Unsupported)
     }
 
+    /// Resize the file to `len` bytes, the way `truncate(2)` means it: a
+    /// shorter file loses its tail, a longer one gains a hole that reads as
+    /// zeros, and the name keeps pointing at the same file either way.
+    ///
+    /// It is not a convenience. A writer that opens a name it has written
+    /// before - `wget -O page.html` over yesterday's page, `rename` replacing
+    /// a name that is already there - replaces the *contents*, and a writer
+    /// that can only overwrite from the front leaves whatever tail was longer
+    /// than the new data. The file is then corrupt in a way nothing reports:
+    /// the new bytes, followed by the old ones nobody overwrote.
+    fn truncate(&self, len: u64) -> VfsResult<()> {
+        let _ = len;
+        Err(VfsError::Unsupported)
+    }
+
     /// The tty this node is, if it is one.
     ///
     /// A device is more than the bytes it reads and writes: `TCGETS` and
@@ -165,6 +180,18 @@ pub trait Inode: Send + Sync {
     /// terminal by handing back the node it points at. Everything else is not
     /// a terminal, and the termios ioctls answer `ENOTTY` for it.
     fn as_tty(&self) -> Option<&crate::vfs::tty::Tty> {
+        None
+    }
+
+    /// The `socketpair` end this node is, if it is one.
+    ///
+    /// A descriptor that carries a connected stream has one operation a file
+    /// does not: `shutdown`, which closes one direction and leaves the other
+    /// running. It is the only way a program can say "that was all I had to
+    /// send" without also saying "stop reading", and the syscall layer has
+    /// nothing but an `Arc<dyn Inode>` to ask with. Same shape as [`Self::as_tty`],
+    /// for the same reason.
+    fn as_duplex(&self) -> Option<&crate::vfs::pipe::DuplexEnd> {
         None
     }
 

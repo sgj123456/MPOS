@@ -31,7 +31,7 @@ pub fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
 
 #[cfg(target_os = "none")]
 pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -> isize {
-    match nr {
+    let ret = match nr {
         // --- file I/O: Linux argument shapes ---
         nr::READ => fs::handle_read(args, from_user),
         nr::WRITE => fs::handle_write(args, from_user),
@@ -69,6 +69,10 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
             ],
             &cwd(),
         ),
+        // The *at spelling carries its own dirfds: (olddirfd, oldpath,
+        // newdirfd, newpath). apk renames its downloaded index into the
+        // cache with this form, dirfds and all.
+        nr::RENAMEAT => fs::renameat2([args[0], args[1], args[2], args[3], 0, 0], &cwd()),
         nr::MKDIRAT => fs::mkdirat(args, &cwd()),
         nr::RENAMEAT2 => fs::renameat2(args, &cwd()),
         nr::GETCWD => fs::handle_getcwd(args, from_user),
@@ -147,7 +151,12 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::MADVISE => 0, // stub: success
 
         // --- stubs ---
-        nr::POLL | nr::PPOLL => fs::poll(args),
+        // Two spellings of one wait, with timeouts that are *not* the same
+        // shape: `poll` takes a millisecond count, `ppoll` a `timespec *`.
+        // Sharing a handler between them reads a pointer as a count, and the
+        // wait then outlives the machine.
+        nr::POLL => fs::poll(args),
+        nr::PPOLL => fs::ppoll(args, from_user),
         nr::SELECT => fs::select(args),
         nr::UTIMENSAT => fs::utimensat(args, &cwd()),
         // `utimes(path, tv)` names no dirfd and carries a timeval struct -
@@ -178,17 +187,55 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::RSEQ => proc::handle_rseq(args),
         nr::CLEANUP_AFTER_KTHREAD => 0,
 
+        // --- the calls an ordinary libc reaches for ---
+        nr::PREAD64 => fs::handle_pread64(args, from_user),
+        nr::PWRITE64 => fs::handle_pwrite64(args, from_user),
+        nr::PREADV => fs::handle_preadv(args, from_user),
+        nr::PWRITEV => fs::handle_pwritev(args, from_user),
+        nr::FSYNC | nr::FDATASYNC => fs::handle_fsync(args),
+        nr::CHMOD => fs::handle_chmod(args, &cwd()),
+        nr::FCHMOD => fs::handle_fchmod(args),
+        nr::CHOWN => fs::handle_chown(args, &cwd()),
+        nr::FCHOWN => fs::handle_fchown(args),
+        // The legacy `link` names two paths; `linkat` names two dirfds and
+        // the paths under them, and is the shape the handler wants.
+        nr::LINK => fs::handle_linkat(
+            [
+                fs::AT_FDCWD as usize,
+                args[0],
+                fs::AT_FDCWD as usize,
+                args[1],
+                0,
+                0,
+            ],
+            &cwd(),
+        ),
+        nr::LINKAT => fs::handle_linkat(args, &cwd()),
+        nr::MKNOD => fs::handle_mknod(args, &cwd()),
+        nr::FADVISE64 => fs::handle_fadvise64(args),
+        nr::PSELECT6 => fs::pselect6(args),
+        nr::TIME => proc::handle_time(args),
+        nr::TIMES => proc::handle_times(args),
+        nr::GETRUSAGE => proc::handle_getrusage(args),
+        nr::CLOCK_GETRES => proc::handle_clock_getres(args),
+        nr::WAITID => proc::handle_waitid(args),
+        nr::GETRLIMIT => proc::handle_getrlimit(args, from_user),
+        nr::SETRLIMIT => proc::handle_setrlimit(args, from_user),
+        nr::MEMBARRIER => proc::handle_membarrier(args),
+        nr::GET_ROBUST_LIST => proc::handle_get_robust_list(args),
+
         _ => {
             // A call with no handler is worth saying out loud - once. A libc
             // probes for optional calls by number and treats ENOSYS as "not
             // available", which is a legitimate answer; what is not
-            // legitimate is never finding out that something is missing. Each
-            // number is reported the first time and never again, so a program
-            // in a loop cannot bury the log.
-            note_missing(nr);
+            // legitimate is never finding out that something is missing.
             super::err::ENOSYS
         }
+    };
+    if ret == super::err::ENOSYS {
+        note_enosys(nr);
     }
+    ret
 }
 
 use super::err;
@@ -200,22 +247,29 @@ const ARCH_GET_FS: usize = 0x1003;
 const ARCH_GET_GS: usize = 0x1004;
 const MSR_GS_BASE: u32 = 0xC000_0101;
 
-/// One bit per syscall number, set the first time a call is seen with no
-/// handler. Four words cover 0..=255, which is every number this kernel
-/// answers to; anything above that is not a call it has ever been asked for,
-/// and reporting it every time would be a log flood rather than a signal.
+/// One bit per syscall number, set the first time the call answers ENOSYS.
+/// Four words cover 0..=255, which is every number this kernel answers to;
+/// anything above that is not a call it has ever been asked for, and
+/// reporting it every time would be a log flood rather than a signal.
 static MISSING_CALLS: [core::sync::atomic::AtomicU64; 4] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Record a call with no handler, printing it the first time only.
-fn note_missing(nr: u64) {
+/// Record that `nr` answered ENOSYS, printing it the first time only.
+///
+/// Two ways to get here, and the log does not distinguish them because a
+/// caller cannot: a number with no handler at all, and a handler that
+/// refuses what it was asked - `clone(CLONE_THREAD)`, `mmap` with a shared
+/// anonymous mapping. Both are a program being told this kernel will not do
+/// that, which is worth saying once and not once per call: a libc in a
+/// startup loop asks for the same thing dozens of times.
+fn note_enosys(nr: u64) {
     use core::sync::atomic::Ordering;
     let Some(word) = MISSING_CALLS.get((nr / 64) as usize) else {
         return;
     };
     let mask = 1u64 << (nr % 64);
     if word.fetch_or(mask, Ordering::Relaxed) & mask == 0 {
-        crate::print!("mpos: no handler for syscall {nr}\n");
+        crate::print!("mpos: syscall {nr} -> ENOSYS\n");
     }
 }
 

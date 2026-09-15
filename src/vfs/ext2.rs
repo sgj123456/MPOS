@@ -24,6 +24,7 @@
 //! checks (there is no identity to check against) and timestamps (preserved
 //! when an inode is rewritten, never updated).
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -47,10 +48,19 @@ const DIRECT_BLOCKS: usize = 12;
 const INODE_PARSED: usize = 104;
 const FT_REG: u8 = 1;
 const FT_DIR: u8 = 2;
+const FT_CHRDEV: u8 = 3;
+const FT_SYMLINK: u8 = 7;
 const S_IFMT: u16 = 0xf000;
 const S_IFREG: u16 = 0x8000;
 const S_IFDIR: u16 = 0x4000;
+const S_IFLNK: u16 = 0xa000;
 const S_IFCHR: u16 = 0x2000;
+/// The most a "fast" symbolic link can hold: the target lives in the fifteen
+/// four-byte block pointers, so the format's own ceiling is 60 bytes. Alpine's
+/// userland is built almost entirely out of links shorter than that -
+/// `/bin/sh -> /bin/busybox` is twelve - so the fast form is the common one,
+/// not an optimisation.
+const FAST_SYMLINK_MAX: u32 = 60;
 const INCOMPAT_FILETYPE: u32 = 1 << 1;
 /// The directory is htree-indexed: a format this driver does not walk.
 const INODE_INDEX_FL: u32 = 1 << 12;
@@ -191,8 +201,25 @@ impl InodeData {
         match self.mode & S_IFMT {
             S_IFDIR => NodeKind::Dir,
             S_IFCHR => NodeKind::CharDev,
+            // A link is a node in its own right, not a file that happens to
+            // hold text: resolution treats it as a name to follow, and the
+            // fifteen block pointers hold its target rather than data.
+            S_IFLNK => NodeKind::Symlink,
+            // Regular files, and the node types this kernel has no use for -
+            // fifos, sockets, block devices - which read as plain files until
+            // something opens one and finds out otherwise.
             _ => NodeKind::File,
         }
+    }
+
+    /// Whether the target of a symbolic link lives inside the inode itself.
+    ///
+    /// The format's rule: a link that fits in the block-pointer area is stored
+    /// there and has no blocks allocated, which is exactly what `i_blocks == 0`
+    /// says. A longer target is written into data blocks like a file's, and
+    /// `i_blocks` counts them.
+    fn is_fast_symlink(&self) -> bool {
+        self.size <= FAST_SYMLINK_MAX && self.blocks == 0
     }
 }
 
@@ -238,6 +265,7 @@ struct Core {
     sb: Super,
     groups: u32,
     cache: Mutex<RefCell<Cache>>,
+    inodes: Mutex<RefCell<BTreeMap<u32, Arc<dyn Inode>>>>,
 }
 
 impl Core {
@@ -254,6 +282,7 @@ impl Core {
             sb,
             groups,
             cache: Mutex::new(RefCell::new(Cache::new(block_size))),
+            inodes: Mutex::new(RefCell::new(BTreeMap::new())),
         })
     }
 
@@ -271,6 +300,15 @@ impl Core {
             dst.len(),
             off,
             block
+        );
+        // A block number at or past the end of the filesystem is what a
+        // misextracted pointer looks like, and the device below answers it
+        // with an I/O error that names nothing. Refuse it here, where the
+        // number still has an identity.
+        assert!(
+            block < self.sb.blocks_count as u64,
+            "ext2 block {block} is past the end of the filesystem ({} blocks)",
+            self.sb.blocks_count
         );
         critical_section::with(|cs| {
             let mut cache = self.cache.borrow(cs).borrow_mut();
@@ -660,6 +698,8 @@ impl Core {
                 };
                 let kind = match ftype {
                     FT_DIR => NodeKind::Dir,
+                    FT_SYMLINK => NodeKind::Symlink,
+                    FT_CHRDEV => NodeKind::CharDev,
                     _ => NodeKind::File,
                 };
                 found.push((String::from(name), kind));
@@ -721,7 +761,6 @@ impl Core {
 
     fn dir_writable(&self, dir: &InodeData) -> VfsResult<()> {
         if dir.flags & INODE_INDEX_FL != 0 {
-            crate::println!("DBG ext2 dir_writable flags={:#x}", dir.flags);
             return Err(VfsError::Unsupported);
         }
         Ok(())
@@ -916,9 +955,17 @@ impl Ext2Fs {
     }
 
     pub fn inode_of(&self, ino: u32) -> Arc<dyn Inode> {
-        Arc::new(Ext2Ino {
-            fs: self.core.clone(),
-            ino,
+        critical_section::with(|cs| {
+            let mut inodes = self.core.inodes.borrow(cs).borrow_mut();
+            if let Some(cached) = inodes.get(&ino) {
+                return cached.clone();
+            }
+            let inode = Arc::new(Ext2Ino {
+                fs: self.core.clone(),
+                ino,
+            });
+            inodes.insert(ino, inode.clone());
+            inode
         })
     }
 }
@@ -933,9 +980,17 @@ pub struct Ext2Ino {
 
 impl Ext2Ino {
     fn wrap(&self, ino: u32) -> Arc<dyn Inode> {
-        Arc::new(Ext2Ino {
-            fs: self.fs.clone(),
-            ino,
+        critical_section::with(|cs| {
+            let mut inodes = self.fs.inodes.borrow(cs).borrow_mut();
+            if let Some(cached) = inodes.get(&ino) {
+                return cached.clone();
+            }
+            let inode = Arc::new(Ext2Ino {
+                fs: self.fs.clone(),
+                ino,
+            });
+            inodes.insert(ino, inode.clone());
+            inode
         })
     }
 
@@ -971,7 +1026,10 @@ impl Inode for Ext2Ino {
     }
 
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
-        if kind == NodeKind::CharDev {
+        if matches!(kind, NodeKind::CharDev | NodeKind::Symlink) {
+            // A character device is a driver's business, and a link is made of
+            // a target rather than a kind - neither is a file this filesystem
+            // can invent from a name alone.
             return Err(VfsError::Unsupported);
         }
         self.require_dir()?;
@@ -1030,10 +1088,60 @@ impl Inode for Ext2Ino {
         self.fs.dir_entries(&dir)
     }
 
+    /// Where this link points, spelled exactly as the filesystem stored it.
+    ///
+    /// Alpine is built out of these: `/bin`, `/sbin`, `/usr/bin` and `/lib`
+    /// hold a few hundred names, all of them links to one busybox or one
+    /// loader. Resolution is what follows them; this is what says where.
+    fn readlink(&self) -> VfsResult<String> {
+        let data = self.fs.read_inode(self.ino);
+        if data.kind() != NodeKind::Symlink {
+            return Err(VfsError::Invalid);
+        }
+        let size = data.size as usize;
+        if data.is_fast_symlink() {
+            // No block was ever allocated: the target is the bytes of
+            // i_block, read back as the text it was written as.
+            let mut raw = Vec::with_capacity(size);
+            for ptr in data.block.iter() {
+                raw.extend_from_slice(&ptr.to_le_bytes());
+            }
+            raw.truncate(size);
+            return String::from_utf8(raw).map_err(|_| VfsError::Invalid);
+        }
+        // A target too long for the inode is in data blocks and reads like a
+        // file's contents - but through the block map directly, because
+        // `read_at` refuses anything that is not a regular file.
+        let block_size = self.fs.block_size() as u64;
+        let mut raw = vec![0u8; size];
+        let mut pos = 0usize;
+        while pos < size {
+            let logical = pos as u64 / block_size;
+            let in_block = pos % block_size as usize;
+            let n = (size - pos).min(block_size as usize - in_block);
+            let Some(block) = self.fs.bmap_lookup(&data, logical) else {
+                return Err(VfsError::Invalid);
+            };
+            self.fs.read_bytes(block, in_block, &mut raw[pos..pos + n]);
+            pos += n;
+        }
+        String::from_utf8(raw).map_err(|_| VfsError::Invalid)
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         let data = self.fs.read_inode(self.ino);
-        if data.kind() != NodeKind::File {
-            return Err(VfsError::IsDir);
+        let kind = data.kind();
+        if kind != NodeKind::File {
+            // A directory is a directory; a link is a name, and reading
+            // through one is a caller that skipped resolution. Neither may
+            // reach the block pointers - a link keeps its target *there*, so
+            // reading it as data asks the device for a block number spelled
+            // out of the link's own text.
+            return Err(if kind == NodeKind::Dir {
+                VfsError::IsDir
+            } else {
+                VfsError::Invalid
+            });
         }
         let block_size = self.fs.block_size() as u64;
         let end = (data.size as u64).min(offset + buf.len() as u64);
@@ -1060,8 +1168,16 @@ impl Inode for Ext2Ino {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         let mut data = self.fs.read_inode(self.ino);
-        if data.kind() != NodeKind::File {
-            return Err(VfsError::IsDir);
+        let kind = data.kind();
+        if kind != NodeKind::File {
+            // The same refusal as a read, for the same reason: a link's block
+            // pointers are its target, and writing "data" there would rewrite
+            // where the link points.
+            return Err(if kind == NodeKind::Dir {
+                VfsError::IsDir
+            } else {
+                VfsError::Invalid
+            });
         }
         if offset + buf.len() as u64 > u32::MAX as u64 {
             return Err(VfsError::FileTooBig);
@@ -1088,6 +1204,56 @@ impl Inode for Ext2Ino {
         data.size = data.size.max((offset + buf.len() as u64) as u32);
         self.fs.write_inode(self.ino, &data);
         Ok(done)
+    }
+
+    /// Resize, with the three cases done differently because they are
+    /// different jobs.
+    ///
+    /// Growing changes the size and nothing else. A block that was never
+    /// allocated reads as zeros - [`Self::read_at`] fills a hole - so there is
+    /// no data to write.
+    ///
+    /// Shrinking has to give the tail's blocks back to the bitmaps. This
+    /// driver can free *all* of an inode's blocks but has no "free the ones
+    /// past N", so the prefix is held aside, the whole mapping is dropped, and
+    /// the prefix is written back. Wasteful, and obviously correct, which is
+    /// the right trade at this size. Zero - the common case, since it is what
+    /// `O_TRUNC` and a replacing `rename` ask for - has no prefix to save and
+    /// costs nothing extra.
+    fn truncate(&self, len: u64) -> VfsResult<()> {
+        let mut data = self.fs.read_inode(self.ino);
+        match data.kind() {
+            NodeKind::File => {}
+            NodeKind::Dir => return Err(VfsError::IsDir),
+            // A link's block pointers are its target: there is nothing here
+            // to resize, and truncating it would rewrite where it points.
+            _ => return Err(VfsError::Invalid),
+        }
+        let size = data.size as u64;
+        if len == size {
+            return Ok(());
+        }
+        if len > size {
+            data.size = u32::try_from(len).map_err(|_| VfsError::FileTooBig)?;
+            self.fs.write_inode(self.ino, &data);
+            return Ok(());
+        }
+        let keep = if len == 0 {
+            Vec::new()
+        } else {
+            let mut prefix = vec![0u8; len as usize];
+            self.read_at(0, &mut prefix)?;
+            prefix
+        };
+        self.fs.free_blocks_of(&data);
+        data.block = [0; 15];
+        data.blocks = 0;
+        data.size = 0;
+        self.fs.write_inode(self.ino, &data);
+        if !keep.is_empty() {
+            self.write_at(0, &keep)?;
+        }
+        Ok(())
     }
 }
 
@@ -1391,6 +1557,76 @@ mod tests {
             root_data.block[1] != 0,
             "a second directory block was mapped"
         );
+    }
+
+    #[test]
+    fn truncating_to_zero_leaves_no_tail_and_frees_the_blocks() {
+        let dev = Arc::new(format());
+        assert_eq!(free_counts(&dev), (115, 62));
+        let fs = mounted(dev.clone());
+        let root = fs.root();
+        let file = root.create("log", NodeKind::File).expect("create");
+        // Three blocks' worth, so the tail is real blocks rather than bytes
+        // inside the block the head lives in.
+        let long = vec![b'x'; 3 * 1024];
+        file.write_at(0, &long).unwrap();
+        assert_eq!(free_counts(&dev), (115 - 3, 61), "three data blocks");
+
+        file.truncate(0).expect("truncate to zero");
+        assert_eq!(file.metadata().size, 0);
+        assert_eq!(read_all(&*file, 16).len(), 0, "an empty file reads empty");
+        assert_eq!(free_counts(&dev), (115, 61), "the blocks came back");
+
+        // The inode survived - only the contents went - so the same name can
+        // be written again without having to be created again.
+        assert_eq!(file.write_at(0, b"fresh").unwrap(), 5);
+        assert_eq!(read_all(&*file, 16), b"fresh");
+    }
+
+    #[test]
+    fn truncating_a_prefix_keeps_the_prefix_and_drops_the_rest() {
+        let dev = Arc::new(format());
+        let fs = mounted(dev.clone());
+        let root = fs.root();
+        let file = root.create("cut", NodeKind::File).expect("create");
+        file.write_at(0, &vec![b'a'; 2500]).unwrap();
+        file.write_at(2500, b"tail that goes away").unwrap();
+
+        file.truncate(2500).expect("truncate the tail off");
+        assert_eq!(file.metadata().size, 2500);
+        let bytes = read_all(&*file, 4096);
+        assert_eq!(bytes.len(), 2500);
+        assert!(bytes.iter().all(|&b| b == b'a'), "the prefix is intact");
+        // The tail's blocks went back to the bitmaps, and the prefix's were
+        // reallocated: the file still occupies what it holds, no more.
+        assert_eq!(free_counts(&dev), (115 - 3, 61));
+    }
+
+    #[test]
+    fn truncating_upward_grows_a_hole_that_reads_as_zeros() {
+        let fs = mounted(Arc::new(format()));
+        let root = fs.root();
+        let file = root.create("grow", NodeKind::File).expect("create");
+        file.write_at(0, b"head").unwrap();
+        file.truncate(4096).expect("grow");
+
+        assert_eq!(file.metadata().size, 4096);
+        let bytes = read_all(&*file, 8192);
+        assert_eq!(bytes.len(), 4096);
+        assert_eq!(&bytes[..4], b"head");
+        assert!(
+            bytes[4..].iter().all(|&b| b == 0),
+            "the new space is a hole"
+        );
+    }
+
+    #[test]
+    fn truncate_refuses_what_is_not_a_file() {
+        let fs = mounted(Arc::new(format()));
+        let root = fs.root();
+        let dir = root.create("d", NodeKind::Dir).expect("create dir");
+        assert_eq!(dir.truncate(0).err(), Some(VfsError::IsDir));
+        assert_eq!(root.truncate(0).err(), Some(VfsError::IsDir));
     }
 
     #[test]

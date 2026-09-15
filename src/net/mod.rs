@@ -84,6 +84,13 @@ pub(crate) enum Channel {
         /// from the record rather than from the socket.
         local: Option<IpEndpoint>,
     },
+    /// An `AF_INET6` socket with no machinery behind it. The stack speaks
+    /// IPv4 only, but Linux always lets `socket(AF_INET6)` open - the failure
+    /// shows up at `connect` as ENETUNREACH, which is what lets a caller
+    /// walking a getaddrinfo list fall through to the IPv4 answer. Faking
+    /// that shape keeps musl's dual-family resolve honest; refusing the
+    /// socket outright turns the whole lookup into EAFNOSUPPORT.
+    Inet6,
 }
 
 /// The syscall-visible facts about one socket, indexed by handle - the number
@@ -177,31 +184,40 @@ pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
     })
 }
 
-/// Register a new socket of the given type and hand back its handle. The
-/// smoltcp socket - with its buffers - is built inside the lock, since the
-/// socket set is part of the stack. `ENETDOWN` when the stack never came up:
-/// a kernel without a network card has no sockets to give.
-pub(crate) fn alloc_socket(typ: u16) -> Result<usize, isize> {
+/// Register a new socket of the given family and type, and hand back its
+/// handle. The smoltcp socket - with its buffers - is built inside the lock,
+/// since the socket set is part of the stack. `ENETDOWN` when the stack never
+/// came up: a kernel without a network card has no sockets to give.
+pub(crate) fn alloc_socket(family: u16, typ: u16) -> Result<usize, isize> {
     critical_section::with(|cs| {
         let mut net = NET.borrow(cs).borrow_mut();
         let Some(stack) = net.as_mut() else {
             return Err(crate::syscall::err::ENETDOWN);
         };
-        let owned = match typ {
-            socket::SOCK_STREAM => Channel::Tcp {
+        let owned = match (family, typ) {
+            (socket::AF_INET, socket::SOCK_STREAM) => Channel::Tcp {
                 handle: stack.add_tcp(),
                 local: None,
             },
-            socket::SOCK_DGRAM => Channel::Udp {
+            (socket::AF_INET, socket::SOCK_DGRAM) => Channel::Udp {
                 handle: stack.add_udp(),
                 peer: None,
                 bound: false,
                 local: None,
             },
-            _ => return Err(crate::syscall::err::EINVAL),
+            // The IPv6 stub: an entry with no smoltcp socket behind it.
+            (socket::AF_INET6, _) => Channel::Inet6,
+            // Two ways to ask for something that is not here, and Linux
+            // names them apart: a family this kernel does not speak at all
+            // is EAFNOSUPPORT, while a family it speaks but a type that
+            // family does not carry - SOCK_SEQPACKET over IPv4 - is
+            // EPROTONOSUPPORT. A caller walking a getaddrinfo list uses
+            // the first to skip to the next answer.
+            (socket::AF_INET, _) => return Err(crate::syscall::err::EPROTONOSUPPORT),
+            _ => return Err(crate::syscall::err::EAFNOSUPPORT),
         };
         let entry = Entry {
-            family: socket::AF_INET,
+            family,
             typ,
             channel: owned,
         };
@@ -234,6 +250,9 @@ pub(crate) fn free_entry(handle: usize) {
         let owned = match &entry.channel {
             Channel::Tcp { handle, .. } => Some(*handle),
             Channel::Udp { handle, .. } => Some(*handle),
+            // The IPv6 stub owns no smoltcp socket; the registry slot is all
+            // there is to free.
+            Channel::Inet6 => None,
         };
         if let Some(h) = owned {
             stack.sockets.remove(h);
@@ -281,6 +300,10 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
                     write: sock.can_send(),
                 }
             }
+            // The IPv6 stub has no queues to ask and no route anywhere:
+            // never ready, which a caller only reaches if it polls without
+            // having tried to connect - and connect already said no.
+            Channel::Inet6 => crate::vfs::Ready::NONE,
         }
     });
     polled.unwrap_or(crate::vfs::Ready::NONE)
@@ -335,7 +358,12 @@ pub fn init() -> bool {
 /// at 100 ticks a second the stack checks for arrived frames 10 times more
 /// often than slirp needs to answer.
 pub fn spawn_service() {
-    crate::sched::spawn(
+    // Permanent: a connection has to keep making progress while the task that
+    // opened it sits blocked in the kernel, and this is the task that does it -
+    // so it runs for the machine's whole life. Started as permanent, not as an
+    // ordinary task, because the boot code's `drain` waits for every task a
+    // check started to be reaped and this one never will be.
+    crate::sched::spawn_permanent(
         || loop {
             service();
             crate::sched::sleep_ticks(1);
@@ -430,17 +458,6 @@ impl TxToken for FrameTx {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut frame = alloc::vec![0u8; len];
         let result = f(&mut frame);
-        crate::println!(
-            "NET TX dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype={:04x} len={}",
-            frame[0],
-            frame[1],
-            frame[2],
-            frame[3],
-            frame[4],
-            frame[5],
-            ((frame[12] as u16) << 8) | frame[13] as u16,
-            len
-        );
         // A full hardware queue drops the frame here. TCP retransmits on its
         // own; a dropped datagram is the lossy-network behavior UDP promises.
         let _ = self.net.transmit(&frame);

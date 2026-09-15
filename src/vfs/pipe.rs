@@ -19,6 +19,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use critical_section::Mutex;
 
@@ -51,6 +52,10 @@ struct PipeState {
 pub struct PipeEnd {
     state: Arc<Mutex<RefCell<PipeState>>>,
     writing: bool,
+    /// Set when this end has left the count, by a half-close or by its own
+    /// drop - whichever came first. Both have to be idempotent, since a
+    /// `shutdown` can be asked for twice and the drop always follows it.
+    closed: AtomicBool,
 }
 
 /// POSIX's floor for record writes, held at compile time, and a buffer that is
@@ -72,10 +77,12 @@ pub fn pair() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     let read_end = Arc::new(PipeEnd {
         state: state.clone(),
         writing: false,
+        closed: AtomicBool::new(false),
     });
     let write_end = Arc::new(PipeEnd {
         state,
         writing: true,
+        closed: AtomicBool::new(false),
     });
     (read_end, write_end)
 }
@@ -85,7 +92,6 @@ impl PipeEnd {
     pub fn buffered(&self) -> usize {
         critical_section::with(|cs| self.state.borrow(cs).borrow().data.len())
     }
-
     /// One non-blocking read. `Some(n)` with `n > 0` is data, `Some(0)` is
     /// end-of-stream, `None` is "nothing to read yet".
     pub fn read_once(&self, buf: &mut [u8]) -> VfsResult<Option<usize>> {
@@ -195,6 +201,33 @@ impl PipeEnd {
         })
     }
 
+    /// Half-close: this end stops being a writer without releasing the buffer,
+    /// so the far end's reads drain what is already there and then see
+    /// end-of-stream. That is what a half-close is for - telling the peer that
+    /// no more is coming, while leaving the other direction alone.
+    ///
+    /// Idempotent: the count may only drop once, and the [`Drop`] that follows
+    /// must not drop it again.
+    pub fn shut_write(&self) {
+        if self.writing && !self.closed.swap(true, Ordering::Relaxed) {
+            critical_section::with(|cs| {
+                self.state.borrow(cs).borrow_mut().writers -= 1;
+            });
+            self.wake_all();
+        }
+    }
+
+    /// Half-close the other direction: this end's reads report end-of-stream,
+    /// and the peer's writes fail the way a write to a closed pipe does.
+    pub fn shut_read(&self) {
+        if !self.writing && !self.closed.swap(true, Ordering::Relaxed) {
+            critical_section::with(|cs| {
+                self.state.borrow(cs).borrow_mut().readers -= 1;
+            });
+            self.wake_all();
+        }
+    }
+
     /// Wake the waiters on the other side. `reading` is the side that just
     /// made progress: a reader freed room (wake writers), a writer added data
     /// (wake readers). A no-op on the host, where nothing ever sleeps.
@@ -225,6 +258,10 @@ impl PipeEnd {
 
 impl Drop for PipeEnd {
     fn drop(&mut self) {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            // A half-close already took this end out of the count.
+            return;
+        }
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
             if self.writing {
@@ -324,12 +361,170 @@ impl Inode for PipeEnd {
     }
 }
 
+/// One end of a `socketpair`: a connected, bidirectional byte stream.
+///
+/// A Unix-domain socket and a pipe are the same object seen from two angles -
+/// an anonymous inode that moves bytes and reports end-of-stream when the far
+/// end closes - so this is built from [`pair`] rather than beside it: two
+/// buffers, one per direction, cut in half and crossed so each end reads what
+/// the other writes. What a pipe cannot express is a descriptor that is *both*
+/// ends at once, which is exactly what this adds.
+///
+/// It is not a socket in the network sense: there is no address, no
+/// connection, and nothing in `net` knows it exists. `socketpair(2)` never
+/// makes any other kind, and programs that ask for one want a channel, not a
+/// protocol.
+pub struct DuplexEnd {
+    read: Arc<PipeEnd>,
+    write: Arc<PipeEnd>,
+}
+
+impl DuplexEnd {
+    /// The two ends of one connected pair.
+    pub fn pair() -> (Arc<DuplexEnd>, Arc<DuplexEnd>) {
+        // Two one-way links. `a_write` feeds `b_read`, and `b_write` feeds
+        // `a_read`, so each end's read half is the other's write half.
+        let (a_read, b_write) = pair();
+        let (b_read, a_write) = pair();
+        let a = Arc::new(DuplexEnd {
+            read: a_read,
+            write: a_write,
+        });
+        let b = Arc::new(DuplexEnd {
+            read: b_read,
+            write: b_write,
+        });
+        (a, b)
+    }
+
+    /// Half-close the writing direction. The far end's next read drains what
+    /// is buffered and then reports end-of-stream, which is the whole point of
+    /// a half-close: the peer is told no more is coming without the reader's
+    /// own direction going anywhere.
+    pub fn shut_write(&self) {
+        self.write.shut_write();
+    }
+
+    /// Half-close the reading direction: this end's reads report
+    /// end-of-stream from now on, and the peer's writes fail as they would to
+    /// a closed pipe.
+    pub fn shut_read(&self) {
+        self.read.shut_read();
+    }
+}
+
+impl Inode for DuplexEnd {
+    fn poll_ready(&self) -> Ready {
+        Ready {
+            read: self.read.poll_ready().read,
+            write: self.write.poll_ready().write,
+        }
+    }
+
+    fn poll_subscribe(&self, id: TaskId) {
+        // Both halves, on purpose: a waiter wants to hear about data arriving
+        // *and* about room appearing, and each half knows which of those its
+        // own waiters are after.
+        self.read.poll_subscribe(id);
+        self.write.poll_subscribe(id);
+    }
+
+    fn poll_unsubscribe(&self, id: TaskId) {
+        self.read.poll_unsubscribe(id);
+        self.write.poll_unsubscribe(id);
+    }
+
+    fn as_duplex(&self) -> Option<&DuplexEnd> {
+        Some(self)
+    }
+
+    fn metadata(&self) -> Metadata {
+        // A stream socket has no size, and nothing but the ends holds it. The
+        // kind is `File` because the filesystem's vocabulary has no better
+        // word for "anonymous byte channel" - the same answer pipes give.
+        Metadata {
+            ino: 0,
+            kind: NodeKind::File,
+            size: 0,
+        }
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        self.read.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        self.write.write_at(offset, buf)
+    }
+}
+
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use alloc::vec;
 
-    use super::{CAPACITY, PIPE_BUF, pair};
+    use super::{CAPACITY, DuplexEnd, PIPE_BUF, pair};
     use crate::vfs::{Inode, VfsError};
+
+    #[test]
+    fn a_socketpair_carries_bytes_both_ways() {
+        let (a, b) = DuplexEnd::pair();
+        let mut buf = [0u8; 8];
+
+        assert_eq!(a.write_at(0, b"ping").unwrap(), 4);
+        assert_eq!(b.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"ping");
+
+        // The other direction runs over the other buffer, so a reply cannot
+        // be read back as an echo of what was just written.
+        assert_eq!(b.write_at(0, b"pong").unwrap(), 4);
+        assert_eq!(a.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"pong");
+    }
+
+    #[test]
+    fn half_closing_a_socketpair_leaves_the_other_direction_running() {
+        let (a, b) = DuplexEnd::pair();
+        a.write_at(0, b"last").unwrap();
+        a.shut_write();
+
+        // What was already in flight is still delivered, and only then does
+        // the far end hear that nothing more is coming.
+        let mut buf = [0u8; 8];
+        assert_eq!(b.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"last");
+        assert_eq!(b.read_at(0, &mut buf).unwrap(), 0, "EOF");
+
+        // b's own direction is untouched, which is the point of a half-close.
+        assert_eq!(b.write_at(0, b"still here").unwrap(), 10);
+        assert_eq!(a.read_at(0, &mut buf).unwrap(), 8); // buf is 8 bytes
+    }
+
+    #[test]
+    fn shutting_down_twice_is_harmless() {
+        let (a, _b) = DuplexEnd::pair();
+        a.shut_write();
+        // The second call must not take the end out of the writer count again,
+        // and the drop that follows must not take it out a third time: an
+        // underflow here would be reported as a panic on a `u32`.
+        a.shut_write();
+        drop(a);
+    }
+
+    #[test]
+    fn a_shut_down_reader_makes_the_peer_write_fail() {
+        let (a, b) = DuplexEnd::pair();
+        a.shut_read();
+        assert_eq!(b.write_at(0, b"nobody").err(), Some(VfsError::BrokenPipe));
+    }
+
+    #[test]
+    fn dropping_one_end_ends_the_stream_the_way_a_pipe_does() {
+        let (a, b) = DuplexEnd::pair();
+        drop(b);
+        let mut buf = [0u8; 4];
+        assert_eq!(a.read_at(0, &mut buf).unwrap(), 0, "the far end is gone");
+        assert_eq!(a.write_at(0, b"gone").err(), Some(VfsError::BrokenPipe));
+    }
 
     #[test]
     fn a_pipe_carries_bytes_from_writer_to_reader() {

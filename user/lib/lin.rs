@@ -1098,3 +1098,443 @@ pub fn die(msg: &[u8]) -> ! {
     let _ = write_all(2, msg);
     exit_group(101)
 }
+
+// ---------------------------------------------------------------------------
+// Sockets: the AF_INET protocol family
+// ---------------------------------------------------------------------------
+//
+// A kernel's network stack is only as real as the programs that speak a
+// protocol over it, and a protocol is only exercised by a program that
+// builds its own packets - which is what the tests behind these wrappers
+// do. The shapes are Linux's: `struct sockaddr_in` is sixteen bytes of
+// family, port, address and padding, and every port travels in network
+// order.
+
+pub const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
+pub const SOCK_STREAM: usize = 1;
+pub const SOCK_DGRAM: usize = 2;
+pub const SOL_SOCKET: usize = 1;
+pub const SO_REUSEADDR: usize = 2;
+pub const SO_TYPE: usize = 3;
+pub const SO_ERROR: usize = 4;
+/// sizeof(struct sockaddr_in).
+pub const SOCKADDR_IN_LEN: usize = 16;
+
+/// A pointer-sized view of `sockaddr_in`, for the calls that take the
+/// struct as a pointer and a length word.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockAddrIn {
+    pub family: u16,
+    /// Network byte order, as the wire has it.
+    pub port: u16,
+    pub addr: [u8; 4],
+    pub zero: [u8; 8],
+}
+
+impl SockAddrIn {
+    /// Name `addr` and `port`, with the port converted to network order.
+    pub fn new(addr: [u8; 4], port: u16) -> Self {
+        SockAddrIn {
+            family: AF_INET,
+            port: port.to_be(),
+            addr,
+            zero: [0; 8],
+        }
+    }
+
+    /// The port in host order - what a caller compares against.
+    pub fn port(&self) -> u16 {
+        u16::from_be(self.port)
+    }
+}
+
+const SYS_SOCKET: u64 = 41;
+const SYS_CONNECT: u64 = 42;
+const SYS_SENDTO: u64 = 44;
+const SYS_RECVFROM: u64 = 45;
+const SYS_SHUTDOWN: u64 = 48;
+const SYS_BIND: u64 = 49;
+const SYS_LISTEN: u64 = 50;
+const SYS_GETSOCKNAME: u64 = 51;
+const SYS_GETPEERNAME: u64 = 52;
+const SYS_SETSOCKOPT: u64 = 54;
+const SYS_GETSOCKOPT: u64 = 55;
+
+/// `socket(domain, type, protocol)` — a descriptor for a channel of the
+/// named family and kind.
+pub fn socket(domain: usize, typ: usize, protocol: usize) -> isize {
+    sys3(SYS_SOCKET, domain, typ, protocol)
+}
+
+/// `connect(fd, addr, len)` — open a stream to the named endpoint, or name
+/// the peer a datagram socket sends to by default.
+pub fn connect(fd: i32, addr: &SockAddrIn) -> isize {
+    sys3(
+        SYS_CONNECT,
+        fd as usize,
+        addr as *const SockAddrIn as usize,
+        SOCKADDR_IN_LEN,
+    )
+}
+
+/// `bind(fd, addr, len)` — name the local end of a socket.
+pub fn bind(fd: i32, addr: &SockAddrIn) -> isize {
+    sys3(
+        SYS_BIND,
+        fd as usize,
+        addr as *const SockAddrIn as usize,
+        SOCKADDR_IN_LEN,
+    )
+}
+
+/// `listen(fd, backlog)` — say this stream socket takes connections.
+pub fn listen(fd: i32, backlog: usize) -> isize {
+    sys2(SYS_LISTEN, fd as usize, backlog)
+}
+
+/// `sendto(fd, buf, flags, addr, len)` — send, to `addr` when one is named.
+pub fn sendto(fd: i32, buf: &[u8], flags: usize, addr: Option<&SockAddrIn>) -> isize {
+    let (addr_ptr, addr_len) = match addr {
+        Some(a) => (a as *const SockAddrIn as usize, SOCKADDR_IN_LEN),
+        None => (0, 0),
+    };
+    sys6(
+        SYS_SENDTO,
+        fd as usize,
+        buf.as_ptr() as usize,
+        buf.len(),
+        flags,
+        addr_ptr,
+        addr_len,
+    )
+}
+
+/// `recvfrom(fd, buf, flags, addr, len)` — receive, and name the sender
+/// when slots for it are given.
+pub fn recvfrom(
+    fd: i32,
+    buf: &mut [u8],
+    flags: usize,
+    addr: Option<&mut SockAddrIn>,
+) -> isize {
+    // The length word is in-out: the kernel writes back how much of the
+    // struct it filled, so it has to be a real mutable local and not the
+    // constant it starts out equal to.
+    let mut addr_len = SOCKADDR_IN_LEN;
+    let (addr_ptr, len_ptr) = match addr {
+        Some(a) => (
+            a as *mut SockAddrIn as usize,
+            &mut addr_len as *mut usize as usize,
+        ),
+        None => (0, 0),
+    };
+    sys6(
+        SYS_RECVFROM,
+        fd as usize,
+        buf.as_mut_ptr() as usize,
+        buf.len(),
+        flags,
+        addr_ptr,
+        len_ptr,
+    )
+}
+
+/// `getsockname(fd, addr, len)` — the local end this socket ended up with.
+pub fn getsockname(fd: i32, addr: &mut SockAddrIn) -> isize {
+    let mut addr_len = SOCKADDR_IN_LEN;
+    sys3(
+        SYS_GETSOCKNAME,
+        fd as usize,
+        addr as *mut SockAddrIn as usize,
+        &mut addr_len as *mut usize as usize,
+    )
+}
+
+/// `getpeername(fd, addr, len)` — the far end, for a connected socket.
+pub fn getpeername(fd: i32, addr: &mut SockAddrIn) -> isize {
+    let mut addr_len = SOCKADDR_IN_LEN;
+    sys3(
+        SYS_GETPEERNAME,
+        fd as usize,
+        addr as *mut SockAddrIn as usize,
+        &mut addr_len as *mut usize as usize,
+    )
+}
+
+/// `setsockopt(fd, level, optname, val, len)`.
+pub fn setsockopt(fd: i32, level: usize, optname: usize, val: &i32) -> isize {
+    sys5(
+        SYS_SETSOCKOPT,
+        fd as usize,
+        level,
+        optname,
+        val as *const i32 as usize,
+        4,
+    )
+}
+
+/// `getsockopt(fd, level, optname, val, len)`.
+pub fn getsockopt(fd: i32, level: usize, optname: usize, val: &mut i32) -> isize {
+    sys5(
+        SYS_GETSOCKOPT,
+        fd as usize,
+        level,
+        optname,
+        val as *mut i32 as usize,
+        &mut 4usize as *mut usize as usize,
+    )
+}
+
+/// `shutdown(fd, how)` — close one direction of a channel, or both.
+pub fn shutdown(fd: i32, how: usize) -> isize {
+    sys2(SYS_SHUTDOWN, fd as usize, how)
+}
+
+// ---------------------------------------------------------------------------
+// The calls an ordinary libc reaches for
+// ---------------------------------------------------------------------------
+
+const SYS_PREAD64: u64 = 17;
+const SYS_PWRITE64: u64 = 18;
+const SYS_FSYNC: u64 = 74;
+const SYS_CHMOD: u64 = 90;
+const SYS_FCHMOD: u64 = 91;
+const SYS_TIME: u64 = 201;
+const SYS_TIMES: u64 = 100;
+const SYS_GETRUSAGE: u64 = 98;
+const SYS_CLOCK_GETRES: u64 = 229;
+const SYS_WAITID: u64 = 247;
+const SYS_GETRLIMIT: u64 = 160;
+
+/// `pread64(fd, buf, count, offset)` — read at a position, leaving the
+/// descriptor's own position where it was.
+pub fn pread(fd: i32, buf: &mut [u8], offset: i64) -> isize {
+    sys4(
+        SYS_PREAD64,
+        fd as usize,
+        buf.as_mut_ptr() as usize,
+        buf.len(),
+        offset as usize,
+    )
+}
+
+/// `pwrite64(fd, buf, count, offset)` — write at a position, likewise.
+pub fn pwrite(fd: i32, buf: &[u8], offset: i64) -> isize {
+    sys4(
+        SYS_PWRITE64,
+        fd as usize,
+        buf.as_ptr() as usize,
+        buf.len(),
+        offset as usize,
+    )
+}
+
+/// `fsync(fd)` — flush a descriptor to its storage.
+pub fn fsync(fd: i32) -> isize {
+    sys1(SYS_FSYNC, fd as usize)
+}
+
+/// `chmod(path, mode)` — set permission bits on a path.
+pub fn chmod(path: &[u8], mode: usize) -> isize {
+    sys2(SYS_CHMOD, path.as_ptr() as usize, mode)
+}
+
+/// `fchmod(fd, mode)` — the same, by descriptor.
+pub fn fchmod(fd: i32, mode: usize) -> isize {
+    sys2(SYS_FCHMOD, fd as usize, mode)
+}
+
+/// `time(tloc)` — seconds since the epoch, written through `tloc` when
+/// it is given.
+pub fn time(tloc: Option<&mut i64>) -> isize {
+    let ptr = match tloc {
+        Some(slot) => slot as *mut i64 as usize,
+        None => 0,
+    };
+    sys1(SYS_TIME, ptr)
+}
+
+/// `times(buf)` — CPU time in clock ticks. `buf` is a four-`clock_t`
+/// `struct tms`; the return value is ticks since boot.
+pub fn times(buf: Option<&mut [u8; 32]>) -> isize {
+    let ptr = match buf {
+        Some(b) => b.as_mut_ptr() as usize,
+        None => 0,
+    };
+    sys1(SYS_TIMES, ptr)
+}
+
+/// `getrusage(who, usage)` — resource counters, zeroed when unmeasured.
+pub fn getrusage(who: usize, usage: &mut [u8; 144]) -> isize {
+    sys2(SYS_GETRUSAGE, who, usage.as_mut_ptr() as usize)
+}
+
+/// `clock_getres(clk_id, res)` — the resolution a clock can deliver.
+pub fn clock_getres(clk_id: usize, res: &mut TimeSpec) -> isize {
+    sys2(SYS_CLOCK_GETRES, clk_id, res as *mut TimeSpec as usize)
+}
+
+/// `getrlimit(resource, rlim)` — one resource limit.
+pub fn getrlimit(resource: usize, rlim: &mut Rlimit) -> isize {
+    sys2(SYS_GETRLIMIT, resource, rlim as *mut Rlimit as usize)
+}
+
+/// `waitid(idtype, id, infop, options, rusage)` — wait for one child and
+/// describe it as a `siginfo_t`.
+pub fn waitid(idtype: usize, id: usize, infop: &mut [u8; 128], options: usize) -> isize {
+    sys5(
+        SYS_WAITID,
+        idtype,
+        id,
+        infop.as_mut_ptr() as usize,
+        options,
+        0,
+    )
+}
+
+// --- the calls that were already there and had no test ---------------------
+
+const SYS_PPOLL: u64 = 271;
+const SYS_SELECT: u64 = 23;
+const SYS_PSELECT6: u64 = 270;
+const SYS_STAT: u64 = 4;
+const SYS_LSTAT: u64 = 6;
+const SYS_SYMLINK: u64 = 88;
+const SYS_UMASK: u64 = 95;
+const SYS_TRUNCATE: u64 = 76;
+const SYS_FTRUNCATE: u64 = 77;
+const SYS_FLOCK: u64 = 73;
+const SYS_SENDFILE: u64 = 40;
+const SYS_GETPPID: u64 = 110;
+const SYS_LINKAT: u64 = 265;
+const SYS_MKNOD: u64 = 133;
+/// 82 is the legacy `rename`; 264 is `renameat`, which leads with two
+/// dirfds. They are different calls with different register layouts, which
+/// is why both are here.
+const SYS_RENAME: u64 = 82;
+const SYS_RENAMEAT: u64 = 264;
+
+/// `ppoll(fds, nfds, timeout, sigmask)` — poll with a nanosecond timeout.
+pub fn ppoll(fds: &mut [PollFd], timeout: &TimeSpec) -> isize {
+    sys5(
+        SYS_PPOLL,
+        fds.as_mut_ptr() as usize,
+        fds.len(),
+        timeout as *const TimeSpec as usize,
+        0,
+        8,
+    )
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)` — the original
+/// wait, in microseconds. `timeout` is a `TimeVal`.
+pub fn select(
+    nfds: usize,
+    readfds: Option<&mut [u8]>,
+    timeout: Option<&TimeVal>,
+) -> isize {
+    let (rfds, _) = match readfds {
+        Some(set) => (set.as_mut_ptr() as usize, set.len()),
+        None => (0, 0),
+    };
+    let tv = match timeout {
+        Some(t) => t as *const TimeVal as usize,
+        None => 0,
+    };
+    sys5(SYS_SELECT, nfds, rfds, 0, 0, tv)
+}
+
+/// `pselect6(nfds, ..., timeout, sigmask)` — select with a `timespec`.
+pub fn pselect6(nfds: usize, readfds: Option<&mut [u8]>, timeout: &TimeSpec) -> isize {
+    let (rfds, _) = match readfds {
+        Some(set) => (set.as_mut_ptr() as usize, set.len()),
+        None => (0, 0),
+    };
+    sys6(
+        SYS_PSELECT6,
+        nfds,
+        rfds,
+        0,
+        0,
+        timeout as *const TimeSpec as usize,
+        0,
+    )
+}
+
+/// `stat(path, buf)` — the legacy path-shaped stat, no dirfd.
+pub fn stat(path: &[u8], buf: *mut Stat) -> isize {
+    sys2(SYS_STAT, path.as_ptr() as usize, buf as usize)
+}
+
+/// `lstat(path, buf)` — the same, but naming a link rather than its target.
+pub fn lstat(path: &[u8], buf: *mut Stat) -> isize {
+    sys2(SYS_LSTAT, path.as_ptr() as usize, buf as usize)
+}
+
+/// `symlink(target, linkpath)` — name a new symbolic link.
+pub fn symlink(target: &[u8], linkpath: &[u8]) -> isize {
+    sys2(SYS_SYMLINK, target.as_ptr() as usize, linkpath.as_ptr() as usize)
+}
+
+/// `umask(mask)` — set the file-creation mask, returning the old one.
+pub fn umask(mask: usize) -> isize {
+    sys1(SYS_UMASK, mask)
+}
+
+/// `truncate(path, len)` — set a file's length by path.
+pub fn truncate(path: &[u8], len: usize) -> isize {
+    sys2(SYS_TRUNCATE, path.as_ptr() as usize, len)
+}
+
+/// `ftruncate(fd, len)` — the same, by descriptor.
+pub fn ftruncate(fd: i32, len: usize) -> isize {
+    sys2(SYS_FTRUNCATE, fd as usize, len)
+}
+
+/// `flock(fd, op)` — advisory file locking.
+pub fn flock(fd: i32, op: usize) -> isize {
+    sys2(SYS_FLOCK, fd as usize, op)
+}
+
+/// `sendfile(out, in, offset, count)` — copy between descriptors.
+pub fn sendfile(out: i32, input: i32, count: usize) -> isize {
+    sys4(SYS_SENDFILE, out as usize, input as usize, 0, count)
+}
+
+
+/// `rename(old, new)` — the legacy two-path spelling.
+pub fn rename(old: &[u8], new: &[u8]) -> isize {
+    sys2(SYS_RENAME, old.as_ptr() as usize, new.as_ptr() as usize)
+}
+
+/// `renameat(olddirfd, old, newdirfd, new)` — the four-argument spelling
+/// that carries its own dirfds. This is the one `apk` uses to move a
+/// fetched index into the cache.
+pub fn renameat(olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8]) -> isize {
+    sys4(
+        SYS_RENAMEAT,
+        olddirfd as usize,
+        old.as_ptr() as usize,
+        newdirfd as usize,
+        new.as_ptr() as usize,
+    )
+}
+
+/// `linkat(olddirfd, old, newdirfd, new, flags)` — a second name for a file.
+pub fn linkat(olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8], flags: usize) -> isize {
+    sys5(
+        SYS_LINKAT,
+        olddirfd as usize,
+        old.as_ptr() as usize,
+        newdirfd as usize,
+        new.as_ptr() as usize,
+        flags,
+    )
+}
+
+/// `mknod(path, mode, dev)` — ask for a device node.
+pub fn mknod(path: &[u8], mode: usize, dev: usize) -> isize {
+    sys3(SYS_MKNOD, path.as_ptr() as usize, mode, dev)
+}

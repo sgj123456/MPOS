@@ -69,6 +69,16 @@ impl Inode for RamFile {
             Ok(buf.len())
         })
     }
+
+    /// `truncate(2)`: shrinking drops the tail, growing adds zeros - which is
+    /// exactly what `Vec::resize` does, fill value included.
+    fn truncate(&self, len: u64) -> VfsResult<()> {
+        let len = usize::try_from(len).map_err(|_| VfsError::FileTooBig)?;
+        critical_section::with(|cs| {
+            self.data.borrow(cs).borrow_mut().resize(len, 0);
+        });
+        Ok(())
+    }
 }
 
 /// A directory: name edges, aka the dentries of this filesystem.
@@ -257,6 +267,29 @@ mod tests {
         let mut buf = [0u8; 8];
         assert_eq!(file.read_at(0, &mut buf).unwrap(), 3);
         assert_eq!(file.read_at(2, &mut buf).unwrap(), 1);
+    }
+
+    #[test]
+    fn truncate_shrinks_drops_the_tail_and_grows_a_hole() {
+        let fs = RamFs::new();
+        let file = fs.root().create("f", NodeKind::File).unwrap();
+        file.write_at(0, b"0123456789").unwrap();
+
+        file.truncate(4).unwrap();
+        assert_eq!(file.metadata().size, 4);
+        let mut buf = [0u8; 16];
+        assert_eq!(file.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"0123", "the tail is gone, not just hidden");
+
+        file.truncate(8).unwrap();
+        assert_eq!(file.metadata().size, 8);
+        assert_eq!(file.read_at(0, &mut buf).unwrap(), 8);
+        assert_eq!(&buf[..4], b"0123");
+        assert_eq!(&buf[4..8], b"\0\0\0\0", "the new space reads as zeros");
+
+        file.truncate(0).unwrap();
+        assert_eq!(file.metadata().size, 0);
+        assert_eq!(file.read_at(0, &mut buf).unwrap(), 0);
     }
 
     #[test]

@@ -45,8 +45,12 @@ use mpos::vfs::{self, FileSystem, Inode, NodeKind};
 
 const MIB: usize = 1024 * 1024;
 
-/// The virtio-blk device, probed once in init_blk and reused by check_blk_process.
+/// The virtio-blk device, probed once in init_blk and reused everywhere.
 static BLK_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
+/// The raw virtio-blk device (before partitioning), for partition lookups.
+static RAW_BLK: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
+/// The data partition device (partition 4), mounted at /mnt after pivot_root.
+static DATA_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
 
 // ---------------------------------------------------------------------------
 // Boot entry
@@ -114,6 +118,13 @@ fn kernel_main(info: &BootInfo) {
     init_sched();
     init_vfs(info);
     init_blk();
+    // After `init_arch`, not before: the seed mixes in the boot instant the
+    // RTC reported and the tick counter, and neither exists until the clock
+    // subsystem is up. Seeding later costs nothing - `fill` seeds on first use
+    // anyway - but seeding here means the very first reader gets a stream
+    // seeded from the machine rather than from a cold counter.
+    mpos::rand::init();
+    switch_root();
     println!("系统就绪");
 
     // ---- phase 2: milestone pre-checks (pure tests, assume init done) ------
@@ -123,11 +134,16 @@ fn kernel_main(info: &BootInfo) {
     check_vfs();
     check_blk_process();
     check_ipc();
+    // The network comes up before the shell sweep rather than after it: the
+    // sweep ends with the tests that leave the machine - a DNS query, a TCP
+    // connection - and none of them can pass on a stack that is not up yet.
+    // The service task this starts is permanent, so the drains the checks run
+    // do not wait for a task that is never going to finish.
+    init_net();
     check_shell();
     println!("全部通过");
 
     // ---- phase 3: hand the machine to /sbin/init ----------------------------
-    init_net();
     handoff_to_init();
 }
 
@@ -218,6 +234,11 @@ fn init_vfs(info: &BootInfo) {
     dev.register("ttyS0", Arc::new(TtyDev));
     dev.register("null", Arc::new(NullDev));
     dev.register("zero", Arc::new(ZeroDev));
+    // The entropy every TLS stack reaches for, and the reason `/dev/urandom`
+    // is registered with the core devices rather than left for later: without
+    // it an HTTPS client cannot start.
+    dev.register("random", Arc::new(RandomDev));
+    dev.register("urandom", Arc::new(RandomDev));
     vfs::mount("/dev", &*dev).expect("mount /dev");
 }
 
@@ -230,6 +251,7 @@ fn init_blk() {
         sectors,
         sectors * 512 / MIB as u64
     );
+    RAW_BLK.call_once(|| dev.clone());
 
     // The disk carries a partition table now - a bootloader, a kernel and
     // this filesystem all live on it - so the filesystem has to be found
@@ -240,8 +262,6 @@ fn init_blk() {
         dev.capacity_sectors()
     );
 
-    // The root filesystem is Alpine's, so /mnt is already there. Make it only
-    // when it is missing: a real tree is not obliged to leave a gap for us.
     let root = vfs::resolve("/").expect("no root filesystem");
     if root.lookup("mnt").is_err() {
         root.create("mnt", NodeKind::Dir).expect("create /mnt");
@@ -249,6 +269,104 @@ fn init_blk() {
     let fs = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("the ext2 image did not mount");
     vfs::mount("/mnt", &fs).expect("mount /mnt");
     BLK_DEV.call_once(|| dev);
+}
+
+/// Mount the root filesystem ext2 partition for the pivot_root transition.
+fn init_rootfs() {
+    let dev = RAW_BLK.get().expect("RAW_BLK not initialized").clone();
+
+    // Find the rootfs partition (partition 3).
+    let rootfs_dev = blk::part::find_rootfs(dev).expect("no rootfs partition found");
+    println!(
+        "rootfs: ext2 on a {}-sector partition",
+        rootfs_dev.capacity_sectors()
+    );
+
+    // Mount the rootfs at /new_root for the pivot_root transition.
+    let fs = vfs::ext2::Ext2Fs::mount(rootfs_dev).expect("the rootfs ext2 image did not mount");
+    vfs::mount("/new_root", &fs).expect("mount /new_root");
+
+    // Create old_root inside the new root so pivot_root can place the
+    // initramfs there before unmounting it.
+    let new_root = vfs::resolve("/new_root").expect("new_root missing");
+    if new_root.lookup("old_root").is_err() {
+        new_root
+            .create("old_root", NodeKind::Dir)
+            .expect("create old_root");
+    }
+}
+
+/// Mount the boot partition at /boot after pivot_root.
+///
+/// The boot partition is FAT32, which the kernel does not yet support as a
+/// mountable filesystem. Skipping this for now — the kernel, initramfs and
+/// limine.conf are only needed during boot, not at runtime.
+fn mount_boot() {
+    // TODO: add FAT32 read support to mount the boot partition at /boot.
+    println!("boot: FAT32 partition skipped (no FAT32 driver yet)");
+}
+
+/// Mount the data partition (partition 4) at /mnt after pivot_root.
+fn mount_data() {
+    let dev = RAW_BLK.get().expect("RAW_BLK not initialized").clone();
+
+    let data_dev = blk::part::find_data(dev).expect("no data partition found");
+    println!(
+        "data: ext2 on a {}-sector partition",
+        data_dev.capacity_sectors()
+    );
+
+    let root = vfs::resolve("/").expect("no root filesystem");
+    if root.lookup("mnt").is_err() {
+        root.create("mnt", NodeKind::Dir).expect("create /mnt");
+    }
+
+    let fs = vfs::ext2::Ext2Fs::mount(data_dev.clone()).expect("the data ext2 image did not mount");
+    vfs::mount("/mnt", &fs).expect("mount /mnt");
+    DATA_DEV.call_once(|| data_dev);
+}
+
+/// Switch from the initramfs root to the real rootfs using pivot_root.
+fn switch_root() {
+    // Create /new_root mountpoint if it doesn't exist yet.
+    let root = vfs::resolve("/").expect("no root filesystem");
+    if root.lookup("new_root").is_err() {
+        root.create("new_root", NodeKind::Dir)
+            .expect("create /new_root");
+    }
+
+    // Mount the rootfs ext2 partition at /new_root.
+    init_rootfs();
+
+    // Pivot root: move /new_root to /, move old root to /old_root inside it.
+    vfs::pivot_root("/new_root", "old_root").expect("pivot_root failed");
+
+    // Re-create /dev on the new root and mount devfs. The old devfs was on
+    // the initramfs root which is now gone.
+    let root = vfs::resolve("/").expect("no root filesystem after pivot");
+    if root.lookup("dev").is_err() {
+        root.create("dev", NodeKind::Dir).expect("create /dev");
+    }
+    let dev = vfs::devfs::DevFs::new();
+    dev.register("tty", Arc::new(TtyDev));
+    dev.register("console", Arc::new(ConsoleDev));
+    dev.register("ttyS0", Arc::new(TtyDev));
+    dev.register("null", Arc::new(NullDev));
+    dev.register("zero", Arc::new(ZeroDev));
+    // The entropy every TLS stack reaches for, and the reason `/dev/urandom`
+    // is registered with the core devices rather than left for later: without
+    // it an HTTPS client cannot start.
+    dev.register("random", Arc::new(RandomDev));
+    dev.register("urandom", Arc::new(RandomDev));
+    vfs::mount("/dev", &*dev).expect("mount /dev after pivot");
+
+    // Mount the boot partition at /boot.
+    mount_boot();
+
+    // Mount the data partition at /mnt.
+    mount_data();
+
+    println!("switched to rootfs, boot mounted");
 }
 
 // ---- mm: heap allocator + buddy frame allocator --------------------------
@@ -1115,6 +1233,34 @@ impl vfs::devfs::CharDevice for ZeroDev {
     }
 }
 
+/// Reads are random bytes, however much is asked; writes vanish.
+///
+/// This is the device a TLS stack's entropy comes from, and for busybox it is
+/// the *only* one: its HTTPS implementation opens `/dev/urandom` and never
+/// calls `getrandom(2)`. A kernel without this node cannot run an HTTPS client
+/// at all, which is why it is here beside `/dev/zero` rather than later.
+///
+/// Reads never block. Linux blocks `/dev/random` until the pool is confident
+/// and answers `/dev/urandom` immediately; this kernel has one stream and
+/// behaves like the latter for both names, so a program that reaches for
+/// either one makes progress.
+struct RandomDev;
+
+impl vfs::devfs::CharDevice for RandomDev {
+    fn read(&self, buf: &mut [u8]) -> usize {
+        mpos::rand::fill(buf);
+        buf.len()
+    }
+
+    fn write(&self, buf: &[u8]) -> usize {
+        // Writing to `/dev/urandom` is how a caller *adds* entropy on Linux,
+        // and Linux accepts and ignores a write when it has no room for it.
+        // There is nowhere to put it here, and accepting it is the compatible
+        // answer: refusing would turn a harmless call into a failure.
+        buf.len()
+    }
+}
+
 // ---- blk + user processes: ELF loading, virtio-blk, ext2 -----------------
 
 /// The exit code the user program ends with.
@@ -1184,7 +1330,7 @@ fn check_blk_process() {
         );
         vfs::close(fd).unwrap();
 
-        let dev = BLK_DEV.get().unwrap().clone();
+        let dev = DATA_DEV.get().unwrap().clone();
         let fs2 = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("remount the ext2 image");
         let back = fs2
             .root()
@@ -1213,7 +1359,7 @@ fn check_blk_process() {
             .unwrap()
             .unlink("written.bin")
             .expect("unlink /mnt/written.bin");
-        let dev = BLK_DEV.get().unwrap().clone();
+        let dev = DATA_DEV.get().unwrap().clone();
         let fs3 = vfs::ext2::Ext2Fs::mount(dev).expect("remount after the unlink");
         assert_eq!(
             fs3.root().lookup("written.bin").err(),
@@ -1504,6 +1650,12 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo t_mkdirat_$?\n",
     b"t_renameat2\n",
     b"echo t_renameat2_$?\n",
+    // The same call, but reached the way a package manager reaches it: both
+    // names bare, both relative to a directory descriptor. `t_renameat2`
+    // above only ever passes `AT_FDCWD` with absolute paths, which is the
+    // shape that hides the bug this one pins.
+    b"t_rename\n",
+    b"echo t_rename_$?\n",
     b"t_unlinkat\n",
     b"echo t_unlinkat_$?\n",
     b"t_getcwd\n",
@@ -1550,6 +1702,26 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     b"echo t_wait4_$?\n",
     b"t_clone\n",
     b"echo t_clone_$?\n",
+    // The network's own tests, last and together: they are the only ones
+    // that need the machine to have a wire, and a failure in them should
+    // not hide a verdict from the calls before them. t_udp is the one that
+    // leaves the machine at all - a DNS query to slirp's resolver and an
+    // answer back - so it proves the stack against something that is not
+    // this kernel.
+    b"t_socket\n",
+    b"echo t_socket_$?\n",
+    b"t_sockopt\n",
+    b"echo t_sockopt_$?\n",
+    b"t_tcp\n",
+    b"echo t_tcp_$?\n",
+    b"t_udp\n",
+    b"echo t_udp_$?\n",
+    // The pair `wget` builds for its TLS helper. It needs no wire, but it
+    // belongs with the socket tests: it is the other half of what
+    // "a socket the userland can use" means, and the one where the descriptor
+    // has to survive an `execve` for HTTPS to be possible at all.
+    b"t_socketpair\n",
+    b"echo t_socketpair_$?\n",
     // t_stdargs pins the Linux startup contract from the std side: a musl
     // binary's Rust `env::args()` reads back the argument block the kernel
     // laid out, with no mpos libc in the way. It is the only test that runs a
@@ -1566,6 +1738,12 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     // shared object arriving through a file `mmap`. It is also the only
     // milestone here that is a real Alpine program rather than one of ours.
     b"apk --version > /dev/null && echo APK_OK\n",
+    // The entropy device, which is what a TLS stack on this userland reads and
+    // the only thing it reads: busybox's HTTPS opens `/dev/urandom` and never
+    // calls `getrandom(2)`. The marker pins that a read comes back with the
+    // bytes that were asked for; that two reads *differ* is pinned by the
+    // host unit tests over the same generator, where it can be said in Rust.
+    b"echo URANDOM_$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | wc -c)\n",
     // b"t_mprotect\n",
     // b"echo t_mprotect_$?\n",
     // b"t_rt_sigprocmask\n",
@@ -1662,9 +1840,12 @@ fn discard() {
 
 // ---- init handoff (terminal, not a check) --------------------------------
 
-/// Bring the network stack up, after every milestone check has run and the
-/// task count is back to baseline: the polling task spawned here is
-/// permanent, and the checks' `drain` would otherwise wait on it forever.
+/// Bring the network stack up.
+///
+/// Called once, before the shell sweep, because the sweep's last tests are the
+/// ones that need a wire. The task this starts lives as long as the machine
+/// does - it is what keeps a connection moving while its owner is blocked -
+/// which is why it is started permanent rather than by `spawn`.
 fn init_net() {
     if mpos::net::init() {
         mpos::net::spawn_service();

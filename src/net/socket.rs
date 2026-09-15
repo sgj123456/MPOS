@@ -30,14 +30,22 @@ use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use super::Channel;
-use crate::arch::timer;
 use crate::syscall::err;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError};
 
 // --- the Linux constants the ABI spells by number ---
+pub(crate) const AF_UNIX: u16 = 1;
 pub(crate) const AF_INET: u16 = 2;
+/// The IPv6 family number. Accepted at `socket()` so address-list walkers
+/// behave as they do on Linux, with every operation answering ENOTUNREACH
+/// further down.
+pub(crate) const AF_INET6: u16 = 10;
 pub(crate) const SOCK_STREAM: u16 = 1;
 pub(crate) const SOCK_DGRAM: u16 = 2;
+/// `SOCK_SEQPACKET`: message boundaries over a stream. Nothing here carries
+/// them, but the number is part of the ABI and is named to be answered, not
+/// to be mistaken for something else.
+const SOCK_SEQPACKET: u16 = 5;
 const SOCK_NONBLOCK: u32 = 0o4000;
 const SOCK_CLOEXEC: u32 = 0o2000000;
 const IPPROTO_TCP: u32 = 6;
@@ -204,8 +212,8 @@ fn validate_source_slot(src: Option<(usize, usize)>) -> Result<(), isize> {
 /// resolver asks for `SOCK_NONBLOCK` right in the call, and the flag has to
 /// land on the open description as `O_NONBLOCK` or it is lost.
 pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
-    let _domain = args[0] as u16;
-    if _domain != AF_INET {
+    let domain = args[0] as u16;
+    if domain != AF_INET && domain != AF_INET6 {
         return err::EAFNOSUPPORT;
     }
     let raw_type = args[1] as u32;
@@ -223,7 +231,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         return err::EPROTONOSUPPORT;
     }
 
-    let handle = match super::alloc_socket(typ) {
+    let handle = match super::alloc_socket(domain, typ) {
         Ok(handle) => handle,
         Err(e) => return e,
     };
@@ -294,6 +302,14 @@ pub(crate) fn handle_connect(args: [usize; 6], from_user: bool) -> isize {
     };
     let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
 
+    // The IPv6 stub has no route to anywhere: connect fails exactly the way
+    // it does on a Linux box with no IPv6 route, and the caller moves on to
+    // the next address in its list.
+    let v6 = super::with(handle, |_, entry| matches!(entry.channel, Channel::Inet6));
+    if v6.unwrap_or(false) {
+        return err::ENETUNREACH;
+    }
+
     let typ = super::with(handle, |_, entry| entry.typ);
     match typ {
         Some(SOCK_STREAM) => connect_tcp(handle, endpoint, nonblock),
@@ -360,8 +376,6 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
     // The handshake loop. A reset closes the socket (state back to Closed);
     // thirty seconds of silence is what Linux answers ETIMEDOUT for.
     let deadline = crate::arch::timer::ticks() + 30 * crate::arch::timer::TICK_HZ as u64;
-    let mut last_state: Option<tcp::State> = None;
-    let mut last_print = 0u64;
     loop {
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
@@ -373,21 +387,12 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
                 return Err(err::ENOTSOCK);
             };
             let sock = stack.sockets.get_mut::<tcp::Socket>(*sock_handle);
-            let state = sock.state();
-            if last_state != Some(state) {
-                crate::println!("NET connect: state={} t={}", state, timer::ticks());
-                last_state = Some(state);
-            }
-            match state {
+            match sock.state() {
                 tcp::State::Established | tcp::State::SynReceived => Ok(true),
                 tcp::State::Closed => Err(err::ECONNREFUSED),
                 _ => Ok(false),
             }
         });
-        if timer::ticks() - last_print >= 25 {
-            crate::println!("NET loop t={} deadline={}", timer::ticks(), deadline);
-            last_print = timer::ticks();
-        }
         match step {
             Some(Ok(true)) => return 0,
             Some(Ok(false)) => {}
@@ -469,6 +474,12 @@ enum SendStep {
 
 fn send_common(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool) -> isize {
     let typ = super::with(handle, |_, entry| entry.typ);
+    if typ.is_some() {
+        let v6 = super::with(handle, |_, entry| matches!(entry.channel, Channel::Inet6));
+        if v6.unwrap_or(false) {
+            return err::ENETUNREACH;
+        }
+    }
     match typ {
         Some(SOCK_STREAM) => tcp_send(handle, data, nonblock),
         Some(SOCK_DGRAM) => udp_send(handle, data, dst),
@@ -660,6 +671,12 @@ fn recv_common(
     nonblock: bool,
 ) -> isize {
     let typ = super::with(handle, |_, entry| entry.typ);
+    if typ.is_some() {
+        let v6 = super::with(handle, |_, entry| matches!(entry.channel, Channel::Inet6));
+        if v6.unwrap_or(false) {
+            return err::ENETUNREACH;
+        }
+    }
     let received = match typ {
         Some(SOCK_STREAM) => tcp_recv(handle, out, nonblock),
         Some(SOCK_DGRAM) => udp_recv(handle, out, nonblock),
@@ -799,9 +816,41 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                 if local.is_some() {
                     return Err(err::EINVAL);
                 }
-                *local = Some(endpoint);
+                // A port of 0 means "pick one", and it is picked here rather
+                // than at connect: `getsockname` has to be able to answer
+                // before the caller connects to anything, which is the whole
+                // point of binding first. The stack is told at `connect`,
+                // which is where smoltcp wants the local endpoint - smoltcp's
+                // own `connect` refuses port 0 and takes the source port as an
+                // argument.
+                let port = if endpoint.port == 0 {
+                    stack.ephemeral()
+                } else {
+                    endpoint.port
+                };
+                // One name, one socket. Nothing underneath tracks the
+                // ownership - smoltcp binds each socket on its own and the
+                // interface only picks between them when it polls - so the
+                // table that sees every socket is where the check has to live.
+                // This entry is lifted out of its slot while the closure runs,
+                // so it cannot match itself.
+                let taken = stack.entries.iter().any(|slot| {
+                    matches!(slot, Some(super::Entry {
+                        channel: Channel::Tcp { local: Some(l), .. },
+                        ..
+                    }) if l.port == port)
+                });
+                if taken {
+                    return Err(err::EADDRINUSE);
+                }
+                *local = Some(IpEndpoint {
+                    addr: endpoint.addr,
+                    port,
+                });
                 Ok(())
             }
+            // The stub takes no addresses: its family has none to name.
+            Channel::Inet6 => Err(err::EAFNOSUPPORT),
             Channel::Udp {
                 handle: sock_handle,
                 bound,
@@ -856,10 +905,70 @@ pub(crate) fn handle_accept(_args: [usize; 6], _from_user: bool) -> isize {
     err::EOPNOTSUPP
 }
 
-/// `socketpair(domain, type, protocol, fds)` - a Unix-domain construct, and
-/// the Unix domain is not spoken here. Pipes cover the use cases.
-pub(crate) fn handle_socketpair(_args: [usize; 6], _from_user: bool) -> isize {
-    err::EOPNOTSUPP
+/// `socketpair(domain, type, protocol, fds)`.
+///
+/// One shape is real: `AF_UNIX`/`SOCK_STREAM`, a connected, bidirectional
+/// byte stream handed back as two descriptors. It is how a program gives a
+/// helper process a private channel - busybox's `wget` builds one to talk to
+/// its `ssl_client` child, which is the whole of its HTTPS support - so a
+/// kernel that answers `EOPNOTSUPP` here cannot do HTTPS at all, however
+/// well the TLS library on top of it works.
+///
+/// There is no Unix-domain *address* here, and no filesystem node: the two
+/// ends are anonymous and exist only as descriptors, which is the only kind
+/// `socketpair(2)` ever makes.
+pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
+    let (domain, raw_type, protocol, out) = (args[0] as u16, args[1] as u32, args[2], args[3]);
+    match domain {
+        AF_UNIX => {}
+        // A family this kernel speaks, but which has no pair operation: Linux
+        // creates the socket, finds no `->socketpair`, and answers
+        // `EOPNOTSUPP`. `EAFNOSUPPORT` would say the family is unknown, and a
+        // caller that distinguishes the two would draw the wrong conclusion.
+        AF_INET | AF_INET6 => return err::EOPNOTSUPP,
+        _ => return err::EAFNOSUPPORT,
+    }
+    let type_bits = raw_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    match type_bits {
+        t if t == SOCK_STREAM as u32 => {}
+        // Pairs that carry message boundaries rather than a byte stream: real
+        // shapes on Linux, and shapes this kernel does not have. Answering
+        // plainly beats answering wrongly - a caller that gets a pair here
+        // would go on to rely on boundaries that are not there.
+        t if t == SOCK_DGRAM as u32 || t == SOCK_SEQPACKET as u32 => {
+            return err::EOPNOTSUPP;
+        }
+        _ => return err::ESOCKTNOSUPPORT,
+    }
+    if protocol != 0 {
+        return err::EPROTONOSUPPORT;
+    }
+    if out == 0 || !crate::syscall::buffer_ok(out, 2 * size_of::<i32>(), true, from_user) {
+        return err::EFAULT;
+    }
+
+    let (first, second) = crate::vfs::pipe::DuplexEnd::pair();
+    let fds = [
+        crate::vfs::file::open_inode(first),
+        crate::vfs::file::open_inode(second),
+    ];
+    let table = crate::sched::current_fds();
+    for fd in fds {
+        if raw_type & SOCK_CLOEXEC != 0 {
+            let _ = table.fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+        }
+        if raw_type & SOCK_NONBLOCK != 0
+            && let Ok(file) = table.clone_at(fd)
+        {
+            file.set_status(crate::vfs::file::O_NONBLOCK);
+        }
+    }
+    unsafe {
+        let slot = out as *mut i32;
+        slot.write(fds[0]);
+        slot.add(1).write(fds[1]);
+    }
+    0
 }
 
 /// `getsockname(fd, addr, addrlen)`.
@@ -885,13 +994,24 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
         match &entry.channel {
             Channel::Tcp {
                 handle: sock_handle,
-                ..
-            } => stack
-                .sockets
-                .get_mut::<tcp::Socket>(*sock_handle)
-                .local_endpoint()
-                .unwrap_or(UNSPECIFIED_ENDPOINT),
+                local,
+            } => match local {
+                // The name `bind` settled - the one the caller is asking
+                // about, and the one `connect` will send from.
+                Some(local) => *local,
+                // Not bound, but possibly connected: `connect` picks the
+                // source port and hands it to the stack, which knows it even
+                // though nothing here recorded it.
+                None => stack
+                    .sockets
+                    .get_mut::<tcp::Socket>(*sock_handle)
+                    .local_endpoint()
+                    .unwrap_or(UNSPECIFIED_ENDPOINT),
+            },
             Channel::Udp { local, .. } => local.unwrap_or(UNSPECIFIED_ENDPOINT),
+            // A stub that cannot connect reads back as unspecified, the same
+            // as a fresh IPv4 socket does.
+            Channel::Inet6 => UNSPECIFIED_ENDPOINT,
         }
     });
     match endpoint {
@@ -939,6 +1059,8 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
                 Some(endpoint) => Ok(*endpoint),
                 None => Err(err::ENOTCONN),
             },
+            // Nowhere to be connected to, so no peer to name.
+            Channel::Inet6 => Err(err::ENOTCONN),
         }
     });
     match endpoint {
@@ -953,6 +1075,29 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
 
 /// `shutdown(fd, how)` - a half-close for streams, a no-op for datagrams.
 pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
+    const SHUT_RD: usize = 0;
+    const SHUT_WR: usize = 1;
+    const SHUT_RDWR: usize = 2;
+
+    let how = args[1];
+    if how > SHUT_RDWR {
+        return err::EINVAL;
+    }
+    // A `socketpair` end is not in the network stack - it is a pair of buffers
+    // with no address and no connection - so its half-close is done on the
+    // node itself. Everything else is a network socket, or is not one at all.
+    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
+        && let Some(end) = file.inode().as_duplex()
+    {
+        if how == SHUT_RD || how == SHUT_RDWR {
+            end.shut_read();
+        }
+        if how == SHUT_WR || how == SHUT_RDWR {
+            end.shut_write();
+        }
+        return 0;
+    }
+
     let handle = match socket_handle_of_fd(args[0] as i32) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -965,6 +1110,8 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
             stack.sockets.get_mut::<tcp::Socket>(*sock_handle).close();
         }
         Channel::Udp { .. } => {}
+        // Nothing is connected, so there is nothing to tear down.
+        Channel::Inet6 => {}
     });
     match done {
         Some(()) => 0,

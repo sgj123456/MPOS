@@ -39,6 +39,17 @@ pub struct File {
     /// changes behavior; the rest are stored so a caller reads back what it
     /// wrote.
     status: core::sync::atomic::AtomicU32,
+    /// The path this description was opened by, when the caller that made it
+    /// knew one.
+    ///
+    /// A directory needs this: `fchdir` has to hand the new cwd a name that
+    /// `getcwd` can read back, and a name is not something an inode carries -
+    /// one directory answers to as many names as there are edges to it.
+    /// Recording the name at open time is exact and costs one string;
+    /// recovering it later means searching the whole tree for the inode, which
+    /// is both slow and, on a path that cannot be reached from the root, has
+    /// no answer at all.
+    label: Mutex<RefCell<Option<alloc::string::String>>>,
 }
 
 impl File {
@@ -48,7 +59,18 @@ impl File {
             inode,
             pos: AtomicU64::new(0),
             status: core::sync::atomic::AtomicU32::new(0),
+            label: Mutex::new(RefCell::new(None)),
         }
+    }
+
+    /// Record the path this description was opened by.
+    pub fn set_label(&self, path: alloc::string::String) {
+        critical_section::with(|cs| *self.label.borrow(cs).borrow_mut() = Some(path));
+    }
+
+    /// The path this description was opened by, if it was ever told.
+    pub fn label(&self) -> Option<alloc::string::String> {
+        critical_section::with(|cs| self.label.borrow(cs).borrow().clone())
     }
 
     pub fn metadata(&self) -> Metadata {

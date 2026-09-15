@@ -7,7 +7,9 @@ pub mod critical;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
+pub mod pci;
 pub mod pic;
+pub mod rtc;
 pub mod syscall;
 pub mod timer;
 
@@ -39,11 +41,16 @@ pub fn kernel_sections() -> KernelSections {
 
 /// Bring up the interrupt subsystem: descriptors first, then the clock, then
 /// unmask. Order matters - the PIT must not fire before the IDT is loaded.
+///
+/// The RTC read happens here too, before interrupts are on: it is plain port
+/// I/O with no dependency on anything but the CPU, and anchoring wall time
+/// before the first tick keeps `clock_gettime` coherent from the start.
 pub fn init_interrupts() {
     gdt::init();
     idt::init();
     pic::remap();
     timer::init();
+    rtc::init();
     syscall::init();
 }
 

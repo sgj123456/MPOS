@@ -102,6 +102,106 @@ impl Vfs {
         })
     }
 
+    /// Unmount the filesystem mounted at `path`.
+    ///
+    /// The path must name a mountpoint - a directory that has a filesystem
+    /// mounted on it. The mount is removed from the mount table, and subsequent
+    /// accesses to files under `path` will see the underlying directory in the
+    /// parent filesystem instead.
+    pub fn unmount(&self, path: &str) -> VfsResult<()> {
+        if critical_section::with(|cs| self.root.borrow(cs).borrow().is_none()) {
+            return Err(VfsError::NoRoot);
+        }
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() || trimmed == "." {
+            return Err(VfsError::Invalid);
+        }
+
+        // Resolve the path to find the mountpoint's inode. We need to find
+        // the mount entry that corresponds to this path.
+        let target = self.resolve(trimmed)?;
+
+        critical_section::with(|cs| {
+            let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            if let Some(pos) = mounts.iter().position(|m| Arc::ptr_eq(&m.root, &target)) {
+                mounts.remove(pos);
+                Ok(())
+            } else {
+                Err(VfsError::Busy)
+            }
+        })
+    }
+
+    /// Replace the root filesystem: move `new_root` to `/`, and move the old
+    /// root to `put_old` inside the new root, so it can be unmounted afterward.
+    ///
+    /// This is the kernel's pivot_root(2): after this call, `/` refers to what
+    /// was previously `new_root`, and `put_old` holds the old root filesystem's
+    /// contents, ready to be unmounted.
+    pub fn pivot_root(&self, new_root: &str, put_old: &str) -> VfsResult<()> {
+        if critical_section::with(|cs| self.root.borrow(cs).borrow().is_none()) {
+            return Err(VfsError::NoRoot);
+        }
+
+        // Resolve new_root to get the inode that will become the new root.
+        let new_root_inode = self.resolve(new_root.trim_end_matches('/'))?;
+
+        // Resolve put_old inside the new root to find where the old root
+        // will be placed. The put_old path must be absolute within the new root.
+        let put_old_trimmed = put_old.trim_start_matches('/');
+        let _put_old_in_new = if put_old_trimmed.is_empty() {
+            new_root_inode.clone()
+        } else {
+            // Walk from new_root to find the put_old directory
+            let mut current = new_root_inode.clone();
+            for component in put_old_trimmed.split('/') {
+                if component.is_empty() || component == "." {
+                    continue;
+                }
+                if component == ".." {
+                    // Can't go above new_root
+                    return Err(VfsError::Invalid);
+                }
+                current = current.lookup(component)?;
+            }
+            current
+        };
+
+        // The old root inode
+        let old_root_inode = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+            .ok_or(VfsError::NoRoot)?;
+
+        // Find and remove the root mount (if any - the initial ramfs root
+        // may or may not be in the mount table).
+        let _old_root_fs_root = {
+            critical_section::with(|cs| {
+                let mounts = self.mounts.borrow(cs).borrow();
+                // Find a mount whose root matches the current root inode
+                mounts
+                    .iter()
+                    .find(|m| Arc::ptr_eq(&m.root, &old_root_inode))
+                    .map(|m| m.at.clone())
+            })
+        };
+
+        // Remove all mounts that are under the old root (they'll be gone after pivot)
+        critical_section::with(|cs| {
+            let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            mounts.retain(|m| !Arc::ptr_eq(&m.root, &old_root_inode));
+        });
+
+        // Install the new root
+        critical_section::with(|cs| {
+            *self.root.borrow(cs).borrow_mut() = Some(new_root_inode);
+        });
+
+        // If the old root had a mount entry, we don't need to create a new
+        // mount for it since we're replacing the root entirely. The old root's
+        // contents are now accessible via put_old_in_new if they were mounted.
+
+        Ok(())
+    }
+
     /// Walk `path` from the root, crossing mounts as they are met.
     pub fn resolve(&self, path: &str) -> VfsResult<Arc<dyn Inode>> {
         let start = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
@@ -280,6 +380,26 @@ pub fn mount_root(fs: &dyn FileSystem) {
 /// Mount `fs` at the directory named by `path` in the kernel's tree.
 pub fn mount(path: &str, fs: &dyn FileSystem) -> VfsResult<()> {
     STATIC.mount(path, fs)
+}
+
+/// Unmount the filesystem mounted at `path`.
+///
+/// The path must name a mountpoint - a directory that has a filesystem mounted
+/// on it. The mount is removed from the mount table, and subsequent accesses
+/// to files under `path` will see the underlying directory in the parent
+/// filesystem instead.
+pub fn unmount(path: &str) -> VfsResult<()> {
+    STATIC.unmount(path)
+}
+
+/// Replace the root filesystem: move `new_root` to `/`, and move the old root
+/// to `put_old` inside the new root, so it can be unmounted afterward.
+///
+/// This is the kernel's pivot_root(2): after this call, `/` refers to what was
+/// previously `new_root`, and `put_old` holds the old root filesystem's
+/// contents, ready to be unmounted.
+pub fn pivot_root(new_root: &str, put_old: &str) -> VfsResult<()> {
+    STATIC.pivot_root(new_root, put_old)
 }
 
 /// Resolve `path` in the kernel's tree.

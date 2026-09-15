@@ -88,6 +88,71 @@ pub fn find_filesystem(dev: Arc<dyn BlockDev>) -> Option<Arc<dyn BlockDev>> {
     None
 }
 
+/// Find the root filesystem partition (partition 3 in the new layout).
+///
+/// This is the ext2 partition that contains the real root filesystem.
+/// Unlike `find_filesystem` which finds *any* ext2 partition, this specifically
+/// targets the rootfs partition for the pivot_root transition.
+pub fn find_rootfs(dev: Arc<dyn BlockDev>) -> Option<Arc<dyn BlockDev>> {
+    // The rootfs is on partition 3 (1-indexed), which is the third entry
+    // in the GPT table. We skip the first two partitions (ESP and boot)
+    // and look for the third ext2 partition.
+    let parts = partitions(dev.as_ref());
+    if parts.len() < 3 {
+        return None;
+    }
+    let (start, sectors) = parts[2]; // 0-indexed, so index 2 is partition 3
+    if start.checked_add(sectors)? > dev.capacity_sectors() {
+        return None;
+    }
+    if has_ext2(dev.as_ref(), start * SECTOR) {
+        Some(Arc::new(Window::new(dev, start, sectors)))
+    } else {
+        None
+    }
+}
+
+/// Find the boot partition (partition 2 in the new layout).
+///
+/// This is the ext2 partition that contains the kernel and initramfs.
+/// After pivot_root, this can be mounted at /boot.
+pub fn find_boot(dev: Arc<dyn BlockDev>) -> Option<Arc<dyn BlockDev>> {
+    // The boot partition is on partition 2 (1-indexed), which is the second
+    // entry in the GPT table.
+    let parts = partitions(dev.as_ref());
+    if parts.len() < 2 {
+        return None;
+    }
+    let (start, sectors) = parts[1]; // 0-indexed, so index 1 is partition 2
+    if start.checked_add(sectors)? > dev.capacity_sectors() {
+        return None;
+    }
+    if has_ext2(dev.as_ref(), start * SECTOR) {
+        Some(Arc::new(Window::new(dev, start, sectors)))
+    } else {
+        None
+    }
+}
+
+/// Find the data partition (partition 4 in the new layout).
+///
+/// This is the small ext2 partition containing seed files, mounted at /mnt.
+pub fn find_data(dev: Arc<dyn BlockDev>) -> Option<Arc<dyn BlockDev>> {
+    let parts = partitions(dev.as_ref());
+    if parts.len() < 4 {
+        return None;
+    }
+    let (start, sectors) = parts[3]; // 0-indexed, so index 3 is partition 4
+    if start.checked_add(sectors)? > dev.capacity_sectors() {
+        return None;
+    }
+    if has_ext2(dev.as_ref(), start * SECTOR) {
+        Some(Arc::new(Window::new(dev, start, sectors)))
+    } else {
+        None
+    }
+}
+
 /// Whether an ext2 superblock begins `at` bytes into the device.
 fn has_ext2(dev: &dyn BlockDev, at: u64) -> bool {
     let mut buf = [0u8; SECTOR as usize];
