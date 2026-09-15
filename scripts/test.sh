@@ -41,7 +41,7 @@ if [[ ${#MARKERS[@]} -eq 0 ]]; then
         "t_openat" "t_read" "t_write" "t_lseek" "t_readv" "t_writev" "t_fstat" \
         "t_newfstatat" "t_statx" "t_access" "t_faccessat" "t_readlink" "t_fcntl" \
         "t_dup" "t_dup2" "t_dup3" "t_ioctl" "t_getdents64" "t_pipe2" "t_mkdirat" \
-        "t_renameat2" "t_rename" "t_unlinkat" "t_getcwd" "t_chdir" "t_brk" "t_mmap" \
+        "t_renameat2" "t_rename" "t_rmdir" "t_unlinkat" "t_getcwd" "t_chdir" "t_brk" "t_mmap" \
         "t_mprotect" "t_munmap" "t_mremap" "t_madvise" "t_rt_sigaction" \
         "t_rt_sigprocmask" "t_sigaltstack" "t_kill" "t_clock_gettime" \
         "t_nanosleep" "t_poll" "t_prlimit64" "t_futex" "t_execve" "t_fork" \

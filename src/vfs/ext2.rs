@@ -500,7 +500,16 @@ impl Core {
     /// levels of indirection reach. The indirect blocks themselves go last,
     /// once nothing points through them. A zero pointer is a hole: nothing
     /// was ever allocated for it.
+    ///
+    /// A fast symlink has no blocks to free and must not be walked: its
+    /// "pointers" are the *text* of the name it stands for, and a target that
+    /// reads as a number would take blocks out of somebody else's file -
+    /// or, when it does not read as a plausible one at all, walk off the end
+    /// of the group table and take the kernel with it.
     fn free_blocks_of(&self, data: &InodeData) {
+        if data.is_fast_symlink() {
+            return;
+        }
         let per_block = self.block_size() / 4;
         for entry in &data.block[..DIRECT_BLOCKS] {
             if *entry != 0 {
@@ -774,6 +783,11 @@ impl Core {
         let mut data = InodeData {
             mode: match kind {
                 NodeKind::Dir => S_IFDIR | 0o755,
+                // A link's permissions are not consulted by anything - Linux
+                // ignores them - but every real ext2 link carries 0777, and a
+                // filesystem tool that reads this back should see what it
+                // expects.
+                NodeKind::Symlink => S_IFLNK | 0o777,
                 _ => S_IFREG | 0o644,
             },
             flags: 0,
@@ -1080,6 +1094,88 @@ impl Inode for Ext2Ino {
             self.fs.write_inode(child, &data);
         }
         Ok(())
+    }
+
+    /// Remove the empty directory `name`.
+    ///
+    /// The accounting is why this cannot be [`Self::unlink`] with a flag.
+    /// A directory's link count is not one name but three kinds of them: its
+    /// parent's entry, its own `.`, and each of its children's `..`. So an
+    /// empty one still holds two, its parent holds one on its behalf - that is
+    /// the `+1` [`Self::create`] gave it - and removing it has to give that
+    /// one back. Everything is checked before anything is written, so a
+    /// refusal leaves both directories exactly as they were.
+    fn rmdir(&self, name: &str) -> VfsResult<()> {
+        self.require_dir()?;
+        let mut dir = self.fs.read_inode(self.ino);
+        let child = self.fs.dir_lookup(&dir, name)?.ok_or(VfsError::NoEntry)?;
+        let data = self.fs.read_inode(child);
+        if data.kind() != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        // `.` and `..` are entries of every directory and are not contents.
+        // Anything else is something to lose, so the call stops here.
+        let holds_something = self
+            .fs
+            .dir_entries(&data)?
+            .iter()
+            .any(|(entry, _)| entry != "." && entry != "..");
+        if holds_something {
+            return Err(VfsError::NotEmpty);
+        }
+
+        self.fs.dir_remove(&mut dir, name)?;
+        dir.links -= 1;
+        self.fs.write_inode(self.ino, &dir);
+        // The child's own two links - its name here and its `.` - went with
+        // it, so nothing is left to decrement.
+        self.fs.free_inode(child);
+        Ok(())
+    }
+
+    /// Make a symbolic link called `name` holding `target`.
+    ///
+    /// The target is stored, not resolved: a link may point at a path that does
+    /// not exist yet, and POSIX says making one is still allowed. What the
+    /// format decides is *where* the text goes - inside the inode when it fits
+    /// the footprint of the block pointers, in a data block when it does not -
+    /// and that choice is invisible from outside, which is why `readlink` reads
+    /// both the same way. Every package in a distribution that ships versioned
+    /// libraries is built out of these: `libfoo.so.1` is a link to
+    /// `libfoo.so.1.2.0`, and a filesystem that cannot make one cannot install
+    /// a package.
+    fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+        self.require_dir()?;
+        let mut dir = self.fs.read_inode(self.ino);
+        if self.fs.dir_lookup(&dir, name)?.is_some() {
+            return Err(VfsError::Exists);
+        }
+        let child = self.fs.new_inode(NodeKind::Symlink, self.ino)?;
+        let mut data = self.fs.read_inode(child);
+        let bytes = target.as_bytes();
+        if bytes.len() as u32 <= FAST_SYMLINK_MAX {
+            // A fast link: the target *is* the block-pointer area, so no block
+            // is ever allocated and `i_blocks` stays zero - which is the very
+            // thing that says the target lives in the inode.
+            let mut raw = [0u8; FAST_SYMLINK_MAX as usize];
+            raw[..bytes.len()].copy_from_slice(bytes);
+            for (i, ptr) in data.block.iter_mut().enumerate() {
+                *ptr = u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().expect("four bytes"));
+            }
+        } else {
+            // Too long for the inode, so it reads like a file's contents - and
+            // `readlink` reads it back that way.
+            let block = self.fs.alloc_block()?;
+            data.block[0] = block as u32;
+            data.blocks = (self.fs.block_size() / 512) as u32;
+            self.fs.write_bytes(block, 0, bytes);
+        }
+        data.size = bytes.len() as u32;
+        self.fs.write_inode(child, &data);
+
+        self.fs.dir_add(&mut dir, name, child, FT_SYMLINK)?;
+        self.fs.write_inode(self.ino, &dir);
+        Ok(self.wrap(child))
     }
 
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
@@ -1627,6 +1723,132 @@ mod tests {
         let dir = root.create("d", NodeKind::Dir).expect("create dir");
         assert_eq!(dir.truncate(0).err(), Some(VfsError::IsDir));
         assert_eq!(root.truncate(0).err(), Some(VfsError::IsDir));
+    }
+
+    #[test]
+    fn a_symlink_puts_its_target_where_it_fits_and_reads_it_back() {
+        let dev = Arc::new(format());
+        assert_eq!(free_counts(&dev), (115, 62));
+        let fs = mounted(dev.clone());
+        let root = fs.root();
+
+        // A target that fits the inode's block-pointer area lives there, and
+        // costs nothing but the inode - which is the format's fast link, and
+        // what `libfoo.so.1 -> libfoo.so.1.2.0` is in every package ever built.
+        let fast = root.symlink("short", "/bin/busybox").expect("fast link");
+        assert_eq!(fast.metadata().kind, NodeKind::Symlink);
+        assert_eq!(fast.readlink().unwrap(), "/bin/busybox");
+        assert_eq!(fast.metadata().size, 12);
+        assert_eq!(free_counts(&dev), (115, 61), "an inode, but no data block");
+
+        // One that does not fit gets a block, and reads back identically - the
+        // choice is invisible from outside, which is the point.
+        let long = "/usr/libexec/some/very/long/path/that/does/not/fit/anywhere/busybox";
+        assert!(long.len() > 60, "the long case has to be long");
+        let slow = root.symlink("long", long).expect("slow link");
+        assert_eq!(slow.readlink().unwrap(), long);
+        assert_eq!(slow.metadata().size, long.len() as u64);
+        assert_eq!(free_counts(&dev), (114, 60), "and one block for the target");
+
+        // The name is taken; the target does not have to exist.
+        assert_eq!(
+            root.symlink("short", "/elsewhere").err(),
+            Some(VfsError::Exists)
+        );
+
+        // A cold mount is the only witness that this reached the disk.
+        drop(fast);
+        drop(slow);
+        drop(root);
+        drop(fs);
+        let fs2 = mounted(dev);
+        let root2 = fs2.root();
+        assert_eq!(
+            root2.lookup("short").unwrap().readlink().unwrap(),
+            "/bin/busybox"
+        );
+        assert_eq!(root2.lookup("long").unwrap().readlink().unwrap(), long);
+
+        // And a link is not a file: writing through one, or resizing it, would
+        // rewrite where it points.
+        let link = root2.lookup("long").unwrap();
+        assert_eq!(link.write_at(0, b"x").err(), Some(VfsError::Invalid));
+        assert_eq!(link.truncate(0).err(), Some(VfsError::Invalid));
+        assert_eq!(
+            link.read_at(0, &mut [0u8; 4]).err(),
+            Some(VfsError::Invalid)
+        );
+    }
+
+    #[test]
+    fn unlinking_a_symlink_gives_back_only_what_it_took() {
+        let dev = Arc::new(format());
+        assert_eq!(free_counts(&dev), (115, 62));
+        let fs = mounted(dev.clone());
+        let root = fs.root();
+
+        // A fast link's "block pointers" are the text of its target. Freeing
+        // them as if they were block numbers takes blocks out of whatever else
+        // is on the filesystem - or, when the text is not a plausible number,
+        // walks off the group table and panics. `/bin/busybox` reads as one.
+        root.symlink("fast", "/bin/busybox").expect("fast link");
+        assert_eq!(free_counts(&dev), (115, 61), "an inode, and nothing else");
+        root.unlink("fast").expect("unlink the fast link");
+        assert_eq!(
+            free_counts(&dev),
+            (115, 62),
+            "the inode came back and no block was ever touched"
+        );
+
+        // The same for a link whose target needed a block: that block *is* its
+        // own, and does come back.
+        let long = "/usr/libexec/some/very/long/path/that/does/not/fit/in/an/inode/busybox";
+        root.symlink("slow", long).expect("slow link");
+        assert_eq!(free_counts(&dev), (114, 61), "the block and the inode");
+        root.unlink("slow").expect("unlink the slow link");
+        assert_eq!(free_counts(&dev), (115, 62), "both came back");
+    }
+
+    #[test]
+    fn rmdir_takes_an_empty_directory_and_puts_the_books_back() {
+        let dev = Arc::new(format());
+        assert_eq!(free_counts(&dev), (115, 62));
+        let fs = mounted(dev.clone());
+        let root = fs.root();
+        let root_links = fs.core.read_inode(ROOT_INO).links;
+
+        let dir = root.create("d", NodeKind::Dir).expect("create dir");
+        // A new subdirectory is a name in its parent *and* a `..` pointing
+        // back at it, so the parent gains a link as well as the child.
+        assert_eq!(fs.core.read_inode(ROOT_INO).links, root_links + 1);
+        assert_eq!(free_counts(&dev), (114, 61), "one block and one inode");
+
+        // Not empty, and it must say so rather than take what is inside with
+        // it: that is the whole difference between `rmdir` and a recursive
+        // delete wearing the wrong name.
+        let inner = dir.create("inner", NodeKind::File).expect("create inner");
+        inner.write_at(0, b"x").unwrap();
+        assert_eq!(root.rmdir("d").err(), Some(VfsError::NotEmpty));
+        assert!(root.lookup("d").is_ok(), "the directory is still there");
+
+        // Emptying it is the caller's job, one name at a time.
+        dir.unlink("inner").expect("unlink what was inside");
+        root.rmdir("d").expect("rmdir the empty directory");
+        assert_eq!(
+            fs.core.read_inode(ROOT_INO).links,
+            root_links,
+            "the parent's link came back"
+        );
+        assert_eq!(
+            free_counts(&dev),
+            (115, 62),
+            "and so did the child's block and inode"
+        );
+
+        // A file is not a directory, and a name that is not there is not one.
+        root.create("f", NodeKind::File).expect("create file");
+        assert_eq!(root.rmdir("f").err(), Some(VfsError::NotDir));
+        assert_eq!(root.rmdir("gone").err(), Some(VfsError::NoEntry));
     }
 
     #[test]

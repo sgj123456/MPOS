@@ -97,6 +97,8 @@ pub enum VfsError {
     IsDir,
     /// EEXIST: an entry of that name is already there.
     Exists,
+    /// ENOTEMPTY: `rmdir` named a directory that still holds something.
+    NotEmpty,
     /// EBUSY: the mountpoint is already mounted.
     Busy,
     /// EBADF: no such open file description.
@@ -141,6 +143,19 @@ pub trait Inode: Send + Sync {
     /// lives on while anything still names it; the last name going is what
     /// frees it.
     fn unlink(&self, name: &str) -> VfsResult<()> {
+        let _ = name;
+        Err(VfsError::Unsupported)
+    }
+
+    /// Drop the **empty** directory called `name`.
+    ///
+    /// A separate operation from [`Self::unlink`] because a directory is not
+    /// just a name: it holds its own `.` and every child's `..`, so removing
+    /// one is a different piece of accounting, and it is only legal when there
+    /// is nothing underneath. Answering `NotEmpty` is the whole reason the
+    /// kernel has a separate `rmdir` - a call that removed a directory and its
+    /// contents would be a recursive delete wearing the wrong name.
+    fn rmdir(&self, name: &str) -> VfsResult<()> {
         let _ = name;
         Err(VfsError::Unsupported)
     }
@@ -295,35 +310,27 @@ pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
 
 /// Split `path` into its parent directory and the name at the end - the two
 /// halves of every make-or-remove, since the name edge lives in the parent.
-/// `/f` is the root and `f`; a path with no slash has no parent here to name,
-/// and `.` and `..` are directories that already exist, not names to make.
+///
+/// A bare name has no slash in it, and that does not make it unnameable: it
+/// sits beside whatever directory the caller is in, which `.` spells exactly.
+/// Resolving `.` against the caller's cwd is what turns `mkdir a` into `mkdir
+/// /where/the/shell/is/a`, and getting this wrong is why it used to answer
+/// `EINVAL`. The caller resolves the parent against its cwd, so this returns
+/// `.` rather than reaching for the root.
+///
+/// The last name is still refused if it is `.` or `..`: those name a directory
+/// that already exists, not an entry to make or remove.
 pub(crate) fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
     let trimmed = path.trim_end_matches('/');
-    let Some(slash) = trimmed.rfind('/') else {
-        return Err(VfsError::Invalid);
+    let (parent, name) = match trimmed.rfind('/') {
+        Some(0) => ("/", &trimmed[1..]),
+        Some(slash) => (&trimmed[..slash], &trimmed[slash + 1..]),
+        None => (".", trimmed),
     };
-    let name = &trimmed[slash + 1..];
     if name.is_empty() || name == "." || name == ".." {
         return Err(VfsError::Invalid);
     }
-    let parent = if slash == 0 { "/" } else { &trimmed[..slash] };
     Ok((parent, name))
-}
-
-/// [`split_parent`](fn.split_parent.html) for a caller that carries a cwd:
-/// a bare relative name - no slash at all - has the cwd itself as its
-/// parent, which is exactly what `./name` spells. Only a caller with a cwd
-/// can say that; the kernel's own callers keep the strict split.
-fn split_parent_with_cwd(path: &str, has_cwd: bool) -> VfsResult<(&str, &str)> {
-    if !path.contains('/') {
-        // A bare name next to a cwd: "." from the cwd is the cwd.
-        return if has_cwd {
-            Ok((".", path))
-        } else {
-            Err(VfsError::Invalid)
-        };
-    }
-    split_parent(path)
 }
 
 /// Make an empty file at `path` and hand back the inode. `Exists` when the
@@ -378,12 +385,142 @@ pub fn read_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Vec
 
 /// [`create_file`](fn.create_file.html) with a caller-supplied start.
 pub fn create_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Arc<dyn Inode>> {
-    let (parent, name) = split_parent_with_cwd(path, start.is_some())?;
+    let (parent, name) = split_parent(path)?;
     resolve_opt(parent, start)?.create(name, NodeKind::File)
 }
 
 /// [`unlink_path`](fn.unlink_path.html) with a caller-supplied start.
 pub fn unlink_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
-    let (parent, name) = split_parent_with_cwd(path, start.is_some())?;
+    let (parent, name) = split_parent(path)?;
     resolve_opt(parent, start)?.unlink(name)
+}
+
+/// Remove the empty directory named by `path`.
+pub fn rmdir_path(path: &str) -> VfsResult<()> {
+    let (parent, name) = split_parent(path)?;
+    resolve(parent)?.rmdir(name)
+}
+
+/// [`rmdir_path`](fn.rmdir_path.html) with a caller-supplied start.
+pub fn rmdir_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
+    let (parent, name) = split_parent(path)?;
+    resolve_opt(parent, start)?.rmdir(name)
+}
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use alloc::sync::Arc;
+
+    use super::mount::Vfs;
+    use super::{NodeKind, VfsError, split_parent};
+
+    #[test]
+    fn a_bare_name_is_a_name_beside_the_caller() {
+        // The shape `mkdir a` uses, and the one that must not answer EINVAL:
+        // with no slash there is nothing to split off, so the parent is the
+        // caller's own directory and resolving `.` against its cwd finds it.
+        assert_eq!(split_parent("a").ok(), Some((".", "a")));
+        assert_eq!(split_parent("a/b").ok(), Some(("a", "b")));
+        assert_eq!(split_parent("/a").ok(), Some(("/", "a")));
+        assert_eq!(split_parent("/a/b/").ok(), Some(("/a", "b")));
+        assert_eq!(split_parent("./a").ok(), Some((".", "a")));
+    }
+
+    #[test]
+    fn the_last_name_cannot_be_a_directory_that_already_exists() {
+        // `.` and `..` name directories, not entries to make or remove. A path
+        // that ends in one is asking to create or delete a directory by
+        // accident, so it is refused rather than resolved to something.
+        assert_eq!(split_parent(".").err(), Some(VfsError::Invalid));
+        assert_eq!(split_parent("..").err(), Some(VfsError::Invalid));
+        assert_eq!(split_parent("/a/.").err(), Some(VfsError::Invalid));
+        assert_eq!(split_parent("/").err(), Some(VfsError::Invalid));
+        assert_eq!(split_parent("").err(), Some(VfsError::Invalid));
+    }
+
+    #[test]
+    fn a_relative_path_resolves_from_the_directory_it_is_given() {
+        let vfs = Vfs::new();
+        let fs = crate::vfs::ramfs::RamFs::new();
+        vfs.mount_root(&*fs);
+        let root = vfs.resolve("/").unwrap();
+        let here = root.create("here", NodeKind::Dir).unwrap();
+        let sub = here.create("sub", NodeKind::Dir).unwrap();
+        let inside = here.create("f", NodeKind::File).unwrap();
+
+        // The same name means the same node, whether it is spelled from the
+        // root or from the directory it is in.
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_from("f", here.clone()).unwrap(),
+            &inside
+        ));
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_from("./f", here.clone()).unwrap(),
+            &inside
+        ));
+        // An absolute path ignores the start entirely, as `/` must.
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_from("/here/f", root.clone()).unwrap(),
+            &inside
+        ));
+        // `..` has to actually go up. This is the part an inode cannot do on
+        // its own - nothing points from a directory back to its parent - so it
+        // is the case that makes the resolver search rather than pop.
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_from("../f", sub.clone()).unwrap(),
+            &inside
+        ));
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_from("../..", sub.clone()).unwrap(),
+            &root
+        ));
+        // `..` at the root stays at the root, as POSIX says.
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_from("..", root.clone()).unwrap(),
+            &root
+        ));
+        // A file has no `..`: an ordinary walk would have to look a name up in
+        // it first, and that is ENOTDIR.
+        assert_eq!(
+            vfs.resolve_from("../elsewhere", inside).err(),
+            Some(VfsError::NotDir)
+        );
+    }
+
+    #[test]
+    fn resolving_a_name_without_following_it_still_handles_dot() {
+        // `lstat(".")` is what a directory-listing tool asks first, and it is
+        // the case a parent/name split cannot express. It must answer the
+        // directory itself rather than refuse.
+        let vfs = Vfs::new();
+        let fs = crate::vfs::ramfs::RamFs::new();
+        vfs.mount_root(&*fs);
+        let root = vfs.resolve("/").unwrap();
+        let here = root.create("here", NodeKind::Dir).unwrap();
+        here.create("f", NodeKind::File).unwrap();
+
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_no_follow(".", here.clone()).unwrap(),
+            &here
+        ));
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_no_follow("..", here.clone()).unwrap(),
+            &root
+        ));
+        // And the no-follow walk still does not follow, which is the whole
+        // reason it exists.
+        let link = here.symlink("link", "f").unwrap();
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_no_follow("link", here.clone()).unwrap(),
+            &link
+        ));
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_from("link", here.clone()).unwrap(),
+            &here.lookup("f").unwrap()
+        ));
+        assert_eq!(
+            vfs.resolve_no_follow("missing", root).err(),
+            Some(VfsError::NoEntry)
+        );
+    }
 }

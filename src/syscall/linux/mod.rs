@@ -58,6 +58,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // its *at equivalent at the caller's cwd.
         nr::UNLINK => fs::unlinkat([fs::AT_FDCWD as usize, args[0], 0, 0, 0, 0], &cwd()),
         nr::MKDIR => fs::mkdirat([fs::AT_FDCWD as usize, args[0], args[1], 0, 0, 0], &cwd()),
+        nr::RMDIR => fs::rmdir(args, &cwd()),
         nr::RENAME => fs::renameat2(
             [
                 fs::AT_FDCWD as usize,
@@ -196,6 +197,8 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::CHMOD => fs::handle_chmod(args, &cwd()),
         nr::FCHMOD => fs::handle_fchmod(args),
         nr::CHOWN => fs::handle_chown(args, &cwd()),
+        nr::FCHOWNAT => fs::handle_fchownat(args, &cwd()),
+        nr::LCHOWN => fs::handle_lchown(args, &cwd()),
         nr::FCHOWN => fs::handle_fchown(args),
         // The legacy `link` names two paths; `linkat` names two dirfds and
         // the paths under them, and is the shape the handler wants.

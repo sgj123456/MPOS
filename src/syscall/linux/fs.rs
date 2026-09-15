@@ -291,11 +291,8 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
     // walks to the parent and looks the name up there - a resolver that
     // followed links would hand back the very thing it was told not to.
     let meta = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        match crate::vfs::global().resolve_parent_from(&path, base) {
-            Ok((parent, name)) => match parent.lookup(&name) {
-                Ok(inode) => inode.metadata(),
-                Err(e) => return err_of(e),
-            },
+        match crate::vfs::global().resolve_no_follow(&path, base) {
+            Ok(inode) => inode.metadata(),
             Err(e) => return err_of(e),
         }
     } else {
@@ -478,6 +475,12 @@ fn normalize_path(path: &str, base: &str) -> alloc::string::String {
 /// `unlinkat(dirfd, path, flags)` - `AT_REMOVEDIR` is accepted and ignored:
 /// removal goes through the same unlink either way.
 pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    // `AT_REMOVEDIR` is `unlinkat` spelling `rmdir`: the flag is not an
+    // optimisation, it is how the caller says which of the two operations it
+    // means, and getting it wrong either removes a directory that still holds
+    // something or refuses a plain file.
+    const AT_REMOVEDIR: usize = 0x200;
+
     let base = match base_of(args[0] as i32, cwd) {
         Ok(base) => base,
         Err(e) => return e,
@@ -486,7 +489,28 @@ pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
         Ok(path) => path,
         Err(e) => return e,
     };
-    match crate::vfs::unlink_opt(&path, Some(base)) {
+    let outcome = if args[2] & AT_REMOVEDIR != 0 {
+        crate::vfs::rmdir_opt(&path, Some(base))
+    } else {
+        crate::vfs::unlink_opt(&path, Some(base))
+    };
+    match outcome {
+        Ok(()) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `rmdir(path)` - remove an empty directory by name.
+///
+/// A separate call from `unlink` because a directory is a different thing to
+/// take apart: it must be empty, and the kernel has to say so rather than
+/// quietly taking what was underneath with it.
+pub(super) fn rmdir(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let path = match cstr_arg(args[0], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    match crate::vfs::rmdir_opt(&path, Some(cwd.clone())) {
         Ok(()) => 0,
         Err(e) => err_of(e),
     }
@@ -502,6 +526,20 @@ pub(super) fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
+    // A name that is already taken is `EEXIST`, whatever kind of thing holds
+    // it - and the names that are always taken are exactly the ones a
+    // parent/name split cannot express: `/`, `.` and `..`. Checking here is
+    // what makes `mkdir -p` work, and its absence was not a small thing:
+    // `-p` creates a path by walking *up* it and stopping at the first
+    // ancestor that is already there, so an `EINVAL` where an `EEXIST`
+    // belonged sent it all the way to `mkdir("/")` and aborted the whole
+    // command with "can't create directory '/'".
+    if crate::vfs::global()
+        .resolve_no_follow(&path, base.clone())
+        .is_ok()
+    {
+        return err::EEXIST;
+    }
     let (parent, name) = match crate::vfs::split_parent(&path) {
         Ok(p) => p,
         Err(e) => return err_of(e),
@@ -625,12 +663,9 @@ pub(super) fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
     } else {
         // The link, not what it points at: a resolver that followed it would
         // answer EINVAL for every link and the target for nothing.
-        match crate::vfs::global().resolve_parent_from(&path, cwd.clone()) {
-            Ok((parent, name)) => match parent.lookup(&name) {
-                Ok(node) => match node.readlink() {
-                    Ok(target) => target,
-                    Err(e) => return err_of(e),
-                },
+        match crate::vfs::global().resolve_no_follow(&path, cwd.clone()) {
+            Ok(node) => match node.readlink() {
+                Ok(target) => target,
                 Err(e) => return err_of(e),
             },
             Err(e) => return err_of(e),
@@ -657,11 +692,20 @@ pub(super) fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
-    match crate::vfs::global().resolve_parent_from(&path, cwd.clone()) {
-        Ok((parent, name)) => match parent.symlink(&name, &target) {
-            Ok(_) => 0,
-            Err(e) => err_of(e),
-        },
+    // The parent, not the name: the name is what this call is about to make,
+    // so it must *not* be there, and asking the tree for it would only
+    // discover that. Splitting it off is also what keeps a link from being
+    // written in place of the link it points at.
+    let (parent_path, name) = match crate::vfs::split_parent(&path) {
+        Ok(p) => p,
+        Err(e) => return err_of(e),
+    };
+    let parent = match crate::vfs::resolve_opt(parent_path, Some(cwd.clone())) {
+        Ok(parent) => parent,
+        Err(e) => return err_of(e),
+    };
+    match parent.symlink(name, &target) {
+        Ok(_) => 0,
         Err(e) => err_of(e),
     }
 }
@@ -1968,6 +2012,57 @@ pub(super) fn handle_fchown(args: [usize; ARG_COUNT]) -> isize {
         Ok(_) => 0,
         Err(e) => err_of(e),
     }
+}
+
+/// `fchownat(dirfd, path, uid, gid, flags)` — the path form, and the only one
+/// this architecture has: there is no `lchown` syscall, so this is what musl's
+/// `lchown` becomes.
+///
+/// The flag is the reason the call exists here at all. `AT_SYMLINK_NOFOLLOW` is
+/// what makes it able to name a *link* rather than what it points at, which is
+/// the whole difference between `chown` and `lchown` - and a file that is not
+/// there is still an error, because the caller is naming something.
+pub(super) fn handle_fchownat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let base = match base_of(args[0] as i32, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let found = if args[4] & AT_SYMLINK_NOFOLLOW != 0 {
+        crate::vfs::global().resolve_no_follow(&path, base)
+    } else {
+        crate::vfs::resolve_opt(&path, Some(base))
+    };
+    // The owner is not stored, so nothing is changed - but the name is still
+    // resolved, because a caller that named something wrong has to hear about
+    // it rather than be told the owner was set.
+    match found {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `lchown(path, uid, gid)` — the owner of the link itself.
+///
+/// This is `fchownat` with the one flag that makes it name the link rather than
+/// what it points at, which is the whole of what `lchown` is. A tool unpacking
+/// an archive sets the owner of every member, and a link is a member like any
+/// other.
+pub(super) fn handle_lchown(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    handle_fchownat(
+        [
+            AT_FDCWD as usize,
+            args[0],
+            args[1],
+            args[2],
+            AT_SYMLINK_NOFOLLOW,
+            0,
+        ],
+        cwd,
+    )
 }
 
 /// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)` — a second name

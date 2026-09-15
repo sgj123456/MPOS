@@ -52,6 +52,10 @@ pub const FCHDIR: u64 = 81;
 /// `AT_FDCWD`, which the dispatch reshapes.
 pub const RENAME: u64 = 82;
 pub const MKDIR: u64 = 83;
+/// `rmdir(2)` - remove an empty directory. Not `unlink` with a flag: a
+/// directory that still holds something has to be refused, and Linux keeps
+/// the two operations apart so that it can be.
+pub const RMDIR: u64 = 84;
 pub const UNLINK: u64 = 87;
 pub const RENAMEAT: u64 = 264;
 pub const MKDIRAT: u64 = 258;
@@ -168,6 +172,13 @@ pub const CHMOD: u64 = 90;
 pub const FCHMOD: u64 = 91;
 pub const CHOWN: u64 = 92;
 pub const FCHOWN: u64 = 93;
+/// `fchownat(2)` - the *at form of the owner change, with the flag that says
+/// whether the *link* or its target is meant.
+pub const FCHOWNAT: u64 = 260;
+/// `lchown(2)` - the owner of the *link*, not of what it points at. A tool
+/// unpacking an archive sets both, and reaches for this one first: x86_64 has
+/// this as a syscall of its own, and busybox calls it directly.
+pub const LCHOWN: u64 = 94;
 /// `mknod(2)`: create a filesystem node. mpos has no device nodes.
 pub const MKNOD: u64 = 133;
 /// `link(2)` / `linkat(2)`: a second name for an inode.

@@ -107,7 +107,19 @@ static TABLE: Mutex<Shared> = Mutex::new(Shared::new(Table::new()));
 /// leaves the whole image below it and everything in between for a heap once
 /// user memory grows one (M11+). The stack itself grows down from here.
 const USER_STACK_TOP: usize = 0x4000_0000;
+/// How much of the stack exists before the program runs. This is where a stack
+/// *starts*, not how big one is: everything below it is mapped on first touch,
+/// up to [`USER_STACK_MAX`].
 const USER_STACK_PAGES: usize = 16;
+/// How far down the main stack may grow. Linux's default `RLIMIT_STACK`, and
+/// the whole reason a program may call deeper than any fixed reservation: the
+/// region extends as it is used.
+const USER_STACK_MAX: usize = 8 * 1024 * 1024;
+/// How far below the stack pointer a faulting address may be and still be a
+/// push. Linux uses the same figure for the same reason: a stack frame is next
+/// to `rsp`, and an address a long way below it is a wild pointer that has to
+/// stay a fault rather than quietly claim pages.
+const STACK_GROWTH_SLACK: usize = 64 * 1024;
 
 /// The most strings a user process may be handed, and the most bytes they may
 /// take. The syscall layer enforces the same limits on the argv blob it reads
@@ -2833,6 +2845,68 @@ pub fn resolve_cow_fault(virt: usize) -> bool {
             task.user_frames.push(new_phys);
         }
         crate::mm::free_frames(old_phys, 0);
+        true
+    })
+}
+
+/// Grow the main stack to cover `addr` - the fault Linux answers by mapping one
+/// more page of stack.
+///
+/// The loader maps [`USER_STACK_PAGES`] and stops. That is not the size of a
+/// stack, it is where one begins: a program's stack is a region that extends as
+/// the program descends into it, which is why a function may use more of it
+/// than any fixed default. Without this a process is limited to whatever the
+/// loader reserved - 64 KiB - and a program with a deep call or a large local
+/// frame dies of a segmentation fault it did nothing to deserve. (`apk add`,
+/// whose dependency walk is exactly that shape, was the one that found it.)
+///
+/// Two bounds keep this from becoming a way to claim memory by accident. The
+/// address must be at or under `rsp` and within [`STACK_GROWTH_SLACK`] of it,
+/// because a push happens next to the stack pointer and a wild pointer does
+/// not; and it must stay above the stack's floor. Anything else is still the
+/// process's own fault to bear.
+pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
+    if addr >= USER_STACK_TOP {
+        return false;
+    }
+    let page = addr & !(PAGE_SIZE - 1);
+    if rsp < page || rsp - page > STACK_GROWTH_SLACK {
+        return false;
+    }
+    if page < USER_STACK_TOP - USER_STACK_MAX {
+        return false;
+    }
+    with_table(|t| {
+        let id = t.current;
+        let Some(task) = t.tasks[id.0].as_mut() else {
+            return false;
+        };
+        let Some(space) = task.space.as_mut() else {
+            return false;
+        };
+        let Some(frame) = mm::alloc_frames(0) else {
+            return false;
+        };
+        // A stack page nobody has written reads as zeros. It is a hole in the
+        // program's memory, not whatever the frame's last owner left there -
+        // and a program that reads uninitialised stack expects zeros.
+        let dest = unsafe {
+            core::slice::from_raw_parts_mut(mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE)
+        };
+        dest.fill(0);
+        let mapped = space.try_map(Mapping {
+            virt: page,
+            phys: frame,
+            length: PAGE_SIZE,
+            flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+        });
+        if mapped.is_err() {
+            // Something is already mapped there, so this was not a stack
+            // growth fault after all: leave the page as it was.
+            mm::free_frames(frame, 0);
+            return false;
+        }
+        task.user_frames.push(frame);
         true
     })
 }

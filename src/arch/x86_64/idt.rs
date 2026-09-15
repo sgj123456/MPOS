@@ -151,6 +151,17 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         return; // The faulting instruction retries and succeeds.
     }
 
+    // A push past the end of what the loader mapped is an ordinary thing for a
+    // program to do, and Linux answers it by extending the stack. The bounds
+    // that make that safe - how far below `rsp`, and how far down in total -
+    // live with the stack itself; here all that matters is that the fault is
+    // at a user address and the process was running when it happened.
+    if user_address
+        && crate::sched::resolve_stack_growth(addr, frame.stack_pointer.as_u64() as usize)
+    {
+        return; // The page is there now; the instruction retries.
+    }
+
     // Anything else at a user address is the process's own fault to bear. The
     // `rip` test keeps this from claiming a kernel fault that merely named a
     // user address: a ring-0 dereference of a bad user pointer is a kernel bug,

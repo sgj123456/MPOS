@@ -170,7 +170,37 @@ impl Inode for RamDir {
 
     /// Drop the name edge. The node the name pointed at lives on while any
     /// open descriptor or other edge holds it; the name is free at once.
+    ///
+    /// A directory is refused, as it is on every other filesystem and as Linux
+    /// answers: `unlink` is for names that hold contents, and a directory holds
+    /// `.` and its children. Removing one through this call would be a
+    /// recursive delete arriving through the wrong door - it is what `rmdir`
+    /// exists to say no to.
     fn unlink(&self, name: &str) -> VfsResult<()> {
+        let child = self.lookup(name)?;
+        if child.metadata().kind == NodeKind::Dir {
+            return Err(VfsError::IsDir);
+        }
+        critical_section::with(|cs| {
+            let mut entries = self.entries.borrow(cs).borrow_mut();
+            entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)
+        })
+    }
+
+    /// Drop the name edge to an **empty** directory.
+    ///
+    /// Nothing here counts links, so the whole of an `rmdir` is: the name must
+    /// be a directory, and it must have nothing under it. The child's own
+    /// listing is the only witness for the second, which is why this asks the
+    /// node rather than the table.
+    fn rmdir(&self, name: &str) -> VfsResult<()> {
+        let child = self.lookup(name)?;
+        if child.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        if !child.read_dir()?.is_empty() {
+            return Err(VfsError::NotEmpty);
+        }
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)
@@ -290,6 +320,37 @@ mod tests {
         file.truncate(0).unwrap();
         assert_eq!(file.metadata().size, 0);
         assert_eq!(file.read_at(0, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn rmdir_takes_an_empty_directory_and_refuses_the_rest() {
+        let fs = RamFs::new();
+        let root = fs.root();
+
+        // A file is not a directory, and `rmdir` is not `unlink` by another
+        // name: the two have to stay apart or a recursive delete is one typo
+        // away from a file.
+        root.create("f", NodeKind::File).unwrap();
+        assert_eq!(root.rmdir("f").err(), Some(VfsError::NotDir));
+        assert!(root.lookup("f").is_ok(), "and the file is untouched");
+
+        let dir = root.create("d", NodeKind::Dir).unwrap();
+        dir.create("inner", NodeKind::File).unwrap();
+        assert_eq!(root.rmdir("d").err(), Some(VfsError::NotEmpty));
+        assert!(root.lookup("d").is_ok(), "the directory is still there");
+
+        // And the converse, from the other side: `unlink` refuses a directory,
+        // so neither call can be made to do the other's work by name.
+        assert_eq!(root.unlink("d").err(), Some(VfsError::IsDir));
+        assert!(root.lookup("d").is_ok(), "the directory is still there");
+
+        dir.unlink("inner").unwrap();
+        root.rmdir("d").unwrap();
+        assert_eq!(root.lookup("d").err(), Some(VfsError::NoEntry));
+
+        // A name that was never there answers for itself, not for the
+        // directory it would have been in.
+        assert_eq!(root.rmdir("gone").err(), Some(VfsError::NoEntry));
     }
 
     #[test]

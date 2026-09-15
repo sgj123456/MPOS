@@ -286,13 +286,46 @@ fn init_rootfs() {
     let fs = vfs::ext2::Ext2Fs::mount(rootfs_dev).expect("the rootfs ext2 image did not mount");
     vfs::mount("/new_root", &fs).expect("mount /new_root");
 
-    // Create old_root inside the new root so pivot_root can place the
-    // initramfs there before unmounting it.
+    // Create the mount point the old root will be parked at, inside the new
+    // root. `pivot_root` requires it to exist - it will not invent one, since
+    // an invented mount point is a directory nobody knows to clean up - and
+    // the boot chain removes it again a few lines later.
     let new_root = vfs::resolve("/new_root").expect("new_root missing");
     if new_root.lookup("old_root").is_err() {
         new_root
             .create("old_root", NodeKind::Dir)
             .expect("create old_root");
+    }
+}
+
+/// Unmount the initramfs and take its mount point with it.
+///
+/// This is the second half of the switch, and the reason the first half mounts
+/// the old root at all instead of dropping it: an unmount needs something to
+/// name. Once the entry is gone the last reference to the initramfs tree goes
+/// with it, and the ramfs that held it - the whole boot-time root, every
+/// unpacked member of the archive - is freed.
+///
+/// The mount point goes too. A leftover empty `/old_root` is not harmless
+/// clutter: it is a directory in the *real* root image that nothing in the
+/// image ever asked for, and the first `ls /` a user runs is where it shows up.
+fn detach_old_root() {
+    match vfs::unmount("/old_root") {
+        Ok(()) => println!("initramfs detached"),
+        // Not fatal: a root that could not be unmounted is still a working
+        // machine, and saying so beats failing the boot over cleanup.
+        Err(e) => println!("initramfs not detached: {e:?}"),
+    }
+    let root = match vfs::resolve("/") {
+        Ok(root) => root,
+        Err(e) => {
+            println!("no root after the pivot: {e:?}");
+            return;
+        }
+    };
+    match root.rmdir("old_root") {
+        Ok(()) => {}
+        Err(e) => println!("the old root's mount point stayed: {e:?}"),
     }
 }
 
@@ -365,6 +398,18 @@ fn switch_root() {
 
     // Mount the data partition at /mnt.
     mount_data();
+
+    // The initramfs has done its job: everything the machine runs on now lives
+    // on the real rootfs. Let go of it - the mount, the mount point, and with
+    // them the memory the whole boot-time tree occupied.
+    detach_old_root();
+
+    // The boot task's cwd was a directory in the initramfs, which is now
+    // gone. Standing at `/` of the real root is the only honest answer, and it
+    // is also what every process started from here inherits.
+    let root = vfs::resolve("/").expect("no root after the pivot");
+    crate::sched::set_cwd(root);
+    crate::sched::set_cwd_path(alloc::string::String::from("/"));
 
     println!("switched to rootfs, boot mounted");
 }
@@ -1656,6 +1701,11 @@ const SHELL_SCRIPT: &[&[u8]] = &[
     // shape that hides the bug this one pins.
     b"t_rename\n",
     b"echo t_rename_$?\n",
+    // Names that are made and taken away by their bare name, and the `..` that
+    // has to actually go up: the shapes a shell needs before it can do anything
+    // relative at all.
+    b"t_rmdir\n",
+    b"echo t_rmdir_$?\n",
     b"t_unlinkat\n",
     b"echo t_unlinkat_$?\n",
     b"t_getcwd\n",

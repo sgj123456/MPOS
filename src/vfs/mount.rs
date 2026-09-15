@@ -135,70 +135,54 @@ impl Vfs {
     /// Replace the root filesystem: move `new_root` to `/`, and move the old
     /// root to `put_old` inside the new root, so it can be unmounted afterward.
     ///
-    /// This is the kernel's pivot_root(2): after this call, `/` refers to what
-    /// was previously `new_root`, and `put_old` holds the old root filesystem's
-    /// contents, ready to be unmounted.
+    /// `put_old` has to be an existing directory in the new root, as Linux
+    /// requires: the point of the operation is that nothing is left in the
+    /// air, and a mount point invented on the caller's behalf would be a
+    /// directory nobody knows to remove.
+    ///
+    /// The old root is *mounted* at `put_old` rather than merely dropped. That
+    /// keeps it reachable until the caller says otherwise, and it is the one
+    /// reference that decides when the initramfs's memory can be given back.
+    /// Dropping it here instead would leave the tree alive in whatever still
+    /// pointed into it, with no name left to reach it by - a leak with no
+    /// handle. Detaching it is the caller's next step, and a deliberate one.
     pub fn pivot_root(&self, new_root: &str, put_old: &str) -> VfsResult<()> {
-        if critical_section::with(|cs| self.root.borrow(cs).borrow().is_none()) {
-            return Err(VfsError::NoRoot);
-        }
-
-        // Resolve new_root to get the inode that will become the new root.
+        let old_root = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+            .ok_or(VfsError::NoRoot)?;
         let new_root_inode = self.resolve(new_root.trim_end_matches('/'))?;
 
-        // Resolve put_old inside the new root to find where the old root
-        // will be placed. The put_old path must be absolute within the new root.
-        let put_old_trimmed = put_old.trim_start_matches('/');
-        let _put_old_in_new = if put_old_trimmed.is_empty() {
-            new_root_inode.clone()
-        } else {
-            // Walk from new_root to find the put_old directory
-            let mut current = new_root_inode.clone();
-            for component in put_old_trimmed.split('/') {
+        // `put_old` is walked *inside* the new root: it names a directory in
+        // the tree that is about to become `/`, not one in the tree being
+        // replaced.
+        let put_old = put_old.trim_start_matches('/');
+        let mut put_old_inode = new_root_inode.clone();
+        if !put_old.is_empty() {
+            for component in put_old.split('/') {
                 if component.is_empty() || component == "." {
                     continue;
                 }
-                if component == ".." {
-                    // Can't go above new_root
-                    return Err(VfsError::Invalid);
-                }
-                current = current.lookup(component)?;
+                put_old_inode = put_old_inode.lookup(component)?;
             }
-            current
-        };
+        }
+        if put_old_inode.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
 
-        // The old root inode
-        let old_root_inode = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
-            .ok_or(VfsError::NoRoot)?;
-
-        // Find and remove the root mount (if any - the initial ramfs root
-        // may or may not be in the mount table).
-        let _old_root_fs_root = {
-            critical_section::with(|cs| {
-                let mounts = self.mounts.borrow(cs).borrow();
-                // Find a mount whose root matches the current root inode
-                mounts
-                    .iter()
-                    .find(|m| Arc::ptr_eq(&m.root, &old_root_inode))
-                    .map(|m| m.at.clone())
-            })
-        };
-
-        // Remove all mounts that are under the old root (they'll be gone after pivot)
         critical_section::with(|cs| {
             let mut mounts = self.mounts.borrow(cs).borrow_mut();
-            mounts.retain(|m| !Arc::ptr_eq(&m.root, &old_root_inode));
-        });
-
-        // Install the new root
-        critical_section::with(|cs| {
+            // Every mount in the table was attached somewhere in the old tree -
+            // /dev, /tmp, the new root itself - and none of them can be reached
+            // once the root is replaced. Keeping them would leave entries
+            // anchored at nodes nothing resolves to, holding whole filesystems
+            // alive for good. The new tree starts with the one mount below plus
+            // whatever the caller attaches next.
+            mounts.clear();
+            mounts.push(Mount {
+                at: put_old_inode.clone(),
+                root: old_root,
+            });
             *self.root.borrow(cs).borrow_mut() = Some(new_root_inode);
         });
-
-        // If the old root had a mount entry, we don't need to create a new
-        // mount for it since we're replacing the root entirely. The old root's
-        // contents are now accessible via put_old_in_new if they were mounted.
-
         Ok(())
     }
 
@@ -257,10 +241,21 @@ impl Vfs {
             while let Some(comp) = todo.pop_front() {
                 match comp.as_str() {
                     "." => {}
-                    // POSIX: `/..` is `/`, so the last entry never pops.
+                    // POSIX: `/..` is `/`, so the last entry never pops. The
+                    // first `..` is the one an inode cannot answer: the stack
+                    // holds the walk so far, and at the base there is no walk
+                    // yet, so the base's own parent has to be looked for.
                     ".." => {
                         if stack.len() > 1 {
                             stack.pop();
+                        } else if stack[0].metadata().kind != NodeKind::Dir {
+                            // `file/..` is not "the parent of a file": a name
+                            // that is not a directory has no `..` to go to, and
+                            // an ordinary walk would have said so by looking a
+                            // name up in it.
+                            return Err(VfsError::NotDir);
+                        } else if let Some(parent) = self.parent_of(&stack[0]) {
+                            stack[0] = parent;
                         }
                     }
                     name => {
@@ -321,31 +316,116 @@ impl Vfs {
         }
     }
 
+    /// The directory that names `target`, found by walking down from the root.
+    ///
+    /// A node does not know its parent. A directory is a *name edge* in
+    /// something else and nothing points back up, so the only way to go up from
+    /// an inode is to look for the edge that names it - which is a walk of the
+    /// tree. It is what makes `..` mean anything from a cwd, since a relative
+    /// path starts at an inode and not at a name.
+    ///
+    /// A mounted filesystem is handled by the edge that carries it: the search
+    /// steps into the mount and compares against the mounted root, so `..` out
+    /// of `/dev` lands on `/` rather than nowhere.
+    ///
+    /// `None` for the root (nothing names it), for a node reached by one of
+    /// several names that the caller did not use, and for a tree too large to
+    /// look through. The first is what POSIX asks for; the others leave `..`
+    /// where it was, which is the honest answer when the tree cannot say.
+    fn parent_of(&self, target: &Arc<dyn Inode>) -> Option<Arc<dyn Inode>> {
+        // Bounded: the answer is near the top for every cwd a program actually
+        // holds, and searching a large tree without limit to resolve one `..`
+        // is a worse trade than a `..` that does not move.
+        const VISITS_MAX: usize = 512;
+
+        let root = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())?;
+        let mut queue: VecDeque<Arc<dyn Inode>> = VecDeque::from([root]);
+        let mut visits = 0usize;
+        while let Some(dir) = queue.pop_front() {
+            visits += 1;
+            if visits > VISITS_MAX {
+                return None;
+            }
+            let Ok(entries) = dir.read_dir() else {
+                continue;
+            };
+            for (name, kind) in entries {
+                if name == "." || name == ".." {
+                    continue;
+                }
+                let Ok(child) = dir.lookup(&name) else {
+                    continue;
+                };
+                // What resolving `name` here would actually give: the mount's
+                // root when the name is a mount point, the child otherwise.
+                let reached = critical_section::with(|cs| {
+                    let mounts = self.mounts.borrow(cs).borrow();
+                    mounts
+                        .iter()
+                        .find(|m| Arc::ptr_eq(&m.at, &child))
+                        .map(|m| m.root.clone())
+                        .unwrap_or_else(|| child.clone())
+                });
+                if Arc::ptr_eq(&reached, target) {
+                    return Some(dir.clone());
+                }
+                if kind == NodeKind::Dir {
+                    queue.push_back(reached);
+                }
+            }
+        }
+        None
+    }
+
     /// The directory holding `path`, and the name within it - without following
     /// a link the name turns out to name.
     ///
     /// This is the shape `readlink`, `symlink`, `unlink` and `mount` need: they
     /// all act on the *name*, and a resolver that followed it would hand back
     /// what the name points at instead of the name itself.
+    ///
+    /// The two halves are separated rather than returned as a node because a
+    /// caller that is about to *make* it needs the directory, and one that is
+    /// about to *read* it needs the name it will look up.
     pub fn resolve_parent(&self, path: &str) -> VfsResult<(Arc<dyn Inode>, String)> {
-        let start = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
-            .ok_or(VfsError::NoRoot)?;
-        self.resolve_parent_from(path, start)
+        let (parent_path, name) = split_last(path);
+        if name.is_empty() {
+            return Err(VfsError::Invalid);
+        }
+        let parent = self.resolve(parent_path)?;
+        Ok((parent, String::from(name)))
     }
 
-    /// [`resolve_parent`](Self::resolve_parent) from `start` rather than the
-    /// root, which is what a relative path in a process with a cwd needs.
-    pub fn resolve_parent_from(
+    /// Resolve `path` without following a symbolic link in its **last**
+    /// component - what `lstat`, `readlink` and `symlink` need, and the one
+    /// thing the ordinary walk cannot give them.
+    ///
+    /// Everything before the last name is walked normally, links and all, so
+    /// `a/b/c` really looks inside the `b` that `a` leads to. The last name is
+    /// then looked up in its parent and handed back unfollowed. That
+    /// distinction is the whole point: `lstat` on a link must answer for the
+    /// link, and `symlink` onto a name that is already a link must report the
+    /// name as taken rather than quietly writing beside its target.
+    ///
+    /// `.` and `..` are the two names that are not entries of the directory
+    /// they appear in - `.` *is* that directory, and neither can be a link -
+    /// so resolving them is ordinary resolution. They are also the names every
+    /// directory-listing tool asks for, which is why treating them as
+    /// unnameable broke `ls -l`.
+    pub fn resolve_no_follow(
         &self,
         path: &str,
         start: Arc<dyn Inode>,
-    ) -> VfsResult<(Arc<dyn Inode>, String)> {
+    ) -> VfsResult<Arc<dyn Inode>> {
         let (parent_path, name) = split_last(path);
         if name.is_empty() || name == "." || name == ".." {
-            return Err(VfsError::Invalid);
+            return self.resolve_from(path, start);
         }
         let parent = self.resolve_from(parent_path, start)?;
-        Ok((parent, String::from(name)))
+        if parent.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        parent.lookup(name)
     }
 }
 

@@ -19,6 +19,9 @@ extern crate alloc;
 
 #[cfg(target_os = "none")]
 pub mod arch;
+/// Binary formats: how the kernel decides what runs a file. Host-compiled,
+/// because reading a `#!` line is pure and its edge cases deserve tests.
+pub mod binfmt;
 pub mod blk;
 pub mod boot;
 #[cfg(target_os = "none")]

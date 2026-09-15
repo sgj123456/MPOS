@@ -58,6 +58,13 @@ pub mod err {
     pub const ENOTTY: isize = -25;
     pub const E2BIG: isize = -7;
     pub const ENAMETOOLONG: isize = -36;
+    /// ELOOP: a chain of `#!` interpreters that leads back into itself. The
+    /// bound that produces it is what ends the chain; nothing else can.
+    pub const ELOOP: isize = -40;
+    /// ENOTEMPTY: `rmdir` on a directory that still names something. Linux
+    /// has a separate call from `unlink` precisely so that this can be said
+    /// instead of "the directory was removed, and so was everything in it".
+    pub const ENOTEMPTY: isize = -39;
     // --- socket family ---
     /// EMSGSIZE: a datagram is larger than the socket can carry as one packet.
     pub const EMSGSIZE: isize = -90;
@@ -121,6 +128,7 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::NotDir => err::ENOTDIR,
         VfsError::IsDir => err::EISDIR,
         VfsError::Exists => err::EEXIST,
+        VfsError::NotEmpty => err::ENOTEMPTY,
         VfsError::Busy => err::EBUSY,
         VfsError::BadFd => err::EBADF,
         VfsError::NoRoot | VfsError::Invalid => err::EINVAL,
