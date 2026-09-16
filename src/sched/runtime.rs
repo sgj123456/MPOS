@@ -264,6 +264,111 @@ pub struct ItimerSnapshot {
     pub remaining_ticks: u64,
 }
 
+
+/// A thread group's memory: the frames behind its mappings, how many threads
+/// are still running on it, and where a leaving thread says so.
+///
+/// A process is one thread group. `fork` makes a new one; `clone(CLONE_VM)`
+/// adds a thread to an existing one, and the *last* thread out frees what the
+/// group owns - which is why the frames live here and not on the task that
+/// happened to allocate them. Linux calls this the `mm`; the page tables
+/// themselves stay on the task that owns them, because threading is the only
+/// case where two tasks reach the same ones.
+pub struct Mm {
+    /// How many threads are running on this group. The last one out frees the
+    /// frames; a group of one is a process that never made a thread.
+    live: core::sync::atomic::AtomicUsize,
+    /// The paging root of the group's address space, as CR3 is loaded with it.
+    /// A thread has no `AddressSpace` of its own and switches to this one.
+    root_value: usize,
+    /// Physical frames behind the group's user mappings - program pages,
+    /// stack and heap. Dropping the address space frees its tables but never
+    /// these, so the reaper returns them by hand.
+    frames: Mutex<RefCell<Vec<usize>>>,
+    /// The thread that started the process: its id is the group's pid, and
+    /// `getpid` answers it from any of the threads.
+    leader: TaskId,
+    /// Where a leaving thread writes zero and wakes whoever waits there -
+    /// `CLONE_CHILD_CLEARTID`, which is how a libc's `pthread_join` learns a
+    /// thread is gone without polling.
+    clear_tid: Mutex<RefCell<Option<usize>>>,
+}
+
+impl Mm {
+    /// The paging root of the group's address space.
+    fn root(&self) -> usize {
+        self.root_value
+    }
+
+    fn new(leader: TaskId, root: usize, frames: Vec<usize>) -> Arc<Mm> {
+        Arc::new(Mm {
+            live: core::sync::atomic::AtomicUsize::new(1),
+            root_value: root,
+            frames: Mutex::new(RefCell::new(frames)),
+            leader,
+            clear_tid: Mutex::new(RefCell::new(None)),
+        })
+    }
+
+    /// Swap one frame for another, in place: the copy-on-write path replaces
+    /// the page it copied and keeps the group's books straight.
+    fn replace(&self, old: usize, new: usize) -> bool {
+        critical_section::with(|cs| {
+            let mut frames = self.frames.borrow(cs).borrow_mut();
+            match frames.iter_mut().find(|held| **held == old) {
+                Some(slot) => {
+                    *slot = new;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// A frame this group now owns.
+    fn own(&self, frame: usize) {
+        critical_section::with(|cs| self.frames.borrow(cs).borrow_mut().push(frame));
+    }
+
+    /// Forget a frame without giving it back: whoever took it owns it now.
+    fn disown(&self, frame: usize) {
+        critical_section::with(|cs| {
+            self.frames.borrow(cs).borrow_mut().retain(|&held| held != frame)
+        });
+    }
+
+    /// Take every frame out, for the last thread's exit to release.
+    fn take_frames(&self) -> Vec<usize> {
+        critical_section::with(|cs| core::mem::take(&mut *self.frames.borrow(cs).borrow_mut()))
+    }
+
+    /// A thread joins the group: one more alive, and it will free nothing.
+    fn join(&self) {
+        self.live
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A thread leaves. The answer says whether it was the last, which is the
+    /// one that frees what the group owns.
+    fn leave(&self) -> bool {
+        self.live
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
+            == 1
+    }
+
+    fn leader(&self) -> TaskId {
+        self.leader
+    }
+
+    fn set_clear_tid(&self, address: usize) {
+        critical_section::with(|cs| *self.clear_tid.borrow(cs).borrow_mut() = Some(address));
+    }
+
+    fn clear_tid(&self) -> Option<usize> {
+        critical_section::with(|cs| *self.clear_tid.borrow(cs).borrow())
+    }
+}
+
 struct Task {
     /// Must stay put for as long as the task exists.
     context: Context,
@@ -284,10 +389,18 @@ struct Task {
     /// child resumes mid-program rather than at the entry point, so it needs
     /// a whole register file where a freshly spawned task needs one address.
     user_resume: Option<UserContext>,
-    /// Physical frames behind the user mappings - program pages and stack.
-    /// Dropping the address space frees its tables but never these, so the
-    /// reaper returns them by hand.
-    user_frames: Vec<usize>,
+    /// The thread group this task runs in: the frames behind its mappings and
+    /// how many threads share them. A process with no threads has a group of
+    /// one, so every task has one and nothing has to ask whether it is a
+    /// thread to find its memory.
+    mm: Arc<Mm>,
+    /// Set once this task's exit has been accounted for. The release pass runs
+    /// on every reap, and a thread that left twice would take the group's count
+    /// down twice - which would free memory a sibling is still using.
+    released: bool,
+    /// The thread group's id - the leader's task id. `getpid` answers this from
+    /// every thread; `gettid` answers the task's own.
+    tgid: TaskId,
     /// Signals sent to this task and not yet delivered.
     signals: signal::Pending,
     /// The signals this task has blocked with `rt_sigprocmask`. A blocked
@@ -361,11 +474,13 @@ impl Task {
             priority: Priority::NORMAL,
             stack: None,
             exited: false,
+            mm: Mm::new(TaskId(0), 0, alloc::vec::Vec::new()),
+            released: false,
+            tgid: TaskId(0),
             body: None,
             space: None,
             user_entry: None,
             user_resume: None,
-            user_frames: Vec::new(),
             signals: 0,
             blocked: 0,
             dispositions: signal::Actions::default(),
@@ -440,6 +555,10 @@ impl Table {
         let task = self.task(id);
         let root = match &task.space {
             Some(space) => space.root(),
+            // A thread owns no address space; it runs on the group's, whose
+            // paging root the group remembers. A kernel task has neither, and
+            // runs on the kernel's own tables.
+            None if task.mm.root() != 0 => task.mm.root(),
             None => paging::kernel_root(),
         };
         paging::switch_to_root(root);
@@ -567,9 +686,11 @@ impl Table {
             exited: false,
             body: Some(Box::new(body)),
             space: None,
+            mm: Mm::new(TaskId(slot), 0, alloc::vec::Vec::new()),
+            released: false,
+            tgid: TaskId(slot),
             user_entry: None,
             user_resume: None,
-            user_frames: Vec::new(),
             signals: 0,
             blocked: 0,
             dispositions: signal::Actions::default(),
@@ -616,21 +737,35 @@ impl Table {
     fn release_exited(&mut self) {
         for entry in self.tasks.iter_mut() {
             let Some(task) = entry else { continue };
-            if !task.exited {
+            if !task.exited || task.released {
                 continue;
             }
+            task.released = true;
 
-            // The address space first: if its CR3 is the one loaded, dropping
-            // it switches back to the kernel's own before any page table is
-            // freed. The drop frees tables only, so the frames the mappings
-            // pointed at come back separately below.
-            drop(task.space.take());
-            for frame in task.user_frames.drain(..) {
-                // A frame shared by a copy-on-write fork is released, not
-                // freed: the process that still maps it owns it now.
-                if mm::free_frame_ref(frame) {
-                    mm::free_frames(frame, 0);
+            // A thread that leaves does not take the group's memory with it:
+            // its siblings are still running on the same frames. Only the last
+            // one out does what a process exit has always done here.
+            let last = task.mm.leave();
+            if last {
+                // The address space first: if its CR3 is the one loaded,
+                // dropping it switches back to the kernel's own before any page
+                // table is freed. The drop frees tables only, so the frames the
+                // mappings pointed at come back separately below.
+                drop(task.space.take());
+                for frame in task.mm.take_frames() {
+                    // A frame shared by a copy-on-write fork is released, not
+                    // freed: the process that still maps it owns it now.
+                    if mm::free_frame_ref(frame) {
+                        mm::free_frames(frame, 0);
+                    }
                 }
+            } else if let Some(address) = task.mm.clear_tid() {
+                // A thread says where it left, and wakes whoever waits there:
+                // `pthread_join` sleeps on a futex at exactly this address.
+                unsafe {
+                    core::ptr::write_volatile(address as *mut u32, 0);
+                }
+                crate::sched::futex::wake_all(address);
             }
 
             // The descriptors are handed over rather than dropped: dropping a
@@ -653,6 +788,12 @@ impl Table {
                 }
             }
         }
+    }
+
+    /// Which task owns the address space a group runs on. A process owns its
+    /// own; a thread does not own one at all, so the leader's is the group's.
+    fn space_owner(&self, id: TaskId) -> TaskId {
+        self.task(id).mm.leader()
     }
 
     fn reap(&mut self) {
@@ -842,6 +983,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             loaded.base,
         );
 
+        let root = space.root();
         let brk_base = image
             .segments
             .iter()
@@ -862,9 +1004,11 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             exited: false,
             body: None,
             space: Some(space),
+            mm: Mm::new(TaskId(slot), root, loaded.frames),
+            released: false,
+            tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),
             user_resume: None,
-            user_frames: loaded.frames,
             signals: 0,
             blocked: 0,
             dispositions: signal::Actions::default(),
@@ -935,6 +1079,9 @@ pub fn try_spawn_user(
         let stack = Stack::new();
         let mut space = AddressSpace::new();
         let loaded = load_user(&mut space, &image, interp.as_ref());
+        // Read before the space moves into the task: a thread switches to
+        // this root, and the group is what remembers it.
+        let root = space.root();
 
         let brk_base = image
             .segments
@@ -987,9 +1134,11 @@ pub fn try_spawn_user(
             exited: false,
             body: None,
             space: Some(space),
+            mm: Mm::new(TaskId(slot), root, loaded.frames),
+            released: false,
+            tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),
             user_resume: None,
-            user_frames: loaded.frames,
             signals: 0,
             blocked: 0,
             dispositions: signal::Actions::default(),
@@ -2099,7 +2248,8 @@ pub fn current_exe() -> alloc::string::String {
 pub fn current_map_user(virt: usize, frame: usize, flags: crate::mm::vm::MapFlags) -> isize {
     with_table(|t| {
         let id = current();
-        let task = t.task_mut(id);
+        let owner = t.space_owner(id);
+        let task = t.task_mut(owner);
         let mapped = match task.space.as_mut() {
             Some(space) => space.try_map(crate::mm::vm::Mapping {
                 virt,
@@ -2112,8 +2262,8 @@ pub fn current_map_user(virt: usize, frame: usize, flags: crate::mm::vm::MapFlag
         match mapped {
             Ok(()) => {
                 // The frame now belongs to the process: the reaper returns it
-                // once the process is gone, not before.
-                task.user_frames.push(frame);
+                // once the last thread is gone, not before.
+                task.mm.own(frame);
                 virt as isize
             }
             Err(crate::arch::paging::PageTaken) => -crate::syscall::err::EEXIST,
@@ -2127,7 +2277,8 @@ pub fn current_map_user(virt: usize, frame: usize, flags: crate::mm::vm::MapFlag
 pub fn move_user_page(virt: usize, frame: usize, flags: crate::mm::vm::MapFlags) -> bool {
     with_table(|t| {
         let id = current();
-        let task = t.task_mut(id);
+        let owner = t.space_owner(id);
+        let task = t.task_mut(owner);
         match task.space.as_mut() {
             Some(space) => space
                 .try_map(crate::mm::vm::Mapping {
@@ -2154,7 +2305,8 @@ pub fn user_frame_at(virt: usize) -> Option<usize> {
 /// whether a `MAP_FIXED` request has anything to replace.
 pub fn user_range_free(virt: usize, len: usize) -> bool {
     with_table(|t| {
-        let task = t.task(current());
+        let owner = t.space_owner(current());
+        let task = t.task(owner);
         let Some(space) = task.space.as_ref() else {
             return false;
         };
@@ -2169,7 +2321,8 @@ pub fn user_range_free(virt: usize, len: usize) -> bool {
 pub fn unmap_user(virt: usize, len: usize) -> alloc::vec::Vec<usize> {
     with_table(|t| {
         let id = current();
-        let task = t.task_mut(id);
+        let owner = t.space_owner(id);
+        let task = t.task_mut(owner);
         match task.space.as_mut() {
             Some(space) => space.unmap(virt, len),
             None => alloc::vec::Vec::new(),
@@ -2183,7 +2336,8 @@ pub fn unmap_user(virt: usize, len: usize) -> alloc::vec::Vec<usize> {
 pub fn protect_user(virt: usize, len: usize, flags: crate::mm::vm::MapFlags) {
     with_table(|t| {
         let id = current();
-        let task = t.task_mut(id);
+        let owner = t.space_owner(id);
+        let task = t.task_mut(owner);
         if let Some(space) = task.space.as_mut() {
             space.protect(virt, len, flags);
         }
@@ -2199,9 +2353,10 @@ pub fn release_user_frames(frames: alloc::vec::Vec<usize>) {
     }
     with_table(|t| {
         let id = current();
-        let task = t.task_mut(id);
+        let owner = t.space_owner(id);
+        let task = t.task_mut(owner);
         for frame in frames {
-            task.user_frames.retain(|&held| held != frame);
+            task.mm.disown(frame);
             crate::mm::free_frames(frame, 0);
         }
     });
@@ -2260,7 +2415,7 @@ pub fn brk(addr: usize) -> isize {
                 None => alloc::vec::Vec::new(),
             };
             for frame in dropped {
-                task.user_frames.retain(|&held| held != frame);
+                task.mm.disown(frame);
                 crate::mm::free_frames(frame, 0);
             }
         }
@@ -2300,7 +2455,7 @@ pub fn brk(addr: usize) -> isize {
                 crate::mm::free_frames(frame, 0);
                 return crate::syscall::err::ENOMEM;
             }
-            task.user_frames.push(frame);
+            task.mm.own(frame);
         }
 
         task.brk_pages = needed_pages;
@@ -2642,6 +2797,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         // Create the child's address space by sharing all parent pages COW.
         let mut child_space = AddressSpace::new();
         let mut child_frames = Vec::new();
+        let child_root = child_space.root();
 
         for &(virt, phys, flags) in &parent_pages {
             // Two address spaces now own this frame; the count keeps it alive
@@ -2697,7 +2853,9 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
                 },
                 ..*state
             }),
-            user_frames: child_frames,
+            mm: Mm::new(TaskId(slot), child_root, child_frames),
+            released: false,
+            tgid: TaskId(slot),
             signals: 0,
             blocked: 0,
             dispositions: signal::Actions::default(),
@@ -2775,7 +2933,7 @@ pub fn exec_replace(
         // Give every page the old image owned back. `free_frames` does the
         // reference-count half itself, so a page a `fork` shared is only
         // returned to the allocator by whichever process drops the last claim.
-        for frame in task.user_frames.drain(..) {
+        for frame in task.mm.take_frames() {
             crate::mm::free_frames(frame, 0);
         }
         // The task is about to be a *new* program: it is no longer a fork child
@@ -2821,7 +2979,11 @@ pub fn exec_replace(
         let new_root = space.root();
         task.space = Some(space);
         task.user_entry = Some((loaded.entry, user_rsp));
-        task.user_frames = loaded.frames;
+        // The group's memory becomes the new image's. A process that execs
+        // with threads running is a case Linux handles by ending them; this
+        // kernel does not yet, and the threads that were there keep the old
+        // group until they exit.
+        task.mm = Mm::new(id, new_root, loaded.frames);
         task.brk_base = brk_base;
         task.brk_pages = 0;
         task.mmap_cursor = crate::syscall::MMAP_BASE;
@@ -2887,13 +3049,11 @@ pub fn resolve_cow_fault(virt: usize) -> bool {
 
         // The page the task now owns is `new_phys`; `old_phys` is one claim
         // lighter and may be free.
-        if let Some(slot) = task.user_frames.iter_mut().find(|f| **f == old_phys) {
-            *slot = new_phys;
-        } else {
+        if !task.mm.replace(old_phys, new_phys) {
             // A page outside the tracked list (the ELF loader's mappings are all
             // tracked, so this is unreachable in practice); record the new frame
             // so at least one of the pair is ever given back.
-            task.user_frames.push(new_phys);
+            task.mm.own(new_phys);
         }
         crate::mm::free_frames(old_phys, 0);
         true
@@ -2957,7 +3117,7 @@ pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
             mm::free_frames(frame, 0);
             return false;
         }
-        task.user_frames.push(frame);
+        task.mm.own(frame);
         true
     })
 }
@@ -3027,9 +3187,170 @@ fn scheduler_loop() {
 /// `CLONE_VFORK` caller in practice (`posix_spawn`) waits on the child itself.
 pub fn clone(state: &UserContext, request: CloneRequest) -> isize {
     if request.flags & nr::CLONE_THREAD != 0 {
-        return crate::syscall::err::ENOSYS;
+        return spawn_thread(state, request);
     }
     spawn_copy(state, request)
+}
+
+/// Create a thread: a task that runs on the calling task's memory, with the
+/// calling task's descriptors, and its own stack.
+///
+/// This is what `fork` would be with nothing copied. The address space is not
+/// duplicated and no frames are shared copy-on-write - the new task *is* the
+/// same process, one more instruction pointer in it - so the group's frame
+/// list stays as it is, and the group's count goes up by one: a thread that
+/// leaves must not free memory its siblings are still using.
+///
+/// The child resumes inside the `clone` call its creator made, with `rax` zero
+/// and `rsp` on the stack it was given, which is how a libc's thread entry
+/// finds its way back to the function it was asked to run: it set that up on
+/// the new stack before calling in.
+fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
+    // A thread with no stack of its own would run on its creator's, and the
+    // first thing either of them did would corrupt the other. Linux leaves
+    // this to the caller; refusing is the kinder answer.
+    if request.child_stack == 0 {
+        return crate::syscall::err::EINVAL;
+    }
+
+    let child_id = with_table(|t| {
+        let parent_id = t.current;
+        let parent = t.task(parent_id);
+        let mm = parent.mm.clone();
+        let fds = parent.fds.clone();
+        let tgid = parent.tgid;
+        let pgid = parent.pgid;
+        let priority = parent.priority;
+        let dispositions = parent.dispositions;
+        let cwd = parent.cwd.clone();
+        let cwd_path = parent.cwd_path.clone();
+        let brk_base = parent.brk_base;
+        let brk_pages = parent.brk_pages;
+        let mmap_cursor = parent.mmap_cursor;
+        let exe = parent.exe.clone();
+        let parent_tls = parent.tls;
+
+        let slot = t.alloc_slot();
+        drop_retired(TaskId(slot));
+
+        let stack = Stack::new();
+        // Interrupts stay off until the thread's `iretq` restores the flags it
+        // was created with, exactly as a fork child's does.
+        let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
+
+        t.tasks[slot] = Some(Task {
+            context,
+            priority,
+            stack: Some(stack),
+            exited: false,
+            body: None,
+            // No address space of its own: the group's root is what the
+            // dispatcher loads for it.
+            space: None,
+            user_entry: None,
+            user_resume: Some(UserContext {
+                // The child returns from the call with zero, and lands on the
+                // stack the caller provided - the one it pushed `func` and
+                // `arg` onto before asking for a thread.
+                rax: 0,
+                rsp: request.child_stack,
+                ..*state
+            }),
+            signals: 0,
+            blocked: 0,
+            // Linux shares the handler table under `CLONE_SIGHAND`; this
+            // kernel copies it, so a thread that installs a handler does not
+            // install it for its siblings. Nothing in this system's userland
+            // does that yet, and a copy is the honest version of "not shared".
+            dispositions,
+            alt_stack: None,
+            fds,
+            cwd,
+            cwd_path,
+            // Not a child: `wait` collects processes, and a thread is not one.
+            // The process becomes collectable when its leader exits.
+            parent: None,
+            pgid,
+            brk_base,
+            brk_pages,
+            mmap_cursor,
+            exe,
+            child_tid: if request.flags & nr::CLONE_CHILD_SETTID != 0 {
+                request.child_tid
+            } else {
+                0
+            },
+            tls: if request.flags & nr::CLONE_SETTLS != 0 {
+                request.tls
+            } else {
+                parent_tls
+            },
+            itimers: [None; 3],
+            mm: {
+                mm.join();
+                mm
+            },
+            released: false,
+            tgid,
+        });
+
+        if request.flags & nr::CLONE_CHILD_CLEARTID != 0 {
+            // Where a joiner sleeps. The thread clears it on the way out, and
+            // wakes whoever is waiting there - which is the whole of what
+            // `pthread_join` needs from the kernel.
+            t.tasks[slot]
+                .as_ref()
+                .expect("the thread was just built")
+                .mm
+                .set_clear_tid(request.child_tid);
+        }
+
+        let child_id = TaskId(slot);
+        t.sched.push_ready(child_id, priority);
+        child_id
+    });
+
+    child_id.0 as isize
+}
+
+/// End every thread of the running task's group, then this one.
+///
+/// `exit_group(2)` is what a libc calls when the *process* decides to end -
+/// `exit`, a return from `main`, an unhandled signal - and Linux ends every
+/// thread with it. The siblings are marked exited here; the release pass
+/// accounts for each of them, so the group's memory goes when the last one has
+/// been accounted for, exactly as if they had all returned on their own.
+pub fn exit_group(code: isize) -> ! {
+    let me = current();
+    let tgid = current_tgid();
+    with_table(|t| {
+        for slot in 0..t.tasks.len() {
+            let id = TaskId(slot);
+            if id == me {
+                continue;
+            }
+            let Some(task) = t.tasks[slot].as_mut() else {
+                continue;
+            };
+            if task.tgid != tgid || task.exited {
+                continue;
+            }
+            // Never scheduled again - and woken, in case it was asleep, so the
+            // scheduler's sleep queue does not keep a task that will not run.
+            task.exited = true;
+            t.sched.wake(id);
+        }
+    });
+    exit(code)
+}
+
+/// The process id of the running task: the id of its thread group's leader.
+///
+/// `getpid` answers this from every thread - a process has one pid however
+/// many threads it runs - while `gettid` answers the thread's own id, which is
+/// what `gettid` is for.
+pub fn current_tgid() -> TaskId {
+    with_table(|t| t.task(t.current).tgid)
 }
 
 /// Where a fresh task's stack first lands. The arch trampoline calls this with

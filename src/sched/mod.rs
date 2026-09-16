@@ -5,6 +5,7 @@
 //! runtime below it owns the task table and the stacks, and calls into
 //! `arch::context` to move between them.
 
+pub mod futex;
 pub mod policy;
 pub mod signal;
 
@@ -19,6 +20,7 @@ pub use runtime::{
     ARGS_BYTES_MAX, ARGV_MAX, CloneRequest, INIT_PID, ITIMER_PROF, ITIMER_REAL, ITIMER_VIRTUAL,
     ItimerSnapshot, ItimerState, MAX_TASKS, Redirect, STACK_ORDER, SpawnError, block_until,
     block_until_code, brk, check_itimer, child_exited_unreaped, clone, current, current_blocked,
+    current_tgid, exit_group,
     current_cwd, current_cwd_path, current_disposition, current_exe, current_fds, current_map_user,
     current_pgid, current_tls, deliver_pending_signal, discard_exit_code, exec_replace, exit,
     exit_code, fork, get_mmap_cursor, group_members, has_children, has_live_child, init, is_child,

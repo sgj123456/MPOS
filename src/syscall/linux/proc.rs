@@ -281,6 +281,16 @@ pub(super) fn handle_exit(args: [usize; ARG_COUNT]) -> isize {
     crate::sched::exit(args[0] as isize);
 }
 
+/// Terminate the current *process*: every thread of it, not just the caller.
+///
+/// This is the call a libc makes when the program ends - returning from
+/// `main`, calling `exit`, dying of a signal - and Linux ends the whole thread
+/// group with it. A thread that means only to end *itself* calls `exit(2)`
+/// (or returns into `pthread_exit`), which leaves its siblings running.
+pub(super) fn handle_exit_group(args: [usize; ARG_COUNT]) -> isize {
+    crate::sched::exit_group(args[0] as isize);
+}
+
 /// Yield the CPU to the scheduler.
 pub(super) fn handle_yield() -> isize {
     crate::sched::yield_now();
@@ -289,7 +299,9 @@ pub(super) fn handle_yield() -> isize {
 
 /// Get the current process ID.
 pub(super) fn handle_getpid() -> isize {
-    crate::sched::current().0 as isize
+    // The *group's* id: a process has one pid however many threads it runs.
+    // `gettid` is the call that answers a thread's own.
+    crate::sched::current_tgid().0 as isize
 }
 
 /// `wait4(pid, status, options)` — collect a child's exit.
@@ -1650,15 +1662,40 @@ pub(super) fn handle_prlimit64(args: [usize; ARG_COUNT], from_user: bool) -> isi
     0
 }
 
-/// `futex(uaddr, op, val, ...)` — basic futex support for threading.
+/// `futex(uaddr, op, val, ...)` — the waiting primitive threads are built on.
 ///
-/// Minimal: only supports FUTEX_WAIT with immediate return (no actual blocking).
+/// A real `FUTEX_WAIT` and `FUTEX_WAKE`, which is what a thread library needs:
+/// a mutex that never blocked and a condition variable that never waited would
+/// let two threads into the same critical section and call it synchronization.
+///
+/// The timeout forms - `FUTEX_WAIT_BITSET`, which is what a *timed* wait uses -
+/// are refused rather than run without their timeout: a caller that asked to
+/// stop waiting would wait for ever, and ENOSYS at least tells it why.
 pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
-    let (_uaddr, op, _val) = (args[0], args[1], args[2]);
-    match op & 0xf {
-        0 => 0, // FUTEX_WAIT: stub — just return 0
-        1 => 0, // FUTEX_WAKE: stub — wake 0 threads
-        _ => 0,
+    const FUTEX_WAIT: usize = 0;
+    const FUTEX_WAKE: usize = 1;
+    const FUTEX_WAIT_BITSET: usize = 9;
+    const FUTEX_WAKE_BITSET: usize = 10;
+    // The operation is the low seven bits; the rest of the word carries flags
+    // like FUTEX_PRIVATE_FLAG, which say which table to look in - and this
+    // kernel has exactly one.
+    let (uaddr, command, val) = (args[0], args[1] & 0x7f, args[2]);
+
+    match command {
+        FUTEX_WAIT => {
+            if !buffer_ok(uaddr, 4, false, true) {
+                return err::EFAULT;
+            }
+            crate::sched::futex::wait(uaddr, val as u32)
+        }
+        FUTEX_WAKE => {
+            if !buffer_ok(uaddr, 4, false, true) {
+                return err::EFAULT;
+            }
+            crate::sched::futex::wake(uaddr, val as usize) as isize
+        }
+        FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET => err::ENOSYS,
+        _ => err::ENOSYS,
     }
 }
 

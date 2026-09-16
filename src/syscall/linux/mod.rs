@@ -113,7 +113,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // --- process ---
         nr::EXECVE => proc::handle_execve(args, &cwd(), regs_ptr),
         nr::EXIT => proc::handle_exit(args),
-        nr::EXIT_GROUP => proc::handle_exit(args),
+        nr::EXIT_GROUP => proc::handle_exit_group(args),
         // `wait4(pid, *status, options, *rusage)` keeps its Linux argument
         // order: the handler reads the status pointer from slot 1 and the
         // options from slot 2.
