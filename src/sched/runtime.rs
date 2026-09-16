@@ -1961,6 +1961,14 @@ pub fn take_exit_code(id: TaskId) -> Option<isize> {
 ///
 /// The caller must be a task: this is `wait`'s core, and nothing else calls
 /// it.
+/// Whether a child of the running task has exited and not yet been
+/// collected - the question a `signalfd` for `SIGCHLD` answers. Nothing is
+/// consumed: `wait(2)` is what collects.
+pub fn child_exited_unreaped() -> Option<usize> {
+    let me = current();
+    with_table(|t| any_child_code(t, me)).map(|(id, _code)| id.0)
+}
+
 pub fn wait_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
     // The condition is the table itself, so it is asked through the borrow
     // `block_until_on` already holds rather than taking one of its own.

@@ -266,9 +266,32 @@ struct Core {
     groups: u32,
     cache: Mutex<RefCell<Cache>>,
     inodes: Mutex<RefCell<BTreeMap<u32, Arc<dyn Inode>>>>,
+    /// Whether this filesystem was mounted read-only. It lives here, on the
+    /// one piece of state every inode of the mount shares, because "read-only"
+    /// is a property of the mount and not of a file - and because it has to be
+    /// the same answer for every path into it.
+    read_only: core::sync::atomic::AtomicBool,
 }
 
 impl Core {
+    /// Refuse a write to a filesystem mounted read-only.
+    ///
+    /// `mount -o ro` is a promise the filesystem keeps, not a hint: an
+    /// initramfs mounts the root it has not yet trusted this way, and a
+    /// kernel that accepted the flag and then wrote anyway would be lying
+    /// about the one thing the caller asked for.
+    fn writable(&self) -> VfsResult<()> {
+        if self.read_only.load(core::sync::atomic::Ordering::Relaxed) {
+            return Err(VfsError::ReadOnly);
+        }
+        Ok(())
+    }
+
+    fn set_read_only(&self, read_only: bool) {
+        self.read_only
+            .store(read_only, core::sync::atomic::Ordering::Relaxed);
+    }
+
     fn mount(dev: Arc<dyn BlockDev>) -> Result<Core, &'static str> {
         // The superblock is read before the cache exists: the cache's slot
         // size is one of the things it decides.
@@ -278,6 +301,7 @@ impl Core {
         let groups = (sb.blocks_count - sb.first_data_block).div_ceil(sb.blocks_per_group);
         let block_size = 1024usize << sb.log_block_size;
         Ok(Core {
+            read_only: core::sync::atomic::AtomicBool::new(false),
             dev,
             sb,
             groups,
@@ -960,6 +984,16 @@ impl FileSystem for Ext2Fs {
     fn name(&self) -> &'static str {
         "ext2"
     }
+
+    fn read_only(&self) -> bool {
+        self.core
+            .read_only
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_read_only(&self, read_only: bool) {
+        self.core.set_read_only(read_only);
+    }
 }
 
 impl Ext2Fs {
@@ -1044,6 +1078,7 @@ impl Inode for Ext2Ino {
     }
 
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+        self.fs.writable()?;
         if matches!(kind, NodeKind::CharDev | NodeKind::Symlink) {
             // A character device is a driver's business, and a link is made of
             // a target rather than a kind - neither is a file this filesystem
@@ -1079,6 +1114,7 @@ impl Inode for Ext2Ino {
     /// us but their own "." and every child's "..", so taking one apart is
     /// the other half of an `rmdir` this filesystem does not have.
     fn unlink(&self, name: &str) -> VfsResult<()> {
+        self.fs.writable()?;
         self.require_dir()?;
         let mut dir = self.fs.read_inode(self.ino);
         // Looked up before anything is touched, so a refusal leaves the
@@ -1110,6 +1146,7 @@ impl Inode for Ext2Ino {
     /// one back. Everything is checked before anything is written, so a
     /// refusal leaves both directories exactly as they were.
     fn rmdir(&self, name: &str) -> VfsResult<()> {
+        self.fs.writable()?;
         self.require_dir()?;
         let mut dir = self.fs.read_inode(self.ino);
         let child = self.fs.dir_lookup(&dir, name)?.ok_or(VfsError::NoEntry)?;
@@ -1149,6 +1186,7 @@ impl Inode for Ext2Ino {
     /// `libfoo.so.1.2.0`, and a filesystem that cannot make one cannot install
     /// a package.
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+        self.fs.writable()?;
         self.require_dir()?;
         let mut dir = self.fs.read_inode(self.ino);
         if self.fs.dir_lookup(&dir, name)?.is_some() {
@@ -1267,6 +1305,7 @@ impl Inode for Ext2Ino {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        self.fs.writable()?;
         let mut data = self.fs.read_inode(self.ino);
         let kind = data.kind();
         if kind != NodeKind::File {
@@ -1321,6 +1360,7 @@ impl Inode for Ext2Ino {
     /// `O_TRUNC` and a replacing `rename` ask for - has no prefix to save and
     /// costs nothing extra.
     fn truncate(&self, len: u64) -> VfsResult<()> {
+        self.fs.writable()?;
         let mut data = self.fs.read_inode(self.ino);
         match data.kind() {
             NodeKind::File => {}

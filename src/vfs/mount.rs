@@ -42,6 +42,13 @@ struct Mount {
     /// filesystem" from "a different one" - `switch_root`'s safety check is
     /// exactly that comparison.
     id: u64,
+    /// Whether `mount -o ro` was asked for. The flag is reported in
+    /// /proc/mounts and passed on to the filesystem, which enforces it.
+    read_only: bool,
+    /// The filesystem itself, when the caller had one to give. `remount`
+    /// needs it: changing the read-only state is a request to the filesystem,
+    /// not a note in this table.
+    fs: Option<Arc<dyn FileSystem>>,
 }
 
 /// A set of mounts with a root, and the resolver over them.
@@ -129,6 +136,8 @@ impl Vfs {
                 fstype: alloc::string::String::from(fs.name()),
                 source: alloc::string::String::from("none"),
                 id,
+                read_only: false,
+                fs: None,
             });
             Ok(())
         })?;
@@ -227,6 +236,7 @@ impl Vfs {
             *self.root_fstype.borrow(cs).borrow_mut() = Some(m.fstype.clone());
             *self.root_source.borrow(cs).borrow_mut() = Some(m.source.clone());
             mounts.clear();
+            let _ = m.read_only;
             Ok(())
         })?;
         self.refresh_mount_points();
@@ -240,13 +250,18 @@ impl Vfs {
     pub fn mount_at(
         &self,
         at: Arc<dyn Inode>,
-        fs: &dyn FileSystem,
+        fs: Arc<dyn FileSystem>,
         fstype: &str,
         source: &str,
+        read_only: bool,
     ) -> VfsResult<()> {
         if at.metadata().kind != NodeKind::Dir {
             return Err(VfsError::NotDir);
         }
+        // The filesystem is told first: a mount that records "read-only" while
+        // the filesystem goes on accepting writes would be a promise nobody
+        // keeps.
+        fs.set_read_only(read_only);
         critical_section::with(|cs| {
             let mut mounts = self.mounts.borrow(cs).borrow_mut();
             if mounts.iter().any(|m| Arc::ptr_eq(&m.at, &at)) {
@@ -259,11 +274,30 @@ impl Vfs {
                 fstype: alloc::string::String::from(fstype),
                 source: alloc::string::String::from(source),
                 id,
+                read_only,
+                fs: Some(fs),
             });
             Ok(())
         })?;
         self.refresh_mount_points();
         Ok(())
+    }
+
+    /// `mount -o remount,...`: change the flags on a filesystem that is
+    /// already mounted, without mounting anything.
+    pub fn remount(&self, at: &Arc<dyn Inode>, read_only: bool) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            let entry = mounts
+                .iter_mut()
+                .find(|m| Arc::ptr_eq(&m.at, at))
+                .ok_or(VfsError::NoEntry)?;
+            if let Some(fs) = entry.fs.clone() {
+                fs.set_read_only(read_only);
+            }
+            entry.read_only = read_only;
+            Ok(())
+        })
     }
 
     /// Unmount whatever is mounted on `target`, given the mountpoint's own
@@ -383,6 +417,8 @@ impl Vfs {
                 fstype: alloc::string::String::from("ramfs"),
                 source: alloc::string::String::from("initramfs"),
                 id,
+                read_only: false,
+                fs: None,
             });
             *self.root.borrow(cs).borrow_mut() = Some(new_root_inode);
         });
@@ -584,6 +620,7 @@ impl Vfs {
         alloc::string::String,
         alloc::string::String,
         alloc::string::String,
+        alloc::string::String,
     )> {
         // The table is copied out first: naming each mount point walks the
         // tree, and that walk takes the same lock. Nested takes of the one
@@ -591,22 +628,47 @@ impl Vfs {
         let (root_fstype, root_source, entries) = critical_section::with(|cs| {
             let fstype = self.root_fstype.borrow(cs).borrow().clone();
             let source = self.root_source.borrow(cs).borrow().clone();
-            let entries: Vec<(Arc<dyn Inode>, alloc::string::String, alloc::string::String)> = self
+            let entries: Vec<(
+                Arc<dyn Inode>,
+                alloc::string::String,
+                alloc::string::String,
+                bool,
+            )> = self
                 .mounts
                 .borrow(cs)
                 .borrow()
                 .iter()
-                .map(|m| (m.at.clone(), m.source.clone(), m.fstype.clone()))
+                .map(|m| {
+                    (
+                        m.at.clone(),
+                        m.source.clone(),
+                        m.fstype.clone(),
+                        m.read_only,
+                    )
+                })
                 .collect();
             (fstype, source, entries)
         });
         let mut lines = Vec::new();
         if let (Some(fstype), Some(source)) = (root_fstype, root_source) {
-            lines.push((source, alloc::string::String::from("/"), fstype));
+            lines.push((
+                source,
+                alloc::string::String::from("/"),
+                fstype,
+                alloc::string::String::from("rw"),
+            ));
         }
-        for (at, source, fstype) in entries {
+        for (at, source, fstype, read_only) in entries {
             if let Some(path) = self.path_of(&at) {
-                lines.push((source, path, fstype));
+                // The options column. Only what this kernel can be asked for
+                // is reported: a caller that reads "ro" here knows a write
+                // will be refused, which is the one thing the column is for.
+                let options = if read_only {
+                    alloc::string::String::from("ro")
+                } else {
+                    alloc::string::String::from("rw")
+                };
+                lines.push((source, path, fstype, options));
             }
         }
         lines
@@ -782,20 +844,32 @@ pub fn pivot_root(new_root: &str, put_old: &str) -> VfsResult<()> {
 /// type and source as the caller spelled them. This is the shape `mount(2)`
 /// arrives in, and the reason it exists as a syscall at all: which filesystems
 /// are mounted where is userland's decision to make.
-pub fn mount_at(target: &str, fs: &dyn FileSystem, fstype: &str, source: &str) -> VfsResult<()> {
-    mount_at_opt(target, None, fs, fstype, source)
+pub fn mount_at(
+    target: &str,
+    fs: Arc<dyn FileSystem>,
+    fstype: &str,
+    source: &str,
+) -> VfsResult<()> {
+    mount_at_opt(target, None, fs, fstype, source, false)
 }
 
 /// [`mount_at`](fn.mount_at.html) resolved against a caller's cwd.
 pub fn mount_at_opt(
     target: &str,
     start: Option<Arc<dyn Inode>>,
-    fs: &dyn FileSystem,
+    fs: Arc<dyn FileSystem>,
     fstype: &str,
     source: &str,
+    read_only: bool,
 ) -> VfsResult<()> {
     let at = resolve_opt(target, start)?;
-    STATIC.mount_at(at, fs, fstype, source)
+    STATIC.mount_at(at, fs, fstype, source, read_only)
+}
+
+/// `mount -o remount,...`: change a mounted filesystem's flags.
+pub fn remount(target: &str, start: Option<Arc<dyn Inode>>, read_only: bool) -> VfsResult<()> {
+    let at = resolve_opt(target, start)?;
+    STATIC.remount(&at, read_only)
 }
 
 /// Unmount the filesystem at `path`, resolved against a caller's cwd.
@@ -806,6 +880,7 @@ pub fn unmount_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
 
 /// Every mount, as /proc/mounts reports it.
 pub fn mount_table() -> Vec<(
+    alloc::string::String,
     alloc::string::String,
     alloc::string::String,
     alloc::string::String,

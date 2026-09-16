@@ -769,8 +769,21 @@ pub(super) fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         Err(e) => return e,
     };
     let fstype = cstr_arg(args[2], true).unwrap_or_default();
-    if args[3] & MS_RDONLY != 0 {
-        return err::EOPNOTSUPP;
+
+    // Read-only is honoured, not recorded and ignored: the filesystem is told,
+    // and refuses writes from then on. This is what an initramfs relies on
+    // while it checks a root it has not mounted writable yet.
+    let read_only = args[3] & MS_RDONLY != 0;
+
+    // `mount -o remount,...`: no new filesystem, just new flags on one that is
+    // already mounted. `rw` is spelled by the *absence* of MS_RDONLY, which is
+    // why this is a replacement rather than a change.
+    const MS_REMOUNT: usize = 0x20;
+    if args[3] & MS_REMOUNT != 0 {
+        return match crate::vfs::mount::remount(&target, Some(cwd.clone()), read_only) {
+            Ok(()) => 0,
+            Err(e) => err_of(e),
+        };
     }
 
     // `mount(2)`'s MS_MOVE: the filesystem mounted at the source moves to the
@@ -798,13 +811,24 @@ pub(super) fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
             Err(e) => err_of(e),
         }
     } else {
-        mount_new(&source, &target, &fstype, cwd)
+        mount_new(&source, &target, &fstype, read_only, cwd)
     }
 }
 
 /// The mount half of `mount(2)`: build the filesystem the type names and
 /// hang it on the target.
-fn mount_new(source: &str, target: &str, fstype: &str, cwd: &Arc<dyn Inode>) -> isize {
+fn mount_new(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    read_only: bool,
+    cwd: &Arc<dyn Inode>,
+) -> isize {
+    // MS_NOSUID, MS_NODEV, MS_NOEXEC and MS_NOATIME are accepted and mean
+    // nothing here: there is no setuid bit to honour, no device to refuse and
+    // no attribute to leave unstamped. Accepting a flag that has no meaning is
+    // not the same as lying about one that does.
+
     // The mountpoint must already be there and must be a directory, as Linux
     // requires: mounting does not invent directories.
     let at = match crate::vfs::resolve_opt(target, Some(cwd.clone())) {
@@ -838,13 +862,15 @@ fn mount_new(source: &str, target: &str, fstype: &str, cwd: &Arc<dyn Inode>) -> 
         "proc" => crate::vfs::procfs::ProcFs::new(),
         "sysfs" => crate::vfs::sysfs::SysFs::new(),
         "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
+        "devpts" => crate::vfs::devpts::DevPts::new(),
         "tmpfs" | "ramfs" => crate::vfs::ramfs::RamFs::new(),
         // A type this kernel does not speak. ENODEV is what Linux answers, and
         // it is the answer a caller walks a list of types on.
         _ => return err::ENODEV,
     };
 
-    match crate::vfs::mount::mount_at_opt(target, Some(cwd.clone()), &*fs, fstype, source) {
+    match crate::vfs::mount::mount_at_opt(target, Some(cwd.clone()), fs, fstype, source, read_only)
+    {
         Ok(()) => 0,
         Err(e) => err_of(e),
     }
@@ -900,6 +926,56 @@ pub(super) fn handle_pivot_root(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) 
         }
         Err(e) => err_of(e),
     }
+}
+
+/// `eventfd(initval, flags)` - a counter a process can wait on.
+///
+/// One thread writes a number to it, another's `poll(2)` wakes: that is the
+/// entire contract, and it is what a program with a worker uses instead of a
+/// pipe.
+pub(super) fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
+    const EFD_SEMAPHORE: usize = 1;
+    const EFD_NONBLOCK: usize = 0x800;
+    if args[1] & EFD_SEMAPHORE != 0 {
+        // The counter is taken whole here; a caller that asked for one-per-read
+        // asked for something else, and saying so beats doing something close.
+        return err::EOPNOTSUPP;
+    }
+    let fd = crate::vfs::open_inode(crate::vfs::eventfd::EventFd::new(
+        next_anon_ino(),
+        args[0] as u32 as u64,
+    ));
+    if args[1] & EFD_NONBLOCK != 0
+        && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+    {
+        file.set_status(crate::vfs::file::O_NONBLOCK);
+    }
+    fd as isize
+}
+
+/// `signalfd(fd, mask, flags)` - signals as a descriptor. The mask is read and
+/// honoured in the one way this kernel has signals to wait for: child exits.
+pub(super) fn handle_signalfd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const SFD_NONBLOCK: usize = 0x800;
+    // Only the mask's validity is checked: this kernel reports child exits,
+    // and a caller that asked for others asked for signals it cannot get here.
+    if !crate::syscall::buffer_ok(args[1], 8, false, from_user) {
+        return err::EFAULT;
+    }
+    let fd = crate::vfs::open_inode(crate::vfs::signalfd::SignalFd::new(next_anon_ino()));
+    if args[2] & SFD_NONBLOCK != 0
+        && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+    {
+        file.set_status(crate::vfs::file::O_NONBLOCK);
+    }
+    fd as isize
+}
+
+/// A number for a descriptor that has no name to be numbered by.
+fn next_anon_ino() -> crate::vfs::Ino {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// `chroot(path)` - make `path` the root of the namespace.

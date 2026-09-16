@@ -240,9 +240,40 @@ impl Numbering {
     }
 }
 
+/// Taking turns on the one global bus, for tests. The crate has no `std` and
+/// the host build has no `spin`, so this is a lock made of one atomic - which
+/// is all a test that must not see another test's events needs.
+#[cfg(test)]
+pub(crate) mod test_bus {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static LOCK: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) struct BusLock;
+
+    pub(crate) fn take() -> BusLock {
+        while LOCK.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        BusLock
+    }
+
+    impl Drop for BusLock {
+        fn drop(&mut self) {
+            LOCK.store(false, Ordering::Release);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bus is global, so the tests that publish on it take turns: a test
+    /// that counts what it receives cannot also receive another test's events.
+    fn bus_lock() -> test_bus::BusLock {
+        test_bus::take()
+    }
 
     fn an_event() -> Event {
         Event {
@@ -257,6 +288,7 @@ mod tests {
 
     #[test]
     fn an_event_encodes_as_the_envp_block_listeners_parse() {
+        let _bus = bus_lock();
         // The wire format is the ABI here: a listener reads the message line
         // first, then KEY=VALUE entries, each NUL-terminated.
         let text = String::from_utf8(an_event().encode())
@@ -272,6 +304,7 @@ mod tests {
 
     #[test]
     fn only_bound_sockets_receive_events_and_the_queue_drains() {
+        let _bus = bus_lock();
         let watcher = open();
         let other = open();
         publish(&an_event());
@@ -308,6 +341,7 @@ mod tests {
 
     #[test]
     fn a_bounded_queue_keeps_the_newest_events() {
+        let _bus = bus_lock();
         let watcher = open();
         bind(watcher, 1);
         for _ in 0..QUEUE_MAX + 8 {

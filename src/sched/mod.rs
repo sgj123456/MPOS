@@ -18,8 +18,8 @@ pub use runtime::spawn_init;
 pub use runtime::{
     ARGS_BYTES_MAX, ARGV_MAX, CloneRequest, INIT_PID, ITIMER_PROF, ITIMER_REAL, ITIMER_VIRTUAL,
     ItimerSnapshot, ItimerState, MAX_TASKS, Redirect, STACK_ORDER, SpawnError, block_until,
-    block_until_code, brk, check_itimer, clone, current, current_blocked, current_cwd,
-    current_cwd_path, current_disposition, current_exe, current_fds, current_map_user,
+    block_until_code, brk, check_itimer, child_exited_unreaped, clone, current, current_blocked,
+    current_cwd, current_cwd_path, current_disposition, current_exe, current_fds, current_map_user,
     current_pgid, current_tls, deliver_pending_signal, discard_exit_code, exec_replace, exit,
     exit_code, fork, get_mmap_cursor, group_members, has_children, has_live_child, init, is_child,
     itimer_snapshot, itimer_swap, move_user_page, parent_of, pause, permanent_tasks, pgid_of,

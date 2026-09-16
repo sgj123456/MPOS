@@ -52,6 +52,7 @@ pub mod err {
     pub const ENOSYS: isize = -38;
     pub const EPERM: isize = -1;
     pub const EOPNOTSUPP: isize = -95;
+    pub const EROFS: isize = -30;
     pub const ENOIOCTLCMD: isize = -515;
     pub const EWOULDBLOCK: isize = -11;
     pub const EINTR: isize = -4;
@@ -138,6 +139,11 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::FileTooBig => err::EFBIG,
         VfsError::BrokenPipe => err::EPIPE,
         VfsError::Unsupported => err::ENOSYS,
+        // EROFS: what Linux answers a write to a filesystem mounted
+        // read-only, and what userland checks for before remounting.
+        VfsError::ReadOnly => err::EROFS,
+        // EAGAIN, which is also EWOULDBLOCK: they are one errno here.
+        VfsError::Again => err::EWOULDBLOCK,
     }
 }
 

@@ -18,6 +18,8 @@
 //! [`mount`] and [`resolve`].
 
 pub mod devfs;
+pub mod devpts;
+pub mod eventfd;
 pub mod ext2;
 pub mod file;
 pub mod mount;
@@ -25,6 +27,7 @@ pub mod path;
 pub mod pipe;
 pub mod procfs;
 pub mod ramfs;
+pub mod signalfd;
 pub mod sysfs;
 pub mod tar;
 pub mod termios;
@@ -122,6 +125,11 @@ pub enum VfsError {
     BrokenPipe,
     /// The filesystem does not support this operation.
     Unsupported,
+    /// A write to a filesystem that was mounted read-only.
+    ReadOnly,
+    /// A read or write that would block, on a descriptor the caller asked
+    /// not to block on.
+    Again,
 }
 
 pub type VfsResult<T> = Result<T, VfsError>;
@@ -302,6 +310,20 @@ pub trait FileSystem: Send + Sync {
     /// reports. A filesystem that cannot be named cannot be mounted from
     /// userland, which is the whole point of the call.
     fn name(&self) -> &'static str;
+
+    /// Whether this filesystem was mounted read-only, and which is asked to
+    /// become so or stop being so. `mount -o ro` is not a comment on how the
+    /// caller intends to behave: it is a promise the filesystem keeps by
+    /// refusing writes, and an initramfs relies on it while it checks the
+    /// root it has not yet trusted.
+    ///
+    /// The default is "writable, and nothing to do": a filesystem with no
+    /// writes to refuse - procfs, devfs, an empty sysfs - has nothing to say.
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    fn set_read_only(&self, _read_only: bool) {}
 }
 
 /// List the directory named by `path`, in one call. The convenience the

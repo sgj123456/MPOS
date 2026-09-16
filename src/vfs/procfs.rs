@@ -212,12 +212,16 @@ impl ProcFs {
             NodeKind::File,
             self.file(|| {
                 let mut out = String::new();
-                for (source, path, fstype) in super::mount::global().mount_table() {
+                for (source, path, fstype, options) in super::mount::global().mount_table() {
+                    // The fourth column is the mount options, and it is the one
+                    // that matters: `ro` says a write here will be refused, and
+                    // userland reads it to decide whether to remount.
                     out.push_str(&alloc::format!(
-                        "{} {} {} rw 0 0\n",
+                        "{} {} {} {} 0 0\n",
                         if source.is_empty() { "none" } else { &source },
                         path,
-                        fstype
+                        fstype,
+                        options
                     ));
                 }
                 out

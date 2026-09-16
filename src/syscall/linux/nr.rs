@@ -197,6 +197,10 @@ pub const PIVOT_ROOT: u64 = 155;
 /// `chroot(2)`: change what `/` means. `switch_root` uses it after moving the
 /// root, to drop the process - and here, the namespace - out of the initramfs.
 pub const CHROOT: u64 = 161;
+/// `signalfd(2)`: a descriptor that reports signals - child exits here.
+pub const SIGNALFD: u64 = 282;
+/// `eventfd(2)`: a counter a process can wait on.
+pub const EVENTFD: u64 = 290;
 /// `link(2)` / `linkat(2)`: a second name for an inode.
 pub const LINK: u64 = 86;
 pub const LINKAT: u64 = 265;
