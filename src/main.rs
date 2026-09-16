@@ -223,8 +223,11 @@ fn init_vfs(info: &BootInfo) {
     let members = vfs::tar::unpack_into(vfs::global(), archive).expect("the initramfs was broken");
     println!("initramfs: {members} members unpacked");
 
-    let dev = drivers::devices::standard_devfs();
-    vfs::mount("/dev", &*dev).expect("mount /dev");
+    // No /dev here. The kernel used to build one and mount it on the temporary
+    // root, which meant it existed before the block layer did - so it had no
+    // disk in it, and `/init` mounting its own got `EBUSY` and kept the crippled
+    // one. Devices belong to whoever mounts /dev, and on this machine that is
+    // the initramfs's own init script.
 }
 
 fn init_blk() {
@@ -1061,6 +1064,13 @@ fn check_vfs() {
                 .next()
                 .unwrap_or("")
         );
+
+        // The device filesystem is mounted here rather than at boot: the
+        // kernel no longer puts a /dev on the temporary root - whoever mounts
+        // /dev owns it, and that is the initramfs's init script. These checks
+        // are the kernel's own userland, so they mount their own.
+        let dev = drivers::devices::standard_devfs();
+        vfs::mount("/dev", &*dev).expect("mount /dev for the device check");
 
         let console = vfs::open("/dev/console").expect("open /dev/console");
         let line = b"this line went through /dev/console\n";

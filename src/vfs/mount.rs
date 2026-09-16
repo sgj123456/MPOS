@@ -37,6 +37,11 @@ struct Mount {
     /// what is mounted where, which is the only record there is.
     fstype: alloc::string::String,
     source: alloc::string::String,
+    /// Which filesystem this is, as `stat`'s `st_dev` reports it: a number
+    /// distinct per mounted instance. Userland compares it to tell "the same
+    /// filesystem" from "a different one" - `switch_root`'s safety check is
+    /// exactly that comparison.
+    id: u64,
 }
 
 /// A set of mounts with a root, and the resolver over them.
@@ -48,6 +53,14 @@ pub struct Vfs {
     /// `pivot_root` from the mount that carried the new root in.
     root_fstype: Mutex<RefCell<Option<alloc::string::String>>>,
     root_source: Mutex<RefCell<Option<alloc::string::String>>>,
+    /// The source of filesystem instance ids: every mount gets one, and
+    /// `stat`'s `st_dev` reports it, which is how userland tells "the same
+    /// filesystem" from "a different one".
+    fs_seq: Mutex<RefCell<u64>>,
+    /// Mountpoint path -> (id, fstype), refreshed whenever the table changes.
+    /// `stat` answers per path, and recomputing the mountpoint paths on every
+    /// stat would be a tree walk per call.
+    mount_points: Mutex<RefCell<Vec<(alloc::string::String, u64, alloc::string::String)>>>,
 }
 
 impl Vfs {
@@ -57,6 +70,8 @@ impl Vfs {
             mounts: Mutex::new(RefCell::new(Vec::new())),
             root_fstype: Mutex::new(RefCell::new(None)),
             root_source: Mutex::new(RefCell::new(None)),
+            fs_seq: Mutex::new(RefCell::new(1)),
+            mount_points: Mutex::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -107,14 +122,115 @@ impl Vfs {
             if mounts.iter().any(|m| Arc::ptr_eq(&m.at, &at)) {
                 return Err(VfsError::Busy);
             }
+            let id = self.next_fs_id();
             mounts.push(Mount {
                 at,
                 root: fs.root(),
                 fstype: alloc::string::String::from(fs.name()),
                 source: alloc::string::String::from("none"),
+                id,
             });
             Ok(())
+        })?;
+        self.refresh_mount_points();
+        Ok(())
+    }
+
+    /// The next filesystem instance id. Ids start at 1: 0 is the root's.
+    fn next_fs_id(&self) -> u64 {
+        critical_section::with(|cs| {
+            let seq = self.fs_seq.borrow(cs);
+            let mut seq = seq.borrow_mut();
+            let id = *seq;
+            *seq += 1;
+            id
         })
+    }
+
+    /// Recompute the mountpoint table: each mount's point named from the root,
+    /// plus the root itself as entry 0. `stat`'s `st_dev` and `statfs`'s type
+    /// both come from here, by longest-prefix match on the path.
+    fn refresh_mount_points(&self) {
+        // The table is copied out first: naming each mount point walks the
+        // tree with `path_of`, and that walk takes the same lock.
+        let (root_fstype, entries) = critical_section::with(|cs| {
+            let fstype = self.root_fstype.borrow(cs).borrow().clone();
+            let entries: Vec<(Arc<dyn Inode>, u64, alloc::string::String)> = self
+                .mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .map(|m| (m.at.clone(), m.id, m.fstype.clone()))
+                .collect();
+            (fstype, entries)
+        });
+        let mut points: Vec<(alloc::string::String, u64, alloc::string::String)> = Vec::new();
+        if let Some(fstype) = root_fstype {
+            points.push((alloc::string::String::from("/"), 0, fstype));
+        }
+        for (at, id, fstype) in entries {
+            if let Some(path) = self.path_of(&at) {
+                points.push((path, id, fstype));
+            }
+        }
+        critical_section::with(|cs| {
+            *self.mount_points.borrow(cs).borrow_mut() = points;
+        });
+    }
+
+    /// Which filesystem serves `path`: its instance id and type, by the
+    /// deepest mountpoint that prefixes the path. The root, when nothing
+    /// else matches, is id 0.
+    pub fn fs_of_path(&self, path: &str) -> (u64, alloc::string::String) {
+        let trimmed = super::path::normalize(path);
+        let points = critical_section::with(|cs| self.mount_points.borrow(cs).borrow().clone());
+        let mut best: Option<(alloc::string::String, u64, alloc::string::String)> = None;
+        for point in points.iter() {
+            let mp = point.0.as_str();
+            let inside = if mp == "/" {
+                true
+            } else {
+                trimmed == mp || (trimmed.starts_with(mp) && trimmed[mp.len()..].starts_with('/'))
+            };
+            if inside && best.as_ref().map_or(true, |b| point.0.len() > b.0.len()) {
+                best = Some(point.clone());
+            }
+        }
+        match best {
+            Some(point) => (point.1, point.2),
+            None => (0, alloc::string::String::from("unknown")),
+        }
+    }
+
+    /// Make `inode` the global root, dropping every mount. `chroot(2)`'s
+    /// shape: the caller has already decided what the root is, and this
+    /// kernel has one namespace.
+    pub fn set_global_root(&self, inode: Arc<dyn Inode>) {
+        critical_section::with(|cs| {
+            *self.root.borrow(cs).borrow_mut() = Some(inode);
+        });
+        self.refresh_mount_points();
+    }
+
+    /// `mount(2)`'s MS_MOVE: the filesystem mounted at `at` becomes the root.
+    /// The mount entry moves out of the table and into the root slot; the
+    /// old tree's remaining mounts go with the old tree.
+    pub fn move_root(&self, at: &Arc<dyn Inode>) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            let pos = mounts
+                .iter()
+                .position(|m| Arc::ptr_eq(&m.at, at))
+                .ok_or(VfsError::Invalid)?;
+            let m = mounts.remove(pos);
+            *self.root.borrow(cs).borrow_mut() = Some(m.root.clone());
+            *self.root_fstype.borrow(cs).borrow_mut() = Some(m.fstype.clone());
+            *self.root_source.borrow(cs).borrow_mut() = Some(m.source.clone());
+            mounts.clear();
+            Ok(())
+        })?;
+        self.refresh_mount_points();
+        Ok(())
     }
 
     /// Mount `fs` on an already-resolved directory, as `mount(2)` does: the
@@ -136,14 +252,18 @@ impl Vfs {
             if mounts.iter().any(|m| Arc::ptr_eq(&m.at, &at)) {
                 return Err(VfsError::Busy);
             }
+            let id = self.next_fs_id();
             mounts.push(Mount {
                 at,
                 root: fs.root(),
                 fstype: alloc::string::String::from(fstype),
                 source: alloc::string::String::from(source),
+                id,
             });
             Ok(())
-        })
+        })?;
+        self.refresh_mount_points();
+        Ok(())
     }
 
     /// Unmount whatever is mounted on `target`, given the mountpoint's own
@@ -158,7 +278,9 @@ impl Vfs {
             } else {
                 Err(VfsError::Busy)
             }
-        })
+        })?;
+        self.refresh_mount_points();
+        Ok(())
     }
 
     /// Unmount the filesystem mounted at `path`.
@@ -254,14 +376,17 @@ impl Vfs {
             // alive for good. The new tree starts with the one mount below plus
             // whatever the caller attaches next.
             mounts.clear();
+            let id = self.next_fs_id();
             mounts.push(Mount {
                 at: put_old_inode.clone(),
                 root: old_root,
                 fstype: alloc::string::String::from("ramfs"),
                 source: alloc::string::String::from("initramfs"),
+                id,
             });
             *self.root.borrow(cs).borrow_mut() = Some(new_root_inode);
         });
+        self.refresh_mount_points();
         Ok(())
     }
 
@@ -686,6 +811,69 @@ pub fn mount_table() -> Vec<(
     alloc::string::String,
 )> {
     STATIC.mount_table()
+}
+
+/// The filesystem instance id serving `path`, with its type.
+pub fn fs_of_path(path: &str) -> (u64, alloc::string::String) {
+    STATIC.fs_of_path(path)
+}
+
+/// The type of the filesystem a node belongs to, by identity: a mount's own
+/// root names that mount; anything else names the root filesystem.
+pub fn fstype_of_inode(inode: &Arc<dyn Inode>) -> alloc::string::String {
+    let (root_fstype, hits) = critical_section::with(|cs| {
+        let fstype = STATIC
+            .root_fstype
+            .borrow(cs)
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| alloc::string::String::from("unknown"));
+        let hits: Vec<alloc::string::String> = STATIC
+            .mounts
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .filter(|m| Arc::ptr_eq(&m.root, inode))
+            .map(|m| m.fstype.clone())
+            .collect();
+        (fstype, hits)
+    });
+    hits.into_iter().next().unwrap_or(root_fstype)
+}
+
+/// The filesystem instance id a node belongs to, by identity: a mount's own
+/// root names that mount; anything else names the root filesystem. This is
+/// `st_dev` for a descriptor, which has no path to look the answer up by.
+pub fn fs_id_of_inode(inode: &Arc<dyn Inode>) -> u64 {
+    critical_section::with(|cs| {
+        STATIC
+            .mounts
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .find(|m| Arc::ptr_eq(&m.root, inode))
+            .map(|m| m.id)
+            .unwrap_or(0)
+    })
+}
+
+/// Make `inode` the root of the namespace, as `chroot(2)` asks. The kernel
+/// has one namespace, so this is a whole-namespace answer rather than a
+/// per-process one - which is exactly what an initramfs's `switch_root`
+/// wants, being pid 1 and alone.
+pub fn chroot(path: &str, cwd: &Arc<dyn Inode>) -> VfsResult<()> {
+    let inode = resolve_opt(path, Some(cwd.clone()))?;
+    if inode.metadata().kind != NodeKind::Dir {
+        return Err(VfsError::NotDir);
+    }
+    STATIC.set_global_root(inode);
+    Ok(())
+}
+
+/// `mount(2)`'s MS_MOVE, free-function spelling: the filesystem mounted at
+/// `at` becomes the root.
+pub fn move_root(at: &Arc<dyn Inode>) -> VfsResult<()> {
+    STATIC.move_root(at)
 }
 
 /// Resolve `path` in the kernel's tree.

@@ -122,7 +122,7 @@ done
 # Both runs execute a setup script (below) with $ROOTFS pointed at the tree;
 # no chroot, so the only privilege used is that the files are owned by root.
 ALPINE_BRANCH=v3.24
-ALPINE_MIRROR=http://dl-cdn.alpinelinux.org/alpine
+ALPINE_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/alpine
 MAKE_ROOTFS="$ROOT/alpine-make-rootfs/alpine-make-rootfs"
 
 # alpine-make-rootfs drives `apk`; the host has none, so the static build
@@ -206,36 +206,76 @@ sh "$MAKE_ROOTFS" \
 copy_programs "$ROOTFS"
 
 # --- initramfs --------------------------------------------------------------
-# A complete-enough Alpine to boot from: busybox for the shell and the mount
-# applets, and the workspace's own test programs. `apk` itself goes in as the
-# static binary the build already fetched - an initramfs has no store to
-# consult, and the sweep proves the ABI with `apk --version`.
 #
-# The initramfs tree is temporary - only the tar survives. It lives under
-# build/ by default; MPOS_INITRAMFS_DIR moves it elsewhere for a host whose
-# build tree is watched by tooling that objects to another program's renames
-# inside it.
+# Built by Alpine's own mkinitfs, inside the Alpine docker image: that is what
+# produces the standard initramfs layout - busybox and its applets, the
+# mkinitfs helper scripts, a /init - and it is the tool the distribution uses
+# for its own kernels.
+#
+# Two facts shape what happens to its output:
+#
+#   * mkinitfs writes a gzipped cpio archive, and this kernel's unpacker reads
+#     ustar. The archive is extracted on the host and repacked below.
+#   * its /init finds the root device over netlink uevents and mounts what
+#     /proc/cmdline names. This kernel has no uevent socket, so the /init that
+#     runs is scripts/initramfs-init - injected here, with mkinitfs's own kept
+#     at /init.mkinitfs for the day that changes.
+#
+# Without a docker daemon the tree is built by alpine-make-rootfs instead: the
+# same shape, a different producer, and the same injected init.
 if [[ -n "${MPOS_INITRAMFS_DIR:-}" ]]; then
     INITRAMFS_DIR="$(mktemp -d "${MPOS_INITRAMFS_DIR%/}.XXXXXX")"
 else
     INITRAMFS_DIR="$PACK/initramfs_root"
     rm -rf "$INITRAMFS_DIR"
 fi
-sh "$MAKE_ROOTFS" \
-    --branch "$ALPINE_BRANCH" \
-    --mirror-uri "$ALPINE_MIRROR" \
-    --packages "alpine-release" \
-    "$INITRAMFS_DIR" "$ROOT/scripts/setup-initramfs.sh"
+mkdir -p "$INITRAMFS_DIR"
 
-cp "$APK_BIN" "$INITRAMFS_DIR/sbin/apk"
-chmod +x "$INITRAMFS_DIR/sbin/apk"
+DOCKER_OUT="$PACK/docker"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo "initramfs: mkinitfs, in alpine:$ALPINE_BRANCH"
+    rm -rf "$DOCKER_OUT"
+    mkdir -p "$DOCKER_OUT"
+    docker run --rm -v "$DOCKER_OUT:/out" "alpine:latest" sh -euxc '
+        apk add --no-cache mkinitfs
+        # The kernel-version argument names where modules would be read from.
+        # This kernel has none, and an empty directory is enough for mkinitfs
+        # to write the archive it is asked for.
+        mkdir -p /lib/modules/0.0.0
+        printf "features=\"base\"\n" > /etc/mkinitfs/mkinitfs.conf
+        mkinitfs -o /out/initramfs.cpio.gz 0.0.0
+    '
+    python3 "$ROOT/scripts/cpio-extract.py" "$DOCKER_OUT/initramfs.cpio.gz" "$INITRAMFS_DIR"
+else
+    echo "initramfs: no docker daemon; building the tree with alpine-make-rootfs"
+    sh "$MAKE_ROOTFS" \
+        --branch "$ALPINE_BRANCH" \
+        --mirror-uri "$ALPINE_MIRROR" \
+        --packages "alpine-release" \
+        "$INITRAMFS_DIR"
+fi
+
+# The canonical directories, the parking place for the real root, the release
+# stamp the boot's own check reads, and mkinitfs's init kept aside.
+ROOTFS="$INITRAMFS_DIR" \
+    ROOTFS_RELEASE="$(cat "$PACK/rootfs/etc/alpine-release" 2>/dev/null || echo "$ALPINE_BRANCH")" \
+    sh "$ROOT/scripts/setup-initramfs.sh"
+
+# The init that runs, and the static apk the boot's ABI check runs: the
+# initramfs has no package store to consult for either.
+install -m 0755 "$ROOT/scripts/initramfs-init" "$INITRAMFS_DIR/init"
+if [[ -f "$APK_BIN" ]]; then
+    mkdir -p "$INITRAMFS_DIR/sbin"
+    cp "$APK_BIN" "$INITRAMFS_DIR/sbin/apk"
+    chmod +x "$INITRAMFS_DIR/sbin/apk"
+fi
 
 copy_programs "$INITRAMFS_DIR"
 
 tar --format=ustar --owner=root --group=root --numeric-owner \
     -cf "$BOOT_TREE/boot/initramfs.tar" -C "$INITRAMFS_DIR" .
 chmod -R a+rwX "$INITRAMFS_DIR" 2>/dev/null || true
-rm -rf "$INITRAMFS_DIR"
+rm -rf "$INITRAMFS_DIR" "$DOCKER_OUT" 2>/dev/null || true
 
 # The ESP carries only the bootloader and its config. Limine looks for
 # limine.conf in the ESP root.

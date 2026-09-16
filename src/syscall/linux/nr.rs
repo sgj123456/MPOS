@@ -194,6 +194,9 @@ pub const UMOUNT2: u64 = 166;
 /// `put_old`. This is the call an initramfs makes to hand the machine over.
 /// (155, not 160-166's neighbourhood: those are setrlimit and the mount pair.)
 pub const PIVOT_ROOT: u64 = 155;
+/// `chroot(2)`: change what `/` means. `switch_root` uses it after moving the
+/// root, to drop the process - and here, the namespace - out of the initramfs.
+pub const CHROOT: u64 = 161;
 /// `link(2)` / `linkat(2)`: a second name for an inode.
 pub const LINK: u64 = 86;
 pub const LINKAT: u64 = 265;
@@ -210,8 +213,8 @@ pub const CLOCK_GETRES: u64 = 229;
 pub const WAITID: u64 = 247;
 /// The legacy rlimit pair; `prlimit64` is the one musl prefers, but old
 /// binaries and busybox applets still ask by these numbers.
-pub const GETRLIMIT: u64 = 160;
-pub const SETRLIMIT: u64 = 161;
+pub const GETRLIMIT: u64 = 97;
+pub const SETRLIMIT: u64 = 160;
 /// `pselect6(2)`: `select` with a signal mask and a nanosecond timeout.
 pub const PSELECT6: u64 = 270;
 /// `fadvise64(2)`: a hint about future access. Nothing here prefetches, so

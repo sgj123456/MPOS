@@ -172,11 +172,14 @@ pub(super) fn stat_legacy(nr: u64, args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode
 /// `fstat(fd, buf)` - the fd's description, not a path, is what is statted.
 pub(super) fn fstat(args: [usize; ARG_COUNT]) -> isize {
     let (fd, buf) = (args[0] as i32, args[1]);
-    let meta = match crate::sched::current_fds().clone_at(fd) {
-        Ok(file) => file.metadata(),
+    let (meta, dev) = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => (
+            file.metadata(),
+            crate::vfs::mount::fs_id_of_inode(&file.inode()),
+        ),
         Err(e) => return err_of(e),
     };
-    write_stat(buf, &meta)
+    write_stat(buf, &meta, dev)
 }
 
 /// `flock(fd, operation)` - the advisory whole-file lock `apk` takes on its
@@ -244,25 +247,49 @@ pub(super) fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
     }
 }
 
-/// `fstatfs(fd, buf)` - filesystem facts for whatever `fd` is open on. Every
-/// descriptor lives on the one ext2 root filesystem, so the answer is the
-/// same for all of them; only the fd's validity is checked.
+/// `fstatfs(fd, buf)` - filesystem facts for whatever `fd` is open on. The
+/// descriptor names a file; the file names a filesystem. A file that *is* a
+/// mountpoint reports that mount; anything else reports the root, which is
+/// the honest answer this kernel can give without tracking a path per
+/// descriptor.
 pub(super) fn fstatfs(args: [usize; ARG_COUNT]) -> isize {
-    if let Err(e) = crate::sched::current_fds().clone_at(args[0] as i32) {
-        return err_of(e);
-    }
-    write_statfs(args[1])
+    let inode = match crate::sched::current_fds()
+        .clone_at(args[0] as i32)
+        .map(|f| f.inode().clone())
+    {
+        Ok(i) => i,
+        Err(e) => return err_of(e),
+    };
+    let fstype = crate::vfs::mount::fstype_of_inode(&inode);
+    write_statfs(args[1], &fstype)
 }
 
-/// `statfs(path, buf)` - the path spelling of `fstatfs`.
+/// `statfs(path, buf)` - the path spelling of `fstatfs`, and the one that
+/// carries real information: the deepest mountpoint prefixing the path is
+/// the filesystem that serves it.
 pub(super) fn statfs(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
     match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
-        Ok(_) => write_statfs(args[1]),
+        Ok(_) => {
+            let (_id, fstype) = crate::vfs::mount::fs_of_path(&absolute(&path));
+            write_statfs(args[1], &fstype)
+        }
         Err(e) => err_of(e),
+    }
+}
+
+/// The absolute, normalized spelling of a path a syscall was handed, for the
+/// filesystem lookup: `st_dev` and `statfs`'s type both key on the path, and
+/// `.` names whatever the caller's cwd is.
+fn absolute(path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        crate::vfs::path::normalize(path)
+    } else {
+        let cwd = crate::sched::current_cwd_path();
+        crate::vfs::path::normalize(&alloc::format!("{}/{}", cwd.trim_end_matches('/'), path))
     }
 }
 
@@ -278,11 +305,14 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
         if flags & AT_EMPTY_PATH == 0 {
             return err::ENOENT;
         }
-        let meta = match crate::sched::current_fds().clone_at(dirfd) {
-            Ok(file) => file.metadata(),
+        let (meta, dev) = match crate::sched::current_fds().clone_at(dirfd) {
+            Ok(file) => (
+                file.metadata(),
+                crate::vfs::mount::fs_id_of_inode(&file.inode()),
+            ),
             Err(e) => return err_of(e),
         };
-        return write_stat(buf, &meta);
+        return write_stat(buf, &meta, dev);
     }
     let base = match base_of(dirfd, cwd) {
         Ok(base) => base,
@@ -302,7 +332,8 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
             Err(e) => return err_of(e),
         }
     };
-    write_stat(buf, &meta)
+    let (dev, _fstype) = crate::vfs::mount::fs_of_path(&absolute(&path));
+    write_stat(buf, &meta, dev)
 }
 
 /// `statx(dirfd, path, flags, mask, buf)` - the extended stat uutils calls.
@@ -476,14 +507,6 @@ fn normalize_path(path: &str, base: &str) -> alloc::string::String {
 /// `unlinkat(dirfd, path, flags)` - `AT_REMOVEDIR` is accepted and ignored:
 /// removal goes through the same unlink either way.
 pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let r = unlinkat_inner(args, cwd);
-    if let Ok(path) = cstr_arg(args[1], true) {
-        crate::println!("TRACE unlink {:?} flags={:#x} = {}", path, args[2], r);
-    }
-    r
-}
-
-fn unlinkat_inner(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // `AT_REMOVEDIR` is `unlinkat` spelling `rmdir`: the flag is not an
     // optimisation, it is how the caller says which of the two operations it
     // means, and getting it wrong either removes a directory that still holds
@@ -569,14 +592,6 @@ pub(super) fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// exchange and whiteout forms have no implementation underneath and answer
 /// `EINVAL`, as Linux does for a flag combination it cannot serve.
 pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let r = renameat2_inner(args, cwd);
-    if let (Ok(old), Ok(new)) = (cstr_arg(args[1], true), cstr_arg(args[3], true)) {
-        crate::println!("TRACE rename {:?} -> {:?} = {}", old, new, r);
-    }
-    r
-}
-
-fn renameat2_inner(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     const RENAME_NOREPLACE: usize = 0x1;
     const RENAME_EXCHANGE: usize = 0x2;
     const RENAME_WHITEOUT: usize = 0x4;
@@ -758,9 +773,41 @@ pub(super) fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         return err::EOPNOTSUPP;
     }
 
+    // `mount(2)`'s MS_MOVE: the filesystem mounted at the source moves to the
+    // target, and a target of `/` is what `switch_root` asks for - the new
+    // root becomes the filesystem, and the initramfs it came from goes away.
+    // No new filesystem is built for a move, so this comes before the type
+    // dispatch: `switch_root` passes no type at all.
+    const MS_MOVE: usize = 0x2000;
+    if args[3] & MS_MOVE != 0 {
+        let src = match crate::vfs::resolve_opt(&source, Some(cwd.clone())) {
+            Ok(s) => s,
+            Err(e) => return err_of(e),
+        };
+        match crate::vfs::mount::move_root(&src) {
+            Ok(()) => {
+                // The caller was standing in the tree that just stopped being
+                // mounted anywhere; the new root is the only place left to
+                // stand, and every name it uses from here resolves there.
+                if let Ok(root) = crate::vfs::resolve("/") {
+                    crate::sched::set_cwd(root);
+                    crate::sched::set_cwd_path(alloc::string::String::from("/"));
+                }
+                0
+            }
+            Err(e) => err_of(e),
+        }
+    } else {
+        mount_new(&source, &target, &fstype, cwd)
+    }
+}
+
+/// The mount half of `mount(2)`: build the filesystem the type names and
+/// hang it on the target.
+fn mount_new(source: &str, target: &str, fstype: &str, cwd: &Arc<dyn Inode>) -> isize {
     // The mountpoint must already be there and must be a directory, as Linux
     // requires: mounting does not invent directories.
-    let at = match crate::vfs::resolve_opt(&target, Some(cwd.clone())) {
+    let at = match crate::vfs::resolve_opt(target, Some(cwd.clone())) {
         Ok(at) => at,
         Err(e) => return err_of(e),
     };
@@ -768,14 +815,14 @@ pub(super) fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         return err::ENOTDIR;
     }
 
-    let fs: alloc::sync::Arc<dyn crate::vfs::FileSystem> = match fstype.as_str() {
+    let fs: alloc::sync::Arc<dyn crate::vfs::FileSystem> = match fstype {
         // The block types. The source names a device node; the node knows
         // which storage it stands for.
         "ext2" | "ext3" | "ext4" => {
             if source.is_empty() {
                 return err::ENOENT;
             }
-            let dev_node = match crate::vfs::resolve_opt(&source, Some(cwd.clone())) {
+            let dev_node = match crate::vfs::resolve_opt(source, Some(cwd.clone())) {
                 Ok(node) => node,
                 Err(e) => return err_of(e),
             };
@@ -797,7 +844,7 @@ pub(super) fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         _ => return err::ENODEV,
     };
 
-    match crate::vfs::mount::mount_at_opt(&target, Some(cwd.clone()), &*fs, &fstype, &source) {
+    match crate::vfs::mount::mount_at_opt(target, Some(cwd.clone()), &*fs, fstype, source) {
         Ok(()) => 0,
         Err(e) => err_of(e),
     }
@@ -845,6 +892,29 @@ pub(super) fn handle_pivot_root(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) 
             // The caller's cwd named a directory in the tree that just stopped
             // being the root. Everything it reaches for from here on - `exec`,
             // relative paths, `getcwd` - has to answer in the new one.
+            if let Ok(root) = crate::vfs::resolve("/") {
+                crate::sched::set_cwd(root);
+                crate::sched::set_cwd_path(alloc::string::String::from("/"));
+            }
+            0
+        }
+        Err(e) => err_of(e),
+    }
+}
+
+/// `chroot(path)` - make `path` the root of the namespace.
+///
+/// `switch_root`'s second step: it has already emptied the initramfs and
+/// moved the new root over `/`, and this call drops the process's remaining
+/// claim on the old tree. The kernel has one namespace, so the answer here is
+/// whole-namespace - which is what the caller wants, being pid 1 and alone.
+pub(super) fn handle_chroot(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let path = match cstr_arg(args[0], true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::vfs::mount::chroot(&path, cwd) {
+        Ok(()) => {
             if let Ok(root) = crate::vfs::resolve("/") {
                 crate::sched::set_cwd(root);
                 crate::sched::set_cwd_path(alloc::string::String::from("/"));
@@ -1336,7 +1406,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
 /// the struct rather than as indices into a `u64` view - an off-by-one word
 /// here is invisible to every caller that only reads `st_mode`, and silently
 /// answers "empty file" to the ones that ask for `st_size`.
-fn write_stat(buf: usize, meta: &Metadata) -> isize {
+fn write_stat(buf: usize, meta: &Metadata, dev: u64) -> isize {
     if !buffer_ok(buf, 144, true, true) {
         return err::EFAULT;
     }
@@ -1347,7 +1417,11 @@ fn write_stat(buf: usize, meta: &Metadata) -> isize {
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 144);
         let at = |offset: usize| (buf + offset) as *mut u8;
-        (at(0) as *mut u64).write_volatile(meta.ino); // st_dev (the one device there is)
+        // st_dev names the *filesystem*, not the file: two files on one
+        // filesystem share it, and a file on another has its own. That is
+        // exactly the comparison `switch_root` makes before it deletes the
+        // old root, and the one `df` makes to group what it reports.
+        (at(0) as *mut u64).write_volatile(dev);
         (at(8) as *mut u64).write_volatile(meta.ino); // st_ino
         (at(16) as *mut u64).write_volatile(nlink); // st_nlink
         (at(24) as *mut u32).write_volatile(mode_of(meta)); // st_mode
@@ -1361,29 +1435,55 @@ fn write_stat(buf: usize, meta: &Metadata) -> isize {
     0
 }
 
-/// Write the 120-byte Linux x86_64 `struct statfs`.
+/// Write the 120-byte Linux x86_64 `struct statfs` for the filesystem `name`
+/// spells. Same rule as `write_stat`: the offsets are the ABI, and every
+/// field is a word except the two-`u32` `f_fsid`. The magic is the real one
+/// the filesystem reports on Linux - `switch_root` reads `f_type` to decide
+/// whether the root it stands in is an initramfs, and answering "ext2" for a
+/// ramfs is what made it refuse to switch.
 ///
-/// Same rule as `write_stat`: the offsets are the ABI, and every field is a
-/// word except the two-`u32` `f_fsid`. The root filesystem is the one ext2
-/// there is, so the answer is constant. The block counts are coarse - no
-/// superblock statistics are carried into the kernel's VFS - but they say
-/// "roughly half of 8 MiB free", which is what an apk caller asking before a
-/// download wants to hear.
-fn write_statfs(buf: usize) -> isize {
+/// The block counts are coarse: they say "memory-sized" for the kernel's own
+/// trees and nothing yet for ext2, whose superblock statistics do not reach
+/// the VFS.
+fn write_statfs(buf: usize, name: &str) -> isize {
     if !buffer_ok(buf, 120, true, true) {
         return err::EFAULT;
     }
-    const EXT2_SUPER_MAGIC: u64 = 0xEF53;
+    // The superblock magics, as Linux defines them. A caller that switches
+    // roots reads exactly this field.
+    let magic: u64 = match name {
+        "ramfs" => 0x858458F6,
+        // tmpfs and the devfs built over it are the same kind of tree here.
+        "tmpfs" | "devfs" | "devtmpfs" => 0x01021994,
+        "proc" => 0x00009FA0,
+        "sysfs" => 0x62656572,
+        "ext2" | "ext3" | "ext4" => 0x0000EF53,
+        _ => 0,
+    };
+    // Memory-backed trees are as big as the frame allocator; ext2's own
+    // numbers are not carried into the VFS yet and read as zero.
+    let memory_backed = matches!(name, "ramfs" | "tmpfs" | "devfs" | "devtmpfs");
+    let (blocks, free) = if memory_backed {
+        critical_section::with(|cs| {
+            let pmm = crate::mm::PMM.borrow(cs).borrow();
+            (
+                (pmm.total_frames() * 4) as u64,
+                (pmm.free_frames() * 4) as u64,
+            )
+        })
+    } else {
+        (0, 0)
+    };
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 120);
         let at = |offset: usize| (buf + offset) as *mut u8;
-        (at(0) as *mut u64).write_volatile(EXT2_SUPER_MAGIC); // f_type
+        (at(0) as *mut u64).write_volatile(magic); // f_type
         (at(8) as *mut u64).write_volatile(4096); // f_bsize
-        (at(16) as *mut u64).write_volatile(2048); // f_blocks (8 MiB)
-        (at(24) as *mut u64).write_volatile(1024); // f_bfree
-        (at(32) as *mut u64).write_volatile(1024); // f_bavail
-        (at(40) as *mut u64).write_volatile(512); // f_files
-        (at(48) as *mut u64).write_volatile(256); // f_ffree
+        (at(16) as *mut u64).write_volatile(blocks); // f_blocks
+        (at(24) as *mut u64).write_volatile(free); // f_bfree
+        (at(32) as *mut u64).write_volatile(free); // f_bavail
+        (at(40) as *mut u64).write_volatile(0); // f_files
+        (at(48) as *mut u64).write_volatile(0); // f_ffree
         (at(64) as *mut u64).write_volatile(255); // f_namelen
         // f_fsid (56..64), f_frsize (72), f_flags (80) and the four spares
         // stay 0: a zero f_frsize reads as "same as f_bsize".

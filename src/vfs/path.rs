@@ -38,6 +38,35 @@ impl<'a> Iterator for Components<'a> {
 
 /// Split an absolute path. Relative paths are [`VfsError::Invalid`] until
 /// processes (and with them, cwd) exist.
+/// The canonical spelling of `path`: absolute, with `.` dropped, `..` folded
+/// into the components before it, and repeated slashes collapsed.
+///
+/// This is not resolution - nothing here touches a filesystem. It is what a
+/// path *means*, and the caller that needs it most is `statfs`: the filesystem
+/// serving a path is found by matching mountpoint prefixes, and a mountpoint
+/// is never spelled `.`.
+pub fn normalize(path: &str) -> alloc::string::String {
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return alloc::string::String::from("/");
+    }
+    let mut out = alloc::string::String::new();
+    for part in parts {
+        out.push('/');
+        out.push_str(part);
+    }
+    out
+}
+
 pub fn components(path: &str) -> VfsResult<Components<'_>> {
     if !path.starts_with('/') {
         return Err(VfsError::Invalid);

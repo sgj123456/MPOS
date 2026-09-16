@@ -34,7 +34,8 @@ pub fn set_raw_disk(dev: Arc<dyn BlockDev>) {
     });
 }
 
-/// The boot disk, if the block layer has one yet.
+/// The boot disk, if the block layer has one yet. The devfs builder asks
+/// here for the names it publishes as `/dev/vda*`.
 pub fn raw_disk() -> Option<Arc<dyn BlockDev>> {
     critical_section::with(|cs| RAW.borrow(cs).borrow().clone())
 }

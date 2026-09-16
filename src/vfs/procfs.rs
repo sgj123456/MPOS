@@ -35,11 +35,14 @@ struct ProcFile {
 
 impl Inode for ProcFile {
     fn metadata(&self) -> Metadata {
-        let content = (self.generate)();
+        // Size zero, as Linux reports for the files it generates: the answer
+        // is not known until it is asked for, and asking is the work. A
+        // generator that ran here would run during every directory listing -
+        // and /proc/mounts' generator walks the tree, which walks /proc.
         Metadata {
             ino: self.ino,
             kind: NodeKind::File,
-            size: content.len() as u64,
+            size: 0,
         }
     }
 
@@ -59,16 +62,19 @@ impl Inode for ProcFile {
 /// A directory of generated files and other directories, by name.
 struct ProcDir {
     ino: Ino,
-    entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
+    /// Each entry with its kind, recorded as it is added: a listing must not
+    /// have to ask a node what it is, because asking a generated file is what
+    /// generates it.
+    entries: Mutex<RefCell<BTreeMap<String, (Arc<dyn Inode>, NodeKind)>>>,
 }
 
 impl ProcDir {
-    fn add(&self, name: &str, node: Arc<dyn Inode>) {
+    fn add(&self, name: &str, kind: NodeKind, node: Arc<dyn Inode>) {
         critical_section::with(|cs| {
             self.entries
                 .borrow(cs)
                 .borrow_mut()
-                .insert(String::from(name), node);
+                .insert(String::from(name), (node, kind));
         });
     }
 }
@@ -88,7 +94,7 @@ impl Inode for ProcDir {
                 .borrow(cs)
                 .borrow()
                 .get(name)
-                .cloned()
+                .map(|(node, _kind)| node.clone())
                 .ok_or(VfsError::NoEntry)
         })
     }
@@ -98,7 +104,7 @@ impl Inode for ProcDir {
             let entries = self.entries.borrow(cs).borrow();
             Ok(entries
                 .iter()
-                .map(|(name, node)| (name.clone(), node.metadata().kind))
+                .map(|(name, (_node, kind))| (name.clone(), *kind))
                 .collect())
         })
     }
@@ -203,6 +209,7 @@ impl ProcFs {
         // read, and the thing `mountinfo` and `mount -a` stand on.
         self.root.add(
             "mounts",
+            NodeKind::File,
             self.file(|| {
                 let mut out = String::new();
                 for (source, path, fstype) in super::mount::global().mount_table() {
@@ -218,6 +225,7 @@ impl ProcFs {
         );
         self.root.add(
             "uptime",
+            NodeKind::File,
             self.file(|| {
                 let (secs, centis) = uptime();
                 alloc::format!("{}.{} 0.0\n", secs, centis)
@@ -225,6 +233,7 @@ impl ProcFs {
         );
         self.root.add(
             "meminfo",
+            NodeKind::File,
             self.file(|| {
                 let (total, free) = meminfo_kb();
                 alloc::format!(
@@ -237,6 +246,7 @@ impl ProcFs {
         );
         self.root.add(
             "cpuinfo",
+            NodeKind::File,
             self.file(|| {
                 alloc::format!(
                     "processor\t: 0\ncpu family\t: x86_64\nmodel name\t: {} x86_64 processor\n\n",
@@ -246,6 +256,7 @@ impl ProcFs {
         );
         self.root.add(
             "version",
+            NodeKind::File,
             self.file(|| {
                 alloc::format!(
                     "{} version {} \n",
@@ -254,13 +265,16 @@ impl ProcFs {
                 )
             }),
         );
-        self.root.add("cmdline", self.file(|| String::from("\n")));
+        self.root
+            .add("cmdline", NodeKind::File, self.file(|| String::from("\n")));
         self.root.add(
             "loadavg",
+            NodeKind::File,
             self.file(|| String::from("0.00 0.00 0.00 1/1 1\n")),
         );
         self.root.add(
             "stat",
+            NodeKind::File,
             self.file(|| {
                 let (secs, _) = uptime();
                 alloc::format!("cpu  {} 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\n", secs)
@@ -276,6 +290,7 @@ impl ProcFs {
         });
         self_dir.add(
             "cmdline",
+            NodeKind::File,
             self.file(|| {
                 let exe = self_exe();
                 if exe.is_empty() {
@@ -285,9 +300,10 @@ impl ProcFs {
                 }
             }),
         );
-        self_dir.add("exe", self.file(self_exe));
+        self_dir.add("exe", NodeKind::File, self.file(self_exe));
         self_dir.add(
             "stat",
+            NodeKind::File,
             self.file(|| {
                 let exe = self_exe();
                 let name = exe.rsplit('/').next().unwrap_or("unknown");
@@ -298,7 +314,7 @@ impl ProcFs {
                 )
             }),
         );
-        self.root.add("self", self_dir);
+        self.root.add("self", NodeKind::Dir, self_dir);
     }
 }
 

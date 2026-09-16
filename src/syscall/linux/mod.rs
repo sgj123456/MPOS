@@ -221,6 +221,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::MOUNT => fs::handle_mount(args, &cwd()),
         nr::UMOUNT2 => fs::handle_umount2(args, &cwd()),
         nr::PIVOT_ROOT => fs::handle_pivot_root(args, &cwd()),
+        nr::CHROOT => fs::handle_chroot(args, &cwd()),
         nr::FADVISE64 => fs::handle_fadvise64(args),
         nr::PSELECT6 => fs::pselect6(args),
         nr::TIME => proc::handle_time(args),
