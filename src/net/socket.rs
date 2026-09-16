@@ -111,6 +111,82 @@ impl Inode for SocketInode {
     }
 }
 
+/// Receive one device event.
+///
+/// Three things go back beyond the payload, and a real listener needs all
+/// three to accept the message at all:
+///
+///   * `msg_name` - a `sockaddr_nl` with `nl_pid = 0`, which is how a netlink
+///     peer is told "this came from the kernel" rather than from another
+///     process.
+///   * `SCM_CREDENTIALS` - `uid 0, gid 0, pid 0`. `nlplug-findfs` drops every
+///     message that arrives without credentials, which makes this the
+///     difference between an initramfs that finds its root and one that waits
+///     forever.
+///   * `msg_flags`, cleared: nothing here is truncated or exceptional.
+fn recvmsg_netlink(
+    msghdr: usize,
+    buf: usize,
+    len: usize,
+    name: usize,
+    namelen: u32,
+    handle: usize,
+) -> isize {
+    // A datagram is delivered whole or not at all; a caller with a shorter
+    // buffer gets what fits, as Linux's datagram sockets do.
+    let Some(event) = crate::uevent::recv(handle) else {
+        return err::EAGAIN;
+    };
+    let n = event.len().min(len);
+    unsafe {
+        core::ptr::copy_nonoverlapping(event.as_ptr(), buf as *mut u8, n);
+    }
+
+    if name != 0 && namelen != 0 {
+        let addr = name as *mut u8;
+        unsafe {
+            core::ptr::write_bytes(addr, 0, 12);
+            (addr as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
+            // nl_pid 0 is the kernel; nl_groups 1 is the group this arrived on.
+            (addr.add(8) as *mut u32).write_unaligned(1);
+            // msg_namelen is the socklen_t in-out at msghdr + 8.
+            ((msghdr + 8) as *mut u32).write_unaligned(12);
+        }
+    }
+
+    // Control data, if the caller left room for it. The values are fixed
+    // because the kernel is always the sender here.
+    const SOL_SOCKET: i32 = 1;
+    const SCM_CREDENTIALS: i32 = 2;
+    const CMSG_LEN: usize = 16 + 12; // header + struct ucred
+    let control = unsafe { ((msghdr + 32) as *const usize).read_unaligned() };
+    let control_len = unsafe { ((msghdr + 40) as *const usize).read_unaligned() };
+    if control != 0 && control_len >= CMSG_LEN {
+        unsafe {
+            let at = control as *mut u8;
+            core::ptr::write_bytes(at, 0, CMSG_LEN);
+            (at as *mut u64).write_unaligned(CMSG_LEN as u64); // cmsg_len
+            (at.add(8) as *mut i32).write_unaligned(SOL_SOCKET); // cmsg_level
+            (at.add(12) as *mut i32).write_unaligned(SCM_CREDENTIALS); // cmsg_type
+            // struct ucred { pid, uid, gid } - the kernel's own.
+            (at.add(16) as *mut i32).write_unaligned(0);
+            (at.add(20) as *mut u32).write_unaligned(0);
+            (at.add(24) as *mut u32).write_unaligned(0);
+            ((msghdr + 40) as *mut usize).write_unaligned(CMSG_LEN);
+        }
+    } else if control_len != 0 {
+        // No room for credentials. Linux answers a listener whose control
+        // buffer is too small with EMSGSIZE rather than sending it a message
+        // it must discard.
+        return err::EMSGSIZE;
+    }
+
+    unsafe {
+        ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(0);
+    }
+    n as isize
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -213,6 +289,30 @@ fn validate_source_slot(src: Option<(usize, usize)>) -> Result<(), isize> {
 /// land on the open description as `O_NONBLOCK` or it is lost.
 pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     let domain = args[0] as u16;
+
+    // Netlink first: it is not a network socket, and a machine with no
+    // network card still needs its device events.
+    if domain == crate::uevent::AF_NETLINK {
+        let typ = (args[1] as u32) & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if typ != SOCK_DGRAM as u32 {
+            return err::ESOCKTNOSUPPORT;
+        }
+        // One protocol exists here. A caller asking for another netlink
+        // protocol gets the same answer Linux gives for a protocol a family
+        // does not carry.
+        if args[2] as u32 != crate::uevent::NETLINK_KOBJECT_UEVENT {
+            return err::EPROTONOSUPPORT;
+        }
+        let handle = crate::uevent::open();
+        let fd = crate::vfs::open_inode(Arc::new(SocketInode { handle }));
+        if (args[1] as u32) & SOCK_NONBLOCK != 0
+            && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        {
+            file.set_status(crate::vfs::file::O_NONBLOCK);
+        }
+        return fd as isize;
+    }
+
     if domain != AF_INET && domain != AF_INET6 {
         return err::EAFNOSUPPORT;
     }
@@ -642,6 +742,9 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     if let Err(e) = validate_source_slot(src) {
         return e;
     }
+    if crate::uevent::exists(handle) {
+        return recvmsg_netlink(msghdr, buf, len, name, namelen, handle);
+    }
     let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
     let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
     let n = match recv_common(handle, out, src, nonblock) {
@@ -801,6 +904,26 @@ fn udp_recv(
 /// source. A datagram socket binds for real: the receive queue starts
 /// holding whatever arrives for the port.
 pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
+    if let Ok(handle) = socket_handle_of_fd(args[0] as i32)
+        && crate::uevent::exists(handle)
+    {
+        // `struct sockaddr_nl`: family, pad, pid, groups. Only the group mask
+        // matters - `nlplug-findfs` binds with all groups set, which is how a
+        // listener says "tell me about every device event".
+        const SOCKADDR_NL_SIZE: usize = 12;
+        let addr = args[1];
+        if !crate::syscall::buffer_ok(addr, SOCKADDR_NL_SIZE, false, from_user) {
+            return err::EFAULT;
+        }
+        let family = unsafe { (addr as *const u16).read_unaligned() };
+        if family != crate::uevent::AF_NETLINK {
+            return err::EINVAL;
+        }
+        let groups = unsafe { ((addr + 8) as *const u32).read_unaligned() };
+        crate::uevent::bind(handle, groups);
+        return 0;
+    }
+
     let fd = args[0] as i32;
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,

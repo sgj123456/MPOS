@@ -265,8 +265,13 @@ impl ProcFs {
                 )
             }),
         );
-        self.root
-            .add("cmdline", NodeKind::File, self.file(|| String::from("\n")));
+        // The command line the machine was booted with. An initramfs's init
+        // reads it to learn `root=`, which is how it knows what to mount.
+        self.root.add(
+            "cmdline",
+            NodeKind::File,
+            self.file(|| alloc::format!("{}\n", crate::boot::cmdline())),
+        );
         self.root.add(
             "loadavg",
             NodeKind::File,

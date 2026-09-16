@@ -76,8 +76,26 @@ pub struct BootInfo {
     /// The mapping belongs to the bootloader's `KernelAndModules` region, which
     /// the frame allocator never hands out, so the bytes stay valid for good.
     pub initramfs: Option<&'static [u8]>,
+    /// The command line the bootloader was given for this kernel. `/proc/cmdline`
+    /// reports it, and the initramfs's init reads it to learn `root=`.
+    pub cmdline: &'static str,
     pub regions: [MemRegion; MAX_MEM_REGIONS],
     pub region_count: usize,
+}
+
+/// The command line the bootloader was given, kept where the filesystems can
+/// read it: `/proc/cmdline` is how the initramfs's init learns `root=`.
+static CMDLINE: critical_section::Mutex<core::cell::RefCell<&'static str>> =
+    critical_section::Mutex::new(core::cell::RefCell::new(""));
+
+/// Record the boot command line. Called once, from the boot task.
+pub fn set_cmdline(line: &'static str) {
+    critical_section::with(|cs| *CMDLINE.borrow(cs).borrow_mut() = line);
+}
+
+/// The boot command line, as the bootloader was given it.
+pub fn cmdline() -> &'static str {
+    critical_section::with(|cs| *CMDLINE.borrow(cs).borrow())
 }
 
 impl BootInfo {

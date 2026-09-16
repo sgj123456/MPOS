@@ -111,6 +111,10 @@ fn banner(info: &BootInfo) {
 /// to init and stand aside. It ends inside `m13`, which parks the boot task
 /// rather than returning - a system that stops running itself is not a system.
 fn kernel_main(info: &BootInfo) {
+    // Before anything can read it: /proc/cmdline is how the initramfs's init
+    // learns what to mount.
+    mpos::boot::set_cmdline(info.cmdline);
+
     // ---- phase 1: initialization (no tests, just set up subsystems) --------
     init_mm();
     init_arch(info);

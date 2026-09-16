@@ -58,9 +58,9 @@ fi
 # holds what is *built* - the user programs, the unpacked root filesystem and
 # the seed tree - and `tree` is the ESP itself, which ends up on the disk
 # verbatim.
-PACK="build/pack-$ARCH"
-ESP_TREE="build/esp-tree-$ARCH"
-BOOT_TREE="build/boot-tree-$ARCH"
+PACK="$ROOT/build/pack-$ARCH"
+ESP_TREE="$ROOT/build/esp-tree-$ARCH"
+BOOT_TREE="$ROOT/build/boot-tree-$ARCH"
 rm -rf "$PACK" "$ESP_TREE" "$BOOT_TREE"
 mkdir -p "$PACK" "$ESP_TREE/EFI/BOOT" "$BOOT_TREE/boot"
 

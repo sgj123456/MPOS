@@ -40,6 +40,11 @@ pub mod rand;
 pub mod sched;
 pub mod sync;
 pub mod syscall;
+/// Device events: what the kernel tells userland when a device
+/// appears, and the netlink socket they travel over. Not target-gated:
+/// nothing here needs hardware, and the wire format is worth testing
+/// on the host.
+pub mod uevent;
 pub mod vfs;
 
 #[cfg(target_os = "none")]

@@ -161,6 +161,11 @@ impl DevFs {
 
     /// Add a device under `name`. Panics on a duplicate: device names are as
     /// fixed as the drivers behind them.
+    ///
+    /// Registering a device also *announces* it: userland that has to find a
+    /// device - an initramfs looking for its root, udev building `/dev` -
+    /// learns about it from the event, and a device that is never announced
+    /// is one nothing can find.
     pub fn register(&self, name: &str, dev: Arc<dyn CharDevice>) {
         let ino = self.root.next_ino.fetch_add(1, Ordering::Relaxed);
         let node: Arc<dyn Inode> = Arc::new(DevNode { ino, dev });
@@ -173,6 +178,7 @@ impl DevFs {
                 .insert(String::from(name), node);
             assert!(prev.is_none(), "device {name} registered twice");
         });
+        announce(name, subsystem_of(name), 0, 0);
     }
 
     /// Add a block device under `name` - the disk itself, or one partition of
@@ -190,6 +196,50 @@ impl DevFs {
                 .insert(String::from(name), node);
             assert!(prev.is_none(), "device {name} registered twice");
         });
+        announce_block(name);
+    }
+}
+
+/// Announce a device on the event bus.
+///
+/// A device that is never announced is one no listener can find - which is
+/// what an initramfs looking for its root does. The bus itself lives with the
+/// network stack's module tree, so on the host (where there is no network
+/// stack and nothing listening) this is a no-op.
+fn announce(name: &str, subsystem: &'static str, major: u32, minor: u32) {
+    let devpath = if subsystem == "block" {
+        alloc::format!("/devices/virtio/block/{}", name)
+    } else {
+        alloc::format!("/devices/virtual/{}", name)
+    };
+    crate::uevent::publish(&crate::uevent::Event {
+        action: "add",
+        devpath,
+        subsystem,
+        devname: String::from(name),
+        major,
+        minor,
+    });
+}
+
+/// Announce a block device, with the numbering `/sys` and `/dev` agree on:
+/// a listener matches an event against a device by exactly these numbers.
+fn announce_block(name: &str) {
+    let numbering = crate::uevent::Numbering::of_boot_disk();
+    let (major, minor, _whole) = numbering.find(name).unwrap_or((0, 0, false));
+    announce(name, "block", major, minor);
+}
+
+/// The subsystem a device belongs to, by the name it is registered under.
+///
+/// These are Linux's own subsystem names - `/sys/class/tty`, `/sys/class/mem`,
+/// `/sys/class/misc` - because a listener sorts events by them, and an
+/// invented name is an event it cannot place.
+fn subsystem_of(name: &str) -> &'static str {
+    match name {
+        "tty" | "console" | "ttyS0" => "tty",
+        "null" | "zero" | "random" | "urandom" => "mem",
+        _ => "misc",
     }
 }
 

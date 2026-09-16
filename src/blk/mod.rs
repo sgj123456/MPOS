@@ -36,6 +36,16 @@ pub fn set_raw_disk(dev: Arc<dyn BlockDev>) {
 
 /// The boot disk, if the block layer has one yet. The devfs builder asks
 /// here for the names it publishes as `/dev/vda*`.
+/// How many partitions the boot disk's table holds. The device names
+/// (`/dev/vda1`...), their `/sys` numbering and the uevents that announce
+/// them all count off this.
+pub fn partition_count() -> usize {
+    match raw_disk() {
+        Some(raw) => part::partitions(raw.as_ref()).len(),
+        None => 0,
+    }
+}
+
 pub fn raw_disk() -> Option<Arc<dyn BlockDev>> {
     critical_section::with(|cs| RAW.borrow(cs).borrow().clone())
 }

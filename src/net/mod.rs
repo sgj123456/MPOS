@@ -237,6 +237,13 @@ pub(crate) fn alloc_socket(family: u16, typ: u16) -> Result<usize, isize> {
 /// Tear down socket `handle`: its registry slot goes empty and its smoltcp
 /// socket is removed from the set, which frees its buffers.
 pub(crate) fn free_entry(handle: usize) {
+    // A netlink socket is not in this registry - it has its own table - so
+    // its teardown happens here, where every socket's last close arrives.
+    if crate::uevent::exists(handle) {
+        crate::uevent::close(handle);
+        return;
+    }
+
     critical_section::with(|cs| {
         let mut net = NET.borrow(cs).borrow_mut();
         let Some(stack) = net.as_mut() else { return };
@@ -275,6 +282,14 @@ pub fn service() {
 /// blocking, which is the fact a caller waiting for a connection to finish
 /// needs to see.
 pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
+    if crate::uevent::exists(handle) {
+        // A device event is either waiting or not; nothing is ever blocked
+        // behind a send, so the write side is always ready.
+        return crate::vfs::Ready {
+            read: crate::uevent::ready(handle),
+            write: true,
+        };
+    }
     let polled = with(handle, |stack, entry| {
         stack.poll_once();
         match &entry.channel {

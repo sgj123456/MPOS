@@ -7,7 +7,8 @@
 
 use limine::memmap as limine_memmap;
 use limine::request::{
-    BootloaderInfoRequest, ExecutableAddressRequest, HhdmRequest, MemmapRequest, ModulesRequest,
+    BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
+    MemmapRequest, ModulesRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
@@ -47,9 +48,25 @@ static EXECUTABLE_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressR
 #[used]
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 
+/// The command line the bootloader was given for *this executable* - the
+/// `cmdline:` line of limine.conf. It is how a machine is told what to boot
+/// into, and the initramfs's own init reads it from /proc/cmdline.
+#[unsafe(link_section = ".limine_requests")]
+#[used]
+static CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+
 #[unsafe(link_section = ".limine_requests_end_marker")]
 #[used]
 static END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
+
+/// The kernel command line, as the bootloader was given it. Empty when the
+/// config names none.
+fn cmdline() -> &'static str {
+    CMDLINE_REQUEST
+        .response()
+        .map(|response| response.cmdline())
+        .unwrap_or("")
+}
 
 /// The module whose path names the initramfs, if the config loaded one.
 fn initramfs_module() -> Option<&'static [u8]> {
@@ -110,6 +127,7 @@ pub fn collect() -> BootInfo {
             kind: MemKind::Reserved,
         }; MAX_MEM_REGIONS],
         region_count: 0,
+        cmdline: cmdline(),
     };
 
     for entry in memmap.entries() {

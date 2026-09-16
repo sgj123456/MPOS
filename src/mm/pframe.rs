@@ -672,6 +672,7 @@ mod tests {
             bootloader_name: "host-test",
             bootloader_version: "0",
             initramfs: None,
+            cmdline: "",
             regions: [MemRegion {
                 base: 0,
                 length: 0,
