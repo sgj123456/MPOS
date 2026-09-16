@@ -138,7 +138,7 @@ impl Inode for RamDir {
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
             // No device registry exists yet; devfs brings real ones at M8.
-            NodeKind::CharDev => return Err(VfsError::Unsupported),
+            NodeKind::CharDev | NodeKind::BlockDev => return Err(VfsError::Unsupported),
             // A link is made with `Inode::symlink`, which carries the one thing
             // a link cannot exist without: what it points at.
             NodeKind::Symlink => return Err(VfsError::Unsupported),
@@ -238,6 +238,10 @@ impl RamFs {
 impl FileSystem for RamFs {
     fn root(&self) -> Arc<dyn Inode> {
         self.root.clone()
+    }
+
+    fn name(&self) -> &'static str {
+        "ramfs"
     }
 }
 

@@ -23,7 +23,9 @@ pub mod file;
 pub mod mount;
 pub mod path;
 pub mod pipe;
+pub mod procfs;
 pub mod ramfs;
+pub mod sysfs;
 pub mod tar;
 pub mod termios;
 pub mod tty;
@@ -45,6 +47,11 @@ pub enum NodeKind {
     Dir,
     /// A character device: reads and writes go to a driver, not storage.
     CharDev,
+    /// A block device: random-access storage, addressed by offset. The kernel
+    /// exposes the disk and its partitions this way, which is what puts the
+    /// `mount` decision in the hands of userland - mounting "the device named
+    /// by this path" is a question only the node can answer.
+    BlockDev,
     /// A symbolic link: a name holding another path, followed by resolution
     /// and *not* by whoever asks for the link itself. A whole userspace can be
     /// built out of these - Alpine's `/bin` is one busybox and three hundred
@@ -210,6 +217,17 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// The block device this node stands for, if it is one.
+    ///
+    /// `mount(2)` is told "mount this device on that directory" and receives
+    /// the device as a *path*. Only the node can turn that into storage, which
+    /// is what hands the mount decision - which filesystems exist, and what is
+    /// mounted where - to userland rather than keeping it in the kernel's boot
+    /// code.
+    fn as_block(&self) -> Option<alloc::sync::Arc<dyn crate::blk::BlockDev>> {
+        None
+    }
+
     /// The network-stack handle this node carries, if it is a socket.
     ///
     /// Sockets have no filesystem storage behind them - they are anonymous
@@ -279,6 +297,11 @@ pub trait Inode: Send + Sync {
 /// its block device handle and on-disk counters) and hands out its root.
 pub trait FileSystem: Send + Sync {
     fn root(&self) -> Arc<dyn Inode>;
+
+    /// The name `mount(2)` spells this filesystem by, and the one /proc/mounts
+    /// reports. A filesystem that cannot be named cannot be mounted from
+    /// userland, which is the whole point of the call.
+    fn name(&self) -> &'static str;
 }
 
 /// List the directory named by `path`, in one call. The convenience the

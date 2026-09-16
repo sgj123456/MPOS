@@ -58,6 +58,55 @@ impl Inode for DevNode {
     }
 }
 
+/// A block device, as an inode: the disk and each of its partitions get a
+/// name here, which is what makes them reachable from userland at all.
+///
+/// Reading one is reading the storage at an offset - a block device is the one
+/// device whose `read_at` offset means something, and the one inode whose
+/// [`Inode::as_block`] answers, because `mount(2)` receives its source as a
+/// *path* and has to arrive at storage through the tree.
+struct DevBlockNode {
+    ino: Ino,
+    dev: Arc<dyn crate::blk::BlockDev>,
+}
+
+impl Inode for DevBlockNode {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::BlockDev,
+            size: self.dev.capacity_sectors() * 512,
+        }
+    }
+
+    fn as_block(&self) -> Option<Arc<dyn crate::blk::BlockDev>> {
+        Some(self.dev.clone())
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        // Reads past the end are an empty read, the same answer a file gives:
+        // a caller sizing the device by reading it gets a stop rather than a
+        // panic out of the driver underneath.
+        let end = self.dev.capacity_sectors() * 512;
+        if offset >= end {
+            return Ok(0);
+        }
+        let len = buf.len().min((end - offset) as usize);
+        self.dev.read_at(offset, &mut buf[..len]);
+        Ok(len)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        let end = self.dev.capacity_sectors() * 512;
+        if offset >= end {
+            return Err(VfsError::NoSpace);
+        }
+        let len = buf.len().min((end - offset) as usize);
+        self.dev.write_at(offset, &buf[..len]);
+        Ok(len)
+    }
+}
+
 /// The one directory, holding every device by name.
 struct DevRoot {
     inodes: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
@@ -125,11 +174,32 @@ impl DevFs {
             assert!(prev.is_none(), "device {name} registered twice");
         });
     }
+
+    /// Add a block device under `name` - the disk itself, or one partition of
+    /// it. These are the names `mount(2)` is pointed at, and the reason the
+    /// choice of what to mount belongs to userland.
+    pub fn register_block(&self, name: &str, dev: Arc<dyn crate::blk::BlockDev>) {
+        let ino = self.root.next_ino.fetch_add(1, Ordering::Relaxed);
+        let node: Arc<dyn Inode> = Arc::new(DevBlockNode { ino, dev });
+        critical_section::with(|cs| {
+            let prev = self
+                .root
+                .inodes
+                .borrow(cs)
+                .borrow_mut()
+                .insert(String::from(name), node);
+            assert!(prev.is_none(), "device {name} registered twice");
+        });
+    }
 }
 
 impl FileSystem for DevFs {
     fn root(&self) -> Arc<dyn Inode> {
         self.root.clone()
+    }
+
+    fn name(&self) -> &'static str {
+        "devfs"
     }
 }
 

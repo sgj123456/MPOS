@@ -167,7 +167,11 @@ fn has_ext2(dev: &dyn BlockDev, at: u64) -> bool {
 
 /// The `(first_lba, sectors)` of every entry in the partition table, in table
 /// order, or nothing at all if there is no table to read.
-fn partitions(dev: &dyn BlockDev) -> Vec<(u64, u64)> {
+/// Every partition on `dev`, in table order, as `(start_lba, sectors)`.
+///
+/// The devfs builder publishes one node per entry - `vda1`, `vda2`, ... - so
+/// that userland can name the partition it wants to mount.
+pub fn partitions(dev: &dyn BlockDev) -> Vec<(u64, u64)> {
     let mut mbr = [0u8; SECTOR as usize];
     if dev.capacity_sectors() < 2 {
         return Vec::new();

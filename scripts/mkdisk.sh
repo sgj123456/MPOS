@@ -11,6 +11,15 @@
 # PROFILE=release builds an optimised image.
 set -euo pipefail
 
+# alpine-make-rootfs insists on root - it sets file ownership for the rootfs
+# and runs `apk --root` against it - and so does `mke2fs -d`, which copies the
+# tree with its ownership intact. Re-exec under sudo rather than failing: the
+# environment goes along, so cargo and the mirror keep working.
+if [[ "$(id -u)" != "0" ]]; then
+    echo "mkdisk builds device images and sets file ownership, so it runs as root."
+    exec sudo -E env "HOME=$HOME" "PATH=$PATH" "$0" "$@"
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -97,126 +106,139 @@ for src in "$ROOT"/user/bin/*.rs; do
     esac
 done
 
-# The root filesystem is Alpine's minirootfs, not a tree of this
-# repository's making: the whole point of the port is that mpos boots into
-# a real, ordinary userland layout - /etc, /lib, /usr, /var and a /bin full
-# of names pointing at one busybox.
-ALPINE="$(bash "$ROOT/scripts/fetch-alpine.sh" | tail -1)"
-ROOTFS="$PACK/rootfs"
-rm -rf "$ROOTFS"
-mkdir -p "$ROOTFS"
-tar -xzf "$ALPINE/alpine-minirootfs.tar.gz" -C "$ROOTFS" \
-    --no-same-owner --no-same-permissions
-
-# Alpine's own busybox is kept, exactly as the distribution ships it.
+# --- the two trees, both built by alpine-make-rootfs ------------------------
 #
-# It used to be swapped for the `busybox-static` build, because the dynamic one
-# asks for /lib/ld-musl-x86_64.so.1 and the kernel had no PT_INTERP support, so
-# every applet was refused. The kernel loads interpreters now - `apk` is a
-# dynamically linked program and runs - and the swap turned out to cost more
-# than it saved: the static build's `wget` has an HTTPS path that cannot
-# complete a handshake, while the shipped busybox delegates TLS to the
-# `ssl_client` applet the minirootfs ships as /bin/ssl_client. With the swap in
-# place, `wget https://...` failed on a machine whose TLS was never at fault.
+#   rootfs     the system the machine runs: Alpine with OpenRC, whose boot
+#              runlevel mounts /proc, /sys and /dev, brings /run up, and
+#              whose `localmount` works through /etc/fstab. The kernel mounts
+#              none of these any more.
+#   initramfs  the early environment: busybox, apk and an `/init` script that
+#              mounts the canonical directories on the temporary root, mounts
+#              the real rootfs from /dev/vda3, pivot_roots into it and execs
+#              /sbin/init. Every mount after that is userland's decision,
+#              made through `mount(2)` against the device nodes the devfs
+#              publishes.
 #
-# So: the stock busybox, the stock applet links, and HTTPS that works.
+# Both runs execute a setup script (below) with $ROOTFS pointed at the tree;
+# no chroot, so the only privilege used is that the files are owned by root.
+ALPINE_BRANCH=v3.24
+ALPINE_MIRROR=http://dl-cdn.alpinelinux.org/alpine
+MAKE_ROOTFS="$ROOT/alpine-make-rootfs/alpine-make-rootfs"
 
-# mpos's own programs go in beside Alpine's, and there are only two left: the
-# kernel's `/sbin/init`, which is the one that knows about this kernel's
-# process model, and `hello`, which M12 runs and Alpine has no equivalent of.
-# Everything else mpos once shipped - sh, cat, echo, ls, true, false, sleep -
-# is Alpine's now, and the source for each was deleted so there is exactly one
-# of each on the system. `t_*` are the ABI conformance tests.
-mkdir -p "$ROOTFS/bin"
-for bin in "$USERBIN"/*; do
-    name="$(basename "$bin")"
-    cp "$bin" "$ROOTFS/bin/$name"
-done
-# The programs the workspace builds: ordinary Rust binaries for musl with
-# `std` and `rustix`, statically linked. They are the ones under
-# `user/src/bin`, and cargo builds them all in one call - which is the point
-# of the workspace. Anything here wins over a same-named program compiled
-# from `user/bin` above, because that is the hand-built no_std form a
-# migrated test leaves behind.
-# Always release, whatever the kernel is built as. A debug-profile musl
-# binary is ~9 MB of debug info per program, and the root filesystem is one
-# uncompressed ustar archive that has to fit in the ESP - four fat programs
-# are enough to push the tree past it, which shows up as a root filesystem
-# that unpacks short of its own /etc. These programs are the tests, not the
-# thing under test: nobody reads their symbols.
+# alpine-make-rootfs drives `apk`; the host has none, so the static build
+# comes off the same mirror the packages do, out of the package that carries
+# it. (The script's own default source is gitlab, which not every build
+# sandbox reaches.)
+APK_BIN="$(command -v apk || true)"
+if [[ -z "$APK_BIN" ]]; then
+    echo "fetching apk.static from $ALPINE_MIRROR"
+    curl -sL -o "$PACK/apk-tools-static.apk" \
+        "$ALPINE_MIRROR/$ALPINE_BRANCH/main/x86_64/apk-tools-static-3.0.8-r0.apk"
+    mkdir -p "$PACK/apktools"
+    # The package's headers carry apk's own PAX keys, which tar reads as
+    # unknown and warns about; they hold nothing the extraction needs.
+    tar -xzf "$PACK/apk-tools-static.apk" -C "$PACK/apktools" \
+        --warning=no-unknown-keyword sbin/apk.static
+    mv "$PACK/apktools/sbin/apk.static" "$PACK/apk.static"
+    chmod +x "$PACK/apk.static"
+    APK_BIN="$PACK/apk.static"
+fi
+export APK="$APK_BIN"
+export APK_OPTS=""
+# The guest's network path, when the build host reaches the network through a
+# loopback proxy: setup-rootfs.sh writes it into /etc/profile for the guest.
+# `${http_proxy:-}` because the build may run with the variable unset, and
+# `set -u` turns an unbound reference into an error.
+if [[ -n "${http_proxy:-}" ]]; then
+    export GUEST_HTTP_PROXY_PORT="${http_proxy##*:}"
+else
+    export GUEST_HTTP_PROXY_PORT=""
+fi
+
+# The user programs the sweep runs come from the workspace: mpos-native
+# no_std forms and, for the migrated tests, real musl binaries speaking std
+# and rustix. They go into *both* trees - the sweep runs from the initramfs,
+# and a booted machine wants its own tests on hand.
 USER_TARGET="x86_64-unknown-linux-musl"
 cargo build --release -p mpos-user --target "$USER_TARGET"
 USER_BINS="target/$USER_TARGET/release"
-if [[ -d "$USER_BINS" ]]; then
-    for bin in "$USER_BINS"/*; do
-        # Only real executables: the same directory holds `.d` depfiles,
-        # incremental artefacts and the build scripts' outputs.
-        [[ -f "$bin" && -x "$bin" ]] || continue
-        name="$(basename "$bin")"
-        [[ "$name" == *.* ]] && continue
-        cp "$bin" "$ROOTFS/bin/$name"
+
+copy_programs() {
+    local dest="$1"
+    mkdir -p "$dest/bin"
+    for bin in "$USERBIN"/*; do
+        cp "$bin" "$dest/bin/$(basename "$bin")"
     done
-fi
+    if [[ -d "$USER_BINS" ]]; then
+        for bin in "$USER_BINS"/*; do
+            # Only real executables: the same directory holds `.d` depfiles
+            # and incremental artefacts.
+            [[ -f "$bin" && -x "$bin" ]] || continue
+            name="$(basename "$bin")"
+            [[ "$name" == *.* ]] && continue
+            cp "$bin" "$dest/bin/$name"
+        done
+    fi
+    # A cross-compiled uutils coreutils, when the host happens to have one.
+    if [[ -f /tmp/coreutils/target/x86_64-unknown-linux-musl/release/coreutils ]]; then
+        cp /tmp/coreutils/target/x86_64-unknown-linux-musl/release/coreutils "$dest/bin/coreutils"
+    fi
+    # Stripped: the initramfs is one ustar that Limine loads into memory and
+    # the kernel unpacks page by page, so a test binary's symbol tables cost
+    # boot time and boot volume for nothing. These programs are the tests,
+    # not the thing under test.
+    strip "$dest/bin/"* 2>/dev/null || true
+}
 
-# Cross-compiled musl coreutils (uutils) binary, when available.
-MUSL_COREUTILS="/tmp/coreutils/target/x86_64-unknown-linux-musl/release/coreutils"
-if [[ -f "$MUSL_COREUTILS" ]]; then
-    cp "$MUSL_COREUTILS" "$ROOTFS/bin/coreutils"
-fi
-# The mountpoint devfs is mounted over. Git cannot hold an empty directory,
-# so the tree cannot be trusted to carry it.
-mkdir -p "$ROOTFS/dev"
+# --- rootfs -----------------------------------------------------------------
+ROOTFS="$PACK/rootfs"
+# The previous run's tree is root-owned with a 0700 /root (Alpine's own
+# baselayout), which makes cleaning it up depend on who is running this. Make
+# it deletable by whoever runs the build before taking it down.
+chmod -R a+rX "$ROOTFS" 2>/dev/null || true
+rm -rf "$ROOTFS"
+sh "$MAKE_ROOTFS" \
+    --branch "$ALPINE_BRANCH" \
+    --mirror-uri "$ALPINE_MIRROR" \
+    --packages "openrc" \
+    "$ROOTFS" "$ROOT/scripts/setup-rootfs.sh"
 
-# --- what mpos needs Alpine's tree to say about itself ----------------------
+copy_programs "$ROOTFS"
+
+# --- initramfs --------------------------------------------------------------
+# A complete-enough Alpine to boot from: busybox for the shell and the mount
+# applets, and the workspace's own test programs. `apk` itself goes in as the
+# static binary the build already fetched - an initramfs has no store to
+# consult, and the sweep proves the ABI with `apk --version`.
 #
-# Alpine's shipped /etc/inittab assumes a bank of virtual consoles
-# (tty1..tty6) and an openrc that is not in a minirootfs: left alone, init
-# spends its life printing "can't run /sbin/openrc" and "can't open
-# /dev/ttyN" and respawning both. This machine has one console - the serial
-# port - and one thing to run on it, which is a shell that init keeps alive.
-cat > "$ROOTFS/etc/inittab" <<'EOF'
-# mpos: the serial console is the only console there is. No openrc in a
-# minirootfs and no tty1..tty6 behind it - one shell, respawned forever.
-::sysinit:/bin/hostname -F /etc/hostname
-::respawn:-/bin/sh
-::ctrlaltdel:/sbin/reboot
-::shutdown:/bin/sync
-EOF
-
-# The network address is fixed, because there is exactly one shape the
-# network takes here: QEMU's user-mode stack, which answers as 10.0.2.2 and
-# forwards DNS at 10.0.2.3. The kernel claims 10.0.2.15/24 on its own; what
-# userland has to be told is only who resolves names. The repositories are
-# the plain-HTTP CDN - apk can speak TLS, but the handshake's retransmit
-# timers have no business being part of a gate's variance.
-cat > "$ROOTFS/etc/resolv.conf" <<'EOF'
-nameserver 10.0.2.3
-EOF
-cat > "$ROOTFS/etc/apk/repositories" <<'EOF'
-http://dl-cdn.alpinelinux.org/alpine/v3.24/main
-http://dl-cdn.alpinelinux.org/alpine/v3.24/community
-EOF
-
-# The development sandbox only lets HTTP out through a loopback proxy, and
-# QEMU's slirp answers the guest's 10.0.2.2 with the host's loopback - so
-# the same proxy, renumbered, is what the guest's fetchers (apk, busybox
-# wget) use. The port comes from the build environment's own http_proxy:
-# it rotates per sandbox invocation, which is why the image is rebuilt in
-# the same command that runs the probe. Outside such a sandbox nothing is
-# appended and the guest talks to the network directly.
-if [[ -n "${http_proxy:-}" ]]; then
-    PROXY_PORT="${http_proxy##*:}"
-    cat >> "$ROOTFS/etc/profile" <<EOF
-
-# mpos build-time wiring: this host reaches the network only through a
-# loopback proxy, and slirp answers 10.0.2.2 with that loopback.
-export http_proxy=http://10.0.2.2:${PROXY_PORT}
-export https_proxy=http://10.0.2.2:${PROXY_PORT}
-EOF
+# The initramfs tree is temporary - only the tar survives. It lives under
+# build/ by default; MPOS_INITRAMFS_DIR moves it elsewhere for a host whose
+# build tree is watched by tooling that objects to another program's renames
+# inside it.
+if [[ -n "${MPOS_INITRAMFS_DIR:-}" ]]; then
+    INITRAMFS_DIR="$(mktemp -d "${MPOS_INITRAMFS_DIR%/}.XXXXXX")"
+else
+    INITRAMFS_DIR="$PACK/initramfs_root"
+    rm -rf "$INITRAMFS_DIR"
 fi
+sh "$MAKE_ROOTFS" \
+    --branch "$ALPINE_BRANCH" \
+    --mirror-uri "$ALPINE_MIRROR" \
+    --packages "alpine-release" \
+    "$INITRAMFS_DIR" "$ROOT/scripts/setup-initramfs.sh"
+
+cp "$APK_BIN" "$INITRAMFS_DIR/sbin/apk"
+chmod +x "$INITRAMFS_DIR/sbin/apk"
+
+copy_programs "$INITRAMFS_DIR"
+
+tar --format=ustar --owner=root --group=root --numeric-owner \
+    -cf "$BOOT_TREE/boot/initramfs.tar" -C "$INITRAMFS_DIR" .
+chmod -R a+rwX "$INITRAMFS_DIR" 2>/dev/null || true
+rm -rf "$INITRAMFS_DIR"
 
 # The ESP carries only the bootloader and its config. Limine looks for
-# limine.conf in the ESP root. FAT32 requires at least ~33 MiB.
+# limine.conf in the ESP root.
 cp third_party/limine/BOOTX64.EFI "$ESP_TREE/EFI/BOOT/BOOTX64.EFI"
 cp limine.conf "$ESP_TREE/limine.conf"
 
@@ -225,20 +247,10 @@ cp limine.conf "$ESP_TREE/limine.conf"
 cp "$KERNEL" "$BOOT_TREE/boot/mpos.elf"
 cp limine.conf "$BOOT_TREE/limine.conf"
 
-# A minimal initramfs: the kernel unpacks it as the temporary root, then
-# pivot_root's to the real rootfs on partition 3. The archive needs to exist
-# and be valid; its contents are minimal because the kernel creates most
-# directories it needs (new_root, old_root) dynamically.
-INITRAMFS_DIR="$PACK/initramfs_root"
-rm -rf "$INITRAMFS_DIR"
-mkdir -p "$INITRAMFS_DIR/dev"
-tar --format=ustar --owner=root --group=root --numeric-owner -cf "$BOOT_TREE/boot/initramfs.tar" -C "$INITRAMFS_DIR" .
-rm -rf "$INITRAMFS_DIR"
-
-# The root filesystem: Alpine's minirootfs as an ext2 image. This is the
-# real root filesystem that the kernel will pivot_root to after booting
-# from the initramfs. Use mke2fs -d to populate at format time.
-ROOTFS_MIB=256
+# The root filesystem image: the tree alpine-make-rootfs built, laid down at
+# format time by mke2fs. 384 MiB - a full Alpine with OpenRC and the test
+# programs wants more than the 256 the minirootfs got.
+ROOTFS_MIB=384
 ROOTFS_IMG="build/rootfs-$ARCH.img"
 rm -f "$ROOTFS_IMG"
 mke2fs -q -F -t ext2 -b 4096 -I 256 -d "$ROOTFS" "$ROOTFS_IMG" $((ROOTFS_MIB * 1024 / 4))
@@ -268,7 +280,7 @@ python3 "$ROOT/scripts/mkfat.py" "$ESP" "${ESP_MIB}M" MPOS-ESP "$ESP_TREE"
 # The boot partition: kernel, limine config, and initramfs archive. FAT32,
 # because Limine's boot(): protocol only supports FAT. FAT32 requires at
 # least ~33 MiB (65525 clusters with FAT overhead).
-BOOT_MIB=64
+BOOT_MIB=192
 BOOT_IMG="build/boot-$ARCH.img"
 rm -f "$BOOT_IMG"
 python3 "$ROOT/scripts/mkfat.py" "$BOOT_IMG" "${BOOT_MIB}M" MPOS-BOOT "$BOOT_TREE"
@@ -302,3 +314,15 @@ dd if="$DATA" of="$DISK" bs=1M seek=$((1 + ESP_MIB + BOOT_MIB + ROOTFS_MIB)) con
 
 echo "built $DISK ($(du -h "$DISK" | cut -f1))"
 parted -s "$DISK" unit MiB print
+
+# The trees this build made are root-owned, and the next build takes them
+# down. Leave them world-traversable so cleanup never depends on who ran the
+# last build - a 0700 /root inside a build tree is the previous run's business,
+# not the next one's.
+chmod -R a+rwX "$PACK" "$ESP_TREE" "$BOOT_TREE" 2>/dev/null || true
+
+# The final images are root-owned too, and run.sh opens them as the invoking
+# user; without this QEMU fails with "Could not open ...: Permission denied".
+# World-writable on the whole-image files only - everything else under build/
+# is covered above.
+chmod a+rw "$ROOTFS_IMG" "$DATA" "$ESP" "$BOOT_IMG" "$DISK" 2>/dev/null || true

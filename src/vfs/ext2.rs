@@ -956,6 +956,10 @@ impl FileSystem for Ext2Fs {
     fn root(&self) -> Arc<dyn Inode> {
         self.inode_of(ROOT_INO)
     }
+
+    fn name(&self) -> &'static str {
+        "ext2"
+    }
 }
 
 impl Ext2Fs {

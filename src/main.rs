@@ -48,7 +48,6 @@ const MIB: usize = 1024 * 1024;
 /// The virtio-blk device, probed once in init_blk and reused everywhere.
 static BLK_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
 /// The raw virtio-blk device (before partitioning), for partition lookups.
-static RAW_BLK: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
 /// The data partition device (partition 4), mounted at /mnt after pivot_root.
 static DATA_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
 
@@ -124,7 +123,6 @@ fn kernel_main(info: &BootInfo) {
     // anyway - but seeding here means the very first reader gets a stream
     // seeded from the machine rather than from a cold counter.
     mpos::rand::init();
-    switch_root();
     println!("系统就绪");
 
     // ---- phase 2: milestone pre-checks (pure tests, assume init done) ------
@@ -213,7 +211,7 @@ fn ensure_child(dir: &Arc<dyn Inode>, name: &str, kind: NodeKind) -> Arc<dyn Ino
 /// `/etc/alpine-release` spells it. Kept in step with `scripts/fetch-alpine.sh`
 /// by hand: the kernel asserts on it, so a silent version bump in the packaging
 /// shows up here rather than as a userland that is not the one that was tested.
-const ALPINE_RELEASE: &str = "3.24.0";
+const ALPINE_RELEASE: &str = "3.24.1";
 
 fn init_vfs(info: &BootInfo) {
     vfs::file::init_standard(vfs::tty::init());
@@ -225,20 +223,7 @@ fn init_vfs(info: &BootInfo) {
     let members = vfs::tar::unpack_into(vfs::global(), archive).expect("the initramfs was broken");
     println!("initramfs: {members} members unpacked");
 
-    let dev = vfs::devfs::DevFs::new();
-    dev.register("tty", Arc::new(TtyDev));
-    dev.register("console", Arc::new(ConsoleDev));
-    // The serial port's traditional name, spelled as a second path to the
-    // same line discipline: a getty on ttyS0 and one on the console would
-    // otherwise be two names for a fight over one keyboard.
-    dev.register("ttyS0", Arc::new(TtyDev));
-    dev.register("null", Arc::new(NullDev));
-    dev.register("zero", Arc::new(ZeroDev));
-    // The entropy every TLS stack reaches for, and the reason `/dev/urandom`
-    // is registered with the core devices rather than left for later: without
-    // it an HTTPS client cannot start.
-    dev.register("random", Arc::new(RandomDev));
-    dev.register("urandom", Arc::new(RandomDev));
+    let dev = drivers::devices::standard_devfs();
     vfs::mount("/dev", &*dev).expect("mount /dev");
 }
 
@@ -251,12 +236,15 @@ fn init_blk() {
         sectors,
         sectors * 512 / MIB as u64
     );
-    RAW_BLK.call_once(|| dev.clone());
+    blk::set_raw_disk(dev.clone());
 
-    // The disk carries a partition table now - a bootloader, a kernel and
-    // this filesystem all live on it - so the filesystem has to be found
-    // inside a partition rather than assumed to start at byte zero.
-    let dev = blk::part::find_filesystem(dev).expect("no ext2 filesystem on the disk");
+    // The disk carries a partition table now, and *two* ext2 partitions: the
+    // rootfs (which `/init` mounts) and the data partition (which this check
+    // works against - its seed files are laid down by mke2fs at image build
+    // time). The data one is picked by its position in the table, not by
+    // "whichever ext2 comes first": with a full rootfs on the disk, first
+    // found is the root, and the check would be reading the wrong disk.
+    let dev = blk::part::find_data(dev).expect("no data partition on the disk");
     println!(
         "ext2: filesystem on a {}-sector partition",
         dev.capacity_sectors()
@@ -268,156 +256,27 @@ fn init_blk() {
     }
     let fs = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("the ext2 image did not mount");
     vfs::mount("/mnt", &fs).expect("mount /mnt");
+    // Both handles name the data partition now: BLK_DEV for the checks that
+    // read through the mounted tree, DATA_DEV for the ones that remount the
+    // raw device to prove a write reached the disk.
+    DATA_DEV.call_once(|| dev.clone());
     BLK_DEV.call_once(|| dev);
 }
 
-/// Mount the root filesystem ext2 partition for the pivot_root transition.
-fn init_rootfs() {
-    let dev = RAW_BLK.get().expect("RAW_BLK not initialized").clone();
-
-    // Find the rootfs partition (partition 3).
-    let rootfs_dev = blk::part::find_rootfs(dev).expect("no rootfs partition found");
-    println!(
-        "rootfs: ext2 on a {}-sector partition",
-        rootfs_dev.capacity_sectors()
-    );
-
-    // Mount the rootfs at /new_root for the pivot_root transition.
-    let fs = vfs::ext2::Ext2Fs::mount(rootfs_dev).expect("the rootfs ext2 image did not mount");
-    vfs::mount("/new_root", &fs).expect("mount /new_root");
-
-    // Create the mount point the old root will be parked at, inside the new
-    // root. `pivot_root` requires it to exist - it will not invent one, since
-    // an invented mount point is a directory nobody knows to clean up - and
-    // the boot chain removes it again a few lines later.
-    let new_root = vfs::resolve("/new_root").expect("new_root missing");
-    if new_root.lookup("old_root").is_err() {
-        new_root
-            .create("old_root", NodeKind::Dir)
-            .expect("create old_root");
-    }
-}
-
-/// Unmount the initramfs and take its mount point with it.
+/// The boot transition moved to userland.
 ///
-/// This is the second half of the switch, and the reason the first half mounts
-/// the old root at all instead of dropping it: an unmount needs something to
-/// name. Once the entry is gone the last reference to the initramfs tree goes
-/// with it, and the ramfs that held it - the whole boot-time root, every
-/// unpacked member of the archive - is freed.
+/// The kernel unpacks the initramfs and runs its `/init`, and *that script*
+/// mounts /proc, /sys and /dev, mounts the real rootfs on `/dev/vda3`,
+/// `pivot_root`s into it and `exec`s `/sbin/init`. From there OpenRC mounts
+/// the canonical directories of the real root and starts the services.
 ///
-/// The mount point goes too. A leftover empty `/old_root` is not harmless
-/// clutter: it is a directory in the *real* root image that nothing in the
-/// image ever asked for, and the first `ls /` a user runs is where it shows up.
-fn detach_old_root() {
-    match vfs::unmount("/old_root") {
-        Ok(()) => println!("initramfs detached"),
-        // Not fatal: a root that could not be unmounted is still a working
-        // machine, and saying so beats failing the boot over cleanup.
-        Err(e) => println!("initramfs not detached: {e:?}"),
-    }
-    let root = match vfs::resolve("/") {
-        Ok(root) => root,
-        Err(e) => {
-            println!("no root after the pivot: {e:?}");
-            return;
-        }
-    };
-    match root.rmdir("old_root") {
-        Ok(()) => {}
-        Err(e) => println!("the old root's mount point stayed: {e:?}"),
-    }
-}
+/// Nothing here mounts a directory any more. A kernel that assembles /proc
+/// and /dev before init exists is doing init's job, and the pieces it mounts
+/// are exactly the pieces an owner of the system cannot then see, change or
+/// unmount - because they were never in a mount table userland can read.
+/// Everything the boot needs - the block devices to mount from, the
+/// filesystem types to mount - is reachable through `mount(2)` instead.
 
-/// Mount the boot partition at /boot after pivot_root.
-///
-/// The boot partition is FAT32, which the kernel does not yet support as a
-/// mountable filesystem. Skipping this for now — the kernel, initramfs and
-/// limine.conf are only needed during boot, not at runtime.
-fn mount_boot() {
-    // TODO: add FAT32 read support to mount the boot partition at /boot.
-    println!("boot: FAT32 partition skipped (no FAT32 driver yet)");
-}
-
-/// Mount the data partition (partition 4) at /mnt after pivot_root.
-fn mount_data() {
-    let dev = RAW_BLK.get().expect("RAW_BLK not initialized").clone();
-
-    let data_dev = blk::part::find_data(dev).expect("no data partition found");
-    println!(
-        "data: ext2 on a {}-sector partition",
-        data_dev.capacity_sectors()
-    );
-
-    let root = vfs::resolve("/").expect("no root filesystem");
-    if root.lookup("mnt").is_err() {
-        root.create("mnt", NodeKind::Dir).expect("create /mnt");
-    }
-
-    let fs = vfs::ext2::Ext2Fs::mount(data_dev.clone()).expect("the data ext2 image did not mount");
-    vfs::mount("/mnt", &fs).expect("mount /mnt");
-    DATA_DEV.call_once(|| data_dev);
-}
-
-/// Switch from the initramfs root to the real rootfs using pivot_root.
-fn switch_root() {
-    // Create /new_root mountpoint if it doesn't exist yet.
-    let root = vfs::resolve("/").expect("no root filesystem");
-    if root.lookup("new_root").is_err() {
-        root.create("new_root", NodeKind::Dir)
-            .expect("create /new_root");
-    }
-
-    // Mount the rootfs ext2 partition at /new_root.
-    init_rootfs();
-
-    // Pivot root: move /new_root to /, move old root to /old_root inside it.
-    vfs::pivot_root("/new_root", "old_root").expect("pivot_root failed");
-
-    // Re-create /dev on the new root and mount devfs. The old devfs was on
-    // the initramfs root which is now gone.
-    let root = vfs::resolve("/").expect("no root filesystem after pivot");
-    if root.lookup("dev").is_err() {
-        root.create("dev", NodeKind::Dir).expect("create /dev");
-    }
-    let dev = vfs::devfs::DevFs::new();
-    dev.register("tty", Arc::new(TtyDev));
-    dev.register("console", Arc::new(ConsoleDev));
-    dev.register("ttyS0", Arc::new(TtyDev));
-    dev.register("null", Arc::new(NullDev));
-    dev.register("zero", Arc::new(ZeroDev));
-    // The entropy every TLS stack reaches for, and the reason `/dev/urandom`
-    // is registered with the core devices rather than left for later: without
-    // it an HTTPS client cannot start.
-    dev.register("random", Arc::new(RandomDev));
-    dev.register("urandom", Arc::new(RandomDev));
-    vfs::mount("/dev", &*dev).expect("mount /dev after pivot");
-
-    // Mount the boot partition at /boot.
-    mount_boot();
-
-    // Mount the data partition at /mnt.
-    mount_data();
-
-    // The initramfs has done its job: everything the machine runs on now lives
-    // on the real rootfs. Let go of it - the mount, the mount point, and with
-    // them the memory the whole boot-time tree occupied.
-    detach_old_root();
-
-    // The boot task's cwd was a directory in the initramfs, which is now
-    // gone. Standing at `/` of the real root is the only honest answer, and it
-    // is also what every process started from here inherits.
-    let root = vfs::resolve("/").expect("no root after the pivot");
-    crate::sched::set_cwd(root);
-    crate::sched::set_cwd_path(alloc::string::String::from("/"));
-
-    println!("switched to rootfs, boot mounted");
-}
-
-// ---- mm: heap allocator + buddy frame allocator --------------------------
-
-/// Prove the heap allocator works end-to-end, and the frame allocator hands
-/// out disjoint blocks that merge back correctly.
 fn check_mm(info: &BootInfo) {
     // M0: the global allocator works.
     {
@@ -1223,89 +1082,6 @@ fn check_vfs() {
     }
 }
 
-/// The console as the line discipline has it.
-struct TtyDev;
-
-impl vfs::devfs::CharDevice for TtyDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
-        vfs::tty::global().read(buf)
-    }
-
-    fn write(&self, buf: &[u8]) -> usize {
-        mpos::console::write_bytes(buf);
-        buf.len()
-    }
-}
-
-/// Writes go out to the console. Nothing arrives, so reads are end of input.
-struct ConsoleDev;
-
-impl vfs::devfs::CharDevice for ConsoleDev {
-    fn read(&self, _buf: &mut [u8]) -> usize {
-        0
-    }
-
-    fn write(&self, buf: &[u8]) -> usize {
-        mpos::console::write_bytes(buf);
-        buf.len()
-    }
-}
-
-/// Writes vanish; reads are end of input.
-struct NullDev;
-
-impl vfs::devfs::CharDevice for NullDev {
-    fn read(&self, _buf: &mut [u8]) -> usize {
-        0
-    }
-
-    fn write(&self, buf: &[u8]) -> usize {
-        buf.len()
-    }
-}
-
-/// Reads are zeros forever, however much is asked; writes vanish.
-struct ZeroDev;
-
-impl vfs::devfs::CharDevice for ZeroDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
-        buf.fill(0);
-        buf.len()
-    }
-
-    fn write(&self, buf: &[u8]) -> usize {
-        buf.len()
-    }
-}
-
-/// Reads are random bytes, however much is asked; writes vanish.
-///
-/// This is the device a TLS stack's entropy comes from, and for busybox it is
-/// the *only* one: its HTTPS implementation opens `/dev/urandom` and never
-/// calls `getrandom(2)`. A kernel without this node cannot run an HTTPS client
-/// at all, which is why it is here beside `/dev/zero` rather than later.
-///
-/// Reads never block. Linux blocks `/dev/random` until the pool is confident
-/// and answers `/dev/urandom` immediately; this kernel has one stream and
-/// behaves like the latter for both names, so a program that reaches for
-/// either one makes progress.
-struct RandomDev;
-
-impl vfs::devfs::CharDevice for RandomDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
-        mpos::rand::fill(buf);
-        buf.len()
-    }
-
-    fn write(&self, buf: &[u8]) -> usize {
-        // Writing to `/dev/urandom` is how a caller *adds* entropy on Linux,
-        // and Linux accepts and ignores a write when it has no room for it.
-        // There is nowhere to put it here, and accepting it is the compatible
-        // answer: refusing would turn a harmless call into a failure.
-        buf.len()
-    }
-}
-
 // ---- blk + user processes: ELF loading, virtio-blk, ext2 -----------------
 
 /// The exit code the user program ends with.
@@ -1908,8 +1684,8 @@ fn init_net() {
 /// M13: a real system start. The checks above are the kernel proving itself;
 /// this is the kernel handing the machine over.
 fn handoff_to_init() {
-    let init = vfs::read_file("/sbin/init").expect("the initramfs carries /sbin/init");
-    let argv = alloc::vec![String::from("init")];
+    let init = vfs::read_file("/init").expect("the initramfs carries /init");
+    let argv = alloc::vec![String::from("/init")];
     let pid = sched::spawn_init(&init, &argv, &[]).expect("the init image loaded");
     assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
     println!("mpos: handing the machine to /sbin/init");

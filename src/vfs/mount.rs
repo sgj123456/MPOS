@@ -20,7 +20,7 @@ use core::cell::RefCell;
 use critical_section::Mutex;
 
 use super::path;
-use super::{FileSystem, Inode, NodeKind, VfsError, VfsResult};
+use super::{FileSystem, Inode, NodeKind, VfsError, VfsResult, resolve_opt};
 
 /// How many links one resolution may follow before it is called a cycle.
 /// Linux's own limit is 40.
@@ -31,12 +31,23 @@ const SYMLINK_HOPS: usize = 40;
 struct Mount {
     at: Arc<dyn Inode>,
     root: Arc<dyn Inode>,
+    /// The name `mount(2)` was given for this filesystem, and the source it
+    /// named - "/dev/vda3" for an ext2 partition, "proc" for procfs. Both are
+    /// what /proc/mounts reports, and /proc/mounts is how userland finds out
+    /// what is mounted where, which is the only record there is.
+    fstype: alloc::string::String,
+    source: alloc::string::String,
 }
 
 /// A set of mounts with a root, and the resolver over them.
 pub struct Vfs {
     root: Mutex<RefCell<Option<Arc<dyn Inode>>>>,
     mounts: Mutex<RefCell<Vec<Mount>>>,
+    /// What `/` is, for /proc/mounts. The root is not in the mount table - it
+    /// is reached directly - so its own record lives here, filled in by
+    /// `pivot_root` from the mount that carried the new root in.
+    root_fstype: Mutex<RefCell<Option<alloc::string::String>>>,
+    root_source: Mutex<RefCell<Option<alloc::string::String>>>,
 }
 
 impl Vfs {
@@ -44,6 +55,8 @@ impl Vfs {
         Vfs {
             root: Mutex::new(RefCell::new(None)),
             mounts: Mutex::new(RefCell::new(Vec::new())),
+            root_fstype: Mutex::new(RefCell::new(None)),
+            root_source: Mutex::new(RefCell::new(None)),
         }
     }
 
@@ -97,8 +110,54 @@ impl Vfs {
             mounts.push(Mount {
                 at,
                 root: fs.root(),
+                fstype: alloc::string::String::from(fs.name()),
+                source: alloc::string::String::from("none"),
             });
             Ok(())
+        })
+    }
+
+    /// Mount `fs` on an already-resolved directory, as `mount(2)` does: the
+    /// syscall has the mountpoint in its hand and the filesystem type and
+    /// source as the caller spelled them, and both go into the record that
+    /// /proc/mounts later reports.
+    pub fn mount_at(
+        &self,
+        at: Arc<dyn Inode>,
+        fs: &dyn FileSystem,
+        fstype: &str,
+        source: &str,
+    ) -> VfsResult<()> {
+        if at.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        critical_section::with(|cs| {
+            let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            if mounts.iter().any(|m| Arc::ptr_eq(&m.at, &at)) {
+                return Err(VfsError::Busy);
+            }
+            mounts.push(Mount {
+                at,
+                root: fs.root(),
+                fstype: alloc::string::String::from(fstype),
+                source: alloc::string::String::from(source),
+            });
+            Ok(())
+        })
+    }
+
+    /// Unmount whatever is mounted on `target`, given the mountpoint's own
+    /// inode - the shape `umount2(2)` arrives in, having resolved the path
+    /// against its caller's cwd.
+    pub fn unmount_resolved(&self, target: &Arc<dyn Inode>) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            if let Some(pos) = mounts.iter().position(|m| Arc::ptr_eq(&m.root, target)) {
+                mounts.remove(pos);
+                Ok(())
+            } else {
+                Err(VfsError::Busy)
+            }
         })
     }
 
@@ -153,8 +212,15 @@ impl Vfs {
 
         // `put_old` is walked *inside* the new root: it names a directory in
         // the tree that is about to become `/`, not one in the tree being
-        // replaced.
+        // replaced. The canonical spelling - `pivot_root /new_root
+        // /new_root/old_root` - names it from the caller's tree, so the new
+        // root's own prefix comes off before the walk.
+        let new_root_trimmed = new_root.trim_end_matches('/');
         let put_old = put_old.trim_start_matches('/');
+        let put_old = match put_old.strip_prefix(new_root_trimmed.trim_start_matches('/')) {
+            Some(rest) => rest.trim_start_matches('/'),
+            None => put_old,
+        };
         let mut put_old_inode = new_root_inode.clone();
         if !put_old.is_empty() {
             for component in put_old.split('/') {
@@ -170,6 +236,17 @@ impl Vfs {
 
         critical_section::with(|cs| {
             let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            // The root's own identity comes from the mount that made
+            // `new_root` reachable: after the pivot that mount is gone, but
+            // /proc/mounts still has to say what `/` is and what it came from.
+            if let Some(entry) = mounts
+                .iter()
+                .find(|m| Arc::ptr_eq(&m.root, &new_root_inode))
+                .map(|m| (m.fstype.clone(), m.source.clone()))
+            {
+                *self.root_fstype.borrow(cs).borrow_mut() = Some(entry.0);
+                *self.root_source.borrow(cs).borrow_mut() = Some(entry.1);
+            }
             // Every mount in the table was attached somewhere in the old tree -
             // /dev, /tmp, the new root itself - and none of them can be reached
             // once the root is replaced. Keeping them would leave entries
@@ -180,6 +257,8 @@ impl Vfs {
             mounts.push(Mount {
                 at: put_old_inode.clone(),
                 root: old_root,
+                fstype: alloc::string::String::from("ramfs"),
+                source: alloc::string::String::from("initramfs"),
             });
             *self.root.borrow(cs).borrow_mut() = Some(new_root_inode);
         });
@@ -314,6 +393,98 @@ impl Vfs {
                 return Err(VfsError::Invalid);
             }
         }
+    }
+
+    /// The path by which `target` is reached, found by walking down from the
+    /// root. The same search [`Self::parent_of`] makes, carrying the names it
+    /// came by - which is what /proc/mounts needs, because a mount is recorded
+    /// by the inode it sits on and /proc reports it by name.
+    ///
+    /// `"/"` for the root itself, `None` for a node the tree cannot name: a
+    /// mounted filesystem's root reached from outside its mount point, or a
+    /// node whose other name the caller did not use.
+    pub fn path_of(&self, target: &Arc<dyn Inode>) -> Option<alloc::string::String> {
+        const VISITS_MAX: usize = 512;
+
+        let root = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())?;
+        if Arc::ptr_eq(&root, target) {
+            return Some(alloc::string::String::from("/"));
+        }
+        let mut queue: VecDeque<(Arc<dyn Inode>, alloc::string::String)> =
+            VecDeque::from([(root, alloc::string::String::new())]);
+        let mut visits = 0usize;
+        while let Some((dir, prefix)) = queue.pop_front() {
+            visits += 1;
+            if visits > VISITS_MAX {
+                return None;
+            }
+            let Ok(entries) = dir.read_dir() else {
+                continue;
+            };
+            for (name, kind) in entries {
+                if name == "." || name == ".." {
+                    continue;
+                }
+                let Ok(child) = dir.lookup(&name) else {
+                    continue;
+                };
+                let reached = critical_section::with(|cs| {
+                    let mounts = self.mounts.borrow(cs).borrow();
+                    mounts
+                        .iter()
+                        .find(|m| Arc::ptr_eq(&m.at, &child))
+                        .map(|m| m.root.clone())
+                        .unwrap_or_else(|| child.clone())
+                });
+                let path = alloc::format!("{prefix}/{name}");
+                if Arc::ptr_eq(&reached, target) {
+                    return Some(path);
+                }
+                if kind == NodeKind::Dir {
+                    queue.push_back((reached, path));
+                }
+            }
+        }
+        None
+    }
+
+    /// Every mount, as /proc/mounts reports them: source, mountpoint, type.
+    /// The root comes first, then the table in mounting order.
+    ///
+    /// This is the only record of what is mounted where that userland can
+    /// read, and the thing `mountinfo` and `mount -a` are built on.
+    pub fn mount_table(
+        &self,
+    ) -> Vec<(
+        alloc::string::String,
+        alloc::string::String,
+        alloc::string::String,
+    )> {
+        // The table is copied out first: naming each mount point walks the
+        // tree, and that walk takes the same lock. Nested takes of the one
+        // critical section are not something to lean on.
+        let (root_fstype, root_source, entries) = critical_section::with(|cs| {
+            let fstype = self.root_fstype.borrow(cs).borrow().clone();
+            let source = self.root_source.borrow(cs).borrow().clone();
+            let entries: Vec<(Arc<dyn Inode>, alloc::string::String, alloc::string::String)> = self
+                .mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .map(|m| (m.at.clone(), m.source.clone(), m.fstype.clone()))
+                .collect();
+            (fstype, source, entries)
+        });
+        let mut lines = Vec::new();
+        if let (Some(fstype), Some(source)) = (root_fstype, root_source) {
+            lines.push((source, alloc::string::String::from("/"), fstype));
+        }
+        for (at, source, fstype) in entries {
+            if let Some(path) = self.path_of(&at) {
+                lines.push((source, path, fstype));
+            }
+        }
+        lines
     }
 
     /// The directory that names `target`, found by walking down from the root.
@@ -480,6 +651,41 @@ pub fn unmount(path: &str) -> VfsResult<()> {
 /// contents, ready to be unmounted.
 pub fn pivot_root(new_root: &str, put_old: &str) -> VfsResult<()> {
     STATIC.pivot_root(new_root, put_old)
+}
+
+/// Mount `fs` on the directory `target` already resolves to, recording the
+/// type and source as the caller spelled them. This is the shape `mount(2)`
+/// arrives in, and the reason it exists as a syscall at all: which filesystems
+/// are mounted where is userland's decision to make.
+pub fn mount_at(target: &str, fs: &dyn FileSystem, fstype: &str, source: &str) -> VfsResult<()> {
+    mount_at_opt(target, None, fs, fstype, source)
+}
+
+/// [`mount_at`](fn.mount_at.html) resolved against a caller's cwd.
+pub fn mount_at_opt(
+    target: &str,
+    start: Option<Arc<dyn Inode>>,
+    fs: &dyn FileSystem,
+    fstype: &str,
+    source: &str,
+) -> VfsResult<()> {
+    let at = resolve_opt(target, start)?;
+    STATIC.mount_at(at, fs, fstype, source)
+}
+
+/// Unmount the filesystem at `path`, resolved against a caller's cwd.
+pub fn unmount_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
+    let resolved = resolve_opt(path, start)?;
+    STATIC.unmount_resolved(&resolved)
+}
+
+/// Every mount, as /proc/mounts reports it.
+pub fn mount_table() -> Vec<(
+    alloc::string::String,
+    alloc::string::String,
+    alloc::string::String,
+)> {
+    STATIC.mount_table()
 }
 
 /// Resolve `path` in the kernel's tree.

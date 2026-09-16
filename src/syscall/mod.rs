@@ -61,6 +61,8 @@ pub mod err {
     /// ELOOP: a chain of `#!` interpreters that leads back into itself. The
     /// bound that produces it is what ends the chain; nothing else can.
     pub const ELOOP: isize = -40;
+    /// ENOTBLK: a mount source that is not a block device.
+    pub const ENOTBLK: isize = -15;
     /// ENOTEMPTY: `rmdir` on a directory that still names something. Linux
     /// has a separate call from `unlink` precisely so that this can be said
     /// instead of "the directory was removed, and so was everything in it".

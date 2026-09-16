@@ -36,10 +36,11 @@ fn base_of(dirfd: i32, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
 /// The mode bits `struct stat` and `struct statx` carry for a node.
 fn mode_of(meta: &Metadata) -> u32 {
     match meta.kind {
-        NodeKind::File => 0o100_644,    // regular file rw-r--r--
-        NodeKind::Dir => 0o040_755,     // directory rwxr-xr-x
-        NodeKind::CharDev => 0o020_666, // character device rw-rw-rw-
-        NodeKind::Symlink => 0o120_777, // symbolic link rwxrwxrwx
+        NodeKind::File => 0o100_644,     // regular file rw-r--r--
+        NodeKind::Dir => 0o040_755,      // directory rwxr-xr-x
+        NodeKind::CharDev => 0o020_666,  // character device rw-rw-rw-
+        NodeKind::BlockDev => 0o060_660, // block device brw-rw----
+        NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
     }
 }
 
@@ -475,6 +476,14 @@ fn normalize_path(path: &str, base: &str) -> alloc::string::String {
 /// `unlinkat(dirfd, path, flags)` - `AT_REMOVEDIR` is accepted and ignored:
 /// removal goes through the same unlink either way.
 pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let r = unlinkat_inner(args, cwd);
+    if let Ok(path) = cstr_arg(args[1], true) {
+        crate::println!("TRACE unlink {:?} flags={:#x} = {}", path, args[2], r);
+    }
+    r
+}
+
+fn unlinkat_inner(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // `AT_REMOVEDIR` is `unlinkat` spelling `rmdir`: the flag is not an
     // optimisation, it is how the caller says which of the two operations it
     // means, and getting it wrong either removes a directory that still holds
@@ -560,6 +569,14 @@ pub(super) fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// exchange and whiteout forms have no implementation underneath and answer
 /// `EINVAL`, as Linux does for a flag combination it cannot serve.
 pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let r = renameat2_inner(args, cwd);
+    if let (Ok(old), Ok(new)) = (cstr_arg(args[1], true), cstr_arg(args[3], true)) {
+        crate::println!("TRACE rename {:?} -> {:?} = {}", old, new, r);
+    }
+    r
+}
+
+fn renameat2_inner(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     const RENAME_NOREPLACE: usize = 0x1;
     const RENAME_EXCHANGE: usize = 0x2;
     const RENAME_WHITEOUT: usize = 0x4;
@@ -704,8 +721,136 @@ pub(super) fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(parent) => parent,
         Err(e) => return err_of(e),
     };
-    match parent.symlink(name, &target) {
+    let r = match parent.symlink(name, &target) {
         Ok(_) => 0,
+        Err(e) => err_of(e),
+    };
+    crate::println!("TRACE symlink target={:?} path={:?} -> {}", target, path, r);
+    r
+}
+
+/// `mount(source, target, fstype, flags, data)`.
+///
+/// The filesystem types are the ones this kernel has. A block-backed type
+/// resolves its source through the tree - `/dev/vda3` is a node, and the node
+/// knows which storage it is - which is the mechanism that lets userland
+/// decide what gets mounted where, instead of the kernel's boot code deciding
+/// for it.
+///
+/// Not implemented, and said so rather than silently accepted: read-only
+/// mounts. `MS_RDONLY` names a property of the filesystem underneath, and
+/// this kernel's writers have no read-only mode to consult; a caller asking
+/// for one gets `EOPNOTSUPP` rather than a writable mount that claims to be
+/// read-only.
+pub(super) fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    const MS_RDONLY: usize = 0x1;
+
+    let source = match cstr_arg(args[0], true) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let target = match cstr_arg(args[1], true) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let fstype = cstr_arg(args[2], true).unwrap_or_default();
+    if args[3] & MS_RDONLY != 0 {
+        return err::EOPNOTSUPP;
+    }
+
+    // The mountpoint must already be there and must be a directory, as Linux
+    // requires: mounting does not invent directories.
+    let at = match crate::vfs::resolve_opt(&target, Some(cwd.clone())) {
+        Ok(at) => at,
+        Err(e) => return err_of(e),
+    };
+    if at.metadata().kind != NodeKind::Dir {
+        return err::ENOTDIR;
+    }
+
+    let fs: alloc::sync::Arc<dyn crate::vfs::FileSystem> = match fstype.as_str() {
+        // The block types. The source names a device node; the node knows
+        // which storage it stands for.
+        "ext2" | "ext3" | "ext4" => {
+            if source.is_empty() {
+                return err::ENOENT;
+            }
+            let dev_node = match crate::vfs::resolve_opt(&source, Some(cwd.clone())) {
+                Ok(node) => node,
+                Err(e) => return err_of(e),
+            };
+            let Some(dev) = dev_node.as_block() else {
+                return err::ENOTBLK;
+            };
+            match crate::vfs::ext2::Ext2Fs::mount(dev) {
+                Ok(fs) => alloc::sync::Arc::new(fs) as alloc::sync::Arc<dyn crate::vfs::FileSystem>,
+                Err(_) => return err::EINVAL,
+            }
+        }
+        // The kernel's own trees, by name.
+        "proc" => crate::vfs::procfs::ProcFs::new(),
+        "sysfs" => crate::vfs::sysfs::SysFs::new(),
+        "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
+        "tmpfs" | "ramfs" => crate::vfs::ramfs::RamFs::new(),
+        // A type this kernel does not speak. ENODEV is what Linux answers, and
+        // it is the answer a caller walks a list of types on.
+        _ => return err::ENODEV,
+    };
+
+    match crate::vfs::mount::mount_at_opt(&target, Some(cwd.clone()), &*fs, &fstype, &source) {
+        Ok(()) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `umount2(target, flags)`.
+///
+/// `MNT_FORCE` and `MNT_DETACH` both land on the same immediate detach, which
+/// is what this kernel's unmount is: there is no in-flight I/O to force and no
+/// lazy expiry to schedule, so the flags name distinctions that do not exist
+/// here and are accepted as no-ops.
+pub(super) fn handle_umount2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    const MNT_FORCE: usize = 0x1;
+    const MNT_DETACH: usize = 0x2;
+    let _ = (MNT_FORCE, MNT_DETACH);
+
+    let target = match cstr_arg(args[0], true) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::vfs::mount::unmount_opt(&target, Some(cwd.clone())) {
+        Ok(()) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `pivot_root(new_root, put_old)` - replace the root, parking the old one.
+///
+/// This is the call an initramfs exists to make: it mounts the real root
+/// somewhere, moves the root to it, and from then on the machine lives on the
+/// filesystem it was built to run. The old root is parked at `put_old`, which
+/// is what lets the caller detach it and give its memory back.
+pub(super) fn handle_pivot_root(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let _ = cwd;
+    let new_root = match cstr_arg(args[0], true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let put_old = match cstr_arg(args[1], true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::vfs::pivot_root(&new_root, &put_old) {
+        Ok(()) => {
+            // The caller's cwd named a directory in the tree that just stopped
+            // being the root. Everything it reaches for from here on - `exec`,
+            // relative paths, `getcwd` - has to answer in the new one.
+            if let Ok(root) = crate::vfs::resolve("/") {
+                crate::sched::set_cwd(root);
+                crate::sched::set_cwd_path(alloc::string::String::from("/"));
+            }
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -1400,6 +1545,7 @@ pub(super) fn handle_getdents64(args: [usize; ARG_COUNT], from_user: bool) -> is
             crate::vfs::NodeKind::File => 8,
             crate::vfs::NodeKind::Dir => 4,
             crate::vfs::NodeKind::CharDev => 2,
+            crate::vfs::NodeKind::BlockDev => 6,
             crate::vfs::NodeKind::Symlink => 10,
         };
         unsafe {
@@ -1962,7 +2108,7 @@ pub(super) fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
         Err(e) => return err_of(e),
     };
     match file.metadata().kind {
-        NodeKind::File | NodeKind::Dir | NodeKind::Symlink => 0,
+        NodeKind::File | NodeKind::Dir | NodeKind::Symlink | NodeKind::BlockDev => 0,
         NodeKind::CharDev => err::EINVAL,
     }
 }

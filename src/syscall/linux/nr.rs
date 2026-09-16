@@ -181,6 +181,19 @@ pub const FCHOWNAT: u64 = 260;
 pub const LCHOWN: u64 = 94;
 /// `mknod(2)`: create a filesystem node. mpos has no device nodes.
 pub const MKNOD: u64 = 133;
+/// `mount(2)`: put a filesystem on a directory. This is the call that hands
+/// the mount table to userland - the kernel builds none of /proc, /sys, /dev
+/// or /run on its own any more, because a system whose own init cannot mount
+/// its directories is a system with a kernel doing init's job.
+pub const MOUNT: u64 = 165;
+/// `umount2(2)`: take one down. The lazy and force flags are accepted and
+/// mean the same thing here as an immediate detach, which is what this
+/// kernel's unmount already is.
+pub const UMOUNT2: u64 = 166;
+/// `pivot_root(2)`: move the root to `new_root`, parking the old one at
+/// `put_old`. This is the call an initramfs makes to hand the machine over.
+/// (155, not 160-166's neighbourhood: those are setrlimit and the mount pair.)
+pub const PIVOT_ROOT: u64 = 155;
 /// `link(2)` / `linkat(2)`: a second name for an inode.
 pub const LINK: u64 = 86;
 pub const LINKAT: u64 = 265;

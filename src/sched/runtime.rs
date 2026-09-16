@@ -147,6 +147,8 @@ pub enum SpawnError {
     NotExecutable,
     /// The argument strings do not fit the initial stack.
     ArgsTooBig,
+    /// A `#!` chain that leads back into itself.
+    Loop,
     /// A descriptor the starter asked the child to be born with names nothing
     /// in the starter's own table.
     BadFd,
@@ -752,8 +754,49 @@ pub fn spawn_user(bytes: &[u8], priority: Priority) -> TaskId {
 /// Nothing spawns it, so nothing is its parent until it has children of its
 /// own; the boot task keeps no link, because it has no `wait` to collect with
 /// and a record nobody reads is a record that lies to the next `wait`.
+/// The bytes and argv of the program a spawn actually runs.
+///
+/// A `#!` chain is followed here exactly as the `execve` handler follows it,
+/// and for the same reason: the kernel's own spawns - pid 1 above all - start
+/// from a file's bytes, and the file may be a script whose interpreter is a
+/// *path into the filesystem* that only a read can resolve. Without this, a
+/// kernel that execs scripts for its processes but not for its own spawns
+/// hands pid 1 an image it then refuses to run.
+///
+/// `start` is the cwd a relative interpreter is resolved against: the syscall
+/// passes the caller's, a kernel-side spawn passes the root.
+pub fn resolve_script(
+    bytes: Vec<u8>,
+    mut argv: Vec<String>,
+    start: Option<alloc::sync::Arc<dyn crate::vfs::Inode>>,
+) -> Result<(Vec<u8>, Vec<String>), SpawnError> {
+    let mut bytes = bytes;
+    let mut hops = 0;
+    while let Some((interp, argument)) = crate::binfmt::shebang(&bytes) {
+        hops += 1;
+        if hops > crate::binfmt::SHEBANG_HOPS_MAX {
+            // A chain of interpreters that leads back into itself.
+            return Err(SpawnError::Loop);
+        }
+        let mut rewritten: Vec<String> = Vec::with_capacity(argv.len() + 2);
+        rewritten.push(interp.clone());
+        if let Some(argument) = argument {
+            rewritten.push(argument);
+        }
+        rewritten.extend(argv.iter().cloned());
+        argv = rewritten;
+        bytes = match start.as_ref() {
+            Some(dir) => crate::vfs::read_file_opt(&interp, Some(dir.clone())),
+            None => crate::vfs::read_file(&interp),
+        }
+        .map_err(|_| SpawnError::NoInterpreter)?;
+    }
+    Ok((bytes, argv))
+}
+
 pub fn spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<TaskId, SpawnError> {
-    let id = try_spawn_init(bytes, argv, env)?;
+    let (bytes, argv) = resolve_script(bytes.to_vec(), argv.to_vec(), None)?;
+    let id = try_spawn_init(&bytes, &argv, env)?;
     assert_eq!(id, INIT_PID, "init did not land on pid 1");
     Ok(id)
 }

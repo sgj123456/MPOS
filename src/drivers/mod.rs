@@ -4,6 +4,7 @@
 //! `arch::x86_64` or `blk`. They are architecture-aware (using port I/O,
 //! PCI enumeration) but are not part of the core architecture abstraction.
 
+pub mod devices;
 pub mod pci;
 pub mod qemu;
 pub mod serial;

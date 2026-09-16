@@ -7,7 +7,6 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use super::nr;
 use crate::sched::TaskId;
@@ -441,31 +440,18 @@ pub(super) fn handle_execve(
     };
 
     // A script is run by its interpreter, and the kernel is where that is
-    // discovered: the file's first two bytes say so. The interpreter is found
-    // by the name the script gave, relative to the cwd when that name has no
-    // slash of its own, and each hop of a chain starts a new argv with the
-    // previous one appended behind it - exactly the shape Linux builds.
-    let mut bytes = bytes;
-    let mut hops = 0;
-    while let Some((interp, argument)) = crate::binfmt::shebang(&bytes) {
-        hops += 1;
-        if hops > crate::binfmt::SHEBANG_HOPS_MAX {
-            // A chain of interpreters that leads back into itself. Linux calls
-            // this ELOOP, and a bound is the only thing that ends it.
-            return err::ELOOP;
-        }
-        let mut rewritten: Vec<String> = Vec::with_capacity(argv.len() + 2);
-        rewritten.push(interp.clone());
-        if let Some(argument) = argument {
-            rewritten.push(argument);
-        }
-        rewritten.extend(argv.iter().cloned());
-        argv = rewritten;
-        bytes = match crate::vfs::read_file_opt(&interp, Some(cwd.clone())) {
-            Ok(bytes) => bytes,
-            Err(e) => return err_of(e),
-        };
-    }
+    // discovered: the file's first two bytes say so. The chain is followed
+    // exactly as the kernel's own spawns follow it - one resolver, so the two
+    // paths can never disagree about what a script is.
+    let (bytes, argv) = match crate::sched::resolve_script(bytes, argv, Some(cwd.clone())) {
+        Ok(r) => r,
+        Err(crate::sched::SpawnError::Loop) => return err::ELOOP,
+        // Linux reports a missing interpreter as "the file was not found",
+        // not as a malformed executable: the script itself was fine, and it
+        // is the path it names that could not be followed.
+        Err(crate::sched::SpawnError::NoInterpreter) => return err::ENOENT,
+        Err(_) => return err::ENOEXEC,
+    };
 
     match crate::sched::exec_replace(&bytes, &argv, &envp, &path) {
         Ok((entry, new_rsp)) => {
@@ -494,6 +480,7 @@ pub(super) fn handle_execve(
         // not found", not as a malformed executable: the program itself was
         // fine, and it is the path it names that could not be followed.
         Err(crate::sched::SpawnError::NoInterpreter) => err::ENOENT,
+        Err(crate::sched::SpawnError::Loop) => err::ELOOP,
     }
 }
 

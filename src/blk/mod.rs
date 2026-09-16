@@ -13,6 +13,32 @@
 
 pub mod part;
 
+use alloc::sync::Arc;
+use core::cell::RefCell;
+
+use critical_section::Mutex;
+
+/// The disk the kernel booted from, as the block layer sees it. Set once at
+/// boot; everything that needs to name the disk to userland - the devfs
+/// builder above all - asks here rather than keeping its own copy.
+static RAW: Mutex<RefCell<Option<Arc<dyn BlockDev>>>> = Mutex::new(RefCell::new(None));
+
+/// Record the boot disk. A second call is ignored: the boot disk does not
+/// change, and whichever caller won keeps the name.
+pub fn set_raw_disk(dev: Arc<dyn BlockDev>) {
+    critical_section::with(|cs| {
+        let mut raw = RAW.borrow(cs).borrow_mut();
+        if raw.is_none() {
+            *raw = Some(dev);
+        }
+    });
+}
+
+/// The boot disk, if the block layer has one yet.
+pub fn raw_disk() -> Option<Arc<dyn BlockDev>> {
+    critical_section::with(|cs| RAW.borrow(cs).borrow().clone())
+}
+
 pub trait BlockDev: Send + Sync {
     /// Device capacity, in 512-byte sectors.
     fn capacity_sectors(&self) -> u64;
