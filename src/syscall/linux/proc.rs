@@ -1672,29 +1672,26 @@ pub(super) fn handle_prlimit64(args: [usize; ARG_COUNT], from_user: bool) -> isi
 /// are refused rather than run without their timeout: a caller that asked to
 /// stop waiting would wait for ever, and ENOSYS at least tells it why.
 pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
-    const FUTEX_WAIT: usize = 0;
-    const FUTEX_WAKE: usize = 1;
-    const FUTEX_WAIT_BITSET: usize = 9;
-    const FUTEX_WAKE_BITSET: usize = 10;
     // The operation is the low seven bits; the rest of the word carries flags
     // like FUTEX_PRIVATE_FLAG, which say which table to look in - and this
     // kernel has exactly one.
-    let (uaddr, command, val) = (args[0], args[1] & 0x7f, args[2]);
+    let (uaddr, command, val) = (args[0], args[1] & !nr::FUTEX_PRIVATE_FLAG, args[2]);
+    let command = command & 0x7f;
 
     match command {
-        FUTEX_WAIT => {
+        nr::FUTEX_WAIT => {
             if !buffer_ok(uaddr, 4, false, true) {
                 return err::EFAULT;
             }
             crate::sched::futex::wait(uaddr, val as u32)
         }
-        FUTEX_WAKE => {
+        nr::FUTEX_WAKE => {
             if !buffer_ok(uaddr, 4, false, true) {
                 return err::EFAULT;
             }
             crate::sched::futex::wake(uaddr, val as usize) as isize
         }
-        FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET => err::ENOSYS,
+        nr::FUTEX_WAIT_BITSET | nr::FUTEX_WAKE_BITSET => err::ENOSYS,
         _ => err::ENOSYS,
     }
 }

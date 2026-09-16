@@ -127,6 +127,16 @@ pub const GETSOCKOPT: u64 = 55;
 pub const GETTID: u64 = 186;
 pub const TKILL: u64 = 200;
 pub const FUTEX: u64 = 202;
+
+/// The futex operations this kernel speaks. The operation is the low seven
+/// bits of the `op` argument; the rest carries flags like
+/// `FUTEX_PRIVATE_FLAG`, which say which table to look in - and this kernel
+/// has exactly one.
+pub const FUTEX_WAIT: usize = 0;
+pub const FUTEX_WAKE: usize = 1;
+pub const FUTEX_WAIT_BITSET: usize = 9;
+pub const FUTEX_WAKE_BITSET: usize = 10;
+pub const FUTEX_PRIVATE_FLAG: usize = 128;
 pub const SCHED_GETAFFINITY: u64 = 203;
 pub const SET_TID_ADDRESS: u64 = 218;
 pub const CLOCK_GETTIME: u64 = 228;

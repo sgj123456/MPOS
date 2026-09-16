@@ -17,8 +17,10 @@
 //!   which is how a thread learns its own id before it does anything else;
 //! * the spawn shape - `CLONE_VM|CLONE_VFORK`, which is what a libc's
 //!   `posix_spawn` builds - starts a child that can exec;
-//! * a real thread (`CLONE_THREAD`) is refused with `ENOSYS` rather than faked,
-//!   because a shared address space is something this kernel cannot yet give.
+//! * a real thread (`CLONE_THREAD`) shares its creator's memory: the child
+//!   writes a word its creator can see, which is the whole difference between a
+//!   thread and a fork, and it answers its own `gettid` while `getpid` stays the
+//!   process's.
 
 #![no_std]
 #![no_main]
@@ -33,6 +35,24 @@ static mut SHARED: i32 = 5;
 
 /// The code the clone child leaves with.
 const CHILD_CODE: i32 = 33;
+
+/// What the thread writes, and what it answers for its own identity. Memory
+/// is shared with a thread, so the caller reads these back.
+static mut THREAD_WROTE: i32 = 0;
+static mut THREAD_TID: i32 = 0;
+static mut THREAD_PID: i32 = 0;
+
+/// The thread's whole life: write what it knows into memory its creator can
+/// see - which is the whole difference between a thread and a fork - and leave
+/// with `exit`, which ends the thread and not the process.
+extern "C" fn thread_body(_arg: usize) -> ! {
+    unsafe {
+        THREAD_WROTE = 42;
+        THREAD_TID = lin::gettid() as i32;
+        THREAD_PID = lin::getpid() as i32;
+    }
+    lin::exit(0)
+}
 
 /// What the spawn-shaped child execs: it exits 0 without a word.
 static TRUE_PROG: [u8; 10] = *b"/bin/true\0";
@@ -186,23 +206,54 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         );
     }
 
-    // A real thread shares its creator's memory and signal handlers. That needs
-    // reference-counted page tables, and it is refused rather than faked: a child
-    // that only looks like a thread breaks the first time two threads touch the
-    // same word.
-    let r = lin::clone(
-        lin::nr::CLONE_VM | lin::nr::CLONE_THREAD | lin::nr::CLONE_SIGHAND | lin::nr::CLONE_FILES,
+    // A real thread shares its creator's memory and signal handlers, and runs
+    // on a stack of its own. The child writes a word the caller then reads -
+    // one address space between them - and leaves with `exit`, which ends the
+    // thread and not the process.
+    let stack = lin::mmap(
         0,
-        null,
-        null,
+        0x8000,
+        lin::PROT_READ | lin::PROT_WRITE,
+        lin::MAP_PRIVATE | lin::MAP_ANONYMOUS,
+        -1,
         0,
     );
-    lin::check_eq(
-        &mut failed,
-        b"CLONE_THREAD is refused with ENOSYS, not faked",
-        r,
-        lin::ENOSYS,
-    );
+    lin::check_true(&mut failed, b"a stack was mapped for the thread", stack > 0);
+    if stack > 0 {
+        unsafe { THREAD_WROTE = 0 };
+        let mut tid_slot: i32 = 0;
+        let tid = lin::thread_create((stack as usize) + 0x8000, thread_body, 0, &mut tid_slot);
+        lin::check_true(&mut failed, b"clone(CLONE_THREAD) answered a tid", tid > 0);
+        let mut spins = 0usize;
+        while unsafe { THREAD_WROTE } == 0 && spins < 200_000 {
+            spins += 1;
+            lin::sched_yield();
+        }
+        lin::check_eq(
+            &mut failed,
+            b"the thread wrote into the caller's memory",
+            unsafe { THREAD_WROTE } as isize,
+            42,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"the thread tid was parked where the caller named",
+            tid_slot as isize,
+            tid,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"the thread knows its own tid",
+            unsafe { THREAD_TID } as isize,
+            tid,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"the thread answers the process's pid",
+            unsafe { THREAD_PID } as isize,
+            lin::getpid(),
+        );
+    }
 
     lin::done(failed)
 }

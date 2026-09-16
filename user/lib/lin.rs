@@ -544,6 +544,14 @@ pub fn exit_group(code: i32) -> ! {
     unreachable!("EXIT_GROUP never returns")
 }
 
+/// Leave, and only this thread. `exit(2)` ends the caller; its siblings in the
+/// same process carry on, which is the difference `pthread_exit` is made of.
+/// `exit_group` is the one that ends them all.
+pub fn exit(code: i32) -> ! {
+    sys1(nr::EXIT, code as usize);
+    unreachable!("EXIT never returns")
+}
+
 pub fn getpid() -> isize {
     sys0(nr::GETPID)
 }
@@ -587,6 +595,72 @@ pub fn sigaltstack(ss: *const StackT, old: *mut StackT) -> isize {
 
 pub fn arch_prctl(code: usize, addr: usize) -> isize {
     sys2(nr::ARCH_PRCTL, code, addr)
+}
+
+// Creating a thread has to be written in assembly, and this is why: the child
+// does not start at a function - it resumes at the *instruction after the
+// syscall*, on the stack its creator handed over. Every register and every
+// stack slot the calling function was using belongs to the caller's frame, so
+// a compiled wrapper that read them back would be reading its creator's stack.
+// A libc's `__clone` therefore lays what the thread needs at the top of the
+// new stack and lets the child pop it, and so does this one:
+//
+//   * `rdi` = flags, `rsi` = the new stack top (with entry and argument at it),
+//     `rdx` = the slot the child's tid is parked in;
+//   * the child (rax == 0 on return) pops the entry point and its argument,
+//     calls it - with the stack the caller chose - and leaves with `exit(2)`,
+//     which ends that thread and not the process.
+global_asm!(
+    ".globl mpos_thread_create",
+    "mpos_thread_create:",
+    "  mov r10, rdx",   // child_tid
+    "  xor edx, edx",   // no parent_tid slot
+    "  xor r8d, r8d",   // no TLS descriptor
+    "  mov eax, 56",    // SYS_clone
+    "  syscall",
+    "  test eax, eax",
+    "  jnz 1f",         // the parent returns with the tid
+    "  pop rax",        // the thread: entry point
+    "  pop rdi",        // and its argument
+    "  call rax",
+    "  xor edi, edi",
+    "  mov eax, 60",    // SYS_exit, this thread only
+    "  syscall",
+    "1: ret",
+);
+
+unsafe extern "C" {
+    fn mpos_thread_create(flags: usize, stack_top: usize, child_tid: usize) -> isize;
+}
+
+/// Start a thread that runs `entry(arg)` on `stack_top`.
+///
+/// `stack_top` is the first byte *past* the caller's mapping, and the two
+/// values the thread needs are written just below it: the red zone a function
+/// may use above its stack pointer has to stay inside the mapping, which is
+/// why an argument at the very edge is a fault and not a stack.
+pub fn thread_create(
+    stack_top: usize,
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+    tid_slot: *mut i32,
+) -> isize {
+    let top = (stack_top - 16) & !0xf;
+    unsafe {
+        let cells = top as *mut usize;
+        cells.write(entry as usize);
+        cells.add(1).write(arg);
+        mpos_thread_create(
+            nr::CLONE_VM
+                | nr::CLONE_FS
+                | nr::CLONE_FILES
+                | nr::CLONE_SIGHAND
+                | nr::CLONE_THREAD
+                | nr::CLONE_CHILD_SETTID,
+            top,
+            tid_slot as usize,
+        )
+    }
 }
 
 /// Register the clear-child-tid slot; the return is the thread id.
@@ -754,6 +828,12 @@ pub fn prlimit64(pid: i32, resource: i32, new: *const Rlimit, old: *mut Rlimit) 
 
 /// Ask which CPUs the caller may run on: fills the mask, returns the CPU
 /// count it covers.
+/// Give the CPU up, and let the scheduler choose again. A thread waiting for
+/// another one to make progress yields rather than spinning at full speed.
+pub fn sched_yield() -> isize {
+    sys0(nr::SCHED_YIELD)
+}
+
 pub fn sched_getaffinity(pid: i32, mask: *mut u64) -> isize {
     sys3(nr::SCHED_GETAFFINITY, pid as usize, 8, mask as usize)
 }

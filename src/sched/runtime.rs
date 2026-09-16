@@ -3380,6 +3380,17 @@ extern "C" fn task_entry(slot: usize) -> ! {
         exit(0);
     }
     if !resume.is_null() {
+        // A thread's first dispatch is worth a line while the path is new: the
+        // stack it resumes on is what the caller handed over, and getting that
+        // wrong shows up as a user fault on the thread's first push.
+        if with_table(|t| t.task(TaskId(slot)).tgid.0 != slot) {
+            crate::println!(
+                "[THREAD-START] slot={} rsp={:#x} rax={}",
+                slot,
+                unsafe { (*resume).rsp },
+                unsafe { (*resume).rax }
+            );
+        }
         // `clone(CLONE_CHILD_SETTID)` asked for the child's own tid to be
         // waiting where the child can read it. This runs on the child's address
         // space - the dispatcher has already loaded it - so the write lands

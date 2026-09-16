@@ -132,7 +132,9 @@ pub fn wait(address: usize, expected: u32) -> isize {
 
     if word_at(address) != expected {
         unregister(address, current);
-        return -crate::syscall::err::EAGAIN;
+        // The errno constants are already negative: negating one here would
+        // hand the caller +11 and turn "look again" into a nonsense success.
+        return crate::syscall::err::EAGAIN;
     }
 
     super::block_until(|| is_woken(address, current));
