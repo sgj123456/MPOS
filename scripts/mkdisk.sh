@@ -261,9 +261,15 @@ ROOTFS="$INITRAMFS_DIR" \
     ROOTFS_RELEASE="$(cat "$PACK/rootfs/etc/alpine-release" 2>/dev/null || echo "$ALPINE_BRANCH")" \
     sh "$ROOT/scripts/setup-initramfs.sh"
 
-# The init that runs, and the static apk the boot's ABI check runs: the
-# initramfs has no package store to consult for either.
-install -m 0755 "$ROOT/scripts/initramfs-init" "$INITRAMFS_DIR/init"
+# The init that runs. mkinitfs ships one - the distribution's own, which finds
+# the root device by listening for device events and mounting what
+# /proc/cmdline names - and that is the one this kernel now runs. The
+# hand-written script is the fallback for a tree from alpine-make-rootfs, which
+# has no init of its own.
+if [[ ! -f "$INITRAMFS_DIR/init" ]]; then
+    echo "initramfs: the producer shipped no /init; using scripts/initramfs-init"
+    install -m 0755 "$ROOT/scripts/initramfs-init" "$INITRAMFS_DIR/init"
+fi
 if [[ -f "$APK_BIN" ]]; then
     mkdir -p "$INITRAMFS_DIR/sbin"
     cp "$APK_BIN" "$INITRAMFS_DIR/sbin/apk"
