@@ -3344,6 +3344,12 @@ pub fn exit_group(code: isize) -> ! {
     exit(code)
 }
 
+/// Name where the running task's exit is announced: the address a leaving
+/// thread writes zero to and wakes, which is what a joiner sleeps on.
+pub fn set_clear_tid(address: usize) {
+    with_table(|t| t.task(t.current).mm.set_clear_tid(address));
+}
+
 /// The process id of the running task: the id of its thread group's leader.
 ///
 /// `getpid` answers this from every thread - a process has one pid however

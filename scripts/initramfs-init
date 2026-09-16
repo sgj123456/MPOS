@@ -26,6 +26,12 @@ mount -t ext2 /dev/vda3 /new_root
 
 echo "init: handing over"
 
+# Clean up initramfs artifacts before switching. switch_root should empty the
+# old root, but BusyBox's implementation may leave files behind. Remove known
+# artifacts so they do not appear in the new root's top level.
+rm -f /init /init.mkinitfs 2>/dev/null || true
+rm -rf /newroot 2>/dev/null || true
+
 # Hand the machine over. switch_root empties this root, chroots into the new
 # one and execs the given init as pid 1; OpenRC mounts /proc, /sys, /dev and
 # /run on the real root and starts the services from there.

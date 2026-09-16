@@ -304,6 +304,29 @@ pub(super) fn handle_getpid() -> isize {
     crate::sched::current_tgid().0 as isize
 }
 
+/// `gettid()` - the calling *thread*'s own id.
+///
+/// This used to be an alias for `getpid`, which was harmless while every
+/// process was one thread and became wrong the moment threads existed: a
+/// thread that asks its own id must not be told the process's.
+pub(super) fn handle_gettid() -> isize {
+    crate::sched::current().0 as isize
+}
+
+/// `set_tid_address(tidptr)` - name where this thread's exit is announced.
+///
+/// It answers the caller's tid, and remembers the address: a thread that
+/// leaves writes zero there and wakes whoever waits on it
+/// (`CLONE_CHILD_CLEARTID` and `set_tid_address` are the same promise made two
+/// ways, which is why a libc uses one for the threads it creates and the other
+/// for the thread it started as).
+pub(super) fn handle_set_tid_address(args: [usize; ARG_COUNT]) -> isize {
+    if args[0] != 0 {
+        crate::sched::set_clear_tid(args[0]);
+    }
+    crate::sched::current().0 as isize
+}
+
 /// `wait4(pid, status, options)` — collect a child's exit.
 ///
 /// Linux's contract, which this follows: the *return value* is the pid of the

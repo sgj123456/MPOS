@@ -1007,12 +1007,20 @@ pub(super) fn handle_chroot(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
 /// them and reads back what it wrote. `F_GETFL` answers `O_RDONLY` - opens
 /// here are untyped - and `F_SETFL` accepts and forgets. A command Linux has
 /// no meaning for answers `EINVAL`, not success.
+///
+/// `F_GETLK`/`F_SETLK`/`F_SETLKW` are permissive stubs: this kernel has one
+/// user and, in practice, one locker at a time, so every lock is granted and
+/// every unlock is a no-op. `apk` and other tools that use `fcntl` record
+/// locking need these to succeed rather than return `EINVAL`.
 pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
     const F_DUPFD: usize = 0;
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
     const F_GETFL: usize = 3;
     const F_SETFL: usize = 4;
+    const F_GETLK: usize = 5;
+    const F_SETLK: usize = 6;
+    const F_SETLKW: usize = 7;
     const FD_CLOEXEC: u32 = 1;
 
     let (fd, cmd, arg) = (args[0] as i32, args[1], args[2]);
@@ -1063,6 +1071,27 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
             }
             Err(e) => err_of(e),
         },
+        // POSIX record locking: permissive stubs. `F_GETLK` reports no lock
+        // held; `F_SETLK` and `F_SETLKW` always succeed. This matches the
+        // single-locker reality of the kernel and lets `apk`'s database lock
+        // acquire succeed.
+        F_GETLK => {
+            // Fill the `struct flock` with "no lock" (F_UNLCK = 2).
+            if arg != 0 {
+                if !crate::syscall::buffer_ok(arg, 32, true, true) {
+                    return err::EFAULT;
+                }
+                // struct flock on x86_64: l_type(i16) + l_whence(i16) + pad(4)
+                // + l_start(i64) + l_len(i64) + l_pid(i32) = 32 bytes.
+                // l_type = F_UNLCK (2), rest zeroed.
+                unsafe {
+                    core::ptr::write_bytes(arg as *mut u8, 0, 32);
+                    (arg as *mut u16).write_volatile(2); // F_UNLCK
+                }
+            }
+            0
+        }
+        F_SETLK | F_SETLKW => 0, // always succeed: single-locker system
         _ => err::EINVAL,
     }
 }

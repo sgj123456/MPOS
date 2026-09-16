@@ -119,7 +119,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // options from slot 2.
         nr::WAIT4 => proc::handle_wait(args, from_user),
         nr::GETPID => proc::handle_getpid(),
-        nr::GETTID => proc::handle_getpid(),
+        nr::GETTID => proc::handle_gettid(),
         nr::GETPPID => proc::handle_getppid(),
         nr::SCHED_YIELD => proc::handle_yield(),
         nr::NANOSLEEP => proc::handle_nanosleep(args, from_user),
@@ -182,7 +182,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::GETRANDOM => proc::handle_getrandom(args, true),
         nr::PRLIMIT64 => proc::handle_prlimit64(args, true),
         nr::FUTEX => proc::handle_futex(args),
-        nr::SET_TID_ADDRESS => proc::handle_getpid(),
+        nr::SET_TID_ADDRESS => proc::handle_set_tid_address(args),
         nr::SCHED_GETAFFINITY => proc::handle_sched_getaffinity(args),
         nr::SET_ROBUST_LIST => proc::handle_set_robust_list(args),
         nr::RSEQ => proc::handle_rseq(args),

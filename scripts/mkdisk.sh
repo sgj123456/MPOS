@@ -58,9 +58,13 @@ fi
 # holds what is *built* - the user programs, the unpacked root filesystem and
 # the seed tree - and `tree` is the ESP itself, which ends up on the disk
 # verbatim.
-PACK="$ROOT/build/pack-$ARCH"
-ESP_TREE="$ROOT/build/esp-tree-$ARCH"
-BOOT_TREE="$ROOT/build/boot-tree-$ARCH"
+# Where the build goes. It defaults to `build/` beside the source, and can be
+# pointed elsewhere - a slower disk, a directory that is already writable, a
+# tree outside the repository - with MPOS_BUILD_DIR.
+BUILD="${MPOS_BUILD_DIR:-$ROOT/build}"
+PACK="$BUILD/pack-$ARCH"
+ESP_TREE="$BUILD/esp-tree-$ARCH"
+BOOT_TREE="$BUILD/boot-tree-$ARCH"
 rm -rf "$PACK" "$ESP_TREE" "$BOOT_TREE"
 mkdir -p "$PACK" "$ESP_TREE/EFI/BOOT" "$BOOT_TREE/boot"
 

@@ -50,6 +50,9 @@ http://dl-cdn.alpinelinux.org/alpine/v3.24/main
 http://dl-cdn.alpinelinux.org/alpine/v3.24/community
 EOF
 
+# apk needs /var/cache/apk for its lock file and package cache.
+mkdir -p "$ROOTFS/var/cache/apk" "$ROOTFS/var/lib/apk"
+
 # The boot runlevel: the services that mount the canonical directories and
 # bring the machine's self-image up. devfs mounts /dev, procfs /proc, sysfs
 # /sys; OpenRC itself mounts /run before any of them; localmount works
