@@ -7,7 +7,6 @@
 #   Partition 3: Root (256 MiB, ext2) - root filesystem
 #   Partition 4: Data (8 MiB, ext2) - mounted at /mnt
 #
-# ARCH selects the target: x86_64 (default), aarch64.
 # PROFILE=release builds an optimised image.
 set -euo pipefail
 
@@ -23,14 +22,10 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-ARCH="${ARCH:-x86_64}"
+ARCH="x86_64"
 PROFILE="${PROFILE:-debug}"
 
-case "$ARCH" in
-    x86_64)  TRIPLE="x86_64-unknown-none" ;;
-    aarch64) TRIPLE="aarch64-unknown-none" ;;
-    *) echo "unknown ARCH: $ARCH (want x86_64|aarch64)" >&2; exit 1 ;;
-esac
+TRIPLE="x86_64-unknown-none"
 
 if [[ "$PROFILE" == "release" ]]; then
     cargo build --release --target "$TRIPLE"
@@ -38,19 +33,16 @@ else
     cargo build --target "$TRIPLE"
 fi
 
-KERNEL="target/$TRIPLE/$PROFILE/mpos"
+# Cargo puts artefacts in ./target unless CARGO_TARGET_DIR says otherwise -
+# which is how a build on a slow or read-only tree points them elsewhere.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+KERNEL="$TARGET_DIR/$TRIPLE/$PROFILE/mpos"
 if [[ ! -f "$KERNEL" ]]; then
     echo "error: expected kernel at $KERNEL" >&2
     exit 1
 fi
 
 mkdir -p build
-
-if [[ "$ARCH" != "x86_64" ]]; then
-    cp "$KERNEL" "build/mpos-$ARCH.elf"
-    echo "built build/mpos-$ARCH.elf"
-    exit 0
-fi
 
 "$ROOT/scripts/fetch-limine.sh"
 
@@ -123,8 +115,8 @@ done
 #              made through `mount(2)` against the device nodes the devfs
 #              publishes.
 #
-# Both runs execute a setup script (below) with $ROOTFS pointed at the tree;
-# no chroot, so the only privilege used is that the files are owned by root.
+# No chroot is used, so the only privilege needed is that the files are owned
+# by root.
 ALPINE_BRANCH=v3.24
 ALPINE_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/alpine
 MAKE_ROOTFS="$ROOT/alpine-make-rootfs/alpine-make-rootfs"
@@ -149,15 +141,6 @@ if [[ -z "$APK_BIN" ]]; then
 fi
 export APK="$APK_BIN"
 export APK_OPTS=""
-# The guest's network path, when the build host reaches the network through a
-# loopback proxy: setup-rootfs.sh writes it into /etc/profile for the guest.
-# `${http_proxy:-}` because the build may run with the variable unset, and
-# `set -u` turns an unbound reference into an error.
-if [[ -n "${http_proxy:-}" ]]; then
-    export GUEST_HTTP_PROXY_PORT="${http_proxy##*:}"
-else
-    export GUEST_HTTP_PROXY_PORT=""
-fi
 
 # The user programs the sweep runs come from the workspace: mpos-native
 # no_std forms and, for the migrated tests, real musl binaries speaking std
@@ -165,7 +148,7 @@ fi
 # and a booted machine wants its own tests on hand.
 USER_TARGET="x86_64-unknown-linux-musl"
 cargo build --release -p mpos-user --target "$USER_TARGET"
-USER_BINS="target/$USER_TARGET/release"
+USER_BINS="$TARGET_DIR/$USER_TARGET/release"
 
 copy_programs() {
     local dest="$1"
@@ -195,6 +178,13 @@ copy_programs() {
 }
 
 # --- rootfs -----------------------------------------------------------------
+# A rootfs image to use verbatim: same idea as MPOS_INITRAMFS_TREE, for the
+# other half. The tree build and mke2fs run are skipped entirely.
+ROOTFS_MIB=384
+if [[ -n "${MPOS_ROOTFS_IMAGE:-}" ]]; then
+    ROOTFS_IMG="${MPOS_ROOTFS_IMAGE}"
+    echo "rootfs: reusing the image at $ROOTFS_IMG"
+else
 ROOTFS="$PACK/rootfs"
 # The previous run's tree is root-owned with a 0700 /root (Alpine's own
 # baselayout), which makes cleaning it up depend on who is running this. Make
@@ -204,10 +194,66 @@ rm -rf "$ROOTFS"
 sh "$MAKE_ROOTFS" \
     --branch "$ALPINE_BRANCH" \
     --mirror-uri "$ALPINE_MIRROR" \
-    --packages "openrc" \
-    "$ROOTFS" "$ROOT/scripts/setup-rootfs.sh"
+    --packages "openrc alpine-release ssl_client ca-certificates apk-tools" \
+    "$ROOTFS"
 
 copy_programs "$ROOTFS"
+
+# mpos: serial console and unlocked root login.
+#
+# The stock inittab respawns gettys on virtual consoles this machine does not
+# have as separate devices - busybox init's respawn entries fail six times and
+# back off for five minutes, and the serial port sits with no login prompt on
+# it. Root ships password-locked (`*`), and /etc/securetty lists tty names
+# this kernel's ttyname(2) cannot answer yet, so login would refuse root
+# while calling it a wrong password. One line, an empty password field, and
+# no securetty: root logs in on ttyS0 with nothing to type.
+cat > "$ROOTFS/etc/inittab" <<'EOT'
+# /etc/inittab - serial-console edition for mpos
+
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+# Put a getty on the serial port
+ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100
+
+# Stuff to do for the 3-finger salute
+::ctrlaltdel:/sbin/reboot
+
+# Stuff to do before rebooting
+::shutdown:/sbin/openrc shutdown
+EOT
+sed -i 's/^root:[^:]*:/root::/' "$ROOTFS/etc/shadow"
+rm -f "$ROOTFS/etc/securetty"
+# The data-partition mountpoint the initramfs's move-mount pass asks for.
+mkdir -p "$ROOTFS/mnt"
+
+# OpenRC refuses to start any runlevel service whose script is not
+# executable - and answers 0, so the failure is silent: `root` (whose whole
+# job is remounting / read-write) never runs and every write answers EROFS.
+# The tree alpine-make-rootfs produces loses the exec bit somewhere between
+# apk and the image, so restore it here.
+chmod +x "$ROOTFS"/etc/init.d/* 2>/dev/null || true
+
+# No runlevel services are linked. OpenRC 0.63's service execution deadlocks
+# on this kernel after the first real service runs - the fork/waitpid chain
+# between openrc-run and the service's child shell never completes - so any
+# service linked here freezes the boot after sysinit's built-in mounts.
+# Everything these services would do is already handled: /dev comes up via
+# the initramfs's devtmpfs, and the root is mounted writable by the kernel
+# command line (`rootflags=rw`), which is what the `root` service would do.
+# Reviving them means finding why openrc-run never reaps its child shells.
+
+# The resolver config musl reads. QEMU's user network serves DNS on a fixed
+# address - without this file getaddrinfo has no nameserver to ask and every
+# hostname resolves to `bad address`.
+mkdir -p "$ROOTFS/etc"
+cat > "$ROOTFS/etc/resolv.conf" <<'EOT'
+# QEMU user networking's built-in forwarder.
+nameserver 10.0.2.3
+EOT
+fi
 
 # --- initramfs --------------------------------------------------------------
 #
@@ -221,12 +267,11 @@ copy_programs "$ROOTFS"
 #   * mkinitfs writes a gzipped cpio archive, and this kernel's unpacker reads
 #     ustar. The archive is extracted on the host and repacked below.
 #   * its /init finds the root device over netlink uevents and mounts what
-#     /proc/cmdline names. This kernel has no uevent socket, so the /init that
-#     runs is scripts/initramfs-init - injected here, with mkinitfs's own kept
-#     at /init.mkinitfs for the day that changes.
+#     /proc/cmdline names. This kernel has no uevent socket; that init is what
+#     runs, against the devfs the kernel publishes.
 #
 # Without a docker daemon the tree is built by alpine-make-rootfs instead: the
-# same shape, a different producer, and the same injected init.
+# same shape, a different producer.
 if [[ -n "${MPOS_INITRAMFS_DIR:-}" ]]; then
     INITRAMFS_DIR="$(mktemp -d "${MPOS_INITRAMFS_DIR%/}.XXXXXX")"
 else
@@ -235,12 +280,19 @@ else
 fi
 mkdir -p "$INITRAMFS_DIR"
 
-DOCKER_OUT="$PACK/docker"
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+# An initramfs tree to use verbatim: one built earlier by this same script (or
+# by the distribution's own mkinitfs), reused while the kernel is what is
+# actually being iterated on.
+DOCKER_OUT=$ROOT/build/docker_out
+if [[ -n "${MPOS_INITRAMFS_TREE:-}" ]]; then
+    echo "initramfs: reusing the tree at $MPOS_INITRAMFS_TREE"
+    cp -a "${MPOS_INITRAMFS_TREE%/}/." "$INITRAMFS_DIR/"
+elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo "initramfs: mkinitfs, in alpine:$ALPINE_BRANCH"
     rm -rf "$DOCKER_OUT"
     mkdir -p "$DOCKER_OUT"
     docker run --rm -v "$DOCKER_OUT:/out" "alpine:latest" sh -euxc '
+        printf "%s\n" "'"$ALPINE_MIRROR"'/'"$ALPINE_BRANCH"'/main" > /etc/apk/repositories
         apk add --no-cache mkinitfs
         # The kernel-version argument names where modules would be read from.
         # This kernel has none, and an empty directory is enough for mkinitfs
@@ -259,21 +311,6 @@ else
         "$INITRAMFS_DIR"
 fi
 
-# The canonical directories, the parking place for the real root, the release
-# stamp the boot's own check reads, and mkinitfs's init kept aside.
-ROOTFS="$INITRAMFS_DIR" \
-    ROOTFS_RELEASE="$(cat "$PACK/rootfs/etc/alpine-release" 2>/dev/null || echo "$ALPINE_BRANCH")" \
-    sh "$ROOT/scripts/setup-initramfs.sh"
-
-# The init that runs. mkinitfs ships one - the distribution's own, which finds
-# the root device by listening for device events and mounting what
-# /proc/cmdline names - and that is the one this kernel now runs. The
-# hand-written script is the fallback for a tree from alpine-make-rootfs, which
-# has no init of its own.
-if [[ ! -f "$INITRAMFS_DIR/init" ]]; then
-    echo "initramfs: the producer shipped no /init; using scripts/initramfs-init"
-    install -m 0755 "$ROOT/scripts/initramfs-init" "$INITRAMFS_DIR/init"
-fi
 if [[ -f "$APK_BIN" ]]; then
     mkdir -p "$INITRAMFS_DIR/sbin"
     cp "$APK_BIN" "$INITRAMFS_DIR/sbin/apk"
@@ -285,7 +322,7 @@ copy_programs "$INITRAMFS_DIR"
 tar --format=ustar --owner=root --group=root --numeric-owner \
     -cf "$BOOT_TREE/boot/initramfs.tar" -C "$INITRAMFS_DIR" .
 chmod -R a+rwX "$INITRAMFS_DIR" 2>/dev/null || true
-rm -rf "$INITRAMFS_DIR" "$DOCKER_OUT" 2>/dev/null || true
+rm -rf "$INITRAMFS_DIR" "${DOCKER_OUT:-}" 2>/dev/null || true
 
 # The ESP carries only the bootloader and its config. Limine looks for
 # limine.conf in the ESP root.
@@ -300,11 +337,12 @@ cp limine.conf "$BOOT_TREE/limine.conf"
 # The root filesystem image: the tree alpine-make-rootfs built, laid down at
 # format time by mke2fs. 384 MiB - a full Alpine with OpenRC and the test
 # programs wants more than the 256 the minirootfs got.
-ROOTFS_MIB=384
-ROOTFS_IMG="build/rootfs-$ARCH.img"
-rm -f "$ROOTFS_IMG"
-mke2fs -q -F -t ext2 -b 4096 -I 256 -d "$ROOTFS" "$ROOTFS_IMG" $((ROOTFS_MIB * 1024 / 4))
-rm -rf "$ROOTFS"
+if [[ -z "${MPOS_ROOTFS_IMAGE:-}" ]]; then
+    ROOTFS_IMG="build/rootfs-$ARCH.img"
+    rm -f "$ROOTFS_IMG"
+    mke2fs -q -F -t ext2 -b 4096 -I 256 -d "$ROOTFS" "$ROOTFS_IMG" $((ROOTFS_MIB * 1024 / 4))
+    rm -rf "$ROOTFS"
+fi
 
 # The data partition: a small ext2 image holding seed files laid down by
 # mke2fs on the host, so the kernel reads something it did not write before

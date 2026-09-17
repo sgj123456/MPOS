@@ -37,9 +37,15 @@ pub trait CharDevice: Send + Sync {
 struct DevNode {
     ino: Ino,
     dev: Arc<dyn CharDevice>,
+    /// The device number `st_rdev` reports - the identity libc's `ttyname`
+    /// matches descriptors by when it walks `/dev`.
+    dev_id: (u32, u32),
 }
 
 impl Inode for DevNode {
+    fn rdev(&self) -> Option<(u32, u32)> {
+        Some(self.dev_id)
+    }
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -92,7 +98,20 @@ impl Inode for DevBlockNode {
             return Ok(0);
         }
         let len = buf.len().min((end - offset) as usize);
-        self.dev.read_at(offset, &mut buf[..len]);
+        if len == 0 {
+            return Ok(0);
+        }
+        // A block device moves whole sectors from a sector boundary, and a
+        // caller reading one does not: probing a filesystem reads the few
+        // hundred bytes of a superblock out of the middle of the first
+        // sector. The sector-sized window covering the request is read, and
+        // the part that was asked for is copied out of it.
+        let (first, covered) = window_for(offset, len as u64, end);
+        let mut window = Vec::new();
+        window.resize(covered as usize, 0);
+        self.dev.read_at(first, &mut window);
+        let from = (offset - first) as usize;
+        buf[..len].copy_from_slice(&window[from..from + len]);
         Ok(len)
     }
 
@@ -102,15 +121,43 @@ impl Inode for DevBlockNode {
             return Err(VfsError::NoSpace);
         }
         let len = buf.len().min((end - offset) as usize);
-        self.dev.write_at(offset, &buf[..len]);
+        if len == 0 {
+            return Ok(0);
+        }
+        // The read twin of the window above, with the same reason: a write
+        // that does not cover whole sectors has to read them first, or it
+        // would erase the bytes around what it was given.
+        let (first, covered) = window_for(offset, len as u64, end);
+        let mut window = Vec::new();
+        window.resize(covered as usize, 0);
+        let at = (offset - first) as usize;
+        self.dev.read_at(first, &mut window);
+        window[at..at + len].copy_from_slice(&buf[..len]);
+        self.dev.write_at(first, &window);
         Ok(len)
     }
+}
+
+/// A sector, the unit a block device moves.
+const SECTOR: u64 = 512;
+
+/// The sector-aligned window that covers `offset..offset + len` of a device
+/// whose last byte is at `end`: where it starts and how many bytes it holds.
+///
+/// Both answers are in whole sectors because that is the only shape the
+/// device underneath accepts, and the window is clipped to the device because
+/// a read of its last partial sector must not ask for the sector after it.
+fn window_for(offset: u64, len: u64, end: u64) -> (u64, u64) {
+    let first = offset - offset % SECTOR;
+    let last = offset + len;
+    let wanted = last + (SECTOR - last % SECTOR) % SECTOR;
+    (first, (wanted.min(end) - first).max(SECTOR))
 }
 
 /// The one directory, holding every device by name.
 struct DevRoot {
     inodes: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
-    next_ino: AtomicU64,
+    next_ino: Arc<AtomicU64>,
 }
 
 impl Inode for DevRoot {
@@ -136,10 +183,181 @@ impl Inode for DevRoot {
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
         critical_section::with(|cs| {
             let inodes = self.inodes.borrow(cs).borrow();
+            // The kind each name actually carries: a listing that calls the
+            // directories char devices is how `ls /dev` lies.
             Ok(inodes
-                .keys()
-                .map(|name| (name.clone(), NodeKind::CharDev))
+                .iter()
+                .map(|(name, node)| (name.clone(), node.metadata().kind))
                 .collect())
+        })
+    }
+
+    /// Make a directory under `/dev`. Real devtmpfs lets userland make
+    /// directories too - `mkdir` answered ENOSYS here, and the script Alpine's
+    /// mdev runs for every hotplugged disk builds `/dev/block` and
+    /// `/dev/disk` before it links anything into them, so its whole
+    /// persistent-name pass died one syscall in.
+    fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+        if kind != NodeKind::Dir {
+            return Err(VfsError::Unsupported);
+        }
+        critical_section::with(|cs| {
+            let mut inodes = self.inodes.borrow(cs).borrow_mut();
+            if inodes.contains_key(name) {
+                return Err(VfsError::Exists);
+            }
+            let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+            let node: Arc<dyn Inode> = Arc::new(DevDirNode {
+                ino,
+                children: Mutex::new(RefCell::new(BTreeMap::new())),
+                next_ino: self.next_ino.clone(),
+            });
+            inodes.insert(String::from(name), node.clone());
+            Ok(node)
+        })
+    }
+
+    /// Name a symbolic link under `/dev`. mdev's persistent-storage script
+    /// links every hotplugged disk into `/dev/block` and `/dev/disk` - without
+    /// this the whole pass died on the first `ln -sf`.
+    fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+        critical_section::with(|cs| {
+            let mut inodes = self.inodes.borrow(cs).borrow_mut();
+            if inodes.contains_key(name) {
+                return Err(VfsError::Exists);
+            }
+            let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+            let node: Arc<dyn Inode> = Arc::new(DevSymlinkNode {
+                ino,
+                target: String::from(target),
+            });
+            inodes.insert(String::from(name), node.clone());
+            Ok(node)
+        })
+    }
+
+    /// Drop the child called `name`. `rm -f` in mdev's link script needs this,
+    /// and a name that was registered by a driver goes with it - the driver
+    /// still owns the device, the name was just one way to reach it.
+    fn unlink(&self, name: &str) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            self.inodes
+                .borrow(cs)
+                .borrow_mut()
+                .remove(name)
+                .map(|_| ())
+                .ok_or(VfsError::NoEntry)
+        })
+    }
+}
+
+/// A symbolic link under `/dev`, as mdev's persistent-name pass makes: the
+/// target is a path, carried verbatim for [`Inode::readlink`].
+struct DevSymlinkNode {
+    ino: Ino,
+    target: String,
+}
+
+impl Inode for DevSymlinkNode {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::Symlink,
+            size: self.target.len() as u64,
+        }
+    }
+
+    fn readlink(&self) -> VfsResult<String> {
+        Ok(self.target.clone())
+    }
+}
+
+/// A plain directory under `/dev` - `/dev/pts`, `/dev/shm` - which exists to
+/// be a mountpoint, and the subdirectories mdev makes below `/dev/disk`.
+/// Mountpoint directories hold nothing and refuse every name: what lands on
+/// them is a whole filesystem. The ones userland creates hold children, so
+/// the node carries a table and answers lookups, creation, linking and
+/// unlinking for them.
+struct DevDirNode {
+    ino: u64,
+    children: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
+    next_ino: Arc<AtomicU64>,
+}
+
+impl Inode for DevDirNode {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::Dir,
+            size: 0,
+        }
+    }
+
+    fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
+        critical_section::with(|cs| {
+            self.children
+                .borrow(cs)
+                .borrow()
+                .get(name)
+                .cloned()
+                .ok_or(VfsError::NoEntry)
+        })
+    }
+
+    fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
+        critical_section::with(|cs| {
+            let children = self.children.borrow(cs).borrow();
+            Ok(children
+                .iter()
+                .map(|(name, node)| (name.clone(), node.metadata().kind))
+                .collect())
+        })
+    }
+
+    fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+        if kind != NodeKind::Dir {
+            return Err(VfsError::Unsupported);
+        }
+        critical_section::with(|cs| {
+            let mut children = self.children.borrow(cs).borrow_mut();
+            if children.contains_key(name) {
+                return Err(VfsError::Exists);
+            }
+            let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+            let node: Arc<dyn Inode> = Arc::new(DevDirNode {
+                ino,
+                children: Mutex::new(RefCell::new(BTreeMap::new())),
+                next_ino: self.next_ino.clone(),
+            });
+            children.insert(String::from(name), node.clone());
+            Ok(node)
+        })
+    }
+
+    fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+        critical_section::with(|cs| {
+            let mut children = self.children.borrow(cs).borrow_mut();
+            if children.contains_key(name) {
+                return Err(VfsError::Exists);
+            }
+            let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+            let node: Arc<dyn Inode> = Arc::new(DevSymlinkNode {
+                ino,
+                target: String::from(target),
+            });
+            children.insert(String::from(name), node.clone());
+            Ok(node)
+        })
+    }
+
+    fn unlink(&self, name: &str) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            self.children
+                .borrow(cs)
+                .borrow_mut()
+                .remove(name)
+                .map(|_| ())
+                .ok_or(VfsError::NoEntry)
         })
     }
 }
@@ -154,7 +372,7 @@ impl DevFs {
         Arc::new(DevFs {
             root: Arc::new(DevRoot {
                 inodes: Mutex::new(RefCell::new(BTreeMap::new())),
-                next_ino: AtomicU64::new(1),
+                next_ino: Arc::new(AtomicU64::new(1)),
             }),
         })
     }
@@ -167,8 +385,19 @@ impl DevFs {
     /// learns about it from the event, and a device that is never announced
     /// is one nothing can find.
     pub fn register(&self, name: &str, dev: Arc<dyn CharDevice>) {
+        self.register_id(name, dev, 0, 0)
+    }
+
+    /// [`register`](Self::register) with the device number the node reports
+    /// as `st_rdev` - the tty names need real ones, because libc's `ttyname`
+    /// identifies a descriptor by matching the number against `/dev`'s nodes.
+    pub fn register_id(&self, name: &str, dev: Arc<dyn CharDevice>, major: u32, minor: u32) {
         let ino = self.root.next_ino.fetch_add(1, Ordering::Relaxed);
-        let node: Arc<dyn Inode> = Arc::new(DevNode { ino, dev });
+        let node: Arc<dyn Inode> = Arc::new(DevNode {
+            ino,
+            dev,
+            dev_id: (major, minor),
+        });
         critical_section::with(|cs| {
             let prev = self
                 .root
@@ -179,6 +408,46 @@ impl DevFs {
             assert!(prev.is_none(), "device {name} registered twice");
         });
         announce(name, subsystem_of(name), 0, 0);
+    }
+
+    /// Add an empty directory under `name`, for the mountpoints userland
+    /// expects `/dev` to carry: an init mounting devpts asks for `/dev/pts`
+    /// the way it asks for `/proc`, and a devtmpfs that cannot hold the
+    /// directory sends it looking for a tmpfs to mount a devpts on.
+    pub fn register_dir(&self, name: &str) {
+        let ino = self.root.next_ino.fetch_add(1, Ordering::Relaxed);
+        let node: Arc<dyn Inode> = Arc::new(DevDirNode {
+            ino,
+            children: Mutex::new(RefCell::new(BTreeMap::new())),
+            next_ino: self.root.next_ino.clone(),
+        });
+        critical_section::with(|cs| {
+            let prev = self
+                .root
+                .inodes
+                .borrow(cs)
+                .borrow_mut()
+                .insert(String::from(name), node);
+            assert!(prev.is_none(), "device {name} registered twice");
+        });
+    }
+
+    /// Add an already-built inode under `name`.
+    ///
+    /// The tty is the reason this exists: a real devfs's tty names are all
+    /// doors into one line discipline, whose termios and `as_tty` behaviour a
+    /// bare character-device wrapper cannot answer - getty's `TIOCSCTTY`,
+    /// a shell's `TCGETS` and every `isatty` ask the node itself.
+    pub fn register_node(&self, name: &str, inode: Arc<dyn Inode>) {
+        critical_section::with(|cs| {
+            let prev = self
+                .root
+                .inodes
+                .borrow(cs)
+                .borrow_mut()
+                .insert(String::from(name), inode);
+            assert!(prev.is_none(), "device {name} registered twice");
+        });
     }
 
     /// Add a block device under `name` - the disk itself, or one partition of

@@ -1300,6 +1300,15 @@ impl Inode for Tty {
         Some(self)
     }
 
+    /// The tty device number, as libc's `ttyname` matches descriptors by: it
+    /// walks `/dev` fstat-ing every node and comparing this number. One line
+    /// discipline fronts every tty name on this machine, so they all carry
+    /// one number - `ttyS0`'s - and the name login prints is whichever node
+    /// the walk meets first.
+    fn rdev(&self) -> Option<(u32, u32)> {
+        Some((4, 64))
+    }
+
     fn poll_ready(&self) -> Ready {
         Ready {
             // A completed line is what a read takes. Bytes still being typed

@@ -34,12 +34,76 @@ const DEVICE_BLK: u16 = 0x1001;
 /// A block, as the device counts them.
 const SECTOR: u64 = 512;
 
+/// Sectors a bounce buffer holds. Four of them - 2 KiB - which is what the
+/// probing reads that land here actually ask for, and small enough to sit on a
+/// 16 KiB kernel stack without a thought.
+const BOUNCE_SECTORS: usize = 4;
+
 pub struct VirtioBlk {
     /// The device, behind a lock: a request needs the crate's `&mut`, and
     /// [`BlockDev`] hands out `&self` because a filesystem takes the whole
     /// device and shares it with everyone it mounts it for.
     device: Mutex<RefCell<VirtIOBlk<HalImpl, PciTransport>>>,
     sectors: u64,
+}
+
+impl VirtioBlk {
+    /// Whether `ptr` names memory a request can hand to the device.
+    ///
+    /// A descriptor carries a *physical* address, and only the direct map
+    /// turns a virtual one into that, by subtraction. Anything else is not
+    /// merely unmappable but unshareable: a user buffer is scattered across
+    /// physical pages that were handed out one at a time, so even an address
+    /// that translated would send the device to the wrong place. The syscalls
+    /// do hand user buffers down - `read`, `readv` and `pread64` pass the
+    /// caller's pointer straight to the filesystem, and a block *device* is
+    /// read with no filesystem in between to break the fall.
+    fn dma_safe(ptr: *const u8) -> bool {
+        ptr as usize >= crate::mm::hhdm_offset()
+    }
+
+    /// Move `buf.len()` bytes at `offset` through the device, in pieces no
+    /// larger than the bounce buffer, for a caller whose memory the device
+    /// cannot reach.
+    fn read_at_bounced(&self, offset: u64, buf: &mut [u8]) {
+        let mut bounce = [0u8; SECTOR as usize * BOUNCE_SECTORS];
+        let mut done = 0;
+        while done < buf.len() {
+            let chunk = (buf.len() - done).min(bounce.len());
+            self.read_dma(offset + done as u64, &mut bounce[..chunk]);
+            buf[done..done + chunk].copy_from_slice(&bounce[..chunk]);
+            done += chunk;
+        }
+    }
+
+    fn write_at_bounced(&self, offset: u64, buf: &[u8]) {
+        let mut bounce = [0u8; SECTOR as usize * BOUNCE_SECTORS];
+        let mut done = 0;
+        while done < buf.len() {
+            let chunk = (buf.len() - done).min(bounce.len());
+            bounce[..chunk].copy_from_slice(&buf[done..done + chunk]);
+            self.write_dma(offset + done as u64, &bounce[..chunk]);
+            done += chunk;
+        }
+    }
+
+    fn read_dma(&self, offset: u64, buf: &mut [u8]) {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            device
+                .read_blocks((offset / SECTOR) as usize, buf)
+                .expect("virtio-blk reported a read error");
+        });
+    }
+
+    fn write_dma(&self, offset: u64, buf: &[u8]) {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            device
+                .write_blocks((offset / SECTOR) as usize, buf)
+                .expect("virtio-blk reported a write error");
+        });
+    }
 }
 
 impl BlockDev for VirtioBlk {
@@ -63,12 +127,11 @@ impl BlockDev for VirtioBlk {
             "virtio-blk read of {count} sectors at {first} runs past the {}-sector device",
             self.sectors
         );
-        critical_section::with(|cs| {
-            let mut device = self.device.borrow(cs).borrow_mut();
-            device
-                .read_blocks((offset / SECTOR) as usize, buf)
-                .expect("virtio-blk reported a read error");
-        });
+        if !Self::dma_safe(buf.as_ptr()) {
+            self.read_at_bounced(offset, buf);
+            return;
+        }
+        self.read_dma(offset, buf);
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) {
@@ -77,12 +140,11 @@ impl BlockDev for VirtioBlk {
             "virtio-blk write {offset:#x}+{} breaks the sector contract",
             buf.len()
         );
-        critical_section::with(|cs| {
-            let mut device = self.device.borrow(cs).borrow_mut();
-            device
-                .write_blocks((offset / SECTOR) as usize, buf)
-                .expect("virtio-blk reported a write error");
-        });
+        if !Self::dma_safe(buf.as_ptr()) {
+            self.write_at_bounced(offset, buf);
+            return;
+        }
+        self.write_dma(offset, buf);
     }
 }
 

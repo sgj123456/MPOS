@@ -994,6 +994,27 @@ impl FileSystem for Ext2Fs {
     fn set_read_only(&self, read_only: bool) {
         self.core.set_read_only(read_only);
     }
+
+    fn statfs(&self) -> Option<crate::vfs::FsStats> {
+        // The free counters live on the group descriptors, the same place
+        // every allocation bumps them (`bump_free`), so a df right after a
+        // write storm reads what is actually on the disk.
+        let mut free_blocks = 0u64;
+        let mut free_inodes = 0u64;
+        for g in 0..self.core.groups {
+            let desc = self.core.group(g);
+            free_blocks += desc.free_blocks as u64;
+            free_inodes += desc.free_inodes as u64;
+        }
+        Some(crate::vfs::FsStats {
+            bsize: self.core.block_size() as u64,
+            blocks: self.core.sb.blocks_count as u64,
+            bfree: free_blocks,
+            bavail: free_blocks,
+            files: self.core.sb.inodes_count as u64,
+            ffree: free_inodes,
+        })
+    }
 }
 
 impl Ext2Fs {
@@ -1062,12 +1083,16 @@ impl Inode for Ext2Ino {
         Metadata {
             ino: self.ino as Ino,
             kind,
-            size: if kind == NodeKind::Dir {
-                0
-            } else {
-                data.size as u64
-            },
+            // The directory's inode size - the byte length of its dirent
+            // blocks - is what Linux's own ext2 reports, and what `ls -l`
+            // prints. Zeroing it made every directory read as empty of
+            // content as a stat could suggest.
+            size: data.size as u64,
         }
+    }
+
+    fn mode(&self) -> u32 {
+        (self.fs.read_inode(self.ino).mode as u32) & 0o7777
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
@@ -1218,6 +1243,35 @@ impl Inode for Ext2Ino {
         self.fs.dir_add(&mut dir, name, child, FT_SYMLINK)?;
         self.fs.write_inode(self.ino, &dir);
         Ok(self.wrap(child))
+    }
+
+    /// Hard-link `target` under `name`: the directory gains an entry naming
+    /// an inode that already exists, and that inode's link count goes up.
+    /// The one rule ext2 enforces where Linux enforces it too: no second
+    /// name for a directory, or the tree would grow cycles it cannot walk.
+    fn link(&self, name: &str, target: &Arc<dyn Inode>) -> VfsResult<()> {
+        self.fs.writable()?;
+        self.require_dir()?;
+        let mut dir = self.fs.read_inode(self.ino);
+        if self.fs.dir_lookup(&dir, name)?.is_some() {
+            return Err(VfsError::Exists);
+        }
+        let child = target.metadata().ino as u32;
+        let mut data = self.fs.read_inode(child);
+        if data.kind() == NodeKind::Dir {
+            return Err(VfsError::Invalid);
+        }
+        let ftype = match data.kind() {
+            NodeKind::File => FT_REG,
+            NodeKind::CharDev => FT_CHRDEV,
+            NodeKind::Symlink => FT_SYMLINK,
+            _ => FT_REG,
+        };
+        self.fs.dir_add(&mut dir, name, child, ftype)?;
+        self.fs.write_inode(self.ino, &dir);
+        data.links += 1;
+        self.fs.write_inode(child, &data);
+        Ok(())
     }
 
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {

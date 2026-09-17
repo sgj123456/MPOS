@@ -144,10 +144,10 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // page, and the page must split for the kernel's write exactly as it would
     // for the process's own. Refusing it here would take the machine down over
     // an operation Linux performs without a second thought.
-    if user_address
+    let cow = user_address
         && code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
-        && crate::sched::resolve_cow_fault(addr)
-    {
+        && crate::sched::resolve_cow_fault(addr);
+    if cow {
         return; // The faulting instruction retries and succeeds.
     }
 
@@ -168,6 +168,12 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // not a signal to deliver.
     if rip < (1 << 47) {
         crate::println!("user #PF at {:#x} code={:?} rip={:#x}", addr, code, rip);
+        // Still extends the stack when the fault is a push past the mapped
+        // end - the same call, moved here so its answer can be printed with
+        // the rest of what the page tables say.
+        if crate::sched::resolve_stack_growth(addr, frame.stack_pointer.as_u64() as usize) {
+            return; // The page is there now; the instruction retries.
+        }
         crate::sched::send_signal(crate::sched::current(), 11);
         crate::sched::preempt();
         return;

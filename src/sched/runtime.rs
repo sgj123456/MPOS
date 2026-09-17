@@ -124,8 +124,14 @@ const STACK_GROWTH_SLACK: usize = 64 * 1024;
 /// The most strings a user process may be handed, and the most bytes they may
 /// take. The syscall layer enforces the same limits on the argv blob it reads
 /// from ring 3, so these bounds decide `spawn()`'s error cases too.
-pub const ARGV_MAX: usize = 16;
-pub const ARGS_BYTES_MAX: usize = 512;
+///
+/// The block lands on one stack page, so the real ceiling is that page minus
+/// the pointer words and auxv - Linux allows megabytes, but nothing in this
+/// userland needs more than the page: OpenRC's service environment, the
+/// largest thing handed over, is a few hundred bytes a string and a couple
+/// of dozen entries.
+pub const ARGV_MAX: usize = 64;
+pub const ARGS_BYTES_MAX: usize = 2048;
 
 /// Where a dynamically linked program's interpreter is loaded.
 ///
@@ -170,6 +176,17 @@ pub type Redirect = (RawFd, RawFd);
 /// it, and anything left over is dropped oldest-first when the cap is reached.
 static RETIRED: Mutex<RefCell<Vec<(TaskId, isize)>>> = Mutex::new(RefCell::new(Vec::new()));
 const RETIRED_CAP: usize = 32;
+
+/// The exits whose `SIGCHLD` is still unread.
+///
+/// Two books, one per consumer: the exit *code* belongs to `wait(2)`, which
+/// takes it exactly once, while the *signal* belongs to a `signalfd`, whose
+/// reader may be a different caller - and draining one must not starve the
+/// other. `nlplug-findfs` leans on exactly that split: it reads the signal
+/// off its descriptor and then reaps the child through `waitpid`, and a
+/// signal read that also consumed the code would leave the reaper looking at
+/// an empty table.
+static SIGCHLD_PENDING: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
 
 /// Descriptions an exited process held, waiting to be dropped.
 ///
@@ -264,7 +281,6 @@ pub struct ItimerSnapshot {
     pub remaining_ticks: u64,
 }
 
-
 /// A thread group's memory: the frames behind its mappings, how many threads
 /// are still running on it, and where a leaving thread says so.
 ///
@@ -333,7 +349,10 @@ impl Mm {
     /// Forget a frame without giving it back: whoever took it owns it now.
     fn disown(&self, frame: usize) {
         critical_section::with(|cs| {
-            self.frames.borrow(cs).borrow_mut().retain(|&held| held != frame)
+            self.frames
+                .borrow(cs)
+                .borrow_mut()
+                .retain(|&held| held != frame)
         });
     }
 
@@ -351,9 +370,7 @@ impl Mm {
     /// A thread leaves. The answer says whether it was the last, which is the
     /// one that frees what the group owns.
     fn leave(&self) -> bool {
-        self.live
-            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
-            == 1
+        self.live.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1
     }
 
     fn leader(&self) -> TaskId {
@@ -735,11 +752,30 @@ impl Table {
     /// What stays is the slot: a zombie still has a pid, a parent, and a code
     /// for that parent to read. Only the stack goes, and only in [`Self::reap`].
     fn release_exited(&mut self) {
-        for entry in self.tasks.iter_mut() {
-            let Some(task) = entry else { continue };
-            if !task.exited || task.released {
+        // Which tasks are waiting to be released, and which address space each
+        // one's memory lives in. Both are collected before any of them is
+        // touched: releasing a task borrows the slot it sits in, and asking
+        // *then* which space its group runs on would borrow the table twice.
+        let due: alloc::vec::Vec<(usize, Option<TaskId>)> = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.as_ref().is_some_and(|t| t.exited && !t.released))
+            .map(|(slot, _)| {
+                let id = crate::sched::policy::TaskId(slot);
+                (slot, Some(self.space_owner(id)))
+            })
+            .collect();
+
+        // The words the leaving threads named, written after the loop rather
+        // than inside it: the write reaches into the leader's task, and the
+        // loop already holds a mutable borrow of the table.
+        let mut clear_tids: alloc::vec::Vec<(Option<TaskId>, usize)> = alloc::vec::Vec::new();
+
+        for (slot, group) in due {
+            let Some(task) = self.tasks[slot].as_mut() else {
                 continue;
-            }
+            };
             task.released = true;
 
             // A thread that leaves does not take the group's memory with it:
@@ -762,10 +798,10 @@ impl Table {
             } else if let Some(address) = task.mm.clear_tid() {
                 // A thread says where it left, and wakes whoever waits there:
                 // `pthread_join` sleeps on a futex at exactly this address.
-                unsafe {
-                    core::ptr::write_volatile(address as *mut u32, 0);
-                }
-                crate::sched::futex::wake_all(address);
+                // The word is written first and the sleepers woken after,
+                // because a joiner that wakes early reads the word, finds the
+                // thread still there and goes back to sleep.
+                clear_tids.push((group, address));
             }
 
             // The descriptors are handed over rather than dropped: dropping a
@@ -788,6 +824,35 @@ impl Table {
                 }
             }
         }
+
+        for (owner, address) in clear_tids {
+            if let Some(owner) = owner {
+                self.write_clear_tid(owner, address);
+            }
+            crate::sched::futex::wake_all(address);
+        }
+    }
+
+    /// Zero the word an exiting thread named in `CLONE_CHILD_CLEARTID`.
+    ///
+    /// The word lives in the leader's address space and this runs on the
+    /// scheduler, translating through whoever happens to be current - so the
+    /// space is loaded for the write, and a page the group still shares with a
+    /// fork parent is copied first. That copy is not a nicety:
+    /// `user_accessible` deliberately counts a copy-on-write page as writable,
+    /// because for ring 3 the fault handler answers the write, but this store
+    /// is made in ring 0, where a fault is a panic rather than a copy.
+    fn write_clear_tid(&mut self, owner: TaskId, address: usize) {
+        let Some(task) = self.tasks[owner.0].as_mut() else {
+            return;
+        };
+        let mm = task.mm.clone();
+        let Some(space) = task.space.as_mut() else {
+            return;
+        };
+        let root = space.root();
+        split_cow(space, &mm, address);
+        crate::arch::paging::write_user_u32(root, address, 0);
     }
 
     /// Which task owns the address space a group runs on. A process owns its
@@ -2099,6 +2164,9 @@ pub fn take_exit_code(id: TaskId) -> Option<isize> {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         let at = retired.iter().rposition(|(retired, _)| *retired == id)?;
+        // The code is collected - so the signal about it can never be read
+        // again, and a stale entry must not name a slot a new task owns.
+        SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
         Some(retired.remove(at).1)
     })
 }
@@ -2113,9 +2181,47 @@ pub fn take_exit_code(id: TaskId) -> Option<isize> {
 /// Whether a child of the running task has exited and not yet been
 /// collected - the question a `signalfd` for `SIGCHLD` answers. Nothing is
 /// consumed: `wait(2)` is what collects.
+/// Whether a child of the running task has an unread `SIGCHLD` - the question
+/// a `signalfd` answers when polled. Nothing is consumed here.
 pub fn child_exited_unreaped() -> Option<usize> {
     let me = current();
-    with_table(|t| any_child_code(t, me)).map(|(id, _code)| id.0)
+    with_table(|t| {
+        critical_section::with(|cs| {
+            SIGCHLD_PENDING
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|id| {
+                    // The named child must still be ours: a slot a new task
+                    // took over describes nobody's child any more.
+                    t.tasks[id.0]
+                        .as_ref()
+                        .is_some_and(|task| task.parent == Some(me))
+                        .then(|| id.0)
+                })
+        })
+    })
+}
+
+/// Read one pending `SIGCHLD` of the running task, as a `signalfd` read does:
+/// the signal goes to the caller and is no longer pending, while the exit
+/// code itself stays on file for `wait(2)` to collect. `None` when no child
+/// of this task has an unread signal.
+pub fn read_sigchld() -> Option<usize> {
+    let me = current();
+    with_table(|t| {
+        critical_section::with(|cs| {
+            let mut pending = SIGCHLD_PENDING.borrow(cs).borrow_mut();
+            let at = pending.iter().rposition(|id| {
+                t.tasks[id.0]
+                    .as_ref()
+                    .is_some_and(|task| task.parent == Some(me))
+            })?;
+            let id = pending.remove(at);
+            Some(id.0)
+        })
+    })
 }
 
 pub fn wait_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
@@ -2169,9 +2275,17 @@ fn record_retired(id: TaskId, code: isize) {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         if retired.len() == RETIRED_CAP {
-            retired.remove(0);
+            let dropped = retired.remove(0);
+            // A code nobody will collect has no signal left to read either.
+            SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != dropped.0);
         }
         retired.push((id, code));
+        // The signal the exit carries: pending until a signalfd reader takes
+        // it, independent of who eventually collects the code.
+        let mut pending = SIGCHLD_PENDING.borrow(cs).borrow_mut();
+        if !pending.contains(&id) {
+            pending.push(id);
+        }
     });
 }
 
@@ -3037,27 +3151,42 @@ pub fn exec_replace(
 pub fn resolve_cow_fault(virt: usize) -> bool {
     with_table(|t| {
         let id = t.current;
-        let Some(task) = t.tasks[id.0].as_mut() else {
+        // The space the running task *translates through*, which for a thread
+        // is its group leader's, not its own - a thread has no space of its own
+        // at all, and asking its slot would answer "no space" and hand every
+        // write fault it ever takes to SIGSEGV. A musl thread's first push is a
+        // write to the group's memory, so this is the difference between a
+        // thread that runs and one that dies on its first instruction.
+        let owner = t.space_owner(id);
+        let Some(task) = t.tasks[owner.0].as_mut() else {
             return false;
         };
+        let mm = task.mm.clone();
         let Some(space) = task.space.as_mut() else {
             return false;
         };
-        let Some((old_phys, new_phys)) = space.resolve_cow(virt) else {
-            return false;
-        };
-
-        // The page the task now owns is `new_phys`; `old_phys` is one claim
-        // lighter and may be free.
-        if !task.mm.replace(old_phys, new_phys) {
-            // A page outside the tracked list (the ELF loader's mappings are all
-            // tracked, so this is unreachable in practice); record the new frame
-            // so at least one of the pair is ever given back.
-            task.mm.own(new_phys);
-        }
-        crate::mm::free_frames(old_phys, 0);
-        true
+        split_cow(space, &mm, virt)
     })
+}
+
+/// Give one copy-on-write page of `space` its own frame, and keep the group's
+/// books on the swap. `false` if the page was not copy-on-write, in which case
+/// nothing changes.
+fn split_cow(space: &mut crate::arch::paging::AddressSpace, mm: &Mm, virt: usize) -> bool {
+    let Some((old_phys, new_phys)) = space.resolve_cow(virt) else {
+        return false;
+    };
+
+    // The page the task now owns is `new_phys`; `old_phys` is one claim
+    // lighter and may be free.
+    if !mm.replace(old_phys, new_phys) {
+        // A page outside the tracked list (the ELF loader's mappings are all
+        // tracked, so this is unreachable in practice); record the new frame
+        // so at least one of the pair is ever given back.
+        mm.own(new_phys);
+    }
+    crate::mm::free_frames(old_phys, 0);
+    true
 }
 
 /// Grow the main stack to cover `addr` - the fault Linux answers by mapping one
@@ -3089,7 +3218,11 @@ pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
     }
     with_table(|t| {
         let id = t.current;
-        let Some(task) = t.tasks[id.0].as_mut() else {
+        // The group's space, for the same reason a copy-on-write fault looks
+        // there: a thread's stack is a mapping the group shares, and only the
+        // leader's slot holds the tables that describe it.
+        let owner = t.space_owner(id);
+        let Some(task) = t.tasks[owner.0].as_mut() else {
             return false;
         };
         let Some(space) = task.space.as_mut() else {
@@ -3335,10 +3468,13 @@ pub fn exit_group(code: isize) -> ! {
             if task.tgid != tgid || task.exited {
                 continue;
             }
-            // Never scheduled again - and woken, in case it was asleep, so the
-            // scheduler's sleep queue does not keep a task that will not run.
+            // Never scheduled again - and taken out of every queue, including
+            // the sleep queue, so the picker can never reach a task whose slot
+            // the release pass is about to free. Waking it here would queue a
+            // dead pid: the memory it accounted for is released by the pass,
+            // not by a turn it never gets.
             task.exited = true;
-            t.sched.wake(id);
+            t.sched.retire(id);
         }
     });
     exit(code)
@@ -3386,17 +3522,6 @@ extern "C" fn task_entry(slot: usize) -> ! {
         exit(0);
     }
     if !resume.is_null() {
-        // A thread's first dispatch is worth a line while the path is new: the
-        // stack it resumes on is what the caller handed over, and getting that
-        // wrong shows up as a user fault on the thread's first push.
-        if with_table(|t| t.task(TaskId(slot)).tgid.0 != slot) {
-            crate::println!(
-                "[THREAD-START] slot={} rsp={:#x} rax={}",
-                slot,
-                unsafe { (*resume).rsp },
-                unsafe { (*resume).rax }
-            );
-        }
         // `clone(CLONE_CHILD_SETTID)` asked for the child's own tid to be
         // waiting where the child can read it. This runs on the child's address
         // space - the dispatcher has already loaded it - so the write lands
@@ -3411,12 +3536,6 @@ extern "C" fn task_entry(slot: usize) -> ! {
     if let Some((entry, user_rsp)) = user {
         // One way door: the kernel stack this task arrived on stays behind as
         // nothing but the trap target, and the reaper eventually frees it.
-        crate::println!(
-            "[ENTER] slot={} entry={:#x} rsp={:#x}",
-            slot,
-            entry,
-            user_rsp
-        );
         unsafe { context::enter_user(entry, user_rsp) };
     }
     panic!("task {slot} has neither a body nor a user image")

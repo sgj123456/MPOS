@@ -25,6 +25,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::slice;
 
+use smoltcp::socket::raw as raw_sock;
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
@@ -42,12 +43,14 @@ pub(crate) const AF_INET: u16 = 2;
 pub(crate) const AF_INET6: u16 = 10;
 pub(crate) const SOCK_STREAM: u16 = 1;
 pub(crate) const SOCK_DGRAM: u16 = 2;
+pub(crate) const SOCK_RAW: u16 = 3;
 /// `SOCK_SEQPACKET`: message boundaries over a stream. Nothing here carries
 /// them, but the number is part of the ABI and is named to be answered, not
 /// to be mistaken for something else.
 const SOCK_SEQPACKET: u16 = 5;
 const SOCK_NONBLOCK: u32 = 0o4000;
 const SOCK_CLOEXEC: u32 = 0o2000000;
+const IPPROTO_ICMP: u32 = 1;
 const IPPROTO_TCP: u32 = 6;
 const IPPROTO_UDP: u32 = 17;
 
@@ -81,6 +84,50 @@ const MSGHDR_FLAGS: usize = 48;
 /// and anything that gets here directly finds `Unsupported`.
 pub struct SocketInode {
     pub handle: usize,
+}
+
+/// The route-netlink session a descriptor names, if it names one - how the
+/// send/receive paths route this family's traffic away from the IP stack.
+fn rtnl_handle_of_fd(fd: i32) -> Option<usize> {
+    let file = crate::sched::current_fds().clone_at(fd).ok()?;
+    let handle = file.inode().socket_handle();
+    crate::net::rtnl::exists(handle).then_some(handle)
+}
+
+/// A route-netlink socket: a queue of answers to the dump requests its
+/// caller has sent. The answers are built in [`crate::net::rtnl`] when the
+/// request arrives; reading one pops it.
+pub struct NlRouteInode {
+    pub handle: usize,
+}
+
+impl Inode for NlRouteInode {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: 0x7000_8000 + self.handle as u64,
+            kind: NodeKind::CharDev,
+            size: 0,
+        }
+    }
+
+    fn socket_handle(&self) -> usize {
+        self.handle
+    }
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    fn poll_ready(&self) -> Ready {
+        Ready {
+            read: crate::net::rtnl::ready(self.handle),
+            write: true,
+        }
+    }
 }
 
 impl Inode for SocketInode {
@@ -294,14 +341,28 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     // network card still needs its device events.
     if domain == crate::uevent::AF_NETLINK {
         let typ = (args[1] as u32) & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if typ != SOCK_DGRAM as u32 {
+        // SOCK_DGRAM is what the uevent listener opens; SOCK_RAW is what
+        // busybox `ip` opens for its route dumps.
+        if typ != SOCK_DGRAM as u32 && typ != SOCK_RAW as u32 {
             return err::ESOCKTNOSUPPORT;
         }
-        // One protocol exists here. A caller asking for another netlink
-        // protocol gets the same answer Linux gives for a protocol a family
-        // does not carry.
-        if args[2] as u32 != crate::uevent::NETLINK_KOBJECT_UEVENT {
-            return err::EPROTONOSUPPORT;
+        // Two protocols exist here: the uevent channel the initramfs's device
+        // discovery speaks, and the route half `ip` reads its interfaces
+        // through. A caller asking for anything else gets the same answer
+        // Linux gives for a protocol a family does not carry.
+        match args[2] as u32 {
+            crate::uevent::NETLINK_KOBJECT_UEVENT => {}
+            crate::net::rtnl::NETLINK_ROUTE => {
+                let handle = crate::net::rtnl::open();
+                let fd = crate::vfs::open_inode(Arc::new(NlRouteInode { handle }));
+                if (args[1] as u32) & SOCK_NONBLOCK != 0
+                    && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+                {
+                    file.set_status(crate::vfs::file::O_NONBLOCK);
+                }
+                return fd as isize;
+            }
+            _ => return err::EPROTONOSUPPORT,
         }
         let handle = crate::uevent::open();
         let fd = crate::vfs::open_inode(Arc::new(SocketInode { handle }));
@@ -325,13 +386,17 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     let protocol_matches = match typ {
         SOCK_STREAM => protocol == 0 || protocol == IPPROTO_TCP,
         SOCK_DGRAM => protocol == 0 || protocol == IPPROTO_UDP,
+        // Raw sockets: IPPROTO_ICMP (1) is what `ping` needs. Protocol 0
+        // is allowed too - Linux defaults to the "raw" protocol for the
+        // family, which for AF_INET is ICMP.
+        SOCK_RAW => protocol == 0 || protocol == IPPROTO_ICMP,
         _ => return err::ESOCKTNOSUPPORT,
     };
     if !protocol_matches {
         return err::EPROTONOSUPPORT;
     }
 
-    let handle = match super::alloc_socket(domain, typ) {
+    let handle = match super::alloc_socket(domain, typ, protocol) {
         Ok(handle) => handle,
         Err(e) => return e,
     };
@@ -518,6 +583,16 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
 pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     let fd = args[0] as i32;
     let (buf, len) = (args[1], args[2]);
+    // A route-netlink socket takes the payload whole: the netlink message
+    // protocol lives in the data, and the destination sockaddr is the
+    // kernel's own netlink address, not one to parse as an IP endpoint.
+    if let Some(handle) = rtnl_handle_of_fd(fd) {
+        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+            return err::EFAULT;
+        }
+        let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+        return crate::net::rtnl::send(handle, data);
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -543,6 +618,17 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
 /// the destination comes from `msg_name`, if there is one.
 pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
     let fd = args[0] as i32;
+    if let Some(handle) = rtnl_handle_of_fd(fd) {
+        let (_name, _namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        let mut data: Vec<u8> = Vec::new();
+        if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
+            return e;
+        }
+        return crate::net::rtnl::send(handle, &data);
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -583,6 +669,7 @@ fn send_common(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bo
     match typ {
         Some(SOCK_STREAM) => tcp_send(handle, data, nonblock),
         Some(SOCK_DGRAM) => udp_send(handle, data, dst),
+        Some(SOCK_RAW) => raw_send(handle, data, dst),
         Some(_) => err::EINVAL,
         None => err::EBADF,
     }
@@ -691,6 +778,29 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
 pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     let fd = args[0] as i32;
     let (buf, len) = (args[1], args[2]);
+    if let Some(handle) = rtnl_handle_of_fd(fd) {
+        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+            return err::EFAULT;
+        }
+        let Some(msg) = crate::net::rtnl::recv_blocking(handle) else {
+            return err::EAGAIN;
+        };
+        let n = msg.len().min(len);
+        unsafe {
+            core::ptr::copy_nonoverlapping(msg.as_ptr(), buf as *mut u8, n);
+            if args[4] != 0 {
+                // sockaddr_nl: the answer came from the kernel, pid 0.
+                let at = |offset: usize| (args[4] + offset) as *mut u8;
+                (at(0) as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
+                (at(4) as *mut u32).write_unaligned(0); // nl_pid
+                (at(8) as *mut u32).write_unaligned(0); // nl_groups
+                if args[5] != 0 {
+                    (args[5] as *mut u32).write_unaligned(12);
+                }
+            }
+        }
+        return n as isize;
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -717,11 +827,38 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
 /// is cleared.
 pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     let fd = args[0] as i32;
+    let msghdr = args[1];
+    if let Some(handle) = rtnl_handle_of_fd(fd) {
+        let (name, namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        let Some((buf, len)) = first_iovec(iov, iovlen, from_user) else {
+            return err::EINVAL;
+        };
+        if len == 0 {
+            return err::EINVAL;
+        }
+        let Some(msg) = crate::net::rtnl::recv_blocking(handle) else {
+            return err::EAGAIN;
+        };
+        let n = msg.len().min(len);
+        unsafe {
+            core::ptr::copy_nonoverlapping(msg.as_ptr(), buf as *mut u8, n);
+            if name != 0 && namelen != 0 {
+                let at = |offset: usize| (name + offset) as *mut u8;
+                (at(0) as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
+                (at(4) as *mut u32).write_unaligned(0); // nl_pid
+                (at(8) as *mut u32).write_unaligned(0); // nl_groups
+                ((msghdr + 8) as *mut u32).write_unaligned(12);
+            }
+        }
+        return n as isize;
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
     };
-    let msghdr = args[1];
     let (name, namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
         Ok(fields) => fields,
         Err(e) => return e,
@@ -783,6 +920,7 @@ fn recv_common(
     let received = match typ {
         Some(SOCK_STREAM) => tcp_recv(handle, out, nonblock),
         Some(SOCK_DGRAM) => udp_recv(handle, out, nonblock),
+        Some(SOCK_RAW) => raw_recv(handle, out, nonblock),
         Some(_) => return err::EINVAL,
         None => return err::EBADF,
     };
@@ -894,6 +1032,140 @@ fn udp_recv(
 }
 
 // ---------------------------------------------------------------------------
+// raw IP sockets
+// ---------------------------------------------------------------------------
+
+/// Send a raw IP packet. The caller provides the ICMP payload; we prepend
+/// the 20-byte IPv4 header and hand the complete packet to smoltcp's raw
+/// socket. A destination address is mandatory for raw sockets (there is no
+/// `connect` to pin one).
+fn raw_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
+    let target = match dst {
+        Some(ep) => ep,
+        None => return err::EDESTADDRREQ,
+    };
+    let sent = super::with(handle, |stack, entry| {
+        stack.poll_once();
+        let Channel::Raw {
+            handle: sock_handle,
+            protocol,
+        } = &entry.channel
+        else {
+            return Err(err::ENOTSOCK);
+        };
+        let sock = stack.sockets.get_mut::<raw_sock::Socket>(*sock_handle);
+        // Build a complete IPv4 packet: 20-byte header + ICMP payload.
+        let total_len = 20 + data.len();
+        if total_len > 65535 {
+            return Err(err::EMSGSIZE);
+        }
+        let mut pkt = alloc::vec![0u8; total_len];
+        // IPv4 header (no options, IHL=5).
+        pkt[0] = 0x45; // version=4, IHL=5
+        pkt[1] = 0; // DSCP/ECN
+        let len = (total_len as u16).to_be_bytes();
+        pkt[2] = len[0];
+        pkt[3] = len[1];
+        pkt[4] = 0;
+        pkt[5] = 0; // identification
+        pkt[6] = 0x40; // flags: Don't Fragment
+        pkt[7] = 0; // fragment offset
+        pkt[8] = 64; // TTL
+        pkt[9] = *protocol; // protocol
+        // checksum = 0 (smoltcp fills it in)
+        pkt[10] = 0;
+        pkt[11] = 0;
+        // source: local IP
+        pkt[12] = super::LOCAL_IP[0];
+        pkt[13] = super::LOCAL_IP[1];
+        pkt[14] = super::LOCAL_IP[2];
+        pkt[15] = super::LOCAL_IP[3];
+        // destination
+        let octets = match target.addr {
+            IpAddress::Ipv4(addr) => addr.octets(),
+        };
+        pkt[16] = octets[0];
+        pkt[17] = octets[1];
+        pkt[18] = octets[2];
+        pkt[19] = octets[3];
+        // payload
+        pkt[20..].copy_from_slice(data);
+        match sock.send_slice(&pkt) {
+            Ok(()) => Ok(data.len() as isize),
+            Err(raw_sock::SendError::BufferFull) => Err(err::ENOMEM),
+        }
+    });
+    match sent {
+        Some(Ok(n)) => n,
+        Some(Err(e)) => e,
+        None => err::EBADF,
+    }
+}
+
+/// Receive a raw IP packet. The smoltcp raw socket delivers complete IP
+/// packets; we strip the 20-byte header and return only the ICMP payload
+/// to the caller - matching what Linux does for `SOCK_RAW, IPPROTO_ICMP`.
+fn raw_recv(
+    handle: usize,
+    out: &mut [u8],
+    nonblock: bool,
+) -> Result<(usize, Option<IpEndpoint>), isize> {
+    loop {
+        // Receive into a temporary buffer inside the `with` closure, then
+        // copy the ICMP payload to the caller's buffer.
+        let result: Option<Result<(usize, Option<IpEndpoint>), isize>> =
+            super::with(handle, |stack, entry| {
+                stack.poll_once();
+                let Channel::Raw {
+                    handle: sock_handle,
+                    ..
+                } = &entry.channel
+                else {
+                    return Err(err::ENOTSOCK);
+                };
+                let sock = stack.sockets.get_mut::<raw_sock::Socket>(*sock_handle);
+                let mut tmp = alloc::vec![0u8; 1500];
+                let n = match sock.recv_slice(&mut tmp) {
+                    Ok(n) => n,
+                    Err(raw_sock::RecvError::Exhausted) => return Err(err::EWOULDBLOCK),
+                    Err(raw_sock::RecvError::Truncated) => return Err(err::EMSGSIZE),
+                };
+                tmp.truncate(n);
+                // Strip the IPv4 header: the minimum IHL is 5 (20 bytes).
+                if n < 20 {
+                    return Err(err::EINVAL);
+                }
+                let ihl = ((tmp[0] & 0x0F) as usize) * 4;
+                if ihl > n {
+                    return Err(err::EINVAL);
+                }
+                let payload = &tmp[ihl..];
+                if payload.len() > out.len() {
+                    return Err(err::EMSGSIZE);
+                }
+                // Build the source address from the IP header.
+                let src = IpEndpoint::new(IpAddress::v4(tmp[12], tmp[13], tmp[14], tmp[15]), 0);
+                // Copy payload to caller's buffer.
+                out[..payload.len()].copy_from_slice(payload);
+                Ok((payload.len(), Some(src)))
+            });
+        match result {
+            Some(Ok((n, ep))) => return Ok((n, ep)),
+            Some(Err(e)) if e == err::EWOULDBLOCK && !nonblock => {}
+            Some(Err(e)) => return Err(e),
+            None => return Err(err::EBADF),
+        }
+        if nonblock {
+            return Err(err::EWOULDBLOCK);
+        }
+        if crate::sched::take_fatal_signal().is_some() {
+            return Err(err::EINTR);
+        }
+        crate::sched::sleep_ticks(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bind, listen, names, options
 // ---------------------------------------------------------------------------
 
@@ -921,6 +1193,25 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
         }
         let groups = unsafe { ((addr + 8) as *const u32).read_unaligned() };
         crate::uevent::bind(handle, groups);
+        return 0;
+    }
+    if let Ok(handle) = socket_handle_of_fd(args[0] as i32)
+        && crate::net::rtnl::exists(handle)
+    {
+        // A route session binds to name its port and join groups; `ip` binds
+        // pid 0 and no groups, which asks only to be identified. The kernel
+        // does the identifying here - there is no session state to keep.
+        const SOCKADDR_NL_SIZE: usize = 12;
+        let addr = args[1];
+        if args[2] < SOCKADDR_NL_SIZE
+            || !crate::syscall::buffer_ok(addr, SOCKADDR_NL_SIZE, false, from_user)
+        {
+            return err::EINVAL;
+        }
+        let family = unsafe { (addr as *const u16).read_unaligned() };
+        if family != crate::uevent::AF_NETLINK {
+            return err::EINVAL;
+        }
         return 0;
     }
 
@@ -974,6 +1265,9 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
             }
             // The stub takes no addresses: its family has none to name.
             Channel::Inet6 => Err(err::EAFNOSUPPORT),
+            // Raw sockets do not bind: `ping` uses `sendto` with a
+            // per-call destination.
+            Channel::Raw { .. } => Ok(()),
             Channel::Udp {
                 handle: sock_handle,
                 bound,
@@ -1132,6 +1426,8 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
                     .unwrap_or(UNSPECIFIED_ENDPOINT),
             },
             Channel::Udp { local, .. } => local.unwrap_or(UNSPECIFIED_ENDPOINT),
+            // A raw socket has no bound address; reads back as unspecified.
+            Channel::Raw { .. } => UNSPECIFIED_ENDPOINT,
             // A stub that cannot connect reads back as unspecified, the same
             // as a fresh IPv4 socket does.
             Channel::Inet6 => UNSPECIFIED_ENDPOINT,
@@ -1184,6 +1480,8 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
             },
             // Nowhere to be connected to, so no peer to name.
             Channel::Inet6 => Err(err::ENOTCONN),
+            // Raw sockets are connectionless; no peer.
+            Channel::Raw { .. } => Err(err::ENOTCONN),
         }
     });
     match endpoint {
@@ -1233,6 +1531,8 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
             stack.sockets.get_mut::<tcp::Socket>(*sock_handle).close();
         }
         Channel::Udp { .. } => {}
+        // Raw sockets are connectionless; nothing to tear down.
+        Channel::Raw { .. } => {}
         // Nothing is connected, so there is nothing to tear down.
         Channel::Inet6 => {}
     });

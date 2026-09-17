@@ -76,7 +76,6 @@ extern "C" fn thread_body(_arg: usize) -> ! {
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t_futex\n");
     let mut failed = false;
-    let null = core::ptr::null_mut::<i32>();
     let word = &raw mut WORD;
 
     // A wait on a word that no longer holds the expected value does not sleep:
@@ -108,23 +107,14 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         -1,
         0,
     );
-    lin::check_true(
-        &mut failed,
-        b"a stack was mapped for the thread",
-        stack > 0,
-    );
+    lin::check_true(&mut failed, b"a stack was mapped for the thread", stack > 0);
     if stack <= 0 {
         lin::done(failed);
     }
 
     unsafe { WORD = 0 };
     let mut tid_slot: i32 = 0;
-    let tid = lin::thread_create(
-        (stack as usize) + 0x8000,
-        thread_body,
-        0,
-        &mut tid_slot,
-    );
+    let tid = lin::thread_create((stack as usize) + 0x8000, thread_body, 0, &mut tid_slot);
 
     lin::check_true(&mut failed, b"clone(CLONE_THREAD) answered a tid", tid > 0);
     if tid > 0 {

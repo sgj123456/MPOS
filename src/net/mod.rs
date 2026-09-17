@@ -24,6 +24,7 @@
 //! musl resolves in userspace over UDP sockets, which is why the UDP path has
 //! to work but no resolver lives here.
 
+pub mod rtnl;
 pub mod socket;
 
 use alloc::sync::Arc;
@@ -33,15 +34,20 @@ use core::cell::RefCell;
 use critical_section::Mutex;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::raw as raw_sock;
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address,
+};
 
 use crate::drivers::virtio::net::VirtioNet;
 
 /// The address QEMU's user network hands out on its virtual wire.
-const LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
+pub(crate) const LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
+/// QEMU's default gateway on the same virtual wire.
+pub(crate) const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 const PREFIX_LEN: u8 = 24;
 /// The virtual router: everything not on the local wire goes here.
 const GATEWAY: [u8; 4] = [10, 0, 2, 2];
@@ -91,6 +97,14 @@ pub(crate) enum Channel {
     /// that shape keeps musl's dual-family resolve honest; refusing the
     /// socket outright turns the whole lookup into EAFNOSUPPORT.
     Inet6,
+    /// A raw IP socket: sends and receives complete IP packets with a given
+    /// protocol number. `ping` uses this with `IPPROTO_ICMP` (1) to send
+    /// ICMP echo requests and receive replies.
+    Raw {
+        handle: SocketHandle,
+        /// The IP protocol number this socket is bound to (e.g. 1 for ICMP).
+        protocol: u8,
+    },
 }
 
 /// The syscall-visible facts about one socket, indexed by handle - the number
@@ -148,6 +162,29 @@ impl Stack {
         self.sockets.add(udp::Socket::new(rx, tx))
     }
 
+    /// A raw IP socket bound to the given protocol number. The buffers are
+    /// generous enough for ICMP echo requests/replies (which are well under
+    /// 1 KiB).
+    const RAW_RX_BYTES: usize = 4 * 1024;
+    const RAW_TX_BYTES: usize = 4 * 1024;
+
+    pub(crate) fn add_raw(&mut self, protocol: u8) -> SocketHandle {
+        let rx = raw_sock::PacketBuffer::new(
+            alloc::vec![raw_sock::PacketMetadata::EMPTY; 4],
+            alloc::vec![0u8; Self::RAW_RX_BYTES],
+        );
+        let tx = raw_sock::PacketBuffer::new(
+            alloc::vec![raw_sock::PacketMetadata::EMPTY; 4],
+            alloc::vec![0u8; Self::RAW_TX_BYTES],
+        );
+        self.sockets.add(raw_sock::Socket::new(
+            None,
+            Some(ip_to_smoltcp_protocol(protocol)),
+            rx,
+            tx,
+        ))
+    }
+
     /// The next anonymous local port for `stack` callers inside a `with`.
     pub(crate) fn ephemeral(&mut self) -> u16 {
         self.alloc_ephemeral()
@@ -188,7 +225,10 @@ pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
 /// handle. The smoltcp socket - with its buffers - is built inside the lock,
 /// since the socket set is part of the stack. `ENETDOWN` when the stack never
 /// came up: a kernel without a network card has no sockets to give.
-pub(crate) fn alloc_socket(family: u16, typ: u16) -> Result<usize, isize> {
+///
+/// `protocol` is the IP protocol number for raw sockets (e.g. 1 for ICMP);
+/// ignored for TCP and UDP.
+pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize, isize> {
     critical_section::with(|cs| {
         let mut net = NET.borrow(cs).borrow_mut();
         let Some(stack) = net.as_mut() else {
@@ -204,6 +244,10 @@ pub(crate) fn alloc_socket(family: u16, typ: u16) -> Result<usize, isize> {
                 peer: None,
                 bound: false,
                 local: None,
+            },
+            (socket::AF_INET, socket::SOCK_RAW) => Channel::Raw {
+                handle: stack.add_raw(protocol as u8),
+                protocol: protocol as u8,
             },
             // The IPv6 stub: an entry with no smoltcp socket behind it.
             (socket::AF_INET6, _) => Channel::Inet6,
@@ -257,6 +301,7 @@ pub(crate) fn free_entry(handle: usize) {
         let owned = match &entry.channel {
             Channel::Tcp { handle, .. } => Some(*handle),
             Channel::Udp { handle, .. } => Some(*handle),
+            Channel::Raw { handle, .. } => Some(*handle),
             // The IPv6 stub owns no smoltcp socket; the registry slot is all
             // there is to free.
             Channel::Inet6 => None,
@@ -310,6 +355,13 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
             }
             Channel::Udp { handle: h, .. } => {
                 let sock = stack.sockets.get_mut::<udp::Socket>(*h);
+                crate::vfs::Ready {
+                    read: sock.can_recv(),
+                    write: sock.can_send(),
+                }
+            }
+            Channel::Raw { handle: h, .. } => {
+                let sock = stack.sockets.get_mut::<raw_sock::Socket>(*h);
                 crate::vfs::Ready {
                     read: sock.can_recv(),
                     write: sock.can_send(),
@@ -392,6 +444,16 @@ pub fn spawn_service() {
 fn now() -> SmolInstant {
     let ticks = crate::arch::timer::ticks() as i64;
     SmolInstant::from_millis(ticks * 1000 / crate::arch::timer::TICK_HZ as i64)
+}
+
+/// Convert a raw IP protocol number to smoltcp's `IpProtocol` enum.
+fn ip_to_smoltcp_protocol(num: u8) -> IpProtocol {
+    match num {
+        1 => IpProtocol::Icmp,
+        6 => IpProtocol::Tcp,
+        17 => IpProtocol::Udp,
+        _ => IpProtocol::Unknown(num),
+    }
 }
 
 /// The whole stack, behind the usual kernel lock. `None` until [`init`].

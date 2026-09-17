@@ -87,7 +87,16 @@ pub fn hhdm_offset() -> usize {
 
 #[cfg(target_os = "none")]
 pub fn virt_to_phys(virt: usize) -> usize {
-    virt - HHDM.load(Ordering::Relaxed)
+    let hhdm = HHDM.load(Ordering::Relaxed);
+    // Named rather than left to the subtraction: the only way to get here with
+    // a smaller address is a caller handing back something that never came
+    // from `alloc_pages` - a physical frame, or a user address - and which one
+    // it is says where the mistake is.
+    assert!(
+        virt >= hhdm,
+        "virt_to_phys({virt:#x}): not an address from the direct map (hhdm {hhdm:#x})"
+    );
+    virt - hhdm
 }
 
 /// Allocate `2^order` contiguous physical frames, aligned to their own size.

@@ -102,6 +102,35 @@ impl Inode for RamSymlink {
     }
 }
 
+/// A device node a `mknod` made: a name carrying a device kind.
+///
+/// No driver stands behind it - on this machine the nodes an initramfs's init
+/// pre-seeds (`/dev/null`, `/dev/ptmx`) are placeholders that live exactly as
+/// long as it takes the `devtmpfs` mount to cover them with real devices.
+/// Reads answer end of file and writes vanish, which is the honest behaviour
+/// of a null device and a harmless one for anything nobody has opened yet.
+struct RamDev {
+    ino: Ino,
+}
+
+impl Inode for RamDev {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::CharDev,
+            size: 0,
+        }
+    }
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        Ok(buf.len())
+    }
+}
+
 struct RamDir {
     ino: Ino,
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
@@ -137,8 +166,11 @@ impl Inode for RamDir {
                 ino: fresh_ino(),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
-            // No device registry exists yet; devfs brings real ones at M8.
-            NodeKind::CharDev | NodeKind::BlockDev => return Err(VfsError::Unsupported),
+            // A device node mknod made: a placeholder until a devtmpfs mount
+            // covers the directory with driver-backed devices.
+            NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev {
+                ino: fresh_ino(),
+            }),
             // A link is made with `Inode::symlink`, which carries the one thing
             // a link cannot exist without: what it points at.
             NodeKind::Symlink => return Err(VfsError::Unsupported),

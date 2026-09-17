@@ -84,6 +84,16 @@ pub const SETPGID: u64 = 109;
 pub const GETPGRP: u64 = 111;
 pub const SETSID: u64 = 112;
 pub const GETPGID: u64 = 121;
+/// `getsid(2)`: which session a process belongs to. This kernel keeps no
+/// sessions - a process's group leader stands in, which is the answer a libc
+/// `setsid()` reads back to check its own work.
+pub const GETSID: u64 = 124;
+/// `setgroups(2)`: the supplementary groups. This kernel keeps no groups
+/// beyond the one each process belongs to, so login's "clear the extras"
+/// call is accepted and dropped - refusing it made every root login read
+/// back as a wrong password.
+pub const SETGROUPS: u64 = 116;
+pub const GETGROUPS: u64 = 115;
 pub const GETDENTS64: u64 = 217;
 /// `sendfile(out, in, offset, count)`: copy bytes between descriptors in the
 /// kernel. Something in the init path asks for it once.
@@ -137,7 +147,8 @@ pub const FUTEX_WAKE: usize = 1;
 pub const FUTEX_WAIT_BITSET: usize = 9;
 pub const FUTEX_WAKE_BITSET: usize = 10;
 pub const FUTEX_PRIVATE_FLAG: usize = 128;
-pub const SCHED_GETAFFINITY: u64 = 203;
+pub const SCHED_SETAFFINITY: u64 = 203;
+pub const SCHED_GETAFFINITY: u64 = 204;
 pub const SET_TID_ADDRESS: u64 = 218;
 pub const CLOCK_GETTIME: u64 = 228;
 pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -153,6 +164,11 @@ pub const GETRANDOM: u64 = 318;
 pub const STATX: u64 = 332;
 pub const RSEQ: u64 = 334;
 pub const ARCH_PRCTL: u64 = 158;
+/// `prctl(2)`: the miscellaneous process-control call. `mdev` and friends
+/// call it for `PR_SET_NAME`; the options that touch privileges this kernel
+/// does not model are answered with success, which is what a caller checking
+/// the exit status wants.
+pub const PRCTL: u64 = 157;
 pub const SIGALTSTACK: u64 = 131;
 pub const STATFS: u64 = 137;
 pub const FSTATFS: u64 = 138;
@@ -209,7 +225,13 @@ pub const PIVOT_ROOT: u64 = 155;
 pub const CHROOT: u64 = 161;
 /// `signalfd(2)`: a descriptor that reports signals - child exits here.
 pub const SIGNALFD: u64 = 282;
-/// `eventfd(2)`: a counter a process can wait on.
+/// `signalfd4(2)`: the signalfd spelling musl actually makes. The original
+/// `signalfd` number answers on x86_64 too, but every libc in use goes
+/// through the `4` form, flags and all - a caller whose descriptor never
+/// existed polls a `POLLNVAL` hole and spins.
+pub const SIGNALFD4: u64 = 289;
+/// `eventfd(2)`: a counter a process can wait on. The number is the
+/// `eventfd2` spelling - the flags-taking form every libc makes.
 pub const EVENTFD: u64 = 290;
 /// `link(2)` / `linkat(2)`: a second name for an inode.
 pub const LINK: u64 = 86;
@@ -256,4 +278,11 @@ pub const CLONE_SYSVSEM: usize = 0x0004_0000;
 pub const CLONE_SETTLS: usize = 0x0008_0000;
 pub const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 pub const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+/// Historical no-op. Linux removed its meaning years ago but still accepts
+/// the bit, and musl's `pthread_create` puts it in every thread's flag word -
+/// refusing it refuses every pthread in the system.
+pub const CLONE_DETACHED: usize = 0x0040_0000;
+/// Historical no-op, same treatment: accepted so a caller from a kernel that
+/// still sends it is not refused for a bit that does nothing.
+pub const CLONE_UNTRACED: usize = 0x0080_0000;
 pub const CLONE_CHILD_SETTID: usize = 0x0100_0000;

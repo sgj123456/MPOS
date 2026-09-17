@@ -149,6 +149,24 @@ impl Scheduler {
         self.ready[priority.band()].push_back(id);
     }
 
+    /// Take a task out of every queue - ready and sleeping. It will never run
+    /// again: this is how a group exit disposes of its siblings, whose slots
+    /// the release pass frees while their contexts sit unreached. A task left
+    /// queued after its slot went away is a pid the picker would dereference
+    /// into nothing.
+    pub fn retire(&mut self, id: TaskId) {
+        for band in self.ready.iter_mut() {
+            band.retain(|queued| *queued != id);
+        }
+        let mut rebuilt = BinaryHeap::new();
+        while let Some(Reverse(sleeper)) = self.sleeping.pop() {
+            if sleeper.id != id {
+                rebuilt.push(Reverse(sleeper));
+            }
+        }
+        self.sleeping = rebuilt;
+    }
+
     /// Queue a task to wake after `ticks` more clock advances.
     ///
     /// `ticks` of 0 is not "wake immediately": the task still has to wait for the

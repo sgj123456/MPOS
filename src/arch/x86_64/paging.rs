@@ -794,6 +794,37 @@ pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
     true
 }
 
+/// Write one word to a user address, in the address space `root` names.
+///
+/// The scheduler gives an exited thread's memory back on its own stack, which
+/// is to say while the CPU translates through somebody else's tables. A
+/// `CLONE_CHILD_CLEARTID` address cannot be written straight from there: the
+/// write lands in whichever process happens to be current - or, when that
+/// process does not map the address at all, faults in ring 0 and takes the
+/// machine down. Linux never meets this shape because its exit path runs in
+/// the dying process's own context; this kernel has to load the space the
+/// address belongs to before it can touch it.
+///
+/// A page the space will not let be written is left alone rather than forced:
+/// a process that made its clear-tid word read-only loses the wake that word
+/// would carry, not the machine.
+pub fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
+    if at == 0 || at.checked_add(4).is_none_or(|end| end > USER_END) {
+        return false;
+    }
+    // Switching CR3 mid-function is safe here and only here: both halves of
+    // the kernel - its code, its stack, its heap - are mapped in every space,
+    // so nothing this function runs on disappears when the switch happens.
+    let saved = active_root();
+    activate(root);
+    let ok = user_accessible(at, 4, true);
+    if ok {
+        unsafe { core::ptr::write_volatile(at as *mut u32, value) };
+    }
+    activate(saved);
+    ok
+}
+
 /// Whether the page holding `virt` carries the copy-on-write bit: present, and
 /// marked as shared-until-written.
 ///
@@ -814,6 +845,27 @@ pub fn is_cow_page(virt: usize) -> bool {
         table = (entry & ADDR_MASK) as usize;
     }
     false
+}
+
+/// The raw leaf entry the *active* address space holds for `virt`, if the
+/// walk reaches one.
+///
+/// Diagnostic only: when a fault's answer depends on what a page's bits say,
+/// the bits are worth more than a boolean about them.
+pub fn leaf_pte(virt: usize) -> Option<u64> {
+    let (root, _) = Cr3::read();
+    let mut table = root.start_address().as_u64() as usize;
+    for level in (0..4).rev() {
+        let entry = table_entry(table, virt, level);
+        if entry & PRESENT == 0 {
+            return None;
+        }
+        if level == 0 || entry & HUGE != 0 {
+            return Some(entry);
+        }
+        table = (entry & ADDR_MASK) as usize;
+    }
+    None
 }
 
 /// One entry of a page table, read through the direct map.

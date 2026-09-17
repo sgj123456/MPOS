@@ -40,8 +40,6 @@ def extract(blob, dest):
     count = 0
     while offset + HEADER <= len(blob):
         header = blob[offset:offset + HEADER]
-        if header[:6] == b"TRAILER":
-            break
         if header[:6] not in (MAGIC, MAGIC_CRC):
             raise SystemExit(f"cpio: bad magic at {offset}: {header[:6]!r}")
         mode = field(header, 1)
@@ -49,6 +47,10 @@ def extract(blob, dest):
         namesize = field(header, 11)
         name_start = offset + HEADER
         name = blob[name_start:name_start + namesize - 1].decode("utf-8", "surrogateescape")
+        # The archive's end is an entry named TRAILER!!! - zero padding follows
+        # it, and reading that as a header is what "bad magic" was.
+        if name == "TRAILER!!!":
+            break
         data_start = name_start + namesize
         data_start += (-data_start) % ALIGN
         data = blob[data_start:data_start + filesize]
@@ -56,9 +58,12 @@ def extract(blob, dest):
         offset += (-offset) % ALIGN
 
         # A leading slash would escape the destination; the archive is read as
-        # paths relative to it, which is what cpio means.
-        target = os.path.normpath(os.path.join(dest, name.lstrip("/")))
-        if not target.startswith(os.path.abspath(dest)):
+        # paths relative to it, which is what cpio means. mkinitfs's archive
+        # starts with the root directory itself, spelled ".", which lands on
+        # the destination and is fine.
+        dest_abs = os.path.abspath(dest)
+        target = os.path.normpath(os.path.join(dest_abs, name.lstrip("/")))
+        if target != dest_abs and not target.startswith(dest_abs + os.sep):
             raise SystemExit(f"cpio: {name} escapes the destination")
 
         kind = mode & 0o170000

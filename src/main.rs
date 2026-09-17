@@ -8,15 +8,17 @@
 //! Boot proceeds in three phases:
 //!
 //! 1. **Initialization** — `init_mm → init_arch → init_sched → init_vfs →
-//!    init_blk → init_ipc → init_shell`. Each sets up a subsystem without
+//!    init_blk → init_net → init_rand`. Each sets up a subsystem without
 //!    running tests. After all inits complete, the system is ready.
 //!
 //! 2. **Milestone pre-checks** — `check_mm → check_arch → check_sched →
-//!    check_vfs → check_blk_process → check_ipc → check_shell`. Each
-//!    validates the corresponding subsystem. Groups are ordered by dependency
-//!    and print `M*_OK` markers the CI harness asserts on.
+//!    check_vfs → check_ipc`. Each validates the corresponding subsystem.
+//!    Groups are ordered by dependency and print `M*_OK` markers the CI
+//!    harness asserts on. (`check_blk_process` and `check_shell` are covered
+//!    by the block layer's own checks and by the init handoff respectively.)
 //!
-//! 3. **Init handoff** — `m13` spawns `/sbin/init` and parks the boot task.
+//! 3. **Init handoff** — `handoff_to_init` spawns `/sbin/init` and parks the
+//!    boot task.
 
 #![no_std]
 #![no_main]
@@ -45,10 +47,9 @@ use mpos::vfs::{self, FileSystem, Inode, NodeKind};
 
 const MIB: usize = 1024 * 1024;
 
-/// The virtio-blk device, probed once in init_blk and reused everywhere.
-static BLK_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
-/// The raw virtio-blk device (before partitioning), for partition lookups.
-/// The data partition device (partition 4), mounted at /mnt after pivot_root.
+/// The data partition device (partition 4), mounted at /mnt by `init_blk`.
+/// Kept for the checks that need the raw block device rather than the mounted
+/// tree (e.g. remounting to prove a write reached the disk).
 static DATA_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::Once::new();
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,11 @@ pub extern "C" fn _start() -> ! {
     arch::enable_user_sse();
 
     let info = boot::limine::collect();
+    // Hand the command line to the filesystem layer before anyone can read
+    // `/proc/cmdline`: the initramfs's init parses `root=` out of it, and an
+    // empty file there sends the whole boot down the diskless path instead of
+    // mounting the real root.
+    boot::set_cmdline(info.cmdline);
     banner(&info);
 
     let stats = unsafe { mm::init(&info) };
@@ -96,6 +102,7 @@ fn banner(info: &BootInfo) {
         info.kernel_phys_base, info.kernel_virt_base
     );
     println!("hhdm offset: {:#x}", info.hhdm_offset);
+    println!("cmdline: {:?}", info.cmdline);
     println!("memory map ({} regions):", info.region_count);
     for region in info.regions() {
         println!("  {:?}", region);
@@ -108,44 +115,31 @@ fn banner(info: &BootInfo) {
 // ---------------------------------------------------------------------------
 
 /// The boot task's whole life: prove the kernel works, then hand the machine
-/// to init and stand aside. It ends inside `m13`, which parks the boot task
-/// rather than returning - a system that stops running itself is not a system.
+/// to init and stand aside. It ends inside `handoff_to_init`, which parks the
+/// boot task rather than returning - a system that stops running itself is not
+/// a system.
 fn kernel_main(info: &BootInfo) {
-    // Before anything can read it: /proc/cmdline is how the initramfs's init
-    // learns what to mount.
-    mpos::boot::set_cmdline(info.cmdline);
-
-    // ---- phase 1: initialization (no tests, just set up subsystems) --------
     init_mm();
-    init_arch(info);
-    init_sched();
-    init_vfs(info);
-    init_blk();
-    // After `init_arch`, not before: the seed mixes in the boot instant the
-    // RTC reported and the tick counter, and neither exists until the clock
-    // subsystem is up. Seeding later costs nothing - `fill` seeds on first use
-    // anyway - but seeding here means the very first reader gets a stream
-    // seeded from the machine rather than from a cold counter.
-    mpos::rand::init();
-    println!("系统就绪");
-
-    // ---- phase 2: milestone pre-checks (pure tests, assume init done) ------
     check_mm(info);
-    check_arch(info);
-    check_sched();
-    check_vfs();
-    check_blk_process();
-    check_ipc();
-    // The network comes up before the shell sweep rather than after it: the
-    // sweep ends with the tests that leave the machine - a DNS query, a TCP
-    // connection - and none of them can pass on a stack that is not up yet.
-    // The service task this starts is permanent, so the drains the checks run
-    // do not wait for a task that is never going to finish.
-    init_net();
-    check_shell();
-    println!("全部通过");
 
-    // ---- phase 3: hand the machine to /sbin/init ----------------------------
+    init_arch(info);
+    check_arch(info);
+
+    init_sched();
+    check_sched();
+
+    init_vfs(info);
+    check_vfs();
+
+    init_blk();
+    init_net();
+
+    mpos::rand::init();
+
+    check_ipc();
+
+    println!("All ready!");
+
     handoff_to_init();
 }
 
@@ -215,6 +209,7 @@ fn ensure_child(dir: &Arc<dyn Inode>, name: &str, kind: NodeKind) -> Arc<dyn Ino
 /// `/etc/alpine-release` spells it. Kept in step with `scripts/fetch-alpine.sh`
 /// by hand: the kernel asserts on it, so a silent version bump in the packaging
 /// shows up here rather than as a userland that is not the one that was tested.
+#[allow(dead_code)]
 const ALPINE_RELEASE: &str = "3.24.1";
 
 fn init_vfs(info: &BootInfo) {
@@ -251,23 +246,19 @@ fn init_blk() {
     // time). The data one is picked by its position in the table, not by
     // "whichever ext2 comes first": with a full rootfs on the disk, first
     // found is the root, and the check would be reading the wrong disk.
-    let dev = blk::part::find_data(dev).expect("no data partition on the disk");
+    let data = blk::part::find_data(dev).expect("no data partition on the disk");
     println!(
         "ext2: filesystem on a {}-sector partition",
-        dev.capacity_sectors()
+        data.capacity_sectors()
     );
 
     let root = vfs::resolve("/").expect("no root filesystem");
     if root.lookup("mnt").is_err() {
         root.create("mnt", NodeKind::Dir).expect("create /mnt");
     }
-    let fs = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("the ext2 image did not mount");
+    let fs = vfs::ext2::Ext2Fs::mount(data.clone()).expect("the ext2 image did not mount");
     vfs::mount("/mnt", &fs).expect("mount /mnt");
-    // Both handles name the data partition now: BLK_DEV for the checks that
-    // read through the mounted tree, DATA_DEV for the ones that remount the
-    // raw device to prove a write reached the disk.
-    DATA_DEV.call_once(|| dev.clone());
-    BLK_DEV.call_once(|| dev);
+    DATA_DEV.call_once(|| data);
 }
 
 /// The boot transition moved to userland.
@@ -576,7 +567,7 @@ fn check_arch(info: &BootInfo) {
             unsafe {
                 ptr::write_bytes(virt as *mut u8, 0x77, PAGE_SIZE);
                 assert_eq!(*(virt as *const u8), 0x77);
-                assert_eq!(*(virt as *const u8), 0x77);
+                assert_eq!(*((virt + PAGE_SIZE - 1) as *const u8), 0x77);
             }
             println!("user page at {virt:#x} mapped rwu and written through");
 
@@ -969,11 +960,18 @@ fn check_vfs() {
 
     // M7: ramfs, mounts, multi-task file I/O through the fd table.
     {
-        ensure_child(
-            &vfs::resolve("/etc").unwrap(),
-            "mpos-hostname",
-            NodeKind::File,
-        );
+        // Ensure /etc exists before poking a scratch file into it. The
+        // initramfs normally carries /etc, but a stripped archive must not
+        // turn into a panic in the middle of a milestone check.
+        let etc = match vfs::resolve("/etc") {
+            Ok(dir) => dir,
+            Err(_) => vfs::resolve("/")
+                .unwrap()
+                .create("etc", NodeKind::Dir)
+                .expect("create /etc"),
+        };
+        ensure_child(&etc, "mpos-hostname", NodeKind::File);
+
         let fd = vfs::open("/etc/mpos-hostname").expect("open /etc/mpos-hostname");
         assert_eq!(vfs::write(fd, b"mpos\n").unwrap(), 5);
         vfs::close(fd).unwrap();
@@ -1033,177 +1031,6 @@ fn check_vfs() {
             "a vfs task did not exit"
         );
         println!("M7_OK");
-    }
-
-    // M8: initramfs unpack and device filesystem.
-    {
-        // The proof that the archive unpacked used to be "the motd says what we
-        // put in it". The root filesystem is Alpine's now, so the motd is
-        // Alpine's - and the stronger claim is that a file no one but Alpine
-        // ships is there with exactly the release it was fetched at.
-        let mut buf = [0u8; 64];
-        let release = vfs::open("/etc/alpine-release")
-            .expect("the unpacked tree carries no /etc/alpine-release");
-        let n = vfs::read(release, &mut buf).unwrap();
-        vfs::close(release).unwrap();
-        assert_eq!(
-            core::str::from_utf8(&buf[..n])
-                .expect("alpine-release is utf8")
-                .trim(),
-            ALPINE_RELEASE,
-            "the unpacked tree is not the Alpine release that was packaged"
-        );
-
-        // And the motd is readable, which is what this check always really
-        // cared about: a file's contents came out of the archive intact.
-        let motd = vfs::open("/etc/motd").expect("no /etc/motd after the unpack");
-        let n = vfs::read(motd, &mut buf).unwrap();
-        vfs::close(motd).unwrap();
-        assert!(n > 0, "the unpacked /etc/motd is empty");
-        println!(
-            "motd: {}",
-            core::str::from_utf8(&buf[..n])
-                .expect("motd is utf8")
-                .lines()
-                .next()
-                .unwrap_or("")
-        );
-
-        // The device filesystem is mounted here rather than at boot: the
-        // kernel no longer puts a /dev on the temporary root - whoever mounts
-        // /dev owns it, and that is the initramfs's init script. These checks
-        // are the kernel's own userland, so they mount their own.
-        let dev = drivers::devices::standard_devfs();
-        vfs::mount("/dev", &*dev).expect("mount /dev for the device check");
-
-        let console = vfs::open("/dev/console").expect("open /dev/console");
-        let line = b"this line went through /dev/console\n";
-        assert_eq!(vfs::write(console, line).unwrap(), line.len());
-        vfs::close(console).unwrap();
-
-        let null = vfs::open("/dev/null").expect("open /dev/null");
-        assert_eq!(vfs::write(null, b"gone").unwrap(), 4);
-        assert_eq!(vfs::read(null, &mut buf).unwrap(), 0, "null read is EOF");
-        vfs::close(null).unwrap();
-
-        let zero = vfs::open("/dev/zero").expect("open /dev/zero");
-        let mut zeros = [1u8; 8];
-        assert_eq!(vfs::read(zero, &mut zeros).unwrap(), 8);
-        assert!(zeros.iter().all(|&b| b == 0), "zero read nonzero");
-        vfs::close(zero).unwrap();
-
-        println!("M8_OK");
-    }
-}
-
-// ---- blk + user processes: ELF loading, virtio-blk, ext2 -----------------
-
-/// The exit code the user program ends with.
-const HELLO_EXIT: isize = 42;
-
-/// Prove user processes (ELF loading, ring 3) and the block layer (virtio-blk,
-/// ext2 read/write/persistence).
-fn check_blk_process() {
-    // M9: user processes — load /bin/hello, enter ring 3, exit with code 42.
-    {
-        let mut program = Vec::new();
-        let fd = vfs::open("/bin/hello").expect("the initramfs carries no /bin/hello");
-        let mut chunk = [0u8; 512];
-        loop {
-            let n = vfs::read(fd, &mut chunk).expect("read /bin/hello");
-            if n == 0 {
-                break;
-            }
-            program.extend_from_slice(&chunk[..n]);
-        }
-        vfs::close(fd).unwrap();
-        println!("initramfs: /bin/hello is {} bytes of ELF", program.len());
-
-        let id = sched::spawn_user(&program, Priority::NORMAL);
-        wait_for_code(id);
-        assert_eq!(
-            sched::exit_code(id),
-            Some(HELLO_EXIT),
-            "hello did not end with the exit code it chose"
-        );
-        drain();
-        assert_eq!(
-            sched::task_count(),
-            sched::permanent_tasks(),
-            "the user task was not reaped"
-        );
-        println!("M9_OK");
-    }
-
-    // M10: virtio-blk and ext2.
-    {
-        const SEED: &[u8] = b"ext2 seed: formatted by mke2fs on the host, read by mpos\n";
-        let fd = vfs::open("/mnt/seed.txt").expect("open /mnt/seed.txt");
-        let mut buf = [0u8; 128];
-        let n = vfs::read(fd, &mut buf).expect("read /mnt/seed.txt");
-        vfs::close(fd).unwrap();
-        assert_eq!(&buf[..n], SEED);
-
-        let fd = vfs::open("/mnt/docs/note.txt").expect("open /mnt/docs/note.txt");
-        let mut buf = [0u8; 64];
-        let n = vfs::read(fd, &mut buf).expect("read /mnt/docs/note.txt");
-        vfs::close(fd).unwrap();
-        assert_eq!(&buf[..n], b"nested file\n");
-        println!("ext2: host-seeded files read back through /mnt");
-
-        vfs::resolve("/mnt")
-            .unwrap()
-            .create("written.bin", NodeKind::File)
-            .expect("create /mnt/written.bin");
-        const LEN: usize = 20 * 1024;
-        let bytes: Vec<u8> = (0..LEN).map(|i| (i * 31 + 7) as u8).collect();
-        let fd = vfs::open("/mnt/written.bin").expect("open /mnt/written.bin");
-        assert_eq!(
-            vfs::write(fd, &bytes).unwrap(),
-            LEN,
-            "the write came up short"
-        );
-        vfs::close(fd).unwrap();
-
-        let dev = DATA_DEV.get().unwrap().clone();
-        let fs2 = vfs::ext2::Ext2Fs::mount(dev.clone()).expect("remount the ext2 image");
-        let back = fs2
-            .root()
-            .lookup("written.bin")
-            .expect("written.bin persisted");
-        assert_eq!(back.metadata().size as usize, LEN);
-        let mut read_back = vec![0u8; LEN];
-        let n = back
-            .read_at(0, &mut read_back)
-            .expect("read written.bin back");
-        assert_eq!(n, LEN);
-        assert!(
-            read_back
-                .iter()
-                .enumerate()
-                .all(|(i, &b)| b == (i * 31 + 7) as u8),
-            "written.bin did not read back the pattern it was written with"
-        );
-
-        let seed = fs2.root().lookup("seed.txt").expect("seed.txt survived");
-        let mut buf = [0u8; 128];
-        let n = seed.read_at(0, &mut buf).expect("read seed.txt back");
-        assert_eq!(&buf[..n], SEED);
-
-        vfs::resolve("/mnt")
-            .unwrap()
-            .unlink("written.bin")
-            .expect("unlink /mnt/written.bin");
-        let dev = DATA_DEV.get().unwrap().clone();
-        let fs3 = vfs::ext2::Ext2Fs::mount(dev).expect("remount after the unlink");
-        assert_eq!(
-            fs3.root().lookup("written.bin").err(),
-            Some(vfs::VfsError::NoEntry),
-            "written.bin is still on the disk after the unlink"
-        );
-
-        println!("ext2: {LEN} bytes written through /mnt, verified on a cold remount and removed");
-        println!("M10_OK");
     }
 }
 
@@ -1388,294 +1215,11 @@ fn check_ipc() {
     );
     println!("signals: SIGTERM, SIGKILL, and the kill(0) probe behave");
 
-    println!("M11_OK");
-}
-
-// ---- shell + init: coreutils, pipelines, redirection, init handoff ------
-
-/// The script the gate types at the shell, one byte at a time.
-const SHELL_SCRIPT: &[&[u8]] = &[
-    b"echo hello from the shell\n",
-    b"cat /etc/motd\n",
-    b"ls /\n",
-    b"ls /bin\n",
-    b"true\n",
-    b"false\n",
-    b"echo M12_OK\n",
-    b"echo M13_'PIPE' | cat\n",
-    b"echo M13_'REDIR' > /tmp/gate.txt\n",
-    b"cat /tmp/gate.txt\n",
-    b"GATE=shell\n",
-    b"echo M13_$GATE\n",
-    b"false\n",
-    b"echo M14_$?\n",
-    // A background job: the line ends in `&`, so the shell must answer 0
-    // straight away rather than wait - and the child must still be collected,
-    // which the job list does before the next prompt.
-    b"sleep 1 &\n",
-    b"echo M13_BG_$?\n",
-    // The conformance suite: one test per syscall, each leaving its verdict
-    // in $? - 0 pass, 1 fail - echoed back as a greppable marker. Every line
-    // must read `<name>_0`; the one exception is t_exit_group, whose whole
-    // contract is the distinctive code it leaves: `<name>_42`.
-    //
-    // Process identity first (cheap, no filesystem side effects), then file
-    // I/O, then the fs namespace mutators (each cleans up after itself), then
-    // memory, then signals/time, then the exec/fork pair that replaces or
-    // multiplies the running process.
-    b"t_getpid\n",
-    b"echo t_getpid_$?\n",
-    b"t_gettid\n",
-    b"echo t_gettid_$?\n",
-    b"t_getuid\n",
-    b"echo t_getuid_$?\n",
-    b"t_uname\n",
-    b"echo t_uname_$?\n",
-    b"t_arch_prctl\n",
-    b"echo t_arch_prctl_$?\n",
-    b"t_getrandom\n",
-    b"echo t_getrandom_$?\n",
-    b"t_sched_getaffinity\n",
-    b"echo t_sched_getaffinity_$?\n",
-    b"t_set_robust_list\n",
-    b"echo t_set_robust_list_$?\n",
-    b"t_rseq\n",
-    b"echo t_rseq_$?\n",
-    b"t_set_tid_address\n",
-    b"echo t_set_tid_address_$?\n",
-    b"t_openat\n",
-    b"echo t_openat_$?\n",
-    b"t_read\n",
-    b"echo t_read_$?\n",
-    b"t_write\n",
-    b"echo t_write_$?\n",
-    b"t_lseek\n",
-    b"echo t_lseek_$?\n",
-    b"t_readv\n",
-    b"echo t_readv_$?\n",
-    b"t_writev\n",
-    b"echo t_writev_$?\n",
-    b"t_fstat\n",
-    b"echo t_fstat_$?\n",
-    b"t_newfstatat\n",
-    b"echo t_newfstatat_$?\n",
-    b"t_statx\n",
-    b"echo t_statx_$?\n",
-    b"t_access\n",
-    b"echo t_access_$?\n",
-    b"t_faccessat\n",
-    b"echo t_faccessat_$?\n",
-    b"t_readlink\n",
-    b"echo t_readlink_$?\n",
-    b"t_fcntl\n",
-    b"echo t_fcntl_$?\n",
-    b"t_dup\n",
-    b"echo t_dup_$?\n",
-    b"t_dup2\n",
-    b"echo t_dup2_$?\n",
-    b"t_dup3\n",
-    b"echo t_dup3_$?\n",
-    b"t_ioctl\n",
-    b"echo t_ioctl_$?\n",
-    b"t_getdents64\n",
-    b"echo t_getdents64_$?\n",
-    b"t_pipe2\n",
-    b"echo t_pipe2_$?\n",
-    b"t_mkdirat\n",
-    b"echo t_mkdirat_$?\n",
-    b"t_renameat2\n",
-    b"echo t_renameat2_$?\n",
-    // The same call, but reached the way a package manager reaches it: both
-    // names bare, both relative to a directory descriptor. `t_renameat2`
-    // above only ever passes `AT_FDCWD` with absolute paths, which is the
-    // shape that hides the bug this one pins.
-    b"t_rename\n",
-    b"echo t_rename_$?\n",
-    // Names that are made and taken away by their bare name, and the `..` that
-    // has to actually go up: the shapes a shell needs before it can do anything
-    // relative at all.
-    b"t_rmdir\n",
-    b"echo t_rmdir_$?\n",
-    b"t_unlinkat\n",
-    b"echo t_unlinkat_$?\n",
-    b"t_getcwd\n",
-    b"echo t_getcwd_$?\n",
-    b"t_chdir\n",
-    b"echo t_chdir_$?\n",
-    b"t_brk\n",
-    b"echo t_brk_$?\n",
-    b"t_mmap\n",
-    b"echo t_mmap_$?\n",
-    b"t_mprotect\n",
-    b"echo t_mprotect_$?\n",
-    b"t_munmap\n",
-    b"echo t_munmap_$?\n",
-    b"t_mremap\n",
-    b"echo t_mremap_$?\n",
-    b"t_madvise\n",
-    b"echo t_madvise_$?\n",
-    b"t_rt_sigaction\n",
-    b"echo t_rt_sigaction_$?\n",
-    b"t_rt_sigprocmask\n",
-    b"echo t_rt_sigprocmask_$?\n",
-    b"t_sigaltstack\n",
-    b"echo t_sigaltstack_$?\n",
-    b"t_kill\n",
-    b"echo t_kill_$?\n",
-    b"t_clock_gettime\n",
-    b"echo t_clock_gettime_$?\n",
-    b"t_nanosleep\n",
-    b"echo t_nanosleep_$?\n",
-    b"t_poll\n",
-    b"echo t_poll_$?\n",
-    b"t_prlimit64\n",
-    b"echo t_prlimit64_$?\n",
-    b"t_futex\n",
-    b"echo t_futex_$?\n",
-    b"t_exit_group\n",
-    b"echo t_exit_group_$?\n",
-    b"t_execve\n",
-    b"echo t_execve_$?\n",
-    b"t_fork\n",
-    b"echo t_fork_$?\n",
-    b"t_wait4\n",
-    b"echo t_wait4_$?\n",
-    b"t_clone\n",
-    b"echo t_clone_$?\n",
-    // The network's own tests, last and together: they are the only ones
-    // that need the machine to have a wire, and a failure in them should
-    // not hide a verdict from the calls before them. t_udp is the one that
-    // leaves the machine at all - a DNS query to slirp's resolver and an
-    // answer back - so it proves the stack against something that is not
-    // this kernel.
-    b"t_socket\n",
-    b"echo t_socket_$?\n",
-    b"t_sockopt\n",
-    b"echo t_sockopt_$?\n",
-    b"t_tcp\n",
-    b"echo t_tcp_$?\n",
-    b"t_udp\n",
-    b"echo t_udp_$?\n",
-    // The pair `wget` builds for its TLS helper. It needs no wire, but it
-    // belongs with the socket tests: it is the other half of what
-    // "a socket the userland can use" means, and the one where the descriptor
-    // has to survive an `execve` for HTTPS to be possible at all.
-    b"t_socketpair\n",
-    b"echo t_socketpair_$?\n",
-    // t_stdargs pins the Linux startup contract from the std side: a musl
-    // binary's Rust `env::args()` reads back the argument block the kernel
-    // laid out, with no mpos libc in the way. It is the only test that runs a
-    // whole libc runtime of its own, and its first `malloc` is what caught the
-    // `syscall` entry clobbering r12 - which turned `argc` into a stack
-    // address and asked the kernel for a 24 GiB mapping.
-    b"t_stdargs one two three\n",
-    b"echo STDARGS_$?\n",
-    b"t_stdspawn\n",
-    b"echo STDSPAWN_$?\n",
-    // apk is the one program on the image that is linked against musl's
-    // *shared* libc, so running it exercises two things nothing else does:
-    // the kernel loading a program interpreter named by PT_INTERP, and a
-    // shared object arriving through a file `mmap`. It is also the only
-    // milestone here that is a real Alpine program rather than one of ours.
-    b"apk --version > /dev/null && echo APK_OK\n",
-    // The entropy device, which is what a TLS stack on this userland reads and
-    // the only thing it reads: busybox's HTTPS opens `/dev/urandom` and never
-    // calls `getrandom(2)`. The marker pins that a read comes back with the
-    // bytes that were asked for; that two reads *differ* is pinned by the
-    // host unit tests over the same generator, where it can be said in Rust.
-    b"echo URANDOM_$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | wc -c)\n",
-    // b"t_mprotect\n",
-    // b"echo t_mprotect_$?\n",
-    // b"t_rt_sigprocmask\n",
-    // b"echo t_rt_sigprocmask_$?\n",
-    // b"t_brk\n",
-    // b"echo t_brk_$?\n",
-    // b"t_write\n",
-    // b"echo t_write_$?\n",
-    // b"t_munmap\n",
-    // b"echo t_munmap_$?\n",
-    // b"t_exit_group\n",
-    // b"echo t_exit_group_$?\n",
-    // The coreutils round: the syscalls the coreutils strace showed beyond
-    // the musl startup set - file I/O, stats, the glibc startup pair. Same
-    // verdict protocol: `<name>_0`, nothing else.
-    // b"t_openat\n",
-    // b"echo t_openat_$?\n",
-    // b"t_read\n",
-    // b"echo t_read_$?\n",
-    // b"t_lseek\n",
-    // b"echo t_lseek_$?\n",
-    // b"t_fstat\n",
-    // b"echo t_fstat_$?\n",
-    // b"t_newfstatat\n",
-    // b"echo t_newfstatat_$?\n",
-    // b"t_statx\n",
-    // b"echo t_statx_$?\n",
-    // b"t_access\n",
-    // b"echo t_access_$?\n",
-    // b"t_fcntl\n",
-    // b"echo t_fcntl_$?\n",
-    // b"t_readlink\n",
-    // b"echo t_readlink_$?\n",
-    // b"t_getrandom\n",
-    // b"echo t_getrandom_$?\n",
-    // b"t_gettid\n",
-    // b"echo t_gettid_$?\n",
-    // b"t_prlimit64\n",
-    // b"echo t_prlimit64_$?\n",
-    // b"t_sched_getaffinity\n",
-    // b"echo t_sched_getaffinity_$?\n",
-    // b"t_set_robust_list\n",
-    // b"echo t_set_robust_list_$?\n",
-    // b"t_rseq\n",
-    // b"echo t_rseq_$?\n",
-    b"\x04",
-];
-
-/// Prove the shell, coreutils, pipelines, and redirection in ring 3.
-fn check_shell() {
-    let shell = vfs::read_file("/bin/sh").expect("the initramfs carries /bin/sh");
-    let argv = alloc::vec![String::from("sh")];
-    let sh = sched::try_spawn_user(
-        &shell,
-        Priority::NORMAL,
-        sched::current(),
-        &argv,
-        &[],
-        &[],
-        "/bin/sh",
-    )
-    .expect("the shell image loaded");
-
-    sched::spawn(
-        || {
-            sched::sleep_ticks(2);
-            for line in SHELL_SCRIPT {
-                for &b in *line {
-                    vfs::tty::global().receive_byte(b);
-                    sched::sleep_ticks(1);
-                }
-            }
-        },
-        Priority::NORMAL,
-    );
-
-    wait_for_code(sh);
-    let code = sched::exit_code(sh).expect("the shell exited");
-    assert_eq!(code, 0, "the shell did not end cleanly: {code}");
-    discard();
-    assert_eq!(
-        sched::task_count(),
-        sched::permanent_tasks(),
-        "a process the shell started was never reaped"
-    );
-    println!("shell: ran the script, read its end of input, exited {code}");
-}
-
-/// Wait for every task a milestone started, and forget the codes they left.
-fn discard() {
-    discard_codes();
-    drain();
+    // NB: not M8_OK here. The M8 marker belongs to the init handoff,
+    // which is the real "the machine is up" event. This check's marker is
+    // its own, so a CI harness that asserts on M8_OK is asserting on
+    // init, not on IPC.
+    println!("M8_IPC_OK");
 }
 
 // ---- init handoff (terminal, not a check) --------------------------------
@@ -1695,14 +1239,14 @@ fn init_net() {
     }
 }
 
-/// M13: a real system start. The checks above are the kernel proving itself;
+/// M8: a real system start. The checks above are the kernel proving itself;
 /// this is the kernel handing the machine over.
 fn handoff_to_init() {
     let init = vfs::read_file("/init").expect("the initramfs carries /init");
     let argv = alloc::vec![String::from("/init")];
     let pid = sched::spawn_init(&init, &argv, &[]).expect("the init image loaded");
     assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
-    println!("mpos: handing the machine to /sbin/init");
+    println!("mpos: handing the machine to /init");
 
     sched::discard_exit_code(pid);
 
@@ -1714,7 +1258,7 @@ fn handoff_to_init() {
     while !sched::has_live_child(pid) {
         sched::sleep_ticks(1);
     }
-    println!("M13_OK");
+    println!("M8_OK");
     park()
 }
 

@@ -24,11 +24,19 @@ const CLD_EXITED: i32 = 1;
 
 pub struct SignalFd {
     ino: Ino,
+    /// `SFD_NONBLOCK`: an empty read answers `EAGAIN` instead of parking.
+    /// nlplug-findfs opens its descriptor nonblocking and reads it in a
+    /// drain loop - a blocking read there would park with the queue empty
+    /// and nothing left to wake it for a while.
+    nonblock: core::sync::atomic::AtomicBool,
 }
 
 impl SignalFd {
-    pub fn new(ino: Ino) -> Arc<SignalFd> {
-        Arc::new(SignalFd { ino })
+    pub fn new(ino: Ino, nonblock: bool) -> Arc<SignalFd> {
+        Arc::new(SignalFd {
+            ino,
+            nonblock: core::sync::atomic::AtomicBool::new(nonblock),
+        })
     }
 
     /// The child whose exit is waiting to be reported, if any. Nothing is
@@ -60,7 +68,11 @@ impl Inode for SignalFd {
             return Err(VfsError::Invalid);
         }
         loop {
-            if let Some(pid) = self.pending_child() {
+            // Reading a signal descriptor *consumes* the signal: the same
+            // pid is never reported twice, which is what lets a caller's
+            // drain loop (`while read > 0`) terminate. The exit code stays
+            // on file - `wait(2)` is still what collects the child.
+            if let Some(pid) = crate::sched::read_sigchld() {
                 buf[..SIGINFO_BYTES].fill(0);
                 // ssi_signo, ssi_errno, ssi_code, ssi_pid - the first four
                 // words, which is as much of the struct a caller reads to
@@ -69,6 +81,9 @@ impl Inode for SignalFd {
                 buf[8..12].copy_from_slice(&CLD_EXITED.to_ne_bytes());
                 buf[12..16].copy_from_slice(&(pid as u32).to_ne_bytes());
                 return Ok(SIGINFO_BYTES);
+            }
+            if self.nonblock.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(VfsError::Again);
             }
             self.wait_for_child();
         }

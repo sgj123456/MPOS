@@ -51,6 +51,25 @@ impl CharDevice for NullDev {
     }
 }
 
+/// `/dev/kmsg`. Writes land in the kernel log ring (`console::log_bytes`),
+/// which is where Linux keeps them too: off the console. An init that files
+/// its banner through this device and prints it to stdout would otherwise be
+/// on the screen twice - once from its own stdout, once from where it filed
+/// it. Reads answer end of file: the ring has no reader yet, and there is
+/// nothing to replay.
+pub struct KmsgDev;
+
+impl CharDevice for KmsgDev {
+    fn read(&self, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write(&self, buf: &[u8]) -> usize {
+        crate::console::log_bytes(buf);
+        buf.len()
+    }
+}
+
 /// Reads are zeros forever, however much is asked; writes vanish.
 pub struct ZeroDev;
 
@@ -107,13 +126,39 @@ impl CharDevice for RandomDev {
 /// because naming a device is the driver's decision, not a caller's.
 pub fn standard_devfs() -> Arc<DevFs> {
     let dev = DevFs::new();
-    dev.register("tty", Arc::new(TtyDev));
+    // The tty names are all doors into the one line discipline, registered as
+    // the line discipline's own inode: a getty's `TIOCSCTTY`, a shell's
+    // `TCGETS` and every `isatty` ask the node itself, and a bare
+    // character-device wrapper cannot answer any of them. `console` stays a
+    // bare device - writes go out, nothing comes back. `ttyS0` is the serial
+    // port's traditional name spelled as a second path to the same line, and
+    // tty1-6 are the virtual consoles a stock /etc/inittab respawns gettys
+    // on - without those names, busybox init's respawn entries fail six times
+    // and back off for five minutes, and the serial port sits with no login
+    // prompt on it at all.
+    let tty = crate::vfs::tty::global();
+    dev.register_node("tty", tty.clone());
+    dev.register_node("ttyS0", tty.clone());
+    for index in 1..=6 {
+        dev.register_node(&alloc::format!("tty{index}"), tty.clone());
+    }
     dev.register("console", Arc::new(ConsoleDev));
-    // The serial port's traditional name, spelled as a second path to the
-    // same line discipline: a getty on ttyS0 and one on the console would
-    // otherwise be two names for a fight over one keyboard.
-    dev.register("ttyS0", Arc::new(TtyDev));
+    // The mountpoints an init expects `/dev` to carry: devpts goes on
+    // /dev/pts, a tmpfs on /dev/shm, and both names have to be there to be
+    // mounted on.
+    dev.register_dir("pts");
+    dev.register_dir("shm");
+
+    // The kernel's ring buffer, as far as this kernel has one: a sink. The
+    // initramfs's init writes its progress there, and a write that fails
+    // would turn every line of its output into an error message instead.
+    dev.register("kmsg", Arc::new(KmsgDev));
     dev.register("null", Arc::new(NullDev));
+    // The pty master's traditional name. A real one hands out slave pairs
+    // on /dev/pts; this kernel's devpts has no master to offer yet, but the
+    // name exists as a character device so an init's `[ -c /dev/ptmx ]`
+    // stops falling through to mknod.
+    dev.register("ptmx", Arc::new(NullDev));
     dev.register("zero", Arc::new(ZeroDev));
     dev.register("random", Arc::new(RandomDev));
     dev.register("urandom", Arc::new(RandomDev));

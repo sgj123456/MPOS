@@ -90,8 +90,14 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::READV => fs::handle_readv(args, from_user),
         nr::ACCESS => fs::access(args, &cwd()),
         nr::FACCESSAT => fs::faccessat(args, &cwd()),
-        nr::READLINK | nr::READLINKAT => fs::readlink(args, &cwd()),
-        nr::SYMLINK | nr::SYMLINKAT => fs::symlink(args, &cwd()),
+        nr::READLINK => fs::readlink(args, &cwd()),
+        nr::READLINKAT => fs::readlinkat(args, &cwd()),
+        // `symlinkat` moves the linkpath to args[2] and puts a dirfd in
+        // args[1] - the plain `symlink` layout would read the dirfd number as
+        // the link's name, which is how apk's library links all ended up as
+        // one junk name in `/` with EEXIST for every one after the first.
+        nr::SYMLINK => fs::symlink(args, &cwd()),
+        nr::SYMLINKAT => fs::symlinkat(args, &cwd()),
 
         // --- sockets: AF_INET over the smoltcp stack ---
         nr::SOCKET => crate::net::socket::handle_socket(args, from_user),
@@ -174,15 +180,30 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::GETTIMEOFDAY => proc::handle_gettimeofday(args),
         nr::UNAME => proc::handle_uname(args, true),
         nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => 0,
-        nr::SETUID | nr::SETGID | nr::SETSID => err::EPERM,
+        // setuid/setgid: this kernel runs everything as uid/gid 0, so a root
+        // login's "become root" calls are already true. Anything else is a
+        // privilege change there is no identity model for.
+        nr::SETUID | nr::SETGID => {
+            if args[0] == 0 {
+                0
+            } else {
+                err::EPERM
+            }
+        }
+        nr::SETSID => proc::handle_setsid(args),
+        nr::GETSID => proc::handle_getsid(args),
+        nr::SETGROUPS => 0,
+        nr::GETGROUPS => 0,
         nr::RT_SIGACTION => sigaction(args),
         nr::RT_SIGPROCMASK => rt_sigprocmask(args),
         nr::RT_SIGRETURN => proc::handle_rt_sigreturn(regs_ptr),
         nr::ARCH_PRCTL => handle_arch_prctl(args),
+        nr::PRCTL => proc::handle_prctl(args),
         nr::GETRANDOM => proc::handle_getrandom(args, true),
         nr::PRLIMIT64 => proc::handle_prlimit64(args, true),
         nr::FUTEX => proc::handle_futex(args),
         nr::SET_TID_ADDRESS => proc::handle_set_tid_address(args),
+        nr::SCHED_SETAFFINITY => proc::handle_sched_setaffinity(args),
         nr::SCHED_GETAFFINITY => proc::handle_sched_getaffinity(args),
         nr::SET_ROBUST_LIST => proc::handle_set_robust_list(args),
         nr::RSEQ => proc::handle_rseq(args),
@@ -222,7 +243,8 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::UMOUNT2 => fs::handle_umount2(args, &cwd()),
         nr::PIVOT_ROOT => fs::handle_pivot_root(args, &cwd()),
         nr::CHROOT => fs::handle_chroot(args, &cwd()),
-        nr::SIGNALFD => fs::handle_signalfd(args, from_user),
+        nr::SIGNALFD => fs::handle_signalfd(args, 0, from_user),
+        nr::SIGNALFD4 => fs::handle_signalfd(args, args[3], from_user),
         nr::EVENTFD => fs::handle_eventfd(args),
         nr::FADVISE64 => fs::handle_fadvise64(args),
         nr::PSELECT6 => fs::pselect6(args),

@@ -281,11 +281,39 @@ pub trait Inode: Send + Sync {
         Err(VfsError::Invalid)
     }
 
+    /// The device number this node carries, as `st_rdev` reports it. Only
+    /// character and block devices answer - `ttyname` in libc identifies its
+    /// descriptor by walking `/dev` and matching this number, and a node
+    /// without one matches nothing.
+    fn rdev(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// The permission bits (the low twelve) the filesystem stores for this
+    /// node, or `0` when it carries none - the caller then falls back to what
+    /// the node's kind implies. ext2 carries the real thing, and OpenRC runs
+    /// on it: it refuses to start any service script a `test -x` rejects, and
+    /// a kernel that hands out one fixed mode per kind leaves every script
+    /// 0644 and every runlevel silent.
+    fn mode(&self) -> u32 {
+        0
+    }
+
     /// Name a new symbolic link in this directory. Separate from [`Inode::create`]
     /// because a link is made of a target, not just a kind - there is nothing
     /// useful to create without one.
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
         let _ = (name, target);
+        Err(VfsError::Unsupported)
+    }
+
+    /// Hard-link `target` into this directory under `name`: a second name for
+    /// the very same inode, the inode's link count going up by one. Linux's
+    /// apk commits every extracted library this way - the versioned file is
+    /// written once and every ABI name is linked to it - so a filesystem
+    /// without this installs half of every package.
+    fn link(&self, name: &str, _target: &Arc<dyn Inode>) -> VfsResult<()> {
+        let _ = name;
         Err(VfsError::Unsupported)
     }
 
@@ -299,12 +327,33 @@ pub trait Inode: Send + Sync {
     }
 }
 
+/// The block/inode accounting `statfs(2)` reports, as the filesystem itself
+/// counts it: `blocks`/`bfree`/`bavail` in `bsize`-sized blocks, `files`/
+/// `ffree` in inodes.
+#[derive(Clone, Copy)]
+pub struct FsStats {
+    pub bsize: u64,
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+}
+
 /// A mounted filesystem instance: what other systems would call a superblock.
 ///
 /// The instance owns the per-mount state (ramfs: its node graph; ext2 later:
 /// its block device handle and on-disk counters) and hands out its root.
 pub trait FileSystem: Send + Sync {
     fn root(&self) -> Arc<dyn Inode>;
+
+    /// The space accounting `statfs(2)` reports, in the filesystem's own
+    /// block units. `None` - the default - says "no real numbers": the
+    /// syscall layer then answers what it can for the type, and a `df` that
+    /// reads zero total blocks filters the mount out, as Linux's own does.
+    fn statfs(&self) -> Option<FsStats> {
+        None
+    }
 
     /// The name `mount(2)` spells this filesystem by, and the one /proc/mounts
     /// reports. A filesystem that cannot be named cannot be mounted from

@@ -60,6 +60,13 @@ pub struct Vfs {
     /// `pivot_root` from the mount that carried the new root in.
     root_fstype: Mutex<RefCell<Option<alloc::string::String>>>,
     root_source: Mutex<RefCell<Option<alloc::string::String>>>,
+    /// The filesystem that *is* `/`, once `pivot_root` has promoted one, and
+    /// its read-only promise. `mount -o remount,rw /` names the root, which is
+    /// not in the mount table to find - these two fields are where that call
+    /// lands - and `/proc/mounts` reports the promise, which a hardcoded "rw"
+    /// turned into a lie the moment an init mounted the root read-only.
+    root_fs: Mutex<RefCell<Option<Arc<dyn FileSystem>>>>,
+    root_read_only: Mutex<RefCell<bool>>,
     /// The source of filesystem instance ids: every mount gets one, and
     /// `stat`'s `st_dev` reports it, which is how userland tells "the same
     /// filesystem" from "a different one".
@@ -77,6 +84,8 @@ impl Vfs {
             mounts: Mutex::new(RefCell::new(Vec::new())),
             root_fstype: Mutex::new(RefCell::new(None)),
             root_source: Mutex::new(RefCell::new(None)),
+            root_fs: Mutex::new(RefCell::new(None)),
+            root_read_only: Mutex::new(RefCell::new(false)),
             fs_seq: Mutex::new(RefCell::new(1)),
             mount_points: Mutex::new(RefCell::new(Vec::new())),
         }
@@ -88,6 +97,11 @@ impl Vfs {
             let mut root = self.root.borrow(cs).borrow_mut();
             assert!(root.is_none(), "the root filesystem is already mounted");
             *root = Some(fs.root());
+            // The root's own type has to be on record from the start: init's
+            // `statfs("/")` reads it, and busybox `switch_root` refuses to run
+            // unless the tree it stands in answers ramfs/tmpfs magic.
+            *self.root_fstype.borrow(cs).borrow_mut() =
+                Some(alloc::string::String::from(fs.name()));
         });
     }
 
@@ -211,6 +225,44 @@ impl Vfs {
         }
     }
 
+    /// The filesystem instance that serves `path` - the same longest-prefix
+    /// winner `fs_of_path` names, but the instance itself, so `statfs(2)` can
+    /// ask it for real block numbers. The root slot (id 0) serves from
+    /// `root_fs`; a table entry serves from its own `fs`.
+    pub fn fs_serving_path(&self, path: &str) -> Option<alloc::sync::Arc<dyn super::FileSystem>> {
+        let (id, _) = self.fs_of_path(path);
+        critical_section::with(|cs| {
+            if id == 0 {
+                self.root_fs.borrow(cs).borrow().clone()
+            } else {
+                self.mounts
+                    .borrow(cs)
+                    .borrow()
+                    .iter()
+                    .find(|m| m.id == id)
+                    .and_then(|m| m.fs.clone())
+            }
+        })
+    }
+
+    /// The filesystem instance that serves `inode`: a mount's own root names
+    /// that mount; anything else is served by the root filesystem - the same
+    /// rule `fstype_of_inode` spells by type.
+    pub fn fs_serving_inode(
+        &self,
+        inode: &alloc::sync::Arc<dyn super::Inode>,
+    ) -> Option<alloc::sync::Arc<dyn super::FileSystem>> {
+        critical_section::with(|cs| {
+            self.mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .find(|m| alloc::sync::Arc::ptr_eq(&m.root, inode))
+                .and_then(|m| m.fs.clone())
+                .or_else(|| self.root_fs.borrow(cs).borrow().clone())
+        })
+    }
+
     /// Make `inode` the global root, dropping every mount. `chroot(2)`'s
     /// shape: the caller has already decided what the root is, and this
     /// kernel has one namespace.
@@ -222,21 +274,90 @@ impl Vfs {
     }
 
     /// `mount(2)`'s MS_MOVE: the filesystem mounted at `at` becomes the root.
-    /// The mount entry moves out of the table and into the root slot; the
-    /// old tree's remaining mounts go with the old tree.
+    /// The mount entry moves out of the table and into the root slot.
+    ///
+    /// The mounts that survive are the ones whose mount points live *inside*
+    /// the promoted tree - an initramfs has already moved `/proc`, `/sys` and
+    /// `/dev` onto directories under the new root before `switch_root` runs,
+    /// and those names are exactly what the new root's processes expect to
+    /// find. The rest are anchored in the old tree, which is about to be
+    /// unmounted out from under them; keeping them would leave entries
+    /// pointing at nodes nothing resolves any more.
     pub fn move_root(&self, at: &Arc<dyn Inode>) -> VfsResult<()> {
+        // Named outside the table lock: `path_of` walks the tree and takes
+        // the same lock this edit needs, so every mount point is named first
+        // and judged afterwards.
+        let promoted = self.path_of(at);
+        let named: alloc::vec::Vec<(Arc<dyn Inode>, Option<alloc::string::String>)> =
+            critical_section::with(|cs| {
+                self.mounts
+                    .borrow(cs)
+                    .borrow()
+                    .iter()
+                    .map(|m| (m.at.clone(), self.path_of(&m.at)))
+                    .collect()
+            });
+        let follows = |path: &Option<alloc::string::String>| match (&promoted, path) {
+            (Some(base), Some(p)) => {
+                p == base.as_str() || p.starts_with(&alloc::format!("{base}/"))
+            }
+            // A mount point the current tree cannot name - or a promotion of
+            // a node with no name - stays behind with the old tree.
+            _ => false,
+        };
         critical_section::with(|cs| {
             let mut mounts = self.mounts.borrow(cs).borrow_mut();
             let pos = mounts
                 .iter()
-                .position(|m| Arc::ptr_eq(&m.at, at))
+                .position(|m| Arc::ptr_eq(&m.at, at) || Arc::ptr_eq(&m.root, at))
                 .ok_or(VfsError::Invalid)?;
             let m = mounts.remove(pos);
             *self.root.borrow(cs).borrow_mut() = Some(m.root.clone());
             *self.root_fstype.borrow(cs).borrow_mut() = Some(m.fstype.clone());
             *self.root_source.borrow(cs).borrow_mut() = Some(m.source.clone());
-            mounts.clear();
-            let _ = m.read_only;
+            // The promoted filesystem keeps its own promise about writes: an
+            // init that mounted its root read-only hands a read-only root on,
+            // and the `root` service's later remount,rw is what lifts it.
+            *self.root_fs.borrow(cs).borrow_mut() = m.fs.clone();
+            *self.root_read_only.borrow(cs).borrow_mut() = m.read_only;
+            mounts.retain(|e| {
+                named
+                    .iter()
+                    .find(|(node, _)| Arc::ptr_eq(node, &e.at))
+                    .is_some_and(|(_, path)| follows(path))
+            });
+            Ok(())
+        })?;
+        self.refresh_mount_points();
+        Ok(())
+    }
+
+    /// `mount(2)`'s MS_MOVE in its ordinary form: the filesystem mounted at
+    /// `source` is re-homed on the directory `at`, and every other mount stays
+    /// exactly where it was. This is what an initramfs does with the
+    /// directories it mounted before finding the real root - `/proc`, `/sys`
+    /// and `/dev` move under it rather than being mounted there a second
+    /// time, which is both impossible (the names are taken) and wrong (the
+    /// new root would see empty directories where its processes expect the
+    /// devices and the process tables).
+    ///
+    /// `source` is named the way a caller names a mounted directory - a path
+    /// that resolves *into* the mount - so the entry is found by the root it
+    /// serves, the way `umount` finds its.
+    pub fn move_mount(&self, source: &Arc<dyn Inode>, at: &Arc<dyn Inode>) -> VfsResult<()> {
+        if at.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        critical_section::with(|cs| {
+            let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            if mounts.iter().any(|m| Arc::ptr_eq(&m.at, at)) {
+                return Err(VfsError::Busy);
+            }
+            let entry = mounts
+                .iter_mut()
+                .find(|m| Arc::ptr_eq(&m.root, source))
+                .ok_or(VfsError::Invalid)?;
+            entry.at = at.clone();
             Ok(())
         })?;
         self.refresh_mount_points();
@@ -286,11 +407,35 @@ impl Vfs {
     /// `mount -o remount,...`: change the flags on a filesystem that is
     /// already mounted, without mounting anything.
     pub fn remount(&self, at: &Arc<dyn Inode>, read_only: bool) -> VfsResult<()> {
+        // The root slot first. The filesystem that *is* `/` never entered the
+        // mount table - it is reached directly - and `mount -o remount,rw /`
+        // is exactly how an init's `root` service asks to have it writable.
+        let is_root = critical_section::with(|cs| {
+            self.root
+                .borrow(cs)
+                .borrow()
+                .as_ref()
+                .is_some_and(|root| Arc::ptr_eq(root, at))
+        });
+        if is_root {
+            let fs = critical_section::with(|cs| self.root_fs.borrow(cs).borrow().clone());
+            if let Some(fs) = fs {
+                fs.set_read_only(read_only);
+            }
+            critical_section::with(|cs| {
+                *self.root_read_only.borrow(cs).borrow_mut() = read_only;
+            });
+            return Ok(());
+        }
         critical_section::with(|cs| {
             let mut mounts = self.mounts.borrow(cs).borrow_mut();
             let entry = mounts
                 .iter_mut()
-                .find(|m| Arc::ptr_eq(&m.at, at))
+                // The mountpoint's own inode is what `mount(2)` recorded, but
+                // a caller that resolved the path (`remount dev /dev`) holds
+                // the mounted *root* - the resolver crossed into the mount.
+                // Either name is the same filesystem to remount.
+                .find(|m| Arc::ptr_eq(&m.at, at) || Arc::ptr_eq(&m.root, at))
                 .ok_or(VfsError::NoEntry)?;
             if let Some(fs) = entry.fs.clone() {
                 fs.set_read_only(read_only);
@@ -395,13 +540,18 @@ impl Vfs {
             // The root's own identity comes from the mount that made
             // `new_root` reachable: after the pivot that mount is gone, but
             // /proc/mounts still has to say what `/` is and what it came from.
+            // Its write promise travels too - a read-only mount read-only
+            // stays - together with the filesystem itself, so a later
+            // `remount,rw /` can reach the thing that refuses the writes.
             if let Some(entry) = mounts
                 .iter()
                 .find(|m| Arc::ptr_eq(&m.root, &new_root_inode))
-                .map(|m| (m.fstype.clone(), m.source.clone()))
+                .map(|m| (m.fstype.clone(), m.source.clone(), m.read_only, m.fs.clone()))
             {
                 *self.root_fstype.borrow(cs).borrow_mut() = Some(entry.0);
                 *self.root_source.borrow(cs).borrow_mut() = Some(entry.1);
+                *self.root_read_only.borrow(cs).borrow_mut() = entry.2;
+                *self.root_fs.borrow(cs).borrow_mut() = entry.3;
             }
             // Every mount in the table was attached somewhere in the old tree -
             // /dev, /tmp, the new root itself - and none of them can be reached
@@ -598,7 +748,11 @@ impl Vfs {
                         .unwrap_or_else(|| child.clone())
                 });
                 let path = alloc::format!("{prefix}/{name}");
-                if Arc::ptr_eq(&reached, target) {
+                // Two names for one place: `target` may be the directory the
+                // mount sits on - how the mount table asks - or the mounted
+                // filesystem's own root, how a walk through the mount sees
+                // it. Both spell `/proc` here.
+                if Arc::ptr_eq(&child, &target) || Arc::ptr_eq(&reached, &target) {
                     return Some(path);
                 }
                 if kind == NodeKind::Dir {
@@ -625,9 +779,10 @@ impl Vfs {
         // The table is copied out first: naming each mount point walks the
         // tree, and that walk takes the same lock. Nested takes of the one
         // critical section are not something to lean on.
-        let (root_fstype, root_source, entries) = critical_section::with(|cs| {
+        let (root_fstype, root_source, root_read_only, entries) = critical_section::with(|cs| {
             let fstype = self.root_fstype.borrow(cs).borrow().clone();
             let source = self.root_source.borrow(cs).borrow().clone();
+            let ro = self.root_read_only.borrow(cs).borrow().clone();
             let entries: Vec<(
                 Arc<dyn Inode>,
                 alloc::string::String,
@@ -647,7 +802,7 @@ impl Vfs {
                     )
                 })
                 .collect();
-            (fstype, source, entries)
+            (fstype, source, ro, entries)
         });
         let mut lines = Vec::new();
         if let (Some(fstype), Some(source)) = (root_fstype, root_source) {
@@ -655,7 +810,7 @@ impl Vfs {
                 source,
                 alloc::string::String::from("/"),
                 fstype,
-                alloc::string::String::from("rw"),
+                alloc::string::String::from(if root_read_only { "ro" } else { "rw" }),
             ));
         }
         for (at, source, fstype, read_only) in entries {
@@ -893,6 +1048,18 @@ pub fn fs_of_path(path: &str) -> (u64, alloc::string::String) {
     STATIC.fs_of_path(path)
 }
 
+/// The space accounting of the filesystem that serves `path`, straight from
+/// the instance. `None` when the serving filesystem has no real numbers
+/// (ramfs and friends answer through the syscall layer instead).
+pub fn fs_stats_of_path(path: &str) -> Option<super::FsStats> {
+    STATIC.fs_serving_path(path).and_then(|fs| fs.statfs())
+}
+
+/// The same, for an inode with no path - `fstatfs(2)`'s descriptor shape.
+pub fn fs_stats_of_inode(inode: &Arc<dyn Inode>) -> Option<super::FsStats> {
+    STATIC.fs_serving_inode(inode).and_then(|fs| fs.statfs())
+}
+
 /// The type of the filesystem a node belongs to, by identity: a mount's own
 /// root names that mount; anything else names the root filesystem.
 pub fn fstype_of_inode(inode: &Arc<dyn Inode>) -> alloc::string::String {
@@ -949,6 +1116,11 @@ pub fn chroot(path: &str, cwd: &Arc<dyn Inode>) -> VfsResult<()> {
 /// `at` becomes the root.
 pub fn move_root(at: &Arc<dyn Inode>) -> VfsResult<()> {
     STATIC.move_root(at)
+}
+
+/// Re-home the mount serving `source` on the directory `at`.
+pub fn move_mount(source: &Arc<dyn Inode>, at: &Arc<dyn Inode>) -> VfsResult<()> {
+    STATIC.move_mount(source, at)
 }
 
 /// Resolve `path` in the kernel's tree.

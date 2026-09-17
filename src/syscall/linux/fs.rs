@@ -34,13 +34,29 @@ fn base_of(dirfd: i32, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
 }
 
 /// The mode bits `struct stat` and `struct statx` carry for a node.
-fn mode_of(meta: &Metadata) -> u32 {
-    match meta.kind {
-        NodeKind::File => 0o100_644,     // regular file rw-r--r--
-        NodeKind::Dir => 0o040_755,      // directory rwxr-xr-x
-        NodeKind::CharDev => 0o020_666,  // character device rw-rw-rw-
-        NodeKind::BlockDev => 0o060_660, // block device brw-rw----
-        NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
+fn mode_of(meta: &Metadata, stored: u32) -> u32 {
+    // The format bits follow the kind - `st_mode`'s top nibble is a type
+    // tag, not a permission. The permission bits are the filesystem's own
+    // when it stores them (ext2 does, and OpenRC's `test -x` gate lives on
+    // them); a filesystem without them gets the kind's default, which keeps
+    // directories traversable and devices usable.
+    let format = match meta.kind {
+        NodeKind::File => 0o100_000,
+        NodeKind::Dir => 0o040_000,
+        NodeKind::CharDev => 0o020_000,
+        NodeKind::BlockDev => 0o060_000,
+        NodeKind::Symlink => 0o120_000,
+    };
+    if stored != 0 {
+        format | (stored & 0o7777)
+    } else {
+        match meta.kind {
+            NodeKind::File => 0o100_644,     // regular file rw-r--r--
+            NodeKind::Dir => 0o040_755,      // directory rwxr-xr-x
+            NodeKind::CharDev => 0o020_666,  // character device rw-rw-rw-
+            NodeKind::BlockDev => 0o060_660, // block device brw-rw----
+            NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
+        }
     }
 }
 
@@ -85,11 +101,16 @@ fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
     match opened {
         Ok(fd) => {
             // A directory description remembers the path it was opened by, so
-            // a later `fchdir` can give the cwd a name `getcwd` reads back.
-            // Files are left unlabelled: only a directory can be a cwd.
+            // a later `fchdir` can give the cwd a name `getcwd` reads back. A
+            // character device remembers too: libc's `ttyname` names the tty
+            // by reading `/proc/self/fd/<n>`, and a nameless descriptor reads
+            // back as nothing at all.
             if let Some(label) = label
                 && let Ok(file) = crate::sched::current_fds().clone_at(fd)
-                && file.metadata().kind == crate::vfs::NodeKind::Dir
+                && matches!(
+                    file.metadata().kind,
+                    crate::vfs::NodeKind::Dir | crate::vfs::NodeKind::CharDev
+                )
             {
                 file.set_label(label);
             }
@@ -172,14 +193,22 @@ pub(super) fn stat_legacy(nr: u64, args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode
 /// `fstat(fd, buf)` - the fd's description, not a path, is what is statted.
 pub(super) fn fstat(args: [usize; ARG_COUNT]) -> isize {
     let (fd, buf) = (args[0] as i32, args[1]);
-    let (meta, dev) = match crate::sched::current_fds().clone_at(fd) {
-        Ok(file) => (
-            file.metadata(),
-            crate::vfs::mount::fs_id_of_inode(&file.inode()),
-        ),
+    let (meta, dev, rdev, stored) = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => {
+            let inode = file.inode();
+            // The filesystem a descriptor belongs to is named by the path it
+            // was opened through - the same answer `stat` by path would give,
+            // which is what libc's `ttyname` compares the two sides of. A
+            // nameless descriptor falls back to the mount-table lookup.
+            let dev = match file.label() {
+                Some(path) => crate::vfs::mount::fs_of_path(&path).0,
+                None => crate::vfs::mount::fs_id_of_inode(&inode),
+            };
+            (file.metadata(), dev, inode.rdev(), inode.mode())
+        }
         Err(e) => return err_of(e),
     };
-    write_stat(buf, &meta, dev)
+    write_stat(buf, &meta, dev, rdev, stored)
 }
 
 /// `flock(fd, operation)` - the advisory whole-file lock `apk` takes on its
@@ -261,7 +290,8 @@ pub(super) fn fstatfs(args: [usize; ARG_COUNT]) -> isize {
         Err(e) => return err_of(e),
     };
     let fstype = crate::vfs::mount::fstype_of_inode(&inode);
-    write_statfs(args[1], &fstype)
+    let stats = crate::vfs::mount::fs_stats_of_inode(&inode);
+    write_statfs(args[1], &fstype, stats)
 }
 
 /// `statfs(path, buf)` - the path spelling of `fstatfs`, and the one that
@@ -274,8 +304,10 @@ pub(super) fn statfs(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     };
     match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
         Ok(_) => {
-            let (_id, fstype) = crate::vfs::mount::fs_of_path(&absolute(&path));
-            write_statfs(args[1], &fstype)
+            let abs = absolute(&path);
+            let stats = crate::vfs::mount::fs_stats_of_path(&abs);
+            let (_id, fstype) = crate::vfs::mount::fs_of_path(&abs);
+            write_statfs(args[1], &fstype, stats)
         }
         Err(e) => err_of(e),
     }
@@ -305,14 +337,18 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
         if flags & AT_EMPTY_PATH == 0 {
             return err::ENOENT;
         }
-        let (meta, dev) = match crate::sched::current_fds().clone_at(dirfd) {
-            Ok(file) => (
-                file.metadata(),
-                crate::vfs::mount::fs_id_of_inode(&file.inode()),
-            ),
+        let (meta, dev, rdev, stored) = match crate::sched::current_fds().clone_at(dirfd) {
+            Ok(file) => {
+                let inode = file.inode();
+                let dev = match file.label() {
+                    Some(path) => crate::vfs::mount::fs_of_path(&path).0,
+                    None => crate::vfs::mount::fs_id_of_inode(&inode),
+                };
+                (file.metadata(), dev, inode.rdev(), inode.mode())
+            }
             Err(e) => return err_of(e),
         };
-        return write_stat(buf, &meta, dev);
+        return write_stat(buf, &meta, dev, rdev, stored);
     }
     let base = match base_of(dirfd, cwd) {
         Ok(base) => base,
@@ -321,19 +357,19 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
     // `lstat` is the one call that wants the link and not its target, so it
     // walks to the parent and looks the name up there - a resolver that
     // followed links would hand back the very thing it was told not to.
-    let meta = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+    let (meta, rdev, stored) = if flags & AT_SYMLINK_NOFOLLOW != 0 {
         match crate::vfs::global().resolve_no_follow(&path, base) {
-            Ok(inode) => inode.metadata(),
+            Ok(inode) => (inode.metadata(), inode.rdev(), inode.mode()),
             Err(e) => return err_of(e),
         }
     } else {
         match crate::vfs::resolve_opt(&path, Some(base)) {
-            Ok(inode) => inode.metadata(),
+            Ok(inode) => (inode.metadata(), inode.rdev(), inode.mode()),
             Err(e) => return err_of(e),
         }
     };
     let (dev, _fstype) = crate::vfs::mount::fs_of_path(&absolute(&path));
-    write_stat(buf, &meta, dev)
+    write_stat(buf, &meta, dev, rdev, stored)
 }
 
 /// `statx(dirfd, path, flags, mask, buf)` - the extended stat uutils calls.
@@ -353,12 +389,15 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     };
     // An empty path names the descriptor, but only when the caller said so:
     // Linux requires AT_EMPTY_PATH and answers ENOENT for the unannounced form.
-    let meta = if path.is_empty() {
+    let (meta, rdev, stored) = if path.is_empty() {
         if _flags & AT_EMPTY_PATH == 0 {
             return err::ENOENT;
         }
         match crate::sched::current_fds().clone_at(dirfd) {
-            Ok(file) => file.metadata(),
+            Ok(file) => {
+                let inode = file.inode();
+                (file.metadata(), inode.rdev(), inode.mode())
+            }
             Err(e) => return err_of(e),
         }
     } else {
@@ -367,7 +406,7 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Err(e) => return e,
         };
         match crate::vfs::resolve_opt(&path, Some(base)) {
-            Ok(inode) => inode.metadata(),
+            Ok(inode) => (inode.metadata(), inode.rdev(), inode.mode()),
             Err(e) => return err_of(e),
         }
     };
@@ -381,10 +420,14 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         (at(0) as *mut u32).write_volatile(mask & STATX_BASIC_STATS); // stx_mask
         (at(4) as *mut u32).write_volatile(512); // stx_blksize
         (at(16) as *mut u32).write_volatile(if meta.kind == NodeKind::Dir { 2 } else { 1 }); // stx_nlink
-        (at(28) as *mut u16).write_volatile(mode_of(&meta) as u16); // stx_mode
+        (at(28) as *mut u16).write_volatile(mode_of(&meta, stored) as u16); // stx_mode
         (at(32) as *mut u64).write_volatile(meta.ino); // stx_ino
         (at(40) as *mut u64).write_volatile(meta.size); // stx_size
         (at(48) as *mut u64).write_volatile(meta.size.div_ceil(512) as u64); // stx_blocks
+        if let Some((major, minor)) = rdev {
+            (at(72) as *mut u32).write_volatile(major); // stx_rdev_major
+            (at(76) as *mut u32).write_volatile(minor); // stx_rdev_minor
+        }
     }
     0
 }
@@ -645,12 +688,22 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         Ok(inode) => (inode, false),
         // Renaming onto an existing file replaces it - unless the caller
         // asked for NOREPLACE, which is the one flag that protects the name.
+        // What gets replaced is the *name*, whatever kind it holds: resolving
+        // here would follow a symlink and write the replacement's bytes into
+        // the file it points at - a library's real body overwritten by a
+        // link's two-line target, which is exactly what apk's library
+        // commits do and what corrupted the tree. Drop the old name and make
+        // a plain file in its place instead.
         Err(crate::vfs::VfsError::Exists) => {
             if flags & RENAME_NOREPLACE != 0 {
                 return err::EEXIST;
             }
-            match crate::vfs::resolve_opt(&new_path, Some(new_base)) {
-                Ok(inode) => (inode, true),
+            match crate::vfs::unlink_opt(&new_path, Some(new_base)) {
+                Ok(()) => {}
+                Err(e) => return err_of(e),
+            }
+            match dir.create(&name, NodeKind::File) {
+                Ok(inode) => (inode, false),
                 Err(e) => return err_of(e),
             }
         }
@@ -692,6 +745,21 @@ pub(super) fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
     };
     let target: String = if path == "/proc/self/exe" {
         crate::sched::current_exe()
+    } else if let Some(rest) = path.strip_prefix("/proc/self/fd/") {
+        // The descriptor's own path: what libc's `ttyname` reads to name the
+        // tty a login session is on. The fd must be one of the caller's, and
+        // the answer is the name it was opened by.
+        let fd: i32 = match rest.parse() {
+            Ok(n) => n,
+            Err(_) => return err::ENOENT,
+        };
+        match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) => match file.label().or_else(|| path_of(&file.inode())) {
+                Some(p) => p,
+                None => return err::ENOENT,
+            },
+            Err(e) => return err_of(e),
+        }
     } else {
         // The link, not what it points at: a resolver that followed it would
         // answer EINVAL for every link and the target for nothing.
@@ -708,6 +776,19 @@ pub(super) fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
         core::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n);
     }
     n as isize
+}
+
+/// `readlinkat(dirfd, path, buf, bufsiz)` - the dirfd form of `readlink`.
+///
+/// The arguments shift by one: the dirfd sits in `args[0]` and the path in
+/// `args[1]`, so the plain `readlink` layout would read the dirfd number as
+/// the path and answer ENOENT for every caller.
+pub(super) fn readlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let base = match base_of(args[0] as i32, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    readlink([args[1], args[2], args[3], 0, 0, 0], &base)
 }
 
 /// `symlink(target, linkpath)` — name a link that stands for `target`.
@@ -740,8 +821,20 @@ pub(super) fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(_) => 0,
         Err(e) => err_of(e),
     };
-    crate::println!("TRACE symlink target={:?} path={:?} -> {}", target, path, r);
     r
+}
+
+/// `symlinkat(target, newdirfd, linkpath)` - the dirfd form of `symlink`.
+///
+/// The dirfd names where the link lands: `AT_FDCWD` means the caller's
+/// directory, anything else is a directory descriptor apk keeps open across
+/// the whole extraction of a package.
+pub(super) fn symlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let base = match base_of(args[1] as i32, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    symlink([args[0], args[2], 0, 0, 0, 0], &base)
 }
 
 /// `mount(source, target, fstype, flags, data)`.
@@ -797,17 +890,31 @@ pub(super) fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
             Ok(s) => s,
             Err(e) => return err_of(e),
         };
-        match crate::vfs::mount::move_root(&src) {
-            Ok(()) => {
-                // The caller was standing in the tree that just stopped being
-                // mounted anywhere; the new root is the only place left to
-                // stand, and every name it uses from here resolves there.
-                if let Ok(root) = crate::vfs::resolve("/") {
-                    crate::sched::set_cwd(root);
-                    crate::sched::set_cwd_path(alloc::string::String::from("/"));
+        // A move onto `/` is not a re-homing - nothing can be "the directory
+        // under /" when / is the tree the move puts there. That spelling is
+        // what `switch_root` uses to make the tree it stands in the root: the
+        // mount carrying it is promoted, the table it leaves behind is
+        // dropped, and the caller's cwd follows, because the names it was
+        // using resolved through a tree that is no longer mounted anywhere.
+        if target.trim_end_matches('/').is_empty() {
+            return match crate::vfs::mount::move_root(&src) {
+                Ok(()) => {
+                    if let Ok(root) = crate::vfs::resolve("/") {
+                        crate::sched::set_cwd(root);
+                        crate::sched::set_cwd_path(alloc::string::String::from("/"));
+                    }
+                    0
                 }
-                0
-            }
+                Err(e) => err_of(e),
+            };
+        }
+        // The ordinary move: one mount, re-homed, everything else untouched.
+        let at = match crate::vfs::resolve_opt(&target, Some(cwd.clone())) {
+            Ok(at) => at,
+            Err(e) => return err_of(e),
+        };
+        match crate::vfs::mount::move_mount(&src, &at) {
+            Ok(()) => 0,
             Err(e) => err_of(e),
         }
     } else {
@@ -955,15 +1062,21 @@ pub(super) fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
 
 /// `signalfd(fd, mask, flags)` - signals as a descriptor. The mask is read and
 /// honoured in the one way this kernel has signals to wait for: child exits.
-pub(super) fn handle_signalfd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+///
+/// `flags` sits in the fourth slot of the `signalfd4` ABI musl makes; the
+/// plain number routes a zero here, because the original spelling has no
+/// flags at all - reading `args[2]` for it would take the mask *size* for a
+/// flag word and drop the caller's nonblock silently.
+pub(super) fn handle_signalfd(args: [usize; ARG_COUNT], flags: usize, from_user: bool) -> isize {
     const SFD_NONBLOCK: usize = 0x800;
     // Only the mask's validity is checked: this kernel reports child exits,
     // and a caller that asked for others asked for signals it cannot get here.
     if !crate::syscall::buffer_ok(args[1], 8, false, from_user) {
         return err::EFAULT;
     }
-    let fd = crate::vfs::open_inode(crate::vfs::signalfd::SignalFd::new(next_anon_ino()));
-    if args[2] & SFD_NONBLOCK != 0
+    let nonblock = flags & SFD_NONBLOCK != 0;
+    let fd = crate::vfs::open_inode(crate::vfs::signalfd::SignalFd::new(next_anon_ino(), nonblock));
+    if nonblock
         && let Ok(file) = crate::sched::current_fds().clone_at(fd)
     {
         file.set_status(crate::vfs::file::O_NONBLOCK);
@@ -1223,12 +1336,14 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         if expired {
             break 0;
         }
-        match deadline {
-            // Nobody is going to wake us on a timer, so sleep until a node
-            // does. The loop re-checks: another reader may have taken it.
-            None => crate::sched::block_until(|| check_ready(fds, &nodes) > 0),
-            Some(_) => crate::sched::sleep_ticks(1),
-        }
+        // One tick of sleep, then a fresh check - the same wait the bounded
+        // form uses. Parking in `block_until` here would need a waker behind
+        // every descriptor: a tty or a pipe has one (poll_subscribe), but a
+        // netlink uevent socket, a signalfd and an eventfd do not - and
+        // `nlplug-findfs` parks exactly that way, with no timeout, for the
+        // events its trigger thread provokes. Ten milliseconds of polling is
+        // what keeps such a wait from sleeping forever.
+        crate::sched::sleep_ticks(1);
     };
 
     for node in nodes.iter().flatten() {
@@ -1432,11 +1547,11 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
             // recorded readiness is refreshed once it returns, for the
             // write-back below.
             None => {
-                crate::sched::block_until(|| {
-                    watches
-                        .iter()
-                        .any(|watch| matches!(watch_ready(watch), (true, _) | (_, true)))
-                });
+                // Poll once a tick rather than park: the descriptors without
+                // a poll_subscribe behind them - netlink, signalfd, eventfd -
+                // have no waker to hand, and a blocked wait would never be
+                // told they turned ready. poll's unbounded wait does the same.
+                crate::sched::sleep_ticks(1);
                 ready = watches.iter().map(watch_ready).collect();
             }
             Some(_) => {
@@ -1511,13 +1626,19 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
 /// the struct rather than as indices into a `u64` view - an off-by-one word
 /// here is invisible to every caller that only reads `st_mode`, and silently
 /// answers "empty file" to the ones that ask for `st_size`.
-fn write_stat(buf: usize, meta: &Metadata, dev: u64) -> isize {
+fn write_stat(buf: usize, meta: &Metadata, dev: u64, rdev: Option<(u32, u32)>, stored: u32) -> isize {
     if !buffer_ok(buf, 144, true, true) {
         return err::EFAULT;
     }
     let nlink: u64 = if meta.kind == NodeKind::Dir { 2 } else { 1 };
     let size = meta.size;
     let blocks: u64 = size.div_ceil(512);
+    // The device number a character device node carries, packed the way
+    // `makedev` lays it out: major in the high bytes, minor in the low.
+    let packed_rdev = match rdev {
+        Some((major, minor)) => ((major as u64) << 8) | (minor as u64 & 0xff) | 0,
+        None => 0,
+    };
 
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 144);
@@ -1529,9 +1650,11 @@ fn write_stat(buf: usize, meta: &Metadata, dev: u64) -> isize {
         (at(0) as *mut u64).write_volatile(dev);
         (at(8) as *mut u64).write_volatile(meta.ino); // st_ino
         (at(16) as *mut u64).write_volatile(nlink); // st_nlink
-        (at(24) as *mut u32).write_volatile(mode_of(meta)); // st_mode
-        // st_uid, st_gid, the pad word and st_rdev stay 0: one user, no
-        // devices named here.
+        (at(24) as *mut u32).write_volatile(mode_of(meta, stored)); // st_mode
+        // st_uid, st_gid and the pad word stay 0: one user. st_rdev carries
+        // the node's own device number - the identity libc's `ttyname`
+        // matches a descriptor by.
+        (at(40) as *mut u64).write_volatile(packed_rdev); // st_rdev
         (at(48) as *mut u64).write_volatile(size); // st_size
         (at(56) as *mut u64).write_volatile(512); // st_blksize
         (at(64) as *mut u64).write_volatile(blocks); // st_blocks
@@ -1547,10 +1670,11 @@ fn write_stat(buf: usize, meta: &Metadata, dev: u64) -> isize {
 /// whether the root it stands in is an initramfs, and answering "ext2" for a
 /// ramfs is what made it refuse to switch.
 ///
-/// The block counts are coarse: they say "memory-sized" for the kernel's own
-/// trees and nothing yet for ext2, whose superblock statistics do not reach
-/// the VFS.
-fn write_statfs(buf: usize, name: &str) -> isize {
+/// The block counts are real for a filesystem that reports them (ext2, from
+/// its superblock and group descriptors) and "memory-sized" for the kernel's
+/// own trees. A filesystem with neither - and one that reports zero total
+/// blocks - is what `df` filters out, exactly as Linux's own does.
+fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> isize {
     if !buffer_ok(buf, 120, true, true) {
         return err::EFAULT;
     }
@@ -1565,30 +1689,43 @@ fn write_statfs(buf: usize, name: &str) -> isize {
         "ext2" | "ext3" | "ext4" => 0x0000EF53,
         _ => 0,
     };
-    // Memory-backed trees are as big as the frame allocator; ext2's own
-    // numbers are not carried into the VFS yet and read as zero.
-    let memory_backed = matches!(name, "ramfs" | "tmpfs" | "devfs" | "devtmpfs");
-    let (blocks, free) = if memory_backed {
-        critical_section::with(|cs| {
-            let pmm = crate::mm::PMM.borrow(cs).borrow();
-            (
-                (pmm.total_frames() * 4) as u64,
-                (pmm.free_frames() * 4) as u64,
-            )
-        })
+    // Memory-backed trees are as big as the frame allocator; a filesystem
+    // with its own accounting answers with those numbers instead.
+    let (bsize, blocks, free, files, ffree) = if let Some(s) = stats {
+        (
+            s.bsize,
+            s.blocks,
+            s.bfree,
+            s.files,
+            s.ffree,
+        )
     } else {
-        (0, 0)
+        let memory_backed = matches!(name, "ramfs" | "tmpfs" | "devfs" | "devtmpfs");
+        if memory_backed {
+            critical_section::with(|cs| {
+                let pmm = crate::mm::PMM.borrow(cs).borrow();
+                (
+                    4096u64,
+                    (pmm.total_frames() * 4) as u64,
+                    (pmm.free_frames() * 4) as u64,
+                    0u64,
+                    0u64,
+                )
+            })
+        } else {
+            (4096, 0, 0, 0, 0)
+        }
     };
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 120);
         let at = |offset: usize| (buf + offset) as *mut u8;
         (at(0) as *mut u64).write_volatile(magic); // f_type
-        (at(8) as *mut u64).write_volatile(4096); // f_bsize
+        (at(8) as *mut u64).write_volatile(bsize); // f_bsize
         (at(16) as *mut u64).write_volatile(blocks); // f_blocks
         (at(24) as *mut u64).write_volatile(free); // f_bfree
         (at(32) as *mut u64).write_volatile(free); // f_bavail
-        (at(40) as *mut u64).write_volatile(0); // f_files
-        (at(48) as *mut u64).write_volatile(0); // f_ffree
+        (at(40) as *mut u64).write_volatile(files); // f_files
+        (at(48) as *mut u64).write_volatile(ffree); // f_ffree
         (at(64) as *mut u64).write_volatile(255); // f_namelen
         // f_fsid (56..64), f_frsize (72), f_flags (80) and the four spares
         // stay 0: a zero f_frsize reads as "same as f_bsize".
@@ -1912,7 +2049,22 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 err::EFAULT
             }
         }
-        0x540F | 0x541E => {
+        0x540E => {
+            // TIOCSCTTY: make the descriptor's tty the controlling terminal.
+            // There is no controlling-terminal bookkeeping here to change -
+            // sessions do not exist yet - so the whole of the call is the tty
+            // check, which is what getty insists on before it prints a
+            // login prompt.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            if file.inode().as_tty().is_none() {
+                return err::ENOTTY;
+            }
+            0
+        }
+        0x540F | 0x5410 => {
             // TIOCGPGRP / TIOCSPGRP: the terminal's foreground process group.
             //
             // Job control is built on exactly this pair. A shell asks who owns
@@ -1920,6 +2072,9 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // when the job finishes - and a kernel that cannot answer makes
             // every shell print `can't access tty; job control turned off` and
             // then run as though it were talking to a file.
+            //
+            // TIOCSPGRP is 0x5410 on x86_64 - 0x541E is TIOCSETD, and routing
+            // the pair there was why every `tcsetpgrp` read back ENOTTY.
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
@@ -1929,11 +2084,6 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return err::ENOTTY;
             };
 
-            crate::println!(
-                "[TIOC{}PGRP] fd={fd} foreground={:?}",
-                if request == 0x540F { "G" } else { "S" },
-                tty.foreground()
-            );
             if request == 0x540F {
                 if !buffer_ok(buf, 4, true, from_user) {
                     return err::EFAULT;
@@ -1989,6 +2139,64 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             let tio = unsafe { crate::vfs::termios::Termios::from_ptr(buf as *const u8) };
             tty.set_termios(tio);
+            0
+        }
+        // The block-device facts libblkid asks for before it probes a device:
+        // how big it is, in bytes and in sectors, and what one sector is.
+        // Without them a probe reads the device blind, sizing it by EIO.
+        0x80081272 | 0x1260 | 0x1268 => {
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            let Some(dev) = file.inode().as_block() else {
+                return err::ENOTTY;
+            };
+            let sectors = dev.capacity_sectors();
+            match request {
+                // BLKGETSIZE64: u64, the size in bytes.
+                0x80081272 => {
+                    if !buffer_ok(buf, 8, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    unsafe { (buf as *mut u64).write_volatile(sectors * 512) };
+                }
+                // BLKGETSIZE: u32, the size in 512-byte sectors.
+                0x1260 => {
+                    if !buffer_ok(buf, 4, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    unsafe { (buf as *mut u32).write_volatile(sectors as u32) };
+                }
+                // BLKSSZGET: u32, the sector size itself.
+                _ => {
+                    if !buffer_ok(buf, 4, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    unsafe { (buf as *mut u32).write_volatile(512) };
+                }
+            }
+            0
+        }
+        0x8942 => {
+            // SIOCGIFHWADDR: the hardware address of the named interface.
+            // `ip` falls back to this for the MAC a netlink dump did not
+            // spell out. One interface exists; its address is the one the
+            // stack's static configuration assumes.
+            if !buffer_ok(buf, 40, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe {
+                let at = |offset: usize| (buf + offset) as *mut u8;
+                // ifr_hwaddr: sockaddr with family ARPHRD_ETHER, then the MAC.
+                (at(16) as *mut u16).write_volatile(1);
+                for (i, byte) in [0x52u8, 0x54, 0x00, 0x12, 0x34, 0x56]
+                    .into_iter()
+                    .enumerate()
+                {
+                    at(18 + i).write_volatile(byte);
+                }
+            }
             0
         }
         _ => err::ENOTTY,
@@ -2442,24 +2650,71 @@ pub(super) fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
     };
     // Both names have to exist as paths for the request to be a request:
     // a link to a missing file is ENOENT, not EPERM.
-    if crate::vfs::resolve_opt(&old_path, Some(old_base)).is_err() {
-        return err::ENOENT;
+    let old = match crate::vfs::global().resolve_no_follow(&old_path, old_base) {
+        Ok(inode) => inode,
+        Err(e) => return err_of(e),
+    };
+    let (parent_path, name) = match crate::vfs::split_parent(&new_path) {
+        Ok(p) => p,
+        Err(e) => return err_of(e),
+    };
+    let parent = match crate::vfs::resolve_opt(parent_path, Some(new_base)) {
+        Ok(parent) => parent,
+        Err(e) => return err_of(e),
+    };
+    match parent.link(name, &old) {
+        Ok(()) => 0,
+        Err(e) => err_of(e),
     }
-    let _ = (new_base, new_path);
-    err::EPERM
 }
 
 /// `mknod(path, mode, dev)` — create a device or FIFO node.
 ///
-/// There are no device nodes to create outside devfs, and a caller without
-/// CAP_MKNOD gets `EPERM` for it on Linux too.
+/// The nodes an initramfs's init pre-seeds (`[ -c /dev/null ] || mknod
+/// /dev/null c 1 3`) land on the temporary root, which is a ramfs: they are
+/// placeholders the `devtmpfs` mount then covers with driver-backed devices.
+/// A name that already exists answers success - the caller wanted the node,
+/// not the call - and a filesystem that cannot hold the kind passes its own
+/// error through.
 pub(super) fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let _ = (path, cwd);
-    err::EPERM
+    let kind = match args[1] as u32 & 0o170000 {
+        0o020000 => NodeKind::CharDev,
+        0o060000 => NodeKind::BlockDev,
+        // A FIFO is a plain file here: the descriptor layer cannot tell.
+        0o010000 => NodeKind::File,
+        _ => return err::EINVAL,
+    };
+    let absolute = if path.starts_with('/') {
+        crate::vfs::path::normalize(&path)
+    } else {
+        let cwd_path = crate::sched::current_cwd_path();
+        crate::vfs::path::normalize(&alloc::format!(
+            "{}/{}",
+            cwd_path.trim_end_matches('/'),
+            path
+        ))
+    };
+    // A name this kernel already serves needs no creating.
+    if crate::vfs::resolve_opt(&absolute, Some(cwd.clone())).is_ok() {
+        return 0;
+    }
+    let (parent_path, name) = match absolute.rsplit_once('/') {
+        Some((p, n)) if p.is_empty() => (String::from("/"), n),
+        Some((p, n)) => (String::from(p), n),
+        None => return err::ENOENT,
+    };
+    let parent = match crate::vfs::resolve_opt(&parent_path, Some(cwd.clone())) {
+        Ok(p) => p,
+        Err(e) => return err_of(e),
+    };
+    match parent.create(name, kind) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
 }
 
 /// `fadvise64(fd, offset, len, advice)` — a hint about coming access.

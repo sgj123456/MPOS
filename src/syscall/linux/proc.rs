@@ -313,6 +313,30 @@ pub(super) fn handle_gettid() -> isize {
     crate::sched::current().0 as isize
 }
 
+/// `prctl(option, ...)` — the miscellaneous process-control call.
+///
+/// `PR_SET_NAME` and `PR_GET_NAME` (15/16) are the ones userland actually
+/// exercises here - `mdev` names itself so `ps` shows a tidy label, and a
+/// `ps` is not built yet. The options that would touch privileges, dump
+/// core flags or endianness touch things this kernel does not model, so
+/// they are accepted and dropped: a caller checking the exit status wants
+/// success, and one reading a value gets zero.
+pub(super) fn handle_prctl(args: [usize; ARG_COUNT]) -> isize {
+    const PR_GET_NAME: usize = 16;
+    const NAME_LEN: usize = 16;
+    match args[0] {
+        PR_GET_NAME => {
+            let buf = args[1];
+            if buf == 0 || !crate::syscall::buffer_ok(buf, NAME_LEN, true, true) {
+                return err::EFAULT;
+            }
+            unsafe { core::ptr::write_bytes(buf as *mut u8, 0, NAME_LEN) };
+            0
+        }
+        _ => 0,
+    }
+}
+
 /// `set_tid_address(tidptr)` - name where this thread's exit is announced.
 ///
 /// It answers the caller's tid, and remembers the address: a thread that
@@ -357,18 +381,25 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     // Every child: the pid == -1 form, and every other group form this kernel
     // cannot tell apart for lack of process groups.
     if pid <= 0 {
+        // A caller with no children at all has nothing to wait for: Linux
+        // answers ECHILD, and blocking here would sleep forever - OpenRC
+        // parks exactly that way after its last helper exits.
         let collected = if no_hang {
             crate::sched::poll_any_child(me)
-        } else {
+        } else if crate::sched::has_children(me) {
             crate::sched::wait_any_child(me)
+        } else {
+            None
         };
-        return match collected {
-            Some((id, code)) => finish_wait(id, code, status, from_user),
-            // Nothing to report: an error only when there is nobody left to
-            // wait for, and otherwise the "none exited yet" zero.
-            None if no_hang && crate::sched::has_children(me) => 0,
-            None => err::ECHILD,
-        };
+        if let Some((id, code)) = collected {
+            return finish_wait(id, code, status, from_user);
+        }
+        // Nothing to report: an error only when there is nobody left to
+        // wait for, and otherwise the "none exited yet" zero.
+        if no_hang && crate::sched::has_children(me) {
+            return 0;
+        }
+        return err::ECHILD;
     }
 
     // A named child. The bound keeps a wild pid from indexing the table.
@@ -661,6 +692,10 @@ fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::arch::context::U
 /// honoured - see [`crate::sched::clone`].
 #[allow(clippy::too_many_lines)]
 pub(super) fn handle_clone(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
+    handle_clone_impl(args, regs_ptr)
+}
+
+fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     let (flags, child_stack, parent_tid, child_tid, tls) =
         (args[0], args[1], args[2], args[3], args[4]);
 
@@ -674,9 +709,13 @@ pub(super) fn handle_clone(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize
     let exit_signal = flags & CSIGNAL;
     let flags = flags & !CSIGNAL;
 
-    // The bits this kernel understands. Anything else is a request from a
-    // kernel newer than this one, and honouring it half-way would be worse than
-    // refusing it.
+    // The bits this kernel understands. `CLONE_DETACHED` and `CLONE_UNTRACED`
+    // are accepted and ignored exactly as Linux ignores them: both are
+    // historical no-ops, and musl's `pthread_create` sends the first one in
+    // every thread's flag word - refusing it refuses every pthread in the
+    // system, and musl swallows the clone failure into a bare EAGAIN that
+    // hides the reason. Anything else is a request from a kernel newer than
+    // this one, and honouring it half-way would be worse than refusing it.
     const KNOWN: usize = nr::CLONE_VM
         | nr::CLONE_FS
         | nr::CLONE_FILES
@@ -688,7 +727,9 @@ pub(super) fn handle_clone(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize
         | nr::CLONE_SETTLS
         | nr::CLONE_PARENT_SETTID
         | nr::CLONE_CHILD_CLEARTID
-        | nr::CLONE_CHILD_SETTID;
+        | nr::CLONE_CHILD_SETTID
+        | nr::CLONE_DETACHED
+        | nr::CLONE_UNTRACED;
     if flags & !KNOWN != 0 {
         return err::EINVAL;
     }
@@ -805,9 +846,49 @@ pub(super) fn handle_setpgid(args: [usize; ARG_COUNT]) -> isize {
         n if n > 0 => TaskId(n as usize),
         _ => return err::EINVAL,
     };
-    let r = crate::sched::set_pgid(target, group);
-    crate::println!("[SETPGID] pid={pid} pgid={pgid} -> {r}");
-    r
+    crate::sched::set_pgid(target, group)
+}
+
+/// `setsid()` — leave the caller's session and become a session leader with
+/// its own process group. This kernel has process groups but no sessions, so
+/// the whole of the call is: refuse if the caller already leads its group
+/// (every member of it would have to move), otherwise make it the leader of a
+/// group of its own.
+///
+/// This is what a getty calls before opening its tty - and busybox init's
+/// respawned gettys are what put a login prompt on the serial line.
+pub(super) fn handle_setsid(_args: [usize; ARG_COUNT]) -> isize {
+    let me = crate::sched::current();
+    // The caller is already the leader of its own group: on Linux every group
+    // member would have to move for the session to split, so this is refused
+    // rather than silently accepted.
+    if crate::sched::pgid_of(me) == Some(me) {
+        return err::EPERM;
+    }
+    match crate::sched::set_pgid(me, me) {
+        0 => me.0 as isize,
+        e => e,
+    }
+}
+
+/// `getsid(pid)` — the session a process belongs to.
+///
+/// This kernel has no sessions; a process's group leader stands in for one.
+/// That is the answer a libc `setsid()` reads back to check its own work -
+/// busybox getty calls setsid, then getsid, and an ENOSYS here turns into
+/// "setsid: Function not implemented" on a getty that actually succeeded.
+pub(super) fn handle_getsid(args: [usize; ARG_COUNT]) -> isize {
+    let pid = args[0] as isize;
+    let target = match pid {
+        0 => crate::sched::current(),
+        n if n > 0 => TaskId(n as usize),
+        _ => return err::EINVAL,
+    };
+    // Linux answers any live pid; only a dead one is ESRCH.
+    match crate::sched::pgid_of(target) {
+        Some(pgid) => pgid.0 as isize,
+        None => err::ESRCH,
+    }
 }
 
 /// `getpgid(pid)` and `getpgrp()` — which group a task is in.
@@ -1083,6 +1164,10 @@ const USER_LIMIT: usize = 1 << 47;
 /// leaving them unmapped, so a later `mprotect` can hand them back with their
 /// contents intact.
 pub(super) fn handle_mmap(args: [usize; ARG_COUNT]) -> isize {
+    handle_mmap_impl(args)
+}
+
+fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
     use crate::mm::pframe::PAGE_SIZE;
 
     let (addr, length, prot, flags, fd, offset) =
@@ -1742,7 +1827,27 @@ pub(super) fn handle_sched_getaffinity(args: [usize; ARG_COUNT]) -> isize {
             );
         }
     }
-    1
+    // The byte count, as Linux answers: a caller counts the CPUs it was
+    // given by scanning that many bytes for bits.
+    core::mem::size_of::<u64>() as isize
+}
+
+/// `sched_setaffinity(pid, len, mask)` - pin the caller to the CPUs named in
+/// `mask`. This machine has one, so the only acceptable request is one that
+/// keeps it; anything else asks for a machine that is not here.
+pub(super) fn handle_sched_setaffinity(args: [usize; ARG_COUNT]) -> isize {
+    let (_pid, len, mask) = (args[0], args[1], args[2]);
+    if len < core::mem::size_of::<u64>() {
+        return err::EINVAL;
+    }
+    if !buffer_ok(mask, len, true, true) {
+        return err::EFAULT;
+    }
+    let requested = unsafe { (mask as *const u64).read_volatile() };
+    if requested & 1 == 0 {
+        return err::EINVAL;
+    }
+    0
 }
 
 /// `set_robust_list(head, len)` — register the robust-futex list head.

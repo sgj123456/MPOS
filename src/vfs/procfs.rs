@@ -227,6 +227,35 @@ impl ProcFs {
                 out
             }),
         );
+        // Which filesystem types a mount(2) may name. The `nodev` mark is
+        // not decoration: a caller mounting a *device* - busybox's mount,
+        // probing for the type it was not told - tries the unmarked entries
+        // and only those, and a pseudo-filesystem without the mark would be
+        // tried first and mounted over the device's data.
+        self.root.add(
+            "filesystems",
+            NodeKind::File,
+            self.file(|| {
+                let mut out = String::new();
+                for (name, nodev) in [
+                    ("sysfs", true),
+                    ("rootfs", true),
+                    ("proc", true),
+                    ("devtmpfs", true),
+                    ("devpts", true),
+                    ("tmpfs", true),
+                    ("ramfs", true),
+                    ("ext2", false),
+                ] {
+                    if nodev {
+                        out.push_str("nodev\t");
+                    }
+                    out.push_str(name);
+                    out.push('\n');
+                }
+                out
+            }),
+        );
         self.root.add(
             "uptime",
             NodeKind::File,
