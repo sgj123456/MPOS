@@ -673,6 +673,9 @@ mod tests {
             bootloader_version: "0",
             initramfs: None,
             cmdline: "",
+            // No loader on the host, so no canary anywhere. Zero is the value
+            // that says so, and the check skips on it.
+            boot_stack_base: 0,
             regions: [MemRegion {
                 base: 0,
                 length: 0,

@@ -56,6 +56,14 @@ const ETH0_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 static NEXT_HANDLE: AtomicUsize = AtomicUsize::new(0x8000_0000);
 
 struct Session {
+    /// The netlink port id this session answers under. Zero means unbound:
+    /// Linux draws one when the socket `bind`s - an explicit nonzero request
+    /// is honored, a zero request is filled in - and a socket that never
+    /// binds is auto-bound at its first send. The distinction is load-bearing
+    /// for callers that filter answers by `nlmsg_pid` against their own name
+    /// (fastfetch's default-route probe does exactly that): an answer stamped
+    /// with anything else reads as somebody else's mail and is dropped.
+    portid: u32,
     /// Answers to the last dump request, one netlink message each.
     queue: VecDeque<Vec<u8>>,
 }
@@ -71,11 +79,69 @@ pub fn open() -> usize {
         TABLE.borrow(cs).borrow_mut().push((
             handle,
             Session {
+                portid: 0,
                 queue: VecDeque::new(),
             },
         ));
     });
     handle
+}
+
+/// Name the session, as `bind(fd, {AF_NETLINK, nl_pid, ...})` asks. An
+/// explicit nonzero `nl_pid` is honored unless another session holds it;
+/// zero asks the kernel to pick, which Linux does from the binding thread's
+/// tid - here from the next free number, which identifies the session just
+/// as well. Returns an errno or zero.
+pub fn bind(handle: usize, requested: u32) -> isize {
+    critical_section::with(|cs| {
+        let mut table = TABLE.borrow(cs).borrow_mut();
+        if requested != 0
+            && table
+                .iter()
+                .any(|(h, s)| *h != handle && s.portid == requested)
+        {
+            return crate::syscall::err::EADDRINUSE;
+        }
+        // Already named? Linux keeps the first binding. Unknown handle? The
+        // second pass below misses it and says so.
+        if table
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .is_some_and(|(_, s)| s.portid != 0)
+        {
+            return 0;
+        }
+        // Draw the id while the table is only read: the mutable assignment
+        // comes after.
+        let pid = if requested != 0 {
+            requested
+        } else {
+            free_portid(&table, handle)
+        };
+        match table.iter_mut().find(|(h, _)| *h == handle) {
+            Some((_, session)) => session.portid = pid,
+            None => return crate::syscall::err::EBADF,
+        }
+        0
+    })
+}
+
+/// The next port id no other session holds.
+fn free_portid(table: &[(usize, Session)], handle: usize) -> u32 {
+    let mut candidate = 1u32;
+    while table
+        .iter()
+        .any(|(h, s)| *h != handle && s.portid == candidate)
+    {
+        candidate += 1;
+    }
+    candidate
+}
+
+/// The session's port id - zero while it is unbound, which is what Linux's
+/// `getsockname` answers for a netlink socket nothing has named yet.
+pub fn portid(handle: usize) -> Option<u32> {
+    with_session(handle, |s| s.portid)
 }
 
 /// Whether `handle` names a route session - how the syscall layer tells this
@@ -117,11 +183,42 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
     }
     let ty = u16::from_le_bytes([msg[4], msg[5]]);
     let seq = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
+    // Linux auto-binds a netlink socket at its first send - musl's
+    // getifaddrs never binds at all - so by the time the answers are built
+    // there is a port id for them to carry. Every answer is stamped with it:
+    // a dump reader that matches `nlmsg_pid` against its own port id
+    // (fastfetch's default-route probe) otherwise reads every message as
+    // foreign mail, never sees the end marker, and waits forever for more.
+    let portid = critical_section::with(|cs| {
+        let mut table = TABLE.borrow(cs).borrow_mut();
+        let unbound = table
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .is_some_and(|(_, s)| s.portid == 0);
+        if unbound {
+            // Draw the id before taking the mutable borrow: the scan that
+            // looks for a free one reads the whole table.
+            let fresh = free_portid(&table, handle);
+            table
+                .iter_mut()
+                .find(|(h, _)| *h == handle)
+                .expect("send on a route session the table no longer names")
+                .1 .portid = fresh;
+            fresh
+        } else {
+            table
+                .iter()
+                .find(|(h, _)| *h == handle)
+                .map(|(_, s)| s.portid)
+                .expect("send on a route session the table no longer names")
+        }
+    });
     let answers: Vec<Vec<u8>> = match ty {
         RTM_GETLINK => {
             let mut v = Vec::new();
             v.push(link_msg(
                 seq,
+                portid,
                 1,
                 "lo",
                 IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
@@ -130,20 +227,21 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
             ));
             v.push(link_msg(
                 seq,
+                portid,
                 2,
                 "eth0",
                 IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,
                 ARPHRD_ETHER,
                 Some(&ETH0_MAC),
             ));
-            v.push(done(seq));
+            v.push(done(seq, portid));
             v
         }
         RTM_GETADDR => {
             let mut v = Vec::new();
-            v.push(addr_msg(seq, 1, 8, [127, 0, 0, 1], "lo", 254));
-            v.push(addr_msg(seq, 2, 24, crate::net::LOCAL_IP, "eth0", 0));
-            v.push(done(seq));
+            v.push(addr_msg(seq, portid, 1, 8, [127, 0, 0, 1], "lo", 254));
+            v.push(addr_msg(seq, portid, 2, 24, crate::net::LOCAL_IP, "eth0", 0));
+            v.push(done(seq, portid));
             v
         }
         RTM_GETROUTE => {
@@ -151,14 +249,14 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
             // everything leaves by the gateway over eth0. A dump with only an
             // end-marker makes callers that hunt for a default interface spin.
             let mut v = Vec::new();
-            v.push(route_msg(seq, 2, crate::net::GATEWAY_IP));
-            v.push(done(seq));
+            v.push(route_msg(seq, portid, 2, crate::net::GATEWAY_IP));
+            v.push(done(seq, portid));
             v
         }
         // Mutations and the query types nobody here can answer: the request
         // is accepted and nothing comes back but the end marker, which is
         // what a caller looping on a dump needs to stop.
-        _ => vec![done(seq)],
+        _ => vec![done(seq, portid)],
     };
     critical_section::with(|cs| {
         if let Some((_, session)) = TABLE
@@ -190,21 +288,23 @@ fn with_session<R>(
     })
 }
 
-/// One `nlmsghdr` wrapped around `payload`.
-fn nlmsg(ty: u16, seq: u32, payload: &[u8], multi: bool) -> Vec<u8> {
+/// One `nlmsghdr` wrapped around `payload`. `pid` is the port id of the
+/// session the answer goes to - what Linux sets, and what a caller matching
+/// answers against its own name compares.
+fn nlmsg(ty: u16, seq: u32, pid: u32, payload: &[u8], multi: bool) -> Vec<u8> {
     let len = 16 + payload.len();
     let mut m = Vec::with_capacity(len);
     m.extend((len as u32).to_le_bytes());
     m.extend(ty.to_le_bytes());
     m.extend((multi as u16 * NLM_F_MULTI).to_le_bytes());
     m.extend(seq.to_le_bytes());
-    m.extend(0u32.to_le_bytes()); // nlmsg_pid: the kernel sends with 0
+    m.extend(pid.to_le_bytes());
     m.extend(payload);
     m
 }
 
-fn done(seq: u32) -> Vec<u8> {
-    nlmsg(NLMSG_DONE, seq, &[], true)
+fn done(seq: u32, pid: u32) -> Vec<u8> {
+    nlmsg(NLMSG_DONE, seq, pid, &[], true)
 }
 
 /// One route attribute, padded to the four-byte alignment netlink keeps.
@@ -228,6 +328,7 @@ fn name_with_nul(name: &str) -> Vec<u8> {
 /// `RTM_NEWLINK`: an `ifinfomsg` plus the interface's name (and address).
 fn link_msg(
     seq: u32,
+    pid: u32,
     index: u32,
     name: &str,
     flags: u32,
@@ -245,12 +346,12 @@ fn link_msg(
     if let Some(mac) = mac {
         payload.extend(rtattr(IFLA_ADDRESS, mac));
     }
-    nlmsg(RTM_NEWLINK, seq, &payload, true)
+    nlmsg(RTM_NEWLINK, seq, pid, &payload, true)
 }
 
 /// `RTM_NEWROUTE`: a `rtmsg` plus the gateway and outgoing interface. This
 /// one route is the default route - `dst_len` 0 means "everything else".
-fn route_msg(seq: u32, oif: u32, gateway: [u8; 4]) -> Vec<u8> {
+fn route_msg(seq: u32, pid: u32, oif: u32, gateway: [u8; 4]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(2); // rtm_family: AF_INET
     payload.push(0); // rtm_dst_len: 0 = the default route
@@ -262,13 +363,13 @@ fn route_msg(seq: u32, oif: u32, gateway: [u8; 4]) -> Vec<u8> {
     payload.push(1); // rtm_type: RTN_UNICAST
     payload.extend(rtattr(RTA_GATEWAY, &gateway));
     payload.extend(rtattr(RTA_OIF, &oif.to_le_bytes()));
-    nlmsg(RTM_NEWROUTE, seq, &payload, true)
+    nlmsg(RTM_NEWROUTE, seq, pid, &payload, true)
 }
 
 /// `RTM_NEWADDR`: an `ifaddrmsg` plus the address, stated twice the way
 /// Linux does it - `IFA_ADDRESS` for the prefix, `IFA_LOCAL` for the local
 /// end - and the interface's name.
-fn addr_msg(seq: u32, index: u32, prefix: u8, ip: [u8; 4], name: &str, scope: u8) -> Vec<u8> {
+fn addr_msg(seq: u32, pid: u32, index: u32, prefix: u8, ip: [u8; 4], name: &str, scope: u8) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(2); // ifa_family: AF_INET
     payload.push(prefix);
@@ -278,5 +379,5 @@ fn addr_msg(seq: u32, index: u32, prefix: u8, ip: [u8; 4], name: &str, scope: u8
     payload.extend(rtattr(IFA_ADDRESS, &ip));
     payload.extend(rtattr(IFA_LOCAL, &ip));
     payload.extend(rtattr(IFA_LABEL, &name_with_nul(name)));
-    nlmsg(RTM_NEWADDR, seq, &payload, true)
+    nlmsg(RTM_NEWADDR, seq, pid, &payload, true)
 }

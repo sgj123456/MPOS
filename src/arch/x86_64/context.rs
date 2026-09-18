@@ -103,13 +103,22 @@ unsafe extern "C" {
 /// come back to this call: the only ways out are the syscall gate and the
 /// interrupt handlers, which return to user mode through their own `iretq`.
 ///
-/// The interrupt frame is built by hand with ordinary pushes rather than with
-/// an `iretq`-shaped struct, so the five words land in the order the
-/// instruction pops them. `cli` first, because the frame and the jump must be
-/// atomic with respect to the clock - a tick in between would run the timer
-/// handler on a stack whose top is a half-built frame - and the `iretq` itself
-/// restores IF through the flags image it consumes.
+/// The frame is built by hand with ordinary pushes. `push` walks the stack
+/// *down*, so the word pushed first ends up highest and is the one `iretq`
+/// pops last - which makes the push order the exact reverse of the pop order.
+/// `iretq` pops `RIP, CS, RFLAGS, RSP, SS`, so the pushes have to run
+/// `SS, RSP, RFLAGS, CS, RIP`, and getting any pair of those the wrong way
+/// round leaves two correct values in each other's slots. `cli` first, because
+/// the frame and the jump must be atomic with respect to the clock - a tick in
+/// between would run the timer handler on a stack whose top is a half-built
+/// frame - and the `iretq` itself restores IF through the flags image it
+/// consumes.
 ///
+/// The flags image `enter_user` hands to ring 3. `IF` is set so the program
+/// gets preempted on the next tick rather than monopolising the core, and bit 1
+/// is the always-one bit `iretq` insists on.
+pub const USER_RFLAGS: usize = (1 << 1) | (1 << 9);
+
 /// # Safety
 ///
 /// The active address space must map `entry` executable and `user_rsp`
@@ -117,24 +126,27 @@ unsafe extern "C" {
 /// for anything but traps from here on: entering user mode abandons this call
 /// frame permanently.
 pub unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
-    const RFLAGS_RESERVED: usize = 1 << 1;
-    const RFLAGS_INTERRUPT_FLAG: usize = 1 << 9;
-
     let (code, data) = crate::arch::gdt::user_selectors();
+
+    // Push in `iretq`'s pop order reversed, one operand per push so the
+    // sequence below reads as that order rather than as a list to be
+    // mentally inverted. `ss` goes first and `rip` last; the two
+    // selectors and the flags image each land in the slot the instruction
+    // will read them from.
     unsafe {
         core::arch::asm!(
             "cli",
-            "push {data}",
-            "push {stack}",
-            "push {flags}",
-            "push {code}",
-            "push {entry}",
+            "push {ss}",
+            "push {rsp}",
+            "push {rflags}",
+            "push {cs}",
+            "push {rip}",
             "iretq",
-            data = in(reg) data.0 as usize,
-            stack = in(reg) user_rsp,
-            flags = in(reg) RFLAGS_RESERVED | RFLAGS_INTERRUPT_FLAG,
-            code = in(reg) code.0 as usize,
-            entry = in(reg) entry,
+            ss = in(reg) data.0 as usize,
+            rsp = in(reg) user_rsp,
+            rflags = in(reg) USER_RFLAGS,
+            cs = in(reg) code.0 as usize,
+            rip = in(reg) entry,
             options(noreturn),
         );
     }
@@ -225,9 +237,17 @@ global_asm!(
     ".p2align 4",
     "mpos_resume_user:",
     // Build the `iretq` frame first, in the order the instruction pops it:
-    // SS, RSP, RFLAGS, CS, RIP. Reading each word straight out of the struct
-    // keeps the register file working from a single pointer, with no scratch
+    // SS, RSP, RFLAGS, CS, RIP. `push` walks the stack down, so the first of
+    // these lands highest and is popped last, which is what makes the pop
+    // order come out right. Reading each word straight out of the struct keeps
+    // the register file working from a single pointer, with no scratch
     // register borrowed from the state being restored.
+    //
+    // This order is the load-bearing part and the easy thing to get wrong:
+    // [enter_user] builds the same frame with operand pushes, and a pair of
+    // them swapped there put RFLAGS where SS belonged and killed the first
+    // ring-3 entry with a `#GP` naming 0x202 - the flags image - as the
+    // offending selector. Both builders have to agree with this sequence.
     "    cli",
     "    push qword ptr [rdi + 56]", // ss
     "    push qword ptr [rdi + 8]",  // rsp

@@ -1,0 +1,26 @@
+[package]
+name = "mpos-boot"
+version = "0.1.0"
+edition = "2024"
+
+# The loader is a UEFI application, so it is built for the `x86_64-unknown-uefi`
+# target rather than the kernel's `x86_64-unknown-none` - they are different
+# machines as far as rustc is concerned, with different object formats (PE
+# against ELF) and different calling conventions at the firmware boundary. The
+# workspace root pins the kernel's target; `boot/.cargo/config.toml` pins this
+# one, so `cargo build` inside this directory does the right thing on its own.
+#
+# `alloc` is what `FileSystem::read` needs to hand back a `Vec<u8>`, and with it
+# comes `global_allocator`: the firmware's pool allocator is the only one there
+# is before boot services are exited, so `uefi` installs it as the crate's own.
+# Neither survives `exit_boot_services`, which is why every allocation this
+# loader makes happens before that call - see the ordering note in `main.rs`.
+[dependencies]
+uefi = { version = "0.36", default-features = false, features = [
+    "alloc",
+    "global_allocator",
+] }
+
+[[bin]]
+name = "mpos-boot"
+path = "src/main.rs"

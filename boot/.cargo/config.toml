@@ -1,0 +1,6 @@
+# The loader is a UEFI application and nothing else, so it says so here rather
+# than relying on whoever runs cargo to remember `--target`. The workspace root
+# config sets the kernel's target; this file takes precedence for builds that
+# start in this directory.
+[build]
+target = "x86_64-unknown-uefi"

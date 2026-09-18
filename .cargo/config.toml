@@ -1,6 +1,12 @@
-# Limine base revision 3 loads the kernel as a position-independent executable at
-# its own chosen higher-half base and applies the RELATIVE relocations itself.
-# These flags mirror the recipe Limine uses for its own reference kernel.
+# `mpos-boot` loads the kernel as a position-independent executable: it places
+# the segments wherever the firmware gave it memory, maps them at the kernel's
+# linked higher-half address, and applies the RELATIVE relocations itself. These
+# flags are what make that possible - `pic` and `-pie` for the relocations,
+# `-ztext` to refuse any of them landing in a read-only segment.
+#
+# The loader is not built from this configuration: `boot/.cargo/config.toml`
+# overrides the target for it, because it is a UEFI application and this is the
+# kernel.
 
 [build]
 target = "x86_64-unknown-none"

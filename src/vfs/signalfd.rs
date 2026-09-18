@@ -72,7 +72,7 @@ impl Inode for SignalFd {
             // pid is never reported twice, which is what lets a caller's
             // drain loop (`while read > 0`) terminate. The exit code stays
             // on file - `wait(2)` is still what collects the child.
-            if let Some(pid) = crate::sched::read_sigchld() {
+            if let Some(pid) = Self::take_sigchld() {
                 buf[..SIGINFO_BYTES].fill(0);
                 // ssi_signo, ssi_errno, ssi_code, ssi_pid - the first four
                 // words, which is as much of the struct a caller reads to
@@ -108,5 +108,22 @@ impl SignalFd {
     #[cfg(not(target_os = "none"))]
     fn wait_for_child(&self) {
         panic!("blocking on a signalfd needs the kernel scheduler");
+    }
+
+    /// Take the next unreported `SIGCHLD`, or `None` when there is none.
+    ///
+    /// Paired like [`Self::wait_for_child`] and for the same reason: the
+    /// pending-signal queue lives in the scheduler's task table, which only
+    /// exists on a real target. The host build of this module still has to
+    /// compile - the VFS is tested there - so the call is routed through a stub
+    /// rather than made directly from `read_at`.
+    #[cfg(target_os = "none")]
+    fn take_sigchld() -> Option<usize> {
+        crate::sched::read_sigchld()
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn take_sigchld() -> Option<usize> {
+        None
     }
 }

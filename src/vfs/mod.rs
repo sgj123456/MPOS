@@ -127,6 +127,10 @@ pub enum VfsError {
     Unsupported,
     /// A write to a filesystem that was mounted read-only.
     ReadOnly,
+    /// EXDEV: a hard link whose two ends live on different filesystems -
+    /// the one request `link(2)` refuses by design, since a name edge is
+    /// the filesystem's own bookkeeping and cannot reach into another's.
+    CrossDevice,
     /// A read or write that would block, on a descriptor the caller asked
     /// not to block on.
     Again,

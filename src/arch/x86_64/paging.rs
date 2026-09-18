@@ -1,8 +1,8 @@
 //! The kernel's own page tables, and the address spaces built alongside them.
 //!
-//! Limine hands us a working higher-half mapping, but it is Limine's: the tables
-//! live in bootloader-reclaimable memory, the permissions are whatever the
-//! protocol chose, and there is only ever one address space. So the kernel builds
+//! `mpos-boot` hands us a working higher-half mapping, but it is the loader's:
+//! its tables live in loader-owned memory, they carry an identity map the kernel
+//! must not keep, and they were built for one address space. So the kernel builds
 //! a fresh four-level hierarchy from the plan in [`crate::mm::vm`] and switches
 //! to it. What to map is decided there, once, for every port; this file is only
 //! the x86_64 encoding of it.

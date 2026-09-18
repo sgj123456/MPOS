@@ -1,7 +1,15 @@
 /target
 /build
+/boot/target
 /third_party/limine
 
 .Trash-*/
 .workbuddy/
 __pycache__/
+
+# 一次性探针的残留：沙箱把这两个文件钉成了 bind mount，容器内删不掉。
+# 不是构建产物，也不该进版本库，直接忽略。
+/.probe_gt/
+/.dis.txt
+/.esp.bin
+/.boot.log

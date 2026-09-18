@@ -20,6 +20,14 @@ pub(super) use crate::syscall::MMAP_BASE;
 /// [`handle_execve`] patches the return address and stack pointer through it,
 /// and [`handle_fork`] reads the whole thing to rebuild the child's register
 /// file.
+///
+/// Keep this in step with `Regs` in `arch/x86_64/syscall.rs` - the two describe
+/// one frame, and the stub's epilogue is written against those offsets. The
+/// `_filler` below is the stub's extra word, a second copy of `rax` pushed so
+/// the nine `pop`s in the epilogue stop exactly on the caller's RSP; leaving it
+/// out here would make every field above it name the word below the one it
+/// means, and a `fork` child would resume with its parent's `rdi` in `r12` and
+/// its `rsi` as the return address.
 #[repr(C)]
 struct RegsFrame {
     rax: usize,      // [rsp+0]   return value / syscall number
@@ -32,12 +40,15 @@ struct RegsFrame {
     rsi: usize,      // [rsp+56]
     rdi: usize,      // [rsp+64]
     user_rsp: usize, // [rsp+72]  user RSP (restored from here at sysretq)
-    r12: usize,      // [rsp+80]
-    r15: usize,      // [rsp+88]
-    r14: usize,      // [rsp+96]
-    r13: usize,      // [rsp+104]
-    rbx: usize,      // [rsp+112]
-    rbp: usize,      // [rsp+120]
+    /// Not a register: the stub's padding word, never read back. See the
+    /// comment on `Regs`.
+    _filler: usize, // [rsp+80]
+    r12: usize,      // [rsp+88]
+    r15: usize,      // [rsp+96]
+    r14: usize,      // [rsp+104]
+    r13: usize,      // [rsp+112]
+    rbx: usize,      // [rsp+120]
+    rbp: usize,      // [rsp+128]
 }
 
 // ---- signals: the frame a handler runs on -------------------------------

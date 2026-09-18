@@ -5,9 +5,9 @@
 //!
 //!     cargo test --lib --target x86_64-unknown-linux-gnu
 //!
-//! Machine-dependent code (`arch`, the console, the Limine translation) is
-//! compiled only for `target_os = "none"`, which is what keeps the host build
-//! free of port I/O, descriptor tables and bootloader protocol.
+//! Machine-dependent code (`arch`, the console, the boot handoff) is compiled
+//! only for `target_os = "none"`, which is what keeps the host build free of
+//! port I/O, descriptor tables and firmware calls.
 
 #![no_std]
 #![cfg_attr(

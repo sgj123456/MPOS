@@ -112,7 +112,7 @@ impl fmt::Debug for Mapping {
 pub struct KernelSections {
     /// Executable code.
     pub text: Range<usize>,
-    /// Constants, including the Limine request structures.
+    /// Constants.
     pub rodata: Range<usize>,
     /// Writable data and BSS, up to the end of the image.
     pub data: Range<usize>,
@@ -207,6 +207,9 @@ mod tests {
             bootloader_version: "0",
             initramfs: None,
             cmdline: "",
+            // The host has no loader, so no boot stack and no canary to point
+            // at. Zero is how the handoff spells "the loader planted none".
+            boot_stack_base: 0,
             regions: [MemRegion {
                 base: 0,
                 length: 0,

@@ -94,6 +94,28 @@ fn rtnl_handle_of_fd(fd: i32) -> Option<usize> {
     crate::net::rtnl::exists(handle).then_some(handle)
 }
 
+/// `recv(2)`'s "do not sleep" flag, as `linux/socket.h` spells it.
+const MSG_DONTWAIT: usize = 0x40;
+
+/// The next dump answer for a route-netlink session, honoring the caller's
+/// wish not to wait: `MSG_DONTWAIT` on the call or `O_NONBLOCK` on the
+/// description turns an empty queue into `EAGAIN` rather than a park.
+///
+/// The empty-queue case matters in its own right. musl's `getifaddrs` reads
+/// with `MSG_DONTWAIT` and a queue that is never empty, so it never noticed
+/// this kernel used to block; fastfetch's default-route probe filtered every
+/// queued answer out on the `nlmsg_pid` field, reached the empty queue - and
+/// waited forever on an answer that had already come and gone. Linux answers
+/// that loop with `EAGAIN` and an error return; so does this now.
+fn rtnl_answer(handle: usize, flags: usize, fd: i32) -> Option<Vec<u8>> {
+    let dontwait =
+        flags & MSG_DONTWAIT != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    if dontwait && !crate::net::rtnl::ready(handle) {
+        return None;
+    }
+    crate::net::rtnl::recv_blocking(handle)
+}
+
 /// A route-netlink socket: a queue of answers to the dump requests its
 /// caller has sent. The answers are built in [`crate::net::rtnl`] when the
 /// request arrives; reading one pops it.
@@ -782,7 +804,9 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         if !crate::syscall::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
-        let Some(msg) = crate::net::rtnl::recv_blocking(handle) else {
+        // args[3] is the flags word: `MSG_DONTWAIT` here means the caller
+        // wants an answer only if one is queued.
+        let Some(msg) = rtnl_answer(handle, args[3], fd) else {
             return err::EAGAIN;
         };
         let n = msg.len().min(len);
@@ -839,7 +863,9 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         if len == 0 {
             return err::EINVAL;
         }
-        let Some(msg) = crate::net::rtnl::recv_blocking(handle) else {
+        // args[2] is the flags word: `MSG_DONTWAIT` here means the caller
+        // wants an answer only if one is queued.
+        let Some(msg) = rtnl_answer(handle, args[2], fd) else {
             return err::EAGAIN;
         };
         let n = msg.len().min(len);
@@ -1198,9 +1224,11 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
     if let Ok(handle) = socket_handle_of_fd(args[0] as i32)
         && crate::net::rtnl::exists(handle)
     {
-        // A route session binds to name its port and join groups; `ip` binds
-        // pid 0 and no groups, which asks only to be identified. The kernel
-        // does the identifying here - there is no session state to keep.
+        // A route session binds to name its port and join groups. The port id
+        // matters beyond ceremony: every dump answer this session reads back
+        // carries it in `nlmsg_pid`, and callers that filter on that field -
+        // fastfetch's default-route probe - drop everything else as foreign
+        // mail. An explicit nonzero pid is honored, zero asks for one.
         const SOCKADDR_NL_SIZE: usize = 12;
         let addr = args[1];
         if args[2] < SOCKADDR_NL_SIZE
@@ -1212,7 +1240,8 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
         if family != crate::uevent::AF_NETLINK {
             return err::EINVAL;
         }
-        return 0;
+        let pid = unsafe { ((addr + 4) as *const u32).read_unaligned() };
+        return crate::net::rtnl::bind(handle, pid);
     }
 
     let fd = args[0] as i32;
@@ -1392,6 +1421,32 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
 pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
     let fd = args[0] as i32;
     let (addr_ptr, len_ptr) = (args[1], args[2]);
+    // A route-netlink session names itself with a `sockaddr_nl`, not a
+    // `sockaddr_in`. The port id `bind` assigned is the one thing a caller
+    // needs from here: fastfetch's default-route probe reads it back and
+    // then filters every dump answer by `nlmsg_pid == portid`, so answering
+    // this wrong (or failing it - the fallback callers adopt is their own
+    // process id) strands the exchange.
+    if let Some(handle) = rtnl_handle_of_fd(fd) {
+        const SOCKADDR_NL_SIZE: usize = 12;
+        if addr_ptr == 0
+            || len_ptr == 0
+            || !crate::syscall::buffer_ok(addr_ptr, SOCKADDR_NL_SIZE, true, true)
+            || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+        {
+            return err::EFAULT;
+        }
+        let pid = crate::net::rtnl::portid(handle).unwrap_or(0);
+        unsafe {
+            let at = |offset: usize| (addr_ptr + offset) as *mut u8;
+            (at(0) as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
+            (at(2) as *mut u16).write_unaligned(0); // nl_pad
+            (at(4) as *mut u32).write_unaligned(pid); // nl_pid
+            (at(8) as *mut u32).write_unaligned(0); // nl_groups
+            (len_ptr as *mut u32).write_unaligned(SOCKADDR_NL_SIZE as u32);
+        }
+        return 0;
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,

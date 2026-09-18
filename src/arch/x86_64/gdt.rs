@@ -1,7 +1,7 @@
 //! Global Descriptor Table.
 //!
-//! Limine already installs a GDT good enough for ring-0 64-bit code, but we
-//! install our own immediately so that descriptor layout is under our control:
+//! The firmware leaves a GDT good enough for ring-0 64-bit code, but we install
+//! our own immediately so that descriptor layout is under our control:
 //! the user-mode segments and the TSS sit here beside the kernel ones, and
 //! nothing had to reshuffle selectors to make room.
 //!
@@ -15,7 +15,6 @@ use core::cell::UnsafeCell;
 
 use spin::Once;
 
-use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
@@ -47,6 +46,16 @@ struct TssCell(UnsafeCell<TaskStateSegment>);
 unsafe impl Sync for TssCell {}
 
 static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
+
+/// Where `RSP0` sits inside that TSS, as a byte count from the static's own
+/// address. Not `offset_of!`-style field arithmetic: `TaskStateSegment` is
+/// `repr(C, packed(4))`, and a `packed` struct's fields cannot be referenced at
+/// all when they land on an odd byte, so the one field the CPU reads on every
+/// ring-3 transition has to be reached by address instead.
+///
+/// Four from the front: `reserved_1` is a `u32` and `RSP0` is the member right
+/// after it. Nothing else in the struct comes before them.
+const RSP0_OFFSET: usize = 4;
 
 /// The two words the `syscall` entry needs before it has anything else: a
 /// kernel stack to push on, and somewhere to put a register while it gets
@@ -129,8 +138,23 @@ pub fn init() {
 /// task's kernel stack. The scheduler calls this on every dispatch.
 pub fn set_kernel_stack(top: usize) {
     unsafe {
-        let tss = &mut *TSS.0.get();
-        tss.privilege_stack_table[0] = VirtAddr::new(top as u64);
+        debug_assert_eq!(
+            core::ptr::addr_of!((*TSS.0.get()).privilege_stack_table) as usize - TSS.0.get() as usize,
+            RSP0_OFFSET,
+            "the RSP0 byte offset in the packed TSS moved"
+        );
+        // `write_unaligned`, not `write_volatile`: the TSS is `repr(C,
+        // packed(4))` and this field sits at offset 4 inside it, so the address
+        // is only 4-byte aligned and a `*mut u64` there is not a valid
+        // `write_volatile` target - the precondition fires under the debug
+        // assertion the build enables. The CPU reads this field with an
+        // ordinary unaligned load, so an unaligned store is the matching
+        // operation. The write is `volatile` in effect rather than by name: it
+        // goes through a raw pointer derived from an `UnsafeCell`, and nothing
+        // here reads the field back through a reference that the compiler could
+        // cache.
+        let slot = (TSS.0.get() as *mut u8).add(RSP0_OFFSET) as *mut u64;
+        core::ptr::write_unaligned(slot, top as u64);
         // Keep the `syscall` fast path's view of the kernel stack in step with
         // the TSS; `swapgs` in the entry exposes this to kernel code.
         *ENTRY_SCRATCH.kernel_rsp.get() = top;
@@ -160,13 +184,23 @@ pub fn user_selectors() -> (SegmentSelector, SegmentSelector) {
 }
 
 /// What `IA32_STAR[63:48]` must hold for `sysretq` to land on our user
-/// segments.
+/// segments - with the RPL bits pre-applied, because not every CPU applies
+/// them itself.
 ///
 /// `sysret` does not take a selector pair: it computes
-/// `CS = STAR[63:48] + 16` and `SS = STAR[63:48] + 8`, forcing RPL 3 on both.
-/// So STAR holds neither selector - it holds the slot *below* the user data
-/// descriptor, from which the CPU reaches both by adding. With the GDT laid
-/// out user-data-then-user-code, that is the data selector's index minus 8.
+/// `CS = STAR[63:48] + 16` and `SS = STAR[63:48] + 8`, and the SDM says it
+/// forces RPL 3 on both. It does not, on every CPU: this machine boots under
+/// KVM, the instruction runs on the host silicon, and the host loads SS as
+/// `STAR[63:48] + 8` *without* the OR 3 - the class of behaviour Xen documented
+/// as XSA-132. The result was user code running with `SS = 0x18` (RPL 0), which
+/// nothing faults on until the next trap out of ring 3 pushes that SS into a
+/// frame and `iretq` refuses to pop it: `#GP(0x18)`, kernel mode, at the
+/// `iretq`. So the base carries the RPL bits itself: `STAR[63:48] = 0x13`
+/// makes `+8` yield `0x1b` and `+16` yield `0x23` outright, and the SDM's
+/// `OR 3` - still executed by the CPUs that do honor it - becomes a no-op
+/// because both values already end in binary `11`. Adding 8 or 16 cannot
+/// carry into the low three bits, so the OR survives the arithmetic on both
+/// kinds of CPU.
 ///
 /// The descriptors are queried rather than hardcoded, and the pairing is
 /// checked, because getting this wrong does not fail at load time: it fails
@@ -175,9 +209,10 @@ pub fn user_selectors() -> (SegmentSelector, SegmentSelector) {
 pub fn user_code_star_base() -> u64 {
     let (code, data) = user_selectors();
     let data_base = (data.0 as u64) & !0b11;
-    // The code descriptor is one GDT slot (8 bytes) above the data one, so
-    // `data_base + 16` is what `sysret` will compute for CS from `data_base -
-    // 8`, and `data_base + 8` is what it will compute for SS.
+    // The code descriptor is one GDT slot (8 bytes) above the data one, and
+    // both selectors carry RPL 3. `data_base + 11` is `user_code` outright and
+    // `data_base + 3` is `user_data` outright, which is exactly what `+ 16`
+    // and `+ 8` from the returned base compute.
     debug_assert_eq!(
         (code.0 as u64) & !0b11,
         data_base + 8,
@@ -186,7 +221,24 @@ pub fn user_code_star_base() -> u64 {
     debug_assert_eq!(
         code.0 & 0b11,
         0b11,
-        "sysret forces RPL 3, so the user CS must be a ring-3 descriptor"
+        "the STAR base pre-applies RPL 3, so the user CS must be a ring-3 descriptor"
     );
-    data_base - 8
+    debug_assert_eq!(
+        data.0 & 0b11,
+        0b11,
+        "the STAR base pre-applies RPL 3, so the user SS must be a ring-3 descriptor"
+    );
+    (data_base - 8) | 0b11
+}
+
+/// The user code / data selectors as plain numbers, for the exit-frame dump
+/// that checks an `iretq` frame's slots against what each one must hold. Same
+/// values `user_selectors` hands out - read through here rather than spelled as
+/// literals so a GDT reshuffle cannot leave the check asserting a stale number.
+pub fn user_code() -> u64 {
+    user_selectors().0 .0 as u64
+}
+
+pub fn user_data() -> u64 {
+    user_selectors().1 .0 as u64
 }

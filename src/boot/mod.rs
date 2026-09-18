@@ -1,16 +1,22 @@
 //! Machine-independent view of the hardware the kernel was handed at boot.
 //!
-//! This module deliberately does not name any bootloader type. `boot::limine`
-//! translates the Limine protocol into these structures; everything else in the
-//! kernel only ever sees what is declared here. That is the seam future ports
-//! (riscv64 via OpenSBI+DTB, aarch64) plug into.
+//! This module deliberately does not name any bootloader type. `boot::handoff`
+//! translates what `mpos-boot`, the EFI loader, left behind into these
+//! structures; everything else in the kernel only ever sees what is declared
+//! here. That is the seam future ports (riscv64 via OpenSBI+DTB, aarch64) plug
+//! into.
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub mod limine;
+pub mod handoff;
 
 use core::fmt;
 
-pub const MAX_MEM_REGIONS: usize = 64;
+/// Room for every region a firmware's memory map can carry after the loader has
+/// merged the neighbours that share a kind. Firmware maps are longer than a
+/// bootloader's - OVMF describes the same RAM in far more pieces - and the
+/// kernel has no heap yet when this is filled in, so the room is a ceiling and
+/// not an allocation.
+pub const MAX_MEM_REGIONS: usize = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MemKind {
@@ -79,6 +85,10 @@ pub struct BootInfo {
     /// The command line the bootloader was given for this kernel. `/proc/cmdline`
     /// reports it, and the initramfs's init reads it to learn `root=`.
     pub cmdline: &'static str,
+    /// The lowest word of the boot stack, where the loader left its canary, or
+    /// zero when the loader planted none. [`check_boot_stack`] reads it; nothing
+    /// else needs it, and nothing may write through it.
+    pub boot_stack_base: usize,
     pub regions: [MemRegion; MAX_MEM_REGIONS],
     pub region_count: usize,
 }

@@ -661,12 +661,42 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         Ok(path) => path,
         Err(e) => return e,
     };
-    // No atomic rename primitive underneath: copy the bytes, then drop the
-    // old name. A crash in between leaves both names, never none.
-    let data = match crate::vfs::read_file_opt(&old_path, Some(old_base.clone())) {
-        Ok(d) => d,
+    // Renaming a name onto itself is a no-op - and it has to be said so
+    // *before* the copy path runs, because that path unlinks the taken name
+    // on the way to recreating it, and with one shared dentry that unlink
+    // takes the file's only name with it.
+    if alloc::sync::Arc::ptr_eq(&old_base, &new_base) && old_path == new_path {
+        return 0;
+    }
+    // No atomic rename primitive underneath: the old name's body is copied
+    // to the new one and the old name dropped. A crash in between leaves
+    // both names, never none.
+    //
+    // The old name is looked up *without following it*. A rename moves the
+    // name, whatever kind of node holds - and apk's commits rename symlinks
+    // wholesale: a package's `.so` link is laid down under a temp name and
+    // renamed to its real one, with the link's target typically still under
+    // its own temp name at that moment. Resolving the old path would follow
+    // the link and go looking for the target by its real name - ENOENT for
+    // every `apk add` that ships a symlink - and where the target did exist,
+    // the copy would drag its whole body over what should have stayed a
+    // link, which is how the tree got corrupted the first time this was
+    // driven by apk.
+    let (old_dir, old_name) = match old_path.rsplit_once('/') {
+        Some((parent, name)) => {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            match crate::vfs::resolve_opt(parent, Some(old_base.clone())) {
+                Ok(d) => (d, alloc::string::String::from(name)),
+                Err(e) => return err_of(e),
+            }
+        }
+        None => (old_base.clone(), old_path.clone()),
+    };
+    let old_inode = match old_dir.lookup(&old_name) {
+        Ok(ino) => ino,
         Err(e) => return err_of(e),
     };
+
     // Where the new name goes. A path with a slash names its own parent; a
     // bare name has none, and the directory it is created in is the one the
     // caller pointed at - `newdirfd`, or the cwd when that is `AT_FDCWD`.
@@ -684,48 +714,67 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         }
         None => (new_base.clone(), new_path.clone()),
     };
-    let (inode, replacing) = match dir.create(&name, NodeKind::File) {
-        Ok(inode) => (inode, false),
-        // Renaming onto an existing file replaces it - unless the caller
-        // asked for NOREPLACE, which is the one flag that protects the name.
-        // What gets replaced is the *name*, whatever kind it holds: resolving
-        // here would follow a symlink and write the replacement's bytes into
-        // the file it points at - a library's real body overwritten by a
-        // link's two-line target, which is exactly what apk's library
-        // commits do and what corrupted the tree. Drop the old name and make
-        // a plain file in its place instead.
-        Err(crate::vfs::VfsError::Exists) => {
-            if flags & RENAME_NOREPLACE != 0 {
-                return err::EEXIST;
-            }
-            match crate::vfs::unlink_opt(&new_path, Some(new_base)) {
-                Ok(()) => {}
+
+    // What `create` owes the caller when the name is taken: the name is
+    // replaced, whatever kind of node holds - unless NOREPLACE protected it.
+    // Replacing by unlink-and-create is what keeps a link from being written
+    // in place of the link it points at.
+    macro_rules! claim_name {
+        ($make:expr) => {{
+            match $make {
+                Ok(inode) => inode,
+                Err(crate::vfs::VfsError::Exists) => {
+                    if flags & RENAME_NOREPLACE != 0 {
+                        return err::EEXIST;
+                    }
+                    match dir.unlink(&name) {
+                        Ok(()) => {}
+                        Err(e) => return err_of(e),
+                    }
+                    match $make {
+                        Ok(inode) => inode,
+                        Err(e) => return err_of(e),
+                    }
+                }
                 Err(e) => return err_of(e),
             }
-            match dir.create(&name, NodeKind::File) {
-                Ok(inode) => (inode, false),
+        }};
+    }
+
+    match old_inode.metadata().kind {
+        // The old name is a link: the new name becomes the same link. Its
+        // target text travels verbatim, relative targets and all.
+        NodeKind::Symlink => {
+            let target = match old_inode.readlink() {
+                Ok(t) => t,
                 Err(e) => return err_of(e),
+            };
+            claim_name!(dir.symlink(&name, &target).map(|_| ()));
+        }
+        // A regular file: copy the bytes, then drop the old name.
+        NodeKind::File => {
+            let file = crate::vfs::File::new(old_inode);
+            let mut data = alloc::vec::Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match file.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => data.extend_from_slice(&chunk[..n]),
+                    Err(e) => return err_of(e),
+                }
+            }
+            let inode = claim_name!(dir.create(&name, NodeKind::File));
+            if crate::vfs::File::new(inode).write(&data).is_err() {
+                return err::ENOSPC;
             }
         }
-        Err(e) => return err_of(e),
-    };
-    // Replacing means replacing: the name ends up on a file whose contents
-    // are the source's, and *only* the source's. Writing over the target from
-    // offset zero would leave whatever tail was longer than the source, so
-    // the file would be the source followed by the old file's leftovers - and
-    // a plain `rename` over a longer name is the ordinary way a cache, a log
-    // or a download directory replaces what it had.
-    //
-    // Only when there was something there to replace: a name that was just
-    // created is already empty, and filesystems are not obliged to offer a
-    // resize at all.
-    if replacing && let Err(e) = inode.truncate(0) {
-        return err_of(e);
+        // A directory rename would have to move the whole subtree's parent
+        // back-pointer; nothing here needs it yet, and pretending otherwise
+        // would half-move it. Say so.
+        _ => return err::EISDIR,
     }
-    if crate::vfs::File::new(inode).write(&data).is_err() {
-        return err::ENOSPC;
-    }
-    let _ = crate::vfs::unlink_opt(&old_path, Some(old_base));
+
+    let _ = old_dir.unlink(&old_name);
     0
 }
 
@@ -2662,6 +2711,17 @@ pub(super) fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
         Ok(parent) => parent,
         Err(e) => return err_of(e),
     };
+    // A name edge belongs to the filesystem that keeps the directory. An old
+    // inode served by a different filesystem cannot be reached by one of this
+    // one's edges, which is `link(2)`'s EXDEV - the caller's cue to copy.
+    // The filesystem instance is identified by the deepest mountpoint over
+    // each path, the same rule `st_dev` uses; inode identity cannot answer
+    // here, because a non-mount-root node does not know its filesystem.
+    let old_fs = crate::vfs::mount::fs_of_path(&absolute(&old_path)).0;
+    let parent_fs = crate::vfs::mount::fs_of_path(&absolute(parent_path)).0;
+    if old_fs != parent_fs {
+        return err::EXDEV;
+    }
     match parent.link(name, &old) {
         Ok(()) => 0,
         Err(e) => err_of(e),

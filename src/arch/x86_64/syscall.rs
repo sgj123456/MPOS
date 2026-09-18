@@ -90,10 +90,11 @@ pub fn init() {
 
         // MSR_STAR (0xC0000081): segment selectors. `syscall` takes the kernel
         // CS from bits 47:32 (SS is CS+8); `sysret` computes its pair from bits
-        // 63:48 as `+16` (CS) and `+8` (SS), forcing RPL 3 on both. So bits
-        // 63:48 are *not* a selector: they are the GDT slot below the user data
-        // descriptor, which `user_code_star_base` derives from the real
-        // descriptors. Bits 31:0 are the SYSEXIT pair, unused here.
+        // 63:48 as `+16` (CS) and `+8` (SS). The SDM says both arrive with
+        // RPL 3 forced, but this machine's host CPU applies it to neither
+        // reliably, so `user_code_star_base` bakes the RPL bits into the base
+        // itself - see the XSA-132 note there. Bits 31:0 are the SYSEXIT
+        // pair, unused here.
         let user_base = super::gdt::user_code_star_base();
         // Kernel CS/SS: `syscall` loads the kernel CS from these bits and
         // takes the kernel SS from CS + 8, so the table's data descriptor
@@ -112,6 +113,43 @@ pub fn init() {
             in("edx") (star >> 32) as u32,
             in("eax") star as u32,
         );
+
+        // `sysret` is the *other* way back to ring 3, and unlike `enter_user`'s
+        // `iretq` it builds no frame anyone can inspect - it derives both
+        // selectors from what was just written here. The SDM says it forces
+        // RPL 3 on each (`CS.Selector ← STAR[63:48]+16; CS.Selector ←
+        // CS.Selector OR 3`, likewise SS), but the host this boots on does not
+        // honor that for SS: the first log of this bug shows a user task
+        // running with SS 0x18 from exactly this derivation. Hence the base
+        // carries the RPL bits pre-applied, and the check below is on the
+        // *raw* sums - without the OR - so a CPU that skips the OR still
+        // loads ring-3 selectors.
+        let (user_code, user_data) = super::gdt::user_selectors();
+        let derived_cs = (user_base + 16) | 3;
+        let derived_ss = (user_base + 8) | 3;
+        debug_assert_eq!(
+            derived_cs, user_code.0 as u64,
+            "sysret would load CS {:#x}, not the user code selector",
+            derived_cs
+        );
+        debug_assert_eq!(
+            derived_ss, user_data.0 as u64,
+            "sysret would load SS {:#x}, not the user data selector",
+            derived_ss
+        );
+        // The invariant that matters on this host: the sums must carry RPL 3
+        // before any `OR 3`. `| 3` on the base is what guarantees it, and this
+        // assert fails if anyone "simplifies" that away.
+        debug_assert_eq!(
+            (user_base + 8) & 0b11,
+            0b11,
+            "sysret's raw SS sum must already carry RPL 3 - some CPUs skip the OR"
+        );
+        debug_assert_eq!(
+            (user_base + 16) & 0b11,
+            0b11,
+            "sysret's raw CS sum must already carry RPL 3 - some CPUs skip the OR"
+        );
     }
 }
 
@@ -128,6 +166,15 @@ use crate::syscall;
 /// the return address from rcx and the flags from r11 and nothing at all for
 /// the stack. `r12` sits where the stub pushed it: a saved caller value, not
 /// scratch.
+///
+/// The frame is one word longer than this struct's *fields*: the stub pushes a
+/// second copy of `rax` between the caller's RSP and the caller's r12, so that
+/// the nine `pop`s in its epilogue consume whole words without ever landing on
+/// the two values recovered by offset. That filler is not a register and so is
+/// spelled as a padding field here - leaving it out would shift `r12` and
+/// everything above it one word down in this struct relative to the frame, and
+/// a `fork` reconstructing a child from the block would hand it an `r12` that
+/// held the caller's rdi.
 #[repr(C)]
 struct Regs {
     rax: usize,
@@ -140,6 +187,9 @@ struct Regs {
     rsi: usize,
     rdi: usize,
     user_rsp: usize,
+    /// The stub's filler word. Never meaningful: it is a second copy of `rax`,
+    /// pushed purely to hold the frame open one word so the offsets line up.
+    _filler: usize,
     r12: usize,
     r15: usize,
     r14: usize,
@@ -197,6 +247,15 @@ global_asm!(
     "    push r14",
     "    push r15",
     "    push qword ptr gs:[8]", // the caller's r12, read back through the kernel GS
+    // One filler word, and it has to sit exactly here. The epilogue's nine
+    // `pop`s restore nine registers and walk *up* from `rbp`, so whatever is
+    // nine words below the top is where they stop; the two values they cannot
+    // reach - the caller's RSP and r12 - have to be below that. Sixteen pushes
+    // would put the caller's RSP exactly where the ninth pop lands, so the
+    // frame carries seventeen. This is the extra one: a second copy of `rax`,
+    // which nothing reads back, placed so that the block below it is the
+    // register file `Regs` describes, word for word.
+    "    push rax",
     "    push r12",           // the caller's RSP
     "    swapgs",             // user GS base restored
     "    push rdi",
@@ -207,7 +266,7 @@ global_asm!(
     "    push r9",
     "    push rcx",           // user RIP
     "    push r11",           // user RFLAGS
-    "    push rax",           // syscall number
+    "    push rax",           // syscall number, at offset 0 so [rsp] patches
     "    mov  rbp, rsp",      // rbp = &Regs (base for the call and restore)
     "    mov  rdi, rbp",
     "    and  rsp, -16",
@@ -227,27 +286,44 @@ global_asm!(
     "    pop  rdx",
     "    pop  rsi",
     "    pop  rdi",
-    // What is left of the frame is read by offset rather than popped: the word
-    // that carries the stack pointer is the one a `pop` would need a spare
-    // register for. The caller's RSP sits at [rsp]; above it are the registers
-    // the stub pushed to get out of the caller's way - r12, parked while the
-    // stack switch used it; r15/r14/r13, which never left their registers at
-    // all; and rbx and rbp, saved above them. The frame itself is abandoned
-    // here: `sysretq` takes the return address from rcx and the flags from r11,
-    // and the stack is already the caller's.
-    "    mov  rbx, [rsp + 40]", // the caller's rbx
-    "    mov  rbp, [rsp + 48]", // the caller's rbp
-    "    mov  r12, [rsp + 8]",  // the caller's r12
-    // r13-r15 are pushed so a frame reader can see them, and until now they
-    // were never popped back: nothing in the stub touches them, so leaving the
-    // registers alone was the same thing. It is not the same thing any more,
-    // because `rt_sigreturn` rewrites them in the frame and expects the
-    // rewrite to take effect - a handler that clobbers r13 would otherwise
-    // return to code that had lost it.
-    "    mov  r15, [rsp + 16]",
-    "    mov  r14, [rsp + 24]",
-    "    mov  r13, [rsp + 32]",
-    "    mov  rsp, [rsp]",      // back to the caller's RSP
+    // What is left of the frame is read by offset rather than popped, because
+    // the two words that carry the caller's RSP and r12 sit *below* the nine
+    // that were popped, and a `pop` cannot reach down.
+    //
+    // Two facts about the baseline have to hold at once here, and getting
+    // either wrong moves every offset by a fixed amount:
+    //
+    //   1. `mov rbp, rsp` runs AFTER the last push, so `rbp` points at the
+    //      newest word - the syscall number - and not at the top of the task's
+    //      kernel stack. The frame occupies `[rbp .. rbp + 0x80]`, with `rbp`
+    //      itself being its lowest-addressed word. That is what makes the
+    //      `mov [rsp], rax` above land on the number, patching the return
+    //      value in place.
+    //   2. The pops walk *up* from `rbp`. Nine of them consume `rbp+0x00`
+    //      through `rbp+0x40` - the rax slot through the rdi slot - and leave
+    //      `rsp` at `rbp + 0x48`, which is where the offsets below are
+    //      measured from. `rbp+0x40` is genuinely `rdi` and not the filler:
+    //      the filler sits at `rbp+0x58`, above the caller's RSP, because the
+    //      nine popped words have to be the six argument/system registers and
+    //      the three `syscall`-stashed ones, exactly as `Regs` lists them.
+    //
+    // From `rbp + 0x48` the frame reads, going up: the caller's RSP at `+0x00`
+    // (the word the `push r12` put there), the filler at `+0x08` that nobody
+    // needs back, the caller's r12 at `+0x10`, then r15/r14/r13, and rbx and
+    // rbp closing the frame at `+0x30` and `+0x38`.
+    "    mov  r12, [rsp + 0x10]", // the caller's r12, pushed from gs:[8]
+    "    mov  r15, [rsp + 0x18]",
+    "    mov  r14, [rsp + 0x20]",
+    "    mov  r13, [rsp + 0x28]",
+    // r13-r15 are pushed so a frame reader can see them, and reading them back
+    // is what makes `rt_sigreturn` work: it rewrites them in the frame and
+    // expects the rewrite to take effect - a handler that clobbers r13 would
+    // otherwise return to code that had lost it.
+    "    mov  rbx, [rsp + 0x30]", // the caller's rbx
+    "    mov  rbp, [rsp + 0x38]", // the caller's rbp
+    // The caller's RSP is read last, out of the frame's deepest word, because
+    // that load is the one that retires the frame.
+    "    mov  rsp, [rsp]",        // back to the caller's RSP
     "    sysretq",
     rust_entry = sym rust_syscall,
 );

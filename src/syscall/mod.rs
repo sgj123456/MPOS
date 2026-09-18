@@ -53,6 +53,10 @@ pub mod err {
     pub const EPERM: isize = -1;
     pub const EOPNOTSUPP: isize = -95;
     pub const EROFS: isize = -30;
+    /// EXDEV: a hard link across two filesystems. The one request `link(2)`
+    /// cannot honor by design, and the answer that tells a caller to fall
+    /// back to copy-and-delete.
+    pub const EXDEV: isize = -18;
     pub const ENOIOCTLCMD: isize = -515;
     pub const EWOULDBLOCK: isize = -11;
     pub const EINTR: isize = -4;
@@ -142,6 +146,8 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         // EROFS: what Linux answers a write to a filesystem mounted
         // read-only, and what userland checks for before remounting.
         VfsError::ReadOnly => err::EROFS,
+        // EXDEV: a hard link whose two ends live on different filesystems.
+        VfsError::CrossDevice => err::EXDEV,
         // EAGAIN, which is also EWOULDBLOCK: they are one errno here.
         VfsError::Again => err::EWOULDBLOCK,
     }

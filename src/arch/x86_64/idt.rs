@@ -179,30 +179,126 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         return;
     }
     crate::println!(
-        "\nKERNEL PANIC: #PF at {:#x} ({:?}) rip {:#x}",
+        "\nKERNEL PANIC: #PF at {:#x} ({:?}) rip {:#x} cs {:#x} rsp {:#x}",
         addr,
         code,
-        frame.instruction_pointer
+        frame.instruction_pointer,
+        frame.code_segment.0,
+        frame.stack_pointer
     );
     crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_FAILURE)
 }
 
+/// The last-resort report for a fault nobody can resolve.
+///
+/// The `x86-interrupt` ABI hands the handler a pointer to an
+/// `InterruptStackFrame`, and where that pointer lands is worth writing down
+/// once, because getting it wrong makes every dump read as garbage:
+///
+///   +0x00  instruction_pointer   <- the faulting RIP
+///   +0x08  code_segment          <- CS as the CPU had it
+///   +0x10  cpu_flags             <- RFLAGS
+///   +0x18  stack_pointer         <- only on a privilege change
+///   +0x20  stack_segment         <- likewise
+///
+/// The pointer itself is `rsp_hw + 8`, where `rsp_hw` is the first word the
+/// CPU pushed. That is the error code for a vector that has one, and the RIP
+/// for one that does not - which is exactly why the offset comes out the same
+/// for both: the compiler emits one extra push (and a wider `sub`) for a
+/// handler carrying an error code, and consumes them in its epilogue with the
+/// matching `add $0x10`. Verified against the disassembly of both
+/// `page_fault` (10 pushes, `sub $0x1d8`, epilogue `add $0x1d8` + 9 pops +
+/// `add $0x10`) and `breakpoint` (9 pushes, `sub $0x30`, epilogue `add $0x30`
+/// + 9 pops, no extra skip).
+///
+/// So the words around the struct read, for *any* vector, as:
+///
+///   word(-1)  error code
+///   word(0)   RIP      (the struct's own field, so this always agrees)
+///   word(1)   CS
+///   word(2)   RFLAGS
+///   word(3)   RSP      - only meaningful on a privilege change
+///   word(4)   SS       - likewise
+///
+/// `word(3)`/`word(4)` are the trap's own idea of the interrupted stack and
+/// segment, and for a fault taken in ring 0 the CPU never wrote them: they
+/// hold whatever the interrupted code left on its stack. They are printed, but
+/// for a ring-0 fault they are not a stack pointer and not a segment.
 fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
+    crate::println!("\nKERNEL PANIC: {}", name);
+    // A non-zero error code on a `#GP` *is* a selector, and a selector is only
+    // worth printing if it is named: index in the GDT, and both privilege bits.
+    if code != 0 {
+        crate::println!(
+            "  code {:#x}: gdt index {} ti {} rpl {}",
+            code,
+            code >> 3,
+            (code >> 2) & 1,
+            code & 3
+        );
+    }
+    let base = frame as *const InterruptStackFrame as *const u8 as *const u64;
+    let word = |index: isize| -> u64 { unsafe { core::ptr::read_unaligned(base.offset(index)) } };
+    // The error code lives at the word below the struct. RIP/CS/RFLAGS come
+    // from the struct's own fields rather than from `word(0..3)`: they are the
+    // same memory, so printing the fields proves the pointer arithmetic - if
+    // the two ever disagreed, one of them would be a bug worth seeing.
     crate::println!(
-        "\nKERNEL PANIC: {} code {:#x} rip {:#x} rsp {:#x}",
-        name,
-        code,
+        "  err {:#x} rip {:#x} cs {:#x} rflags {:#x}",
+        word(-1),
         frame.instruction_pointer,
-        frame.stack_pointer
+        frame.code_segment.0,
+        frame.cpu_flags
+    );
+    // The two privilege-change slots sit at `word(3)`/`word(4)`, and only a
+    // trap taken at CPL 3 has them written by the CPU. A fault taken in ring 0
+    // pushes four words, not six, so those two slots hold whatever the
+    // interrupted kernel code left on its stack - a `ss 0x0` in this dump is
+    // that, not a stack segment. Printing them regardless is how a reader ends
+    // up chasing a value the hardware never wrote, so they are labelled for
+    // what they are and only claimed as real when `cs.rpl` says a privilege
+    // change happened.
+    if frame.code_segment.0 & 3 == 3 {
+        crate::println!("  rsp {:#x} ss {:#x}", word(3), word(4));
+    } else {
+        crate::println!(
+            "  (ring 0: no privilege change, so word3/word4 are stack litter) w3 {:#x} w4 {:#x}",
+            word(3),
+            word(4)
+        );
+    }
+    // The faulting RIP's role, so the two cases a `#GP` usually is - a bad
+    // ring-3 return and a bad `sysret` - can be told apart at a glance.
+    let rip = frame.instruction_pointer.as_u64() as usize;
+    crate::println!(
+        "  rip is {} ({}), cs.rpl = {}",
+        if rip < (1 << 47) { "user" } else { "kernel" },
+        if rip & 0xfff == 0 {
+            "page-aligned"
+        } else {
+            "not page-aligned"
+        },
+        frame.code_segment.0 & 3
     );
     crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_FAILURE)
 }
 
 /// If the faulting rip is in the lower half (user mode), deliver SIGSEGV and
 /// return `true`.  Otherwise return `false` so the caller can panic.
+///
+/// The one printed line matters more than it looks: a `#GP` in ring 3 means
+/// user code attempted something the CPU refuses - loading a selector whose
+/// RPL is below CPL, most commonly - and the only evidence that it happened
+/// is this line. Silently converting it to a signal leaves the fault's
+/// selector, which is the diagnostic, on the floor.
 fn user_fault_or_die(frame: &InterruptStackFrame) -> bool {
     let rip = frame.instruction_pointer.as_u64() as usize;
     if rip < (1 << 47) {
+        crate::println!(
+            "user #GP/#SS/#NP at rip {:#x} cs {:#x}",
+            rip,
+            frame.code_segment.0
+        );
         crate::sched::send_signal(crate::sched::current(), 11); // SIGSEGV
         crate::sched::preempt();
         return true;

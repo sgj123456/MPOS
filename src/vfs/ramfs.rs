@@ -219,6 +219,26 @@ impl Inode for RamDir {
         })
     }
 
+    /// A hard link: a second name edge to the node another name already
+    /// reaches. Here that is literally all one is - the same `Arc` under a
+    /// second key - so both names read, write and truncate the same bytes,
+    /// and the data survives either name being unlinked while one edge
+    /// remains. Directories are refused, as `link(2)` does: a cycle of name
+    /// edges is not something a tree this shape can survive.
+    fn link(&self, name: &str, target: &Arc<dyn Inode>) -> VfsResult<()> {
+        if target.metadata().kind == NodeKind::Dir {
+            return Err(VfsError::Invalid);
+        }
+        critical_section::with(|cs| {
+            let mut entries = self.entries.borrow(cs).borrow_mut();
+            if entries.contains_key(name) {
+                return Err(VfsError::Exists);
+            }
+            entries.insert(alloc::string::String::from(name), target.clone());
+            Ok(())
+        })
+    }
+
     /// Drop the name edge to an **empty** directory.
     ///
     /// Nothing here counts links, so the whole of an `rmdir` is: the name must

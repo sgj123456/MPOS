@@ -5,7 +5,7 @@
 # without it would build the user programs for the host too, and they are
 # built for musl.
 [workspace]
-members = ["user"]
+members = ["user", "boot"]
 # "." is the kernel - the root package, which is a member without being
 # listed in `members`.
 default-members = ["."]
@@ -64,7 +64,6 @@ critical-section = { version = "1.2", features = ["std"] }
 # x86_64-only: Limine is the x86_64 bootloader, the 16550 driver talks to port
 # I/O, and the IDT's one-time init is the only spin::Once user.
 [target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
-limine = "0.6.5"
 uart_16550 = "0.8"
 spin = { version = "0.12", default-features = false, features = ["once", "lazy"] }
 x86_64 = { version = "0.15", default-features = false, features = [

@@ -47,6 +47,14 @@ use mpos::vfs::{self, FileSystem, Inode, NodeKind};
 
 const MIB: usize = 1024 * 1024;
 
+/// The word the loader writes at the bottom of the boot stack, mirroring the
+/// loader's own `BOOT_STACK_CANARY`. Spelled as bytes again rather than shared,
+/// because the two sides of the handoff ABI are separate compilations with no
+/// crate between them - the same reason [`mpos::boot`]'s magic is written twice.
+/// Reading it as `b"mpos_boo"` little-endian is a courtesy to whoever is staring
+/// at a hexdump.
+const BOOT_STACK_CANARY: u64 = u64::from_le_bytes(*b"mpos_boo");
+
 /// The data partition device (partition 4), mounted at /mnt by `init_blk`.
 /// Kept for the checks that need the raw block device rather than the mounted
 /// tree (e.g. remounting to prove a write reached the disk).
@@ -56,19 +64,29 @@ static DATA_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::O
 // Boot entry
 // ---------------------------------------------------------------------------
 
-/// Limine jumps here in 64-bit long mode, ring 0, paging enabled, interrupts
-/// disabled, on a bootloader-provided stack.
+/// `mpos-boot` jumps here in 64-bit long mode, ring 0, interrupts disabled, on
+/// a stack it mapped itself, with `RDI` holding the [`Handoff`] record it wrote.
+///
+/// The register is the whole interface: the loader has already done the parts
+/// that need firmware - read the kernel off the ESP, applied its relocations,
+/// built the direct map and the higher-half alias, and left boot services - so
+/// there is no protocol to negotiate and no call to make. It is also why the
+/// record has to be checked rather than trusted: nothing in the machine
+/// enforces that `RDI` holds what this function was compiled to expect, and a
+/// wrong guess has to be a panic and not a wild read.
+///
+/// [`Handoff`]: mpos::boot::handoff::Handoff
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    // Serial first: it depends on no bootloader response, so it is usable even
-    // if Limine rejected our base revision and `collect` panics below.
+pub extern "C" fn _start(handoff: *const boot::handoff::Handoff) -> ! {
+    // Serial first: it depends on nothing the loader wrote, so it is usable even
+    // if the record turns out to be the wrong one and `collect` panics below.
     mpos::console::init();
 
     // Enable SSE/AVX for user processes before anything else touches CR0/CR4.
     arch::enable_user_sse();
 
-    let info = boot::limine::collect();
+    let info = unsafe { boot::handoff::collect(handoff) };
     // Hand the command line to the filesystem layer before anyone can read
     // `/proc/cmdline`: the initramfs's init parses `root=` out of it, and an
     // empty file there sends the whole boot down the diskless path instead of
@@ -87,7 +105,7 @@ pub extern "C" fn _start() -> ! {
     kernel_main(&info);
     // The system never stops booting: `kernel_main` ends parked in the boot
     // task, with init and its shell running. If it ever returned, the stack
-    // underneath is the bootloader's and there is nothing left to do.
+    // underneath is the loader's and there is nothing left to do.
     arch::halt()
 }
 
@@ -138,9 +156,51 @@ fn kernel_main(info: &BootInfo) {
 
     check_ipc();
 
+    check_boot_stack(info, "after the self-tests");
+
     println!("All ready!");
 
-    handoff_to_init();
+    handoff_to_init(info);
+}
+
+/// Check that the boot stack never ran into the canary the loader planted at
+/// its bottom.
+///
+/// The boot stack is the one stack nothing in the kernel owns: the loader
+/// allocated it, the kernel spends `_start` through `handoff_to_init` on it, and
+/// after that the boot task keeps it forever - it is adopted, so there is no
+/// `Stack` whose canary the reaper would check. That leaves it the one stack
+/// whose overflow has no witness at all, which is the worst place for the gap:
+/// the boot path is the deepest single-threaded run in the machine, with
+/// `handoff_to_init` nesting an ELF parse and a whole address space on top of
+/// every initialisation step that preceded it.
+///
+/// An overflow here is not a clean failure. Whatever trap comes next builds its
+/// frame where the overflow already wrote, so the `iretq` out of it pops a word
+/// that was never a selector and the machine dies reporting a `#GP` on a
+/// descriptor that was never loaded. That is a symptom pointing at the GDT, and
+/// it costs a long afternoon to find out it was the stack.
+///
+/// Called at the two deepest points in the boot: before the handoff, and again
+/// after init has been spawned - `spawn_init` is the single deepest call the
+/// boot task ever makes.
+fn check_boot_stack(info: &BootInfo, when: &str) {
+    let base = info.boot_stack_base;
+    // Zero means the loader planted no canary, which is how an older loader's
+    // handoff reads. Nothing to check, and not an error.
+    if base == 0 {
+        return;
+    }
+    let canary = unsafe { core::ptr::read_volatile(base as *const u64) };
+    assert_eq!(
+        canary,
+        BOOT_STACK_CANARY,
+        "the boot stack ran off its bottom by {when}: the canary at {base:#x} is \
+         {canary:#x}, not {BOOT_STACK_CANARY:#x}. The loader gave it 64 pages; a \
+         build that needs more says so here rather than as a #GP on a selector \
+         nothing ever loaded."
+    );
+    println!("boot stack: intact {when}");
 }
 
 // ---------------------------------------------------------------------------
@@ -230,8 +290,23 @@ fn init_vfs(info: &BootInfo) {
 }
 
 fn init_blk() {
-    let dev = drivers::virtio::blk::VirtioBlk::init()
-        .expect("no virtio-blk device answered on the PCI bus");
+    // `/mnt` exists whether or not anything is mounted on it: it is where the
+    // initramfs's own init puts the data partition when the image has one, and a
+    // directory is cheaper than making a userland mount point conditional on the
+    // kernel's opinion of the layout.
+    let root = vfs::resolve("/").expect("no root filesystem");
+    if root.lookup("mnt").is_err() {
+        root.create("mnt", NodeKind::Dir).expect("create /mnt");
+    }
+
+    // A machine with no disk is a machine that boots and has nothing to mount -
+    // the diskless path the boot used to take when the command line named no
+    // root. Nothing below this can run without a device to read, and none of it
+    // is load-bearing for a kernel that is going to sit in the initramfs.
+    let Some(dev) = drivers::virtio::blk::VirtioBlk::init() else {
+        println!("blk: no virtio-blk device answered on the PCI bus");
+        return;
+    };
     let sectors = dev.capacity_sectors();
     println!(
         "virtio-blk: {} sectors ({} MiB)",
@@ -240,22 +315,23 @@ fn init_blk() {
     );
     blk::set_raw_disk(dev.clone());
 
-    // The disk carries a partition table now, and *two* ext2 partitions: the
-    // rootfs (which `/init` mounts) and the data partition (which this check
-    // works against - its seed files are laid down by mke2fs at image build
-    // time). The data one is picked by its position in the table, not by
-    // "whichever ext2 comes first": with a full rootfs on the disk, first
-    // found is the root, and the check would be reading the wrong disk.
-    let data = blk::part::find_data(dev).expect("no data partition on the disk");
+    // The data partition is a second ext2 filesystem, and it is the only thing
+    // on the disk the kernel reads for its own sake rather than to hand to
+    // userland - seed files laid down by the image builder, so that a check can
+    // read something the machine did not write. Not every layout has room for
+    // one: a UEFI image is an ESP and a root filesystem and nothing else, and
+    // asking for a fourth partition there would be asking the disk to carry a
+    // filesystem nothing on it uses. So its absence is a quieter boot, not a
+    // failed one.
+    let Some(data) = blk::part::find_data(dev) else {
+        println!("blk: no data partition on this disk, so /mnt stays empty");
+        return;
+    };
     println!(
         "ext2: filesystem on a {}-sector partition",
         data.capacity_sectors()
     );
 
-    let root = vfs::resolve("/").expect("no root filesystem");
-    if root.lookup("mnt").is_err() {
-        root.create("mnt", NodeKind::Dir).expect("create /mnt");
-    }
     let fs = vfs::ext2::Ext2Fs::mount(data.clone()).expect("the ext2 image did not mount");
     vfs::mount("/mnt", &fs).expect("mount /mnt");
     DATA_DEV.call_once(|| data);
@@ -1241,11 +1317,18 @@ fn init_net() {
 
 /// M8: a real system start. The checks above are the kernel proving itself;
 /// this is the kernel handing the machine over.
-fn handoff_to_init() {
+fn handoff_to_init(info: &BootInfo) {
     let init = vfs::read_file("/init").expect("the initramfs carries /init");
     let argv = alloc::vec![String::from("/init")];
     let pid = sched::spawn_init(&init, &argv, &[]).expect("the init image loaded");
     assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
+
+    // The deepest the boot stack ever gets: `spawn_init` parsed an ELF and built
+    // a process's address space and stack on top of everything above. Checking
+    // here rather than after the handoff is the point - once init runs, the trap
+    // that lands on an overrun stack is the one that cannot report it.
+    check_boot_stack(info, "under spawn_init");
+
     println!("mpos: handing the machine to /init");
 
     sched::discard_exit_code(pid);

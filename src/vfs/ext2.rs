@@ -1978,7 +1978,12 @@ mod tests {
         let inner = dir.create("f", NodeKind::File).expect("create in dir");
         assert_eq!(inner.write_at(0, b"nested").unwrap(), 6);
         assert_eq!(dir.metadata().kind, NodeKind::Dir);
-        assert_eq!(dir.metadata().size, 0, "directories report size 0");
+        // A directory's size is the byte length of its dirent blocks - what
+        // Linux's own ext2 reports and `ls -l` prints. A fresh directory
+        // holds "." and ".." in its one first block, so the size is the
+        // block size. Zeroing it (as this test once asserted) made every
+        // directory read as empty of content as a stat could suggest.
+        assert_eq!(dir.metadata().size, fs.core.block_size() as u64);
 
         // "." and ".." resolve to the right inodes, through the real parser.
         assert_eq!(
@@ -2164,5 +2169,65 @@ mod tests {
         assert_eq!(le16(&page, 44), 12, "ab shrank to its real length");
         assert_eq!(le32(&page, 52), 9);
         assert_eq!(le16(&page, 56), 12, "cd owns what ab's record gave up");
+    }
+
+    /// apk's install, replayed in the order that broke it: a package lays
+    /// every file down under a `.apk.<digest>` temp name and commits them
+    /// one by one, and within a directory the `.so` symlink sorts before the
+    /// real library it points at. So the symlink's rename runs while its
+    /// target still lives under its own temp name - resolving the link would
+    /// go looking for the target's real name and die with ENOENT, which is
+    /// exactly what `apk add eza` showed: every regular file committed,
+    /// every symlink failed. A rename must move the name un-followed.
+    #[test]
+    fn an_apk_style_symlink_commit_resolves() {
+        let fs = mounted(Arc::new(format()));
+        let vfs = alloc::sync::Arc::new(crate::vfs::mount::Vfs::new());
+        vfs.mount_root(&fs);
+
+        let root = vfs.resolve("/").expect("root");
+        root.create("usr", NodeKind::Dir).expect("usr");
+        let usr = root.lookup("usr").expect("usr");
+        usr.create("lib", NodeKind::Dir).expect("lib");
+        let lib = usr.lookup("lib").expect("lib");
+
+        let tmpname =
+            ".apk.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bodytmp =
+            ".apk.1111111111111111111111111111111111111111111111111111111111111111";
+
+        // Extract: the symlink first - dangling, because the library under
+        // it has not been laid down yet - then the library's own temp file.
+        lib.symlink(tmpname, "libllhttp.so.9.4.1")
+            .expect("symlinkat the temp name");
+        let body = lib
+            .create(bodytmp, NodeKind::File)
+            .expect("the real library's temp file");
+        crate::vfs::File::new(body.clone())
+            .write(&vec![0x42u8; 63088])
+            .expect("write the library body");
+
+        // Commit the symlink first, as the db order does. What renameat2
+        // must do: look the old name up un-followed, read the link's own
+        // target text, and lay the same link under the real name.
+        let old = lib.lookup(tmpname).expect("the temp link is there");
+        assert_eq!(old.metadata().kind, NodeKind::Symlink);
+        assert_eq!(old.readlink().expect("readlink"), "libllhttp.so.9.4.1");
+        lib.symlink("libllhttp.so.9.4", "libllhttp.so.9.4.1")
+            .expect("rename lays the link under its real name");
+        lib.unlink(tmpname).expect("the temp name goes");
+
+        // Commit the library itself.
+        lib.link("libllhttp.so.9.4.1", &body).expect("rename the body");
+        lib.unlink(bodytmp).expect("the body's temp name goes");
+
+        // The end state apk expects: the library body, plus a link chain
+        // that resolves to it.
+        let lib9 = lib.lookup("libllhttp.so.9.4").expect("the .so.9.4 link");
+        assert_eq!(lib9.metadata().kind, NodeKind::Symlink);
+        assert_eq!(lib9.readlink().expect("readlink"), "libllhttp.so.9.4.1");
+        let real = lib.lookup("libllhttp.so.9.4.1").expect("the library");
+        assert_eq!(real.metadata().kind, NodeKind::File);
+        assert_eq!(real.metadata().size, 63088);
     }
 }
