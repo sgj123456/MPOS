@@ -9,10 +9,13 @@
 //! negative errno values in `rax`.
 //!
 //! The dispatch runs the handlers, which need a console and a scheduler
-//! under them, so it only exists on the machine.
+//! under them, so it only exists on the machine. The Linux module's *number
+//! table* and its pure *ABI half* (`linux::abi`: flag values, struct
+//! layouts, argument shaping) compile on the host too - that is where the
+//! man-page contract is unit-tested, and where a change to a flag bit or a
+//! struct offset reads as a red test instead of a mystery on the machine.
 
 /// Linux x86_64 syscall number mapping and POSIX handlers.
-#[cfg(target_os = "none")]
 pub mod linux;
 
 /// Base address for user mmap: where every process's mmap cursor starts.
@@ -119,11 +122,9 @@ pub mod err {
 pub const ARG_COUNT: usize = 6;
 
 /// Upper bound on a single read or write.
-#[cfg(target_os = "none")]
 pub(crate) const MAX_IO: usize = 1 << 20;
 
 /// Maximum length of a path argument.
-#[cfg(target_os = "none")]
 pub(crate) const MAX_PATH: usize = 255;
 
 /// Map a VFS error onto the errno [`linux::dispatch`] returns.
@@ -154,9 +155,25 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
 }
 
 /// Validate a user buffer: length within bounds and pages accessible.
-#[cfg(target_os = "none")]
 pub(crate) fn buffer_ok(buf: usize, len: usize, write: bool, from_user: bool) -> bool {
-    len <= MAX_IO && (!from_user || crate::arch::paging::user_accessible(buf, len, write))
+    len <= MAX_IO && (!from_user || user_accessible(buf, len, write))
+}
+
+/// The page-walk half of [`buffer_ok`]: is the range mapped and, for a read
+/// performed by the kernel on the caller's behalf, writable?
+///
+/// On the machine this is the page table's answer. The host build has no
+/// page tables - the tests that reach this layer hand it real memory and
+/// call with `from_user = false` where the distinction matters - so the stub
+/// answers "accessible" and the length bound above stays the real gate.
+#[cfg(target_os = "none")]
+fn user_accessible(buf: usize, len: usize, write: bool) -> bool {
+    crate::arch::paging::user_accessible(buf, len, write)
+}
+
+#[cfg(not(target_os = "none"))]
+fn user_accessible(_buf: usize, _len: usize, _write: bool) -> bool {
+    true
 }
 
 /// Parse a NUL-terminated string argument - the Linux ABI's path shape - into
@@ -168,7 +185,6 @@ pub(crate) fn buffer_ok(buf: usize, len: usize, write: bool, from_user: bool) ->
 /// string that ends inside its last mapped page from being rejected for the
 /// unmapped bytes beyond it. A string with no NUL within [`MAX_PATH`]
 /// characters answers `ENAMETOOLONG`, the errno Linux uses for exactly that.
-#[cfg(target_os = "none")]
 pub(crate) fn cstr_arg(ptr: usize, from_user: bool) -> Result<alloc::string::String, isize> {
     if ptr == 0 {
         return Err(err::EFAULT);
@@ -198,7 +214,6 @@ pub(crate) fn cstr_arg(ptr: usize, from_user: bool) -> Result<alloc::string::Str
 
 /// Parse a NULL-terminated array of NUL-terminated strings - the Linux ABI's
 /// argv shape - into an owned vector. An absent array (`NULL`) is empty.
-#[cfg(target_os = "none")]
 pub(crate) fn argv_arg(ptr: usize) -> Result<alloc::vec::Vec<alloc::string::String>, isize> {
     if ptr == 0 {
         return Ok(alloc::vec::Vec::new());

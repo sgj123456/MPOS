@@ -121,17 +121,9 @@ const USER_STACK_MAX: usize = 8 * 1024 * 1024;
 /// stay a fault rather than quietly claim pages.
 const STACK_GROWTH_SLACK: usize = 64 * 1024;
 
-/// The most strings a user process may be handed, and the most bytes they may
-/// take. The syscall layer enforces the same limits on the argv blob it reads
-/// from ring 3, so these bounds decide `spawn()`'s error cases too.
-///
-/// The block lands on one stack page, so the real ceiling is that page minus
-/// the pointer words and auxv - Linux allows megabytes, but nothing in this
-/// userland needs more than the page: OpenRC's service environment, the
-/// largest thing handed over, is a few hundred bytes a string and a couple
-/// of dozen entries.
-pub const ARGV_MAX: usize = 64;
-pub const ARGS_BYTES_MAX: usize = 2048;
+// `ARGV_MAX` / `ARGS_BYTES_MAX` live in `policy`: the syscall layer checks
+// them on the host too, where this module is not compiled.
+use super::policy::{ARGS_BYTES_MAX, ARGV_MAX};
 
 /// Where a dynamically linked program's interpreter is loaded.
 ///
@@ -398,6 +390,11 @@ struct Task {
     body: Option<Box<dyn FnOnce()>>,
     /// The ring-3 address space; `None` for tasks that only run kernel code.
     space: Option<AddressSpace>,
+    /// Set for every task that was given a user image to run, and stays set
+    /// after it exits: a zombie is still a process, and `/proc` - which has no
+    /// address space of its own to look at any more - needs this to tell it
+    /// from a kernel task, which never had one at all.
+    user: bool,
     /// Where a user task's first dispatch goes: the entry point and the stack
     /// `enter_user` hands the CPU. Kernel tasks have none.
     user_entry: Option<(usize, usize)>,
@@ -467,6 +464,16 @@ struct Task {
     /// through. Empty for tasks that never had an image (kernel tasks, the
     /// boot task).
     exe: alloc::string::String,
+    /// The argument vector this process was entered with, `argv[0]` included -
+    /// what `/proc/<pid>/cmdline` reads through, and the only record of it:
+    /// the block was written onto the process's own stack, and once the
+    /// program is running it is free to write over it.
+    ///
+    /// Shared rather than copied so that `fork` - which copies a whole process
+    /// for a child that will usually `exec` something else in the next
+    /// instruction - hands over one reference instead of cloning every string.
+    /// `execve` replaces the whole vector, which drops the old one.
+    argv: alloc::sync::Arc<alloc::vec::Vec<alloc::string::String>>,
     /// Where a child created by `clone(CLONE_CHILD_SETTID)` writes its own tid
     /// before it first runs. Zero when nothing was asked for.
     child_tid: usize,
@@ -496,6 +503,7 @@ impl Task {
             tgid: TaskId(0),
             body: None,
             space: None,
+            user: false,
             user_entry: None,
             user_resume: None,
             signals: 0,
@@ -511,6 +519,7 @@ impl Task {
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
+            argv: alloc::sync::Arc::new(alloc::vec::Vec::new()),
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
@@ -703,6 +712,7 @@ impl Table {
             exited: false,
             body: Some(Box::new(body)),
             space: None,
+            user: false,
             mm: Mm::new(TaskId(slot), 0, alloc::vec::Vec::new()),
             released: false,
             tgid: TaskId(slot),
@@ -721,6 +731,7 @@ impl Table {
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
+            argv: alloc::sync::Arc::new(alloc::vec::Vec::new()),
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
@@ -1069,6 +1080,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             exited: false,
             body: None,
             space: Some(space),
+            user: true,
             mm: Mm::new(TaskId(slot), root, loaded.frames),
             released: false,
             tgid: TaskId(slot),
@@ -1089,6 +1101,10 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::new(),
+            // The one record of how init was started: `/proc/1/cmdline` and
+            // `ps` both read it back, and an empty one reads as a process
+            // that has no name at all.
+            argv: alloc::sync::Arc::new(argv.to_vec()),
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
@@ -1199,6 +1215,7 @@ pub fn try_spawn_user(
             exited: false,
             body: None,
             space: Some(space),
+            user: true,
             mm: Mm::new(TaskId(slot), root, loaded.frames),
             released: false,
             tgid: TaskId(slot),
@@ -1217,6 +1234,7 @@ pub fn try_spawn_user(
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
             exe: alloc::string::String::from(exe),
+            argv: alloc::sync::Arc::new(argv.to_vec()),
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
@@ -1691,6 +1709,91 @@ fn block_until_on(cond: impl Fn(&Table) -> bool) {
     }
 }
 
+/// [`block_until`] with a clock on the wait: block until `cond` is true, the
+/// `deadline` - a tick deadline, as the sleep queue keeps them - passes, or a
+/// catchable signal demands the wait's attention. A wake still ends the sleep
+/// early, exactly as it does for [`block_until`]; the clock and the signal
+/// only add ways out. `u64::MAX` is the [`block_until`] spelling of "never",
+/// which is how a caller with no timeout spells this call.
+///
+/// The three answers are the caller's to interpret: the condition holding
+/// means woken, the clock means timed out, and a pending signal means the
+/// wait has to go answer EINTR - the syscall gate delivers the signal on the
+/// way out, and a libc's own handler is often the thing meant to end the
+/// wait, which is why sleeping through it would hang the caller. The signal
+/// is left pending, not consumed: taking it here would strand it where no
+/// register file exists to build the handler's frame on.
+pub enum WaitEnd {
+    /// The condition held.
+    Condition,
+    /// The clock ran out with the condition still false.
+    Deadline,
+    /// A catchable, unblocked, non-ignored signal is pending.
+    Interrupted,
+}
+
+pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
+    loop {
+        if let Some(sig) = take_fatal_signal() {
+            exit(-(sig as isize));
+        }
+        if cond() {
+            return WaitEnd::Condition;
+        }
+        if with_table(|t| table_has_deliverable(t)) {
+            return WaitEnd::Interrupted;
+        }
+        if timer::ticks() >= deadline {
+            return WaitEnd::Deadline;
+        }
+        schedule(|t| {
+            let done =
+                cond() || table_has_deliverable(t) || timer::ticks() >= deadline;
+            if done {
+                t.requeue_current();
+            } else {
+                let id = t.current;
+                let priority = t.task(id).priority;
+                // The deadline is absolute, the sleep's is relative: what is
+                // left of the wait is what the clock should run down, and a
+                // wake may still end it before that.
+                t.sched.advance(timer::ticks());
+                let remaining = deadline.saturating_sub(timer::ticks()).max(1);
+                t.sched.sleep(id, priority, remaining);
+            }
+        });
+    }
+}
+
+/// Whether the running task has a signal that would interrupt a blocking
+/// wait: pending, unblocked, and not ignored. The table-borrowing shape of
+/// [`has_deliverable_signal`], for a check inside `schedule`, where the table
+/// is already borrowed and no second borrow may be taken.
+fn table_has_deliverable(t: &Table) -> bool {
+    let task = t.task(t.current);
+    let mut ready = task.signals & !task.blocked;
+    while let Some(sig) = signal::take(&mut ready) {
+        if task.dispositions.get(sig).is_ignore() {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Whether a signal that would interrupt a blocking wait is pending, without
+/// taking it off the pending set.
+///
+/// This is the question a blocking syscall asks before it sleeps: Linux
+/// answers an interruptible wait with `EINTR` when a catchable, unblocked
+/// signal is pending, and leaves the signal itself for the syscall gate to
+/// deliver on the way out - the handler runs there, where a register file
+/// exists to build its frame on. Ignored signals are not pending
+/// interruptions and do not count, same as in [`take_deliverable_signal`].
+pub fn has_deliverable_signal() -> bool {
+    with_table(|t| table_has_deliverable(t))
+}
+
 /// Take a child's exit code if one is waiting, and report `None` - not
 /// "keep waiting" - when it is not. The non-blocking half of `wait`: this is
 /// how a shell reaps jobs it started in the background without stopping for
@@ -2100,6 +2203,18 @@ pub fn exit(code: isize) -> ! {
         let parent = t.task(id).parent;
         if let Some(parent) = parent {
             t.sched.wake(parent);
+            // The real SIGCHLD, not just the wake. A parent sitting in
+            // `wait(2)` needs only the wake - the code it waits for is on
+            // file here - but a parent waiting any other way (a futex, a
+            // handler of its own) is ended by the signal, and without it
+            // such a caller sleeps for ever: musl's waitpid blocks on a
+            // futex and lets its SIGCHLD handler do the waking. Queued only
+            // when a handler would run: SIGCHLD's default action ignores
+            // it, and a signal the parent has ignored must never become
+            // pending - Linux discards it as it is generated.
+            if t.task(parent).dispositions.get(signal::SIGCHLD).is_handler() {
+                signal::add(&mut t.task_mut(parent).signals, signal::SIGCHLD);
+            }
             // The console goes back to the parent's group as the child leaves
             // it: a shell waits, gets its prompt back, and reads again. A
             // job-controlled shell has already taken the terminal back with
@@ -2350,6 +2465,202 @@ pub fn current_fds() -> Arc<FdTable> {
 pub fn current_exe() -> alloc::string::String {
     let id = current();
     with_table(|t| t.task(id).exe.clone())
+}
+
+/// How many characters of a process's name Linux's `comm` holds.
+///
+/// It is a `char comm[16]` in the kernel's task struct, so fifteen plus a
+/// terminator - and it is why `ps` truncates a long command name rather than
+/// wrapping it.
+const COMM_MAX: usize = 15;
+
+/// What `/proc/<pid>` says about one task.
+///
+/// A copy rather than a view into the table: the table is behind a critical
+/// section, and a filesystem read cannot hold one across the formatting of a
+/// file - the generator would still be inside it while the next line is
+/// written, and anything that wanted the table in between would deadlock. So
+/// the facts come out in one look and the file is built from the copy.
+#[derive(Clone)]
+pub struct TaskSnapshot {
+    /// The scheduler's own id for this thread.
+    pub tid: usize,
+    /// The process id - the thread group leader's tid, which is what `getpid`
+    /// answers from any thread and what a directory in `/proc` is named after.
+    pub pid: usize,
+    /// The parent, or 0 for a process with none: init's own ppid, which is
+    /// what Linux reports for pid 1.
+    pub ppid: usize,
+    pub pgid: usize,
+    /// `R` running, `S` sleeping on something, `Z` exited and not yet
+    /// collected - the letter `/proc/<pid>/stat` carries in field 3.
+    pub state: char,
+    /// The name, as `comm` and `ps` print it: the image's last path
+    /// component, cut to [`COMM_MAX`].
+    pub comm: alloc::string::String,
+    /// The path the process was started from, empty when it has no named
+    /// image - what `/proc/<pid>/exe` is a link to.
+    pub exe: alloc::string::String,
+    /// The argument vector it was entered with. Shared with the task: a
+    /// reader only reads it, and a whole process's command line is not worth
+    /// copying for a `ps`.
+    pub argv: alloc::sync::Arc<alloc::vec::Vec<alloc::string::String>>,
+    /// The directory relative paths are resolved from, as the caller spelled
+    /// it. `/` for a process that never moved.
+    pub cwd: alloc::string::String,
+    /// Threads in the group: what `/proc/<pid>/task` lists and
+    /// `Status: Threads` reports.
+    pub threads: usize,
+    /// Frames behind the group's user mappings. `stat` wants resident pages,
+    /// `status` wants kilobytes, and both are this number.
+    pub rss_pages: usize,
+}
+
+/// The facts about `task`, in the shape `/proc` reports them.
+fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
+    // Exited-but-uncollected is a zombie, and it is still in the table
+    // because it is still someone's child to collect. Sleeping is a question
+    // only the scheduler's own queue can answer: a task blocked in a read is
+    // waiting for a driver to wake it, and nothing about the task says so.
+    let state = if task.exited {
+        'Z'
+    } else if t.sched.is_sleeping(id) {
+        'S'
+    } else {
+        'R'
+    };
+    let rss_pages = critical_section::with(|cs| task.mm.frames.borrow(cs).borrow().len());
+    TaskSnapshot {
+        tid: id.0,
+        pid: task.tgid.0,
+        ppid: task.parent.map_or(0, |p| p.0),
+        pgid: task.pgid.0,
+        state,
+        comm: comm_of(task),
+        exe: task.exe.clone(),
+        argv: alloc::sync::Arc::clone(&task.argv),
+        cwd: task
+            .cwd_path
+            .clone()
+            .unwrap_or_else(|| alloc::string::String::from("/")),
+        threads: task.mm.live.load(core::sync::atomic::Ordering::Relaxed),
+        rss_pages,
+    }
+}
+
+/// The name a process is listed under: the image's last path component, cut
+/// to the fifteen characters `comm` holds.
+///
+/// `argv[0]` is the fallback rather than the first choice because a program
+/// may exec itself under any name it likes - a shell running as `-sh`, or a
+/// wrapper - and what Linux records is the image, not the claim. The
+/// truncation takes the cut on a character boundary, since a name in UTF-8
+/// with a byte cut through the middle of one is not a name at all.
+fn comm_of(task: &Task) -> alloc::string::String {
+    let named = if !task.exe.is_empty() {
+        task.exe.as_str()
+    } else {
+        task.argv.first().map_or("", |first| first.as_str())
+    };
+    let base = named.rsplit('/').next().unwrap_or("");
+    if base.is_empty() {
+        return alloc::string::String::from("unknown");
+    }
+    match base.char_indices().nth(COMM_MAX) {
+        Some((cut, _)) => alloc::string::String::from(&base[..cut]),
+        None => alloc::string::String::from(base),
+    }
+}
+
+/// Every process in the table, as `/proc` reports them.
+///
+/// Kernel tasks and the boot task are left out, which is the difference
+/// between this and the table itself: they share the kernel's address space
+/// and have no user image, no descriptors of their own and no pid a userland
+/// tool could name - `ps` listing four of them beside the shell would be a
+/// report about the kernel's own plumbing, not about the machine's work.
+///
+/// A zombie stays in: it has exited but not been collected, and until its
+/// parent reads its code it is still a process with a pid - the `'Z'` Linux
+/// lists. Its address space is already gone, which is why the filter asks
+/// `user` rather than `space`.
+pub fn snapshots() -> alloc::vec::Vec<TaskSnapshot> {
+    with_table(|t| {
+        t.tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, maybe)| {
+                let task = maybe.as_ref()?;
+                if !task.user {
+                    return None;
+                }
+                Some(snapshot_of(t, TaskId(slot), task))
+            })
+            .collect()
+    })
+}
+
+/// One task, by pid or tid. `None` when no user task answers to it, which is
+/// what turns into `ENOENT` from a read of `/proc/<pid>` - the same answer
+/// Linux gives for a pid that has already been reaped.
+///
+/// A tid names its thread just as a pid names its leader: the files under
+/// `/proc/<pid>/task/<tid>` are built by asking this for the thread. A caller
+/// that wants leaders only tells the two apart by comparing the snapshot's
+/// `pid` with the id it asked for.
+pub fn snapshot(pid: usize) -> Option<TaskSnapshot> {
+    with_table(|t| {
+        let task = t.tasks.get(pid)?.as_ref()?;
+        if !task.user {
+            return None;
+        }
+        Some(snapshot_of(t, TaskId(pid), task))
+    })
+}
+
+/// Every thread of the process `pid`, in the order the task table holds them.
+///
+/// The group leader is one of them, which is why Linux keeps threads under
+/// `/proc/<pid>/task` rather than beside the process: the process *is* its
+/// leader, and listing both separately would be two answers to one question.
+pub fn thread_snapshots(pid: usize) -> alloc::vec::Vec<TaskSnapshot> {
+    with_table(|t| {
+        t.tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, maybe)| {
+                let task = maybe.as_ref()?;
+                if !task.user || task.tgid.0 != pid {
+                    return None;
+                }
+                Some(snapshot_of(t, TaskId(slot), task))
+            })
+            .collect()
+    })
+}
+
+/// The open descriptors of the process `pid`, each with the name
+/// `/proc/<pid>/fd` reports it by, in fd-number order.
+///
+/// Only descriptors still open are listed: a closed slot names nothing, and a
+/// listing that carried its number would point tools at a name that answers
+/// `ENOENT`. The name is the path the descriptor was opened by when one was
+/// recorded, the tree's own name for the inode when the tree knows one, and
+/// Linux's spelling of an anonymous kind - `pipe:[ino]`, `socket:[ino]` -
+/// when it has neither.
+pub fn descriptors_of(pid: usize) -> alloc::vec::Vec<(usize, alloc::string::String)> {
+    // The files are collected under the table and named outside it: naming
+    // asks the mount table where an inode sits, and the two locks must never
+    // nest the other way round.
+    let open: alloc::vec::Vec<(i32, alloc::sync::Arc<crate::vfs::File>)> = with_table(|t| {
+        match t.tasks.get(pid).and_then(Option::as_ref) {
+            Some(task) if task.user => task.fds.open_files(),
+            _ => alloc::vec::Vec::new(),
+        }
+    });
+    open.into_iter()
+        .map(|(fd, file)| (fd as usize, file.display_name()))
+        .collect()
 }
 
 /// Map a physical frame at `virt` in the current task's address space with
@@ -2846,6 +3157,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         parent_cwd,
         parent_cwd_path,
         parent_exe,
+        parent_argv,
         parent_brk_base,
         parent_brk_pages,
         parent_mmap_cursor,
@@ -2860,6 +3172,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         let parent_cwd = parent.cwd.clone();
         let parent_cwd_path = parent.cwd_path.clone();
         let parent_exe = parent.exe.clone();
+        let parent_argv = alloc::sync::Arc::clone(&parent.argv);
         let parent_brk_base = parent.brk_base;
         let parent_brk_pages = parent.brk_pages;
         let parent_mmap_cursor = parent.mmap_cursor;
@@ -2881,6 +3194,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             parent_cwd,
             parent_cwd_path,
             parent_exe,
+            parent_argv,
             parent_brk_base,
             parent_brk_pages,
             parent_mmap_cursor,
@@ -2954,6 +3268,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             exited: false,
             body: None,
             space: Some(child_space),
+            user: true,
             // The child does not start at the entry point: it returns from the
             // `fork` that made it, so it carries a whole register file instead.
             user_entry: None,
@@ -2983,6 +3298,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             brk_pages: parent_brk_pages,
             mmap_cursor: parent_mmap_cursor,
             exe: parent_exe,
+            argv: parent_argv,
             // `CLONE_CHILD_SETTID` parks the child's tid where the child can
             // read it; without the flag there is nothing to record.
             child_tid: if request.flags & nr::CLONE_CHILD_SETTID != 0 {
@@ -3102,6 +3418,11 @@ pub fn exec_replace(
         task.brk_pages = 0;
         task.mmap_cursor = crate::syscall::MMAP_BASE;
         task.exe = alloc::string::String::from(exe);
+        // The program that was running is being replaced, and so is the
+        // command line that described it: a process that `exec`s is the same
+        // pid with a new name, and `/proc/<pid>/cmdline` has to say the new
+        // one from here on.
+        task.argv = alloc::sync::Arc::new(argv.to_vec());
 
         // Reset signal dispositions to SIG_DFL (POSIX requirement).
         task.dispositions = signal::Actions::default();
@@ -3361,6 +3682,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let brk_pages = parent.brk_pages;
         let mmap_cursor = parent.mmap_cursor;
         let exe = parent.exe.clone();
+        let argv = alloc::sync::Arc::clone(&parent.argv);
         let parent_tls = parent.tls;
 
         let slot = t.alloc_slot();
@@ -3380,6 +3702,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             // No address space of its own: the group's root is what the
             // dispatcher loads for it.
             space: None,
+            user: false,
             user_entry: None,
             user_resume: Some(UserContext {
                 // The child returns from the call with zero, and lands on the
@@ -3408,6 +3731,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             brk_pages,
             mmap_cursor,
             exe,
+            argv,
             child_tid: if request.flags & nr::CLONE_CHILD_SETTID != 0 {
                 request.child_tid
             } else {

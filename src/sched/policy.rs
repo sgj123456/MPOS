@@ -18,6 +18,21 @@ use core::cmp::{Ordering, Reverse};
 /// number is the whole of the policy's tunable surface.
 pub const BANDS: usize = 4;
 
+/// The most strings a user process may be handed, and the most bytes they may
+/// take. The syscall layer enforces the same limits on the argv blob it reads
+/// from ring 3, so these bounds decide `spawn()`'s error cases too.
+///
+/// The block lands on one stack page, so the real ceiling is that page minus
+/// the pointer words and auxv - Linux allows megabytes, but nothing in this
+/// userland needs more than the page: OpenRC's service environment, the
+/// largest thing handed over, is a few hundred bytes a string and a couple
+/// of dozen entries.
+///
+/// These live here rather than in `runtime` because the syscall layer checks
+/// them on the host too, where `runtime` is not compiled at all.
+pub const ARGV_MAX: usize = 64;
+pub const ARGS_BYTES_MAX: usize = 2048;
+
 const _: () = assert!(BANDS > 0, "a scheduler with no bands cannot queue anything");
 
 /// Identifies a task. The runtime hands these out and they are never reused
@@ -130,6 +145,17 @@ impl Scheduler {
     /// until tick 1000 leaves the scheduler empty of ready work but not empty.
     pub fn is_empty(&self) -> bool {
         self.ready_count() == 0 && self.sleeping.is_empty()
+    }
+
+    /// Whether `id` is waiting on something rather than able to run - the
+    /// difference `ps` spells `S` and `R`.
+    ///
+    /// Asked from outside the task table, by `/proc/<pid>/stat`: a process
+    /// blocked in a read or a `wait` is asleep in *this* queue, and there is no
+    /// other record of it. A task in neither queue has been picked and is the
+    /// one running, which is as close to `R` as a single CPU gets.
+    pub fn is_sleeping(&self, id: TaskId) -> bool {
+        self.sleeping.iter().any(|Reverse(sleeper)| sleeper.id == id)
     }
 
     /// The task to run next, removed from its queue.

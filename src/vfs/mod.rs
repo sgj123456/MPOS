@@ -229,6 +229,19 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// The descriptor this node is a second name for, if it is one.
+    ///
+    /// `/proc/self/fd/3` and the `/dev/stdin`, `/dev/stdout` and `/dev/stderr`
+    /// links that point into it are not files: opening one opens the
+    /// descriptor it names, sharing its file and its position, which is the
+    /// whole point - a `> /dev/stdout` has to write to wherever standard
+    /// output goes, and a program listing `/dev/fd` is looking at what it has
+    /// open. Resolution hands back the link's own inode, so this is how the
+    /// opener is told what the name really meant.
+    fn as_fd(&self) -> Option<usize> {
+        None
+    }
+
     /// The block device this node stands for, if it is one.
     ///
     /// `mount(2)` is told "mount this device on that directory" and receives

@@ -8,6 +8,11 @@
 
 pub mod nr;
 
+/// The pure ABI half: flag values, struct layouts, argument validation and
+/// encodings - host-compiled so the man-page contract is unit-tested, and
+/// the only place those facts are spelled.
+pub mod abi;
+
 /// The path-carrying calls, in Linux argument shapes: NUL-terminated paths
 /// and dirfd-led resolution.
 #[cfg(target_os = "none")]
@@ -25,6 +30,7 @@ pub(crate) mod proc;
 /// The register frame is what makes this possible at all - entering a handler
 /// means rewriting the task's return context wholesale - so it is handed
 /// straight through to the layer that knows the frame's shape.
+#[cfg(target_os = "none")]
 pub fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
     proc::deliver_signal(regs_ptr, ret)
 }
@@ -56,14 +62,14 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::UNLINKAT => fs::unlinkat(args, &cwd()),
         // The legacy path forms, man(2) conventions musl/glibc call: each is
         // its *at equivalent at the caller's cwd.
-        nr::UNLINK => fs::unlinkat([fs::AT_FDCWD as usize, args[0], 0, 0, 0, 0], &cwd()),
-        nr::MKDIR => fs::mkdirat([fs::AT_FDCWD as usize, args[0], args[1], 0, 0, 0], &cwd()),
+        nr::UNLINK => fs::unlinkat([abi::AT_FDCWD as usize, args[0], 0, 0, 0, 0], &cwd()),
+        nr::MKDIR => fs::mkdirat([abi::AT_FDCWD as usize, args[0], args[1], 0, 0, 0], &cwd()),
         nr::RMDIR => fs::rmdir(args, &cwd()),
         nr::RENAME => fs::renameat2(
             [
-                fs::AT_FDCWD as usize,
+                abi::AT_FDCWD as usize,
                 args[0],
-                fs::AT_FDCWD as usize,
+                abi::AT_FDCWD as usize,
                 args[1],
                 0,
                 0,
@@ -134,12 +140,12 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::TKILL => proc::handle_kill(args),
         nr::RT_SIGTIMEDWAIT => proc::handle_rt_sigtimedwait(args, from_user),
         nr::REBOOT => proc::handle_reboot(args),
-        // The name is validated for shape only - one machine, no identity
-        // to keep distinct - but answering ENOSYS would make init's
-        // sysinit line print an error on every boot.
-        nr::SETHOSTNAME => 0,
+        // The hostname is kept, not just accepted: `uname -n`, `hostname`
+        // and `/proc/sys/kernel/hostname` all read it, and an init's
+        // sysinit line changes it on every boot.
+        nr::SETHOSTNAME => proc::handle_sethostname(args),
         nr::SYNC => 0, // every write already reached its storage: ramfs and ext2 write through
-        nr::UMASK => proc::handle_umask(args),
+        nr::UMASK => abi::handle_umask(args),
         nr::SENDFILE => proc::handle_sendfile(args, from_user),
         nr::SETPGID => proc::handle_setpgid(args),
         nr::GETPGID => proc::handle_getpgid(args),
@@ -170,7 +176,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // which is moot, since timestamps are not kept. It lands on the same
         // path-led answer utimensat gives. (x86_64 has no `utime` number:
         // musl routes that one through utimensat itself.)
-        nr::UTIMES => fs::utimensat([fs::AT_FDCWD as usize, args[0], args[1], 0, 0, 0], &cwd()),
+        nr::UTIMES => fs::utimensat([abi::AT_FDCWD as usize, args[0], args[1], 0, 0, 0], &cwd()),
         nr::SIGALTSTACK => sigaltstack(args),
         nr::GETITIMER => proc::handle_getitimer(args),
         nr::SETITIMER => proc::handle_setitimer(args),
@@ -198,15 +204,15 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::RT_SIGPROCMASK => rt_sigprocmask(args),
         nr::RT_SIGRETURN => proc::handle_rt_sigreturn(regs_ptr),
         nr::ARCH_PRCTL => handle_arch_prctl(args),
-        nr::PRCTL => proc::handle_prctl(args),
-        nr::GETRANDOM => proc::handle_getrandom(args, true),
-        nr::PRLIMIT64 => proc::handle_prlimit64(args, true),
+        nr::PRCTL => abi::handle_prctl(args),
+        nr::GETRANDOM => abi::handle_getrandom(args, true),
+        nr::PRLIMIT64 => abi::handle_prlimit64(args, true),
         nr::FUTEX => proc::handle_futex(args),
         nr::SET_TID_ADDRESS => proc::handle_set_tid_address(args),
-        nr::SCHED_SETAFFINITY => proc::handle_sched_setaffinity(args),
-        nr::SCHED_GETAFFINITY => proc::handle_sched_getaffinity(args),
-        nr::SET_ROBUST_LIST => proc::handle_set_robust_list(args),
-        nr::RSEQ => proc::handle_rseq(args),
+        nr::SCHED_SETAFFINITY => abi::handle_sched_setaffinity(args),
+        nr::SCHED_GETAFFINITY => abi::handle_sched_getaffinity(args),
+        nr::SET_ROBUST_LIST => abi::handle_set_robust_list(args),
+        nr::RSEQ => abi::handle_rseq(args),
         nr::CLEANUP_AFTER_KTHREAD => 0,
 
         // --- the calls an ordinary libc reaches for ---
@@ -225,9 +231,9 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // the paths under them, and is the shape the handler wants.
         nr::LINK => fs::handle_linkat(
             [
-                fs::AT_FDCWD as usize,
+                abi::AT_FDCWD as usize,
                 args[0],
-                fs::AT_FDCWD as usize,
+                abi::AT_FDCWD as usize,
                 args[1],
                 0,
                 0,
@@ -253,10 +259,10 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::GETRUSAGE => proc::handle_getrusage(args),
         nr::CLOCK_GETRES => proc::handle_clock_getres(args),
         nr::WAITID => proc::handle_waitid(args),
-        nr::GETRLIMIT => proc::handle_getrlimit(args, from_user),
-        nr::SETRLIMIT => proc::handle_setrlimit(args, from_user),
-        nr::MEMBARRIER => proc::handle_membarrier(args),
-        nr::GET_ROBUST_LIST => proc::handle_get_robust_list(args),
+        nr::GETRLIMIT => abi::handle_getrlimit(args, from_user),
+        nr::SETRLIMIT => abi::handle_setrlimit(args, from_user),
+        nr::MEMBARRIER => abi::handle_membarrier(args),
+        nr::GET_ROBUST_LIST => abi::handle_get_robust_list(args),
 
         _ => {
             // A call with no handler is worth saying out loud - once. A libc
@@ -272,22 +278,23 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
     ret
 }
 
+#[cfg(target_os = "none")]
 use super::err;
+#[cfg(target_os = "none")]
 use crate::sched::current_cwd as cwd;
 
+#[cfg(target_os = "none")]
 const ARCH_SET_GS: usize = 0x1001;
+#[cfg(target_os = "none")]
 const ARCH_SET_FS: usize = 0x1002;
+#[cfg(target_os = "none")]
 const ARCH_GET_FS: usize = 0x1003;
+#[cfg(target_os = "none")]
 const ARCH_GET_GS: usize = 0x1004;
+#[cfg(target_os = "none")]
 const MSR_GS_BASE: u32 = 0xC000_0101;
 
-/// One bit per syscall number, set the first time the call answers ENOSYS.
-/// Four words cover 0..=255, which is every number this kernel answers to;
-/// anything above that is not a call it has ever been asked for, and
-/// reporting it every time would be a log flood rather than a signal.
-static MISSING_CALLS: [core::sync::atomic::AtomicU64; 4] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
-
+#[cfg(target_os = "none")]
 /// Record that `nr` answered ENOSYS, printing it the first time only.
 ///
 /// Two ways to get here, and the log does not distinguish them because a
@@ -297,12 +304,7 @@ static MISSING_CALLS: [core::sync::atomic::AtomicU64; 4] =
 /// that, which is worth saying once and not once per call: a libc in a
 /// startup loop asks for the same thing dozens of times.
 fn note_enosys(nr: u64) {
-    use core::sync::atomic::Ordering;
-    let Some(word) = MISSING_CALLS.get((nr / 64) as usize) else {
-        return;
-    };
-    let mask = 1u64 << (nr % 64);
-    if word.fetch_or(mask, Ordering::Relaxed) & mask == 0 {
+    if abi::mark_missing(nr) {
         crate::print!("mpos: syscall {nr} -> ENOSYS\n");
     }
 }
@@ -310,6 +312,7 @@ fn note_enosys(nr: u64) {
 /// The 32-byte `struct sigaction` of the Linux x86_64 ABI, in musl's
 /// `sigsetsize = 8` shape: handler, flags, restorer, then one 8-byte mask.
 /// `handler` is a user address, or `SIG_DFL` (0) / `SIG_IGN` (1).
+#[cfg(target_os = "none")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UserSigAction {
@@ -331,6 +334,7 @@ struct UserSigAction {
 /// handler is ever called, because no user frame is built for one. A signal
 /// still kills the process it lands on. What is stored is therefore read back
 /// verbatim rather than interpreted.
+#[cfg(target_os = "none")]
 fn sigaction(args: [usize; 6]) -> isize {
     let (sig, act, old) = (args[0], args[1], args[2]);
     // Linux's refusal set: signal 0 is not a signal, 32 and up are real-time
@@ -374,6 +378,7 @@ fn sigaction(args: [usize; 6]) -> isize {
 }
 
 /// `SS_DISABLE`, the `ss_flags` bit that says "there is no alternate stack".
+#[cfg(target_os = "none")]
 const SS_DISABLE: i32 = 2;
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)`.
@@ -385,6 +390,7 @@ const SS_DISABLE: i32 = 2;
 /// be read, and an `oldset` that cannot be written. A query must *write* its
 /// answer - a fresh process owes its caller zeros, not the sentinels it
 /// happened to have there.
+#[cfg(target_os = "none")]
 fn rt_sigprocmask(args: [usize; 6]) -> isize {
     use crate::sched::signal::{SIGKILL, SIGSTOP, bit};
 
@@ -434,6 +440,7 @@ fn rt_sigprocmask(args: [usize; 6]) -> isize {
 }
 
 /// The 24-byte `stack_t` of the Linux x86_64 ABI.
+#[cfg(target_os = "none")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UserStackT {
@@ -452,6 +459,7 @@ struct UserStackT {
 /// An install is recorded per process. Nothing switches to the stack yet - a
 /// signal still kills rather than calling a handler - but a stack the caller
 /// asked for is a fact about the process, and Linux reports it back.
+#[cfg(target_os = "none")]
 fn sigaltstack(args: [usize; 6]) -> isize {
     let (ss, old) = (args[0], args[1]);
     let id = crate::sched::current();
@@ -520,6 +528,7 @@ fn sigaltstack(args: [usize; 6]) -> isize {
 /// undone by the next context switch. The call therefore goes through the
 /// scheduler's copy. `GS` is not used by any program that runs here yet, and it
 /// has no per-task home, so it stays a direct register access.
+#[cfg(target_os = "none")]
 fn handle_arch_prctl(args: [usize; 6]) -> isize {
     let (cmd, addr) = (args[0], args[1]);
     match cmd {

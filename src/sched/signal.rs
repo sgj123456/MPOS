@@ -16,6 +16,12 @@
 
 /// Interrupt from the keyboard, once there is a keyboard.
 pub const SIGINT: u8 = 2;
+/// A child has stopped or exited. The default action ignores it - which is
+/// why a kernel can boot without ever queueing one - but a shell that
+/// installs a handler of its own waits for exactly this signal, and a task
+/// exit that only wakes a `wait(2)`-blocked parent leaves that parent
+/// asleep for ever.
+pub const SIGCHLD: u8 = 17;
 /// Write on a pipe with no one left to read it.
 pub const SIGPIPE: u8 = 13;
 /// The clock a program asked for: `alarm`, `setitimer(ITIMER_REAL)`.

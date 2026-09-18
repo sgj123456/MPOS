@@ -31,6 +31,17 @@ use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
 pub trait CharDevice: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> usize;
     fn write(&self, buf: &[u8]) -> usize;
+
+    /// The error a write should report instead of succeeding, if any.
+    ///
+    /// A stream reports "how many bytes landed", and there is no count that
+    /// means "the write was refused". `/dev/full` is the device that needs
+    /// one: its whole purpose is to be written to and to answer ENOSPC, and a
+    /// write that returned zero bytes would read as a successful short write
+    /// rather than as a full disk - the failure the device exists to provoke.
+    fn write_error(&self) -> Option<VfsError> {
+        None
+    }
 }
 
 /// One registered device, as an inode.
@@ -60,6 +71,12 @@ impl Inode for DevNode {
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        // A device that refuses writes does so before the write is offered to
+        // it: the stream interface has no way to say no, and a device whose
+        // answer is always ENOSPC should not have its bytes copied first.
+        if let Some(error) = self.dev.write_error() {
+            return Err(error);
+        }
         Ok(self.dev.write(buf))
     }
 }
@@ -428,6 +445,28 @@ impl DevFs {
                 .borrow(cs)
                 .borrow_mut()
                 .insert(String::from(name), node);
+            assert!(prev.is_none(), "device {name} registered twice");
+        });
+    }
+
+    /// Add a symbolic link under `name`.
+    ///
+    /// `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr` are links on
+    /// Linux - into `/proc/self/fd` and the three descriptors inside it - and
+    /// a script that names `/dev/stdout` is naming a descriptor, not a device:
+    /// `echo x > /dev/stdout` has to land wherever the shell's fd 1 goes. A
+    /// device node there would be a second, unrelated thing that happened to
+    /// answer to the same name.
+    pub fn register_symlink(&self, name: &str, target: &str) {
+        let ino = self.root.next_ino.fetch_add(1, Ordering::Relaxed);
+        critical_section::with(|cs| {
+            let prev = self.root.inodes.borrow(cs).borrow_mut().insert(
+                String::from(name),
+                Arc::new(DevSymlinkNode {
+                    ino,
+                    target: String::from(target),
+                }) as Arc<dyn Inode>,
+            );
             assert!(prev.is_none(), "device {name} registered twice");
         });
     }

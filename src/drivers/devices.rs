@@ -70,6 +70,34 @@ impl CharDevice for KmsgDev {
     }
 }
 
+/// Reads are zeros forever; every write is refused with ENOSPC.
+///
+/// This is the device a program is pointed at to make it *fail*: `cp file
+/// /dev/full` is how a test proves a program reports a full disk instead of
+/// silently losing data. A write that answered "zero bytes written" would be
+/// a successful short write, which is the opposite of what is being tested -
+/// so the refusal is carried by [`CharDevice::write_error`] rather than by the
+/// count, and reaches the caller as ENOSPC.
+///
+/// Reads give zeros, as `/dev/zero` does: the pair differs only in whether
+/// writes are accepted, and a reader asked for bytes gets them either way.
+pub struct FullDev;
+
+impl CharDevice for FullDev {
+    fn read(&self, buf: &mut [u8]) -> usize {
+        buf.fill(0);
+        buf.len()
+    }
+
+    fn write(&self, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn write_error(&self) -> Option<crate::vfs::VfsError> {
+        Some(crate::vfs::VfsError::NoSpace)
+    }
+}
+
 /// Reads are zeros forever, however much is asked; writes vanish.
 pub struct ZeroDev;
 
@@ -154,6 +182,16 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // would turn every line of its output into an error message instead.
     dev.register("kmsg", Arc::new(KmsgDev));
     dev.register("null", Arc::new(NullDev));
+    dev.register("full", Arc::new(FullDev));
+    // The three names a script writes to when it means "wherever standard
+    // output goes", and the directory a program lists when it wants to know
+    // what it has open. They are links into /proc rather than devices, so
+    // they follow the reader's own descriptors: a shell's `> /dev/stdout`
+    // lands on the pipe it was given, not on a second console.
+    dev.register_symlink("fd", "/proc/self/fd");
+    dev.register_symlink("stdin", "/proc/self/fd/0");
+    dev.register_symlink("stdout", "/proc/self/fd/1");
+    dev.register_symlink("stderr", "/proc/self/fd/2");
     // The pty master's traditional name. A real one hands out slave pairs
     // on /dev/pts; this kernel's devpts has no master to offer yet, but the
     // name exists as a character device so an init's `[ -c /dev/ptmx ]`

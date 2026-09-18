@@ -380,13 +380,25 @@ impl Core {
             inode_bitmap: le32(&bytes, 4) as u64,
             inode_table: le32(&bytes, 8) as u64,
             free_blocks: le16(&bytes, 12),
-            free_inodes: le16(&bytes, 16),
+            free_inodes: le16(&bytes, 14),
         }
     }
 
     /// Push a change in free block/inode counts to both the group descriptor
     /// and the superblock, so the on-disk bookkeeping is right after every
     /// single allocation rather than at some future flush.
+    ///
+    /// The two structures carry the same two numbers at *different* offsets,
+    /// and the easy mistake is to carry one over to the other:
+    ///
+    /// * a group descriptor is `u32, u32, u32, u16, u16, u16` - free blocks at
+    ///   12, free inodes at **14**, used directories at 16;
+    /// * the superblock is `u32, u32, u32, u32, u32` - free blocks at 12, free
+    ///   inodes at **16**.
+    ///
+    /// Writing the inode delta at 14 in the superblock does not fail loudly:
+    /// it straddles the two counters, so the free-block u32 ends up with a
+    /// stray 0xffff in its high half and `statfs` reports an absurd number.
     fn bump_free(&self, g: u32, blocks: i32, inodes: i32) {
         let block_size = self.block_size();
         let at = g as usize * GROUP_DESC_BYTES;
@@ -400,8 +412,8 @@ impl Core {
             );
             set16(
                 page,
-                desc_off + 16,
-                (le16(page, desc_off + 16) as i32 + inodes) as u16,
+                desc_off + 14,
+                (le16(page, desc_off + 14) as i32 + inodes) as u16,
             );
             true
         });
@@ -695,7 +707,6 @@ impl Core {
     // ---- directories ----
 
     fn dir_lookup(&self, dir: &InodeData, name: &str) -> VfsResult<Option<u32>> {
-        self.dir_writable(dir)?;
         let block_size = self.block_size();
         for l in 0..dir.size as u64 / block_size as u64 {
             let block = self
@@ -714,7 +725,6 @@ impl Core {
     /// The readdir behind `ls`: same block walk as `dir_lookup`, but nothing
     /// stops early.
     fn dir_entries(&self, dir: &InodeData) -> VfsResult<Vec<(String, NodeKind)>> {
-        self.dir_writable(dir)?;
         let block_size = self.block_size();
         let mut found = Vec::new();
         for l in 0..dir.size as u64 / block_size as u64 {
@@ -792,6 +802,19 @@ impl Core {
         Err(VfsError::NoEntry)
     }
 
+    /// The guard on *rewriting* a directory, not on reading it. An
+    /// `INDEX_FL` (htree) directory keeps its hash index inside the slack of
+    /// block 0's `..`, and this filesystem has no code to maintain it - an
+    /// insert or removal here would leave the index describing a tree that
+    /// no longer matches the entries, which a Linux that later mounts the
+    /// image would trust. Reads are another matter: the dirent blocks of an
+    /// indexed directory remain the complete linear list, and a linear scan
+    /// is exactly what Linux's own readdir does - so `dir_lookup` and
+    /// `dir_entries` deliberately skip this check. An mke2fs-populated image
+    /// with the default `dir_index` feature marks every directory past a
+    /// few dozen entries with the flag; refusing to read those is what made
+    /// `/etc/ssl/certs` - and with it every CA certificate, and with those
+    /// every TLS fetch apk attempted - answer `ENOSYS`.
     fn dir_writable(&self, dir: &InodeData) -> VfsResult<()> {
         if dir.flags & INODE_INDEX_FL != 0 {
             return Err(VfsError::Unsupported);
@@ -1534,8 +1557,14 @@ mod tests {
             put32(disk, 2 * 1024, 3); // block bitmap
             put32(disk, 2 * 1024 + 4, 4); // inode bitmap
             put32(disk, 2 * 1024 + 8, 5); // inode table
+            // The three counters are packed u16s at 12, 14 and 16 - free
+            // blocks, free inodes, used directories. Getting the middle one
+            // wrong does not corrupt anything visibly: the allocator reads a
+            // group with "no free inodes", skips it, and every create then
+            // answers ENOSPC on a filesystem that is almost empty.
             put16(disk, 2 * 1024 + 12, 115); // free blocks
-            put16(disk, 2 * 1024 + 16, 62); // free inodes
+            put16(disk, 2 * 1024 + 14, 62); // free inodes
+            put16(disk, 2 * 1024 + 16, 1); // used dirs (the root)
 
             // Blocks 1..=13 are metadata and the root directory. On a 1 KiB
             // filesystem block 0 lives outside every group, so bitmap bit b is
@@ -2191,10 +2220,8 @@ mod tests {
         usr.create("lib", NodeKind::Dir).expect("lib");
         let lib = usr.lookup("lib").expect("lib");
 
-        let tmpname =
-            ".apk.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let bodytmp =
-            ".apk.1111111111111111111111111111111111111111111111111111111111111111";
+        let tmpname = ".apk.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bodytmp = ".apk.1111111111111111111111111111111111111111111111111111111111111111";
 
         // Extract: the symlink first - dangling, because the library under
         // it has not been laid down yet - then the library's own temp file.
@@ -2218,7 +2245,8 @@ mod tests {
         lib.unlink(tmpname).expect("the temp name goes");
 
         // Commit the library itself.
-        lib.link("libllhttp.so.9.4.1", &body).expect("rename the body");
+        lib.link("libllhttp.so.9.4.1", &body)
+            .expect("rename the body");
         lib.unlink(bodytmp).expect("the body's temp name goes");
 
         // The end state apk expects: the library body, plus a link chain

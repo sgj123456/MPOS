@@ -2,7 +2,6 @@
 //!
 //! These are the numbers musl/glibc uses when calling `syscall(N, ...)`.
 
-pub const POLL: u64 = 7;
 pub const READ: u64 = 0;
 pub const WRITE: u64 = 1;
 pub const OPEN: u64 = 2;
@@ -10,6 +9,7 @@ pub const CLOSE: u64 = 3;
 pub const STAT: u64 = 4;
 pub const FSTAT: u64 = 5;
 pub const LSTAT: u64 = 6;
+pub const POLL: u64 = 7;
 pub const LSEEK: u64 = 8;
 pub const MMAP: u64 = 9;
 pub const MPROTECT: u64 = 10;
@@ -147,6 +147,11 @@ pub const FUTEX_WAKE: usize = 1;
 pub const FUTEX_WAIT_BITSET: usize = 9;
 pub const FUTEX_WAKE_BITSET: usize = 10;
 pub const FUTEX_PRIVATE_FLAG: usize = 128;
+/// The flag that renames a futex timeout's clock from monotonic to realtime.
+/// This kernel reads every clock off one tick counter, so the flag changes
+/// only the *spelling* of the deadline - see `futex_deadline` - never the
+/// table it waits in.
+pub const FUTEX_CLOCK_REALTIME: usize = 256;
 pub const SCHED_SETAFFINITY: u64 = 203;
 pub const SCHED_GETAFFINITY: u64 = 204;
 pub const SET_TID_ADDRESS: u64 = 218;
@@ -286,3 +291,258 @@ pub const CLONE_DETACHED: usize = 0x0040_0000;
 /// still sends it is not refused for a bit that does nothing.
 pub const CLONE_UNTRACED: usize = 0x0080_0000;
 pub const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+
+// ---------------------------------------------------------------------------
+// Tests: every number against the Linux x86_64 syscall table
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The numbers themselves are the ABI: a wrong constant here silently
+    /// answers the wrong call - a `renameat` number answering `rmdir`, say,
+    /// deletes what it was asked to move - and nothing downstream can catch
+    /// it, because every layer below trusts the dispatch. So the whole table
+    /// is pinned against the syscall(2) man page's x86_64 column, one
+    /// assertion per name, and a typo reads as a red test rather than a
+    /// mysterious ENOSYS (or worse, the wrong handler) in a shell.
+    #[test]
+    fn syscall_numbers_match_the_x86_64_table() {
+        // Process and file descriptors.
+        assert_eq!(READ, 0);
+        assert_eq!(WRITE, 1);
+        assert_eq!(OPEN, 2);
+        assert_eq!(CLOSE, 3);
+        assert_eq!(STAT, 4);
+        assert_eq!(FSTAT, 5);
+        assert_eq!(LSTAT, 6);
+        assert_eq!(POLL, 7);
+        assert_eq!(LSEEK, 8);
+        assert_eq!(MMAP, 9);
+        assert_eq!(MPROTECT, 10);
+        assert_eq!(MUNMAP, 11);
+        assert_eq!(BRK, 12);
+        assert_eq!(RT_SIGACTION, 13);
+        assert_eq!(RT_SIGPROCMASK, 14);
+        assert_eq!(RT_SIGRETURN, 15);
+        assert_eq!(IOCTL, 16);
+        assert_eq!(PREAD64, 17);
+        assert_eq!(PWRITE64, 18);
+        assert_eq!(READV, 19);
+        assert_eq!(WRITEV, 20);
+        assert_eq!(ACCESS, 21);
+        assert_eq!(PIPE, 22);
+        assert_eq!(SELECT, 23);
+        assert_eq!(SCHED_YIELD, 24);
+        assert_eq!(MREMAP, 25);
+        assert_eq!(MADVISE, 28);
+        assert_eq!(DUP, 32);
+        assert_eq!(DUP2, 33);
+        assert_eq!(NANOSLEEP, 35);
+        assert_eq!(GETITIMER, 36);
+        assert_eq!(ALARM, 37);
+        assert_eq!(SETITIMER, 38);
+        assert_eq!(GETPID, 39);
+        assert_eq!(SENDFILE, 40);
+        // The socket family Linux numbers 41..55, in order.
+        assert_eq!(SOCKET, 41);
+        assert_eq!(CONNECT, 42);
+        assert_eq!(ACCEPT, 43);
+        assert_eq!(SENDTO, 44);
+        assert_eq!(RECVFROM, 45);
+        assert_eq!(SENDMSG, 46);
+        assert_eq!(RECVMSG, 47);
+        assert_eq!(SHUTDOWN, 48);
+        assert_eq!(BIND, 49);
+        assert_eq!(LISTEN, 50);
+        assert_eq!(GETSOCKNAME, 51);
+        assert_eq!(GETPEERNAME, 52);
+        assert_eq!(SOCKETPAIR, 53);
+        assert_eq!(SETSOCKOPT, 54);
+        assert_eq!(GETSOCKOPT, 55);
+        assert_eq!(CLONE, 56);
+        assert_eq!(FORK, 57);
+        assert_eq!(VFORK, 58);
+        assert_eq!(EXECVE, 59);
+        assert_eq!(EXIT, 60);
+        assert_eq!(WAIT4, 61);
+        assert_eq!(KILL, 62);
+        assert_eq!(UNAME, 63);
+        assert_eq!(FCNTL, 72);
+        assert_eq!(FLOCK, 73);
+        assert_eq!(FSYNC, 74);
+        assert_eq!(FDATASYNC, 75);
+        assert_eq!(TRUNCATE, 76);
+        assert_eq!(FTRUNCATE, 77);
+        assert_eq!(GETCWD, 79);
+        assert_eq!(CHDIR, 80);
+        assert_eq!(FCHDIR, 81);
+        assert_eq!(RENAME, 82);
+        assert_eq!(MKDIR, 83);
+        assert_eq!(RMDIR, 84);
+        assert_eq!(LINK, 86);
+        assert_eq!(UNLINK, 87);
+        assert_eq!(SYMLINK, 88);
+        assert_eq!(READLINK, 89);
+        assert_eq!(CHMOD, 90);
+        assert_eq!(FCHMOD, 91);
+        assert_eq!(CHOWN, 92);
+        assert_eq!(FCHOWN, 93);
+        assert_eq!(LCHOWN, 94);
+        assert_eq!(UMASK, 95);
+        assert_eq!(GETTIMEOFDAY, 96);
+        assert_eq!(GETRLIMIT, 97);
+        assert_eq!(GETRUSAGE, 98);
+        assert_eq!(SYSINFO, 99);
+        assert_eq!(TIMES, 100);
+        assert_eq!(GETUID, 102);
+        assert_eq!(GETGID, 104);
+        assert_eq!(SETUID, 105);
+        assert_eq!(SETGID, 106);
+        assert_eq!(GETEUID, 107);
+        assert_eq!(GETEGID, 108);
+        assert_eq!(SETPGID, 109);
+        assert_eq!(GETPPID, 110);
+        assert_eq!(GETPGRP, 111);
+        assert_eq!(SETSID, 112);
+        assert_eq!(GETGROUPS, 115);
+        assert_eq!(SETGROUPS, 116);
+        assert_eq!(GETPGID, 121);
+        assert_eq!(GETSID, 124);
+        assert_eq!(SIGALTSTACK, 131);
+        assert_eq!(MKNOD, 133);
+        assert_eq!(STATFS, 137);
+        assert_eq!(FSTATFS, 138);
+        assert_eq!(PIVOT_ROOT, 155);
+        assert_eq!(PRCTL, 157);
+        assert_eq!(ARCH_PRCTL, 158);
+        assert_eq!(SETRLIMIT, 160);
+        assert_eq!(CHROOT, 161);
+        assert_eq!(SYNC, 162);
+        assert_eq!(MOUNT, 165);
+        assert_eq!(UMOUNT2, 166);
+        assert_eq!(REBOOT, 169);
+        assert_eq!(SETHOSTNAME, 170);
+        assert_eq!(FADVISE64, 221);
+        // The identity and futex block.
+        assert_eq!(SET_TID_ADDRESS, 218);
+        assert_eq!(GETDENTS64, 217);
+        assert_eq!(GETTID, 186);
+        assert_eq!(TKILL, 200);
+        assert_eq!(TIME, 201);
+        assert_eq!(FUTEX, 202);
+        assert_eq!(SCHED_SETAFFINITY, 203);
+        assert_eq!(SCHED_GETAFFINITY, 204);
+        assert_eq!(RT_SIGTIMEDWAIT, 128);
+        assert_eq!(CLOCK_GETRES, 229);
+        assert_eq!(CLOCK_GETTIME, 228);
+        assert_eq!(CLOCK_NANOSLEEP, 230);
+        assert_eq!(EXIT_GROUP, 231);
+        assert_eq!(UTIMES, 235);
+        assert_eq!(WAITID, 247);
+        // The *at family and the modern additions.
+        assert_eq!(OPENAT, 257);
+        assert_eq!(MKDIRAT, 258);
+        assert_eq!(FCHOWNAT, 260);
+        assert_eq!(NEWFSTATAT, 262);
+        assert_eq!(UNLINKAT, 263);
+        assert_eq!(RENAMEAT, 264);
+        assert_eq!(LINKAT, 265);
+        assert_eq!(SYMLINKAT, 266);
+        assert_eq!(READLINKAT, 267);
+        assert_eq!(FACCESSAT, 269);
+        assert_eq!(PSELECT6, 270);
+        assert_eq!(PPOLL, 271);
+        assert_eq!(SET_ROBUST_LIST, 273);
+        assert_eq!(GET_ROBUST_LIST, 274);
+        assert_eq!(UTIMENSAT, 280);
+        assert_eq!(SIGNALFD, 282);
+        assert_eq!(SIGNALFD4, 289);
+        assert_eq!(EVENTFD, 290);
+        assert_eq!(PREADV, 295);
+        assert_eq!(PWRITEV, 296);
+        assert_eq!(DUP3, 292);
+        assert_eq!(PIPE2, 293);
+        assert_eq!(PRLIMIT64, 302);
+        assert_eq!(RENAMEAT2, 316);
+        assert_eq!(GETRANDOM, 318);
+        assert_eq!(RSEQ, 334);
+        assert_eq!(STATX, 332);
+        assert_eq!(MEMBARRIER, 324);
+    }
+
+    /// `clone(2)`: the flag bits, as the same table numbers them. The
+    /// dependency checks and the low-byte exit signal are `abi`'s business;
+    /// here only the bit values are pinned.
+    #[test]
+    fn clone_flag_bits_match_the_x86_64_abi() {
+        assert_eq!(CLONE_VM, 0x0000_0100);
+        assert_eq!(CLONE_FS, 0x0000_0200);
+        assert_eq!(CLONE_FILES, 0x0000_0400);
+        assert_eq!(CLONE_SIGHAND, 0x0000_0800);
+        assert_eq!(CLONE_VFORK, 0x0000_4000);
+        assert_eq!(CLONE_PARENT, 0x0000_8000);
+        assert_eq!(CLONE_THREAD, 0x0001_0000);
+        assert_eq!(CLONE_SYSVSEM, 0x0004_0000);
+        assert_eq!(CLONE_SETTLS, 0x0008_0000);
+        assert_eq!(CLONE_PARENT_SETTID, 0x0010_0000);
+        assert_eq!(CLONE_CHILD_CLEARTID, 0x0020_0000);
+        assert_eq!(CLONE_CHILD_SETTID, 0x0100_0000);
+        assert_eq!(CLONE_DETACHED, 0x0040_0000);
+        assert_eq!(CLONE_UNTRACED, 0x0080_0000);
+        // Every flag bit clears the low byte's worth - the exit signal
+        // cannot masquerade as a flag, and no flag can masquerade as one.
+        for bit in [
+            CLONE_VM,
+            CLONE_FS,
+            CLONE_FILES,
+            CLONE_SIGHAND,
+            CLONE_VFORK,
+            CLONE_PARENT,
+            CLONE_THREAD,
+            CLONE_SYSVSEM,
+            CLONE_SETTLS,
+            CLONE_PARENT_SETTID,
+            CLONE_CHILD_CLEARTID,
+            CLONE_CHILD_SETTID,
+            CLONE_DETACHED,
+            CLONE_UNTRACED,
+        ] {
+            assert!(bit & 0xff == 0, "flag bit {bit:#x} reaches into CSIGNAL");
+            assert!(bit.count_ones() == 1, "flag bit {bit:#x} is not one bit");
+        }
+    }
+
+    /// `futex(2)`: the operation numbers and the private-table flag. The
+    /// ops are a plain table on the man page - WAIT_BITSET is not a bit
+    /// combination of WAIT and anything, so each number is pinned on its
+    /// own.
+    #[test]
+    fn futex_op_numbers_match_the_man_page() {
+        assert_eq!(FUTEX_WAIT, 0);
+        assert_eq!(FUTEX_WAKE, 1);
+        assert_eq!(FUTEX_WAIT_BITSET, 9);
+        assert_eq!(FUTEX_WAKE_BITSET, 10);
+        assert_eq!(FUTEX_PRIVATE_FLAG, 128);
+        // The private flag lives above the operation field, which the
+        // dispatch masks off before matching - it must never collide with
+        // an operation number's seven bits.
+        assert_eq!(FUTEX_PRIVATE_FLAG & 0x7f, 0);
+    }
+
+    /// `CLEANUP_AFTER_KTHREAD` is mpos's own bookkeeping number, not a Linux
+    /// call: it must stay clear of every Linux number this kernel names, so a
+    /// stray request for it can never be mistaken for a real call. It sits
+    /// past the ENOSYS dedup window too, which is fine - an internal number
+    /// has no userland caller to dedupe.
+    #[test]
+    fn cleanup_after_kthread_is_an_internal_number() {
+        assert_eq!(CLEANUP_AFTER_KTHREAD, 999);
+        assert!(CLEANUP_AFTER_KTHREAD > STATX, "collides with a Linux call");
+        assert!(
+            CLEANUP_AFTER_KTHREAD >= 256,
+            "inside the mark_missing window"
+        );
+    }
+}

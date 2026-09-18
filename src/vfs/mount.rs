@@ -659,6 +659,21 @@ impl Vfs {
                             }
                         });
                         if child.metadata().kind == NodeKind::Symlink {
+                            // A descriptor's second name - `/proc/<pid>/fd/N`
+                            // and the `/dev/std*` links into it - is a link
+                            // that must not be spliced. Its target is a
+                            // *report* about a descriptor, not a path to
+                            // reopen: the walk hands the link itself back, and
+                            // the opener reads `as_fd` off it and clones the
+                            // descriptor, position and flags and all. Splicing
+                            // would open a fresh description of whatever the
+                            // descriptor once named - a different file
+                            // position, or nothing at all once the name has
+                            // gone.
+                            if child.as_fd().is_some() {
+                                stack.push(child);
+                                continue;
+                            }
                             // Splice the target in front of whatever was still
                             // to come and start over. `here`, not the link, is
                             // what a relative target is relative to.

@@ -91,6 +91,16 @@ impl DevPts {
     }
 }
 
+/// How many terminal pairs are open, for `/proc/sys/kernel/pty/nr`.
+///
+/// Zero, and honestly so: there is no terminal to open yet. Reporting a
+/// number that matched `max` would tell a library the pty pool was exhausted
+/// and make it refuse to allocate one, which is a worse answer than "none are
+/// in use" - the second is true, and the first is a lie that reads as a limit.
+pub fn open_count() -> usize {
+    0
+}
+
 impl FileSystem for DevPts {
     fn root(&self) -> Arc<dyn Inode> {
         self.root.clone()

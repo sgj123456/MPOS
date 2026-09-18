@@ -51,7 +51,8 @@ readonly ARCH='x86_64'
 readonly IMAGE_FILE='build/mpos-uefi-x86_64.img'
 readonly IMAGE_SIZE='2G'
 readonly ALPINE_BRANCH="${ALPINE_BRANCH:-latest-stable}"
-readonly ALPINE_MIRROR="${ALPINE_MIRROR:-http://dl-cdn.alpinelinux.org/alpine}"
+# readonly ALPINE_MIRROR="${ALPINE_MIRROR:-http://dl-cdn.alpinelinux.org/alpine}"
+readonly ALPINE_MIRROR="${ALPINE_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/alpine}"
 readonly ROOTFS='ext2'
 readonly SERIAL_PORT='ttyS0'
 # What the root filesystem is called *inside the guest*. Not the host's NBD

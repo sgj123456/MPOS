@@ -73,6 +73,32 @@ impl File {
         critical_section::with(|cs| self.label.borrow(cs).borrow().clone())
     }
 
+    /// The name `/proc/<pid>/fd` reports this descriptor by, which is also
+    /// what `readlink` on one of those entries answers.
+    ///
+    /// The recorded label comes first: it is the path this very description
+    /// was opened by, and the exact answer. Without one the tree is searched
+    /// for the inode - a descriptor opened by another name, or made by `dup`
+    /// over one that was - and failing that, Linux's spelling of the kind is
+    /// the honest remainder: `pipe:[ino]` for a pipe, `socket:[ino]` for a
+    /// socket, `anon:[ino]` for whatever else has no name anywhere.
+    pub fn display_name(&self) -> alloc::string::String {
+        if let Some(path) = self.label() {
+            return path;
+        }
+        if let Some(path) = super::global().path_of(&self.inode) {
+            return path;
+        }
+        let meta = self.inode.metadata();
+        if self.inode.as_duplex().is_some() {
+            alloc::format!("pipe:[{}]", meta.ino)
+        } else if self.inode.socket_handle() != 0 {
+            alloc::format!("socket:[{}]", meta.ino)
+        } else {
+            alloc::format!("anon:[{}]", meta.ino)
+        }
+    }
+
     pub fn metadata(&self) -> Metadata {
         self.inode.metadata()
     }
@@ -164,6 +190,26 @@ impl FdTable {
                 .collect();
             self.fd_flags.borrow(cs).borrow_mut().clear();
             files
+        })
+    }
+
+    /// Every open descriptor with its number, in number order: what
+    /// `/proc/<pid>/fd` is a listing of.
+    ///
+    /// Only the open ones are listed - Linux's own rule. A closed slot keeps
+    /// no name, and a listing that carried its number would point tools at an
+    /// entry that answers `ENOENT` on the very next lookup. Each entry carries
+    /// the number it actually occupies, so the numbers stay the process's own
+    /// whether or not anything below has been closed.
+    pub fn open_files(&self) -> alloc::vec::Vec<(RawFd, Arc<File>)> {
+        critical_section::with(|cs| {
+            self.slots
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter_map(|(fd, slot)| slot.as_ref().map(|file| (fd as RawFd, file.clone())))
+                .collect()
         })
     }
 
@@ -384,6 +430,14 @@ pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
         Some(dir) => super::resolve_at(path, dir)?,
         None => resolve(path)?,
     };
+    // A name that is a descriptor's second name opens the descriptor, not a
+    // file: `/dev/stdout` is fd 1 with its position and its flags, and a
+    // fresh description of a link node would be neither - it would be an
+    // inode with no read and write, and the first write to it would fail.
+    if let Some(fd) = inode.as_fd() {
+        let file = current_table().clone_at(fd as RawFd)?;
+        return Ok(current_table().install(file));
+    }
     Ok(current_table().install(Arc::new(File::new(inode))))
 }
 

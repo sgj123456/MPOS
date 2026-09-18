@@ -1,13 +1,19 @@
-//! Linux-compatible syscall handlers. Memory: `mmap`, `munmap`, `mremap`,
-//! `mprotect`, `brk`. Time: `nanosleep`, `clock_nanosleep`, `clock_gettime`,
-//! `gettimeofday`. Identity: `getpid`, `gettid`, `getppid`, `kill`/`tkill`.
-//! Process: `execve`, `exit`/`exit_group`, `wait4`, `fork` (clone), `uname`,
-//! `getrandom`, `prlimit64`, `futex`, `sched_getaffinity`, `set_robust_list`,
-//! `rseq`.
+//! Linux-compatible syscall handlers: the ones that need a running machine.
+//! Memory: `mmap`, `munmap`, `mremap`, `mprotect`, `brk`. Time: `nanosleep`,
+//! `clock_gettime`, `gettimeofday`, `setitimer`. Identity: `getpid`, `gettid`,
+//! `getppid`, `kill`/`tkill`. Process: `execve`, `exit`/`exit_group`, `wait4`,
+//! `fork` (clone), `uname`, `futex`, process groups.
+//!
+//! The calls whose whole behaviour is argument shaping and table answers -
+//! `prctl`, `umask`, `getrandom`, the rlimit family, the affinity and
+//! registration calls - live in [`super::abi`], where the host tests reach
+//! them; this module keeps the parts that sleep, switch, or touch the
+//! machine.
 
 use alloc::string::String;
 use alloc::sync::Arc;
 
+use super::abi;
 use super::nr;
 use crate::sched::TaskId;
 use crate::syscall::{ARG_COUNT, argv_arg, buffer_ok, cstr_arg, err, err_of};
@@ -332,21 +338,8 @@ pub(super) fn handle_gettid() -> isize {
 /// core flags or endianness touch things this kernel does not model, so
 /// they are accepted and dropped: a caller checking the exit status wants
 /// success, and one reading a value gets zero.
-pub(super) fn handle_prctl(args: [usize; ARG_COUNT]) -> isize {
-    const PR_GET_NAME: usize = 16;
-    const NAME_LEN: usize = 16;
-    match args[0] {
-        PR_GET_NAME => {
-            let buf = args[1];
-            if buf == 0 || !crate::syscall::buffer_ok(buf, NAME_LEN, true, true) {
-                return err::EFAULT;
-            }
-            unsafe { core::ptr::write_bytes(buf as *mut u8, 0, NAME_LEN) };
-            0
-        }
-        _ => 0,
-    }
-}
+// `prctl` lives in `abi`: the option table is argument shaping, and that is
+// the half the host tests read.
 
 /// `set_tid_address(tidptr)` - name where this thread's exit is announced.
 ///
@@ -446,25 +439,11 @@ fn finish_wait(id: TaskId, code: isize, status: usize, from_user: bool) -> isize
         if !buffer_ok(status, 4, true, from_user) {
             return err::EFAULT;
         }
-        unsafe { (status as *mut i32).write_volatile(wait_status(code)) };
+        // The W-exit-status encoding is the ABI the libc's macros decode;
+        // it is spelled in `abi`, tested on the host.
+        unsafe { (status as *mut i32).write_volatile(abi::wait_status(code)) };
     }
     id.0 as isize
-}
-
-/// Encode an exit the way `WIFEXITED` and friends decode it.
-///
-/// mpos records a death by signal as the negated signal number, because that is
-/// the shape the rest of the kernel wants; the word Linux reports is different,
-/// so the sign is what carries the distinction here.
-fn wait_status(code: isize) -> i32 {
-    if code < 0 {
-        // Killed by a signal: its number fills the low byte. The core-dump bit
-        // stays clear - mpos writes no core files.
-        (-code & 0x7f) as i32
-    } else {
-        // A normal exit: the low byte of the code, in bits 15:8.
-        ((code & 0xff) << 8) as i32
-    }
 }
 
 /// Get the parent process ID.
@@ -599,19 +578,24 @@ fn sleep_for_timespec(req: usize, from_user: bool) -> isize {
     if !buffer_ok(req, 16, false, from_user) {
         return err::EFAULT;
     }
-    unsafe {
-        let tv_sec = (req as *const i64).read_volatile() as u64;
-        let tv_nsec = ((req + 8) as *const i64).read_volatile() as u64;
-        if tv_nsec >= 1_000_000_000 {
-            return err::EINVAL;
-        }
-        let total_ms = tv_sec.saturating_mul(1000) + tv_nsec / 1_000_000;
-        if total_ms == 0 {
-            return 0;
-        }
-        let ticks = (total_ms * crate::arch::timer::TICK_HZ as u64 / 1000).max(1);
-        crate::sched::sleep_ticks(ticks);
+    let (tv_sec, tv_nsec) = unsafe {
+        (
+            (req as *const i64).read_volatile() as u64,
+            ((req + 8) as *const i64).read_volatile() as u64,
+        )
+    };
+    // The `tv_nsec < 1s` check and the truncate-to-milliseconds fold are the
+    // man page's contract, spelled in `abi` - nanosleep truncates where
+    // ppoll rounds up, and that distinction lives in the one place.
+    let total_ms = match abi::nanosleep_ms(tv_sec, tv_nsec) {
+        Ok(ms) => ms,
+        Err(e) => return e,
+    };
+    if total_ms == 0 {
+        return 0;
     }
+    let ticks = (total_ms * crate::arch::timer::TICK_HZ as u64 / 1000).max(1);
+    crate::sched::sleep_ticks(ticks);
     0
 }
 
@@ -710,80 +694,24 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     let (flags, child_stack, parent_tid, child_tid, tls) =
         (args[0], args[1], args[2], args[3], args[4]);
 
-    // The low byte of the flag word is not a flag: it is the *signal* the
-    // parent should be sent when the child exits, which is why a word like
+    // The flag word is checked before anything is created: the low byte is
+    // the child's exit signal rather than a flag (a word like
     // `CLONE_VM|CLONE_VFORK|SIGCHLD` - exactly what a libc's `posix_spawn`
-    // passes - has a plain signal number mixed into it. Linux masks the byte off
-    // before testing the rest, and so must this: reading `SIGCHLD` (0x11) as an
-    // unknown flag bit would refuse every `posix_spawn` in the system.
-    const CSIGNAL: usize = 0x0000_00ff;
-    let exit_signal = flags & CSIGNAL;
-    let flags = flags & !CSIGNAL;
-
-    // The bits this kernel understands. `CLONE_DETACHED` and `CLONE_UNTRACED`
-    // are accepted and ignored exactly as Linux ignores them: both are
-    // historical no-ops, and musl's `pthread_create` sends the first one in
-    // every thread's flag word - refusing it refuses every pthread in the
-    // system, and musl swallows the clone failure into a bare EAGAIN that
-    // hides the reason. Anything else is a request from a kernel newer than
-    // this one, and honouring it half-way would be worse than refusing it.
-    const KNOWN: usize = nr::CLONE_VM
-        | nr::CLONE_FS
-        | nr::CLONE_FILES
-        | nr::CLONE_SIGHAND
-        | nr::CLONE_VFORK
-        | nr::CLONE_PARENT
-        | nr::CLONE_THREAD
-        | nr::CLONE_SYSVSEM
-        | nr::CLONE_SETTLS
-        | nr::CLONE_PARENT_SETTID
-        | nr::CLONE_CHILD_CLEARTID
-        | nr::CLONE_CHILD_SETTID
-        | nr::CLONE_DETACHED
-        | nr::CLONE_UNTRACED;
-    if flags & !KNOWN != 0 {
-        return err::EINVAL;
-    }
-    // A signal number that names nothing is not a request to deliver anything;
-    // Linux refuses it, and so does this - silently accepting it would hide a
-    // caller's mistake behind a working call.
-    if exit_signal > 31 {
-        return err::EINVAL;
-    }
+    // passes - carries a plain signal number in it), the known bits are the
+    // ones this kernel understands, the THREAD⇒SIGHAND⇒VM dependency chain
+    // holds, and a tid flag without a place to write the tid is refused.
+    // All of it is the clone(2) man page's contract, spelled in `abi` and
+    // tested on the host.
+    let (exit_signal, flags) = match abi::validate_clone_flags(flags, parent_tid, child_tid) {
+        Ok(split) => split,
+        Err(e) => return e,
+    };
     // A fork child is announced by its parent's `wait`, not by a signal, so the
     // exit signal is accepted and not acted on. `wait4` is how every caller in
     // this system collects a child; the byte is kept in the ABI rather than
     // honoured because there is no delivery path a shell could not get from
     // waiting anyway.
     let _ = exit_signal;
-    // The dependency chain Linux enforces: a thread shares its creator's signal
-    // handlers and address space, and a signal-handler table can only be shared
-    // by processes that also share memory.
-    if flags & nr::CLONE_THREAD != 0
-        && (flags & nr::CLONE_SIGHAND == 0 || flags & nr::CLONE_VM == 0)
-    {
-        return err::EINVAL;
-    }
-    if flags & nr::CLONE_SIGHAND != 0 && flags & nr::CLONE_VM == 0 {
-        return err::EINVAL;
-    }
-    // A tid must land somewhere; a flag that asks for the write without a place
-    // to put it is refused rather than ignored.
-    if flags & nr::CLONE_PARENT_SETTID != 0 && parent_tid == 0 {
-        return err::EINVAL;
-    }
-    if flags & (nr::CLONE_CHILD_SETTID | nr::CLONE_CHILD_CLEARTID) != 0 && child_tid == 0 {
-        return err::EINVAL;
-    }
-    // Both tid pointers, when present, must be writable in the caller.
-    if flags & nr::CLONE_PARENT_SETTID != 0 && !buffer_ok(parent_tid, 4, true, true) {
-        return err::EFAULT;
-    }
-    if flags & (nr::CLONE_CHILD_SETTID | nr::CLONE_CHILD_CLEARTID) != 0
-        && !buffer_ok(child_tid, 4, true, true)
-    {
-        return err::EFAULT;
-    }
 
     let ctx = match user_context(regs_ptr, 0) {
         Some(ctx) => ctx,
@@ -922,13 +850,9 @@ pub(super) fn handle_getpgid(args: [usize; ARG_COUNT]) -> isize {
 // test script, and the first thing that ran after the handover - busybox
 // init - asked for all of them within a second of starting.
 
-/// The `cmd` words of `reboot(2)`, Linux x86_64. They are magic numbers, not
-/// flag bits, and each is its own sentence.
-const RB_DISABLE_CAD: usize = 0x0000_0000;
-const RB_ENABLE_CAD: usize = 0x89ab_cdef;
-const RB_AUTOBOOT: usize = 0x0123_4567;
-const RB_HALT_SYSTEM: usize = 0xcdef_0123;
-const RB_POWER_OFF: usize = 0x4321_fedc;
+// The `cmd` words of `reboot(2)` - magic numbers, not flag bits - and their
+// classification into policy / stop / unknown live in `abi`, tested on the
+// host. This side keeps only what a stop word *does*.
 
 /// `reboot(cmd)` — what init asks of the machine.
 ///
@@ -939,14 +863,14 @@ const RB_POWER_OFF: usize = 0x4321_fedc;
 /// environment has, and `-no-reboot` turns it into a clean shutdown either
 /// way. Anything else is refused, as Linux refuses it.
 pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
-    let cmd = args[0];
-    match cmd {
-        RB_DISABLE_CAD | RB_ENABLE_CAD => 0,
-        RB_AUTOBOOT | RB_HALT_SYSTEM | RB_POWER_OFF => {
+    match abi::reboot_classify(args[0]) {
+        abi::RebootCmd::Policy => 0,
+        abi::RebootCmd::Stop => {
+            let cmd = args[0];
             crate::println!("mpos: reboot(0x{cmd:x}) - handing the machine back");
             crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_SUCCESS);
         }
-        _ => err::EINVAL,
+        abi::RebootCmd::Unknown => err::EINVAL,
     }
 }
 
@@ -1029,17 +953,8 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
     }
 }
 
-/// The file-creation mask, `0o022` the way init leaves it.
-static CREATION_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0o022);
-
-/// `umask(mask)` — set the creation mask, and report what it was. No path
-/// records permission bits yet, so the mask is kept and handed back only;
-/// init's `umask(0o22)` still gets the answer it expects.
-pub(super) fn handle_umask(args: [usize; ARG_COUNT]) -> isize {
-    use core::sync::atomic::Ordering;
-    let old = CREATION_MASK.swap(args[0] as u32 & 0o7777, Ordering::Relaxed);
-    old as isize
-}
+// `umask` and its creation mask live in `abi`: a set-and-report with no
+// filesystem consumer is pure argument shaping.
 
 /// `sendfile(out, in, offset, count)` — copy bytes between descriptors in the
 /// kernel. The in-descriptor must be a file (anything `read_at` reaches); the
@@ -1127,17 +1042,10 @@ pub(super) fn handle_brk(args: [usize; ARG_COUNT]) -> isize {
 
 use crate::mm::vm::MapFlags;
 
-/// `mmap`'s flag bits, as Linux numbers them.
-const MAP_SHARED: usize = 0x01;
-const MAP_FIXED: usize = 0x10;
-const MAP_ANONYMOUS: usize = 0x20;
-/// `mprotect`'s protection bits.
-const PROT_WRITE: usize = 0x2;
-const PROT_EXEC: usize = 0x4;
-/// `mremap`'s flag bits: the move may go somewhere else, and the caller named
-/// where.
-const MREMAP_MAYMOVE: usize = 0x1;
-const MREMAP_FIXED: usize = 0x2;
+// The `mmap`/`mprotect`/`mremap` flag bits are Linux's numbering, pinned in
+// `abi` with the rest of the flag words.
+use super::abi::{MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE, PROT_EXEC, PROT_WRITE};
+
 /// One past the highest address a process may map: the lower half of the
 /// canonical address space, which is where every user mapping lives.
 const USER_LIMIT: usize = 1 << 47;
@@ -1534,17 +1442,18 @@ pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
         if !buffer_ok(new_ptr, ITIMERVAL_SIZE, false, true) {
             return err::EFAULT;
         }
-        unsafe {
+        let (vsec, vusec, isec, iusec) = unsafe {
             let word = |n: usize| (new_ptr as *const u64).add(n).read_volatile();
-            let (vsec, vusec, isec, iusec) = (word(0), word(1), word(2), word(3));
-            if vusec >= 1_000_000 || iusec >= 1_000_000 {
-                return err::EINVAL;
-            }
-            let value_ms = vsec * 1000 + vusec.div_ceil(1000);
-            let interval_ms = isec * 1000 + iusec.div_ceil(1000);
-            let hz = crate::arch::timer::TICK_HZ as u64;
-            (value_ms * hz / 1000, interval_ms * hz / 1000)
-        }
+            (word(0), word(1), word(2), word(3))
+        };
+        // The `tv_usec < 1s` checks and the round-up fold into milliseconds
+        // are the man page's contract, spelled in `abi`.
+        let (value_ms, interval_ms) = match abi::itimerval_ms(vsec, vusec, isec, iusec) {
+            Ok(pair) => pair,
+            Err(e) => return e,
+        };
+        let hz = crate::arch::timer::TICK_HZ as u64;
+        (value_ms * hz / 1000, interval_ms * hz / 1000)
     };
     let new = if value_ticks == 0 {
         // A zero it_value disarms, exactly as the man page words it.
@@ -1698,6 +1607,34 @@ pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
     0
 }
 
+/// `sethostname(name, len)` — give the machine the name `uname` reports.
+///
+/// It used to answer 0 and remember nothing, which is why every boot began
+/// with the same name and why `hostname` and `uname -n` could not be made to
+/// agree. The name is kept where `/proc/sys/kernel/hostname` reads it, so the
+/// two are one fact: a service that writes the file and a program that calls
+/// `uname` see the same string.
+pub(super) fn handle_sethostname(args: [usize; ARG_COUNT]) -> isize {
+    let ptr = args[0];
+    let len = args[1];
+    // Longer than a `utsname` field is refused rather than cut: the name is
+    // kept in that field, and a caller that asked for seventy bytes would be
+    // given back a name it never chose without being told it had been
+    // shortened. EINVAL is what Linux answers for exactly this.
+    if len > 64 {
+        return err::EINVAL;
+    }
+    let mut bytes = [0u8; 64];
+    if !crate::sched::read_user(ptr, &mut bytes[..len]) {
+        return err::EFAULT;
+    }
+    let Ok(name) = core::str::from_utf8(&bytes[..len]) else {
+        return err::EINVAL;
+    };
+    crate::vfs::procfs::set_hostname(name);
+    0
+}
+
 /// `uname(buf)` — write system name/version info.
 ///
 /// `buf` points to a `struct utsname`: six 65-byte NUL-terminated strings -
@@ -1719,8 +1656,16 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             let n = bytes.len().min(64);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
         };
-        write_str(0, "mpos"); // sysname
-        write_str(65, "mpos"); // nodename
+        // sysname is "Linux": it is the answer to "what kernel is this", and
+        // every configure script and package description that asks is asking
+        // whether the answer is Linux. The kernel's own name goes in
+        // `release`, which is where `uname -r` looks for it.
+        write_str(0, "Linux");
+        // nodename: the hostname, from the same place `/proc/sys/kernel/
+        // hostname` reads it. Two answers to one question, kept in one place
+        // so they cannot disagree - `hostname` and `uname -n` have to say
+        // the same thing or a script that checks one against the other fails.
+        write_str(65, &crate::vfs::procfs::hostname());
         write_str(130, "0.1.0"); // release
         write_str(195, "0.1.0"); // version
         write_str(260, "x86_64"); // machine
@@ -1729,163 +1674,111 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     0
 }
 
-/// `getrandom(buf, len, flags)` — fill `buf` with random bytes.
-///
-/// The same stream `/dev/urandom` reads from. `GRND_RANDOM` and
-/// `GRND_NONBLOCK` are accepted and ignored: there is one generator, it is
-/// always ready, and it never blocks - which is the behaviour both flags are
-/// asking about.
-pub(super) fn handle_getrandom(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (buf, len, _flags) = (args[0], args[1], args[2]);
-    if len == 0 {
-        return 0;
-    }
-    if !buffer_ok(buf, len, true, from_user) {
-        return err::EFAULT;
-    }
-    // Filled straight into the caller's buffer: a kernel buffer here would be
-    // a heap allocation per call for a request that is usually 32 bytes.
-    let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-    crate::rand::fill(out);
-    len as isize
-}
+// `getrandom` fills from the same stream `/dev/urandom` reads; the handler
+// lives in `abi`, where the host tests can exercise the boundary cases
+// against a real slice.
+// The rlimit family and the affinity/registration calls (`sched_getaffinity`,
+// `sched_setaffinity`, `set_robust_list`, `get_robust_list`, `rseq`) are
+// likewise in `abi`: their whole behaviour is argument shaping and table
+// answers, and this module keeps only what has to touch the machine.
 
-/// `prlimit64(pid, resource, new_limit, old_limit)` — get/set resource limits.
+/// `futex(uaddr, op, val, utime, val3)` — the waiting primitive threads are
+/// built on.
 ///
-/// Minimal: return hard-coded defaults for RLIMIT_STACK and RLIMIT_NOFILE.
-/// A resource number past `RLIM_NLIMITS` is `EINVAL`, the errno Linux uses
-/// for one it has no table row for.
-pub(super) fn handle_prlimit64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    const RLIM_NLIMITS: usize = 16;
-    let (_pid, resource, _new_ptr, old_ptr) = (args[0], args[1], args[2], args[3]);
-    if resource >= RLIM_NLIMITS {
-        return err::EINVAL;
-    }
-    if old_ptr == 0 {
-        return 0;
-    }
-    if !buffer_ok(old_ptr, 16, true, from_user) {
-        return err::EFAULT;
-    }
-    // struct rlimit64 { rlim_cur, rlim_max } — both u64.
-    let (cur, max): (u64, u64) = match resource {
-        3 => (8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_STACK
-        5 => (1024, 1048576),                    // RLIMIT_NOFILE
-        7 => (4096, 4096),                       // RLIMIT_NPROC
-        _ => (u64::MAX, u64::MAX),
-    };
-    unsafe {
-        (old_ptr as *mut u64).write_volatile(cur);
-        ((old_ptr + 8) as *mut u64).write_volatile(max);
-    }
-    0
-}
-
-/// `futex(uaddr, op, val, ...)` — the waiting primitive threads are built on.
-///
-/// A real `FUTEX_WAIT` and `FUTEX_WAKE`, which is what a thread library needs:
-/// a mutex that never blocked and a condition variable that never waited would
-/// let two threads into the same critical section and call it synchronization.
-///
-/// The timeout forms - `FUTEX_WAIT_BITSET`, which is what a *timed* wait uses -
-/// are refused rather than run without their timeout: a caller that asked to
-/// stop waiting would wait for ever, and ENOSYS at least tells it why.
+/// A real `FUTEX_WAIT` and `FUTEX_WAKE`, which is what a mutex needs, plus
+/// the bitset forms a condvar and `thread::park_timeout` spell their timed
+/// waits in: `FUTEX_WAIT_BITSET` sleeps until a wake, an absolute deadline -
+/// `NULL` meaning never - or a changed word, whichever comes first, and
+/// `FUTEX_WAKE_BITSET` wakes only the sleepers whose bits intersect the
+/// waker's. Rust's std writes every timed park in the bitset form, so a
+/// kernel without it parks a thread and never hears the alarm.
 pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
-    // The operation is the low seven bits; the rest of the word carries flags
-    // like FUTEX_PRIVATE_FLAG, which say which table to look in - and this
-    // kernel has exactly one.
-    let (uaddr, command, val) = (args[0], args[1] & !nr::FUTEX_PRIVATE_FLAG, args[2]);
-    let command = command & 0x7f;
+    let (uaddr, op, val, timeout_ptr, val3) = (args[0], args[1], args[2], args[3], args[4]);
+    if !buffer_ok(uaddr, 4, false, true) {
+        return err::EFAULT;
+    }
+    // The operation is the low seven bits; above them sit FUTEX_PRIVATE_FLAG,
+    // which says which table to look in - this kernel has exactly one - and
+    // FUTEX_CLOCK_REALTIME, which only renames the clock an absolute timeout
+    // reads, since every clock here answers off the one tick counter.
+    let command = op & 0x7f;
+    let realtime = op & nr::FUTEX_CLOCK_REALTIME != 0;
 
     match command {
-        nr::FUTEX_WAIT => {
-            if !buffer_ok(uaddr, 4, false, true) {
-                return err::EFAULT;
-            }
-            crate::sched::futex::wait(uaddr, val as u32)
+        nr::FUTEX_WAIT | nr::FUTEX_WAIT_BITSET => {
+            let bitset = if command == nr::FUTEX_WAIT_BITSET {
+                if val3 == 0 {
+                    return err::EINVAL;
+                }
+                val3 as u32
+            } else {
+                crate::sched::futex::BITSET_ANY
+            };
+            // FUTEX_WAIT's timeout counts from now; the bitset form names a
+            // point on a clock, monotonic unless the realtime flag says the
+            // wall clock instead.
+            let deadline = if timeout_ptr != 0 {
+                match futex_deadline(timeout_ptr, command == nr::FUTEX_WAIT, realtime) {
+                    Ok(deadline) => deadline,
+                    Err(e) => return e,
+                }
+            } else {
+                None
+            };
+            crate::sched::futex::wait_bitset(uaddr, val as u32, bitset, deadline)
         }
-        nr::FUTEX_WAKE => {
-            if !buffer_ok(uaddr, 4, false, true) {
-                return err::EFAULT;
+        nr::FUTEX_WAKE => crate::sched::futex::wake(uaddr, val as usize) as isize,
+        nr::FUTEX_WAKE_BITSET => {
+            if val3 == 0 {
+                return err::EINVAL;
             }
-            crate::sched::futex::wake(uaddr, val as usize) as isize
+            crate::sched::futex::wake_bitset(uaddr, val as usize, val3 as u32) as isize
         }
-        nr::FUTEX_WAIT_BITSET | nr::FUTEX_WAKE_BITSET => err::ENOSYS,
         _ => err::ENOSYS,
     }
 }
 
-/// `sched_getaffinity(pid, len, mask)` — which CPUs the caller may run on.
-///
-/// mpos schedules on one CPU, so the mask is always bit 0 and the answer is
-/// the CPU count Linux returns: 1. Bytes of the mask beyond the first word
-/// are zeroed, the way Linux clears what it does not fill.
-pub(super) fn handle_sched_getaffinity(args: [usize; ARG_COUNT]) -> isize {
-    let (_pid, len, mask) = (args[0], args[1], args[2]);
-    if len < core::mem::size_of::<u64>() {
-        return err::EINVAL;
+/// Turn a futex `struct timespec *` into a tick deadline for
+/// [`handle_futex`]. `relative` (FUTEX_WAIT's spelling) counts from now - on
+/// whichever clock the flags name, since a duration is a duration; only the
+/// bitset waits name a point on a clock, monotonic by default or the wall
+/// clock when `realtime` is set - the same wall clock
+/// `clock_gettime(CLOCK_REALTIME)` answers, so a caller comparing the two
+/// agrees with itself. A deadline already in the past comes back as `Some(0)`
+/// and the wait answers `ETIMEDOUT` without sleeping.
+fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u64>, isize> {
+    if !buffer_ok(ts, 16, false, true) {
+        return Err(err::EFAULT);
     }
-    if !buffer_ok(mask, len, true, true) {
-        return err::EFAULT;
+    let sec = unsafe { (ts as *const i64).read_volatile() };
+    let nsec = unsafe { ((ts + 8) as *const i64).read_volatile() };
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(err::EINVAL);
     }
-    unsafe {
-        (mask as *mut u64).write_volatile(1);
-        if len > core::mem::size_of::<u64>() {
-            core::ptr::write_bytes(
-                (mask + core::mem::size_of::<u64>()) as *mut u8,
-                0,
-                len - core::mem::size_of::<u64>(),
-            );
-        }
+    let hz = crate::arch::timer::TICK_HZ as u128;
+    let now_ticks = crate::arch::timer::ticks() as u128;
+    let now_ns = now_ticks * 1_000_000_000 / hz;
+    let target_ns = sec as u128 * 1_000_000_000 + nsec as u128;
+    let delta_ns = if relative {
+        target_ns as i128
+    } else if realtime {
+        // The wall clock is the boot epoch plus the tick counter, which is
+        // exactly what clock_gettime(CLOCK_REALTIME) reports.
+        let wall_ns =
+            crate::arch::rtc::boot_epoch() as u128 * 1_000_000_000 + now_ns;
+        target_ns as i128 - wall_ns as i128
+    } else {
+        // The monotonic clock *is* the tick counter.
+        target_ns as i128 - now_ns as i128
+    };
+    if delta_ns <= 0 {
+        return Ok(Some(0));
     }
-    // The byte count, as Linux answers: a caller counts the CPUs it was
-    // given by scanning that many bytes for bits.
-    core::mem::size_of::<u64>() as isize
+    Ok(Some(now_ticks as u64 + (delta_ns as u128 * hz / 1_000_000_000) as u64 + 1))
 }
 
-/// `sched_setaffinity(pid, len, mask)` - pin the caller to the CPUs named in
-/// `mask`. This machine has one, so the only acceptable request is one that
-/// keeps it; anything else asks for a machine that is not here.
-pub(super) fn handle_sched_setaffinity(args: [usize; ARG_COUNT]) -> isize {
-    let (_pid, len, mask) = (args[0], args[1], args[2]);
-    if len < core::mem::size_of::<u64>() {
-        return err::EINVAL;
-    }
-    if !buffer_ok(mask, len, true, true) {
-        return err::EFAULT;
-    }
-    let requested = unsafe { (mask as *const u64).read_volatile() };
-    if requested & 1 == 0 {
-        return err::EINVAL;
-    }
-    0
-}
-
-/// `set_robust_list(head, len)` — register the robust-futex list head.
-///
-/// The head's contents are never touched; Linux pins the size to
-/// `sizeof(struct robust_list_head)` = 24 and rejects anything else.
-pub(super) fn handle_set_robust_list(args: [usize; ARG_COUNT]) -> isize {
-    let (_head, len) = (args[0], args[1]);
-    if len != 24 {
-        return err::EINVAL;
-    }
-    0
-}
-
-/// `rseq(rseq, len, flags, sig)` — register the restartable-sequence block.
-///
-/// Registration succeeds and nothing is maintained afterwards: glibc only
-/// needs to get past startup, and whether the kernel updates `cpu_id` on
-/// preemption is out of scope. Linux rejects a length other than
-/// `sizeof(struct rseq)` = 32 and any flag but 0.
-pub(super) fn handle_rseq(args: [usize; ARG_COUNT]) -> isize {
-    let (_rseq, len, flags) = (args[0], args[1], args[2]);
-    if len != 32 || flags != 0 {
-        return err::EINVAL;
-    }
-    0
-}
+/// `sched_getaffinity` / `sched_setaffinity` / the robust-list and rseq
+/// registrations live in `abi` - see the note above `futex`.
 
 // ---------------------------------------------------------------------------
 // The calls an ordinary libc reaches for
@@ -2010,15 +1903,11 @@ pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
 /// `si_pid` cleared when no child is ready, which is how a caller polls
 /// without blocking.
 pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
+    use super::abi::SIGINFO_BYTES;
     const P_ALL: usize = 0;
     const P_PID: usize = 1;
     const WNOHANG: usize = 1;
     const WEXITED: usize = 4;
-    const SIGCHLD: i32 = 17;
-    const CLD_EXITED: i32 = 1;
-    const CLD_KILLED: i32 = 2;
-    /// `sizeof(siginfo_t)`: 128 bytes, the whole struct on x86_64.
-    const SIGINFO_BYTES: usize = 128;
 
     let (idtype, _id, infop, options) = (args[0], args[1] as isize, args[2], args[3]);
     if idtype != P_ALL && idtype != P_PID {
@@ -2057,97 +1946,12 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
         }
     };
 
-    let (si_code, status) = if code < 0 {
-        (CLD_KILLED, -code)
-    } else {
-        (CLD_EXITED, code)
-    };
-    unsafe {
-        core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
-        (infop as *mut i32).write_volatile(SIGCHLD); // si_signo
-        ((infop + 8) as *mut i32).write_volatile(si_code); // si_code
-        ((infop + 16) as *mut i32).write_volatile(pid.0 as i32); // si_pid
-        ((infop + 24) as *mut i32).write_volatile(status as i32); // si_status
-    }
-    0
+    // The siginfo layout - SIGCHLD as the signo, CLD_EXITED or CLD_KILLED
+    // as the code, pid and status in their fields - is the ABI the libc's
+    // `W` macros and `waitid` wrappers read; it is spelled in `abi`, tested
+    // on the host.
+    abi::write_waitid_info(infop, pid.0 as u32, code)
 }
 
-/// The resource limits `prlimit64` answers, in the 32-bit-`rlim_t` structure
-/// the legacy pair uses. Same eight resources, same numbers: only the call
-/// that reports them is older.
-fn rlimit_of(resource: usize, out: usize, from_user: bool) -> isize {
-    const RLIM_NLIMITS: usize = 16;
-    if resource >= RLIM_NLIMITS {
-        return err::EINVAL;
-    }
-    if out == 0 {
-        return 0;
-    }
-    if !buffer_ok(out, 16, true, from_user) {
-        return err::EFAULT;
-    }
-    let (cur, max): (u64, u64) = match resource {
-        3 => (8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_STACK
-        5 => (1024, 1_048_576),                  // RLIMIT_NOFILE
-        7 => (4096, 4096),                       // RLIMIT_NPROC
-        _ => (u64::MAX, u64::MAX),
-    };
-    unsafe {
-        (out as *mut u64).write_volatile(cur);
-        ((out + 8) as *mut u64).write_volatile(max);
-    }
-    0
-}
-
-/// `getrlimit(resource, rlim)` — read one resource limit.
-pub(super) fn handle_getrlimit(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    rlimit_of(args[0], args[1], from_user)
-}
-
-/// `setrlimit(resource, rlim)` — set one resource limit.
-///
-/// The limits are advisory answers, not enforced ones, so a set is accepted
-/// for any resource in range and changes nothing - the same contract
-/// `prlimit64` has had. Out-of-range is `EINVAL`, an unwritable pointer
-/// `EFAULT`.
-pub(super) fn handle_setrlimit(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    const RLIM_NLIMITS: usize = 16;
-    let (resource, rlim) = (args[0], args[1]);
-    if resource >= RLIM_NLIMITS {
-        return err::EINVAL;
-    }
-    if rlim != 0 && !buffer_ok(rlim, 16, false, from_user) {
-        return err::EFAULT;
-    }
-    0
-}
-
-/// `membarrier(cmd, flags, cpu_id)` — a memory barrier across the machine.
-///
-/// One core, no preemption between a load and a store a user program could
-/// observe, so every command is already satisfied: the answer is success,
-/// the way Linux answers for commands it can carry out. An unknown command
-/// is `EINVAL`.
-pub(super) fn handle_membarrier(args: [usize; ARG_COUNT]) -> isize {
-    /// MEMBARRIER_CMD_QUERY and the two barriers a musl caller asks for.
-    const CMD_QUERY: usize = 0;
-    const CMD_GLOBAL: usize = 1;
-    const CMD_PRIVATE_EXPEDITED: usize = 8;
-    match args[0] {
-        CMD_QUERY => 0, // no flags are needed, so nothing is reported
-        CMD_GLOBAL | CMD_PRIVATE_EXPEDITED => 0,
-        _ => err::EINVAL,
-    }
-}
-
-/// `get_robust_list(pid, head, len)` — the read half of the robust-futex
-/// list.
-///
-/// Threads are not implemented, so no process has a list, and Linux
-/// answers `ENOSYS` for a kernel built without the call. The write half
-/// still accepts a registration, which is what a glibc that probes the
-/// pair needs to get past startup.
-pub(super) fn handle_get_robust_list(args: [usize; ARG_COUNT]) -> isize {
-    let _ = args;
-    err::ENOSYS
-}
+// The legacy `getrlimit`/`setrlimit` pair, `prlimit64` and `membarrier`
+// live in `abi` with the rest of the table-answer calls.

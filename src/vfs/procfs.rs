@@ -9,20 +9,35 @@
 //! one half of userland (`mountinfo`, `ps`, anything reading `/proc/self`)
 //! quietly assumes is there. A missing `/proc/mounts` is not one service
 //! failing; it is every tool that asks "what is mounted" being told nothing.
+//!
+//! Half of this tree is *not* fixed. `/proc/<pid>` exists because a process
+//! does, `/proc/<pid>/fd/3` because a descriptor does, and `/proc/self` is a
+//! different directory depending on who reads it. Those directories are built
+//! on demand and answered by asking the scheduler, so a listing of `/proc` is
+//! a list of the processes running at that moment rather than a shape decided
+//! when the filesystem was mounted.
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
 use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
 
 /// What a generated file reads back as: a function of the moment.
-type Generator = Box<dyn Fn() -> String + Send + Sync>;
+///
+/// `None` is not "empty", it is "the thing this file reports no longer
+/// exists" - a process that exited between the listing that named it and the
+/// read that opened it. That is `ENOENT` and not a zero-byte file, because a
+/// `ps` that read an empty `/proc/57/stat` would print a process with no name
+/// and no parent rather than skipping one that has already gone.
+type Generator = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// One generated file. Its size is its content's, recomputed on every
 /// `stat` - a file whose contents are "how long has the machine been up"
@@ -47,7 +62,7 @@ impl Inode for ProcFile {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let content = (self.generate)();
+        let content = (self.generate)().ok_or(VfsError::NoEntry)?;
         let bytes = content.as_bytes();
         let start = offset.min(bytes.len() as u64) as usize;
         let end = (start + buf.len()).min(bytes.len());
@@ -56,7 +71,110 @@ impl Inode for ProcFile {
     }
 
     // No `write_at`: the default answers `Unsupported`, and that is the
-    // correct answer. These files report; they do not accept.
+    // correct answer for everything here except the sysctls, which carry
+    // their own.
+}
+
+/// A generated file whose contents can be replaced by writing them.
+///
+/// This is what makes `/proc/sys/kernel/hostname` a sysctl rather than a
+/// read-only fact: `sysctl -w` and OpenRC's `hostname` service both set the
+/// system's name by writing the file, and a file that refused the write would
+/// leave the reader to conclude the write had not taken.
+struct ProcCtl {
+    ino: Ino,
+    read: Generator,
+    write: Box<dyn Fn(&str) -> VfsResult<()> + Send + Sync>,
+}
+
+impl Inode for ProcCtl {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::File,
+            size: 0,
+        }
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        let content = (self.read)().ok_or(VfsError::NoEntry)?;
+        let bytes = content.as_bytes();
+        let start = offset.min(bytes.len() as u64) as usize;
+        let end = (start + buf.len()).min(bytes.len());
+        buf[..end - start].copy_from_slice(&bytes[start..end]);
+        Ok(end - start)
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        // Trailing newlines are how every tool writes these: `sysctl -w`
+        // writes the value and a newline, and a hostname with one inside it
+        // would then be a hostname `hostname` prints with a line break.
+        let text = core::str::from_utf8(buf).map_err(|_| VfsError::Invalid)?;
+        (self.write)(text.trim_end_matches(['\n', '\r']))?;
+        Ok(buf.len())
+    }
+}
+
+/// A link whose target is a fact rather than a stored string.
+///
+/// `/proc/<pid>/exe` names the image the process came from and
+/// `/proc/<pid>/cwd` the directory it is in, and both are answers about a
+/// process that can go away. `None` is `ENOENT`: a link to a process that is
+/// no longer there names nothing.
+struct ProcLink {
+    ino: Ino,
+    target: Generator,
+    /// The process whose descriptor this link is a second name for.
+    pid: usize,
+    /// The descriptor this link is a second name for, when it is one: every
+    /// name under `/proc/<pid>/fd` is, and opening one has to open the
+    /// descriptor rather than the link.
+    fd: Option<usize>,
+}
+
+impl Inode for ProcLink {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::Symlink,
+            size: 0,
+        }
+    }
+
+    fn readlink(&self) -> VfsResult<String> {
+        (self.target)().ok_or(VfsError::NoEntry)
+    }
+
+    fn as_fd(&self) -> Option<usize> {
+        // Another process's descriptor is not ours to clone: opening
+        // `/proc/<other>/fd/3` from here must not hand back *our* fd 3. The
+        // shared-position door opens only for the caller's own group.
+        #[cfg(target_os = "none")]
+        if crate::sched::current_tgid().0 != self.pid {
+            return None;
+        }
+        self.fd
+    }
+}
+
+/// Names a directory has that are not in its table, because they come and go
+/// while the machine runs: one per process, one per open descriptor, one per
+/// thread.
+///
+/// A table cannot hold them - it would have to be rebuilt on every fork,
+/// every `open` and every exit - so the directory asks, at each lookup and
+/// each listing, what exists now. Everything a name means here is a question
+/// about live state, and the answer has to be given at the moment it is asked.
+trait Dynamic: Send + Sync {
+    /// The names that exist right now, with the kind each is listed as, in
+    /// the order they should be listed. The kind is part of the answer
+    /// because `getdents` reports one: an entry under `/proc/<pid>/fd` is a
+    /// symlink, and a tool told it was a directory would try to walk into it.
+    fn names(&self) -> Vec<(String, NodeKind)>;
+    /// The node one of those names names, or `None` if it went away between
+    /// [`names`](Self::names) and here - which is the ordinary case when a
+    /// process exits while a tool is walking `/proc`.
+    fn node(&self, name: &str) -> Option<Arc<dyn Inode>>;
 }
 
 /// A directory of generated files and other directories, by name.
@@ -66,9 +184,19 @@ struct ProcDir {
     /// have to ask a node what it is, because asking a generated file is what
     /// generates it.
     entries: Mutex<RefCell<BTreeMap<String, (Arc<dyn Inode>, NodeKind)>>>,
+    /// The children that are not in `entries` because they are not fixed.
+    dynamic: Option<Arc<dyn Dynamic>>,
 }
 
 impl ProcDir {
+    fn new(dynamic: Option<Arc<dyn Dynamic>>) -> Arc<ProcDir> {
+        Arc::new(ProcDir {
+            ino: next_ino(),
+            entries: Mutex::new(RefCell::new(BTreeMap::new())),
+            dynamic,
+        })
+    }
+
     fn add(&self, name: &str, kind: NodeKind, node: Arc<dyn Inode>) {
         critical_section::with(|cs| {
             self.entries
@@ -89,24 +217,646 @@ impl Inode for ProcDir {
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
-        critical_section::with(|cs| {
+        let fixed = critical_section::with(|cs| {
             self.entries
                 .borrow(cs)
                 .borrow()
                 .get(name)
                 .map(|(node, _kind)| node.clone())
-                .ok_or(VfsError::NoEntry)
-        })
+        });
+        match (fixed, &self.dynamic) {
+            (Some(node), _) => Ok(node),
+            (None, Some(live)) => live.node(name).ok_or(VfsError::NoEntry),
+            (None, None) => Err(VfsError::NoEntry),
+        }
     }
 
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
-        critical_section::with(|cs| {
-            let entries = self.entries.borrow(cs).borrow();
-            Ok(entries
+        let mut listed: Vec<(String, NodeKind)> = critical_section::with(|cs| {
+            self.entries
+                .borrow(cs)
+                .borrow()
                 .iter()
                 .map(|(name, (_node, kind))| (name.clone(), *kind))
-                .collect())
-        })
+                .collect()
+        });
+        if let Some(live) = &self.dynamic {
+            for (name, kind) in live.names() {
+                // A live name that is also a fixed one - `self` beside the
+                // pid directories - is listed once, by whoever holds it.
+                let already = critical_section::with(|cs| {
+                    self.entries.borrow(cs).borrow().contains_key(&name)
+                });
+                if !already {
+                    listed.push((name, kind));
+                }
+            }
+        }
+        // Sorted, as Linux lists them: a `ps` that walks /proc in directory
+        // order sees processes in pid order rather than in whatever order the
+        // task table happens to hold them.
+        listed.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(listed)
+    }
+}
+
+/// A directory that is whichever directory the closure answers, decided at
+/// every lookup.
+///
+/// `/proc/self` is why this exists: it names a different process's directory
+/// depending on who reads it, so it cannot be built when the tree is built.
+/// Every operation forwards to whatever is true now, and a process that has
+/// gone answers `NoEntry` - the same thing `ls /proc/self` says on Linux for
+/// a pid that no longer exists.
+struct MirrorDir {
+    ino: Ino,
+    resolve: Box<dyn Fn() -> Option<Arc<dyn Inode>> + Send + Sync>,
+}
+
+impl Inode for MirrorDir {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::Dir,
+            size: 0,
+        }
+    }
+
+    fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
+        (self.resolve)()
+            .ok_or(VfsError::NoEntry)?
+            .lookup(name)
+    }
+
+    fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
+        (self.resolve)().ok_or(VfsError::NoEntry)?.read_dir()
+    }
+}
+
+/// Inode numbers, shared by the whole filesystem rather than kept per mount.
+///
+/// `/proc`'s nodes are made on demand - a directory per process, built when
+/// the name is looked up and thrown away when nothing names it - so there is
+/// no fixed set to count and no instance to keep the count on.
+static NEXT_INO: AtomicU64 = AtomicU64::new(1);
+
+fn next_ino() -> Ino {
+    NEXT_INO.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A file that always has an answer.
+fn file(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        generate: Box::new(move || Some(generate())),
+    })
+}
+
+/// A file that reports something which can go away.
+fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        generate: Box::new(generate),
+    })
+}
+
+/// A writable file, for the handful of facts that are set by writing them.
+fn ctl(
+    read: impl Fn() -> String + Send + Sync + 'static,
+    write: impl Fn(&str) -> VfsResult<()> + Send + Sync + 'static,
+) -> Arc<dyn Inode> {
+    Arc::new(ProcCtl {
+        ino: next_ino(),
+        read: Box::new(move || Some(read())),
+        write: Box::new(write),
+    })
+}
+
+/// A link to something that can go away.
+fn link(target: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
+    Arc::new(ProcLink {
+        ino: next_ino(),
+        target: Box::new(target),
+        pid: 0,
+        fd: None,
+    })
+}
+
+/// A link that is also a descriptor's second name, as every entry in
+/// `/proc/<pid>/fd` is.
+fn fd_link(
+    pid: usize,
+    fd: usize,
+    target: impl Fn() -> Option<String> + Send + Sync + 'static,
+) -> Arc<dyn Inode> {
+    Arc::new(ProcLink {
+        ino: next_ino(),
+        target: Box::new(target),
+        pid,
+        fd: Some(fd),
+    })
+}
+
+/// A directory of fixed entries.
+fn dir() -> Arc<ProcDir> {
+    ProcDir::new(None)
+}
+
+// ---------------------------------------------------------------------------
+// The questions /proc asks the scheduler.
+//
+// Host builds have no scheduler, and this filesystem is compiled into them so
+// its shapes are unit-testable - so each of these answers emptily there
+// rather than failing to compile. A /proc with no processes is what a machine
+// that has not started any would report.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "none")]
+fn current_pid() -> usize {
+    crate::sched::current_tgid().0
+}
+
+#[cfg(not(target_os = "none"))]
+fn current_pid() -> usize {
+    1
+}
+
+/// Every process id, in the order the task table holds them. Threads are left
+/// out: a process *is* its leader's id, and listing a thread's tid beside it
+/// would be two names for one process.
+#[cfg(target_os = "none")]
+fn process_ids() -> Vec<usize> {
+    crate::sched::snapshots()
+        .into_iter()
+        .filter(|task| task.pid == task.tid)
+        .map(|task| task.pid)
+        .collect()
+}
+
+#[cfg(not(target_os = "none"))]
+fn process_ids() -> Vec<usize> {
+    Vec::new()
+}
+
+#[cfg(target_os = "none")]
+fn pid_exists(pid: usize) -> bool {
+    crate::sched::snapshot(pid)
+        .map(|task| task.pid == pid)
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "none"))]
+fn pid_exists(_pid: usize) -> bool {
+    false
+}
+
+/// The ids of every thread in the process `pid`, leader included.
+#[cfg(target_os = "none")]
+fn thread_ids(pid: usize) -> Vec<usize> {
+    crate::sched::thread_snapshots(pid)
+        .into_iter()
+        .map(|task| task.tid)
+        .collect()
+}
+
+#[cfg(not(target_os = "none"))]
+fn thread_ids(_pid: usize) -> Vec<usize> {
+    Vec::new()
+}
+
+/// The direct children of `pid`, as `children` reports them.
+#[cfg(target_os = "none")]
+fn child_ids(pid: usize) -> Vec<usize> {
+    let mut ids: Vec<usize> = crate::sched::snapshots()
+        .into_iter()
+        .filter(|task| task.pid == task.tid && task.ppid == pid)
+        .map(|task| task.pid)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[cfg(not(target_os = "none"))]
+fn child_ids(_pid: usize) -> Vec<usize> {
+    Vec::new()
+}
+
+/// The descriptor numbers `pid` has open.
+#[cfg(target_os = "none")]
+fn fd_numbers(pid: usize) -> Vec<String> {
+    crate::sched::descriptors_of(pid)
+        .into_iter()
+        .map(|(fd, _name)| alloc::format!("{fd}"))
+        .collect()
+}
+
+#[cfg(not(target_os = "none"))]
+fn fd_numbers(_pid: usize) -> Vec<String> {
+    Vec::new()
+}
+
+/// What the descriptor `fd` of `pid` is reported as: the path it was opened
+/// by, or the anonymous spelling a pipe or a socket falls back to. `None`
+/// only when the descriptor is not open.
+#[cfg(target_os = "none")]
+fn fd_target(pid: usize, fd: usize) -> Option<String> {
+    crate::sched::descriptors_of(pid)
+        .into_iter()
+        .find(|(number, _name)| *number == fd)
+        .map(|(_number, name)| name)
+}
+
+#[cfg(not(target_os = "none"))]
+fn fd_target(_pid: usize, _fd: usize) -> Option<String> {
+    None
+}
+
+/// The facts about a process that the files below are built from.
+#[cfg(target_os = "none")]
+pub type Process = crate::sched::TaskSnapshot;
+
+/// The same shape on a build with no scheduler.
+///
+/// It carries the fields because the generators below are compiled on the host
+/// too - that is what makes their file shapes testable - and every one of them
+/// answers `None` there, since none of them ever finds a process.
+#[cfg(not(target_os = "none"))]
+pub struct Process {
+    pub comm: String,
+    pub exe: String,
+    pub argv: alloc::sync::Arc<Vec<String>>,
+    pub cwd: String,
+    pub state: char,
+    pub pid: usize,
+    pub tid: usize,
+    pub ppid: usize,
+    pub pgid: usize,
+    pub threads: usize,
+    pub rss_pages: usize,
+}
+
+/// One process, by pid. `None` when nothing answers to it.
+#[cfg(target_os = "none")]
+fn task(pid: usize) -> Option<Process> {
+    crate::sched::snapshot(pid)
+}
+
+#[cfg(not(target_os = "none"))]
+fn task(_pid: usize) -> Option<Process> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// /proc/<pid>: the files a process is described by.
+// ---------------------------------------------------------------------------
+
+/// The one line `/proc/<pid>/stat` is, in Linux's own field order.
+///
+/// Fifty-two fields, because that is what the file is: a `ps` reads field 4
+/// for the parent and field 3 for the state, and a tool that stops reading
+/// after the ones it wants still lands on the right ones. Fields this kernel
+/// does not account - page faults, CPU time, wchan - are zero, which is what
+/// a machine that never counted them would honestly report.
+fn stat_line(pid: usize, tid: usize) -> Option<String> {
+    let task = task(tid)?;
+    let shown = if tid == task.pid { task.pid } else { tid };
+    let kb = task.rss_pages * 4096 / 1024;
+    let fields: [alloc::borrow::Cow<'_, str>; 52] = [
+        Cow::Owned(alloc::format!("{}", shown)),
+        Cow::Owned(alloc::format!("({})", task.comm)),
+        Cow::Owned(alloc::format!("{}", task.state)),
+        Cow::Owned(alloc::format!("{}", task.ppid)),
+        Cow::Owned(alloc::format!("{}", task.pgid)),
+        // session: no `setsid` has ever been answered with a group of its
+        // own, so the process group is the closest thing there is.
+        Cow::Owned(alloc::format!("{}", task.pgid)),
+        // tty_nr: 0, "no controlling terminal". Everything on this machine
+        // types at the one console, and claiming a terminal number that no
+        // entry in /dev carries would send `ps` looking for a name it cannot
+        // find.
+        Cow::Borrowed("0"),
+        Cow::Borrowed("-1"),  // tpgid
+        Cow::Borrowed("0"),   // flags
+        Cow::Borrowed("0"),   // minflt
+        Cow::Borrowed("0"),   // cminflt
+        Cow::Borrowed("0"),   // majflt
+        Cow::Borrowed("0"),   // cmajflt
+        Cow::Borrowed("0"),   // utime
+        Cow::Borrowed("0"),   // stime
+        Cow::Borrowed("0"),   // cutime
+        Cow::Borrowed("0"),   // cstime
+        Cow::Borrowed("20"),  // priority
+        Cow::Borrowed("0"),   // nice
+        Cow::Owned(alloc::format!("{}", task.threads)),
+        Cow::Borrowed("0"), // itrealvalue
+        // starttime: no per-task record of when a process began, so every
+        // process claims to have started at boot. A `ps` that reads it prints
+        // a start time rather than crashing on an absent one.
+        Cow::Borrowed("0"),
+        Cow::Owned(alloc::format!("{}", kb * 1024)), // vsize
+        Cow::Owned(alloc::format!("{}", task.rss_pages)), // rss
+        Cow::Borrowed("0"), // rsslim
+        Cow::Borrowed("0"), // startcode
+        Cow::Borrowed("0"), // endcode
+        Cow::Borrowed("0"), // startstack
+        Cow::Borrowed("0"), // kstkesp
+        Cow::Borrowed("0"), // kstkeip
+        Cow::Borrowed("0"), // signal
+        Cow::Borrowed("0"), // blocked
+        Cow::Borrowed("0"), // sigignore
+        Cow::Borrowed("0"), // sigcatch
+        Cow::Borrowed("0"), // wchan
+        Cow::Borrowed("0"), // nswap
+        Cow::Borrowed("0"), // cnswap
+        Cow::Borrowed("17"), // exit_signal: SIGCHLD
+        Cow::Borrowed("0"), // processor
+        Cow::Borrowed("0"), // rt_priority
+        Cow::Borrowed("0"), // policy
+        Cow::Borrowed("0"), // delayacct_blkio_ticks
+        Cow::Borrowed("0"), // guest_time
+        Cow::Borrowed("0"), // cguest_time
+        Cow::Borrowed("0"), // start_data
+        Cow::Borrowed("0"), // end_data
+        Cow::Borrowed("0"), // start_brk
+        Cow::Borrowed("0"), // arg_start
+        Cow::Borrowed("0"), // arg_end
+        Cow::Borrowed("0"), // env_start
+        Cow::Borrowed("0"), // env_end
+        Cow::Borrowed("0"), // exit_code
+    ];
+    let mut out = String::new();
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(field);
+    }
+    out.push('\n');
+    // `pid` is unused on the `/proc/<pid>` spelling because the file is
+    // already named for it; it is carried so the thread spelling can ask for
+    // a tid that is not the process's own.
+    let _ = pid;
+    Some(out)
+}
+
+/// `/proc/<pid>/statm`: the same memory numbers as `stat`, in pages, as
+/// seven fields - total, resident, shared, text, library, data, dirty.
+fn statm_line(pid: usize) -> Option<String> {
+    let task = task(pid)?;
+    Some(alloc::format!(
+        "{} {} 0 0 0 {} 0\n",
+        task.rss_pages, task.rss_pages, task.rss_pages
+    ))
+}
+
+/// `/proc/<pid>/cmdline`: the argument vector, NUL-separated, with a NUL
+/// after the last one.
+///
+/// Empty - not absent - for a process that was started without one, which is
+/// what Linux reports for a kernel thread and what makes `ps` fall back to the
+/// name in brackets rather than print a blank command.
+fn cmdline_of(pid: usize) -> Option<String> {
+    let task = task(pid)?;
+    let mut out = String::new();
+    for arg in task.argv.iter() {
+        out.push_str(arg);
+        out.push('\0');
+    }
+    Some(out)
+}
+
+/// `/proc/<pid>/status`: the same facts `stat` carries, in the long form a
+/// human or a `top` reads.
+fn status_of(pid: usize) -> Option<String> {
+    let task = task(pid)?;
+    let kb = task.rss_pages * 4096 / 1024;
+    let state_name = match task.state {
+        'R' => "running",
+        'S' => "sleeping",
+        'Z' => "zombie",
+        _ => "unknown",
+    };
+    Some(alloc::format!(
+        "Name:\t{name}\n\
+         Umask:\t0022\n\
+         State:\t{state} ({state_name})\n\
+         Tgid:\t{tgid}\n\
+         Ngid:\t0\n\
+         Pid:\t{pid}\n\
+         PPid:\t{ppid}\n\
+         TracerPid:\t0\n\
+         Uid:\t0\t0\t0\t0\n\
+         Gid:\t0\t0\t0\t0\n\
+         FDSize:\t64\n\
+         Groups:\t\n\
+         NStgid:\t{tgid}\n\
+         NSpid:\t{pid}\n\
+         NSpgid:\t{pgid}\n\
+         NSsid:\t0\n\
+         VmPeak:\t   {kb} kB\n\
+         VmSize:\t   {kb} kB\n\
+         VmLck:\t       0 kB\n\
+         VmPin:\t       0 kB\n\
+         VmHWM:\t   {kb} kB\n\
+         VmRSS:\t   {kb} kB\n\
+         RssAnon:\t   {kb} kB\n\
+         RssFile:\t       0 kB\n\
+         RssShmem:\t       0 kB\n\
+         VmData:\t   {kb} kB\n\
+         VmStk:\t       0 kB\n\
+         VmExe:\t       0 kB\n\
+         VmLib:\t       0 kB\n\
+         VmPTE:\t       0 kB\n\
+         VmSwap:\t       0 kB\n\
+         HugetlbPages:\t       0 kB\n\
+         CoreDumping:\t0\n\
+         Threads:\t{threads}\n\
+         SigQ:\t0/64\n\
+         SigPnd:\t0000000000000000\n\
+         ShdPnd:\t0000000000000000\n\
+         SigBlk:\t0000000000000000\n\
+         SigIgn:\t0000000000000000\n\
+         SigCgt:\t0000000000000000\n\
+         CapInh:\t0000000000000000\n\
+         CapPrm:\t000001ffffffffff\n\
+         CapEff:\t000001ffffffffff\n\
+         CapBnd:\t000001ffffffffff\n\
+         CapAmb:\t0000000000000000\n\
+         NoNewPrivs:\t0\n\
+         Seccomp:\t0\n\
+         Seccomp_filters:\t0\n\
+         Cpus_allowed:\t1\n\
+         Cpus_allowed_list:\t0\n\
+         Mems_allowed:\t1\n\
+         Mems_allowed_list:\t0\n\
+         voluntary_ctxt_switches:\t0\n\
+         nonvoluntary_ctxt_switches:\t0\n",
+        name = task.comm,
+        state = task.state,
+        tgid = task.pid,
+        pid = task.pid,
+        ppid = task.ppid,
+        pgid = task.pgid,
+        threads = task.threads,
+    ))
+}
+
+/// `/proc/<pid>/task/<tid>/children`: the process's direct children, space
+/// separated, as `pstree` reads it to walk the tree without scanning /proc.
+fn children_of(pid: usize, tid: usize) -> Option<String> {
+    if !pid_exists(pid) {
+        return None;
+    }
+    let _ = tid;
+    let mut out = String::new();
+    for id in child_ids(pid) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&alloc::format!("{id}"));
+    }
+    out.push('\n');
+    Some(out)
+}
+
+/// One thread's directory: the same files a process has, named for the
+/// thread, plus `children` - which Linux puts under `task` because children
+/// belong to the process, not to whichever thread is listed.
+fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
+    let node = dir();
+    node.add("stat", NodeKind::File, maybe_file(move || stat_line(pid, tid)));
+    node.add("comm", NodeKind::File, maybe_file(move || {
+        Some(alloc::format!("{}\n", task(tid)?.comm))
+    }));
+    node.add(
+        "cmdline",
+        NodeKind::File,
+        maybe_file(move || cmdline_of(tid)),
+    );
+    node.add(
+        "status",
+        NodeKind::File,
+        maybe_file(move || status_of(tid)),
+    );
+    node.add(
+        "children",
+        NodeKind::File,
+        maybe_file(move || children_of(pid, tid)),
+    );
+    node
+}
+
+/// `/proc/<pid>`: the directory a process is described by.
+///
+/// Built when the name is looked up and thrown away when the next lookup
+/// finds the process gone - a process's `/proc` entry is not a thing the
+/// filesystem keeps, it is a view of the task table, and a view kept after the
+/// process left would be a directory of files all answering nothing.
+fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
+    if !pid_exists(pid) {
+        return None;
+    }
+    let node = dir();
+
+    node.add("stat", NodeKind::File, maybe_file(move || stat_line(pid, pid)));
+    node.add("statm", NodeKind::File, maybe_file(move || statm_line(pid)));
+    node.add("comm", NodeKind::File, maybe_file(move || {
+        Some(alloc::format!("{}\n", task(pid)?.comm))
+    }));
+    node.add("cmdline", NodeKind::File, maybe_file(move || cmdline_of(pid)));
+    node.add("status", NodeKind::File, maybe_file(move || status_of(pid)));
+    // The image and the working directory, as links: `readlink` is the only
+    // way to ask for them, and their targets are facts about a process, not
+    // bytes a file holds.
+    node.add(
+        "exe",
+        NodeKind::Symlink,
+        link(move || {
+            let exe = task(pid)?.exe;
+            if exe.is_empty() {
+                None
+            } else {
+                Some(exe)
+            }
+        }),
+    );
+    node.add("cwd", NodeKind::Symlink, link(move || Some(task(pid)?.cwd)));
+    node.add("root", NodeKind::Symlink, link(|| Some(String::from("/"))));
+
+    // `/proc/<pid>/task`: one directory per thread, the leader among them.
+    let tasks = ProcDir::new(Some(Arc::new(Threads { pid })));
+    node.add("task", NodeKind::Dir, tasks);
+
+    // `/proc/<pid>/fd`: one link per open descriptor, whose target is the
+    // path it was opened by.
+    let fds = ProcDir::new(Some(Arc::new(Descriptors { pid })));
+    node.add("fd", NodeKind::Dir, fds);
+
+    Some(node)
+}
+
+/// The threads of one process, as `/proc/<pid>/task` names them.
+struct Threads {
+    pid: usize,
+}
+
+impl Dynamic for Threads {
+    fn names(&self) -> Vec<(String, NodeKind)> {
+        thread_ids(self.pid)
+            .into_iter()
+            .map(|tid| (alloc::format!("{tid}"), NodeKind::Dir))
+            .collect()
+    }
+
+    fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
+        let tid = name.parse::<usize>().ok()?;
+        if !thread_ids(self.pid).contains(&tid) {
+            return None;
+        }
+        Some(thread_dir(self.pid, tid))
+    }
+}
+
+/// The open descriptors of one process, as `/proc/<pid>/fd` names them.
+struct Descriptors {
+    pid: usize,
+}
+
+impl Dynamic for Descriptors {
+    fn names(&self) -> Vec<(String, NodeKind)> {
+        fd_numbers(self.pid)
+            .into_iter()
+            .map(|name| (name, NodeKind::Symlink))
+            .collect()
+    }
+
+    fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
+        let fd = name.parse::<usize>().ok()?;
+        let target = fd_target(self.pid, fd)?;
+        Some(fd_link(self.pid, fd, move || Some(target.clone())))
+    }
+}
+
+/// The processes themselves, as `/proc` names them.
+///
+/// A name is looked up as a number and answered only when a process answers
+/// to that number: `/proc` holds a great many names that are not pids
+/// (`mounts`, `uptime`, `self`), and a file that claimed every number was a
+/// process would turn `mounts` into a directory and break the first tool that
+/// asked for it.
+struct Processes;
+
+impl Dynamic for Processes {
+    fn names(&self) -> Vec<(String, NodeKind)> {
+        process_ids()
+            .into_iter()
+            .map(|pid| (alloc::format!("{pid}"), NodeKind::Dir))
+            .collect()
+    }
+
+    fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
+        let pid = name.parse::<usize>().ok()?;
+        process_dir(pid)
     }
 }
 
@@ -143,63 +893,54 @@ fn meminfo_kb() -> (u64, u64) {
     (0, 0)
 }
 
-/// The calling process's own executable path, and its pid. Both are questions
-/// the scheduler answers on the kernel and that the host test build answers
-/// with placeholders, because the tests exercise the *file shapes*.
-#[cfg(target_os = "none")]
-fn self_exe() -> String {
-    crate::sched::current_exe()
+// ---------------------------------------------------------------------------
+// The name of this machine.
+// ---------------------------------------------------------------------------
+
+/// The system's hostname, as `sethostname` last set it and as
+/// `/proc/sys/kernel/hostname` reports it.
+///
+/// It starts as the kernel's own name rather than empty, because the first
+/// thing an init prints is usually a banner with the hostname in it and an
+/// empty name there reads as a failure to look one up.
+static HOSTNAME: Mutex<RefCell<String>> = Mutex::new(RefCell::new(String::new()));
+
+/// The name this machine calls itself.
+pub fn hostname() -> String {
+    critical_section::with(|cs| {
+        let name = HOSTNAME.borrow(cs).borrow();
+        if name.is_empty() {
+            String::from(DEFAULT_HOSTNAME)
+        } else {
+            name.clone()
+        }
+    })
 }
 
-#[cfg(not(target_os = "none"))]
-fn self_exe() -> String {
-    String::from("/sbin/init")
+/// Give the machine a name. `sethostname(2)` spells it through here, and so
+/// does a write to `/proc/sys/kernel/hostname` - one fact, two doors, which
+/// is why the name is kept here rather than in either caller.
+pub fn set_hostname(name: &str) {
+    critical_section::with(|cs| {
+        *HOSTNAME.borrow(cs).borrow_mut() = String::from(name);
+    });
 }
 
-#[cfg(target_os = "none")]
-fn self_pid() -> usize {
-    crate::sched::current().0
-}
-
-#[cfg(not(target_os = "none"))]
-fn self_pid() -> usize {
-    1
-}
+/// The name before anyone sets one.
+const DEFAULT_HOSTNAME: &str = "mpos";
 
 /// The filesystem itself.
 pub struct ProcFs {
     root: Arc<ProcDir>,
-    next_ino: Mutex<RefCell<Ino>>,
 }
 
 impl ProcFs {
     pub fn new() -> Arc<ProcFs> {
         let fs = Arc::new(ProcFs {
-            root: Arc::new(ProcDir {
-                ino: 0,
-                entries: Mutex::new(RefCell::new(BTreeMap::new())),
-            }),
-            next_ino: Mutex::new(RefCell::new(1)),
+            root: ProcDir::new(Some(Arc::new(Processes))),
         });
         fs.build();
         fs
-    }
-
-    fn ino(&self) -> Ino {
-        critical_section::with(|cs| {
-            let next = self.next_ino.borrow(cs);
-            let mut next = next.borrow_mut();
-            let ino = *next;
-            *next += 1;
-            ino
-        })
-    }
-
-    fn file<F: Fn() -> String + Send + Sync + 'static>(&self, generate: F) -> Arc<dyn Inode> {
-        Arc::new(ProcFile {
-            ino: self.ino(),
-            generate: Box::new(generate),
-        })
     }
 
     /// The tree. Each file's generator is written where its content is
@@ -210,7 +951,7 @@ impl ProcFs {
         self.root.add(
             "mounts",
             NodeKind::File,
-            self.file(|| {
+            file(|| {
                 let mut out = String::new();
                 for (source, path, fstype, options) in super::mount::global().mount_table() {
                     // The fourth column is the mount options, and it is the one
@@ -235,7 +976,7 @@ impl ProcFs {
         self.root.add(
             "filesystems",
             NodeKind::File,
-            self.file(|| {
+            file(|| {
                 let mut out = String::new();
                 for (name, nodev) in [
                     ("sysfs", true),
@@ -259,7 +1000,7 @@ impl ProcFs {
         self.root.add(
             "uptime",
             NodeKind::File,
-            self.file(|| {
+            file(|| {
                 let (secs, centis) = uptime();
                 alloc::format!("{}.{} 0.0\n", secs, centis)
             }),
@@ -267,7 +1008,7 @@ impl ProcFs {
         self.root.add(
             "meminfo",
             NodeKind::File,
-            self.file(|| {
+            file(|| {
                 let (total, free) = meminfo_kb();
                 alloc::format!(
                     "MemTotal:       {} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\n",
@@ -280,7 +1021,7 @@ impl ProcFs {
         self.root.add(
             "cpuinfo",
             NodeKind::File,
-            self.file(|| {
+            file(|| {
                 alloc::format!(
                     "processor\t: 0\ncpu family\t: x86_64\nmodel name\t: {} x86_64 processor\n\n",
                     env!("CARGO_PKG_NAME")
@@ -290,7 +1031,7 @@ impl ProcFs {
         self.root.add(
             "version",
             NodeKind::File,
-            self.file(|| {
+            file(|| {
                 alloc::format!(
                     "{} version {} \n",
                     env!("CARGO_PKG_NAME"),
@@ -303,57 +1044,186 @@ impl ProcFs {
         self.root.add(
             "cmdline",
             NodeKind::File,
-            self.file(|| alloc::format!("{}\n", crate::boot::cmdline())),
+            file(|| alloc::format!("{}\n", crate::boot::cmdline())),
         );
         self.root.add(
             "loadavg",
             NodeKind::File,
-            self.file(|| String::from("0.00 0.00 0.00 1/1 1\n")),
+            file(|| {
+                // The last field is the most recent pid, which a shell uses
+                // to pick a number for a job. Ours comes from the same place
+                // a pid comes from, so it agrees with what `ps` lists.
+                let newest = process_ids().into_iter().max().unwrap_or(1);
+                alloc::format!("0.00 0.00 0.00 1/{} {}\n", process_count(), newest)
+            }),
         );
         self.root.add(
             "stat",
             NodeKind::File,
-            self.file(|| {
+            file(|| {
                 let (secs, _) = uptime();
                 alloc::format!("cpu  {} 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\n", secs)
             }),
         );
-
-        // `/proc/self`: the calling process, resolved at read time. The `exe`
-        // link's *reading* is short-circuited in the readlink handler, but the
-        // name still has to resolve for a caller that stats it first.
-        let self_dir = Arc::new(ProcDir {
-            ino: self.ino(),
-            entries: Mutex::new(RefCell::new(BTreeMap::new())),
-        });
-        self_dir.add(
-            "cmdline",
+        // Every device the kernel has registered, split the way a reader of
+        // `/proc/devices` expects: character devices first, then block. It is
+        // what a `ls -l /dev` cross-references a device number against, and
+        // what tells a tool whether a major number is a char device or a disk.
+        self.root.add(
+            "devices",
             NodeKind::File,
-            self.file(|| {
-                let exe = self_exe();
-                if exe.is_empty() {
-                    String::from("\n")
-                } else {
-                    alloc::format!("{}\n", exe)
+            file(|| {
+                let mut out = String::from("Character devices:\n");
+                for (name, major) in [
+                    ("mem", 1u32),
+                    ("tty", 4),
+                    ("ttyS", 4),
+                    ("misc", 10),
+                ] {
+                    out.push_str(&alloc::format!("{major} {name}\n"));
                 }
+                out.push_str("\nBlock devices:\n");
+                out.push_str("254 virtblk\n");
+                out
             }),
         );
-        self_dir.add("exe", NodeKind::File, self.file(self_exe));
-        self_dir.add(
-            "stat",
+
+        // `/proc/sys`: the knobs. `sysctl -a` walks this tree, and OpenRC's
+        // `sysctl` service writes into it at boot - a tree that is absent is
+        // a service that fails on every entry in /etc/sysctl.conf, not one
+        // that quietly does nothing.
+        let sys = dir();
+        let kernel = dir();
+        // The three `uname` answers that live here rather than in /proc: a
+        // program asking what it is running on reads these, and they have to
+        // agree with what `uname(2)` said or the two disagree about the
+        // machine.
+        kernel.add("ostype", NodeKind::File, file(|| String::from("Linux\n")));
+        kernel.add(
+            "osrelease",
             NodeKind::File,
-            self.file(|| {
-                let exe = self_exe();
-                let name = exe.rsplit('/').next().unwrap_or("unknown");
-                alloc::format!(
-                    "{} ({}) R 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 0\n",
-                    self_pid(),
-                    name
-                )
-            }),
+            file(|| alloc::format!("{}\n", env!("CARGO_PKG_VERSION"))),
         );
+        kernel.add(
+            "version",
+            NodeKind::File,
+            file(|| String::from("#1 SMP PREEMPT mpos\n")),
+        );
+        kernel.add(
+            "hostname",
+            NodeKind::File,
+            // Read back with the newline every sibling sysctl ends in, and
+            // written under the same 64-byte cap `sethostname(2)` enforces:
+            // one fact, two doors, one rule - a name the file accepted and
+            // `uname` then truncated would be two facts wearing one label.
+            ctl(
+                || alloc::format!("{}\n", hostname()),
+                |name| {
+                    if name.len() > 64 {
+                        return Err(VfsError::Invalid);
+                    }
+                    set_hostname(name);
+                    Ok(())
+                },
+            ),
+        );
+        kernel.add(
+            "domainname",
+            NodeKind::File,
+            ctl(|| String::from("(none)\n"), |_| Ok(())),
+        );
+        kernel.add(
+            "pid_max",
+            NodeKind::File,
+            file(|| alloc::format!("{}\n", max_pids())),
+        );
+        kernel.add(
+            "threads-max",
+            NodeKind::File,
+            file(|| alloc::format!("{}\n", max_pids())),
+        );
+        kernel.add("ngroups_max", NodeKind::File, file(|| String::from("65536\n")));
+        kernel.add("pty", NodeKind::Dir, pty_dir());
+        sys.add("kernel", NodeKind::Dir, kernel);
+        self.root.add("sys", NodeKind::Dir, sys);
+
+        // `/proc/self`: whichever process is reading, which is not knowable
+        // when the tree is built. The link's *reading* is short-circuited in
+        // the readlink handler for the two names that need a shortcut -
+        // `exe` and `fd/<n>` - but every other name has to resolve through
+        // the process's own directory to be answered at all.
+        let self_dir: Arc<dyn Inode> = Arc::new(MirrorDir {
+            ino: next_ino(),
+            resolve: Box::new(|| process_dir(current_pid())),
+        });
         self.root.add("self", NodeKind::Dir, self_dir);
+        // `/proc/thread-self` is the same idea for the calling *thread*, and
+        // exists because a threaded program asking about itself gets a tid,
+        // not a pid - `pthread_self` and `gettid` agree with each other and
+        // with this, and not with `getpid`.
+        let thread_self: Arc<dyn Inode> = Arc::new(MirrorDir {
+            ino: next_ino(),
+            resolve: Box::new(|| {
+                let tid = current_tid();
+                let pid = current_pid();
+                Some(thread_dir(pid, tid))
+            }),
+        });
+        self.root.add("thread-self", NodeKind::Dir, thread_self);
     }
+}
+
+/// `/proc/sys/kernel/pty`: how many pseudo-terminals there can be and how
+/// many are open.
+///
+/// `max` is what a library reads before deciding whether it can open another
+/// pty; `nr` is how many it thinks are in use. This kernel's devpts has no
+/// limit of its own, so `max` reports the number of task slots - the real
+/// ceiling, since a pty is driven by whoever opened it - and `nr` counts the
+/// descriptors devpts has handed out.
+fn pty_dir() -> Arc<ProcDir> {
+    let pty = dir();
+    pty.add("max", NodeKind::File, file(|| alloc::format!("{}\n", max_pids())));
+    pty.add("nr", NodeKind::File, file(|| {
+        let open = crate::vfs::devpts::open_count();
+        alloc::format!("{open}\n")
+    }));
+    pty
+}
+
+/// The largest pid there can be: the task table's size, which is where pids
+/// come from and therefore the number a tool checking "can there be another
+/// one" is actually asking about.
+#[cfg(target_os = "none")]
+fn max_pids() -> usize {
+    crate::sched::MAX_TASKS
+}
+
+#[cfg(not(target_os = "none"))]
+fn max_pids() -> usize {
+    64
+}
+
+/// How many processes are running, for `/proc/loadavg`'s "1/n" field.
+#[cfg(target_os = "none")]
+fn process_count() -> usize {
+    process_ids().len()
+}
+
+#[cfg(not(target_os = "none"))]
+fn process_count() -> usize {
+    1
+}
+
+/// The calling thread's id, for `/proc/thread-self`.
+#[cfg(target_os = "none")]
+fn current_tid() -> usize {
+    crate::sched::current().0
+}
+
+#[cfg(not(target_os = "none"))]
+fn current_tid() -> usize {
+    1
 }
 
 impl FileSystem for ProcFs {

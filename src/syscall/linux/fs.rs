@@ -10,18 +10,22 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use super::abi;
+// The flag words and helpers the handlers below spell by name; the values
+// and their tests live in `abi`.
+use super::abi::{
+    EFD_NONBLOCK, EFD_SEMAPHORE, F_DUPFD, F_GETFD, F_GETFL, F_GETLK, F_SETFD, F_SETFL, F_SETLK,
+    F_SETLKW, FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL,
+    O_TMPFILE, O_TRUNC, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLIN, POLLOUT, POLLNVAL,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, normalize_path, write_stat,
+};
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
-use crate::vfs::{Inode, Metadata, NodeKind};
-
-/// `openat`'s magic dirfd: the path is relative to the caller's cwd.
-pub(super) const AT_FDCWD: i32 = -100;
-/// `fstatat` by descriptor: an empty path names the dirfd itself.
-const AT_EMPTY_PATH: usize = 0x1000;
+use crate::vfs::{Inode, NodeKind};
 
 /// The inode a dirfd-led path resolves from: the descriptor's directory, or
 /// the caller's cwd for `AT_FDCWD`.
 fn base_of(dirfd: i32, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
-    if dirfd == AT_FDCWD {
+    if dirfd == abi::AT_FDCWD {
         return Ok(cwd.clone());
     }
     let file = crate::sched::current_fds()
@@ -33,49 +37,26 @@ fn base_of(dirfd: i32, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
     Ok(file.inode())
 }
 
-/// The mode bits `struct stat` and `struct statx` carry for a node.
-fn mode_of(meta: &Metadata, stored: u32) -> u32 {
-    // The format bits follow the kind - `st_mode`'s top nibble is a type
-    // tag, not a permission. The permission bits are the filesystem's own
-    // when it stores them (ext2 does, and OpenRC's `test -x` gate lives on
-    // them); a filesystem without them gets the kind's default, which keeps
-    // directories traversable and devices usable.
-    let format = match meta.kind {
-        NodeKind::File => 0o100_000,
-        NodeKind::Dir => 0o040_000,
-        NodeKind::CharDev => 0o020_000,
-        NodeKind::BlockDev => 0o060_000,
-        NodeKind::Symlink => 0o120_000,
-    };
-    if stored != 0 {
-        format | (stored & 0o7777)
-    } else {
-        match meta.kind {
-            NodeKind::File => 0o100_644,     // regular file rw-r--r--
-            NodeKind::Dir => 0o040_755,      // directory rwxr-xr-x
-            NodeKind::CharDev => 0o020_666,  // character device rw-rw-rw-
-            NodeKind::BlockDev => 0o060_660, // block device brw-rw----
-            NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
-        }
-    }
-}
-
-/// O_CREAT: make the named file when it is not there already. With O_EXCL
-/// it refuses instead of replacing; on its own it opens whatever is there.
-const O_CREAT: usize = 0o100;
-const O_EXCL: usize = 0o400;
-/// `O_TRUNC`: an existing file is emptied as part of the open. Without it a
-/// writer that reopens a name it wrote before keeps whatever tail was longer
-/// than what it writes now - the new bytes followed by the old ones, with
-/// nothing reporting it.
-const O_TRUNC: usize = 0o1000;
-const O_CLOEXEC: usize = 0o200_0000;
-/// `AT_SYMLINK_NOFOLLOW`: name the link itself, not what it points at.
-const AT_SYMLINK_NOFOLLOW: usize = 0x100;
-
 /// `open`/`openat` shared tail: open the path, and on a miss with `O_CREAT`
 /// make the file first, then open it.
 fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
+    // O_TMPFILE, which is the O_TMPFILE bit over O_DIRECTORY, asks for an
+    // inode no name holds: the caller writes it whole and `linkat`s it into
+    // the tree when it is done. Nothing here can keep an inode out of the
+    // tree, and answering with the named file the path resolves to would
+    // read as anonymity to the caller - apk refreshes its repository index
+    // through one against `.` in the cache directory, and a descriptor over
+    // the *directory* turned every refresh into `Is a directory` at the
+    // first write. EOPNOTSUPP is what a filesystem without the feature
+    // answers, and what sends apk down the named-temp-file-and-rename path
+    // it keeps for exactly this. The pairing itself is read the way Linux
+    // reads it: the bit without the flag is not a spelling anyone meant.
+    if flags & O_TMPFILE != 0 {
+        if flags & O_DIRECTORY == 0 {
+            return err::EINVAL;
+        }
+        return err::EOPNOTSUPP;
+    }
     // Resolved before the base moves into `open_opt`, and used only if what
     // comes back is a directory.
     let label = recoverable_path(path, &base);
@@ -100,6 +81,29 @@ fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
     };
     match opened {
         Ok(fd) => {
+            // The refusals the name earns once it resolves, the ones Linux's
+            // may_open makes: a directory opened for writing - the access
+            // bits, since O_RDONLY is zero - or with O_TRUNC, a write with
+            // the serial number filed off, is EISDIR; and O_DIRECTORY over
+            // anything but a directory is ENOTDIR. O_CREAT is *not* refused:
+            // on a directory that already exists it is the ordinary
+            // "ensure this is here" idiom, and Linux opens it. Saying yes
+            // hands back a descriptor whose first real use fails with an
+            // errno the caller has no way to connect to the open that
+            // succeeded. The refused descriptor is closed on the way out: a
+            // refusal that leaks the fd it refused would be a second bug
+            // answering the first.
+            if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+                let dir = file.metadata().kind == NodeKind::Dir;
+                if dir && (flags & O_ACCMODE != 0 || flags & O_TRUNC != 0) {
+                    let _ = crate::sched::current_fds().close(fd);
+                    return err::EISDIR;
+                }
+                if flags & O_DIRECTORY != 0 && !dir {
+                    let _ = crate::sched::current_fds().close(fd);
+                    return err::ENOTDIR;
+                }
+            }
             // A directory description remembers the path it was opened by, so
             // a later `fchdir` can give the cwd a name `getcwd` reads back. A
             // character device remembers too: libc's `ttyname` names the tty
@@ -378,9 +382,6 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
 /// are not, and the mask says so. The struct is zeroed through `stx_mnt_id`
 /// (152 bytes) first, so fields the caller did not ask about read as absent.
 pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    const STATX_BASIC_STATS: u32 = 0x7ff;
-    const STATX_SIZE: usize = 152;
-
     let (dirfd, path_ptr, _flags, mask, buf) =
         (args[0] as i32, args[1], args[2], args[3] as u32, args[4]);
     let path = match cstr_arg(path_ptr, true) {
@@ -411,25 +412,10 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         }
     };
 
-    if !buffer_ok(buf, STATX_SIZE, true, true) {
-        return err::EFAULT;
-    }
-    unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, STATX_SIZE);
-        let at = |offset: usize| (buf + offset) as *mut u8;
-        (at(0) as *mut u32).write_volatile(mask & STATX_BASIC_STATS); // stx_mask
-        (at(4) as *mut u32).write_volatile(512); // stx_blksize
-        (at(16) as *mut u32).write_volatile(if meta.kind == NodeKind::Dir { 2 } else { 1 }); // stx_nlink
-        (at(28) as *mut u16).write_volatile(mode_of(&meta, stored) as u16); // stx_mode
-        (at(32) as *mut u64).write_volatile(meta.ino); // stx_ino
-        (at(40) as *mut u64).write_volatile(meta.size); // stx_size
-        (at(48) as *mut u64).write_volatile(meta.size.div_ceil(512) as u64); // stx_blocks
-        if let Some((major, minor)) = rdev {
-            (at(72) as *mut u32).write_volatile(major); // stx_rdev_major
-            (at(76) as *mut u32).write_volatile(minor); // stx_rdev_minor
-        }
-    }
-    0
+    // The byte layout - zeroed head, field offsets, the `STATX_BASIC_STATS`
+    // mask answer - is the ABI, and lives in `abi` where the host tests can
+    // walk it field by field. This side only resolves what the struct says.
+    abi::write_statx(buf, mask, &meta, stored, rdev)
 }
 
 /// `access(path, mode)` - is the path there and reachable? Mode is ignored:
@@ -515,38 +501,6 @@ pub(super) fn chdir(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
-/// The normalized absolute path `path` names, relative components resolved
-/// against `base`. `.` drops out, `..` pops one component, repeated slashes
-/// collapse — the shape `getcwd` owes and `chdir` remembers.
-fn normalize_path(path: &str, base: &str) -> alloc::string::String {
-    let joined = if path.starts_with('/') {
-        alloc::string::String::from(path)
-    } else if base.ends_with('/') {
-        alloc::format!("{base}{path}")
-    } else {
-        alloc::format!("{base}/{path}")
-    };
-    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
-    for component in joined.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    if parts.is_empty() {
-        return alloc::string::String::from("/");
-    }
-    let mut out = alloc::string::String::new();
-    for part in parts {
-        out.push('/');
-        out.push_str(part);
-    }
-    out
-}
-
 /// `unlinkat(dirfd, path, flags)` - `AT_REMOVEDIR` is accepted and ignored:
 /// removal goes through the same unlink either way.
 pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
@@ -554,8 +508,6 @@ pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
     // optimisation, it is how the caller says which of the two operations it
     // means, and getting it wrong either removes a directory that still holds
     // something or refuses a plain file.
-    const AT_REMOVEDIR: usize = 0x200;
-
     let base = match base_of(args[0] as i32, cwd) {
         Ok(base) => base,
         Err(e) => return e,
@@ -797,16 +749,14 @@ pub(super) fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
     } else if let Some(rest) = path.strip_prefix("/proc/self/fd/") {
         // The descriptor's own path: what libc's `ttyname` reads to name the
         // tty a login session is on. The fd must be one of the caller's, and
-        // the answer is the name it was opened by.
+        // the answer is the name it was opened by - or the anonymous spelling
+        // (`pipe:[ino]`) for a descriptor that has no path anywhere.
         let fd: i32 = match rest.parse() {
             Ok(n) => n,
             Err(_) => return err::ENOENT,
         };
         match crate::sched::current_fds().clone_at(fd) {
-            Ok(file) => match file.label().or_else(|| path_of(&file.inode())) {
-                Some(p) => p,
-                None => return err::ENOENT,
-            },
+            Ok(file) => file.display_name(),
             Err(e) => return err_of(e),
         }
     } else {
@@ -1090,8 +1040,6 @@ pub(super) fn handle_pivot_root(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) 
 /// entire contract, and it is what a program with a worker uses instead of a
 /// pipe.
 pub(super) fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
-    const EFD_SEMAPHORE: usize = 1;
-    const EFD_NONBLOCK: usize = 0x800;
     if args[1] & EFD_SEMAPHORE != 0 {
         // The counter is taken whole here; a caller that asked for one-per-read
         // asked for something else, and saying so beats doing something close.
@@ -1175,16 +1123,6 @@ pub(super) fn handle_chroot(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
 /// every unlock is a no-op. `apk` and other tools that use `fcntl` record
 /// locking need these to succeed rather than return `EINVAL`.
 pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
-    const F_DUPFD: usize = 0;
-    const F_GETFD: usize = 1;
-    const F_SETFD: usize = 2;
-    const F_GETFL: usize = 3;
-    const F_SETFL: usize = 4;
-    const F_GETLK: usize = 5;
-    const F_SETLK: usize = 6;
-    const F_SETLKW: usize = 7;
-    const FD_CLOEXEC: u32 = 1;
-
     let (fd, cmd, arg) = (args[0] as i32, args[1], args[2]);
     match cmd {
         // `dup` with a floor rather than a free-for-all: the new descriptor is
@@ -1258,19 +1196,9 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
-/// One `struct pollfd` on x86_64: `fd`, `events`, then `revents`.
-const POLLFD_SIZE: usize = 8;
-/// Where `revents` sits inside a `struct pollfd`.
-const POLLFD_REVENTS: usize = 6;
-/// Where \`events\` sits inside a \`struct pollfd\`.
-const POLLFD_EVENTS: usize = 4;
-
-/// `poll(fds, nfds, timeout)`.
-///
-/// What a caller may ask `poll` to watch for, and what it is told happened.
-const POLLIN: i16 = 0x001;
-const POLLOUT: i16 = 0x004;
-const POLLNVAL: i16 = 0x020;
+// The `struct pollfd` layout (its size, where `events` and `revents` sit)
+// and the event bits live in `abi`, where the host tests pin the byte
+// offsets against the x86_64 ABI.
 
 /// Wait for any of `nfds` descriptors to be ready.
 ///
@@ -1324,15 +1252,12 @@ fn ppoll_deadline(tsp: usize, from_user: bool) -> Result<Option<u64>, isize> {
         let at = |offset: usize| (tsp + offset) as *const u64;
         (at(0).read_volatile(), at(8).read_volatile())
     };
-    if nsec >= 1_000_000_000 {
-        return Err(err::EINVAL);
-    }
-    // A deadline further out than this is a clock that has gone wrong, not a
-    // request; Linux clamps instead of refusing, and so does the arithmetic
-    // here - the tick count saturates rather than wrapping into the past.
-    let ms = sec
-        .saturating_mul(1000)
-        .saturating_add(nsec.div_ceil(1_000_000));
+    // The `tv_nsec < 1s` check and the round-*up* to milliseconds are the
+    // man page's contract, spelled in `abi`: a caller that asked for one
+    // nanosecond must not get a zero-millisecond wait. The deadline further
+    // out than the tick count can name saturates rather than wrapping into
+    // the past - Linux clamps the same way.
+    let ms = abi::ppoll_ms(sec, nsec)?;
     Ok(Some(deadline_in_ticks(ms)))
 }
 
@@ -1433,9 +1358,9 @@ fn check_ready(fds: usize, nodes: &[Option<Arc<dyn Inode>>]) -> usize {
 // select: the fd_set-bitmap spelling of poll
 // ---------------------------------------------------------------------------
 
-/// The ABI's ceiling on a descriptor number in an `fd_set`. Linux answers
-/// `EINVAL` for anything past it, and so does this.
-const FD_SETSIZE: usize = 1024;
+// The ABI's ceiling on a descriptor number in an `fd_set` - `FD_SETSIZE`,
+// 1024 - is pinned in `abi` with the rest of the flag words. Linux answers
+// `EINVAL` for anything past it, and so does the check below.
 
 /// One descriptor a `select` caller asked about: which fd, what it is, and
 /// which of the caller's sets it appeared in.
@@ -1556,21 +1481,18 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         None
     } else {
         // Both shapes lead with seconds and follow with a sub-second field:
-        // microseconds for `select`, nanoseconds for `pselect6`. The field
-        // is validated against its own unit before it is folded into
-        // milliseconds, which is the resolution the wait below works in.
+        // microseconds for `select`, nanoseconds for `pselect6`. The unit
+        // check and the fold into milliseconds are the man page's contract,
+        // spelled once in `abi` - the resolution the wait below works in is
+        // what the milliseconds are for.
         let (sec, frac) = unsafe {
             let at = |offset: usize| (tvp + offset) as *const u64;
             (at(0).read_volatile(), at(8).read_volatile())
         };
-        let unit = if timespec { 1_000_000 } else { 1_000 };
-        if sec >= (1 << 43) || frac >= unit * 1_000 {
-            // Beyond a few centuries, or a sub-second field that does not
-            // fit its unit: a corrupted timeout. Linux clamps; a bounded
-            // answer beats wrapping.
-            return err::EINVAL;
-        }
-        let ms = sec * 1000 + frac.div_ceil(unit);
+        let ms = match abi::select_timeout_ms(sec, frac, timespec) {
+            Ok(ms) => ms,
+            Err(e) => return e,
+        };
         let ticks = ms * crate::arch::timer::TICK_HZ as u64 / 1000;
         Some(crate::arch::timer::ticks() + ticks)
     };
@@ -1669,78 +1591,30 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
     count
 }
 
-/// Write the 144-byte Linux x86_64 `struct stat` for `meta`.
-///
-/// The field offsets are the ABI, so they are spelled as the byte offsets of
-/// the struct rather than as indices into a `u64` view - an off-by-one word
-/// here is invisible to every caller that only reads `st_mode`, and silently
-/// answers "empty file" to the ones that ask for `st_size`.
-fn write_stat(buf: usize, meta: &Metadata, dev: u64, rdev: Option<(u32, u32)>, stored: u32) -> isize {
-    if !buffer_ok(buf, 144, true, true) {
-        return err::EFAULT;
-    }
-    let nlink: u64 = if meta.kind == NodeKind::Dir { 2 } else { 1 };
-    let size = meta.size;
-    let blocks: u64 = size.div_ceil(512);
-    // The device number a character device node carries, packed the way
-    // `makedev` lays it out: major in the high bytes, minor in the low.
-    let packed_rdev = match rdev {
-        Some((major, minor)) => ((major as u64) << 8) | (minor as u64 & 0xff) | 0,
-        None => 0,
-    };
-
-    unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, 144);
-        let at = |offset: usize| (buf + offset) as *mut u8;
-        // st_dev names the *filesystem*, not the file: two files on one
-        // filesystem share it, and a file on another has its own. That is
-        // exactly the comparison `switch_root` makes before it deletes the
-        // old root, and the one `df` makes to group what it reports.
-        (at(0) as *mut u64).write_volatile(dev);
-        (at(8) as *mut u64).write_volatile(meta.ino); // st_ino
-        (at(16) as *mut u64).write_volatile(nlink); // st_nlink
-        (at(24) as *mut u32).write_volatile(mode_of(meta, stored)); // st_mode
-        // st_uid, st_gid and the pad word stay 0: one user. st_rdev carries
-        // the node's own device number - the identity libc's `ttyname`
-        // matches a descriptor by.
-        (at(40) as *mut u64).write_volatile(packed_rdev); // st_rdev
-        (at(48) as *mut u64).write_volatile(size); // st_size
-        (at(56) as *mut u64).write_volatile(512); // st_blksize
-        (at(64) as *mut u64).write_volatile(blocks); // st_blocks
-        // Timestamps (offsets 72..120) stay 0: no clock is kept per inode.
-    }
-    0
-}
+// The 144-byte `struct stat` writer lives in `abi`: the field offsets are
+// the ABI, and they are pinned there by host tests that read the struct
+// back field by field - an off-by-one word here is invisible to every
+// caller that only reads `st_mode`, and silently answers "empty file" to
+// the ones that ask for `st_size`.
 
 /// Write the 120-byte Linux x86_64 `struct statfs` for the filesystem `name`
-/// spells. Same rule as `write_stat`: the offsets are the ABI, and every
-/// field is a word except the two-`u32` `f_fsid`. The magic is the real one
-/// the filesystem reports on Linux - `switch_root` reads `f_type` to decide
+/// spells. Same rule as `stat`: the offsets are the ABI, and every
+/// field is a word except the two-`u32` `f_fsid`. The magic comes from
+/// `abi::fstype_magic` - `switch_root` reads `f_type` to decide
 /// whether the root it stands in is an initramfs, and answering "ext2" for a
 /// ramfs is what made it refuse to switch.
 ///
 /// The block counts are real for a filesystem that reports them (ext2, from
 /// its superblock and group descriptors) and "memory-sized" for the kernel's
 /// own trees. A filesystem with neither - and one that reports zero total
-/// blocks - is what `df` filters out, exactly as Linux's own does.
+/// blocks - is what `df` filters out, exactly as Linux's own does. The byte
+/// writing itself is `abi::write_statfs`, tested on the host; the PMM fallback
+/// below is the only part that has to stay machine-side.
 fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> isize {
-    if !buffer_ok(buf, 120, true, true) {
-        return err::EFAULT;
-    }
-    // The superblock magics, as Linux defines them. A caller that switches
-    // roots reads exactly this field.
-    let magic: u64 = match name {
-        "ramfs" => 0x858458F6,
-        // tmpfs and the devfs built over it are the same kind of tree here.
-        "tmpfs" | "devfs" | "devtmpfs" => 0x01021994,
-        "proc" => 0x00009FA0,
-        "sysfs" => 0x62656572,
-        "ext2" | "ext3" | "ext4" => 0x0000EF53,
-        _ => 0,
-    };
+    let magic = abi::fstype_magic(name);
     // Memory-backed trees are as big as the frame allocator; a filesystem
     // with its own accounting answers with those numbers instead.
-    let (bsize, blocks, free, files, ffree) = if let Some(s) = stats {
+    let (bsize, blocks, bfree, files, ffree) = if let Some(s) = stats {
         (
             s.bsize,
             s.blocks,
@@ -1765,21 +1639,7 @@ fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> i
             (4096, 0, 0, 0, 0)
         }
     };
-    unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, 120);
-        let at = |offset: usize| (buf + offset) as *mut u8;
-        (at(0) as *mut u64).write_volatile(magic); // f_type
-        (at(8) as *mut u64).write_volatile(bsize); // f_bsize
-        (at(16) as *mut u64).write_volatile(blocks); // f_blocks
-        (at(24) as *mut u64).write_volatile(free); // f_bfree
-        (at(32) as *mut u64).write_volatile(free); // f_bavail
-        (at(40) as *mut u64).write_volatile(files); // f_files
-        (at(48) as *mut u64).write_volatile(ffree); // f_ffree
-        (at(64) as *mut u64).write_volatile(255); // f_namelen
-        // f_fsid (56..64), f_frsize (72), f_flags (80) and the four spares
-        // stay 0: a zero f_frsize reads as "same as f_bsize".
-    }
-    0
+    abi::write_statfs(buf, magic, bsize, blocks, bfree, files, ffree)
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,18 +1746,14 @@ pub(super) fn handle_lseek(args: [usize; ARG_COUNT]) -> isize {
     };
     let cur = file.pos() as i64;
     let size = file.metadata().size as i64;
-    let new_pos = match whence {
-        0 => Some(offset),
-        1 => cur.checked_add(offset),
-        2 => size.checked_add(offset),
-        _ => None,
-    };
-    match new_pos {
-        Some(pos) if pos >= 0 => {
+    // The whence arithmetic and the "before byte 0 is EINVAL" rule are the
+    // man page's contract, spelled in `abi`.
+    match abi::lseek_target(cur, size, offset, whence) {
+        Some(pos) => {
             file.set_pos(pos as u64);
             pos as isize
         }
-        _ => err::EINVAL,
+        None => err::EINVAL,
     }
 }
 
@@ -1923,22 +1779,18 @@ pub(super) fn handle_getdents64(args: [usize; ARG_COUNT], from_user: bool) -> is
 
     // Linux getdents64 format:
     //   u64 d_ino, u64 d_off, u16 d_reclen, u8 d_type, u8 d_name[NUL] (8-aligned).
+    // The `d_reclen` rounding and the `DT_*` numbering are the format's
+    // contract, spelled in `abi` and pinned there by host tests.
     let mut offset = 0usize;
     for (idx, (name, kind)) in entries.iter().enumerate().skip(start) {
-        let reclen = (19 + name.len() + 1 + 7) & !7;
+        let reclen = abi::reclen_of(name.len());
         if offset + reclen > buf_len {
             if offset == 0 {
                 return err::EINVAL;
             }
             break;
         }
-        let d_type = match kind {
-            crate::vfs::NodeKind::File => 8,
-            crate::vfs::NodeKind::Dir => 4,
-            crate::vfs::NodeKind::CharDev => 2,
-            crate::vfs::NodeKind::BlockDev => 6,
-            crate::vfs::NodeKind::Symlink => 10,
-        };
+        let d_type = abi::dt_type_of(*kind);
         unsafe {
             let base = (buf + offset) as *mut u8;
             (base as *mut u64).write_volatile(idx as u64 + 1);
@@ -2085,7 +1937,18 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     match request {
         0x5413 => {
             // TIOCGWINSZ: report 80x25. `isatty` is a call to this on musl,
-            // so it has to work on a tty and fail everywhere else.
+            // so it has to work on a tty and fail everywhere else - and the
+            // "everywhere else" is load-bearing: a program that finds its
+            // stdin a terminal when it is a pipe draws the wrong conclusion
+            // about where its input came from. fish's `source`, piped a
+            // script on stdin, asked exactly that question and gave up.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            if file.inode().as_tty().is_none() {
+                return err::ENOTTY;
+            }
             if buffer_ok(buf, 8, true, from_user) {
                 unsafe {
                     (buf as *mut u16).write_volatile(25);
@@ -2741,12 +2604,12 @@ pub(super) fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         Ok(p) => p,
         Err(e) => return e,
     };
-    let kind = match args[1] as u32 & 0o170000 {
-        0o020000 => NodeKind::CharDev,
-        0o060000 => NodeKind::BlockDev,
-        // A FIFO is a plain file here: the descriptor layer cannot tell.
-        0o010000 => NodeKind::File,
-        _ => return err::EINVAL,
+    // The `S_IFMT` field picks the kind; sockets and modeless modes are
+    // refused, and a FIFO is a plain file here. The mapping is spelled in
+    // `abi`, tested on the host.
+    let kind = match abi::mknod_kind(args[1]) {
+        Ok(kind) => kind,
+        Err(e) => return e,
     };
     let absolute = if path.starts_with('/') {
         crate::vfs::path::normalize(&path)
