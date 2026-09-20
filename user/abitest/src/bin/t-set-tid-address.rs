@@ -1,4 +1,4 @@
-//! t-set_tid_address - one test for set_tid_address, which a musl binary's
+//! t-set-tid-address - one test for set_tid_address, which a musl binary's
 //! strace calls right after arch_prctl: musl's __init_tp registers the main
 //! thread's clear-child-tid slot and uses the return value as the thread
 //! id.
@@ -23,7 +23,7 @@ static mut SLOT: i64 = -1;
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-set_tid_address\n");
+    lin::puts(b"t-set-tid-address\n");
     let mut failed = false;
 
     let tid = lin::set_tid_address(&raw mut SLOT);
@@ -43,5 +43,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-set_tid_address: panicked\n")
+    lin::die(b"t-set-tid-address: panicked\n")
 }

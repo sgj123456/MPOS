@@ -1,4 +1,4 @@
-//! t-copy_file_range - the copy the kernel makes.
+//! t-copy-file-range - the copy the kernel makes.
 //!
 //! Pinned here, per copy_file_range(2): both ends must be regular files
 //! (a pipe is the man page's EINVAL), a non-zero flags word is EINVAL, a
@@ -19,7 +19,7 @@ static DST: [u8; 15] = *b"/tmp/t_cfr_dst\0";
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-copy_file_range\n");
+    lin::puts(b"t-copy-file-range\n");
     let mut failed = false;
 
     let src = lin::openat(lin::AT_FDCWD, &SRC, lin::O_CREAT | lin::O_RDWR | 0o1000, 0o644) as i32;
@@ -111,5 +111,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-copy_file_range: panicked\n")
+    lin::die(b"t-copy-file-range: panicked\n")
 }

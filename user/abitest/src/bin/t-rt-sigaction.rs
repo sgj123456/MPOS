@@ -1,4 +1,4 @@
-//! t-rt_sigaction - one test for rt_sigaction, of which a musl binary's
+//! t-rt-sigaction - one test for rt_sigaction, of which a musl binary's
 //! strace shows four calls on the way up:
 //!
 //! - a query of the untouched SIGSEGV and SIGBUS dispositions
@@ -30,7 +30,7 @@ extern "C" fn segv_handler() {}
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-rt_sigaction\n");
+    lin::puts(b"t-rt-sigaction\n");
     let mut failed = false;
     let restorer_addr = restorer as extern "C" fn() as usize;
     let handler_addr = segv_handler as extern "C" fn() as usize;
@@ -147,5 +147,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-rt_sigaction: panicked\n")
+    lin::die(b"t-rt-sigaction: panicked\n")
 }

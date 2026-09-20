@@ -1,4 +1,4 @@
-//! t-mmap_reserve_commit - a region reserved with `PROT_NONE` and then
+//! t-mmap-reserve-commit - a region reserved with `PROT_NONE` and then
 //! committed with `mprotect` is writable.
 //!
 //! That is the shape every allocator and every thread stack uses: map the
@@ -42,7 +42,7 @@ const BYTE: u8 = 0x5a;
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-mmap_reserve_commit\n");
+    lin::puts(b"t-mmap-reserve-commit\n");
     let mut failed = false;
 
     let reserved = lin::mmap(
@@ -130,5 +130,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-mmap_reserve_commit: panicked\n")
+    lin::die(b"t-mmap-reserve-commit: panicked\n")
 }

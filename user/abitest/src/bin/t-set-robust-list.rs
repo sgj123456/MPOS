@@ -1,4 +1,4 @@
-//! t-set_robust_list - one test for set_robust_list, which glibc calls at
+//! t-set-robust-list - one test for set_robust_list, which glibc calls at
 //! startup (`set_robust_list(0x..., 24) = 0` in the strace) to register
 //! its robust-futex head.
 //!
@@ -18,7 +18,7 @@ static mut HEAD: lin::RobustListHead = lin::RobustListHead { next: 0 };
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-set_robust_list\n");
+    lin::puts(b"t-set-robust-list\n");
     let mut failed = false;
 
     let r = lin::set_robust_list(&raw const HEAD, 24);
@@ -42,5 +42,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-set_robust_list: panicked\n")
+    lin::die(b"t-set-robust-list: panicked\n")
 }

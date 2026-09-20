@@ -1,4 +1,4 @@
-//! t-exit_group - one test for exit_group, how musl terminates: the strace
+//! t-exit-group - one test for exit_group, how musl terminates: the strace
 //! closes with `exit_group(0)`.
 //!
 //! The code a process leaves with cannot be read from inside the dying
@@ -22,7 +22,7 @@ const CODE: i32 = 42;
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-exit_group\n");
+    lin::puts(b"t-exit-group\n");
     let mut failed = false;
 
     let child = lin::fork();
@@ -57,5 +57,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-exit_group: panicked\n")
+    lin::die(b"t-exit-group: panicked\n")
 }

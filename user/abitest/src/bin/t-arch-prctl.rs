@@ -1,4 +1,4 @@
-//! t-arch_prctl - one test for arch_prctl, the TLS setup a musl binary's
+//! t-arch-prctl - one test for arch_prctl, the TLS setup a musl binary's
 //! strace opens with: `arch_prctl(ARCH_SET_FS, 0x...)`.
 //!
 //! musl's __init_tp calls ARCH_SET_FS once at startup to point FS at the
@@ -34,7 +34,7 @@ static mut FS_OUT: u64 = 0xAAAA;
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-arch_prctl\n");
+    lin::puts(b"t-arch-prctl\n");
     let mut failed = false;
 
     // The GET probe: set a base the test chose itself, read it back through
@@ -130,5 +130,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-arch_prctl: panicked\n")
+    lin::die(b"t-arch-prctl: panicked\n")
 }

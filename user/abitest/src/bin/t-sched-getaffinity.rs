@@ -1,4 +1,4 @@
-//! t-sched_getaffinity - one test for sched_getaffinity, which the strace
+//! t-sched-getaffinity - one test for sched_getaffinity, which the strace
 //! shows at startup (`sched_getaffinity(pid, 32, mask) = 8` on the 16-core
 //! host): Rust std's available_parallelism asks through it.
 //!
@@ -28,7 +28,7 @@ static mut MASK: u64 = 0;
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-sched_getaffinity\n");
+    lin::puts(b"t-sched-getaffinity\n");
     let mut failed = false;
 
     let mask = &raw mut MASK;
@@ -70,5 +70,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-sched_getaffinity: panicked\n")
+    lin::die(b"t-sched-getaffinity: panicked\n")
 }

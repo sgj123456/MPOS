@@ -1,4 +1,4 @@
-//! t-fpu_across_switch - the floating-point registers belong to a *task*, not
+//! t-fpu-across-switch - the floating-point registers belong to a *task*, not
 //! to the CPU.
 //!
 //! Nothing in the syscall ABI mentions XMM, so a missing save/restore is
@@ -62,7 +62,7 @@ static mut CORRUPT: u64 = PARENT_BITS;
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-fpu_across_switch\n");
+    lin::puts(b"t-fpu-across-switch\n");
     let mut failed = false;
 
     store_xmm7(PARENT_BITS);
@@ -129,5 +129,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-fpu_across_switch: panicked\n")
+    lin::die(b"t-fpu-across-switch: panicked\n")
 }

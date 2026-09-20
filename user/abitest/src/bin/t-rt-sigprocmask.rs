@@ -1,4 +1,4 @@
-//! t-rt_sigprocmask - one test for rt_sigprocmask, which a musl binary's
+//! t-rt-sigprocmask - one test for rt_sigprocmask, which a musl binary's
 //! strace shows once: Rust std unblocking SIGRT_1 and SIGRT_2 at startup
 //! (`rt_sigprocmask(SIG_UNBLOCK, [RT_1 RT_2], NULL, 8) = 0`).
 //!
@@ -49,7 +49,7 @@ fn rt_sigprocmask_raw(how: usize, set: usize, old: usize, sigsetsize: usize) -> 
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-rt_sigprocmask\n");
+    lin::puts(b"t-rt-sigprocmask\n");
     let mut failed = false;
 
     let set = RT_PAIR;
@@ -137,5 +137,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-rt_sigprocmask: panicked\n")
+    lin::die(b"t-rt-sigprocmask: panicked\n")
 }

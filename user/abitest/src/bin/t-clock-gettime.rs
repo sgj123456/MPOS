@@ -1,4 +1,4 @@
-//! t-clock_gettime - one test for clock_gettime and the time it reports.
+//! t-clock-gettime - one test for clock_gettime and the time it reports.
 //!
 //! The man page pins: the call fills a `struct timespec { tv_sec, tv_nsec }`
 //! with tv_nsec in [0, 1e9), answers 0 for the clock ids a kernel keeps,
@@ -39,7 +39,7 @@ fn clock_gettime_raw(clk_id: usize, tp: usize) -> isize {
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-clock_gettime\n");
+    lin::puts(b"t-clock-gettime\n");
     let mut failed = false;
 
     let mut rt = lin::TimeSpec { tv_sec: -1, tv_nsec: -1 };
@@ -108,5 +108,5 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    lin::die(b"t-clock_gettime: panicked\n")
+    lin::die(b"t-clock-gettime: panicked\n")
 }
