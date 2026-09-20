@@ -1,0 +1,26 @@
+# The ABI conformance tests: `#![no_std]` programs that speak the Linux ABI
+# through `lib/lin.rs`, whose `syscall` stubs take their numbers straight from
+# the kernel's `src/syscall/linux/nr.rs` - kernel and tests cannot disagree
+# about a number without one of them failing to build.
+#
+# They are built for `x86_64-unknown-none` rather than musl on purpose: there
+# is no libc to link, and rust-lld links each binary as a static ET_EXEC at a
+# fixed base (the link args in `build.rs`), exactly the image shape the
+# kernel's ELF loader accepts. The `x86_64-unknown-none` rustflags in the root
+# `.cargo/config.toml` belong to the kernel, so `cargo xtask test` builds this
+# package with `RUSTFLAGS=-C relocation-model=static`, which replaces the
+# root's flags for the invocation instead of merging with them.
+#
+# The verdict protocol every binary follows is lin.rs's: `ok:`/`FAIL:` per
+# check, a final `PASS`/`FAILED` line, exit 0 on pass, 1 on failure, 101 from
+# the panic path. `cargo xtask test` runs each one in the guest and reads the
+# exit status.
+[package]
+name = "mpos-user-abi"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+# The binaries are named `t-<syscall>`, one per syscall family, so the test
+# run's output says which one is missing.
+[lints.cargo]

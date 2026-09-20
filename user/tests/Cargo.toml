@@ -1,0 +1,32 @@
+# The std-side user tests: ordinary Rust binaries that exercise the kernel
+# through `std` and `rustix` - the same surface musl programs speak - for the
+# calls whose behaviour is easiest to pin from a hosted language (sockets,
+# name lookup, spawning). The no-std ABI conformance suite lives beside this
+# crate in `user/abitest`; `cargo xtask test` runs both.
+#
+# These are built for `x86_64-unknown-linux-musl` and statically linked,
+# because this kernel's Linux ABI is written against musl and its loader only
+# accepts the static ET_EXEC shape - see the rustflags in the root
+# `.cargo/config.toml`.
+#
+# `rustix` rather than raw `syscall` instructions is not a style choice. A
+# test written with inline asm can pass against a kernel that is wrong: the
+# arguments are whatever the author wrote down, and the errno is whatever the
+# register happened to hold. `rustix` names the call, checks the shape, and
+# hands back a `Result` whose `Errno` is the one Linux defines - so a test
+# that says "this is EAFNOSUPPORT" is a claim about the ABI, not about the
+# author's memory of it.
+[package]
+name = "mpos-user-tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "all-apis",
+] }
+
+# The binaries are named `t-<syscall>`, one per syscall family, so the test
+# run's output says which one is missing.
+[lints.cargo]
