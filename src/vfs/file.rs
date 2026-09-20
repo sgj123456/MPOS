@@ -438,6 +438,13 @@ pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
         let file = current_table().clone_at(fd as RawFd)?;
         return Ok(current_table().install(file));
     }
+    // A name can also be a door rather than a thing: opening `/dev/ptmx`
+    // mints a new pty pair and hands back that pair's master, and opening a
+    // locked pty's slave refuses. The node itself says which it is.
+    let inode = match inode.open_replacement()? {
+        Some(replacement) => replacement,
+        None => inode,
+    };
     Ok(current_table().install(Arc::new(File::new(inode))))
 }
 

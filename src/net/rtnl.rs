@@ -29,6 +29,22 @@ const RTM_GETROUTE: u16 = 26;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_MULTI: u16 = 2;
 
+/// `NLMSG_ERROR`: the one message that is both an answer and a report. An
+/// `error` field of zero *is* the success report, and that is the only thing
+/// a mutation gets back: `ip addr add` sends its request, waits for exactly
+/// this, and reads anything else as noise. Answering a mutation with
+/// `NLMSG_DONE` instead is what made busybox `ip` print `unexpected reply!`
+/// and then sit in `recv` for ever - an `ip` command that never returns hangs
+/// every script that runs one.
+const NLMSG_ERROR: u16 = 2;
+
+/// "Answer me." A caller that asks for this waits for the report; a caller
+/// that does not is not listening, and an answer nobody reads is a reply the
+/// *next* command will read by mistake. A dump - `NLM_F_REQUEST | NLM_F_DUMP`
+/// on a `GET` - does not ask: its answer is the run of messages itself,
+/// closed by `NLMSG_DONE`, and a report on top of it would be noise.
+const NLM_F_ACK: u16 = 0x04;
+
 /// Attribute types of the route attribute family.
 const IFLA_IFNAME: u16 = 3;
 const IFLA_ADDRESS: u16 = 1;
@@ -147,13 +163,7 @@ pub fn portid(handle: usize) -> Option<u32> {
 /// Whether `handle` names a route session - how the syscall layer tells this
 /// family's descriptors from the network stack's and the uevent socket's.
 pub fn exists(handle: usize) -> bool {
-    critical_section::with(|cs| {
-        TABLE
-            .borrow(cs)
-            .borrow()
-            .iter()
-            .any(|(h, _)| *h == handle)
-    })
+    critical_section::with(|cs| TABLE.borrow(cs).borrow().iter().any(|(h, _)| *h == handle))
 }
 
 /// Whether something is waiting to be read.
@@ -182,6 +192,7 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
         return crate::syscall::err::EINVAL;
     }
     let ty = u16::from_le_bytes([msg[4], msg[5]]);
+    let flags = u16::from_le_bytes([msg[6], msg[7]]);
     let seq = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
     // Linux auto-binds a netlink socket at its first send - musl's
     // getifaddrs never binds at all - so by the time the answers are built
@@ -203,7 +214,8 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
                 .iter_mut()
                 .find(|(h, _)| *h == handle)
                 .expect("send on a route session the table no longer names")
-                .1 .portid = fresh;
+                .1
+                .portid = fresh;
             fresh
         } else {
             table
@@ -240,7 +252,15 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
         RTM_GETADDR => {
             let mut v = Vec::new();
             v.push(addr_msg(seq, portid, 1, 8, [127, 0, 0, 1], "lo", 254));
-            v.push(addr_msg(seq, portid, 2, 24, crate::net::LOCAL_IP, "eth0", 0));
+            v.push(addr_msg(
+                seq,
+                portid,
+                2,
+                24,
+                crate::net::LOCAL_IP,
+                "eth0",
+                0,
+            ));
             v.push(done(seq, portid));
             v
         }
@@ -253,10 +273,25 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
             v.push(done(seq, portid));
             v
         }
-        // Mutations and the query types nobody here can answer: the request
-        // is accepted and nothing comes back but the end marker, which is
-        // what a caller looping on a dump needs to stop.
-        _ => vec![done(seq, portid)],
+        // Mutations and the query types nobody here can answer.
+        //
+        // A mutation is not a dump, so it gets no run of messages and no end
+        // marker - it gets the report a caller that said `NLM_F_ACK` is
+        // waiting for, which is an `NLMSG_ERROR` carrying error 0. Nothing
+        // else satisfies `rtnl_talk`: it reads one message, insists it be
+        // `NLMSG_ERROR`, and loops for another if it is not - so an end
+        // marker here is a hang, not an answer.
+        //
+        // Without `NLM_F_ACK` there is no answer at all, which is what Linux
+        // does: nobody is listening, and a message left in the queue is one
+        // the next caller on this socket will read as its own.
+        _ => {
+            if flags & NLM_F_ACK != 0 {
+                vec![ack(seq, portid, &msg[..16])]
+            } else {
+                Vec::new()
+            }
+        }
     };
     critical_section::with(|cs| {
         if let Some((_, session)) = TABLE
@@ -274,10 +309,7 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
 }
 
 /// Run `f` against `handle`'s session.
-fn with_session<R>(
-    handle: usize,
-    f: impl FnOnce(&mut Session) -> R,
-) -> Option<R> {
+fn with_session<R>(handle: usize, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
     critical_section::with(|cs| {
         TABLE
             .borrow(cs)
@@ -325,6 +357,15 @@ fn name_with_nul(name: &str) -> Vec<u8> {
     s
 }
 
+/// The success report: `NLMSG_ERROR` with an `error` of zero, followed by the
+/// header of the message it answers - which is how the caller pairs the two,
+/// since `nlmsg_seq` alone is shared with every request on the socket.
+fn ack(seq: u32, pid: u32, request: &[u8]) -> Vec<u8> {
+    let mut payload = 0i32.to_le_bytes().to_vec();
+    payload.extend_from_slice(&request[..16.min(request.len())]);
+    nlmsg(NLMSG_ERROR, seq, pid, &payload, false)
+}
+
 /// `RTM_NEWLINK`: an `ifinfomsg` plus the interface's name (and address).
 fn link_msg(
     seq: u32,
@@ -369,7 +410,15 @@ fn route_msg(seq: u32, pid: u32, oif: u32, gateway: [u8; 4]) -> Vec<u8> {
 /// `RTM_NEWADDR`: an `ifaddrmsg` plus the address, stated twice the way
 /// Linux does it - `IFA_ADDRESS` for the prefix, `IFA_LOCAL` for the local
 /// end - and the interface's name.
-fn addr_msg(seq: u32, pid: u32, index: u32, prefix: u8, ip: [u8; 4], name: &str, scope: u8) -> Vec<u8> {
+fn addr_msg(
+    seq: u32,
+    pid: u32,
+    index: u32,
+    prefix: u8,
+    ip: [u8; 4],
+    name: &str,
+    scope: u8,
+) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(2); // ifa_family: AF_INET
     payload.push(prefix);

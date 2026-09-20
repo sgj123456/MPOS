@@ -79,7 +79,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::components;
+    use super::{components, normalize};
     use crate::vfs::VfsError;
 
     fn parts(path: &str) -> Vec<&str> {
@@ -101,6 +101,41 @@ mod tests {
     #[test]
     fn dots_pass_through_for_resolution_to_interpret() {
         assert_eq!(parts("/a/./b/../c"), vec!["a", ".", "b", "..", "c"]);
+    }
+
+    /// `normalize` is not resolution - it never touches a filesystem - but it
+    /// is what `statfs` matches a mountpoint against, so two spellings of one
+    /// path have to come out as one string. `.` is dropped, `..` folds into
+    /// the name before it, and runs of slashes collapse.
+    #[test]
+    fn normalize_drops_dots_and_collapses_repeated_slashes() {
+        assert_eq!(normalize("/a/b"), "/a/b");
+        assert_eq!(normalize("/a//b//c"), "/a/b/c");
+        assert_eq!(normalize("/a/./b"), "/a/b");
+        assert_eq!(normalize("/a/x/../b"), "/a/b");
+        assert_eq!(normalize("/a/b/"), "/a/b");
+        assert_eq!(normalize("//"), "/");
+    }
+
+    /// There is nothing above the root to climb into, and a path that says
+    /// otherwise is the ordinary "too many `..`" a userland tool produces when
+    /// it builds a path by hand rather than by walking.
+    #[test]
+    fn normalize_cannot_climb_above_the_root() {
+        assert_eq!(normalize("/.."), "/");
+        assert_eq!(normalize("/../.."), "/");
+        assert_eq!(normalize("/a/../.."), "/");
+    }
+
+    /// Every caller hands `normalize` an absolute path - a mountpoint is never
+    /// spelled `.` - and a relative one is read as if it hung off the root,
+    /// which is what makes the prefix match below behave. It is a spelling
+    /// rule, not a resolution: a `cwd` is the resolver's business, not this
+    /// function's.
+    #[test]
+    fn normalize_spells_a_relative_path_from_the_root() {
+        assert_eq!(normalize("a/b"), "/a/b");
+        assert_eq!(normalize(""), "/");
     }
 
     #[test]

@@ -283,9 +283,7 @@ impl Inode for MirrorDir {
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
-        (self.resolve)()
-            .ok_or(VfsError::NoEntry)?
-            .lookup(name)
+        (self.resolve)().ok_or(VfsError::NoEntry)?.lookup(name)
     }
 
     fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
@@ -535,18 +533,18 @@ fn stat_line(pid: usize, tid: usize) -> Option<String> {
         // entry in /dev carries would send `ps` looking for a name it cannot
         // find.
         Cow::Borrowed("0"),
-        Cow::Borrowed("-1"),  // tpgid
-        Cow::Borrowed("0"),   // flags
-        Cow::Borrowed("0"),   // minflt
-        Cow::Borrowed("0"),   // cminflt
-        Cow::Borrowed("0"),   // majflt
-        Cow::Borrowed("0"),   // cmajflt
-        Cow::Borrowed("0"),   // utime
-        Cow::Borrowed("0"),   // stime
-        Cow::Borrowed("0"),   // cutime
-        Cow::Borrowed("0"),   // cstime
-        Cow::Borrowed("20"),  // priority
-        Cow::Borrowed("0"),   // nice
+        Cow::Borrowed("-1"), // tpgid
+        Cow::Borrowed("0"),  // flags
+        Cow::Borrowed("0"),  // minflt
+        Cow::Borrowed("0"),  // cminflt
+        Cow::Borrowed("0"),  // majflt
+        Cow::Borrowed("0"),  // cmajflt
+        Cow::Borrowed("0"),  // utime
+        Cow::Borrowed("0"),  // stime
+        Cow::Borrowed("0"),  // cutime
+        Cow::Borrowed("0"),  // cstime
+        Cow::Borrowed("20"), // priority
+        Cow::Borrowed("0"),  // nice
         Cow::Owned(alloc::format!("{}", task.threads)),
         Cow::Borrowed("0"), // itrealvalue
         // starttime: no per-task record of when a process began, so every
@@ -555,34 +553,34 @@ fn stat_line(pid: usize, tid: usize) -> Option<String> {
         Cow::Borrowed("0"),
         Cow::Owned(alloc::format!("{}", kb * 1024)), // vsize
         Cow::Owned(alloc::format!("{}", task.rss_pages)), // rss
-        Cow::Borrowed("0"), // rsslim
-        Cow::Borrowed("0"), // startcode
-        Cow::Borrowed("0"), // endcode
-        Cow::Borrowed("0"), // startstack
-        Cow::Borrowed("0"), // kstkesp
-        Cow::Borrowed("0"), // kstkeip
-        Cow::Borrowed("0"), // signal
-        Cow::Borrowed("0"), // blocked
-        Cow::Borrowed("0"), // sigignore
-        Cow::Borrowed("0"), // sigcatch
-        Cow::Borrowed("0"), // wchan
-        Cow::Borrowed("0"), // nswap
-        Cow::Borrowed("0"), // cnswap
-        Cow::Borrowed("17"), // exit_signal: SIGCHLD
-        Cow::Borrowed("0"), // processor
-        Cow::Borrowed("0"), // rt_priority
-        Cow::Borrowed("0"), // policy
-        Cow::Borrowed("0"), // delayacct_blkio_ticks
-        Cow::Borrowed("0"), // guest_time
-        Cow::Borrowed("0"), // cguest_time
-        Cow::Borrowed("0"), // start_data
-        Cow::Borrowed("0"), // end_data
-        Cow::Borrowed("0"), // start_brk
-        Cow::Borrowed("0"), // arg_start
-        Cow::Borrowed("0"), // arg_end
-        Cow::Borrowed("0"), // env_start
-        Cow::Borrowed("0"), // env_end
-        Cow::Borrowed("0"), // exit_code
+        Cow::Borrowed("0"),                          // rsslim
+        Cow::Borrowed("0"),                          // startcode
+        Cow::Borrowed("0"),                          // endcode
+        Cow::Borrowed("0"),                          // startstack
+        Cow::Borrowed("0"),                          // kstkesp
+        Cow::Borrowed("0"),                          // kstkeip
+        Cow::Borrowed("0"),                          // signal
+        Cow::Borrowed("0"),                          // blocked
+        Cow::Borrowed("0"),                          // sigignore
+        Cow::Borrowed("0"),                          // sigcatch
+        Cow::Borrowed("0"),                          // wchan
+        Cow::Borrowed("0"),                          // nswap
+        Cow::Borrowed("0"),                          // cnswap
+        Cow::Borrowed("17"),                         // exit_signal: SIGCHLD
+        Cow::Borrowed("0"),                          // processor
+        Cow::Borrowed("0"),                          // rt_priority
+        Cow::Borrowed("0"),                          // policy
+        Cow::Borrowed("0"),                          // delayacct_blkio_ticks
+        Cow::Borrowed("0"),                          // guest_time
+        Cow::Borrowed("0"),                          // cguest_time
+        Cow::Borrowed("0"),                          // start_data
+        Cow::Borrowed("0"),                          // end_data
+        Cow::Borrowed("0"),                          // start_brk
+        Cow::Borrowed("0"),                          // arg_start
+        Cow::Borrowed("0"),                          // arg_end
+        Cow::Borrowed("0"),                          // env_start
+        Cow::Borrowed("0"),                          // env_end
+        Cow::Borrowed("0"),                          // exit_code
     ];
     let mut out = String::new();
     for (index, field) in fields.iter().enumerate() {
@@ -605,7 +603,9 @@ fn statm_line(pid: usize) -> Option<String> {
     let task = task(pid)?;
     Some(alloc::format!(
         "{} {} 0 0 0 {} 0\n",
-        task.rss_pages, task.rss_pages, task.rss_pages
+        task.rss_pages,
+        task.rss_pages,
+        task.rss_pages
     ))
 }
 
@@ -724,20 +724,22 @@ fn children_of(pid: usize, tid: usize) -> Option<String> {
 /// belong to the process, not to whichever thread is listed.
 fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     let node = dir();
-    node.add("stat", NodeKind::File, maybe_file(move || stat_line(pid, tid)));
-    node.add("comm", NodeKind::File, maybe_file(move || {
-        Some(alloc::format!("{}\n", task(tid)?.comm))
-    }));
+    node.add(
+        "stat",
+        NodeKind::File,
+        maybe_file(move || stat_line(pid, tid)),
+    );
+    node.add(
+        "comm",
+        NodeKind::File,
+        maybe_file(move || Some(alloc::format!("{}\n", task(tid)?.comm))),
+    );
     node.add(
         "cmdline",
         NodeKind::File,
         maybe_file(move || cmdline_of(tid)),
     );
-    node.add(
-        "status",
-        NodeKind::File,
-        maybe_file(move || status_of(tid)),
-    );
+    node.add("status", NodeKind::File, maybe_file(move || status_of(tid)));
     node.add(
         "children",
         NodeKind::File,
@@ -758,12 +760,22 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     }
     let node = dir();
 
-    node.add("stat", NodeKind::File, maybe_file(move || stat_line(pid, pid)));
+    node.add(
+        "stat",
+        NodeKind::File,
+        maybe_file(move || stat_line(pid, pid)),
+    );
     node.add("statm", NodeKind::File, maybe_file(move || statm_line(pid)));
-    node.add("comm", NodeKind::File, maybe_file(move || {
-        Some(alloc::format!("{}\n", task(pid)?.comm))
-    }));
-    node.add("cmdline", NodeKind::File, maybe_file(move || cmdline_of(pid)));
+    node.add(
+        "comm",
+        NodeKind::File,
+        maybe_file(move || Some(alloc::format!("{}\n", task(pid)?.comm))),
+    );
+    node.add(
+        "cmdline",
+        NodeKind::File,
+        maybe_file(move || cmdline_of(pid)),
+    );
     node.add("status", NodeKind::File, maybe_file(move || status_of(pid)));
     // The image and the working directory, as links: `readlink` is the only
     // way to ask for them, and their targets are facts about a process, not
@@ -773,11 +785,7 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
         NodeKind::Symlink,
         link(move || {
             let exe = task(pid)?.exe;
-            if exe.is_empty() {
-                None
-            } else {
-                Some(exe)
-            }
+            if exe.is_empty() { None } else { Some(exe) }
         }),
     );
     node.add("cwd", NodeKind::Symlink, link(move || Some(task(pid)?.cwd)));
@@ -893,6 +901,48 @@ fn meminfo_kb() -> (u64, u64) {
     (0, 0)
 }
 
+/// One `/proc/partitions` row, in Linux's column widths.
+///
+/// `#blocks` counts 1024-byte blocks - half the 512-byte sectors the block
+/// layer works in - and the columns are fixed-width because the programs that
+/// read this file parse by column.
+fn partition_row(name: &str, major: u32, minor: u32, sectors: u64) -> String {
+    alloc::format!("{major:4} {minor:4} {:10} {name}\n", sectors / 2)
+}
+
+/// `/proc/partitions`: the boot disk and its partitions, one per line.
+///
+/// The names and numbers come from [`crate::uevent::Numbering`] - the same
+/// numbering `/dev` nodes are minted from and `/sys/class/block/*/dev` prints -
+/// so the three cannot name the same partition differently.
+///
+/// Its existence is load-bearing in a way a missing file usually is not.
+/// `fdisk -l` opens it before it does anything else, and an `ENOENT` there
+/// leaves it holding a null `FILE *` that it passes straight to stdio: the
+/// symptom is a page fault inside the libc's stream lock, on an address a few
+/// hundred bytes into the program's own read-only image, which says nothing at
+/// all about the missing file.
+fn partitions() -> String {
+    let mut out = String::from("major minor  #blocks  name\n\n");
+    let Some(raw) = crate::blk::raw_disk() else {
+        return out;
+    };
+    let table = crate::blk::part::partitions(raw.as_ref());
+    for (name, major, minor, whole) in crate::uevent::Numbering::of_boot_disk().devices {
+        let sectors = if whole {
+            raw.capacity_sectors()
+        } else {
+            // Partitions take minors 1.. in table order, so the minor is the
+            // index into the table plus one.
+            table
+                .get((minor as usize).saturating_sub(1))
+                .map_or(0, |(_, sectors)| *sectors)
+        };
+        out.push_str(&partition_row(&name, major, minor, sectors));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // The name of this machine.
 // ---------------------------------------------------------------------------
@@ -928,6 +978,34 @@ pub fn set_hostname(name: &str) {
 
 /// The name before anyone sets one.
 const DEFAULT_HOSTNAME: &str = "mpos";
+
+/// The name this machine's network domain is, set through `setdomainname(2)`.
+/// As with the hostname: one fact, one home, so a call that sets it and a
+/// reader that reports it cannot disagree. The default is `(none)`, which is
+/// what Linux's own `uname` reports for a machine nobody named.
+static DOMAINNAME: Mutex<RefCell<String>> = Mutex::new(RefCell::new(String::new()));
+
+/// The domain this machine belongs to, `(none)` until somebody names it.
+pub fn domainname() -> String {
+    critical_section::with(|cs| {
+        let name = DOMAINNAME.borrow(cs).borrow();
+        if name.is_empty() {
+            String::from(DEFAULT_DOMAINNAME)
+        } else {
+            name.clone()
+        }
+    })
+}
+
+/// Name the domain. `setdomainname(2)` lands here.
+pub fn set_domainname(name: &str) {
+    critical_section::with(|cs| {
+        *DOMAINNAME.borrow(cs).borrow_mut() = String::from(name);
+    });
+}
+
+/// The domain before anyone sets one.
+const DEFAULT_DOMAINNAME: &str = "(none)";
 
 /// The filesystem itself.
 pub struct ProcFs {
@@ -1057,6 +1135,8 @@ impl ProcFs {
                 alloc::format!("0.00 0.00 0.00 1/{} {}\n", process_count(), newest)
             }),
         );
+        self.root
+            .add("partitions", NodeKind::File, file(partitions));
         self.root.add(
             "stat",
             NodeKind::File,
@@ -1074,12 +1154,7 @@ impl ProcFs {
             NodeKind::File,
             file(|| {
                 let mut out = String::from("Character devices:\n");
-                for (name, major) in [
-                    ("mem", 1u32),
-                    ("tty", 4),
-                    ("ttyS", 4),
-                    ("misc", 10),
-                ] {
+                for (name, major) in [("mem", 1u32), ("tty", 4), ("ttyS", 4), ("misc", 10)] {
                     out.push_str(&alloc::format!("{major} {name}\n"));
                 }
                 out.push_str("\nBlock devices:\n");
@@ -1142,7 +1217,11 @@ impl ProcFs {
             NodeKind::File,
             file(|| alloc::format!("{}\n", max_pids())),
         );
-        kernel.add("ngroups_max", NodeKind::File, file(|| String::from("65536\n")));
+        kernel.add(
+            "ngroups_max",
+            NodeKind::File,
+            file(|| String::from("65536\n")),
+        );
         kernel.add("pty", NodeKind::Dir, pty_dir());
         sys.add("kernel", NodeKind::Dir, kernel);
         self.root.add("sys", NodeKind::Dir, sys);
@@ -1183,11 +1262,19 @@ impl ProcFs {
 /// descriptors devpts has handed out.
 fn pty_dir() -> Arc<ProcDir> {
     let pty = dir();
-    pty.add("max", NodeKind::File, file(|| alloc::format!("{}\n", max_pids())));
-    pty.add("nr", NodeKind::File, file(|| {
-        let open = crate::vfs::devpts::open_count();
-        alloc::format!("{open}\n")
-    }));
+    pty.add(
+        "max",
+        NodeKind::File,
+        file(|| alloc::format!("{}\n", max_pids())),
+    );
+    pty.add(
+        "nr",
+        NodeKind::File,
+        file(|| {
+            let open = crate::vfs::devpts::open_count();
+            alloc::format!("{open}\n")
+        }),
+    );
     pty
 }
 
@@ -1233,5 +1320,39 @@ impl FileSystem for ProcFs {
 
     fn name(&self) -> &'static str {
         "proc"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shapes below are copied from what Linux prints, because that is
+    /// the only specification these files have: they are parsed by column
+    /// width, and a program that reads them is not asked to be forgiving.
+    #[test]
+    fn a_partition_row_has_linuxs_column_widths() {
+        // ` 254        0   20971520 vda` - a 20 GiB disk, major 254 minor 0.
+        assert_eq!(
+            partition_row("vda", 254, 0, 20_971_520 * 2),
+            " 254    0   20971520 vda\n"
+        );
+        // ` 254        3     131072 vda3` - a 64 MiB partition.
+        assert_eq!(
+            partition_row("vda3", 254, 3, 131_072 * 2),
+            " 254    3     131072 vda3\n"
+        );
+    }
+
+    /// A machine with no block device still gets the header and its blank
+    /// line: the tools that read this file read the columns after it, not the
+    /// file's emptiness.
+    #[test]
+    fn a_machine_with_no_disk_still_has_the_header() {
+        let text = partitions();
+        assert!(
+            text.starts_with("major minor  #blocks  name\n\n"),
+            "{text:?}"
+        );
     }
 }

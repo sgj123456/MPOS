@@ -14,10 +14,11 @@ use super::abi;
 // The flag words and helpers the handlers below spell by name; the values
 // and their tests live in `abi`.
 use super::abi::{
-    EFD_NONBLOCK, EFD_SEMAPHORE, F_DUPFD, F_GETFD, F_GETFL, F_GETLK, F_SETFD, F_SETFL, F_SETLK,
-    F_SETLKW, FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL,
-    O_TMPFILE, O_TRUNC, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLIN, POLLOUT, POLLNVAL,
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, normalize_path, write_stat,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EFD_NONBLOCK, EFD_SEMAPHORE,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW,
+    FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_TMPFILE, O_TRUNC,
+    POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLIN, POLLNVAL, POLLOUT, normalize_path,
+    write_stat,
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
 use crate::vfs::{Inode, NodeKind};
@@ -490,6 +491,16 @@ pub(super) fn chdir(args: [usize; ARG_COUNT]) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
+    // An empty path names nothing. It has to be refused here, before the
+    // normalization: joining `""` onto the cwd yields the cwd itself, so
+    // `chdir("")` used to *succeed* on the directory it was already in. Linux
+    // answers ENOENT for a path that names no file, and a tracer's startup
+    // probe is written around that - it calls `chdir("")` and expects -ENOENT,
+    // and the `0` this kernel handed back told it that syscall results could
+    // not be trusted here at all.
+    if path.is_empty() {
+        return err::ENOENT;
+    }
     let canonical = normalize_path(&path, &crate::sched::current_cwd_path());
     match crate::vfs::resolve(&canonical) {
         Ok(dir) if dir.metadata().kind == NodeKind::Dir => {
@@ -1072,10 +1083,11 @@ pub(super) fn handle_signalfd(args: [usize; ARG_COUNT], flags: usize, from_user:
         return err::EFAULT;
     }
     let nonblock = flags & SFD_NONBLOCK != 0;
-    let fd = crate::vfs::open_inode(crate::vfs::signalfd::SignalFd::new(next_anon_ino(), nonblock));
-    if nonblock
-        && let Ok(file) = crate::sched::current_fds().clone_at(fd)
-    {
+    let fd = crate::vfs::open_inode(crate::vfs::signalfd::SignalFd::new(
+        next_anon_ino(),
+        nonblock,
+    ));
+    if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
     fd as isize
@@ -1141,6 +1153,27 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
                 Err(e) => err_of(e),
             }
         }
+        // The CLOEXEC-marked twin of `F_DUPFD`: the same copy with the new
+        // descriptor flagged for the exec, which is what a modern libc asks
+        // for by default (`musl` reaches for it on every pipe-protected
+        // spawn). EINVAL for a negative floor, the same rule F_DUPFD has.
+        F_DUPFD_CLOEXEC => {
+            if (arg as isize) < 0 {
+                return err::EINVAL;
+            }
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(file) => file,
+                Err(e) => return err_of(e),
+            };
+            let fds = crate::sched::current_fds();
+            match fds.install_at_least(file, arg as i32) {
+                Ok(new) => {
+                    let _ = fds.fd_flags_set(new, FD_CLOEXEC as u32);
+                    new as isize
+                }
+                Err(e) => err_of(e),
+            }
+        }
         F_GETFD => match crate::sched::current_fds().fd_flags_get(fd) {
             Ok(flags) => flags as isize,
             Err(e) => err_of(e),
@@ -1167,6 +1200,14 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
         F_SETFL => match crate::sched::current_fds().clone_at(fd) {
             Ok(file) => {
                 file.set_status(arg as u32);
+                // The one stored flag with teeth is O_NONBLOCK, and on a pipe
+                // the behaviour lives in the inode: sync the bit, so a
+                // `fcntl(F_SETFL, O_NONBLOCK)` on a plain pipe() reads and
+                // writes exactly as one born through `pipe2(O_NONBLOCK)`
+                // would.
+                if let Some(pipe) = file.inode().as_pipe() {
+                    pipe.set_nonblocking(arg as u32 & crate::vfs::file::O_NONBLOCK != 0);
+                }
                 0
             }
             Err(e) => err_of(e),
@@ -1186,7 +1227,7 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
                 // l_type = F_UNLCK (2), rest zeroed.
                 unsafe {
                     core::ptr::write_bytes(arg as *mut u8, 0, 32);
-                    (arg as *mut u16).write_volatile(2); // F_UNLCK
+                    (arg as *mut u16).write_unaligned(2); // F_UNLCK
                 }
             }
             0
@@ -1250,7 +1291,7 @@ fn ppoll_deadline(tsp: usize, from_user: bool) -> Result<Option<u64>, isize> {
     }
     let (sec, nsec) = unsafe {
         let at = |offset: usize| (tsp + offset) as *const u64;
-        (at(0).read_volatile(), at(8).read_volatile())
+        (at(0).read_unaligned(), at(8).read_unaligned())
     };
     // The `tv_nsec < 1s` check and the round-*up* to milliseconds are the
     // man page's contract, spelled in `abi`: a caller that asked for one
@@ -1290,7 +1331,7 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     let mut nodes: Vec<Option<Arc<dyn Inode>>> = Vec::with_capacity(nfds);
     for index in 0..nfds {
         let at = fds + index * POLLFD_SIZE;
-        let fd = unsafe { (at as *const i32).read_volatile() };
+        let fd = unsafe { (at as *const i32).read_unaligned() };
         let node = crate::sched::current_fds()
             .clone_at(fd)
             .ok()
@@ -1331,7 +1372,7 @@ fn check_ready(fds: usize, nodes: &[Option<Arc<dyn Inode>>]) -> usize {
     let mut count = 0;
     for (index, node) in nodes.iter().enumerate() {
         let at = fds + index * POLLFD_SIZE;
-        let events = unsafe { ((at + POLLFD_EVENTS) as *const i16).read_volatile() };
+        let events = unsafe { ((at + POLLFD_EVENTS) as *const i16).read_unaligned() };
         let revents = match node {
             None => POLLNVAL,
             Some(node) => {
@@ -1346,7 +1387,7 @@ fn check_ready(fds: usize, nodes: &[Option<Arc<dyn Inode>>]) -> usize {
                 bits
             }
         };
-        unsafe { ((at + POLLFD_REVENTS) as *mut i16).write_volatile(revents) };
+        unsafe { ((at + POLLFD_REVENTS) as *mut i16).write_unaligned(revents) };
         if revents != 0 {
             count += 1;
         }
@@ -1442,7 +1483,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
             return false;
         }
         unsafe {
-            let word = ((set + (fd / 64) * 8) as *const u64).read_volatile();
+            let word = ((set + (fd / 64) * 8) as *const u64).read_unaligned();
             word >> (fd % 64) & 1 == 1
         }
     }
@@ -1487,7 +1528,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         // what the milliseconds are for.
         let (sec, frac) = unsafe {
             let at = |offset: usize| (tvp + offset) as *const u64;
-            (at(0).read_volatile(), at(8).read_volatile())
+            (at(0).read_unaligned(), at(8).read_unaligned())
         };
         let ms = match abi::select_timeout_ms(sec, frac, timespec) {
             Ok(ms) => ms,
@@ -1553,7 +1594,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
                 if set != 0 {
                     unsafe {
                         let at = (set + (fd / 64) * 8) as *mut u64;
-                        at.write_volatile(at.read_volatile() | 1u64 << (fd % 64));
+                        at.write_unaligned(at.read_unaligned() | 1u64 << (fd % 64));
                     }
                 }
             };
@@ -1584,8 +1625,8 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         };
         unsafe {
             let at = |offset: usize| (tvp + offset) as *mut u64;
-            at(0).write_volatile(remaining_ms / 1000);
-            at(8).write_volatile(remaining_ms % 1000 * 1000);
+            at(0).write_unaligned(remaining_ms / 1000);
+            at(8).write_unaligned(remaining_ms % 1000 * 1000);
         }
     }
     count
@@ -1615,13 +1656,7 @@ fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> i
     // Memory-backed trees are as big as the frame allocator; a filesystem
     // with its own accounting answers with those numbers instead.
     let (bsize, blocks, bfree, files, ffree) = if let Some(s) = stats {
-        (
-            s.bsize,
-            s.blocks,
-            s.bfree,
-            s.files,
-            s.ffree,
-        )
+        (s.bsize, s.blocks, s.bfree, s.files, s.ffree)
     } else {
         let memory_backed = matches!(name, "ramfs" | "tmpfs" | "devfs" | "devtmpfs");
         if memory_backed {
@@ -1793,13 +1828,13 @@ pub(super) fn handle_getdents64(args: [usize; ARG_COUNT], from_user: bool) -> is
         let d_type = abi::dt_type_of(*kind);
         unsafe {
             let base = (buf + offset) as *mut u8;
-            (base as *mut u64).write_volatile(idx as u64 + 1);
-            ((base.add(8)) as *mut u64).write_volatile((idx + 1) as u64);
-            ((base.add(16)) as *mut u16).write_volatile(reclen as u16);
-            base.add(18).write_volatile(d_type);
+            (base as *mut u64).write_unaligned(idx as u64 + 1);
+            ((base.add(8)) as *mut u64).write_unaligned((idx + 1) as u64);
+            ((base.add(16)) as *mut u16).write_unaligned(reclen as u16);
+            base.add(18).write_unaligned(d_type);
             let name_bytes = name.as_bytes();
             core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), base.add(19), name_bytes.len());
-            base.add(19 + name_bytes.len()).write_volatile(0);
+            base.add(19 + name_bytes.len()).write_unaligned(0);
         }
         offset += reclen;
         file.set_pos((idx + 1) as u64);
@@ -1852,20 +1887,29 @@ pub(super) fn handle_dup3(args: [usize; ARG_COUNT]) -> isize {
 /// `pipe(fds)` — write `[read_end, write_end]` into `fds`.
 pub(super) fn handle_pipe(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const O_CLOEXEC: u32 = 0o200_0000_u32;
-    // `pipe(2)` is `pipe2(2)` with a zero flag word; the only flag that exists
-    // is `O_CLOEXEC`, and it belongs to both ends. A pipe that outlives the
-    // `execve` it was made for never reports end-of-stream to whoever is
-    // reading it - which is exactly how `posix_spawn` learns whether the exec
-    // worked - so the flag has to be recorded, not just accepted.
+    const O_NONBLOCK: u32 = crate::vfs::file::O_NONBLOCK;
+    // `pipe(2)` is `pipe2(2)` with a zero flag word; the two flags that exist
+    // both belong to the ends rather than the numbers. `O_CLOEXEC`, because a
+    // pipe that outlives the `execve` it was made for never reports
+    // end-of-stream to whoever is reading it - which is exactly how
+    // `posix_spawn` learns whether the exec worked. `O_NONBLOCK`, because it
+    // is the birth state a self-pipe wants: a program with an event loop -
+    // sudo's signal channel is the one that was dying here - reads its pipe
+    // only when something was signalled, and a pipe born blocking parks it on
+    // the first empty read instead. Anything else in the word is `EINVAL`,
+    // the answer Linux gives a flag combination it cannot serve.
     let out = args[0];
     let flags = args[1] as u32;
-    if flags & !O_CLOEXEC != 0 {
+    if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
         return err::EINVAL;
     }
     if out == 0 || !buffer_ok(out, 2 * core::mem::size_of::<i32>(), true, from_user) {
         return err::EFAULT;
     }
     let (read_end, write_end) = crate::vfs::pipe::pair();
+    let nonblocking = flags & O_NONBLOCK != 0;
+    read_end.set_nonblocking(nonblocking);
+    write_end.set_nonblocking(nonblocking);
     let fds = [
         crate::vfs::file::open_inode(read_end),
         crate::vfs::file::open_inode(write_end),
@@ -1874,6 +1918,16 @@ pub(super) fn handle_pipe(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         let table = crate::sched::current_fds();
         for fd in fds {
             let _ = table.fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+        }
+    }
+    if nonblocking {
+        // The status word is what `fcntl(F_GETFL)` reads back, and a caller
+        // asking how the pipe will behave has to be told.
+        let table = crate::sched::current_fds();
+        for fd in fds {
+            if let Ok(file) = table.clone_at(fd) {
+                file.set_status(O_NONBLOCK);
+            }
         }
     }
     unsafe {
@@ -1951,10 +2005,10 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             if buffer_ok(buf, 8, true, from_user) {
                 unsafe {
-                    (buf as *mut u16).write_volatile(25);
-                    (buf as *mut u16).add(1).write_volatile(80);
-                    (buf as *mut u16).add(2).write_volatile(0);
-                    (buf as *mut u16).add(3).write_volatile(0);
+                    (buf as *mut u16).write_unaligned(25);
+                    (buf as *mut u16).add(1).write_unaligned(80);
+                    (buf as *mut u16).add(2).write_unaligned(0);
+                    (buf as *mut u16).add(3).write_unaligned(0);
                 }
                 0
             } else {
@@ -1963,16 +2017,26 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         }
         0x540E => {
             // TIOCSCTTY: make the descriptor's tty the controlling terminal.
-            // There is no controlling-terminal bookkeeping here to change -
-            // sessions do not exist yet - so the whole of the call is the tty
-            // check, which is what getty insists on before it prints a
-            // login prompt.
+            // The call binds the terminal to the caller - `/dev/tty` is that
+            // terminal's name for exactly this process from here on - and,
+            // the Linux `__proc_set_tty` behaviour, aims the terminal's
+            // foreground at the caller's process group: the getty that just
+            // became a session leader owns the line before anyone reads or
+            // writes it, which is the state a login shell's job-control probe
+            // expects to find when it asks `tcgetpgrp`.
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
             };
-            if file.inode().as_tty().is_none() {
+            let inode = file.inode();
+            if inode.as_tty().is_none() {
                 return err::ENOTTY;
+            }
+            // The device id is what the binding and every later `/dev/tty`
+            // open resolve through; a tty inode always carries one.
+            match inode.rdev() {
+                Some(dev_id) => crate::sched::acquire_controlling_tty(dev_id),
+                None => return err::ENOTTY,
             }
             0
         }
@@ -2004,18 +2068,48 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 // it is a valid answer rather than an error: a shell is
                 // allowed to find out that nobody owns the terminal yet.
                 let pgid = tty.foreground().unwrap_or(crate::sched::TaskId(0));
-                unsafe { (buf as *mut i32).write_volatile(pgid.0 as i32) };
+                unsafe { (buf as *mut i32).write_unaligned(pgid.0 as i32) };
                 return 0;
             }
 
             if !buffer_ok(buf, 4, false, from_user) {
                 return err::EFAULT;
             }
-            let pgid = unsafe { (buf as *const i32).read_volatile() };
+            let pgid = unsafe { (buf as *const i32).read_unaligned() };
             if pgid <= 0 || pgid as usize >= crate::sched::MAX_TASKS {
                 return err::EINVAL;
             }
             tty.set_foreground(Some(crate::sched::TaskId(pgid as usize)));
+            0
+        }
+        0x80045430 | 0x40045431 => {
+            // TIOCGPTN / TIOCSPTLCK, the pty master's pair. `TIOCGPTN` names
+            // the number the slave will appear under in `/dev/pts` - the
+            // middle step of the `posix_openpt` / `grantpt` / `unlockpt` /
+            // `open` sequence, which has no other way to learn it.
+            // `TIOCSPTLCK` is `grantpt` and `unlockpt` themselves: a zero
+            // unlocks the pair so a slave may be opened, and a locked pair
+            // refuses its slave with `EIO`.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            let inode = file.inode();
+            let Some(pty) = inode.as_pty() else {
+                return err::ENOTTY;
+            };
+            if request == 0x80045430 {
+                if !buffer_ok(buf, 4, true, from_user) {
+                    return err::EFAULT;
+                }
+                unsafe { (buf as *mut u32).write_unaligned(pty.number()) };
+                return 0;
+            }
+            if !buffer_ok(buf, 4, false, from_user) {
+                return err::EFAULT;
+            }
+            let lock = unsafe { (buf as *const i32).read_unaligned() };
+            pty.set_locked(lock != 0);
             0
         }
         0x5401 => {
@@ -2071,21 +2165,21 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     if !buffer_ok(buf, 8, false, from_user) {
                         return err::EFAULT;
                     }
-                    unsafe { (buf as *mut u64).write_volatile(sectors * 512) };
+                    unsafe { (buf as *mut u64).write_unaligned(sectors * 512) };
                 }
                 // BLKGETSIZE: u32, the size in 512-byte sectors.
                 0x1260 => {
                     if !buffer_ok(buf, 4, false, from_user) {
                         return err::EFAULT;
                     }
-                    unsafe { (buf as *mut u32).write_volatile(sectors as u32) };
+                    unsafe { (buf as *mut u32).write_unaligned(sectors as u32) };
                 }
                 // BLKSSZGET: u32, the sector size itself.
                 _ => {
                     if !buffer_ok(buf, 4, false, from_user) {
                         return err::EFAULT;
                     }
-                    unsafe { (buf as *mut u32).write_volatile(512) };
+                    unsafe { (buf as *mut u32).write_unaligned(512) };
                 }
             }
             0
@@ -2101,12 +2195,12 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             unsafe {
                 let at = |offset: usize| (buf + offset) as *mut u8;
                 // ifr_hwaddr: sockaddr with family ARPHRD_ETHER, then the MAC.
-                (at(16) as *mut u16).write_volatile(1);
+                (at(16) as *mut u16).write_unaligned(1);
                 for (i, byte) in [0x52u8, 0x54, 0x00, 0x12, 0x34, 0x56]
                     .into_iter()
                     .enumerate()
                 {
-                    at(18 + i).write_volatile(byte);
+                    at(18 + i).write_unaligned(byte);
                 }
             }
             0
@@ -2649,5 +2743,1175 @@ pub(super) fn handle_fadvise64(args: [usize; ARG_COUNT]) -> isize {
     match crate::sched::current_fds().clone_at(args[0] as i32) {
         Ok(_) => 0,
         Err(e) => err_of(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// epoll: the interest-list multiplexer (epoll_create(2), epoll_ctl(2),
+// epoll_wait(2)). The interest list itself is `vfs::epoll`; this is the
+// argument-shaping half - flag validation in the man page's order, the
+// packed event record, and the three ways a wait can end.
+// ---------------------------------------------------------------------------
+
+/// `EPOLL_CLOEXEC`: the one flag `epoll_create1` takes. Its value is
+/// `O_CLOEXEC` under the other name, as the header spells it.
+const EPOLL_CLOEXEC: usize = 0o200_0000;
+
+/// `epoll_create(size)` — the original spelling, whose size argument has
+/// been ignored since Linux 2.6.8 but must still be positive: the man page
+/// keeps the check even after losing the meaning.
+pub(super) fn handle_epoll_create(args: [usize; ARG_COUNT]) -> isize {
+    if args[0] as i64 <= 0 {
+        return err::EINVAL;
+    }
+    epoll_create(0)
+}
+
+/// `epoll_create1(flags)` — the same instance, the modern flag word.
+pub(super) fn handle_epoll_create1(args: [usize; ARG_COUNT]) -> isize {
+    if args[0] & !EPOLL_CLOEXEC != 0 {
+        return err::EINVAL;
+    }
+    epoll_create(args[0])
+}
+
+/// The shared half of both creations: the instance, and the descriptor
+/// carrying the close-on-exec flag that belongs to the number, not to the
+/// instance.
+fn epoll_create(flags: usize) -> isize {
+    let fd = crate::vfs::open_inode(crate::vfs::epoll::Epoll::new(next_anon_ino()));
+    if flags & EPOLL_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    fd as isize
+}
+
+/// `epoll_ctl(epfd, op, fd, event)` — add, change or drop one entry of the
+/// interest list.
+///
+/// The refusal order is the man page's: an operation outside the three
+/// answers EINVAL before a descriptor is looked at; a number that is not
+/// open answers EBADF; an open number that is not an epoll answers EINVAL
+/// - the line between "the number is bad" and "the thing it names is the
+/// wrong kind".
+pub(super) fn handle_epoll_ctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (epfd, op, fd, event) = (args[0] as i32, args[1], args[2] as i32, args[3]);
+    if !matches!(
+        op,
+        crate::vfs::epoll::EPOLL_CTL_ADD
+            | crate::vfs::epoll::EPOLL_CTL_MOD
+            | crate::vfs::epoll::EPOLL_CTL_DEL
+    ) {
+        return err::EINVAL;
+    }
+    let file = match crate::sched::current_fds().clone_at(epfd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    let Some(instance) = inode.as_epoll() else {
+        return err::EINVAL;
+    };
+    // DEL ignores the event pointer altogether - it may be NULL. ADD and
+    // MOD read it, and the record is packed: the caller's data word sits at
+    // byte 4, not 8, which is the one thing a word-aligned read would get
+    // silently wrong.
+    let (events, data) = if op == crate::vfs::epoll::EPOLL_CTL_DEL {
+        (0, 0)
+    } else {
+        if !buffer_ok(event, crate::vfs::epoll::EPOLL_EVENT_SIZE, false, from_user) {
+            return err::EFAULT;
+        }
+        unsafe {
+            (
+                (event as *const u32).read_unaligned(),
+                ((event + crate::vfs::epoll::EPOLL_EVENT_DATA) as *const u64).read_unaligned(),
+            )
+        }
+    };
+    match instance.ctl(&crate::sched::current_fds(), epfd, op, fd, events, data) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// The wait `epoll_wait`, `epoll_pwait` and `epoll_pwait2` are all made
+/// of: the interest list scanned, the ready entries written out in the
+/// packed twelve-byte record, and the three ways out - events, the clock,
+/// a signal - that `block_until_deadline` already spells. The table is
+/// taken once, before the wait: the condition runs inside the scheduler's
+/// own borrow of it, where taking it again is not a thing.
+fn epoll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>, from_user: bool) -> isize {
+    let (epfd, events, maxevents) = (args[0] as i32, args[1], args[2] as i64);
+    if maxevents <= 0 {
+        return err::EINVAL;
+    }
+    let maxevents = maxevents as usize;
+    let file = match crate::sched::current_fds().clone_at(epfd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    let Some(instance) = inode.as_epoll() else {
+        return err::EINVAL;
+    };
+    let len = match maxevents.checked_mul(crate::vfs::epoll::EPOLL_EVENT_SIZE) {
+        Some(len) => len,
+        None => return err::EINVAL,
+    };
+    if !buffer_ok(events, len, true, from_user) {
+        return err::EFAULT;
+    }
+
+    let fds = crate::sched::current_fds();
+    // The collected reports live in a cell: the wait's condition is called
+    // by the scheduler as an `Fn`, and a cell is how a condition keeps
+    // state without claiming to be anything but a read.
+    let out_cell = core::cell::RefCell::new(alloc::vec::Vec::with_capacity(maxevents));
+    let me = crate::sched::current();
+    instance.subscribe_waits(me);
+    let answer = crate::sched::block_until_deadline(
+        || {
+            let mut out = out_cell.borrow_mut();
+            instance.collect(&fds, &mut out);
+            !out.is_empty()
+        },
+        deadline.unwrap_or(u64::MAX),
+    );
+    instance.unsubscribe_waits(me);
+    let out = out_cell.into_inner();
+
+    match answer {
+        crate::sched::WaitEnd::Interrupted => return err::EINTR,
+        crate::sched::WaitEnd::Deadline => return 0,
+        crate::sched::WaitEnd::Condition => {}
+    }
+    for (index, report) in out.iter().enumerate() {
+        unsafe {
+            let at = events + index * crate::vfs::epoll::EPOLL_EVENT_SIZE;
+            (at as *mut u32).write_unaligned(report.events);
+            ((at + crate::vfs::epoll::EPOLL_EVENT_DATA) as *mut u64).write_unaligned(report.data);
+        }
+    }
+    out.len() as isize
+}
+
+/// `epoll_wait(epfd, events, maxevents, timeout)` — the timeout is a
+/// millisecond count, and the two special values are a signed integer's
+/// ends: -1 waits for ever, 0 answers what is ready right now.
+pub(super) fn handle_epoll_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let timeout = args[3] as i64;
+    let deadline = (timeout >= 0).then(|| deadline_in_ticks(timeout as u64));
+    epoll_wait(args, deadline, from_user)
+}
+
+/// `epoll_pwait(epfd, events, maxevents, timeout, sigmask)` — the wait
+/// with a signal mask swapped in for the duration. This kernel delivers
+/// signals on the way out of a syscall rather than by interrupting one,
+/// so the mask is read for validity and not acted on - the same treatment
+/// `ppoll` gives it, and for the same reason.
+pub(super) fn handle_epoll_pwait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    if args[4] != 0 && !buffer_ok(args[4], 8, false, from_user) {
+        return err::EFAULT;
+    }
+    handle_epoll_wait(args, from_user)
+}
+
+/// `epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)` -
+/// the nanosecond spelling of the pwait pair. The timeout is a
+/// `struct timespec *`, NULL naming the endless wait; the mask size is the
+/// ABI's eight bytes, and anything else is EINVAL before a thing is read.
+pub(super) fn handle_epoll_pwait2(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    if args[4] != 0 {
+        if args[5] != 8 {
+            return err::EINVAL;
+        }
+        if !buffer_ok(args[4], 8, false, from_user) {
+            return err::EFAULT;
+        }
+    }
+    let deadline = match ppoll_deadline(args[3], from_user) {
+        Ok(deadline) => deadline,
+        Err(e) => return e,
+    };
+    epoll_wait(args, deadline, from_user)
+}
+
+// ---------------------------------------------------------------------------
+// timerfd: the timer that reports through a descriptor (timerfd_create(2)).
+// The state machine is `vfs::timerfd`; this is the argument-shaping half,
+// including the timespec arithmetic the tick clock measures in.
+// ---------------------------------------------------------------------------
+
+/// `timerfd_create(clockid, flags)`.
+pub(super) fn handle_timerfd_create(args: [usize; ARG_COUNT]) -> isize {
+    let (clockid, flags) = (args[0], args[1]);
+    if !crate::vfs::timerfd::clock_ok(clockid) {
+        return err::EINVAL;
+    }
+    if flags & !(crate::vfs::timerfd::TFD_CLOEXEC | crate::vfs::timerfd::TFD_NONBLOCK) != 0 {
+        return err::EINVAL;
+    }
+    let fd = crate::vfs::open_inode(crate::vfs::timerfd::TimerFd::new(
+        next_anon_ino(),
+        clockid,
+        flags & crate::vfs::timerfd::TFD_NONBLOCK != 0,
+    ));
+    if flags & crate::vfs::timerfd::TFD_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    if flags & crate::vfs::timerfd::TFD_NONBLOCK != 0
+        && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+    {
+        // The status word is set as well, so a `fcntl(F_GETFL)` caller
+        // reads back the nonblocking it asked for - the same bookkeeping
+        // `signalfd4` keeps.
+        file.set_status(crate::vfs::file::O_NONBLOCK);
+    }
+    fd as isize
+}
+
+/// `timerfd_settime(fd, flags, new_value, old_value)` — arm, re-arm or
+/// disarm the timer.
+///
+/// The flag vocabulary is small and its one rule is strict: the
+/// cancel-on-set flag is only a word beside an absolute arm of the wall
+/// clock, because only that arm can be invalidated by somebody setting the
+/// clock underneath it.
+pub(super) fn handle_timerfd_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, flags, new_value, old_value) = (args[0] as i32, args[1], args[2], args[3]);
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    let Some(timer) = inode.as_timerfd() else {
+        return err::EINVAL;
+    };
+    if flags
+        & !(crate::vfs::timerfd::TFD_TIMER_ABSTIME | crate::vfs::timerfd::TFD_TIMER_CANCEL_ON_SET)
+        != 0
+    {
+        return err::EINVAL;
+    }
+    let cancel_on_set = flags & crate::vfs::timerfd::TFD_TIMER_CANCEL_ON_SET != 0;
+    let on_wall_clock = matches!(
+        timer.clockid(),
+        crate::vfs::timerfd::CLOCK_REALTIME | crate::vfs::timerfd::CLOCK_REALTIME_ALARM
+    );
+    if cancel_on_set && (flags & crate::vfs::timerfd::TFD_TIMER_ABSTIME == 0 || !on_wall_clock) {
+        return err::EINVAL;
+    }
+    if new_value == 0
+        || !buffer_ok(
+            new_value,
+            crate::vfs::timerfd::ITIMERSPEC_SIZE,
+            false,
+            from_user,
+        )
+    {
+        return err::EFAULT;
+    }
+    // `struct itimerspec`: the interval first, the initial value second -
+    // the reverse of `struct itimerval`, which is the thing a guess here
+    // would hand back wrong. Each half is a `struct timespec`, seconds
+    // then nanoseconds.
+    let (interval, initial) = unsafe {
+        let word = |offset: usize| (new_value + offset) as *const u64;
+        (
+            (word(0).read_unaligned(), word(8).read_unaligned()),
+            (
+                word(crate::vfs::timerfd::ITIMERSPEC_VALUE).read_unaligned(),
+                word(crate::vfs::timerfd::ITIMERSPEC_VALUE + 8).read_unaligned(),
+            ),
+        )
+    };
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    let interval_ticks = match crate::vfs::timerfd::ticks_of_timespec(interval.0, interval.1, hz) {
+        Ok(ticks) => ticks,
+        Err(e) => return e,
+    };
+    let now = crate::arch::timer::ticks();
+    let deadline = if initial.0 == 0 && initial.1 == 0 {
+        // The man page's disarm: a zero `it_value` is the whole spelling.
+        None
+    } else {
+        // The value as this clock reads it, in ticks. A relative arm
+        // counts from now; an absolute one names a point the clock has
+        // either reached (the deadline is due) or has not.
+        let at = match crate::vfs::timerfd::ticks_of_timespec(initial.0, initial.1, hz) {
+            Ok(ticks) => ticks,
+            Err(e) => return e,
+        };
+        if flags & crate::vfs::timerfd::TFD_TIMER_ABSTIME == 0 {
+            Some(now.saturating_add(at))
+        } else if on_wall_clock {
+            // The wall clock is the RTC's boot anchor plus the tick
+            // count, so a point named on it is that many ticks past the
+            // anchor - and one already past is a deadline of zero, which
+            // the state machine counts the next time it looks.
+            Some(at.saturating_sub(crate::arch::rtc::boot_epoch().saturating_mul(hz)))
+        } else {
+            // The monotonic clock *is* the tick count: an absolute point
+            // on it is already the number this state machine keeps.
+            Some(at)
+        }
+    };
+    let old = timer.set(now, deadline, interval_ticks, cancel_on_set);
+    if old_value != 0 {
+        write_itimerspec(old_value, old, from_user);
+    }
+    0
+}
+
+/// `timerfd_gettime(fd, curr_value)` — what is left of the current span
+/// and the interval between spans. A disarmed timer reports zeros for both.
+pub(super) fn handle_timerfd_gettime(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (fd, curr) = (args[0] as i32, args[1]);
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    let Some(timer) = inode.as_timerfd() else {
+        return err::EINVAL;
+    };
+    if !buffer_ok(curr, crate::vfs::timerfd::ITIMERSPEC_SIZE, true, from_user) {
+        return err::EFAULT;
+    }
+    write_itimerspec(curr, timer.snapshot(crate::arch::timer::ticks()), from_user);
+    0
+}
+
+/// Write the `struct itimerspec` a timer reports: interval first, then the
+/// time left, each a `struct timespec` in the tick clock's own resolution.
+/// `None` is the disarmed spelling, zeros throughout.
+fn write_itimerspec(buf: usize, snapshot: Option<(u64, u64)>, from_user: bool) {
+    if !buffer_ok(buf, crate::vfs::timerfd::ITIMERSPEC_SIZE, true, from_user) {
+        return;
+    }
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    let (remaining, interval) = snapshot.unwrap_or((0, 0));
+    let (rsec, rnsec) = crate::vfs::timerfd::timespec_of_ticks(remaining, hz);
+    let (isec, insec) = crate::vfs::timerfd::timespec_of_ticks(interval, hz);
+    unsafe {
+        let word = |offset: usize| (buf + offset) as *mut u64;
+        word(0).write_unaligned(isec);
+        word(8).write_unaligned(insec);
+        word(crate::vfs::timerfd::ITIMERSPEC_VALUE).write_unaligned(rsec);
+        word(crate::vfs::timerfd::ITIMERSPEC_VALUE + 8).write_unaligned(rnsec);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fallocate(2): arrange a file's storage before writing it
+// ---------------------------------------------------------------------------
+
+/// `fallocate(fd, mode, offset, len)` — lay out the storage of a byte
+/// range ahead of the writes that fill it.
+///
+/// The default operation is real here: extending the file to the range's
+/// end is what "the space is allocated" means on this kernel, and the
+/// zero-filled extension `truncate(2)` gives is the contract the man page
+/// spells — the size grows, and the new range reads as zeros.
+/// `FALLOC_FL_KEEP_SIZE` is accepted and remembered nowhere: the write
+/// that later fills the range allocates as it goes, so the promise the
+/// flag makes — that writes into the range succeed — holds without it.
+/// The operations that reshape or free an *interior* range are refused
+/// with the errno Linux gives for a filesystem without the feature,
+/// which is the honest answer from one that cannot undo a byte in place.
+pub(super) fn handle_fallocate(args: [usize; ARG_COUNT]) -> isize {
+    const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+    const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
+    const FALLOC_FL_NO_HIDE_STALE: usize = 0x04;
+    const FALLOC_FL_COLLAPSE_RANGE: usize = 0x08;
+    const FALLOC_FL_ZERO_RANGE: usize = 0x10;
+    const FALLOC_FL_INSERT_RANGE: usize = 0x20;
+    const FALLOC_FL_UNSHARE_RANGE: usize = 0x40;
+    const FALLOC_FL_WRITE_ZEROES: usize = 0x80;
+    const RESHAPERS: usize = FALLOC_FL_PUNCH_HOLE
+        | FALLOC_FL_COLLAPSE_RANGE
+        | FALLOC_FL_ZERO_RANGE
+        | FALLOC_FL_INSERT_RANGE
+        | FALLOC_FL_WRITE_ZEROES;
+
+    let (fd, mode, offset, len) = (args[0] as i32, args[1], args[2] as i64, args[3] as i64);
+    if offset < 0 || len <= 0 {
+        return err::EINVAL;
+    }
+    if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_NO_HIDE_STALE | FALLOC_FL_UNSHARE_RANGE | RESHAPERS)
+        != 0
+    {
+        // Bits outside the operation vocabulary: EOPNOTSUPP, the way Linux
+        // answers a mode word from a kernel newer than it.
+        return err::EOPNOTSUPP;
+    }
+    if mode & RESHAPERS != 0 {
+        // A punch without KEEP_SIZE beside it is EINVAL before the
+        // refusal for the operation itself - the man page's own pair of
+        // sentences, in its own order.
+        if mode & FALLOC_FL_PUNCH_HOLE != 0 && mode & FALLOC_FL_KEEP_SIZE == 0 {
+            return err::EINVAL;
+        }
+        return err::EOPNOTSUPP;
+    }
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    match file.metadata().kind {
+        // A pipe's metadata answers `File` - the vocabulary's only word for
+        // an unnamed channel - but it has no byte range to lay out, so it
+        // lands in the ENODEV arm with the other non-files.
+        NodeKind::File if file.inode().as_pipe().is_none() => {}
+        NodeKind::Dir => return err::EISDIR,
+        // A pipe, a terminal, a socket: no byte range to lay out. The
+        // man page's ENODEV line about descriptors that are neither
+        // files nor directories lands here.
+        _ => return err::ENODEV,
+    }
+    // A range past the end of what an offset can name is EFBIG, the
+    // "beyond the maximum file size" of the error list, rather than a
+    // wrap into a small file.
+    let end = match offset.checked_add(len) {
+        Some(end) => end,
+        None => return err::EFBIG,
+    };
+    if mode & FALLOC_FL_KEEP_SIZE == 0 && end as u64 > file.metadata().size {
+        return match file.inode().truncate(end as u64) {
+            Ok(()) => 0,
+            Err(e) => err_of(e),
+        };
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// copy_file_range(2): the kernel-made copy
+// ---------------------------------------------------------------------------
+
+/// `copy_file_range(in, off_in, out, off_out, len, flags)` — copy between
+/// two files without the caller's buffers in the middle.
+///
+/// Both descriptors must name regular files, the one EINVAL the man page
+/// is explicit about; a copy across a mount is EXDEV, the same refusal
+/// `link(2)` gives a cross-filesystem name, because it is the same rule -
+/// a byte range belongs to the storage that serves it. The offsets are
+/// in-out `loff_t *`s; a NULL one means the descriptor's own cursor, and
+/// that cursor is what the copy moves.
+pub(super) fn handle_copy_file_range(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (in_fd, off_in, out_fd, off_out, len, flags) = (
+        args[0] as i32,
+        args[1],
+        args[2] as i32,
+        args[3],
+        args[4],
+        args[5],
+    );
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let fds = crate::sched::current_fds();
+    let input = match fds.clone_at(in_fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let output = match fds.clone_at(out_fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    for file in [&input, &output] {
+        // A pipe is an anonymous channel, not a file: its read has no
+        // position, and a read that would block must not be mistaken for
+        // seekable storage. `copy_file_range` refuses it with EINVAL - and
+        // the kind check alone cannot do that, because a pipe's metadata
+        // answers `File`, the filesystem's only word for an unnamed channel.
+        if file.inode().as_pipe().is_some() || file.metadata().kind != NodeKind::File {
+            return err::EINVAL;
+        }
+    }
+    // The positions: a caller's word when there is one, the descriptor's
+    // own cursor when there is not. A negative word is not a position.
+    let in_start = match splice_position(&input, off_in, from_user) {
+        Ok(pos) => pos,
+        Err(e) => return e,
+    };
+    let out_start = match splice_position(&output, off_out, from_user) {
+        Ok(pos) => pos,
+        Err(e) => return e,
+    };
+    // The man page's overlap refusal: one file, ranges that collide - the
+    // one way a copy could corrupt what it is copying.
+    if alloc::sync::Arc::ptr_eq(&input.inode(), &output.inode()) {
+        let (a, b) = (in_start, in_start.saturating_add(len as u64));
+        let (c, d) = (out_start, out_start.saturating_add(len as u64));
+        if a < d && c < b {
+            return err::EINVAL;
+        }
+    }
+    // EXDEV across mounts, decided the way `st_dev` decides it: the
+    // deepest mountpoint over each descriptor's label, and the labels
+    // both descriptors were opened by.
+    let (in_dev, _) = crate::vfs::mount::fs_of_path(
+        &input
+            .label()
+            .unwrap_or_else(|| alloc::string::String::from("/")),
+    );
+    let (out_dev, _) = crate::vfs::mount::fs_of_path(
+        &output
+            .label()
+            .unwrap_or_else(|| alloc::string::String::from("/")),
+    );
+    if in_dev != out_dev {
+        return err::EXDEV;
+    }
+
+    let mut pos_in = in_start;
+    let mut pos_out = out_start;
+    let mut chunk = [0u8; 4096];
+    let mut copied = 0usize;
+    while copied < len {
+        let want = (len - copied).min(chunk.len());
+        let n = match input.inode().read_at(pos_in, &mut chunk[..want]) {
+            Ok(n) => n,
+            Err(e) => {
+                if copied > 0 {
+                    break;
+                }
+                return err_of(e);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let w = match output.inode().write_at(pos_out, &chunk[..n]) {
+            Ok(w) => w,
+            Err(e) => {
+                if copied > 0 {
+                    break;
+                }
+                return err_of(e);
+            }
+        };
+        if w == 0 {
+            break;
+        }
+        pos_in += w as u64;
+        pos_out += w as u64;
+        copied += w;
+    }
+    // Each side's position goes home: through the caller's word when it
+    // named one, into the descriptor's cursor when it did not.
+    splice_finish(&input, off_in, pos_in, from_user);
+    splice_finish(&output, off_out, pos_out, from_user);
+    copied as isize
+}
+
+/// Where one side of a kernel copy starts: the caller's `loff_t` when
+/// there is one, the descriptor's own cursor when there is not.
+fn splice_position(
+    file: &Arc<crate::vfs::File>,
+    off: usize,
+    from_user: bool,
+) -> Result<u64, isize> {
+    if off != 0 {
+        if !buffer_ok(off, 8, false, from_user) {
+            return Err(err::EFAULT);
+        }
+        let at = unsafe { (off as *const u64).read_unaligned() } as i64;
+        if at < 0 {
+            return Err(err::EINVAL);
+        }
+        Ok(at as u64)
+    } else {
+        Ok(file.pos())
+    }
+}
+
+/// The tail of one side of a kernel copy: the new position written back
+/// through the caller's word, or into the descriptor's cursor when the
+/// position was the descriptor's own.
+fn splice_finish(file: &Arc<crate::vfs::File>, off: usize, pos: u64, from_user: bool) {
+    if off != 0 {
+        if buffer_ok(off, 8, true, from_user) {
+            unsafe { (off as *mut u64).write_unaligned(pos) };
+        }
+    } else {
+        file.set_pos(pos);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// preadv2(2) / pwritev2(2): the vectored pair with the RWF_* advice words
+// ---------------------------------------------------------------------------
+
+/// `preadv2(fd, iov, iovcnt, offset, flags)` — the vectored read at a
+/// position, with the advice word. `pwritev2` is the same with the write's
+/// verb.
+///
+/// The advice bits this kernel cannot act on are accepted — its writes
+/// already reach storage, and its reads never wait for a device — and the
+/// one bit it cannot honour at all, `RWF_ATOMIC`, is refused the way Linux
+/// refuses it from a filesystem without atomic-write support. A flag
+/// outside the vocabulary is EOPNOTSUPP, the man page's own spelling.
+/// `offset` of -1 is the position-carrying form: the descriptor's own
+/// cursor, moved by the call, exactly as the un-at `readv`/`writev` move
+/// it. `RWF_APPEND` is a per-write O_APPEND: the end of the file,
+/// wherever the offset named.
+pub(super) fn handle_preadv2(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    vectored_at_position(args, from_user, false)
+}
+
+/// `pwritev2(fd, iov, iovcnt, offset, flags)` — see [`handle_preadv2`].
+pub(super) fn handle_pwritev2(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    vectored_at_position(args, from_user, true)
+}
+
+fn vectored_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool) -> isize {
+    const RWF_HIPRI: usize = 0x1;
+    const RWF_DSYNC: usize = 0x2;
+    const RWF_SYNC: usize = 0x4;
+    const RWF_NOWAIT: usize = 0x8;
+    const RWF_APPEND: usize = 0x10;
+    const RWF_NOAPPEND: usize = 0x20;
+    const RWF_ATOMIC: usize = 0x40;
+    const RWF_DONTCACHE: usize = 0x80;
+    const KNOWN: usize = RWF_HIPRI
+        | RWF_DSYNC
+        | RWF_SYNC
+        | RWF_NOWAIT
+        | RWF_APPEND
+        | RWF_NOAPPEND
+        | RWF_ATOMIC
+        | RWF_DONTCACHE;
+
+    let (fd, offset, flags) = (args[0] as i32, args[3] as i64, args[4]);
+    if flags & !KNOWN != 0 || flags & RWF_ATOMIC != 0 {
+        // Unknown advice is the man page's EOPNOTSUPP; ATOMIC is known but
+        // asks for a torn-write guarantee no storage here can make.
+        return err::EOPNOTSUPP;
+    }
+    if !crate::sched::current_fds().clone_at(fd).is_ok() {
+        return err::EBADF;
+    }
+    if writing && flags & RWF_APPEND != 0 {
+        // The append the flag spells: the end of the file is the position,
+        // whatever the offset argument said.
+        let size = crate::sched::current_fds()
+            .clone_at(fd)
+            .map(|file| file.metadata().size as i64)
+            .unwrap_or(0);
+        return at_position(fd, size, || handle_writev(args, from_user));
+    }
+    if offset == -1 {
+        // The cursor-carrying spelling: no position discipline at all, the
+        // plain `readv`/`writev` behaviour.
+        return if writing {
+            handle_writev(args, from_user)
+        } else {
+            handle_readv(args, from_user)
+        };
+    }
+    io_at_position(
+        [args[0], args[1], args[2], offset as usize, 0, 0],
+        from_user,
+        writing,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// openat2(2), faccessat2(2): the extensible forms
+// ---------------------------------------------------------------------------
+
+/// `openat2(dirfd, path, how, size)` — `openat` with the extensible
+/// argument struct.
+///
+/// The struct is three words — flags, mode, resolve — and the size word
+/// is how a kernel and a caller from different eras agree on which fields
+/// exist: smaller than any known version is EINVAL, larger is E2BIG, the
+/// man page's own split between "your struct is too old to be real" and
+/// "your struct has fields this kernel has never heard of". The resolve
+/// flags this kernel's resolver cannot keep are refused EOPNOTSUPP —
+/// they are promises about the *walk*, and a walk that cannot keep one
+/// says so rather than pretending. `RESOLVE_CACHED` is accepted: nothing
+/// here caches, which makes every walk a cached one.
+pub(super) fn handle_openat2(
+    args: [usize; ARG_COUNT],
+    cwd: &Arc<dyn Inode>,
+    from_user: bool,
+) -> isize {
+    const OPEN_HOW_SIZE: usize = 24;
+    const RESOLVE_NO_XDEV: usize = 0x01;
+    const RESOLVE_NO_MAGICLINKS: usize = 0x02;
+    const RESOLVE_NO_SYMLINKS: usize = 0x04;
+    const RESOLVE_BENEATH: usize = 0x08;
+    const RESOLVE_IN_ROOT: usize = 0x10;
+    const RESOLVE_CACHED: usize = 0x20;
+
+    let (dirfd, path_ptr, how, size) = (args[0] as i32, args[1], args[2], args[3]);
+    if size < OPEN_HOW_SIZE {
+        return err::EINVAL;
+    }
+    if size > OPEN_HOW_SIZE {
+        return err::E2BIG;
+    }
+    if !buffer_ok(how, OPEN_HOW_SIZE, false, from_user) {
+        return err::EFAULT;
+    }
+    // The three words are `__u64`s in the struct; the flag vocabulary
+    // below them is the `usize` every other open call here speaks.
+    let (flags, mode, resolve) = unsafe {
+        (
+            (how as *const u64).read_unaligned() as usize,
+            ((how + 8) as *const u64).read_unaligned() as usize,
+            ((how + 16) as *const u64).read_unaligned() as usize,
+        )
+    };
+    if resolve
+        & !(RESOLVE_NO_XDEV
+            | RESOLVE_NO_MAGICLINKS
+            | RESOLVE_NO_SYMLINKS
+            | RESOLVE_BENEATH
+            | RESOLVE_IN_ROOT
+            | RESOLVE_CACHED)
+        != 0
+    {
+        return err::EINVAL;
+    }
+    if resolve & !RESOLVE_CACHED != 0 {
+        return err::EOPNOTSUPP;
+    }
+    // The mode is a create's business alone, the man page's own EINVAL.
+    if mode != 0 && flags & (abi::O_CREAT | abi::O_TMPFILE) == 0 {
+        return err::EINVAL;
+    }
+    let base = match base_of(dirfd, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let path = match cstr_arg(path_ptr, true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    open_linux(&path, flags, base)
+}
+
+/// `faccessat2(dirfd, path, mode, flags)` — the access check with the
+/// flags the original could not take.
+///
+/// `AT_EACCESS` is accepted and indistinguishable: the real and effective
+/// IDs are one ID here, so the two questions the flag distinguishes have
+/// one answer. `AT_SYMLINK_NOFOLLOW` names the link itself and is honoured
+/// the way `lstat`'s is. The mode is validated the way `access(2)` validates
+/// it — anything outside F_OK/R_OK/W_OK/X_OK is EINVAL — and `X_OK`
+/// answers from the mode bits the filesystem stores, the only bits this
+/// kernel keeps: a directory traverses, a script with its bit clear does
+/// not, which is the question a shell's `test -x` is asking.
+pub(super) fn handle_faccessat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    const AT_EACCESS: usize = 0x200;
+    const R_OK: usize = 4;
+    const W_OK: usize = 2;
+    const X_OK: usize = 1;
+
+    let (dirfd, path_ptr, mode, flags) = (args[0] as i32, args[1], args[2], args[3]);
+    if mode & !(R_OK | W_OK | X_OK) != 0 {
+        return err::EINVAL;
+    }
+    if flags & !(abi::AT_SYMLINK_NOFOLLOW | AT_EACCESS) != 0 {
+        return err::EINVAL;
+    }
+    let base = match base_of(dirfd, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let path = match cstr_arg(path_ptr, true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let found = if flags & abi::AT_SYMLINK_NOFOLLOW != 0 {
+        crate::vfs::global().resolve_no_follow(&path, base)
+    } else {
+        crate::vfs::resolve_opt(&path, Some(base))
+    };
+    match found {
+        Ok(inode) => {
+            if mode & X_OK != 0 {
+                // Root's X_OK is "any execute bit, anywhere in the mode" -
+                // the stored bits when the filesystem keeps them, and the
+                // kind's defaults when it does not.
+                let full = abi::mode_of(&inode.metadata(), inode.mode());
+                if full & 0o111 == 0 {
+                    return err::EACCES;
+                }
+            }
+            // R_OK and W_OK: one user, and it is root. The read and write
+            // checks this kernel can actually make are about existence and
+            // writability of the storage, which `open` itself answers.
+            0
+        }
+        Err(e) => err_of(e),
+    }
+}
+
+/// `fchmodat(dirfd, path, mode, flags)` — the permission bits, relative to
+/// a dirfd.
+///
+/// The bit this call adds to `chmod`'s vocabulary is `AT_SYMLINK_NOFOLLOW`,
+/// and Linux cannot honour it either: the syscall follows the link, and
+/// glibc answers EOPNOTSUPP for a caller that asks. This keeps that same
+/// split — follow the link, and refuse the flag rather than silently
+/// ignoring it.
+pub(super) fn handle_fchmodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    if args[3] & !abi::AT_SYMLINK_NOFOLLOW != 0 {
+        return err::EINVAL;
+    }
+    if args[3] & abi::AT_SYMLINK_NOFOLLOW != 0 {
+        return err::EOPNOTSUPP;
+    }
+    let base = match base_of(args[0] as i32, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    match crate::vfs::resolve_opt(&path, Some(base)) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The *at relatives and the legacy spellings this table has numbers for
+// ---------------------------------------------------------------------------
+
+/// `mknodat(dirfd, path, mode, dev)` — create a node, relative to a
+/// dirfd. `mknod` is this at the caller's cwd.
+pub(super) fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let base = match base_of(args[0] as i32, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let kind = match abi::mknod_kind(args[2]) {
+        Ok(kind) => kind,
+        Err(e) => return e,
+    };
+    let (parent, name) = match crate::vfs::split_parent(&path) {
+        Ok(split) => split,
+        Err(e) => return err_of(e),
+    };
+    let parent = match crate::vfs::resolve_opt(parent, Some(base)) {
+        Ok(dir) => dir,
+        Err(e) => return err_of(e),
+    };
+    // A name this kernel already serves needs no creating — the caller
+    // wanted the node, not the call.
+    if crate::vfs::global()
+        .resolve_no_follow(name, parent.clone())
+        .is_ok()
+    {
+        return 0;
+    }
+    match parent.create(name, kind) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `futimesat(dirfd, path, tv)` — the timestamps call with the dirfd the
+/// future took.
+///
+/// A NULL `path` names the descriptor itself — the `futimens` shape — and
+/// requires a real one, not `AT_FDCWD`. Timestamps are not kept, so the
+/// answer is the resolution's; the `timeval`s are still validated,
+/// because a caller that names a usec past a second has made a request
+/// nobody would recognise as the one it meant.
+pub(super) fn handle_futimesat(
+    args: [usize; ARG_COUNT],
+    cwd: &Arc<dyn Inode>,
+    from_user: bool,
+) -> isize {
+    let (dirfd, path_ptr, tvp) = (args[0] as i32, args[1], args[2]);
+    if path_ptr == 0 {
+        if dirfd == abi::AT_FDCWD {
+            return err::EINVAL;
+        }
+        return match crate::sched::current_fds().clone_at(dirfd) {
+            Ok(_) => 0,
+            Err(e) => err_of(e),
+        };
+    }
+    if tvp != 0 {
+        if !buffer_ok(tvp, 32, false, from_user) {
+            return err::EFAULT;
+        }
+        let (a_usec, m_usec) = unsafe {
+            (
+                ((tvp + 8) as *const u64).read_unaligned(),
+                ((tvp + 24) as *const u64).read_unaligned(),
+            )
+        };
+        if a_usec >= 1_000_000 || m_usec >= 1_000_000 {
+            return err::EINVAL;
+        }
+    }
+    let base = match base_of(dirfd, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    let path = match cstr_arg(path_ptr, true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    match crate::vfs::resolve_opt(&path, Some(base)) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `creat(path, mode)` — open, spelled the way the 1970s spelled it:
+/// create-or-truncate, for writing. The mode is advisory exactly as
+/// `open`'s is, and the file it names is the one `open` would make.
+pub(super) fn handle_creat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let path = match cstr_arg(args[0], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    // O_WRONLY (1) of the access bits: the write-only the name promises.
+    open_linux(&path, abi::O_CREAT | abi::O_TRUNC | 1, cwd.clone())
+}
+
+/// `utime(path, times)` — the seconds-only spelling of the timestamps
+/// call. NULL `times` means now; the `utimbuf` the pointer names is two
+/// `time_t`s, access time then modification time. Timestamps are not
+/// kept, so both spellings land on the resolution's answer.
+pub(super) fn handle_utime(
+    args: [usize; ARG_COUNT],
+    cwd: &Arc<dyn Inode>,
+    from_user: bool,
+) -> isize {
+    let (path_ptr, times) = (args[0], args[1]);
+    if times != 0 && !buffer_ok(times, 16, false, from_user) {
+        return err::EFAULT;
+    }
+    let path = match cstr_arg(path_ptr, true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// splice(2), readahead(2), syncfs(2), syslog(2)
+// ---------------------------------------------------------------------------
+
+/// `splice(fd_in, off_in, fd_out, off_out, len, flags)` — move bytes
+/// between a pipe and anything else, without a caller's buffer in the
+/// middle.
+///
+/// One of the two descriptors must be a pipe, the man page's own rule,
+/// and a pipe takes no offset: its data is a stream, and the cursor the
+/// descriptor keeps is the only position it has — asking for one by
+/// pointer is EINVAL. The move itself is a chunked copy through the
+/// kernel; the flags are the advice bits the man page lists, accepted
+/// for the same reason `poll` accepts its nonblocking one: the
+/// descriptor's own flags are what govern.
+pub(super) fn handle_splice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const SPLICE_F_MOVE: usize = 0x01;
+    const SPLICE_F_NONBLOCK: usize = 0x02;
+    const SPLICE_F_MORE: usize = 0x04;
+    const SPLICE_F_GIFT: usize = 0x08;
+
+    let (in_fd, off_in, out_fd, off_out, len, flags) = (
+        args[0] as i32,
+        args[1],
+        args[2] as i32,
+        args[3],
+        args[4],
+        args[5],
+    );
+    if flags & !(SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT) != 0 {
+        return err::EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let fds = crate::sched::current_fds();
+    let input = match fds.clone_at(in_fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let output = match fds.clone_at(out_fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let in_is_pipe = input.inode().as_pipe().is_some();
+    let out_is_pipe = output.inode().as_pipe().is_some();
+    if !in_is_pipe && !out_is_pipe {
+        return err::EINVAL;
+    }
+    if in_is_pipe && off_in != 0 || out_is_pipe && off_out != 0 {
+        return err::EINVAL;
+    }
+
+    let mut pos_in = match splice_position(&input, off_in, from_user) {
+        Ok(pos) => pos,
+        Err(e) => return e,
+    };
+    let mut pos_out = match splice_position(&output, off_out, from_user) {
+        Ok(pos) => pos,
+        Err(e) => return e,
+    };
+    let mut chunk = [0u8; 4096];
+    let mut moved = 0usize;
+    while moved < len {
+        let want = (len - moved).min(chunk.len());
+        let n = match input.inode().read_at(pos_in, &mut chunk[..want]) {
+            Ok(n) => n,
+            Err(e) => {
+                if moved > 0 {
+                    break;
+                }
+                return err_of(e);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let w = match output.inode().write_at(pos_out, &chunk[..n]) {
+            Ok(w) => w,
+            Err(e) => {
+                if moved > 0 {
+                    break;
+                }
+                return err_of(e);
+            }
+        };
+        if w == 0 {
+            break;
+        }
+        pos_in += w as u64;
+        pos_out += w as u64;
+        moved += w;
+    }
+    splice_finish(&input, off_in, pos_in, from_user);
+    splice_finish(&output, off_out, pos_out, from_user);
+    moved as isize
+}
+
+/// `readahead(fd, offset, count)` — a promise that the range is coming.
+/// Nothing here reads lazily, so there is nothing to pull in early; the
+/// call is the descriptor's validity and the success.
+pub(super) fn handle_readahead(args: [usize; ARG_COUNT]) -> isize {
+    match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `syncfs(fd)` — flush the filesystem one descriptor belongs to. Every
+/// write here already reached its storage — ramfs and ext2 write through —
+/// so the flush is empty; the call still owes the descriptor check.
+pub(super) fn handle_syncfs(args: [usize; ARG_COUNT]) -> isize {
+    match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(_) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `syslog(type, buf, len)` — the kernel log, `klogctl`'s door.
+///
+/// The types are numbers; the man page says so itself. The reads are the
+/// heart of it: type 2 takes what is there and it is gone — the one a
+/// `klogd` parks in, waiting for the kernel to speak; type 3 reads the
+/// tail without consuming, the one `dmesg` makes; type 4 reads and then
+/// empties. Clearing (5) empties; the counters (9, 10) are the numbers a
+/// reader sizes itself by. The console-loglevel games (0, 1, 6, 7, 8)
+/// are accepted: this kernel has one loglevel — everything — and one
+/// user.
+pub(super) fn handle_syslog(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const READ: usize = 2;
+    const READ_ALL: usize = 3;
+    const READ_CLEAR: usize = 4;
+    const CLEAR: usize = 5;
+    const CONSOLE_LEVEL: usize = 8;
+    const SIZE_UNREAD: usize = 9;
+    const SIZE_BUFFER: usize = 10;
+
+    let (kind, bufp, len) = (args[0], args[1], args[2] as i64);
+    match kind {
+        // Open, close, console off and on: bookkeeping for a loglevel
+        // this kernel does not keep.
+        0 | 1 | 6 | 7 => 0,
+        CONSOLE_LEVEL => {
+            if !(1..=8).contains(&len) {
+                return err::EINVAL;
+            }
+            0
+        }
+        READ => {
+            if bufp == 0 || len < 0 {
+                return err::EINVAL;
+            }
+            if !buffer_ok(bufp, len as usize, true, from_user) {
+                return err::EFAULT;
+            }
+            // The destructive read waits until there is something to
+            // take, and a signal that would run a handler is a way out of
+            // the wait the man page spells EINTR. The cell is how a
+            // condition hands a whole read back out of an `Fn`.
+            let taken_cell = core::cell::RefCell::new(alloc::vec::Vec::new());
+            let answer = crate::sched::block_until_deadline(
+                || {
+                    *taken_cell.borrow_mut() = crate::console::dmesg_take(len as usize);
+                    !taken_cell.borrow().is_empty()
+                },
+                u64::MAX,
+            );
+            match answer {
+                crate::sched::WaitEnd::Interrupted => return err::EINTR,
+                crate::sched::WaitEnd::Deadline => return 0,
+                crate::sched::WaitEnd::Condition => {}
+            }
+            let taken = taken_cell.into_inner();
+            unsafe {
+                core::ptr::copy_nonoverlapping(taken.as_ptr(), bufp as *mut u8, taken.len());
+            }
+            taken.len() as isize
+        }
+        READ_ALL | READ_CLEAR => {
+            if bufp == 0 || len < 0 {
+                return err::EINVAL;
+            }
+            if !buffer_ok(bufp, len as usize, true, from_user) {
+                return err::EFAULT;
+            }
+            let log = crate::console::dmesg_snapshot();
+            let n = log.len().min(len as usize);
+            let start = log.len() - n;
+            unsafe { core::ptr::copy_nonoverlapping(log[start..].as_ptr(), bufp as *mut u8, n) };
+            if kind == READ_CLEAR {
+                crate::console::dmesg_clear();
+            }
+            n as isize
+        }
+        CLEAR => {
+            crate::console::dmesg_clear();
+            0
+        }
+        SIZE_UNREAD => crate::console::dmesg_snapshot().len() as isize,
+        SIZE_BUFFER => crate::console::dmesg_capacity() as isize,
+        _ => err::EINVAL,
     }
 }

@@ -228,6 +228,16 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
     if regs_ptr.is_null() {
         return false;
     }
+    // A traced task's signals are its tracer's business before they are its
+    // own: the tracer is told which one is about to arrive and decides whether
+    // it does. The signal stays pending across that stop, so what the tracer
+    // leaves behind - the same signal, a different one, or nothing at all - is
+    // what the lines below go on to find.
+    if crate::sched::has_tracer(crate::sched::current()) {
+        let mut saved = capture_frame(regs_ptr, ret as usize);
+        crate::sched::trace_signal_stop(&mut saved);
+        apply_frame(regs_ptr, &saved);
+    }
     let Some(sig) = crate::sched::take_deliverable_signal() else {
         return false;
     };
@@ -235,7 +245,30 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
     if action.is_ignore() {
         return false;
     }
-    if action.is_default() || !build_frame(regs_ptr, sig, &action, ret) {
+    if action.is_default() {
+        // With no handler the default action table decides, and it does not
+        // give one answer. The great majority of signals terminate; `SIGCONT`
+        // resumes and `SIGSTOP` stops. Before this kernel had a stop state to
+        // be in, "no handler" and "dies of it" really were the same thing.
+        match crate::sched::signal::default_action(sig) {
+            crate::sched::signal::DefaultAction::Terminate => {
+                crate::sched::exit(-(sig as isize));
+            }
+            crate::sched::signal::DefaultAction::Ignore => return false,
+            // Arriving at a task that is *running*: it is already going, so the
+            // signal has said everything it had to say. The state it changes -
+            // ending a stop - is the sender's to change, because a stopped task
+            // is not here to receive it.
+            crate::sched::signal::DefaultAction::Continue => return false,
+            crate::sched::signal::DefaultAction::Stop => {
+                let mut saved = capture_frame(regs_ptr, ret as usize);
+                crate::sched::group_stop(&mut saved, sig);
+                apply_frame(regs_ptr, &saved);
+                return false;
+            }
+        }
+    }
+    if !build_frame(regs_ptr, sig, &action, ret) {
         // Nothing to run, or nowhere to put the frame - and the default action
         // for every signal this kernel names is to die of it, with the number
         // in the exit code so the parent can tell which one it was.
@@ -376,11 +409,25 @@ pub(super) fn handle_set_tid_address(args: [usize; ARG_COUNT]) -> isize {
 /// `WNOHANG` is honoured as Linux defines it: a child that has not exited yet is
 /// answered with 0, not an error, and only a caller with no child at all gets
 /// `ECHILD`.
+///
+/// What there is to report is wider than "it died". A child that was traced and
+/// stopped, or that stopped on a `SIGSTOP` the caller asked to hear about with
+/// `WUNTRACED`, is also an answer - and for a tracer that is the *usual* answer,
+/// since a traced child spends most of its life stopped. `__WALL` and the other
+/// Linux-only option bits arrive in the same word and need no interpreting here:
+/// they widen which children count, and this kernel already counts every one it
+/// can be asked about.
 pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    const WNOHANG: usize = 1;
     let (pid, status, options) = (args[0] as isize, args[1], args[2]);
     let me = crate::sched::current();
-    let no_hang = options & WNOHANG != 0;
+    let no_hang = options & abi::WNOHANG != 0;
+    // `WUNTRACED` is what a *parent* needs to hear about a stop; a *tracer* does
+    // not, because a stop of its tracee is its business whether it asked or not.
+    // That distinction lives in the event scan, which reports a stop that is
+    // `traced` unconditionally - so what is passed here is only the parent's
+    // half of the question.
+    let stops = options & abi::WUNTRACED != 0;
+    let continues = options & abi::WCONTINUED != 0;
 
     // Every child: the pid == -1 form, and every other group form this kernel
     // cannot tell apart for lack of process groups.
@@ -389,17 +436,17 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // answers ECHILD, and blocking here would sleep forever - OpenRC
         // parks exactly that way after its last helper exits.
         let collected = if no_hang {
-            crate::sched::poll_any_child(me)
+            crate::sched::poll_any_child_event(me, stops, continues)
         } else if crate::sched::has_children(me) {
-            crate::sched::wait_any_child(me)
+            crate::sched::wait_any_child_event(me, stops, continues)
         } else {
             None
         };
-        if let Some((id, code)) = collected {
-            return finish_wait(id, code, status, from_user);
+        if let Some(event) = collected {
+            return finish_wait_event(event, status, from_user);
         }
         // Nothing to report: an error only when there is nobody left to
-        // wait for, and otherwise the "none exited yet" zero.
+        // wait for, and otherwise the "none yet" zero.
         if no_hang && crate::sched::has_children(me) {
             return 0;
         }
@@ -412,6 +459,12 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
     let id = TaskId(pid as usize);
 
+    // A stop first, then a death: a tracee that stopped on its way to exiting
+    // has news of both, and the stop is the earlier news and the one that
+    // gates everything after it.
+    if let Some(event) = crate::sched::take_child_event(id, stops, continues) {
+        return finish_wait_event(event, status, from_user);
+    }
     // A code already on file means the child is a zombie: it is collected now,
     // blocking or not.
     if let Some(code) = crate::sched::take_exit_code(id) {
@@ -424,11 +477,36 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         return 0;
     }
 
-    crate::sched::block_until_code(id);
-    match crate::sched::take_exit_code(id) {
-        Some(code) => finish_wait(id, code, status, from_user),
+    match crate::sched::block_until_child_event(id, stops, continues) {
+        Some(event) => finish_wait_event(event, status, from_user),
         None => err::ECHILD,
     }
+}
+
+/// The three shapes a successful `wait` returns, each encoded into `*status` the
+/// way its `W`-macro decodes it: a death, a stop, or a resume.
+fn finish_wait_event(event: crate::sched::WaitEvent, status: usize, from_user: bool) -> isize {
+    match event {
+        crate::sched::WaitEvent::Exited { id, code } => finish_wait(id, code, status, from_user),
+        crate::sched::WaitEvent::Stopped { id, signal, event } => {
+            write_wait_status(id, abi::stop_status(signal, event), status, from_user)
+        }
+        crate::sched::WaitEvent::Continued { id } => {
+            write_wait_status(id, abi::CONTINUED_STATUS, status, from_user)
+        }
+    }
+}
+
+/// Encode an already-formed status word and answer the child's pid. The
+/// counterpart of [`finish_wait`] for the two events that are not a death.
+fn write_wait_status(id: TaskId, word: i32, status: usize, from_user: bool) -> isize {
+    if status != 0 {
+        if !buffer_ok(status, 4, true, from_user) {
+            return err::EFAULT;
+        }
+        unsafe { (status as *mut i32).write_unaligned(word) };
+    }
+    id.0 as isize
 }
 
 /// The two outputs of a successful `wait`: the child's pid as the return value,
@@ -441,9 +519,756 @@ fn finish_wait(id: TaskId, code: isize, status: usize, from_user: bool) -> isize
         }
         // The W-exit-status encoding is the ABI the libc's macros decode;
         // it is spelled in `abi`, tested on the host.
-        unsafe { (status as *mut i32).write_volatile(abi::wait_status(code)) };
+        unsafe { (status as *mut i32).write_unaligned(abi::wait_status(code)) };
     }
     id.0 as isize
+}
+
+// ---------------------------------------------------------------------------
+// ptrace(2): the tracer's half
+// ---------------------------------------------------------------------------
+
+/// The tracee's user register file, in `user_regs_struct` order, as the gate's
+/// frame will restore it.
+///
+/// Two slots do not hold what their names say. `syscall` parked the caller's
+/// return address in `rcx` and its flags in `r11` - the instruction destroys
+/// both registers - so those two frame words are `RIP` and `EFLAGS` in the
+/// structure a tracer reads. Taking them at face value would hand `strace` a
+/// `rip` that is really a flags word.
+///
+/// `rax` is passed in rather than read: at a syscall entry the frame's `rax`
+/// holds the call's number, and at an exit it holds that *same* number, because
+/// the gate writes the result into the slot only after the dispatch has
+/// returned. The caller is the only one that knows which value belongs there.
+fn capture_frame(regs_ptr: *mut (), rax: usize) -> [u64; abi::uregs::COUNT] {
+    use abi::uregs::*;
+
+    let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
+    let (code, data) = crate::arch::gdt::user_selectors();
+    let mut regs = [0u64; COUNT];
+    regs[R15] = frame.r15 as u64;
+    regs[R14] = frame.r14 as u64;
+    regs[R13] = frame.r13 as u64;
+    regs[R12] = frame.r12 as u64;
+    regs[RBP] = frame.rbp as u64;
+    regs[RBX] = frame.rbx as u64;
+    regs[R11] = frame.r11 as u64;
+    regs[R10] = frame.r10 as u64;
+    regs[R9] = frame.r9 as u64;
+    regs[R8] = frame.r8 as u64;
+    regs[RAX] = rax as u64;
+    regs[RCX] = frame.rcx as u64;
+    regs[RDX] = frame.rdx as u64;
+    regs[RSI] = frame.rsi as u64;
+    regs[RDI] = frame.rdi as u64;
+    regs[ORIG_RAX] = frame.rax as u64;
+    regs[RIP] = frame.rcx as u64;
+    regs[CS] = code.0 as u64;
+    regs[EFLAGS] = frame.r11 as u64;
+    regs[RSP] = frame.user_rsp as u64;
+    regs[SS] = data.0 as u64;
+    // The thread-local base is a CPU register, not a frame word: the gate
+    // reinstalls it from the task on every switch, so the task is where it is
+    // read from - and where a `PTRACE_SETREGS` puts it back.
+    regs[FS_BASE] = crate::sched::current_tls() as u64;
+    // The segment registers and the user GS base, written out rather than left
+    // to the array's zero: long mode ignores DS, ES, FS and GS - their contents
+    // select nothing - and nothing here ever sets a user GS base, so zero is
+    // what the CPU would ignore anyway. FS *is* meaningful, and it is not a
+    // segment at all but the thread-local base above; a tracer reading this
+    // structure sees the base in `FS_BASE` and a selector it may ignore in `FS`.
+    regs[DS] = 0;
+    regs[ES] = 0;
+    regs[FS] = 0;
+    regs[GS] = 0;
+    regs[GS_BASE] = 0;
+    regs
+}
+
+/// Write a register file back into the gate's frame and answer the value the
+/// gate should return to ring 3.
+///
+/// The inverse of [`capture_frame`], including the two swapped slots: `rcx` gets
+/// `RIP` because `sysretq` takes the return address from there, and `r11` gets
+/// `EFLAGS` for the same reason. `rax` is *returned* instead of written, and
+/// that is not a shortcut: the gate stores the dispatch's result into that slot
+/// after this function's caller returns, so the only way a tracer's
+/// `PTRACE_SETREGS` can change what the tracee sees in `rax` is for the new
+/// value to *be* the result.
+fn apply_frame(regs_ptr: *mut (), regs: &[u64; abi::uregs::COUNT]) -> usize {
+    use abi::uregs::*;
+
+    let frame = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
+    frame.r15 = regs[R15] as usize;
+    frame.r14 = regs[R14] as usize;
+    frame.r13 = regs[R13] as usize;
+    frame.r12 = regs[R12] as usize;
+    frame.rbp = regs[RBP] as usize;
+    frame.rbx = regs[RBX] as usize;
+    frame.r11 = regs[EFLAGS] as usize;
+    frame.r10 = regs[R10] as usize;
+    frame.r9 = regs[R9] as usize;
+    frame.r8 = regs[R8] as usize;
+    frame.rcx = regs[RIP] as usize;
+    frame.rdx = regs[RDX] as usize;
+    frame.rsi = regs[RSI] as usize;
+    frame.rdi = regs[RDI] as usize;
+    frame.user_rsp = regs[RSP] as usize;
+    if crate::sched::current_tls() != regs[FS_BASE] as usize {
+        crate::sched::set_current_tls(regs[FS_BASE] as usize);
+    }
+    regs[RAX] as usize
+}
+
+/// The tracee's half of a syscall-entry stop: show the tracer the call before it
+/// is made, and answer the arguments the tracee will actually make it with.
+///
+/// Re-reading the argument registers rather than returning the ones handed in is
+/// the point of the exercise: a tracer that rewrote `rdi` at the stop meant to
+/// change the call, and a kernel that then made the call with the old value
+/// would be ignoring it.
+pub(crate) fn syscall_entry_stop(
+    regs_ptr: *mut (),
+    nr: u64,
+    args: [usize; ARG_COUNT],
+) -> [usize; ARG_COUNT] {
+    if regs_ptr.is_null() || !crate::sched::has_tracer(crate::sched::current()) {
+        return args;
+    }
+    let (ip, sp) = {
+        let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
+        (frame.rcx as u64, frame.user_rsp as u64)
+    };
+    let mut regs = capture_frame(regs_ptr, nr as usize);
+    let wide = args.map(|arg| arg as u64);
+    crate::sched::stop_at_syscall(true, &mut regs, nr, &wide, ip, sp);
+    apply_frame(regs_ptr, &regs);
+    let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
+    [
+        frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+    ]
+}
+
+/// The tracee's half of a syscall-exit stop. The result goes in and comes back,
+/// possibly rewritten: at this stop `rax` *is* the result, and a tracer that
+/// changed it changed what the tracee sees.
+pub(crate) fn syscall_exit_stop(
+    regs_ptr: *mut (),
+    nr: u64,
+    args: [usize; ARG_COUNT],
+    ret: isize,
+) -> isize {
+    if regs_ptr.is_null() || !crate::sched::has_tracer(crate::sched::current()) {
+        return ret;
+    }
+    let (ip, sp) = {
+        let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
+        (frame.rcx as u64, frame.user_rsp as u64)
+    };
+    let mut regs = capture_frame(regs_ptr, ret as usize);
+    let wide = args.map(|arg| arg as u64);
+    crate::sched::stop_at_syscall(false, &mut regs, nr, &wide, ip, sp);
+    apply_frame(regs_ptr, &regs) as isize
+}
+
+/// Read one `struct iovec` - a base and a length - out of the caller's memory.
+fn read_iovec(at: usize) -> Option<(usize, usize)> {
+    let mut raw = [0u8; 16];
+    if !crate::sched::read_user(at, &mut raw) {
+        return None;
+    }
+    Some((
+        usize::from_le_bytes(raw[0..8].try_into().unwrap()),
+        usize::from_le_bytes(raw[8..16].try_into().unwrap()),
+    ))
+}
+
+/// `ptrace(request, pid, addr, data)` — one task observing and steering another.
+///
+/// The request word is the call's whole shape: `pid` is the target, and `addr`
+/// and `data` mean whatever that particular request says they mean. What is
+/// implemented here is the subset a tracer actually reaches - everything
+/// `strace` and a debugger need for syscall tracing, memory reading and register
+/// editing - and the requests beyond it answer `EIO`, which is Linux's answer
+/// for a request it does not know.
+///
+/// The tracee does the stopping; this is only the tracer's half, and the two
+/// meet in the scheduler. `PTRACE_TRACEME` writes the link from the tracee's own
+/// call, `PTRACE_ATTACH` writes it from here and stops the target, and from then
+/// on every syscall boundary and every signal in the tracee's life arrives here
+/// as a `wait(2)` event.
+#[allow(clippy::too_many_lines)]
+pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (request, pid, addr, data) = (args[0], args[1] as isize, args[2], args[3]);
+    let me = crate::sched::current();
+
+    if request == abi::PTRACE_TRACEME {
+        // The tracee hands *itself* over, and the only tracer it may name is the
+        // task that spawned it. A task with no parent - init, or a kernel task
+        // that somehow got here - has nobody to hand itself to.
+        return match crate::sched::parent_of(me) {
+            Some(parent) if crate::sched::set_tracer(me, parent) => 0,
+            _ => err::EPERM,
+        };
+    }
+
+    if pid <= 0 || pid as usize >= crate::sched::MAX_TASKS {
+        return err::ESRCH;
+    }
+    let id = TaskId(pid as usize);
+
+    if request == abi::PTRACE_ATTACH {
+        // Attaching is the pair of a `TRACEME` and a `SIGSTOP`: the link is
+        // written by the tracer rather than offered by the tracee, and the stop
+        // that follows is what makes the new tracer's first `wait` return.
+        if !crate::sched::set_tracer(id, me) {
+            return err::ESRCH;
+        }
+        crate::sched::send_signal(id, crate::sched::signal::SIGSTOP);
+        return 0;
+    }
+
+    // Everything else has to find a link already made. The check is `ours`
+    // rather than "is my tracee" because of a race that is not hypothetical:
+    // a tracer sets its options in the instruction after `fork`, and the child -
+    // which is the side that calls `TRACEME` - may not have reached it yet. A
+    // child of the caller is close enough, since that is the only task that
+    // could be calling `TRACEME` on this caller a moment later.
+    let ours = crate::sched::tracer_of(id) == Some(me) || crate::sched::parent_of(id) == Some(me);
+    if !ours {
+        return err::ESRCH;
+    }
+
+    match request {
+        // A word out of the tracee's memory. `PEEKTEXT` and `PEEKDATA` are the
+        // same request to a machine without separate I and D spaces, which is
+        // every machine this kernel runs on.
+        abi::PTRACE_PEEKTEXT | abi::PTRACE_PEEKDATA => {
+            let Some(root) = crate::sched::space_root_of(id) else {
+                return err::ESRCH;
+            };
+            if !buffer_ok(data, 8, true, from_user) {
+                return err::EFAULT;
+            }
+            let mut word = [0u8; 8];
+            if !crate::sched::read_user_of(root, addr, &mut word) {
+                return err::EIO;
+            }
+            unsafe { (data as *mut u64).write_unaligned(u64::from_le_bytes(word)) };
+            0
+        }
+        // And the writing half. The value arrives in `data` by value, not
+        // through a pointer - one of the few places `ptrace`'s arguments do not
+        // mean what they look like.
+        abi::PTRACE_POKETEXT | abi::PTRACE_POKEDATA => {
+            let Some(root) = crate::sched::space_root_of(id) else {
+                return err::ESRCH;
+            };
+            if !crate::sched::write_user_of(root, addr, &(data as u64).to_le_bytes()) {
+                return err::EIO;
+            }
+            0
+        }
+        // The `user` structure's register area. `addr` is a *byte offset* into
+        // it, and on x86_64 the registers are its first member, so an offset
+        // inside the register file is the only one that names anything here.
+        abi::PTRACE_PEEKUSER | abi::PTRACE_POKEUSER => {
+            if addr + 8 > abi::uregs::BYTES {
+                return err::EIO;
+            }
+            let Some(mut regs) = crate::sched::trace_regs(id) else {
+                return err::ESRCH;
+            };
+            if request == abi::PTRACE_PEEKUSER {
+                if !buffer_ok(data, 8, true, from_user) {
+                    return err::EFAULT;
+                }
+                unsafe { (data as *mut u64).write_unaligned(regs[addr / 8]) };
+                return 0;
+            }
+            regs[addr / 8] = data as u64;
+            if crate::sched::set_trace_regs(id, &regs) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        abi::PTRACE_GETREGS => {
+            let Some(regs) = crate::sched::trace_regs(id) else {
+                return err::ESRCH;
+            };
+            if !buffer_ok(data, abi::uregs::BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            abi::write_user_regs(data, &regs);
+            0
+        }
+        abi::PTRACE_SETREGS => {
+            if !buffer_ok(data, abi::uregs::BYTES, false, from_user) {
+                return err::EFAULT;
+            }
+            if crate::sched::set_trace_regs(id, &abi::read_user_regs(data)) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        // The same register set, named by number and reached through an
+        // `iovec`. Newer tracers prefer this spelling; `strace` tries it first
+        // and falls back to `GETREGS`, so both answering is what keeps it from
+        // printing an error on its way to working.
+        abi::PTRACE_GETREGSET | abi::PTRACE_SETREGSET => {
+            if addr != abi::NT_PRSTATUS {
+                return err::EIO;
+            }
+            let Some((base, len)) = read_iovec(data) else {
+                return err::EFAULT;
+            };
+            let room = len.min(abi::uregs::BYTES);
+            if room < abi::uregs::BYTES {
+                // A short buffer is not a request for a short answer: the
+                // register set is one structure, and half of it is a tracer
+                // acting on registers it did not read.
+                return err::EIO;
+            }
+            if request == abi::PTRACE_GETREGSET {
+                let Some(regs) = crate::sched::trace_regs(id) else {
+                    return err::ESRCH;
+                };
+                if !buffer_ok(base, room, true, from_user) {
+                    return err::EFAULT;
+                }
+                abi::write_user_regs(base, &regs);
+                return 0;
+            }
+            if !buffer_ok(base, room, false, from_user) {
+                return err::EFAULT;
+            }
+            if crate::sched::set_trace_regs(id, &abi::read_user_regs(base)) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        // The syscall this stop is a boundary of. `addr` is the size of the
+        // buffer at `data` and not an address - the other place `ptrace`'s
+        // arguments do not mean what they look like. A buffer too small for the
+        // structure is `EINVAL`, because it has a union in it and a truncated
+        // answer would describe the wrong thing rather than less of the right
+        // one.
+        abi::PTRACE_GET_SYSCALL_INFO => {
+            if addr < abi::SYSCALL_INFO_BYTES {
+                return err::EINVAL;
+            }
+            if !buffer_ok(data, abi::SYSCALL_INFO_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            match crate::sched::trace_syscall(id) {
+                Some((entry, nr, call_args, ip, sp)) => {
+                    // At an exit stop the result is in the saved register file,
+                    // where `syscall_exit_stop` put it - so a tracer that
+                    // rewrote `rax` sees its own value here too.
+                    let ret = crate::sched::trace_regs(id)
+                        .map_or(0, |regs| regs[abi::uregs::RAX] as i64)
+                        as isize;
+                    abi::write_syscall_info(
+                        data,
+                        entry,
+                        nr,
+                        &call_args,
+                        ip,
+                        sp,
+                        if entry { 0 } else { ret },
+                    );
+                }
+                None => {
+                    // Not a syscall stop at all. The operation byte says exactly
+                    // that, which is far more use to a tracer than the previous
+                    // call's arguments offered as if they were this stop's.
+                    //
+                    // `ip` and `sp` are the task's own even here. The structure
+                    // carries them at every stop, and a tracer reads them as the
+                    // proof that the kernel filled it in: `strace`'s startup
+                    // probe rejects a `NONE` answer whose `ip` or `sp` is zero:
+                    //
+                    //     if (psi_size < expected_none_size ||
+                    //         info->op != PTRACE_SYSCALL_INFO_NONE ||
+                    //         !info->arch ||
+                    //         !info->instruction_pointer ||
+                    //         !info->stack_pointer) {
+                    //             debug_func_msg("... signal stop mismatch");
+                    //
+                    // and having rejected it, it stops asking for this
+                    // structure for the rest of the session and assumes the
+                    // stops alternate instead. That assumption is one dropped
+                    // stop away from reporting every return value as the *next*
+                    // call's number - which is exactly what it did.
+                    let (ip, sp) = crate::sched::trace_regs(id).map_or((0, 0), |regs| {
+                        (regs[abi::uregs::RIP], regs[abi::uregs::RSP])
+                    });
+                    abi::write_syscall_info(data, true, 0, &[0; 6], ip, sp, 0);
+                    unsafe { (data as *mut u8).write_unaligned(abi::SYSCALL_INFO_NONE) };
+                }
+            }
+            abi::SYSCALL_INFO_BYTES as isize
+        }
+        abi::PTRACE_SETOPTIONS => {
+            // The bits this kernel understands. A request naming one it does
+            // not is `EINVAL` rather than a shrug: the tracer would otherwise
+            // wait for a stop that would never come, which is the worst kind of
+            // wrong answer.
+            const KNOWN: usize = abi::PTRACE_O_TRACESYSGOOD
+                | abi::PTRACE_O_TRACEFORK
+                | abi::PTRACE_O_TRACEVFORK
+                | abi::PTRACE_O_TRACECLONE
+                | abi::PTRACE_O_TRACEEXEC
+                | abi::PTRACE_O_TRACEVFORKDONE
+                | abi::PTRACE_O_TRACEEXIT
+                | abi::PTRACE_O_EXITKILL;
+            if data & !KNOWN != 0 {
+                return err::EINVAL;
+            }
+            if crate::sched::set_trace_options(id, data) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        // The message an event carries, which the stop itself holds: a fork, a
+        // vfork or a clone reports the *new child's* pid there, an exec the tid
+        // the task had before it exec'd, and every other kind of stop carries
+        // nothing because there is no event for a message to belong to.
+        //
+        // Reading it off the stop rather than off the task is what makes the
+        // answer belong to the question. A tracer asks this while the tracee
+        // sits in a particular stop, and a task that has been stopped twice has
+        // two different answers - only the second of which is still true of it.
+        //
+        // The value is an `unsigned long`, not the four bytes a pid needs:
+        // `ptrace(2)` says so, and a tracer that declares it as one has eight
+        // bytes there to be written.
+        abi::PTRACE_GETEVENTMSG => {
+            let Some(stop) = crate::sched::stop_of(id) else {
+                return err::ESRCH;
+            };
+            if !buffer_ok(data, 8, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { (data as *mut u64).write_unaligned(stop.message) };
+            0
+        }
+        // The `siginfo_t` of the stop.
+        //
+        // Which kind of stop it is *is* the `si_code`, and that is not
+        // decoration: a tracer tells the three kinds of `SIGTRAP` stop apart by
+        // it. A ptrace event carries `SIGTRAP | (event << 8)`, a syscall
+        // boundary carries plain `SIGTRAP`, and a signal that was sent to the
+        // tracee carries the code of whoever sent it.
+        //
+        // Answering `SI_USER` for all three - which this used to - hands a
+        // tracer an exec event that reads as "somebody sent the tracee a
+        // SIGTRAP", and a tracer that acts on that difference does not finish
+        // the `execve` the event was reporting.
+        abi::PTRACE_GETSIGINFO => {
+            let Some(stop) = crate::sched::stop_of(id) else {
+                return err::ESRCH;
+            };
+            if !buffer_ok(data, abi::SIGINFO_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            let code = if stop.event != 0 {
+                // A ptrace event: the event number sits above the signal.
+                ((stop.event as i32) << 8) | crate::sched::signal::SIGTRAP as i32
+            } else if stop.delivering.is_some() {
+                SI_USER
+            } else {
+                // A syscall boundary, or the exec trap when the tracer did not
+                // ask for the event: a trap, not a signal anybody sent.
+                crate::sched::signal::SIGTRAP as i32
+            };
+            unsafe { core::ptr::write_bytes(data as *mut u8, 0, abi::SIGINFO_BYTES) };
+            unsafe {
+                (data as *mut i32).write_unaligned(stop.signal as i32);
+                ((data + 8) as *mut i32).write_unaligned(code);
+            }
+            0
+        }
+        // Accepted and discarded: the signal a tracee actually receives is the
+        // one the tracer names on the resume, and a `siginfo_t` planted here
+        // would describe it wrongly rather than more fully.
+        abi::PTRACE_SETSIGINFO => 0,
+        // Letting the tracee go on. `SYSCALL` re-arms the syscall trace and
+        // `CONT` does not; `SINGLESTEP` is answered as a `SYSCALL` because this
+        // kernel has no single-step trap, and a tracer that asked for one gets
+        // stops at the next boundaries rather than none at all.
+        abi::PTRACE_CONT | abi::PTRACE_SYSCALL | abi::PTRACE_SINGLESTEP => {
+            let arm = request != abi::PTRACE_CONT;
+            if crate::sched::resume_traced(id, data as u8, arm) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        // `PTRACE_KILL` is a `SIGKILL` that is also a resume: a stopped tracee
+        // cannot die where it stands, so killing it means letting it run far
+        // enough to be killed.
+        abi::PTRACE_KILL => {
+            if crate::sched::resume_traced(id, crate::sched::signal::SIGKILL, false) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        abi::PTRACE_DETACH => {
+            if crate::sched::detach_traced(id, data as u8) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        // The floating-point register file. The state exists per task like the
+        // integer one does - it has to, or two programs would share one physical
+        // register file - and on x86_64 the ABI's `user_fpregs_struct` *is* the
+        // 512-byte `fxsave` image, so what a tracer gets here is the same block
+        // the context switch moves.
+        //
+        // The size is not a parameter the way it is for `GET_SYSCALL_INFO`: that
+        // structure has a union in it whose length the caller chooses, while
+        // this one is fixed, and a buffer smaller than the registers is a tracer
+        // about to act on registers it did not read (`EFAULT` here, checked by
+        // `buffer_ok`'s length).
+        abi::PTRACE_GETFPREGS => {
+            if !buffer_ok(data, abi::FPREGS_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            let Some(fpu) = crate::sched::trace_fpu(id) else {
+                return err::ESRCH;
+            };
+            abi::write_user_fpregs(data, &fpu);
+            0
+        }
+        abi::PTRACE_SETFPREGS => {
+            if !buffer_ok(data, abi::FPREGS_BYTES, false, from_user) {
+                return err::EFAULT;
+            }
+            let fpu = abi::read_user_fpregs(data);
+            if crate::sched::set_trace_fpu(id, &fpu) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        // A request this kernel does not know: Linux's own answer, and the one
+        // a tracer's feature probe is written to read.
+        _ => err::EIO,
+    }
+}
+
+/// `process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)` —
+/// bulk memory reading across processes.
+///
+/// `strace` reaches for this before falling back to `PTRACE_PEEKDATA`: a word
+/// per call is fine for a `stat` structure and hopeless for a long `execve`
+/// argument vector. The pair of iovec arrays are in the *caller's* memory and
+/// the iovecs themselves name the two address spaces - local ones here, remote
+/// ones in the target.
+pub(super) fn handle_process_vm_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (pid, local, local_count, remote, remote_count, flags) = (
+        args[0] as isize,
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+    );
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    if pid <= 0 || pid as usize >= crate::sched::MAX_TASKS {
+        return err::ESRCH;
+    }
+    let id = TaskId(pid as usize);
+    let Some(root) = crate::sched::space_root_of(id) else {
+        return err::ESRCH;
+    };
+    match transfer_iovs(
+        local,
+        local_count,
+        remote,
+        remote_count,
+        from_user,
+        Cross::FromRemote,
+        |at, bytes| crate::sched::read_user_of(root, at, bytes),
+    ) {
+        Ok(moved) => moved as isize,
+        Err(e) => e,
+    }
+}
+
+/// The writing half: `process_vm_writev`.
+pub(super) fn handle_process_vm_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (pid, local, local_count, remote, remote_count, flags) = (
+        args[0] as isize,
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+    );
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    if pid <= 0 || pid as usize >= crate::sched::MAX_TASKS {
+        return err::ESRCH;
+    }
+    let id = TaskId(pid as usize);
+    let Some(root) = crate::sched::space_root_of(id) else {
+        return err::ESRCH;
+    };
+    match transfer_iovs(
+        local,
+        local_count,
+        remote,
+        remote_count,
+        from_user,
+        Cross::ToRemote,
+        |at, bytes| crate::sched::write_user_of(root, at, bytes),
+    ) {
+        Ok(moved) => moved as isize,
+        Err(e) => e,
+    }
+}
+
+/// Which way the bytes cross in a `process_vm_*` call. The two calls differ in
+/// nothing else - the same two iovec arrays, walked the same way - so one
+/// routine does both and the flag decides which side is read and which written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cross {
+    /// `process_vm_readv`: the remote task's memory is the source.
+    FromRemote,
+    /// `process_vm_writev`: the remote task's memory is the destination.
+    ToRemote,
+}
+
+/// Walk two iovec arrays in step and hand each pair to `move_remote`, answering
+/// how many bytes crossed.
+///
+/// The two arrays are *not* required to be the same shape: Linux walks them as
+/// two cursors and moves the smaller of the two remainders at each step, which
+/// is how a caller can name one long range on one side and several short ones on
+/// the other. Pairing the iovecs up by index instead, which is the obvious
+/// simplification, silently mangles exactly those transfers.
+fn transfer_iovs(
+    local: usize,
+    local_count: usize,
+    remote: usize,
+    remote_count: usize,
+    from_user: bool,
+    cross: Cross,
+    mut move_remote: impl FnMut(usize, &mut [u8]) -> bool,
+) -> Result<usize, isize> {
+    const IOVEC_BYTES: usize = 16;
+    const CHUNK: usize = 512;
+    if local == 0 || remote == 0 {
+        return Err(err::EFAULT);
+    }
+    if local_count > 1024 || remote_count > 1024 {
+        return Err(err::EINVAL);
+    }
+    if !buffer_ok(local, local_count * IOVEC_BYTES, false, from_user)
+        || !buffer_ok(remote, remote_count * IOVEC_BYTES, false, from_user)
+    {
+        return Err(err::EFAULT);
+    }
+
+    let mut moved = 0usize;
+    let mut piece = [0u8; CHUNK];
+    let (mut li, mut ri) = (0usize, 0usize);
+    let (mut lat, mut lleft) = (0usize, 0usize);
+    let (mut rat, mut rleft) = (0usize, 0usize);
+
+    loop {
+        if lleft == 0 {
+            if li >= local_count {
+                break;
+            }
+            let Some((base, len)) = read_iovec(local + li * IOVEC_BYTES) else {
+                return Err(err::EFAULT);
+            };
+            li += 1;
+            lat = base;
+            lleft = len;
+        }
+        if rleft == 0 {
+            if ri >= remote_count {
+                break;
+            }
+            let Some((base, len)) = read_iovec(remote + ri * IOVEC_BYTES) else {
+                return Err(err::EFAULT);
+            };
+            ri += 1;
+            rat = base;
+            rleft = len;
+        }
+        // A zero-length iovec is a step, not a stop: the cursor above has
+        // already moved past it, and the loop comes back round for the next.
+        let chunk = lleft.min(rleft).min(CHUNK);
+        if chunk == 0 {
+            continue;
+        }
+        // Only the local side is the caller's own memory, so only it is checked
+        // with the pointer rules every other syscall uses. The remote side
+        // belongs to another process entirely: `move_remote` reaches it by
+        // translation and is the one that knows whether it is reachable.
+        let local_ok = if cross == Cross::FromRemote {
+            buffer_ok(lat, chunk, true, from_user)
+        } else {
+            buffer_ok(lat, chunk, false, from_user)
+        };
+        if !local_ok {
+            // A transfer that stopped partway is not a failure. Linux answers
+            // with however many bytes did cross, and a tracer reading a string
+            // that ends beside an unmapped page depends on exactly that -
+            // answering `EFAULT` where a short answer was available turns a
+            // truncated string into an error. Only a transfer that moved
+            // nothing at all is reported as one.
+            return if moved > 0 {
+                Ok(moved)
+            } else {
+                Err(err::EFAULT)
+            };
+        }
+        let ok = match cross {
+            // Reading *from* the remote task: it fills the buffer, the caller
+            // gets it. Reading the local side first here - which looks like the
+            // same statement in a different order - would take the caller's
+            // uninitialised bytes for the answer and then overwrite them.
+            Cross::FromRemote => {
+                move_remote(rat, &mut piece[..chunk])
+                    && crate::sched::write_user(lat, &piece[..chunk])
+            }
+            Cross::ToRemote => {
+                crate::sched::read_user(lat, &mut piece[..chunk])
+                    && move_remote(rat, &mut piece[..chunk])
+            }
+        };
+        if !ok {
+            // The same rule as above: a page that could not be reached ends the
+            // transfer where it stands rather than discarding what crossed.
+            return if moved > 0 {
+                Ok(moved)
+            } else {
+                Err(err::EFAULT)
+            };
+        }
+        moved += chunk;
+        lat += chunk;
+        lleft -= chunk;
+        rat += chunk;
+        rleft -= chunk;
+    }
+    Ok(moved)
 }
 
 /// Get the parent process ID.
@@ -478,7 +1303,7 @@ pub(super) fn handle_execve(
         Ok(path) => path,
         Err(e) => return e,
     };
-    let mut argv = match argv_arg(args[1]) {
+    let mut argv = match argv_arg(args[1], crate::syscall::MAX_PATH) {
         Ok(argv) => argv,
         Err(e) => return e,
     };
@@ -486,7 +1311,10 @@ pub(super) fn handle_execve(
         let name = path.rsplit('/').next().unwrap_or(&path);
         argv.push(String::from(name));
     }
-    let envp = match argv_arg(args[2]) {
+    // The environment's strings are not paths: a real compiler's
+    // COLLECT_GCC_OPTIONS runs past 255 bytes, and Linux bounds envp by
+    // the argument block's total, not by a pathname's ceiling.
+    let envp = match argv_arg(args[2], crate::syscall::MAX_ARG_STR) {
         Ok(envp) => envp,
         Err(e) => return e,
     };
@@ -526,6 +1354,18 @@ pub(super) fn handle_execve(
                 let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
                 regs.rcx = entry; // sysretq will jump here
                 regs.user_rsp = new_rsp; // new stack pointer
+            }
+            // A traced task traps here, on the *new* image's first instruction:
+            // by the time `execve` could otherwise "return" the old program is
+            // gone, so the trap is the only honest way to tell a tracer that the
+            // exec happened. It is also what a tracer is waiting for the very
+            // first time - `strace`'s child calls `PTRACE_TRACEME` and then
+            // `execv`s, and this stop is how the tracer learns the program
+            // started.
+            if !regs_ptr.is_null() && crate::sched::has_tracer(crate::sched::current()) {
+                let mut regs = capture_frame(regs_ptr, 0);
+                crate::sched::exec_trap(&mut regs);
+                apply_frame(regs_ptr, &regs);
             }
             0 // execve succeeds; the frame patches make it "not return"
         }
@@ -580,8 +1420,8 @@ fn sleep_for_timespec(req: usize, from_user: bool) -> isize {
     }
     let (tv_sec, tv_nsec) = unsafe {
         (
-            (req as *const i64).read_volatile() as u64,
-            ((req + 8) as *const i64).read_volatile() as u64,
+            (req as *const i64).read_unaligned() as u64,
+            ((req + 8) as *const i64).read_unaligned() as u64,
         )
     };
     // The `tv_nsec < 1s` check and the truncate-to-milliseconds fold are the
@@ -618,12 +1458,42 @@ fn sleep_for_timespec(req: usize, from_user: bool) -> isize {
 /// every `vfork` user writes behaves identically. Suspending the parent is a
 /// scheduling feature for an optimisation this kernel does not make (there is no
 /// page-table sharing to avoid), so there is nothing to gain by faking it.
-pub(super) fn handle_fork(_args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
+pub(super) fn handle_fork(nr: u64, _args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     let ctx = match user_context(regs_ptr, 0) {
         Some(ctx) => ctx,
         None => return err::EINVAL,
     };
-    crate::sched::fork(&ctx)
+    let child = if nr == super::nr::VFORK {
+        crate::sched::vfork(&ctx)
+    } else {
+        crate::sched::fork(&ctx)
+    };
+    if child > 0 {
+        tell_tracer_of_child(regs_ptr);
+    }
+    child
+}
+
+/// Tell the tracer, if there is one, that this task has just made a child.
+///
+/// The `(event, message)` pair is what the scheduler recorded at the creation,
+/// taken once - see `sched::attach_new_child`, which also stops the child
+/// before it can run. The *stop* is raised here rather than at the creation
+/// because a stop is a change to the registers this task will return through,
+/// and the frame those live in is reachable only from the syscall layer. Doing
+/// it here also puts it in the right place in the call: `PTRACE_EVENT_CLONE`
+/// belongs inside the `clone` that caused it, and the call's ordinary exit stop
+/// still follows, exactly as it does after an exec trap.
+fn tell_tracer_of_child(regs_ptr: *mut ()) {
+    if regs_ptr.is_null() {
+        return;
+    }
+    let Some((event, child)) = crate::sched::take_pending_event(crate::sched::current()) else {
+        return;
+    };
+    let mut regs = capture_frame(regs_ptr, 0);
+    crate::sched::fork_trap(&mut regs, event, child);
+    apply_frame(regs_ptr, &regs);
 }
 
 /// Build the ring-3 register file a process would resume with, from the syscall
@@ -735,8 +1605,9 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     // CLONE_PARENT_SETTID: the child's tid goes into the *parent's* memory, so
     // the write happens here, before the child has run.
     if flags & nr::CLONE_PARENT_SETTID != 0 {
-        unsafe { (parent_tid as *mut i32).write_volatile(child as i32) };
+        unsafe { (parent_tid as *mut i32).write_unaligned(child as i32) };
     }
+    tell_tracer_of_child(regs_ptr);
     child
 }
 
@@ -805,7 +1676,15 @@ pub(super) fn handle_setsid(_args: [usize; ARG_COUNT]) -> isize {
         return err::EPERM;
     }
     match crate::sched::set_pgid(me, me) {
-        0 => me.0 as isize,
+        0 => {
+            // The session half of the call: the caller leads its own session
+            // from here, and the controlling terminal it held belongs to the
+            // session it just left. A getty re-acquires one with TIOCSCTTY
+            // immediately after; that is the whole reason the two calls
+            // travel together.
+            crate::sched::become_session_leader();
+            me.0 as isize
+        }
         e => e,
     }
 }
@@ -838,10 +1717,11 @@ pub(super) fn handle_getpgid(args: [usize; ARG_COUNT]) -> isize {
         n if n > 0 => TaskId(n as usize),
         _ => return err::EINVAL,
     };
-    match crate::sched::pgid_of(target) {
+    let r = match crate::sched::pgid_of(target) {
         Some(pgid) => pgid.0 as isize,
         None => err::ESRCH,
-    }
+    };
+    r
 }
 
 // ---- init's own calls: reboot, sigtimedwait, umask, sendfile -------------
@@ -863,14 +1743,21 @@ pub(super) fn handle_getpgid(args: [usize; ARG_COUNT]) -> isize {
 /// environment has, and `-no-reboot` turns it into a clean shutdown either
 /// way. Anything else is refused, as Linux refuses it.
 pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
-    match abi::reboot_classify(args[0]) {
-        abi::RebootCmd::Policy => 0,
-        abi::RebootCmd::Stop => {
-            let cmd = args[0];
+    // `reboot(magic, magic2, cmd, arg)`: the magic words come first and the
+    // command is the third argument. Reading `args[0]` as the command reads
+    // `LINUX_REBOOT_MAGIC1` instead, classifies it as unknown and refuses -
+    // which is a `poweroff -f` that prints "Invalid argument" and leaves the
+    // machine up, and a test run that never reaches its end.
+    match abi::reboot_command(args) {
+        Ok(abi::RebootCmd::Policy) => 0,
+        Ok(abi::RebootCmd::Stop) => {
+            let cmd = args[2];
             crate::println!("mpos: reboot(0x{cmd:x}) - handing the machine back");
             crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_SUCCESS);
         }
-        abi::RebootCmd::Unknown => err::EINVAL,
+        // A command no kernel knows, whether or not it came with the magic.
+        Ok(abi::RebootCmd::Unknown) => err::EINVAL,
+        Err(e) => e,
     }
 }
 
@@ -903,7 +1790,7 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
         if !buffer_ok(set_ptr, 8, true, from_user) {
             return err::EFAULT;
         }
-        wanted = unsafe { (set_ptr as *const u32).read_volatile() };
+        wanted = unsafe { (set_ptr as *const u32).read_unaligned() };
     }
     let wanted = wanted
         & !(crate::sched::signal::bit(crate::sched::signal::SIGKILL))
@@ -916,8 +1803,8 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
         if !buffer_ok(timeout, 16, true, from_user) {
             return err::EFAULT;
         }
-        let sec = unsafe { (timeout as *const i64).read_volatile() };
-        let nsec = unsafe { ((timeout + 8) as *const i64).read_volatile() };
+        let sec = unsafe { (timeout as *const i64).read_unaligned() };
+        let nsec = unsafe { ((timeout + 8) as *const i64).read_unaligned() };
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             return err::EINVAL;
         }
@@ -935,8 +1822,8 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                 }
                 unsafe {
                     core::ptr::write_bytes(info as *mut u8, 0, SIGINFO_BYTES);
-                    (info as *mut i32).write_volatile(sig as i32); // si_signo
-                    ((info + 8) as *mut i32).write_volatile(SI_USER); // si_code
+                    (info as *mut i32).write_unaligned(sig as i32); // si_signo
+                    ((info + 8) as *mut i32).write_unaligned(SI_USER); // si_code
                 }
             }
             return sig as isize;
@@ -983,7 +1870,7 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         if !buffer_ok(offset_ptr, 8, true, from_user) {
             return err::EFAULT;
         }
-        unsafe { (offset_ptr as *const u64).read_volatile() }
+        unsafe { (offset_ptr as *const u64).read_unaligned() }
     } else {
         input.pos()
     };
@@ -1029,7 +1916,7 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         if !buffer_ok(offset_ptr, 8, false, from_user) {
             return err::EFAULT;
         }
-        unsafe { (offset_ptr as *mut u64).write_volatile(pos) };
+        unsafe { (offset_ptr as *mut u64).write_unaligned(pos) };
     }
     sent as isize
 }
@@ -1044,7 +1931,9 @@ use crate::mm::vm::MapFlags;
 
 // The `mmap`/`mprotect`/`mremap` flag bits are Linux's numbering, pinned in
 // `abi` with the rest of the flag words.
-use super::abi::{MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE, PROT_EXEC, PROT_WRITE};
+use super::abi::{
+    MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE, PROT_EXEC, PROT_WRITE,
+};
 
 /// One past the highest address a process may map: the lower half of the
 /// canonical address space, which is where every user mapping lives.
@@ -1415,7 +2304,7 @@ unsafe fn write_itimerval(at: usize, snapshot: Option<crate::sched::ItimerSnapsh
     let words: [u64; 4] = [value * 1000 / hz, 0, interval * 1000 / hz, 0];
     unsafe {
         for (n, word) in words.iter().enumerate() {
-            (at as *mut u64).add(n).write_volatile(*word);
+            (at as *mut u64).add(n).write_unaligned(*word);
         }
     }
 }
@@ -1443,7 +2332,7 @@ pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
             return err::EFAULT;
         }
         let (vsec, vusec, isec, iusec) = unsafe {
-            let word = |n: usize| (new_ptr as *const u64).add(n).read_volatile();
+            let word = |n: usize| (new_ptr as *const u64).add(n).read_unaligned();
             (word(0), word(1), word(2), word(3))
         };
         // The `tv_usec < 1s` checks and the round-up fold into milliseconds
@@ -1525,13 +2414,13 @@ pub(super) fn handle_sysinfo(args: [usize; ARG_COUNT]) -> isize {
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, SYSINFO_SIZE);
         let word = |offset: usize| (buf + offset) as *mut u64;
-        word(0).write_volatile(ticks / hz); // uptime
-        word(32).write_volatile(stats.total as u64 * page); // totalram
-        word(40).write_volatile(stats.free as u64 * page); // freeram
+        word(0).write_unaligned(ticks / hz); // uptime
+        word(32).write_unaligned(stats.total as u64 * page); // totalram
+        word(40).write_unaligned(stats.free as u64 * page); // freeram
         (buf as *mut u16)
             .add(40)
-            .write_volatile(crate::sched::task_count() as u16); // procs
-        (buf as *mut u32).add(26).write_volatile(1); // mem_unit: bytes
+            .write_unaligned(crate::sched::task_count() as u16); // procs
+        (buf as *mut u32).add(26).write_unaligned(1); // mem_unit: bytes
     }
     0
 }
@@ -1578,8 +2467,8 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     let secs = wall + ticks / freq;
     let nsecs = (ticks % freq) * (1_000_000_000 / freq);
     unsafe {
-        (tp as *mut i64).write_volatile(secs as i64);
-        ((tp + 8) as *mut i64).write_volatile(nsecs as i64);
+        (tp as *mut i64).write_unaligned(secs as i64);
+        ((tp + 8) as *mut i64).write_unaligned(nsecs as i64);
     }
     0
 }
@@ -1601,8 +2490,8 @@ pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
     let secs = crate::arch::rtc::boot_epoch() + ticks / freq;
     let usecs = (ticks % freq) * (1_000_000 / freq);
     unsafe {
-        (tv as *mut i64).write_volatile(secs as i64);
-        ((tv + 8) as *mut i64).write_volatile(usecs as i64);
+        (tv as *mut i64).write_unaligned(secs as i64);
+        ((tv + 8) as *mut i64).write_unaligned(usecs as i64);
     }
     0
 }
@@ -1682,8 +2571,8 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 // likewise in `abi`: their whole behaviour is argument shaping and table
 // answers, and this module keeps only what has to touch the machine.
 
-/// `futex(uaddr, op, val, utime, val3)` — the waiting primitive threads are
-/// built on.
+/// `futex(uaddr, op, val, utime, uaddr2, val3)` — the waiting primitive
+/// threads are built on.
 ///
 /// A real `FUTEX_WAIT` and `FUTEX_WAKE`, which is what a mutex needs, plus
 /// the bitset forms a condvar and `thread::park_timeout` spell their timed
@@ -1692,8 +2581,14 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// `FUTEX_WAKE_BITSET` wakes only the sleepers whose bits intersect the
 /// waker's. Rust's std writes every timed park in the bitset form, so a
 /// kernel without it parks a thread and never hears the alarm.
+///
+/// `val3` is the *sixth* argument. The fifth is `uaddr2`, which only the
+/// requeue operations read and this kernel does not serve; reading `val3`
+/// from its slot made every bitset wait see the zero `uaddr2` passes and
+/// answer `EINVAL` - the answer a libc's lock retries on, forever, which is
+/// how a program as lock-heavy as fish could spin before its first banner.
 pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
-    let (uaddr, op, val, timeout_ptr, val3) = (args[0], args[1], args[2], args[3], args[4]);
+    let (uaddr, op, val, timeout_ptr, val3) = (args[0], args[1], args[2], args[3], args[5]);
     if !buffer_ok(uaddr, 4, false, true) {
         return err::EFAULT;
     }
@@ -1750,8 +2645,12 @@ fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u6
     if !buffer_ok(ts, 16, false, true) {
         return Err(err::EFAULT);
     }
-    let sec = unsafe { (ts as *const i64).read_volatile() };
-    let nsec = unsafe { ((ts + 8) as *const i64).read_volatile() };
+    // The caller's timespec sits in *its* memory at whatever alignment its
+    // own layout gave it - the kernel only asked that 16 readable bytes be
+    // there - so the reads must not assume the 8-byte alignment the type
+    // would have in kernel space.
+    let sec = unsafe { (ts as *const i64).read_unaligned() };
+    let nsec = unsafe { ((ts + 8) as *const i64).read_unaligned() };
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return Err(err::EINVAL);
     }
@@ -1764,8 +2663,7 @@ fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u6
     } else if realtime {
         // The wall clock is the boot epoch plus the tick counter, which is
         // exactly what clock_gettime(CLOCK_REALTIME) reports.
-        let wall_ns =
-            crate::arch::rtc::boot_epoch() as u128 * 1_000_000_000 + now_ns;
+        let wall_ns = crate::arch::rtc::boot_epoch() as u128 * 1_000_000_000 + now_ns;
         target_ns as i128 - wall_ns as i128
     } else {
         // The monotonic clock *is* the tick counter.
@@ -1774,7 +2672,9 @@ fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u6
     if delta_ns <= 0 {
         return Ok(Some(0));
     }
-    Ok(Some(now_ticks as u64 + (delta_ns as u128 * hz / 1_000_000_000) as u64 + 1))
+    Ok(Some(
+        now_ticks as u64 + (delta_ns as u128 * hz / 1_000_000_000) as u64 + 1,
+    ))
 }
 
 /// `sched_getaffinity` / `sched_setaffinity` / the robust-list and rseq
@@ -1800,7 +2700,7 @@ pub(super) fn handle_time(args: [usize; ARG_COUNT]) -> isize {
             return err::EFAULT;
         }
         unsafe {
-            (tloc as *mut i64).write_volatile(secs as i64);
+            (tloc as *mut i64).write_unaligned(secs as i64);
         }
     }
     secs as isize
@@ -1886,8 +2786,8 @@ pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
         }
         let hz = crate::arch::timer::TICK_HZ as u64;
         unsafe {
-            (res as *mut i64).write_volatile(0);
-            ((res + 8) as *mut i64).write_volatile((1_000_000_000 / hz) as i64);
+            (res as *mut i64).write_unaligned(0);
+            ((res + 8) as *mut i64).write_unaligned((1_000_000_000 / hz) as i64);
         }
     }
     0

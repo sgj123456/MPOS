@@ -411,4 +411,82 @@ mod tests {
         let disk = Fake::new(64);
         assert!(find_filesystem(Arc::new(disk)).is_none());
     }
+
+    /// devfs publishes one node per entry - `vda1`, `vda2`, ... - so the
+    /// enumeration has to be the table's own order and nothing else, and an
+    /// entry nobody claimed (an all-zero type GUID) is not a partition.
+    #[test]
+    fn every_claimed_entry_is_enumerated_in_table_order() {
+        let disk = Fake::new(4096);
+        write_gpt(&disk, &[(1, 100), (101, 200), (301, 300)]);
+        assert_eq!(partitions(&disk), vec![(1, 100), (101, 200), (301, 300)]);
+
+        // Blanking the middle entry's type GUID unclaims it: the bounds are
+        // still there, but nothing has said what the partition is.
+        let mut empty = [0u8; GPT_ENTRY_SIZE];
+        empty[32..40].copy_from_slice(&101u64.to_le_bytes());
+        empty[40..48].copy_from_slice(&300u64.to_le_bytes());
+        disk.put(2 * SECTOR + GPT_ENTRY_SIZE as u64, &empty);
+        assert_eq!(partitions(&disk), vec![(1, 100), (301, 300)]);
+    }
+
+    /// Writing through a window lands inside the partition, which is the
+    /// direction the filesystem's own writes take: an offset of 0 is the
+    /// partition's first sector, not the disk's.
+    #[test]
+    fn a_window_writes_inside_its_own_partition() {
+        let disk = Arc::new(Fake::new(4096));
+        write_gpt(&disk, &[(1, 2048), (2049, 2047)]);
+        disk.put_ext2(2049);
+        let found = find_filesystem(disk.clone()).expect("the second partition mounts");
+
+        let mut marker = [0u8; 8];
+        marker.copy_from_slice(b"written!");
+        found.write_at(SUPERBLOCK + 64, &marker);
+
+        // Read back off the raw disk, where those bytes live at the
+        // partition's first sector plus the offset written through the
+        // window: an offset of 0 is the partition's, not the disk's.
+        let mut buf = [0u8; 8];
+        disk.read_at(2049 * SECTOR + SUPERBLOCK + 64, &mut buf);
+        assert_eq!(buf, marker);
+    }
+
+    /// The three named partitions are picked by position, not by content:
+    /// rootfs is the third entry, boot the second, data the fourth. That is
+    /// the layout `mkdisk.sh` writes, and it is the one assumption a
+    /// positional lookup makes that a content search cannot.
+    #[test]
+    fn the_named_partitions_are_the_ones_at_their_position() {
+        let disk = Arc::new(Fake::new(8192));
+        write_gpt(
+            &disk,
+            &[(1, 1024), (1025, 1024), (2049, 1024), (3073, 1024)],
+        );
+        disk.put_ext2(1025); // boot
+        disk.put_ext2(2049); // rootfs
+        disk.put_ext2(3073); // data
+
+        let boot = find_boot(disk.clone()).expect("partition 2 is boot");
+        assert_eq!(boot.capacity_sectors(), 1024);
+        let rootfs = find_rootfs(disk.clone()).expect("partition 3 is the rootfs");
+        assert_eq!(rootfs.capacity_sectors(), 1024);
+        let data = find_data(disk).expect("partition 4 is the data partition");
+        assert_eq!(data.capacity_sectors(), 1024);
+    }
+
+    /// A short table leaves the later names absent rather than answering with
+    /// whichever partition happens to be there - a two-partition disk has no
+    /// rootfs by this rule, however much ext2 is on it.
+    #[test]
+    fn a_table_shorter_than_the_position_answers_nothing() {
+        let disk = Arc::new(Fake::new(4096));
+        write_gpt(&disk, &[(1, 1024), (1025, 1024)]);
+        disk.put_ext2(1);
+        disk.put_ext2(1025);
+
+        assert!(find_boot(disk.clone()).is_some(), "partition 2 is there");
+        assert!(find_rootfs(disk.clone()).is_none(), "there is no third");
+        assert!(find_data(disk).is_none(), "there is no fourth");
+    }
 }

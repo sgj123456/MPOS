@@ -1,10 +1,9 @@
 /target
 /build
-/boot/target
-/third_party/limine
 
 .Trash-*/
 .workbuddy/
+.codely-cli/
 __pycache__/
 
 # 一次性探针的残留：沙箱把这两个文件钉成了 bind mount，容器内删不掉。

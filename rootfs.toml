@@ -1,0 +1,62 @@
+# rootfs configuration for mpos
+# This file specifies additional packages and configuration for the root filesystem
+
+[rootfs]
+# Alpine mirror URL
+mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
+# Alpine branch
+branch = "latest-stable"
+# Architecture
+arch = "x86_64"
+# Filesystem type
+filesystem = "ext2"
+# Root device in the guest
+root_device = "/dev/vda2"
+# Serial port
+serial_port = "ttyS0"
+# Image size
+image_size = "2G"
+
+# Base packages that are always installed (do not modify unless needed)
+base_packages = ["alpine-base", "e2fsprogs", "dosfstools"]
+
+# Additional packages to install in rootfs
+# These are added on top of the base packages
+extra_packages = [
+    "openrc",
+    "alpine-release",
+    "ssl_client",
+    "ca-certificates",
+    "apk-tools",
+    "fastfetch",
+    "strace",
+    "musl-dev",
+    "gcc",
+    "curl",
+    "sudo",
+    "fish"
+]
+
+# Files to include in the rootfs (relative to rootfs/ directory)
+# These will be copied to the root of the rootfs
+include_files = []
+
+# Directories to include in the rootfs (relative to rootfs/ directory)
+# These will be copied recursively to the root of the rootfs
+include_dirs = []
+
+# Network configuration
+[network]
+# Interface name
+interface = "eth0"
+# DHCP configuration
+dhcp = true
+
+# System configuration
+[system]
+# Hostname
+hostname = "mpos"
+# Timezone
+timezone = "UTC"
+# Locale
+locale = "en_US.UTF-8"

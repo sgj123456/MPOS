@@ -185,3 +185,13 @@ pub fn init() {
 pub fn boot_epoch() -> u64 {
     BOOT_EPOCH.load(Ordering::Relaxed)
 }
+
+/// Move the boot anchor, the way `settimeofday(2)` and `clock_settime(2)`
+/// set the wall clock: the tick counter keeps running, and the epoch it is
+/// measured from moves underneath it. The one discontinuity this makes is
+/// exactly the one those calls promise - the wall clock jumps - and the
+/// timers that asked to hear about it are told, by the caller that reaches
+/// for the anchor.
+pub fn set_boot_epoch(epoch: u64) {
+    BOOT_EPOCH.store(epoch, Ordering::Relaxed);
+}

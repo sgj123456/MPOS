@@ -1,22 +1,13 @@
-# Every program that runs on mpos, as one workspace member.
+# The ordinary user programs that run on mpos - `std` binaries, `fn main`,
+# with `rustix` for the calls that are not in `std`. They are built for
+# `x86_64-unknown-linux-musl` and statically linked, because this kernel's
+# Linux ABI is written against musl and its loader only accepts the static
+# ET_EXEC shape - see the rustflags in the root `.cargo/config.toml`.
 #
-# These are ordinary Rust binaries: `std`, `fn main`, and `rustix` for the
-# calls that are not in `std`. They are built for `x86_64-unknown-linux-musl`
-# and statically linked, because this kernel's Linux ABI is written against
-# musl and its loader only accepts the static ET_EXEC shape - see the
-# rustflags in `.cargo/config.toml`.
-#
-# `rustix` rather than raw `syscall` instructions is not a style choice. A
-# test written with inline asm can pass against a kernel that is wrong: the
-# arguments are whatever the author wrote down, and the errno is whatever the
-# register happened to hold. `rustix` names the call, checks the shape, and
-# hands back a `Result` whose `Errno` is the one Linux defines - so a test
-# that says "this is EAFNOSUPPORT" is a claim about the ABI, not about the
-# author's memory of it.
-#
-# `all-apis` is deliberate: these programs are the kernel's conformance
-# suite, and a feature gate that quietly removes an API would remove a test
-# with it.
+# The test programs are deliberately *not* here: the no-std ABI conformance
+# suite lives in `user/abitest`, the std-side tests in `user/tests`, and
+# `cargo xtask test` is what builds and runs them. A regular program ships in
+# the system image; a test only ever ships in the self-test initramfs.
 [package]
 name = "mpos-user"
 version = "0.1.0"
@@ -27,14 +18,3 @@ rustix = { version = "1", default-features = false, features = [
     "std",
     "all-apis",
 ] }
-
-# The binaries are named `t_<syscall>`, which is this project's convention for
-# an ABI conformance test - one per call, named after it, so the boot sweep's
-# output says which one is missing. That is not kebab-case and is not going to
-# be; the sweep and the gate both match on these exact names.
-[lints.cargo]
-non_kebab_case_bins = "allow"
-
-# No `[profile]` here: a profile in a non-root workspace member is ignored by
-# cargo and warns. The panic strategy these programs are built with is the
-# workspace's, set in the root manifest - as it is for the kernel.

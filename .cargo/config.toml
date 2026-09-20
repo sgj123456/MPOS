@@ -49,3 +49,6 @@ rustflags = [
     "-C", "link-arg=-no-pie",
     "-C", "link-arg=-Wl,-z,norelro",
 ]
+
+[alias]
+xtask = "run --quiet --package mpos-xtask --target x86_64-unknown-linux-gnu --"

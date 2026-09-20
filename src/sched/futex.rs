@@ -125,9 +125,14 @@ pub fn waiting_on(address: usize) -> usize {
 /// sends the caller back to look again rather than to sleep.
 #[cfg(target_os = "none")]
 fn word_at(address: usize) -> u32 {
+    // Unaligned, not volatile: the caller names the address, and nothing in
+    // the ABI promises a futex word sits on a four-byte boundary - a `u32`
+    // packed behind a byte in some other process's struct is still a word it
+    // may wait on. Volatile would add nothing here anyway: the point is not to
+    // defeat an optimisation, it is to read what is there right now.
     match super::user_frame_at(address) {
         Some(phys) => unsafe {
-            core::ptr::read_volatile(crate::mm::phys_to_virt(phys) as *const u32)
+            core::ptr::read_unaligned(crate::mm::phys_to_virt(phys) as *const u32)
         },
         None => 0,
     }
@@ -135,7 +140,7 @@ fn word_at(address: usize) -> u32 {
 
 #[cfg(not(target_os = "none"))]
 fn word_at(address: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(address as *const u32) }
+    unsafe { core::ptr::read_unaligned(address as *const u32) }
 }
 
 /// `FUTEX_WAIT`: sleep while the word at `address` still holds `expected`.
@@ -170,7 +175,6 @@ pub fn wait_bitset(address: usize, expected: u32, bitset: u32, deadline: Option<
         return crate::syscall::err::EAGAIN;
     }
 
-    crate::println!("DBG futex wait {address} expected {expected:#x}");
     // The sleep names the deadline, not "never" when there is one: the
     // clock's own tick can end the wait, and a wake ends it sooner. The
     // unregister runs before the answer is spelled, so a sleeper that
@@ -183,10 +187,8 @@ pub fn wait_bitset(address: usize, expected: u32, bitset: u32, deadline: Option<
     // waitpid blocks on a futex and relies on its SIGCHLD handler to change
     // the word - and musl's __wait retries an EINTR against the
     // handler-updated word, which then answers EAGAIN.
-    let woken = super::block_until_deadline(
-        || is_woken(address, current),
-        deadline.unwrap_or(u64::MAX),
-    );
+    let woken =
+        super::block_until_deadline(|| is_woken(address, current), deadline.unwrap_or(u64::MAX));
     unregister(address, current);
     match woken {
         super::WaitEnd::Condition => 0,
@@ -207,7 +209,6 @@ pub fn wake(address: usize, count: usize) -> usize {
 #[cfg(target_os = "none")]
 pub fn wake_bitset(address: usize, count: usize, bitset: u32) -> usize {
     let woken = mark_woken_bitset(address, count, bitset);
-    crate::println!("DBG futex wake {address} -> {woken}");
     if woken > 0 {
         // A task inside `block_until` sleeps with a deadline of "never", so it
         // has to be told to look again. Sleeping waiters under other bits are

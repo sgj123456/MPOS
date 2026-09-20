@@ -26,10 +26,14 @@ use crate::boot::{BootInfo, MemRegion};
 pub const PAGE_SHIFT: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 
-/// Largest block handed out, as a power of two in pages: 2^12 pages = 16 MiB.
-/// Big enough that the kernel heap arena and later page-table pools are single
-/// allocations, small enough that merging stays cheap.
-pub const MAX_ORDER: usize = 12;
+/// Largest block handed out, as a power of two in pages: 2^14 pages = 64 MiB.
+/// Big enough that the kernel heap arena, a page-table pool, and a whole user
+/// image read in for `execve` are single allocations - gcc's compiler proper
+/// alone is 40 MB - and small enough that merging stays cheap. The free-list
+/// indices are `u32`s, so the ceiling this could reach is four terabytes of
+/// frames; the real bound is that a bigger order makes every search walk more
+/// lists for a benefit nothing here has needed.
+pub const MAX_ORDER: usize = 14;
 
 /// One zone per usable memory region; QEMU and real firmware both stay far below.
 pub const MAX_ZONES: usize = 32;

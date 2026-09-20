@@ -149,9 +149,8 @@ impl PageTables {
             "map({virt:#x}, {phys:#x}, {len:#x}) is not whole pages"
         );
 
-        let leaf = PRESENT
-            | if writable { WRITABLE } else { 0 }
-            | if executable { 0 } else { NO_EXECUTE };
+        let leaf =
+            PRESENT | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE };
 
         let mut offset = 0;
         while offset < len {

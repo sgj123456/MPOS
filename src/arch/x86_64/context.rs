@@ -6,20 +6,158 @@
 //! it belongs to the interrupted task's own trap frame, still sitting on its
 //! stack where `iretq` will find it when that task comes back.
 //!
-//! Two properties of the target keep this as small as it is. `disable-redzone`
-//! means an interrupt cannot land on data a leaf function parked below its stack
-//! pointer. And SSE is off with `soft-float`, so there is no XMM state to carry.
+//! Two properties of the target keep the *integer* half as small as it is.
+//! `disable-redzone` means an interrupt cannot land on data a leaf function
+//! parked below its stack pointer, and the kernel is built `soft-float`, so its
+//! own use of the FPU is nonexistent and needs no saving.
+//!
+//! What the soft-float build does **not** remove is the *user's* floating-point
+//! state. Two ring-3 programs share one physical x87/XMM register file, and the
+//! switch is the only place anything can arrange for each to keep its own - the
+//! kernel never touches those registers, so a syscall does not disturb them, but
+//! it does *preempt*, and the program that runs next has no reason to leave the
+//! registers as it found them. That state is [`FpuState`], carried in the first
+//! 512 bytes of every [`Context`], and moved by the `fxsave`/`fxrstor` pair in
+//! `mpos_context_switch`.
+//!
+//! Leaving it out is not a missing optimisation, it is a wrong answer that shows
+//! up as memory corruption. musl's `__init_tp` builds `{td, td}` in `xmm0`, makes
+//! the `set_tid_address` syscall with it live, and only then stores it - over the
+//! `prev` and `next` links of the main thread's control block. Any preemption in
+//! that window (any other program's `memcpy`, which musl writes with `movups`)
+//! hands the store whatever that program left in the register: with zeros, `fish`
+//! ends up with an unlinked thread ring, `pthread_key_delete` walks off its end,
+//! reads a pointer out of the process's own program headers, and stores into the
+//! read-only first page of its image.
 
 use core::arch::global_asm;
 
-/// The suspended half of a task: one word, the stack pointer its registers were
-/// left at.
+/// The 512 bytes `fxsave` and `fxrstor` move: the x87 control/status/tag words,
+/// the eight x87 registers, `MXCSR` and the sixteen XMM registers.
 ///
-/// The registers themselves are on the task's own stack and this points at them,
-/// which is why a `Context` must never move while its task is alive.
+/// `align(16)` is the instruction's requirement, not a preference - `fxsave`
+/// raises `#GP` on a misaligned operand - and it is why this is the first field
+/// of [`Context`]: a struct that *begins* with a 16-byte-aligned member is
+/// 16-byte-aligned itself, whatever the caller does with it.
+///
+/// Only x87 and SSE are covered. AVX's upper halves would need `xsave` and a
+/// CPUID check, and no program that runs here is built to use them: the guest
+/// CPU has no AVX, and musl's string routines - which are what would reach for
+/// it - are baseline x86-64.
+#[repr(C, align(16))]
 #[derive(Debug)]
-#[repr(transparent)]
+pub struct FpuState {
+    bytes: [u8; FPU_BYTES],
+}
+
+/// How many bytes one task's floating-point state occupies - what `fxsave`,
+/// `fxrstor`, `PTRACE_GETFPREGS` and `PTRACE_SETFPREGS` all agree on.
+pub const FPU_BYTES: usize = 512;
+
+impl FpuState {
+    /// The architectural reset state: the state a CPU is in after `fninit` and
+    /// `ldmxcsr(0x1f80)`.
+    ///
+    /// Two fields have to be *written* rather than left zero, and both are load
+    /// bearing. `MXCSR` at 0 would unmask every SSE exception, so the first
+    /// inexact result a program computed would raise `#XM` - with no handler for
+    /// it, and a kernel that has never needed one. And the x87 tag word has to
+    /// say "all eight registers empty", not "all eight hold zero".
+    ///
+    /// A task that runs user code must therefore never start from a zeroed
+    /// block; [`Context::empty`] and [`bootstrap`] are the two doors in, and
+    /// both go through here.
+    pub const fn reset() -> FpuState {
+        let mut bytes = [0u8; 512];
+        bytes[0] = 0x7f; // x87 control word 0x037f: round to nearest, 64-bit
+        bytes[1] = 0x03;
+        bytes[4] = 0xff; // abridged tag word: all x87 registers empty
+        bytes[24] = 0x80; // MXCSR 0x1f80: all exceptions masked, round to nearest
+        bytes[25] = 0x1f;
+        FpuState { bytes }
+    }
+
+    /// The address `fxsave`/`fxrstor` take, for the assembly to use.
+    fn ptr_mut(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    /// The image as a plain array, for a tracer to hand to ring 3.
+    pub fn to_bytes(&self) -> [u8; FPU_BYTES] {
+        self.bytes
+    }
+
+    /// An image a tracer supplied. Not validated: the caller is a debugger
+    /// writing the registers its tracee will resume with, and every bit pattern
+    /// in the area is a state `fxrstor` will load.
+    pub fn from_bytes(bytes: &[u8; FPU_BYTES]) -> FpuState {
+        FpuState { bytes: *bytes }
+    }
+}
+
+impl Default for FpuState {
+    fn default() -> FpuState {
+        FpuState::reset()
+    }
+}
+
+/// Copy the *live* floating-point registers into `state`.
+///
+/// For the two places that need the running task's state rather than a saved
+/// one: a `fork` child inherits its parent's, and so does a thread. Reading the
+/// registers touches no XMM register, so this is safe to call from the kernel
+/// without disturbing the value it is copying.
+///
+/// # Safety
+///
+/// The CPU must be able to execute `fxsave`: `CR4.OSFXSR` set (see
+/// [`super::enable_user_sse`]) and `CR0.TS` and `CR0.EM` clear (nothing here
+/// sets either).
+pub unsafe fn save_live_fpu(state: &mut FpuState) {
+    unsafe {
+        core::arch::asm!(
+            "fxsave [{ptr}]",
+            ptr = in(reg) state.ptr_mut(),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Put the *live* floating-point registers back to the architectural reset
+/// state, so that they agree with an [`FpuState::reset`] block.
+///
+/// `execve` is the caller: the image it discards had whatever state it had, and
+/// the next program must not be able to read it out of the registers - which is
+/// what it would do if only the *saved* block were reset, because the registers
+/// are the copy that is live until the next switch.
+///
+/// # Safety
+///
+/// Same requirement as [`save_live_fpu`], plus that restoring the register file
+/// is what the caller wants: it discards the current contents.
+pub unsafe fn reset_live_fpu() {
+    static DEFAULT_MXCSR: u32 = 0x1f80;
+    unsafe {
+        core::arch::asm!(
+            "fninit",
+            "ldmxcsr [{mxcsr}]",
+            mxcsr = in(reg) &raw const DEFAULT_MXCSR,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// The suspended half of a task: its floating-point state and the stack pointer
+/// its integer registers were left at.
+///
+/// `fpu` comes first so that it starts 16 bytes into nothing - see [`FpuState`].
+/// The integer registers themselves are on the task's own stack, which is what
+/// `stack_pointer` names, and that is why a `Context` must never move while its
+/// task is alive.
+#[repr(C)]
+#[derive(Debug)]
 pub struct Context {
+    pub fpu: FpuState,
     stack_pointer: usize,
 }
 
@@ -27,9 +165,16 @@ impl Context {
     /// A context that has never been switched out of. The boot task starts here;
     /// its first switch away fills in the real value.
     pub const fn empty() -> Context {
-        Context { stack_pointer: 0 }
+        Context {
+            fpu: FpuState::reset(),
+            stack_pointer: 0,
+        }
     }
 }
+
+/// The offset `mpos_context_switch` reads the stack pointer from - the end of
+/// the `FpuState` that starts the struct.
+const CONTEXT_STACK_POINTER: usize = size_of::<FpuState>();
 
 /// Registers [`switch`] pushes, not counting the return address the `call` that
 /// reached it already pushed.
@@ -90,6 +235,7 @@ pub unsafe fn bootstrap(
         unsafe { slot.add(index).write_volatile(*word) };
     }
     Context {
+        fpu: FpuState::reset(),
         stack_pointer: base,
     }
 }
@@ -283,6 +429,26 @@ global_asm!(
     ".p2align 4",
     "mpos_context_switch:",
     "    cli",
+    // The floating-point half of the switch. `fxsave`/`fxrstor` want a
+    // 16-byte-aligned operand, which is why `FpuState` is 512 bytes of
+    // `align(16)` at offset zero: `[rdi]` and `[rsi]` are the *Contexts*
+    // themselves, and every one of them is 16-byte-aligned because the struct
+    // starts with an aligned member.
+    //
+    // `clts` is insurance rather than necessity - nothing here ever sets
+    // `CR0.TS`, so a lazy-FPU scheme is not in use and the bit is already
+    // clear. But `fxsave` raises `#NM` if it is ever set, and `#NM` has no
+    // handler here, so the cost of being wrong about that is a panic on the
+    // first switch. One instruction, once per switch, buys the guarantee.
+    //
+    // The pair is done before the integer registers are touched: neither
+    // instruction uses a register of its own, and doing it first means the
+    // saved image describes the CPU as the task left it rather than as the
+    // switch's own prologue left it. (The prologue is integer-only, so the two
+    // orderings are in fact identical today; the ordering is what keeps them
+    // identical if that ever changes.)
+    "    clts",
+    "    fxsave [rdi]",
     "    push rbx",
     "    push rbp",
     "    push r12",
@@ -290,8 +456,12 @@ global_asm!(
     "    push r14",
     "    push r15",
     "    pushfq",
-    "    mov [rdi], rsp",
-    "    mov rsp, [rsi]",
+    "    mov [rdi + {sp}], rsp",
+    "    mov rsp, [rsi + {sp}]",
+    // The incoming task's registers, loaded while rsi is still the pointer to
+    // them - the pops below never touch rsi, so the two could be swapped, but
+    // this reads as "aim at the new task, then restore it".
+    "    fxrstor [rsi]",
     "    popfq",
     "    pop r15",
     "    pop r14",
@@ -300,8 +470,15 @@ global_asm!(
     "    pop rbp",
     "    pop rbx",
     "    ret",
-    // Where a task's stack first lands. The pops above have already put the
-    // entry point in r12 and the argument in rbx.
+    sp = const CONTEXT_STACK_POINTER,
+);
+
+global_asm!(
+    // Where a task's stack first lands. The pops in `mpos_context_switch` have
+    // already put the entry point in r12 and the argument in rbx - the two
+    // registers `bootstrap` wrote for the purpose. Separate from the switch
+    // above only because a `global_asm!` template may not be resumed after a
+    // named operand.
     ".globl mpos_task_trampoline",
     ".p2align 4",
     "mpos_task_trampoline:",

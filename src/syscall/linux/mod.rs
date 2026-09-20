@@ -25,6 +25,16 @@ pub mod fs;
 #[cfg(target_os = "none")]
 pub(crate) mod proc;
 
+/// The POSIX completion set's process half: identity, capabilities,
+/// scheduling, memory advice, the wall clock's setters, and the signals a
+/// process aims at itself. Kept beside `fs` and `proc` rather than inside
+/// `proc` because it is the surface *completed* rather than the machinery
+/// - the calls are table answers and validations over the scheduler's
+/// exported state, and the module's own opening note says what that
+/// means for each family.
+#[cfg(target_os = "none")]
+pub(crate) mod posix;
+
 /// Run a pending signal's handler on the way out of a syscall.
 ///
 /// The register frame is what makes this possible at all - entering a handler
@@ -121,6 +131,12 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::SOCKETPAIR => crate::net::socket::handle_socketpair(args, from_user),
         nr::SETSOCKOPT => crate::net::socket::handle_setsockopt(args, from_user),
         nr::GETSOCKOPT => crate::net::socket::handle_getsockopt(args, from_user),
+        // The multiple-message pair and the flagged accept: `sendmsg` and
+        // `recvmsg` over an array of records, and `accept` with the two
+        // descriptor flags the modern spelling takes.
+        nr::ACCEPT4 => crate::net::socket::handle_accept4(args, from_user),
+        nr::SENDMMSG => crate::net::socket::handle_sendmmsg(args, from_user),
+        nr::RECVMMSG => crate::net::socket::handle_recvmmsg(args, from_user),
 
         // --- process ---
         nr::EXECVE => proc::handle_execve(args, &cwd(), regs_ptr),
@@ -138,6 +154,12 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::CLOCK_NANOSLEEP => proc::handle_clock_nanosleep(args, from_user),
         nr::KILL => proc::handle_kill(args),
         nr::TKILL => proc::handle_kill(args),
+        // `ptrace` and its bulk-memory relatives: one task observing another.
+        // They are in `proc` because everything they need - the task table, the
+        // register frames, the stops - is the process machinery's.
+        nr::PTRACE => proc::handle_ptrace(args, from_user),
+        nr::PROCESS_VM_READV => proc::handle_process_vm_readv(args, from_user),
+        nr::PROCESS_VM_WRITEV => proc::handle_process_vm_writev(args, from_user),
         nr::RT_SIGTIMEDWAIT => proc::handle_rt_sigtimedwait(args, from_user),
         nr::REBOOT => proc::handle_reboot(args),
         // The hostname is kept, not just accepted: `uname -n`, `hostname`
@@ -153,7 +175,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // the register file and the caller's own group is the whole answer.
         nr::GETPGRP => proc::handle_getpgid([0; 6]),
         nr::CLONE => proc::handle_clone(args, regs_ptr),
-        nr::FORK | nr::VFORK => proc::handle_fork(args, regs_ptr),
+        nr::FORK | nr::VFORK => proc::handle_fork(nr, args, regs_ptr),
 
         // --- memory ---
         nr::BRK => proc::handle_brk(args),
@@ -185,17 +207,15 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::CLOCK_GETTIME => proc::handle_clock_gettime(args),
         nr::GETTIMEOFDAY => proc::handle_gettimeofday(args),
         nr::UNAME => proc::handle_uname(args, true),
-        nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => 0,
-        // setuid/setgid: this kernel runs everything as uid/gid 0, so a root
-        // login's "become root" calls are already true. Anything else is a
-        // privilege change there is no identity model for.
-        nr::SETUID | nr::SETGID => {
-            if args[0] == 0 {
-                0
-            } else {
-                err::EPERM
-            }
-        }
+        nr::GETUID => posix::handle_getuid(args),
+        nr::GETEUID => posix::handle_geteuid(args),
+        nr::GETGID => posix::handle_getgid(args),
+        nr::GETEGID => posix::handle_getegid(args),
+        // setuid/setgid: root may set any id - a privilege dance like
+        // sudo's depends on exactly that - and everyone else only an id
+        // they already hold, which is the man page's own rule.
+        nr::SETUID => posix::handle_setuid(args),
+        nr::SETGID => posix::handle_setgid(args),
         nr::SETSID => proc::handle_setsid(args),
         nr::GETSID => proc::handle_getsid(args),
         nr::SETGROUPS => 0,
@@ -220,6 +240,20 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::PWRITE64 => fs::handle_pwrite64(args, from_user),
         nr::PREADV => fs::handle_preadv(args, from_user),
         nr::PWRITEV => fs::handle_pwritev(args, from_user),
+        // The positioned-vectored pair with the advice words. `offset` of
+        // -1 is the cursor-carrying spelling - the position the descriptor
+        // itself keeps - and a flag the kernel does not know is the one
+        // refusal, spelled EOPNOTSUPP the way the man page spells it.
+        nr::PREADV2 => fs::handle_preadv2(args, from_user),
+        nr::PWRITEV2 => fs::handle_pwritev2(args, from_user),
+        // `fallocate`'s default operation is real: the zero-filled
+        // extension a truncate makes is the allocated range the man page
+        // promises. The interior-reshaping operations are refused with
+        // the errno a filesystem without the feature gets.
+        nr::FALLOCATE => fs::handle_fallocate(args),
+        // The kernel-made copy: both ends regular files, a mount crossing
+        // answered EXDEV like `link(2)`'s, and the offsets in-out.
+        nr::COPY_FILE_RANGE => fs::handle_copy_file_range(args, from_user),
         nr::FSYNC | nr::FDATASYNC => fs::handle_fsync(args),
         nr::CHMOD => fs::handle_chmod(args, &cwd()),
         nr::FCHMOD => fs::handle_fchmod(args),
@@ -252,6 +286,87 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::SIGNALFD => fs::handle_signalfd(args, 0, from_user),
         nr::SIGNALFD4 => fs::handle_signalfd(args, args[3], from_user),
         nr::EVENTFD => fs::handle_eventfd(args),
+        // --- the POSIX completion set ---
+        //
+        // The descriptor-backed timer and the interest-list multiplexer:
+        // the pair of subsystems a poll loop is built on, and the two this
+        // table was missing. The timer answers through `read` the way the
+        // signalfd above answers through one; the epoll instance is an
+        // anonymous inode whose interest list the ctl builds and the wait
+        // walks.
+        nr::TIMERFD_CREATE => fs::handle_timerfd_create(args),
+        nr::TIMERFD_SETTIME => fs::handle_timerfd_settime(args, from_user),
+        nr::TIMERFD_GETTIME => fs::handle_timerfd_gettime(args, from_user),
+        nr::EPOLL_CREATE => fs::handle_epoll_create(args),
+        nr::EPOLL_CREATE1 => fs::handle_epoll_create1(args),
+        nr::EPOLL_CTL => fs::handle_epoll_ctl(args, from_user),
+        nr::EPOLL_WAIT => fs::handle_epoll_wait(args, from_user),
+        nr::EPOLL_PWAIT => fs::handle_epoll_pwait(args, from_user),
+        nr::EPOLL_PWAIT2 => fs::handle_epoll_pwait2(args, from_user),
+        // The *at and modern spellings of the file calls: the access check
+        // with flags, the extensible open, the permission bits and the
+        // node-maker relative to a dirfd, and the legacy `creat`/`utime`
+        // numbers a libc still dials directly.
+        nr::OPENAT2 => fs::handle_openat2(args, &cwd(), from_user),
+        nr::FACCESSAT2 => fs::handle_faccessat2(args, &cwd()),
+        nr::FCHMODAT => fs::handle_fchmodat(args, &cwd()),
+        nr::MKNODAT => fs::handle_mknodat(args, &cwd()),
+        nr::FUTIMESAT => fs::handle_futimesat(args, &cwd(), from_user),
+        nr::CREAT => fs::handle_creat(args, &cwd()),
+        nr::UTIME => fs::handle_utime(args, &cwd(), from_user),
+        // The pipe-and-file mover, the eager read, the one-descriptor
+        // flush, and the kernel log's own door - four calls whose whole
+        // contract here is a rule each and the descriptor checks.
+        nr::SPLICE => fs::handle_splice(args, from_user),
+        nr::READAHEAD => fs::handle_readahead(args),
+        nr::SYNCFS => fs::handle_syncfs(args),
+        nr::SYSLOG => fs::handle_syslog(args, from_user),
+        // The process half: identity, capabilities, scheduling, memory
+        // advice, the wall clock's setters, and the self-aimed signals.
+        // `posix` holds the whole family; the module's own opening note
+        // spells what each subfamily answers.
+        nr::SETREUID => posix::handle_setreuid(args),
+        nr::SETREGID => posix::handle_setregid(args),
+        nr::SETRESUID => posix::handle_setresuid(args),
+        nr::GETRESUID => posix::handle_getresuid(args, from_user),
+        nr::SETRESGID => posix::handle_setresgid(args),
+        nr::GETRESGID => posix::handle_getresgid(args, from_user),
+        nr::SETFSUID => posix::handle_setfsuid(args),
+        nr::SETFSGID => posix::handle_setfsgid(args),
+        nr::CAPGET => posix::handle_capget(args, from_user),
+        nr::CAPSET => posix::handle_capset(args, from_user),
+        nr::SCHED_SETPARAM => posix::handle_sched_setparam(args, from_user),
+        nr::SCHED_GETPARAM => posix::handle_sched_getparam(args, from_user),
+        nr::SCHED_SETSCHEDULER => posix::handle_sched_setscheduler(args, from_user),
+        nr::SCHED_GETSCHEDULER => posix::handle_sched_getscheduler(args),
+        nr::SCHED_GET_PRIORITY_MAX => posix::handle_sched_get_priority_max(args),
+        nr::SCHED_GET_PRIORITY_MIN => posix::handle_sched_get_priority_min(args),
+        nr::SCHED_RR_GET_INTERVAL => posix::handle_sched_rr_get_interval(args, from_user),
+        nr::SCHED_SETATTR => posix::handle_sched_setattr(args, from_user),
+        nr::SCHED_GETATTR => posix::handle_sched_getattr(args, from_user),
+        nr::GETPRIORITY => posix::handle_getpriority(args),
+        nr::SETPRIORITY => posix::handle_setpriority(args),
+        nr::MSYNC => posix::handle_msync(args),
+        nr::MINCORE => posix::handle_mincore(args, from_user),
+        nr::MLOCK => posix::handle_mlock(args),
+        nr::MUNLOCK => posix::handle_munlock(args),
+        nr::MLOCKALL => posix::handle_mlockall(args),
+        nr::MUNLOCKALL => posix::handle_munlockall(args),
+        nr::MLOCK2 => posix::handle_mlock2(args),
+        nr::PERSONALITY => posix::handle_personality(args),
+        nr::VHANGUP => posix::handle_vhangup(args),
+        nr::GETCPU => posix::handle_getcpu(args, from_user),
+        nr::SETTIMEOFDAY => posix::handle_settimeofday(args, from_user),
+        nr::CLOCK_SETTIME => posix::handle_clock_settime(args, from_user),
+        nr::UNSHARE => posix::handle_unshare(args),
+        nr::SETNS => posix::handle_setns(args),
+        nr::SECCOMP => posix::handle_seccomp(args, from_user),
+        nr::SETDOMAINNAME => posix::handle_setdomainname(args),
+        nr::TGKILL => posix::handle_tgkill(args),
+        nr::RT_SIGPENDING => posix::handle_rt_sigpending(args, from_user),
+        nr::RT_SIGQUEUEINFO => posix::handle_rt_sigqueueinfo(args, from_user),
+        nr::RT_SIGSUSPEND => posix::handle_rt_sigsuspend(args, from_user),
+        nr::PAUSE => posix::handle_pause(),
         nr::FADVISE64 => fs::handle_fadvise64(args),
         nr::PSELECT6 => fs::pselect6(args),
         nr::TIME => proc::handle_time(args),
@@ -275,13 +390,16 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
     if ret == super::err::ENOSYS {
         note_enosys(nr);
     }
+    if ret == super::err::EOPNOTSUPP {
+        println!("[nr] : {nr}");
+    }
     ret
 }
 
 #[cfg(target_os = "none")]
 use super::err;
 #[cfg(target_os = "none")]
-use crate::sched::current_cwd as cwd;
+use crate::{println, sched::current_cwd as cwd};
 
 #[cfg(target_os = "none")]
 const ARCH_SET_GS: usize = 0x1001;
@@ -410,7 +528,7 @@ fn rt_sigprocmask(args: [usize; 6]) -> isize {
         if !super::buffer_ok(set, 8, false, true) {
             return err::EFAULT;
         }
-        requested = unsafe { (set as *const u64).read_volatile() };
+        requested = unsafe { (set as *const u64).read_unaligned() };
     }
 
     // The query half is answered first and from the mask as it stands, which
@@ -420,7 +538,7 @@ fn rt_sigprocmask(args: [usize; 6]) -> isize {
         if !super::buffer_ok(old, 8, true, true) {
             return err::EFAULT;
         }
-        unsafe { (old as *mut u64).write_volatile(current as u64) };
+        unsafe { (old as *mut u64).write_unaligned(current as u64) };
     }
 
     if set != 0 {
@@ -540,7 +658,7 @@ fn handle_arch_prctl(args: [usize; 6]) -> isize {
             if !super::buffer_ok(addr, 8, true, true) {
                 return err::EFAULT;
             }
-            unsafe { (addr as *mut u64).write_volatile(crate::sched::current_tls() as u64) };
+            unsafe { (addr as *mut u64).write_unaligned(crate::sched::current_tls() as u64) };
             0
         }
         ARCH_SET_GS => {
@@ -568,7 +686,7 @@ fn handle_arch_prctl(args: [usize; 6]) -> isize {
                 return err::EFAULT;
             }
             let val = ((hi as u64) << 32) | (lo as u64);
-            unsafe { (addr as *mut u64).write_volatile(val) };
+            unsafe { (addr as *mut u64).write_unaligned(val) };
             0
         }
         _ => err::EINVAL,

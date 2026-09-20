@@ -32,6 +32,23 @@ pub const MMAP_BASE: usize = 0x0000_7f00_0000_0000;
 pub mod err {
     pub const ENOENT: isize = -2;
     pub const ESRCH: isize = -3;
+    /// EIO: an I/O error. `ptrace` answers it for a request the kernel does
+    /// not know or a tracee address it cannot reach, which is exactly how Linux
+    /// spells both - and a debugger distinguishes them from `EFAULT`, which
+    /// means the *caller's* pointer was bad.
+    pub const EIO: isize = -5;
+    pub const ENXIO: isize = -6;
+    /// ECANCELED: the operation was undone by something outside it. The
+    /// one user is a `TFD_TIMER_CANCEL_ON_SET` timer whose real-time clock
+    /// was set underneath it - timerfd_create(2) says the next read(2) fails
+    /// with exactly this, and a caller distinguishes it from EINVAL, which
+    /// would mean the buffer it handed over was the problem.
+    pub const ECANCELED: isize = -125;
+    /// EACCES: permission denied. What `access(2)`'s family answers for the
+    /// one check this kernel can refuse - an execute asked of a file whose
+    /// stored mode has no execute bit - which is the question a shell's
+    /// `test -x` is really asking.
+    pub const EACCES: isize = -13;
     pub const ENOEXEC: isize = -8;
     pub const EBADF: isize = -9;
     pub const ECHILD: isize = -10;
@@ -143,14 +160,26 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::NoSpace => err::ENOSPC,
         VfsError::FileTooBig => err::EFBIG,
         VfsError::BrokenPipe => err::EPIPE,
-        VfsError::Unsupported => err::ENOSYS,
+        VfsError::Unsupported => err::EOPNOTSUPP,
         // EROFS: what Linux answers a write to a filesystem mounted
         // read-only, and what userland checks for before remounting.
         VfsError::ReadOnly => err::EROFS,
+        // EIO: damage the filesystem can see. Reported rather than panicked on
+        // for the same reason Linux reports it - a caller can be told, and a
+        // machine that stops on one bad directory entry cannot tell anyone.
+        VfsError::Corrupt => err::EIO,
         // EXDEV: a hard link whose two ends live on different filesystems.
         VfsError::CrossDevice => err::EXDEV,
         // EAGAIN, which is also EWOULDBLOCK: they are one errno here.
         VfsError::Again => err::EWOULDBLOCK,
+        // ECANCELED: a timerfd whose CANCEL_ON_SET clock was set - the
+        // read that would have counted its expirations reports the undoing
+        // instead, which is timerfd_create(2)'s wording of the case.
+        VfsError::Canceled => err::ECANCELED,
+        // ENXIO: the device's name answers nothing for this caller. `/dev/tty`
+        // without a controlling terminal is the whole case - POSIX's own
+        // answer, and the one a shell reads as "job control off".
+        VfsError::NoDevice => err::ENXIO,
     }
 }
 
@@ -186,6 +215,25 @@ fn user_accessible(_buf: usize, _len: usize, _write: bool) -> bool {
 /// unmapped bytes beyond it. A string with no NUL within [`MAX_PATH`]
 /// characters answers `ENAMETOOLONG`, the errno Linux uses for exactly that.
 pub(crate) fn cstr_arg(ptr: usize, from_user: bool) -> Result<alloc::string::String, isize> {
+    cstr_limit(ptr, from_user, MAX_PATH)
+}
+
+/// [`cstr_arg`] for the strings of an `execve`'s `envp` and `argv` arrays,
+/// whose limit is not a path's. Linux caps a *pathname* at 255 bytes per
+/// component, but an environment string is only bounded by the argument
+/// block's total - `COLLECT_GCC_OPTIONS` and friends from a real compiler
+/// run past 255 bytes easily - and refusing one is what makes `gcc` fail
+/// with `posix_spawn: Filename too long` before it ever runs a subprocess.
+pub(crate) fn cstr_env(ptr: usize, from_user: bool) -> Result<alloc::string::String, isize> {
+    cstr_limit(ptr, from_user, MAX_ARG_STR)
+}
+
+/// The per-string ceiling of `execve`'s arrays. Linux's own limit is
+/// `MAX_ARG_STRLEN` = 32 pages minus a byte - 131071 - for each of argv and
+/// envp; this takes the same shape at a scale the argument block can hold.
+pub(crate) const MAX_ARG_STR: usize = 4095;
+
+fn cstr_limit(ptr: usize, from_user: bool, limit: usize) -> Result<alloc::string::String, isize> {
     if ptr == 0 {
         return Err(err::EFAULT);
     }
@@ -197,12 +245,12 @@ pub(crate) fn cstr_arg(ptr: usize, from_user: bool) -> Result<alloc::string::Str
         if (p & 0xfff == 0 || p == ptr) && !buffer_ok(p, 1, false, from_user) {
             return Err(err::EFAULT);
         }
-        let b = unsafe { (p as *const u8).read_volatile() };
+        let b = unsafe { (p as *const u8).read_unaligned() };
         if b == 0 {
             break;
         }
         bytes.push(b);
-        if bytes.len() > MAX_PATH {
+        if bytes.len() > limit {
             return Err(err::ENAMETOOLONG);
         }
         p += 1;
@@ -214,7 +262,12 @@ pub(crate) fn cstr_arg(ptr: usize, from_user: bool) -> Result<alloc::string::Str
 
 /// Parse a NULL-terminated array of NUL-terminated strings - the Linux ABI's
 /// argv shape - into an owned vector. An absent array (`NULL`) is empty.
-pub(crate) fn argv_arg(ptr: usize) -> Result<alloc::vec::Vec<alloc::string::String>, isize> {
+/// `limit` is the per-string ceiling: [`MAX_PATH`] for the `argv` a caller
+/// spells as paths, [`MAX_ARG_STR`] for the environment.
+pub(crate) fn argv_arg(
+    ptr: usize,
+    limit: usize,
+) -> Result<alloc::vec::Vec<alloc::string::String>, isize> {
     if ptr == 0 {
         return Ok(alloc::vec::Vec::new());
     }
@@ -224,14 +277,14 @@ pub(crate) fn argv_arg(ptr: usize) -> Result<alloc::vec::Vec<alloc::string::Stri
         if !buffer_ok(p, core::mem::size_of::<usize>(), false, true) {
             return Err(err::EFAULT);
         }
-        let entry = unsafe { (p as *const usize).read_volatile() };
+        let entry = unsafe { (p as *const usize).read_unaligned() };
         if entry == 0 {
             break;
         }
         if out.len() >= crate::sched::ARGV_MAX {
             return Err(err::E2BIG);
         }
-        out.push(cstr_arg(entry, true)?);
+        out.push(cstr_limit(entry, true, limit)?);
         p += core::mem::size_of::<usize>();
     }
     Ok(out)
@@ -260,7 +313,13 @@ pub fn linux_dispatch(
     // this covers the third state - a task in and out of syscalls - so no
     // caller waits a whole slice past its deadline.
     crate::sched::check_itimer();
+    // The two moments a tracer wants to see: the call before it is made and its
+    // result before it is returned. Both are ordinary stops in the task table,
+    // and both are no-ops - one branch on a flag - for every task no tracer has
+    // touched, which is every task on a machine without a tracer running.
+    let args = linux::proc::syscall_entry_stop(regs_ptr, nr, args);
     let ret = linux::dispatch(nr, args, from_user, regs_ptr);
+    let ret = linux::proc::syscall_exit_stop(regs_ptr, nr, args, ret);
     // Signals are delivered here rather than before the call: a handler has to
     // see the *result* of the syscall it interrupted, and the result does not
     // exist until the call has returned. Jumping into a handler means

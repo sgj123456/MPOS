@@ -41,13 +41,41 @@ use crate::mm::vm::{MapFlags, Mapping};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{Priority, Scheduler, TaskId};
 use crate::sched::signal;
-use crate::syscall::linux::nr;
+use crate::syscall::linux::{abi, nr};
 use crate::vfs::RawFd;
 use crate::vfs::file::{FdTable, File};
 
 /// How many tasks can exist at once. A hard limit rather than a grown
 /// collection, for the reason given in the module docs.
 pub const MAX_TASKS: usize = 64;
+
+/// A process's user and group identity: the real, effective and saved id of
+/// each, which is the whole of what `setuid(2)`'s family manipulates.
+///
+/// The real id is who started the process, the effective id is who it is
+/// acting as now, and the saved id is who it may go back to - the one
+/// `setreuid`/`setresuid` dances depend on. A program like `sudo` lowers its
+/// effective id to read a file it does not trust itself with and raises it
+/// back through the saved one; without all three words, that dance has no
+/// floor to stand on. The kernel still does not enforce file modes, so these
+/// are what the syscall family reads and writes - the honest half of the
+/// ownership model, with the permission half still to come.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Identity {
+    /// The real user id: who the process was started as.
+    pub ruid: u32,
+    /// The effective user id: who privilege checks act as. Zero is this
+    /// kernel's approximation of "may set any id".
+    pub euid: u32,
+    /// The saved user id: who the process may raise its effective id back to.
+    pub suid: u32,
+    /// The real group id.
+    pub rgid: u32,
+    /// The effective group id.
+    pub egid: u32,
+    /// The saved group id.
+    pub sgid: u32,
+}
 
 /// Task stacks are `2^STACK_ORDER` pages. 64 KiB, because the kernel stack has
 /// to hold the trap frames that stack up above a task the clock preempted
@@ -451,6 +479,23 @@ struct Task {
     /// its parent's group, so `setpgid(0, 0)` in a child - which is what a
     /// shell does before `exec` - is the whole of what makes that job separate.
     pgid: TaskId,
+    /// The session this task belongs to, named by its leader's id. Zero for
+    /// tasks no `setsid` has claimed - the boot task, kernel tasks. What a
+    /// session carries here is not a controlling terminal (that is `ctty`,
+    /// a per-process property) but the orphan test: a process group whose
+    /// members' parents all sit in other sessions - or nowhere - is a group
+    /// nobody could un-stop, and stop signals are discarded for it.
+    session: TaskId,
+    /// The controlling terminal this process acquired with `TIOCSCTTY`, by
+    /// device id. `/dev/tty` is a door to exactly this terminal for exactly
+    /// this process, and a process that has acquired none cannot open the
+    /// name at all - the answer a shell reads as "job control off". Inherited
+    /// across `fork`, preserved by `exec`, lost at `setsid`.
+    ctty: Option<(u32, u32)>,
+    /// Who this process is - the real, effective and saved ids of its user
+    /// and group, in that order. Root until something changes it, inherited
+    /// across `fork`, preserved by `exec`.
+    identity: Identity,
     /// Per-process brk state for heap management. The frames behind the
     /// break's pages are on `user_frames` like every other frame the process
     /// owns; only the bookkeeping of *where* the break is stays here.
@@ -487,6 +532,154 @@ struct Task {
     /// ticks the board has; the other two are recorded but never fire, for
     /// want of per-task CPU accounting.
     itimers: [Option<ItimerState>; 3],
+    /// What a tracer has made of this task, if anything.
+    trace: Tracing,
+}
+
+/// What `ptrace` has made of a task.
+///
+/// One field rather than half a dozen on `Task`, because a task no tracer has
+/// ever touched is the overwhelmingly common case and deserves one word of "no"
+/// rather than six. [`Tracing::default`] is that case exactly: untraced, no
+/// options, running.
+#[derive(Clone, Copy, Default)]
+struct Tracing {
+    /// The task tracing this one. Set by `PTRACE_TRACEME` from the tracee's own
+    /// call and by `PTRACE_ATTACH` from the tracer's.
+    ///
+    /// This is the whole of the relationship: a task is traced iff something is
+    /// named here, and every stop below is gated on it. It is deliberately not
+    /// `parent` - a tracee is usually its tracer's child, but not always, and
+    /// `PTRACE_DETACH` has to be able to take the link away without touching
+    /// the family.
+    tracer: Option<TaskId>,
+    /// The `PTRACE_O_*` word the tracer set with `PTRACE_SETOPTIONS`.
+    options: usize,
+    /// Where this task is stopped. `None` is a running, ready or sleeping task;
+    /// `Some` is a task sitting still with its history waiting to be read.
+    stop: Option<Stop>,
+    /// Set by `PTRACE_SYSCALL`: stop at the next syscall boundary.
+    ///
+    /// Cleared by the stop it causes, not by the resume - which is exactly what
+    /// makes the entry and the exit two separate events. A tracer that wants
+    /// both re-arms on every resume, and the alternation follows.
+    armed: bool,
+    /// The user register file as of the stop.
+    ///
+    /// Saved rather than pointed at, twice over: the frame it came from is on
+    /// the tracee's kernel stack, which nobody hands out a pointer to, and a
+    /// `PTRACE_SETREGS` needs somewhere to put what it changed.
+    regs: Option<[u64; abi::uregs::COUNT]>,
+    /// The syscall the tracee stopped in the middle of. Written at the entry
+    /// stop and kept for the exit stop, because `PTRACE_GET_SYSCALL_INFO`
+    /// describes both ends of one call and the exit half has no arguments of
+    /// its own.
+    syscall: Option<SyscallStop>,
+    /// Set by an exec trap: the syscall-exit stop that would otherwise follow
+    /// it has already been reported, and must not be reported twice.
+    ///
+    /// The trap *is* the `execve`'s completion notice - that is what Linux's
+    /// exec trap is for - so an exit stop after it would tell a tracer the same
+    /// call had returned a second time. Cleared by the next entry stop, which is
+    /// the only thing that can follow a disarmed resume.
+    at_exec_exit: bool,
+    /// A `SIGCONT` ended a stop of this task and no `wait` has reported it yet.
+    ///
+    /// It outlives the stop itself, and has to: by the time a parent looks, the
+    /// task is running again and the stop it was told about is gone. That is
+    /// the `WIFCONTINUED` word, and the reason `wait` takes the flag at all.
+    continued: bool,
+    /// The event stop this task owes its tracer for a child it has just made,
+    /// as `(PTRACE_EVENT_*, child pid)`.
+    ///
+    /// It travels this way because of *where* the two halves have to happen.
+    /// The child is created deep inside the scheduler, and the stop has to be
+    /// raised where the syscall frame is - a stop is a change to the registers
+    /// the task will return through, and only the syscall layer has those. The
+    /// alternative is raising the stop at the creation, in a place with no
+    /// frame, which would report the parent's state from before the call
+    /// instead of from inside it - and Linux raises it inside.
+    ///
+    /// `None` is the overwhelmingly common case: nobody is tracing, or the
+    /// tracer did not ask about this kind of child.
+    pending_event: Option<(u32, u64)>,
+}
+
+/// The syscall a tracee is stopped at, as `PTRACE_GET_SYSCALL_INFO` reports it.
+#[derive(Clone, Copy)]
+pub struct SyscallStop {
+    /// The call's number - `orig_rax` in the register file's terms.
+    pub nr: u64,
+    /// The six arguments, as they were when the call was made. Kept across the
+    /// pair of stops because the exit half has none of its own.
+    pub args: [u64; 6],
+    /// Where the `syscall` instruction will return to, and the stack it was
+    /// issued on: the `instruction_pointer` and `stack_pointer` fields.
+    pub ip: u64,
+    pub sp: u64,
+    /// Whether this is the stop on the way *in*. What the tracer reads to know
+    /// whether it is looking at a call's arguments or at its result.
+    pub entry: bool,
+}
+
+/// A task held where it stands, and what the thing that put it there will be
+/// told.
+///
+/// Two things stop a task, and they differ only in who collects the news. A
+/// tracer stops a tracee at every syscall boundary and reports every signal
+/// before it is delivered; a stop signal with no tracer stops the task for its
+/// parent. Both are this structure, and `traced` is the flag that says which.
+#[derive(Clone, Copy)]
+pub struct Stop {
+    /// The signal `wait(2)` reports as `WSTOPSIG`. For a syscall boundary it is
+    /// `SIGTRAP`, with `TRACESYSGOOD`'s `0x80` set when the tracer asked for it;
+    /// for a signal-delivery stop it is the signal itself.
+    pub signal: u8,
+    /// The `PTRACE_EVENT_*` the status word carries in its high byte. Zero for
+    /// everything this kernel produces: a syscall boundary, a signal, an exec.
+    pub event: u32,
+    /// Whether a tracer is the one that will be told. A group stop has no
+    /// tracer: it goes to the parent, and only to a parent that asked with
+    /// `WUNTRACED`.
+    pub traced: bool,
+    /// Whether this is a *group* stop: the task was held by a stop signal of its
+    /// own rather than by its tracer, and a `SIGCONT` may end it.
+    ///
+    /// It is deliberately not the same question as `traced`. A group stop of a
+    /// traced task is reported to the tracer - it has to be, or nothing would
+    /// ever resume it - but it is still the tracee's own stop, and `SIGCONT`
+    /// ends it whether or not a tracer is watching. A tracer's stop is the
+    /// tracer's alone, and no signal ends that one.
+    pub group: bool,
+    /// Set once a `wait` has reported it. News is news once, and the tracee
+    /// then sits in the stop until something resumes it.
+    pub reported: bool,
+    /// What `PTRACE_GETEVENTMSG` answers while the tracee sits here.
+    ///
+    /// Only the events carry one, and each carries a different thing: a fork,
+    /// a vfork or a clone reports the **new child's pid**, an exec reports the
+    /// **tid the task had before it exec'd**. Zero - "no message" - is a
+    /// truthful answer for every other kind of stop, because there is no event
+    /// for a message to belong to.
+    ///
+    /// It lives on the stop rather than on the task because that is the
+    /// question the tracer is asking: *this* stop's message. A task that ran
+    /// twice carries the second answer, and the first one is gone.
+    pub message: u64,
+    /// The signal this stop is reporting, when it *is* a signal-delivery stop.
+    ///
+    /// It is what makes resuming such a stop mean something: the tracer either
+    /// passes the signal on or drops it, and Linux's rule is that the signal the
+    /// tracer names is the one delivered, in place of this one either way. A
+    /// syscall stop names nothing, because there is nothing to replace.
+    pub delivering: Option<u8>,
+    /// The syscall this stop is a boundary of, when it is one.
+    ///
+    /// It travels on the stop rather than being read out of the task, because
+    /// what `PTRACE_GET_SYSCALL_INFO` must answer depends on *which* stop the
+    /// tracer is looking at: an exec event and a signal delivery are stops too,
+    /// and for those the honest answer is "this is not a syscall stop".
+    pub syscall: Option<SyscallStop>,
 }
 
 impl Task {
@@ -515,6 +708,9 @@ impl Task {
             cwd_path: None,
             parent: None,
             pgid: TaskId(0),
+            session: TaskId(0),
+            ctty: None,
+            identity: Identity::default(),
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -523,6 +719,7 @@ impl Task {
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
+            trace: Tracing::default(),
         }
     }
 }
@@ -727,6 +924,9 @@ impl Table {
             cwd_path: None,
             parent: None,
             pgid: TaskId(0),
+            session: TaskId(0),
+            ctty: None,
+            identity: Identity::default(),
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -735,6 +935,7 @@ impl Table {
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
+            trace: Tracing::default(),
         });
         TaskId(slot)
     }
@@ -1097,6 +1298,13 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // init leads the first process group, so a command started
             // before any job control exists still has a group to land in.
             pgid: INIT_PID,
+            // ...and the first session, of which it is the leader: getty's
+            // `setsid` splits away from it, and the orphan test reads the
+            // difference between init's session and a getty's.
+            session: INIT_PID,
+            ctty: None,
+            // Init starts as root, like everything the kernel itself spawns.
+            identity: Identity::default(),
             brk_base,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -1108,6 +1316,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
+            trace: Tracing::default(),
         });
         t.sched.push_ready(INIT_PID, Priority::NORMAL);
         Ok(INIT_PID)
@@ -1230,6 +1439,9 @@ pub fn try_spawn_user(
             cwd_path: t.task(parent).cwd_path.clone(),
             parent: Some(parent),
             pgid: t.task(parent).pgid,
+            session: t.task(parent).session,
+            ctty: t.task(parent).ctty,
+            identity: t.task(parent).identity,
             brk_base,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -1238,6 +1450,7 @@ pub fn try_spawn_user(
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
+            trace: Tracing::default(),
         });
         let id = TaskId(slot);
         t.sched.push_ready(id, priority);
@@ -1747,8 +1960,7 @@ pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
             return WaitEnd::Deadline;
         }
         schedule(|t| {
-            let done =
-                cond() || table_has_deliverable(t) || timer::ticks() >= deadline;
+            let done = cond() || table_has_deliverable(t) || timer::ticks() >= deadline;
             if done {
                 t.requeue_current();
             } else {
@@ -1878,20 +2090,83 @@ pub fn wake(id: TaskId) -> bool {
 /// next blocking point.
 pub fn send_signal(id: TaskId, sig: u8) -> bool {
     with_table(|t| {
-        let Some(slot) = t.tasks.get_mut(id.0) else {
-            return false;
-        };
-        let Some(task) = slot.as_mut() else {
+        // The first look is immutable: whether the signal is delivered,
+        // discarded or refused, the answer is read off the same facts.
+        let Some(task) = t.tasks.get(id.0).and_then(Option::as_ref) else {
             return false;
         };
         if task.exited {
             return false;
         }
-        if sig != 0 {
-            signal::add(&mut task.signals, sig);
-            t.sched.wake(id);
+        if sig == 0 {
+            // The existence probe delivers nothing. Every answer it has is in
+            // the `true` above.
+            return true;
         }
+        // POSIX 2.4.3: a stop signal generated for a member of an orphaned
+        // process group is discarded. The group is one whose members' parents
+        // are all gone or all in other sessions - a group nothing could
+        // un-stop, because the only un-stop is a SIGCONT from outside and no
+        // same-session parent outside the group is left to send one. A shell
+        // that finds itself in the background of its terminal raises SIGTTIN
+        // to its own group exactly this way; discarding it is the difference
+        // between "job control off" and a login that freezes forever.
+        // `SIGSTOP` is not on the list: it is uncatchable, and `kill -STOP`
+        // stays exactly what it says.
+        if signal::stops_by_default(sig) && sig != signal::SIGSTOP && orphaned_group(t, task.pgid) {
+            return true;
+        }
+        let Some(task) = t.tasks.get_mut(id.0).and_then(Option::as_mut) else {
+            return false;
+        };
+        signal::add(&mut task.signals, sig);
+        // `SIGCONT` is the one signal whose effect is on the *state* of a task
+        // rather than on its pending set, and this is the only place a task's
+        // state can be changed from outside it.
+        if sig == signal::SIGCONT {
+            // It cancels the stop signals still queued, so that a task woken
+            // by it does not stop again on the way out.
+            for stop_sig in [
+                signal::SIGSTOP,
+                signal::SIGTSTP,
+                signal::SIGTTIN,
+                signal::SIGTTOU,
+            ] {
+                task.signals &= !signal::bit(stop_sig);
+            }
+            // And it ends a group stop. A *traced* stop is deliberately not
+            // ended here: only the tracer may resume its tracee, and a
+            // `SIGCONT` that resumed one would not break the stop so much as
+            // the protocol the stop exists for.
+            if task.trace.stop.is_some_and(|stop| stop.group) {
+                task.trace.stop = None;
+                task.trace.continued = true;
+            }
+        }
+        t.sched.wake(id);
         true
+    })
+}
+
+/// Whether `pgid` is an orphaned process group: no live member has a live
+/// parent in the same session outside the group.
+///
+/// That is POSIX's definition, in the words this kernel can now honour. The
+/// parent that keeps a group un-orphaned is one `wait`ing in the same
+/// session but a different group - the shell behind a job. A getty's session
+/// has no such parent: the login shell's parent, login, is in the group, and
+/// login's own parent, init, sits in another session - so a login shell that
+/// raises a stop signal to itself has it discarded rather than stranded
+/// forever with the screen frozen behind it.
+fn orphaned_group(t: &Table, pgid: TaskId) -> bool {
+    t.tasks.iter().flatten().all(|task| {
+        !(task.pgid == pgid
+            && task
+                .parent
+                .and_then(|parent| t.tasks.get(parent.0).and_then(Option::as_ref))
+                .is_some_and(|parent| {
+                    !parent.exited && parent.session == task.session && parent.pgid != pgid
+                }))
     })
 }
 
@@ -1903,6 +2178,64 @@ pub fn current_pgid() -> TaskId {
 /// The group `id` is in, or `None` when the task is gone.
 pub fn pgid_of(id: TaskId) -> Option<TaskId> {
     with_table(|t| t.tasks.get(id.0)?.as_ref().map(|task| task.pgid))
+}
+
+/// Bind the running task's controlling terminal, by the terminal's device id.
+///
+/// `TIOCSCTTY` is the caller. Binding is two facts at once: `/dev/tty` opens
+/// onto this terminal for this process from now on, and - the Linux
+/// `__proc_set_tty` behaviour - the terminal's foreground goes to the
+/// acquiring process's group, so the getty that just became a session leader
+/// also owns the line before anyone reads or writes it.
+pub fn acquire_controlling_tty(dev_id: (u32, u32)) {
+    with_table(|t| {
+        t.task_mut(t.current).ctty = Some(dev_id);
+    });
+    // Outside the table borrow: the foreground is the tty's own state, and
+    // `set_foreground` takes its own critical section.
+    if let Some(tty) = crate::vfs::tty::by_dev_id(dev_id) {
+        tty.set_foreground(Some(current_pgid()));
+    }
+}
+
+/// The controlling terminal of the running task, by device id - what an
+/// open of `/dev/tty` resolves to. `None` is a process that has acquired
+/// none, and there is no default to fall back on: a controlling terminal is
+/// the process's own history, not a machine-wide answer.
+#[cfg(target_os = "none")]
+pub fn controlling_tty_of_current() -> Option<(u32, u32)> {
+    with_table(|t| t.task(t.current).ctty)
+}
+
+/// The identity of the running task: the real, effective and saved ids of
+/// its user and group. This is what `getuid`'s family reads and what
+/// `setuid`'s family writes, after the syscall layer has applied the man
+/// page's rules - the rules live there, because they are answers about
+/// calls, and only the storage lives here.
+#[cfg(target_os = "none")]
+pub fn current_identity() -> Identity {
+    with_table(|t| t.task(t.current).identity)
+}
+
+/// Store the running task's identity. The caller has validated the change;
+/// this is the table's half of the bargain.
+#[cfg(target_os = "none")]
+pub fn set_current_identity(identity: Identity) {
+    with_table(|t| t.task_mut(t.current).identity = identity);
+}
+
+/// `setsid`'s kernel half beyond the group move: the caller becomes the
+/// leader of its own session and loses the controlling terminal, which
+/// belongs to the session it just left. The getty that calls this re-acquires
+/// a terminal with `TIOCSCTTY` immediately after; everything else that
+/// `setsid`s meant to leave its terminal behind anyway.
+pub fn become_session_leader() {
+    with_table(|t| {
+        let id = t.current;
+        let task = t.task_mut(id);
+        task.session = id;
+        task.ctty = None;
+    });
 }
 
 /// Everyone in a process group, for a signal that has to reach all of them at
@@ -2077,6 +2410,15 @@ pub fn take_fatal_signal() -> Option<u8> {
             if task.dispositions.get(sig).is_handler() {
                 continue;
             }
+            // Of the signals with no handler, only the ones whose default
+            // action is to terminate end a task sitting in a blocking call.
+            // `SIGSTOP` is not one of them - it stops, and stopping a task
+            // that is already asleep changes nothing - and `SIGCONT` is not
+            // one of them either. Before there was a stop state to be in,
+            // "no handler" and "dies of it" really were the same thing.
+            if signal::default_action(sig) != signal::DefaultAction::Terminate {
+                continue;
+            }
             task.signals &= !signal::bit(sig);
             return Some(sig);
         }
@@ -2106,6 +2448,14 @@ pub fn current_blocked() -> signal::Pending {
     with_table(|t| t.task(t.current).blocked)
 }
 
+/// The signals the running task has waiting: the pending set as
+/// `rt_sigpending(2)` reads it - a mask of what has arrived, not of what
+/// is blocked. The two sets are independent: a signal can be both pending
+/// and blocked, and this answer names it either way.
+pub fn current_pending() -> signal::Pending {
+    with_table(|t| t.task(t.current).signals)
+}
+
 /// Replace the running task's blocked set. `rt_sigprocmask` and the return
 /// from a handler are its two callers.
 pub fn set_current_blocked(mask: signal::Pending) {
@@ -2113,6 +2463,976 @@ pub fn set_current_blocked(mask: signal::Pending) {
         let id = t.current;
         t.task_mut(id).blocked = mask;
     });
+}
+
+// ---------------------------------------------------------------------------
+// ptrace: the tracer link, the stops, and what a wait collects
+// ---------------------------------------------------------------------------
+//
+// A tracer and its tracee are two tasks in a protocol, and the protocol has
+// exactly two directions:
+//
+//   * the tracee stops - at a syscall boundary, on a signal, on `execve` - and
+//     parks itself until something resumes it;
+//   * the tracer sits in `wait(2)` until one of its children has something to
+//     report, reads the stop, and resumes it.
+//
+// Both directions are ordinary task-table operations. The tracee parks in the
+// same sleep queue every other blocking call uses, with a deadline of "never"
+// and a `stop` record beside it; the tracer's `wait` blocks on the same
+// condition mechanism, with the stop record as its condition. There is no new
+// synchronisation primitive here, and that is the point: the whole of what makes
+// this safe is the rule the rest of the module already follows - publish the
+// state and park the waiter in one critical section, so a waiter that has not
+// looked yet finds it on its next look.
+
+/// Whether `id` is being traced by anyone.
+pub fn has_tracer(id: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|task| task.trace.tracer.is_some())
+    })
+}
+
+/// Whether `id` is stopped: present, alive, and sitting in a stop.
+pub fn is_stopped(id: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|task| task.trace.stop.is_some())
+    })
+}
+
+/// Bind `id` to `tracer`. Returns false when the task is gone or has exited,
+/// which the syscall layer reports as `ESRCH`.
+pub fn set_tracer(id: TaskId, tracer: TaskId) -> bool {
+    with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) if !task.exited => {
+            task.trace.tracer = Some(tracer);
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The task tracing `id`, if any.
+pub fn tracer_of(id: TaskId) -> Option<TaskId> {
+    with_table(|t| t.tasks.get(id.0)?.as_ref()?.trace.tracer)
+}
+
+/// The `PTRACE_O_*` word `id`'s tracer set.
+pub fn trace_options(id: TaskId) -> usize {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(0, |task| task.trace.options)
+    })
+}
+
+/// Record the options a tracer asked for. False when the task is gone.
+pub fn set_trace_options(id: TaskId, options: usize) -> bool {
+    with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) if !task.exited => {
+            task.trace.options = options;
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The register file `id` will resume with, if it is stopped.
+///
+/// A task that has never been out of the kernel has no snapshot to hand back:
+/// a snapshot is what [`park`] takes, and nothing has parked it yet. What it has
+/// instead is `user_resume` - the state the one-way door into ring 3 will read -
+/// and that *is* its register file, not a description of one. The two cases are
+/// told apart by `regs` being empty, which for a stopped task happens exactly
+/// when nothing has parked it; [`attach_new_child`] is what creates such a task.
+pub fn trace_regs(id: TaskId) -> Option<[u64; abi::uregs::COUNT]> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0)?.as_ref()?;
+        task.trace.regs.or_else(|| {
+            // Only a *stopped* task that never ran: a running task's registers
+            // are nobody's to report, which is why the stop is part of the
+            // question rather than implied by it.
+            let stopped = task.trace.stop.and(task.user_resume.as_ref())?;
+            Some(context_regs(stopped, task.tls))
+        })
+    })
+}
+
+/// The register file a task that has never been out of the kernel would resume
+/// with, in the order `PTRACE_GETREGS` reports it.
+///
+/// Three of the twenty-seven slots have no counterpart in [`UserContext`], and
+/// each for a reason: no syscall is in flight, so `orig_rax` is nothing; and
+/// `rcx` and `r11` are the two registers the `syscall` instruction itself
+/// clobbers, which is why the structure does not carry them - a program cannot
+/// be relying on them across a call, so there is nothing to carry. The segment
+/// registers the structure does not name are left zero, which is the value the
+/// machine reads them as. `fs_base` is not in the structure either because it
+/// is per *task*: the task table holds it, and it is handed in here.
+fn context_regs(state: &UserContext, tls: usize) -> [u64; abi::uregs::COUNT] {
+    use abi::uregs::*;
+
+    let mut regs = [0u64; COUNT];
+    regs[R15] = state.r15 as u64;
+    regs[R14] = state.r14 as u64;
+    regs[R13] = state.r13 as u64;
+    regs[R12] = state.r12 as u64;
+    regs[RBP] = state.rbp as u64;
+    regs[RBX] = state.rbx as u64;
+    regs[R10] = state.r10 as u64;
+    regs[R9] = state.r9 as u64;
+    regs[R8] = state.r8 as u64;
+    regs[RAX] = state.rax as u64;
+    regs[RDX] = state.rdx as u64;
+    regs[RSI] = state.rsi as u64;
+    regs[RDI] = state.rdi as u64;
+    regs[RIP] = state.rip as u64;
+    regs[CS] = state.cs as u64;
+    regs[EFLAGS] = state.rflags as u64;
+    regs[RSP] = state.rsp as u64;
+    regs[SS] = state.ss as u64;
+    regs[FS_BASE] = tls as u64;
+    regs
+}
+
+/// The other direction: turn a register file a tracer may have rewritten back
+/// into the state the one-way door into ring 3 reads.
+fn context_from_regs(regs: &[u64; abi::uregs::COUNT]) -> UserContext {
+    use abi::uregs::*;
+
+    UserContext {
+        rip: regs[RIP] as usize,
+        rsp: regs[RSP] as usize,
+        rflags: regs[EFLAGS] as usize,
+        rax: regs[RAX] as usize,
+        rbx: regs[RBX] as usize,
+        rbp: regs[RBP] as usize,
+        cs: regs[CS] as usize,
+        ss: regs[SS] as usize,
+        r12: regs[R12] as usize,
+        r13: regs[R13] as usize,
+        r14: regs[R14] as usize,
+        r15: regs[R15] as usize,
+        rdi: regs[RDI] as usize,
+        rsi: regs[RSI] as usize,
+        rdx: regs[RDX] as usize,
+        r8: regs[R8] as usize,
+        r9: regs[R9] as usize,
+        r10: regs[R10] as usize,
+    }
+}
+
+/// Replace the register file `id` will resume with. False when the task is
+/// gone, or is not stopped - a running task's registers are not the kernel's
+/// to rewrite from another task, and `PTRACE_SETREGS` on a running tracee is
+/// `ESRCH` on Linux too.
+pub fn set_trace_regs(id: TaskId, regs: &[u64; abi::uregs::COUNT]) -> bool {
+    with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) if !task.exited && task.trace.stop.is_some() => {
+            match (task.trace.regs, task.user_resume.as_mut()) {
+                // A task stopped before its first instruction has no snapshot
+                // to replace: what a tracer edits here *is* the state the door
+                // will read, so the edit has to land there or nowhere. The rule
+                // is the same one `trace_regs` reads by, seen from the writing
+                // side.
+                (None, Some(state)) => *state = context_from_regs(regs),
+                _ => task.trace.regs = Some(*regs),
+            }
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The floating-point registers `id` is stopped with, as the 512-byte image
+/// `PTRACE_GETFPREGS` and `PTRACE_SETFPREGS` move.
+///
+/// A stopped task's saved block is current: every switch out of a task writes
+/// its live registers there, and a task that is stopped has been switched out at
+/// least once since it last ran.
+pub fn trace_fpu(id: TaskId) -> Option<[u8; crate::arch::context::FPU_BYTES]> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)?
+            .as_ref()
+            .map(|task| task.context.fpu.to_bytes())
+    })
+}
+
+/// Replace the floating-point registers `id` will resume with. The same rule as
+/// [`set_trace_regs`]: only a stopped task's state is the kernel's to rewrite.
+pub fn set_trace_fpu(id: TaskId, bytes: &[u8; crate::arch::context::FPU_BYTES]) -> bool {
+    with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) if !task.exited && task.trace.stop.is_some() => {
+            task.context.fpu = crate::arch::context::FpuState::from_bytes(bytes);
+            true
+        }
+        _ => false,
+    })
+}
+
+/// What a `PTRACE_GET_SYSCALL_INFO` reports about the syscall `id` is stopped
+/// at, as `(entry, nr, args, ip, sp)`.
+pub fn trace_syscall(id: TaskId) -> Option<(bool, u64, [u64; 6], u64, u64)> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0)?.as_ref()?;
+        let stop = task.trace.stop?;
+        // A stop at a syscall boundary describes itself. Any *other* stop - a
+        // signal arriving, an exec - is described by the call the tracee was in
+        // the middle of, which is the one it last entered: Linux reads that
+        // answer out of the registers, and the entry record is the same answer
+        // kept somewhere a stopped task can still be asked.
+        let entry_stop = stop.syscall.map(|syscall| syscall.entry);
+        let syscall = stop.syscall.or(task.trace.syscall)?;
+        Some((
+            entry_stop.unwrap_or(true),
+            syscall.nr,
+            syscall.args,
+            syscall.ip,
+            syscall.sp,
+        ))
+    })
+}
+
+/// The stop `id` is sitting in, without collecting it: what a `wait` looks at
+/// while it decides whether there is anything to report.
+pub fn stop_of(id: TaskId) -> Option<Stop> {
+    with_table(|t| t.tasks.get(id.0)?.as_ref()?.trace.stop)
+}
+
+/// Collect `id`'s stop: mark it reported and hand it back. This is the moment
+/// the news stops being news, and it is deliberately separate from looking.
+pub fn take_stop_report(id: TaskId) -> Option<Stop> {
+    with_table(|t| {
+        let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
+        let stop = task.trace.stop.as_mut()?;
+        if stop.reported {
+            return None;
+        }
+        stop.reported = true;
+        Some(*stop)
+    })
+}
+
+/// Take `id`'s `WIFCONTINUED` flag, if a `SIGCONT` set one and no `wait` has
+/// reported it.
+pub fn take_continued_report(id: TaskId) -> bool {
+    with_table(|t| {
+        let Some(task) = t.tasks.get_mut(id.0).and_then(Option::as_mut) else {
+            return false;
+        };
+        let flag = task.trace.continued;
+        task.trace.continued = false;
+        flag
+    })
+}
+
+/// Whether a `SIGCONT` has ended a stop of `id` and nobody has been told.
+pub fn continued_report_pending(id: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|task| task.trace.continued)
+    })
+}
+
+/// The oldest unreported stop among `parent`'s children, if one is reportable.
+///
+/// `requested` is `WUNTRACED`, and it is not the whole condition: a traced
+/// child's stop is reported to its *tracer* whether or not the tracer asked for
+/// stops, because the tracer is the only thing that can end it and a tracer
+/// that could not hear about one would deadlock on its first `wait`. That is
+/// what `stop.traced` says, and it is why `strace`'s very first `waitpid` - with
+/// no option bits at all - still returns.
+fn unreported_stop(t: &Table, parent: TaskId, requested: bool) -> Option<WaitEvent> {
+    for (slot, task) in t.tasks.iter().enumerate() {
+        let Some(task) = task.as_ref() else { continue };
+        let id = TaskId(slot);
+        if !waitable(task, parent) || id == parent {
+            continue;
+        }
+        let Some(stop) = task.trace.stop else {
+            continue;
+        };
+        if stop.reported || !(requested || stop.traced) {
+            continue;
+        }
+        // The scan is ascending, so the first match is the lowest id: two
+        // children stopping in the same tick are reported in a fixed order
+        // rather than whichever order the table happened to hand out.
+        return Some(WaitEvent::Stopped {
+            id,
+            signal: stop.signal,
+            event: stop.event,
+        });
+    }
+    None
+}
+
+/// Whether `id` is one `me` may `wait` for.
+///
+/// Two things make a task waitable, and Linux treats them the same way: being
+/// `me`'s child, and being traced by `me`. The second is not a convenience -
+/// `PTRACE_ATTACH` makes a tracer responsible for a task it did not spawn, and
+/// the only way that task's stops and death can be collected is by waiting for
+/// them. Having one rule means the six places that scan for "my children" do
+/// not each grow a second predicate, and cannot disagree with each other.
+fn waitable(task: &Task, me: TaskId) -> bool {
+    task.parent == Some(me) || task.trace.tracer == Some(me)
+}
+
+/// Whether `id` is a child of `parent` - the check that keeps a `wait` from
+/// blocking on someone else's child.
+pub fn is_child(id: TaskId, parent: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks[id.0]
+            .as_ref()
+            .is_some_and(|task| !task.exited && waitable(task, parent))
+    })
+}
+
+/// The lowest unblocked, non-ignored pending signal of `task` - the set
+/// [`take_deliverable_signal`] draws from, without taking anything.
+///
+/// This is what lets the delivery path decide whether there is a signal to
+/// report to a tracer before it commits to consuming one.
+fn deliverable(task: &Task) -> Option<u8> {
+    let mut ready = task.signals & !task.blocked;
+    while let Some(sig) = signal::take(&mut ready) {
+        if task.dispositions.get(sig).is_ignore() {
+            continue;
+        }
+        return Some(sig);
+    }
+    None
+}
+
+/// Park the running task in `stop` and return only when something resumes it.
+///
+/// The register file goes in and comes back out: it is stored where
+/// `PTRACE_GETREGS` can read it and `PTRACE_SETREGS` can change it, and the
+/// caller gets whatever the tracer left there. That is the whole mechanism
+/// behind "stop the program, change its registers, let it go".
+///
+/// Both the tracer and the parent are woken rather than one being chosen
+/// between. For a tracer's stop only the tracer can do anything about it, and
+/// for a group stop only the parent - but the two are one test apart, and a
+/// wake delivered to a task that is not waiting is a no-op.
+fn park(regs: &mut [u64; abi::uregs::COUNT], stop: Stop) {
+    let id = current();
+    let snapshot = *regs;
+    schedule(|t| {
+        let (tracer, parent) = {
+            let task = t.task_mut(id);
+            task.trace.stop = Some(stop);
+            task.trace.regs = Some(snapshot);
+            (task.trace.tracer, task.parent)
+        };
+        if let Some(tracer) = tracer {
+            t.sched.wake(tracer);
+        }
+        if let Some(parent) = parent {
+            t.sched.wake(parent);
+        }
+        let priority = t.task(id).priority;
+        // `u64::MAX` is "until someone wakes me". A stop has no clock on it:
+        // a tracee that gave up waiting would break the protocol, and a group
+        // stop is ended by `SIGCONT` and nothing else.
+        t.sched.sleep(id, priority, u64::MAX);
+    });
+    *regs = with_table(|t| t.task(id).trace.regs).unwrap_or(snapshot);
+}
+
+/// The stop a successful `execve` leaves a traced task in.
+///
+/// There are two shapes, and which one applies is the tracer's own choice via
+/// `PTRACE_O_TRACEEXEC`:
+///
+/// * With the option set, the call is interrupted mid-flight by an event stop
+///   carrying `PTRACE_EVENT_EXEC`, and *the call's exit stop still follows it*.
+///   That ordering is Linux's, and it is worth spelling out because it is
+///   counter-intuitive - the ptrace(2) man page walks through it:
+///   `we get PTRACE_EVENT_EXEC ... we issue PTRACE_SYSCALL ... we get
+///   syscall-exit-stop ... PID0 <... execve resumed> ) = 0`. A tracer that
+///   treats the event as the call's completion finds its enter/exit bookkeeping
+///   one stop ahead from then on, and every later return value read off the
+///   following call - the shape `strace`'s output had before this was right.
+/// * Without it, the trap is the completion notice: the exit hop that follows
+///   has nothing left to say, which `at_exec_exit` records for
+///   [`stop_at_syscall`] to skip. The trap is a plain `SIGTRAP` - the classic
+///   exec trap every legacy tracer is written against.
+///
+/// In both shapes the syscall record is left as the *entry* one: the record is
+/// only ever written at syscall stops, so at this stop it still describes the
+/// call in flight, which is what `PTRACE_GET_SYSCALL_INFO` should say here too.
+pub fn exec_trap(regs: &mut [u64; abi::uregs::COUNT]) {
+    let id = current();
+    let options = with_table(|t| t.task(id).trace.options);
+    if options & abi::PTRACE_O_TRACEEXEC != 0 {
+        let entry = with_table(|t| t.task(id).trace.syscall);
+        park(
+            regs,
+            Stop {
+                signal: signal::SIGTRAP,
+                event: abi::PTRACE_EVENT_EXEC,
+                traced: true,
+                reported: false,
+                // The former tid: an exec does not change the task's number
+                // here, so it is the same one - but it is the *question* a
+                // tracer asks with `PTRACE_GETEVENTMSG` after an exec, and the
+                // answer has to come from the stop rather than from whoever
+                // happens to be reading it.
+                message: id.0 as u64,
+                delivering: None,
+                syscall: entry,
+                group: false,
+            },
+        );
+        return;
+    }
+    with_table(|t| t.task_mut(id).trace.at_exec_exit = true);
+    let entry = with_table(|t| t.task(id).trace.syscall);
+    park(
+        regs,
+        Stop {
+            signal: signal::SIGTRAP,
+            event: abi::PTRACE_EVENT_NONE,
+            traced: true,
+            reported: false,
+            message: 0,
+            delivering: None,
+            syscall: entry.map(|call| SyscallStop {
+                entry: false,
+                ..call
+            }),
+            group: false,
+        },
+    );
+}
+
+/// Which `PTRACE_EVENT_*` a child's creation is, read off the `clone` flags
+/// that asked for it.
+///
+/// The three-way split is Linux's, and it is not a detail a tracer can recover
+/// on its own: `fork`, `vfork` and a thread-creating `clone` all arrive at the
+/// kernel as one syscall with different flags, and a tracer that asked about
+/// threads but not about processes needs to be told which one it just got.
+fn fork_event(flags: usize) -> u32 {
+    if flags & nr::CLONE_THREAD != 0 {
+        abi::PTRACE_EVENT_CLONE
+    } else if flags & nr::CLONE_VFORK != 0 {
+        abi::PTRACE_EVENT_VFORK
+    } else {
+        abi::PTRACE_EVENT_FORK
+    }
+}
+
+/// Hand a brand-new child to its creator's tracer, if the tracer asked about
+/// this kind of child. True when it did.
+///
+/// Two things have to happen together, and Linux does both inside its own fork
+/// path. The child is **attached to the same tracer and born stopped**, so that
+/// nothing it does can happen before the tracer has looked at it; and the
+/// creator is left **owing its tracer an event stop**, which the syscall layer
+/// raises a few lines later, where the frame is.
+///
+/// Born stopped is what makes `strace -f` work at all. A thread that runs even
+/// once before its tracer's first look has already made a syscall the trace
+/// will not contain, and a tracer left to guess where the thread was is worse
+/// off than one that is simply told.
+fn attach_new_child(t: &mut Table, parent: TaskId, child: TaskId, event: u32) -> bool {
+    let bit = match event {
+        abi::PTRACE_EVENT_FORK => abi::PTRACE_O_TRACEFORK,
+        abi::PTRACE_EVENT_VFORK => abi::PTRACE_O_TRACEVFORK,
+        abi::PTRACE_EVENT_CLONE => abi::PTRACE_O_TRACECLONE,
+        _ => return false,
+    };
+    let (tracer, options) = {
+        let parent = t.task(parent);
+        (parent.trace.tracer, parent.trace.options)
+    };
+    // No tracer, or one that did not ask about this kind of child: the child is
+    // nobody's business but its parent's, and it starts running.
+    if tracer.is_none() || options & bit == 0 {
+        return false;
+    }
+
+    let child_task = t.task_mut(child);
+    child_task.trace.tracer = tracer;
+    // The options come with the child. Linux copies them, and it matters: a
+    // tracer sets its options once, on the process it started, and every thread
+    // that process creates afterwards is traced with those same options without
+    // the tracer saying so again.
+    child_task.trace.options = options;
+    child_task.trace.stop = Some(Stop {
+        // The `SIGSTOP` of being newly attached - the same stop `PTRACE_ATTACH`
+        // gives, and the one a tracer is written to swallow. Linux reports
+        // `PTRACE_EVENT_STOP` instead when the tracer attached with
+        // `PTRACE_SEIZE`; this kernel has no `SEIZE`, so it is the older shape.
+        signal: signal::SIGSTOP,
+        event: abi::PTRACE_EVENT_NONE,
+        traced: true,
+        reported: false,
+        message: 0,
+        // Nothing is pending delivery: the child was not sent a signal, it was
+        // born here. A tracer that resumes it *with* `SIGSTOP` gets one
+        // delivered, which is what Linux does with that too.
+        delivering: None,
+        syscall: None,
+        // A stop signal's stop, so a `SIGCONT` can end it.
+        group: true,
+    });
+    // It has no saved register file, because it has never been out of the
+    // kernel: the registers it will resume with are the ones it was built with,
+    // and `trace_regs` reads those out of `user_resume`.
+    child_task.trace.regs = None;
+
+    t.task_mut(parent).trace.pending_event = Some((event, child.0 as u64));
+    true
+}
+
+/// The event stop a task owes its tracer for a child it has just made, taken
+/// once. See `Tracing::pending_event`.
+pub fn take_pending_event(id: TaskId) -> Option<(u32, u64)> {
+    with_table(|t| {
+        let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
+        task.trace.pending_event.take()
+    })
+}
+
+/// Hold the running task where it is so its tracer can be told that it made a
+/// child, and which child.
+///
+/// Called from inside the `fork`/`clone`/`vfork` call rather than after it, for
+/// the same reason [`exec_trap`] is called inside `execve`: the stop describes
+/// a moment in the middle of a syscall, and the call's own exit stop still
+/// follows it. `message` is the child's pid, which is what
+/// `PTRACE_GETEVENTMSG` answers at this stop.
+pub fn fork_trap(regs: &mut [u64; abi::uregs::COUNT], event: u32, message: u64) {
+    // The syscall record is deliberately left alone: it still describes the
+    // call in flight, and a tracer that asks what this stop is a boundary of
+    // should hear "the clone that has not returned yet".
+    let entry = with_table(|t| t.task(current()).trace.syscall);
+    park(
+        regs,
+        Stop {
+            signal: signal::SIGTRAP,
+            event,
+            traced: true,
+            reported: false,
+            message,
+            delivering: None,
+            syscall: entry,
+            group: false,
+        },
+    );
+}
+
+/// Stop the running task at a syscall boundary, if its tracer asked for one.
+///
+/// Called twice per syscall - once before the handler runs and once after -
+/// because that is the pair of moments a tracer wants to see. The `armed` flag
+/// is cleared here rather than at the resume: it is the stop that consumes the
+/// tracer's request, and the tracer re-arms it, which is what makes an entry
+/// stop and an exit stop two events rather than one repeated.
+pub fn stop_at_syscall(
+    entry: bool,
+    regs: &mut [u64; abi::uregs::COUNT],
+    nr: u64,
+    args: &[u64; 6],
+    ip: u64,
+    sp: u64,
+) {
+    let id = current();
+    let (armed, options, exec_exit) = with_table(|t| {
+        let trace = &t.task(id).trace;
+        (
+            trace.armed && trace.tracer.is_some(),
+            trace.options,
+            trace.at_exec_exit,
+        )
+    });
+    if !armed {
+        return;
+    }
+    if !entry && exec_exit {
+        // Legacy tracer (no `PTRACE_O_TRACEEXEC`): the exec trap *was* the
+        // call's completion notice. See `exec_trap`. With the option set this
+        // flag is never raised, and the exit stop follows the event stop the
+        // way ptrace(2) describes.
+        with_table(|t| t.task_mut(id).trace.at_exec_exit = false);
+        return;
+    }
+    let stop_syscall = with_table(|t| {
+        let task = t.task_mut(id);
+        // The entry's arguments are remembered across the pair of stops, so the
+        // exit half can describe the call as well as the entry half can.
+        if entry {
+            task.trace.at_exec_exit = false;
+            task.trace.syscall = Some(SyscallStop {
+                nr,
+                args: *args,
+                ip,
+                sp,
+                entry: true,
+            });
+            task.trace.syscall
+        } else {
+            let previous = task.trace.syscall.filter(|syscall| syscall.entry);
+            task.trace.syscall = Some(SyscallStop {
+                nr: previous.map_or(nr, |syscall| syscall.nr),
+                args: previous.map_or(*args, |syscall| syscall.args),
+                ip,
+                sp,
+                entry: false,
+            });
+            task.trace.syscall
+        }
+    });
+    // `TRACESYSGOOD` is the difference between a stop a tracer can recognise
+    // and one it has to guess at, so it is applied where the signal is chosen
+    // rather than stored anywhere.
+    let signal = signal::SIGTRAP
+        | if options & abi::PTRACE_O_TRACESYSGOOD != 0 {
+            abi::SYSCALL_TRAP
+        } else {
+            0
+        };
+    park(
+        regs,
+        Stop {
+            signal,
+            event: abi::PTRACE_EVENT_NONE,
+            traced: true,
+            reported: false,
+            message: 0,
+            delivering: None,
+            syscall: stop_syscall,
+            group: false,
+        },
+    );
+}
+
+/// Report the running task's pending signal to its tracer before it is
+/// delivered, and hold the task there until the tracer answers.
+///
+/// The signal stays pending across the stop. The tracer's resume replaces it -
+/// with the signal it names, or with nothing at all - and what is left behind is
+/// what the delivery path a few lines further on finds. A tracer that names
+/// nothing therefore drops the signal, which is the point: that is how a
+/// debugger "swallows" a signal, and how `strace` reports one without letting it
+/// through twice.
+pub fn trace_signal_stop(regs: &mut [u64; abi::uregs::COUNT]) {
+    let id = current();
+    let traced = with_table(|t| t.task(id).trace.tracer.is_some());
+    if !traced {
+        return;
+    }
+    let Some(sig) = with_table(|t| deliverable(t.task(id))) else {
+        return;
+    };
+    // Not a syscall stop, and it must not be reported as one: a tracer that
+    // asked about the syscall will find nothing and say so, rather than
+    // reading the previous call's arguments back and calling them this stop's.
+    with_table(|t| t.task_mut(id).trace.syscall = None);
+    park(
+        regs,
+        Stop {
+            signal: sig,
+            event: abi::PTRACE_EVENT_NONE,
+            traced: true,
+            reported: false,
+            message: 0,
+            delivering: Some(sig),
+            syscall: None,
+            // A stop reported *for a stop signal* is the tracee's own stop, and
+            // a `SIGCONT` ends it. Linux gets there in two steps - the tracer
+            // passes the signal on and the task then enters a group stop - and
+            // this kernel reports the signal-delivery stop and the group stop as
+            // one event. The observable consequence is the one that matters:
+            // `kill -CONT` must be able to get a task out of a `SIGSTOP`, and
+            // anything that stopped it that way has only that way back.
+            group: signal::stops_by_default(sig),
+        },
+    );
+}
+
+/// Stop the running task on a stop signal with nobody tracing it, and hold it
+/// there until a `SIGCONT` ends the stop.
+///
+/// This is the non-ptrace half of "stopped": `kill -STOP`, and Ctrl-Z once
+/// there is a keyboard. The parent is told with `WUNTRACED`, which is the only
+/// reason `wait` has the flag at all.
+pub fn group_stop(regs: &mut [u64; abi::uregs::COUNT], sig: u8) {
+    let id = current();
+    // A traced task's group stop is its tracer's business as well as its
+    // parent's. Linux reports it to the tracer, and it has to: a group stop
+    // nobody is told about is a task nothing will ever resume, because the only
+    // other way out is a `SIGCONT` and the tracee is inside a tracer that has no
+    // shell to send one.
+    let traced = with_table(|t| t.task(id).trace.tracer.is_some());
+    park(
+        regs,
+        Stop {
+            signal: sig,
+            event: abi::PTRACE_EVENT_NONE,
+            traced,
+            reported: false,
+            message: 0,
+            delivering: None,
+            syscall: None,
+            group: true,
+        },
+    );
+}
+
+/// Let a stopped task go on: `PTRACE_CONT`, `PTRACE_SYSCALL`, `PTRACE_DETACH`
+/// and the scheduler all end up here.
+///
+/// `signal` is what the tracer wants delivered, zero for nothing - and that
+/// zero is not a no-op. A stop entered to report a signal replaces that signal
+/// with whatever the tracer names, so naming nothing is how a tracer drops it.
+/// `arm` re-arms the syscall trace.
+///
+/// Deliberately permissive about a task that is not stopped: a tracer may arm
+/// the trace or set options before its tracee has reached its first syscall
+/// boundary, and answering `ESRCH` for that would be technically right and
+/// useless. A task that is running simply gets the arm, and stops at the next
+/// boundary as asked.
+pub fn resume_traced(id: TaskId, signal: u8, arm: bool) -> bool {
+    with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) if !task.exited => {
+            if let Some(reported) = task.trace.stop.and_then(|stop| stop.delivering) {
+                task.signals &= !signal::bit(reported);
+            }
+            task.trace.stop = None;
+            task.trace.armed = arm;
+            if signal != 0 {
+                signal::add(&mut task.signals, signal);
+            }
+            t.sched.wake(id);
+            true
+        }
+        _ => false,
+    })
+}
+
+/// Break the tracer link: `PTRACE_DETACH`, and the tracer's own death.
+///
+/// The tracee is resumed on the way out - a task left stopped with nobody to
+/// resume it would sit there for the machine's life, which is a worse outcome
+/// than running on with an unfinished trace.
+pub fn detach_traced(id: TaskId, signal: u8) -> bool {
+    with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) if !task.exited => {
+            task.trace.tracer = None;
+            task.trace.armed = false;
+            if let Some(reported) = task.trace.stop.and_then(|stop| stop.delivering) {
+                task.signals &= !signal::bit(reported);
+            }
+            task.trace.stop = None;
+            task.trace.regs = None;
+            if signal != 0 {
+                signal::add(&mut task.signals, signal);
+            }
+            t.sched.wake(id);
+            true
+        }
+        _ => false,
+    })
+}
+
+/// What happened to one child, as `wait(2)` reports it.
+#[derive(Clone, Copy)]
+pub enum WaitEvent {
+    /// A death to collect.
+    Exited { id: TaskId, code: isize },
+    /// A stop to report: the signal `WSTOPSIG` names, and the `PTRACE_EVENT_*`
+    /// the status word's high byte carries.
+    Stopped { id: TaskId, signal: u8, event: u32 },
+    /// A `SIGCONT` ended a stop. Only ever reported to a caller that asked
+    /// with `WCONTINUED`.
+    Continued { id: TaskId },
+}
+
+/// Is there something to report about one of `parent`'s children, given what
+/// the caller asked to hear about? `t` is borrowed rather than taken because
+/// this is also the blocking condition, which must not change anything.
+///
+/// The order is stops, then deaths, then resumes. A death comes last of the
+/// three because it cannot be reported at all until a stop that precedes it has
+/// been; a resume comes last because it is the least interesting thing that can
+/// have happened, and a tracer that is told about one when a stop was waiting
+/// has lost the stop.
+fn any_child_event(t: &Table, parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+    let children = || {
+        t.tasks.iter().enumerate().filter_map(|(slot, task)| {
+            let task = task.as_ref()?;
+            // A slot this task's own id names is not its child: `any_child_code`
+            // makes the same exclusion for the same reason.
+            (waitable(task, parent) && TaskId(slot) != parent).then_some((TaskId(slot), task))
+        })
+    };
+    if let Some(stopped) = unreported_stop(t, parent, stops) {
+        return Some(stopped);
+    }
+    if continues {
+        for (id, task) in children() {
+            if task.trace.continued {
+                return Some(WaitEvent::Continued { id });
+            }
+        }
+    }
+    // Deaths last, and read out of the retired list exactly as the exit-only
+    // `wait` reads them - the same records, so a caller that asks about stops
+    // cannot lose an exit code by asking.
+    critical_section::with(|cs| {
+        RETIRED
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(id, _)| {
+                let free = t.tasks[id.0].is_none();
+                let ours = free
+                    || t.tasks[id.0]
+                        .as_ref()
+                        .is_some_and(|task| waitable(task, parent));
+                ours && *id != parent
+            })
+            .map(|(id, code)| WaitEvent::Exited {
+                id: *id,
+                code: *code,
+            })
+    })
+}
+
+/// Turn a look into a collection: mark the stop reported, take the `SIGCONT`
+/// flag, or consume the exit code. Everything this does is a change, which is
+/// why it is a second pass over the table rather than part of the look.
+fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
+    match event {
+        // The code in the event is a look, not a claim: the value that counts
+        // is the one taken here, because between the look and the take another
+        // waiter could have collected it.
+        WaitEvent::Exited { id, .. } => {
+            take_exit_code(id).map(|code| WaitEvent::Exited { id, code })
+        }
+        WaitEvent::Stopped { id, signal, event } => {
+            let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
+            let stop = task.trace.stop.as_mut()?;
+            if stop.reported {
+                return None;
+            }
+            stop.reported = true;
+            Some(WaitEvent::Stopped { id, signal, event })
+        }
+        WaitEvent::Continued { id } => {
+            let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
+            if !task.trace.continued {
+                return None;
+            }
+            task.trace.continued = false;
+            Some(WaitEvent::Continued { id })
+        }
+    }
+}
+
+/// Block until a child of `parent` has something to report, and collect it.
+/// The exit-only shape is `wait_any_child`, which this generalises.
+pub fn wait_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+    block_until_on(|t| any_child_event(t, parent, stops, continues).is_some());
+    with_table(|t| {
+        let event = any_child_event(t, parent, stops, continues)?;
+        take_event(t, event)
+    })
+}
+
+/// The non-blocking half: is there anything to collect right now?
+pub fn poll_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+    with_table(|t| {
+        let event = any_child_event(t, parent, stops, continues)?;
+        take_event(t, event)
+    })
+}
+
+/// The same question for one named child, which is what `waitpid` asks.
+pub fn child_event(id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+    with_table(|t| child_event_in(t, id, stops, continues))
+}
+
+/// [`child_event`] against a table the caller already holds - the shape the
+/// blocking condition needs, since it runs inside `schedule`'s borrow.
+fn child_event_in(t: &Table, id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+    let task = t.tasks.get(id.0).and_then(Option::as_ref)?;
+    if let Some(stop) = task.trace.stop
+        && !stop.reported
+        && (stops || stop.traced)
+    {
+        return Some(WaitEvent::Stopped {
+            id,
+            signal: stop.signal,
+            event: stop.event,
+        });
+    }
+    if task.trace.continued && continues {
+        return Some(WaitEvent::Continued { id });
+    }
+    None
+}
+
+/// Collect `id`'s stop or resume, if there is one waiting.
+pub fn take_child_event(id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+    let event = child_event(id, stops, continues)?;
+    with_table(|t| take_event(t, event))
+}
+
+/// Whether `id` has anything a `wait` with these flags could report.
+pub fn child_event_pending(id: TaskId, stops: bool, continues: bool) -> bool {
+    child_event(id, stops, continues).is_some()
+}
+
+/// Block the running task until `id` has something to report, then collect it.
+///
+/// The stop-aware relative of [`block_until_code`]. The condition is read
+/// through the borrow `block_until_on` already holds for the same reason it is
+/// there: a closure taking its own critical section inside `schedule`'s would
+/// nest one inside another and hand interrupts back early.
+pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+    block_until_on(|t| {
+        exit_code(id).is_some() || child_event_in(t, id, stops, continues).is_some()
+    });
+    if let Some(event) = take_child_event(id, stops, continues) {
+        return Some(event);
+    }
+    take_exit_code(id).map(|code| WaitEvent::Exited { id, code })
+}
+
+/// The paging root `id` runs on: its own address space's, or its thread group's
+/// for a thread. `None` for a kernel task, which has no user memory to reach.
+pub fn space_root_of(id: TaskId) -> Option<usize> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0)?.as_ref()?;
+        match &task.space {
+            Some(space) => Some(space.root()),
+            None if task.mm.root() != 0 => Some(task.mm.root()),
+            None => None,
+        }
+    })
+}
+
+/// The thread-local storage base `id` runs with - the `fs_base` of a
+/// `user_regs_struct` that belongs to somebody other than the caller.
+pub fn tls_of(id: TaskId) -> Option<usize> {
+    with_table(|t| t.tasks.get(id.0)?.as_ref().map(|task| task.tls))
 }
 
 /// The address a process's user virtual address translates to, if it may be
@@ -2150,6 +3470,59 @@ pub fn write_user(virt: usize, bytes: &[u8]) -> bool {
             crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
         let chunk = core::cmp::min(page_end - at, bytes.len() - done);
         let Some(phys) = user_byte_address(at, true) else {
+            return false;
+        };
+        let dest =
+            unsafe { core::slice::from_raw_parts_mut(mm::phys_to_virt(phys) as *mut u8, chunk) };
+        dest.copy_from_slice(&bytes[done..done + chunk]);
+        done += chunk;
+    }
+    true
+}
+
+/// Read `bytes` out of the user address space `root` names.
+///
+/// The cross-process twin of [`read_user`], and the one `PTRACE_PEEKDATA` and
+/// `process_vm_readv` are built on. It goes through the direct map rather than
+/// through a user pointer, because the address belongs to a *different* process:
+/// the kernel may not dereference it as its own, and the page tables that
+/// describe it are not the ones CR3 holds. Every frame in the machine is
+/// reachable at the HHDM offset, which is what makes "translate here, read
+/// there" possible at all.
+///
+/// A write of a page that is still copy-on-write is deliberately *not*
+/// broken here. `strace` only reads; a debugger poking a page a forked tracee
+/// still shares would want the copy broken first, and doing that needs the
+/// tracee's own `Mm` accounting rather than a physical address. Said plainly
+/// rather than half-done.
+pub fn read_user_of(root: usize, virt: usize, bytes: &mut [u8]) -> bool {
+    let mut done = 0;
+    while done < bytes.len() {
+        let at = virt + done;
+        let page_end =
+            crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
+        let chunk = core::cmp::min(page_end - at, bytes.len() - done);
+        let Some(phys) = paging::phys_for_virt_of(root, at) else {
+            return false;
+        };
+        let src =
+            unsafe { core::slice::from_raw_parts(mm::phys_to_virt(phys) as *const u8, chunk) };
+        bytes[done..done + chunk].copy_from_slice(src);
+        done += chunk;
+    }
+    true
+}
+
+/// Write `bytes` into the user address space `root` names. The writing half of
+/// [`read_user_of`], and so the same note about copy-on-write pages applies.
+pub fn write_user_of(root: usize, virt: usize, bytes: &[u8]) -> bool {
+    let mut done = 0;
+    while done < bytes.len() {
+        let at = virt + done;
+        let page_end =
+            crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
+        let chunk = core::cmp::min(page_end - at, bytes.len() - done);
+        let Some(phys) = paging::phys_for_virt_of(root, at) else {
             return false;
         };
         let dest =
@@ -2212,7 +3585,11 @@ pub fn exit(code: isize) -> ! {
             // when a handler would run: SIGCHLD's default action ignores
             // it, and a signal the parent has ignored must never become
             // pending - Linux discards it as it is generated.
-            if t.task(parent).dispositions.get(signal::SIGCHLD).is_handler() {
+            if t.task(parent)
+                .dispositions
+                .get(signal::SIGCHLD)
+                .is_handler()
+            {
                 signal::add(&mut t.task_mut(parent).signals, signal::SIGCHLD);
             }
             // The console goes back to the parent's group as the child leaves
@@ -2247,6 +3624,28 @@ pub fn exit(code: isize) -> ! {
             if adopted {
                 t.sched.wake(INIT_PID);
             }
+        }
+
+        // Anything this task was tracing is let go. A tracee whose tracer has
+        // died has nobody left to resume it, and a task stopped with nobody to
+        // resume it sits there for the machine's life - a worse outcome than an
+        // unfinished trace, which is all that running on gives up.
+        let tracees: Vec<TaskId> = t
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, task)| {
+                let task = task.as_ref()?;
+                (task.trace.tracer == Some(id) && !task.exited).then_some(TaskId(slot))
+            })
+            .collect();
+        for tracee in tracees {
+            let task = t.task_mut(tracee);
+            task.trace.tracer = None;
+            task.trace.armed = false;
+            task.trace.stop = None;
+            task.trace.regs = None;
+            t.sched.wake(tracee);
         }
     });
     unreachable!("an exited task is never picked again")
@@ -2372,7 +3771,7 @@ fn any_child_code(t: &Table, parent: TaskId) -> Option<(TaskId, isize)> {
                 let ours = free
                     || t.tasks[id.0]
                         .as_ref()
-                        .is_some_and(|task| task.parent == Some(parent));
+                        .is_some_and(|task| waitable(task, parent));
                 ours && *id != parent
             })
             .map(|(id, code)| (*id, *code))
@@ -2392,7 +3791,10 @@ fn record_retired(id: TaskId, code: isize) {
         if retired.len() == RETIRED_CAP {
             let dropped = retired.remove(0);
             // A code nobody will collect has no signal left to read either.
-            SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != dropped.0);
+            SIGCHLD_PENDING
+                .borrow(cs)
+                .borrow_mut()
+                .retain(|p| *p != dropped.0);
         }
         retired.push((id, code));
         // The signal the exit carries: pending until a signalfd reader takes
@@ -2428,18 +3830,6 @@ fn drop_retired(id: TaskId) {
             .borrow_mut()
             .retain(|(retired, _)| *retired != id);
     });
-}
-
-/// Whether `id` names a live, un-exited task whose parent is `parent` - the
-/// check that keeps `wait` from blocking on someone else's child. A task that
-/// has already exited answers false here, but its code is in the retired
-/// records for the caller to read.
-pub fn is_child(id: TaskId, parent: TaskId) -> bool {
-    with_table(|t| {
-        t.tasks[id.0]
-            .as_ref()
-            .is_some_and(|task| !task.exited && task.parent == Some(parent))
-    })
 }
 
 /// The running task.
@@ -2524,6 +3914,12 @@ fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
     // waiting for a driver to wake it, and nothing about the task says so.
     let state = if task.exited {
         'Z'
+    } else if task.trace.stop.is_some() {
+        // Stopped, not sleeping: the stop is a state a SIGCONT undoes and a
+        // `wait(WUNTRACED)` reports, and reporting it as sleep would read as
+        // an ordinary blocked syscall - the letter a debugger and a shell's
+        // job table both key on.
+        'T'
     } else if t.sched.is_sleeping(id) {
         'S'
     } else {
@@ -2652,12 +4048,11 @@ pub fn descriptors_of(pid: usize) -> alloc::vec::Vec<(usize, alloc::string::Stri
     // The files are collected under the table and named outside it: naming
     // asks the mount table where an inode sits, and the two locks must never
     // nest the other way round.
-    let open: alloc::vec::Vec<(i32, alloc::sync::Arc<crate::vfs::File>)> = with_table(|t| {
-        match t.tasks.get(pid).and_then(Option::as_ref) {
+    let open: alloc::vec::Vec<(i32, alloc::sync::Arc<crate::vfs::File>)> =
+        with_table(|t| match t.tasks.get(pid).and_then(Option::as_ref) {
             Some(task) if task.user => task.fds.open_files(),
             _ => alloc::vec::Vec::new(),
-        }
-    });
+        });
     open.into_iter()
         .map(|(fd, file)| (fd as usize, file.display_name()))
         .collect()
@@ -2720,7 +4115,18 @@ pub fn move_user_page(virt: usize, frame: usize, flags: crate::mm::vm::MapFlags)
 
 /// The frame behind `virt` in the current task's address space, if it has one.
 pub fn user_frame_at(virt: usize) -> Option<usize> {
-    with_table(|t| t.task(current()).space.as_ref()?.phys_for_virt(virt))
+    with_table(|t| {
+        // The *group's* space, as every other mapping question asks: a thread
+        // owns no address space of its own, so a thread's slot holds `None` and
+        // asking it answers "nothing is mapped" for every address the thread
+        // names - which is the wrong answer for all four callers. The sharpest
+        // of them is `futex`: it reads the word it is about to sleep on, so
+        // every thread's `FUTEX_WAIT` would see a word that is always zero and
+        // answer `EAGAIN`, and musl's `__timedwait_cp` retries on `EAGAIN` in a
+        // loop. A condvar wait inside a thread became a spin.
+        let owner = t.space_owner(current());
+        t.task(owner).space.as_ref()?.phys_for_virt(virt)
+    })
 }
 
 /// Whether every page of `virt..virt + len` is still unmapped in the current
@@ -3116,6 +4522,24 @@ pub fn fork(state: &UserContext) -> isize {
     spawn_copy(state, CloneRequest::default())
 }
 
+/// `vfork(2)`: the same copy of the calling process, labelled for the tracer.
+///
+/// Linux's `vfork` is `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`, and that flag is
+/// what makes the event a tracer is waiting for `PTRACE_EVENT_VFORK` rather
+/// than `PTRACE_EVENT_FORK`. The sharing and the suspended parent are the parts
+/// this kernel does not reproduce - see [`clone`] for why a copy meets the
+/// contract better here than a share would - but which of the two events a
+/// tracer is waiting for is not something it can recover for itself.
+pub fn vfork(state: &UserContext) -> isize {
+    spawn_copy(
+        state,
+        CloneRequest {
+            flags: nr::CLONE_VFORK,
+            ..CloneRequest::default()
+        },
+    )
+}
+
 /// What a `clone` asks for beyond "a copy of me": which flags, where the child's
 /// stack is, where the child should record its own tid, and what TLS it runs
 /// with.
@@ -3220,7 +4644,15 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         // parent's RFLAGS: a fork child resumes inside a syscall gate, and the
         // gate runs with IF clear. Enabling them any earlier would let the clock
         // fire on a task that has not reached user mode yet.
-        let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
+        let mut context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
+        // The child's floating-point registers are its creator's: they are part
+        // of what `fork` and a thread-creating `clone` copy, and `bootstrap`
+        // would otherwise hand over the architectural reset state. The live
+        // registers *are* the creator's at this point - the kernel touches none
+        // of them, so the syscall it is inside did not disturb them, and any
+        // preemption since it was switched in restored them from its own saved
+        // block.
+        unsafe { context::save_live_fpu(&mut context.fpu) };
 
         // Create the child's address space by sharing all parent pages COW.
         let mut child_space = AddressSpace::new();
@@ -3294,6 +4726,12 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             cwd_path: parent_cwd_path,
             parent: Some(parent_id),
             pgid: t.task(parent_id).pgid,
+            // A fork child is in the same session as its parent and holds the
+            // same controlling terminal - the identity `/dev/tty` opens for
+            // it, whatever its parent was doing when it copied itself.
+            session: t.task(parent_id).session,
+            ctty: t.task(parent_id).ctty,
+            identity: t.task(parent_id).identity,
             brk_base: parent_brk_base,
             brk_pages: parent_brk_pages,
             mmap_cursor: parent_mmap_cursor,
@@ -3314,10 +4752,21 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
                 parent_tls
             },
             itimers: [None; 3],
+            trace: Tracing::default(),
         });
 
         let child_id = TaskId(slot);
-        t.sched.push_ready(child_id, parent_priority);
+        // A child born into a tracer's hands does not go on the ready queue: it
+        // is stopped, and letting it run would be the one thing that stop exists
+        // to prevent. Everything else about it is already built - `user_resume`
+        // holds the register file it will come back from the call with - so the
+        // resume is what puts it on the queue, exactly as it is for a tracee
+        // stopped anywhere else.
+        if attach_new_child(t, parent_id, child_id, fork_event(request.flags)) {
+            t.sched.sleep(child_id, parent_priority, u64::MAX);
+        } else {
+            t.sched.push_ready(child_id, parent_priority);
+        }
         t.sched.wake(parent_id);
         child_id
     });
@@ -3373,6 +4822,15 @@ pub fn exec_replace(
         task.child_tid = 0;
         task.tls = 0;
         unsafe { write_msr(MSR_FS_BASE, 0) };
+        // And a fresh image starts with the floating-point registers reset, for
+        // the reason POSIX says so and Linux does the same: the discarded image
+        // must not be readable out of them, and its rounding mode must not leak
+        // into the next program's arithmetic. Both copies are reset - the live
+        // registers, because they are what the new program runs with until the
+        // next switch, and the task's saved block, because that is what a switch
+        // to it would restore.
+        unsafe { crate::arch::context::reset_live_fpu() };
+        task.context.fpu = crate::arch::context::FpuState::reset();
 
         // --- Build new address space ---
         let mut space = AddressSpace::new();
@@ -3618,22 +5076,20 @@ fn scheduler_loop() {
 /// caller's requests honoured. The flag word has already been validated by the
 /// syscall layer, so what is left here is the part the flags decide.
 ///
-/// A *thread* is the one thing this cannot build. `CLONE_THREAD` means the child
-/// shares the caller's address space and signal handlers - which is what makes a
-/// shared variable a shared variable - and this kernel's address space belongs
-/// to exactly one task: two owners would free each other's frames on the way
-/// out. Sharing one honestly needs reference-counted page tables, so a thread is
-/// refused with `ENOSYS` rather than answered with a child that only looks like
-/// one and would break the first time two threads touched the same word.
+/// A *thread* - `CLONE_THREAD` - is built by [`spawn_thread`]: a task that runs
+/// on the caller's memory rather than a copy of it. What makes that possible is
+/// the thread group: the frames behind the mappings belong to the group, which
+/// counts its members, so a thread that leaves does not free memory its
+/// siblings are still using.
 ///
 /// `CLONE_VM` *without* `CLONE_THREAD` is a different request, and it is the one
-/// a libc actually makes: `posix_spawn` clones with `CLONE_VM|CLONE_VFORK`, and
-/// the child's entire job is to `execve` immediately. Such a child only ever
+/// a libc actually makes in `posix_spawn`: it clones with `CLONE_VM|CLONE_VFORK`
+/// and the child's entire job is to `execve` immediately. Such a child only ever
 /// *reads* the caller's memory - the path, the argument vector, the file-action
-/// list - and reading is exactly what a copy-on-write image and a shared one do
-/// identically. So the spawn shape is answered with a copy: the contract the
-/// caller asked for, met precisely, with no shared page tables to reference-count
-/// and no way for the child to outlive the address space it came from.
+/// list - and reading is what a copy and a share do identically. So the spawn
+/// shape is answered with a copy: the contract the caller asked for, met
+/// precisely, with no shared page tables to reference-count and no way for the
+/// child to outlive the address space it came from.
 ///
 /// `CLONE_VFORK` is accepted and not acted on. Linux suspends the parent until
 /// the child execs; with a private copy of memory there is nothing the parent
@@ -3674,6 +5130,9 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let fds = parent.fds.clone();
         let tgid = parent.tgid;
         let pgid = parent.pgid;
+        let session = parent.session;
+        let ctty = parent.ctty;
+        let identity = parent.identity;
         let priority = parent.priority;
         let dispositions = parent.dispositions;
         let cwd = parent.cwd.clone();
@@ -3691,7 +5150,15 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let stack = Stack::new();
         // Interrupts stay off until the thread's `iretq` restores the flags it
         // was created with, exactly as a fork child's does.
-        let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
+        let mut context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
+        // The child's floating-point registers are its creator's: they are part
+        // of what `fork` and a thread-creating `clone` copy, and `bootstrap`
+        // would otherwise hand over the architectural reset state. The live
+        // registers *are* the creator's at this point - the kernel touches none
+        // of them, so the syscall it is inside did not disturb them, and any
+        // preemption since it was switched in restored them from its own saved
+        // block.
+        unsafe { context::save_live_fpu(&mut context.fpu) };
 
         t.tasks[slot] = Some(Task {
             context,
@@ -3702,7 +5169,13 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             // No address space of its own: the group's root is what the
             // dispatcher loads for it.
             space: None,
-            user: false,
+            // ...but it *is* a user task, and saying so is what makes it
+            // visible at all: `user` is the flag `/proc` filters on, and it
+            // measures "has an image", not "owns an address space" - a thread
+            // runs the group's image. Without it `/proc/<pid>/task` lists the
+            // leader alone while `/proc/<pid>/status` counts both, which is the
+            // one place a `ps -T` and a `Threads:` line can disagree.
+            user: true,
             user_entry: None,
             user_resume: Some(UserContext {
                 // The child returns from the call with zero, and lands on the
@@ -3727,6 +5200,12 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             // The process becomes collectable when its leader exits.
             parent: None,
             pgid,
+            // A thread is its process: the same session, the same controlling
+            // terminal its creator's group holds.
+            session,
+            ctty,
+            // ...and the same identity, group and user words alike.
+            identity,
             brk_base,
             brk_pages,
             mmap_cursor,
@@ -3743,6 +5222,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
                 parent_tls
             },
             itimers: [None; 3],
+            trace: Tracing::default(),
             mm: {
                 mm.join();
                 mm
@@ -3763,7 +5243,15 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         }
 
         let child_id = TaskId(slot);
-        t.sched.push_ready(child_id, priority);
+        // A thread born into a tracer's hands is stopped before its first
+        // instruction for the same reason a process child is - and it matters
+        // more here, because a thread that has run once is a thread whose first
+        // syscalls are missing from the trace.
+        if attach_new_child(t, parent_id, child_id, abi::PTRACE_EVENT_CLONE) {
+            t.sched.sleep(child_id, priority, u64::MAX);
+        } else {
+            t.sched.push_ready(child_id, priority);
+        }
         child_id
     });
 

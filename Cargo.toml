@@ -5,7 +5,7 @@
 # without it would build the user programs for the host too, and they are
 # built for musl.
 [workspace]
-members = ["user", "boot"]
+members = ["user", "user/tests", "user/abitest", "boot", "xtask"]
 # "." is the kernel - the root package, which is a member without being
 # listed in `members`.
 default-members = ["."]
@@ -37,6 +37,16 @@ virtio-drivers = "0.13"
 # feature set, and `rand_core` supplies the `SeedableRng`/`RngCore` traits.
 rand_chacha = { version = "0.9", default-features = false }
 rand_core = { version = "0.9", default-features = false }
+
+# Kernel logging. `tracing` is used in its `no_std` configuration - the
+# subscriber crates all need `std` - and the subscriber that turns an event
+# into a line on the serial console is this crate's own (`src/logging.rs`).
+# The macro front end is why it is `tracing` and not a hand-rolled `log!`:
+# an event carries a level, a target and structured fields, and the console
+# gets all three without a formatting layer of the kernel's own. `alloc` is
+# required by `tracing-core` when `std` is off, and the kernel has an
+# allocator before the first event is emitted.
+tracing = { version = "0.1", default-features = false }
 
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = { version = "1.2", features = ["restore-state-bool"] }

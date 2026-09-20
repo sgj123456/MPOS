@@ -62,8 +62,22 @@ const S_IFCHR: u16 = 0x2000;
 /// not an optimisation.
 const FAST_SYMLINK_MAX: u32 = 60;
 const INCOMPAT_FILETYPE: u32 = 1 << 1;
-/// The directory is htree-indexed: a format this driver does not walk.
+/// The directory is htree-indexed: block 0 is an index root rather than a
+/// plain list of entries, so inserts have to maintain the tree. Reads are
+/// immune - the index bytes hide in the slack of `..` and of whole-block
+/// fake dirents, which every linear dirent walker skips - and so is removal,
+/// which never moves an entry between leaves. Only insertion cares.
 const INODE_INDEX_FL: u32 = 1 << 12;
+/// `EXT2_FLAGS_UNSIGNED_HASH` in the superblock: the tree's hashes were made
+/// with unsigned character semantics, which renumbers the stored hash
+/// version from the signed variants onto the unsigned ones.
+const SB_FLAGS_UNSIGNED_HASH: u32 = 1 << 1;
+/// The largest hash an index entry can name; `<< 1` is where the clamped
+/// ones go.
+const HTREE_EOF_32BIT: u32 = 0x7fff_ffff;
+/// An htree never grows deeper than one intermediate index level below the
+/// root - the shape every ext2/ext4 without the `largedir` feature makes.
+const HTREE_MAX_LEVELS: u8 = 1;
 const GROUP_DESC_BYTES: usize = 32;
 const DIRENT_HEADER: usize = 8;
 /// Direct-mapped cache: one slot per possible block modulo this count.
@@ -96,6 +110,15 @@ struct Super {
     inodes_per_group: u32,
     first_ino: u32,
     inode_size: u16,
+    /// The htree hash seed: four words at `s_hash_seed` (offset 236, past
+    /// the journal fields the rev-1 layout grew), salt shared by every
+    /// directory index on this filesystem.
+    hash_seed: [u32; 4],
+    /// Whether those indexes were built with unsigned character semantics -
+    /// the `s_flags` bit (offset 352) Linux records the first time it mounts
+    /// a filesystem whose hash flavor was never written down. A filesystem
+    /// that says nothing, like this image's, reads as signed.
+    hash_unsigned: bool,
     /// The superblock's own home: block and offset within it. It moves with
     /// the block size, so the free counters can be rewritten in place later.
     sb_block: u64,
@@ -135,6 +158,13 @@ impl Super {
             inodes_per_group: le32(bytes, 40),
             first_ino,
             inode_size: inode_size as u16,
+            hash_seed: [
+                le32(bytes, 236),
+                le32(bytes, 240),
+                le32(bytes, 244),
+                le32(bytes, 248),
+            ],
+            hash_unsigned: le32(bytes, 352) & SB_FLAGS_UNSIGNED_HASH != 0,
             sb_block: first_data_block as u64,
             sb_off: SUPERBLOCK_AT as usize - first_data_block as usize * block_size,
         };
@@ -752,16 +782,37 @@ impl Core {
         Ok(found)
     }
 
-    /// Append `name -> child` to a directory, carving slack out of existing
-    /// blocks first and growing the directory by one block only when nothing
-    /// fits. The caller owns the inode rewrite; `dir` is mutated in place so
-    /// size and block count stay truthful.
+    /// Append `name -> child` to a directory. The caller owns the inode
+    /// rewrite; `dir` is mutated in place so size, block count and flags stay
+    /// truthful.
+    ///
+    /// An indexed directory takes the htree path: the entry has to land in
+    /// the leaf the index names for its hash, and every leaf the tree gains
+    /// has to be registered in the index, or the tree stops describing the
+    /// entries and a Linux that later mounts the image walks a lie. A linear
+    /// directory just carves slack; its flag stays unset, and a Linux that
+    /// wants it indexed converts it on its own.
     fn dir_add(&self, dir: &mut InodeData, name: &str, child: u32, ftype: u8) -> VfsResult<()> {
-        self.dir_writable(dir)?;
         assert!(
             !name.is_empty() && name.len() <= 255,
             "ext2 names are 1..=255 bytes"
         );
+        if dir.flags & INODE_INDEX_FL != 0 {
+            self.dir_add_indexed(dir, name, child, ftype)
+        } else {
+            self.dir_add_linear(dir, name, child, ftype)
+        }
+    }
+
+    /// The linear insert: carve slack out of existing blocks first and grow
+    /// the directory by one block only when nothing fits.
+    fn dir_add_linear(
+        &self,
+        dir: &mut InodeData,
+        name: &str,
+        child: u32,
+        ftype: u8,
+    ) -> VfsResult<()> {
         let block_size = self.block_size();
         let blocks = dir.size as u64 / block_size as u64;
         for l in 0..blocks {
@@ -786,8 +837,14 @@ impl Core {
     /// space goes to the one before it, so the block stays walkable without a
     /// hole in its middle; an entry with no predecessor is emptied instead,
     /// which is the zero inode a walk skips and a later insert reuses.
+    ///
+    /// No index bookkeeping: a removal never moves an entry between leaves
+    /// and never changes a hash, so the index keeps describing the tree
+    /// exactly as it did - which is what Linux's own delete does. The linear
+    /// walk finds the entry wherever it lives (index blocks hide behind
+    /// whole-block fake dirents, and block 0 of an indexed directory holds
+    /// only "." and "..").
     fn dir_remove(&self, dir: &mut InodeData, name: &str) -> VfsResult<u32> {
-        self.dir_writable(dir)?;
         let block_size = self.block_size();
         for l in 0..dir.size as u64 / block_size as u64 {
             let block = self
@@ -800,26 +857,6 @@ impl Core {
             }
         }
         Err(VfsError::NoEntry)
-    }
-
-    /// The guard on *rewriting* a directory, not on reading it. An
-    /// `INDEX_FL` (htree) directory keeps its hash index inside the slack of
-    /// block 0's `..`, and this filesystem has no code to maintain it - an
-    /// insert or removal here would leave the index describing a tree that
-    /// no longer matches the entries, which a Linux that later mounts the
-    /// image would trust. Reads are another matter: the dirent blocks of an
-    /// indexed directory remain the complete linear list, and a linear scan
-    /// is exactly what Linux's own readdir does - so `dir_lookup` and
-    /// `dir_entries` deliberately skip this check. An mke2fs-populated image
-    /// with the default `dir_index` feature marks every directory past a
-    /// few dozen entries with the flag; refusing to read those is what made
-    /// `/etc/ssl/certs` - and with it every CA certificate, and with those
-    /// every TLS fetch apk attempted - answer `ENOSYS`.
-    fn dir_writable(&self, dir: &InodeData) -> VfsResult<()> {
-        if dir.flags & INODE_INDEX_FL != 0 {
-            return Err(VfsError::Unsupported);
-        }
-        Ok(())
     }
 
     /// A brand-new inode: reserved fields zeroed, mode and links set, and for
@@ -990,6 +1027,717 @@ fn dir_init(page: &mut [u8], dir_ino: u32, parent_ino: u32) -> bool {
         FT_DIR,
     );
     true
+}
+
+// ---- the directory hash (htree) ----
+//
+// An indexed directory sorts its entries by a hash of the name. The hash is
+// not a local invention: a Linux that mounts this image later has to agree
+// with every value this driver ever wrote into an index, byte for byte, or
+// its lookups land in the wrong leaf and names vanish. The transforms below
+// are line-for-line the ones in Linux's `fs/ext4/hash.c` - the legacy ext2
+// hash, a cut-down MD4 and a TEA - fed by the same seed from the superblock.
+
+/// One round of the cut-down MD4: `a += f(b, c, d) + x`, rotated.
+fn md4_round(
+    f: impl Fn(u32, u32, u32) -> u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+    x: u32,
+    s: u32,
+) -> u32 {
+    a.wrapping_add(f(b, c, d)).wrapping_add(x).rotate_left(s)
+}
+
+/// Half of MD4 - rounds 1..3 over eight words, the whole of what the htree
+/// needs of the real thing.
+fn half_md4_transform(buf: &mut [u32; 4], input: &[u32; 8]) {
+    // The round constants of MD4's middle and last rounds.
+    const K2: u32 = 0o13240474631;
+    const K3: u32 = 0o15666365641;
+    let f = |x: u32, y: u32, z: u32| z ^ (x & (y ^ z));
+    let g = |x: u32, y: u32, z: u32| (x & y).wrapping_add((x ^ y) & z);
+    let h = |x: u32, y: u32, z: u32| x ^ y ^ z;
+    let (mut a, mut b, mut c, mut d) = (buf[0], buf[1], buf[2], buf[3]);
+
+    a = md4_round(f, a, b, c, d, input[0], 3);
+    d = md4_round(f, d, a, b, c, input[1], 7);
+    c = md4_round(f, c, d, a, b, input[2], 11);
+    b = md4_round(f, b, c, d, a, input[3], 19);
+    a = md4_round(f, a, b, c, d, input[4], 3);
+    d = md4_round(f, d, a, b, c, input[5], 7);
+    c = md4_round(f, c, d, a, b, input[6], 11);
+    b = md4_round(f, b, c, d, a, input[7], 19);
+
+    a = md4_round(g, a, b, c, d, input[1].wrapping_add(K2), 3);
+    d = md4_round(g, d, a, b, c, input[3].wrapping_add(K2), 5);
+    c = md4_round(g, c, d, a, b, input[5].wrapping_add(K2), 9);
+    b = md4_round(g, b, c, d, a, input[7].wrapping_add(K2), 13);
+    a = md4_round(g, a, b, c, d, input[0].wrapping_add(K2), 3);
+    d = md4_round(g, d, a, b, c, input[2].wrapping_add(K2), 5);
+    c = md4_round(g, c, d, a, b, input[4].wrapping_add(K2), 9);
+    b = md4_round(g, b, c, d, a, input[6].wrapping_add(K2), 13);
+
+    a = md4_round(h, a, b, c, d, input[3].wrapping_add(K3), 3);
+    d = md4_round(h, d, a, b, c, input[7].wrapping_add(K3), 9);
+    c = md4_round(h, c, d, a, b, input[2].wrapping_add(K3), 11);
+    b = md4_round(h, b, c, d, a, input[6].wrapping_add(K3), 15);
+    a = md4_round(h, a, b, c, d, input[1].wrapping_add(K3), 3);
+    d = md4_round(h, d, a, b, c, input[5].wrapping_add(K3), 9);
+    c = md4_round(h, c, d, a, b, input[0].wrapping_add(K3), 11);
+    b = md4_round(h, b, c, d, a, input[4].wrapping_add(K3), 15);
+
+    for (word, sum) in buf.iter_mut().zip([a, b, c, d]) {
+        *word = word.wrapping_add(sum);
+    }
+}
+
+/// The TEA round the htree uses as a second mixing function.
+fn tea_transform(buf: &mut [u32; 4], input: &[u32; 4]) {
+    const DELTA: u32 = 0x9e37_79b9;
+    let (mut b0, mut b1) = (buf[0], buf[1]);
+    let (a, b, c, d) = (input[0], input[1], input[2], input[3]);
+    let mut sum = 0u32;
+    for _ in 0..16 {
+        sum = sum.wrapping_add(DELTA);
+        b0 = b0.wrapping_add(
+            ((b1 << 4).wrapping_add(a)) ^ b1.wrapping_add(sum) ^ ((b1 >> 5).wrapping_add(b)),
+        );
+        b1 = b1.wrapping_add(
+            ((b0 << 4).wrapping_add(c)) ^ b0.wrapping_add(sum) ^ ((b0 >> 5).wrapping_add(d)),
+        );
+    }
+    buf[0] = buf[0].wrapping_add(b0);
+    buf[1] = buf[1].wrapping_add(b1);
+}
+
+/// The original ext2 hash, before there was a tree to sort with.
+fn dx_hack_hash(name: &[u8], unsigned: bool) -> u32 {
+    let (mut hash0, mut hash1) = (0x12a3_fe2d_u32, 0x37ab_e8f9_u32);
+    for &byte in name {
+        let c = if unsigned {
+            byte as u32
+        } else {
+            byte as i8 as i32 as u32
+        };
+        let mut hash = hash1.wrapping_add(hash0 ^ c.wrapping_mul(7152373));
+        if hash & 0x8000_0000 != 0 {
+            hash = hash.wrapping_sub(0x7fff_ffff);
+        }
+        hash1 = hash0;
+        hash0 = hash;
+    }
+    hash0 << 1
+}
+
+/// Pack name bytes into `out.len()` words the way the transforms consume
+/// them. `unsigned` decides whether a byte above 127 enters the word
+/// sign-extended or zero-filled - the one place the two hash flavors differ.
+fn str2hashbuf(msg: &[u8], out: &mut [u32], unsigned: bool) {
+    let len = msg.len().min(out.len() * 4);
+    let mut pad = len as u32 | (len as u32) << 8;
+    pad |= pad << 16;
+    let mut word = 0;
+    let mut at = 0;
+    while len - at >= 4 {
+        out[word] = (byte_of(msg[at], unsigned) << 24)
+            .wrapping_add((byte_of(msg[at + 1], unsigned)) << 16)
+            .wrapping_add((byte_of(msg[at + 2], unsigned)) << 8)
+            .wrapping_add(byte_of(msg[at + 3], unsigned));
+        word += 1;
+        at += 4;
+    }
+    let mut val = pad;
+    for b in &msg[at..len] {
+        val = byte_of(*b, unsigned).wrapping_add(val << 8);
+    }
+    if word < out.len() {
+        out[word] = val;
+        word += 1;
+    }
+    out[word..].fill(pad);
+}
+
+fn byte_of(b: u8, unsigned: bool) -> u32 {
+    if unsigned {
+        b as u32
+    } else {
+        b as i8 as i32 as u32
+    }
+}
+
+/// The hash an index sorts a name by: the algorithm the directory's root
+/// block names, salted with the superblock's seed. `None` for a version this
+/// driver does not implement (Siphash, the casefolding flavor).
+///
+/// Stored versions 0..=2 are the signed variants; the superblock's unsigned
+/// flag renumbers them onto the unsigned ones (+3). Every hash is even - the
+/// low bit is reserved to mark a leaf that continues the previous one.
+fn dx_hash_name(name: &[u8], version: u8, seed: [u32; 4], unsigned: bool) -> Option<u32> {
+    let version = match version {
+        0..=2 if unsigned => version + 3,
+        v => v,
+    };
+    // MD4's initialization vector: what the transforms start from when the
+    // superblock never recorded a seed.
+    let mut buf = if seed == [0; 4] {
+        [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476]
+    } else {
+        seed
+    };
+    let hash = match version {
+        0 | 3 => dx_hack_hash(name, version == 3),
+        1 | 4 => {
+            let mut input = [0u32; 8];
+            let mut rest = name;
+            while !rest.is_empty() {
+                str2hashbuf(rest, &mut input, version == 4);
+                half_md4_transform(&mut buf, &input);
+                rest = &rest[rest.len().min(32)..];
+            }
+            buf[1]
+        }
+        2 | 5 => {
+            let mut input = [0u32; 4];
+            let mut rest = name;
+            while !rest.is_empty() {
+                str2hashbuf(rest, &mut input, version == 5);
+                tea_transform(&mut buf, &input);
+                rest = &rest[rest.len().min(16)..];
+            }
+            buf[0]
+        }
+        _ => return None,
+    };
+    let mut hash = hash & !1;
+    if hash == HTREE_EOF_32BIT << 1 {
+        hash = (HTREE_EOF_32BIT - 1) << 1;
+    }
+    Some(hash)
+}
+
+// ---- the directory index (dx) ----
+//
+// Block 0 of an indexed directory is the index root: "." then ".." - the
+// latter's record length stretched over the whole of what follows - then a
+// small info structure at offset 24, then the entries. Each entry pairs a
+// hash with the logical block of the leaf (or of the next index level down)
+// that owns every name hashing below it and above the entry before. Entry 0
+// is not a real entry: its two halves are the count and the limit, and its
+// block field names the first leaf. An intermediate index block is the same
+// shape a level down, introduced by one fake dirent covering the whole
+// block, with its entries right behind the 8-byte dirent header. Leaves are
+// ordinary dirent blocks - which is why every linear walk of an indexed
+// directory works unchanged.
+
+/// The info structure every index root carries at offset 24.
+struct DxRoot {
+    hash_version: u8,
+    indirect_levels: u8,
+    /// Where the entries begin: right after the info block, whose length is
+    /// itself recorded (and always 8 in every tree anyone has made).
+    entries_at: usize,
+}
+
+impl DxRoot {
+    /// Parse the root's info block, or `None` for an index this driver does
+    /// not walk. The caller falls back to a linear insert and lets the flag
+    /// go, which is what Linux's own checksum-less fallback does.
+    fn parse(page: &[u8]) -> Option<DxRoot> {
+        if le32(page, 24) != 0 {
+            return None;
+        }
+        let hash_version = page[28];
+        let info_length = page[29] as usize;
+        let indirect_levels = page[30];
+        let unused_flags = page[31];
+        if info_length != 8 || unused_flags & 1 != 0 {
+            return None;
+        }
+        if hash_version > 2 || indirect_levels > HTREE_MAX_LEVELS {
+            return None;
+        }
+        Some(DxRoot {
+            hash_version,
+            indirect_levels,
+            entries_at: 24 + info_length,
+        })
+    }
+}
+
+/// One level of the path a hash takes through the index: the logical block
+/// holding that level's entries and the slot of the entry that owns the
+/// hash - the one whose leaf, or whose child index block, the search
+/// descends into.
+#[derive(Clone, Copy)]
+struct DxFrame {
+    block: u64,
+    entries_at: usize,
+    at: usize,
+}
+
+/// The path down the index: the root, an optional intermediate level, and
+/// the logical block of the leaf that owns the hash.
+struct DxPath {
+    root: DxFrame,
+    node: Option<DxFrame>,
+    leaf: u64,
+}
+
+fn dx_count(page: &[u8], entries_at: usize) -> usize {
+    le16(page, entries_at + 2) as usize
+}
+
+fn dx_limit(page: &[u8], entries_at: usize) -> usize {
+    le16(page, entries_at) as usize
+}
+
+fn dx_entry_hash(page: &[u8], entries_at: usize, i: usize) -> u32 {
+    le32(page, entries_at + i * 8)
+}
+
+/// The logical block an entry points at. The top four bits are reserved and
+/// never part of a block number.
+fn dx_entry_block(page: &[u8], entries_at: usize, i: usize) -> u32 {
+    le32(page, entries_at + i * 8 + 4) & 0x0fff_ffff
+}
+
+fn dx_set_count(page: &mut [u8], entries_at: usize, count: usize) {
+    set16(page, entries_at + 2, count as u16);
+}
+
+/// How many entries a root can hold: the block less ".", ".." and the info
+/// structure, one entry per eight bytes.
+fn dx_root_limit(block_size: usize, info_length: usize) -> usize {
+    (block_size - dirent_len(1) - dirent_len(2) - info_length) / 8
+}
+
+/// How many entries an intermediate index block can hold: the block less the
+/// fake dirent that stands in for the header.
+fn dx_node_limit(block_size: usize) -> usize {
+    (block_size - DIRENT_HEADER) / 8
+}
+
+/// Shift the index entries after slot `at` up by one and put
+/// `hash -> block` into the gap: the entry a new leaf registers under.
+fn dx_insert_entry(page: &mut [u8], entries_at: usize, at: usize, hash: u32, block: u32) {
+    let count = dx_count(page, entries_at);
+    let from = entries_at + (at + 1) * 8;
+    page.copy_within(from..entries_at + count * 8, from + 8);
+    set32(page, from, hash);
+    set32(page, from + 4, block);
+    dx_set_count(page, entries_at, count + 1);
+}
+
+impl Core {
+    /// Walk the index to the leaf that owns `hash`, validating every level
+    /// against the shape it must have. `Err` is "not a tree this driver
+    /// walks" - a corrupt or foreign index, which the insert path answers by
+    /// dropping the flag and going linear, as Linux does for a tree it
+    /// cannot trust and cannot checksum.
+    fn dx_probe(&self, dir: &InodeData, hash: u32) -> Result<DxPath, ()> {
+        let block_size = self.block_size();
+        if dir.size == 0 {
+            return Err(());
+        }
+        let mut page = vec![0u8; block_size];
+        let root_disk = self.bmap_lookup(dir, 0).ok_or(())?;
+        self.read_bytes(root_disk, 0, &mut page);
+        let root = DxRoot::parse(&page).ok_or(())?;
+        if dx_limit(&page, root.entries_at) != dx_root_limit(block_size, 8) {
+            return Err(());
+        }
+
+        let mut frames: Vec<DxFrame> = Vec::new();
+        let mut frame = DxFrame {
+            block: 0,
+            entries_at: root.entries_at,
+            at: 0,
+        };
+        let leaf = loop {
+            let count = dx_count(&page, frame.entries_at);
+            if count == 0 || count > dx_limit(&page, frame.entries_at) {
+                return Err(());
+            }
+            // Binary search the real entries (1..count) for the last one
+            // hashing at or below the target; entry 0 - the count-limit
+            // alias - is the floor, and its block names the first leaf.
+            let mut p = 1usize;
+            let mut q = count - 1;
+            while p <= q {
+                let m = p + (q - p) / 2;
+                if dx_entry_hash(&page, frame.entries_at, m) > hash {
+                    q = m - 1;
+                } else {
+                    p = m + 1;
+                }
+            }
+            frame.at = p - 1;
+            let next = dx_entry_block(&page, frame.entries_at, frame.at) as u64;
+            frames.push(frame);
+            if frames.len() as u8 > root.indirect_levels {
+                break next;
+            }
+            // One more index level to descend - its block must not point
+            // back at block 0, which is the cycle a damaged tree makes.
+            if next == 0 {
+                return Err(());
+            }
+            let node_disk = self.bmap_lookup(dir, next).ok_or(())?;
+            self.read_bytes(node_disk, 0, &mut page);
+            frame = DxFrame {
+                block: next,
+                entries_at: DIRENT_HEADER,
+                at: 0,
+            };
+            if dx_limit(&page, frame.entries_at) != dx_node_limit(block_size) {
+                return Err(());
+            }
+        };
+        Ok(DxPath {
+            root: frames[0],
+            node: frames.get(1).copied(),
+            leaf,
+        })
+    }
+
+    /// Append `name -> child` to an indexed directory.
+    fn dir_add_indexed(
+        &self,
+        dir: &mut InodeData,
+        name: &str,
+        child: u32,
+        ftype: u8,
+    ) -> VfsResult<()> {
+        let block_size = self.block_size();
+        let root_disk = match self.bmap_lookup(dir, 0) {
+            Some(block) => block,
+            None => return self.dir_add_fallback(dir, name, child, ftype),
+        };
+        let mut root_page = vec![0u8; block_size];
+        self.read_bytes(root_disk, 0, &mut root_page);
+        let root = match DxRoot::parse(&root_page) {
+            Some(root) => root,
+            None => return self.dir_add_fallback(dir, name, child, ftype),
+        };
+        let Some(hash) = dx_hash_name(
+            name.as_bytes(),
+            root.hash_version,
+            self.sb.hash_seed,
+            self.sb.hash_unsigned,
+        ) else {
+            return self.dir_add_fallback(dir, name, child, ftype);
+        };
+
+        loop {
+            let path = match self.dx_probe(dir, hash) {
+                Ok(path) => path,
+                Err(()) => return self.dir_add_fallback(dir, name, child, ftype),
+            };
+            let leaf_disk = self.bmap_lookup(dir, path.leaf).ok_or(VfsError::NoSpace)?;
+            let mut leaf_page = vec![0u8; block_size];
+            self.read_bytes(leaf_disk, 0, &mut leaf_page);
+            if dir_try_insert(&mut leaf_page, name, child, ftype) {
+                self.write_bytes(leaf_disk, 0, &leaf_page);
+                return Ok(());
+            }
+
+            // The leaf is full. Splitting it adds one entry to the index
+            // level directly above - the root for a one-level tree, the
+            // intermediate node for a two-level one - possible only while
+            // that level has a slot. With the level above full too, the
+            // answer is the ENOSPC Linux itself gives ("directory index
+            // full"); disk space has nothing to do with it.
+            let parent = path.node.unwrap_or(path.root);
+            let parent_disk = self
+                .bmap_lookup(dir, parent.block)
+                .ok_or(VfsError::NoSpace)?;
+            let mut parent_page = vec![0u8; block_size];
+            self.read_bytes(parent_disk, 0, &mut parent_page);
+            if dx_count(&parent_page, parent.entries_at) < dx_limit(&parent_page, parent.entries_at)
+            {
+                return self.dx_split_leaf(
+                    dir,
+                    name,
+                    child,
+                    ftype,
+                    root.hash_version,
+                    hash,
+                    path.leaf,
+                    parent,
+                );
+            }
+            match path.node {
+                // A one-level tree whose root is full is the end of the
+                // road: without the `largedir` feature neither this driver
+                // nor Linux grows the tree deeper than one node.
+                None => return Err(VfsError::NoSpace),
+                Some(node) => {
+                    // The node is full; only the root can take the sibling,
+                    // and it needs a free slot of its own. The root page is
+                    // re-read: an earlier pass of this loop may have split
+                    // it since.
+                    self.read_bytes(root_disk, 0, &mut root_page);
+                    if dx_count(&root_page, path.root.entries_at)
+                        >= dx_limit(&root_page, path.root.entries_at)
+                    {
+                        return Err(VfsError::NoSpace);
+                    }
+                    self.dx_split_node(
+                        dir,
+                        root_disk,
+                        &mut root_page,
+                        path.root,
+                        parent_disk,
+                        &mut parent_page,
+                        node,
+                    )?;
+                    // The tree changed shape under the search; find the
+                    // leaf again.
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Split a full leaf: append a fresh one at the end of the directory,
+    /// deal the entries out by hash so neither half is over half full, and
+    /// register the new leaf in the index level above (`parent`) right after
+    /// the old one. Then put the new entry into whichever half its hash
+    /// belongs to.
+    fn dx_split_leaf(
+        &self,
+        dir: &mut InodeData,
+        name: &str,
+        child: u32,
+        ftype: u8,
+        hash_version: u8,
+        name_hash: u32,
+        leaf_logical: u64,
+        parent: DxFrame,
+    ) -> VfsResult<()> {
+        let block_size = self.block_size();
+        let leaf_disk = self
+            .bmap_lookup(dir, leaf_logical)
+            .ok_or(VfsError::NoSpace)?;
+        let mut leaf_page = vec![0u8; block_size];
+        self.read_bytes(leaf_disk, 0, &mut leaf_page);
+        let parent_disk = self
+            .bmap_lookup(dir, parent.block)
+            .ok_or(VfsError::NoSpace)?;
+        let mut parent_page = vec![0u8; block_size];
+        self.read_bytes(parent_disk, 0, &mut parent_page);
+
+        // The new leaf is the block after every current one.
+        let new_logical = dir.size as u64 / block_size as u64;
+        let new_disk = self.bmap_ensure(dir, new_logical)?.0;
+        dir.size += block_size as u32;
+        dir.blocks += (block_size / 512) as u32;
+        let mut new_page = vec![0u8; block_size];
+
+        // Map the live entries and sort them by hash.
+        let mut map: Vec<(u32, usize, usize)> = Vec::new();
+        let mut at = 0;
+        while at + DIRENT_HEADER <= leaf_page.len() {
+            let rec = le16(&leaf_page, at + 4) as usize;
+            assert!(
+                rec >= DIRENT_HEADER && at + rec <= leaf_page.len(),
+                "corrupt ext2 directory: entry at {at} claims {rec} bytes"
+            );
+            let ino = le32(&leaf_page, at);
+            let name_len = leaf_page[at + 6] as usize;
+            if ino != 0 && name_len != 0 {
+                let hash = dx_hash_name(
+                    &leaf_page[at + 8..at + 8 + name_len],
+                    hash_version,
+                    self.sb.hash_seed,
+                    self.sb.hash_unsigned,
+                )
+                .unwrap_or(0);
+                map.push((hash, at, rec));
+            }
+            at += rec;
+        }
+        map.sort_by_key(|entry| entry.0);
+
+        // Take entries from the top while half a block still holds them, so
+        // both halves come out with room to spare; if even the first does
+        // not fit, fall back to splitting by count.
+        let count = map.len();
+        let (mut size, mut moved) = (0usize, 0usize);
+        for entry in map.iter().rev() {
+            if size + entry.2 / 2 > block_size / 2 {
+                break;
+            }
+            size += entry.2;
+            moved += 1;
+        }
+        let split = if moved > 0 { count - moved } else { count / 2 };
+        let split = split.max(1);
+        let hash2 = map[split].0;
+        // When equal hashes straddle the split, the index key is bumped by
+        // one: its low bit marks a leaf that *continues* the previous one,
+        // and a Linux looking for either half finds both.
+        let continued = u32::from(map[split - 1].0 == hash2);
+
+        dx_move_dirents(&mut leaf_page, &mut new_page, &map[split..]);
+        dx_pack_dirents(&mut leaf_page);
+        dx_insert_entry(
+            &mut parent_page,
+            parent.entries_at,
+            parent.at,
+            hash2.wrapping_add(continued),
+            new_logical as u32,
+        );
+
+        // Which half takes the new entry: the one its hash belongs in. Both
+        // halves are at most half full, so the insert cannot fail - but a
+        // refused insert tries the other half rather than leave the name off
+        // a tree that already lists both leaves.
+        let into_new = name_hash >= hash2;
+        let mut placed = if into_new {
+            dir_try_insert(&mut new_page, name, child, ftype)
+        } else {
+            dir_try_insert(&mut leaf_page, name, child, ftype)
+        };
+        if !placed {
+            placed = if into_new {
+                dir_try_insert(&mut leaf_page, name, child, ftype)
+            } else {
+                dir_try_insert(&mut new_page, name, child, ftype)
+            };
+        }
+        if !placed {
+            return Err(VfsError::NoSpace);
+        }
+        self.write_bytes(leaf_disk, 0, &leaf_page);
+        self.write_bytes(new_disk, 0, &new_page);
+        self.write_bytes(parent_disk, 0, &parent_page);
+        Ok(())
+    }
+
+    /// Split a full intermediate index node. The caller has checked the root
+    /// has a slot: the node's upper half of entries moves to a fresh block,
+    /// and the root's entry naming the old node gains a sibling for the new
+    /// one, keyed by the first hash that moved.
+    fn dx_split_node(
+        &self,
+        dir: &mut InodeData,
+        root_disk: u64,
+        root_page: &mut [u8],
+        root_frame: DxFrame,
+        node_disk: u64,
+        node_page: &mut [u8],
+        node_frame: DxFrame,
+    ) -> VfsResult<()> {
+        let block_size = self.block_size();
+        let icount = dx_count(node_page, node_frame.entries_at);
+        let icount1 = icount / 2;
+        let icount2 = icount - icount1;
+        let hash2 = dx_entry_hash(node_page, node_frame.entries_at, icount1);
+
+        let new_logical = dir.size as u64 / block_size as u64;
+        let new_disk = self.bmap_ensure(dir, new_logical)?.0;
+        dir.size += block_size as u32;
+        dir.blocks += (block_size / 512) as u32;
+
+        // The new node: one fake dirent covering the whole block, entries
+        // behind the 8-byte header. The upper half moves over; entry 0 of
+        // the copy is then overwritten by the count-limit pair, its block
+        // field left naming the first leaf of the upper half - exactly the
+        // alias shape a probe expects to find.
+        let mut new_page = vec![0u8; block_size];
+        set16(&mut new_page, 4, block_size as u16);
+        new_page[DIRENT_HEADER..DIRENT_HEADER + 8 * icount2].copy_from_slice(
+            &node_page[node_frame.entries_at + 8 * icount1..node_frame.entries_at + 8 * icount],
+        );
+        set16(
+            &mut new_page,
+            DIRENT_HEADER,
+            dx_node_limit(block_size) as u16,
+        );
+        dx_set_count(&mut new_page, DIRENT_HEADER, icount2);
+        // The old node keeps the lower half.
+        dx_set_count(node_page, node_frame.entries_at, icount1);
+        // The root names the new node right after the old one.
+        dx_insert_entry(
+            root_page,
+            root_frame.entries_at,
+            root_frame.at,
+            hash2,
+            new_logical as u32,
+        );
+
+        self.write_bytes(node_disk, 0, node_page);
+        self.write_bytes(new_disk, 0, &new_page);
+        self.write_bytes(root_disk, 0, root_page);
+        Ok(())
+    }
+
+    /// An index this driver cannot walk - foreign, or corrupt, or a hash
+    /// version it has no code for. Drop the flag and insert linearly, the
+    /// way Linux's own checksum-less fallback does. The dead index bytes sit
+    /// in the slack of `..` (root) or of a fake dirent covering the whole
+    /// block (node), which linear walkers skip, so the directory stays
+    /// exactly as walkable as before - just no longer sorted.
+    fn dir_add_fallback(
+        &self,
+        dir: &mut InodeData,
+        name: &str,
+        child: u32,
+        ftype: u8,
+    ) -> VfsResult<()> {
+        dir.flags &= !INODE_INDEX_FL;
+        self.dir_add_linear(dir, name, child, ftype)
+    }
+}
+
+/// Move the mapped entries into a fresh leaf, packed to their minimal
+/// lengths, the last one's record running to the end of the block. Each
+/// source slot is emptied - inode zeroed, name wiped - so the compaction of
+/// what stays never sees it.
+fn dx_move_dirents(from: &mut [u8], to: &mut [u8], map: &[(u32, usize, usize)]) {
+    let mut at = 0;
+    let last = map.len().saturating_sub(1);
+    for (i, &(_hash, offs, size)) in map.iter().enumerate() {
+        let own = dirent_len(from[offs + 6] as usize);
+        to[at..at + own].copy_from_slice(&from[offs..offs + own]);
+        set16(to, at + 4, own as u16);
+        if i == last {
+            set16(to, at + 4, (to.len() - at) as u16);
+        }
+        set32(from, offs, 0);
+        for b in &mut from[offs + 6..offs + size] {
+            *b = 0;
+        }
+        at += own;
+    }
+}
+
+/// Compact the live entries of a leaf to their minimal lengths at the front
+/// of the block; the last one's record runs to the end, as a walker expects.
+fn dx_pack_dirents(page: &mut [u8]) {
+    let (mut to, mut last) = (0usize, 0usize);
+    let mut at = 0;
+    while at + DIRENT_HEADER <= page.len() {
+        let rec = le16(page, at + 4) as usize;
+        if rec < DIRENT_HEADER || at + rec > page.len() {
+            break;
+        }
+        let ino = le32(page, at);
+        let name_len = page[at + 6] as usize;
+        if ino != 0 && name_len != 0 {
+            let own = dirent_len(name_len);
+            page.copy_within(at..at + own, to);
+            set16(page, to + 4, own as u16);
+            last = to;
+            to += own;
+        }
+        at += rec;
+    }
+    set16(page, last + 4, (page.len() - last) as u16);
 }
 
 // ---- the VFS seam ----
@@ -1171,6 +1919,21 @@ impl Inode for Ext2Ino {
         let mut data = self.fs.read_inode(child);
         if data.kind() == NodeKind::Dir {
             return Err(VfsError::IsDir);
+        }
+        // A directory entry naming an inode whose link count is already zero is
+        // a damaged filesystem: ext2 never writes that state, and something that
+        // did not finish - an install killed partway, a tool that wrote the
+        // directory before the inode table - left it. Checked here, before
+        // anything is touched, for the same reason the refusal above is: this
+        // must not take a good directory entry away on its way to saying no.
+        //
+        // `data.links -= 1` on a zero is not a wrong answer, it is no answer:
+        // in a debug build it stops the machine, and in a release build it
+        // wraps to 65535 and leaks every block the inode maps - so a caller that
+        // could have been told `EIO` instead finds out much later, and through
+        // something else's corruption.
+        if data.links == 0 {
+            return Err(VfsError::Corrupt);
         }
         self.fs.dir_remove(&mut dir, name)?;
         self.fs.write_inode(self.ino, &dir);
@@ -1479,6 +2242,8 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use alloc::vec;
+    // The host test build links std, which the kernel itself never sees.
+    extern crate std;
 
     /// An in-memory disk for host tests: a `Vec<u8>` behind the house lock.
     struct MemDev {
@@ -1486,9 +2251,9 @@ mod tests {
     }
 
     impl MemDev {
-        fn new() -> MemDev {
+        fn new(blocks: usize) -> MemDev {
             MemDev {
-                bytes: Mutex::new(RefCell::new(vec![0u8; 128 * 1024])),
+                bytes: Mutex::new(RefCell::new(vec![0u8; blocks * 1024])),
             }
         }
     }
@@ -1524,29 +2289,37 @@ mod tests {
     }
 
     // Test image layout: block 0 boot, 1 superblock, 2 group descriptors,
-    // 3 block bitmap, 4 inode bitmap, 5..12 inode table (64 inodes at 128
-    // bytes), 13 root directory, 14 onward data.
+    // 3 block bitmap, 4 inode bitmap, 5.. inode table (128-byte inodes),
+    // then the root directory, then data. The table's length follows the
+    // inode count, so the big-disk fixtures can hold enough inodes to fill
+    // a directory index.
     const TABLE: usize = 5 * 1024;
-    const ROOT_DIR_BLOCK: u32 = 13;
 
-    /// A minimal 128-block, 1024-byte, one-group ext2 with an empty root
+    /// A minimal 1024-byte-block, one-group ext2 with an empty root
     /// directory. Enough structure to mount, and to hand-place files into.
-    fn format() -> MemDev {
-        let dev = MemDev::new();
+    /// `total_blocks` sizes the disk; the small default keeps the original
+    /// 128-block, 64-inode shape, the big ones grow the inode table to match
+    /// the tests that fill a directory index.
+    fn format_sized(total_blocks: usize) -> MemDev {
+        let inodes = if total_blocks <= 128 { 64 } else { 1200 };
+        let inode_blocks = inodes * 128 / 1024;
+        let root_dir_block = 5 + inode_blocks;
+        let used_blocks = root_dir_block; // blocks 1..=root_dir_block
+        let dev = MemDev::new(total_blocks);
         critical_section::with(|cs| {
             let mut disk = dev.bytes.borrow(cs).borrow_mut();
             let disk = &mut *disk;
             let sb = 1024;
-            put32(disk, sb, 64); // inodes_count
-            put32(disk, sb + 4, 128); // blocks_count
-            put32(disk, sb + 12, 115); // free_blocks_count
-            put32(disk, sb + 16, 62); // free_inodes_count
+            put32(disk, sb, inodes as u32); // inodes_count
+            put32(disk, sb + 4, total_blocks as u32); // blocks_count
+            put32(disk, sb + 12, (total_blocks - used_blocks) as u32); // free_blocks_count
+            put32(disk, sb + 16, (inodes - 2) as u32); // free_inodes_count
             put32(disk, sb + 20, 1); // first_data_block
             put32(disk, sb + 24, 0); // log_block_size: 1024
             put32(disk, sb + 28, 0); // fragments == blocks
             put32(disk, sb + 32, 8192); // blocks_per_group
             put32(disk, sb + 36, 8192); // frags_per_group
-            put32(disk, sb + 40, 64); // inodes_per_group
+            put32(disk, sb + 40, inodes as u32); // inodes_per_group
             put16(disk, sb + 56, MAGIC);
             put16(disk, sb + 58, 1); // clean
             put32(disk, sb + 76, 1); // rev 1
@@ -1562,15 +2335,16 @@ mod tests {
             // wrong does not corrupt anything visibly: the allocator reads a
             // group with "no free inodes", skips it, and every create then
             // answers ENOSPC on a filesystem that is almost empty.
-            put16(disk, 2 * 1024 + 12, 115); // free blocks
-            put16(disk, 2 * 1024 + 14, 62); // free inodes
+            put16(disk, 2 * 1024 + 12, (total_blocks - used_blocks) as u16); // free blocks
+            put16(disk, 2 * 1024 + 14, (inodes - 2) as u16); // free inodes
             put16(disk, 2 * 1024 + 16, 1); // used dirs (the root)
 
-            // Blocks 1..=13 are metadata and the root directory. On a 1 KiB
-            // filesystem block 0 lives outside every group, so bitmap bit b is
-            // block b + 1: bits 0..=12 here.
-            disk[3 * 1024] = 0xff;
-            disk[3 * 1024 + 1] = 0x1f;
+            // Blocks 1..=root_dir_block are metadata and the root directory.
+            // On a 1 KiB filesystem block 0 lives outside every group, so
+            // bitmap bit b is block b + 1.
+            for bit in 0..used_blocks {
+                disk[3 * 1024 + bit / 8] |= 1 << (bit % 8);
+            }
             disk[4 * 1024] = 0b0000_0011; // inodes 1 (bad) and 2 (root)
 
             let root = TABLE + 128; // inode 2, index 1
@@ -1578,13 +2352,13 @@ mod tests {
             put32(disk, root + 4, 1024); // size
             put16(disk, root + 26, 2); // links
             put32(disk, root + 28, 2); // blocks in sectors
-            put32(disk, root + 40, ROOT_DIR_BLOCK);
+            put32(disk, root + 40, root_dir_block as u32);
 
             // "." and "..", the latter owning the rest of the block.
-            write_dirent(&mut disk[13 * 1024..], 0, 2, dirent_len(1), ".", FT_DIR);
+            write_dirent(disk, root_dir_block * 1024, 2, dirent_len(1), ".", FT_DIR);
             write_dirent(
-                &mut disk[13 * 1024..],
-                dirent_len(1),
+                disk,
+                root_dir_block * 1024 + dirent_len(1),
                 2,
                 1024 - dirent_len(1),
                 "..",
@@ -1592,6 +2366,72 @@ mod tests {
             );
         });
         dev
+    }
+
+    fn format() -> MemDev {
+        format_sized(128)
+    }
+
+    /// The raw word at `offset` in the on-disk inode `ino`.
+    fn inode_word(dev: &MemDev, ino: u32, offset: usize) -> u32 {
+        critical_section::with(|cs| {
+            let disk = dev.bytes.borrow(cs).borrow();
+            le32(&disk, TABLE + (ino as usize - 1) * 128 + offset)
+        })
+    }
+
+    /// Convert an empty directory (nothing but "." and "..") into a one-leaf
+    /// htree index, the shape a Linux conversion leaves behind: block 0
+    /// becomes the index root and a fresh leaf - allocated by the caller at
+    /// `leaf_block` - takes the (here: no) entries.
+    fn make_indexed(dev: &MemDev, dir_ino: u32, leaf_block: u32) {
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            let disk = &mut *disk;
+            let at = TABLE + (dir_ino as usize - 1) * 128;
+            let base = le32(disk, at + 40) as usize * 1024;
+            let parent = le32(disk, base + 12); // ".." keeps its inode
+
+            // Inode: the flag goes on, the leaf joins the directory, and
+            // block[1] names it.
+            let flags = le32(disk, at + 32) | INODE_INDEX_FL;
+            put32(disk, at + 32, flags);
+            let size = le32(disk, at + 4) + 1024;
+            put32(disk, at + 4, size);
+            let sectors = le32(disk, at + 28) + 2;
+            put32(disk, at + 28, sectors);
+            put32(disk, at + 44, leaf_block);
+
+            // The leaf: one hole covering the whole block.
+            let leaf = leaf_block as usize * 1024;
+            put16(disk, leaf + 4, 1024);
+
+            // Block 0 becomes the index root.
+            write_dirent(disk, base, dir_ino, dirent_len(1), ".", FT_DIR);
+            write_dirent(
+                disk,
+                base + dirent_len(1),
+                parent,
+                1024 - dirent_len(1),
+                "..",
+                FT_DIR,
+            );
+            put32(disk, base + 24, 0); // reserved_zero
+            disk[base + 28] = 1; // half_md4
+            disk[base + 29] = 8; // info_length
+            disk[base + 30] = 0; // indirect_levels
+            disk[base + 31] = 0; // unused flags
+            put16(disk, base + 32, dx_root_limit(1024, 8) as u16); // limit
+            put16(disk, base + 34, 1); // count: the alias only
+            put32(disk, base + 36, 1); // entry[0].block = the leaf
+
+            // Bookkeeping: the leaf block is in use now.
+            disk[3 * 1024 + (leaf_block as usize - 1) / 8] |= 1 << ((leaf_block - 1) % 8);
+            for free in [2 * 1024 + 12, 1024 + 12] {
+                let n = le16(disk, free) - 1;
+                put16(disk, free, n);
+            }
+        });
     }
 
     /// Place a file by hand: inode, data block, both bitmaps, and a root
@@ -1624,8 +2464,10 @@ mod tests {
             }
 
             // Walk to the entry that owns the end of the root block and take
-            // its slack.
-            let root = &mut disk[ROOT_DIR_BLOCK as usize * 1024..];
+            // its slack. The root's block comes from the root inode - the
+            // big fixtures lay the table out differently.
+            let root_block = le32(disk, TABLE + 128 + 40) as usize * 1024;
+            let root = &mut disk[root_block..];
             let mut last = 0;
             loop {
                 let rec = le16(root, last + 4) as usize;
@@ -1658,7 +2500,7 @@ mod tests {
 
     #[test]
     fn mount_rejects_bytes_that_are_not_ext2() {
-        assert!(Ext2Fs::mount(Arc::new(MemDev::new())).is_err());
+        assert!(Ext2Fs::mount(Arc::new(MemDev::new(128))).is_err());
     }
 
     #[test]
@@ -2257,5 +3099,338 @@ mod tests {
         let real = lib.lookup("libllhttp.so.9.4.1").expect("the library");
         assert_eq!(real.metadata().kind, NodeKind::File);
         assert_eq!(real.metadata().size, 63088);
+    }
+
+    // ---- the directory hash tree ----
+
+    #[test]
+    fn dx_hash_matches_the_reference_implementation() {
+        // Goldens from e2fsprogs 1.47.4's debugfs `dx_hash`, half_md4 salted
+        // with this seed - the one /usr/lib of the real image carries. The
+        // third name is full of bytes above 127, the one place the signed and
+        // unsigned flavors of the algorithm part ways.
+        let seed = [0x0450_54d6, 0x9e4e_2290, 0xe5a0_1da8, 0xbc0d_2838];
+        assert_eq!(
+            dx_hash_name(b"libpsx.so.2", 1, seed, false),
+            Some(0x2d8a_cbda)
+        );
+        assert_eq!(
+            dx_hash_name(b"modules-load.d", 1, seed, false),
+            Some(0x26d5_4824)
+        );
+        assert_eq!(
+            dx_hash_name(&[0xff, 0x80, 0x7f, 0x01, b'a', b'b'], 1, seed, false),
+            Some(0xbbed_4542)
+        );
+        assert_eq!(
+            dx_hash_name(&[0xff, 0x80, 0x7f, 0x01, b'a', b'b'], 1, seed, true),
+            Some(0xf8d3_c940)
+        );
+        // The other two algorithms, from the same source. The legacy hash
+        // takes no seed; TEA does.
+        assert_eq!(
+            dx_hash_name(b"libpsx.so.2", 0, [0; 4], false),
+            Some(0xd417_b560)
+        );
+        assert_eq!(
+            dx_hash_name(b"libpsx.so.2", 2, seed, false),
+            Some(0x9b01_6660)
+        );
+    }
+
+    /// A directory made indexed by [`make_indexed`], plus its on-disk inode
+    /// number and the device, for the raw reads the tree checks need.
+    fn indexed_dir(total_blocks: usize) -> (Arc<MemDev>, Ext2Fs, Arc<dyn Inode>, u32, u32) {
+        let dev = Arc::new(format_sized(total_blocks));
+        let ino = {
+            let fs = mounted(dev.clone());
+            fs.root()
+                .create("d", NodeKind::Dir)
+                .expect("mkdir")
+                .metadata()
+                .ino as u32
+        };
+        // The leaf goes right after the block the directory already owns -
+        // on this little image that first block is always block 14, and a
+        // leaf dropped on it would be the root indexing itself.
+        let leaf_block = inode_word(&dev, ino, 40) + 1;
+        make_indexed(&dev, ino, leaf_block);
+        // A fresh mount: the block cache is write-through, and the first
+        // mount's slots still hold the blocks the raw surgery just rewrote
+        // underneath it.
+        let fs = mounted(dev.clone());
+        let dir = fs.root().lookup("d").expect("the directory");
+        (dev, fs, dir, ino, leaf_block)
+    }
+
+    #[test]
+    fn an_indexed_directory_takes_an_insert() {
+        let (dev, _fs, dir, ino, _leaf_block) = indexed_dir(128);
+
+        // The apk shape that started all this: a versioned library under a
+        // symlink chain, laid into /usr/lib the way symlinkat does.
+        dir.symlink("libllhttp.so.9.4", "libllhttp.so.9.4.1")
+            .expect("insert into the indexed directory");
+        let link = dir
+            .lookup("libllhttp.so.9.4")
+            .expect("the link resolves through the index");
+        assert_eq!(link.readlink().expect("readlink"), "libllhttp.so.9.4.1");
+
+        // The entry landed in the leaf the index names, not in the root
+        // block's dead slack, and the index still counts its alias only.
+        let root_block = inode_word(&dev, ino, 40);
+        let leaf = inode_word(&dev, ino, 44) as usize * 1024;
+        critical_section::with(|cs| {
+            let disk = dev.bytes.borrow(cs).borrow();
+            assert_eq!(
+                dir_find(&disk[leaf..leaf + 1024], "libllhttp.so.9.4").is_some(),
+                true
+            );
+            assert_eq!(
+                dir_find(
+                    &disk[root_block as usize * 1024..root_block as usize * 1024 + 1024],
+                    "libllhttp.so.9.4"
+                ),
+                None
+            );
+            assert_eq!(le16(&disk, root_block as usize * 1024 + 34), 1); // count
+        });
+    }
+
+    #[test]
+    fn a_growing_indexed_directory_splits_leaves_and_stays_consistent() {
+        let (_dev, fs, dir, ino, _leaf) = indexed_dir(512);
+
+        let names: Vec<String> = (0..200)
+            .map(|i| alloc::format!("entry-{i:04}-padpadpad"))
+            .collect();
+        for name in &names {
+            dir.create(name, NodeKind::File).expect("insert");
+        }
+        for name in &names {
+            dir.lookup(name).expect("every name is findable");
+        }
+
+        // The tree agrees with itself: for every name, the leaf the index
+        // probe names for its hash is the leaf the name actually lives in -
+        // which is exactly the property a Linux lookup depends on.
+        let core = &fs.core;
+        let data = core.read_inode(ino);
+        let blocks = data.size as u64 / 1024;
+        assert!(blocks > 2, "the test must have forced leaf splits");
+        for name in &names {
+            let hash = dx_hash_name(name.as_bytes(), 1, [0; 4], false).expect("hash");
+            let path = core.dx_probe(&data, hash).expect("probe");
+            let mut home = None;
+            for l in 0..blocks {
+                let block = core.bmap_lookup(&data, l).expect("mapped");
+                let mut page = vec![0u8; 1024];
+                core.read_bytes(block, 0, &mut page);
+                if dir_find(&page, name).is_some() {
+                    home = Some(l);
+                    break;
+                }
+            }
+            assert_eq!(home, Some(path.leaf), "{name} lives outside its leaf");
+        }
+    }
+
+    #[test]
+    fn a_full_root_index_answers_enospc_like_linux() {
+        let (_dev, _fs, dir, _ino, _leaf) = indexed_dir(512);
+
+        // 100-byte names: 108-byte entries, nine to a 1 KiB leaf. The root's
+        // index limit at this block size is 124 entries, so the tree tops
+        // out at 124 leaves and the next split is refused - with ENOSPC,
+        // exactly what Linux ("directory index full") answers here.
+        let name = |i: usize| alloc::format!("n{:0>99}", i);
+        let mut inserted = 0;
+        loop {
+            match dir.create(&name(inserted), NodeKind::File) {
+                Ok(_) => inserted += 1,
+                Err(VfsError::NoSpace) => break,
+                Err(e) => panic!("unexpected error at {inserted}: {e:?}"),
+            }
+        }
+        assert!(inserted > 500, "only {inserted} entries before ENOSPC");
+        // The refusal is clean: everything already inserted is intact, and
+        // the refusal repeats.
+        for i in 0..inserted {
+            dir.lookup(&name(i)).expect("still there");
+        }
+        assert!(matches!(
+            dir.create(&name(inserted), NodeKind::File),
+            Err(VfsError::NoSpace)
+        ));
+    }
+
+    #[test]
+    fn removing_from_an_indexed_directory_leaves_the_index_alone() {
+        let (dev, _fs, dir, ino, _leaf) = indexed_dir(512);
+
+        let names: Vec<String> = (0..40)
+            .map(|i| alloc::format!("victim-{i:03}-padding"))
+            .collect();
+        for name in &names {
+            dir.create(name, NodeKind::File).expect("insert");
+        }
+        let root_block = inode_word(&dev, ino, 40);
+        let count_before = critical_section::with(|cs| {
+            let disk = dev.bytes.borrow(cs).borrow();
+            le16(&disk, root_block as usize * 1024 + 34) as usize
+        });
+        assert!(count_before > 1, "the inserts must have split leaves");
+
+        // Half the names go. A removal never touches the index - it cannot
+        // move an entry between leaves - so the root's count is untouched.
+        for name in names.iter().take(20) {
+            dir.unlink(name).expect("unlink");
+        }
+        let count_after = critical_section::with(|cs| {
+            let disk = dev.bytes.borrow(cs).borrow();
+            le16(&disk, root_block as usize * 1024 + 34) as usize
+        });
+        assert_eq!(count_after, count_before);
+        for name in names.iter().skip(20) {
+            dir.lookup(name).expect("survivor");
+        }
+        for name in names.iter().take(20) {
+            assert!(dir.lookup(name).is_err(), "{name} should be gone");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_index_degrades_to_a_linear_directory() {
+        let (dev, _fs, _dir, ino, _leaf) = indexed_dir(128);
+        // Scramble the index: a hash version nothing implements.
+        let root_block = inode_word(&dev, ino, 40) as usize * 1024;
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            disk[root_block + 28] = 9;
+        });
+        // A fresh mount, so the fs reads the scrambled block rather than the
+        // cached copy from before the surgery.
+        let dir = {
+            let fs = mounted(dev.clone());
+            fs.root().lookup("d").expect("the directory")
+        };
+
+        dir.create("after", NodeKind::File)
+            .expect("a bad index does not stop inserts");
+        dir.lookup("after").expect("the name is there");
+        // The flag went with the fallback, and the directory is linear now.
+        assert_eq!(inode_word(&dev, ino, 32) & INODE_INDEX_FL, 0);
+    }
+
+    #[test]
+    fn a_full_index_node_splits_when_the_root_has_room() {
+        let (dev, _fs, _dir, ino, _leaf) = indexed_dir(512);
+
+        // Hand-build a two-level tree: root -> node -> leaf, the shape ext4
+        // with `largedir` makes and the only way an intermediate level comes
+        // to exist at all. The node is full: 127 entries, its exact limit.
+        // Every entry hashes 0x10 and points at the one leaf, whose eight
+        // 120-byte entries leave no slack.
+        let dir_block = inode_word(&dev, ino, 40) as usize;
+        let (node_block, leaf_block) = (dir_block + 2, dir_block + 3);
+        put32_wrapper(&dev, ino, 44, node_block as u32); // block[1] = node
+        put32_wrapper(&dev, ino, 48, leaf_block as u32); // block[2] = leaf
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            let base = dir_block * 1024;
+            // Inode: two more blocks.
+            let iat = TABLE + (ino as usize - 1) * 128;
+            put32(&mut disk, iat + 4, 3 * 1024);
+            put32(&mut disk, iat + 28, 6);
+            // Root info: one intermediate level below the root.
+            disk[base + 30] = 1;
+            // Node: fake dirent over the whole block; limit 127; count 127,
+            // entry 0 the alias naming the leaf, 126 real entries all
+            // hashing 0x10 and pointing at the leaf.
+            let node = node_block * 1024;
+            put16(&mut disk, node + 4, 1024);
+            put16(&mut disk, node + 8, 127); // limit
+            put16(&mut disk, node + 10, 127); // count
+            // Index entries hold LOGICAL block numbers: the leaf is
+            // block[2], logical 2.
+            put32(&mut disk, node + 12, 2); // alias block: the leaf
+            for j in 1..127usize {
+                put32(&mut disk, node + 8 + j * 8, 0x10); // hash
+                put32(&mut disk, node + 8 + j * 8 + 4, 2);
+            }
+            // Leaf: eight maximal entries, no slack, no holes.
+            let leaf = leaf_block * 1024;
+            for i in 0..8u32 {
+                let at = leaf + i as usize * 128;
+                put32(&mut disk, at, 100 + i); // a plausible inode
+                put16(&mut disk, at + 4, 128);
+                disk[at + 6] = 120;
+                disk[at + 7] = FT_REG;
+                for (j, b) in disk[at + 8..at + 8 + 120].iter_mut().enumerate() {
+                    *b = if j < 3 { b'0' + i as u8 } else { b'x' };
+                }
+            }
+            for b in [node_block, leaf_block] {
+                disk[3 * 1024 + (b - 1) / 8] |= 1 << ((b - 1) % 8);
+            }
+            for free in [2 * 1024 + 12, 1024 + 12] {
+                let n = le16(&disk, free) - 1;
+                put16(&mut disk, free, n);
+            }
+        });
+        // A fresh mount, past the cached blocks the surgery rewrote.
+        let fs = mounted(dev.clone());
+        let core = &fs.core;
+        let dir = fs.root().lookup("d").expect("the directory");
+
+        // The name hashes past every 0x10 entry of the node, so the probe
+        // lands in the last leaf - full - with the node above it full too,
+        // and the root (one entry, limit 124) holding the only slot. The
+        // insert has to split the node, restart, and split the leaf.
+        dir.create("new-name", NodeKind::File)
+            .expect("the insert goes through the two splits");
+        dir.lookup("new-name").expect("the name is findable");
+
+        // Root gained the sibling node; the node's halves split 63/64; the
+        // leaf gained a sibling; the directory grew by two blocks.
+        let data = core.read_inode(ino);
+        let base = data.block[0] as usize * 1024;
+        let (root_count, node_count) = critical_section::with(|cs| {
+            let disk = dev.bytes.borrow(cs).borrow();
+            (
+                le16(&disk, base + 34),
+                le16(&disk, data.block[1] as usize * 1024 + 8 + 2),
+            )
+        });
+        assert_eq!(root_count, 2);
+        assert_eq!(node_count, 63);
+        assert_eq!(data.size, 5 * 1024);
+        // And the filler entries of the original leaf are all still there.
+        let mut found = 0;
+        for l in 1..data.size as u64 / 1024 {
+            let block = core.bmap_lookup(&data, l).expect("mapped");
+            let mut page = vec![0u8; 1024];
+            core.read_bytes(block, 0, &mut page);
+            let mut at = 0;
+            while at + 8 <= page.len() {
+                let rec = le16(&page, at + 4) as usize;
+                if rec < 8 {
+                    break;
+                }
+                if le32(&page, at) != 0 && page[at + 6] != 0 {
+                    found += 1;
+                }
+                at += rec;
+            }
+        }
+        assert_eq!(found, 9); // eight fillers plus the new name
+    }
+
+    /// The test fixture's disk writes: one raw word into inode `ino`.
+    fn put32_wrapper(dev: &MemDev, ino: u32, offset: usize, value: u32) {
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            put32(&mut disk, TABLE + (ino as usize - 1) * 128 + offset, value);
+        });
     }
 }

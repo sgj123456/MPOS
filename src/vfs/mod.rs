@@ -19,6 +19,7 @@
 
 pub mod devfs;
 pub mod devpts;
+pub mod epoll;
 pub mod eventfd;
 pub mod ext2;
 pub mod file;
@@ -26,12 +27,16 @@ pub mod mount;
 pub mod path;
 pub mod pipe;
 pub mod procfs;
+pub mod pty;
 pub mod ramfs;
 pub mod signalfd;
 pub mod sysfs;
 pub mod tar;
 pub mod termios;
+pub mod timerfd;
 pub mod tty;
+#[cfg(target_os = "none")]
+pub mod vcmux;
 
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
 pub use mount::{global, mount, mount_root, pivot_root, resolve, resolve_at, unmount};
@@ -127,6 +132,12 @@ pub enum VfsError {
     Unsupported,
     /// A write to a filesystem that was mounted read-only.
     ReadOnly,
+    /// EIO: the filesystem says something that cannot be true - a directory
+    /// entry pointing at an inode with no links left, say. Linux's answer for
+    /// damage it can see but cannot repair, and a better one than either
+    /// alternative: taking the machine down over it, or freeing the inode a
+    /// second time and handing its blocks to two owners.
+    Corrupt,
     /// EXDEV: a hard link whose two ends live on different filesystems -
     /// the one request `link(2)` refuses by design, since a name edge is
     /// the filesystem's own bookkeeping and cannot reach into another's.
@@ -134,6 +145,17 @@ pub enum VfsError {
     /// A read or write that would block, on a descriptor the caller asked
     /// not to block on.
     Again,
+    /// ECANCELED: an operation undone by something outside it - a timer
+    /// whose clock was set underneath it, the `TFD_TIMER_CANCEL_ON_SET`
+    /// case of timerfd_create(2), where the read that would have counted
+    /// expirations reports the cancellation instead.
+    Canceled,
+    /// ENXIO: the device's name answers nothing for this caller. `/dev/tty`
+    /// is the one case: a controlling terminal is a property of the opening
+    /// process, and a process that has acquired none cannot open the name at
+    /// all - POSIX's answer, and the one a shell reads as "job control off"
+    /// rather than as a terminal it does not own.
+    NoDevice,
 }
 
 pub type VfsResult<T> = Result<T, VfsError>;
@@ -217,7 +239,31 @@ pub trait Inode: Send + Sync {
         None
     }
 
-    /// The `socketpair` end this node is, if it is one.
+    /// The pty pair this node belongs to, if it is a pty master.
+    ///
+    /// `/dev/ptmx`'s answers are about the *pair*, not a terminal: `TIOCGPTN`
+    /// names the number the slave will appear under in `/dev/pts`, and
+    /// `TIOCSPTLCK` is the lock `grantpt` clears. Only a master can answer
+    /// them, and the syscall layer has nothing but the inode to ask.
+    fn as_pty(&self) -> Option<&crate::vfs::pty::Pty> {
+        None
+    }
+
+    /// What opening this node really hands back, when the node is a door
+    /// rather than a thing.
+    ///
+    /// `/dev/ptmx` is one name with no fixed device behind it: every open
+    /// mints a *new* pty pair and returns that pair's master, the way
+    /// `posix_openpt` does in one step. A shared inode cannot be "a different
+    /// thing each time", so the opener is told what the name meant this time.
+    /// `Ok(None)` - the default - opens the node itself; a locked pty's slave
+    /// answers [`VfsError::Corrupt`] (`EIO`), which is exactly what Linux
+    /// opens with.
+    fn open_replacement(&self) -> VfsResult<Option<alloc::sync::Arc<dyn Inode>>> {
+        Ok(None)
+    }
+
+    /// The socketpair end this node is, if it is one.
     ///
     /// A descriptor that carries a connected stream has one operation a file
     /// does not: `shutdown`, which closes one direction and leaves the other
@@ -226,6 +272,16 @@ pub trait Inode: Send + Sync {
     /// nothing but an `Arc<dyn Inode>` to ask with. Same shape as [`Self::as_tty`],
     /// for the same reason.
     fn as_duplex(&self) -> Option<&crate::vfs::pipe::DuplexEnd> {
+        None
+    }
+
+    /// The pipe end this node is, if it is one.
+    ///
+    /// `splice(2)`'s contract names a pipe specifically - one of its two
+    /// descriptors must be one, and a pipe forbids the explicit offsets a
+    /// file takes - which is a question only the node can answer. Same
+    /// shape as [`Self::as_tty`], for the same reason.
+    fn as_pipe(&self) -> Option<&crate::vfs::pipe::PipeEnd> {
         None
     }
 
@@ -239,6 +295,28 @@ pub trait Inode: Send + Sync {
     /// open. Resolution hands back the link's own inode, so this is how the
     /// opener is told what the name really meant.
     fn as_fd(&self) -> Option<usize> {
+        None
+    }
+
+    /// The epoll instance this node is, if it is one.
+    ///
+    /// `epoll_ctl` and `epoll_wait` arrive holding nothing but a descriptor
+    /// number, and the only way from a number to the interest list it names
+    /// is through the inode it opens - which is the same shape as
+    /// [`Self::as_tty`], for the same reason: the syscall layer must be able
+    /// to ask the node what it really is, without knowing which filesystem
+    /// or registry minted it.
+    fn as_epoll(&self) -> Option<&crate::vfs::epoll::Epoll> {
+        None
+    }
+
+    /// The timer this node is, if it is one.
+    ///
+    /// `timerfd_settime` and `timerfd_gettime` are the timerfd(2) pair the
+    /// same way `epoll_ctl` is the epoll one: a descriptor number is all they
+    /// hold, and the timer behind the number is reachable only through the
+    /// inode. See [`Self::as_epoll`].
+    fn as_timerfd(&self) -> Option<&crate::vfs::timerfd::TimerFd> {
         None
     }
 
@@ -315,6 +393,17 @@ pub trait Inode: Send + Sync {
     fn mode(&self) -> u32 {
         0
     }
+
+    /// Give the node the permission bits an archive or a `chmod` named.
+    ///
+    /// Not `chmod(2)` - that is a syscall with a caller to answer - but the
+    /// way a filesystem that stores modes learns them from something that
+    /// already knew: the initramfs unpack, whose members carry a mode in
+    /// their ustar header and whose `/bin` is useless when they are dropped.
+    /// The default keeps nothing, which is honest for a filesystem with
+    /// nowhere to put it; a caller that only *offers* the bits has to be
+    /// willing to hear no.
+    fn set_mode(&self, _mode: u32) {}
 
     /// Name a new symbolic link in this directory. Separate from [`Inode::create`]
     /// because a link is made of a target, not just a kind - there is nothing
@@ -408,7 +497,10 @@ pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
     }
     let file = File::new(inode);
     let size = file.metadata().size as usize;
-    let mut bytes = Vec::with_capacity(size);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| VfsError::NoSpace)?;
     let mut chunk = [0u8; 4096];
     loop {
         let n = file.read(&mut chunk)?;
@@ -438,6 +530,14 @@ pub(crate) fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
         Some(slash) => (&trimmed[..slash], &trimmed[slash + 1..]),
         None => (".", trimmed),
     };
+    // A path that is *empty* names no file, which is a missing file rather than
+    // a malformed request: Linux answers ENOENT for it, the same answer any
+    // other unresolvable path gets. The cases below are the other kind - `.`,
+    // `..` and a bare `/` all name directories that exist, so refusing to make
+    // or remove one is about the operation, not about the name.
+    if path.is_empty() {
+        return Err(VfsError::NoEntry);
+    }
     if name.is_empty() || name == "." || name == ".." {
         return Err(VfsError::Invalid);
     }
@@ -476,6 +576,11 @@ pub fn read_dir_opt(
 }
 
 /// [`read_file`](fn.read_file.html) with a caller-supplied start.
+///
+/// The capacity is reserved with the fallible form: a file bigger than the
+/// kernel's largest contiguous allocation — a 40 MB compiler, say — comes
+/// back as `NoSpace` rather than dying in the allocator, and the execve
+/// that reached for it answers ENOMEM instead of taking the machine down.
 pub fn read_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Vec<u8>> {
     let inode = resolve_opt(path, start)?;
     if inode.metadata().kind != NodeKind::File {
@@ -483,7 +588,10 @@ pub fn read_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Vec
     }
     let file = File::new(inode);
     let size = file.metadata().size as usize;
-    let mut bytes = Vec::with_capacity(size);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| VfsError::NoSpace)?;
     let mut chunk = [0u8; 4096];
     loop {
         let n = file.read(&mut chunk)?;
@@ -546,7 +654,11 @@ mod tests {
         assert_eq!(split_parent("..").err(), Some(VfsError::Invalid));
         assert_eq!(split_parent("/a/.").err(), Some(VfsError::Invalid));
         assert_eq!(split_parent("/").err(), Some(VfsError::Invalid));
-        assert_eq!(split_parent("").err(), Some(VfsError::Invalid));
+        // An empty path is the different case: it names nothing at all, and
+        // "nothing there" is what ENOENT means. Linux answers ENOENT for it -
+        // and a tracer's startup probe rests on that, checking `chdir("")` for
+        // -ENOENT to decide whether this kernel reports syscall results honestly.
+        assert_eq!(split_parent("").err(), Some(VfsError::NoEntry));
     }
 
     #[test]

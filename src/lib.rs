@@ -28,6 +28,10 @@ pub mod boot;
 pub mod console;
 #[cfg(target_os = "none")]
 pub mod drivers;
+/// Kernel logging: `tracing` events, formatted onto the serial console.
+/// Ungated so the level names and the command-line parsing stay testable on
+/// the host; only the subscriber that writes to COM1 is machine-specific.
+pub mod logging;
 pub mod mm;
 /// The network stack, and the socket syscalls over it. Host builds skip it:
 /// its tests are the conformance programs that run on the machine.

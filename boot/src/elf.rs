@@ -124,11 +124,7 @@ impl<'a> Kernel<'a> {
             ELF_MAGIC,
             "mpos.elf does not begin with an ELF magic number"
         );
-        assert_eq!(
-            r.u8(4),
-            ELFCLASS64,
-            "mpos.elf is not a 64-bit ELF file"
-        );
+        assert_eq!(r.u8(4), ELFCLASS64, "mpos.elf is not a 64-bit ELF file");
         assert_eq!(
             r.u16(18),
             EM_X86_64,
@@ -174,7 +170,10 @@ impl<'a> Kernel<'a> {
             }
         }
         assert!(!segments.is_empty(), "mpos.elf has no loadable segments");
-        assert!(lowest <= entry && entry < highest, "mpos.elf's entry point is not in the image");
+        assert!(
+            lowest <= entry && entry < highest,
+            "mpos.elf's entry point is not in the image"
+        );
 
         let mut kernel = Kernel {
             bytes,
@@ -203,9 +202,7 @@ impl<'a> Kernel<'a> {
         let Some((at, len)) = dynamic else {
             return Vec::new();
         };
-        let r = Reader {
-            bytes: self.bytes,
-        };
+        let r = Reader { bytes: self.bytes };
         let at = self.to_file_offset(at);
 
         let mut rela = None;
@@ -257,7 +254,14 @@ impl<'a> Kernel<'a> {
     /// The four boundaries the kernel maps its own image by, taken from the
     /// section headers so that the loader's own tables give the same W^X the
     /// kernel will install a moment later.
-    fn read_sections(&mut self, r: &Reader<'a>, shoff: u64, shentsize: u64, shnum: u64, shstrndx: u64) {
+    fn read_sections(
+        &mut self,
+        r: &Reader<'a>,
+        shoff: u64,
+        shentsize: u64,
+        shnum: u64,
+        shstrndx: u64,
+    ) {
         let names = {
             let at = shoff + shstrndx * shentsize;
             (r.u64(at + 24), r.u64(at + 32))
@@ -301,10 +305,7 @@ impl<'a> Kernel<'a> {
         // runs from the first to the end of the last. `.bss` is `SHT_NOBITS`:
         // it has an address and a size, and no bytes in the file.
         let end = bss.map_or(data.0 + data.1, |b| b.0 + b.1);
-        self.data = Range {
-            start: data.0,
-            end,
-        };
+        self.data = Range { start: data.0, end };
     }
 
     /// Where in the file a virtual address's bytes are.
@@ -329,8 +330,7 @@ impl<'a> Kernel<'a> {
     pub unsafe fn load(&self, dest: *mut u8, virt_base: u64) {
         for segment in &self.segments {
             let target = unsafe { dest.add((segment.vaddr - self.base) as usize) };
-            let source = &self.bytes[segment.file_offset as usize..]
-                [..segment.file_size as usize];
+            let source = &self.bytes[segment.file_offset as usize..][..segment.file_size as usize];
             unsafe {
                 core::ptr::copy_nonoverlapping(source.as_ptr(), target, source.len());
                 // What the file does not carry - `.bss` - is zero, which is

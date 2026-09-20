@@ -35,6 +35,11 @@ pub struct Entry<'a> {
     /// `/` directories carry.
     pub path: &'a str,
     pub kind: EntryKind,
+    /// The permission bits the archive recorded, low twelve. An archive is
+    /// how a filesystem that keeps modes learns them: `/bin` arrives
+    /// executable or an init that asks `test -x` before running anything
+    /// finds nothing it may run.
+    pub mode: u32,
     /// Empty for directories.
     pub data: &'a [u8],
 }
@@ -70,6 +75,10 @@ impl<'a> Iterator for Entries<'a> {
         };
         let size = octal(&header[124..136])?;
         let name = str_field(&header[0..100])?;
+        // The mode is the low twelve of the field; above them sit the type
+        // bits (setuid, setgid, sticky) a permission check here never reads,
+        // and the format bits ustar does not even store.
+        let mode = (octal(&header[100..108]).unwrap_or(0) & 0o7777) as u32;
 
         let data_len = size as usize;
         let padded = data_len.div_ceil(BLOCK) * BLOCK;
@@ -95,7 +104,12 @@ impl<'a> Iterator for Entries<'a> {
         } else {
             data
         };
-        Some(Entry { path, kind, data })
+        Some(Entry {
+            path,
+            kind,
+            mode,
+            data,
+        })
     }
 }
 
@@ -122,7 +136,7 @@ pub fn unpack_into(vfs: &Vfs, archive: &[u8]) -> VfsResult<usize> {
         let path = format!("/{}", entry.path);
         match entry.kind {
             EntryKind::Dir => {
-                ensure_dir(vfs, &path)?;
+                ensure_dir(vfs, &path)?.set_mode(entry.mode);
             }
             EntryKind::File => {
                 let (parent_path, name) = split_last(&path);
@@ -131,6 +145,7 @@ pub fn unpack_into(vfs: &Vfs, archive: &[u8]) -> VfsResult<usize> {
                     return Err(VfsError::Exists);
                 }
                 let file = parent.create(name, NodeKind::File)?;
+                file.set_mode(entry.mode);
                 file.write_at(0, entry.data)?;
             }
             EntryKind::Symlink => {
@@ -140,7 +155,7 @@ pub fn unpack_into(vfs: &Vfs, archive: &[u8]) -> VfsResult<usize> {
                     return Err(VfsError::Exists);
                 }
                 let target = core::str::from_utf8(entry.data).map_err(|_| VfsError::Invalid)?;
-                parent.symlink(name, target)?;
+                parent.symlink(name, target)?.set_mode(entry.mode);
             }
         }
         count += 1;
@@ -204,6 +219,14 @@ mod tests {
         out.extend_from_slice(data);
         let pad = data.len().div_ceil(BLOCK) * BLOCK - data.len();
         out.extend(core::iter::repeat_n(0u8, pad));
+        out
+    }
+
+    /// A member carrying the permission bits an archive would record for it.
+    fn member_mode(path: &str, typeflag: u8, data: &[u8], mode: u32) -> Vec<u8> {
+        let mut out = member(path, typeflag, data);
+        let text = format!("{:07o}", mode);
+        out[100..100 + text.len()].copy_from_slice(text.as_bytes());
         out
     }
 
@@ -316,6 +339,23 @@ mod tests {
             super::unpack_into(&vfs, &archive).err(),
             Some(VfsError::Exists)
         );
+    }
+
+    /// An archive is where a filesystem that stores modes learns them: a
+    /// `/bin` unpacked without its execute bits is a `/bin` nothing in it can
+    /// be run from, and `test -x` - what an init asks before starting a
+    /// service - answers no to every one of them.
+    #[test]
+    fn unpack_carries_the_mode_the_archive_recorded() {
+        let mut archive = member_mode("bin/", b'5', b"", 0o755);
+        archive.extend(member_mode("bin/sh", b'0', b"#!/bin/sh\n", 0o755));
+        archive.extend(member_mode("etc/motd", b'0', b"hi\n", 0o644));
+
+        let vfs = tree();
+        assert_eq!(super::unpack_into(&vfs, &archive).unwrap(), 3);
+        assert_eq!(vfs.resolve("/bin").unwrap().mode(), 0o755);
+        assert_eq!(vfs.resolve("/bin/sh").unwrap().mode(), 0o755);
+        assert_eq!(vfs.resolve("/etc/motd").unwrap().mode(), 0o644);
     }
 
     /// A link member's target is the `linkname` field, never the data blocks -

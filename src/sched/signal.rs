@@ -16,22 +16,38 @@
 
 /// Interrupt from the keyboard, once there is a keyboard.
 pub const SIGINT: u8 = 2;
-/// A child has stopped or exited. The default action ignores it - which is
-/// why a kernel can boot without ever queueing one - but a shell that
-/// installs a handler of its own waits for exactly this signal, and a task
-/// exit that only wakes a `wait(2)`-blocked parent leaves that parent
-/// asleep for ever.
-pub const SIGCHLD: u8 = 17;
+/// The hardware's trap, and the signal `ptrace` reports a stop with. Every
+/// stop a tracer sees is one of these: a syscall boundary, an `exec`, a
+/// signal that arrived, or a single step. It is also the one a `SIGTRAP`
+/// handler would run for, though nothing here raises it any other way.
+pub const SIGTRAP: u8 = 5;
+/// Termination, the kind that cannot be caught, blocked or ignored.
+pub const SIGKILL: u8 = 9;
 /// Write on a pipe with no one left to read it.
 pub const SIGPIPE: u8 = 13;
 /// The clock a program asked for: `alarm`, `setitimer(ITIMER_REAL)`.
 pub const SIGALRM: u8 = 14;
 /// Termination, the polite kind.
 pub const SIGTERM: u8 = 15;
-/// Termination, the kind that cannot be caught, blocked or ignored.
-pub const SIGKILL: u8 = 9;
+/// A child has stopped or exited. The default action ignores it - which is
+/// why a kernel can boot without ever queueing one - but a shell that
+/// installs a handler of its own waits for exactly this signal, and a task
+/// exit that only wakes a `wait(2)`-blocked parent leaves that parent
+/// asleep for ever.
+pub const SIGCHLD: u8 = 17;
+/// Continue. The default action is to resume a stopped task, which is the
+/// only thing that undoes a stop; it also clears pending stop signals, so a
+/// `SIGSTOP` followed by a `SIGCONT` does not leave the task stopping again
+/// the moment it resumes.
+pub const SIGCONT: u8 = 18;
 /// Stop, the other kind that cannot be caught.
 pub const SIGSTOP: u8 = 19;
+/// The keyboard's stop, and its two relatives from the tty: a background job
+/// reading or writing a terminal it does not own. All three stop by default,
+/// like `SIGSTOP`, and all three are catchable, unlike it.
+pub const SIGTSTP: u8 = 20;
+pub const SIGTTIN: u8 = 21;
+pub const SIGTTOU: u8 = 22;
 
 /// How many signal numbers a process can hold a disposition for. `Pending` is
 /// a `u32`, so 1..=31 are the numbers this kernel can name at all; the zero
@@ -156,6 +172,49 @@ pub fn catchable(sig: usize) -> bool {
     (1..SIGNALS).contains(&sig) && sig != SIGKILL as usize && sig != SIGSTOP as usize
 }
 
+/// What a signal does when no handler is installed for it.
+///
+/// The module's opening comment used to say every signal here was fatal by
+/// default, and for the set it named that was true. A tracer needs the two
+/// that are not: `SIGSTOP` stops rather than kills, and `SIGCONT` is the only
+/// way back from a stop. Spelling the table out is what keeps a `kill -STOP`
+/// from being a `kill -9` with a misleading name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultAction {
+    /// Die of it, the number in the exit code.
+    Terminate,
+    /// Hold the task where it stands until something resumes it. The
+    /// something is `SIGCONT` or a `PTRACE_CONT`, and the hold is what
+    /// `wait(2)` reports as `WIFSTOPPED`.
+    Stop,
+    /// Resume a stopped task. The signal itself means nothing else: a task
+    /// that is not stopped ignores it.
+    Continue,
+    /// Do nothing at all. `SIGCHLD` is here because a `wait(2)` needs no
+    /// signal to be woken - the parent wake is direct - so queueing it would
+    /// only make a shell's `wait` return `EINTR` for a death it just reaped.
+    Ignore,
+}
+
+/// The default action table, as `signal(7)` spells it.
+///
+/// Everything not named terminates: that is the honest default for the
+/// signals this kernel can name, and the ones a program actually catches
+/// (`SIGINT`, `SIGTERM`, `SIGPIPE`, `SIGALRM`) are in that group.
+pub fn default_action(sig: u8) -> DefaultAction {
+    match sig {
+        SIGCHLD => DefaultAction::Ignore,
+        SIGCONT => DefaultAction::Continue,
+        SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => DefaultAction::Stop,
+        _ => DefaultAction::Terminate,
+    }
+}
+
+/// Whether `sig`'s default action is to stop the task.
+pub fn stops_by_default(sig: u8) -> bool {
+    default_action(sig) == DefaultAction::Stop
+}
+
 /// The alternate stack `sigaltstack` installs, if any.
 ///
 /// `sp` is the region's base, as the caller gave it - not its top, which is
@@ -200,9 +259,46 @@ mod tests {
     fn numbers_are_pinned() {
         // These are the traditional values; the libc will bind them as is.
         assert_eq!(SIGINT, 2);
+        assert_eq!(SIGTRAP, 5);
         assert_eq!(SIGKILL, 9);
         assert_eq!(SIGPIPE, 13);
         assert_eq!(SIGTERM, 15);
+        assert_eq!(SIGCHLD, 17);
+        assert_eq!(SIGCONT, 18);
+        assert_eq!(SIGSTOP, 19);
+        assert_eq!(SIGTSTP, 20);
+    }
+
+    /// `signal(7)`: the default action of a signal with no handler is what
+    /// decides whether `kill -STOP` stops and `kill -CONT` resumes, or is a
+    /// `kill -9` wearing the wrong name.
+    #[test]
+    fn the_default_action_table_matches_signal_7() {
+        assert_eq!(default_action(SIGINT), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGTRAP), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGKILL), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGTERM), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGCHLD), DefaultAction::Ignore);
+        assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
+        for sig in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
+            assert_eq!(default_action(sig), DefaultAction::Stop);
+            assert!(stops_by_default(sig));
+        }
+        assert!(!stops_by_default(SIGINT));
+    }
+
+    /// `SIGKILL` and `SIGSTOP` are the two the kernel keeps for itself: a
+    /// `rt_sigaction` for either must not take, or a process could make
+    /// itself unstoppable (or unkillable).
+    #[test]
+    fn only_uncatchable_signals_are_refused_a_disposition() {
+        assert!(!catchable(SIGKILL as usize));
+        assert!(!catchable(SIGSTOP as usize));
+        assert!(!catchable(0));
+        assert!(!catchable(32));
+        assert!(catchable(SIGTRAP as usize));
+        assert!(catchable(SIGCONT as usize));
+        assert!(catchable(SIGTSTP as usize));
     }
 
     #[test]

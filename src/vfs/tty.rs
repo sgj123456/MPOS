@@ -37,7 +37,7 @@ use super::termios::{
     ECHO, ECHOCTL, ICANON, ICRNL, IEXTEN, IGNCR, INLCR, ISIG, ISTRIP, IXON, Termios, VEOF, VERASE,
     VINTR, VKILL, VLNEXT, VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VWERASE,
 };
-use super::{Inode, Metadata, NodeKind, Ready, VfsResult};
+use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
 #[cfg(target_os = "none")]
 use crate::sched::signal::SIGINT;
@@ -1100,7 +1100,30 @@ impl LineDiscipline {
     }
 }
 
-/// The machine's one input line discipline, behind a mutex.
+/// Where a terminal's output goes.
+///
+/// An enum rather than a trait object because a tty is built in a `const`
+/// context, before there is an allocator. The real wires are the UART and the
+/// master side of a pty pair; `Discard` is a terminal with nothing behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TtyOutput {
+    /// COM1 - the kernel console, `/dev/console` and `ttyS0`.
+    Serial,
+    /// A pty pair, by number: what the slave prints is what the master reads.
+    Pty(u32),
+    /// Nothing: the bytes are dropped.
+    Discard,
+}
+
+/// One terminal: a line discipline, the readers waiting on it, and the wire its
+/// output goes out.
+///
+/// There is more than one, and that is the point. The kernel's own voice is
+/// `ttyS0` on COM1; the shells talk through the slave ends of pty pairs, and
+/// the console multiplexer carries their traffic over the same serial wire.
+/// Each terminal has its own line discipline, so a boot log and a login
+/// prompt never edit the same buffer - and each has its own device number,
+/// because `ttyname(3)` tells two terminals apart by exactly that.
 pub struct Tty {
     ld: Mutex<RefCell<LineDiscipline>>,
     /// Tasks blocked in [`Tty::read`]. A producer cannot name them, but the
@@ -1112,14 +1135,40 @@ pub struct Tty {
     /// aimed at, so the most recent reader is the best guess there is - and
     /// the shell, waiting on a child, is not it.
     foreground: Mutex<RefCell<Option<TaskId>>>,
+    /// Where output goes: the echo of what is typed, and everything a
+    /// `write(2)` sends.
+    output: Mutex<RefCell<TtyOutput>>,
+    /// What `st_rdev` reports.
+    dev_id: (u32, u32),
 }
 
 impl Tty {
-    pub const fn new() -> Tty {
+    pub const fn new(dev_id: (u32, u32), output: TtyOutput) -> Tty {
         Tty {
             ld: Mutex::new(RefCell::new(LineDiscipline::new())),
             waiters: Mutex::new(RefCell::new(Vec::new())),
             foreground: Mutex::new(RefCell::new(None)),
+            output: Mutex::new(RefCell::new(output)),
+            dev_id,
+        }
+    }
+
+    /// Send bytes to this terminal's wire. Called for echo, for `write(2)`, and
+    /// for the answers the line discipline gives a cursor query - so all three
+    /// land on the same wire the terminal is attached to.
+    fn write_out(&self, bytes: &[u8]) {
+        let output = critical_section::with(|cs| *self.output.borrow(cs).borrow());
+        #[cfg(target_os = "none")]
+        match output {
+            TtyOutput::Serial => crate::console::write_bytes(bytes),
+            TtyOutput::Pty(number) => crate::vfs::pty::master_input(number, bytes),
+            TtyOutput::Discard => {}
+        }
+        // On the host there is no console to write to, but the pty wire is
+        // plain memory - the pair tests drive it exactly as the machine does.
+        #[cfg(not(target_os = "none"))]
+        if let TtyOutput::Pty(number) = output {
+            crate::vfs::pty::master_input(number, bytes);
         }
     }
 
@@ -1140,9 +1189,9 @@ impl Tty {
             let foreground = *self.foreground.borrow(cs).borrow();
             (echo, action, waiters, foreground)
         });
+        self.write_out(&echo);
         #[cfg(target_os = "none")]
         {
-            crate::console::write_bytes(&echo);
             for id in waiters {
                 crate::sched::wake(id);
             }
@@ -1158,7 +1207,7 @@ impl Tty {
             }
         }
         #[cfg(not(target_os = "none"))]
-        drop((echo, action, waiters, foreground));
+        drop((action, waiters, foreground));
     }
 
     /// Remember which process group an interrupt belongs to.
@@ -1202,7 +1251,7 @@ impl Tty {
     }
 
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
-    fn has_ready(&self) -> bool {
+    pub(crate) fn has_ready(&self) -> bool {
         critical_section::with(|cs| self.ld.borrow(cs).borrow().has_ready())
     }
 
@@ -1220,7 +1269,13 @@ impl Tty {
         // meant for its process group - not for whatever waits on it. A shell
         // that has claimed the terminal with `TIOCSPGRP` has already said who
         // that is; this is the same answer for a program that never asks.
-        self.set_foreground(Some(crate::sched::pgid_of(id).unwrap_or(id)));
+        // The kernel's own boot task has no process group; recording its
+        // id would name a group that can never be signalled, and every
+        // later `tcgetpgrp` on this terminal would read the poison.
+        let fg = crate::sched::pgid_of(id).unwrap_or(id);
+        if fg != crate::sched::TaskId(0) {
+            self.set_foreground(Some(fg));
+        }
         let got = self.read_blocking(buf);
         critical_section::with(|cs| {
             self.waiters.borrow(cs).borrow_mut().retain(|&w| w != id);
@@ -1232,10 +1287,22 @@ impl Tty {
     /// construction, so only the discipline itself is testable.
     #[cfg(not(target_os = "none"))]
     pub fn read(&self, buf: &mut [u8]) -> usize {
-        if buf.is_empty() {
-            return 0;
-        }
+        let _ = buf;
         panic!("blocking tty reads need the kernel scheduler; test LineDiscipline instead");
+    }
+
+    /// Take what a read would take, without blocking - the pair tests on the
+    /// host, which cannot park a task but still want to see a typed line
+    /// arrive whole at the slave.
+    #[cfg(all(test, not(target_os = "none")))]
+    pub(crate) fn take_ready(&self, buf: &mut [u8]) -> Option<usize> {
+        critical_section::with(|cs| {
+            let mut ld = self.ld.borrow(cs).borrow_mut();
+            let bytes = ld.take(buf.len())?;
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            Some(n)
+        })
     }
 
     #[cfg(target_os = "none")]
@@ -1253,35 +1320,120 @@ impl Tty {
     }
 }
 
-static TTY: Mutex<RefCell<Option<Arc<Tty>>>> = Mutex::new(RefCell::new(None));
+/// The machine's own terminal: the console - `ttyS0` on COM1, where every
+/// kernel log goes and where the boot task's standard descriptors point. The
+/// shells' terminals are not here: `tty1`..`tty6` are the slave ends of pty
+/// pairs (`pty::init` mints them), and the console multiplexer carries their
+/// traffic over this one serial wire.
+static TTYS: Mutex<RefCell<Vec<Arc<Tty>>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// The device numbers the terminals report, from Linux's `tty` major: minor 64
+/// is the first serial port. `tty1`..`tty6` carry `(4, n)` instead, and a pty
+/// slave `(136, n)` - `ttyname(3)` matches a descriptor to a `/dev` name by
+/// exactly these numbers, so every terminal keeps its own.
+const CONSOLE_DEV_ID: (u32, u32) = (4, 64);
 
 impl Default for Tty {
     fn default() -> Tty {
-        Tty::new()
+        Tty::new(CONSOLE_DEV_ID, TtyOutput::Serial)
     }
 }
 
-/// Create the console tty and hand back the shared handle. Calling `init`
-/// again returns the same tty: there is exactly one, because the machine's
-/// input line is not a per-task thing.
+/// Create the console terminal and the virtual consoles, and hand back the
+/// console.
+///
+/// Called once, from the boot task. The console tty is what the kernel's own
+/// standard descriptors point at; the pty pairs behind `/dev/tty1`..`tty6`
+/// are minted here too, so those names lead to real terminals - each with its
+/// own line discipline and its own wire - by the time an `inittab` respawns a
+/// getty on one.
 pub fn init() -> Arc<Tty> {
     critical_section::with(|cs| {
-        TTY.borrow(cs)
-            .borrow_mut()
-            .get_or_insert_with(|| Arc::new(Tty::new()))
+        let mut ttys = TTYS.borrow(cs).borrow_mut();
+        if ttys.is_empty() {
+            ttys.push(Arc::new(Tty::new(CONSOLE_DEV_ID, TtyOutput::Serial)));
+        }
+        ttys[0].clone()
+    });
+    super::pty::init();
+    critical_section::with(|cs| TTYS.borrow(cs).borrow()[0].clone())
+}
+
+/// The console tty, for whoever feeds it input: the kernel log's own wire, and
+/// the terminal the COM1 receiver feeds before the console multiplexer exists.
+pub fn global() -> Arc<Tty> {
+    critical_section::with(|cs| {
+        TTYS.borrow(cs)
+            .borrow()
+            .first()
+            .expect("ttys exist only after vfs::tty::init()")
             .clone()
     })
 }
 
-/// The console tty, for whoever feeds it input.
-pub fn global() -> Arc<Tty> {
-    critical_section::with(|cs| {
-        TTY.borrow(cs)
-            .borrow()
-            .as_ref()
-            .expect("the tty exists only after vfs::tty::init()")
-            .clone()
-    })
+/// The terminal whose device id this is, if one lives: the console by its
+/// `(4, 64)`, a virtual console by its `(4, n)`, a pty slave by its `(136, n)`.
+///
+/// `/dev/tty` resolves through exactly this: the opening process carries the
+/// device id of the terminal it acquired with `TIOCSCTTY`, and the id has to
+/// lead back to the one `Tty` behind it. An id nothing mints is no terminal
+/// at all, which is [`VfsError::NoDevice`]'s business at the open.
+pub fn by_dev_id(dev_id: (u32, u32)) -> Option<Arc<Tty>> {
+    match dev_id {
+        (4, 64) => Some(global()),
+        (4, n) | (136, n) => super::pty::lookup(n).map(|pty| pty.slave().clone()),
+        _ => None,
+    }
+}
+
+/// `/dev/tty`: the opening process's controlling terminal.
+///
+/// The name is not a device in its own right. It is whatever terminal this
+/// process acquired with `TIOCSCTTY`, which is why every open of it can land
+/// on a different terminal: the getty that claimed `tty1` opens its own line,
+/// a shell on `tty3` opens a different one, and the same process's open after
+/// a `setsid` fails. A process that has acquired none cannot open the name at
+/// all - POSIX answers `ENXIO`, which a shell reads as "job control off"
+/// rather than as somebody else's terminal. That reading is load-bearing: an
+/// interactive shell probes `tcgetpgrp` on `/dev/tty` to decide whether it is
+/// in the foreground, and a name that resolved to a terminal nobody owns
+/// turned every probe into "background" - a stop signal to itself, and a
+/// login that froze forever for want of a SIGCONT nobody would send.
+pub struct ControllingTty;
+
+impl Inode for ControllingTty {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: 0,
+            kind: NodeKind::CharDev,
+            size: 0,
+        }
+    }
+
+    /// Linux's own numbers for the name: character major 5, minor 0.
+    fn rdev(&self) -> Option<(u32, u32)> {
+        Some((5, 0))
+    }
+
+    /// Every open resolves to the caller's controlling terminal - a different
+    /// terminal for every process that has bound one, which is what
+    /// [`Inode::open_replacement`] exists for.
+    #[cfg(target_os = "none")]
+    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+        let Some(dev_id) = crate::sched::controlling_tty_of_current() else {
+            return Err(VfsError::NoDevice);
+        };
+        by_dev_id(dev_id)
+            .map(|tty| Some(tty as Arc<dyn Inode>))
+            .ok_or(VfsError::NoDevice)
+    }
+
+    /// No scheduler on the host, so no process to ask; the pair tests drive
+    /// terminals directly rather than through this name.
+    #[cfg(not(target_os = "none"))]
+    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+        Err(VfsError::NoDevice)
+    }
 }
 
 impl Inode for Tty {
@@ -1301,12 +1453,12 @@ impl Inode for Tty {
     }
 
     /// The tty device number, as libc's `ttyname` matches descriptors by: it
-    /// walks `/dev` fstat-ing every node and comparing this number. One line
-    /// discipline fronts every tty name on this machine, so they all carry
-    /// one number - `ttyS0`'s - and the name login prints is whichever node
-    /// the walk meets first.
+    /// walks `/dev` fstat-ing every node and comparing this number. Every
+    /// terminal carries its own - `ttyS0` is `(4, 64)`, `tty1` is `(4, 1)`, a
+    /// pty slave is `(136, n)` - so the walk finds the name of the terminal it
+    /// is actually holding.
     fn rdev(&self) -> Option<(u32, u32)> {
-        Some((4, 64))
+        Some(self.dev_id)
     }
 
     fn poll_ready(&self) -> Ready {
@@ -1341,34 +1493,32 @@ impl Inode for Tty {
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        // Output can be input: a shell that asks where the cursor is gets
+        // its answer here, and a reader waiting on that answer has to be
+        // woken exactly as if the bytes had been typed.
+        let (forwarded, waiters) = critical_section::with(|cs| {
+            let mut ld = self.ld.borrow(cs).borrow_mut();
+            let forwarded = ld.note_output(buf);
+            let waiters = if ld.has_ready() {
+                core::mem::take(&mut *self.waiters.borrow(cs).borrow_mut())
+            } else {
+                Vec::new()
+            };
+            (forwarded, waiters)
+        });
+        // What the discipline answered itself does not travel on: the
+        // question would only be asked twice, once of a real terminal
+        // whose reply has nowhere useful to go.
+        match forwarded {
+            Some(bytes) => self.write_out(&bytes),
+            None => self.write_out(buf),
+        }
         #[cfg(target_os = "none")]
-        {
-            // Output can be input: a shell that asks where the cursor is gets
-            // its answer here, and a reader waiting on that answer has to be
-            // woken exactly as if the bytes had been typed.
-            let (forwarded, waiters) = critical_section::with(|cs| {
-                let mut ld = self.ld.borrow(cs).borrow_mut();
-                let forwarded = ld.note_output(buf);
-                let waiters = if ld.has_ready() {
-                    core::mem::take(&mut *self.waiters.borrow(cs).borrow_mut())
-                } else {
-                    Vec::new()
-                };
-                (forwarded, waiters)
-            });
-            // What the discipline answered itself does not travel on: the
-            // question would only be asked twice, once of a real terminal
-            // whose reply has nowhere useful to go.
-            match forwarded {
-                Some(bytes) => crate::console::write_bytes(&bytes),
-                None => crate::console::write_bytes(buf),
-            }
-            for id in waiters {
-                crate::sched::wake(id);
-            }
+        for id in waiters {
+            crate::sched::wake(id);
         }
         #[cfg(not(target_os = "none"))]
-        let _ = buf;
+        drop(waiters);
         Ok(buf.len())
     }
 }

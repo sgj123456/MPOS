@@ -56,6 +56,13 @@ pub struct PipeEnd {
     /// drop - whichever came first. Both have to be idempotent, since a
     /// `shutdown` can be asked for twice and the drop always follows it.
     closed: AtomicBool,
+    /// `O_NONBLOCK`, as `pipe2(2)` is born with it and `fcntl(F_SETFL)` sets
+    /// it: an operation that would wait answers `EAGAIN` instead. It lives
+    /// here rather than in the descriptor, because the wait is here - testing
+    /// it beside the state it would wait on is what makes the answer
+    /// race-free, where a descriptor checked beforehand could have the data
+    /// it saw taken by another reader before its own turn comes.
+    nonblocking: AtomicBool,
 }
 
 /// POSIX's floor for record writes, held at compile time, and a buffer that is
@@ -78,11 +85,13 @@ pub fn pair() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
         state: state.clone(),
         writing: false,
         closed: AtomicBool::new(false),
+        nonblocking: AtomicBool::new(false),
     });
     let write_end = Arc::new(PipeEnd {
         state,
         writing: true,
         closed: AtomicBool::new(false),
+        nonblocking: AtomicBool::new(false),
     });
     (read_end, write_end)
 }
@@ -91,6 +100,13 @@ impl PipeEnd {
     /// Bytes waiting to be read.
     pub fn buffered(&self) -> usize {
         critical_section::with(|cs| self.state.borrow(cs).borrow().data.len())
+    }
+
+    /// Set or clear `O_NONBLOCK` on this end. `pipe2` sets it on birth,
+    /// `fcntl(F_SETFL)` on demand, and both write the same bit: the pipe's
+    /// answer to "would you wait?" is the one thing it changes.
+    pub fn set_nonblocking(&self, on: bool) {
+        self.nonblocking.store(on, Ordering::Relaxed);
     }
     /// One non-blocking read. `Some(n)` with `n > 0` is data, `Some(0)` is
     /// end-of-stream, `None` is "nothing to read yet".
@@ -276,6 +292,10 @@ impl Drop for PipeEnd {
 }
 
 impl Inode for PipeEnd {
+    fn as_pipe(&self) -> Option<&PipeEnd> {
+        Some(self)
+    }
+
     fn poll_ready(&self) -> Ready {
         critical_section::with(|cs| {
             let st = self.state.borrow(cs).borrow();
@@ -337,7 +357,17 @@ impl Inode for PipeEnd {
                     }
                     return Ok(n);
                 }
-                None => self.wait_readable(),
+                None => {
+                    // Nothing to take, and a writer still alive - which an
+                    // O_NONBLOCK reader asked not to wait for. EAGAIN, not a
+                    // park: a self-pipe's reader only reads when something
+                    // was signalled, and parking it on the first empty read
+                    // is how a program with an event loop freezes.
+                    if self.nonblocking.load(Ordering::Relaxed) {
+                        return Err(VfsError::Again);
+                    }
+                    self.wait_readable();
+                }
             }
         }
     }
@@ -354,7 +384,20 @@ impl Inode for PipeEnd {
                     // Data arrived for a blocked reader.
                     self.wake_waiters(false);
                 }
-                None => self.wait_writable(),
+                None => {
+                    // No room - which an O_NONBLOCK writer asked to hear as
+                    // EAGAIN. Bytes already landed are reported first: a
+                    // nonblocking write answers with what it managed and
+                    // leaves the rest to the caller, which is Linux's
+                    // spelling of the same rule.
+                    if self.nonblocking.load(Ordering::Relaxed) {
+                        if done > 0 {
+                            return Ok(done);
+                        }
+                        return Err(VfsError::Again);
+                    }
+                    self.wait_writable();
+                }
             }
         }
         Ok(done)
@@ -602,6 +645,43 @@ mod tests {
         write_end.write_at(0, b"hi").unwrap();
         drop(read_end);
         assert_eq!(write_end.write_once(b"!").err(), Some(VfsError::BrokenPipe));
+    }
+
+    #[test]
+    fn a_nonblocking_end_answers_eagain_rather_than_waiting() {
+        let (read_end, write_end) = pair();
+        read_end.set_nonblocking(true);
+
+        // Empty with a writer alive: EAGAIN, not a wait (which would panic
+        // on the host - the wait needs a scheduler - and park the caller
+        // forever on the machine).
+        let mut buf = [0u8; 4];
+        assert_eq!(read_end.read_at(0, &mut buf).err(), Some(VfsError::Again));
+
+        // Buffered data still reads back: the flag changes what a *wait*
+        // is, not what a read takes.
+        assert_eq!(write_end.write_at(0, b"data").unwrap(), 4);
+        assert_eq!(read_end.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"data");
+
+        // A full pipe answers a writer the same way: fill to capacity, and
+        // one more write is EAGAIN rather than a park.
+        write_end.set_nonblocking(true);
+        let big = vec![0u8; CAPACITY];
+        assert_eq!(write_end.write_at(0, &big).unwrap(), CAPACITY);
+        assert_eq!(write_end.write_at(0, b"more").err(), Some(VfsError::Again));
+
+        // Draining lets writes through again: the EAGAIN was about the
+        // state, not the pipe's lifetime.
+        let mut sink = vec![0u8; CAPACITY];
+        assert_eq!(read_end.read_at(0, &mut sink).unwrap(), CAPACITY);
+        assert_eq!(write_end.write_at(0, b"done").unwrap(), 4);
+
+        // EOF outranks the flag: with the writer gone, the drain reads the
+        // last bytes and then answers 0, exactly as a blocking one would.
+        write_end.shut_write();
+        assert_eq!(read_end.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(read_end.read_at(0, &mut buf).unwrap(), 0, "EOF");
     }
 
     #[test]

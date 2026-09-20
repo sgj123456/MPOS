@@ -108,8 +108,7 @@ const MSG_DONTWAIT: usize = 0x40;
 /// waited forever on an answer that had already come and gone. Linux answers
 /// that loop with `EAGAIN` and an error return; so does this now.
 fn rtnl_answer(handle: usize, flags: usize, fd: i32) -> Option<Vec<u8>> {
-    let dontwait =
-        flags & MSG_DONTWAIT != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    let dontwait = flags & MSG_DONTWAIT != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
     if dontwait && !crate::net::rtnl::ready(handle) {
         return None;
     }
@@ -1349,6 +1348,207 @@ pub(crate) fn handle_listen(_args: [usize; 6], _from_user: bool) -> isize {
 /// `accept(fd, addr, addrlen)` - see [`handle_listen`].
 pub(crate) fn handle_accept(_args: [usize; 6], _from_user: bool) -> isize {
     err::EOPNOTSUPP
+}
+
+/// `accept4(fd, addr, addrlen, flags)` - `accept` with the two flags the
+/// modern spelling takes.
+///
+/// The flags are validated first, before the socket is looked at - the
+/// man page's own order, and the one that matters to a caller probing for
+/// the feature: an unknown bit is `EINVAL` whatever the socket is doing.
+/// The two known bits belong to the descriptor an accepted connection
+/// would arrive on, and this kernel's accept is the honest refusal the
+/// flag-less form gives, so they are accepted and unused - the same
+/// treatment `pipe2` gives a flag it cannot yet honour.
+pub(crate) fn handle_accept4(args: [usize; 6], from_user: bool) -> isize {
+    const SOCK_CLOEXEC: usize = 0o200_0000;
+    const SOCK_NONBLOCK: usize = 0x800;
+    if args[3] & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+        return err::EINVAL;
+    }
+    handle_accept(args, from_user)
+}
+
+/// One `struct mmsghdr`: a full `struct msghdr` (56 bytes) followed by the
+/// `unsigned int msg_len` the multiple-message calls write their per-entry
+/// byte counts into, padded to the 8-byte alignment the next record needs.
+const MMSGHDR_SIZE: usize = 64;
+/// Where `msg_len` sits inside a `struct mmsghdr`.
+const MMSGHDR_LEN: usize = 56;
+/// The ABI's ceiling on the record count of a multiple-message call - the
+/// same `UIO_MAXIOV` the vectored I/O calls are bounded by.
+const UIO_MAXIOV: usize = 1024;
+
+/// `sendmmsg(fd, msgvec, vlen, flags)` - `sendmsg` over an array of
+/// messages, one syscall for the round trip.
+///
+/// Each entry is sent as its own `sendmsg`; the byte count lands in the
+/// entry's `msg_len` field, and the answer is how many entries went out. An
+/// entry that fails ends the call: the count of what already left is the
+/// answer - the man page's own "succeeds, and returns the number of messages
+/// sent" for the partial case - and nothing is the answer only when nothing
+/// left, in which case the failure itself is what the caller hears.
+pub(crate) fn handle_sendmmsg(args: [usize; 6], from_user: bool) -> isize {
+    let (fd, msgvec, vlen, flags) = (args[0] as i32, args[1], args[2], args[3]);
+    if vlen == 0 {
+        return 0;
+    }
+    if vlen > UIO_MAXIOV {
+        return err::EINVAL;
+    }
+    let len = match vlen.checked_mul(MMSGHDR_SIZE) {
+        Some(len) => len,
+        None => return err::EINVAL,
+    };
+    // The headers are read and the lengths written back, so both
+    // directions of the array must be reachable.
+    if !crate::syscall::buffer_ok(msgvec, len, true, from_user) {
+        return err::EFAULT;
+    }
+
+    let mut sent = 0usize;
+    for index in 0..vlen {
+        let at = msgvec + index * MMSGHDR_SIZE;
+        let n = handle_sendmsg([fd as usize, at, flags, 0, 0, 0], from_user);
+        if n < 0 {
+            if sent > 0 {
+                return sent as isize;
+            }
+            return n;
+        }
+        unsafe { ((at + MMSGHDR_LEN) as *mut u32).write_volatile(n as u32) };
+        sent += 1;
+    }
+    sent as isize
+}
+
+/// `recvmmsg(fd, msgvec, vlen, flags, timeout)` - `recvmsg` over an array
+/// of messages, with a clock on the whole call.
+///
+/// A blocking call with no timeout waits the way `recvmsg` itself waits,
+/// message by message. A timeout paces the whole call instead: every
+/// attempt is a nonblocking one, the deadline is checked between them, and
+/// when it expires the answer is how many arrived - zero included, which
+/// is the man page's own answer for "the clock ran out before anything
+/// came". `MSG_WAITFORONE` is honoured as its name says: after the first
+/// message, nothing blocks - whatever is queued arrives and the call
+/// answers.
+pub(crate) fn handle_recvmmsg(args: [usize; 6], from_user: bool) -> isize {
+    const MSG_WAITFORONE: usize = 0x10000;
+    let (fd, msgvec, vlen, flags, timeout) = (args[0] as i32, args[1], args[2], args[3], args[4]);
+    if vlen == 0 {
+        return 0;
+    }
+    if vlen > UIO_MAXIOV {
+        return err::EINVAL;
+    }
+    let len = match vlen.checked_mul(MMSGHDR_SIZE) {
+        Some(len) => len,
+        None => return err::EINVAL,
+    };
+    if !crate::syscall::buffer_ok(msgvec, len, true, from_user) {
+        return err::EFAULT;
+    }
+    let deadline = if timeout != 0 {
+        if !crate::syscall::buffer_ok(timeout, 16, false, from_user) {
+            return err::EFAULT;
+        }
+        let (sec, nsec) = unsafe {
+            (
+                (timeout as *const i64).read_volatile(),
+                ((timeout + 8) as *const i64).read_volatile(),
+            )
+        };
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return err::EINVAL;
+        }
+        // A timeout is a lower bound, so the sub-second part rounds up -
+        // the same fold `ppoll` makes. Both fields were validated above,
+        // so both are non-negative and the u64 arithmetic below is the
+        // whole story.
+        let hz = crate::arch::timer::TICK_HZ as u64;
+        let ms = (sec as u64)
+            .saturating_mul(1_000)
+            .saturating_add((nsec as u64).div_ceil(1_000_000));
+        Some(crate::arch::timer::ticks().saturating_add(ms.saturating_mul(hz) / 1000))
+    } else {
+        None
+    };
+    let wait_for_one = flags & MSG_WAITFORONE != 0;
+
+    let mut received = 0usize;
+    for index in 0..vlen {
+        let at = msgvec + index * MMSGHDR_SIZE;
+        let n = if index == 0 && deadline.is_none() {
+            // The first message of an unclocked call is the ordinary
+            // blocking receive - `recvmsg`'s own wait.
+            handle_recvmsg([fd as usize, at, flags, 0, 0, 0], from_user)
+        } else {
+            match recv_one_bounded(fd, at, flags, from_user, deadline) {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    if e == err::EWOULDBLOCK && (deadline.is_some() || wait_for_one) {
+                        // The clock ran out, or `MSG_WAITFORONE` said one
+                        // was enough: the count is the answer, timeout and
+                        // all, and a caller with none asks for `EAGAIN`.
+                        if received == 0 && wait_for_one {
+                            return err::EWOULDBLOCK;
+                        }
+                        return received as isize;
+                    }
+                    if e == err::EWOULDBLOCK && received == 0 {
+                        return err::EWOULDBLOCK;
+                    }
+                    if received > 0 {
+                        return received as isize;
+                    }
+                    return e;
+                }
+            }
+        };
+        if n < 0 {
+            if received > 0 {
+                return received as isize;
+            }
+            return n;
+        }
+        unsafe { ((at + MMSGHDR_LEN) as *mut u32).write_volatile(n as u32) };
+        received += 1;
+    }
+    received as isize
+}
+
+/// One nonblocking `recvmsg` attempt, paced by a deadline: the descriptor
+/// is made nonblocking for the duration, and `EWOULDBLOCK` is retried a
+/// tick at a time until either data arrives or the clock runs out. The
+/// `Err(EWOULDBLOCK)` the clock produces is indistinguishable from the
+/// socket's own - deliberately, because to the caller both mean "nothing
+/// else is coming now".
+fn recv_one_bounded(
+    fd: i32,
+    at: usize,
+    flags: usize,
+    from_user: bool,
+    deadline: Option<u64>,
+) -> Result<usize, isize> {
+    let file = crate::sched::current_fds()
+        .clone_at(fd)
+        .map_err(|_| err::EBADF)?;
+    let saved = file.status();
+    file.set_status(saved | crate::vfs::file::O_NONBLOCK);
+    let answer = loop {
+        let n = handle_recvmsg([fd as usize, at, flags, 0, 0, 0], from_user);
+        if n != err::EWOULDBLOCK {
+            break Ok(n as usize);
+        }
+        match deadline {
+            None => break Err(err::EWOULDBLOCK),
+            Some(end) if crate::arch::timer::ticks() >= end => break Err(err::EWOULDBLOCK),
+            _ => crate::sched::sleep_ticks(1),
+        }
+    };
+    file.set_status(saved);
+    answer
 }
 
 /// `socketpair(domain, type, protocol, fds)`.

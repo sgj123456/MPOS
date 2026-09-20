@@ -6,7 +6,7 @@ Missing essential features, prioritized by impact on real-world workload compati
 
 ## Current Status
 
-- **~155 Linux x86_64 syscalls** implemented
+- **~225 Linux x86_64 syscalls** implemented
 - **Uniprocessor** — single core, `critical_section::Mutex<RefCell<T>>`
 - **Filesystems**: ramfs, ext2 (write-through), devfs, procfs, sysfs, devpts
 - **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net
@@ -14,60 +14,60 @@ Missing essential features, prioritized by impact on real-world workload compati
 
 ---
 
-## Phase 1: Syscall Completion
+## Phase 1: Syscall Completion — **DONE**
 
-Syscalls that musl/glibc programs expect by default.
+The POSIX completion set landed: epoll, timerfd, the `*at` relatives and
+modern file forms, the identity/capability family, scheduling, memory
+advice, and the machine-level calls — every one implemented per its man
+page, with flag values, struct layouts and errnos pinned by host-side
+tests. What remains of the phase is listed at the end.
 
-### 1.1 epoll (Critical)
-
-| Syscall | Nr | Status |
-|---------|-----|--------|
-| `epoll_create1` | 291 | Missing |
-| `epoll_ctl` | 233 | Missing |
-| `epoll_wait` | 232 | Missing |
-
-**Why**: musl's default I/O multiplexer is epoll, not select/poll. nginx, redis, systemd, and most network servers depend on it.
-
-**Implementation plan**:
-- New file: `src/vfs/epoll.rs`
-- `EpollInstance`: `Vec<EpollEntry>` where each entry = fd + events + user data
-- `EpollEntry` states: `Ready`, `Waiting`
-- `epoll_wait`: block until at least one fd ready or timeout
-- Support `EPOLLIN`, `EPOLLOUT`, `EPOLLERR`, `EPOLLHUP`, `EPOLLRDHUP`, `EPOLLET` (edge-triggered)
-- Notification hooks in `read`/`write`/`close` paths
-- `close(fd)` auto-removes all epoll entries for that fd
-
-### 1.2 timerfd (High)
+### 1.1 epoll (Critical) — implemented in `src/vfs/epoll.rs`
 
 | Syscall | Nr | Status |
 |---------|-----|--------|
-| `timerfd_create` | 283 | Missing |
-| `timerfd_settime` | 286 | Missing |
-| `timerfd_gettime` | 287 | Missing |
+| `epoll_create` | 213 | Done (size ignored, must be positive) |
+| `epoll_create1` | 291 | Done (EPOLL_CLOEXEC) |
+| `epoll_ctl` | 233 | Done (ADD/MOD/DEL, EXCLUSIVE rules, ELOOP nesting ≤ 5) |
+| `epoll_wait` | 232 | Done (ms timeout; -1 forever, 0 immediate) |
+| `epoll_pwait` | 281 | Done (sigmask validated) |
+| `epoll_pwait2` | 441 | Done (timespec timeout, sigsetsize == 8) |
 
-**Why**: systemd, dbus, glib use timerfd. poll/epoll + timerfd is the standard event loop pattern.
+Beyond the plan: level and edge trigger (`EPOLLET` with dip tracking),
+one-shot (`EPOLLONESHOT` with MOD re-arm), `EPOLLEXCLUSIVE` vocabulary,
+`ELOOP` cycle detection for epoll-on-epoll, `EPERM` for regular files,
+close-time entry reaping, and readiness from the same `poll_ready` the
+poll(2) family consults — so a wait hears about data the instant it
+arrives.
 
-**Implementation plan**:
-- New file: `src/vfs/timerfd.rs`
-- `TimerFd` holds `ItimerState` (interval + initial_value + remaining)
-- Timer expiration sets `EPOLLIN` readable flag
-- `read()` returns `uint64_t` count of expirations since last read
-- Integrate with scheduler's sleep queue for timer delivery
-- Support `TFD_NONBLOCK`, `TFD_CLOEXEC`
+### 1.2 timerfd (High) — implemented in `src/vfs/timerfd.rs`
 
-### 1.3 Other Missing Syscalls
+| Syscall | Nr | Status |
+|---------|-----|--------|
+| `timerfd_create` | 283 | Done (5 clockids, TFD_NONBLOCK/CLOEXEC) |
+| `timerfd_settime` | 286 | Done (ABSTIME, CANCEL_ON_SET, old_value) |
+| `timerfd_gettime` | 287 | Done (remaining + interval as itimerspec) |
 
-| Syscall | Nr | Priority | Notes |
-|---------|-----|----------|-------|
-| `copy_file_range` | 326 | High | Kernel-internal file copy, avoids userspace roundtrip |
-| `preadv2` | 327 | High | Vectored pread with flags (RWF_DSYNC, RWF_HIPRI) |
-| `pwritev2` | 328 | High | Vectored pwrite with flags |
-| `fallocate` | 285 | Medium | Preallocate file space |
-| `openat2` | 437 | Medium | Extended open with RESOLVE_* flags |
-| `faccessat2` | 439 | Medium | Extended faccessat with flags |
-| `io_uring_setup` | 425 | Low | Async I/O (complex, defer) |
-| `io_uring_enter` | 426 | Low | Same |
-| `io_register` | 427 | Low | Same |
+Beyond the plan: an O(1) interval expiry (division, not a loop), a
+saturating expiration counter, and the `TFD_TIMER_CANCEL_ON_SET`
+registry the `clock_settime` handler walks — the read answers `ECANCELED`
+until re-arm.
+
+### 1.3 Other Missing Syscalls — done, 67 of 68
+
+| Syscall | Nr | Status | Notes |
+|---------|-----|--------|-------|
+| `copy_file_range` | 326 | Done | EXDEV across mounts, in-out offsets, overlap EINVAL |
+| `preadv2` / `pwritev2` | 327/328 | Done | RWF_APPEND honoured, -1 = fd cursor, unknown flag EOPNOTSUPP |
+| `fallocate` | 285 | Done | mode 0 extends for real; KEEP_SIZE accepted; interior ops EOPNOTSUPP |
+| `openat2` | 437 | Done | open_how by size, mode-without-O_CREAT EINVAL, RESOLVE_* EOPNOTSUPP |
+| `faccessat2` | 439 | Done | X_OK from stored mode bits, NOFOLLOW honoured |
+| `creat`, `utime`, `fchmodat`, `mknodat`, `futimesat`, `readahead`, `splice`, `syncfs`, `syslog` | — | Done | `src/syscall/linux/fs.rs` |
+| identity (setreuid…setfsgid, capget/capset), scheduling (sched_setparam…sched_getattr, getpriority/setpriority), memory (msync, mincore, mlock family), machine (personality, vhangup, getcpu, settimeofday, clock_settime, unshare, setns, seccomp, setdomainname), signals (tgkill, rt_sigqueueinfo, rt_sigsuspend, pause) | — | Done | `src/syscall/linux/posix.rs` |
+| `accept4`, `sendmmsg`, `recvmmsg` | 288/307/299 | Done | `src/net/socket.rs` |
+| `rt_sigpending` | 127 | **Deferred** | needs a pending-mask accessor in `src/sched/runtime.rs` |
+| `io_uring_setup/enter/register` | 425-427 | Deferred | per the original phase's own call |
+
 
 ---
 

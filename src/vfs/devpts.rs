@@ -1,109 +1,42 @@
 //! `devpts`: the pseudo-terminal filesystem.
 //!
-//! Linux mounts this at `/dev/pts`, and an initramfs's init does too - then
-//! gets its login on a pty. This kernel has no pseudo-terminal driver yet, so
-//! the honest tree is a directory with a `pts` subdirectory and nothing in it:
-//! a program that looks for a terminal pair finds none, by name, rather than
-//! finding one that cannot allocate.
+//! Linux mounts this at `/dev/pts`, and the slave end of every pair minted
+//! through `/dev/ptmx` appears here, named by its number: `posix_openpt`
+//! mints, `TIOCGPTN` names the number, and `/dev/pts/<that number>` is the
+//! terminal to open. The pair registry in [`super::pty`] is the storage -
+//! this filesystem is the naming layer over it, and holds nothing itself.
 //!
-//! What the mount buys is the thing the caller actually asked for - `/dev/pts`
-//! exists, is a mount point, and reports itself as `devpts` in /proc/mounts -
-//! so a boot script that mounts it and moves on keeps moving.
+//! The virtual consoles are deliberately absent: their slaves already have
+//! names - `/dev/tty1` and friends in `/dev` - and giving the same terminal a
+//! second name would only make `ttyname(3)`'s walk find one of the two, at
+//! random. A devpts that lists nothing it does not own is one that reads
+//! exactly as it is.
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
-use critical_section::Mutex;
+use super::pty::PtySlave;
+use super::{FileSystem, Inode, NodeKind, VfsResult};
 
-use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
-
-struct PtsDir {
-    ino: Ino,
-    entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
-}
-
-impl PtsDir {
-    fn new(ino: Ino) -> Arc<PtsDir> {
-        Arc::new(PtsDir {
-            ino,
-            entries: Mutex::new(RefCell::new(BTreeMap::new())),
-        })
-    }
-
-    fn add_dir(&self, name: &str, ino: Ino) -> Arc<PtsDir> {
-        let dir = PtsDir::new(ino);
-        critical_section::with(|cs| {
-            self.entries
-                .borrow(cs)
-                .borrow_mut()
-                .insert(String::from(name), dir.clone());
-        });
-        dir
-    }
-}
-
-impl Inode for PtsDir {
-    fn metadata(&self) -> Metadata {
-        Metadata {
-            ino: self.ino,
-            kind: NodeKind::Dir,
-            size: 0,
-        }
-    }
-
-    fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
-        critical_section::with(|cs| {
-            self.entries
-                .borrow(cs)
-                .borrow()
-                .get(name)
-                .cloned()
-                .ok_or(VfsError::NoEntry)
-        })
-    }
-
-    fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
-        critical_section::with(|cs| {
-            Ok(self
-                .entries
-                .borrow(cs)
-                .borrow()
-                .keys()
-                .map(|name| (name.clone(), NodeKind::Dir))
-                .collect())
-        })
-    }
-}
-
-/// The devpts root: a `pts` directory, which is where the terminals would be.
-pub struct DevPts {
-    root: Arc<PtsDir>,
-}
+/// The devpts root: the dynamic pairs' slaves, by number.
+pub struct DevPts;
 
 impl DevPts {
     pub fn new() -> Arc<DevPts> {
-        let root = PtsDir::new(1);
-        let _pts = root.add_dir("pts", 2);
-        Arc::new(DevPts { root })
+        Arc::new(DevPts)
     }
 }
 
-/// How many terminal pairs are open, for `/proc/sys/kernel/pty/nr`.
-///
-/// Zero, and honestly so: there is no terminal to open yet. Reporting a
-/// number that matched `max` would tell a library the pty pool was exhausted
-/// and make it refuse to allocate one, which is a worse answer than "none are
-/// in use" - the second is true, and the first is a lie that reads as a limit.
-pub fn open_count() -> usize {
-    0
+impl Default for DevPts {
+    fn default() -> DevPts {
+        DevPts
+    }
 }
 
 impl FileSystem for DevPts {
     fn root(&self) -> Arc<dyn Inode> {
-        self.root.clone()
+        Arc::new(PtsRoot)
     }
 
     fn name(&self) -> &'static str {
@@ -111,19 +44,77 @@ impl FileSystem for DevPts {
     }
 }
 
+/// The directory itself. Every lookup goes to the pair registry, so a slave
+/// exists here exactly as long as its pair does - which is what makes the
+/// `posix_openpt` → `TIOCGPTN` → `open("/dev/pts/N")` sequence meaningful.
+struct PtsRoot;
+
+impl Inode for PtsRoot {
+    fn metadata(&self) -> super::Metadata {
+        super::Metadata {
+            ino: 1,
+            kind: NodeKind::Dir,
+            size: 0,
+        }
+    }
+
+    fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
+        let number: u32 = name.parse().map_err(|_| super::VfsError::NoEntry)?;
+        let pty = super::pty::lookup(number).ok_or(super::VfsError::NoEntry)?;
+        Ok(PtySlave::new(pty) as Arc<dyn Inode>)
+    }
+
+    fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
+        Ok(super::pty::pairs()
+            .iter()
+            .filter(|pty| pty.slave_dev_id().0 != 4)
+            .map(|pty| (alloc::format!("{}", pty.number()), NodeKind::CharDev))
+            .collect())
+    }
+}
+
+/// How many terminal pairs are open, for `/proc/sys/kernel/pty/nr`.
+pub fn open_count() -> usize {
+    super::pty::open_count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_tree_has_the_directory_terminals_would_live_in() {
+    fn the_tree_lists_dynamic_pairs_and_nothing_else() {
+        let pty = crate::vfs::pty::allocate(800, (136, 800));
+        let _ = pty; // minted; devpts reads the registry
         let fs = DevPts::new();
-        let pts = fs.root().lookup("pts").expect("/dev/pts");
-        assert_eq!(pts.metadata().kind, NodeKind::Dir);
+        let listed = fs.root().read_dir().unwrap();
         assert!(
-            pts.read_dir().unwrap().is_empty(),
-            "no terminal pairs exist to list"
+            listed
+                .iter()
+                .any(|(name, kind)| { name == "800" && *kind == NodeKind::CharDev }),
+            "the dynamic pair is listed by its number: {listed:?}"
         );
-        assert_eq!(fs.name(), "devpts");
+        // The virtual consoles are not here: they are /dev/ttyN, and a
+        // second name for the same terminal would break ttyname(3)'s walk.
+        assert!(
+            !listed.iter().any(|(name, _)| name == "1"),
+            "the virtual consoles have their own names in /dev"
+        );
+    }
+
+    #[test]
+    fn a_lookup_by_number_hands_back_a_terminal() {
+        crate::vfs::pty::allocate(801, (136, 801));
+        let slave = DevPts::new().root().lookup("801").unwrap();
+        assert_eq!(slave.metadata().kind, NodeKind::CharDev);
+        assert!(slave.as_tty().is_some(), "the slave is a real terminal");
+        assert_eq!(slave.rdev(), Some((136, 801)));
+        assert!(DevPts::new().root().lookup("99999").is_err());
+        assert!(DevPts::new().root().lookup("pts").is_err());
+    }
+
+    #[test]
+    fn the_filesystem_introduces_itself_as_devpts() {
+        assert_eq!(DevPts::new().name(), "devpts");
     }
 }

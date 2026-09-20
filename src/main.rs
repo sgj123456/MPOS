@@ -101,6 +101,10 @@ pub extern "C" fn _start(handoff: *const boot::handoff::Handoff) -> ! {
         stats.total,
         stats.total * PAGE_SIZE / MIB
     );
+    // Logging comes up as soon as the heap does, because the subscriber it
+    // installs allocates and the level it prints at is read from the command
+    // line. Everything after this point is worth being able to turn on or off.
+    mpos::logging::init();
 
     kernel_main(&info);
     // The system never stops booting: `kernel_main` ends parked in the boot
@@ -193,8 +197,7 @@ fn check_boot_stack(info: &BootInfo, when: &str) {
     }
     let canary = unsafe { core::ptr::read_volatile(base as *const u64) };
     assert_eq!(
-        canary,
-        BOOT_STACK_CANARY,
+        canary, BOOT_STACK_CANARY,
         "the boot stack ran off its bottom by {when}: the canary at {base:#x} is \
          {canary:#x}, not {BOOT_STACK_CANARY:#x}. The loader gave it 64 pages; a \
          build that needs more says so here rather than as a #GP on a selector \
@@ -1333,6 +1336,11 @@ fn handoff_to_init(info: &BootInfo) {
 
     sched::discard_exit_code(pid);
 
+    // The mux owns the serial input from here on: every byte typed at COM1
+    // belongs to the active virtual console, and the six consoles' output is
+    // carried back over the same wire. It goes up before the receiver is
+    // enabled, so no keystroke can arrive with nowhere to go.
+    vfs::vcmux::init();
     drivers::serial::enable_rx();
     // init forks, execve's the shell in the child, and waits. So a child
     // appearing under init is exactly the "the shell is up" signal - and init

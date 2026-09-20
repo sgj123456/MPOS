@@ -245,6 +245,13 @@ pub const LINKAT: u64 = 265;
 pub const TIME: u64 = 201;
 /// `times(2)`: this process's CPU time, in clock ticks.
 pub const TIMES: u64 = 100;
+/// `ptrace(2)`: one task observing and steering another. This is the whole of
+/// what a debugger, a tracer or an `strace` is built on.
+pub const PTRACE: u64 = 101;
+/// `process_vm_readv(2)` / `process_vm_writev(2)`: bulk cross-process memory
+/// access, named by iovec pairs rather than one word per call.
+pub const PROCESS_VM_READV: u64 = 310;
+pub const PROCESS_VM_WRITEV: u64 = 311;
 /// `getrusage(2)`: resource use for self or for reaped children.
 pub const GETRUSAGE: u64 = 98;
 /// `clock_getres(2)`: the resolution a clock can actually deliver.
@@ -268,6 +275,161 @@ pub const GET_ROBUST_LIST: u64 = 274;
 /// `membarrier(2)`: a memory barrier across the machine. Single core, so
 /// the barrier is what a compiler fence already gives.
 pub const MEMBARRIER: u64 = 324;
+
+// --- the POSIX completion set ----------------------------------------------
+//
+// The calls below are the ones a Linux table has numbers for and this
+// kernel did not answer: the epoll and timerfd subsystems, the *at
+// relatives and modern forms of the file calls, and the classic POSIX
+// set - identity, scheduling, signals, memory advice - that a libc probes
+// on its way through anything. Every number is the x86_64 one; every one
+// is pinned in the tests below against the kernel's table.
+
+/// `epoll_create(2)`: the original spelling. The size argument is ignored
+/// (and has been since Linux 2.6.8) but must be positive.
+pub const EPOLL_CREATE: u64 = 213;
+/// `epoll_create1(2)`: the flag-taking spelling every libc makes.
+pub const EPOLL_CREATE1: u64 = 291;
+/// `epoll_ctl(2)`: add, change or drop one entry of an interest list.
+pub const EPOLL_CTL: u64 = 233;
+/// `epoll_wait(2)`: collect the events of an interest list.
+pub const EPOLL_WAIT: u64 = 232;
+/// `epoll_pwait(2)`: the wait with a signal mask swapped in.
+pub const EPOLL_PWAIT: u64 = 281;
+/// `epoll_pwait2(2)`: the pwait pair's nanosecond-timeout spelling.
+pub const EPOLL_PWAIT2: u64 = 441;
+/// `timerfd_create(2)`: a timer that reports its expirations through a
+/// descriptor - the wait `systemd`'s timer units and every poll loop with
+/// a deadline are built on.
+pub const TIMERFD_CREATE: u64 = 283;
+/// `timerfd_settime(2)`: arm, re-arm or disarm one.
+pub const TIMERFD_SETTIME: u64 = 286;
+/// `timerfd_gettime(2)`: what is left of the current span, and the interval.
+pub const TIMERFD_GETTIME: u64 = 287;
+/// `fallocate(2)`: arrange a file's storage before writing it.
+pub const FALLOCATE: u64 = 285;
+/// `copy_file_range(2)`: a copy the kernel makes without the caller's
+/// buffers in the middle.
+pub const COPY_FILE_RANGE: u64 = 326;
+/// `preadv2(2)` / `pwritev2(2)`: the vectored pair at a position, with
+/// the RWF_* advice words.
+pub const PREADV2: u64 = 327;
+pub const PWRITEV2: u64 = 328;
+/// `openat2(2)`: openat with the extensible `struct open_how`.
+pub const OPENAT2: u64 = 437;
+/// `faccessat2(2)`: the access check with the flags the original could
+/// not take.
+pub const FACCESSAT2: u64 = 439;
+/// `creat(2)`: open, spelled the way the 1970s spelled it.
+pub const CREAT: u64 = 85;
+/// `utime(2)`: the seconds-only spelling of the timestamps call.
+pub const UTIME: u64 = 132;
+/// `fchmodat(2)`: the permission bits, relative to a dirfd.
+pub const FCHMODAT: u64 = 268;
+/// `mknodat(2)`: create a node, relative to a dirfd.
+pub const MKNODAT: u64 = 259;
+/// `futimesat(2)`: the timestamps call with the dirfd the future took.
+pub const FUTIMESAT: u64 = 261;
+/// `readahead(2)`: a promise that the range is coming.
+pub const READAHEAD: u64 = 187;
+/// `splice(2)`: move bytes between a pipe and anything else.
+pub const SPLICE: u64 = 275;
+/// `syncfs(2)`: flush the filesystem one descriptor belongs to.
+pub const SYNCFS: u64 = 306;
+/// `syslog(2)` / `klogctl(3)`: the kernel log ring, `dmesg`'s and a
+/// `klogd`'s door.
+pub const SYSLOG: u64 = 103;
+/// `setdomainname(2)`: the name `uname -n`'s neighbour reports.
+pub const SETDOMAINNAME: u64 = 171;
+/// `setreuid(2)` / `setregid(2)`: the real-and-effective pair, where -1
+/// names the id that stays.
+pub const SETREUID: u64 = 113;
+pub const SETREGID: u64 = 114;
+/// `setresuid(2)` / `getresuid(2)` and the gid pair: the real, effective
+/// and saved ids, three words in and three out.
+pub const SETRESUID: u64 = 117;
+pub const GETRESUID: u64 = 118;
+pub const SETRESGID: u64 = 119;
+pub const GETRESGID: u64 = 120;
+/// `setfsuid(2)` / `setfsgid(2)`: the filesystem ids. The answer is
+/// always the previous one, successful or not - the man page's own
+/// observation, and the only shape a caller can probe with.
+pub const SETFSUID: u64 = 122;
+pub const SETFSGID: u64 = 123;
+/// `capget(2)` / `capset(2)`: the capability state.
+pub const CAPGET: u64 = 125;
+pub const CAPSET: u64 = 126;
+/// `rt_sigpending(2)`: which signals are waiting.
+pub const RT_SIGPENDING: u64 = 127;
+/// `rt_sigqueueinfo(2)`: `kill` with a `siginfo_t` attached.
+pub const RT_SIGQUEUEINFO: u64 = 129;
+/// `rt_sigsuspend(2)`: swap the mask and wait for a signal outside it.
+pub const RT_SIGSUSPEND: u64 = 130;
+/// `pause(2)`: the original "wait for a signal" - a sleep that only a
+/// delivery ends.
+pub const PAUSE: u64 = 34;
+/// `tgkill(2)`: a signal to one thread, named by its group and itself.
+pub const TGKILL: u64 = 234;
+/// `personality(2)`: the process's execution environment word. The only
+/// value this kernel has is the default one.
+pub const PERSONALITY: u64 = 135;
+/// `getpriority(2)` / `setpriority(2)`: the nice value, by process,
+/// group or user.
+pub const GETPRIORITY: u64 = 140;
+pub const SETPRIORITY: u64 = 141;
+/// The `sched_(get|set)(param|scheduler)` family: the scheduling policy
+/// and its parameter, where this kernel has one policy and the zero
+/// parameter it takes.
+pub const SCHED_SETPARAM: u64 = 142;
+pub const SCHED_GETPARAM: u64 = 143;
+pub const SCHED_SETSCHEDULER: u64 = 144;
+pub const SCHED_GETSCHEDULER: u64 = 145;
+/// `sched_get_priority_max(2)` / `sched_get_priority_min(2)`: the
+/// priority range a policy's band allows.
+pub const SCHED_GET_PRIORITY_MAX: u64 = 146;
+pub const SCHED_GET_PRIORITY_MIN: u64 = 147;
+/// `sched_rr_get_interval(2)`: the round-robin slice, as a timespec.
+pub const SCHED_RR_GET_INTERVAL: u64 = 148;
+/// `sched_setattr(2)` / `sched_getattr(2)`: the extensible scheduling
+/// attributes - the EDF/DEADLINE-shaped successor to the family above.
+pub const SCHED_SETATTR: u64 = 314;
+pub const SCHED_GETATTR: u64 = 315;
+/// `msync(2)`: a file mapping's pages back to the file they came from.
+/// The mappings here are private copies made at map time, so the sync is
+/// the range check and nothing more.
+pub const MSYNC: u64 = 26;
+/// `mincore(2)`: which pages of a range are resident. Everything this
+/// kernel maps is resident - it reads file pages in eagerly - so the
+/// answer is a vec of ones and a success.
+pub const MINCORE: u64 = 27;
+/// The `mlock(2)` family: pages pinned into memory. Nothing here pages
+/// out, so every page is already pinned and the calls are their
+/// validations and a success.
+pub const MLOCK: u64 = 149;
+pub const MUNLOCK: u64 = 150;
+pub const MLOCKALL: u64 = 151;
+pub const MUNLOCKALL: u64 = 152;
+/// `mlock2(2)`: the mlock pair's flag-taking form.
+pub const MLOCK2: u64 = 325;
+/// `vhangup(2)`: virtually hang up the controlling terminal. There is no
+/// controlling-terminal bookkeeping to hang up.
+pub const VHANGUP: u64 = 153;
+/// `getcpu(2)`: which processor and node the caller runs on.
+pub const GETCPU: u64 = 309;
+/// `settimeofday(2)` / `clock_settime(2)`: set the wall clock.
+pub const SETTIMEOFDAY: u64 = 164;
+pub const CLOCK_SETTIME: u64 = 227;
+/// `unshare(2)` / `setns(2)`: enter and leave namespaces. This kernel
+/// has one of each.
+pub const UNSHARE: u64 = 272;
+pub const SETNS: u64 = 308;
+/// `seccomp(2)`: the secure-computing mode.
+pub const SECCOMP: u64 = 317;
+/// `accept4(2)`: accept with flags. The flag-less original is 43.
+pub const ACCEPT4: u64 = 288;
+/// `sendmmsg(2)` / `recvmmsg(2)`: the multiple-message socket pair.
+pub const SENDMMSG: u64 = 307;
+pub const RECVMMSG: u64 = 299;
 
 // `clone(2)` flag bits, as the Linux x86_64 ABI numbers them. Each one names a
 // part of the caller that the child **shares** instead of copying; a zero flag
@@ -396,6 +558,9 @@ mod tests {
         assert_eq!(GETRUSAGE, 98);
         assert_eq!(SYSINFO, 99);
         assert_eq!(TIMES, 100);
+        assert_eq!(PTRACE, 101);
+        assert_eq!(PROCESS_VM_READV, 310);
+        assert_eq!(PROCESS_VM_WRITEV, 311);
         assert_eq!(GETUID, 102);
         assert_eq!(GETGID, 104);
         assert_eq!(SETUID, 105);
@@ -544,5 +709,96 @@ mod tests {
             CLEANUP_AFTER_KTHREAD >= 256,
             "inside the mark_missing window"
         );
+    }
+
+    /// The POSIX completion set, pinned against the kernel's x86_64 table
+    /// one assertion per name - same rule as the table above, applied to
+    /// the calls that complete the surface: the epoll and timerfd
+    /// subsystems, the *at and modern forms of the file calls, and the
+    /// classic set a libc probes on its way through anything.
+    #[test]
+    fn posix_completion_numbers_match_the_x86_64_table() {
+        // The epoll family: the original create, the flag-taking one, and
+        // the wait in all three spellings.
+        assert_eq!(EPOLL_CREATE, 213);
+        assert_eq!(EPOLL_CREATE1, 291);
+        assert_eq!(EPOLL_CTL, 233);
+        assert_eq!(EPOLL_WAIT, 232);
+        assert_eq!(EPOLL_PWAIT, 281);
+        assert_eq!(EPOLL_PWAIT2, 441);
+        // The timerfd triple.
+        assert_eq!(TIMERFD_CREATE, 283);
+        assert_eq!(TIMERFD_SETTIME, 286);
+        assert_eq!(TIMERFD_GETTIME, 287);
+        // File I/O: allocate, copy, the vectored pair with advice, the
+        // extensible open, and the *at and legacy spellings.
+        assert_eq!(FALLOCATE, 285);
+        assert_eq!(COPY_FILE_RANGE, 326);
+        assert_eq!(PREADV2, 327);
+        assert_eq!(PWRITEV2, 328);
+        assert_eq!(OPENAT2, 437);
+        assert_eq!(FACCESSAT2, 439);
+        assert_eq!(CREAT, 85);
+        assert_eq!(UTIME, 132);
+        assert_eq!(FCHMODAT, 268);
+        assert_eq!(MKNODAT, 259);
+        assert_eq!(FUTIMESAT, 261);
+        assert_eq!(READAHEAD, 187);
+        assert_eq!(SPLICE, 275);
+        assert_eq!(SYNCFS, 306);
+        assert_eq!(SYSLOG, 103);
+        assert_eq!(SETDOMAINNAME, 171);
+        // Identity: the re, res and fs spellings, and the capabilities.
+        assert_eq!(SETREUID, 113);
+        assert_eq!(SETREGID, 114);
+        assert_eq!(SETRESUID, 117);
+        assert_eq!(GETRESUID, 118);
+        assert_eq!(SETRESGID, 119);
+        assert_eq!(GETRESGID, 120);
+        assert_eq!(SETFSUID, 122);
+        assert_eq!(SETFSGID, 123);
+        assert_eq!(CAPGET, 125);
+        assert_eq!(CAPSET, 126);
+        // Signals: pending, queued, suspended, paused, and one thread's.
+        assert_eq!(RT_SIGPENDING, 127);
+        assert_eq!(RT_SIGQUEUEINFO, 129);
+        assert_eq!(RT_SIGSUSPEND, 130);
+        assert_eq!(PAUSE, 34);
+        assert_eq!(TGKILL, 234);
+        // The personality word and the nice value.
+        assert_eq!(PERSONALITY, 135);
+        assert_eq!(GETPRIORITY, 140);
+        assert_eq!(SETPRIORITY, 141);
+        // The scheduling family, classic and extensible.
+        assert_eq!(SCHED_SETPARAM, 142);
+        assert_eq!(SCHED_GETPARAM, 143);
+        assert_eq!(SCHED_SETSCHEDULER, 144);
+        assert_eq!(SCHED_GETSCHEDULER, 145);
+        assert_eq!(SCHED_GET_PRIORITY_MAX, 146);
+        assert_eq!(SCHED_GET_PRIORITY_MIN, 147);
+        assert_eq!(SCHED_RR_GET_INTERVAL, 148);
+        assert_eq!(SCHED_SETATTR, 314);
+        assert_eq!(SCHED_GETATTR, 315);
+        // Memory: sync, residency, and the lock family.
+        assert_eq!(MSYNC, 26);
+        assert_eq!(MINCORE, 27);
+        assert_eq!(MLOCK, 149);
+        assert_eq!(MUNLOCK, 150);
+        assert_eq!(MLOCKALL, 151);
+        assert_eq!(MUNLOCKALL, 152);
+        assert_eq!(MLOCK2, 325);
+        // The machine: which cpu, the wall clock, and the names a
+        // namespace would need.
+        assert_eq!(VHANGUP, 153);
+        assert_eq!(GETCPU, 309);
+        assert_eq!(SETTIMEOFDAY, 164);
+        assert_eq!(CLOCK_SETTIME, 227);
+        assert_eq!(UNSHARE, 272);
+        assert_eq!(SETNS, 308);
+        assert_eq!(SECCOMP, 317);
+        // The socket trio.
+        assert_eq!(ACCEPT4, 288);
+        assert_eq!(SENDMMSG, 307);
+        assert_eq!(RECVMMSG, 299);
     }
 }

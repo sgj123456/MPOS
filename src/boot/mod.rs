@@ -6,7 +6,10 @@
 //! here. That is the seam future ports (riscv64 via OpenSBI+DTB, aarch64) plug
 //! into.
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+// The kernel build is the only one that needs this, and the host cannot
+// provide the loader's record - but the layout it declares is a promise to
+// another crate, so `test` keeps it compiled where the tests can pin it.
+#[cfg(all(any(target_os = "none", test), target_arch = "x86_64"))]
 pub mod handoff;
 
 use core::fmt;

@@ -154,23 +154,33 @@ impl CharDevice for RandomDev {
 /// because naming a device is the driver's decision, not a caller's.
 pub fn standard_devfs() -> Arc<DevFs> {
     let dev = DevFs::new();
-    // The tty names are all doors into the one line discipline, registered as
-    // the line discipline's own inode: a getty's `TIOCSCTTY`, a shell's
-    // `TCGETS` and every `isatty` ask the node itself, and a bare
-    // character-device wrapper cannot answer any of them. `console` stays a
-    // bare device - writes go out, nothing comes back. `ttyS0` is the serial
-    // port's traditional name spelled as a second path to the same line, and
-    // tty1-6 are the virtual consoles a stock /etc/inittab respawns gettys
-    // on - without those names, busybox init's respawn entries fail six times
-    // and back off for five minutes, and the serial port sits with no login
-    // prompt on it at all.
+    // The console names are doors into the console tty: a getty's `TIOCSCTTY`,
+    // a shell's `TCGETS` and every `isatty` ask the node itself, and a bare
+    // character-device wrapper cannot answer any of them. `ttyS0` is the
+    // serial port's name - the kernel log's wire, and the kernel's own
+    // standard descriptors. `console` stays a bare device - writes go out,
+    // nothing comes back. `tty` is the odd one: not a device at all but the
+    // opening process's controlling terminal, which is what the name has
+    // meant since Unix had job control. Every open of it resolves through the
+    // caller's own `TIOCSCTTY` binding, and a process that has acquired none
+    // is refused with `ENXIO` rather than handed someone else's terminal -
+    // which is what keeps a shell's job-control probe honest about whether it
+    // is in the foreground.
     let tty = crate::vfs::tty::global();
-    dev.register_node("tty", tty.clone());
     dev.register_node("ttyS0", tty.clone());
-    for index in 1..=6 {
-        dev.register_node(&alloc::format!("tty{index}"), tty.clone());
-    }
+    dev.register_node("tty", Arc::new(crate::vfs::tty::ControllingTty));
     dev.register("console", Arc::new(ConsoleDev));
+    // The virtual consoles: the slave ends of the pty pairs minted at boot.
+    // A getty respawns on `tty1`..`tty6` the way a stock inittab asks, and
+    // the console multiplexer holds the masters - typed bytes go to the
+    // active console's slave, what its shell prints comes back over the one
+    // serial wire.
+    for index in 1..=crate::vfs::pty::VC_COUNT {
+        dev.register_node(
+            &alloc::format!("tty{index}"),
+            crate::vfs::pty::vc(index).slave().clone(),
+        );
+    }
     // The mountpoints an init expects `/dev` to carry: devpts goes on
     // /dev/pts, a tmpfs on /dev/shm, and both names have to be there to be
     // mounted on.
@@ -192,11 +202,10 @@ pub fn standard_devfs() -> Arc<DevFs> {
     dev.register_symlink("stdin", "/proc/self/fd/0");
     dev.register_symlink("stdout", "/proc/self/fd/1");
     dev.register_symlink("stderr", "/proc/self/fd/2");
-    // The pty master's traditional name. A real one hands out slave pairs
-    // on /dev/pts; this kernel's devpts has no master to offer yet, but the
-    // name exists as a character device so an init's `[ -c /dev/ptmx ]`
-    // stops falling through to mknod.
-    dev.register("ptmx", Arc::new(NullDev));
+    // The pty master's traditional name. Every open mints a pty pair and
+    // hands back the master, so a login's `posix_openpt`/`grantpt`/
+    // `unlockpt`/`open("/dev/pts/N")` sequence works by the book.
+    dev.register_node("ptmx", Arc::new(crate::vfs::pty::Ptmx));
     dev.register("zero", Arc::new(ZeroDev));
     dev.register("random", Arc::new(RandomDev));
     dev.register("urandom", Arc::new(RandomDev));

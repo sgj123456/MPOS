@@ -139,7 +139,8 @@ pub fn init() {
 pub fn set_kernel_stack(top: usize) {
     unsafe {
         debug_assert_eq!(
-            core::ptr::addr_of!((*TSS.0.get()).privilege_stack_table) as usize - TSS.0.get() as usize,
+            core::ptr::addr_of!((*TSS.0.get()).privilege_stack_table) as usize
+                - TSS.0.get() as usize,
             RSP0_OFFSET,
             "the RSP0 byte offset in the packed TSS moved"
         );
@@ -236,9 +237,9 @@ pub fn user_code_star_base() -> u64 {
 /// values `user_selectors` hands out - read through here rather than spelled as
 /// literals so a GDT reshuffle cannot leave the check asserting a stale number.
 pub fn user_code() -> u64 {
-    user_selectors().0 .0 as u64
+    user_selectors().0.0 as u64
 }
 
 pub fn user_data() -> u64 {
-    user_selectors().1 .0 as u64
+    user_selectors().1.0 as u64
 }

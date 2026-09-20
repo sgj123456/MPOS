@@ -546,7 +546,14 @@ impl Vfs {
             if let Some(entry) = mounts
                 .iter()
                 .find(|m| Arc::ptr_eq(&m.root, &new_root_inode))
-                .map(|m| (m.fstype.clone(), m.source.clone(), m.read_only, m.fs.clone()))
+                .map(|m| {
+                    (
+                        m.fstype.clone(),
+                        m.source.clone(),
+                        m.read_only,
+                        m.fs.clone(),
+                    )
+                })
             {
                 *self.root_fstype.borrow(cs).borrow_mut() = Some(entry.0);
                 *self.root_source.borrow(cs).borrow_mut() = Some(entry.1);
@@ -1153,7 +1160,7 @@ pub fn resolve_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>
 mod tests {
     use alloc::sync::Arc;
 
-    use super::Vfs;
+    use super::{Vfs, split_last};
     use crate::vfs::ramfs::RamFs;
     use crate::vfs::{FileSystem, NodeKind, VfsError};
 
@@ -1312,6 +1319,86 @@ mod tests {
             parent.lookup(&name).unwrap().readlink().err(),
             Some(VfsError::Invalid)
         );
+    }
+
+    /// The parent/name split every create and remove goes through. A trailing
+    /// slash is not a name, and a bare `/` has no name to split off at all -
+    /// which comes out as the caller's own directory and an empty name, the
+    /// one shape no caller actually asks for.
+    #[test]
+    fn split_last_names_the_parent_and_the_last_name() {
+        assert_eq!(split_last("/a/b"), ("/a", "b"));
+        assert_eq!(split_last("/a"), ("/", "a"));
+        assert_eq!(split_last("/a/b/"), ("/a", "b"));
+        assert_eq!(split_last("/a//b"), ("/a/", "b"));
+        assert_eq!(split_last("/"), (".", ""));
+    }
+
+    /// `statfs(2)` and `stat`'s `st_dev` both ask which filesystem serves a
+    /// path, and the answer is the *deepest* mountpoint that prefixes it -
+    /// `/mnt/usb/f` is served by the filesystem on `/mnt/usb`, not the one on
+    /// `/mnt`, and not the root.
+    #[test]
+    fn the_deepest_mountpoint_serves_the_path_under_it() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        root.create("mnt", NodeKind::Dir).unwrap();
+        vfs.mount("/mnt", &*RamFs::new()).unwrap();
+        // `usb` is made *inside* the mount, which is the only place it can be
+        // seen once the filesystem is on top of `/mnt`.
+        let mnt = vfs.resolve("/mnt").unwrap();
+        mnt.create("usb", NodeKind::Dir).unwrap();
+        vfs.mount("/mnt/usb", &*RamFs::new()).unwrap();
+
+        // Ids are handed out in mount order, and 0 is the root's.
+        assert_eq!(vfs.fs_of_path("/mnt/usb/f").0, 2);
+        assert_eq!(vfs.fs_of_path("/mnt/usb").0, 2);
+        assert_eq!(vfs.fs_of_path("/mnt/f").0, 1);
+        assert_eq!(vfs.fs_of_path("/").0, 0);
+        assert_eq!(vfs.fs_of_path("/elsewhere").0, 0);
+    }
+
+    /// The prefix has to end on a name boundary: `/mntx` is a sibling of
+    /// `/mnt`, not something under it, and a match that stopped at the string
+    /// would report every filesystem as serving its neighbours' names.
+    #[test]
+    fn a_mountpoint_does_not_serve_a_name_it_only_prefixes() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        root.create("mnt", NodeKind::Dir).unwrap();
+        root.create("mntx", NodeKind::Dir).unwrap();
+        vfs.mount("/mnt", &*RamFs::new()).unwrap();
+
+        assert_eq!(vfs.fs_of_path("/mnt").0, 1);
+        assert_eq!(vfs.fs_of_path("/mnt/f").0, 1);
+        assert_eq!(vfs.fs_of_path("/mntx").0, 0);
+        assert_eq!(vfs.fs_of_path("/mntx/f").0, 0);
+    }
+
+    /// The path is normalized before the match, so a spelling with `..` or a
+    /// doubled slash in it lands on the same filesystem as the plain one -
+    /// otherwise `statfs` would answer by how a program happened to write the
+    /// path rather than by where the file is.
+    #[test]
+    fn a_path_is_normalized_before_the_mountpoint_match() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        root.create("mnt", NodeKind::Dir).unwrap();
+        vfs.mount("/mnt", &*RamFs::new()).unwrap();
+
+        for spelling in [
+            "/mnt/f",
+            "/mnt//f",
+            "/mnt/./f",
+            "/other/../mnt/f",
+            "/mnt/f/",
+        ] {
+            assert_eq!(
+                vfs.fs_of_path(spelling).0,
+                1,
+                "{spelling} is served by /mnt"
+            );
+        }
     }
 }
 

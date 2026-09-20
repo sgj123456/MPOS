@@ -37,10 +37,30 @@ const CLASSES: usize = MAX_CLASS - MIN_CLASS + 1;
 /// A new run holds at least this many slots, and at least one page.
 const MIN_RUN_SLOTS: usize = 32;
 
-/// Over-sized allocations we can remember at once. Bounded because the table is
-/// a `static`; 128 concurrent multi-page allocations is far past what the kernel
-/// does before M9, when userspace memory stops going through here.
+/// Over-sized allocations we can remember at once.
+///
+/// This table is not on the path an over-sized allocation normally takes. A
+/// block from the frame allocator is page-aligned, and so is every alignment up
+/// to a page, so `align_up` moves the pointer only for an alignment *larger*
+/// than a page - and then the block start is no longer recoverable from the
+/// pointer, which is the whole reason `Large` exists. For everything else
+/// [`block_of`] derives the block from the layout and the table is not touched.
+///
+/// Keeping it that narrow matters more than the bound itself: a table is a
+/// resource that runs out, and an allocator whose worst failure is "bookkeeping
+/// full" fails at a moment a workload can choose. It was 128 for every
+/// allocation once, and `apk add` found the ceiling - a kernel panic reading
+/// `memory allocation of 8192 bytes failed` on a machine with 900 MB free.
 const MAX_LARGE: usize = 128;
+
+/// The block an over-sized allocation was carved from, and its order.
+///
+/// `None` when the pointer *is* the block: that holds for every alignment a
+/// page or smaller, because the frame allocator's blocks are page-aligned and a
+/// power-of-two alignment that divides a page cannot move the pointer.
+fn block_of(ptr: usize, layout: Layout) -> Option<(usize, usize)> {
+    (layout.align() <= PAGE_SIZE).then(|| (ptr, large_order(layout)))
+}
 
 fn class_size(class: usize) -> usize {
     1 << (class + MIN_CLASS)
@@ -104,6 +124,11 @@ struct Slab {
     counts: [usize; CLASSES],
     large: [Large; MAX_LARGE],
     large_count: usize,
+    /// The most `large_count` has ever held. Not needed to allocate anything -
+    /// it is the one number that tells a table-full failure apart from the
+    /// table simply doing its job, so it costs a word that is only spent on
+    /// the panic path.
+    high: usize,
     live: usize,
     cached: usize,
     mapped: usize,
@@ -116,6 +141,7 @@ impl Slab {
             counts: [0; CLASSES],
             large: [Large::EMPTY; MAX_LARGE],
             large_count: 0,
+            high: 0,
             live: 0,
             cached: 0,
             mapped: 0,
@@ -172,14 +198,29 @@ impl Slab {
     }
 
     fn alloc_large(&mut self, layout: Layout) -> *mut u8 {
-        if self.large_count == MAX_LARGE {
-            return ptr::null_mut();
-        }
         let order = large_order(layout);
         if order > MAX_ORDER {
             return ptr::null_mut();
         }
+        // Only an over-aligned request needs an entry, so only an over-aligned
+        // request can find the table full - and the check comes before the
+        // frames are taken, because a refusal that leaked them would be a
+        // second bug.
+        let over_aligned = layout.align() > PAGE_SIZE;
+        if over_aligned && self.large_count == MAX_LARGE {
+            crate::println!(
+                "heap: large table full ({} entries), {} bytes aligned {}",
+                MAX_LARGE,
+                layout.size(),
+                layout.align()
+            );
+            return ptr::null_mut();
+        }
         let Some(block) = alloc_pages(order) else {
+            crate::println!(
+                "heap: no frames left for order {order} ({} bytes requested)",
+                layout.size()
+            );
             return ptr::null_mut();
         };
 
@@ -190,12 +231,15 @@ impl Slab {
             "aligned pointer escaped its block"
         );
 
-        self.large[self.large_count] = Large {
-            ptr: aligned,
-            block,
-            order,
-        };
-        self.large_count += 1;
+        if over_aligned {
+            self.large[self.large_count] = Large {
+                ptr: aligned,
+                block,
+                order,
+            };
+            self.large_count += 1;
+            self.high = self.high.max(self.large_count);
+        }
         self.mapped += bytes;
         self.live += bytes;
         aligned as *mut u8
@@ -210,6 +254,16 @@ impl Slab {
             let size = class_size(class);
             self.live -= size;
             self.cached += size;
+            return;
+        }
+
+        // The common case, and the reason the table above cannot be filled by
+        // a workload: nothing was recorded, so there is nothing to look up.
+        if let Some((block, order)) = block_of(ptr, layout) {
+            let bytes = PAGE_SIZE << order;
+            self.mapped -= bytes;
+            self.live -= bytes;
+            free_pages(block, order);
             return;
         }
 

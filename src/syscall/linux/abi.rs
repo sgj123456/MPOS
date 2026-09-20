@@ -86,6 +86,20 @@ pub(super) const F_SETFL: usize = 4;
 pub(super) const F_GETLK: usize = 5;
 pub(super) const F_SETLK: usize = 6;
 pub(super) const F_SETLKW: usize = 7;
+/// `F_DUPFD` that flags the *new* descriptor `FD_CLOEXEC` in one call - what a
+/// modern libc asks for instead of the `F_DUPFD` + `F_SETFD` pair (`musl`
+/// reaches for it on every pipe-protected spawn). It does not sit with the
+/// commands above: the kernel numbers the Linux-specific ones from
+/// `F_LINUX_SPECIFIC_BASE` (1024), and this is the seventh of those.
+///
+/// ⚠️ Its value is load-bearing in a way the others' are not. `fs::fcntl`
+/// matches on this *name*, and a name that is not in scope in a `match`
+/// pattern is not a missing constant - it is a fresh **binding**, which
+/// matches every value. That is a catch-all in disguise: every `fcntl` command
+/// silently answered by the `dup` arm, and the only complaint is an
+/// `unreachable_patterns` warning on the arms *below* it, which a build that
+/// greps for `error` never shows. Hence the test that pins the value.
+pub(super) const F_DUPFD_CLOEXEC: usize = 1030;
 /// The one descriptor flag: the descriptor must not survive the next execve.
 pub(super) const FD_CLOEXEC: u32 = 1;
 
@@ -351,11 +365,11 @@ pub(crate) fn write_statx(
 /// The `d_type` byte a node kind becomes, in the `DT_*` numbering.
 pub(crate) fn dt_type_of(kind: NodeKind) -> u8 {
     match kind {
-        NodeKind::File => 8,      // DT_REG
-        NodeKind::Dir => 4,       // DT_DIR
-        NodeKind::CharDev => 2,   // DT_CHR
-        NodeKind::BlockDev => 6,  // DT_BLK
-        NodeKind::Symlink => 10,  // DT_LNK
+        NodeKind::File => 8,     // DT_REG
+        NodeKind::Dir => 4,      // DT_DIR
+        NodeKind::CharDev => 2,  // DT_CHR
+        NodeKind::BlockDev => 6, // DT_BLK
+        NodeKind::Symlink => 10, // DT_LNK
     }
 }
 
@@ -374,9 +388,9 @@ pub(crate) fn reclen_of(name_len: usize) -> usize {
 /// before byte 0, which is `EINVAL` rather than wrapping.
 pub(crate) fn lseek_target(cur: i64, size: i64, offset: i64, whence: i32) -> Option<i64> {
     let new_pos = match whence {
-        0 => Some(offset),                     // SEEK_SET
-        1 => cur.checked_add(offset),          // SEEK_CUR
-        2 => size.checked_add(offset),         // SEEK_END
+        0 => Some(offset),             // SEEK_SET
+        1 => cur.checked_add(offset),  // SEEK_CUR
+        2 => size.checked_add(offset), // SEEK_END
         _ => None,
     };
     match new_pos {
@@ -418,6 +432,288 @@ pub(crate) fn wait_status(code: isize) -> i32 {
     } else {
         // A normal exit: the low byte of the code, in bits 15:8.
         ((code & 0xff) << 8) as i32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ptrace(2): the request numbers, the options, and the shapes it reports
+// ---------------------------------------------------------------------------
+
+/// `ptrace(2)`'s request numbers, x86_64 column.
+///
+/// The low ones are the original pair-per-operation set and the `0x4200`s are
+/// the ones added later; both numbers are what a libc passes and neither is
+/// negotiable. Only the subset a tracer actually reaches is named here - the
+/// kernel answers `EIO` for the rest, which is Linux's answer for a request it
+/// does not know.
+pub(crate) const PTRACE_TRACEME: usize = 0;
+pub(crate) const PTRACE_PEEKTEXT: usize = 1;
+pub(crate) const PTRACE_PEEKDATA: usize = 2;
+pub(crate) const PTRACE_PEEKUSER: usize = 3;
+pub(crate) const PTRACE_POKETEXT: usize = 4;
+pub(crate) const PTRACE_POKEDATA: usize = 5;
+pub(crate) const PTRACE_POKEUSER: usize = 6;
+pub(crate) const PTRACE_CONT: usize = 7;
+pub(crate) const PTRACE_KILL: usize = 8;
+pub(crate) const PTRACE_SINGLESTEP: usize = 9;
+pub(crate) const PTRACE_GETREGS: usize = 12;
+pub(crate) const PTRACE_SETREGS: usize = 13;
+pub(crate) const PTRACE_GETFPREGS: usize = 14;
+pub(crate) const PTRACE_SETFPREGS: usize = 15;
+pub(crate) const PTRACE_ATTACH: usize = 16;
+pub(crate) const PTRACE_DETACH: usize = 17;
+pub(crate) const PTRACE_SYSCALL: usize = 24;
+pub(crate) const PTRACE_SETOPTIONS: usize = 0x4200;
+pub(crate) const PTRACE_GETEVENTMSG: usize = 0x4201;
+pub(crate) const PTRACE_GETSIGINFO: usize = 0x4202;
+pub(crate) const PTRACE_SETSIGINFO: usize = 0x4203;
+pub(crate) const PTRACE_GETREGSET: usize = 0x4204;
+pub(crate) const PTRACE_SETREGSET: usize = 0x4205;
+pub(crate) const PTRACE_GET_SYSCALL_INFO: usize = 0x420E;
+
+/// `PTRACE_O_*`: what the tracer asked to be told about.
+///
+/// `TRACESYSGOOD` is the one that matters most in practice, and for a
+/// cosmetic-looking reason that is not cosmetic: without it a syscall stop is
+/// reported as a plain `SIGTRAP`, which a debugger cannot tell from a
+/// breakpoint or a real `SIGTRAP` arriving. With it the reported signal is
+/// `SIGTRAP | 0x80`, which cannot be anything else.
+pub(crate) const PTRACE_O_TRACESYSGOOD: usize = 0x0000_0001;
+pub(crate) const PTRACE_O_TRACEFORK: usize = 0x0000_0002;
+pub(crate) const PTRACE_O_TRACEVFORK: usize = 0x0000_0004;
+pub(crate) const PTRACE_O_TRACECLONE: usize = 0x0000_0008;
+pub(crate) const PTRACE_O_TRACEEXEC: usize = 0x0000_0010;
+pub(crate) const PTRACE_O_TRACEVFORKDONE: usize = 0x0000_0020;
+pub(crate) const PTRACE_O_TRACEEXIT: usize = 0x0000_0040;
+pub(crate) const PTRACE_O_EXITKILL: usize = 0x0010_0000;
+
+/// The bit `TRACESYSGOOD` sets in the reported stop signal.
+pub(crate) const SYSCALL_TRAP: u8 = 0x80;
+
+/// `PTRACE_EVENT_*`: the value in bits 23:16 of a `SIGTRAP` stop's status
+/// word. Zero means "an ordinary stop", which is every syscall boundary and
+/// every signal delivery.
+pub(crate) const PTRACE_EVENT_NONE: u32 = 0;
+
+/// The stop a tracee makes to announce a child it has just created.
+///
+/// Which of the three it is comes from the flags the child was asked for, not
+/// from the call: `fork`, `vfork` and a thread-creating `clone` are one syscall
+/// with different flags, and a tracer that asked about threads but not about
+/// processes needs to be told which one it got. At this stop
+/// `PTRACE_GETEVENTMSG` answers the **new child's pid**.
+pub(crate) const PTRACE_EVENT_FORK: u32 = 1;
+pub(crate) const PTRACE_EVENT_VFORK: u32 = 2;
+pub(crate) const PTRACE_EVENT_CLONE: u32 = 3;
+
+/// The exec event: raised on the far side of an `execve` that succeeded. See
+/// `sched::exec_trap`. `PTRACE_GETEVENTMSG` answers the tid the task had
+/// *before* it exec'd at this stop, which is the question a tracer that
+/// reassembles a thread group after the leader exec'd is asking.
+pub(crate) const PTRACE_EVENT_EXEC: u32 = 4;
+
+/// The events this kernel accepts a name for and does not produce.
+///
+/// `VFORK_DONE` and `EXIT` are each a separate stop a tracer can ask to be told
+/// about with the matching `PTRACE_O_*`, and this kernel raises neither: an
+/// `EXIT` stop would be a second stop at the very end of a task's life, in the
+/// middle of the release path a terminating task is already inside, and
+/// `VFORK_DONE` needs a parent that is suspended for the child's benefit - which
+/// [`crate::sched::clone`] deliberately is not.
+///
+/// They are named rather than absent because `PTRACE_SETOPTIONS` refuses an
+/// option it cannot name, and a tracer that died of `EINVAL` because this
+/// kernel had never heard of `PTRACE_O_TRACEEXIT` would be worse served than one
+/// that asked and was quietly not told. The allowance lives in one module so
+/// that the set of "named but never produced" is one line to read.
+#[allow(dead_code)]
+pub(crate) mod unwatched_events {
+    pub(crate) const VFORK_DONE: u32 = 5;
+    pub(crate) const EXIT: u32 = 6;
+}
+
+/// `NT_PRSTATUS`, the register-set a `PTRACE_GETREGSET` asks for by name.
+pub(crate) const NT_PRSTATUS: usize = 1;
+
+/// The `wait(2)` option bits a tracer passes, beyond `WNOHANG`.
+///
+/// `__WALL` is the one `strace` waits with: it is documented as Linux-only and
+/// "do not use", and every tracer uses it anyway, because it is the only way
+/// to wait for a child that was not created with `SIGCHLD` as its exit signal.
+pub(crate) const WNOHANG: usize = 0x0000_0001;
+pub(crate) const WUNTRACED: usize = 0x0000_0002;
+pub(crate) const WCONTINUED: usize = 0x0000_0008;
+pub(crate) const __WNOTHREAD: usize = 0x2000_0000;
+pub(crate) const __WALL: usize = 0x4000_0000;
+pub(crate) const __WCLONE: usize = 0x8000_0000;
+
+/// The status word `WIFSTOPPED` decodes: `0x7f` in the low byte, the signal
+/// that caused the stop in bits 15:8, and a `PTRACE_EVENT_*` in bits 23:16.
+///
+/// The three fields share the word because the macros read it that way -
+/// `WSTOPSIG(w)` is `(w >> 8) & 0xff` and `WIFSTOPPED(w)` is
+/// `(w & 0xff) == 0x7f` - and a `ptrace` event is expressed as a `SIGTRAP`
+/// whose high byte carries the event number. Writing the fields anywhere else
+/// produces a status the libc decodes into a plausible, wrong answer.
+pub(crate) fn stop_status(sig: u8, event: u32) -> i32 {
+    0x7f | ((sig as i32) << 8) | ((event as i32) << 16)
+}
+
+/// The status word `WIFCONTINUED` decodes: all ones.
+pub(crate) const CONTINUED_STATUS: i32 = 0xffff;
+
+/// `struct user_regs_struct` on x86_64, as `PTRACE_GETREGS` fills it.
+///
+/// The order is the ABI's, not a choice: the structure is what `strace` and
+/// `gdb` read `rip`, `rsp` and `orig_rax` out of by offset, and a field in
+/// the wrong slot is a debugger looking at the wrong register.
+pub(crate) mod uregs {
+    pub const R15: usize = 0;
+    pub const R14: usize = 1;
+    pub const R13: usize = 2;
+    pub const R12: usize = 3;
+    pub const RBP: usize = 4;
+    pub const RBX: usize = 5;
+    pub const R11: usize = 6;
+    pub const R10: usize = 7;
+    pub const R9: usize = 8;
+    pub const R8: usize = 9;
+    pub const RAX: usize = 10;
+    pub const RCX: usize = 11;
+    pub const RDX: usize = 12;
+    pub const RSI: usize = 13;
+    pub const RDI: usize = 14;
+    pub const ORIG_RAX: usize = 15;
+    pub const RIP: usize = 16;
+    pub const CS: usize = 17;
+    pub const EFLAGS: usize = 18;
+    pub const RSP: usize = 19;
+    pub const SS: usize = 20;
+    pub const FS_BASE: usize = 21;
+    pub const GS_BASE: usize = 22;
+    pub const DS: usize = 23;
+    pub const ES: usize = 24;
+    pub const FS: usize = 25;
+    pub const GS: usize = 26;
+    pub const COUNT: usize = 27;
+    pub const BYTES: usize = COUNT * 8;
+}
+
+/// Copy a register file out to the tracer's buffer, in `user_regs_struct`'s
+/// order. The caller has already checked the buffer is writable.
+pub(crate) fn write_user_regs(at: usize, regs: &[u64; uregs::COUNT]) {
+    for (slot, value) in regs.iter().enumerate() {
+        unsafe { ((at + slot * 8) as *mut u64).write_unaligned(*value) };
+    }
+}
+
+/// Read a register file back from the tracer's buffer. The caller has already
+/// checked the buffer is readable.
+pub(crate) fn read_user_regs(at: usize) -> [u64; uregs::COUNT] {
+    let mut regs = [0u64; uregs::COUNT];
+    for (slot, value) in regs.iter_mut().enumerate() {
+        *value = unsafe { ((at + slot * 8) as *const u64).read_unaligned() };
+    }
+    regs
+}
+
+/// `sizeof(struct user_fpregs_struct)` on x86_64: the floating-point register
+/// file `PTRACE_GETFPREGS` and `PTRACE_SETFPREGS` move.
+///
+/// It is 512 rather than "some sensible size" because on this architecture the
+/// structure *is* the `fxsave` image - the x87 control/status/tag words, the
+/// eight x87 registers, `MXCSR` and the sixteen XMM registers, in the order the
+/// instruction writes them. That is what lets a tracer's buffer be filled
+/// straight from, and stored straight into, the block a task carries.
+pub(crate) const FPREGS_BYTES: usize = 512;
+
+/// The floating-point image, for a tracer to read. Word at a time and unaligned
+/// for the same reason the register file is: the buffer belongs to the tracer,
+/// and its alignment is whatever the tracer chose.
+pub(crate) fn write_user_fpregs(at: usize, bytes: &[u8; FPREGS_BYTES]) {
+    for (word, chunk) in bytes.chunks_exact(8).enumerate() {
+        let value = u64::from_le_bytes(chunk.try_into().unwrap());
+        unsafe { ((at + word * 8) as *mut u64).write_unaligned(value) };
+    }
+}
+
+/// And the reading half. The caller has checked the buffer is readable.
+pub(crate) fn read_user_fpregs(at: usize) -> [u8; FPREGS_BYTES] {
+    let mut bytes = [0u8; FPREGS_BYTES];
+    for (word, chunk) in bytes.chunks_exact_mut(8).enumerate() {
+        let value = unsafe { ((at + word * 8) as *const u64).read_unaligned() };
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// `struct ptrace_syscall_info`: what `PTRACE_GET_SYSCALL_INFO` reports about
+/// the syscall a tracee stopped at.
+///
+/// ```text
+///   0  __u8  op                  1 = entry, 2 = exit
+///   1  __u8  pad[3]
+///   4  __u32 arch                AUDIT_ARCH_X86_64
+///   8  __u64 instruction_pointer
+///  16  __u64 stack_pointer
+///  24  union {
+///        entry: { __u64 nr; __u64 args[6]; }   56 bytes
+///        exit:  { __s64 rval; __u8 is_error; } 16 bytes, padded
+///      }
+/// ```
+///
+/// The union is why this is 80 bytes and not 24: the largest member decides
+/// the size, and the exit shape is written into the same 56 bytes the entry
+/// shape uses.
+pub(crate) const SYSCALL_INFO_BYTES: usize = 80;
+/// `PTRACE_SYSCALL_INFO_NONE`: the operation byte at a stop that is not a
+/// syscall boundary. A tracer reads it to tell "here are the arguments" from
+/// "there are no arguments to show you".
+pub(crate) const SYSCALL_INFO_NONE: u8 = 0;
+pub(crate) const SYSCALL_INFO_ENTRY: u8 = 1;
+pub(crate) const SYSCALL_INFO_EXIT: u8 = 2;
+/// `AUDIT_ARCH_X86_64` - what `syscall_get_arch()` answers on this machine,
+/// and what the `arch` field carries.
+pub(crate) const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+
+/// Write the `struct ptrace_syscall_info` describing a syscall boundary.
+///
+/// `nr`, `args`, `ip` and `sp` describe the *entry*; at an exit stop the only
+/// field with anything new to say is the return value, and the entry half is
+/// still written because the caller's buffer is 80 bytes either way and
+/// leaving it untouched would hand back whatever was there before.
+pub(crate) fn write_syscall_info(
+    at: usize,
+    entry: bool,
+    nr: u64,
+    args: &[u64; 6],
+    ip: u64,
+    sp: u64,
+    ret: isize,
+) {
+    unsafe {
+        core::ptr::write_bytes(at as *mut u8, 0, SYSCALL_INFO_BYTES);
+        (at as *mut u8).write_unaligned(if entry {
+            SYSCALL_INFO_ENTRY
+        } else {
+            SYSCALL_INFO_EXIT
+        });
+        ((at + 4) as *mut u32).write_unaligned(AUDIT_ARCH_X86_64);
+        ((at + 8) as *mut u64).write_unaligned(ip);
+        ((at + 16) as *mut u64).write_unaligned(sp);
+        if entry {
+            ((at + 24) as *mut u64).write_unaligned(nr);
+            for (slot, value) in args.iter().enumerate() {
+                ((at + 32 + slot * 8) as *mut u64).write_unaligned(*value);
+            }
+        } else {
+            ((at + 24) as *mut i64).write_unaligned(ret as i64);
+            // `IS_ERR_VALUE`: a return in the last 4095 slots below zero is an
+            // errno, not a result. The boundary is what every libc uses, and
+            // the caller reads `is_error` to decide whether to negate it.
+            let is_error = ret < 0 && ret >= -4095;
+            ((at + 32) as *mut u8).write_unaligned(is_error as u8);
+        }
     }
 }
 
@@ -573,6 +869,38 @@ pub(crate) fn reboot_classify(cmd: usize) -> RebootCmd {
     }
 }
 
+/// The two words that have to come before `cmd`, as `reboot(2)` declares them:
+/// `reboot(int magic, int magic2, int cmd, void *arg)`. The command word is
+/// the **third** argument, not the first - a handler that classified `args[0]`
+/// classified `LINUX_REBOOT_MAGIC1` and answered `EINVAL`, which is why
+/// `poweroff -f` said "Invalid argument" and never ended the machine.
+pub(super) const RB_MAGIC1: usize = 0xfee1_dead;
+pub(super) const RB_MAGIC2: usize = 0x2812_1969;
+/// The two older `magic2` values Linux still accepts, from before the
+/// constants were renamed: `LINUX_REBOOT_MAGIC2A` and `LINUX_REBOOT_MAGIC2B`.
+const RB_MAGIC2A: usize = 0x2011_2000;
+const RB_MAGIC2B: usize = 0x0511_1996;
+
+/// Read `reboot`'s arguments the way the man page orders them: the magic
+/// words first, since a call that does not name them is refused before its
+/// command is even looked at, then the command itself.
+///
+/// `Ok(RebootCmd::Unknown)` is a call that named the magic and asked for
+/// something no kernel knows: that is `EINVAL` too, and it is the one a
+/// program sees when *it* passes a bad word rather than when we mislaid one.
+pub(crate) fn reboot_command(args: [usize; crate::syscall::ARG_COUNT]) -> Result<RebootCmd, isize> {
+    if args[0] != RB_MAGIC1 {
+        return Err(err::EINVAL);
+    }
+    if args[1] != RB_MAGIC2 && args[1] != RB_MAGIC2A && args[1] != RB_MAGIC2B {
+        return Err(err::EINVAL);
+    }
+    match reboot_classify(args[2]) {
+        RebootCmd::Unknown => Err(err::EINVAL),
+        other => Ok(other),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The timespec-carrying calls: one validation per man page
 // ---------------------------------------------------------------------------
@@ -600,7 +928,9 @@ pub(crate) fn ppoll_ms(sec: u64, nsec: u64) -> Result<u64, isize> {
     if nsec >= 1_000_000_000 {
         return Err(err::EINVAL);
     }
-    Ok(sec.saturating_mul(1000).saturating_add(nsec.div_ceil(1_000_000)))
+    Ok(sec
+        .saturating_mul(1000)
+        .saturating_add(nsec.div_ceil(1_000_000)))
 }
 
 /// The millisecond duration a `select`/`pselect6` timeout names. `timespec`
@@ -621,12 +951,21 @@ pub(crate) fn select_timeout_ms(sec: u64, frac: u64, timespec: bool) -> Result<u
 /// names, validated the way the man page words it: each `tv_usec` must stay
 /// below a second's worth. A zero value is the "disarm" answer the caller
 /// decides on, not an error.
-pub(crate) fn itimerval_ms(vsec: u64, vusec: u64, isec: u64, iusec: u64) -> Result<(u64, u64), isize> {
+pub(crate) fn itimerval_ms(
+    vsec: u64,
+    vusec: u64,
+    isec: u64,
+    iusec: u64,
+) -> Result<(u64, u64), isize> {
     if vusec >= 1_000_000 || iusec >= 1_000_000 {
         return Err(err::EINVAL);
     }
-    let value_ms = vsec.saturating_mul(1000).saturating_add(vusec.div_ceil(1000));
-    let interval_ms = isec.saturating_mul(1000).saturating_add(iusec.div_ceil(1000));
+    let value_ms = vsec
+        .saturating_mul(1000)
+        .saturating_add(vusec.div_ceil(1000));
+    let interval_ms = isec
+        .saturating_mul(1000)
+        .saturating_add(iusec.div_ceil(1000));
     Ok((value_ms, interval_ms))
 }
 
@@ -681,10 +1020,7 @@ pub(crate) fn handle_umask(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
 /// `GRND_NONBLOCK` are accepted and ignored: there is one generator, it is
 /// always ready, and it never blocks - which is the behaviour both flags are
 /// asking about.
-pub(crate) fn handle_getrandom(
-    args: [usize; crate::syscall::ARG_COUNT],
-    from_user: bool,
-) -> isize {
+pub(crate) fn handle_getrandom(args: [usize; crate::syscall::ARG_COUNT], from_user: bool) -> isize {
     let (buf, len, _flags) = (args[0], args[1], args[2]);
     if len == 0 {
         return 0;
@@ -743,10 +1079,7 @@ fn rlimit_of(resource: usize, out: usize, from_user: bool) -> isize {
 /// `prlimit64(pid, resource, new_limit, old_limit)` — get/set resource
 /// limits. The new limit is accepted and not enforced: these are advisory
 /// answers, not a budget the kernel keeps.
-pub(crate) fn handle_prlimit64(
-    args: [usize; crate::syscall::ARG_COUNT],
-    from_user: bool,
-) -> isize {
+pub(crate) fn handle_prlimit64(args: [usize; crate::syscall::ARG_COUNT], from_user: bool) -> isize {
     let (_pid, resource, _new_ptr, old_ptr) = (args[0], args[1], args[2], args[3]);
     if resource >= RLIM_NLIMITS {
         return err::EINVAL;
@@ -766,20 +1099,14 @@ pub(crate) fn handle_prlimit64(
 }
 
 /// `getrlimit(resource, rlim)` — read one resource limit.
-pub(crate) fn handle_getrlimit(
-    args: [usize; crate::syscall::ARG_COUNT],
-    from_user: bool,
-) -> isize {
+pub(crate) fn handle_getrlimit(args: [usize; crate::syscall::ARG_COUNT], from_user: bool) -> isize {
     rlimit_of(args[0], args[1], from_user)
 }
 
 /// `setrlimit(resource, rlim)` — set one resource limit. A set is accepted
 /// for any resource in range and changes nothing; out-of-range is `EINVAL`,
 /// an unwritable pointer `EFAULT`.
-pub(crate) fn handle_setrlimit(
-    args: [usize; crate::syscall::ARG_COUNT],
-    from_user: bool,
-) -> isize {
+pub(crate) fn handle_setrlimit(args: [usize; crate::syscall::ARG_COUNT], from_user: bool) -> isize {
     let (resource, rlim) = (args[0], args[1]);
     if resource >= RLIM_NLIMITS {
         return err::EINVAL;
@@ -936,7 +1263,10 @@ mod tests {
     fn normalize_path_resolves_dot_components_per_path_resolution() {
         assert_eq!(normalize_path("etc/motd", "/"), "/etc/motd");
         assert_eq!(normalize_path("./etc/motd", "/initrd"), "/initrd/etc/motd");
-        assert_eq!(normalize_path("../etc/motd", "/initrd/mnt"), "/initrd/etc/motd");
+        assert_eq!(
+            normalize_path("../etc/motd", "/initrd/mnt"),
+            "/initrd/etc/motd"
+        );
         // `..` above the base pops what is there, one component at a time.
         assert_eq!(normalize_path("../../..", "/a/b/c"), "/");
         // Repeated and trailing slashes collapse; an empty path is the root.
@@ -945,7 +1275,10 @@ mod tests {
         assert_eq!(normalize_path(".", "/"), "/");
         assert_eq!(normalize_path("/", "/initrd"), "/");
         // Absolute paths ignore the base entirely.
-        assert_eq!(normalize_path("/etc/passwd", "/somewhere/else"), "/etc/passwd");
+        assert_eq!(
+            normalize_path("/etc/passwd", "/somewhere/else"),
+            "/etc/passwd"
+        );
         // A base with a trailing slash does not gain a second one.
         assert_eq!(normalize_path("etc", "/initrd/"), "/initrd/etc");
     }
@@ -981,8 +1314,8 @@ mod tests {
         let written = write_stat(
             buf.as_mut_ptr() as usize,
             &meta(NodeKind::File, 0x1234, 257),
-            0x8,                       // st_dev: a filesystem id
-            Some((4, 3)),              // st_rdev: /dev/ttyS-style 4:3? no - a char dev
+            0x8,          // st_dev: a filesystem id
+            Some((4, 3)), // st_rdev: /dev/ttyS-style 4:3? no - a char dev
             0o640,
         );
         assert_eq!(written, 0);
@@ -990,7 +1323,10 @@ mod tests {
         assert_eq!(word(0), 0x8); // st_dev
         assert_eq!(word(8), 0x1234); // st_ino
         assert_eq!(word(16), 1); // st_nlink: one name for a file
-        assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 0o100_640); // st_mode
+        assert_eq!(
+            u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            0o100_640
+        ); // st_mode
         assert_eq!(word(40), (4u64 << 8) | 3); // st_rdev, makedev-packed
         assert_eq!(word(48), 257); // st_size
         assert_eq!(word(56), 512); // st_blksize
@@ -1003,11 +1339,23 @@ mod tests {
         // A directory reports two names (itself through `.`, its parent
         // through `..`), the convention every caller of st_nlink assumes.
         let mut dbuf = [0u8; 144];
-        assert_eq!(write_stat(dbuf.as_mut_ptr() as usize, &meta(NodeKind::Dir, 9, 4096), 0, None, 0), 0);
+        assert_eq!(
+            write_stat(
+                dbuf.as_mut_ptr() as usize,
+                &meta(NodeKind::Dir, 9, 4096),
+                0,
+                None,
+                0
+            ),
+            0
+        );
         assert_eq!(u64::from_le_bytes(dbuf[16..24].try_into().unwrap()), 2);
         // Zero permissions stored fall back to the kind's defaults, so a
         // directory statts traversable.
-        assert_eq!(u32::from_le_bytes(dbuf[24..28].try_into().unwrap()), 0o040_755);
+        assert_eq!(
+            u32::from_le_bytes(dbuf[24..28].try_into().unwrap()),
+            0o040_755
+        );
     }
 
     /// `statfs(2)`: `f_type` carries the superblock magic the filesystem
@@ -1027,7 +1375,10 @@ mod tests {
         assert_eq!(fstype_magic("iso9660"), 0); // not spoken: absent
 
         let mut buf = [0u8; 120];
-        assert_eq!(write_statfs(buf.as_mut_ptr() as usize, 0x0000EF53, 4096, 100, 60, 7, 5), 0);
+        assert_eq!(
+            write_statfs(buf.as_mut_ptr() as usize, 0x0000EF53, 4096, 100, 60, 7, 5),
+            0
+        );
         let word = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
         assert_eq!(word(0), 0xEF53); // f_type
         assert_eq!(word(8), 4096); // f_bsize
@@ -1047,12 +1398,24 @@ mod tests {
     #[test]
     fn write_statx_reports_only_the_basic_stats_the_mask_asked_for() {
         let mut buf = [0u8; 152];
-        assert_eq!(write_statx(buf.as_mut_ptr() as usize, 0x7ff, &meta(NodeKind::File, 77, 1024), 0, Some((1, 9))), 0);
+        assert_eq!(
+            write_statx(
+                buf.as_mut_ptr() as usize,
+                0x7ff,
+                &meta(NodeKind::File, 77, 1024),
+                0,
+                Some((1, 9))
+            ),
+            0
+        );
         let word = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0x7ff); // stx_mask
         assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 512); // stx_blksize
         assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 1); // stx_nlink
-        assert_eq!(u16::from_le_bytes(buf[28..30].try_into().unwrap()), 0o100_644); // stx_mode
+        assert_eq!(
+            u16::from_le_bytes(buf[28..30].try_into().unwrap()),
+            0o100_644
+        ); // stx_mode
         assert_eq!(word(32), 77); // stx_ino
         assert_eq!(word(40), 1024); // stx_size
         assert_eq!(word(48), 2); // stx_blocks: ceil(1024/512)
@@ -1064,7 +1427,16 @@ mod tests {
         // A mask wider than the basic stats is trimmed: only what is filled
         // is reported, so a caller does not read absent fields as present.
         let mut buf2 = [0u8; 152];
-        assert_eq!(write_statx(buf2.as_mut_ptr() as usize, 0xfff, &meta(NodeKind::Dir, 1, 0), 0, None), 0);
+        assert_eq!(
+            write_statx(
+                buf2.as_mut_ptr() as usize,
+                0xfff,
+                &meta(NodeKind::Dir, 1, 0),
+                0,
+                None
+            ),
+            0
+        );
         assert_eq!(u32::from_le_bytes(buf2[0..4].try_into().unwrap()), 0x7ff);
         assert_eq!(u32::from_le_bytes(buf2[16..20].try_into().unwrap()), 2);
     }
@@ -1140,7 +1512,11 @@ mod tests {
 
         // No core-dump bit is ever set: mpos writes no core files.
         for code in [-1isize, -9, 0, 7, 255] {
-            assert_eq!(wait_status(code) & 0x80, 0, "WCOREDUMP must stay clear for {code}");
+            assert_eq!(
+                wait_status(code) & 0x80,
+                0,
+                "WCOREDUMP must stay clear for {code}"
+            );
         }
     }
 
@@ -1180,17 +1556,29 @@ mod tests {
         // posix_spawn's word: SIGCHLD (17) in the low byte rides along with
         // the flags, and the rest of the word is what gets checked.
         let word = n::CLONE_VM | n::CLONE_VFORK | 17;
-        assert_eq!(validate_clone_flags(word, 0, 0), Ok((17, n::CLONE_VM | n::CLONE_VFORK)));
+        assert_eq!(
+            validate_clone_flags(word, 0, 0),
+            Ok((17, n::CLONE_VM | n::CLONE_VFORK))
+        );
 
         // A signal byte past the real-time signals is refused.
-        assert_eq!(validate_clone_flags(64, 0, 0), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            validate_clone_flags(64, 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
 
         // An unknown bit - CLONE_NEWNS (0x20000) among them - is refused
         // before anything is created.
-        assert_eq!(validate_clone_flags(n::CLONE_VM | 0x2_0000, 0, 0), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            validate_clone_flags(n::CLONE_VM | 0x2_0000, 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
 
         // The dependency chain: THREAD implies SIGHAND implies VM.
-        assert_eq!(validate_clone_flags(n::CLONE_THREAD, 0, 0), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            validate_clone_flags(n::CLONE_THREAD, 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
         assert_eq!(
             validate_clone_flags(n::CLONE_THREAD | n::CLONE_SIGHAND, 0, 0),
             Err(crate::syscall::err::EINVAL)
@@ -1203,14 +1591,32 @@ mod tests {
             validate_clone_flags(n::CLONE_THREAD | n::CLONE_SIGHAND | n::CLONE_VM, 0, 0),
             Ok((0, n::CLONE_THREAD | n::CLONE_SIGHAND | n::CLONE_VM))
         );
-        assert_eq!(validate_clone_flags(n::CLONE_SIGHAND, 0, 0), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            validate_clone_flags(n::CLONE_SIGHAND, 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
 
         // A tid flag without a place to put the tid is refused.
-        assert_eq!(validate_clone_flags(n::CLONE_PARENT_SETTID, 0, 0), Err(crate::syscall::err::EINVAL));
-        assert_eq!(validate_clone_flags(n::CLONE_CHILD_SETTID, 0, 0), Err(crate::syscall::err::EINVAL));
-        assert_eq!(validate_clone_flags(n::CLONE_CHILD_CLEARTID, 0, 0), Err(crate::syscall::err::EINVAL));
-        assert_eq!(validate_clone_flags(n::CLONE_PARENT_SETTID, 0x1000, 0), Ok((0, n::CLONE_PARENT_SETTID)));
-        assert_eq!(validate_clone_flags(n::CLONE_CHILD_SETTID, 0, 0x1000), Ok((0, n::CLONE_CHILD_SETTID)));
+        assert_eq!(
+            validate_clone_flags(n::CLONE_PARENT_SETTID, 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            validate_clone_flags(n::CLONE_CHILD_SETTID, 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            validate_clone_flags(n::CLONE_CHILD_CLEARTID, 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            validate_clone_flags(n::CLONE_PARENT_SETTID, 0x1000, 0),
+            Ok((0, n::CLONE_PARENT_SETTID))
+        );
+        assert_eq!(
+            validate_clone_flags(n::CLONE_CHILD_SETTID, 0, 0x1000),
+            Ok((0, n::CLONE_CHILD_SETTID))
+        );
 
         // The historical no-ops musl still sends are accepted, not refused.
         assert_eq!(
@@ -1237,6 +1643,54 @@ mod tests {
         assert_eq!(reboot_classify(0xdead_beef), RebootCmd::Unknown);
     }
 
+    /// `reboot(2)` takes `magic, magic2, cmd, arg`, so the command word is the
+    /// **third** argument. `poweroff -f` sends the magics musl wraps around the
+    /// command, and a handler that classified `args[0]` read `LINUX_REBOOT_MAGIC1`
+    /// instead - answered `EINVAL`, printed "Invalid argument", and left the
+    /// machine (and every test run after it) hanging.
+    #[test]
+    fn reboot_reads_its_command_from_the_third_argument() {
+        let call = |magic: usize, magic2: usize, cmd: usize| [magic, magic2, cmd, 0, 0, 0];
+
+        assert_eq!(
+            reboot_command(call(RB_MAGIC1, RB_MAGIC2, RB_POWER_OFF)),
+            Ok(RebootCmd::Stop)
+        );
+        assert_eq!(
+            reboot_command(call(RB_MAGIC1, RB_MAGIC2, RB_HALT_SYSTEM)),
+            Ok(RebootCmd::Stop)
+        );
+        assert_eq!(
+            reboot_command(call(RB_MAGIC1, RB_MAGIC2, RB_ENABLE_CAD)),
+            Ok(RebootCmd::Policy)
+        );
+        // The magic words come first: a call that does not name them is
+        // refused before its command is looked at, which is how the shape
+        // above gets noticed instead of silently classifying the wrong word.
+        assert_eq!(
+            reboot_command(call(RB_POWER_OFF, RB_MAGIC2, RB_POWER_OFF)),
+            Err(err::EINVAL)
+        );
+        assert_eq!(
+            reboot_command(call(RB_MAGIC1, 0, RB_POWER_OFF)),
+            Err(err::EINVAL)
+        );
+        // A magic-named call asking for something no kernel knows.
+        assert_eq!(
+            reboot_command(call(RB_MAGIC1, RB_MAGIC2, 0xdead_beef)),
+            Err(err::EINVAL)
+        );
+        // The two older `magic2` values Linux still accepts.
+        assert_eq!(
+            reboot_command(call(RB_MAGIC1, 0x2011_2000, RB_AUTOBOOT)),
+            Ok(RebootCmd::Stop)
+        );
+        assert_eq!(
+            reboot_command(call(RB_MAGIC1, 0x0511_1996, RB_AUTOBOOT)),
+            Ok(RebootCmd::Stop)
+        );
+    }
+
     /// `nanosleep(2)`: `tv_nsec` below a billion, sub-second truncation.
     #[test]
     fn nanosleep_validates_nsec_and_truncates_the_subsecond() {
@@ -1246,8 +1700,15 @@ mod tests {
         assert_eq!(nanosleep_ms(1, 999_999), Ok(1000));
         assert_eq!(nanosleep_ms(1, 1_500_000), Ok(1001));
         // The one field the man page validates.
-        assert_eq!(nanosleep_ms(0, 1_000_000_000), Err(crate::syscall::err::EINVAL));
-        assert_eq!(nanosleep_ms(u64::MAX, 999_999_999), Ok(u64::MAX), "saturates, never wraps");
+        assert_eq!(
+            nanosleep_ms(0, 1_000_000_000),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            nanosleep_ms(u64::MAX, 999_999_999),
+            Ok(u64::MAX),
+            "saturates, never wraps"
+        );
     }
 
     /// `ppoll(2)`: like `nanosleep`'s validation, but the sub-second field
@@ -1260,7 +1721,11 @@ mod tests {
         assert_eq!(ppoll_ms(1, 1), Ok(1001));
         assert_eq!(ppoll_ms(0, 999_999_999), Ok(1000));
         assert_eq!(ppoll_ms(1, 1_000_000_000), Err(crate::syscall::err::EINVAL));
-        assert_eq!(ppoll_ms(u64::MAX, 999_999_999), Ok(u64::MAX), "saturates, never wraps");
+        assert_eq!(
+            ppoll_ms(u64::MAX, 999_999_999),
+            Ok(u64::MAX),
+            "saturates, never wraps"
+        );
     }
 
     /// `select(2)`/`pselect6(2)`: the sub-second field is validated against
@@ -1271,16 +1736,28 @@ mod tests {
         // pselect6 hands a timespec: nanoseconds.
         assert_eq!(select_timeout_ms(2, 999_999_999, true), Ok(3000));
         assert_eq!(select_timeout_ms(0, 1, true), Ok(1));
-        assert_eq!(select_timeout_ms(1, 1_000_000_000, true), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            select_timeout_ms(1, 1_000_000_000, true),
+            Err(crate::syscall::err::EINVAL)
+        );
         // select hands a timeval: microseconds, and the ceiling is one
         // second's worth of them - 999 µs folds into a millisecond, a
         // million is the first refusal.
         assert_eq!(select_timeout_ms(1, 500, false), Ok(1001));
-        assert_eq!(select_timeout_ms(1, 1_000_000, false), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            select_timeout_ms(1, 1_000_000, false),
+            Err(crate::syscall::err::EINVAL)
+        );
         assert_eq!(select_timeout_ms(1, 999_999, false), Ok(2000));
         // Both refuse a timeout further out than a few centuries.
-        assert_eq!(select_timeout_ms(1 << 43, 0, true), Err(crate::syscall::err::EINVAL));
-        assert_eq!(select_timeout_ms((1 << 43) - 1, 0, false), Ok(((1 << 43) - 1) * 1000));
+        assert_eq!(
+            select_timeout_ms(1 << 43, 0, true),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            select_timeout_ms((1 << 43) - 1, 0, false),
+            Ok(((1 << 43) - 1) * 1000)
+        );
     }
 
     /// `setitimer(2)`: each `tv_usec` must stay below a second's worth; a
@@ -1289,8 +1766,14 @@ mod tests {
     fn itimerval_fields_are_validated_per_field() {
         assert_eq!(itimerval_ms(1, 500_000, 0, 0), Ok((1500, 0)));
         assert_eq!(itimerval_ms(0, 999_999, 2, 1), Ok((1000, 2001)));
-        assert_eq!(itimerval_ms(0, 1_000_000, 0, 0), Err(crate::syscall::err::EINVAL));
-        assert_eq!(itimerval_ms(0, 0, 0, 1_000_000), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            itimerval_ms(0, 1_000_000, 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            itimerval_ms(0, 0, 0, 1_000_000),
+            Err(crate::syscall::err::EINVAL)
+        );
         // A zero timer is how a caller disarms: a valid (0, 0) answer.
         assert_eq!(itimerval_ms(0, 0, 0, 0), Ok((0, 0)));
     }
@@ -1302,10 +1785,16 @@ mod tests {
         let mut buf = [0xABu8; 16];
         let args = [16, buf.as_mut_ptr() as usize, 0, 0, 0, 0];
         assert_eq!(handle_prctl(args), 0);
-        assert!(buf.iter().all(|&b| b == 0), "the name slot reads back empty");
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "the name slot reads back empty"
+        );
 
         // A null buffer has nowhere to put the name.
-        assert_eq!(handle_prctl([16, 0, 0, 0, 0, 0]), crate::syscall::err::EFAULT);
+        assert_eq!(
+            handle_prctl([16, 0, 0, 0, 0, 0]),
+            crate::syscall::err::EFAULT
+        );
 
         // Every other option - PR_SET_NAME from a kernel with no name to
         // keep, privilege flips, endianness - is accepted and dropped.
@@ -1342,7 +1831,10 @@ mod tests {
         assert!(a.iter().any(|&x| x != 0));
 
         // A zero length asks for nothing and costs nothing.
-        assert_eq!(handle_getrandom([a.as_mut_ptr() as usize, 0, 0, 0, 0, 0], false), 0);
+        assert_eq!(
+            handle_getrandom([a.as_mut_ptr() as usize, 0, 0, 0, 0, 0], false),
+            0
+        );
         // GRND_RANDOM / GRND_NONBLOCK change nothing: the generator is
         // always ready and never blocks, which is what both ask about.
         let args = [a.as_mut_ptr() as usize, 8, 1 | 2, 0, 0, 0];
@@ -1358,9 +1850,17 @@ mod tests {
         let mut buf = [0u8; 16];
         let pair = |resource: usize, out: usize| {
             let args = [0, resource, 0, out, 0, 0];
-            (handle_prlimit64(args, false), handle_getrlimit([resource, out, 0, 0, 0, 0], false))
+            (
+                handle_prlimit64(args, false),
+                handle_getrlimit([resource, out, 0, 0, 0, 0], false),
+            )
         };
-        let words = |b: &[u8]| (u64::from_le_bytes(b[0..8].try_into().unwrap()), u64::from_le_bytes(b[8..16].try_into().unwrap()));
+        let words = |b: &[u8]| {
+            (
+                u64::from_le_bytes(b[0..8].try_into().unwrap()),
+                u64::from_le_bytes(b[8..16].try_into().unwrap()),
+            )
+        };
 
         // RLIMIT_STACK (3): 8 MiB, hard and soft.
         buf = [0u8; 16];
@@ -1383,8 +1883,14 @@ mod tests {
         assert_eq!(words(&buf), (u64::MAX, u64::MAX));
 
         // Past the table: EINVAL, before any pointer is touched.
-        assert_eq!(handle_prlimit64([0, 16, 0, buf.as_mut_ptr() as usize, 0, 0], false), crate::syscall::err::EINVAL);
-        assert_eq!(handle_getrlimit([16, buf.as_mut_ptr() as usize, 0, 0, 0, 0], false), crate::syscall::err::EINVAL);
+        assert_eq!(
+            handle_prlimit64([0, 16, 0, buf.as_mut_ptr() as usize, 0, 0], false),
+            crate::syscall::err::EINVAL
+        );
+        assert_eq!(
+            handle_getrlimit([16, buf.as_mut_ptr() as usize, 0, 0, 0, 0], false),
+            crate::syscall::err::EINVAL
+        );
 
         // A null out-pointer is "not interested", not an error.
         assert_eq!(handle_prlimit64([0, 3, 0, 0, 0, 0], false), 0);
@@ -1392,7 +1898,10 @@ mod tests {
 
         // setrlimit accepts any in-range resource and changes nothing.
         assert_eq!(handle_setrlimit([3, 0, 0, 0, 0, 0], false), 0);
-        assert_eq!(handle_setrlimit([16, 0, 0, 0, 0, 0], false), crate::syscall::err::EINVAL);
+        assert_eq!(
+            handle_setrlimit([16, 0, 0, 0, 0, 0], false),
+            crate::syscall::err::EINVAL
+        );
     }
 
     /// `sched_setaffinity(2)`/`sched_getaffinity(2)`: one CPU, so the mask
@@ -1402,23 +1911,41 @@ mod tests {
     fn affinity_masks_name_exactly_the_one_cpu() {
         let mut mask = [0u8; 8];
         // Get: bit 0 set, byte count is the answer, the rest is cleared.
-        assert_eq!(handle_sched_getaffinity([0, 8, mask.as_mut_ptr() as usize, 0, 0, 0]), 8);
+        assert_eq!(
+            handle_sched_getaffinity([0, 8, mask.as_mut_ptr() as usize, 0, 0, 0]),
+            8
+        );
         assert_eq!(u64::from_le_bytes(mask), 1);
 
         // A short mask cannot name a CPU set: EINVAL.
-        assert_eq!(handle_sched_getaffinity([0, 4, mask.as_mut_ptr() as usize, 0, 0, 0]), crate::syscall::err::EINVAL);
-        assert_eq!(handle_sched_setaffinity([0, 4, mask.as_mut_ptr() as usize, 0, 0, 0]), crate::syscall::err::EINVAL);
+        assert_eq!(
+            handle_sched_getaffinity([0, 4, mask.as_mut_ptr() as usize, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
+        assert_eq!(
+            handle_sched_setaffinity([0, 4, mask.as_mut_ptr() as usize, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
 
         // Set: keeping CPU 0 is fine; asking for a machine that is not here
         // is refused.
         let keep = 1u64.to_le_bytes();
-        assert_eq!(handle_sched_setaffinity([0, 8, keep.as_ptr() as usize, 0, 0, 0]), 0);
+        assert_eq!(
+            handle_sched_setaffinity([0, 8, keep.as_ptr() as usize, 0, 0, 0]),
+            0
+        );
         let drop_zero = 2u64.to_le_bytes();
-        assert_eq!(handle_sched_setaffinity([0, 8, drop_zero.as_ptr() as usize, 0, 0, 0]), crate::syscall::err::EINVAL);
+        assert_eq!(
+            handle_sched_setaffinity([0, 8, drop_zero.as_ptr() as usize, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
 
         // A long mask gets its tail zeroed, as Linux clears what it does not fill.
         let mut long = [0xFFu8; 16];
-        assert_eq!(handle_sched_getaffinity([0, 16, long.as_mut_ptr() as usize, 0, 0, 0]), 8);
+        assert_eq!(
+            handle_sched_getaffinity([0, 16, long.as_mut_ptr() as usize, 0, 0, 0]),
+            8
+        );
         assert_eq!(u64::from_le_bytes(long[0..8].try_into().unwrap()), 1);
         assert!(long[8..].iter().all(|&b| b == 0));
     }
@@ -1430,12 +1957,24 @@ mod tests {
     #[test]
     fn startup_registrations_check_their_abi_sizes() {
         assert_eq!(handle_set_robust_list([0x1000, 24, 0, 0, 0, 0]), 0);
-        assert_eq!(handle_set_robust_list([0x1000, 32, 0, 0, 0, 0]), crate::syscall::err::EINVAL);
-        assert_eq!(handle_get_robust_list([0, 0, 0, 0, 0, 0]), crate::syscall::err::ENOSYS);
+        assert_eq!(
+            handle_set_robust_list([0x1000, 32, 0, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
+        assert_eq!(
+            handle_get_robust_list([0, 0, 0, 0, 0, 0]),
+            crate::syscall::err::ENOSYS
+        );
 
         assert_eq!(handle_rseq([0x1000, 32, 0, 0, 0, 0]), 0);
-        assert_eq!(handle_rseq([0x1000, 20, 0, 0, 0, 0]), crate::syscall::err::EINVAL);
-        assert_eq!(handle_rseq([0x1000, 32, 1, 0, 0, 0]), crate::syscall::err::EINVAL);
+        assert_eq!(
+            handle_rseq([0x1000, 20, 0, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
+        assert_eq!(
+            handle_rseq([0x1000, 32, 1, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
     }
 
     /// `membarrier(2)`: on one core every command is already satisfied, so
@@ -1445,8 +1984,14 @@ mod tests {
         assert_eq!(handle_membarrier([0, 0, 0, 0, 0, 0]), 0); // CMD_QUERY
         assert_eq!(handle_membarrier([1, 0, 0, 0, 0, 0]), 0); // CMD_GLOBAL
         assert_eq!(handle_membarrier([8, 0, 0, 0, 0, 0]), 0); // CMD_PRIVATE_EXPEDITED
-        assert_eq!(handle_membarrier([2, 0, 0, 0, 0, 0]), crate::syscall::err::EINVAL);
-        assert_eq!(handle_membarrier([16, 0, 0, 0, 0, 0]), crate::syscall::err::EINVAL);
+        assert_eq!(
+            handle_membarrier([2, 0, 0, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
+        assert_eq!(
+            handle_membarrier([16, 0, 0, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
     }
 
     /// A missing call is reported once: the second attempt and every one
@@ -1467,7 +2012,10 @@ mod tests {
         assert!(!mark_missing(u64::MAX));
 
         // Distinct numbers are reported independently.
-        assert!(mark_missing(251), "a different number is its own first report");
+        assert!(
+            mark_missing(251),
+            "a different number is its own first report"
+        );
     }
 
     /// The flag-bit and structure constants of this module are the ABI, not
@@ -1497,6 +2045,9 @@ mod tests {
         ] {
             assert_eq!(cmd, value);
         }
+        // The Linux-specific block starts at 1024, and this is its seventh.
+        assert_eq!(F_DUPFD_CLOEXEC, 1024 + 6);
+        assert_eq!(F_DUPFD_CLOEXEC, 1030);
         assert_eq!(FD_CLOEXEC, 1);
         // fcntl(2)'s AT_* and *at relatives
         assert_eq!(AT_FDCWD, -100);
@@ -1528,5 +2079,177 @@ mod tests {
         assert_eq!(SIGINFO_BYTES, 128);
         assert_eq!(RLIM_NLIMITS, 16);
         assert_eq!(RLIM_INFINITY, u64::MAX);
+    }
+
+    /// The `ptrace` request numbers, against the ptrace(2) man page's x86_64
+    /// column. These are worse than most to get wrong: a `TRACEME` that lands
+    /// on `PEEKTEXT` reads the tracer's own memory instead of handing the
+    /// child over, and nothing reports it - the tracer just never sees a stop.
+    #[test]
+    fn ptrace_requests_and_options_match_the_man_page() {
+        assert_eq!(PTRACE_TRACEME, 0);
+        assert_eq!(PTRACE_PEEKTEXT, 1);
+        assert_eq!(PTRACE_PEEKDATA, 2);
+        assert_eq!(PTRACE_PEEKUSER, 3);
+        assert_eq!(PTRACE_POKETEXT, 4);
+        assert_eq!(PTRACE_POKEDATA, 5);
+        assert_eq!(PTRACE_POKEUSER, 6);
+        assert_eq!(PTRACE_CONT, 7);
+        assert_eq!(PTRACE_KILL, 8);
+        assert_eq!(PTRACE_SINGLESTEP, 9);
+        assert_eq!(PTRACE_GETREGS, 12);
+        assert_eq!(PTRACE_SETREGS, 13);
+        assert_eq!(PTRACE_ATTACH, 16);
+        assert_eq!(PTRACE_DETACH, 17);
+        assert_eq!(PTRACE_SYSCALL, 24);
+        assert_eq!(PTRACE_SETOPTIONS, 0x4200);
+        assert_eq!(PTRACE_GETEVENTMSG, 0x4201);
+        assert_eq!(PTRACE_GETSIGINFO, 0x4202);
+        assert_eq!(PTRACE_GETREGSET, 0x4204);
+        assert_eq!(PTRACE_SETREGSET, 0x4205);
+        assert_eq!(PTRACE_GET_SYSCALL_INFO, 0x420E);
+        assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
+        assert_eq!(PTRACE_O_TRACEEXEC, 0x10);
+        assert_eq!(PTRACE_O_EXITKILL, 0x0010_0000);
+        assert_eq!(PTRACE_EVENT_EXEC, 4);
+        // The fork family, and the last two this kernel names but never raises.
+        // Pinned for the same reason as the rest: a tracer's switch on these
+        // numbers is written against them, and a wrong one there is a stop read
+        // as the wrong kind.
+        assert_eq!(PTRACE_EVENT_FORK, 1);
+        assert_eq!(PTRACE_EVENT_VFORK, 2);
+        assert_eq!(PTRACE_EVENT_CLONE, 3);
+        assert_eq!(unwatched_events::VFORK_DONE, 5);
+        assert_eq!(unwatched_events::EXIT, 6);
+        assert_eq!(NT_PRSTATUS, 1);
+        assert_eq!(SYSCALL_TRAP, 0x80);
+        // The wait(2) options a tracer passes.
+        assert_eq!(WNOHANG, 1);
+        assert_eq!(WUNTRACED, 2);
+        assert_eq!(WCONTINUED, 8);
+        assert_eq!(__WALL, 0x4000_0000);
+        assert_eq!(__WCLONE, 0x8000_0000);
+    }
+
+    /// The stop word, decoded the way the libc decodes it. Writing the three
+    /// fields anywhere but where `WSTOPSIG` and `WIFSTOPPED` look produces a
+    /// status a tracer reads as a plausible, wrong answer - the failure mode
+    /// this kernel has already met once, in the exit-status word.
+    #[test]
+    fn stop_status_is_readable_by_the_w_macros() {
+        // A plain syscall stop: SIGTRAP with TRACESYSGOOD's bit, no event.
+        let word = stop_status(5 | SYSCALL_TRAP, PTRACE_EVENT_NONE);
+        assert_eq!(word & 0xff, 0x7f, "WIFSTOPPED");
+        assert_eq!((word >> 8) & 0xff, 0x85, "WSTOPSIG carries the 0x80");
+        assert_eq!(word >> 16, 0);
+
+        // An exec event: the event number in the high byte, WSTOPSIG SIGTRAP.
+        let word = stop_status(5, PTRACE_EVENT_EXEC);
+        assert_eq!(word & 0xff, 0x7f);
+        assert_eq!((word >> 8) & 0xff, 5);
+        assert_eq!(word >> 16, PTRACE_EVENT_EXEC as i32);
+
+        // A signal-delivery stop reports the signal itself.
+        let word = stop_status(17, PTRACE_EVENT_NONE);
+        assert_eq!((word >> 8) & 0xff, 17);
+        assert_eq!(CONTINUED_STATUS, 0xffff);
+    }
+
+    /// `struct user_regs_struct`'s offsets. `strace` reads `rip`, `rsp` and
+    /// `orig_rax` out of these by index; a field one slot over is a tracer
+    /// reporting on a register nothing touched.
+    #[test]
+    fn user_regs_struct_field_order_is_the_abis() {
+        use uregs::*;
+        // The first ten are the caller-saved general registers in the order
+        // ptrace(2) lists them.
+        assert_eq!((R15, R14, R13, R12, RBP, RBX), (0, 1, 2, 3, 4, 5));
+        assert_eq!((R11, R10, R9, R8), (6, 7, 8, 9));
+        assert_eq!((RAX, RCX, RDX, RSI, RDI), (10, 11, 12, 13, 14));
+        assert_eq!(ORIG_RAX, 15);
+        assert_eq!((RIP, CS, EFLAGS, RSP, SS), (16, 17, 18, 19, 20));
+        assert_eq!((FS_BASE, GS_BASE, DS, ES, FS, GS), (21, 22, 23, 24, 25, 26));
+        assert_eq!(COUNT, 27);
+        assert_eq!(BYTES, 216);
+
+        // A round trip through the two accessors has to be the identity, and
+        // the buffer is not guaranteed aligned - the same rule the rest of
+        // this module follows.
+        let mut buffer = [0u8; BYTES + 1];
+        let base = buffer.as_mut_ptr() as usize + 1;
+        let mut regs = [0u64; COUNT];
+        for (slot, value) in regs.iter_mut().enumerate() {
+            *value = 0x1000 + slot as u64;
+        }
+        write_user_regs(base, &regs);
+        assert_eq!(read_user_regs(base), regs);
+        assert_eq!(read_user_regs(base)[RIP], 0x1000 + RIP as u64);
+    }
+
+    /// `struct ptrace_syscall_info`: the size, and where the two shapes put
+    /// their fields. `strace` decides whether a stop was an entry or an exit
+    /// from `op` alone, and reads the syscall number and its arguments from
+    /// the entry half - so both have to be exactly where the header says.
+    #[test]
+    fn ptrace_syscall_info_has_the_layout_the_header_declares() {
+        assert_eq!(SYSCALL_INFO_BYTES, 80);
+        assert_eq!(AUDIT_ARCH_X86_64, 0xC000_003E);
+
+        let mut buffer = [0u8; SYSCALL_INFO_BYTES + 3];
+        let base = buffer.as_mut_ptr() as usize + 3;
+
+        // An entry stop: op, arch, ip, sp, nr and six arguments.
+        write_syscall_info(
+            base,
+            true,
+            59, // execve
+            &[1, 2, 3, 4, 5, 6],
+            0xdead_beef,
+            0x7fff_0000,
+            0,
+        );
+        assert_eq!(buffer[3], SYSCALL_INFO_ENTRY);
+        assert_eq!(
+            u32::from_le_bytes(buffer[3 + 4..3 + 8].try_into().unwrap()),
+            AUDIT_ARCH_X86_64
+        );
+        assert_eq!(
+            u64::from_le_bytes(buffer[3 + 8..3 + 16].try_into().unwrap()),
+            0xdead_beef
+        );
+        assert_eq!(
+            u64::from_le_bytes(buffer[3 + 16..3 + 24].try_into().unwrap()),
+            0x7fff_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(buffer[3 + 24..3 + 32].try_into().unwrap()),
+            59
+        );
+        assert_eq!(
+            u64::from_le_bytes(buffer[3 + 32..3 + 40].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u64::from_le_bytes(buffer[3 + 72..3 + 80].try_into().unwrap()),
+            6
+        );
+
+        // An exit stop reuses the same bytes: the return value where the
+        // entry shape keeps the number, and the error flag beside it.
+        write_syscall_info(base, false, 59, &[0; 6], 0xbeef, 0x1000, -14);
+        assert_eq!(buffer[3], SYSCALL_INFO_EXIT);
+        assert_eq!(
+            i64::from_le_bytes(buffer[3 + 24..3 + 32].try_into().unwrap()),
+            -14
+        );
+        assert_eq!(buffer[3 + 32], 1, "EFAULT is an error");
+        // A result at the very edge of the errno range is still an error, and
+        // one below it is a legitimate (if odd) value.
+        write_syscall_info(base, false, 0, &[0; 6], 0, 0, -4095);
+        assert_eq!(buffer[3 + 32], 1);
+        write_syscall_info(base, false, 0, &[0; 6], 0, 0, -4096);
+        assert_eq!(buffer[3 + 32], 0);
+        write_syscall_info(base, false, 0, &[0; 6], 0, 0, 7);
+        assert_eq!(buffer[3 + 32], 0);
     }
 }

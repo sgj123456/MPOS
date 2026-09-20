@@ -7,7 +7,7 @@
 //! normally whenever that task is resumed. Hand-written stubs would only buy
 //! control over the exact frame layout, which nothing here needs.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use spin::Once;
 use x86_64::registers::control::Cr2;
@@ -44,6 +44,8 @@ pub fn init() {
         table[pic::IRQ0_VECTOR].set_handler_fn(timer);
         // IRQ4 is COM1 on every PC that has one: the console's input arrives
         // here, a byte at a time, once `serial::enable_rx` has asked for it.
+        // It is the machine's only input line - the console multiplexer is
+        // what turns it into the six virtual consoles.
         table[pic::IRQ0_VECTOR + 4].set_handler_fn(serial);
 
         table
@@ -168,6 +170,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // not a signal to deliver.
     if rip < (1 << 47) {
         crate::println!("user #PF at {:#x} code={:?} rip={:#x}", addr, code, rip);
+        pf_diag(addr, rip);
         // Still extends the stack when the fault is a push past the mapped
         // end - the same call, moved here so its answer can be printed with
         // the rest of what the page tables say.
@@ -175,6 +178,34 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
             return; // The page is there now; the instruction retries.
         }
         crate::sched::send_signal(crate::sched::current(), 11);
+        // A queued signal is delivered at a syscall boundary, and a faulting
+        // instruction never reaches one: returning to it just faults again,
+        // forever, with the signal never leaving the pending set. A SIGSEGV
+        // with no handler is death - end the task here, the way the delivery
+        // path at a syscall exit would, with the signal number in the exit
+        // code for the parent's `wait` to read.
+        if crate::sched::current_disposition(11).is_default() {
+            crate::sched::exit(-11);
+        }
+        // A task that *installed* a handler needs the signal-frame machinery,
+        // and that machinery is written against the syscall gate's frame - a
+        // faulting instruction has none, and re-entering it produces the same
+        // fault at the same instruction for as long as the task is allowed to
+        // run. That is a livelock, and it is not a harmless one: the console
+        // gets a line per fault (thousands a second, which is how `fish`'s own
+        // crash handler buried everything else the machine was saying) and the
+        // task holds its slice forever. Counting repeats at one instruction and
+        // ending the task is what a kernel without an interrupt-frame signal
+        // path can honestly do: the handler does not run either way, and a
+        // death with a reason beats a spin with a flood.
+        if fault_repeats(rip) {
+            crate::println!(
+                "task {} died of SIGSEGV it could not be handed: {addr:#x} ({code:?}) at {rip:#x}, \
+                 the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
+                crate::sched::current().0
+            );
+            crate::sched::exit(-11);
+        }
         crate::sched::preempt();
         return;
     }
@@ -187,6 +218,116 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         frame.stack_pointer
     );
     crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_FAILURE)
+}
+
+/// How many times one instruction may fault unresolvably before the task stuck
+/// on it is ended rather than sent round again.
+const FAULT_REPEAT_LIMIT: usize = 3;
+
+/// Has the task on the CPU now faulted at the *same* instruction
+/// [`FAULT_REPEAT_LIMIT`] times running?
+///
+/// One triple of globals is enough: only one task runs at a time, so the pair
+/// (task, rip) is exactly the condition worth counting, and a different task or
+/// a different instruction is a different problem - which is why the counters
+/// are replaced rather than decremented. No lock: the values are advisory, two
+/// faults cannot happen at once on one CPU, and being wrong by one only changes
+/// how soon the task is ended.
+fn fault_repeats(rip: usize) -> bool {
+    static LAST_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static LAST_RIP: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    let task = crate::sched::current().0;
+    if LAST_TASK.load(Ordering::Relaxed) == task && LAST_RIP.load(Ordering::Relaxed) == rip {
+        return COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= FAULT_REPEAT_LIMIT;
+    }
+    LAST_TASK.store(task, Ordering::Relaxed);
+    LAST_RIP.store(rip, Ordering::Relaxed);
+    COUNT.store(1, Ordering::Relaxed);
+    false
+}
+
+/// What the page tables say about the page a user fault named, printed beside
+/// the fault itself.
+///
+/// This is the same instinct as the register dump in [`fatal`]: when a fault
+/// has a cause the error code cannot express, read the scene rather than
+/// deduce it from the code. The `#PF` error code says "write, user, present" -
+/// four bits - and the interesting half of the answer is in the entry that
+/// refused the access: whether the leaf permits a write, whether the levels
+/// above it do, and how far the mapping reaches in each direction.
+///
+/// It has earned its place twice over. A page whose own PTE read `P=1 W=1 U=1`
+/// was still refusing writes, and the run - identical bits down to page 0, then
+/// a page whose bits differed - was the only way to see that the *tables above*
+/// were the ones withholding it. And a write to `0x8c` in a program's own
+/// read-only image is a null `FILE *` passed to stdio, which the run makes
+/// obvious and the address alone does not.
+fn pf_diag(addr: usize, rip: usize) {
+    use core::sync::atomic::AtomicUsize;
+
+    // A handful per boot: a task that faults in a loop would otherwise bury
+    // every other thing the machine is saying, which is exactly the failure
+    // mode `fault_repeats` exists to cut short.
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return;
+    }
+
+    let page_size = crate::mm::PAGE_SIZE;
+    let page = addr & !(page_size - 1);
+    // P, W, U, and bit 9 (the COW marker this kernel sets instead of clearing
+    // the write bit, if it does).
+    let bits = |e: u64| -> u64 {
+        (e & 1) | (((e >> 1) & 1) << 1) | (((e >> 2) & 1) << 2) | (((e >> 9) & 1) << 3)
+    };
+
+    let Some(entry) = crate::arch::paging::leaf_pte(page) else {
+        crate::println!(
+            "PFDIAG page={page:#x} NOT MAPPED task={:?} rip={rip:#x}",
+            crate::sched::current().0
+        );
+        return;
+    };
+
+    let want = bits(entry);
+    let mut lo = page;
+    while lo >= page_size
+        && crate::arch::paging::leaf_pte(lo - page_size).is_some_and(|e| bits(e) == want)
+    {
+        lo -= page_size;
+    }
+    let mut hi = page + page_size;
+    while hi < (1 << 47) && crate::arch::paging::leaf_pte(hi).is_some_and(|e| bits(e) == want) {
+        hi += page_size;
+    }
+
+    crate::println!(
+        "PFDIAG page={page:#x} pte={entry:#x} P={} W={} U={} B9={} phys={:#x} run=[{lo:#x}..{hi:#x}) \
+         task={:?} rip={rip:#x}",
+        entry & 1,
+        (entry >> 1) & 1,
+        (entry >> 2) & 1,
+        (entry >> 9) & 1,
+        entry & 0x000f_ffff_ffff_f000,
+        crate::sched::current().0
+    );
+
+    // Then the whole walk, not just the leaf. The leaf's own bits are a true
+    // statement about the leaf and not about the access: the U/S bit is ANDed
+    // along the walk, and a write on a 4 KiB page can be refused by a level
+    // above it. Every level is printed, unused slots included, so the shape of
+    // the walk is unambiguous.
+    for (level, e) in crate::arch::paging::entry_chain(page) {
+        crate::println!(
+            "PFDIAG L{level} entry={e:#x} P={} W={} U={} PS={}",
+            e & 1,
+            (e >> 1) & 1,
+            (e >> 2) & 1,
+            (e >> 7) & 1
+        );
+    }
 }
 
 /// The last-resort report for a fault nobody can resolve.

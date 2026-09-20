@@ -48,7 +48,7 @@ use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
 use uefi::prelude::*;
 
 use elf::PAGE_SIZE;
-use handoff::{Handoff, MAX_MEM_REGIONS, MAGIC, Region};
+use handoff::{Handoff, MAGIC, MAX_MEM_REGIONS, Region};
 
 /// Where the kernel and its two companions are on the boot partition. Fixed
 /// names rather than a boot entry or a config file: the layout is decided by the
@@ -124,10 +124,7 @@ fn main() -> Status {
     let mut fs = FileSystem::new(fs);
 
     let kernel_bytes = read(&mut fs, KERNEL_PATH);
-    log(&format!(
-        "kernel image: {} KiB",
-        kernel_bytes.len() / 1024
-    ));
+    log(&format!("kernel image: {} KiB", kernel_bytes.len() / 1024));
     let initramfs = read(&mut fs, INITRAMFS_PATH);
     log(&format!("initramfs: {} KiB", initramfs.len() / 1024));
     let cmdline = read(&mut fs, CMDLINE_PATH);
@@ -180,11 +177,7 @@ fn main() -> Status {
         let pages = (initramfs.len() as u64).div_ceil(PAGE_SIZE) as usize;
         let at = allocate(pages, "initramfs");
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                initramfs.as_ptr(),
-                at as *mut u8,
-                initramfs.len(),
-            )
+            core::ptr::copy_nonoverlapping(initramfs.as_ptr(), at as *mut u8, initramfs.len())
         };
         at
     };
@@ -347,7 +340,10 @@ fn write_handoff(
     // reachable.
     unsafe { core::ptr::write(&raw mut HANDOFF, record) };
 
-    assert_eq!(dropped, 0, "{dropped} memory regions did not fit in the record");
+    assert_eq!(
+        dropped, 0,
+        "{dropped} memory regions did not fit in the record"
+    );
 }
 
 /// Copy a byte string into frames of its own and return where they are.
@@ -440,9 +436,7 @@ mod serial {
 
     fn inp(port: u16) -> u8 {
         let value: u8;
-        unsafe {
-            asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack))
-        };
+        unsafe { asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)) };
         value
     }
 

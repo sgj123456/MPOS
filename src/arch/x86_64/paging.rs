@@ -54,6 +54,35 @@ const KERNEL_PML4_START: usize = 256;
 /// One past the last address a process may map.
 const USER_END: usize = 1 << 47;
 
+/// What an *intermediate* paging-structure entry carries - the PML4E, PDPTE and
+/// PDE a walk passes through on its way to a leaf.
+///
+/// These are not the leaf's to decide, and deriving them from it is a trap this
+/// kernel fell into. The `x86_64` crate's `map_to` does exactly that: it masks
+/// the leaf flags down to `PRESENT | WRITABLE | USER_ACCESSIBLE` and stamps
+/// them on every table it has to create. Two properties make that wrong here.
+///
+/// The U/S bit is ANDed along the walk, so one level with U=0 makes its whole
+/// subtree a supervisor page whatever the leaf says - and a table is created
+/// once and then shared by everything that lands under it, so the first leaf's
+/// opinion becomes every later leaf's fate. `PROT_NONE` is where that bites:
+/// `handle_mmap` answers it with `MapFlags::READ` and no `USER` (correctly -
+/// ring 3 must not touch the page), the crate turns that into PRESENT-only
+/// tables, and every later `mmap(PROT_READ|PROT_WRITE)` under the same PDE span
+/// gets a writable user leaf beneath supervisor parents. musl's thread stack is
+/// exactly such a mapping, and the first write to it - `__copy_tls` storing the
+/// TCB header - faults forever on a page whose own PTE reads P=1 W=1 U=1.
+///
+/// R/W has the same shape for large pages, so both user bits go on every level
+/// below the user half rather than only where a leaf asked for them. That is
+/// what Linux does (`_PAGE_TABLE` is present, writable and user, always).
+const USER_TABLE_FLAGS: PageTableFlags = PageTableFlags::PRESENT
+    .union(PageTableFlags::WRITABLE)
+    .union(PageTableFlags::USER_ACCESSIBLE);
+
+/// The same for the kernel half: writable, and deliberately not user.
+const KERNEL_TABLE_FLAGS: PageTableFlags = PageTableFlags::PRESENT.union(PageTableFlags::WRITABLE);
+
 /// Physical frame of the kernel's root page table, set by [`install`]. Every
 /// address space copies the kernel half out of it.
 static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -93,7 +122,7 @@ pub unsafe fn install(info: &BootInfo, sections: &vm::KernelSections) -> usize {
         };
         let mut pool = FramePool { frames: 0 };
         for mapping in vm::kernel_mappings(info, sections) {
-            install_mapping(&mut tables, mapping, &mut pool);
+            install_mapping(&mut tables, mapping, KERNEL_TABLE_FLAGS, &mut pool);
         }
 
         unsafe {
@@ -167,6 +196,7 @@ pub fn map_mmio(virt: usize, phys: usize, len: usize) {
             // reachable from ring 3, whatever else a process manages to map.
             flags: MapFlags::READ | MapFlags::WRITE,
         },
+        KERNEL_TABLE_FLAGS,
         &mut pool,
     );
     // The tables are live the moment they are written, but the TLB is not, and
@@ -261,7 +291,7 @@ impl AddressSpace {
             )
         };
         let mut pool = FramePool { frames: 0 };
-        install_mapping(&mut tables, mapping, &mut pool);
+        install_mapping(&mut tables, mapping, USER_TABLE_FLAGS, &mut pool);
 
         // install_mapping skips the per-page invalidation because it is normally
         // building tables nothing is running on yet. If this one is live, reload
@@ -303,7 +333,15 @@ impl AddressSpace {
             .expect("aligned page");
         let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(mapping.phys as u64))
             .expect("aligned frame");
-        match unsafe { tables.map_to(page, frame, page_flags(mapping.flags), &mut pool) } {
+        match unsafe {
+            tables.map_to_with_table_flags(
+                page,
+                frame,
+                page_flags(mapping.flags),
+                USER_TABLE_FLAGS,
+                &mut pool,
+            )
+        } {
             Ok(flush) => flush.ignore(),
             Err(_) => return Err(PageTaken),
         }
@@ -437,7 +475,15 @@ impl AddressSpace {
             flags |= PageTableFlags::from_bits_truncate(COW_BIT);
         }
 
-        match unsafe { tables.map_to(page, frame, flags, &mut FramePool { frames: 0 }) } {
+        match unsafe {
+            tables.map_to_with_table_flags(
+                page,
+                frame,
+                flags,
+                USER_TABLE_FLAGS,
+                &mut FramePool { frames: 0 },
+            )
+        } {
             Ok(flush) => flush.ignore(),
             Err(_) => panic!("COW map failed at {virt:#x}"),
         }
@@ -636,20 +682,34 @@ impl AddressSpace {
     /// tables (not the active CR3) and return the physical frame it maps to.
     /// Used by the ELF loader to apply relocations through the direct map.
     pub fn phys_for_virt(&self, virt: usize) -> Option<usize> {
-        let mut table = self.root;
-        for level in (0..4).rev() {
-            let entry = table_entry(table, virt, level);
-            if entry & PRESENT == 0 {
-                return None;
-            }
-            let span = 1 << (12 + level * 9);
-            if level == 0 || entry & HUGE != 0 {
-                return Some(((entry & ADDR_MASK) | (virt & (span - 1)) as u64) as usize);
-            }
-            table = (entry & ADDR_MASK) as usize;
-        }
-        None
+        phys_for_virt_of(self.root, virt)
     }
+}
+
+/// Translate `virt` through the page tables `root` names, rather than through
+/// whatever CR3 happens to be holding.
+///
+/// [`AddressSpace::phys_for_virt`] is this walk for a caller that owns an
+/// address space. A `ptrace` tracer does not: it holds an id, and the memory it
+/// needs to read is by definition *not* the memory the active tables describe.
+/// Handing the root in is the whole difference, and it is the only safe way to
+/// reach another process's pages from a uniprocessor kernel - switching CR3 to
+/// do it would work and would also mean the kernel's own stack had to survive a
+/// page-table change mid-function for no reason.
+pub fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+    let mut table = root;
+    for level in (0..4).rev() {
+        let entry = table_entry(table, virt, level);
+        if entry & PRESENT == 0 {
+            return None;
+        }
+        let span = 1 << (12 + level * 9);
+        if level == 0 || entry & HUGE != 0 {
+            return Some(((entry & ADDR_MASK) | (virt & (span - 1)) as u64) as usize);
+        }
+        table = (entry & ADDR_MASK) as usize;
+    }
+    None
 }
 
 impl Default for AddressSpace {
@@ -868,6 +928,30 @@ pub fn leaf_pte(virt: usize) -> Option<u64> {
     None
 }
 
+/// Every paging-structure entry the walk for `virt` passes through, from the
+/// PML4 down, as `(level, entry)`. Slots past the end are `(0, 0)`.
+///
+/// The leaf's own bits are not the whole answer. A walk stops at the first
+/// absent entry or at a huge page, and a level the walk *does* pass through can
+/// still be what refuses an access - the U/S bit is ANDed along the walk, so a
+/// supervisor entry above a user leaf makes the page unreachable from ring 3
+/// whatever the leaf says. When a fault and [`leaf_pte`] disagree about a page,
+/// this is what says which level did it.
+pub fn entry_chain(virt: usize) -> [(u8, u64); 4] {
+    let (root, _) = Cr3::read();
+    let mut out = [(0u8, 0u64); 4];
+    let mut table = root.start_address().as_u64() as usize;
+    for (slot, level) in (0..4).rev().enumerate() {
+        let entry = table_entry(table, virt, level);
+        out[slot] = (level as u8, entry);
+        if entry & PRESENT == 0 || level == 0 || entry & HUGE != 0 {
+            break;
+        }
+        table = (entry & ADDR_MASK) as usize;
+    }
+    out
+}
+
 /// One entry of a page table, read through the direct map.
 fn entry_at(table: usize, index: usize) -> u64 {
     let entry = mm::phys_to_virt(table) + index * 8;
@@ -891,7 +975,12 @@ fn nx_supported() -> bool {
 ///
 /// Bigger pages are not just smaller tables: one TLB entry then covers a whole
 /// gigabyte of the direct map instead of a single 4 KiB slice of it.
-fn install_mapping(tables: &mut OffsetPageTable<'_>, mapping: Mapping, pool: &mut FramePool) {
+fn install_mapping(
+    tables: &mut OffsetPageTable<'_>,
+    mapping: Mapping,
+    table_flags: PageTableFlags,
+    pool: &mut FramePool,
+) {
     // Not redundant with the plan's own tests: a length that is not a whole number
     // of pages leaves a remainder no arm below can match, and the loop would spin
     // forever instead of failing.
@@ -910,7 +999,7 @@ fn install_mapping(tables: &mut OffsetPageTable<'_>, mapping: Mapping, pool: &mu
         for size in [Size1GiB::SIZE, Size2MiB::SIZE, Size4KiB::SIZE] {
             let size = size as usize;
             if left >= size && virt.is_multiple_of(size) && phys.is_multiple_of(size) {
-                map_chunk(tables, virt, phys, flags, size, pool);
+                map_chunk(tables, virt, phys, flags, table_flags, size, pool);
                 virt += size;
                 phys += size;
                 left -= size;
@@ -925,13 +1014,14 @@ fn map_chunk(
     virt: usize,
     phys: usize,
     flags: PageTableFlags,
+    table_flags: PageTableFlags,
     size: usize,
     pool: &mut FramePool,
 ) {
     match size as u64 {
-        Size1GiB::SIZE => map_one::<Size1GiB, _>(tables, virt, phys, flags, pool),
-        Size2MiB::SIZE => map_one::<Size2MiB, _>(tables, virt, phys, flags, pool),
-        _ => map_one::<Size4KiB, _>(tables, virt, phys, flags, pool),
+        Size1GiB::SIZE => map_one::<Size1GiB, _>(tables, virt, phys, flags, table_flags, pool),
+        Size2MiB::SIZE => map_one::<Size2MiB, _>(tables, virt, phys, flags, table_flags, pool),
+        _ => map_one::<Size4KiB, _>(tables, virt, phys, flags, table_flags, pool),
     }
 }
 
@@ -940,6 +1030,7 @@ fn map_one<S, M>(
     virt: usize,
     phys: usize,
     flags: PageTableFlags,
+    table_flags: PageTableFlags,
     pool: &mut FramePool,
 ) where
     S: PageSize + fmt::Debug,
@@ -949,7 +1040,7 @@ fn map_one<S, M>(
     let frame =
         PhysFrame::<S>::from_start_address(PhysAddr::new(phys as u64)).expect("aligned frame");
 
-    let result = unsafe { tables.map_to(page, frame, flags, pool) };
+    let result = unsafe { tables.map_to_with_table_flags(page, frame, flags, table_flags, pool) };
     match result {
         // These tables are not active yet, so there is nothing in the TLB to
         // invalidate; writing CR3 drops all of it at once.

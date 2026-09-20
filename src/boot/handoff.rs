@@ -171,3 +171,155 @@ fn kind_of(kind: u32) -> MemKind {
         _ => MemKind::Reserved,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use core::mem::{align_of, offset_of, size_of};
+
+    use super::*;
+
+    /// The loader's `Handoff` is `#[repr(C)]` and its twin lives in another
+    /// crate, so the field offsets are the ABI: a field inserted in one copy
+    /// and not the other is a machine that boots to a wrong address rather
+    /// than a compile error. These are the offsets `boot/src/handoff.rs` has
+    /// to agree with.
+    #[test]
+    fn the_record_lays_out_the_way_the_loader_writes_it() {
+        assert_eq!(size_of::<AbiRegion>(), 24);
+        assert_eq!(offset_of!(AbiRegion, base), 0);
+        assert_eq!(offset_of!(AbiRegion, length), 8);
+        assert_eq!(offset_of!(AbiRegion, kind), 16);
+
+        assert_eq!(align_of::<Handoff>(), 8);
+        assert_eq!(offset_of!(Handoff, magic), 0);
+        assert_eq!(offset_of!(Handoff, hhdm_offset), 8);
+        assert_eq!(offset_of!(Handoff, kernel_phys_base), 16);
+        assert_eq!(offset_of!(Handoff, kernel_virt_base), 24);
+        assert_eq!(offset_of!(Handoff, initramfs_phys), 32);
+        assert_eq!(offset_of!(Handoff, initramfs_len), 40);
+        assert_eq!(offset_of!(Handoff, cmdline_phys), 48);
+        assert_eq!(offset_of!(Handoff, cmdline_len), 56);
+        assert_eq!(offset_of!(Handoff, boot_stack_base), 64);
+        assert_eq!(offset_of!(Handoff, region_count), 72);
+        assert_eq!(offset_of!(Handoff, regions), 80);
+
+        // The loader zero-fills one page and writes the record into it, so a
+        // record that has grown past a page is a boot that cannot happen.
+        assert!(
+            size_of::<Handoff>() <= 4096,
+            "the handoff record is {} bytes, more than the page it lives in",
+            size_of::<Handoff>()
+        );
+    }
+
+    #[test]
+    fn the_magic_is_the_loaders_name_spelled_backwards_in_le_bytes() {
+        // Compared by eye against `boot/src/handoff.rs`; a loader built from
+        // an older copy fails the kernel's check rather than being misread.
+        // `M` is the low byte: the value read as a little-endian u64.
+        assert_eq!(HANDOFF_MAGIC, 0x544F_4F42_534F_504D);
+        assert_eq!(HANDOFF_MAGIC.to_le_bytes(), *b"MPOSBOOT");
+    }
+
+    #[test]
+    fn every_region_kind_the_loader_names_is_translated() {
+        assert_eq!(kind_of(KIND_USABLE), MemKind::Usable);
+        assert_eq!(kind_of(KIND_RESERVED), MemKind::Reserved);
+        assert_eq!(kind_of(KIND_ACPI_RECLAIMABLE), MemKind::AcpiReclaimable);
+        assert_eq!(kind_of(KIND_ACPI_NVS), MemKind::AcpiNvs);
+        assert_eq!(kind_of(KIND_BAD_MEMORY), MemKind::BadMemory);
+        assert_eq!(
+            kind_of(KIND_BOOTLOADER_RECLAIMABLE),
+            MemKind::BootloaderReclaimable
+        );
+        assert_eq!(kind_of(KIND_KERNEL_AND_MODULES), MemKind::KernelAndModules);
+        assert_eq!(kind_of(KIND_FRAMEBUFFER), MemKind::Framebuffer);
+        // A kind a newer loader invented is reserved, not usable: the cost of
+        // being wrong that way is memory, not corruption.
+        assert_eq!(kind_of(KIND_FRAMEBUFFER + 1), MemKind::Reserved);
+        assert_eq!(kind_of(0xffff_ffff), MemKind::Reserved);
+    }
+
+    /// A record the loader never got to fill in - no initramfs, no command
+    /// line, no regions - is what a diskless boot looks like, and it has to
+    /// read as absent rather than as address zero.
+    #[test]
+    fn an_empty_record_reads_as_nothing_loaded() {
+        let raw = Handoff {
+            magic: HANDOFF_MAGIC,
+            ..zeroed()
+        };
+        let info = unsafe { collect(&raw) };
+        assert_eq!(info.initramfs, None);
+        assert_eq!(info.cmdline, "");
+        assert_eq!(info.region_count, 0);
+        assert_eq!(info.boot_stack_base, 0);
+    }
+
+    /// The command line is the one field whose bytes the kernel reads, so it
+    /// is read through the direct map the loader names - here a map of zero,
+    /// which makes the physical address the address.
+    #[test]
+    fn the_command_line_and_the_regions_come_out_of_the_record() {
+        static LINE: &[u8] = b"root=/dev/vda2 quiet";
+
+        let mut raw = Handoff {
+            magic: HANDOFF_MAGIC,
+            hhdm_offset: 0,
+            kernel_phys_base: 0x100_000,
+            kernel_virt_base: 0xffff_ffff_8000_0000,
+            boot_stack_base: 0x200_000,
+            cmdline_phys: LINE.as_ptr() as u64,
+            cmdline_len: LINE.len() as u64,
+            region_count: 2,
+            ..zeroed()
+        };
+        raw.regions[0] = AbiRegion {
+            base: 0x100_000,
+            length: 0x40_000,
+            kind: KIND_KERNEL_AND_MODULES,
+            reserved: 0,
+        };
+        raw.regions[1] = AbiRegion {
+            base: 0x1_0000_0000,
+            length: 0x1000,
+            kind: KIND_FRAMEBUFFER,
+            reserved: 0,
+        };
+
+        let info = unsafe { collect(&raw) };
+        assert_eq!(info.cmdline, "root=/dev/vda2 quiet");
+        assert_eq!(info.kernel_phys_base, 0x100_000);
+        assert_eq!(info.kernel_virt_base, 0xffff_ffff_8000_0000);
+        assert_eq!(info.boot_stack_base, 0x200_000);
+        assert_eq!(info.region_count, 2);
+        assert_eq!(info.regions[0].base, 0x100_000);
+        assert_eq!(info.regions[0].length, 0x40_000);
+        assert_eq!(info.regions[0].kind, MemKind::KernelAndModules);
+        assert_eq!(info.regions[1].kind, MemKind::Framebuffer);
+        // The tail of the array is left alone: only what `region_count` names
+        // is a region the loader described.
+        assert_eq!(info.regions[2].length, 0);
+    }
+
+    /// A loader that loaded no initramfs says so with a zero length rather
+    /// than with a null pointer, and the translation has to answer "none"
+    /// instead of slicing from wherever the pointer points.
+    #[test]
+    fn a_zero_length_range_is_absent_not_a_slice_at_zero() {
+        let raw = Handoff {
+            magic: HANDOFF_MAGIC,
+            initramfs_phys: 0xdead_beef,
+            initramfs_len: 0,
+            ..zeroed()
+        };
+        assert_eq!(unsafe { collect(&raw) }.initramfs, None);
+    }
+
+    /// The loader defaults the record to zeroes, so `Handoff` cannot carry
+    /// padding the kernel would have to know about - and a test that spells
+    /// out all 3 kB of it once is enough.
+    fn zeroed() -> Handoff {
+        unsafe { core::mem::zeroed() }
+    }
+}

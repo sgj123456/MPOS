@@ -29,7 +29,7 @@
 |------|------|
 | **里程碑验证** | 每个子系统在构建下一个之前都会被证明正确。串口日志携带标记（`M0_OK` 到 `M14_OK`），由测试框架断言验证。 |
 | **主机可测试拆分** | 所有不涉及机器状态的代码都在库 crate 中，通过 `cargo test` 在主机上运行。机器相关代码位于 `#[cfg(target_os = "none")]` 之后。 |
-| **Linux ABI 兼容** | 实现了约 155 个 Linux x86_64 系统调用。基于 musl 的程序（Alpine、busybox）可直接在内核上运行。 |
+| **Linux ABI 兼容** | 实现了约 225 个 Linux x86_64 系统调用。基于 musl 的程序（Alpine、busybox）可直接在内核上运行。 |
 | **直写式 ext2** | 完整的可读写 ext2 实现，采用直写语义——无日志、无脏页追踪、崩溃即可见。 |
 | **优先级调度器** | 四个优先级带（LOW、NORMAL、HIGH、CRITICAL）之间严格优先级，带内轮转调度，基于截止时间的休眠队列，COW fork，按需分页栈增长。 |
 | **TCP/IP 网络** | 基于 smoltcp 的协议栈，支持 TCP、UDP、ICMP、ARP，运行在 virtio-net 上。仅支持 AF_INET——足以满足 musl DNS 解析器和 apk HTTP 通信。 |
@@ -51,7 +51,7 @@ graph TB
     end
 
     subgraph KernelSpace["内核空间 (Ring 0)"]
-        subgraph SyscallGate["系统调用门 (~155 个 Linux x86_64 调用)"]
+        subgraph SyscallGate["系统调用门 (~225 个 Linux x86_64 调用)"]
             SYSCALL["syscall / sysret"]
         end
 
@@ -289,7 +289,7 @@ mpos/
 
 ## 系统调用
 
-MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程序二进制兼容。分发表位于 `src/syscall/linux/mod.rs`。
+MPOS 实现了约 **225 个 Linux x86_64 系统调用**。POSIX 补全集(epoll、timerfd、*at 家族、身份、调度、内存建议)完全按 man 手册实现,每个标志值、结构布局和 errno 都由主机端测试钉死，与基于 musl 的程序二进制兼容。分发表位于 `src/syscall/linux/mod.rs`。
 
 ### 文件 I/O
 
@@ -325,6 +325,7 @@ MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程�
 | 82 | `rename` | 重命名路径（旧版） |
 | 83 | `mkdir` | 创建目录（旧版） |
 | 84 | `rmdir` | 删除空目录 |
+| 85 | `creat` | 创建或清空文件 —— 1970 年代的写法 |
 | 86 | `link` | 创建硬链接（返回 EPERM） |
 | 87 | `unlink` | 删除文件（旧版） |
 | 88 | `symlink` | 创建符号链接 |
@@ -334,31 +335,41 @@ MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程�
 | 92 | `chown` | 设置所有者（不强制执行） |
 | 93 | `fchown` | 按 fd 设置所有者 |
 | 94 | `lchown` | 设置符号链接所有者 |
+| 132 | `utime` | 设置时间戳,秒精度(旧式) |
 | 133 | `mknod` | 创建设备/FIFO 节点 |
 | 137 | `statfs` | 获取文件系统统计信息 |
 | 138 | `fstatfs` | 按 fd 获取文件系统统计信息 |
 | 162 | `sync` | 刷新脏数据（空操作） |
 | 165 | `mount` | 挂载文件系统 |
 | 166 | `umount2` | 卸载文件系统 |
+| 187 | `readahead` | 预读提示(本内核积极读入:空操作) |
 | 217 | `getdents64` | 读取目录条目 |
 | 235 | `utimes` | 设置时间戳（旧版） |
 | 257 | `openat` | 相对于 dirfd 打开 |
 | 258 | `mkdirat` | 相对于 dirfd 创建目录 |
+| 259 | `mknodat` | 相对 dirfd 创建节点 |
 | 260 | `fchownat` | 相对于 dirfd 设置所有者 |
+| 261 | `futimesat` | 相对 dirfd 设置时间戳 |
 | 262 | `newfstatat` | 相对于 dirfd stat |
 | 263 | `unlinkat` | 相对于 dirfd 删除文件 |
 | 264 | `renameat` | 相对于 dirfds 重命名 |
 | 265 | `linkat` | 相对于 dirfds 创建硬链接（返回 EPERM） |
 | 266 | `symlinkat` | 相对于 dirfd 创建符号链接 |
 | 267 | `readlinkat` | 相对于 dirfd 读取符号链接 |
+| 268 | `fchmodat` | 相对 dirfd 设置权限位 |
 | 269 | `faccessat` | 相对于 dirfd 检查可访问性 |
+| 275 | `splice` | 在管道与文件之间搬移字节 |
 | 280 | `utimensat` | 设置时间戳（纳秒精度） |
+| 285 | `fallocate` | 预分配文件空间 |
 | 292 | `dup3` | 带标志复制 fd |
 | 293 | `pipe2` | 带标志创建管道 |
 | 295 | `preadv` | 带偏移的矢量读 |
 | 296 | `pwritev` | 带偏移的矢量写 |
+| 306 | `syncfs` | 刷新一个描述符所在的文件系统 |
 | 316 | `renameat2` | 带标志重命名 |
+| 326 | `copy_file_range` | 内核内部跨文件复制 |
 | 332 | `statx` | 扩展 stat |
+| 437 | `openat2` | 以 struct open_how 打开(RESOLVE_*:EOPNOTSUPP) |
 
 ### 内存
 
@@ -369,7 +380,9 @@ MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程�
 | 11 | `munmap` | 取消内存映射 |
 | 12 | `brk` | 更改程序断点 |
 | 25 | `mremap` | 调整或移动映射 |
+| 26 | `msync` | 同步文件映射(私有副本:空操作) |
 | 28 | `madvise` | 内存建议（接受，空操作） |
+| 149 | `mlock` | 锁定页(本已全部驻留) |
 
 ### 进程
 
@@ -399,24 +412,45 @@ MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程�
 | 110 | `getppid` | 获取父进程 PID |
 | 111 | `getpgrp` | 获取进程组 |
 | 112 | `setsid` | 创建会话 |
+| 113 | `setreuid` | 设置真实/有效 UID(仅 root) |
+| 114 | `setregid` | 设置真实/有效 GID(仅 root) |
 | 115 | `getgroups` | 获取补充组 |
 | 116 | `setgroups` | 设置补充组 |
+| 117 | `setresuid` | 设置真实/有效/保存 UID |
+| 118 | `getresuid` | 获取真实/有效/保存 UID |
+| 119 | `setresgid` | 设置真实/有效/保存 GID |
+| 120 | `getresgid` | 获取真实/有效/保存 GID |
+| 122 | `setfsuid` | 设置文件系统 UID(返回前值) |
+| 123 | `setfsgid` | 设置文件系统 GID(返回前值) |
 | 121 | `getpgid` | 获取进程的进程组 |
 | 124 | `getsid` | 获取会话 ID |
+| 125 | `capget` | 获取能力状态(root:全部许可) |
+| 126 | `capset` | 设置能力状态 |
+| 135 | `personality` | 执行域(查询 + PER_LINUX) |
+| 140 | `getpriority` | 获取 nice 值(内核 20-nice 编码) |
+| 141 | `setpriority` | 设置 nice 值(校验,不生效) |
 | 155 | `pivot_root` | 切换根文件系统 |
 | 157 | `prctl` | 进程控制（PR_GET_NAME 等） |
 | 160 | `setrlimit` | 设置资源限制（接受） |
 | 161 | `chroot` | 切换根目录 |
 | 169 | `reboot` | 重启/关机 |
 | 170 | `sethostname` | 设置主机名（接受，不存储） |
+| 171 | `setdomainname` | 设置域名(procfs 存储) |
 | 186 | `gettid` | 获取线程 ID |
 | 200 | `tkill` | 向线程发送信号 |
+| 234 | `tgkill` | 定向进程组中的一个线程发信号 |
 | 201 | `time` | 获取 epoch 以来的秒数 |
 | 231 | `exit_group` | 终止所有线程 |
 | 247 | `waitid` | 等待子进程（siginfo_t） |
+| 272 | `unshare` | 脱离命名空间(不存在:EOPNOTSUPP) |
 | 273 | `set_robust_list` | 注册健壮 futex 列表 |
 | 274 | `get_robust_list` | 获取健壮 futex 列表（返回 ENOSYS） |
+| 309 | `getcpu` | 所在 CPU 与节点(单核,节点 0) |
+| 317 | `seccomp` | 安全计算模式(ENOSYS;探测返回空) |
 | 302 | `prlimit64` | 获取/设置资源限制 |
+| 308 | `setns` | 加入命名空间(不存在:EINVAL) |
+| 310 | `process_vm_readv` | 读另一进程内存 |
+| 311 | `process_vm_writev` | 写另一进程内存 |
 | 324 | `membarrier` | 内存屏障（单核上为空操作） |
 | 334 | `rseq` | 注册可重启序列（接受） |
 
@@ -427,7 +461,10 @@ MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程�
 | 13 | `rt_sigaction` | 获取/设置信号处置 |
 | 14 | `rt_sigprocmask` | 获取/设置信号掩码 |
 | 15 | `rt_sigreturn` | 从信号处理程序返回 |
+| 34 | `pause` | 等待被捕获的信号(EINTR) |
 | 128 | `rt_sigtimedwait` | 等待集合中的信号 |
+| 129 | `rt_sigqueueinfo` | 附带 siginfo_t 的 kill(向非自身发 SI_USER:EPERM) |
+| 130 | `rt_sigsuspend` | 换掩码并等待掩码外的信号 |
 | 131 | `sigaltstack` | 获取/设置备用信号栈 |
 
 ### I/O 多路复用
@@ -438,6 +475,12 @@ MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程�
 | 23 | `select` | fd_set 式等待 |
 | 270 | `pselect6` | select + 纳秒超时 + 信号掩码 |
 | 271 | `ppoll` | poll + 纳秒超时 + 信号掩码 |
+| 213 | `epoll_create` | 创建 epoll 实例(size 被忽略但须为正) |
+| 232 | `epoll_wait` | 从兴趣表收集就绪条目 |
+| 233 | `epoll_ctl` | 增改删兴趣表条目 |
+| 281 | `epoll_pwait` | 带信号掩码的 epoll_wait |
+| 291 | `epoll_create1` | 带标志创建 epoll 实例 |
+| 441 | `epoll_pwait2` | timespec 超时版的 epoll_pwait |
 
 ### 时间与定时器
 
@@ -448,15 +491,28 @@ MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程�
 | 37 | `alarm` | 一次性闹钟 |
 | 38 | `setitimer` | 设置间隔定时器 |
 | 96 | `gettimeofday` | 获取墙钟时间（timeval） |
+| 164 | `settimeofday` | 设置墙上时钟(移动 RTC 锚点) |
 | 228 | `clock_gettime` | 获取时钟（REALTIME、MONOTONIC、PROCESS_CPUTIME_ID） |
 | 229 | `clock_getres` | 获取时钟分辨率 |
 | 230 | `clock_nanosleep` | 带时钟规范的休眠 |
+| 283 | `timerfd_create` | 以描述符报告的定时器 |
+| 286 | `timerfd_settime` | 启停(ABSTIME、CANCEL_ON_SET) |
+| 287 | `timerfd_gettime` | 剩余时间与间隔 |
 
 ### 调度
 
 | # | 名称 | 说明 |
 |:-:|------|------|
 | 24 | `sched_yield` | 让出 CPU |
+| 142 | `sched_setparam` | 设置调度参数(SCHED_OTHER:零) |
+| 143 | `sched_getparam` | 获取调度参数 |
+| 144 | `sched_setscheduler` | 设置策略(SCHED_OTHER;FIFO/RR:EOPNOTSUPP) |
+| 145 | `sched_getscheduler` | 获取策略(恒为 SCHED_OTHER) |
+| 146 | `sched_get_priority_max` | 策略的最高优先级(man 页表) |
+| 147 | `sched_get_priority_min` | 策略的最低优先级 |
+| 148 | `sched_rr_get_interval` | 轮转切片(timespec) |
+| 314 | `sched_setattr` | 可扩展调度属性(设置) |
+| 315 | `sched_getattr` | 可扩展调度属性(获取) |
 | 158 | `arch_prctl` | 设置 FS/GS 基址（TLS） |
 | 202 | `futex` | Futex wait/wake |
 | 203 | `sched_setaffinity` | 设置 CPU 亲和性 |
@@ -489,12 +545,17 @@ MPOS 实现了约 **155 个 Linux x86_64 系统调用**，与基于 musl 的程�
 | 53 | `socketpair` | 创建 socket 对 |
 | 54 | `setsockopt` | 设置 socket 选项 |
 | 55 | `getsockopt` | 获取 socket 选项 |
+| 288 | `accept4` | 带标志的 accept(随后 EOPNOTSUPP:无 TCP accept) |
+| 299 | `recvmmsg` | 收多条消息,带超时 |
+| 307 | `sendmmsg` | 发多条消息 |
 
 ### 杂项 / Stub
 
 | # | 名称 | 说明 |
 |:-:|------|------|
 | 95 | `umask` | 获取/设置文件创建掩码（不强制执行） |
+| 103 | `syslog` | 内核日志环,klogctl 0-10 型 |
+| 153 | `vhangup` | 虚拟挂起终端(空操作) |
 | 282 | `signalfd` | 创建信号 fd |
 | 289 | `signalfd4` | 带标志创建信号 fd |
 | 290 | `eventfd` | 创建事件计数 fd |

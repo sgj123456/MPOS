@@ -255,6 +255,7 @@ fn extract_rela(
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::{MapFlags, parse};
+    use alloc::vec;
     use alloc::vec::Vec;
 
     /// Assemble a minimal ELF64: one Ehdr, one Phdr per entry - each a
@@ -292,6 +293,7 @@ mod tests {
     }
 
     const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
     const PT_INTERP: u32 = 3;
     const PT_NOTE: u32 = 4;
 
@@ -399,6 +401,101 @@ mod tests {
         // has no vaddr of its own and must not turn into a segment.
         assert_eq!(image.segments.len(), 1);
         assert_eq!(image.segments[0].vaddr, 0x1000);
+    }
+
+    /// One `Elf64_Rela` record: where to write, what kind it is (the low half
+    /// of `r_info`, with the symbol index above it), and the addend.
+    fn rela(r_offset: u64, r_type: u32, r_addend: i64) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..8].copy_from_slice(&r_offset.to_le_bytes());
+        out[8..16].copy_from_slice(&(r_type as u64).to_le_bytes());
+        out[16..24].copy_from_slice(&r_addend.to_le_bytes());
+        out
+    }
+
+    /// One `(d_tag, d_val)` pair of a `PT_DYNAMIC` table.
+    fn dyn_entry(tag: u64, val: u64) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..8].copy_from_slice(&tag.to_le_bytes());
+        out[8..16].copy_from_slice(&val.to_le_bytes());
+        out
+    }
+
+    /// A static-pie binary lists its `R_X86_64_RELATIVE` entries in `.rela.dyn`
+    /// and the runtime linker would apply them. The loader applies only that
+    /// one kind - it is the only one that needs nothing but a base address -
+    /// so the table is read out of the dynamic segment and filtered.
+    #[test]
+    fn the_relative_relocations_are_the_ones_the_loader_reads() {
+        // The table sits 16 bytes into the load segment, so reading it means
+        // translating a virtual address to a file offset rather than assuming
+        // it starts at the segment.
+        let mut table = Vec::new();
+        table.extend_from_slice(&[0u8; 16]);
+        table.extend_from_slice(&rela(0x2000, 8, 0x1234)); // R_X86_64_RELATIVE
+        table.extend_from_slice(&rela(0x3000, 1, 0x99)); // some other kind
+        table.extend_from_slice(&rela(0x4000, 8, -8)); // relative again
+
+        let mut dynamic = Vec::new();
+        dynamic.extend_from_slice(&dyn_entry(7, 0x1000 + 16)); // DT_RELA
+        dynamic.extend_from_slice(&dyn_entry(8, 72)); // DT_RELASZ
+        dynamic.extend_from_slice(&dyn_entry(9, 24)); // DT_RELAENT
+        dynamic.extend_from_slice(&dyn_entry(0, 0)); // DT_NULL
+
+        let bytes = elf(
+            0x1000,
+            &[
+                (PT_LOAD, 6, 0x1000, 0x200, &table),
+                (PT_DYNAMIC, 6, 0x2000, 0x100, &dynamic),
+            ],
+        );
+        let image = parse(&bytes).expect("parses");
+        assert_eq!(image.rela, vec![(0x2000, 0x1234), (0x4000, -8)]);
+    }
+
+    /// A record size the loader does not use is a file it must not guess at:
+    /// the stride is what turns a byte range into records, and reading the
+    /// wrong one would produce addresses out of the middle of a field.
+    #[test]
+    fn a_rela_table_of_an_unknown_record_size_is_left_alone() {
+        let mut table = Vec::new();
+        table.extend_from_slice(&rela(0x2000, 8, 0x1234));
+
+        let mut dynamic = Vec::new();
+        dynamic.extend_from_slice(&dyn_entry(7, 0x1000)); // DT_RELA
+        dynamic.extend_from_slice(&dyn_entry(8, 24)); // DT_RELASZ
+        dynamic.extend_from_slice(&dyn_entry(9, 16)); // DT_RELAENT, not 24
+        dynamic.extend_from_slice(&dyn_entry(0, 0));
+
+        let bytes = elf(
+            0x1000,
+            &[
+                (PT_LOAD, 6, 0x1000, 0x100, &table),
+                (PT_DYNAMIC, 6, 0x2000, 0x100, &dynamic),
+            ],
+        );
+        assert!(parse(&bytes).expect("parses").rela.is_empty());
+    }
+
+    /// `DT_RELA` is a virtual address, and one no segment covers names bytes
+    /// that are not in the file - which is a malformed image, not a table to
+    /// read at whatever offset the arithmetic happens to produce.
+    #[test]
+    fn a_rela_table_outside_every_segment_is_left_alone() {
+        let mut dynamic = Vec::new();
+        dynamic.extend_from_slice(&dyn_entry(7, 0x900_000)); // nowhere
+        dynamic.extend_from_slice(&dyn_entry(8, 24));
+        dynamic.extend_from_slice(&dyn_entry(9, 24));
+        dynamic.extend_from_slice(&dyn_entry(0, 0));
+
+        let bytes = elf(
+            0x1000,
+            &[
+                (PT_LOAD, 6, 0x1000, 0x100, b"code"),
+                (PT_DYNAMIC, 6, 0x2000, 0x100, &dynamic),
+            ],
+        );
+        assert!(parse(&bytes).expect("parses").rela.is_empty());
     }
 
     #[test]

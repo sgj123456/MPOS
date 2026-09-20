@@ -29,7 +29,7 @@ The kernel is organized as a **Rust library** (`src/lib.rs`) that can be unit-te
 |---------|-------------|
 | **Milestone Verification** | Each subsystem is proven correct before the next is built. Serial logs carry markers (`M0_OK` through `M14_OK`) asserted by the test harness. |
 | **Host-Testable Split** | Architecture-independent code lives in the library crate and runs on the host via `cargo test`. Machine-dependent code is gated behind `#[cfg(target_os = "none")]`. |
-| **Linux ABI Compatible** | ~155 Linux x86_64 system calls implemented. musl binaries (Alpine, busybox) run unmodified on the kernel. |
+| **Linux ABI Compatible** | ~225 Linux x86_64 system calls implemented. musl binaries (Alpine, busybox) run unmodified on the kernel. |
 | **Write-Through ext2** | Complete read/write ext2 with write-through semantics—no journal, no dirty page tracking, crash-visible. |
 | **Priority Scheduler** | Strict priority across four bands (LOW, NORMAL, HIGH, CRITICAL), round-robin within a band, deadline-based sleep queue, COW fork, demand-paged stack growth. |
 | **TCP/IP Networking** | smoltcp-based stack with TCP, UDP, ICMP, ARP over virtio-net. AF_INET only—sufficient for musl's DNS resolver and apk's HTTP. |
@@ -51,7 +51,7 @@ graph TB
     end
 
     subgraph KernelSpace["Kernel Space (Ring 0)"]
-        subgraph SyscallGate["Syscall Gate (~155 Linux x86_64 calls)"]
+        subgraph SyscallGate["Syscall Gate (~225 Linux x86_64 calls)"]
             SYSCALL["syscall / sysret"]
         end
 
@@ -287,7 +287,7 @@ mpos/
 
 ## Syscalls
 
-MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible with musl-based programs. The dispatch table is in `src/syscall/linux/mod.rs`.
+MPOS implements **~225 Linux x86_64 system calls**, making it binary-compatible with musl-based programs. The dispatch table is in `src/syscall/linux/mod.rs`.
 
 ### File I/O
 
@@ -323,6 +323,7 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 82 | `rename` | Rename path (legacy) |
 | 83 | `mkdir` | Create directory (legacy) |
 | 84 | `rmdir` | Remove empty directory |
+| 85 | `creat` | Create-or-truncate, the 1970s spelling |
 | 86 | `link` | Create hard link (returns EPERM) |
 | 87 | `unlink` | Remove file (legacy) |
 | 88 | `symlink` | Create symbolic link |
@@ -332,31 +333,41 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 92 | `chown` | Set owner (not enforced) |
 | 93 | `fchown` | Set owner by fd |
 | 94 | `lchown` | Set symlink owner |
+| 132 | `utime` | Set timestamps, seconds-only (legacy) |
 | 133 | `mknod` | Create device/FIFO node |
 | 137 | `statfs` | Get filesystem stats |
 | 138 | `fstatfs` | Get filesystem stats by fd |
 | 162 | `sync` | Flush dirty data (no-op) |
 | 165 | `mount` | Mount filesystem |
 | 166 | `umount2` | Unmount filesystem |
+| 187 | `readahead` | Read a range early (eager: no-op) |
 | 217 | `getdents64` | Read directory entries |
 | 235 | `utimes` | Set timestamps (legacy) |
 | 257 | `openat` | Open relative to dirfd |
 | 258 | `mkdirat` | Create directory relative to dirfd |
+| 259 | `mknodat` | Create node relative to dirfd |
 | 260 | `fchownat` | Set owner relative to dirfd |
+| 261 | `futimesat` | Set timestamps relative to dirfd |
 | 262 | `newfstatat` | Stat relative to dirfd |
 | 263 | `unlinkat` | Remove file relative to dirfd |
 | 264 | `renameat` | Rename relative to dirfds |
 | 265 | `linkat` | Hard link relative to dirfds (returns EPERM) |
 | 266 | `symlinkat` | Symlink relative to dirfd |
 | 267 | `readlinkat` | Readlink relative to dirfd |
+| 268 | `fchmodat` | Set permission bits relative to dirfd |
 | 269 | `faccessat` | Check accessibility relative to dirfd |
+| 275 | `splice` | Move bytes between a pipe and a file |
 | 280 | `utimensat` | Set timestamps (ns precision) |
+| 285 | `fallocate` | Preallocate file space |
 | 292 | `dup3` | Duplicate fd with flags |
 | 293 | `pipe2` | Create pipe with flags |
 | 295 | `preadv` | Vectored read at offset |
 | 296 | `pwritev` | Vectored write at offset |
+| 306 | `syncfs` | Flush the filesystem of one fd |
 | 316 | `renameat2` | Rename with flags |
+| 326 | `copy_file_range` | Kernel-internal copy between files |
 | 332 | `statx` | Extended stat |
+| 437 | `openat2` | Open with struct open_how (RESOLVE_*: EOPNOTSUPP) |
 
 ### Memory
 
@@ -367,7 +378,9 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 11 | `munmap` | Unmap memory range |
 | 12 | `brk` | Change program break |
 | 25 | `mremap` | Resize or move mapping |
+| 26 | `msync` | Sync a file mapping (private copies: no-op) |
 | 28 | `madvise` | Memory advice (accepted, no-op) |
+| 149 | `mlock` | Pin pages (all already resident) |
 
 ### Process
 
@@ -386,7 +399,7 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 98 | `getrusage` | Get resource usage (returns zeros) |
 | 99 | `sysinfo` | Get system info (uptime, memory) |
 | 100 | `times` | Get CPU time in ticks |
-| 101 | `ptrace` | Process trace (returns EPERM) |
+| 101 | `ptrace` | Trace syscalls, signals and memory (strace runs) |
 | 102 | `getuid` | Get user ID (always 0) |
 | 104 | `getgid` | Get group ID (always 0) |
 | 105 | `setuid` | Set user ID |
@@ -397,24 +410,45 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 110 | `getppid` | Get parent PID |
 | 111 | `getpgrp` | Get process group |
 | 112 | `setsid` | Create session |
+| 113 | `setreuid` | Set real/effective UID (root only) |
+| 114 | `setregid` | Set real/effective GID (root only) |
 | 115 | `getgroups` | Get supplementary groups |
 | 116 | `setgroups` | Set supplementary groups |
+| 117 | `setresuid` | Set real/effective/saved UID |
+| 118 | `getresuid` | Get real/effective/saved UID |
+| 119 | `setresgid` | Set real/effective/saved GID |
+| 120 | `getresgid` | Get real/effective/saved GID |
+| 122 | `setfsuid` | Set filesystem UID (answers previous) |
+| 123 | `setfsgid` | Set filesystem GID (answers previous) |
 | 121 | `getpgid` | Get process group of PID |
 | 124 | `getsid` | Get session ID |
+| 125 | `capget` | Get capability state (root: all permitted) |
+| 126 | `capset` | Set capability state |
+| 135 | `personality` | Execution persona (query + PER_LINUX) |
+| 140 | `getpriority` | Get nice value (kernel 20-nice encoding) |
+| 141 | `setpriority` | Set nice value (validated, not enforced) |
 | 155 | `pivot_root` | Change root filesystem |
 | 157 | `prctl` | Process control (PR_GET_NAME, ...) |
 | 160 | `setrlimit` | Set resource limits (accepted) |
 | 161 | `chroot` | Change root directory |
 | 169 | `reboot` | Reboot/shutdown |
-| 170 | `sethostname` | Set hostname (accepted, not stored) |
+| 170 | `sethostname` | Set hostname (stored, read back by uname) |
+| 171 | `setdomainname` | Set domain name (stored in procfs) |
 | 186 | `gettid` | Get thread ID |
 | 200 | `tkill` | Send signal to thread |
+| 234 | `tgkill` | Signal one thread of a group |
 | 201 | `time` | Get seconds since epoch |
 | 231 | `exit_group` | Terminate all threads |
 | 247 | `waitid` | Wait for child (siginfo_t) |
+| 272 | `unshare` | Leave namespaces (none exist: EOPNOTSUPP) |
 | 273 | `set_robust_list` | Register robust futex list |
 | 274 | `get_robust_list` | Get robust futex list (returns ENOSYS) |
+| 309 | `getcpu` | Which CPU and node (one core, node 0) |
+| 317 | `seccomp` | Secure computing (ENOSYS; probe: empty) |
 | 302 | `prlimit64` | Get/set resource limits |
+| 308 | `setns` | Join a namespace (none: EINVAL) |
+| 310 | `process_vm_readv` | Read memory of another process |
+| 311 | `process_vm_writev` | Write memory of another process |
 | 324 | `membarrier` | Memory barrier (no-op on single core) |
 | 334 | `rseq` | Register restartable sequence (accepted) |
 
@@ -425,7 +459,10 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 13 | `rt_sigaction` | Get/set signal disposition |
 | 14 | `rt_sigprocmask` | Get/set signal mask |
 | 15 | `rt_sigreturn` | Return from signal handler |
+| 34 | `pause` | Wait for a caught signal (EINTR) |
 | 128 | `rt_sigtimedwait` | Wait for signal from set |
+| 129 | `rt_sigqueueinfo` | kill with a siginfo_t (SI_USER to non-self: EPERM) |
+| 130 | `rt_sigsuspend` | Swap mask and wait for a signal outside it |
 | 131 | `sigaltstack` | Get/set alternate signal stack |
 
 ### I/O Multiplexing
@@ -436,6 +473,12 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 23 | `select` | fd_set-based wait |
 | 270 | `pselect6` | select with ns timeout + signal mask |
 | 271 | `ppoll` | poll with ns timeout + signal mask |
+| 213 | `epoll_create` | Create an epoll instance (size ignored, must be positive) |
+| 232 | `epoll_wait` | Collect ready entries from the interest list |
+| 233 | `epoll_ctl` | Add, change or delete interest-list entries |
+| 281 | `epoll_pwait` | epoll_wait with a signal mask |
+| 291 | `epoll_create1` | Create an epoll instance with flags |
+| 441 | `epoll_pwait2` | epoll_pwait with a timespec timeout |
 
 ### Time & Timers
 
@@ -446,15 +489,28 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 37 | `alarm` | One-shot alarm |
 | 38 | `setitimer` | Set interval timer |
 | 96 | `gettimeofday` | Get wall time (timeval) |
+| 164 | `settimeofday` | Set the wall clock (moves the RTC anchor) |
 | 228 | `clock_gettime` | Get clock (REALTIME, MONOTONIC, PROCESS_CPUTIME_ID) |
 | 229 | `clock_getres` | Get clock resolution |
 | 230 | `clock_nanosleep` | Sleep with clock specification |
+| 283 | `timerfd_create` | A timer that reports through a descriptor |
+| 286 | `timerfd_settime` | Arm or disarm (ABSTIME, CANCEL_ON_SET) |
+| 287 | `timerfd_gettime` | The time left, and the interval |
 
 ### Scheduling
 
 | # | Name | Description |
 |:-:|------|-------------|
 | 24 | `sched_yield` | Yield CPU |
+| 142 | `sched_setparam` | Set the scheduling parameter (SCHED_OTHER: zero) |
+| 143 | `sched_getparam` | Get the scheduling parameter |
+| 144 | `sched_setscheduler` | Set policy (SCHED_OTHER; FIFO/RR: EOPNOTSUPP) |
+| 145 | `sched_getscheduler` | Get policy (always SCHED_OTHER) |
+| 146 | `sched_get_priority_max` | A policy top priority (man page table) |
+| 147 | `sched_get_priority_min` | A policy bottom priority |
+| 148 | `sched_rr_get_interval` | The round-robin slice, as a timespec |
+| 314 | `sched_setattr` | Extensible scheduling attributes (set) |
+| 315 | `sched_getattr` | Extensible scheduling attributes (get) |
 | 158 | `arch_prctl` | Set FS/GS base (TLS) |
 | 202 | `futex` | Futex wait/wake |
 | 203 | `sched_setaffinity` | Set CPU affinity |
@@ -487,12 +543,17 @@ MPOS implements **~155 Linux x86_64 system calls**, making it binary-compatible 
 | 53 | `socketpair` | Create socket pair |
 | 54 | `setsockopt` | Set socket option |
 | 55 | `getsockopt` | Get socket option |
+| 288 | `accept4` | Accept with flags (then EOPNOTSUPP: no TCP accept) |
+| 299 | `recvmmsg` | Receive multiple messages, with a timeout |
+| 307 | `sendmmsg` | Send multiple messages |
 
 ### Misc / Stubs
 
 | # | Name | Description |
 |:-:|------|-------------|
 | 95 | `umask` | Get/set file creation mask (not enforced) |
+| 103 | `syslog` | Kernel log ring, klogctl types 0-10 |
+| 153 | `vhangup` | Virtually hang up the terminal (no-op) |
 | 282 | `signalfd` | Create signal fd |
 | 289 | `signalfd4` | Create signal fd with flags |
 | 290 | `eventfd` | Create event counter fd |
