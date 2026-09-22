@@ -1410,7 +1410,8 @@ impl Tty {
             return 0;
         }
         let id = crate::sched::current();
-        critical_section::with(|cs| self.waiters.borrow(cs).borrow_mut().push(id));
+        // The waiter is registered inside `read_blocking`, re-armed on every
+        // pass, rather than once here - see the reason there.
         // While this task is reading, an interrupt typed at the console is
         // meant for its process group - not for whatever waits on it. A shell
         // that has claimed the terminal with `TIOCSPGRP` has already said who
@@ -1453,7 +1454,19 @@ impl Tty {
 
     #[cfg(target_os = "none")]
     fn read_blocking(&self, buf: &mut [u8]) -> usize {
+        let id = crate::sched::current();
         loop {
+            // Re-arm the waiter on every pass, not once. `receive_byte` wakes
+            // by taking the WHOLE waiter list, so a reader that loses a line to
+            // another reader has already been removed from it; if it parked
+            // again without re-registering, the next line would not name it and
+            // it would hang. pipe and eventfd re-arm across their own retries
+            // for the same reason; the `retain` keeps the list to one entry.
+            critical_section::with(|cs| {
+                let mut w = self.waiters.borrow(cs).borrow_mut();
+                w.retain(|&x| x != id);
+                w.push(id);
+            });
             crate::sched::block_until(|| self.has_ready());
             let got = critical_section::with(|cs| self.ld.borrow(cs).borrow_mut().take(buf.len()));
             // `None` means another reader took it first; wait for the next one.

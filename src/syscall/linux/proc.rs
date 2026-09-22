@@ -788,7 +788,11 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // it, and on x86_64 the registers are its first member, so an offset
         // inside the register file is the only one that names anything here.
         abi::PTRACE_PEEKUSER | abi::PTRACE_POKEUSER => {
-            if addr + 8 > abi::uregs::BYTES {
+            // `addr` is a caller-supplied byte offset; adding the 8-byte word
+            // length must not wrap, or a huge offset slips past the bound here
+            // and `regs[addr / 8]` indexes out of the register file. Overflow
+            // (checked_add yields None) is out of range, same as too-large.
+            if addr.checked_add(8).map_or(true, |end| end > abi::uregs::BYTES) {
                 return err::EIO;
             }
             let Some(mut regs) = crate::sched::trace_regs(id) else {
@@ -2571,6 +2575,12 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     if tp == 0 {
         return err::EFAULT;
     }
+    // The timespec goes into the caller's memory two words deep; a non-null but
+    // unmapped pointer must answer EFAULT here, as `clock_getres` and every
+    // other writer does - not be written through blindly.
+    if !buffer_ok(tp, 16, true, true) {
+        return err::EFAULT;
+    }
     // Return the tick count, anchored to the RTC's wall time for the
     // REALTIME clocks.
     let ticks = crate::arch::timer::ticks();
@@ -2606,6 +2616,11 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
 pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
     let tv = args[0];
     if tv == 0 {
+        return err::EFAULT;
+    }
+    // Same as `clock_gettime`: the `timeval` is two words written into the
+    // caller's pointer, so a non-null but unaddressable one is EFAULT.
+    if !buffer_ok(tv, 16, true, true) {
         return err::EFAULT;
     }
     // gettimeofday has no monotonic variant - every caller wants the wall
