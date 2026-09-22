@@ -275,7 +275,6 @@ pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> 
     let row_of = |ep: IpEndpoint| -> ([u8; 4], u16) {
         match ep.addr {
             IpAddress::Ipv4(v4) => (v4.octets(), ep.port),
-            _ => ([0, 0, 0, 0], ep.port),
         }
     };
     with_stack(|st| {

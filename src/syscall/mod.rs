@@ -301,19 +301,6 @@ pub(crate) fn cstr_arg(ptr: usize, from_user: bool) -> Result<alloc::string::Str
 /// block's total - `COLLECT_GCC_OPTIONS` and friends from a real compiler
 /// run past 255 bytes easily - and refusing one is what makes `gcc` fail
 /// with `posix_spawn: Filename too long` before it ever runs a subprocess.
-pub(crate) fn cstr_env(ptr: usize, from_user: bool) -> Result<alloc::string::String, isize> {
-    cstr_limit(ptr, from_user, MAX_ARG_STR)
-}
-
-/// The per-string ceiling of `execve`'s arrays. Linux's own limit is
-/// `MAX_ARG_STRLEN` = 32 pages minus a byte - 131071 - for each of argv and
-/// envp, and a string may be as large as the whole argument block; this takes
-/// the same shape at the scale of the stack a program starts with.
-///
-/// It has to be generous for the same reason the block below is: a *program*
-/// is not a pathname. `fish`'s completion machinery runs a helper with an
-/// `awk` script as one argument - several kilobytes of it - and a per-string
-/// ceiling of a page refused it with `Name is too long` before `awk` ever ran.
 pub(crate) const MAX_ARG_STR: usize = crate::sched::ARGS_BYTES_MAX;
 
 fn cstr_limit(ptr: usize, from_user: bool, limit: usize) -> Result<alloc::string::String, isize> {

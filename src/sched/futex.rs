@@ -78,6 +78,11 @@ pub const BITSET_ANY: u32 = u32::MAX;
 /// with nobody there is not an error: it is the common case. This is the
 /// match-any form - `FUTEX_WAKE` reaches every sleeper on the address,
 /// whatever bitset they slept under.
+///
+/// The host model of a wake (`wake_all`'s test path and the unit tests below)
+/// marks with this; the kernel path reaches sleepers through `wake`, so on the
+/// `none` target it has no caller.
+#[cfg(not(target_os = "none"))]
 fn mark_woken(address: usize, count: usize) -> usize {
     mark_woken_bitset(address, count, BITSET_ANY)
 }
