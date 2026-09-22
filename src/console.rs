@@ -78,13 +78,24 @@ pub fn dmesg_capacity() -> usize {
     DMESG_CAP
 }
 
-/// Write raw bytes on the console, as one uninterruptible chunk.
+/// Write raw bytes on the console, as chunks with the clock live between them.
 ///
-/// The syscall `write` handler uses this: it has bytes rather than format
-/// arguments, and the same line-at-a-time exclusion as [`print_args`] so a
-/// preempted task cannot interleave into the middle of one.
+/// The syscall `write` handler uses this for program output, which can be a
+/// large buffer at once. The old form held the one critical section across the
+/// whole buffer - and the 16550 spins on the transmitter-empty bit per byte, so
+/// a few kilobytes of output blanked interrupts long enough to starve the
+/// receiver and lose ticks (the laggy, dropped-input console this is meant to
+/// fix). Writing a chunk at a time keeps the section only around the register
+/// traffic that must not interleave, and re-enables interrupts between chunks so
+/// the RX interrupt and timer keep running. UART register writes are
+/// independently atomic MMIO, so a handler that prints in the gap merely
+/// interleaves at chunk granularity - far cheaper than freezing the clock, and
+/// the panic path already accepts the same trade.
 pub fn write_bytes(bytes: &[u8]) {
-    critical_section::with(|_| crate::drivers::serial::write_bytes(bytes));
+    const CHUNK: usize = 64;
+    for piece in bytes.chunks(CHUNK) {
+        critical_section::with(|_| crate::drivers::serial::write_bytes(piece));
+    }
 }
 
 #[doc(hidden)]

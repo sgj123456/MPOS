@@ -15,12 +15,12 @@
 //! `clone(CLONE_VM|CLONE_VFORK)`. Every check below is therefore also a check on
 //! that flag word: if the kernel refused it, none of this would run at all.
 //!
-//! One thing this deliberately does *not* use is `Command::output()`. That path
-//! has the parent read its children's pipes itself, and on Linux it does so with
-//! a non-blocking `fcntl` plus `poll` - neither of which this kernel implements.
-//! A shell can live without it: the pipeline form below gets the same data to the
-//! same place without the parent in the middle. It is worth knowing which half of
-//! `std` works here, and this is the line between them.
+//! One thing this used to avoid was `Command::output()`. That path has the
+//! parent read both of the child's pipes itself, which std does by putting them
+//! in non-blocking mode and then polling them - and on Linux the non-blocking
+//! step is `ioctl(FIONBIO)`, not `fcntl` (that is the non-Linux arm). The
+//! request was missing here, and every `output()` died with "Not a tty", which
+//! is what `rustup-init` panicked of. It is checked below now that it exists.
 
 use std::fs::File;
 use std::process::{Command, Stdio};
@@ -135,6 +135,36 @@ fn main() {
         }
         Err(e) => {
             println!("FAIL: /bin/false could not be spawned: {e}");
+            failed = true;
+        }
+    }
+
+    // 6. `Command::output()`, the path where the parent reads both of the
+    //    child's pipes itself. std puts them in non-blocking mode first - with
+    //    `ioctl(FIONBIO)` on Linux - and then polls them, so this also pins
+    //    that request. Both streams are checked, because it is the two-pipe
+    //    branch of `read_output` that used to panic.
+    match Command::new("/bin/sh")
+        .arg("-c")
+        .arg("echo captured-out; echo captured-err >&2")
+        .output()
+    {
+        Ok(out)
+            if out.status.success()
+                && out.stdout == b"captured-out\n"
+                && out.stderr == b"captured-err\n" =>
+        {
+            println!("ok:   output() captured both of the child's streams");
+        }
+        Ok(out) => {
+            println!(
+                "FAIL: output() gave {:?} out={:?} err={:?}",
+                out.status, out.stdout, out.stderr
+            );
+            failed = true;
+        }
+        Err(e) => {
+            println!("FAIL: output() failed: {e}");
             failed = true;
         }
     }

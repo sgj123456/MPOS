@@ -31,7 +31,13 @@ const DEVICE_NET: u16 = 0x1000;
 /// Slots in each queue. The receive side keeps this many buffers posted, so a
 /// burst that arrives while the kernel is busy is not dropped for want of
 /// somewhere to put it.
-const QUEUE_SIZE: usize = 16;
+///
+/// This number is not free: it is what the stack advertises as its receive
+/// window (see [`VirtioNet::rx_frames`]). Sixty-four 2 KiB buffers are 128 KiB
+/// of ring, which is more than a 64 KiB socket buffer can ever hand back - so
+/// the ring is never what loses a packet, and the window is not what caps the
+/// transfer. Sixteen was small enough that both were true at once.
+const QUEUE_SIZE: usize = 64;
 
 /// The size of one receive buffer: a frame and its header, with room to spare.
 const BUFFER_BYTES: usize = 2048;
@@ -47,6 +53,16 @@ impl VirtioNet {
     /// Which address this device answers to.
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// How many frames the receive ring can hold at once.
+    ///
+    /// The stack's TCP window is computed from this, because it is the answer
+    /// to the only question that matters for a window: how much can arrive
+    /// before something has to be dropped. Advertising more than the ring
+    /// holds loses packets the peer has every reason to think arrived.
+    pub fn rx_frames(&self) -> usize {
+        QUEUE_SIZE
     }
 
     /// Take one frame the device has received, if there is one.

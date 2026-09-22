@@ -90,11 +90,13 @@ fn identity_set_one(word: usize, uid: bool) -> isize {
     }
     let word = word as u32;
     let mut identity = crate::sched::current_identity();
-    let privileged = if uid {
-        identity.euid == 0
-    } else {
-        identity.egid == 0
-    };
+    // Both halves of this question are about the *effective user* id, because
+    // that is what capabilities follow: a set-uid program with `euid` 0 holds
+    // `CAP_SETUID` and `CAP_SETGID` alike, whatever its effective group id
+    // happens to be. Reading `egid` for the group half refuses the one caller
+    // that matters - the set-uid helper dropping to the ids it was installed
+    // to hand over, which is exactly the shape `su` and `doas` are.
+    let privileged = identity.euid == 0;
     if privileged {
         if uid {
             identity.ruid = word;
@@ -141,11 +143,13 @@ pub fn handle_setregid(args: [usize; ARG_COUNT]) -> isize {
 
 fn identity_set_re(args: [usize; ARG_COUNT], uid: bool) -> isize {
     let identity = crate::sched::current_identity();
-    let privileged = if uid {
-        identity.euid == 0
-    } else {
-        identity.egid == 0
-    };
+    // Both halves of this question are about the *effective user* id, because
+    // that is what capabilities follow: a set-uid program with `euid` 0 holds
+    // `CAP_SETUID` and `CAP_SETGID` alike, whatever its effective group id
+    // happens to be. Reading `egid` for the group half refuses the one caller
+    // that matters - the set-uid helper dropping to the ids it was installed
+    // to hand over, which is exactly the shape `su` and `doas` are.
+    let privileged = identity.euid == 0;
     // Privileged, the saved id follows the new effective one; an
     // unprivileged caller's saved id never moves - that is the floor the
     // raise-itself-back rule stands on.
@@ -177,11 +181,13 @@ fn identity_set_res(args: [usize; ARG_COUNT], uid: bool) -> isize {
     } else {
         [identity.rgid, identity.egid, identity.sgid]
     };
-    let privileged = if uid {
-        identity.euid == 0
-    } else {
-        identity.egid == 0
-    };
+    // Both halves of this question are about the *effective user* id, because
+    // that is what capabilities follow: a set-uid program with `euid` 0 holds
+    // `CAP_SETUID` and `CAP_SETGID` alike, whatever its effective group id
+    // happens to be. Reading `egid` for the group half refuses the one caller
+    // that matters - the set-uid helper dropping to the ids it was installed
+    // to hand over, which is exactly the shape `su` and `doas` are.
+    let privileged = identity.euid == 0;
     let mut words = held;
     for (slot, &word) in words.iter_mut().zip(args.iter()) {
         if word == NO_ID {
@@ -838,20 +844,31 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
-/// `seccomp(op, flags, args)` — the secure-computing mode. Neither mode
-/// can be kept here: strict mode needs a per-task refusal of everything
-/// but the four exit calls, and the filter mode needs a BPF runner, and
-/// neither exists under this kernel's dispatch. The honest answer for
-/// both is the one a kernel built without the feature gives — ENOSYS —
-/// and the availability probe answers with the empty set, so a caller
-/// that asks whether an action is supported is told no rather than left
-/// to guess.
+/// `seccomp(op, flags, args)` — the secure-computing mode. Strict mode is
+/// honoured: it latches the thread to the four-call allow-list (`read`,
+/// `write`, `exit`, `sigreturn`) enforced at dispatch, irreversible for the
+/// thread's life. The filter mode still needs a BPF runner this kernel does
+/// not have, so it answers the way a kernel built without it does - ENOSYS -
+/// and the availability probe returns the empty set, so a caller that asks
+/// whether an action is supported is told no rather than left to guess.
 pub fn handle_seccomp(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SET_MODE_STRICT: usize = 0;
     const SET_MODE_FILTER: usize = 1;
     const GET_ACTION_AVAIL: usize = 2;
     match args[0] {
-        SET_MODE_STRICT | SET_MODE_FILTER => err::ENOSYS,
+        // Strict mode is the whole filter Linux started with: the thread may
+        // make only `read`, `write`, `exit` and `sigreturn` from here on and
+        // dies on anything else. It takes no flags and no filter argument, so
+        // anything else in those slots is a caller mistake, and once latched it
+        // cannot be cleared - it survives exec and is inherited across fork.
+        SET_MODE_STRICT => {
+            if args[1] != 0 || args[2] != 0 {
+                return err::EINVAL;
+            }
+            crate::sched::set_seccomp_strict();
+            0
+        }
+        SET_MODE_FILTER => err::ENOSYS,
         GET_ACTION_AVAIL => {
             if args[2] == 0 || !buffer_ok(args[2], 4, true, from_user) {
                 return err::EFAULT;
@@ -934,9 +951,9 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
 /// attached. The rules are the man page's: the siginfo must be readable,
 /// and a caller signalling *another* process may not forge the codes the
 /// kernel itself uses — `si_code` at or above zero is SI_USER's ground,
-/// and sending that to somebody else is EPERM. The queue keeps a mask,
-/// not the payload, so what the target's handler reads back is the
-/// kernel's own SI_USER record; the caller's bytes arrive as the signal.
+/// and sending that to somebody else is EPERM. An `SI_QUEUE` record carries
+/// its payload's `si_value` word to the target's handler; any other code
+/// arrives as the kernel's own SI_USER record.
 pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SIGINFO_BYTES: usize = 128;
     let (tgid, sig, uinfo) = (args[0] as isize, args[1], args[2]);
@@ -953,7 +970,20 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     if tgid <= 0 || tgid as usize >= crate::sched::MAX_TASKS {
         return err::ESRCH;
     }
-    if crate::sched::send_signal(TaskId(tgid as usize), sig as u8) {
+    let (pid, uid) = {
+        let cur = crate::sched::current_identity();
+        (crate::sched::current_tgid().0 as i32, cur.ruid as i32)
+    };
+    // `union sigval` sits at offset 24 of `siginfo_t` on x86_64; an `SI_QUEUE`
+    // sender put its word there. The buffer was validated readable above, so
+    // the direct read matches the `si_code` read just before it.
+    let info = if si_code == crate::sched::signal::SI_QUEUE {
+        let value = unsafe { ((uinfo + 24) as *const u64).read_unaligned() };
+        crate::sched::signal::SigInfo::queue(sig as u8, pid, uid, value)
+    } else {
+        crate::sched::signal::SigInfo::user(sig as u8, pid, uid)
+    };
+    if crate::sched::send_signal_info(TaskId(tgid as usize), sig as u8, info) {
         0
     } else {
         err::ESRCH

@@ -9,6 +9,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use critical_section::Mutex;
 
@@ -22,15 +23,26 @@ pub struct EventFd {
     /// until someone wakes it - the deadline is "never" - so a writer has to
     /// name the readers it made a difference to.
     waiters: Mutex<RefCell<Vec<crate::sched::TaskId>>>,
+    /// `EFD_NONBLOCK`, as the fd's `F_SETFL` keeps it in sync: a read of an
+    /// empty counter answers `EAGAIN` instead of sleeping. Without this a
+    /// caller that drains the change-signaller after a poll *timeout* - fish's
+    /// fd-monitor loop does exactly that, 256 msec at a time - sleeps here
+    /// forever while holding the very mutex its main thread is waiting for.
+    nonblocking: AtomicBool,
 }
 
 impl EventFd {
-    pub fn new(ino: Ino, initial: u64) -> Arc<EventFd> {
+    pub fn new(ino: Ino, initial: u64, nonblocking: bool) -> Arc<EventFd> {
         Arc::new(EventFd {
             ino,
             counter: Mutex::new(RefCell::new(initial)),
             waiters: Mutex::new(RefCell::new(Vec::new())),
+            nonblocking: AtomicBool::new(nonblocking),
         })
+    }
+
+    pub fn set_nonblocking(&self, on: bool) {
+        self.nonblocking.store(on, Ordering::Relaxed);
     }
 
     fn value(&self) -> u64 {
@@ -39,6 +51,15 @@ impl EventFd {
 }
 
 impl Inode for EventFd {
+    fn as_eventfd(&self) -> Option<&EventFd> {
+        Some(self)
+    }
+
+    /// An event counter has no position: `lseek(2)` on one is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             // Event descriptors are anonymous; the number only has to be one
@@ -69,6 +90,9 @@ impl Inode for EventFd {
             if let Some(value) = taken {
                 buf[..8].copy_from_slice(&value.to_ne_bytes());
                 return Ok(8);
+            }
+            if self.nonblocking.load(Ordering::Relaxed) {
+                return Err(VfsError::Again);
             }
             self.wait_nonzero();
         }
@@ -138,7 +162,7 @@ mod tests {
 
     #[test]
     fn a_write_adds_and_a_read_takes_everything() {
-        let fd = EventFd::new(1, 0);
+        let fd = EventFd::new(1, 0, false);
         assert!(!fd.poll_ready().read, "nothing written yet");
         let mut buf = [0u8; 8];
         assert_eq!(fd.write_at(0, &3u64.to_ne_bytes()).unwrap(), 8);
@@ -149,8 +173,22 @@ mod tests {
     }
 
     #[test]
+    fn a_nonblocking_eventfd_answers_eagain_on_an_empty_counter() {
+        // The shape fish's fd-monitor loop depends on: poll says not-readable,
+        // the caller drains the signaller anyway, and the read has to come
+        // back rather than sleep - the caller holds a lock its main thread
+        // needs, and a sleeping drain holds that lock for ever.
+        let fd = EventFd::new(3, 0, true);
+        let mut buf = [0u8; 8];
+        assert!(matches!(fd.read_at(0, &mut buf), Err(VfsError::Again)));
+        fd.write_at(0, &1u64.to_ne_bytes()).unwrap();
+        assert_eq!(fd.read_at(0, &mut buf).unwrap(), 8);
+        assert!(matches!(fd.read_at(0, &mut buf), Err(VfsError::Again)));
+    }
+
+    #[test]
     fn an_eventfd_starts_at_its_initial_value_and_saturates() {
-        let fd = EventFd::new(2, 7);
+        let fd = EventFd::new(2, 7, false);
         let mut buf = [0u8; 8];
         fd.read_at(0, &mut buf).unwrap();
         assert_eq!(u64::from_ne_bytes(buf), 7);

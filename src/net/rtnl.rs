@@ -51,8 +51,10 @@ const IFLA_ADDRESS: u16 = 1;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
-const RTA_GATEWAY: u16 = 2;
+const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PREFSRC: u16 = 7;
 
 /// Link flag bits, as `linux/if.h` spells them.
 const IFF_UP: u32 = 0x1;
@@ -104,11 +106,15 @@ pub fn open() -> usize {
 }
 
 /// Name the session, as `bind(fd, {AF_NETLINK, nl_pid, ...})` asks. An
-/// explicit nonzero `nl_pid` is honored unless another session holds it;
-/// zero asks the kernel to pick, which Linux does from the binding thread's
-/// tid - here from the next free number, which identifies the session just
-/// as well. Returns an errno or zero.
+/// explicit nonzero `nl_pid` is honored unless another session holds it; zero
+/// asks the kernel to pick, which Linux does with the binding thread's process
+/// id (`netlink_autobind`), falling back to a fresh number only on collision.
+/// Returns an errno or zero.
 pub fn bind(handle: usize, requested: u32) -> isize {
+    // Read the caller's process id before the critical section: autobinding a
+    // nameless socket to it is what makes a reply match the requester's own
+    // `getpid()` check.
+    let tgid = crate::sched::current_tgid().0 as u32;
     critical_section::with(|cs| {
         let mut table = TABLE.borrow(cs).borrow_mut();
         if requested != 0
@@ -132,7 +138,7 @@ pub fn bind(handle: usize, requested: u32) -> isize {
         let pid = if requested != 0 {
             requested
         } else {
-            free_portid(&table, handle)
+            auto_portid(&table, handle, tgid)
         };
         match table.iter_mut().find(|(h, _)| *h == handle) {
             Some((_, session)) => session.portid = pid,
@@ -152,6 +158,22 @@ fn free_portid(table: &[(usize, Session)], handle: usize) -> u32 {
         candidate += 1;
     }
     candidate
+}
+
+/// The port id Linux's `netlink_autobind` hands a socket the caller never named:
+/// the binding thread's *process* id, and only if that is already taken by
+/// another socket does it fall back to a fresh number. This is not cosmetic -
+/// callers that authenticate a reply by matching its `nlmsg_pid` against their
+/// own `getpid()` (fastfetch's local-IP probe among them) silently discard every
+/// message whose id is an unrelated small counter. `tgid` is read by the caller
+/// before the critical section; `0` cannot be an autobind id (`0` means unbound).
+fn auto_portid(table: &[(usize, Session)], handle: usize, tgid: u32) -> u32 {
+    let taken = |id: u32| table.iter().any(|(h, s)| *h != handle && s.portid == id);
+    if tgid != 0 && !taken(tgid) {
+        tgid
+    } else {
+        free_portid(table, handle)
+    }
 }
 
 /// The session's port id - zero while it is unbound, which is what Linux's
@@ -196,10 +218,12 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
     let seq = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
     // Linux auto-binds a netlink socket at its first send - musl's
     // getifaddrs never binds at all - so by the time the answers are built
-    // there is a port id for them to carry. Every answer is stamped with it:
-    // a dump reader that matches `nlmsg_pid` against its own port id
-    // (fastfetch's default-route probe) otherwise reads every message as
+    // there is a port id for them to carry, and that id is the sender's
+    // process id, exactly as `netlink_autobind` would give it. Every answer is
+    // stamped with it: a reader that matches `nlmsg_pid` against its own
+    // `getpid()` (fastfetch's local-IP probe) otherwise reads every message as
     // foreign mail, never sees the end marker, and waits forever for more.
+    let tgid = crate::sched::current_tgid().0 as u32;
     let portid = critical_section::with(|cs| {
         let mut table = TABLE.borrow(cs).borrow_mut();
         let unbound = table
@@ -209,7 +233,7 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
         if unbound {
             // Draw the id before taking the mutable borrow: the scan that
             // looks for a free one reads the whole table.
-            let fresh = free_portid(&table, handle);
+            let fresh = auto_portid(&table, handle, tgid);
             table
                 .iter_mut()
                 .find(|(h, _)| *h == handle)
@@ -266,10 +290,19 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
         }
         RTM_GETROUTE => {
             // The default route, exactly as the static configuration implies:
-            // everything leaves by the gateway over eth0. A dump with only an
-            // end-marker makes callers that hunt for a default interface spin.
+            // everything leaves by the gateway over eth0 (index 2), and the
+            // preferred source is eth0's own address. A dump with only an
+            // end-marker makes callers that hunt for a default interface spin,
+            // and a dump missing `RTA_PREFSRC` makes callers like fastfetch
+            // print an empty LocalIp.
             let mut v = Vec::new();
-            v.push(route_msg(seq, portid, 2, crate::net::GATEWAY_IP));
+            v.push(route_msg(
+                seq,
+                portid,
+                2,
+                crate::net::GATEWAY_IP,
+                crate::net::LOCAL_IP,
+            ));
             v.push(done(seq, portid));
             v
         }
@@ -390,9 +423,21 @@ fn link_msg(
     nlmsg(RTM_NEWLINK, seq, pid, &payload, true)
 }
 
-/// `RTM_NEWROUTE`: a `rtmsg` plus the gateway and outgoing interface. This
-/// one route is the default route - `dst_len` 0 means "everything else".
-fn route_msg(seq: u32, pid: u32, oif: u32, gateway: [u8; 4]) -> Vec<u8> {
+/// `RTM_NEWROUTE`: a `rtmsg` plus the four attributes a default route needs
+/// to be useful to a caller. `dst_len` 0 makes this "everything else", so
+/// `RTA_DST` is the network address 0.0.0.0; `RTA_GATEWAY` is the next hop;
+/// `RTA_OIF` is the outgoing interface index, which is how a caller ties the
+/// route to a named device; and `RTA_PREFSRC` is the kernel's preferred source
+/// address for the route - the value `fastfetch` and friends read as the
+/// machine's local IP. Omit any of them and a strict caller drops the whole
+/// reply rather than guess.
+fn route_msg(
+    seq: u32,
+    pid: u32,
+    oif: u32,
+    gateway: [u8; 4],
+    prefsrc: [u8; 4],
+) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(2); // rtm_family: AF_INET
     payload.push(0); // rtm_dst_len: 0 = the default route
@@ -402,8 +447,15 @@ fn route_msg(seq: u32, pid: u32, oif: u32, gateway: [u8; 4]) -> Vec<u8> {
     payload.push(4); // rtm_protocol: RTPROT_STATIC
     payload.push(0); // rtm_scope: RT_SCOPE_UNIVERSE
     payload.push(1); // rtm_type: RTN_UNICAST
+    // rtm_flags closes `struct rtmsg` at 12 bytes. Skipping it shifts every
+    // attribute four bytes early: a strict caller reads the four attribute
+    // bytes that should have been flags as `rta_len`, sees the zero payload of
+    // the next attribute, and reports `deficit N, rta_len=0!`.
+    payload.extend(0u32.to_le_bytes());
+    payload.extend(rtattr(RTA_DST, &[0u8; 4]));
     payload.extend(rtattr(RTA_GATEWAY, &gateway));
     payload.extend(rtattr(RTA_OIF, &oif.to_le_bytes()));
+    payload.extend(rtattr(RTA_PREFSRC, &prefsrc));
     nlmsg(RTM_NEWROUTE, seq, pid, &payload, true)
 }
 

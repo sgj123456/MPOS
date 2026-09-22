@@ -361,6 +361,103 @@ fn dir() -> Arc<ProcDir> {
 }
 
 // ---------------------------------------------------------------------------
+// /proc/net/{tcp,udp} - the socket table.
+//
+// The rows are resolved to plain byte fields (`NetRow`) before they reach the
+// formatter, so the byte-order and layout of the `/proc/net` text - the part a
+// tool like `ss` parses - is unit-testable here without a live network stack;
+// only collecting the rows touches smoltcp, and that is the target-only half.
+// ---------------------------------------------------------------------------
+
+/// One listening or connected socket, already reduced to the numbers the text
+/// format needs: IPv4 octets and port for the two ends, the numeric TCP state
+/// (0 for UDP), and the inode the descriptor answers with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NetRow {
+    pub local: ([u8; 4], u16),
+    pub remote: ([u8; 4], u16),
+    pub state: u8,
+    pub uid: u32,
+    pub inode: u64,
+}
+
+/// An IPv4 address as `/proc/net` prints it: the octets packed into a u32 read
+/// little-endian, so `127.0.0.1` is `0100007F`.
+fn net_ip_word(octets: &[u8; 4]) -> u32 {
+    (octets[0] as u32) | (octets[1] as u32) << 8 | (octets[2] as u32) << 16 | (octets[3] as u32) << 24
+}
+
+/// Render the socket rows in the `/proc/net/tcp` shape.
+fn format_net(rows: &[NetRow]) -> String {
+    let mut out = String::from(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+    );
+    for (i, r) in rows.iter().enumerate() {
+        out.push_str(&alloc::format!(
+            "  {:2}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:>7} 0 {:>8} 1 0 0 0\n",
+            i,
+            net_ip_word(&r.local.0),
+            r.local.1,
+            net_ip_word(&r.remote.0),
+            r.remote.1,
+            r.state,
+            0u32,
+            0u32,
+            r.uid,
+            r.inode,
+        ));
+    }
+    out
+}
+
+/// The live rows for one protocol. Host builds have no stack, so they are
+/// empty - the `/proc/net` files then show just the header.
+fn net_rows(tcp: bool) -> Vec<NetRow> {
+    #[cfg(target_os = "none")]
+    {
+        crate::net::collect_net_sockets(tcp)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = tcp;
+        Vec::new()
+    }
+}
+
+/// Render `/proc/net/route` for a statically-configured interface: the default
+/// route (destination `0.0.0.0` via `gw`, `RTF_UP|RTF_GATEWAY`) and the
+/// directly-reachable /24 link route. `fastfetch`'s LocalIp and `ip route`
+/// parse this text to name the default interface, so it is a real requirement,
+/// not decoration. Addresses are the little-endian `%08X` form the file uses.
+fn format_route_table(local: &[u8; 4], gw: &[u8; 4]) -> String {
+    let network = [local[0], local[1], local[2], 0];
+    alloc::format!(
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+         eth0\t{:08X}\t{:08X}\t0003\t0\t0\t0\t{:08X}\t0\t0\t0\n\
+         eth0\t{:08X}\t{:08X}\t0001\t0\t0\t0\t{:08X}\t0\t0\t0\n",
+        0u32,
+        net_ip_word(gw),
+        0u32,
+        net_ip_word(&network),
+        0u32,
+        net_ip_word(&[255, 255, 255, 0]),
+    )
+}
+
+/// The `/proc/net/route` text. Host builds have no stack, so they report the
+/// same static configuration the kernel boots with.
+fn route_table_text() -> String {
+    #[cfg(target_os = "none")]
+    {
+        format_route_table(&crate::net::LOCAL_IP, &crate::net::GATEWAY_IP)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        format_route_table(&[10, 0, 2, 15], &[10, 0, 2, 2])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The questions /proc asks the scheduler.
 //
 // Host builds have no scheduler, and this filesystem is compiled into them so
@@ -440,11 +537,18 @@ fn child_ids(_pid: usize) -> Vec<usize> {
 }
 
 /// The descriptor numbers `pid` has open.
+/// The descriptor numbers `pid` has open - what `/proc/<pid>/fd` lists.
+///
+/// The numbers only, deliberately: naming a descriptor is a search of the
+/// filesystem tree, and this is a *listing*, which a tree search is itself
+/// made of. Asking for a name here would put the search inside its own
+/// listing - `/proc/<pid>/fd` again, one stack deeper, without end - so a
+/// name is computed where one is actually wanted, by `readlink` on an entry.
 #[cfg(target_os = "none")]
 fn fd_numbers(pid: usize) -> Vec<String> {
-    crate::sched::descriptors_of(pid)
+    crate::sched::descriptor_numbers(pid)
         .into_iter()
-        .map(|(fd, _name)| alloc::format!("{fd}"))
+        .map(|fd| alloc::format!("{fd}"))
         .collect()
 }
 
@@ -719,6 +823,50 @@ fn children_of(pid: usize, tid: usize) -> Option<String> {
     Some(out)
 }
 
+/// `/proc/<pid>/limits`: the `RLIMIT_*` table `setrlimit` writes, rendered the
+/// way Linux does - a header, then one named row per resource with the soft
+/// and hard ceilings, `unlimited` for `RLIM_INFINITY`. `ulimit` reads it.
+#[cfg(target_os = "none")]
+fn limits_of_pid(pid: usize) -> Option<String> {
+    let rl = crate::sched::rlimits_of(pid)?;
+    let table: &[(&str, &str)] = &[
+        ("Max cpu time", "seconds"),
+        ("Max file size", "bytes"),
+        ("Max data size", "bytes"),
+        ("Max stack size", "bytes"),
+        ("Max core file size", "bytes"),
+        ("Max open files", "files"),
+        ("Max locked memory", "bytes"),
+        ("Max processes", "processes"),
+        ("Max pending signals", "signals"),
+        ("Max locks", "locks"),
+        ("Max msgqueue size", "bytes"),
+        ("Max nice priority", ""),
+        ("Max realtime priority", ""),
+        ("Max realtime timeout", "us"),
+    ];
+    let fmt = |v: u64| -> String {
+        if v == u64::MAX {
+            String::from("unlimited")
+        } else {
+            alloc::format!("{}", v)
+        }
+    };
+    let mut out =
+        String::from("Limit                     Soft Limit           Hard Limit           Units     \n");
+    for (i, (name, unit)) in table.iter().enumerate() {
+        let r = rl.get(i)?;
+        out.push_str(&alloc::format!(
+            "{:<26} {:<20} {:<20} {}\n",
+            name,
+            fmt(r.cur),
+            fmt(r.max),
+            unit
+        ));
+    }
+    Some(out)
+}
+
 /// One thread's directory: the same files a process has, named for the
 /// thread, plus `children` - which Linux puts under `task` because children
 /// belong to the process, not to whichever thread is listed.
@@ -766,6 +914,8 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
         maybe_file(move || stat_line(pid, pid)),
     );
     node.add("statm", NodeKind::File, maybe_file(move || statm_line(pid)));
+    #[cfg(target_os = "none")]
+    node.add("limits", NodeKind::File, maybe_file(move || limits_of_pid(pid)));
     node.add(
         "comm",
         NodeKind::File,
@@ -840,8 +990,16 @@ impl Dynamic for Descriptors {
 
     fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
         let fd = name.parse::<usize>().ok()?;
-        let target = fd_target(self.pid, fd)?;
-        Some(fd_link(self.pid, fd, move || Some(target.clone())))
+        if !crate::sched::descriptor_numbers(self.pid).contains(&fd) {
+            return None;
+        }
+        // The target is looked up when `readlink` asks for it, not here. This
+        // runs for every entry of a `/proc/<pid>/fd` listing - which a tree
+        // search performs on its way past - and naming the descriptor is a
+        // tree search itself. Resolving it eagerly is what made the two call
+        // each other until the kernel stack ran out.
+        let pid = self.pid;
+        Some(fd_link(pid, fd, move || fd_target(pid, fd)))
     }
 }
 
@@ -1065,6 +1223,8 @@ impl ProcFs {
                     ("tmpfs", true),
                     ("ramfs", true),
                     ("ext2", false),
+                    ("ext3", false),
+                    ("ext4", false),
                 ] {
                     if nodev {
                         out.push_str("nodev\t");
@@ -1226,6 +1386,16 @@ impl ProcFs {
         sys.add("kernel", NodeKind::Dir, kernel);
         self.root.add("sys", NodeKind::Dir, sys);
 
+        // `/proc/net`: the socket table `ss`/`netstat` read. `tcp` lists the
+        // TCP endpoints (with their state byte), `udp` the datagram ones; both
+        // resolve through the registry into the `NetRow` shape the formatter
+        // turns into the kernel's `local_address:port rem_address:port` text.
+        let net = dir();
+        net.add("tcp", NodeKind::File, file(|| format_net(&net_rows(true))));
+        net.add("udp", NodeKind::File, file(|| format_net(&net_rows(false))));
+        net.add("route", NodeKind::File, file(route_table_text));
+        self.root.add("net", NodeKind::Dir, net);
+
         // `/proc/self`: whichever process is reading, which is not knowable
         // when the tree is built. The link's *reading* is short-circuited in
         // the readlink handler for the two names that need a shortcut -
@@ -1326,6 +1496,47 @@ impl FileSystem for ProcFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/proc/net/tcp` is parsed by fixed column positions, so its address byte
+    /// order (`127.0.0.1` -> `0100007F`) and the state byte must be exact.
+    #[test]
+    fn the_net_table_prints_addresses_and_state_as_linux_does() {
+        let rows = [NetRow {
+            local: ([127, 0, 0, 1], 8080),
+            remote: ([10, 0, 2, 15], 443),
+            state: 1,
+            uid: 0,
+            inode: 42,
+        }];
+        let text = format_net(&rows);
+        let head = text.lines().next().unwrap();
+        assert!(head.starts_with("  sl  local_address rem_address"), "{head}");
+        let row = text.lines().nth(1).unwrap();
+        // local 127.0.0.1:8080 = 0100007F:1F90, remote 10.0.2.15:443 = 0F02000A:01BB.
+        assert!(row.contains("0100007F:1F90"), "{row}");
+        assert!(row.contains("0F02000A:01BB"), "{row}");
+        // state ESTABLISHED (1) and the inode appear.
+        assert!(row.contains(" 01 ") && row.contains(" 42 "), "{row}");
+        // No rows -> just the header line.
+        assert_eq!(format_net(&[]).lines().count(), 1);
+    }
+
+    /// `/proc/net/route` is what `fastfetch`'s LocalIp (and `ip route`) parse to
+    /// name the default interface; the first tab-field is the iface and the
+    /// destination `00000000` line is the default route.
+    #[test]
+    fn the_route_table_names_the_default_interface_and_gateway() {
+        let text = format_route_table(&[10, 0, 2, 15], &[10, 0, 2, 2]);
+        let mut lines = text.lines();
+        assert!(lines.next().unwrap().starts_with("Iface\tDestination\tGateway"));
+        // Default route: destination 00000000, gateway 10.0.2.2 -> 0202000A.
+        let def = lines.next().unwrap();
+        assert!(def.starts_with("eth0\t00000000\t0202000A\t0003"), "{def}");
+        // Link route: the /24 network 10.0.2.0 -> 0002000A, mask 00FFFFFF.
+        let link = lines.next().unwrap();
+        assert!(link.starts_with("eth0\t0002000A\t00000000\t0001"), "{link}");
+        assert!(link.ends_with("00FFFFFF\t0\t0\t0"), "{link}");
+    }
 
     /// The shapes below are copied from what Linux prints, because that is
     /// the only specification these files have: they are parsed by column

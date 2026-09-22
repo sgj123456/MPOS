@@ -187,6 +187,25 @@ pub fn dir_newer_than(dir: &Path, after: SystemTime) -> Result<bool> {
     Ok(false)
 }
 
+/// True when the image on disk does not reflect the sources: it is missing, it
+/// was never assembled, or anything it was assembled from has changed since.
+///
+/// The image is the last of three stages - the kernel and its loader, the
+/// initramfs archive, the root filesystem - and it depends on all of them, so
+/// any one moving makes it stale. Each stage is asked the question it asks
+/// itself rather than this function keeping a second copy of the rules: a
+/// kernel rebuilt after the last image has to trigger the rebuild, or `run`
+/// boots code that is no longer on disk and calls it a fix that did nothing.
+pub fn image_stale(build_dir: &Path, profile: &str) -> Result<bool> {
+    if !image_path(build_dir).exists() {
+        return Ok(true);
+    }
+    if crate::initramfs::needs_rebuild(build_dir)? {
+        return Ok(true);
+    }
+    crate::rootfs::needs_rebuild(build_dir, profile)
+}
+
 pub fn build_kernel(profile: &str) -> Result<()> {
     let root = project_root()?;
     println!("Building the kernel ({profile})");
@@ -356,10 +375,15 @@ pub fn set_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("Failed to set mode {mode:o} on {}", path.display()))
 }
 
-/// Copies a tree onto another, keeping symlinks as symlinks. `cp -a` does this
-/// in the shell; `std::fs::copy` alone would turn a link into a second copy of
-/// its target, which is wrong for every `/bin/*` in an Alpine tree.
-pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Merges an overlay directory into a tree: the *contents* of `src` land in
+/// `dst`, so `rootfs/etc/abc` becomes `/etc/abc` and replaces whatever was
+/// already there. Directories are merged rather than replaced; files and
+/// symlinks overwrite.
+///
+/// `cp -a src/. dst/` is the shell equivalent, and `std::fs::copy` alone would
+/// not do: it turns a link into a second copy of its target, which is wrong
+/// for every `/bin/*` in an Alpine tree.
+pub fn merge_overlay(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Ok(());
     }
@@ -376,7 +400,18 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             }
             std::os::unix::fs::symlink(fs::read_link(&from)?, &to)?;
         } else if meta.is_dir() {
-            copy_dir_recursive(&from, &to)?;
+            // A directory in the overlay replaces a file of the same name: the
+            // overlay is the authority on what the tree looks like, and
+            // `create_dir_all` over a file would otherwise be the build's
+            // failure for a conflict the caller already resolved by writing
+            // the overlay.
+            let replaced_file = to
+                .symlink_metadata()
+                .is_ok_and(|existing| !existing.is_dir());
+            if replaced_file {
+                fs::remove_file(&to)?;
+            }
+            merge_overlay(&from, &to)?;
         } else {
             if to.symlink_metadata().is_ok() {
                 fs::remove_file(&to)?;
@@ -400,22 +435,42 @@ pub fn run_status(cmd: &mut Command, what: &str) -> Result<()> {
 /// Unmounts everything mounted at or under `mount_point`, deepest first. Read
 /// from `/proc/mounts` rather than kept in a list, because a run that failed
 /// half way through can leave mounts this process never recorded.
-pub fn umount_recursively(mount_point: &Path) {
-    let Ok(mounts) = fs::read_to_string("/proc/mounts") else {
-        return;
-    };
+pub fn umount_recursively(mount_point: &Path) -> usize {
     let prefix = mount_point.to_string_lossy().to_string();
+    // Deepest first, so a child mount is released before the directory under
+    // which its parent sits. A plain `umount` is the polite pass; whatever still
+    // holds the table after it is forced loose with a lazy detach, which
+    // unlinks the mount from the namespace at once even while a process remains
+    // inside it.
+    for point in mount_points_under(&prefix) {
+        let _ = Command::new("umount").arg(&point).status();
+    }
+    for point in mount_points_under(&prefix) {
+        let _ = Command::new("umount").args(["-l", &point]).status();
+    }
+    // The caller must know if anything is still mounted: deleting a directory
+    // that still has a live bind mount under it recurses THROUGH that mount and
+    // removes the mounted tree's own files. The staged root bind-mounts the
+    // host `/dev` and `/sys`, so a `/dev` bind that outlived the umount and was
+    // then `rm -rf`'d would take the real `/dev/null` down with it.
+    mount_points_under(&prefix).len()
+}
+
+/// Every mount point at or below `prefix`, deepest first. Reads the live table
+/// each call so a caller can re-check after issuing unmounts.
+fn mount_points_under(prefix: &str) -> Vec<String> {
+    let Ok(mounts) = fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
     let nested = format!("{prefix}/");
     let mut points: Vec<String> = mounts
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
         .map(|point| point.replace("\\040", " "))
-        .filter(|point| point == &prefix || point.starts_with(&nested))
+        .filter(|point| point == prefix || point.starts_with(&nested))
         .collect();
     points.sort_by_key(|point| std::cmp::Reverse(point.len()));
-    for point in points {
-        let _ = Command::new("umount").arg(&point).status();
-    }
+    points
 }
 
 /// The version of `apk-tools-static` fetched when the host has no `apk`. It is
@@ -525,6 +580,18 @@ fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     numbers(a).cmp(&numbers(b))
 }
 
+/// The `/etc/apk/repositories` file, one line per repository the config names.
+///
+/// The order is the config's and it matters: apk takes a package from the first
+/// repository that has it, so `main` before `community` is what keeps a package
+/// that exists in both coming from the one it belongs to.
+pub fn repositories_text(mirror: &str, branch: &str, repos: &[String]) -> String {
+    repos
+        .iter()
+        .map(|repo| format!("{mirror}/{branch}/{repo}\n"))
+        .collect()
+}
+
 /// Writes the host's APK keys into a tree, or the ones embedded here when the
 /// host has none. The file *name* is load-bearing: apk decides whether a
 /// repository index is trusted by looking for a key whose filename matches the
@@ -595,5 +662,114 @@ mod tests {
         assert_eq!(version_cmp(older, newer), std::cmp::Ordering::Less);
         assert_eq!(version_cmp(newer, older), std::cmp::Ordering::Greater);
         assert_eq!(version_cmp(older, older), std::cmp::Ordering::Equal);
+    }
+
+    /// A scratch directory of this test's own, removed first so a previous
+    /// run's leftovers cannot make the test pass.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mpos-xtask-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_overlay_lands_at_the_target_root_and_overwrites() {
+        let dir = scratch("overlay");
+        let src = dir.join("rootfs");
+        let dst = dir.join("target");
+        fs::create_dir_all(src.join("etc/init.d")).unwrap();
+        fs::write(src.join("etc/abc"), "from the overlay").unwrap();
+        fs::create_dir_all(dst.join("etc")).unwrap();
+        fs::write(dst.join("etc/abc"), "from the base system").unwrap();
+
+        merge_overlay(&src, &dst).unwrap();
+
+        // `rootfs/etc/abc` is `/etc/abc`: the *contents* of the overlay map to
+        // the target's root, not to a `/rootfs` directory inside it.
+        assert_eq!(
+            fs::read_to_string(dst.join("etc/abc")).unwrap(),
+            "from the overlay",
+            "the overlay has to replace what the base system put there"
+        );
+        assert!(
+            !dst.join("rootfs").exists(),
+            "the overlay is not a directory in the target"
+        );
+        assert!(dst.join("etc/init.d").is_dir(), "directories are merged");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_in_the_overlay_replaces_a_file_of_the_same_name() {
+        let dir = scratch("overlay-dir");
+        let src = dir.join("rootfs");
+        let dst = dir.join("target");
+        fs::create_dir_all(src.join("etc/abc")).unwrap();
+        fs::write(src.join("etc/abc/inner"), "x").unwrap();
+        fs::create_dir_all(dst.join("etc")).unwrap();
+        fs::write(
+            dst.join("etc/abc"),
+            "a file where the overlay has a directory",
+        )
+        .unwrap();
+
+        merge_overlay(&src, &dst).unwrap();
+
+        assert!(dst.join("etc/abc/inner").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rebuilt_kernel_makes_the_image_stale() {
+        let dir = scratch("stale");
+        let build = dir.join("build");
+        let target = dir.join("target");
+        fs::create_dir_all(&build).unwrap();
+        fs::create_dir_all(target.join("x86_64-unknown-none/debug")).unwrap();
+        fs::create_dir_all(target.join("x86_64-unknown-uefi/debug")).unwrap();
+
+        let kernel = target.join("x86_64-unknown-none/debug/mpos");
+        let loader = target.join("x86_64-unknown-uefi/debug/mpos-boot.efi");
+        let tar = initramfs_path(&build);
+        let image = image_path(&build);
+        let stamp = rootfs_stamp(&build);
+
+        // The tree as it is just after a build: every input older than the
+        // stamp, and the stamp the newest thing in it.
+        fs::write(&kernel, "").unwrap();
+        fs::write(&loader, "").unwrap();
+        fs::write(&tar, "").unwrap();
+        fs::write(&image, "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&stamp, "").unwrap();
+
+        // The kernel path is resolved through `CARGO_TARGET_DIR`, so the
+        // environment is pointed at this test's tree for the length of it.
+        // Nothing else in this crate reads that variable, which is what makes
+        // changing it here safe.
+        let previous = env::var_os("CARGO_TARGET_DIR");
+        unsafe { env::set_var("CARGO_TARGET_DIR", &target) };
+
+        assert!(
+            !image_stale(&build, "debug").unwrap(),
+            "an image newer than everything it was built from is not stale"
+        );
+
+        // The image is the kernel, the loader, the initramfs and the root
+        // filesystem; rebuilding any one of them has to make it stale, or
+        // `run` boots code that is no longer on disk.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&kernel, "rebuilt").unwrap();
+        assert!(
+            image_stale(&build, "debug").unwrap(),
+            "a kernel rebuilt after the image has to trigger the rebuild"
+        );
+
+        match previous {
+            Some(value) => unsafe { env::set_var("CARGO_TARGET_DIR", value) },
+            None => unsafe { env::remove_var("CARGO_TARGET_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

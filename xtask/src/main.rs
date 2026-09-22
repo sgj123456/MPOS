@@ -82,10 +82,28 @@ fn main() -> Result<()> {
     // root-owned tree. Repair it before anything tries to.
     utils::repair_ownership(&build_dir)?;
 
-    // `run` needs root only when there is nothing to boot yet, because then it
-    // has to build. The boot itself belongs to the user, not to root.
-    let run_needs_build = match cli.command {
-        Commands::Run => qemu::needs_build(&build_dir)?,
+    // Whether the kernel is already built for this command. It is true in the
+    // sudo half of a build, which is the one process that must never run
+    // cargo: `target/` would come back owned by root.
+    let artefacts_ready = env::var_os("MPOS_XTASK_ARTEFACTS_READY").is_some();
+
+    // `run` boots a kernel, so the kernel has to be the current one. Cargo is
+    // run first - and is a no-op when nothing has changed - because an image
+    // built from a kernel that has since been rebuilt is exactly the stale
+    // image this is supposed to catch: editing kernel sources and running
+    // `run` must rebuild the image, not boot the old code.
+    let mut kernel_built = artefacts_ready;
+    if matches!(cli.command, Commands::Run) && !kernel_built {
+        utils::build_kernel(&profile)?;
+        kernel_built = true;
+    }
+
+    // `run` needs root only when the image has to be rebuilt, and it has to be
+    // rebuilt whenever the kernel, the loader, the initramfs or the root
+    // filesystem has changed since it was assembled. The boot itself belongs to
+    // the user, not to root.
+    let mut run_needs_build = match cli.command {
+        Commands::Run => qemu::needs_build(&build_dir, &profile)?,
         _ => false,
     };
 
@@ -101,13 +119,25 @@ fn main() -> Result<()> {
         // $CARGO_TARGET_DIR, and a `target/` cargo made as root is one the user
         // cannot write into again - the state a build that re-execs first ends
         // in.
-        if needs_kernel(cli.command, run_needs_build) {
+        if !kernel_built && needs_kernel(cli.command, run_needs_build) {
             utils::build_kernel(&profile)?;
         }
-        escalate(cli.command, &build_dir, &profile)?;
+        if matches!(cli.command, Commands::Run) {
+            // Build in a child, and wait: this process still has to boot the
+            // result, and a process that replaced itself with the build never
+            // could - which is why `run` used to end by asking to be run again.
+            build_under_sudo(cli.command, &build_dir, &profile)?;
+            if qemu::needs_build(&build_dir, &profile)? {
+                anyhow::bail!(
+                    "The image is still out of date after building it; the output above says why."
+                );
+            }
+            run_needs_build = false;
+        } else {
+            escalate(cli.command, &build_dir, &profile)?;
+        }
     }
 
-    let artefacts_ready = env::var_os("MPOS_XTASK_ARTEFACTS_READY").is_some();
     let result = dispatch(
         cli.command,
         &build_dir,
@@ -188,14 +218,14 @@ fn dispatch(
             if !artefacts_ready {
                 utils::build_kernel(profile)?;
             }
-            initramfs::ensure(build_dir, profile)?;
+            // `build_rootfs` brings the initramfs up to date itself: it is one
+            // of the inputs the image is assembled from.
             rootfs::build_rootfs(build_dir, profile)
         }
         Commands::All => {
             if !artefacts_ready {
                 utils::build_kernel(profile)?;
             }
-            initramfs::ensure(build_dir, profile)?;
             disk::ensure(build_dir, profile)?;
             rootfs::ensure(build_dir, profile)
         }
@@ -203,6 +233,43 @@ fn dispatch(
         Commands::Test => selftest::run_tests(build_dir, profile),
         Commands::Clean => utils::clean(build_dir),
     }
+}
+
+/// Runs the privileged half in a child sudo process instead of replacing this
+/// one, and waits for it.
+///
+/// `escalate` execs, which is right for a command whose work ends when the
+/// privileged half does - but a `run` that needs to build still has to boot
+/// afterwards, and a process that replaced itself with the build never could.
+/// The child is told to skip the cargo build: this process already did that as
+/// the user, and doing it again as root is what used to make root the owner of
+/// `target/`.
+fn build_under_sudo(command: Commands, build_dir: &Path, profile: &str) -> Result<()> {
+    let exe = env::current_exe().context("Failed to find the xtask executable")?;
+    let home = env::var("HOME").unwrap_or_default();
+    let path = env::var("PATH").unwrap_or_default();
+
+    let mut sudo = Command::new("sudo");
+    sudo.arg("-E")
+        .arg("env")
+        .arg(format!("HOME={home}"))
+        .arg(format!("PATH={path}"))
+        .arg("MPOS_XTASK_SUDO=1")
+        .arg("MPOS_XTASK_ARTEFACTS_READY=1")
+        .arg(format!("MPOS_XTASK_UID={}", utils::current_uid()))
+        .arg(format!("MPOS_XTASK_GID={}", utils::current_gid()))
+        .arg(exe)
+        .arg("--build-dir")
+        .arg(build_dir)
+        .arg("--profile")
+        .arg(profile)
+        .arg(command.name());
+
+    let status = sudo.status().context("Failed to run sudo")?;
+    if !status.success() {
+        anyhow::bail!("The privileged part of the build failed");
+    }
+    Ok(())
 }
 
 /// Re-runs this command as root, carrying the invoking user's identity along so

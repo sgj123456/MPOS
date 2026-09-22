@@ -643,6 +643,13 @@ impl Vfs {
                     // holds the walk so far, and at the base there is no walk
                     // yet, so the base's own parent has to be looked for.
                     ".." => {
+                        // Leaving a directory is a search of it as much as
+                        // entering one is: Linux asks for the execute bit
+                        // here too, and without it `../secret` reaches a
+                        // file through a directory the caller cannot walk.
+                        if let Some(here) = stack.last() {
+                            crate::vfs::may_search(here)?;
+                        }
                         if stack.len() > 1 {
                             stack.pop();
                         } else if stack[0].metadata().kind != NodeKind::Dir {
@@ -657,6 +664,14 @@ impl Vfs {
                     }
                     name => {
                         let here = stack.last().expect("the stack is never empty").clone();
+                        // Walking *through* a directory is what the execute
+                        // bit is for: without it a caller can name a file it
+                        // may not reach, and the name is all a directory
+                        // listing ever needed. Linux checks every component
+                        // as it goes, so the check belongs in the walk rather
+                        // than at the open - the walk is what reaches the
+                        // file.
+                        crate::vfs::may_search(&here)?;
                         let child = here.lookup(name)?;
                         let child = critical_section::with(|cs| {
                             let mounts = self.mounts.borrow(cs).borrow();
@@ -736,6 +751,13 @@ impl Vfs {
     /// `"/"` for the root itself, `None` for a node the tree cannot name: a
     /// mounted filesystem's root reached from outside its mount point, or a
     /// node whose other name the caller did not use.
+    ///
+    /// The walk asks every directory it meets to list itself, so a listing
+    /// that answers by searching the tree would start this search again from
+    /// the top, one stack deeper each time. The one directory that used to do
+    /// that is `/proc/<pid>/fd`, which names each open descriptor by the path
+    /// it was opened through; it now answers a listing with the descriptor
+    /// numbers alone, and computes a name only when `readlink` asks for one.
     pub fn path_of(&self, target: &Arc<dyn Inode>) -> Option<alloc::string::String> {
         const VISITS_MAX: usize = 512;
 

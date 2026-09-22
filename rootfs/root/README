@@ -1,0 +1,47 @@
+# The root filesystem overlay
+
+Whatever is in this directory is merged into the root filesystem the image is
+built with: the *contents* map to that system's root, so `rootfs/etc/inittab`
+becomes `/etc/inittab` and replaces what the packages put there. Directories are
+merged; files and symlinks overwrite.
+
+It is applied on every rootfs build - a boot-files update included - and after
+everything generated from `rootfs.toml`, so a file here is the authority over
+anything the build writes.
+
+## What is configured here rather than in rootfs.toml
+
+| File | Is |
+|------|-----|
+| `etc/inittab` | what runs at boot, and how many consoles get a getty |
+| `etc/network/interfaces` | the network: interfaces, addressing, the hook lines |
+| `etc/resolv.conf` | the resolver - QEMU's user-mode forwarder at 10.0.2.3 |
+| `etc/doas.conf` | who may escalate: `wheel`, no password |
+
+`rootfs.toml` is for the values the build has to interpolate - the hostname, the
+accounts and their passwords, the package list, the mirror, the disk layout -
+because those have no file to live in. Anything that is a constant belongs here,
+where changing it is editing a file rather than a Rust string.
+
+## Adding something
+
+Drop it in: `rootfs/etc/init.d/custom-service` becomes
+`/etc/init.d/custom-service` on the image, and the next `cargo xtask rootfs`
+copies it in - no reinstall, no package list to change.
+
+A service script has to be executable for OpenRC to start it:
+
+```sh
+#!/sbin/openrc-run
+
+depend() {
+    need localmount
+    after boot
+}
+
+start() {
+    ebegin "Starting custom service"
+    # Your service commands here
+    eend $?
+}
+```

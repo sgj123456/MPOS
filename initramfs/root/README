@@ -1,0 +1,33 @@
+# The initramfs overlay
+
+Whatever is in this directory is merged into the early userspace the kernel
+unpacks: the *contents* map to that archive's root, so `initramfs/init` becomes
+`/init` and replaces what the packages put there. Directories are merged; files
+and symlinks overwrite.
+
+## init
+
+`init` is the script the kernel runs as pid 1 on the ramfs. It mounts the
+pseudo-filesystems, mounts the filesystem the command line names with `root=`,
+moves the mounts onto it and `switch_root`s into `/sbin/init`.
+
+It lives here rather than in a Rust string in `xtask`, so editing it is editing
+a shell script. It must stay executable - the kernel execs it - and the archive
+carries the mode it has in this tree.
+
+Two things are worth knowing when changing it:
+
+* Anything created *before* `switch_root` disappears with the ramfs; anything
+  mounted onto the new root survives. That is why the script makes `/sysroot/tmp`
+  and friends and then mounts onto them.
+* `mount -t devpts devpts /sysroot/dev/pts` is not optional. Without it every
+  `openpty` in the real system fails with ENOENT - which is how a `doas` or a
+  nested shell reports "unable to allocate pty".
+
+## An extra mount at boot
+
+```sh
+# initramfs/etc/extra-mount.sh
+#!/bin/sh
+mount -t tmpfs tmpfs /tmp
+```

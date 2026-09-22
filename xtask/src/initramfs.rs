@@ -23,14 +23,9 @@ pub fn build_initramfs(build_dir: &Path, _profile: &str) -> Result<()> {
     let staging = build_dir.join("initramfs");
     let tar = utils::initramfs_path(build_dir);
 
-    if tar.exists() {
-        let tar_time = utils::file_mtime(&tar)?;
-        if !utils::newer(&config_path, &tar)?
-            && !utils::dir_newer_than(&root.join("initramfs"), tar_time)?
-        {
-            println!("initramfs: up to date");
-            return Ok(());
-        }
+    if !needs_rebuild(build_dir)? {
+        println!("initramfs: up to date");
+        return Ok(());
     }
 
     println!("Building the initramfs");
@@ -43,10 +38,7 @@ pub fn build_initramfs(build_dir: &Path, _profile: &str) -> Result<()> {
         fs::create_dir_all(staging.join(dir))?;
     }
 
-    let repositories = format!(
-        "{}/{}/main\n{}/{}/community\n",
-        config.mirror, config.branch, config.mirror, config.branch
-    );
+    let repositories = utils::repositories_text(&config.mirror, &config.branch, &config.repos);
     fs::write(staging.join("etc/apk/repositories"), repositories)?;
 
     utils::install_apk_keys(&staging.join("etc/apk/keys"))?;
@@ -90,16 +82,18 @@ pub fn build_initramfs(build_dir: &Path, _profile: &str) -> Result<()> {
         anyhow::bail!("Could not install the busybox applet links");
     }
 
-    fs::write(staging.join("init"), INIT)?;
-    utils::set_mode(&staging.join("init"), 0o755)?;
-
+    // `/init` is a file of its own now - `initramfs/init`, applied with the
+    // rest of the overlay below - so nothing here writes it. It used to be a
+    // constant in this binary, which is why a rebuilt `xtask` had to count as a
+    // reason to rebuild the archive; a file in the tree has an mtime, and the
+    // staleness check reads that instead.
     let sh = staging.join("bin/sh");
     if sh.symlink_metadata().is_ok() {
         fs::remove_file(&sh)?;
     }
     std::os::unix::fs::symlink("/bin/busybox", &sh)?;
 
-    utils::copy_dir_recursive(&root.join("initramfs"), &staging)?;
+    utils::merge_overlay(&root.join("initramfs"), &staging)?;
 
     let status = Command::new("tar")
         .args([
@@ -135,55 +129,28 @@ pub fn ensure(build_dir: &Path, profile: &str) -> Result<()> {
     build_initramfs(build_dir, profile)
 }
 
-const INIT: &str = r#"#!/bin/sh
-# Mount the pseudo-filesystems on the temporary root, mount the root
-# filesystem the kernel command line names, and hand the machine over.
-#
-# This runs as pid 1 on a ramfs, with the archive the kernel unpacked as its
-# whole world. Everything it does before `switch_root` is gone with that
-# ramfs, and everything it mounts *onto the new root* is not.
+/// True when the archive is missing or older than what it is built from: the
+/// configuration and the `initramfs/` overlay, which is where the init script
+/// and everything else in the tree lives.
+///
+/// The binary is not an input. It was one while `/init` was a constant inside
+/// it - a rebuilt `xtask` meant a new init script, and nothing else said so.
+/// With the script a file in the overlay, the tree's own mtimes answer the
+/// question, and editing this crate no longer rebuilds an archive whose
+/// contents did not change.
+///
+/// `run` asks this same question through `utils::image_stale`, which is what
+/// makes a stale image rebuild instead of booting code that is no longer on
+/// disk.
+pub fn needs_rebuild(build_dir: &Path) -> Result<bool> {
+    let root = utils::project_root()?;
+    let tar = utils::initramfs_path(build_dir);
+    if !tar.exists() {
+        return Ok(true);
+    }
 
-export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+    let tar_time = utils::file_mtime(&tar)?;
 
-# Before the command line is read, because /proc/cmdline is where it is read
-# from, and before anything else because every tool below wants one of these
-# three.
-mount -t proc     proc     /proc
-mount -t sysfs    sysfs    /sys
-mount -t devtmpfs devtmpfs /dev
-
-root=''
-rootflags='rw'
-for arg in $(cat /proc/cmdline); do
-    case "$arg" in
-        root=*)      root="${arg#root=}" ;;
-        rootflags=*) rootflags="${arg#rootflags=}" ;;
-    esac
-done
-
-if [ -z "$root" ]; then
-    echo "initramfs: no root= on the command line; staying here"
-    exec /bin/sh
-fi
-
-mkdir -p /sysroot
-if ! mount -t ext2 -o "$rootflags" "$root" /sysroot; then
-    echo "initramfs: cannot mount $root; staying here"
-    exec /bin/sh
-fi
-
-# The directories the real init expects to find already mounted. What is
-# mounted here survives the pivot; what is created here does not, so each one
-# is made on the new root, not on the ramfs.
-for dir in proc sys dev tmp run; do
-    mkdir -p "/sysroot/$dir"
-done
-
-mount -t proc     proc     /sysroot/proc
-mount -t sysfs    sysfs    /sysroot/sys
-mount -t tmpfs    tmpfs    /sysroot/tmp
-mount -t tmpfs    tmpfs    /sysroot/run
-mount --move /dev /sysroot/dev
-
-exec switch_root /sysroot /sbin/init
-"#;
+    Ok(utils::newer(&root.join("initramfs.toml"), &tar)?
+        || utils::dir_newer_than(&root.join("initramfs"), tar_time)?)
+}

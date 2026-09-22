@@ -228,6 +228,23 @@ pub const PIVOT_ROOT: u64 = 155;
 /// `chroot(2)`: change what `/` means. `switch_root` uses it after moving the
 /// root, to drop the process - and here, the namespace - out of the initramfs.
 pub const CHROOT: u64 = 161;
+// The extended-attribute family (188-199), every operation in the three
+// spellings: by path, by path without following a final symlink (`l`-prefixed,
+// operating on the link itself), and by descriptor (`f`-prefixed). None of this
+// kernel's filesystems store xattrs, so all of them answer `EOPNOTSUPP` once
+// their target resolves - see the handlers in `fs`.
+pub const SETXATTR: u64 = 188;
+pub const LSETXATTR: u64 = 189;
+pub const FSETXATTR: u64 = 190;
+pub const GETXATTR: u64 = 191;
+pub const LGETXATTR: u64 = 192;
+pub const FGETXATTR: u64 = 193;
+pub const LISTXATTR: u64 = 194;
+pub const LLISTXATTR: u64 = 195;
+pub const FLISTXATTR: u64 = 196;
+pub const REMOVEXATTR: u64 = 197;
+pub const LREMOVEXATTR: u64 = 198;
+pub const FREMOVEXATTR: u64 = 199;
 /// `signalfd(2)`: a descriptor that reports signals - child exits here.
 pub const SIGNALFD: u64 = 282;
 /// `signalfd4(2)`: the signalfd spelling musl actually makes. The original
@@ -568,6 +585,20 @@ mod tests {
         assert_eq!(GETEUID, 107);
         assert_eq!(GETEGID, 108);
         assert_eq!(SETPGID, 109);
+        // The xattr family occupies the whole 188-199 block on x86_64, in the
+        // set/get/list/remove order, each plain then `l`- then `f`-prefixed.
+        assert_eq!(SETXATTR, 188);
+        assert_eq!(LSETXATTR, 189);
+        assert_eq!(FSETXATTR, 190);
+        assert_eq!(GETXATTR, 191);
+        assert_eq!(LGETXATTR, 192);
+        assert_eq!(FGETXATTR, 193);
+        assert_eq!(LISTXATTR, 194);
+        assert_eq!(LLISTXATTR, 195);
+        assert_eq!(FLISTXATTR, 196);
+        assert_eq!(REMOVEXATTR, 197);
+        assert_eq!(LREMOVEXATTR, 198);
+        assert_eq!(FREMOVEXATTR, 199);
         assert_eq!(GETPPID, 110);
         assert_eq!(GETPGRP, 111);
         assert_eq!(SETSID, 112);

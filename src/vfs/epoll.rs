@@ -493,6 +493,11 @@ fn nesting_check(this: &Epoll, target: &Epoll) -> Result<(), isize> {
 }
 
 impl Inode for Epoll {
+    /// An epoll set has no position: `lseek(2)` on one is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x7000_0000 + self.ino,
@@ -550,14 +555,16 @@ mod tests {
     fn epoll_fd() -> (FdTable, Arc<Epoll>, i32) {
         let table = FdTable::new();
         let epoll = Epoll::new(7);
-        let fd = table.install(Arc::new(File::new(epoll.clone())));
+        let fd = table
+            .install(Arc::new(File::new(epoll.clone())))
+            .unwrap();
         assert_eq!(fd, 0, "the epfd is the table's first descriptor");
         (table, epoll, fd)
     }
 
     /// Install a node in `table` and hand back its number.
     fn watch(table: &FdTable, node: Arc<dyn Inode>) -> i32 {
-        table.install(Arc::new(File::new(node)))
+        table.install(Arc::new(File::new(node))).unwrap()
     }
 
     /// The ABI is not a choice: every bit and offset is the value the
@@ -882,7 +889,7 @@ mod tests {
         // A dup of the epfd, at another number, still names this instance:
         // ADDing it is a circle, and the answer is ELOOP.
         let (table, ep, epfd) = epoll_fd();
-        let dup = table.install(table.clone_at(epfd).unwrap());
+        let dup = table.install(table.clone_at(epfd).unwrap()).unwrap();
         assert_eq!(
             ep.ctl(&table, epfd, EPOLL_CTL_ADD, dup, EPOLLIN, 0),
             Err(err::ELOOP)

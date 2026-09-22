@@ -369,6 +369,11 @@ fn now_ticks() -> u64 {
 }
 
 impl Inode for TimerFd {
+    /// A timer has no position: `lseek(2)` on one is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x8000_0000 + self.ino,

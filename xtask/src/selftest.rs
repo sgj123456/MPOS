@@ -307,7 +307,11 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     )?;
     fs::copy(utils::kernel_path(profile)?, esp.join("mpos.elf"))?;
     fs::copy(tar, esp.join("initramfs.tar"))?;
-    fs::write(esp.join("mpos.cmdline"), "console=ttyS0\n")?;
+    // `mpos.selftest` is the switch the kernel reads to run its milestone
+    // checks (the half-second clock wait and the scheduler sleeps). A normal
+    // boot leaves it off and goes straight to init; the test boot wants every
+    // check run, so it asks for them here.
+    fs::write(esp.join("mpos.cmdline"), "console=ttyS0 mpos.selftest\n")?;
 
     let ovmf_dir = qemu::find_ovmf()?;
     let vars = utils::ovmf_vars_path(build_dir);
@@ -317,54 +321,25 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     let log = build_dir.join("test-serial.log");
     let esp = esp.canonicalize()?;
     let log_path = log.display().to_string();
-    let accel = qemu::detect_accel();
-    let mem = std::env::var("MEM").unwrap_or_else(|_| "1024".to_string());
-
+    // The same command line `run` boots with, from `[qemu]` in rootfs.toml -
+    // except that the disk is this run's ESP and the serial line goes to a
+    // file, because a test reads its verdict back out of it.
+    let config = crate::config::QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
+    let args = qemu::machine_args(
+        &config,
+        &ovmf_dir,
+        &vars,
+        qemu::Boot::Esp(esp.clone()),
+        qemu::Console::File(log_path.clone()),
+    );
     // `isa-debug-exit` is what turns the guest's `poweroff` into a process
     // exit: the kernel writes 0x10 to port 0xf4 and QEMU terminates with
     // status (0x10 << 1) | 1 = 33.
-    let args: Vec<String> = vec![
-        "-machine".into(),
-        "q35".into(),
-        "-accel".into(),
-        accel,
-        "-m".into(),
-        mem,
-        "-drive".into(),
-        format!(
-            "if=pflash,format=raw,unit=0,readonly=on,file={}",
-            ovmf_dir.join("OVMF_CODE.4m.fd").display()
-        ),
-        "-drive".into(),
-        format!("if=pflash,format=raw,unit=1,file={}", vars.display()),
-        // `readonly=on` is not decoration: QEMU's virtual FAT cannot be
-        // written, and a virtio-blk device refuses a backend it was not told
-        // is read-only (`Block node is read-only`) - the machine never
-        // starts, and every test reports as failed. Say so up front and the
-        // disk is a perfectly good ESP: the loader only ever reads it.
-        "-drive".into(),
-        format!("file=fat:{},format=raw,if=none,id=hd0,readonly=on", esp.display()),
-        "-device".into(),
-        "virtio-blk-pci,drive=hd0".into(),
-        // The network the socket tests are written against. `/init` brings
-        // eth0 up with the address slirp expects, and `t-socket`, `t-tcp` and
-        // `t-udp` then talk to the host through it; without a NIC those three
-        // open sockets into nothing and the suite loses them to failures that
-        // name the network, not the kernel.
-        "-netdev".into(),
-        "user,id=n0,hostname=mpos".into(),
-        "-device".into(),
-        "virtio-net-pci,netdev=n0".into(),
+    let mut args = args;
+    args.extend([
         "-device".into(),
         "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
-        "-display".into(),
-        "none".into(),
-        "-monitor".into(),
-        "none".into(),
-        "-serial".into(),
-        format!("file:{log_path}"),
-        "-no-reboot".into(),
-    ];
+    ]);
 
     eprintln!("+ qemu-system-x86_64 {}", args.join(" "));
     let mut child = Command::new("qemu-system-x86_64")

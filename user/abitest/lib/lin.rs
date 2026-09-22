@@ -283,6 +283,10 @@ pub const F_GETFD: i32 = 1;
 pub const F_SETFD: i32 = 2;
 pub const F_GETFL: i32 = 3;
 pub const F_SETFL: i32 = 4;
+/// `FIONBIO`: set or clear `O_NONBLOCK` through `ioctl` rather than `fcntl`.
+/// The request Rust's std uses on Linux to put a pipe in non-blocking mode
+/// before it polls it, which is why it has to exist at all.
+pub const FIONBIO: usize = 0x5421;
 pub const FD_CLOEXEC: usize = 1;
 /// access modes.
 pub const F_OK: usize = 0;
@@ -328,6 +332,12 @@ pub const SIGSTOP: i32 = 19;
 /// stop. A stopped task does not act on anything else first - it is not
 /// scheduled - so resuming is what makes any later signal reach it.
 pub const SIGCONT: i32 = 18;
+pub const SIGINT: i32 = 2;
+pub const SIGALRM: i32 = 14;
+/// `si_code` values a handler reads out of `siginfo_t`: a bare `kill`, a
+/// `sigqueue` carrying a payload, and an interval timer's expiry.
+pub const SI_USER: i32 = 0;
+pub const SI_QUEUE: i32 = -1;
 
 /// clock ids.
 pub const CLOCK_REALTIME: usize = 0;
@@ -473,6 +483,37 @@ pub struct StackT {
     pub ss_flags: i32,
     pub _pad: u32,
     pub ss_size: usize,
+}
+
+/// The `siginfo_t` a `SA_SIGINFO` handler is handed: signo at 0, `si_code` at
+/// 8, and - for a `sigqueue` - the `union sigval` at 24. Padded to the ABI's
+/// full 128 bytes so it can also be built on the stack and passed to
+/// `rt_sigqueueinfo`.
+#[repr(C)]
+pub struct SigInfo {
+    pub signo: i32,   // 0
+    pub errno: i32,   // 4
+    pub code: i32,    // 8
+    pub _pad: i32,    // 12
+    pub pid: i32,     // 16
+    pub uid: i32,     // 20
+    pub value: u64,   // 24 - `union sigval`
+    pub _rest: [u8; 128 - 32],
+}
+
+impl SigInfo {
+    pub fn zero() -> Self {
+        SigInfo {
+            signo: 0,
+            errno: 0,
+            code: 0,
+            _pad: 0,
+            pid: 0,
+            uid: 0,
+            value: 0,
+            _rest: [0; 128 - 32],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,6 +1299,25 @@ pub fn tgkill(tgid: isize, tid: isize, sig: usize) -> isize {
 /// `rt_sigpending(set, sigsetsize)`: the pending mask out.
 pub fn rt_sigpending(set: *mut u64, sigsetsize: usize) -> isize {
     sys2(nr::RT_SIGPENDING, set as usize, sigsetsize)
+}
+
+/// `rt_sigreturn()`: the frame `rt_sigaction`'s handler left on the stack,
+/// restored. A test's `SA_RESTORER` trampoline is a function that only calls
+/// this; it never returns.
+pub fn rt_sigreturn() -> isize {
+    sys0(nr::RT_SIGRETURN)
+}
+
+/// `rt_sigqueueinfo(tgid, sig, info)`: `sigqueue`'s syscall spelling. The
+/// `si_code` and `si_value` the caller wrote in `info` reach the target's
+/// handler.
+pub fn rt_sigqueueinfo(tgid: isize, sig: i32, info: &SigInfo) -> isize {
+    sys3(
+        nr::RT_SIGQUEUEINFO,
+        tgid as usize,
+        sig as usize,
+        info as *const SigInfo as usize,
+    )
 }
 
 /// `copy_file_range(in, off_in, out, off_out, len, flags)`: the offsets

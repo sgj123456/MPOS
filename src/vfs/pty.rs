@@ -308,6 +308,11 @@ pub fn master_input(number: u32, bytes: &[u8]) {
 pub struct Ptmx;
 
 impl Inode for Ptmx {
+    /// The pty multiplexer has no position either: `lseek` is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0,
@@ -335,6 +340,11 @@ pub struct PtyMaster {
 }
 
 impl Inode for PtyMaster {
+    /// A pty is a terminal: no position, so `lseek` is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0,
@@ -345,6 +355,22 @@ impl Inode for PtyMaster {
 
     fn as_pty(&self) -> Option<&Pty> {
         Some(&self.pty)
+    }
+
+    /// The master answers the terminal ioctls, as it does on Linux: a pty pair
+    /// is *one* terminal with two ends, so its termios, its window size and
+    /// its foreground process group belong to the pair rather than to an end.
+    ///
+    /// This is load-bearing for every program that drives a pty. A supervisor
+    /// holds the master and nothing else - it has no other descriptor to ask -
+    /// so it decides whether it can do job control at all by asking *this*
+    /// end: `sudo` calls `isatty`/`TCGETS` on the master, and a master that
+    /// says `ENOTTY` makes it skip the `tcsetpgrp` that would put the command
+    /// it started in the foreground. The command's shell then finds itself in
+    /// the background of its own terminal, stops itself, and waits forever for
+    /// a parent that has already decided the terminal is not a terminal.
+    fn as_tty(&self) -> Option<&Tty> {
+        Some(self.pty.slave().as_ref())
     }
 
     fn rdev(&self) -> Option<(u32, u32)> {
@@ -408,6 +434,11 @@ impl PtySlave {
 }
 
 impl Inode for PtySlave {
+    /// A pty is a terminal: no position, so `lseek` is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         let mut meta = self.pty.slave().metadata();
         meta.ino = self.pty.number() as u64;
@@ -531,11 +562,18 @@ mod tests {
     }
 
     #[test]
-    fn the_master_is_not_a_terminal_but_carries_the_pair() {
-        let master = PtyMaster {
-            pty: allocate(903, (136, 903)),
-        };
-        assert!(master.as_tty().is_none(), "isatty(master) is false");
+    fn the_master_is_a_terminal_too_and_carries_the_pair() {
+        let pty = allocate(903, (136, 903));
+        let master = PtyMaster { pty: pty.clone() };
+        // Both ends are the terminal: a supervisor holds only the master, so
+        // `isatty` on it is how it decides whether it can do job control. It
+        // still reports its own `st_rdev`, which is what `ttyname` tells the
+        // ends apart by.
+        let as_tty = master.as_tty().expect("isatty(master) is true");
+        assert!(
+            core::ptr::eq(as_tty, pty.slave().as_ref()),
+            "one terminal, two ends"
+        );
         assert_eq!(master.as_pty().map(|p| p.number()), Some(903));
         assert_eq!(master.rdev(), Some((5, 2)));
     }

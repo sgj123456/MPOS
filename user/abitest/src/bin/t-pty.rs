@@ -86,17 +86,22 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_true(&mut failed, b"/dev/pts/N opens", slave >= 0);
     let slave = slave as i32;
 
-    // The master is a wire, not a terminal; the slave is one.
+    // Both ends answer the terminal ioctls, as they do on Linux: a pty pair
+    // is one terminal with two ends, so the termios belongs to the pair. A
+    // supervisor holds only the master, and `isatty`/`TCGETS` on it is how it
+    // decides whether it can do job control at all - `sudo` skipping its
+    // `tcsetpgrp` on an `ENOTTY` master is a command left stopped forever.
     let mut termios = [0u8; 64];
     let r = lin::ioctl(master, lin::TCGETS, &raw mut termios as usize);
-    lin::check_eq(
-        &mut failed,
-        b"TCGETS on the master answers ENOTTY",
-        r,
-        lin::ENOTTY,
-    );
-    let r = lin::ioctl(slave, lin::TCGETS, &raw mut termios as usize);
+    lin::check_eq(&mut failed, b"TCGETS on the master succeeds", r, 0);
+    let mut slave_termios = [0u8; 64];
+    let r = lin::ioctl(slave, lin::TCGETS, &raw mut slave_termios as usize);
     lin::check_eq(&mut failed, b"TCGETS on the slave succeeds", r, 0);
+    lin::check_true(
+        &mut failed,
+        b"the two ends report one terminal",
+        termios == slave_termios,
+    );
 
     // Master to slave: what is typed is what the line discipline hands the
     // reader, canonical mode and ICRNL included.

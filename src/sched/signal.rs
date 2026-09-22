@@ -230,6 +230,91 @@ pub struct AltStack {
 /// signal frame, and Linux answers `ENOMEM` rather than truncating it.
 pub const MINSIGSTKSZ: usize = 2048;
 
+/// `si_code` values: what a handler reads out of `siginfo_t` to tell one
+/// arrival from another. `SI_USER` is a bare `kill`; `SI_QUEUE` is `sigqueue`
+/// carrying a payload; `SI_TIMER` is a POSIX interval timer; `SI_KERNEL` is
+/// the hardware raising a fault.
+pub const SI_USER: i32 = 0;
+pub const SI_KERNEL: i32 = 0x80;
+pub const SI_QUEUE: i32 = -1;
+pub const SI_TIMER: i32 = -2;
+
+/// The part of a `siginfo_t` this kernel can honour for the signals it names:
+/// the number, where it came from, and - for `sigqueue` - the one word of the
+/// caller's payload that survives to the handler. Standard signals are not
+/// queued, so one record per signal number is exactly the storage the ABI
+/// implies, and it is why this is a slot in an array rather than a list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SigInfo {
+    pub signo: i32,
+    pub errno: i32,
+    pub code: i32,
+    pub pid: i32,
+    pub uid: i32,
+    /// The `union sigval` a `sigqueue` sent, or zero for a plain `kill`.
+    pub value: u64,
+}
+
+impl SigInfo {
+    /// The zero record: no signal. An empty pending slot looks like this.
+    pub const ZERO: SigInfo = SigInfo {
+        signo: 0,
+        errno: 0,
+        code: 0,
+        pid: 0,
+        uid: 0,
+        value: 0,
+    };
+
+    /// A `kill`/`tgkill` record: `SI_USER`, from `pid`/`uid`, no payload.
+    pub fn user(sig: u8, pid: i32, uid: i32) -> SigInfo {
+        SigInfo {
+            signo: sig as i32,
+            errno: 0,
+            code: SI_USER,
+            pid,
+            uid,
+            value: 0,
+        }
+    }
+
+    /// A `sigqueue` record: `SI_QUEUE` carrying the caller's `value`.
+    pub fn queue(sig: u8, pid: i32, uid: i32, value: u64) -> SigInfo {
+        SigInfo {
+            signo: sig as i32,
+            errno: 0,
+            code: SI_QUEUE,
+            pid,
+            uid,
+            value,
+        }
+    }
+
+    /// A record for a signal the kernel raised itself - a fault, a broken pipe.
+    pub fn kernel(sig: u8) -> SigInfo {
+        SigInfo {
+            signo: sig as i32,
+            errno: 0,
+            code: SI_KERNEL,
+            pid: 0,
+            uid: 0,
+            value: 0,
+        }
+    }
+
+    /// A record for a `setitimer`/timerfd expiry: `SI_TIMER`, no payload.
+    pub fn timer(sig: u8) -> SigInfo {
+        SigInfo {
+            signo: sig as i32,
+            errno: 0,
+            code: SI_TIMER,
+            pid: 0,
+            uid: 0,
+            value: 0,
+        }
+    }
+}
+
 /// A pending-signal set: one bit per signal number.
 pub type Pending = u32;
 
@@ -318,5 +403,23 @@ mod tests {
         add(&mut set, SIGKILL);
         assert_eq!(take(&mut set), Some(SIGKILL));
         assert_eq!(take(&mut set), None);
+    }
+
+    /// The records a handler reads out of `si_code` are the ABI's, so a
+    /// `sigqueue` payload is distinguishable from a bare `kill` - which is the
+    /// whole point of Phase 2.3.
+    #[test]
+    fn siginfo_codes_are_pinned() {
+        assert_eq!(SI_USER, 0);
+        assert_eq!(SI_QUEUE, -1);
+        assert_eq!(SI_TIMER, -2);
+        assert_eq!(SI_KERNEL, 0x80);
+        let q = SigInfo::queue(SIGTERM, 7, 0, 0x1234);
+        assert_eq!(q.code, SI_QUEUE);
+        assert_eq!(q.value, 0x1234);
+        assert_eq!(q.signo, SIGTERM as i32);
+        assert_eq!(SigInfo::user(SIGTERM, 7, 0).code, SI_USER);
+        assert_eq!(SigInfo::user(SIGTERM, 7, 0).value, 0);
+        assert_eq!(SigInfo::timer(SIGALRM).code, SI_TIMER);
     }
 }

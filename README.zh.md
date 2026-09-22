@@ -30,7 +30,7 @@
 | **里程碑验证** | 每个子系统在构建下一个之前都会被证明正确。串口日志携带标记（`M0_OK` 到 `M14_OK`），由测试框架断言验证。 |
 | **主机可测试拆分** | 所有不涉及机器状态的代码都在库 crate 中，通过 `cargo test` 在主机上运行。机器相关代码位于 `#[cfg(target_os = "none")]` 之后。 |
 | **Linux ABI 兼容** | 实现了约 225 个 Linux x86_64 系统调用。基于 musl 的程序（Alpine、busybox）可直接在内核上运行。 |
-| **直写式 ext2** | 完整的可读写 ext2 实现，采用直写语义——无日志、无脏页追踪、崩溃即可见。 |
+| **直写式 ext2/ext4** | 完整的可读写 ext2 和 ext4 实现，采用直写语义——无日志、无脏页追踪、崩溃即可见。 |
 | **优先级调度器** | 四个优先级带（LOW、NORMAL、HIGH、CRITICAL）之间严格优先级，带内轮转调度，基于截止时间的休眠队列，COW fork，按需分页栈增长。 |
 | **TCP/IP 网络** | 基于 smoltcp 的协议栈，支持 TCP、UDP、ICMP、ARP，运行在 virtio-net 上。仅支持 AF_INET——足以满足 musl DNS 解析器和 apk HTTP 通信。 |
 | **交互式 Shell** | Alpine 的 ash shell，支持管道、重定向、环境变量、后台作业，以及可脚本化的 init。 |
@@ -58,7 +58,7 @@ graph TB
         subgraph VFS["VFS 层"]
             VFS_CORE["Inode trait + 挂载表"]
             RAMFS["ramfs (initramfs, tmpfs)"]
-            EXT2["ext2 (读写)"]
+            EXT2["ext2/ext4 (读写)"]
             DEVFS["devfs (/dev/null, tty, console, ...)"]
             PROCFS["procfs (/proc/meminfo, cmdline, ...)"]
             SYSFS["sysfs (/sys/class/block, ...)"]
@@ -125,7 +125,7 @@ graph TD
     C --> G["paging::install() — 4级页表, NX, WP"]
     C --> H["sched::init() — 接管启动任务, 创建调度器任务"]
     C --> I["vfs::init() — ramfs 根, 解包 initramfs.tar"]
-    C --> J["blk::init() — virtio-blk, GPT 扫描, ext2 挂载"]
+    C --> J["blk::init() — virtio-blk, GPT 扫描, ext2/ext4 挂载"]
     C --> K["net::init() — virtio-net, smoltcp, 10.0.2.15/24"]
     C --> L["rand::init() — ChaCha20 PRNG"]
     C --> M["里程碑检查 M0–M8"]
@@ -217,7 +217,7 @@ mpos/
 │   │   ├── file.rs          # 打开文件表（fd table）
 │   │   ├── mount.rs         # 挂载表、Vfs struct、pivot_root
 │   │   ├── ramfs.rs         # 内存文件系统
-│   │   ├── ext2.rs          # 可读写 ext2（直写式）
+│   │   ├── ext4.rs          # 可读写 ext2 和 ext4（直写式）
 │   │   ├── devfs.rs         # /dev/null、/dev/zero、/dev/tty、/dev/console 等
 │   │   ├── devpts.rs        # /dev/pts/*（PTY）
 │   │   ├── procfs.rs        # /proc（meminfo、mounts、cmdline、maps、fd 等）
@@ -577,7 +577,7 @@ MPOS 实现了约 **225 个 Linux x86_64 系统调用**。POSIX 补全集(epoll�
 | **M7** | VFS | ramfs 根、挂载子文件系统、通过 fd 表的多任务文件 I/O |
 | **M8** | Initramfs 与 devfs | tar 解包、`/dev/tty`、`/dev/console`、`/dev/null`、`/dev/zero` |
 | **M9** | 进程 | ELF 加载到新地址空间；进入 Ring 3；退出码往返验证 |
-| **M10** | 块设备与 ext2 | virtio-blk 检测；ext2 挂载、读取、写入、冷挂载验证 |
+| **M10** | 块设备与 ext2/ext4 | virtio-blk 检测；ext2/ext4 挂载、读取、写入、冷挂载验证 |
 | **M11** | 管道、TTY、信号 | 管道字节传输和 EOF；TTY 行编辑；SIGTERM、SIGKILL、kill(0) |
 | **M12** | Shell 与核心工具 | Shell、echo、cat、ls、true、false、sleep —— 全部运行在 Ring 3 |
 | **M13** | Init 移交 | `/sbin/init` 成为 PID 1；Shell 通过 UART 中断变为交互式 |
@@ -594,7 +594,7 @@ MPOS 实现了约 **225 个 Linux x86_64 系统调用**。POSIX 补全集(epoll�
 - **OVMF** —— QEMU 用它替代 SeaBIOS 的 UEFI 固件（`/usr/share/OVMF/x64/OVMF_CODE.4m.fd`）
 - **python3** —— `scripts/mkfat.py` 无需 loop 设备即可写出 FAT32 卷
 - **parted** —— 划分镜像的 GPT 分区表
-- **mke2fs** / **e2fsprogs** —— 创建 ext2 数据分区
+- **mke2fs** / **e2fsprogs** —— 创建 ext2/ext4 数据分区
 
 ```bash
 rustup toolchain install nightly
@@ -639,7 +639,7 @@ cargo build --target x86_64-unknown-none
 |------|------|------|
 | 1, `ESP` | FAT32, 34 MiB | `EFI/BOOT/BOOTX64.EFI`（Limine）、`limine.conf` |
 | 2, `Boot` | FAT32, 192 MiB | `mpos.elf`、`initramfs.tar` |
-| 3, `Root` | ext2, 384 MiB | Alpine Linux rootfs（OpenRC、musl、busybox、apk） |
+| 3, `Root` | ext2/ext4, 384 MiB | Alpine Linux rootfs（OpenRC、musl、busybox、apk） |
 | 4, `Data` | ext2, 8 MiB | 种子文件（用于测试的文本文档） |
 
 QEMU 直接在 OVMF 下启动——不需要 ISO、不需要光驱、宿主上也不需要 loop 设备。FAT32 卷由 `scripts/mkfat.py` 逐字节写出。
@@ -712,7 +712,7 @@ MPOS 运行在单核上。所有共享状态由 `critical_section::Mutex<RefCell
 
 用户栈从 16 页（64 KiB）开始，在缺页时增长，上限为 `USER_STACK_MAX = 8 MiB` 和 `STACK_GROWTH_SLACK = 64 KiB`。缺页处理程序检查当前栈限制，如果在范围内则映射新页。
 
-### 直写式 ext2
+### 直写式 ext2/ext4
 
 每次 `write_at()` 都立即通过块缓存刷新。无日志、无脏页追踪、无后台回写。简单但正确——崩溃即可见。
 

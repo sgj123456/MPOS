@@ -24,7 +24,6 @@
 //! master has something, and the masters wake it the same way they wake any
 //! reader, so an idle console costs nothing.
 
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::sched::policy::TaskId;

@@ -15,12 +15,134 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use crate::config::QemuConfig;
 use crate::utils;
 
-/// True when there is nothing to boot yet, or only the empty image file `disk`
-/// made - the stamp is what says a root filesystem was installed into it.
-pub fn needs_build(build_dir: &Path) -> Result<bool> {
-    Ok(!utils::image_path(build_dir).exists() || !utils::rootfs_stamp(build_dir).exists())
+/// What the machine boots from, which is the one thing an image run and a user
+/// test run do differently.
+pub enum Boot {
+    /// The assembled image, as a virtio disk the guest can write.
+    Image(PathBuf),
+    /// A directory exported over QEMU's virtual FAT, read-only - what
+    /// `xtask test` boots when there is no image and no root filesystem, just
+    /// an ESP full of test programs.
+    Esp(PathBuf),
+}
+
+/// Where the guest's serial line goes.
+pub enum Console {
+    /// The terminal this command was run from.
+    Stdio,
+    /// A file, which is what a test run reads its verdict out of.
+    File(String),
+}
+
+/// The QEMU command line both `run` and `test` boot with.
+///
+/// One builder, because the two differed only in what they put on the disk and
+/// where the serial line went - and the rest (the firmware, the machine type,
+/// the network) drifting apart between them is a difference nobody asked for.
+/// The sizes and the name come from `[qemu]` in `rootfs.toml`.
+pub fn machine_args(
+    config: &QemuConfig,
+    ovmf_dir: &Path,
+    vars: &Path,
+    boot: Boot,
+    console: Console,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-machine".into(),
+        "q35".into(),
+        "-accel".into(),
+        detect_accel(),
+        "-m".into(),
+        config.memory.clone(),
+    ];
+
+    // A second processor is worth saying only when there is one: `-smp 1` is
+    // QEMU's default and the setting the kernel's bring-up code reads as
+    // "one processor, nothing to start".
+    if config.cpus > 1 {
+        args.push("-smp".into());
+        args.push(config.cpus.to_string());
+    }
+
+    args.extend([
+        "-drive".into(),
+        format!(
+            "if=pflash,format=raw,unit=0,readonly=on,file={}",
+            ovmf_dir.join("OVMF_CODE.4m.fd").display()
+        ),
+        "-drive".into(),
+        format!("if=pflash,format=raw,unit=1,file={}", vars.display()),
+    ]);
+
+    match boot {
+        Boot::Image(image) => args.extend([
+            "-drive".into(),
+            format!(
+                "file={},format=raw,if=none,id=hd0,file.locking=off",
+                image.display()
+            ),
+            "-device".into(),
+            "virtio-blk-pci,drive=hd0".into(),
+        ]),
+        // `readonly=on` is not decoration: QEMU's virtual FAT cannot be
+        // written, and a virtio-blk device refuses a backend it was not told
+        // is read-only (`Block node is read-only`) - the machine never
+        // starts, and every test reports as failed. Say so up front and the
+        // disk is a perfectly good ESP: the loader only ever reads it.
+        Boot::Esp(esp) => args.extend([
+            "-drive".into(),
+            format!(
+                "file=fat:{},format=raw,if=none,id=hd0,readonly=on",
+                esp.display()
+            ),
+            "-device".into(),
+            "virtio-blk-pci,drive=hd0".into(),
+        ]),
+    }
+
+    // The name the guest's DHCP client reports, and the network the socket
+    // tests are written against: `/init` brings eth0 up with the address slirp
+    // expects, and `t-socket`, `t-tcp` and `t-udp` then talk to the host
+    // through it.
+    args.extend([
+        "-netdev".into(),
+        format!("user,id=n0,hostname={}", config.hostname),
+        "-device".into(),
+        "virtio-net-pci,netdev=n0".into(),
+    ]);
+
+    match console {
+        Console::Stdio => args.extend([
+            "-display".into(),
+            "none".into(),
+            "-serial".into(),
+            "mon:stdio".into(),
+        ]),
+        Console::File(log) => args.extend([
+            "-display".into(),
+            "none".into(),
+            "-serial".into(),
+            format!("file:{log}"),
+        ]),
+    }
+
+    args.extend(["-monitor".into(), "none".into(), "-no-reboot".into()]);
+    args.extend(config.extra_args.iter().cloned());
+    args
+}
+
+/// True when the image does not reflect the sources: missing, never assembled,
+/// or assembled from a kernel, a loader, an initramfs or an overlay that has
+/// changed since.
+///
+/// `run` asks this before it decides anything. A kernel rebuilt after the last
+/// image has to trigger the rebuild - otherwise the boot is of code that is no
+/// longer on disk, and it reads exactly like a fix that changed nothing.
+pub fn needs_build(build_dir: &Path, profile: &str) -> Result<bool> {
+    utils::image_stale(build_dir, profile)
 }
 
 pub fn run_qemu(
@@ -30,15 +152,21 @@ pub fn run_qemu(
     needs_build: bool,
 ) -> Result<()> {
     if needs_build {
-        println!("run: there is no complete image yet; building one");
+        println!("run: the image is missing or out of date; building it");
         if !artefacts_ready {
             utils::build_kernel(profile)?;
         }
-        crate::initramfs::ensure(build_dir, profile)?;
         crate::disk::ensure(build_dir, profile)?;
+        // The rootfs step brings the initramfs up to date itself, so there is
+        // no separate call here to report it twice.
         crate::rootfs::ensure(build_dir, profile)?;
-        println!();
-        println!("run: the image is built; run this command again to boot it");
+        // When `artefacts_ready` is set this is the sudo half, and its parent
+        // is waiting to boot what was just built. Only a `run` that is the
+        // whole command has to be told to come back.
+        if !artefacts_ready {
+            println!();
+            println!("run: the image is built; run this command again to boot it");
+        }
         return Ok(());
     }
 
@@ -80,42 +208,16 @@ pub fn run_qemu(
         )
     })?;
 
-    let accel = detect_accel();
-    let mem = env::var("MEM").unwrap_or_else(|_| "1024".to_string());
-
-    let args: Vec<String> = vec![
-        "-machine".into(),
-        "q35".into(),
-        "-accel".into(),
-        accel,
-        "-m".into(),
-        mem,
-        "-drive".into(),
-        format!(
-            "if=pflash,format=raw,unit=0,readonly=on,file={}",
-            ovmf_dir.join("OVMF_CODE.4m.fd").display()
-        ),
-        "-drive".into(),
-        format!("if=pflash,format=raw,unit=1,file={}", vars.display()),
-        "-drive".into(),
-        format!(
-            "file={},format=raw,if=none,id=hd0,file.locking=off",
-            image.display()
-        ),
-        "-device".into(),
-        "virtio-blk-pci,drive=hd0".into(),
-        "-netdev".into(),
-        "user,id=n0,hostname=mpos".into(),
-        "-device".into(),
-        "virtio-net-pci,netdev=n0".into(),
-        "-display".into(),
-        "none".into(),
-        "-monitor".into(),
-        "none".into(),
-        "-serial".into(),
-        "stdio".into(),
-        "-no-reboot".into(),
-    ];
+    // The machine's own settings: memory, processors, the name the guest
+    // reports, and whatever `extra_args` adds.
+    let config = QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
+    let args = machine_args(
+        &config,
+        &ovmf_dir,
+        &vars,
+        Boot::Image(image.clone()),
+        Console::Stdio,
+    );
 
     // Printed because a boot that goes wrong is usually read off this line.
     eprintln!("+ qemu-system-x86_64 {}", args.join(" "));
@@ -159,4 +261,95 @@ pub fn detect_accel() -> String {
     }
 
     "tcg".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::QemuConfig;
+
+    fn config(memory: &str, cpus: u32, extra: &[&str]) -> QemuConfig {
+        QemuConfig {
+            memory: memory.to_string(),
+            cpus,
+            hostname: "probe".to_string(),
+            extra_args: extra.iter().map(|arg| arg.to_string()).collect(),
+        }
+    }
+
+    fn args(config: &QemuConfig, boot: Boot) -> Vec<String> {
+        machine_args(
+            config,
+            Path::new("/ovmf"),
+            Path::new("/build/OVMF_VARS.4m.fd"),
+            boot,
+            Console::Stdio,
+        )
+    }
+
+    /// The argument after `flag`, which is how every assertion here reads the
+    /// line - the order of unrelated options is QEMU's business, not this
+    /// crate's.
+    fn after(args: &[String], flag: &str) -> Option<String> {
+        let at = args.iter().position(|arg| arg == flag)?;
+        args.get(at + 1).cloned()
+    }
+
+    #[test]
+    fn the_machine_line_carries_the_configured_memory_and_processors() {
+        let config = config("2048", 4, &[]);
+        let args = args(&config, Boot::Image(PathBuf::from("/build/mpos.img")));
+        assert_eq!(after(&args, "-m").as_deref(), Some("2048"));
+        assert_eq!(after(&args, "-smp").as_deref(), Some("4"));
+        assert_eq!(after(&args, "-machine").as_deref(), Some("q35"));
+    }
+
+    #[test]
+    fn one_processor_is_left_to_qemu() {
+        // `-smp 1` is the default, and the kernel's own bring-up reads the
+        // absence of a second processor out of the same place either way.
+        let config = config("1024", 1, &[]);
+        let args = args(&config, Boot::Image(PathBuf::from("/build/mpos.img")));
+        assert!(!args.iter().any(|arg| arg == "-smp"), "{args:?}");
+    }
+
+    #[test]
+    fn an_image_boot_is_a_writable_disk_and_an_esp_boot_is_read_only() {
+        let config = config("1024", 1, &[]);
+
+        let image = args(&config, Boot::Image(PathBuf::from("/build/mpos.img")));
+        let disk = image
+            .iter()
+            .find(|arg| arg.contains("mpos.img"))
+            .expect("the image is on the command line");
+        assert!(disk.contains("file.locking=off"), "{disk}");
+        assert!(!disk.contains("readonly"), "the guest writes to it: {disk}");
+
+        let esp = args(&config, Boot::Esp(PathBuf::from("/build/test-esp")));
+        let disk = esp
+            .iter()
+            .find(|arg| arg.contains("test-esp"))
+            .expect("the ESP is on the command line");
+        assert!(
+            disk.contains("readonly=on"),
+            "virtual FAT cannot be written, and a device that was not told so never starts: {disk}"
+        );
+    }
+
+    #[test]
+    fn the_guest_is_named_and_extra_arguments_come_last() {
+        let config = config("1024", 1, &["-enable-kvm"]);
+        let args = args(&config, Boot::Image(PathBuf::from("/build/mpos.img")));
+
+        let netdev = args
+            .iter()
+            .find(|arg| arg.starts_with("user,id=n0"))
+            .expect("the network is on the command line");
+        assert!(netdev.contains("hostname=probe"), "{netdev}");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("-enable-kvm"),
+            "the escape hatch is appended after everything computed: {args:?}"
+        );
+    }
 }

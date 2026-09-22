@@ -1,8 +1,11 @@
-//! The ext2 filesystem, read and write.
+//! The ext4 filesystem, read and write - and the ext2 one it grew out of,
+//! which this same driver mounts by the rules ext4 lays down: an image
+//! without the `extents` feature is a block-map filesystem, and one with
+//! it is a tree, decided image by image and inode by inode.
 //!
 //! Everything runs through one design choice: the block cache is
 //! *write-through*. Every modification lands on the disk before the call
-//! returns, so the cache is the only state an [`Ext2Fs`] owns - dropping it
+//! returns, so the cache is the only state an [`Ext4Fs`] owns - dropping it
 //! loses nothing, and a second mount over the same device sees every write.
 //! That costs one extra write per allocation (counter blocks get rewritten
 //! immediately) and buys crash-plain semantics with no dirty tracking, no
@@ -15,14 +18,22 @@
 //! bookkeeping after every operation means the image stays inspectable with
 //! the host's own ext2 tools after a run.
 //!
-//! Block mapping covers direct, single-indirect and double-indirect; a file
-//! that would need triple-indirect gets [`VfsError::FileTooBig`] rather than
-//! silent truncation. Removal is the mirror of that: `unlink` drops a name
-//! and gives the freed blocks and inode straight back to the bitmaps, so a
-//! filesystem can be left as it was found. What is deliberately absent:
-//! htree-indexed directories (refused rather than misparsed), permission
+//! Block mapping covers both shapes the format has. The old one is direct,
+//! single-indirect and double-indirect; a file that would need triple gets
+//! [`VfsError::FileTooBig`] rather than silent truncation. The new one is
+//! ext4's extent tree, where a file is a handful of runs instead of a list of
+//! blocks: four extents fit in the inode, and past that the tree moves into
+//! blocks and splits, which is why that half of this file is recursive.
+//! Removal is the mirror of both. What is deliberately absent: permission
 //! checks (there is no identity to check against) and timestamps (preserved
 //! when an inode is rewritten, never updated).
+//!
+//! An ext4 image is mounted when its features allow it. They are sorted into
+//! three answers rather than two - features this driver can maintain,
+//! features it can read but must not write (checksums it cannot recompute, an
+//! unrecovered journal), and features it refuses outright because they change
+//! what a block *means* - and the second kind costs a read-only mount instead
+//! of a failed one: an image worth reading is worth reading.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -44,8 +55,13 @@ const SUPERBLOCK_AT: u64 = 1024;
 const SUPERBLOCK_BYTES: usize = 1024;
 const DIRECT_BLOCKS: usize = 12;
 /// How much of the 128-byte-plus inode we parse and rewrite. i_block ends at
-/// byte 100; everything after is metadata this driver does not touch.
-const INODE_PARSED: usize = 104;
+/// byte 100; byte 108 is ext2's `i_dir_acl` and ext4's high half of a file's
+/// size, and it is the last byte range this driver owns.
+const INODE_PARSED: usize = 112;
+/// Offset of `i_size_high`, which ext2 reads as `i_dir_acl`. Only a regular
+/// file's size is split across the two; for anything else the word means
+/// something else entirely and is preserved, not interpreted.
+const INODE_SIZE_HIGH: usize = 108;
 const FT_REG: u8 = 1;
 const FT_DIR: u8 = 2;
 const FT_CHRDEV: u8 = 3;
@@ -62,6 +78,81 @@ const S_IFCHR: u16 = 0x2000;
 /// not an optimisation.
 const FAST_SYMLINK_MAX: u32 = 60;
 const INCOMPAT_FILETYPE: u32 = 1 << 1;
+/// The journal holds transactions that were never applied. A filesystem in
+/// this state is not merely one we choose not to write - it is mid-repair,
+/// and writing over it is the one thing guaranteed to lose data.
+const INCOMPAT_RECOVER: u32 = 1 << 2;
+/// Inodes map their data with extent trees instead of block maps.
+const INCOMPAT_EXTENTS: u32 = 1 << 6;
+/// Block numbers are 64 bits wide: group descriptors grow to 64 bytes to hold
+/// the high halves, and the superblock's block count grows a high word.
+const INCOMPAT_64BIT: u32 = 1 << 7;
+/// A group's bitmaps and inode table may live outside the group itself. That
+/// is harmless here because every reader starts from the descriptor, which
+/// still names where they went - unlike `META_BG`, which moves the
+/// descriptors themselves out of the block following the superblock.
+const INCOMPAT_FLEX_BG: u32 = 1 << 9;
+/// A filesystem may keep a checksum seed in the superblock. It only matters
+/// to whoever recomputes metadata checksums, which this driver does not.
+const INCOMPAT_CSUM_SEED: u32 = 1 << 13;
+/// Directory indexes may grow deeper than the one intermediate level this
+/// driver maintains. Reads are a linear walk and do not care; only insertion
+/// into a directory that actually needs the extra level would.
+const INCOMPAT_LARGEDIR: u32 = 1 << 14;
+/// The incompatible features this driver understands and can honour.
+const INCOMPAT_SUPPORTED: u32 = INCOMPAT_FILETYPE
+    | INCOMPAT_RECOVER
+    | INCOMPAT_EXTENTS
+    | INCOMPAT_64BIT
+    | INCOMPAT_FLEX_BG
+    | INCOMPAT_CSUM_SEED
+    | INCOMPAT_LARGEDIR;
+/// The ones it understands well enough to refuse: each of them redefines what
+/// a block or an inode *means* - compressed, encrypted, inline - so reading
+/// past the refusal would hand back the wrong bytes, and refusing costs one
+/// error at mount.
+const INCOMPAT_REFUSED: u32 = (1 << 0)    // COMPRESSION
+    | (1 << 3)                            // JOURNAL_DEV
+    | (1 << 4)                            // META_BG
+    | (1 << 8)                            // MMP
+    | (1 << 10)                           // EA_INODE
+    | (1 << 12)                           // DIRDATA
+    | (1 << 15)                           // INLINE_DATA
+    | (1 << 16)                           // ENCRYPT
+    | (1 << 17); // CASEFOLD
+/// Everything this driver can at least read unchanged: directory indexes,
+/// files past 2 GiB, directories past 65000 links, inodes with extra space.
+const ROCOMPAT_SUPPORTED: u32 = (1 << 0)  // SPARSE_SUPER
+    | (1 << 1)                            // LARGE_FILE
+    | (1 << 2)                            // BTREE_DIR (DIR_INDEX)
+    | (1 << 3)                            // HUGE_FILE
+    | (1 << 4)                            // GDT_CSUM
+    | (1 << 5)                            // DIR_NLINK
+    | (1 << 6)                            // EXTRA_ISIZE
+    | (1 << 8)                            // QUOTA
+    | (1 << 10)                           // METADATA_CSUM
+    | (1 << 13); // PROJECT
+/// Read-only-compatible features that change the unit of allocation or the
+/// meaning of a file's contents, and so cannot be read correctly by a driver
+/// that does not implement them.
+const ROCOMPAT_REFUSED: u32 = (1 << 7)    // HAS_SNAPSHOT
+    | (1 << 9)                            // BIGALLOC
+    | (1 << 11)                           // REPLICA
+    | (1 << 15)                           // VERITY
+    | (1 << 16); // ORPHAN_PRESENT
+/// Metadata carries checksums this driver neither verifies nor recomputes.
+/// Reading is fine - a checksum is not data - but every write would leave a
+/// stale one behind, and a Linux that later mounts the image would trust it.
+const ROCOMPAT_METADATA_CSUM: u32 = 1 << 10;
+/// Group descriptors carry a checksum, for the same reason and with the same
+/// consequence: `bump_free` rewrites a descriptor on every allocation.
+const ROCOMPAT_GDT_CSUM: u32 = 1 << 4;
+/// `i_blocks` is counted in filesystem blocks rather than 512-byte sectors.
+/// It applies per inode, and the filesystem-wide feature is what lets Linux
+/// set the flag - a file that needs it says so on itself.
+const INODE_HUGE_FILE_FL: u32 = 1 << 18;
+/// The inode's block pointers are an extent tree, not a block map.
+const INODE_EXTENTS_FL: u32 = 1 << 19;
 /// The directory is htree-indexed: block 0 is an index root rather than a
 /// plain list of entries, so inserts have to maintain the tree. Reads are
 /// immune - the index bytes hide in the slack of `..` and of whole-block
@@ -79,7 +170,31 @@ const HTREE_EOF_32BIT: u32 = 0x7fff_ffff;
 /// root - the shape every ext2/ext4 without the `largedir` feature makes.
 const HTREE_MAX_LEVELS: u8 = 1;
 const GROUP_DESC_BYTES: usize = 32;
+/// The most of a descriptor this driver reads: the `64bit` layout is the
+/// 32-byte ext2 one with the high halves appended, and nothing past that
+/// changes how a block or an inode is found.
+const GROUP_DESC_BYTES_MAX: usize = 64;
 const DIRENT_HEADER: usize = 8;
+// ---- extent trees ----
+/// Every extent node opens with this word, which is what says "the sixty
+/// bytes of i_block are a tree" rather than fifteen block pointers.
+const EXTENT_MAGIC: u16 = 0xf30a;
+const EXTENT_HEADER: usize = 12;
+/// One extent, or one pointer to a node below: `ee_block`, a length, and a
+/// physical start, or the child's block for an index entry.
+const EXTENT_ENTRY: usize = 12;
+/// How much of an inode the tree's root gets: `i_block` is fifteen words, the
+/// header takes three of them, and what is left holds four extents.
+const EXTENT_ROOT_BYTES: usize = 60;
+/// ext4 allows five levels; deeper than that is a corrupt tree, not a big
+/// one, and walking it would recurse into whatever the child block says.
+const EXTENT_MAX_DEPTH: u16 = 5;
+/// The top bit of `ee_len` marks an extent that is allocated but not written:
+/// a hole that has a block behind it. Reads see zeros, writes clear it.
+const EXTENT_UNWRITTEN: u16 = 1 << 15;
+/// The most a written extent can cover: the length field's other fifteen
+/// bits, minus the one reserved value of zero.
+const EXTENT_INIT_MAX: u16 = 32768;
 /// Direct-mapped cache: one slot per possible block modulo this count.
 const CACHE_SLOTS: usize = 32;
 const NO_BLOCK: u64 = u64::MAX;
@@ -103,13 +218,35 @@ fn set32(bytes: &mut [u8], at: usize, value: u32) {
 /// The fields of the on-disk superblock this driver keeps.
 struct Super {
     inodes_count: u32,
-    blocks_count: u32,
+    /// Blocks in the whole filesystem, high word included. A 64-bit image
+    /// writes its size in two places, and a driver that reads only the low
+    /// one sees a 4 TiB filesystem as a zero-block one - or, worse, as a
+    /// plausible small one whose every block number is past its own end.
+    blocks_count: u64,
     first_data_block: u32,
     log_block_size: u32,
     blocks_per_group: u32,
     inodes_per_group: u32,
     first_ino: u32,
     inode_size: u16,
+    /// Bytes per group descriptor: 32 for ext2, 64 once `64bit` is on, which
+    /// is where the high halves of the bitmap and inode-table pointers live.
+    /// Every walk of the descriptor table is strided by this, not by 32.
+    desc_size: u16,
+    /// Inodes map data with extent trees. It is a property of the filesystem,
+    /// not of an inode: a file created here has to be born extent-mapped or a
+    /// Linux that later mounts the image finds a block map where the feature
+    /// flags promised a tree.
+    has_extents: bool,
+    /// Block numbers and block counts are 64 bits wide.
+    has_64bit: bool,
+    /// Whether this filesystem must stay read-only however it was mounted.
+    /// Checksums this driver cannot recompute, or a journal with unapplied
+    /// transactions, make every write a corruption - so the mount that asked
+    /// for read-write gets read-only, and says so through `statfs` and every
+    /// refused write rather than by failing outright: an image worth reading
+    /// is worth reading.
+    must_read_only: bool,
     /// The htree hash seed: four words at `s_hash_seed` (offset 236, past
     /// the journal fields the rev-1 layout grew), salt shared by every
     /// directory index on this filesystem.
@@ -137,9 +274,22 @@ impl Super {
         if le32(bytes, 28) != log_block_size {
             return Err("ext2 fragments are unsupported");
         }
-        if le32(bytes, 96) & !INCOMPAT_FILETYPE != 0 {
-            return Err("ext2 carries incompatible features this driver does not implement");
+        // Feature negotiation. Three answers instead of two: a feature this
+        // driver cannot read is a refused mount, but one it can read and not
+        // maintain - checksums, an unrecovered journal - is a read-only
+        // mount. A filesystem worth reading is worth reading, and the answer
+        // has to be decided once, here, where the bits are still on screen.
+        let incompat = le32(bytes, 96);
+        let ro_compat = le32(bytes, 100);
+        if incompat & INCOMPAT_REFUSED != 0 || ro_compat & ROCOMPAT_REFUSED != 0 {
+            return Err("ext4 carries features this driver refuses rather than misreads");
         }
+        if incompat & !INCOMPAT_SUPPORTED != 0 || ro_compat & !ROCOMPAT_SUPPORTED != 0 {
+            return Err("ext4 carries features this driver does not know about");
+        }
+        let has_64bit = incompat & INCOMPAT_64BIT != 0;
+        let must_read_only = incompat & INCOMPAT_RECOVER != 0
+            || ro_compat & (ROCOMPAT_METADATA_CSUM | ROCOMPAT_GDT_CSUM) != 0;
         let (inode_size, first_ino) = match le32(bytes, 76) {
             0 => (128, 11),
             _ => (le16(bytes, 88) as usize, le32(bytes, 84)),
@@ -149,15 +299,38 @@ impl Super {
         }
         let first_data_block = le32(bytes, 20);
         let block_size = 1024usize << log_block_size;
+        // The descriptor stride is written down from rev 1 onwards; before
+        // that it is 32 by definition, and a zero means "not written down"
+        // rather than "no descriptors".
+        let desc_size = if le32(bytes, 76) >= 1 && le16(bytes, 254) != 0 {
+            le16(bytes, 254)
+        } else {
+            GROUP_DESC_BYTES as u16
+        };
+        if !(GROUP_DESC_BYTES as u16..=GROUP_DESC_BYTES_MAX as u16).contains(&desc_size)
+            || desc_size % 4 != 0
+            || desc_size as usize > block_size
+        {
+            return Err("ext4 group descriptor size is unusable");
+        }
         let sb = Super {
             inodes_count: le32(bytes, 0),
-            blocks_count: le32(bytes, 4),
+            blocks_count: le32(bytes, 4) as u64
+                | if has_64bit {
+                    (le32(bytes, 336) as u64) << 32
+                } else {
+                    0
+                },
             first_data_block,
             log_block_size,
             blocks_per_group: le32(bytes, 32),
             inodes_per_group: le32(bytes, 40),
             first_ino,
             inode_size: inode_size as u16,
+            desc_size,
+            has_extents: incompat & INCOMPAT_EXTENTS != 0,
+            has_64bit,
+            must_read_only,
             hash_seed: [
                 le32(bytes, 236),
                 le32(bytes, 240),
@@ -186,31 +359,91 @@ struct Group {
     block_bitmap: u64,
     inode_bitmap: u64,
     inode_table: u64,
-    free_blocks: u16,
-    free_inodes: u16,
+    /// Free counts as u32 because `64bit` splits each of them across two
+    /// u16s, and a driver that reads only the low one reports a nearly-full
+    /// group for one that is nearly empty.
+    free_blocks: u32,
+    free_inodes: u32,
 }
 
 /// The inode fields this driver reads and writes, decoded out of the table.
 #[derive(Clone, Copy)]
 struct InodeData {
     mode: u16,
+    /// The owner, `i_uid` and `i_gid` - the low sixteen bits of each, which
+    /// is all the 128-byte inode has room for and all a user id needs here.
+    /// Every node used to answer as root's because nothing wrote these.
+    uid: u16,
+    gid: u16,
     flags: u32,
-    size: u32,
+    /// Size in bytes. ext4 splits it across two words four bytes apart in
+    /// meaning and a hundred apart on disk: the low one at 4, the high one at
+    /// 108 - which is where ext2 keeps `i_dir_acl`. Only a regular file has a
+    /// size up there, so any other inode carries the word it came with and
+    /// hands it back unchanged.
+    size: u64,
+    /// That word, for everything that is not a regular file.
+    dir_acl: u32,
+    /// In 512-byte sectors, as ext2 counts them - or in filesystem blocks when
+    /// the inode is marked `huge_file`.
     links: u16,
-    /// In 512-byte sectors, as ext2 counts them.
     blocks: u32,
     block: [u32; 15],
+    /// Unix seconds, the ext2 on-disk words at 8, 12 and 16. `mtime` is the
+    /// one callers decide by - apk judges a cached index fresh by it, and an
+    /// epoch of zero read as 1970 sent every `apk add` back to the network.
+    /// `atime` is carried but never bumped: no read path here updates it, and
+    /// carrying it is what keeps a foreign atime from being zeroed by a
+    /// metadata write this driver makes for other reasons.
+    atime: u32,
+    ctime: u32,
+    mtime: u32,
+}
+
+/// The wall clock, in unix seconds - what inode timestamps are written in.
+/// The RTC anchor rides the tick counter, the same sum `gettimeofday` reports;
+/// on the host there is no clock, and the tests read the zero that stands for
+/// it.
+#[cfg(target_os = "none")]
+fn now() -> u32 {
+    (crate::arch::rtc::boot_epoch()
+        + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64) as u32
+}
+
+#[cfg(not(target_os = "none"))]
+fn now() -> u32 {
+    // The crate is `#![no_std]` even on the host, so there is no clock to
+    // read here. A count that moves is what the tests need - a created file
+    // has a mtime, and writing it moves it - and deterministic beats real.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static HOST_NOW: AtomicU32 = AtomicU32::new(1_700_000_000);
+    HOST_NOW.fetch_add(1, Ordering::Relaxed)
 }
 
 impl InodeData {
     fn parse(bytes: &[u8]) -> InodeData {
+        let mode = le16(bytes, 0);
+        let uid = le16(bytes, 2);
+        let gid = le16(bytes, 24);
+        let high = le32(bytes, INODE_SIZE_HIGH);
+        let regular = mode & S_IFMT == S_IFREG;
         InodeData {
-            mode: le16(bytes, 0),
+            mode,
+            uid,
+            gid,
             flags: le32(bytes, 32),
-            size: le32(bytes, 4),
+            size: if regular {
+                le32(bytes, 4) as u64 | ((high as u64) << 32)
+            } else {
+                le32(bytes, 4) as u64
+            },
+            dir_acl: high,
             links: le16(bytes, 26),
             blocks: le32(bytes, 28),
             block: core::array::from_fn(|i| le32(bytes, 40 + 4 * i)),
+            atime: le32(bytes, 8),
+            ctime: le32(bytes, 12),
+            mtime: le32(bytes, 16),
         }
     }
 
@@ -218,10 +451,30 @@ impl InodeData {
     /// on-disk inode (times, reserved space) untouched.
     fn store(&self, bytes: &mut [u8]) {
         set16(bytes, 0, self.mode);
-        set32(bytes, 4, self.size);
+        set16(bytes, 2, self.uid);
+        set16(bytes, 24, self.gid);
+        set32(bytes, 4, self.size as u32);
+        // The high half of a size, or the word that was there before: writing
+        // a directory's ACL field as if it were the top of a size would give
+        // every directory a size in exabytes the next time it is read.
+        set32(
+            bytes,
+            INODE_SIZE_HIGH,
+            if self.mode & S_IFMT == S_IFREG {
+                (self.size >> 32) as u32
+            } else {
+                self.dir_acl
+            },
+        );
         set32(bytes, 28, self.blocks);
         set16(bytes, 26, self.links);
         set32(bytes, 32, self.flags);
+        // The times ride along parsed-and-stored, so a metadata write this
+        // driver makes for its own reasons does not zero what the filesystem
+        // had. Which of them move is decided by the operation, not here.
+        set32(bytes, 8, self.atime);
+        set32(bytes, 12, self.ctime);
+        set32(bytes, 16, self.mtime);
         for (i, value) in self.block.iter().enumerate() {
             set32(bytes, 40 + 4 * i, *value);
         }
@@ -249,7 +502,7 @@ impl InodeData {
     /// says. A longer target is written into data blocks like a file's, and
     /// `i_blocks` counts them.
     fn is_fast_symlink(&self) -> bool {
-        self.size <= FAST_SYMLINK_MAX && self.blocks == 0
+        self.size <= FAST_SYMLINK_MAX as u64 && self.blocks == 0
     }
 }
 
@@ -318,8 +571,13 @@ impl Core {
     }
 
     fn set_read_only(&self, read_only: bool) {
-        self.read_only
-            .store(read_only, core::sync::atomic::Ordering::Relaxed);
+        // A filesystem that must be read-only stays that way however it was
+        // mounted: `mount -o remount,rw` cannot promise what the on-disk
+        // format cannot keep.
+        self.read_only.store(
+            read_only || self.sb.must_read_only,
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     fn mount(dev: Arc<dyn BlockDev>) -> Result<Core, &'static str> {
@@ -328,10 +586,17 @@ impl Core {
         let mut bytes = [0u8; SUPERBLOCK_BYTES];
         dev.read_at(SUPERBLOCK_AT, &mut bytes);
         let sb = Super::parse(&bytes)?;
-        let groups = (sb.blocks_count - sb.first_data_block).div_ceil(sb.blocks_per_group);
+        let groups =
+            (sb.blocks_count - sb.first_data_block as u64).div_ceil(sb.blocks_per_group as u64);
+        let groups = u32::try_from(groups)
+            .map_err(|_| "ext4 has more groups than this driver can address")?;
         let block_size = 1024usize << sb.log_block_size;
         Ok(Core {
-            read_only: core::sync::atomic::AtomicBool::new(false),
+            // The mount starts in the mode the format can honour: an image
+            // with checksums or an unrecovered journal is readable, and a
+            // caller that asked for read-write gets told no by the first
+            // write rather than by a mount that refuses to see the disk.
+            read_only: core::sync::atomic::AtomicBool::new(sb.must_read_only),
             dev,
             sb,
             groups,
@@ -342,6 +607,27 @@ impl Core {
 
     fn block_size(&self) -> usize {
         1024 << self.sb.log_block_size
+    }
+
+    /// How much `i_blocks` grows for one block. Everywhere in the format it is
+    /// counted in 512-byte sectors, except on an inode marked `huge_file`,
+    /// which counts filesystem blocks - the same quantity in a different unit,
+    /// and the one mistake that makes `stat` report a file eight times its
+    /// size on a 4 KiB filesystem.
+    fn block_units(&self, flags: u32) -> u32 {
+        if flags & INODE_HUGE_FILE_FL != 0 {
+            1
+        } else {
+            (self.block_size() / 512) as u32
+        }
+    }
+
+    /// Whether an inode maps its data with an extent tree. It is the inode's
+    /// own flag, not the filesystem's feature: an image converted from ext2
+    /// can hold both shapes side by side, and the inode is the only thing
+    /// that says which one it is.
+    fn is_extent_mapped(&self, data: &InodeData) -> bool {
+        data.flags & INODE_EXTENTS_FL != 0
     }
 
     // ---- cache primitives ----
@@ -360,7 +646,7 @@ impl Core {
         // with an I/O error that names nothing. Refuse it here, where the
         // number still has an identity.
         assert!(
-            block < self.sb.blocks_count as u64,
+            block < self.sb.blocks_count,
             "ext2 block {block} is past the end of the filesystem ({} blocks)",
             self.sb.blocks_count
         );
@@ -401,16 +687,42 @@ impl Core {
     fn group(&self, g: u32) -> Group {
         assert!(g < self.groups, "ext2 group {g} out of range");
         let block_size = self.block_size();
-        let at = g as usize * GROUP_DESC_BYTES;
+        let desc_size = self.sb.desc_size as usize;
+        let at = g as usize * desc_size;
         let block = self.sb.first_data_block as u64 + 1 + (at / block_size) as u64;
-        let mut bytes = [0u8; GROUP_DESC_BYTES];
-        self.read_bytes(block, at % block_size, &mut bytes);
+        // Read only as much as the descriptor really is: a 32-byte one is not
+        // followed by the high halves, and the bytes after it belong to the
+        // next group.
+        let mut bytes = [0u8; GROUP_DESC_BYTES_MAX];
+        self.read_bytes(block, at % block_size, &mut bytes[..desc_size]);
+        // The high halves live at 32, 36 and 40 - a word each, sixty-four
+        // bits up the descriptor, not the next field along. They exist only
+        // in the 64-byte layout; a 32-byte one simply has 32-bit pointers.
+        let high = desc_size >= 64;
+        let wide = |lo: usize, at: usize| {
+            le32(&bytes, lo) as u64
+                | if high {
+                    (le32(&bytes, at) as u64) << 32
+                } else {
+                    0
+                }
+        };
         Group {
-            block_bitmap: le32(&bytes, 0) as u64,
-            inode_bitmap: le32(&bytes, 4) as u64,
-            inode_table: le32(&bytes, 8) as u64,
-            free_blocks: le16(&bytes, 12),
-            free_inodes: le16(&bytes, 14),
+            block_bitmap: wide(0, 32),
+            inode_bitmap: wide(4, 36),
+            inode_table: wide(8, 40),
+            free_blocks: le16(&bytes, 12) as u32
+                + if desc_size >= 46 {
+                    (le16(&bytes, 44) as u32) << 16
+                } else {
+                    0
+                },
+            free_inodes: le16(&bytes, 14) as u32
+                + if desc_size >= 48 {
+                    (le16(&bytes, 46) as u32) << 16
+                } else {
+                    0
+                },
         }
     }
 
@@ -431,29 +743,55 @@ impl Core {
     /// stray 0xffff in its high half and `statfs` reports an absurd number.
     fn bump_free(&self, g: u32, blocks: i32, inodes: i32) {
         let block_size = self.block_size();
-        let at = g as usize * GROUP_DESC_BYTES;
+        let desc_size = self.sb.desc_size as usize;
+        let at = g as usize * desc_size;
         let desc_block = self.sb.first_data_block as u64 + 1 + (at / block_size) as u64;
         let desc_off = at % block_size;
+        // The same two numbers, twice, in two shapes: u16 pairs in the
+        // descriptor (with a high half once the layout is 64 bytes) and u32s
+        // in the superblock (with a high word once block numbers are 64 bits).
+        let wide = desc_size >= 64;
         self.update_block(desc_block, |page| {
-            set16(
-                page,
-                desc_off + 12,
-                (le16(page, desc_off + 12) as i32 + blocks) as u16,
-            );
-            set16(
-                page,
-                desc_off + 14,
-                (le16(page, desc_off + 14) as i32 + inodes) as u16,
-            );
+            // Read the pair as one number, add, write the pair back: a carry
+            // out of the low u16 is the whole point of the high one, and
+            // adding to each half separately loses it.
+            let bump = |page: &mut [u8], lo: usize, hi: usize, delta: i32| {
+                let was = le16(page, lo) as u32
+                    + if wide {
+                        (le16(page, hi) as u32) << 16
+                    } else {
+                        0
+                    };
+                let now = (was as i64 + delta as i64) as u32;
+                set16(page, lo, now as u16);
+                if wide {
+                    set16(page, hi, (now >> 16) as u16);
+                }
+            };
+            bump(page, desc_off + 12, desc_off + 44, blocks);
+            bump(page, desc_off + 14, desc_off + 46, inodes);
             true
         });
         self.update_block(self.sb.sb_block, |page| {
             let at = self.sb.sb_off;
-            set32(
-                page,
-                at + 12,
-                (le32(page, at + 12) as i64 + blocks as i64) as u32,
-            );
+            if self.sb.has_64bit {
+                // Read the pair as one number: a carry out of the low word is
+                // the whole point of the high one, and adding to each half
+                // separately loses it.
+                let was = le32(page, at + 12) as u64 | ((le32(page, at + 344) as u64) << 32);
+                let now = (was as i64 + blocks as i64) as u64;
+                set32(page, at + 12, now as u32);
+                // 344, not 340: 340 is the high half of the *reserved* count.
+                set32(page, at + 344, (now >> 32) as u32);
+            } else {
+                set32(
+                    page,
+                    at + 12,
+                    (le32(page, at + 12) as i64 + blocks as i64) as u32,
+                );
+            }
+            // Inodes are counted in 32 bits everywhere: there is no high word
+            // for them to carry into.
             set32(
                 page,
                 at + 16,
@@ -480,7 +818,7 @@ impl Core {
                     let bit = byte.trailing_ones();
                     *byte |= 1 << bit;
                     let block = first + (byte_i * 8 + bit as usize) as u64;
-                    if block < self.sb.blocks_count as u64 {
+                    if block < self.sb.blocks_count {
                         found = Some(block);
                     }
                     break;
@@ -562,10 +900,11 @@ impl Core {
         self.bump_free(g, 1, 0);
     }
 
-    /// Free every block `data` maps - the direct ones, then whatever the two
-    /// levels of indirection reach. The indirect blocks themselves go last,
-    /// once nothing points through them. A zero pointer is a hole: nothing
-    /// was ever allocated for it.
+    /// Free every block `data` maps. A block map's are the direct ones plus
+    /// whatever the two levels of indirection reach - the indirect blocks
+    /// themselves last, once nothing points through them - and a zero pointer
+    /// is a hole, something nothing was ever allocated for. An extent tree's
+    /// are the runs its leaves name, plus the tree's own blocks.
     ///
     /// A fast symlink has no blocks to free and must not be walked: its
     /// "pointers" are the *text* of the name it stands for, and a target that
@@ -574,6 +913,10 @@ impl Core {
     /// of the group table and take the kernel with it.
     fn free_blocks_of(&self, data: &InodeData) {
         if data.is_fast_symlink() {
+            return;
+        }
+        if self.is_extent_mapped(data) {
+            self.free_extents_of(data);
             return;
         }
         let per_block = self.block_size() / 4;
@@ -665,9 +1008,47 @@ impl Core {
         self.write_bytes(block, i * 4, &bytes);
     }
 
-    /// Which disk block holds logical block `l` of a file with inode `d`.
-    /// `None` is a hole or a block past what the triple of indirections maps.
+    /// Which disk block holds logical block `l`. `None` is a hole, or a block
+    /// past what this inode maps.
+    ///
+    /// The inode says which of the two shapes it is, and the answer has to
+    /// come from it rather than from the filesystem: an image converted from
+    /// ext2 holds a block map and a tree side by side, and guessing wrong
+    /// reads a file's first extent as a pointer to somebody else's data.
     fn bmap_lookup(&self, d: &InodeData, l: u64) -> Option<u64> {
+        if self.is_extent_mapped(d) {
+            self.extent_lookup(d, l)
+        } else {
+            self.block_map_lookup(d, l)
+        }
+    }
+
+    /// Map logical block `l` for writing, allocating anything missing. Returns
+    /// the disk block and whether anything new was allocated, for i_blocks
+    /// accounting.
+    fn bmap_ensure(&self, d: &mut InodeData, l: u64) -> VfsResult<(u64, bool)> {
+        if self.is_extent_mapped(d) {
+            self.extent_ensure(d, l)
+        } else {
+            self.block_map_ensure(d, l)
+        }
+    }
+
+    /// Drop every mapping an inode has. The two shapes empty differently: a
+    /// block map zeroes fifteen words, an extent tree keeps its header and
+    /// forgets its entries - the header is the only thing that says the tree
+    /// is a tree, and zeroing it would turn the inode into a block map.
+    fn reset_mapping(&self, d: &mut InodeData) {
+        if self.is_extent_mapped(d) {
+            let mut root = [0u8; EXTENT_ROOT_BYTES];
+            ext_init_header(&mut root, 0);
+            ext_put_root(d, &root);
+        } else {
+            d.block = [0; 15];
+        }
+    }
+
+    fn block_map_lookup(&self, d: &InodeData, l: u64) -> Option<u64> {
         let per_block = (self.block_size() / 4) as u64;
         let direct = DIRECT_BLOCKS as u64;
         if l < direct {
@@ -685,28 +1066,34 @@ impl Core {
         }
     }
 
-    /// Map logical block `l` for writing, allocating anything missing - the
-    /// data block, and any indirect block on the path to it. Returns the disk
-    /// block and whether anything new was allocated, for i_blocks accounting.
-    fn bmap_ensure(&self, d: &mut InodeData, l: u64) -> VfsResult<(u64, bool)> {
+    /// A block number a block-map pointer can hold. The map stores 32-bit
+    /// numbers, so a filesystem whose blocks do not fit in one is a filesystem
+    /// made with `64bit` - and every inode on it is extent-mapped, which is
+    /// why reaching here with a number that big means the image disagrees
+    /// with itself. Truncating it would point the inode at another block.
+    fn block32(&self, block: u64) -> VfsResult<u32> {
+        u32::try_from(block).map_err(|_| VfsError::FileTooBig)
+    }
+
+    fn block_map_ensure(&self, d: &mut InodeData, l: u64) -> VfsResult<(u64, bool)> {
         let per_block = (self.block_size() / 4) as u64;
         let direct = DIRECT_BLOCKS as u64;
         let mut allocated = false;
         let target = if l < direct {
             if d.block[l as usize] == 0 {
-                d.block[l as usize] = self.alloc_block()? as u32;
+                d.block[l as usize] = self.block32(self.alloc_block()?)?;
                 allocated = true;
             }
             d.block[l as usize] as u64
         } else if l < direct + per_block {
             if d.block[12] == 0 {
-                d.block[12] = self.alloc_block()? as u32;
+                d.block[12] = self.block32(self.alloc_block()?)?;
                 allocated = true;
             }
             self.ensure_slot(d.block[12] as u64, (l - direct) as usize, &mut allocated)?
         } else if l < direct + per_block + per_block * per_block {
             if d.block[13] == 0 {
-                d.block[13] = self.alloc_block()? as u32;
+                d.block[13] = self.block32(self.alloc_block()?)?;
                 allocated = true;
             }
             let rest = l - direct - per_block;
@@ -727,9 +1114,340 @@ impl Core {
             Some(block) => Ok(block),
             None => {
                 let block = self.alloc_block()?;
-                self.put_ptr(indirect, i, block as u32);
+                self.put_ptr(indirect, i, self.block32(block)?);
                 *allocated = true;
                 Ok(block)
+            }
+        }
+    }
+
+    // ---- extent trees ----
+    //
+    // An extent is a run: "logical block L for the next N blocks lives at
+    // physical block P". That is the whole difference from a block map, and
+    // it is why writing is not a matter of poking one word. A block map maps
+    // one block at a time and never runs out of room in the inode until all
+    // fifteen words are gone; an extent tree maps runs out of *four* of them
+    // in the inode and then has to move to blocks, splitting nodes as it
+    // goes, which is the part that makes this a tree rather than a list.
+
+    /// Which disk block holds logical block `l` of an extent-mapped inode.
+    ///
+    /// `None` means a hole. It also means "unwritten", which is a different
+    /// thing that reads the same way: the block is there and has never been
+    /// written, so Linux hands back zeros rather than whatever the last owner
+    /// of the block left behind.
+    fn extent_lookup(&self, d: &InodeData, l: u64) -> Option<u64> {
+        let mut node = ext_root(d).to_vec();
+        loop {
+            if !ext_ok(&node) {
+                return None;
+            }
+            let depth = ext_depth(&node);
+            if depth > EXTENT_MAX_DEPTH {
+                return None;
+            }
+            let count = ext_entries(&node);
+            if depth == 0 {
+                for i in 0..count {
+                    let (first, raw_len, start) = ext_leaf(&node, i);
+                    let len = (raw_len & !EXTENT_UNWRITTEN) as u64;
+                    // Entries are sorted by logical block, so one that starts
+                    // past `l` says every later one does too.
+                    if l < first as u64 {
+                        return None;
+                    }
+                    if l < first as u64 + len {
+                        return if raw_len & EXTENT_UNWRITTEN != 0 {
+                            None
+                        } else {
+                            Some(start + (l - first as u64))
+                        };
+                    }
+                }
+                return None;
+            }
+            let (_at, child) = self.ext_child(&node, l)?;
+            node = self.ext_load(child).ok()?;
+        }
+    }
+
+    /// Map logical block `l` of an extent-mapped inode, allocating what is
+    /// missing - the data block, and any node it takes to hold the extent
+    /// that names it.
+    fn extent_ensure(&self, d: &mut InodeData, l: u64) -> VfsResult<(u64, bool)> {
+        let mut root = ext_root(d);
+        if !ext_ok(&root) {
+            // The flag says tree and the bytes say otherwise: an inode whose
+            // block pointers were written by something that never heard of
+            // extents. Reading it as a tree would follow a name as a block
+            // number, which is how a filesystem takes itself apart.
+            return Err(VfsError::Corrupt);
+        }
+        let mut nodes = 0u32;
+        let (block, allocated, split) = self.ext_ensure_node(&mut root, l, &mut nodes)?;
+        if let Some(split) = split {
+            self.ext_grow_root(&mut root, split, &mut nodes)?;
+        }
+        // The tree's own blocks belong to the inode as much as its data does:
+        // `i_blocks` counts them, and an inode that hides the two blocks its
+        // index lives in reports six sectors where the disk holds eight.
+        for _ in 0..nodes {
+            d.blocks += self.block_units(d.flags);
+        }
+        ext_put_root(d, &root);
+        Ok((block, allocated))
+    }
+
+    /// Ensure `l` is mapped inside `node`, recursing into the child that
+    /// covers it. The node is modified in place and written back by the
+    /// caller - which for the root is the inode, and for anything below it is
+    /// the block it was loaded from plus the sibling a split may have made.
+    /// `nodes` counts the tree's own blocks allocated along the way, for
+    /// `i_blocks`.
+    fn ext_ensure_node(
+        &self,
+        node: &mut [u8],
+        l: u64,
+        nodes: &mut u32,
+    ) -> VfsResult<(u64, bool, Option<ExtSplit>)> {
+        if !ext_ok(node) {
+            return Err(VfsError::Corrupt);
+        }
+        let depth = ext_depth(node);
+        if depth > EXTENT_MAX_DEPTH {
+            return Err(VfsError::Corrupt);
+        }
+        let count = ext_entries(node);
+        if depth > 0 {
+            let (at, child_block) = self.ext_child(node, l).ok_or(VfsError::Corrupt)?;
+            let mut child = self.ext_load(child_block)?;
+            let (block, allocated, split) = self.ext_ensure_node(&mut child, l, nodes)?;
+            // Written back whatever happened: the recursion may have added an
+            // extent to it or taken half its entries away.
+            self.write_bytes(child_block, 0, &child);
+            let Some(split) = split else {
+                return Ok((block, allocated, None));
+            };
+            // The child split, so there is a sibling to index. It goes beside
+            // the child we came down through, which is the entry `at`.
+            if count < ext_max(node) {
+                ext_insert(node, at + 1);
+                ext_write_index(node, at + 1, split.first, split.child);
+                return Ok((block, allocated, None));
+            }
+            *nodes += 1;
+            let split = self.ext_split(node, at + 1, ExtInsert::Index(split), block)?;
+            return Ok((block, allocated, Some(split)));
+        }
+        // A leaf: either `l` is inside one of its extents, or a new one goes
+        // in at the first entry that starts past it.
+        let mut at = count;
+        for i in 0..count {
+            let (first, raw_len, start) = ext_leaf(node, i);
+            let len = (raw_len & !EXTENT_UNWRITTEN) as u64;
+            if l < first as u64 {
+                at = i;
+                break;
+            }
+            if l < first as u64 + len {
+                // An unwritten extent already has the block; "initialising"
+                // it is exactly this, taking the top bit off its length.
+                if raw_len & EXTENT_UNWRITTEN != 0 {
+                    ext_write_leaf(node, i, first, raw_len & !EXTENT_UNWRITTEN, start);
+                }
+                return Ok((start + (l - first as u64), false, None));
+            }
+        }
+        let block = self.alloc_block()?;
+        if count < ext_max(node) {
+            // A block that lands beside an extent it could have been part of
+            // joins it instead of starting a new one. Logical and physical
+            // adjacency together, and only between written extents - a run
+            // the allocator gave out in pieces is one extent, not a list of
+            // one-block ones a reference fsck would spend its first pass
+            // folding back together.
+            if at > 0 {
+                let (first, raw_len, start) = ext_leaf(node, at - 1);
+                let len = raw_len & !EXTENT_UNWRITTEN;
+                if raw_len & EXTENT_UNWRITTEN == 0
+                    && len < EXTENT_INIT_MAX - 1
+                    && first as u64 + len as u64 == l
+                    && start + len as u64 == block
+                {
+                    ext_write_leaf(node, at - 1, first, raw_len + 1, start);
+                    return Ok((block, true, None));
+                }
+            }
+            if at < count {
+                let (first, raw_len, start) = ext_leaf(node, at);
+                if raw_len & EXTENT_UNWRITTEN == 0
+                    && raw_len < EXTENT_INIT_MAX - 1
+                    && first as u64 == l + 1
+                    && start == block + 1
+                {
+                    ext_write_leaf(node, at, l as u32, raw_len + 1, block);
+                    return Ok((block, true, None));
+                }
+            }
+            ext_insert(node, at);
+            ext_write_leaf(node, at, l as u32, 1, block);
+            return Ok((block, true, None));
+        }
+        *nodes += 1;
+        let split = self.ext_split(node, at, ExtInsert::Leaf(l), block)?;
+        Ok((block, true, Some(split)))
+    }
+
+    /// The child of an index node that covers logical block `l`: the last
+    /// entry whose first block is at or below it, or the first entry when
+    /// every one of them starts above - a tree whose index never says 0 still
+    /// answers for block 0.
+    fn ext_child(&self, node: &[u8], l: u64) -> Option<(usize, u64)> {
+        let count = ext_entries(node);
+        let mut chosen = None;
+        for i in 0..count {
+            let (first, child) = ext_index(node, i);
+            if first as u64 <= l {
+                chosen = Some((i, child));
+            } else {
+                break;
+            }
+        }
+        chosen.or_else(|| (count > 0).then(|| (0, ext_index(node, 0).1)))
+    }
+
+    fn ext_load(&self, block: u64) -> VfsResult<Vec<u8>> {
+        if block >= self.sb.blocks_count {
+            return Err(VfsError::Corrupt);
+        }
+        let mut node = vec![0u8; self.block_size()];
+        self.read_bytes(block, 0, &mut node);
+        Ok(node)
+    }
+
+    /// Split a full node in two: the upper half of its entries moves to a
+    /// fresh block and the new entry goes into whichever half it belongs to.
+    /// The sibling is written where it is born; this node is written by the
+    /// caller, which is the only place that knows where it lives.
+    fn ext_split(
+        &self,
+        node: &mut [u8],
+        at: usize,
+        what: ExtInsert,
+        answer: u64,
+    ) -> VfsResult<ExtSplit> {
+        let sibling = self.alloc_block()?;
+        let mut other = vec![0u8; self.block_size()];
+        ext_init_header(&mut other, ext_depth(node));
+        let count = ext_entries(node);
+        let keep = count / 2;
+        let moved = count - keep;
+        other[EXTENT_HEADER..EXTENT_HEADER + moved * EXTENT_ENTRY].copy_from_slice(
+            &node[EXTENT_HEADER + keep * EXTENT_ENTRY..EXTENT_HEADER + count * EXTENT_ENTRY],
+        );
+        ext_set_entries(&mut other, moved);
+        ext_set_entries(node, keep);
+        // Which half took the new entry decides where its block ends up.
+        let (target, at) = if at >= keep {
+            (&mut other[..], at - keep)
+        } else {
+            (node, at)
+        };
+        match what {
+            // A run of one block. Joining the extent next door would be
+            // cheaper on disk and wrong in general: two adjacent logical
+            // blocks are only adjacent on disk until somebody frees one.
+            ExtInsert::Leaf(l) => {
+                ext_insert(target, at);
+                ext_write_leaf(target, at, l as u32, 1, answer);
+            }
+            ExtInsert::Index(split) => {
+                ext_insert(target, at);
+                ext_write_index(target, at, split.first, split.child);
+            }
+        }
+        self.write_bytes(sibling, 0, &other);
+        // What the parent indexes is the sibling - the half that was moved
+        // out, not the half that was kept, and not whichever one happened to
+        // take the new entry. Two children under the same first block is a
+        // tree that cannot be searched: a lookup picks the first one whose
+        // range covers the block, and the other half becomes unreachable.
+        let first = if ext_depth(&other) == 0 {
+            ext_leaf(&other, 0).0
+        } else {
+            ext_index(&other, 0).0
+        };
+        Ok(ExtSplit {
+            first,
+            child: sibling,
+        })
+    }
+
+    /// The root ran out of room and split, which is the only way a tree gets
+    /// deeper: everything the root held moves into one fresh block and the
+    /// root becomes an index over two children.
+    fn ext_grow_root(&self, root: &mut [u8], split: ExtSplit, nodes: &mut u32) -> VfsResult<()> {
+        let depth = ext_depth(root);
+        if depth + 1 > EXTENT_MAX_DEPTH {
+            // Five levels hold a file in the exabytes. Past that it is not a
+            // big tree, it is a loop someone wrote into the image.
+            return Err(VfsError::FileTooBig);
+        }
+        *nodes += 1;
+        let child = self.alloc_block()?;
+        let mut node = vec![0u8; self.block_size()];
+        ext_init_header(&mut node, depth);
+        let count = ext_entries(root);
+        // The entries keep their shape: what was a leaf stays a leaf one
+        // level down, what was an index stays an index.
+        node[EXTENT_HEADER..EXTENT_HEADER + count * EXTENT_ENTRY]
+            .copy_from_slice(&root[EXTENT_HEADER..EXTENT_HEADER + count * EXTENT_ENTRY]);
+        ext_set_entries(&mut node, count);
+        self.write_bytes(child, 0, &node);
+        let first = if depth == 0 {
+            ext_leaf(&node, 0).0
+        } else {
+            ext_index(&node, 0).0
+        };
+        ext_init_header(root, depth + 1);
+        ext_set_entries(root, 2);
+        ext_write_index(root, 0, first, child);
+        ext_write_index(root, 1, split.first, split.child);
+        Ok(())
+    }
+
+    /// Give back every block an extent tree maps, and the tree's own blocks
+    /// with them: a node is freed after everything it names, because a block
+    /// freed while something still points at it is a block somebody else is
+    /// about to be given twice.
+    fn free_extents_of(&self, data: &InodeData) {
+        let root = ext_root(data);
+        if !ext_ok(&root) {
+            return;
+        }
+        self.free_extent_node(&root, ext_depth(&root));
+    }
+
+    fn free_extent_node(&self, node: &[u8], depth: u16) {
+        if depth > EXTENT_MAX_DEPTH {
+            return;
+        }
+        for i in 0..ext_entries(node) {
+            if depth == 0 {
+                let (_first, raw_len, start) = ext_leaf(node, i);
+                for n in 0..(raw_len & !EXTENT_UNWRITTEN) as u64 {
+                    self.free_block(start + n);
+                }
+            } else {
+                let (_first, child) = ext_index(node, i);
+                let Ok(child_node) = self.ext_load(child) else {
+                    continue;
+                };
+                if ext_ok(&child_node) {
+                    self.free_extent_node(&child_node, depth - 1);
+                }
+                self.free_block(child);
             }
         }
     }
@@ -738,7 +1456,7 @@ impl Core {
 
     fn dir_lookup(&self, dir: &InodeData, name: &str) -> VfsResult<Option<u32>> {
         let block_size = self.block_size();
-        for l in 0..dir.size as u64 / block_size as u64 {
+        for l in 0..dir.size / block_size as u64 {
             let block = self
                 .bmap_lookup(dir, l)
                 .expect("a directory block was never mapped");
@@ -757,7 +1475,7 @@ impl Core {
     fn dir_entries(&self, dir: &InodeData) -> VfsResult<Vec<(String, NodeKind)>> {
         let block_size = self.block_size();
         let mut found = Vec::new();
-        for l in 0..dir.size as u64 / block_size as u64 {
+        for l in 0..dir.size / block_size as u64 {
             let block = self
                 .bmap_lookup(dir, l)
                 .expect("a directory block was never mapped");
@@ -814,7 +1532,7 @@ impl Core {
         ftype: u8,
     ) -> VfsResult<()> {
         let block_size = self.block_size();
-        let blocks = dir.size as u64 / block_size as u64;
+        let blocks = dir.size / block_size as u64;
         for l in 0..blocks {
             let block = self
                 .bmap_lookup(dir, l)
@@ -828,8 +1546,8 @@ impl Core {
             write_dirent(page, 0, child, page.len(), name, ftype);
             true
         });
-        dir.size += block_size as u32;
-        dir.blocks += (block_size / 512) as u32;
+        dir.size += block_size as u64;
+        dir.blocks += self.block_units(dir.flags);
         Ok(())
     }
 
@@ -846,7 +1564,7 @@ impl Core {
     /// only "." and "..").
     fn dir_remove(&self, dir: &mut InodeData, name: &str) -> VfsResult<u32> {
         let block_size = self.block_size();
-        for l in 0..dir.size as u64 / block_size as u64 {
+        for l in 0..dir.size / block_size as u64 {
             let block = self
                 .bmap_lookup(dir, l)
                 .expect("a directory block was never mapped");
@@ -864,7 +1582,21 @@ impl Core {
     fn new_inode(&self, kind: NodeKind, parent: u32) -> VfsResult<u32> {
         let ino = self.alloc_inode()?;
         let block_size = self.block_size();
+        // A regular file or a directory on a filesystem that promised extents
+        // is born extent-mapped: Linux sets the flag as it creates one, and an
+        // inode without it is a block map in a filesystem whose superblock says
+        // there are none. A symlink is never extent-mapped anywhere - its
+        // sixty bytes hold the target, not a tree.
+        let extent = self.sb.has_extents && matches!(kind, NodeKind::File | NodeKind::Dir);
+        // The node belongs to whoever is creating it, taken here because
+        // this is the one place every create passes through - file, directory,
+        // symlink, device node and `O_TMPFILE` alike - and because the
+        // creator's identity is a fact about *now*: a name does not remember
+        // who first wrote it, and nothing later can reconstruct it.
+        let (uid, gid) = crate::sched::current_owner();
         let mut data = InodeData {
+            uid: uid as u16,
+            gid: gid as u16,
             mode: match kind {
                 NodeKind::Dir => S_IFDIR | 0o755,
                 // A link's permissions are not consulted by anything - Linux
@@ -874,23 +1606,154 @@ impl Core {
                 NodeKind::Symlink => S_IFLNK | 0o777,
                 _ => S_IFREG | 0o644,
             },
-            flags: 0,
+            flags: if extent { INODE_EXTENTS_FL } else { 0 },
             size: 0,
+            dir_acl: 0,
             links: 1,
             blocks: 0,
             block: [0; 15],
+            // Born now, in all three senses: nothing has read it, nothing has
+            // changed it, and nothing has written it yet.
+            atime: now(),
+            ctime: now(),
+            mtime: now(),
         };
+        if extent {
+            let mut root = [0u8; EXTENT_ROOT_BYTES];
+            ext_init_header(&mut root, 0);
+            ext_put_root(&mut data, &root);
+        }
         if kind == NodeKind::Dir {
-            let block = self.alloc_block()?;
-            data.block[0] = block as u32;
-            data.size = block_size as u32;
-            data.blocks = (block_size / 512) as u32;
+            let (block, allocated) = self.bmap_ensure(&mut data, 0)?;
+            data.size = block_size as u64;
+            if allocated {
+                data.blocks += self.block_units(data.flags);
+            }
             data.links = 2;
             self.update_block(block, |page| dir_init(page, ino, parent));
         }
         self.write_inode(ino, &data);
         Ok(ino)
     }
+}
+
+// ---- extent node images, pure over bytes ----
+
+/// A node that could not hold what it was given and was split in two. The
+/// parent has to index the new sibling under the first logical block it
+/// covers; that is the whole of what an index entry says.
+struct ExtSplit {
+    first: u32,
+    child: u64,
+}
+
+/// What a split has to put into whichever half takes it.
+enum ExtInsert {
+    /// A new single-block extent covering logical block `l`.
+    Leaf(u64),
+    /// A sibling handed up by a node below, which becomes an index entry.
+    Index(ExtSplit),
+}
+
+/// The sixty bytes of `i_block` read as a node image. It is the same fifteen
+/// words a block map uses, which is the point: the inode's flag, and only the
+/// flag, says which one they are.
+fn ext_root(d: &InodeData) -> [u8; EXTENT_ROOT_BYTES] {
+    let mut node = [0u8; EXTENT_ROOT_BYTES];
+    for (i, word) in d.block.iter().enumerate() {
+        node[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    node
+}
+
+fn ext_put_root(d: &mut InodeData, node: &[u8]) {
+    for (i, word) in d.block.iter_mut().enumerate() {
+        *word = u32::from_le_bytes(node[i * 4..i * 4 + 4].try_into().expect("four bytes"));
+    }
+}
+
+fn ext_ok(node: &[u8]) -> bool {
+    le16(node, 0) == EXTENT_MAGIC
+}
+
+fn ext_entries(node: &[u8]) -> usize {
+    le16(node, 2) as usize
+}
+
+fn ext_set_entries(node: &mut [u8], count: usize) {
+    set16(node, 2, count as u16);
+}
+
+fn ext_max(node: &[u8]) -> usize {
+    le16(node, 4) as usize
+}
+
+fn ext_depth(node: &[u8]) -> u16 {
+    le16(node, 6)
+}
+
+/// Lay down an empty node: the magic that says this is a tree, no entries,
+/// and room for however many fit the space it has - four in the inode's sixty
+/// bytes, eighty-odd in a whole block.
+fn ext_init_header(node: &mut [u8], depth: u16) {
+    set16(node, 0, EXTENT_MAGIC);
+    set16(node, 2, 0);
+    set16(
+        node,
+        4,
+        ((node.len() - EXTENT_HEADER) / EXTENT_ENTRY) as u16,
+    );
+    set16(node, 6, depth);
+    set32(node, 8, 0);
+}
+
+/// Make room for one entry at `at`, shifting the rest up. The node has to
+/// have room; a node that does not splits instead.
+fn ext_insert(node: &mut [u8], at: usize) {
+    let count = ext_entries(node);
+    assert!(
+        count + 1 <= ext_max(node),
+        "extent node holds {count} of {} entries already",
+        ext_max(node)
+    );
+    let from = EXTENT_HEADER + at * EXTENT_ENTRY;
+    let to = EXTENT_HEADER + count * EXTENT_ENTRY;
+    node.copy_within(from..to, from + EXTENT_ENTRY);
+    ext_set_entries(node, count + 1);
+}
+
+/// Leaf entry `i`: the logical block it starts at, its length, and the
+/// physical block that run begins on. The length's top bit is the unwritten
+/// flag rather than part of the number, so callers mask before using it.
+fn ext_leaf(node: &[u8], i: usize) -> (u32, u16, u64) {
+    let at = EXTENT_HEADER + i * EXTENT_ENTRY;
+    let start = le32(node, at + 8) as u64 | ((le16(node, at + 6) as u64) << 32);
+    (le32(node, at), le16(node, at + 4), start)
+}
+
+fn ext_write_leaf(node: &mut [u8], i: usize, first: u32, len: u16, start: u64) {
+    let at = EXTENT_HEADER + i * EXTENT_ENTRY;
+    set32(node, at, first);
+    set16(node, at + 4, len);
+    set16(node, at + 6, (start >> 32) as u16);
+    set32(node, at + 8, start as u32);
+}
+
+/// Index entry `i`: the first logical block the child covers, and the child.
+fn ext_index(node: &[u8], i: usize) -> (u32, u64) {
+    let at = EXTENT_HEADER + i * EXTENT_ENTRY;
+    (
+        le32(node, at),
+        le32(node, at + 4) as u64 | ((le16(node, at + 8) as u64) << 32),
+    )
+}
+
+fn ext_write_index(node: &mut [u8], i: usize, first: u32, child: u64) {
+    let at = EXTENT_HEADER + i * EXTENT_ENTRY;
+    set32(node, at, first);
+    set32(node, at + 4, child as u32);
+    set16(node, at + 8, (child >> 32) as u16);
+    set16(node, at + 10, 0);
 }
 
 // ---- directory entry encoding, pure over a block image ----
@@ -1533,8 +2396,8 @@ impl Core {
         // The new leaf is the block after every current one.
         let new_logical = dir.size as u64 / block_size as u64;
         let new_disk = self.bmap_ensure(dir, new_logical)?.0;
-        dir.size += block_size as u32;
-        dir.blocks += (block_size / 512) as u32;
+        dir.size += block_size as u64;
+        dir.blocks += self.block_units(dir.flags);
         let mut new_page = vec![0u8; block_size];
 
         // Map the live entries and sort them by hash.
@@ -1640,8 +2503,8 @@ impl Core {
 
         let new_logical = dir.size as u64 / block_size as u64;
         let new_disk = self.bmap_ensure(dir, new_logical)?.0;
-        dir.size += block_size as u32;
-        dir.blocks += (block_size / 512) as u32;
+        dir.size += block_size as u64;
+        dir.blocks += self.block_units(dir.flags);
 
         // The new node: one fake dirent covering the whole block, entries
         // behind the 8-byte header. The upper half moves over; entry 0 of
@@ -1743,17 +2606,25 @@ fn dx_pack_dirents(page: &mut [u8]) {
 // ---- the VFS seam ----
 
 /// An ext2 filesystem mounted through the VFS.
-pub struct Ext2Fs {
+pub struct Ext4Fs {
     core: Arc<Core>,
 }
 
-impl FileSystem for Ext2Fs {
+impl FileSystem for Ext4Fs {
     fn root(&self) -> Arc<dyn Inode> {
         self.inode_of(ROOT_INO)
     }
 
+    /// What `/proc/mounts` calls this filesystem. The driver is one, the name
+    /// is not: an image that maps files with extents is what every other
+    /// operating system calls ext4, and reporting it as ext2 tells `mount`
+    /// and anything reading that file a lie about the disk underneath.
     fn name(&self) -> &'static str {
-        "ext2"
+        if self.core.sb.has_extents {
+            "ext4"
+        } else {
+            "ext2"
+        }
     }
 
     fn read_only(&self) -> bool {
@@ -1779,7 +2650,7 @@ impl FileSystem for Ext2Fs {
         }
         Some(crate::vfs::FsStats {
             bsize: self.core.block_size() as u64,
-            blocks: self.core.sb.blocks_count as u64,
+            blocks: self.core.sb.blocks_count,
             bfree: free_blocks,
             bavail: free_blocks,
             files: self.core.sb.inodes_count as u64,
@@ -1788,12 +2659,12 @@ impl FileSystem for Ext2Fs {
     }
 }
 
-impl Ext2Fs {
+impl Ext4Fs {
     /// Mount the filesystem on `dev`, validating the superblock. The device
     /// must already be quiescent; all state lives on the disk plus the
     /// write-through cache.
-    pub fn mount(dev: Arc<dyn BlockDev>) -> Result<Ext2Fs, &'static str> {
-        Ok(Ext2Fs {
+    pub fn mount(dev: Arc<dyn BlockDev>) -> Result<Ext4Fs, &'static str> {
+        Ok(Ext4Fs {
             core: Arc::new(Core::mount(dev)?),
         })
     }
@@ -1804,7 +2675,7 @@ impl Ext2Fs {
             if let Some(cached) = inodes.get(&ino) {
                 return cached.clone();
             }
-            let inode = Arc::new(Ext2Ino {
+            let inode = Arc::new(Ext4Ino {
                 fs: self.core.clone(),
                 ino,
             });
@@ -1817,19 +2688,19 @@ impl Ext2Fs {
 /// One inode of one ext2 mount: a pure handle. The on-disk header is read
 /// through the cache on every operation, so two handles to the same inode
 /// can never disagree, and there is nothing here to go stale.
-pub struct Ext2Ino {
+pub struct Ext4Ino {
     fs: Arc<Core>,
     ino: u32,
 }
 
-impl Ext2Ino {
+impl Ext4Ino {
     fn wrap(&self, ino: u32) -> Arc<dyn Inode> {
         critical_section::with(|cs| {
             let mut inodes = self.fs.inodes.borrow(cs).borrow_mut();
             if let Some(cached) = inodes.get(&ino) {
                 return cached.clone();
             }
-            let inode = Arc::new(Ext2Ino {
+            let inode = Arc::new(Ext4Ino {
                 fs: self.fs.clone(),
                 ino,
             });
@@ -1847,7 +2718,7 @@ impl Ext2Ino {
     }
 }
 
-impl Inode for Ext2Ino {
+impl Inode for Ext4Ino {
     fn metadata(&self) -> Metadata {
         let data = self.fs.read_inode(self.ino);
         let kind = data.kind();
@@ -1858,7 +2729,7 @@ impl Inode for Ext2Ino {
             // blocks - is what Linux's own ext2 reports, and what `ls -l`
             // prints. Zeroing it made every directory read as empty of
             // content as a stat could suggest.
-            size: data.size as u64,
+            size: data.size,
         }
     }
 
@@ -1866,10 +2737,101 @@ impl Inode for Ext2Ino {
         (self.fs.read_inode(self.ino).mode as u32) & 0o7777
     }
 
+    /// Every ext4 inode carries a mode, so a zero here is `chmod 000` rather
+    /// than "nobody said" - the distinction a permission check turns on.
+    fn keeps_modes(&self) -> bool {
+        true
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        let data = self.fs.read_inode(self.ino);
+        (data.uid as u32, data.gid as u32)
+    }
+
+    /// Store the owner, `chown`'s half of the model. The inode keeps sixteen
+    /// bits of each id, so a larger one is kept as its low half rather than
+    /// dropped: a filesystem that cannot hold the whole number should still
+    /// answer with something the caller recognises.
+    fn set_owner(&self, uid: u32, gid: u32) {
+        let mut data = self.fs.read_inode(self.ino);
+        data.uid = uid as u16;
+        data.gid = gid as u16;
+        self.fs.write_inode(self.ino, &data);
+    }
+
+    /// Store the permission bits - the low twelve - on the inode.
+    ///
+    /// This is what makes a package install real. `apk` writes each extracted
+    /// file's mode through `open(O_CREAT, mode)` and through `chmod`, and a
+    /// kernel that accepts both and stores neither hands every binary back as
+    /// 0644: a setuid helper like `doas` or `sudo` then refuses to run at all
+    /// - "not installed setuid" - and an executable script comes out
+    /// non-executable, which is the same gate OpenRC's service check is built
+    /// on. The bits above the twelve are the node's *kind*, which the inode
+    /// already carries and this must not disturb.
+    fn set_mode(&self, mode: u32) {
+        let mut data = self.fs.read_inode(self.ino);
+        data.mode = (data.mode & !0o7777) | (mode as u16 & 0o7777);
+        self.fs.write_inode(self.ino, &data);
+    }
+
+    /// Set the access and modification clocks, `utimensat`'s whole job. The
+    /// change clock moves with the metadata, so it is stamped with the current
+    /// time here rather than taken from the caller - exactly what Linux does,
+    /// and what makes `ls -lc` show the touch and not the file's age.
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        let mut data = self.fs.read_inode(self.ino);
+        data.atime = atime as u32;
+        data.mtime = mtime as u32;
+        data.ctime = now();
+        self.fs.write_inode(self.ino, &data);
+        Ok(())
+    }
+
+    /// The file's last write, off the on-disk inode. This is the number apk
+    /// judges a cached index by, and the one `make` compares against its
+    /// sources.
+    fn mtime(&self) -> u64 {
+        self.fs.read_inode(self.ino).mtime as u64
+    }
+
+    /// The read and metadata-change clocks, off the on-disk inode. ext2 keeps
+    /// all three; a `stat` that reported mtime for them threw away the ctime
+    /// the disk already had.
+    fn atime(&self) -> u64 {
+        self.fs.read_inode(self.ino).atime as u64
+    }
+
+    fn ctime(&self) -> u64 {
+        self.fs.read_inode(self.ino).ctime as u64
+    }
+
+    /// `i_links_count`: how many names reach this inode. This is the whole
+    /// point of a hard link as `stat` sees it - after `ln a b`, both names
+    /// report two, and the file is only freed when the count reaches zero.
+    fn nlink(&self) -> u64 {
+        self.fs.read_inode(self.ino).links as u64
+    }
+
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
         self.require_dir()?;
         let dir = self.fs.read_inode(self.ino);
         let child = self.fs.dir_lookup(&dir, name)?.ok_or(VfsError::NoEntry)?;
+        Ok(self.wrap(child))
+    }
+
+    /// `O_TMPFILE`: an inode with no name in it, born here and written whole
+    /// before anything links it in. [`Inode::new_inode`] gives a new file one
+    /// link for the name it is about to get, and this one gets no name - so
+    /// the count is set back to zero, and [`Inode::link`] is what gives it
+    /// the one it ends up living by.
+    fn create_tmpfile(&self) -> VfsResult<Arc<dyn Inode>> {
+        self.fs.writable()?;
+        self.require_dir()?;
+        let child = self.fs.new_inode(NodeKind::File, self.ino)?;
+        let mut data = self.fs.read_inode(child);
+        data.links = 0;
+        self.fs.write_inode(child, &data);
         Ok(self.wrap(child))
     }
 
@@ -2018,12 +2980,13 @@ impl Inode for Ext2Ino {
         } else {
             // Too long for the inode, so it reads like a file's contents - and
             // `readlink` reads it back that way.
-            let block = self.fs.alloc_block()?;
-            data.block[0] = block as u32;
-            data.blocks = (self.fs.block_size() / 512) as u32;
+            let (block, allocated) = self.fs.bmap_ensure(&mut data, 0)?;
+            if allocated {
+                data.blocks += self.fs.block_units(data.flags);
+            }
             self.fs.write_bytes(block, 0, bytes);
         }
-        data.size = bytes.len() as u32;
+        data.size = bytes.len() as u64;
         self.fs.write_inode(child, &data);
 
         self.fs.dir_add(&mut dir, name, child, FT_SYMLINK)?;
@@ -2122,7 +3085,7 @@ impl Inode for Ext2Ino {
             });
         }
         let block_size = self.fs.block_size() as u64;
-        let end = (data.size as u64).min(offset + buf.len() as u64);
+        let end = data.size.min(offset + buf.len() as u64);
         if offset >= end {
             return Ok(0);
         }
@@ -2175,12 +3138,16 @@ impl Inode for Ext2Ino {
                 true
             });
             if allocated {
-                data.blocks += (block_size / 512) as u32;
+                data.blocks += self.fs.block_units(data.flags);
             }
             done += n;
             pos += n as u64;
         }
-        data.size = data.size.max((offset + buf.len() as u64) as u32);
+        data.size = data.size.max(offset + buf.len() as u64);
+        // A write is what mtime is for, and ctime rides with it: the inode's
+        // metadata - its size - changed too.
+        data.mtime = now();
+        data.ctime = data.mtime;
         self.fs.write_inode(self.ino, &data);
         Ok(done)
     }
@@ -2209,12 +3176,12 @@ impl Inode for Ext2Ino {
             // to resize, and truncating it would rewrite where it points.
             _ => return Err(VfsError::Invalid),
         }
-        let size = data.size as u64;
+        let size = data.size;
         if len == size {
             return Ok(());
         }
         if len > size {
-            data.size = u32::try_from(len).map_err(|_| VfsError::FileTooBig)?;
+            data.size = len;
             self.fs.write_inode(self.ino, &data);
             return Ok(());
         }
@@ -2226,9 +3193,11 @@ impl Inode for Ext2Ino {
             prefix
         };
         self.fs.free_blocks_of(&data);
-        data.block = [0; 15];
+        self.fs.reset_mapping(&mut data);
         data.blocks = 0;
         data.size = 0;
+        data.mtime = now();
+        data.ctime = data.mtime;
         self.fs.write_inode(self.ino, &data);
         if !keep.is_empty() {
             self.write_at(0, &keep)?;
@@ -2487,8 +3456,8 @@ mod tests {
         });
     }
 
-    fn mounted(dev: Arc<dyn BlockDev>) -> Ext2Fs {
-        Ext2Fs::mount(dev).expect("the test image mounts")
+    fn mounted(dev: Arc<dyn BlockDev>) -> Ext4Fs {
+        Ext4Fs::mount(dev).expect("the test image mounts")
     }
 
     fn read_all(inode: &dyn Inode, len: usize) -> Vec<u8> {
@@ -2500,7 +3469,52 @@ mod tests {
 
     #[test]
     fn mount_rejects_bytes_that_are_not_ext2() {
-        assert!(Ext2Fs::mount(Arc::new(MemDev::new(128))).is_err());
+        assert!(Ext4Fs::mount(Arc::new(MemDev::new(128))).is_err());
+    }
+
+    /// Reproduce how fish reads its `default.theme`: a multi-line file whose
+    /// values contain spaces and `=` (`--background=cyan`), consumed in many
+    /// small chunked `read_at` calls and split on tabs. This is the exact byte
+    /// path a corrupted theme read would ride through, so pinning it rules the
+    /// filesystem in or out as the source of a garbled line.
+    #[test]
+    fn a_theme_shaped_file_reads_back_intact_under_chunked_reads() {
+        let dev = Arc::new(format());
+        let fs = Ext4Fs::mount(dev).expect("mount");
+        let root = fs.root();
+        let file = root.create("default.theme", NodeKind::File).expect("create");
+        let mut body: Vec<u8> = Vec::new();
+        for name in [
+            "fish_color_normal",
+            "fish_color_search_match",
+            "fish_pager_color_progress",
+        ] {
+            body.extend_from_slice(name.as_bytes());
+            body.push(b'\t');
+            body.extend_from_slice(b"brwhite --background=cyan --bold\n");
+        }
+        assert_eq!(file.write_at(0, &body).unwrap(), body.len());
+
+        // Read it back the way a reader with a small buffer does.
+        let mut got: Vec<u8> = Vec::new();
+        let mut off = 0u64;
+        loop {
+            let mut chunk = [0u8; 13]; // deliberately not a block or line size
+            let n = file.read_at(off, &mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..n]);
+            off += n as u64;
+        }
+        assert_eq!(got, body, "the bytes come back exactly");
+
+        // Split like `read -t`: the tab field before the value must be intact.
+        let text = String::from_utf8_lossy(&got);
+        let first_line = text.lines().next().unwrap();
+        let toks: Vec<&str> = first_line.split('\t').collect();
+        assert_eq!(toks[0], "fish_color_normal");
+        assert_eq!(toks[1], "brwhite --background=cyan --bold");
     }
 
     #[test]
@@ -2646,6 +3660,23 @@ mod tests {
         // be written again without having to be created again.
         assert_eq!(file.write_at(0, b"fresh").unwrap(), 5);
         assert_eq!(read_all(&*file, 16), b"fresh");
+    }
+
+    #[test]
+    fn set_times_stamps_the_access_and_modification_clocks() {
+        let dev = Arc::new(format());
+        let fs = mounted(dev.clone());
+        let root = fs.root();
+        let file = root.create("stamp", NodeKind::File).expect("create");
+        let ctime_before = file.ctime();
+        file.set_times(111, 222).expect("set_times");
+        assert_eq!(file.atime(), 111, "st_atime took the caller's value");
+        assert_eq!(file.mtime(), 222, "st_mtime took the caller's value");
+        // ctime tracks the metadata change, not either word the caller set -
+        // which is what makes `ls -lc` show the touch, not the file's age.
+        assert_ne!(file.ctime(), ctime_before, "ctime moved with the change");
+        assert_ne!(file.ctime(), 111);
+        assert_ne!(file.ctime(), 222);
     }
 
     #[test]
@@ -3140,7 +4171,7 @@ mod tests {
 
     /// A directory made indexed by [`make_indexed`], plus its on-disk inode
     /// number and the device, for the raw reads the tree checks need.
-    fn indexed_dir(total_blocks: usize) -> (Arc<MemDev>, Ext2Fs, Arc<dyn Inode>, u32, u32) {
+    fn indexed_dir(total_blocks: usize) -> (Arc<MemDev>, Ext4Fs, Arc<dyn Inode>, u32, u32) {
         let dev = Arc::new(format_sized(total_blocks));
         let ino = {
             let fs = mounted(dev.clone());
@@ -3432,5 +4463,525 @@ mod tests {
             let mut disk = dev.bytes.borrow(cs).borrow_mut();
             put32(&mut disk, TABLE + (ino as usize - 1) * 128 + offset, value);
         });
+    }
+
+    // ---- ext4 ----
+    //
+    // The same one-group, 1 KiB-block skeleton as above with the four things
+    // ext4 changes written into it by hand: 64-byte group descriptors with
+    // high halves, 256-byte inodes, files mapped by extent trees, and a file
+    // whose size needs its high word. Nothing here is produced by mke2fs,
+    // which is the point - a fixture built from the spec cannot agree with a
+    // bug in the reader.
+
+    const EXT4_INODE_SIZE: usize = 256;
+    const EXT4_INODES: u32 = 32;
+    const EXT4_TABLE: usize = 5 * 1024;
+    const EXT4_INODE_BLOCKS: usize = EXT4_INODES as usize * EXT4_INODE_SIZE / 1024;
+    const EXT4_ROOT_BLOCK: u32 = (5 + EXT4_INODE_BLOCKS) as u32;
+    /// Where "hello"'s two-block extent starts.
+    const EXT4_HELLO_BLOCK: u32 = EXT4_ROOT_BLOCK + 2;
+    const EXT4_USED: usize = EXT4_ROOT_BLOCK as usize + 2;
+
+    fn ext4_inode_at(ino: u32) -> usize {
+        EXT4_TABLE + (ino as usize - 1) * EXT4_INODE_SIZE
+    }
+
+    /// Write an extent header into an inode's i_block, the way a filesystem
+    /// that has been sitting on a disk has it.
+    fn ext4_put_header(disk: &mut [u8], ino: u32, entries: u16, depth: u16) {
+        let at = ext4_inode_at(ino) + 40;
+        put16(disk, at, EXTENT_MAGIC);
+        put16(disk, at + 2, entries);
+        put16(disk, at + 4, 4);
+        put16(disk, at + 6, depth);
+        put32(disk, at + 8, 0);
+    }
+
+    fn ext4_put_extent(disk: &mut [u8], ino: u32, i: usize, first: u32, len: u16, start: u64) {
+        let at = ext4_inode_at(ino) + 40 + EXTENT_HEADER + i * EXTENT_ENTRY;
+        put32(disk, at, first);
+        put16(disk, at + 4, len);
+        put16(disk, at + 6, (start >> 32) as u16);
+        put32(disk, at + 8, start as u32);
+    }
+
+    fn format_ext4() -> MemDev {
+        let total_blocks = 128usize;
+        let dev = MemDev::new(total_blocks);
+        critical_section::with(|cs| {
+            let mut guard = dev.bytes.borrow(cs).borrow_mut();
+            let disk = &mut *guard;
+            let sb = 1024;
+            put32(disk, sb, EXT4_INODES); // inodes_count
+            put32(disk, sb + 4, total_blocks as u32); // blocks_count_lo
+            put32(disk, sb + 12, (total_blocks - 1 - EXT4_USED) as u32);
+            put32(disk, sb + 16, EXT4_INODES - 12); // inodes 1..12 are taken
+            put32(disk, sb + 20, 1); // first_data_block
+            put32(disk, sb + 24, 0); // log_block_size: 1024
+            put32(disk, sb + 28, 0);
+            put32(disk, sb + 32, 8192); // blocks_per_group
+            put32(disk, sb + 36, 8192);
+            put32(disk, sb + 40, EXT4_INODES); // inodes_per_group
+            put16(disk, sb + 56, MAGIC);
+            put16(disk, sb + 58, 1); // clean
+            put32(disk, sb + 76, 1); // rev 1
+            put32(disk, sb + 84, 11); // first_ino
+            put16(disk, sb + 88, EXT4_INODE_SIZE as u16);
+            // compat: no journal, so nothing to replay. incompat: filetype,
+            // extents, 64bit. ro_compat: sparse_super, large_file, dir_nlink,
+            // extra_isize - every one of them is a thing this driver reads.
+            put32(disk, sb + 92, 0);
+            put32(
+                disk,
+                sb + 96,
+                INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT,
+            );
+            put32(disk, sb + 100, (1 << 0) | (1 << 1) | (1 << 5) | (1 << 6));
+            put16(disk, sb + 254, 64); // desc_size
+            put32(disk, sb + 336, 0); // blocks_count_hi
+
+            // The 64-byte descriptor: the ext2 fields, then the high halves
+            // of all three pointers and of both free counts.
+            put32(disk, 2 * 1024, 3); // block bitmap
+            put32(disk, 2 * 1024 + 4, 4); // inode bitmap
+            put32(disk, 2 * 1024 + 8, 5); // inode table
+            put16(disk, 2 * 1024 + 12, (total_blocks - 1 - EXT4_USED) as u16);
+            put16(disk, 2 * 1024 + 14, (EXT4_INODES - 12) as u16);
+            put16(disk, 2 * 1024 + 16, 1); // used dirs: the root
+            put32(disk, 2 * 1024 + 32, 0); // block_bitmap_hi
+            put32(disk, 2 * 1024 + 36, 0); // inode_bitmap_hi
+            put32(disk, 2 * 1024 + 40, 0); // inode_table_hi
+            put16(disk, 2 * 1024 + 44, 0); // free_blocks_hi
+            put16(disk, 2 * 1024 + 46, 0); // free_inodes_hi
+
+            // Blocks 1..=13 (metadata and the root directory) plus hello's
+            // two. Bit b is block b + 1: block 0 is outside the group.
+            for block in 1..=EXT4_ROOT_BLOCK {
+                disk[3 * 1024 + (block - 1) as usize / 8] |= 1 << ((block - 1) % 8);
+            }
+            for block in EXT4_HELLO_BLOCK..EXT4_HELLO_BLOCK + 2 {
+                disk[3 * 1024 + (block - 1) as usize / 8] |= 1 << ((block - 1) % 8);
+            }
+            put16(disk, 4 * 1024, 0x0fff); // inodes 1..12
+
+            // Root: extent-mapped, one extent holding its only block.
+            let root = ext4_inode_at(2);
+            put16(disk, root, S_IFDIR | 0o755);
+            put32(disk, root + 4, 1024);
+            put16(disk, root + 26, 2);
+            put32(disk, root + 28, 2);
+            put32(disk, root + 32, INODE_EXTENTS_FL);
+            ext4_put_header(disk, 2, 1, 0);
+            ext4_put_extent(disk, 2, 0, 0, 1, EXT4_ROOT_BLOCK as u64);
+            let base = EXT4_ROOT_BLOCK as usize * 1024;
+            write_dirent(disk, base, 2, dirent_len(1), ".", FT_DIR);
+            write_dirent(disk, base + dirent_len(1), 2, dirent_len(1), "..", FT_DIR);
+            write_dirent(
+                disk,
+                base + 2 * dirent_len(1),
+                11,
+                1024 - 2 * dirent_len(1),
+                "hello",
+                FT_REG,
+            );
+
+            // "hello": eleven bytes in the first block of a two-block extent
+            // and four more in its second, which is what an extent is - a run
+            // of blocks, mapped by one entry.
+            let hello = ext4_inode_at(11);
+            put16(disk, hello, S_IFREG | 0o644);
+            put32(disk, hello + 4, 1500);
+            put16(disk, hello + 26, 1);
+            put32(disk, hello + 28, 4);
+            put32(disk, hello + 32, INODE_EXTENTS_FL);
+            ext4_put_header(disk, 11, 1, 0);
+            ext4_put_extent(disk, 11, 0, 0, 2, EXT4_HELLO_BLOCK as u64);
+            disk[EXT4_HELLO_BLOCK as usize * 1024..][..11].copy_from_slice(b"hello world");
+            disk[(EXT4_HELLO_BLOCK + 1) as usize * 1024..][..4].copy_from_slice(b"XXXX");
+
+            // Inode 12: a file whose size is 4 GiB, all of it in the high
+            // word at 108 - the word ext2 reads as i_dir_acl.
+            let big = ext4_inode_at(12);
+            put16(disk, big, S_IFREG | 0o644);
+            put32(disk, big + 4, 0);
+            put32(disk, big + INODE_SIZE_HIGH, 1);
+            put16(disk, big + 26, 1);
+            put32(disk, big + 32, INODE_EXTENTS_FL);
+            ext4_put_header(disk, 12, 0, 0);
+        });
+        dev
+    }
+
+    /// Set one feature word in the ext4 fixture's superblock before mounting.
+    fn ext4_feature(dev: &MemDev, at: usize, bits: u32) {
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            let was = le32(&disk, at);
+            put32(&mut disk, at, was | bits);
+        });
+    }
+
+    #[test]
+    fn an_ext4_image_mounts_and_reads_through_its_extent_tree() {
+        let fs = mounted(Arc::new(format_ext4()));
+        let root = fs.root();
+        let names: Vec<String> = root
+            .read_dir()
+            .expect("readdir")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains(&String::from("hello")), "{names:?}");
+        let hello = root.lookup("hello").expect("hello is there");
+        assert_eq!(read_all(&*hello, 11), b"hello world".to_vec());
+        // The second block of the run, four hundred and sixty-one bytes past
+        // the end of the first block's data: one extent entry maps both, and
+        // a lookup that only ever looked at the first would read a hole.
+        let mut past = [0u8; 4];
+        assert_eq!(hello.read_at(1024, &mut past).expect("read"), 4);
+        assert_eq!(&past, b"XXXX");
+    }
+
+    #[test]
+    fn a_64bit_descriptor_carries_its_high_halves() {
+        let dev = format_ext4();
+        // Put the inode table past the 4 GiB mark, which only the
+        // descriptor's high half can say.
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            put32(&mut disk, 2 * 1024 + 40, 1);
+        });
+        let fs = mounted(Arc::new(dev));
+        assert_eq!(fs.core.group(0).inode_table, (1u64 << 32) + 5);
+    }
+
+    #[test]
+    fn a_files_size_is_the_two_words_ext4_splits_it_into() {
+        let dev = Arc::new(format_ext4());
+        let fs = mounted(dev.clone());
+        assert_eq!(fs.inode_of(12).metadata().size, 1u64 << 32);
+        // And a directory's word at 108 is not the top of a size: it is
+        // i_dir_acl, and handing it back as one would make every directory
+        // exabytes long.
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            put32(&mut disk, ext4_inode_at(2) + INODE_SIZE_HIGH, 7);
+        });
+        assert_eq!(fs.inode_of(2).metadata().size, 1024);
+    }
+
+    #[test]
+    fn an_extent_tree_grows_past_the_four_extents_the_inode_holds() {
+        let fs = mounted(Arc::new(format_ext4()));
+        let core = &fs.core;
+        let file = fs
+            .root()
+            .create("grown", NodeKind::File)
+            .expect("the file is created");
+        // Six extents nowhere near each other - near ones would merge into a
+        // run - so the inode's four are outgrown: the fifth has to split it
+        // and the root has to become an index over two leaves rather than a
+        // leaf itself.
+        for l in [10u64, 20, 30, 40, 50, 60] {
+            let page = vec![b'a' + (l / 10) as u8; 1024];
+            assert_eq!(file.write_at(l * 1024, &page).expect("write"), 1024);
+        }
+        let data = core.read_inode(file.metadata().ino as u32);
+        assert!(
+            data.flags & INODE_EXTENTS_FL != 0,
+            "a file born on an extent filesystem stays extent-mapped"
+        );
+        let root = ext_root(&data);
+        assert_eq!(ext_depth(&root), 1, "the root became an index");
+        assert_eq!(ext_entries(&root), 2, "over the two halves it split into");
+        for l in [10u64, 20, 30, 40, 50, 60] {
+            let mut page = vec![0u8; 1024];
+            assert_eq!(file.read_at(l * 1024, &mut page).expect("read"), 1024);
+            assert!(
+                page.iter().all(|b| *b == b'a' + (l / 10) as u8),
+                "block {l} reads back what was written"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_blocks_join_the_extent_they_land_beside() {
+        let fs = mounted(Arc::new(format_ext4()));
+        let core = &fs.core;
+        let file = fs
+            .root()
+            .create("run", NodeKind::File)
+            .expect("the file is created");
+        // Six blocks written one at a time, and the allocator hands them out
+        // in a row: five entries saying so would be a list where one run
+        // belongs, and the first thing a reference fsck says about it is
+        // "narrower".
+        for l in 0..6u64 {
+            let page = vec![b'a' + l as u8; 1024];
+            assert_eq!(file.write_at(l * 1024, &page).expect("write"), 1024);
+        }
+        let data = core.read_inode(file.metadata().ino as u32);
+        let root = ext_root(&data);
+        assert_eq!(ext_depth(&root), 0, "one run, no tree");
+        assert_eq!(ext_entries(&root), 2, "block 0 apart, blocks 1..5 as a run");
+        let (_first, len, _start) = ext_leaf(&root, 1);
+        assert_eq!(len, 5, "five blocks, one extent");
+        for l in 0..6u64 {
+            let mut page = vec![0u8; 1024];
+            assert_eq!(file.read_at(l * 1024, &mut page).expect("read"), 1024);
+            assert!(
+                page.iter().all(|b| *b == b'a' + l as u8),
+                "block {l} reads back what was written"
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_that_lands_in_the_half_that_was_kept_still_indexes_both() {
+        let fs = mounted(Arc::new(format_ext4()));
+        let file = fs
+            .root()
+            .create("sparse", NodeKind::File)
+            .expect("the file is created");
+        // Four extents nowhere near each other, then a fifth that belongs
+        // *before* all of them. The split has to hand the new one to the half
+        // that stayed and still index the half that moved out - under the
+        // block the moved half starts at, not the one that took the entry.
+        for l in [10u64, 20, 30, 40] {
+            let page = vec![b'a' + (l / 10) as u8; 1024];
+            file.write_at(l * 1024, &page).expect("write");
+        }
+        file.write_at(5 * 1024, &vec![b'z'; 1024]).expect("write");
+        for (l, want) in [(5u64, b'z'), (10, b'b'), (20, b'c'), (30, b'd'), (40, b'e')] {
+            let mut page = vec![0u8; 1024];
+            assert_eq!(file.read_at(l * 1024, &mut page).expect("read"), 1024);
+            assert!(
+                page.iter().all(|b| *b == want),
+                "block {l} reads back what was written"
+            );
+        }
+    }
+
+    #[test]
+    fn every_block_of_an_extent_tree_comes_back_on_truncate() {
+        let dev = Arc::new(format_ext4());
+        let before = mounted(dev.clone()).statfs().expect("statfs").bfree;
+        let fs = mounted(dev.clone());
+        let file = fs
+            .root()
+            .create("grown", NodeKind::File)
+            .expect("the file is created");
+        // Six extents nowhere near each other, so the tree has to split and
+        // grow: six data blocks, the sibling the split made, and the block
+        // the root's own entries moved into when it became an index.
+        for l in [10u64, 20, 30, 40, 50, 60] {
+            let page = vec![b'a' + (l / 10) as u8; 1024];
+            file.write_at(l * 1024, &page).expect("write");
+        }
+        let spent = before - mounted(dev.clone()).statfs().expect("statfs").bfree;
+        assert_eq!(spent, 8, "the tree costs its own blocks, and no more");
+        file.truncate(0).expect("truncate");
+        // A fresh mount: nothing of it is in this one's cache.
+        let after = mounted(dev).statfs().expect("statfs").bfree;
+        assert_eq!(after, before, "every block came back");
+        assert_eq!(read_all(&*file, 32).len(), 0, "and the file is empty");
+    }
+
+    #[test]
+    fn a_feature_this_driver_cannot_read_is_refused_at_mount() {
+        let dev = format_ext4();
+        // ENCRYPT: an inode's block pointers are ciphertext until somebody
+        // supplies a key, which is not a thing to read past.
+        ext4_feature(&dev, 1024 + 96, 1 << 16);
+        assert!(
+            Ext4Fs::mount(Arc::new(dev)).is_err(),
+            "a filesystem is refused rather than misread"
+        );
+    }
+
+    #[test]
+    fn metadata_checksums_mount_read_only_and_stay_that_way() {
+        let dev = format_ext4();
+        ext4_feature(&dev, 1024 + 100, ROCOMPAT_METADATA_CSUM);
+        let fs = mounted(Arc::new(dev));
+        // Worth reading: a checksum is not data, and an image that has them
+        // is every image mke2fs makes now.
+        assert!(
+            fs.read_only(),
+            "checksums we cannot recompute mean no writes"
+        );
+        fs.set_read_only(false);
+        assert!(
+            fs.read_only(),
+            "remounting read-write does not lift what the format cannot keep"
+        );
+        assert_eq!(
+            read_all(&*fs.root().lookup("hello").expect("hello"), 11),
+            b"hello world".to_vec(),
+            "and it still reads"
+        );
+        match fs.root().create("x", NodeKind::File) {
+            Err(VfsError::ReadOnly) => {}
+            Ok(_) => panic!("a write went through on a checksummed filesystem"),
+            Err(other) => panic!("refused as read-only, not as {other:?}"),
+        }
+    }
+
+    /// A real file as a block device, for the one test that holds ground
+    /// truth: an image the host's own mke2fs made.
+    struct FileDev {
+        file: std::fs::File,
+        sectors: u64,
+    }
+
+    impl BlockDev for FileDev {
+        fn capacity_sectors(&self) -> u64 {
+            self.sectors
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(offset)).expect("seek");
+            file.read_exact(buf).expect("read");
+        }
+
+        fn write_at(&self, offset: u64, buf: &[u8]) {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(offset)).expect("seek");
+            file.write_all(buf).expect("write");
+        }
+    }
+
+    /// Read a large file (the multi-megabyte `fish` binary, whose embedded
+    /// theme data fish fetches at a high byte offset) through this driver and
+    /// write it to `MPOS_BIGFILE_OUT`, so the host can hash-compare it against
+    /// `debugfs` ground truth. A large-file/extent-tree read slip corrupts a
+    /// high offset only - exactly what small-file round-trips cannot catch.
+    #[test]
+    fn a_large_file_reads_through_the_driver_byte_for_byte() {
+        let Ok(img) = std::env::var("MPOS_EXT4_IMG") else {
+            return;
+        };
+        let Ok(out) = std::env::var("MPOS_BIGFILE_OUT") else {
+            return;
+        };
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&img)
+            .expect("image opens");
+        let sectors = file.metadata().expect("metadata").len() / 512;
+        let dev: Arc<dyn BlockDev> = Arc::new(FileDev { file, sectors });
+        let fs = mounted(dev);
+        let bin = fs
+            .root()
+            .lookup("usr")
+            .expect("usr")
+            .lookup("bin")
+            .expect("bin")
+            .lookup("fish")
+            .expect("fish");
+        let size = bin.metadata().size as usize;
+        assert!(size > 1 << 20, "fish is a multi-megabyte binary");
+        // Read it in small chunks, the way a reader with a modest buffer does.
+        let mut got: Vec<u8> = Vec::with_capacity(size);
+        let mut off = 0u64;
+        while (got.len()) < size {
+            let mut chunk = vec![0u8; 4096];
+            let n = bin.read_at(off, &mut chunk).expect("read_at");
+            assert!(n > 0, "progress at offset {off}");
+            got.extend_from_slice(&chunk[..n]);
+            off += n as u64;
+        }
+        std::fs::write(&out, &got).expect("write out");
+    }
+
+    /// Mount an image made by the host's mke2fs and read what it wrote - the
+    /// fixture above is built from the spec and cannot disagree with it, so
+    /// the real thing is the only check that the spec was read right. Skipped
+    /// unless `MPOS_EXT4_IMG` names an image; `.workbuddy/verify-ext4.sh`
+    /// makes one and runs this against it.
+    #[test]
+    fn an_image_the_host_mke2fs_made_mounts_and_reads() {
+        let Ok(path) = std::env::var("MPOS_EXT4_IMG") else {
+            return;
+        };
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("the image opens");
+        let sectors = file.metadata().expect("metadata").len() / 512;
+        let dev: Arc<dyn BlockDev> = Arc::new(FileDev { file, sectors });
+        let fs = mounted(dev);
+        let names: Vec<String> = fs
+            .root()
+            .read_dir()
+            .expect("readdir")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains(&String::from("hello.txt")), "{names:?}");
+        let hello = fs.root().lookup("hello.txt").expect("hello.txt");
+        assert_eq!(
+            read_all(&*hello, 64),
+            b"hello from mke2fs\n".to_vec(),
+            "the file mke2fs wrote reads back"
+        );
+        let deep = fs
+            .root()
+            .lookup("sub")
+            .expect("the directory")
+            .lookup("deep.txt")
+            .expect("deep.txt");
+        assert_eq!(read_all(&*deep, 64), b"deep enough\n".to_vec());
+    }
+
+    /// Write to a real mke2fs image through the driver and read it back. The
+    /// script that runs this then hands the same image to the host's debugfs,
+    /// which is the referee: whatever this kernel wrote, the reference tools
+    /// must be able to read.
+    #[test]
+    fn writes_to_a_real_image_read_back_in_the_driver() {
+        let Ok(path) = std::env::var("MPOS_EXT4_IMG") else {
+            return;
+        };
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("the image opens");
+        let sectors = file.metadata().expect("metadata").len() / 512;
+        let dev: Arc<dyn BlockDev> = Arc::new(FileDev { file, sectors });
+        let fs = mounted(dev);
+        assert!(
+            !fs.read_only(),
+            "the image without metadata_csum is writable"
+        );
+
+        // Six blocks, one extent each - the fifth and sixth force a split.
+        let grown = fs.root().create("grown", NodeKind::File).expect("create");
+        for l in 0..6u64 {
+            let page = vec![b'a' + l as u8; 1024];
+            assert_eq!(grown.write_at(l * 1024, &page).expect("write"), 1024);
+        }
+        for l in 0..6u64 {
+            let mut page = vec![0u8; 1024];
+            assert_eq!(grown.read_at(l * 1024, &mut page).expect("read"), 1024);
+            assert!(page.iter().all(|b| *b == b'a' + l as u8), "block {l}");
+        }
+
+        // An overwrite inside an extent mke2fs made: in place, no new blocks.
+        let hello = fs.root().lookup("hello.txt").expect("hello.txt");
+        assert_eq!(
+            hello
+                .write_at(0, b"CHANGED BY THE KERNEL\n")
+                .expect("overwrite"),
+            22
+        );
+        assert_eq!(read_all(&*hello, 64), b"CHANGED BY THE KERNEL\n".to_vec());
     }
 }

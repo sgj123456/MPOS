@@ -1,0 +1,25 @@
+# /etc/inittab - mpos: shells on the virtual consoles, kernel log on ttyS0
+#
+# The respawn entries below name the virtual consoles `tty1`..`tty4`, which are
+# real pty-backed terminals: the kernel's console multiplexer carries their
+# traffic over the serial line, and `^A 1`..`^A 4` switches between them. The
+# serial port itself carries only the kernel's log, which is why nothing here
+# puts a getty on it.
+#
+# This file is the configuration - add a fifth console by adding a line, not by
+# editing the build.
+
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+tty1::respawn:/sbin/getty 38400 tty1
+tty2::respawn:/sbin/getty 38400 tty2
+tty3::respawn:/sbin/getty 38400 tty3
+tty4::respawn:/sbin/getty 38400 tty4
+
+# Stuff to do for the 3-finger salute
+::ctrlaltdel:/sbin/reboot
+
+# Stuff to do before rebooting
+::shutdown:/sbin/openrc shutdown

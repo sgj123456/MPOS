@@ -34,6 +34,18 @@ use crate::vfs::{Metadata, NodeKind};
 pub(super) const AT_FDCWD: i32 = -100;
 /// `AT_SYMLINK_NOFOLLOW`: name the link itself, not what it points at.
 pub(super) const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+/// `AT_EACCESS`: ask the `access` question about the **effective** ids rather
+/// than the real ones - "may I" rather than "could the user who invoked me".
+/// It is the whole reason a setuid program can ask about somebody else
+/// without dropping its own privileges first.
+pub(super) const AT_EACCESS: usize = 0x200;
+/// `AT_SYMLINK_FOLLOW`: `linkat`'s opposite number - the source is the file
+/// the name leads to, not the name. It is the flag that gives a file with no
+/// name of its own one: `apk` writes its repository index through
+/// `O_TMPFILE` and links the result in by way of `/proc/self/fd/N`, and
+/// without the flag that path is a link to a name on procfs rather than to
+/// the file, which is EXDEV and a re-fetch.
+pub(super) const AT_SYMLINK_FOLLOW: usize = 0x400;
 /// `fstatat` by descriptor: an empty path names the dirfd itself.
 pub(super) const AT_EMPTY_PATH: usize = 0x1000;
 /// `unlinkat`'s spelling of `rmdir`: the flag says which of the two
@@ -61,6 +73,12 @@ pub(super) const O_CLOEXEC: usize = 0o200_0000;
 /// invisible to a test for the other two, and why `F_GETFL` can answer it
 /// only as the absence of them both.
 pub(super) const O_ACCMODE: usize = 0o3;
+/// The three values that field takes, named so a `match` can tell them
+/// apart. `O_RDONLY` is zero, so it can only ever be the absence of the
+/// other two - which is why the handlers below spell it as the fallback arm
+/// rather than testing for it.
+pub(super) const O_WRONLY: usize = 1;
+pub(super) const O_RDWR: usize = 2;
 /// O_DIRECTORY is a demand about the name, not a hint: the name must
 /// already be a directory, and a file under it is ENOTDIR rather than a
 /// descriptor the caller will read what it believes are entries out of.
@@ -218,6 +236,31 @@ pub(crate) fn mode_of(meta: &Metadata, stored: u32) -> u32 {
 // stat(2): the 144-byte struct stat of the x86_64 ABI
 // ---------------------------------------------------------------------------
 
+/// The three clocks `struct stat` and `struct statx` report. A filesystem that
+/// keeps them separately (ext2) hands back three distinct values; one that
+/// keeps none reports the epoch, and one that keeps a single clock reports it
+/// for all three.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StatTimes {
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+}
+
+/// The hard-link count `stat` reports for a node whose filesystem does not
+/// track one (`nlink()` answered 0): a directory has the two names POSIX gives
+/// it - `.` and the entry in its parent - and everything else has the one it
+/// was created under.
+pub(crate) fn nlink_of(meta: &Metadata, tracked: u64) -> u64 {
+    if tracked != 0 {
+        tracked
+    } else if meta.kind == NodeKind::Dir {
+        2
+    } else {
+        1
+    }
+}
+
 /// Write the 144-byte Linux x86_64 `struct stat` for `meta`.
 ///
 /// The field offsets are the ABI, so they are spelled as the byte offsets of
@@ -230,11 +273,14 @@ pub(crate) fn write_stat(
     dev: u64,
     rdev: Option<(u32, u32)>,
     stored: u32,
+    nlink: u64,
+    owner: (u32, u32),
+    times: StatTimes,
 ) -> isize {
     if !buffer_ok(buf, 144, true, true) {
         return err::EFAULT;
     }
-    let nlink: u64 = if meta.kind == NodeKind::Dir { 2 } else { 1 };
+    let nlink = nlink_of(meta, nlink);
     let size = meta.size;
     let blocks: u64 = size.div_ceil(512);
     // The device number a character device node carries, packed the way
@@ -255,14 +301,23 @@ pub(crate) fn write_stat(
         (at(8) as *mut u64).write_unaligned(meta.ino); // st_ino
         (at(16) as *mut u64).write_unaligned(nlink); // st_nlink
         (at(24) as *mut u32).write_unaligned(mode_of(meta, stored)); // st_mode
-        // st_uid, st_gid and the pad word stay 0: one user. st_rdev carries
-        // the node's own device number - the identity libc's `ttyname`
-        // matches a descriptor by.
+        // The owner is the node's, not the caller's: a filesystem that keeps
+        // one answers with what it holds, and a node it never stamped answers
+        // root's. st_rdev carries the node's own device number - the identity
+        // libc's `ttyname` matches a descriptor by.
+        (at(28) as *mut u32).write_unaligned(owner.0); // st_uid
+        (at(32) as *mut u32).write_unaligned(owner.1); // st_gid
         (at(40) as *mut u64).write_unaligned(packed_rdev); // st_rdev
         (at(48) as *mut u64).write_unaligned(size); // st_size
         (at(56) as *mut u64).write_unaligned(512); // st_blksize
         (at(64) as *mut u64).write_unaligned(blocks); // st_blocks
-        // Timestamps (offsets 72..120) stay 0: no clock is kept per inode.
+        // The three clocks, each the value the filesystem kept for it. The
+        // nanosecond halves stay 0: ext2's on-disk inode has no sub-second
+        // field, and reporting a precise-looking zero the clock does not have
+        // would be a lie of the second kind.
+        (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atime
+        (at(80) as *mut i64).write_unaligned(times.mtime as i64); // st_mtime
+        (at(88) as *mut i64).write_unaligned(times.ctime as i64); // st_ctime
     }
     0
 }
@@ -336,16 +391,22 @@ pub(crate) fn write_statx(
     meta: &Metadata,
     stored: u32,
     rdev: Option<(u32, u32)>,
+    nlink: u64,
+    owner: (u32, u32),
+    times: StatTimes,
 ) -> isize {
     if !buffer_ok(buf, STATX_SIZE, true, true) {
         return err::EFAULT;
     }
+    let nlink = nlink_of(meta, nlink);
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, STATX_SIZE);
         let at = |offset: usize| (buf + offset) as *mut u8;
         (at(0) as *mut u32).write_unaligned(mask & STATX_BASIC_STATS); // stx_mask
         (at(4) as *mut u32).write_unaligned(512); // stx_blksize
-        (at(16) as *mut u32).write_unaligned(if meta.kind == NodeKind::Dir { 2 } else { 1 }); // stx_nlink
+        (at(16) as *mut u32).write_unaligned(nlink as u32); // stx_nlink
+        (at(20) as *mut u32).write_unaligned(owner.0); // stx_uid
+        (at(24) as *mut u32).write_unaligned(owner.1); // stx_gid
         (at(28) as *mut u16).write_unaligned(mode_of(meta, stored) as u16); // stx_mode
         (at(32) as *mut u64).write_unaligned(meta.ino); // stx_ino
         (at(40) as *mut u64).write_unaligned(meta.size); // stx_size
@@ -354,6 +415,15 @@ pub(crate) fn write_statx(
             (at(72) as *mut u32).write_unaligned(major); // stx_rdev_major
             (at(76) as *mut u32).write_unaligned(minor); // stx_rdev_minor
         }
+        // stx_atime / stx_mtime / stx_ctime at 96, 112, 128 - each the value
+        // the filesystem kept for it, with a zero nanosecond half (ext2's
+        // on-disk inode has no sub-second clock).
+        (at(96) as *mut i64).write_unaligned(times.atime as i64); // stx_atime
+        (at(104) as *mut i32).write_unaligned(0); // stx_atime_nsec
+        (at(112) as *mut i64).write_unaligned(times.mtime as i64); // stx_mtime
+        (at(120) as *mut i32).write_unaligned(0); // stx_mtime_nsec
+        (at(128) as *mut i64).write_unaligned(times.ctime as i64); // stx_ctime
+        (at(136) as *mut i32).write_unaligned(0); // stx_ctime_nsec
     }
     0
 }
@@ -979,8 +1049,11 @@ pub(crate) fn itimerval_ms(
 /// options that would touch privileges, dump core flags or endianness touch
 /// things this kernel does not model, so they are accepted and dropped.
 pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
+    const PR_GET_SECCOMP: usize = 21;
+    const PR_SET_SECCOMP: usize = 22;
     const PR_GET_NAME: usize = 16;
     const NAME_LEN: usize = 16;
+    const SECCOMP_MODE_STRICT: usize = 1;
     match args[0] {
         PR_GET_NAME => {
             let buf = args[1];
@@ -990,6 +1063,20 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
             unsafe { core::ptr::write_bytes(buf as *mut u8, 0, NAME_LEN) };
             0
         }
+        // The seccomp pair is the older spelling of the same latch the
+        // `seccomp(2)` syscall sets. `PR_GET_SECCOMP` answers 0 while
+        // unconfined and 1 (`SECCOMP_MODE_STRICT`) once latched; the BPF
+        // filter mode is not implemented, so asking to enter it is refused
+        // rather than silently ignored.
+        PR_GET_SECCOMP => crate::sched::current_is_seccomp_strict() as isize,
+        PR_SET_SECCOMP => {
+            if args[1] == SECCOMP_MODE_STRICT {
+                crate::sched::set_seccomp_strict();
+                0
+            } else {
+                err::ENOSYS
+            }
+        }
         _ => 0,
     }
 }
@@ -998,15 +1085,15 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
 // umask(2): the creation mask
 // ---------------------------------------------------------------------------
 
-/// The file-creation mask, `0o022` the way init leaves it.
-static CREATION_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0o022);
-
-/// `umask(mask)` — set the creation mask, and report what it was. No path
-/// records permission bits yet, so the mask is kept and handed back only;
-/// init's `umask(0o22)` still gets the answer it expects.
+/// `umask(mask)` — set the creation mask, and report what it was.
+///
+/// The mask is the process's, not the machine's: it is inherited across
+/// `fork` and preserved by `exec`, so a program that narrows its own must not
+/// narrow what its neighbours may create. Only the low twelve bits are kept,
+/// because those are the bits a mode has.
 pub(crate) fn handle_umask(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
-    use core::sync::atomic::Ordering;
-    let old = CREATION_MASK.swap(args[0] as u32 & 0o7777, Ordering::Relaxed);
+    let old = crate::sched::current_umask();
+    crate::sched::set_current_umask(args[0] as u32 & 0o7777);
     old as isize
 }
 
@@ -1041,20 +1128,61 @@ pub(crate) fn handle_getrandom(args: [usize; crate::syscall::ARG_COUNT], from_us
 
 /// `RLIM_NLIMITS`: the resource table's length. A number past it is
 /// `EINVAL`, the errno Linux uses for one it has no row for.
-pub(super) const RLIM_NLIMITS: usize = 16;
+pub const RLIM_NLIMITS: usize = 16;
 /// `RLIM_INFINITY`: what an unlimited limit reads as.
-pub(super) const RLIM_INFINITY: u64 = u64::MAX;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// One resource limit pair: the soft ceiling a process is held to and the hard
+/// ceiling it may raise the soft one to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rlimit {
+    pub cur: u64,
+    pub max: u64,
+}
+
+/// The limits a fresh process starts with: an 8 MiB stack, a descriptor
+/// ceiling, a process count, and infinity for the rows nothing budgets. Every
+/// other resource reads these until `setrlimit` says otherwise.
+pub(crate) fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
+    let mut t = [Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY }; RLIM_NLIMITS];
+    t[3] = Rlimit { cur: 8 * 1024 * 1024, max: 8 * 1024 * 1024 }; // RLIMIT_STACK
+    t[5] = Rlimit { cur: 1024, max: 1_048_576 }; // RLIMIT_NOFILE
+    t[7] = Rlimit { cur: 4096, max: 4096 }; // RLIMIT_NPROC
+    t
+}
+
+/// `setrlimit`'s one rule, returned as the errno a refusal carries (or the
+/// accepted pair): the soft limit may not exceed the hard, and only root may
+/// lift the hard ceiling above where it stands.
+pub(crate) fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, isize> {
+    if new.cur > new.max {
+        return Err(err::EINVAL);
+    }
+    if !is_root && new.max > old.max {
+        return Err(err::EPERM);
+    }
+    Ok(new)
+}
 
 /// The `(rlim_cur, rlim_max)` pair a resource reports. The numbers are the
 /// defaults a static musl binary needs to start: an 8 MiB stack, a generous
 /// descriptor ceiling, and infinity for the rest.
 pub(crate) fn rlimit_pair(resource: usize) -> (u64, u64) {
-    match resource {
-        3 => (8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_STACK
-        5 => (1024, 1048576),                    // RLIMIT_NOFILE
-        7 => (4096, 4096),                       // RLIMIT_NPROC
-        _ => (RLIM_INFINITY, RLIM_INFINITY),
+    let r = default_rlimits()[resource.min(RLIM_NLIMITS - 1)];
+    (r.cur, r.max)
+}
+
+/// The current process's stored limit for `resource`, as a `(cur, max)` pair.
+/// On the kernel it comes from the task's own table; a host build has no
+/// table, so it reads the startup defaults - which is what a test wants.
+fn current_pair(resource: usize) -> (u64, u64) {
+    #[cfg(target_os = "none")]
+    if let Some(r) = crate::sched::current_rlimit(resource) {
+        return (r.cur, r.max);
     }
+    #[cfg(not(target_os = "none"))]
+    let _ = resource;
+    rlimit_pair(resource)
 }
 
 /// Write the `struct rlimit64 { rlim_cur, rlim_max }` pair into `out`.
@@ -1068,7 +1196,7 @@ fn rlimit_of(resource: usize, out: usize, from_user: bool) -> isize {
     if !buffer_ok(out, 16, true, from_user) {
         return err::EFAULT;
     }
-    let (cur, max) = rlimit_pair(resource);
+    let (cur, max) = current_pair(resource);
     unsafe {
         (out as *mut u64).write_unaligned(cur);
         ((out + 8) as *mut u64).write_unaligned(max);
@@ -1076,26 +1204,99 @@ fn rlimit_of(resource: usize, out: usize, from_user: bool) -> isize {
     0
 }
 
-/// `prlimit64(pid, resource, new_limit, old_limit)` — get/set resource
-/// limits. The new limit is accepted and not enforced: these are advisory
-/// answers, not a budget the kernel keeps.
+/// Apply a new soft/hard pair to the current process's `resource`, or report
+/// the errno Linux would. A host build has no table, so a set is a no-op.
+fn set_current(resource: usize, cur: u64, max: u64) -> isize {
+    #[cfg(target_os = "none")]
+    {
+        let is_root = crate::sched::current_owner().0 == 0;
+        let new = Rlimit { cur, max };
+        match crate::sched::set_current_rlimit(resource, new, is_root) {
+            Ok(()) => 0,
+            Err(e) => e,
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (resource, cur, max);
+        0
+    }
+}
+
+/// `prlimit64(pid, resource, new_limit, old_limit)` — get/set one limit of a
+/// process. `pid` 0 (or the caller's own) acts on the current process with the
+/// full rule; another pid can be read (its stored table) but not written here,
+/// which answers a cross-process set with `EPERM` rather than pretending.
 pub(crate) fn handle_prlimit64(args: [usize; crate::syscall::ARG_COUNT], from_user: bool) -> isize {
-    let (_pid, resource, _new_ptr, old_ptr) = (args[0], args[1], args[2], args[3]);
+    let (pid, resource, new_ptr, old_ptr) = (args[0], args[1], args[2], args[3]);
     if resource >= RLIM_NLIMITS {
         return err::EINVAL;
     }
-    if old_ptr == 0 {
-        return 0;
-    }
-    if !buffer_ok(old_ptr, 16, true, from_user) {
+    if old_ptr != 0 && !buffer_ok(old_ptr, 16, true, from_user) {
         return err::EFAULT;
     }
-    let (cur, max) = rlimit_pair(resource);
-    unsafe {
-        (old_ptr as *mut u64).write_unaligned(cur);
-        ((old_ptr + 8) as *mut u64).write_unaligned(max);
+    let new = if new_ptr != 0 {
+        if !buffer_ok(new_ptr, 16, false, from_user) {
+            return err::EFAULT;
+        }
+        Some((
+            unsafe { (new_ptr as *const u64).read_unaligned() },
+            unsafe { ((new_ptr + 8) as *const u64).read_unaligned() },
+        ))
+    } else {
+        None
+    };
+
+    #[cfg(target_os = "none")]
+    let is_self = pid == 0 || pid as usize == crate::sched::current_tgid().0;
+    // A host build has no processes, so every request is the current one.
+    #[cfg(not(target_os = "none"))]
+    let is_self = true;
+    if !is_self {
+        // Reading another process: it must exist.
+        let table = rlimits_of_pid(pid as usize);
+        let Some(table) = table else {
+            return err::ESRCH;
+        };
+        if new.is_some() {
+            return err::EPERM;
+        }
+        let r = table[resource];
+        if old_ptr != 0 {
+            unsafe {
+                (old_ptr as *mut u64).write_unaligned(r.cur);
+                ((old_ptr + 8) as *mut u64).write_unaligned(r.max);
+            }
+        }
+        return 0;
+    }
+    if let Some((ncur, nmax)) = new {
+        let code = set_current(resource, ncur, nmax);
+        if code != 0 {
+            return code;
+        }
+    }
+    if old_ptr != 0 {
+        let (cur, max) = current_pair(resource);
+        unsafe {
+            (old_ptr as *mut u64).write_unaligned(cur);
+            ((old_ptr + 8) as *mut u64).write_unaligned(max);
+        }
     }
     0
+}
+
+/// Look up another process's stored table (a host build has none).
+fn rlimits_of_pid(pid: usize) -> Option<[Rlimit; RLIM_NLIMITS]> {
+    #[cfg(target_os = "none")]
+    {
+        crate::sched::rlimits_of(pid)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// `getrlimit(resource, rlim)` — read one resource limit.
@@ -1103,18 +1304,23 @@ pub(crate) fn handle_getrlimit(args: [usize; crate::syscall::ARG_COUNT], from_us
     rlimit_of(args[0], args[1], from_user)
 }
 
-/// `setrlimit(resource, rlim)` — set one resource limit. A set is accepted
-/// for any resource in range and changes nothing; out-of-range is `EINVAL`,
-/// an unwritable pointer `EFAULT`.
+/// `setrlimit(resource, rlim)` — set one resource limit on the current
+/// process. Out-of-range is `EINVAL`, an unwritable pointer `EFAULT`, and a
+/// change the caller's privilege will not allow is `EPERM`.
 pub(crate) fn handle_setrlimit(args: [usize; crate::syscall::ARG_COUNT], from_user: bool) -> isize {
     let (resource, rlim) = (args[0], args[1]);
     if resource >= RLIM_NLIMITS {
         return err::EINVAL;
     }
-    if rlim != 0 && !buffer_ok(rlim, 16, false, from_user) {
+    if rlim == 0 {
         return err::EFAULT;
     }
-    0
+    if !buffer_ok(rlim, 16, false, from_user) {
+        return err::EFAULT;
+    }
+    let cur = unsafe { (rlim as *const u64).read_unaligned() };
+    let max = unsafe { ((rlim + 8) as *const u64).read_unaligned() };
+    set_current(resource, cur, max)
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,21 +1406,149 @@ pub(crate) fn handle_rseq(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     0
 }
 
-/// `membarrier(cmd, flags, cpu_id)` — a memory barrier across the machine.
+/// `membarrier(2)`: the promise one thread makes to the others.
 ///
-/// One core, no preemption between a load and a store a user program could
-/// observe, so every command is already satisfied: the answer is success.
-/// An unknown command is `EINVAL`.
+/// The command word is a set of bits with two halves that mean different
+/// things. A `REGISTER_*` command is a *declaration* - the process says it will
+/// use the matching barrier, which is what lets a kernel commit to the cost of
+/// one up front - and the barrier commands are the barrier itself. `QUERY` is a
+/// third thing again: it asks which of the rest this kernel supports, and is
+/// the only command a caller may use before registering anything.
+pub(super) const MEMBARRIER_CMD_QUERY: usize = 0;
+pub(super) const MEMBARRIER_CMD_GLOBAL: usize = 1 << 0;
+pub(super) const MEMBARRIER_CMD_GLOBAL_EXPEDITED: usize = 1 << 1;
+pub(super) const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: usize = 1 << 2;
+pub(super) const MEMBARRIER_CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
+pub(super) const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+
+/// The one flag the `flags` word carries: "the `cpu_id` argument is a CPU to
+/// act on, not padding".
+pub(super) const MEMBARRIER_CMD_FLAG_CPU: usize = 1;
+
+/// Which commands this kernel answers yes to.
+///
+/// `QUERY` reports this word and the handler below is driven by it, so what is
+/// advertised and what is accepted cannot drift apart. That coupling matters
+/// more here than in most places: a caller told "no" is *expected* to fall back
+/// to a slower mechanism, while a caller told yes and given nothing has lost the
+/// guarantee it asked for without being told.
+///
+/// Two of Linux's commands are deliberately absent. `..._SYNC_CORE` asks that
+/// every thread of the process execute a *core serializing* instruction - the
+/// promise a just-in-time compiler needs after writing code another thread may
+/// already be running - and this kernel has no way to make an arbitrary thread
+/// execute one. `..._RSEQ` asks for a barrier over per-thread `rseq` state this
+/// kernel does not carry at all. Both are answers that would be plausible and
+/// wrong, which is the kind this kernel has paid for before.
+const MEMBARRIER_SUPPORTED: usize = MEMBARRIER_CMD_GLOBAL
+    | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+
+/// Decode the `flags` and `cpu_id` pair: which processor the call names, if any.
+///
+/// A `cpu_id` that arrives without the flag that makes it meaningful is a
+/// caller bug, and Linux answers it with `EINVAL` rather than quietly ignoring
+/// it - which is the right way round, because a caller that meant to name a
+/// processor and silently got all of them has asked for something weaker than
+/// it thinks.
+fn membarrier_target(flags: usize, cpu_id: usize) -> Result<Option<usize>, isize> {
+    match flags {
+        0 => Ok(None),
+        MEMBARRIER_CMD_FLAG_CPU => {
+            // One processor, numbered zero. Any other number names something
+            // that is not there, which is `EINVAL` on Linux as well.
+            if cpu_id == 0 {
+                Ok(Some(0))
+            } else {
+                Err(err::EINVAL)
+            }
+        }
+        _ => Err(err::EINVAL),
+    }
+}
+
+/// `membarrier(cmd, flags, cpu_id)` - "before this returns, the threads I name
+/// have each executed a memory barrier".
+///
+/// The promise is about *other processors*, and this machine has one. While a
+/// thread runs, no thread of the process is running anywhere else, so every
+/// store any of them has made is already visible to the caller: x86 orders a
+/// store before any later load from the same processor, and the scheduler's own
+/// switch is a serializing event besides. So the barrier is a `fence`, which is
+/// what the architecture asks for and all that is left for this call to do.
+///
+/// That reasoning is the whole implementation, and it is also the one thing
+/// that stops being true if this kernel ever brings up a second processor: an
+/// *expedited* barrier would then have to interrupt each of them and have it
+/// execute the fence on the caller's behalf, and [`MEMBARRIER_SUPPORTED`] is
+/// where that day would have to be answered for too.
+///
+/// The registration half is bookkeeping rather than machinery, and it is kept
+/// honest rather than waved through: Linux answers an unregistered private or
+/// global *expedited* barrier with `EPERM`, and a caller that finds out here has
+/// a bug it can see instead of a guarantee it does not have.
 pub(crate) fn handle_membarrier(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
-    /// MEMBARRIER_CMD_QUERY and the two barriers a musl caller asks for.
-    const CMD_QUERY: usize = 0;
-    const CMD_GLOBAL: usize = 1;
-    const CMD_PRIVATE_EXPEDITED: usize = 8;
-    match args[0] {
-        CMD_QUERY => 0, // no flags are needed, so nothing is reported
-        CMD_GLOBAL | CMD_PRIVATE_EXPEDITED => 0,
+    let (command, flags, cpu_id) = (args[0], args[1], args[2]);
+
+    if command == MEMBARRIER_CMD_QUERY {
+        // QUERY names no processor even when the flag is set: it is a question
+        // about this kernel, not an instruction to it.
+        return if flags == 0 {
+            MEMBARRIER_SUPPORTED as isize
+        } else {
+            err::EINVAL
+        };
+    }
+
+    // One command, not a set of them, and one this kernel knows. A word with a
+    // bit outside `SUPPORTED` is a command from a newer kernel; a word with two
+    // of our own bits is two commands in one, which Linux refuses too.
+    if command & !MEMBARRIER_SUPPORTED != 0 || !command.is_power_of_two() {
+        return err::EINVAL;
+    }
+    let target = match membarrier_target(flags, cpu_id) {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
+    // Only the global expedited barrier takes a processor to act on - the
+    // others are about *this process's* threads, which are wherever they are.
+    if target.is_some() && command != MEMBARRIER_CMD_GLOBAL_EXPEDITED {
+        return err::EINVAL;
+    }
+
+    let registered = crate::sched::membarrier_registrations();
+    match command {
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED => {
+            crate::sched::register_membarrier(MEMBARRIER_CMD_GLOBAL_EXPEDITED);
+            0
+        }
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
+            crate::sched::register_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED);
+            0
+        }
+        // The deprecated `GLOBAL` names no registration: it predates them, and
+        // it was the only barrier there was, so every caller is assumed to want
+        // it. Its modern spelling is the expedited one above, which does check.
+        MEMBARRIER_CMD_GLOBAL => barrier(),
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED if registered & MEMBARRIER_CMD_GLOBAL_EXPEDITED != 0 => {
+            barrier()
+        }
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED if registered & MEMBARRIER_CMD_PRIVATE_EXPEDITED != 0 => {
+            barrier()
+        }
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED | MEMBARRIER_CMD_PRIVATE_EXPEDITED => err::EPERM,
         _ => err::EINVAL,
     }
+}
+
+/// The barrier itself, and the reason the comment above is short: on one
+/// processor there is nothing for it to do but order *this* thread's memory
+/// accesses, which is what a sequentially consistent fence is.
+fn barrier() -> isize {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,6 +1575,46 @@ pub(crate) fn mark_missing(nr: u64) -> bool {
         return false;
     };
     let mask = 1u64 << (nr % 64);
+    word.fetch_or(mask, Ordering::Relaxed) & mask == 0
+}
+
+/// One bit per syscall number, set the first time the call answers EOPNOTSUPP.
+/// Its own table, because a number can legitimately answer both - ENOSYS for a
+/// spelling this kernel has no handler for and EOPNOTSUPP for an option it
+/// refuses - and one table shared between them would report whichever came
+/// first and then go quiet about the other.
+static UNSUPPORTED_CALLS: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Record that `nr` answered EOPNOTSUPP, answering `true` the first time only.
+pub(crate) fn mark_unsupported(nr: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    let Some(word) = UNSUPPORTED_CALLS.get((nr / 64) as usize) else {
+        return false;
+    };
+    let mask = 1u64 << (nr % 64);
+    word.fetch_or(mask, Ordering::Relaxed) & mask == 0
+}
+
+/// The same, for the *operations* of one call rather than calls.
+///
+/// A futex operation arrives inside a system call this kernel implements, so it
+/// has no number of its own to be reported under. Two words cover 0..=127, which
+/// is every operation the command's low seven bits can name; the flags above
+/// them - `FUTEX_PRIVATE_FLAG`, `FUTEX_CLOCK_REALTIME` - are not part of what is
+/// being asked for and are folded off before the report, so one operation is one
+/// line however it was spelled.
+static MISSING_FUTEX_OPS: [core::sync::atomic::AtomicU64; 2] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Record that futex operation `op` answered ENOSYS, true the first time only.
+pub(crate) fn mark_missing_futex_op(op: usize) -> bool {
+    use core::sync::atomic::Ordering;
+    let op = op & 0x7f;
+    let Some(word) = MISSING_FUTEX_OPS.get(op / 64) else {
+        return false;
+    };
+    let mask = 1u64 << (op % 64);
     word.fetch_or(mask, Ordering::Relaxed) & mask == 0
 }
 
@@ -1317,12 +1691,26 @@ mod tests {
             0x8,          // st_dev: a filesystem id
             Some((4, 3)), // st_rdev: /dev/ttyS-style 4:3? no - a char dev
             0o640,
+            // A hard-linked file: three names reach the inode, and the
+            // filesystem kept three distinct clocks for it.
+            3,
+            // And an owner, so the test can say where st_uid and st_gid land
+            // rather than trusting two fields nobody had written yet.
+            (1000, 100),
+            StatTimes {
+                atime: 1_700_000_400,
+                mtime: 1_700_000_123,
+                ctime: 1_700_000_200,
+            },
         );
         assert_eq!(written, 0);
         let word = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
         assert_eq!(word(0), 0x8); // st_dev
         assert_eq!(word(8), 0x1234); // st_ino
-        assert_eq!(word(16), 1); // st_nlink: one name for a file
+        assert_eq!(word(16), 3); // st_nlink: the count the filesystem reported
+        let dword = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        assert_eq!(dword(28), 1000); // st_uid
+        assert_eq!(dword(32), 100); // st_gid
         assert_eq!(
             u32::from_le_bytes(buf[24..28].try_into().unwrap()),
             0o100_640
@@ -1331,13 +1719,18 @@ mod tests {
         assert_eq!(word(48), 257); // st_size
         assert_eq!(word(56), 512); // st_blksize
         assert_eq!(word(64), 1); // st_blocks: ceil(257/512)
-        // The user and group words stay zero: one user.
-        assert_eq!(&buf[28..40], &[0u8; 12]);
-        // Timestamps are not kept: offsets 72..144 read as zero.
-        assert!(buf[72..].iter().all(|&b| b == 0));
+        // Each clock carries its own value - not one collapsed into three -
+        // and the nanosecond halves stay zero.
+        assert_eq!(word(72), 1_700_000_400); // st_atime
+        assert_eq!(word(80), 1_700_000_123); // st_mtime
+        assert_eq!(word(88), 1_700_000_200); // st_ctime
+        assert_eq!(&buf[76..80], &[0u8; 4]);
+        assert_eq!(&buf[84..88], &[0u8; 4]);
+        assert_eq!(&buf[92..96], &[0u8; 4]);
 
-        // A directory reports two names (itself through `.`, its parent
-        // through `..`), the convention every caller of st_nlink assumes.
+        // An untracked count (a filesystem that stores no `i_links_count`)
+        // falls back to the kind's convention: two names for a directory, the
+        // one it was created under for a file.
         let mut dbuf = [0u8; 144];
         assert_eq!(
             write_stat(
@@ -1345,7 +1738,14 @@ mod tests {
                 &meta(NodeKind::Dir, 9, 4096),
                 0,
                 None,
-                0
+                0,
+                0,      // nlink untracked
+                (0, 0), // and no owner: root's, which is the default
+                StatTimes {
+                    atime: 0,
+                    mtime: 1_700_000_123,
+                    ctime: 0
+                },
             ),
             0
         );
@@ -1404,14 +1804,22 @@ mod tests {
                 0x7ff,
                 &meta(NodeKind::File, 77, 1024),
                 0,
-                Some((1, 9))
+                Some((1, 9)),
+                // A tracked count and three distinct clocks, as ext2 reports.
+                5,
+                (0, 0),
+                StatTimes {
+                    atime: 1_700_000_400,
+                    mtime: 1_700_000_123,
+                    ctime: 1_700_000_200,
+                },
             ),
             0
         );
         let word = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0x7ff); // stx_mask
         assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 512); // stx_blksize
-        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 1); // stx_nlink
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 5); // stx_nlink
         assert_eq!(
             u16::from_le_bytes(buf[28..30].try_into().unwrap()),
             0o100_644
@@ -1421,8 +1829,12 @@ mod tests {
         assert_eq!(word(48), 2); // stx_blocks: ceil(1024/512)
         assert_eq!(u32::from_le_bytes(buf[72..76].try_into().unwrap()), 1); // stx_rdev_major
         assert_eq!(u32::from_le_bytes(buf[76..80].try_into().unwrap()), 9); // stx_rdev_minor
-        // Timestamps and mount id stay absent.
-        assert!(buf[80..].iter().all(|&b| b == 0));
+        // Each clock carries its own seconds value, zero in the nanosecond
+        // half; the mount id beyond them stays absent.
+        assert_eq!(word(96), 1_700_000_400); // stx_atime
+        assert_eq!(word(112), 1_700_000_123); // stx_mtime
+        assert_eq!(word(128), 1_700_000_200); // stx_ctime
+        assert!(buf[144..].iter().all(|&b| b == 0));
 
         // A mask wider than the basic stats is trimmed: only what is filled
         // is reported, so a caller does not read absent fields as present.
@@ -1433,7 +1845,10 @@ mod tests {
                 0xfff,
                 &meta(NodeKind::Dir, 1, 0),
                 0,
-                None
+                None,
+                0, // untracked -> the directory's two names
+                (0, 0),
+                StatTimes::default(),
             ),
             0
         );
@@ -1802,6 +2217,31 @@ mod tests {
         assert_eq!(handle_prctl([0x1337, 0, 0, 0, 0, 0]), 0);
     }
 
+    /// The `PR_SET_SECCOMP` / `PR_GET_SECCOMP` pair latches strict mode the
+    /// same one-way way the `seccomp(2)` syscall does, and refuses the BPF
+    /// filter mode this kernel has no matcher for.
+    #[test]
+    fn prctl_seccomp_latches_strict_and_refuses_filter() {
+        const PR_GET_SECCOMP: usize = 21;
+        const PR_SET_SECCOMP: usize = 22;
+        const STRICT: usize = 1;
+        const FILTER: usize = 2;
+
+        // Asking to enter the filter mode is refused, not ignored: a caller
+        // that believes it installed a BPF program must not be left thinking
+        // it is confined when it is not.
+        assert_eq!(
+            handle_prctl([PR_SET_SECCOMP, FILTER, 0, 0, 0, 0]),
+            crate::syscall::err::ENOSYS
+        );
+
+        // Strict mode takes, the read-back says so, and it stays said - the
+        // latch has no off switch.
+        assert_eq!(handle_prctl([PR_SET_SECCOMP, STRICT, 0, 0, 0, 0]), 0);
+        assert_eq!(handle_prctl([PR_GET_SECCOMP, 0, 0, 0, 0, 0]), 1);
+        assert_eq!(handle_prctl([PR_GET_SECCOMP, 0, 0, 0, 0, 0]), 1);
+    }
+
     /// `umask(2)`: the previous mask is the answer, and only the low
     /// twelve bits of the request are kept.
     #[test]
@@ -1896,12 +2336,39 @@ mod tests {
         assert_eq!(handle_prlimit64([0, 3, 0, 0, 0, 0], false), 0);
         assert_eq!(handle_getrlimit([3, 0, 0, 0, 0, 0], false), 0);
 
-        // setrlimit accepts any in-range resource and changes nothing.
-        assert_eq!(handle_setrlimit([3, 0, 0, 0, 0, 0], false), 0);
+        // setrlimit rejects an unknown resource first, then a null `rlim`
+        // (EFAULT, since a real set dereferences it); the storage lives in the
+        // task table, so a host build accepts an in-range set and changes
+        // nothing.
         assert_eq!(
             handle_setrlimit([16, 0, 0, 0, 0, 0], false),
             crate::syscall::err::EINVAL
         );
+        assert_eq!(
+            handle_setrlimit([3, 0, 0, 0, 0, 0], false),
+            crate::syscall::err::EFAULT
+        );
+    }
+
+    /// The `setrlimit` rule, on its own: soft may not exceed hard, and only
+    /// root may lift a hard ceiling - lowering is always allowed.
+    #[test]
+    fn setrlimit_admits_by_privilege() {
+        let e_einval = crate::syscall::err::EINVAL;
+        let e_eperm = crate::syscall::err::EPERM;
+        // Soft above hard is EINVAL, root or not.
+        assert_eq!(rlimit_admit(Rlimit { cur: 10, max: 20 }, Rlimit { cur: 30, max: 20 }, true).err(), Some(e_einval));
+        // An unprivileged process may not raise the hard limit...
+        assert_eq!(rlimit_admit(Rlimit { cur: 10, max: 20 }, Rlimit { cur: 10, max: 40 }, false).err(), Some(e_eperm));
+        // ...but root may, and anyone may lower it or hold it.
+        assert!(rlimit_admit(Rlimit { cur: 10, max: 20 }, Rlimit { cur: 10, max: 40 }, true).is_ok());
+        assert!(rlimit_admit(Rlimit { cur: 10, max: 20 }, Rlimit { cur: 5, max: 10 }, false).is_ok());
+        assert!(rlimit_admit(Rlimit { cur: 20, max: 20 }, Rlimit { cur: 20, max: 20 }, false).is_ok());
+        // The startup table: an 8 MiB stack, a 1024/1M descriptor ceiling.
+        let d = default_rlimits();
+        assert_eq!((d[3].cur, d[3].max), (8 * 1024 * 1024, 8 * 1024 * 1024));
+        assert_eq!((d[5].cur, d[5].max), (1024, 1_048_576));
+        assert_eq!((d[0].cur, d[0].max), (u64::MAX, u64::MAX));
     }
 
     /// `sched_setaffinity(2)`/`sched_getaffinity(2)`: one CPU, so the mask
@@ -1977,20 +2444,114 @@ mod tests {
         );
     }
 
-    /// `membarrier(2)`: on one core every command is already satisfied, so
-    /// the known ones answer success and an unknown one is EINVAL.
+    /// `membarrier(2)`: what `QUERY` advertises and what the handler accepts are
+    /// one word, so these checks are really about the *refusals* - the commands
+    /// that are named in Linux's ABI, are plausible, and would be promises this
+    /// kernel cannot keep.
     #[test]
-    fn membarrier_answers_known_commands_and_refuses_the_rest() {
-        assert_eq!(handle_membarrier([0, 0, 0, 0, 0, 0]), 0); // CMD_QUERY
-        assert_eq!(handle_membarrier([1, 0, 0, 0, 0, 0]), 0); // CMD_GLOBAL
-        assert_eq!(handle_membarrier([8, 0, 0, 0, 0, 0]), 0); // CMD_PRIVATE_EXPEDITED
+    fn membarrier_advertises_exactly_what_it_accepts() {
+        let query = handle_membarrier([MEMBARRIER_CMD_QUERY, 0, 0, 0, 0, 0]);
+        assert_eq!(query as usize, MEMBARRIER_SUPPORTED);
+        // QUERY names no processor, so flags are not its business.
         assert_eq!(
-            handle_membarrier([2, 0, 0, 0, 0, 0]),
-            crate::syscall::err::EINVAL
+            handle_membarrier([MEMBARRIER_CMD_QUERY, MEMBARRIER_CMD_FLAG_CPU, 0, 0, 0, 0]),
+            err::EINVAL
+        );
+
+        // Every advertised command is answered, registration ones included -
+        // which is the part that used to be refused, and the part musl's
+        // `pthread_create` actually asks for.
+        assert_eq!(
+            handle_membarrier([MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0, 0, 0, 0]),
+            0
         );
         assert_eq!(
-            handle_membarrier([16, 0, 0, 0, 0, 0]),
-            crate::syscall::err::EINVAL
+            handle_membarrier([MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(handle_membarrier([MEMBARRIER_CMD_GLOBAL, 0, 0, 0, 0, 0]), 0);
+
+        // The two commands named in the ABI and deliberately not advertised:
+        // `SYNC_CORE` (32) and `RSEQ` (128), with their registrations.
+        for command in [32usize, 64, 128, 256] {
+            assert_eq!(
+                handle_membarrier([command, 0, 0, 0, 0, 0]),
+                err::EINVAL,
+                "command {command}"
+            );
+            assert_eq!(
+                query as usize & command,
+                0,
+                "command {command} must not be advertised"
+            );
+        }
+
+        // A command word is one command: two of our own bits is two at once.
+        assert_eq!(
+            handle_membarrier([
+                MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_PRIVATE_EXPEDITED,
+                0,
+                0,
+                0,
+                0,
+                0
+            ]),
+            err::EINVAL
+        );
+    }
+
+    /// An expedited barrier this process never registered for is `EPERM`, not a
+    /// shrug: the caller asked for a guarantee and has not done the bookkeeping
+    /// that buys it. The host has nothing registered, so both arms are here.
+    #[test]
+    fn membarrier_refuses_an_unregistered_expedited_barrier() {
+        assert_eq!(
+            handle_membarrier([MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0, 0, 0, 0]),
+            err::EPERM
+        );
+        assert_eq!(
+            handle_membarrier([MEMBARRIER_CMD_GLOBAL_EXPEDITED, 0, 0, 0, 0, 0]),
+            err::EPERM
+        );
+    }
+
+    /// `MEMBARRIER_CMD_FLAG_CPU` makes the third argument meaningful, and only
+    /// the global expedited barrier takes a processor to act on.
+    #[test]
+    fn membarrier_only_lets_the_global_barrier_name_a_cpu() {
+        // The machine has one processor, numbered zero.
+        assert_eq!(
+            handle_membarrier([
+                MEMBARRIER_CMD_GLOBAL_EXPEDITED,
+                MEMBARRIER_CMD_FLAG_CPU,
+                0,
+                0,
+                0,
+                0
+            ]),
+            err::EPERM, // named correctly, but this process registered nothing
+        );
+        // A processor that is not there, and a private barrier that has no
+        // business naming one at all.
+        assert_eq!(
+            handle_membarrier([
+                MEMBARRIER_CMD_GLOBAL_EXPEDITED,
+                MEMBARRIER_CMD_FLAG_CPU,
+                1,
+                0,
+                0,
+                0
+            ]),
+            err::EINVAL
+        );
+        assert_eq!(
+            handle_membarrier([MEMBARRIER_CMD_GLOBAL, MEMBARRIER_CMD_FLAG_CPU, 0, 0, 0, 0]),
+            err::EINVAL
+        );
+        // A flag word nobody defined.
+        assert_eq!(
+            handle_membarrier([MEMBARRIER_CMD_GLOBAL, 1 << 8, 0, 0, 0, 0]),
+            err::EINVAL
         );
     }
 
@@ -2052,6 +2613,7 @@ mod tests {
         // fcntl(2)'s AT_* and *at relatives
         assert_eq!(AT_FDCWD, -100);
         assert_eq!(AT_SYMLINK_NOFOLLOW, 0x100);
+        assert_eq!(AT_SYMLINK_FOLLOW, 0x400);
         assert_eq!(AT_EMPTY_PATH, 0x1000);
         assert_eq!(AT_REMOVEDIR, 0x200);
         // poll(2)

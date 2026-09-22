@@ -1,27 +1,51 @@
-# rootfs configuration for mpos
-# This file specifies additional packages and configuration for the root filesystem
+# rootfs.toml - what the guest image contains, and what it boots on.
+#
+# Read by `cargo xtask disk`, `rootfs`, `initramfs` and `run`. The parser is a
+# small one: `key = value`, one array per key (which may be written across
+# several lines), and the section headers are for the reader - the keys are what
+# the build looks up, and each one appears once in this file.
+#
+# A file that does not need a value from here lives in `rootfs/` as a real file
+# instead: /etc/inittab, /etc/network/interfaces, /etc/resolv.conf and
+# /etc/doas.conf are all editable there, and everything written from this file
+# is applied before the overlay - so a file in the tree wins.
 
 [rootfs]
 # Alpine mirror URL
 mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
 # Alpine branch
-branch = "latest-stable"
+branch = "edge"
 # Architecture
 arch = "x86_64"
-# Filesystem type
-filesystem = "ext2"
-# Root device in the guest
+# The repository components to fetch, in this order: apk takes a package from
+# the first repository that has it, so `main` before `community` is what keeps a
+# package that exists in both coming from the one it belongs to.
+repos = ["main", "community"]
+# Filesystem for the root partition. This kernel routes ext2, ext3 and ext4 to
+# the same driver, so any of the three boots; ext4 is what the image ships.
+filesystem = "ext4"
+# How the guest sees the root device (virtio disk in QEMU)
 root_device = "/dev/vda2"
-# Serial port
+# Serial port the kernel's console goes to
 serial_port = "ttyS0"
-# Image size
+# Disk image size
 image_size = "2G"
+# EFI System Partition size. It holds the loader, the kernel and the initramfs
+# and nothing else, so it only has to grow if those do.
+esp_size = "128M"
+# `mke2fs -O` features, comma-separated. The driver cannot honour two of the
+# defaults: a journal (nothing here replays one, and a crash would leave the
+# filesystem asking for a recovery this kernel cannot do) and metadata checksums
+# (every write would leave a stale one behind). An empty list means "whatever
+# mkfs decides".
+mkfs_options = "^has_journal,^metadata_csum"
 
 # Base packages that are always installed (do not modify unless needed)
 base_packages = ["alpine-base", "e2fsprogs", "dosfstools"]
 
-# Additional packages to install in rootfs
-# These are added on top of the base packages
+# Additional packages to install in the rootfs, on top of the base ones.
+# `doas` is the privilege escalation tool this image ships - not sudo, which is
+# deliberately absent.
 extra_packages = [
     "openrc",
     "alpine-release",
@@ -33,30 +57,44 @@ extra_packages = [
     "musl-dev",
     "gcc",
     "curl",
-    "sudo",
+    "doas",
     "fish"
 ]
 
-# Files to include in the rootfs (relative to rootfs/ directory)
-# These will be copied to the root of the rootfs
-include_files = []
-
-# Directories to include in the rootfs (relative to rootfs/ directory)
-# These will be copied recursively to the root of the rootfs
-include_dirs = []
-
-# Network configuration
-[network]
-# Interface name
-interface = "eth0"
-# DHCP configuration
-dhcp = true
-
-# System configuration
+# The machine the guest is: its name, its clock and its logins.
 [system]
-# Hostname
+# Hostname, written to /etc/hostname and /etc/hosts - and the name the guest
+# reports to QEMU's DHCP server.
 hostname = "mpos"
-# Timezone
+# Timezone. `UTC` costs nothing and needs no package; any other zone wants a
+# symlink to /usr/share/zoneinfo/<zone>, which needs `tzdata` in the list above.
 timezone = "UTC"
-# Locale
+# Locale, exported from /etc/profile.d/locale.sh. musl takes it from the
+# environment rather than from a generated table, so there is nothing else to do.
 locale = "en_US.UTF-8"
+# Root's password. Empty means "nothing to type", which is what a serial console
+# with no keyboard needs; anything else is set with chpasswd.
+root_password = ""
+
+# The account created in the guest, besides root. An empty `name` skips the
+# whole thing and leaves an image that only ever logs in as root.
+[user]
+name = "mpos"
+# Groups to add it to. `wheel` is the one /etc/doas.conf grants escalation to.
+groups = ["mpos", "wheel"]
+shell = "/usr/bin/fish"
+# Empty means the account has no password to type, like root above. Anything
+# else is set with chpasswd.
+password = ""
+
+# The machine `run` and `test` boot the image on. `MEM=…` still overrides the
+# memory for a one-off run.
+[qemu]
+memory = "1024"
+# Processors. One is QEMU's default; a second one is what exercises the kernel's
+# bring-up of another processor, which is why the option is here.
+cpus = 1
+# Appended to the QEMU command line verbatim, after everything the build
+# computes. One argument per element, and an element may not contain a comma -
+# the list is comma-separated on the way in.
+extra_args = []

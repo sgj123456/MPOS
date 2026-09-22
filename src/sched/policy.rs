@@ -22,19 +22,17 @@ pub const BANDS: usize = 4;
 /// take. The syscall layer enforces the same limits on the argv blob it reads
 /// from ring 3, so these bounds decide `spawn()`'s error cases too.
 ///
-/// The block lands on one stack page, so the hard ceiling is that page minus
-/// the pointer words and auxv - Linux allows megabytes, but a budget just
-/// under one page's worth of strings is what this kernel keeps: OpenRC's
-/// service environment, and a real compiler's exported state
-/// (COLLECT_GCC_OPTIONS, COMPILER_PATH, LIBRARY_PATH and the rest of what
-/// `gcc` hands a subprocess through `posix_spawn`), all fit under it. The
-/// first draft's 2048 was the "few hundred bytes a string" guess, and a
-/// `gcc` exporting its full option vector blew past it.
-///
-/// These live here rather than in `runtime` because the syscall layer checks
-/// them on the host too, where `runtime` is not compiled at all.
-pub const ARGV_MAX: usize = 64;
-pub const ARGS_BYTES_MAX: usize = 3072;
+/// The block lands on the pages a program starts with - 64 KiB - and it may
+/// span them, as it does on Linux: a block that has to fit one page is not a
+/// budget, it is a cliff. A *program* is not a pathname either - `fish` runs
+/// a completion helper with an `awk` script as one argument, several
+/// kilobytes of it - and the earlier 3072 refused it with `Name is too long`
+/// before the helper ever ran. Linux's own ceiling is megabytes
+/// (`ARG_MAX`, a quarter of the stack); this is the same shape at the size of
+/// the stack a program actually starts with, with room for the pointer words
+/// and auxv the block carries alongside the strings.
+pub const ARGV_MAX: usize = 512;
+pub const ARGS_BYTES_MAX: usize = 32 * 1024;
 
 const _: () = assert!(BANDS > 0, "a scheduler with no bands cannot queue anything");
 

@@ -141,26 +141,43 @@ fn banner(info: &BootInfo) {
 /// boot task rather than returning - a system that stops running itself is not
 /// a system.
 fn kernel_main(info: &BootInfo) {
+    // The milestone checks prove each subsystem in isolation, but they are pure
+    // probes: `check_arch` busy-waits half a second and `check_sched` sleeps out
+    // several more ticks, so on an ordinary boot they are nothing but latency
+    // and serial chatter between the real initialisation and init. They run only
+    // when the command line carries `mpos.selftest` - which `cargo xtask test`
+    // adds and the real rootfs boot does not - so a normal boot pays none of it.
+    let selftest = boot::cmdline().split_whitespace().any(|a| a == "mpos.selftest");
+
     init_mm();
-    check_mm(info);
+    if selftest {
+        check_mm(info);
+    }
 
     init_arch(info);
-    check_arch(info);
+    if selftest {
+        check_arch(info);
+    }
 
     init_sched();
-    check_sched();
+    if selftest {
+        check_sched();
+    }
 
     init_vfs(info);
-    check_vfs();
+    if selftest {
+        check_vfs();
+    }
 
     init_blk();
     init_net();
 
     mpos::rand::init();
 
-    check_ipc();
-
-    check_boot_stack(info, "after the self-tests");
+    if selftest {
+        check_ipc();
+        check_boot_stack(info, "after the self-tests");
+    }
 
     println!("All ready!");
 
@@ -268,13 +285,6 @@ fn ensure_child(dir: &Arc<dyn Inode>, name: &str, kind: NodeKind) -> Arc<dyn Ino
     }
 }
 
-/// The Alpine release the root filesystem is built from, as
-/// `/etc/alpine-release` spells it. Kept in step with `scripts/fetch-alpine.sh`
-/// by hand: the kernel asserts on it, so a silent version bump in the packaging
-/// shows up here rather than as a userland that is not the one that was tested.
-#[allow(dead_code)]
-const ALPINE_RELEASE: &str = "3.24.1";
-
 fn init_vfs(info: &BootInfo) {
     vfs::file::init_standard(vfs::tty::init());
 
@@ -318,7 +328,8 @@ fn init_blk() {
     );
     blk::set_raw_disk(dev.clone());
 
-    // The data partition is a second ext2 filesystem, and it is the only thing
+    // The data partition is a second disk filesystem - ext2 or ext4, whichever
+    // the image builder made; the same driver reads both - and it is the only thing
     // on the disk the kernel reads for its own sake rather than to hand to
     // userland - seed files laid down by the image builder, so that a check can
     // read something the machine did not write. Not every layout has room for
@@ -330,12 +341,14 @@ fn init_blk() {
         println!("blk: no data partition on this disk, so /mnt stays empty");
         return;
     };
+    let fs = vfs::ext4::Ext4Fs::mount(data.clone()).expect("the data image did not mount");
+    // What it is on disk is the filesystem's own answer: ext2 and ext4 take
+    // different names from the same driver.
     println!(
-        "ext2: filesystem on a {}-sector partition",
+        "{}: {}-sector partition",
+        fs.name(),
         data.capacity_sectors()
     );
-
-    let fs = vfs::ext2::Ext2Fs::mount(data.clone()).expect("the ext2 image did not mount");
     vfs::mount("/mnt", &fs).expect("mount /mnt");
     DATA_DEV.call_once(|| data);
 }
@@ -1363,5 +1376,57 @@ fn park() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("\nKERNEL PANIC: {}", info);
+    stack_scan();
     drivers::qemu::exit(drivers::qemu::EXIT_FAILURE)
+}
+
+/// How much of the running task's kernel stack is in use, and whether it is
+/// still inside its own block at all.
+///
+/// A wild write and a stack that ran off its bottom look the same from the
+/// place the damage is noticed - a collection's bookkeeping is wrong - and
+/// they want opposite investigations. The one number that separates them is
+/// how far the stack pointer has come down from the top of the block it was
+/// given: a stack still thousands of bytes above its base did not overflow,
+/// and one sitting at or below the base did.
+#[cfg(target_arch = "x86_64")]
+fn report_stack_use() {
+    let mut rsp: usize;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem)) };
+    match crate::sched::current_stack_range() {
+        Some((base, top)) => println!(
+            "  kernel stack: rsp {rsp:#x} of [{base:#x}..{top:#x}), {} bytes in use, \
+             {} bytes to spare",
+            top.saturating_sub(rsp),
+            rsp.saturating_sub(base)
+        ),
+        None => println!("  kernel stack: rsp {rsp:#x}, not a task stack"),
+    }
+}
+
+/// Dump the return addresses sitting on the stack above the panic handler.
+///
+/// A panic names where core *noticed* the problem, which is rarely where it
+/// was caused: `slice::get_unchecked` fires deep inside a collection whose
+/// bookkeeping a write somewhere else broke, and the location line points at
+/// core, not at the culprit. The stack is the only trail back, and the words
+/// worth following are the ones in the kernel's own address range - return
+/// addresses into code, which `rip_symbol.py` turns into a function name and
+/// an offset. Everything else on the stack is data, so it is skipped rather
+/// than dumped as noise.
+#[cfg(target_arch = "x86_64")]
+fn stack_scan() {
+    const KERNEL_TEXT: usize = 0xffff_ffff_8000_0000;
+    report_stack_use();
+    crate::syscall::trail::dump();
+    let mut rsp: usize;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem)) };
+    println!("  stack from {rsp:#x}, kernel-text words only:");
+    let words = unsafe { core::slice::from_raw_parts(rsp as *const u64, 64) };
+    for (i, word) in words.iter().enumerate() {
+        let value = *word as usize;
+        if value >= KERNEL_TEXT {
+            println!("    rsp+{:3} {:#018x}", i * 8, value);
+        }
+    }
 }

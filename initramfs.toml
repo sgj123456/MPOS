@@ -1,13 +1,19 @@
-# initramfs configuration for mpos
-# This file specifies additional packages to install in the initramfs
+# initramfs.toml - what the early userspace contains.
+#
+# Read by `cargo xtask initramfs`, which packs the archive the kernel unpacks as
+# its first root filesystem. It wants a shell, the tools to mount with, and
+# `/init` - which is a file in the `initramfs/` tree, applied as an overlay, so
+# editing it is editing a script and not this crate.
 
 [initramfs]
 # Alpine mirror URL
 mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
 # Alpine branch
-branch = "latest-stable"
+branch = "edge"
 # Architecture
 arch = "x86_64"
+# The repository components to fetch, in the order apk should look in them.
+repos = ["main", "community"]
 
 # Base packages that are always installed (do not modify unless needed)
 base_packages = ["busybox", "alpine-baselayout", "apk-tools"]
@@ -15,11 +21,3 @@ base_packages = ["busybox", "alpine-baselayout", "apk-tools"]
 # Additional packages to install in initramfs
 # These are added on top of the base packages
 extra_packages = []
-
-# Files to include in the initramfs (relative to initramfs/ directory)
-# These will be copied to the root of the initramfs
-include_files = []
-
-# Directories to include in the initramfs (relative to initramfs/ directory)
-# These will be copied recursively to the root of the initramfs
-include_dirs = []

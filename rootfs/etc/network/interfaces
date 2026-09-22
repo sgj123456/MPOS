@@ -1,0 +1,14 @@
+# The network the guest comes up on.
+#
+# `eth0` is the virtio-net device QEMU attaches (`-device virtio-net-pci`), and
+# the address comes from QEMU's user-mode network, which is a DHCP server on
+# 10.0.2.0/24 with the host reachable as 10.0.2.2 and its resolver as 10.0.2.3.
+#
+# This file is the configuration for the network: a static address, a second
+# interface or a bridge goes here, not into the build. The two hook directories
+# are what the post-up/post-down lines invoke.
+auto eth0
+iface eth0 inet dhcp
+
+post-up /etc/network/if-post-up.d/*
+post-down /etc/network/if-post-down.d/*

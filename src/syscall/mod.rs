@@ -66,7 +66,18 @@ pub mod err {
     pub const EINVAL: isize = -22;
     pub const ENOMEM: isize = -12;
     pub const EFBIG: isize = -27;
+    /// EMFILE: the process has run out of its descriptor allowance - the
+    /// `RLIMIT_NOFILE` ceiling. Linux's errno for an fd allocation that would
+    /// land at or above the soft limit, and what `open`/`dup`/`pipe` answer once
+    /// a program has used up its file descriptors.
+    pub const EMFILE: isize = -24;
     pub const ENOSPC: isize = -28;
+    /// ESPIPE: a seek on something that has no position - a pipe, a socket, a
+    /// terminal. It is `lseek(2)`'s own answer, and a load-bearing one: a
+    /// reader that has taken more bytes than it wanted pushes the rest back by
+    /// seeking, so a kernel that answers "fine" instead makes the caller drop
+    /// them.
+    pub const ESPIPE: isize = -29;
     pub const ERANGE: isize = -34;
     pub const EPIPE: isize = -32;
     pub const ENOSYS: isize = -38;
@@ -138,6 +149,65 @@ pub mod err {
 /// How many register arguments a syscall may pass.
 pub const ARG_COUNT: usize = 6;
 
+/// The file-creation mask every process starts with, and the one a host build
+/// reports: `022`, so a file made with the usual `0666` arrives `0644` and a
+/// directory made with `0777` arrives `0755` - which is what init's own
+/// `umask 022` leaves behind.
+pub const DEFAULT_UMASK: u32 = 0o022;
+
+/// The last few system calls the kernel entered, for the panic handler.
+///
+/// A panic names the place the damage was *noticed*, and in a kernel that is
+/// routinely a whole system call after the write that caused it: the fault is
+/// a collection reading its own bookkeeping wrong, and the write that broke
+/// it was in whatever ran before. The one question worth answering first is
+/// therefore which call the machine was actually in, and a ring of the last
+/// few answers it without guessing. The entries are the number and the first
+/// two arguments - enough to tell a `linkat` from a `write`, which is the
+/// whole of what it is for - and the cost is a handful of relaxed stores per
+/// call, cheap enough to leave on.
+///
+/// Machine-only, like the dispatch it records: a host build has no console to
+/// print the ring to, and nothing that panics for want of it.
+#[cfg(target_os = "none")]
+pub mod trail {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// How many calls are remembered. Eight is deep enough to see a pattern
+    /// (a loop of `openat`/`write`/`close`) and short enough to read off a
+    /// serial line in one glance.
+    pub const DEPTH: usize = 8;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static NR: [AtomicUsize; DEPTH] = [const { AtomicUsize::new(0) }; DEPTH];
+    static A0: [AtomicUsize; DEPTH] = [const { AtomicUsize::new(0) }; DEPTH];
+    static A1: [AtomicUsize; DEPTH] = [const { AtomicUsize::new(0) }; DEPTH];
+
+    /// Record one call, at dispatch entry - before anything can go wrong.
+    pub fn note(nr: u64, args: [usize; super::ARG_COUNT]) {
+        let at = NEXT.fetch_add(1, Ordering::Relaxed) % DEPTH;
+        NR[at].store(nr as usize, Ordering::Relaxed);
+        A0[at].store(args[0], Ordering::Relaxed);
+        A1[at].store(args[1], Ordering::Relaxed);
+    }
+
+    /// Print the ring, oldest first.
+    pub fn dump() {
+        let next = NEXT.load(Ordering::Relaxed);
+        let count = next.min(DEPTH);
+        crate::println!("  last {count} syscalls, oldest first (number, arg0, arg1):");
+        for i in 0..count {
+            let at = (next + DEPTH - count + i) % DEPTH;
+            crate::println!(
+                "    nr {:3} {:#x} {:#x}",
+                NR[at].load(Ordering::Relaxed),
+                A0[at].load(Ordering::Relaxed),
+                A1[at].load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 /// Upper bound on a single read or write.
 pub(crate) const MAX_IO: usize = 1 << 20;
 
@@ -172,6 +242,8 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::CrossDevice => err::EXDEV,
         // EAGAIN, which is also EWOULDBLOCK: they are one errno here.
         VfsError::Again => err::EWOULDBLOCK,
+        // EMFILE: the descriptor allowance is spent.
+        VfsError::TooManyDescriptors => err::EMFILE,
         // ECANCELED: a timerfd whose CANCEL_ON_SET clock was set - the
         // read that would have counted its expirations reports the undoing
         // instead, which is timerfd_create(2)'s wording of the case.
@@ -179,6 +251,11 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         // ENXIO: the device's name answers nothing for this caller. `/dev/tty`
         // without a controlling terminal is the whole case - POSIX's own
         // answer, and the one a shell reads as "job control off".
+        // EACCES and EPERM, the two answers a permission check gives: the
+        // first says the caller's identity may not, the second says the
+        // operation is refused for a reason the bits cannot express.
+        VfsError::Access => err::EACCES,
+        VfsError::NotPermitted => err::EPERM,
         VfsError::NoDevice => err::ENXIO,
     }
 }
@@ -230,8 +307,14 @@ pub(crate) fn cstr_env(ptr: usize, from_user: bool) -> Result<alloc::string::Str
 
 /// The per-string ceiling of `execve`'s arrays. Linux's own limit is
 /// `MAX_ARG_STRLEN` = 32 pages minus a byte - 131071 - for each of argv and
-/// envp; this takes the same shape at a scale the argument block can hold.
-pub(crate) const MAX_ARG_STR: usize = 4095;
+/// envp, and a string may be as large as the whole argument block; this takes
+/// the same shape at the scale of the stack a program starts with.
+///
+/// It has to be generous for the same reason the block below is: a *program*
+/// is not a pathname. `fish`'s completion machinery runs a helper with an
+/// `awk` script as one argument - several kilobytes of it - and a per-string
+/// ceiling of a page refused it with `Name is too long` before `awk` ever ran.
+pub(crate) const MAX_ARG_STR: usize = crate::sched::ARGS_BYTES_MAX;
 
 fn cstr_limit(ptr: usize, from_user: bool, limit: usize) -> Result<alloc::string::String, isize> {
     if ptr == 0 {
@@ -308,6 +391,7 @@ pub fn linux_dispatch(
     from_user: bool,
     regs_ptr: *mut (),
 ) -> isize {
+    trail::note(nr, args);
     // Fire an interval timer that came due while the task was in ring 3. The
     // clock covers a spinning task and the scheduler covers an idle core;
     // this covers the third state - a task in and out of syscalls - so no

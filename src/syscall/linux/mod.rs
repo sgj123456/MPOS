@@ -47,6 +47,17 @@ pub fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
 
 #[cfg(target_os = "none")]
 pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -> isize {
+    // SECCOMP_MODE_STRICT is on for this thread. Only the four calls a
+    // condemned process still needs survive: read, write, exit and the
+    // signal-return trampoline. Anything else is fatal - the filtered call
+    // never reaches the handlers below and this thread gets SIGKILL, matching
+    // the `do_exit(SIGKILL)` Linux runs on a strict-mode violation.
+    if crate::sched::current_is_seccomp_strict()
+        && !matches!(nr, nr::READ | nr::WRITE | nr::EXIT | nr::RT_SIGRETURN)
+    {
+        crate::sched::send_signal(crate::sched::current(), crate::sched::signal::SIGKILL);
+        return err::ENOSYS;
+    }
     let ret = match nr {
         // --- file I/O: Linux argument shapes ---
         nr::READ => fs::handle_read(args, from_user),
@@ -183,7 +194,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::MUNMAP => proc::handle_munmap(args),
         nr::MPROTECT => proc::handle_mprotect(args),
         nr::MREMAP => proc::handle_mremap(args),
-        nr::MADVISE => 0, // stub: success
+        nr::MADVISE => proc::handle_madvise(args),
 
         // --- stubs ---
         // Two spellings of one wait, with timeouts that are *not* the same
@@ -379,6 +390,19 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::MEMBARRIER => abi::handle_membarrier(args),
         nr::GET_ROBUST_LIST => abi::handle_get_robust_list(args),
 
+        // --- extended attributes: validated, then `EOPNOTSUPP` ---
+        // No filesystem here stores xattrs; the handlers check the arguments and
+        // the target and answer that the operation is not supported, so a
+        // probing caller learns "not supported on this filesystem" instead of
+        // the fall-through "no such syscall". The `l`-forms act on the symlink
+        // itself, the `f`-forms on a descriptor's file.
+        nr::GETXATTR | nr::SETXATTR | nr::REMOVEXATTR => fs::xattr_path(args, &cwd(), true),
+        nr::LGETXATTR | nr::LSETXATTR | nr::LREMOVEXATTR => fs::xattr_path(args, &cwd(), false),
+        nr::FGETXATTR | nr::FSETXATTR | nr::FREMOVEXATTR => fs::xattr_fd(args),
+        nr::LISTXATTR => fs::xattr_list_path(args, &cwd(), true),
+        nr::LLISTXATTR => fs::xattr_list_path(args, &cwd(), false),
+        nr::FLISTXATTR => fs::xattr_list_fd(args),
+
         _ => {
             // A call with no handler is worth saying out loud - once. A libc
             // probes for optional calls by number and treats ENOSYS as "not
@@ -391,7 +415,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         note_enosys(nr);
     }
     if ret == super::err::EOPNOTSUPP {
-        println!("[nr] : {nr}");
+        note_eopnotsupp(nr);
     }
     ret
 }
@@ -399,7 +423,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
 #[cfg(target_os = "none")]
 use super::err;
 #[cfg(target_os = "none")]
-use crate::{println, sched::current_cwd as cwd};
+use crate::sched::current_cwd as cwd;
 
 #[cfg(target_os = "none")]
 const ARCH_SET_GS: usize = 0x1001;
@@ -424,6 +448,35 @@ const MSR_GS_BASE: u32 = 0xC000_0101;
 fn note_enosys(nr: u64) {
     if abi::mark_missing(nr) {
         crate::print!("mpos: syscall {nr} -> ENOSYS\n");
+    }
+}
+
+#[cfg(target_os = "none")]
+/// Record that a call was asked for something this kernel will not do, naming
+/// the number once. "Not supported" is a legitimate answer a libc probes for -
+/// `O_TMPFILE` on a filesystem without it, a `SEEK_HOLE` no driver answers -
+/// and printing it on every occurrence turned one such call into a line per
+/// attempt on the console.
+fn note_eopnotsupp(nr: u64) {
+    if abi::mark_unsupported(nr) {
+        crate::print!("mpos: syscall {nr} -> EOPNOTSUPP\n");
+    }
+}
+
+/// Record that a *futex operation* answered ENOSYS, printing it the first time
+/// only.
+///
+/// The call itself is implemented and the operation is not, which is the one
+/// refusal `note_enosys` cannot describe: it is keyed by syscall number, and
+/// every one of these arrives as futex. Naming the operation is the whole
+/// difference between a log that says "something about futex is missing" and one
+/// that says which of the twenty-odd things the command word can mean is - and
+/// the answer decides whether the gap is a caller falling back or a caller
+/// losing the guarantee it asked for.
+#[cfg(target_os = "none")]
+pub(super) fn note_missing_futex_op(op: usize) {
+    if abi::mark_missing_futex_op(op) {
+        crate::print!("mpos: futex op {op:#x} -> ENOSYS\n");
     }
 }
 

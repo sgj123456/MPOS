@@ -149,13 +149,22 @@ pub struct FdTable {
     /// Indexed in lockstep with `slots`; a fresh description always starts
     /// with no flags, including one that lands on a reused or duplicated fd.
     fd_flags: Mutex<RefCell<Vec<u32>>>,
+    /// The `RLIMIT_NOFILE` soft ceiling: no descriptor may be allocated at a
+    /// number at or above it. Seeded from the default and lifted by
+    /// `setrlimit`; inherited whole across `fork`.
+    nofile: Mutex<RefCell<usize>>,
 }
+
+/// The descriptor allowance a process starts with, matching the default
+/// `RLIMIT_NOFILE` the scheduler seeds each task with.
+const DEFAULT_NOFILE: usize = 1024;
 
 impl FdTable {
     pub fn new() -> FdTable {
         FdTable {
             slots: Mutex::new(RefCell::new(Vec::new())),
             fd_flags: Mutex::new(RefCell::new(Vec::new())),
+            nofile: Mutex::new(RefCell::new(DEFAULT_NOFILE)),
         }
     }
 
@@ -217,7 +226,10 @@ impl FdTable {
     /// would be handed fd 0.
     fn push_standard(&self, tty: Arc<dyn Inode>) {
         for _ in 0..3 {
-            self.install(Arc::new(File::new(tty.clone())));
+            // The three standard descriptors are far below the ceiling the
+            // table starts with, so allocating one cannot fail; say so.
+            self.install(Arc::new(File::new(tty.clone())))
+                .expect("standard descriptors fit under the default ceiling");
         }
     }
 
@@ -238,28 +250,51 @@ impl FdTable {
         critical_section::with(|cs| {
             let slots = self.slots.borrow(cs).borrow();
             let flags = self.fd_flags.borrow(cs).borrow();
+            let nofile = *self.nofile.borrow(cs).borrow();
             *copy.slots.borrow(cs).borrow_mut() = slots.clone();
             *copy.fd_flags.borrow(cs).borrow_mut() = flags.clone();
+            *copy.nofile.borrow(cs).borrow_mut() = nofile;
         });
         copy
     }
 
-    pub fn install(&self, file: Arc<File>) -> RawFd {
+    /// Raise or lower the descriptor ceiling - what `setrlimit(RLIMIT_NOFILE)`
+    /// does to the process's table. A value past `usize`'s range (an
+    /// `RLIM_INFINITY` of `u64::MAX`) is taken as "no practical cap".
+    pub fn set_nofile(&self, n: u64) {
+        critical_section::with(|cs| {
+            *self.nofile.borrow(cs).borrow_mut() = n as usize;
+        });
+    }
+
+    /// The current ceiling, for tests and `/proc`.
+    pub fn nofile(&self) -> usize {
+        critical_section::with(|cs| *self.nofile.borrow(cs).borrow())
+    }
+
+    pub fn install(&self, file: Arc<File>) -> VfsResult<RawFd> {
         critical_section::with(|cs| {
             let mut slots = self.slots.borrow(cs).borrow_mut();
             let mut flags = self.fd_flags.borrow(cs).borrow_mut();
-            match slots.iter().position(Option::is_none) {
-                Some(slot) => {
-                    slots[slot] = Some(file);
-                    flags[slot] = 0;
-                    slot as RawFd
-                }
-                None => {
-                    slots.push(Some(file));
-                    flags.push(0);
-                    (slots.len() - 1) as RawFd
-                }
+            let cap = *self.nofile.borrow(cs).borrow();
+            let slot = match slots.iter().position(Option::is_none) {
+                Some(slot) => slot,
+                None => slots.len(),
+            };
+            // A new descriptor at or past the ceiling is EMFILE, not growth -
+            // this is the line `RLIMIT_NOFILE` draws, and the reason the table
+            // no longer grows without bound.
+            if slot >= cap {
+                return Err(VfsError::TooManyDescriptors);
             }
+            if slot == slots.len() {
+                slots.push(Some(file));
+                flags.push(0);
+            } else {
+                slots[slot] = Some(file);
+                flags[slot] = 0;
+            }
+            Ok(slot as RawFd)
         })
     }
 
@@ -271,10 +306,14 @@ impl FdTable {
         critical_section::with(|cs| {
             let mut slots = self.slots.borrow(cs).borrow_mut();
             let mut flags = self.fd_flags.borrow(cs).borrow_mut();
+            let cap = *self.nofile.borrow(cs).borrow();
             let at = (at.max(0)) as usize;
             let slot = (at..slots.len())
                 .find(|&slot| slots[slot].is_none())
                 .unwrap_or(slots.len());
+            if slot >= cap {
+                return Err(VfsError::TooManyDescriptors);
+            }
             if slot == slots.len() {
                 slots.push(Some(file));
                 flags.push(0);
@@ -420,7 +459,7 @@ pub fn init_standard(tty: Arc<dyn Inode>) {
 /// Resolve `path` and open a fresh description on it.
 pub fn open(path: &str) -> VfsResult<RawFd> {
     let inode = resolve(path)?;
-    Ok(current_table().install(Arc::new(File::new(inode))))
+    current_table().install(Arc::new(File::new(inode)))
 }
 
 /// [`open`](fn.open.html) with a caller-supplied start for relative paths.
@@ -436,7 +475,7 @@ pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
     // inode with no read and write, and the first write to it would fail.
     if let Some(fd) = inode.as_fd() {
         let file = current_table().clone_at(fd as RawFd)?;
-        return Ok(current_table().install(file));
+        return current_table().install(file);
     }
     // A name can also be a door rather than a thing: opening `/dev/ptmx`
     // mints a new pty pair and hands back that pair's master, and opening a
@@ -445,12 +484,12 @@ pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
         Some(replacement) => replacement,
         None => inode,
     };
-    Ok(current_table().install(Arc::new(File::new(inode))))
+    current_table().install(Arc::new(File::new(inode)))
 }
 
 /// Open a fresh description on an inode already in hand - a pipe end, whose
 /// channel is anonymous and has no name to resolve.
-pub fn open_inode(inode: Arc<dyn Inode>) -> RawFd {
+pub fn open_inode(inode: Arc<dyn Inode>) -> VfsResult<RawFd> {
     current_table().install(Arc::new(File::new(inode)))
 }
 
@@ -557,11 +596,30 @@ mod tests {
     fn numbers_mean_nothing_without_the_table_they_index() {
         let a = FdTable::new();
         let b = FdTable::new();
-        let fd = a.install(file_on("f"));
+        let fd = a.install(file_on("f")).unwrap();
 
         // The same number in another process's table names nothing at all.
         assert_eq!(b.get(fd).err(), Some(VfsError::BadFd));
         b.close(fd).unwrap_err();
+    }
+
+    #[test]
+    fn the_descriptor_table_honours_its_ceiling() {
+        let table = FdTable::new();
+        table.set_nofile(4);
+        // Slots 0..3 all sit below a ceiling of 4.
+        for expected in 0..4i32 {
+            assert_eq!(table.install(file_on("f")).unwrap(), expected);
+        }
+        // The fifth would land on number 4, at the ceiling: EMFILE, and no
+        // growth - the table no longer extends past RLIMIT_NOFILE.
+        assert_eq!(
+            table.install(file_on("f")).err(),
+            Some(VfsError::TooManyDescriptors)
+        );
+        // Closing one frees a slot below the ceiling, and reuse fits again.
+        table.close(1).unwrap();
+        assert_eq!(table.install(file_on("f")).unwrap(), 1);
     }
 
     #[test]
@@ -573,13 +631,13 @@ mod tests {
         assert_eq!(table.get(3).err(), Some(VfsError::BadFd));
         // Whatever it opens next lands past them: without the standard three
         // the first pipe would be handed fd 0.
-        assert_eq!(table.install(file_on("f")), 3);
+        assert_eq!(table.install(file_on("f")).unwrap(), 3);
     }
 
     #[test]
     fn dup2_points_a_second_number_at_the_same_description() {
         let table = FdTable::new();
-        let fd = table.install(file_on("f"));
+        let fd = table.install(file_on("f")).unwrap();
 
         assert_eq!(table.dup2(fd, 2).unwrap(), 2);
         assert!(Arc::ptr_eq(&table.get(fd).unwrap(), &table.get(2).unwrap()));

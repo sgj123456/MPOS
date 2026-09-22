@@ -2,7 +2,7 @@
 //!
 //! The seam here is the [`Inode`] trait. Everything above it - resolution, the
 //! fd table, later syscalls - speaks only in `Arc<dyn Inode>`; everything below
-//! it (ramfs now, devfs and tar initramfs next, ext2 after) implements the
+//! it (ramfs, devfs, the tar initramfs, the ext2/ext4 driver) implements the
 //! trait over its own storage. Operations a filesystem cannot support keep
 //! their default bodies, which return errors, so a read-only filesystem never
 //! writes a stub for `write_at`.
@@ -10,8 +10,9 @@
 //! Dentries - the name-to-inode edges - have no cache of their own yet. Each
 //! filesystem holds its edges directly (ramfs in per-directory maps), and
 //! [`mount::Vfs::resolve`] is the only walker, treating every edge as fresh.
-//! A shared dcache becomes worth its complexity when ext2 arrives with
-//! on-disk directories worth caching; nothing before then is.
+//! A shared dcache becomes worth its complexity with the disk-backed
+//! filesystems, whose directories are worth caching; the memory ones
+//! are their own cache.
 //!
 //! [`mount::Vfs`] is instantiable rather than global so tests can build
 //! isolated tables; the kernel holds one instance, exposed by [`mount_root`],
@@ -21,8 +22,9 @@ pub mod devfs;
 pub mod devpts;
 pub mod epoll;
 pub mod eventfd;
-pub mod ext2;
+pub mod ext4;
 pub mod file;
+pub mod locks;
 pub mod mount;
 pub mod path;
 pub mod pipe;
@@ -145,11 +147,22 @@ pub enum VfsError {
     /// A read or write that would block, on a descriptor the caller asked
     /// not to block on.
     Again,
+    /// EMFILE: allocating a new descriptor would put it at or above the
+    /// process's `RLIMIT_NOFILE` soft ceiling - it has used its allowance.
+    TooManyDescriptors,
     /// ECANCELED: an operation undone by something outside it - a timer
     /// whose clock was set underneath it, the `TFD_TIMER_CANCEL_ON_SET`
     /// case of timerfd_create(2), where the read that would have counted
     /// expirations reports the cancellation instead.
     Canceled,
+    /// EACCES: the caller's identity may not do this to the node - the
+    /// directory it is writing to, or the file it is opening, says so.
+    Access,
+    /// EPERM: the operation is refused for a reason the node's own bits
+    /// cannot express. One case: removing a name from a *sticky* directory
+    /// (`/tmp`, `1777`) that belongs to somebody else - which is the whole
+    /// point of the bit, and the answer Linux gives.
+    NotPermitted,
     /// ENXIO: the device's name answers nothing for this caller. `/dev/tty`
     /// is the one case: a controlling terminal is a property of the opening
     /// process, and a process that has acquired none cannot open the name at
@@ -180,6 +193,24 @@ pub trait Inode: Send + Sync {
         Err(VfsError::Unsupported)
     }
 
+    /// Create a file with no name, in this directory, and hand back the node
+    /// it is: `O_TMPFILE`.
+    ///
+    /// The caller writes it whole and then links it into the tree under the
+    /// name it wants - `apk` refreshes a repository index exactly this way, so
+    /// a fetch cannot be seen half-written. No directory entry holds it yet,
+    /// so its link count starts at zero and [`Inode::link`] is what gives it
+    /// one.
+    ///
+    /// The default refuses, which is what a filesystem without the feature
+    /// answers and what sends a caller down the named-temporary-and-rename
+    /// path it keeps for exactly this. One difference from Linux is worth
+    /// naming: an unnamed file that is never linked keeps its blocks here,
+    /// because nothing reclaims it when the last descriptor closes.
+    fn create_tmpfile(&self) -> VfsResult<Arc<dyn Inode>> {
+        Err(VfsError::Unsupported)
+    }
+
     /// Drop the child called `name` from this directory. The node it named
     /// lives on while anything still names it; the last name going is what
     /// frees it.
@@ -199,6 +230,21 @@ pub trait Inode: Send + Sync {
     fn rmdir(&self, name: &str) -> VfsResult<()> {
         let _ = name;
         Err(VfsError::Unsupported)
+    }
+
+    /// Whether this node has a *position* at all - whether `lseek(2)` on a
+    /// descriptor for it can succeed.
+    ///
+    /// A regular file and a directory do; a pipe, a socket and a terminal do
+    /// not, and Linux answers those `ESPIPE`. That refusal is load-bearing
+    /// rather than pedantic: the way a reader gives back bytes it has taken
+    /// too many of is to seek backwards, so a kernel that reports a position
+    /// for something that has none makes the caller believe the push-back
+    /// worked and throw the bytes away. `fish`'s `read` is exactly that
+    /// caller, which is why a `while read` loop over a pipe stopped after one
+    /// line here.
+    fn seekable(&self) -> bool {
+        true
     }
 
     /// Read at an absolute offset. Returns how many bytes landed in `buf`;
@@ -282,6 +328,13 @@ pub trait Inode: Send + Sync {
     /// file takes - which is a question only the node can answer. Same
     /// shape as [`Self::as_tty`], for the same reason.
     fn as_pipe(&self) -> Option<&crate::vfs::pipe::PipeEnd> {
+        None
+    }
+
+    /// The node is an eventfd, if it is one - the one place `F_SETFL`'s
+    /// `O_NONBLOCK` bit has to reach an inode that blocks on read. Same shape
+    /// as [`Inode::as_pipe`], for the same reason.
+    fn as_eventfd(&self) -> Option<&crate::vfs::eventfd::EventFd> {
         None
     }
 
@@ -384,14 +437,64 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// The node's last write, in unix seconds - what `st_mtime` reports and
+    /// what a freshness check decides by. `apk` judges a cached repository
+    /// index this way, and an epoch of zero reads as 1970: infinitely stale,
+    /// which turned every `apk add` into a re-fetch.
+    ///
+    /// The default is zero. A virtual filesystem whose nodes are not
+    /// persisted has no timestamp to report - `stat`-ing a pipe was always
+    /// epoch anything - and a persisted one that does keep times says so by
+    /// overriding this.
+    fn mtime(&self) -> u64 {
+        0
+    }
+
+    /// The node's last read, in unix seconds - `st_atime`. The default reports
+    /// the mtime, which is the honest answer for a filesystem that keeps one
+    /// clock, and matches what a `stat` used to collapse all three to.
+    fn atime(&self) -> u64 {
+        self.mtime()
+    }
+
+    /// The node's last metadata change, in unix seconds - `st_ctime`. The
+    /// default again reports the mtime; a persisted filesystem that keeps the
+    /// word on disk (ext2's `i_ctime`) overrides it.
+    fn ctime(&self) -> u64 {
+        self.mtime()
+    }
+
+    /// How many directory names reach this node - `st_nlink`. A hard link is
+    /// the second name for one inode, and the count is what tells a caller a
+    /// file has more than one. The default `0` means "this filesystem does not
+    /// track the count", and the `stat` writer then falls back to the kind's
+    /// convention (a directory's `.` and `..`). A filesystem that keeps
+    /// `i_links_count` overrides this with the real number.
+    fn nlink(&self) -> u64 {
+        0
+    }
+
     /// The permission bits (the low twelve) the filesystem stores for this
     /// node, or `0` when it carries none - the caller then falls back to what
-    /// the node's kind implies. ext2 carries the real thing, and OpenRC runs
+    /// the node's kind implies. The disk filesystems carry the real thing,
+    /// and OpenRC runs on them
     /// on it: it refuses to start any service script a `test -x` rejects, and
     /// a kernel that hands out one fixed mode per kind leaves every script
     /// 0644 and every runlevel silent.
     fn mode(&self) -> u32 {
         0
+    }
+
+    /// Whether this filesystem keeps permission bits at all.
+    ///
+    /// [`mode`](Inode::mode) answers zero both for a node nobody set a mode on
+    /// and for one deliberately set to `0000`, and a permission check cannot
+    /// tell those apart from the number alone. So the filesystem is asked
+    /// directly: one that keeps modes is policed exactly, and one that keeps
+    /// none refuses nothing rather than inventing permissions for nodes nobody
+    /// set any on.
+    fn keeps_modes(&self) -> bool {
+        false
     }
 
     /// Give the node the permission bits an archive or a `chmod` named.
@@ -404,6 +507,29 @@ pub trait Inode: Send + Sync {
     /// nowhere to put it; a caller that only *offers* the bits has to be
     /// willing to hear no.
     fn set_mode(&self, _mode: u32) {}
+
+    /// The user and group that own this node, as `stat` reports them.
+    ///
+    /// `(0, 0)` - root - is the answer for a filesystem that keeps no owner:
+    /// a ramfs the kernel built for itself, or a node from before there was a
+    /// second user. The disk filesystems carry the real thing.
+    fn owner(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    /// Store the owner. The default keeps nothing, like [`Inode::set_mode`]:
+    /// the node then answers `stat` as root's, which is what every node was
+    /// before this existed.
+    fn set_owner(&self, _uid: u32, _gid: u32) {}
+
+    /// Set the node's access and modification clocks - what `utimensat`/`futimens`
+    /// do when a caller (or `touch`) names times. The change clock moves with
+    /// the metadata, so a filesystem that keeps the three stores a fresh ctime
+    /// itself and takes only these two. The default refuses, for a filesystem
+    /// with nowhere to keep a time.
+    fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
 
     /// Name a new symbolic link in this directory. Separate from [`Inode::create`]
     /// because a link is made of a target, not just a kind - there is nothing
@@ -448,8 +574,9 @@ pub struct FsStats {
 
 /// A mounted filesystem instance: what other systems would call a superblock.
 ///
-/// The instance owns the per-mount state (ramfs: its node graph; ext2 later:
-/// its block device handle and on-disk counters) and hands out its root.
+/// The instance owns the per-mount state (ramfs: its node graph; the disk
+/// filesystems: the block device handle and on-disk counters) and hands
+/// out its root.
 pub trait FileSystem: Send + Sync {
     fn root(&self) -> Arc<dyn Inode>;
 
@@ -608,22 +735,150 @@ pub fn create_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<A
     resolve_opt(parent, start)?.create(name, NodeKind::File)
 }
 
+/// The bit set `open(2)` and `access(2)` share: read, write, execute - the
+/// numbers `access(2)` takes as its mode, and the ones each permission triad
+/// holds in its low three bits.
+pub const R_OK: u32 = 4;
+pub const W_OK: u32 = 2;
+pub const X_OK: u32 = 1;
+/// The sticky bit: a directory whose entries only its own owner (and each
+/// entry's owner) may remove.
+const S_ISVTX: u32 = 0o1000;
+/// The set-user-id and set-group-id bits. `chmod` writes them, `execve` reads
+/// them, and the rules about who may keep them belong to both: a caller who
+/// is not in a file's group cannot grant the group's authority to it.
+pub const S_ISUID: u32 = 0o4000;
+pub const S_ISGID: u32 = 0o2000;
+
+/// Whether `mode`, owned by `owner`, lets `me` do `want` - where `want` is the
+/// same bit set `open(2)` uses: 4 read, 2 write, 1 execute.
+///
+/// The triad comparison alone: whether the filesystem keeps a mode at all is
+/// [`Inode::keeps_modes`], which the callers below ask first. A `mode` of zero
+/// here means every triad is empty and nothing is permitted, which is what
+/// `chmod 000` means. `groups` is the caller's supplementary group list, so the
+/// group triad applies when the node's gid is any of them - not just the
+/// effective gid - the way Linux matches membership.
+fn permitted(mode: u32, owner: (u32, u32), want: u32, me: (u32, u32), groups: &[u32]) -> bool {
+    let bits = if me.0 == owner.0 {
+        (mode >> 6) & 7
+    } else if me.1 == owner.1 || groups.contains(&owner.1) {
+        (mode >> 3) & 7
+    } else {
+        mode & 7
+    };
+    bits & want == want
+}
+
+/// The root override, Linux's `CAP_DAC_OVERRIDE`: root passes every check
+/// without consulting the owner or the triads, with the one exception the
+/// capability keeps - execute on a non-directory still needs an execute bit set
+/// for someone, so even root cannot run a file nobody ever marked runnable, and
+/// `access(X_OK)` on a `0644` file is `EACCES` for the superuser too. This is
+/// Linux's exact behaviour; the earlier "root bypasses all" simplification is
+/// dropped in favour of matching it.
+fn root_override(mode: u32, want: u32, is_dir: bool) -> bool {
+    want & X_OK == 0 || is_dir || mode & 0o111 != 0
+}
+
+/// Whether the process whose ids are `me` may do `want` to `node`.
+///
+/// The identity is a parameter rather than something read here, because the
+/// `access` calls disagree about which pair to use: `access(2)` asks about the
+/// **real** ids - "would *this user* be able to" - while `faccessat2` with
+/// `AT_EACCESS` asks about the effective ones. Everything else asks with the
+/// effective pair, which is what the wrappers below do.
+pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()> {
+    // A filesystem that keeps no modes is not policed: refusing would mean
+    // inventing permissions for nodes nobody set any on.
+    if !inode.keeps_modes() {
+        return Ok(());
+    }
+    let mode = inode.mode();
+    let allowed = if me.0 == 0 {
+        root_override(mode, want, inode.metadata().kind == NodeKind::Dir)
+    } else {
+        permitted(mode, inode.owner(), want, me, &crate::sched::current_groups())
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(VfsError::Access)
+    }
+}
+
+/// Whether the running process may do `want` to `node`, asked for its
+/// effective ids - the check every syscall that touches a path makes.
+pub fn may_access(inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()> {
+    may_as(crate::sched::current_owner(), inode, want)
+}
+
+/// Whether the running process may **search** `dir`: look a name up in it.
+/// Execute on a directory is the permission to walk through it, and it is
+/// what every path component is checked against.
+pub fn may_search(dir: &Arc<dyn Inode>) -> VfsResult<()> {
+    may_access(dir, X_OK)
+}
+
+/// Whether the running process may **create or remove a name** in `dir`: an
+/// entry is a write to the directory, and finding where to put it is a search.
+pub fn may_create_in(dir: &Arc<dyn Inode>) -> VfsResult<()> {
+    may_access(dir, W_OK | X_OK)
+}
+
+/// Whether the running process may remove the name that `target` is, out of
+/// the directory `parent`.
+///
+/// Two rules, and the second is the one that makes a shared directory
+/// shareable. The caller needs **write permission on the directory**: a name
+/// is an entry in it, and the file's own mode says nothing about whether its
+/// entry may go - which is why `rm` on a read-only file inside a writable
+/// directory succeeds, and why the check belongs here rather than on the file.
+/// And when the directory is **sticky** (`/tmp`, `1777`), only the file's
+/// owner, the directory's owner or root may remove it: without that half, any
+/// user can delete any other user's work out of a directory everyone can
+/// write, which is precisely what the bit exists to prevent.
+///
+/// The caller is the running process, asked for its effective ids: a filesystem
+/// cannot know who is calling, and a permission check is a fact about the
+/// caller, not about the node.
+pub fn may_remove(parent: &Arc<dyn Inode>, target: &Arc<dyn Inode>) -> VfsResult<()> {
+    let me = crate::sched::current_owner();
+    // Write permission on the directory, through the same core every other
+    // check uses - so root passes here as everywhere, and the kernel's own
+    // paths, which run as root, are not refused the mount table's writes.
+    may_as(me, parent, W_OK)?;
+    // The sticky half reads the directory's own mode rather than its triads,
+    // so it is asked directly; root is not subject to it.
+    let mode = parent.mode();
+    if mode & S_ISVTX != 0 && me.0 != 0 && me.0 != target.owner().0 && me.0 != parent.owner().0 {
+        return Err(VfsError::NotPermitted);
+    }
+    Ok(())
+}
+
 /// [`unlink_path`](fn.unlink_path.html) with a caller-supplied start.
 pub fn unlink_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
     let (parent, name) = split_parent(path)?;
-    resolve_opt(parent, start)?.unlink(name)
+    let dir = resolve_opt(parent, start)?;
+    may_remove(&dir, &dir.lookup(name)?)?;
+    dir.unlink(name)
 }
 
 /// Remove the empty directory named by `path`.
 pub fn rmdir_path(path: &str) -> VfsResult<()> {
     let (parent, name) = split_parent(path)?;
-    resolve(parent)?.rmdir(name)
+    let dir = resolve(parent)?;
+    may_remove(&dir, &dir.lookup(name)?)?;
+    dir.rmdir(name)
 }
 
 /// [`rmdir_path`](fn.rmdir_path.html) with a caller-supplied start.
 pub fn rmdir_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
     let (parent, name) = split_parent(path)?;
-    resolve_opt(parent, start)?.rmdir(name)
+    let dir = resolve_opt(parent, start)?;
+    may_remove(&dir, &dir.lookup(name)?)?;
+    dir.rmdir(name)
 }
 
 #[cfg(all(test, not(target_os = "none")))]
@@ -631,7 +886,9 @@ mod tests {
     use alloc::sync::Arc;
 
     use super::mount::Vfs;
-    use super::{NodeKind, VfsError, split_parent};
+    use super::{
+        NodeKind, R_OK, VfsError, W_OK, X_OK, may_as, permitted, root_override, split_parent,
+    };
 
     #[test]
     fn a_bare_name_is_a_name_beside_the_caller() {
@@ -745,5 +1002,63 @@ mod tests {
             vfs.resolve_no_follow("missing", root).err(),
             Some(VfsError::NoEntry)
         );
+    }
+
+    #[test]
+    fn a_triad_decides_who_may_do_what() {
+        // Owner (uid 7, gid 7), mode 0640: the owner reads and writes, the
+        // group reads, and a stranger gets nothing.
+        assert!(permitted(0o640, (7, 7), R_OK, (7, 7), &[]));
+        assert!(permitted(0o640, (7, 7), W_OK, (7, 7), &[]));
+        assert!(!permitted(0o640, (7, 7), X_OK, (7, 7), &[]));
+        assert!(permitted(0o640, (7, 7), R_OK, (9, 7), &[]));
+        assert!(!permitted(0o640, (7, 7), W_OK, (9, 7), &[]));
+        assert!(!permitted(0o640, (7, 7), R_OK, (9, 9), &[]));
+        // The requested set has to be covered whole: read *and* write needs
+        // both bits, which is what `open(O_RDWR)` asks for.
+        assert!(!permitted(0o440, (7, 7), R_OK | W_OK, (7, 7), &[]));
+        assert!(permitted(0o660, (7, 7), R_OK | W_OK, (7, 7), &[]));
+        // An empty mode is `chmod 000`: every triad is empty, so nothing is
+        // permitted. That is a different thing from a filesystem that keeps
+        // no modes at all, which is what `keeps_modes` tells apart - and why
+        // the check cannot be made by looking at the number.
+        assert!(!permitted(0, (7, 7), R_OK, (7, 7), &[]));
+        assert!(!permitted(0, (7, 7), R_OK, (9, 9), &[]));
+        // Linux matches the group triad against the supplementary groups too:
+        // uid 9 is no group member by `egid` (9), but a member via the list, so
+        // the group's read bit applies to it.
+        assert!(permitted(0o640, (7, 7), R_OK, (9, 9), &[7]));
+        assert!(!permitted(0o640, (7, 7), W_OK, (9, 9), &[7]));
+    }
+
+    #[test]
+    fn root_passes_everything_but_execute_on_a_file_nobody_made_runnable() {
+        // Root overrides the triads outright...
+        assert!(root_override(0o000, R_OK | W_OK, false));
+        // ...including search on a directory.
+        assert!(root_override(0o000, X_OK, true));
+        // Linux's `CAP_DAC_OVERRIDE` keeps one exception: execute on a plain
+        // file needs an x bit for someone, and root is not above it.
+        assert!(!root_override(0o666, X_OK, false));
+        assert!(root_override(0o111, X_OK, false));
+    }
+
+    #[test]
+    fn may_as_answers_for_the_node_and_the_identity_it_is_given() {
+        let vfs = Vfs::new();
+        let fs = crate::vfs::ramfs::RamFs::new();
+        vfs.mount_root(&*fs);
+        let root = vfs.resolve("/").unwrap();
+        let file = root.create("f", NodeKind::File).unwrap();
+        file.set_mode(0o600);
+        file.set_owner(10, 10);
+
+        // The owner may read it, a stranger may not, and root may regardless.
+        assert_eq!(may_as((10, 10), &file, R_OK).ok(), Some(()));
+        assert_eq!(may_as((11, 11), &file, R_OK).err(), Some(VfsError::Access));
+        assert_eq!(may_as((0, 0), &file, R_OK).ok(), Some(()));
+        // A node the filesystem kept no mode for is not policed.
+        let bare = root.create("bare", NodeKind::File).unwrap();
+        assert_eq!(may_as((11, 11), &bare, R_OK | W_OK | X_OK).ok(), Some(()));
     }
 }

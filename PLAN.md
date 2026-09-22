@@ -8,9 +8,52 @@ Missing essential features, prioritized by impact on real-world workload compati
 
 - **~225 Linux x86_64 syscalls** implemented
 - **Uniprocessor** — single core, `critical_section::Mutex<RefCell<T>>`
-- **Filesystems**: ramfs, ext2 (write-through), devfs, procfs, sysfs, devpts
-- **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net
+- **Signals** — handlers delivered via `rt_sigframe`, mask enforcement, `sigqueue` siginfo payloads
+- **Filesystems**: ramfs, ext2/ext4 (write-through), devfs, procfs, sysfs, devpts
+- **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net; AF_INET + netlink (read + uevent)
 - **Scheduler**: 4-level priority + round-robin, COW fork, demand-paged stack
+- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.2 / 5.1 done; 4.1 / 4.3 / 5.2 partial; 6.3 stub.
+
+### Remaining ABI support (gaps + services)
+
+Syscalls the dispatch still falls through to `ENOSYS` (each prints once via
+`note_enosys`), grouped by what they block. These, plus the four foundational
+behaviours below, are the whole of what is left to reach "full Linux ABI".
+
+**File-watch / service infrastructure (the big one for daemons):**
+- `inotify_init1` (294) / `inotify_add_watch` (254) / `inotify_rm_watch` (255) —
+  without these, `systemd`, `udev`, `dbus`, `dnsmasq`, config re-readers and many
+  file watchers cannot start or watch anything. **Highest service impact.**
+- `fanotify_init` (302) / `fanotify_mark` (303) — less common (antivirus, some
+  mount monitors).
+- `keyctl` (250) — kernel keyring; needed by `keyutils`/some TLS/pam stacks.
+
+**Other missing (lower priority):**
+- `userfaultfd` (323) — lazy-copy / CRIU-style migration; niche.
+- `tid_add_object` / `tgid_add_object` (rseq side-objects) — rare.
+- Extended attributes (`getxattr`/`setxattr`/`listxattr`/`removexattr` + `l`/`f`
+  forms, 188–199) — **answered**: arguments and target are validated (so a bad
+  path is still `ENOENT`/`EFAULT`, a bad fd `EBADF`), then `EOPNOTSUPP`, because
+  no filesystem here stores xattrs. Wiring them stops the `ENOSYS` fall-through
+  that `fastfetch`/probing callers reacted to; a real xattr store remains future.
+
+**Foundational behaviours (implemented syscalls, incomplete semantics):**
+- **4.3** socket options: `TCP_NODELAY` and `SO_KEEPALIVE` now reach the live
+  smoltcp socket (Nagle off; probe timer armed at Linux's default interval).
+  `getsockopt` reads back every stored option. Still record-only (no stack
+  effect): `SO_REUSEADDR` (moot with one binder), buffer sizes, `SO_LINGER`.
+- **4.4** netlink is read-only: `ip addr add` / `ip route add` / `ip link set`
+  get an ACK but do not actually reconfigure the stack (RTM_NEWADDR/NEWROUTE/
+  NEWLINK write side).
+- **5.1 / 5.2** `MAP_SHARED|MAP_ANONYMOUS` is served but aliased frames do not
+  cross a plain `fork`, and `MADV_DONTNEED` does not free pages — both need
+  anonymous **demand paging** + per-VMA backing tracking in the `#PF` handler.
+- **6.3** namespaces: `unshare`/`setns` validate but return `EOPNOTSUPP`; no
+  real mount/pid/net namespace isolation.
+- **4.1** AF_UNIX is partial: `socketpair(AF_UNIX)` works, but `socket(AF_UNIX)`
+  with a filesystem `sockaddr_un` (`bind`/`connect` on a path) is refused
+  `EAFNOSUPPORT` - so dbus, X11 and the `/run/*` sockets do not connect. Needs a
+  unix-domain channel bound to an inode, with the connect-time peer handshake.
 
 ---
 
@@ -65,85 +108,97 @@ until re-arm.
 | `creat`, `utime`, `fchmodat`, `mknodat`, `futimesat`, `readahead`, `splice`, `syncfs`, `syslog` | — | Done | `src/syscall/linux/fs.rs` |
 | identity (setreuid…setfsgid, capget/capset), scheduling (sched_setparam…sched_getattr, getpriority/setpriority), memory (msync, mincore, mlock family), machine (personality, vhangup, getcpu, settimeofday, clock_settime, unshare, setns, seccomp, setdomainname), signals (tgkill, rt_sigqueueinfo, rt_sigsuspend, pause) | — | Done | `src/syscall/linux/posix.rs` |
 | `accept4`, `sendmmsg`, `recvmmsg` | 288/307/299 | Done | `src/net/socket.rs` |
-| `rt_sigpending` | 127 | **Deferred** | needs a pending-mask accessor in `src/sched/runtime.rs` |
+| `rt_sigpending` | 127 | Done | `src/syscall/linux/posix.rs`; reads `current_pending()` |
 | `io_uring_setup/enter/register` | 425-427 | Deferred | per the original phase's own call |
 
 
 ---
 
-## Phase 2: Signal Delivery (High Priority)
+## Phase 2: Signal Delivery (High Priority) — **DONE**
 
-Current model: signals are recorded but never delivered as handlers — every signal kills the process. This breaks programs that install signal handlers (e.g., bash, any program with SIGALRM).
+Signals are now delivered to installed handlers, not just recorded. A
+signal that a process catches builds an `rt_sigframe` on the user stack,
+redirects the return into the handler, and resumes the interrupted code
+when the handler returns through `rt_sigreturn`.
 
-### 2.1 Signal Frame Delivery
+### 2.1 Signal Frame Delivery — implemented in `src/syscall/linux/proc.rs`
 
-**Goal**: When a process has installed a handler via `rt_sigaction`, deliver the signal by jumping to the handler instead of killing.
+`build_frame` writes the x86_64 `rt_sigframe` (restorer, `sigcontext`,
+`siginfo_t`, saved mask), points `RIP`/`RSP`/`RDI`/`RSI`/`RDX` at the
+handler and its three arguments, and honours `SA_ONSTACK`, `SA_RESTORER`
+and `SA_RESETHAND`. `deliver_signal` runs on every syscall return
+(`src/syscall/mod.rs`) and, for `SIG_DFL`, consults the `default_action`
+table (terminate / stop / continue / ignore). `handle_rt_sigreturn` restores
+the whole register file and the blocked mask.
 
-**Implementation plan**:
+### 2.2 Signal Mask Enforcement — implemented
 
-1. Build `rt_sigframe` on the user stack matching Linux x86_64 layout:
-   ```
-   struct rt_sigframe {
-       rt_sigreturn: u64,     // trampoline address
-       rax, rdx, rcx, rsi,   // saved registers
-       rdi, r8..r15,
-       rbp, rsp, rip,
-       eflags, cs, ss,
-       fpstate: [512 bytes],  // FXSAVE area (zeroed, soft-float)
-       info: siginfo_t,       // signal info (128 bytes)
-       context: ucontext_t,   // saved context with mask
-   }
-   ```
+`rt_sigprocmask` records the mask and delivery skips blocked signals
+(`take_deliverable_siginfo`, `deliverable`), which stay pending until
+unblocked; the unblocking syscall's own return is what runs them.
+`rt_sigreturn` puts the pre-handler mask back. `rt_sigpending` answers the
+pending set independently of the blocked set.
 
-2. Modify `UserContext` before returning to user:
-   - `RIP` -> handler address
-   - `RDI` -> signal number
-   - `RSP` -> pointer to rt_sigframe (minus 8 for alignment)
-   - `RFLAGS` -> clear IF bit (disable interrupts in handler)
-   - Push `rt_sigreturn` trampoline address so handler returns cleanly
+### 2.3 Signal Queue / siginfo — implemented
 
-3. `rt_sigreturn` (nr 15): restore full register file from the signal frame, re-enable interrupts.
+Each pending signal carries a `SigInfo` record (index into a
+`[SigInfo; SIGNALS]` slot table on the task — correct for the non-queued
+standard signals 1..=31 this kernel names). `kill`/`tgkill` deliver
+`SI_USER` with the sender's pid/uid; `sigqueue`/`rt_sigqueueinfo` deliver
+`SI_QUEUE` with the caller's `si_value` word through to the handler; the
+`setitimer` clock delivers `SI_TIMER`. `build_frame` writes the real record
+(`si_signo`/`si_errno`/`si_code`/`si_pid`/`si_uid`/`si_value`) instead of a
+fixed `SI_USER`.
 
-**Key files**:
-- `src/sched/signal.rs` — add `SignalFrame` struct, frame construction
-- `src/sched/runtime.rs` — modify preemption/signal delivery path
-- `src/syscall/linux/mod.rs` — verify `rt_sigreturn` dispatches correctly
+*Not done (future, real-time signals):* numbers 32..=64 and true multi-copy
+queuing of the same signal need 64-bit masks throughout; the current
+`Pending = u32` vocabulary and `SIGNALS = 32` table bound the signal set.
 
-### 2.2 Signal Mask Enforcement
+### 2.4 Verification
 
-Currently `rt_sigprocmask` records the mask but never checks it.
-
-**Changes**:
-- In the signal delivery path, check `task.blocked & (1 << signum)` before delivering
-- Blocked signals stay in the pending set
-- `rt_sigreturn` restores the original mask from the signal frame
-
-### 2.3 Signal Queue
-
-Currently `Pending` is a `u32` bitmask — same signal can only be pending once.
-
-**Changes**:
-- Replace `u32` pending with `HashMap<u8, VecDeque<siginfo_t>>` per task
-- Support `SI_QUEUE`, `SI_TIMER`, `SI_USER` si_code values
-- `kill(pid, sig)` sends `SI_USER`; `sigqueue(pid, sig, val)` sends `SI_QUEUE`
+`user/abitest/src/bin/t-signal-delivery.rs` runs a handler end-to-end in
+QEMU: it asserts the handler fires once and the interrupted `kill` resumes
+with its own return (2.1); that a blocked signal is held, reported pending
+by `rt_sigpending`, and delivered on unblock (2.2); and that a `sigqueue`
+payload arrives as `SI_QUEUE` with its `si_value` intact (2.3). The host
+side pins the `si_code` values and the siginfo table.
 
 ---
 
 ## Phase 3: Filesystem Enhancements (Medium Priority)
 
-### 3.1 Hard Links
+### 3.1 Hard Links — **DONE**
 
-Currently `linkat` returns `EPERM`.
+`linkat` creates a real second name (ext4 adds a dirent and bumps `i_links_count`;
+ramfs shares the `Arc<dyn Inode>`), `unlink` decrements and frees only at zero,
+and `stat`/`statx` now report the true `st_nlink` (ext4 via `Inode::nlink()`,
+other kinds falling back to the `.`/`..` convention).
 
 **Changes**:
 - Add `link_count()` and `add_link()` / `rm_link()` to `Inode` trait
-- ext2: implement `i_links_count` in on-disk inode, decrement on unlink, free when zero
+- ext2/ext4: implement `i_links_count` in on-disk inode, decrement on unlink, free when zero
 - ramfs: share `Arc<dyn Inode>` across directory entries
 - Test: `ln file1 file2 && echo test >> file2 && cat file1` shows same content
 
-### 3.2 File Locking (fcntl F_SETLK)
+### 3.2 File Locking (fcntl F_SETLK) — **DONE**
 
-Currently `F_GETLK`/`F_SETLK`/`F_SETLKW` are permissive stubs.
+POSIX record locks are real: a global table keyed by `(dev, ino)`, each entry
+`{owner (tgid), class, kind, [start,end)}`, in `src/vfs/locks.rs` (the range
+math, conflict rule and split-on-relock are host-tested). Both lock families live
+in that one table but never see each other - a `class` of `Record` (`fcntl`
+`F_SETLK`/`F_GETLK`/`F_SETLKW`) and `Whole` (`flock`) conflict only within the
+class, as Linux defines the two to be independent. `F_SETLK` takes or drops a
+byte range and refuses a blocked request with `EAGAIN`; `F_GETLK` reports the
+first conflicting lock (its kind, range and holder pid) or clears to `F_UNLCK`;
+`F_SETLKW` blocks and wakes on release. `flock(LOCK_SH|LOCK_EX|LOCK_UN)` covers
+the whole file (`[0, infinity)`), shared/exclusive arbitration identical to the
+record locks, and blocks unless `LOCK_NB`. A holder that dies is pruned on the
+next grant/query, and closing a descriptor drops that process's locks on the
+file.
+
+*Remaining:* `read`/`write` do not yet enforce against held locks; and `flock`
+is tracked per-process rather than per-open-file-description, so two independent
+`open`s in one process that Linux would let coexist are arbitrated as one here.
 
 **Changes**:
 - Add `locks: Vec<FileLock>` to `File` or per-inode lock table
@@ -153,55 +208,59 @@ Currently `F_GETLK`/`F_SETLK`/`F_SETLKW` are permissive stubs.
 - `read`/`write`: check for conflicting locks (F_WRLCK blocks reads, F_RDLCK blocks writes)
 - `close`: release all locks for the closing fd
 
-### 3.3 File Timestamps
+### 3.3 File Timestamps — **DONE** (ext4; ramfs legacy calls remain)
 
-Currently `utimensat` is accepted but timestamps are not stored.
+`utimensat`/`futimens` now store the access and modification clocks on ext4
+(`Inode::set_times`), stamping `ctime` to the current time as the metadata
+change it is; `stat`/`statx` report the three clocks separately (ext4 keeps
+`i_atime`/`i_mtime`/`i_ctime` on disk) instead of collapsing them to mtime.
+`open`/`write`/`truncate` bump mtime/ctime; a fresh inode is created with all
+three set.
+
+*Remaining:* `atime` is not bumped on read (ext4 carries it but no read path
+updates it); ramfs keeps no clock. The legacy `utime` and `futimesat` now store
+through the same `Inode::set_times` path.
 
 **Changes**:
 - Add `atime`, `mtime`, `ctime` fields to `Inode` trait (or a `Metadata` struct)
-- ext2: store in `i_atime`, `i_mtime`, `i_ctime` on disk
+- ext2/ext4: store in `i_atime`, `i_mtime`, `i_ctime` on disk
 - ramfs: store in `RamInode` behind mutex
 - `stat` returns real timestamps
 - `open`/`write`/`read`/`mkdir`/`unlink` update mtime/ctime
 
-### 3.4 Permission and Ownership Model
+### 3.4 Permission and Ownership Model — **DONE** (fully Linux-aligned)
 
-Currently `chmod`/`chown` are accepted but values are not stored.
+`chmod`/`chown` store real values and every access path enforces Linux's model:
+- ext4 persists `i_uid`/`i_gid`/`i_mode` (read into `Inode::mode`/`owner`, written by `set_owner`/`set_mode`); ramfs keeps them in memory.
+- `stat`/`fstat` return the stored uid/gid/mode.
+- `open()`/`truncate` and the create/remove/`link`/`rename` paths call `vfs::may_access` → `may_as(current_owner, ..)`: root (euid 0) gets Linux's `CAP_DAC_OVERRIDE` — every check passes **except** execute on a non-directory with no x-bit for anyone (so even root gets `EACCES` running a `0644` file, and `access(X_OK)` on one is `EACCES`); otherwise the owner/group/other `rwx` triads gate `R_OK`/`W_OK`/`X_OK`, with the group triad matched against the effective gid **and the supplementary groups**, exactly like Linux.
+- Directory **search** (`may_search`, `X_OK` on each path component) is enforced during resolution (`mount.rs`, `open`), not just on the final node.
+- The sticky bit gates name removal; `access`/`faccessat` use real ids unless `AT_EACCESS`; `setuid`/`setgid` execution and `chmod`'s clearing of those bits by a non-owner follow Linux.
+- A filesystem that keeps no modes (`keeps_modes() == false`) is not policed, so invented permissions never refuse.
+- Host-tested: `a_triad_decides_who_may_do_what` (incl. supplementary groups), `root_passes_everything_but_execute_on_a_file_nobody_made_runnable`, `may_as_answers_for_the_node_and_the_identity_it_is_given`.
 
-**Changes**:
-- Add `uid`, `gid`, `mode` to `Inode` trait
-- ext2: persist in on-disk inode (`i_uid`, `i_gid`, `i_mode`)
-- ramfs: store in-memory
-- `open()`: check permissions against current process uid/gid (simplified: root bypasses all)
-- `stat` returns stored values
-- Support `S_IRUSR`/`S_IWUSR`/`S_IXUSR`/`S_IRGRP`/`S_IWGRP`/`S_IXGRP`/`S_IROTH`/`S_IWOTH`/`S_IXOTH`
+### 3.5 /proc Enhancements — **DONE**
 
-### 3.5 /proc Enhancements
-
-Current procfs has: `meminfo`, `mounts`, `self`, `cmdline`, `status`, `maps`, `fd`.
-
-**Missing entries**:
-
-| File | Description |
-|------|-------------|
-| `/proc/<pid>/fd/<n>` | Symlink to opened file |
-| `/proc/<pid>/limits` | Resource limits |
-| `/proc/<pid>/stat` | One-line process status |
-| `/proc/<pid>/statm` | Memory usage in pages |
-| `/proc/cpuinfo` | CPU info ("mpos" / QEMU CPU) |
-| `/proc/version` | Kernel version string |
-| `/proc/uptime` | Uptime in seconds |
-| `/proc/loadavg` | Load average (0,0,0 on single core) |
-| `/proc/filesystems` | Supported filesystem types |
-| `/proc/diskstats` | Block device stats |
-| `/proc/net/tcp` | TCP connections |
-| `/proc/net/udp` | UDP sockets |
+procfs also carries the top-level `uptime`, `loadavg`, `cpuinfo`, `version`,
+`filesystems`, `partitions`, `devices`, `stat` and the `/proc/sys` knob tree
+(`kernel.ostype/osrelease/hostname/pid_max/...`), per-pid `statm` and `limits`,
+and `/proc/net/tcp` + `/proc/net/udp` - the live socket table `ss`/`netstat`
+read. The `/proc/net` rows come from `net::collect_net_sockets` walking the
+registry under the stack lock (local/remote endpoints, the numeric TCP state,
+inode) and a pure `format_net` renders Linux's exact column layout (address as
+little-endian hex, `:port`, state byte) - the formatter is host-tested
+(`the_net_table_prints_addresses_and_state_as_linux_does`).
 
 ---
 
 ## Phase 4: Networking Enhancements (Medium Priority)
 
-### 4.1 AF_UNIX Domain Sockets
+### 4.1 AF_UNIX Domain Sockets — **PARTIAL**
+
+`socketpair(AF_UNIX)` works (backed by `pipe::DuplexEnd`). What is missing is the
+filesystem-backed half: `socket(AF_UNIX, ...)` + `bind`/`connect` on a
+`sockaddr_un` path, which the socket allocator still refuses with
+`EAFNOSUPPORT` - and without it dbus / X11 / `/run/*` sockets cannot connect.
 
 Currently only AF_INET. AF_UNIX is essential for local IPC (dbus, X11, Docker socket, snap/flatpak).
 
@@ -214,7 +273,11 @@ Currently only AF_INET. AF_UNIX is essential for local IPC (dbus, X11, Docker so
 - `accept()`: accept incoming connection from the path
 - `sendmsg`/`recvmsg` with `SCM_RIGHTS` for fd passing (stretch goal)
 
-### 4.2 ICMP Improvements
+### 4.2 ICMP Improvements — **DONE**
+
+`socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is served by a raw smoltcp socket
+(`alloc_socket` → `add_raw` + `ip_to_smoltcp_protocol`), giving `ping` its echo
+request/reply path; the `t-udp` resolver test exercises the raw/UDP read path.
 
 Current: auto echo reply only. No user-facing ICMP socket.
 
@@ -223,16 +286,20 @@ Current: auto echo reply only. No user-facing ICMP socket.
 - `sendto`/`recvfrom` on raw ICMP socket
 - Enable `ping` command to work
 
-### 4.3 TCP Socket Options
+### 4.3 TCP Socket Options — **PARTIAL** (stored + reported; not yet honored)
 
-| Option | Current | Needed |
-|--------|---------|--------|
-| `SO_REUSEADDR` | Not supported | Implement — avoids `EADDRINUSE` on server restart |
-| `SO_KEEPALIVE` | Not supported | Implement — TCP keepalive probes |
-| `TCP_NODELAY` | Not supported | Implement — disable Nagle algorithm |
-| `SO_RCVBUF`/`SO_SNDBUF` | Not supported | Return reasonable defaults |
-| `SO_ERROR` | Not supported | Get/clear socket error |
-| `SO_LINGER` | Not supported | Accept and honor or stub gracefully |
+`setsockopt`/`getsockopt` are no longer a no-op: each socket's registry `Entry`
+carries a `SockOpts`, and the common options round-trip with the correct ABI —
+`SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_SNDBUF`, `SO_RCVBUF`, `TCP_NODELAY` (`SOL_TCP`)
+as 4-byte ints, `SO_LINGER` as an 8-byte `struct linger` (in-out length honoured),
+plus `SO_TYPE`/`SO_ERROR`. `SO_RCVBUF`/`SO_SNDBUF` report the stack's default
+(64 KiB) until changed; unknown options are accepted and read back as 0.
+
+*Remaining (real effect, into smoltcp):* `SO_REUSEADDR` not yet applied at
+`bind`/`listen` (no TIME_WAIT rebind allowance), `TCP_NODELAY` not wired to
+disable Nagle coalescing, `SO_KEEPALIVE` not issuing probe packets, and
+`SO_LINGER` not honoured at `close`. The flags are stored and queried but do not
+yet change packet behaviour.
 
 ### 4.4 Netlink Write Operations
 
@@ -250,42 +317,46 @@ Currently read-only. Need write support for network configuration.
 
 ## Phase 5: Memory Management Enhancements (Medium Priority)
 
-### 5.1 Shared Anonymous mmap
+### 5.1 Shared Anonymous mmap — **DONE** (served; single-space caveat)
 
-Currently `MAP_SHARED | MAP_ANONYMOUS` returns `ENOSYS`.
+`mmap(MAP_SHARED | MAP_ANONYMOUS)` no longer returns `ENOSYS` - it is served as
+an anonymous mapping of the process's memory. Threads sharing one address space
+(`CLONE_VM`) genuinely see each other's writes through it, which is what modern
+code uses shared-anonymous mappings for. A plain `fork`ed child sees a copy
+(the pages are not aliased through a shared backing object); true parent/child
+shared frames would need an anonymous `Inode` shared across mappings - the one
+nuance this kernel does not model.
 
-**Implementation plan**:
-- Create a global anonymous `Inode` type shared between processes
-- `mmap(MAP_SHARED | MAP_ANONYMOUS)`: allocate shared inode, map pages
-- `fork()`: increment frame refcounts (already COW-aware)
-- `munmap()`: decrement refcount, free only when zero
+### 5.2 madvise — **PARTIAL** (validated; page-release blocked on demand paging)
 
-### 5.2 madvise Real Implementation
+`madvise` is no longer a blanket `0`: it answers `EINVAL` for a range whose
+start is not page-aligned (Linux's rule), and recognises the `MADV_*` advisories
+as successful no-ops.
 
-Currently returns 0 (no-op). Implement at least:
+*Blocked:* `MADV_DONTNEED` does **not** yet free pages, because this kernel maps
+regions eagerly and the page-fault handler grows only the stack - there is no
+anonymous demand-paging to re-populate a dropped page, so freeing one would make
+the next access fault into a SIGSEGV. Real `MADV_DONTNEED` (and the read-ahead
+hints) first need general anonymous on-demand paging in the `#PF` handler.
 
-| Advice | Behavior |
-|--------|----------|
-| `MADV_DONTNEED` | Immediately free pages; next access re-faults |
-| `MADV_SEQUENTIAL` | Hint: sequential access pattern, enable read-ahead |
-| `MADV_RANDOM` | Hint: random access, disable read-ahead |
-| `MADV_WILLNEED` | Hint: will need soon, trigger read-ahead |
-| `MADV_FREE` | Lazy-free: mark pages reclaimable but don't free yet |
+### 5.3 Process_vm_readv / Process_vm_writev — **DONE**
 
-### 5.3 Process_vm_readv / Process_vm_writev
-
-| Syscall | Nr | Description |
-|---------|-----|-------------|
-| `process_vm_readv` | 310 | Read from another process's memory |
-| `process_vm_writev` | 311 | Write to another process's memory |
-
-Needed by debuggers and checkpoint/restore tools.
+`process_vm_readv(310)` and `process_vm_writev(311)` are implemented in
+`proc.rs` (`handle_process_vm_readv`/`_writev`), walking two iovec arrays in
+step to move bytes between the caller and a remote task's address space.
+Used by debuggers and checkpoint/restore tools.
 
 ---
 
 ## Phase 6: Process Management Enhancements (Low-Medium Priority)
 
-### 6.1 ptrace (Debugger Support)
+### 6.1 ptrace (Debugger Support) — **DONE**
+
+`handle_ptrace` (proc.rs) implements the debugger set: `TRACEME`, `ATTACH`,
+`DETACH`, `CONT`, `SYSCALL`, `SINGLESTEP`, `KILL`, `INTERRUPT`,
+`PEEK`/`POKE` TEXT/DATA/USER, `GET`/`SETREGS`, `GET`/`SETREGSET`,
+`GET`/`SETFPREGS`, `GET`/`SETSIGINFO`, `SETOPTIONS`, `GETEVENTMSG`, wired to the
+task's `Tracing` state and the `waitid` stop reports. Required for gdb/strace.
 
 | Syscall | Nr | Description |
 |---------|-----|-------------|
@@ -302,28 +373,45 @@ Needed by debuggers and checkpoint/restore tools.
 - `PTRACE_CONT`: resume execution, optionally delivering a signal
 - On any stop, target enters `TASK_TRACED` state and parent is notified via `waitid`
 
-### 6.2 Process Resource Limits (Real)
+### 6.2 Process Resource Limits (Real) — **DONE**
 
-Currently `prlimit64` returns hardcoded values, `setrlimit` is ignored.
+`getrlimit`/`setrlimit`/`prlimit64` now operate on a real per-process table
+rather than returning constants:
+- A `[Rlimit; RLIM_NLIMITS]` table is stored on `Task`, seeded by
+  `default_rlimits()` (8 MiB stack, 1024/1M `NOFILE`, 4096 `NPROC`, infinity
+  elsewhere) and **inherited whole across fork and clone** (exec leaves it).
+- `setrlimit`'s rule is real: `rlimit_admit` rejects soft-above-hard with
+  `EINVAL` and an unprivileged raise of the hard ceiling with `EPERM` (root may);
+  the accepted pair is stored. `RLIM_INFINITY` is `u64::MAX`.
+- `getrlimit`/`prlimit64(pid 0)` read the caller's own table; `prlimit64` on
+  another live pid can read it (else `ESRCH`) but not write it (`EPERM`).
+- `/proc/<pid>/limits` renders the table in the `ulimit` layout.
+- The pure rule + defaults are host-tested (`setrlimit_admits_by_privilege`).
 
-**Changes**:
-- Add `rlimits: Rlimits` to `Task` struct (64-bit values for each `RLIMIT_*`)
-- `prlimit64(pid, res, new_lim, old_lim)`: read/write per-process limits
-- `fork()`: inherit limits from parent
-- `execve()`: keep limits (no reset)
-- Enforce `RLIMIT_NOFILE` on fd allocation
-- Enforce `RLIMIT_STACK` on stack growth
+*Both remaining resources are now enforced:*
+- **`RLIMIT_NOFILE`**: the descriptor table carries the soft ceiling (seeded 1024,
+  synced from `setrlimit(5)`, copied on fork); `install`/`install_at_least`
+  refuse a descriptor at or above it with `EMFILE` instead of growing unbounded.
+  Every fd-creating syscall propagates it, and `pipe`/`socketpair` return the
+  first descriptor if the second is refused. Host-tested by
+  `the_descriptor_table_honours_its_ceiling`.
+- **`RLIMIT_STACK`**: `resolve_stack_growth` reads the faulting task's soft limit
+  as the stack floor (SIGSEGV beyond it; capped at the reserved region for a
+  raised/infinite one).
 
-### 6.3 Namespace Support (Minimal)
+### 6.3 Namespace Support (Minimal) — **stub**
 
-| Syscall | Nr | Description |
-|---------|-----|-------------|
-| `setns` | 308 | Enter namespace |
-| `unshare` | 272 | Unshare namespace |
+`unshare`/`setns` exist and validate the `CLONE_NEW*` bits (unknown → `EINVAL`),
+but a request to actually enter a namespace returns `EOPNOTSUPP` - there is one
+of each kind and no isolation machinery behind it. Real `CLONE_NEWNS` mount
+namespaces (or any other) are not implemented; the syscalls fail cleanly rather
+than pretend. (Not one-shot implementable: needs per-namespace mount/root/pid
+state threaded through the VFS and scheduler, and guest verification.)
 
-**Minimal scope**: `CLONE_NEWNS` (mount namespace only) for basic container isolation.
+### 6.4 Additional Process Syscalls — **DONE**
 
-### 6.4 Additional Process Syscalls
+All wired to real handlers in `posix.rs`/`proc.rs`: `getpgrp`, `setreuid`,
+`setregid`, `getresuid`, `getresgid`, `capget`, `capset`.
 
 | Syscall | Nr | Description |
 |---------|-----|-------------|
@@ -379,19 +467,30 @@ Currently `prlimit64` returns hardcoded values, `setrlimit` is ignored.
 
 ### 8.2 seccomp
 
-| Syscall | Nr | Description |
-|---------|-----|-------------|
-| `seccomp` | 317 | Secure computing mode |
+| Syscall | Nr | Description | Status |
+|---------|-----|-------------|--------|
+| `seccomp` | 317 | Secure computing mode | Done (STRICT) |
+| `prctl(PR_SET_SECCOMP/PR_GET_SECCOMP)` | 157 | Legacy latch spelling | Done (STRICT) |
 
-- `SECCOMP_MODE_STRICT`: block execve, socket, mount
-- `SECCOMP_MODE_FILTER`: BPF program filter (future)
+- `SECCOMP_MODE_STRICT` — **done**. Latched via `seccomp(2)` (`op=0, flags=0,
+  args=NULL`) or `prctl(PR_SET_SECCOMP, 1)`, and read back with
+  `prctl(PR_GET_SECCOMP)` (0 unconfined, 1 strict). It is the real Linux
+  allow-list, not a block-list: the thread may make only `read`, `write`,
+  `exit` and `sigreturn`; every other syscall is fatal (`SIGKILL`), matching
+  Linux's `do_exit(SIGKILL)` on a strict violation. The latch is per-task,
+  cannot be cleared, survives `exec` and is inherited across `fork`/`clone`.
+- `SECCOMP_MODE_FILTER` — **future**: needs a BPF runner; refused with
+  `ENOSYS` so a caller never mistakes it for being confined.
 
-### 8.3 User Stack Canary
+### 8.3 User Stack Canary — **DONE** (kernel side)
 
-**Changes**:
-- Inject random canary at process start
-- `__stack_chk_fail` trampoline that sends `SIGABRT`
-- Compiler flag: `-fstack-protector-strong` for user programs
+`AT_RANDOM` is now filled from the kernel ChaCha20 pool (RDRAND + boot-epoch +
+tick seeded) at every exec — **16 random, per-process, per-boot bytes** — which
+is exactly what musl/glibc derive `__stack_chk_guard` from, so a stack-protector
+canary is now unpredictable (it was a fixed constant before, defeating the point).
+The fail path (`__stack_chk_fail` → `abort()` → `SIGABRT`) is musl's own and
+needs no kernel work; `-fstack-protector-strong` is a user-build flag, not the
+kernel's. Kernel-side stack protection is therefore complete.
 
 ---
 

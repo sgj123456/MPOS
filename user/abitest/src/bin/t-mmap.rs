@@ -12,8 +12,8 @@
 //! actually faults on access needs fault delivery and is deliberately not
 //! probed.
 //!
-//! The refusals the man page fixes are pinned too - a zero length, a file-backed
-//! request, a shared anonymous mapping, and a MAP_FIXED that is unaligned or
+//! The refusals the man page fixes are pinned too - a zero length, a
+//! file-backed request over a bad fd, and a MAP_FIXED that is unaligned or
 //! past the user limit - along with the full shape of the address argument: a
 //! free hint is honoured exactly, a hint already in use is ignored, and
 //! MAP_FIXED takes its range and arrives freshly zeroed. On this raw syscall
@@ -150,12 +150,25 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         -1,
         0,
     );
-    lin::check_eq(
+    // Phase 5.1: a shared anonymous mapping is served (a usable region), not
+    // refused. It used to answer ENOSYS; check it maps and can be written.
+    let mapped = (r as isize) > 0;
+    lin::check_true(
         &mut failed,
-        b"MAP_SHARED|MAP_ANONYMOUS answers ENOSYS",
-        r,
-        lin::ENOSYS,
+        b"MAP_SHARED|MAP_ANONYMOUS is served as a mapping",
+        mapped,
     );
+    if mapped {
+        let p = r as *mut u8;
+        unsafe {
+            p.write(0xa5);
+            lin::check_true(
+                &mut failed,
+                b"the shared anonymous region takes and reads back a write",
+                p.read() == 0xa5,
+            );
+        }
+    }
 
     let r = lin::mmap(
         0x5000_0123,

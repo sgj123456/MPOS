@@ -60,7 +60,14 @@ const EPHEMERAL_MAX: u16 = 60999;
 
 /// Per-socket TCP window. A bigger receive window lets a bulk transfer fill
 /// the pipe; the transmit side needs less, since slirp drains it promptly.
-const TCP_RX_BYTES: usize = 32 * 1024;
+///
+/// The receive side is sized against the device's ring rather than picked
+/// freely: the window advertised to a peer is `min(this buffer, the ring's
+/// capacity)`, so a buffer much larger than the ring would only promise
+/// something the ring cannot hold. Sixty-four kilobytes is under the 128 KiB
+/// the sixty-four receive buffers add up to, which is the pair this machine
+/// was measured with.
+const TCP_RX_BYTES: usize = 64 * 1024;
 const TCP_TX_BYTES: usize = 16 * 1024;
 
 /// Datagrams the receive side can hold at once, and the shared byte pool
@@ -117,6 +124,43 @@ pub(crate) struct Entry {
     pub family: u16,
     pub typ: u16,
     pub channel: Channel,
+    /// The socket options `setsockopt` stored and `getsockopt` reads back. Kept
+    /// per-socket so a set is not visible on its neighbours, and a query answers
+    /// what the process asked for rather than a constant.
+    pub opts: SockOpts,
+}
+
+/// The `setsockopt`/`getsockopt` state a socket carries. The buffer sizes get
+/// the stack's defaults so a query is a real number, not zero; the flags record
+/// what was asked for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SockOpts {
+    pub reuseaddr: bool,
+    pub keepalive: bool,
+    pub nodelay: bool,
+    /// `struct linger`'s two fields, kept apart so `getsockopt` can rebuild it.
+    pub linger_on: bool,
+    pub linger_sec: i32,
+    pub rcvbuf: u32,
+    pub sndbuf: u32,
+}
+
+/// The receive/transmit buffer size a fresh socket reports until it is asked to
+/// change - `smoltcp`'s own default window, rounded to a round number.
+const SOCK_BUF_DEFAULT: u32 = 64 * 1024;
+
+impl Default for SockOpts {
+    fn default() -> SockOpts {
+        SockOpts {
+            reuseaddr: false,
+            keepalive: false,
+            nodelay: false,
+            linger_on: false,
+            linger_sec: 0,
+            rcvbuf: SOCK_BUF_DEFAULT,
+            sndbuf: SOCK_BUF_DEFAULT,
+        }
+    }
 }
 
 /// Everything the network stack owns, in one place behind one lock.
@@ -221,6 +265,78 @@ pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
     })
 }
 
+/// The live socket table for `/proc/net/tcp` (`tcp` set) or `/proc/net/udp`.
+/// Walks every registry entry, reads the smoltcp socket behind the ones of the
+/// requested kind, and reduces each to a `NetRow` the procfs formatter prints.
+/// A stack that never came up yields nothing.
+pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> {
+    use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+    let zero = || IpEndpoint { addr: IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), port: 0 };
+    let row_of = |ep: IpEndpoint| -> ([u8; 4], u16) {
+        match ep.addr {
+            IpAddress::Ipv4(v4) => (v4.octets(), ep.port),
+            _ => ([0, 0, 0, 0], ep.port),
+        }
+    };
+    with_stack(|st| {
+        let mut rows = Vec::new();
+        for (idx, slot) in st.entries.iter().enumerate() {
+            let Some(entry) = slot else { continue };
+            let inode = (idx + 1) as u64;
+            match &entry.channel {
+                Channel::Tcp { handle, local } if tcp => {
+                    let sock = st.sockets.get::<tcp::Socket>(*handle);
+                    let local_ep = sock.local_endpoint().or(*local).unwrap_or_else(zero);
+                    let remote_ep = sock.remote_endpoint().unwrap_or_else(zero);
+                    rows.push(crate::vfs::procfs::NetRow {
+                        local: row_of(local_ep),
+                        remote: row_of(remote_ep),
+                        state: tcp_proc_state(sock),
+                        uid: 0,
+                        inode,
+                    });
+                }
+                Channel::Udp { local, peer, .. } if !tcp => {
+                    // UDP reports the bound/connected endpoints the entry
+                    // records; its datagram "state" is 0, as Linux shows.
+                    let local_ep = (*local).unwrap_or_else(zero);
+                    let remote_ep = (*peer).unwrap_or_else(zero);
+                    rows.push(crate::vfs::procfs::NetRow {
+                        local: row_of(local_ep),
+                        remote: row_of(remote_ep),
+                        state: 0,
+                        uid: 0,
+                        inode,
+                    });
+                }
+                _ => {}
+            }
+        }
+        rows
+    })
+    .unwrap_or_default()
+}
+
+/// A smoltcp TCP socket's state as the numeric `/proc/net/tcp` `st` byte
+/// (LISTEN=10, ESTABLISHED=1, TIME_WAIT=6, ...).
+fn tcp_proc_state(sock: &tcp::Socket) -> u8 {
+    if sock.is_listening() {
+        return 10;
+    }
+    match sock.state() {
+        tcp::State::Established => 1,
+        tcp::State::SynSent => 2,
+        tcp::State::SynReceived => 3,
+        tcp::State::FinWait1 => 4,
+        tcp::State::FinWait2 => 5,
+        tcp::State::TimeWait => 6,
+        tcp::State::CloseWait => 8,
+        tcp::State::LastAck => 9,
+        tcp::State::Closing => 11,
+        _ => 7, // Closed and any unrecognised state read as CLOSE.
+    }
+}
+
 /// Register a new socket of the given family and type, and hand back its
 /// handle. The smoltcp socket - with its buffers - is built inside the lock,
 /// since the socket set is part of the stack. `ENETDOWN` when the stack never
@@ -264,6 +380,7 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
             family,
             typ,
             channel: owned,
+            opts: SockOpts::default(),
         };
         Ok(match stack.entries.iter().position(|slot| slot.is_none()) {
             Some(pos) => {
@@ -510,7 +627,19 @@ impl Device for NicDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = MTU;
-        caps.max_burst_size = Some(1);
+        // Not a description of the hardware - smoltcp multiplies this by the
+        // segment size and clamps every advertised receive window to the
+        // result (`iface/packet.rs`, and the comment there calls it "a
+        // terrible hack"). It is the one place the library lets a driver say
+        // how many frames can pile up before the next one has to be dropped,
+        // which for this device is exactly the receive ring.
+        //
+        // `Some(1)` - the value in smoltcp's own example, and what this was -
+        // advertised 1460 bytes: one segment in flight, so the peer had to
+        // wait a round trip for every segment. Measured on this machine that
+        // is 72 KB/s of download, and it looks exactly like slirp being slow.
+        // The window is what it was spending.
+        caps.max_burst_size = Some(self.net.rx_frames());
         caps
     }
 }

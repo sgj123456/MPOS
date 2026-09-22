@@ -16,12 +16,36 @@ use super::abi;
 use super::abi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EFD_NONBLOCK, EFD_SEMAPHORE,
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW,
-    FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_TMPFILE, O_TRUNC,
-    POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLIN, POLLNVAL, POLLOUT, normalize_path,
-    write_stat,
+    FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_RDWR, O_TMPFILE,
+    O_TRUNC, O_WRONLY, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLIN, POLLNVAL, POLLOUT,
+    StatTimes, normalize_path, write_stat,
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
-use crate::vfs::{Inode, NodeKind};
+use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X_OK};
+
+/// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
+///
+/// The ordinary walk follows stored links and stops at a *descriptor's*
+/// second name - `/proc/<pid>/fd/N` and the `/dev/std*` links into it - on
+/// purpose: opening one has to clone the descriptor rather than reopen
+/// whatever path it reports, so the resolver hands the link itself back.
+/// Following it here therefore means the file the descriptor holds, and it is
+/// reached through the descriptor table rather than through the tree.
+fn followed_link(path: &str, base: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
+    let inode = crate::vfs::resolve_at(path, base)?;
+    match inode.as_fd() {
+        Some(fd) => descriptor_file(fd),
+        None => Ok(inode),
+    }
+}
+
+/// The file a descriptor holds: what a `/proc/<pid>/fd/N` entry stands for.
+fn descriptor_file(fd: usize) -> VfsResult<Arc<dyn Inode>> {
+    let fd = i32::try_from(fd).map_err(|_| VfsError::BadFd)?;
+    crate::sched::current_fds()
+        .clone_at(fd)
+        .map(|file| file.inode())
+}
 
 /// The inode a dirfd-led path resolves from: the descriptor's directory, or
 /// the caller's cwd for `AT_FDCWD`.
@@ -38,29 +62,89 @@ fn base_of(dirfd: i32, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
     Ok(file.inode())
 }
 
+/// The mode a newly created node gets: what the caller asked for, less the
+/// process's file-creation mask. Every create masks - that is the whole of
+/// what `umask` does - and the twelve bits are all a mode has.
+fn masked_mode(mode: u32) -> u32 {
+    mode & !crate::sched::current_umask() & 0o7777
+}
+
 /// `open`/`openat` shared tail: open the path, and on a miss with `O_CREAT`
 /// make the file first, then open it.
-fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
-    // O_TMPFILE, which is the O_TMPFILE bit over O_DIRECTORY, asks for an
-    // inode no name holds: the caller writes it whole and `linkat`s it into
-    // the tree when it is done. Nothing here can keep an inode out of the
-    // tree, and answering with the named file the path resolves to would
-    // read as anonymity to the caller - apk refreshes its repository index
-    // through one against `.` in the cache directory, and a descriptor over
-    // the *directory* turned every refresh into `Is a directory` at the
-    // first write. EOPNOTSUPP is what a filesystem without the feature
-    // answers, and what sends apk down the named-temp-file-and-rename path
-    // it keeps for exactly this. The pairing itself is read the way Linux
-    // reads it: the bit without the flag is not a spelling anyone meant.
+fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isize {
+    // O_TMPFILE - the bit over O_DIRECTORY - asks for an inode no name holds:
+    // the caller writes it whole and `linkat`s it into the tree when it is
+    // done, so a file is never seen half-written. `apk` refreshes a repository
+    // index this way against its cache directory, and without it every `apk
+    // add` fell back to a named temporary - the `APKINDEX.*.tmp.N` left behind
+    // in `/var/cache/apk` was that fallback's fingerprint, and an index that
+    // never landed under its real name is one that gets fetched again.
+    //
+    // The pairing is read the way Linux reads it: the bit without the flag is
+    // not a spelling anyone meant. A filesystem that cannot keep an inode out
+    // of the tree answers EOPNOTSUPP, which is what a caller with a fallback
+    // is listening for.
     if flags & O_TMPFILE != 0 {
         if flags & O_DIRECTORY == 0 {
             return err::EINVAL;
         }
-        return err::EOPNOTSUPP;
+        // The directory the file is born into is what the name resolves to -
+        // `openat(dirfd, ".")` names the directory itself.
+        let dir = match crate::vfs::resolve_opt(path, Some(base)) {
+            Ok(dir) => dir,
+            Err(e) => return err_of(e),
+        };
+        // An unnamed inode is still an entry being made in this directory, so
+        // the directory's bits decide - and they are asked before it exists,
+        // so a refused create leaves nothing behind.
+        if let Err(e) = crate::vfs::may_create_in(&dir) {
+            return err_of(e);
+        }
+        let file = match dir.create_tmpfile() {
+            Ok(file) => file,
+            Err(e) => return err_of(e),
+        };
+        // The mode is the file's, as it is for any create - an unnamed inode
+        // is made the same way and linked in later, and a caller with no name
+        // to `chmod` afterwards has no second chance to say 04755. Package
+        // extraction is that caller: apk unpacks a file through `O_TMPFILE`
+        // and links it in, so a mode dropped here is a setuid helper that
+        // arrives as 0644 and refuses to run.
+        if mode & 0o7777 != 0 {
+            file.set_mode(masked_mode(mode));
+        }
+        let fd = match crate::vfs::open_inode(file) {
+            Ok(fd) => fd,
+            Err(e) => return err_of(e),
+        };
+        // Nothing to truncate and no name to label: only `O_CLOEXEC` applies,
+        // and it says the same thing here it says on any other open.
+        if flags & O_CLOEXEC != 0 {
+            let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+        }
+        return fd as isize;
     }
     // Resolved before the base moves into `open_opt`, and used only if what
     // comes back is a directory.
     let label = recoverable_path(path, &base);
+    // The access the flags ask for, in the bit set the triads use. `O_RDONLY`
+    // is zero, so the access bits are a three-way choice rather than a flag:
+    // reading, writing, or both. `O_TRUNC` is a write whatever the access bits
+    // say - a file emptied by a caller who asked only to read it is the
+    // combination Linux answers EACCES for.
+    let mut want = match flags & O_ACCMODE {
+        O_WRONLY => W_OK,
+        O_RDWR => R_OK | W_OK,
+        _ => R_OK,
+    };
+    if flags & O_TRUNC != 0 {
+        want |= W_OK;
+    }
+    // Whether this open is what brought the name into being. Linux does not
+    // check a mode against the caller who just asked for it: that is what
+    // makes `open(name, O_CREAT | O_WRONLY, 0)` succeed and a second open of
+    // the same name fail.
+    let mut created = false;
     // O_EXCL refuses to open a name that is already there, whatever it names.
     if flags & O_CREAT != 0
         && flags & O_EXCL != 0
@@ -73,8 +157,30 @@ fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
         Err(crate::vfs::VfsError::NoEntry) if flags & O_CREAT != 0 => {
             // O_EXCL names an existing file EEXIST; a missing directory, no
             // space: the create error is the answer, not a retry.
+            //
+            // A new name is a write to the directory and finding where it goes
+            // is a search, so the parent's bits are asked first - and a refusal
+            // here is a create that leaves nothing behind.
+            if let Ok((parent, _)) = crate::vfs::split_parent(path)
+                && let Ok(dir) = crate::vfs::resolve_opt(parent, Some(base.clone()))
+                && let Err(e) = crate::vfs::may_create_in(&dir)
+            {
+                return err_of(e);
+            }
             if let Err(e) = crate::vfs::create_file_opt(path, Some(base.clone())) {
                 return err_of(e);
+            }
+            created = true;
+            // A file born through `open(O_CREAT, mode)` carries that mode, and
+            // this is how a package is unpacked: `apk` writes every extracted
+            // file's mode here - setuid helpers and executable scripts
+            // included - and a kernel that drops the argument hands back a
+            // tree of 0644 files. Only a *creation* sets it: on a name that
+            // already exists the argument is ignored, as the man page says.
+            if mode & 0o7777 != 0
+                && let Ok(created) = crate::vfs::resolve_opt(path, Some(base.clone()))
+            {
+                created.set_mode(masked_mode(mode));
             }
             crate::vfs::open_opt(path, Some(base))
         }
@@ -103,6 +209,16 @@ fn open_linux(path: &str, flags: usize, base: Arc<dyn Inode>) -> isize {
                 if flags & O_DIRECTORY != 0 && !dir {
                     let _ = crate::sched::current_fds().close(fd);
                     return err::ENOTDIR;
+                }
+                // The permission check is last of the refusals, so the shape
+                // errors above keep their errno, and it is skipped for a name
+                // this very open created.
+                if !created && want != 0 {
+                    let inode = file.inode();
+                    if let Err(e) = crate::vfs::may_access(&inode, want) {
+                        let _ = crate::sched::current_fds().close(fd);
+                        return err_of(e);
+                    }
                 }
             }
             // A directory description remembers the path it was opened by, so
@@ -167,7 +283,7 @@ pub(super) fn open(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
-    open_linux(&path, args[1], cwd.clone())
+    open_linux(&path, args[1], args[2] as u32, cwd.clone())
 }
 
 /// `openat(dirfd, path, flags, mode)`.
@@ -180,7 +296,7 @@ pub(super) fn openat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
-    open_linux(&path, args[2], base)
+    open_linux(&path, args[2], args[3] as u32, base)
 }
 
 /// `stat(path, buf)` and `lstat(path, buf)`: the pre-`*at` spellings, which are
@@ -198,22 +314,35 @@ pub(super) fn stat_legacy(nr: u64, args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode
 /// `fstat(fd, buf)` - the fd's description, not a path, is what is statted.
 pub(super) fn fstat(args: [usize; ARG_COUNT]) -> isize {
     let (fd, buf) = (args[0] as i32, args[1]);
-    let (meta, dev, rdev, stored) = match crate::sched::current_fds().clone_at(fd) {
-        Ok(file) => {
-            let inode = file.inode();
-            // The filesystem a descriptor belongs to is named by the path it
-            // was opened through - the same answer `stat` by path would give,
-            // which is what libc's `ttyname` compares the two sides of. A
-            // nameless descriptor falls back to the mount-table lookup.
-            let dev = match file.label() {
-                Some(path) => crate::vfs::mount::fs_of_path(&path).0,
-                None => crate::vfs::mount::fs_id_of_inode(&inode),
-            };
-            (file.metadata(), dev, inode.rdev(), inode.mode())
-        }
-        Err(e) => return err_of(e),
-    };
-    write_stat(buf, &meta, dev, rdev, stored)
+    let (meta, dev, rdev, stored, nlink, owner, times) =
+        match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) => {
+                let inode = file.inode();
+                // The filesystem a descriptor belongs to is named by the path it
+                // was opened through - the same answer `stat` by path would give,
+                // which is what libc's `ttyname` compares the two sides of. A
+                // nameless descriptor falls back to the mount-table lookup.
+                let dev = match file.label() {
+                    Some(path) => crate::vfs::mount::fs_of_path(&path).0,
+                    None => crate::vfs::mount::fs_id_of_inode(&inode),
+                };
+                (
+                    file.metadata(),
+                    dev,
+                    inode.rdev(),
+                    inode.mode(),
+                    inode.nlink(),
+                    inode.owner(),
+                    StatTimes {
+                        atime: inode.atime(),
+                        mtime: inode.mtime(),
+                        ctime: inode.ctime(),
+                    },
+                )
+            }
+            Err(e) => return err_of(e),
+        };
+    write_stat(buf, &meta, dev, rdev, stored, nlink, owner, times)
 }
 
 /// `flock(fd, operation)` - the advisory whole-file lock `apk` takes on its
@@ -227,10 +356,51 @@ pub(super) fn fstat(args: [usize; ARG_COUNT]) -> isize {
 /// is exactly the invariant single-locker callers rely on. `LOCK_UN` (8) is
 /// a no-op because nothing was ever recorded.
 pub(super) fn flock(args: [usize; ARG_COUNT]) -> isize {
-    if let Err(e) = crate::sched::current_fds().clone_at(args[0] as i32) {
-        return err_of(e);
+    let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    let op = args[1] as i32;
+    const LOCK_SH: i32 = 1;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
+    if op & !(LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN) != 0 {
+        return err::EINVAL;
     }
-    0
+    // Exactly one of SH/EX/UN selects the operation; a request for both lock
+    // kinds, or for none, is the `EINVAL` the man page spells.
+    let kind = match op & (LOCK_SH | LOCK_EX | LOCK_UN) {
+        LOCK_SH => Some(crate::vfs::locks::LockKind::Read),
+        LOCK_EX => Some(crate::vfs::locks::LockKind::Write),
+        LOCK_UN => None,
+        _ => return err::EINVAL,
+    };
+    #[cfg(target_os = "none")]
+    {
+        let inode = file.inode();
+        let dev = crate::vfs::mount::fs_id_of_inode(&inode);
+        let ino = file.metadata().ino;
+        let owner = crate::sched::current_tgid().0 as u32;
+        // A whole-file lock covers `[0, infinity)`, in the `Whole` class that
+        // never interacts with an `fcntl` record lock, and it blocks unless
+        // `LOCK_NB` was asked for.
+        return lock_take(
+            dev,
+            ino,
+            owner,
+            crate::vfs::locks::LockClass::Whole,
+            kind,
+            0,
+            crate::vfs::locks::INF,
+            op & LOCK_NB == 0,
+        );
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = kind;
+        0
+    }
 }
 
 /// `ftruncate(fd, length)` - the resize `wget` asks of its output before it
@@ -275,6 +445,12 @@ pub(super) fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
         Ok(inode) => inode,
         Err(e) => return err_of(e),
     };
+    // Emptying a file is a write to it, whatever the caller's descriptor
+    // situation: Linux asks for write permission here, and `truncate` on a
+    // file the caller may only read is EACCES rather than a silent success.
+    if let Err(e) = crate::vfs::may_access(&inode, crate::vfs::W_OK) {
+        return err_of(e);
+    }
     match inode.truncate(length as u64) {
         Ok(()) => 0,
         Err(e) => err_of(e),
@@ -342,18 +518,31 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
         if flags & AT_EMPTY_PATH == 0 {
             return err::ENOENT;
         }
-        let (meta, dev, rdev, stored) = match crate::sched::current_fds().clone_at(dirfd) {
-            Ok(file) => {
-                let inode = file.inode();
-                let dev = match file.label() {
-                    Some(path) => crate::vfs::mount::fs_of_path(&path).0,
-                    None => crate::vfs::mount::fs_id_of_inode(&inode),
-                };
-                (file.metadata(), dev, inode.rdev(), inode.mode())
-            }
-            Err(e) => return err_of(e),
-        };
-        return write_stat(buf, &meta, dev, rdev, stored);
+        let (meta, dev, rdev, stored, nlink, owner, times) =
+            match crate::sched::current_fds().clone_at(dirfd) {
+                Ok(file) => {
+                    let inode = file.inode();
+                    let dev = match file.label() {
+                        Some(path) => crate::vfs::mount::fs_of_path(&path).0,
+                        None => crate::vfs::mount::fs_id_of_inode(&inode),
+                    };
+                    (
+                        file.metadata(),
+                        dev,
+                        inode.rdev(),
+                        inode.mode(),
+                        inode.nlink(),
+                        inode.owner(),
+                        StatTimes {
+                            atime: inode.atime(),
+                            mtime: inode.mtime(),
+                            ctime: inode.ctime(),
+                        },
+                    )
+                }
+                Err(e) => return err_of(e),
+            };
+        return write_stat(buf, &meta, dev, rdev, stored, nlink, owner, times);
     }
     let base = match base_of(dirfd, cwd) {
         Ok(base) => base,
@@ -362,19 +551,41 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
     // `lstat` is the one call that wants the link and not its target, so it
     // walks to the parent and looks the name up there - a resolver that
     // followed links would hand back the very thing it was told not to.
-    let (meta, rdev, stored) = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+    let (meta, rdev, stored, nlink, owner, times) = if flags & AT_SYMLINK_NOFOLLOW != 0 {
         match crate::vfs::global().resolve_no_follow(&path, base) {
-            Ok(inode) => (inode.metadata(), inode.rdev(), inode.mode()),
+            Ok(inode) => (
+                inode.metadata(),
+                inode.rdev(),
+                inode.mode(),
+                inode.nlink(),
+                inode.owner(),
+                StatTimes {
+                    atime: inode.atime(),
+                    mtime: inode.mtime(),
+                    ctime: inode.ctime(),
+                },
+            ),
             Err(e) => return err_of(e),
         }
     } else {
         match crate::vfs::resolve_opt(&path, Some(base)) {
-            Ok(inode) => (inode.metadata(), inode.rdev(), inode.mode()),
+            Ok(inode) => (
+                inode.metadata(),
+                inode.rdev(),
+                inode.mode(),
+                inode.nlink(),
+                inode.owner(),
+                StatTimes {
+                    atime: inode.atime(),
+                    mtime: inode.mtime(),
+                    ctime: inode.ctime(),
+                },
+            ),
             Err(e) => return err_of(e),
         }
     };
     let (dev, _fstype) = crate::vfs::mount::fs_of_path(&absolute(&path));
-    write_stat(buf, &meta, dev, rdev, stored)
+    write_stat(buf, &meta, dev, rdev, stored, nlink, owner, times)
 }
 
 /// `statx(dirfd, path, flags, mask, buf)` - the extended stat uutils calls.
@@ -391,14 +602,25 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     };
     // An empty path names the descriptor, but only when the caller said so:
     // Linux requires AT_EMPTY_PATH and answers ENOENT for the unannounced form.
-    let (meta, rdev, stored) = if path.is_empty() {
+    let (meta, rdev, stored, nlink, owner, times) = if path.is_empty() {
         if _flags & AT_EMPTY_PATH == 0 {
             return err::ENOENT;
         }
         match crate::sched::current_fds().clone_at(dirfd) {
             Ok(file) => {
                 let inode = file.inode();
-                (file.metadata(), inode.rdev(), inode.mode())
+                (
+                    file.metadata(),
+                    inode.rdev(),
+                    inode.mode(),
+                    inode.nlink(),
+                    inode.owner(),
+                    StatTimes {
+                        atime: inode.atime(),
+                        mtime: inode.mtime(),
+                        ctime: inode.ctime(),
+                    },
+                )
             }
             Err(e) => return err_of(e),
         }
@@ -408,7 +630,18 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Err(e) => return e,
         };
         match crate::vfs::resolve_opt(&path, Some(base)) {
-            Ok(inode) => (inode.metadata(), inode.rdev(), inode.mode()),
+            Ok(inode) => (
+                inode.metadata(),
+                inode.rdev(),
+                inode.mode(),
+                inode.nlink(),
+                inode.owner(),
+                StatTimes {
+                    atime: inode.atime(),
+                    mtime: inode.mtime(),
+                    ctime: inode.ctime(),
+                },
+            ),
             Err(e) => return err_of(e),
         }
     };
@@ -416,18 +649,52 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // The byte layout - zeroed head, field offsets, the `STATX_BASIC_STATS`
     // mask answer - is the ABI, and lives in `abi` where the host tests can
     // walk it field by field. This side only resolves what the struct says.
-    abi::write_statx(buf, mask, &meta, stored, rdev)
+    abi::write_statx(buf, mask, &meta, stored, rdev, nlink, owner, times)
 }
 
-/// `access(path, mode)` - is the path there and reachable? Mode is ignored:
-/// one user, no permission bits.
+/// The `access` question, for all three spellings: may the process whose ids
+/// are `me` do `mode` to `inode`?
+///
+/// `mode` is the `R_OK`/`W_OK`/`X_OK` bit set, and `F_OK` - zero - asks only
+/// that the name is there, which resolving it has already answered. `me` is
+/// the identity to ask about: the **real** ids for `access(2)`, and either
+/// pair for the `faccessat` family, which is what `AT_EACCESS` selects.
+fn access_check(inode: &Arc<dyn Inode>, mode: usize, me: (u32, u32)) -> isize {
+    if mode & !(R_OK as usize | W_OK as usize | X_OK as usize) != 0 {
+        return err::EINVAL;
+    }
+    if mode == 0 {
+        return 0;
+    }
+    match crate::vfs::may_as(me, inode, mode as u32) {
+        Ok(()) => 0,
+        Err(e) => err_of(e),
+    }
+}
+
+/// The identity an `access` call asks about: the effective pair when
+/// `AT_EACCESS` is set, the real one otherwise.
+fn access_ids(flags: usize) -> (u32, u32) {
+    if flags & abi::AT_EACCESS != 0 {
+        crate::sched::current_owner()
+    } else {
+        crate::sched::current_real_owner()
+    }
+}
+
+/// `access(path, mode)` - may the caller reach `path` for `mode`?
+///
+/// The ids asked about are the **real** ones, not the effective ones: this is
+/// the call a setuid program makes to find out what the user who invoked it
+/// could do, and answering with its own raised privileges would make the
+/// question meaningless.
 pub(super) fn access(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
     match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
-        Ok(_) => 0,
+        Ok(inode) => access_check(&inode, args[1], crate::sched::current_real_owner()),
         Err(e) => err_of(e),
     }
 }
@@ -443,40 +710,191 @@ pub(super) fn faccessat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         Err(e) => return e,
     };
     match crate::vfs::resolve_opt(&path, Some(base)) {
-        Ok(_) => 0,
+        Ok(inode) => access_check(&inode, args[2], access_ids(args[3])),
         Err(e) => err_of(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// extended attributes: validated, then reported as unsupported
+// ---------------------------------------------------------------------------
+
+/// The inode a descriptor names, for the `f*` xattr spellings. The descriptor
+/// only has to be open; the attribute's target is then the file it holds.
+fn xattr_inode_of_fd(fd: i32) -> Result<Arc<dyn Inode>, isize> {
+    crate::sched::current_fds()
+        .clone_at(fd)
+        .map(|file| file.inode())
+        .map_err(err_of)
+}
+
+/// The filesystem a name resolves to, checked the way the xattr layer would
+/// check it before reaching a handler: the path (and the attribute name, when
+/// the operation takes one) must be readable strings, and the target must
+/// exist. `follow` tells the `l`-forms, which act on a final symlink rather
+/// than its target, to resolve without following.
+///
+/// This kernel stores no extended attributes on any of its filesystems, so once
+/// the target is confirmed the answer is `EOPNOTSUPP` - the "this filesystem
+/// does not do xattrs" report Linux gives a filesystem with no xattr support,
+/// and the reason the call is wired to a handler at all. Before it was, the
+/// syscall number fell through to `ENOSYS`, which a caller reads as "this
+/// kernel has no such call" and may handle far more bluntly than a single
+/// unsupported filesystem.
+fn xattr_target(path: &str, cwd: &Arc<dyn Inode>, follow: bool) -> isize {
+    let resolved = if follow {
+        crate::vfs::resolve_opt(path, Some(cwd.clone()))
+    } else {
+        crate::vfs::global().resolve_no_follow(path, cwd.clone())
+    };
+    match resolved {
+        Ok(_) => err::EOPNOTSUPP,
+        Err(e) => err_of(e),
+    }
+}
+
+/// `getxattr`/`setxattr`/`removexattr` and their `l`-prefixed forms. All three
+/// take a path then an attribute name in the first two slots, and all three
+/// reach the same verdict here, so they share it.
+pub(super) fn xattr_path(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, follow: bool) -> isize {
+    let path = match cstr_arg(args[0], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    if let Err(e) = cstr_arg(args[1], true) {
+        return e;
+    }
+    xattr_target(&path, cwd, follow)
+}
+
+/// `fgetxattr`/`fsetxattr`/`fremovexattr`: the descriptor form. A bad descriptor
+/// is `EBADF` before the name is even looked at, as the descriptor table check
+/// happens first.
+pub(super) fn xattr_fd(args: [usize; ARG_COUNT]) -> isize {
+    if let Err(e) = xattr_inode_of_fd(args[0] as i32) {
+        return e;
+    }
+    if let Err(e) = cstr_arg(args[1], true) {
+        return e;
+    }
+    err::EOPNOTSUPP
+}
+
+/// `listxattr`/`llistxattr`: path, then a buffer to fill - no name argument.
+pub(super) fn xattr_list_path(
+    args: [usize; ARG_COUNT],
+    cwd: &Arc<dyn Inode>,
+    follow: bool,
+) -> isize {
+    let path = match cstr_arg(args[0], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    xattr_target(&path, cwd, follow)
+}
+
+/// `flistxattr`: the descriptor form of the list call.
+pub(super) fn xattr_list_fd(args: [usize; ARG_COUNT]) -> isize {
+    match xattr_inode_of_fd(args[0] as i32) {
+        Ok(_) => err::EOPNOTSUPP,
+        Err(e) => e,
+    }
+}
+
+/// Wall-clock seconds, the value `UTIME_NOW` resolves to - the same sum
+/// `gettimeofday` reports (the boot epoch plus elapsed ticks).
+fn wall_now() -> u64 {
+    crate::arch::rtc::boot_epoch()
+        + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64
+}
+
+/// `struct timespec` as `utimensat` reads it: seconds, nanoseconds.
+#[repr(C)]
+struct Utimespec {
+    sec: i64,
+    nsec: i64,
+}
+
+/// The two `tv_nsec` sentinels that are not a clock value at all: use the
+/// current time, or leave that clock as it is. Their values are the ABI's.
+const UTIME_NOW: i64 = (1 << 30) - 1;
+const UTIME_OMIT: i64 = (1 << 30) - 2;
+
+/// One clock's new value from a `timespec`, resolving the sentinels: `keep` is
+/// what the node holds now (`UTIME_OMIT`), and a plain value is its seconds.
+/// A nanosecond field that is neither in range nor a sentinel is refused with
+/// `None`, which the caller turns into `EINVAL`.
+fn resolve_time(ts: &Utimespec, keep: u64, now: u64) -> Option<u64> {
+    match ts.nsec {
+        UTIME_NOW => Some(now),
+        UTIME_OMIT => Some(keep),
+        n if (0..1_000_000_000).contains(&n) => Some(ts.sec as u64),
+        _ => None,
     }
 }
 
 /// `utimensat(dirfd, pathname, times, flags)`.
 ///
-/// Timestamps arrive but are not kept: the VFS carries no metadata clock,
-/// so a call naming a real file answers success and a missing one answers
-/// ENOENT - the two answers a caller branches on. `touch` is the everyday
-/// user, and it needs the success. The branch that matters is the one
-/// `futimens` speaks: `utimensat(fd, NULL, times, 0)` names no path at all,
-/// the descriptor *is* the file - and busybox `touch` opens its target and
-/// then futimens it, so a NULL path with a plain-file fd is the everyday
-/// shape, not a corner.
+/// The timestamps are now kept, on a filesystem that has somewhere to put them
+/// (ext2 is; the default `set_times` refuses). `touch` is the everyday user. The
+/// branch that matters is the one `futimens` speaks: `utimensat(fd, NULL, times,
+/// 0)` names no path at all - the descriptor *is* the file - and busybox `touch`
+/// opens its target and then futimens it, so a NULL path with a plain-file fd is
+/// the everyday shape, not a corner. A null `times` sets both clocks to now; the
+/// `UTIME_NOW` / `UTIME_OMIT` sentinels resolve per clock.
 pub(super) fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    if args[1] == 0 {
-        // futimens shape: the fd names the file, timestamps are not kept.
-        let fd = args[0] as u32 as i32;
-        return match crate::sched::current_fds().clone_at(fd) {
-            Ok(_) => 0,
-            Err(e) => err_of(e),
-        };
+    let (dirfd, path_ptr, times_ptr, flags) = (args[0] as i32, args[1], args[2], args[3] as usize);
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return err::EINVAL;
     }
-    let base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
+    // Resolve the node whose clocks are being set, by path or by descriptor.
+    let inode: Arc<dyn Inode> = if path_ptr == 0 {
+        match crate::sched::current_fds().clone_at(dirfd) {
+            Ok(file) => file.inode(),
+            Err(e) => return err_of(e),
+        }
+    } else {
+        let base = match base_of(dirfd, cwd) {
+            Ok(base) => base,
+            Err(e) => return e,
+        };
+        let path = match cstr_arg(path_ptr, true) {
+            Ok(path) => path,
+            Err(e) => return e,
+        };
+        let resolved = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            crate::vfs::global().resolve_no_follow(&path, base)
+        } else {
+            crate::vfs::resolve_opt(&path, Some(base))
+        };
+        match resolved {
+            Ok(inode) => inode,
+            Err(e) => return err_of(e),
+        }
     };
-    let path = match cstr_arg(args[1], true) {
-        Ok(path) => path,
-        Err(e) => return e,
+
+    // The two clocks. A null `times` means "now, both"; otherwise read the
+    // pair, refusing an unreadable pointer and an out-of-range nanosecond.
+    let (atime, mtime) = if times_ptr == 0 {
+        let now = wall_now();
+        (now, now)
+    } else {
+        if !buffer_ok(times_ptr, 32, false, true) {
+            return err::EFAULT;
+        }
+        let pair = unsafe { &*(times_ptr as *const [Utimespec; 2]) };
+        let now = wall_now();
+        match (
+            resolve_time(&pair[0], inode.atime(), now),
+            resolve_time(&pair[1], inode.mtime(), now),
+        ) {
+            (Some(a), Some(m)) => (a, m),
+            _ => return err::EINVAL,
+        }
     };
-    match crate::vfs::resolve_opt(&path, Some(base)) {
-        Ok(_) => 0,
+
+    match inode.set_times(atime, mtime) {
+        Ok(()) => 0,
         Err(e) => err_of(e),
     }
 }
@@ -504,6 +922,13 @@ pub(super) fn chdir(args: [usize; ARG_COUNT]) -> isize {
     let canonical = normalize_path(&path, &crate::sched::current_cwd_path());
     match crate::vfs::resolve(&canonical) {
         Ok(dir) if dir.metadata().kind == NodeKind::Dir => {
+            // Entering a directory is the execute bit's job, the same as
+            // walking through one: Linux refuses `chdir` without it, and a
+            // kernel that allowed it would let a caller sit in a directory it
+            // cannot then read a single name out of.
+            if let Err(e) = crate::vfs::may_search(&dir) {
+                return err_of(e);
+            }
             adopt_cwd(dir, canonical);
             0
         }
@@ -586,8 +1011,16 @@ pub(super) fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(d) => d,
         Err(e) => return err_of(e),
     };
+    // A new name is a write to the directory and finding where it goes is a
+    // search, so the parent's bits are asked before the directory exists.
+    if let Err(e) = crate::vfs::may_create_in(&parent) {
+        return err_of(e);
+    }
     match parent.create(name, NodeKind::Dir) {
-        Ok(_) => 0,
+        Ok(created) => {
+            created.set_mode(masked_mode(args[2] as u32));
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -659,6 +1092,12 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         Ok(ino) => ino,
         Err(e) => return err_of(e),
     };
+    // Renaming takes the old name out of its directory, so the rule that
+    // governs `unlink` governs this too: without it, a rename is a way around
+    // the permission check - and a rename is what `mv` is.
+    if let Err(e) = crate::vfs::may_remove(&old_dir, &old_inode) {
+        return err_of(e);
+    }
 
     // Where the new name goes. A path with a slash names its own parent; a
     // bare name has none, and the directory it is created in is the one the
@@ -677,6 +1116,12 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         }
         None => (new_base.clone(), new_path.clone()),
     };
+    // The new name is an entry being made in `dir`, so the directory's bits
+    // decide - the same rule a create follows. Without it a rename is a way to
+    // put a name somewhere the caller could not have created one.
+    if let Err(e) = crate::vfs::may_create_in(&dir) {
+        return err_of(e);
+    }
 
     // What `create` owes the caller when the name is taken: the name is
     // replaced, whatever kind of node holds - unless NOREPLACE protected it.
@@ -712,11 +1157,16 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
                 Ok(t) => t,
                 Err(e) => return err_of(e),
             };
-            claim_name!(dir.symlink(&name, &target).map(|_| ()));
+            let link = claim_name!(dir.symlink(&name, &target));
+            // The same rule a file's copy follows: the name moves and the node
+            // keeps its owner. A link's mode is consulted by nothing, so only
+            // the owner has to be carried across.
+            let (uid, gid) = old_inode.owner();
+            link.set_owner(uid, gid);
         }
         // A regular file: copy the bytes, then drop the old name.
         NodeKind::File => {
-            let file = crate::vfs::File::new(old_inode);
+            let file = crate::vfs::File::new(old_inode.clone());
             let mut data = alloc::vec::Vec::new();
             let mut chunk = [0u8; 4096];
             loop {
@@ -727,9 +1177,25 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
                 }
             }
             let inode = claim_name!(dir.create(&name, NodeKind::File));
-            if crate::vfs::File::new(inode).write(&data).is_err() {
+            if crate::vfs::File::new(inode.clone()).write(&data).is_err() {
                 return err::ENOSPC;
             }
+            // A rename moves the *name*; the node keeps everything that was its
+            // own. There is no atomic rename underneath this filesystem, so the
+            // body lands in a freshly created inode, and that inode has to be
+            // handed back the mode and the owner the old one carried. Without
+            // this, every rename of a regular file resets it to the
+            // filesystem's default - 0644, and owned by whoever did the
+            // renaming - which is exactly how a package install turns every
+            // extracted binary into a plain readable file: `apk` writes each
+            // member through `O_TMPFILE`, gives it a temporary name, and
+            // renames it into place, so surviving the rename is the whole of
+            // how a mode, a setuid bit or an owner reaches its final name.
+            if old_inode.keeps_modes() {
+                inode.set_mode(old_inode.mode());
+            }
+            let (uid, gid) = old_inode.owner();
+            inode.set_owner(uid, gid);
         }
         // A directory rename would have to move the whole subtree's parent
         // back-pointer; nothing here needs it yet, and pretending otherwise
@@ -827,6 +1293,11 @@ pub(super) fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(parent) => parent,
         Err(e) => return err_of(e),
     };
+    // A link is a new name in this directory, so the directory's bits decide
+    // whether it may be made - the same rule a create follows.
+    if let Err(e) = crate::vfs::may_create_in(&parent) {
+        return err_of(e);
+    }
     let r = match parent.symlink(name, &target) {
         Ok(_) => 0,
         Err(e) => err_of(e),
@@ -970,7 +1441,7 @@ fn mount_new(
             let Some(dev) = dev_node.as_block() else {
                 return err::ENOTBLK;
             };
-            match crate::vfs::ext2::Ext2Fs::mount(dev) {
+            match crate::vfs::ext4::Ext4Fs::mount(dev) {
                 Ok(fs) => alloc::sync::Arc::new(fs) as alloc::sync::Arc<dyn crate::vfs::FileSystem>,
                 Err(_) => return err::EINVAL,
             }
@@ -980,7 +1451,20 @@ fn mount_new(
         "sysfs" => crate::vfs::sysfs::SysFs::new(),
         "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
         "devpts" => crate::vfs::devpts::DevPts::new(),
-        "tmpfs" | "ramfs" => crate::vfs::ramfs::RamFs::new(),
+        "tmpfs" | "ramfs" => {
+            let fs = crate::vfs::ramfs::RamFs::new();
+            // A tmpfs root starts out `S_IRWXUGO | S_ISVTX` - 01777 - and that
+            // default is the whole of what `/tmp` is: writable by everyone,
+            // with each name removable only by its own owner. It is not
+            // decoration. A root that kept no mode at all is one whose
+            // permissions are never checked, sticky bit included, so without
+            // this the rule the bit exists for simply does not run - which is
+            // how any user could delete any other user's files out of `/tmp`.
+            if fstype == "tmpfs" {
+                fs.root().set_mode(0o1777);
+            }
+            fs
+        }
         // A type this kernel does not speak. ENODEV is what Linux answers, and
         // it is the answer a caller walks a list of types on.
         _ => return err::ENODEV,
@@ -1056,13 +1540,16 @@ pub(super) fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
         // asked for something else, and saying so beats doing something close.
         return err::EOPNOTSUPP;
     }
-    let fd = crate::vfs::open_inode(crate::vfs::eventfd::EventFd::new(
+    let nonblocking = args[1] & EFD_NONBLOCK != 0;
+    let fd = match crate::vfs::open_inode(crate::vfs::eventfd::EventFd::new(
         next_anon_ino(),
         args[0] as u32 as u64,
-    ));
-    if args[1] & EFD_NONBLOCK != 0
-        && let Ok(file) = crate::sched::current_fds().clone_at(fd)
-    {
+        nonblocking,
+    )) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
+    if nonblocking && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
     fd as isize
@@ -1083,10 +1570,13 @@ pub(super) fn handle_signalfd(args: [usize; ARG_COUNT], flags: usize, from_user:
         return err::EFAULT;
     }
     let nonblock = flags & SFD_NONBLOCK != 0;
-    let fd = crate::vfs::open_inode(crate::vfs::signalfd::SignalFd::new(
+    let fd = match crate::vfs::open_inode(crate::vfs::signalfd::SignalFd::new(
         next_anon_ino(),
         nonblock,
-    ));
+    )) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
     if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
@@ -1204,37 +1694,173 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
                 // the behaviour lives in the inode: sync the bit, so a
                 // `fcntl(F_SETFL, O_NONBLOCK)` on a plain pipe() reads and
                 // writes exactly as one born through `pipe2(O_NONBLOCK)`
-                // would.
-                if let Some(pipe) = file.inode().as_pipe() {
-                    pipe.set_nonblocking(arg as u32 & crate::vfs::file::O_NONBLOCK != 0);
-                }
+                // would. An eventfd keeps its own copy for the same reason -
+                // its reader blocks on an empty counter, and a caller that
+                // flips the flag after the fact expects the flip to bite.
+                sync_nonblocking(&file, arg as u32);
                 0
             }
             Err(e) => err_of(e),
         },
-        // POSIX record locking: permissive stubs. `F_GETLK` reports no lock
-        // held; `F_SETLK` and `F_SETLKW` always succeed. This matches the
-        // single-locker reality of the kernel and lets `apk`'s database lock
-        // acquire succeed.
-        F_GETLK => {
-            // Fill the `struct flock` with "no lock" (F_UNLCK = 2).
-            if arg != 0 {
-                if !crate::syscall::buffer_ok(arg, 32, true, true) {
-                    return err::EFAULT;
+        // POSIX record locking. The range math, the conflict rule and the
+        // split-on-relock all live in `vfs::locks`, host-tested; this resolves
+        // the caller's `struct flock` against the descriptor's file and applies
+        // it. `F_SETLK` refuses a blocked request with `EAGAIN`; `F_SETLKW`
+        // would block, and - since there is no wake-on-unlock yet - it records
+        // the grant instead of spinning, so a blocking caller never hangs.
+        F_GETLK | F_SETLK | F_SETLKW => record_lock(fd, cmd, arg),
+        _ => err::EINVAL,
+    }
+}
+
+/// The `struct flock` byte offsets on x86_64: `l_type` (i16) and `l_whence`
+/// (i16) share the first word, then `l_start`, `l_len` (i64 each) and `l_pid`
+/// (i32) follow at the ABI's padding. The struct is 32 bytes.
+mod flock_off {
+    pub const TYPE: usize = 0;
+    pub const WHENCE: usize = 2;
+    pub const START: usize = 8;
+    pub const LEN: usize = 16;
+    pub const PID: usize = 24;
+    pub const BYTES: usize = 32;
+}
+
+/// Take or drop a lock in `class` over `[lo, hi)`, the one path `F_SETLK`,
+/// `F_SETLKW` and `flock(2)` share. `block` false refuses a conflict with
+/// `EAGAIN`; `block` true parks until the range frees, the caller acquires it,
+/// or a signal interrupts with `EINTR` (`set_or_arm` takes the lock or registers
+/// a waiter atomically, and `block_until_deadline` re-checks the condition under
+/// the scheduler's own lock before parking, so a release is never missed). A
+/// `kind` of `None` is an unlock.
+#[cfg(target_os = "none")]
+fn lock_take(
+    dev: u64,
+    ino: u64,
+    owner: u32,
+    class: crate::vfs::locks::LockClass,
+    kind: Option<crate::vfs::locks::LockKind>,
+    lo: i64,
+    hi: i64,
+    block: bool,
+) -> isize {
+    use crate::vfs::locks;
+    if !block {
+        return match locks::set(dev, ino, owner, class, kind, lo, hi) {
+            Ok(()) => 0,
+            Err(_holder) => err::EAGAIN,
+        };
+    }
+    let me = crate::sched::current().0;
+    loop {
+        if locks::set_or_arm(dev, ino, owner, class, me, kind, lo, hi) {
+            locks::disarm(me);
+            return 0;
+        }
+        match crate::sched::block_until_deadline(
+            || locks::is_free(dev, ino, owner, class, kind, lo, hi),
+            u64::MAX,
+        ) {
+            crate::sched::WaitEnd::Condition => continue,
+            crate::sched::WaitEnd::Interrupted => {
+                locks::disarm(me);
+                return err::EINTR;
+            }
+            crate::sched::WaitEnd::Deadline => unreachable!("no timeout"),
+        }
+    }
+}
+
+/// One `fcntl` locking command against `fd`: `F_GETLK` reports the first
+/// conflicting lock, `F_SETLK`/`F_SETLKW` take or drop one. `arg` is a user
+/// `struct flock *`; for `F_SETLK` the fields are read, and a conflict is the
+/// holder's pid (returned as `EAGAIN`).
+#[cfg(target_os = "none")]
+fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
+    use crate::vfs::locks::{self, F_RDLCK, F_WRLCK, LockClass};
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    if arg == 0 || !crate::syscall::buffer_ok(arg, flock_off::BYTES, cmd == abi::F_GETLK, true) {
+        return err::EFAULT;
+    }
+    let read_i16 = |off: usize| unsafe { ((arg + off) as *const i16).read_unaligned() };
+    let read_i64 = |off: usize| unsafe { ((arg + off) as *const i64).read_unaligned() };
+    let l_type = read_i16(flock_off::TYPE);
+    let l_whence = read_i16(flock_off::WHENCE);
+    let l_start = read_i64(flock_off::START);
+    let l_len = read_i64(flock_off::LEN);
+
+    let meta = file.metadata();
+    let inode = file.inode();
+    let dev = crate::vfs::mount::fs_id_of_inode(&inode);
+    let ino = meta.ino;
+    let size = meta.size as i64;
+    let owner = crate::sched::current_tgid().0 as u32;
+
+    let (lo, hi) = match locks::resolve_range(l_whence, l_start, l_len, size, file.pos() as i64) {
+        Some(r) => r,
+        None => return err::EINVAL,
+    };
+
+    match cmd {
+        abi::F_GETLK => {
+            // Ask as the requested kind; a lock the caller would take is
+            // reported back with the holder's kind, range and pid, or cleared
+            // to `F_UNLCK` when nothing is in the way.
+            let kind = if l_type == F_WRLCK {
+                locks::LockKind::Write
+            } else {
+                locks::LockKind::Read
+            };
+            let write_i16 =
+                |off: usize, v: i16| unsafe { ((arg + off) as *mut i16).write_unaligned(v) };
+            let write_i64 =
+                |off: usize, v: i64| unsafe { ((arg + off) as *mut i64).write_unaligned(v) };
+            match locks::query(dev, ino, owner, LockClass::Record, kind, lo, hi) {
+                Some(held) => {
+                    write_i16(
+                        flock_off::TYPE,
+                        match held.kind {
+                            locks::LockKind::Write => F_WRLCK,
+                            locks::LockKind::Read => F_RDLCK,
+                        },
+                    );
+                    write_i64(flock_off::START, held.start);
+                    write_i64(
+                        flock_off::LEN,
+                        if held.end == locks::INF {
+                            0
+                        } else {
+                            held.end - held.start
+                        },
+                    );
+                    unsafe {
+                        ((arg + flock_off::PID) as *mut i32).write_unaligned(held.owner as i32)
+                    };
                 }
-                // struct flock on x86_64: l_type(i16) + l_whence(i16) + pad(4)
-                // + l_start(i64) + l_len(i64) + l_pid(i32) = 32 bytes.
-                // l_type = F_UNLCK (2), rest zeroed.
-                unsafe {
-                    core::ptr::write_bytes(arg as *mut u8, 0, 32);
-                    (arg as *mut u16).write_unaligned(2); // F_UNLCK
-                }
+                None => write_i16(flock_off::TYPE, 2), // F_UNLCK
             }
             0
         }
-        F_SETLK | F_SETLKW => 0, // always succeed: single-locker system
+        F_SETLK | F_SETLKW => {
+            // An `F_UNLCK` drops the range, the others take it; `F_SETLK` is
+            // the non-blocking spelling and `F_SETLKW` waits for the range.
+            let kind = match l_type {
+                F_RDLCK => Some(locks::LockKind::Read),
+                F_WRLCK => Some(locks::LockKind::Write),
+                2 => None, // F_UNLCK
+                _ => return err::EINVAL,
+            };
+            lock_take(dev, ino, owner, LockClass::Record, kind, lo, hi, cmd == abi::F_SETLKW)
+        }
         _ => err::EINVAL,
     }
+}
+
+#[cfg(not(target_os = "none"))]
+fn record_lock(_fd: i32, _cmd: usize, _arg: usize) -> isize {
+    err::EINVAL
 }
 
 // The `struct pollfd` layout (its size, where `events` and `revents` sit)
@@ -1342,14 +1968,24 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         nodes.push(node);
     }
 
-    let ready = loop {
+    let ready: isize = loop {
         let count = check_ready(fds, &nodes);
         if count > 0 {
-            break count;
+            break count as isize;
         }
         let expired = deadline.is_some_and(|end| crate::arch::timer::ticks() >= end);
         if expired {
             break 0;
+        }
+        // A pending signal ends the wait: this is an *interruptible* wait, and
+        // the gate delivers the signal on the way out, where a register file
+        // exists to build a handler's frame on. Without this the signal is
+        // never seen here at all - the wait runs to its own deadline, and a
+        // wait that has none never ends. `ping` is the shape it matters for: a
+        // reply ends the wait, and the next request is sent when the wait
+        // times out or a signal arrives.
+        if crate::sched::has_deliverable_signal() {
+            break -1;
         }
         // One tick of sleep, then a fresh check - the same wait the bounded
         // form uses. Parking in `block_until` here would need a waker behind
@@ -1364,7 +2000,10 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     for node in nodes.iter().flatten() {
         node.poll_unsubscribe(me);
     }
-    ready as isize
+    if ready < 0 {
+        return err::EINTR;
+    }
+    ready
 }
 
 /// Fill in \`revents\` for every entry and answer how many have something.
@@ -1549,6 +2188,11 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         if deadline.is_some_and(|end| crate::arch::timer::ticks() >= end) {
             break 0;
         }
+        // The same interruptible-wait rule as `poll`: a pending signal ends
+        // this wait, and the gate delivers it on the way out.
+        if crate::sched::has_deliverable_signal() {
+            break -1;
+        }
         match deadline {
             // Without a timeout and without descriptors there is nothing
             // that could wake this wait and nothing waiting for it: answer
@@ -1577,6 +2221,9 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         if let Some(node) = &watch.node {
             node.poll_unsubscribe(me);
         }
+    }
+    if count < 0 {
+        return err::EINTR;
     }
 
     // Rewrite the caller's sets with only the ready bits, as select's
@@ -1760,6 +2407,18 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
+    // POSIX drops every one of the process's record locks on a file the moment
+    // it closes any descriptor to it - the behaviour that surprises people, and
+    // the reason the lock is keyed by the file and the owner, not the fd.
+    #[cfg(target_os = "none")]
+    {
+        let inode = file.inode();
+        crate::vfs::locks::release(
+            crate::vfs::mount::fs_id_of_inode(&inode),
+            file.metadata().ino,
+            crate::sched::current_tgid().0 as u32,
+        );
+    }
     match crate::vfs::close(fd) {
         Ok(()) => {}
         Err(e) => return err_of(e),
@@ -1779,6 +2438,14 @@ pub(super) fn handle_lseek(args: [usize; ARG_COUNT]) -> isize {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
+    // A pipe, a socket or a terminal has no position to move, and Linux says
+    // so with ESPIPE. Answering with a number instead is worse than useless:
+    // a caller that pushes back bytes it did not want - which is how a
+    // buffered reader un-reads the tail of a chunk - is told the push-back
+    // worked and then drops them.
+    if !file.inode().seekable() {
+        return err::ESPIPE;
+    }
     let cur = file.pos() as i64;
     let size = file.metadata().size as i64;
     // The whence arithmetic and the "before byte 0 is EINVAL" rule are the
@@ -1849,7 +2516,10 @@ pub(super) fn handle_dup(args: [usize; ARG_COUNT]) -> isize {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
-    crate::sched::current_fds().install(file) as isize
+    match crate::sched::current_fds().install(file) {
+        Ok(fd) => fd as isize,
+        Err(e) => err_of(e),
+    }
 }
 
 /// `dup2(oldfd, newfd)` — make `newfd` name what `oldfd` names.
@@ -1910,10 +2580,20 @@ pub(super) fn handle_pipe(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let nonblocking = flags & O_NONBLOCK != 0;
     read_end.set_nonblocking(nonblocking);
     write_end.set_nonblocking(nonblocking);
-    let fds = [
-        crate::vfs::file::open_inode(read_end),
-        crate::vfs::file::open_inode(write_end),
-    ];
+    let fd0 = match crate::vfs::file::open_inode(read_end) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
+    let fd1 = match crate::vfs::file::open_inode(write_end) {
+        Ok(fd) => fd,
+        Err(e) => {
+            // The read end landed but the write end could not: hand the first
+            // back so a failed `pipe` leaves no descriptor behind.
+            let _ = crate::vfs::close(fd0);
+            return err_of(e);
+        }
+    };
+    let fds = [fd0, fd1];
     if flags & O_CLOEXEC != 0 {
         let table = crate::sched::current_fds();
         for fd in fds {
@@ -1977,6 +2657,22 @@ pub(super) fn handle_fchdir(args: [usize; ARG_COUNT]) -> isize {
     0
 }
 
+/// Push the stored `O_NONBLOCK` bit down to where the blocking behaviour
+/// actually lives.
+///
+/// `fcntl(F_SETFL)` and `ioctl(FIONBIO)` both set the flag on the description,
+/// but a pipe's and an eventfd's blocking is the *inode's* own: the bit has to
+/// be mirrored there too, or a `fcntl(F_SETFL, O_NONBLOCK)` on a plain
+/// `pipe()` would read and write exactly as a blocking one.
+fn sync_nonblocking(file: &crate::vfs::File, status: u32) {
+    let on = status & crate::vfs::file::O_NONBLOCK != 0;
+    if let Some(pipe) = file.inode().as_pipe() {
+        pipe.set_nonblocking(on);
+    } else if let Some(eventfd) = file.inode().as_eventfd() {
+        eventfd.set_nonblocking(on);
+    }
+}
+
 /// `ioctl(fd, request, arg)` — terminal settings and queries, stub the rest.
 ///
 /// `TCGETS` and `TCSETS` are the ones that matter: a shell asks what the
@@ -1989,6 +2685,34 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, request) = (args[0] as i32, args[1] as u32);
     let buf = args[2];
     match request {
+        0x5421 => {
+            // FIONBIO: set or clear `O_NONBLOCK` - `fcntl(F_SETFL)`'s bit in
+            // an ioctl's clothes, and the one request here that is about any
+            // descriptor rather than a terminal. It is not optional: Rust's
+            // std puts the pipes it is about to `poll` into non-blocking mode
+            // exactly this way, so answering ENOTTY makes every
+            // `Command::output()` panic with "Not a tty" - which is how
+            // `rustup-init` dies on its first command. The other status bits
+            // are left alone, because this request carries only the one.
+            if !buffer_ok(buf, 4, false, from_user) {
+                return err::EFAULT;
+            }
+            let on = unsafe { (buf as *const i32).read_unaligned() } != 0;
+            match crate::sched::current_fds().clone_at(fd) {
+                Ok(file) => {
+                    let mut status = file.status();
+                    if on {
+                        status |= crate::vfs::file::O_NONBLOCK;
+                    } else {
+                        status &= !crate::vfs::file::O_NONBLOCK;
+                    }
+                    file.set_status(status);
+                    sync_nonblocking(&file, status);
+                    0
+                }
+                Err(e) => err_of(e),
+            }
+        }
         0x5413 => {
             // TIOCGWINSZ: report 80x25. `isatty` is a call to this on musl,
             // so it has to work on a tty and fail everywhere else - and the
@@ -2080,6 +2804,46 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return err::EINVAL;
             }
             tty.set_foreground(Some(crate::sched::TaskId(pgid as usize)));
+            // POSIX's `tcsetpgrp` is not only a record: it sends `SIGCONT` to
+            // the group it names. That is what resumes a job that stopped
+            // itself waiting to be made foreground - a shell's `fg`, and a
+            // supervisor's handshake - and without it the wait is one-way: the
+            // group is named the foreground and the process that was going to
+            // use that answer is still stopped, for the machine's life.
+            crate::sched::send_signal_group(
+                crate::sched::TaskId(pgid as usize),
+                crate::sched::signal::SIGCONT,
+            );
+            0
+        }
+        // TIOCGSID: the session the terminal belongs to - `tcgetsid`, which a
+        // job-control shell asks before it decides whether this terminal is
+        // *its* terminal to claim. Only the session leader that owns the line
+        // may take it, and a shell that cannot find out has to assume it may
+        // not: `su`'s shell then leaves the terminal to the process that
+        // acquired it and stops itself waiting to be made foreground. A
+        // terminal no session holds has no answer, which is ENOTTY.
+        0x5429 => {
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            let inode = file.inode();
+            if inode.as_tty().is_none() {
+                return err::ENOTTY;
+            }
+            // A pair is one terminal, so the master asks about the slave's
+            // session - the id its binding was recorded under.
+            let dev_id = inode
+                .as_pty()
+                .map_or_else(|| inode.rdev(), |pty| Some(pty.slave_dev_id()));
+            let Some(sid) = dev_id.and_then(crate::sched::session_of_tty) else {
+                return err::ENOTTY;
+            };
+            if !buffer_ok(buf, 4, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut i32).write_unaligned(sid as i32) };
             0
         }
         0x80045430 | 0x40045431 => {
@@ -2532,20 +3296,52 @@ pub(super) fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
+/// The mode a `chmod` is allowed to store, or the errno that refuses it.
+///
+/// Two rules, both Linux's. Only the owner of a node - or root - may change
+/// its mode: the bits are the owner's to set, and letting anyone rewrite them
+/// is letting anyone hand themselves the file. And an unprivileged caller
+/// changing a node whose group is not one of theirs loses the set-group-id
+/// bit, because that bit says "run me as this group" and a caller outside the
+/// group has no standing to grant it - which is exactly the hole a `chmod
+/// g+s` on somebody else's file would otherwise open.
+fn chmod_mode(inode: &Arc<dyn Inode>, mode: u32) -> Result<u32, isize> {
+    let me = crate::sched::current_owner();
+    let owner = inode.owner();
+    if me.0 != 0 && me.0 != owner.0 {
+        return Err(err::EPERM);
+    }
+    let mut mode = mode & 0o7777;
+    if me.0 != 0 && !crate::sched::current_groups().contains(&owner.1) {
+        mode &= !crate::vfs::S_ISGID;
+    }
+    Ok(mode)
+}
+
 /// `chmod(2)` / `fchmod(2)` — set permission bits.
 ///
-/// There is one user and no permission checks anywhere in this kernel, so
-/// every mode is satisfiable and the call is a shape check: the descriptor
-/// or the path has to exist. The bits are not remembered, which is the same
-/// answer a caller gets on a filesystem mounted without them.
+/// Two rules decide who may, both Linux's, and they live in [`chmod_mode`]:
+/// the owner of the node (or root) is the only one who may rewrite its bits,
+/// and an unprivileged caller changing a node whose group is not one of
+/// theirs does not get to keep the set-group-id bit. The bits are *stored*,
+/// not merely accepted: it is how a package install marks its setuid helpers
+/// and its scripts, and a kernel that forgets them hands back a tree where
+/// `doas` says "not installed setuid" and every service script fails
+/// `test -x`.
 pub(super) fn handle_chmod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let (path, _mode) = (args[0], args[1]);
+    let (path, mode) = (args[0], args[1] as u32);
     let path = match cstr_arg(path, true) {
         Ok(p) => p,
         Err(e) => return e,
     };
     match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
-        Ok(_) => 0,
+        Ok(inode) => match chmod_mode(&inode, mode) {
+            Ok(mode) => {
+                inode.set_mode(mode);
+                0
+            }
+            Err(e) => e,
+        },
         Err(e) => err_of(e),
     }
 }
@@ -2553,20 +3349,99 @@ pub(super) fn handle_chmod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
 /// `fchmod(2)` — the same, by descriptor.
 pub(super) fn handle_fchmod(args: [usize; ARG_COUNT]) -> isize {
     match crate::sched::current_fds().clone_at(args[0] as i32) {
-        Ok(_) => 0,
+        Ok(file) => {
+            let inode = file.inode();
+            match chmod_mode(&inode, args[1] as u32) {
+                Ok(mode) => {
+                    inode.set_mode(mode);
+                    0
+                }
+                Err(e) => e,
+            }
+        }
         Err(e) => err_of(e),
     }
 }
 
 /// `chown(2)` / `fchown(2)` — set owner and group. One user, no groups:
 /// the call is accepted for anything that exists, as `chmod` is.
+/// The ids a `chown`-family call names, applied to what the node has now.
+///
+/// `-1` is the family's "leave this one alone", which is why the caller's word
+/// is read as signed before it is believed; a caller that means root passes a
+/// plain zero. The ids are stored rather than noted and dropped: an unpacked
+/// package's files belong to whoever the archive says, and a kernel that
+/// answers every `ls -l` with root:root cannot tell one user's work from
+/// another's.
+/// The owner a `chown` is allowed to store, or the errno that refuses it.
+///
+/// Linux's rules, and the asymmetry is the point. Changing the **owner** needs
+/// privilege: the uid is the identity a file's permissions are measured
+/// against, so naming somebody else is handing them the file, and only root
+/// may. Changing the **group** needs less - the file's owner may do it, but
+/// only to a group they are themselves in, because the group is what a
+/// set-group-id file runs with and naming a group you are not in would be
+/// granting yourself its authority. Root may name any group.
+///
+/// A `-1` means "leave this one alone", which is how a caller changes one id
+/// without having to know the other.
+fn chown_allowed(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> Result<(u32, u32), isize> {
+    let current = inode.owner();
+    let me = crate::sched::current_owner();
+    let privileged = me.0 == 0;
+    let owner = me.0 == current.0;
+
+    let uid = if uid_arg == -1 {
+        current.0
+    } else {
+        uid_arg as u32
+    };
+    let gid = if gid_arg == -1 {
+        current.1
+    } else {
+        gid_arg as u32
+    };
+
+    if !privileged && uid != current.0 {
+        return Err(err::EPERM);
+    }
+    if !privileged && gid != current.1 && (!owner || !crate::sched::current_groups().contains(&gid))
+    {
+        return Err(err::EPERM);
+    }
+    Ok((uid, gid))
+}
+
+/// Store a new owner for `inode`, applying the rules above and dropping the
+/// set-uid and set-group-id bits when an unprivileged caller is the one
+/// changing it.
+///
+/// Those two bits are the authority the file runs with. A caller who could
+/// rewrite who a file belongs to *and* keep them would be choosing its own
+/// privileges, which is the whole of what the rule prevents.
+fn chown_apply(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> isize {
+    let before = inode.owner();
+    let (uid, gid) = match chown_allowed(inode, uid_arg, gid_arg) {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    inode.set_owner(uid, gid);
+    if crate::sched::current_owner().0 != 0
+        && (uid != before.0 || gid != before.1)
+        && inode.keeps_modes()
+    {
+        inode.set_mode(inode.mode() & !(crate::vfs::S_ISUID | crate::vfs::S_ISGID));
+    }
+    0
+}
+
 pub(super) fn handle_chown(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(p) => p,
         Err(e) => return e,
     };
     match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
-        Ok(_) => 0,
+        Ok(inode) => chown_apply(&inode, args[1] as i32, args[2] as i32),
         Err(e) => err_of(e),
     }
 }
@@ -2574,7 +3449,10 @@ pub(super) fn handle_chown(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
 /// `fchown(2)` — the same, by descriptor.
 pub(super) fn handle_fchown(args: [usize; ARG_COUNT]) -> isize {
     match crate::sched::current_fds().clone_at(args[0] as i32) {
-        Ok(_) => 0,
+        Ok(file) => {
+            let inode = file.inode();
+            chown_apply(&inode, args[1] as i32, args[2] as i32)
+        }
         Err(e) => err_of(e),
     }
 }
@@ -2601,11 +3479,10 @@ pub(super) fn handle_fchownat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) ->
     } else {
         crate::vfs::resolve_opt(&path, Some(base))
     };
-    // The owner is not stored, so nothing is changed - but the name is still
-    // resolved, because a caller that named something wrong has to hear about
-    // it rather than be told the owner was set.
+    // The name is resolved first, because a caller that named something wrong
+    // has to hear about it rather than be told the owner was set.
     match found {
-        Ok(_) => 0,
+        Ok(inode) => chown_apply(&inode, args[2] as i32, args[3] as i32),
         Err(e) => err_of(e),
     }
 }
@@ -2656,10 +3533,30 @@ pub(super) fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
     };
     // Both names have to exist as paths for the request to be a request:
     // a link to a missing file is ENOENT, not EPERM.
-    let old = match crate::vfs::global().resolve_no_follow(&old_path, old_base) {
+    let old = match crate::vfs::global().resolve_no_follow(&old_path, old_base.clone()) {
         Ok(inode) => inode,
         Err(e) => return err_of(e),
     };
+    // `AT_SYMLINK_FOLLOW` says the source is the *file* the name leads to
+    // rather than the name. Without it a link to a link is what was asked
+    // for, which is the same reading `AT_SYMLINK_NOFOLLOW` gives every other
+    // call. With it there are two ways through, and the second is the whole
+    // reason the flag exists here: a stored link is resolved again following
+    // it, and a descriptor's second name under `/proc` - which resolution
+    // hands back unspliced on purpose, because opening one has to clone the
+    // descriptor rather than reopen a path - is the file that descriptor
+    // holds. That is how a file with no name of its own gets one, which is
+    // what `apk` does with the repository index it wrote through `O_TMPFILE`.
+    let followed = if args[4] & abi::AT_SYMLINK_FOLLOW != 0 {
+        match followed_link(&old_path, old_base) {
+            Ok(inode) => Some(inode),
+            Err(e) => return err_of(e),
+        }
+    } else {
+        None
+    };
+    let via_descriptor = followed.is_some() && old.as_fd().is_some();
+    let old = followed.unwrap_or(old);
     let (parent_path, name) = match crate::vfs::split_parent(&new_path) {
         Ok(p) => p,
         Err(e) => return err_of(e),
@@ -2671,12 +3568,36 @@ pub(super) fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
     // A name edge belongs to the filesystem that keeps the directory. An old
     // inode served by a different filesystem cannot be reached by one of this
     // one's edges, which is `link(2)`'s EXDEV - the caller's cue to copy.
-    // The filesystem instance is identified by the deepest mountpoint over
-    // each path, the same rule `st_dev` uses; inode identity cannot answer
-    // here, because a non-mount-root node does not know its filesystem.
-    let old_fs = crate::vfs::mount::fs_of_path(&absolute(&old_path)).0;
-    let parent_fs = crate::vfs::mount::fs_of_path(&absolute(parent_path)).0;
-    if old_fs != parent_fs {
+    //
+    // The source is asked for its filesystem in whichever way it can answer.
+    // While the source is still a *name*, the deepest mountpoint over each
+    // path is the answer - the rule `st_dev` uses, and the only one that also
+    // places a node *inside* a mount, which no inode of its own can
+    // (`/proc/mounts` is procfs, and only its path says so). Followed through
+    // a descriptor it is not a name any more: `/proc/self/fd/7` names procfs
+    // while standing for a file on the root filesystem, so the file is asked
+    // instead, by the same identity test `fstatfs` uses on a descriptor.
+    //
+    // The identity test is the weaker of the two for a node inside a mount
+    // that is not the mount's own root - such an inode cannot say which
+    // filesystem it belongs to, and the answer falls back to the root's - and
+    // it can therefore refuse a link that would have worked. A refusal is the
+    // safe direction: EXDEV's meaning is "copy instead", which is what the
+    // caller does, and the alternative is a directory entry naming an inode
+    // the filesystem does not own.
+    let same_filesystem = if via_descriptor {
+        match (
+            crate::vfs::mount::global().fs_serving_inode(&old),
+            crate::vfs::mount::global().fs_serving_inode(&parent),
+        ) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+            _ => false,
+        }
+    } else {
+        crate::vfs::mount::fs_of_path(&absolute(&old_path)).0
+            == crate::vfs::mount::fs_of_path(&absolute(parent_path)).0
+    };
+    if !same_filesystem {
         return err::EXDEV;
     }
     match parent.link(name, &old) {
@@ -2779,7 +3700,10 @@ pub(super) fn handle_epoll_create1(args: [usize; ARG_COUNT]) -> isize {
 /// carrying the close-on-exec flag that belongs to the number, not to the
 /// instance.
 fn epoll_create(flags: usize) -> isize {
-    let fd = crate::vfs::open_inode(crate::vfs::epoll::Epoll::new(next_anon_ino()));
+    let fd = match crate::vfs::open_inode(crate::vfs::epoll::Epoll::new(next_anon_ino())) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
     if flags & EPOLL_CLOEXEC != 0 {
         let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
     }
@@ -2952,11 +3876,14 @@ pub(super) fn handle_timerfd_create(args: [usize; ARG_COUNT]) -> isize {
     if flags & !(crate::vfs::timerfd::TFD_CLOEXEC | crate::vfs::timerfd::TFD_NONBLOCK) != 0 {
         return err::EINVAL;
     }
-    let fd = crate::vfs::open_inode(crate::vfs::timerfd::TimerFd::new(
+    let fd = match crate::vfs::open_inode(crate::vfs::timerfd::TimerFd::new(
         next_anon_ino(),
         clockid,
         flags & crate::vfs::timerfd::TFD_NONBLOCK != 0,
-    ));
+    )) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
     if flags & crate::vfs::timerfd::TFD_CLOEXEC != 0 {
         let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
     }
@@ -3496,7 +4423,7 @@ pub(super) fn handle_openat2(
         Ok(path) => path,
         Err(e) => return e,
     };
-    open_linux(&path, flags, base)
+    open_linux(&path, flags, mode as u32, base)
 }
 
 /// `faccessat2(dirfd, path, mode, flags)` — the access check with the
@@ -3511,16 +4438,11 @@ pub(super) fn handle_openat2(
 /// kernel keeps: a directory traverses, a script with its bit clear does
 /// not, which is the question a shell's `test -x` is asking.
 pub(super) fn handle_faccessat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    const AT_EACCESS: usize = 0x200;
-    const R_OK: usize = 4;
-    const W_OK: usize = 2;
-    const X_OK: usize = 1;
-
     let (dirfd, path_ptr, mode, flags) = (args[0] as i32, args[1], args[2], args[3]);
-    if mode & !(R_OK | W_OK | X_OK) != 0 {
+    if mode & !(R_OK as usize | W_OK as usize | X_OK as usize) != 0 {
         return err::EINVAL;
     }
-    if flags & !(abi::AT_SYMLINK_NOFOLLOW | AT_EACCESS) != 0 {
+    if flags & !(abi::AT_SYMLINK_NOFOLLOW | abi::AT_EACCESS) != 0 {
         return err::EINVAL;
     }
     let base = match base_of(dirfd, cwd) {
@@ -3537,21 +4459,7 @@ pub(super) fn handle_faccessat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) 
         crate::vfs::resolve_opt(&path, Some(base))
     };
     match found {
-        Ok(inode) => {
-            if mode & X_OK != 0 {
-                // Root's X_OK is "any execute bit, anywhere in the mode" -
-                // the stored bits when the filesystem keeps them, and the
-                // kind's defaults when it does not.
-                let full = abi::mode_of(&inode.metadata(), inode.mode());
-                if full & 0o111 == 0 {
-                    return err::EACCES;
-                }
-            }
-            // R_OK and W_OK: one user, and it is root. The read and write
-            // checks this kernel can actually make are about existence and
-            // writability of the storage, which `open` itself answers.
-            0
-        }
+        Ok(inode) => access_check(&inode, mode, access_ids(flags)),
         Err(e) => err_of(e),
     }
 }
@@ -3580,7 +4488,13 @@ pub(super) fn handle_fchmodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) ->
         Err(e) => return e,
     };
     match crate::vfs::resolve_opt(&path, Some(base)) {
-        Ok(_) => 0,
+        Ok(inode) => match chmod_mode(&inode, args[2] as u32) {
+            Ok(mode) => {
+                inode.set_mode(mode);
+                0
+            }
+            Err(e) => e,
+        },
         Err(e) => err_of(e),
     }
 }
@@ -3620,8 +4534,16 @@ pub(super) fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> 
     {
         return 0;
     }
+    // The parent's bits decide whether a name may be made here, and the mode
+    // arrives masked like every other create's.
+    if let Err(e) = crate::vfs::may_create_in(&parent) {
+        return err_of(e);
+    }
     match parent.create(name, kind) {
-        Ok(_) => 0,
+        Ok(created) => {
+            created.set_mode(masked_mode(args[2] as u32));
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -3640,16 +4562,35 @@ pub(super) fn handle_futimesat(
     from_user: bool,
 ) -> isize {
     let (dirfd, path_ptr, tvp) = (args[0] as i32, args[1], args[2]);
-    if path_ptr == 0 {
+    let inode: Arc<dyn Inode> = if path_ptr == 0 {
         if dirfd == abi::AT_FDCWD {
             return err::EINVAL;
         }
-        return match crate::sched::current_fds().clone_at(dirfd) {
-            Ok(_) => 0,
-            Err(e) => err_of(e),
+        match crate::sched::current_fds().clone_at(dirfd) {
+            Ok(file) => file.inode(),
+            Err(e) => return err_of(e),
+        }
+    } else {
+        let base = match base_of(dirfd, cwd) {
+            Ok(base) => base,
+            Err(e) => return e,
         };
-    }
-    if tvp != 0 {
+        let path = match cstr_arg(path_ptr, true) {
+            Ok(path) => path,
+            Err(e) => return e,
+        };
+        match crate::vfs::resolve_opt(&path, Some(base)) {
+            Ok(inode) => inode,
+            Err(e) => return err_of(e),
+        }
+    };
+    // `futimesat` carries `struct timeval times[2]`; the microseconds are
+    // validated but dropped, since an inode clock is whole seconds. A null
+    // `tvp` means "now, both".
+    let (atime, mtime) = if tvp == 0 {
+        let now = wall_now();
+        (now, now)
+    } else {
         if !buffer_ok(tvp, 32, false, from_user) {
             return err::EFAULT;
         }
@@ -3662,17 +4603,13 @@ pub(super) fn handle_futimesat(
         if a_usec >= 1_000_000 || m_usec >= 1_000_000 {
             return err::EINVAL;
         }
-    }
-    let base = match base_of(dirfd, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
+        (
+            unsafe { (tvp as *const i64).read_unaligned() } as u64,
+            unsafe { ((tvp + 16) as *const i64).read_unaligned() } as u64,
+        )
     };
-    let path = match cstr_arg(path_ptr, true) {
-        Ok(path) => path,
-        Err(e) => return e,
-    };
-    match crate::vfs::resolve_opt(&path, Some(base)) {
-        Ok(_) => 0,
+    match inode.set_times(atime, mtime) {
+        Ok(()) => 0,
         Err(e) => err_of(e),
     }
 }
@@ -3686,7 +4623,12 @@ pub(super) fn handle_creat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         Err(e) => return e,
     };
     // O_WRONLY (1) of the access bits: the write-only the name promises.
-    open_linux(&path, abi::O_CREAT | abi::O_TRUNC | 1, cwd.clone())
+    open_linux(
+        &path,
+        abi::O_CREAT | abi::O_TRUNC | 1,
+        args[1] as u32,
+        cwd.clone(),
+    )
 }
 
 /// `utime(path, times)` — the seconds-only spelling of the timestamps
@@ -3706,8 +4648,23 @@ pub(super) fn handle_utime(
         Ok(path) => path,
         Err(e) => return e,
     };
-    match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
-        Ok(_) => 0,
+    let inode = match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
+        Ok(inode) => inode,
+        Err(e) => return err_of(e),
+    };
+    // `struct utimbuf { time_t actime; time_t modtime; }`; a null pointer sets
+    // both clocks to now, exactly as `utime(path, NULL)` says.
+    let (atime, mtime) = if times == 0 {
+        let now = wall_now();
+        (now, now)
+    } else {
+        (
+            unsafe { (times as *const i64).read_unaligned() } as u64,
+            unsafe { ((times + 8) as *const i64).read_unaligned() } as u64,
+        )
+    };
+    match inode.set_times(atime, mtime) {
+        Ok(()) => 0,
         Err(e) => err_of(e),
     }
 }

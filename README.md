@@ -30,7 +30,7 @@ The kernel is organized as a **Rust library** (`src/lib.rs`) that can be unit-te
 | **Milestone Verification** | Each subsystem is proven correct before the next is built. Serial logs carry markers (`M0_OK` through `M14_OK`) asserted by the test harness. |
 | **Host-Testable Split** | Architecture-independent code lives in the library crate and runs on the host via `cargo test`. Machine-dependent code is gated behind `#[cfg(target_os = "none")]`. |
 | **Linux ABI Compatible** | ~225 Linux x86_64 system calls implemented. musl binaries (Alpine, busybox) run unmodified on the kernel. |
-| **Write-Through ext2** | Complete read/write ext2 with write-through semantics—no journal, no dirty page tracking, crash-visible. |
+| **Write-Through ext2/ext4** | Complete read/write ext2 and ext4 with write-through semantics—no journal, no dirty page tracking, crash-visible. |
 | **Priority Scheduler** | Strict priority across four bands (LOW, NORMAL, HIGH, CRITICAL), round-robin within a band, deadline-based sleep queue, COW fork, demand-paged stack growth. |
 | **TCP/IP Networking** | smoltcp-based stack with TCP, UDP, ICMP, ARP over virtio-net. AF_INET only—sufficient for musl's DNS resolver and apk's HTTP. |
 | **Interactive Shell** | Alpine's ash shell with pipes, redirection, environment variables, background jobs, and a scriptable init. |
@@ -58,7 +58,7 @@ graph TB
         subgraph VFS["VFS Layer"]
             VFS_CORE["Inode trait + mount table"]
             RAMFS["ramfs (initramfs, tmpfs)"]
-            EXT2["ext2 (read/write)"]
+            EXT2["ext2/ext4 (read/write)"]
             DEVFS["devfs (/dev/null, tty, console, ...)"]
             PROCFS["procfs (/proc/meminfo, cmdline, ...)"]
             SYSFS["sysfs (/sys/class/block, ...)"]
@@ -125,7 +125,7 @@ graph TD
     C --> G["paging::install() — 4-level tables, NX, WP"]
     C --> H["sched::init() — adopt boot task, create scheduler task"]
     C --> I["vfs::init() — ramfs root, unpack initramfs.tar"]
-    C --> J["blk::init() — virtio-blk, GPT scan, ext2 mount"]
+    C --> J["blk::init() — virtio-blk, GPT scan, ext2/ext4 mount"]
     C --> K["net::init() — virtio-net, smoltcp, 10.0.2.15/24"]
     C --> L["rand::init() — ChaCha20 from RDRAND"]
     C --> M["Milestone checks M0–M8"]
@@ -217,7 +217,7 @@ mpos/
 │   │   ├── file.rs          # Open file table (fd table)
 │   │   ├── mount.rs         # Mount table, Vfs struct, pivot_root
 │   │   ├── ramfs.rs         # In-memory filesystem
-│   │   ├── ext2.rs          # Read/write ext2 (write-through)
+│   │   ├── ext4.rs          # Read/write ext2 and ext4 (write-through)
 │   │   ├── devfs.rs         # /dev/null, /dev/zero, /dev/tty, /dev/console, ...
 │   │   ├── devpts.rs        # /dev/pts/* (PTY)
 │   │   ├── procfs.rs        # /proc (meminfo, mounts, cmdline, maps, fd, ...)
@@ -575,7 +575,7 @@ Each milestone proves the current subsystem correct before the next is built.
 | **M7** | VFS | ramfs root, mounted sub-filesystems, multi-task file I/O |
 | **M8** | Initramfs & devfs | tar unpacking, `/dev/tty`, `/dev/console`, `/dev/null`, `/dev/zero` |
 | **M9** | Processes | ELF loaded into new address space; Ring 3 entry; exit code round-trip |
-| **M10** | Block Device & ext2 | virtio-blk detection; ext2 mount, read, write, cold-mount verification |
+| **M10** | Block Device & ext2/ext4 | virtio-blk detection; ext2/ext4 mount, read, write, cold-mount verification |
 | **M11** | Pipes, TTY, Signals | Pipe byte transfer and EOF; TTY line editing; SIGTERM, SIGKILL, kill(0) |
 | **M12** | Shell & Core Utils | Shell, echo, cat, ls, true, false, sleep — all running in Ring 3 |
 | **M13** | Init Handoff | `/sbin/init` becomes PID 1; shell becomes interactive via UART interrupts |
@@ -592,7 +592,7 @@ Each milestone proves the current subsystem correct before the next is built.
 - **OVMF** — UEFI firmware (`/usr/share/OVMF/x64/OVMF_CODE.4m.fd`)
 - **python3** — `scripts/mkfat.py` builds FAT32 without loop devices
 - **parted** — GPT partition table
-- **mke2fs** / **e2fsprogs** — ext2 data partition
+- **mke2fs** / **e2fsprogs** — ext2/ext4 data partition
 
 ```bash
 rustup toolchain install nightly
@@ -637,7 +637,7 @@ Builds everything and assembles a 4-partition GPT disk image `build/linux-x86_64
 |-----------|------|----------|
 | 1, `ESP` | FAT32, 34 MiB | `EFI/BOOT/BOOTX64.EFI` (Limine), `limine.conf` |
 | 2, `Boot` | FAT32, 192 MiB | `mpos.elf`, `initramfs.tar` |
-| 3, `Root` | ext2, 384 MiB | Alpine Linux rootfs (OpenRC, musl, busybox, apk) |
+| 3, `Root` | ext2/ext4, 384 MiB | Alpine Linux rootfs (OpenRC, musl, busybox, apk) |
 | 4, `Data` | ext2, 8 MiB | Seed files (text documents for testing) |
 
 QEMU boots directly under OVMF — no ISO, no optical drive, no loop device. The FAT32 volumes are written byte-by-byte by `scripts/mkfat.py`.
@@ -710,7 +710,7 @@ Pages shared between parent and child are marked read-only with a COW bit (PTE b
 
 The user stack starts at 16 pages (64 KiB) and grows on fault, bounded by `USER_STACK_MAX = 8 MiB` and `STACK_GROWTH_SLACK = 64 KiB`. The fault handler checks the current stack limit and maps a new page if within bounds.
 
-### Write-Through ext2
+### Write-Through ext2/ext4
 
 Every `write_at()` flushes immediately through the block cache. No journal, no dirty page tracking, no background writeback. Simple but correct — crash-visible.
 

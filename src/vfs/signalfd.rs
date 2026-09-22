@@ -55,6 +55,11 @@ impl SignalFd {
 }
 
 impl Inode for SignalFd {
+    /// A signal queue has no position: `lseek(2)` on one is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x6000_0000 + self.ino as u64,

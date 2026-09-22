@@ -28,13 +28,18 @@ fn fresh_ino() -> Ino {
 /// A file: bytes with no structure of their own.
 struct RamFile {
     ino: Ino,
-    /// The permission bits, when anybody set them. Zero until then, which
+    /// The permission bits, once anybody set them. `None` until then - which
     /// `abi::mode_of` reads as "this filesystem keeps none" and answers the
-    /// kind's default for. The initramfs unpacker is the caller that sets
-    /// them: an archive's whole `/bin` is executable, and a kernel that
-    /// forgets that answers `EACCES` to the `test -x` an init asks before
-    /// running anything.
-    mode: Mutex<Cell<u32>>,
+    /// kind's default for - and `Some(0)` after a `chmod 000`, which is a
+    /// mode like any other and denies. The initramfs unpacker is the caller
+    /// that sets them: an archive's whole `/bin` is executable, and a kernel
+    /// that forgets that answers `EACCES` to the `test -x` an init asks
+    /// before running anything.
+    mode: Mutex<Cell<Option<u32>>>,
+    /// Who owns it, when anybody said. `(0, 0)` - root - until a create or a
+    /// `chown` writes it, which is what a memory filesystem the kernel built
+    /// for itself used to answer for everything.
+    owner: Mutex<Cell<(u32, u32)>>,
     data: Mutex<RefCell<Vec<u8>>>,
 }
 
@@ -48,11 +53,25 @@ impl Inode for RamFile {
     }
 
     fn mode(&self) -> u32 {
-        critical_section::with(|cs| self.mode.borrow(cs).get())
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0)
     }
 
     fn set_mode(&self, mode: u32) {
-        critical_section::with(|cs| self.mode.borrow(cs).set(mode));
+        critical_section::with(|cs| self.mode.borrow(cs).set(Some(mode)));
+    }
+
+    /// A mode is kept only once somebody set one: `chmod 000` and "nobody
+    /// said" are different answers, and the cell has to hold both.
+    fn keeps_modes(&self) -> bool {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).is_some()
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).get())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).set((uid, gid)));
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -148,7 +167,8 @@ impl Inode for RamDev {
 
 struct RamDir {
     ino: Ino,
-    mode: Mutex<Cell<u32>>,
+    mode: Mutex<Cell<Option<u32>>>,
+    owner: Mutex<Cell<(u32, u32)>>,
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
 }
 
@@ -162,11 +182,25 @@ impl Inode for RamDir {
     }
 
     fn mode(&self) -> u32 {
-        critical_section::with(|cs| self.mode.borrow(cs).get())
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0)
     }
 
     fn set_mode(&self, mode: u32) {
-        critical_section::with(|cs| self.mode.borrow(cs).set(mode));
+        critical_section::with(|cs| self.mode.borrow(cs).set(Some(mode)));
+    }
+
+    /// A directory is in the same position as a file: the bits are kept once
+    /// somebody sets them, and the initramfs unpacker is what sets them.
+    fn keeps_modes(&self) -> bool {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).is_some()
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).get())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).set((uid, gid)));
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
@@ -184,12 +218,14 @@ impl Inode for RamDir {
         let node: Arc<dyn Inode> = match kind {
             NodeKind::File => Arc::new(RamFile {
                 ino: fresh_ino(),
-                mode: Mutex::new(Cell::new(0)),
+                mode: Mutex::new(Cell::new(None)),
+                owner: Mutex::new(Cell::new(crate::sched::current_owner())),
                 data: Mutex::new(RefCell::new(Vec::new())),
             }),
             NodeKind::Dir => Arc::new(RamDir {
                 ino: fresh_ino(),
-                mode: Mutex::new(Cell::new(0)),
+                mode: Mutex::new(Cell::new(None)),
+                owner: Mutex::new(Cell::new(crate::sched::current_owner())),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
             // A device node mknod made: a placeholder until a devtmpfs mount
@@ -305,7 +341,8 @@ impl RamFs {
         Arc::new(RamFs {
             root: Arc::new(RamDir {
                 ino: fresh_ino(),
-                mode: Mutex::new(Cell::new(0)),
+                mode: Mutex::new(Cell::new(None)),
+                owner: Mutex::new(Cell::new(crate::sched::current_owner())),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
         })

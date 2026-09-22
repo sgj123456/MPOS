@@ -143,6 +143,67 @@ const USER_STACK_PAGES: usize = 16;
 /// the whole reason a program may call deeper than any fixed reservation: the
 /// region extends as it is used.
 const USER_STACK_MAX: usize = 8 * 1024 * 1024;
+
+// The resource-limit table's type and startup values live with the syscall
+// layer (which is host-compiled and tests them); the scheduler only carries a
+// per-task copy and reads/writes it through the accessors below.
+use crate::syscall::linux::abi::{RLIM_NLIMITS, Rlimit, default_rlimits, rlimit_admit};
+
+/// The current process's limit for `resource`.
+#[cfg(target_os = "none")]
+pub fn current_rlimit(resource: usize) -> Option<Rlimit> {
+    with_table(|t| t.task(t.current).rlimits.get(resource).copied())
+}
+
+/// Set the current process's limit for `resource`, applying `setrlimit`'s rule
+/// against the caller's root-ness. `Err(errno)` on a refused change.
+#[cfg(target_os = "none")]
+pub fn set_current_rlimit(resource: usize, new: Rlimit, is_root: bool) -> Result<(), isize> {
+    with_table(|t| {
+        let cur = t.current;
+        let old = t.task(cur).rlimits[resource];
+        match rlimit_admit(old, new, is_root) {
+            Ok(v) => {
+                t.task_mut(cur).rlimits[resource] = v;
+                // RLIMIT_NOFILE also caps the descriptor table: keep the two in
+                // step so an fd allocation refuses at the new ceiling.
+                if resource == 5 {
+                    let fds = t.task(cur).fds.clone();
+                    fds.set_nofile(v.cur);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// Whether the current task is in `SECCOMP_MODE_STRICT`, read at the syscall
+/// dispatch to decide whether a non-whitelisted call is fatal.
+#[cfg(target_os = "none")]
+pub fn current_is_seccomp_strict() -> bool {
+    with_table(|t| t.task(t.current).seccomp_strict)
+}
+
+/// Latch the current task into `SECCOMP_MODE_STRICT`: irreversible for its
+/// life, inherited across `fork`, kept across `exec`.
+#[cfg(target_os = "none")]
+pub fn set_seccomp_strict() {
+    with_table(|t| t.task_mut(t.current).seccomp_strict = true);
+}
+
+/// The whole limit table of `pid` (`0` = the current process), for
+/// `/proc/<pid>/limits`. `None` if no such task exists.
+#[cfg(target_os = "none")]
+pub fn rlimits_of(pid: usize) -> Option<[Rlimit; RLIM_NLIMITS]> {
+    with_table(|t| {
+        let id = if pid == 0 { t.current } else { TaskId(pid) };
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|tk| tk.rlimits)
+    })
+}
 /// How far below the stack pointer a faulting address may be and still be a
 /// push. Linux uses the same figure for the same reason: a stack frame is next
 /// to `rsp`, and an address a long way below it is a wild pointer that has to
@@ -189,12 +250,26 @@ pub enum SpawnError {
 /// redirection, which is how a shell hands a pipe end to the program it runs.
 pub type Redirect = (RawFd, RawFd);
 
+/// One collected-death record.
+#[derive(Clone, Copy)]
+struct Retired {
+    id: TaskId,
+    code: isize,
+    /// The tracer this task died under, if any. A traced task's death is the
+    /// tracer's to collect: the tracer reaps the corpse first, and only its
+    /// taking releases the record to the real parent - the same
+    /// release-on-reap order Linux uses. Without it, a `strace -f timeout ...
+    /// fish` run reports the fish exit to `timeout` while strace still owns
+    /// the body, and the two wait loops race for one record.
+    tracer: Option<TaskId>,
+}
+
 /// Exit codes, kept after the task is gone. The slot a task occupied is free
 /// for reuse the moment it is reaped, but the code it exited with can still be
 /// wanted - a milestone check reads it one tick later, and `wait` reads it
 /// once. Reading it takes it: a code belongs to the one caller that collects
 /// it, and anything left over is dropped oldest-first when the cap is reached.
-static RETIRED: Mutex<RefCell<Vec<(TaskId, isize)>>> = Mutex::new(RefCell::new(Vec::new()));
+static RETIRED: Mutex<RefCell<Vec<Retired>>> = Mutex::new(RefCell::new(Vec::new()));
 const RETIRED_CAP: usize = 32;
 
 /// The exits whose `SIGCHLD` is still unread.
@@ -328,6 +403,15 @@ pub struct Mm {
     /// `CLONE_CHILD_CLEARTID`, which is how a libc's `pthread_join` learns a
     /// thread is gone without polling.
     clear_tid: Mutex<RefCell<Option<usize>>>,
+    /// The `MEMBARRIER_CMD_REGISTER_*` commands this process has declared it
+    /// will use, as a bitmask.
+    ///
+    /// Per *process*, not per thread, and that is not a shortcut: the
+    /// registration is a statement about threads sharing one address space, and
+    /// the sharing is what makes the barrier mean anything - which is why Linux
+    /// keeps it on the `mm` too. A thread's `Mm` *is* the group's, so the `Arc`
+    /// gives these semantics for free.
+    membarrier: core::sync::atomic::AtomicUsize,
 }
 
 impl Mm {
@@ -343,7 +427,22 @@ impl Mm {
             frames: Mutex::new(RefCell::new(frames)),
             leader,
             clear_tid: Mutex::new(RefCell::new(None)),
+            membarrier: core::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// The `membarrier` registrations this group has made. See
+    /// [`Mm::membarrier`].
+    fn membarrier_registrations(&self) -> usize {
+        self.membarrier.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that this process may use `barrier`, leaving any other
+    /// registration as it was: a process may register for both kinds, and the
+    /// second registration is not a claim that the first never happened.
+    fn register_membarrier(&self, barrier: usize) {
+        self.membarrier
+            .fetch_or(barrier, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Swap one frame for another, in place: the copy-on-write path replaces
@@ -445,6 +544,10 @@ struct Task {
     tgid: TaskId,
     /// Signals sent to this task and not yet delivered.
     signals: signal::Pending,
+    /// The `siginfo_t` behind each pending signal, indexed like `signals`. A
+    /// standard signal is not queued, so one record per number is all the ABI
+    /// implies; this is what lets a `sigqueue` payload reach the handler.
+    siginfo: [signal::SigInfo; signal::SIGNALS],
     /// The signals this task has blocked with `rt_sigprocmask`. A blocked
     /// signal stays pending until it is unblocked, which is what makes a
     /// critical section able to say "not now" and be obeyed.
@@ -496,6 +599,24 @@ struct Task {
     /// and group, in that order. Root until something changes it, inherited
     /// across `fork`, preserved by `exec`.
     identity: Identity,
+    /// The file-creation mask, `0o022` until something calls `umask`.
+    ///
+    /// It belongs to the process and not to the machine: a shell sets its own
+    /// and every program it starts inherits that, while a program that sets a
+    /// restrictive mask must not narrow what its neighbours may create. It is
+    /// applied by masking the mode at every create, which is the only place
+    /// it is ever read.
+    umask: u32,
+    /// The process's resource limits, the `RLIMIT_*` table `getrlimit`/
+    /// `setrlimit`/`prlimit64` read and write and `/proc/<pid>/limits` prints.
+    /// Inherited whole across fork and exec, the way a limit belongs to the
+    /// process rather than to the program it last ran.
+    rlimits: [Rlimit; RLIM_NLIMITS],
+    /// `SECCOMP_MODE_STRICT` is on for this thread: only `read`, `write`,
+    /// `exit` and `sigreturn` are permitted and every other syscall is fatal
+    /// (`SIGKILL`). Once set it cannot be cleared, and it survives `exec` and
+    /// is inherited across `fork` - so it is a per-task latch, not a limit.
+    seccomp_strict: bool,
     /// Per-process brk state for heap management. The frames behind the
     /// break's pages are on `user_frames` like every other frame the process
     /// owns; only the bookkeeping of *where* the break is stays here.
@@ -700,6 +821,7 @@ impl Task {
             user_entry: None,
             user_resume: None,
             signals: 0,
+            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -711,6 +833,9 @@ impl Task {
             session: TaskId(0),
             ctty: None,
             identity: Identity::default(),
+            rlimits: default_rlimits(),
+            seccomp_strict: false,
+            umask: crate::syscall::DEFAULT_UMASK,
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -837,7 +962,11 @@ impl Table {
                 continue;
             }
             let interval = state.interval_ticks;
-            signal::add(&mut task.signals, signal::SIGALRM);
+            queue_signal(
+                task,
+                signal::SIGALRM,
+                signal::SigInfo::timer(signal::SIGALRM),
+            );
             self.sched.wake(TaskId(i));
             match task.itimers[ITIMER_REAL].as_mut() {
                 Some(st) if interval > 0 => {
@@ -916,6 +1045,7 @@ impl Table {
             user_entry: None,
             user_resume: None,
             signals: 0,
+            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -927,6 +1057,9 @@ impl Table {
             session: TaskId(0),
             ctty: None,
             identity: Identity::default(),
+            rlimits: default_rlimits(),
+            seccomp_strict: false,
+            umask: crate::syscall::DEFAULT_UMASK,
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -1028,6 +1161,23 @@ impl Table {
             if Arc::strong_count(&task.fds) == 1 {
                 let files = task.fds.take_all();
                 if !files.is_empty() {
+                    // Locks go with the process, not with the descriptor.
+                    // POSIX drops every lock a process holds when it exits,
+                    // and a lock left behind is one the next process to be
+                    // handed the same task id finds in its way: `fish` takes
+                    // `flock` on its universal-variable file to save it, so a
+                    // stale lock is a save that blocks and times out, a
+                    // `fish_variables` that never appears, and a second lost
+                    // on every run.
+                    let owner = task.tgid.0 as u32;
+                    for file in &files {
+                        let inode = file.inode();
+                        crate::vfs::locks::release(
+                            crate::vfs::mount::fs_id_of_inode(&inode),
+                            file.metadata().ino,
+                            owner,
+                        );
+                    }
                     // Sockets go down with the process that held their last
                     // reference - before the batch is parked for dropping,
                     // while the counts still say who owns them.
@@ -1250,15 +1400,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         let stack = Stack::new();
         let mut space = AddressSpace::new();
         let loaded = load_user(&mut space, &image, interp.as_ref());
-        write_arg_block(
-            loaded.stack_top,
-            user_rsp,
-            argv,
-            env,
-            "",
-            &image,
-            loaded.base,
-        );
+        write_arg_block(space.root(), user_rsp, argv, env, "", &image, loaded.base);
 
         let root = space.root();
         let brk_base = image
@@ -1288,6 +1430,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             user_entry: Some((loaded.entry, user_rsp)),
             user_resume: None,
             signals: 0,
+            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -1305,6 +1448,9 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             ctty: None,
             // Init starts as root, like everything the kernel itself spawns.
             identity: Identity::default(),
+            rlimits: default_rlimits(),
+            seccomp_strict: false,
+            umask: crate::syscall::DEFAULT_UMASK,
             brk_base,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -1382,19 +1528,12 @@ pub fn try_spawn_user(
                 (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
             });
 
-        // The argument block is written last, straight into the top page of
-        // the stack this task will land on, through the direct map. The top
-        // frame is already in `loaded.frames` - `load_user` reports it
-        // separately only so this write knows where the stack's page lives.
-        write_arg_block(
-            loaded.stack_top,
-            user_rsp,
-            argv,
-            env,
-            exe,
-            &image,
-            loaded.base,
-        );
+        // The argument block is written last, into the stack this task will
+        // land on. It is placed from its *top* down - the strings grow
+        // towards the program's entry point - and it may span pages, so the
+        // write resolves the stack's frames as it crosses them rather than
+        // assuming the block lives in one.
+        write_arg_block(space.root(), user_rsp, argv, env, exe, &image, loaded.base);
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
@@ -1431,6 +1570,7 @@ pub fn try_spawn_user(
             user_entry: Some((loaded.entry, user_rsp)),
             user_resume: None,
             signals: 0,
+            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -1442,6 +1582,9 @@ pub fn try_spawn_user(
             session: t.task(parent).session,
             ctty: t.task(parent).ctty,
             identity: t.task(parent).identity,
+            umask: t.task(parent).umask,
+            rlimits: t.task(parent).rlimits,
+            seccomp_strict: t.task(parent).seccomp_strict,
             brk_base,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -1518,7 +1661,12 @@ fn initial_stack_rsp(argv: &[String], env: &[String], exe: &str) -> Option<usize
     let random_bytes = 16usize;
     let total = words_bytes + random_bytes + arg_bytes + env_bytes + execfn_bytes;
     let rsp = (USER_STACK_TOP - total) & !15;
-    (USER_STACK_TOP - rsp <= PAGE_SIZE).then_some(rsp)
+    // The block has to land on the pages the loader maps. Everything below
+    // them is demand-paged, and the fault that would claim one has nothing to
+    // fault on yet: the program has not started. Linux bounds the block by
+    // `ARG_MAX` and lets it span pages; this is the same shape at the size of
+    // the stack a program starts with.
+    (USER_STACK_TOP - rsp <= USER_STACK_PAGES * PAGE_SIZE).then_some(rsp)
 }
 
 /// Fill the initial stack page with the argument block [`initial_stack_rsp`]
@@ -1537,7 +1685,7 @@ fn initial_stack_rsp(argv: &[String], env: &[String], exe: &str) -> Option<usize
 /// of its own falls back to an empty string, never to the random bytes, or
 /// the scan walks off the stack.
 fn write_arg_block(
-    frame: usize,
+    root: usize,
     user_rsp: usize,
     argv: &[String],
     env: &[String],
@@ -1545,29 +1693,38 @@ fn write_arg_block(
     image: &elf::Image,
     at_base: usize,
 ) {
-    let page =
-        unsafe { core::slice::from_raw_parts_mut(mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE) };
-    let from = user_rsp - (USER_STACK_TOP - PAGE_SIZE);
-    assert!(
-        USER_STACK_TOP - user_rsp <= PAGE_SIZE,
-        "argv block is not in the top page"
-    );
+    // The block is built here and copied to the user stack in one piece. It
+    // may span pages - a *program* is not a pathname, and a completion helper
+    // handing a subprocess a few kilobytes of script is an ordinary thing for
+    // it to do - while the stack's pages are separate frames, so a writer that
+    // reaches them through one page's worth of bytes can only place a block
+    // that fits in one. The kernel's own memory has no such shape, and
+    // [`write_user_of`] resolves a page at a time on the way across.
+    //
+    // The address space is named by its root rather than taken as "the
+    // current one": a task being spawned is not running yet, so its stack is
+    // not the stack the kernel is on.
+    let total = USER_STACK_TOP - user_rsp;
+    let mut block = alloc::vec![0u8; total];
+    let base = user_rsp;
 
     let argc = argv.len();
-    let mut off = from;
+    let mut off = 0usize;
 
     // argc
-    page[off..off + 8].copy_from_slice(&(argc as u64).to_le_bytes());
+    block[off..off + 8].copy_from_slice(&(argc as u64).to_le_bytes());
     off += 8;
 
-    // Random bytes at the very top of the page (16 bytes, 16-byte aligned).
-    let random_at = PAGE_SIZE - 16;
-    let random_vaddr = (USER_STACK_TOP - PAGE_SIZE) + random_at;
-    let random: [u8; 16] = [
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
-        0x10,
-    ];
-    page[random_at..random_at + 16].copy_from_slice(&random);
+    // Random bytes at the very top of the stack (16 bytes, 16-byte aligned).
+    let random_at = total - 16;
+    let random_vaddr = base + random_at;
+    // AT_RANDOM must be unique per exec: libc derives the `__stack_chk_guard`
+    // (stack-smashing canary) from these bytes, so a constant here is a
+    // predictable canary - the whole point of 8.3's stack protection is lost.
+    // Draw them from the kernel ChaCha20 pool, freshly seeded, like `getrandom`.
+    let mut random = [0u8; 16];
+    crate::rand::fill(&mut random);
+    block[random_at..random_at + 16].copy_from_slice(&random);
 
     // Strings, descending from just below the random bytes: argv first, then
     // the environment, then the AT_EXECFN path.
@@ -1575,28 +1732,28 @@ fn write_arg_block(
     let mut argv0_vaddr = 0usize;
     for (i, arg) in argv.iter().enumerate() {
         string_at -= arg.len() + 1;
-        page[string_at..string_at + arg.len()].copy_from_slice(arg.as_bytes());
-        page[string_at + arg.len()] = 0;
+        block[string_at..string_at + arg.len()].copy_from_slice(arg.as_bytes());
+        block[string_at + arg.len()] = 0;
         // argv[i] pointer: virtual address of the string.
-        let vaddr = (USER_STACK_TOP - PAGE_SIZE) + string_at;
+        let vaddr = base + string_at;
         if i == 0 {
             argv0_vaddr = vaddr;
         }
-        page[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
+        block[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
         off += 8;
     }
-    // NULL argv terminator (zero-filled page).
+    // NULL argv terminator (zero-filled block).
     off += size_of::<usize>();
 
     for var in env.iter() {
         string_at -= var.len() + 1;
-        page[string_at..string_at + var.len()].copy_from_slice(var.as_bytes());
-        page[string_at + var.len()] = 0;
-        let vaddr = (USER_STACK_TOP - PAGE_SIZE) + string_at;
-        page[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
+        block[string_at..string_at + var.len()].copy_from_slice(var.as_bytes());
+        block[string_at + var.len()] = 0;
+        let vaddr = base + string_at;
+        block[off..off + 8].copy_from_slice(&vaddr.to_le_bytes());
         off += 8;
     }
-    // NULL envp terminator (zero-filled page).
+    // NULL envp terminator (zero-filled block).
     off += size_of::<usize>();
 
     // The AT_EXECFN string: the path the program was executed through when
@@ -1605,19 +1762,30 @@ fn write_arg_block(
     // progname scan at unterminated data.
     let execfn_vaddr = if !exe.is_empty() {
         string_at -= exe.len() + 1;
-        page[string_at..string_at + exe.len()].copy_from_slice(exe.as_bytes());
-        page[string_at + exe.len()] = 0;
-        (USER_STACK_TOP - PAGE_SIZE) + string_at
+        block[string_at..string_at + exe.len()].copy_from_slice(exe.as_bytes());
+        block[string_at + exe.len()] = 0;
+        base + string_at
     } else if argv0_vaddr != 0 {
         argv0_vaddr
     } else {
         string_at -= 1;
-        page[string_at] = 0;
-        (USER_STACK_TOP - PAGE_SIZE) + string_at
+        block[string_at] = 0;
+        base + string_at
     };
 
     // Auxiliary vector entries.
-    auxv(&mut page[off..], image, at_base, random_vaddr, execfn_vaddr);
+    auxv(
+        &mut block[off..],
+        image,
+        at_base,
+        random_vaddr,
+        execfn_vaddr,
+    );
+
+    assert!(
+        write_user_of(root, base, &block),
+        "the argument block did not fit"
+    );
 }
 
 /// Write the Linux auxiliary vector into `buf` as (type, value) u64 pairs.
@@ -1652,13 +1820,23 @@ fn auxv(buf: &mut [u8], image: &elf::Image, at_base: usize, random_vaddr: usize,
     entry!(6, PAGE_SIZE); // AT_PAGESZ
     entry!(7, at_base); // AT_BASE (0 = no dynamic linker)
     entry!(9, image.entry); // AT_ENTRY
-    entry!(11, 0usize); // AT_UID
-    entry!(12, 0usize); // AT_EUID
-    entry!(13, 0usize); // AT_GID
-    entry!(14, 0usize); // AT_EGID
+    // The ids are the ones the new image will run with, which after a set-uid
+    // exec are not the ones the caller had. libc reads them here rather than
+    // asking, and a program that found the wrong answer would take the wrong
+    // path through its own privilege handling - musl's `issetugid` is this
+    // entry.
+    let id = current_identity();
+    entry!(11, id.ruid); // AT_UID
+    entry!(12, id.euid); // AT_EUID
+    entry!(13, id.rgid); // AT_GID
+    entry!(14, id.egid); // AT_EGID
     entry!(16, 0usize); // AT_HWCAP
     entry!(17, 100usize); // AT_CLKTCK
-    entry!(23, 0usize); // AT_SECURE (0 = not setuid)
+    // AT_SECURE: the exec raised an effective id, so libc has to take its
+    // hardened path - no `LD_PRELOAD`, no `LD_LIBRARY_PATH`, sanitised locale.
+    // Linux computes it the same way, as "did the ids come out different".
+    let secure = id.euid != id.ruid || id.egid != id.rgid;
+    entry!(23, secure as usize); // AT_SECURE
     entry!(25, random_vaddr); // AT_RANDOM
     entry!(31, execfn); // AT_EXECFN
     entry!(0, 0usize); // AT_NULL
@@ -1680,9 +1858,6 @@ struct Loaded {
     /// Every frame that was mapped for this process, for the reaper to give
     /// back when it exits.
     frames: Vec<usize>,
-    /// The frame holding the top page of the stack, where the argument block
-    /// is written.
-    stack_top: usize,
 }
 
 /// Map every page of `image` into `space` at `base` - file bytes, the zero
@@ -1794,7 +1969,6 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>, interp: Option<&Image<
     map_image(space, image, 0, &mut frames);
     apply_rela(space, image);
 
-    let mut stack_top = 0;
     for index in 0..USER_STACK_PAGES {
         let frame = mm::alloc_frames(0).expect("out of frames for the user stack");
         frames.push(frame);
@@ -1804,15 +1978,14 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>, interp: Option<&Image<
         dest.fill(0);
         space.map(Mapping {
             // Index 0 is the highest page, the one `rsp` starts in and the
-            // one the argument block is written into below.
+            // one the argument block is written into from the top down. The
+            // block may reach past it, so the pages below are mapped here
+            // too - it is the *stack* the loader lays out, not one page.
             virt: USER_STACK_TOP - (index + 1) * PAGE_SIZE,
             phys: frame,
             length: PAGE_SIZE,
             flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
         });
-        if index == 0 {
-            stack_top = frame;
-        }
     }
 
     // Control goes to the interpreter when there is one, and to the program
@@ -1827,7 +2000,6 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>, interp: Option<&Image<
         entry,
         base,
         frames,
-        stack_top,
     }
 }
 
@@ -1836,17 +2008,40 @@ pub fn yield_now() {
     schedule(Table::requeue_current);
 }
 
-/// Sleep for at least `ticks` clock ticks.
+/// Sleep for at least `ticks` clock ticks, or until a fatal signal ends the
+/// task.
+///
+/// The signal check is the whole of why this is not simply "park until the
+/// deadline". Linux ends a sleeping task when a fatal signal arrives, and a
+/// sleep that ignores them is a `sleep 100` that survives `SIGTERM` - which
+/// is what `timeout` reports as a kill that never happened, with the sleeper
+/// still on the machine afterwards.
 pub fn sleep_ticks(ticks: u64) {
-    schedule(move |t| {
-        // Read the clock here rather than trusting the scheduler's last turn.
-        // This task may have been running for a while since then, and a deadline
-        // computed from a stale clock wakes early.
-        t.sched.advance(timer::ticks());
-        let id = t.current;
-        let priority = t.task(id).priority;
-        t.sched.sleep(id, priority, ticks);
-    });
+    let deadline = timer::ticks().saturating_add(ticks);
+    loop {
+        if let Some(sig) = take_fatal_signal() {
+            exit(-(sig as isize));
+        }
+        if timer::ticks() >= deadline {
+            return;
+        }
+        schedule(|t| {
+            // Read the clock here rather than trusting the scheduler's last
+            // turn. This task may have been running for a while since then,
+            // and a deadline computed from a stale clock wakes early.
+            t.sched.advance(timer::ticks());
+            if timer::ticks() >= deadline {
+                t.requeue_current();
+                return;
+            }
+            let id = t.current;
+            let priority = t.task(id).priority;
+            // What is *left* of the wait, so a wake that was not the deadline
+            // does not start the whole sleep over.
+            let remaining = deadline.saturating_sub(timer::ticks()).max(1);
+            t.sched.sleep(id, priority, remaining);
+        });
+    }
 }
 
 /// Block the running task until `cond` returns true.
@@ -2011,8 +2206,10 @@ pub fn has_deliverable_signal() -> bool {
 /// how a shell reaps jobs it started in the background without stopping for
 /// any of them.
 pub fn poll_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
-    with_table(|t| any_child_code(t, parent))
-        .and_then(|(id, _)| take_exit_code(id).map(|code| (id, code)))
+    with_table(|t| {
+        any_child_code(t, parent)
+            .and_then(|(id, _)| take_exit_code_for(t, id, parent).map(|code| (id, code)))
+    })
 }
 
 /// Whether `parent` has a child at all - one still running, or one that has
@@ -2081,14 +2278,37 @@ pub fn wake(id: TaskId) -> bool {
     with_table(|t| t.sched.wake(id))
 }
 
-/// Send `sig` to `id`. Returns `false` when the task does not exist or has
-/// already exited, which the syscall layer reports as `ESRCH`.
+/// Add `sig` to `task`'s pending set and store the `siginfo_t` a handler will
+/// read for it. The one place a bit and its record are set together, so no
+/// raise site can leave a handler looking at a zeroed `signo`.
+fn queue_signal(task: &mut Task, sig: u8, info: signal::SigInfo) {
+    signal::add(&mut task.signals, sig);
+    if (sig as usize) < signal::SIGNALS {
+        task.siginfo[sig as usize] = info;
+    }
+}
+
+/// Send `sig` to `id` with an `SI_USER` record naming the caller. The plain
+/// `kill`/`tgkill` shape; a `sigqueue` goes through [`send_signal_info`] so it
+/// can carry a payload.
+pub fn send_signal(id: TaskId, sig: u8) -> bool {
+    let (pid, uid) = with_table(|t| {
+        let cur = t.task(t.current);
+        (cur.tgid.0 as i32, cur.identity.ruid as i32)
+    });
+    send_signal_info(id, sig, signal::SigInfo::user(sig, pid, uid))
+}
+
+/// Send `sig` to `id`, recording `info` as the `siginfo_t` a handler will read.
+///
+/// Returns `false` when the task does not exist or has already exited, which
+/// the syscall layer reports as `ESRCH`.
 ///
 /// `sig` of 0 is the POSIX existence probe: it delivers nothing and only
 /// reports liveness. With no handler machinery there is nothing to deliver to
 /// anyway: the bit waits in the task's pending set, and the task dies at its
 /// next blocking point.
-pub fn send_signal(id: TaskId, sig: u8) -> bool {
+pub fn send_signal_info(id: TaskId, sig: u8, info: signal::SigInfo) -> bool {
     with_table(|t| {
         // The first look is immutable: whether the signal is delivered,
         // discarded or refused, the answer is read off the same facts.
@@ -2120,8 +2340,10 @@ pub fn send_signal(id: TaskId, sig: u8) -> bool {
             return false;
         };
         signal::add(&mut task.signals, sig);
-        // `SIGCONT` is the one signal whose effect is on the *state* of a task
-        // rather than on its pending set, and this is the only place a task's
+        if (sig as usize) < signal::SIGNALS {
+            task.siginfo[sig as usize] = info;
+        }
+        // `SIGCONT` is the one signal whose effect is on the *state* of a task        // rather than on its pending set, and this is the only place a task's
         // state can be changed from outside it.
         if sig == signal::SIGCONT {
             // It cancels the stop signals still queued, so that a task woken
@@ -2224,11 +2446,55 @@ pub fn set_current_identity(identity: Identity) {
     with_table(|t| t.task_mut(t.current).identity = identity);
 }
 
+/// The running task's file-creation mask - what `umask(2)` reports, and what
+/// every create masks the mode it was given with.
+pub fn current_umask() -> u32 {
+    with_table(|t| t.task(t.current).umask)
+}
+
+/// Store the running task's file-creation mask. The syscall layer has already
+/// narrowed it to the twelve bits a mode can hold.
+pub fn set_current_umask(mask: u32) {
+    with_table(|t| t.task_mut(t.current).umask = mask);
+}
+
+/// The group ids the running task holds - real, effective and saved.
+///
+/// Linux asks this as "is the file's group one of the caller's?", and this
+/// kernel keeps no supplementary groups, so the three words are the whole of
+/// the answer.
+pub fn current_groups() -> [u32; 3] {
+    let id = current_identity();
+    [id.rgid, id.egid, id.sgid]
+}
+
 /// `setsid`'s kernel half beyond the group move: the caller becomes the
 /// leader of its own session and loses the controlling terminal, which
 /// belongs to the session it just left. The getty that calls this re-acquires
 /// a terminal with `TIOCSCTTY` immediately after; everything else that
 /// `setsid`s meant to leave its terminal behind anyway.
+/// The effective user and group of the running process - the ids a file it
+/// creates belongs to.
+///
+/// A *filesystem* asks, because that is where a new node is stamped and there
+/// is no way to stamp it later without walking the tree: the creator's
+/// identity is not a property of the name, it is a property of the moment.
+/// The effective ids are the ones Linux uses, not the real ones.
+pub fn current_owner() -> (u32, u32) {
+    let id = current_identity();
+    (id.euid, id.egid)
+}
+
+/// The *real* ids of the running task, which is the pair `access(2)` asks
+/// about rather than the effective one above. The distinction is the whole
+/// point of the call: a setuid program asking whether the user who invoked
+/// it could open a file must not be answered with its own raised
+/// privileges.
+pub fn current_real_owner() -> (u32, u32) {
+    let id = current_identity();
+    (id.ruid, id.rgid)
+}
+
 pub fn become_session_leader() {
     with_table(|t| {
         let id = t.current;
@@ -2236,6 +2502,25 @@ pub fn become_session_leader() {
         task.session = id;
         task.ctty = None;
     });
+}
+
+/// The session id of the session whose controlling terminal is `dev_id`, or
+/// `None` when no task holds that terminal - what `TIOCGSID` reports, and what
+/// `tcgetsid` is.
+///
+/// A job-control shell asks this before it decides whether the terminal is
+/// *its* terminal to claim: the session leader that owns the line is the one
+/// that may take it, and a shell that cannot find out has to assume it may
+/// not. The answer is the leader's id, which is the session id everywhere in
+/// the ABI.
+pub fn session_of_tty(dev_id: (u32, u32)) -> Option<usize> {
+    with_table(|t| {
+        t.tasks
+            .iter()
+            .flatten()
+            .find(|task| !task.exited && task.ctty == Some(dev_id))
+            .map(|task| task.session.0)
+    })
 }
 
 /// Everyone in a process group, for a signal that has to reach all of them at
@@ -2365,6 +2650,29 @@ pub fn take_deliverable_signal() -> Option<u8> {
             }
             task.signals &= !signal::bit(sig);
             return Some(sig);
+        }
+        None
+    })
+}
+
+/// As [`take_deliverable_signal`], but also handing back the `siginfo_t` the
+/// sender attached, so the delivery path can build a handler's frame with the
+/// real record - `si_code`, `si_pid`, the `sigqueue` payload - rather than a
+/// fixed `SI_USER`.
+pub fn take_deliverable_siginfo() -> Option<(u8, signal::SigInfo)> {
+    with_table(|t| {
+        let id = t.current;
+        let task = t.task_mut(id);
+        let mut ready = task.signals & !task.blocked;
+        while let Some(sig) = signal::take(&mut ready) {
+            if task.dispositions.get(sig).is_ignore() {
+                continue;
+            }
+            task.signals &= !signal::bit(sig);
+            let slot = (sig as usize).min(signal::SIGNALS - 1);
+            let info = task.siginfo[slot];
+            task.siginfo[slot] = signal::SigInfo::ZERO;
+            return Some((sig, info));
         }
         None
     })
@@ -2762,7 +3070,24 @@ fn unreported_stop(t: &Table, parent: TaskId, requested: bool) -> Option<WaitEve
         let Some(stop) = task.trace.stop else {
             continue;
         };
-        if stop.reported || !(requested || stop.traced) {
+        if stop.reported {
+            continue;
+        }
+        // Who may hear this stop. A ptrace stop belongs to the *tracer* - the
+        // real parent waiting without `WUNTRACED` must never see one, and not
+        // with `WUNTRACED` either: Linux keeps ptrace-stops out of the real
+        // parent's `wait` entirely, because the parent learning "child
+        // stopped" while the tracer owns the corpse leaves the parent acting
+        // on a state it can do nothing about. `strace -f timeout ...` hung a
+        // whole class of runners exactly here, when a born-stopped fork child
+        // was reported to a parent that was only collecting exits. A plain
+        // group stop (a `SIGSTOP` of job control) is the opposite: it is the
+        // parent's news, and only with `WUNTRACED`.
+        if stop.traced {
+            if task.trace.tracer != Some(parent) {
+                continue;
+            }
+        } else if !requested {
             continue;
         }
         // The scan is ascending, so the first match is the lowest id: two
@@ -3216,7 +3541,7 @@ pub fn resume_traced(id: TaskId, signal: u8, arm: bool) -> bool {
             task.trace.stop = None;
             task.trace.armed = arm;
             if signal != 0 {
-                signal::add(&mut task.signals, signal);
+                queue_signal(task, signal, signal::SigInfo::user(signal, 0, 0));
             }
             t.sched.wake(id);
             true
@@ -3241,7 +3566,7 @@ pub fn detach_traced(id: TaskId, signal: u8) -> bool {
             task.trace.stop = None;
             task.trace.regs = None;
             if signal != 0 {
-                signal::add(&mut task.signals, signal);
+                queue_signal(task, signal, signal::SigInfo::user(signal, 0, 0));
             }
             t.sched.wake(id);
             true
@@ -3293,24 +3618,26 @@ fn any_child_event(t: &Table, parent: TaskId, stops: bool, continues: bool) -> O
     }
     // Deaths last, and read out of the retired list exactly as the exit-only
     // `wait` reads them - the same records, so a caller that asks about stops
-    // cannot lose an exit code by asking.
+    // cannot lose an exit code by asking. A record still owned by a tracer is
+    // the tracer's alone to see.
     critical_section::with(|cs| {
         RETIRED
             .borrow(cs)
             .borrow()
             .iter()
             .rev()
-            .find(|(id, _)| {
+            .find(|retired| {
+                let id = retired.id;
                 let free = t.tasks[id.0].is_none();
                 let ours = free
                     || t.tasks[id.0]
                         .as_ref()
                         .is_some_and(|task| waitable(task, parent));
-                ours && *id != parent
+                ours && id != parent && retired.tracer.is_none_or(|tracer| tracer == parent)
             })
-            .map(|(id, code)| WaitEvent::Exited {
-                id: *id,
-                code: *code,
+            .map(|retired| WaitEvent::Exited {
+                id: retired.id,
+                code: retired.code,
             })
     })
 }
@@ -3324,7 +3651,7 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
         // is the one taken here, because between the look and the take another
         // waiter could have collected it.
         WaitEvent::Exited { id, .. } => {
-            take_exit_code(id).map(|code| WaitEvent::Exited { id, code })
+            take_exit_code_for(t, id, t.current).map(|code| WaitEvent::Exited { id, code })
         }
         WaitEvent::Stopped { id, signal, event } => {
             let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
@@ -3364,18 +3691,34 @@ pub fn poll_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Opt
     })
 }
 
-/// The same question for one named child, which is what `waitpid` asks.
+/// The same question for one named child, which is what `waitpid` asks. The
+/// asker is the running task; `child_event` says what *it* may hear.
 pub fn child_event(id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
-    with_table(|t| child_event_in(t, id, stops, continues))
+    with_table(|t| child_event_in(t, id, t.current, stops, continues))
 }
 
 /// [`child_event`] against a table the caller already holds - the shape the
 /// blocking condition needs, since it runs inside `schedule`'s borrow.
-fn child_event_in(t: &Table, id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+fn child_event_in(
+    t: &Table,
+    id: TaskId,
+    me: TaskId,
+    stops: bool,
+    continues: bool,
+) -> Option<WaitEvent> {
     let task = t.tasks.get(id.0).and_then(Option::as_ref)?;
     if let Some(stop) = task.trace.stop
         && !stop.reported
-        && (stops || stop.traced)
+        // Who may hear this stop - the same rule `unreported_stop` applies to
+        // the wildcard wait: a ptrace stop is the tracer's, a group stop is
+        // the parent's when `WUNTRACED` asked for it. Without the tracer check
+        // a parent's plain `waitpid(pid)` collects a born-stop its tracer has
+        // not even looked at yet.
+        && (if stop.traced {
+            task.trace.tracer == Some(me)
+        } else {
+            stops
+        })
     {
         return Some(WaitEvent::Stopped {
             id,
@@ -3408,12 +3751,18 @@ pub fn child_event_pending(id: TaskId, stops: bool, continues: bool) -> bool {
 /// nest one inside another and hand interrupts back early.
 pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
     block_until_on(|t| {
-        exit_code(id).is_some() || child_event_in(t, id, stops, continues).is_some()
+        exit_code(id).is_some() || child_event_in(t, id, t.current, stops, continues).is_some()
     });
     if let Some(event) = take_child_event(id, stops, continues) {
         return Some(event);
     }
-    take_exit_code(id).map(|code| WaitEvent::Exited { id, code })
+    take_exit_code_current(id).map(|code| WaitEvent::Exited { id, code })
+}
+
+/// [`take_exit_code_for`] for the running task - the shape a `waitpid(pid)`
+/// call lands in, where the collector is the caller itself.
+pub fn take_exit_code_current(id: TaskId) -> Option<isize> {
+    with_table(|t| take_exit_code_for(t, id, t.current))
 }
 
 /// The paging root `id` runs on: its own address space's, or its thread group's
@@ -3567,7 +3916,7 @@ pub fn exit(code: isize) -> ! {
             crate::arch::halt();
         }
         t.task_mut(id).exited = true;
-        record_retired(id, code);
+        record_retired(id, code, t.task(id).trace.tracer);
 
         // Whoever was waiting on this task as its parent is woken here, in
         // the same critical section that made the condition true: either it
@@ -3590,7 +3939,12 @@ pub fn exit(code: isize) -> ! {
                 .get(signal::SIGCHLD)
                 .is_handler()
             {
-                signal::add(&mut t.task_mut(parent).signals, signal::SIGCHLD);
+                let child_pid = t.task(id).tgid.0 as i32;
+                queue_signal(
+                    t.task_mut(parent),
+                    signal::SIGCHLD,
+                    signal::SigInfo::user(signal::SIGCHLD, child_pid, 0),
+                );
             }
             // The console goes back to the parent's group as the child leaves
             // it: a shell waits, gets its prompt back, and reads again. A
@@ -3647,6 +4001,17 @@ pub fn exit(code: isize) -> ! {
             task.trace.regs = None;
             t.sched.wake(tracee);
         }
+        // Deaths the tracer never got to collect are released with it. A
+        // record still owned by a dead tracer is uncollectable for ever - the
+        // real parent's `wait` would pass over it every tick while the corpse
+        // it names is already gone.
+        critical_section::with(|cs| {
+            for retired in RETIRED.borrow(cs).borrow_mut().iter_mut() {
+                if retired.tracer == Some(id) {
+                    retired.tracer = None;
+                }
+            }
+        });
     });
     unreachable!("an exited task is never picked again")
 }
@@ -3667,21 +4032,57 @@ pub fn exit_code(id: TaskId) -> Option<isize> {
             .borrow()
             .iter()
             .rev()
-            .find(|(retired, _)| *retired == id)
-            .map(|(_, code)| *code)
+            .find(|retired| retired.id == id)
+            .map(|retired| retired.code)
     })
 }
 
-/// Collect this process's `pid`'s exit code, consuming the record. `None` when
-/// no death has been recorded for that pid since its slot was last reused.
-pub fn take_exit_code(id: TaskId) -> Option<isize> {
+/// Collect `id`'s exit code for caller `me`, consuming the record. `None` when
+/// no death has been recorded for that pid since its slot was last reused, or
+/// when the record is still owned by a tracer other than `me`.
+///
+/// A record owned by `me` as its tracer is *released*, not removed: the code
+/// stays on file, now visible to the real parent, whose own `wait` collects it
+/// and removes the record for good. That is the tracer-first order the record
+/// exists to keep - unless `me` is the real parent *as well*, the
+/// `fork` + `PTRACE_TRACEME` shape every strace run has: there is no other
+/// parent to release to, and leaving the record in place would report the same
+/// death a second time to the same waiter, whose tcb is already gone. It comes
+/// out instead.
+fn take_exit_code_for(t: &Table, id: TaskId, me: TaskId) -> Option<isize> {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
-        let at = retired.iter().rposition(|(retired, _)| *retired == id)?;
+        let at = retired.iter().rposition(|retired| retired.id == id)?;
+        if retired[at].tracer.is_some_and(|tracer| tracer != me) {
+            return None;
+        }
+        let also_parent = retired[at].tracer == Some(me)
+            && t.tasks[id.0]
+                .as_ref()
+                .is_none_or(|task| task.parent == Some(me));
+        if also_parent {
+            SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
+            return Some(retired.remove(at).code);
+        }
+        if retired[at].tracer == Some(me) {
+            retired[at].tracer = None;
+            return Some(retired[at].code);
+        }
         // The code is collected - so the signal about it can never be read
         // again, and a stale entry must not name a slot a new task owns.
         SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
-        Some(retired.remove(at).1)
+        Some(retired.remove(at).code)
+    })
+}
+
+/// Collect `id`'s exit code regardless of tracer ownership. The boot task's
+/// use for init, whose death nobody reaps, and nothing else.
+pub fn take_exit_code(id: TaskId) -> Option<isize> {
+    critical_section::with(|cs| {
+        let mut retired = RETIRED.borrow(cs).borrow_mut();
+        let at = retired.iter().rposition(|retired| retired.id == id)?;
+        SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
+        Some(retired.remove(at).code)
     })
 }
 
@@ -3742,10 +4143,13 @@ pub fn wait_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
     // The condition is the table itself, so it is asked through the borrow
     // `block_until_on` already holds rather than taking one of its own.
     block_until_on(|t| any_child_code(t, parent).is_some());
-    // Taken, not looked up again: a second lookup by pid would race the slot
-    // being handed to a new task, and the record would go to it instead.
-    let id = with_table(|t| any_child_code(t, parent))?.0;
-    take_exit_code(id).map(|code| (id, code))
+    // Taken under the same borrow, not looked up again: a second lookup by pid
+    // would race the slot being handed to a new task, and the record would go
+    // to it instead.
+    with_table(|t| {
+        any_child_code(t, parent)
+            .and_then(|(id, _)| take_exit_code_for(t, id, parent).map(|code| (id, code)))
+    })
 }
 
 /// The pid and code of the oldest of `parent`'s children to have exited and
@@ -3763,18 +4167,19 @@ fn any_child_code(t: &Table, parent: TaskId) -> Option<(TaskId, isize)> {
             .borrow()
             .iter()
             .rev()
-            .find(|(id, _)| {
+            .find(|retired| {
                 // The slot is spoken for by a live task: the record describes
                 // an older tenant of the same number, so it is not this
                 // parent's business.
+                let id = retired.id;
                 let free = t.tasks[id.0].is_none();
                 let ours = free
                     || t.tasks[id.0]
                         .as_ref()
                         .is_some_and(|task| waitable(task, parent));
-                ours && *id != parent
+                ours && id != parent && retired.tracer.is_none_or(|tracer| tracer == parent)
             })
-            .map(|(id, code)| (*id, *code))
+            .map(|retired| (retired.id, retired.code))
     })
 }
 
@@ -3785,7 +4190,7 @@ pub fn discard_exit_code(id: TaskId) {
     take_exit_code(id);
 }
 
-fn record_retired(id: TaskId, code: isize) {
+fn record_retired(id: TaskId, code: isize, tracer: Option<TaskId>) {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         if retired.len() == RETIRED_CAP {
@@ -3794,9 +4199,9 @@ fn record_retired(id: TaskId, code: isize) {
             SIGCHLD_PENDING
                 .borrow(cs)
                 .borrow_mut()
-                .retain(|p| *p != dropped.0);
+                .retain(|p| *p != dropped.id);
         }
-        retired.push((id, code));
+        retired.push(Retired { id, code, tracer });
         // The signal the exit carries: pending until a signalfd reader takes
         // it, independent of who eventually collects the code.
         let mut pending = SIGCHLD_PENDING.borrow(cs).borrow_mut();
@@ -3813,7 +4218,7 @@ fn exit_code_pending(id: TaskId) -> bool {
             .borrow(cs)
             .borrow()
             .iter()
-            .any(|(retired, _)| *retired == id)
+            .any(|retired| retired.id == id)
     })
 }
 
@@ -3828,13 +4233,30 @@ fn drop_retired(id: TaskId) {
         RETIRED
             .borrow(cs)
             .borrow_mut()
-            .retain(|(retired, _)| *retired != id);
+            .retain(|retired| retired.id != id);
     });
 }
 
 /// The running task.
 pub fn current() -> TaskId {
     with_table(|t| t.current)
+}
+
+/// The kernel stack the running task is on, as `(base, top)` - the low and
+/// high addresses of the block the frame allocator handed out for it.
+///
+/// The panic handler asks for this and nothing else does. A stack that ran
+/// into its own bottom is the one failure whose damage lands on whatever the
+/// frame allocator put in the next block over, which reads as corruption
+/// anywhere but the stack; knowing how much of it was in use at the moment of
+/// the fault is what tells that apart from a wild write. `None` for the boot
+/// task, whose stack the bootloader owns and the kernel never measured.
+pub fn current_stack_range() -> Option<(usize, usize)> {
+    with_table(|t| {
+        let task = t.tasks.get(t.current.0)?.as_ref()?;
+        let stack = task.stack.as_ref()?;
+        Some((stack.base, stack.top()))
+    })
 }
 
 /// The descriptor table of the running task: what its fd numbers index.
@@ -4056,6 +4478,29 @@ pub fn descriptors_of(pid: usize) -> alloc::vec::Vec<(usize, alloc::string::Stri
     open.into_iter()
         .map(|(fd, file)| (fd as usize, file.display_name()))
         .collect()
+}
+
+/// The descriptor numbers `pid` has open, without asking for any of their
+/// names.
+///
+/// This is what `/proc/<pid>/fd` is *listed* by, and the numbers are also all
+/// a listing shows. Naming one is a search of the filesystem tree - see
+/// [`crate::vfs::File::display_name`] - and a listing that searched the tree
+/// would walk into `/proc/<pid>/fd` while it was in the middle of listing it:
+/// the same question one stack deeper, without end, until the kernel stack
+/// runs off its bottom and the damage lands on whatever the frame allocator
+/// put next door. A name is computed when one is actually wanted - `readlink`
+/// on an entry, which is a lookup and not a listing.
+pub fn descriptor_numbers(pid: usize) -> alloc::vec::Vec<usize> {
+    with_table(|t| match t.tasks.get(pid).and_then(Option::as_ref) {
+        Some(task) if task.user => task
+            .fds
+            .open_files()
+            .into_iter()
+            .map(|(fd, _file)| fd as usize)
+            .collect(),
+        _ => alloc::vec::Vec::new(),
+    })
 }
 
 /// Map a physical frame at `virt` in the current task's address space with
@@ -4308,6 +4753,21 @@ pub fn get_mmap_cursor() -> usize {
         let task = t.task(current());
         task.mmap_cursor
     })
+}
+
+/// The `MEMBARRIER_CMD_REGISTER_*` commands the running task's process has
+/// declared it will use, as a bitmask of the *barrier* commands they enable.
+///
+/// The process, not the task: a registration made by one thread is what lets
+/// every thread of the group use the barrier, which is the only sense in which
+/// a barrier over a process's threads can be asked for at all.
+pub fn membarrier_registrations() -> usize {
+    with_table(|t| t.task(t.current).mm.membarrier_registrations())
+}
+
+/// Record a `membarrier` registration for the running task's process.
+pub fn register_membarrier(barrier: usize) {
+    with_table(|t| t.task(t.current).mm.register_membarrier(barrier));
 }
 
 /// Set the mmap cursor for the current task.
@@ -4718,6 +5178,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             released: false,
             tgid: TaskId(slot),
             signals: 0,
+            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -4732,6 +5193,9 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             session: t.task(parent_id).session,
             ctty: t.task(parent_id).ctty,
             identity: t.task(parent_id).identity,
+            umask: t.task(parent_id).umask,
+            rlimits: t.task(parent_id).rlimits,
+            seccomp_strict: t.task(parent_id).seccomp_strict,
             brk_base: parent_brk_base,
             brk_pages: parent_brk_pages,
             mmap_cursor: parent_mmap_cursor,
@@ -4845,15 +5309,7 @@ pub fn exec_replace(
                 (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
             });
 
-        write_arg_block(
-            loaded.stack_top,
-            user_rsp,
-            argv,
-            env,
-            exe,
-            &image,
-            loaded.base,
-        );
+        write_arg_block(space.root(), user_rsp, argv, env, exe, &image, loaded.base);
 
         // --- Reset process state ---
         //
@@ -4992,11 +5448,21 @@ pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
     if rsp < page || rsp - page > STACK_GROWTH_SLACK {
         return false;
     }
-    if page < USER_STACK_TOP - USER_STACK_MAX {
-        return false;
-    }
     with_table(|t| {
         let id = t.current;
+        // RLIMIT_STACK is the floor, read from the faulting task rather than a
+        // compile-time constant: a soft limit below the reserved region stops
+        // growth early (SIGSEGV beyond it), and a raised or infinite one is
+        // capped at the region actually reserved for the stack.
+        let stack_max = t
+            .task(id)
+            .rlimits
+            .get(3)
+            .map_or(USER_STACK_MAX as u64, |r| r.cur)
+            .min(USER_STACK_MAX as u64) as usize;
+        if page < USER_STACK_TOP - stack_max {
+            return false;
+        }
         // The group's space, for the same reason a copy-on-write fault looks
         // there: a thread's stack is a mapping the group shares, and only the
         // leader's slot holds the tables that describe it.
@@ -5133,6 +5599,9 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let session = parent.session;
         let ctty = parent.ctty;
         let identity = parent.identity;
+        let umask = parent.umask;
+        let rlimits = parent.rlimits;
+        let seccomp_strict = parent.seccomp_strict;
         let priority = parent.priority;
         let dispositions = parent.dispositions;
         let cwd = parent.cwd.clone();
@@ -5186,6 +5655,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
                 ..*state
             }),
             signals: 0,
+            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
             blocked: 0,
             // Linux shares the handler table under `CLONE_SIGHAND`; this
             // kernel copies it, so a thread that installs a handler does not
@@ -5204,8 +5674,12 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             // terminal its creator's group holds.
             session,
             ctty,
-            // ...and the same identity, group and user words alike.
+            // ...and the same identity, group and user words alike, and the
+            // same creation mask - a thread creates files as its process does.
             identity,
+            umask,
+            rlimits,
+            seccomp_strict,
             brk_base,
             brk_pages,
             mmap_cursor,

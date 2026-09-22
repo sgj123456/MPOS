@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::config::RootfsConfig;
+use crate::config::{RootfsConfig, UserConfig};
 use crate::utils;
 
 pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
@@ -34,114 +34,103 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // the rebuild the new archive needs.
     crate::initramfs::ensure(build_dir, profile)?;
 
-    // The image's own mtime cannot say whether a root filesystem was installed
-    // into it: `disk` creating the file makes it newer than the configuration,
-    // which would read as "built after the last change" and skip the install.
-    // The stamp is written only by a run that got all the way through.
-    let stamp = utils::rootfs_stamp(build_dir);
-    if stamp.exists() {
-        let built = utils::file_mtime(&stamp)?;
-        let mut changed = false;
-        for path in [
-            config_path.clone(),
-            utils::kernel_path(profile)?,
-            utils::loader_path(profile)?,
-            utils::initramfs_path(build_dir),
-            image.clone(),
-        ] {
-            if utils::newer(&path, &stamp)? {
-                changed = true;
-            }
-        }
-        if !changed && !utils::dir_newer_than(&root.join("rootfs"), built)? {
-            println!("rootfs: up to date");
-            return Ok(());
-        }
+    if !needs_rebuild(build_dir, profile)? {
+        println!("rootfs: up to date");
+        return Ok(());
     }
-
-    println!("Building the rootfs");
 
     let kernel = utils::kernel_path(profile)?;
     let loader = utils::loader_path(profile)?;
     let initramfs = utils::initramfs_path(build_dir);
-    if !kernel.exists() {
-        anyhow::bail!(
-            "No kernel at {}; run `cargo xtask build` first",
-            kernel.display()
-        );
-    }
-    if !loader.exists() {
-        anyhow::bail!(
-            "No EFI loader at {}; run `cargo xtask build` first",
-            loader.display()
-        );
-    }
-    if !initramfs.exists() {
-        anyhow::bail!(
-            "No initramfs at {}; run `cargo xtask initramfs` first",
-            initramfs.display()
-        );
+    for (what, path, command) in [
+        ("kernel", &kernel, "build"),
+        ("EFI loader", &loader, "build"),
+        ("initramfs", &initramfs, "initramfs"),
+    ] {
+        if !path.exists() {
+            anyhow::bail!(
+                "No {what} at {}; run `cargo xtask {command}` first",
+                path.display()
+            );
+        }
     }
 
-    let apk = utils::find_apk_tool(build_dir, &config.mirror, &config.branch)?;
+    // A kernel or an initramfs that changed is two files on the ESP and nothing
+    // else: the Alpine tree inside the image is untouched. Reinstalling
+    // thirty-odd packages to copy two files is how a one-line kernel change
+    // turns into minutes, so the base install runs only when the thing that
+    // decides what is installed - the configuration - has changed, or when
+    // there is no image to update.
+    let full_install = needs_full_install(build_dir)?;
+    println!(
+        "{}",
+        if full_install {
+            "Building the rootfs (base system)"
+        } else {
+            "Updating the image (boot files only)"
+        }
+    );
+
+    // A run that was killed left the image attached and mounted, and the next
+    // one would meet a device in use. Clear that before attaching again.
+    clear_stale_state(build_dir);
 
     let mount_dir = build_dir.join("mnt");
     fs::create_dir_all(build_dir)?;
-    if mount_dir.exists() {
-        utils::umount_recursively(&mount_dir);
-        let _ = fs::remove_dir_all(&mount_dir);
-    }
     fs::create_dir_all(&mount_dir)?;
 
-    let disk_dev = attach_image(&image)?;
+    let disk_dev = attach_image(&image, build_dir)?;
     // From here on the image is attached and may be mounted: the guard detaches
     // it however this function leaves, errors included.
-    let _guard = ImageGuard::new(disk_dev.clone(), mount_dir.clone());
+    let _guard = ImageGuard::new(
+        disk_dev.clone(),
+        mount_dir.clone(),
+        build_dir.join(NBD_LEASE),
+    );
 
-    create_gpt(&disk_dev)?;
-
-    let esp_dev = format!("{disk_dev}p1");
-    let root_dev = format!("{disk_dev}p2");
-
-    // The partition nodes are asked for rather than waited for: the nbd node
-    // may have been made by hand a moment ago, and a node udev never saw appear
-    // is one it has no event to make partitions for.
-    let _ = Command::new("partx").args(["-a", &disk_dev]).status();
-    for _ in 0..10 {
-        if Path::new(&esp_dev).exists() && Path::new(&root_dev).exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        let _ = Command::new("partx").args(["-a", &disk_dev]).status();
+    if full_install {
+        create_gpt(&disk_dev, &config.esp_size)?;
     }
-    if !Path::new(&esp_dev).exists() || !Path::new(&root_dev).exists() {
-        anyhow::bail!("The kernel did not publish {esp_dev} and {root_dev}");
+    let (esp_dev, root_dev) = partitions(&disk_dev)?;
+
+    if full_install {
+        // The ESP gets FAT32, and the root filesystem is whatever the config
+        // says - ext4 today, mounted by the kernel's ext2/ext4 driver. Two
+        // features are refused, because the driver cannot honour either:
+        // `has_journal`, since a crash then leaves RECOVER set and nothing
+        // here replays a journal - the image would come up read-only until a
+        // Linux fsck ran - and `metadata_csum`, since every write would leave
+        // behind a checksum this kernel cannot recompute. `64bit` stays on:
+        // the driver reads the high halves now, and a 2 GiB image exercises
+        // them for free. `-F` because the image still carries the filesystem
+        // the last run put there, and `mke2fs` otherwise stops to ask about
+        // overwriting it; `-E nodiscard` because these blocks are a sparse
+        // file and discarding them is wasted work.
+        utils::run_status(
+            Command::new("mkfs.fat")
+                .args(["-F32", "-n", "EFI"])
+                .arg(&esp_dev),
+            "mkfs.fat",
+        )?;
+        utils::run_status(
+            Command::new(format!("mkfs.{}", config.filesystem))
+                .args(["-F", "-L", "root"])
+                .args(if config.mkfs_options.is_empty() {
+                    Vec::new()
+                } else {
+                    vec!["-O", &config.mkfs_options]
+                })
+                .args(["-E", "nodiscard"])
+                .arg(&root_dev),
+            "mkfs the root filesystem",
+        )?;
     }
-
-    // The ESP gets FAT32, and the root filesystem classic ext2: this kernel's
-    // driver reads that layout, and `-E nodiscard` because these blocks are a
-    // sparse file and discarding them is wasted work.
-    utils::run_status(
-        Command::new("mkfs.fat")
-            .args(["-F32", "-n", "EFI"])
-            .arg(&esp_dev),
-        "mkfs.fat",
-    )?;
-    utils::run_status(
-        Command::new("mkfs.ext2")
-            .args(["-L", "root", "-O", "^64bit", "-E", "nodiscard"])
-            .arg(&root_dev),
-        "mkfs.ext2",
-    )?;
-
-    let root_uuid = blk_uuid(&root_dev)?;
 
     utils::run_status(
         Command::new("mount").arg(&root_dev).arg(&mount_dir),
         "mount the root filesystem",
     )?;
     fs::create_dir_all(mount_dir.join("boot"))?;
-    utils::set_mode(&mount_dir.join("boot"), 0o000)?;
     utils::run_status(
         Command::new("mount")
             .args(["-t", "vfat"])
@@ -150,65 +139,29 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
         "mount the ESP",
     )?;
 
-    // The base system, installed into the mounted root the way `mkdisk.sh`
-    // does: repositories, keys, then apk.
-    fs::create_dir_all(mount_dir.join("etc/apk/keys"))?;
-    let repositories = format!(
-        "{}/{}/main\n{}/{}/community\n",
-        config.mirror, config.branch, config.mirror, config.branch
-    );
-    fs::write(mount_dir.join("etc/apk/repositories"), repositories)?;
-    utils::install_apk_keys(&mount_dir.join("etc/apk/keys"))?;
-
-    let status = Command::new(&apk)
-        .args(["--no-progress", "add"])
-        .arg("--root")
-        .arg(&mount_dir)
-        .args(["--arch", &config.arch, "--update-cache", "--initdb"])
-        .args(&config.base_packages)
-        .status()
-        .context("Failed to install the Alpine base system")?;
-    if !status.success() {
-        anyhow::bail!("Failed to install the Alpine base system");
+    if full_install {
+        install_base(build_dir, &mount_dir, &config, &root_dev)?;
     }
 
-    prepare_chroot(&mount_dir)?;
+    install_boot_files(&mount_dir, &config, &kernel, &loader, &initramfs)?;
 
-    // The three files Alpine's `linux-virt` and `mkinitfs` would put on the ESP,
-    // all of them built out of this repository a moment ago. `BOOTX64.EFI` under
-    // EFI/BOOT is where a UEFI firmware falls back when nothing has written a
-    // boot entry into its non-volatile memory.
-    fs::create_dir_all(mount_dir.join("boot/EFI/BOOT"))?;
-    install_file(&loader, &mount_dir.join("boot/EFI/BOOT/BOOTX64.EFI"))?;
-    install_file(&kernel, &mount_dir.join("boot/mpos.elf"))?;
-    install_file(&initramfs, &mount_dir.join("boot/initramfs.tar"))?;
+    // The machine's own configuration, then the overlay. Both run on every
+    // build path - a change to the hostname or to a file under `rootfs/` should
+    // take effect on the next boot, not on the next reinstall - and the overlay
+    // goes last, so a file there is the authority over anything generated.
+    write_system_config(&mount_dir, &config)?;
+    utils::merge_overlay(&root.join("rootfs"), &mount_dir)?;
+
+    // Detached before the stamp, not after: the nbd server can still be
+    // flushing the last writes when the last file is copied, and the image's
+    // mtime bumps when it does. Letting go of the image first makes the file
+    // quiet, so the stamp that goes down next is strictly after everything the
+    // build wrote.
+    drop(_guard);
     fs::write(
-        mount_dir.join("boot/mpos.cmdline"),
-        format!(
-            "root={} rootflags=rw console={}\n",
-            config.root_device, config.serial_port
-        ),
+        utils::rootfs_stamp(build_dir),
+        format!("image: {}\n", image.display()),
     )?;
-
-    write_system_config(&mount_dir, &config, &root_uuid)?;
-
-    if !config.extra_packages.is_empty() {
-        println!("Installing additional packages");
-        let status = Command::new(&apk)
-            .args(["--no-progress", "add"])
-            .arg("--root")
-            .arg(&mount_dir)
-            .args(&config.extra_packages)
-            .status()
-            .context("Failed to install the additional packages")?;
-        if !status.success() {
-            anyhow::bail!("Failed to install the additional packages");
-        }
-    }
-
-    utils::copy_dir_recursive(&root.join("rootfs"), &mount_dir)?;
-
-    fs::write(&stamp, format!("image: {}\n", image.display()))?;
     println!("rootfs: completed");
     Ok(())
 }
@@ -219,50 +172,151 @@ pub fn ensure(build_dir: &Path, profile: &str) -> Result<()> {
     build_rootfs(build_dir, profile)
 }
 
-/// The files that make the guest usable from a serial console: fstab, the
-/// network, an inittab with a getty on the serial port, an unlocked root, and
-/// the resolver QEMU's user network answers on.
-fn write_system_config(mount_dir: &Path, config: &RootfsConfig, root_uuid: &str) -> Result<()> {
-    // The ESP is where the firmware reads from and nothing else mounts it, so it
-    // gets no fstab entry: that would only be a mount that can fail.
+/// True when the image does not hold the current root filesystem: it is
+/// missing, it was never assembled, or anything it was assembled from has
+/// changed since the stamp was written.
+///
+/// The stamp is what makes this answerable at all. The image's own mtime
+/// cannot: `disk` creating the file makes it newer than the configuration,
+/// which reads as "built after the last change" and skips the install
+/// entirely - which is how an image ends up with no root filesystem in it and
+/// still looks newer than everything it was supposed to contain. An image that
+/// is simply *missing* is answered above, so the gap the old wording was
+/// guarding is closed without the image in the list.
+///
+/// It is also why the image must not be compared against the stamp at all:
+/// the image is the output of this build, not one of its inputs, and a write
+/// that lands after the stamp reads as "the image changed after the build" for
+/// ever. `qemu-nbd` does exactly that - it flushes when it detaches, which is
+/// after the last file is copied, and the image's mtime bumps tens of
+/// milliseconds after the stamp. Every run then rebuilds, and `run` bails with
+/// "still out of date" having just built successfully.
+/// The files the stamp is a record of: everything the rootfs is built *from*,
+/// and nothing it is built *into*.
+///
+/// The image is what [`needs_rebuild`] leaves out, on purpose.
+fn stamp_inputs(root: &Path, build_dir: &Path, profile: &str) -> Result<Vec<PathBuf>> {
+    Ok(vec![
+        root.join("rootfs.toml"),
+        utils::kernel_path(profile)?,
+        utils::loader_path(profile)?,
+        utils::initramfs_path(build_dir),
+    ])
+}
+
+pub fn needs_rebuild(build_dir: &Path, profile: &str) -> Result<bool> {
+    let root = utils::project_root()?;
+    let image = utils::image_path(build_dir);
+    let stamp = utils::rootfs_stamp(build_dir);
+    if !image.exists() || !stamp.exists() {
+        return Ok(true);
+    }
+
+    for input in stamp_inputs(&root, build_dir, profile)? {
+        if utils::newer(&input, &stamp)? {
+            return Ok(true);
+        }
+    }
+
+    // The overlay is a tree rather than a file: a file added under `rootfs/`
+    // is an input the stamp knows nothing about until it is written, so the
+    // tree's own contents are what say it changed.
+    utils::dir_newer_than(&root.join("rootfs"), utils::file_mtime(&stamp)?)
+}
+
+/// `/etc/fstab`: the root filesystem by UUID, which is the one name for it
+/// that does not depend on how the kernel enumerated the disk.
+///
+/// The ESP gets no entry: the firmware reads from it and nothing else mounts
+/// it, so an entry would only be a mount that can fail.
+///
+/// Written only on a full install, because what it says is decided by
+/// `mke2fs`/`mkfs.fat` and the UUID they handed out - neither of which a
+/// boot-files update touches.
+fn write_fstab(mount_dir: &Path, config: &RootfsConfig, root_uuid: &str) -> Result<()> {
     let fstab = format!(
         "# <fs>\t\t<mountpoint>\t<type>\t<opts>\t\t<dump/pass>\nUUID={root_uuid}\t/\t\t{}\trelatime\t0 1\n",
         config.filesystem
     );
     fs::write(mount_dir.join("etc/fstab"), fstab)?;
+    Ok(())
+}
 
-    let interfaces = "auto eth0\niface eth0 inet dhcp\n\npost-up /etc/network/if-post-up.d/*\npost-down /etc/network/if-post-down.d/*\n";
-    fs::write(mount_dir.join("etc/network/interfaces"), interfaces)?;
+/// The machine's own configuration: its name, its clock, the login the console
+/// starts from, and the two directories the network hooks live in.
+///
+/// This runs on both build paths - the full install and the boot-files update -
+/// because none of it needs `apk`, all of it is cheap, and a change to the
+/// configuration should take effect on the next boot rather than on the next
+/// reinstall. Everything whose content is a constant moved to the `rootfs/`
+/// overlay instead (`inittab`, `interfaces`, `resolv.conf`, `doas.conf`), which
+/// is applied after this and so wins over anything written here.
+fn write_system_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
+    // The name the prompt, `hostname` and the DHCP client report. Written
+    // rather than left to alpine-baselayout's `localhost`, so that
+    // `[system] hostname` is the one place it is decided.
+    fs::write(
+        mount_dir.join("etc/hostname"),
+        format!("{}\n", config.hostname),
+    )?;
+    // The hostname rides the loopback line, which is how Alpine's own
+    // `setup-hostname` leaves it: a resolver asked for the machine's own name
+    // answers from this file instead of going to the network for it.
+    fs::write(
+        mount_dir.join("etc/hosts"),
+        format!(
+            "127.0.0.1\tlocalhost localhost.localdomain {hostname}\n::1\t\tlocalhost localhost.localdomain\n",
+            hostname = config.hostname
+        ),
+    )?;
+
+    // musl reads the zone from `/etc/localtime` unless `TZ` says otherwise,
+    // and the zone files come from the `tzdata` package. UTC needs neither -
+    // it is what the RTC is already read as - so the default costs nothing and
+    // a zone that is not installed is named rather than linked to a file that
+    // is not there.
+    if config.timezone != "UTC" {
+        let zone = Path::new("/usr/share/zoneinfo").join(&config.timezone);
+        let localtime = mount_dir.join("etc/localtime");
+        if zone.exists() {
+            let _ = fs::remove_file(&localtime);
+            std::os::unix::fs::symlink(&zone, &localtime)?;
+        } else {
+            println!(
+                "rootfs: no {} on this host; leaving the clock in UTC (add tzdata to extra_packages to set {})",
+                zone.display(),
+                config.timezone
+            );
+        }
+    }
+
+    // There is no locale table to generate: musl takes the locale from the
+    // environment. A file that exports it is the whole implementation, and
+    // `/etc/profile.d` is what a login shell sources. The directory is made
+    // rather than assumed - the base system ships one, and a test tree does
+    // not.
+    fs::create_dir_all(mount_dir.join("etc/profile.d"))?;
+    fs::write(
+        mount_dir.join("etc/profile.d/locale.sh"),
+        format!(
+            "# Written from `[system] locale` in rootfs.toml.\nexport LANG={locale}\nexport LC_ALL={locale}\n",
+            locale = config.locale
+        ),
+    )?;
+
+    // The console is a serial line with no keyboard worth typing a password on,
+    // which is why the default for both accounts is none at all.
+    set_password(mount_dir, "root", &config.root_password)?;
+    if !config.user.name.is_empty() {
+        set_password(mount_dir, &config.user.name, &config.user.password)?;
+    }
+
+    // These directories exist because `interfaces` names them in its post-up
+    // and post-down lines; a glob that matches nothing is fine, a directory
+    // that is not there is a line that fails on every ifup.
     fs::create_dir_all(mount_dir.join("etc/network/if-post-up.d"))?;
     fs::create_dir_all(mount_dir.join("etc/network/if-post-down.d"))?;
 
-    // The respawn entries name the virtual consoles `tty1`..`tty4`, which are
-    // real pty-backed terminals here - the kernel's console multiplexer
-    // carries their traffic over `ttyS0`, and `ttyS0` itself carries only the
-    // kernel's log. Root ships password-locked; one line with an empty
-    // password field is what lets root log in with nothing to type.
-    let gettys = ["tty1", "tty2", "tty3", "tty4"]
-        .map(|tty| format!("{tty}::respawn:/sbin/getty 38400 {tty}\n"))
-        .concat();
-    let inittab = format!(
-        "# /etc/inittab - mpos: shells on the virtual consoles, kernel log on ttyS0\n\n::sysinit:/sbin/openrc sysinit\n::sysinit:/sbin/openrc boot\n::wait:/sbin/openrc default\n\n# A getty on each virtual console; ^A 1..4 switches the serial mux between them\n{gettys}\n# Stuff to do for the 3-finger salute\n::ctrlaltdel:/sbin/reboot\n\n# Stuff to do before rebooting\n::shutdown:/sbin/openrc shutdown\n"
-    );
-    fs::write(mount_dir.join("etc/inittab"), inittab)?;
-
-    let shadow_path = mount_dir.join("etc/shadow");
-    if let Ok(shadow) = fs::read_to_string(&shadow_path) {
-        let unlocked: Vec<String> = shadow
-            .lines()
-            .map(|line| match line.strip_prefix("root:") {
-                Some(rest) => match rest.split_once(':') {
-                    Some((_, after)) => format!("root::{after}"),
-                    None => line.to_string(),
-                },
-                None => line.to_string(),
-            })
-            .collect();
-        fs::write(&shadow_path, unlocked.join("\n") + "\n")?;
-    }
     // /etc/securetty lists tty names this kernel's ttyname(2) cannot answer
     // yet, and login would refuse root while calling it a wrong password.
     let _ = fs::remove_file(mount_dir.join("etc/securetty"));
@@ -276,11 +330,121 @@ fn write_system_config(mount_dir: &Path, config: &RootfsConfig, root_uuid: &str)
         }
     }
 
-    let resolv_conf = "# QEMU user networking's built-in forwarder.\nnameserver 10.0.2.3\n";
-    fs::write(mount_dir.join("etc/resolv.conf"), resolv_conf)?;
-
     fs::create_dir_all(mount_dir.join("mnt"))?;
     Ok(())
+}
+
+/// Sets or clears one account's password.
+///
+/// Empty means "nothing to type": the shadow field is emptied, which is what
+/// makes both the default root login and a passwordless account work. Anything
+/// else goes through `chpasswd` in the chroot, because hashing a password is
+/// `crypt(3)` and the image's own libc owns that function, not this build.
+fn set_password(mount_dir: &Path, name: &str, password: &str) -> Result<()> {
+    if password.is_empty() {
+        let shadow_path = mount_dir.join("etc/shadow");
+        if let Ok(shadow) = fs::read_to_string(&shadow_path) {
+            let prefix = format!("{name}:");
+            let cleared: Vec<String> = shadow
+                .lines()
+                .map(|line| match line.strip_prefix(&prefix) {
+                    Some(rest) => match rest.split_once(':') {
+                        Some((_, after)) => format!("{name}::{after}"),
+                        None => line.to_string(),
+                    },
+                    None => line.to_string(),
+                })
+                .collect();
+            fs::write(&shadow_path, cleared.join("\n") + "\n")?;
+        }
+        return Ok(());
+    }
+
+    use std::io::Write;
+
+    let mut child = Command::new("chroot")
+        .arg(mount_dir)
+        .args(["/usr/sbin/chpasswd"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("Failed to run chpasswd in the image")?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        writeln!(stdin, "{name}:{password}").context("Failed to feed chpasswd")?;
+    }
+    let status = child.wait().context("Failed to wait for chpasswd")?;
+    if !status.success() {
+        anyhow::bail!("chpasswd could not set the password for {name}");
+    }
+    Ok(())
+}
+
+/// Creates the account the config names, using the image's own userland.
+///
+/// `adduser` is the one that keeps `/etc/passwd`, `/etc/shadow` and the group
+/// files consistent with each other, and running it inside the chroot means the
+/// busybox in the image decides what those files look like - the same busybox
+/// that will read them.
+///
+/// The password is not set here: [`set_password`] does that on both build paths,
+/// so changing it does not need the packages reinstalled. `-D` is what keeps
+/// `adduser` from assigning one of its own.
+fn create_user(mount_dir: &Path, user: &UserConfig) -> Result<()> {
+    if user.name.is_empty() {
+        return Ok(());
+    }
+
+    // Busybox's `adduser -G` names ONE group and does not split a comma list,
+    // so the old `-G mpos,wheel` looked up a group literally called "mpos,wheel"
+    // and died with "unknown group mpos,wheel". The supported shape instead:
+    // make each group, create the user on its own, then give it membership
+    // group by group with `addgroup USER GROUP`. Creating an existing group and
+    // adding a membership that is already there are both fine, so `addgroup`'s
+    // status is ignored; the `-D` user add is what must succeed.
+    for group in &user.groups {
+        addgroup_in_image(mount_dir, &[group.as_str()]);
+    }
+
+    let status = Command::new("chroot")
+        .arg(mount_dir)
+        .args(["/usr/sbin/adduser", "-D", "-s", &user.shell])
+        .arg(&user.name)
+        .status()
+        .context("Failed to run adduser in the image")?;
+    if !status.success() {
+        anyhow::bail!("adduser could not create {}", user.name);
+    }
+
+    for group in &user.groups {
+        addgroup_in_image(mount_dir, &[user.name.as_str(), group.as_str()]);
+    }
+
+    println!(
+        "rootfs: created the account {} ({})",
+        user.name,
+        if user.groups.is_empty() {
+            "no extra groups".to_string()
+        } else {
+            user.groups.join(", ")
+        }
+    );
+    Ok(())
+}
+
+/// Run busybox `addgroup` inside the image with these arguments, ignoring the
+/// outcome. One argument creates a group; two (`USER GROUP`) add an existing
+/// user to an existing group. Both are called only for their end state in
+/// `/etc/group`, so an "already exists" or "already a member" is success here.
+fn addgroup_in_image(mount_dir: &Path, args: &[&str]) {
+    let mut cmd = Command::new("chroot");
+    cmd.arg(mount_dir)
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("addgroup \"$@\" >/dev/null 2>&1 || :")
+        .arg("addgroup");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
 fn install_file(src: &Path, dst: &Path) -> Result<()> {
@@ -295,20 +459,24 @@ fn install_file(src: &Path, dst: &Path) -> Result<()> {
 struct ImageGuard {
     disk_dev: String,
     mount_dir: PathBuf,
+    /// Where this build wrote down the device it attached, so a run that is
+    /// killed can be cleared by the next one.
+    lease: PathBuf,
 }
 
 impl ImageGuard {
-    fn new(disk_dev: String, mount_dir: PathBuf) -> Self {
+    fn new(disk_dev: String, mount_dir: PathBuf, lease: PathBuf) -> Self {
         Self {
             disk_dev,
             mount_dir,
+            lease,
         }
     }
 }
 
 impl Drop for ImageGuard {
     fn drop(&mut self) {
-        utils::umount_recursively(&self.mount_dir);
+        let still_mounted = utils::umount_recursively(&self.mount_dir);
         // The partition nodes first: `qemu-nbd --disconnect` removes the whole
         // device, and a partition node left pointing at a deleted parent is a
         // stale entry the next run counts as a device in use.
@@ -317,12 +485,25 @@ impl Drop for ImageGuard {
             .arg("--disconnect")
             .arg(&self.disk_dev)
             .status();
-        let _ = fs::remove_dir_all(&self.mount_dir);
+        let _ = fs::remove_file(&self.lease);
+        // Only remove the staging directory once nothing is mounted under it.
+        // `remove_dir_all` recurses through any live bind mount and deletes the
+        // mounted-through tree, so with `/dev` bound in here that would destroy
+        // the host's own device nodes. A leftover empty-ish directory is a
+        // far cheaper failure than that.
+        if still_mounted == 0 {
+            let _ = fs::remove_dir_all(&self.mount_dir);
+        } else {
+            eprintln!(
+                "rootfs: leaving {} in place: {still_mounted} filesystem(s) still mounted under it",
+                self.mount_dir.display()
+            );
+        }
     }
 }
 
 /// Attaches the image as an NBD block device and returns its path.
-fn attach_image(image: &Path) -> Result<String> {
+fn attach_image(image: &Path, build_dir: &Path) -> Result<String> {
     let disk_dev = match get_available_nbd() {
         Ok(dev) => dev,
         Err(_) => {
@@ -347,6 +528,12 @@ fn attach_image(image: &Path) -> Result<String> {
     if !status.success() {
         anyhow::bail!("Could not attach the image");
     }
+
+    // The device is written down before anything is done with it: a `SIGINT`
+    // between here and `ImageGuard::drop` ends the process without unwinding,
+    // and the next run has to be able to name what it has to clear.
+    fs::write(build_dir.join(NBD_LEASE), &disk_dev)
+        .with_context(|| format!("Failed to record {NBD_LEASE} in {}", build_dir.display()))?;
 
     std::thread::sleep(Duration::from_secs(1));
     Ok(disk_dev)
@@ -398,7 +585,12 @@ fn get_available_nbd() -> Result<String> {
 }
 
 /// Creates the GPT partition table: an EFI System Partition and a system one.
-fn create_gpt(disk_dev: &str) -> Result<()> {
+///
+/// The ESP's size is the config's, because it is the one number that depends on
+/// what goes on it - the loader, the kernel, the initramfs and nothing else, so
+/// the default is generous and a bigger kernel image does not have to mean a
+/// different disk.
+fn create_gpt(disk_dev: &str, esp_size: &str) -> Result<()> {
     use std::io::Write;
 
     let mut child = Command::new("sfdisk")
@@ -408,8 +600,10 @@ fn create_gpt(disk_dev: &str) -> Result<()> {
         .context("Failed to run sfdisk")?;
 
     if let Some(mut stdin) = child.stdin.take() {
+        let table =
+            format!("label: gpt\nname=efi,type=U,size={esp_size},bootable\nname=system,type=L\n");
         stdin
-            .write_all(b"label: gpt\nname=efi,type=U,size=128M,bootable\nname=system,type=L\n")
+            .write_all(table.as_bytes())
             .context("Failed to write the partition table to sfdisk")?;
     }
 
@@ -473,4 +667,357 @@ fn mount_bind(src: &Path, dst: &Path) -> Result<()> {
         "make the bind mount private",
     )?;
     Ok(())
+}
+
+/// The file recording which nbd device this build attached. A run that is
+/// killed cannot clean up after itself, so it leaves the name behind for the
+/// next one.
+const NBD_LEASE: &str = ".nbd-device";
+
+/// True when the image needs the base system installed rather than just its
+/// boot files refreshed.
+///
+/// The configuration is what decides what is installed, so a change to it -
+/// or an image with no root filesystem in it - is what makes the install run.
+/// Everything else the image contains is either already there or is a file on
+/// the ESP.
+pub fn needs_full_install(build_dir: &Path) -> Result<bool> {
+    let root = utils::project_root()?;
+    let stamp = utils::rootfs_stamp(build_dir);
+    if !utils::image_path(build_dir).exists() || !stamp.exists() {
+        return Ok(true);
+    }
+    utils::newer(&root.join("rootfs.toml"), &stamp)
+}
+
+/// Undoes what a run that was killed left behind.
+///
+/// [`ImageGuard`] detaches the image on every path this process can take - but
+/// not on `SIGINT`, which ends it without unwinding. Ctrl-C during a build
+/// therefore leaves the image attached and mounted, and the next run meets a
+/// device in use: `sfdisk` warns about it, `mke2fs` stops to ask about
+/// overwriting the filesystem, and both messages name a device this run never
+/// made. The device is written down when it is attached, so the next run can be
+/// the one that clears it.
+fn clear_stale_state(build_dir: &Path) {
+    let mount_dir = build_dir.join("mnt");
+    let still_mounted = utils::umount_recursively(&mount_dir);
+
+    let lease = build_dir.join(NBD_LEASE);
+    if let Ok(device) = fs::read_to_string(&lease) {
+        let device = device.trim();
+        if !device.is_empty() {
+            println!("rootfs: clearing {device}, left attached by an interrupted build");
+            let _ = Command::new("partx").args(["-d", device]).status();
+            let _ = Command::new("qemu-nbd")
+                .arg("--disconnect")
+                .arg(device)
+                .status();
+        }
+        let _ = fs::remove_file(&lease);
+    }
+    // Same hazard as `ImageGuard::drop`: never `remove_dir_all` through a bind
+    // mount that outlived the umount - it deletes the mounted-through tree.
+    if still_mounted == 0 {
+        let _ = fs::remove_dir_all(&mount_dir);
+    } else {
+        eprintln!(
+            "rootfs: leaving {} in place: {still_mounted} filesystem(s) still mounted under it",
+            mount_dir.display()
+        );
+    }
+}
+
+/// Asks the kernel for the partition nodes of an attached image.
+///
+/// Any the last run left are dropped first: `partx -a` on a table it has
+/// already added fails, and the failure is a message the caller would have to
+/// know to ignore.
+fn partitions(disk_dev: &str) -> Result<(String, String)> {
+    let esp_dev = format!("{disk_dev}p1");
+    let root_dev = format!("{disk_dev}p2");
+
+    let _ = Command::new("partx").args(["-d", disk_dev]).status();
+    let _ = Command::new("partx").args(["-a", disk_dev]).status();
+    for _ in 0..10 {
+        if Path::new(&esp_dev).exists() && Path::new(&root_dev).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let _ = Command::new("partx").args(["-a", disk_dev]).status();
+    }
+    if !Path::new(&esp_dev).exists() || !Path::new(&root_dev).exists() {
+        anyhow::bail!("The kernel did not publish {esp_dev} and {root_dev}");
+    }
+    Ok((esp_dev, root_dev))
+}
+
+/// Installs the Alpine base system into a freshly formatted root filesystem.
+///
+/// The expensive half, and the reason it is a step of its own: apk resolves and
+/// unpacks thirty-odd packages, and none of that changes when the kernel does.
+fn install_base(
+    build_dir: &Path,
+    mount_dir: &Path,
+    config: &RootfsConfig,
+    root_dev: &str,
+) -> Result<()> {
+    let apk = utils::find_apk_tool(build_dir, &config.mirror, &config.branch)?;
+
+    // Repositories and keys, then apk - the way `mkdisk.sh` does it.
+    fs::create_dir_all(mount_dir.join("etc/apk/keys"))?;
+    let repositories = utils::repositories_text(&config.mirror, &config.branch, &config.repos);
+    fs::write(mount_dir.join("etc/apk/repositories"), repositories)?;
+    utils::install_apk_keys(&mount_dir.join("etc/apk/keys"))?;
+
+    let status_ok = apk_add(
+        &apk,
+        mount_dir,
+        &["--arch", config.arch.as_str(), "--update-cache", "--initdb"],
+        &config.base_packages,
+    );
+    status_ok.context("Failed to install the Alpine base system")?;
+
+    prepare_chroot(mount_dir)?;
+
+    write_fstab(mount_dir, config, &blk_uuid(root_dev)?)?;
+
+    if !config.extra_packages.is_empty() {
+        println!("Installing additional packages");
+        apk_add(&apk, mount_dir, &[], &config.extra_packages)
+            .context("Failed to install the additional packages")?;
+    }
+
+    // After the packages, so a shell the config names is one that is installed
+    // by the time the account points at it.
+    create_user(mount_dir, &config.user)?;
+
+    Ok(())
+}
+
+/// Attempts to make a transient `qemu-nbd` write hiccup recoverable: how many
+/// times `apk add` is given before the build gives up. The device has been seen
+/// to return `Input/output error` on the largest package payloads - the binutils
+/// archives, `libgcc.a`, the gcc `cc1` - on a host with free space and no stale
+/// mount, and only some runs, which is the signature of the NBD layer under
+/// heavy write load rather than a real fault the retry can't clear.
+const APK_ADD_ATTEMPTS: usize = 4;
+
+/// `apk --no-progress add --root <mount_dir> <preflags...> <packages...>`,
+/// retried. A `qemu-nbd`-attached image intermittently fails its biggest
+/// writes with an I/O error; `apk` records what it did manage to install, so a
+/// plain re-run finishes the packages the failed attempt dropped. `sync` before
+/// each retry flushes the queued writeback to the image before the device is
+/// touched again.
+fn apk_add(
+    apk: &str,
+    mount_dir: &Path,
+    preflags: &[&str],
+    packages: &[String],
+) -> Result<()> {
+    for attempt in 1..=APK_ADD_ATTEMPTS {
+        let status = Command::new(apk)
+            .args(["--no-progress", "add"])
+            .arg("--root")
+            .arg(mount_dir)
+            .args(preflags)
+            .args(packages)
+            .status()
+            .context("Failed to run apk")?;
+        if status.success() {
+            return Ok(());
+        }
+        if attempt == APK_ADD_ATTEMPTS {
+            anyhow::bail!("apk add failed after {attempt} attempts: {packages:?}");
+        }
+        eprintln!(
+            "rootfs: apk add failed (attempt {attempt}/{APK_ADD_ATTEMPTS}); syncing and retrying"
+        );
+        let _ = Command::new("sync").status();
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Ok(())
+}
+
+/// The three files Alpine's `linux-virt` and `mkinitfs` would put on the ESP,
+/// and the command line the loader hands the kernel.
+///
+/// `BOOTX64.EFI` under `EFI/BOOT` is where a UEFI firmware falls back when
+/// nothing has written a boot entry into its non-volatile memory, which is
+/// exactly the state of a machine that has never booted this disk.
+fn install_boot_files(
+    mount_dir: &Path,
+    config: &RootfsConfig,
+    kernel: &Path,
+    loader: &Path,
+    initramfs: &Path,
+) -> Result<()> {
+    fs::create_dir_all(mount_dir.join("boot/EFI/BOOT"))?;
+    install_file(loader, &mount_dir.join("boot/EFI/BOOT/BOOTX64.EFI"))?;
+    install_file(kernel, &mount_dir.join("boot/mpos.elf"))?;
+    install_file(initramfs, &mount_dir.join("boot/initramfs.tar"))?;
+    fs::write(
+        mount_dir.join("boot/mpos.cmdline"),
+        format!(
+            // `rootfstype` is for the initramfs's mount, not for the kernel:
+            // the loader hands the whole line over, and the kernel ignores
+            // what it does not know. Naming it here keeps the init script
+            // from guessing.
+            "root={} rootfstype={} rootflags=rw console={}\n",
+            config.root_device, config.filesystem, config.serial_port
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_image_is_not_an_input_to_its_own_stamp() {
+        // The output of the build is not one of its inputs. Comparing the
+        // image against the stamp meant a write landing after the stamp read
+        // as "the image changed after the build": qemu-nbd flushes when it
+        // detaches, which is after the last file is copied, and a real build
+        // left the image 82 milliseconds newer than the stamp - every run
+        // then rebuilt, and `run` bailed with "still out of date" having just
+        // built successfully.
+        let root = utils::project_root().expect("the project root is there");
+        let build_dir = Path::new("/mpos-a-build-dir-that-does-not-exist");
+        let inputs = stamp_inputs(&root, build_dir, "debug").expect("the paths resolve");
+
+        assert!(
+            inputs.contains(&root.join("rootfs.toml")),
+            "the configuration is an input"
+        );
+        assert!(
+            inputs.contains(&utils::initramfs_path(build_dir)),
+            "the initramfs is an input"
+        );
+        assert!(
+            inputs.contains(&utils::kernel_path("debug").unwrap()),
+            "the kernel is an input"
+        );
+        assert!(
+            inputs.contains(&utils::loader_path("debug").unwrap()),
+            "the loader is an input"
+        );
+        assert_eq!(inputs.len(), 4, "and that is the whole list");
+        assert!(
+            !inputs.contains(&utils::image_path(build_dir)),
+            "the image is built, not built from"
+        );
+    }
+
+    /// A mount directory with the two files the generated configuration reads
+    /// back: `/etc/shadow`, as the packages leave it, and `/etc/init.d`.
+    fn staged_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mpos-rootfs-test-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("etc/init.d")).unwrap();
+        fs::create_dir_all(dir.join("etc/network")).unwrap();
+        fs::write(
+            dir.join("etc/shadow"),
+            "root:$6$abc$def:19000:0:99999:7:::\nmpos:!:19000:0:99999:7:::\nother:$6$x$y:19000:0:99999:7:::\n",
+        )
+        .unwrap();
+        fs::write(dir.join("etc/securetty"), "ttyS0\n").unwrap();
+        dir
+    }
+
+    /// The configuration a test asks for, read back through the real loader -
+    /// the keys and the defaults are then the ones the build gets, not a
+    /// hand-built struct that can drift from them. `name` keys the file as
+    /// well, because the tests run in parallel and share a temp directory.
+    fn load_config(name: &str, toml: &str) -> RootfsConfig {
+        let path = std::env::temp_dir().join(format!("mpos-rootfs-test-{name}.toml"));
+        fs::write(&path, toml).unwrap();
+        RootfsConfig::load(&path).unwrap()
+    }
+
+    #[test]
+    fn a_passwordless_account_has_nothing_to_type_and_the_rest_is_untouched() {
+        let dir = staged_dir("shadow");
+        let config = load_config(
+            "shadow",
+            "[system]\nhostname = \"mpos\"\n[user]\nname = \"mpos\"\npassword = \"\"\n",
+        );
+        write_system_config(&dir, &config).unwrap();
+
+        let shadow = fs::read_to_string(dir.join("etc/shadow")).unwrap();
+        let field = |name: &str| {
+            shadow
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}:")))
+                .map(|line| line.split(':').nth(1).unwrap().to_string())
+        };
+        assert_eq!(field("root").as_deref(), Some(""), "root's hash is cleared");
+        assert_eq!(
+            field("mpos").as_deref(),
+            Some(""),
+            "and so is the account's"
+        );
+        assert_eq!(
+            field("other").as_deref(),
+            Some("$6$x$y"),
+            "an account the config does not name keeps its own"
+        );
+        assert!(
+            !dir.join("etc/securetty").exists(),
+            "securetty lists tty names ttyname(2) cannot answer yet"
+        );
+    }
+
+    #[test]
+    fn the_name_and_the_locale_land_where_the_guest_reads_them() {
+        let dir = staged_dir("system");
+        let config = load_config(
+            "system",
+            "[system]\nhostname = \"probe\"\nlocale = \"C.UTF-8\"\n[user]\nname = \"\"\n",
+        );
+        write_system_config(&dir, &config).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("etc/hostname")).unwrap(),
+            "probe\n"
+        );
+        let hosts = fs::read_to_string(dir.join("etc/hosts")).unwrap();
+        assert!(
+            hosts.contains("127.0.0.1\tlocalhost localhost.localdomain probe"),
+            "the name rides the loopback line: {hosts}"
+        );
+        let locale = fs::read_to_string(dir.join("etc/profile.d/locale.sh")).unwrap();
+        assert!(locale.contains("export LANG=C.UTF-8"), "{locale}");
+    }
+
+    #[test]
+    fn fstab_names_the_root_by_uuid_and_the_configured_filesystem() {
+        let dir = staged_dir("fstab");
+        let config = load_config("fstab", "[rootfs]\nfilesystem = \"ext4\"\n");
+        write_fstab(&dir, &config, "1234-abcd").unwrap();
+
+        let fstab = fs::read_to_string(dir.join("etc/fstab")).unwrap();
+        assert!(
+            fstab.contains("UUID=1234-abcd\t/\t\text4\trelatime\t0 1"),
+            "{fstab}"
+        );
+        assert!(
+            !fstab.contains("boot"),
+            "the ESP is the firmware's, and an entry for it would only be a mount that can fail"
+        );
+    }
+
+    #[test]
+    fn the_repository_file_lists_the_components_in_the_order_they_are_configured() {
+        let text = utils::repositories_text(
+            "https://example.invalid/alpine",
+            "edge",
+            &["main".to_string(), "community".to_string()],
+        );
+        assert_eq!(
+            text,
+            "https://example.invalid/alpine/edge/main\nhttps://example.invalid/alpine/edge/community\n"
+        );
+    }
 }

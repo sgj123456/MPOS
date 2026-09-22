@@ -57,6 +57,20 @@ const IPPROTO_UDP: u32 = 17;
 const SOL_SOCKET: usize = 1;
 const SO_TYPE: usize = 3;
 const SO_ERROR: usize = 4;
+// The option names `setsockopt`/`getsockopt` exchange, in the x86_64 numbering.
+const SO_REUSEADDR: usize = 2;
+const SO_SNDBUF: usize = 7;
+const SO_RCVBUF: usize = 8;
+const SO_KEEPALIVE: usize = 9;
+const SO_LINGER: usize = 13;
+const SOL_TCP: usize = 6;
+const TCP_NODELAY: usize = 1;
+
+/// The keep-alive probe interval `SO_KEEPALIVE` arms smoltcp with when it is
+/// turned on. Linux's default `TCP_KEEPINTVL` - the pace the socket holds to
+/// once its idle timer has already fired - so a peer that vanishes is noticed
+/// within a couple of these intervals rather than never.
+const KEEPALIVE_INTERVAL_SECS: u64 = 75;
 
 /// The length of a `sockaddr_in` on x86_64: family, port, address, padding.
 const SOCKADDR_IN_LEN: usize = 16;
@@ -96,6 +110,27 @@ fn rtnl_handle_of_fd(fd: i32) -> Option<usize> {
 
 /// `recv(2)`'s "do not sleep" flag, as `linux/socket.h` spells it.
 const MSG_DONTWAIT: usize = 0x40;
+/// `recv(2)`'s "look without taking" flag.
+const MSG_PEEK: usize = 0x02;
+
+/// The `AF_UNIX` stream pair's end behind `fd`, if it is one. `socketpair`
+/// mints anonymous duplex pipes - a channel, not a protocol - and the message
+/// calls on such a descriptor are its read and write wearing socket clothes:
+/// no address to name, no control data to carry. The routing matters, because
+/// a channel end is not an IP socket: answering every `send` on one with
+/// `ENOTSOCK` is what broke sudo's backchannel between parent and monitor
+/// process, which is a socketpair and nothing else.
+fn duplex_of_fd(fd: i32) -> Option<Arc<crate::vfs::File>> {
+    let file = crate::sched::current_fds().clone_at(fd).ok()?;
+    file.inode().as_duplex()?;
+    Some(file)
+}
+
+/// Whether a call on `fd` must answer without parking: `MSG_DONTWAIT` on the
+/// call, or `O_NONBLOCK` on the descriptor.
+fn dontwait(fd: i32, flags: usize) -> bool {
+    flags & MSG_DONTWAIT != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0
+}
 
 /// The next dump answer for a route-netlink session, honoring the caller's
 /// wish not to wait: `MSG_DONTWAIT` on the call or `O_NONBLOCK` on the
@@ -123,6 +158,11 @@ pub struct NlRouteInode {
 }
 
 impl Inode for NlRouteInode {
+    /// A socket has no position: `lseek(2)` on one is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x7000_8000 + self.handle as u64,
@@ -152,6 +192,11 @@ impl Inode for NlRouteInode {
 }
 
 impl Inode for SocketInode {
+    /// A socket has no position: `lseek(2)` on one is `ESPIPE`.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             // A made-up inode number in a range nothing else claims: sockets
@@ -375,7 +420,10 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
             crate::uevent::NETLINK_KOBJECT_UEVENT => {}
             crate::net::rtnl::NETLINK_ROUTE => {
                 let handle = crate::net::rtnl::open();
-                let fd = crate::vfs::open_inode(Arc::new(NlRouteInode { handle }));
+                let fd = match crate::vfs::open_inode(Arc::new(NlRouteInode { handle })) {
+                    Ok(fd) => fd,
+                    Err(e) => return crate::syscall::err_of(e),
+                };
                 if (args[1] as u32) & SOCK_NONBLOCK != 0
                     && let Ok(file) = crate::sched::current_fds().clone_at(fd)
                 {
@@ -386,7 +434,10 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
             _ => return err::EPROTONOSUPPORT,
         }
         let handle = crate::uevent::open();
-        let fd = crate::vfs::open_inode(Arc::new(SocketInode { handle }));
+        let fd = match crate::vfs::open_inode(Arc::new(SocketInode { handle })) {
+            Ok(fd) => fd,
+            Err(e) => return crate::syscall::err_of(e),
+        };
         if (args[1] as u32) & SOCK_NONBLOCK != 0
             && let Ok(file) = crate::sched::current_fds().clone_at(fd)
         {
@@ -421,7 +472,10 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         Ok(handle) => handle,
         Err(e) => return e,
     };
-    let fd = crate::vfs::open_inode(Arc::new(SocketInode { handle }));
+    let fd = match crate::vfs::open_inode(Arc::new(SocketInode { handle })) {
+        Ok(fd) => fd,
+        Err(e) => return crate::syscall::err_of(e),
+    };
     if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
@@ -585,7 +639,7 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
             Some(Err(e)) => return e,
             None => return err::EBADF,
         }
-        if crate::sched::take_fatal_signal().is_some() {
+        if crate::sched::has_deliverable_signal() {
             return err::EINTR;
         }
         if crate::arch::timer::ticks() >= deadline {
@@ -613,6 +667,26 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         }
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
         return crate::net::rtnl::send(handle, data);
+    }
+    // A connected pair's end: the send *is* a write. There is no destination
+    // to parse and no control data this kernel carries, so the whole of the
+    // call is the bytes; a caller that names a destination on a connected
+    // socket is told so, as Linux does.
+    if let Some(file) = duplex_of_fd(fd) {
+        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+            return err::EFAULT;
+        }
+        if args[4] != 0 {
+            return err::EISCONN;
+        }
+        if dontwait(fd, args[3]) && !file.inode().poll_ready().write {
+            return err::EAGAIN;
+        }
+        let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+        return file
+            .write(data)
+            .map(|n| n as isize)
+            .unwrap_or_else(crate::syscall::err_of);
     }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
@@ -649,6 +723,29 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
             return e;
         }
         return crate::net::rtnl::send(handle, &data);
+    }
+    // A connected pair's end, in scatter-gather form: gather, then write.
+    // No name is legal to send to and no control data is carried, so a
+    // caller that set either is told so.
+    if let Some(file) = duplex_of_fd(fd) {
+        let (name, _namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        if name != 0 {
+            return err::EISCONN;
+        }
+        let mut data: Vec<u8> = Vec::new();
+        if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
+            return e;
+        }
+        if dontwait(fd, args[2]) && !file.inode().poll_ready().write {
+            return err::EAGAIN;
+        }
+        return file
+            .write(&data)
+            .map(|n| n as isize)
+            .unwrap_or_else(crate::syscall::err_of);
     }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
@@ -743,7 +840,7 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
             Some(Err(e)) => return e,
             None => return err::EBADF,
         }
-        if crate::sched::take_fatal_signal().is_some() {
+        if crate::sched::has_deliverable_signal() {
             return if sent > 0 { sent as isize } else { err::EINTR };
         }
         crate::sched::sleep_ticks(1);
@@ -824,6 +921,25 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         }
         return n as isize;
     }
+    // The read side of a connected pair's end. A peek would need to look at
+    // the front of the pipe's queue without taking it, which a pipe cannot
+    // do - refusing beats consuming bytes the caller meant to keep.
+    if let Some(file) = duplex_of_fd(fd) {
+        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+            return err::EFAULT;
+        }
+        if args[3] & MSG_PEEK != 0 {
+            return err::EOPNOTSUPP;
+        }
+        if dontwait(fd, args[3]) && !file.inode().poll_ready().read {
+            return err::EAGAIN;
+        }
+        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+        return file
+            .read(out)
+            .map(|n| n as isize)
+            .unwrap_or_else(crate::syscall::err_of);
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -879,6 +995,46 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             }
         }
         return n as isize;
+    }
+    // The read side of a connected pair's end, in scatter-gather form: one
+    // contiguous read into the first iovec, no name and no control data to
+    // report - the fields go back zeroed, which is how Linux says "none".
+    if let Some(file) = duplex_of_fd(fd) {
+        let (name, namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        let Some((buf, len)) = first_iovec(iov, iovlen, from_user) else {
+            return err::EINVAL;
+        };
+        if len == 0 {
+            return err::EINVAL;
+        }
+        if args[2] & MSG_PEEK != 0 {
+            // A peek needs the front of the queue without the take, and a
+            // pipe has no way to look. Refusing beats consuming bytes the
+            // caller meant to keep.
+            return err::EOPNOTSUPP;
+        }
+        if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
+            return err::EAGAIN;
+        }
+        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+        let n = match file.read(out) {
+            Ok(n) => n as isize,
+            Err(e) => return crate::syscall::err_of(e),
+        };
+        if !crate::syscall::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
+            return err::EFAULT;
+        }
+        unsafe {
+            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(0);
+            if name != 0 && namelen != 0 {
+                ((msghdr + 8) as *mut u32).write_unaligned(0);
+            }
+            ((msghdr + 40) as *mut u64).write_unaligned(0); // msg_controllen
+        }
+        return n;
     }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
@@ -998,7 +1154,7 @@ fn tcp_recv(
         if nonblock {
             return Err(err::EWOULDBLOCK);
         }
-        if crate::sched::take_fatal_signal().is_some() {
+        if crate::sched::has_deliverable_signal() {
             return Err(err::EINTR);
         }
         crate::sched::sleep_ticks(1);
@@ -1049,7 +1205,7 @@ fn udp_recv(
         if nonblock {
             return Err(err::EWOULDBLOCK);
         }
-        if crate::sched::take_fatal_signal().is_some() {
+        if crate::sched::has_deliverable_signal() {
             return Err(err::EINTR);
         }
         crate::sched::sleep_ticks(1);
@@ -1183,7 +1339,13 @@ fn raw_recv(
         if nonblock {
             return Err(err::EWOULDBLOCK);
         }
-        if crate::sched::take_fatal_signal().is_some() {
+        // Any signal with a handler ends the wait, not just a fatal one, and
+        // the signal is left pending for the gate to deliver on the way out.
+        // `ping` is the shape this is for: it arms `ITIMER_REAL` with a
+        // SIGALRM handler and expects the blocking read to come back `EINTR`
+        // once a second so that it can send the next request - a wait that
+        // only noticed fatal signals never gave it the chance.
+        if crate::sched::has_deliverable_signal() {
             return Err(err::EINTR);
         }
         crate::sched::sleep_ticks(1);
@@ -1594,10 +1756,21 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
     }
 
     let (first, second) = crate::vfs::pipe::DuplexEnd::pair();
-    let fds = [
-        crate::vfs::file::open_inode(first),
-        crate::vfs::file::open_inode(second),
-    ];
+    let fd0 = match crate::vfs::file::open_inode(first) {
+        Ok(fd) => fd,
+        Err(e) => return crate::syscall::err_of(e),
+    };
+    let fd1 = match crate::vfs::file::open_inode(second) {
+        Ok(fd) => fd,
+        Err(e) => {
+            // The first landed but the allowance ran out on the second: give
+            // the first back rather than leak a descriptor the caller never
+            // learns the number of.
+            let _ = crate::vfs::close(fd0);
+            return crate::syscall::err_of(e);
+        }
+    };
+    let fds = [fd0, fd1];
     let table = crate::sched::current_fds();
     for fd in fds {
         if raw_type & SOCK_CLOEXEC != 0 {
@@ -1799,10 +1972,78 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
 
 /// `setsockopt(fd, level, optname, optval, optlen)`.
 ///
-/// Options are accepted and forgotten. Nothing musl or apk sets on these
-/// sockets changes what the stack does with them - timeouts live in user
-/// code (`poll`), and `SO_REUSEADDR` is moot with one process binding.
-pub(crate) fn handle_setsockopt(_args: [usize; 6], _from_user: bool) -> isize {
+/// Every option is remembered so `getsockopt` reads back what the caller set.
+/// Two of them also reach the stack: `TCP_NODELAY` switches Nagle off on the
+/// live socket and `SO_KEEPALIVE` arms its probe timer. The rest - buffer
+/// sizes, linger, reuse - are recorded only: timeouts live in user code
+/// (`poll`) and `SO_REUSEADDR` is moot while one process binds at a time.
+pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
+    let (fd, level, optname, optval, optlen) =
+        (args[0] as i32, args[1], args[2], args[3], args[4]);
+    let handle = match socket_handle_of_fd(fd) {
+        Ok(handle) => handle,
+        Err(e) => return e,
+    };
+    // An int-valued option is 4 bytes; `struct linger` is two ints.
+    let need = if (level, optname) == (SOL_SOCKET, SO_LINGER) {
+        8
+    } else {
+        4
+    };
+    if optval == 0 || optlen < need || !crate::syscall::buffer_ok(optval, need, false, from_user) {
+        return err::EINVAL;
+    }
+    let val = unsafe { (optval as *const i32).read_unaligned() };
+    super::with(handle, |stack, entry| {
+        // The smoltcp socket behind this channel, when it is a TCP one. Two of
+        // the options below actually steer the stack and so are applied here,
+        // not merely remembered; `get_mut` downcasts and panics on a mismatch,
+        // so it is only ever called with a handle this `Entry` owns as TCP.
+        let tcp_sock = match entry.channel {
+            Channel::Tcp { handle: h, .. } => Some(h),
+            _ => None,
+        };
+        match (level, optname) {
+            (SOL_SOCKET, SO_REUSEADDR) => entry.opts.reuseaddr = val != 0,
+            (SOL_SOCKET, SO_KEEPALIVE) => {
+                entry.opts.keepalive = val != 0;
+                // Turning keep-alive on arms smoltcp's probe timer; the interval
+                // is Linux's default `TCP_KEEPINTVL`, which is the pace it then
+                // holds the socket to.
+                if let Some(h) = tcp_sock {
+                    let interval = (val != 0)
+                        .then(|| smoltcp::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+                    stack.sockets.get_mut::<tcp::Socket>(h).set_keep_alive(interval);
+                }
+            }
+            (SOL_SOCKET, SO_SNDBUF) => {
+                if val > 0 {
+                    entry.opts.sndbuf = val as u32;
+                }
+            }
+            (SOL_SOCKET, SO_RCVBUF) => {
+                if val > 0 {
+                    entry.opts.rcvbuf = val as u32;
+                }
+            }
+            (SOL_SOCKET, SO_LINGER) => {
+                let t = unsafe { ((optval + 4) as *const i32).read_unaligned() };
+                entry.opts.linger_on = val != 0;
+                entry.opts.linger_sec = t;
+            }
+            (SOL_TCP, TCP_NODELAY) => {
+                entry.opts.nodelay = val != 0;
+                // `TCP_NODELAY` is Nagle switched off, exactly the inverse of
+                // the flag smoltcp names.
+                if let Some(h) = tcp_sock {
+                    stack.sockets.get_mut::<tcp::Socket>(h).set_nagle_enabled(val == 0);
+                }
+            }
+            // An option this stack does not model is accepted and forgotten, the
+            // way a lenient kernel lets a caller set an exotic one and ignore it.
+            _ => {}
+        }
+    });
     0
 }
 
@@ -1823,16 +2064,52 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     if optval == 0 || optlen_ptr == 0 {
         return err::EFAULT;
     }
-    if !crate::syscall::buffer_ok(optval, 4, true, from_user)
-        || !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user)
-    {
+    if !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user) {
         return err::EFAULT;
+    }
+    let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() };
+    // `SO_LINGER` answers a `struct linger { int l_onoff; int l_linger; }`, so
+    // it is the one option eight bytes wide.
+    if (level, optname) == (SOL_SOCKET, SO_LINGER) {
+        if cap < 8 || !crate::syscall::buffer_ok(optval, 8, true, from_user) {
+            return err::EINVAL;
+        }
+        let (on, t) = super::with(handle, |_, entry| {
+            (entry.opts.linger_on as i32, entry.opts.linger_sec)
+        })
+        .unwrap_or((0, 0));
+        unsafe {
+            (optval as *mut i32).write_unaligned(on);
+            ((optval + 4) as *mut i32).write_unaligned(t);
+            (optlen_ptr as *mut u32).write_unaligned(8);
+        }
+        return 0;
+    }
+    if cap < 4 || !crate::syscall::buffer_ok(optval, 4, true, from_user) {
+        return err::EINVAL;
     }
     let value = match (level, optname) {
         (SOL_SOCKET, SO_TYPE) => super::with(handle, |_, entry| entry.typ as i32).unwrap_or(0),
         // Errors are reported by the calls that hit them, so a query reads
         // back "no error pending" - which for this stack is always true.
         (SOL_SOCKET, SO_ERROR) => 0,
+        (SOL_SOCKET, SO_REUSEADDR) => {
+            super::with(handle, |_, entry| entry.opts.reuseaddr as i32).unwrap_or(0)
+        }
+        (SOL_SOCKET, SO_KEEPALIVE) => {
+            super::with(handle, |_, entry| entry.opts.keepalive as i32).unwrap_or(0)
+        }
+        (SOL_SOCKET, SO_SNDBUF) => {
+            super::with(handle, |_, entry| entry.opts.sndbuf as i32).unwrap_or(0)
+        }
+        (SOL_SOCKET, SO_RCVBUF) => {
+            super::with(handle, |_, entry| entry.opts.rcvbuf as i32).unwrap_or(0)
+        }
+        (SOL_TCP, TCP_NODELAY) => {
+            super::with(handle, |_, entry| entry.opts.nodelay as i32).unwrap_or(0)
+        }
+        // An unmodelled option reads as unset (zero), matching the permissive
+        // `setsockopt` above rather than answering ENOPROTOOPT.
         _ => 0,
     };
     unsafe {
@@ -1921,4 +2198,121 @@ fn first_iovec(iov: usize, iovlen: usize, from_user: bool) -> Option<(usize, usi
         }
     }
     None
+}
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use super::*;
+
+    /// A pair as `socketpair` mints it, both fds closed when the test ends.
+    /// The handlers run with `from_user = false`, so the buffers they touch
+    /// are ordinary kernel-side locals - the host test harness's whole trick.
+    fn a_pair() -> (i32, i32) {
+        let mut out = [0i32; 2];
+        let args = [
+            AF_UNIX as usize,
+            SOCK_STREAM as usize,
+            0,
+            out.as_mut_ptr() as usize,
+            0,
+            0,
+        ];
+        assert_eq!(handle_socketpair(args, false), 0);
+        (out[0], out[1])
+    }
+
+    #[test]
+    fn a_pair_takes_send_and_answers_recv() {
+        let (a, b) = a_pair();
+
+        // The parent's status message, sent the way sudo does: `send`, which
+        // is `sendto` with no destination.
+        let args = [a as usize, b"status: 0".as_ptr() as usize, 9, 0, 0, 0];
+        assert_eq!(handle_sendto(args, false), 9);
+
+        let mut buf = [0u8; 64];
+        let args = [b as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0];
+        assert_eq!(handle_recvfrom(args, false), 9);
+        assert_eq!(&buf[..9], b"status: 0");
+
+        // And the other direction, because a pair is two-way.
+        let args = [b as usize, b"ack".as_ptr() as usize, 3, 0, 0, 0];
+        assert_eq!(handle_sendto(args, false), 3);
+        let args = [a as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0];
+        assert_eq!(handle_recvfrom(args, false), 3);
+        assert_eq!(&buf[..3], b"ack");
+    }
+
+    #[test]
+    fn msg_forms_carry_the_bytes_and_report_nothing_else() {
+        let (a, b) = a_pair();
+
+        // msghdr for a kernel-space gather send: no name, two iovecs.
+        let iovecs: [usize; 4] = [b"one ".as_ptr() as usize, 4, b"two ".as_ptr() as usize, 4];
+        let mut msghdr = [0u8; MSGHDR_SIZE];
+        let (iov_ptr,) = (iovecs.as_ptr() as usize,);
+        set64(&mut msghdr, 16, iov_ptr); // msg_iov
+        set64(&mut msghdr, 24, 2); // msg_iovlen
+        let args = [a as usize, msghdr.as_ptr() as usize, 0, 0, 0, 0];
+        assert_eq!(handle_sendmsg(args, false), 8);
+
+        // The receive side: one iovec, and the answer says "no address, no
+        // control data, no flags" - the message shape of "nothing to say".
+        let mut rbuf = [0u8; 64];
+        let mut riov: [usize; 2] = [rbuf.as_mut_ptr() as usize, rbuf.len()];
+        let mut rmsghdr = [0u8; MSGHDR_SIZE];
+        set64(&mut rmsghdr, 16, riov.as_mut_ptr() as usize);
+        set64(&mut rmsghdr, 24, 1);
+        set64(&mut rmsghdr, 8, 8); // msg_namelen nonzero: the caller asked
+        let args = [b as usize, rmsghdr.as_ptr() as usize, 0, 0, 0, 0];
+        assert_eq!(handle_recvmsg(args, false), 8);
+        assert_eq!(&rbuf[..8], b"one two ");
+        // The caller's name request comes back answered with "none".
+        assert_eq!(le64(&rmsghdr, 8), 0);
+        assert_eq!(le64(&rmsghdr, 40), 0); // msg_controllen
+        assert_eq!(le32(&rmsghdr, 48), 0); // msg_flags
+        let _ = &mut riov;
+    }
+
+    #[test]
+    fn refusals_match_a_connected_channel() {
+        let (a, b) = a_pair();
+        let _ = &b;
+
+        // A destination on a connected pair: EISCONN, as Linux answers.
+        let bogus_sockaddr = [0u8; 16];
+        let args = [
+            a as usize,
+            b"to whom?".as_ptr() as usize,
+            8,
+            0,
+            bogus_sockaddr.as_ptr() as usize,
+            16,
+        ];
+        assert_eq!(handle_sendto(args, false), err::EISCONN);
+
+        // DONTWAIT on an empty channel: EAGAIN, not a park.
+        let mut buf = [0u8; 8];
+        let args = [
+            a as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            MSG_DONTWAIT,
+            0,
+            0,
+        ];
+        assert_eq!(handle_recvfrom(args, false), err::EAGAIN);
+    }
+
+    fn set64(bytes: &mut [u8], at: usize, value: usize) {
+        bytes[at..at + 8].copy_from_slice(&(value as u64).to_le_bytes());
+    }
+
+    fn le64(bytes: &[u8], at: usize) -> usize {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().expect("in-bounds")) as usize
+    }
+
+    fn le32(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("in-bounds"))
+    }
 }

@@ -296,6 +296,12 @@ impl Inode for PipeEnd {
         Some(self)
     }
 
+    /// A pipe has no position: `lseek(2)` on one is `ESPIPE`, which is how a
+    /// reader learns it cannot push back the bytes it over-read.
+    fn seekable(&self) -> bool {
+        false
+    }
+
     fn poll_ready(&self) -> Ready {
         critical_section::with(|cs| {
             let st = self.state.borrow(cs).borrow();
@@ -462,6 +468,12 @@ impl Inode for DuplexEnd {
             read: self.read.poll_ready().read,
             write: self.write.poll_ready().write,
         }
+    }
+
+    /// Neither half of a socketpair is seekable, for the same reason a pipe
+    /// is not.
+    fn seekable(&self) -> bool {
+        false
     }
 
     fn poll_subscribe(&self, id: TaskId) {

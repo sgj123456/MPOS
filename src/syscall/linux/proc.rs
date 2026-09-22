@@ -98,6 +98,10 @@ fn put_word(bytes: &mut [u8], at: usize, value: usize) {
     bytes[at..at + 8].copy_from_slice(&(value as u64).to_le_bytes());
 }
 
+fn put_dword(bytes: &mut [u8], at: usize, value: i32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 fn get_word(bytes: &[u8], at: usize) -> usize {
     usize::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
@@ -111,6 +115,7 @@ fn build_frame(
     regs_ptr: *mut (),
     sig: u8,
     action: &crate::sched::signal::Action,
+    info: &crate::sched::signal::SigInfo,
     ret: isize,
 ) -> bool {
     use crate::sched::signal::{
@@ -188,10 +193,17 @@ fn build_frame(
         blocked as usize,
     );
 
-    // A `siginfo_t`: signo, errno, code. Everything else a `kill` has to say
-    // is in the first three fields.
-    bytes[SIGFRAME_SIGINFO..SIGFRAME_SIGINFO + 4].copy_from_slice(&(sig as i32).to_le_bytes());
-    bytes[SIGFRAME_SIGINFO + 8..SIGFRAME_SIGINFO + 12].copy_from_slice(&SI_USER.to_le_bytes());
+    // A `siginfo_t`: signo, errno, code, and - for a signal that names a
+    // sender - the pid and uid, with the `sigqueue` payload in the union at
+    // offset 24. The offsets are Linux x86_64's, so a handler written against
+    // `<signal.h>` reads the right fields.
+    let si = SIGFRAME_SIGINFO;
+    bytes[si..si + 4].copy_from_slice(&info.signo.to_le_bytes());
+    bytes[si + 4..si + 8].copy_from_slice(&info.errno.to_le_bytes());
+    bytes[si + 8..si + 12].copy_from_slice(&info.code.to_le_bytes());
+    put_dword(&mut bytes, si + 16, info.pid);
+    put_dword(&mut bytes, si + 20, info.uid);
+    put_word(&mut bytes, si + 24, info.value as usize);
 
     if !crate::sched::write_user(frame, &bytes) {
         return false;
@@ -238,7 +250,7 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
         crate::sched::trace_signal_stop(&mut saved);
         apply_frame(regs_ptr, &saved);
     }
-    let Some(sig) = crate::sched::take_deliverable_signal() else {
+    let Some((sig, info)) = crate::sched::take_deliverable_siginfo() else {
         return false;
     };
     let action = crate::sched::current_disposition(sig);
@@ -268,7 +280,7 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
             }
         }
     }
-    if !build_frame(regs_ptr, sig, &action, ret) {
+    if !build_frame(regs_ptr, sig, &action, &info, ret) {
         // Nothing to run, or nowhere to put the frame - and the default action
         // for every signal this kernel names is to die of it, with the number
         // in the exit code so the parent can tell which one it was.
@@ -466,8 +478,10 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         return finish_wait_event(event, status, from_user);
     }
     // A code already on file means the child is a zombie: it is collected now,
-    // blocking or not.
-    if let Some(code) = crate::sched::take_exit_code(id) {
+    // blocking or not. Tracer-owned records stay with the tracer: this caller
+    // collecting through a tracer's corpse is the double-report that hung
+    // strace.
+    if let Some(code) = crate::sched::take_exit_code_current(id) {
         return finish_wait(id, code, status, from_user);
     }
     if !crate::sched::is_child(id, me) {
@@ -1280,6 +1294,39 @@ pub(super) fn handle_getppid() -> isize {
     crate::sched::parent_of(crate::sched::current()).map_or(0, |parent| parent.0 as isize)
 }
 
+/// The identity a set-uid or set-group-id exec switches to, or `None` when the
+/// file grants neither.
+///
+/// The bits are read from the file that is about to run, and everything they
+/// do not name is left as the caller had it: a set-uid-only file raises the
+/// effective *user* id and leaves the group alone. The saved ids move with the
+/// effective ones, because that is what lets the program drop the privilege
+/// and take it back - the dance a helper does around the one call it needs
+/// root for, and the reason a saved id exists at all.
+fn setuid_identity(inode: &Arc<dyn crate::vfs::Inode>) -> Option<crate::sched::Identity> {
+    // Only a regular file carries the bits: a directory or a device named by
+    // `execve` is refused long before this point, and a filesystem that keeps
+    // no modes has no bits to read.
+    if inode.metadata().kind != crate::vfs::NodeKind::File || !inode.keeps_modes() {
+        return None;
+    }
+    let mode = inode.mode();
+    let owner = inode.owner();
+    let mut id = crate::sched::current_identity();
+    let mut changed = false;
+    if mode & crate::vfs::S_ISUID != 0 && id.euid != owner.0 {
+        id.euid = owner.0;
+        id.suid = owner.0;
+        changed = true;
+    }
+    if mode & crate::vfs::S_ISGID != 0 && id.egid != owner.1 {
+        id.egid = owner.1;
+        id.sgid = owner.1;
+        changed = true;
+    }
+    if changed { Some(id) } else { None }
+}
+
 /// `execve(path, argv, envp)` — replace the current process image.
 ///
 /// Parses the ELF, tears down the old address space, loads the new image,
@@ -1303,7 +1350,14 @@ pub(super) fn handle_execve(
         Ok(path) => path,
         Err(e) => return e,
     };
-    let mut argv = match argv_arg(args[1], crate::syscall::MAX_PATH) {
+    // An argument is not a pathname either. Linux bounds both arrays by
+    // `MAX_ARG_STRLEN` - 32 pages - and nothing else: a program is handed
+    // whatever the caller wrote, and `fish`'s completion machinery passes an
+    // `awk` script several kilobytes long as one argument. A pathname's
+    // 255-byte ceiling here refused it with `Filename too long` before `awk`
+    // ever ran, which is the same mistake the environment's line below
+    // records - made in the array that is *not* paths.
+    let mut argv = match argv_arg(args[1], crate::syscall::MAX_ARG_STR) {
         Ok(argv) => argv,
         Err(e) => return e,
     };
@@ -1318,10 +1372,26 @@ pub(super) fn handle_execve(
         Ok(envp) => envp,
         Err(e) => return e,
     };
+    // The name has to be executable by the caller before a byte of it is
+    // read, and the check comes after the argument strings for the reason
+    // Linux puts it there: a caller with a bad `argv` pointer hears EFAULT
+    // about its own arguments, not EACCES about a file it never reached.
+    let inode = match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
+        Ok(inode) => inode,
+        Err(e) => return err_of(e),
+    };
+    if let Err(e) = crate::vfs::may_access(&inode, crate::vfs::X_OK) {
+        return err_of(e);
+    }
     let bytes = match crate::vfs::read_file_opt(&path, Some(cwd.clone())) {
         Ok(bytes) => bytes,
         Err(e) => return err_of(e),
     };
+    // A `#!` file is a script rather than a program, and Linux does not honour
+    // the set-uid bits on one: the bits that count belong to the interpreter,
+    // and a kernel that honoured the script's would let anyone who can write
+    // into a set-uid-owned script choose what runs with that authority.
+    let is_script = bytes.starts_with(b"#!");
 
     // A script is run by its interpreter, and the kernel is where that is
     // discovered: the file's first two bytes say so. The chain is followed
@@ -1337,7 +1407,30 @@ pub(super) fn handle_execve(
         Err(_) => return err::ENOEXEC,
     };
 
-    match crate::sched::exec_replace(&bytes, &argv, &envp, &path) {
+    // A set-uid or set-group-id file promises that the program runs with the
+    // file's authority rather than the caller's, and honouring that promise is
+    // what makes an installed helper work at all: a `doas` that never becomes
+    // root refuses to run for exactly the reason it was installed.
+    //
+    // The switch happens before the exec so the auxv the new image reads
+    // describes the identity it actually has, and it is undone when the exec
+    // fails - Linux does not hand the privilege to a process that never became
+    // the program, and leaving it raised would be a way to ask for root with a
+    // file that will not load.
+    let before = crate::sched::current_identity();
+    let switched = if is_script {
+        None
+    } else {
+        setuid_identity(&inode)
+    };
+    if let Some(id) = switched {
+        crate::sched::set_current_identity(id);
+    }
+    let outcome = crate::sched::exec_replace(&bytes, &argv, &envp, &path);
+    if outcome.is_err() && switched.is_some() {
+        crate::sched::set_current_identity(before);
+    }
+    match outcome {
         Ok((entry, new_rsp)) => {
             // Patch the syscall return frame: when sysretq fires, RIP = entry
             // and RSP = new_rsp, so the process enters the new image.
@@ -1921,6 +2014,25 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     sent as isize
 }
 
+/// `madvise(addr, length, advice)` — a hint about a mapping.
+///
+/// A range that does not begin on a page boundary is not one the kernel can
+/// locate, so it answers `EINVAL` the way Linux does. The advisories themselves
+/// are accepted without effect: this kernel maps a region eagerly and grows only
+/// the stack on fault, so there is no demand-paging hole for `MADV_DONTNEED` to
+/// release into (a page it dropped here would fault again and - with no
+/// anonymous re-population in the fault handler - die). Freeing memory on
+/// `MADV_DONTNEED` therefore waits on anonymous demand paging, tracked in PLAN
+/// 5.2; recognising the call and rejecting a misaligned range is the whole of
+/// what is honest to do until then.
+pub(super) fn handle_madvise(args: [usize; ARG_COUNT]) -> isize {
+    use crate::mm::pframe::PAGE_SIZE;
+    if args[0] & (PAGE_SIZE - 1) != 0 {
+        return err::EINVAL;
+    }
+    0
+}
+
 /// `brk(addr)` — change the program break (heap end).
 pub(super) fn handle_brk(args: [usize; ARG_COUNT]) -> isize {
     let addr = args[0];
@@ -1982,19 +2094,25 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         (args[0], args[1], args[2], args[3], args[4] as i32, args[5]);
 
     let anon = flags & MAP_ANONYMOUS != 0;
-    let shared = flags & MAP_SHARED != 0;
+    // Shared and private are accepted alike: below a mapping is filled eagerly
+    // into the process's own frames, so a shared one reads back the same bytes
+    // and only differs across a plain `fork` (see the note on anonymous shared
+    // mappings). Recorded here so the flag is deliberately, not accidentally,
+    // uniform.
+    let _shared = flags & MAP_SHARED != 0;
     let fixed = flags & MAP_FIXED != 0;
 
     if length == 0 {
         return err::EINVAL;
     }
-    // A shared *anonymous* mapping is the one shape this kernel cannot keep:
-    // two processes seeing the same frames through. A shared *file* mapping
-    // for a reader is indistinguishable from the private read-in below, and
-    // apk's index reader depends on being served one.
-    if shared && anon {
-        return err::ENOSYS;
-    }
+    // `MAP_SHARED` is accepted for anonymous and read-only file mappings alike.
+    // A shared *anonymous* mapping is served as an anonymous mapping of the
+    // process's own memory: threads (`CLONE_VM`) share one address space and so
+    // genuinely see each other's writes through it - the case modern code uses
+    // `MAP_SHARED|MAP_ANONYMOUS` for - while a `fork`ed child sees a copy. True
+    // parent/child *shared* frames across a plain `fork` would need a shared
+    // backing object this kernel does not keep; that difference only surfaces
+    // there, and serving the mapping beats refusing it with `ENOSYS`.
 
     // What the mapping is filled from. The descriptor is ignored when the
     // mapping is anonymous, as Linux ignores it.
@@ -2301,7 +2419,8 @@ unsafe fn write_itimerval(at: usize, snapshot: Option<crate::sched::ItimerSnapsh
         None => (0, 0),
     };
     let hz = crate::arch::timer::TICK_HZ as u64;
-    let words: [u64; 4] = [value * 1000 / hz, 0, interval * 1000 / hz, 0];
+    // `{ it_interval, it_value }`, the same order the reader above uses.
+    let words: [u64; 4] = [interval * 1000 / hz, 0, value * 1000 / hz, 0];
     unsafe {
         for (n, word) in words.iter().enumerate() {
             (at as *mut u64).add(n).write_unaligned(*word);
@@ -2331,7 +2450,13 @@ pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
         if !buffer_ok(new_ptr, ITIMERVAL_SIZE, false, true) {
             return err::EFAULT;
         }
-        let (vsec, vusec, isec, iusec) = unsafe {
+        // `struct itimerval` is `{ it_interval, it_value }` - the *interval*
+        // first, the value second. Reading them the other way round turns a
+        // one-shot `it_value` into the interval and the interval into the
+        // value, and the common `{0, 1s}` spelling - `ping`'s, and every
+        // alarm-style use - then reads as "disarm": the timer is never armed
+        // and whatever waited on it waits forever.
+        let (isec, iusec, vsec, vusec) = unsafe {
             let word = |n: usize| (new_ptr as *const u64).add(n).read_unaligned();
             (word(0), word(1), word(2), word(3))
         };
@@ -2629,7 +2754,19 @@ pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
             }
             crate::sched::futex::wake_bitset(uaddr, val as usize, val3 as u32) as isize
         }
-        _ => err::ENOSYS,
+        // Linux has a dozen operations this kernel does not serve, and they are
+        // not all the same kind of absence. `FUTEX_REQUEUE` and its compare
+        // spelling are how a libc's `pthread_cond_broadcast` hands its waiters
+        // to a mutex in one step; `FUTEX_LOCK_PI` and `FUTEX_UNLOCK_PI` are what
+        // musl's `LOCK`/`UNLOCK` become once a process that *had* threads is
+        // single-threaded again - and musl does not read the result, so a
+        // refusal there is a lock that silently does not lock. Saying so once,
+        // with the operation's name, is what makes the gap visible; the answers
+        // themselves have not been decided here.
+        other => {
+            super::note_missing_futex_op(other);
+            err::ENOSYS
+        }
     }
 }
 

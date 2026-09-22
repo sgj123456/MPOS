@@ -54,7 +54,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::ENOENT,
     );
 
-    // A file that exists but is no program: ENOEXEC.
+    // A file that exists but is not executable: Linux's permission check runs
+    // before any binary-format probe, so `execve` answers EACCES (root's
+    // CAP_DAC_OVERRIDE does not cover execute on a file with no x bit). `/etc/
+    // motd` is plain data - not a program and not runnable - so this is EACCES
+    // rather than ENOEXEC; the readable-but-unrunnable refusal is the point.
     let r = lin::execve(
         MOTD.as_ptr(),
         &raw const ARGV as *const *const u8,
@@ -62,9 +66,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_eq(
         &mut failed,
-        b"execve on a non-ELF file is ENOEXEC",
+        b"execve on a non-executable file is EACCES",
         r,
-        lin::ENOEXEC,
+        lin::EACCES,
     );
 
     // The success case, seen from the parent: the child becomes /bin/true and is
