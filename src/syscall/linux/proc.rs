@@ -2581,10 +2581,11 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     if !buffer_ok(tp, 16, true, true) {
         return err::EFAULT;
     }
-    // Return the tick count, anchored to the RTC's wall time for the
-    // REALTIME clocks.
-    let ticks = crate::arch::timer::ticks();
-    let freq = crate::arch::timer::TICK_HZ as u64;
+    // Return the elapsed time, anchored to the RTC's wall time for the
+    // REALTIME clocks. `since_boot_nanos` interpolates within the current tick
+    // via the TSC, so a fast syscall reports a true sub-millisecond delta
+    // instead of snapping to the 10 ms grid the tick counter alone gives.
+    let elapsed = crate::arch::timer::since_boot_nanos();
     let monotonic = matches!(
         clk_id,
         CLOCK_MONOTONIC
@@ -2599,8 +2600,8 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     } else {
         crate::arch::rtc::boot_epoch()
     };
-    let secs = wall + ticks / freq;
-    let nsecs = (ticks % freq) * (1_000_000_000 / freq);
+    let secs = wall + elapsed / 1_000_000_000;
+    let nsecs = elapsed % 1_000_000_000;
     unsafe {
         (tp as *mut i64).write_unaligned(secs as i64);
         ((tp + 8) as *mut i64).write_unaligned(nsecs as i64);
@@ -2624,11 +2625,11 @@ pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
         return err::EFAULT;
     }
     // gettimeofday has no monotonic variant - every caller wants the wall
-    // clock, so the RTC anchor rides along here unconditionally.
-    let ticks = crate::arch::timer::ticks();
-    let freq = crate::arch::timer::TICK_HZ as u64;
-    let secs = crate::arch::rtc::boot_epoch() + ticks / freq;
-    let usecs = (ticks % freq) * (1_000_000 / freq);
+    // clock, so the RTC anchor rides along here unconditionally. The TSC-
+    // interpolated elapsed time gives a microsecond the 10 ms tick never could.
+    let elapsed = crate::arch::timer::since_boot_nanos();
+    let secs = crate::arch::rtc::boot_epoch() + elapsed / 1_000_000_000;
+    let usecs = (elapsed % 1_000_000_000) / 1000;
     unsafe {
         (tv as *mut i64).write_unaligned(secs as i64);
         ((tv + 8) as *mut i64).write_unaligned(usecs as i64);
