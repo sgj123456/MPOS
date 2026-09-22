@@ -532,7 +532,15 @@ fn check_arch(info: &BootInfo) {
         timer::busy_wait_ms(500);
         let elapsed = timer::ticks() - before;
         println!("clock: {} ticks in ~500ms ({} Hz)", elapsed, timer::TICK_HZ);
-        assert!((40..=60).contains(&elapsed), "timer tick rate is wrong");
+        // Expect half a second's worth of ticks, within ten percent. Written
+        // against TICK_HZ, not a literal, so raising the tick rate does not
+        // silently turn a working clock into a failed assertion.
+        let half = timer::TICK_HZ as u64 / 2;
+        let tol = timer::TICK_HZ as u64 / 10;
+        assert!(
+            (half - tol..=half + tol).contains(&elapsed),
+            "timer tick rate is wrong"
+        );
 
         #[cfg(target_arch = "x86_64")]
         unsafe {

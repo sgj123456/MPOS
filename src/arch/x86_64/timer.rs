@@ -11,7 +11,14 @@ const PIT_BASE_HZ: u32 = 1_193_182;
 /// Channel 0, lo/hi byte access, mode 2 (rate generator).
 const CMD_CHANNEL0_MODE2: u8 = 0x34;
 
-pub const TICK_HZ: u32 = 100;
+/// PIT ticks per second - the scheduling and poll-granularity clock.
+///
+/// Time *reading* no longer depends on this (the TSC fills sub-tick detail in
+/// `since_boot_nanos`), so it can be raised purely to cut scheduling latency:
+/// a wake of a same-or-higher-priority task is honored at the next tick, so the
+/// tick period is the worst-case hand-off wait. 250 Hz (Linux's usual `HZ`)
+/// makes that 4 ms instead of the old 10 ms, at 2.5× the timer-interrupt load.
+pub const TICK_HZ: u32 = 250;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 

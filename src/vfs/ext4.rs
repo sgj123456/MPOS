@@ -196,7 +196,15 @@ const EXTENT_UNWRITTEN: u16 = 1 << 15;
 /// bits, minus the one reserved value of zero.
 const EXTENT_INIT_MAX: u16 = 32768;
 /// Direct-mapped cache: one slot per possible block modulo this count.
-const CACHE_SLOTS: usize = 32;
+///
+/// A direct-mapped cache indexed by `block % CACHE_SLOTS` thrashes hard when a
+/// working set is longer than the slot count: reading a file or walking inode
+/// tables cycles every slot and evicts the inode-table block the very next
+/// lookup needs, so each metadata access becomes a device read. 32 slots (128
+/// KiB) was small enough that an ordinary `ls` re-read the table repeatedly;
+/// 512 (2 MiB) keeps the hot metadata resident. Purely a size/latency trade -
+/// correctness does not depend on it, so an undersized cache is slow, not wrong.
+const CACHE_SLOTS: usize = 512;
 const NO_BLOCK: u64 = u64::MAX;
 
 fn le16(bytes: &[u8], at: usize) -> u16 {
