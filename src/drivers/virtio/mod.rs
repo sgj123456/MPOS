@@ -12,4 +12,5 @@
 
 pub mod blk;
 pub mod hal;
+pub mod msix;
 pub mod net;

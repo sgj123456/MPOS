@@ -17,6 +17,12 @@ use super::pic;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
+/// The vector the virtio-net adapter's MSI-X entry points at: clear of the
+/// PIC's 32..47 and of every architecturally reserved slot. The driver arms
+/// the device to raise it when a frame lands; until it does, the handler
+/// below is registered but never runs.
+pub const NET_IRQ_VECTOR: u8 = 0x41;
+
 static BREAKPOINTS_CAUGHT: AtomicU64 = AtomicU64::new(0);
 
 pub fn breakpoints_caught() -> u64 {
@@ -47,6 +53,12 @@ pub fn init() {
         // It is the machine's only input line - the console multiplexer is
         // what turns it into the six virtual consoles.
         table[pic::IRQ0_VECTOR + 4].set_handler_fn(serial);
+
+        // The virtio-net adapter's message-signalled interrupt, armed by the
+        // driver when it manages to enable MSI-X. The vector sits above the
+        // PIC's range and is never a CPU exception; if the driver never arms
+        // it, nothing ever raises it, and the handler simply stands ready.
+        table[NET_IRQ_VECTOR].set_handler_fn(virtio_net);
 
         table
     });
@@ -79,6 +91,29 @@ extern "x86-interrupt" fn serial(_frame: InterruptStackFrame) {
     // After the FIFO is empty, so a byte arriving during the drain is not
     // lost behind an EOI that already went out.
     pic::end_of_interrupt(4);
+}
+
+/// A frame (or a burst of them) is on the virtio-net receive ring.
+///
+/// The stack does the work - poll the interface, which hands the frames to
+/// smoltcp and wakes every task registered on socket readiness, and
+/// acknowledge the device - and the APIC gets the EOI, which is where the
+/// message-signalled interrupt arrived and the only place it can be ended.
+/// Nothing here switches tasks: like the serial handler, it wakes and lets
+/// the scheduler pick the woken task up on the next turn, so the interrupted
+/// context is never left half-modified.
+extern "x86-interrupt" fn virtio_net(_frame: InterruptStackFrame) {
+    crate::net::irq_service();
+    // End the delivery before anything that might switch away, exactly as
+    // the clock handler does with the PIC: a switch from here does not
+    // return until the woken task yields, and an interrupt left in service
+    // would block its own vector - and every lower one - until then.
+    super::lapic::eoi();
+    // A woken task runs now, not at the next clock tick. In the scheduler's
+    // own context - the idle hlt - this is the documented no-op and the
+    // scheduler's next turn picks the woken task on its own; in any task's
+    // context it hands the core over immediately.
+    crate::sched::preempt();
 }
 
 /// Deliberately reachable from tests: `int3` must return here, not panic.

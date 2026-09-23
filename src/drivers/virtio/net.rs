@@ -2,13 +2,17 @@
 //!
 //! The crate owns the hard parts - the two queues, the receive buffers it
 //! posts and recycles, the ten- or twelve-byte header in front of every frame.
-//! What is left here is which device to open and the three words the rest of
+//! What is left here is which device to open and the four words the rest of
 //! the kernel needs from it: what address it answers to, how to send a frame,
-//! and how to get one.
+//! how to get one, and how to acknowledge the interrupt a frame raises.
 //!
-//! The device is polled rather than interrupted. There is no interrupt handler
-//! wired to it yet, and on one core a look at the receive queue costs less
-//! than the machinery to be told to look.
+//! The device is driven both ways. A background task polls once a tick and
+//! the socket paths poll inline, so progress never depends on the interrupt;
+//! and when the adapter can be armed for MSI-X ([`msix`]), a frame that lands
+//! between polls interrupts immediately, the handler polls and wakes the
+//! waiters, and the tick is only a safety net instead of the discovery
+//! mechanism. The polling is what a kernel without the interrupt machinery
+//! falls back to, and what keeps it honest once the machinery is there.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -22,6 +26,7 @@ use virtio_drivers::transport::pci::bus::DeviceFunction;
 use crate::drivers::pci;
 
 use super::hal::{HalImpl, pci_root};
+use super::msix;
 
 const VENDOR_VIRTIO: u16 = 0x1af4;
 /// The transitional device id for a network adapter; a modern-only device
@@ -110,6 +115,17 @@ impl VirtioNet {
         }
     }
 
+    /// Acknowledge the device's interrupt, if the adapter raised one.
+    ///
+    /// The interrupt handler's second half: the first (the stack's poll)
+    /// drained what the frames there was to drain, and this clears the
+    /// interrupt status so the next arrival can raise its vector again.
+    pub fn ack_interrupt(&self) {
+        critical_section::with(|cs| {
+            let _ = self.device.borrow(cs).borrow_mut().ack_interrupt();
+        });
+    }
+
     /// Probe the PCI bus and bring up the first virtio-net device, if any.
     pub fn init() -> Option<Arc<VirtioNet>> {
         let func = pci::find(VENDOR_VIRTIO, DEVICE_NET)?;
@@ -132,8 +148,24 @@ impl VirtioNet {
         )
         .ok()?;
 
-        let device = VirtIONet::<HalImpl, _, QUEUE_SIZE>::new(transport, BUFFER_BYTES).ok()?;
+        let mut device = VirtIONet::<HalImpl, _, QUEUE_SIZE>::new(transport, BUFFER_BYTES).ok()?;
         let mac = device.mac_address();
+
+        // Arm the message-signalled interrupt: the vector table entry first,
+        // then the queues' binding to it - the order the virtio spec demands,
+        // entry ready before the queue names it. Either step failing leaves
+        // the machine exactly as it was, polled, which is what it ran as
+        // before any of this existed. The APIC's EOI register is mapped
+        // first as well: the handler's last write goes there, and an unmapped
+        // write from interrupt context is a panic nothing recovers from.
+        crate::arch::lapic::init();
+        if msix::enable(&func, crate::arch::idt::NET_IRQ_VECTOR) && msix::set_queue_vectors(&func) {
+            // With the queues told whom to interrupt, the notification
+            // suppression flags come off. (A no-op while `VIRTIO_F_EVENT_IDX`
+            // is negotiated - the crate re-arms that way - and the honest
+            // spelling of the same request the day it is not.)
+            device.enable_interrupts();
+        }
 
         Some(Arc::new(VirtioNet {
             device: Mutex::new(RefCell::new(device)),

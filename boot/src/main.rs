@@ -50,6 +50,25 @@ use uefi::prelude::*;
 use elf::PAGE_SIZE;
 use handoff::{Handoff, MAGIC, MAX_MEM_REGIONS, Region};
 
+/// `wcslen`, spelled by the compiler rather than by any source here.
+///
+/// At the workspace's optimization level LLVM recognises the wide-character
+/// counting loop inside the `uefi` crate (`CStr16::num_chars`, behind the file
+/// protocols this loader reads through) as the `wcslen` idiom and emits a call
+/// to the libc symbol for it - a call the UEFI target cannot satisfy, there
+/// being no libc. The same loop at the debug profile stays a loop, which is
+/// why only the release build of this crate ever linked against the name.
+/// Providing it is five lines, and the semantics are the one the idiom
+/// promises: the number of `u16`s before the first zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn wcslen(s: *const u16) -> usize {
+    let mut n = 0;
+    while unsafe { *s.add(n) } != 0 {
+        n += 1;
+    }
+    n
+}
+
 /// Where the kernel and its two companions are on the boot partition. Fixed
 /// names rather than a boot entry or a config file: the layout is decided by the
 /// script that builds the image, the loader is built from the same tree, and a

@@ -6,6 +6,7 @@ pub mod context;
 pub mod critical;
 pub mod gdt;
 pub mod idt;
+pub mod lapic;
 pub mod paging;
 pub mod pci;
 pub mod pic;

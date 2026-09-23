@@ -12,10 +12,12 @@
 //! `critical_section::Mutex` - the same lock discipline as the rest of the
 //! kernel. The rule that follows from it: no network operation may sleep
 //! while holding the lock. Blocking calls therefore run a loop of
-//! *lock, poll, try, unlock, sleep one tick, repeat*, checking for a fatal
-//! signal each round so a `SIGKILL` still lands while a task is parked in
-//! `recv`. A background task polls the interface once a tick, which is what
-//! keeps a connection progressing while nobody is blocked on it.
+//! *lock, poll, try, unlock, park*, where the park ends on the stack's own
+//! wakeup call - every task waiting on a socket registers itself with
+//! [`subscribe`], and [`service`] wakes the whole list after every poll, so
+//! a blocked reader resumes the instant anything moved rather than on the
+//! next clock tick. A background task polls the interface once a tick, which
+//! is what keeps a connection progressing while nobody is blocked on it.
 //!
 //! # Addresses
 //!
@@ -177,6 +179,13 @@ pub(crate) struct Stack {
     sockets: SocketSet<'static>,
     entries: Vec<Option<Entry>>,
     next_ephemeral: u16,
+    /// Tasks parked on any socket's readiness, registered through
+    /// [`subscribe`] and woken by [`service`] after every poll. One flat
+    /// list rather than a waiter set per entry, because a wake is allowed to
+    /// be spurious: the woken task re-checks its own condition and parks
+    /// again if it is still false, which is the same licence `poll(2)` gives
+    /// itself, and one list is less state to keep consistent.
+    waiters: Vec<crate::sched::policy::TaskId>,
 }
 
 impl Stack {
@@ -278,7 +287,10 @@ pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
 /// A stack that never came up yields nothing.
 pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> {
     use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
-    let zero = || IpEndpoint { addr: IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), port: 0 };
+    let zero = || IpEndpoint {
+        addr: IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)),
+        port: 0,
+    };
     let row_of = |ep: IpEndpoint| -> ([u8; 4], u16) {
         match ep.addr {
             IpAddress::Ipv4(v4) => (v4.octets(), ep.port),
@@ -435,11 +447,66 @@ pub(crate) fn free_entry(handle: usize) {
     });
 }
 
-/// Poll the interface once, unconditionally. The background task calls this
-/// every tick; socket operations poll inline before they try, so a response
-/// that arrived in the last tick is seen without waiting for the task.
+/// Poll the interface once, unconditionally, then wake every task registered
+/// as waiting on socket readiness. The background task calls this every tick;
+/// socket operations poll inline before they try, so a response that arrived
+/// in the last tick is seen without waiting for the task.
+///
+/// The wake is deliberately unselective - every waiter, every poll. The
+/// alternative, tracking which socket changed and waking only its waiters,
+/// is state the stack would have to keep true through smoltcp's dispatch,
+/// while a spurious wake costs one re-check of a condition that is already
+/// in memory. The waiters are woken *after* the poll, outside the stack's
+/// lock, so a woken task never runs under one.
 pub fn service() {
-    with_stack(|stack| stack.poll_once());
+    let waiters = with_stack(|stack| {
+        stack.poll_once();
+        stack.waiters.clone()
+    })
+    .unwrap_or_default();
+    for id in waiters {
+        crate::sched::wake(id);
+    }
+}
+
+/// Register `id` to be woken after every stack poll, until the matching
+/// [`unsubscribe`]. The `poll_subscribe` on [`socket::SocketInode`] is what
+/// routes a `poll(2)`/`epoll` wait through here; the blocked socket calls
+/// in `socket.rs` use it directly. A task already registered is not added
+/// twice.
+pub(crate) fn subscribe(id: crate::sched::policy::TaskId) {
+    with_stack(|stack| {
+        if !stack.waiters.contains(&id) {
+            stack.waiters.push(id);
+        }
+    });
+}
+
+/// Take `id` back out of the wake list - the wait it was registered for has
+/// ended, however it ended. A task that is not registered is a no-op, which
+/// is what makes an interrupted wait's cleanup unconditional.
+pub(crate) fn unsubscribe(id: crate::sched::policy::TaskId) {
+    with_stack(|stack| stack.waiters.retain(|w| *w != id));
+}
+
+/// The interrupt-shaped entry into the stack: poll, wake the registered
+/// waiters, then acknowledge the device.
+///
+/// The acknowledgement is the one step [`service`] cannot take - a poll from
+/// a syscall or the background task has no interrupt to acknowledge - and it
+/// is what lets the next arrival raise the vector again. The local APIC's
+/// EOI, which ends the delivery itself, belongs to the caller's handler, not
+/// to the stack: it is machine bookkeeping, not network state.
+pub fn irq_service() {
+    let waiters = with_stack(|stack| {
+        stack.poll_once();
+        stack.device.net.ack_interrupt();
+        stack.waiters.clone()
+    })
+    .unwrap_or_default();
+    for id in waiters {
+        crate::sched::wake(id);
+    }
 }
 
 /// What a descriptor on this socket could do right now, for `poll(2)`.
@@ -535,6 +602,7 @@ pub fn init() -> bool {
             sockets: SocketSet::new(Vec::new()),
             entries: Vec::new(),
             next_ephemeral: EPHEMERAL_MIN,
+            waiters: Vec::new(),
         });
     });
     true
@@ -562,11 +630,13 @@ pub fn spawn_service() {
     );
 }
 
-/// smoltcp's clock, from the kernel tick counter. Smoltcp wants milliseconds
-/// and the tick is ten of them at 100 Hz.
+/// smoltcp's clock. Smoltcp wants milliseconds; the source is the TSC's
+/// sub-tick nanoseconds rather than the tick counter, so a retransmission
+/// timer or an RTT sample is measured to the resolution the hardware reads
+/// at instead of snapping to whole ticks - the tick still drives *when* the
+/// stack is polled, but no longer rounds what it measures.
 fn now() -> SmolInstant {
-    let ticks = crate::arch::timer::ticks() as i64;
-    SmolInstant::from_millis(ticks * 1000 / crate::arch::timer::TICK_HZ as i64)
+    SmolInstant::from_millis(crate::arch::timer::since_boot_nanos() as i64 / 1_000_000)
 }
 
 /// Convert a raw IP protocol number to smoltcp's `IpProtocol` enum.

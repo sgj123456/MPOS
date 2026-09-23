@@ -101,7 +101,7 @@ pub fn resolve_build_dir(cli: Option<&Path>) -> Result<PathBuf> {
 pub fn resolve_profile(cli: Option<&str>) -> String {
     cli.map(str::to_string)
         .or_else(|| env::var("PROFILE").ok())
-        .unwrap_or_else(|| "debug".to_string())
+        .unwrap_or_else(|| "release".to_string())
 }
 
 pub fn target_dir() -> Result<PathBuf> {

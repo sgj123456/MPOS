@@ -17,9 +17,12 @@
 //! "fall back to the console".
 //!
 //! Blocking follows the stack's one rule: no sleeping with the lock held. A
-//! blocking `recv` or `connect` is a loop of *lock, poll, try, unlock, sleep
-//! one tick*, with a fatal-signal check each round so a `SIGKILL` still ends
-//! a task parked on a quiet socket.
+//! blocking `recv` or `connect` is a loop of *lock, poll, try, unlock, park*,
+//! where the park is [`crate::sched::block_until_deadline`] over the socket's
+//! own readiness: the task registers with the stack (see
+//! [`park_until`]) and every stack poll wakes the registered list, so the
+//! wait ends the moment the condition changes. A pending signal ends it the
+//! same way - as `EINTR`, with the signal left for the gate to deliver.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -241,6 +244,43 @@ impl Inode for SocketInode {
 
     fn poll_ready(&self) -> Ready {
         super::socket_ready(self.handle)
+    }
+
+    /// A wait on this socket ends when the stack next polls - the wait's
+    /// own wakeup call, not the next clock tick. Registering is what lets
+    /// `poll(2)`, `select(2)` and `epoll_wait` on a network socket return
+    /// the instant data arrives, and what keeps an unclocked wait from
+    /// sleeping forever: the background service task polls every tick, and
+    /// every poll wakes the list.
+    fn poll_subscribe(&self, id: crate::sched::policy::TaskId) {
+        super::subscribe(id);
+    }
+
+    fn poll_unsubscribe(&self, id: crate::sched::policy::TaskId) {
+        super::unsubscribe(id);
+    }
+}
+
+/// Park the running task until `ready` holds on the socket being waited on,
+/// or a deliverable signal ends the wait. Returns `EINTR` for the signal
+/// case, zero otherwise.
+///
+/// The registration with the stack is what gives the park its wakeup source:
+/// every poll wakes the registered list, and the readiness condition is
+/// re-evaluated by the scheduler inside its own critical section immediately
+/// before the sleep, so a poll that lands between the caller's last attempt
+/// and the park is seen by that final look rather than lost. The condition
+/// itself polls the stack (that is what [`super::socket_ready`] does), which
+/// is also what keeps a spurious wake from spinning: a wake that finds the
+/// condition still false simply sleeps again.
+fn park_until(ready: impl Fn() -> bool) -> isize {
+    let me = crate::sched::current();
+    super::subscribe(me);
+    let end = crate::sched::block_until_deadline(ready, u64::MAX);
+    super::unsubscribe(me);
+    match end {
+        crate::sched::WaitEnd::Interrupted => err::EINTR,
+        crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => 0,
     }
 }
 
@@ -744,10 +784,37 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
         if crate::sched::has_deliverable_signal() {
             return err::EINTR;
         }
-        if crate::arch::timer::ticks() >= deadline {
-            return err::ETIMEDOUT;
+        // Park until the handshake moves: the state leaves `SynSent` - either
+        // the reply arrived, or the peer refused and the socket is `Closed`
+        // again - or the thirty seconds run out, whichever comes first. The
+        // wake comes from the stack's polls (the service task's each tick,
+        // and every inline poll in between), and the condition re-checks with
+        // one final poll inside the scheduler's critical section before it
+        // sleeps, so the reply cannot slip past the park.
+        let moved = || {
+            super::with(handle, |stack, entry| {
+                stack.poll_once();
+                let Channel::Tcp {
+                    handle: sock_handle,
+                    ..
+                } = &entry.channel
+                else {
+                    return true;
+                };
+                let state = stack.sockets.get_mut::<tcp::Socket>(*sock_handle).state();
+                !matches!(state, tcp::State::SynSent)
+            })
+            .unwrap_or(true)
+        };
+        let me = crate::sched::current();
+        super::subscribe(me);
+        let end = crate::sched::block_until_deadline(moved, deadline);
+        super::unsubscribe(me);
+        match end {
+            crate::sched::WaitEnd::Interrupted => return err::EINTR,
+            crate::sched::WaitEnd::Deadline => return err::ETIMEDOUT,
+            crate::sched::WaitEnd::Condition => {}
         }
-        crate::sched::sleep_ticks(1);
     }
 }
 
@@ -919,7 +986,14 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
             }
             match sock.send_slice(&data[sent..]) {
                 Ok(0) => Ok(SendStep::Wait),
-                Ok(n) => Ok(SendStep::Sent(n)),
+                Ok(n) => {
+                    // Bytes accepted are queued, not on the wire: one more
+                    // poll hands them to the device now rather than at the
+                    // next poll tick, so a request-response exchange does
+                    // not pay a tick for the outbound leg.
+                    stack.poll_once();
+                    Ok(SendStep::Sent(n))
+                }
                 Err(_) => Err(err::EPIPE),
             }
         });
@@ -942,10 +1016,28 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
             Some(Err(e)) => return e,
             None => return err::EBADF,
         }
-        if crate::sched::has_deliverable_signal() {
-            return if sent > 0 { sent as isize } else { err::EINTR };
+        // Park until there is room for the rest, or a signal ends the send.
+        // A partial push already reported is a completed send: the park is
+        // only for the bytes still owed.
+        let e = park_until(|| {
+            super::with(handle, |stack, entry| {
+                let Channel::Tcp {
+                    handle: sock_handle,
+                    ..
+                } = &entry.channel
+                else {
+                    return true;
+                };
+                stack
+                    .sockets
+                    .get_mut::<tcp::Socket>(*sock_handle)
+                    .can_send()
+            })
+            .unwrap_or(true)
+        });
+        if e == err::EINTR {
+            return if sent > 0 { sent as isize } else { e };
         }
-        crate::sched::sleep_ticks(1);
     }
 }
 
@@ -976,7 +1068,12 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
         }
         let sock = stack.sockets.get_mut::<udp::Socket>(*sock_handle);
         match sock.send_slice(data, target) {
-            Ok(()) => Ok(data.len() as isize),
+            Ok(()) => {
+                // Queued is not sent: the extra poll puts the datagram on
+                // the wire with this call instead of at the next poll tick.
+                stack.poll_once();
+                Ok(data.len() as isize)
+            }
             // A datagram bigger than the send pool is never going to fit.
             Err(udp::SendError::BufferFull) => Err(err::EMSGSIZE),
             Err(udp::SendError::Unaddressable) => Err(err::EINVAL),
@@ -1190,8 +1287,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     })
     .unwrap_or(false);
     let control = unsafe { ((msghdr + MSGHDR_CONTROL) as *const usize).read_volatile() };
-    let capacity =
-        unsafe { ((msghdr + MSGHDR_CONTROLLEN) as *const u64).read_volatile() } as usize;
+    let capacity = unsafe { ((msghdr + MSGHDR_CONTROLLEN) as *const u64).read_volatile() } as usize;
     let mut attached = false;
     if want_ttl && n >= 20 && control != 0 && capacity >= CMSG_RECVTTL_LEN {
         if !crate::syscall::buffer_ok(control, CMSG_RECVTTL_LEN, true, from_user) {
@@ -1297,7 +1393,9 @@ fn tcp_recv(
         if crate::sched::has_deliverable_signal() {
             return Err(err::EINTR);
         }
-        crate::sched::sleep_ticks(1);
+        if park_until(|| super::socket_ready(handle).read) == err::EINTR {
+            return Err(err::EINTR);
+        }
     }
 }
 
@@ -1348,7 +1446,9 @@ fn udp_recv(
         if crate::sched::has_deliverable_signal() {
             return Err(err::EINTR);
         }
-        crate::sched::sleep_ticks(1);
+        if park_until(|| super::socket_ready(handle).read) == err::EINTR {
+            return Err(err::EINTR);
+        }
     }
 }
 
@@ -1413,7 +1513,13 @@ fn raw_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
         // payload
         pkt[20..].copy_from_slice(data);
         match sock.send_slice(&pkt) {
-            Ok(()) => Ok(data.len() as isize),
+            Ok(()) => {
+                // Queued is not sent: the extra poll emits the frame now, so
+                // a fire-and-forget request does not wait for the next poll
+                // to leave the machine.
+                stack.poll_once();
+                Ok(data.len() as isize)
+            }
             Err(raw_sock::SendError::BufferFull) => Err(err::ENOMEM),
         }
     });
@@ -1490,7 +1596,12 @@ fn raw_recv(
         if crate::sched::has_deliverable_signal() {
             return Err(err::EINTR);
         }
-        crate::sched::sleep_ticks(1);
+        // The park ends on the stack's own wakeup call - every poll wakes
+        // the registered waiters - so the reply is noticed when it arrives,
+        // not when the next clock tick happens to fall.
+        if park_until(|| super::socket_ready(handle).read) == err::EINTR {
+            return Err(err::EINTR);
+        }
     }
 }
 
@@ -1704,8 +1815,8 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
         Some(sock) => sock,
         None => return err::EBADF,
     };
-    let nonblock = flags & SOCK_NONBLOCK_F != 0
-        || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    let nonblock =
+        flags & SOCK_NONBLOCK_F != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
     let id = match crate::net::unix::accept_face(&listener, nonblock) {
         Ok(id) => id,
         Err(e) => return e,
@@ -1722,7 +1833,9 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
         Ok(fd) => fd,
         Err(e) => return crate::syscall::err_of(e),
     };
-    if flags & SOCK_NONBLOCK_F != 0 && let Ok(file) = crate::sched::current_fds().clone_at(new_fd) {
+    if flags & SOCK_NONBLOCK_F != 0
+        && let Ok(file) = crate::sched::current_fds().clone_at(new_fd)
+    {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
     if flags & SOCK_CLOEXEC_F != 0 {
@@ -2267,8 +2380,7 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
 /// sizes, linger, reuse - are recorded only: timeouts live in user code
 /// (`poll`) and `SO_REUSEADDR` is moot while one process binds at a time.
 pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
-    let (fd, level, optname, optval, optlen) =
-        (args[0] as i32, args[1], args[2], args[3], args[4]);
+    let (fd, level, optname, optval, optlen) = (args[0] as i32, args[1], args[2], args[3], args[4]);
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -2302,7 +2414,10 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                 if let Some(h) = tcp_sock {
                     let interval = (val != 0)
                         .then(|| smoltcp::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-                    stack.sockets.get_mut::<tcp::Socket>(h).set_keep_alive(interval);
+                    stack
+                        .sockets
+                        .get_mut::<tcp::Socket>(h)
+                        .set_keep_alive(interval);
                 }
             }
             (SOL_SOCKET, SO_SNDBUF) => {
@@ -2325,7 +2440,10 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                 // `TCP_NODELAY` is Nagle switched off, exactly the inverse of
                 // the flag smoltcp names.
                 if let Some(h) = tcp_sock {
-                    stack.sockets.get_mut::<tcp::Socket>(h).set_nagle_enabled(val == 0);
+                    stack
+                        .sockets
+                        .get_mut::<tcp::Socket>(h)
+                        .set_nagle_enabled(val == 0);
                 }
             }
             (SOL_IP, IP_RECVTTL) => entry.opts.recv_ttl = val != 0,

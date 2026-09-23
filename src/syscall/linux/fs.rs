@@ -985,9 +985,9 @@ pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
         Ok((parent_path, name)) => {
             let child = crate::vfs::resolve_opt(&path, Some(base.clone())).ok();
             let parent = crate::vfs::resolve_opt(parent_path, Some(base.clone())).ok();
-            child.zip(parent).map(|(child, parent)| {
-                (parent, alloc::string::String::from(name), child)
-            })
+            child
+                .zip(parent)
+                .map(|(child, parent)| (parent, alloc::string::String::from(name), child))
         }
         Err(_) => None,
     };
@@ -1034,9 +1034,9 @@ pub(super) fn rmdir(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok((parent_path, name)) => {
             let child = crate::vfs::resolve_opt(&path, Some(cwd.clone())).ok();
             let parent = crate::vfs::resolve_opt(parent_path, Some(cwd.clone())).ok();
-            child.zip(parent).map(|(child, parent)| {
-                (parent, alloc::string::String::from(name), child)
-            })
+            child
+                .zip(parent)
+                .map(|(child, parent)| (parent, alloc::string::String::from(name), child))
         }
         Err(_) => None,
     };
@@ -1304,11 +1304,7 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
 /// own identity for the kinds renamed in place. The identity is what the
 /// `IN_MOVE_SELF` watcher compares, and reporting the old number keeps
 /// that event tied to the watch that asked.
-fn inode_for_news(
-    old_inode: &Arc<dyn Inode>,
-    dir: &Arc<dyn Inode>,
-    name: &str,
-) -> Arc<dyn Inode> {
+fn inode_for_news(old_inode: &Arc<dyn Inode>, dir: &Arc<dyn Inode>, name: &str) -> Arc<dyn Inode> {
     if old_inode.metadata().kind == crate::vfs::NodeKind::File {
         dir.lookup(name).unwrap_or_else(|_| old_inode.clone())
     } else {
@@ -1963,7 +1959,16 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
                 2 => None, // F_UNLCK
                 _ => return err::EINVAL,
             };
-            lock_take(dev, ino, owner, LockClass::Record, kind, lo, hi, cmd == abi::F_SETLKW)
+            lock_take(
+                dev,
+                ino,
+                owner,
+                LockClass::Record,
+                kind,
+                lo,
+                hi,
+                cmd == abi::F_SETLKW,
+            )
         }
         _ => err::EINVAL,
     }
@@ -2098,14 +2103,38 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         if crate::sched::has_deliverable_signal() {
             break -1;
         }
-        // One tick of sleep, then a fresh check - the same wait the bounded
-        // form uses. Parking in `block_until` here would need a waker behind
-        // every descriptor: a tty or a pipe has one (poll_subscribe), but a
-        // netlink uevent socket, a signalfd and an eventfd do not - and
-        // `nlplug-findfs` parks exactly that way, with no timeout, for the
-        // events its trigger thread provokes. Ten milliseconds of polling is
-        // what keeps such a wait from sleeping forever.
-        crate::sched::sleep_ticks(1);
+        // One *interruptible* park instead of a plain tick sleep. The nodes
+        // were asked to wake us above, and the ones that can - pipes, ttys,
+        // unix and now network sockets - do; a wake re-runs the readiness
+        // query below and ends the park the moment any watched descriptor
+        // has something. The clock only bounds the wait for the nodes that
+        // have no waker behind them - a netlink uevent socket, a signalfd,
+        // an eventfd - whose readiness nobody can announce, so one tick at
+        // a time is what keeps such a wait from sleeping forever
+        // (`nlplug-findfs` parks exactly that way, with no timeout). The
+        // condition is read-only: it reports, and the loop's own
+        // `check_ready` above fills the caller's `revents` once.
+        let next = crate::arch::timer::ticks().saturating_add(1);
+        let floor = deadline.map_or(next, |end| end.min(next));
+        let any_ready = || {
+            (0..nfds).any(|index| {
+                let at = fds + index * POLLFD_SIZE;
+                let events = unsafe { ((at + POLLFD_EVENTS) as *const i16).read_unaligned() };
+                let Some(node) = &nodes[index] else {
+                    // A dead fd has POLLNVAL waiting for the caller: the
+                    // wait ends so the report can be made.
+                    return true;
+                };
+                let ready = node.poll_ready();
+                (events & POLLIN != 0 && ready.read) || (events & POLLOUT != 0 && ready.write)
+            })
+        };
+        if matches!(
+            crate::sched::block_until_deadline(any_ready, floor),
+            crate::sched::WaitEnd::Interrupted
+        ) {
+            break -1;
+        }
     };
 
     for node in nodes.iter().flatten() {
@@ -2304,28 +2333,31 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         if crate::sched::has_deliverable_signal() {
             break -1;
         }
-        match deadline {
-            // Without a timeout and without descriptors there is nothing
-            // that could wake this wait and nothing waiting for it: answer
-            // zero rather than park the task forever.
-            None if watches.is_empty() => break 0,
-            // The wait's wake condition asks the nodes afresh each time
-            // (block_until's condition must be side-effect free); the
-            // recorded readiness is refreshed once it returns, for the
-            // write-back below.
-            None => {
-                // Poll once a tick rather than park: the descriptors without
-                // a poll_subscribe behind them - netlink, signalfd, eventfd -
-                // have no waker to hand, and a blocked wait would never be
-                // told they turned ready. poll's unbounded wait does the same.
-                crate::sched::sleep_ticks(1);
-                ready = watches.iter().map(watch_ready).collect();
-            }
-            Some(_) => {
-                crate::sched::sleep_ticks(1);
-                ready = watches.iter().map(watch_ready).collect();
-            }
+        // Nothing could wake a wait with no descriptors and no clock: answer
+        // zero rather than park the task forever.
+        if deadline.is_none() && watches.is_empty() {
+            break 0;
         }
+        // An interruptible park, bounded by the next tick - the same shape
+        // as poll's wait. A wake from a subscribed node (pipes, ttys, unix
+        // and, since the stack grew its wake list, network sockets) re-runs
+        // the readiness query and ends the park the moment anything watched
+        // has something; the tick is the bound for the descriptors whose
+        // readiness nobody can announce - netlink, signalfd, eventfd.
+        // `watch_ready` only reads; the recorded readiness is refreshed from
+        // it once the park ends, for the write-back below.
+        let next = crate::arch::timer::ticks().saturating_add(1);
+        let floor = deadline.map_or(next, |end| end.min(next));
+        let any_ready = || {
+            watches
+                .iter()
+                .any(|watch| matches!(watch_ready(watch), (true, _) | (_, true)))
+        };
+        match crate::sched::block_until_deadline(any_ready, floor) {
+            crate::sched::WaitEnd::Interrupted => break -1,
+            _ => {}
+        }
+        ready = watches.iter().map(watch_ready).collect();
     };
 
     for watch in &watches {
@@ -4091,9 +4123,7 @@ pub(super) fn handle_inotify_add_watch(args: [usize; ARG_COUNT], cwd: &Arc<dyn I
         Ok(node) => node,
         Err(e) => return err_of(e),
     };
-    if in_mask & inotify::IN_ONLYDIR != 0
-        && watched.metadata().kind != crate::vfs::NodeKind::Dir
-    {
+    if in_mask & inotify::IN_ONLYDIR != 0 && watched.metadata().kind != crate::vfs::NodeKind::Dir {
         return err::EINVAL;
     }
     let owner = node.metadata().ino;
