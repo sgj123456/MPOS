@@ -13,6 +13,8 @@ Missing essential features, prioritized by impact on real-world workload compati
 - **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net; AF_INET + AF_UNIX
   (path `SOCK_STREAM`) + netlink (read + uevent)
 - **Scheduler**: 4-level priority + round-robin, COW fork, demand-paged stack
+- **Network latency**: event-driven socket waits + virtio-net MSI-X interrupts;
+  loopback `ping 127.0.0.1` 7.5 ms → 0.3 ms (10.1 done)
 - **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.1 / 4.2 / 5.1 done; 4.3 / 5.2 partial; 6.3 stub.
 
 ### Remaining ABI support (gaps + services)
@@ -548,6 +550,119 @@ Current status: kernel ELF compiles but boot flow incomplete.
 
 ---
 
+## Phase 10: Performance
+
+One number framed this phase: `ping 127.0.0.1` measured 20 ms on the 100 Hz
+build (7.5 ms at the current 250 Hz) against the host's 0.03 ms. The cause
+was architectural rather than slow code - every blocking network wait slept a
+whole clock tick per round, arrived frames were discovered only by tick-rate
+polling because the virtio-net adapter was never interrupted, and an AF_INET
+socket had no wakeup source at all (pipes and AF_UNIX already did). Each
+subsystem below names the same shape of fix: make the event end the wait.
+
+### 10.1 Network Latency — **DONE**
+
+- Blocking socket calls (`recv`/`send`/`connect`, TCP/UDP/raw) park on their
+  own readiness through `block_until_deadline` instead of sleeping a tick per
+  round; signals still end them as `EINTR`. Sockets register with the stack
+  through `poll_subscribe`, and every poll wakes the registered list.
+- `poll(2)`/`select(2)` park the same way, with the tick kept as the bound
+  for descriptors that have no waker behind them (uevent, signalfd,
+  eventfd). An unclocked `epoll_wait` over a network socket - which
+  previously would sleep forever, having no wakeup source - now ends with
+  the event (`t-epoll-socket`).
+- The virtio-net adapter is armed for MSI-X: the vector table entry is
+  programmed by hand and every queue bound to vector 0 through the common
+  configuration, whose BAR is 64-bit and sits above 4 GiB (reading only the
+  low dword maps ordinary RAM, and register "writes" round-trip through it
+  while the device hears nothing). The handler polls, wakes the waiters,
+  EOIs the local APIC, and preempts so the woken task runs immediately
+  rather than at the next tick. The tick-rate polls all remain, so a machine
+  where the interrupt cannot be armed runs exactly as it did.
+- `sendto`/UDP/TCP emit immediately after queueing rather than at the next
+  poll; smoltcp's clock reads the TSC instead of the tick counter; `xtask`
+  builds release by default (the loader gained the `wcslen` its release
+  codegen calls for).
+- Measured by `t-netlat` (20 ICMP echo rounds to 127.0.0.1): 7.5 ms → 0.3 ms
+  average, 74 µs floor - the remainder is slirp's own path through the host.
+
+### 10.2 Context-Switch and Fork Cost — planned
+
+**Why**: every task switch saves and restores 512 B of FPU state
+(`fxsave`/`fxrstor` unconditionally), rewrites CR3 with a full TLB flush (no
+PCID, no global pages), and `fork` walks the entire address space to mark
+pages COW with two PTE writes per page. A busybox fork+exec pays all three.
+
+| Change | Where |
+|---|---|
+| Enable PCID (`CR4.PCIDE`), keep per-process TLB entries across switches | `arch/x86_64/paging.rs` |
+| Save FPU state lazily: set TS, save on first `#NM`, restore on switch in | `arch/x86_64/context.rs` |
+| One TLB flush per fork instead of per-page `protect` calls | `sched/runtime.rs` |
+| Kernel stacks smaller than the fixed 64 KiB per task | `sched/runtime.rs` |
+
+### 10.3 Syscall Path — planned
+
+**Why**: every syscall pays a scan of all 64 task slots for itimers whether
+any is armed, and every user-buffer operation walks four page-table levels
+per page to validate it. Both are fixed costs on the hottest path in the
+kernel.
+
+| Change | Where |
+|---|---|
+| A global "any itimer armed" flag; `check_itimers` skips the scan when clear | `sched/runtime.rs`, `syscall/mod.rs` |
+| Validate user buffers with the copy itself (fault handler catches `EFAULT`) instead of a pre-walk | `arch/x86_64/paging.rs`, `syscall/mod.rs` |
+
+### 10.4 Pipes and Per-Frame Allocations — planned
+
+**Why**: pipe reads and writes move bytes one at a time through a `VecDeque`
+(`pop_front`/`extend(iter().copied())`), and the network path allocates and
+frees a fresh `Vec` per frame in each direction (TX build, RX copy, raw
+recv's 1500-byte temporary).
+
+| Change | Where |
+|---|---|
+| Slice copies (`extend_from_slice`) or a ring buffer for pipe data | `vfs/pipe.rs` |
+| A pool of frame buffers behind the smoltcp device seam | `net/mod.rs` |
+| The raw receive temporary sized from the actual datagram, or on the stack | `net/socket.rs` |
+
+### 10.5 Filesystem and Block Read Path — planned
+
+**Why**: ext4's cache is a 512-slot direct-mapped array that thrashes on
+large working sets, path resolution reads a directory block per component on
+a miss, and each 4 KiB write leaves for the device as eight 512-byte
+synchronous requests. Write-through stays: crash visibility is a deliberate
+semantic, and only the read side is being tuned.
+
+| Change | Where |
+|---|---|
+| Sequential readahead past the block being asked for | `vfs/ext4/` |
+| Set-associative cache with victim selection | `vfs/ext4/cache.rs` |
+| virtio-blk interrupt-driven completions and multi-request pipelining (the MSI-X ground is laid in 10.1) | `drivers/virtio/blk.rs` |
+
+### 10.6 Serial Output — planned
+
+**Why**: UART transmit is polled with the console lock held; on real
+hardware a 60-byte line costs ~5 ms of machine-wide stall (QEMU's emulated
+16550 never blocks, which is why it does not show here). The kernel's own
+hot paths log nothing - this matters the day they do.
+
+| Change | Where |
+|---|---|
+| A transmit ring drained by the TX-held interrupt; `write` only enqueues | `drivers/serial.rs`, `arch/x86_64/idt.rs` |
+
+### 10.7 Sub-Tick Sleeps — planned
+
+**Why**: the tick is the smallest unit a sleep can name (4 ms at 250 Hz).
+Event-driven waits ended the network's dependence on it; the remaining
+callers - `nanosleep`, timerfd, TCP retransmit pacing - still round to whole
+ticks.
+
+| Change | Where |
+|---|---|
+| LAPIC one-shot timer programmed per sleep, PIT kept as the periodic floor | `arch/x86_64/` (new `lapic-timer`), `sched/policy.rs` |
+
+---
+
 ## Priority Summary
 
 | Phase | Effort | Impact | Blocks |
@@ -561,6 +676,7 @@ Current status: kernel ELF compiles but boot flow incomplete.
 | **P7: Drivers** | ~2 weeks | Low | GUI, input |
 | **P8: Security** | ~1 week | Low | ASLR, seccomp |
 | **P9: Architectures** | ~4 weeks | Low | aarch64, RISC-V |
+| **P10: Performance** | 10.1 done; rest ~3 weeks | High (10.2-10.3) / Medium (rest) | Interactive latency, throughput |
 
 **Recommended order**: P1 -> P2 -> P3 -> P4 -> P5 -> P6 -> P7 -> P8 -> P9
 
