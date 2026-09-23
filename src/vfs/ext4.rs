@@ -2845,10 +2845,13 @@ impl Inode for Ext4Ino {
 
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
         self.fs.writable()?;
-        if matches!(kind, NodeKind::CharDev | NodeKind::Symlink) {
-            // A character device is a driver's business, and a link is made of
-            // a target rather than a kind - neither is a file this filesystem
-            // can invent from a name alone.
+        if matches!(kind, NodeKind::CharDev | NodeKind::Symlink | NodeKind::Socket) {
+            // A character device is a driver's business, a link is made of a
+            // target rather than a kind, and a socket's S_IFSOCK needs an
+            // on-disk inode type this layout does not carry - none of them
+            // are files this filesystem can invent from a name alone. The
+            // sockets this kernel serves live on tmpfs, where `bind` has a
+            // node kind to plant.
             return Err(VfsError::Unsupported);
         }
         self.require_dir()?;

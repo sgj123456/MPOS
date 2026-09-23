@@ -39,6 +39,12 @@ pub struct File {
     /// changes behavior; the rest are stored so a caller reads back what it
     /// wrote.
     status: core::sync::atomic::AtomicU32,
+    /// Whether this description was opened for writing - the question
+    /// `close(2)` answers with `IN_CLOSE_WRITE` rather than
+    /// `IN_CLOSE_NOWRITE`, recorded once at open because the flags word a
+    /// description keeps is the changeable `F_SETFL` half, not the access
+    /// mode it was opened under.
+    opened_for_write: core::sync::atomic::AtomicBool,
     /// The path this description was opened by, when the caller that made it
     /// knew one.
     ///
@@ -58,6 +64,7 @@ impl File {
         File {
             inode,
             pos: AtomicU64::new(0),
+            opened_for_write: core::sync::atomic::AtomicBool::new(false),
             status: core::sync::atomic::AtomicU32::new(0),
             label: Mutex::new(RefCell::new(None)),
         }
@@ -132,10 +139,29 @@ impl File {
         Ok(n)
     }
 
+    /// Record the access mode the description was opened under, for the
+    /// close-time `IN_CLOSE_WRITE`/`IN_CLOSE_NOWRITE` question.
+    pub fn mark_opened_for(&self, write: bool) {
+        self.opened_for_write
+            .store(write, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this description was opened for writing.
+    pub fn opened_for_write(&self) -> bool {
+        self.opened_for_write.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
         let pos = self.pos.load(Ordering::Relaxed);
         let n = self.inode.write_at(pos, buf)?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
+        // The one IN_MODIFY chokepoint of the userland write paths: every
+        // write/writev/pwrite/splice/copy handler reaches the inode through
+        // here, so the event is said once. Kernel-internal writers that must
+        // not report (the rename copy) call `Inode::write_at` directly.
+        if n > 0 {
+            crate::vfs::inotify::emit_write(&self.inode);
+        }
         Ok(n)
     }
 }

@@ -218,6 +218,7 @@ pub(crate) fn mode_of(meta: &Metadata, stored: u32) -> u32 {
         NodeKind::CharDev => 0o020_000,
         NodeKind::BlockDev => 0o060_000,
         NodeKind::Symlink => 0o120_000,
+        NodeKind::Socket => 0o140_000,
     };
     if stored != 0 {
         format | (stored & 0o7777)
@@ -228,6 +229,7 @@ pub(crate) fn mode_of(meta: &Metadata, stored: u32) -> u32 {
             NodeKind::CharDev => 0o020_666,  // character device rw-rw-rw-
             NodeKind::BlockDev => 0o060_660, // block device brw-rw----
             NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
+            NodeKind::Socket => 0o140_755,   // socket srwxr-xr-x until chmod
         }
     }
 }
@@ -440,6 +442,7 @@ pub(crate) fn dt_type_of(kind: NodeKind) -> u8 {
         NodeKind::CharDev => 2,  // DT_CHR
         NodeKind::BlockDev => 6, // DT_BLK
         NodeKind::Symlink => 10, // DT_LNK
+        NodeKind::Socket => 12,  // DT_SOCK
     }
 }
 
@@ -1888,6 +1891,26 @@ mod tests {
         // The only three whence values exist.
         assert_eq!(lseek_target(100, 500, 0, 3), None);
         assert_eq!(lseek_target(100, 500, 0, -1), None);
+    }
+
+    /// The socket vocabulary, pinned against `<linux/stat.h>` and
+    /// `<dirent.h>`: `st_mode`'s type tag, its default permission when the
+    /// filesystem stored none, and the directory-entry type that lets
+    /// `ls -F` mark the name. `mknod` still refuses S_IFSOCK on purpose -
+    /// only `bind(2)` plants a socket node - and that refusal is pinned
+    /// beside this test.
+    #[test]
+    fn a_socket_reports_its_kind_in_every_door() {
+        use crate::vfs::{Metadata, NodeKind};
+        let meta = Metadata {
+            ino: 7,
+            kind: NodeKind::Socket,
+            size: 0,
+        };
+        assert_eq!(mode_of(&meta, 0) & 0o170_000, 0o140_000, "S_IFSOCK");
+        assert_eq!(mode_of(&meta, 0), 0o140_755, "srwxr-xr-x by default");
+        assert_eq!(mode_of(&meta, 0o700), 0o140_700, "a stored mode keeps the tag");
+        assert_eq!(dt_type_of(NodeKind::Socket), 12, "DT_SOCK");
     }
 
     /// `mknod(2)`: the `S_IFMT` field picks the kind; a mode with no type

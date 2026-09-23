@@ -167,10 +167,19 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             {
                 return err_of(e);
             }
+            let parent_for_news = match crate::vfs::split_parent(path) {
+                Ok((parent, name)) => crate::vfs::resolve_opt(parent, Some(base.clone()))
+                    .ok()
+                    .map(|dir| (dir, alloc::string::String::from(name))),
+                Err(_) => None,
+            };
             if let Err(e) = crate::vfs::create_file_opt(path, Some(base.clone())) {
                 return err_of(e);
             }
             created = true;
+            if let Some((dir, name)) = parent_for_news {
+                crate::vfs::inotify::emit(&dir, crate::vfs::inotify::IN_CREATE, &name);
+            }
             // A file born through `open(O_CREAT, mode)` carries that mode, and
             // this is how a package is unpacked: `apk` writes every extracted
             // file's mode here - setuid helpers and executable scripts
@@ -234,6 +243,13 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 )
             {
                 file.set_label(label);
+            }
+            // The close events need the access mode from the moment it is
+            // still only the open's flags: the description keeps it, and the
+            // `IN_OPEN` report rides the same clone.
+            if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+                file.mark_opened_for(flags & O_ACCMODE != 0);
+                crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_OPEN, "");
             }
             // `O_CLOEXEC` is part of the open flags, not a property of the file:
             // it says the descriptor must not survive the next `execve`. Left
@@ -426,7 +442,10 @@ pub(super) fn ftruncate(args: [usize; ARG_COUNT]) -> isize {
         return err::EINVAL;
     }
     match file.inode().truncate(length as u64) {
-        Ok(()) => 0,
+        Ok(()) => {
+            crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_MODIFY, "");
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -452,7 +471,10 @@ pub(super) fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
         return err_of(e);
     }
     match inode.truncate(length as u64) {
-        Ok(()) => 0,
+        Ok(()) => {
+            crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_MODIFY, "");
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -894,7 +916,10 @@ pub(super) fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
     };
 
     match inode.set_times(atime, mtime) {
-        Ok(()) => 0,
+        Ok(()) => {
+            crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -952,13 +977,42 @@ pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
         Ok(path) => path,
         Err(e) => return e,
     };
+    // The news wants the inode while it still has a name: resolve the
+    // target and its parent before the removal (a failed lookup simply
+    // means no news), remove, then tell the directory `IN_DELETE` and the
+    // dying inode's watchers their loss.
+    let news = match crate::vfs::split_parent(&path) {
+        Ok((parent_path, name)) => {
+            let child = crate::vfs::resolve_opt(&path, Some(base.clone())).ok();
+            let parent = crate::vfs::resolve_opt(parent_path, Some(base.clone())).ok();
+            child.zip(parent).map(|(child, parent)| {
+                (parent, alloc::string::String::from(name), child)
+            })
+        }
+        Err(_) => None,
+    };
     let outcome = if args[2] & AT_REMOVEDIR != 0 {
         crate::vfs::rmdir_opt(&path, Some(base))
     } else {
         crate::vfs::unlink_opt(&path, Some(base))
     };
     match outcome {
-        Ok(()) => 0,
+        Ok(()) => {
+            if let Some((parent, name, child)) = news {
+                // A socket's name going is also its binding's last day:
+                // no connect may reach the listener by this path again
+                // (the listener itself lives on by its descriptors, and a
+                // still-open fd may even re-... - no: it cannot rebind;
+                // only the *name* retires. `unix::unbind_node` is a
+                // no-op for every other kind.
+                if child.metadata().kind == crate::vfs::NodeKind::Socket {
+                    crate::net::unix::unbind_node(&child);
+                }
+                crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_DELETE, &name);
+                crate::vfs::inotify::notify_deleted(&child);
+            }
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -973,8 +1027,27 @@ pub(super) fn rmdir(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
+    // Same news shape as `unlinkat`: the dying directory and its parent
+    // are looked up while the name still exists, and reported after the
+    // removal succeeds.
+    let news = match crate::vfs::split_parent(&path) {
+        Ok((parent_path, name)) => {
+            let child = crate::vfs::resolve_opt(&path, Some(cwd.clone())).ok();
+            let parent = crate::vfs::resolve_opt(parent_path, Some(cwd.clone())).ok();
+            child.zip(parent).map(|(child, parent)| {
+                (parent, alloc::string::String::from(name), child)
+            })
+        }
+        Err(_) => None,
+    };
     match crate::vfs::rmdir_opt(&path, Some(cwd.clone())) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if let Some((parent, name, child)) = news {
+                crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_DELETE, &name);
+                crate::vfs::inotify::notify_deleted(&child);
+            }
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -1019,6 +1092,8 @@ pub(super) fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     match parent.create(name, NodeKind::Dir) {
         Ok(created) => {
             created.set_mode(masked_mode(args[2] as u32));
+            crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
+            let _ = created;
             0
         }
         Err(e) => err_of(e),
@@ -1177,7 +1252,10 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
                 }
             }
             let inode = claim_name!(dir.create(&name, NodeKind::File));
-            if crate::vfs::File::new(inode.clone()).write(&data).is_err() {
+            // The copy is the kernel moving bytes between two names of the
+            // same file, not a write anyone made: `write_at` stands outside
+            // the `File::write` IN_MODIFY chokepoint on purpose.
+            if inode.write_at(0, &data).is_err() {
                 return err::ENOSPC;
             }
             // A rename moves the *name*; the node keeps everything that was its
@@ -1204,7 +1282,38 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
     }
 
     let _ = old_dir.unlink(&old_name);
+    // The move's news: `IN_MOVED_FROM` on the old directory and
+    // `IN_MOVED_TO` on the new share one cookie so a reader joins the
+    // pair, and the inode that travelled says `IN_MOVE_SELF` to its own
+    // watchers. The old name is gone and the new one stands for a fresh
+    // inode (this kernel's rename copies), so the moved report names both
+    // sides as it should.
+    crate::vfs::inotify::emit_move(
+        &old_dir,
+        &old_name,
+        &dir,
+        &name,
+        &inode_for_news(&old_inode, &dir, &name),
+    );
+    crate::vfs::inotify::notify_deleted(&old_inode);
     0
+}
+
+/// The inode a finished rename stands for: the body copy's fresh node for
+/// a regular file (looked up again under the new name), the old node's
+/// own identity for the kinds renamed in place. The identity is what the
+/// `IN_MOVE_SELF` watcher compares, and reporting the old number keeps
+/// that event tied to the watch that asked.
+fn inode_for_news(
+    old_inode: &Arc<dyn Inode>,
+    dir: &Arc<dyn Inode>,
+    name: &str,
+) -> Arc<dyn Inode> {
+    if old_inode.metadata().kind == crate::vfs::NodeKind::File {
+        dir.lookup(name).unwrap_or_else(|_| old_inode.clone())
+    } else {
+        old_inode.clone()
+    }
 }
 
 /// `readlink(path, buf, size)` - what a symlink points at, and on mpos that
@@ -1298,11 +1407,13 @@ pub(super) fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     if let Err(e) = crate::vfs::may_create_in(&parent) {
         return err_of(e);
     }
-    let r = match parent.symlink(name, &target) {
-        Ok(_) => 0,
+    match parent.symlink(name, &target) {
+        Ok(_) => {
+            crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
+            0
+        }
         Err(e) => err_of(e),
-    };
-    r
+    }
 }
 
 /// `symlinkat(target, newdirfd, linkpath)` - the dirfd form of `symlink`.
@@ -2424,6 +2535,7 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         Err(e) => return err_of(e),
     }
     crate::net::socket::close_last_socket(&file);
+    crate::vfs::inotify::close_last(&file);
     0
 }
 
@@ -2670,6 +2782,8 @@ fn sync_nonblocking(file: &crate::vfs::File, status: u32) {
         pipe.set_nonblocking(on);
     } else if let Some(eventfd) = file.inode().as_eventfd() {
         eventfd.set_nonblocking(on);
+    } else if let Some(inotify) = file.inode().as_inotify() {
+        inotify.set_nonblocking(on);
     }
 }
 
@@ -3292,7 +3406,9 @@ pub(super) fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
     };
     match file.metadata().kind {
         NodeKind::File | NodeKind::Dir | NodeKind::Symlink | NodeKind::BlockDev => 0,
-        NodeKind::CharDev => err::EINVAL,
+        // Nothing to flush behind a character door, and nothing behind a
+        // socket's either - Linux answers EINVAL for both.
+        NodeKind::CharDev | NodeKind::Socket => err::EINVAL,
     }
 }
 
@@ -3338,6 +3454,7 @@ pub(super) fn handle_chmod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         Ok(inode) => match chmod_mode(&inode, mode) {
             Ok(mode) => {
                 inode.set_mode(mode);
+                crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
                 0
             }
             Err(e) => e,
@@ -3354,6 +3471,7 @@ pub(super) fn handle_fchmod(args: [usize; ARG_COUNT]) -> isize {
             match chmod_mode(&inode, args[1] as u32) {
                 Ok(mode) => {
                     inode.set_mode(mode);
+                    crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
                     0
                 }
                 Err(e) => e,
@@ -3426,6 +3544,7 @@ fn chown_apply(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> isize {
         Err(e) => return e,
     };
     inode.set_owner(uid, gid);
+    crate::vfs::inotify::emit(inode, crate::vfs::inotify::IN_ATTRIB, "");
     if crate::sched::current_owner().0 != 0
         && (uid != before.0 || gid != before.1)
         && inode.keeps_modes()
@@ -3601,7 +3720,13 @@ pub(super) fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
         return err::EXDEV;
     }
     match parent.link(name, &old) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // A second name is a new entry in the destination directory -
+            // the create event belongs to it, with the watched inode's own
+            // `IN_ATTRIB`-style news left to a later hook family.
+            crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -3896,6 +4021,108 @@ pub(super) fn handle_timerfd_create(args: [usize; ARG_COUNT]) -> isize {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
     fd as isize
+}
+
+/// `inotify_init1(flags)` — a fresh event queue. The flags are the `O_`
+/// pair under other names and the refusal of anything else is the man
+/// page's; the queue itself lives in `src/vfs/inotify.rs`.
+pub(super) fn handle_inotify_init1(args: [usize; ARG_COUNT]) -> isize {
+    let flags = args[0];
+    if flags & !(crate::vfs::inotify::IN_CLOEXEC | crate::vfs::inotify::IN_NONBLOCK) != 0 {
+        return err::EINVAL;
+    }
+    let Some(instance) = crate::vfs::inotify::InotifyInstance::try_new(
+        next_anon_ino(),
+        flags & crate::vfs::inotify::IN_NONBLOCK != 0,
+    ) else {
+        // The system-wide instance cap, answered with Linux's errno.
+        return err::EMFILE;
+    };
+    let fd = match crate::vfs::open_inode(instance) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
+    if flags & crate::vfs::inotify::IN_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    if flags & crate::vfs::inotify::IN_NONBLOCK != 0
+        && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+    {
+        file.set_status(crate::vfs::file::O_NONBLOCK);
+    }
+    fd as isize
+}
+
+/// `inotify_add_watch(fd, pathname, mask)` — watch one inode.
+///
+/// The mask's rules are the man page's, in order: unknown bits are
+/// `EINVAL`, and the two merge flags that contradict each other
+/// (`IN_MASK_ADD` with `IN_MASK_CREATE`) are `EINVAL` together. The path is
+/// resolved from the caller's cwd - this call has no dirfd to ask - and
+/// `IN_ONLYDIR` refuses anything that is not a directory with `EINVAL`,
+/// which is also Linux's answer. The dedup, merge and cap decisions live
+/// in [`crate::vfs::inotify::add_watch`]; this half only translates them
+/// into errno numbers and a watch descriptor.
+pub(super) fn handle_inotify_add_watch(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    use crate::vfs::inotify::{self, AddOutcome};
+    // Linux's argument order is (fd, pathname, mask) - the pointer is the
+    // second word, the mask the third, and reading them the other way made
+    // a path pointer look like an impossible mask.
+    let (fd, path_ptr) = (args[0] as i32, args[1]);
+    let in_mask = args[2] as u32;
+    if in_mask & !inotify::IN_ON_ALL_EVENTS != 0
+        || in_mask & (inotify::IN_MASK_ADD | inotify::IN_MASK_CREATE)
+            == (inotify::IN_MASK_ADD | inotify::IN_MASK_CREATE)
+    {
+        return err::EINVAL;
+    }
+    let Ok(file) = crate::sched::current_fds().clone_at(fd) else {
+        return err::EBADF;
+    };
+    let node = file.inode();
+    if node.as_inotify().is_none() {
+        return err::EINVAL;
+    }
+    let path = match cstr_arg(path_ptr, true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let watched = match crate::vfs::resolve_opt(&path, Some(cwd.clone())) {
+        Ok(node) => node,
+        Err(e) => return err_of(e),
+    };
+    if in_mask & inotify::IN_ONLYDIR != 0
+        && watched.metadata().kind != crate::vfs::NodeKind::Dir
+    {
+        return err::EINVAL;
+    }
+    let owner = node.metadata().ino;
+    match inotify::add_watch(&node, owner, inotify::key_of(&watched), in_mask) {
+        AddOutcome::New(wd) | AddOutcome::Replaced(wd) | AddOutcome::Exists(wd) => wd as isize,
+        AddOutcome::NoSpace => err::ENOSPC,
+        AddOutcome::NotAnInstance => err::EINVAL,
+    }
+}
+
+/// `inotify_rm_watch(fd, wd)` — drop one watch. The wd belongs to the
+/// instance behind the descriptor; an unknown wd is the man page's
+/// `EINVAL`, and the watch's death is reported to the queue as
+/// `IN_IGNORED` - the record that lets `inotifywait -m` stop printing a
+/// watch it no longer has.
+pub(super) fn handle_inotify_rm_watch(args: [usize; ARG_COUNT]) -> isize {
+    let (fd, wd) = (args[0] as i32, args[1] as i32);
+    let Ok(file) = crate::sched::current_fds().clone_at(fd) else {
+        return err::EBADF;
+    };
+    let node = file.inode();
+    let Some(instance) = node.as_inotify() else {
+        return err::EINVAL;
+    };
+    if crate::vfs::inotify::remove_watch(instance, node.metadata().ino, wd) {
+        0
+    } else {
+        err::EINVAL
+    }
 }
 
 /// `timerfd_settime(fd, flags, new_value, old_value)` — arm, re-arm or
@@ -4542,6 +4769,8 @@ pub(super) fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> 
     match parent.create(name, kind) {
         Ok(created) => {
             created.set_mode(masked_mode(args[2] as u32));
+            crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
+            let _ = created;
             0
         }
         Err(e) => err_of(e),
@@ -4609,7 +4838,10 @@ pub(super) fn handle_futimesat(
         )
     };
     match inode.set_times(atime, mtime) {
-        Ok(()) => 0,
+        Ok(()) => {
+            crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -4664,7 +4896,10 @@ pub(super) fn handle_utime(
         )
     };
     match inode.set_times(atime, mtime) {
-        Ok(()) => 0,
+        Ok(()) => {
+            crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+            0
+        }
         Err(e) => err_of(e),
     }
 }

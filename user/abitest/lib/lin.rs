@@ -100,6 +100,17 @@ fn sys1(number: u64, a1: usize) -> isize {
     ret
 }
 
+/// A raw syscall through the harness's own gate, for the calls no typed
+/// wrapper has earned yet (socket by family number today).
+pub fn raw_sys(number: u64, a1: usize, a2: usize, a3: usize) -> isize {
+    sys3(number, a1, a2, a3)
+}
+
+/// The two-argument form of the same escape.
+pub fn raw_sys2(number: u64, a1: usize, a2: usize) -> isize {
+    sys2(number, a1, a2)
+}
+
 fn sys2(number: u64, a1: usize, a2: usize) -> isize {
     let ret: isize;
     unsafe {
@@ -192,6 +203,16 @@ fn sys6(number: u64, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: 
 
 pub const EPERM: isize = -1;
 pub const ENOENT: isize = -2;
+/// EADDRINUSE: a bind whose name is taken, and the address a socket
+/// cannot share.
+pub const EADDRINUSE: isize = -98;
+/// ENXIO: the file doors' answer at a socket's name.
+pub const ENXIO: isize = -6;
+/// ECONNREFUSED, EISCONN, ENOTCONN: the connect-side refusals a unix
+/// socket hands out.
+pub const ECONNREFUSED: isize = -111;
+pub const EISCONN: isize = -106;
+pub const ENOTCONN: isize = -107;
 pub const ESRCH: isize = -3;
 pub const EINTR: isize = -4;
 pub const E2BIG: isize = -7;
@@ -1130,6 +1151,108 @@ pub fn timerfd_gettime(fd: i32, curr_value: &mut Itimerspec) -> isize {
         fd as usize,
         curr_value as *mut Itimerspec as usize,
     )
+}
+
+// --- inotify(7) -------------------------------------------------------------
+
+/// `inotify_init1`'s flags: the `O_` pair under the header's other names.
+pub const IN_CLOEXEC: usize = 0o200_0000;
+pub const IN_NONBLOCK: usize = 0x800;
+
+/// The event bits, as `linux/inotify.h` numbers them - the test asserts
+/// against the kernel's own constants through these literals.
+pub const IN_ACCESS: u32 = 0x0000_0001;
+pub const IN_MODIFY: u32 = 0x0000_0002;
+pub const IN_ATTRIB: u32 = 0x0000_0004;
+pub const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+pub const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
+pub const IN_OPEN: u32 = 0x0000_0020;
+pub const IN_MOVED_FROM: u32 = 0x0000_0040;
+pub const IN_MOVED_TO: u32 = 0x0000_0080;
+pub const IN_CREATE: u32 = 0x0000_0100;
+pub const IN_DELETE: u32 = 0x0000_0200;
+pub const IN_DELETE_SELF: u32 = 0x0000_0400;
+pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+pub const IN_IGNORED: u32 = 0x0000_8000;
+pub const IN_ONLYDIR: u32 = 0x0100_0000;
+pub const IN_MASK_ADD: u32 = 0x2000_0000;
+pub const IN_MASK_CREATE: u32 = 0x1000_0000;
+pub const IN_ISDIR: u32 = 0x4000_0000;
+pub const IN_ONESHOT: u32 = 0x8000_0000;
+
+/// One decoded `struct inotify_event`: the header fields and the name as
+/// a fixed array with its length (NUL-stripped). `from_bytes` walks one
+/// record off a read buffer.
+pub struct InotifyRecord {
+    pub wd: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    pub name: [u8; 256],
+    pub name_len: usize,
+}
+
+impl InotifyRecord {
+    /// The name as bytes.
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len]
+    }
+
+    /// Parse the first record of `buf`, returning it and the record's
+    /// total length. A buffer that holds less than one whole record, or
+    /// whose length field runs past the data, answers `None`.
+    pub fn from_bytes(buf: &[u8]) -> Option<(InotifyRecord, usize)> {
+        if buf.len() < 16 {
+            return None;
+        }
+        let wd = i32::from_ne_bytes(buf[..4].try_into().unwrap());
+        let mask = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
+        let cookie = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let len = u32::from_ne_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let total = 16 + len;
+        if buf.len() < total || len > 256 {
+            return None;
+        }
+        let mut name = [0u8; 256];
+        let mut name_len = 0;
+        for &b in &buf[16..total] {
+            if b == 0 {
+                break;
+            }
+            name[name_len] = b;
+            name_len += 1;
+        }
+        Some((
+            InotifyRecord {
+                wd,
+                mask,
+                cookie,
+                name,
+                name_len,
+            },
+            total,
+        ))
+    }
+}
+
+/// `inotify_init1(flags)`: the event queue.
+pub fn inotify_init1(flags: usize) -> isize {
+    sys1(nr::INOTIFY_INIT1, flags)
+}
+
+/// `inotify_add_watch(fd, path, mask)`: watch what the path names.
+pub fn inotify_add_watch(fd: i32, path: &[u8], mask: u32) -> isize {
+    sys3(
+        nr::INOTIFY_ADD_WATCH,
+        fd as usize,
+        path.as_ptr() as usize,
+        mask as usize,
+    )
+}
+
+/// `inotify_rm_watch(fd, wd)`: stop watching.
+pub fn inotify_rm_watch(fd: i32, wd: i32) -> isize {
+    sys2(nr::INOTIFY_RM_WATCH, fd as usize, wd as usize)
 }
 
 // --- the file calls of the completion set ----------------------------------
@@ -2129,4 +2252,87 @@ pub fn linkat(olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8], flags: usize
 /// `mknod(path, mode, dev)` — ask for a device node.
 pub fn mknod(path: &[u8], mode: usize, dev: usize) -> isize {
     sys3(SYS_MKNOD, path.as_ptr() as usize, mode, dev)
+}
+
+/// `struct sockaddr_un` as the kernel's parser reads it: family at zero,
+/// the path from two. `bytes` returns exactly the `addrlen` a call should
+/// carry: the family, the path and one NUL.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockAddrUn {
+    pub sun_family: u16,
+    pub sun_path: [u8; 108],
+}
+
+pub const AF_UNIX: usize = 1;
+
+impl SockAddrUn {
+    /// The address for one path: NUL-terminated, minimal `addrlen`. A path
+    /// over 107 characters cannot fit the field, and the builder refuses
+    /// (0 length answers "no address" at the wrappers).
+    pub const fn new(path: &[u8]) -> (SockAddrUn, usize) {
+        let mut a = SockAddrUn {
+            sun_family: 1,
+            sun_path: [0; 108],
+        };
+        if path.len() > 107 {
+            return (a, 0);
+        }
+        let mut i = 0;
+        while i < path.len() {
+            a.sun_path[i] = path[i];
+            i += 1;
+        }
+        a.sun_path[path.len()] = 0;
+        (a, 3 + path.len())
+    }
+
+    /// A raw, hand-spelled address: family bytes and a body that may be
+    /// NUL at the front (the abstract namespace, which this kernel
+    /// refuses) or lack a terminator - shapes only the parser's own
+    /// verdict answers.
+    pub const fn raw(family: u16, body: &[u8]) -> (SockAddrUn, usize) {
+        let mut a = SockAddrUn {
+            sun_family: family,
+            sun_path: [0; 108],
+        };
+        let mut i = 0;
+        while i < body.len() && i < 108 {
+            a.sun_path[i] = body[i];
+            i += 1;
+        }
+        (a, 2 + i)
+    }
+}
+
+/// `bind` with a `sockaddr_un` of the given length.
+pub fn bind_un(fd: i32, addr: &SockAddrUn, len: usize) -> isize {
+    sys3(
+        nr::BIND,
+        fd as usize,
+        addr as *const SockAddrUn as usize,
+        len,
+    )
+}
+
+/// `connect` with a `sockaddr_un`.
+pub fn connect_un(fd: i32, addr: &SockAddrUn, len: usize) -> isize {
+    sys3(
+        nr::CONNECT,
+        fd as usize,
+        addr as *const SockAddrUn as usize,
+        len,
+    )
+}
+
+/// `accept(fd, addr, addrlen)` - either output may be absent (null), which
+/// is how the "I do not care who it is" form is spelled.
+pub fn accept4_un(fd: i32, addr: *mut SockAddrUn, len: *mut u32, flags: usize) -> isize {
+    sys4(
+        nr::ACCEPT4,
+        fd as usize,
+        addr as usize,
+        len as usize,
+        flags,
+    )
 }

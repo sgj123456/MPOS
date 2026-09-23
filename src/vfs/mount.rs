@@ -664,6 +664,13 @@ impl Vfs {
                     }
                     name => {
                         let here = stack.last().expect("the stack is never empty").clone();
+                        // A name that is not a directory has no children to
+                        // look up - and Linux says so *before* it asks the
+                        // permission questions, so `cat /etc/hostname/x`
+                        // reads as ENOTDIR whatever the file's bits are.
+                        if here.metadata().kind != NodeKind::Dir {
+                            return Err(VfsError::NotDir);
+                        }
                         // Walking *through* a directory is what the execute
                         // bit is for: without it a caller can name a file it
                         // may not reach, and the name is all a directory

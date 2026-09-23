@@ -258,26 +258,30 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_eq(&mut failed, b"vhangup succeeds", lin::vhangup(), 0);
 
-    // seccomp: the ENOSYS of a kernel built without it, and the probe
-    // that answers with the empty set rather than leaving the caller to
-    // guess.
+    // seccomp(2), as this kernel implements it (PLAN 8.2): STRICT latches
+    // for real, FILTER is refused so a caller never mistakes it for being
+    // confined, and the availability probe answers the empty set. The
+    // strict checks are done non-destructively - once latched, this
+    // program's next `getpid` is a fatal call - and the latch itself is
+    // proved in a child, whose death by SIGKILL is the whole of what
+    // Linux promises a strict thread that reaches for anything else.
     lin::check_eq(
         &mut failed,
-        b"seccomp strict mode answers ENOSYS",
-        lin::seccomp(0, 0, 0),
-        lin::ENOSYS,
+        b"seccomp with an unknown op answers EINVAL",
+        lin::seccomp(99, 0, 0),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"strict mode with stray flags answers EINVAL before latching",
+        lin::seccomp(0, 1, 0),
+        lin::EINVAL,
     );
     lin::check_eq(
         &mut failed,
         b"seccomp filter mode answers ENOSYS",
         lin::seccomp(1, 0, 0),
         lin::ENOSYS,
-    );
-    lin::check_eq(
-        &mut failed,
-        b"seccomp with an unknown op answers EINVAL",
-        lin::seccomp(99, 0, 0),
-        lin::EINVAL,
     );
     let mut avail = 99u32;
     lin::check_eq(
@@ -287,6 +291,29 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         0,
     );
     lin::check_true(&mut failed, b"no action is available", avail == 0);
+    {
+        let kid = lin::fork();
+        if kid == 0 {
+            // The child latches strict, then reaches for a syscall the
+            // whitelist does not carry. It should not return; the exit
+            // below is the failure path, reached only if the kernel let
+            // the forbidden call answer like a normal one.
+            let strict = lin::seccomp(0, 0, 0);
+            let probe = lin::getpid();
+            if strict == 0 && probe == lin::ENOSYS {
+                lin::exit(0);
+            }
+            lin::exit(1);
+        }
+        let mut status = 0i32;
+        let got = lin::waitpid(kid as usize, &mut status, 0);
+        lin::check_true(&mut failed, b"the strict child was reaped", got == kid as isize);
+        lin::check_true(
+            &mut failed,
+            b"the strict child died by SIGKILL on its first forbidden call",
+            status & 0x7f == 9,
+        );
+    }
 
     // The namespace pair: nothing to unshare, nothing to join.
     lin::check_eq(&mut failed, b"unshare(0) succeeds", lin::unshare(0), 0);

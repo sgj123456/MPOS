@@ -211,6 +211,69 @@ impl Inode for RamDev {
     }
 }
 
+/// A socket node: a name `bind(2)` made for a connection endpoint. It
+/// carries the namespace presence - stat type, directory listing, unlink -
+/// and deliberately no bytes: reading the node through the file doors is
+/// the question a socket never answers, and `open(2)` on the path gets
+/// Linux's `ENXIO` from the read/write refusals below.
+struct RamSocket {
+    ino: Ino,
+    /// The moment `bind` planted the name; a socket's own clock has nothing
+    /// else to say about it.
+    mtime: u64,
+    mode: Mutex<Cell<Option<u32>>>,
+    owner: Mutex<Cell<(u32, u32)>>,
+}
+
+impl Inode for RamSocket {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::Socket,
+            size: 0,
+        }
+    }
+
+    fn mtime(&self) -> u64 {
+        self.mtime
+    }
+
+    fn mode(&self) -> u32 {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0)
+    }
+
+    fn set_mode(&self, mode: u32) {
+        critical_section::with(|cs| self.mode.borrow(cs).set(Some(mode)));
+    }
+
+    fn keeps_modes(&self) -> bool {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).is_some()
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).get())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).set((uid, gid)));
+    }
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Err(VfsError::NotConnected)
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
+        Err(VfsError::NotConnected)
+    }
+
+    /// The file doors do not reach the queue behind a socket name:
+    /// `open(2)` answers Linux's ENXIO, the same refusal `/dev/tty`
+    /// gives a process it has no answer for.
+    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+        Err(VfsError::NoDevice)
+    }
+}
+
 struct RamDir {
     ino: Ino,
     mode: Mutex<Cell<Option<u32>>>,
@@ -292,6 +355,14 @@ impl Inode for RamDir {
             // A device node mknod made: a placeholder until a devtmpfs mount
             // covers the directory with driver-backed devices.
             NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev { ino: fresh_ino() }),
+            // A socket name, made by `bind` alone. Its clock is the bind;
+            // `connect` looks up the node's identity, never its bytes.
+            NodeKind::Socket => Arc::new(RamSocket {
+                ino: fresh_ino(),
+                mtime: now(),
+                mode: Mutex::new(Cell::new(None)),
+                owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+            }),
             // A link is made with `Inode::symlink`, which carries the one thing
             // a link cannot exist without: what it points at.
             NodeKind::Symlink => return Err(VfsError::Unsupported),
@@ -613,6 +684,30 @@ mod tests {
         // A symlink answers with its creation time; it has no write path.
         let link = root.symlink("l", "/f").unwrap();
         assert_ne!(link.mtime(), 0);
+    }
+
+    /// A socket node: the kind stat reports, the doors it refuses, and the
+    /// one clock it carries. `bind(2)` is the only maker; the reads that
+    /// answer ENOTCONN are what keep `open(2)`-style callers out.
+    #[test]
+    fn a_socket_node_is_a_name_with_no_bytes() {
+        let fs = RamFs::new();
+        let root = fs.root();
+        let sock = root.create("x.sock", NodeKind::Socket).unwrap();
+        assert_eq!(sock.metadata().kind, NodeKind::Socket);
+        assert_ne!(sock.mtime(), 0, "the bind moment is the node's birthday");
+        assert_eq!(sock.mode(), 0, "no mode was said yet - stat fills the default");
+        assert_eq!(
+            sock.read_at(0, &mut [0u8; 4]).unwrap_err(),
+            VfsError::NotConnected
+        );
+        assert_eq!(
+            sock.write_at(0, b"x").unwrap_err(),
+            VfsError::NotConnected
+        );
+        // The name lives and dies with the directory like any other.
+        root.unlink("x.sock").unwrap();
+        assert!(root.lookup("x.sock").is_err());
     }
 
     #[test]

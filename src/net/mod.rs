@@ -26,6 +26,7 @@
 
 pub mod rtnl;
 pub mod socket;
+pub mod unix;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

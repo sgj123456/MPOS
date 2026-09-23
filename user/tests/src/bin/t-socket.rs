@@ -82,12 +82,25 @@ fn main() {
         ),
     }
 
-    // The two refusals, named apart.
-    let err = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap_err();
+    // AF_UNIX is spoken for: the path family opens, and t-unix is the
+    // test of what it answers. The refusals that remain are the family
+    // *types* this kernel still declines - a datagram unix socket gets
+    // EOPNOTSUPP at the type line, and an AppleTalk-style family still
+    // gets EAFNOSUPPORT at the family line.
+    match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
+        Ok(fd) => {
+            r.check("socket(AF_UNIX, SOCK_STREAM) opens the path family", true);
+            drop(fd);
+        }
+        Err(err) => {
+            r.check(&format!("socket(AF_UNIX, SOCK_STREAM) opens the path family (got {err})"), false);
+        }
+    }
+    let err = socket(AddressFamily::UNIX, SocketType::SEQPACKET, None).unwrap_err();
     r.check_errno(
-        "a family this kernel does not speak is EAFNOSUPPORT",
+        "a unix type without a kernel story is EOPNOTSUPP",
         err,
-        rustix::io::Errno::AFNOSUPPORT,
+        rustix::io::Errno::OPNOTSUPP,
     );
     let err = socket(AddressFamily::INET, SocketType::SEQPACKET, None).unwrap_err();
     r.check_errno(

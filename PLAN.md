@@ -6,13 +6,14 @@ Missing essential features, prioritized by impact on real-world workload compati
 
 ## Current Status
 
-- **~225 Linux x86_64 syscalls** implemented
+- **~229 Linux x86_64 syscalls** implemented
 - **Uniprocessor** — single core, `critical_section::Mutex<RefCell<T>>`
 - **Signals** — handlers delivered via `rt_sigframe`, mask enforcement, `sigqueue` siginfo payloads
 - **Filesystems**: ramfs, ext2/ext4 (write-through), devfs, procfs, sysfs, devpts
-- **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net; AF_INET + netlink (read + uevent)
+- **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net; AF_INET + AF_UNIX
+  (path `SOCK_STREAM`) + netlink (read + uevent)
 - **Scheduler**: 4-level priority + round-robin, COW fork, demand-paged stack
-- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.2 / 5.1 done; 4.1 / 4.3 / 5.2 partial; 6.3 stub.
+- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.1 / 4.2 / 5.1 done; 4.3 / 5.2 partial; 6.3 stub.
 
 ### Remaining ABI support (gaps + services)
 
@@ -22,8 +23,17 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
 
 **File-watch / service infrastructure (the big one for daemons):**
 - `inotify_init1` (294) / `inotify_add_watch` (254) / `inotify_rm_watch` (255) —
-  without these, `systemd`, `udev`, `dbus`, `dnsmasq`, config re-readers and many
-  file watchers cannot start or watch anything. **Highest service impact.**
+  **answered**: a full watch queue in `src/vfs/inotify.rs` (event records,
+  the `(dev, ino)` registry, the `IN_ISDIR`/oneshot/`IN_EXCL_UNLINK`/
+  `IN_MASK_ADD`/`IN_MASK_CREATE` rules, the rename cookie pair, DELETE_SELF
+  and IGNORED, one coalesced Q_OVERFLOW per drop episode), emitting from the
+  create/delete/rename/link/open/close/write/attrib hooks of the syscall
+  layer. `mdev`/`udev`, `dbus` and config re-readers can watch and hear.
+  Deliberate v1 divergences: `IN_ACCESS` is never emitted (the read path
+  does not bump atime), `IN_UNMOUNT` is not emitted (unmount does not track
+  watches), a directory's `IN_MOVE_SELF` waits on directory rename, and a
+  rename that replaces a name reports the `IN_DELETE` this kernel's copy
+  actually performs.
 - `fanotify_init` (302) / `fanotify_mark` (303) — less common (antivirus, some
   mount monitors).
 - `keyctl` (250) — kernel keyring; needed by `keyutils`/some TLS/pam stacks.
@@ -50,10 +60,9 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   anonymous **demand paging** + per-VMA backing tracking in the `#PF` handler.
 - **6.3** namespaces: `unshare`/`setns` validate but return `EOPNOTSUPP`; no
   real mount/pid/net namespace isolation.
-- **4.1** AF_UNIX is partial: `socketpair(AF_UNIX)` works, but `socket(AF_UNIX)`
-  with a filesystem `sockaddr_un` (`bind`/`connect` on a path) is refused
-  `EAFNOSUPPORT` - so dbus, X11 and the `/run/*` sockets do not connect. Needs a
-  unix-domain channel bound to an inode, with the connect-time peer handshake.
+- **4.1** AF_UNIX is answered for `SOCK_STREAM` (see Phase 4): what the
+  family still lacks is `SCM_RIGHTS`/`SCM_CREDENTIALS`, without which a real
+  dbus broker can connect its clients but not authenticate them.
 
 ---
 
@@ -218,7 +227,10 @@ change it is; `stat`/`statx` report the three clocks separately (ext4 keeps
 three set.
 
 *Remaining:* `atime` is not bumped on read (ext4 carries it but no read path
-updates it); ramfs keeps no clock. The legacy `utime` and `futimesat` now store
+updates it). ramfs/tmpfs now keeps one clock - stamped at creation and by
+writes, truncates and directory-entry changes - which is what stopped
+OpenRC's deptree freshness check from reading every `/run` file as 1970.
+The legacy `utime` and `futimesat` now store
 through the same `Inode::set_times` path.
 
 **Changes**:
@@ -255,23 +267,32 @@ little-endian hex, `:port`, state byte) - the formatter is host-tested
 
 ## Phase 4: Networking Enhancements (Medium Priority)
 
-### 4.1 AF_UNIX Domain Sockets — **PARTIAL**
+### 4.1 AF_UNIX Domain Sockets — **ANSWERED** (SOCK_STREAM)
 
-`socketpair(AF_UNIX)` works (backed by `pipe::DuplexEnd`). What is missing is the
-filesystem-backed half: `socket(AF_UNIX, ...)` + `bind`/`connect` on a
-`sockaddr_un` path, which the socket allocator still refuses with
-`EAFNOSUPPORT` - and without it dbus / X11 / `/run/*` sockets cannot connect.
+The path family is real: `src/net/unix.rs` carries `socket(AF_UNIX,
+SOCK_STREAM)` through `bind` (which creates a genuine `S_IFSOCK` node in
+ramfs, visible to `stat`/`ls -l`/`find`, and `open` on which answers
+`ENXIO`), `listen` with a clamped backlog, `connect` by resolved path
+(symlinks and mounts ride the normal resolution), `accept`/`accept4`,
+`getsockname` echoing the bound path, `shutdown`, and the full data path -
+a connected unix socket *is* a `pipe::DuplexEnd` half, so `read`/`write`/
+`sendmsg`/`recvmsg`/`poll`/`epoll` all speak to it unchanged. The bind
+table is keyed by `(fs_id, ino)` like locks and inotify watches, so
+`unlink` of the name retires the binding (hooked in `unlinkat`) while the
+listener itself survives - exactly how a daemon outlives its own stale
+socket file. Permissions: bind needs write+search on the parent (the
+mkdirat rule), connect needs `W_OK` on the node.
 
-Currently only AF_INET. AF_UNIX is essential for local IPC (dbus, X11, Docker socket, snap/flatpak).
-
-**Implementation plan**:
-- New file: `src/net/unix.rs`
-- `UnixSocket`: backed by a `sockaddr_un` path in the filesystem
-- `socketpair()` already has pipe-like semantics — reuse `PipeState` or create `UnixSocketState`
-- `bind()`: create a filesystem node at the socket path
-- `connect()`: look up path, establish bidirectional pipe-like channel
-- `accept()`: accept incoming connection from the path
-- `sendmsg`/`recvmsg` with `SCM_RIGHTS` for fd passing (stretch goal)
+Deliberate divergences from Linux (each asserted in `t-unix`/
+`t-unix-rustix`): `SOCK_DGRAM`/`SOCK_SEQPACKET` unix sockets answer
+`EOPNOTSUPP` (stream only); the abstract namespace answers `EINVAL`; a
+connect to a bound-but-never-listened name is `ECONNREFUSED` rather than
+Linux's implicit backlog-0 rendezvous; ext4 refuses socket nodes
+(`EOPNOTSUPP` - `/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so only
+`bind` creates a socket name; `getpeername` answers `AF_UNIX` with an empty
+path (accepted peers carry no name); and **no `SCM_RIGHTS`/
+`SCM_CREDENTIALS`** - a real dbus broker still cannot authenticate its
+clients, which is the next milestone for this family.
 
 ### 4.2 ICMP Improvements — **DONE**
 

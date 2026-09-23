@@ -24,6 +24,7 @@ pub mod epoll;
 pub mod eventfd;
 pub mod ext4;
 pub mod file;
+pub mod inotify;
 pub mod locks;
 pub mod mount;
 pub mod path;
@@ -67,6 +68,15 @@ pub enum NodeKind {
     /// built out of these - Alpine's `/bin` is one busybox and three hundred
     /// names pointing at it.
     Symlink,
+    /// A socket: a name whose "contents" are a connection endpoint, created
+    /// by `bind(2)` and answered by `connect(2)`. It is a node so that the
+    /// file system owns its namespace - `ls -l` shows `srw-rw-rw-`,
+    /// `find -type s` finds it, and unlinking it retires the name while the
+    /// listening socket behind it lives on by its descriptors, exactly as
+    /// Linux behaves. Nothing reads or writes one through the file doors;
+    /// opening a socket path answers `ENXIO` here and `connect` reaches the
+    /// socket layer through the bind table.
+    Socket,
 }
 
 /// What a descriptor can do right now, for `poll(2)`.
@@ -169,6 +179,13 @@ pub enum VfsError {
     /// all - POSIX's answer, and the one a shell reads as "job control off"
     /// rather than as a terminal it does not own.
     NoDevice,
+    /// ENOTCONN: an operation that needs a connection found none. The
+    /// listening and unnamed ends of an AF_UNIX socket read through the
+    /// file door answer this - Linux's `read(2)` on a socket that is not
+    /// connected - rather than the `Unsupported` "this kind of file has no
+    /// reads at all", which would misdescribe a socket one call before it
+    /// connects.
+    NotConnected,
 }
 
 pub type VfsResult<T> = Result<T, VfsError>;
@@ -373,6 +390,15 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// The inotify descriptor this node is, if it is one.
+    ///
+    /// `inotify_add_watch` and `inotify_rm_watch` hold nothing but a
+    /// descriptor number, and the queue behind it is reachable only here -
+    /// the same shape as [`Self::as_timerfd`].
+    fn as_inotify(&self) -> Option<&crate::vfs::inotify::InotifyInstance> {
+        None
+    }
+
     /// The block device this node stands for, if it is one.
     ///
     /// `mount(2)` is told "mount this device on that directory" and receives
@@ -394,6 +420,38 @@ pub trait Inode: Send + Sync {
     /// `net` numbers its entries from one.
     fn socket_handle(&self) -> usize {
         0
+    }
+
+    /// The AF_UNIX socket this node is, if it is one - the same question
+    /// [`Self::socket_handle`] puts to the network registry, answered with
+    /// this module's own slot number. The unix syscalls hold nothing but a
+    /// descriptor; the listener's queue and the bind record live behind this
+    /// id in `net::unix`, and zero means "not a unix socket".
+    fn unix_id(&self) -> usize {
+        0
+    }
+
+    /// The connected stream channel behind this node, if any.
+    ///
+    /// A socketpair end *is* a [`DuplexEnd`](crate::vfs::pipe::DuplexEnd);
+    /// a connected AF_UNIX socket *has* one, and forwards its whole file
+    /// face through this handle. The message syscalls route by it, which is
+    /// how both spellings of a connected unix stream read, write, poll and
+    /// half-close through exactly the same pipe machinery.
+    fn unix_end(&self) -> Option<alloc::sync::Arc<crate::vfs::pipe::DuplexEnd>> {
+        None
+    }
+
+    /// The AF_UNIX socket this node is, if it is one - the borrow form of
+    /// [`Self::unix_id`], for the calls that operate on the socket's own
+    /// state (bind's record, getsockname's echo) rather than its slot.
+    ///
+    /// Gated with the `net` module itself: on the host the type does not
+    /// exist, and every caller lives in the socket layer the host build
+    /// skips as well.
+    #[cfg(target_os = "none")]
+    fn as_unix(&self) -> Option<&crate::net::unix::UnixSock> {
+        None
     }
 
     /// What this node can do without blocking, for `poll(2)`.

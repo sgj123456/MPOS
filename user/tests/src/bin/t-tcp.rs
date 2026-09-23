@@ -79,9 +79,9 @@ fn main() {
     // the stack has no support for at all. Pinned here so the gap is a fact
     // in the log instead of a surprise for a server that tries.
     match listen(&sock, 1) {
-        Ok(()) => r.check("listen is refused with EOPNOTSUPP, not faked", false),
+        Ok(()) => r.check("listen on an IPv4 socket is refused with EOPNOTSUPP, not faked (unix sockets listen; the network stack does not yet)", false),
         Err(err) => r.check(
-            &format!("listen is refused with EOPNOTSUPP, not faked (got {err})"),
+            &format!("listen on an IPv4 socket is refused with EOPNOTSUPP, not faked (got {err})"),
             err == rustix::io::Errno::OPNOTSUPP,
         ),
     }

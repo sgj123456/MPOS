@@ -257,6 +257,9 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         VfsError::Access => err::EACCES,
         VfsError::NotPermitted => err::EPERM,
         VfsError::NoDevice => err::ENXIO,
+        // ENOTCONN: the door is a socket's, and no connection stands
+        // behind it - Linux's read(2) answer on an unconnected socket.
+        VfsError::NotConnected => err::ENOTCONN,
     }
 }
 

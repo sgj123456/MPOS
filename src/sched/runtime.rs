@@ -1188,6 +1188,7 @@ impl Table {
                     // reference - before the batch is parked for dropping,
                     // while the counts still say who owns them.
                     crate::net::socket::close_sockets_at_exit(&files);
+                    crate::vfs::inotify::close_at_exit(&files);
                     queue_release(files);
                 }
             }

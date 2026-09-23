@@ -120,9 +120,16 @@ const MSG_PEEK: usize = 0x02;
 /// a channel end is not an IP socket: answering every `send` on one with
 /// `ENOTSOCK` is what broke sudo's backchannel between parent and monitor
 /// process, which is a socketpair and nothing else.
-fn duplex_of_fd(fd: i32) -> Option<Arc<crate::vfs::File>> {
+fn channel_of_fd(fd: i32) -> Option<Arc<crate::vfs::File>> {
     let file = crate::sched::current_fds().clone_at(fd).ok()?;
-    file.inode().as_duplex()?;
+    // A socketpair end *is* the channel; a connected unix socket *has*
+    // one, and answers the message calls through it identically. An
+    // unconnected unix fd falls through: `socket_handle` is zero for it,
+    // so the calls below reach their own ENOTSOCK-style answer - the
+    // `read`/`write` doors are where ENOTCONN speaks first.
+    if file.inode().as_duplex().is_none() && file.inode().unix_end().is_none() {
+        return None;
+    }
     Some(file)
 }
 
@@ -446,6 +453,37 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         return fd as isize;
     }
 
+    // AF_UNIX: the path family, answered by `src/net/unix.rs`. The fd is a
+    // `UnixSock` inode - not a network registry entry - because unix sockets
+    // must work on a machine with no network card at all, the same reason
+    // netlink took its own path through this function.
+    if domain == AF_UNIX {
+        let raw_type = args[1] as u32;
+        let cloexec = raw_type & SOCK_CLOEXEC != 0;
+        let nonblock = raw_type & SOCK_NONBLOCK != 0;
+        let typ = raw_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if args[2] != 0 {
+            return err::EPROTONOSUPPORT;
+        }
+        if typ != SOCK_STREAM as u32 {
+            // DGRAM and SEQPACKET over unix answer the refusal socketpair
+            // already makes for them; STREAM serves every target daemon.
+            return err::EOPNOTSUPP;
+        }
+        let sock = crate::net::unix::alloc(typ as u16);
+        let fd = match crate::vfs::open_inode(sock) {
+            Ok(fd) => fd,
+            Err(e) => return crate::syscall::err_of(e),
+        };
+        if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+            file.set_status(crate::vfs::file::O_NONBLOCK);
+        }
+        if cloexec {
+            let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+        }
+        return fd as isize;
+    }
+
     if domain != AF_INET && domain != AF_INET6 {
         return err::EAFNOSUPPORT;
     }
@@ -490,6 +528,15 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
 /// one of those is gone. This runs after the table entry is removed, so a
 /// count of one means the reference in hand is the only one left.
 pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
+    // The last reference to a unix socket retires its slot (and its name's
+    // table key) the same way a network socket's frees its registry entry.
+    let unix_id = file.inode().unix_id();
+    if unix_id != 0 {
+        if Arc::strong_count(file) == 1 {
+            super::unix::release(unix_id);
+        }
+        return;
+    }
     let handle = file.inode().socket_handle();
     if handle == 0 || Arc::strong_count(file) != 1 {
         return;
@@ -503,6 +550,32 @@ pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
 pub(crate) fn close_sockets_at_exit(files: &[Arc<crate::vfs::File>]) {
     let mut closed: Vec<usize> = Vec::new();
     for file in files {
+        // Unix sockets retire by their own slot number, on the same
+        // last-reference rule: the batch holds all the references when it
+        // closes. The id space is disjoint from the network registry's -
+        // unix ids carry their own sequence - so the dedup list below is
+        // kept honest by tagging each closed id by kind.
+        let unix_id = file.inode().unix_id();
+        if unix_id != 0 {
+            // The two id spaces share this dedup list, so unix ids carry
+            // a tag bit the network handles cannot reach (they are small
+            // slot indexes into the stack's Vec).
+            const UNIX_TAG: usize = 1 << 40;
+            if closed.contains(&(unix_id | UNIX_TAG)) {
+                continue;
+            }
+            let ptr = Arc::as_ptr(file) as *const ();
+            let total = Arc::strong_count(file);
+            let in_batch = files
+                .iter()
+                .filter(|other| Arc::as_ptr(other) as *const () == ptr)
+                .count();
+            if total == in_batch {
+                closed.push(unix_id | UNIX_TAG);
+                super::unix::release(unix_id);
+            }
+            continue;
+        }
         let handle = file.inode().socket_handle();
         if handle == 0 || closed.contains(&handle) {
             continue;
@@ -532,6 +605,22 @@ pub(crate) fn close_sockets_at_exit(files: &[Arc<crate::vfs::File>]) {
 /// which is the whole of what UDP `connect` means.
 pub(crate) fn handle_connect(args: [usize; 6], from_user: bool) -> isize {
     let fd = args[0] as i32;
+    // A unix socket's connect is a path: resolve, hand the listener's
+    // queue the handshake. The whole act is `unix::connect_path`.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        if let Some(sock) = file.inode().as_unix() {
+            let raw = match read_sockaddr_un(args[1], args[2], from_user) {
+                Ok(raw) => raw,
+                Err(e) => return e,
+            };
+            let path = match crate::net::unix::sockaddr_un_path(&raw) {
+                Ok(path) => path,
+                Err(e) => return e,
+            };
+            let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+            return crate::net::unix::connect_path(sock, &path, nonblock);
+        }
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -672,7 +761,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // to parse and no control data this kernel carries, so the whole of the
     // call is the bytes; a caller that names a destination on a connected
     // socket is told so, as Linux does.
-    if let Some(file) = duplex_of_fd(fd) {
+    if let Some(file) = channel_of_fd(fd) {
         if !crate::syscall::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
         }
@@ -727,7 +816,7 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
     // A connected pair's end, in scatter-gather form: gather, then write.
     // No name is legal to send to and no control data is carried, so a
     // caller that set either is told so.
-    if let Some(file) = duplex_of_fd(fd) {
+    if let Some(file) = channel_of_fd(fd) {
         let (name, _namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
             Ok(fields) => fields,
             Err(e) => return e,
@@ -924,7 +1013,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     // The read side of a connected pair's end. A peek would need to look at
     // the front of the pipe's queue without taking it, which a pipe cannot
     // do - refusing beats consuming bytes the caller meant to keep.
-    if let Some(file) = duplex_of_fd(fd) {
+    if let Some(file) = channel_of_fd(fd) {
         if !crate::syscall::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
@@ -999,7 +1088,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     // The read side of a connected pair's end, in scatter-gather form: one
     // contiguous read into the first iovec, no name and no control data to
     // report - the fields go back zeroed, which is how Linux says "none".
-    if let Some(file) = duplex_of_fd(fd) {
+    if let Some(file) = channel_of_fd(fd) {
         let (name, namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
             Ok(fields) => fields,
             Err(e) => return e,
@@ -1363,6 +1452,25 @@ fn raw_recv(
 /// source. A datagram socket binds for real: the receive queue starts
 /// holding whatever arrives for the port.
 pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
+    // AF_UNIX: the path bind. The address is a `sockaddr_un`; the socket's
+    // whole namespace story - node, table, news - is `unix::bind_path`.
+    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
+        if let Some(sock) = file.inode().as_unix() {
+            let raw = match read_sockaddr_un(args[1], args[2], from_user) {
+                Ok(raw) => raw,
+                Err(e) => return e,
+            };
+            let path = match crate::net::unix::sockaddr_un_path(&raw) {
+                Ok(path) => path,
+                Err(e) => return e,
+            };
+            return crate::net::unix::bind_path(sock, &path);
+        }
+    }
+    // The netlink probes look up the *network registry's* handle - a unix
+    // socket has none, so it can never be mistaken for one, even though
+    // `sockaddr_un` and `sockaddr_nl` share the family's first bytes and a
+    // unix bind carries enough bytes to satisfy either reader.
     if let Ok(handle) = socket_handle_of_fd(args[0] as i32)
         && crate::uevent::exists(handle)
     {
@@ -1500,16 +1608,79 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
     }
 }
 
-/// `listen(fd, backlog)` - accepting connections is not on the menu yet, and
-/// a server this kernel cannot run gets a straight answer rather than a
-/// silent failure.
-pub(crate) fn handle_listen(_args: [usize; 6], _from_user: bool) -> isize {
+/// `listen(fd, backlog)` - a unix listener's queue opens here; the network
+/// sockets keep the straight refusal (their accept machinery, with the
+/// handshake and the half-close states it implies, is not built).
+pub(crate) fn handle_listen(args: [usize; 6], _from_user: bool) -> isize {
+    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
+        if let Some(sock) = file.inode().as_unix() {
+            return match crate::net::unix::listen(sock, args[1] as i32) {
+                Ok(()) => 0,
+                Err(e) => e,
+            };
+        }
+    }
     err::EOPNOTSUPP
 }
 
-/// `accept(fd, addr, addrlen)` - see [`handle_listen`].
-pub(crate) fn handle_accept(_args: [usize; 6], _from_user: bool) -> isize {
-    err::EOPNOTSUPP
+/// `accept(fd, addr, addrlen)` - a unix listener hands out the connected
+/// socket a `connect` queued; see [`handle_listen`] for the network
+/// refusal. The flags of the `accept4` spelling ride through both
+/// parameters the modern call separates.
+pub(crate) fn handle_accept(args: [usize; 6], _from_user: bool) -> isize {
+    accept_common(args[0] as i32, args[1], args[2], 0)
+}
+
+/// The accept body for one set of descriptor flags (`SOCK_CLOEXEC |
+/// SOCK_NONBLOCK` as `accept4` spells them).
+fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isize {
+    const SOCK_CLOEXEC_F: usize = 0o200_0000;
+    const SOCK_NONBLOCK_F: usize = 0x800;
+    let listener_arc = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return crate::syscall::err_of(e),
+    };
+    // The borrow that asks "is this a unix socket, and which id" cannot
+    // outlive the statement; the id, and the Arc the registry hands back
+    // for it, can.
+    let Some(listener_id) = listener_arc.inode().as_unix().map(|sock| sock.id()) else {
+        return err::EOPNOTSUPP;
+    };
+    drop(listener_arc);
+    let listener = match crate::net::unix::by_id(listener_id) {
+        Some(sock) => sock,
+        None => return err::EBADF,
+    };
+    let nonblock = flags & SOCK_NONBLOCK_F != 0
+        || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    let id = match crate::net::unix::accept_face(&listener, nonblock) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    // The accepted socket arrives as a fresh descriptor on the same
+    // connected channel; `getsockname` on it answers the listener's name
+    // once the caller asks (the write-back below), and with an absent
+    // address it is simply a new fd.
+    let sock = match crate::net::unix::by_id(id) {
+        Some(sock) => sock,
+        None => return err::EBADF,
+    };
+    let new_fd = match crate::vfs::open_inode(sock) {
+        Ok(fd) => fd,
+        Err(e) => return crate::syscall::err_of(e),
+    };
+    if flags & SOCK_NONBLOCK_F != 0 && let Ok(file) = crate::sched::current_fds().clone_at(new_fd) {
+        file.set_status(crate::vfs::file::O_NONBLOCK);
+    }
+    if flags & SOCK_CLOEXEC_F != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(new_fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    // The caller's `addr`/`addrlen`, when present: the peer's name is the
+    // listener's bound path, which is what Linux writes back.
+    if addr_ptr != 0 && len_ptr != 0 {
+        crate::net::unix::write_name_by_id(id, addr_ptr, len_ptr);
+    }
+    new_fd as isize
 }
 
 /// `accept4(fd, addr, addrlen, flags)` - `accept` with the two flags the
@@ -1527,6 +1698,13 @@ pub(crate) fn handle_accept4(args: [usize; 6], from_user: bool) -> isize {
     const SOCK_NONBLOCK: usize = 0x800;
     if args[3] & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
         return err::EINVAL;
+    }
+    // The flags belong to the descriptor an accepted socket arrives on -
+    // a unix listener honours them; the network refusal stays.
+    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
+        if file.inode().as_unix().is_some() {
+            return accept_common(args[0] as i32, args[1], args[2], args[3]);
+        }
     }
     handle_accept(args, from_user)
 }
@@ -1791,9 +1969,35 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
 }
 
 /// `getsockname(fd, addr, addrlen)`.
+/// Read a `sockaddr_un` of at most the header's whole size, as far as the
+/// caller's `addrlen` reaches. The length bounds are the parser's question
+/// (it owns the family and path rules); this reads the bytes and lets it
+/// answer them.
+fn read_sockaddr_un(ptr: usize, len: usize, from_user: bool) -> Result<alloc::vec::Vec<u8>, isize> {
+    if ptr == 0 || len < 3 || len > 2 + crate::net::unix::SUN_PATH_MAX {
+        return Err(err::EINVAL);
+    }
+    if !crate::syscall::buffer_ok(ptr, len, false, from_user) {
+        return Err(err::EFAULT);
+    }
+    let mut raw = alloc::vec![0u8; len];
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, raw.as_mut_ptr(), len);
+    }
+    Ok(raw)
+}
+
 pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
     let fd = args[0] as i32;
     let (addr_ptr, len_ptr) = (args[1], args[2]);
+    // A unix socket's name is its bind path (or the empty name before it),
+    // written back in `sockaddr_un` form with the in-out length the
+    // man page spells.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        if let Some(sock) = file.inode().as_unix() {
+            return crate::net::unix::write_name(sock, addr_ptr, len_ptr);
+        }
+    }
     // A route-netlink session names itself with a `sockaddr_nl`, not a
     // `sockaddr_in`. The port id `bind` assigned is the one thing a caller
     // needs from here: fastfetch's default-route probe reads it back and
@@ -1874,6 +2078,20 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
 pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
     let fd = args[0] as i32;
     let (addr_ptr, len_ptr) = (args[1], args[2]);
+    // A unix stream's peer carries no name of its own in this kernel: the
+    // client never binds, and the accepted half is a fresh anonymous end -
+    // so the answer is the empty `AF_UNIX` sockaddr Linux gives for an
+    // unnamed socket. An unconnected one has no peer to name at all,
+    // which is `ENOTCONN` and not an empty answer: "nobody is there" is
+    // a different fact from "everybody is anonymous".
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        if let Some(sock) = file.inode().as_unix() {
+            if sock.unix_end().is_none() {
+                return err::ENOTCONN;
+            }
+            return crate::net::unix::write_name(sock, addr_ptr, len_ptr);
+        }
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -1935,6 +2153,24 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
     // A `socketpair` end is not in the network stack - it is a pair of buffers
     // with no address and no connection - so its half-close is done on the
     // node itself. Everything else is a network socket, or is not one at all.
+    // A connected unix socket half-closes through the same channel a
+    // socketpair end does - the `unix_end` the file doors already route by.
+    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
+        if file.inode().unix_id() != 0 {
+            let Some(end) = file.inode().unix_end() else {
+                // ENOTCONN is Linux's answer to shutdown on a socket that
+                // never connected; an unconnected unix fd is exactly that.
+                return err::ENOTCONN;
+            };
+            if how == SHUT_RD || how == SHUT_RDWR {
+                end.shut_read();
+            }
+            if how == SHUT_WR || how == SHUT_RDWR {
+                end.shut_write();
+            }
+            return 0;
+        }
+    }
     if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
         && let Some(end) = file.inode().as_duplex()
     {

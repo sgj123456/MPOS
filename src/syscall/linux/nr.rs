@@ -318,6 +318,13 @@ pub const EPOLL_PWAIT2: u64 = 441;
 /// descriptor - the wait `systemd`'s timer units and every poll loop with
 /// a deadline are built on.
 pub const TIMERFD_CREATE: u64 = 283;
+/// `inotify_init1(2)`: an event queue for filesystem news, with the flag
+/// spelling. `mdev`/`udev`, `dbus` and every config re-reader start here.
+pub const INOTIFY_INIT1: u64 = 294;
+/// `inotify_add_watch(2)`: watch one inode for the events a mask names.
+pub const INOTIFY_ADD_WATCH: u64 = 254;
+/// `inotify_rm_watch(2)`: drop one watch by its descriptor.
+pub const INOTIFY_RM_WATCH: u64 = 255;
 /// `timerfd_settime(2)`: arm, re-arm or disarm one.
 pub const TIMERFD_SETTIME: u64 = 286;
 /// `timerfd_gettime(2)`: what is left of the current span, and the interval.
@@ -760,6 +767,10 @@ mod tests {
         assert_eq!(TIMERFD_CREATE, 283);
         assert_eq!(TIMERFD_SETTIME, 286);
         assert_eq!(TIMERFD_GETTIME, 287);
+        // The inotify triple: the queue, the watch in and the watch out.
+        assert_eq!(INOTIFY_INIT1, 294);
+        assert_eq!(INOTIFY_ADD_WATCH, 254);
+        assert_eq!(INOTIFY_RM_WATCH, 255);
         // File I/O: allocate, copy, the vectored pair with advice, the
         // extensible open, and the *at and legacy spellings.
         assert_eq!(FALLOCATE, 285);
