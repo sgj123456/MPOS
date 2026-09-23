@@ -104,7 +104,8 @@ pub(crate) use self::extent::EXTENT_MAGIC;
 pub(crate) use self::inode::INODE_SIZE_HIGH;
 #[cfg(test)]
 pub(crate) use self::super_block::{
-    INCOMPAT_64BIT, INCOMPAT_EXTENTS, INCOMPAT_FILETYPE, ROCOMPAT_METADATA_CSUM,
+    COMPAT_HAS_JOURNAL, COMPAT_ORPHAN_FILE, INCOMPAT_64BIT, INCOMPAT_EXTENTS, INCOMPAT_FILETYPE,
+    ROCOMPAT_METADATA_CSUM, STATE_VALID_FS,
 };
 
 /// The filesystem state shared by every inode of one mount.
@@ -151,6 +152,17 @@ impl Core {
         let mut bytes = [0u8; SUPERBLOCK_BYTES];
         dev.read_at(SUPERBLOCK_AT, &mut bytes);
         let sb = Super::parse(&bytes)?;
+        // The format has just decided the mount's mode; say which half of
+        // that decision the caller did not ask for. A journal this driver
+        // does not maintain, and a volume whose clean-unmount marker never
+        // arrived, are both readable - and writing either is what tomorrow's
+        // fsck would have to undo.
+        #[cfg(target_os = "none")]
+        if sb.has_journal {
+            crate::console::print_args(format_args!(
+                "ext4: volume has a journal; mounted read-only until the journal is maintained\n"
+            ));
+        }
         let groups =
             (sb.blocks_count - sb.first_data_block as u64).div_ceil(sb.blocks_per_group as u64);
         let groups = u32::try_from(groups)
@@ -952,6 +964,7 @@ mod tests {
             put32(disk, sb + 36, 8192); // frags_per_group
             put32(disk, sb + 40, inodes as u32); // inodes_per_group
             put16(disk, sb + 56, MAGIC);
+            put16(disk, sb + 58, 0x0001); // s_state: cleanly unmounted
             put16(disk, sb + 58, 1); // clean
             put32(disk, sb + 76, 1); // rev 1
             put32(disk, sb + 84, 11); // first_ino
@@ -2186,6 +2199,7 @@ mod tests {
             put32(disk, sb + 36, 8192);
             put32(disk, sb + 40, EXT4_INODES); // inodes_per_group
             put16(disk, sb + 56, MAGIC);
+            put16(disk, sb + 58, 0x0001); // s_state: cleanly unmounted
             put16(disk, sb + 58, 1); // clean
             put32(disk, sb + 76, 1); // rev 1
             put32(disk, sb + 84, 11); // first_ino
@@ -2488,6 +2502,64 @@ mod tests {
             Ok(_) => panic!("a write went through on a checksummed filesystem"),
             Err(other) => panic!("refused as read-only, not as {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_volume_with_a_journal_mounts_read_only_and_stays_that_way() {
+        // `has_journal` is a *compat* bit - the old table never even read
+        // word 92 - and a journal nobody maintains means today's bypassing
+        // write is what tomorrow's Linux replay scribbles over. Read-only
+        // until the journal milestone is the honest answer.
+        let dev = format_ext4();
+        ext4_feature(&dev, 1024 + 92, COMPAT_HAS_JOURNAL);
+        let fs = mounted(Arc::new(dev));
+        assert!(fs.read_only(), "a journaled volume is not ours to write");
+        fs.set_read_only(false);
+        assert!(fs.read_only(), "and the refusal does not wash off");
+        assert_eq!(
+            read_all(&*fs.root().lookup("hello").expect("hello"), 11),
+            b"hello world".to_vec(),
+            "a volume worth reading is read"
+        );
+    }
+
+    #[test]
+    fn a_volume_never_marked_cleanly_unmounted_mounts_read_only() {
+        let dev = Arc::new(format_ext4());
+        // Clear EXT2_VALID_FS from s_state: the marker a crash leaves behind.
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            disk[1024 + 58] = 0;
+        });
+        let fs = mounted(dev.clone());
+        assert!(fs.read_only(), "mid-repair is not a state to write through");
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            disk[1024 + 58] = STATE_VALID_FS as u8;
+        });
+        assert!(
+            !mounted(dev).read_only(),
+            "the refusal belongs to the marker, not to the volume"
+        );
+    }
+
+    #[test]
+    fn the_modern_compat_table_tolerates_orphan_file_and_refuses_the_unknown() {
+        // A default 2026 mke2fs image sets compat 0x103c - journal, attr,
+        // resize, dir_index, orphan_file. Refusing the last one would refuse
+        // every modern volume over a bit this driver simply never writes.
+        let dev = format_ext4();
+        ext4_feature(&dev, 1024 + 92, COMPAT_ORPHAN_FILE);
+        let fs = mounted(Arc::new(dev));
+        assert!(!fs.read_only(), "orphan_file is a bit we leave alone");
+        // The same word with an un-named bit is a format we have not read
+        // the meaning of: refusal, not guesswork.
+        let dev = format_ext4();
+        ext4_feature(&dev, 1024 + 92, 1 << 7);
+        assert!(
+            Ext4Fs::mount(Arc::new(dev)).is_err(),
+            "an unknown compat bit refuses the mount"
+        );
     }
 
     /// A real file as a block device, for the one test that holds ground

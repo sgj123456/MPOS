@@ -61,4 +61,15 @@ pub trait BlockDev: Send + Sync {
 
     /// Write whole sectors from `buf`, under the same contract as [`read_at`].
     fn write_at(&self, offset: u64, buf: &[u8]);
+
+    /// Ask the device to push whatever it has cached to stable media. A
+    /// filesystem that promises a commit point - a journal, or even just
+    /// "these bytes are on the disk" - says this between the writes whose
+    /// order it needs remembered. `false` means the device has no such
+    /// concept, and the caller keeps the ordering guarantees the transport
+    /// happens to give it; `true` is the answer from a device that either
+    /// caches nothing (RAM) or has now flushed what it cached.
+    fn flush(&self) -> bool {
+        true
+    }
 }

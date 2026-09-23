@@ -70,6 +70,37 @@ pub(crate) const ROCOMPAT_METADATA_CSUM: u32 = 1 << 10;
 /// Group descriptors carry a checksum, for the same reason and with the same
 /// consequence: `bump_free` rewrites a descriptor on every allocation.
 pub(crate) const ROCOMPAT_GDT_CSUM: u32 = 1 << 4;
+/// The compatible features, which by their own definition a reader may
+/// ignore - except the two that decide whether writing is safe at all:
+/// a filesystem with a journal must not be written by a driver that does not
+/// maintain the journal, and one whose mount state says it was not unmounted
+/// cleanly may be mid-repair. Both force the read-only answer below.
+pub(crate) const COMPAT_DIR_PREALLOC: u32 = 1 << 0;
+pub(crate) const COMPAT_IMAGIC_INODES: u32 = 1 << 1;
+pub(crate) const COMPAT_HAS_JOURNAL: u32 = 1 << 2;
+pub(crate) const COMPAT_EXTENDED_ATTR: u32 = 1 << 3;
+pub(crate) const COMPAT_RESIZE_INODE: u32 = 1 << 4;
+pub(crate) const COMPAT_DIR_INDEX: u32 = 1 << 5;
+/// The modern orphan tracking: deleted-open inodes chained through inode 11
+/// instead of the classic list head. This driver frees at unlink and never
+/// writes either form, so seeing the bit costs nothing - but it is a named
+/// bit, not a mystery, and the mount table stays honest about it.
+pub(crate) const COMPAT_ORPHAN_FILE: u32 = 1 << 12;
+/// The compat bits this driver can see and still honour: prealloc and attr
+/// and dir-index and resize are writes it simply does not make use of;
+/// `has_journal` is read-only until the journal milestone lands. `imagic`
+/// redefines what the reserved inodes *are*, so it joins the refused set
+/// below rather than this one.
+pub(crate) const COMPAT_SUPPORTED: u32 = COMPAT_DIR_PREALLOC
+    | COMPAT_HAS_JOURNAL
+    | COMPAT_EXTENDED_ATTR
+    | COMPAT_RESIZE_INODE
+    | COMPAT_DIR_INDEX
+    | COMPAT_ORPHAN_FILE;
+pub(crate) const COMPAT_REFUSED: u32 = COMPAT_IMAGIC_INODES;
+/// `EXT2_VALID_FS`: `s_state` without it means the volume was not unmounted
+/// cleanly - the crash marker every fsck honors.
+pub(crate) const STATE_VALID_FS: u16 = 0x0001;
 
 /// `EXT2_FLAGS_UNSIGNED_HASH` in the superblock: the tree's hashes were made
 /// with unsigned character semantics, which renumbers the stored hash
@@ -108,6 +139,10 @@ pub(crate) struct Super {
     /// refused write rather than by failing outright: an image worth reading
     /// is worth reading.
     pub(crate) must_read_only: bool,
+    /// Whether this filesystem carries a journal at all. Read here so the
+    /// mount can say out loud what it will not be maintaining, and so the
+    /// journal milestone has one place to grow from.
+    pub(crate) has_journal: bool,
     /// The htree hash seed: four words at `s_hash_seed` (offset 236, past
     /// the journal fields the rev-1 layout grew), salt shared by every
     /// directory index on this filesystem.
@@ -142,14 +177,32 @@ impl Super {
         // has to be decided once, here, where the bits are still on screen.
         let incompat = le32(bytes, 96);
         let ro_compat = le32(bytes, 100);
-        if incompat & INCOMPAT_REFUSED != 0 || ro_compat & ROCOMPAT_REFUSED != 0 {
+        let compat = le32(bytes, 92);
+        if incompat & INCOMPAT_REFUSED != 0
+            || ro_compat & ROCOMPAT_REFUSED != 0
+            || compat & COMPAT_REFUSED != 0
+        {
             return Err("ext4 carries features this driver refuses rather than misreads");
         }
         if incompat & !INCOMPAT_SUPPORTED != 0 || ro_compat & !ROCOMPAT_SUPPORTED != 0 {
             return Err("ext4 carries features this driver does not know about");
         }
+        if compat & !COMPAT_SUPPORTED != 0 {
+            return Err("ext4 carries compatible features this driver does not know about");
+        }
         let has_64bit = incompat & INCOMPAT_64BIT != 0;
+        // A dirty volume is one a write would finish corrupting, not one we
+        // choose to spare: a journal nobody maintains leaves tomorrow's
+        // Linux replay to scribble over today's bypassing writes, and a
+        // volume that never recorded a clean unmount may be mid-repair.
+        // Until the journal milestone replays and maintains, both answer
+        // read-only. (`has_journal` is a *compat* bit; the incompat RECOVER
+        // below is the ext3-era dirty spelling, honored for old images.)
+        let has_journal = compat & COMPAT_HAS_JOURNAL != 0;
+        let state = le16(bytes, 58);
         let must_read_only = incompat & INCOMPAT_RECOVER != 0
+            || state & STATE_VALID_FS == 0
+            || has_journal
             || ro_compat & (ROCOMPAT_METADATA_CSUM | ROCOMPAT_GDT_CSUM) != 0;
         let (inode_size, first_ino) = match le32(bytes, 76) {
             0 => (128, 11),
@@ -192,6 +245,7 @@ impl Super {
             has_extents: incompat & INCOMPAT_EXTENTS != 0,
             has_64bit,
             must_read_only,
+            has_journal,
             hash_seed: [
                 le32(bytes, 236),
                 le32(bytes, 240),
