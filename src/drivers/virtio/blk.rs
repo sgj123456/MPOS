@@ -146,6 +146,16 @@ impl BlockDev for VirtioBlk {
         }
         self.write_dma(offset, buf);
     }
+
+    fn flush(&self) -> bool {
+        // The Flush request carries no data; an error answer (or a device
+        // that never advertised VIRTIO_BLK_F_FLUSH) says the transport
+        // promises no ordering beyond what it already gave the writes.
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            device.flush().is_ok()
+        })
+    }
 }
 
 impl VirtioBlk {

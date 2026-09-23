@@ -64,6 +64,10 @@ impl BlockDev for Window {
     fn write_at(&self, offset: u64, buf: &[u8]) {
         self.inner.write_at(self.base + offset, buf);
     }
+
+    fn flush(&self) -> bool {
+        self.inner.flush()
+    }
 }
 
 /// The filesystem on `dev`, as a device scoped to whichever partition holds
