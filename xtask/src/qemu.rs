@@ -106,10 +106,15 @@ pub fn machine_args(
     // The name the guest's DHCP client reports, and the network the socket
     // tests are written against: `/init` brings eth0 up with the address slirp
     // expects, and `t-socket`, `t-tcp` and `t-udp` then talk to the host
-    // through it.
+    // through it. A configured `dns` names the server behind `10.0.2.3`;
+    // without it slirp follows the host's own resolver file.
+    let mut netdev = format!("user,id=n0,hostname={}", config.hostname);
+    if let Some(dns) = config.dns.as_deref() {
+        netdev.push_str(&format!(",dns={dns}"));
+    }
     args.extend([
         "-netdev".into(),
-        format!("user,id=n0,hostname={}", config.hostname),
+        netdev,
         "-device".into(),
         "virtio-net-pci,netdev=n0".into(),
     ]);
@@ -273,6 +278,7 @@ mod tests {
             memory: memory.to_string(),
             cpus,
             hostname: "probe".to_string(),
+            dns: None,
             extra_args: extra.iter().map(|arg| arg.to_string()).collect(),
         }
     }
@@ -346,10 +352,24 @@ mod tests {
             .find(|arg| arg.starts_with("user,id=n0"))
             .expect("the network is on the command line");
         assert!(netdev.contains("hostname=probe"), "{netdev}");
+        // No `dns` configured, no `dns=` on the line: slirp follows the host.
+        assert!(!netdev.contains("dns="), "{netdev}");
         assert_eq!(
             args.last().map(String::as_str),
             Some("-enable-kvm"),
             "the escape hatch is appended after everything computed: {args:?}"
         );
+    }
+
+    #[test]
+    fn a_configured_dns_names_the_nameserver_behind_10_0_2_3() {
+        let mut config = config("1024", 1, &[]);
+        config.dns = Some("172.16.0.1".to_string());
+        let args = args(&config, Boot::Image(PathBuf::from("/build/mpos.img")));
+        let netdev = args
+            .iter()
+            .find(|arg| arg.starts_with("user,id=n0"))
+            .expect("the network is on the command line");
+        assert!(netdev.contains("dns=172.16.0.1"), "{netdev}");
     }
 }

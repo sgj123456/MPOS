@@ -44,6 +44,14 @@ pub struct QemuConfig {
     /// `hostname` the rootfs config writes into the image: one machine has one
     /// name, and the file has one key for it.
     pub hostname: String,
+    /// The address QEMU's user-mode network answers as the guest's `10.0.2.3`.
+    /// Unset, slirp forwards to whatever the host's `/etc/resolv.conf` names -
+    /// and a host whose resolver is a loopback stub (`127.0.0.53`,
+    /// systemd-resolved) hands the guest a nameserver behind that stub's own
+    /// queue, which answers only sometimes: the guest sees `bad address` until
+    /// one lookup gets through. Naming a reachable server here keeps slirp's
+    /// forwarding on the network.
+    pub dns: Option<String>,
     /// Passed through to `qemu-system-x86_64` verbatim, after everything this
     /// crate computes. The escape hatch for the one option a run needs and
     /// this file does not name.
@@ -132,6 +140,7 @@ impl QemuConfig {
                 .and_then(|text| text.trim().parse().ok())
                 .unwrap_or(1),
             hostname,
+            dns: values.remove("dns").filter(|text| !text.trim().is_empty()),
             extra_args: take_list(values, "extra_args", &[]),
         }
     }
