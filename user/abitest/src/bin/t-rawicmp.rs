@@ -50,6 +50,13 @@ fn cmsg_int(ctl: &[u8]) -> i32 {
     unsafe { (ctl.as_ptr().add(16) as *const i32).read_unaligned() }
 }
 
+/// Monotonic milliseconds, for a per-answer clock.
+fn ms() -> u64 {
+    let mut ts: lin::TimeSpec = unsafe { core::mem::zeroed() };
+    lin::clock_gettime(lin::CLOCK_MONOTONIC, &mut ts);
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-rawicmp\n");
@@ -83,6 +90,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         let cs = icmp_cksum(&pkt[..28]);
         pkt[2] = (cs >> 8) as u8;
         pkt[3] = cs as u8;
+        let t0 = ms();
         let sent = lin::sendto(fd, &pkt[..28], 0, Some(&PEER));
         if sent != 28 {
             lin::puts(b"FAIL: echo request did not leave: ");
@@ -110,6 +118,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             msg_flags: 0,
         };
         let n = lin::recvmsg(fd, &mut hdr, 0);
+        let rtt = ms().saturating_sub(t0);
         if n < 0 {
             lin::puts(b"FAIL: no echo answer: ");
             lin::puts_isize(n);
@@ -119,7 +128,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         }
         lin::puts(b"seq ");
         lin::puts_isize(seq as isize);
-        lin::puts(b": n=");
+        lin::puts(b": rtt=");
+        lin::puts_isize(rtt as isize);
+        lin::puts(b"ms n=");
         lin::puts_isize(n);
         lin::puts(b" ver_ihl=");
         lin::puts_isize(buf[0] as isize);
