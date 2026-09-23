@@ -111,6 +111,26 @@ pub fn raw_sys2(number: u64, a1: usize, a2: usize) -> isize {
     sys2(number, a1, a2)
 }
 
+/// The five- and six-argument forms: `setsockopt` and `sendmsg` shaped
+/// calls, whose later registers the three-argument escape cannot fill.
+pub fn raw_sys5(number: u64, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") number as isize => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 fn sys2(number: u64, a1: usize, a2: usize) -> isize {
     let ret: isize;
     unsafe {
@@ -1880,8 +1900,49 @@ const SYS_BIND: u64 = 49;
 const SYS_LISTEN: u64 = 50;
 const SYS_GETSOCKNAME: u64 = 51;
 const SYS_GETPEERNAME: u64 = 52;
+const SYS_RECVMSG: u64 = 47;
 const SYS_SETSOCKOPT: u64 = 54;
 const SYS_GETSOCKOPT: u64 = 55;
+
+/// `struct iovec`: one segment of a scatter-gather buffer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IoVec {
+    pub base: usize,
+    pub len: usize,
+}
+
+/// `struct msghdr` of the x86_64 ABI: 56 bytes, with the padding word
+/// after `msg_namelen` the ABI carries.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MsgHdr {
+    pub msg_name: usize,
+    pub msg_namelen: u32,
+    pub _pad: u32,
+    pub msg_iov: usize,
+    pub msg_iovlen: usize,
+    pub msg_control: usize,
+    pub msg_controllen: usize,
+    pub msg_flags: usize,
+}
+
+/// `recvmsg(fd, msg, flags)`.
+pub fn recvmsg(fd: i32, msg: &mut MsgHdr, flags: usize) -> isize {
+    raw_sys(SYS_RECVMSG, fd as usize, msg as *mut MsgHdr as usize, flags)
+}
+
+/// `setsockopt(fd, level, optname, &val, 4)` for the int-valued options.
+pub fn setsockopt_int(fd: i32, level: usize, opt: usize, val: i32) -> isize {
+    raw_sys5(
+        SYS_SETSOCKOPT,
+        fd as usize,
+        level,
+        opt,
+        &val as *const i32 as usize,
+        4,
+    )
+}
 
 /// `socket(domain, type, protocol)` — a descriptor for a channel of the
 /// named family and kind.

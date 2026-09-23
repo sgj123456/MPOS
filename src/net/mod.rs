@@ -139,6 +139,11 @@ pub(crate) struct SockOpts {
     pub reuseaddr: bool,
     pub keepalive: bool,
     pub nodelay: bool,
+    /// `IP_RECVTTL`: every received message also carries the hop count it
+    /// arrived with, as a control message. `ping` reads its `ttl=` field
+    /// from exactly that, and prints a stack word of garbage when the
+    /// answer it asked for never comes.
+    pub recv_ttl: bool,
     /// `struct linger`'s two fields, kept apart so `getsockopt` can rebuild it.
     pub linger_on: bool,
     pub linger_sec: i32,
@@ -156,6 +161,7 @@ impl Default for SockOpts {
             reuseaddr: false,
             keepalive: false,
             nodelay: false,
+            recv_ttl: false,
             linger_on: false,
             linger_sec: 0,
             rcvbuf: SOCK_BUF_DEFAULT,

@@ -65,6 +65,11 @@ const SO_KEEPALIVE: usize = 9;
 const SO_LINGER: usize = 13;
 const SOL_TCP: usize = 6;
 const TCP_NODELAY: usize = 1;
+/// The IP level's number, and its one option this kernel models: a socket
+/// that asks for `IP_RECVTTL` is told, message by message, the hop count
+/// the packet arrived with - `ping`'s `ttl=` comes from nowhere else.
+const SOL_IP: usize = 0;
+const IP_RECVTTL: usize = 12;
 
 /// The keep-alive probe interval `SO_KEEPALIVE` arms smoltcp with when it is
 /// turned on. Linux's default `TCP_KEEPINTVL` - the pace the socket holds to
@@ -84,6 +89,14 @@ const UNSPECIFIED_ENDPOINT: IpEndpoint = IpEndpoint {
 /// Where `msg_flags` sits in a 56-byte `struct msghdr` on x86_64.
 const MSGHDR_SIZE: usize = 56;
 const MSGHDR_FLAGS: usize = 48;
+/// `msg_control` (a pointer) and `msg_controllen` (a `size_t` in-out) at
+/// their offsets in the same layout.
+const MSGHDR_CONTROL: usize = 32;
+const MSGHDR_CONTROLLEN: usize = 40;
+/// The size of one `IP_RECVTTL` control message on x86_64: a 16-byte
+/// `cmsghdr` (two `size_t`-aligned ints follow the length) plus the one
+/// `int` of data, the total padded to word size.
+const CMSG_RECVTTL_LEN: usize = 24;
 
 // ---------------------------------------------------------------------------
 // The inode
@@ -1158,9 +1171,47 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         n if n >= 0 => n as usize,
         e => return e,
     };
-    // A received message carries no control data or exceptional flags here.
     if !crate::syscall::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
         return err::EFAULT;
+    }
+    // The one control message this kernel knows is `IP_RECVTTL`: a raw
+    // socket that asked to be told the hop count gets it as the control
+    // buffer's sole entry, read out of the IP header that rides at the
+    // front of every received raw packet. (UDP cannot carry it the same
+    // way: smoltcp hands a datagram socket no view of the header its
+    // packet arrived under - a recorded divergence.) Every other answer
+    // carries no control data, and the length says so: a caller that
+    // trusted its own stale `msg_controllen` would otherwise walk a
+    // control buffer the kernel never filled - which is exactly how
+    // `ping` came to print a word of stack garbage as its ttl.
+    let want_ttl = super::with(handle, |_, entry| match entry.channel {
+        Channel::Raw { .. } => entry.opts.recv_ttl,
+        _ => false,
+    })
+    .unwrap_or(false);
+    let control = unsafe { ((msghdr + MSGHDR_CONTROL) as *const usize).read_volatile() };
+    let capacity =
+        unsafe { ((msghdr + MSGHDR_CONTROLLEN) as *const u64).read_volatile() } as usize;
+    let mut attached = false;
+    if want_ttl && n >= 20 && control != 0 && capacity >= CMSG_RECVTTL_LEN {
+        if !crate::syscall::buffer_ok(control, CMSG_RECVTTL_LEN, true, from_user) {
+            return err::EFAULT;
+        }
+        let ttl = out[8] as u32;
+        unsafe {
+            let at = |offset: usize| (control + offset) as *mut u8;
+            (at(0) as *mut u64).write_unaligned(CMSG_RECVTTL_LEN as u64); // cmsg_len
+            (at(8) as *mut i32).write_unaligned(SOL_IP as i32); // cmsg_level
+            (at(12) as *mut i32).write_unaligned(IP_RECVTTL as i32); // cmsg_type
+            (at(16) as *mut u32).write_unaligned(ttl); // the hop limit, as an int
+            ((msghdr + MSGHDR_CONTROLLEN) as *mut u64).write_volatile(CMSG_RECVTTL_LEN as u64);
+        }
+        attached = true;
+    }
+    if !attached && control != 0 {
+        unsafe {
+            ((msghdr + MSGHDR_CONTROLLEN) as *mut u64).write_volatile(0);
+        }
     }
     unsafe {
         ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(0);
@@ -1305,9 +1356,10 @@ fn udp_recv(
 // raw IP sockets
 // ---------------------------------------------------------------------------
 
-/// Send a raw IP packet. The caller provides the ICMP payload; we prepend
-/// the 20-byte IPv4 header and hand the complete packet to smoltcp's raw
-/// socket. A destination address is mandatory for raw sockets (there is no
+/// Send a raw IP packet. As on Linux's IPv4 raw socket without
+/// `IP_HDRINCL`, the caller hands over the *protocol payload* (an ICMP
+/// message, say) and the kernel builds the IPv4 header in front of it.
+/// A destination address is mandatory for raw sockets (there is no
 /// `connect` to pin one).
 fn raw_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
     let target = match dst {
@@ -1372,9 +1424,12 @@ fn raw_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
     }
 }
 
-/// Receive a raw IP packet. The smoltcp raw socket delivers complete IP
-/// packets; we strip the 20-byte header and return only the ICMP payload
-/// to the caller - matching what Linux does for `SOCK_RAW, IPPROTO_ICMP`.
+/// Receive a raw IP packet. As on Linux, the caller is handed the complete
+/// IPv4 packet - header and all: `ping` reads its `ttl=` out of that header
+/// and filters by its protocol byte, and a delivery that starts at the ICMP
+/// octets instead hands every one of those reads the wrong bytes (which is
+/// how a stable peer's replies came to print a ttl that wandered the whole
+/// 0..=255 range).
 fn raw_recv(
     handle: usize,
     out: &mut [u8],
@@ -1382,7 +1437,7 @@ fn raw_recv(
 ) -> Result<(usize, Option<IpEndpoint>), isize> {
     loop {
         // Receive into a temporary buffer inside the `with` closure, then
-        // copy the ICMP payload to the caller's buffer.
+        // copy the whole packet to the caller's buffer.
         let result: Option<Result<(usize, Option<IpEndpoint>), isize>> =
             super::with(handle, |stack, entry| {
                 stack.poll_once();
@@ -1401,23 +1456,21 @@ fn raw_recv(
                     Err(raw_sock::RecvError::Truncated) => return Err(err::EMSGSIZE),
                 };
                 tmp.truncate(n);
-                // Strip the IPv4 header: the minimum IHL is 5 (20 bytes).
-                if n < 20 {
-                    return Err(err::EINVAL);
-                }
-                let ihl = ((tmp[0] & 0x0F) as usize) * 4;
-                if ihl > n {
-                    return Err(err::EINVAL);
-                }
-                let payload = &tmp[ihl..];
-                if payload.len() > out.len() {
+                if n > out.len() {
                     return Err(err::EMSGSIZE);
                 }
-                // Build the source address from the IP header.
-                let src = IpEndpoint::new(IpAddress::v4(tmp[12], tmp[13], tmp[14], tmp[15]), 0);
-                // Copy payload to caller's buffer.
-                out[..payload.len()].copy_from_slice(payload);
-                Ok((payload.len(), Some(src)))
+                // The source address is the IP header's sender, which is
+                // also what Linux's `recvfrom` names for a raw socket.
+                let src = if n >= 20 {
+                    Some(IpEndpoint::new(
+                        IpAddress::v4(tmp[12], tmp[13], tmp[14], tmp[15]),
+                        0,
+                    ))
+                } else {
+                    None
+                };
+                out[..n].copy_from_slice(&tmp);
+                Ok((n, src))
             });
         match result {
             Some(Ok((n, ep))) => return Ok((n, ep)),
@@ -2275,6 +2328,7 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                     stack.sockets.get_mut::<tcp::Socket>(h).set_nagle_enabled(val == 0);
                 }
             }
+            (SOL_IP, IP_RECVTTL) => entry.opts.recv_ttl = val != 0,
             // An option this stack does not model is accepted and forgotten, the
             // way a lenient kernel lets a caller set an exotic one and ignore it.
             _ => {}
@@ -2343,6 +2397,9 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
         }
         (SOL_TCP, TCP_NODELAY) => {
             super::with(handle, |_, entry| entry.opts.nodelay as i32).unwrap_or(0)
+        }
+        (SOL_IP, IP_RECVTTL) => {
+            super::with(handle, |_, entry| entry.opts.recv_ttl as i32).unwrap_or(0)
         }
         // An unmodelled option reads as unset (zero), matching the permissive
         // `setsockopt` above rather than answering ENOPROTOOPT.

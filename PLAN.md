@@ -299,6 +299,15 @@ clients, which is the next milestone for this family.
 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is served by a raw smoltcp socket
 (`alloc_socket` → `add_raw` + `ip_to_smoltcp_protocol`), giving `ping` its echo
 request/reply path; the `t-udp` resolver test exercises the raw/UDP read path.
+The socket now speaks Linux's exact shape both ways: `sendto` takes the
+protocol payload and the kernel builds the IPv4 header (no `IP_HDRINCL`
+needed), and receives deliver the **complete IP packet** - the earlier
+header-stripped delivery is what made busybox's `ping` print a ttl wandering
+0..255 (it reads `iphdr->ttl` at offset 8, which fell inside the echo data).
+`IP_RECVTTL` is honoured too (setsockopt stored, the answer attached as a
+24-byte cmsg, and `msg_controllen` zeroed when a message carries no control
+data). `t-rawicmp` pins the delivered bytes; `t-dns`/`t-stdresolve` pin the
+resolver's UDP path (12/12 raw queries, 20/20 musl `getaddrinfo`).
 
 Current: auto echo reply only. No user-facing ICMP socket.
 
