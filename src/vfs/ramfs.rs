@@ -25,6 +25,25 @@ fn fresh_ino() -> Ino {
     NEXT_INO.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The wall clock in unix seconds, the same sum `gettimeofday` reports. A
+/// memory filesystem that stamps nothing makes every file it holds look
+/// older than 1970-adjacent files on disk: OpenRC read its freshly-written
+/// `/run/openrc/deptree` as epoch, declared clock skew against the real
+/// mtimes of `/etc/init.d`, and warned on every boot. On the host there is
+/// no clock, and the tests want one that moves - see the ext2 driver's
+/// equivalent.
+#[cfg(target_os = "none")]
+fn now() -> u64 {
+    crate::arch::rtc::boot_epoch() + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64
+}
+
+#[cfg(not(target_os = "none"))]
+fn now() -> u64 {
+    use core::sync::atomic::AtomicU32;
+    static HOST_NOW: AtomicU32 = AtomicU32::new(1_700_000_000);
+    HOST_NOW.fetch_add(1, Ordering::Relaxed) as u64
+}
+
 /// A file: bytes with no structure of their own.
 struct RamFile {
     ino: Ino,
@@ -40,6 +59,11 @@ struct RamFile {
     /// `chown` writes it, which is what a memory filesystem the kernel built
     /// for itself used to answer for everything.
     owner: Mutex<Cell<(u32, u32)>>,
+    /// The one clock this filesystem keeps, in unix seconds - stamped at
+    /// creation and moved by every write. `stat`'s atime and ctime report it
+    /// too, which is the trait's stated answer for a filesystem with a single
+    /// clock.
+    mtime: Mutex<Cell<u64>>,
     data: Mutex<RefCell<Vec<u8>>>,
 }
 
@@ -74,6 +98,17 @@ impl Inode for RamFile {
         critical_section::with(|cs| self.owner.borrow(cs).set((uid, gid)));
     }
 
+    fn mtime(&self) -> u64 {
+        critical_section::with(|cs| self.mtime.borrow(cs).get())
+    }
+
+    /// `utimensat`: the atime is accepted and dropped - one clock stands for
+    /// all three here - and the mtime is what `stat` will report.
+    fn set_times(&self, _atime: u64, mtime: u64) -> VfsResult<()> {
+        critical_section::with(|cs| self.mtime.borrow(cs).set(mtime));
+        Ok(())
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         critical_section::with(|cs| {
             let data = self.data.borrow(cs).borrow();
@@ -87,6 +122,7 @@ impl Inode for RamFile {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        let at = now();
         critical_section::with(|cs| {
             let mut data = self.data.borrow(cs).borrow_mut();
             let start = offset as usize;
@@ -100,6 +136,7 @@ impl Inode for RamFile {
                 data.resize(end, 0);
             }
             data[start..end].copy_from_slice(buf);
+            self.mtime.borrow(cs).set(at);
             Ok(buf.len())
         })
     }
@@ -108,8 +145,10 @@ impl Inode for RamFile {
     /// exactly what `Vec::resize` does, fill value included.
     fn truncate(&self, len: u64) -> VfsResult<()> {
         let len = usize::try_from(len).map_err(|_| VfsError::FileTooBig)?;
+        let at = now();
         critical_section::with(|cs| {
             self.data.borrow(cs).borrow_mut().resize(len, 0);
+            self.mtime.borrow(cs).set(at);
         });
         Ok(())
     }
@@ -119,6 +158,9 @@ impl Inode for RamFile {
 /// A symbolic link: nothing but the path it stands for.
 struct RamSymlink {
     ino: Ino,
+    /// The moment the link was made - all the clock a link, which has no
+    /// contents to rewrite, can have.
+    mtime: u64,
     target: String,
 }
 
@@ -129,6 +171,10 @@ impl Inode for RamSymlink {
             kind: NodeKind::Symlink,
             size: self.target.len() as u64,
         }
+    }
+
+    fn mtime(&self) -> u64 {
+        self.mtime
     }
 
     fn readlink(&self) -> VfsResult<String> {
@@ -169,6 +215,9 @@ struct RamDir {
     ino: Ino,
     mode: Mutex<Cell<Option<u32>>>,
     owner: Mutex<Cell<(u32, u32)>>,
+    /// Stamped when an entry is added or removed, as a directory's mtime is
+    /// on every real filesystem.
+    mtime: Mutex<Cell<u64>>,
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
 }
 
@@ -203,6 +252,15 @@ impl Inode for RamDir {
         critical_section::with(|cs| self.owner.borrow(cs).set((uid, gid)));
     }
 
+    fn mtime(&self) -> u64 {
+        critical_section::with(|cs| self.mtime.borrow(cs).get())
+    }
+
+    fn set_times(&self, _atime: u64, mtime: u64) -> VfsResult<()> {
+        critical_section::with(|cs| self.mtime.borrow(cs).set(mtime));
+        Ok(())
+    }
+
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
         critical_section::with(|cs| {
             self.entries
@@ -215,17 +273,20 @@ impl Inode for RamDir {
     }
 
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+        let at = now();
         let node: Arc<dyn Inode> = match kind {
             NodeKind::File => Arc::new(RamFile {
                 ino: fresh_ino(),
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+                mtime: Mutex::new(Cell::new(at)),
                 data: Mutex::new(RefCell::new(Vec::new())),
             }),
             NodeKind::Dir => Arc::new(RamDir {
                 ino: fresh_ino(),
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+                mtime: Mutex::new(Cell::new(at)),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
             // A device node mknod made: a placeholder until a devtmpfs mount
@@ -241,13 +302,16 @@ impl Inode for RamDir {
                 return Err(VfsError::Exists);
             }
             entries.insert(String::from(name), node.clone());
+            self.mtime.borrow(cs).set(at);
             Ok(node)
         })
     }
 
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+        let at = now();
         let node: Arc<dyn Inode> = Arc::new(RamSymlink {
             ino: fresh_ino(),
+            mtime: at,
             target: String::from(target),
         });
         critical_section::with(|cs| {
@@ -256,6 +320,7 @@ impl Inode for RamDir {
                 return Err(VfsError::Exists);
             }
             entries.insert(String::from(name), node.clone());
+            self.mtime.borrow(cs).set(at);
             Ok(node)
         })
     }
@@ -273,9 +338,12 @@ impl Inode for RamDir {
         if child.metadata().kind == NodeKind::Dir {
             return Err(VfsError::IsDir);
         }
+        let at = now();
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
-            entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)
+            entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)?;
+            self.mtime.borrow(cs).set(at);
+            Ok(())
         })
     }
 
@@ -289,12 +357,14 @@ impl Inode for RamDir {
         if target.metadata().kind == NodeKind::Dir {
             return Err(VfsError::Invalid);
         }
+        let at = now();
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
             if entries.contains_key(name) {
                 return Err(VfsError::Exists);
             }
             entries.insert(alloc::string::String::from(name), target.clone());
+            self.mtime.borrow(cs).set(at);
             Ok(())
         })
     }
@@ -313,9 +383,12 @@ impl Inode for RamDir {
         if !child.read_dir()?.is_empty() {
             return Err(VfsError::NotEmpty);
         }
+        let at = now();
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
-            entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)
+            entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)?;
+            self.mtime.borrow(cs).set(at);
+            Ok(())
         })
     }
 
@@ -343,6 +416,7 @@ impl RamFs {
                 ino: fresh_ino(),
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+                mtime: Mutex::new(Cell::new(now())),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
         })
@@ -513,6 +587,32 @@ mod tests {
         // Removing a name that is not there answers NoEntry.
         assert_eq!(root.unlink("f").err(), None);
         assert_eq!(root.unlink("gone").err(), Some(VfsError::NoEntry));
+    }
+
+    #[test]
+    fn nodes_carry_a_clock_that_writes_and_utimensat_move() {
+        let fs = RamFs::new();
+        let root = fs.root();
+        let file = root.create("f", NodeKind::File).unwrap();
+
+        let born = file.mtime();
+        assert_ne!(born, 0, "a new file is not from 1970");
+        assert!(root.mtime() >= born, "the directory knows it gained a name");
+
+        file.write_at(0, b"x").unwrap();
+        assert!(file.mtime() > born, "a write moves the clock");
+
+        file.set_times(111, 222).unwrap();
+        assert_eq!(file.mtime(), 222, "utimensat takes the caller's value");
+        assert_eq!(
+            file.atime(),
+            222,
+            "one clock stands for the read clock too"
+        );
+
+        // A symlink answers with its creation time; it has no write path.
+        let link = root.symlink("l", "/f").unwrap();
+        assert_ne!(link.mtime(), 0);
     }
 
     #[test]

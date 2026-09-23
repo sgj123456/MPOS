@@ -395,15 +395,15 @@ fn create_user(mount_dir: &Path, user: &UserConfig) -> Result<()> {
 
     // Busybox's `adduser -G` names ONE group and does not split a comma list,
     // so the old `-G mpos,wheel` looked up a group literally called "mpos,wheel"
-    // and died with "unknown group mpos,wheel". The supported shape instead:
-    // make each group, create the user on its own, then give it membership
-    // group by group with `addgroup USER GROUP`. Creating an existing group and
-    // adding a membership that is already there are both fine, so `addgroup`'s
-    // status is ignored; the `-D` user add is what must succeed.
-    for group in &user.groups {
-        addgroup_in_image(mount_dir, &[group.as_str()]);
-    }
-
+    // and died with "unknown group mpos,wheel". The supported shape is one
+    // membership per call - but the account first: `adduser` makes a group
+    // named after the user for its primary gid, and a group already sitting
+    // under that name reads back as "group 'mpos' in use" and fails the user
+    // add outright. So: create the account, then for each configured group
+    // make it if missing and give the user the membership. Creating an
+    // existing group and re-adding a membership that is there are both fine,
+    // so `addgroup`'s failures say a warning rather than stopping the build;
+    // the `-D` user add is the one step that must succeed.
     let status = Command::new("chroot")
         .arg(mount_dir)
         .args(["/usr/sbin/adduser", "-D", "-s", &user.shell])
@@ -415,6 +415,7 @@ fn create_user(mount_dir: &Path, user: &UserConfig) -> Result<()> {
     }
 
     for group in &user.groups {
+        addgroup_in_image(mount_dir, &[group.as_str()]);
         addgroup_in_image(mount_dir, &[user.name.as_str(), group.as_str()]);
     }
 
@@ -430,21 +431,43 @@ fn create_user(mount_dir: &Path, user: &UserConfig) -> Result<()> {
     Ok(())
 }
 
-/// Run busybox `addgroup` inside the image with these arguments, ignoring the
-/// outcome. One argument creates a group; two (`USER GROUP`) add an existing
-/// user to an existing group. Both are called only for their end state in
-/// `/etc/group`, so an "already exists" or "already a member" is success here.
+/// Run busybox `addgroup` inside the image with these arguments. One argument
+/// creates a group; two (`USER GROUP`) add an existing user to an existing
+/// group. Both are called only for their end state in `/etc/group`, so an
+/// "already exists" or "already a member" is success here.
+///
+/// The applet is named by absolute path, like `adduser` is: this image keeps
+/// the busybox user-management links in `/usr/sbin` alone, and the bare name
+/// resolves through the PATH the chroot inherits from the host - which is what
+/// made every call here "not found" while its own `adduser` succeeded.
 fn addgroup_in_image(mount_dir: &Path, args: &[&str]) {
     let mut cmd = Command::new("chroot");
     cmd.arg(mount_dir)
         .arg("/bin/sh")
         .arg("-c")
-        .arg("addgroup \"$@\" >/dev/null 2>&1 || :")
+        .arg("/usr/sbin/addgroup \"$@\"")
         .arg("addgroup");
     for arg in args {
         cmd.arg(arg);
     }
-    let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+    match cmd.output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // The two ways busybox says "already there": `addgroup GROUP` on
+            // a group that exists answers "group 'wheel' in use", and the
+            // membership forms report an existing entry as one that exists.
+            // Both are the end state these calls are after.
+            if !text.contains("exists") && !text.contains("in use") {
+                eprintln!("addgroup {:?} failed: {}", args, text.trim());
+            }
+        }
+        Err(e) => eprintln!("addgroup {:?} could not run: {}", args, e),
+    }
 }
 
 fn install_file(src: &Path, dst: &Path) -> Result<()> {

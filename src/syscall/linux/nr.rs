@@ -88,10 +88,9 @@ pub const GETPGID: u64 = 121;
 /// sessions - a process's group leader stands in, which is the answer a libc
 /// `setsid()` reads back to check its own work.
 pub const GETSID: u64 = 124;
-/// `setgroups(2)`: the supplementary groups. This kernel keeps no groups
-/// beyond the one each process belongs to, so login's "clear the extras"
-/// call is accepted and dropped - refusing it made every root login read
-/// back as a wrong password.
+/// `setgroups(2)`: the supplementary groups, kept per process on the
+/// identity and reported by `getgroups(2)` - the set a `:group` rule in
+/// `doas.conf` matches against, and what login's `initgroups` installs.
 pub const SETGROUPS: u64 = 116;
 pub const GETGROUPS: u64 = 115;
 pub const GETDENTS64: u64 = 217;

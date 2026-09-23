@@ -50,7 +50,9 @@ use crate::vfs::file::{FdTable, File};
 pub const MAX_TASKS: usize = 64;
 
 /// A process's user and group identity: the real, effective and saved id of
-/// each, which is the whole of what `setuid(2)`'s family manipulates.
+/// each, which is the whole of what `setuid(2)`'s family manipulates, plus
+/// the supplementary groups `setgroups(2)` names - what a `doas` rule for
+/// `:wheel` checks membership in.
 ///
 /// The real id is who started the process, the effective id is who it is
 /// acting as now, and the saved id is who it may go back to - the one
@@ -60,7 +62,7 @@ pub const MAX_TASKS: usize = 64;
 /// floor to stand on. The kernel still does not enforce file modes, so these
 /// are what the syscall family reads and writes - the honest half of the
 /// ownership model, with the permission half still to come.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Identity {
     /// The real user id: who the process was started as.
     pub ruid: u32,
@@ -75,6 +77,10 @@ pub struct Identity {
     pub egid: u32,
     /// The saved group id.
     pub sgid: u32,
+    /// The supplementary groups, in the order `setgroups(2)` was given them.
+    /// Empty until a privileged caller names some; `getgroups(2)` reports
+    /// this list and a `:group` rule in `doas.conf` matches against it.
+    pub groups: Vec<u32>,
 }
 
 /// Task stacks are `2^STACK_ORDER` pages. 64 KiB, because the kernel stack has
@@ -1581,7 +1587,7 @@ pub fn try_spawn_user(
             pgid: t.task(parent).pgid,
             session: t.task(parent).session,
             ctty: t.task(parent).ctty,
-            identity: t.task(parent).identity,
+            identity: t.task(parent).identity.clone(),
             umask: t.task(parent).umask,
             rlimits: t.task(parent).rlimits,
             seccomp_strict: t.task(parent).seccomp_strict,
@@ -2436,7 +2442,7 @@ pub fn controlling_tty_of_current() -> Option<(u32, u32)> {
 /// calls, and only the storage lives here.
 #[cfg(target_os = "none")]
 pub fn current_identity() -> Identity {
-    with_table(|t| t.task(t.current).identity)
+    with_table(|t| t.task(t.current).identity.clone())
 }
 
 /// Store the running task's identity. The caller has validated the change;
@@ -5192,7 +5198,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             // it, whatever its parent was doing when it copied itself.
             session: t.task(parent_id).session,
             ctty: t.task(parent_id).ctty,
-            identity: t.task(parent_id).identity,
+            identity: t.task(parent_id).identity.clone(),
             umask: t.task(parent_id).umask,
             rlimits: t.task(parent_id).rlimits,
             seccomp_strict: t.task(parent_id).seccomp_strict,
@@ -5598,7 +5604,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let pgid = parent.pgid;
         let session = parent.session;
         let ctty = parent.ctty;
-        let identity = parent.identity;
+        let identity = parent.identity.clone();
         let umask = parent.umask;
         let rlimits = parent.rlimits;
         let seccomp_strict = parent.seccomp_strict;

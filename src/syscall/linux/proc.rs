@@ -1427,8 +1427,8 @@ pub(super) fn handle_execve(
     } else {
         setuid_identity(&inode)
     };
-    if let Some(id) = switched {
-        crate::sched::set_current_identity(id);
+    if let Some(ref id) = switched {
+        crate::sched::set_current_identity(id.clone());
     }
     let outcome = crate::sched::exec_replace(&bytes, &argv, &envp, &path);
     if outcome.is_err() && switched.is_some() {

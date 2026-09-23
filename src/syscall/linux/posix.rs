@@ -19,6 +19,9 @@
 //! `block_until_deadline`, the same three-way wait every other blocking
 //! call uses.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::sched::{TaskId, WaitEnd};
 use crate::syscall::{ARG_COUNT, buffer_ok, err};
 
@@ -82,6 +85,72 @@ pub fn handle_setuid(args: [usize; ARG_COUNT]) -> isize {
 /// `setgid(gid)` — [`handle_setuid`], spelled for groups.
 pub fn handle_setgid(args: [usize; ARG_COUNT]) -> isize {
     identity_set_one(args[0], false)
+}
+
+/// The most supplementary groups a process may carry, the figure Linux
+/// reports from `sysconf(_SC_NGROUPS_MAX)`.
+const NGROUPS_MAX: usize = 65536;
+
+/// `setgroups(n, list)` — install the supplementary groups, the set a
+/// `:group` rule in `doas.conf` matches membership against. Only a
+/// privileged process may name one: the login that assigns a user's groups
+/// runs as root, and letting the launched program re-pick them would be a
+/// way to gain groups it was not given. A count of zero - the "clear the
+/// extras" call - needs no list at all.
+pub fn handle_setgroups(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (count, list) = (args[0], args[1]);
+    if count > NGROUPS_MAX {
+        return err::EINVAL;
+    }
+    if crate::sched::current_identity().euid != 0 {
+        return err::EPERM;
+    }
+    let mut groups = Vec::new();
+    if count > 0 {
+        if list == 0 || !buffer_ok(list, count * 4, false, from_user) {
+            return err::EFAULT;
+        }
+        groups = vec![0u32; count];
+        unsafe {
+            for (i, g) in groups.iter_mut().enumerate() {
+                *g = ((list + i * 4) as *const u32).read_unaligned();
+            }
+        }
+    }
+    let mut identity = crate::sched::current_identity();
+    identity.groups = groups;
+    crate::sched::set_current_identity(identity);
+    0
+}
+
+/// `getgroups(size, list)` — report the supplementary groups. A `size` of
+/// zero asks for the count alone without touching the list, which is how a
+/// libc probes for the buffer it needs; a list too small for the count is
+/// the man page's EINVAL rather than a silent truncation.
+pub fn handle_getgroups(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (size, list) = (args[0] as isize, args[1]);
+    if size < 0 {
+        return err::EINVAL;
+    }
+    let identity = crate::sched::current_identity();
+    let n = identity.groups.len();
+    if size == 0 {
+        return n as isize;
+    }
+    if (size as usize) < n {
+        return err::EINVAL;
+    }
+    if n > 0 {
+        if list == 0 || !buffer_ok(list, n * 4, true, from_user) {
+            return err::EFAULT;
+        }
+        unsafe {
+            for (i, g) in identity.groups.iter().enumerate() {
+                ((list + i * 4) as *mut u32).write_unaligned(*g);
+            }
+        }
+    }
+    n as isize
 }
 
 fn identity_set_one(word: usize, uid: bool) -> isize {
