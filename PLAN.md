@@ -40,14 +40,35 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [ ] 6.3 Namespaces — `unshare`/`setns` return `EOPNOTSUPP` (no isolation) (§6.3)
 
 **ABI gaps → `ENOSYS` (remaining)**
-- [x] inotify · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
+- [x] inotify · [x] `memfd_create` (anon shared buffers, §7/Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
 - [ ] real-time signals 32..=64 (needs 64-bit pending masks throughout) (§2.3)
 - [ ] `io_uring_setup`/`enter`/`register` — deferred by design (§1.3)
 
-**Drivers (Phase 7 — not started)**
-- [ ] 7.1 virtio-gpu · [ ] 7.2 virtio-input · [ ] 7.3 AHCI/SATA (stretch)
+**Drivers (Phase 7)**
+- [~] 7.1 Display — `/dev/fb0` (mmap + FBIOGET_* + PAN/VSYNC present) and a
+      DRM/KMS card `/dev/dri/card0` (resources, dumb buffers, addfb, setcrtc,
+      page-flip + vblank events) for a software/pixman compositor. No 3D/virgl,
+      no `GBM`/`EGL` (§7.1)
+- [x] 7.2 Input — virtio-input evdev: capability ioctls (`EVIOCGBIT`/`EVIOCGABS`/
+      …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents (§7.2)
+- [ ] 7.3 AHCI/SATA (stretch)
+
+**Wayland compositor (weston) support** — the cross-cutting work a rootful
+compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
+`cargo xtask run --console compositor`):
+- [x] Peer credential + fd passing (SCM_RIGHTS/`SO_PEERCRED`) — Stage 0 (see §4.1)
+- [x] libinput device classification — evdev capability ioctls — Stage 1, `t-evdev`
+- [x] Device discovery — `/dev/input`, `/sys/class/input`, input uevents — Stage 2
+- [x] `wl_shm` buffers — `memfd_create` + frame-aliased shared mappings — Stage 3, `t-memfd-shm`
+- [x] Framebuffer present — `FBIOPAN_DISPLAY`/`FBIO_WAITFORVSYNC` + a pointer
+      (virtio-tablet) + `--console compositor` (kernel frees the scanout) — Stage 4, `t-fbdev`
+- [x] DRM/KMS surface — `/dev/dri/card0` (UAPI ioctl + struct ABI, dumb buffers,
+      page-flip, vblank events) for DRM-backend compositors — Stage 5, `t-drm`
+- [ ] 3D / GL / virgl / Mesa-`GBM`+`EGL` — deliberately out of scope
+- [ ] evdev readiness is polled at tick granularity (no interrupt wake);
+      `EVIOCGRAB` is accepted but not enforced per-owner
 
 **Security (Phase 8)**
 - [ ] 8.1 ASLR (mmap/stack/load-address randomization)
@@ -68,7 +89,10 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 1. **P10.2 / P10.3 performance** — biggest interactive-latency/throughput wins, marked High.
 2. **4.1 `SOCK_DGRAM` transfer** — completes the AF_UNIX family for dbus/systemd paths.
 3. **5.1/5.2 anonymous demand paging** — unblocks true shared `fork` frames *and* real `MADV_DONTNEED`.
-4. **4.3 remaining socket options** — small, self-contained.
+4. **Weston polish** — evdev wake-on-event (kill the tick-poll latency for input),
+   a per-buffer mmap offset manager (replace the `handle<<X` encoding), and the
+   remaining DRM objects (`ADDFB2`, atomic) if a compositor needs them.
+5. **4.3 remaining socket options** — small, self-contained.
 
 ---
 
@@ -79,11 +103,18 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - **Signals** — handlers delivered via `rt_sigframe`, mask enforcement, `sigqueue` siginfo payloads
 - **Filesystems**: ramfs, ext2/ext4 (write-through), devfs, procfs, sysfs, devpts
 - **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net; AF_INET + AF_UNIX
-  (path `SOCK_STREAM`) + netlink (read + uevent)
+  (path `SOCK_STREAM`, with `SCM_RIGHTS` fd passing + `SO_PEERCRED`) + netlink
+  (read + uevent)
+- **Display / input**: virtio-gpu 2D scanout exposed as `/dev/fb0` (mmap +
+  fbdev ioctls + pan/vsync) and a DRM/KMS `/dev/dri/card0` (UAPI ABI, dumb
+  buffers, page-flip + vblank) for a software compositor; virtio-input evdev
+  (`/dev/input/eventN`, capability ioctls) with a keyboard + tablet
+- **Buffer sharing**: `memfd_create` whose `MAP_SHARED` mapping aliases real
+  frames, so a compositor and a client sharing one descriptor see the same bytes
 - **Scheduler**: 4-level priority + round-robin, COW fork, demand-paged stack
 - **Network latency**: event-driven socket waits + virtio-net MSI-X interrupts;
   loopback `ping 127.0.0.1` 7.5 ms → 0.3 ms (10.1 done)
-- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.1 / 4.2 / 4.4 / 5.1 done; 4.3 / 5.2 partial; 6.3 stub.
+- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.1 / 4.2 / 4.4 / 5.1 done; 4.3 / 5.2 partial; 6.3 stub; 7.1 / 7.2 answered (Wayland-compositor support: see the TODO Board).
 
 ### Remaining ABI support (gaps + services)
 
@@ -575,23 +606,50 @@ All wired to real handlers in `posix.rs`/`proc.rs`: `getpgrp`, `setreuid`,
 
 ## Phase 7: Device Drivers (Low Priority)
 
-### 7.1 virtio-gpu
+### 7.1 Display: virtio-gpu (framebuffer + DRM/KMS) — **ANSWERED** (2D / software)
 
-**Why**: Graphical output, desktop environment.
+Two faces of the same virtio-gpu scanout, both driven by the single render
+task that owns the GPU (the only `flush()` caller).
 
-- VirtIO GPU driver (2D mode first, 3D stretch)
-- Framebuffer mapped to userspace via mmap
-- `ioctl` DRM interface (`DRM_IOCTL_MODE_GETRESOLUTION`, `DRM_IOCTL_MODE_SETCRTC`)
-- `/dev/dri/card0` via devfs
+- **Framebuffer (`/dev/fb0`)** — 2D scanout, BGRA32; `read`/`write` (write
+  copies in and blocks on the through-flush), `mmap` of the real DMA frames
+  (pinned), and the fbdev ioctls `FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO`.
+  `FBIOPAN_DISPLAY` and `FBIO_WAITFORVSYNC` are answered, and on a compositor
+  boot `FBIOPAN_DISPLAY` *presents* (drives the flush), which is what weston's
+  fbdev backend uses per frame. `FBIOPUT_VSCREENINFO` is refused (a resolution
+  change would tear down live mappings).
+- **DRM/KMS (`/dev/dri/card0`, `src/drivers/drm.rs`)** — a virtual single-CRTC
+  card speaking the Linux UAPI exactly (`drm.h`/`drm_mode.h`): `VERSION`,
+  `GET_CAP` (`DUMB_BUFFER`), `SET_CLIENT_CAP`, `MODE_GETRESOURCES`,
+  `GETCRTC`/`SETCRTC`, `GETENCODER`/`GETCONNECTOR`/`GETPLANE`,
+  `ADDFB`/`RMFB`, `PAGE_FLIP`, `GETPROPERTY`/`SETPROPERTY`/`GETPROPBLOB`, and
+  GEM dumb buffers (`CREATE_DUMB`/`MAP_DUMB`/`DESTROY_DUMB`) whose `mmap`
+  aliases real pages with the same per-mapping frame reference discipline the
+  memfd uses. A page flip is applied to the scanout and reports back as a
+  flip-completion `drmEvent` readable (and pollable) on the card fd. This is
+  the presentation path a **pixman/software** DRM compositor needs; there is
+  **no 3D, no `GBM`/`EGL`, no `virgl`** - the deliberate boundary.
 
-### 7.2 virtio-input
+v1 divergences: one fixed connector/crtc/encoder/plane; vblank is synthesized
+at the frame beat (no hardware interrupt); dumb-buffer mmap uses a
+`handle << log2(PAGES_PER_BUFFER)` offset encoding rather than a DRM VMA
+manager; `SO_PEERCRED`-style per-client DRM leasing and atomic modesetting are
+absent (legacy `SETCRTC`/`PAGE_FLIP` only).
 
-**Why**: Keyboard/mouse without serial.
+### 7.2 Input: virtio-input (evdev) — **DONE**
 
-- VirtIO input driver (evdev protocol)
-- Event queue: `struct input_event { time, type, code, value }`
-- `/dev/input/event0` via devfs
-- Keyboard scancode -> keycode mapping
+`src/drivers/virtio/input.rs` is a real evdev provider, and this is what makes
+`libinput` accept a device. At `init` each device's capability picture is read
+from the virtio config (`ev_bits` per event type, `abs_info` per axis,
+`prop_bits`, `ids`) and frozen; the node answers `EVIOCGVERSION`, `EVIOCGID`,
+`EVIOCGNAME`, `EVIOCGBIT(evtype)`, `EVIOCGABS(axis)` and `EVIOCGRAB` (the ioctl
+dispatcher in `fs.rs`). Nodes live at `/dev/input/eventN` (major 13, minor
+64+N), are announced with `SUBSYSTEM=input` uevents, and have
+`/sys/class/input/eventN/{dev,uevent}` - so udev/`libinput` enumerate them the
+way Linux's do. Keyboard events also feed the console line discipline as before.
+The QEMU machine attaches `virtio-keyboard-pci` **and** `virtio-tablet-pci` (a
+pointer). v1: readiness is polled at tick granularity (no interrupt wake) and
+the grab is recorded, not arbitrated per owner.
 
 ### 7.3 AHCI/SATA (stretch)
 

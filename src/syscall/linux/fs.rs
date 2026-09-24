@@ -3516,6 +3516,12 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             n as isize
         }
         request if (request & 0xff) == b'E' as u32 => evdev_ioctl(fd, request, buf, from_user),
+        // DRM/KMS ioctls (`'d'`-typed), routed to the card handler which
+        // dispatches on the request number itself.
+        #[cfg(target_os = "none")]
+        request if (request & 0xff) == b'd' as u32 => {
+            crate::drivers::drm::drm_ioctl(fd, request, buf)
+        }
         _ => err::ENOTTY,
     }
 }

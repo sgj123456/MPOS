@@ -469,6 +469,14 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// The DRM card node this is, if it is one - how the `ioctl` dispatcher
+    /// routes a `'d'`-typed request to the KMS handler. Gated with the `drm`
+    /// module.
+    #[cfg(target_os = "none")]
+    fn as_drm(&self) -> Option<&crate::drivers::drm::DrmCard> {
+        None
+    }
+
     /// The vsock socket this node is, if it is one - the borrow form of the
     /// id the close paths check, for the socket syscalls that operate on
     /// the socket's own state. Gated with the `net` module, like

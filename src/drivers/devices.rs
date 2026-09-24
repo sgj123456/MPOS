@@ -288,6 +288,15 @@ pub fn standard_devfs() -> Arc<DevFs> {
         }
     }
 
+    // The DRM/KMS card. A compositor that drives the display through KMS (not
+    // the raw framebuffer) opens `/dev/dri/card0`, makes dumb buffers, and
+    // page-flips them onto the scanout. One card, fixed ids, software
+    // presentation only.
+    {
+        let dri = dev.register_dir("dri");
+        dri.insert("card0", crate::drivers::drm::DrmCard::new(0x9100));
+    }
+
     if let Some(raw) = crate::blk::raw_disk() {
         dev.register_block("vda", raw.clone());
         for (index, (start, sectors)) in crate::blk::part::partitions(raw.as_ref())

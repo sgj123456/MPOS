@@ -5,6 +5,8 @@
 //! PCI enumeration) but are not part of the core architecture abstraction.
 
 pub mod devices;
+#[cfg(target_os = "none")]
+pub mod drm;
 pub mod pci;
 pub mod qemu;
 pub mod serial;
