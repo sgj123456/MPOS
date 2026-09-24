@@ -222,6 +222,12 @@ impl Grid {
     }
 
     fn print(&mut self, b: u8) {
+        // Defensive: the cursor is clamped wherever a sequence sets it, but a
+        // display glitch must never crash the machine, so a stray out-of-range
+        // row is pulled back onto the grid before it can be indexed.
+        if self.row >= self.rows {
+            self.row = self.rows - 1;
+        }
         if self.col >= self.cols {
             self.col = 0;
             self.line_feed();
@@ -417,11 +423,11 @@ impl Grid {
                 self.col = 0;
                 self.row = self.row.saturating_sub(self.p(0, 1) as usize);
             }
-            b'G' | b'`' => self.col = self.p(0, 1) as usize - 1,
-            b'd' => self.row = self.p(0, 1) as usize - 1,
+            b'G' | b'`' => self.col = (self.p(0, 1) as usize - 1).min(self.cols - 1),
+            b'd' => self.row = (self.p(0, 1) as usize - 1).min(self.rows - 1),
             b'H' | b'f' => {
-                self.row = self.p(0, 1) as usize - 1;
-                self.col = self.p(1, 1) as usize - 1;
+                self.row = (self.p(0, 1) as usize - 1).min(self.rows - 1);
+                self.col = (self.p(1, 1) as usize - 1).min(self.cols - 1);
             }
             b'J' => self.erase_display(self.param_at(0).unwrap_or(0)),
             b'K' => self.erase_line(self.param_at(0).unwrap_or(0)),
@@ -791,6 +797,18 @@ mod tests {
         g.feed(b"\x1b[2J"); // erase display touches every row
         assert_eq!(g.take_dirty(), 0b111);
         assert_eq!(g.take_dirty(), 0); // cleared
+    }
+
+    #[test]
+    fn a_cursor_address_past_the_margin_is_clamped_not_fatal() {
+        // A getty or shell cursor-addressing at/beyond the bottom-right corner
+        // must not index off the end of the grid.
+        let mut g = Grid::new(2, 5);
+        g.feed(b"\x1b[999;999Hx");
+        assert_eq!(g.cell(1, 4).ch, b'x');
+        // And a further print after the clamped position still lands in bounds.
+        g.feed(b"y");
+        assert_eq!(g.cell(1, 0).ch, b'y'); // 'x' filled the last cell, so it wrapped
     }
 
     #[test]
