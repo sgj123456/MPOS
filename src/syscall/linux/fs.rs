@@ -1250,7 +1250,7 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
             // would OOM the kernel on a large file, and `apk` renames every
             // package member into place (a 128 MiB `Vec` from a big one is
             // what took the machine down).
-            let mut chunk = [0u8; 65536];
+            let mut chunk = alloc::vec![0u8; 65536];
             let mut off: u64 = 0;
             loop {
                 let n = match old_inode.read_at(off, &mut chunk) {
