@@ -20,6 +20,7 @@
 
 pub mod blit;
 pub mod font;
+pub mod keymap;
 
 use alloc::vec;
 use alloc::vec::Vec;

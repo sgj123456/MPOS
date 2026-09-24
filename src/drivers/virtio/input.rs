@@ -15,11 +15,14 @@
 //! device does not carry one of its own, and the host does not deliver
 //! theirs.
 //!
-//! The keyboard *also* being the machine's console input is deliberately
-//! not attempted here. The line discipline on the serial UART owns the
-//! shell's input; an event stream under `/dev/input` is a second, separate
-//! consumer - a program that wants keys opens the node and reads records,
-//! the way every evdev client since the beginning does.
+//! The keyboard *also* being the machine's console input is what
+//! [`service`] does when the framebuffer console is up (not a headless boot):
+//! keyboard events are translated to bytes and routed to the active virtual
+//! console, exactly as a serial keystroke would be. The `/dev/input` node stays
+//! a second, separate consumer - a program that wants raw events opens the node
+//! and reads records, the way every evdev client since the beginning does. On a
+//! headless boot there is no framebuffer console, so only the nodes move and the
+//! serial UART keeps sole ownership of the shell's input.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -221,17 +224,50 @@ pub fn nodes() -> Vec<Arc<EvdevNode>> {
     })
 }
 
+/// The keyboard's console translation state - the latched shift/ctrl/caps - kept
+/// across ticks so a `Shift` press on one event colours the letter that follows.
+static KEYMAP: Mutex<RefCell<crate::vfs::term::keymap::Keymap>> =
+    Mutex::new(RefCell::new(crate::vfs::term::keymap::Keymap::new()));
+
+/// `EV_KEY`, the event type a keyboard press is.
+const EV_KEY: u16 = 1;
+
 /// Harvest everything the devices have reported since the last look. The
 /// service task calls this once a tick; the events are stamped as they are
 /// taken, which is the first moment this kernel knew about them.
+///
+/// Two consumers, deliberately: every event is encoded onto its device's
+/// `/dev/input/eventN` node (an evdev program reads records from there), *and*
+/// - when a display is up, i.e. not headless - keyboard events are translated to
+/// console bytes and fed to the active virtual console through the same funnel
+/// a serial keystroke uses. Routing happens *after* the critical section, so the
+/// echo the keystroke provokes can take the pty's parking branch rather than
+/// growing a queue unbounded under the lock.
 pub fn service() {
+    let to_console = !crate::console::headless();
+    let mut routed = [0u8; 64];
+    let mut n = 0usize;
     critical_section::with(|cs| {
         let devices = DEVICES.borrow(cs).borrow();
+        let mut keymap = KEYMAP.borrow(cs).borrow_mut();
         for (dev, node) in devices.iter() {
             let mut device = dev.device.borrow(cs).borrow_mut();
             while let Some(event) = device.pop_pending_event() {
                 node.push(&event);
+                if to_console && event.event_type == EV_KEY {
+                    if let Some((bytes, cnt)) = keymap.event(event.code, event.value as i32) {
+                        for &b in &bytes[..cnt] {
+                            if n < routed.len() {
+                                routed[n] = b;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
             }
         }
     });
+    for &b in &routed[..n] {
+        crate::vfs::vcmux::route_input(b);
+    }
 }
