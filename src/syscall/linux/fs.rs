@@ -3979,6 +3979,19 @@ pub(super) fn handle_fchownat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) ->
         Ok(path) => path,
         Err(e) => return e,
     };
+    // `AT_EMPTY_PATH` with an empty name is the `fchown`-by-descriptor spelling:
+    // set the owner of whatever the fd holds, not of a path. This is how `apk`
+    // gives an `O_TMPFILE` file its owner before naming it, and without it the
+    // empty name resolves to nothing and the preserve fails.
+    if path.is_empty() {
+        if args[4] & AT_EMPTY_PATH == 0 {
+            return err::ENOENT;
+        }
+        return match crate::sched::current_fds().clone_at(args[0] as i32) {
+            Ok(file) => chown_apply(&file.inode(), args[2] as i32, args[3] as i32),
+            Err(e) => err_of(e),
+        };
+    }
     let found = if args[4] & AT_SYMLINK_NOFOLLOW != 0 {
         crate::vfs::global().resolve_no_follow(&path, base)
     } else {
@@ -5084,18 +5097,37 @@ pub(super) fn handle_faccessat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) 
 /// split — follow the link, and refuse the flag rather than silently
 /// ignoring it.
 pub(super) fn handle_fchmodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    if args[3] & !abi::AT_SYMLINK_NOFOLLOW != 0 {
+    if args[3] & !(abi::AT_SYMLINK_NOFOLLOW | abi::AT_EMPTY_PATH) != 0 {
         return err::EINVAL;
     }
     if args[3] & abi::AT_SYMLINK_NOFOLLOW != 0 {
         return err::EOPNOTSUPP;
     }
-    let base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
+        Err(e) => return e,
+    };
+    // `AT_EMPTY_PATH` with an empty name is `fchmod`-by-descriptor: set the mode
+    // of whatever the fd holds. `apk` uses it to mark an `O_TMPFILE` file setuid
+    // before it has a name at all.
+    if path.is_empty() {
+        if args[3] & abi::AT_EMPTY_PATH == 0 {
+            return err::ENOENT;
+        }
+        let inode = match crate::sched::current_fds().clone_at(args[0] as i32) {
+            Ok(file) => file.inode(),
+            Err(e) => return err_of(e),
+        };
+        return match chmod_mode(&inode, args[2] as u32) {
+            Ok(mode) => {
+                inode.set_mode(mode);
+                0
+            }
+            Err(e) => e,
+        };
+    }
+    let base = match base_of(args[0] as i32, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     match crate::vfs::resolve_opt(&path, Some(base)) {
