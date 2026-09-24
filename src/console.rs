@@ -182,12 +182,16 @@ pub fn write_bytes(bytes: &[u8]) {
 /// Distinct from [`write_bytes`] (the kernel console): these belong to one
 /// screen, whichever produced them, so a flood on a background console updates
 /// that console's grid and is simply not on screen until you switch to it. On
-/// the framebuffer they paint that grid; on a headless (wire) boot they go out
-/// the serial line, as they always did.
+/// the framebuffer they paint that grid; and when the serial mirror is on they
+/// also go out the wire, so the same console shows in the terminal window as
+/// well. On a headless boot (no framebuffer) the wire is the only sink.
 pub fn vc_output(vc: u32, bytes: &[u8]) {
     if gpu_mode() {
         crate::vfs::term::with_screen(vc as usize, |g| g.feed(bytes));
         crate::drivers::video::render::notify();
+        if mirror_serial() {
+            serial_bytes(bytes);
+        }
     } else {
         serial_bytes(bytes);
     }
@@ -220,8 +224,10 @@ fn record(bytes: &[u8]) {
 /// Hand the console to the framebuffer: replay the boot log onto the freshly
 /// made screen, then switch. Called by the render task once its screen exists,
 /// so there is no window between "GPU is the backend" and "there is a screen to
-/// paint." Stops the serial mirror - a mirror would send a `bat` flood back down
-/// the one wire the whole feature exists to get off of.
+/// paint." The serial mirror stays on, so the console shows in the framebuffer
+/// window *and* the serial terminal at once. The mirror is synchronous: a slow
+/// terminal draining a flood can back the mux up and slow both sinks together -
+/// the accepted cost of showing the same console in two places.
 pub fn takeover() {
     let snapshot: Vec<u8> = critical_section::with(|cs| {
         let mut out = Vec::with_capacity(LOG.borrow(cs).borrow().len());
@@ -232,7 +238,7 @@ pub fn takeover() {
         g.reset_to_boot(&snapshot);
     });
     set_gpu();
-    set_mirror_serial(headless());
+    set_mirror_serial(true);
 }
 
 /// Write raw bytes on the serial console - the wire, through the transmit ring.
