@@ -52,6 +52,11 @@ pub fn paint(
 
     if grid.cursor_visible {
         let (crow, ccol) = grid.cursor();
+        // A print at the last column leaves the cursor "wrap-pending" at
+        // `col == cols`; clamp onto the grid so the block never indexes off the
+        // end. The character it covers is the last one written.
+        let crow = crow.min(grid.rows() - 1);
+        let ccol = ccol.min(grid.cols() - 1);
         let cell = grid.cell(crow, ccol);
         draw_cursor(
             fb,

@@ -204,7 +204,14 @@ impl Grid {
     fn ground(&mut self, b: u8) {
         match b {
             0x1b => self.state = State::Esc,
-            b'\n' | 0x0b | 0x0c => self.line_feed(),
+            // A console treats a line feed as "start of the next line" - CR and
+            // LF together - the way the tty's ONLCR did on the serial wire. The
+            // guest writes bare `\n`; without the home here every line would
+            // keep the previous column and staircase rightward.
+            b'\n' | 0x0b | 0x0c => {
+                self.col = 0;
+                self.line_feed();
+            }
             b'\r' => self.col = 0,
             0x08 => {
                 if self.col > 0 {
@@ -749,6 +756,16 @@ mod tests {
         g.feed(b"abc\r\nXY");
         assert_eq!(&row_text(&g, 0), "abc       ");
         assert_eq!(&row_text(&g, 1), "XY        ");
+    }
+
+    #[test]
+    fn a_bare_line_feed_homes_the_column_like_a_console() {
+        // The guest writes bare `\n`; the console treats it as CR+LF, so the
+        // next line starts at column 0 rather than staircasing rightward.
+        let mut g = Grid::new(4, 10);
+        g.feed(b"abc\ndef");
+        assert_eq!(&row_text(&g, 0), "abc       ");
+        assert_eq!(&row_text(&g, 1), "def       ");
     }
 
     #[test]
