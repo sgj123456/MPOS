@@ -84,10 +84,22 @@ fn mux_task() {
         if active() != was_active {
             continue;
         }
-        if let Some(pty) = crate::vfs::pty::lookup(was_active)
-            && let Some(bytes) = pty.take_master(512)
-        {
-            crate::console::write_bytes(&bytes);
+        // Drain this console's queue to the framebuffer. The sink is memory
+        // now, so take more than one 512-byte wire-sized gulp per lap - but
+        // with a budget, so a flood here can never keep the mux from looking at
+        // whether the active console changed (that is what makes `^A` snappy).
+        if let Some(pty) = crate::vfs::pty::lookup(was_active) {
+            let mut budget = 64 * 1024;
+            while budget > 0 {
+                let Some(bytes) = pty.take_master(4096.min(budget)) else {
+                    break;
+                };
+                budget -= bytes.len();
+                crate::console::vc_output(was_active, &bytes);
+                if bytes.len() < 4096 {
+                    break;
+                }
+            }
         }
     }
 }
@@ -146,9 +158,13 @@ fn switch(to: u32) {
     if mux != 0 {
         crate::sched::wake(TaskId(mux as usize));
     }
-    // A word in the kernel's own voice, so the eye can tell the join: the
-    // next thing printed belongs to the console whose name follows.
-    crate::console::write_bytes(alloc::format!("\r\n[tty{to}]\r\n").as_bytes());
+    // On the shared serial wire a word in the kernel's own voice tells the eye
+    // which console the next bytes belong to. On the framebuffer it is not
+    // needed - each console is its own screen, and the switch itself is the
+    // join - so say nothing and let the redraw speak.
+    if !crate::console::gpu_mode() {
+        crate::console::write_bytes(alloc::format!("\r\n[tty{to}]\r\n").as_bytes());
+    }
 }
 
 /// Route COM1's input: the mux's when it is up, the console tty's before.

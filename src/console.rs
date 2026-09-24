@@ -163,16 +163,37 @@ pub fn write_bytes(bytes: &[u8]) {
     // mid-story. Fixed-size, never allocates, safe from the interrupt path.
     record(bytes);
     if gpu_mode() {
-        // Once the render task has made the screen, bytes paint it directly.
-        // Before that (or if there is none), this is a no-op and the wire below
-        // still carries the text.
-        crate::vfs::term::with_screen(crate::vfs::term::KERNEL_SCREEN, |g| g.feed(bytes));
+        // Kernel console text lands on the virtual console currently on screen,
+        // exactly as Linux prints onto the foreground VT. Once its grid exists
+        // (after the render task made it) this paints; before, the ring above
+        // still catches it for the replay.
+        crate::vfs::term::with_screen(active_grid(), |g| g.feed(bytes));
         if mirror_serial() {
             serial_bytes(bytes);
         }
         return;
     }
     serial_bytes(bytes);
+}
+
+/// A virtual console's own printed bytes - what the shell on `/dev/ttyN` wrote.
+///
+/// Distinct from [`write_bytes`] (the kernel console): these belong to one
+/// screen, whichever produced them, so a flood on a background console updates
+/// that console's grid and is simply not on screen until you switch to it. On
+/// the framebuffer they paint that grid; on a headless (wire) boot they go out
+/// the serial line, as they always did.
+pub fn vc_output(vc: u32, bytes: &[u8]) {
+    if gpu_mode() {
+        crate::vfs::term::with_screen(vc as usize, |g| g.feed(bytes));
+    } else {
+        serial_bytes(bytes);
+    }
+}
+
+/// The grid index of the console currently shown, by its `/dev/ttyN` number.
+fn active_grid() -> usize {
+    crate::vfs::vcmux::active() as usize
 }
 
 /// How far back the replayed boot log reaches. A screen is 25 rows; a few
@@ -205,7 +226,7 @@ pub fn takeover() {
         out.extend(LOG.borrow(cs).borrow().iter().copied());
         out
     });
-    crate::vfs::term::with_screen(crate::vfs::term::KERNEL_SCREEN, |g| {
+    crate::vfs::term::with_screen(active_grid(), |g| {
         g.reset_to_boot(&snapshot);
     });
     set_gpu();

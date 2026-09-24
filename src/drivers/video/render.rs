@@ -28,8 +28,10 @@ use crate::drivers::virtio::gpu::VirtioGpuDev;
 use crate::drivers::virtio::hal::HalImpl;
 use crate::mm;
 use crate::sched::policy::TaskId;
+use crate::vfs::pty::VC_COUNT;
 use crate::vfs::term::font::{CELL_H, CELL_W};
-use crate::vfs::term::{self, KERNEL_SCREEN, MAX_ROWS};
+use crate::vfs::term::{self, MAX_ROWS};
+use crate::vfs::vcmux;
 
 /// Rows and columns the console screen is sized to: the same 80x25 the line
 /// discipline's cursor model uses, so the two never disagree about a position.
@@ -81,26 +83,40 @@ fn task() {
     let fb_phys = view.fb_phys();
     let fb_len = view.fb_len();
 
-    // A screen can never show more rows than the pixels allow, nor more than
-    // the dirty mask tracks.
     let rows = (fb_h / CELL_H).min(SCREEN_ROWS).clamp(1, MAX_ROWS);
     let cols = (fb_w / CELL_W).clamp(1, SCREEN_COLS);
-    term::make_screen(KERNEL_SCREEN, rows, cols);
-    // The screen exists now: replay the boot log onto it and move the console
-    // from the wire to the framebuffer, so the display shows the lines already
-    // printed rather than waiting for the next one.
+
+    // One screen per virtual console, so switching preserves each one's
+    // contents - something the single shared wire could never do. Index `n`
+    // is `/dev/ttyN`.
+    for vc in 1..=VC_COUNT as usize {
+        term::make_screen(vc, rows, cols);
+    }
+    // The screens exist now: replay the boot log onto the console being shown
+    // and move output from the wire to the framebuffer.
     crate::console::takeover();
 
+    let mut last_shown = 0usize;
     loop {
         crate::sched::sleep_ticks(8);
 
-        // Paint under a short-lived borrow of the buffer, then release it
-        // before the flush so the DMA spin holds no lock and masks no clock.
+        // A switch means the whole window must be redrawn: the bytes already in
+        // the buffer belong to the console that was shown before. Force the new
+        // screen fully dirty so this one frame replaces it entirely.
+        let shown = vcmux::active() as usize;
+        let switched = shown != last_shown;
+        last_shown = shown;
+        if switched {
+            term::with_screen(shown, |g| g.mark_all_dirty());
+        }
+
+        // Paint under a short-lived borrow of the buffer, then release it before
+        // the flush so the DMA spin holds no lock and masks no clock.
         let painted = {
             let fb = unsafe {
                 core::slice::from_raw_parts_mut(mm::phys_to_virt(fb_phys) as *mut u8, fb_len)
             };
-            term::render_screen(KERNEL_SCREEN, fb, fb_w, fb_h, (0, 0))
+            term::render_screen(shown, fb, fb_w, fb_h, (0, 0))
         };
 
         let req = REQ.load(Ordering::Relaxed);
