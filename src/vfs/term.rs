@@ -61,6 +61,15 @@ enum State {
     Charset,
 }
 
+/// A parked copy of the main screen, kept while an alternate screen shows.
+struct Snapshot {
+    cells: Vec<Cell>,
+    row: usize,
+    col: usize,
+    top: usize,
+    bottom: usize,
+}
+
 /// A screen of cells with a cursor, a scroll region and a pending pen.
 pub struct Grid {
     rows: usize,
@@ -78,6 +87,9 @@ pub struct Grid {
     /// Whether the cursor is shown; `less` hides it while painting a screenful.
     pub cursor_visible: bool,
     dirty: u32,
+    /// The main screen parked while an alternate screen (a full-page `less`, a
+    /// `vi`) is showing, so leaving it restores what was there.
+    alt: Option<Snapshot>,
     // Escape decoder, carried across `feed` so a split sequence holds.
     state: State,
     params: [u16; PARAM_MAX],
@@ -106,6 +118,7 @@ impl Grid {
             pen_bold: false,
             cursor_visible: true,
             dirty: 0,
+            alt: None,
             state: State::Ground,
             params: [0u16; PARAM_MAX],
             nparam: 0,
@@ -432,9 +445,22 @@ impl Grid {
                 self.col = self.saved_col;
             }
             b'h' | b'l' if self.priv_marker == b'?' => {
+                let on = cmd == b'h';
                 for i in 0..np {
-                    if self.params[i] == 25 {
-                        self.cursor_visible = cmd == b'h';
+                    match self.params[i] {
+                        25 => self.cursor_visible = on,
+                        // The alternate screen: `less`, `vi` and friends draw
+                        // over a cleared window and, on leaving, put back the
+                        // screen they replaced. Without this their last page is
+                        // left smeared over the prompt.
+                        47 | 1047 | 1049 => {
+                            if on {
+                                self.enter_alt();
+                            } else {
+                                self.exit_alt();
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -483,6 +509,41 @@ impl Grid {
         self.pen_bg = DEFAULT_BG;
         self.pen_bold = false;
         self.cursor_visible = true;
+    }
+
+    /// Save the main screen and clear for an alternate one. Idempotent: entering
+    /// while already in the alternate is a no-op, so the snapshot is never lost.
+    fn enter_alt(&mut self) {
+        if self.alt.is_some() {
+            return;
+        }
+        self.alt = Some(Snapshot {
+            cells: core::mem::take(&mut self.cells),
+            row: self.row,
+            col: self.col,
+            top: self.top,
+            bottom: self.bottom,
+        });
+        // Reuse the allocation `take` left behind is impossible (it's now in the
+        // snapshot), so build a fresh blank screen of the same shape.
+        self.cells = vec![Self::blank(); self.rows * self.cols];
+        self.row = 0;
+        self.col = 0;
+        self.top = 0;
+        self.bottom = self.rows - 1;
+        self.mark_all_dirty();
+    }
+
+    /// Put the saved main screen back. A no-op if there was no alternate.
+    fn exit_alt(&mut self) {
+        if let Some(saved) = self.alt.take() {
+            self.cells = saved.cells;
+            self.row = saved.row;
+            self.col = saved.col;
+            self.top = saved.top;
+            self.bottom = saved.bottom;
+            self.mark_all_dirty();
+        }
     }
 
     fn sgr(&mut self, np: usize) {
@@ -730,5 +791,19 @@ mod tests {
         g.feed(b"\x1b[2J"); // erase display touches every row
         assert_eq!(g.take_dirty(), 0b111);
         assert_eq!(g.take_dirty(), 0); // cleared
+    }
+
+    #[test]
+    fn the_alternate_screen_shields_the_main_one_then_gives_it_back() {
+        let mut g = Grid::new(2, 5);
+        g.feed(b"main ");
+        // Enter the alternate screen (`?1049h`): the main content is parked and
+        // the visible screen is cleared, so the app draws on a fresh page.
+        g.feed(b"\x1b[?1049l"); // no-op exit before any enter
+        g.feed(b"\x1b[?1049halt  ");
+        assert_eq!(&row_text(&g, 0), "alt  ");
+        // Leave it: the main screen is exactly as it was, not smeared over.
+        g.feed(b"\x1b[?1049l");
+        assert_eq!(&row_text(&g, 0), "main ");
     }
 }
