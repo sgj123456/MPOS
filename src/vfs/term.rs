@@ -178,8 +178,17 @@ impl Grid {
 
     /// Paint a byte-stream into the grid. Safe from any context: no allocation.
     pub fn feed(&mut self, bytes: &[u8]) {
+        // A cursor move that prints nothing (an arrow key's `\e[D`) changes only
+        // where the block is drawn, not any cell - so it marks no row dirty on
+        // its own. Remember where the cursor was and dirty the rows it left and
+        // entered, or the block would stay painted at its old pixel.
+        let before = (self.row, self.col);
         for &b in bytes {
             self.byte(b);
+        }
+        if (self.row, self.col) != before {
+            self.mark(before.0);
+            self.mark(self.row);
         }
     }
 
@@ -836,6 +845,15 @@ mod tests {
         // And a further print after the clamped position still lands in bounds.
         g.feed(b"y");
         assert_eq!(g.cell(1, 0).ch, b'y'); // 'x' filled the last cell, so it wrapped
+    }
+
+    #[test]
+    fn a_cursor_move_without_printing_still_dirties_its_row() {
+        let mut g = Grid::new(2, 5);
+        g.feed(b"ab");
+        let _ = g.take_dirty(); // clear the print's dirty bits
+        g.feed(b"\x1b[D"); // left, moves the cursor but prints nothing
+        assert_ne!(g.take_dirty(), 0, "the cursor's row must be redrawn");
     }
 
     #[test]
