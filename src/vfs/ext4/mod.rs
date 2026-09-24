@@ -1137,6 +1137,38 @@ impl Inode for Ext4Ino {
             self.fs.write_inode(self.ino, &data);
             return Ok(());
         }
+        // Shrinking. The kept bytes never move - only the blocks past the new
+        // end are given back - so a truncate is bounded by the tail, not the
+        // file. Try the direct tail-free first; it covers the extent-mapped
+        // files a real image (and `apk`) uses.
+        let block_size = self.fs.block_size() as u64;
+        let keep_blocks = len.div_ceil(block_size);
+        if let Some(freed) = self.fs.free_blocks_after(&mut data, keep_blocks) {
+            // Zero the bytes past the new end inside the last kept block, so a
+            // later grow does not resurrect the truncated tail.
+            let tail = (len % block_size) as usize;
+            if tail > 0 {
+                if let Some(block) = self.fs.bmap_lookup(&data, keep_blocks - 1) {
+                    self.fs.update_block(block, |page| {
+                        for b in &mut page[tail..] {
+                            *b = 0;
+                        }
+                        true
+                    });
+                }
+            }
+            data.blocks = data
+                .blocks
+                .saturating_sub((freed as u32).saturating_mul(self.fs.block_units(data.flags)));
+            data.size = len;
+            data.mtime = now();
+            data.ctime = data.mtime;
+            self.fs.write_inode(self.ino, &data);
+            return Ok(());
+        }
+        // A mapping the tail-free does not cover (a deep extent tree, or a
+        // block map): the buffering path. It reads the kept prefix into memory -
+        // slow and heavy for a large file, but correct, and rare.
         let keep = if len == 0 {
             Vec::new()
         } else {
@@ -2761,6 +2793,34 @@ mod tests {
         let after = mounted(dev).statfs().expect("statfs").bfree;
         assert_eq!(after, before, "every block came back");
         assert_eq!(read_all(&*file, 32).len(), 0, "and the file is empty");
+    }
+
+    #[test]
+    fn truncate_of_an_extent_file_gives_back_only_the_tail() {
+        // A contiguous file is one depth-0 extent - the shape `apk` installs,
+        // and the case the bounded tail-free covers. Shrinking must free just
+        // the blocks past the new end and leave the kept bytes untouched, with
+        // no allocation proportional to the file.
+        let dev = Arc::new(format_ext4());
+        let fs = mounted(dev.clone());
+        let file = fs.root().create("tail", NodeKind::File).expect("create");
+        for l in 0..5u64 {
+            let page = vec![b'a' + l as u8; 1024];
+            file.write_at(l * 1024, &page).expect("write");
+        }
+        let after_write = mounted(dev.clone()).statfs().expect("statfs").bfree;
+        file.truncate(2 * 1024).expect("truncate to two blocks");
+        assert_eq!(file.metadata().size, 2 * 1024, "the size shrank");
+        let after_trunc = mounted(dev.clone()).statfs().expect("statfs").bfree;
+        assert_eq!(
+            after_trunc - after_write,
+            3,
+            "only the three tail blocks came back"
+        );
+        // The kept bytes are intact, and the file now ends at two blocks.
+        let kept = read_all(&*file, 4096);
+        assert_eq!(kept.len(), 2 * 1024);
+        assert!(kept.iter().all(|&b| b == b'a' || b == b'b'));
     }
 
     #[test]

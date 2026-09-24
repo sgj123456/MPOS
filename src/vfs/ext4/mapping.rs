@@ -491,4 +491,65 @@ impl Core {
             }
         }
     }
+
+    /// Free the tail of an extent-mapped file: every block from logical block
+    /// `keep_blocks` onward, splitting the extent that straddles the cut. The
+    /// kept blocks are left exactly where they are - a shrink never moves data,
+    /// it only gives the tail back - so this is bounded by the tail, not the
+    /// file. Returns `Some(freed)` (written blocks given back) when it handled
+    /// the mapping, or `None` for a shape it does not cover (not extent-mapped,
+    /// or a tree deeper than the root - the caller then falls back).
+    pub(crate) fn free_blocks_after(&self, d: &mut InodeData, keep_blocks: u64) -> Option<u64> {
+        if !self.is_extent_mapped(d) {
+            return None;
+        }
+        let mut root = ext_root(d);
+        if !ext_ok(&root) {
+            return Some(0); // no mapping: nothing to free
+        }
+        if ext_depth(&root) != 0 {
+            return None; // deeper tree: caller falls back to the buffering path
+        }
+        let entries = ext_entries(&root);
+        let mut freed = 0u64;
+        let mut kept = 0usize;
+        for i in 0..entries {
+            let (first, raw_len, start) = ext_leaf(&root, i);
+            let len = (raw_len & !EXTENT_UNWRITTEN) as u64;
+            let unwritten = raw_len & EXTENT_UNWRITTEN != 0;
+            let first = first as u64;
+            if first >= keep_blocks {
+                // Entirely past the cut: give the run back, drop the entry.
+                if !unwritten {
+                    for n in 0..len {
+                        self.free_block(start + n);
+                    }
+                    freed += len;
+                }
+                continue;
+            }
+            if first + len > keep_blocks {
+                // Straddles the cut: free from the cut to the run's end, keep
+                // the head, and rewrite the entry to the shorter run.
+                let keep_len = keep_blocks - first;
+                if !unwritten {
+                    for n in keep_len..len {
+                        self.free_block(start + n);
+                    }
+                    freed += len - keep_len;
+                }
+                ext_write_leaf(&mut root, kept, first as u32, keep_len as u16, start);
+            } else {
+                // Entirely kept: move it down to the compacted slot.
+                ext_write_leaf(&mut root, kept, first as u32, len as u16, start);
+            }
+            kept += 1;
+        }
+        for i in kept..entries {
+            ext_write_leaf(&mut root, i, 0, 0, 0);
+        }
+        ext_set_entries(&mut root, kept);
+        ext_put_root(d, &root);
+        Some(freed)
+    }
 }
