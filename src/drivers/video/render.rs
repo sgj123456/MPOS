@@ -6,8 +6,10 @@
 //! the whole frame - a three-megabyte copy at 1024x768. Anywhere else in the
 //! kernel a spin that long with interrupts masked would starve the clock and
 //! the keyboard, which is the exact failure the serial console worked to fix.
-//! So the design is: paint under the screens' critical section (fast, memory
-//! only), leave the section, *then* flush with the clock live.
+//! So the design is: copy the changed screen's cells under the screens'
+//! critical section (a fixed-size memcpy), leave the section, paint the pixels
+//! from that copy with the clock live, and flush last. Nothing slow - neither
+//! the million-pixel blit nor the DMA flush - runs with interrupts masked.
 //!
 //! Frames are coalesced: the task sleeps roughly a tick-locked beat and paints
 //! only screens whose rows actually changed, so an idle console costs no DMA
@@ -16,6 +18,7 @@
 //! request to this task and parking until the frame left.
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -29,14 +32,10 @@ use crate::drivers::virtio::hal::HalImpl;
 use crate::mm;
 use crate::sched::policy::TaskId;
 use crate::vfs::pty::VC_COUNT;
+use crate::vfs::term::blit;
 use crate::vfs::term::font::{CELL_H, CELL_W};
-use crate::vfs::term::{self, MAX_ROWS};
+use crate::vfs::term::{self, Cell, DEFAULT_BG, DEFAULT_FG, MAX_ROWS};
 use crate::vfs::vcmux;
-
-/// Rows and columns the console screen is sized to: the same 80x25 the line
-/// discipline's cursor model uses, so the two never disagree about a position.
-const SCREEN_ROWS: usize = 25;
-const SCREEN_COLS: usize = 80;
 
 /// The device, parked here for the task to take at its start. After the take
 /// nothing else can reach it, which is what keeps `flush` single-caller.
@@ -83,8 +82,10 @@ fn task() {
     let fb_phys = view.fb_phys();
     let fb_len = view.fb_len();
 
-    let rows = (fb_h / CELL_H).min(SCREEN_ROWS).clamp(1, MAX_ROWS);
-    let cols = (fb_w / CELL_W).clamp(1, SCREEN_COLS);
+    // Fill the whole scanout: a 1280x800 display at 8x16 is 160x50 cells, so
+    // the text uses the window instead of a small corner of it.
+    let rows = (fb_h / CELL_H).clamp(1, MAX_ROWS);
+    let cols = (fb_w / CELL_W).max(1);
 
     // One screen per virtual console, so switching preserves each one's
     // contents - something the single shared wire could never do. Index `n`
@@ -96,13 +97,22 @@ fn task() {
     // and move output from the wire to the framebuffer.
     crate::console::takeover();
 
+    // A scratch copy of one screen's cells, reused every frame, so the pixel
+    // blit runs outside the critical section (see the module doc).
+    let blank = Cell {
+        ch: b' ',
+        fg: DEFAULT_FG,
+        bg: DEFAULT_BG,
+    };
+    let mut scratch = vec![blank; rows * cols];
+
     let mut last_shown = 0usize;
     loop {
         crate::sched::sleep_ticks(8);
 
-        // A switch means the whole window must be redrawn: the bytes already in
-        // the buffer belong to the console that was shown before. Force the new
-        // screen fully dirty so this one frame replaces it entirely.
+        // A switch means the whole window must be redrawn: the pixels already in
+        // the buffer belong to the console shown before. Force the new screen
+        // fully dirty so this one frame replaces it entirely.
         let shown = vcmux::active() as usize;
         let switched = shown != last_shown;
         last_shown = shown;
@@ -110,13 +120,29 @@ fn task() {
             term::with_screen(shown, |g| g.mark_all_dirty());
         }
 
-        // Paint under a short-lived borrow of the buffer, then release it before
-        // the flush so the DMA spin holds no lock and masks no clock.
-        let painted = {
-            let fb = unsafe {
-                core::slice::from_raw_parts_mut(mm::phys_to_virt(fb_phys) as *mut u8, fb_len)
-            };
-            term::render_screen(shown, fb, fb_w, fb_h, (0, 0))
+        // Copy the changed screen's cells under the lock (a fixed memcpy), then
+        // paint from the copy with the clock live. The flush is outside both.
+        let frame = term::snapshot(shown, &mut scratch);
+        let painted = match frame {
+            Some(f) if f.dirty != 0 => {
+                let fb = unsafe {
+                    core::slice::from_raw_parts_mut(mm::phys_to_virt(fb_phys) as *mut u8, fb_len)
+                };
+                blit::paint_cells(
+                    &scratch,
+                    f.rows,
+                    f.cols,
+                    f.cursor,
+                    f.cursor_visible,
+                    fb,
+                    fb_w,
+                    fb_h,
+                    (0, 0),
+                    f.dirty,
+                );
+                true
+            }
+            _ => false,
         };
 
         let req = REQ.load(Ordering::Relaxed);

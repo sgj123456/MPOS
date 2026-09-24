@@ -38,8 +38,9 @@ pub type Rgb = [u8; 3];
 pub const DEFAULT_FG: Rgb = [0xdc, 0xdc, 0xdc];
 pub const DEFAULT_BG: Rgb = [0x1c, 0x1c, 0x1c];
 
-/// The rows a screen can have before the `u32` dirty mask runs out.
-pub const MAX_ROWS: usize = 32;
+/// The rows a screen can have before the `u64` dirty mask runs out. A 1280x800
+/// scanout at 8x16 is 50 rows; 64 leaves room for larger displays.
+pub const MAX_ROWS: usize = 64;
 
 /// One character cell: a code point and the colours it is drawn in.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,7 +87,7 @@ pub struct Grid {
     pen_bold: bool,
     /// Whether the cursor is shown; `less` hides it while painting a screenful.
     pub cursor_visible: bool,
-    dirty: u32,
+    dirty: u64,
     /// The main screen parked while an alternate screen (a full-page `less`, a
     /// `vi`) is showing, so leaving it restores what was there.
     alt: Option<Snapshot>,
@@ -159,14 +160,14 @@ impl Grid {
 
     /// Take and clear the changed-row mask; a screen that changed nothing skips
     /// its flush.
-    pub fn take_dirty(&mut self) -> u32 {
+    pub fn take_dirty(&mut self) -> u64 {
         let d = self.dirty;
         self.dirty = 0;
         d
     }
 
     pub fn mark_all_dirty(&mut self) {
-        self.dirty = (1u32 << self.rows) - 1;
+        self.dirty = (1u64 << self.rows) - 1;
     }
 
     fn mark(&mut self, row: usize) {
@@ -707,29 +708,38 @@ pub fn with_screen<R>(index: usize, f: impl FnOnce(&mut Grid) -> R) -> Option<R>
     })
 }
 
-/// Paint the screen at `index` into `fb` for its dirty rows and say whether it
-/// repainted anything; the flush is left to the caller, outside the lock, so a
-/// slow host-side DMA copy never runs with the clock masked off.
-pub fn render_screen(
-    index: usize,
-    fb: &mut [u8],
-    fb_w: usize,
-    fb_h: usize,
-    origin: (usize, usize),
-) -> bool {
-    with_screen(index, |g| {
-        let dirty = g.take_dirty();
-        if dirty == 0 {
-            return false;
-        }
-        blit::paint(g, fb, fb_w, fb_h, origin, dirty);
-        true
-    })
-    .unwrap_or(false)
+/// A snapshot of a screen taken under the lock, for the renderer to paint
+/// outside it. The pixel blit over a full 1280x800 grid is ~1M writes; doing
+/// that with the clock masked would starve the timer and the keyboard - the
+/// very failure this whole move off the serial wire set out to fix. So the
+/// renderer copies the (small) cell data under the critical section and paints
+/// from the copy with interrupts live.
+pub struct Frame {
+    pub dirty: u64,
+    pub rows: usize,
+    pub cols: usize,
+    pub cursor: (usize, usize),
+    pub cursor_visible: bool,
 }
 
-/// The kernel console screen, index 0.
-pub const KERNEL_SCREEN: usize = 0;
+/// Copy the screen at `index` into `cells` (which must already be sized to the
+/// grid) and report its geometry and dirty rows. The copy is a fixed-size
+/// memcpy - no allocation under the lock.
+pub fn snapshot(index: usize, cells: &mut [Cell]) -> Option<Frame> {
+    with_screen(index, |g| {
+        let dirty = g.take_dirty();
+        if cells.len() == g.cells().len() {
+            cells.copy_from_slice(g.cells());
+        }
+        Frame {
+            dirty,
+            rows: g.rows(),
+            cols: g.cols(),
+            cursor: g.cursor(),
+            cursor_visible: g.cursor_visible,
+        }
+    })
+}
 
 #[cfg(test)]
 mod tests {

@@ -21,23 +21,33 @@ use super::{Cell, Grid, Rgb};
 /// `dirty` is the row bitmask from [`Grid::take_dirty`]. The cursor is drawn
 /// last, inverted over its cell, so it stays legible regardless of the glyph
 /// under it - unless the screen has hidden it (`cursor_visible`).
-pub fn paint(
-    grid: &Grid,
+///
+/// The slice form is what the renderer calls: it paints from a snapshot taken
+/// under the lock, so the million-pixel walk runs with interrupts live.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_cells(
+    cells: &[Cell],
+    rows: usize,
+    cols: usize,
+    cursor: (usize, usize),
+    cursor_visible: bool,
     fb: &mut [u8],
     fb_w: usize,
     fb_h: usize,
     origin: (usize, usize),
-    dirty: u32,
+    dirty: u64,
 ) {
     let (ox, oy) = origin;
     let stride = fb_w * 4;
-    let (rows, cols) = (grid.rows(), grid.cols());
     for r in 0..rows {
         if dirty & (1 << r) == 0 {
             continue;
         }
         for c in 0..cols {
-            let cell = grid.cell(r, c);
+            let idx = r * cols + c;
+            if idx >= cells.len() {
+                continue;
+            }
             draw_cell(
                 fb,
                 stride,
@@ -45,29 +55,54 @@ pub fn paint(
                 fb_h,
                 ox + c * CELL_W,
                 oy + r * CELL_H,
-                &cell,
+                &cells[idx],
             );
         }
     }
 
-    if grid.cursor_visible {
-        let (crow, ccol) = grid.cursor();
+    if cursor_visible {
         // A print at the last column leaves the cursor "wrap-pending" at
         // `col == cols`; clamp onto the grid so the block never indexes off the
         // end. The character it covers is the last one written.
-        let crow = crow.min(grid.rows() - 1);
-        let ccol = ccol.min(grid.cols() - 1);
-        let cell = grid.cell(crow, ccol);
-        draw_cursor(
-            fb,
-            stride,
-            fb_w,
-            fb_h,
-            ox + ccol * CELL_W,
-            oy + crow * CELL_H,
-            &cell,
-        );
+        let crow = cursor.0.min(rows.saturating_sub(1));
+        let ccol = cursor.1.min(cols.saturating_sub(1));
+        let idx = crow * cols + ccol;
+        if idx < cells.len() {
+            draw_cursor(
+                fb,
+                stride,
+                fb_w,
+                fb_h,
+                ox + ccol * CELL_W,
+                oy + crow * CELL_H,
+                &cells[idx],
+            );
+        }
     }
+}
+
+/// Paint a live [`Grid`]. Convenience over [`paint_cells`] for tests and any
+/// caller that already holds the grid.
+pub fn paint(
+    grid: &Grid,
+    fb: &mut [u8],
+    fb_w: usize,
+    fb_h: usize,
+    origin: (usize, usize),
+    dirty: u64,
+) {
+    paint_cells(
+        grid.cells(),
+        grid.rows(),
+        grid.cols(),
+        grid.cursor(),
+        grid.cursor_visible,
+        fb,
+        fb_w,
+        fb_h,
+        origin,
+        dirty,
+    );
 }
 
 fn draw_cell(
