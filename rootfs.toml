@@ -60,6 +60,7 @@ extra_packages = [
     "curl",
     "doas",
     "weston",
+    "seatd",
     "fish"
 ]
 

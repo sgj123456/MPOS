@@ -3516,6 +3516,12 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             n as isize
         }
         request if (request & 0xff) == b'E' as u32 => evdev_ioctl(fd, request, buf, from_user),
+        // Console-ownership (`'V'`-typed VT_*) and keyboard/video-mode
+        // (`'K'`-typed KD*) ioctls, which a seat manager drives the line
+        // through when it takes a terminal away from the text console and
+        // hands it to a compositor.
+        request if (request & 0xff) == b'V' as u32 => vt_ioctl(fd, request, buf, from_user),
+        request if (request & 0xff) == b'K' as u32 => kd_ioctl(fd, request, buf, from_user),
         // DRM/KMS ioctls (`'d'`-typed), routed to the card handler which
         // dispatches on the request number itself.
         #[cfg(target_os = "none")]
@@ -3523,6 +3529,109 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             crate::drivers::drm::drm_ioctl(fd, request, buf)
         }
         _ => err::ENOTTY,
+    }
+}
+
+/// The virtual-terminal (`'V'`-typed) ioctls a seat manager uses to own the
+/// console a compositor runs on. mpos has a single console and no multiplexed
+/// VTs to switch between, so these are answered from that one reality rather
+/// than emulated as a fleet: the queries report the console as it is, and the
+/// actions that would move or re-mode a VT succeed by doing nothing, because
+/// there is nowhere else to move it to. A `seatd` that cannot get past this
+/// dance never hands the card to weston, which is why the reads carry sane
+/// values rather than a flat success.
+fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
+    let size = ((request >> 16) & 0x3fff) as usize;
+    let nr = (request >> 8) & 0xff;
+    // These name a console, so only a tty answers them.
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    if file.inode().as_tty().is_none() {
+        return err::ENOTTY;
+    }
+    use core::mem::size_of;
+    match nr {
+        0x00 => err::EIO,
+        // VT_OPENQRY: no free VT to point at, this one console is all there is
+        // and it is already the one in hand.
+        0x01 => {
+            // VT_GETMODE -> struct vt_mode { mode, waitv, relsig, acqsig, frsig }.
+            // Report automatic switching (`VT_AUTO`), no signals, so a manager
+            // leaves the console in the mode it already runs in.
+            let out = [1u8, 0, 0, 0, 0, 0, 0, 0]; // mode=VT_AUTO, rest zero
+            let n = size.min(out.len());
+            if !buffer_ok(buf, n, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, n) };
+            0
+        }
+        0x02 => 0, // VT_SETMODE: accept whatever mode is asked for.
+        0x03 => {
+            // VT_GETSTATE -> struct vt_stat { v_mode, v_num, v_state } (shorts).
+            // The one console, in text mode, active.
+            if !buffer_ok(buf, size_of::<[u16; 3]>(), true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe {
+                let p = buf as *mut u16;
+                p.write_unaligned(0); // v_mode: not in raw/graphics (text)
+                p.add(1).write_unaligned(1); // v_num: console 1
+                p.add(2).write_unaligned(0); // v_state: active
+            }
+            0
+        }
+        0x04 => 0, // VT_SENDSIG: nothing to signal.
+        0x05 => 1, // VT_RELDISP: agree the display can be released.
+        0x06 => 0, // VT_ACTIVATE: already the console asked for.
+        0x07 => 0, // VT_WAITACTIVE: it is active now, so return at once.
+        0x08 => 0, // VT_DISALLOCATE: nothing to free.
+        0x09 => 0, // VT_RESIZE: the window size comes from TIOCGWINSZ instead.
+        0x0a => 0, // VT_RESIZEX: same.
+        _ => err::ENOTTY,
+    }
+}
+
+/// The keyboard/video-mode (`'K'`-typed) ioctls that bracket a VT handover:
+/// put the keyboard in raw so the compositor gets scancodes, and put the
+/// console in graphics mode so the framebuffer is not painted over by the text
+/// driver. On the compositor boot the scanout is already not the console's, and
+/// the keyboard already reaches input as events, so these record nothing -
+/// they only have to succeed for a seat manager to complete the switch.
+fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
+    let nr = (request >> 8) & 0xff;
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    if file.inode().as_tty().is_none() {
+        return err::ENOTTY;
+    }
+    match nr {
+        // KDGETMODE (0x0b) and KDGKBMODE (0x2c) are reads that report the
+        // current mode; the rest (KDSETMODE 0x0a, KDSKBMODE 0x36, and the
+        // led/keymap setters) are accepted.
+        0x0b => {
+            // KDGETMODE -> int: 0 (KD_TEXT). The compositor's ownership of the
+            // scanout is decided by the boot mode, not by this field, so
+            // reporting text keeps the console's own view consistent.
+            if !buffer_ok(buf, 4, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut i32).write_unaligned(0) };
+            0
+        }
+        0x2c => {
+            // KDGKBMODE -> int: K_XLINUX (0x04), a raw-ish scancode mode.
+            if !buffer_ok(buf, 4, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut i32).write_unaligned(0x04) };
+            0
+        }
+        _ => 0,
     }
 }
 

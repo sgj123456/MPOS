@@ -62,6 +62,16 @@ const NR_MAP_DUMB: u32 = 0xb3;
 const NR_DESTROY_DUMB: u32 = 0xb4;
 const NR_GETPLANE: u32 = 0xb6;
 const NR_GETPLANERESOURCES: u32 = 0xb5;
+/// Session-ownership requests - `DRM_IOCTL_AUTHMB` / `_SET_MASTER` /
+/// `_DROP_MASTER`. They are `_IO` (no argument), so `arg` is null for them and
+/// they must be answered before the read-buffer check in `drm_ioctl`. A seat
+/// manager reaches them through libdrm when it hands the card to a compositor.
+/// mpos has one card and whoever opened it is its master, so all three succeed
+/// by doing nothing - refusing `SET_MASTER` is what stops weston from ever
+/// getting a master fd it can set a mode on.
+const NR_AUTH: u32 = 0x1c;
+const NR_SET_MASTER: u32 = 0x1e;
+const NR_DROP_MASTER: u32 = 0x1f;
 
 /// `DRM_CAP_DUMB_BUFFER`; `GET_CAP` answers 1 for it and 0 elsewhere.
 const CAP_DUMB_BUFFER: u64 = 0x1;
@@ -241,6 +251,11 @@ pub fn drm_ioctl(fd: i32, request: u32, arg: usize) -> isize {
     };
     if file.inode().as_drm().is_none() {
         return -25; // ENOTTY
+    }
+    // Master/auth requests carry no argument, so answer them before the
+    // `arg == 0` fault check below would reject a legitimate no-buffer call.
+    if matches!(nr, NR_AUTH | NR_SET_MASTER | NR_DROP_MASTER) {
+        return 0;
     }
     if arg == 0 {
         return -14; // EFAULT
