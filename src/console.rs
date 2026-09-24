@@ -42,6 +42,25 @@ pub fn set_headless(on: bool) {
     HEADLESS.store(on, Ordering::Relaxed);
 }
 
+/// Whether the boot mode *asks* for the serial mirror at all, before the console
+/// reaches the framebuffer. Set from the command line (`mpos.nomirror` clears
+/// it) and read once by [`takeover`] to decide `MIRROR_SERIAL`. Default on, so a
+/// boot that says nothing keeps mirroring the console to the wire as it did
+/// before the gui/terminal run modes existed.
+static MIRROR_WANTED: AtomicBool = AtomicBool::new(true);
+
+/// Record whether this boot wants the console mirrored to the serial wire once
+/// the framebuffer takes over. Called once, from the kernel entry; off only for a
+/// `mpos.nomirror` (gui-mode) boot.
+pub fn set_mirror_wanted(on: bool) {
+    MIRROR_WANTED.store(on, Ordering::Relaxed);
+}
+
+/// Whether the boot mode asked for the serial mirror. Read by [`takeover`].
+pub fn mirror_wanted() -> bool {
+    MIRROR_WANTED.load(Ordering::Relaxed)
+}
+
 /// Whether this machine was booted with no display (selftest, headless CI).
 pub fn headless() -> bool {
     HEADLESS.load(Ordering::Relaxed)
@@ -170,7 +189,7 @@ pub fn write_bytes(bytes: &[u8]) {
         crate::vfs::term::with_screen(active_grid(), |g| g.feed(bytes));
         crate::drivers::video::render::notify();
         if mirror_serial() {
-            serial_bytes(bytes);
+            serial_mirror_now(bytes);
         }
         return;
     }
@@ -190,7 +209,7 @@ pub fn vc_output(vc: u32, bytes: &[u8]) {
         crate::vfs::term::with_screen(vc as usize, |g| g.feed(bytes));
         crate::drivers::video::render::notify();
         if mirror_serial() {
-            serial_bytes(bytes);
+            serial_mirror_now(bytes);
         }
     } else {
         serial_bytes(bytes);
@@ -224,10 +243,12 @@ fn record(bytes: &[u8]) {
 /// Hand the console to the framebuffer: replay the boot log onto the freshly
 /// made screen, then switch. Called by the render task once its screen exists,
 /// so there is no window between "GPU is the backend" and "there is a screen to
-/// paint." The serial mirror stays on, so the console shows in the framebuffer
-/// window *and* the serial terminal at once. The mirror is synchronous: a slow
-/// terminal draining a flood can back the mux up and slow both sinks together -
-/// the accepted cost of showing the same console in two places.
+/// paint." Whether the serial wire *also* mirrors the console is the boot mode's
+/// choice ([`mirror_wanted`]): mirror mode does, gui mode stays quiet. When it
+/// mirrors it does so best-effort - [`serial_mirror_now`] hands the bytes to the
+/// transmit ring and returns, never parking the caller - so a host terminal that
+/// cannot keep up drops serial bytes instead of stalling the framebuffer and the
+/// console mux behind it.
 pub fn takeover() {
     let snapshot: Vec<u8> = critical_section::with(|cs| {
         let mut out = Vec::with_capacity(LOG.borrow(cs).borrow().len());
@@ -238,7 +259,33 @@ pub fn takeover() {
         g.reset_to_boot(&snapshot);
     });
     set_gpu();
-    set_mirror_serial(true);
+    set_mirror_serial(mirror_wanted());
+}
+
+/// Mirror console bytes onto the serial wire without ever blocking the producer.
+///
+/// This is the framebuffer console's serial mirror - the copy of the screen's
+/// text that also goes out the wire so a plain terminal can watch the same
+/// console. Unlike [`serial_bytes`] (the *authoritative* write, which parks
+/// until the hardware takes everything so nothing is lost), the mirror is
+/// best-effort: the bytes are handed to the transmit ring and we return, and
+/// whatever the ring has no room for is dropped. That is the whole point - a
+/// slow host terminal must never throttle the framebuffer, and the caller here
+/// is often the console mux or a `println!` whose progress the machine cannot
+/// afford to stall on the wire's speed.
+///
+/// Before the transmitter interrupts - early boot, or an interrupt context that
+/// cannot reach the ring - there is nothing to hand over to, so this falls back
+/// to the bounded polled [`serial_bytes`], which never parks either.
+fn serial_mirror_now(bytes: &[u8]) {
+    if crate::drivers::serial::interrupt_driven() {
+        // `tx_submit` copies what fits and returns that count; the tail is
+        // dropped by design - the TX interrupt drains the rest of the ring at
+        // wire speed in the background.
+        let _ = crate::drivers::serial::tx_submit(bytes);
+        return;
+    }
+    serial_bytes(bytes);
 }
 
 /// Write raw bytes on the serial console - the wire, through the transmit ring.

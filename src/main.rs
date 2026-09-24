@@ -162,6 +162,16 @@ fn kernel_main(info: &BootInfo) {
             .any(|a| a == "mpos.headless"),
     );
 
+    // Whether the console should *also* mirror to the serial wire once it is on
+    // the framebuffer. Default on (mirror mode, the historical `run` behaviour);
+    // a `mpos.nomirror` boot - gui mode, from `cargo xtask run --console gui` -
+    // asks for the window alone and leaves the wire quiet after takeover.
+    mpos::console::set_mirror_wanted(
+        !boot::cmdline()
+            .split_whitespace()
+            .any(|a| a == "mpos.nomirror"),
+    );
+
     init_mm();
     if selftest {
         check_mm(info);
