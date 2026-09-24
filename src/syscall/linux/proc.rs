@@ -1404,7 +1404,7 @@ pub(super) fn handle_execve(
     // discovered: the file's first two bytes say so. The chain is followed
     // exactly as the kernel's own spawns follow it - one resolver, so the two
     // paths can never disagree about what a script is.
-    let (bytes, argv) = match crate::sched::resolve_script(bytes, argv, Some(cwd.clone())) {
+    let (bytes, argv) = match crate::sched::resolve_script(bytes, argv, Some(cwd.clone()), &path) {
         Ok(r) => r,
         Err(crate::sched::SpawnError::Loop) => return err::ELOOP,
         // Linux reports a missing interpreter as "the file was not found",

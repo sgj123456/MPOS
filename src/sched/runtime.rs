@@ -1344,8 +1344,17 @@ pub fn resolve_script(
     bytes: Vec<u8>,
     mut argv: Vec<String>,
     start: Option<alloc::sync::Arc<dyn crate::vfs::Inode>>,
+    exec_path: &str,
 ) -> Result<(Vec<u8>, Vec<String>), SpawnError> {
     let mut bytes = bytes;
+    // The path the file in `bytes` was reached by - `execve`'s own argument for
+    // the first file, and each interpreter's name for the next. A script is
+    // handed to its interpreter by *this* path, not by the name the caller
+    // chose for argv[0]: a `PATH` search finds `/usr/bin/mkfontdir` while the
+    // shell still calls it through argv as plain `mkfontdir`, and an
+    // interpreter told to open `mkfontdir` looks for it in the working
+    // directory and fails on a file that is really elsewhere.
+    let mut script_path = String::from(exec_path);
     let mut hops = 0;
     while let Some((interp, argument)) = crate::binfmt::shebang(&bytes) {
         hops += 1;
@@ -1353,16 +1362,21 @@ pub fn resolve_script(
             // A chain of interpreters that leads back into itself.
             return Err(SpawnError::Loop);
         }
+        // The interpreter is the new argv[0]; the resolved path stands in for
+        // the name the script was invoked by, and the caller's own arguments
+        // follow it.
         let mut rewritten: Vec<String> = Vec::with_capacity(argv.len() + 2);
         rewritten.push(interp.clone());
         if let Some(argument) = argument {
             rewritten.push(argument);
         }
-        rewritten.extend(argv.iter().cloned());
+        rewritten.push(core::mem::take(&mut script_path));
+        rewritten.extend(argv.iter().skip(1).cloned());
         argv = rewritten;
+        script_path = interp.clone();
         bytes = match start.as_ref() {
-            Some(dir) => crate::vfs::read_file_opt(&interp, Some(dir.clone())),
-            None => crate::vfs::read_file(&interp),
+            Some(dir) => crate::vfs::read_file_opt(&script_path, Some(dir.clone())),
+            None => crate::vfs::read_file(&script_path),
         }
         .map_err(|_| SpawnError::NoInterpreter)?;
     }
@@ -1370,7 +1384,8 @@ pub fn resolve_script(
 }
 
 pub fn spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<TaskId, SpawnError> {
-    let (bytes, argv) = resolve_script(bytes.to_vec(), argv.to_vec(), None)?;
+    let path = argv.first().cloned().unwrap_or_default();
+    let (bytes, argv) = resolve_script(bytes.to_vec(), argv.to_vec(), None, &path)?;
     let id = try_spawn_init(&bytes, &argv, env)?;
     assert_eq!(id, INIT_PID, "init did not land on pid 1");
     Ok(id)
