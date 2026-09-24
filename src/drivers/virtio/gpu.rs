@@ -43,10 +43,6 @@ const DEVICE_GPU: &[u16] = &[0x1050];
 const FALLBACK: (u32, u32) = (1024, 768);
 
 pub struct VirtioGpuDev {
-    /// The device, behind a lock: every operation the crate offers takes
-    /// `&mut`, and the framebuffer is one device however many windows are
-    /// drawn through it.
-    device: Mutex<RefCell<VirtIOGpu<HalImpl, PciTransport>>>,
     width: u32,
     height: u32,
     /// Where the pixel buffer lives, as the device addresses it. The direct
@@ -75,27 +71,24 @@ impl VirtioGpuDev {
         len
     }
 
-    /// Write pixels into the buffer and put them on the screen. The flush
-    /// is the point: `write(2)` returning is the promise that the pixels
-    /// left, the same contract a write-through disk keeps.
+    /// Write pixels into the buffer and put them on the screen. The flush is
+    /// the point: `write(2)` returning is the promise that the pixels left, the
+    /// same contract a write-through disk keeps. The device itself is owned by
+    /// the render task, so this asks that task to flush and parks until it has.
     fn write(&self, offset: u64, buf: &[u8]) -> usize {
         let at = (offset as usize).min(self.fb_len);
         let len = buf.len().min(self.fb_len - at);
-        critical_section::with(|cs| {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    buf.as_ptr(),
-                    (mm::phys_to_virt(self.fb_phys) + at) as *mut u8,
-                    len,
-                );
-            }
-            // One flush per write, under the lock the device's queue needs
-            // anyway: a writer that interleaved with another's flush could
-            // put half of each on the screen, and the cheap answer - the
-            // whole write, then the flush - is the one the write-through
-            // contract promises.
-            let _ = self.device.borrow(cs).borrow_mut().flush();
+        critical_section::with(|_| unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                (mm::phys_to_virt(self.fb_phys) + at) as *mut u8,
+                len,
+            );
         });
+        // The single flusher is the render task; block until it has moved the
+        // frame we just edited, so the write-through promise still holds.
+        #[cfg(target_os = "none")]
+        crate::drivers::video::render::request_flush_blocking();
         len
     }
 
@@ -121,7 +114,11 @@ impl VirtioGpuDev {
     /// Probe the PCI bus and bring up the first virtio-gpu device: ask the
     /// host what its display is, fall back to the headless shape, and build
     /// the resource at that size.
-    pub fn init() -> Option<Arc<Self>> {
+    ///
+    /// Returns the buffer view (which `/dev/fb0` and the page pins share) *and*
+    /// the device itself, moved out - the render task is its sole owner, and
+    /// the only thing that may call `flush` on it.
+    pub fn init() -> Option<(Arc<Self>, VirtIOGpu<HalImpl, PciTransport>)> {
         let mut device = VirtIOGpu::<HalImpl, _>::new(transport(DEVICE_GPU)?).ok()?;
 
         let dims = match device.resolution() {
@@ -135,7 +132,6 @@ impl VirtioGpuDev {
         let pages = fb_len.div_ceil(PAGE_SIZE);
 
         let dev = Arc::new(VirtioGpuDev {
-            device: Mutex::new(RefCell::new(device)),
             width: dims.0,
             height: dims.1,
             fb_phys,
@@ -150,21 +146,22 @@ impl VirtioGpuDev {
         // still drawing the screen out of.
         mm::pin_frames(fb_phys, pages * PAGE_SIZE);
 
-        Some(dev)
+        Some((dev, device))
     }
 }
 
-/// The device the boot found, if it found one.
+/// The device the boot found, if it found one - the buffer view only. The
+/// render task holds the live device; this is what `/dev/fb0` reaches.
 static GLOBAL: Mutex<RefCell<Option<Arc<VirtioGpuDev>>>> = Mutex::new(RefCell::new(None));
 
-/// Probe for the card and record it under the name userland will open.
-pub fn init_global() -> Option<Arc<VirtioGpuDev>> {
-    let dev = VirtioGpuDev::init()?;
+/// Probe for the card, record the buffer view under the name userland opens,
+/// and hand back both the view and the device for the render task to own.
+pub fn init_global() -> Option<(Arc<VirtioGpuDev>, VirtIOGpu<HalImpl, PciTransport>)> {
+    let (dev, device) = VirtioGpuDev::init()?;
     critical_section::with(|cs| {
-        let mut slot = GLOBAL.borrow(cs).borrow_mut();
-        *slot = Some(dev.clone());
+        *GLOBAL.borrow(cs).borrow_mut() = Some(dev.clone());
     });
-    Some(dev)
+    Some((dev, device))
 }
 
 /// The card, if the machine has one.

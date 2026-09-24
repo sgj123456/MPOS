@@ -8,10 +8,74 @@
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use critical_section::Mutex;
 
 pub struct Console;
+
+/// Where the console's bytes land once the GPU framebuffer takes over.
+///
+/// `Serial` is the boot answer and the permanent headless answer; `Gpu` is
+/// flipped once, when the render task owns the scanout. The switch is read from
+/// the serial interrupt path, so it is a plain atomic, never a lock - for the
+/// same reason `drivers::serial` keeps no lock (see its module doc).
+const BACKEND_SERIAL: u8 = 0;
+const BACKEND_GPU: u8 = 1;
+static BACKEND: AtomicU8 = AtomicU8::new(BACKEND_SERIAL);
+
+/// Mirror kernel-console bytes onto the serial wire as well as drawing them.
+///
+/// On while there is no GPU (and on a panic, so the report reaches the host);
+/// on in headless mode, which is how `cargo xtask test` keeps reading its log;
+/// off for an interactive GPU boot, because a mirror would send the `bat` flood
+/// back down the one wire and undo the whole feature.
+static MIRROR_SERIAL: AtomicBool = AtomicBool::new(true);
+
+/// `mpos.headless` on the command line. A headless QEMU still has a virtio-gpu
+/// (it answers with a fallback mode), so head-lessness is a command-line fact,
+/// not a device-presence one; when it is set the GPU is never engaged at all.
+static HEADLESS: AtomicBool = AtomicBool::new(false);
+
+/// Record the `mpos.headless` boot flag. Called once, from the kernel entry.
+pub fn set_headless(on: bool) {
+    HEADLESS.store(on, Ordering::Relaxed);
+}
+
+/// Whether this machine was booted with no display (selftest, headless CI).
+pub fn headless() -> bool {
+    HEADLESS.load(Ordering::Relaxed)
+}
+
+/// Whether the framebuffer is drawing the console.
+pub fn gpu_mode() -> bool {
+    BACKEND.load(Ordering::Relaxed) == BACKEND_GPU
+}
+
+/// Hand the console to the GPU. Ignored while headless, which is the point of
+/// the headless flag: no scanout, no DMA, the wire stays the whole display.
+pub fn set_gpu() {
+    if !headless() {
+        BACKEND.store(BACKEND_GPU, Ordering::Relaxed);
+    }
+}
+
+/// Pull the console back to the serial wire and mirror onto it. The panic path
+/// uses this so a report is always on the host's serial, GPU or not.
+pub fn force_serial() {
+    BACKEND.store(BACKEND_SERIAL, Ordering::Relaxed);
+    MIRROR_SERIAL.store(true, Ordering::Relaxed);
+}
+
+/// Turn the serial mirror on or off, as the boot mode and takeover require.
+pub fn set_mirror_serial(on: bool) {
+    MIRROR_SERIAL.store(on, Ordering::Relaxed);
+}
+
+/// Whether kernel-console bytes are also going out the serial wire.
+pub fn mirror_serial() -> bool {
+    MIRROR_SERIAL.load(Ordering::Relaxed)
+}
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -93,7 +157,24 @@ pub fn dmesg_capacity() -> usize {
     DMESG_CAP
 }
 
-/// Write raw bytes on the console, parking on the transmit ring when it fills.
+pub fn write_bytes(bytes: &[u8]) {
+    if gpu_mode() {
+        // The GPU renderer is wired in a later phase. Until it owns the bytes,
+        // drawing them still means the mirror; once it does, the mirror is the
+        // only thing headless keeps. Either way the wire path is `serial_bytes`.
+        if mirror_serial() {
+            serial_bytes(bytes);
+        }
+        return;
+    }
+    serial_bytes(bytes);
+}
+
+/// Write raw bytes on the serial console - the wire, through the transmit ring.
+///
+/// This is what [`write_bytes`] dispatches to when the console is on the wire
+/// (and, for now, even when it is meant for the framebuffer). Everything below
+/// is the ring-or-polled choice the boot depends on.
 ///
 /// Once the transmitter interrupts - [`crate::drivers::serial::enable_tx`],
 /// where the IDT and the PIC exist - the bytes are queued and a full ring
@@ -112,7 +193,7 @@ pub fn dmesg_capacity() -> usize {
 /// handler, or the panic path on the way out. It is bounded by the chunk, not
 /// by the wait, so a host that stops draining still costs only one line's
 /// worth of masked interrupts rather than the machine.
-pub fn write_bytes(bytes: &[u8]) {
+fn serial_bytes(bytes: &[u8]) {
     if !crate::drivers::serial::interrupt_driven() || !may_park() {
         const CHUNK: usize = 64;
         for piece in bytes.chunks(CHUNK) {

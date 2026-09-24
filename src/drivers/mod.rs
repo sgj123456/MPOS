@@ -8,4 +8,5 @@ pub mod devices;
 pub mod pci;
 pub mod qemu;
 pub mod serial;
+pub mod video;
 pub mod virtio;

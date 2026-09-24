@@ -151,6 +151,17 @@ fn kernel_main(info: &BootInfo) {
         .split_whitespace()
         .any(|a| a == "mpos.selftest");
 
+    // Head-lessness decides whether the console is ever allowed to move to the
+    // GPU framebuffer. `cargo xtask test` sets it (with `mpos.selftest`) so the
+    // whole boot stays on the serial log the harness reads; an interactive
+    // `run` does not, and gets the framebuffer. A headless machine still has a
+    // virtio-gpu, so this can only be a command-line fact, not device presence.
+    mpos::console::set_headless(
+        boot::cmdline()
+            .split_whitespace()
+            .any(|a| a == "mpos.headless"),
+    );
+
     init_mm();
     if selftest {
         check_mm(info);
@@ -1366,12 +1377,22 @@ fn init_virtio() {
         }
     }
 
-    if let Some(gpu) = mpos::drivers::virtio::gpu::init_global() {
+    if let Some((gpu, device)) = mpos::drivers::virtio::gpu::init_global() {
         let (width, height) = gpu.dims();
         println!(
             "virtio-gpu: {width}x{height}, {} KiB at /dev/fb0",
             gpu.fb_len() / 1024
         );
+        // Hand the device to the render task and move the console to it - but
+        // only when there is a display to render to. A headless boot keeps the
+        // whole console on the serial wire and drops the device unused, so the
+        // DMA spin never runs and `/dev/fb0` still exists for any program that
+        // opens it.
+        if mpos::console::headless() {
+            drop(device);
+        } else {
+            mpos::drivers::video::render::spawn(device, gpu);
+        }
     }
 
     let inputs = mpos::drivers::virtio::input::init();
@@ -1490,6 +1511,9 @@ fn park() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // A panic must reach the host on the wire even if the console had moved to
+    // the framebuffer, and must not park on a transmit ring mid-report.
+    mpos::console::force_serial();
     println!("\nKERNEL PANIC: {}", info);
     stack_scan();
     drivers::qemu::exit(drivers::qemu::EXIT_FAILURE)
