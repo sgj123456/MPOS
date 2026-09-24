@@ -28,14 +28,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // (a) Shrink two pages to one: the tail is dropped, the head keeps its
     // contents.
-    let p = lin::mmap(
-        0x5000_C000,
-        8192,
-        RW,
-        ANON_PRIVATE | lin::MAP_FIXED,
-        -1,
-        0,
-    );
+    let p = lin::mmap(0x5000_C000, 8192, RW, ANON_PRIVATE | lin::MAP_FIXED, -1, 0);
     lin::check_eq(
         &mut failed,
         b"the two-page range maps fixed",
@@ -98,14 +91,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // (c') The relocation path: grow by a page with the neighbor occupied,
     // so MAYMOVE has to find a fresh page-aligned home for the same pages.
-    let blocker = lin::mmap(
-        0x5000_F000,
-        4096,
-        RW,
-        ANON_PRIVATE | lin::MAP_FIXED,
-        -1,
-        0,
-    );
+    let blocker = lin::mmap(0x5000_F000, 4096, RW, ANON_PRIVATE | lin::MAP_FIXED, -1, 0);
     lin::check_eq(
         &mut failed,
         b"the neighbor blocking the grow maps fixed",

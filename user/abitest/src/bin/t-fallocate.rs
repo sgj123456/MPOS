@@ -25,7 +25,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-fallocate\n");
     let mut failed = false;
 
-    let fd = lin::openat(lin::AT_FDCWD, &PATH, lin::O_CREAT | lin::O_RDWR | 0o1000, 0o644) as i32;
+    let fd = lin::openat(
+        lin::AT_FDCWD,
+        &PATH,
+        lin::O_CREAT | lin::O_RDWR | 0o1000,
+        0o644,
+    ) as i32;
     lin::check_true(&mut failed, b"the file is created", fd >= 0);
 
     // The default operation: the range becomes the file's new size, and
@@ -56,20 +61,42 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         st_ctime_nsec: 0,
         _unused: [0; 3],
     };
-    lin::check_eq(&mut failed, b"fstat succeeds", lin::fstat(fd, &raw mut st), 0);
-    lin::check_eq(&mut failed, b"the file grew to the range's end", st.st_size as isize, 4096);
-    static mut ZEROS: [u8; 16] = [1; 16];
-    let r = lin::read(fd, unsafe { core::slice::from_raw_parts_mut(&raw mut ZEROS as *mut u8, 16) });
-    lin::check_eq(&mut failed, b"16 bytes read back", r, 16);
-    lin::check_true(
+    lin::check_eq(
         &mut failed,
-        b"the allocated range reads as zeros",
-        unsafe { core::slice::from_raw_parts(&raw const ZEROS as *const u8, 16).iter().all(|&b| b == 0) },
+        b"fstat succeeds",
+        lin::fstat(fd, &raw mut st),
+        0,
     );
+    lin::check_eq(
+        &mut failed,
+        b"the file grew to the range's end",
+        st.st_size as isize,
+        4096,
+    );
+    static mut ZEROS: [u8; 16] = [1; 16];
+    let r = lin::read(fd, unsafe {
+        core::slice::from_raw_parts_mut(&raw mut ZEROS as *mut u8, 16)
+    });
+    lin::check_eq(&mut failed, b"16 bytes read back", r, 16);
+    lin::check_true(&mut failed, b"the allocated range reads as zeros", unsafe {
+        core::slice::from_raw_parts(&raw const ZEROS as *const u8, 16)
+            .iter()
+            .all(|&b| b == 0)
+    });
 
     // The range's own validation, before any storage is touched.
-    lin::check_eq(&mut failed, b"a zero length answers EINVAL", lin::fallocate(fd, 0, 0, 0), lin::EINVAL);
-    lin::check_eq(&mut failed, b"a past-the-end offset answers EINVAL", lin::fallocate(fd, 0, 1usize << 63, 1), lin::EINVAL);
+    lin::check_eq(
+        &mut failed,
+        b"a zero length answers EINVAL",
+        lin::fallocate(fd, 0, 0, 0),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"a past-the-end offset answers EINVAL",
+        lin::fallocate(fd, 0, 1usize << 63, 1),
+        lin::EINVAL,
+    );
 
     // The mode vocabulary: unknown bits are EOPNOTSUPP, and the interior
     // operations this kernel cannot keep are answered the same way, after
@@ -89,7 +116,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"the punch is unsupported here",
-        lin::fallocate(fd, lin::FALLOC_FL_PUNCH_HOLE | lin::FALLOC_FL_KEEP_SIZE, 0, 1),
+        lin::fallocate(
+            fd,
+            lin::FALLOC_FL_PUNCH_HOLE | lin::FALLOC_FL_KEEP_SIZE,
+            0,
+            1,
+        ),
         lin::EOPNOTSUPP,
     );
     lin::check_eq(
@@ -107,20 +139,40 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::fallocate(fd, lin::FALLOC_FL_KEEP_SIZE, 0, 100),
         0,
     );
-    lin::check_eq(&mut failed, b"fstat still succeeds", lin::fstat(fd, &raw mut st), 0);
-    lin::check_eq(&mut failed, b"KEEP_SIZE changed nothing", st.st_size as isize, 4096);
+    lin::check_eq(
+        &mut failed,
+        b"fstat still succeeds",
+        lin::fstat(fd, &raw mut st),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"KEEP_SIZE changed nothing",
+        st.st_size as isize,
+        4096,
+    );
 
     // A descriptor that is not a file: the pipe gets the man page's
     // ENODEV, and a closed number gets EBADF.
     let mut fds: [i32; 2] = [-1; 2];
-    lin::check_eq(&mut failed, b"the pipe pair is made", lin::pipe2(&mut fds, 0), 0);
+    lin::check_eq(
+        &mut failed,
+        b"the pipe pair is made",
+        lin::pipe2(&mut fds, 0),
+        0,
+    );
     lin::check_eq(
         &mut failed,
         b"a pipe answers ENODEV",
         lin::fallocate(fds[0], 0, 0, 1),
         lin::ENODEV,
     );
-    lin::check_eq(&mut failed, b"a closed number answers EBADF", lin::fallocate(99, 0, 0, 1), lin::EBADF);
+    lin::check_eq(
+        &mut failed,
+        b"a closed number answers EBADF",
+        lin::fallocate(99, 0, 0, 1),
+        lin::EBADF,
+    );
 
     let _ = lin::close(fds[0]);
     let _ = lin::close(fds[1]);

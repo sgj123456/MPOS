@@ -44,12 +44,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         ss_size: SEED,
     };
     let r = lin::sigaltstack(core::ptr::null(), &mut old);
-    lin::check_eq(
-        &mut failed,
-        b"querying the fresh alt stack succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"querying the fresh alt stack succeeds", r, 0);
     lin::check_true(
         &mut failed,
         b"the fresh process reports SS_DISABLE with no stack",
@@ -145,12 +140,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         ss_size: 0,
     };
     let r = lin::sigaltstack(&disable, core::ptr::null_mut());
-    lin::check_eq(
-        &mut failed,
-        b"disabling with SS_DISABLE succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"disabling with SS_DISABLE succeeds", r, 0);
     let mut old = lin::StackT {
         ss_sp: SEED,
         ss_flags: 0x5a5a,
@@ -158,12 +148,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         ss_size: SEED,
     };
     let r = lin::sigaltstack(core::ptr::null(), &mut old);
-    lin::check_eq(
-        &mut failed,
-        b"the query after the disable succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"the query after the disable succeeds", r, 0);
     lin::check_true(
         &mut failed,
         b"the disabled stack reports SS_DISABLE again",

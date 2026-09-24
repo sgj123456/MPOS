@@ -113,6 +113,17 @@ pub fn alloc_frames(order: usize) -> Option<usize> {
 /// remain.
 #[cfg(target_os = "none")]
 pub fn free_frames(phys: usize, order: usize) {
+    // A pinned range is never handed back, whatever path asks. The pages in
+    // one belong to a device the kernel cannot reclaim: the GPU's
+    // framebuffer, whose DMA pages userland maps directly, so that a
+    // `munmap`, a fork's copy-on-write, or a process exit freeing "its" page
+    // would recycle memory the device is still drawing the screen out of.
+    // The frame's reference count is left alone on this path - the count
+    // only arbitrates between *owners*, and a pinned page has exactly one
+    // that never lets go.
+    if is_pinned(phys) {
+        return;
+    }
     if order == 0 {
         let should_free =
             critical_section::with(|cs| PMM.borrow(cs).borrow_mut().free_frame_ref(phys));
@@ -121,6 +132,41 @@ pub fn free_frames(phys: usize, order: usize) {
         }
     }
     critical_section::with(|cs| PMM.borrow(cs).borrow_mut().free(phys, order))
+}
+
+/// Physical ranges that must never reach the free lists, because a device
+/// owns them for the machine's life - set by [`pin_frames`], consulted by
+/// [`free_frames`]. One frame buffer is the whole registry today; a `Vec`
+/// because a second device with a user-mapped DMA region would be a second
+/// entry, not a redesign.
+#[cfg(target_os = "none")]
+static PINNED: critical_section::Mutex<core::cell::RefCell<alloc::vec::Vec<(usize, usize)>>> =
+    critical_section::Mutex::new(core::cell::RefCell::new(alloc::vec::Vec::new()));
+
+/// Mark `phys..phys + len` as device-owned for good: the allocator will
+/// refuse the range no matter who asks to free it or through which path.
+#[cfg(target_os = "none")]
+pub fn pin_frames(phys: usize, len: usize) {
+    critical_section::with(|cs| {
+        PINNED.borrow(cs).borrow_mut().push((
+            phys,
+            phys.checked_add(len).expect("a pinned range does not wrap"),
+        ));
+    });
+}
+
+/// Whether `phys` lies inside a pinned range. The check is a small walk of a
+/// tiny list - it only runs on the free path of an order-0 page, and the
+/// answer it protects is a screen's worth of DMA memory.
+#[cfg(target_os = "none")]
+fn is_pinned(phys: usize) -> bool {
+    critical_section::with(|cs| {
+        PINNED
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .any(|&(start, end)| phys >= start && phys < end)
+    })
 }
 
 /// The reference count of a single page. Returns 0 for untracked pages.

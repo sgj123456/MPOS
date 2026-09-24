@@ -43,12 +43,18 @@ pub enum Console {
 /// where the serial line went - and the rest (the firmware, the machine type,
 /// the network) drifting apart between them is a difference nobody asked for.
 /// The sizes and the name come from `[qemu]` in `rootfs.toml`.
+///
+/// `share_dir` is where the 9p share is exported from and where the console
+/// port's host socket lives - both under the build directory, both made
+/// before QEMU starts, so a device that needs a host-side file never finds
+/// it missing.
 pub fn machine_args(
     config: &QemuConfig,
     ovmf_dir: &Path,
     vars: &Path,
     boot: Boot,
     console: Console,
+    share_dir: &Path,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-machine".into(),
@@ -106,12 +112,14 @@ pub fn machine_args(
     // The name the guest's DHCP client reports, and the network the socket
     // tests are written against: `/init` brings eth0 up with the address slirp
     // expects, and `t-socket`, `t-tcp` and `t-udp` then talk to the host
-    // through it. A configured `dns` names the server behind `10.0.2.3`;
-    // without it slirp follows the host's own resolver file.
-    let mut netdev = format!("user,id=n0,hostname={}", config.hostname);
-    if let Some(dns) = config.dns.as_deref() {
-        netdev.push_str(&format!(",dns={dns}"));
-    }
+    // through it. No `dns=` ever goes here. QEMU's option of that name is the
+    // address slirp *answers* DNS at - the 10.0.2.3 the guest's resolv.conf
+    // and `t-dns` both name - not an upstream to forward to: the forwarding
+    // behind it always follows the host's own resolver, and moving the
+    // address strands every query the guest sends. Naming a different server
+    // is `[system] dns` in rootfs.toml, which the rootfs build writes into
+    // the guest's resolv.conf instead.
+    let netdev = format!("user,id=n0,hostname={}", config.hostname);
     args.extend([
         "-netdev".into(),
         netdev,
@@ -119,12 +127,84 @@ pub fn machine_args(
         "virtio-net-pci,netdev=n0".into(),
     ]);
 
+    // The rest of the virtio devices the kernel drives, each one probed and
+    // reported by the boot: the entropy source, the GPU, a keyboard, and a
+    // console port. None is required by the guest - a missing one boots
+    // without it - but the ones a boot verifies are the ones attached.
+    args.extend([
+        "-device".into(),
+        "virtio-rng-pci".into(),
+        "-device".into(),
+        "virtio-gpu-pci".into(),
+        "-device".into(),
+        "virtio-keyboard-pci".into(),
+        // The console port rides a `virtio-serial` card, and its far end is
+        // a host socket a test - or a curious operator - can hold. Until
+        // something connects, the port is exactly what it says it is: a
+        // console with no reader, whose writes go nowhere and whose reads
+        // answer nothing. `wait=off` keeps the machine from blocking on a
+        // listener that may never come.
+        "-chardev".into(),
+        format!(
+            "socket,id=console0,path={},server=on,wait=off",
+            share_dir.join("console.sock").display()
+        ),
+        "-device".into(),
+        "virtio-serial-pci".into(),
+        "-device".into(),
+        "virtconsole,chardev=console0".into(),
+        // The host share, under the tag the guest's `mount -t 9p hostshare`
+        // names. The directory is made before QEMU starts; an empty one is a
+        // share that lists empty, not a failed boot. `security_model=none`
+        // is the model a teaching kernel wants: the host's own permissions
+        // decide, and QEMU invents neither a chroot nor a mangled-uid
+        // mapping between the two sides.
+        "-virtfs".into(),
+        format!(
+            "local,path={},mount_tag=hostshare,security_model=none",
+            share_dir.display()
+        ),
+    ]);
+
+    // The two devices that depend on the host having something to give.
+    // Both are opt-in through `[qemu]` because a host without what they
+    // need refuses to start QEMU outright - and a machine that never boots
+    // is worse than a machine with no vsock and no sound.
+    if config.vsock {
+        // `guest-cid=3` is the guest's address on the host's vsock bus; the
+        // host itself answers on CID 2. The device's QEMU name is
+        // `vhost-vsock-pci` - the vhost backend is the device, which is why
+        // the name is not the virtio one the other devices carry.
+        args.extend(["-device".into(), "vhost-vsock-pci,guest-cid=3".into()]);
+    }
+    if config.audio {
+        // The `none` backend consumes the stream and plays silence - the
+        // driver is exercised end to end without asking the host for
+        // speakers.
+        args.extend([
+            "-audiodev".into(),
+            "none,id=snd0".into(),
+            "-device".into(),
+            "virtio-sound-pci,audiodev=snd0".into(),
+        ]);
+    }
+
     match console {
+        // `mux=off` is what the guest's own console keys are for. QEMU's
+        // default for a serial line shared with stdio is to claim `Ctrl-A` as
+        // its own escape between the monitor and the port, and the byte never
+        // reaches the machine - so `^A 1..6`, the virtual-console switch the
+        // kernel's mux and `/etc/inittab` both advertise, would sit unheard
+        // while every other keystroke went through. `signal=off` keeps
+        // `Ctrl-C` an ordinary character for the guest's line discipline
+        // rather than a request to quit the emulator.
         Console::Stdio => args.extend([
             "-display".into(),
             "none".into(),
+            "-chardev".into(),
+            "stdio,id=stdio0,mux=off,signal=off".into(),
             "-serial".into(),
-            "mon:stdio".into(),
+            "chardev:stdio0".into(),
         ]),
         Console::File(log) => args.extend([
             "-display".into(),
@@ -134,7 +214,17 @@ pub fn machine_args(
         ]),
     }
 
+    // The guest's own way out. `reboot(2)` with a stop command ends at
+    // `drivers::qemu::exit`, which writes port 0xf4; with no device listening,
+    // that write goes nowhere and the kernel halts with QEMU still up - which
+    // is why `run` had no way to stop except killing the emulator. The test
+    // boot reads the same port for its verdict, so it belongs to every machine
+    // this builds, not to the harness alone.
     args.extend(["-monitor".into(), "none".into(), "-no-reboot".into()]);
+    args.extend([
+        "-device".into(),
+        "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
+    ]);
     args.extend(config.extra_args.iter().cloned());
     args
 }
@@ -213,6 +303,13 @@ pub fn run_qemu(
         )
     })?;
 
+    // The share the 9p device exports and the console port's socket both
+    // live under the build directory, and the devices they belong to start
+    // only if their host-side files do - so they exist before QEMU is
+    // asked for them.
+    let share = build_dir.join("9p-share");
+    fs::create_dir_all(&share)?;
+
     // The machine's own settings: memory, processors, the name the guest
     // reports, and whatever `extra_args` adds.
     let config = QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
@@ -222,6 +319,7 @@ pub fn run_qemu(
         &vars,
         Boot::Image(image.clone()),
         Console::Stdio,
+        &share,
     );
 
     // Printed because a boot that goes wrong is usually read off this line.
@@ -278,8 +376,9 @@ mod tests {
             memory: memory.to_string(),
             cpus,
             hostname: "probe".to_string(),
-            dns: None,
             extra_args: extra.iter().map(|arg| arg.to_string()).collect(),
+            vsock: false,
+            audio: false,
         }
     }
 
@@ -290,6 +389,7 @@ mod tests {
             Path::new("/build/OVMF_VARS.4m.fd"),
             boot,
             Console::Stdio,
+            Path::new("/build/9p-share"),
         )
     }
 
@@ -352,24 +452,18 @@ mod tests {
             .find(|arg| arg.starts_with("user,id=n0"))
             .expect("the network is on the command line");
         assert!(netdev.contains("hostname=probe"), "{netdev}");
-        // No `dns` configured, no `dns=` on the line: slirp follows the host.
+        // No `dns=` on the line, ever - not because the guest's nameserver is
+        // not configurable, but because QEMU's `dns=` does something else: it
+        // renames the address slirp answers DNS at (the 10.0.2.3 the guest's
+        // resolv.conf and `t-dns` name) rather than choosing an upstream,
+        // which strands every query the guest sends. Choosing a server is
+        // `[system] dns` in rootfs.toml, which the rootfs build writes into
+        // the guest's own resolv.conf.
         assert!(!netdev.contains("dns="), "{netdev}");
         assert_eq!(
             args.last().map(String::as_str),
             Some("-enable-kvm"),
             "the escape hatch is appended after everything computed: {args:?}"
         );
-    }
-
-    #[test]
-    fn a_configured_dns_names_the_nameserver_behind_10_0_2_3() {
-        let mut config = config("1024", 1, &[]);
-        config.dns = Some("172.16.0.1".to_string());
-        let args = args(&config, Boot::Image(PathBuf::from("/build/mpos.img")));
-        let netdev = args
-            .iter()
-            .find(|arg| arg.starts_with("user,id=n0"))
-            .expect("the network is on the command line");
-        assert!(netdev.contains("dns=172.16.0.1"), "{netdev}");
     }
 }

@@ -36,12 +36,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     let b = unsafe { core::slice::from_raw_parts_mut(&raw mut B as *mut u8, 16) };
     let n = lin::getrandom(b, GRND_NONBLOCK);
-    lin::check_eq(
-        &mut failed,
-        b"the non-blocking fill answers 16 too",
-        n,
-        16,
-    );
+    lin::check_eq(&mut failed, b"the non-blocking fill answers 16 too", n, 16);
 
     let c = unsafe { core::slice::from_raw_parts_mut(&raw mut C as *mut u8, 1) };
     let n = lin::getrandom(c, 0);
@@ -59,11 +54,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // Different sizes, same story: never a negative answer.
     let d = unsafe { core::slice::from_raw_parts_mut(&raw mut D as *mut u8, 7) };
     let n = lin::getrandom(d, 0);
-    lin::check_true(
-        &mut failed,
-        b"a 7-byte fill never answers negative",
-        n >= 0,
-    );
+    lin::check_true(&mut failed, b"a 7-byte fill never answers negative", n >= 0);
     let e = unsafe { core::slice::from_raw_parts_mut(&raw mut E as *mut u8, 100) };
     let n = lin::getrandom(e, 0);
     lin::check_true(

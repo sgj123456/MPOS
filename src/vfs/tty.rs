@@ -57,6 +57,10 @@ const CSI_MAX: usize = 16;
 /// Cap on the body of an OSC string tracked on the output, so a colour query
 /// can be recognised; a longer run is a colour *set*, which is just forwarded.
 const OSC_MAX: usize = 32;
+/// How long a held output sequence may grow before it is given up as a
+/// sequence and put on the wire as ordinary text. A program that writes an
+/// unterminated `ESC [` must not lose everything after it.
+const HELD_MAX: usize = 64;
 
 /// Recognise a colour *query* OSC body - `10;?` (foreground) or `11;?`
 /// (background), which `set_color`/a theme probe send - and name the reply. A
@@ -242,6 +246,12 @@ pub struct LineDiscipline {
     /// opposed to a charset selection that also passes through `Esc::One`), so
     /// a terminating `ESC \` knows to finish it.
     in_string_seq: bool,
+    /// The bytes of the output sequence in flight, held back from the wire.
+    /// Whether a sequence is a question this discipline answers is only known
+    /// when it ends, and what has already reached the wire cannot be taken
+    /// back - so nothing of it goes out until it resolves. See
+    /// [`LineDiscipline::note_output`].
+    out_held: Vec<u8>,
     /// Where the cursor stands, to answer a shell that asks.
     screen: Screen,
 }
@@ -274,6 +284,7 @@ impl LineDiscipline {
             out_osc: Vec::new(),
             out_dcs: false,
             in_string_seq: false,
+            out_held: Vec::new(),
             screen: Screen::new(),
         }
     }
@@ -898,23 +909,50 @@ impl LineDiscipline {
     /// editor's own echo and would be replayed twice.
     ///
     /// Returns what `write_at` should put on the wire instead of the caller's
-    /// buffer: the same bytes minus the device-status questions this line
-    /// discipline answers itself. `None` - the common case - means forward
-    /// everything untouched.
+    /// buffer: the same bytes minus the questions this line discipline answers
+    /// itself, and minus the bytes of any sequence still in flight. `None` -
+    /// the common case - means forward everything untouched.
     pub fn note_output(&mut self, bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         // A question the discipline answers itself must not also reach the
         // wire: whatever real terminal sits beyond it would answer too, and
         // that second answer comes back as typed input - the ghost `R` a
         // fresh prompt showed, parsed and half-echoed by the shell.
-        let mut swallowed: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
-        // Where the sequence in flight began: byte 0 when it began in an
-        // earlier call, the ESC's own index once this call has seen it.
-        let mut seq_start = if self.out_esc != Esc::Ground {
-            Some(0usize)
+        //
+        // That is only true if *none* of the question travels. Whether a
+        // sequence is such a question is known only when it ends, so the whole
+        // of it is held here until then: a swallow measured against one
+        // `write` leaves the head of a sequence that straddles two of them on
+        // the wire. `bat` asks for the terminal's colours exactly that way -
+        // `ESC ] 10 ; ?` in one write, its terminator in the next - so the
+        // orphaned query reached the real terminal, its reply came back as
+        // typed input, and every `bat` prompt ended up holding
+        // `]10;rgb:abab/b2b2/bfbf`.
+        // Nothing in sight of a sequence, and none carried over: the state
+        // machine still has to run - the cursor and the prompt line are what
+        // answer a later `ESC [ 6n` - but no byte needs a second home, so the
+        // buffer is not allocated at all. `bat` renders by writing one colour
+        // token per `write(2)`, tens of thousands of them for a minified
+        // stylesheet, and this is the hot path of every one.
+        let plain =
+            self.out_esc == Esc::Ground && self.out_held.is_empty() && !bytes.contains(&0x1b);
+        let mut out: alloc::vec::Vec<u8> = if plain {
+            alloc::vec::Vec::new()
         } else {
-            None
+            alloc::vec::Vec::with_capacity(bytes.len())
         };
-        for (i, &b) in bytes.iter().enumerate() {
+        // The sequence in flight, carried between calls for as long as it is
+        // open. Its bytes have not gone anywhere.
+        let mut held = core::mem::take(&mut self.out_held);
+        for &b in bytes {
+            // The byte extends the sequence in flight, or opens one; anything
+            // else is ordinary output.
+            if !held.is_empty() || b == 0x1b {
+                held.push(b);
+            } else if !plain {
+                out.push(b);
+            }
+            // What the step below decided, in the terms this loop needs.
+            let mut answered = false;
             match (self.out_esc, b) {
                 // An OSC/DCS string in flight. BEL ends an OSC only (a DCS
                 // keeps buffering); `ESC \` ends either, handled via `Esc::One`.
@@ -924,7 +962,7 @@ impl LineDiscipline {
                             self.out_osc.push(b);
                         }
                     } else {
-                        self.finish_osc(seq_start, i + 1, &mut swallowed);
+                        answered = self.finish_osc();
                     }
                 }
                 (Esc::Osc, 0x1b) => {
@@ -943,7 +981,6 @@ impl LineDiscipline {
                 (_, 0x1b) => {
                     self.out_esc = Esc::Start;
                     self.out_params.clear();
-                    seq_start = Some(i);
                 }
                 (Esc::Start, b'[') => {
                     self.out_esc = Esc::Csi;
@@ -976,27 +1013,22 @@ impl LineDiscipline {
                 (Esc::Csi, _) => {
                     let params = core::mem::take(&mut self.out_params);
                     self.out_esc = Esc::Ground;
-                    // A question this discipline answers itself is swallowed,
+                    // A question this discipline answers itself never travels,
                     // so the host terminal beyond it cannot give a second
                     // answer that would come back as typed input: DSR (`5n`/
                     // `6n`) and Device Attributes (`c`, primary or `>c`
                     // secondary).
-                    let answered = b == b'n' && matches!(params.first(), Some(b'5') | Some(b'6'));
-                    if (answered || b == b'c')
-                        && let Some(start) = seq_start
-                    {
-                        swallowed.push((start, i + 1));
-                    }
-                    seq_start = None;
+                    answered = (b == b'n' && matches!(params.first(), Some(b'5') | Some(b'6')))
+                        || b == b'c';
                     self.output_csi(b, &params);
                 }
                 (Esc::One, b'\\') if self.in_string_seq => {
                     // `ESC \` is the ST terminator of the string in flight.
-                    if self.out_dcs {
-                        self.finish_dcs(seq_start, i + 1, &mut swallowed);
+                    answered = if self.out_dcs {
+                        self.finish_dcs()
                     } else {
-                        self.finish_osc(seq_start, i + 1, &mut swallowed);
-                    }
+                        self.finish_osc()
+                    };
                 }
                 (Esc::One, _) => {
                     self.out_esc = Esc::Ground;
@@ -1024,18 +1056,33 @@ impl LineDiscipline {
                 }
                 _ => self.screen.put(),
             }
+            // The sequence ended: what it held goes on the wire, unless this
+            // discipline answered it, in which case it goes nowhere.
+            if self.out_esc == Esc::Ground {
+                if answered {
+                    held.clear();
+                } else {
+                    out.append(&mut held);
+                }
+            } else if held.len() > HELD_MAX {
+                // No terminator in sight: it was not a sequence after all, and
+                // holding it any longer only loses output.
+                self.out_esc = Esc::Ground;
+                self.in_string_seq = false;
+                self.out_dcs = false;
+                out.append(&mut held);
+            }
         }
-        if swallowed.is_empty() {
+        self.out_held = held;
+        // A plain run holds nothing: it travels as it came.
+        if plain {
             return None;
         }
-        let mut out = alloc::vec::Vec::with_capacity(bytes.len());
-        let mut at = 0usize;
-        for (start, end) in swallowed {
-            out.extend_from_slice(&bytes[at..start]);
-            at = end;
+        if out.len() == bytes.len() && self.out_held.is_empty() {
+            None
+        } else {
+            Some(out)
         }
-        out.extend_from_slice(&bytes[at..]);
-        Some(out)
     }
 
     /// One finished output sequence: move the cursor this line discipline is
@@ -1117,19 +1164,17 @@ impl LineDiscipline {
     /// An OSC string ended (on BEL). If its body was a colour *query*, answer
     /// it and record the bytes for swallowing so the host cannot answer a
     /// second time; otherwise leave it to be forwarded as a colour set.
-    fn finish_osc(
-        &mut self,
-        seq_start: Option<usize>,
-        end: usize,
-        swallowed: &mut alloc::vec::Vec<(usize, usize)>,
-    ) {
+    /// An OSC string ended (on BEL or ST). If its body was a colour *query*,
+    /// answer it - and report that the query was answered, so the caller keeps
+    /// it off the wire and the host cannot answer a second time.
+    fn finish_osc(&mut self) -> bool {
         self.out_esc = Esc::Ground;
         self.in_string_seq = false;
         self.out_dcs = false;
         let payload = core::mem::take(&mut self.out_osc);
         let (index, rgb) = match osc_color_query(&payload) {
             Some(v) => v,
-            None => return,
+            None => return false,
         };
         // `\e] <index> ; <rgb> \e\` - the reply a terminal gives a colour query.
         self.answer(b"\x1b]");
@@ -1137,32 +1182,24 @@ impl LineDiscipline {
         self.answer(b";");
         self.answer(rgb.as_bytes());
         self.answer(b"\x1b\\");
-        if let Some(start) = seq_start {
-            swallowed.push((start, end));
-        }
+        true
     }
 
     /// A DCS string ended (on ST). A capability query (`ESC P 1 + q <hex>`,
     /// XTGETTCap - what fish/neovim/tmux use to ask a terminal its dynamic
-    /// capabilities) is answered with an empty reply and swallowed, so the
-    /// caller stops waiting and the host cannot answer a second time. Any other
-    /// DCS is left to be forwarded.
-    fn finish_dcs(
-        &mut self,
-        seq_start: Option<usize>,
-        end: usize,
-        swallowed: &mut alloc::vec::Vec<(usize, usize)>,
-    ) {
+    /// capabilities) is answered with an empty reply and kept off the wire, so
+    /// the caller stops waiting and the host cannot answer a second time. Any
+    /// other DCS is left to be forwarded.
+    fn finish_dcs(&mut self) -> bool {
         self.out_esc = Esc::Ground;
         self.in_string_seq = false;
         self.out_dcs = false;
         let body = core::mem::take(&mut self.out_osc);
         if body.starts_with(b"1+q") {
             self.answer(b"\x1bP1+r\x1b\\");
-            if let Some(start) = seq_start {
-                swallowed.push((start, end));
-            }
+            return true;
         }
+        false
     }
 
     pub fn termios(&self) -> Termios {
@@ -2116,12 +2153,18 @@ mod tests {
         // Primary DA (`CSI c`): a VT220-class answer.
         let fwd = ld.note_output(b"\x1b[c");
         assert_eq!(ld.take(64), Some(b"\x1b[?62;1;2;6;7;8;9c".to_vec()));
-        assert!(fwd.is_some() && fwd.unwrap().is_empty(), "the query is swallowed");
+        assert!(
+            fwd.is_some() && fwd.unwrap().is_empty(),
+            "the query is swallowed"
+        );
 
         // Secondary DA (`CSI > c`): the terminal-identity answer.
         let fwd = ld.note_output(b"\x1b[>c");
         assert_eq!(ld.take(64), Some(b"\x1b>0;10;0c".to_vec()));
-        assert!(fwd.is_some() && fwd.unwrap().is_empty(), "the query is swallowed");
+        assert!(
+            fwd.is_some() && fwd.unwrap().is_empty(),
+            "the query is swallowed"
+        );
     }
 
     /// A colour (`CSI 32m`) ends in `m`, not `c`: it is drawn by the host and
@@ -2129,7 +2172,10 @@ mod tests {
     #[test]
     fn a_colour_sequence_is_forwarded_not_answered() {
         let mut ld = LineDiscipline::new();
-        assert!(ld.note_output(b"\x1b[32m").is_none(), "nothing to answer, so nothing swallowed");
+        assert!(
+            ld.note_output(b"\x1b[32m").is_none(),
+            "nothing to answer, so nothing swallowed"
+        );
         assert!(ld.take(16).is_none(), "no reply is queued");
     }
 
@@ -2146,7 +2192,10 @@ mod tests {
             Some(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\".to_vec()),
             "a well-formed background reply"
         );
-        assert!(fwd.is_some() && fwd.unwrap().is_empty(), "the query is swallowed");
+        assert!(
+            fwd.is_some() && fwd.unwrap().is_empty(),
+            "the query is swallowed"
+        );
 
         // A colour *set* (`11;rgb:...`) is not a question: forwarded, no reply.
         assert!(ld.note_output(b"\x1b]11;rgb:0000/0000/0000\x07").is_none());
@@ -2168,7 +2217,48 @@ mod tests {
             Some(b"\x1bP1+r\x1b\\".to_vec()),
             "an empty capability reply"
         );
-        assert!(fwd.is_some() && fwd.unwrap().is_empty(), "the query is swallowed");
+        assert!(
+            fwd.is_some() && fwd.unwrap().is_empty(),
+            "the query is swallowed"
+        );
+    }
+
+    /// The same, written in two calls. Whether a sequence is a question the
+    /// discipline answers is only known when it ends, so nothing of it may
+    /// travel until then: a swallow measured against one `write` let the head
+    /// of a split query reach the wire, the real terminal answered the orphan,
+    /// and the reply landed as typed input - which is how every `bat` prompt
+    /// came back holding `]10;rgb:abab/b2b2/bfbf`.
+    #[test]
+    fn a_query_split_across_writes_never_reaches_the_wire() {
+        let mut ld = LineDiscipline::new();
+        // `bat`'s own shape: the body in one write, the BEL in the next.
+        let head = ld.note_output(b"\x1b]10;?");
+        assert_eq!(
+            head,
+            Some(Vec::new()),
+            "the head of an unresolved sequence is held, not sent"
+        );
+        assert_eq!(
+            ld.note_output(b"\x07"),
+            Some(Vec::new()),
+            "and answering it drops the whole of it"
+        );
+        assert_eq!(
+            ld.take(64),
+            Some(b"\x1b]10;rgb:dcdcdc/dcdcdc/dcdcdc\x1b\\".to_vec()),
+            "the answer still goes back as input"
+        );
+
+        // A sequence that turns out to be ordinary output must still arrive,
+        // in order, once it resolves - holding is a delay, not a loss.
+        let mut ld = LineDiscipline::new();
+        assert_eq!(ld.note_output(b"\x1b[31"), Some(Vec::new()));
+        assert_eq!(
+            ld.note_output(b"m"),
+            Some(b"\x1b[31m".to_vec()),
+            "the colour set travels whole"
+        );
     }
 
     #[test]

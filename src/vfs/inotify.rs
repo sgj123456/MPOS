@@ -78,8 +78,13 @@ pub const IN_ISDIR: u32 = 0x4000_0000;
 pub const IN_ONESHOT: u32 = 0x8000_0000;
 
 /// Everything `inotify_add_watch`'s mask may hold.
-pub const IN_ON_ALL_EVENTS: u32 = IN_ALL_EVENTS | IN_ONESHOT | IN_ONLYDIR | IN_DONT_FOLLOW
-    | IN_EXCL_UNLINK | IN_MASK_ADD | IN_MASK_CREATE;
+pub const IN_ON_ALL_EVENTS: u32 = IN_ALL_EVENTS
+    | IN_ONESHOT
+    | IN_ONLYDIR
+    | IN_DONT_FOLLOW
+    | IN_EXCL_UNLINK
+    | IN_MASK_ADD
+    | IN_MASK_CREATE;
 
 /// `inotify_init1`'s flags - the `O_` flags under other names, as the
 /// headers spell them.
@@ -165,8 +170,7 @@ impl InotifyEvent {
 /// `IN_ISDIR` in a stored mask is a filter, never an event bit, so it is
 /// stripped from the first test.
 pub fn event_matches(watch_mask: u32, ev_mask: u32, ev_is_dir: bool) -> bool {
-    (watch_mask & !IN_ISDIR & ev_mask) != 0
-        || (ev_is_dir && (watch_mask & IN_ISDIR) != 0)
+    (watch_mask & !IN_ISDIR & ev_mask) != 0 || (ev_is_dir && (watch_mask & IN_ISDIR) != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +329,11 @@ impl InotifyInstance {
     /// Record a new watch's wd for this instance.
     pub fn record_wd(&self, wd: i32, key: (u64, u64)) {
         critical_section::with(|cs| {
-            self.state.borrow(cs).borrow_mut().watches.push((wd, key.0, key.1));
+            self.state
+                .borrow(cs)
+                .borrow_mut()
+                .watches
+                .push((wd, key.0, key.1));
         });
     }
 
@@ -614,7 +622,8 @@ pub fn remove_watch(instance: &InotifyInstance, owner: Ino, wd: i32) -> bool {
     };
     critical_section::with(|cs| {
         let mut reg = REGISTRY.borrow(cs).borrow_mut();
-        reg.watches.retain(|w| !(w.key == key && w.owner == owner && w.wd == wd));
+        reg.watches
+            .retain(|w| !(w.key == key && w.owner == owner && w.wd == wd));
     });
     instance.deliver(ignored(wd));
     true
@@ -666,10 +675,7 @@ fn emit_rec(key: (u64, u64), mask: u32, name: &str, cookie: u32, is_dir: bool) {
             wake.extend(instance.push(ev));
             if w.mask & IN_ONESHOT != 0 {
                 spent_ids.push((w.owner, w.wd));
-                spent.push((
-                    node.clone(),
-                    w.wd,
-                ));
+                spent.push((node.clone(), w.wd));
             }
         }
         if !spent_ids.is_empty() {
@@ -813,7 +819,6 @@ pub fn sweep_dead() {
         });
     });
 }
-
 
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
@@ -1023,7 +1028,10 @@ mod tests {
             1,
             "one overflow report per episode"
         );
-        assert_eq!(q.iter().find(|e| e.mask == IN_Q_OVERFLOW).unwrap().wd, NO_WD);
+        assert_eq!(
+            q.iter().find(|e| e.mask == IN_Q_OVERFLOW).unwrap().wd,
+            NO_WD
+        );
     }
 
     /// The instance cap: descriptors cannot be conjured past it, and
@@ -1058,7 +1066,10 @@ mod tests {
     /// nodes and the emit tests ask the registry exactly what the syscall
     /// handlers would.
     fn watched_dir() -> Arc<dyn Inode> {
-        crate::vfs::ramfs::RamFs::new().root().create("watched", NodeKind::Dir).unwrap()
+        crate::vfs::ramfs::RamFs::new()
+            .root()
+            .create("watched", NodeKind::Dir)
+            .unwrap()
     }
 
     /// The wd lifecycle: new watches allocate from 1, the same instance
@@ -1074,14 +1085,23 @@ mod tests {
         let owner = node.metadata().ino;
 
         assert_eq!(add_watch(&node, owner, key, IN_CREATE), AddOutcome::New(1));
-        assert_eq!(add_watch(&node, owner, key, IN_DELETE), AddOutcome::Replaced(1));
-        assert_eq!(add_watch(&node, owner, key, IN_CREATE | IN_MASK_CREATE), AddOutcome::Exists(1));
+        assert_eq!(
+            add_watch(&node, owner, key, IN_DELETE),
+            AddOutcome::Replaced(1)
+        );
+        assert_eq!(
+            add_watch(&node, owner, key, IN_CREATE | IN_MASK_CREATE),
+            AddOutcome::Exists(1)
+        );
         assert_eq!(
             add_watch(&node, owner, key, IN_CREATE | IN_MASK_ADD),
             AddOutcome::Replaced(1)
         );
         // A second instance watching the same inode gets its own number.
-        assert_eq!(add_watch(&other, other.metadata().ino, key, IN_CREATE), AddOutcome::New(1));
+        assert_eq!(
+            add_watch(&other, other.metadata().ino, key, IN_CREATE),
+            AddOutcome::New(1)
+        );
         // And the stored mask after the merge carries both bits the first
         // two adds asked for, and not the replaced-only one: replace means
         // "IN_DELETE alone", merge added CREATE back.
@@ -1108,9 +1128,15 @@ mod tests {
         add_watch(&node, node.metadata().ino, key, IN_CREATE);
 
         emit(&dir, IN_DELETE, "gone"); // mask mismatch
-        assert!(!instance.pending(), "a watched mask that does not match stays silent");
+        assert!(
+            !instance.pending(),
+            "a watched mask that does not match stays silent"
+        );
         emit(&watched_dir(), IN_CREATE, "elsewhere"); // key mismatch
-        assert!(!instance.pending(), "another inode's news is not this watch's");
+        assert!(
+            !instance.pending(),
+            "another inode's news is not this watch's"
+        );
 
         emit(&dir, IN_CREATE, "new");
         assert!(instance.pending(), "the match lands");
@@ -1137,8 +1163,14 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = instance.read_at(0, &mut buf).unwrap();
         assert_eq!(n, 40, "24-byte event + 16-byte IGNORED");
-        assert_eq!(u32::from_ne_bytes(buf[4..8].try_into().unwrap()), IN_CREATE | IN_ISDIR);
-        assert_eq!(u32::from_ne_bytes(buf[28..32].try_into().unwrap()), IN_IGNORED);
+        assert_eq!(
+            u32::from_ne_bytes(buf[4..8].try_into().unwrap()),
+            IN_CREATE | IN_ISDIR
+        );
+        assert_eq!(
+            u32::from_ne_bytes(buf[28..32].try_into().unwrap()),
+            IN_IGNORED
+        );
         assert!(
             !critical_section::with(|cs| REGISTRY
                 .borrow(cs)
@@ -1175,9 +1207,12 @@ mod tests {
             "IGNORED at the second record's mask offset"
         );
         assert_eq!(instance.watch_count(), 0);
-        assert!(
-            !critical_section::with(|cs| REGISTRY.borrow(cs).borrow().watches.iter().any(|w| w.key == key))
-        );
+        assert!(!critical_section::with(|cs| REGISTRY
+            .borrow(cs)
+            .borrow()
+            .watches
+            .iter()
+            .any(|w| w.key == key)));
     }
 
     /// `remove_watch` for an unknown wd answers false (the errno is the
@@ -1194,10 +1229,16 @@ mod tests {
         assert!(remove_watch(&instance, node.metadata().ino, 1));
         let mut buf = [0u8; 16];
         instance.read_at(0, &mut buf).unwrap();
-        assert_eq!(u32::from_ne_bytes(buf[4..8].try_into().unwrap()), IN_IGNORED);
-        assert!(
-            !critical_section::with(|cs| REGISTRY.borrow(cs).borrow().watches.iter().any(|w| w.key == key))
+        assert_eq!(
+            u32::from_ne_bytes(buf[4..8].try_into().unwrap()),
+            IN_IGNORED
         );
+        assert!(!critical_section::with(|cs| REGISTRY
+            .borrow(cs)
+            .borrow()
+            .watches
+            .iter()
+            .any(|w| w.key == key)));
     }
 
     /// Dead instances are swept: closing every reference to a node leaves
@@ -1212,13 +1253,11 @@ mod tests {
         drop(instance);
         drop(node);
         sweep_dead();
-        assert!(
-            !critical_section::with(|cs| REGISTRY
-                .borrow(cs)
-                .borrow()
-                .watches
-                .iter()
-                .any(|w| w.key == key && w.owner == owner))
-        );
+        assert!(!critical_section::with(|cs| REGISTRY
+            .borrow(cs)
+            .borrow()
+            .watches
+            .iter()
+            .any(|w| w.key == key && w.owner == owner)));
     }
 }

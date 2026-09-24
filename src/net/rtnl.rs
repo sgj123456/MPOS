@@ -1,4 +1,4 @@
-//! The rtnetlink half of netlink: the read side `ip` and friends speak.
+//! The rtnetlink half of netlink: both halves of what `ip` speaks.
 //!
 //! Netlink is a socket family whose payload is a little message protocol of
 //! its own. The uevent half carries one fixed shape of event; this half
@@ -6,20 +6,28 @@
 //! receiving until a `NLMSG_DONE`, so the answer is built here, one message
 //! per interface, out of what the net layer knows.
 //!
-//! There is no write side: requests that mutate (add an address, bring a
-//! link down) are acknowledged with success and dropped, which is what a
-//! caller with nothing to re-read after the fact cannot tell from done.
+//! And it *takes* the mutations: `ip addr add`, `ip route add`, `ip link
+//! set` are parsed here and applied to the live stack - the address and
+//! route tables smoltcp consults, and the link's up flag that gates the
+//! stack's polling. A mutation is answered with the `NLMSG_ERROR` report a
+//! caller running `rtnl_talk` waits for, carrying zero on success or the
+//! errno it failed with; a request that never asked for an ACK and did not
+//! fail gets nothing back, exactly as Linux leaves an unread success.
 
-use alloc::{collections::VecDeque, vec, vec::Vec};
+use alloc::{collections::VecDeque, format, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Message types of the route family, as `linux/rtnetlink.h` spells them.
 pub const NETLINK_ROUTE: u32 = 0;
 
 const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
+const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 const RTM_GETADDR: u16 = 22;
 /// `RTM_GETROUTE`: what a caller hunting the default gateway's interface
 /// sends. An empty answer here is worse than a wrong one - fastfetch reads
@@ -45,12 +53,36 @@ const NLMSG_ERROR: u16 = 2;
 /// closed by `NLMSG_DONE`, and a report on top of it would be noise.
 const NLM_F_ACK: u16 = 0x04;
 
-/// Attribute types of the route attribute family.
+/// `NLM_F_REPLACE`: "settle your own conflict" - the caller of `ip route
+/// replace` expects the destination's old entry to give way, where `add`
+/// expects `EEXIST`.
+const NLM_F_REPLACE: u16 = 0x100;
+
+/// `NLM_F_CREATE`: "make one if there is none." On a link request with no
+/// index it names `ip link add`, which this kernel cannot do.
+const NLM_F_CREATE: u16 = 0x400;
+
+/// Attribute types of the route attribute family, as `linux/if_link.h`
+/// numbers them: `IFLA_ADDRESS` 1, `IFLA_BROADCAST` 2, `IFLA_IFNAME` 3,
+/// `IFLA_MTU` 4, `IFLA_QDISC` 6 - the numbers are the contract, and getting
+/// one wrong swaps whole fields (an MTU read as a broadcast address, a qdisc
+/// read as a MAC).
 const IFLA_IFNAME: u16 = 3;
 const IFLA_ADDRESS: u16 = 1;
+const IFLA_BROADCAST: u16 = 2;
+const IFLA_MTU: u16 = 4;
+/// The queueing discipline's name, as a string. `ip link` prints it; the
+/// stack has no qdisc, which Linux spells "noqueue".
+const IFLA_QDISC: u16 = 6;
+/// The transmit queue length, as a native-order word.
+const IFLA_TXQLEN: u16 = 13;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
+/// `IFA_F_PERMANENT`: the address was put there on purpose, not learned.
+/// Without it busybox `ip addr` prints the address as `dynamic` - the mark
+/// of an address a DHCP client or router advertisement left behind.
+const IFA_F_PERMANENT: u8 = 0x80;
 const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
@@ -63,13 +95,18 @@ const IFF_LOOPBACK: u32 = 0x8;
 const IFF_RUNNING: u32 = 0x40;
 const IFF_MULTICAST: u32 = 0x1000;
 
+/// The interface indexes this kernel's single NIC and its loopback answer
+/// under: `lo` is 1 and `eth0` is 2, the pair Linux's own enumeration of a
+/// one-NIC machine would hand out.
+const LO_INDEX: u32 = 1;
+const ETH_INDEX: u32 = 2;
+
+/// `AF_INET`, the one family the stack speaks.
+const AF_INET: u8 = 2;
+
 /// ARPHRD_ values: what an interface's `type` field says the link layer is.
 const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
-
-/// QEMU's default NIC address: the one the stack's static configuration
-/// assumes, so `ip addr` and the stack agree about what eth0 carries.
-const ETH0_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
 static NEXT_HANDLE: AtomicUsize = AtomicUsize::new(0x8000_0000);
 
@@ -250,74 +287,28 @@ pub fn send(handle: usize, msg: &[u8]) -> isize {
         }
     });
     let answers: Vec<Vec<u8>> = match ty {
-        RTM_GETLINK => {
-            let mut v = Vec::new();
-            v.push(link_msg(
-                seq,
-                portid,
-                1,
-                "lo",
-                IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
-                ARPHRD_LOOPBACK,
-                None,
-            ));
-            v.push(link_msg(
-                seq,
-                portid,
-                2,
-                "eth0",
-                IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,
-                ARPHRD_ETHER,
-                Some(&ETH0_MAC),
-            ));
-            v.push(done(seq, portid));
-            v
+        RTM_GETLINK => dump_links(seq, portid),
+        RTM_GETADDR => dump_addrs(seq, portid),
+        RTM_GETROUTE => dump_routes(seq, portid),
+        // The mutations: parse, apply to the live stack, and answer with the
+        // report. A failure is *always* answered - Linux sends `NLMSG_ERROR`
+        // with the errno whether or not the caller asked for an ACK, because
+        // the error is the reply, not a courtesy. A success without
+        // `NLM_F_ACK` gets nothing: nobody is listening, and a message left
+        // in the queue is one the next caller on this socket will read as
+        // its own.
+        RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE | RTM_NEWLINK | RTM_SETLINK
+        | RTM_DELLINK => {
+            let rc = apply(ty, flags, msg);
+            if rc != 0 {
+                vec![err_reply(seq, portid, rc, &msg[..16])]
+            } else if flags & NLM_F_ACK != 0 {
+                vec![ack(seq, portid, &msg[..16])]
+            } else {
+                Vec::new()
+            }
         }
-        RTM_GETADDR => {
-            let mut v = Vec::new();
-            v.push(addr_msg(seq, portid, 1, 8, [127, 0, 0, 1], "lo", 254));
-            v.push(addr_msg(
-                seq,
-                portid,
-                2,
-                24,
-                crate::net::LOCAL_IP,
-                "eth0",
-                0,
-            ));
-            v.push(done(seq, portid));
-            v
-        }
-        RTM_GETROUTE => {
-            // The default route, exactly as the static configuration implies:
-            // everything leaves by the gateway over eth0 (index 2), and the
-            // preferred source is eth0's own address. A dump with only an
-            // end-marker makes callers that hunt for a default interface spin,
-            // and a dump missing `RTA_PREFSRC` makes callers like fastfetch
-            // print an empty LocalIp.
-            let mut v = Vec::new();
-            v.push(route_msg(
-                seq,
-                portid,
-                2,
-                crate::net::GATEWAY_IP,
-                crate::net::LOCAL_IP,
-            ));
-            v.push(done(seq, portid));
-            v
-        }
-        // Mutations and the query types nobody here can answer.
-        //
-        // A mutation is not a dump, so it gets no run of messages and no end
-        // marker - it gets the report a caller that said `NLM_F_ACK` is
-        // waiting for, which is an `NLMSG_ERROR` carrying error 0. Nothing
-        // else satisfies `rtnl_talk`: it reads one message, insists it be
-        // `NLMSG_ERROR`, and loops for another if it is not - so an end
-        // marker here is a hang, not an answer.
-        //
-        // Without `NLM_F_ACK` there is no answer at all, which is what Linux
-        // does: nobody is listening, and a message left in the queue is one
-        // the next caller on this socket will read as its own.
+        // The query types nobody here can answer.
         _ => {
             if flags & NLM_F_ACK != 0 {
                 vec![ack(seq, portid, &msg[..16])]
@@ -399,7 +390,425 @@ fn ack(seq: u32, pid: u32, request: &[u8]) -> Vec<u8> {
     nlmsg(NLMSG_ERROR, seq, pid, &payload, false)
 }
 
-/// `RTM_NEWLINK`: an `ifinfomsg` plus the interface's name (and address).
+/// The failure report: same message shape, an `error` of the errno. The
+/// field carries the errno **negated** - the kernel's own convention, which
+/// is what `rtnl_talk` reads back through `errno = -err->error` before
+/// printing. Writing it positive made busybox print the message for an
+/// errno no table knows: "No error information".
+fn err_reply(seq: u32, pid: u32, errno: isize, request: &[u8]) -> Vec<u8> {
+    let mut payload = (errno as i32).to_le_bytes().to_vec();
+    payload.extend_from_slice(&request[..16.min(request.len())]);
+    nlmsg(NLMSG_ERROR, seq, pid, &payload, false)
+}
+
+/// Walk the attributes of one message: the bytes after its header and
+/// family-specific struct, pair by `rta_len`/`rta_type` (a 4-byte head, then
+/// the value, padded to four). `f` sees each attribute's type and value; an
+/// attribute shorter than its own head ends the walk - there is no honest
+/// way to step past one, and a malformed request is `EINVAL` wherever it
+/// lands.
+fn for_each_attr<F: FnMut(u16, &[u8])>(payload: &[u8], skip: usize, mut f: F) -> bool {
+    let mut at = skip;
+    while at + 4 <= payload.len() {
+        let rta_len = u16::from_le_bytes([payload[at], payload[at + 1]]) as usize;
+        if rta_len < 4 || at + rta_len > payload.len() {
+            return false;
+        }
+        let ty = u16::from_le_bytes([payload[at + 2], payload[at + 3]]);
+        f(ty, &payload[at + 4..at + rta_len]);
+        at += (rta_len + 3) & !3;
+    }
+    true
+}
+
+/// A four-byte big-endian value out of an attribute, or nothing for a short
+/// one. IP addresses and MTUs are the sizes the users of these attributes
+/// send; anything else is a malformed request.
+fn be32(value: &[u8]) -> Option<u32> {
+    (value.len() == 4).then(|| u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+/// A four-byte little-endian value out of an attribute. The non-address
+/// netlink integers - an MTU, a queue length - are native-order words,
+/// which on this machine is little.
+fn le32(value: &[u8]) -> Option<u32> {
+    (value.len() == 4).then(|| u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+/// Apply one mutation request to the live stack. Returns the errno (already
+/// negated, the kernel's convention) - zero is success.
+fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
+    match ty {
+        RTM_NEWADDR => {
+            // `struct ifaddrmsg` is eight bytes: family, prefix, flags,
+            // scope, then the interface index.
+            let Some(body) = msg.get(16..) else {
+                return crate::syscall::err::EINVAL;
+            };
+            if body.len() < 8 {
+                return crate::syscall::err::EINVAL;
+            }
+            if body[0] != AF_INET {
+                // The one family the stack speaks. IPv6 address requests
+                // would need the stack's IPv6 half, which is not built.
+                return crate::syscall::err::EAFNOSUPPORT;
+            }
+            let index = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            if index != ETH_INDEX {
+                // `lo` holds one address and it is not this kernel's to
+                // change; any other index names no device at all.
+                return if index == LO_INDEX {
+                    crate::syscall::err::EOPNOTSUPP
+                } else {
+                    crate::syscall::err::ENODEV
+                };
+            }
+            let mut addr = None;
+            let ok = for_each_attr(body, 8, |ty, value| {
+                // `IFA_LOCAL` names the address; `IFA_ADDRESS` is the
+                // prefix's other end, which for a peerless point-to-point
+                // link is the same word. Either one answers here, `LOCAL`
+                // winning if both appear - which is what `ip addr add`
+                // sends and what a plain `IFA_ADDRESS` caller expects.
+                if ty == IFA_LOCAL {
+                    addr = be32(value);
+                } else if ty == IFA_ADDRESS && addr.is_none() {
+                    addr = be32(value);
+                }
+            });
+            if !ok {
+                return crate::syscall::err::EINVAL;
+            }
+            let Some(addr) = addr else {
+                // No address to add is Linux's `EINVAL` ("invalid argument
+                // for a prefix with no address in it").
+                return crate::syscall::err::EINVAL;
+            };
+            let prefix = body[1];
+            if prefix > 32 {
+                return crate::syscall::err::EINVAL;
+            }
+            let rc = crate::net::add_ipv4_addr(addr.to_be_bytes(), prefix);
+            match rc {
+                Ok(()) => 0,
+                // `ip addr replace` is the caller settling its own conflict.
+                Err(e) if e == crate::syscall::err::EEXIST && flags & NLM_F_REPLACE != 0 => {
+                    let _ = crate::net::del_ipv4_addr(addr.to_be_bytes());
+                    crate::net::add_ipv4_addr(addr.to_be_bytes(), prefix)
+                        .err()
+                        .unwrap_or(0)
+                }
+                Err(e) => e,
+            }
+        }
+        RTM_DELADDR => {
+            let Some(body) = msg.get(16..) else {
+                return crate::syscall::err::EINVAL;
+            };
+            if body.len() < 8 {
+                return crate::syscall::err::EINVAL;
+            }
+            if body[0] != AF_INET {
+                return crate::syscall::err::EAFNOSUPPORT;
+            }
+            let index = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            if index != ETH_INDEX {
+                return if index == LO_INDEX {
+                    crate::syscall::err::EOPNOTSUPP
+                } else {
+                    crate::syscall::err::ENODEV
+                };
+            }
+            let mut addr = None;
+            let ok = for_each_attr(body, 8, |ty, value| {
+                if ty == IFA_LOCAL || (ty == IFA_ADDRESS && addr.is_none()) {
+                    addr = be32(value);
+                }
+            });
+            if !ok {
+                return crate::syscall::err::EINVAL;
+            }
+            let Some(addr) = addr else {
+                return crate::syscall::err::EINVAL;
+            };
+            match crate::net::del_ipv4_addr(addr.to_be_bytes()) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        RTM_NEWROUTE => {
+            // `struct rtmsg` is twelve bytes: family, dst_len, src_len, tos,
+            // table, protocol, scope, type, then four bytes of flags.
+            let Some(body) = msg.get(16..) else {
+                return crate::syscall::err::EINVAL;
+            };
+            if body.len() < 12 {
+                return crate::syscall::err::EINVAL;
+            }
+            if body[0] != AF_INET {
+                return crate::syscall::err::EAFNOSUPPORT;
+            }
+            let dst_len = body[1];
+            if dst_len > 32 {
+                return crate::syscall::err::EINVAL;
+            }
+            let mut dst = 0u32;
+            let mut gateway = None;
+            let ok = for_each_attr(body, 12, |ty, value| match ty {
+                RTA_DST => dst = be32(value).unwrap_or(dst),
+                RTA_GATEWAY => gateway = be32(value),
+                _ => {}
+            });
+            if !ok {
+                return crate::syscall::err::EINVAL;
+            }
+            let Some(gateway) = gateway else {
+                // A route with no gateway names an on-link prefix - the
+                // interface's own address is already exactly that, by
+                // smoltcp's design, and a second spelling of it would be a
+                // route the stack cannot express. Linux accepts one; this
+                // kernel says what it means instead of pretending.
+                return crate::syscall::err::EINVAL;
+            };
+            // The destination is the network, not the address: the host
+            // bits a caller left set are not part of the prefix, and
+            // keeping them would make the entry unfindable by the exact
+            // match a later `del` asks for.
+            let mask: u32 = if dst_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - dst_len as u32)
+            };
+            let dst = dst & mask;
+            let rc = crate::net::add_route(dst.to_be_bytes(), dst_len, gateway.to_be_bytes());
+            match rc {
+                Ok(()) => 0,
+                Err(e) if e == crate::syscall::err::EEXIST && flags & NLM_F_REPLACE != 0 => {
+                    let _ = crate::net::del_route(dst.to_be_bytes(), dst_len);
+                    crate::net::add_route(dst.to_be_bytes(), dst_len, gateway.to_be_bytes())
+                        .err()
+                        .unwrap_or(0)
+                }
+                Err(e) => e,
+            }
+        }
+        RTM_DELROUTE => {
+            let Some(body) = msg.get(16..) else {
+                return crate::syscall::err::EINVAL;
+            };
+            if body.len() < 12 {
+                return crate::syscall::err::EINVAL;
+            }
+            if body[0] != AF_INET {
+                return crate::syscall::err::EAFNOSUPPORT;
+            }
+            let dst_len = body[1];
+            if dst_len > 32 {
+                return crate::syscall::err::EINVAL;
+            }
+            let mut dst = 0u32;
+            let ok = for_each_attr(body, 12, |ty, value| {
+                if ty == RTA_DST {
+                    dst = be32(value).unwrap_or(dst);
+                }
+            });
+            if !ok {
+                return crate::syscall::err::EINVAL;
+            }
+            // No `RTA_DST` at all is the default route - the prefix of
+            // length zero, which is what `ip route del default` sends.
+            let mask: u32 = if dst_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - dst_len as u32)
+            };
+            match crate::net::del_route((dst & mask).to_be_bytes(), dst_len) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        RTM_NEWLINK | RTM_SETLINK => {
+            // `struct ifinfomsg` is sixteen bytes: family, two bytes of
+            // padding, type, index, flags, change mask.
+            let Some(body) = msg.get(16..) else {
+                return crate::syscall::err::EINVAL;
+            };
+            if body.len() < 16 {
+                return crate::syscall::err::EINVAL;
+            }
+            let index = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            if index == 0 && flags & NLM_F_CREATE != 0 {
+                // `ip link add`: no device to create, and no way to pretend.
+                return crate::syscall::err::EOPNOTSUPP;
+            }
+            if index != LO_INDEX && index != ETH_INDEX {
+                return crate::syscall::err::ENODEV;
+            }
+            let change = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
+            let mut up: Option<bool> = None;
+            let mut mtu: Option<u32> = None;
+            let mut name: Option<Vec<u8>> = None;
+            let ok = for_each_attr(body, 16, |ty, value| {
+                match ty {
+                    IFLA_MTU => mtu = le32(value),
+                    IFLA_IFNAME => {
+                        // The NUL a label carries is part of the value, not
+                        // the name.
+                        let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+                        name = Some(value[..end].to_vec());
+                    }
+                    _ => {}
+                }
+            });
+            if !ok {
+                return crate::syscall::err::EINVAL;
+            }
+            // The `ifi_change` mask is what says the request means its
+            // flags: `ip link set eth0 down` sends flags with only IFF_UP
+            // clear and change with IFF_UP set, while `ip link set eth0
+            // name X` sends flags nobody should read.
+            if change & IFF_UP != 0 {
+                let requested = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+                up = Some(requested & IFF_UP != 0);
+            }
+            if let Some(up) = up {
+                if let Err(e) = crate::net::set_link_up(index, up) {
+                    return e;
+                }
+            }
+            if let Some(mtu) = mtu {
+                if index != ETH_INDEX {
+                    return crate::syscall::err::EOPNOTSUPP;
+                }
+                if let Err(e) = crate::net::set_mtu(mtu) {
+                    return e;
+                }
+            }
+            if let Some(name) = name {
+                if index != ETH_INDEX {
+                    return crate::syscall::err::EOPNOTSUPP;
+                }
+                let Ok(name) = core::str::from_utf8(&name) else {
+                    return crate::syscall::err::EINVAL;
+                };
+                if let Err(e) = crate::net::set_eth_name(name) {
+                    return e;
+                }
+            }
+            0
+        }
+        RTM_DELLINK => crate::syscall::err::EOPNOTSUPP,
+        _ => crate::syscall::err::EOPNOTSUPP,
+    }
+}
+
+/// `RTM_GETLINK`'s answer: one message per interface, from what the stack
+/// reports. The loopback's flags and eth0's flags, name, MTU and address are
+/// all live - a link brought down reports down, a renamed one reports its new
+/// name, and nothing here is a constant the stack could disagree with.
+fn dump_links(seq: u32, pid: u32) -> Vec<Vec<u8>> {
+    let mut v = Vec::new();
+    let Some(facts) = crate::net::link_facts() else {
+        return vec![done(seq, pid)];
+    };
+    v.push(link_msg(
+        seq,
+        pid,
+        LO_INDEX,
+        "lo",
+        flags_of(facts.lo_up, true),
+        ARPHRD_LOOPBACK,
+        None,
+        65536,
+    ));
+    v.push(link_msg(
+        seq,
+        pid,
+        ETH_INDEX,
+        &facts.eth_name,
+        flags_of(facts.eth_up, false),
+        ARPHRD_ETHER,
+        Some(&facts.mac),
+        facts.mtu,
+    ));
+    v.push(done(seq, pid));
+    v
+}
+
+/// An interface's flags: `IFF_UP` as the administrative bit says, and the
+/// carrier-and-capability bits a link of that kind always carries. `RUNNING`
+/// rides `UP` - a stack that is not polling a downed link has no carrier to
+/// report, which is exactly what `ip link` prints `NO-CARRIER` from.
+fn flags_of(up: bool, loopback: bool) -> u32 {
+    let mut f = IFF_UP | IFF_RUNNING;
+    if !up {
+        f &= !(IFF_UP | IFF_RUNNING);
+    }
+    if loopback {
+        f | IFF_LOOPBACK
+    } else {
+        f | IFF_BROADCAST | IFF_MULTICAST
+    }
+}
+
+/// `RTM_GETADDR`'s answer: the loopback's one address and every address the
+/// interface carries, in the order the stack holds them. The label is the
+/// interface's name - `eth0` for the first address, `eth0:1` for the second,
+/// the alias convention `ip addr` prints.
+fn dump_addrs(seq: u32, pid: u32) -> Vec<Vec<u8>> {
+    let mut v = Vec::new();
+    let Some(facts) = crate::net::link_facts() else {
+        return vec![done(seq, pid)];
+    };
+    // The loopback's address is reported whatever its flag says: an address
+    // outlives the link's up-ness (Linux reports both states), and callers
+    // walking `getifaddrs` expect 127.0.0.1 to be there.
+    v.push(addr_msg(seq, pid, LO_INDEX, 8, [127, 0, 0, 1], "lo", 254));
+    for (n, addr) in crate::net::ipv4_addrs().into_iter().enumerate() {
+        let label = if n == 0 {
+            facts.eth_name.clone()
+        } else {
+            format!("{}:{}", facts.eth_name, n)
+        };
+        v.push(addr_msg(
+            seq,
+            pid,
+            ETH_INDEX,
+            addr.prefix,
+            addr.ip,
+            &label,
+            0,
+        ));
+    }
+    v.push(done(seq, pid));
+    v
+}
+
+/// `RTM_GETROUTE`'s answer: every prefix the routing table holds, each with
+/// the gateway it leaves by and the preferred source address. The preferred
+/// source is the interface's first address - what `fastfetch` reads as the
+/// machine's local IP, and the field whose absence once made it print an
+/// empty one.
+fn dump_routes(seq: u32, pid: u32) -> Vec<Vec<u8>> {
+    let mut v = Vec::new();
+    let prefsrc = crate::net::primary_ipv4();
+    for route in crate::net::routes() {
+        v.push(route_msg(
+            seq,
+            pid,
+            ETH_INDEX,
+            route.dst,
+            route.dst_len,
+            route.gateway,
+            prefsrc,
+        ));
+    }
+    v.push(done(seq, pid));
+    v
+}
+
+/// `RTM_NEWLINK`: an `ifinfomsg` plus the interface's name, address and MTU.
+#[allow(clippy::too_many_arguments)]
 fn link_msg(
     seq: u32,
     pid: u32,
@@ -408,6 +817,7 @@ fn link_msg(
     flags: u32,
     link_type: u16,
     mac: Option<&[u8; 6]>,
+    mtu: u32,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(0); // ifi_family: unspecified on a dump answer
@@ -419,28 +829,47 @@ fn link_msg(
     payload.extend(rtattr(IFLA_IFNAME, &name_with_nul(name)));
     if let Some(mac) = mac {
         payload.extend(rtattr(IFLA_ADDRESS, mac));
+        // An Ethernet link broadcasts to the whole-wire address.
+        payload.extend(rtattr(IFLA_BROADCAST, &[0xff; 6]));
+    } else {
+        // The loopback has no station address to name. Linux still carries
+        // the broadcast attribute - all zeros, "nobody" - and `ip link`
+        // prints it, so a message without one makes the printer read
+        // garbage where the attribute should have been.
+        payload.extend(rtattr(IFLA_ADDRESS, &[0x00; 6]));
+        payload.extend(rtattr(IFLA_BROADCAST, &[0x00; 6]));
     }
+    payload.extend(rtattr(IFLA_MTU, &mtu.to_le_bytes()));
+    // A discipline name the link does not have: "noqueue" is what Linux
+    // reports for a device with no qdisc, which is what this stack runs.
+    payload.extend(rtattr(IFLA_QDISC, b"noqueue\0"));
+    // The transmit queue length. Linux's own default for every NIC is 1000;
+    // the attribute is a native-order word, like every netlink integer that
+    // is not an address.
+    payload.extend(rtattr(IFLA_TXQLEN, &1000u32.to_le_bytes()));
     nlmsg(RTM_NEWLINK, seq, pid, &payload, true)
 }
 
-/// `RTM_NEWROUTE`: a `rtmsg` plus the four attributes a default route needs
-/// to be useful to a caller. `dst_len` 0 makes this "everything else", so
-/// `RTA_DST` is the network address 0.0.0.0; `RTA_GATEWAY` is the next hop;
-/// `RTA_OIF` is the outgoing interface index, which is how a caller ties the
-/// route to a named device; and `RTA_PREFSRC` is the kernel's preferred source
-/// address for the route - the value `fastfetch` and friends read as the
-/// machine's local IP. Omit any of them and a strict caller drops the whole
-/// reply rather than guess.
+/// `RTM_NEWROUTE`: a `rtmsg` plus the four attributes a route needs to be
+/// useful to a caller. `dst_len` says what the destination prefix is, so
+/// `RTA_DST` carries the network address (0.0.0.0 for the default route);
+/// `RTA_GATEWAY` is the next hop; `RTA_OIF` is the outgoing interface index,
+/// which is how a caller ties the route to a named device; and `RTA_PREFSRC`
+/// is the kernel's preferred source address for the route - the value
+/// `fastfetch` and friends read as the machine's local IP. Omit any of them
+/// and a strict caller drops the whole reply rather than guess.
 fn route_msg(
     seq: u32,
     pid: u32,
     oif: u32,
+    dst: [u8; 4],
+    dst_len: u8,
     gateway: [u8; 4],
-    prefsrc: [u8; 4],
+    prefsrc: Option<[u8; 4]>,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(2); // rtm_family: AF_INET
-    payload.push(0); // rtm_dst_len: 0 = the default route
+    payload.push(dst_len);
     payload.push(0); // rtm_src_len
     payload.push(0); // rtm_tos
     payload.push(254); // rtm_table: RT_TABLE_MAIN
@@ -452,16 +881,18 @@ fn route_msg(
     // bytes that should have been flags as `rta_len`, sees the zero payload of
     // the next attribute, and reports `deficit N, rta_len=0!`.
     payload.extend(0u32.to_le_bytes());
-    payload.extend(rtattr(RTA_DST, &[0u8; 4]));
+    payload.extend(rtattr(RTA_DST, &dst));
     payload.extend(rtattr(RTA_GATEWAY, &gateway));
     payload.extend(rtattr(RTA_OIF, &oif.to_le_bytes()));
-    payload.extend(rtattr(RTA_PREFSRC, &prefsrc));
+    if let Some(prefsrc) = prefsrc {
+        payload.extend(rtattr(RTA_PREFSRC, &prefsrc));
+    }
     nlmsg(RTM_NEWROUTE, seq, pid, &payload, true)
 }
 
 /// `RTM_NEWADDR`: an `ifaddrmsg` plus the address, stated twice the way
 /// Linux does it - `IFA_ADDRESS` for the prefix, `IFA_LOCAL` for the local
-/// end - and the interface's name.
+/// end - and the address's label.
 fn addr_msg(
     seq: u32,
     pid: u32,
@@ -474,7 +905,7 @@ fn addr_msg(
     let mut payload = Vec::new();
     payload.push(2); // ifa_family: AF_INET
     payload.push(prefix);
-    payload.push(0); // ifa_flags
+    payload.push(IFA_F_PERMANENT); // ifa_flags
     payload.push(scope);
     payload.extend(index.to_le_bytes());
     payload.extend(rtattr(IFA_ADDRESS, &ip));

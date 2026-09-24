@@ -518,12 +518,50 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         if args[2] != 0 {
             return err::EPROTONOSUPPORT;
         }
-        if typ != SOCK_STREAM as u32 {
-            // DGRAM and SEQPACKET over unix answer the refusal socketpair
-            // already makes for them; STREAM serves every target daemon.
+        // DGRAM is accepted as a real socket shape, and has to be: musl's
+        // `if_nametoindex` opens one as the mere handle for its
+        // `SIOCGIFINDEX` ioctl, so a refusal turns every device-name
+        // lookup on this kernel into "can't find device". What the family
+        // still lacks is the datagram *transfer* - SEQPACKET and the
+        // connectionless send paths are the documented v1 gap.
+        if typ != SOCK_STREAM as u32 && typ != SOCK_DGRAM as u32 {
             return err::EOPNOTSUPP;
         }
         let sock = crate::net::unix::alloc(typ as u16);
+        let fd = match crate::vfs::open_inode(sock) {
+            Ok(fd) => fd,
+            Err(e) => return crate::syscall::err_of(e),
+        };
+        if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+            file.set_status(crate::vfs::file::O_NONBLOCK);
+        }
+        if cloexec {
+            let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+        }
+        return fd as isize;
+    }
+
+    // AF_VSOCK: the guest-to-host family, answered by `src/net/vsock.rs`
+    // over the virtio socket device. It takes its own path for the same
+    // reason AF_UNIX and netlink did: a machine with no network card still
+    // runs the family, and a machine with no socket device answers the
+    // family refusal - EAFNOSUPPORT - rather than ENETDOWN.
+    if domain == crate::net::vsock::AF_VSOCK {
+        let raw_type = args[1] as u32;
+        let cloexec = raw_type & SOCK_CLOEXEC != 0;
+        let nonblock = raw_type & SOCK_NONBLOCK != 0;
+        let typ = raw_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if args[2] != 0 {
+            return err::EPROTONOSUPPORT;
+        }
+        if typ != SOCK_STREAM as u32 {
+            // DGRAM and SEQPACKET over vsock answer the refusal the family
+            // has no machinery for, the same spelling AF_UNIX uses.
+            return err::EOPNOTSUPP;
+        }
+        let Some(sock) = crate::net::vsock::alloc(typ as u16) else {
+            return err::EAFNOSUPPORT;
+        };
         let fd = match crate::vfs::open_inode(sock) {
             Ok(fd) => fd,
             Err(e) => return crate::syscall::err_of(e),
@@ -590,6 +628,16 @@ pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
         }
         return;
     }
+    // A vsock socket retires by its own registry id: the device is told -
+    // the connection reset, the listener's port unlistened - and the slot
+    // goes empty.
+    let vsock_id = file.inode().vsock_id();
+    if vsock_id != 0 {
+        if Arc::strong_count(file) == 1 {
+            crate::net::vsock::release(vsock_id);
+        }
+        return;
+    }
     let handle = file.inode().socket_handle();
     if handle == 0 || Arc::strong_count(file) != 1 {
         return;
@@ -626,6 +674,27 @@ pub(crate) fn close_sockets_at_exit(files: &[Arc<crate::vfs::File>]) {
             if total == in_batch {
                 closed.push(unix_id | UNIX_TAG);
                 super::unix::release(unix_id);
+            }
+            continue;
+        }
+        // Vsock sockets retire by their registry id, on the same
+        // last-reference rule, with their own tag bit in the dedup list -
+        // the third id space this loop walks.
+        let vsock_id = file.inode().vsock_id();
+        if vsock_id != 0 {
+            const VSOCK_TAG: usize = 1 << 41;
+            if closed.contains(&(vsock_id | VSOCK_TAG)) {
+                continue;
+            }
+            let ptr = Arc::as_ptr(file) as *const ();
+            let total = Arc::strong_count(file);
+            let in_batch = files
+                .iter()
+                .filter(|other| Arc::as_ptr(other) as *const () == ptr)
+                .count();
+            if total == in_batch {
+                closed.push(vsock_id | VSOCK_TAG);
+                crate::net::vsock::release(vsock_id);
             }
             continue;
         }
@@ -672,6 +741,18 @@ pub(crate) fn handle_connect(args: [usize; 6], from_user: bool) -> isize {
             };
             let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
             return crate::net::unix::connect_path(sock, &path, nonblock);
+        }
+        // A vsock socket's connect is a CID and a port: send the request,
+        // then drive the handshake through the events the service task
+        // routes, unless the caller asked not to wait.
+        if let Some(sock) = file.inode().as_vsock() {
+            let (cid, port) =
+                match crate::net::vsock::parse_sockaddr_vm(args[1], args[2], from_user) {
+                    Ok(pair) => pair,
+                    Err(e) => return e,
+                };
+            let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+            return crate::net::vsock::connect(sock, cid, port, nonblock);
         }
     }
     let handle = match socket_handle_of_fd(fd) {
@@ -857,6 +938,27 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
             .map(|n| n as isize)
             .unwrap_or_else(crate::syscall::err_of);
     }
+    // A vsock socket: the send is a protocol packet, chunked and
+    // credit-checked by the device, not a write into a pipe of the
+    // kernel's. A connected stream has no per-call destination, and a
+    // caller that names one is told so - the same answer the channel
+    // above gives.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_vsock()
+    {
+        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+            return err::EFAULT;
+        }
+        if args[4] != 0 {
+            return err::EISCONN;
+        }
+        let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+        let nonblock = dontwait(fd, args[3]);
+        return match crate::net::vsock::send_blocking(sock, data, nonblock) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -915,6 +1017,28 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
             .write(&data)
             .map(|n| n as isize)
             .unwrap_or_else(crate::syscall::err_of);
+    }
+    // The vsock form of the same: gathered bytes into the connected
+    // stream, no name to name on a connected socket.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_vsock()
+    {
+        let (name, _namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        if name != 0 {
+            return err::EISCONN;
+        }
+        let mut data: Vec<u8> = Vec::new();
+        if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
+            return e;
+        }
+        let nonblock = dontwait(fd, args[2]);
+        return match crate::net::vsock::send_blocking(sock, &data, nonblock) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
     }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
@@ -1139,6 +1263,40 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
             .map(|n| n as isize)
             .unwrap_or_else(crate::syscall::err_of);
     }
+    // The read side of a vsock stream: bytes out of the connection's
+    // buffer, the peer's address into the source slot when the caller
+    // left one. The slot is validated before anything is consumed - a
+    // message delivered and then unreportable is a message lost.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_vsock()
+    {
+        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+            return err::EFAULT;
+        }
+        if args[3] & MSG_PEEK != 0 {
+            return err::EOPNOTSUPP;
+        }
+        if args[4] != 0
+            && (args[5] == 0
+                || !crate::syscall::buffer_ok(args[4], 16, true, true)
+                || !crate::syscall::buffer_ok(args[5], 4, true, true))
+        {
+            return err::EFAULT;
+        }
+        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+        let nonblock = dontwait(fd, args[3]);
+        let got = match crate::net::vsock::recv_blocking(sock, out, nonblock) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        if args[4] != 0
+            && got > 0
+            && let Some((cid, port)) = crate::net::vsock::peername(sock)
+        {
+            crate::net::vsock::write_sockaddr_vm(args[4], args[5], cid, port);
+        }
+        return got as isize;
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -1234,6 +1392,47 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             ((msghdr + 40) as *mut u64).write_unaligned(0); // msg_controllen
         }
         return n;
+    }
+    // The vsock form: one contiguous read out of the connection, the
+    // peer's address into `msg_name` when the caller left room for one,
+    // and no control data - a stream carries none.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_vsock()
+    {
+        let (name, namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        let Some((buf, len)) = first_iovec(iov, iovlen, from_user) else {
+            return err::EINVAL;
+        };
+        if len == 0 {
+            return err::EINVAL;
+        }
+        if args[2] & MSG_PEEK != 0 {
+            return err::EOPNOTSUPP;
+        }
+        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+        let nonblock = dontwait(fd, args[2]);
+        let got = match crate::net::vsock::recv_blocking(sock, out, nonblock) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        if !crate::syscall::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
+            return err::EFAULT;
+        }
+        unsafe {
+            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(0);
+            if name != 0
+                && namelen != 0
+                && got > 0
+                && let Some((cid, port)) = crate::net::vsock::peername(sock)
+            {
+                crate::net::vsock::write_sockaddr_vm(name, msghdr + 8, cid, port);
+            }
+            ((msghdr + MSGHDR_CONTROLLEN) as *mut u64).write_unaligned(0);
+        }
+        return got as isize;
     }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
@@ -1630,6 +1829,18 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
             };
             return crate::net::unix::bind_path(sock, &path);
         }
+        // A vsock socket binds a port; the CID in the address is the
+        // guest's own whether the caller spells it or the wildcard,
+        // because the host assigned it and nothing below the device can
+        // change it.
+        if let Some(sock) = file.inode().as_vsock() {
+            let (_cid, port) =
+                match crate::net::vsock::parse_sockaddr_vm(args[1], args[2], from_user) {
+                    Ok(pair) => pair,
+                    Err(e) => return e,
+                };
+            return crate::net::vsock::bind(sock, port);
+        }
     }
     // The netlink probes look up the *network registry's* handle - a unix
     // socket has none, so it can never be mistaken for one, even though
@@ -1783,6 +1994,12 @@ pub(crate) fn handle_listen(args: [usize; 6], _from_user: bool) -> isize {
                 Err(e) => e,
             };
         }
+        // A vsock listener opens the accept queue at the device: from
+        // here the host's requests to the port are answered, and `accept`
+        // hands out what arrived.
+        if let Some(sock) = file.inode().as_vsock() {
+            return crate::net::vsock::listen(sock, args[1] as i32);
+        }
     }
     err::EOPNOTSUPP
 }
@@ -1804,6 +2021,37 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
         Ok(f) => f,
         Err(e) => return crate::syscall::err_of(e),
     };
+    // A vsock listener hands out connections the host already made - the
+    // device answered each request the moment it arrived, so accept is a
+    // queue drain rather than a handshake.
+    if let Some(listener) = listener_arc.inode().as_vsock() {
+        let nonblock =
+            flags & SOCK_NONBLOCK_F != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+        let (sock, peer) = match crate::net::vsock::accept(listener, nonblock) {
+            Ok(pair) => pair,
+            Err(e) => return e,
+        };
+        let new_fd = match crate::vfs::open_inode(sock) {
+            Ok(fd) => fd,
+            Err(e) => return crate::syscall::err_of(e),
+        };
+        if flags & SOCK_NONBLOCK_F != 0
+            && let Ok(file) = crate::sched::current_fds().clone_at(new_fd)
+        {
+            file.set_status(crate::vfs::file::O_NONBLOCK);
+        }
+        if flags & SOCK_CLOEXEC_F != 0 {
+            let _ = crate::sched::current_fds().fd_flags_set(new_fd, crate::vfs::file::FD_CLOEXEC);
+        }
+        // The peer's address, when the caller left a slot: the CID and
+        // port the connection arrived from, which is what Linux writes
+        // back for a vsock accept. The CID narrows to the 32 bits
+        // `sockaddr_vm` carries.
+        if addr_ptr != 0 && len_ptr != 0 {
+            crate::net::vsock::write_sockaddr_vm(addr_ptr, len_ptr, peer.cid as u32, peer.port);
+        }
+        return new_fd as isize;
+    }
     // The borrow that asks "is this a unix socket, and which id" cannot
     // outlive the statement; the id, and the Arc the registry hands back
     // for it, can.
@@ -1866,11 +2114,11 @@ pub(crate) fn handle_accept4(args: [usize; 6], from_user: bool) -> isize {
         return err::EINVAL;
     }
     // The flags belong to the descriptor an accepted socket arrives on -
-    // a unix listener honours them; the network refusal stays.
-    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
-        if file.inode().as_unix().is_some() {
-            return accept_common(args[0] as i32, args[1], args[2], args[3]);
-        }
+    // a unix or vsock listener honours them; the network refusal stays.
+    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
+        && (file.inode().as_unix().is_some() || file.inode().as_vsock().is_some())
+    {
+        return accept_common(args[0] as i32, args[1], args[2], args[3]);
     }
     handle_accept(args, from_user)
 }
@@ -2163,6 +2411,13 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
         if let Some(sock) = file.inode().as_unix() {
             return crate::net::unix::write_name(sock, addr_ptr, len_ptr);
         }
+        // A vsock socket's name is the guest CID and the local port -
+        // the address a peer would dial to reach it, zeros where nothing
+        // was bound, the same shape a fresh AF_INET socket gives.
+        if let Some(sock) = file.inode().as_vsock() {
+            let (cid, port) = crate::net::vsock::sockname(sock);
+            return crate::net::vsock::write_sockaddr_vm(addr_ptr, len_ptr, cid, port);
+        }
     }
     // A route-netlink session names itself with a `sockaddr_nl`, not a
     // `sockaddr_in`. The port id `bind` assigned is the one thing a caller
@@ -2257,6 +2512,17 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
             }
             return crate::net::unix::write_name(sock, addr_ptr, len_ptr);
         }
+        // A vsock stream's peer is the CID and port the connection was
+        // made with - the two numbers a connected caller can dial back
+        // through, and `ENOTCONN` when no peer exists to name.
+        if let Some(sock) = file.inode().as_vsock() {
+            return match crate::net::vsock::peername(sock) {
+                Some((cid, port)) => {
+                    crate::net::vsock::write_sockaddr_vm(addr_ptr, len_ptr, cid, port)
+                }
+                None => err::ENOTCONN,
+            };
+        }
     }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
@@ -2348,6 +2614,14 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
         }
         return 0;
     }
+    // A vsock stream half-closes the way the protocol carries it: the
+    // write side sends the shutdown packet the device acknowledges, the
+    // read side is a local fact the buffered bytes survive.
+    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
+        && let Some(sock) = file.inode().as_vsock()
+    {
+        return crate::net::vsock::shutdown(sock, how);
+    }
 
     let handle = match socket_handle_of_fd(args[0] as i32) {
         Ok(handle) => handle,
@@ -2381,6 +2655,22 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
 /// (`poll`) and `SO_REUSEADDR` is moot while one process binds at a time.
 pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen) = (args[0] as i32, args[1], args[2], args[3], args[4]);
+    // A vsock socket is not in the network registry; its options are the
+    // recorded-no-op kind - the four every stream socket is asked for at
+    // setup, accepted by name so a caller's setup never fails on a family
+    // the kernel does speak.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && file.inode().as_vsock().is_some()
+    {
+        if level != SOL_SOCKET {
+            return err::EOPNOTSUPP;
+        }
+        let _ = (optval, optlen);
+        return match optname {
+            SO_REUSEADDR | SO_SNDBUF | SO_RCVBUF | SO_KEEPALIVE | SO_LINGER => 0,
+            _ => err::ENOPROTOOPT,
+        };
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -2465,6 +2755,42 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
 pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen_ptr) =
         (args[0] as i32, args[1], args[2], args[3], args[4]);
+    // A vsock socket answers the questions a caller asks a stream socket
+    // at setup - what it is, whether an error is pending, how big its
+    // buffers are - and reads back zeros for the rest, the same permissive
+    // answer the INET registry gives its unmodelled options.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && file.inode().as_vsock().is_some()
+    {
+        if level != SOL_SOCKET {
+            return err::EOPNOTSUPP;
+        }
+        if optval == 0 || optlen_ptr == 0 {
+            return err::EFAULT;
+        }
+        if !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user) {
+            return err::EFAULT;
+        }
+        let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() };
+        if cap < 4 || !crate::syscall::buffer_ok(optval, 4, true, from_user) {
+            return err::EINVAL;
+        }
+        let value = match optname {
+            SO_TYPE => SOCK_STREAM as i32,
+            // Errors are reported by the calls that hit them; none is
+            // ever pending between calls.
+            SO_ERROR => 0,
+            // The window the device advertises per connection - the one
+            // real buffer number this family has.
+            SO_SNDBUF | SO_RCVBUF => crate::drivers::virtio::vsock::PER_CONNECTION_BUFFER as i32,
+            _ => 0,
+        };
+        unsafe {
+            (optval as *mut i32).write_volatile(value);
+            (optlen_ptr as *mut u32).write_volatile(4);
+        }
+        return 0;
+    }
     let handle = match socket_handle_of_fd(fd) {
         Ok(handle) => handle,
         Err(e) => return e,

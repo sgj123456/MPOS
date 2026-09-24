@@ -25,21 +25,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let r = lin::access(&MOTD, lin::R_OK);
-    lin::check_eq(
-        &mut failed,
-        b"an existing file is readable",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"an existing file is readable", r, 0);
 
     // One user, no permission bits: every mode probes as reachable.
     let r = lin::access(&MOTD, lin::W_OK);
-    lin::check_eq(
-        &mut failed,
-        b"an existing file answers W_OK",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"an existing file answers W_OK", r, 0);
 
     // Root's `CAP_DAC_OVERRIDE` grants read and write outright, but Linux's one
     // exception stands for execute: a `0644` file with no x bit for anyone
@@ -54,20 +44,10 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     let r = lin::access(&MOTD, lin::F_OK);
-    lin::check_eq(
-        &mut failed,
-        b"an existing file answers F_OK",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"an existing file answers F_OK", r, 0);
 
     let r = lin::access(&BIN, lin::R_OK);
-    lin::check_eq(
-        &mut failed,
-        b"a directory is readable",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"a directory is readable", r, 0);
 
     let r = lin::access(&NO_SUCH, lin::R_OK);
     lin::check_eq(

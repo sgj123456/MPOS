@@ -44,18 +44,22 @@ pub struct QemuConfig {
     /// `hostname` the rootfs config writes into the image: one machine has one
     /// name, and the file has one key for it.
     pub hostname: String,
-    /// The address QEMU's user-mode network answers as the guest's `10.0.2.3`.
-    /// Unset, slirp forwards to whatever the host's `/etc/resolv.conf` names -
-    /// and a host whose resolver is a loopback stub (`127.0.0.53`,
-    /// systemd-resolved) hands the guest a nameserver behind that stub's own
-    /// queue, which answers only sometimes: the guest sees `bad address` until
-    /// one lookup gets through. Naming a reachable server here keeps slirp's
-    /// forwarding on the network.
-    pub dns: Option<String>,
     /// Passed through to `qemu-system-x86_64` verbatim, after everything this
     /// crate computes. The escape hatch for the one option a run needs and
     /// this file does not name.
     pub extra_args: Vec<String>,
+    /// Attach the vsock device (`-device virtio-vsock-pci,guest-cid=3`), so
+    /// the guest's `socket(AF_VSOCK)` has a host to talk to. Opt-in because
+    /// it needs the host's vhost kernel module (`/dev/vhost-vsock`) - a
+    /// QEMU asked for the device on a host without the module refuses to
+    /// start at all, and a boot that never starts is worse than a machine
+    /// with no vsock.
+    pub vsock: bool,
+    /// Attach the sound card (`-audiodev none` + `virtio-sound-pci`), so the
+    /// guest's `/dev/dsp` has a device to play through. The backend plays
+    /// nowhere - the point is exercising the driver, not the speakers - but
+    /// the card itself needs QEMU 8.2 or newer, which is why it is opt-in.
+    pub audio: bool,
 }
 
 #[derive(Debug)]
@@ -73,6 +77,17 @@ pub struct RootfsConfig {
     pub hostname: String,
     pub timezone: String,
     pub locale: String,
+    /// The nameserver written into the guest's `/etc/resolv.conf`, over the
+    /// stock `10.0.2.3` the `rootfs/` overlay ships. Unset, QEMU's user-mode
+    /// network answers `10.0.2.3` itself - by forwarding to whatever the
+    /// *host's* resolv.conf names, which on a systemd-resolved host is the
+    /// `127.0.0.53` loopback stub, and which no QEMU option can redirect (its
+    /// `dns=` netdev key renames the address slirp answers at; it does not
+    /// name an upstream, which is why the build never passes it). A server
+    /// named here is asked directly instead: slirp carries the guest's UDP to
+    /// any address the host can reach, which is the one way a build has of
+    /// choosing the guest's upstream.
+    pub dns: Option<String>,
     /// Empty leaves root passwordless, which is the default a serial console
     /// with no keyboard needs. Anything else is set through `chpasswd`.
     pub root_password: String,
@@ -140,10 +155,20 @@ impl QemuConfig {
                 .and_then(|text| text.trim().parse().ok())
                 .unwrap_or(1),
             hostname,
-            dns: values.remove("dns").filter(|text| !text.trim().is_empty()),
             extra_args: take_list(values, "extra_args", &[]),
+            vsock: take_flag(values, "vsock"),
+            audio: take_flag(values, "audio"),
         }
     }
+}
+
+/// Read a `key = true`-style boolean. Anything but an explicit `true` -
+/// absent, empty, any other word - is false: a device that needs the host's
+/// cooperation defaults to off, and the file says so in one word.
+fn take_flag(values: &mut HashMap<String, String>, key: &str) -> bool {
+    values
+        .remove(key)
+        .is_some_and(|text| text.trim().eq_ignore_ascii_case("true"))
 }
 
 fn default_hostname() -> String {
@@ -212,6 +237,7 @@ impl RootfsConfig {
             locale: values
                 .remove("locale")
                 .unwrap_or_else(|| "en_US.UTF-8".to_string()),
+            dns: values.remove("dns").filter(|text| !text.trim().is_empty()),
             root_password: values.remove("root_password").unwrap_or_default(),
             base_packages: parse_package_list(
                 values

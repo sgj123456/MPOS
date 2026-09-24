@@ -55,11 +55,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let master = lin::openat(lin::AT_FDCWD, &PTMX, lin::O_RDWR, 0);
-    lin::check_true(
-        &mut failed,
-        b"/dev/ptmx opens",
-        master >= 0,
-    );
+    lin::check_true(&mut failed, b"/dev/ptmx opens", master >= 0);
     let master = master as i32;
 
     // The number the slave will carry: at least past the six virtual
@@ -80,9 +76,13 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"TIOCSPTLCK(0) unlocks the pair", r, 0);
 
     let path = slave_path(n as usize);
-    lin::puts(b"openat path: "); lin::puts(path); lin::puts(b"\n");
+    lin::puts(b"openat path: ");
+    lin::puts(path);
+    lin::puts(b"\n");
     let slave = lin::openat(lin::AT_FDCWD, path, lin::O_RDWR, 0);
-    lin::puts(b"slave fd = "); lin::puts_isize(slave); lin::puts(b"\n");
+    lin::puts(b"slave fd = ");
+    lin::puts_isize(slave);
+    lin::puts(b"\n");
     lin::check_true(&mut failed, b"/dev/pts/N opens", slave >= 0);
     let slave = slave as i32;
 
@@ -122,11 +122,23 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // echo of the typed line is in the master's queue ahead of it, so that
     // goes down the drain first.
     let got = lin::read(master, unsafe { &mut *core::ptr::addr_of_mut!(ECHO) });
-    lin::check_eq(&mut failed, b"the typed line's echo reached the master", got, 3);
+    lin::check_eq(
+        &mut failed,
+        b"the typed line's echo reached the master",
+        got,
+        3,
+    );
     let r = lin::write(slave, b"out\n");
     lin::check_eq(&mut failed, b"the slave write is taken whole", r, 4);
-    let got = lin::read(master, unsafe { &mut *core::ptr::addr_of_mut!(SLAVE_TO_MASTER) });
-    lin::check_eq(&mut failed, b"the master read sees the slave's bytes", got, 4);
+    let got = lin::read(master, unsafe {
+        &mut *core::ptr::addr_of_mut!(SLAVE_TO_MASTER)
+    });
+    lin::check_eq(
+        &mut failed,
+        b"the master read sees the slave's bytes",
+        got,
+        4,
+    );
     unsafe {
         let line: [u8; 4] = core::ptr::read(core::ptr::addr_of!(SLAVE_TO_MASTER).cast());
         lin::check_true(

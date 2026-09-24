@@ -44,19 +44,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // The signal number is range-checked before anything else: 32 is one
     // past the 0..=31 the kernel can name, and 999 is far past it.
     let r = lin::kill(me, 32);
-    lin::check_eq(
-        &mut failed,
-        b"kill(self, 32) is EINVAL",
-        r,
-        lin::EINVAL,
-    );
+    lin::check_eq(&mut failed, b"kill(self, 32) is EINVAL", r, lin::EINVAL);
     let r = lin::kill(me, 999);
-    lin::check_eq(
-        &mut failed,
-        b"kill(self, 999) is EINVAL",
-        r,
-        lin::EINVAL,
-    );
+    lin::check_eq(&mut failed, b"kill(self, 999) is EINVAL", r, lin::EINVAL);
 
     lin::done(failed)
 }

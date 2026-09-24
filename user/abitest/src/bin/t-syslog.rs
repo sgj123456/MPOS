@@ -41,12 +41,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let got = lin::syslog(3, unsafe { &raw mut LOG as *mut u8 }, 512);
     lin::check_true(&mut failed, b"READ_ALL answers a count", got >= 0);
     let r = lin::syslog(3, unsafe { &raw mut LOG as *mut u8 }, 512);
-    lin::check_eq(
-        &mut failed,
-        b"READ_ALL did not consume the log",
-        r,
-        got,
-    );
+    lin::check_eq(&mut failed, b"READ_ALL did not consume the log", r, got);
     let _ = before;
 
     // The validations: a null buffer for the readers is EINVAL, and the
@@ -84,11 +79,36 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // The bookkeeping types: open, close, console on and off, and the
     // clear, which answers success and empties the tail.
-    lin::check_eq(&mut failed, b"CLOSE succeeds", lin::syslog(0, core::ptr::null_mut(), 0), 0);
-    lin::check_eq(&mut failed, b"OPEN succeeds", lin::syslog(1, core::ptr::null_mut(), 0), 0);
-    lin::check_eq(&mut failed, b"CONSOLE_OFF succeeds", lin::syslog(6, core::ptr::null_mut(), 0), 0);
-    lin::check_eq(&mut failed, b"CONSOLE_ON succeeds", lin::syslog(7, core::ptr::null_mut(), 0), 0);
-    lin::check_eq(&mut failed, b"CLEAR succeeds", lin::syslog(5, core::ptr::null_mut(), 0), 0);
+    lin::check_eq(
+        &mut failed,
+        b"CLOSE succeeds",
+        lin::syslog(0, core::ptr::null_mut(), 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"OPEN succeeds",
+        lin::syslog(1, core::ptr::null_mut(), 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"CONSOLE_OFF succeeds",
+        lin::syslog(6, core::ptr::null_mut(), 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"CONSOLE_ON succeeds",
+        lin::syslog(7, core::ptr::null_mut(), 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"CLEAR succeeds",
+        lin::syslog(5, core::ptr::null_mut(), 0),
+        0,
+    );
     lin::check_eq(
         &mut failed,
         b"the tail after a clear is empty",

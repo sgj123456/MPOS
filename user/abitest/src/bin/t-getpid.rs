@@ -24,11 +24,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let first = lin::getpid();
-    lin::check_true(
-        &mut failed,
-        b"getpid answers a positive id",
-        first > 0,
-    );
+    lin::check_true(&mut failed, b"getpid answers a positive id", first > 0);
 
     let second = lin::getpid();
     lin::check_eq(

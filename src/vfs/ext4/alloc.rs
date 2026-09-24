@@ -116,8 +116,20 @@ impl Core {
                 at + 16,
                 (le32(page, at + 16) as i64 + inodes as i64) as u32,
             );
+            if self.sb.has_metadata_csum {
+                // The counters above live inside what the superblock's own
+                // checksum covers; leaving the old value behind would make
+                // this write a write with a lie attached.
+                let c = self::csum::sb_csum(&page[at..at + 1020]);
+                set32(page, at + 1020, c);
+            }
             true
         });
+        // The counts just moved are inside the descriptor the group's own
+        // checksum covers - and the bitmaps that changed hands with them
+        // carry checksums of their own. One call puts the group back to
+        // self-consistent.
+        self.refresh_group_csums(g);
     }
 
     pub(crate) fn alloc_block(&self) -> VfsResult<u64> {
@@ -159,6 +171,39 @@ impl Core {
         Err(VfsError::NoSpace)
     }
 
+    /// Record that this group's inodes have now been used as far as table
+    /// index `idx`: the `bg_itable_unused` tail shrinks to keep that inode
+    /// inside the used region. Lives only in the 64-byte descriptor, where
+    /// the field sits at 28 with its high half at 50.
+    fn push_itable_high_water(&self, g: u32, idx: u32) {
+        if !self.sb.has_64bit {
+            return;
+        }
+        let per = self.sb.inodes_per_group;
+        let desc_size = self.sb.desc_size as usize;
+        let bs = self.block_size();
+        let at = g as usize * desc_size;
+        let block = self.sb.first_data_block as u64 + 1 + (at / bs) as u64;
+        let off = at % bs;
+        self.update_block(block, |page| {
+            let was = le16(page, off + 28) as u32
+                + if desc_size >= 52 {
+                    (le16(page, off + 50) as u32) << 16
+                } else {
+                    0
+                };
+            if idx + 1 <= per.saturating_sub(was) {
+                return false;
+            }
+            let unused = per - (idx + 1);
+            set16(page, off + 28, unused as u16);
+            if desc_size >= 52 {
+                set16(page, off + 50, (unused >> 16) as u16);
+            }
+            true
+        });
+    }
+
     pub(crate) fn alloc_inode(&self) -> VfsResult<u32> {
         let per_group = self.sb.inodes_per_group as u64;
         for g in 0..self.groups {
@@ -189,6 +234,12 @@ impl Core {
                     ino <= self.sb.inodes_count as u64,
                     "ext2 inode bitmap offered inode {ino} past the end"
                 );
+                // An inode taken from the table's never-used tail moves the
+                // group's unused count down with it: that count is not an
+                // opinion about free space but a promise about which table
+                // slots were never written, and a used inode inside the
+                // promised-virgin tail is the error e2fsck names.
+                self.push_itable_high_water(g, ((ino - 1) % per_group) as u32);
                 self.bump_free(g, 0, -1);
                 let (block, off) = self.inode_pos(ino as u32);
                 let size = self.sb.inode_size as usize;

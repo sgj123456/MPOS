@@ -532,13 +532,13 @@ pub struct StackT {
 /// `rt_sigqueueinfo`.
 #[repr(C)]
 pub struct SigInfo {
-    pub signo: i32,   // 0
-    pub errno: i32,   // 4
-    pub code: i32,    // 8
-    pub _pad: i32,    // 12
-    pub pid: i32,     // 16
-    pub uid: i32,     // 20
-    pub value: u64,   // 24 - `union sigval`
+    pub signo: i32, // 0
+    pub errno: i32, // 4
+    pub code: i32,  // 8
+    pub _pad: i32,  // 12
+    pub pid: i32,   // 16
+    pub uid: i32,   // 20
+    pub value: u64, // 24 - `union sigval`
     pub _rest: [u8; 128 - 32],
 }
 
@@ -2389,11 +2389,5 @@ pub fn connect_un(fd: i32, addr: &SockAddrUn, len: usize) -> isize {
 /// `accept(fd, addr, addrlen)` - either output may be absent (null), which
 /// is how the "I do not care who it is" form is spelled.
 pub fn accept4_un(fd: i32, addr: *mut SockAddrUn, len: *mut u32, flags: usize) -> isize {
-    sys4(
-        nr::ACCEPT4,
-        fd as usize,
-        addr as usize,
-        len as usize,
-        flags,
-    )
+    sys4(nr::ACCEPT4, fd as usize, addr as usize, len as usize, flags)
 }

@@ -133,7 +133,10 @@ fn main() {
         }
     };
     if let Err(err) = connect(&client, &addr) {
-        r.check(&format!("connect reaches the listener by name (got {err})"), false);
+        r.check(
+            &format!("connect reaches the listener by name (got {err})"),
+            false,
+        );
         std::process::exit(1);
     }
     r.check("connect reaches the listener by name", true);
@@ -144,7 +147,10 @@ fn main() {
             fd
         }
         Err(err) => {
-            r.check(&format!("accept hands out the connection (got {err})"), false);
+            r.check(
+                &format!("accept hands out the connection (got {err})"),
+                false,
+            );
             std::process::exit(1);
         }
     };
@@ -167,18 +173,13 @@ fn main() {
     } else {
         buf = [0u8; 64];
         let got = read(&client, &mut buf).unwrap_or(0);
-        r.check(
-            "the client reads the reply",
-            &buf[..got] == REPLY,
-        );
+        r.check("the client reads the reply", &buf[..got] == REPLY);
     }
 
     // The anonymous peer: the client carries no name and the accepted
     // half is anonymous too, so getpeername answers an `AF_UNIX` with an
     // empty path - the empty name Linux gives for an unnamed socket.
-    match getpeername(&client)
-        .map(|any| any.and_then(|a| SocketAddrUnix::try_from(a).ok()))
-    {
+    match getpeername(&client).map(|any| any.and_then(|a| SocketAddrUnix::try_from(a).ok())) {
         Ok(Some(back)) => r.check(
             "getpeername on the connected end is the empty unix name",
             back.path().is_none_or(|p| p.to_str() == Ok("")),
@@ -199,7 +200,11 @@ fn main() {
     // because "nobody is there" and "everybody left" are different facts.
     let fresh = unix_stream().expect("fresh socket");
     let err = read(&fresh, &mut buf).unwrap_err();
-    r.check_errno("read on an unconnected socket is ENOTCONN", err, Errno::NOTCONN);
+    r.check_errno(
+        "read on an unconnected socket is ENOTCONN",
+        err,
+        Errno::NOTCONN,
+    );
     drop(fresh);
 
     // The name goes when it is unlinked; the listener keeps living on its
@@ -214,11 +219,7 @@ fn main() {
     // the retired name is probed with a caller that has no state yet.
     let later = unix_stream().expect("later socket");
     let err = connect(&later, &addr).unwrap_err();
-    r.check_errno(
-        "connect by the retired name is ENOENT",
-        err,
-        Errno::NOENT,
-    );
+    r.check_errno("connect by the retired name is ENOENT", err, Errno::NOENT);
     drop(later);
     drop(client);
     drop(accepted);

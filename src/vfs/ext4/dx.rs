@@ -95,15 +95,17 @@ pub(crate) fn dx_set_count(page: &mut [u8], entries_at: usize, count: usize) {
 }
 
 /// How many entries a root can hold: the block less ".", ".." and the info
-/// structure, one entry per eight bytes.
+/// structure and the eight-byte tail they all stop short of, one entry per
+/// eight bytes. On a 1 KiB block that is 123, which is what a real `mkfs`
+/// volume records and what a probe compares against.
 pub(crate) fn dx_root_limit(block_size: usize, info_length: usize) -> usize {
-    (block_size - dirent_len(1) - dirent_len(2) - info_length) / 8
+    (block_size - dirent_len(1) - dirent_len(2) - info_length - 8) / 8
 }
 
 /// How many entries an intermediate index block can hold: the block less the
-/// fake dirent that stands in for the header.
+/// fake dirent that stands in for the header, less the tail at the end.
 pub(crate) fn dx_node_limit(block_size: usize) -> usize {
-    (block_size - DIRENT_HEADER) / 8
+    (block_size - DIRENT_HEADER - 8) / 8
 }
 
 /// Shift the index entries after slot `at` up by one and put
@@ -199,6 +201,7 @@ impl Core {
     pub(crate) fn dir_add_indexed(
         &self,
         dir: &mut InodeData,
+        dir_ino: u32,
         name: &str,
         child: u32,
         ftype: u8,
@@ -206,13 +209,13 @@ impl Core {
         let block_size = self.block_size();
         let root_disk = match self.bmap_lookup(dir, 0) {
             Some(block) => block,
-            None => return self.dir_add_fallback(dir, name, child, ftype),
+            None => return self.dir_add_fallback(dir, dir_ino, name, child, ftype),
         };
         let mut root_page = vec![0u8; block_size];
         self.read_bytes(root_disk, 0, &mut root_page);
         let root = match DxRoot::parse(&root_page) {
             Some(root) => root,
-            None => return self.dir_add_fallback(dir, name, child, ftype),
+            None => return self.dir_add_fallback(dir, dir_ino, name, child, ftype),
         };
         let Some(hash) = dx_hash_name(
             name.as_bytes(),
@@ -220,18 +223,26 @@ impl Core {
             self.sb.hash_seed,
             self.sb.hash_unsigned,
         ) else {
-            return self.dir_add_fallback(dir, name, child, ftype);
+            return self.dir_add_fallback(dir, dir_ino, name, child, ftype);
         };
 
         loop {
             let path = match self.dx_probe(dir, hash) {
                 Ok(path) => path,
-                Err(()) => return self.dir_add_fallback(dir, name, child, ftype),
+                Err(()) => return self.dir_add_fallback(dir, dir_ino, name, child, ftype),
             };
             let leaf_disk = self.bmap_lookup(dir, path.leaf).ok_or(VfsError::NoSpace)?;
             let mut leaf_page = vec![0u8; block_size];
             self.read_bytes(leaf_disk, 0, &mut leaf_page);
-            if dir_try_insert(&mut leaf_page, name, child, ftype) {
+            trim_dir_tail(&mut leaf_page, self.leaf_limit(block_size));
+            if dir_try_insert(
+                &mut leaf_page,
+                self.leaf_limit(block_size),
+                name,
+                child,
+                ftype,
+            ) {
+                self.stamp_leaf_tail(&mut leaf_page, dir_ino, dir.generation);
                 self.write_bytes(leaf_disk, 0, &leaf_page);
                 return Ok(());
             }
@@ -252,6 +263,7 @@ impl Core {
             {
                 return self.dx_split_leaf(
                     dir,
+                    dir_ino,
                     name,
                     child,
                     ftype,
@@ -279,6 +291,7 @@ impl Core {
                     }
                     self.dx_split_node(
                         dir,
+                        dir_ino,
                         root_disk,
                         &mut root_page,
                         path.root,
@@ -302,6 +315,7 @@ impl Core {
     pub(crate) fn dx_split_leaf(
         &self,
         dir: &mut InodeData,
+        dir_ino: u32,
         name: &str,
         child: u32,
         ftype: u8,
@@ -324,18 +338,22 @@ impl Core {
 
         // The new leaf is the block after every current one.
         let new_logical = dir.size as u64 / block_size as u64;
-        let new_disk = self.bmap_ensure(dir, new_logical)?.0;
+        let new_disk = self.bmap_ensure(dir, dir_ino, new_logical)?.0;
         dir.size += block_size as u64;
         dir.blocks += self.block_units(dir.flags);
         let mut new_page = vec![0u8; block_size];
 
-        // Map the live entries and sort them by hash.
+        // Map the live entries and sort them by hash. The usable block ends
+        // where the checksum trailer begins, and the last live entry's
+        // record ends there too.
+        let limit = self.leaf_limit(block_size);
+        trim_dir_tail(&mut leaf_page, limit);
         let mut map: Vec<(u32, usize, usize)> = Vec::new();
         let mut at = 0;
-        while at + DIRENT_HEADER <= leaf_page.len() {
+        while at < limit {
             let rec = le16(&leaf_page, at + 4) as usize;
             assert!(
-                rec >= DIRENT_HEADER && at + rec <= leaf_page.len(),
+                rec >= DIRENT_HEADER && at + rec <= limit,
                 "corrupt ext2 directory: entry at {at} claims {rec} bytes"
             );
             let ino = le32(&leaf_page, at);
@@ -374,8 +392,8 @@ impl Core {
         // and a Linux looking for either half finds both.
         let continued = u32::from(map[split - 1].0 == hash2);
 
-        dx_move_dirents(&mut leaf_page, &mut new_page, &map[split..]);
-        dx_pack_dirents(&mut leaf_page);
+        dx_move_dirents(&mut leaf_page, &mut new_page, &map[split..], limit);
+        dx_pack_dirents(&mut leaf_page, limit);
         dx_insert_entry(
             &mut parent_page,
             parent.entries_at,
@@ -390,20 +408,23 @@ impl Core {
         // a tree that already lists both leaves.
         let into_new = name_hash >= hash2;
         let mut placed = if into_new {
-            dir_try_insert(&mut new_page, name, child, ftype)
+            dir_try_insert(&mut new_page, limit, name, child, ftype)
         } else {
-            dir_try_insert(&mut leaf_page, name, child, ftype)
+            dir_try_insert(&mut leaf_page, limit, name, child, ftype)
         };
         if !placed {
             placed = if into_new {
-                dir_try_insert(&mut leaf_page, name, child, ftype)
+                dir_try_insert(&mut leaf_page, limit, name, child, ftype)
             } else {
-                dir_try_insert(&mut new_page, name, child, ftype)
+                dir_try_insert(&mut new_page, limit, name, child, ftype)
             };
         }
         if !placed {
             return Err(VfsError::NoSpace);
         }
+        self.stamp_leaf_tail(&mut leaf_page, dir_ino, dir.generation);
+        self.stamp_leaf_tail(&mut new_page, dir_ino, dir.generation);
+        self.stamp_dx_tail(&mut parent_page, parent.entries_at, dir_ino, dir.generation);
         self.write_bytes(leaf_disk, 0, &leaf_page);
         self.write_bytes(new_disk, 0, &new_page);
         self.write_bytes(parent_disk, 0, &parent_page);
@@ -417,6 +438,7 @@ impl Core {
     pub(crate) fn dx_split_node(
         &self,
         dir: &mut InodeData,
+        dir_ino: u32,
         root_disk: u64,
         root_page: &mut [u8],
         root_frame: DxFrame,
@@ -431,7 +453,7 @@ impl Core {
         let hash2 = dx_entry_hash(node_page, node_frame.entries_at, icount1);
 
         let new_logical = dir.size as u64 / block_size as u64;
-        let new_disk = self.bmap_ensure(dir, new_logical)?.0;
+        let new_disk = self.bmap_ensure(dir, dir_ino, new_logical)?.0;
         dir.size += block_size as u64;
         dir.blocks += self.block_units(dir.flags);
 
@@ -462,6 +484,9 @@ impl Core {
             new_logical as u32,
         );
 
+        self.stamp_dx_tail(node_page, node_frame.entries_at, dir_ino, dir.generation);
+        self.stamp_dx_tail(&mut new_page, DIRENT_HEADER, dir_ino, dir.generation);
+        self.stamp_dx_tail(root_page, root_frame.entries_at, dir_ino, dir.generation);
         self.write_bytes(node_disk, 0, node_page);
         self.write_bytes(new_disk, 0, &new_page);
         self.write_bytes(root_disk, 0, root_page);
@@ -477,20 +502,27 @@ impl Core {
     pub(crate) fn dir_add_fallback(
         &self,
         dir: &mut InodeData,
+        dir_ino: u32,
         name: &str,
         child: u32,
         ftype: u8,
     ) -> VfsResult<()> {
         dir.flags &= !INODE_INDEX_FL;
-        self.dir_add_linear(dir, name, child, ftype)
+        self.dir_add_linear(dir, dir_ino, name, child, ftype)
     }
 }
 
 /// Move the mapped entries into a fresh leaf, packed to their minimal
-/// lengths, the last one's record running to the end of the block. Each
-/// source slot is emptied - inode zeroed, name wiped - so the compaction of
-/// what stays never sees it.
-pub(crate) fn dx_move_dirents(from: &mut [u8], to: &mut [u8], map: &[(u32, usize, usize)]) {
+/// lengths, the last one's record running to the end of the usable block -
+/// which is where the checksum trailer starts, on a volume that has one.
+/// Each source slot is emptied - inode zeroed, name wiped - so the
+/// compaction of what stays never sees it.
+pub(crate) fn dx_move_dirents(
+    from: &mut [u8],
+    to: &mut [u8],
+    map: &[(u32, usize, usize)],
+    limit: usize,
+) {
     let mut at = 0;
     let last = map.len().saturating_sub(1);
     for (i, &(_hash, offs, size)) in map.iter().enumerate() {
@@ -498,7 +530,7 @@ pub(crate) fn dx_move_dirents(from: &mut [u8], to: &mut [u8], map: &[(u32, usize
         to[at..at + own].copy_from_slice(&from[offs..offs + own]);
         set16(to, at + 4, own as u16);
         if i == last {
-            set16(to, at + 4, (to.len() - at) as u16);
+            set16(to, at + 4, (limit - at) as u16);
         }
         set32(from, offs, 0);
         for b in &mut from[offs + 6..offs + size] {
@@ -509,13 +541,14 @@ pub(crate) fn dx_move_dirents(from: &mut [u8], to: &mut [u8], map: &[(u32, usize
 }
 
 /// Compact the live entries of a leaf to their minimal lengths at the front
-/// of the block; the last one's record runs to the end, as a walker expects.
-pub(crate) fn dx_pack_dirents(page: &mut [u8]) {
+/// of the usable block; the last one's record runs to the end of it, as a
+/// walker - and the trailer, where there is one - expect.
+pub(crate) fn dx_pack_dirents(page: &mut [u8], limit: usize) {
     let (mut to, mut last) = (0usize, 0usize);
     let mut at = 0;
-    while at + DIRENT_HEADER <= page.len() {
+    while at + DIRENT_HEADER <= limit {
         let rec = le16(page, at + 4) as usize;
-        if rec < DIRENT_HEADER || at + rec > page.len() {
+        if rec < DIRENT_HEADER || at + rec > limit {
             break;
         }
         let ino = le32(page, at);
@@ -529,5 +562,5 @@ pub(crate) fn dx_pack_dirents(page: &mut [u8]) {
         }
         at += rec;
     }
-    set16(page, last + 4, (page.len() - last) as u16);
+    set16(page, last + 4, (limit - last) as u16);
 }

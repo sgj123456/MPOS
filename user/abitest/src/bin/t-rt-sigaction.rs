@@ -36,7 +36,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let handler_addr = segv_handler as extern "C" fn() as usize;
 
     // The fresh-process query: the sentinels must all be gone.
-    let mut old = lin::SigAction { handler: SEED as usize, flags: SEED as usize, restorer: SEED as usize, mask: SEED };
+    let mut old = lin::SigAction {
+        handler: SEED as usize,
+        flags: SEED as usize,
+        restorer: SEED as usize,
+        mask: SEED,
+    };
     let r = lin::rt_sigaction(lin::SIGSEGV, core::ptr::null(), &mut old);
     lin::check_eq(
         &mut failed,
@@ -58,12 +63,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         mask: 0,
     };
     let r = lin::rt_sigaction(lin::SIGPIPE, &act, core::ptr::null_mut());
-    lin::check_eq(
-        &mut failed,
-        b"installing SIG_IGN on SIGPIPE succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"installing SIG_IGN on SIGPIPE succeeds", r, 0);
 
     // Rust std arms SIGSEGV and SIGBUS with SA_ONSTACK for its stack-overflow
     // guard - the flag combination the strace shows.
@@ -81,34 +81,26 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         0,
     );
     let r = lin::rt_sigaction(lin::SIGBUS, &act, core::ptr::null_mut());
-    lin::check_eq(
-        &mut failed,
-        b"installing the SIGBUS handler succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"installing the SIGBUS handler succeeds", r, 0);
 
     // The refusal set the man page fixes: signal 0 is not a signal,
     // SIGKILL/SIGSTOP cannot be given a disposition by anyone, and 32 is
     // the first real-time number past the 0..=31 this kernel can name.
     let r = lin::rt_sigaction(0, core::ptr::null(), core::ptr::null_mut());
-    lin::check_eq(&mut failed, b"rt_sigaction on signal 0 is EINVAL", r, lin::EINVAL);
-    let r = lin::rt_sigaction(
-        lin::SIGKILL,
-        core::ptr::null(),
-        core::ptr::null_mut(),
+    lin::check_eq(
+        &mut failed,
+        b"rt_sigaction on signal 0 is EINVAL",
+        r,
+        lin::EINVAL,
     );
+    let r = lin::rt_sigaction(lin::SIGKILL, core::ptr::null(), core::ptr::null_mut());
     lin::check_eq(
         &mut failed,
         b"rt_sigaction on SIGKILL is EINVAL",
         r,
         lin::EINVAL,
     );
-    let r = lin::rt_sigaction(
-        lin::SIGSTOP,
-        core::ptr::null(),
-        core::ptr::null_mut(),
-    );
+    let r = lin::rt_sigaction(lin::SIGSTOP, core::ptr::null(), core::ptr::null_mut());
     lin::check_eq(
         &mut failed,
         b"rt_sigaction on SIGSTOP is EINVAL",

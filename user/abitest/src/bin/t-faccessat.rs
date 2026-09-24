@@ -25,12 +25,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let r = lin::faccessat(lin::AT_FDCWD, &MOTD, lin::R_OK);
-    lin::check_eq(
-        &mut failed,
-        b"an existing file is reachable for R_OK",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"an existing file is reachable for R_OK", r, 0);
 
     let r = lin::faccessat(lin::AT_FDCWD, &NO_SUCH, lin::F_OK);
     lin::check_eq(
@@ -45,23 +40,13 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_true(&mut failed, b"/bin opens as a dirfd", binfd >= 0);
     if binfd >= 0 {
         let r = lin::faccessat(binfd as i32, &SH, lin::F_OK);
-        lin::check_eq(
-            &mut failed,
-            b"faccessat relative to a dirfd succeeds",
-            r,
-            0,
-        );
+        lin::check_eq(&mut failed, b"faccessat relative to a dirfd succeeds", r, 0);
         let _ = lin::close(binfd as i32);
     }
 
     // A dirfd that is not open answers EBADF.
     let r = lin::faccessat(77, &MOTD, lin::F_OK);
-    lin::check_eq(
-        &mut failed,
-        b"a bad dirfd answers EBADF",
-        r,
-        lin::EBADF,
-    );
+    lin::check_eq(&mut failed, b"a bad dirfd answers EBADF", r, lin::EBADF);
 
     lin::done(failed)
 }

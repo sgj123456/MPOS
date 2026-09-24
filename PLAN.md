@@ -15,7 +15,7 @@ Missing essential features, prioritized by impact on real-world workload compati
 - **Scheduler**: 4-level priority + round-robin, COW fork, demand-paged stack
 - **Network latency**: event-driven socket waits + virtio-net MSI-X interrupts;
   loopback `ping 127.0.0.1` 7.5 ms → 0.3 ms (10.1 done)
-- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.1 / 4.2 / 5.1 done; 4.3 / 5.2 partial; 6.3 stub.
+- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.1 / 4.2 / 4.4 / 5.1 done; 4.3 / 5.2 partial; 6.3 stub.
 
 ### Remaining ABI support (gaps + services)
 
@@ -286,15 +286,17 @@ socket file. Permissions: bind needs write+search on the parent (the
 mkdirat rule), connect needs `W_OK` on the node.
 
 Deliberate divergences from Linux (each asserted in `t-unix`/
-`t-unix-rustix`): `SOCK_DGRAM`/`SOCK_SEQPACKET` unix sockets answer
-`EOPNOTSUPP` (stream only); the abstract namespace answers `EINVAL`; a
-connect to a bound-but-never-listened name is `ECONNREFUSED` rather than
-Linux's implicit backlog-0 rendezvous; ext4 refuses socket nodes
-(`EOPNOTSUPP` - `/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so only
-`bind` creates a socket name; `getpeername` answers `AF_UNIX` with an empty
-path (accepted peers carry no name); and **no `SCM_RIGHTS`/
-`SCM_CREDENTIALS`** - a real dbus broker still cannot authenticate its
-clients, which is the next milestone for this family.
+`t-unix-rustix`): the abstract namespace answers `EINVAL`; a connect to a
+bound-but-never-listened name is `ECONNREFUSED` rather than Linux's
+implicit backlog-0 rendezvous; ext4 refuses socket nodes (`EOPNOTSUPP` -
+`/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so only `bind` creates a
+socket name; `getpeername` answers `AF_UNIX` with an empty path (accepted
+peers carry no name); and **no `SCM_RIGHTS`/`SCM_CREDENTIALS`** - a real
+dbus broker still cannot authenticate its clients, which is the next
+milestone for this family. `SOCK_DGRAM` unix sockets now *open* - musl's
+`if_nametoindex` asks for one as the handle for its own `SIOCGIFINDEX`
+ioctl, and a refusal turned every device-name lookup into "can't find
+device" - but the datagram transfer itself is the documented v1 gap.
 
 ### 4.2 ICMP Improvements — **DONE**
 
@@ -333,17 +335,49 @@ disable Nagle coalescing, `SO_KEEPALIVE` not issuing probe packets, and
 `SO_LINGER` not honoured at `close`. The flags are stored and queried but do not
 yet change packet behaviour.
 
-### 4.4 Netlink Write Operations
+### 4.4 Netlink Write Operations — **DONE**
 
-Currently read-only. Need write support for network configuration.
+The write side is real: `ip addr add/del`, `ip route add/del/replace`,
+`ip link set eth0 up|down|mtu N|name X` are parsed (`ifaddrmsg`/`rtmsg`/
+`ifinfomsg` + `rtattr` walks) and applied to the live stack - smoltcp's own
+address and route tables, so a route added is a route the packet path
+follows. `ip link set eth0 down` stops the interface from being polled:
+frames neither leave nor arrive, and a `ping` through it loses 100% until
+`up` restores it. Dumps read the same live state, so what was written is
+what `ip addr`/`ip route`/`ip link` print - with the Linux shapes filled in
+(`IFLA_BROADCAST`, `IFLA_MTU`, `IFLA_QDISC "noqueue"`, `IFLA_TXQLEN`,
+`IFA_F_PERMANENT`, secondary-address labels `eth0:1`).
+
+Errnos match Linux: `EEXIST` on a duplicate, `EADDRNOTAVAIL`/`ESRCH` on a
+delete of something absent, `ENODEV` on an unknown index, `EAFNOSUPPORT`
+off-family, `ENOBUFS` when the fixed route table (four entries) is full.
+The error rides back in `nlmsgerr.error` **negated** - the kernel's own
+convention; writing it positive made busybox print the message for an errno
+no table knows ("No error information") instead of "File exists".
+
+Deliberate v1 divergences (each asserted in `t-netlink`): an exact-
+duplicate `ip addr add` succeeds instead of `EEXIST` (the boot's own
+idempotent re-configuration stays quiet); a route with no gateway is
+`EINVAL` (smoltcp delivers the interface's own subnets implicitly, so an
+on-link prefix has no second expression); `RTM_DELLINK` and `ip link add`
+are `EOPNOTSUPP` (no dynamic interfaces); `lo`'s address and MTU are fixed
+(flags and read-back work, the stack has no loopback device behind them).
+The `ip link set` flags path also works through the **ioctls** busybox
+reaches it by - `SIOCGIFFLAGS`/`SIOCSIFFLAGS`/`SIOCSIFMTU`/`SIOCGIFINDEX`
+(the one musl's `if_nametoindex` needs), `SIOCGIFMTU`, `SIOCGIFTXQLEN`/
+`SIOCGIFHWADDR` (whose numbers 0x8942/0x8927 had been swapped, answering
+the MAC for a txqueue-length request). Two helper gaps this opened: AF_UNIX
+`SOCK_DGRAM` now *opens* (musl's `if_nametoindex` asks for it as the bare
+handle for its own `SIOCGIFINDEX`), with the datagram transfer still the
+documented gap; and `IFLA_TXQLEN`/`IFLA_MTU` are native-order words, the
+endianness addresses are not.
 
 **Changes**:
-- `RTM_NEWADDR`: configure IP address (for `ip addr add`)
-- `RTM_DELADDR`: remove IP address
-- `RTM_NEWROUTE`: add route
-- `RTM_DELROUTE`: remove route
-- `RTM_NEWLINK`: bring interface up/down
-- `RTM_SETLINK`: change MTU, name
+- `RTM_NEWADDR`/`RTM_DELADDR`: `ip addr add`/`del`, applied to the stack
+- `RTM_NEWROUTE`/`RTM_DELROUTE`: `ip route add`/`del`/`replace`
+- `RTM_NEWLINK`/`RTM_SETLINK`: link up/down (a real poll gate), MTU, name
+- `ip addr`/`ip route`/`ip link` dumps read the live tables, not constants
+- The `ifreq` ioctl set `ip link set` and `if_nametoindex` ride on
 
 ---
 

@@ -58,14 +58,24 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // Identity: a fresh process is root three words over - real, effective
     // and saved, user and group alike.
     let mut ids = [1u64; 3];
-    lin::check_eq(&mut failed, b"getresuid succeeds", lin::getresuid(&mut ids), 0);
+    lin::check_eq(
+        &mut failed,
+        b"getresuid succeeds",
+        lin::getresuid(&mut ids),
+        0,
+    );
     lin::check_true(
         &mut failed,
         b"the real, effective and saved uids are root's",
         ids == [0, 0, 0],
     );
     let mut gids = [1u64; 3];
-    lin::check_eq(&mut failed, b"getresgid succeeds", lin::getresgid(&mut gids), 0);
+    lin::check_eq(
+        &mut failed,
+        b"getresgid succeeds",
+        lin::getresgid(&mut gids),
+        0,
+    );
     lin::check_true(&mut failed, b"the gids are root's", gids == [0, 0, 0]);
 
     // The res spelling, as the privilege dance sudo actually performs: root
@@ -77,14 +87,29 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::setresuid(-1, 1, -1),
         0,
     );
-    lin::check_eq(&mut failed, b"getresuid still succeeds", lin::getresuid(&mut ids), 0);
+    lin::check_eq(
+        &mut failed,
+        b"getresuid still succeeds",
+        lin::getresuid(&mut ids),
+        0,
+    );
     lin::check_true(
         &mut failed,
         b"the dance reads back real 0, effective 1, saved 0",
         ids == [0, 1, 0],
     );
-    lin::check_eq(&mut failed, b"geteuid reads the lowered id", lin::geteuid(), 1);
-    lin::check_eq(&mut failed, b"getuid still reads the real one", lin::getuid(), 0);
+    lin::check_eq(
+        &mut failed,
+        b"geteuid reads the lowered id",
+        lin::geteuid(),
+        1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"getuid still reads the real one",
+        lin::getuid(),
+        0,
+    );
     lin::check_eq(
         &mut failed,
         b"a lowered caller cannot set an id it does not hold",
@@ -101,15 +126,30 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // The re spelling: for root the saved id follows the new effective one,
     // and becoming what one already is always succeeds.
-    lin::check_eq(&mut failed, b"setreuid(0, 0) succeeds", lin::setreuid(0, 0), 0);
-    lin::check_eq(&mut failed, b"setreuid(-1, 0) succeeds", lin::setreuid(-1, 0), 0);
+    lin::check_eq(
+        &mut failed,
+        b"setreuid(0, 0) succeeds",
+        lin::setreuid(0, 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"setreuid(-1, 0) succeeds",
+        lin::setreuid(-1, 0),
+        0,
+    );
     lin::check_eq(
         &mut failed,
         b"setreuid(0, 100) succeeds for root",
         lin::setreuid(0, 100),
         0,
     );
-    lin::check_eq(&mut failed, b"getresuid reads the pair back", lin::getresuid(&mut ids), 0);
+    lin::check_eq(
+        &mut failed,
+        b"getresuid reads the pair back",
+        lin::getresuid(&mut ids),
+        0,
+    );
     lin::check_true(
         &mut failed,
         b"the saved id followed the new effective one",
@@ -123,7 +163,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::setuid(0),
         0,
     );
-    lin::check_eq(&mut failed, b"getresuid reads the raise back", lin::getresuid(&mut ids), 0);
+    lin::check_eq(
+        &mut failed,
+        b"getresuid reads the raise back",
+        lin::getresuid(&mut ids),
+        0,
+    );
     lin::check_true(
         &mut failed,
         b"an unprivileged setuid moved only the effective word",
@@ -135,8 +180,17 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::setresuid(-1, -1, 0),
         0,
     );
-    lin::check_eq(&mut failed, b"getresuid reads the reset", lin::getresuid(&mut ids), 0);
-    lin::check_true(&mut failed, b"all three words are root's again", ids == [0, 0, 0]);
+    lin::check_eq(
+        &mut failed,
+        b"getresuid reads the reset",
+        lin::getresuid(&mut ids),
+        0,
+    );
+    lin::check_true(
+        &mut failed,
+        b"all three words are root's again",
+        ids == [0, 0, 0],
+    );
 
     // Capabilities: root's state is everything permitted and effective,
     // nothing inheritable, in the version 3 shape of two records.
@@ -188,7 +242,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::getpriority(0, 0),
         20,
     );
-    lin::check_eq(&mut failed, b"setpriority 5 succeeds", lin::setpriority(0, 0, 5), 0);
+    lin::check_eq(
+        &mut failed,
+        b"setpriority 5 succeeds",
+        lin::setpriority(0, 0, 5),
+        0,
+    );
     lin::check_eq(
         &mut failed,
         b"setpriority out of range answers EINVAL",
@@ -210,8 +269,18 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         0,
     );
     let mut prio = -1i32;
-    lin::check_eq(&mut failed, b"sched_getparam succeeds", lin::sched_getparam(0, &raw mut prio), 0);
-    lin::check_eq(&mut failed, b"the SCHED_OTHER priority is zero", prio as isize, 0);
+    lin::check_eq(
+        &mut failed,
+        b"sched_getparam succeeds",
+        lin::sched_getparam(0, &raw mut prio),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the SCHED_OTHER priority is zero",
+        prio as isize,
+        0,
+    );
     lin::check_eq(
         &mut failed,
         b"SCHED_OTHER's max priority is zero",
@@ -240,7 +309,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // The machine: one core, node zero, the default persona.
     let mut cpu = 99u32;
     let mut node = 99u32;
-    lin::check_eq(&mut failed, b"getcpu succeeds", lin::getcpu(&raw mut cpu, &raw mut node), 0);
+    lin::check_eq(
+        &mut failed,
+        b"getcpu succeeds",
+        lin::getcpu(&raw mut cpu, &raw mut node),
+        0,
+    );
     lin::check_true(&mut failed, b"the cpu is 0", cpu == 0);
     lin::check_true(&mut failed, b"the node is 0", node == 0);
     lin::check_eq(
@@ -249,7 +323,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::personality(0xffff_ffff),
         0,
     );
-    lin::check_eq(&mut failed, b"setting the default persona succeeds", lin::personality(0), 0);
+    lin::check_eq(
+        &mut failed,
+        b"setting the default persona succeeds",
+        lin::personality(0),
+        0,
+    );
     lin::check_eq(
         &mut failed,
         b"an unknown persona answers EINVAL",
@@ -307,7 +386,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         }
         let mut status = 0i32;
         let got = lin::waitpid(kid as usize, &mut status, 0);
-        lin::check_true(&mut failed, b"the strict child was reaped", got == kid as isize);
+        lin::check_true(
+            &mut failed,
+            b"the strict child was reaped",
+            got == kid as isize,
+        );
         lin::check_true(
             &mut failed,
             b"the strict child died by SIGKILL on its first forbidden call",
@@ -330,7 +413,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EINVAL,
     );
     let mut pipe_fds: [i32; 2] = [-1; 2];
-    lin::check_eq(&mut failed, b"the pipe pair is made", lin::pipe2(&mut pipe_fds, 0), 0);
+    lin::check_eq(
+        &mut failed,
+        b"the pipe pair is made",
+        lin::pipe2(&mut pipe_fds, 0),
+        0,
+    );
     lin::check_eq(
         &mut failed,
         b"setns on a pipe answers EINVAL",
@@ -349,8 +437,18 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // group the thread does not belong to.
     let pid = lin::getpid();
     let tid = lin::gettid();
-    lin::check_eq(&mut failed, b"tgkill's probe on self succeeds", lin::tgkill(pid, tid, 0), 0);
-    lin::check_eq(&mut failed, b"tgkill's probe on a dead thread answers ESRCH", lin::tgkill(pid, 99, 0), lin::ESRCH);
+    lin::check_eq(
+        &mut failed,
+        b"tgkill's probe on self succeeds",
+        lin::tgkill(pid, tid, 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"tgkill's probe on a dead thread answers ESRCH",
+        lin::tgkill(pid, 99, 0),
+        lin::ESRCH,
+    );
     lin::check_eq(
         &mut failed,
         b"tgkill with a wrong group answers ESRCH",
@@ -370,7 +468,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_true(&mut failed, b"mmap hands back a page", page != 0);
     static mut VEC: [u8; 1] = [0; 1];
     let vec = unsafe { &raw mut VEC as *mut u8 };
-    lin::check_eq(&mut failed, b"mincore succeeds", lin::mincore(page, 4096, vec), 0);
+    lin::check_eq(
+        &mut failed,
+        b"mincore succeeds",
+        lin::mincore(page, 4096, vec),
+        0,
+    );
     lin::check_true(&mut failed, b"the page is resident", unsafe { VEC[0] == 1 });
     lin::check_eq(
         &mut failed,
@@ -379,7 +482,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EINVAL,
     );
     lin::check_eq(&mut failed, b"mlock succeeds", lin::mlock(page, 4096), 0);
-    lin::check_eq(&mut failed, b"munlock succeeds", lin::munlock(page, 4096), 0);
+    lin::check_eq(
+        &mut failed,
+        b"munlock succeeds",
+        lin::munlock(page, 4096),
+        0,
+    );
     lin::check_eq(&mut failed, b"mlockall succeeds", lin::mlockall(1), 0);
     lin::check_eq(
         &mut failed,

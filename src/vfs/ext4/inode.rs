@@ -70,6 +70,11 @@ pub(crate) struct InodeData {
     pub(crate) atime: u32,
     pub(crate) ctime: u32,
     pub(crate) mtime: u32,
+    /// `i_generation`, the word at 100: a cookie tying a directory block's
+    /// metadata checksum (and any rename racing an open) to the inode's
+    /// history. Carried and written back so a metadata edit neither zeroes
+    /// it nor invalidates the checksum folded from it.
+    pub(crate) generation: u32,
 }
 
 /// The wall clock, in unix seconds - what inode timestamps are written in.
@@ -116,6 +121,7 @@ impl InodeData {
             atime: le32(bytes, 8),
             ctime: le32(bytes, 12),
             mtime: le32(bytes, 16),
+            generation: le32(bytes, 100),
         }
     }
 
@@ -147,6 +153,7 @@ impl InodeData {
         set32(bytes, 8, self.atime);
         set32(bytes, 12, self.ctime);
         set32(bytes, 16, self.mtime);
+        set32(bytes, 100, self.generation);
         for (i, value) in self.block.iter().enumerate() {
             set32(bytes, 40 + 4 * i, *value);
         }

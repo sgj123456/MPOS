@@ -21,9 +21,19 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-preadv2\n");
     let mut failed = false;
 
-    let fd = lin::openat(lin::AT_FDCWD, &PATH, lin::O_CREAT | lin::O_RDWR | 0o1000, 0o644) as i32;
+    let fd = lin::openat(
+        lin::AT_FDCWD,
+        &PATH,
+        lin::O_CREAT | lin::O_RDWR | 0o1000,
+        0o644,
+    ) as i32;
     lin::check_true(&mut failed, b"the file is created", fd >= 0);
-    lin::check_eq(&mut failed, b"the file takes 10 bytes", lin::write(fd, b"0123456789"), 10);
+    lin::check_eq(
+        &mut failed,
+        b"the file takes 10 bytes",
+        lin::write(fd, b"0123456789"),
+        10,
+    );
 
     static mut A: [u8; 3] = [b'X'; 3];
     static mut B: [u8; 4] = [b'X'; 4];
@@ -40,13 +50,16 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // The explicit position: bytes 2..9 land across the two vectors, and
     // the descriptor's own cursor stays where it was.
-    let n = lin::preadv2(fd, unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) }, 2, 0);
-    lin::check_eq(&mut failed, b"the vectored read takes 7 bytes", n, 7);
-    lin::check_true(
-        &mut failed,
-        b"the first vector read bytes 2,3,4",
-        unsafe { A == *b"234" },
+    let n = lin::preadv2(
+        fd,
+        unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) },
+        2,
+        0,
     );
+    lin::check_eq(&mut failed, b"the vectored read takes 7 bytes", n, 7);
+    lin::check_true(&mut failed, b"the first vector read bytes 2,3,4", unsafe {
+        A == *b"234"
+    });
     lin::check_true(
         &mut failed,
         b"the second vector read bytes 5,6,7,8",
@@ -64,13 +77,28 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"a negative offset other than -1 answers EINVAL",
-        lin::preadv2(fd, unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) }, -5, 0),
+        lin::preadv2(
+            fd,
+            unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) },
+            -5,
+            0,
+        ),
         lin::EINVAL,
     );
 
     // The -1 spelling: the cursor's own position, moved by the call.
-    lin::check_eq(&mut failed, b"the cursor seeks to 0", lin::lseek(fd, 0, lin::SEEK_SET), 0);
-    let n = lin::preadv2(fd, unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) }, -1, 0);
+    lin::check_eq(
+        &mut failed,
+        b"the cursor seeks to 0",
+        lin::lseek(fd, 0, lin::SEEK_SET),
+        0,
+    );
+    let n = lin::preadv2(
+        fd,
+        unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) },
+        -1,
+        0,
+    );
     lin::check_eq(&mut failed, b"the cursor-mode read takes 7 bytes", n, 7);
     lin::check_eq(
         &mut failed,
@@ -85,13 +113,23 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"RWF_NOWAIT on an eager read is accepted",
-        lin::preadv2(fd, unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) }, 0, lin::RWF_NOWAIT),
+        lin::preadv2(
+            fd,
+            unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) },
+            0,
+            lin::RWF_NOWAIT,
+        ),
         7,
     );
     lin::check_eq(
         &mut failed,
         b"an unknown advice bit answers EOPNOTSUPP",
-        lin::preadv2(fd, unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) }, 0, 0x1000),
+        lin::preadv2(
+            fd,
+            unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) },
+            0,
+            0x1000,
+        ),
         lin::EOPNOTSUPP,
     );
 
@@ -105,8 +143,15 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let n = lin::pwritev2(fd, &wiov, 0, lin::RWF_APPEND);
     lin::check_eq(&mut failed, b"the append write takes 3 bytes", n, 3);
     static mut TAIL: [u8; 3] = [0; 3];
-    lin::check_eq(&mut failed, b"the tail seeks to 10", lin::lseek(fd, 10, lin::SEEK_SET), 10);
-    let r = lin::read(fd, unsafe { core::slice::from_raw_parts_mut(&raw mut TAIL as *mut u8, 3) });
+    lin::check_eq(
+        &mut failed,
+        b"the tail seeks to 10",
+        lin::lseek(fd, 10, lin::SEEK_SET),
+        10,
+    );
+    let r = lin::read(fd, unsafe {
+        core::slice::from_raw_parts_mut(&raw mut TAIL as *mut u8, 3)
+    });
     lin::check_eq(&mut failed, b"the tail read takes 3 bytes", r, 3);
     lin::check_true(
         &mut failed,
@@ -117,7 +162,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"a closed descriptor answers EBADF",
-        lin::preadv2(99, unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) }, 0, 0),
+        lin::preadv2(
+            99,
+            unsafe { core::slice::from_raw_parts_mut(&raw mut iov as *mut lin::Iovec, 2) },
+            0,
+            0,
+        ),
         lin::EBADF,
     );
 

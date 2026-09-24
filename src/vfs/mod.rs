@@ -27,6 +27,7 @@ pub mod file;
 pub mod inotify;
 pub mod locks;
 pub mod mount;
+pub mod p9;
 pub mod path;
 pub mod pipe;
 pub mod procfs;
@@ -422,12 +423,63 @@ pub trait Inode: Send + Sync {
         0
     }
 
+    /// The physical frame `mmap` should map for page `index` of this node,
+    /// if the node owns memory it can share rather than copy.
+    ///
+    /// The kernel's file mappings are read-in copies - right for every file
+    /// a program merely reads, and wrong for the one thing that must not be
+    /// a copy: a framebuffer, where a program drawing into its mapping is
+    /// drawing *on the screen*. A node that owns shareable pages answers
+    /// with their physical address and the mapping becomes those very
+    /// frames; the rest answer `None` and get the copy the contract always
+    /// promised. The node's own protection against those frames being
+    /// recycled - the pin, for the GPU's DMA - is the node's business,
+    /// which is why this is a method and not a type.
+    fn mmap_frame(&self, _index: u64) -> Option<usize> {
+        None
+    }
+
+    /// The framebuffer this node is, if it is one - how `FBIOGET_*` reaches
+    /// the resolution and the buffer facts without the ioctl layer knowing
+    /// where framebuffers live. Same shape as [`Self::as_tty`], for the
+    /// same reason: the syscall layer must be able to ask the node what it
+    /// really is.
+    #[cfg(target_os = "none")]
+    fn as_fb(&self) -> Option<&crate::drivers::virtio::gpu::FbDev> {
+        None
+    }
+
+    /// The evdev node this is, if it is one - how `EVIOCGNAME` reaches the
+    /// device's own name for itself. See [`Self::as_fb`] for why a syscall
+    /// that arrives holding nothing but a descriptor needs this.
+    #[cfg(target_os = "none")]
+    fn as_evdev(&self) -> Option<&crate::drivers::virtio::input::EvdevNode> {
+        None
+    }
+
+    /// The vsock socket this node is, if it is one - the borrow form of the
+    /// id the close paths check, for the socket syscalls that operate on
+    /// the socket's own state. Gated with the `net` module, like
+    /// [`Self::as_unix`], which this mirrors family for family.
+    #[cfg(target_os = "none")]
+    fn as_vsock(&self) -> Option<&crate::net::vsock::VsockSock> {
+        None
+    }
+
     /// The AF_UNIX socket this node is, if it is one - the same question
     /// [`Self::socket_handle`] puts to the network registry, answered with
     /// this module's own slot number. The unix syscalls hold nothing but a
     /// descriptor; the listener's queue and the bind record live behind this
     /// id in `net::unix`, and zero means "not a unix socket".
     fn unix_id(&self) -> usize {
+        0
+    }
+
+    /// The AF_VSOCK socket this node is, if it is one - the id the close
+    /// paths retire the socket by, numbered exactly like [`Self::unix_id`]:
+    /// zero means "not a vsock socket", and the family's registry holds the
+    /// rest. See [`Self::as_vsock`] for the gated borrow form.
+    fn vsock_id(&self) -> usize {
         0
     }
 
@@ -856,7 +908,13 @@ pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
     let allowed = if me.0 == 0 {
         root_override(mode, want, inode.metadata().kind == NodeKind::Dir)
     } else {
-        permitted(mode, inode.owner(), want, me, &crate::sched::current_groups())
+        permitted(
+            mode,
+            inode.owner(),
+            want,
+            me,
+            &crate::sched::current_groups(),
+        )
     };
     if allowed {
         Ok(())

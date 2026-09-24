@@ -44,6 +44,19 @@ pub const VC_COUNT: u32 = 6;
 /// worth asking for one more.
 pub const MAX: u32 = 4096;
 
+/// How much a slave may have printed that the master has not yet taken.
+///
+/// The bound is what makes an unstoppable flood stoppable. Without it a program
+/// writing a big file to its terminal (`bat` over a minified HTML) never blocks:
+/// the bytes pile into memory, the program runs to its end and exits, and the
+/// only thing left is the wire, which nothing can now interrupt or switch away
+/// from. With it the writer parks once the buffer is full: it stays alive and
+/// still in the foreground, so Ctrl-C reaches it, and the mux keeps carrying
+/// the buffered tail out between chunks, so `^A <num>` switches on the next lap
+/// rather than after the whole file has crawled over COM1.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+const TO_MASTER_MAX: usize = 64 * 1024;
+
 /// The `tty` major and the minor a pty slave's device number starts at. Linux
 /// uses 136 for `/dev/pts/*`, and 5:2 for `/dev/ptmx` itself.
 const PTS_MAJOR: u32 = 136;
@@ -71,6 +84,10 @@ struct State {
     /// Tasks blocked reading the master. A producer cannot name them, but the
     /// pair can, and a wake aimed anywhere else would miss.
     waiters: Vec<TaskId>,
+    /// Tasks blocked in [`Pty::push_master_backpressure`], waiting for room in
+    /// `to_master` the way the readers wait for bytes in it. `take_master`
+    /// creates the room and wakes them.
+    write_waiters: Vec<TaskId>,
 }
 
 impl Pty {
@@ -83,6 +100,7 @@ impl Pty {
                 to_master: VecDeque::new(),
                 locked: true,
                 waiters: Vec::new(),
+                write_waiters: Vec::new(),
             })),
         })
     }
@@ -118,6 +136,91 @@ impl Pty {
         });
     }
 
+    /// Copy as much of `bytes` as fits under [`TO_MASTER_MAX`], and report how
+    /// many that was. The rest is the caller's to offer again once the master
+    /// takes some - see [`push_master_backpressure`](Self::push_master_backpressure).
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    fn push_master_bounded(&self, bytes: &[u8]) -> usize {
+        critical_section::with(|cs| {
+            let mut state = self.state.borrow(cs).borrow_mut();
+            let room = TO_MASTER_MAX.saturating_sub(state.to_master.len());
+            let n = room.min(bytes.len());
+            state.to_master.extend(bytes[..n].iter().copied());
+            n
+        })
+    }
+
+    /// Whether `to_master` has room a blocked writer can use. The condition the
+    /// back-pressure wait turns on, and what `take_master` makes true.
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    fn master_room(&self) -> bool {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().to_master.len() < TO_MASTER_MAX)
+    }
+
+    /// Push a slave's printed bytes, parking the writing task when the buffer
+    /// is full until the master takes enough for the rest.
+    ///
+    /// The task-context path: it is the back-pressure that keeps a flood from
+    /// running ahead of the one serial wire and out of anyone's reach. Because
+    /// it parks through `block_until`, a fatal signal ends the wait - a Ctrl-C
+    /// kills the blocked writer rather than leaving it to be killed after it
+    /// has already dumped the whole file into memory. Joining the wait list
+    /// before the first attempt mirrors the console's transmit ring: room that
+    /// appears between a failed push and the sleep must have someone to tell.
+    #[cfg(target_os = "none")]
+    fn push_master_backpressure(&self, bytes: &[u8]) {
+        let id = crate::sched::current();
+        self.subscribe_writer(id);
+        let mut at = 0;
+        while at < bytes.len() {
+            at += self.push_master_bounded(&bytes[at..]);
+            // Tell the pump there is something to carry before possibly waiting
+            // for it to make room; otherwise a full buffer with a sleeping
+            // master is nobody waiting on anybody.
+            self.wake_master_waiters();
+            if at == bytes.len() {
+                break;
+            }
+            crate::sched::block_until(|| self.master_room());
+        }
+        self.unsubscribe_writer(id);
+    }
+
+    /// Add the running task to the writers' wait list, before it parks on room.
+    #[cfg(target_os = "none")]
+    fn subscribe_writer(&self, id: TaskId) {
+        critical_section::with(|cs| {
+            let mut state = self.state.borrow(cs).borrow_mut();
+            if !state.write_waiters.contains(&id) {
+                state.write_waiters.push(id);
+            }
+        });
+    }
+
+    /// Take the running task back off the list - the wait ended however it ended.
+    #[cfg(target_os = "none")]
+    fn unsubscribe_writer(&self, id: TaskId) {
+        critical_section::with(|cs| {
+            self.state
+                .borrow(cs)
+                .borrow_mut()
+                .write_waiters
+                .retain(|&w| w != id);
+        });
+    }
+
+    /// Tell the writers that the master took some bytes and room appeared.
+    fn wake_writer_waiters(&self) {
+        let waiters =
+            critical_section::with(|cs| self.state.borrow(cs).borrow().write_waiters.clone());
+        for id in waiters {
+            #[cfg(target_os = "none")]
+            crate::sched::wake(id);
+            #[cfg(not(target_os = "none"))]
+            let _ = id;
+        }
+    }
+
     /// Wake everyone waiting on the master. Membership is the subscribers'
     /// business - `subscribe_master` and `unsubscribe_master` own it - because
     /// a waiter that is woken but keeps waiting (the mux, a blocked master
@@ -142,14 +245,20 @@ impl Pty {
 
     /// Take up to `want` bytes the slave printed, if any.
     pub fn take_master(&self, want: usize) -> Option<Vec<u8>> {
-        critical_section::with(|cs| {
+        let taken = critical_section::with(|cs| {
             let mut state = self.state.borrow(cs).borrow_mut();
             if state.to_master.is_empty() {
                 return None;
             }
             let take = state.to_master.len().min(want);
             Some(state.to_master.drain(..take).collect())
-        })
+        });
+        // Room the writers parked on only exists once the master has taken it,
+        // so this is where a blocked slave is told to go on.
+        if taken.is_some() {
+            self.wake_writer_waiters();
+        }
+        taken
     }
 
     /// Join the list `master_input` wakes when the slave has printed something.
@@ -297,6 +406,16 @@ pub fn master_input(number: u32, bytes: &[u8]) {
     let Some(pty) = lookup(number) else {
         return;
     };
+    // A task that may sleep pushes with back-pressure, so a flood stops at the
+    // buffer bound and its writer stays killable and switchable-away-from.
+    // Anything else - the echo of a keystroke from the interrupt handler, the
+    // host's pair tests - is bounded by its own making and must not park, so it
+    // goes straight onto the wire.
+    #[cfg(target_os = "none")]
+    if crate::sched::started() && crate::arch::interrupts_enabled() {
+        pty.push_master_backpressure(bytes);
+        return;
+    }
     pty.push_master(bytes);
     pty.wake_master_waiters();
 }

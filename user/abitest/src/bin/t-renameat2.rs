@@ -64,13 +64,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     if fd >= 0 {
         let _ = lin::close(fd as i32);
     }
-    let r = lin::renameat2(
-        lin::AT_FDCWD,
-        &A,
-        lin::AT_FDCWD,
-        &B,
-        lin::RENAME_NOREPLACE,
-    );
+    let r = lin::renameat2(lin::AT_FDCWD, &A, lin::AT_FDCWD, &B, lin::RENAME_NOREPLACE);
     lin::check_eq(
         &mut failed,
         b"NOREPLACE over an existing target answers EEXIST",
@@ -94,12 +88,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // A flags word with unknown bits is refused outright.
     let r = lin::renameat2(lin::AT_FDCWD, &A, lin::AT_FDCWD, &B, 0x8);
-    lin::check_eq(
-        &mut failed,
-        b"unknown flags answer EINVAL",
-        r,
-        lin::EINVAL,
-    );
+    lin::check_eq(&mut failed, b"unknown flags answer EINVAL", r, lin::EINVAL);
 
     // A source that is not there cannot be renamed.
     let r = lin::renameat2(lin::AT_FDCWD, &GONE, lin::AT_FDCWD, &B, 0);

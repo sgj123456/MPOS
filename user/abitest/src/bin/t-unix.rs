@@ -31,7 +31,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // The family opens: AF_UNIX SOCK_STREAM, the same channel a socketpair
     // end is made of.
     let fd = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1 /* SOCK_STREAM */, 0) as i32;
-    lin::check_true(&mut failed, b"socket(AF_UNIX, SOCK_STREAM) succeeds", fd >= 0);
+    lin::check_true(
+        &mut failed,
+        b"socket(AF_UNIX, SOCK_STREAM) succeeds",
+        fd >= 0,
+    );
 
     // Leftovers from an earlier run cannot haunt this one.
     let _ = lin::unlinkat(lin::AT_FDCWD, SOCK, 0);
@@ -157,7 +161,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::O_CREAT | lin::O_WRONLY,
         0o644,
     ) as i32;
-    lin::check_true(&mut failed, b"the not-a-directory parent was made", parent >= 0);
+    lin::check_true(
+        &mut failed,
+        b"the not-a-directory parent was made",
+        parent >= 0,
+    );
     lin::close(parent);
     let (notdir, dlen) = lin::SockAddrUn::new(b"/tmp/t-unix-notdir/s.sock");
     let got = lin::bind_un(fd2, &notdir, dlen);
@@ -222,18 +230,35 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EISCONN,
     );
     let server = lin::accept4_un(fd2, core::ptr::null_mut(), core::ptr::null_mut(), 0) as i32;
-    lin::check_true(&mut failed, b"accept hands out the queued connection", server >= 0);
+    lin::check_true(
+        &mut failed,
+        b"accept hands out the queued connection",
+        server >= 0,
+    );
 
     // The byte channel, both ways.
     let _ = lin::write_all(client, b"ping");
     let mut rbuf = [0u8; 8];
     let n = lin::read(server, &mut rbuf);
     lin::check_eq(&mut failed, b"the server reads what the client wrote", n, 4);
-    lin::check_true(&mut failed, b"the bytes are the bytes", &rbuf[..4] == b"ping");
+    lin::check_true(
+        &mut failed,
+        b"the bytes are the bytes",
+        &rbuf[..4] == b"ping",
+    );
     let _ = lin::write_all(server, b"pong!");
     let mut cbuf = [0u8; 8];
-    lin::check_eq(&mut failed, b"the client reads the reply", lin::read(client, &mut cbuf), 5);
-    lin::check_true(&mut failed, b"the reply bytes arrived whole", &cbuf[..5] == b"pong!");
+    lin::check_eq(
+        &mut failed,
+        b"the client reads the reply",
+        lin::read(client, &mut cbuf),
+        5,
+    );
+    lin::check_true(
+        &mut failed,
+        b"the reply bytes arrived whole",
+        &cbuf[..5] == b"pong!",
+    );
 
     // getpeername on a connected end: the client carries no name and the
     // accepted half is anonymous too, so the answer is `AF_UNIX` with the
@@ -267,13 +292,23 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::raw_sys2(lin::nr::SHUTDOWN, client as usize, 1),
         0,
     );
-    lin::check_eq(&mut failed, b"the server sees end-of-stream", lin::read(server, &mut rbuf), 0);
+    lin::check_eq(
+        &mut failed,
+        b"the server sees end-of-stream",
+        lin::read(server, &mut rbuf),
+        0,
+    );
 
     // Backlog and nonblocking accept: an empty queue answers EAGAIN.
     lin::check_eq(
         &mut failed,
         b"accept on an empty nonblocking queue answers EAGAIN",
-        lin::accept4_un(fd2, core::ptr::null_mut(), core::ptr::null_mut(), 0x800 /* SOCK_NONBLOCK */),
+        lin::accept4_un(
+            fd2,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            0x800, /* SOCK_NONBLOCK */
+        ),
         lin::EAGAIN,
     );
 
@@ -321,7 +356,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::poll(core::slice::from_mut(&mut pfd), 100),
         1,
     );
-    lin::check_true(&mut failed, b"POLLIN is the reported event", pfd.revents & 1 != 0);
+    lin::check_true(
+        &mut failed,
+        b"POLLIN is the reported event",
+        pfd.revents & 1 != 0,
+    );
     let server2 = lin::accept4_un(fd2, core::ptr::null_mut(), core::ptr::null_mut(), 0) as i32;
     lin::check_true(&mut failed, b"and the queued socket is there", server2 >= 0);
     // The accepted descriptor is the connected half of that very handshake:
@@ -329,7 +368,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // descriptor telling one story.
     let _ = lin::write_all(client2, b"x");
     let mut abuf = [0u8; 4];
-    lin::check_eq(&mut failed, b"the accepted socket reads its own client", lin::read(server2, &mut abuf), 1);
+    lin::check_eq(
+        &mut failed,
+        b"the accepted socket reads its own client",
+        lin::read(server2, &mut abuf),
+        1,
+    );
     lin::close(server2);
 
     // A bound socket that never listened refuses streams (the kernel's

@@ -40,19 +40,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // The GET probe: set a base the test chose itself, read it back through
     // memory, and put the zero base back before anything else runs.
     let r = lin::arch_prctl(lin::ARCH_SET_FS, 0x2000);
-    lin::check_eq(
-        &mut failed,
-        b"ARCH_SET_FS accepts the probe base",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"ARCH_SET_FS accepts the probe base", r, 0);
     let r = lin::arch_prctl(lin::ARCH_GET_FS, &raw mut FS_OUT as usize);
-    lin::check_eq(
-        &mut failed,
-        b"ARCH_GET_FS answers 0",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"ARCH_GET_FS answers 0", r, 0);
     unsafe {
         lin::check_eq(
             &mut failed,
@@ -85,12 +75,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     }
 
     let r = lin::arch_prctl(lin::ARCH_SET_FS, base);
-    lin::check_eq(
-        &mut failed,
-        b"ARCH_SET_FS accepts the TLS base",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"ARCH_SET_FS accepts the TLS base", r, 0);
 
     let mut self_ptr: u64;
     let mut magic: u64;
@@ -118,12 +103,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     let r = lin::arch_prctl(lin::ARCH_SET_FS, 0);
-    lin::check_eq(
-        &mut failed,
-        b"ARCH_SET_FS restores the zero base",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"ARCH_SET_FS restores the zero base", r, 0);
 
     lin::done(failed)
 }

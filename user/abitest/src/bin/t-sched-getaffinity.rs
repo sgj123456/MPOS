@@ -39,16 +39,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         n,
         MASK_BYTES,
     );
-    lin::check_true(
-        &mut failed,
-        b"that CPU is CPU 0",
-        unsafe { (*mask) & 1 == 1 },
-    );
-    lin::check_true(
-        &mut failed,
-        b"bits 1-63 of the mask are clear",
-        unsafe { (*mask) & !1 == 0 },
-    );
+    lin::check_true(&mut failed, b"that CPU is CPU 0", unsafe {
+        (*mask) & 1 == 1
+    });
+    lin::check_true(&mut failed, b"bits 1-63 of the mask are clear", unsafe {
+        (*mask) & !1 == 0
+    });
 
     // The pid argument does not steer anything: -1 answers just like 0,
     // with the same one-CPU mask.
@@ -59,11 +55,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         n,
         MASK_BYTES,
     );
-    lin::check_true(
-        &mut failed,
-        b"the -1 call fills bit 0 too",
-        unsafe { (*mask) & 1 == 1 },
-    );
+    lin::check_true(&mut failed, b"the -1 call fills bit 0 too", unsafe {
+        (*mask) & 1 == 1
+    });
 
     lin::done(failed)
 }

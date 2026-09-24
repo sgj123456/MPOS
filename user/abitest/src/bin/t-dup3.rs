@@ -44,24 +44,19 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     let r = lin::dup3(1, 6, lin::O_CLOEXEC);
-    lin::check_eq(
-        &mut failed,
-        b"dup3 with O_CLOEXEC succeeds",
-        r,
-        6,
-    );
+    lin::check_eq(&mut failed, b"dup3 with O_CLOEXEC succeeds", r, 6);
     let _ = lin::close(6);
 
     let a = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the file opens on the lowest free fd", a, base);
-
-    let r = lin::dup3(1, 3, 0);
     lin::check_eq(
         &mut failed,
-        b"dup3 onto the open file fd replaces it",
-        r,
-        3,
+        b"the file opens on the lowest free fd",
+        a,
+        base,
     );
+
+    let r = lin::dup3(1, 3, 0);
+    lin::check_eq(&mut failed, b"dup3 onto the open file fd replaces it", r, 3);
     let n = lin::write(3, LINE);
     lin::check_eq(
         &mut failed,

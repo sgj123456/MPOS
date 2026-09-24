@@ -35,9 +35,14 @@ impl Core {
     /// Map logical block `l` for writing, allocating anything missing. Returns
     /// the disk block and whether anything new was allocated, for i_blocks
     /// accounting.
-    pub(crate) fn bmap_ensure(&self, d: &mut InodeData, l: u64) -> VfsResult<(u64, bool)> {
+    pub(crate) fn bmap_ensure(
+        &self,
+        d: &mut InodeData,
+        ino: u32,
+        l: u64,
+    ) -> VfsResult<(u64, bool)> {
         if self.is_extent_mapped(d) {
-            self.extent_ensure(d, l)
+            self.extent_ensure(d, ino, l)
         } else {
             self.block_map_ensure(d, l)
         }
@@ -189,7 +194,12 @@ impl Core {
     /// Map logical block `l` of an extent-mapped inode, allocating what is
     /// missing - the data block, and any node it takes to hold the extent
     /// that names it.
-    pub(crate) fn extent_ensure(&self, d: &mut InodeData, l: u64) -> VfsResult<(u64, bool)> {
+    pub(crate) fn extent_ensure(
+        &self,
+        d: &mut InodeData,
+        ino: u32,
+        l: u64,
+    ) -> VfsResult<(u64, bool)> {
         let mut root = ext_root(d);
         if !ext_ok(&root) {
             // The flag says tree and the bytes say otherwise: an inode whose
@@ -199,9 +209,10 @@ impl Core {
             return Err(VfsError::Corrupt);
         }
         let mut nodes = 0u32;
-        let (block, allocated, split) = self.ext_ensure_node(&mut root, l, &mut nodes)?;
+        let (block, allocated, split) =
+            self.ext_ensure_node(&mut root, ino, d.generation, l, &mut nodes)?;
         if let Some(split) = split {
-            self.ext_grow_root(&mut root, split, &mut nodes)?;
+            self.ext_grow_root(&mut root, ino, d.generation, split, &mut nodes)?;
         }
         // The tree's own blocks belong to the inode as much as its data does:
         // `i_blocks` counts them, and an inode that hides the two blocks its
@@ -222,6 +233,8 @@ impl Core {
     pub(crate) fn ext_ensure_node(
         &self,
         node: &mut [u8],
+        ino: u32,
+        genc: u32,
         l: u64,
         nodes: &mut u32,
     ) -> VfsResult<(u64, bool, Option<ExtSplit>)> {
@@ -236,9 +249,11 @@ impl Core {
         if depth > 0 {
             let (at, child_block) = self.ext_child(node, l).ok_or(VfsError::Corrupt)?;
             let mut child = self.ext_load(child_block)?;
-            let (block, allocated, split) = self.ext_ensure_node(&mut child, l, nodes)?;
+            let (block, allocated, split) =
+                self.ext_ensure_node(&mut child, ino, genc, l, nodes)?;
             // Written back whatever happened: the recursion may have added an
             // extent to it or taken half its entries away.
+            self.stamp_extent(&mut child, ino, genc);
             self.write_bytes(child_block, 0, &child);
             let Some(split) = split else {
                 return Ok((block, allocated, None));
@@ -251,7 +266,7 @@ impl Core {
                 return Ok((block, allocated, None));
             }
             *nodes += 1;
-            let split = self.ext_split(node, at + 1, ExtInsert::Index(split), block)?;
+            let split = self.ext_split(node, ino, genc, at + 1, ExtInsert::Index(split), block)?;
             return Ok((block, allocated, Some(split)));
         }
         // A leaf: either `l` is inside one of its extents, or a new one goes
@@ -309,7 +324,7 @@ impl Core {
             return Ok((block, true, None));
         }
         *nodes += 1;
-        let split = self.ext_split(node, at, ExtInsert::Leaf(l), block)?;
+        let split = self.ext_split(node, ino, genc, at, ExtInsert::Leaf(l), block)?;
         Ok((block, true, Some(split)))
     }
 
@@ -347,6 +362,8 @@ impl Core {
     pub(crate) fn ext_split(
         &self,
         node: &mut [u8],
+        ino: u32,
+        genc: u32,
         at: usize,
         what: ExtInsert,
         answer: u64,
@@ -381,6 +398,7 @@ impl Core {
                 ext_write_index(target, at, split.first, split.child);
             }
         }
+        self.stamp_extent(&mut other, ino, genc);
         self.write_bytes(sibling, 0, &other);
         // What the parent indexes is the sibling - the half that was moved
         // out, not the half that was kept, and not whichever one happened to
@@ -404,6 +422,8 @@ impl Core {
     pub(crate) fn ext_grow_root(
         &self,
         root: &mut [u8],
+        ino: u32,
+        genc: u32,
         split: ExtSplit,
         nodes: &mut u32,
     ) -> VfsResult<()> {
@@ -423,6 +443,7 @@ impl Core {
         node[EXTENT_HEADER..EXTENT_HEADER + count * EXTENT_ENTRY]
             .copy_from_slice(&root[EXTENT_HEADER..EXTENT_HEADER + count * EXTENT_ENTRY]);
         ext_set_entries(&mut node, count);
+        self.stamp_extent(&mut node, ino, genc);
         self.write_bytes(child, 0, &node);
         let first = if depth == 0 {
             ext_leaf(&node, 0).0

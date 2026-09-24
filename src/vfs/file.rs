@@ -148,7 +148,8 @@ impl File {
 
     /// Whether this description was opened for writing.
     pub fn opened_for_write(&self) -> bool {
-        self.opened_for_write.load(core::sync::atomic::Ordering::Relaxed)
+        self.opened_for_write
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {

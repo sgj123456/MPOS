@@ -18,6 +18,7 @@
 
 use core::ptr::NonNull;
 
+use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction, PciRoot};
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
@@ -88,4 +89,54 @@ impl ConfigurationAccess for IoCam {
 /// A PCI root complex over [`IoCam`].
 pub fn pci_root() -> PciRoot<IoCam> {
     PciRoot::new(IoCam)
+}
+
+/// The virtio vendor: every device the crate can drive answers to it.
+const VENDOR_VIRTIO: u16 = 0x1af4;
+
+/// The command bits every virtio device is brought up with. Memory decoding
+/// is not optional the way it was for a port-mapped device - the transport
+/// talks through an MMIO BAR - and bus mastering is what lets the device
+/// DMA at all. Interrupts stay masked: every driver here polls, and a
+/// completion raising an unhandled line is worse than one nobody sees.
+const COMMAND_ON: u16 = pci::COMMAND_IO_SPACE
+    | pci::COMMAND_MEMORY_SPACE
+    | pci::COMMAND_BUS_MASTER
+    | pci::COMMAND_INTX_DISABLE;
+
+/// Probe the PCI bus and hand back a transport for the first virtio device
+/// answering one of `device_ids`.
+///
+/// The virtio vendor owns two ID ranges. The transitional devices answer the
+/// legacy IDs (0x1000 upwards): QEMU's `virtio-blk`, `virtio-9p` and their
+/// kin, which carry the modern capabilities alongside the legacy registers -
+/// and it is the capabilities the transport below reads. The devices that
+/// never had a legacy form - the GPU, input, the socket, the sound card -
+/// answer the modern range (0x1040 upwards) and nothing else. A driver names
+/// the ID it expects, this finds the function behind it.
+pub fn transport(device_ids: &[u16]) -> Option<PciTransport> {
+    transport_all(device_ids).into_iter().next()
+}
+
+/// Every device answering one of `device_ids`, as a transport, in bus
+/// order. The input family is the caller this exists for: one PCI ID, any
+/// number of devices behind it.
+pub fn transport_all(device_ids: &[u16]) -> alloc::vec::Vec<PciTransport> {
+    pci::find_any(VENDOR_VIRTIO, device_ids)
+        .into_iter()
+        .filter_map(|func| {
+            func.command_on(COMMAND_ON);
+            let (bus, device, function) = func.bdf();
+            let mut root = pci_root();
+            PciTransport::new::<HalImpl, _>(
+                &mut root,
+                DeviceFunction {
+                    bus,
+                    device,
+                    function,
+                },
+            )
+            .ok()
+        })
+        .collect()
 }

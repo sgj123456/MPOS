@@ -70,6 +70,15 @@ pub fn enable_user_sse() {
     }
 }
 
+/// Whether this core would take an interrupt right now.
+///
+/// The one honest test for "may this context sleep": a task with interrupts on
+/// can be woken by a device, while an interrupt handler - which runs with them
+/// off, however it got there - cannot, and must never try to park.
+pub fn interrupts_enabled() -> bool {
+    x86_64::instructions::interrupts::are_enabled()
+}
+
 pub fn halt() -> ! {
     loop {
         // `hlt` with interrupts disabled parks the core until reset, which is

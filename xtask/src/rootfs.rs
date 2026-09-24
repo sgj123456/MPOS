@@ -148,9 +148,11 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // The machine's own configuration, then the overlay. Both run on every
     // build path - a change to the hostname or to a file under `rootfs/` should
     // take effect on the next boot, not on the next reinstall - and the overlay
-    // goes last, so a file there is the authority over anything generated.
+    // goes last, so a file there is the authority over anything generated. The
+    // resolver is the one file that may still change after it.
     write_system_config(&mount_dir, &config)?;
     utils::merge_overlay(&root.join("rootfs"), &mount_dir)?;
+    write_resolver(&mount_dir, &config)?;
 
     // Detached before the stamp, not after: the nbd server can still be
     // flushing the last writes when the last file is copied, and the image's
@@ -331,6 +333,38 @@ fn write_system_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
     }
 
     fs::create_dir_all(mount_dir.join("mnt"))?;
+    Ok(())
+}
+
+/// The guest's resolver, when `[system] dns` names a server. Written after
+/// the overlay - the one generated file that beats a file in the tree, which
+/// is what makes the key the answer it is.
+///
+/// The stock `rootfs/etc/resolv.conf` names `10.0.2.3`, the address QEMU's
+/// user-mode network answers DNS at by forwarding to whatever the *host's*
+/// own resolv.conf names - on a systemd-resolved host, the `127.0.0.53`
+/// loopback stub. No QEMU option can redirect that forwarding: `dns=` on the
+/// netdev renames the address slirp answers at rather than naming an
+/// upstream, so passing it strands every query the guest sends (the `bad
+/// address` a ping answers with) - which is why the build never passes it.
+/// What a build *can* do is name a real server here: slirp carries the
+/// guest's UDP to any address the host can reach, so the guest asks that
+/// server directly.
+fn write_resolver(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
+    let Some(dns) = config
+        .dns
+        .as_deref()
+        .map(str::trim)
+        .filter(|dns| !dns.is_empty())
+    else {
+        return Ok(());
+    };
+    fs::write(
+        mount_dir.join("etc/resolv.conf"),
+        format!(
+            "# Written from `[system] dns` in rootfs.toml; the guest asks this\n# server directly, carried over QEMU's user-mode network.\nnameserver {dns}\n"
+        ),
+    )?;
     Ok(())
 }
 
@@ -832,12 +866,7 @@ const APK_ADD_ATTEMPTS: usize = 4;
 /// plain re-run finishes the packages the failed attempt dropped. `sync` before
 /// each retry flushes the queued writeback to the image before the device is
 /// touched again.
-fn apk_add(
-    apk: &str,
-    mount_dir: &Path,
-    preflags: &[&str],
-    packages: &[String],
-) -> Result<()> {
+fn apk_add(apk: &str, mount_dir: &Path, preflags: &[&str], packages: &[String]) -> Result<()> {
     for attempt in 1..=APK_ADD_ATTEMPTS {
         let status = Command::new(apk)
             .args(["--no-progress", "add"])
@@ -1029,6 +1058,29 @@ mod tests {
             !fstab.contains("boot"),
             "the ESP is the firmware's, and an entry for it would only be a mount that can fail"
         );
+    }
+
+    #[test]
+    fn a_named_dns_becomes_the_guests_resolv_conf_and_an_absent_one_keeps_it() {
+        // `10.0.2.3` is the address QEMU's user-mode network answers DNS at,
+        // and what the tree's own resolv.conf names; an unset `dns` leaves it
+        // in place, so the guest rides the host's resolver. A named server is
+        // written over it, after the overlay, because slirp can carry a query
+        // to any server the host reaches - the one way a build has of
+        // choosing the guest's upstream.
+        let dir = staged_dir("resolver-set");
+        fs::write(dir.join("etc/resolv.conf"), "nameserver 10.0.2.3\n").unwrap();
+        let config = load_config("resolver-set", "[system]\ndns = \"223.5.5.5\"\n");
+        write_resolver(&dir, &config).unwrap();
+        let text = fs::read_to_string(dir.join("etc/resolv.conf")).unwrap();
+        assert!(text.contains("nameserver 223.5.5.5"), "{text}");
+
+        let dir = staged_dir("resolver-unset");
+        fs::write(dir.join("etc/resolv.conf"), "nameserver 10.0.2.3\n").unwrap();
+        let config = load_config("resolver-unset", "[system]\n");
+        write_resolver(&dir, &config).unwrap();
+        let text = fs::read_to_string(dir.join("etc/resolv.conf")).unwrap();
+        assert!(text.contains("nameserver 10.0.2.3"), "{text}");
     }
 
     #[test]

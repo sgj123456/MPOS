@@ -75,6 +75,19 @@ fn seed() -> [u8; 32] {
         }
     }
 
+    // The host's own random source, when the machine has a virtio-rng
+    // device: bytes no software on this machine chose, which is a stronger
+    // seed than any of the three below. Mixed in rather than trusted alone -
+    // a device that answers with a weak stream still cannot make the seed
+    // worse than the machine's own sources, and XOR is what keeps that true.
+    // The boot probes the device before `init` runs, so the entropy the
+    // first caller gets is the entropy the machine had.
+    if let Some(entropy) = crate::drivers::virtio::rng::entropy() {
+        for (byte, host) in seed.iter_mut().zip(entropy) {
+            *byte ^= host;
+        }
+    }
+
     // The boot instant and the tick counter, mixed one byte at a time so a
     // zero-filled stretch above is not left as zeroes.
     let epoch = crate::arch::rtc::boot_epoch();

@@ -55,8 +55,18 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let r = lin::ioctl(0, lin::TIOCGWINSZ, &raw mut WS as usize);
     lin::check_eq(&mut failed, b"TIOCGWINSZ on the console succeeds", r, 0);
     let ws = unsafe { &*(&raw mut WS as *const lin::Winsize) };
-    lin::check_eq(&mut failed, b"the console reports 25 rows", ws.ws_row as isize, 25);
-    lin::check_eq(&mut failed, b"the console reports 80 columns", ws.ws_col as isize, 80);
+    lin::check_eq(
+        &mut failed,
+        b"the console reports 25 rows",
+        ws.ws_row as isize,
+        25,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the console reports 80 columns",
+        ws.ws_col as isize,
+        80,
+    );
     lin::check_eq(
         &mut failed,
         b"the pixel fields are zeroed, not left to the caller",
@@ -83,7 +93,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"the console turns the interrupt key into a signal",
         tio.lflag & ISIG != 0,
     );
-    lin::check_eq(&mut failed, b"^C is the interrupt", tio.cc[VINTR] as isize, 3);
+    lin::check_eq(
+        &mut failed,
+        b"^C is the interrupt",
+        tio.cc[VINTR] as isize,
+        3,
+    );
     lin::check_eq(&mut failed, b"^D is end of input", tio.cc[VEOF] as isize, 4);
 
     // TCSETS: what a shell does when it wants to do its own editing. Ask for

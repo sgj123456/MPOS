@@ -140,6 +140,28 @@ impl CharDevice for RandomDev {
     }
 }
 
+/// `/dev/hwrng`: the virtio entropy pipe, as a stream of raw bytes the host
+/// generated. Reads ask the device and answer what came back - a refusal
+/// reads as end of input, which is the honest shape for a machine whose
+/// entropy source went quiet rather than a blocking wait for it. Writes
+/// vanish, as they do on Linux.
+pub struct HwrngDev(Arc<crate::drivers::virtio::rng::VirtioRng>);
+
+impl CharDevice for HwrngDev {
+    fn read(&self, buf: &mut [u8]) -> usize {
+        // The count is the device's own answer: how many bytes the host
+        // actually generated, which for a healthy device is the whole
+        // buffer and for a quiet one is a short read - the shape every
+        // stream answers with, and the one a caller retrying a short read
+        // expects.
+        self.0.fill(buf)
+    }
+
+    fn write(&self, buf: &[u8]) -> usize {
+        buf.len()
+    }
+}
+
 /// The device set every boot needs, plus the disk and its partitions.
 ///
 /// This is what `mount -t devfs /dev` builds, and the same set the boot code
@@ -209,6 +231,48 @@ pub fn standard_devfs() -> Arc<DevFs> {
     dev.register("zero", Arc::new(ZeroDev));
     dev.register("random", Arc::new(RandomDev));
     dev.register("urandom", Arc::new(RandomDev));
+
+    // The virtio devices the boot probed, each under the name Linux gives
+    // its kind - registered only when the device answered, because a node
+    // for a machine this kernel does not have is a lie an open would trip
+    // over. The adapters wrap the driver's own handle: the device behind
+    // /dev/hwrng is the entropy pipe, the one behind /dev/hvc0 is the
+    // console port, /dev/dsp is the sound card's stream.
+    if let Some(rng) = crate::drivers::virtio::rng::global() {
+        dev.register("hwrng", Arc::new(HwrngDev(rng)));
+    }
+    if let Some(hvc) = crate::drivers::virtio::console::global() {
+        let device = Arc::new(crate::drivers::virtio::console::HvcDev::new(hvc));
+        // The name of a hypervisor console is `hvc0`; `hvc` is the alias
+        // Linux keeps for "the first one" - a getty that asks for either
+        // spelling finds the same port.
+        dev.register("hvc0", device.clone());
+        dev.register("hvc", device);
+    }
+    if let Some(snd) = crate::drivers::virtio::sound::global() {
+        dev.register(
+            "dsp",
+            Arc::new(crate::drivers::virtio::sound::DspDev::new(snd)),
+        );
+    }
+    // The framebuffer is a node with more than a stream face - `mmap` of
+    // the pixels, the `FBIOGET_*` ioctls - so it registers as the inode
+    // it is, through the door the tty uses for the same reason.
+    if let Some(gpu) = crate::drivers::virtio::gpu::global() {
+        dev.register_node(
+            "fb0",
+            Arc::new(crate::drivers::virtio::gpu::FbDev::new(gpu)),
+        );
+    }
+    // The input devices, one node each under /dev/input, in bus order:
+    // event0, event1, ... exactly how evdev names them.
+    let evdevs = crate::drivers::virtio::input::nodes();
+    if !evdevs.is_empty() {
+        dev.register_dir("input");
+        for (index, node) in evdevs.iter().enumerate() {
+            dev.register_node(&alloc::format!("event{index}"), node.clone());
+        }
+    }
 
     if let Some(raw) = crate::blk::raw_disk() {
         dev.register_block("vda", raw.clone());

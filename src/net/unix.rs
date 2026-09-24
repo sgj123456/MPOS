@@ -146,14 +146,7 @@ impl UnixSock {
     /// The bound node's table key, if a bind has planted one - the same
     /// fact `local_name` reports, told by identity.
     pub fn bound_key(&self) -> Option<(u64, u64)> {
-        critical_section::with(|cs| {
-            self.state
-                .borrow(cs)
-                .borrow()
-                .bound
-                .as_ref()
-                .map(|b| b.key)
-        })
+        critical_section::with(|cs| self.state.borrow(cs).borrow().bound.as_ref().map(|b| b.key))
     }
 
     /// The bound path, for `getsockname`.
@@ -340,10 +333,7 @@ pub(crate) fn bind(sock: &Arc<UnixSock>, _node: Arc<dyn Inode>, path: String, ke
 /// (Linux's behavior: a listening socket survives its own unlink); only
 /// the table key retires.
 pub(crate) fn unbind_node(node: &Arc<dyn Inode>) {
-    let key = (
-        crate::vfs::mount::fs_id_of_inode(node),
-        node.metadata().ino,
-    );
+    let key = (crate::vfs::mount::fs_id_of_inode(node), node.metadata().ino);
     critical_section::with(|cs| {
         let mut reg = UNIX.borrow(cs).borrow_mut();
         reg.by_node.remove(&key);
@@ -393,14 +383,14 @@ pub(crate) fn release(id: usize) {
 /// entry, an entry behind a closed socket, or a stale key all mean the
 /// same thing to a connector.
 fn live_listener(node: &Arc<dyn Inode>) -> Option<Arc<UnixSock>> {
-    let key = (
-        crate::vfs::mount::fs_id_of_inode(node),
-        node.metadata().ino,
-    );
+    let key = (crate::vfs::mount::fs_id_of_inode(node), node.metadata().ino);
     critical_section::with(|cs| {
         let reg = UNIX.borrow(cs).borrow();
         let id = *reg.by_node.get(&key)?;
-        reg.slots.get(id - 1)?.as_ref().map(|slot| slot.socket.clone())
+        reg.slots
+            .get(id - 1)?
+            .as_ref()
+            .map(|slot| slot.socket.clone())
     })
 }
 
@@ -720,8 +710,7 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
 fn sock_arc(sock: &UnixSock) -> Arc<UnixSock> {
     critical_section::with(|cs| {
         let reg = UNIX.borrow(cs).borrow();
-        reg
-            .slots
+        reg.slots
             .get(sock.id - 1)
             .and_then(|slot| slot.as_ref())
             .map(|slot| slot.socket.clone())

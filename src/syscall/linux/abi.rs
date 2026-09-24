@@ -1147,10 +1147,22 @@ pub struct Rlimit {
 /// ceiling, a process count, and infinity for the rows nothing budgets. Every
 /// other resource reads these until `setrlimit` says otherwise.
 pub(crate) fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
-    let mut t = [Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY }; RLIM_NLIMITS];
-    t[3] = Rlimit { cur: 8 * 1024 * 1024, max: 8 * 1024 * 1024 }; // RLIMIT_STACK
-    t[5] = Rlimit { cur: 1024, max: 1_048_576 }; // RLIMIT_NOFILE
-    t[7] = Rlimit { cur: 4096, max: 4096 }; // RLIMIT_NPROC
+    let mut t = [Rlimit {
+        cur: RLIM_INFINITY,
+        max: RLIM_INFINITY,
+    }; RLIM_NLIMITS];
+    t[3] = Rlimit {
+        cur: 8 * 1024 * 1024,
+        max: 8 * 1024 * 1024,
+    }; // RLIMIT_STACK
+    t[5] = Rlimit {
+        cur: 1024,
+        max: 1_048_576,
+    }; // RLIMIT_NOFILE
+    t[7] = Rlimit {
+        cur: 4096,
+        max: 4096,
+    }; // RLIMIT_NPROC
     t
 }
 
@@ -1909,7 +1921,11 @@ mod tests {
         };
         assert_eq!(mode_of(&meta, 0) & 0o170_000, 0o140_000, "S_IFSOCK");
         assert_eq!(mode_of(&meta, 0), 0o140_755, "srwxr-xr-x by default");
-        assert_eq!(mode_of(&meta, 0o700), 0o140_700, "a stored mode keeps the tag");
+        assert_eq!(
+            mode_of(&meta, 0o700),
+            0o140_700,
+            "a stored mode keeps the tag"
+        );
         assert_eq!(dt_type_of(NodeKind::Socket), 12, "DT_SOCK");
     }
 
@@ -2380,13 +2396,50 @@ mod tests {
         let e_einval = crate::syscall::err::EINVAL;
         let e_eperm = crate::syscall::err::EPERM;
         // Soft above hard is EINVAL, root or not.
-        assert_eq!(rlimit_admit(Rlimit { cur: 10, max: 20 }, Rlimit { cur: 30, max: 20 }, true).err(), Some(e_einval));
+        assert_eq!(
+            rlimit_admit(
+                Rlimit { cur: 10, max: 20 },
+                Rlimit { cur: 30, max: 20 },
+                true
+            )
+            .err(),
+            Some(e_einval)
+        );
         // An unprivileged process may not raise the hard limit...
-        assert_eq!(rlimit_admit(Rlimit { cur: 10, max: 20 }, Rlimit { cur: 10, max: 40 }, false).err(), Some(e_eperm));
+        assert_eq!(
+            rlimit_admit(
+                Rlimit { cur: 10, max: 20 },
+                Rlimit { cur: 10, max: 40 },
+                false
+            )
+            .err(),
+            Some(e_eperm)
+        );
         // ...but root may, and anyone may lower it or hold it.
-        assert!(rlimit_admit(Rlimit { cur: 10, max: 20 }, Rlimit { cur: 10, max: 40 }, true).is_ok());
-        assert!(rlimit_admit(Rlimit { cur: 10, max: 20 }, Rlimit { cur: 5, max: 10 }, false).is_ok());
-        assert!(rlimit_admit(Rlimit { cur: 20, max: 20 }, Rlimit { cur: 20, max: 20 }, false).is_ok());
+        assert!(
+            rlimit_admit(
+                Rlimit { cur: 10, max: 20 },
+                Rlimit { cur: 10, max: 40 },
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            rlimit_admit(
+                Rlimit { cur: 10, max: 20 },
+                Rlimit { cur: 5, max: 10 },
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            rlimit_admit(
+                Rlimit { cur: 20, max: 20 },
+                Rlimit { cur: 20, max: 20 },
+                false
+            )
+            .is_ok()
+        );
         // The startup table: an 8 MiB stack, a 1024/1M descriptor ceiling.
         let d = default_rlimits();
         assert_eq!((d[3].cur, d[3].max), (8 * 1024 * 1024, 8 * 1024 * 1024));

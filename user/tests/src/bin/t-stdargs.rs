@@ -26,10 +26,7 @@ fn main() {
     // past the end of the block, or the NULL terminator is missing.
     let env_ok = env.iter().all(|(k, _)| !k.is_empty() && !k.contains('='));
 
-    if args.len() == want.len()
-        && args.iter().zip(want.iter()).all(|(a, w)| a == w)
-        && env_ok
-    {
+    if args.len() == want.len() && args.iter().zip(want.iter()).all(|(a, w)| a == w) && env_ok {
         println!(
             "t-stdargs: argc={} argv0={} env={} vars, all well formed",
             args.len(),

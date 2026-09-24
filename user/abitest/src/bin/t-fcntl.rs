@@ -30,12 +30,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     let r = lin::fcntl(1, lin::F_SETFD, lin::FD_CLOEXEC);
-    lin::check_eq(
-        &mut failed,
-        b"F_SETFD stores FD_CLOEXEC",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"F_SETFD stores FD_CLOEXEC", r, 0);
 
     let r = lin::fcntl(1, lin::F_GETFD, 0);
     lin::check_eq(
@@ -65,12 +60,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"F_SETFD clears the flag again", r, 0);
 
     let r = lin::fcntl(1, lin::F_GETFD, 0);
-    lin::check_eq(
-        &mut failed,
-        b"F_GETFD confirms the cleared flag word",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"F_GETFD confirms the cleared flag word", r, 0);
 
     let r = lin::fcntl(1, lin::F_GETFL, 0);
     lin::check_eq(

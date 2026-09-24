@@ -49,7 +49,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"the guard-page PROT_NONE succeeds", r, 0);
 
     let r = lin::mprotect(p as usize, 8192, lin::PROT_READ | lin::PROT_WRITE);
-    lin::check_eq(&mut failed, b"restoring PROT_READ|PROT_WRITE succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"restoring PROT_READ|PROT_WRITE succeeds",
+        r,
+        0,
+    );
 
     unsafe { (p as *mut u64).write_volatile(PATTERN) };
     let back = unsafe { (p as *const u64).read_volatile() };

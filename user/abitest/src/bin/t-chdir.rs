@@ -44,11 +44,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     if fd >= 0 {
         let buf = unsafe { core::slice::from_raw_parts_mut(&raw mut BUF as *mut u8, 256) };
         let n = lin::read(fd as i32, buf);
-        lin::check_true(
-            &mut failed,
-            b"the relatively opened file reads",
-            n > 0,
-        );
+        lin::check_true(&mut failed, b"the relatively opened file reads", n > 0);
         let _ = lin::close(fd as i32);
     }
 
@@ -69,7 +65,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // A file is not a directory, and a missing path is not anything.
     let r = lin::chdir(&MOTD);
-    lin::check_eq(&mut failed, b"chdir to a file answers ENOTDIR", r, lin::ENOTDIR);
+    lin::check_eq(
+        &mut failed,
+        b"chdir to a file answers ENOTDIR",
+        r,
+        lin::ENOTDIR,
+    );
     let r = lin::chdir(&NO_SUCH);
     lin::check_eq(
         &mut failed,
@@ -83,14 +84,13 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_true(&mut failed, b"/etc opens as a directory fd", dfd >= 0);
     if dfd >= 0 {
         let r = lin::fchdir(dfd as i32);
-        lin::check_eq(
-            &mut failed,
-            b"fchdir to the directory fd succeeds",
-            r,
-            0,
-        );
+        lin::check_eq(&mut failed, b"fchdir to the directory fd succeeds", r, 0);
         let r = lin::getcwd(cwd);
-        lin::check_true(&mut failed, b"getcwd returns the buffer after fchdir", r > 0);
+        lin::check_true(
+            &mut failed,
+            b"getcwd returns the buffer after fchdir",
+            r > 0,
+        );
         lin::check_true(
             &mut failed,
             b"the cwd reads /etc after fchdir",
@@ -113,7 +113,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         let _ = lin::close(ffd as i32);
     }
     let r = lin::fchdir(77);
-    lin::check_eq(&mut failed, b"fchdir on a bad fd answers EBADF", r, lin::EBADF);
+    lin::check_eq(
+        &mut failed,
+        b"fchdir on a bad fd answers EBADF",
+        r,
+        lin::EBADF,
+    );
 
     lin::done(failed)
 }

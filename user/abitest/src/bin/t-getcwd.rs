@@ -48,7 +48,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let r = lin::chdir(&DOTDOT);
     lin::check_eq(&mut failed, b"chdir(..) succeeds", r, 0);
     let r = lin::getcwd(cwd);
-    lin::check_true(&mut failed, b"getcwd returns the buffer a third time", r > 0);
+    lin::check_true(
+        &mut failed,
+        b"getcwd returns the buffer a third time",
+        r > 0,
+    );
     lin::check_true(
         &mut failed,
         b"the cwd reads / again",

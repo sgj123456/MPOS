@@ -27,7 +27,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let base = lin::free_fd();
 
     let a = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the file opens on the lowest free fd", a, base);
+    lin::check_eq(
+        &mut failed,
+        b"the file opens on the lowest free fd",
+        a,
+        base,
+    );
 
     let r = lin::dup2(1, 5);
     lin::check_eq(&mut failed, b"dup2(stdout, 5) returns 5", r, 5);

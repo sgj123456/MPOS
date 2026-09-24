@@ -555,9 +555,7 @@ mod tests {
     fn epoll_fd() -> (FdTable, Arc<Epoll>, i32) {
         let table = FdTable::new();
         let epoll = Epoll::new(7);
-        let fd = table
-            .install(Arc::new(File::new(epoll.clone())))
-            .unwrap();
+        let fd = table.install(Arc::new(File::new(epoll.clone()))).unwrap();
         assert_eq!(fd, 0, "the epfd is the table's first descriptor");
         (table, epoll, fd)
     }

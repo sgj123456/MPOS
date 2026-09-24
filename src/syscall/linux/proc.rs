@@ -792,7 +792,10 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             // length must not wrap, or a huge offset slips past the bound here
             // and `regs[addr / 8]` indexes out of the register file. Overflow
             // (checked_add yields None) is out of range, same as too-large.
-            if addr.checked_add(8).map_or(true, |end| end > abi::uregs::BYTES) {
+            if addr
+                .checked_add(8)
+                .map_or(true, |end| end > abi::uregs::BYTES)
+            {
                 return err::EIO;
             }
             let Some(mut regs) = crate::sched::trace_regs(id) else {
@@ -2178,35 +2181,56 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         mf |= MapFlags::USER;
     }
 
-    for page in (base..base + len).step_by(PAGE_SIZE) {
-        // The pages of a replaced range are gone; these are fresh ones, zeroed
-        // as POSIX promises for anonymous memory and as the tail of a file
-        // mapping promises past the end of the file.
-        let frame = match crate::mm::alloc_frames(0) {
+    for (index, page) in (base..base + len).step_by(PAGE_SIZE).enumerate() {
+        // The one file mapping that must not be a copy: a node that owns
+        // shareable memory - the GPU's framebuffer - answers with the
+        // physical frame itself, and the mapping *is* that memory, so a
+        // program drawing into its mapping is drawing on the screen. The
+        // frames are pinned by the node that offered them, which is what
+        // keeps this map - and every unmap, fork and exit that follows it -
+        // from handing the device's memory back to the allocator.
+        let shared = backing.as_ref().and_then(|file| {
+            file.inode()
+                .mmap_frame((offset / PAGE_SIZE) as u64 + index as u64)
+        });
+        let frame = match shared {
             Some(frame) => frame,
-            None => return err::ENOMEM,
-        };
-        let dest = unsafe {
-            core::slice::from_raw_parts_mut(crate::mm::phys_to_virt(frame) as *mut u8, PAGE_SIZE)
-        };
-        dest.fill(0);
+            None => {
+                // The pages of a replaced range are gone; these are fresh
+                // ones, zeroed as POSIX promises for anonymous memory and as
+                // the tail of a file mapping promises past the end of the
+                // file.
+                let frame = match crate::mm::alloc_frames(0) {
+                    Some(frame) => frame,
+                    None => return err::ENOMEM,
+                };
+                let dest = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        crate::mm::phys_to_virt(frame) as *mut u8,
+                        PAGE_SIZE,
+                    )
+                };
+                dest.fill(0);
 
-        if let Some(file) = &backing {
-            // Copy what the file has for this page. A short read ends the
-            // copy rather than failing it: the last page of a mapping is
-            // rarely full, and the zeros already there are the right answer
-            // for the rest.
-            let inode = file.inode();
-            let start = offset + (page - base);
-            let mut done = 0;
-            while done < PAGE_SIZE {
-                match inode.read_at((start + done) as u64, &mut dest[done..]) {
-                    Ok(0) => break,
-                    Ok(n) => done += n,
-                    Err(_) => break,
+                if let Some(file) = &backing {
+                    // Copy what the file has for this page. A short read
+                    // ends the copy rather than failing it: the last page
+                    // of a mapping is rarely full, and the zeros already
+                    // there are the right answer for the rest.
+                    let inode = file.inode();
+                    let start = offset + (page - base);
+                    let mut done = 0;
+                    while done < PAGE_SIZE {
+                        match inode.read_at((start + done) as u64, &mut dest[done..]) {
+                            Ok(0) => break,
+                            Ok(n) => done += n,
+                            Err(_) => break,
+                        }
+                    }
                 }
+                frame
             }
-        }
+        };
 
         if crate::sched::current_map_user(page, frame, mf) < 0 {
             return err::ENOMEM;

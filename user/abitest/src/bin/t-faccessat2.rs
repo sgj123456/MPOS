@@ -91,7 +91,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"AT_SYMLINK_NOFOLLOW is accepted",
-        lin::faccessat2(lin::AT_FDCWD, b"/tmp\0", lin::F_OK, lin::AT_SYMLINK_NOFOLLOW),
+        lin::faccessat2(
+            lin::AT_FDCWD,
+            b"/tmp\0",
+            lin::F_OK,
+            lin::AT_SYMLINK_NOFOLLOW,
+        ),
         0,
     );
 

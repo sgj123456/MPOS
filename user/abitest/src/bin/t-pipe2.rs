@@ -98,7 +98,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // the call sudo's signal channel was dying on when the flag was refused.
     let mut fds: [i32; 2] = [-1; 2];
     let r = lin::pipe2(&mut fds, lin::O_NONBLOCK | lin::O_CLOEXEC);
-    lin::check_eq(&mut failed, b"pipe2 with O_NONBLOCK|O_CLOEXEC succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"pipe2 with O_NONBLOCK|O_CLOEXEC succeeds",
+        r,
+        0,
+    );
     let buf = unsafe { core::slice::from_raw_parts_mut(&raw mut BUF as *mut u8, 16) };
     let n = lin::read(fds[0], buf);
     lin::check_eq(

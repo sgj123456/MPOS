@@ -143,6 +143,23 @@ pub(crate) struct Super {
     /// mount can say out loud what it will not be maintaining, and so the
     /// journal milestone has one place to grow from.
     pub(crate) has_journal: bool,
+    /// `metadata_csum`: every structure's checksum is the CRC-32C chain
+    /// below. `GDT_CSUM` (`uninit_bg`): the same idea in the older, weaker
+    /// CRC-16 spelling. The write paths branch on these constantly.
+    pub(crate) has_metadata_csum: bool,
+    pub(crate) has_gdt_csum: bool,
+    /// The filesystem's UUID (`s_uuid`, offset 104). Every metadata checksum
+    /// seeds from it - the group descriptors' CRC-16 literally folds its
+    /// bytes in - so a driver that recomputes checksums has to know it, and
+    /// a driver that reads them cannot place the descriptors' tails without
+    /// it either.
+    pub(crate) uuid: [u8; 16],
+    /// The seed the metadata checksums start from: `s_checksum_seed` (offset
+    /// 264) when the `metadata_csum_seed` bit says it is written down, and
+    /// otherwise the CRC-32C of the UUID itself - the same answer from two
+    /// places, which is why an image copied with a new UUID and the old seed
+    /// left in place fails every checksum inside it.
+    pub(crate) csum_seed: u32,
     /// The htree hash seed: four words at `s_hash_seed` (offset 236, past
     /// the journal fields the rev-1 layout grew), salt shared by every
     /// directory index on this filesystem.
@@ -191,19 +208,43 @@ impl Super {
             return Err("ext4 carries compatible features this driver does not know about");
         }
         let has_64bit = incompat & INCOMPAT_64BIT != 0;
+        // The UUID on disk is the textual bytes, in order (e2fsprogs writes
+        // it as a string, not the mixed-endian of a `uuid_t`), and it is the
+        // seed's source as well as the descriptors' salt.
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&bytes[104..120]);
+        // `metadata_csum_seed` (incompat 13) means the seed is written down
+        // far out in the superblock's grown region - byte 624, where
+        // e2fsprogs put it and where `dumpe2fs` reads it from. Without the
+        // bit, the seed is the CRC-32C of the UUID from an all-ones start,
+        // which is how old images and new agree.
+        let csum_seed = super::csum::csum_seed(
+            if incompat & INCOMPAT_CSUM_SEED != 0 {
+                Some(le32(bytes, 624))
+            } else {
+                None
+            },
+            &uuid,
+        );
         // A dirty volume is one a write would finish corrupting, not one we
         // choose to spare: a journal nobody maintains leaves tomorrow's
         // Linux replay to scribble over today's bypassing writes, and a
         // volume that never recorded a clean unmount may be mid-repair.
-        // Until the journal milestone replays and maintains, both answer
-        // read-only. (`has_journal` is a *compat* bit; the incompat RECOVER
-        // below is the ext3-era dirty spelling, honored for old images.)
+        // Both answer read-only. (The checksummed forms of the same
+        // warning - `uninit_bg` and `metadata_csum` - retired from this
+        // list the day the driver started recomputing what it writes.)
         let has_journal = compat & COMPAT_HAS_JOURNAL != 0;
         let state = le16(bytes, 58);
         let must_read_only = incompat & INCOMPAT_RECOVER != 0
             || state & STATE_VALID_FS == 0
             || has_journal
-            || ro_compat & (ROCOMPAT_METADATA_CSUM | ROCOMPAT_GDT_CSUM) != 0;
+            // The superblock carries a crc32c of its own first 1020 bytes,
+            // from a raw all-ones start rather than the volume's seed. A
+            // stale one means those bytes already disagree with whoever
+            // wrote them; the recompute-on-write that makes fresh writes
+            // honest is no reason to trust a volume that arrived lying.
+            || (ro_compat & ROCOMPAT_METADATA_CSUM != 0
+                && le32(bytes, 1020) != super::csum::sb_csum(&bytes[..1020]));
         let (inode_size, first_ino) = match le32(bytes, 76) {
             0 => (128, 11),
             _ => (le16(bytes, 88) as usize, le32(bytes, 84)),
@@ -246,6 +287,10 @@ impl Super {
             has_64bit,
             must_read_only,
             has_journal,
+            has_metadata_csum: ro_compat & ROCOMPAT_METADATA_CSUM != 0,
+            has_gdt_csum: ro_compat & ROCOMPAT_GDT_CSUM != 0,
+            uuid,
+            csum_seed,
             hash_seed: [
                 le32(bytes, 236),
                 le32(bytes, 240),

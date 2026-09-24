@@ -50,12 +50,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_true(&mut failed, b"recreating the file opens it", fd >= 0);
     if fd >= 0 {
         let r = lin::unlinkat(lin::AT_FDCWD, &FILE, 0);
-        lin::check_eq(
-            &mut failed,
-            b"unlinking a still-open file succeeds",
-            r,
-            0,
-        );
+        lin::check_eq(&mut failed, b"unlinking a still-open file succeeds", r, 0);
         let r = lin::unlinkat(lin::AT_FDCWD, &FILE, 0);
         lin::check_eq(
             &mut failed,
@@ -79,12 +74,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let r = lin::mkdirat(lin::AT_FDCWD, &DIR, 0);
     lin::check_eq(&mut failed, b"mkdirat makes the directory", r, 0);
     let r = lin::unlinkat(lin::AT_FDCWD, &DIR, lin::AT_REMOVEDIR);
-    lin::check_eq(
-        &mut failed,
-        b"unlinkat with AT_REMOVEDIR removes it",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"unlinkat with AT_REMOVEDIR removes it", r, 0);
     let r = lin::openat(lin::AT_FDCWD, &DIR, lin::O_RDONLY, 0);
     lin::check_eq(
         &mut failed,

@@ -60,6 +60,7 @@ const GROUP_DESC_BYTES: usize = 32;
 const GROUP_DESC_BYTES_MAX: usize = 64;
 
 mod cache;
+mod csum;
 mod dir;
 mod dirent;
 mod dx;
@@ -79,7 +80,8 @@ mod util;
 
 pub(crate) use self::cache::Cache;
 pub(crate) use self::dirent::{
-    DIRENT_HEADER, dir_find, dir_init, dir_take, dir_try_insert, dir_walk, dirent_len, write_dirent,
+    DIRENT_HEADER, dir_find, dir_init, dir_take, dir_try_insert, dir_walk, dirent_len,
+    trim_dir_tail, write_dirent,
 };
 pub(crate) use self::extent::{
     EXTENT_ENTRY, EXTENT_HEADER, EXTENT_INIT_MAX, EXTENT_MAX_DEPTH, EXTENT_ROOT_BYTES,
@@ -168,18 +170,30 @@ impl Core {
         let groups = u32::try_from(groups)
             .map_err(|_| "ext4 has more groups than this driver can address")?;
         let block_size = 1024usize << sb.log_block_size;
-        Ok(Core {
-            // The mount starts in the mode the format can honour: an image
-            // with checksums or an unrecovered journal is readable, and a
-            // caller that asked for read-write gets told no by the first
-            // write rather than by a mount that refuses to see the disk.
+        let core = Core {
+            // The mount starts in the mode the format can honour: a journal
+            // nobody maintains and a volume that never recorded a clean
+            // unmount are both readable, and a caller that asked for
+            // read-write gets told no by the first write rather than by a
+            // mount that refuses to see the disk.
             read_only: core::sync::atomic::AtomicBool::new(sb.must_read_only),
             dev,
             sb,
             groups,
             cache: Mutex::new(RefCell::new(Cache::new(block_size))),
             inodes: Mutex::new(RefCell::new(BTreeMap::new())),
-        })
+        };
+        // Checksummed volumes are verified at mount, the way the kernel's
+        // initial-group-descriptor check is: a descriptor table whose own
+        // numbers do not add up means the disk is not what it claims to be,
+        // and no later read of a block pointer can be trusted through it.
+        // (A descriptor or bitmap half left at zero is treated as
+        // "not yet filled in" - lazy forms of `mke2fs` leave exactly that,
+        // and every tool exempts it.)
+        if core.sb.has_metadata_csum || core.sb.has_gdt_csum {
+            core.verify_group_descriptors()?;
+        }
+        Ok(core)
     }
 
     fn block_size(&self) -> usize {
@@ -270,7 +284,267 @@ impl Core {
         let (block, off) = self.inode_pos(ino);
         let mut bytes = [0u8; INODE_PARSED];
         data.store(&mut bytes);
-        self.write_bytes(block, off, &bytes);
+        // An inode with extra space carries its own checksum - and every
+        // field this driver just rewrote lives inside the fold, so the old
+        // stored value is now a lie about these bytes. Recompute it from the
+        // full on-disk record (its generation, its preserved tail), exactly
+        // as the kernel's ext4_inode_csum_set would.
+        let meta = self.sb.has_metadata_csum;
+        let seed = self.sb.csum_seed;
+        let isize_ = self.sb.inode_size as usize;
+        self.update_block(block, |page| {
+            page[off..off + INODE_PARSED].copy_from_slice(&bytes);
+            if meta && isize_ > INODE_PARSED && off + isize_ <= page.len() {
+                let rec = &mut page[off..off + isize_];
+                // The checksum lives inside the extra area, so an inode that
+                // arrives with none of it claimed (a lazy-initialized table
+                // slot) claims the standard 32 bytes first - the same floor
+                // mke2fs and the kernel give a fresh inode on a checksummed
+                // volume, and the line M5's in-inode xattrs start above.
+                if le16(rec, 128) == 0 {
+                    let room = (isize_ - INODE_PARSED).min(32);
+                    if room >= 4 {
+                        set16(rec, 128, room as u16);
+                    }
+                }
+                // Low half at 124 (a u16 in a word the format otherwise
+                // leaves reserved), high half at 130 once the extra area
+                // reaches that far - e2fsprogs' exact test.
+                let (lo, hi) = self::csum::inode_csum(seed, ino, le32(rec, 100), rec);
+                set16(rec, 124, lo);
+                if le16(rec, 128) >= 4 {
+                    set16(rec, 130, hi);
+                }
+            }
+            true
+        });
+    }
+
+    /// Whether any metadata checksum bookkeeping applies to this mount.
+    fn csums_active(&self) -> bool {
+        self.sb.has_metadata_csum || self.sb.has_gdt_csum
+    }
+
+    /// Stamp the leaf block's twelve-byte trailer: the fake dirent whose
+    /// `rec_len` is 12 and whose `name_len` is the format's marker, with
+    /// the covered-prefix checksum in its last four octets.
+    /// Stamp an extent block's tail checksum. The tail sits at the end of the
+    /// node's full capacity - header plus `eh_max` twelve-byte slots - and
+    /// the last four of those bytes carry the answer, the fold running over
+    /// everything before them. A block written this way needs no slot beyond
+    /// its stated maximum, which is why the capacity, not the live count,
+    /// places the tail. (The inode-embedded root is never stamped: at four
+    /// entries its tail would land on `i_generation` itself, and neither
+    /// mke2fs nor e2fsck treats that word as a checksum.)
+    fn stamp_extent(&self, node: &mut [u8], ino: u32, genc: u32) {
+        if !self.sb.has_metadata_csum {
+            return;
+        }
+        let max = le16(node, 4) as usize;
+        let tail = EXTENT_HEADER + max * EXTENT_ENTRY;
+        if tail + 4 > node.len() {
+            return;
+        }
+        let c = self::csum::ext_csum(self.sb.csum_seed, ino, genc, &node[..tail]);
+        set32(node, tail, c);
+    }
+
+    /// Stamp the leaf block's twelve-byte trailer: the fake dirent at the
+    /// end of the block - zero inode, `rec_len` 12, the name-length marker
+    /// 0xDE00 - with the covered-prefix checksum in its last four octets.
+    /// A walk sees the zero inode and steps over it; a checksum reads the
+    /// bytes before it and folds the directory's own number and generation
+    /// in place of what a real entry would have carried there.
+    fn stamp_leaf_tail(&self, page: &mut [u8], dir_ino: u32, dir_gen: u32) {
+        if !self.sb.has_metadata_csum {
+            return;
+        }
+        let bs = page.len();
+        page[bs - 12..bs - 8].fill(0);
+        set16(page, bs - 8, 12);
+        set16(page, bs - 6, 0xDE00);
+        let c = self::csum::dir_csum(self.sb.csum_seed, dir_ino, dir_gen, page);
+        set32(page, bs - 4, c);
+    }
+
+    /// How much of a leaf directory block entries may use: the whole block,
+    /// or the block less its twelve-byte checksum trailer.
+    pub(crate) fn leaf_limit(&self, block_size: usize) -> usize {
+        if self.sb.has_metadata_csum {
+            block_size - self::dirent::DIR_LEAF_TAIL
+        } else {
+            block_size
+        }
+    }
+
+    /// Stamp an index block's tail: the entry array runs from the count/limit
+    /// word for `limit` slots, and the tail is its last eight bytes - a
+    /// reserved word, then the checksum folded over the directory's inode
+    /// number and generation, the live array (count slots, the alias entry
+    /// among them), the reserved word itself and a zero where the checksum
+    /// will sit (the format folds its own absence in, then writes where it
+    /// was).
+    fn stamp_dx_tail(&self, page: &mut [u8], entries_at: usize, dir_ino: u32, dir_gen: u32) {
+        if !self.sb.has_metadata_csum {
+            return;
+        }
+        let limit = self::dx::dx_limit(page, entries_at);
+        let count = self::dx::dx_count(page, entries_at);
+        let tail = entries_at + limit * 8;
+        let entries_end = entries_at + count * 8;
+        if tail + 8 > page.len() || entries_end > tail {
+            // An index that does not leave its tail eight bytes inside the
+            // block is a tree this mount will not write a checksum into -
+            // there is nowhere lawful to put it.
+            return;
+        }
+        let head = [page[tail], page[tail + 1], page[tail + 2], page[tail + 3]];
+        page[tail..tail + 4].fill(0);
+        let c = self::csum::dx_csum(
+            self.sb.csum_seed,
+            dir_ino,
+            dir_gen,
+            page,
+            entries_end,
+            &head,
+        );
+        page[tail + 4..tail + 8].copy_from_slice(&c.to_le_bytes());
+    }
+
+    /// Walk the group descriptor table and confirm every filled-in checksum
+    /// says what this mount's own arithmetic says. Zero halves mean
+    /// "not written yet" and pass; a wrong one means the table lies about
+    /// where its groups live, which is a mount to refuse rather than a
+    /// read to hope through.
+    fn verify_group_descriptors(&self) -> Result<(), &'static str> {
+        let bs = self.block_size();
+        let desc_size = self.sb.desc_size as usize;
+        let mut page = vec![0u8; bs];
+        for g in 0..self.groups {
+            let at = g as usize * desc_size;
+            let block = self.sb.first_data_block as u64 + 1 + (at / bs) as u64;
+            let off = at % bs;
+            self.dev.read_at(block * bs as u64, &mut page);
+            let mut d = page[off..off + desc_size].to_vec();
+            let stored = le16(&d, 30);
+            if stored != 0 {
+                let want = if self.sb.has_metadata_csum {
+                    self::csum::gdt_csum(self.sb.csum_seed, g, &mut d)
+                } else {
+                    self::csum::gdt_csum16(&self.sb.uuid, g, &mut d)
+                };
+                if want != stored {
+                    return Err("ext4 group descriptor checksum does not match");
+                }
+            }
+            // The bitmap halves, when the descriptors point at bitmaps whose
+            // checksums are filled: verify them too, so a silent bit-rot on
+            // a bitmap block is caught at mount, not at the first free.
+            let g0 = self.group(g);
+            let blk_sum = le16(&d, 24) as u32
+                | if desc_size >= 64 {
+                    (le16(&d, 56) as u32) << 16
+                } else {
+                    0
+                };
+            if blk_sum != 0 && g0.block_bitmap != 0 {
+                self.dev.read_at(g0.block_bitmap * bs as u64, &mut page);
+                let want = if self.sb.has_metadata_csum {
+                    self::csum::bitmap_csum(self.sb.csum_seed, &page)
+                } else {
+                    u32::from(self::csum::bitmap_csum16(&self.sb.uuid, g, &page))
+                };
+                if want != blk_sum {
+                    return Err("ext4 block bitmap checksum does not match");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recompute everything a group's own bits depend on: the two bitmap
+    /// checksum halves and the group descriptor checksum. Call it after any
+    /// write that changed a bitmap or a descriptor's counts - the halves are
+    /// stored in the descriptor, so one call leaves the group self-consistent.
+    pub(crate) fn refresh_group_csums(&self, group: u32) {
+        if !self.csums_active() {
+            return;
+        }
+        let g = self.group(group);
+        let bs = self.block_size();
+        let mut blk = vec![0u8; bs];
+        self.dev.read_at(g.block_bitmap * bs as u64, &mut blk);
+        let ino_len = (self.sb.inodes_per_group as usize).div_ceil(8);
+        let mut inob = vec![0u8; bs];
+        self.dev.read_at(g.inode_bitmap * bs as u64, &mut inob);
+        let (bsum, isum) = if self.sb.has_metadata_csum {
+            (
+                self::csum::bitmap_csum(self.sb.csum_seed, &blk),
+                self::csum::bitmap_csum(self.sb.csum_seed, &inob[..ino_len]),
+            )
+        } else {
+            (
+                u32::from(self::csum::bitmap_csum16(&self.sb.uuid, group, &blk)),
+                u32::from(self::csum::bitmap_csum16(
+                    &self.sb.uuid,
+                    group,
+                    &inob[..ino_len],
+                )),
+            )
+        };
+        let desc_size = self.sb.desc_size as usize;
+        let at = group as usize * desc_size;
+        let desc_block = self.sb.first_data_block as u64 + 1 + (at / bs) as u64;
+        let desc_off = at % bs;
+        let meta = self.sb.has_metadata_csum;
+        let seed = self.sb.csum_seed;
+        let uuid = self.sb.uuid;
+        self.update_block(desc_block, |page| {
+            set16(page, desc_off + 24, bsum as u16);
+            set16(page, desc_off + 26, isum as u16);
+            if desc_size >= 64 {
+                set16(page, desc_off + 56, (bsum >> 16) as u16);
+                set16(page, desc_off + 58, (isum >> 16) as u16);
+            }
+            let d = &mut page[desc_off..desc_off + desc_size];
+            let c = if meta {
+                self::csum::gdt_csum(seed, group, d)
+            } else {
+                self::csum::gdt_csum16(&uuid, group, d)
+            };
+            set16(page, desc_off + 30, c);
+            true
+        });
+    }
+
+    /// Read `f`'s leaf directory block and, when the format asks for one,
+    /// leave a valid trailer checksum behind in the fake twelve-byte tail at
+    /// the block's end - the tail the dirent walk never names, whose
+    /// `rec_len` of 12 and `name_len` of 0xDE00 are the format's own marks.
+    /// Indexed blocks carry their tail where the index entries end, so the
+    /// dx code fixes those at its own write sites; this is the leaf shape.
+    fn update_dir_block(
+        &self,
+        block: u64,
+        dir_ino: u32,
+        dir_gen: u32,
+        f: impl FnOnce(&mut [u8]) -> bool,
+    ) -> bool {
+        if !self.sb.has_metadata_csum {
+            return self.update_block(block, f);
+        }
+        self.update_block(block, |page| {
+            // An entry that still runs over the trailer's home gives the
+            // overhang back first; then the edit, then the trailer whose
+            // checksum covers whatever the block now holds.
+            let trimmed = trim_dir_tail(page, page.len() - self::dirent::DIR_LEAF_TAIL);
+            let wrote = f(page);
+            if !wrote && !trimmed {
+                return false;
+            }
+            self.stamp_leaf_tail(page, dir_ino, dir_gen);
+            true
+        })
     }
 }
 
@@ -508,7 +782,10 @@ impl Inode for Ext4Ino {
 
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
         self.fs.writable()?;
-        if matches!(kind, NodeKind::CharDev | NodeKind::Symlink | NodeKind::Socket) {
+        if matches!(
+            kind,
+            NodeKind::CharDev | NodeKind::Symlink | NodeKind::Socket
+        ) {
             // A character device is a driver's business, a link is made of a
             // target rather than a kind, and a socket's S_IFSOCK needs an
             // on-disk inode type this layout does not carry - none of them
@@ -533,7 +810,7 @@ impl Inode for Ext4Ino {
             // The child's ".." is a link to us, on top of its own ".".
             dir.links += 1;
         }
-        self.fs.dir_add(&mut dir, name, child, ftype)?;
+        self.fs.dir_add(&mut dir, self.ino, name, child, ftype)?;
         self.fs.write_inode(self.ino, &dir);
 
         Ok(self.wrap(child))
@@ -571,7 +848,7 @@ impl Inode for Ext4Ino {
         if data.links == 0 {
             return Err(VfsError::Corrupt);
         }
-        self.fs.dir_remove(&mut dir, name)?;
+        self.fs.dir_remove(&mut dir, self.ino, name)?;
         self.fs.write_inode(self.ino, &dir);
 
         data.links -= 1;
@@ -612,7 +889,7 @@ impl Inode for Ext4Ino {
             return Err(VfsError::NotEmpty);
         }
 
-        self.fs.dir_remove(&mut dir, name)?;
+        self.fs.dir_remove(&mut dir, self.ino, name)?;
         dir.links -= 1;
         self.fs.write_inode(self.ino, &dir);
         // The child's own two links - its name here and its `.` - went with
@@ -654,7 +931,7 @@ impl Inode for Ext4Ino {
         } else {
             // Too long for the inode, so it reads like a file's contents - and
             // `readlink` reads it back that way.
-            let (block, allocated) = self.fs.bmap_ensure(&mut data, 0)?;
+            let (block, allocated) = self.fs.bmap_ensure(&mut data, self.ino, 0)?;
             if allocated {
                 data.blocks += self.fs.block_units(data.flags);
             }
@@ -663,7 +940,8 @@ impl Inode for Ext4Ino {
         data.size = bytes.len() as u64;
         self.fs.write_inode(child, &data);
 
-        self.fs.dir_add(&mut dir, name, child, FT_SYMLINK)?;
+        self.fs
+            .dir_add(&mut dir, self.ino, name, child, FT_SYMLINK)?;
         self.fs.write_inode(self.ino, &dir);
         Ok(self.wrap(child))
     }
@@ -690,7 +968,7 @@ impl Inode for Ext4Ino {
             NodeKind::Symlink => FT_SYMLINK,
             _ => FT_REG,
         };
-        self.fs.dir_add(&mut dir, name, child, ftype)?;
+        self.fs.dir_add(&mut dir, self.ino, name, child, ftype)?;
         self.fs.write_inode(self.ino, &dir);
         data.links += 1;
         self.fs.write_inode(child, &data);
@@ -805,7 +1083,7 @@ impl Inode for Ext4Ino {
             let logical = pos / block_size as u64;
             let in_block = (pos % block_size as u64) as usize;
             let n = (block_size - in_block).min(buf.len() - done);
-            let (block, allocated) = self.fs.bmap_ensure(&mut data, logical)?;
+            let (block, allocated) = self.fs.bmap_ensure(&mut data, self.ino, logical)?;
             let src = &buf[done..done + n];
             self.fs.update_block(block, |page| {
                 page[in_block..in_block + n].copy_from_slice(src);
@@ -1157,7 +1435,9 @@ mod tests {
         let dev = Arc::new(format());
         let fs = Ext4Fs::mount(dev).expect("mount");
         let root = fs.root();
-        let file = root.create("default.theme", NodeKind::File).expect("create");
+        let file = root
+            .create("default.theme", NodeKind::File)
+            .expect("create");
         let mut body: Vec<u8> = Vec::new();
         for name in [
             "fish_color_normal",
@@ -1727,22 +2007,34 @@ mod tests {
             FT_DIR,
         );
 
-        assert!(dir_try_insert(&mut page, "newly", 7, FT_REG));
+        {
+            let lim = page.len();
+            assert!(dir_try_insert(&mut page, lim, "newly", 7, FT_REG));
+        }
         assert_eq!(le32(&page, 24), 7, "inserted behind ..");
         assert_eq!(le16(&page, 28), 64 - 24, "its record owns the rest");
         assert_eq!(page[30], 5, "name_len");
         assert_eq!(le16(&page, 16), 12, ".. shrank to its real length");
 
         // A second one shrinks the first inserted entry instead.
-        assert!(dir_try_insert(&mut page, "ab", 8, FT_REG));
+        {
+            let lim = page.len();
+            assert!(dir_try_insert(&mut page, lim, "ab", 8, FT_REG));
+        }
         assert_eq!(le32(&page, 40), 8);
         assert_eq!(le16(&page, 44), 24, "the new entry owns what remained");
         assert_eq!(le16(&page, 28), 16, "newly shrank to its real length");
 
         // Nothing left but "ab"'s 12-byte slack: a 20-byte entry cannot fit.
-        assert!(!dir_try_insert(&mut page, "toolongname", 9, FT_REG));
+        {
+            let lim = page.len();
+            assert!(!dir_try_insert(&mut page, lim, "toolongname", 9, FT_REG));
+        }
         // But a 12-byte one fits exactly, taking the whole remainder.
-        assert!(dir_try_insert(&mut page, "cd", 9, FT_REG));
+        {
+            let lim = page.len();
+            assert!(dir_try_insert(&mut page, lim, "cd", 9, FT_REG));
+        }
         assert_eq!(le16(&page, 44), 12, "ab shrank to its real length");
         assert_eq!(le32(&page, 52), 9);
         assert_eq!(le16(&page, 56), 12, "cd owns what ab's record gave up");
@@ -2050,17 +2342,17 @@ mod tests {
             put32(&mut disk, iat + 28, 6);
             // Root info: one intermediate level below the root.
             disk[base + 30] = 1;
-            // Node: fake dirent over the whole block; limit 127; count 127,
-            // entry 0 the alias naming the leaf, 126 real entries all
-            // hashing 0x10 and pointing at the leaf.
+            // Node: fake dirent over the whole block; limit 126; count 126 -
+            // the slot count a real volume records, with the eight-byte
+            // tail reserved out of the entry array.
             let node = node_block * 1024;
             put16(&mut disk, node + 4, 1024);
-            put16(&mut disk, node + 8, 127); // limit
-            put16(&mut disk, node + 10, 127); // count
+            put16(&mut disk, node + 8, 126); // limit
+            put16(&mut disk, node + 10, 126); // count
             // Index entries hold LOGICAL block numbers: the leaf is
             // block[2], logical 2.
             put32(&mut disk, node + 12, 2); // alias block: the leaf
-            for j in 1..127usize {
+            for j in 1..126usize {
                 put32(&mut disk, node + 8 + j * 8, 0x10); // hash
                 put32(&mut disk, node + 8 + j * 8 + 4, 2);
             }
@@ -2097,7 +2389,7 @@ mod tests {
             .expect("the insert goes through the two splits");
         dir.lookup("new-name").expect("the name is findable");
 
-        // Root gained the sibling node; the node's halves split 63/64; the
+        // Root gained the sibling node; the node's halves split 63/63; the
         // leaf gained a sibling; the directory grew by two blocks.
         let data = core.read_inode(ino);
         let base = data.block[0] as usize * 1024;
@@ -2290,11 +2582,18 @@ mod tests {
     }
 
     /// Set one feature word in the ext4 fixture's superblock before mounting.
+    /// A volume that ends up with `metadata_csum` also gets the superblock's
+    /// own checksum recomputed, because a mount now verifies it - a fixture
+    /// that flipped the bit silently is a fixture that mounts read-only.
     fn ext4_feature(dev: &MemDev, at: usize, bits: u32) {
         critical_section::with(|cs| {
             let mut disk = dev.bytes.borrow(cs).borrow_mut();
             let was = le32(&disk, at);
             put32(&mut disk, at, was | bits);
+            if le32(&disk, 1024 + 100) & ROCOMPAT_METADATA_CSUM != 0 {
+                let c = self::csum::sb_csum(&disk[1024..1024 + 1020]);
+                put32(&mut disk, 1024 + 1020, c);
+            }
         });
     }
 
@@ -2477,31 +2776,25 @@ mod tests {
     }
 
     #[test]
-    fn metadata_checksums_mount_read_only_and_stay_that_way() {
-        let dev = format_ext4();
+    fn a_checksummed_volume_writes_and_leaves_its_checksums_true() {
+        // The retirement of the read-only gate, pinned: a `metadata_csum`
+        // image is writable, every write recomputes what it touched, and a
+        // *fresh mount* - whose verifier recomputes from the bytes alone -
+        // accepts the result. A stale checksum would fail that second mount
+        // exactly the way the kernel's would.
+        let dev = Arc::new(format_ext4());
         ext4_feature(&dev, 1024 + 100, ROCOMPAT_METADATA_CSUM);
-        let fs = mounted(Arc::new(dev));
-        // Worth reading: a checksum is not data, and an image that has them
-        // is every image mke2fs makes now.
-        assert!(
-            fs.read_only(),
-            "checksums we cannot recompute mean no writes"
-        );
-        fs.set_read_only(false);
-        assert!(
-            fs.read_only(),
-            "remounting read-write does not lift what the format cannot keep"
-        );
+        let fs = mounted(dev.clone());
+        assert!(!fs.read_only(), "checksums we maintain mean writes");
+        let file = fs.root().create("summed", NodeKind::File).expect("create");
+        file.write_at(0, b"checksum payload").expect("write");
+        drop(fs);
+        let again = mounted(dev);
         assert_eq!(
-            read_all(&*fs.root().lookup("hello").expect("hello"), 11),
-            b"hello world".to_vec(),
-            "and it still reads"
+            read_all(&*again.root().lookup("summed").expect("found"), 16),
+            b"checksum payload".to_vec(),
+            "the file and its bookkeeping survive a remount"
         );
-        match fs.root().create("x", NodeKind::File) {
-            Err(VfsError::ReadOnly) => {}
-            Ok(_) => panic!("a write went through on a checksummed filesystem"),
-            Err(other) => panic!("refused as read-only, not as {other:?}"),
-        }
     }
 
     #[test]

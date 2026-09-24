@@ -22,11 +22,26 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-copy-file-range\n");
     let mut failed = false;
 
-    let src = lin::openat(lin::AT_FDCWD, &SRC, lin::O_CREAT | lin::O_RDWR | 0o1000, 0o644) as i32;
+    let src = lin::openat(
+        lin::AT_FDCWD,
+        &SRC,
+        lin::O_CREAT | lin::O_RDWR | 0o1000,
+        0o644,
+    ) as i32;
     lin::check_true(&mut failed, b"the source is created", src >= 0);
-    let dst = lin::openat(lin::AT_FDCWD, &DST, lin::O_CREAT | lin::O_RDWR | 0o1000, 0o644) as i32;
+    let dst = lin::openat(
+        lin::AT_FDCWD,
+        &DST,
+        lin::O_CREAT | lin::O_RDWR | 0o1000,
+        0o644,
+    ) as i32;
     lin::check_true(&mut failed, b"the destination is created", dst >= 0);
-    lin::check_eq(&mut failed, b"the source takes 11 bytes", lin::write(src, b"hello world"), 11);
+    lin::check_eq(
+        &mut failed,
+        b"the source takes 11 bytes",
+        lin::write(src, b"hello world"),
+        11,
+    );
 
     // The explicit-offset spelling: both words name byte 0, and the copy
     // hands back the full length and moves them to its end.
@@ -34,13 +49,30 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut off_out: i64 = 0;
     let n = lin::copy_file_range(src, &raw mut off_in, dst, &raw mut off_out, 11, 0);
     lin::check_eq(&mut failed, b"the copy takes all 11 bytes", n, 11);
-    lin::check_eq(&mut failed, b"the source offset advanced", off_in as isize, 11);
-    lin::check_eq(&mut failed, b"the destination offset advanced", off_out as isize, 11);
+    lin::check_eq(
+        &mut failed,
+        b"the source offset advanced",
+        off_in as isize,
+        11,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the destination offset advanced",
+        off_out as isize,
+        11,
+    );
 
     // What landed is what was copied, read back from byte 0.
-    lin::check_eq(&mut failed, b"the destination seeks to 0", lin::lseek(dst, 0, lin::SEEK_SET), 0);
+    lin::check_eq(
+        &mut failed,
+        b"the destination seeks to 0",
+        lin::lseek(dst, 0, lin::SEEK_SET),
+        0,
+    );
     static mut BACK: [u8; 16] = [0; 16];
-    let r = lin::read(dst, unsafe { core::slice::from_raw_parts_mut(&raw mut BACK as *mut u8, 16) });
+    let r = lin::read(dst, unsafe {
+        core::slice::from_raw_parts_mut(&raw mut BACK as *mut u8, 16)
+    });
     lin::check_eq(&mut failed, b"the destination reads back 11 bytes", r, 11);
     lin::check_true(
         &mut failed,
@@ -69,7 +101,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // A descriptor that is not a regular file: the pipe is EINVAL.
     let mut fds: [i32; 2] = [-1; 2];
-    lin::check_eq(&mut failed, b"the pipe pair is made", lin::pipe2(&mut fds, 0), 0);
+    lin::check_eq(
+        &mut failed,
+        b"the pipe pair is made",
+        lin::pipe2(&mut fds, 0),
+        0,
+    );
     let mut a: i64 = 0;
     let mut b: i64 = 0;
     lin::check_eq(
@@ -87,12 +124,32 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // The cursor spelling: no offset words, the descriptors' own positions
     // name the ranges, and the copy moves them.
-    lin::check_eq(&mut failed, b"the source seeks to 0", lin::lseek(src, 0, lin::SEEK_SET), 0);
-    lin::check_eq(&mut failed, b"the destination seeks to 0", lin::lseek(dst, 0, lin::SEEK_SET), 0);
+    lin::check_eq(
+        &mut failed,
+        b"the source seeks to 0",
+        lin::lseek(src, 0, lin::SEEK_SET),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the destination seeks to 0",
+        lin::lseek(dst, 0, lin::SEEK_SET),
+        0,
+    );
     let n = lin::copy_file_range(src, core::ptr::null_mut(), dst, core::ptr::null_mut(), 5, 0);
     lin::check_eq(&mut failed, b"the cursor-mode copy takes 5 bytes", n, 5);
-    lin::check_eq(&mut failed, b"the source cursor advanced", lin::lseek(src, 0, lin::SEEK_CUR), 5);
-    lin::check_eq(&mut failed, b"the destination cursor advanced", lin::lseek(dst, 0, lin::SEEK_CUR), 5);
+    lin::check_eq(
+        &mut failed,
+        b"the source cursor advanced",
+        lin::lseek(src, 0, lin::SEEK_CUR),
+        5,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the destination cursor advanced",
+        lin::lseek(dst, 0, lin::SEEK_CUR),
+        5,
+    );
     lin::check_eq(
         &mut failed,
         b"a closed descriptor answers EBADF",

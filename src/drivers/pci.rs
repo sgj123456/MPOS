@@ -101,15 +101,30 @@ impl Func {
 /// `0xffff` reads as the vendor of an empty slot, which is how absent devices
 /// are signalled.
 pub fn find(vendor: u16, device: u16) -> Option<Func> {
+    find_any(vendor, &[device]).into_iter().next()
+}
+
+/// Every bus-0 function with this vendor and any of these device IDs, in
+/// slot order.
+///
+/// One device ID is not always one device: QEMU names every virtio input
+/// device - its keyboard, its tablet - with the same PCI id, and a driver
+/// that can only find "the first" finds only the keyboard. The multifunction
+/// header bit is not consulted: a read of a function that is not there
+/// answers the empty-slot vendor, which is a check in itself.
+pub fn find_any(vendor: u16, devices: &[u16]) -> alloc::vec::Vec<Func> {
+    let mut found = alloc::vec::Vec::new();
     for slot in 0..32 {
-        let func = Func {
-            bus: 0,
-            slot,
-            func: 0,
-        };
-        if func.vendor() == vendor && func.device() == device {
-            return Some(func);
+        for function in 0..8 {
+            let func = Func {
+                bus: 0,
+                slot,
+                func: function,
+            };
+            if func.vendor() == vendor && devices.contains(&func.device()) {
+                found.push(func);
+            }
         }
     }
-    None
+    found
 }

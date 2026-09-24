@@ -128,7 +128,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::puts_isize((rtt_sum_ms / answered) as isize);
     }
     lin::puts(b" ms\n");
-    lin::check_eq(&mut failed, b"every query was answered", answered as isize, 12);
+    lin::check_eq(
+        &mut failed,
+        b"every query was answered",
+        answered as isize,
+        12,
+    );
 
     if failed {
         lin::puts(b"FAILED\n");

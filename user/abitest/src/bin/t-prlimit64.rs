@@ -30,18 +30,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     let rl = &raw mut RL as *mut lin::Rlimit;
     let r = lin::prlimit64(0, lin::RLIMIT_STACK, core::ptr::null(), rl);
-    lin::check_eq(
-        &mut failed,
-        b"querying RLIMIT_STACK succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"querying RLIMIT_STACK succeeds", r, 0);
     unsafe {
-        lin::check_true(
-            &mut failed,
-            b"the soft limit is usable",
-            (*rl).rlim_cur > 0,
-        );
+        lin::check_true(&mut failed, b"the soft limit is usable", (*rl).rlim_cur > 0);
         lin::check_true(
             &mut failed,
             b"the hard limit is at least the soft one",
@@ -52,12 +43,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // RLIMIT_NOFILE is a number programs compute with, not just sanity-check:
     // the soft limit is pinned to the classic 1024 exactly.
     let r = lin::prlimit64(0, lin::RLIMIT_NOFILE, core::ptr::null(), rl);
-    lin::check_eq(
-        &mut failed,
-        b"querying RLIMIT_NOFILE succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"querying RLIMIT_NOFILE succeeds", r, 0);
     unsafe {
         lin::check_eq(
             &mut failed,
@@ -77,7 +63,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     // old=NULL suppresses the query: the call is a valid no-op.
-    let r = lin::prlimit64(0, lin::RLIMIT_STACK, core::ptr::null(), core::ptr::null_mut());
+    let r = lin::prlimit64(
+        0,
+        lin::RLIMIT_STACK,
+        core::ptr::null(),
+        core::ptr::null_mut(),
+    );
     lin::check_eq(
         &mut failed,
         b"a query with a null old pointer answers 0 and writes nothing",

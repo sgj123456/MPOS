@@ -22,12 +22,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let r = lin::set_robust_list(&raw const HEAD, 24);
-    lin::check_eq(
-        &mut failed,
-        b"registering the 24-byte head succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"registering the 24-byte head succeeds", r, 0);
 
     let r = lin::set_robust_list(&raw const HEAD, 23);
     lin::check_eq(

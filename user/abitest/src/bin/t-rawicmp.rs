@@ -62,7 +62,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-rawicmp\n");
     let mut failed = false;
 
-    let fd = lin::socket(lin::AF_INET as usize, 3 /* SOCK_RAW */, 1 /* ICMP */) as i32;
+    let fd = lin::socket(
+        lin::AF_INET as usize,
+        3, /* SOCK_RAW */
+        1, /* ICMP */
+    ) as i32;
     lin::check_true(&mut failed, b"raw ICMP socket opens", fd >= 0);
     lin::check_eq(
         &mut failed,

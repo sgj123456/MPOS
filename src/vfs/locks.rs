@@ -406,12 +406,40 @@ mod tests {
     #[test]
     fn shared_locks_coexist_and_exclusive_fights_everything() {
         let held = lock(7, LockClass::Record, LockKind::Read, 0, 100);
-        assert!(!conflicts(&held, 8, LockClass::Record, LockKind::Read, 0, 50));
-        assert!(conflicts(&held, 8, LockClass::Record, LockKind::Write, 50, 60));
+        assert!(!conflicts(
+            &held,
+            8,
+            LockClass::Record,
+            LockKind::Read,
+            0,
+            50
+        ));
+        assert!(conflicts(
+            &held,
+            8,
+            LockClass::Record,
+            LockKind::Write,
+            50,
+            60
+        ));
         let w = lock(7, LockClass::Record, LockKind::Write, 0, 100);
         assert!(conflicts(&w, 8, LockClass::Record, LockKind::Read, 50, 60));
-        assert!(!conflicts(&w, 7, LockClass::Record, LockKind::Write, 0, 100));
-        assert!(!conflicts(&w, 8, LockClass::Record, LockKind::Write, 100, 200));
+        assert!(!conflicts(
+            &w,
+            7,
+            LockClass::Record,
+            LockKind::Write,
+            0,
+            100
+        ));
+        assert!(!conflicts(
+            &w,
+            8,
+            LockClass::Record,
+            LockKind::Write,
+            100,
+            200
+        ));
     }
 
     /// The two families are independent: a `flock` never blocks an `fcntl`
@@ -420,12 +448,33 @@ mod tests {
     fn record_and_whole_locks_never_conflict() {
         let rec = lock(7, LockClass::Record, LockKind::Write, 0, 100);
         // A whole-file exclusive request is unbothered by the record lock...
-        assert!(!conflicts(&rec, 8, LockClass::Whole, LockKind::Write, 0, 100));
+        assert!(!conflicts(
+            &rec,
+            8,
+            LockClass::Whole,
+            LockKind::Write,
+            0,
+            100
+        ));
         // ...and vice versa.
         let whl = lock(8, LockClass::Whole, LockKind::Write, 0, INF);
-        assert!(!conflicts(&whl, 7, LockClass::Record, LockKind::Write, 50, 60));
+        assert!(!conflicts(
+            &whl,
+            7,
+            LockClass::Record,
+            LockKind::Write,
+            50,
+            60
+        ));
         // But same-class requests still do.
-        assert!(conflicts(&rec, 8, LockClass::Record, LockKind::Write, 0, 100));
+        assert!(conflicts(
+            &rec,
+            8,
+            LockClass::Record,
+            LockKind::Write,
+            0,
+            100
+        ));
         assert!(conflicts(&whl, 7, LockClass::Whole, LockKind::Read, 0, 5));
     }
 

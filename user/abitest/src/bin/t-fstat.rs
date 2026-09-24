@@ -86,7 +86,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // A descriptor that is not open answers EBADF.
     let r = lin::fstat(77, st);
-    lin::check_eq(&mut failed, b"fstat on a bad fd answers EBADF", r, lin::EBADF);
+    lin::check_eq(
+        &mut failed,
+        b"fstat on a bad fd answers EBADF",
+        r,
+        lin::EBADF,
+    );
 
     // A directory: S_IFDIR in st_mode, nlink 2 like the man page's example.
     let binfd = lin::openat(lin::AT_FDCWD, &BIN, lin::O_RDONLY, 0);

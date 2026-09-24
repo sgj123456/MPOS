@@ -1556,6 +1556,15 @@ fn mount_new(
         // The kernel's own trees, by name.
         "proc" => crate::vfs::procfs::ProcFs::new(),
         "sysfs" => crate::vfs::sysfs::SysFs::new(),
+        // A host share, served over 9p: the *source* is the mount tag the
+        // host exported the share under - `mount -t 9p hostshare /mnt`
+        // opens the device QEMU was told `-virtfs ...,mount_tag=hostshare`
+        // for. An empty source takes the only share the bus has, which is
+        // the same call the boot's own mount makes.
+        "9p" => match crate::vfs::p9::mount(source) {
+            Ok(fs) => fs,
+            Err(e) => return err_of(e),
+        },
         "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
         "devpts" => crate::vfs::devpts::DevPts::new(),
         "tmpfs" | "ramfs" => {
@@ -2069,7 +2078,9 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     // Ask every node to wake us before the first check: one that becomes ready
     // between the check and the sleep must not be missed. A descriptor the
     // table does not name has no node, and is reported POLLNVAL - counting it
-    // is what stops a caller waiting on a closed fd from sleeping forever.
+    // is what stops a caller waiting on a closed fd from sleeping forever. A
+    // negative fd is not a closed one but a placeholder, and is skipped rather
+    // than reported: the check below zero-answers it, so it never counts.
     let mut nodes: Vec<Option<Arc<dyn Inode>>> = Vec::with_capacity(nfds);
     for index in 0..nfds {
         let at = fds + index * POLLFD_SIZE;
@@ -2119,6 +2130,18 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         let any_ready = || {
             (0..nfds).any(|index| {
                 let at = fds + index * POLLFD_SIZE;
+                // The same skip `check_ready` makes, and for the same reason:
+                // a placeholder entry answers "not ready", so a wait whose
+                // only other descriptors are quiet has to keep waiting.
+                // Reading it as a dead one instead answers *ready* forever -
+                // `check_ready` reports nothing, the park returns at once, and
+                // the loop never sleeps: `apk add` parks on
+                // `poll({9},{11},{-1}, -1)` for its trigger's pipes and the
+                // whole machine spins at that one call.
+                let fd = unsafe { (at as *const i32).read_unaligned() };
+                if fd < 0 {
+                    return false;
+                }
                 let events = unsafe { ((at + POLLFD_EVENTS) as *const i16).read_unaligned() };
                 let Some(node) = &nodes[index] else {
                     // A dead fd has POLLNVAL waiting for the caller: the
@@ -2151,19 +2174,32 @@ fn check_ready(fds: usize, nodes: &[Option<Arc<dyn Inode>>]) -> usize {
     let mut count = 0;
     for (index, node) in nodes.iter().enumerate() {
         let at = fds + index * POLLFD_SIZE;
+        let fd = unsafe { (at as *const i32).read_unaligned() };
         let events = unsafe { ((at + POLLFD_EVENTS) as *const i16).read_unaligned() };
-        let revents = match node {
-            None => POLLNVAL,
-            Some(node) => {
-                let ready = node.poll_ready();
-                let mut bits = 0;
-                if events & POLLIN != 0 && ready.read {
-                    bits |= POLLIN;
+        // A negative `fd` names no descriptor *on purpose*: poll(2) skips
+        // the entry whole - `events` ignored, `revents` zeroed, the entry
+        // never counted as ready. Answering POLLNVAL instead would report
+        // the slot as ready, and callers keep such slots beside real ones:
+        // musl's resolver polls the TCP-fallback slots it holds at -1 next
+        // to its UDP socket, so a "ready" answer turns its wait into a spin
+        // that only the timeout ends, with the name it asked for unanswered
+        // - which busybox prints as `bad address`.
+        let revents = if fd < 0 {
+            0
+        } else {
+            match node {
+                None => POLLNVAL,
+                Some(node) => {
+                    let ready = node.poll_ready();
+                    let mut bits = 0;
+                    if events & POLLIN != 0 && ready.read {
+                        bits |= POLLIN;
+                    }
+                    if events & POLLOUT != 0 && ready.write {
+                        bits |= POLLOUT;
+                    }
+                    bits
                 }
-                if events & POLLOUT != 0 && ready.write {
-                    bits |= POLLOUT;
-                }
-                bits
             }
         };
         unsafe { ((at + POLLFD_REVENTS) as *mut i16).write_unaligned(revents) };
@@ -3094,7 +3130,146 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
+        0x8913 => {
+            // SIOCGIFFLAGS: the administrative flags of the named link, as
+            // busybox's `ip link set` reads them before writing new ones.
+            if !buffer_ok(buf, 40, true, from_user) {
+                return err::EFAULT;
+            }
+            match ifreq_index(buf).and_then(ifreq_flags) {
+                Some(flags) => {
+                    unsafe {
+                        ((buf + 16) as *mut u16).write_unaligned(flags);
+                    }
+                    0
+                }
+                None => err::ENODEV,
+            }
+        }
+        0x8914 => {
+            // SIOCSIFFLAGS: the new flags. Only `IFF_UP` carries meaning -
+            // the capability bits are the link's to keep, not the setter's.
+            if !buffer_ok(buf, 40, false, from_user) {
+                return err::EFAULT;
+            }
+            match ifreq_index(buf) {
+                Some(index) => {
+                    let flags = unsafe { ((buf + 16) as *const u16).read_unaligned() };
+                    match crate::net::set_link_up(index, flags & 1 != 0) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    }
+                }
+                None => err::ENODEV,
+            }
+        }
+        0x8921 => {
+            // SIOCGIFMTU: the link's current MTU - the loopback's is the
+            // 64 KiB an IPv4 datagram tops out at, the NIC's is what
+            // `RTM_SETLINK` last set.
+            if !buffer_ok(buf, 40, true, from_user) {
+                return err::EFAULT;
+            }
+            match ifreq_index(buf) {
+                Some(1) => {
+                    unsafe {
+                        ((buf + 16) as *mut i32).write_unaligned(65536);
+                    }
+                    0
+                }
+                Some(_) => match crate::net::link_facts() {
+                    Some(facts) => {
+                        unsafe {
+                            ((buf + 16) as *mut i32).write_unaligned(facts.mtu as i32);
+                        }
+                        0
+                    }
+                    None => err::ENODEV,
+                },
+                None => err::ENODEV,
+            }
+        }
+        0x8922 => {
+            // SIOCSIFMTU: the new MTU, which `ip link set eth0 mtu N`
+            // writes. The stack clamps it to the bounds a frame can carry.
+            if !buffer_ok(buf, 40, false, from_user) {
+                return err::EFAULT;
+            }
+            match ifreq_index(buf) {
+                Some(2) => {
+                    let mtu = unsafe { ((buf + 16) as *const i32).read_unaligned() };
+                    match crate::net::set_mtu(mtu as u32) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    }
+                }
+                Some(_) => err::EOPNOTSUPP,
+                None => err::ENODEV,
+            }
+        }
+        0x8923 => {
+            // SIOCSIFNAME: rename. The new name rides the union half of the
+            // request - the same place the flags and the MTU do.
+            if !buffer_ok(buf, 40, false, from_user) {
+                return err::EFAULT;
+            }
+            match ifreq_index(buf) {
+                Some(2) => {
+                    let mut name = [0u8; 16];
+                    unsafe {
+                        for (i, slot) in name.iter_mut().enumerate() {
+                            *slot = ((buf + 16 + i) as *const u8).read_unaligned();
+                            if *slot == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    let len = name.iter().position(|b| *b == 0).unwrap_or(16);
+                    match core::str::from_utf8(&name[..len]) {
+                        Ok(name) => match crate::net::set_eth_name(name) {
+                            Ok(()) => 0,
+                            Err(e) => e,
+                        },
+                        Err(_) => err::EINVAL,
+                    }
+                }
+                Some(_) => err::EOPNOTSUPP,
+                None => err::ENODEV,
+            }
+        }
+        0x8933 => {
+            // SIOCGIFINDEX: the index of the named link. musl's
+            // `if_nametoindex` asks this, and busybox's `ip ... dev eth0`
+            // resolves the device through it - without this arm every
+            // device-named command dies with "can't find device".
+            if !buffer_ok(buf, 40, true, from_user) {
+                return err::EFAULT;
+            }
+            match ifreq_index(buf) {
+                Some(index) => {
+                    unsafe {
+                        ((buf + 16) as *mut i32).write_unaligned(index as i32);
+                    }
+                    0
+                }
+                None => err::ENODEV,
+            }
+        }
         0x8942 => {
+            // SIOCGIFTXQLEN: the interface's transmit queue length, which
+            // busybox `ip` asks for by name right after the netlink dump -
+            // the one field it never reads from the attributes. The name is
+            // ignored: one NIC, one answer, and both it and `lo` carry the
+            // 1000 that is Linux's own default.
+            if !buffer_ok(buf, 40, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe {
+                ((buf + 16) as *mut i32).write_unaligned(1000);
+            }
+            0
+        }
+        0x8927 => {
             // SIOCGIFHWADDR: the hardware address of the named interface.
             // `ip` falls back to this for the MAC a netlink dump did not
             // spell out. One interface exists; its address is the one the
@@ -3115,8 +3290,180 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
+        0x4600 => {
+            // FBIOGET_VSCREENLINFO: the framebuffer's own description, in
+            // `struct fb_var_screeninfo` - the resolution a program sizes
+            // its surface from, and the bitfields that tell it where in one
+            // 32-bit pixel each channel lives. The device draws BGRA, which
+            // as a little-endian word is 0xAARRGGBB - red at bit 16, green
+            // at 8, blue at 0 - and that mapping is what the fields carry.
+            // Everything a headless display cannot promise - timings, sync
+            // polarity, rotation - stays zero, which is the ABI's own "not
+            // applicable".
+            const FB_VAR_SIZE: usize = 160;
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            // The inode is bound first: `as_fb` borrows from it, and a
+            // temporary `Arc` borrowed through would be gone before the
+            // answer it lent was read.
+            let inode = file.inode();
+            let Some(fb) = inode.as_fb() else {
+                return err::ENOTTY;
+            };
+            if !buffer_ok(buf, FB_VAR_SIZE, true, from_user) {
+                return err::EFAULT;
+            }
+            let (width, height) = fb.dims();
+            unsafe {
+                core::ptr::write_bytes(buf as *mut u8, 0, FB_VAR_SIZE);
+                let word = |offset: usize, value: u32| {
+                    ((buf + offset) as *mut u32).write_unaligned(value);
+                };
+                word(0, width);
+                word(4, height);
+                word(8, width);
+                word(12, height);
+                word(24, 32); // bits_per_pixel
+                // The channel bitfields: offset, length, msb_right each.
+                word(32, 16); // red.offset
+                word(36, 8);
+                word(44, 8); // green.offset
+                word(48, 8);
+                word(56, 0); // blue.offset
+                word(60, 8);
+                word(68, 24); // transp.offset: alpha
+                word(72, 8);
+            }
+            0
+        }
+        0x4601 => {
+            // FBIOPUT_VSCREENLINFO: a request to reshape the framebuffer.
+            // Refused rather than faked: changing the resolution tears down
+            // the buffer every `mmap` holds a mapping of, and a node whose
+            // mappings change length under their holders is a node that
+            // corrupts whoever trusted it. EOPNOTSUPP, the errno of a
+            // request the device type exists to carry but this one
+            // declines.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            if file.inode().as_fb().is_none() {
+                return err::ENOTTY;
+            }
+            err::EOPNOTSUPP
+        }
+        0x4602 => {
+            // FBIOGET_FSCREENINFO: the fixed half of the pair - where the
+            // pixel buffer physically is and how long a row is, the numbers
+            // an fbdev program needs before its first draw. `FB_TYPE_PACKED
+            // _PIXELS` (0) and `FB_VISUAL_TRUECOLOR` (2) are what a plain
+            // 32-bit linear buffer answers on Linux.
+            const FB_FIX_SIZE: usize = 80;
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            // The inode is bound first, for the same lifetime reason as the
+            // arm above it.
+            let inode = file.inode();
+            let Some(fb) = inode.as_fb() else {
+                return err::ENOTTY;
+            };
+            if !buffer_ok(buf, FB_FIX_SIZE, true, from_user) {
+                return err::EFAULT;
+            }
+            let (width, _) = fb.dims();
+            unsafe {
+                core::ptr::write_bytes(buf as *mut u8, 0, FB_FIX_SIZE);
+                let bytes = b"virtio-gpu";
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+                ((buf + 16) as *mut u64).write_unaligned(fb.fb_phys() as u64); // smem_start
+                ((buf + 24) as *mut u32).write_unaligned(fb.fb_len() as u32); // smem_len
+                ((buf + 28) as *mut u32).write_unaligned(0); // type: packed pixels
+                ((buf + 36) as *mut u32).write_unaligned(2); // visual: truecolor
+                ((buf + 48) as *mut u32).write_unaligned(width * 4); // line_length
+            }
+            0
+        }
+        request if (request & 0xc0ff_ffff) == (0x8000_0000 | ((b'E' as u32) << 8) | 0x06) => {
+            // EVIOCGNAME: the input device's name for itself - the string
+            // the host filled the virtio device's config with, which is how
+            // an evdev reader tells a keyboard from a tablet without
+            // reading events. The request word carries the caller's
+            // buffer size in the _IOC size field, so the limit is read out
+            // of the request rather than being a separate argument; the
+            // string is written NUL-terminated and the answer is how many
+            // bytes it took, as the ioctl returns the count of any read.
+            let size = ((request >> 16) & 0x3fff) as usize;
+            if size == 0 {
+                return err::EINVAL;
+            }
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            // The inode is bound first, for the same lifetime reason as the
+            // framebuffer arms above it.
+            let inode = file.inode();
+            let Some(evdev) = inode.as_evdev() else {
+                return err::ENOTTY;
+            };
+            if !buffer_ok(buf, size, true, from_user) {
+                return err::EFAULT;
+            }
+            let name = evdev.name().as_bytes();
+            let n = name.len().min(size - 1);
+            unsafe {
+                core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
+                (buf as *mut u8).add(n).write_volatile(0);
+            }
+            n as isize
+        }
         _ => err::ENOTTY,
     }
+}
+
+/// The interface a `struct ifreq` names: `lo` is 1 and the NIC - under
+/// whatever name it currently carries - is 2. `None` names no device, which
+/// the interface ioctls answer with `ENODEV`.
+fn ifreq_index(buf: usize) -> Option<u32> {
+    let mut name = [0u8; 16];
+    unsafe {
+        for (i, slot) in name.iter_mut().enumerate() {
+            *slot = ((buf + i) as *const u8).read_unaligned();
+            if *slot == 0 {
+                break;
+            }
+        }
+    }
+    let len = name.iter().position(|b| *b == 0)?;
+    let name = core::str::from_utf8(&name[..len]).ok()?;
+    if name == "lo" {
+        return Some(1);
+    }
+    crate::net::link_facts()
+        .filter(|facts| facts.eth_name == name)
+        .map(|_| 2)
+}
+
+/// The flags an interface ioctl reports - the same bits the netlink link
+/// dump carries, as the `ifr_flags` halfword: the link's kind, and the
+/// up-and-running pair that rides the administrative bit.
+fn ifreq_flags(index: u32) -> Option<u16> {
+    let facts = crate::net::link_facts()?;
+    let (up, loopback) = match index {
+        1 => (facts.lo_up, true),
+        2 => (facts.eth_up, false),
+        _ => return None,
+    };
+    let mut flags = if loopback { 0x8 } else { 0x2 | 0x1000 };
+    if up {
+        flags |= 0x1 | 0x40;
+    }
+    Some(flags)
 }
 
 /// `writev(fd, iov, iovcnt)` — scatter write.

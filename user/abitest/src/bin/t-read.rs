@@ -30,11 +30,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let fd = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_true(
-        &mut failed,
-        b"the file to read opens",
-        fd >= 0,
-    );
+    lin::check_true(&mut failed, b"the file to read opens", fd >= 0);
 
     if fd >= 0 {
         let mut total = 0usize;
@@ -52,16 +48,8 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
                 break;
             }
         }
-        lin::check_true(
-            &mut failed,
-            b"the first read hands back bytes",
-            total > 0,
-        );
-        lin::check_true(
-            &mut failed,
-            b"reading past the end answers 0",
-            eof,
-        );
+        lin::check_true(&mut failed, b"the first read hands back bytes", total > 0);
+        lin::check_true(&mut failed, b"reading past the end answers 0", eof);
 
         let empty: &mut [u8] = &mut [];
         let n = lin::read(fd as i32, empty);
@@ -72,7 +60,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     let buf = unsafe { core::slice::from_raw_parts_mut(&raw mut BUF as *mut u8, 16) };
     let n = lin::read(99, buf);
-    lin::check_eq(&mut failed, b"a descriptor that does not exist answers EBADF", n, lin::EBADF);
+    lin::check_eq(
+        &mut failed,
+        b"a descriptor that does not exist answers EBADF",
+        n,
+        lin::EBADF,
+    );
 
     let p = lin::mmap(
         GUARD,
@@ -82,7 +75,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         -1,
         0,
     );
-    lin::check_eq(&mut failed, b"the PROT_NONE guard page maps at the fixed address", p, GUARD as isize);
+    lin::check_eq(
+        &mut failed,
+        b"the PROT_NONE guard page maps at the fixed address",
+        p,
+        GUARD as isize,
+    );
     let buf = unsafe { core::slice::from_raw_parts_mut(GUARD as *mut u8, 16) };
     let n = lin::read(3, buf);
     lin::check_eq(

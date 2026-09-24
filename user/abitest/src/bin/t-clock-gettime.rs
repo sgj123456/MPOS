@@ -42,7 +42,10 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-clock-gettime\n");
     let mut failed = false;
 
-    let mut rt = lin::TimeSpec { tv_sec: -1, tv_nsec: -1 };
+    let mut rt = lin::TimeSpec {
+        tv_sec: -1,
+        tv_nsec: -1,
+    };
     let r = lin::clock_gettime(lin::CLOCK_REALTIME, &mut rt);
     lin::check_eq(&mut failed, b"CLOCK_REALTIME answers 0", r, 0);
     lin::check_true(
@@ -56,12 +59,18 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         rt.tv_sec >= 0,
     );
 
-    let mut mt = lin::TimeSpec { tv_sec: -1, tv_nsec: -1 };
+    let mut mt = lin::TimeSpec {
+        tv_sec: -1,
+        tv_nsec: -1,
+    };
     let r = lin::clock_gettime(lin::CLOCK_MONOTONIC, &mut mt);
     lin::check_eq(&mut failed, b"CLOCK_MONOTONIC answers 0", r, 0);
 
     // Two successive reads: the second must be at or after the first.
-    let mut rt2 = lin::TimeSpec { tv_sec: -1, tv_nsec: -1 };
+    let mut rt2 = lin::TimeSpec {
+        tv_sec: -1,
+        tv_nsec: -1,
+    };
     let r = lin::clock_gettime(lin::CLOCK_REALTIME, &mut rt2);
     lin::check_eq(&mut failed, b"a second realtime read answers 0", r, 0);
     lin::check_true(
@@ -76,19 +85,26 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // Sleep 50 ms and demand the monotonic clock noticed: at least 40 ms
     // (the tick is coarse) and at most 5 s (a stuck sleep is a bug).
-    let mut before = lin::TimeSpec { tv_sec: 0, tv_nsec: 0 };
+    let mut before = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let r = lin::clock_gettime(lin::CLOCK_MONOTONIC, &mut before);
-    lin::check_eq(
-        &mut failed,
-        b"the pre-sleep monotonic read answers 0",
-        r,
-        0,
-    );
-    let req = lin::TimeSpec { tv_sec: 0, tv_nsec: 50_000_000 };
-    let mut rem = lin::TimeSpec { tv_sec: 0, tv_nsec: 0 };
+    lin::check_eq(&mut failed, b"the pre-sleep monotonic read answers 0", r, 0);
+    let req = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 50_000_000,
+    };
+    let mut rem = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let r = lin::nanosleep(&req, &mut rem);
     lin::check_eq(&mut failed, b"the 50 ms sleep answers 0", r, 0);
-    let mut after = lin::TimeSpec { tv_sec: 0, tv_nsec: 0 };
+    let mut after = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let r = lin::clock_gettime(lin::CLOCK_MONOTONIC, &mut after);
     lin::check_eq(
         &mut failed,
@@ -96,7 +112,8 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         r,
         0,
     );
-    let elapsed_ms = (after.tv_sec - before.tv_sec) * 1000 + (after.tv_nsec - before.tv_nsec) / 1_000_000;
+    let elapsed_ms =
+        (after.tv_sec - before.tv_sec) * 1000 + (after.tv_nsec - before.tv_nsec) / 1_000_000;
     lin::check_true(
         &mut failed,
         b"the sleep moved the monotonic clock by 40 ms to 5 s",

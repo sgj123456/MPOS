@@ -36,12 +36,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
     let base = lin::free_fd();
 
-    let fd = lin::openat(
-        lin::AT_FDCWD,
-        &MOTD,
-        lin::O_RDONLY | lin::O_CLOEXEC,
-        0,
-    );
+    let fd = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY | lin::O_CLOEXEC, 0);
     lin::check_eq(
         &mut failed,
         b"openat(AT_FDCWD) hands out the lowest free fd",
@@ -86,7 +81,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let _ = lin::close(binfd as i32);
 
     let r = lin::openat(77, &MOTD, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"a dirfd that is not open answers EBADF", r, lin::EBADF);
+    lin::check_eq(
+        &mut failed,
+        b"a dirfd that is not open answers EBADF",
+        r,
+        lin::EBADF,
+    );
 
     let fd = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
     let r = lin::openat(fd as i32, &X, lin::O_RDONLY, 0);

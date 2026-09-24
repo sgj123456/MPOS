@@ -38,31 +38,16 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // Linux pins the length to sizeof(struct rseq) = 32; 31 is one short.
     let r = lin::rseq(&raw mut RSEQ as *mut lin::Rseq, 31, 0, lin::RSEQ_SIG);
-    lin::check_eq(
-        &mut failed,
-        b"a length of 31 is EINVAL",
-        r,
-        lin::EINVAL,
-    );
+    lin::check_eq(&mut failed, b"a length of 31 is EINVAL", r, lin::EINVAL);
 
     // The flag word must be 0: there is no flag the kernel knows.
     let r = lin::rseq(&raw mut RSEQ as *mut lin::Rseq, 32, 1, lin::RSEQ_SIG);
-    lin::check_eq(
-        &mut failed,
-        b"a flag word of 1 is EINVAL",
-        r,
-        lin::EINVAL,
-    );
+    lin::check_eq(&mut failed, b"a flag word of 1 is EINVAL", r, lin::EINVAL);
 
     // The signature is recorded and never acted on, so 0 is as good as
     // glibc's.
     let r = lin::rseq(&raw mut RSEQ as *mut lin::Rseq, 32, 0, 0);
-    lin::check_eq(
-        &mut failed,
-        b"a signature of 0 is accepted",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"a signature of 0 is accepted", r, 0);
 
     // Re-registration with the same arguments succeeds: the kernel keeps no
     // registration state that could see the second call as a conflict.

@@ -90,7 +90,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     let mut status: i32 = 0;
     let rc = lin::wait4(pid as usize, &mut status, 0);
-    lin::check_eq(&mut failed, b"the exec'd child is reaped by its pid", rc, pid);
+    lin::check_eq(
+        &mut failed,
+        b"the exec'd child is reaped by its pid",
+        rc,
+        pid,
+    );
     lin::check_eq(
         &mut failed,
         b"execve replaced the child: /bin/true ran and exited 0",

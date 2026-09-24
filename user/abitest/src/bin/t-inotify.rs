@@ -148,12 +148,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     let _ = drain();
 
-    let target = lin::openat(
-        lin::AT_FDCWD,
-        b"/tmp/ino-dir/plain\0",
-        lin::O_RDWR,
-        0,
-    ) as i32;
+    let target = lin::openat(lin::AT_FDCWD, b"/tmp/ino-dir/plain\0", lin::O_RDWR, 0) as i32;
     lin::check_true(&mut failed, b"the watched file opened", target >= 0);
     let _ = lin::write(target, b"hello");
     lin::close(target);
@@ -232,11 +227,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // The rename pair across two watched directories, joined by cookie.
     let wd_to = lin::inotify_add_watch(fd, b"/tmp/ino-to\0", lin::IN_MOVED_TO);
-    lin::check_true(
-        &mut failed,
-        b"a second watch gets a fresh wd",
-        wd_to > wd,
-    );
+    lin::check_true(&mut failed, b"a second watch gets a fresh wd", wd_to > wd);
     let src = lin::openat(
         lin::AT_FDCWD,
         b"/tmp/ino-dir/traveler\0",

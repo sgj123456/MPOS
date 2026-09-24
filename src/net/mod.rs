@@ -29,13 +29,15 @@
 pub mod rtnl;
 pub mod socket;
 pub mod unix;
+pub mod vsock;
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use critical_section::Mutex;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config, Interface, Route, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::raw as raw_sock;
 use smoltcp::socket::tcp;
@@ -186,12 +188,38 @@ pub(crate) struct Stack {
     /// again if it is still false, which is the same licence `poll(2)` gives
     /// itself, and one list is less state to keep consistent.
     waiters: Vec<crate::sched::policy::TaskId>,
+    /// Whether eth0 is administratively up - the `ip link set` bit. Down, the
+    /// interface stops being polled, which is what makes a downed link read
+    /// as a downed link: frames are neither sent nor received, and a `ping`
+    /// through it goes unanswered rather than failing in some other way.
+    eth_up: bool,
+    /// The loopback's flag - a session-level courtesy that mirrors what the
+    /// stack itself already answers (the 127.0.0.1 traffic never touches the
+    /// wire), so `ip link show` reports the bit a setter wrote.
+    lo_up: bool,
+    /// eth0's name, settable by `ip link set eth0 name X` - what the link
+    /// dump reports and what the address labels are derived from.
+    eth_name: String,
 }
+
+/// The MTU `ip link set` writes, clamped to the floor the interface hardware
+/// accepts. (IPv4's minimum, 68, is the floor; anything a setter says above
+/// that the frame path will happily carry, since the driver allocates
+/// per-frame.)
+pub(crate) const MTU_FLOOR: usize = 68;
+/// The MTU ceiling: an IPv4 datagram cannot name a length past 65535, and a
+/// link that claims more only lies to whoever reads it back.
+pub(crate) const MTU_CEIL: usize = 65536;
 
 impl Stack {
     /// Advance the interface once: drain received frames into smoltcp, hand
     /// it queued segments to transmit, let its timers retransmit and answer.
+    /// A link administratively down does not advance - the whole point of
+    /// `ip link set eth0 down` is that the machine stops talking.
     fn poll_once(&mut self) {
+        if !self.eth_up {
+            return;
+        }
         let now = now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
     }
@@ -509,6 +537,257 @@ pub fn irq_service() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The rtnetlink write side: what `ip addr add` and friends actually change
+// ---------------------------------------------------------------------------
+
+/// One IPv4 address the address dump reports: the address and its prefix
+/// length.
+pub(crate) struct AddrFacts {
+    pub ip: [u8; 4],
+    pub prefix: u8,
+}
+
+/// One route the route dump reports: the destination network, its prefix
+/// length, and the router the prefix leaves by.
+pub(crate) struct RouteFacts {
+    pub dst: [u8; 4],
+    pub dst_len: u8,
+    pub gateway: [u8; 4],
+}
+
+/// Everything a link dump reports about the two interfaces: the loopback's
+/// and eth0's administrative flags, eth0's name, MTU and MAC. `None` means
+/// the stack never came up - no NIC, no links worth the name.
+pub(crate) struct LinkFacts {
+    pub lo_up: bool,
+    pub eth_up: bool,
+    pub eth_name: String,
+    pub mtu: u32,
+    pub mac: [u8; 6],
+}
+
+/// eth0's IPv4 addresses, in the order the interface holds them.
+pub(crate) fn ipv4_addrs() -> Vec<AddrFacts> {
+    with_stack(|st| {
+        st.iface
+            .ip_addrs()
+            .iter()
+            .filter_map(|cidr| match cidr {
+                IpCidr::Ipv4(v4) => Some(AddrFacts {
+                    ip: v4.address().octets(),
+                    prefix: v4.prefix_len(),
+                }),
+                // The stack builds without IPv6, so the enum's other arm
+                // does not exist here; the wildcard would be unreachable.
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The routing table as it stands, one entry per prefix.
+pub(crate) fn routes() -> Vec<RouteFacts> {
+    with_stack(|st| {
+        let mut out = Vec::new();
+        st.iface.routes_mut().update(|storage| {
+            for route in storage.iter() {
+                let (dst, dst_len) = match route.cidr {
+                    IpCidr::Ipv4(v4) => (v4.address().octets(), v4.prefix_len()),
+                    // See `ipv4_addrs` for why the wildcard is gated.
+                    #[allow(unreachable_patterns)]
+                    _ => continue,
+                };
+                let gateway = match route.via_router {
+                    IpAddress::Ipv4(v4) => v4.octets(),
+                    #[allow(unreachable_patterns)]
+                    _ => continue,
+                };
+                out.push(RouteFacts {
+                    dst,
+                    dst_len,
+                    gateway,
+                });
+            }
+        });
+        out
+    })
+    .unwrap_or_default()
+}
+
+/// The whole of what a link dump reports, or `None` with no stack behind it.
+pub(crate) fn link_facts() -> Option<LinkFacts> {
+    with_stack(|st| LinkFacts {
+        lo_up: st.lo_up,
+        eth_up: st.eth_up,
+        eth_name: st.eth_name.clone(),
+        mtu: st.device.mtu as u32,
+        mac: st.device.net.mac(),
+    })
+}
+
+/// eth0's preferred source address - the first IPv4 address the interface
+/// carries, which is what a route dump reports as `RTA_PREFSRC` and what
+/// `fastfetch` reads as the machine's local IP.
+pub(crate) fn primary_ipv4() -> Option<[u8; 4]> {
+    with_stack(|st| st.iface.ipv4_addr().map(|a| a.octets())).flatten()
+}
+
+/// `ip addr add` on eth0: the address the interface does not yet carry. An
+/// exact duplicate is Linux's `EEXIST`; a table with no room left (eight is
+/// the interface's bound) is `ENOBUFS`. No stack at all is `ENODEV` - there
+/// is no device to configure.
+pub(crate) fn add_ipv4_addr(ip: [u8; 4], prefix: u8) -> Result<(), isize> {
+    with_stack(|st| {
+        let cidr = IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
+            prefix,
+        );
+        let mut rc = Ok(());
+        st.iface.update_ip_addrs(|addrs| {
+            if addrs.contains(&cidr) {
+                rc = Err(crate::syscall::err::EEXIST);
+                return;
+            }
+            if addrs.push(cidr).is_err() {
+                rc = Err(crate::syscall::err::ENOBUFS);
+            }
+        });
+        rc
+    })
+    .unwrap_or(Err(crate::syscall::err::ENODEV))
+}
+
+/// `ip addr del`: the local address itself names the entry, whatever prefix
+/// the request carries (Linux matches on the address). Nothing to remove is
+/// `EADDRNOTAVAIL`.
+pub(crate) fn del_ipv4_addr(ip: [u8; 4]) -> Result<(), isize> {
+    with_stack(|st| {
+        let mut rc = Err(crate::syscall::err::EADDRNOTAVAIL);
+        st.iface.update_ip_addrs(|addrs| {
+            let hit = addrs.iter().position(|a| match a {
+                IpCidr::Ipv4(v4) => v4.address().octets() == ip,
+                // See `ipv4_addrs` for why the wildcard is gated.
+                #[allow(unreachable_patterns)]
+                _ => false,
+            });
+            if let Some(pos) = hit {
+                addrs.remove(pos);
+                rc = Ok(());
+            }
+        });
+        rc
+    })
+    .unwrap_or(Err(crate::syscall::err::ENODEV))
+}
+
+/// `ip route add`: a destination prefix and the router it leaves by. The
+/// prefix already routed is `EEXIST` (a `replace` settles its own conflict by
+/// deleting first); a table with no room left (four is its bound) is
+/// `ENOBUFS`.
+pub(crate) fn add_route(dst: [u8; 4], dst_len: u8, gateway: [u8; 4]) -> Result<(), isize> {
+    with_stack(|st| {
+        let cidr = IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::new(dst[0], dst[1], dst[2], dst[3])),
+            dst_len,
+        );
+        let via = IpAddress::Ipv4(Ipv4Address::new(
+            gateway[0], gateway[1], gateway[2], gateway[3],
+        ));
+        let mut rc = Ok(());
+        st.iface.routes_mut().update(|storage| {
+            if storage.iter().any(|r| r.cidr == cidr) {
+                rc = Err(crate::syscall::err::EEXIST);
+                return;
+            }
+            let route = Route {
+                cidr,
+                via_router: via,
+                preferred_until: None,
+                expires_at: None,
+            };
+            if storage.push(route).is_err() {
+                rc = Err(crate::syscall::err::ENOBUFS);
+            }
+        });
+        rc
+    })
+    .unwrap_or(Err(crate::syscall::err::ENODEV))
+}
+
+/// `ip route del`: the destination prefix names the route. No such route is
+/// `ESRCH` - "no such process", Linux's own answer for a route that is not
+/// there to delete.
+pub(crate) fn del_route(dst: [u8; 4], dst_len: u8) -> Result<(), isize> {
+    with_stack(|st| {
+        let want = IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::new(dst[0], dst[1], dst[2], dst[3])),
+            dst_len,
+        );
+        let mut rc = Err(crate::syscall::err::ESRCH);
+        st.iface.routes_mut().update(|storage| {
+            if let Some(pos) = storage.iter().position(|r| r.cidr == want) {
+                storage.remove(pos);
+                rc = Ok(());
+            }
+        });
+        rc
+    })
+    .unwrap_or(Err(crate::syscall::err::ENODEV))
+}
+
+/// `ip link set <dev> up|down`. Index 1 is the loopback, whose flag is
+/// recorded and reported; index 2 is eth0, whose down state the stack
+/// honours. Anything else is `ENODEV`.
+pub(crate) fn set_link_up(index: u32, up: bool) -> Result<(), isize> {
+    with_stack(|st| match index {
+        1 => {
+            st.lo_up = up;
+            Ok(())
+        }
+        2 => {
+            st.eth_up = up;
+            Ok(())
+        }
+        _ => Err(crate::syscall::err::ENODEV),
+    })
+    .unwrap_or(Err(crate::syscall::err::ENODEV))
+}
+
+/// `ip link set eth0 mtu N`. The floor is the smallest an IPv4 datagram can
+/// be; above that the frame path carries whatever a setter names. Out of
+/// range is `EINVAL`.
+pub(crate) fn set_mtu(mtu: u32) -> Result<(), isize> {
+    with_stack(|st| {
+        if (MTU_FLOOR..=MTU_CEIL).contains(&(mtu as usize)) {
+            st.device.mtu = mtu as usize;
+            Ok(())
+        } else {
+            Err(crate::syscall::err::EINVAL)
+        }
+    })
+    .unwrap_or(Err(crate::syscall::err::ENODEV))
+}
+
+/// `ip link set eth0 name X`: one to fifteen bytes, and not the name the
+/// loopback already answers to. The new name is what the dumps report from
+/// then on - the stack itself never looks itself up by name.
+pub(crate) fn set_eth_name(name: &str) -> Result<(), isize> {
+    with_stack(|st| {
+        if name.is_empty() || name.len() > 15 {
+            return Err(crate::syscall::err::EINVAL);
+        }
+        if name == "lo" {
+            return Err(crate::syscall::err::EEXIST);
+        }
+        st.eth_name = String::from(name);
+        Ok(())
+    })
+    .unwrap_or(Err(crate::syscall::err::ENODEV))
+}
+
 /// What a descriptor on this socket could do right now, for `poll(2)`.
 ///
 /// The interface is polled first so the answer reflects frames that arrived
@@ -579,6 +858,7 @@ pub fn init() -> bool {
     let mut device = NicDevice {
         net: dev,
         pending: None,
+        mtu: MTU,
     };
     let mut iface = Interface::new(
         Config::new(HardwareAddress::Ethernet(EthernetAddress(mac))),
@@ -603,6 +883,9 @@ pub fn init() -> bool {
             entries: Vec::new(),
             next_ephemeral: EPHEMERAL_MIN,
             waiters: Vec::new(),
+            eth_up: true,
+            lo_up: true,
+            eth_name: String::from("eth0"),
         });
     });
     true
@@ -665,6 +948,10 @@ struct NicDevice {
     /// frame on a repeat call, since smoltcp may drop the token pair without
     /// reading it (a run with nothing to send, for instance).
     pending: Option<Vec<u8>>,
+    /// The MTU the link reports. Settable through `RTM_SETLINK`; defaults to
+    /// [MTU] at boot. smoltcp reads it via `capabilities()` on every poll, so
+    /// a change applies to the next frame without any state to flush.
+    mtu: usize,
 }
 
 impl Device for NicDevice {
@@ -702,7 +989,7 @@ impl Device for NicDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = MTU;
+        caps.max_transmission_unit = self.mtu;
         // Not a description of the hardware - smoltcp multiplies this by the
         // segment size and clamps every advertised receive window to the
         // result (`iface/packet.rs`, and the comment there calls it "a

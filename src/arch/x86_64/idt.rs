@@ -79,15 +79,21 @@ extern "x86-interrupt" fn timer(_frame: InterruptStackFrame) {
     crate::sched::preempt();
 }
 
-/// The console's input. Every byte the UART has goes through the line
-/// discipline, which echoes it and wakes whoever is reading fd 0.
+/// The console's input and the console's queued output.
 ///
-/// Nothing here may switch tasks. It does not have to: `receive_byte` edits
-/// the line and calls `sched::wake`, which only moves a task between queues,
-/// and the task it wakes runs when this handler returns and the scheduler
-/// next gets a turn - not here, on the interrupt's own stack.
+/// Every byte the UART has goes through the line discipline, which echoes it
+/// and wakes whoever is reading fd 0; and because an echo is output, the same
+/// interrupt is what drains whatever the line discipline queued behind it.
+///
+/// Nothing here may switch tasks. It does not have to: `receive_byte` edits the
+/// line and calls `sched::wake`, which only moves a task between queues, and
+/// the task it wakes runs when this handler returns and the scheduler next gets
+/// a turn - not here, on the interrupt's own stack.
 extern "x86-interrupt" fn serial(_frame: InterruptStackFrame) {
     crate::drivers::serial::drain_into_tty();
+    // After the drain, so what the echoed input queued is carried by this same
+    // visit rather than waiting for the next one.
+    crate::drivers::serial::pump_tx();
     // After the FIFO is empty, so a byte arriving during the drain is not
     // lost behind an EOI that already went out.
     pic::end_of_interrupt(4);

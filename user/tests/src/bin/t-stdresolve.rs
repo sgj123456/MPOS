@@ -24,10 +24,7 @@ fn main() {
                 Ok(mut addrs) => match addrs.next() {
                     Some(addr) => {
                         ok += 1;
-                        println!(
-                            "  {host} -> {addr} in {} ms",
-                            started.elapsed().as_millis()
-                        );
+                        println!("  {host} -> {addr} in {} ms", started.elapsed().as_millis());
                     }
                     None => println!("FAIL: round {round} {host} resolved to nothing"),
                 },

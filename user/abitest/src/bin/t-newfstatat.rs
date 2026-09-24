@@ -93,10 +93,19 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // A path relative to a directory descriptor.
     let binfd = lin::openat(lin::AT_FDCWD, &BIN, lin::O_RDONLY, 0);
-    lin::check_true(&mut failed, b"/bin opens for a dirfd-relative stat", binfd >= 0);
+    lin::check_true(
+        &mut failed,
+        b"/bin opens for a dirfd-relative stat",
+        binfd >= 0,
+    );
     if binfd >= 0 {
         let r = lin::newfstatat(binfd as i32, &SH, st, 0);
-        lin::check_eq(&mut failed, b"newfstatat relative to a dirfd succeeds", r, 0);
+        lin::check_eq(
+            &mut failed,
+            b"newfstatat relative to a dirfd succeeds",
+            r,
+            0,
+        );
         unsafe {
             lin::check_true(
                 &mut failed,

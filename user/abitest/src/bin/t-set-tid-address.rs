@@ -27,11 +27,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let tid = lin::set_tid_address(&raw mut SLOT);
-    lin::check_true(
-        &mut failed,
-        b"set_tid_address returns a live tid",
-        tid > 0,
-    );
+    lin::check_true(&mut failed, b"set_tid_address returns a live tid", tid > 0);
     lin::check_true(
         &mut failed,
         b"the tid is the process's own id",

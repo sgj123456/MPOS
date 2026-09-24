@@ -256,10 +256,20 @@ const TEST_INIT: &str = r#"#!/bin/sh
 
 # The socket tests talk to QEMU's user-network stack, which only answers at
 # its fixed addresses once the interface is up and carries the address slirp
-# expects of the guest.
-/bin/busybox ip link set eth0 up
-/bin/busybox ip addr add 10.0.2.15/24 dev eth0
-/bin/busybox ip route add default via 10.0.2.2
+# expects of the guest. The kernel brings eth0 up with that address and route
+# already; the commands run for the boot that does not have them, and
+# `|| true` keeps one that does from failing on the "File exists" the
+# netlink write side now honestly answers.
+/bin/busybox ip link set eth0 up || true
+/bin/busybox ip addr add 10.0.2.15/24 dev eth0 || true
+/bin/busybox ip route add default via 10.0.2.2 || true
+
+# musl's resolver asks 127.0.0.1 when /etc/resolv.conf is absent - a socket
+# nothing in this machine answers, so every lookup ends `Try again` and
+# t-stdresolve fails 0/20. The address QEMU's user-mode network *does*
+# answer is 10.0.2.3, which forwards to the host's own resolver; the test
+# boot has no rootfs to carry the file, so it is written here.
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
 
 pass=0
 fail=0
@@ -323,7 +333,11 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     let log_path = log.display().to_string();
     // The same command line `run` boots with, from `[qemu]` in rootfs.toml -
     // except that the disk is this run's ESP and the serial line goes to a
-    // file, because a test reads its verdict back out of it.
+    // file, because a test reads its verdict back out of it. The share and
+    // the console socket live under the build directory the same way, made
+    // here so the devices that want them never start without.
+    let share = build_dir.join("9p-share");
+    fs::create_dir_all(&share)?;
     let config = crate::config::QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
     let args = qemu::machine_args(
         &config,
@@ -331,15 +345,10 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
         &vars,
         qemu::Boot::Esp(esp.clone()),
         qemu::Console::File(log_path.clone()),
+        &share,
     );
-    // `isa-debug-exit` is what turns the guest's `poweroff` into a process
-    // exit: the kernel writes 0x10 to port 0xf4 and QEMU terminates with
-    // status (0x10 << 1) | 1 = 33.
-    let mut args = args;
-    args.extend([
-        "-device".into(),
-        "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
-    ]);
+    // `isa-debug-exit` - the port the kernel writes its verdict to - comes with
+    // every machine `machine_args` builds.
 
     eprintln!("+ qemu-system-x86_64 {}", args.join(" "));
     let mut child = Command::new("qemu-system-x86_64")

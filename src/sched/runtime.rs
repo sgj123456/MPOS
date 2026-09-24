@@ -4249,6 +4249,15 @@ pub fn current() -> TaskId {
     with_table(|t| t.current)
 }
 
+/// Whether the scheduler has taken the machine over.
+///
+/// The boot code is not a task yet, and there is no queue to put it back on:
+/// a caller that would sleep has to spin instead, which is what the console's
+/// output path asks before it parks on the transmit ring.
+pub fn started() -> bool {
+    STARTED.load(Ordering::Relaxed)
+}
+
 /// The kernel stack the running task is on, as `(base, top)` - the low and
 /// high addresses of the block the frame allocator handed out for it.
 ///

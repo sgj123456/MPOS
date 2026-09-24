@@ -53,8 +53,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::check_true(
             &mut failed,
             b"the mask reports type and size",
-            (*stx).stx_mask & lin::STATX_TYPE != 0
-                && (*stx).stx_mask & lin::STATX_SIZE != 0,
+            (*stx).stx_mask & lin::STATX_TYPE != 0 && (*stx).stx_mask & lin::STATX_SIZE != 0,
         );
         lin::check_true(
             &mut failed,
@@ -97,7 +96,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // An empty path names the descriptor, but only under AT_EMPTY_PATH.
     let fd = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_true(&mut failed, b"the file opens again for the fd form", fd >= 0);
+    lin::check_true(
+        &mut failed,
+        b"the file opens again for the fd form",
+        fd >= 0,
+    );
     if fd >= 0 {
         let r = lin::statx(
             fd as i32,
@@ -106,7 +109,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             lin::STATX_BASIC_STATS,
             stx,
         );
-        lin::check_eq(&mut failed, b"statx by fd with AT_EMPTY_PATH succeeds", r, 0);
+        lin::check_eq(
+            &mut failed,
+            b"statx by fd with AT_EMPTY_PATH succeeds",
+            r,
+            0,
+        );
         unsafe {
             lin::check_true(
                 &mut failed,

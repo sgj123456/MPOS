@@ -63,7 +63,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         -1,
         0,
     );
-    lin::check_eq(&mut failed, b"the PROT_NONE guard page maps at the fixed address", p, GUARD as isize);
+    lin::check_eq(
+        &mut failed,
+        b"the PROT_NONE guard page maps at the fixed address",
+        p,
+        GUARD as isize,
+    );
     let src = unsafe { core::slice::from_raw_parts(GUARD as *const u8, 16) };
     let n = lin::write(1, src);
     lin::check_eq(

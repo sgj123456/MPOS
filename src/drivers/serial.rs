@@ -25,20 +25,57 @@
 //! way out is the tty, which is written through `critical_section` and is
 //! safe to enter from anywhere because interrupts are already off by then.
 //!
+//! The transmit ring below does take a lock, and it is safe for the same
+//! reason read the other way: the borrow covers only the copy into the ring or
+//! out of it, never the wait for the hardware. That distinction is the whole
+//! point of the ring - see [`pump_tx`] and [`tx_submit`].
+//!
 //! The interrupt stays masked until [`enable_rx`] asks for it, so nothing
 //! arrives while the kernel is still finding its feet.
 
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use critical_section::Mutex;
 use uart_16550::spec::registers::{FifoTriggerLevel, LSR};
 use uart_16550::{Config, Uart16550};
 use x86_64::instructions::port::Port;
 
+use crate::sched::policy::TaskId;
+
 /// IER bit 0: raise an interrupt whenever a byte is ready to be read.
 const IER_DATA_READY: u8 = 1 << 0;
+/// IER bit 1: raise an interrupt whenever the transmitter is ready for one
+/// more byte. Enabled only while the ring holds something, so an idle console
+/// does not interrupt forever.
+const IER_TX_READY: u8 = 1 << 1;
+
+/// LSR bit 5: the transmitter holding register is empty.
+const LSR_TX_READY: u8 = 1 << 5;
 
 /// How many bytes one interrupt will move before giving the rest back to the
 /// next one. The FIFO holds 16, so this is never reached with working
 /// hardware; it exists so the handler cannot spin forever if it does.
 const MAX_DRAIN: usize = 64;
+/// The same bound on the way out. The hardware says when it has had enough by
+/// clearing its own status bit, so this only caps the handler against a
+/// transmitter that keeps claiming to be ready.
+const TX_BURST: usize = 256;
+
+/// How many bytes the transmit ring holds. Sized for a screenful of the
+/// heaviest thing the console carries - a `bat`-painted line of colour
+/// sequences - so a printing task parks on the ring rather than on the wire.
+const TX_RING: usize = 16 * 1024;
+
+/// The bytes waiting to go out, and who is waiting for room in them.
+static TX: Mutex<RefCell<VecDeque<u8>>> = Mutex::new(RefCell::new(VecDeque::new()));
+static TX_WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
+/// Whether the ring is what the console writes through. Cleared until
+/// [`enable_tx`], because before the IDT and the PIC exist the only way to
+/// put a byte on the wire is to wait for the hardware right here.
+static TX_IRQ: AtomicBool = AtomicBool::new(false);
 
 /// One UART: the base I/O port, 0x3f8 for COM1.
 #[derive(Clone, Copy)]
@@ -82,6 +119,12 @@ impl Uart {
             .expect("the UART rejected its line config");
     }
 
+    /// Put bytes on the wire by waiting for the hardware to take each one.
+    ///
+    /// The polled path: correct everywhere, cheap only when the host keeps up.
+    /// It is what the console uses before [`enable_tx`] and what it falls back
+    /// to when the caller cannot park - from an interrupt handler, or during
+    /// the panic path.
     fn write(&self, bytes: &[u8]) {
         // A fresh wrapper over the same port, with no init: the UART's registers
         // are the state, and they are already set up.
@@ -95,12 +138,35 @@ impl Uart {
     /// terminal, and until the scripted boot checks are done there is nothing
     /// that should be typing.
     fn enable_rx(&self) {
+        self.ier_set(IER_DATA_READY, true);
+        crate::arch::pic::set_masked(4, false);
+    }
+
+    /// Set or clear one bit of the interrupt enable register.
+    fn ier_set(&self, bit: u8, on: bool) {
         let mut ier = self.ier();
         // SAFETY: the register is a byte. Read first so a bit another path set
         // is not cleared.
         let current = unsafe { ier.read() };
-        unsafe { ier.write(current | IER_DATA_READY) };
-        crate::arch::pic::set_masked(4, false);
+        let next = if on { current | bit } else { current & !bit };
+        unsafe { ier.write(next) };
+    }
+
+    /// Whether the transmitter will take another byte right now.
+    fn tx_ready(&self) -> bool {
+        let mut lsr = self.lsr();
+        // SAFETY: the register belongs to this port. Unlike the receiver's
+        // data register, reading it has no side effect to reason about.
+        let status = unsafe { lsr.read() };
+        status & LSR_TX_READY != 0
+    }
+
+    /// Put one byte in the transmitter holding register. Only ever called
+    /// when [`tx_ready`](Self::tx_ready) said it was empty, so it cannot wait.
+    fn tx_put(&self, byte: u8) {
+        let mut data = self.data();
+        // SAFETY: the register is a byte of the port this module owns.
+        unsafe { data.write(byte) };
     }
 
     /// Every byte the receiver is holding goes to the console's input path -
@@ -163,4 +229,96 @@ pub fn enable_rx() {
 /// COM1's bytes into the console input path.
 pub fn drain_into_tty() {
     COM1.drain();
+}
+
+/// Whether the console may queue its output rather than wait for the wire.
+pub fn interrupt_driven() -> bool {
+    TX_IRQ.load(Ordering::Relaxed)
+}
+
+/// Start queueing: the IDT and the PIC are up, so the transmitter can be told
+/// to interrupt for what the ring holds. Called once, where the receiver is
+/// armed - before that, [`write_bytes`] is the only way a byte gets out.
+pub fn enable_tx() {
+    TX_IRQ.store(true, Ordering::Relaxed);
+}
+
+/// How many bytes the ring has room for.
+pub fn tx_space() -> usize {
+    critical_section::with(|cs| TX_RING - TX.borrow(cs).borrow().len())
+}
+
+/// Queue what fits for the transmitter to send, and ask for the interrupt that
+/// does it. Returns how many bytes were taken; the rest is the caller's to
+/// offer again once room appears.
+///
+/// The critical section covers the copy into the ring only. That is the point
+/// of the whole device: waiting for the hardware to empty its holding register
+/// used to happen with interrupts off, so a host that stopped draining the
+/// serial line stopped the clock, the keyboard and every task with them.
+pub fn tx_submit(bytes: &[u8]) -> usize {
+    let n = critical_section::with(|cs| {
+        let mut ring = TX.borrow(cs).borrow_mut();
+        let n = (TX_RING - ring.len()).min(bytes.len());
+        ring.extend(bytes[..n].iter().copied());
+        n
+    });
+    if n > 0 {
+        COM1.ier_set(IER_TX_READY, true);
+    }
+    n
+}
+
+/// The transmitter's interrupt: hand the ring to the hardware, and tell
+/// whoever was waiting for room that some has appeared.
+///
+/// Bounded by [`TX_BURST`], so a stream the host will not drain costs this
+/// interrupt one burst rather than the rest of the machine's time. The bytes
+/// that did not fit stay queued, and the next interrupt picks them up.
+pub fn pump_tx() {
+    let waiters = critical_section::with(|cs| {
+        let mut moved = 0usize;
+        {
+            let mut ring = TX.borrow(cs).borrow_mut();
+            while moved < TX_BURST && COM1.tx_ready() {
+                let Some(byte) = ring.pop_front() else { break };
+                COM1.tx_put(byte);
+                moved += 1;
+            }
+            if ring.is_empty() {
+                // Nothing left to send: ask no more, or the UART interrupts
+                // forever on an idle line.
+                COM1.ier_set(IER_TX_READY, false);
+            }
+        }
+        if moved > 0 {
+            Some(core::mem::take(&mut *TX_WAITERS.borrow(cs).borrow_mut()))
+        } else {
+            None
+        }
+    });
+    if let Some(waiters) = waiters {
+        for id in waiters {
+            crate::sched::wake(id);
+        }
+    }
+}
+
+/// Add the running task to the ring's wait list, before it parks on room.
+pub fn tx_wait_now() {
+    let me = crate::sched::current();
+    critical_section::with(|cs| {
+        let mut waiters = TX_WAITERS.borrow(cs).borrow_mut();
+        if !waiters.contains(&me) {
+            waiters.push(me);
+        }
+    });
+}
+
+/// Take the running task back off the list - the wait ended however it ended.
+pub fn tx_stop_waiting() {
+    let me = crate::sched::current();
+    critical_section::with(|cs| {
+        TX_WAITERS.borrow(cs).borrow_mut().retain(|w| *w != me);
+    });
 }

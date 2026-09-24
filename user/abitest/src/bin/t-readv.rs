@@ -27,7 +27,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let base = lin::free_fd();
 
     let fd = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the file opens on the lowest free fd", fd, base);
+    lin::check_eq(
+        &mut failed,
+        b"the file opens on the lowest free fd",
+        fd,
+        base,
+    );
 
     let mut iov = [
         lin::Iovec {
@@ -53,7 +58,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let n2 = (t - n1).min(8);
 
     let r = lin::lseek(fd as i32, 0, lin::SEEK_SET);
-    lin::check_eq(&mut failed, b"rewinding for the plain re-read reports 0", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"rewinding for the plain re-read reports 0",
+        r,
+        0,
+    );
     let whole = unsafe { core::slice::from_raw_parts_mut(&raw mut WHOLE as *mut u8, 4096) };
     let n = lin::read(fd as i32, whole);
     lin::check_true(

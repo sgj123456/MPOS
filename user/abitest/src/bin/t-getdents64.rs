@@ -68,7 +68,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let base = lin::free_fd();
 
     let fd = lin::openat(lin::AT_FDCWD, &BIN, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the /bin directory opens on the lowest free fd", fd, base);
+    lin::check_eq(
+        &mut failed,
+        b"the /bin directory opens on the lowest free fd",
+        fd,
+        base,
+    );
 
     let mut types = [0u8; 2];
     let (count, eof) = scan(fd as i32, b"sh", b"cat", &mut types);
@@ -92,7 +97,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     let r = lin::lseek(fd as i32, 0, lin::SEEK_SET);
-    lin::check_eq(&mut failed, b"seeking the directory back to 0 succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"seeking the directory back to 0 succeeds",
+        r,
+        0,
+    );
     let buf = unsafe { core::slice::from_raw_parts_mut(&raw mut DBUF as *mut u8, 4096) };
     let n = lin::getdents64(fd as i32, buf);
     lin::check_true(
@@ -103,7 +113,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let _ = lin::close(fd as i32);
 
     let fd = lin::openat(lin::AT_FDCWD, &ETC, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the /etc directory opens on the lowest free fd", fd, base);
+    lin::check_eq(
+        &mut failed,
+        b"the /etc directory opens on the lowest free fd",
+        fd,
+        base,
+    );
     let mut types = [0u8; 2];
     let (count, eof) = scan(fd as i32, b"motd", b"", &mut types);
     lin::check_true(&mut failed, b"the /etc pass terminates", eof);
@@ -111,16 +126,36 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let _ = lin::close(fd as i32);
 
     let fd = lin::openat(lin::AT_FDCWD, &ROOT, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"the root directory opens on the lowest free fd", fd, base);
+    lin::check_eq(
+        &mut failed,
+        b"the root directory opens on the lowest free fd",
+        fd,
+        base,
+    );
     let mut types = [0u8; 2];
     let (_count, eof) = scan(fd as i32, b"etc", b"bin", &mut types);
     lin::check_true(&mut failed, b"the root pass terminates", eof);
-    lin::check_eq(&mut failed, b"\"etc\" turns up at the root as a DT_DIR entry", types[0] as isize, lin::DT_DIR as isize);
-    lin::check_eq(&mut failed, b"\"bin\" turns up at the root as a DT_DIR entry", types[1] as isize, lin::DT_DIR as isize);
+    lin::check_eq(
+        &mut failed,
+        b"\"etc\" turns up at the root as a DT_DIR entry",
+        types[0] as isize,
+        lin::DT_DIR as isize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"\"bin\" turns up at the root as a DT_DIR entry",
+        types[1] as isize,
+        lin::DT_DIR as isize,
+    );
     let _ = lin::close(fd as i32);
 
     let fd = lin::openat(lin::AT_FDCWD, &BIN, lin::O_RDONLY, 0);
-    lin::check_eq(&mut failed, b"/bin opens again on the lowest free fd", fd, base);
+    lin::check_eq(
+        &mut failed,
+        b"/bin opens again on the lowest free fd",
+        fd,
+        base,
+    );
     let tiny = unsafe { core::slice::from_raw_parts_mut(&raw mut DBUF as *mut u8, 8) };
     let n = lin::getdents64(fd as i32, tiny);
     lin::check_eq(

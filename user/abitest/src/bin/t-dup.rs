@@ -30,11 +30,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // What the lowest free descriptor is, discovered rather than assumed: dup
     // and open must both answer it.
     let d = lin::dup(1);
-    lin::check_true(
-        &mut failed,
-        b"dup(stdout) hands out a free fd",
-        d >= 3,
-    );
+    lin::check_true(&mut failed, b"dup(stdout) hands out a free fd", d >= 3);
     let _ = lin::close(d as i32);
 
     let a = lin::openat(lin::AT_FDCWD, &MOTD, lin::O_RDONLY, 0);
@@ -46,12 +42,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let r = lin::lseek(a as i32, 2, lin::SEEK_SET);
     lin::check_eq(&mut failed, b"lseek through the original reports 2", r, 2);
     let r = lin::lseek(b as i32, 0, lin::SEEK_CUR);
-    lin::check_eq(
-        &mut failed,
-        b"the duplicate shares the file offset",
-        r,
-        2,
-    );
+    lin::check_eq(&mut failed, b"the duplicate shares the file offset", r, 2);
 
     let end = lin::lseek(b as i32, 0, lin::SEEK_END);
     lin::check_true(

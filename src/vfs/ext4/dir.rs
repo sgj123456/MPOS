@@ -62,6 +62,7 @@ impl Core {
     pub(crate) fn dir_add(
         &self,
         dir: &mut InodeData,
+        dir_ino: u32,
         name: &str,
         child: u32,
         ftype: u8,
@@ -71,9 +72,9 @@ impl Core {
             "ext2 names are 1..=255 bytes"
         );
         if dir.flags & INODE_INDEX_FL != 0 {
-            self.dir_add_indexed(dir, name, child, ftype)
+            self.dir_add_indexed(dir, dir_ino, name, child, ftype)
         } else {
-            self.dir_add_linear(dir, name, child, ftype)
+            self.dir_add_linear(dir, dir_ino, name, child, ftype)
         }
     }
 
@@ -82,23 +83,27 @@ impl Core {
     pub(crate) fn dir_add_linear(
         &self,
         dir: &mut InodeData,
+        dir_ino: u32,
         name: &str,
         child: u32,
         ftype: u8,
     ) -> VfsResult<()> {
         let block_size = self.block_size();
+        let limit = self.leaf_limit(block_size);
         let blocks = dir.size / block_size as u64;
         for l in 0..blocks {
             let block = self
                 .bmap_lookup(dir, l)
                 .expect("a directory block was never mapped");
-            if self.update_block(block, |page| dir_try_insert(page, name, child, ftype)) {
+            if self.update_dir_block(block, dir_ino, dir.generation, |page| {
+                dir_try_insert(page, limit, name, child, ftype)
+            }) {
                 return Ok(());
             }
         }
-        let (block, _allocated) = self.bmap_ensure(dir, blocks)?;
-        self.update_block(block, |page| {
-            write_dirent(page, 0, child, page.len(), name, ftype);
+        let (block, _allocated) = self.bmap_ensure(dir, dir_ino, blocks)?;
+        self.update_dir_block(block, dir_ino, dir.generation, |page| {
+            write_dirent(page, 0, child, limit, name, ftype);
             true
         });
         dir.size += block_size as u64;
@@ -117,14 +122,21 @@ impl Core {
     /// walk finds the entry wherever it lives (index blocks hide behind
     /// whole-block fake dirents, and block 0 of an indexed directory holds
     /// only "." and "..").
-    pub(crate) fn dir_remove(&self, dir: &mut InodeData, name: &str) -> VfsResult<u32> {
+    pub(crate) fn dir_remove(
+        &self,
+        dir: &mut InodeData,
+        dir_ino: u32,
+        name: &str,
+    ) -> VfsResult<u32> {
         let block_size = self.block_size();
         for l in 0..dir.size / block_size as u64 {
             let block = self
                 .bmap_lookup(dir, l)
                 .expect("a directory block was never mapped");
             let mut found = None;
-            self.update_block(block, |page| dir_take(page, name, &mut found));
+            self.update_dir_block(block, dir_ino, dir.generation, |page| {
+                dir_take(page, name, &mut found)
+            });
             if let Some(ino) = found {
                 return Ok(ino);
             }
@@ -162,6 +174,7 @@ impl Core {
                 _ => S_IFREG | 0o644,
             },
             flags: if extent { INODE_EXTENTS_FL } else { 0 },
+            generation: 0,
             size: 0,
             dir_acl: 0,
             links: 1,
@@ -179,13 +192,15 @@ impl Core {
             ext_put_root(&mut data, &root);
         }
         if kind == NodeKind::Dir {
-            let (block, allocated) = self.bmap_ensure(&mut data, 0)?;
+            let (block, allocated) = self.bmap_ensure(&mut data, ino, 0)?;
             data.size = block_size as u64;
             if allocated {
                 data.blocks += self.block_units(data.flags);
             }
             data.links = 2;
-            self.update_block(block, |page| dir_init(page, ino, parent));
+            self.update_dir_block(block, ino, 0, |page| {
+                dir_init(page, self.leaf_limit(page.len()), ino, parent)
+            });
         }
         self.write_inode(ino, &data);
         Ok(ino)

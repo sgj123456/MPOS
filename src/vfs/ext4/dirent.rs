@@ -1,6 +1,11 @@
 use super::*;
 
 pub(crate) const DIRENT_HEADER: usize = 8;
+/// What a checksummed leaf block reserves for its trailer: the twelve-byte
+/// fake entry at the block's end, past the last real entry. Every insert and
+/// every last-record-length in such a block runs to the block less this, not
+/// to the block's end.
+pub(crate) const DIR_LEAF_TAIL: usize = 12;
 
 // ---- directory entry encoding, pure over a block image ----
 
@@ -59,17 +64,58 @@ pub(crate) fn write_dirent(
     page[at + 8..at + 8 + name.len()].copy_from_slice(name.as_bytes());
 }
 
+/// Bring a last record that overhangs the trailer's home back to the usable
+/// limit. A volume that grew its checksum trailer the way the format says
+/// already stops there; one that does not - an entry whose record still
+/// claims the trailer's twelve bytes - is repaired by taking the overhang
+/// back, which is exactly what the kernel does when it adds the trailer to
+/// an old block. Returns whether it changed anything.
+pub(crate) fn trim_dir_tail(page: &mut [u8], limit: usize) -> bool {
+    let mut at = 0;
+    let mut changed = false;
+    while at + DIRENT_HEADER <= limit {
+        let rec = le16(page, at + 4) as usize;
+        if rec < DIRENT_HEADER {
+            break;
+        }
+        if at + rec > limit {
+            set16(page, at + 4, (limit - at) as u16);
+            changed = true;
+        }
+        at += rec;
+    }
+    changed
+}
+
 /// Try to fit one more entry into a directory block, returning whether it
 /// went in. Two sources of room: a hole wide enough for the whole entry, or
 /// slack after a live entry wide enough for the entry plus a header's worth
-/// of its own hole.
-pub(crate) fn dir_try_insert(page: &mut [u8], name: &str, child: u32, ftype: u8) -> bool {
+/// of its own hole. `limit` is the end of the usable block - the block's
+/// full length, less the checksum trailer where a volume has one.
+pub(crate) fn dir_try_insert(
+    page: &mut [u8],
+    limit: usize,
+    name: &str,
+    child: u32,
+    ftype: u8,
+) -> bool {
     let needed = dirent_len(name.len());
+    // A block nothing has been written into yet - zero inode, zero record.
+    // Fresh in a way no damaged entry is: every byte empty. It takes the
+    // entry whole, as its first and only record.
+    if le32(page, 0) == 0 && le16(page, 4) == 0 {
+        debug_assert!(
+            page.iter().all(|b| *b == 0),
+            "a fresh leaf block is all zero"
+        );
+        write_dirent(page, 0, child, limit, name, ftype);
+        return true;
+    }
     let mut at = 0;
-    while at < page.len() {
+    while at < limit {
         let rec = le16(page, at + 4) as usize;
         assert!(
-            rec >= DIRENT_HEADER && at + rec <= page.len(),
+            rec >= DIRENT_HEADER && at + rec <= limit,
             "corrupt ext2 directory: entry at {at} claims {rec} bytes"
         );
         let ino = le32(page, at);
@@ -131,14 +177,15 @@ pub(crate) fn dir_take(page: &mut [u8], name: &str, found: &mut Option<u32>) -> 
 }
 
 /// Initialise a fresh directory block with "." and "..", the latter taking
-/// the rest of the block.
-pub(crate) fn dir_init(page: &mut [u8], dir_ino: u32, parent_ino: u32) -> bool {
+/// the rest of the usable block - which on a checksummed volume stops short
+/// of the trailer that follows.
+pub(crate) fn dir_init(page: &mut [u8], limit: usize, dir_ino: u32, parent_ino: u32) -> bool {
     write_dirent(page, 0, dir_ino, dirent_len(1), ".", FT_DIR);
     write_dirent(
         page,
         dirent_len(1),
         parent_ino,
-        page.len() - dirent_len(1),
+        limit - dirent_len(1),
         "..",
         FT_DIR,
     );

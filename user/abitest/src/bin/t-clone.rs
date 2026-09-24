@@ -116,7 +116,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     if pid > 0 {
         let mut status: i32 = 0;
         let rc = lin::wait4(pid as usize, &mut status, 0);
-        lin::check_eq(&mut failed, b"the clone child is reaped by its pid", rc, pid);
+        lin::check_eq(
+            &mut failed,
+            b"the clone child is reaped by its pid",
+            rc,
+            pid,
+        );
         lin::check_eq(
             &mut failed,
             b"the clone child's exit code survives",
@@ -154,7 +159,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     if pid > 0 {
         let mut status: i32 = 0;
         let rc = lin::wait4(pid as usize, &mut status, 0);
-        lin::check_eq(&mut failed, b"the CLONE_CHILD_SETTID child is reaped", rc, pid);
+        lin::check_eq(
+            &mut failed,
+            b"the CLONE_CHILD_SETTID child is reaped",
+            rc,
+            pid,
+        );
         lin::check_eq(
             &mut failed,
             b"the child saw its own tid in the slot it named",
@@ -173,13 +183,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // what a libc's `posix_spawn` builds, and the child's whole job is to exec.
     // This has to work, so it is pinned here from the syscall side; `t-stdspawn`
     // pins the same thing from the std side.
-    let pid = lin::clone(
-        lin::nr::CLONE_VM | lin::nr::CLONE_VFORK,
-        0,
-        null,
-        null,
-        0,
-    );
+    let pid = lin::clone(lin::nr::CLONE_VM | lin::nr::CLONE_VFORK, 0, null, null, 0);
     if pid == 0 {
         let _ = lin::execve(
             TRUE_PROG.as_ptr(),
@@ -197,7 +201,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     if pid > 0 {
         let mut status: i32 = 0;
         let rc = lin::wait4(pid as usize, &mut status, 0);
-        lin::check_eq(&mut failed, b"the spawned child is reaped by its pid", rc, pid);
+        lin::check_eq(
+            &mut failed,
+            b"the spawned child is reaped by its pid",
+            rc,
+            pid,
+        );
         lin::check_eq(
             &mut failed,
             b"the spawned child exec'd and exited 0",

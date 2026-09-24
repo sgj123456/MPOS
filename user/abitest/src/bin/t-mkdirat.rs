@@ -53,12 +53,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // Cleanup: AT_REMOVEDIR takes the directory back.
     let r = lin::unlinkat(lin::AT_FDCWD, &DIR, lin::AT_REMOVEDIR);
-    lin::check_eq(
-        &mut failed,
-        b"unlinkat with AT_REMOVEDIR removes it",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"unlinkat with AT_REMOVEDIR removes it", r, 0);
 
     // A parent that does not exist cannot be created under.
     let r = lin::mkdirat(lin::AT_FDCWD, &MISSING, 0o755);

@@ -384,7 +384,10 @@ pub(crate) struct NetRow {
 /// An IPv4 address as `/proc/net` prints it: the octets packed into a u32 read
 /// little-endian, so `127.0.0.1` is `0100007F`.
 fn net_ip_word(octets: &[u8; 4]) -> u32 {
-    (octets[0] as u32) | (octets[1] as u32) << 8 | (octets[2] as u32) << 16 | (octets[3] as u32) << 24
+    (octets[0] as u32)
+        | (octets[1] as u32) << 8
+        | (octets[2] as u32) << 16
+        | (octets[3] as u32) << 24
 }
 
 /// Render the socket rows in the `/proc/net/tcp` shape.
@@ -852,8 +855,9 @@ fn limits_of_pid(pid: usize) -> Option<String> {
             alloc::format!("{}", v)
         }
     };
-    let mut out =
-        String::from("Limit                     Soft Limit           Hard Limit           Units     \n");
+    let mut out = String::from(
+        "Limit                     Soft Limit           Hard Limit           Units     \n",
+    );
     for (i, (name, unit)) in table.iter().enumerate() {
         let r = rl.get(i)?;
         out.push_str(&alloc::format!(
@@ -915,7 +919,11 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     );
     node.add("statm", NodeKind::File, maybe_file(move || statm_line(pid)));
     #[cfg(target_os = "none")]
-    node.add("limits", NodeKind::File, maybe_file(move || limits_of_pid(pid)));
+    node.add(
+        "limits",
+        NodeKind::File,
+        maybe_file(move || limits_of_pid(pid)),
+    );
     node.add(
         "comm",
         NodeKind::File,
@@ -1510,7 +1518,10 @@ mod tests {
         }];
         let text = format_net(&rows);
         let head = text.lines().next().unwrap();
-        assert!(head.starts_with("  sl  local_address rem_address"), "{head}");
+        assert!(
+            head.starts_with("  sl  local_address rem_address"),
+            "{head}"
+        );
         let row = text.lines().nth(1).unwrap();
         // local 127.0.0.1:8080 = 0100007F:1F90, remote 10.0.2.15:443 = 0F02000A:01BB.
         assert!(row.contains("0100007F:1F90"), "{row}");
@@ -1528,7 +1539,12 @@ mod tests {
     fn the_route_table_names_the_default_interface_and_gateway() {
         let text = format_route_table(&[10, 0, 2, 15], &[10, 0, 2, 2]);
         let mut lines = text.lines();
-        assert!(lines.next().unwrap().starts_with("Iface\tDestination\tGateway"));
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with("Iface\tDestination\tGateway")
+        );
         // Default route: destination 00000000, gateway 10.0.2.2 -> 0202000A.
         let def = lines.next().unwrap();
         assert!(def.starts_with("eth0\t00000000\t0202000A\t0003"), "{def}");

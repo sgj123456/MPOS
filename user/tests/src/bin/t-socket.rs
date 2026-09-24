@@ -93,7 +93,10 @@ fn main() {
             drop(fd);
         }
         Err(err) => {
-            r.check(&format!("socket(AF_UNIX, SOCK_STREAM) opens the path family (got {err})"), false);
+            r.check(
+                &format!("socket(AF_UNIX, SOCK_STREAM) opens the path family (got {err})"),
+                false,
+            );
         }
     }
     let err = socket(AddressFamily::UNIX, SocketType::SEQPACKET, None).unwrap_err();

@@ -70,11 +70,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     unsafe { (stack as *mut u64).write_volatile(PATTERN) };
     let back = unsafe { (stack as *const u64).read_volatile() };
-    lin::check_true(
-        &mut failed,
-        b"the region takes writes",
-        back == PATTERN,
-    );
+    lin::check_true(&mut failed, b"the region takes writes", back == PATTERN);
 
     // The guard page, at the fixed address.
     let guard = lin::mmap(

@@ -34,7 +34,8 @@ fn fresh_ino() -> Ino {
 /// equivalent.
 #[cfg(target_os = "none")]
 fn now() -> u64 {
-    crate::arch::rtc::boot_epoch() + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64
+    crate::arch::rtc::boot_epoch()
+        + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64
 }
 
 #[cfg(not(target_os = "none"))]
@@ -675,11 +676,7 @@ mod tests {
 
         file.set_times(111, 222).unwrap();
         assert_eq!(file.mtime(), 222, "utimensat takes the caller's value");
-        assert_eq!(
-            file.atime(),
-            222,
-            "one clock stands for the read clock too"
-        );
+        assert_eq!(file.atime(), 222, "one clock stands for the read clock too");
 
         // A symlink answers with its creation time; it has no write path.
         let link = root.symlink("l", "/f").unwrap();
@@ -696,15 +693,16 @@ mod tests {
         let sock = root.create("x.sock", NodeKind::Socket).unwrap();
         assert_eq!(sock.metadata().kind, NodeKind::Socket);
         assert_ne!(sock.mtime(), 0, "the bind moment is the node's birthday");
-        assert_eq!(sock.mode(), 0, "no mode was said yet - stat fills the default");
+        assert_eq!(
+            sock.mode(),
+            0,
+            "no mode was said yet - stat fills the default"
+        );
         assert_eq!(
             sock.read_at(0, &mut [0u8; 4]).unwrap_err(),
             VfsError::NotConnected
         );
-        assert_eq!(
-            sock.write_at(0, b"x").unwrap_err(),
-            VfsError::NotConnected
-        );
+        assert_eq!(sock.write_at(0, b"x").unwrap_err(), VfsError::NotConnected);
         // The name lives and dies with the directory like any other.
         root.unlink("x.sock").unwrap();
         assert!(root.lookup("x.sock").is_err());

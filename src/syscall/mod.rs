@@ -72,6 +72,10 @@ pub mod err {
     /// a program has used up its file descriptors.
     pub const EMFILE: isize = -24;
     pub const ENOSPC: isize = -28;
+    /// ENOBUFS: a kernel buffer with a fixed bound is full. rtnetlink's
+    /// answer for an address or route table that cannot take another entry -
+    /// the table sizes are compile-time bounds, not tunables.
+    pub const ENOBUFS: isize = -105;
     /// ESPIPE: a seek on something that has no position - a pipe, a socket, a
     /// terminal. It is `lseek(2)`'s own answer, and a load-bearing one: a
     /// reader that has taken more bytes than it wanted pushes the rest back by

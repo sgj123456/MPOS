@@ -48,7 +48,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     }
 
     // The parent. `pid` is the child's pid, which is what fork promises.
-    lin::check_true(&mut failed, b"fork returns the child's pid to the parent", pid > 0);
+    lin::check_true(
+        &mut failed,
+        b"fork returns the child's pid to the parent",
+        pid > 0,
+    );
 
     let mut status: i32 = 0;
     let rc = lin::wait4(pid as usize, &mut status, 0);

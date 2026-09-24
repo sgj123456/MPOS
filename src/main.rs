@@ -147,7 +147,9 @@ fn kernel_main(info: &BootInfo) {
     // and serial chatter between the real initialisation and init. They run only
     // when the command line carries `mpos.selftest` - which `cargo xtask test`
     // adds and the real rootfs boot does not - so a normal boot pays none of it.
-    let selftest = boot::cmdline().split_whitespace().any(|a| a == "mpos.selftest");
+    let selftest = boot::cmdline()
+        .split_whitespace()
+        .any(|a| a == "mpos.selftest");
 
     init_mm();
     if selftest {
@@ -171,6 +173,7 @@ fn kernel_main(info: &BootInfo) {
 
     init_blk();
     init_net();
+    init_virtio();
 
     mpos::rand::init();
 
@@ -1339,6 +1342,106 @@ fn init_net() {
     }
 }
 
+/// Bring up the rest of the virtio devices: the entropy source, the console
+/// port, the GPU, the input devices, the sound card, the 9p share and the
+/// vsock device. Each is probed, each reports what it found, and none of
+/// them is load-bearing - a machine without one boots without it, which is
+/// what keeps these lines facts rather than gates.
+///
+/// The entropy source goes first, because `rand::init` - the next thing
+/// the boot does - mixes its bytes into the seed it stamps, and a probe
+/// after the seed would be entropy nobody got. The service task goes last,
+/// when everything it polls has been built.
+fn init_virtio() {
+    if mpos::drivers::virtio::rng::init_global().is_some() {
+        println!("virtio-rng: host entropy mixed into the kernel seed");
+    } else {
+        println!("virtio-rng: no device on the bus; the seed stands on RDRAND alone");
+    }
+
+    if let Some(hvc) = mpos::drivers::virtio::console::init_global() {
+        match hvc.size() {
+            Some((columns, rows)) => println!("virtio-console: {columns}x{rows} at /dev/hvc0"),
+            None => println!("virtio-console: up at /dev/hvc0"),
+        }
+    }
+
+    if let Some(gpu) = mpos::drivers::virtio::gpu::init_global() {
+        let (width, height) = gpu.dims();
+        println!(
+            "virtio-gpu: {width}x{height}, {} KiB at /dev/fb0",
+            gpu.fb_len() / 1024
+        );
+    }
+
+    let inputs = mpos::drivers::virtio::input::init();
+    if inputs.is_empty() {
+        println!("virtio-input: no device on the bus");
+    }
+    for (index, (_node, name)) in inputs.iter().enumerate() {
+        println!("virtio-input: event{index}: {name}");
+    }
+
+    if let Some(snd) = mpos::drivers::virtio::sound::init_global() {
+        let (rate, channels) = snd.format();
+        println!("virtio-sound: {rate} Hz, {channels} channels at /dev/dsp");
+    }
+
+    mount_share();
+
+    match mpos::drivers::virtio::vsock::VirtioVsock::init() {
+        Some(dev) => {
+            println!(
+                "virtio-vsock: guest cid {} answers on AF_VSOCK",
+                dev.guest_cid()
+            );
+            mpos::net::vsock::init(dev);
+        }
+        None => println!("virtio-vsock: no device on the bus; AF_VSOCK answers EAFNOSUPPORT"),
+    }
+
+    // One permanent task polls the input devices and the vsock device - the
+    // two whose work arrives whether or not anyone is waiting for it.
+    mpos::drivers::virtio::spawn_service();
+}
+
+/// The host share, mounted by the boot the way the data partition is: the
+/// boot does it because a share with no mountpoint is a device nobody can
+/// reach, and `/mnt/share` is the name. A machine with no share - or one
+/// whose tag the host never exported - skips the step with a line, which is
+/// a quieter boot rather than a failed one.
+fn mount_share() {
+    let Some(dev) = mpos::drivers::virtio::fs9p::devices().into_iter().next() else {
+        println!("virtio-9p: no share on the bus");
+        return;
+    };
+    let tag = dev.mount_tag();
+    let fs = match mpos::vfs::p9::mount(tag) {
+        Ok(fs) => fs,
+        Err(e) => {
+            println!("virtio-9p: \"{tag}\" refused to open: {e:?}");
+            return;
+        }
+    };
+    let root = vfs::resolve("/").expect("no root filesystem");
+    // /mnt exists - `init_blk` made it - and the share hangs under its own
+    // name, made here if the mount is the first thing to want it.
+    let mnt = root.lookup("mnt").expect("the boot made /mnt");
+    if mnt.lookup("share").is_err()
+        && let Err(e) = mnt.create("share", NodeKind::Dir)
+    {
+        println!("virtio-9p: /mnt/share could not be made: {e:?}");
+        return;
+    }
+    // The filesystem is held by `Arc` - its inodes hold it by `Weak`, so a
+    // share that outlives its mount is answered rather than crashed - and
+    // the mount API takes a filesystem by trait: one deref bridges the two.
+    match vfs::mount("/mnt/share", &*fs) {
+        Ok(()) => println!("virtio-9p: \"{tag}\" mounted at /mnt/share"),
+        Err(e) => println!("virtio-9p: \"{tag}\" did not mount: {e:?}"),
+    }
+}
+
 /// M8: a real system start. The checks above are the kernel proving itself;
 /// this is the kernel handing the machine over.
 fn handoff_to_init(info: &BootInfo) {
@@ -1363,6 +1466,10 @@ fn handoff_to_init(info: &BootInfo) {
     // enabled, so no keystroke can arrive with nowhere to go.
     vfs::vcmux::init();
     drivers::serial::enable_rx();
+    // And the other direction: from here the console queues into the transmit
+    // ring and lets the UART's own interrupt drain it, instead of the writer
+    // waiting for the hardware with the clock and the keyboard masked off.
+    drivers::serial::enable_tx();
     // init forks, execve's the shell in the child, and waits. So a child
     // appearing under init is exactly the "the shell is up" signal - and init
     // itself staying alive is what makes that a shell and not a machine with

@@ -26,11 +26,8 @@ static SLEEP_ARG0: [u8; 6] = *b"sleep\0";
 static SLEEP_ARG1: [u8; 2] = *b"2\0";
 static mut TRUE_ARGV: [*const u8; 2] = [TRUE_ARG0.as_ptr(), core::ptr::null()];
 static mut FALSE_ARGV: [*const u8; 2] = [FALSE_ARG0.as_ptr(), core::ptr::null()];
-static mut SLEEP_ARGV: [*const u8; 3] = [
-    SLEEP_ARG0.as_ptr(),
-    SLEEP_ARG1.as_ptr(),
-    core::ptr::null(),
-];
+static mut SLEEP_ARGV: [*const u8; 3] =
+    [SLEEP_ARG0.as_ptr(), SLEEP_ARG1.as_ptr(), core::ptr::null()];
 static mut ENVP: [*const u8; 1] = [core::ptr::null()];
 
 /// Start `prog` as a child and return the child's pid, or a negative errno.
@@ -82,7 +79,10 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // A child that exits non-zero: the code survives the round trip through the
     // status word, which is the part a naive implementation gets wrong.
-    let pid = start(FALSE_PROG.as_ptr(), &raw const FALSE_ARGV as *const *const u8);
+    let pid = start(
+        FALSE_PROG.as_ptr(),
+        &raw const FALSE_ARGV as *const *const u8,
+    );
     lin::check_true(&mut failed, b"a /bin/false child was started", pid > 0);
     if pid > 0 {
         let rc = lin::wait4(pid as usize, &mut status, 0);
@@ -101,7 +101,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         SLEEP_PROG.as_ptr(),
         &raw const SLEEP_ARGV as *const *const u8,
     );
-    lin::check_true(&mut failed, b"a /bin/sleep 2 child was started", sleeper > 0);
+    lin::check_true(
+        &mut failed,
+        b"a /bin/sleep 2 child was started",
+        sleeper > 0,
+    );
     if sleeper > 0 {
         let r = lin::wait4(sleeper as usize, &mut status, lin::WNOHANG);
         lin::check_eq(

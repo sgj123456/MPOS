@@ -63,31 +63,21 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     let empty: u64 = 0;
     let r = lin::rt_sigprocmask(lin::SIG_SETMASK, &empty, core::ptr::null_mut());
-    lin::check_eq(
-        &mut failed,
-        b"restoring an empty mask succeeds",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"restoring an empty mask succeeds", r, 0);
 
     // `how` is a two-value enum (0..=2); anything past it is refused.
     let r = lin::rt_sigprocmask(5, &set, core::ptr::null_mut());
-    lin::check_eq(&mut failed, b"an unknown how of 5 is EINVAL", r, lin::EINVAL);
-
-    // The ABI pins sigsetsize to 8 - the kernel validates the size before
-    // it looks at anything else.
-    let r = rt_sigprocmask_raw(
-        lin::SIG_BLOCK as usize,
-        &set as *const u64 as usize,
-        0,
-        16,
-    );
     lin::check_eq(
         &mut failed,
-        b"a sigsetsize of 16 is EINVAL",
+        b"an unknown how of 5 is EINVAL",
         r,
         lin::EINVAL,
     );
+
+    // The ABI pins sigsetsize to 8 - the kernel validates the size before
+    // it looks at anything else.
+    let r = rt_sigprocmask_raw(lin::SIG_BLOCK as usize, &set as *const u64 as usize, 0, 16);
+    lin::check_eq(&mut failed, b"a sigsetsize of 16 is EINVAL", r, lin::EINVAL);
 
     // A query has to write its answer: the seeded sentinel must be gone,
     // replaced by the empty mask a fresh process owes.
@@ -109,22 +99,13 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // The set is optional: changing nothing through SIG_BLOCK with a null
     // set is a valid, successful call.
     let r = lin::rt_sigprocmask(lin::SIG_BLOCK, core::ptr::null(), core::ptr::null_mut());
-    lin::check_eq(
-        &mut failed,
-        b"SIG_BLOCK with a null set is allowed",
-        r,
-        0,
-    );
+    lin::check_eq(&mut failed, b"SIG_BLOCK with a null set is allowed", r, 0);
 
     // A set pointer that names no mapping is EFAULT, not a crash. Address 1
     // would not do: these binaries are static-PIEs loaded from vaddr 0, so
     // their own first page is readable and the kernel is right to accept it.
     const NOWHERE: usize = 0x0000_0000_5000_0000;
-    let r = lin::rt_sigprocmask(
-        lin::SIG_BLOCK,
-        NOWHERE as *const u64,
-        core::ptr::null_mut(),
-    );
+    let r = lin::rt_sigprocmask(lin::SIG_BLOCK, NOWHERE as *const u64, core::ptr::null_mut());
     lin::check_eq(
         &mut failed,
         b"an unreadable set pointer is EFAULT",

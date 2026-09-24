@@ -73,13 +73,15 @@ fn main() {
     // 3. A redirection, and the file it left behind: `>` is a `File` in the
     //    child's stdout slot.
     let path = "/tmp/stdspawn.txt";
-    let redirected = File::create(path).map_err(|e| e.to_string()).and_then(|file| {
-        Command::new("/bin/echo")
-            .arg("through-a-file")
-            .stdout(Stdio::from(file))
-            .status()
-            .map_err(|e| e.to_string())
-    });
+    let redirected = File::create(path)
+        .map_err(|e| e.to_string())
+        .and_then(|file| {
+            Command::new("/bin/echo")
+                .arg("through-a-file")
+                .stdout(Stdio::from(file))
+                .status()
+                .map_err(|e| e.to_string())
+        });
     match redirected {
         Ok(status) if status.success() => match std::fs::read_to_string(path) {
             Ok(text) if text.trim_end() == "through-a-file" => {
