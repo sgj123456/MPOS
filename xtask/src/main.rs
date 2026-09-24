@@ -35,7 +35,9 @@ struct Cli {
     /// Console mode for `run` (default: `[qemu] console`, or mirror): how the
     /// console is shown - `terminal` (serial only, no window), `gui` (window
     /// only), or `mirror` (window plus a best-effort copy on the serial line).
-    #[arg(long, value_name = "MODE")]
+    /// Global so `cargo xtask run --console gui` accepts it after the subcommand,
+    /// where a plain parent flag would be rejected.
+    #[arg(long, value_name = "MODE", global = true)]
     console: Option<String>,
 
     #[command(subcommand)]
