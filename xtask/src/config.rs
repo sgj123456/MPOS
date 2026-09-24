@@ -10,6 +10,73 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// How `cargo xtask run` puts the console in front of the user. Three shapes,
+/// each agreeing on both the QEMU wiring and the guest boot flag, because a
+/// console that shows in two places at once needs both sides to know the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleMode {
+    /// Serial is the whole console: no window, the GPU never engages, and the
+    /// wire is the *lossless* sink. `mpos.headless` on the guest line, QEMU
+    /// `-display none` with the serial on stdio.
+    Terminal,
+    /// The framebuffer window only: the GPU is the console, and the serial wire
+    /// carries nothing once the console moves over. `mpos.nomirror`, QEMU
+    /// `-display {backend}` with `-serial none`.
+    Gui,
+    /// The window plus a best-effort copy out the serial line, so the same
+    /// console shows in the window and the terminal at once. `mpos.mirror`, QEMU
+    /// `-display {backend}` with the serial on stdio. This is the default.
+    Mirror,
+}
+
+impl ConsoleMode {
+    /// Parse the `[qemu] console` value / `--console` argument. Case- and
+    /// space-insensitive; anything unrecognised is `None` so the caller can
+    /// report it rather than silently booting a different mode.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "terminal" => Some(Self::Terminal),
+            "gui" => Some(Self::Gui),
+            "mirror" => Some(Self::Mirror),
+            _ => None,
+        }
+    }
+
+    /// The word this mode adds to the guest command line. The kernel reads
+    /// `mpos.headless` to keep the console on the wire, `mpos.nomirror` to skip
+    /// the serial mirror after it moves to the framebuffer, and treats the
+    /// absence of both (or `mpos.mirror`) as the mirroring default.
+    pub fn cmdline_flag(self) -> &'static str {
+        match self {
+            Self::Terminal => "mpos.headless",
+            Self::Gui => "mpos.nomirror",
+            Self::Mirror => "mpos.mirror",
+        }
+    }
+
+    /// Whether this mode wants a QEMU window at all. Only terminal does not.
+    pub fn has_window(self) -> bool {
+        !matches!(self, Self::Terminal)
+    }
+
+    /// Whether this mode routes the serial line to the user's terminal (stdio),
+    /// as opposed to leaving it attached to nothing. Gui drops it.
+    pub fn serial_to_stdio(self) -> bool {
+        matches!(self, Self::Terminal | Self::Mirror)
+    }
+
+    /// The lowercase name, used for the `build/console.mode` marker this crate
+    /// keeps of what was last baked into the image, and for the
+    /// `MPOS_XTASK_CONSOLE` hand-off into the privileged build.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Gui => "gui",
+            Self::Mirror => "mirror",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct InitramfsConfig {
     pub mirror: String,
@@ -66,6 +133,10 @@ pub struct QemuConfig {
     /// the serial log - which then goes quiet once the console moves to the
     /// framebuffer. A `test` boot ignores this and always runs headless.
     pub display: Option<String>,
+    /// The standing console shape for `run`, overridable per invocation with
+    /// `--console`. Defaults to [`ConsoleMode::Mirror`] - the window with a
+    /// best-effort serial copy - which is what `run` did before the modes split.
+    pub console: ConsoleMode,
 }
 
 #[derive(Debug)]
@@ -164,7 +235,17 @@ impl QemuConfig {
             extra_args: take_list(values, "extra_args", &[]),
             vsock: take_flag(values, "vsock"),
             audio: take_flag(values, "audio"),
-            display: values.remove("display").filter(|text| !text.trim().is_empty()),
+            display: values
+                .remove("display")
+                .filter(|text| !text.trim().is_empty()),
+            // A name this crate does not recognise is not an error at load -
+            // `test` never boots a window and must not fail on a typo it ignores
+            // - so it falls back to the default here. `run --console` reports an
+            // unknown word directly when it parses the flag.
+            console: values
+                .remove("console")
+                .and_then(|text| ConsoleMode::parse(&text))
+                .unwrap_or(ConsoleMode::Mirror),
         }
     }
 }
@@ -344,6 +425,44 @@ fn parse_package_list(list: String) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_modes_round_trip_and_name_their_boot_flag() {
+        // The words the user types, the flag the kernel reads, and the name the
+        // marker keeps must all line up, because a mode that parses but bakes the
+        // wrong flag boots the console in a mode nobody asked for.
+        for (text, mode, flag) in [
+            ("terminal", ConsoleMode::Terminal, "mpos.headless"),
+            ("gui", ConsoleMode::Gui, "mpos.nomirror"),
+            ("mirror", ConsoleMode::Mirror, "mpos.mirror"),
+        ] {
+            assert_eq!(ConsoleMode::parse(text), Some(mode));
+            // Case- and space-insensitive: the name comes from a config file a
+            // person edits by hand.
+            assert_eq!(
+                ConsoleMode::parse(&format!("  {}  ", text.to_uppercase())),
+                Some(mode)
+            );
+            assert_eq!(mode.cmdline_flag(), flag);
+            assert_eq!(mode.name(), text);
+        }
+        assert_eq!(ConsoleMode::parse("anything-else"), None);
+        // Only terminal drops the window; only gui drops the serial line.
+        assert!(!ConsoleMode::Terminal.has_window());
+        assert!(ConsoleMode::Mirror.has_window() && ConsoleMode::Gui.has_window());
+        assert!(ConsoleMode::Terminal.serial_to_stdio());
+        assert!(ConsoleMode::Mirror.serial_to_stdio());
+        assert!(!ConsoleMode::Gui.serial_to_stdio());
+    }
+
+    #[test]
+    fn an_absent_console_config_defaults_to_mirror() {
+        // The `[qemu]` block may not name `console` at all; the default must be
+        // the pre-split behaviour (window + serial mirror), not an error.
+        let mut values = HashMap::new();
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        assert_eq!(config.console, ConsoleMode::Mirror);
+    }
 
     #[test]
     fn joins_an_array_written_across_lines() {

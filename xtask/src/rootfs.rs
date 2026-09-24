@@ -12,8 +12,22 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::config::{RootfsConfig, UserConfig};
+use crate::config::{ConsoleMode, QemuConfig, RootfsConfig, UserConfig};
 use crate::utils;
+
+/// The console mode to bake into the image: an explicit `MPOS_XTASK_CONSOLE`
+/// (what `cargo xtask run --console X` hands the privileged build) wins over
+/// `[qemu] console` in `rootfs.toml`, which itself defaults to mirror.
+fn effective_console() -> Result<ConsoleMode> {
+    if let Some(text) = std::env::var("MPOS_XTASK_CONSOLE").ok()
+        && let Some(mode) = ConsoleMode::parse(&text)
+    {
+        return Ok(mode);
+    }
+    let root = utils::project_root()?;
+    let qemu = QemuConfig::load(&root.join("rootfs.toml"))?;
+    Ok(qemu.console)
+}
 
 pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     let root = utils::project_root()?;
@@ -34,7 +48,13 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // the rebuild the new archive needs.
     crate::initramfs::ensure(build_dir, profile)?;
 
-    if !needs_rebuild(build_dir, profile)? {
+    // The console mode to bake. It is a boot-file change, not a package change,
+    // so it forces the (fast) boot-file refresh on its own even when nothing
+    // else moved - that is how `cargo xtask run --console X` re-points an
+    // existing image without reinstalling Alpine.
+    let console = effective_console()?;
+
+    if !needs_rebuild(build_dir, profile)? && crate::qemu::baked_console(build_dir) == console {
         println!("rootfs: up to date");
         return Ok(());
     }
@@ -143,7 +163,7 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
         install_base(build_dir, &mount_dir, &config, &root_dev)?;
     }
 
-    install_boot_files(&mount_dir, &config, &kernel, &loader, &initramfs)?;
+    install_boot_files(&mount_dir, &config, &kernel, &loader, &initramfs, console)?;
 
     // The machine's own configuration, then the overlay. Both run on every
     // build path - a change to the hostname or to a file under `rootfs/` should
@@ -164,6 +184,9 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
         utils::rootfs_stamp(build_dir),
         format!("image: {}\n", image.display()),
     )?;
+    // Record the console mode now baked into `mpos.cmdline`, so the next `run`
+    // can tell cheaply whether the image already says what the user asked for.
+    crate::qemu::set_baked_console(build_dir, console)?;
     println!("rootfs: completed");
     Ok(())
 }
@@ -903,6 +926,7 @@ fn install_boot_files(
     kernel: &Path,
     loader: &Path,
     initramfs: &Path,
+    console: crate::config::ConsoleMode,
 ) -> Result<()> {
     fs::create_dir_all(mount_dir.join("boot/EFI/BOOT"))?;
     install_file(loader, &mount_dir.join("boot/EFI/BOOT/BOOTX64.EFI"))?;
@@ -914,9 +938,13 @@ fn install_boot_files(
             // `rootfstype` is for the initramfs's mount, not for the kernel:
             // the loader hands the whole line over, and the kernel ignores
             // what it does not know. Naming it here keeps the init script
-            // from guessing.
-            "root={} rootfstype={} rootflags=rw console={}\n",
-            config.root_device, config.filesystem, config.serial_port
+            // from guessing. The trailing `mpos.*` word is the console mode
+            // `cargo xtask run` put the image in (see `ConsoleMode`).
+            "root={} rootfstype={} rootflags=rw console={} {}\n",
+            config.root_device,
+            config.filesystem,
+            config.serial_port,
+            console.cmdline_flag()
         ),
     )?;
     Ok(())

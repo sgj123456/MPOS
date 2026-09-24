@@ -15,7 +15,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::config::QemuConfig;
+use crate::config::{ConsoleMode, QemuConfig};
 use crate::utils;
 
 /// What the machine boots from, which is the one thing an image run and a user
@@ -29,12 +29,48 @@ pub enum Boot {
     Esp(PathBuf),
 }
 
-/// Where the guest's serial line goes.
+/// Where the guest's serial line and framebuffer go.
 pub enum Console {
-    /// The terminal this command was run from.
-    Stdio,
-    /// A file, which is what a test run reads its verdict out of.
+    /// An interactive `run`, laid out per [`ConsoleMode`]: which of the window
+    /// and the serial terminal actually show the console.
+    Run(ConsoleMode),
+    /// A file, which is what a test run reads its verdict out of. Always
+    /// headless: no window, the whole console on the wire to the log.
     File(String),
+}
+
+/// Where this crate records which [`ConsoleMode`] is baked into the image's
+/// `mpos.cmdline`. The guest learns its console from that file, which lives
+/// inside the disk image; the marker lets `run` decide, without mounting
+/// anything as root, whether the image already says what the user asked for.
+fn console_marker_path(build_dir: &Path) -> PathBuf {
+    build_dir.join("console.mode")
+}
+
+/// The mode last baked into the image. A missing marker - an image built before
+/// the run modes existed - reads as [`ConsoleMode::Mirror`], which is exactly
+/// what such an image boots as (no `mpos.headless`/`nomirror`, mirror on).
+pub fn baked_console(build_dir: &Path) -> ConsoleMode {
+    fs::read_to_string(console_marker_path(build_dir))
+        .ok()
+        .and_then(|text| ConsoleMode::parse(&text))
+        .unwrap_or(ConsoleMode::Mirror)
+}
+
+pub fn set_baked_console(build_dir: &Path, mode: ConsoleMode) -> Result<()> {
+    fs::write(console_marker_path(build_dir), mode.name()).with_context(|| {
+        format!(
+            "Failed to record the console mode in {}",
+            build_dir.display()
+        )
+    })
+}
+
+/// Whether the image's baked console differs from `desired`, so a `run` must
+/// take root to rewrite `mpos.cmdline` before booting. No image means nothing to
+/// switch (the build that makes it will bake `desired` anyway).
+pub fn needs_console_switch(build_dir: &Path, desired: ConsoleMode) -> bool {
+    utils::image_path(build_dir).exists() && baked_console(build_dir) != desired
 }
 
 /// The QEMU command line both `run` and `test` boot with.
@@ -198,17 +234,28 @@ pub fn machine_args(
         // while every other keystroke went through. `signal=off` keeps
         // `Ctrl-C` an ordinary character for the guest's line discipline
         // rather than a request to quit the emulator.
-        Console::Stdio => args.extend([
-            "-display".into(),
-            // A window for the framebuffer console: the shells render there, so
-            // an interactive run needs a real display backend, not `none`. SDL
-            // is the default; `[qemu] display = "gtk"` (or another) overrides.
-            config.display.clone().unwrap_or_else(|| "sdl".to_string()),
-            "-chardev".into(),
-            "stdio,id=stdio0,mux=off,signal=off".into(),
-            "-serial".into(),
-            "chardev:stdio0".into(),
-        ]),
+        Console::Run(mode) => {
+            // The window only when the mode asks for one. A terminal boot
+            // renders nowhere: `-display none`, the whole console on the wire.
+            let display = if mode.has_window() {
+                config.display.clone().unwrap_or_else(|| "sdl".to_string())
+            } else {
+                "none".to_string()
+            };
+            args.extend(["-display".into(), display]);
+            if mode.serial_to_stdio() {
+                args.extend([
+                    "-chardev".into(),
+                    "stdio,id=stdio0,mux=off,signal=off".into(),
+                    "-serial".into(),
+                    "chardev:stdio0".into(),
+                ]);
+            } else {
+                // gui: the console lives in the window alone, so the serial
+                // line is discarded rather than watched in the terminal.
+                args.extend(["-serial".into(), "file:/dev/null".into()]);
+            }
+        }
         Console::File(log) => args.extend([
             "-display".into(),
             "none".into(),
@@ -316,12 +363,15 @@ pub fn run_qemu(
     // The machine's own settings: memory, processors, the name the guest
     // reports, and whatever `extra_args` adds.
     let config = QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
+    // The host wiring follows whatever the image was baked with, so the window,
+    // the serial line and the guest's own console policy always agree.
+    let mode = baked_console(build_dir);
     let args = machine_args(
         &config,
         &ovmf_dir,
         &vars,
         Boot::Image(image.clone()),
-        Console::Stdio,
+        Console::Run(mode),
         &share,
     );
 
@@ -383,6 +433,7 @@ mod tests {
             vsock: false,
             audio: false,
             display: None,
+            console: ConsoleMode::Mirror,
         }
     }
 
@@ -392,7 +443,7 @@ mod tests {
             Path::new("/ovmf"),
             Path::new("/build/OVMF_VARS.4m.fd"),
             boot,
-            Console::Stdio,
+            Console::Run(ConsoleMode::Mirror),
             Path::new("/build/9p-share"),
         )
     }
@@ -495,5 +546,40 @@ mod tests {
             Path::new("/build/9p-share"),
         );
         assert_eq!(after(&file, "-display").as_deref(), Some("none"));
+    }
+
+    fn run_args(config: &QemuConfig, mode: ConsoleMode) -> Vec<String> {
+        machine_args(
+            config,
+            Path::new("/ovmf"),
+            Path::new("/build/OVMF_VARS.4m.fd"),
+            Boot::Image(PathBuf::from("/build/mpos.img")),
+            Console::Run(mode),
+            Path::new("/build/9p-share"),
+        )
+    }
+
+    #[test]
+    fn each_run_mode_wires_the_window_and_the_serial_line_differently() {
+        let cfg = config("1024", 1, &[]);
+
+        // mirror: a window for the framebuffer, and the serial line on stdio so
+        // the terminal shows the same console.
+        let mirror = run_args(&cfg, ConsoleMode::Mirror);
+        assert_eq!(after(&mirror, "-display").as_deref(), Some("sdl"));
+        assert_eq!(after(&mirror, "-serial").as_deref(), Some("chardev:stdio0"));
+
+        // gui: a window, and the serial line discarded rather than watched.
+        let gui = run_args(&cfg, ConsoleMode::Gui);
+        assert_eq!(after(&gui, "-display").as_deref(), Some("sdl"));
+        assert_eq!(after(&gui, "-serial").as_deref(), Some("file:/dev/null"));
+
+        // terminal: no window at all - the console is the serial line, on stdio.
+        let terminal = run_args(&cfg, ConsoleMode::Terminal);
+        assert_eq!(after(&terminal, "-display").as_deref(), Some("none"));
+        assert_eq!(
+            after(&terminal, "-serial").as_deref(),
+            Some("chardev:stdio0")
+        );
     }
 }

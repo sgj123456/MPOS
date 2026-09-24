@@ -32,6 +32,12 @@ struct Cli {
     #[arg(long)]
     profile: Option<String>,
 
+    /// Console mode for `run` (default: `[qemu] console`, or mirror): how the
+    /// console is shown - `terminal` (serial only, no window), `gui` (window
+    /// only), or `mirror` (window plus a best-effort copy on the serial line).
+    #[arg(long, value_name = "MODE")]
+    console: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -98,12 +104,37 @@ fn main() -> Result<()> {
         kernel_built = true;
     }
 
+    // `run --console X` re-points the image at a different console mode. That is
+    // a change to one file inside the image (`mpos.cmdline`), so it takes root
+    // only to refresh the boot files - not to reinstall the root filesystem -
+    // which `build_rootfs` does when the mode it is handed differs from the one
+    // already baked. The desired mode travels to the privileged half through
+    // `MPOS_XTASK_CONSOLE`.
+    let console_mode = match cli.console.as_deref() {
+        Some(text) => Some(config::ConsoleMode::parse(text).ok_or_else(|| {
+            anyhow::anyhow!("unknown console mode {text:?}; expected terminal, gui or mirror")
+        })?),
+        None => None,
+    };
+    if matches!(cli.command, Commands::Run)
+        && let Some(mode) = console_mode
+    {
+        // SAFETY: single-threaded here (cargo has not spawned any of our
+        // threads), and no other code reads the environment concurrently in
+        // this process before we `exec`/`spawn` the privileged half.
+        unsafe { env::set_var("MPOS_XTASK_CONSOLE", mode.name()) };
+    }
+
     // `run` needs root only when the image has to be rebuilt, and it has to be
     // rebuilt whenever the kernel, the loader, the initramfs or the root
-    // filesystem has changed since it was assembled. The boot itself belongs to
-    // the user, not to root.
+    // filesystem has changed since it was assembled - or when `--console` asks
+    // for a mode other than the one the image currently carries. The boot itself
+    // belongs to the user, not to root.
     let mut run_needs_build = match cli.command {
-        Commands::Run => qemu::needs_build(&build_dir, &profile)?,
+        Commands::Run => {
+            qemu::needs_build(&build_dir, &profile)?
+                || console_mode.is_some_and(|mode| qemu::needs_console_switch(&build_dir, mode))
+        }
         _ => false,
     };
 
@@ -257,8 +288,14 @@ fn build_under_sudo(command: Commands, build_dir: &Path, profile: &str) -> Resul
         .arg("MPOS_XTASK_SUDO=1")
         .arg("MPOS_XTASK_ARTEFACTS_READY=1")
         .arg(format!("MPOS_XTASK_UID={}", utils::current_uid()))
-        .arg(format!("MPOS_XTASK_GID={}", utils::current_gid()))
-        .arg(exe)
+        .arg(format!("MPOS_XTASK_GID={}", utils::current_gid()));
+    // Carry a requested console mode across the sudo boundary - before the
+    // program name, as an `env` assignment - so the privileged refresh bakes the
+    // mode the user asked for, not the file default.
+    if let Some(mode) = env::var_os("MPOS_XTASK_CONSOLE") {
+        sudo.arg(format!("MPOS_XTASK_CONSOLE={}", mode.to_string_lossy()));
+    }
+    sudo.arg(exe)
         .arg("--build-dir")
         .arg(build_dir)
         .arg("--profile")
@@ -288,8 +325,11 @@ fn escalate(command: Commands, build_dir: &Path, profile: &str) -> Result<()> {
         .arg("MPOS_XTASK_SUDO=1")
         .arg("MPOS_XTASK_ARTEFACTS_READY=1")
         .arg(format!("MPOS_XTASK_UID={}", utils::current_uid()))
-        .arg(format!("MPOS_XTASK_GID={}", utils::current_gid()))
-        .arg(exe)
+        .arg(format!("MPOS_XTASK_GID={}", utils::current_gid()));
+    if let Some(mode) = env::var_os("MPOS_XTASK_CONSOLE") {
+        sudo.arg(format!("MPOS_XTASK_CONSOLE={}", mode.to_string_lossy()));
+    }
+    sudo.arg(exe)
         .arg("--build-dir")
         .arg(build_dir)
         .arg("--profile")
