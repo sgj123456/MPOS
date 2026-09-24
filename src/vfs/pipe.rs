@@ -30,9 +30,14 @@ use crate::sched::policy::TaskId;
 /// what lets two processes use a pipe as a record channel. POSIX's minimum.
 pub const PIPE_BUF: usize = 4096;
 
-/// How much a pipe buffers before writers block. A multiple of [`PIPE_BUF`],
-/// so a stream of record-sized writes never wedges against itself.
-const CAPACITY: usize = 16 * PIPE_BUF;
+/// How much a pipe buffers before writers block. One page - the smallest a
+/// pipe can be while still holding a whole [`PIPE_BUF`]-sized record, so a
+/// record-sized write is never itself the thing that wedges the pipe. A short
+/// buffer is what makes a pipeline *stream*: the writer runs out of room
+/// quickly and waits on the reader, so a reader that takes a little (`head`,
+/// `grep`) ends the writer's block rather than draining a deep reservoir that
+/// had already swallowed the whole of a fast producer's output.
+const CAPACITY: usize = PIPE_BUF;
 
 struct PipeState {
     data: VecDeque<u8>,
