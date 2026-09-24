@@ -55,6 +55,11 @@ static REQ: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 static WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
 
+/// Whether the task only *presents* (a compositor owns the scanout) rather than
+/// painting the console. Set once by [`spawn`]; the task never takes the console
+/// over and never paints a text grid when this is true.
+static PRESENT_ONLY: AtomicBool = AtomicBool::new(false);
+
 /// A screen changed and needs repainting. Set by whoever feeds a grid, so the
 /// render task wakes on the next keystroke instead of waiting out its beat -
 /// and the task clears it when it repaints.
@@ -79,13 +84,25 @@ pub fn running() -> bool {
 
 /// Hand the device and its buffer view to a new render task. Called once, from
 /// the boot, when a display was found and the machine is not headless.
-pub fn spawn(device: VirtIOGpu<HalImpl, PciTransport>, view: Arc<VirtioGpuDev>) {
+/// `present_only` leaves the scanout to a userspace compositor: the task never
+/// takes the console over and only flushes when `/dev/fb0` work asks.
+pub fn spawn(
+    device: VirtIOGpu<HalImpl, PciTransport>,
+    view: Arc<VirtioGpuDev>,
+    present_only: bool,
+) {
+    PRESENT_ONLY.store(present_only, Ordering::Relaxed);
     critical_section::with(|cs| {
         *DEVICE.borrow(cs).borrow_mut() = Some(device);
         *VIEW.borrow(cs).borrow_mut() = Some(view);
     });
     let id = crate::sched::spawn_permanent(task, crate::sched::Priority::NORMAL);
     RENDER_PID.store(id.0 as u32, Ordering::Relaxed);
+    if present_only {
+        // Nothing drives `notify` in this mode; wake the task once so it
+        // settles into its present loop.
+        notify();
+    }
 }
 
 fn task() {
@@ -109,13 +126,17 @@ fn task() {
 
     // One screen per virtual console, so switching preserves each one's
     // contents - something the single shared wire could never do. Index `n`
-    // is `/dev/ttyN`.
-    for vc in 1..=VC_COUNT as usize {
-        term::make_screen(vc, rows, cols);
+    // is `/dev/ttyN`. Skipped for a compositor boot: the scanout is not the
+    // console's, so no grid is made and the console is never taken over.
+    let present_only = PRESENT_ONLY.load(Ordering::Relaxed);
+    if !present_only {
+        for vc in 1..=VC_COUNT as usize {
+            term::make_screen(vc, rows, cols);
+        }
+        // The screens exist now: replay the boot log onto the console being shown
+        // and move output from the wire to the framebuffer.
+        crate::console::takeover();
     }
-    // The screens exist now: replay the boot log onto the console being shown
-    // and move output from the wire to the framebuffer.
-    crate::console::takeover();
 
     // A scratch copy of one screen's cells, reused every frame, so the pixel
     // blit runs outside the critical section (see the module doc).
@@ -132,9 +153,12 @@ fn task() {
     let mut last_paint = 0u64;
     loop {
         // Wake the moment a screen changes - a keystroke should repaint now,
-        // not on the next beat - but never more than ~31 Hz: sleep out the rest
-        // of the frame interval so a flood coalesces instead of storming flush.
-        crate::sched::block_until(|| DIRTY.load(Ordering::Relaxed));
+        // not on the next beat - or when a compositor writer asks for a
+        // present. Never storming: sleep out the rest of the frame interval.
+        crate::sched::block_until(|| {
+            DIRTY.load(Ordering::Relaxed)
+                || REQ.load(Ordering::Relaxed) > DONE.load(Ordering::Relaxed)
+        });
         DIRTY.store(false, Ordering::Relaxed);
         let now = crate::arch::timer::ticks();
         if now.saturating_sub(last_paint) < FRAME_TICKS {
@@ -142,39 +166,44 @@ fn task() {
         }
         last_paint = crate::arch::timer::ticks();
 
-        // A switch means the whole window must be redrawn: the pixels already in
-        // the buffer belong to the console shown before. Force the new screen
-        // fully dirty so this one frame replaces it entirely.
-        let shown = vcmux::active() as usize;
-        let switched = shown != last_shown;
-        last_shown = shown;
-        if switched {
-            term::with_screen(shown, |g| g.mark_all_dirty());
-        }
-
         // Copy the changed screen's cells under the lock (a fixed memcpy), then
         // paint from the copy with the clock live. The flush is outside both.
-        let frame = term::snapshot(shown, &mut scratch);
-        let painted = match frame {
-            Some(f) if f.dirty != 0 => {
-                let fb = unsafe {
-                    core::slice::from_raw_parts_mut(mm::phys_to_virt(fb_phys) as *mut u8, fb_len)
-                };
-                blit::paint_cells(
-                    &scratch,
-                    f.rows,
-                    f.cols,
-                    f.cursor,
-                    f.cursor_visible,
-                    fb,
-                    fb_w,
-                    fb_h,
-                    (0, 0),
-                    f.dirty,
-                );
-                true
+        // In a compositor boot there is no console grid to paint - the pixels
+        // are the compositor's already in the buffer - so this whole step is
+        // skipped and only the `req > done` present below ever runs.
+        let painted = if present_only {
+            false
+        } else {
+            let shown = vcmux::active() as usize;
+            let switched = shown != last_shown;
+            last_shown = shown;
+            if switched {
+                term::with_screen(shown, |g| g.mark_all_dirty());
             }
-            _ => false,
+            match term::snapshot(shown, &mut scratch) {
+                Some(f) if f.dirty != 0 => {
+                    let fb = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            mm::phys_to_virt(fb_phys) as *mut u8,
+                            fb_len,
+                        )
+                    };
+                    blit::paint_cells(
+                        &scratch,
+                        f.rows,
+                        f.cols,
+                        f.cursor,
+                        f.cursor_visible,
+                        fb,
+                        fb_w,
+                        fb_h,
+                        (0, 0),
+                        f.dirty,
+                    );
+                    true
+                }
+                _ => false,
+            }
         };
 
         let req = REQ.load(Ordering::Relaxed);

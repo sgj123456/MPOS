@@ -42,6 +42,22 @@ pub fn set_headless(on: bool) {
     HEADLESS.store(on, Ordering::Relaxed);
 }
 
+/// `mpos.compositor` on the command line: the GPU is present and `/dev/fb0`
+/// is live, but the framebuffer belongs to a userspace compositor, not to the
+/// kernel console. The render task then only presents frames the compositor
+/// asks for and never paints a text grid onto the scanout, and the console
+/// stays on the serial wire.
+static COMPOSITOR: AtomicBool = AtomicBool::new(false);
+
+pub fn set_compositor(on: bool) {
+    COMPOSITOR.store(on, Ordering::Relaxed);
+}
+
+/// Whether this boot hands the framebuffer to a compositor.
+pub fn compositor() -> bool {
+    COMPOSITOR.load(Ordering::Relaxed)
+}
+
 /// Whether the boot mode *asks* for the serial mirror at all, before the console
 /// reaches the framebuffer. Set from the command line (`mpos.nomirror` clears
 /// it) and read once by [`takeover`] to decide `MIRROR_SERIAL`. Default on, so a

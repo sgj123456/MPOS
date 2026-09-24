@@ -174,6 +174,13 @@ pub fn machine_args(
         "virtio-gpu-pci".into(),
         "-device".into(),
         "virtio-keyboard-pci".into(),
+        // A pointer, so a compositor has somewhere to route the mouse. The
+        // tablet is absolute (a host cursor position maps straight onto it),
+        // which is what a windowed display feeds, so it is the form that
+        // actually moves a weston pointer rather than a relative mouse the
+        // SDL window would have to grab and release.
+        "-device".into(),
+        "virtio-tablet-pci".into(),
         // The console port rides a `virtio-serial` card, and its far end is
         // a host socket a test - or a curious operator - can hold. Until
         // something connects, the port is exactly what it says it is: a

@@ -240,9 +240,19 @@ impl Inode for Memfd {
     /// the mechanism by which two processes mapping one memfd share bytes.
     /// A mapping past the truncated size grows the frame store, so the tail
     /// of a mapping is always real, never a private copy.
+    ///
+    /// `clone_frame_ref` hands the mapping process its *own* reference: the
+    /// frame the inode allocated is owned by the inode (released in `Drop`),
+    /// and every process that maps it must hold a count the process reaper
+    /// will drop when it exits - else that exit frees a frame the inode and
+    /// the other mappers still use. This is what the pinned framebuffer gets
+    /// by being pinned; here the same safety comes from the refcount.
     fn mmap_frame(&self, index: u64) -> Option<usize> {
         let frame = self.ensure_page(index as usize);
-        (frame != 0).then_some(frame)
+        (frame != 0).then(|| {
+            crate::mm::clone_frame_ref(frame);
+            frame
+        })
     }
 
     fn as_memfd(&self) -> Option<&Memfd> {

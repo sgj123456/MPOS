@@ -144,6 +144,41 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         );
     }
 
+    // A pointer device (the tablet) advertises EV_ABS and answers its axis
+    // geometry - the path a relative-only keyboard never exercises, and the
+    // one libinput needs to size a touchscreen or tablet.
+    let mut saw_abs = false;
+    for path in ["/dev/input/event0\0", "/dev/input/event1\0"] {
+        let p = lin::openat(lin::AT_FDCWD, path.as_bytes(), lin::O_RDONLY, 0) as i32;
+        if p < 0 {
+            continue;
+        }
+        let mut abs_bits = [0u8; 32];
+        let _ = eviocgbit(p, 0x03 /* EV_ABS */, &mut abs_bits);
+        if abs_bits.iter().any(|&b| b != 0) {
+            saw_abs = true;
+            // EVIOCGABS(ABS_X): min/max/... of axis 0, in struct input_absinfo.
+            let mut axis = [0i32; 6];
+            let r = lin::ioctl(
+                p,
+                ioc(IOC_READ, 0x40, axis.len() * 4),
+                axis.as_mut_ptr() as usize,
+            );
+            lin::check_eq(&mut failed, b"EVIOCGABS(ABS_X) succeeds", r, 0);
+            lin::check_true(
+                &mut failed,
+                b"the axis carries a real min..max range",
+                axis[2] > axis[1],
+            );
+        }
+        let _ = lin::close(p);
+    }
+    lin::check_true(
+        &mut failed,
+        b"a pointer/tablet device advertises EV_ABS",
+        saw_abs,
+    );
+
     lin::done(failed)
 }
 

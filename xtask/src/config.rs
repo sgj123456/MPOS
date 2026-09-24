@@ -27,6 +27,11 @@ pub enum ConsoleMode {
     /// console shows in the window and the terminal at once. `mpos.mirror`, QEMU
     /// `-display {backend}` with the serial on stdio. This is the default.
     Mirror,
+    /// A rootful Wayland compositor's canvas: the window is there and the GPU is
+    /// present, but the kernel console never takes the framebuffer - `/dev/fb0`
+    /// and the scanout belong to the compositor. `mpos.compositor`, QEMU
+    /// `-display {backend}` with the serial on stdio.
+    Compositor,
 }
 
 impl ConsoleMode {
@@ -38,6 +43,7 @@ impl ConsoleMode {
             "terminal" => Some(Self::Terminal),
             "gui" => Some(Self::Gui),
             "mirror" => Some(Self::Mirror),
+            "compositor" | "weston" => Some(Self::Compositor),
             _ => None,
         }
     }
@@ -51,6 +57,7 @@ impl ConsoleMode {
             Self::Terminal => "mpos.headless",
             Self::Gui => "mpos.nomirror",
             Self::Mirror => "mpos.mirror",
+            Self::Compositor => "mpos.compositor",
         }
     }
 
@@ -62,7 +69,7 @@ impl ConsoleMode {
     /// Whether this mode routes the serial line to the user's terminal (stdio),
     /// as opposed to leaving it attached to nothing. Gui drops it.
     pub fn serial_to_stdio(self) -> bool {
-        matches!(self, Self::Terminal | Self::Mirror)
+        matches!(self, Self::Terminal | Self::Mirror | Self::Compositor)
     }
 
     /// The lowercase name, used for the `build/console.mode` marker this crate
@@ -73,6 +80,7 @@ impl ConsoleMode {
             Self::Terminal => "terminal",
             Self::Gui => "gui",
             Self::Mirror => "mirror",
+            Self::Compositor => "compositor",
         }
     }
 }

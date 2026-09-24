@@ -3446,6 +3446,41 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
+        0x4603 => {
+            // FBIOPAN_DISPLAY: accept a page-flip request. This framebuffer
+            // is a single scanout (`yres_virtual == yres`), so a compositor
+            // does not pan between buffer halves here - it draws through its
+            // `mmap` instead. Answering success rather than `ENOTTY` is what
+            // lets weston's fbdev backend finish its setup against a display
+            // whose type is expected to speak this ioctl.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            if file.inode().as_fb().is_none() {
+                return err::ENOTTY;
+            }
+            // Present the pixels the caller has drawn: ask the render engine to
+            // flush and park until they have left. On a headless boot no
+            // engine runs, so this returns at once and the ioctl is just the
+            // accepted no-op a setup probe expects.
+            crate::drivers::video::render::request_flush_blocking();
+            0
+        }
+        0x4622 => {
+            // FBIO_WAITFORVSYNC: a frame-pacing wait. There is no vertical
+            // blank to hold on, so this answers the wait at once; a
+            // compositor then paces itself. Accepted on a framebuffer so a
+            // client's flip loop is not met with `ENOTTY`.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            if file.inode().as_fb().is_none() {
+                return err::ENOTTY;
+            }
+            0
+        }
         request if (request & 0xc0ff_ffff) == (0x8000_0000 | ((b'E' as u32) << 8) | 0x06) => {
             // EVIOCGNAME: the input device's name for itself - the string
             // the host filled the virtio device's config with, which is how

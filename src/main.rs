@@ -172,6 +172,17 @@ fn kernel_main(info: &BootInfo) {
             .any(|a| a == "mpos.nomirror"),
     );
 
+    // A compositor boot keeps the GPU device and `/dev/fb0` live, but the
+    // kernel console never moves onto the framebuffer - the scanout is left
+    // for a rootful Wayland compositor to draw, and the render task only
+    // presents when that compositor asks (`FBIOPAN_DISPLAY`), never paints a
+    // text grid over it. `cargo xtask run --console compositor` sets it.
+    mpos::console::set_compositor(
+        boot::cmdline()
+            .split_whitespace()
+            .any(|a| a == "mpos.compositor"),
+    );
+
     init_mm();
     if selftest {
         check_mm(info);
@@ -1401,7 +1412,9 @@ fn init_virtio() {
         if mpos::console::headless() {
             drop(device);
         } else {
-            mpos::drivers::video::render::spawn(device, gpu);
+            // A compositor boot keeps the device and the present engine but
+            // tells the render task never to take the console onto the screen.
+            mpos::drivers::video::render::spawn(device, gpu, mpos::console::compositor());
         }
     }
 
