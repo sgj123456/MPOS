@@ -300,6 +300,8 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::SIGNALFD => fs::handle_signalfd(args, 0, from_user),
         nr::SIGNALFD4 => fs::handle_signalfd(args, args[3], from_user),
         nr::EVENTFD => fs::handle_eventfd(args),
+        #[cfg(target_os = "none")]
+        nr::MEMFD_CREATE => fs::handle_memfd_create(args, from_user),
         // --- the POSIX completion set ---
         //
         // The descriptor-backed timer and the interest-list multiplexer:

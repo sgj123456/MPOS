@@ -26,6 +26,8 @@ pub mod ext4;
 pub mod file;
 pub mod inotify;
 pub mod locks;
+#[cfg(target_os = "none")]
+pub mod memfd;
 pub mod mount;
 pub mod p9;
 pub mod path;
@@ -455,6 +457,15 @@ pub trait Inode: Send + Sync {
     /// that arrives holding nothing but a descriptor needs this.
     #[cfg(target_os = "none")]
     fn as_evdev(&self) -> Option<&crate::drivers::virtio::input::EvdevNode> {
+        None
+    }
+
+    /// The `memfd` this node is, if it is one - how `fcntl`'s sealing
+    /// (`F_ADD_SEALS`/`F_GET_SEALS`) reaches the seal state of an anonymous
+    /// shared buffer. Gated with the `memfd` module, which the host has no
+    /// page allocator to build.
+    #[cfg(target_os = "none")]
+    fn as_memfd(&self) -> Option<&crate::vfs::memfd::Memfd> {
         None
     }
 

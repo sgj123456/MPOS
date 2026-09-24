@@ -267,6 +267,13 @@ pub const ECANCELED: isize = -125;
 pub const PROT_NONE: usize = 0;
 pub const PROT_READ: usize = 1;
 pub const PROT_WRITE: usize = 2;
+pub const MAP_SHARED: usize = 0x01;
+/// `memfd_create(2)` flags and the `fcntl` sealing commands.
+pub const MFD_CLOEXEC: usize = 0o001;
+pub const MFD_ALLOW_SEALING: usize = 0o002;
+pub const F_ADD_SEALS: usize = 1033;
+pub const F_GET_SEALS: usize = 1034;
+pub const F_SEAL_SHRINK: usize = 0x02;
 pub const PROT_EXEC: usize = 4;
 
 pub const MAP_PRIVATE: usize = 0x02;
@@ -779,6 +786,12 @@ pub fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: i32, off: us
 
 pub fn munmap(addr: usize, len: usize) -> isize {
     sys2(nr::MUNMAP, addr, len)
+}
+
+/// `memfd_create(name, flags)` — an anonymous shared buffer as a descriptor.
+/// `name` is passed verbatim, so the caller supplies its trailing NUL.
+pub fn memfd_create(name: &[u8], flags: usize) -> isize {
+    raw_sys(319, name.as_ptr() as usize, flags, 0)
 }
 
 pub fn mprotect(addr: usize, len: usize, prot: usize) -> isize {

@@ -347,9 +347,18 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // file, because a test reads its verdict back out of it. The share and
     // the console socket live under the build directory the same way, made
     // here so the devices that want them never start without.
-    let share = build_dir.join("9p-share");
+    // The share and console socket get their own directory, not `run`'s:
+    // `machine_args` binds `console.sock` inside this dir and exports it over
+    // 9p, and a second QEMU (a live `cargo xtask run`) already holds those -
+    // the bind would fail before the guest boots.
+    let share = build_dir.join("test-9p-share");
     fs::create_dir_all(&share)?;
-    let config = crate::config::QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
+    let mut config = crate::config::QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
+    // A test boot never needs the host vsock bus, and claiming `guest-cid=3`
+    // collides with any VM already running on this host (a concurrent
+    // `cargo xtask run`, say) - which would abort QEMU before the guest boots
+    // and report every test as failed. Leave it off here; `run` keeps it.
+    config.vsock = false;
     let args = qemu::machine_args(
         &config,
         &ovmf_dir,

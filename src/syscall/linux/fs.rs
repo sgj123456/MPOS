@@ -1678,6 +1678,35 @@ pub(super) fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
     fd as isize
 }
 
+/// `memfd_create(name, flags)` - an anonymous shared buffer, as a descriptor.
+///
+/// The buffer is a `Memfd` inode that owns its pages, so a `wl_shm` pool can
+/// be built here, mapped, drawn into, and handed to a compositor over
+/// `SCM_RIGHTS` with the mapping still shared. The name is cosmetic (it only
+/// ever reaches `/proc`); a slash in it is `EINVAL`, as Linux's `mfd_validate_name`
+/// answers, and `MFD_CLOEXEC` marks the descriptor close-on-exec like
+/// `open(O_CLOEXEC)`.
+#[cfg(target_os = "none")]
+pub(super) fn handle_memfd_create(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const NAME_MAX: usize = 255;
+    let flags = args[1];
+    let name = match crate::syscall::cstr_arg(args[0], from_user) {
+        Ok(name) => name,
+        Err(e) => return e,
+    };
+    if name.len() >= NAME_MAX || name.as_bytes().contains(&b'/') {
+        return err::EINVAL;
+    }
+    let fd = match crate::vfs::open_inode(crate::vfs::memfd::Memfd::new(next_anon_ino(), flags)) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
+    if flags & crate::vfs::memfd::MFD_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    fd as isize
+}
+
 /// `signalfd(fd, mask, flags)` - signals as a descriptor. The mask is read and
 /// honoured in the one way this kernel has signals to wait for: child exits.
 ///
@@ -1832,6 +1861,28 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
         // would block, and - since there is no wake-on-unlock yet - it records
         // the grant instead of spinning, so a blocking caller never hangs.
         F_GETLK | F_SETLK | F_SETLKW => record_lock(fd, cmd, arg),
+        // memfd sealing: only a memfd has a seal state, and only under
+        // `MFD_ALLOW_SEALING` can it be added to. The commands are the
+        // `F_ADD_SEALS`/`F_GET_SEALS` a wl_shm pool uses to freeze its size.
+        #[cfg(target_os = "none")]
+        crate::vfs::memfd::F_ADD_SEALS => match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) => match file.inode().as_memfd() {
+                Some(m) => match m.add_seals(arg as u32) {
+                    Ok(()) => 0,
+                    Err(e) => err_of(e),
+                },
+                None => err::EINVAL,
+            },
+            Err(e) => err_of(e),
+        },
+        #[cfg(target_os = "none")]
+        crate::vfs::memfd::F_GET_SEALS => match crate::sched::current_fds().clone_at(fd) {
+            Ok(file) => match file.inode().as_memfd() {
+                Some(m) => m.seals() as isize,
+                None => err::EINVAL,
+            },
+            Err(e) => err_of(e),
+        },
         _ => err::EINVAL,
     }
 }
@@ -3429,11 +3480,120 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             n as isize
         }
+        request if (request & 0xff) == b'E' as u32 => evdev_ioctl(fd, request, buf, from_user),
         _ => err::ENOTTY,
     }
 }
 
-/// The interface a `struct ifreq` names: `lo` is 1 and the NIC - under
+/// The evdev (`'E'`-typed) ioctl set libinput reads to classify a device
+/// before it consumes any event. `request` carries the direction in bits
+/// 30-31, the number in 8-15 and the caller's buffer size in 16-29; the
+/// number selects which question this is. Reads answer from the node's
+/// frozen capability picture (`drivers/virtio/input.rs`); the handful of
+/// writes this kernel honors (`EVIOCGRAB`, and the keymap/force-feedback
+/// settings) are accepted rather than refused, since refusing a seat grab
+/// or a repeat-rate write would stop a compositor that only wanted them to
+/// take effect quietly.
+fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
+    let size = ((request >> 16) & 0x3fff) as usize;
+    let dir = (request >> 30) & 0x3;
+    let nr = (request >> 8) & 0xff;
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    let Some(ev) = inode.as_evdev() else {
+        return err::ENOTTY;
+    };
+    use core::mem::size_of;
+    // Copy `src` into the caller's read buffer, no more than it asked for.
+    let give = |src: &[u8]| -> isize {
+        let n = src.len().min(size);
+        if n == 0 {
+            return 0;
+        }
+        if !buffer_ok(buf, n, true, from_user) {
+            return err::EFAULT;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), buf as *mut u8, n);
+        }
+        0
+    };
+    match (dir, nr) {
+        // Reads.
+        (2, 0x01) => give(&1i32.to_ne_bytes()), // EVIOCGVERSION
+        (2, 0x02) => {
+            // EVIOCGID: struct input_id {u16 bustype,vendor,product,version}.
+            let id = ev.id();
+            let mut b = [0u8; 8];
+            for (i, w) in id.iter().enumerate() {
+                b[i * 2..i * 2 + 2].copy_from_slice(&w.to_ne_bytes());
+            }
+            give(&b)
+        }
+        (2, 0x06) => {
+            // EVIOCGNAME: the device's name, NUL-terminated, capped by size.
+            if size == 0 {
+                return err::EINVAL;
+            }
+            if !buffer_ok(buf, size, true, from_user) {
+                return err::EFAULT;
+            }
+            let name = ev.name().as_bytes();
+            let n = name.len().min(size - 1);
+            unsafe {
+                core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
+                (buf as *mut u8).add(n).write_volatile(0);
+            }
+            (n + 1) as isize
+        }
+        (2, 0x09) => give(ev.prop_bits()), // EVIOCGPROP
+        (2, 0x20..=0x3f) => {
+            // EVIOCGBIT(evtype): the supported-type or -code bitmap.
+            let mut tmp = [0u8; 64];
+            let n = ev.eviocgbit((nr - 0x20) as u8, &mut tmp);
+            give(&tmp[..n])
+        }
+        (2, 0x40..=0x7f) => {
+            // EVIOCGABS(axis): struct input_absinfo, six ints.
+            match ev.eviocgabs((nr - 0x40) as u8) {
+                Some(a) => {
+                    let mut b = [0u8; 6 * size_of::<i32>()];
+                    for (i, v) in a.iter().enumerate() {
+                        b[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+                    }
+                    give(&b)
+                }
+                // An axis the device does not have is EINVAL, as Linux's
+                // input_get_absinfo answers.
+                None => err::EINVAL,
+            }
+        }
+        (2, 0x84) => give(&0i32.to_ne_bytes()), // EVIOCGEFFECTS
+        (2, 0x03) | (2, 0x04) | (2, 0x0a) | (2, 0x18) | (2, 0x19) | (2, 0x1a) | (2, 0x1b) => {
+            // EVIOCGREP/KEYCODE/MTSLOTS/KEY/LED/SND/SW: state this kernel does
+            // not track, so a zeroed picture of the asked-for length.
+            give(&[])
+        }
+        // Writes.
+        (1, 0x90) => {
+            // EVIOCGRAB: remember the seat grab; never refused here.
+            if size_of::<i32>() > size || !buffer_ok(buf, size_of::<i32>(), false, from_user) {
+                return err::EINVAL;
+            }
+            let on = unsafe { (buf as *const i32).read_unaligned() } != 0;
+            ev.set_grab(on);
+            0
+        }
+        (1, 0x80) | (1, 0x81) | (1, 0x82) | (1, 0x83) | (1, 0x91) | (1, 0x04) => {
+            // EVIOCSFF/CRMFF, EVIOCREVOKE, EVIOCSREP/KEYCODE: accepted quietly.
+            0
+        }
+        _ => err::ENOTTY,
+    }
+}
 /// whatever name it currently carries - is 2. `None` names no device, which
 /// the interface ioctls answer with `ENODEV`.
 fn ifreq_index(buf: usize) -> Option<u32> {

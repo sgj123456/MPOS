@@ -295,10 +295,25 @@ impl Inode for DevSymlinkNode {
 /// them is a whole filesystem. The ones userland creates hold children, so
 /// the node carries a table and answers lookups, creation, linking and
 /// unlinking for them.
-struct DevDirNode {
+pub(crate) struct DevDirNode {
     ino: u64,
     children: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
     next_ino: Arc<AtomicU64>,
+}
+
+impl DevDirNode {
+    /// Place an already-built inode under this directory. This is how a
+    /// driver that owns its node objects - the evdev devices, each with its
+    /// own read/ioctl face - gets them into `/dev/input/` rather than the
+    /// `/dev` root, which is the path udev and `libinput` look in.
+    pub(crate) fn insert(&self, name: &str, inode: Arc<dyn Inode>) {
+        critical_section::with(|cs| {
+            self.children
+                .borrow(cs)
+                .borrow_mut()
+                .insert(String::from(name), inode);
+        });
+    }
 }
 
 impl Inode for DevDirNode {
@@ -431,9 +446,9 @@ impl DevFs {
     /// expects `/dev` to carry: an init mounting devpts asks for `/dev/pts`
     /// the way it asks for `/proc`, and a devtmpfs that cannot hold the
     /// directory sends it looking for a tmpfs to mount a devpts on.
-    pub fn register_dir(&self, name: &str) {
+    pub(crate) fn register_dir(&self, name: &str) -> Arc<DevDirNode> {
         let ino = self.root.next_ino.fetch_add(1, Ordering::Relaxed);
-        let node: Arc<dyn Inode> = Arc::new(DevDirNode {
+        let node = Arc::new(DevDirNode {
             ino,
             children: Mutex::new(RefCell::new(BTreeMap::new())),
             next_ino: self.root.next_ino.clone(),
@@ -444,9 +459,10 @@ impl DevFs {
                 .inodes
                 .borrow(cs)
                 .borrow_mut()
-                .insert(String::from(name), node);
+                .insert(String::from(name), node.clone() as Arc<dyn Inode>);
             assert!(prev.is_none(), "device {name} registered twice");
         });
+        node
     }
 
     /// Add a symbolic link under `name`.

@@ -265,12 +265,26 @@ pub fn standard_devfs() -> Arc<DevFs> {
         );
     }
     // The input devices, one node each under /dev/input, in bus order:
-    // event0, event1, ... exactly how evdev names them.
+    // event0, event1, ... exactly how evdev names them. udev and libinput
+    // find a device by the pair of its sysfs `dev` number and this node, so
+    // each is also announced with `SUBSYSTEM=input` and DEVNAME pointing at
+    // the /dev/input path it actually lives under.
     let evdevs = crate::drivers::virtio::input::nodes();
     if !evdevs.is_empty() {
-        dev.register_dir("input");
+        let input_dir = dev.register_dir("input");
         for (index, node) in evdevs.iter().enumerate() {
-            dev.register_node(&alloc::format!("event{index}"), node.clone());
+            let name = alloc::format!("event{index}");
+            let major = crate::drivers::virtio::input::INPUT_MAJOR;
+            let minor = crate::drivers::virtio::input::input_minor(index);
+            input_dir.insert(&name, node.clone());
+            crate::uevent::publish(&crate::uevent::Event {
+                action: "add",
+                devpath: alloc::format!("/devices/virtual/input/input{index}"),
+                subsystem: "input",
+                devname: alloc::format!("input/{name}"),
+                major,
+                minor,
+            });
         }
     }
 

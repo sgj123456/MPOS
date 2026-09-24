@@ -244,6 +244,51 @@ impl SysFs {
             next += 1;
         }
 
+        // `/class/input`: the evdev nodes, each carrying the same `dev`
+        // number `/dev/input/eventN` is announced with. This is how udev and
+        // `libinput` enumerate the keyboard and the pointer without scanning
+        // `/dev` by hand - they read this tree, open the node the number
+        // names, then interrogate it through the evdev ioctls. The input
+        // driver only exists on the kernel target, so this half of the tree
+        // is built there alone.
+        #[cfg(target_os = "none")]
+        {
+            let input = class.add_dir("input", next);
+            next += 1;
+            for index in 0..crate::drivers::virtio::input::nodes().len() {
+                let name = alloc::format!("event{index}");
+                let major = crate::drivers::virtio::input::INPUT_MAJOR;
+                let minor = crate::drivers::virtio::input::input_minor(index);
+                let dir = input.add_dir(&name, next);
+                next += 1;
+                let numbers = alloc::format!("{}:{}\n", major, minor);
+                let numbers: &'static str = Box::leak(numbers.into_boxed_str());
+                dir.add(
+                    "dev",
+                    Arc::new(SysFile {
+                        ino: next,
+                        content: numbers,
+                    }),
+                );
+                next += 1;
+                dir.add(
+                    "uevent",
+                    Arc::new(SysEventAttr {
+                        ino: next,
+                        event: Event {
+                            action: "add",
+                            devpath: alloc::format!("/devices/virtual/input/input{index}"),
+                            subsystem: "input",
+                            devname: alloc::format!("input/{}", name),
+                            major,
+                            minor,
+                        },
+                    }),
+                );
+                next += 1;
+            }
+        }
+
         let kernel = fs.root.add_dir("kernel", next);
         next += 1;
         kernel.add(

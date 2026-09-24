@@ -254,6 +254,9 @@ pub const SIGNALFD4: u64 = 289;
 /// `eventfd(2)`: a counter a process can wait on. The number is the
 /// `eventfd2` spelling - the flags-taking form every libc makes.
 pub const EVENTFD: u64 = 290;
+/// `memfd_create(2)`: an anonymous shared buffer, the descriptor a Wayland
+/// `wl_shm` pool is made from.
+pub const MEMFD_CREATE: u64 = 319;
 /// `link(2)` / `linkat(2)`: a second name for an inode.
 pub const LINK: u64 = 86;
 pub const LINKAT: u64 = 265;

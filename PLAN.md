@@ -5,6 +5,73 @@ Missing essential features, prioritized by impact on real-world workload compati
 
 ---
 
+## Progress — TODO Board
+
+One-glance status of the whole roadmap. `[x]` done, `[~]` partial/served with a
+named gap, `[ ]` not started. Each line points at its detail section below.
+Full-ABI gaps still falling through to `ENOSYS` are collected under **ABI**.
+
+Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a prerequisite first
+
+**Core (Phases 1–3)**
+- [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
+- [x] P2 Signal delivery — frame · mask · siginfo (§2)
+- [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3)
+  - [ ] read/write enforce against held locks; flock per-OFD not per-process (§3.2)
+  - [ ] ext4 `atime` bumped on read (§3.3)
+
+**Networking (Phase 4)**
+- [~] 4.1 AF_UNIX `SOCK_STREAM` — bind/listen/connect/accept · data path ·
+      `SCM_RIGHTS` · `SCM_CREDENTIALS` · `SO_PEERCRED` (`t-unix-scm`) done
+  - [ ] `SOCK_DGRAM` datagram transfer (opens today, no transfer)
+  - [ ] per-skb cmsg boundaries on `SOCK_STREAM` (today: one per send)
+- [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
+- [~] 4.3 TCP options — round-trip all; `TCP_NODELAY`/`SO_KEEPALIVE` reach smoltcp
+  - [ ] `SO_REUSEADDR` / `SO_LINGER` / buffer sizes still record-only (§4.3)
+- [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
+
+**Memory (Phase 5)**
+- [~] 5.1 Shared anon `mmap` — served; aliased frames don't cross a plain `fork`
+- [~] 5.2 `madvise` — validated; `MADV_DONTNEED` no-op *(blocked: anon demand paging)*
+- [x] 5.3 `process_vm_readv`/`writev` (§5.3)
+
+**Process (Phase 6)**
+- [x] 6.1 ptrace (§6.1) · [x] 6.2 real rlimits incl. NOFILE/STACK (§6.2) · [x] 6.4 identity/cap calls (§6.4)
+- [ ] 6.3 Namespaces — `unshare`/`setns` return `EOPNOTSUPP` (no isolation) (§6.3)
+
+**ABI gaps → `ENOSYS` (remaining)**
+- [x] inotify · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
+- [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
+- [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
+- [ ] real-time signals 32..=64 (needs 64-bit pending masks throughout) (§2.3)
+- [ ] `io_uring_setup`/`enter`/`register` — deferred by design (§1.3)
+
+**Drivers (Phase 7 — not started)**
+- [ ] 7.1 virtio-gpu · [ ] 7.2 virtio-input · [ ] 7.3 AHCI/SATA (stretch)
+
+**Security (Phase 8)**
+- [ ] 8.1 ASLR (mmap/stack/load-address randomization)
+- [~] 8.2 seccomp — `STRICT` done; `FILTER` *(blocked: BPF runner)*
+- [x] 8.3 user stack canary (`AT_RANDOM`) (§8.3)
+
+**Performance (Phase 10)**
+- [x] 10.1 Network latency — event-driven waits + virtio-net MSI-X (`ping` 7.5→0.3 ms)
+- [ ] 10.2 Context-switch/fork cost — PCID · lazy FPU · one TLB flush/fork · smaller stacks
+- [ ] 10.3 Syscall path — itimer-armed flag · fault-driven user-buffer copy
+- [ ] 10.4 Pipes + per-frame allocations · [ ] 10.5 ext4/virtio-blk read path
+- [ ] 10.6 Serial TX ring · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
+
+**Architectures (Phase 9 — far future)**
+- [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
+
+### Suggested next moves (highest impact, tractable)
+1. **P10.2 / P10.3 performance** — biggest interactive-latency/throughput wins, marked High.
+2. **4.1 `SOCK_DGRAM` transfer** — completes the AF_UNIX family for dbus/systemd paths.
+3. **5.1/5.2 anonymous demand paging** — unblocks true shared `fork` frames *and* real `MADV_DONTNEED`.
+4. **4.3 remaining socket options** — small, self-contained.
+
+---
+
 ## Current Status
 
 - **~229 Linux x86_64 syscalls** implemented

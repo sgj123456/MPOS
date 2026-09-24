@@ -29,9 +29,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use critical_section::Mutex;
-use virtio_drivers::device::input::VirtIOInput;
+use virtio_drivers::device::input::{AbsInfo, VirtIOInput};
 use virtio_drivers::transport::pci::PciTransport;
 
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
@@ -60,10 +61,107 @@ struct Dev {
     device: Mutex<RefCell<VirtIOInput<HalImpl, PciTransport>>>,
 }
 
+/// The device kinds the evdev ABI names by number, as far as the capability
+/// bitmap is walked. `EV_KEY`..`EV_FF_STATUS` sit in the low byte; 32 slots
+/// cover every type a virtio-input device may advertise.
+const EV_SYN: u8 = 0x00;
+const EV_ABS: u8 = 0x03;
+/// The highest event code EVIOCGABS is asked for - the ABS_MT_* range reaches
+/// this far on modern multi-touch devices.
+const ABS_MAX: u8 = 0x3f;
+
+/// The capability picture of one input device, read from the virtio config
+/// once at init and then frozen: which event types the device answers, the
+/// bitmap of codes within each type, the geometry of each absolute axis, the
+/// device's identity and its property bits. `libinput` reads all of this -
+/// mostly through `EVIOCGBIT` - to decide what a device *is* before it ever
+/// reads an event, so it must be here without any event having arrived yet.
+pub struct EvdevCaps {
+    /// `EVIOCGBIT(EV_SYN)`: a bitmap with bit *t* set when event type *t* is
+    /// supported. Four bytes covers types 0..=31.
+    type_bits: [u8; 4],
+    /// `EVIOCGBIT(t)`: the supported-code bitmap for each event type, indexed
+    /// by type; empty when the type is absent.
+    code_bits: [Vec<u8>; 0x20],
+    /// `EVIOCGABS(axis)`: the geometry of each advertised absolute axis.
+    abs: Vec<(u8, AbsInfo)>,
+    /// `EVIOCGPROP`: the `INPUT_PROP_*` bitmap.
+    prop_bits: Vec<u8>,
+    /// `EVIOCGID`: bus / vendor / product / version.
+    id: [u16; 4],
+}
+
+impl Default for EvdevCaps {
+    fn default() -> Self {
+        EvdevCaps {
+            type_bits: [0; 4],
+            code_bits: core::array::from_fn(|_| Vec::new()),
+            abs: Vec::new(),
+            prop_bits: Vec::new(),
+            id: [0; 4],
+        }
+    }
+}
+
+/// Query the device's whole capability picture. Every `ev_bits`/`abs_info`
+/// call walks the virtio config space; a device that does not answer one is
+/// simply missing that entry, which is the honest, conservative picture.
+fn read_caps(device: &mut VirtIOInput<HalImpl, PciTransport>) -> EvdevCaps {
+    let mut caps = EvdevCaps::default();
+    for t in 0..0x20u8 {
+        if let Ok(bits) = device.ev_bits(t)
+            && !bits.is_empty()
+        {
+            caps.code_bits[t as usize] = bits.into_vec();
+            caps.type_bits[(t / 8) as usize] |= 1 << (t % 8);
+        }
+    }
+    // Every real input device frames its events with EV_SYN, whether or not
+    // the config space lists it explicitly.
+    caps.type_bits[0] |= 1 << EV_SYN;
+    // Walk the EV_ABS code bitmap and ask for the geometry of each axis.
+    let abs_map = caps.code_bits[EV_ABS as usize].clone();
+    for code in 0..abs_map.len() * 8 {
+        if code > ABS_MAX as usize {
+            break;
+        }
+        if abs_map[code / 8] & (1u8 << (code % 8)) == 0 {
+            continue;
+        }
+        if let Ok(info) = device.abs_info(code as u8) {
+            caps.abs.push((code as u8, info));
+        }
+    }
+    if let Ok(prop) = device.prop_bits() {
+        caps.prop_bits = prop.into_vec();
+    }
+    if let Ok(ids) = device.ids() {
+        caps.id = [ids.bustype, ids.vendor, ids.product, ids.version];
+    }
+    caps
+}
+
+/// The evdev major number - `INPUT_MAJOR` in the kernel's own headers. Every
+/// `/dev/input/eventN` node carries it, and `libinput`/udev match on it.
+pub const INPUT_MAJOR: u32 = 13;
+/// The minor a node at bus index `i` reports: evdev numbers its `eventN`
+/// from 64, one per device, in the order the bus answered them.
+pub fn input_minor(index: usize) -> u32 {
+    64 + index as u32
+}
+
 /// The node under `/dev/input`: a name, and a queue of encoded records.
 pub struct EvdevNode {
     name: String,
+    /// The inode number this node reports in `stat`. A distinct one per
+    /// device, so `readdir`/`ls -i` never present two events as one file.
+    ino: u64,
     queue: Mutex<RefCell<VecDeque<[u8; RECORD]>>>,
+    caps: EvdevCaps,
+    /// Whether some process currently holds `EVIOCGRAB` on this device. This
+    /// kernel has a single seat, so a grab is remembered but never refused;
+    /// Linux's contention `EBUSY` needs per-owner arbitration this lacks.
+    grab: AtomicBool,
 }
 
 impl EvdevNode {
@@ -72,6 +170,69 @@ impl EvdevNode {
     /// evdev reader tells a keyboard from a tablet without reading events.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The evdev ABI version, always `1`.
+    pub fn version(&self) -> i32 {
+        1
+    }
+
+    /// `EVIOCGID`: bus / vendor / product / version, in the struct's order.
+    pub fn id(&self) -> [u16; 4] {
+        self.caps.id
+    }
+
+    /// `EVIOCGBIT(evtype, len)`: the supported-event-type bitmap when
+    /// `evtype` is `EV_SYN`, otherwise the supported-code bitmap for that
+    /// type. Copies up to `out.len()` bytes and reports how many it wrote.
+    pub fn eviocgbit(&self, evtype: u8, out: &mut [u8]) -> usize {
+        let src: &[u8] = if evtype == EV_SYN {
+            &self.caps.type_bits
+        } else {
+            self.caps
+                .code_bits
+                .get(evtype as usize)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+        };
+        let n = src.len().min(out.len());
+        out[..n].copy_from_slice(&src[..n]);
+        n
+    }
+
+    /// `EVIOCGABS(axis)`: the axis geometry as the six `int`s of
+    /// `struct input_absinfo` - `value, min, max, fuzz, flat, resolution`
+    /// (`value` is the last-seen position, which this kernel does not track).
+    pub fn eviocgabs(&self, axis: u8) -> Option<[i32; 6]> {
+        self.caps
+            .abs
+            .iter()
+            .find(|(code, _)| *code == axis)
+            .map(|(_, info)| {
+                [
+                    0i32,
+                    info.min as i32,
+                    info.max as i32,
+                    info.fuzz as i32,
+                    info.flat as i32,
+                    info.res as i32,
+                ]
+            })
+    }
+
+    /// `EVIOCGPROP`: the `INPUT_PROP_*` bitmap.
+    pub fn prop_bits(&self) -> &[u8] {
+        &self.caps.prop_bits
+    }
+
+    /// `EVIOCGRAB`: whether the device is grabbed, and the act of grabbing or
+    /// releasing it.
+    pub fn is_grabbed(&self) -> bool {
+        self.grab.load(Ordering::Relaxed)
+    }
+
+    pub fn set_grab(&self, on: bool) {
+        self.grab.store(on, Ordering::Relaxed);
     }
 
     /// Encode and queue one event, stamped with the kernel's clock.
@@ -131,7 +292,7 @@ impl EvdevNode {
 impl Inode for EvdevNode {
     fn metadata(&self) -> Metadata {
         Metadata {
-            ino: 0x9000,
+            ino: self.ino,
             kind: NodeKind::CharDev,
             size: 0,
         }
@@ -190,9 +351,16 @@ pub fn init() -> Vec<(Arc<EvdevNode>, String)> {
         let name = device
             .name()
             .unwrap_or_else(|_| String::from("virtio_input"));
+        // Read the whole capability picture before the device is parked
+        // behind the service table - libinput asks for it at open time.
+        let caps = read_caps(&mut device);
+        let ino = 0x9000 + nodes.len() as u64;
         let node = Arc::new(EvdevNode {
             name: name.clone(),
+            ino,
             queue: Mutex::new(RefCell::new(VecDeque::new())),
+            caps,
+            grab: AtomicBool::new(false),
         });
         devices.push((
             Arc::new(Dev {
