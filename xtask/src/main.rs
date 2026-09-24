@@ -159,7 +159,9 @@ fn main() -> Result<()> {
             // Build in a child, and wait: this process still has to boot the
             // result, and a process that replaced itself with the build never
             // could - which is why `run` used to end by asking to be run again.
-            build_under_sudo(cli.command, &build_dir, &profile)?;
+            // The child is handed the same `--console` so it recomputes the same
+            // console-switch decision (and bakes it) rather than booting.
+            build_under_sudo(cli.command, console_mode, &build_dir, &profile)?;
             if qemu::needs_build(&build_dir, &profile)? {
                 anyhow::bail!(
                     "The image is still out of date after building it; the output above says why."
@@ -167,9 +169,14 @@ fn main() -> Result<()> {
             }
             run_needs_build = false;
         } else {
-            escalate(cli.command, &build_dir, &profile)?;
+            escalate(cli.command, console_mode, &build_dir, &profile)?;
         }
     }
+
+    // The host wiring follows the mode the user asked for (or, with no
+    // `--console`, the mode the image is already baked in), so the window and
+    // the serial line always match the guest's own console policy.
+    let boot_console = console_mode.unwrap_or_else(|| qemu::baked_console(&build_dir));
 
     let result = dispatch(
         cli.command,
@@ -177,6 +184,7 @@ fn main() -> Result<()> {
         &profile,
         artefacts_ready,
         run_needs_build,
+        boot_console,
     );
 
     // Root wrote into the build directory. Hand the tree back to the user who
@@ -242,6 +250,7 @@ fn dispatch(
     profile: &str,
     artefacts_ready: bool,
     run_needs_build: bool,
+    console: config::ConsoleMode,
 ) -> Result<()> {
     match command {
         Commands::Build => utils::build_kernel(profile),
@@ -262,7 +271,13 @@ fn dispatch(
             disk::ensure(build_dir, profile)?;
             rootfs::ensure(build_dir, profile)
         }
-        Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build),
+        Commands::Run => qemu::run_qemu(
+            build_dir,
+            profile,
+            artefacts_ready,
+            run_needs_build,
+            console,
+        ),
         Commands::Test => selftest::run_tests(build_dir, profile),
         Commands::Clean => utils::clean(build_dir),
     }
@@ -277,7 +292,12 @@ fn dispatch(
 /// The child is told to skip the cargo build: this process already did that as
 /// the user, and doing it again as root is what used to make root the owner of
 /// `target/`.
-fn build_under_sudo(command: Commands, build_dir: &Path, profile: &str) -> Result<()> {
+fn build_under_sudo(
+    command: Commands,
+    console: Option<config::ConsoleMode>,
+    build_dir: &Path,
+    profile: &str,
+) -> Result<()> {
     let exe = env::current_exe().context("Failed to find the xtask executable")?;
     let home = env::var("HOME").unwrap_or_default();
     let path = env::var("PATH").unwrap_or_default();
@@ -291,9 +311,10 @@ fn build_under_sudo(command: Commands, build_dir: &Path, profile: &str) -> Resul
         .arg("MPOS_XTASK_ARTEFACTS_READY=1")
         .arg(format!("MPOS_XTASK_UID={}", utils::current_uid()))
         .arg(format!("MPOS_XTASK_GID={}", utils::current_gid()));
-    // Carry a requested console mode across the sudo boundary - before the
-    // program name, as an `env` assignment - so the privileged refresh bakes the
-    // mode the user asked for, not the file default.
+    // Carry a requested console mode across the sudo boundary - as an `env`
+    // assignment before the program name (so the privileged refresh bakes it)
+    // and as `--console` after the subcommand (so the child recomputes the same
+    // console-switch decision and bakes, rather than booting the old mode).
     if let Some(mode) = env::var_os("MPOS_XTASK_CONSOLE") {
         sudo.arg(format!("MPOS_XTASK_CONSOLE={}", mode.to_string_lossy()));
     }
@@ -303,6 +324,9 @@ fn build_under_sudo(command: Commands, build_dir: &Path, profile: &str) -> Resul
         .arg("--profile")
         .arg(profile)
         .arg(command.name());
+    if let Some(mode) = console {
+        sudo.arg("--console").arg(mode.name());
+    }
 
     let status = sudo.status().context("Failed to run sudo")?;
     if !status.success() {
@@ -314,7 +338,12 @@ fn build_under_sudo(command: Commands, build_dir: &Path, profile: &str) -> Resul
 /// Re-runs this command as root, carrying the invoking user's identity along so
 /// the output can be given back when the privileged half is done. `exec` rather
 /// than `spawn` keeps one process and one exit status for the whole command.
-fn escalate(command: Commands, build_dir: &Path, profile: &str) -> Result<()> {
+fn escalate(
+    command: Commands,
+    console: Option<config::ConsoleMode>,
+    build_dir: &Path,
+    profile: &str,
+) -> Result<()> {
     let exe = env::current_exe().context("Failed to find the xtask executable")?;
     let home = env::var("HOME").unwrap_or_default();
     let path = env::var("PATH").unwrap_or_default();
@@ -337,6 +366,9 @@ fn escalate(command: Commands, build_dir: &Path, profile: &str) -> Result<()> {
         .arg("--profile")
         .arg(profile)
         .arg(command.name());
+    if let Some(mode) = console {
+        sudo.arg("--console").arg(mode.name());
+    }
 
     let err = sudo.exec();
     anyhow::bail!("Failed to re-exec under sudo: {err}");

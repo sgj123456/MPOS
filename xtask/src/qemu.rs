@@ -295,6 +295,7 @@ pub fn run_qemu(
     profile: &str,
     artefacts_ready: bool,
     needs_build: bool,
+    console: ConsoleMode,
 ) -> Result<()> {
     if needs_build {
         println!("run: the image is missing or out of date; building it");
@@ -363,15 +364,14 @@ pub fn run_qemu(
     // The machine's own settings: memory, processors, the name the guest
     // reports, and whatever `extra_args` adds.
     let config = QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
-    // The host wiring follows whatever the image was baked with, so the window,
-    // the serial line and the guest's own console policy always agree.
-    let mode = baked_console(build_dir);
+    // The host wiring follows the mode the caller asked for, so the window, the
+    // serial line and the guest's own console policy always agree.
     let args = machine_args(
         &config,
         &ovmf_dir,
         &vars,
         Boot::Image(image.clone()),
-        Console::Run(mode),
+        Console::Run(console),
         &share,
     );
 
