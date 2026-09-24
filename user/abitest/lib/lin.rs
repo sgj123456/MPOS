@@ -1901,6 +1901,8 @@ const SYS_LISTEN: u64 = 50;
 const SYS_GETSOCKNAME: u64 = 51;
 const SYS_GETPEERNAME: u64 = 52;
 const SYS_RECVMSG: u64 = 47;
+const SYS_SENDMSG: u64 = 46;
+const SYS_SOCKETPAIR: u64 = 53;
 const SYS_SETSOCKOPT: u64 = 54;
 const SYS_GETSOCKOPT: u64 = 55;
 
@@ -2067,6 +2069,77 @@ pub fn getsockopt(fd: i32, level: usize, optname: usize, val: &mut i32) -> isize
 /// `shutdown(fd, how)` — close one direction of a channel, or both.
 pub fn shutdown(fd: i32, how: usize) -> isize {
     sys2(SYS_SHUTDOWN, fd as usize, how)
+}
+
+// --- AF_UNIX SCM_RIGHTS / SCM_CREDENTIALS test surface ---
+
+/// `struct cmsghdr`, x86_64: a `size_t` length then two `int`s, with the data
+/// starting at a word boundary (offset 16).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Cmsghdr {
+    pub cmsg_len: usize,
+    pub cmsg_level: i32,
+    pub cmsg_type: i32,
+}
+
+/// `CMSG_ALIGN`: round a control-buffer byte count up to the ABI's word size.
+pub const fn cmsg_align(n: usize) -> usize {
+    (n + 7) & !7
+}
+/// `CMSG_LEN(len)`: the value to store in `cmsg_len`.
+pub const fn cmsg_len(len: usize) -> usize {
+    16 + len
+}
+/// `CMSG_SPACE(len)`: the room a message with `len` data bytes occupies.
+pub const fn cmsg_space(len: usize) -> usize {
+    cmsg_align(16 + len)
+}
+
+/// `SOL_SOCKET` control-message types and the `SO_PASSCRED`/`SO_PEERCRED`
+/// option numbers, and the two `recvmsg` flags the SCM path reads.
+pub const SCM_RIGHTS: i32 = 1;
+pub const SCM_CREDENTIALS: i32 = 2;
+pub const SO_PASSCRED: usize = 16;
+pub const SO_PEERCRED: usize = 17;
+pub const MSG_CMSG_CLOEXEC: usize = 0x10000;
+pub const MSG_CTRUNC: usize = 0x8;
+
+/// `sendmsg(fd, msg, flags)`.
+pub fn sendmsg(fd: i32, msg: &mut MsgHdr, flags: usize) -> isize {
+    sys3(SYS_SENDMSG, fd as usize, msg as *mut MsgHdr as usize, flags)
+}
+
+/// `socketpair(domain, type, flags, sv)` — two connected unix ends.
+pub fn socketpair(domain: usize, typ: usize, flags: usize, sv: &mut [i32; 2]) -> isize {
+    sys4(SYS_SOCKETPAIR, domain, typ, flags, sv.as_mut_ptr() as usize)
+}
+
+/// `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &ucred, &mut 12)` — the peer's
+/// pid, uid and gid, read into three words.
+pub fn getsockopt_cred(fd: i32, out: &mut [u32; 3]) -> isize {
+    let mut len: usize = 12;
+    sys5(
+        SYS_GETSOCKOPT,
+        fd as usize,
+        SOL_SOCKET,
+        SO_PEERCRED,
+        out as *mut [u32; 3] as usize,
+        &mut len as *mut usize as usize,
+    )
+}
+
+/// `getsockopt(fd, level, opt, &mut i32)` — a 4-byte int option read back.
+pub fn getsockopt_int(fd: i32, level: usize, opt: usize, val: &mut i32) -> isize {
+    let mut len: usize = 4;
+    sys5(
+        SYS_GETSOCKOPT,
+        fd as usize,
+        level,
+        opt,
+        val as *mut i32 as usize,
+        &mut len as *mut usize as usize,
+    )
 }
 
 // ---------------------------------------------------------------------------

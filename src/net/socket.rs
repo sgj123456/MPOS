@@ -35,6 +35,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use super::Channel;
 use crate::syscall::err;
+use crate::vfs::pipe::DuplexEnd;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError};
 
 // --- the Linux constants the ABI spells by number ---
@@ -73,6 +74,39 @@ const TCP_NODELAY: usize = 1;
 /// the packet arrived with - `ping`'s `ttl=` comes from nowhere else.
 const SOL_IP: usize = 0;
 const IP_RECVTTL: usize = 12;
+
+// --- AF_UNIX control messages and peer credentials (unix(7), socket(7)) ---
+/// The two options `setsockopt`/`getsockopt` speak at `SOL_SOCKET` for a unix
+/// socket: `SO_PASSCRED` makes every read carry the peer's credentials, and
+/// `SO_PEERCRED` asks for them directly (get-only, 12-byte `ucred`).
+const SO_PASSCRED: usize = 16;
+const SO_PEERCRED: usize = 17;
+/// `cmsg_type` values under `cmsg_level == SOL_SOCKET`.
+const SCM_RIGHTS: i32 = 1;
+const SCM_CREDENTIALS: i32 = 2;
+/// `recvmsg` flags: ask for received descriptors to be `O_CLOEXEC`, and the
+/// kernel's signal that control data was dropped for want of room.
+const MSG_CMSG_CLOEXEC: usize = 0x10000;
+const MSG_CTRUNC: i32 = 0x8;
+/// One `cmsghdr` on x86_64: a `size_t` length then two `int`s, padded to a
+/// word - `CMSG_ALIGN(16)`, so the data always starts at offset 16.
+const CMSG_HDRLEN: usize = 16;
+/// `sizeof(struct ucred)` - `pid`, `uid`, `gid`.
+const UCREN_LEN: usize = 12;
+
+/// Round a control-buffer byte count up to the ABI's alignment, so the next
+/// `cmsghdr` starts where musl's `CMSG_ALIGN` will look for it.
+fn cmsg_align(n: usize) -> usize {
+    (n + core::mem::size_of::<usize>() - 1) & !(core::mem::size_of::<usize>() - 1)
+}
+/// `CMSG_LEN(len)`: the value to store in a message's `cmsg_len`.
+fn cmsg_len(len: usize) -> usize {
+    CMSG_HDRLEN + len
+}
+/// `CMSG_SPACE(len)`: the room a message with `len` data bytes occupies.
+fn cmsg_space(len: usize) -> usize {
+    cmsg_align(CMSG_HDRLEN + len)
+}
 
 /// The keep-alive probe interval `SO_KEEPALIVE` arms smoltcp with when it is
 /// turned on. Linux's default `TCP_KEEPINTVL` - the pace the socket holds to
@@ -147,6 +181,136 @@ fn channel_of_fd(fd: i32) -> Option<Arc<crate::vfs::File>> {
         return None;
     }
     Some(file)
+}
+
+/// Run `f` over the duplex channel `file` speaks over - borrowed off a
+/// socketpair's own inode, or cloned out of a connected unix socket's state -
+/// and hand back whatever it produced. A `RefCell` borrow cannot outlive the
+/// critical section it was taken in, so the channel is consumed by the closure
+/// rather than returned by reference. `None` when the fd is no channel at all.
+fn on_channel<T>(file: &Arc<crate::vfs::File>, f: impl FnOnce(&DuplexEnd) -> T) -> Option<T> {
+    if let Some(d) = file.inode().as_duplex() {
+        Some(f(d))
+    } else {
+        file.inode().unix_end().map(|d| f(&d))
+    }
+}
+
+/// Walk a `sendmsg` control buffer and collect the open files its
+/// `SCM_RIGHTS` entries name, resolved against the sender's own table. A
+/// descriptor the sender does not hold is `EBADF`; entries other than
+/// `SCM_RIGHTS` are ignored (the sender's own credentials, if it asserted
+/// any, are checked at the kernel's discretion, not carried here).
+unsafe fn collect_scm_rights(
+    msghdr: usize,
+    from_user: bool,
+) -> Result<Vec<Arc<crate::vfs::File>>, isize> {
+    unsafe {
+        let control = ((msghdr + MSGHDR_CONTROL) as *const usize).read_unaligned();
+        let clen = ((msghdr + MSGHDR_CONTROLLEN) as *const usize).read_unaligned();
+        if control == 0 || clen < CMSG_HDRLEN {
+            return Ok(Vec::new());
+        }
+        if !crate::syscall::buffer_ok(control, clen, false, from_user) {
+            return Err(err::EINVAL);
+        }
+        let base = control as *const u8;
+        let mut out: Vec<Arc<crate::vfs::File>> = Vec::new();
+        let mut off = 0usize;
+        while off + CMSG_HDRLEN <= clen {
+            let at = base.add(off);
+            let cl = (at as *const usize).read_unaligned();
+            if cl < CMSG_HDRLEN || off + cl > clen {
+                break;
+            }
+            let level = (at.add(8) as *const i32).read_unaligned();
+            let ctype = (at.add(12) as *const i32).read_unaligned();
+            if level as usize == SOL_SOCKET && ctype == SCM_RIGHTS {
+                let nfds = (cl - CMSG_HDRLEN) / core::mem::size_of::<i32>();
+                for i in 0..nfds {
+                    let fd = (at.add(CMSG_HDRLEN + i * 4) as *const i32).read_unaligned();
+                    match crate::sched::current_fds().clone_at(fd) {
+                        Ok(f) => out.push(f),
+                        Err(_) => return Err(err::EBADF),
+                    }
+                }
+            }
+            off += cmsg_align(cl);
+        }
+        Ok(out)
+    }
+}
+
+/// Build the `recvmsg` control chain for a unix/Socketpair read: an optional
+/// `SCM_CREDENTIALS` (when the reader set `SO_PASSCRED`) then the queued
+/// descriptors as `SCM_RIGHTS`, installing each into the reader's table.
+/// Returns `(bytes_written, truncated)`; a descriptor that will not fit the
+/// control buffer, or the `RLIMIT_NOFILE` ceiling, is dropped - which closes
+/// it, Linux's rule for a handover never taken.
+unsafe fn emit_unix_control(
+    msghdr: usize,
+    files: Vec<Arc<crate::vfs::File>>,
+    want_cred: Option<crate::net::unix::UCred>,
+    cloexec: bool,
+    from_user: bool,
+) -> (usize, bool) {
+    unsafe {
+        let control = ((msghdr + MSGHDR_CONTROL) as *const usize).read_unaligned();
+        let capacity = ((msghdr + MSGHDR_CONTROLLEN) as *const usize).read_unaligned();
+        let writable =
+            control != 0 && crate::syscall::buffer_ok(control, capacity, true, from_user);
+        let mut used = 0usize;
+        let mut trunc = false;
+
+        if let Some(c) = want_cred {
+            let need = cmsg_space(UCREN_LEN);
+            if writable && used + need <= capacity {
+                let m = control as *mut u8;
+                core::ptr::write_bytes(m.add(used), 0, need);
+                let m = m.add(used);
+                (m as *mut usize).write_unaligned(cmsg_len(UCREN_LEN));
+                (m.add(8) as *mut i32).write_unaligned(SOL_SOCKET as i32);
+                (m.add(12) as *mut i32).write_unaligned(SCM_CREDENTIALS);
+                (m.add(16) as *mut i32).write_unaligned(c.pid as i32);
+                (m.add(20) as *mut u32).write_unaligned(c.uid);
+                (m.add(24) as *mut u32).write_unaligned(c.gid);
+                used += need;
+            } else {
+                trunc = true;
+            }
+        }
+
+        if !files.is_empty() {
+            let mut installed: Vec<i32> = Vec::new();
+            for f in files.into_iter() {
+                let need = cmsg_space((installed.len() + 1) * core::mem::size_of::<i32>());
+                if !writable || used + need > capacity {
+                    trunc = true;
+                    break;
+                }
+                match crate::sched::current_fds().install(f) {
+                    Ok(fd) => installed.push(fd),
+                    Err(_) => trunc = true,
+                }
+            }
+            if !installed.is_empty() {
+                let dlen = installed.len() * core::mem::size_of::<i32>();
+                let m = (control as *mut u8).add(used);
+                (m as *mut usize).write_unaligned(cmsg_len(dlen));
+                (m.add(8) as *mut i32).write_unaligned(SOL_SOCKET as i32);
+                (m.add(12) as *mut i32).write_unaligned(SCM_RIGHTS);
+                let table = crate::sched::current_fds();
+                for (i, fd) in installed.iter().enumerate() {
+                    (m.add(CMSG_HDRLEN + i * 4) as *mut i32).write_unaligned(*fd);
+                    if cloexec {
+                        let _ = table.fd_flags_set(*fd, crate::vfs::file::FD_CLOEXEC);
+                    }
+                }
+                used += cmsg_space(dlen);
+            }
+        }
+        (used, trunc)
+    }
 }
 
 /// Whether a call on `fd` must answer without parking: `MSG_DONTWAIT` on the
@@ -996,8 +1160,9 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         return crate::net::rtnl::send(handle, &data);
     }
     // A connected pair's end, in scatter-gather form: gather, then write.
-    // No name is legal to send to and no control data is carried, so a
-    // caller that set either is told so.
+    // No name is legal to send to, but an `SCM_RIGHTS` control buffer names
+    // descriptors to hand across - the one thing a stream channel carries
+    // beside its bytes. A caller that set `msg_name` is still told so.
     if let Some(file) = channel_of_fd(fd) {
         let (name, _namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
             Ok(fields) => fields,
@@ -1006,6 +1171,10 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         if name != 0 {
             return err::EISCONN;
         }
+        let fds = match unsafe { collect_scm_rights(args[1], from_user) } {
+            Ok(fds) => fds,
+            Err(e) => return e,
+        };
         let mut data: Vec<u8> = Vec::new();
         if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
             return e;
@@ -1013,10 +1182,19 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         if dontwait(fd, args[2]) && !file.inode().poll_ready().write {
             return err::EAGAIN;
         }
-        return file
-            .write(&data)
-            .map(|n| n as isize)
-            .unwrap_or_else(crate::syscall::err_of);
+        let written = match file.write(&data) {
+            Ok(n) => n as isize,
+            Err(e) => {
+                // The bytes did not land, so the handover never happened:
+                // dropping `fds` here closes the descriptors it named, as if
+                // the send had not carried them.
+                return crate::syscall::err_of(e);
+            }
+        };
+        if !fds.is_empty() {
+            on_channel(&file, |c| c.send_scm(fds));
+        }
+        return written;
     }
     // The vsock form of the same: gathered bytes into the connected
     // stream, no name to name on a connected socket.
@@ -1354,17 +1532,29 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         return n as isize;
     }
     // The read side of a connected pair's end, in scatter-gather form: one
-    // contiguous read into the first iovec, no name and no control data to
-    // report - the fields go back zeroed, which is how Linux says "none".
+    // contiguous read into the first iovec, plus the control chain a unix
+    // channel may carry - handed-over descriptors and, for a reader that set
+    // `SO_PASSCRED`, the peer's credentials. A caller with no iovec and no
+    // control buffer and nothing to wait for is `EINVAL`; a control-only read
+    // (a zero-length iovec, room for a cmsg) picks up a queued handover.
     if let Some(file) = channel_of_fd(fd) {
         let (name, namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
             Ok(fields) => fields,
             Err(e) => return e,
         };
-        let Some((buf, len)) = first_iovec(iov, iovlen, from_user) else {
-            return err::EINVAL;
+        if !crate::syscall::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
+            return err::EFAULT;
+        }
+        let wants_control = unsafe {
+            ((msghdr + MSGHDR_CONTROL) as *const usize).read_unaligned() != 0
+                && ((msghdr + MSGHDR_CONTROLLEN) as *const usize).read_unaligned() >= CMSG_HDRLEN
         };
-        if len == 0 {
+        let (buf, len) = match first_iovec(iov, iovlen, from_user) {
+            Some(pair) => pair,
+            None if wants_control => (0usize, 0usize),
+            None => return err::EINVAL,
+        };
+        if len == 0 && !wants_control {
             return err::EINVAL;
         }
         if args[2] & MSG_PEEK != 0 {
@@ -1376,20 +1566,44 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
             return err::EAGAIN;
         }
-        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-        let n = match file.read(out) {
-            Ok(n) => n as isize,
-            Err(e) => return crate::syscall::err_of(e),
-        };
-        if !crate::syscall::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
-            return err::EFAULT;
+        let mut n = 0isize;
+        if len > 0 {
+            if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+                return err::EFAULT;
+            }
+            let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+            n = match file.read(out) {
+                Ok(n) => n as isize,
+                Err(e) => return crate::syscall::err_of(e),
+            };
         }
+        // Pop any descriptor handover queued for this channel and decide
+        // whether the peer's credentials ride along.
+        let handover = on_channel(&file, |c| c.take_scm()).flatten();
+        let want_cred = match file.inode().as_unix() {
+            Some(sock) if sock.passcred() => sock.peer_cred(),
+            _ => None,
+        };
+        let cloexec = args[2] & MSG_CMSG_CLOEXEC != 0;
+        let (used, trunc) = unsafe {
+            emit_unix_control(
+                msghdr,
+                handover.unwrap_or_default(),
+                want_cred,
+                cloexec,
+                from_user,
+            )
+        };
         unsafe {
-            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(0);
+            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(if trunc {
+                MSG_CTRUNC
+            } else {
+                0
+            });
             if name != 0 && namelen != 0 {
                 ((msghdr + 8) as *mut u32).write_unaligned(0);
             }
-            ((msghdr + 40) as *mut u64).write_unaligned(0); // msg_controllen
+            ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(used);
         }
         return n;
     }
@@ -2655,6 +2869,35 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
 /// (`poll`) and `SO_REUSEADDR` is moot while one process binds at a time.
 pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen) = (args[0] as i32, args[1], args[2], args[3], args[4]);
+    // A unix socket is not in the network registry either; its options are the
+    // credential knobs. `SO_PASSCRED` is the one that matters: it makes every
+    // read carry the peer's `SCM_CREDENTIALS`. A sender's `SCM_CREDENTIALS`
+    // opt-in is accepted too, though this kernel fills the peer's real ids at
+    // connect and does not let a sender claim another's.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_unix()
+    {
+        if level != SOL_SOCKET {
+            return err::ENOPROTOOPT;
+        }
+        if optval == 0 || optlen < 4 || !crate::syscall::buffer_ok(optval, 4, false, from_user) {
+            return err::EINVAL;
+        }
+        let val = unsafe { (optval as *const i32).read_unaligned() };
+        return match optname {
+            SO_PASSCRED => {
+                sock.set_passcred(val != 0);
+                0
+            }
+            // `SCM_CREDENTIALS` (the sender's opt-in) shares `SO_REUSEADDR`'s
+            // number, 2, at this level; it is accepted and recorded, and this
+            // kernel always fills the peer's real ids at connect. The ordinary
+            // socket bookkeeping options are accepted by name so a caller's
+            // setup never fails on the family.
+            SO_REUSEADDR | SO_SNDBUF | SO_RCVBUF | SO_KEEPALIVE | SO_LINGER => 0,
+            _ => err::ENOPROTOOPT,
+        };
+    }
     // A vsock socket is not in the network registry; its options are the
     // recorded-no-op kind - the four every stream socket is asked for at
     // setup, accepted by name so a caller's setup never fails on a family
@@ -2755,7 +2998,67 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
 pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen_ptr) =
         (args[0] as i32, args[1], args[2], args[3], args[4]);
+    // A unix socket's own options, answered before the network registry (which
+    // it is not part of). `SO_PEERCRED` is the authentication read: the peer's
+    // `ucred` captured when the connection was made. `SO_PASSCRED` reads back
+    // whether the reader asked for credentials on every message.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_unix()
+    {
+        if level != SOL_SOCKET {
+            return err::ENOPROTOOPT;
+        }
+        if optval == 0 || optlen_ptr == 0 {
+            return err::EFAULT;
+        }
+        if !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user) {
+            return err::EFAULT;
+        }
+        let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() } as usize;
+        // (value length, is-cred). Everything else is a 4-byte int.
+        let (need, cred) = match optname {
+            SO_PEERCRED => (UCREN_LEN, true),
+            SO_PASSCRED => (4, false),
+            SO_TYPE => (4, false),
+            _ => (4, false),
+        };
+        if cap < 4 || !crate::syscall::buffer_ok(optval, need.min(cap), true, from_user) {
+            return err::EINVAL;
+        }
+        if cred {
+            let c = sock.peer_cred().unwrap_or_default();
+            unsafe {
+                if cap >= 4 {
+                    (optval as *mut u32).write_unaligned(c.pid);
+                }
+                if cap >= 8 {
+                    ((optval + 4) as *mut u32).write_unaligned(c.uid);
+                }
+                if cap >= 12 {
+                    ((optval + 8) as *mut u32).write_unaligned(c.gid);
+                }
+            }
+        } else {
+            let value: i32 = match optname {
+                SO_PASSCRED => sock.passcred() as i32,
+                SO_TYPE => SOCK_STREAM as i32,
+                // No error is ever pending between calls on a unix channel.
+                SO_ERROR => 0,
+                _ => 0,
+            };
+            unsafe {
+                (optval as *mut i32).write_unaligned(value);
+            }
+        }
+        unsafe {
+            (optlen_ptr as *mut u32).write_unaligned(need as u32);
+        }
+        return 0;
+    }
     // A vsock socket answers the questions a caller asks a stream socket
+    // at setup - what it is, whether an error is pending, how big its
+    // buffers are - and reads back zeros for the rest, the same permissive
+    // answer the INET registry gives its unmodelled options.
     // at setup - what it is, whether an error is pending, how big its
     // buffers are - and reads back zeros for the rest, the same permissive
     // answer the INET registry gives its unmodelled options.

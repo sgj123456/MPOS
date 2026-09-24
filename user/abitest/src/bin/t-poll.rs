@@ -191,8 +191,14 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let pid = lin::fork();
     if pid == 0 {
         let _ = lin::close(q[0]);
-        let sleep = lin::TimeSpec { tv_sec: 0, tv_nsec: 40_000_000 };
-        let mut rest = lin::TimeSpec { tv_sec: 0, tv_nsec: 0 };
+        let sleep = lin::TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 40_000_000,
+        };
+        let mut rest = lin::TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         lin::nanosleep(&sleep, &mut rest);
         let _ = lin::write(q[1], b"y");
         lin::exit(0);
@@ -217,7 +223,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         r,
         1,
     );
-    lin::check_true(&mut failed, b"and names the pipe as the ready one", waiting[1].revents == POLLIN);
+    lin::check_true(
+        &mut failed,
+        b"and names the pipe as the ready one",
+        waiting[1].revents == POLLIN,
+    );
     lin::check_true(
         &mut failed,
         b"while the placeholder is still skipped",

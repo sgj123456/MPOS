@@ -58,6 +58,37 @@ pub const SOMAXCONN: usize = 4096;
 /// The size of `struct sockaddr_un`'s `sun_path`, `linux/un.h`.
 pub const SUN_PATH_MAX: usize = 108;
 
+/// `struct ucred`, the credential payload `SO_PEERCRED` and the
+/// `SCM_CREDENTIALS` control message carry. Linux fills `pid` with the peer's
+/// thread-group id, and `uid`/`gid` with its *real* ids.
+#[derive(Clone, Copy, Default)]
+pub struct UCred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// The running task's credentials, in the shape `ucred` wants. Read outside any
+/// socket lock - the scheduler table wants the same critical section, so
+/// capturing this first and carrying the plain words in is what keeps the two
+/// locks from nesting. On the host there is no task table, so the answer is the
+/// zero the queue logic never depends on.
+fn self_cred() -> UCred {
+    #[cfg(target_os = "none")]
+    {
+        let (uid, gid) = crate::sched::current_real_owner();
+        UCred {
+            pid: crate::sched::current_tgid().0 as u32,
+            uid,
+            gid,
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        UCred::default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // One AF_UNIX socket, as the fd table sees it
 // ---------------------------------------------------------------------------
@@ -85,8 +116,10 @@ struct UnixState {
     /// (`ECONNREFUSED`, the header's divergence list).
     backlog: Option<usize>,
     /// The pending connections: the server-facing halves minted by
-    /// `connect`, waiting for `accept` to hand them to a descriptor.
-    pending: VecDeque<Arc<DuplexEnd>>,
+    /// `connect`, each tagged with the connector's credentials so the socket
+    /// `accept` mints learns who dialed it, waiting for `accept` to hand them
+    /// to a descriptor.
+    pending: VecDeque<(Arc<DuplexEnd>, UCred)>,
     /// Tasks parked in `accept`, and tasks parked in a `connect` that
     /// found the backlog full. Stale ids are harmless - every wait
     /// re-checks its condition inside its own predicate - the rule
@@ -97,6 +130,17 @@ struct UnixState {
     /// is "not connected", which is what the file doors and the send path
     /// refuse with `ENOTCONN`.
     end: Option<Arc<DuplexEnd>>,
+    /// The credentials of the task that created this socket (`socket`, or the
+    /// `accept` that minted a connected one) - what a peer sees as ours.
+    owner: UCred,
+    /// The peer's credentials, captured when the connection was made (the
+    /// connector's at `connect`, the listener's on the client side). This is
+    /// what `SO_PEERCRED` reports and `SCM_CREDENTIALS` delivers, and it is
+    /// `Some` exactly when the socket is connected.
+    peer: Option<UCred>,
+    /// `SO_PASSCRED`: the owner wants the peer's credentials attached, as an
+    /// `SCM_CREDENTIALS` message, to every read that has room for one.
+    passcred: bool,
 }
 
 struct BoundName {
@@ -112,7 +156,7 @@ struct BoundName {
 }
 
 impl UnixSock {
-    fn new(id: usize, typ: u16) -> Arc<UnixSock> {
+    fn new(id: usize, typ: u16, owner: UCred) -> Arc<UnixSock> {
         Arc::new(UnixSock {
             id,
             typ,
@@ -123,12 +167,33 @@ impl UnixSock {
                 accept_waiters: Vec::new(),
                 room_waiters: Vec::new(),
                 end: None,
+                owner,
+                peer: None,
+                passcred: false,
             })),
         })
     }
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// The peer's credentials this socket learned at connect, if it is
+    /// connected - `SO_PEERCRED`'s answer and `SCM_CREDENTIALS`' payload.
+    pub fn peer_cred(&self) -> Option<UCred> {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().peer)
+    }
+
+    /// Whether `SO_PASSCRED` is set - whether a read should attach the peer's
+    /// credentials.
+    pub fn passcred(&self) -> bool {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().passcred)
+    }
+
+    /// Set `SO_PASSCRED`, so the next `recvmsg` with room carries a
+    /// `SCM_CREDENTIALS`.
+    pub fn set_passcred(&self, on: bool) {
+        critical_section::with(|cs| self.state.borrow(cs).borrow_mut().passcred = on);
     }
 
     /// The connected channel, if there is one - the downcast the file
@@ -300,10 +365,11 @@ static UNIX: Mutex<RefCell<Registry>> = Mutex::new(RefCell::new(Registry::new())
 /// a stale id can only fail its own liveness check, never answer to a
 /// different socket.
 pub(crate) fn alloc(typ: u16) -> Arc<UnixSock> {
+    let owner = self_cred();
     critical_section::with(|cs| {
         let mut reg = UNIX.borrow(cs).borrow_mut();
         let id = reg.slots.len() + 1;
-        let sock = UnixSock::new(id, typ);
+        let sock = UnixSock::new(id, typ, owner);
         reg.slots.push(Some(Slot {
             socket: sock.clone(),
             key: None,
@@ -420,16 +486,23 @@ pub(crate) fn connect(
                     return ConnectOutcome::Full;
                 }
                 let (client, server) = DuplexEnd::pair();
-                stl.pending.push_back(server);
+                let listener_cred = stl.owner;
                 let waiters = stl.accept_waiters.clone();
                 // The connector owns its half immediately: connect is not
                 // a rendezvous, and an unaccepted connection is a live
                 // socket on both sides (Linux's behavior once backlog
-                // space existed).
-                {
+                // space existed). It also records who it dialed into - the
+                // listener's credentials are this socket's peer from now on.
+                let connector_cred = {
                     let mut stc = sock.state.borrow(cs).borrow_mut();
+                    let cred = stc.owner;
                     stc.end = Some(client);
-                }
+                    stc.peer = Some(listener_cred);
+                    cred
+                };
+                // The connector's own credentials ride the queued half, so the
+                // socket `accept` mints can report them as its peer.
+                stl.pending.push_back((server, connector_cred));
                 ConnectOutcome::Connected(waiters)
             };
             lst
@@ -515,21 +588,24 @@ fn room_wait(listener: &Arc<UnixSock>) {
 /// caller made the descriptor nonblocking; the blocking wait is
 /// [`accept_blocking`], split out so the queue arithmetic is host-testable
 /// exactly like the pipe's wait is.
-pub(crate) fn accept_once(sock: &UnixSock, nonblock: bool) -> Result<Arc<DuplexEnd>, isize> {
+pub(crate) fn accept_once(
+    sock: &UnixSock,
+    nonblock: bool,
+) -> Result<(Arc<DuplexEnd>, UCred), isize> {
     loop {
         let popped = critical_section::with(|cs| {
             let mut st = sock.state.borrow(cs).borrow_mut();
             match st.pending.pop_front() {
-                Some(end) => {
+                Some(conn) => {
                     // Room for a blocked connect, if any waits.
-                    Some((end, st.room_waiters.clone()))
+                    Some((conn, st.room_waiters.clone()))
                 }
                 None => None,
             }
         });
-        if let Some((end, room)) = popped {
+        if let Some(((end, peer), room)) = popped {
             wake_all(room);
-            return Ok(end);
+            return Ok((end, peer));
         }
         if nonblock {
             return Err(crate::syscall::err::EAGAIN);
@@ -788,18 +864,22 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
 /// fresh unix socket, and hand the caller a descriptor that is already
 /// connected - the shape an accepted socket has on every system.
 pub(crate) fn accept_face(listener: &UnixSock, nonblock: bool) -> Result<usize, isize> {
-    let end = accept_once(listener, nonblock)?;
+    let (end, peer) = accept_once(listener, nonblock)?;
     let accepted = alloc(listener.typ);
-    accepted.with_state_connect(end);
+    accepted.with_state_connect(end, peer);
     Ok(accepted.id)
 }
 
 impl UnixSock {
-    /// Install a channel the accept queue just released. Inherent to the
-    /// type; the handler borrows through the Arc it made for the fd.
-    fn with_state_connect(&self, end: Arc<DuplexEnd>) {
+    /// Install a channel the accept queue just released, and the credentials
+    /// of the socket that dialed it - the accepted socket's peer, which
+    /// `SO_PEERCRED` and `SCM_CREDENTIALS` report from here on. Inherent to
+    /// the type; the handler borrows through the Arc it made for the fd.
+    fn with_state_connect(&self, end: Arc<DuplexEnd>, peer: UCred) {
         critical_section::with(|cs| {
-            self.state.borrow(cs).borrow_mut().end = Some(end);
+            let mut st = self.state.borrow(cs).borrow_mut();
+            st.end = Some(end);
+            st.peer = Some(peer);
         });
     }
 }

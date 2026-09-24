@@ -1,3 +1,4 @@
+
 # MPOS Feature Roadmap
 
 Missing essential features, prioritized by impact on real-world workload compatibility.
@@ -62,9 +63,10 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   anonymous **demand paging** + per-VMA backing tracking in the `#PF` handler.
 - **6.3** namespaces: `unshare`/`setns` validate but return `EOPNOTSUPP`; no
   real mount/pid/net namespace isolation.
-- **4.1** AF_UNIX is answered for `SOCK_STREAM` (see Phase 4): what the
-  family still lacks is `SCM_RIGHTS`/`SCM_CREDENTIALS`, without which a real
-  dbus broker can connect its clients but not authenticate them.
+- **4.1** AF_UNIX is answered for `SOCK_STREAM` (see Phase 4), including
+  `SCM_RIGHTS` descriptor handover and `SCM_CREDENTIALS`/`SO_PEERCRED` peer
+  authentication — a real dbus broker can now both connect its clients and
+  name them. What the family still lacks is `SOCK_DGRAM` datagram transfer.
 
 ---
 
@@ -291,12 +293,25 @@ bound-but-never-listened name is `ECONNREFUSED` rather than Linux's
 implicit backlog-0 rendezvous; ext4 refuses socket nodes (`EOPNOTSUPP` -
 `/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so only `bind` creates a
 socket name; `getpeername` answers `AF_UNIX` with an empty path (accepted
-peers carry no name); and **no `SCM_RIGHTS`/`SCM_CREDENTIALS`** - a real
-dbus broker still cannot authenticate its clients, which is the next
-milestone for this family. `SOCK_DGRAM` unix sockets now *open* - musl's
+peers carry no name). `SOCK_DGRAM` unix sockets now *open* - musl's
 `if_nametoindex` asks for one as the handle for its own `SIOCGIFINDEX`
 ioctl, and a refusal turned every device-name lookup into "can't find
 device" - but the datagram transfer itself is the documented v1 gap.
+
+**`SCM_RIGHTS` / `SCM_CREDENTIALS` / `SO_PEERCRED` are now answered** (see
+`t-unix-scm`): a unix (or socketpair) `sendmsg` can hand live descriptors
+across, `recvmsg` installs them into the reader's table (respecting
+`RLIMIT_NOFILE`, and `MSG_CMSG_CLOEXEC`), `SO_PASSCRED` makes every read
+carry an `SCM_CREDENTIALS`, and `getsockopt(SO_PEERCRED)` returns the peer's
+pid/uid/gid - the identity a dbus broker authenticates on. The handover rides
+the connection's `PipeState` beside the bytes it travels with, so a descriptor
+never taken is closed when the queue drops, and the peer's credentials are
+captured at `connect`/`accept`/`socketpair`. v1 divergences: on `SOCK_STREAM`
+the kernel keeps one cmsg boundary per send rather than per skb (a data-less
+`sendmsg`'s handover is delivered on the next read), a sender's
+`SCM_CREDENTIALS` opt-in is accepted but the kernel always fills the peer's
+real ids (no impersonation), and `SO_PEERCRED`/`SO_PASSCRED` are the unix
+`connect` path's - a `socketpair` carries descriptors but not credentials.
 
 ### 4.2 ICMP Improvements — **DONE**
 

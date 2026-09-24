@@ -170,12 +170,20 @@ fn build_test_initramfs(build_dir: &Path, tests: &[UserTest]) -> Result<PathBuf>
     println!("User tests: packing the test initramfs");
 
     let self_exe = std::env::current_exe().context("Failed to find the xtask executable")?;
-    let status = Command::new(&self_exe)
-        .arg("initramfs")
-        .status()
-        .context("Failed to run the initramfs command")?;
-    if !status.success() {
-        bail!("The initramfs did not build");
+    // The base initramfs only needs the privileged `initramfs` command when it
+    // is actually out of date - that command takes root for its `chroot` step,
+    // and a fresh archive needs no such thing. Building it unconditionally
+    // would demand a password even when there is nothing to rebuild.
+    if crate::initramfs::needs_rebuild(build_dir)? {
+        let status = Command::new(&self_exe)
+            .arg("initramfs")
+            .status()
+            .context("Failed to run the initramfs command")?;
+        if !status.success() {
+            bail!("The initramfs did not build");
+        }
+    } else {
+        println!("User tests: the base initramfs is up to date; not rebuilding");
     }
 
     let staging = build_dir.join("test-initramfs.d");
@@ -321,7 +329,10 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // checks (the half-second clock wait and the scheduler sleeps). A normal
     // boot leaves it off and goes straight to init; the test boot wants every
     // check run, so it asks for them here.
-    fs::write(esp.join("mpos.cmdline"), "console=ttyS0 mpos.selftest mpos.headless\n")?;
+    fs::write(
+        esp.join("mpos.cmdline"),
+        "console=ttyS0 mpos.selftest mpos.headless\n",
+    )?;
 
     let ovmf_dir = qemu::find_ovmf()?;
     let vars = utils::ovmf_vars_path(build_dir);

@@ -39,6 +39,13 @@ const CAPACITY: usize = 16 * PIPE_BUF;
 
 struct PipeState {
     data: VecDeque<u8>,
+    /// SCM_RIGHTS side channel, one entry per send that carried descriptors.
+    /// It lives here - beside the bytes it travels with - because the two
+    /// crossed halves of a [`DuplexEnd`] share exactly this state, so a record
+    /// pushed on the write side is the record the far reader pops, in order.
+    /// Each entry is the set of open files to hand over; dropping one without a
+    /// reader closes them, which is Linux's rule for a descriptor never taken.
+    scm: VecDeque<Vec<Arc<super::File>>>,
     readers: u32,
     writers: u32,
     /// Tasks blocked waiting for data or EOF. A dead task's stale entry is
@@ -79,6 +86,7 @@ const _: () = {
 pub fn pair() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     let state = Arc::new(Mutex::new(RefCell::new(PipeState {
         data: VecDeque::new(),
+        scm: VecDeque::new(),
         readers: 1,
         writers: 1,
         waiting_readers: Vec::new(),
@@ -103,6 +111,17 @@ impl PipeEnd {
     /// Bytes waiting to be read.
     pub fn buffered(&self) -> usize {
         critical_section::with(|cs| self.state.borrow(cs).borrow().data.len())
+    }
+
+    /// Queue one SCM_RIGHTS handover beside the bytes just written. Any end of
+    /// the shared buffer can push; the peer's read half is the one that pops.
+    pub fn push_scm(&self, fds: Vec<Arc<super::File>>) {
+        critical_section::with(|cs| self.state.borrow(cs).borrow_mut().scm.push_back(fds));
+    }
+
+    /// Take the oldest pending handover, if any, from this (reading) side.
+    pub fn take_scm(&self) -> Option<Vec<Arc<super::File>>> {
+        critical_section::with(|cs| self.state.borrow(cs).borrow_mut().scm.pop_front())
     }
 
     /// Set or clear `O_NONBLOCK` on this end. `pipe2` sets it on birth,
@@ -476,6 +495,17 @@ impl DuplexEnd {
     pub fn shut_read(&self) {
         self.read.shut_read();
     }
+
+    /// Queue an SCM_RIGHTS handover for the peer to pick up on its next read.
+    /// It rides the writing direction, which is the buffer the peer reads.
+    pub fn send_scm(&self, fds: Vec<Arc<super::File>>) {
+        self.write.push_scm(fds);
+    }
+
+    /// Take the handover the peer queued for this end, if any.
+    pub fn take_scm(&self) -> Option<Vec<Arc<super::File>>> {
+        self.read.take_scm()
+    }
 }
 
 impl Inode for DuplexEnd {
@@ -531,10 +561,11 @@ impl Inode for DuplexEnd {
 
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
+    use alloc::sync::Arc;
     use alloc::vec;
 
     use super::{CAPACITY, DuplexEnd, PIPE_BUF, pair};
-    use crate::vfs::{Inode, VfsError};
+    use crate::vfs::{File, Inode, VfsError};
 
     #[test]
     fn a_socketpair_carries_bytes_both_ways() {
@@ -550,6 +581,30 @@ mod tests {
         assert_eq!(b.write_at(0, b"pong").unwrap(), 4);
         assert_eq!(a.read_at(0, &mut buf).unwrap(), 4);
         assert_eq!(&buf[..4], b"pong");
+    }
+
+    #[test]
+    fn an_scm_handover_rides_only_the_direction_it_was_sent_on() {
+        let (a, b) = DuplexEnd::pair();
+        // Two distinct open files, handed over in order on a's write side.
+        let f1 = Arc::new(File::new(DuplexEnd::pair().0));
+        let f2 = Arc::new(File::new(DuplexEnd::pair().0));
+        let p1 = Arc::as_ptr(&f1);
+        let p2 = Arc::as_ptr(&f2);
+
+        // Before anything is sent, neither side owes the other a handover.
+        assert!(a.take_scm().is_none());
+        assert!(b.take_scm().is_none());
+
+        a.send_scm(vec![f1, f2]);
+
+        // The handover left on a's write direction, so it is not readable back
+        // on a's own (inbound) side - only the peer pops what was sent to it.
+        assert!(a.take_scm().is_none(), "a's send is not echoed to a");
+        let got = b.take_scm().expect("the handover arrives on b");
+        assert_eq!(got.len(), 2, "both descriptors ride one message");
+        assert_eq!(Arc::as_ptr(&got[0]), p1, "in the order they were queued");
+        assert_eq!(Arc::as_ptr(&got[1]), p2);
     }
 
     #[test]
