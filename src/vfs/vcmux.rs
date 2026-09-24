@@ -158,6 +158,10 @@ fn switch(to: u32) {
     if mux != 0 {
         crate::sched::wake(TaskId(mux as usize));
     }
+    // On the framebuffer, tell the renderer to show the new console now.
+    if crate::console::gpu_mode() {
+        crate::drivers::video::render::notify();
+    }
     // On the shared serial wire a word in the kernel's own voice tells the eye
     // which console the next bytes belong to. On the framebuffer it is not
     // needed - each console is its own screen, and the switch itself is the

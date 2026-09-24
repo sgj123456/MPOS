@@ -21,7 +21,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use critical_section::Mutex;
 use virtio_drivers::device::gpu::VirtIOGpu;
@@ -37,6 +37,10 @@ use crate::vfs::term::font::{CELL_H, CELL_W};
 use crate::vfs::term::{self, Cell, DEFAULT_BG, DEFAULT_FG, MAX_ROWS};
 use crate::vfs::vcmux;
 
+/// The minimum ticks between repaints (~31 Hz at 250 Hz): the ceiling that
+/// coalesces a flood, while a lone keystroke still repaints immediately.
+const FRAME_TICKS: u64 = 8;
+
 /// The device, parked here for the task to take at its start. After the take
 /// nothing else can reach it, which is what keeps `flush` single-caller.
 static DEVICE: Mutex<RefCell<Option<VirtIOGpu<HalImpl, PciTransport>>>> =
@@ -50,6 +54,22 @@ static RENDER_PID: AtomicU32 = AtomicU32::new(0);
 static REQ: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 static WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// A screen changed and needs repainting. Set by whoever feeds a grid, so the
+/// render task wakes on the next keystroke instead of waiting out its beat -
+/// and the task clears it when it repaints.
+static DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Nudge the render task to repaint soon. Called after any byte is painted into
+/// a grid. Cheap and safe from any context (a keystroke's echo runs from the
+/// interrupt handler): it only sets a flag and wakes the task.
+pub fn notify() {
+    DIRTY.store(true, Ordering::Relaxed);
+    let pid = RENDER_PID.load(Ordering::Relaxed);
+    if pid != 0 {
+        crate::sched::wake(TaskId(pid as usize));
+    }
+}
 
 /// Whether the framebuffer console is live. Cleared if the task was never
 /// spawned (headless), so `console` and `/dev/fb0` know not to route bytes here.
@@ -106,9 +126,21 @@ fn task() {
     };
     let mut scratch = vec![blank; rows * cols];
 
+    // Force a first paint of the replayed boot log even before any keystroke.
+    DIRTY.store(true, Ordering::Relaxed);
     let mut last_shown = 0usize;
+    let mut last_paint = 0u64;
     loop {
-        crate::sched::sleep_ticks(8);
+        // Wake the moment a screen changes - a keystroke should repaint now,
+        // not on the next beat - but never more than ~31 Hz: sleep out the rest
+        // of the frame interval so a flood coalesces instead of storming flush.
+        crate::sched::block_until(|| DIRTY.load(Ordering::Relaxed));
+        DIRTY.store(false, Ordering::Relaxed);
+        let now = crate::arch::timer::ticks();
+        if now.saturating_sub(last_paint) < FRAME_TICKS {
+            crate::sched::sleep_ticks(FRAME_TICKS - (now - last_paint));
+        }
+        last_paint = crate::arch::timer::ticks();
 
         // A switch means the whole window must be redrawn: the pixels already in
         // the buffer belong to the console shown before. Force the new screen
