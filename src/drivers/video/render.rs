@@ -86,12 +86,10 @@ fn task() {
     let rows = (fb_h / CELL_H).min(SCREEN_ROWS).clamp(1, MAX_ROWS);
     let cols = (fb_w / CELL_W).clamp(1, SCREEN_COLS);
     term::make_screen(KERNEL_SCREEN, rows, cols);
-    // A first thing to see, so the very act of bringing the console up is
-    // visible on the display: the marker below is proof the render path works
-    // even before any program has written a byte.
-    term::with_screen(KERNEL_SCREEN, |g| {
-        g.feed(b"mpos: framebuffer console online\r\n")
-    });
+    // The screen exists now: replay the boot log onto it and move the console
+    // from the wire to the framebuffer, so the display shows the lines already
+    // printed rather than waiting for the next one.
+    crate::console::takeover();
 
     loop {
         crate::sched::sleep_ticks(8);

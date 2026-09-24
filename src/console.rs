@@ -158,16 +158,58 @@ pub fn dmesg_capacity() -> usize {
 }
 
 pub fn write_bytes(bytes: &[u8]) {
+    // Keep a copy of what the console has said, so the framebuffer can be
+    // brought up to a screen that already shows the boot log rather than born
+    // mid-story. Fixed-size, never allocates, safe from the interrupt path.
+    record(bytes);
     if gpu_mode() {
-        // The GPU renderer is wired in a later phase. Until it owns the bytes,
-        // drawing them still means the mirror; once it does, the mirror is the
-        // only thing headless keeps. Either way the wire path is `serial_bytes`.
+        // Once the render task has made the screen, bytes paint it directly.
+        // Before that (or if there is none), this is a no-op and the wire below
+        // still carries the text.
+        crate::vfs::term::with_screen(crate::vfs::term::KERNEL_SCREEN, |g| g.feed(bytes));
         if mirror_serial() {
             serial_bytes(bytes);
         }
         return;
     }
     serial_bytes(bytes);
+}
+
+/// How far back the replayed boot log reaches. A screen is 25 rows; a few
+/// kilobytes covers the banner, the memory map and the milestone lines.
+const LOG_CAP: usize = 8 * 1024;
+static LOG: Mutex<RefCell<alloc::collections::VecDeque<u8>>> =
+    Mutex::new(RefCell::new(alloc::collections::VecDeque::new()));
+
+/// File a byte-run into the replay ring, oldest bytes dropped first.
+fn record(bytes: &[u8]) {
+    critical_section::with(|cs| {
+        let mut log = LOG.borrow(cs).borrow_mut();
+        for &b in bytes {
+            if log.len() == LOG_CAP {
+                log.pop_front();
+            }
+            log.push_back(b);
+        }
+    });
+}
+
+/// Hand the console to the framebuffer: replay the boot log onto the freshly
+/// made screen, then switch. Called by the render task once its screen exists,
+/// so there is no window between "GPU is the backend" and "there is a screen to
+/// paint." Stops the serial mirror - a mirror would send a `bat` flood back down
+/// the one wire the whole feature exists to get off of.
+pub fn takeover() {
+    let snapshot: Vec<u8> = critical_section::with(|cs| {
+        let mut out = Vec::with_capacity(LOG.borrow(cs).borrow().len());
+        out.extend(LOG.borrow(cs).borrow().iter().copied());
+        out
+    });
+    crate::vfs::term::with_screen(crate::vfs::term::KERNEL_SCREEN, |g| {
+        g.reset_to_boot(&snapshot);
+    });
+    set_gpu();
+    set_mirror_serial(headless());
 }
 
 /// Write raw bytes on the serial console - the wire, through the transmit ring.

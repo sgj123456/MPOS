@@ -168,6 +168,15 @@ impl Grid {
         }
     }
 
+    /// Clear the screen and paint a fresh boot log onto it - how the
+    /// framebuffer is brought up to show the lines the console already printed
+    /// while it was still on the serial wire.
+    pub fn reset_to_boot(&mut self, bytes: &[u8]) {
+        self.reset();
+        self.feed(bytes);
+        self.mark_all_dirty();
+    }
+
     fn byte(&mut self, b: u8) {
         match self.state {
             State::Ground => self.ground(b),
