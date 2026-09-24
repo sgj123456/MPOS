@@ -60,6 +60,12 @@ pub struct QemuConfig {
     /// nowhere - the point is exercising the driver, not the speakers - but
     /// the card itself needs QEMU 8.2 or newer, which is why it is opt-in.
     pub audio: bool,
+    /// The QEMU display backend for an interactive `run` (`-display`), so the
+    /// framebuffer console has a window to show itself in. Absent means `sdl`;
+    /// name another backend your QEMU was built with, or `none` to watch only
+    /// the serial log - which then goes quiet once the console moves to the
+    /// framebuffer. A `test` boot ignores this and always runs headless.
+    pub display: Option<String>,
 }
 
 #[derive(Debug)]
@@ -158,6 +164,7 @@ impl QemuConfig {
             extra_args: take_list(values, "extra_args", &[]),
             vsock: take_flag(values, "vsock"),
             audio: take_flag(values, "audio"),
+            display: values.remove("display").filter(|text| !text.trim().is_empty()),
         }
     }
 }

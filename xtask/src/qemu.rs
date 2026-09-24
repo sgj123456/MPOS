@@ -200,7 +200,10 @@ pub fn machine_args(
         // rather than a request to quit the emulator.
         Console::Stdio => args.extend([
             "-display".into(),
-            "none".into(),
+            // A window for the framebuffer console: the shells render there, so
+            // an interactive run needs a real display backend, not `none`. SDL
+            // is the default; `[qemu] display = "gtk"` (or another) overrides.
+            config.display.clone().unwrap_or_else(|| "sdl".to_string()),
             "-chardev".into(),
             "stdio,id=stdio0,mux=off,signal=off".into(),
             "-serial".into(),
@@ -379,6 +382,7 @@ mod tests {
             extra_args: extra.iter().map(|arg| arg.to_string()).collect(),
             vsock: false,
             audio: false,
+            display: None,
         }
     }
 
@@ -465,5 +469,31 @@ mod tests {
             Some("-enable-kvm"),
             "the escape hatch is appended after everything computed: {args:?}"
         );
+    }
+
+    #[test]
+    fn an_interactive_run_opens_a_window_for_the_framebuffer() {
+        // The shells now render to the framebuffer, so `run` must give QEMU a
+        // real display backend (SDL by default) - not `none`, which would show
+        // nothing once the console leaves the wire. Overridable; a headless
+        // file-log boot (the selftest) still asks for `none`.
+        let cfg = config("1024", 1, &[]);
+        let stdio = args(&cfg, Boot::Image(PathBuf::from("/build/mpos.img")));
+        assert_eq!(after(&stdio, "-display").as_deref(), Some("sdl"));
+
+        let mut custom = config("1024", 1, &[]);
+        custom.display = Some("gtk".to_string());
+        let gtk = args(&custom, Boot::Image(PathBuf::from("/build/mpos.img")));
+        assert_eq!(after(&gtk, "-display").as_deref(), Some("gtk"));
+
+        let file = machine_args(
+            &cfg,
+            Path::new("/ovmf"),
+            Path::new("/build/OVMF_VARS.4m.fd"),
+            Boot::Image(PathBuf::from("/build/mpos.img")),
+            Console::File("/build/test-serial.log".to_string()),
+            Path::new("/build/9p-share"),
+        );
+        assert_eq!(after(&file, "-display").as_deref(), Some("none"));
     }
 }

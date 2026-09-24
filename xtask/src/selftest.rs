@@ -321,7 +321,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // checks (the half-second clock wait and the scheduler sleeps). A normal
     // boot leaves it off and goes straight to init; the test boot wants every
     // check run, so it asks for them here.
-    fs::write(esp.join("mpos.cmdline"), "console=ttyS0 mpos.selftest\n")?;
+    fs::write(esp.join("mpos.cmdline"), "console=ttyS0 mpos.selftest mpos.headless\n")?;
 
     let ovmf_dir = qemu::find_ovmf()?;
     let vars = utils::ovmf_vars_path(build_dir);
