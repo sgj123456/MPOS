@@ -30,14 +30,12 @@ use crate::sched::policy::TaskId;
 /// what lets two processes use a pipe as a record channel. POSIX's minimum.
 pub const PIPE_BUF: usize = 4096;
 
-/// How much a pipe buffers before writers block. One page - the smallest a
-/// pipe can be while still holding a whole [`PIPE_BUF`]-sized record, so a
-/// record-sized write is never itself the thing that wedges the pipe. A short
-/// buffer is what makes a pipeline *stream*: the writer runs out of room
-/// quickly and waits on the reader, so a reader that takes a little (`head`,
-/// `grep`) ends the writer's block rather than draining a deep reservoir that
-/// had already swallowed the whole of a fast producer's output.
-const CAPACITY: usize = PIPE_BUF;
+/// How much a pipe buffers before writers block. Sixteen pages is Linux's
+/// default pipe capacity (`pipe-max-size`), so a pipeline holds exactly as much
+/// in flight here as it would there. (A writer that needs a whole record of
+/// room parks until one frees - see [`PipeEnd::wait_writable`] - so the buffer
+/// being an exact multiple of [`PIPE_BUF`] is not the stall it once was.)
+const CAPACITY: usize = 16 * PIPE_BUF;
 
 struct PipeState {
     data: VecDeque<u8>,
@@ -178,7 +176,7 @@ impl PipeEnd {
     }
 
     #[cfg(target_os = "none")]
-    fn wait_writable(&self) {
+    fn wait_writable(&self, need: usize) {
         let id = crate::sched::current();
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
@@ -186,7 +184,7 @@ impl PipeEnd {
                 st.waiting_writers.push(id);
             }
         });
-        crate::sched::block_until(|| self.writable_or_broken());
+        crate::sched::block_until(|| self.writable_or_broken(need));
         critical_section::with(|cs| {
             self.state
                 .borrow(cs)
@@ -202,7 +200,7 @@ impl PipeEnd {
     }
 
     #[cfg(not(target_os = "none"))]
-    fn wait_writable(&self) {
+    fn wait_writable(&self, _need: usize) {
         panic!("blocking pipe writes need the kernel scheduler; test write_once instead");
     }
 
@@ -214,11 +212,18 @@ impl PipeEnd {
         })
     }
 
+    /// Whether the writer asking for `need` bytes can move: the far end is gone
+    /// (so the next write is `EPIPE`, and the wait must end to report it), or
+    /// there is room for the whole request. The second half has to match what
+    /// [`write_once`](Self::write_once) actually admits - a record-sized write
+    /// is all-or-nothing and wants `need` free, not merely one free byte - or a
+    /// writer with a partial line waiting for room would be woken, find the
+    /// write still refused, and spin instead of sleeping.
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
-    fn writable_or_broken(&self) -> bool {
+    fn writable_or_broken(&self, need: usize) -> bool {
         critical_section::with(|cs| {
             let st = self.state.borrow(cs).borrow();
-            st.readers == 0 || st.data.len() < CAPACITY
+            st.readers == 0 || CAPACITY - st.data.len() >= need
         })
     }
 
@@ -407,7 +412,13 @@ impl Inode for PipeEnd {
                         }
                         return Err(VfsError::Again);
                     }
-                    self.wait_writable();
+                    // Park until there is room for what `write_once` would
+                    // actually accept: a record-sized write wants the whole
+                    // record free (it is all-or-nothing), while a longer one
+                    // only wants a single byte to make progress in pieces.
+                    let rest = buf.len() - done;
+                    let need = if rest <= PIPE_BUF { rest } else { 1 };
+                    self.wait_writable(need);
                 }
             }
         }
@@ -646,6 +657,38 @@ mod tests {
         assert_eq!(&buf[..4], b"last");
         assert_eq!(read_end.read_at(0, &mut buf).unwrap(), 0, "EOF");
         assert_eq!(read_end.read_at(0, &mut buf).unwrap(), 0, "EOF is sticky");
+    }
+
+    #[test]
+    fn a_writer_parks_for_a_whole_record_not_mere_room() {
+        // The regression: `write_once` admits a record-sized write only with a
+        // full record free, so the condition a blocked writer sleeps on must
+        // agree. If it woke on `any` room instead, a writer waiting on a
+        // partial line would be woken, refused again, and spin at 100% CPU
+        // rather than sleeping until the reader makes real room.
+        let (read_end, write_end) = pair();
+
+        // Fill all but 1000 bytes: there is room, but not a whole record's.
+        write_end.write_at(0, &vec![7u8; CAPACITY - 1000]).unwrap();
+        assert!(
+            !write_end.writable_or_broken(PIPE_BUF),
+            "a record must wait"
+        );
+        assert!(write_end.writable_or_broken(1), "one byte can go through");
+
+        // Draining the pipe down frees a whole record's worth, so the parked
+        // record write can finally proceed.
+        let mut all = vec![0u8; CAPACITY];
+        assert_eq!(read_end.read_at(0, &mut all).unwrap(), CAPACITY - 1000);
+        assert!(write_end.writable_or_broken(PIPE_BUF), "a record fits now");
+
+        // A vanished reader outranks the room question: the wait must end so the
+        // writer learns about `EPIPE`, even with no space at all.
+        let (read_end, write_end) = pair();
+        write_end.write_at(0, &vec![7u8; CAPACITY]).unwrap();
+        assert!(!write_end.writable_or_broken(1));
+        drop(read_end);
+        assert!(write_end.writable_or_broken(PIPE_BUF), "broken beats full");
     }
 
     #[test]
