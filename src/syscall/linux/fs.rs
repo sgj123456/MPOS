@@ -1241,22 +1241,29 @@ pub(super) fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         }
         // A regular file: copy the bytes, then drop the old name.
         NodeKind::File => {
-            let file = crate::vfs::File::new(old_inode.clone());
-            let mut data = alloc::vec::Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                match file.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => data.extend_from_slice(&chunk[..n]),
-                    Err(e) => return err_of(e),
-                }
-            }
             let inode = claim_name!(dir.create(&name, NodeKind::File));
             // The copy is the kernel moving bytes between two names of the
             // same file, not a write anyone made: `write_at` stands outside
-            // the `File::write` IN_MODIFY chokepoint on purpose.
-            if inode.write_at(0, &data).is_err() {
-                return err::ENOSPC;
+            // the `File::write` IN_MODIFY chokepoint on purpose. Copy in
+            // bounded chunks - there is no atomic rename under this
+            // filesystem, so a rename is a copy, but buffering the whole body
+            // would OOM the kernel on a large file, and `apk` renames every
+            // package member into place (a 128 MiB `Vec` from a big one is
+            // what took the machine down).
+            let mut chunk = [0u8; 65536];
+            let mut off: u64 = 0;
+            loop {
+                let n = match old_inode.read_at(off, &mut chunk) {
+                    Ok(n) => n,
+                    Err(e) => return err_of(e),
+                };
+                if n == 0 {
+                    break;
+                }
+                if inode.write_at(off, &chunk[..n]).is_err() {
+                    return err::ENOSPC;
+                }
+                off += n as u64;
             }
             // A rename moves the *name*; the node keeps everything that was its
             // own. There is no atomic rename underneath this filesystem, so the
