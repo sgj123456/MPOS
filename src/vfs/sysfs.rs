@@ -289,6 +289,54 @@ impl SysFs {
             }
         }
 
+        // `/class/drm`: the KMS card and its render node, announced the way
+        // the DRM class spells them - `card0` with the `dev` number
+        // 226:0 and a `DEVNAME` under `dri/`. This is how weston's DRM
+        // backend finds a device at all: it enumerates the `drm` subsystem
+        // through libudev, matching the sysname against `card[0-9]*`, and
+        // opens what answers as its primary GPU. A tree without this class
+        // is a machine with no display, however good /dev/dri is; eudev
+        // reads exactly the two attributes below.
+        #[cfg(target_os = "none")]
+        {
+            let drm = class.add_dir("drm", next);
+            next += 1;
+            for (name, minor, devnode) in [
+                ("card0", 0u32, "dri/card0"),
+                ("renderD128", 128, "dri/renderD128"),
+            ] {
+                let dir = drm.add_dir(name, next);
+                next += 1;
+                // DRM's major, fixed as a convention since XFree86; the
+                // minors are the card index and 128 + index.
+                let numbers = alloc::format!("226:{}\n", minor);
+                let numbers: &'static str = Box::leak(numbers.into_boxed_str());
+                dir.add(
+                    "dev",
+                    Arc::new(SysFile {
+                        ino: next,
+                        content: numbers,
+                    }),
+                );
+                next += 1;
+                dir.add(
+                    "uevent",
+                    Arc::new(SysEventAttr {
+                        ino: next,
+                        event: Event {
+                            action: "add",
+                            devpath: alloc::format!("/devices/virtual/drm/{}", name),
+                            subsystem: "drm",
+                            devname: String::from(devnode),
+                            major: 226,
+                            minor,
+                        },
+                    }),
+                );
+                next += 1;
+            }
+        }
+
         let kernel = fs.root.add_dir("kernel", next);
         next += 1;
         kernel.add(

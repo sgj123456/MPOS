@@ -191,6 +191,11 @@ pub fn standard_devfs() -> Arc<DevFs> {
     let tty = crate::vfs::tty::global();
     dev.register_node("ttyS0", tty.clone());
     dev.register_node("tty", Arc::new(crate::vfs::tty::ControllingTty));
+    // `/dev/tty0` - "the current VT", the name a seat manager opens to ask
+    // the console as a whole about its VT state and switch it. mpos has one
+    // console, so the name is that console seen a second time; the VT and KD
+    // ioctls answer from the single-console reality whoever asks them.
+    dev.register_node("tty0", tty.clone());
     dev.register("console", Arc::new(ConsoleDev));
     // The virtual consoles: the slave ends of the pty pairs minted at boot.
     // A getty respawns on `tty1`..`tty6` the way a stock inittab asks, and

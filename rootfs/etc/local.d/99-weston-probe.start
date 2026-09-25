@@ -1,0 +1,20 @@
+#!/bin/sh
+# TEMP probe: eudev's view of the drm class, then weston itself.
+say() { echo "W $*" > /dev/console; }
+sleep 1
+say "tty0=$(ls -l /dev/tty0 2>&1 | tail -1)"
+udevadm info /sys/class/drm/card0 > /tmp/ui.out 2>&1
+say "udevadm rc=$?"
+sed 's/^/I /' /tmp/ui.out > /dev/console 2>&1
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
+export SEATD_SOCK=/run/seatd.sock
+weston --backend=drm-backend.so --renderer=gl > /tmp/wlog.out 2>&1 &
+ws=$!
+sleep 8
+if kill -0 $ws 2>/dev/null; then say "weston ALIVE"; else wait $ws; say "weston DEAD rc=$?"; fi
+tail -25 /tmp/wlog.out | sed 's/^/K /' > /dev/console 2>&1
+pkill -f 'weston --backend' 2>/dev/null
+sleep 1
+echo PROBE-DONE > /dev/console
+poweroff -f
