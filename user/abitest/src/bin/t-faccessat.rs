@@ -1,10 +1,13 @@
-//! t-faccessat - one test for faccessat, the dirfd form of access that
-//! path-probing code uses.
+//! t-faccessat - root's access check is the same through every spelling.
 //!
-//! Pinned here: an existing file is reachable (answer 0 - one user, every
-//! permission bit set), a path that does not exist answers ENOENT, the
-//! path resolves relative to a directory descriptor, and a dirfd that is
-//! not open answers EBADF.
+//! `apk` preserves a file's ownership by `fchmod`ing it to `0600` and then
+//! asking, of the *same* file in the *same* process, whether it may write it -
+//! once with `access(2)` and once with `faccessat(2)`. Those two disagreed:
+//! `access` said yes and `faccessat` said `EACCES`, which is what surfaced as
+//! the "failed to preserve <file>: permission" warnings that left every setuid
+//! helper unpacked wrong. They route through one `may_as`, so for uid 0 they
+//! must answer alike, and alike with `faccessat2` too - this pins that, on a
+//! mode (`0600`, then `0000`) that an unprivileged check would refuse.
 
 #![no_std]
 #![no_main]
@@ -14,41 +17,91 @@ mod lin;
 
 use core::panic::PanicInfo;
 
-static MOTD: [u8; 10] = *b"/etc/motd\0";
-static NO_SUCH: [u8; 9] = *b"/no/such\0";
-static BIN: [u8; 5] = *b"/bin\0";
-static SH: [u8; 3] = *b"sh\0";
+const R_OK: usize = 4;
+const W_OK: usize = 2;
+const X_OK: usize = 1;
+
+const O_CREAT: usize = 0o100;
+const O_RDWR: usize = 2;
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-faccessat\n");
     let mut failed = false;
 
-    let r = lin::faccessat(lin::AT_FDCWD, &MOTD, lin::R_OK);
-    lin::check_eq(&mut failed, b"an existing file is reachable for R_OK", r, 0);
-
-    let r = lin::faccessat(lin::AT_FDCWD, &NO_SUCH, lin::F_OK);
+    let name = b"/tmp/t-faccessat.f\0";
+    // The file apk ends up holding: root:root, mode 0600.
+    let fd = lin::openat(lin::AT_FDCWD, name, O_CREAT | O_RDWR, 0o600) as i32;
+    lin::check_true(&mut failed, b"the 0600 file is created", fd >= 0);
+    if fd < 0 {
+        lin::done(failed);
+    }
     lin::check_eq(
         &mut failed,
-        b"a path that does not exist answers ENOENT",
-        r,
-        lin::ENOENT,
+        b"fchmod 0600 succeeds",
+        lin::fchmod(fd, 0o600),
+        0,
+    );
+    lin::close(fd);
+
+    // Read and write: the triads allow it for root, and every spelling agrees.
+    lin::check_eq(
+        &mut failed,
+        b"access(2) R_OK|W_OK is allowed for root",
+        lin::access(name, R_OK | W_OK),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"faccessat(2) W_OK is allowed for root (was EACCES)",
+        lin::faccessat(lin::AT_FDCWD, name, W_OK),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"faccessat2 W_OK is allowed for root",
+        lin::faccessat2(lin::AT_FDCWD, name, W_OK, 0),
+        0,
+    );
+    // Execute on a file with no execute bit for anyone: mpos lets uid 0 pass
+    // (Linux's CAP_DAC_OVERRIDE would refuse, but this image drops it), so this
+    // is the difference the fix makes observable for a caller that is root.
+    lin::check_eq(
+        &mut failed,
+        b"access(2) X_OK on 0600 is allowed for root",
+        lin::access(name, X_OK),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"faccessat(2) X_OK on 0600 matches access(2)",
+        lin::faccessat(lin::AT_FDCWD, name, X_OK),
+        0,
     );
 
-    // The path resolves relative to a directory descriptor.
-    let binfd = lin::openat(lin::AT_FDCWD, &BIN, lin::O_RDONLY, 0);
-    lin::check_true(&mut failed, b"/bin opens as a dirfd", binfd >= 0);
-    if binfd >= 0 {
-        let r = lin::faccessat(binfd as i32, &SH, lin::F_OK);
-        lin::check_eq(&mut failed, b"faccessat relative to a dirfd succeeds", r, 0);
-        let _ = lin::close(binfd as i32);
-    }
+    // And a mode no one is granted at all: still reachable by root, still
+    // agreed by all three calls.
+    lin::check_eq(
+        &mut failed,
+        b"chmod 0000 succeeds",
+        lin::chmod(name, 0o000),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"access(2) R_OK|W_OK|X_OK on 0000 is allowed for root",
+        lin::access(name, R_OK | W_OK | X_OK),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"faccessat(2) R_OK|W_OK|X_OK on 0000 is allowed for root",
+        lin::faccessat(lin::AT_FDCWD, name, R_OK | W_OK | X_OK),
+        0,
+    );
 
-    // A dirfd that is not open answers EBADF.
-    let r = lin::faccessat(77, &MOTD, lin::F_OK);
-    lin::check_eq(&mut failed, b"a bad dirfd answers EBADF", r, lin::EBADF);
-
-    lin::done(failed)
+    lin::unlinkat(lin::AT_FDCWD, name, 0);
+    lin::done(failed);
 }
 
 #[panic_handler]

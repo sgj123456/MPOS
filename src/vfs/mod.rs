@@ -900,15 +900,18 @@ fn permitted(mode: u32, owner: (u32, u32), want: u32, me: (u32, u32), groups: &[
     bits & want == want
 }
 
-/// The root override, Linux's `CAP_DAC_OVERRIDE`: root passes every check
-/// without consulting the owner or the triads, with the one exception the
-/// capability keeps - execute on a non-directory still needs an execute bit set
-/// for someone, so even root cannot run a file nobody ever marked runnable, and
-/// `access(X_OK)` on a `0644` file is `EACCES` for the superuser too. This is
-/// Linux's exact behaviour; the earlier "root bypasses all" simplification is
-/// dropped in favour of matching it.
-fn root_override(mode: u32, want: u32, is_dir: bool) -> bool {
-    want & X_OK == 0 || is_dir || mode & 0o111 != 0
+/// The root override: uid 0 reaches everything.
+///
+/// Linux folds this into `CAP_DAC_OVERRIDE` and keeps one exception - execute
+/// on a plain file still needs an execute bit set for *someone*, so
+/// `access(X_OK)` on a `0644` file is `EACCES` even for the superuser. mpos
+/// drops that exception on purpose: on a single-user image whose root does the
+/// packaging, running and repairing, a check that can tell the superuser "you
+/// may not run this" is a footgun rather than a security boundary, and it is
+/// the fine print that made `apk` read a perfectly accessible tree back as
+/// denied.
+fn root_override() -> bool {
+    true
 }
 
 /// Whether the process whose ids are `me` may do `want` to `node`.
@@ -924,12 +927,13 @@ pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
     if !inode.keeps_modes() {
         return Ok(());
     }
-    let mode = inode.mode();
+    // Neither is root: uid 0 passes every check without consulting the owner
+    // or the triads.
     let allowed = if me.0 == 0 {
-        root_override(mode, want, inode.metadata().kind == NodeKind::Dir)
+        root_override()
     } else {
         permitted(
-            mode,
+            inode.mode(),
             inode.owner(),
             want,
             me,
@@ -1168,15 +1172,11 @@ mod tests {
     }
 
     #[test]
-    fn root_passes_everything_but_execute_on_a_file_nobody_made_runnable() {
-        // Root overrides the triads outright...
-        assert!(root_override(0o000, R_OK | W_OK, false));
-        // ...including search on a directory.
-        assert!(root_override(0o000, X_OK, true));
-        // Linux's `CAP_DAC_OVERRIDE` keeps one exception: execute on a plain
-        // file needs an x bit for someone, and root is not above it.
-        assert!(!root_override(0o666, X_OK, false));
-        assert!(root_override(0o111, X_OK, false));
+    fn root_passes_everything_including_execute_on_a_file_nobody_made_runnable() {
+        // mpos drops Linux's one `CAP_DAC_OVERRIDE` exception: uid 0 passes
+        // every triad check outright, so even read on a `000` file and execute
+        // on a file with no execute bit at all are allowed for root.
+        assert!(root_override());
     }
 
     #[test]

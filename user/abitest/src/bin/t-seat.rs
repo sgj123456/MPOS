@@ -69,11 +69,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut vm = [0u8; 8];
     let r = lin::ioctl(tty, ioc_v(NR_VT_GETMODE, 8), vm.as_mut_ptr() as usize);
     lin::check_eq(&mut failed, b"VT_GETMODE succeeds", r, 0);
-    lin::check_true(
-        &mut failed,
-        b"VT_GETMODE reports VT_AUTO",
-        vm[0] == 1,
-    );
+    lin::check_true(&mut failed, b"VT_GETMODE reports VT_AUTO", vm[0] == 1);
 
     // The activation calls: taking and waiting on the (only) console succeed.
     lin::check_eq(
