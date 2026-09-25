@@ -44,7 +44,7 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::cell::RefCell;
 
 use critical_section::Mutex;
@@ -329,12 +329,27 @@ impl Inode for UnixSock {
 // ---------------------------------------------------------------------------
 
 struct Registry {
-    /// Slot `id - 1`, the socket's own number. Strong, and retired by the
-    /// close hook (`release`) - the uevent socket's pattern, not timerfd's
-    /// weak list: a socket must outlive every transient borrow the syscall
-    /// handlers take through its descriptor, and it dies exactly when its
-    /// last fd does. A slot freed to `None` makes later lookups answer
-    /// `ECONNREFUSED`, Linux's dead-socket-file verdict.
+    /// Slot `id - 1`, the socket's own number. Weak: the socket lives
+    /// exactly as long as something holds a descriptor to it - an fd
+    /// table's entry, an epoll interest list's reference, a handler's
+    /// transient clone - and dies the moment the last one lets go. The
+    /// registry is a *directory of names*, not an owner: an owner would be
+    /// a socket whose last reference went away while some cleanup hook
+    /// still owed it a call, and that socket would answer `connect` for
+    /// ever - a listener nothing will ever accept, the shape of a connect
+    /// that hangs where Linux answers `ECONNREFUSED`.
+    ///
+    /// The death is [`UnixSock::drop`]'s doing, and it is *the* mechanism
+    /// rather than a backstop because the alternative - a strong slot
+    /// retired by an explicit close hook - was tried here and failed a
+    /// count gate: `close_sockets_at_exit` compared the batch's references
+    /// against the socket's whole `strong_count`, an epoll entry watching
+    /// its own listener is one of those references (every daemon that
+    /// polls its listening socket - dbus first - holds exactly that
+    /// shape), and the gate read the pair as "someone still owns this" on
+    /// the day the owner died. A reference the batch does not hold can
+    /// only honestly mean "the socket is not this batch's to close", and
+    /// the only rule that is true for *every* holder is the count itself.
     slots: Vec<Option<Slot>>,
     /// Which live socket answers each bound node. `unlink` removes the key
     /// by node identity (`unbind_node`); a connect resolves a path to a
@@ -344,7 +359,7 @@ struct Registry {
 }
 
 struct Slot {
-    socket: Arc<UnixSock>,
+    socket: Weak<UnixSock>,
     /// The key `by_node` points here, so a release can remove its own
     /// entry without scanning paths.
     key: Option<(u64, u64)>,
@@ -371,7 +386,7 @@ pub(crate) fn alloc(typ: u16) -> Arc<UnixSock> {
         let id = reg.slots.len() + 1;
         let sock = UnixSock::new(id, typ, owner);
         reg.slots.push(Some(Slot {
-            socket: sock.clone(),
+            socket: Arc::downgrade(&sock),
             key: None,
         }));
         sock
@@ -411,43 +426,51 @@ pub(crate) fn unbind_node(node: &Arc<dyn Inode>) {
     });
 }
 
-/// The close hook, beside `close_last_socket`: the socket's last
-/// descriptor went. Its pending connections drop (the `PipeEnd` drop path
-/// EOFs whoever already held the other half), its key retires, and anyone
-/// parked on its accept queue wakes to find the slot dead and leave.
-pub(crate) fn release(id: usize) {
-    let (dead, waiters) = critical_section::with(|cs| {
-        let mut reg = UNIX.borrow(cs).borrow_mut();
-        // `take` the slot whole: the registry's strong reference ends here,
-        // and the caller's descriptor Arc is what lets the socket live
-        // exactly as long as the close path still means it.
-        let Some(slot) = reg.slots.get_mut(id - 1).and_then(Option::take) else {
-            return (None, Vec::new());
-        };
-        let dead = slot.socket;
-        if let Some(key) = slot.key {
-            reg.by_node.remove(&key);
-        }
-        let waiters = {
-            let mut st = dead.state.borrow(cs).borrow_mut();
-            let mut w = st.accept_waiters.clone();
-            w.extend(st.room_waiters.iter().copied());
-            st.pending.clear();
-            w
-        }; // the borrow of `dead` ends with the block; the Arc moves freely
-        (Some(dead), waiters)
-    });
-    // The registry's released reference goes here, at the end: the caller's
-    // fd Arc (or the exit batch's) is what let the socket live until this
-    // moment, and the close path itself is what finishes the job.
-    drop(dead);
-    wake_all(waiters);
+/// The last reference is gone: whatever held a descriptor - an fd table's
+/// entry, an epoll interest list's reference, a handler's transient clone -
+/// has let go, and the socket retires itself. The name's table key goes
+/// first, so no later `connect` resolves the node to this socket; the slot
+/// follows; the pending connections drop outside every borrow (the
+/// `DuplexEnd` drop path EOFs whoever already held the other half - a
+/// client parked on a dead daemon's queue wakes to end-of-file, not to
+/// nothing); and anyone parked in `accept` or in a backlog-full `connect`
+/// wakes to find the socket gone.
+///
+/// This is *the* mechanism, not a backstop. A registry that owned its
+/// sockets would need every death path to remember a call, and the one
+/// death path that did not - the exit batch's count gate seeing an epoll
+/// entry's reference and reading "someone still owns this" - left the
+/// listener answering `connect` for ever: a daemon that polls its own
+/// listening socket (dbus first) is exactly that shape. A weak slot and
+/// this drop are the same rule told once: the socket is alive exactly
+/// while something names it.
+impl Drop for UnixSock {
+    fn drop(&mut self) {
+        let (pending, waiters) = critical_section::with(|cs| {
+            let mut reg = UNIX.borrow(cs).borrow_mut();
+            if let Some(Some(slot)) = reg.slots.get_mut(self.id - 1)
+                && let Some(key) = slot.key.take()
+            {
+                reg.by_node.remove(&key);
+            }
+            reg.slots[self.id - 1] = None;
+            let mut st = self.state.borrow(cs).borrow_mut();
+            let pending = core::mem::take(&mut st.pending);
+            let mut waiters = core::mem::take(&mut st.accept_waiters);
+            waiters.append(&mut st.room_waiters);
+            (pending, waiters)
+        });
+        // Outside every borrow: a queued half's drop can wake whoever
+        // blocked on it, and a wake needs locks no drop may hold.
+        drop(pending);
+        wake_all(waiters);
+    }
 }
 
 /// Look up a connect's resolved node in the table, returning the live
 /// socket behind it. `None` answers `ECONNREFUSED` at the call site: no
-/// entry, an entry behind a closed socket, or a stale key all mean the
-/// same thing to a connector.
+/// entry, an entry whose socket has died - the upgrade is the liveness
+/// test - or a stale key all mean the same thing to a connector.
 fn live_listener(node: &Arc<dyn Inode>) -> Option<Arc<UnixSock>> {
     let key = (crate::vfs::mount::fs_id_of_inode(node), node.metadata().ino);
     critical_section::with(|cs| {
@@ -456,7 +479,7 @@ fn live_listener(node: &Arc<dyn Inode>) -> Option<Arc<UnixSock>> {
         reg.slots
             .get(id - 1)?
             .as_ref()
-            .map(|slot| slot.socket.clone())
+            .and_then(|slot| slot.socket.upgrade())
     })
 }
 
@@ -779,18 +802,19 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
     0
 }
 
-/// The bind record wants an `Arc` for the slot's weak self-reference; the
-/// handler holds only a borrow. The slot registry is what upgrades it -
-/// the fd the caller holds keeps that slot alive, so the borrow cannot
-/// outrun the arc.
+/// The bind record wants an `Arc` for the registry's weak self-reference; the
+/// handler holds only a borrow. The caller's own fd is what keeps the socket
+/// alive - the upgrade cannot fail while the borrow it came from exists - so
+/// the registry is the one place that can turn "the socket this fd names"
+/// back into the Arc itself.
 fn sock_arc(sock: &UnixSock) -> Arc<UnixSock> {
     critical_section::with(|cs| {
         let reg = UNIX.borrow(cs).borrow();
         reg.slots
             .get(sock.id - 1)
             .and_then(|slot| slot.as_ref())
-            .map(|slot| slot.socket.clone())
-            .expect("a unix fd outlives its own slot while borrowed")
+            .and_then(|slot| slot.socket.upgrade())
+            .expect("a unix fd outlives its own socket while borrowed")
     })
 }
 
@@ -894,7 +918,7 @@ pub(crate) fn by_id(id: usize) -> Option<Arc<UnixSock>> {
             .slots
             .get(id - 1)
             .and_then(|slot| slot.as_ref())
-            .map(|slot| slot.socket.clone())
+            .and_then(|slot| slot.socket.upgrade())
     })
 }
 

@@ -9,6 +9,13 @@
 //! read the flip-completion `drmEvent` off the card fd. The request numbers and
 //! struct offsets are the Linux UAPI's, so a green run means a real compositor
 //! speaking libdrm would find the same shapes.
+//!
+//! Past the flip, the bracket a GL compositor adds around it: `GETFB` reading
+//! the binding back, `ADDFB2` binding by fourcc, the connector's property list
+//! (`OBJ_GETPROPERTIES`), the `SET_VERSION` handshake, the `GET_MAGIC`/
+//! `AUTH_MAGIC` pair, `GEM_CLOSE` releasing a handle - and the render node
+//! (`renderD128`) making and mapping a dumb buffer of its own, the door GBM
+//! allocates through.
 
 #![no_std]
 #![no_main]
@@ -18,23 +25,42 @@ mod lin;
 
 use core::panic::PanicInfo;
 
-/// `DRM_IOCTL_BASE` is `'d'` (0x64). A request is the `_IOC` word; this kernel
-/// dispatches on the `nr` byte (bits 8..15), so the sizes below only need to
-/// be right for the direction, not for matching.
+/// `DRM_IOCTL_BASE` is `'d'` (0x64). A request is the `_IOC` word; this
+/// kernel's family dispatch accepts this spelling of it - the command number
+/// at bits 8..15, the family byte below - and the Linux spelling a real
+/// libdrm builds, with the two halves the other way around. The sizes only
+/// matter for the direction bits, not for matching.
 const fn ioc_d(nr: usize, size: usize) -> usize {
     (3 << 30) | (size << 16) | (nr << 8) | (b'd' as usize)
 }
 const NR_GET_CAP: usize = 0x0c;
 const NR_GETRESOURCES: usize = 0xa0;
 const NR_SETCRTC: usize = 0xa2;
+const NR_GETPROPERTY: usize = 0xaa;
 const NR_ADDFB: usize = 0xae;
 const NR_PAGE_FLIP: usize = 0xb0;
 const NR_CREATE_DUMB: usize = 0xb2;
 const NR_MAP_DUMB: usize = 0xb3;
+/// The core requests a GL compositor brackets the flip sequence with: the
+/// framebuffer readback, the fourcc ADDFB, the connector's property list,
+/// the version handshake, the auth pair, and the handle release.
+const NR_GETFB: usize = 0xad;
+const NR_ADDFB2: usize = 0xb8;
+const NR_OBJ_GETPROPERTIES: usize = 0xb9;
+const NR_SET_VERSION: usize = 0x07;
+const NR_GET_MAGIC: usize = 0x02;
+const NR_AUTH_MAGIC: usize = 0x11;
+const NR_GEM_CLOSE: usize = 0x09;
 
 const O_RDWR: usize = 2;
 const EVENT_FLIP_COMPLETE: u32 = 0x8000_0002;
 const CRTC_ID: u32 = 34;
+
+/// Little-endian u32 out of a byte buffer at `at` (the UAPI structs are
+/// native-order, and the host is little-endian).
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
 
 /// Little-endian u64 out of a byte buffer at `at` (the UAPI structs are
 /// native-order, and the host is little-endian).
@@ -169,6 +195,265 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         etype as isize,
         EVENT_FLIP_COMPLETE as isize,
     );
+
+    // --- the UAPI a GL compositor asks for beyond the flip itself ---
+
+    // GETFB: the geometry and handle ADDFB bound, answered back.
+    let mut getfb = [0u8; 28];
+    getfb[0..4].copy_from_slice(&fb_id.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_GETFB, 28), getfb.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"GETFB succeeds", r, 0);
+    if r == 0 {
+        lin::check_eq(
+            &mut failed,
+            b"GETFB reports the width",
+            u32_at(&getfb, 4) as isize,
+            64,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"GETFB reports the height",
+            u32_at(&getfb, 8) as isize,
+            64,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"GETFB reports the pitch",
+            u32_at(&getfb, 12) as isize,
+            256,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"GETFB reports the bpp",
+            u32_at(&getfb, 16) as isize,
+            32,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"GETFB reports the handle",
+            u32_at(&getfb, 24) as isize,
+            handle as isize,
+        );
+    }
+
+    // ADDFB2: the fourcc spelling of the same binding - XRGB8888, one
+    // plane, no offsets or modifiers - answered with a second fb id.
+    let mut fb2 = [0u8; 100];
+    fb2[4..8].copy_from_slice(&64u32.to_ne_bytes()); // width
+    fb2[8..12].copy_from_slice(&64u32.to_ne_bytes()); // height
+    fb2[12..16].copy_from_slice(&0x3432_5258u32.to_ne_bytes()); // DRM_FORMAT_XRGB8888
+    fb2[20..24].copy_from_slice(&handle.to_ne_bytes()); // handles[0]
+    fb2[36..40].copy_from_slice(&256u32.to_ne_bytes()); // pitches[0]
+    let r = lin::ioctl(fd, ioc_d(NR_ADDFB2, 100), fb2.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"ADDFB2 succeeds", r, 0);
+    let fb2_id = u32::from_ne_bytes([fb2[0], fb2[1], fb2[2], fb2[3]]);
+    lin::check_true(&mut failed, b"ADDFB2 returns a framebuffer id", fb2_id != 0);
+
+    // OBJ_GETPROPERTIES on the connector: the two-call list shape, and the
+    // CRTC_ID/DPMS pair a compositor drives the connector by.
+    let mut props = [0u8; 28];
+    props[20..24].copy_from_slice(&35u32.to_ne_bytes()); // obj_id: the connector
+    props[24..28].copy_from_slice(&0xc0c0_c0c0u32.to_ne_bytes()); // DRM_MODE_OBJECT_CONNECTOR
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_OBJ_GETPROPERTIES, 28),
+        props.as_mut_ptr() as usize,
+    );
+    lin::check_eq(&mut failed, b"OBJ_GETPROPERTIES succeeds", r, 0);
+    let count = u32::from_ne_bytes([props[16], props[17], props[18], props[19]]);
+    lin::check_eq(
+        &mut failed,
+        b"the connector carries properties",
+        count as isize,
+        2,
+    );
+    let mut prop_ids = [0u32; 2];
+    let mut prop_values = [0u64; 2];
+    props[0..8].copy_from_slice(&(prop_ids.as_mut_ptr() as usize as u64).to_ne_bytes());
+    props[8..16].copy_from_slice(&(prop_values.as_mut_ptr() as usize as u64).to_ne_bytes());
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_OBJ_GETPROPERTIES, 28),
+        props.as_mut_ptr() as usize,
+    );
+    lin::check_eq(&mut failed, b"OBJ_GETPROPERTIES fills the arrays", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"the connector's first property is CRTC_ID",
+        prop_ids[0] as isize,
+        70,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the connector is bound to the one CRTC",
+        prop_values[0] as isize,
+        CRTC_ID as isize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the connector's second property is DPMS",
+        prop_ids[1] as isize,
+        71,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the connector's DPMS mode is on",
+        prop_values[1] as isize,
+        0,
+    );
+
+    // OBJ_GETPROPERTIES on the plane: the `type` property that classifies it
+    // - what weston picks its primary plane by.
+    let mut pprops = [0u8; 28];
+    pprops[20..24].copy_from_slice(&36u32.to_ne_bytes()); // obj_id: the plane
+    pprops[24..28].copy_from_slice(&0xeeee_eeeeu32.to_ne_bytes()); // DRM_MODE_OBJECT_PLANE
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_OBJ_GETPROPERTIES, 28),
+        pprops.as_mut_ptr() as usize,
+    );
+    lin::check_eq(&mut failed, b"the plane carries properties", r, 0);
+    let mut pids = [0u32; 1];
+    let mut pvals = [0u64; 1];
+    pprops[0..8].copy_from_slice(&(pids.as_mut_ptr() as usize as u64).to_ne_bytes());
+    pprops[8..16].copy_from_slice(&(pvals.as_mut_ptr() as usize as u64).to_ne_bytes());
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_OBJ_GETPROPERTIES, 28),
+        pprops.as_mut_ptr() as usize,
+    );
+    lin::check_eq(&mut failed, b"the plane's properties fill", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"the plane's property is its type",
+        pids[0] as isize,
+        73,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the plane is a primary surface",
+        pvals[0] as isize,
+        1,
+    );
+
+    // GETPROPERTY: weston finds its properties by *name*, so the id the
+    // connector's list advertised must answer under the name weston asks
+    // for - and the name field is at 24 in the 64-byte struct.
+    let mut gp = [0u8; 64];
+    gp[16..20].copy_from_slice(&70u32.to_ne_bytes()); // prop_id: CRTC_ID
+    let r = lin::ioctl(fd, ioc_d(NR_GETPROPERTY, 64), gp.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"GETPROPERTY succeeds", r, 0);
+    lin::check_true(
+        &mut failed,
+        b"GETPROPERTY names the property CRTC_ID",
+        unsafe { core::slice::from_raw_parts(gp.as_ptr().add(24), 7) == b"CRTC_ID" },
+    );
+
+    // SET_VERSION: request the 1.4 KMS interface, read the driver's 1.1.
+    let mut ver = [0u8; 16];
+    ver[0..4].copy_from_slice(&1i32.to_ne_bytes()); // drm_di_major
+    ver[4..8].copy_from_slice(&4i32.to_ne_bytes()); // drm_di_minor
+    let r = lin::ioctl(fd, ioc_d(NR_SET_VERSION, 16), ver.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"SET_VERSION succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"SET_VERSION confirms the interface",
+        i32::from_ne_bytes([ver[0], ver[1], ver[2], ver[3]]) as isize,
+        1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"SET_VERSION reports the driver",
+        i32::from_ne_bytes([ver[8], ver[9], ver[10], ver[11]]) as isize,
+        1,
+    );
+
+    // The magic handshake, as a master authenticating itself.
+    let mut magic = [0u8; 4];
+    let r = lin::ioctl(fd, ioc_d(NR_GET_MAGIC, 4), magic.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"GET_MAGIC succeeds", r, 0);
+    let magic = u32::from_ne_bytes([magic[0], magic[1], magic[2], magic[3]]);
+    lin::check_true(&mut failed, b"GET_MAGIC hands out a token", magic != 0);
+    let mut auth = [0u8; 4];
+    auth.copy_from_slice(&magic.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_AUTH_MAGIC, 4), auth.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"AUTH_MAGIC accepts the token", r, 0);
+
+    // GEM_CLOSE: a handle released once, then refused the second time.
+    let mut dumb2 = [0u8; 32];
+    dumb2[0..4].copy_from_slice(&48u32.to_ne_bytes()); // height
+    dumb2[4..8].copy_from_slice(&48u32.to_ne_bytes()); // width
+    dumb2[8..12].copy_from_slice(&32u32.to_ne_bytes()); // bpp
+    let r = lin::ioctl(fd, ioc_d(NR_CREATE_DUMB, 32), dumb2.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"a second dumb buffer is made", r, 0);
+    let handle2 = u32::from_ne_bytes([dumb2[16], dumb2[17], dumb2[18], dumb2[19]]);
+    let mut close = [0u8; 8];
+    close[0..4].copy_from_slice(&handle2.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_GEM_CLOSE, 8), close.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"GEM_CLOSE releases the handle", r, 0);
+    let r = lin::ioctl(fd, ioc_d(NR_GEM_CLOSE, 8), close.as_mut_ptr() as usize);
+    lin::check_eq(
+        &mut failed,
+        b"GEM_CLOSE refuses a dead handle",
+        r,
+        lin::EINVAL,
+    );
+
+    // The render node: the same card under GBM's allocation door, where a
+    // client that is not the master makes its buffers.
+    let render = lin::openat(lin::AT_FDCWD, b"/dev/dri/renderD128\0", O_RDWR, 0) as i32;
+    lin::check_true(&mut failed, b"/dev/dri/renderD128 opens", render >= 0);
+    if render >= 0 {
+        let mut rdumb = [0u8; 32];
+        rdumb[0..4].copy_from_slice(&32u32.to_ne_bytes()); // height
+        rdumb[4..8].copy_from_slice(&32u32.to_ne_bytes()); // width
+        rdumb[8..12].copy_from_slice(&32u32.to_ne_bytes()); // bpp
+        let r = lin::ioctl(
+            render,
+            ioc_d(NR_CREATE_DUMB, 32),
+            rdumb.as_mut_ptr() as usize,
+        );
+        lin::check_eq(&mut failed, b"the render node makes a dumb buffer", r, 0);
+        let rhandle = u32::from_ne_bytes([rdumb[16], rdumb[17], rdumb[18], rdumb[19]]);
+        let rsize = u64_at(&rdumb, 24) as usize;
+        lin::check_true(
+            &mut failed,
+            b"the render node returns a handle",
+            rhandle >= 1,
+        );
+        if r == 0 && rhandle >= 1 {
+            let mut rmap = [0u8; 16];
+            rmap[0..4].copy_from_slice(&rhandle.to_ne_bytes());
+            let r = lin::ioctl(render, ioc_d(NR_MAP_DUMB, 16), rmap.as_mut_ptr() as usize);
+            lin::check_eq(&mut failed, b"the render node maps the buffer", r, 0);
+            let m = lin::mmap(
+                0,
+                rsize,
+                lin::PROT_READ | lin::PROT_WRITE,
+                lin::MAP_SHARED,
+                render,
+                u64_at(&rmap, 8) as usize,
+            );
+            lin::check_true(&mut failed, b"the render node's buffer maps", m > 0);
+            if m > 0 {
+                unsafe {
+                    (m as *mut u32).write_volatile(0xfeed_face);
+                }
+                let back = unsafe { (m as *const u32).read_volatile() };
+                lin::check_eq(
+                    &mut failed,
+                    b"the render node's mapping round-trips",
+                    back as isize,
+                    0xfeed_face as isize,
+                );
+                let _ = lin::munmap(m as usize, rsize);
+            }
+            let mut rclose = [0u8; 8];
+            rclose[0..4].copy_from_slice(&rhandle.to_ne_bytes());
+            let _ = lin::ioctl(render, ioc_d(NR_GEM_CLOSE, 8), rclose.as_mut_ptr() as usize);
+        }
+        let _ = lin::close(render);
+    }
 
     let _ = lin::close(fd);
     lin::done(failed)

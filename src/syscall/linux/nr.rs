@@ -352,6 +352,10 @@ pub const CREAT: u64 = 85;
 pub const UTIME: u64 = 132;
 /// `fchmodat(2)`: the permission bits, relative to a dirfd.
 pub const FCHMODAT: u64 = 268;
+/// `fchmodat2(2)`: the same call with a flags word (`AT_SYMLINK_NOFOLLOW`,
+/// `AT_EMPTY_PATH`). Linux 6.6 added it, and apk-tools reaches for it on
+/// every setuid or set-group-id file it unpacks.
+pub const FCHMODAT2: u64 = 452;
 /// `mknodat(2)`: create a node, relative to a dirfd.
 pub const MKNODAT: u64 = 259;
 /// `futimesat(2)`: the timestamps call with the dirfd the future took.
@@ -785,6 +789,7 @@ mod tests {
         assert_eq!(CREAT, 85);
         assert_eq!(UTIME, 132);
         assert_eq!(FCHMODAT, 268);
+        assert_eq!(FCHMODAT2, 452);
         assert_eq!(MKNODAT, 259);
         assert_eq!(FUTIMESAT, 261);
         assert_eq!(READAHEAD, 187);

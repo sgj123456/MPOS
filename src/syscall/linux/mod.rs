@@ -326,6 +326,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::OPENAT2 => fs::handle_openat2(args, &cwd(), from_user),
         nr::FACCESSAT2 => fs::handle_faccessat2(args, &cwd()),
         nr::FCHMODAT => fs::handle_fchmodat(args, &cwd()),
+        nr::FCHMODAT2 => fs::handle_fchmodat2(args, &cwd()),
         nr::MKNODAT => fs::handle_mknodat(args, &cwd()),
         nr::FUTIMESAT => fs::handle_futimesat(args, &cwd(), from_user),
         nr::CREAT => fs::handle_creat(args, &cwd()),

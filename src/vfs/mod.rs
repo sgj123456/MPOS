@@ -20,6 +20,8 @@
 
 pub mod devfs;
 pub mod devpts;
+#[cfg(target_os = "none")]
+pub mod dmabuf;
 pub mod epoll;
 pub mod eventfd;
 pub mod ext4;
@@ -466,6 +468,17 @@ pub trait Inode: Send + Sync {
     /// page allocator to build.
     #[cfg(target_os = "none")]
     fn as_memfd(&self) -> Option<&crate::vfs::memfd::Memfd> {
+        None
+    }
+
+    /// The dma-buf this node is, if it is one - how the DRM card's PRIME
+    /// import recognizes a descriptor that names shareable pages (and hands
+    /// the geometry and the pages back to build a GEM handle from), and how
+    /// the dma-buf ioctls reach a buffer without knowing who exported it.
+    /// Same shape as [`Self::as_memfd`], for the same reason. Gated with
+    /// the `dmabuf` module.
+    #[cfg(target_os = "none")]
+    fn as_dmabuf(&self) -> Option<&crate::vfs::dmabuf::DmaBuf> {
         None
     }
 

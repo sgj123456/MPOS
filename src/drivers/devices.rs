@@ -292,9 +292,20 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // the raw framebuffer) opens `/dev/dri/card0`, makes dumb buffers, and
     // page-flips them onto the scanout. One card, fixed ids, software
     // presentation only.
+    //
+    // Beside it the render node: GBM opens renderD128 to make its buffers
+    // (a GL client is not the display master, so libdrm's convention is to
+    // allocate on the render node and import onto the card), and mpos has one
+    // card with no permission boundary between the two names - so the node
+    // is the same card state under a fresh inode, not a second driver.
+    // Both nodes ioctl the same single `DrmState`, and a modesetting ioctl
+    // sent to the render node is accepted the way it would be on card0
+    // (a teaching kernel's honesty; the split is a naming convention here,
+    // not a boundary).
     {
         let dri = dev.register_dir("dri");
         dri.insert("card0", crate::drivers::drm::DrmCard::new(0x9100));
+        dri.insert("renderD128", crate::drivers::drm::DrmCard::new(0x9200));
     }
 
     if let Some(raw) = crate::blk::raw_disk() {

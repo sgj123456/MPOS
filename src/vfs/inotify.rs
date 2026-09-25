@@ -853,6 +853,19 @@ mod tests {
         (node, instance)
     }
 
+    /// One instance for a test that needs its own, serialized against the
+    /// inventory tests: the cap is system-wide, so a test that fills it
+    /// (`the_instance_cap_answers_and_frees`) must not run beside one that
+    /// needs a slot - which is exactly what it did, and what made this test
+    /// fail on the days the parallel harness scheduled them together. The
+    /// guard is held only for the creation; the slot, once taken, is the
+    /// test's own. It is *not* reentrant, so a caller must not already hold
+    /// it.
+    fn instance(ino: Ino, nonblock: bool) -> Arc<InotifyInstance> {
+        let _g = lock_tests();
+        InotifyInstance::try_new(ino, nonblock).expect("under the cap")
+    }
+
     /// The ABI, pinned against the headers: the event bits in order, the
     /// aggregates as Linux sums them, the init flags as the `O_` values.
     #[test]
@@ -948,7 +961,7 @@ mod tests {
     /// arriving cut.
     #[test]
     fn the_read_takes_whole_records_and_leaves_the_unfit_one() {
-        let fd = InotifyInstance::try_new(1, true).expect("under the cap");
+        let fd = instance(1, true);
         assert_eq!(
             fd.read_at(0, &mut [0u8; 8]).err(),
             Some(VfsError::Invalid),
@@ -983,7 +996,7 @@ mod tests {
     /// never writable.
     #[test]
     fn poll_reports_readability_and_never_writability() {
-        let fd = InotifyInstance::try_new(2, false).unwrap();
+        let fd = instance(2, false);
         assert!(!fd.poll_ready().read);
         assert!(!fd.poll_ready().write);
         fd.push(self_event(1, IN_ATTRIB));
@@ -995,7 +1008,7 @@ mod tests {
     /// resolves both ways, and a forgotten wd answers none.
     #[test]
     fn wds_start_at_one_and_map_back_to_their_key() {
-        let fd = InotifyInstance::try_new(3, false).unwrap();
+        let fd = instance(3, false);
         let wd = fd.alloc_wd();
         assert_eq!(wd, 1);
         fd.record_wd(wd, (0, 55));
@@ -1011,7 +1024,7 @@ mod tests {
     /// while the episode lasts.
     #[test]
     fn a_full_queue_reports_overflow_once() {
-        let fd = InotifyInstance::try_new(4, false).unwrap();
+        let fd = instance(4, false);
         for i in 0..MAX_QUEUED_EVENTS as u32 {
             fd.push(self_event(i as i32, IN_MODIFY));
         }

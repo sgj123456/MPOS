@@ -3515,20 +3515,66 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             n as isize
         }
-        request if (request & 0xff) == b'E' as u32 => evdev_ioctl(fd, request, buf, from_user),
+        request if family_nr(request, b'E').is_some() => evdev_ioctl(fd, request, buf, from_user),
         // Console-ownership (`'V'`-typed VT_*) and keyboard/video-mode
         // (`'K'`-typed KD*) ioctls, which a seat manager drives the line
         // through when it takes a terminal away from the text console and
         // hands it to a compositor.
-        request if (request & 0xff) == b'V' as u32 => vt_ioctl(fd, request, buf, from_user),
-        request if (request & 0xff) == b'K' as u32 => kd_ioctl(fd, request, buf, from_user),
-        // DRM/KMS ioctls (`'d'`-typed), routed to the card handler which
-        // dispatches on the request number itself.
+        request if family_nr(request, b'V').is_some() => vt_ioctl(fd, request, buf, from_user),
+        request if family_nr(request, b'K').is_some() => kd_ioctl(fd, request, buf, from_user),
+        // dma-buf ioctls (`'b'`-typed), on the descriptor a PRIME export
+        // handed out. A dma-buf here is coherent guest RAM - the same pages
+        // the exporter and every mapper share - so the CPU access bracket
+        // `DMA_BUF_IOCTL_SYNC` is accepted as the no-op it documents itself
+        // as for coherent memory, and `DMA_BUF_SET_NAME` is a debug label
+        // nothing reads. Anything else on one of these descriptors is as
+        // unknown as it is on Linux.
         #[cfg(target_os = "none")]
-        request if (request & 0xff) == b'd' as u32 => {
-            crate::drivers::drm::drm_ioctl(fd, request, buf)
+        request if family_nr(request, b'b').is_some() => {
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            if file.inode().as_dmabuf().is_none() {
+                return err::ENOTTY;
+            }
+            if !buffer_ok(buf, 8, false, from_user) {
+                return err::EFAULT;
+            }
+            match family_nr(request, b'b') {
+                Some(0) | Some(1) => 0, // SYNC / SET_NAME
+                _ => err::ENOTTY,
+            }
         }
+        // DRM/KMS ioctls (`'d'`-typed), routed to the card handler with the
+        // command number already decoded out of the request word.
+        #[cfg(target_os = "none")]
+        request if family_nr(request, b'd').is_some() => match family_nr(request, b'd') {
+            Some(nr) => crate::drivers::drm::drm_ioctl(fd, nr, buf),
+            None => err::ENOTTY,
+        },
         _ => err::ENOTTY,
+    }
+}
+
+/// The command number of a request word, for a family whose magic byte is
+/// `magic` - or `None` when the request does not belong to the family.
+///
+/// Linux lays an `_IOC` word out with the family byte at bits 8..15 and the
+/// command number in the low byte, and that is the shape every real binary
+/// sends: libdrm, libseat, mesa, all of them. This kernel's own ABI tests
+/// were written with the two bytes swapped, and the family dispatch grew to
+/// match them - so both spellings are recognized, the family byte saying
+/// which half the number lives in. The command ranges the families use never
+/// collide with the magic bytes, so the two spellings cannot be confused.
+fn family_nr(request: u32, magic: u8) -> Option<u32> {
+    let magic = magic as u32;
+    if (request >> 8) & 0xff == magic {
+        Some(request & 0xff)
+    } else if request & 0xff == magic {
+        Some((request >> 8) & 0xff)
+    } else {
+        None
     }
 }
 
@@ -3542,7 +3588,9 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// values rather than a flat success.
 fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let size = ((request >> 16) & 0x3fff) as usize;
-    let nr = (request >> 8) & 0xff;
+    let Some(nr) = family_nr(request, b'V') else {
+        return err::ENOTTY;
+    };
     // These name a console, so only a tty answers them.
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
@@ -3601,7 +3649,9 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 /// the keyboard already reaches input as events, so these record nothing -
 /// they only have to succeed for a seat manager to complete the switch.
 fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
-    let nr = (request >> 8) & 0xff;
+    let Some(nr) = family_nr(request, b'K') else {
+        return err::ENOTTY;
+    };
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
         Err(e) => return err_of(e),
@@ -3637,7 +3687,8 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 
 /// The evdev (`'E'`-typed) ioctl set libinput reads to classify a device
 /// before it consumes any event. `request` carries the direction in bits
-/// 30-31, the number in 8-15 and the caller's buffer size in 16-29; the
+/// 30-31, the number in whichever half the family byte did not take (see
+/// [`family_nr`]) and the caller's buffer size in 16-29; the
 /// number selects which question this is. Reads answer from the node's
 /// frozen capability picture (`drivers/virtio/input.rs`); the handful of
 /// writes this kernel honors (`EVIOCGRAB`, and the keymap/force-feedback
@@ -3647,7 +3698,9 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let size = ((request >> 16) & 0x3fff) as usize;
     let dir = (request >> 30) & 0x3;
-    let nr = (request >> 8) & 0xff;
+    let Some(nr) = family_nr(request, b'E') else {
+        return err::ENOTTY;
+    };
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
         Err(e) => return err_of(e),
@@ -5398,30 +5451,62 @@ pub(super) fn handle_faccessat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) 
     }
 }
 
-/// `fchmodat(dirfd, path, mode, flags)` — the permission bits, relative to
-/// a dirfd.
+/// `fchmodat(dirfd, path, mode)` — the permission bits, relative to a dirfd.
 ///
-/// The bit this call adds to `chmod`'s vocabulary is `AT_SYMLINK_NOFOLLOW`,
-/// and Linux cannot honour it either: the syscall follows the link, and
-/// glibc answers EOPNOTSUPP for a caller that asks. This keeps that same
-/// split — follow the link, and refuse the flag rather than silently
-/// ignoring it.
+/// The syscall takes three arguments and no flags word: what a caller wants
+/// from one (`AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`) goes through
+/// [`handle_fchmodat2`] instead - musl and glibc both refuse those flags
+/// before the kernel is ever reached, so the fourth register here holds
+/// nothing a caller meant to say, and is not read.
 pub(super) fn handle_fchmodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    if args[3] & !(abi::AT_SYMLINK_NOFOLLOW | abi::AT_EMPTY_PATH) != 0 {
-        return err::EINVAL;
+    let path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_of(args[0] as i32, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
+    match crate::vfs::resolve_opt(&path, Some(base)) {
+        Ok(inode) => match chmod_mode(&inode, args[2] as u32) {
+            Ok(mode) => {
+                inode.set_mode(mode);
+                crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+                0
+            }
+            Err(e) => e,
+        },
+        Err(e) => err_of(e),
     }
-    if args[3] & abi::AT_SYMLINK_NOFOLLOW != 0 {
-        return err::EOPNOTSUPP;
+}
+
+/// `fchmodat2(dirfd, path, mode, flags)` — the permission bits, relative to a
+/// dirfd, with the flags word the old call never had (Linux 6.6 added the
+/// call for exactly this).
+///
+/// `AT_SYMLINK_NOFOLLOW` names the link itself rather than what it points
+/// at, and a link has no mode of its own, so one is answered `EOPNOTSUPP` -
+/// while any other file is chmod'ed as asked. `AT_EMPTY_PATH` with an empty
+/// name is `fchmod` by descriptor - how an installer marks a not-yet-linked
+/// `O_TMPFILE` setuid before it has a name at all.
+///
+/// This is the call `apk` makes for every setuid or set-group-id file it
+/// unpacks (`fs_fsys.c` reaches for it under `AT_SYMLINK_NOFOLLOW`), which
+/// is why it exists here: without it, every package install warned
+/// "failed to preserve <file>: permission" over exactly those files and
+/// dropped their special bits.
+pub(super) fn handle_fchmodat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    let flags = args[3];
+    if flags & !(abi::AT_SYMLINK_NOFOLLOW | abi::AT_EMPTY_PATH) != 0 {
+        return err::EINVAL;
     }
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
-    // `AT_EMPTY_PATH` with an empty name is `fchmod`-by-descriptor: set the mode
-    // of whatever the fd holds. `apk` uses it to mark an `O_TMPFILE` file setuid
-    // before it has a name at all.
+    // An empty name with `AT_EMPTY_PATH` is the descriptor, not the tree.
     if path.is_empty() {
-        if args[3] & abi::AT_EMPTY_PATH == 0 {
+        if flags & abi::AT_EMPTY_PATH == 0 {
             return err::ENOENT;
         }
         let inode = match crate::sched::current_fds().clone_at(args[0] as i32) {
@@ -5431,6 +5516,7 @@ pub(super) fn handle_fchmodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) ->
         return match chmod_mode(&inode, args[2] as u32) {
             Ok(mode) => {
                 inode.set_mode(mode);
+                crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
                 0
             }
             Err(e) => e,
@@ -5440,15 +5526,27 @@ pub(super) fn handle_fchmodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) ->
         Ok(base) => base,
         Err(e) => return e,
     };
-    match crate::vfs::resolve_opt(&path, Some(base)) {
-        Ok(inode) => match chmod_mode(&inode, args[2] as u32) {
-            Ok(mode) => {
-                inode.set_mode(mode);
-                0
-            }
-            Err(e) => e,
-        },
-        Err(e) => err_of(e),
+    let resolved = if flags & abi::AT_SYMLINK_NOFOLLOW != 0 {
+        crate::vfs::global().resolve_no_follow(&path, base)
+    } else {
+        crate::vfs::resolve_opt(&path, Some(base))
+    };
+    let inode = match resolved {
+        Ok(inode) => inode,
+        Err(e) => return err_of(e),
+    };
+    // The flag can name a link; a link carries no permission bits of its
+    // own, so there is nothing to change - the answer Linux gives.
+    if inode.metadata().kind == NodeKind::Symlink {
+        return err::EOPNOTSUPP;
+    }
+    match chmod_mode(&inode, args[2] as u32) {
+        Ok(mode) => {
+            inode.set_mode(mode);
+            crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+            0
+        }
+        Err(e) => e,
     }
 }
 

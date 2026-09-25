@@ -783,15 +783,11 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
 /// one of those is gone. This runs after the table entry is removed, so a
 /// count of one means the reference in hand is the only one left.
 pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
-    // The last reference to a unix socket retires its slot (and its name's
-    // table key) the same way a network socket's frees its registry entry.
-    let unix_id = file.inode().unix_id();
-    if unix_id != 0 {
-        if Arc::strong_count(file) == 1 {
-            super::unix::release(unix_id);
-        }
-        return;
-    }
+    // A unix socket needs no close hook here: its registry slot is weak
+    // and its drop is the retirement, so the last Arc away - this
+    // table's, an epoll interest list's, whoever's - is the whole of its
+    // death, whichever path let it go.
+    //
     // A vsock socket retires by its own registry id: the device is told -
     // the connection reset, the listener's port unlistened - and the slot
     // goes empty.
@@ -815,35 +811,18 @@ pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
 pub(crate) fn close_sockets_at_exit(files: &[Arc<crate::vfs::File>]) {
     let mut closed: Vec<usize> = Vec::new();
     for file in files {
-        // Unix sockets retire by their own slot number, on the same
-        // last-reference rule: the batch holds all the references when it
-        // closes. The id space is disjoint from the network registry's -
-        // unix ids carry their own sequence - so the dedup list below is
-        // kept honest by tagging each closed id by kind.
-        let unix_id = file.inode().unix_id();
-        if unix_id != 0 {
-            // The two id spaces share this dedup list, so unix ids carry
-            // a tag bit the network handles cannot reach (they are small
-            // slot indexes into the stack's Vec).
-            const UNIX_TAG: usize = 1 << 40;
-            if closed.contains(&(unix_id | UNIX_TAG)) {
-                continue;
-            }
-            let ptr = Arc::as_ptr(file) as *const ();
-            let total = Arc::strong_count(file);
-            let in_batch = files
-                .iter()
-                .filter(|other| Arc::as_ptr(other) as *const () == ptr)
-                .count();
-            if total == in_batch {
-                closed.push(unix_id | UNIX_TAG);
-                super::unix::release(unix_id);
-            }
-            continue;
-        }
+        // Unix sockets need no pass here at all: their registry slots are
+        // weak and their drop retires them, so the batch's own drop -
+        // `queue_release`, then the scheduler's drain - is what ends them,
+        // in the same moment it ends the epoll instances holding
+        // references to them. A count gate in this loop was the earlier
+        // design, and an epoll entry watching its own listener (every
+        // daemon's shape) made it read "someone still owns this" on the
+        // day the owner died, leaving the listener answering connects for
+        // ever.
         // Vsock sockets retire by their registry id, on the same
         // last-reference rule, with their own tag bit in the dedup list -
-        // the third id space this loop walks.
+        // the other id space this loop walks.
         let vsock_id = file.inode().vsock_id();
         if vsock_id != 0 {
             const VSOCK_TAG: usize = 1 << 41;

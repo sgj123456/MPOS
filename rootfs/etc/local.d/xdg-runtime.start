@@ -1,0 +1,26 @@
+#!/bin/sh
+# The runtime directories a Wayland compositor needs, made at boot.
+#
+# `local` runs every executable /etc/local.d/*.start after the rest of the
+# boot runlevel, and this is the one piece of the session that has no service
+# of its own: /run/user/<uid>, the place weston puts its socket, with the
+# 0700 the protocol requires.
+#
+# seatd does not create these - it is a seat manager, not a login manager.
+# A stock Alpine gets them from elogind, which declares `need cgroups` and
+# so cannot run on this kernel; what is left is making the directory here,
+# once, at boot.
+set -eu
+
+mkdir -p /run/user/0
+chmod 0700 /run/user/0
+
+# The unprivileged account too, if the image has one: the same directory
+# under its own uid, owned by it, so `XDG_RUNTIME_DIR=/run/user/<uid>` from
+# /etc/profile.d/xdg-runtime.sh is a directory it can actually use.
+if id mpos >/dev/null 2>&1; then
+    uid=$(id -u mpos)
+    mkdir -p "/run/user/$uid"
+    chmod 0700 "/run/user/$uid"
+    chown mpos:mpos "/run/user/$uid"
+fi

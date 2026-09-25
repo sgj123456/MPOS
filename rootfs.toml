@@ -45,10 +45,28 @@ mkfs_options = "^has_journal,^metadata_csum"
 base_packages = ["alpine-base", "e2fsprogs", "dosfstools"]
 
 # Additional packages to install in the rootfs, on top of the base ones.
-# `doas` is the privilege escalation tool this image ships - not sudo, which is
-# deliberately absent.
+# `doas` is the privilege escalation tool this image ships - not sudo, which
+# is deliberately absent. The graphics stack is weston on the DRM card:
+# `weston-backend-drm` is the backend module (the weston package ships only
+# the gl renderer, no fbdev backend, so DRM+GL is the one display path), and
+# the mesa packages bring GBM/EGL and the software GL driver. `mesa` is the
+# gallium core and `mesa-dri-gallium` the DRI drivers themselves (swrast and
+# kms_swrast - llvmpipe; nothing depends on that package, so it has to be
+# named). mesa-egl/gbm/gl/gles and libdrm arrive as apk dependencies of the
+# tools. `mesa-utils` is `eglinfo`, `kmscube` the first end-to-end probe of
+# DRM+GBM+EGL before weston enters.
+#
+# The `-openrc` packages are the service scripts themselves - Alpine keeps
+# them in subpackages, so a daemon without its `-openrc` half has no
+# `/etc/init.d` entry for a runlevel to point at. `seatd-openrc` is the seat
+# manager weston's DRM backend gets its card and console from; `dbus-openrc`
+# is the session bus a stock Wayland setup starts (`setup-wayland-base`
+# enables it); `busybox-openrc` carries the syslog and crond scripts the
+# stock boot runlevel wants. Which of them the image actually starts is in
+# `xtask/src/rootfs.rs` (`SERVICES`), not here.
 extra_packages = [
     "openrc",
+    "busybox-openrc",
     "alpine-release",
     "ssl_client",
     "ca-certificates",
@@ -60,7 +78,15 @@ extra_packages = [
     "curl",
     "doas",
     "weston",
+    "weston-backend-drm",
+    "mesa",
+    "mesa-dri-gallium",
+    "mesa-utils",
+    "kmscube",
     "seatd",
+    "seatd-openrc",
+    "dbus",
+    "dbus-openrc",
     "fish"
 ]
 
@@ -92,8 +118,11 @@ root_password = ""
 # whole thing and leaves an image that only ever logs in as root.
 [user]
 name = "mpos"
-# Groups to add it to. `wheel` is the one /etc/doas.conf grants escalation to.
-groups = ["mpos", "wheel"]
+# Groups to add it to. `wheel` is the one /etc/doas.conf grants escalation to;
+# `seat` is the group the seatd service hands its socket to, so an account
+# that is not root can still start a compositor (seatd's own package makes
+# the group, and root is let through regardless).
+groups = ["mpos", "wheel", "seat"]
 shell = "/usr/bin/fish"
 # Empty means the account has no password to type, like root above. Anything
 # else is set with chpasswd.

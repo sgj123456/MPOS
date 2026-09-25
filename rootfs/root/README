@@ -17,17 +17,38 @@ anything the build writes.
 | `etc/network/interfaces` | the network: interfaces, addressing, the hook lines |
 | `etc/resolv.conf` | the resolver - QEMU's user-mode forwarder at 10.0.2.3 |
 | `etc/doas.conf` | who may escalate: `wheel`, no password |
+| `etc/profile.d/xdg-runtime.sh` | `XDG_RUNTIME_DIR` for the login shells |
+| `etc/fish/conf.d/xdg-runtime.fish` | the same for the `fish` shells |
+| `etc/local.d/xdg-runtime.start` | makes `/run/user/<uid>` at boot (see below) |
 
 `rootfs.toml` is for the values the build has to interpolate - the hostname, the
 accounts and their passwords, the package list, the mirror, the disk layout -
 because those have no file to live in. Anything that is a constant belongs here,
 where changing it is editing a file rather than a Rust string.
 
+## Which services boot
+
+The runlevels are filled by `enable_services` in `xtask/src/rootfs.rs`
+(`SERVICES`), which is the one place to read or change them: a symlink per
+service, which is all `rc-update add` makes. It is the stock Alpine set -
+`setup-alpine`, `setup-devd`, `setup-wayland-base` - minus the entries this
+kernel cannot honour, and the comment there says which and why (no module
+loader, no cgroup filesystem, a single-reader evdev queue, a link the kernel
+already configured).
+
+`seatd` is the seat manager the session runs on: weston's DRM backend asks
+libseat for the card and the console, and seatd is what hands them over.
+`dbus` is the session bus a stock Wayland setup starts. `local` runs the
+scripts in `/etc/local.d` - which is where the runtime directory a Wayland
+compositor needs comes from, because seatd (unlike elogind, which needs
+cgroups) does not create one.
+
 ## Adding something
 
 Drop it in: `rootfs/etc/init.d/custom-service` becomes
 `/etc/init.d/custom-service` on the image, and the next `cargo xtask rootfs`
-copies it in - no reinstall, no package list to change.
+copies it in - no reinstall, no package list to change. To have it *started*,
+name it in `SERVICES` in `xtask/src/rootfs.rs`.
 
 A service script has to be executable for OpenRC to start it:
 

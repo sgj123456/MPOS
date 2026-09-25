@@ -872,6 +872,84 @@ fn install_base(
     // by the time the account points at it.
     create_user(mount_dir, &config.user)?;
 
+    // And after the account, so a group the config adds it to exists.
+    enable_services(mount_dir)?;
+
+    Ok(())
+}
+
+/// The services a fresh image boots with, in the runlevel each starts from.
+///
+/// This is what a stock Alpine turns on - `setup-alpine`, `setup-devd`'s
+/// device manager, and `setup-wayland-base`'s session bus - with the entries
+/// this kernel cannot honour left out, each for a reason the kernel itself
+/// gives:
+///
+///   * `devfs`, `mdev`, `hwdrivers`, `udev`: the initramfs mounts `/dev` as
+///     devtmpfs and the drivers populate it as they probe. There is no module
+///     loader for `hwdrivers` to load a modalias with and no hotplug event
+///     for a device manager to deliver.
+///   * `networking`: the kernel brings `eth0` up with the address QEMU's
+///     user-mode network hands out. The service would run a DHCP client over
+///     a link that is already configured, and a client that fails leaves the
+///     interface it flushed behind it.
+///   * `cgroups` and `elogind`: `elogind` declares `need cgroups`, and this
+///     kernel has no cgroup filesystem for either to stand on. Stock Alpine
+///     does not enable `elogind` either - `setup-wayland-base` starts the
+///     bus and leaves the login manager to whoever wants it. `seatd` is the
+///     seat manager that runs here, and `weston` reaches it through libseat.
+///   * `acpid`: it would open `/dev/input/event*`, and this kernel's evdev
+///     nodes are a single queue - a second reader takes the compositor's
+///     keystrokes away from it.
+///
+/// What is left is the log, the clock, the hostname, the session bus, the
+/// seat manager, and the hook a local service script hangs off. `hwclock` is
+/// the `clock` provider `syslog` needs (`need clock hostname localmount`);
+/// on a machine with no `/dev/rtc` node it warns and starts anyway, which is
+/// how the service is written.
+const SERVICES: &[(&str, &[&str])] = &[
+    ("sysinit", &["dmesg"]),
+    (
+        "boot",
+        &[
+            "hwclock", "modules", "sysctl", "hostname", "bootmisc", "syslog", "seedrng",
+        ],
+    ),
+    ("default", &["dbus", "seatd", "crond", "local"]),
+    ("shutdown", &["killprocs", "mount-ro", "savecache"]),
+];
+
+/// Turn on the services [`SERVICES`] names, the way `rc-update add` does it:
+/// a symlink from the runlevel directory to the init script, which is the
+/// whole of what a runlevel is. Done here rather than through a chroot round
+/// trip so a rebuild reproduces the boot from the config alone, and so the
+/// set is one place to read.
+///
+/// A service whose script is not installed is named and skipped: which
+/// packages the image carries is the config's decision, and a runlevel entry
+/// pointing at a script that is not there would be an OpenRC complaint on
+/// every boot.
+fn enable_services(mount_dir: &Path) -> Result<()> {
+    let mut enabled = 0usize;
+    for (runlevel, services) in SERVICES {
+        let dir = mount_dir.join("etc/runlevels").join(runlevel);
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create the {runlevel} runlevel"))?;
+        for service in *services {
+            if !mount_dir.join("etc/init.d").join(service).exists() {
+                println!("rootfs: {service} is not installed; not adding it to {runlevel}");
+                continue;
+            }
+            let link = dir.join(service);
+            if link.symlink_metadata().is_ok() {
+                continue;
+            }
+            std::os::unix::fs::symlink(format!("/etc/init.d/{service}"), &link)
+                .with_context(|| format!("Failed to enable {service} in {runlevel}"))?;
+            enabled += 1;
+        }
+    }
+    println!("rootfs: enabled {enabled} boot services");
     Ok(())
 }
 
