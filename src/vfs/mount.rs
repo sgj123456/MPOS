@@ -49,6 +49,12 @@ struct Mount {
     /// needs it: changing the read-only state is a request to the filesystem,
     /// not a note in this table.
     fs: Option<Arc<dyn FileSystem>>,
+    /// Whether this record is a bind alias rather than an attached
+    /// filesystem: `root` is a node that another record - or the root slot -
+    /// already serves, and the `id`, `fs` and `fstype` below are *borrowed*
+    /// from that serving instance so one filesystem keeps one identity under
+    /// both of its names.
+    bind: bool,
 }
 
 /// A set of mounts with a root, and the resolver over them.
@@ -152,6 +158,7 @@ impl Vfs {
                 id,
                 read_only: false,
                 fs: None,
+                bind: false,
             });
             Ok(())
         })?;
@@ -397,6 +404,80 @@ impl Vfs {
                 id,
                 read_only,
                 fs: Some(fs),
+                bind: false,
+            });
+            Ok(())
+        })?;
+        self.refresh_mount_points();
+        Ok(())
+    }
+
+    /// `mount --bind`: hang an already-existing directory tree at a second
+    /// name, sharing everything about the instance that serves it.
+    ///
+    /// A bind is not a filesystem; it is a second edge into one. The new
+    /// record borrows the serving instance's id, type, filesystem handle and
+    /// write promise rather than minting its own, because the point of the
+    /// operation is that the two names are the *same* storage: a file written
+    /// through one appears under the other, and `stat` answers one `st_dev`
+    /// from either. The resolver already swaps a mountpoint child for its
+    /// mount's root, and `root` here is simply a node that is not a freshly
+    /// attached filesystem's - so the crossing itself needs no new machinery.
+    ///
+    /// What is not here: binding a *file* (the resolver models directory
+    /// crossings only, and no boot caller binds anything else), and `MS_REC`'s
+    /// carrying of the subtree's other mounts - the handler refuses that flag
+    /// rather than silently binding less than was asked.
+    pub fn bind_mount(
+        &self,
+        at: Arc<dyn Inode>,
+        source: Arc<dyn Inode>,
+        source_path: &str,
+        read_only: bool,
+    ) -> VfsResult<()> {
+        if at.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        if source.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::Invalid);
+        }
+        // What serves the source is what serves the bind: the same questions
+        // `stat`'s `st_dev` and `statfs` already answer by path, asked of the
+        // name the caller gave.
+        let (id, fstype) = self.fs_of_path(source_path);
+        let fs = self.fs_serving_path(source_path);
+        let serving_read_only = critical_section::with(|cs| {
+            if id == 0 {
+                *self.root_read_only.borrow(cs).borrow()
+            } else {
+                self.mounts
+                    .borrow(cs)
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|m| m.id == id)
+                    .is_some_and(|m| m.read_only)
+            }
+        });
+        critical_section::with(|cs| {
+            let mut mounts = self.mounts.borrow(cs).borrow_mut();
+            if mounts.iter().any(|m| Arc::ptr_eq(&m.at, &at)) {
+                return Err(VfsError::Busy);
+            }
+            mounts.push(Mount {
+                at,
+                root: source,
+                fstype,
+                source: alloc::string::String::from(source_path),
+                id,
+                // A bind's own `MS_RDONLY` is a promise about writes *through
+                // this name*; it does not reach the shared filesystem, which
+                // the other name may still write through. Nothing in this
+                // boot asks; the distinction is recorded so that when it does,
+                // the record tells which one it was.
+                read_only: serving_read_only || read_only,
+                fs,
+                bind: true,
             });
             Ok(())
         })?;
@@ -445,13 +526,49 @@ impl Vfs {
         })
     }
 
+    /// The *mountpoint's own* directory for `path`: the parent resolved
+    /// through the table as it stands, and the final name looked up in it
+    /// **without** the crossing. A caller mounting on a directory that is
+    /// already someone's mountpoint must meet that directory, not the tree
+    /// currently covering it - resolving all the way would re-aim the mount
+    /// into the existing mount's filesystem, and its "is this point taken?"
+    /// check at that answer is a question about the wrong inode.
+    fn mountpoint_inode(
+        &self,
+        path: &str,
+        start: Option<Arc<dyn Inode>>,
+    ) -> VfsResult<Arc<dyn Inode>> {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            // The target of a bind can never be `/` itself (the kernel has
+            // one root slot, and no mountpoint inode names it), but the
+            // mountpoint of a path *is* wherever the walk starts for "/".
+            return Ok(self.root_inode());
+        }
+        let (parent_path, name) = split_last(trimmed);
+        let parent = match start {
+            Some(s) => self.resolve_from(parent_path, s)?,
+            None => self.resolve(parent_path)?,
+        };
+        if parent.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        parent.lookup(name)
+    }
+
     /// Unmount whatever is mounted on `target`, given the mountpoint's own
     /// inode - the shape `umount2(2)` arrives in, having resolved the path
     /// against its caller's cwd.
     pub fn unmount_resolved(&self, target: &Arc<dyn Inode>) -> VfsResult<()> {
         critical_section::with(|cs| {
             let mut mounts = self.mounts.borrow(cs).borrow_mut();
-            if let Some(pos) = mounts.iter().position(|m| Arc::ptr_eq(&m.root, target)) {
+            // The *last* record wins, the way a stack of mounts on one
+            // directory peels from the top: a bind shares its source's tree -
+            // the source's own mount entry, or the root - and unmounting the
+            // bind's name must remove the bind, not the mount underneath it.
+            // Bind entries are pushed after what they alias, so newest-first
+            // is the right search order.
+            if let Some(pos) = mounts.iter().rposition(|m| Arc::ptr_eq(&m.root, target)) {
                 mounts.remove(pos);
                 Ok(())
             } else {
@@ -576,6 +693,7 @@ impl Vfs {
                 id,
                 read_only: false,
                 fs: None,
+                bind: false,
             });
             *self.root.borrow(cs).borrow_mut() = Some(new_root_inode);
         });
@@ -628,6 +746,17 @@ impl Vfs {
         // the link it came from.
         let mut base = start;
         let mut hops = 0;
+        // Whether the walk's current context is inside a *bind* alias. Linux
+        // copies no child mounts into a plain bind - only `MS_REC` carries
+        // the subtree's mounts along, and this kernel refuses that flag -
+        // so from inside a bind's copy no further mount crossing exists: the
+        // copy shows the aliased filesystem's own directories, exactly where
+        // the originals are mounted *over*. OpenRC's bootmisc depends on
+        // this precisely: `mount --bind / $dir && rm -rf $dir/run/*` is its
+        // way to clean the *underlying* /run, and a crossing that re-appeared
+        // through the alias would hand that `rm -rf` to the live tmpfs
+        // instead - deleting the softlevel file every later service checks.
+        let mut bound = false;
 
         loop {
             // The logical chain from `base`. Length 1 means "at `base`", where
@@ -680,13 +809,26 @@ impl Vfs {
                         // file.
                         crate::vfs::may_search(&here)?;
                         let child = here.lookup(name)?;
-                        let child = critical_section::with(|cs| {
-                            let mounts = self.mounts.borrow(cs).borrow();
-                            match mounts.iter().find(|m| Arc::ptr_eq(&m.at, &child)) {
-                                Some(m) => m.root.clone(),
-                                None => child,
-                            }
-                        });
+                        let child = if bound {
+                            // Inside a bind alias: the table's other mounts
+                            // are not part of this copy's subtree (see the
+                            // note on `bound` above), so the directory the
+                            // lookup found is the answer as it stands.
+                            child
+                        } else {
+                            critical_section::with(|cs| {
+                                let mounts = self.mounts.borrow(cs).borrow();
+                                // The newest mount on the point wins, the
+                                // way a stack of mounts peels from the top.
+                                match mounts.iter().rposition(|m| Arc::ptr_eq(&m.at, &child)) {
+                                    Some(pos) => {
+                                        bound = mounts[pos].bind;
+                                        mounts[pos].root.clone()
+                                    }
+                                    None => child,
+                                }
+                            })
+                        };
                         if child.metadata().kind == NodeKind::Symlink {
                             // A descriptor's second name - `/proc/<pid>/fd/N`
                             // and the `/dev/std*` links into it - is a link
@@ -730,6 +872,12 @@ impl Vfs {
                             } else {
                                 here
                             };
+                            if target.starts_with('/') {
+                                // The restart is from the real root, not from
+                                // inside the alias, so the bind context ends
+                                // with the path it was walked on.
+                                bound = false;
+                            }
                             met_link = true;
                             break;
                         }
@@ -839,6 +987,7 @@ impl Vfs {
                 alloc::string::String,
                 alloc::string::String,
                 bool,
+                bool,
             )> = self
                 .mounts
                 .borrow(cs)
@@ -850,6 +999,7 @@ impl Vfs {
                         m.source.clone(),
                         m.fstype.clone(),
                         m.read_only,
+                        m.bind,
                     )
                 })
                 .collect();
@@ -864,15 +1014,19 @@ impl Vfs {
                 alloc::string::String::from(if root_read_only { "ro" } else { "rw" }),
             ));
         }
-        for (at, source, fstype, read_only) in entries {
+        for (at, source, fstype, read_only, bind) in entries {
             if let Some(path) = self.path_of(&at) {
                 // The options column. Only what this kernel can be asked for
                 // is reported: a caller that reads "ro" here knows a write
                 // will be refused, which is the one thing the column is for.
-                let options = if read_only {
-                    alloc::string::String::from("ro")
-                } else {
-                    alloc::string::String::from("rw")
+                // A bind says so too, because that is how a reader tells a
+                // second name from a real second filesystem - `findmnt` and
+                // OpenRC's scan for the mount under `/run` both key on it.
+                let options = match (read_only, bind) {
+                    (true, true) => alloc::string::String::from("ro,bind"),
+                    (true, false) => alloc::string::String::from("ro"),
+                    (false, true) => alloc::string::String::from("rw,bind"),
+                    (false, false) => alloc::string::String::from("rw"),
                 };
                 lines.push((source, path, fstype, options));
             }
@@ -1078,6 +1232,20 @@ pub fn remount(target: &str, start: Option<Arc<dyn Inode>>, read_only: bool) -> 
     STATIC.remount(&at, read_only)
 }
 
+/// `mount --bind source target`: an existing tree, a second name. Both paths
+/// resolve the way `mount(2)` resolves them - against the caller's cwd - and
+/// the source's name is what the record reports as its source afterward.
+pub fn bind_mount(
+    source: &str,
+    target: &str,
+    start: Option<Arc<dyn Inode>>,
+    read_only: bool,
+) -> VfsResult<()> {
+    let src = resolve_opt(source, start.clone())?;
+    let at = STATIC.mountpoint_inode(target, start)?;
+    STATIC.bind_mount(at, src, source, read_only)
+}
+
 /// Unmount the filesystem at `path`, resolved against a caller's cwd.
 pub fn unmount_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
     let resolved = resolve_opt(path, start)?;
@@ -1245,6 +1413,49 @@ mod tests {
         // walks back in through the mount edge.
         let back = vfs.resolve("/mnt/hello/../../mnt").unwrap();
         assert!(Arc::ptr_eq(&back, &mnt));
+    }
+
+    /// A plain bind aliases one filesystem; the mounts attached *inside* it
+    /// are children of the original mount, and Linux copies none of them
+    /// into the alias. OpenRC's bootmisc is the case this exists for:
+    /// `mount --bind / $dir && rm -rf $dir/run/*` is meant to clean the
+    /// underlying `/run` - the directory the tmpfs covers - and a crossing
+    /// that re-appeared through the alias would run that `rm -rf` against
+    /// the live tmpfs and delete the very `/run/openrc` state the boot is
+    /// built on.
+    #[test]
+    fn a_bind_alias_carries_no_mounts_of_the_aliased_tree() {
+        let vfs = tree_with_root();
+        let under = vfs
+            .resolve("/")
+            .unwrap()
+            .create("run", NodeKind::Dir)
+            .unwrap();
+        under.create("stale", NodeKind::File).unwrap();
+        let live = RamFs::new();
+        live.root().create("openrc", NodeKind::Dir).unwrap();
+        vfs.mount("/run", &*live).unwrap();
+        vfs.resolve("/")
+            .unwrap()
+            .create("b", NodeKind::Dir)
+            .unwrap();
+        let b = vfs.resolve("/b").unwrap();
+        vfs.bind_mount(b, vfs.resolve("/").unwrap(), "/", false)
+            .unwrap();
+
+        // Through the alias, `run` is the root tree's own directory: it
+        // holds what is under the mount and none of what is mounted.
+        let aliased = vfs.resolve("/b/run").unwrap();
+        assert!(Arc::ptr_eq(&aliased, &under));
+        assert!(vfs.resolve("/b/run/stale").is_ok());
+        assert_eq!(vfs.resolve("/b/run/openrc").err(), Some(VfsError::NoEntry));
+
+        // The original context keeps its crossings; the alias is the only
+        // place the mounts stop showing.
+        assert!(Arc::ptr_eq(&vfs.resolve("/run").unwrap(), &live.root()));
+        // And both names are the same filesystem instance, st_dev and all:
+        // the record the alias adds borrows the root's id.
+        assert_eq!(vfs.fs_of_path("/b/run").0, vfs.fs_of_path("/run/..").0);
     }
 
     #[test]

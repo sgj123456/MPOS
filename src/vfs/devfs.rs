@@ -6,10 +6,13 @@
 //! sequencing. Reading a device through a `File` therefore reads the stream
 //! in order, which is what every caller expects.
 //!
-//! Devices are registered before the filesystem is mounted and never change
-//! after; directories here have no `create`, because making a device node
-//! means having a driver for it, and that is the kernel's decision, not a
-//! caller's.
+//! Devices are registered before the filesystem is mounted; the node a
+//! driver registered is the driver's, and a caller cannot make one by name -
+//! making a device node means having a driver for it. What a caller *can*
+//! make here are directories (mdev's persistent-name pass) and socket nodes:
+//! real devtmpfs lets `bind(2)` create a `SOCK_FILE` in `/dev`, and busybox
+//! syslog's `/dev/log` is exactly that - a name whose only content is the
+//! unix registry's key, so the node needs no stream face at all.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -209,14 +212,18 @@ impl Inode for DevRoot {
         })
     }
 
-    /// Make a directory under `/dev`. Real devtmpfs lets userland make
-    /// directories too - `mkdir` answered ENOSYS here, and the script Alpine's
-    /// mdev runs for every hotplugged disk builds `/dev/block` and
-    /// `/dev/disk` before it links anything into them, so its whole
-    /// persistent-name pass died one syscall in.
+    /// Make a directory - or a socket name - under `/dev`. Real devtmpfs lets
+    /// userland make directories too - `mkdir` answered ENOSYS here, and the
+    /// script Alpine's mdev runs for every hotplugged disk builds `/dev/block`
+    /// and `/dev/disk` before it links anything into them, so its whole
+    /// persistent-name pass died one syscall in. Sockets are the other half:
+    /// devtmpfs permits `bind(2)` of a `SOCK_FILE` here, and busybox syslog
+    /// does exactly that for `/dev/log` on every boot. Device nodes stay the
+    /// driver's decision; a fifo would need a pipe face to be worth making.
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
-        if kind != NodeKind::Dir {
-            return Err(VfsError::Unsupported);
+        match kind {
+            NodeKind::Dir | NodeKind::Socket => {}
+            _ => return Err(VfsError::Unsupported),
         }
         critical_section::with(|cs| {
             let mut inodes = self.inodes.borrow(cs).borrow_mut();
@@ -224,11 +231,15 @@ impl Inode for DevRoot {
                 return Err(VfsError::Exists);
             }
             let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-            let node: Arc<dyn Inode> = Arc::new(DevDirNode {
-                ino,
-                children: Mutex::new(RefCell::new(BTreeMap::new())),
-                next_ino: self.next_ino.clone(),
-            });
+            let node: Arc<dyn Inode> = if kind == NodeKind::Dir {
+                Arc::new(DevDirNode {
+                    ino,
+                    children: Mutex::new(RefCell::new(BTreeMap::new())),
+                    next_ino: self.next_ino.clone(),
+                })
+            } else {
+                Arc::new(DevSocketNode { ino })
+            };
             inodes.insert(String::from(name), node.clone());
             Ok(node)
         })
@@ -286,6 +297,26 @@ impl Inode for DevSymlinkNode {
 
     fn readlink(&self) -> VfsResult<String> {
         Ok(self.target.clone())
+    }
+}
+
+/// A socket name made by `bind(2)` - `/dev/log`.
+///
+/// It is a nameplate, not a pipe: the unix registry resolves a connect to a
+/// live socket through this node's `(fs id, ino)` key, so the node itself
+/// carries only its identity and kind. Opening the name is opening the
+/// socket - which is decided by the registry lookup, not by anything here.
+struct DevSocketNode {
+    ino: Ino,
+}
+
+impl Inode for DevSocketNode {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::Socket,
+            size: 0,
+        }
     }
 }
 
@@ -347,8 +378,9 @@ impl Inode for DevDirNode {
     }
 
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
-        if kind != NodeKind::Dir {
-            return Err(VfsError::Unsupported);
+        match kind {
+            NodeKind::Dir | NodeKind::Socket => {}
+            _ => return Err(VfsError::Unsupported),
         }
         critical_section::with(|cs| {
             let mut children = self.children.borrow(cs).borrow_mut();
@@ -356,11 +388,15 @@ impl Inode for DevDirNode {
                 return Err(VfsError::Exists);
             }
             let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-            let node: Arc<dyn Inode> = Arc::new(DevDirNode {
-                ino,
-                children: Mutex::new(RefCell::new(BTreeMap::new())),
-                next_ino: self.next_ino.clone(),
-            });
+            let node: Arc<dyn Inode> = if kind == NodeKind::Dir {
+                Arc::new(DevDirNode {
+                    ino,
+                    children: Mutex::new(RefCell::new(BTreeMap::new())),
+                    next_ino: self.next_ino.clone(),
+                })
+            } else {
+                Arc::new(DevSocketNode { ino })
+            };
             children.insert(String::from(name), node.clone());
             Ok(node)
         })
@@ -698,12 +734,33 @@ mod tests {
     }
 
     #[test]
-    fn directories_here_have_no_create() {
+    fn directories_make_dirs_and_sockets_only() {
         let fs = DevFs::new();
+        // A device node - and any other kind - is still the driver's decision.
         assert_eq!(
             fs.root().create("node", NodeKind::CharDev).err(),
             Some(VfsError::Unsupported)
         );
+        assert_eq!(
+            fs.root().create("plain", NodeKind::File).err(),
+            Some(VfsError::Unsupported)
+        );
+        // A socket name is the caller's: bind(2) of /dev/log arrives here.
+        let sock = fs.root().create("log", NodeKind::Socket).unwrap();
+        assert_eq!(sock.metadata().kind, NodeKind::Socket);
+        assert_eq!(
+            fs.root().lookup("log").unwrap().metadata().ino,
+            sock.metadata().ino
+        );
+        assert_eq!(
+            fs.root().create("log", NodeKind::Socket).err(),
+            Some(VfsError::Exists)
+        );
+        // unlink retires the name, and the same name is bindable again -
+        // syslog's restart path is create, unlink, create.
+        fs.root().unlink("log").unwrap();
+        assert_eq!(fs.root().lookup("log").err(), Some(VfsError::NoEntry));
+        assert!(fs.root().create("log", NodeKind::Socket).is_ok());
     }
 
     #[test]

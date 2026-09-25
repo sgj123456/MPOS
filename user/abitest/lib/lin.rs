@@ -131,6 +131,35 @@ pub fn raw_sys5(number: u64, a1: usize, a2: usize, a3: usize, a4: usize, a5: usi
     ret
 }
 
+/// The whole six-argument escape: `sendto` and `recvfrom`, whose address
+/// and address-length pair lives in `r9`.
+pub fn raw_sys6(
+    number: u64,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") number as isize => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
+            in("r9") a6,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 fn sys2(number: u64, a1: usize, a2: usize) -> isize {
     let ret: isize;
     unsafe {
@@ -242,6 +271,7 @@ pub const ECHILD: isize = -10;
 pub const EAGAIN: isize = -11;
 pub const ENOMEM: isize = -12;
 pub const EFAULT: isize = -14;
+pub const EBUSY: isize = -16;
 pub const EEXIST: isize = -17;
 pub const ENODEV: isize = -19;
 pub const ENOTDIR: isize = -20;
@@ -1614,6 +1644,25 @@ pub fn ioctl(fd: i32, request: usize, arg: usize) -> isize {
     sys3(nr::IOCTL, fd as usize, request, arg)
 }
 
+/// `mount(source, target, fstype, flags, NULL)`: hang a filesystem, or -
+/// with `MS_BIND` - a second name on a tree already mounted. The three path
+/// arguments must be NUL-terminated by the caller, as every other path here.
+pub fn mount(source: &[u8], target: &[u8], fstype: &[u8], flags: usize) -> isize {
+    sys5(
+        nr::MOUNT,
+        source.as_ptr() as usize,
+        target.as_ptr() as usize,
+        fstype.as_ptr() as usize,
+        flags,
+        0,
+    )
+}
+
+/// `umount2(target, flags)`.
+pub fn umount2(target: &[u8], flags: usize) -> isize {
+    sys2(nr::UMOUNT2, target.as_ptr() as usize, flags)
+}
+
 /// `uname(buf)`: fill the six 65-byte fields of `struct utsname`.
 pub fn uname(buf: &mut Utsname) -> isize {
     sys1(nr::UNAME, buf.bytes.as_mut_ptr() as usize)
@@ -2117,6 +2166,10 @@ pub const SO_PASSCRED: usize = 16;
 pub const SO_PEERCRED: usize = 17;
 pub const MSG_CMSG_CLOEXEC: usize = 0x10000;
 pub const MSG_CTRUNC: usize = 0x8;
+/// `MSG_DONTWAIT` as the Linux uapi spells it - `0x40`. (`0x4000` is
+/// `MSG_CMSG_CLOEXEC` on this arch; the values are easy to swap by eye.)
+pub const MSG_DONTWAIT: usize = 0x40;
+pub const MSG_PEEK: usize = 0x2;
 
 /// `sendmsg(fd, msg, flags)`.
 pub fn sendmsg(fd: i32, msg: &mut MsgHdr, flags: usize) -> isize {

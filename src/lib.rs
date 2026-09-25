@@ -26,6 +26,11 @@ pub mod blk;
 pub mod boot;
 #[cfg(target_os = "none")]
 pub mod console;
+/// The civil calendar: day counts to dates and back. Not target-gated - the
+/// arithmetic is pure, and the `arch` half that writes it to hardware is
+/// compiled where its tests are not, so the sums live here where a host
+/// build can argue with them.
+pub mod date;
 #[cfg(target_os = "none")]
 pub mod drivers;
 /// Kernel logging: `tracing` events, formatted onto the serial console.

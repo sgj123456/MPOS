@@ -229,8 +229,12 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // `unlockpt`/`open("/dev/pts/N")` sequence works by the book.
     dev.register_node("ptmx", Arc::new(crate::vfs::pty::Ptmx));
     dev.register("zero", Arc::new(ZeroDev));
-    dev.register("random", Arc::new(RandomDev));
-    dev.register("urandom", Arc::new(RandomDev));
+    // The entropy pair carries its real Linux device numbers (mem 1, minors
+    // 8 and 9) because an ioctl on them is recognized by that number rather
+    // than by a downcast: one stream, two names, and the numbers are what
+    // make the pair the pair.
+    dev.register_id("random", Arc::new(RandomDev), 1, 8);
+    dev.register_id("urandom", Arc::new(RandomDev), 1, 9);
 
     // The virtio devices the boot probed, each under the name Linux gives
     // its kind - registered only when the device answered, because a node
@@ -240,6 +244,16 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // console port, /dev/dsp is the sound card's stream.
     if let Some(rng) = crate::drivers::virtio::rng::global() {
         dev.register("hwrng", Arc::new(HwrngDev(rng)));
+    }
+    // The CMOS clock, on its Linux misc-device number (10,135 - the number
+    // `hwclock` and the `RTC_*` ioctls are keyed on). `rtc0` is the name the
+    // class gives it; `rtc` is the alias every busybox `hwclock` tries when
+    // the numbered one is missing, and registering both is cheaper than
+    // trusting which list the shipped binary walks.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        dev.register_id("rtc0", Arc::new(crate::drivers::rtc::RtcDev), 10, 135);
+        dev.register_id("rtc", Arc::new(crate::drivers::rtc::RtcDev), 10, 135);
     }
     if let Some(hvc) = crate::drivers::virtio::console::global() {
         let device = Arc::new(crate::drivers::virtio::console::HvcDev::new(hvc));

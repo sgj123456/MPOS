@@ -1474,6 +1474,26 @@ pub(super) fn handle_mount(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         };
     }
 
+    // `mount --bind`: the source is a tree already mounted somewhere, and the
+    // target gets it as a second name. Checked before the type dispatch, as
+    // Linux checks it: busybox spells the fstype `none` for a bind, and a
+    // bind never builds a filesystem - the type word is not consulted at all.
+    const MS_BIND: usize = 0x1000;
+    const MS_REC: usize = 0x4000;
+    if args[3] & MS_BIND != 0 {
+        // MS_REC promises the subtree's *other* mounts come along too; this
+        // kernel's bind aliases one directory tree, so answering success to a
+        // recursive bind would silently mount less than was asked. Refused
+        // rather than pretended - nothing in this image's boot uses it.
+        if args[3] & MS_REC != 0 {
+            return err::EOPNOTSUPP;
+        }
+        return match crate::vfs::mount::bind_mount(&source, &target, Some(cwd.clone()), read_only) {
+            Ok(()) => 0,
+            Err(e) => err_of(e),
+        };
+    }
+
     // `mount(2)`'s MS_MOVE: the filesystem mounted at the source moves to the
     // target, and a target of `/` is what `switch_root` asks for - the new
     // root becomes the filesystem, and the initramfs it came from goes away.
@@ -2910,6 +2930,8 @@ fn sync_nonblocking(file: &crate::vfs::File, status: u32) {
         eventfd.set_nonblocking(on);
     } else if let Some(inotify) = file.inode().as_inotify() {
         inotify.set_nonblocking(on);
+    } else if let Some(sock) = file.inode().as_unix() {
+        sock.set_nonblocking(on);
     }
 }
 
@@ -3480,6 +3502,139 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return err::ENOTTY;
             }
             0
+        }
+        0x541B => {
+            // FIONREAD: "how many bytes can I read before I would block".
+            // seedrng asks it of the entropy devices to size the pool, and
+            // on Linux the answer there is the readable bytes of the pool -
+            // `poolsize`/8 for a pool reported full, which is what the
+            // `RNDGETENTCNT` arm below pairs with. Other descriptors keep
+            // their own queue-length story for a later day; here a socket
+            // or pipe asking is answered the honest ENOTTY rather than a
+            // borrowed zero.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            match file.inode().rdev() {
+                Some((1, 8)) | Some((1, 9)) => {}
+                _ => return err::ENOTTY,
+            }
+            if !buffer_ok(buf, 4, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut i32).write_unaligned(512) };
+            0
+        }
+        // The entropy-pool ioctls (`'R'`-typed), answered on the two device
+        // numbers the pool's names carry. There is no pool - one always-ready
+        // ChaCha20 stream - so the reads report it full (4096 bits, the same
+        // figure `/proc/sys/kernel/random/poolsize` gives) and the credit and
+        // clear calls succeed by doing nothing, which is exactly how Linux
+        // treats a write to `/dev/urandom` here too.
+        request if family_nr(request, b'R').is_some() => {
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            match file.inode().rdev() {
+                Some((1, 8)) | Some((1, 9)) => {}
+                _ => return err::ENOTTY,
+            }
+            match family_nr(request, b'R') {
+                Some(0) => {
+                    // RNDGETENTCNT: entropy available, in bits.
+                    if !buffer_ok(buf, 4, true, from_user) {
+                        return err::EFAULT;
+                    }
+                    unsafe { (buf as *mut i32).write_unaligned(4096) };
+                    0
+                }
+                Some(1) | Some(2) => {
+                    // RNDADDTOENTCNT / RNDADDENTROPY: credited entropy this
+                    // kernel has no accounting to receive. The argument is
+                    // still checked the way the request shape demands.
+                    if !buffer_ok(buf, 8, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    0
+                }
+                Some(3) | Some(4) => 0, // RNDCLEARPOOL / RNDZAPENTCNT: no-arg
+                _ => err::ENOTTY,
+            }
+        }
+        // The RTC ioctls `hwclock(8)` speaks, answered on the clock's device
+        // number. Both directions read and write the kernel's wall clock -
+        // one clock, so `date` and `hwclock -r` cannot disagree - and
+        // `RTC_SET_TIME` additionally stores it in the CMOS, where it waits
+        // for the next boot's anchor. The alarm/interrupt requests are the
+        // family's own ENOTTY, as they are for hardware without them.
+        //
+        // The family is accepted under two magic bytes. The kernel's own
+        // header spells the RTC ioctls `'t'`, but the `linux/rtc.h` busybox
+        // was built against carries the older `'p'` - the byte the mc146818
+        // driver used before the subsystem moved - and Alpine's hwclock
+        // therefore asks with `0x80247009`/`0x4024700a`. Only those two
+        // commands cross over: `'p'` is also PPP's family, and a stray PPP
+        // request must stay as unknown here as it would be on any machine.
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        request
+            if family_nr(request, b't').is_some()
+                || matches!(request, 0x8024_7009 | 0x4024_700A) =>
+        {
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            if file.inode().rdev() != Some((10, 135)) {
+                return err::ENOTTY;
+            }
+            let nr = family_nr(request, b't').or(match request {
+                0x8024_7009 => Some(0x09),
+                0x4024_700A => Some(0x0a),
+                _ => None,
+            });
+            // `struct rtc_time` is nine ints in both directions.
+            const RTC_TIME_SIZE: usize = 9 * 4;
+            match nr {
+                Some(0x09) => {
+                    // RTC_RD_TIME.
+                    if !buffer_ok(buf, RTC_TIME_SIZE, true, from_user) {
+                        return err::EFAULT;
+                    }
+                    let fields = crate::drivers::rtc::time_fields(crate::drivers::rtc::now_epoch());
+                    unsafe {
+                        for (i, value) in fields.iter().enumerate() {
+                            (buf as *mut i32).add(i).write_unaligned(*value);
+                        }
+                    }
+                    0
+                }
+                Some(0x0a) => {
+                    // RTC_SET_TIME: a field set no calendar carries is the
+                    // EINVAL the real driver returns, and nothing is written.
+                    if !buffer_ok(buf, RTC_TIME_SIZE, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    let mut fields = [0i32; 9];
+                    unsafe {
+                        for (i, value) in fields.iter_mut().enumerate() {
+                            *value = (buf as *const i32).add(i).read_unaligned();
+                        }
+                    }
+                    match crate::drivers::rtc::fields_to_epoch(&fields) {
+                        Ok(epoch) => {
+                            if crate::arch::rtc::write_epoch(epoch) {
+                                0
+                            } else {
+                                err::EINVAL
+                            }
+                        }
+                        Err(e) => err_of(e),
+                    }
+                }
+                _ => err::ENOTTY,
+            }
         }
         request if (request & 0xc0ff_ffff) == (0x8000_0000 | ((b'E' as u32) << 8) | 0x06) => {
             // EVIOCGNAME: the input device's name for itself - the string

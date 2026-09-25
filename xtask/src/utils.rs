@@ -80,6 +80,39 @@ pub fn project_root() -> Result<PathBuf> {
         .context("The xtask crate has no parent directory")
 }
 
+/// The kernel's `uname -r` answer, read from the workspace root package.
+///
+/// The kernel embeds its own version at build time - `env!("CARGO_PKG_VERSION")`
+/// in `proc.rs` (uname) and `procfs.rs` (`/proc/sys/kernel/osrelease`) - and
+/// xtask, being a different package, cannot read *that* at its own compile
+/// time. But the `/lib/modules/<release>` tree it writes into the image has to
+/// be named exactly what `uname -r` will answer inside the guest, or modprobe
+/// looks in a directory the kernel does not name. One number, and this parse
+/// is what keeps the three readers agreeing without a shared crate.
+pub fn kernel_release() -> Result<String> {
+    let manifest = project_root()?.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest)
+        .with_context(|| format!("Failed to read the workspace manifest {manifest:?}"))?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some((_, value)) = line.strip_prefix("version").and_then(|r| r.split_once('=')) {
+            let value = value.trim().trim_matches('"');
+            if !value.is_empty() && !value.starts_with('{') {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    anyhow::bail!("The workspace root Cargo.toml names no [package] version")
+}
+
 /// Resolves the build directory: an absolute path is taken as written, a
 /// relative one is relative to the tree, so the commands name the same image
 /// wherever they are invoked from.

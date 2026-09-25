@@ -330,6 +330,19 @@ fn ctl(
     })
 }
 
+/// A sysctl knob whose value the kernel reports but does not enforce.
+///
+/// Each of these is a real Linux default, honestly labelled: the read answers
+/// what Linux would answer, and a write is accepted and ignored - the same
+/// deal `domainname` makes. This is not `sysctl -a` shrugging; a key that
+/// does not exist here is a key the kernel refuses (ENOENT on a plain open,
+/// EOPNOTSUPP when `sysctl -w` asks `open(O_CREAT)` to invent it), and a
+/// stub is a knob whose *policy* this kernel has no machinery to act on.
+/// Writing one changes what the next read says, not how the kernel behaves.
+fn stub(value: &'static str) -> Arc<dyn Inode> {
+    ctl(move || alloc::format!("{}\n", value), |_| Ok(()))
+}
+
 /// A link to something that can go away.
 fn link(target: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(ProcLink {
@@ -1390,8 +1403,28 @@ impl ProcFs {
             NodeKind::File,
             file(|| String::from("65536\n")),
         );
+        // The knobs OpenRC's sysctl service writes on every boot. Neither
+        // policy has machinery behind it here - no panic-timeout and no bpf
+        // syscall at all - so each answers its Linux default and accepts the
+        // write; see `stub`.
+        kernel.add("panic", NodeKind::File, stub("0"));
+        kernel.add("unprivileged_bpf_disabled", NodeKind::File, stub("2"));
+        kernel.add("random", NodeKind::Dir, random_dir());
         kernel.add("pty", NodeKind::Dir, pty_dir());
         sys.add("kernel", NodeKind::Dir, kernel);
+        // `/proc/sys/fs`: the two hardening link guards. mpos's path
+        // resolution does not follow symlinks in the sticky-world-writable
+        // sense these knobs toggle, so the defaults are reported and writes
+        // accepted, but nothing re-checks on the kernel's side.
+        let fs_knobs = dir();
+        fs_knobs.add("protected_hardlinks", NodeKind::File, stub("1"));
+        fs_knobs.add("protected_symlinks", NodeKind::File, stub("1"));
+        sys.add("fs", NodeKind::Dir, fs_knobs);
+        // `/proc/sys/net`: the per-protocol and per-interface knobs. The
+        // network stack here is smoltcp with no sysctl surface, so every one
+        // of these is a `stub` - the Linux default as the answer, the write
+        // accepted, and no packet ever consults it.
+        sys.add("net", NodeKind::Dir, sysnet_dir());
         self.root.add("sys", NodeKind::Dir, sys);
 
         // `/proc/net`: the socket table `ss`/`netstat` read. `tcp` lists the
@@ -1454,6 +1487,110 @@ fn pty_dir() -> Arc<ProcDir> {
         }),
     );
     pty
+}
+
+/// `/proc/sys/kernel/random`: what entropy tools ask the pool about.
+///
+/// This kernel has no pool - one ChaCha20 stream, always ready - so these
+/// answer in the units the readers expect: `poolsize` in bits (the file
+/// Linux 5.18 removed, kept because the seedrng in this image reads it if
+/// present and nothing if not), `urandom_min_res_cov` as the creditable
+/// fraction, and `boot_id` as one UUID per boot.
+fn random_dir() -> Arc<ProcDir> {
+    let random = dir();
+    random.add("poolsize", NodeKind::File, file(|| String::from("4096\n")));
+    random.add(
+        "urandom_min_res_cov",
+        NodeKind::File,
+        file(|| String::from("64\n")),
+    );
+    random.add("boot_id", NodeKind::File, file(boot_id));
+    random
+}
+
+/// The one UUID this boot gets, made on first read and never re-rolled:
+/// tools correlate events across a boot by it, so two reads of one boot that
+/// disagree would be worse than a fixed string. Version-4 layout, random
+/// body from the kernel's own stream.
+fn boot_id() -> String {
+    critical_section::with(|cs| {
+        let mut slot = BOOT_ID.borrow(cs).borrow_mut();
+        if slot.is_none() {
+            let mut b = [0u8; 16];
+            crate::rand::fill(&mut b);
+            b[6] = (b[6] & 0x0f) | 0x40;
+            b[8] = (b[8] & 0x3f) | 0x80;
+            let hex = |bytes: &[u8]| -> String {
+                let mut s = String::new();
+                for byte in bytes {
+                    s.push_str(&alloc::format!("{:02x}", byte));
+                }
+                s
+            };
+            *slot = Some(alloc::format!(
+                "{}-{}-{}-{}-{}\n",
+                hex(&b[0..4]),
+                hex(&b[4..6]),
+                hex(&b[6..8]),
+                hex(&b[8..10]),
+                hex(&b[10..16])
+            ));
+        }
+        slot.clone().unwrap_or_default()
+    })
+}
+
+static BOOT_ID: Mutex<RefCell<Option<String>>> = Mutex::new(RefCell::new(None));
+
+/// `/proc/sys/net`: the protocol knobs OpenRC's `/etc/sysctl.conf` writes.
+///
+/// Two trees per family (`ipv4`, `ipv6`), each with its per-interface `conf`
+/// directories - `all` and `default` are the two every distro's sysctl.conf
+/// addresses. The values are Linux's shipped defaults and the writes are
+/// accepted and ignored (`stub`); smoltcp consults none of them, and neither
+/// does anything else here.
+fn sysnet_dir() -> Arc<ProcDir> {
+    fn conf_dir(keys: &[(&str, &'static str)]) -> Arc<ProcDir> {
+        let conf = dir();
+        for iface in ["all", "default"] {
+            let entry = dir();
+            for (name, value) in keys {
+                entry.add(name, NodeKind::File, stub(value));
+            }
+            conf.add(iface, NodeKind::Dir, entry);
+        }
+        conf
+    }
+
+    let net = dir();
+    let ipv4 = dir();
+    ipv4.add("tcp_syncookies", NodeKind::File, stub("1"));
+    ipv4.add("tcp_rfc1337", NodeKind::File, stub("0"));
+    // Linux's default is the empty range `1 0` - no group may ping.
+    ipv4.add("ping_group_range", NodeKind::File, stub("1 0"));
+    ipv4.add(
+        "conf",
+        NodeKind::Dir,
+        conf_dir(&[
+            ("rp_filter", "0"),
+            ("accept_redirects", "1"),
+            ("secure_redirects", "1"),
+            ("accept_source_route", "0"),
+        ]),
+    );
+    let ipv6 = dir();
+    ipv6.add(
+        "conf",
+        NodeKind::Dir,
+        conf_dir(&[
+            ("accept_redirects", "1"),
+            ("accept_source_route", "0"),
+            ("use_tempaddr", "0"),
+        ]),
+    );
+    net.add("ipv4", NodeKind::Dir, ipv4);
+    net.add("ipv6", NodeKind::Dir, ipv6);
+    net
 }
 
 /// The largest pid there can be: the task table's size, which is where pids

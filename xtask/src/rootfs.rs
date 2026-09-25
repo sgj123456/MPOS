@@ -171,6 +171,14 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // goes last, so a file there is the authority over anything generated. The
     // resolver is the one file that may still change after it.
     write_system_config(&mount_dir, &config)?;
+    // The runlevels and the module index are re-asserted on *every* build,
+    // not only on a full install - they are the build's policy, and policy
+    // that only lands on a reinstall quietly rots (a `rc-update add` inside
+    // a running guest otherwise survives every later build). Both run
+    // before the overlay, so `rootfs/` stays the authoritative last word on
+    // any name either writes.
+    enable_services(&mount_dir)?;
+    write_modules(&mount_dir)?;
     utils::merge_overlay(&root.join("rootfs"), &mount_dir)?;
     write_resolver(&mount_dir, &config)?;
 
@@ -872,9 +880,6 @@ fn install_base(
     // by the time the account points at it.
     create_user(mount_dir, &config.user)?;
 
-    // And after the account, so a group the config adds it to exists.
-    enable_services(mount_dir)?;
-
     Ok(())
 }
 
@@ -905,8 +910,9 @@ fn install_base(
 /// What is left is the log, the clock, the hostname, the session bus, the
 /// seat manager, and the hook a local service script hangs off. `hwclock` is
 /// the `clock` provider `syslog` needs (`need clock hostname localmount`);
-/// on a machine with no `/dev/rtc` node it warns and starts anyway, which is
-/// how the service is written.
+/// the kernel answers it through `/dev/rtc0`, the CMOS clock the wall time
+/// is anchored to. The `modules` service is the one modprobe reads the
+/// built-in list below (`write_modules`) through.
 const SERVICES: &[(&str, &[&str])] = &[
     ("sysinit", &["dmesg"]),
     (
@@ -923,7 +929,12 @@ const SERVICES: &[(&str, &[&str])] = &[
 /// a symlink from the runlevel directory to the init script, which is the
 /// whole of what a runlevel is. Done here rather than through a chroot round
 /// trip so a rebuild reproduces the boot from the config alone, and so the
-/// set is one place to read.
+/// set is one place to read - and then read *exactly*: after the adds, the
+/// function removes every other name from the directories SERVICES owns,
+/// which is what keeps a guest's own `rc-update add` from surviving a
+/// rebuild. (An old image is a disk the guest has written to; a rebuilt one
+/// is the config talking again.) A name to keep is either added to SERVICES
+/// or dropped into `rootfs/etc/runlevels/...`, which runs after this.
 ///
 /// A service whose script is not installed is named and skipped: which
 /// packages the image carries is the config's decision, and a runlevel entry
@@ -949,7 +960,62 @@ fn enable_services(mount_dir: &Path) -> Result<()> {
             enabled += 1;
         }
     }
-    println!("rootfs: enabled {enabled} boot services");
+    // The removals, per runlevel directory SERVICES names. (A directory that
+    // is not a runlevel this table speaks for is left alone entirely - this
+    // function is SERVICES' voice, not a janitor's.)
+    let mut removed = 0usize;
+    for (runlevel, services) in SERVICES {
+        let dir = mount_dir.join("etc/runlevels").join(runlevel);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if services.contains(&name.as_ref()) {
+                continue;
+            }
+            // Only the symlinks are runlevel entries; anything else a guest
+            // put in its own runlevel directory is not this build's to judge.
+            if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                fs::remove_file(entry.path())
+                    .with_context(|| format!("Failed to remove {runlevel}/{name}"))?;
+                removed += 1;
+            }
+        }
+    }
+    println!("rootfs: enabled {enabled} boot services, removed {removed} others");
+    Ok(())
+}
+
+/// Tell kmod's `modprobe` what this kernel already has.
+///
+/// `modprobe unix` - what a device service's init script asks, and what the
+/// boot's `modules` service runs for every line of `/etc/modules` - starts
+/// by looking for a tree under `/lib/modules/$(uname -r)`, and warns "can't
+/// change directory" loudly when there is none. mpos has no loadable modules
+/// at all; every name the boot reaches for (`unix`, `ipv6`, `af_packet`) is
+/// built in the way Linux means it, and these two files are how modprobe
+/// learns that without a kernel to ask. `modules.builtin` is the list - a hit
+/// answers "already loaded", exit 0, no output - and `modules.dep` is the
+/// empty resolution table, since nothing in it needs resolving. The directory
+/// is named for the version the running kernel will report; see
+/// [`utils::kernel_release`].
+fn write_modules(mount_dir: &Path) -> Result<()> {
+    let release = utils::kernel_release()?;
+    let dir = mount_dir.join("lib/modules").join(&release);
+    fs::create_dir_all(&dir).with_context(|| format!("Failed to create {dir:?}"))?;
+    fs::write(dir.join("modules.dep"), b"")
+        .with_context(|| format!("Failed to write {dir:?}/modules.dep"))?;
+    // The paths are decoration - kmod matches on the basename - but they
+    // are the paths the real kernel's modules would have, so the file reads
+    // like everyone else's.
+    fs::write(
+        dir.join("modules.builtin"),
+        "kernel/net/unix/unix.ko\nkernel/net/ipv6/ipv6.ko\nkernel/net/af_packet/af_packet.ko\n",
+    )
+    .with_context(|| format!("Failed to write {dir:?}/modules.builtin"))?;
     Ok(())
 }
 

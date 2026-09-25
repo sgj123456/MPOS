@@ -1,5 +1,8 @@
 //! t-ioctl - one test for ioctl, the terminal-query door musl and every
-//! line editor walk through (`ioctl(0, TIOCGWINSZ, &ws)` in the strace).
+//! line editor walk through (`ioctl(0, TIOCGWINSZ, &ws)` in the strace),
+//! plus the two device families the boot's own services ask: the entropy
+//! pool queries seedrng sends to `/dev/urandom`, and the clock reads and
+//! writes hwclock sends to `/dev/rtc0`.
 //!
 //! Pinned here on fd 0, the console: TIOCGWINSZ writes the 25x80 window
 //! the kernel serves, zeroing the pixel fields too; TCGETS answers 0 and
@@ -25,6 +28,22 @@ static mut WS: lin::Winsize = lin::Winsize {
     ws_ypixel: 0xFFFF,
 };
 static mut TERMIOS: [u8; 64] = [0xFF; 64];
+/// The one-word answer slot for FIONREAD/RNDGETENTCNT, and the pool-info
+/// pair RNDADDENTROPY takes, and the nine ints of `struct rtc_time`.
+static mut WORD: i32 = -1;
+static mut POOLINFO: [i32; 2] = [0; 2];
+static mut RTCTIME: [i32; 9] = [-1; 9];
+
+// The request words, spelled in their `_IOC` form: direction, size, the
+// family byte at bits 8..15, the command in the low byte. FIONREAD is the
+// legacy x86 number that predates the layout; the rest carry it exactly -
+// `RND*` are 'R', `RTC_*` are 't', and the size field of the RTC pair is
+// `struct rtc_time`'s 36 bytes, which is what pins the struct's shape here.
+const FIONREAD: usize = 0x541B;
+const RNDGETENTCNT: usize = 0x8004_5200;
+const RNDADDENTROPY: usize = 0x4008_5202;
+const RTC_RD_TIME: usize = 0x8024_7409;
+const RTC_SET_TIME: usize = 0x4024_740A;
 
 /// The `struct termios` glibc hands an ioctl: four flag words, a line
 /// discipline, 32 control characters, then two speeds.
@@ -171,6 +190,126 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         r,
         0,
     );
+
+    // ---- The entropy pool, as seedrng asks of it ----
+    static URANDOM: [u8; 13] = *b"/dev/urandom\0";
+    static RTC0: [u8; 10] = *b"/dev/rtc0\0";
+    let urandom = lin::openat(lin::AT_FDCWD, &URANDOM, lin::O_RDONLY, 0);
+    lin::check_true(&mut failed, b"/dev/urandom opens", urandom >= 0);
+
+    let r = lin::ioctl(urandom as i32, RNDGETENTCNT, &raw mut WORD as usize);
+    lin::check_eq(&mut failed, b"RNDGETENTCNT succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"the pool answers full (4096 bits)",
+        unsafe { *(&raw mut WORD as *const i32) } as isize,
+        4096,
+    );
+
+    let r = lin::ioctl(urandom as i32, FIONREAD, &raw mut WORD as usize);
+    lin::check_eq(&mut failed, b"FIONREAD on the pool succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"FIONREAD reports the pool's bytes (4096 bits = 512)",
+        unsafe { *(&raw mut WORD as *const i32) } as isize,
+        512,
+    );
+
+    // RNDADDENTROPY credits a `struct poolinfo { int entropy; int size; }`.
+    // This kernel has no accounting to receive the credit; what is pinned is
+    // that the request is accepted rather than bounced as ENOTTY - which is
+    // what made seedrng's boot line an error.
+    unsafe {
+        *(&raw mut POOLINFO as *mut [i32; 2]) = [64, 0];
+    }
+    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut POOLINFO as usize);
+    lin::check_eq(&mut failed, b"RNDADDENTROPY is accepted", r, 0);
+
+    // A device that is not the pool refuses the pool's requests, and the
+    // pool refuses the clock's - the families are keyed on the device, not
+    // on whoever asks.
+    let r = lin::ioctl(urandom as i32, RTC_RD_TIME, &raw mut RTCTIME as usize);
+    lin::check_eq(
+        &mut failed,
+        b"RTC_RD_TIME on urandom answers ENOTTY",
+        r,
+        lin::ENOTTY,
+    );
+    lin::close(urandom as i32);
+
+    // ---- The clock, as hwclock asks of it ----
+    let rtc = lin::openat(lin::AT_FDCWD, &RTC0, lin::O_RDWR, 0);
+    lin::check_true(&mut failed, b"/dev/rtc0 opens", rtc >= 0);
+
+    let r = lin::ioctl(rtc as i32, RTC_RD_TIME, &raw mut RTCTIME as usize);
+    lin::check_eq(&mut failed, b"RTC_RD_TIME succeeds", r, 0);
+    let t = unsafe { *(&raw mut RTCTIME as *const [i32; 9]) };
+    lin::check_true(
+        &mut failed,
+        b"the clock's fields are in range",
+        t[0] < 60 && t[1] < 60 && t[2] < 24 && (1..=31).contains(&t[3]) && (0..12).contains(&t[4]),
+    );
+    lin::check_true(
+        &mut failed,
+        b"the clock reads the post-2020 world it was booted from (tm_year since 1900)",
+        t[5] >= 120,
+    );
+    lin::check_eq(&mut failed, b"tm_isdst is 0", t[8] as isize, 0);
+
+    // The same request spelled with the older RTC magic byte - `'p'`, which
+    // is what Alpine's busybox hwclock actually sends, its `linux/rtc.h`
+    // predating the kernel's move to `'t'`. Same struct, same command, the
+    // same answer; and a `'p'` request that is *not* one of the two clock
+    // commands stays ENOTTY, because `'p'` is PPP's family too.
+    let r = lin::ioctl(rtc as i32, 0x8024_7009, &raw mut RTCTIME as usize);
+    lin::check_eq(&mut failed, b"the 'p'-spelled RTC_RD_TIME succeeds", r, 0);
+    let tp = unsafe { *(&raw mut RTCTIME as *const [i32; 9]) };
+    lin::check_true(
+        &mut failed,
+        b"both spellings read the same date",
+        tp[3] == t[3] && tp[4] == t[4] && tp[5] == t[5],
+    );
+    let r = lin::ioctl(rtc as i32, 0x8024_7020, &raw mut RTCTIME as usize);
+    lin::check_eq(
+        &mut failed,
+        b"a stray 'p'-typed request stays ENOTTY",
+        r,
+        lin::ENOTTY,
+    );
+
+    // RTC_SET_TIME of what was just read back: the store round-trips, and a
+    // second read agrees on the date. (The seconds may tick between the
+    // calls, so the time-of-day fields are not compared.)
+    let r = lin::ioctl(rtc as i32, RTC_SET_TIME, &raw mut RTCTIME as usize);
+    lin::check_eq(&mut failed, b"RTC_SET_TIME succeeds", r, 0);
+    let r = lin::ioctl(rtc as i32, RTC_RD_TIME, &raw mut RTCTIME as usize);
+    lin::check_eq(&mut failed, b"RTC_RD_TIME after the set succeeds", r, 0);
+    let t2 = unsafe { *(&raw mut RTCTIME as *const [i32; 9]) };
+    lin::check_true(
+        &mut failed,
+        b"the date reads back unchanged",
+        t[3] == t2[3] && t[4] == t2[4] && t[5] == t2[5],
+    );
+
+    // A nonsense date is refused rather than stored.
+    unsafe {
+        *(&raw mut RTCTIME as *mut [i32; 9]) = [0, 0, 0, 31, 12, 80, 0, 0, 0];
+    }
+    let r = lin::ioctl(rtc as i32, RTC_SET_TIME, &raw mut RTCTIME as usize);
+    lin::check_eq(
+        &mut failed,
+        b"RTC_SET_TIME of month 13 answers EINVAL",
+        r,
+        lin::EINVAL,
+    );
+    let r = lin::ioctl(rtc as i32, RNDGETENTCNT, &raw mut WORD as usize);
+    lin::check_eq(
+        &mut failed,
+        b"RNDGETENTCNT on rtc0 answers ENOTTY",
+        r,
+        lin::ENOTTY,
+    );
+    lin::close(rtc as i32);
 
     lin::done(failed)
 }

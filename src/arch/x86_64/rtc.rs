@@ -64,20 +64,11 @@ fn decode(raw: u8, status_b: u8) -> u8 {
     }
 }
 
-/// Days from 1970-01-01 to the given civil date, proleptic Gregorian.
-///
-/// Howard Hinnant's `days_from_civil`, the standard compact date arithmetic:
-/// shift March to the start of the year so leap days land at the end, then
-/// count 400-year eras where the leap pattern is exactly periodic.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (if m > 2 { m - 3 } else { m + 9 }) as i64; // [0, 11], March = 0
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
-}
+/// Days from 1970-01-01, and the date a day-count names: the pure halves of
+/// the calendar live in [`crate::date`], where a host build can test them;
+/// this file is only the wires to the CMOS.
+use crate::date::civil_from_epoch;
+use crate::date::days_from_civil;
 
 /// Read the clock once, converting to Unix seconds.
 ///
@@ -194,4 +185,85 @@ pub fn boot_epoch() -> u64 {
 /// for the anchor.
 pub fn set_boot_epoch(epoch: u64) {
     BOOT_EPOCH.store(epoch, Ordering::Relaxed);
+}
+
+fn cmos_write(index: u8, value: u8) {
+    unsafe {
+        let mut addr: Port<u8> = Port::new(CMOS_ADDR);
+        let mut data: Port<u8> = Port::new(CMOS_DATA);
+        addr.write(0x80 | index);
+        data.write(value);
+    }
+}
+
+/// Encode one field into the format status register B names - `decode`'s
+/// exact inverse, in both directions and under every quirk of this board's
+/// status byte. Writing through the inverse of the reader is what makes the
+/// pair self-consistent: whatever the format bits end up meaning, a write
+/// here reads back there.
+fn encode(value: u8, status_b: u8) -> u8 {
+    if status_b & STATUS_B_BINARY != 0 {
+        value
+    } else {
+        (value / 10) << 4 | value % 10
+    }
+}
+
+/// Store a wall-clock time in the CMOS, the way `RTC_SET_TIME` does it: the
+/// fields go out in the format the reader expects, and the year is split
+/// across the century register the way `to_epoch` reassembles it.
+///
+/// Status register B is deliberately left untouched. The conventional SET bit
+/// would freeze the clock's own update while the fields change, but writing
+/// that bit wrong on a board with a shifted bit layout stops the clock from
+/// ever updating again - and a field write that races a second's update is
+/// worth less than the next second's update, which on the machines this
+/// kernel boots (QEMU, whose RTC shadows the host clock) overwrites these
+/// registers within a tick anyway. What the write buys is the honest
+/// `hwclock -w` round trip - read the clock back and it says the time you
+/// set - which is what userland actually checks.
+///
+/// `false` when the epoch is outside the range the registers can spell
+/// (years 1900..2500 - a century byte past 25 would decode wrong); nothing
+/// is written in that case.
+pub fn write_epoch(epoch: u64) -> bool {
+    let secs_of_day = epoch % 86_400;
+    let days = (epoch / 86_400) as i64;
+    let (year, month, day) = civil_from_epoch(days);
+    if !(1900..2500).contains(&year) || month == 0 || month > 12 || day == 0 || day > 31 {
+        return false;
+    }
+
+    let status_b = cmos_read(RTC_STATUS_B);
+    let mut hour = (secs_of_day / 3600) as u8;
+    if status_b & STATUS_B_24H == 0 {
+        // 12-hour mode, exactly as `to_epoch` normalises it on the way in:
+        // the PM bit at 0x80, twelve o'clock spelled as 12 rather than 0.
+        let pm = hour >= 12;
+        hour %= 12;
+        if hour == 0 {
+            hour = 12;
+        }
+        if pm {
+            hour |= 0x80;
+        }
+    }
+
+    // Wait out an in-flight update, bounded like the reader does, so the
+    // fields do not land across the clock's own write of the next second.
+    for _ in 0..1_000_000 {
+        if cmos_read(RTC_STATUS_A) & STATUS_A_UIP == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    cmos_write(RTC_SEC, encode((secs_of_day % 60) as u8, status_b));
+    cmos_write(RTC_MIN, encode((secs_of_day / 60 % 60) as u8, status_b));
+    cmos_write(RTC_HOUR, encode(hour, status_b));
+    cmos_write(RTC_DAY, encode(day as u8, status_b));
+    cmos_write(RTC_MONTH, encode(month as u8, status_b));
+    cmos_write(RTC_YEAR, encode((year % 100) as u8, status_b));
+    cmos_write(RTC_CENTURY, encode((year / 100) as u8, status_b));
+    true
 }

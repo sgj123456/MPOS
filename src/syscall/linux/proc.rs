@@ -2720,8 +2720,13 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // so they cannot disagree - `hostname` and `uname -n` have to say
         // the same thing or a script that checks one against the other fails.
         write_str(65, &crate::vfs::procfs::hostname());
-        write_str(130, "0.1.0"); // release
-        write_str(195, "0.1.0"); // version
+        // `uname -r` must answer the version the kernel was built with - it
+        // is the same `CARGO_PKG_VERSION` `/proc/sys/kernel/osrelease`
+        // reports, and the name of the `/lib/modules/<release>` directory
+        // the image carries for modprobe, which xtask reads from the root
+        // Cargo.toml (see `utils::kernel_release`). Three readers, one number.
+        write_str(130, env!("CARGO_PKG_VERSION")); // release
+        write_str(195, "#1 SMP PREEMPT mpos"); // version
         write_str(260, "x86_64"); // machine
         write_str(325, "(none)"); // domainname
     }

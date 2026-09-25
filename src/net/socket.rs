@@ -158,7 +158,10 @@ fn rtnl_handle_of_fd(fd: i32) -> Option<usize> {
     crate::net::rtnl::exists(handle).then_some(handle)
 }
 
-/// `recv(2)`'s "do not sleep" flag, as `linux/socket.h` spells it.
+/// `recv(2)`'s "do not sleep" flag, as `linux/socket.h` spells it:
+/// `MSG_DONTWAIT` is `0x40`. (`0x4000` is `MSG_CMSG_CLOEXEC`/`MSG_NOSIGNAL`'s
+/// bit - a test that sends that and waits for `EAGAIN` hangs, which is how
+/// this got double-checked.)
 const MSG_DONTWAIT: usize = 0x40;
 /// `recv(2)`'s "look without taking" flag.
 const MSG_PEEK: usize = 0x02;
@@ -698,6 +701,12 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         };
         if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
             file.set_status(crate::vfs::file::O_NONBLOCK);
+            // The datagram doors park on the socket's own flag, so an
+            // `O_NONBLOCK` named at creation has to reach it here - the
+            // same sync `F_SETFL` and `FIONBIO` do later.
+            if let Some(sock) = file.inode().as_unix() {
+                sock.set_nonblocking(true);
+            }
         }
         if cloexec {
             let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
@@ -1061,6 +1070,35 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
         return crate::net::rtnl::send(handle, data);
     }
+    // A unix *datagram* send is the one send whose destination is a name,
+    // so it cannot come through the channel doors - an unconnected
+    // datagram socket has no channel, and `channel_of_fd` below would
+    // report it as no socket at all. The name, when the caller gives one,
+    // is a `sockaddr_un`; when it does not, the send is aimed at the peer
+    // a previous `connect` pinned, and without either it is `ENOTCONN`.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        if let Some(sock) = file.inode().as_unix() {
+            if sock.is_dgram() {
+                if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+                    return err::EFAULT;
+                }
+                let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+                let dest = if args[4] != 0 {
+                    let raw = match read_sockaddr_un(args[4], args[5], from_user) {
+                        Ok(raw) => raw,
+                        Err(e) => return e,
+                    };
+                    match crate::net::unix::sockaddr_un_path(&raw) {
+                        Ok(path) => Some(path),
+                        Err(e) => return e,
+                    }
+                } else {
+                    None
+                };
+                return crate::net::unix::send_dgram(sock, data, dest.as_deref());
+            }
+        }
+    }
     // A connected pair's end: the send *is* a write. There is no destination
     // to parse and no control data this kernel carries, so the whole of the
     // call is the bytes; a caller that names a destination on a connected
@@ -1137,6 +1175,38 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
             return e;
         }
         return crate::net::rtnl::send(handle, &data);
+    }
+    // The datagram form of `sendmsg`: gather the iovecs, take the
+    // destination from `msg_name` if there is one, and hand the whole to
+    // the same single-message send `sendto` reaches. Control data is not
+    // carried on a datagram send here - `SCM_RIGHTS` rides the connected
+    // stream, the shape every caller in this image uses it in.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        if let Some(sock) = file.inode().as_unix() {
+            if sock.is_dgram() {
+                let (name, namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
+                    Ok(fields) => fields,
+                    Err(e) => return e,
+                };
+                let dest = if name != 0 {
+                    let raw = match read_sockaddr_un(name, namelen as usize, from_user) {
+                        Ok(raw) => raw,
+                        Err(e) => return e,
+                    };
+                    match crate::net::unix::sockaddr_un_path(&raw) {
+                        Ok(path) => Some(path),
+                        Err(e) => return e,
+                    }
+                } else {
+                    None
+                };
+                let mut data: Vec<u8> = Vec::new();
+                if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
+                    return e;
+                }
+                return crate::net::unix::send_dgram(sock, &data, dest.as_deref());
+            }
+        }
     }
     // A connected pair's end, in scatter-gather form: gather, then write.
     // No name is legal to send to, but an `SCM_RIGHTS` control buffer names
@@ -1401,6 +1471,39 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         }
         return n as isize;
     }
+    // The datagram receive: one message per call, the sender's name for
+    // the `src_addr` slots - which is the whole reason `recvfrom` exists
+    // beside `read` on a socket of this shape. A buffer smaller than the
+    // message truncates it, discarding the rest, as unix datagrams do.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        if let Some(sock) = file.inode().as_unix() {
+            if sock.is_dgram() {
+                if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+                    return err::EFAULT;
+                }
+                if args[3] & MSG_PEEK != 0 {
+                    return err::EOPNOTSUPP;
+                }
+                if dontwait(fd, args[3]) && !file.inode().poll_ready().read {
+                    return err::EAGAIN;
+                }
+                let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+                return match crate::net::unix::recv_dgram(sock, out) {
+                    Ok((n, from)) => {
+                        if args[4] != 0 {
+                            let name = from.unwrap_or_default();
+                            let r = crate::net::unix::write_named(&name, args[4], args[5]);
+                            if r != 0 {
+                                return r;
+                            }
+                        }
+                        n as isize
+                    }
+                    Err(e) => crate::syscall::err_of(e),
+                };
+            }
+        }
+    }
     // The read side of a connected pair's end. A peek would need to look at
     // the front of the pipe's queue without taking it, which a pipe cannot
     // do - refusing beats consuming bytes the caller meant to keep.
@@ -1509,6 +1612,58 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             }
         }
         return n as isize;
+    }
+    // The datagram receive in scatter-gather form: one message into the
+    // first iovec (the stack wants contiguity, and a syslog-sized message
+    // fits the first iovec of every caller this image has), and the
+    // sender's name back through `msg_name`.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        if let Some(sock) = file.inode().as_unix() {
+            if sock.is_dgram() {
+                let (name, _namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
+                    Ok(fields) => fields,
+                    Err(e) => return e,
+                };
+                let (buf, len) = match first_iovec(iov, iovlen, from_user) {
+                    Some(pair) => pair,
+                    None => return err::EINVAL,
+                };
+                if len == 0 {
+                    return err::EINVAL;
+                }
+                if args[2] & MSG_PEEK != 0 {
+                    return err::EOPNOTSUPP;
+                }
+                if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+                    return err::EFAULT;
+                }
+                if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
+                    return err::EAGAIN;
+                }
+                let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+                return match crate::net::unix::recv_dgram(sock, out) {
+                    Ok((n, from)) => {
+                        if name != 0 {
+                            let peer = from.unwrap_or_default();
+                            let bytes = crate::net::unix::sockaddr_un_bytes(&peer);
+                            if !crate::syscall::buffer_ok(name, bytes.len(), true, from_user) {
+                                return err::EFAULT;
+                            }
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr(),
+                                    name as *mut u8,
+                                    bytes.len(),
+                                );
+                                ((msghdr + 8) as *mut u32).write_unaligned(bytes.len() as u32);
+                            }
+                        }
+                        n as isize
+                    }
+                    Err(e) => crate::syscall::err_of(e),
+                };
+            }
+        }
     }
     // The read side of a connected pair's end, in scatter-gather form: one
     // contiguous read into the first iovec, plus the control chain a unix
@@ -2258,18 +2413,21 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
     };
     let nonblock =
         flags & SOCK_NONBLOCK_F != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
-    let id = match crate::net::unix::accept_face(&listener, nonblock) {
-        Ok(id) => id,
+    // The accepted socket arrives as the Arc itself, not a slot number to
+    // look up: the registry keeps its slots weak, so the only strong
+    // reference between here and the fd table is the one `accept_face`
+    // hands back. Asking it for an id and then re-resolving that id - the
+    // old shape - re-found a slot whose socket had already died the moment
+    // the accept returned, and answered `accept` with EBADF.
+    //
+    // `getsockname` on it answers the listener's name once the caller asks
+    // (the write-back below), and with an absent address it is simply a new
+    // fd.
+    let sock = match crate::net::unix::accept_face(&listener, nonblock) {
+        Ok(sock) => sock,
         Err(e) => return e,
     };
-    // The accepted socket arrives as a fresh descriptor on the same
-    // connected channel; `getsockname` on it answers the listener's name
-    // once the caller asks (the write-back below), and with an absent
-    // address it is simply a new fd.
-    let sock = match crate::net::unix::by_id(id) {
-        Some(sock) => sock,
-        None => return err::EBADF,
-    };
+    let id = sock.id();
     let new_fd = match crate::vfs::open_inode(sock) {
         Ok(fd) => fd,
         Err(e) => return crate::syscall::err_of(e),

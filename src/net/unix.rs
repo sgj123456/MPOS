@@ -1,24 +1,29 @@
-//! AF_UNIX path sockets: the bind table, the listener, the handshake.
+//! AF_UNIX path sockets: the bind table, the listener, the handshake, and
+//! the datagram queue.
 //!
-//! A dbus daemon owns `/run/dbus/system_bus_socket`; an X client finds the
-//! server through `/tmp/.X11-unix/X0`. Neither relationship begins at a
-//! network address - it begins at a *name in the filesystem*, planted by
-//! `bind(2)` and answered by `connect(2)`. That is this module's whole
-//! subject: the two steps between `socket(AF_UNIX, SOCK_STREAM)` and a
-//! working byte channel, which `socketpair` already provides by other
-//! means.
+//! A dbus daemon owns `/run/dbus/system_bus_socket`; busybox syslog owns
+//! `/dev/log`; an X client finds the server through `/tmp/.X11-unix/X0`.
+//! Neither relationship begins at a network address - it begins at a *name
+//! in the filesystem*, planted by `bind(2)` and answered by `connect(2)`
+//! or a `sendto`. That is this module's whole subject: the steps between
+//! `socket(AF_UNIX, ...)` and a working channel, which `socketpair`
+//! already provides by other means.
 //!
 //! The division of labor follows that fact. A *connected* unix stream is
 //! the same anonymous byte channel a socketpair end is - a
 //! [`DuplexEnd`](crate::vfs::pipe::DuplexEnd), whose read/write/poll/
-//! half-close machinery is not duplicated here at all. What this module
-//! owns is the state before a connection exists: the [`UnixSock`] an fd
-//! names, the registry that maps a bound node's identity `(dev, ino)` to
-//! the socket listening behind it, and the accept queue a `connect` feeds
-//! and an `accept` drains. The registry keys on node identity for the same
-//! reason the lock table and inotify watches do (`src/vfs/locks.rs`,
-//! `src/vfs/inotify.rs`): a path can be renamed over or unlinked and
-//! rebound, and only the inode's own number says which socket answered.
+//! half-close machinery is not duplicated here at all. A *datagram* socket
+//! is not a channel at all: it is a name and a queue - messages arrive
+//! whole from anywhere the name resolves, and leave whole to the peer a
+//! `connect` pinned - so it keeps its own [`Dgram`] queue here rather
+//! than borrowing the pipe's. What this module owns either way is the
+//! state before bytes move: the [`UnixSock`] an fd names, the registry
+//! that maps a bound node's identity `(dev, ino)` to the socket listening
+//! behind it, and the accept queue a `connect` feeds and an `accept`
+//! drains. The registry keys on node identity for the same reason the lock
+//! table and inotify watches do (`src/vfs/locks.rs`, `src/vfs/inotify.rs`):
+//! a path can be renamed over or unlinked and rebound, and only the
+//! inode's own number says which socket answered.
 //!
 //! Why none of this lives in the network registry (`src/net/mod.rs`): that
 //! registry is smoltcp's, and it answers `ENETDOWN` before a machine has a
@@ -27,15 +32,19 @@
 //! (`socket.rs`'s uevent socket).
 //!
 //! Deliberate departures from Linux, each visible from userland:
-//! * `SOCK_DGRAM` and `SOCK_SEQPACKET` over AF_UNIX answer `EOPNOTSUPP`,
-//!   the refusal `socketpair` already makes; STREAM serves both target
-//!   daemons.
+//! * `SOCK_SEQPACKET` over AF_UNIX answers `EOPNOTSUPP`, the refusal
+//!   `socketpair` already makes; no caller this image runs asks for it.
 //! * the abstract namespace (`sun_path[0] == '\0'`) answers `EINVAL` - it
 //!   has no filesystem node, hence no part of this design that would hold
 //!   it, and no target daemon reaches for it.
-//! * a bound socket that was never `listen`ed answers `ECONNREFUSED`;
-//!   Linux's implicit backlog-zero rendezvous is state this kernel
-//!   declines to model, and both daemons call `listen`.
+//! * a bound *stream* socket that was never `listen`ed answers
+//!   `ECONNREFUSED`; Linux's implicit backlog-zero rendezvous is state
+//!   this kernel declines to model, and both daemons call `listen`. A
+//!   bound *datagram* socket needs no `listen` - there is nothing to
+//!   queue up to; its queue is open from the bind.
+//! * a datagram queue holds [`RECVQ_MAX`] messages and refuses more with
+//!   `EAGAIN` to the sender; Linux grows the queue against the receiver's
+//!   socket buffer, and one fixed, generous cap is this kernel's shape.
 //! * a socket path on ext4 cannot be bound (`EOPNOTSUPP` at the node
 //!   level): the on-disk inode type is unwired, and `/run` and
 //!   `/tmp/.X11-unix` - where every real socket lives - are tmpfs.
@@ -100,8 +109,10 @@ fn self_cred() -> UCred {
 /// say an unconnected socket answers.
 pub struct UnixSock {
     id: usize,
-    /// `SOCK_STREAM` in this kernel's v1 (the module header's refusal
-    /// list); carried so a future datagram form reaches the same downcast.
+    /// `SOCK_STREAM` or `SOCK_DGRAM`, as `socket` was told: the streams
+    /// connect through a listener's queue and carry bytes; the datagrams
+    /// connect to a name and carry whole messages. SEQPACKET stays the
+    /// documented refusal.
     typ: u16,
     state: Mutex<RefCell<UnixState>>,
 }
@@ -141,7 +152,42 @@ struct UnixState {
     /// `SO_PASSCRED`: the owner wants the peer's credentials attached, as an
     /// `SCM_CREDENTIALS` message, to every read that has room for one.
     passcred: bool,
+    /// A `SOCK_DGRAM` socket's received datagrams, whole, in send order -
+    /// the queue a connected writer pushes onto and `read` pops. A
+    /// listener's `pending` holds *channels*; this holds *messages*, which
+    /// is the whole difference between the two shapes of unix socket.
+    recvq: VecDeque<Dgram>,
+    /// Tasks parked in a `read` that found the queue empty. Same contract
+    /// as the accept waiters: the delivery wakes them, and every wake
+    /// re-checks its own condition.
+    read_waiters: Vec<TaskId>,
+    /// The socket a `connect` aimed this datagram socket at. Weak: a
+    /// connected sender must not keep the recipient alive; the upgrade
+    /// failing is exactly the "peer is gone" the send answers with.
+    dgram_peer: Option<Weak<UnixSock>>,
+    /// Whether the descriptor's `O_NONBLOCK` has reached the socket - the
+    /// pipe's rule, carried by the same `F_SETFL`/`FIONBIO` sync.
+    nonblocking: bool,
 }
+
+/// One received datagram: the bytes and the sender's name if it had a
+/// bound one - the `recvfrom` answer. `SCM_CREDENTIALS` per message is
+/// still the connected stream's story, told by `SO_PEERCRED` at accept.
+struct Dgram {
+    data: Vec<u8>,
+    from: Option<String>,
+}
+
+/// Queued datagrams per socket before a send answers `EAGAIN`, and the
+/// largest datagram accepted. Linux sizes these from socket buffers; one
+/// fixed, generous number is the teaching-kernel shape: a syslog line is
+/// a few hundred bytes, and a caller whose peer is not reading gets an
+/// explicit no instead of an unbounded queue.
+const RECVQ_MAX: usize = 64;
+const GRAM_MAX: usize = 64 * 1024;
+
+/// `SOCK_DGRAM` as `socket(2)` names it.
+const SOCK_DGRAM: u16 = 2;
 
 struct BoundName {
     /// The path spelled at `bind`, for `getsockname`'s echo. The node the
@@ -170,6 +216,10 @@ impl UnixSock {
                 owner,
                 peer: None,
                 passcred: false,
+                recvq: VecDeque::new(),
+                read_waiters: Vec::new(),
+                dgram_peer: None,
+                nonblocking: false,
             })),
         })
     }
@@ -194,6 +244,122 @@ impl UnixSock {
     /// `SCM_CREDENTIALS`.
     pub fn set_passcred(&self, on: bool) {
         critical_section::with(|cs| self.state.borrow(cs).borrow_mut().passcred = on);
+    }
+
+    /// Whether this is a datagram socket - the branch the byte doors and
+    /// the message syscalls route by.
+    pub fn is_dgram(&self) -> bool {
+        self.typ == SOCK_DGRAM
+    }
+
+    /// The descriptor's `O_NONBLOCK`, carried onto the socket the way the
+    /// pipe carries it: the doors answer EAGAIN instead of parking.
+    pub fn set_nonblocking(&self, on: bool) {
+        critical_section::with(|cs| self.state.borrow(cs).borrow_mut().nonblocking = on);
+    }
+
+    /// The receiver's half of a datagram send: queue one whole message and
+    /// wake whoever sits in `read`. `false` is the queue at its cap - the
+    /// sender's `EAGAIN`, never a silent drop of a message someone asked
+    /// to send.
+    fn push_dgram(&self, data: &[u8], from: Option<String>) -> bool {
+        let waiters = critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            if st.recvq.len() >= RECVQ_MAX {
+                return None;
+            }
+            st.recvq.push_back(Dgram {
+                data: data.to_vec(),
+                from,
+            });
+            Some(st.read_waiters.clone())
+        });
+        match waiters {
+            Some(ids) => {
+                wake_all(ids);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The socket `connect` aimed a datagram sender at, while it lives.
+    fn dgram_peer(&self) -> Option<Arc<UnixSock>> {
+        critical_section::with(|cs| {
+            self.state
+                .borrow(cs)
+                .borrow()
+                .dgram_peer
+                .as_ref()
+                .and_then(|w| w.upgrade())
+        })
+    }
+
+    /// Whether a datagram socket has a peer pinned, live or not - the
+    /// `EISCONN` a second `connect` answers by.
+    fn dgram_connected(&self) -> bool {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().dgram_peer.is_some())
+    }
+
+    /// Take the front datagram, parked for if the queue is empty and the
+    /// caller allowed waiting. The answer is the bytes copied and the
+    /// sender's name; the copy truncates to the caller's buffer the way
+    /// unix datagrams do - the rest of that one message is gone, and the
+    /// next read still finds the next message whole.
+    fn take_dgram(&self, buf: &mut [u8]) -> Result<(usize, Option<String>), VfsError> {
+        loop {
+            let taken = critical_section::with(|cs| {
+                let mut st = self.state.borrow(cs).borrow_mut();
+                match st.recvq.pop_front() {
+                    Some(g) => Some((g.data, g.from, st.read_waiters.clone())),
+                    None => None,
+                }
+            });
+            if let Some((data, from, _waiters)) = taken {
+                // The queue only got emptier by one message, so the other
+                // parked readers stay parked until a push wakes them all;
+                // this take's own waiters set is the poll subscribers, and
+                // `epoll` re-arms them through `poll_ready` on its own.
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                return Ok((n, from));
+            }
+            let nonblock = critical_section::with(|cs| self.state.borrow(cs).borrow().nonblocking);
+            if nonblock {
+                return Err(VfsError::Again);
+            }
+            #[cfg(not(target_os = "none"))]
+            return Err(VfsError::Again);
+            #[cfg(target_os = "none")]
+            self.wait_for_dgram();
+        }
+    }
+
+    /// Park until a datagram stands in the queue - the accept wait's
+    /// shape: register, wait on the condition, unregister. A signal
+    /// breaks `block_until` the way it breaks every other kernel park.
+    #[cfg(target_os = "none")]
+    fn wait_for_dgram(&self) {
+        let me = crate::sched::current();
+        critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            if !st.read_waiters.contains(&me) {
+                st.read_waiters.push(me);
+            }
+        });
+        crate::sched::block_until(|| {
+            critical_section::with(|cs| {
+                let st = self.state.borrow(cs).borrow();
+                !st.recvq.is_empty()
+            })
+        });
+        critical_section::with(|cs| {
+            self.state
+                .borrow(cs)
+                .borrow_mut()
+                .read_waiters
+                .retain(|&w| w != me);
+        });
     }
 
     /// The connected channel, if there is one - the downcast the file
@@ -260,10 +426,19 @@ impl Inode for UnixSock {
         Some(self)
     }
 
-    /// The byte doors: a connected socket answers through its channel -
-    /// the same reads a socketpair end gives - and an unconnected one
-    /// answers `ENOTCONN`, listening or fresh.
+    /// The byte doors. A stream answers through its channel - the same
+    /// reads a socketpair end gives - and answers `ENOTCONN` when there is
+    /// no channel, listening or fresh. A datagram socket answers through
+    /// its queue instead: one `read` takes one whole datagram (bytes past
+    /// the caller's buffer are discarded, which is the unix rule, not a
+    /// loss to paper over), and one `write` is one whole datagram to the
+    /// connected peer.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        if self.typ == SOCK_DGRAM {
+            let (n, _) = self.take_dgram(buf)?;
+            return Ok(n);
+        }
+        let _ = offset;
         match self.end_of() {
             Some(end) => end.read_at(offset, buf),
             None => Err(VfsError::NotConnected),
@@ -271,13 +446,37 @@ impl Inode for UnixSock {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
-        match self.end_of() {
-            Some(end) => end.write_at(offset, buf),
-            None => Err(VfsError::NotConnected),
+        if self.typ == SOCK_DGRAM {
+            let _ = offset;
+            let peer = self.dgram_peer().ok_or(VfsError::NotConnected)?;
+            let name = self.local_name();
+            if peer.push_dgram(buf, name) {
+                Ok(buf.len())
+            } else {
+                Err(VfsError::Again)
+            }
+        } else {
+            match self.end_of() {
+                Some(end) => end.write_at(offset, buf),
+                None => Err(VfsError::NotConnected),
+            }
         }
     }
 
     fn poll_ready(&self) -> Ready {
+        // A datagram socket is readable when a message stands in its queue,
+        // and writable while the queue has room to send into the peer's -
+        // the peer's cap is the only backpressure, so `write: true` states
+        // what is true of a socket whose peer reads at all; a full peer
+        // answers the send itself with `EAGAIN`.
+        if self.typ == SOCK_DGRAM {
+            let queued =
+                critical_section::with(|cs| !self.state.borrow(cs).borrow().recvq.is_empty());
+            return Ready {
+                read: queued,
+                write: true,
+            };
+        }
         // Connected first, by fact not by position: the client end of a
         // completed handshake has an empty accept queue of its own, and
         // reading it through the listener branch below would report it
@@ -298,6 +497,16 @@ impl Inode for UnixSock {
     /// waiting out its tick budget. A connected socket forwards to the
     /// channel - both of its halves, the socketpair rule.
     fn poll_subscribe(&self, id: TaskId) {
+        // A datagram reader waits on the message queue, not the accept one.
+        if self.typ == SOCK_DGRAM {
+            critical_section::with(|cs| {
+                let mut st = self.state.borrow(cs).borrow_mut();
+                if !st.read_waiters.contains(&id) {
+                    st.read_waiters.push(id);
+                }
+            });
+            return;
+        }
         // Connected: both halves of the channel, the socketpair rule.
         // Listening (or nothing): the accept waiters, so a `connect`
         // reaching the queue is what wakes the poll.
@@ -320,6 +529,7 @@ impl Inode for UnixSock {
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
             st.accept_waiters.retain(|&w| w != id);
+            st.read_waiters.retain(|&w| w != id);
         });
     }
 }
@@ -458,6 +668,7 @@ impl Drop for UnixSock {
             let pending = core::mem::take(&mut st.pending);
             let mut waiters = core::mem::take(&mut st.accept_waiters);
             waiters.append(&mut st.room_waiters);
+            waiters.append(&mut st.read_waiters);
             (pending, waiters)
         });
         // Outside every borrow: a queued half's drop can wake whoever
@@ -497,6 +708,23 @@ pub(crate) fn connect(
     nonblock: bool,
 ) -> Result<(), ConnectRefused> {
     let listener = live_listener(node).ok_or(ConnectRefused::Refused)?;
+    if sock.typ == SOCK_DGRAM {
+        // A datagram `connect` pins a destination and nothing else: no
+        // handshake, no queue entry, no listener's consent - the name just
+        // has to answer, and answering as a stream is answering with no
+        // queue to land messages in, so both are refused the way Linux
+        // refuses them.
+        if !listener.is_dgram() {
+            return Err(ConnectRefused::Refused);
+        }
+        critical_section::with(|cs| {
+            let cred = listener.state.borrow(cs).borrow().owner;
+            let mut st = sock.state.borrow(cs).borrow_mut();
+            st.dgram_peer = Some(Arc::downgrade(&listener));
+            st.peer = Some(cred);
+        });
+        return Ok(());
+    }
     loop {
         let outcome = critical_section::with(|cs| {
             let lst = {
@@ -670,6 +898,12 @@ fn accept_blocking_step(_sock: &UnixSock) -> bool {
 /// answers are decided by [`clamp_backlog`] and the handler; the first
 /// `listen` on a socket is what makes a `connect` acceptable at all.
 pub(crate) fn listen(sock: &UnixSock, backlog: i32) -> Result<(), isize> {
+    // `listen` is the stream call: it opens an accept queue, and a
+    // datagram socket has no such thing - its queue is its queue, already
+    // open from the moment the socket was. Linux answers `EOPNOTSUPP`.
+    if sock.typ == SOCK_DGRAM {
+        return Err(err::EOPNOTSUPP);
+    }
     let cap = clamp_backlog(backlog).ok_or(crate::syscall::err::EINVAL)?;
     critical_section::with(|cs| {
         let mut st = sock.state.borrow(cs).borrow_mut();
@@ -825,7 +1059,14 @@ fn sock_arc(sock: &UnixSock) -> Arc<UnixSock> {
 /// address.
 pub(crate) fn write_name(sock: &UnixSock, addr_ptr: usize, len_ptr: usize) -> isize {
     let path = sock.local_name().unwrap_or_default();
-    let bytes = sockaddr_un_bytes(&path);
+    write_named(&path, addr_ptr, len_ptr)
+}
+
+/// The same contract with the name given directly - which is what
+/// `recvfrom` needs: the address it writes back is the *sender's* name of
+/// the datagram just taken, not the receiver's own.
+pub(crate) fn write_named(path: &str, addr_ptr: usize, len_ptr: usize) -> isize {
+    let bytes = sockaddr_un_bytes(path);
     if len_ptr == 0 {
         return err::EFAULT;
     }
@@ -873,7 +1114,7 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
         return crate::syscall::err_of(e);
     }
     // Already connected sockets cannot connect again.
-    if sock.end_of().is_some() {
+    if sock.end_of().is_some() || sock.dgram_connected() {
         return err::EISCONN;
     }
     let arc = sock_arc(sock);
@@ -884,14 +1125,90 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
     }
 }
 
+// ---------------------------------------------------------------------------
+// The datagram face: a send to a name, a receive from the queue
+// ---------------------------------------------------------------------------
+
+/// One datagram's whole send, from either spelling of the call: with a
+/// name the socket is aiming at it this time (the `sendto` shape, which
+/// does not remember the aim); without one, the queue of the peer a
+/// previous `connect` pinned is where the message goes, and a socket that
+/// was never connected sends nowhere - `ENOTCONN`, the man page's answer
+/// for a sender with no one to send to.
+///
+/// Delivery is the receiving socket's queue: a datagram never waits for a
+/// reader the way a stream byte does, it waits for *room*. A full queue
+/// answers `EAGAIN` to the sender - the receiver's slow read is the
+/// sender's problem to hear about, which is the honest version of Linux's
+/// socket-buffer accounting at this scale.
+pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&str>) -> isize {
+    if data.len() > GRAM_MAX {
+        return err::EMSGSIZE;
+    }
+    let target: Arc<UnixSock> = match dest {
+        Some(path) => {
+            // A connected datagram socket sends to its peer; naming a
+            // different destination on the call that already pinned one is
+            // `EISCONN`, the same refusal the stream channel answers.
+            if sock.dgram_connected() {
+                return err::EISCONN;
+            }
+            let cwd = crate::sched::current_cwd();
+            let node = match crate::vfs::resolve_opt(path, Some(cwd)) {
+                Ok(node) => node,
+                Err(e) => return crate::syscall::err_of(e),
+            };
+            if node.metadata().kind != NodeKind::Socket {
+                return err::ECONNREFUSED;
+            }
+            match live_listener(&node) {
+                Some(sock) => sock,
+                None => return err::ECONNREFUSED,
+            }
+        }
+        None => match sock.dgram_peer() {
+            Some(peer) => peer,
+            None => return err::ENOTCONN,
+        },
+    };
+    // A stream socket has no message queue to land in: the name is there,
+    // no datagram lives behind it, and the refusal is the one `connect`
+    // to the same name would answer - `ECONNREFUSED`.
+    if !target.is_dgram() {
+        return err::ECONNREFUSED;
+    }
+    let from = sock.local_name();
+    if target.push_dgram(data, from) {
+        data.len() as isize
+    } else {
+        err::EAGAIN
+    }
+}
+
+/// One `recvfrom` on a datagram socket: take the front message into the
+/// caller's buffer and report the sender's name for the `src_addr` slots.
+pub(crate) fn recv_dgram(
+    sock: &UnixSock,
+    buf: &mut [u8],
+) -> Result<(usize, Option<String>), VfsError> {
+    sock.take_dgram(buf)
+}
+
 /// The accept act, handler side: pop (or park), wrap the server half in a
 /// fresh unix socket, and hand the caller a descriptor that is already
 /// connected - the shape an accepted socket has on every system.
-pub(crate) fn accept_face(listener: &UnixSock, nonblock: bool) -> Result<usize, isize> {
+///
+/// The Arc leaves *by name*, not as a slot number: the registry holds its
+/// slots weak, so a socket nothing owns is gone the moment the statement
+/// that made it ends - and an id sent back through the handler would be
+/// looked up in a slot that had already died. The caller receives the one
+/// strong reference that keeps the accepted socket alive until the fd table
+/// has taken its own.
+pub(crate) fn accept_face(listener: &UnixSock, nonblock: bool) -> Result<Arc<UnixSock>, isize> {
     let (end, peer) = accept_once(listener, nonblock)?;
     let accepted = alloc(listener.typ);
     accepted.with_state_connect(end, peer);
-    Ok(accepted.id)
+    Ok(accepted)
 }
 
 impl UnixSock {
