@@ -59,7 +59,17 @@ pub(super) const AT_REMOVEDIR: usize = 0x200;
 /// O_CREAT: make the named file when it is not there already. With O_EXCL
 /// it refuses instead of replacing; on its own it opens whatever is there.
 pub(super) const O_CREAT: usize = 0o100;
-pub(super) const O_EXCL: usize = 0o400;
+/// `O_EXCL`: with `O_CREAT`, refuse a name that is already there rather than
+/// opening it.
+///
+/// The value is `0o200`, and it is worth spelling out because it sat at
+/// `0o400` here for a while - which is `O_NOCTTY`'s number. Nothing noticed
+/// until `busybox syslogd` opened `/var/log/messages` with
+/// `O_WRONLY|O_CREAT|O_NOCTTY|O_APPEND|O_NONBLOCK`: the kernel read the
+/// `O_NOCTTY` bit as `O_EXCL`, the file existed, and the answer was `EEXIST`
+/// - so the log file was never written and every message went to the console
+/// instead.
+pub(super) const O_EXCL: usize = 0o200;
 /// `O_TRUNC`: an existing file is emptied as part of the open. Without it a
 /// writer that reopens a name it wrote before keeps whatever tail was longer
 /// than what it writes now - the new bytes followed by the old ones, with
@@ -2662,7 +2672,7 @@ mod tests {
     fn abi_flag_bits_match_the_man_pages() {
         // open(2)
         assert_eq!(O_CREAT, 0o100);
-        assert_eq!(O_EXCL, 0o400);
+        assert_eq!(O_EXCL, 0o200);
         assert_eq!(O_TRUNC, 0o1000);
         assert_eq!(O_CLOEXEC, 0o200_0000);
         assert_eq!(O_ACCMODE, 0o3);

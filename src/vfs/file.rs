@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
-use super::{Inode, Metadata, VfsError, VfsResult, resolve};
+use super::{Inode, Metadata, NodeKind, VfsError, VfsResult, resolve};
 
 /// What an fd number is.
 pub type RawFd = i32;
@@ -30,6 +30,24 @@ pub const FD_CLOEXEC: u32 = 1;
 /// a datagram socket that refuses to wait is exactly what a DNS resolver's
 /// timeout loop is built on.
 pub const O_NONBLOCK: u32 = 0o4000;
+
+/// The `O_APPEND` open flag: every write lands at the end of the file,
+/// whatever the description's cursor says.
+///
+/// It is the flag a log file is written with, and the reason it has to live on
+/// the *description* rather than be folded into the open: the point is that
+/// the position is re-read on every write, so a writer that has been running
+/// since before somebody else appended to the file does not clobber their
+/// bytes. `busybox syslogd` opens `/var/log/messages` with it, and a kernel
+/// that ignores the flag writes the new line over the start of the old one -
+/// which is what made the guest's log file a single line long for ever.
+pub const O_APPEND: u32 = 0o2000;
+
+/// The bits of an open's flag word that outlive the open: the access mode,
+/// and the two flags the read and write paths consult. The creation flags
+/// (`O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_NOCTTY`) are spent by the open itself
+/// and are not file status - Linux's `F_GETFL` does not report them either.
+pub const OPEN_STATUS_FLAGS: u32 = 0o3 | O_APPEND | O_NONBLOCK;
 
 /// An open file description: an inode plus where the next read/write lands.
 pub struct File {
@@ -153,7 +171,19 @@ impl File {
     }
 
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
-        let pos = self.pos.load(Ordering::Relaxed);
+        // `O_APPEND` decides the position here rather than at the open,
+        // because that is what the flag promises: the end of the file *now*,
+        // re-read on every write, so a description held open while somebody
+        // else appends does not overwrite what they wrote. A regular file is
+        // the only thing the flag means anything for - a pipe or a terminal
+        // has no end to append at, and its offset is ignored anyway - so the
+        // size is asked of the inode only for one.
+        let status = self.status.load(Ordering::Relaxed);
+        let pos = if status & O_APPEND != 0 && self.inode.metadata().kind == NodeKind::File {
+            self.inode.metadata().size
+        } else {
+            self.pos.load(Ordering::Relaxed)
+        };
         let n = self.inode.write_at(pos, buf)?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
         // The one IN_MODIFY chokepoint of the userland write paths: every
@@ -568,12 +598,52 @@ mod tests {
         assert_eq!(file.read(&mut buf).unwrap(), 0);
     }
 
+    /// `O_APPEND` lands every write at the end of the file, and it is the
+    /// *description's* flag, not a cursor trick: a description that has never
+    /// written - whose cursor still reads 0 - appends where the file ends.
+    /// That is the case `busybox syslogd` is: it reopens `/var/log/messages`
+    /// on every write, so a kernel that wrote at the cursor put each new line
+    /// over the start of the previous one.
+    #[test]
+    fn a_description_opened_for_append_writes_at_the_end() {
+        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+        let first = File::new(inode.clone());
+        assert_eq!(first.write(b"one\n").unwrap(), 4);
+
+        // A fresh description, as the second `open` of a log file makes: its
+        // cursor is 0, and with `O_APPEND` set the write must not use it.
+        let appending = File::new(inode.clone());
+        appending.set_status(super::O_APPEND);
+        assert_eq!(appending.write(b"two\n").unwrap(), 4);
+
+        let mut buf = [0u8; 16];
+        assert_eq!(File::new(inode).read(&mut buf).unwrap(), 8);
+        assert_eq!(&buf[..8], b"one\ntwo\n");
+
+        // Without the flag the same fresh description writes at its cursor,
+        // which is the behaviour the flag exists to change.
+        let overwriting = File::new(RamFs::new().root().create("g", NodeKind::File).unwrap());
+        overwriting.write(b"abcdef").unwrap();
+        let plain = File::new(overwriting.inode());
+        plain.write(b"XY").unwrap();
+        let mut buf = [0u8; 8];
+        let n = File::new(plain.inode()).read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"XYcdef");
+    }
+
+    /// The two flag bits the description keeps are the ones the headers
+    /// spell: `O_APPEND` is `0o2000` and `O_NONBLOCK` is `0o4000`.
+    #[test]
+    fn the_status_flag_bits_match_the_headers() {
+        assert_eq!(super::O_APPEND, 0o2000);
+        assert_eq!(super::O_NONBLOCK, 0o4000);
+        assert_eq!(super::OPEN_STATUS_FLAGS, 0o3 | 0o2000 | 0o4000);
+    }
     #[test]
     fn descriptions_over_one_inode_read_independently() {
         let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
         let writer = File::new(inode.clone());
         let reader = File::new(inode);
-
         assert_eq!(writer.write(b"abcd").unwrap(), 4);
 
         let mut buf = [0u8; 2];

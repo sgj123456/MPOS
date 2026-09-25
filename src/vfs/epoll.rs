@@ -202,13 +202,23 @@ impl Epoll {
                     // spurious wakeups in both directions.
                     //
                     // The *kind* alone cannot tell a pipe or a socket from
-                    // a file - both report `NodeKind::File` - so the
-                    // two who can wait are named before the refusal lands:
-                    // a pipe can block a reader, and a socket is the whole
-                    // reason epoll exists.
+                    // a file - all three report `NodeKind::File` - so the
+                    // ones who can wait are named before the refusal lands:
+                    // a pipe can block a reader, a socketpair end is the
+                    // same channel in socket clothes, and an IP socket is
+                    // the whole reason epoll exists.
+                    //
+                    // The socketpair end is the one that got left out once,
+                    // and it is not a corner: `dbus-daemon`'s reload pipe is
+                    // a `socketpair`, so the bus refused to start at all -
+                    // `epoll_ctl` answered `EPERM` on a descriptor Linux
+                    // watches without a second thought, and the daemon read
+                    // that as its own internal error and exited.
                     let epollable = match file.metadata().kind {
                         NodeKind::File => {
-                            file.inode().as_pipe().is_some() || file.inode().socket_handle() != 0
+                            file.inode().as_pipe().is_some()
+                                || file.inode().as_duplex().is_some()
+                                || file.inode().socket_handle() != 0
                         }
                         NodeKind::Dir => false,
                         _ => true,
@@ -667,6 +677,23 @@ mod tests {
             ep.ctl(&table, epfd, EPOLL_CTL_ADD, dfd, EPOLLIN, 0),
             Err(err::EPERM)
         );
+    }
+
+    /// The two anonymous channels that are `NodeKind::File` and still
+    /// watchable: a pipe end and a `socketpair` end. The second is the one
+    /// that was refused as a file, and the cost was a daemon - `dbus-daemon`
+    /// builds its reload pipe with `socketpair(2)`, so the bus would not
+    /// start.
+    #[test]
+    fn ctl_accepts_the_channels_that_are_file_kinded() {
+        let (table, ep, epfd) = epoll_fd();
+        let (read_end, _write_end) = pipe::pair();
+        let pfd = watch(&table, read_end);
+        let (a, _b) = pipe::DuplexEnd::pair();
+        let sfd = watch(&table, a);
+
+        assert_eq!(ep.ctl(&table, epfd, EPOLL_CTL_ADD, pfd, EPOLLIN, 0), Ok(()));
+        assert_eq!(ep.ctl(&table, epfd, EPOLL_CTL_ADD, sfd, EPOLLIN, 0), Ok(()));
     }
 
     /// `epoll_ctl(2)`: EPOLLEXCLUSIVE is ADD-only, MOD refuses it twice -

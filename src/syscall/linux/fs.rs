@@ -258,6 +258,18 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             if flags & O_CLOEXEC != 0 {
                 let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
             }
+            // The half of the open's flag word that outlives the open: the
+            // access mode, `O_APPEND` and `O_NONBLOCK`, which is what
+            // `fcntl(F_GETFL)` reports and what the read and write paths ask.
+            // Storing it here is what makes `O_APPEND` bite at all - a
+            // description that never learned it writes at its cursor, which
+            // for a fresh open is the start of the file, so a log writer
+            // overwrites the beginning of its own log instead of appending.
+            if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+                let status = (flags as u32) & crate::vfs::file::OPEN_STATUS_FLAGS;
+                file.set_status(status);
+                sync_nonblocking(&file, status);
+            }
             // `O_TRUNC` empties an existing file as part of the open, which is
             // what a writer that reopens a name is promising: what it writes
             // now is the whole file. Without it, `wget -O page.html` over a

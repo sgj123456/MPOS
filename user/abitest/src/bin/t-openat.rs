@@ -25,8 +25,12 @@ static SH: [u8; 3] = *b"sh\0";
 static X: [u8; 2] = *b"x\0";
 static NEW: [u8; 18] = *b"/tmp/t-openat_new\0";
 
-const O_CREAT: usize = 0o100;
-const O_EXCL: usize = 0o400;
+// The flag bits come from the shared header rather than being spelled here:
+// this file once carried its own `O_EXCL = 0o400`, which is `O_NOCTTY`, and
+// so asserted the kernel's own wrong bit back at it - the test passed while
+// `O_CREAT|O_EXCL` on an existing file never actually answered `EEXIST`.
+const O_CREAT: usize = lin::O_CREAT;
+const O_EXCL: usize = lin::O_EXCL;
 
 static mut BUF: [u8; 64] = [0; 64];
 
