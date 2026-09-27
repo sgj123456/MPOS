@@ -1546,9 +1546,20 @@ fn handoff_to_init(info: &BootInfo) {
 }
 
 /// Where the boot task spends the rest of the machine's life.
+///
+/// It *blocks* here rather than halting on the spot, and the difference is the
+/// whole of the wake latency. `wait_for_interrupt` from a task stops the core
+/// rather than giving it up: this task stays runnable, so the picker hands it
+/// the CPU, and a task that has halted can only be taken off it by an
+/// interrupt - of which the only one that reliably arrives is the clock. Any
+/// wake that lands behind it in the ready queue therefore waits for the next
+/// tick, which is 4 ms at this build's 250 Hz, on every blocking call in the
+/// system. Parking in the scheduler instead leaves the idle halt where the rest
+/// of the kernel already assumes it is - in the scheduler's own loop, where a
+/// wake is followed by a turn and not by a tick.
 fn park() -> ! {
     loop {
-        sched::wait_for_interrupt();
+        sched::block_until(|| false);
     }
 }
 
