@@ -4337,6 +4337,14 @@ pub fn write_user(virt: usize, bytes: &[u8]) -> bool {
 /// still shares would want the copy broken first, and doing that needs the
 /// tracee's own `Mm` accounting rather than a physical address. Said plainly
 /// rather than half-done.
+///
+/// The walk asks for `USER` - [`paging::user_phys_for_virt_of`], not the bare
+/// translation - because the address belongs to somebody else: every space
+/// carries the kernel's own mappings above the user half, and a walk without
+/// that bit answers for them too. A same-task caller has
+/// [`user_byte_address`] instead, which makes the same refusal, and the
+/// user-pointer check the syscall layer runs on its own arguments cannot answer
+/// for tables CR3 does not hold.
 pub fn read_user_of(root: usize, virt: usize, bytes: &mut [u8]) -> bool {
     let mut done = 0;
     while done < bytes.len() {
@@ -4344,7 +4352,7 @@ pub fn read_user_of(root: usize, virt: usize, bytes: &mut [u8]) -> bool {
         let page_end =
             crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
         let chunk = core::cmp::min(page_end - at, bytes.len() - done);
-        let Some(phys) = paging::phys_for_virt_of(root, at) else {
+        let Some(phys) = paging::user_phys_for_virt_of(root, at) else {
             return false;
         };
         let src =
@@ -4356,7 +4364,8 @@ pub fn read_user_of(root: usize, virt: usize, bytes: &mut [u8]) -> bool {
 }
 
 /// Write `bytes` into the user address space `root` names. The writing half of
-/// [`read_user_of`], and so the same note about copy-on-write pages applies.
+/// [`read_user_of`], and so the same notes apply: the `USER` bit is asked for,
+/// and a copy-on-write page is not broken.
 pub fn write_user_of(root: usize, virt: usize, bytes: &[u8]) -> bool {
     let mut done = 0;
     while done < bytes.len() {
@@ -4364,7 +4373,7 @@ pub fn write_user_of(root: usize, virt: usize, bytes: &[u8]) -> bool {
         let page_end =
             crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
         let chunk = core::cmp::min(page_end - at, bytes.len() - done);
-        let Some(phys) = paging::phys_for_virt_of(root, at) else {
+        let Some(phys) = paging::user_phys_for_virt_of(root, at) else {
             return false;
         };
         let dest =

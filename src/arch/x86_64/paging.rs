@@ -740,6 +740,40 @@ pub fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
     None
 }
 
+/// [`phys_for_virt_of`] for a caller that must not reach anything the process
+/// could not reach itself: the physical address `virt` lands on in the address
+/// space `root` names, or `None` when the walk ends somewhere ring 3 could not
+/// go.
+///
+/// The difference from [`phys_for_virt_of`] is one permission bit, and it is
+/// the difference between a debugger and a hole. Every address space carries
+/// the kernel's own mappings above [`USER_END`], so a walk that does not ask for
+/// `USER` answers for the supervisor's memory too - which is how
+/// `process_vm_readv` would have read another task's kernel pages. The
+/// user-pointer check that guards the kernel's own dereferences cannot answer
+/// here, because the tables under it are not the ones CR3 holds.
+pub fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+    let mut table = root;
+    for level in (0..4).rev() {
+        let entry = table_entry(table, virt, level);
+        if entry & PRESENT == 0 {
+            return None;
+        }
+        // A page is only as reachable as the strictest level above it - the
+        // same rule `translate` applies to the active tables, except that a
+        // refusal here is `None` rather than a flag dropped.
+        if entry & USER == 0 {
+            return None;
+        }
+        let span = 1 << (12 + level * 9);
+        if level == 0 || entry & HUGE != 0 {
+            return Some(((entry & ADDR_MASK) | (virt & (span - 1)) as u64) as usize);
+        }
+        table = (entry & ADDR_MASK) as usize;
+    }
+    None
+}
+
 impl Default for AddressSpace {
     fn default() -> AddressSpace {
         AddressSpace::new()
