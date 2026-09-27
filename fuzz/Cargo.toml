@@ -1,0 +1,159 @@
+[package]
+name = "mpos-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Its own workspace root. The kernel's workspace at `..` lists its members
+# explicitly and does not include this crate, so without this table cargo
+# refuses to build: `mpos-fuzz` would believe it belongs to a workspace that
+# never heard of it. Keeping it separate is also what lets the fuzz build pick
+# `--target x86_64-unknown-linux-gnu` over the kernel's own `[build] target`,
+# which is `x86_64-unknown-none` and cannot link a libFuzzer binary.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The structured inputs: `pci_bars`, `sched_policy`, `date_civil`, `keymap_events`,
+# `signal_sets`, `term_grid` take a derived shape rather than a byte string,
+# because the thing worth fuzzing in those is the field values, not their
+# encoding. Raw bytes stay the input for the parsers that read a format.
+arbitrary = { version = "1", features = ["derive"] }
+
+# The kernel library, built for the host. Everything reachable here is what
+# `src/lib.rs` leaves un-gated for a `target_os = "none"`-free build: the
+# parsers that decide what the kernel trusts from bytes - ELF, ustar, the
+# on-disk ext2/ext4 structures, partition tables, paths, PCI sizing, the
+# console's escape parser.
+[dependencies.mpos]
+path = ".."
+default-features = false
+
+[[bin]]
+name = "binfmt_shebang"
+path = "fuzz_targets/binfmt_shebang.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "date_civil"
+path = "fuzz_targets/date_civil.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf_parse"
+path = "fuzz_targets/elf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext4_image"
+path = "fuzz_targets/ext4_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext4_write"
+path = "fuzz_targets/ext4_write.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "evdev_window"
+path = "fuzz_targets/evdev_window.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inotify_record"
+path = "fuzz_targets/inotify_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keymap_events"
+path = "fuzz_targets/keymap_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "logging_cmdline"
+path = "fuzz_targets/logging_cmdline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "partition_table"
+path = "fuzz_targets/partition_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pci_bars"
+path = "fuzz_targets/pci_bars.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sched_policy"
+path = "fuzz_targets/sched_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signal_sets"
+path = "fuzz_targets/signal_sets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_unpack"
+path = "fuzz_targets/tar_unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "term_grid"
+path = "fuzz_targets/term_grid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uevent_encode"
+path = "fuzz_targets/uevent_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uinput_setup"
+path = "fuzz_targets/uinput_setup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vfs_path"
+path = "fuzz_targets/vfs_path.rs"
+test = false
+doc = false
+bench = false

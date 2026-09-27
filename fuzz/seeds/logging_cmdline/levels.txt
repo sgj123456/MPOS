@@ -1,0 +1,5 @@
+quiet
+loglevel=7
+loglevel=debug console=ttyS0
+rw
+loglevel=

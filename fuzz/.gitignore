@@ -1,0 +1,13 @@
+# cargo-fuzz's outputs, which the README names but nothing enforced until now:
+# `seeds/` and `fuzz_targets/` are the sources and are committed, while the
+# corpus that accumulates, the inputs that crashed, and the build target are
+# not. The `crash-*` family is what libFuzzer writes next to the crate when it
+# is run from `fuzz/` instead of through `cargo fuzz tmin`.
+/corpus
+/artifacts
+/target
+/crash-*
+/oom-*
+/leak-*
+/timeout-*
+/slow-unit-*
