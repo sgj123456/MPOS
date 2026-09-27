@@ -799,15 +799,83 @@ fn xattr_target(path: &str, cwd: &Arc<dyn Inode>, follow: bool) -> isize {
     }
 }
 
+/// Which of the three shapes an `*xattr` call is, for the arguments that only
+/// some of them carry.
+///
+/// The family shares one handler because it shares one verdict: nothing here
+/// stores an attribute, so every well-formed request ends as `EOPNOTSUPP`. What
+/// the shapes do *not* share is their argument list - `setxattr` is the one with
+/// a value and a flags word - and the checks that have to run before the verdict
+/// are the ones those arguments exist for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Xattr {
+    /// `getxattr` and its `l`/`f` forms: a name, then a buffer the store would
+    /// have filled.
+    Get,
+    /// `setxattr` and its `l`/`f` forms: a value of `size` bytes, and the flags
+    /// word saying how it may land.
+    Set,
+    /// `removexattr` and its `l`/`f` forms: the name, and nothing else.
+    Remove,
+}
+
+impl Xattr {
+    /// The shape a syscall number is. The three forms of one call differ only in
+    /// how the target is reached - by path, by path without following a final
+    /// link, or by descriptor - so they answer the same shape.
+    fn of(nr: u64) -> Xattr {
+        use crate::syscall::linux::nr;
+        match nr {
+            nr::SETXATTR | nr::LSETXATTR | nr::FSETXATTR => Xattr::Set,
+            nr::REMOVEXATTR | nr::LREMOVEXATTR | nr::FREMOVEXATTR => Xattr::Remove,
+            _ => Xattr::Get,
+        }
+    }
+}
+
+/// The checks on the two arguments only a `setxattr` carries, in Linux's order:
+/// the flags word, then the value the call names.
+///
+/// `XATTR_CREATE` and `XATTR_REPLACE` are the two bits Linux defines - "make it,
+/// or fail if it is already there" and its converse - so any other bit is
+/// `EINVAL`, and both together are `EINVAL` too, because they contradict each
+/// other rather than combine. The value is then *copied before the filesystem is
+/// asked*, which is why a set whose value this kernel cannot read is `EFAULT`
+/// even though the answer would have been `EOPNOTSUPP`: the refusal is about the
+/// bytes, and a caller that got "unsupported" for a bad pointer would go looking
+/// for the wrong bug.
+fn setxattr_args(value: usize, size: usize, flags: usize) -> Option<isize> {
+    const XATTR_CREATE: usize = 0x1;
+    const XATTR_REPLACE: usize = 0x2;
+    if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == (XATTR_CREATE | XATTR_REPLACE) {
+        return Some(err::EINVAL);
+    }
+    if size != 0 && !buffer_ok(value, size, false, true) {
+        return Some(err::EFAULT);
+    }
+    None
+}
+
 /// `getxattr`/`setxattr`/`removexattr` and their `l`-prefixed forms. All three
 /// take a path then an attribute name in the first two slots, and all three
-/// reach the same verdict here, so they share it.
-pub(super) fn xattr_path(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, follow: bool) -> isize {
+/// reach the same verdict here, so they share it - the call's shape deciding
+/// only what else is read before it.
+pub(super) fn xattr_path(
+    nr: u64,
+    args: [usize; ARG_COUNT],
+    cwd: &Arc<dyn Inode>,
+    follow: bool,
+) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
     if let Err(e) = cstr_arg(args[1], true) {
+        return e;
+    }
+    if Xattr::of(nr) == Xattr::Set
+        && let Some(e) = setxattr_args(args[2], args[3], args[4])
+    {
         return e;
     }
     xattr_target(&path, cwd, follow)
@@ -816,11 +884,16 @@ pub(super) fn xattr_path(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, follow:
 /// `fgetxattr`/`fsetxattr`/`fremovexattr`: the descriptor form. A bad descriptor
 /// is `EBADF` before the name is even looked at, as the descriptor table check
 /// happens first.
-pub(super) fn xattr_fd(args: [usize; ARG_COUNT]) -> isize {
+pub(super) fn xattr_fd(nr: u64, args: [usize; ARG_COUNT]) -> isize {
     if let Err(e) = xattr_inode_of_fd(args[0] as i32) {
         return e;
     }
     if let Err(e) = cstr_arg(args[1], true) {
+        return e;
+    }
+    if Xattr::of(nr) == Xattr::Set
+        && let Some(e) = setxattr_args(args[2], args[3], args[4])
+    {
         return e;
     }
     err::EOPNOTSUPP
@@ -4580,10 +4653,23 @@ pub(super) fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
+    // A byte channel is asked about by *name* rather than by kind, because the
+    // kind cannot answer for it: a pipe and a `socketpair` end report `File`,
+    // the filesystem's vocabulary having no word for "anonymous byte channel"
+    // (see `pipe.rs`). Reading the kind alone therefore answered `fsync` on a
+    // pipe with 0 where Linux answers EINVAL - and the two families whose
+    // `kind` lies are exactly the two `as_*` below.
+    let inode = file.inode();
+    if inode.as_pipe().is_some() || inode.as_duplex().is_some() {
+        return err::EINVAL;
+    }
     match file.metadata().kind {
         NodeKind::File | NodeKind::Dir | NodeKind::Symlink | NodeKind::BlockDev => 0,
         // Nothing to flush behind a character door, and nothing behind a
-        // socket's either - Linux answers EINVAL for both.
+        // socket's either - Linux answers EINVAL for both. The whole
+        // anonymous family - a pty, an eventfd, a timerfd, an epoll, an
+        // inotify, a signalfd - is a character device here, so this one arm
+        // answers for all of it.
         NodeKind::CharDev | NodeKind::Socket => err::EINVAL,
     }
 }

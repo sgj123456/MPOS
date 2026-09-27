@@ -3030,8 +3030,16 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
             return 0;
         }
         None => {
-            // Blocking, so wait for somebody. `poll_any_child` already
-            // reported nobody ready; park until one of them finishes.
+            // Blocking, so wait for somebody - but only if there *is*
+            // somebody. A caller with no child at all is `ECHILD`, not a
+            // sleep that nothing can ever end; `wait4` has asked this guard
+            // all along, and `waitid` was the one arm without it, so a
+            // second wait for an already-collected child parked forever.
+            if !crate::sched::has_children(me) {
+                return err::ECHILD;
+            }
+            // `poll_any_child` already reported nobody ready; park until one
+            // of them finishes.
             match crate::sched::wait_any_child(me) {
                 Some(found) => found,
                 None => return err::ECHILD,

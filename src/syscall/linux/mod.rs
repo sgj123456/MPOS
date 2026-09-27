@@ -496,10 +496,12 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // the target and answer that the operation is not supported, so a
         // probing caller learns "not supported on this filesystem" instead of
         // the fall-through "no such syscall". The `l`-forms act on the symlink
-        // itself, the `f`-forms on a descriptor's file.
-        nr::GETXATTR | nr::SETXATTR | nr::REMOVEXATTR => fs::xattr_path(args, &cwd(), true),
-        nr::LGETXATTR | nr::LSETXATTR | nr::LREMOVEXATTR => fs::xattr_path(args, &cwd(), false),
-        nr::FGETXATTR | nr::FSETXATTR | nr::FREMOVEXATTR => fs::xattr_fd(args),
+        // itself, the `f`-forms on a descriptor's file, and the number is passed
+        // through because `setxattr` carries a value and a flags word the other
+        // two do not.
+        nr::GETXATTR | nr::SETXATTR | nr::REMOVEXATTR => fs::xattr_path(nr, args, &cwd(), true),
+        nr::LGETXATTR | nr::LSETXATTR | nr::LREMOVEXATTR => fs::xattr_path(nr, args, &cwd(), false),
+        nr::FGETXATTR | nr::FSETXATTR | nr::FREMOVEXATTR => fs::xattr_fd(nr, args),
         nr::LISTXATTR => fs::xattr_list_path(args, &cwd(), true),
         nr::LLISTXATTR => fs::xattr_list_path(args, &cwd(), false),
         nr::FLISTXATTR => fs::xattr_list_fd(args),
