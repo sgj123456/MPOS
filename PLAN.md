@@ -58,10 +58,11 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [ ] `io_uring_setup`/`enter`/`register` — deferred by design (§1.3)
 
 **Drivers (Phase 7)**
-- [~] 7.1 Display — `/dev/fb0` (mmap + FBIOGET_* + PAN/VSYNC present) and a
-      DRM/KMS card `/dev/dri/card0` (resources, dumb buffers, addfb, setcrtc,
-      page-flip + vblank events) for a software/pixman compositor. No 3D/virgl,
-      no `GBM`/`EGL` (§7.1)
+- [~] 7.1 Display — `/dev/fb0` (mmap + FBIOGET_* + PAN/VSYNC present) and
+      `/dev/dri/card0` + `/dev/dri/renderD128` (resources, dumb buffers, addfb2,
+      atomic commits, page-flip + vblank events, PRIME both ways) — which with
+      Mesa's GBM and EGL is weston-on-GL, in software. No 3D/virgl, no sync
+      objects, no format modifiers, no EDID (§7.1, §7.4)
 - [x] 7.2 Input — virtio-input evdev: capability ioctls (`EVIOCGBIT`/`EVIOCGABS`/
       …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents, and
       events that belong to the description that grabbed them (§7.2)
@@ -83,7 +84,10 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
       (virtio-tablet) + `--mode weston` (kernel frees the scanout) — Stage 4, `t-fbdev`
 - [x] DRM/KMS surface — `/dev/dri/card0` (UAPI ioctl + struct ABI, dumb buffers,
       page-flip, vblank events) for DRM-backend compositors — Stage 5, `t-drm`
-- [ ] 3D / GL / virgl / Mesa-`GBM`+`EGL` — deliberately out of scope
+- [x] Mesa `GBM`+`EGL`+GLES — served through `/dev/dri/renderD128` and PRIME, in
+      software (llvmpipe); it is how weston's DRM backend runs at all
+- [ ] 3D / virgl / venus (`DRM_VIRTGPU_*`) — deliberately out of scope, and the
+      one thing that would let niri run (§7.4)
 - [x] a parked evdev reader - direct, `select`, or an `epoll` interest like a
       compositor's - is woken by the service task when a record lands, instead of
       at the next tick; the wait re-checks the queue as it parks, so an event
@@ -107,6 +111,36 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
         stream this family has), which is the one documented divergence left on
         the path from `udevadm` to a tagged device node
 
+**Compositors beyond weston (niri, wlroots)** — what a *second* compositor family
+needs on top of the line above. The analysis is §7.4, and none of it has been
+run, so these are steps rather than results:
+- [~] the DRM surface a **wlroots pixman** compositor needs — a primary node with
+      `SET_MASTER`, `DRM_CAP_DUMB_BUFFER`, `CREATE_DUMB`/`MAP_DUMB`,
+      `PRIME_HANDLE_TO_FD`, `ADDFB`/`MODE_ATOMIC` — is already in place, which
+      makes `WLR_RENDERER=pixman` the cheapest second-compositor experiment there
+      is; no wlroots compositor has been booted yet, and that is the whole of
+      what is missing (§7.4)
+- [ ] **threads** — `clone(CLONE_THREAD)` answers `ENOSYS`, and every compositor
+      that is not single-threaded, every Mesa worker pool and every Vulkan ICD
+      wants one (§6.4, §7.4)
+- [ ] DRM sync objects — the `SYNCOBJ_*` family, including `SYNCOBJ_EVENTFD`
+      (which Smithay probes before it will expose `wp_linux_drm_syncobj_v1`),
+      with `IN_FENCE_FD`/`OUT_FENCE_PTR` given the behaviour their names promise
+      (§7.4)
+- [ ] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
+      the only one that lets niri, which rejects software EGL outright, run at
+      all; virgl and venus are both built on it (§7.4)
+- [ ] the property families a compositor finds by name: `EDID`, `non-desktop`,
+      `max bpc`, `panel orientation`, `vrr_capable`/`VRR_ENABLED`,
+      `GAMMA_LUT`/`GAMMA_LUT_SIZE`, `IN_FORMATS` with
+      `DRM_CAP_ADDFB2_MODIFIERS`, `FB_DAMAGE_CLIPS`, `OUT_FENCE_PTR`, and
+      `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` — refused today, and asked for
+      precisely by the virtualized drivers (§7.4)
+- [ ] `MODE_GETFB2`, the `MODE_CREATE_LEASE` family, `MODE_CURSOR`/`MODE_CURSOR2`
+      and the legacy gamma pair (§7.4)
+- [ ] `/proc/<pid>/maps` — absent, and read by Mesa's allocator paths, LLVM and
+      most crash reporters (§Remaining)
+
 **Security (Phase 8)**
 - [~] 8.0 **a userspace process could panic the kernel** - fixed for the case
       that was reproducing (a ramfs file grew as one `Vec`, and a 128 MiB
@@ -127,9 +161,10 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
       rather than attempted (the audit it needs is in §10.2)
 - [~] 10.3 Syscall path — itimer-armed flag landed; the fault-driven user-buffer
       copy is not, and §10.3 says why the pre-walk it removes does not exist
-- [~] 10.4 Pipes + per-frame allocations — the pipe ring and the raw-receive
-      temporary landed, with numbers in §10.4; the frame pool is not, and §10.4
-      also records the larger finding that a pipe *handover* costs two ticks
+- [~] 10.4 Pipes + per-frame allocations — the pipe ring, the raw-receive
+      temporary and the *handover* all landed, with numbers in §10.4 (a
+      two-process pipeline now runs at the pipe's own speed); the frame pool is
+      not, and is the last item left here
 - [~] 10.5 ext4/virtio-blk read path — the set-associative cache landed with its
       device-read counts in §10.5; readahead and blk pipelining are each other's
       prerequisite and neither is measurable until the test machine has a disk
@@ -138,6 +173,18 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
 
 **Architectures (Phase 9 — far future)**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
+
+**Architecture debt (Phase 11 — audit done, nothing fixed)**
+- [ ] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
+      dispatcher, the aarch64 linker script that does not exist (§11)
+- [ ] 11.B the device seam: one handle instead of six `Inode::as_*` downcasts, each device's
+      ioctl contract moved down to its driver, user-pointer validation moved to `mm` (§11)
+- [ ] 11.C per-open-file resources get a registry, so `sched` stops naming `net`/`vfs`/`drivers`
+      on task exit (§11)
+- [ ] 11.D the terminal emulator and the console mux move out of `vfs` (§11)
+- [ ] 11.F the `target_os = "none"` gate gets a written criterion, and the unused host test
+      module behind it is settled (§11)
+- [ ] 11.G a depgraph ratchet, so the measured cycle count cannot grow back (§11)
 
 ### Suggested next moves (highest impact, tractable)
 
@@ -149,32 +196,41 @@ so (AF_UNIX `SOCK_DGRAM` transfer, the serial TX ring), and evdev's read rule is
 finished: a reader that is not the grabber is told nothing while the grab is
 held, and two readers of one node each keep their own copy (§7.2, `t-evdev`).
 
+**And the wake latency, which was the first item on this list, is fixed** - one
+tick on every blocking wait, because the boot task's `park()` halted the core
+while staying runnable. `wait4` went from 7.6 ms to tens of microseconds and a
+two-process pipe handover from 7 MiB/s to 10 168 MiB/s, with `fork` unmoved;
+§10.2 and §10.4 have the numbers, `t-forkcost` now *asserts* the bound (§10.7),
+and it is the one item that was worth more than everything else in the
+performance family put together.
+
+**Two more of the list's own items have landed since it was written**, and both
+were checked against the code rather than taken from their sections' headers:
+per-message cmsg boundaries on `SOCK_STREAM` (§4.1 - the pipe ring tags each
+handover with the stream position its send ended at and a read *stops* there, so
+descriptors come back with their own bytes; `t-unix-scm` pins it at line 610,
+"one byte, not two"), and ASLR (§8.1, whose own section records the four
+landmarks, the stacked draws, and the `ET_EXEC`-must-not-move rule).
+
 What is left, in the order that keeps each step verifiable on its own:
 
-1. **`SO_REUSEADDR` / `SO_LINGER` / buffer sizes** (§4.3) - self-contained, and
-   each has a test that can only be written once the behaviour is real.
-2. **Per-message cmsg boundaries on `SOCK_STREAM`** (§4.1) - the handover queue
-   is already a FIFO *per send*; what it lacks is the byte offset each send
-   finished at, so a read that swallows two sends reports one control chain.
-   Needs the pipe ring to carry marks, which is why it is not a small patch.
-3. **ASLR** (§8.1) - `ET_DYN` (static-pie) is already loaded and RELA-relocated
-   at base 0, so the work is a load bias plus `AT_PHDR`/`AT_BASE`/`AT_ENTRY`
-   shifted with it, then the stack and mmap gaps. Every static-pie binary in the
-   image is a test of the auxv arithmetic.
-4. **Anonymous demand paging** (§5.1 + §5.2) - the prerequisite both items name,
+1. **The loopback, and then §4.3's listener** - `listen`/`accept` is that
+   section's first item and it cannot be *tested* until a connection can be made
+   inside the guest at all: this harness forwards no host port, and the stack has
+   no 127.0.0.1 path, which is what §4.3's own "no local socket pair exists"
+   refers to. §4.3 now spells out why the loopback is a step of its own rather
+   than a footnote to `listen`, and what it costs.
+2. **Anonymous demand paging** (§5.1 + §5.2) - the prerequisite both items name,
    and the only one that changes the mm fault path for everything.
-5. **`seccomp` FILTER** (§8.2) then **namespaces** (§6.3) - one a BPF evaluator
-   over `seccomp_data`, the other a set of decisions (which namespaces, and what
-   each one must observably isolate) that should be made before code.
-6. **The wake latency before anything else in this family** - the two
-   measurements that disagree with their own plan both land on it: `wait4` costs
-   8 ms whether the child owned 32 MiB or nothing (§10.2), and a pipe handover
-   costs 8.0 ms for the same two ticks (§10.4). Both are 250 Hz ticks on a task
-   that has already been woken, so a blocking syscall's round trip has a floor
-   of ~8 ms on this machine and no amount of work removed from the syscall
-   itself will move it. `t-forkcost` and `t-pipecost` are the instruments.
-   After that, §10.5's disk-backed instrument and the frame pool, then each of
-   these wants a before/after number - and the number is allowed to say "no".
+3. **`seccomp` FILTER's plumbing** (§8.2 - its runner has landed and is
+   host-tested; what is left is the per-task list, the two install paths and the
+   gate, which is a bounded piece of wiring rather than a feature), then
+   **namespaces** (§6.3) - a set of decisions (which namespaces, and what each
+   one must observably isolate) that should be made before code.
+4. **§10.5's disk-backed instrument, then the frame pool** - the two remaining
+   members of the performance family with a plan and no number. Both are
+   measurable today, and each wants a before/after figure with the disk in
+   place - and the number is allowed to say "no".
 
 ---
 
@@ -188,11 +244,14 @@ What is left, in the order that keeps each step verifiable on its own:
   (path `SOCK_STREAM`, with `SCM_RIGHTS` fd passing + `SO_PEERCRED`) + netlink
   (read + uevent)
 - **Display / input**: virtio-gpu 2D scanout exposed as `/dev/fb0` (mmap +
-  fbdev ioctls + pan/vsync) and a DRM/KMS `/dev/dri/card0` (UAPI ABI, dumb
-  buffers, page-flip + vblank) for a software compositor; virtio-input evdev
+  fbdev ioctls + pan/vsync) and a DRM/KMS `/dev/dri/card0` with its
+  `/dev/dri/renderD128` (UAPI ABI, dumb buffers, addfb2, atomic commits,
+  page-flip + vblank, PRIME both ways) — GBM, EGL and GLES on top of it, in
+  software, which is how weston's DRM backend runs; virtio-input evdev
   (`/dev/input/eventN`, capability ioctls, and events that belong to the
   description holding `EVIOCGRAB`) with a keyboard + tablet, and `/dev/uinput`
-  for a program that needs an input device of its own
+  for a program that needs an input device of its own. What the *next*
+  compositor family needs is §7.4.
 - **Buffer sharing**: `memfd_create` whose `MAP_SHARED` mapping aliases real
   frames, so a compositor and a client sharing one descriptor see the same bytes
 - **Scheduler**: 4-level priority + round-robin, COW fork, demand-paged stack
@@ -226,6 +285,11 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
 **Other missing (lower priority):**
 - `userfaultfd` (323) — lazy-copy / CRIU-style migration; niche.
 - `tid_add_object` / `tgid_add_object` (rseq side-objects) — rare.
+- **`/proc/<pid>/maps`** — not a syscall and not yet a file: the per-process
+  directory carries `fd`, `stat` and `cmdline` and stops there. It is listed
+  here because it is ABI, not a feature of a debugger: Mesa's allocator paths,
+  LLVM and most crash reporters read it, and anything that reports where a
+  mapping came from has nowhere to look (§7.4).
 - Extended attributes (`getxattr`/`setxattr`/`listxattr`/`removexattr` + `l`/`f`
   forms, 188–199) — **answered**: arguments and target are validated (so a bad
   path is still `ENOENT`/`EFAULT`, a bad fd `EBADF`), then `EOPNOTSUPP`, because
@@ -556,6 +620,24 @@ passive-open slot + an inode per accepted connection) is therefore the first
 §4.3 item, not a footnote to it, and it is also what `dbus`, a local `nginx`, and
 any `ssh` *server* on this machine would need.
 
+**And the loopback has to come before it, which is a step of its own.** A listener
+nobody can connect to is a feature this suite cannot test: the harness forwards
+no host port (`-netdev user` with no `hostfwd`), and the stack has no 127.0.0.1
+path at all - `ip link show lo` *reports* a loopback because `rtnl` fills in the
+shape a reader expects, but nothing answers a segment sent to it. So an in-guest
+client is the only client there can be, and that means making loopback real
+first. The cost is not the device - a `Device` that hands a transmitted frame
+back on the next receive is fifty lines - it is that **smoltcp cannot route it
+with one socket set**. Its route lookup is *destination-only*
+(`Routes::lookup(addr)`; `Interface::route` answers `in_same_network(dst)` or the
+best matching route), so given a shared set, `eth0`'s poll would claim a
+127.0.0.1 socket, match its default route, and put the segment on the wire. Two
+interfaces therefore mean two socket sets, and a socket cannot move between them
+(smoltcp has no such operation), so a socket with no address yet has no home: the
+set is decided by the first `bind`/`connect`/`sendto` - which is a change to when
+a socket joins a set, and to every place that looks one up by handle. That is the
+real shape of "add `listen`": the listener inode is the easy half.
+
 **Second is done, and was measured rather than assumed**: a plain `close(2)`
 reached `net::free_entry`, which called `sockets.remove(handle)` on the spot,
 while smoltcp only puts the `FIN` out from its poll loop after the socket is
@@ -783,6 +865,19 @@ All wired to real handlers in `posix.rs`/`proc.rs`: `getpgrp`, `setreuid`,
 | `capget` | 125 | Get capability state |
 | `capset` | 126 | Set capability state |
 
+One request in this family is deliberately not answered, and it is the largest
+hole left in the process ABI: **`clone(CLONE_THREAD)`** — thread creation —
+answers `ENOSYS`. Everything without it is built (the process-shaped clone, with
+the tid writes, the TLS base and the signal frame the flags name), and a thread
+group would share an address space that the scheduler's exit and space
+accounting does not model yet — this kernel's address spaces are owned by one
+task. Nothing in the shipped image needs a thread, which is how it has lasted;
+everything larger does — a compositor that is not single-threaded, Mesa's worker
+pools (`LP_NUM_THREADS`), any Vulkan ICD, `tracy_client`, `async-io` under
+niri's D-Bus feature (§7.4). The refusal goes through the dispatcher's
+`note_enosys` table with the other two of its kind, so a program that asks is
+told once rather than left waiting.
+
 ---
 
 ## Phase 7: Device Drivers (Low Priority)
@@ -799,23 +894,68 @@ task that owns the GPU (the only `flush()` caller).
   boot `FBIOPAN_DISPLAY` *presents* (drives the flush), which is what weston's
   fbdev backend uses per frame. `FBIOPUT_VSCREENINFO` is refused (a resolution
   change would tear down live mappings).
-- **DRM/KMS (`/dev/dri/card0`, `src/drivers/drm.rs`)** — a virtual single-CRTC
-  card speaking the Linux UAPI exactly (`drm.h`/`drm_mode.h`): `VERSION`,
-  `GET_CAP` (`DUMB_BUFFER`), `SET_CLIENT_CAP`, `MODE_GETRESOURCES`,
-  `GETCRTC`/`SETCRTC`, `GETENCODER`/`GETCONNECTOR`/`GETPLANE`,
-  `ADDFB`/`RMFB`, `PAGE_FLIP`, `GETPROPERTY`/`SETPROPERTY`/`GETPROPBLOB`, and
-  GEM dumb buffers (`CREATE_DUMB`/`MAP_DUMB`/`DESTROY_DUMB`) whose `mmap`
-  aliases real pages with the same per-mapping frame reference discipline the
-  memfd uses. A page flip is applied to the scanout and reports back as a
-  flip-completion `drmEvent` readable (and pollable) on the card fd. This is
-  the presentation path a **pixman/software** DRM compositor needs; there is
-  **no 3D, no `GBM`/`EGL`, no `virgl`** - the deliberate boundary.
+- **DRM/KMS (`/dev/dri/card0` and `/dev/dri/renderD128`, `src/drivers/drm.rs`)**
+  — a virtual single-CRTC card speaking the Linux UAPI exactly
+  (`drm.h`/`drm_mode.h`): `VERSION`, `GET_CAP` (`DUMB_BUFFER`, `PRIME`,
+  `TIMESTAMP_MONOTONIC`, `CRTC_IN_VBLANK_EVENT`, the cursor size),
+  `SET_CLIENT_CAP`, `MODE_GETRESOURCES`, `GETCRTC`/`SETCRTC`,
+  `GETENCODER`/`GETCONNECTOR`/`GETPLANE`/`GETPLANERESOURCES`,
+  `GETPROPERTY`/`SETPROPERTY`/`GETPROPBLOB`/`CREATE_BLOB`/`DESTROY_BLOB`,
+  `ADDFB`/`ADDFB2`/`RMFB`/`GETFB`, `PAGE_FLIP`, `MODE_ATOMIC`,
+  `OBJ_GETPROPERTIES`/`OBJ_SETPROPERTY`, `SET_MASTER`/`DROP_MASTER`, and GEM
+  dumb buffers (`CREATE_DUMB`/`MAP_DUMB`/`DESTROY_DUMB`) whose `mmap` aliases
+  real pages with the same per-mapping frame reference discipline the memfd
+  uses. A page flip is applied to the scanout and reports back as a
+  flip-completion `drmEvent` readable (and pollable) on the card fd.
+- **The render node, PRIME and the GL stack.** `/dev/dri/renderD128` is the
+  same card state under the render minor, which is the node GBM opens to
+  allocate; `PRIME_HANDLE_TO_FD`/`FD_TO_HANDLE` (both directions, so
+  `DRM_CAP_PRIME` answers `IMPORT|EXPORT`) turn a dumb buffer into a dma-buf
+  and back, and `src/vfs/dmabuf.rs` is the object that crosses. That is the
+  whole of what Mesa's GBM needs to hand a buffer to the card, and it is why
+  the image boots **weston on DRM + GL** (`weston-backend-drm` ships only the
+  GL renderer; the driver behind it is llvmpipe — the software GL that
+  `mesa-dri-gallium` provides). So "the presentation path a pixman compositor
+  needs" is no longer the whole of it: **GBM, EGL and GLES are served**, in
+  software. What is still absent is **3D/virgl** (no `VIRTGPU_*`), **sync
+  objects**, **format modifiers**, and the property and metadata families a
+  compositor reads by name - all of it the subject of §7.4.
 
-v1 divergences: one fixed connector/crtc/encoder/plane; vblank is synthesized
-at the frame beat (no hardware interrupt); dumb-buffer mmap uses a
-`handle << log2(PAGES_PER_BUFFER)` offset encoding rather than a DRM VMA
-manager; `SO_PEERCRED`-style per-client DRM leasing and atomic modesetting are
-absent (legacy `SETCRTC`/`PAGE_FLIP` only).
+v1 divergences: one fixed connector/crtc/encoder/plane; one synthesized mode
+(the GPU's size at 60 Hz, `PREFERRED|DRIVER`), no `EDID` blob and
+`mm_width`/`mm_height` of zero; vblank is synthesized at the frame beat (no
+hardware interrupt); dumb-buffer mmap uses a `handle << log2(PAGES_PER_BUFFER)`
+offset encoding rather than a DRM VMA manager; no per-client DRM leasing
+(`MODE_CREATE_LEASE` and its family); `IN_FENCE_FD` exists and is stored but no
+fence is ever waited on, so a compositor that passes one is told nothing about
+it - and no `OUT_FENCE_PTR` at all. `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` and
+the colour-pipeline cap are refused `EOPNOTSUPP`, the first of which the
+virtualized drivers are the ones that ask for.
+
+**The console's text grid, and the window it reports.** The framebuffer console
+paints an 8x16 bitmap grid sized from the scanout (1024x768 is 128x48 cells,
+1280x800 is 160x50, `MAX_ROWS` capping the rows at 64), and a virtual console
+now *reports that grid* as its window: `TIOCGWINSZ` on `/dev/ttyN` asks
+`Grid::rows/cols`, because the framebuffer console **is** that terminal's
+emulator and the grid **is** the window. It used to answer a constant 80x25,
+which is how a full-screen program came to draw into the top-left corner of the
+screen - `vim` laid out 80 of 128 columns and 25 of 48 rows and left the rest
+blank, which is the bug that reported it. `/dev/tty0` and `/dev/console` name
+the console *currently shown*, so they answer the same way; both fall back to
+80x25 when no screen exists, which is also every headless boot.
+
+**The other half of that pair is `TIOCSWINSZ`**, and it is the one that matters
+where the kernel *cannot* know the size: a terminal emulator in userspace - one
+inside weston, say - opens a `/dev/ptmx` pair and names its window, and the
+program it runs reads that back on the slave. So a pty keeps a window of its own
+(25x80 until an emulator says otherwise) and reports it, while the console
+stores a set size and goes on answering its screen - the screen is what is being
+painted, and a number that disagreed with it would be the same lie the
+corner-drawing bug came from. A *change* raises `SIGWINCH` to the foreground
+group, by the same route a `Ctrl-C` takes: a pipeline is one job and every
+process in it has the same window, and the signal is the only way a running
+full-screen program learns it has been resized. `stty rows`/`cols` and `resize`
+are what that pair is for.
 
 ### 7.2 Input: virtio-input (evdev) — **DONE**
 
@@ -941,6 +1081,159 @@ in the buffer it wrote.
 
 ---
 
+### 7.4 The next compositor: niri, wlroots, and the renderer families — **ANALYSIS**
+
+§7.1–§7.2 answer *weston*: DRM/KMS to present on, evdev for input, `memfd` +
+`SCM_RIGHTS` for buffers, and Mesa's software GL through GBM and EGL. That is one
+family, and a narrow one - the wlroots architecture with its GL renderer. This
+section is what the *other* families want, read off their sources and the kernel
+UAPI rather than measured here, and it says so: nothing below has been executed
+on the machine, which is why it is a plan rather than a claim. The two
+architectures fail for different reasons, and the surprise is which one is cheap.
+
+#### What wlroots' pixman route already has
+
+`WLR_RENDERER=pixman` on the DRM backend never creates an EGL context at all;
+`wlr_allocator_autocreate` walks gbm → shm → **drm dumb** → udmabuf and, with no
+GBM to be had, settles on the dumb allocator. Its requirements are short and the
+card meets every one: `/dev/dri/card0` opened and `SET_MASTER` held (its
+`drmIsMaster` check), the `DUMB_BUFFER` capability, `CREATE_DUMB`/`MAP_DUMB`/
+`DESTROY_DUMB` with an `mmap(MAP_SHARED)` over the result,
+`PRIME_HANDLE_TO_FD` to hand that buffer on, and `ADDFB`/`PAGE_FLIP` or
+`MODE_ATOMIC` to put it on the screen. Formats are `LINEAR` or `INVALID` only,
+which is what this card produces; `EDID`, modifiers and leases are each optional
+to it, and the empty DRM lease it prefers for reopening a node falls back to a
+plain `open` on `EINVAL`/`EOPNOTSUPP`, by its own source. So
+`WLR_RENDERER=pixman sway` is the cheapest second-compositor experiment there is,
+and it should be the first thing this plan does.
+
+What it also needs is not a kernel object: `$XDG_RUNTIME_DIR`, libinput's udev
+tagging (present, §7.2), and a seat. `seatd` is in the image and enabled, the
+card arrives from the seat manager as a descriptor passed over its own unix
+socket - `SCM_RIGHTS`, which this kernel already has (`t-unix-scm`) - and weston
+takes its card that way today, which is the model to follow. All of it is rootfs
+and init work.
+
+#### What niri needs, and the two things that stop it
+
+niri's TTY backend is `GpuManager<GbmGlesBackend<GlesRenderer>>` and nothing
+else - there is no pixman renderer in it - and, worse for this kernel, it
+*rejects* the renderer that is available:
+
+    ensure!(!egl_device.is_software(), "software EGL renderers are skipped");
+
+So on llvmpipe the render node is left `None`, no primary renderer is ever
+created, and `connector_connected` cannot obtain one: there is no output at all.
+That is a deliberate upstream choice (software EGL devices "segfault on importing
+dmabufs from other renderers"), not a bug to route around, so **niri here
+requires a hardware-style GL device**: `virtio-gpu` 3D. The `DRM_VIRTGPU_*`
+family - `GET_PARAM`, `RESOURCE_CREATE`, `RESOURCE_INFO`, `SUBMIT_3D`,
+`EXECBUFFER`, `MAP`, `TRANSFER_{TO,FROM}_HOST`, `CONTEXT_INIT`, resource blobs -
+is what virgl (and venus, for Vulkan) is built on, and it is the largest single
+item in this section.
+
+Two smaller blockers sit behind it. **Threads**: `clone(CLONE_THREAD)` is
+`ENOSYS` (§6.4), and a real compositor spawns them - `tracy_client`'s
+profiler thread, `async-io` under the D-Bus feature, and Mesa's own worker pools
+(`LP_NUM_THREADS`; one CPU makes llvmpipe's default single-threaded, but the path
+exists, and Vulkan ICDs use it unconditionally). **Explicit sync**: Smithay will
+not expose `wp_linux_drm_syncobj_v1` at all unless `DRM_IOCTL_SYNCOBJ_EVENTFD`
+answers, and its DRM plane config writes `IN_FENCE_FD` when a fence is present -
+a property this card accepts and then ignores, with no `OUT_FENCE_PTR` beside it.
+A compositor that never gets the protocol will not pass a fence, so nothing is
+*wrong* today; it does mean a client's buffer is read with no synchronisation
+primitive at all, which is the implicit-fence boundary `src/vfs/dmabuf.rs`
+already names as v1's.
+
+What niri does **not** require is worth as much as what it does, because each one
+is work this plan does not have to do: no `EDID` blob (`make`/`model`/`serial`
+become "Unknown", and the physical size is `unwrap_or((0, 0))`), no `non-desktop`,
+`max bpc`, `panel orientation`, `vrr_capable` or `VRR_ENABLED` (each looked up by
+name and defaulted, with a `debug!` at most), no gamma (`GAMMA_LUT` is tried,
+then the legacy `MODE_SETGAMMA`, then given up on), and no DRM lease (the global
+is created and no-ops without it). What it *does* need is for the properties it
+finds by name to exist under those names - and the half of `GETPROPERTY` that
+reports the name is what such an interface depends on and cannot fake. This card
+answers the names it needs: `CRTC_ID`, `ACTIVE`, `MODE_ID`, `FB_ID`, `type`,
+`SRC_*`/`CRTC_*`, `pixel blend mode`, `IN_FENCE_FD`, `DPMS`.
+
+#### The renderer families, and what each asks of the kernel
+
+- **llvmpipe** (software GL - the driver behind today's weston). The JIT needs
+  anonymous memory made executable: `MAP_PRIVATE|MAP_ANON` and then `mprotect`
+  `RW`→`RX` or straight `RWX`, which `mmap`/`mprotect` already allow. It wants
+  threads for `LP_NUM_THREADS`, a writable `$XDG_CACHE_HOME/mesa_shader_cache`,
+  and `madvise(MADV_DONTNEED)` to give its scratch back - a **no-op here**
+  (§5.2), so that last one is a growth problem rather than a correctness one, and
+  the same prerequisite the memory phase already names.
+- **lavapipe** (software Vulkan) is the same stack one layer up, plus the Vulkan
+  loader and an ICD manifest: userspace work that puts `vulkaninfo`-class probing
+  and a Vulkan-based renderer within reach on a machine with no GPU 3D.
+- **virgl and venus** (virtio-gpu 3D, and Vulkan over it) are `DRM_VIRTGPU_*`
+  again. This is the only path that makes `is_software()` false, so it is on
+  niri's critical path - and on lavapipe's performance path rather than its
+  correctness one. It is also the only item here that needs the GPU's own
+  command stream rather than the card's bookkeeping.
+- **pixman** (software 2D) needs a buffer and a mapping and nothing else, which
+  is the whole reason the wlroots route above is the cheap one.
+
+#### The gap, as a list
+
+Devices and ioctls, roughly in the order the compositors reach for them:
+`MODE_CREATE_LEASE`/`LIST_LESSEES`/`GET_LEASE`/`REVOKE_LEASE`; `MODE_GETFB2`;
+`CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE`; `MODE_CURSOR`/`MODE_CURSOR2` and
+`MODE_GETGAMMA`/`MODE_SETGAMMA` (the legacy pair niri falls back to); the
+`SYNCOBJ_*` family (`CREATE`, `DESTROY`, `HANDLE_TO_FD`, `FD_TO_HANDLE`, `WAIT`,
+`SIGNAL`, `RESET`, `QUERY`, `TRANSFER`, `TIMELINE_WAIT`, `TIMELINE_SIGNAL`,
+`EVENTFD`) with `DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE`; and
+`DRM_VIRTGPU_*`.
+
+Properties and caps, cheap one at a time and load-bearing in aggregate: `EDID`
+(a blob - with non-zero `mm_width`/`mm_height` and a `subconnector`, if anything
+is ever to show a monitor's name), `non-desktop`, `max bpc`,
+`panel orientation`, `vrr_capable`/`VRR_ENABLED` with
+`DRM_CAP_ASYNC_PAGE_FLIP` beside them, `GAMMA_LUT`/`GAMMA_LUT_SIZE`,
+`FB_DAMAGE_CLIPS` (the blob that lets a compositor say *what* changed instead of
+sending whole frames), `OUT_FENCE_PTR`, `IN_FORMATS` with
+`DRM_CAP_ADDFB2_MODIFIERS`, and `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` - refused
+today, and asked for precisely by the virtualized drivers.
+
+Syscalls and memory, the parts this section cannot fix from inside the display
+driver: **threads** (`clone(CLONE_THREAD)`, §6.4); `/proc/<pid>/maps`, absent and
+read by Mesa's allocator paths, LLVM and most crash reporters; anonymous demand
+paging and a real `MADV_DONTNEED` (§5.1/§5.2); and the frame pool (§10.4), since
+the renderer families allocate scratch in tens of megabytes where the current
+per-frame accounting was never sized for it.
+
+Services, which are rootfs work: `sway`/`niri` with their libraries
+(`libdisplay-info`, `libseat`, `xkbcommon`, `pango`/`cairo` and the fonts *and
+writable font cache* those need), `vulkan-loader` with an ICD, and the
+compositor-starting half weston already models.
+
+#### Order
+
+Each step stands on its own, which is the only reason the order is this one:
+
+1. **A wlroots compositor on pixman.** Rootfs and init only; no kernel change is
+   expected. `WLR_RENDERER=pixman` on `/dev/dri/card0`, and whatever the run says
+   is missing becomes `t-drm`'s next case. Cheapest possible answer to "does a
+   second compositor family run here", and a better rendering instrument than
+   weston into the bargain.
+2. **The property and cap families above.** No new subsystem: `GETPROPERTY`,
+   `GETPROPBLOB` and one client cap, each observable from userspace
+   (`drm_info`, `modetest`) before any compositor is involved.
+3. **DRM sync objects**, with `IN_FENCE_FD`/`OUT_FENCE_PTR` given the behaviour
+   their names promise - which is what makes explicit sync real rather than
+   merely accepted.
+4. **Threads** (§6.4) - not a display item, but on the critical path of every
+   compositor that is not single-threaded and every Vulkan driver.
+5. **`DRM_VIRTGPU_*`, then virgl in the image.** The largest item and the only
+   one that makes niri possible.
+6. **`/proc/<pid>/maps`**, `MADV_DONTNEED` and the frame pool: the supporting
+   cast, wanted by everything above and by nothing in particular.
+
+---
+
 ## Phase 8: Security Hardening (Low Priority)
 
 ### 8.0 A userspace process could panic the kernel — **fixed: a file is not one buffer**
@@ -1057,8 +1350,26 @@ re-examined, which is worth knowing before either is attempted.
   `exit` and `sigreturn`; every other syscall is fatal (`SIGKILL`), matching
   Linux's `do_exit(SIGKILL)` on a strict violation. The latch is per-task,
   cannot be cleared, survives `exec` and is inherited across `fork`/`clone`.
-- `SECCOMP_MODE_FILTER` — **future**: needs a BPF runner; refused with
-  `ENOSYS` so a caller never mistakes it for being confined.
+- `SECCOMP_MODE_FILTER` — **done and wired**. The program, its validation and
+  its evaluation are `src/seccomp.rs` (classic BPF with the packet idioms left
+  out, one description of the instruction set shared by the validator and the
+  interpreter, forward-only jumps that must land inside the program, an
+  out-of-range load ending the program with `KILL_THREAD`, and the stacked
+  action order compared as a *signed* field so `KILL_PROCESS` outranks `ALLOW`);
+  nine host tests run real filter shapes over it. The plumbing that reaches it is
+  in too: `Task::seccomp_filters` is a cumulative per-thread list inherited across
+  `fork` and kept across `exec`; `seccomp(2)`'s op 1 and
+  `prctl(PR_SET_SECCOMP, 2)` both go through one `install_seccomp_filter`, which
+  copies the program out of the caller's memory and validates it *in full* before
+  anything is stored (`EINVAL` for a malformed program, `EFAULT` for an unreadable
+  one, `EACCES` for a caller that is not root, `EINVAL` for any flag - `TSYNC` is
+  not modelled and a caller must not think it got it); a machine-wide armed flag
+  keeps an unfiltered syscall to one relaxed load; and the gate acts on the answer
+  *before* the table runs - allow/log/trace pass, `ERRNO` fails the call, `TRAP`
+  raises `SIGSYS`, the kill actions and anything unimplemented refuse it - with
+  `PR_GET_SECCOMP` answering 2 once a filter is installed. **Still missing**: its
+  guest test (`t-prctl` is where the pins belong) and the action probe, which
+  answers the empty set rather than the truth about what this kernel supports.
 
 ### 8.3 User Stack Canary — **DONE** (kernel side)
 
@@ -1194,26 +1505,46 @@ guest's translations are tagged (`VPID`), and loading a CR3 is a tag switch
 rather than an invalidation. The change is kept because it is strictly less work
 and the smaller of the two shapes, but nobody should read a speedup into it.
 
-**The cost of a `fork` is the mapping, and the cost of the `wait4` after it is
-not.** Taking the arena away cuts the fork from 351 µs to 17 µs - twenty-one
-times - and leaves the `wait4` where it was, at *eight milliseconds either way*.
-An earlier draft of this section read the second row as the child's exit and its
-8192 frame references coming home (`release_user_frames`), and the third row
-refutes it: a parent reaping a child that owned nothing pays exactly the same
-8 ms. The frame release is not the cost.
+**The cost of a `fork` is the mapping; the `wait4` after it was the clock.**
+Taking the arena away cuts the fork from 351 µs to 17 µs - twenty-one times -
+and used to leave the `wait4` where it was, at *eight milliseconds either way*.
+An earlier draft read the second row as the child's exit and its 8192 frame
+references coming home (`release_user_frames`), and the third row refuted it: a
+parent reaping a child that owned nothing paid exactly the same 8 ms.
 
-**What 8 ms is, and why it matters more than anything in this section.** It is
-two ticks of this build's 250 Hz clock, and it shows up in the two places a task
-can park: the `wait4` above, and the pipe handover in §10.4, where a 64 KiB
-transfer costs 8.0 ms for the same reason. Both are the disease §10.1 cured for
-sockets - a blocking wait that ends on the scheduler's tick rather than on the
-event that satisfies it (see §10.4, where the same 16 MiB moves at 7 MiB/s
-behind a task boundary and 2611 MiB/s without one). It is a fixed latency on
-every blocking call in the system rather than a cost proportional to any work,
-which is why it is worth more than the flush, the marking, and the frame pool
-put together. `t-forkcost`'s two-phase shape is the instrument for it: a change
-that ends a wait on its event will move the top row's `wait4` and the bottom
-row's together.
+**What that 8 ms was, and why it mattered more than anything in this section.**
+One tick of this build's 250 Hz clock, on *every* blocking wait, and the cause
+was the boot task. `park()` - where the boot task spends the machine's life -
+halted the core with `wait_for_interrupt` instead of blocking in the scheduler,
+which left a permanently *runnable* task at NORMAL priority: the picker handed
+it the CPU, `hlt` stopped the core while holding it, and a task that has halted
+can only be taken off it by an interrupt - of which the one that reliably
+arrives is the clock. Anything woken while the idle task was in that state (or
+behind it in the ready queue) waited for the next tick. A probe in the scheduler
+recording the wake-to-resume latency in whole ticks is what named it: 604 of 640
+wakes took *exactly one* tick, never two, while the scheduler itself never went
+idle, so the task was ready and the picker was choosing somebody else first.
+Parking the boot task in the scheduler puts the idle halt back in the
+scheduler's own loop, which is where the virtio-net handler's comment already
+assumed it was - "in the scheduler's own context ... the scheduler's next turn
+picks the woken task on its own". That is the whole fix: one call site.
+
+| `t-forkcost`, 200 cycles | before | after |
+|---|---|---|
+| `wait4`, 32 MiB parent | 7 648 682 ns | 1 760 ns - 100 µs |
+| `wait4`, no arena | 7 980 378 ns | 13 046 ns - 100 µs |
+| `fork`, 32 MiB parent | 351 052 ns | 223 983 - 298 868 ns |
+
+The `fork` row is the control and it is the mapping: it did not move. The `wait4`
+rows are now the child's own exit and a picker turn instead of a clock tick, and
+the *range* is the honest shape of that figure rather than noise in it: a parent
+that reaches `wait4` after its child has already exited does not block at all and
+reads ~2 µs, one that gets there first blocks and reads ~100 µs on a loaded
+machine - and one of them can print *below* the clock's resolution, where a
+negative figure is the TSC fraction's noise floor and not a negative time. What
+matters for both is the same: they are tens of microseconds against a tick of
+4 ms, which is what `t-forkcost` now *asserts* (§10.7). §10.4 carries the same
+fix's effect where it was largest.
 
 **Why PCID is not done, and it is a decision rather than an oversight.** Three
 things have to be true before `CR4.PCIDE` pays for itself, and only the first is
@@ -1304,18 +1635,28 @@ phases, because the two turn out to answer different questions:
 The first row is the change: ten times the throughput, which is what two slice
 copies per 4096 bytes instead of 8192 deque operations buys.
 
-**The second row is the finding, and it is bigger than the change.** A
-two-process transfer did not move at all - 2047.5 ms to 2047.4 ms - and the
-arithmetic says why: 2047 ms over 256 chunks is **8.0 ms per 64 KiB handover**,
-which is exactly two of the 4 ms ticks this build runs at (250 Hz). The bytes
-are not the cost; the *handover* is, and it is the same disease §10.1 cured for
-sockets - a blocking wait that ends on the scheduler's tick rather than on the
-event that satisfies it. It also puts the two rows side by side in the most
-useful way possible: the same 16 MiB, through the same pipe, at 7 MiB/s when it
-has to cross a task boundary and 2611 MiB/s when it does not. Whatever fixes the
-handover is worth a factor of three hundred here, and nothing else in this
-section is worth a factor of ten. `t-pipecost` is the instrument for it, and it
-is deliberately in the suite so the fix has a number waiting for it.
+**The second row was the finding, and it was bigger than the change.** A
+two-process transfer did not move at all when the ring landed - 2047.5 ms to
+2047.4 ms - and the arithmetic said why: 2047 ms over 256 chunks is **8.0 ms per
+64 KiB chunk**. The reading taken at the time was "two ticks per handover", and
+the count was right while the unit was wrong: a chunk is not one handover but
+*two blocking waits* - the writer waiting for room in a full pipe, the reader
+waiting for data in an empty one - so the figure was **one tick per wait**, and
+one tick was the cost of *any* wake on this machine (§10.2). The bytes were
+never the cost. `t-pipecost` is the instrument, and it was deliberately in the
+suite so the fix had a number waiting for it:
+
+| 16 MiB through one pipe | before | after |
+|---|---|---|
+| one process, 4096-byte units (data path only) | 6.5 ms - 2 478 MiB/s | 1.6 ms - **10 206 MiB/s** |
+| two processes, 64 KiB chunks (a pipeline) | 2047.3 ms - 7 MiB/s | 1.6 ms - **10 168 MiB/s** |
+
+The second row is the whole point of the pair: the same 16 MiB, through the same
+pipe, now crosses 256 task boundaries at *the same speed as the copy that
+crosses none*. Nothing about the pipe changed for this - the fix is the boot
+task's park (§10.2) - and it is the clearest statement of what a wake used to
+cost, because the pipeline was previously 1 300 times slower than the data path
+it was built out of.
 
 **The raw receive.** `raw_recv` filled a fresh `alloc::vec![0u8; 1500]` and then
 copied it into the caller's buffer. It now receives straight into `out`: no
@@ -1413,26 +1754,38 @@ a `bat` over a minified stylesheet turned into a machine that looked dead.
 | A transmit ring drained by the TX-held interrupt; `write` only enqueues and parks on a full ring, re-arming before *every* park so a write larger than one drain burst cannot sleep unannounced | `drivers/serial.rs`, `console.rs` |
 | The framebuffer console's serial **mirror** is best-effort: it hands bytes to the ring and returns, so a host terminal that cannot keep up drops bytes rather than throttling the window or the console mux | `console.rs` (`serial_mirror_now`) |
 
-### 10.7 Sub-Tick Sleeps — planned
+### 10.7 Sub-Tick Sleeps — planned (the wake half is done, and was not this)
 
-**Two measurements now say the gap is wider than "sleeps round to ticks".** A
-task that is *woken* - not sleeping on a deadline, but parked in `block_until`
-and made runnable by an event - does not resume for what looks like two ticks,
-and it does so on two paths that were not in this section's list:
+**The wake latency was filed here and did not belong here; it is fixed.** Two
+measurements said a *woken* task - not sleeping on a deadline, but parked in
+`block_until` and made runnable by an event - did not resume for what looked
+like two ticks:
 
-| measured | figure | instrument |
-|---|---|---|
-| `wait4` reaping a child, whatever that child owned | ~8.0 ms, unchanged when the child's 32 MiB address space is taken away | `t-forkcost` (§10.2) |
-| a 64 KiB pipe handover between two processes | 8.0 ms per chunk, 7 MiB/s, while the same bytes move at 2611 MiB/s without a task boundary | `t-pipecost` (§10.4) |
+| measured | before | after | instrument |
+|---|---|---|---|
+| `wait4` reaping a child, whatever that child owned | ~8.0 ms, unchanged when the child's 32 MiB address space is taken away | 1.8 µs | `t-forkcost` (§10.2) |
+| a 64 KiB pipe handover between two processes | 8.0 ms per chunk, 7 MiB/s | 6.1 µs per chunk, 10 168 MiB/s | `t-pipecost` (§10.4) |
 
-Both are 8.0 ms at a 4 ms tick, and neither scales with any work the call does,
-which is why they are worth more than anything else in this family: they are a
-floor on every blocking syscall's round trip. The *mechanism is not identified* -
-`Scheduler::wake` does push the task straight into the ready queue and
-`Table::next_turn` does pick from it, so the two ticks are not obvious from the
-code - and that is exactly why the two instruments are in the suite: whatever
-fixes it has a number waiting, and a fix that explains it should be able to say
-which of the two ticks it removed.
+Neither was a sleep rounding to a tick, which is what this section is for: the
+woken task was *ready* and the picker was not choosing it, because the boot
+task's `park()` halted the core while remaining runnable at NORMAL priority and
+a halted task is only taken off the CPU by an interrupt. The scheduler never
+went idle once during the whole suite, which is the observation that separates
+"the task is not runnable" from "the task is runnable and somebody else is
+running" - and a probe recording wake-to-resume in *ticks* named the last one
+directly: 604 of 640 wakes took exactly one tick. §10.2 has the fix and the
+numbers.
+
+**The bound is now written, in the one place it is honest.** `t-forkcost`
+asserts that *both* of its `wait4` rows - each a 200-round average - are under
+one clock tick. A wake must be a scheduler turn and not a deadline, and the
+before-figures above are *clock-quantized*: they sat at two ticks (7.6-8.1 ms)
+in every run, because a wait that ends on the clock cannot land between ticks.
+So the bound sits ~40× above the fixed figure (tens of microseconds) and below a
+broken one that cannot drift down to meet it. `t-pipecost` still only *reports*,
+deliberately: its figures are throughputs, and a bound that holds under KVM can
+be a flaky failure under TCG, which is its own stated rule. The wake is where
+the quantized claim can be made, and it is the claim that mattered.
 
 **Why**: the tick is the smallest unit a sleep can name (4 ms at 250 Hz).
 Event-driven waits ended the network's dependence on it; the remaining
@@ -1464,6 +1817,440 @@ latency bug that only shows under load, which is where it will be found first.
 
 ---
 
+## Phase 11: Architectural Debt — **AUDIT DONE, NOTHING FIXED**
+
+Everything above this phase is about *features*: what the kernel cannot yet do. This phase is
+about the *shape* of the kernel that does them, and it opens with a measurement rather than an
+opinion, because "bad architecture" is not a finding until something counts it.
+
+`ARCHITECTURE.md` is the companion document: it draws the module graph, the boot sequence and
+the syscall path, and its §9 mirrors the findings below. This section is the work list.
+
+**Nothing in this phase has been implemented.** No file was edited to produce it. It is a plan.
+
+---
+
+### 11.0 How the audit was made
+
+Reproducible in a few seconds, and worth re-running after any structural change:
+
+```
+# module-level edges: map every file to its top-level module, collect crate::<mod> refs
+python3 - <<'PY'
+import os,re,collections
+files=[os.path.join(r,f) for r,_,fs in os.walk('src') for f in fs if f.endswith('.rs')]
+top=lambda p:(lambda q:q[0][:-3] if len(q)==1 else q[0])(os.path.relpath(p,'src').split(os.sep))
+edges=collections.Counter()
+for p in files:
+    for m in re.finditer(r'crate::([a-z_][a-z0-9_]*)',open(p,encoding='utf8',errors='ignore').read()):
+        if m.group(1)!=top(p): edges[(top(p),m.group(1))]+=1
+for (a,b),w in sorted(edges.items()): print(f"{a:12} -> {b:12} {w}")
+for (a,b) in sorted(edges):
+    if (b,a) in edges and a<b: print("CYCLE",a,b)
+PY
+
+# god files
+find src -name '*.rs' | xargs wc -l | sort -rn | head -12
+
+# orphan modules: a file under arch/x86_64 that mod.rs does not declare
+cat src/arch/x86_64/mod.rs
+```
+
+The three numbers that came out of it:
+
+| Measurement | Result |
+|---|---|
+| Kernel size | 79 095 lines across 116 `.rs` files (plus `boot/` 1 225 and `xtask/` ~2 500) |
+| Host unit tests | 491 `#[test]` in `src/`, 25 in `xtask/` |
+| Mutual module pairs (a cycle of length 2) | **23** out of the 25 possible among the twelve participating modules |
+
+That last row is the finding. At module granularity the kernel is one strongly connected
+component: there is no layer that can be compiled, tested or refactored on its own. Every
+other item below is a *cause* of that number, which is why the fixes are ordered to reduce it
+rather than to make any single file prettier.
+
+---
+
+### 11.1 The findings
+
+Severity is about cost-to-change, not about user-visible bugs: none of these is a defect a
+program can observe today.
+
+#### 11.1.1 — V-1: the `Inode` downcast chain (severity: high)
+
+`src/vfs/mod.rs:453–546` gives the central VFS trait a method per concrete device and network
+type:
+
+```rust
+fn as_fb(&self) -> Option<&crate::drivers::virtio::gpu::FbDev> { None }
+fn as_evdev(&self) -> Option<&crate::drivers::virtio::input::EvdevNode> { None }
+fn as_uinput(&self) -> Option<&crate::drivers::uinput::Uinput> { None }
+fn as_drm(&self) -> Option<&crate::drivers::drm::DrmCard> { None }
+fn as_vsock(&self) -> Option<&crate::net::vsock::VsockSock> { None }
+fn as_unix(&self) -> Option<&crate::net::unix::UnixSock> { None }
+```
+
+This is the textbook abstraction leak: the VFS — which is supposed to know only that a node has
+a name, a kind, bytes and an owner — names six device drivers and two network socket types, and
+the *syscall* layer reaches through these to drive a device. Adding a seventh device type means
+editing the VFS trait, so the VFS can never be compiled without `drivers` and `net`, and
+neither can anything that depends on the VFS. It is the largest single contributor to the
+23-cycle count.
+
+#### 11.1.2 — V-2: device ioctl ABI lives in the syscall layer (severity: high)
+
+`src/syscall/linux/fs.rs` is 6 311 lines and is the second-largest file in the tree. It is not
+only path-carrying file calls; it is also the switchboard for every device's ioctl contract:
+
+| Device | Where its ABI is parsed |
+|---|---|
+| fbdev (`FBIOGET_*`, `FBIOPAN_DISPLAY`, `FBIO_WAITFORVSYNC`) | `fs.rs` around `:3561` |
+| RTC (`RTC_RD_TIME`, `RTC_SET_TIME`) | `fs.rs` around `:3677` |
+| DRM/KMS (`drm_ioctl` dispatch) | `fs.rs` around `:3751` |
+| uinput (`UI_SET_*`, `UI_DEV_SETUP`, `UI_DEV_CREATE`) | `fs.rs` around `:4001` |
+| TTY, block, evdev, termios | `fs.rs` throughout |
+
+A driver change therefore lands in the syscall layer, and the driver cannot state its own
+contract next to the code that implements it. The dispatch routing counts make the split
+explicit: 135 of the 247 names are handled by `fs.rs`, 50 by `proc.rs`, 50 by `posix.rs`, 12 by
+`abi.rs`.
+
+#### 11.1.3 — V-3: the scheduler does other subsystems' cleanup (severity: high)
+
+`sched/runtime.rs` is 6 397 lines — the largest file in the tree — and on task teardown it
+reaches into four unrelated subsystems:
+
+```rust
+crate::net::socket::close_sockets_at_exit(&files);
+crate::vfs::inotify::close_at_exit(&files);
+crate::drivers::virtio::input::close_at_exit(&files);
+crate::drivers::uinput::close_at_exit(&files);
+```
+
+plus `vfs::locks::release_process` and `vfs::mount::fs_id_of_inode` in the same path, and
+`binfmt::shebang`, `vfs::read_file`, `vfs::tty::global` and `vfs::tty::by_dev_id` in the exec
+path. The scheduler owns *tasks*; it should not know that inotify exists. Each new
+per-open-file resource adds a line here, and each line makes `sched` unbuildable without `net`,
+`vfs` and `drivers`.
+
+#### 11.1.4 — V-4: the terminal emulator and console live inside the VFS (severity: medium)
+
+`src/vfs/term/` holds the cell grid, the key handling and an embedded 4 KiB `vga8x16.bin` font.
+`src/vfs/tty.rs` (2 359 lines), `src/vfs/pty.rs`, `src/vfs/devpts.rs` and `src/vfs/vcmux.rs`
+implement the console, and `src/console.rs` — the kernel's own logging console — reaches *into*
+the filesystem layer to draw:
+
+```rust
+crate::vfs::term::with_screen(active_grid(), |g| g.feed(bytes));
+crate::drivers::video::render::notify();
+```
+
+The direction is wrong: a terminal emulator is not a filesystem. `/dev/tty` being a node is a
+filesystem concern; how a cell is painted and which of six virtual consoles is active is not.
+
+#### 11.1.5 — V-5 and V-9: user-pointer validation owned from below (severity: medium)
+
+`drivers/drm.rs:595,741` calls `crate::syscall::buffer_ok(...)`, and `net/socket.rs` /
+`net/unix.rs` call `crate::syscall::buffer_ok` and `err_of` dozens of times. A driver validating
+a *user* pointer is an inversion — the driver is below the syscall layer in every other respect
+— and it exists because the helper happens to live there. The helper itself is fine; its home
+is not.
+
+#### 11.1.6 — V-6: a temporary trace in the dispatch hot path (severity: low, but it must go)
+
+`syscall/linux/mod.rs::trace_msg` is self-labelled:
+
+> TEMPORARY (udevd worker-channel hunt): ... Remove once the site is known.
+
+It fires on every failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` and prints up to 60
+`[msgtrace]` lines from inside the dispatcher. The hunt it belongs to is recorded as finished
+in §4.1's udevd note, so this is leftover scaffolding standing in the one path every syscall
+crosses.
+
+#### 11.1.7 — V-7: orphan and duplicate machine modules (severity: low, purely subtractive)
+
+| File | Status |
+|---|---|
+| `src/arch/x86_64/serial.rs` (119 lines) | **not declared in `arch/x86_64/mod.rs`** → never compiled. A near-duplicate of `drivers/serial.rs` (324 lines), same doc header |
+| `src/arch/x86_64/qemu.rs` (23 lines) | Not declared → never compiled. **Byte-identical** to `drivers/qemu.rs` |
+| `src/arch/x86_64/pci.rs` | Declared, compiled, **referenced nowhere**. A stale earlier copy of `drivers/pci.rs` (discovery-only, one function per slot, bus 0) |
+| `src/arch/x86_64/rtc.rs` vs `src/drivers/rtc.rs` | Both live and both used — but the names collide and the split is not obvious from either name |
+
+Three modules named `pci`, two named `rtc`, two named `serial`, two named `qemu`. Two of the
+twelve are dead and one is a duplicate, which is how a reader learns to distrust the tree.
+
+#### 11.1.8 — V-8: the aarch64 configuration points at a missing file (severity: low)
+
+`.cargo/config.toml` sets `-C link-arg=--script=arch/aarch64/linker.ld`; only
+`arch/x86_64/linker.ld` exists. The target cannot link. §9.1 calls aarch64 "under development",
+which understates it: there is no linker script, and `src/arch/mod.rs` says the modules will be
+declared "when they are written rather than now".
+
+#### 11.1.9 — V-10: the handoff ABI is written twice (severity: accepted)
+
+`boot/src/handoff.rs` and `src/boot/handoff.rs` are separate definitions of one record, and
+`BOOT_STACK_CANARY` is spelled out in `src/main.rs` as well as in the loader. This is deliberate
+— the loader is a UEFI application on a different target and cannot link the kernel crate — and
+it is documented on both sides. Recorded so it reads as a decision rather than an oversight.
+
+#### 11.1.10 — V-11: a host test module behind a never-host-compiled parent (severity: low)
+
+`src/lib.rs:48` gates `pub mod net` on `target_os = "none"`, so the module is absent from every
+host build — while `src/net/socket.rs:3527` annotates its test module
+`#[cfg(all(test, not(target_os = "none")))]`, i.e. "run me on the host". The annotation is only
+ever evaluated in a build that does not include the file, so those three tests have never run.
+`net`'s doc comment says its tests "are the conformance programs that run on the machine",
+which is true of the rest of `net` and false of this file.
+
+#### 11.1.11 — Sizes, for the record
+
+| File | Lines |
+|---|---|
+| `src/sched/runtime.rs` | 6 397 |
+| `src/syscall/linux/fs.rs` | 6 311 |
+| `src/net/socket.rs` | 3 642 |
+| `src/vfs/ext4/mod.rs` | 3 391 |
+| `src/syscall/linux/proc.rs` | 3 039 |
+| `src/syscall/linux/abi.rs` | 2 903 |
+| `src/drivers/drm.rs` | 2 371 |
+| `src/vfs/tty.rs` | 2 359 |
+| `src/vfs/procfs.rs` | 1 996 |
+| `src/vfs/mount.rs` | 1 681 |
+| `src/main.rs` | 1 625 |
+
+Long files are a symptom here, not the disease: `ext4/mod.rs` is long because a filesystem is
+large, and splitting it would buy nothing. `sched/runtime.rs` and `syscall/linux/fs.rs` are long
+*because each holds several subsystems' concerns*, which is what 11.1.2 and 11.1.3 are about.
+That distinction is what the plan below is built on: split by responsibility, not by length.
+
+#### 11.1.12 — V-12: the in-flight refactor, and the green baseline it was blocking (resolved)
+
+This item was written while the tree did not build: an in-flight refactor (the `user/abitest`
+programs moving into `syscall/` and `integration/` subdirectories, plus edits across `vfs/ext4`,
+`vfs/tty.rs` and the syscall layer) left `cargo test -p mpos --lib --target
+x86_64-unknown-linux-gnu` **failing to compile** — `Tty`/`TtyOutput` unresolved in `vfs/tty.rs`
+and a borrow error in `vfs/ext4/super.rs:501` — and it said no step below should begin until
+that work was finished or reverted, because every acceptance criterion here is "the host tests
+still pass".
+
+**It is finished and committed, and the baseline is green.** `cargo xtask test` reports `498
+passed` host unit tests, `29` from xtask, `=== SUMMARY pass=120 fail=0` from the guest suite, and
+QEMU exit `33` (the clean debug exit). The refactor is what the batch of commits ending at this
+one carries: the suite split into two tiers, and the session's kernel work (seccomp's filter
+mode, the terminal's window, ramfs link counts, the ext4 host tests, a cross-task user copy that
+could reach a supervisor page, and the boot task's park that cost a clock tick on every wake).
+
+So the prerequisite is met and **Step A may begin**. It is the one item in this phase that needs
+no green baseline anyway — it is a deletion — but it has one now, which is what makes its own
+acceptance criterion ("the host test suite and a boot are unchanged") checkable.
+
+---
+
+### 11.2 The remediation plan
+
+Ordered so each step is independently verifiable, behaviour-preserving, and leaves the machine
+bootable. Every step states its acceptance criterion as something a test can decide.
+
+The dependency direction to converge on (also in `ARCHITECTURE.md` §9):
+
+```
+drivers, net, blk, pci, rand, uevent   ->  may use arch, mm, sched, sync
+      vfs, sched                       ->  may use mm, arch, sync, blk, pci
+     syscall                           ->  may use vfs, sched, mm, net, drivers
+       main                            ->  may use everything
+```
+
+Two hard rules: **nothing below `syscall` names `syscall`**, and **nothing outside `vfs` names
+the VFS's concrete device types**.
+
+---
+
+#### Step A — Subtract: dead modules, the leftover trace, the phantom target (V-6, V-7, V-8)
+
+*No behaviour change. Do it first: it is a deletion, and it removes the clutter that makes the
+rest of the audit hard to read.*
+
+| Change | Where |
+|---|---|
+| Delete `src/arch/x86_64/serial.rs`, `src/arch/x86_64/qemu.rs` (uncompiled) and `src/arch/x86_64/pci.rs` (compiled, unreferenced) | `src/arch/x86_64/` |
+| Delete `trace_msg` and its call site from the dispatcher | `src/syscall/linux/mod.rs` |
+| Either add `arch/aarch64/linker.ld` or drop the `aarch64-unknown-none` rustflags and target, so the configuration stops naming a file that does not exist | `.cargo/config.toml`, `rust-toolchain.toml` |
+| Disambiguate the colliding names: `drivers/rtc.rs` → `drivers/rtc_dev.rs` (the *node*), leaving `arch::x86_64::rtc` as the clock; `drivers/qemu.rs` becomes the only `qemu` | `src/drivers/` |
+
+**Acceptance:** `git grep 'arch::x86_64::serial\|arch::x86_64::qemu\|arch::x86_64::pci'` returns
+nothing (the one stale doc-comment mention in `console.rs` is corrected); the host test suite and
+a boot are unchanged apart from the absence of the `[msgtrace]` lines; `.cargo/config.toml` no
+longer references a nonexistent path.
+**Risk:** the only real risk is deleting something referenced through a macro. Grep first; for
+two of the three files the absence of a `mod` declaration is proof enough.
+
+---
+
+#### Step B — Give devices a seam the VFS can hold without naming them (V-1, V-2, V-5)
+
+The largest step, and the one that pays for the others: it removes the largest cause of the
+23-cycle count.
+
+**B1 — Replace the six `as_*` downcasts with one typed handle.** Introduce a `vfs::DevNode` so
+that a char-device node carries an `Arc<dyn DevOps>` whose *own* module defines the operations
+(`read`, `write`, `ioctl(cmd, arg)`). The trait lives in `vfs`; the implementations live in
+`drivers`/`net` and are *installed* at boot by the code that owns them. The syscall layer then
+calls `node.dev().ioctl(nr, arg)` instead of matching on a device type. (A single
+`as_any`/`downcast_ref` pair over `core::any::Any` is the smaller alternative; either is fine —
+the point is that `vfs` stops naming the types.)
+
+**B2 — Move each device's ioctl contract down to its driver.** For each family in 11.1.2
+(fbdev, DRM, RTC, uinput, tty, evdev, block), move the request-number constants, struct layouts
+and validation into the driver module as `pub fn ioctl(req, arg, from_user) -> isize` (or a small
+table), leaving `syscall/linux/fs.rs` with the dispatch to that entry point. The *pure* parts stay
+host-compiled and keep their tests; `drivers/drm.rs` already carries most of the DRM UAPI, so it
+is closer to this shape than it looks.
+
+**B3 — Move the user-pointer helper out of `syscall`.** `buffer_ok`/`err_of` answer "is this range
+readable/writable by the current task", which is an `mm` question. Add
+`mm::user::{validate, copy_in, copy_out}` and have `syscall`, `net` and `drivers` all call that.
+This deletes V-5 and V-9 at once.
+
+**Acceptance:**
+- `crate::drivers::` and `crate::net::` no longer appear in `src/vfs/mod.rs` (the six `as_*`
+  methods are gone).
+- `crate::syscall::` no longer appears anywhere under `src/drivers/` or `src/net/`.
+- `wc -l src/syscall/linux/fs.rs` drops materially from 6 311.
+- Every host test still passes, and `cargo xtask test` still boots with every `/bin/t-*`
+  reporting `=== PASS` — with `t-drm`, `t-drm-args`, `t-fbdev`, `t-evdev`, `t-ioctl`, `t-seat`,
+  `t-prime` and `t-unix*` as the programs that specifically exercise the moved paths.
+**Risk:** this touches every device path at once. Do it one device at a time (fbdev first — the
+smallest contract; DRM last — the largest), keeping that device's conformance program as the
+gate, and never batch two devices into one commit.
+
+---
+
+#### Step C — Let subsystems own their per-open-file resources (V-3)
+
+`close_at_exit` ×4 in the scheduler becomes a **registry**: the scheduler keeps a list of hooks
+that each subsystem registers at boot, and on task exit it walks the list, naming nothing but its
+own trait. A subsystem that registers nothing costs nothing.
+
+For the exec path, decide per edge rather than abstracting for symmetry: `binfmt::shebang` and
+`vfs::read_file` are genuinely needed to load an image, so either accept the `vfs` edge and
+document it as allowed ("the scheduler loads images from a filesystem" is not a leak in the way
+that "the scheduler closes sockets" is), or hold a narrow `ImageSource` trait. The rule to apply:
+*is this the scheduler's business, or somebody else's?* — per-open-file resource ownership is
+somebody else's; reading an executable is the scheduler's.
+
+**Acceptance:** `sched/runtime.rs` contains no `crate::net::`, no `crate::drivers::` and no
+`crate::vfs::(inotify|locks)` reference; a task that held a socket, an inotify watch, an evdev
+grab and a uinput device is still cleaned up correctly (`t-inotify`, `t-evdev`, `t-filelock`,
+`t-unix-scm` are the gates); `wc -l src/sched/runtime.rs` drops from 6 397.
+**Risk:** teardown order matters — a descriptor's resource must go before the table entry. Pin
+the order with a host test on the registry itself, then keep the guest tests as the end-to-end
+gate.
+
+---
+
+#### Step D — Move the terminal emulator out of the VFS (V-4)
+
+Create `src/term/` (grid, keys, font, escape parsing) and `src/console/vcmux`, leaving in `vfs`
+only what is a filesystem fact: `/dev/tty*` and `/dev/pts/*` nodes, the line discipline as the
+node's behaviour, and `termios`. `console` then depends on `term`, and `vfs` depends on neither
+`console` nor the render task.
+
+**Acceptance:** `vfs/` contains no font asset, no escape-sequence parser and no `vcmux`;
+`crate::vfs::term` is gone; `console.rs` no longer reaches into `vfs` for the grid; the three
+`vfs/term` test modules keep passing after the move (they are pure, so the move is mechanical);
+`cargo xtask run --mode mirror` still paints the same screen and `Ctrl-A 1..6` still switches
+virtual consoles.
+**Risk:** `vfs/term/vga8x16.bin` is `include_bytes!`-ed — a missed path is a compile error, which
+is the good outcome.
+
+---
+
+#### Step E — Split `fs.rs` along its real seams (follow-up to B2)
+
+After B2 the file should be much smaller. What remains is still two jobs: the path-carrying calls
+(`open`, `stat`, `getdents64`, …) and the device-ioctl entry point. Split into
+`syscall/linux/file.rs` and `syscall/linux/dev.rs`, or leave it once B2 has removed the
+switchboard — whichever the size says.
+
+**Acceptance:** the dispatch routing counts are unchanged, no handler changed meaning, host tests
+unchanged.
+
+---
+
+#### Step F — Make the target gate a rule, not a habit (V-11 + the `ARCHITECTURE.md` §8 drift)
+
+1. Settle the `net` case: either declare `pub mod net` for the host too — which means moving the
+   pure parts of `net/socket.rs` out from under the gate, since `smoltcp` is gated in
+   `Cargo.toml` — or delete the unreachable test module and say so. Pick one; do not leave the
+   annotation lying.
+2. Write the criterion down (`AGENTS.md` §4 and a header comment in `src/lib.rs`): *a module is
+   host-compiled when its logic touches no hardware, no port I/O, no virtio ring and no real
+   clock — and then its dependencies must be host-compiled too, transitively.* The transitive
+   half is the part that gets forgotten.
+3. Add a cheap mechanical check: a host test in `xtask` that walks `src/**/*.rs` and fails when a
+   `#[cfg(test)]` module sits in a file whose nearest declaring parent is gated
+   `target_os = "none"`. Crude, but it catches the V-11 class without a compiler change.
+
+**Acceptance:** the check fails on today's `net/socket.rs` and passes after the fix;
+`cargo test -p mpos-xtask` covers it.
+
+---
+
+#### Step G — Keep the graph from regressing
+
+Once A–F have landed, freeze the result. Add to `xtask` a `depgraph` subcommand (or a host test)
+that re-runs §11.0's extraction and asserts:
+
+- no edge from a lower layer into `syscall` (`drivers`, `net`, `blk`, `pci`, `rand`, `uevent`,
+  `vfs`, `sched` must not reference `crate::syscall::`);
+- no `crate::drivers::` or `crate::net::` reference from `vfs/mod.rs`;
+- the measured cycle count is at or below the recorded baseline.
+
+The baseline is what makes it useful: a **ratchet**, not a cliff. Store it as a constant next to
+the check with a comment naming the date and the number, so a reduction is a commit somebody can
+make and a regression is a failing test.
+
+**Acceptance:** `cargo xtask depgraph` reports the current edge and cycle counts and fails when
+either worsens.
+
+---
+
+### 11.3 Order, and what is deliberately not in this plan
+
+**Do this, in this order:**
+
+1. ~~**V-12** — finish or revert the in-flight refactor.~~ **Done**: the tree builds and the
+   whole gate is green (§11.1.12), so everything below is now verifiable.
+2. **Step A** — pure subtraction, ~5 files, one commit, no behaviour change.
+3. **Step B** — the device seam, one device at a time. This is where the 23 becomes a real
+   number, and it is the largest single piece of work in the phase.
+4. **Step C** — the resource registry.
+5. **Step D** — the terminal emulator move.
+6. **Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.
+7. **Step F** — the gate criterion and the check for it.
+8. **Step G** — the ratchet.
+
+Steps A, D and F are mechanical and could be done by anyone with an afternoon; B and C need
+someone who knows the device and scheduler paths. Nothing here has to land before the feature
+work in Phases 1–10 — but every feature lands *cheaper* after B and C, which is the argument for
+doing them before the next device or the next per-open-file resource is added.
+
+**Deliberately not in this plan:**
+
+- **Rewriting the `Inode` interface.** The trait itself is fine; it is the six device methods
+  hanging off it that are wrong. B1 removes them and stops there.
+- **A message bus, an async runtime, or a generic HAL trait forest.** The kernel is uniprocessor
+  and synchronous by design, and `ARCHITECTURE.md` §7's locking rules exist because that is what
+  makes the design legible. This phase is about *who names whom*, not about adding indirection.
+- **Splitting files because they are long.** `vfs/ext4/mod.rs` (3 391 lines) stays as it is.
+- **Restructuring `src/main.rs` (1 625 lines).** The boot sequence, the milestone checks and the
+  panic handler do belong in the binary; if it ever becomes worth splitting, the checks move to
+  `src/main/checks.rs`, and that is a tidiness commit rather than an architecture one.
+- **Fixing V-10.** Accepted, documented, and cheaper to live with than a shared crate across two
+  targets would be.
+
+---
+
 ## Priority Summary
 
 | Phase | Effort | Impact | Blocks |
@@ -1478,7 +2265,17 @@ latency bug that only shows under load, which is where it will be found first.
 | **P8: Security** | ~1 week | Low | ASLR, seccomp |
 | **P9: Architectures** | ~4 weeks | Low | aarch64, RISC-V |
 | **P10: Performance** | 10.1 done; rest ~3 weeks | High (10.2-10.3) / Medium (rest) | Interactive latency, throughput |
+| **P11: Architectural debt** | A ~1 day; B–C ~3–5 weeks; D–G ~1 week | High (maintainability) — measures 23 of 25 module pairs in a cycle | Every later phase: nothing can be tested or refactored in isolation (§11) |
 
 **Recommended order**: P1 -> P2 -> P3 -> P4 -> P5 -> P6 -> P7 -> P8 -> P9
+
+**And P11 Step A, at any time** — it is a deletion, not a refactor, and it needs no green
+baseline. P11's Steps B and C are the ones worth doing before the next device driver or the next
+per-open-file resource is added, because each of those makes the debt one line larger.
+
+**For the display work specifically**, §7.4 carries its own order, and its first step is not a
+kernel change at all: a wlroots compositor on `WLR_RENDERER=pixman` is expected to run on the
+DRM surface as it stands, which makes "boot one and read what it says" the cheapest way to find
+out what that analysis has wrong.
 
 The first two phases (epoll/timerfd + signal delivery) are the highest impact — they unlock the majority of real-world Linux userspace programs.
