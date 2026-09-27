@@ -257,8 +257,8 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // trusting which list the shipped binary walks.
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     {
-        dev.register_id("rtc0", Arc::new(crate::drivers::rtc::RtcDev), 10, 135);
-        dev.register_id("rtc", Arc::new(crate::drivers::rtc::RtcDev), 10, 135);
+        dev.register_id("rtc0", Arc::new(crate::drivers::rtc_dev::RtcDev), 10, 135);
+        dev.register_id("rtc", Arc::new(crate::drivers::rtc_dev::RtcDev), 10, 135);
     }
     if let Some(hvc) = crate::drivers::virtio::console::global() {
         let device = Arc::new(crate::drivers::virtio::console::HvcDev::new(hvc));

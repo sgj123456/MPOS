@@ -3803,7 +3803,8 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     if !buffer_ok(buf, RTC_TIME_SIZE, true, from_user) {
                         return err::EFAULT;
                     }
-                    let fields = crate::drivers::rtc::time_fields(crate::drivers::rtc::now_epoch());
+                    let fields =
+                        crate::drivers::rtc_dev::time_fields(crate::drivers::rtc_dev::now_epoch());
                     unsafe {
                         for (i, value) in fields.iter().enumerate() {
                             (buf as *mut i32).add(i).write_unaligned(*value);
@@ -3823,7 +3824,7 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                             *value = (buf as *const i32).add(i).read_unaligned();
                         }
                     }
-                    match crate::drivers::rtc::fields_to_epoch(&fields) {
+                    match crate::drivers::rtc_dev::fields_to_epoch(&fields) {
                         Ok(epoch) => {
                             if crate::arch::rtc::write_epoch(epoch) {
                                 0

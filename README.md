@@ -378,10 +378,13 @@ and `/init` are edited.
 
 ### Cross-architecture
 
-Not available. `.cargo/config.toml` carries an `aarch64-unknown-none` profile, but it names
-`arch/aarch64/linker.ld`, which does not exist, so the target cannot link. `PLAN.md` §9.1 has
-the list of what a real aarch64 port needs; `PLAN.md` Phase 11 (Step A) proposes deleting the
-configuration until then so that it stops advertising a port that is not there.
+Not available, and the configuration no longer pretends otherwise: there is no
+`aarch64-unknown-none` profile in `.cargo/config.toml` and no such target in
+`rust-toolchain.toml`, because the profile that used to sit there named
+`arch/aarch64/linker.ld` and no such script has ever existed (`PLAN.md` Phase 11
+Step A removed it). `PLAN.md` §9.1 lists what a real aarch64 port needs - the
+exception vectors, the GIC, the page tables, PSCI, the generic timer, a UART -
+and none of it is written.
 
 ---
 
@@ -534,7 +537,7 @@ mpos/
 │   │   ├── pci.rs           #   PCI config space (mechanism 1), enumeration
 │   │   ├── devices.rs       #   device registry, uevent publishing
 │   │   ├── serial.rs        #   COM1: TX ring, interrupt-driven RX
-│   │   ├── rtc.rs           #   /dev/rtc0
+│   │   ├── rtc_dev.rs       #   /dev/rtc0 (the node; the clock is arch::x86_64::rtc)
 │   │   ├── qemu.rs          #   the isa-debug-exit test port
 │   │   ├── drm.rs           #   /dev/dri/card0: the Linux DRM/KMS UAPI
 │   │   ├── uinput.rs        #   /dev/uinput

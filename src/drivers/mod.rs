@@ -10,7 +10,7 @@ pub mod drm;
 pub mod pci;
 pub mod qemu;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub mod rtc;
+pub mod rtc_dev;
 pub mod serial;
 pub mod uinput;
 pub mod video;

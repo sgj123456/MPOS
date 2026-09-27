@@ -599,7 +599,7 @@ MPOS 实现了约 **225 个 Linux x86_64 系统调用**。POSIX 补全集(epoll�
 ```bash
 rustup toolchain install nightly
 rustup component add rust-src rustfmt clippy --toolchain nightly
-rustup target add x86_64-unknown-none aarch64-unknown-none --toolchain nightly
+rustup target add x86_64-unknown-none --toolchain nightly
 ```
 
 ### 构建并运行
@@ -646,11 +646,10 @@ QEMU 直接在 OVMF 下启动——不需要 ISO、不需要光驱、宿主上�
 
 ### 交叉架构
 
-```bash
-ARCH=aarch64 ./scripts/run.sh
-```
-
-aarch64 支持正在开发中——目前内核 ELF 可以构建，但启动流程尚未完成。
+不支持。`.cargo/config.toml` 里已经没有 `aarch64-unknown-none` 配置，`rust-toolchain.toml`
+里也没有这个 target——原来那份配置指向 `arch/aarch64/linker.ld`，而这个链接脚本从来就不存在，
+所以它无法链接（`PLAN.md` Phase 11 Step A 把这份空头承诺删掉了）。`PLAN.md` §9.1 列出了真正的
+aarch64 移植需要什么：异常向量表、GIC、页表、PSCI、通用定时器、UART——这些目前都还没有写。
 
 ---
 

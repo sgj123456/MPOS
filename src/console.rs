@@ -1,4 +1,4 @@
-//! Kernel console — architecture-agnostic formatting over `arch::serial`.
+//! Kernel console — architecture-agnostic formatting over `drivers::serial`.
 //!
 //! This module is a **kernel-wide service**, not a driver or a VFS component.
 //! It wraps the raw serial driver with interrupt-safe output and provides the

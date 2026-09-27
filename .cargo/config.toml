@@ -26,15 +26,12 @@ rustflags = [
     "-C", "link-arg=-zmax-page-size=0x1000",
 ]
 
-[target.aarch64-unknown-none]
-rustflags = [
-    "-C", "relocation-model=pic",
-    "-C", "target-feature=+nofp,+nosimd",
-    "-C", "link-arg=--script=arch/aarch64/linker.ld",
-    "-C", "link-arg=-pie",
-    "-C", "link-arg=-ztext",
-    "-C", "link-arg=-zmax-page-size=0x1000",
-]
+# There is no `[target.aarch64-unknown-none]` here, and there used to be: it
+# named `arch/aarch64/linker.ld`, which has never existed, so the profile
+# described a target that could not link. The port's real prerequisites are
+# `PLAN.md` §9.1; until they are written the configuration does not claim a
+# backend it cannot build. Re-adding the block is one line, next to a script
+# that is actually there.
 
 # The user programs: ordinary Rust binaries for musl, which is the libc this
 # kernel's Linux ABI is written against. They are **statically** linked and

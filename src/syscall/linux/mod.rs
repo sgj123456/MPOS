@@ -45,34 +45,6 @@ pub fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
     proc::deliver_signal(regs_ptr, ret)
 }
 
-/// TEMPORARY (udevd worker-channel hunt): name the message call that a socket
-/// layer refused, so the failure can be told apart from the 49 places that
-/// answer `EINVAL` without being asked to. Remove once the site is known.
-#[cfg(target_os = "none")]
-fn trace_msg(nr: u64, args: [usize; 6], ret: isize) -> isize {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    // udevd's manager and its ten workers are the loudest callers at boot, and
-    // a trace that outlives them is a wall of text rather than an answer.
-    const CAP: usize = 60;
-    static SEEN: AtomicUsize = AtomicUsize::new(0);
-    if ret < 0
-        && ret != err::EAGAIN
-        && matches!(nr, nr::SENDTO | nr::RECVFROM | nr::SENDMSG | nr::RECVMSG)
-    {
-        let n = SEEN.fetch_add(1, Ordering::Relaxed);
-        if n < CAP {
-            crate::println!(
-                "[msgtrace] nr={nr} fd={} arg2={:#x} arg3={:#x} ret={ret} pid={}",
-                args[0],
-                args[2],
-                args[3],
-                crate::sched::current().0,
-            );
-        }
-    }
-    ret
-}
-
 #[cfg(target_os = "none")]
 pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -> isize {
     // SECCOMP_MODE_STRICT is on for this thread. Only the four calls a
@@ -209,26 +181,10 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::SOCKET => crate::net::socket::handle_socket(args, from_user),
         nr::CONNECT => crate::net::socket::handle_connect(args, from_user),
         nr::ACCEPT => crate::net::socket::handle_accept(args, from_user),
-        nr::SENDTO => trace_msg(
-            nr::SENDTO,
-            args,
-            crate::net::socket::handle_sendto(args, from_user),
-        ),
-        nr::RECVFROM => trace_msg(
-            nr::RECVFROM,
-            args,
-            crate::net::socket::handle_recvfrom(args, from_user),
-        ),
-        nr::SENDMSG => trace_msg(
-            nr::SENDMSG,
-            args,
-            crate::net::socket::handle_sendmsg(args, from_user),
-        ),
-        nr::RECVMSG => trace_msg(
-            nr::RECVMSG,
-            args,
-            crate::net::socket::handle_recvmsg(args, from_user),
-        ),
+        nr::SENDTO => crate::net::socket::handle_sendto(args, from_user),
+        nr::RECVFROM => crate::net::socket::handle_recvfrom(args, from_user),
+        nr::SENDMSG => crate::net::socket::handle_sendmsg(args, from_user),
+        nr::RECVMSG => crate::net::socket::handle_recvmsg(args, from_user),
         nr::SHUTDOWN => crate::net::socket::handle_shutdown(args, from_user),
         nr::BIND => crate::net::socket::handle_bind(args, from_user),
         nr::LISTEN => crate::net::socket::handle_listen(args, from_user),

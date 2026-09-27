@@ -1,6 +1,13 @@
 //! `/dev/rtc0` - the CMOS clock as a device node, which is the door
 //! `hwclock(8)` reaches through.
 //!
+//! This module is `rtc_dev` and not `rtc` because the clock itself is
+//! [`crate::arch::x86_64::rtc`]: the code that reads and writes the CMOS,
+//! which the kernel's own `clock_gettime` anchor comes from. What lives here
+//! is the *node* in front of it - the file, its char-device number, and the
+//! stream face - and two modules called `rtc` in one tree, one a driver and
+//! one a device, is how a reader learns to distrust the names.
+//!
 //! The kernel already keeps its wall clock *in* this hardware (the boot
 //! anchor comes from the CMOS; see `arch::x86_64::rtc`), but until now no
 //! name led there: OpenRC's `sysclock` service ran `hwclock --hctosys`, got

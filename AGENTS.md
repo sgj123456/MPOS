@@ -247,9 +247,9 @@ is no shared crate between them by design. Change all three, and keep the loader
 |---|---|
 | Bare `cargo test` fails to link/run | Always add `--target x86_64-unknown-linux-gnu` |
 | A new test program is silently never built | Add the `[[bin]]` block; `xtask` treats "no binary" as a hard error, but only for sources it finds |
-| `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` look real | They are **orphans**: not declared in `arch/x86_64/mod.rs`, so not compiled at all. `qemu.rs` is byte-identical to `drivers/qemu.rs`. `arch/x86_64/pci.rs` is a stale earlier copy of `drivers/pci.rs`. Edit `drivers/`, not these |
+| A file under `src/` that nothing declares looks real | That is how `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` survived uncompiled for months (Phase 11 V-7). They are **deleted now**, along with the unreferenced `arch/x86_64/pci.rs`, and `drivers/rtc.rs` is `drivers/rtc_dev.rs` (`arch::x86_64::rtc` is the clock; this one is the node). The trap outlives them: a `mod` declaration is what makes a file part of the build, and a duplicate driver is what happens when it is missing |
 | `cargo xtask run` does not print the milestone markers | By design: the `M*_OK` checks only run with `mpos.selftest`, which `xtask test` sets and a normal boot does not. The markers that exist are M0–M4, M6, M7, M8_IPC and M8 — there is no M5 and nothing above M8 |
-| `README.md` promises aarch64 | `.cargo/config.toml` names `arch/aarch64/linker.ld`, which does not exist. The target is aspirational and will not link |
+| `README.md` used to promise aarch64 | Fixed in Phase 11 Step A: the `aarch64-unknown-none` profile is gone from `.cargo/config.toml` (and the target from `rust-toolchain.toml`), because it named `arch/aarch64/linker.ld` and no such script exists. There is no cross-architecture build until a port is written; `PLAN.md` §9.1 lists what one needs |
 | `fuzz/` refuses to build from the root workspace | It is its own workspace on purpose; run `cargo fuzz` from inside `fuzz/` |
 | A `net/*` host test does not run | `src/lib.rs` gates the whole `net` module on `target_os = "none"`; `net/socket.rs`'s test module is annotated for the host and is consequently unreachable |
 | Something in `user/staging/` looks like a missing test | It is deliberate scratch space; check `user/abitest` and `user/tests` for the live version first |

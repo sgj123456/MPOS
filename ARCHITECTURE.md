@@ -280,7 +280,7 @@ carries the edge. Self-edges (a module's own files) are excluded.
 | From | To | W | Example carrier |
 |---|---|---:|---|
 | arch | mm | 4 | `arch/x86_64/idt.rs` |
-| arch | boot, console, date, drivers, net, sched, syscall, vfs | 1 each | `arch/x86_64/paging.rs`, `idt.rs`, `rtc.rs`, `syscall.rs`, `serial.rs` |
+| arch | boot, console, date, drivers, net, sched, syscall | 1 each | `arch/x86_64/paging.rs`, `idt.rs`, `rtc.rs`, `syscall.rs` |
 | blk | mm | 1 | `blk/part.rs` |
 | console | arch, drivers, sched, vfs | 1 each | `console.rs` |
 | drivers | arch 7, mm 6, sched 7, vfs 11, console 3, blk 2, evdev 2, uevent 2, uinput 2, net 1, pci 1, rand 1, syscall 1, date 1 | 48 | `drivers/devices.rs`, `drivers/drm.rs` |
@@ -302,18 +302,29 @@ carries the edge. Self-edges (a module's own files) are excluded.
 ```
 arch     <-> console      arch     <-> drivers     arch     <-> mm
 arch     <-> net          arch     <-> sched       arch     <-> syscall
-arch     <-> vfs          console  <-> drivers     console  <-> vfs
-drivers  <-> net          drivers  <-> pci         drivers  <-> rand
-drivers  <-> sched        drivers  <-> syscall     drivers  <-> vfs
-net      <-> sched        net      <-> syscall     net      <-> uevent
-net      <-> vfs          sched    <-> syscall     sched    <-> vfs
-syscall  <-> vfs
+console  <-> drivers      console  <-> vfs         drivers  <-> net
+drivers  <-> pci          drivers  <-> rand        drivers  <-> sched
+drivers  <-> syscall      drivers  <-> vfs         net      <-> sched
+net      <-> syscall      net      <-> uevent      net      <-> vfs
+sched    <-> syscall      sched    <-> vfs         syscall  <-> vfs
 ```
 
-That is 23 of the 25 possible pairs among the twelve modules that participate. The module
-graph is, at this granularity, one strongly connected component: **there is no layer that
-can be compiled, tested or refactored in isolation.** §9 breaks the number down by cause;
-`PLAN.md` Phase 11 has the plan.
+That is 21 pairs among the eleven modules that appear in one (`arch`, `console`, `drivers`, `mm`,
+`net`, `pci`, `rand`, `sched`, `syscall`, `vfs`, `uevent`). The module graph is, at this
+granularity, one strongly connected component: **there is no layer that can be compiled, tested
+or refactored in isolation.** §9 breaks the number down by cause; `PLAN.md` Phase 11 has the plan.
+
+Two notes on the table above, both of them about trusting a measured number:
+
+- It was measured **before Step A**, which deleted three files from `arch/x86_64`. One of them
+  mattered to this list: `arch/x86_64/serial.rs` was never compiled - it was not declared in
+  `arch/x86_64/mod.rs` - and the extraction reads files rather than builds, so the byte it
+  contributed made `arch <-> vfs` a pair. `arch` no longer names `vfs` at all, which is why that
+  row and that pair are gone above; the other twenty-one are real.
+- The list used to be printed under a count of *23* "of the 25 possible". The list had 22 entries;
+  the count was one too high and the denominator was never defined. `PLAN.md` §11.0 now carries
+  the re-measured figures and names what participates, so the number and its scope arrive
+  together.
 
 ---
 
@@ -394,13 +405,13 @@ yet — this is the audit, and `PLAN.md` Phase 11 is the work list.
 | V-3 | The scheduler performs other subsystems' per-process cleanup | `sched/runtime.rs` calls `net::socket::close_sockets_at_exit`, `vfs::inotify::close_at_exit`, `drivers::virtio::input::close_at_exit`, `drivers::uinput::close_at_exit` on task exit | Phase 11 C |
 | V-4 | The terminal emulator and console mux live inside the VFS | `vfs/term/` holds the cell grid, keys and an embedded `vga8x16.bin` font; `vfs/vcmux.rs`, `vfs/pty.rs`, `vfs/tty.rs` (2 359 lines) implement the console; `console.rs` reaches *into* `vfs::term::with_screen` to render | Phase 11 D |
 | V-5 | A driver calls back into the syscall layer | `drivers/drm.rs:595,741` call `crate::syscall::buffer_ok` to validate user pointers | Phase 11 B |
-| V-6 | A debug trace sits in the dispatch hot path | `syscall/linux/mod.rs::trace_msg`, self-labelled `TEMPORARY (udevd worker-channel hunt)`, writes `[msgtrace]` lines from any failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` | Phase 11 A |
-| V-7 | Dead and duplicate machine modules | `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` are not declared in `arch/x86_64/mod.rs` at all; `qemu.rs` is byte-identical to `drivers/qemu.rs`. Three PCI modules exist (`arch/x86_64/pci.rs` is a stale earlier copy of `drivers/pci.rs`), two RTC, two serial | Phase 11 A |
-| V-8 | Cross-architecture config points at a missing file | `.cargo/config.toml` sets `link-arg=--script=arch/aarch64/linker.ld`; only `arch/x86_64/linker.ld` exists, so the `aarch64-unknown-none` build cannot link | Phase 11 A |
+| V-6 | A debug trace sat in the dispatch hot path | `syscall/linux/mod.rs::trace_msg`, self-labelled `TEMPORARY (udevd worker-channel hunt)`, wrote `[msgtrace]` lines from any failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` | **Done** (Phase 11 A) |
+| V-7 | Dead and duplicate machine modules | `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` were not declared in `arch/x86_64/mod.rs` at all; `qemu.rs` was byte-identical to `drivers/qemu.rs`. Three PCI modules existed (`arch/x86_64/pci.rs` was a stale earlier copy of `drivers/pci.rs`), two RTC, two serial | **Done** (Phase 11 A) — all three deleted, `drivers/rtc` renamed `drivers/rtc_dev` |
+| V-8 | Cross-architecture config pointed at a missing file | `.cargo/config.toml` set `link-arg=--script=arch/aarch64/linker.ld`; only `arch/x86_64/linker.ld` exists, so the `aarch64-unknown-none` build could not link | **Done** (Phase 11 A) — the profile is gone, and `PLAN.md` §9.1 keeps what a port needs |
 | V-9 | The network layer validates user pointers with the syscall layer's helper | `net/socket.rs` and `net/unix.rs` call `crate::syscall::buffer_ok` / `err_of` throughout; the dependency is for two pure functions that have no business owning the direction | Phase 11 E |
 | V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | Accepted by design; document only |
 | V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs:3527` is `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs:48` gates `pub mod net` on `target_os = "none"`; 3 tests never run | Phase 11 F |
-| V-12 | The tree is mid-refactor and does not build for the host | The uncommitted work renames `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edits `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` fails to compile (see `AGENTS.md` §3, "Current verification state") | Not a plan item — finish the in-flight work first |
+| V-12 | The tree was mid-refactor and did not build for the host | The uncommitted work renamed `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edited `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` failed to compile | **Resolved** — finished and committed; the gate is green (`PLAN.md` §11.1.12) |
 
 **The dependency direction to aim for** (used as the acceptance criterion in Phase 11):
 

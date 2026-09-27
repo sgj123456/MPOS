@@ -174,9 +174,9 @@ run, so these are steps rather than results:
 **Architectures (Phase 9 — far future)**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
-**Architecture debt (Phase 11 — audit done, nothing fixed)**
-- [ ] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
-      dispatcher, the aarch64 linker script that does not exist (§11)
+**Architecture debt (Phase 11 — audit done, Step A landed)**
+- [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
+      dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [ ] 11.B the device seam: one handle instead of six `Inode::as_*` downcasts, each device's
       ioctl contract moved down to its driver, user-pointer validation moved to `mm` (§11)
 - [ ] 11.C per-open-file resources get a registry, so `sched` stops naming `net`/`vfs`/`drivers`
@@ -1856,13 +1856,20 @@ find src -name '*.rs' | xargs wc -l | sort -rn | head -12
 cat src/arch/x86_64/mod.rs
 ```
 
-The three numbers that came out of it:
+The three numbers that came out of it, re-measured after Step A (§11.2):
 
 | Measurement | Result |
 |---|---|
-| Kernel size | 79 095 lines across 116 `.rs` files (plus `boot/` 1 225 and `xtask/` ~2 500) |
-| Host unit tests | 491 `#[test]` in `src/`, 25 in `xtask/` |
-| Mutual module pairs (a cycle of length 2) | **23** out of the 25 possible among the twelve participating modules |
+| Kernel size | 80 239 lines across 114 `.rs` files (plus `boot/` 1 225 in 4 files and `xtask/` 4 396) |
+| Host unit tests | 501 `#[test]` in `src/`, of which 498 run in the host build - the other three are `net/socket.rs`'s, behind the gate V-11 names - and 29 in `xtask/` |
+| Mutual module pairs (a cycle of length 2) | **21**, among the eleven modules that appear in one: `arch`, `console`, `drivers`, `mm`, `net`, `pci`, `rand`, `sched`, `syscall`, `vfs`, `uevent` |
+
+The audit was published with 79 095 lines across 116 files, 491 + 25 tests and *23* pairs. Re-running
+its own script corrects two of those and the correction is worth keeping: the tree has grown since
+(the batch that lands with this document), and **the pair count was one too high** - the list
+`ARCHITECTURE.md` §6 prints has 22 entries, which is what the re-measurement finds before Step A.
+Step A then takes it to 21, for the reason §11.1.7 records: one of those pairs came from a file the
+compiler never saw.
 
 That last row is the finding. At module granularity the kernel is one strongly connected
 component: there is no layer that can be compiled, tested or refactored on its own. Every
@@ -1956,35 +1963,53 @@ a *user* pointer is an inversion — the driver is below the syscall layer in ev
 — and it exists because the helper happens to live there. The helper itself is fine; its home
 is not.
 
-#### 11.1.6 — V-6: a temporary trace in the dispatch hot path (severity: low, but it must go)
+#### 11.1.6 — V-6: a temporary trace in the dispatch hot path — **DONE**
 
-`syscall/linux/mod.rs::trace_msg` is self-labelled:
+`syscall/linux/mod.rs::trace_msg` was self-labelled:
 
 > TEMPORARY (udevd worker-channel hunt): ... Remove once the site is known.
 
-It fires on every failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` and prints up to 60
-`[msgtrace]` lines from inside the dispatcher. The hunt it belongs to is recorded as finished
-in §4.1's udevd note, so this is leftover scaffolding standing in the one path every syscall
-crosses.
+It fired on every failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` and printed up to 60
+`[msgtrace]` lines from inside the dispatcher. The hunt it belonged to is recorded as finished
+in §4.1's udevd note, so it was leftover scaffolding standing in the one path every syscall
+crosses. **Removed, and the four arms are plain calls again** (§11.2 Step A).
 
-#### 11.1.7 — V-7: orphan and duplicate machine modules (severity: low, purely subtractive)
+#### 11.1.7 — V-7: orphan and duplicate machine modules — **DONE**
 
-| File | Status |
+| File | Was |
 |---|---|
 | `src/arch/x86_64/serial.rs` (119 lines) | **not declared in `arch/x86_64/mod.rs`** → never compiled. A near-duplicate of `drivers/serial.rs` (324 lines), same doc header |
 | `src/arch/x86_64/qemu.rs` (23 lines) | Not declared → never compiled. **Byte-identical** to `drivers/qemu.rs` |
 | `src/arch/x86_64/pci.rs` | Declared, compiled, **referenced nowhere**. A stale earlier copy of `drivers/pci.rs` (discovery-only, one function per slot, bus 0) |
-| `src/arch/x86_64/rtc.rs` vs `src/drivers/rtc.rs` | Both live and both used — but the names collide and the split is not obvious from either name |
+| `src/arch/x86_64/rtc.rs` vs `src/drivers/rtc.rs` | Both live and both used — but the names collided and the split was not obvious from either name |
 
-Three modules named `pci`, two named `rtc`, two named `serial`, two named `qemu`. Two of the
-twelve are dead and one is a duplicate, which is how a reader learns to distrust the tree.
+Three modules named `pci`, two named `rtc`, two named `serial`, two named `qemu`; two of the
+twelve were dead and one was a duplicate, which is how a reader learns to distrust the tree.
 
-#### 11.1.8 — V-8: the aarch64 configuration points at a missing file (severity: low)
+**All three files are deleted** and the module declaration with them; `drivers::rtc` is renamed
+`drivers::rtc_dev` (the node), which leaves `arch::x86_64::rtc` as the only thing called `rtc`
+and the clock as the one that owns the name. The `console.rs` module header, which described
+itself as formatting over `arch::serial`, now names `drivers::serial`.
 
-`.cargo/config.toml` sets `-C link-arg=--script=arch/aarch64/linker.ld`; only
-`arch/x86_64/linker.ld` exists. The target cannot link. §9.1 calls aarch64 "under development",
-which understates it: there is no linker script, and `src/arch/mod.rs` says the modules will be
-declared "when they are written rather than now".
+*One number fell out of the deletion that is worth keeping.* §11.0's extraction counts mutual
+module pairs by reading every file under `src/`, and it read the two orphans even though the
+compiler never did: the `arch <-> vfs` pair existed **only** because `arch/x86_64/serial.rs`
+mentioned `crate::vfs`. Deleting it takes the count from 22 to 21 - a reminder that an audit by
+text search measures the tree, not the build, which is the same lesson V-7 itself is about.
+
+#### 11.1.8 — V-8: the aarch64 configuration points at a missing file — **DONE**
+
+`.cargo/config.toml` set `-C link-arg=--script=arch/aarch64/linker.ld`; only
+`arch/x86_64/linker.ld` exists. The target could not link. §9.1 calls aarch64 "under
+development", which understates it: there is no linker script, and `src/arch/mod.rs` says the
+modules will be declared "when they are written rather than now".
+
+**The profile is gone** (`[target.aarch64-unknown-none]` in `.cargo/config.toml`, and the target
+in `rust-toolchain.toml`), with a comment in its place saying what it was and where the port's
+real prerequisites are (§9.1). Re-adding it is one line, next to a linker script that exists -
+which is the point: the configuration no longer advertises a target that cannot be built. The
+alternative the step offered - writing the linker script now - would have been a claim about a
+port nobody has started, and this step is subtraction.
 
 #### 11.1.9 — V-10: the handoff ABI is written twice (severity: accepted)
 
@@ -2065,7 +2090,7 @@ the VFS's concrete device types**.
 
 ---
 
-#### Step A — Subtract: dead modules, the leftover trace, the phantom target (V-6, V-7, V-8)
+#### Step A — Subtract: dead modules, the leftover trace, the phantom target (V-6, V-7, V-8) — **DONE**
 
 *No behaviour change. Do it first: it is a deletion, and it removes the clutter that makes the
 rest of the audit hard to read.*
@@ -2083,6 +2108,24 @@ a boot are unchanged apart from the absence of the `[msgtrace]` lines; `.cargo/c
 longer references a nonexistent path.
 **Risk:** the only real risk is deleting something referenced through a macro. Grep first; for
 two of the three files the absence of a `mod` declaration is proof enough.
+
+**Done, and what the run said.** All four rows landed, one commit, no behaviour change.
+
+- The three files are gone and `pub mod pci;` with them.
+- `trace_msg` and its four call sites are gone; the socket arms are plain calls again, and the
+  only sign the trace existed is that a failed `sendto` no longer prints a line.
+- The aarch64 profile is gone from **both** files rather than the linker script being written:
+  §11.1.8 has the reasoning, and the short form is that this step subtracts.
+- `drivers/rtc_dev` is the rename, done with `git mv` so the history follows it, and its module
+  header now says why the name carries `_dev` (`arch::x86_64::rtc` is the clock).
+
+`git grep` for the three old paths returns nothing; the host suite is still **498 passed, 29 in
+xtask**; `cargo xtask test` ends the same way it did before the change - `=== SUMMARY pass=120
+fail=0` and QEMU exit **33** - which is the "unchanged apart from the `[msgtrace]` lines"
+criterion, checked by running it rather than by reading the diff.
+
+The one number that moved is the pair count, from 22 to 21, and §11.1.7 says why: the extraction
+reads files the compiler never saw.
 
 ---
 
@@ -2221,7 +2264,9 @@ either worsens.
 
 1. ~~**V-12** — finish or revert the in-flight refactor.~~ **Done**: the tree builds and the
    whole gate is green (§11.1.12), so everything below is now verifiable.
-2. **Step A** — pure subtraction, ~5 files, one commit, no behaviour change.
+2. ~~**Step A** — pure subtraction, ~5 files, one commit, no behaviour change.~~ **Done**
+   (§11.2 Step A): the three dead modules, the `[msgtrace]` trace and the aarch64 profile are
+   gone, and the pair count it was measured with fell from 22 to 21.
 3. **Step B** — the device seam, one device at a time. This is where the 23 becomes a real
    number, and it is the largest single piece of work in the phase.
 4. **Step C** — the resource registry.
@@ -2265,12 +2310,11 @@ doing them before the next device or the next per-open-file resource is added.
 | **P8: Security** | ~1 week | Low | ASLR, seccomp |
 | **P9: Architectures** | ~4 weeks | Low | aarch64, RISC-V |
 | **P10: Performance** | 10.1 done; rest ~3 weeks | High (10.2-10.3) / Medium (rest) | Interactive latency, throughput |
-| **P11: Architectural debt** | A ~1 day; B–C ~3–5 weeks; D–G ~1 week | High (maintainability) — measures 23 of 25 module pairs in a cycle | Every later phase: nothing can be tested or refactored in isolation (§11) |
+| **P11: Architectural debt** | A done; B–C ~3–5 weeks; D–G ~1 week | High (maintainability) — the number was 22 mutual module pairs, and Step A took it to 21 | Every later phase: nothing can be tested or refactored in isolation (§11) |
 
 **Recommended order**: P1 -> P2 -> P3 -> P4 -> P5 -> P6 -> P7 -> P8 -> P9
 
-**And P11 Step A, at any time** — it is a deletion, not a refactor, and it needs no green
-baseline. P11's Steps B and C are the ones worth doing before the next device driver or the next
+**P11 Step A is done** — a deletion, landed on the green baseline the tree now has. P11's Steps B and C are the ones worth doing before the next device driver or the next
 per-open-file resource is added, because each of those makes the debt one line larger.
 
 **For the display work specifically**, §7.4 carries its own order, and its first step is not a
