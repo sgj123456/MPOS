@@ -29,23 +29,24 @@ pub use runtime::{
     current_umask, deliver_pending_signal, descriptor_numbers, descriptors_of, detach_traced,
     device_not_available, discard_exit_code, exec_replace, exec_trap, exit, exit_code, exit_group,
     fork, fork_trap, get_mmap_cursor, group_members, group_stop, has_children,
-    has_deliverable_signal, has_live_child, has_tracer, init, is_child, is_stopped,
-    itimer_snapshot, itimer_swap, membarrier_registrations, move_user_page, oom_score_adj_of,
-    parent_of, pause, permanent_tasks, pgid_of, poll_any_child, poll_any_child_event, preempt,
-    protect_user, read_sigchld, read_user, read_user_of, register_membarrier, release_user_frames,
-    reset_disposition, resolve_cow_fault, resolve_script, resolve_stack_growth, resume_traced,
-    rlimits_of, send_signal, send_signal_group, send_signal_info, session_of_tty, set_brk_base,
-    set_clear_tid, set_current_blocked, set_current_identity, set_current_rlimit, set_current_tls,
+    has_deliverable_signal, has_live_child, has_seccomp_filter, has_tracer, init, is_child,
+    is_stopped, itimer_snapshot, itimer_swap, membarrier_registrations, move_user_page,
+    oom_score_adj_of, parent_of, pause, permanent_tasks, pgid_of, poll_any_child,
+    poll_any_child_event, preempt, protect_user, read_sigchld, read_user, read_user_of,
+    register_membarrier, release_user_frames, reset_disposition, resolve_cow_fault, resolve_script,
+    resolve_stack_growth, resume_traced, rlimits_of, run_seccomp_filters, send_signal,
+    send_signal_group, send_signal_info, session_of_tty, set_brk_base, set_clear_tid,
+    set_current_blocked, set_current_identity, set_current_rlimit, set_current_tls,
     set_current_umask, set_cwd, set_cwd_path, set_mmap_cursor, set_oom_score_adj, set_pgid,
-    set_seccomp_strict, set_signal_action, set_signal_alt_stack, set_trace_fpu, set_trace_options,
-    set_trace_regs, set_tracer, signal_action, signal_alt_stack, sleep_ticks, snapshot, snapshots,
-    space_root_of, spawn, spawn_permanent, spawn_user, started, stop_at_syscall, stop_of,
-    take_child_event, take_continued_report, take_deliverable_siginfo, take_deliverable_signal,
-    take_exit_code, take_exit_code_current, take_fatal_signal, take_pending_event,
-    take_signal_in_set, take_stop_report, task_count, thread_snapshots, tls_of, trace_fpu,
-    trace_options, trace_regs, trace_signal_stop, trace_syscall, tracer_of, try_spawn_user,
-    unmap_user, user_frame_at, user_range_free, vfork, wait_any_child, wait_any_child_event,
-    wait_for_interrupt, wake, write_user, write_user_of, yield_now,
+    set_seccomp_filter, set_seccomp_strict, set_signal_action, set_signal_alt_stack, set_trace_fpu,
+    set_trace_options, set_trace_regs, set_tracer, signal_action, signal_alt_stack, sleep_ticks,
+    snapshot, snapshots, space_root_of, spawn, spawn_permanent, spawn_user, started,
+    stop_at_syscall, stop_of, take_child_event, take_continued_report, take_deliverable_siginfo,
+    take_deliverable_signal, take_exit_code, take_exit_code_current, take_fatal_signal,
+    take_pending_event, take_signal_in_set, take_stop_report, task_count, thread_snapshots, tls_of,
+    trace_fpu, trace_options, trace_regs, trace_signal_stop, trace_syscall, tracer_of,
+    try_spawn_user, unmap_user, user_frame_at, user_range_free, vfork, wait_any_child,
+    wait_any_child_event, wait_for_interrupt, wake, write_user, write_user_of, yield_now,
 };
 
 /// A host build has no processes, so no creator: root, which is what a node
@@ -96,6 +97,44 @@ pub fn current_is_seccomp_strict() -> bool {
 #[cfg(not(target_os = "none"))]
 pub fn set_seccomp_strict() {
     HOST_SECCOMP_STRICT.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The host build's filter list, the same one-value stand-in the strict latch
+/// above uses. It is not a convenience: a filter's *validation* - which
+/// instructions are known, which jumps land inside the program, whether it ends
+/// by returning - is arithmetic over the caller's bytes, and the install path
+/// that copies those bytes out of a `sock_fprog` is the same code on both
+/// targets. Without this the whole install path would be kernel-only and no
+/// host test could argue with it.
+#[cfg(not(target_os = "none"))]
+static HOST_SECCOMP_FILTERS: critical_section::Mutex<
+    core::cell::RefCell<alloc::vec::Vec<crate::seccomp::Program>>,
+> = critical_section::Mutex::new(core::cell::RefCell::new(alloc::vec::Vec::new()));
+
+#[cfg(not(target_os = "none"))]
+pub fn has_seccomp_filter() -> bool {
+    critical_section::with(|cs| !HOST_SECCOMP_FILTERS.borrow(cs).borrow().is_empty())
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_seccomp_filter(program: crate::seccomp::Program) {
+    crate::seccomp::arm();
+    critical_section::with(|cs| HOST_SECCOMP_FILTERS.borrow(cs).borrow_mut().push(program));
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn run_seccomp_filters(data: &[u8; crate::seccomp::DATA_BYTES]) -> Option<u32> {
+    critical_section::with(|cs| {
+        let filters = HOST_SECCOMP_FILTERS.borrow(cs).borrow();
+        if filters.is_empty() {
+            return None;
+        }
+        let mut answer = crate::seccomp::RET_ALLOW;
+        for program in filters.iter() {
+            answer = crate::seccomp::more_restrictive(answer, program.run(data));
+        }
+        Some(answer)
+    })
 }
 
 /// A host build's one process holds only the group it runs as, and the harness

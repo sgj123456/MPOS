@@ -29,6 +29,11 @@ pub const SIGPIPE: u8 = 13;
 pub const SIGALRM: u8 = 14;
 /// Termination, the polite kind.
 pub const SIGTERM: u8 = 15;
+/// A syscall was made that a `SECCOMP_MODE_FILTER` program refused with
+/// `SECCOMP_RET_TRAP`. It terminates by default like any other unnamed signal,
+/// and the `siginfo_t` a handler is given names the call in `si_syscall` - a
+/// program that catches it is expected to be one that installed the filter.
+pub const SIGSYS: u8 = 31;
 /// A child has stopped or exited. The default action ignores it - which is
 /// why a kernel can boot without ever queueing one - but a shell that
 /// installs a handler of its own waits for exactly this signal, and a task

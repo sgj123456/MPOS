@@ -57,6 +57,12 @@ pub mod pci;
 /// property that matters - that two reads are not the same bytes.
 pub mod rand;
 pub mod sched;
+/// `SECCOMP_MODE_FILTER`'s program: the classic-BPF interpreter, its validation
+/// and the action ordering. Ungated because it is arithmetic over a byte block -
+/// nothing in it knows what a task is - so a host build can run every filter a
+/// test cares to write; the task table and the syscall gate are what decide who
+/// has one and when it runs.
+pub mod seccomp;
 pub mod sync;
 pub mod syscall;
 /// Device events: what the kernel tells userland when a device

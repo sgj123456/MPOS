@@ -347,6 +347,56 @@ pub fn set_seccomp_strict() {
     with_table(|t| t.task_mut(t.current).seccomp_strict = true);
 }
 
+/// Whether the current task has any `SECCOMP_MODE_FILTER` program - what
+/// `PR_GET_SECCOMP` reports as mode 2, and what a caller must be told if it
+/// asks whether it is confined.
+#[cfg(target_os = "none")]
+pub fn has_seccomp_filter() -> bool {
+    with_table(|t| !t.task(t.current).seccomp_filters.is_empty())
+}
+
+/// Install one filter on the current task.
+///
+/// Cumulative and irreversible, both of them Linux's rules: a thread ends up
+/// running every program it has ever installed, and the *most restrictive*
+/// answer among them is the one that counts. That is why this appends rather
+/// than replaces - a sandboxed program installing a second, narrower filter
+/// must not thereby lose the first.
+#[cfg(target_os = "none")]
+pub fn set_seccomp_filter(program: crate::seccomp::Program) {
+    // Armed before the filter is stored, so the gate can never see the list
+    // without knowing to look at it - the same ordering, and the same reason,
+    // as `itimer_swap` setting `ITIMER_ARMED` before it stores the timer.
+    crate::seccomp::arm();
+    with_table(|t| t.task_mut(t.current).seccomp_filters.push(program));
+}
+
+/// Run the current task's filters over one call and answer the action to take,
+/// or `None` when it has none - which is the case the gate must be able to skip
+/// without touching the table at all.
+///
+/// The programs run under the task table's own critical section, with
+/// interrupts off, because that is where the task's state is. The work is
+/// bounded and it has to be: at most `MAX_INSNS` straight-line instructions over
+/// a 64-byte block, no allocation, no I/O and no nested lock. A seccomp filter
+/// gets no second thread to run on, on this kernel or on Linux.
+#[cfg(target_os = "none")]
+pub fn run_seccomp_filters(data: &[u8; crate::seccomp::DATA_BYTES]) -> Option<u32> {
+    with_table(|t| {
+        let filters = &t.task(t.current).seccomp_filters;
+        if filters.is_empty() {
+            return None;
+        }
+        // Allowed until a filter says otherwise, and the strictest answer is
+        // the one taken - so a program can only ever be narrowed by adding one.
+        let mut answer = crate::seccomp::RET_ALLOW;
+        for program in filters {
+            answer = crate::seccomp::more_restrictive(answer, program.run(data));
+        }
+        Some(answer)
+    })
+}
+
 /// The whole limit table of `pid` (`0` = the current process), for
 /// `/proc/<pid>/limits`. `None` if no such task exists.
 #[cfg(target_os = "none")]
@@ -803,6 +853,12 @@ struct Task {
     /// (`SIGKILL`). Once set it cannot be cleared, and it survives `exec` and
     /// is inherited across `fork` - so it is a per-task latch, not a limit.
     seccomp_strict: bool,
+    /// The `SECCOMP_MODE_FILTER` programs this thread has installed, oldest
+    /// first. Cumulative the way Linux's are - a filter can be added and never
+    /// taken away - and every one of them runs on every syscall, with the most
+    /// restrictive answer deciding. Inherited across `fork`/`clone` and left
+    /// alone by `exec`, both of which are the ABI's own rules.
+    seccomp_filters: Vec<crate::seccomp::Program>,
     /// Per-process brk state for heap management. The frames behind the
     /// break's pages are on `user_frames` like every other frame the process
     /// owns; only the bookkeeping of *where* the break is stays here.
@@ -1032,6 +1088,7 @@ impl Task {
             identity: Identity::default(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
+            seccomp_filters: Vec::new(),
             umask: crate::syscall::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
@@ -1375,6 +1432,7 @@ impl Table {
             identity: Identity::default(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
+            seccomp_filters: Vec::new(),
             umask: crate::syscall::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
@@ -1791,6 +1849,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             identity: Identity::default(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
+            seccomp_filters: Vec::new(),
             umask: crate::syscall::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
@@ -1925,6 +1984,10 @@ pub fn try_spawn_user(
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             rlimits: t.task(parent).rlimits,
             seccomp_strict: t.task(parent).seccomp_strict,
+            // A filter is inherited, not shared: the child gets its own copy of
+            // the list, so a filter installed *after* the fork does not appear
+            // in the child, and the parent cannot add to the child's.
+            seccomp_filters: t.task(parent).seccomp_filters.clone(),
             brk_base: loaded.brk,
             brk_pages: 0,
             mmap_cursor: layout.mmap_top,
@@ -5737,6 +5800,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             rlimits: t.task(parent_id).rlimits,
             seccomp_strict: t.task(parent_id).seccomp_strict,
+            seccomp_filters: t.task(parent_id).seccomp_filters.clone(),
             brk_base: parent_brk_base,
             brk_pages: parent_brk_pages,
             mmap_cursor: parent_mmap_cursor,
@@ -6176,6 +6240,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let oom_score_adj_min = parent.oom_score_adj_min;
         let rlimits = parent.rlimits;
         let seccomp_strict = parent.seccomp_strict;
+        let seccomp_filters = parent.seccomp_filters.clone();
         let priority = parent.priority;
         let dispositions = parent.dispositions;
         let cwd = parent.cwd.clone();
@@ -6257,6 +6322,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             oom_score_adj_min,
             rlimits,
             seccomp_strict,
+            seccomp_filters,
             brk_base,
             brk_pages,
             mmap_cursor,

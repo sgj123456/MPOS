@@ -916,10 +916,10 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
 /// `seccomp(op, flags, args)` — the secure-computing mode. Strict mode is
 /// honoured: it latches the thread to the four-call allow-list (`read`,
 /// `write`, `exit`, `sigreturn`) enforced at dispatch, irreversible for the
-/// thread's life. The filter mode still needs a BPF runner this kernel does
-/// not have, so it answers the way a kernel built without it does - ENOSYS -
-/// and the availability probe returns the empty set, so a caller that asks
-/// whether an action is supported is told no rather than left to guess.
+/// thread's life. Filter mode installs a classic-BPF program
+/// (`SECCOMP_SET_MODE_FILTER`), and the availability probe returns the empty
+/// set, so a caller that asks whether an action is supported is told no rather
+/// than left to guess.
 pub fn handle_seccomp(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SET_MODE_STRICT: usize = 0;
     const SET_MODE_FILTER: usize = 1;
@@ -937,7 +937,7 @@ pub fn handle_seccomp(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             crate::sched::set_seccomp_strict();
             0
         }
-        SET_MODE_FILTER => err::ENOSYS,
+        SET_MODE_FILTER => super::abi::install_seccomp_filter(args[2], args[1], from_user),
         GET_ACTION_AVAIL => {
             if args[2] == 0 || !buffer_ok(args[2], 4, true, from_user) {
                 return err::EFAULT;

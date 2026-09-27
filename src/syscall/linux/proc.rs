@@ -34,6 +34,17 @@ pub(super) use crate::syscall::MMAP_BASE;
 /// out here would make every field above it name the word below the one it
 /// means, and a `fork` child would resume with its parent's `rdi` in `r12` and
 /// its `rsi` as the return address.
+/// The user instruction pointer of the call being dispatched: the `rcx` the
+/// syscall gate saved, which is where `sysretq` will resume. `seccomp_data`
+/// carries it, and a filter that inspects it - one checking which of its own
+/// call sites is running - reads the value the kernel recorded rather than a
+/// guess.
+#[cfg(target_os = "none")]
+pub(super) fn user_ip(regs_ptr: *mut ()) -> u64 {
+    let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
+    frame.rcx as u64
+}
+
 #[repr(C)]
 struct RegsFrame {
     rax: usize,      // [rsp+0]   return value / syscall number

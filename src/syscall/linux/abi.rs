@@ -1056,6 +1056,76 @@ pub(crate) fn itimerval_ms(
 // prctl(2): the option this kernel models
 // ---------------------------------------------------------------------------
 
+/// Install one `SECCOMP_MODE_FILTER` program on the calling thread.
+///
+/// One implementation for the two doors Linux puts on the same operation -
+/// `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)` here and `seccomp(2)`'s
+/// `SECCOMP_SET_MODE_FILTER` in `posix` - because a caller must not be able to
+/// reach a different set of checks through each. It lives on this side of the
+/// gate because `posix` is compiled only for the machine while this is compiled
+/// for both, and the install path is exactly what a host test can argue with:
+/// the validation is arithmetic over the caller's bytes.
+///
+/// The program is copied out of the caller's address space and validated *in
+/// full* before anything is stored: a filter that was half-installed would be
+/// worse than one that was refused, because by then the thread has been told it
+/// is confined.
+pub(super) fn install_seccomp_filter(prog_ptr: usize, flags: usize, from_user: bool) -> isize {
+    // No flag is supported. `SECCOMP_FILTER_FLAG_TSYNC` would have to hand the
+    // filter to every thread of the group - a decision about `clone` this
+    // kernel has not made - and an unknown flag must be *refused* rather than
+    // ignored: a caller that asked for one and did not get it believes
+    // something about its own threads that is not true.
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    // Linux lets a privileged caller install a filter, or anyone who has first
+    // given up the right to gain privileges (`PR_SET_NO_NEW_PRIVS`, which this
+    // kernel does not model). Every process in this image is root, so the arm
+    // that matters is the first; a caller that is not root is refused rather
+    // than handed a confinement it could then walk out of. A host build has no
+    // identities to ask and its harness is root by construction - the same
+    // reason `current_owner` answers root there.
+    #[cfg(target_os = "none")]
+    if crate::sched::current_identity().ruid != 0 {
+        return err::EACCES;
+    }
+    // `struct sock_fprog`: a `u16` length, two bytes of padding, then the
+    // pointer to the instructions.
+    const PROG_BYTES: usize = 16;
+    // The null check is not redundant with `buffer_ok`: this kernel's version
+    // validates the range against the caller's own mappings, so address zero
+    // fails it - but a host build has no mappings to ask and answers "fine" to
+    // everything, and a program that then *read* address zero would fault the
+    // harness. Every user-pointer reader here spells the guard out for exactly
+    // that reason.
+    if prog_ptr == 0 || !buffer_ok(prog_ptr, PROG_BYTES, false, from_user) {
+        return err::EFAULT;
+    }
+    let len = unsafe { (prog_ptr as *const u16).read_unaligned() } as usize;
+    let insns = unsafe { ((prog_ptr + 8) as *const u64).read_unaligned() } as usize;
+    let Some(bytes) = len.checked_mul(8) else {
+        return err::EINVAL;
+    };
+    if insns == 0 || !buffer_ok(insns, bytes, false, from_user) {
+        return err::EFAULT;
+    }
+    // Safety: the range was just checked against the caller's own mappings, so
+    // the bytes are readable - and they are read once, here, rather than
+    // re-read per syscall on the fast path the filter then runs on.
+    let raw = unsafe { core::slice::from_raw_parts(insns as *const u8, bytes) };
+    match crate::seccomp::Program::parse(raw) {
+        Ok(program) => {
+            crate::sched::set_seccomp_filter(program);
+            0
+        }
+        // Every way a program can be wrong is `EINVAL` - Linux's answer for a
+        // malformed filter, and the one errno a caller cannot read as
+        // "installed".
+        Err(_) => err::EINVAL,
+    }
+}
+
 /// `prctl(option, ...)` — the miscellaneous process-control call.
 ///
 /// `PR_GET_NAME` (16) is the one userland actually exercises here. The
@@ -1067,6 +1137,7 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     const PR_GET_NAME: usize = 16;
     const NAME_LEN: usize = 16;
     const SECCOMP_MODE_STRICT: usize = 1;
+    const SECCOMP_MODE_FILTER: usize = 2;
     match args[0] {
         PR_GET_NAME => {
             let buf = args[1];
@@ -1076,20 +1147,30 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
             unsafe { core::ptr::write_bytes(buf as *mut u8, 0, NAME_LEN) };
             0
         }
-        // The seccomp pair is the older spelling of the same latch the
-        // `seccomp(2)` syscall sets. `PR_GET_SECCOMP` answers 0 while
-        // unconfined and 1 (`SECCOMP_MODE_STRICT`) once latched; the BPF
-        // filter mode is not implemented, so asking to enter it is refused
-        // rather than silently ignored.
-        PR_GET_SECCOMP => crate::sched::current_is_seccomp_strict() as isize,
-        PR_SET_SECCOMP => {
-            if args[1] == SECCOMP_MODE_STRICT {
-                crate::sched::set_seccomp_strict();
-                0
+        // The seccomp pair is the older spelling of what the `seccomp(2)`
+        // syscall does. `PR_GET_SECCOMP` answers 0 while unconfined, 1
+        // (`SECCOMP_MODE_STRICT`) once latched and 2 (`SECCOMP_MODE_FILTER`)
+        // once a program is installed - and a thread cannot be in both at
+        // once, because strict mode would have killed the `prctl` that tried
+        // to add a filter.
+        PR_GET_SECCOMP => {
+            if crate::sched::has_seccomp_filter() {
+                2
             } else {
-                err::ENOSYS
+                crate::sched::current_is_seccomp_strict() as isize
             }
         }
+        PR_SET_SECCOMP => match args[1] {
+            SECCOMP_MODE_STRICT => {
+                crate::sched::set_seccomp_strict();
+                0
+            }
+            // The same operation `seccomp(2)` performs, through the other
+            // door: it takes no flags here, because the legacy spelling has
+            // nowhere to put them.
+            SECCOMP_MODE_FILTER => install_seccomp_filter(args[2], 0, true),
+            _ => err::EINVAL,
+        },
         _ => 0,
     }
 }
@@ -2267,21 +2348,28 @@ mod tests {
     }
 
     /// The `PR_SET_SECCOMP` / `PR_GET_SECCOMP` pair latches strict mode the
-    /// same one-way way the `seccomp(2)` syscall does, and refuses the BPF
-    /// filter mode this kernel has no matcher for.
+    /// same one-way way the `seccomp(2)` syscall does, and refuses a filter
+    /// mode asked for with no program to install.
     #[test]
-    fn prctl_seccomp_latches_strict_and_refuses_filter() {
+    fn prctl_seccomp_latches_strict_and_refuses_a_filter_with_no_program() {
         const PR_GET_SECCOMP: usize = 21;
         const PR_SET_SECCOMP: usize = 22;
         const STRICT: usize = 1;
         const FILTER: usize = 2;
 
-        // Asking to enter the filter mode is refused, not ignored: a caller
-        // that believes it installed a BPF program must not be left thinking
-        // it is confined when it is not.
+        // Asking to enter the filter mode with no program to install is refused
+        // rather than ignored: a caller that believes it installed a BPF program
+        // must not be left thinking it is confined. What it is refused *with*
+        // is a bad-pointer error rather than "unsupported" - the mode exists now,
+        // and the interpreter behind it is argued with in `seccomp`'s tests.
+        //
+        // A real install is deliberately not done here: the host harness keeps
+        // one filter list for the whole test binary, so a filter installed by
+        // this test would change the answer every later test in the binary reads
+        // back from `PR_GET_SECCOMP`.
         assert_eq!(
             handle_prctl([PR_SET_SECCOMP, FILTER, 0, 0, 0, 0]),
-            crate::syscall::err::ENOSYS
+            crate::syscall::err::EFAULT
         );
 
         // Strict mode takes, the read-back says so, and it stays said - the

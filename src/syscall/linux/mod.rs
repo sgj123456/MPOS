@@ -86,6 +86,57 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         crate::sched::send_signal(crate::sched::current(), crate::sched::signal::SIGKILL);
         return err::ENOSYS;
     }
+    // And a `SECCOMP_MODE_FILTER` program decides *before* the table does, for
+    // the same reason strict mode does: the filtered call must not run at all.
+    // The whole check sits behind one relaxed load of a machine-wide flag, so a
+    // machine that never installs a filter - every boot in this image - pays
+    // nothing for the feature.
+    if crate::seccomp::any_installed() {
+        let mut data_args = [0u64; 6];
+        for (slot, arg) in data_args.iter_mut().zip(args) {
+            *slot = arg as u64;
+        }
+        let data = crate::seccomp::data_bytes(nr as i32, proc::user_ip(regs_ptr), data_args);
+        if let Some(answer) = crate::sched::run_seccomp_filters(&data) {
+            use crate::seccomp as sc;
+            match sc::action(answer) {
+                // Allow, and the log action that also allows: this kernel has
+                // one loglevel and no per-filter audit sink, so a filter asking
+                // for its decision to be recorded gets the decision.
+                sc::RET_ALLOW | sc::RET_LOG => {}
+                // `TRACE` with no tracer attached is an allow, which is the
+                // ABI's own rule - the program is waiting for a supervisor
+                // that never came, and refusing the call would hang it.
+                sc::RET_TRACE => {}
+                sc::RET_ERRNO => return -(sc::action_data(answer) as isize),
+                sc::RET_TRAP => {
+                    // `SIGSYS`, and the call does not happen: a program that
+                    // catches it and returns from the handler resumes *after*
+                    // the syscall, which is what makes this a usable
+                    // single-step hook.
+                    crate::sched::send_signal(
+                        crate::sched::current(),
+                        crate::sched::signal::SIGSYS,
+                    );
+                    return err::ENOSYS;
+                }
+                sc::RET_KILL_THREAD | sc::RET_KILL_PROCESS => {
+                    // This kernel has no threads to kill apart from the
+                    // process's, so the two are the same act here.
+                    crate::sched::send_signal(
+                        crate::sched::current(),
+                        crate::sched::signal::SIGKILL,
+                    );
+                    return err::ENOSYS;
+                }
+                // `USER_NOTIF` asks for a supervisor this kernel has no way to
+                // summon, and an action it does not know must not be allowed by
+                // default: both refuse the call, which is the safe direction to
+                // be wrong in.
+                _ => return err::ENOSYS,
+            }
+        }
+    }
     let ret = match nr {
         // --- file I/O: Linux argument shapes ---
         nr::READ => fs::handle_read(args, from_user),
