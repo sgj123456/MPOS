@@ -511,4 +511,91 @@ mod tests {
         assert!(find_rootfs(disk.clone()).is_none(), "there is no third");
         assert!(find_data(disk).is_none(), "there is no fourth");
     }
+
+    /// `has_ext2` asks the device two questions at once: is the magic at the
+    /// field, and is the device long enough to hold that field. The second is
+    /// not decoration - a read past the end is a driver panic, and a short
+    /// device cannot hold the filesystem either way.
+    #[test]
+    fn has_ext2_needs_a_magic_it_can_actually_reach() {
+        let disk = Fake::new(64);
+        assert!(!has_ext2(&disk, 0), "nothing has been written yet");
+        disk.put_ext2(0);
+        assert!(has_ext2(&disk, 0));
+        assert!(
+            !has_ext2(&disk, 2048),
+            "the field on a partition that holds nothing"
+        );
+
+        // One sector is shorter than the superblock's own magic field.
+        let too_short = Fake::new(1);
+        assert!(!has_ext2(&too_short, 0));
+    }
+
+    /// An MBR's four slots are read in order, and a slot with no start or no
+    /// length is not a partition - which is how an empty slot spells itself.
+    #[test]
+    fn mbr_entries_read_the_four_slots_in_order() {
+        let mut mbr = [0u8; SECTOR as usize];
+        let set = |mbr: &mut [u8; SECTOR as usize], slot: usize, start: u32, len: u32| {
+            let at = 446 + slot * 16;
+            mbr[at + 8..at + 12].copy_from_slice(&start.to_le_bytes());
+            mbr[at + 12..at + 16].copy_from_slice(&len.to_le_bytes());
+        };
+        set(&mut mbr, 1, 100, 40);
+        set(&mut mbr, 2, 300, 0); // a length of zero is not a partition
+        set(&mut mbr, 3, 200, 8);
+        assert_eq!(mbr_entries(&mbr), vec![(100, 40), (200, 8)]);
+    }
+
+    /// A GPT's stride is fixed by the format. Anything narrower than an entry,
+    /// or not a power of two, is a table this reader refuses rather than
+    /// guesses at - a wrong stride reads partition boundaries out of the
+    /// middle of another field.
+    #[test]
+    fn gpt_entries_refuse_a_stride_the_format_does_not_allow() {
+        let disk = Fake::new(4096);
+        // A protective MBR, which is what says "a GPT follows".
+        let mut mbr = [0u8; SECTOR as usize];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        mbr[446 + 4] = 0xEE;
+        disk.put(0, &mbr);
+
+        let header = |stride: u32, count: u32| {
+            let mut header = [0u8; SECTOR as usize];
+            header[0..8].copy_from_slice(b"EFI PART");
+            header[72..80].copy_from_slice(&2u64.to_le_bytes()); // table at LBA 2
+            header[80..84].copy_from_slice(&count.to_le_bytes());
+            header[84..88].copy_from_slice(&stride.to_le_bytes());
+            header
+        };
+
+        // A stride the format allows is walked: two entries, each a type GUID
+        // (all-zero means "nobody has claimed it") and a first and last LBA.
+        disk.put(SECTOR, &header(128, 2));
+        let mut table = [0u8; SECTOR as usize];
+        table[0..16].fill(0xff); // entry 0 is claimed
+        table[32..40].copy_from_slice(&10u64.to_le_bytes());
+        table[40..48].copy_from_slice(&29u64.to_le_bytes());
+        table[128..144].fill(0xff); // entry 1 is claimed
+        table[128 + 32..128 + 40].copy_from_slice(&40u64.to_le_bytes());
+        table[128 + 40..128 + 48].copy_from_slice(&59u64.to_le_bytes());
+        disk.put(2 * SECTOR, &table);
+        assert_eq!(partitions(&disk), vec![(10, 20), (40, 20)]);
+
+        // Anything narrower than an entry, or not a power of two, is no table
+        // at all. (The spec allows any power of two from 128 up, so 256 would
+        // be walked and is not in this list.)
+        for stride in [64u32, 100, 127] {
+            disk.put(SECTOR, &header(stride, 2));
+            assert!(partitions(&disk).is_empty(), "stride {stride} was walked");
+        }
+
+        // And a header without its signature is not a GPT header.
+        let mut header = header(128, 2);
+        header[0..8].copy_from_slice(b"NOT PART");
+        disk.put(SECTOR, &header);
+        assert!(partitions(&disk).is_empty());
+    }
 }
