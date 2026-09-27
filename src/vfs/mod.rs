@@ -671,6 +671,22 @@ pub trait Inode: Send + Sync {
         0
     }
 
+    /// Record how many names reach this node - the writing half of
+    /// [`Self::nlink`], and the bookkeeping [`Self::link`] owes.
+    ///
+    /// The two halves are separate calls because they live on separate nodes:
+    /// the *directory* makes the second edge and is the only node that can see
+    /// both ends, while the number belongs to the *target*. A filesystem that
+    /// stores the count on disk - ext4's `i_links_count` - moves it inside its
+    /// own `link` and `unlink` and has nothing to add here; this is for the
+    /// in-memory filesystems, whose nodes hold the number themselves.
+    ///
+    /// The default does nothing, like [`Self::set_mode`] on a filesystem that
+    /// keeps no modes: a node that does not track a count cannot be told one.
+    fn set_nlink(&self, links: u64) {
+        let _ = links;
+    }
+
     /// The permission bits (the low twelve) the filesystem stores for this
     /// node, or `0` when it carries none - the caller then falls back to what
     /// the node's kind implies. The disk filesystems carry the real thing,

@@ -283,6 +283,13 @@ struct RamFile {
     /// reference goes.
     fs: Arc<Usage>,
     ino: Ino,
+    /// How many names reach it - one at creation, one more per `link`. The
+    /// last name going leaves `0`, which the trait's getter reads as "counts
+    /// nothing"... and which `abi::nlink_of` reads as "does not track one" and
+    /// answers `1` for. An unlinked file still held open therefore reports the
+    /// one name it was created under rather than Linux's `0`, the price of a
+    /// getter whose zero is a sentinel.
+    links: Mutex<Cell<u64>>,
     /// The permission bits, once anybody set them. `None` until then - which
     /// `abi::mode_of` reads as "this filesystem keeps none" and answers the
     /// kind's default for - and `Some(0)` after a `chmod 000`, which is a
@@ -318,6 +325,63 @@ impl Drop for RamFile {
     fn drop(&mut self) {
         self.fs.release(self.len() as u64);
     }
+}
+
+/// How many names reach a node, and the writing half of that count.
+///
+/// A hard link is a second edge to the same `Arc`, so the node is shared by
+/// both names and the number belongs to it. The *directory* is what makes the
+/// edge and the only node that sees both ends, which is why the trait carries
+/// a setter for the count as well as a getter for it. A directory is not
+/// linkable, so `RamDir` has neither and keeps the trait's fallback.
+macro_rules! counts_its_names {
+    () => {
+        fn nlink(&self) -> u64 {
+            critical_section::with(|cs| self.links.borrow(cs).get())
+        }
+        fn set_nlink(&self, links: u64) {
+            critical_section::with(|cs| self.links.borrow(cs).set(links));
+        }
+    };
+}
+
+/// The operations that make a name, answered by a node that cannot hold one.
+///
+/// A path is walked before a name is made in it, and a walk that reaches
+/// something which is not a directory is `ENOTDIR` on Linux. The trait's own
+/// default is `Unsupported` instead, which reads to a caller as "this
+/// filesystem cannot make sockets" rather than "this component is a file" -
+/// `bind` under a plain file and `open(O_CREAT)` under one both answered
+/// `EOPNOTSUPP` where Linux answers `ENOTDIR`. The resolver already says
+/// `NotDir` for a non-directory in the *middle* of a path; this is the same
+/// fact for the component that ends it. `RamDir` is the only node here that
+/// holds names, so every other node says so in one word through this.
+macro_rules! names_live_in_dirs {
+    () => {
+        fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+            let _ = (name, kind);
+            Err(VfsError::NotDir)
+        }
+        fn create_tmpfile(&self) -> VfsResult<Arc<dyn Inode>> {
+            Err(VfsError::NotDir)
+        }
+        fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
+            let _ = (name, target);
+            Err(VfsError::NotDir)
+        }
+        fn unlink(&self, name: &str) -> VfsResult<()> {
+            let _ = name;
+            Err(VfsError::NotDir)
+        }
+        fn rmdir(&self, name: &str) -> VfsResult<()> {
+            let _ = name;
+            Err(VfsError::NotDir)
+        }
+        fn link(&self, name: &str, target: &Arc<dyn Inode>) -> VfsResult<()> {
+            let _ = (name, target);
+            Err(VfsError::NotDir)
+        }
+    };
 }
 
 impl Inode for RamFile {
@@ -375,7 +439,7 @@ impl Inode for RamFile {
         let at = now();
         // Room first, bytes second: asking the kernel heap for a write the
         // mount has no room for is the failure this ordering exists to prevent.
-        let grows_to = (offset as usize).max(0) + buf.len();
+        let grows_to = (offset as usize) + buf.len();
         let current = self.len();
         if grows_to > current && !self.fs.charge((grows_to - current) as u64) {
             return Err(VfsError::NoSpace);
@@ -413,12 +477,17 @@ impl Inode for RamFile {
         });
         Ok(())
     }
+
+    counts_its_names!();
+    names_live_in_dirs!();
 }
 
 /// A directory: name edges, aka the dentries of this filesystem.
 /// A symbolic link: nothing but the path it stands for.
 struct RamSymlink {
     ino: Ino,
+    /// How many names reach it: one, plus one per `link` of the link itself.
+    links: Mutex<Cell<u64>>,
     /// The moment the link was made - all the clock a link, which has no
     /// contents to rewrite, can have.
     mtime: u64,
@@ -441,6 +510,9 @@ impl Inode for RamSymlink {
     fn readlink(&self) -> VfsResult<String> {
         Ok(self.target.clone())
     }
+
+    counts_its_names!();
+    names_live_in_dirs!();
 }
 
 /// A device node a `mknod` made: a name carrying a device kind.
@@ -452,6 +524,9 @@ impl Inode for RamSymlink {
 /// of a null device and a harmless one for anything nobody has opened yet.
 struct RamDev {
     ino: Ino,
+    /// How many names reach it: a `mknod` placeholder can be linked like any
+    /// other node.
+    links: Mutex<Cell<u64>>,
 }
 
 impl Inode for RamDev {
@@ -470,6 +545,9 @@ impl Inode for RamDev {
     fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
         Ok(buf.len())
     }
+
+    counts_its_names!();
+    names_live_in_dirs!();
 }
 
 /// A socket node: a name `bind(2)` made for a connection endpoint. It
@@ -479,6 +557,8 @@ impl Inode for RamDev {
 /// Linux's `ENXIO` from the read/write refusals below.
 struct RamSocket {
     ino: Ino,
+    /// How many names reach it - the bound path, and any `link` of it.
+    links: Mutex<Cell<u64>>,
     /// The moment `bind` planted the name; a socket's own clock has nothing
     /// else to say about it.
     mtime: u64,
@@ -533,6 +613,9 @@ impl Inode for RamSocket {
     fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
         Err(VfsError::NoDevice)
     }
+
+    counts_its_names!();
+    names_live_in_dirs!();
 }
 
 struct RamDir {
@@ -605,6 +688,7 @@ impl Inode for RamDir {
             NodeKind::File => Arc::new(RamFile {
                 fs: self.fs.clone(),
                 ino: fresh_ino(),
+                links: Mutex::new(Cell::new(1)),
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
                 mtime: Mutex::new(Cell::new(at)),
@@ -620,11 +704,15 @@ impl Inode for RamDir {
             }),
             // A device node mknod made: a placeholder until a devtmpfs mount
             // covers the directory with driver-backed devices.
-            NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev { ino: fresh_ino() }),
+            NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev {
+                ino: fresh_ino(),
+                links: Mutex::new(Cell::new(1)),
+            }),
             // A socket name, made by `bind` alone. Its clock is the bind;
             // `connect` looks up the node's identity, never its bytes.
             NodeKind::Socket => Arc::new(RamSocket {
                 ino: fresh_ino(),
+                links: Mutex::new(Cell::new(1)),
                 mtime: now(),
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
@@ -648,6 +736,7 @@ impl Inode for RamDir {
         let at = now();
         let node: Arc<dyn Inode> = Arc::new(RamSymlink {
             ino: fresh_ino(),
+            links: Mutex::new(Cell::new(1)),
             mtime: at,
             target: String::from(target),
         });
@@ -681,7 +770,12 @@ impl Inode for RamDir {
             entries.remove(name).map(|_| ()).ok_or(VfsError::NoEntry)?;
             self.mtime.borrow(cs).set(at);
             Ok(())
-        })
+        })?;
+        // The name is gone, so one fewer reaches the node - `st_nlink` follows
+        // the edge count, which is what tells `ln` and `rm -i` a file has
+        // another name. Floored at the trait's zero, "counts nothing".
+        child.set_nlink(child.nlink().saturating_sub(1));
+        Ok(())
     }
 
     /// A hard link: a second name edge to the node another name already
@@ -703,7 +797,12 @@ impl Inode for RamDir {
             entries.insert(alloc::string::String::from(name), target.clone());
             self.mtime.borrow(cs).set(at);
             Ok(())
-        })
+        })?;
+        // The second edge is up, so `st_nlink` is one more for both names -
+        // the target's own count, since both names reach the same node. A
+        // node that does not track one is not told (the setter's default).
+        target.set_nlink(target.nlink() + 1);
+        Ok(())
     }
 
     /// Drop the name edge to an **empty** directory.
@@ -1034,6 +1133,71 @@ mod tests {
         // A file has no entries to list.
         let file = root.lookup("a").unwrap();
         assert_eq!(file.read_dir().unwrap_err(), VfsError::NotDir);
+    }
+
+    #[test]
+    fn a_second_name_raises_the_link_count_and_unlinking_lowers_it() {
+        let fs = RamFs::new();
+        let root = fs.root();
+        let file = root.create("a", NodeKind::File).unwrap();
+        assert_eq!(file.nlink(), 1, "a created file has the one name");
+
+        root.link("b", &file).unwrap();
+        assert_eq!(file.nlink(), 2, "the second name reaches the same node");
+        assert_eq!(
+            root.lookup("b").unwrap().nlink(),
+            2,
+            "and both names report it"
+        );
+
+        root.unlink("b").unwrap();
+        assert_eq!(file.nlink(), 1, "dropping a name drops the count");
+
+        // A `mknod` placeholder and a bound socket name are counted too: they
+        // are nodes like any other, and a link to one is a real second name.
+        let dev = root.create("d", NodeKind::CharDev).unwrap();
+        assert_eq!(dev.nlink(), 1);
+        root.link("d2", &dev).unwrap();
+        assert_eq!(dev.nlink(), 2);
+        let sock = root.create("s", NodeKind::Socket).unwrap();
+        assert_eq!(sock.nlink(), 1);
+        root.link("s2", &sock).unwrap();
+        assert_eq!(sock.nlink(), 2);
+    }
+
+    #[test]
+    fn a_node_that_is_not_a_directory_refuses_names_with_not_dir() {
+        // The trait's own default for these answers `Unsupported`, which reads
+        // as "this filesystem cannot make that kind of thing". Linux refuses
+        // the *walk* at the component that is not a directory, so a `bind` or
+        // an `open(O_CREAT)` under a plain file has to hear `ENOTDIR` - and
+        // this is the one place the distinction can be pinned.
+        let fs = RamFs::new();
+        let root = fs.root();
+        let file = root.create("f", NodeKind::File).unwrap();
+        assert_eq!(
+            file.create("x", NodeKind::File).err(),
+            Some(VfsError::NotDir)
+        );
+        assert_eq!(file.create_tmpfile().err(), Some(VfsError::NotDir));
+        assert_eq!(file.symlink("x", "y").err(), Some(VfsError::NotDir));
+        assert_eq!(file.unlink("f").err(), Some(VfsError::NotDir));
+        assert_eq!(file.rmdir("f").err(), Some(VfsError::NotDir));
+        assert_eq!(file.link("x", &file).err(), Some(VfsError::NotDir));
+
+        // A link is refused the same way, and so is a bound socket's name.
+        let link = root.symlink("l", "nowhere").unwrap();
+        assert_eq!(
+            link.create("x", NodeKind::File).err(),
+            Some(VfsError::NotDir)
+        );
+        assert_eq!(link.unlink("l").err(), Some(VfsError::NotDir));
+        let sock = root.create("s", NodeKind::Socket).unwrap();
+        assert_eq!(
+            sock.create("x", NodeKind::File).err(),
+            Some(VfsError::NotDir)
+        );
+        assert_eq!(sock.unlink("s").err(), Some(VfsError::NotDir));
     }
 
     #[test]
