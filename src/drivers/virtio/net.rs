@@ -167,6 +167,10 @@ impl VirtioNet {
             device.enable_interrupts();
         }
 
+        // The device is this driver's from here, which is what `lspci -k`
+        // reads back.
+        pci::claim(&func, super::PCI_DRIVER);
+
         Some(Arc::new(VirtioNet {
             device: Mutex::new(RefCell::new(device)),
             mac,

@@ -7,9 +7,12 @@
 //! must place. Parsing is bytes in, image out, so it is unit-tested on the
 //! host; only the loading of a parsed image touches the machine. What is
 //! accepted is deliberately narrow: a statically linked `ET_EXEC` or `ET_DYN`
-//! whose `PT_LOAD` segments say exactly where each piece goes. That is what a
-//! freestanding user program links to, and anything more - dynamic linking,
-//! PIE with a base - waits until something needs it.
+//! whose `PT_LOAD` segments say where each piece goes relative to a base. The
+//! first kind's base is the one its header implies and the loader must honour;
+//! the second kind is placed wherever the loader likes, which is what makes
+//! address randomisation possible. Dynamic linking - following `PT_INTERP` and
+//! letting the interpreter finish the job - is the third thing this accepts, and
+//! the kernel does no part of *that* relocation itself.
 
 use alloc::vec::Vec;
 use elf::ElfBytes;
@@ -37,6 +40,17 @@ pub struct Image<'a> {
     pub phnum: usize,
     /// Size of each program header entry (for AT_PHENT auxv).
     pub phent: usize,
+    /// Whether the image's addresses are positions rather than destinations.
+    ///
+    /// This is `ET_DYN`, and it is the loader's whole basis for moving a
+    /// program: an image that says `ET_EXEC` names the address each piece must
+    /// be at - a binary that was linked to sit at `0x400000` has jumps to
+    /// `0x400000`-plus-offset baked into it - while a position-independent one
+    /// carries `R_X86_64_RELATIVE` records precisely so that it can be placed
+    /// anywhere. Linux honours the same split, and honours it the same way: a
+    /// `ET_DYN` load address is randomised per `exec`, an `ET_EXEC` one is not
+    /// randomised at all.
+    pub pie: bool,
     /// R_X86_64_RELATIVE relocations: (virtual address, addend).
     /// The loader must write `addend` at `offset` after mapping segments.
     pub rela: Vec<(usize, i64)>,
@@ -84,10 +98,11 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     if file.ehdr.class != Class::ELF64 {
         return None;
     }
-    // Accept ET_EXEC (fixed-address) and ET_DYN (static-pie). Both are
-    // statically linked and need no relocation processing beyond the
-    // R_X86_64_RELATIVE entries: ET_DYN segments have vaddrs that are
-    // absolute (base 0 for static-pie), so the loader can map them directly.
+    // Accept ET_EXEC (fixed-address) and ET_DYN (position independent). Both
+    // are statically parseable: the segments say what each piece is, and the
+    // only difference is whether the addresses in them are destinations or
+    // offsets. `pie` records which, and the loader is the code that has to act
+    // on it - an ET_EXEC mapped somewhere else would jump to where it *was*.
     if file.ehdr.e_type != ET_EXEC && file.ehdr.e_type != ET_DYN {
         return None;
     }
@@ -168,10 +183,43 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
             .unwrap_or(bytes.len());
         (!bytes[..end].is_empty()).then(|| Vec::from(&bytes[..end]))
     });
+
+    // Every relocation *the kernel* will apply has to land inside something this
+    // image actually mapped. `DT_RELA` is the one table read without checking it
+    // against the segments, so an entry outside them hands `apply_rela` an
+    // address the file chose and the kernel never placed - a write beside the
+    // program rather than into it.
+    //
+    // Asked of `interp` rather than of `PT_INTERP` itself, because that is the
+    // question the loader asks: `load_user` runs its relocation pass when there
+    // is no interpreter image to hand the job to, and an empty `PT_INTERP`
+    // yields no interpreter rather than a zero-length one. Checking the raw
+    // segment would skip the check on exactly the file the loader still
+    // relocates itself.
+    //
+    // Measured against `memsz`, not `filesz`: a `R_X86_64_RELATIVE` most often
+    // lands in `.got` or `.data.rel.ro`, and the tail of the last segment is
+    // `.bss`, which has no file bytes at all to be inside.
+    if interp.is_none()
+        && rela.iter().any(|&(offset, _)| {
+            !segments.iter().any(|s| {
+                s.vaddr <= offset
+                    && offset
+                        .checked_add(core::mem::size_of::<u64>())
+                        .is_some_and(|end| end <= s.vaddr + s.memsz)
+            })
+        })
+    {
+        return None;
+    }
+
     Some(Image {
         entry: entry as usize,
         segments,
         phdr_addr,
+        // Only a position-independent image may be placed elsewhere: the
+        // addresses an `ET_EXEC` names are the ones its own code refers to.
+        pie: file.ehdr.e_type == ET_DYN,
         phnum: file.ehdr.e_phnum as usize,
         phent: file.ehdr.e_phentsize as usize,
         rela,
@@ -373,6 +421,22 @@ mod tests {
         assert!(parse(&bytes).is_none(), "the kernel half is not loadable");
     }
 
+    /// The one bit of the header that decides where the loader may put the
+    /// image. `ET_EXEC` names addresses its own instructions refer to, so it is
+    /// placed where it says; `ET_DYN` carries relocations precisely so that it
+    /// can be placed anywhere, which is what makes per-process randomisation
+    /// possible at all - and applying it to the first kind would produce a
+    /// program that cannot run rather than one that is hard to attack.
+    #[test]
+    fn only_a_position_independent_image_moved_from_its_named_addresses() {
+        let bytes = elf(0x400_000, &[(PT_LOAD, 5, 0x400_000, 0x100, b"code")]);
+        assert!(!parse(&bytes).expect("parses").pie, "ET_EXEC");
+
+        let mut dyn_bytes = bytes.clone();
+        dyn_bytes[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        assert!(parse(&dyn_bytes).expect("parses").pie, "ET_DYN");
+    }
+
     #[test]
     fn a_static_image_names_no_interpreter() {
         let bytes = elf(0x400_078, &[(PT_LOAD, 6, 0x400_000, 0x120, b"program")]);
@@ -429,12 +493,14 @@ mod tests {
     fn the_relative_relocations_are_the_ones_the_loader_reads() {
         // The table sits 16 bytes into the load segment, so reading it means
         // translating a virtual address to a file offset rather than assuming
-        // it starts at the segment.
+        // it starts at the segment. The addresses it relocates are in a second
+        // one - which is where a real static-pie puts them, in `.data` rather
+        // than beside the table that describes them.
         let mut table = Vec::new();
         table.extend_from_slice(&[0u8; 16]);
-        table.extend_from_slice(&rela(0x2000, 8, 0x1234)); // R_X86_64_RELATIVE
-        table.extend_from_slice(&rela(0x3000, 1, 0x99)); // some other kind
-        table.extend_from_slice(&rela(0x4000, 8, -8)); // relative again
+        table.extend_from_slice(&rela(0x3010, 8, 0x1234)); // R_X86_64_RELATIVE
+        table.extend_from_slice(&rela(0x9000, 1, 0x99)); // some other kind
+        table.extend_from_slice(&rela(0x3020, 8, -8)); // relative again
 
         let mut dynamic = Vec::new();
         dynamic.extend_from_slice(&dyn_entry(7, 0x1000 + 16)); // DT_RELA
@@ -447,10 +513,55 @@ mod tests {
             &[
                 (PT_LOAD, 6, 0x1000, 0x200, &table),
                 (PT_DYNAMIC, 6, 0x2000, 0x100, &dynamic),
+                (PT_LOAD, 6, 0x3000, 0x100, b"data"),
             ],
         );
         let image = parse(&bytes).expect("parses");
-        assert_eq!(image.rela, vec![(0x2000, 0x1234), (0x4000, -8)]);
+        assert_eq!(image.rela, vec![(0x3010, 0x1234), (0x3020, -8)]);
+    }
+
+    /// A `R_X86_64_RELATIVE` whose target is inside no loaded segment is a
+    /// write to an address the image named and the kernel never placed, so the
+    /// loader would apply it beside the program - into whatever else is mapped
+    /// there. Nothing in an ELF link map can produce this, which is the point
+    /// of refusing the file rather than skipping the entry: a table that
+    /// claims it is a table this image is not.
+    #[test]
+    fn a_relocation_target_outside_every_segment_refuses_the_image() {
+        let mut table = Vec::new();
+        table.extend_from_slice(&rela(0x9000, 8, 0x1234));
+
+        let mut dynamic = Vec::new();
+        dynamic.extend_from_slice(&dyn_entry(7, 0x1000)); // DT_RELA
+        dynamic.extend_from_slice(&dyn_entry(8, 24)); // DT_RELASZ
+        dynamic.extend_from_slice(&dyn_entry(9, 24)); // DT_RELAENT
+        dynamic.extend_from_slice(&dyn_entry(0, 0));
+
+        let bytes = elf(
+            0x1000,
+            &[
+                (PT_LOAD, 6, 0x1000, 0x100, &table),
+                (PT_DYNAMIC, 6, 0x2000, 0x100, &dynamic),
+            ],
+        );
+        assert!(parse(&bytes).is_none(), "0x9000 is in no segment");
+
+        // The entry has to fit its segment rather than merely start in it: a
+        // target four bytes from the end would put half of the `u64` outside,
+        // and the tail of the last segment is the one place that happens.
+        let mut edge = Vec::new();
+        edge.extend_from_slice(&rela(0x1000 + 0x100 - 4, 8, 0x1234));
+        let dynamic_at_edge = elf(
+            0x1000,
+            &[
+                (PT_LOAD, 6, 0x1000, 0x100, &edge),
+                (PT_DYNAMIC, 6, 0x2000, 0x100, &dynamic),
+            ],
+        );
+        assert!(
+            parse(&dynamic_at_edge).is_none(),
+            "a relocation that runs past the end of its segment"
+        );
     }
 
     /// A record size the loader does not use is a file it must not guess at:

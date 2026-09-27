@@ -27,6 +27,15 @@ pub mod rng;
 pub mod sound;
 pub mod vsock;
 
+/// The name a virtio function's driver has in `/sys`, and the one `lspci -k`
+/// prints as "Kernel driver in use".
+///
+/// One name for all of them, because that is what Linux has: `virtio-pci` is
+/// the PCI driver, and the block device, the network adapter and the rest are
+/// *children* of it. What a device's `driver` link names is the thing that
+/// claimed the PCI function, not the thing that claimed the disk.
+pub const PCI_DRIVER: &str = "virtio-pci";
+
 /// The task that keeps the polled devices moving between userland calls.
 ///
 /// Two families need it: the input devices, whose events arrive whether

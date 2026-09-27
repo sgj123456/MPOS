@@ -913,6 +913,53 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     node
 }
 
+/// The range Linux lets `oom_score_adj` take - `OOM_SCORE_ADJ_MIN` and
+/// `OOM_SCORE_ADJ_MAX`, the two ends of the scale the OOM killer scores on.
+#[cfg(target_os = "none")]
+const OOM_SCORE_ADJ_MIN: i32 = -1000;
+#[cfg(target_os = "none")]
+const OOM_SCORE_ADJ_MAX: i32 = 1000;
+
+/// `/proc/<pid>/oom_score_adj`: the score adjustment itself, with the floor
+/// Linux's `oom_score_adj_write` keeps beside it.
+///
+/// Three answers a caller can tell apart, and each is Linux's: a value that is
+/// not a number or is outside the scale is `EINVAL` - `kstrtoint` refuses both
+/// and the man page says the range outright. A process that has gone is
+/// `ENOENT`, which is why the read is a generator that can fail rather than a
+/// string: a write that races an exit has to report the vanished file, not
+/// quietly succeed. And going below the floor the process has already been
+/// given needs `CAP_SYS_RESOURCE`; this kernel has no capability set, so uid 0
+/// is the reading of it - the same rule every other DAC check here already
+/// applies, and a non-root writer hears `EACCES`.
+#[cfg(target_os = "none")]
+fn oom_score_adj_ctl(pid: usize) -> Arc<dyn Inode> {
+    Arc::new(ProcCtl {
+        ino: next_ino(),
+        read: Box::new(move || {
+            crate::sched::oom_score_adj_of(pid).map(|(value, _)| alloc::format!("{value}\n"))
+        }),
+        write: Box::new(move |text: &str| {
+            let Ok(value) = text.parse::<i32>() else {
+                return Err(VfsError::Invalid);
+            };
+            if !(OOM_SCORE_ADJ_MIN..=OOM_SCORE_ADJ_MAX).contains(&value) {
+                return Err(VfsError::Invalid);
+            }
+            let Some((_, floor)) = crate::sched::oom_score_adj_of(pid) else {
+                return Err(VfsError::NoEntry);
+            };
+            if value < floor && crate::sched::current_owner().0 != 0 {
+                return Err(VfsError::Access);
+            }
+            if !crate::sched::set_oom_score_adj(pid, value) {
+                return Err(VfsError::NoEntry);
+            }
+            Ok(())
+        }),
+    })
+}
+
 /// `/proc/<pid>`: the directory a process is described by.
 ///
 /// Built when the name is looked up and thrown away when the next lookup
@@ -948,6 +995,18 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
         maybe_file(move || cmdline_of(pid)),
     );
     node.add("status", NodeKind::File, maybe_file(move || status_of(pid)));
+    // `/proc/<pid>/oom_score_adj` - the OOM-killer's score adjustment, which
+    // `udevd`'s workers push down on every boot so the device database is not
+    // the first thing killed. Linux keeps a *pair* here: the value, and the
+    // most protective value ever written, which nothing may go below without
+    // `CAP_SYS_RESOURCE` - so a process cannot be talked back into the line by
+    // something it runs later. Both are stored on the process and read back
+    // from it; that is the whole of what this kernel does with them, since
+    // there is no killer to score. A missing name is what made those workers
+    // hear `EOPNOTSUPP`: their `fopen(..., "w")` is an `open(O_CREAT)`, and
+    // procfs invents no file to answer it.
+    #[cfg(target_os = "none")]
+    node.add("oom_score_adj", NodeKind::File, oom_score_adj_ctl(pid));
     // The image and the working directory, as links: `readlink` is the only
     // way to ask for them, and their targets are facts about a process, not
     // bytes a file holds.
@@ -1044,6 +1103,116 @@ impl Dynamic for Processes {
     fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
         let pid = name.parse::<usize>().ok()?;
         process_dir(pid)
+    }
+}
+
+/// `/proc/bus/pci`: the PCI bus, as the kernel found it.
+///
+/// This is pciutils' second access method - `linux-proc`, tried when the sysfs
+/// tree is not there - and it is the one `setpci` reaches for after it too. A
+/// kernel without it is a kernel whose `lspci` fails outright the moment `/sys`
+/// is not mounted, so the tree is built from the same snapshot `/sys` is:
+/// [`crate::pci::devices`] answers both, and the two cannot disagree about
+/// which devices exist.
+///
+/// Two halves, which are the two things the reader needs. `devices` is one
+/// line per function - its identity, its resources and the driver bound to it
+/// - and `<bus>/<dev>.<func>` is the function's own configuration space.
+fn pci_dir() -> Arc<ProcDir> {
+    let pci = ProcDir::new(Some(Arc::new(PciBuses)));
+    pci.add("devices", NodeKind::File, file(pci_devices_text));
+    pci
+}
+
+/// `/proc/bus/pci/devices`, the way Linux's `show_device` prints it.
+fn pci_devices_text() -> String {
+    let mut out = String::new();
+    for device in crate::pci::devices() {
+        out.push_str(&device.devices_line());
+    }
+    out
+}
+
+/// The bus directories under `/proc/bus/pci`, one per bus that has a device.
+///
+/// Dynamic for the same reason `/proc/<pid>` is: which buses exist is the
+/// enumeration's answer, not a shape decided when the filesystem was mounted.
+/// Linux creates them as it scans the bus, at boot; here they are made when
+/// they are asked for, out of the same snapshot.
+struct PciBuses;
+
+impl Dynamic for PciBuses {
+    fn names(&self) -> Vec<(String, NodeKind)> {
+        let mut seen: Vec<String> = Vec::new();
+        for device in crate::pci::devices() {
+            let name = device.proc_dir();
+            if !seen.contains(&name) {
+                seen.push(name);
+            }
+        }
+        seen.into_iter().map(|name| (name, NodeKind::Dir)).collect()
+    }
+
+    fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
+        let bus = dir();
+        let mut any = false;
+        for device in crate::pci::devices() {
+            if device.proc_dir() != name {
+                continue;
+            }
+            any = true;
+            bus.add(
+                &device.proc_name(),
+                NodeKind::File,
+                Arc::new(ProcConfig {
+                    ino: next_ino(),
+                    bus: device.bus,
+                    dev: device.dev,
+                    func: device.func,
+                }),
+            );
+        }
+        any.then_some(bus)
+    }
+}
+
+/// One function's configuration space, as a file.
+///
+/// `pread` and `pwrite` reach the device itself rather than a snapshot, so
+/// what a reader sees is the live registers and what `setpci` writes really
+/// does change the device - which is the whole point of the file existing.
+///
+/// 256 bytes, the same as the `config` attribute in `/sys` and for the same
+/// reason: mechanism 1's address register has eight bits of offset, and the
+/// 4096-byte extended space is not reachable through it.
+struct ProcConfig {
+    ino: Ino,
+    bus: u8,
+    dev: u8,
+    func: u8,
+}
+
+impl Inode for ProcConfig {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::File,
+            size: crate::pci::CFG_SIZE,
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        Ok(crate::drivers::pci::config_read(
+            self.bus, self.dev, self.func, offset, buf,
+        ))
+    }
+
+    #[cfg(target_os = "none")]
+    fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        Ok(crate::drivers::pci::config_write(
+            self.bus, self.dev, self.func, offset, buf,
+        ))
     }
 }
 
@@ -1437,6 +1606,15 @@ impl ProcFs {
         net.add("route", NodeKind::File, file(route_table_text));
         self.root.add("net", NodeKind::Dir, net);
 
+        // `/proc/bus/pci`: pciutils' fallback access method, and the one
+        // `setpci` writes through. It reads the same device snapshot the
+        // sysfs tree is built from, so the two describe one machine.
+        self.root.add("bus", NodeKind::Dir, {
+            let bus = dir();
+            bus.add("pci", NodeKind::Dir, pci_dir());
+            bus
+        });
+
         // `/proc/self`: whichever process is reading, which is not knowable
         // when the tree is built. The link's *reading* is short-circuited in
         // the readlink handler for the two names that need a shortcut -
@@ -1718,5 +1896,101 @@ mod tests {
             text.starts_with("major minor  #blocks  name\n\n"),
             "{text:?}"
         );
+    }
+
+    /// Read a whole generated file, the way `cat` does.
+    fn read(node: &Arc<dyn Inode>) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            let n = node.read_at(out.len() as u64, &mut buf).expect("a read");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    #[test]
+    fn the_bus_tree_lists_the_functions_the_kernel_found() {
+        // The device list is global, so this test takes its turn with the
+        // others that publish one.
+        let _lock = crate::pci::test_lock::take();
+        let mut disk = crate::pci::Device::fixture(0, 3, 0);
+        disk.driver = Some("virtio-pci");
+        let mut bridge = crate::pci::Device::fixture(0, 1, 2);
+        bridge.header_type = 0x01;
+        bridge.bridge = Some(0x01);
+        let behind = crate::pci::Device::fixture(1, 0, 0);
+        crate::pci::publish(alloc::vec![disk, bridge, behind]);
+
+        let fs = ProcFs::new();
+        let pci = fs
+            .root()
+            .lookup("bus")
+            .unwrap()
+            .lookup("pci")
+            .expect("the fallback pciutils' second access method needs");
+
+        // `devices`: one line per function, and every line the seventeen
+        // numbers pciutils' parser insists on.
+        let devices = read(&pci.lookup("devices").unwrap());
+        let lines: Vec<&str> = devices.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].starts_with("0018\t1af41001\tb\t"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with("\tvirtio-pci"), "{:?}", lines[0]);
+        assert!(
+            lines[2].starts_with("0100\t1af41001\tb\t"),
+            "{:?}",
+            lines[2]
+        );
+        assert!(lines[2].ends_with('\t'), "an unclaimed device names nobody");
+
+        // The bus directories, one per bus that has a device, each holding
+        // the functions on it under Linux's `<dev>.<func>` names. They sit
+        // beside `devices`, which is the other thing the directory holds.
+        let mut buses: Vec<String> = Vec::new();
+        for (name, kind) in pci.read_dir().unwrap() {
+            match kind {
+                NodeKind::File => assert_eq!(name, "devices"),
+                NodeKind::Dir => buses.push(name),
+                other => panic!("{name} is a {other:?}"),
+            }
+        }
+        buses.sort();
+        assert_eq!(buses, alloc::vec![String::from("00"), String::from("01")]);
+
+        let bus0 = pci.lookup("00").unwrap();
+        let mut names: Vec<String> = bus0
+            .read_dir()
+            .unwrap()
+            .into_iter()
+            .map(|(name, kind)| {
+                assert_eq!(kind, NodeKind::File);
+                name
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            alloc::vec![String::from("01.2"), String::from("03.0")]
+        );
+        assert!(pci.lookup("01").unwrap().lookup("00.0").is_ok());
+        // A bus that is not there names nothing rather than an empty
+        // directory: a listing must not invent one.
+        assert!(pci.lookup("ff").is_err());
+
+        // Each function's file is its configuration space - 256 bytes of it,
+        // the most mechanism 1 can address.
+        let config = bus0.lookup("03.0").unwrap();
+        assert_eq!(config.metadata().kind, NodeKind::File);
+        assert_eq!(config.metadata().size, 256);
+
+        crate::pci::publish(Vec::new());
     }
 }

@@ -15,19 +15,42 @@ pub(crate) fn dirent_len(name_len: usize) -> usize {
     (DIRENT_HEADER + name_len).next_multiple_of(4)
 }
 
+/// The record length of the entry at `at`, or `None` where the block stops
+/// describing entries.
+///
+/// Every walk of a directory block is reading a structure some unknown hand
+/// wrote, and an entry whose length does not fit the block is not a fact to be
+/// argued about - it is where the directory ends. That is Linux's answer too
+/// (`ext2_readdir` prints "corrupt directory" and stops), and it is the only
+/// one that keeps a bad block from being a dead kernel: an `assert!` here costs
+/// the whole machine what fsck could have fixed.
+pub(crate) fn entry_rec(page: &[u8], at: usize, limit: usize) -> Option<usize> {
+    if at + DIRENT_HEADER > limit || limit > page.len() {
+        return None;
+    }
+    let rec = usize::from(le16(page, at + 4));
+    (rec >= DIRENT_HEADER && at + rec <= limit).then_some(rec)
+}
+
+/// The name of the entry at `at`, shortened to what its own record can hold.
+///
+/// `name_len` is a byte, so it can claim more name than the entry has room
+/// for. Reading it literally is the out-of-bounds slice a corrupt block hands
+/// to the caller; clamping to the record is what the format means, since an
+/// entry's name lives entirely inside its record.
+pub(crate) fn entry_name(page: &[u8], at: usize, rec: usize) -> &[u8] {
+    let len = usize::from(page[at + 6]).min(rec - DIRENT_HEADER);
+    &page[at + DIRENT_HEADER..at + DIRENT_HEADER + len]
+}
+
 /// Walk the entries of one directory block. Zero-inode slots are holes and
 /// are skipped; `visit` returning false stops the walk.
 pub(crate) fn dir_walk(page: &[u8], mut visit: impl FnMut(u32, u8, &[u8]) -> bool) {
     let mut at = 0;
-    while at < page.len() {
-        let rec = le16(page, at + 4) as usize;
-        assert!(
-            rec >= DIRENT_HEADER && at + rec <= page.len(),
-            "corrupt ext2 directory: entry at {at} claims {rec} bytes"
-        );
+    while let Some(rec) = entry_rec(page, at, page.len()) {
         let ino = le32(page, at);
         if ino != 0 {
-            let name = &page[at + 8..at + 8 + page[at + 6] as usize];
+            let name = entry_name(page, at, rec);
             if !visit(ino, page[at + 7], name) {
                 return;
             }
@@ -103,37 +126,35 @@ pub(crate) fn dir_try_insert(
     // A block nothing has been written into yet - zero inode, zero record.
     // Fresh in a way no damaged entry is: every byte empty. It takes the
     // entry whole, as its first and only record.
-    if le32(page, 0) == 0 && le16(page, 4) == 0 {
-        debug_assert!(
-            page.iter().all(|b| *b == 0),
-            "a fresh leaf block is all zero"
-        );
+    //
+    // "Every byte empty" is part of the test rather than an assertion about it,
+    // because the two words that look like freshness - a zero inode and a zero
+    // record length - are what a truncated or damaged block starts with too.
+    // Claiming a block is fresh when the rest of it holds entries overwrites
+    // them; refusing the shortcut and walking the block is the answer that is
+    // right either way.
+    if le32(page, 0) == 0 && le16(page, 4) == 0 && page.iter().all(|byte| *byte == 0) {
         write_dirent(page, 0, child, limit, name, ftype);
         return true;
     }
     let mut at = 0;
-    while at < limit {
-        let rec = le16(page, at + 4) as usize;
-        assert!(
-            rec >= DIRENT_HEADER && at + rec <= limit,
-            "corrupt ext2 directory: entry at {at} claims {rec} bytes"
-        );
+    while let Some(rec) = entry_rec(page, at, limit) {
         let ino = le32(page, at);
         if ino == 0 {
             if rec >= needed {
                 let rest = rec - needed;
-                let entry_rec = if rest >= DIRENT_HEADER { needed } else { rec };
-                write_dirent(page, at, child, entry_rec, name, ftype);
-                if entry_rec < rec {
+                let entry_rec_len = if rest >= DIRENT_HEADER { needed } else { rec };
+                write_dirent(page, at, child, entry_rec_len, name, ftype);
+                if entry_rec_len < rec {
                     // What remains of the hole stays a hole, reachable from
                     // the new entry's end.
-                    set32(page, at + entry_rec, 0);
-                    set16(page, at + entry_rec + 4, (rec - entry_rec) as u16);
+                    set32(page, at + entry_rec_len, 0);
+                    set16(page, at + entry_rec_len + 4, (rec - entry_rec_len) as u16);
                 }
                 return true;
             }
         } else {
-            let own = dirent_len(page[at + 6] as usize);
+            let own = dirent_len(entry_name(page, at, rec).len());
             if rec - own >= needed {
                 set16(page, at + 4, own as u16);
                 write_dirent(page, at + own, child, rec - own, name, ftype);
@@ -152,15 +173,10 @@ pub(crate) fn dir_try_insert(
 pub(crate) fn dir_take(page: &mut [u8], name: &str, found: &mut Option<u32>) -> bool {
     let mut at = 0;
     let mut prev: Option<usize> = None;
-    while at < page.len() {
-        let rec = le16(page, at + 4) as usize;
-        assert!(
-            rec >= DIRENT_HEADER && at + rec <= page.len(),
-            "corrupt ext2 directory: entry at {at} claims {rec} bytes"
-        );
+    while let Some(rec) = entry_rec(page, at, page.len()) {
         let ino = le32(page, at);
         if ino != 0 {
-            if &page[at + 8..at + 8 + page[at + 6] as usize] == name.as_bytes() {
+            if entry_name(page, at, rec) == name.as_bytes() {
                 *found = Some(ino);
                 match prev {
                     // The predecessor's record grows over the whole gap.

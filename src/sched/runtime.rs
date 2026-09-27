@@ -83,15 +83,25 @@ pub struct Identity {
     pub groups: Vec<u32>,
 }
 
-/// Task stacks are `2^STACK_ORDER` pages. 64 KiB, because the kernel stack has
-/// to hold the trap frames that stack up above a task the clock preempted
-/// *and* whatever the deepest syscall path needs - and `execve` is by far the
-/// deepest: it reads a whole program image, hands it to a parser, and builds a
-/// new address space underneath all of that. A debug build's frames are large
-/// enough that 16 KiB - Linux's own figure, measured on optimised code - is
-/// not enough for it, and the symptom is the worst kind: the overflow eats the
-/// fault handler's own frame, so the machine triple-faults with nothing said.
+/// Task stacks are `2^STACK_ORDER` pages. The kernel stack has to hold the trap
+/// frames that stack up above a task the clock preempted *and* whatever the
+/// deepest syscall path needs - and `execve` is by far the deepest: it reads a
+/// whole program image, hands it to a parser, and builds a new address space
+/// underneath all of that.
+///
+/// The figure depends on the build, because that path's frame sizes do. A
+/// release image gets Linux's own 16 KiB (`STACK_ORDER` 2), which is what the
+/// 64 ring-3 programs in the image are booted and measured against. A debug
+/// image keeps 64 KiB: unoptimised frames are several times larger, and 16 KiB
+/// was measured to be too few for `execve` there. The symptom of getting it
+/// wrong is the worst kind - the overflow eats the fault handler's own frame,
+/// so the machine triple-faults with nothing said - which is why the two
+/// figures are the ones that have been booted rather than the ones that look
+/// smallest.
+#[cfg(debug_assertions)]
 pub const STACK_ORDER: usize = 4;
+#[cfg(not(debug_assertions))]
+pub const STACK_ORDER: usize = 2;
 const STACK_SIZE: usize = PAGE_SIZE << STACK_ORDER;
 
 /// Written at the bottom of every stack, which is where a runaway task arrives
@@ -99,6 +109,20 @@ const STACK_SIZE: usize = PAGE_SIZE << STACK_ORDER;
 /// rather than preventing it; preventing it needs a guard page, and the direct
 /// map is not something to punch holes in for one task's benefit.
 const STACK_CANARY: u64 = 0x6d70_6f73_5f73_746b;
+
+/// Whether any task may have an `ITIMER_REAL` armed.
+///
+/// The hot-path half of [`Table::check_itimers`]: the scan of all 64 slots runs
+/// on every scheduler turn and every clock tick, and all but a handful of
+/// programs in the image never arm a timer at all. Set here by the one thing
+/// that arms one ([`itimer_swap`]) and cleared by the scan itself when it finds
+/// none - so it can be wrong only in the direction of "run the scan", never in
+/// the direction of "skip a timer that is due".
+///
+/// Only `ITIMER_REAL` is tracked, because only `ITIMER_REAL` is a wall-clock
+/// deadline the scheduler has to honour; the virtual and profiling timers are
+/// charged against consumed CPU time and are checked where that time is counted.
+static ITIMER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Slot 0 belongs to whatever was running when [`init`] was called. It adopts
 /// that stack instead of getting one, so there is nothing of ours to free.
@@ -149,6 +173,131 @@ const USER_STACK_PAGES: usize = 16;
 /// the whole reason a program may call deeper than any fixed reservation: the
 /// region extends as it is used.
 const USER_STACK_MAX: usize = 8 * 1024 * 1024;
+
+/// How far below [`USER_STACK_TOP`] a program's stack may start, in pages.
+///
+/// This is the one randomisation range that is *not* Linux's number: Linux
+/// bounds the stack's movement by a fraction of the machine's memory and of
+/// `RLIMIT_STACK`, so the range is a property of the box rather than of the
+/// ABI. Measured over 64 runs here it came out at about 16 GiB, which this
+/// kernel's layout cannot imitate - the stack top is 1 GiB and the program sits
+/// below it. Eight MiB is the largest movement that keeps the whole stack clear
+/// of the image no matter how far `RLIMIT_STACK` lets it grow.
+const ASLR_STACK_PAGES: usize = 1 << 11;
+
+/// How far below its landmark a randomised load address or `mmap` region may
+/// sit, in pages: a tebibyte's worth.
+///
+/// The number comes from measuring Linux rather than from rounding: over 64
+/// runs of the same position-independent binary, its code base, its `mmap`
+/// region and its heap anchor each moved across a range of this order, and the
+/// same program linked `-no-pie` moved its stack and `mmap` region but kept its
+/// code address at `0x401156` every time. Matching that last half is the point:
+/// randomising a fixed-address image's placement would break it, because the
+/// addresses in its own instructions are the ones it was linked to run at.
+const ASLR_REGION_PAGES: usize = 1 << 28;
+
+/// A page-aligned random multiple of [`PAGE_SIZE`] below `count` pages.
+///
+/// Drawn from the same ChaCha20 stream that fills `AT_RANDOM` and `getrandom`,
+/// which means it is seeded from the machine at boot and not reproducible by
+/// anything running on it. A process that could predict this could rebuild the
+/// layout it was supposed to be guessing at, so the draw goes through the pool
+/// rather than through the tick counter - the tick is readable by every process
+/// on the machine, and a layout derived from it is a layout with no secrets.
+fn random_pages(count: usize) -> usize {
+    let mut bytes = [0u8; 8];
+    crate::rand::fill(&mut bytes);
+    let drawn = u64::from_le_bytes(bytes) as usize;
+    (drawn % count) * PAGE_SIZE
+}
+
+/// Where one program's pieces are going to go, drawn fresh at every `exec`.
+///
+/// Four landmarks move, and they are the ones Linux moves: where a
+/// position-independent image is loaded, where its interpreter is loaded, where
+/// its stack starts, and where its anonymous `mmap` region begins. What does not
+/// move is a fixed-address (`ET_EXEC`) image's own address - see
+/// [`ASLR_REGION_PAGES`] - and a `fork` copies every landmark rather than drawing
+/// new ones, because a child that inherited its parent's memory at addresses of
+/// its own had would not have inherited its parent's memory.
+///
+/// The interpreter is the one worth the most care. On this userland `libc` and
+/// the program interpreter are the same image, so a fixed interpreter base leaves
+/// every process on the machine with the same stock of return addresses and the
+/// same table of function pointers - which is exactly what a write-anywhere
+/// primitive reaches for. Randomising the program alone would move the thing an
+/// attacker least needs to find.
+///
+/// The reason for all of it: anything that overwrites a pointer with a value it
+/// chose needs to know where the thing it points at *is*. A layout that is the
+/// same in every process on every boot answers that question once, for
+/// everybody, which is why a kernel without this is a kernel where one leaked
+/// pointer is a working exploit rather than one guess among thousands.
+struct Layout {
+    /// The address the image's own `vaddr`s are offsets from. Zero for an
+    /// image that named where it wanted to be.
+    bias: usize,
+    /// The same, for the interpreter. Zero when the program is static.
+    interp_bias: usize,
+    /// The highest stack address the program may use, one past the top.
+    stack_top: usize,
+    /// The address the `mmap` region grows down from.
+    mmap_top: usize,
+}
+
+/// How far a placed image reaches above the addresses it was linked with.
+fn span_of(image: &Image<'_>) -> usize {
+    let end = image
+        .segments
+        .iter()
+        .map(|segment| segment.vaddr + segment.memsz)
+        .max()
+        .unwrap_or(0);
+    pframe::align_up(end, PAGE_SIZE)
+}
+
+/// Draw a program's layout. See [`Layout`].
+///
+/// The order is not free: the three regions that come out of the `mmap` band are
+/// stacked against each other - the `mmap` region's start, then the interpreter
+/// below it, then the program below that - with an independent draw between each
+/// pair. Two programs of the same size therefore start at addresses that differ
+/// by a random amount, and no draw can put one region on top of another. Placing
+/// them that way also means the top of a placed image is always below
+/// `MMAP_BASE`, so no amount of bias can walk a program's pages up into the
+/// kernel half of the address space.
+fn new_layout(image: &Image<'_>, interp: Option<&Image<'_>>) -> Layout {
+    let mmap_top = crate::syscall::MMAP_BASE - random_pages(ASLR_REGION_PAGES);
+    let mut ceiling = mmap_top;
+    let interp_bias = match interp {
+        Some(interp) => {
+            ceiling -= random_pages(ASLR_REGION_PAGES);
+            let base = ceiling.checked_sub(span_of(interp));
+            if let Some(base) = base {
+                ceiling = base;
+            }
+            base.unwrap_or(INTERP_BASE)
+        }
+        None => 0,
+    };
+    // An image too large to fit below the interpreter is left at the addresses
+    // it names. That is not a weakness in the randomisation but a property of the
+    // file: no placement can fit an image whose own span exceeds the band, and
+    // `elf::parse` has already refused the ones that reach into the kernel half.
+    let bias = if image.pie {
+        ceiling -= random_pages(ASLR_REGION_PAGES);
+        ceiling.checked_sub(span_of(image)).unwrap_or(0)
+    } else {
+        0
+    };
+    Layout {
+        bias,
+        interp_bias,
+        stack_top: USER_STACK_TOP - random_pages(ASLR_STACK_PAGES),
+        mmap_top,
+    }
+}
 
 // The resource-limit table's type and startup values live with the syscall
 // layer (which is host-compiled and tests them); the scheduler only carries a
@@ -220,15 +369,20 @@ const STACK_GROWTH_SLACK: usize = 64 * 1024;
 // them on the host too, where this module is not compiled.
 use super::policy::{ARGS_BYTES_MAX, ARGV_MAX};
 
-/// Where a dynamically linked program's interpreter is loaded.
+/// Where a dynamically linked program's interpreter is loaded when the layout
+/// could not find it room anywhere else.
 ///
-/// It cannot go at zero with the program: an interpreter is position
-/// independent, its segments count from zero, and mapping it there would land
-/// it on top of the program's own first pages. Linux gives it a high address
-/// out of the way of everything; this is the same idea placed for *this*
-/// layout, which has no room at the top - the stack ends at 1 GiB, the mmap
-/// region grows down from 0x7f00_0000_0000, and 1.75 GiB is the widest gap
-/// left between them.
+/// The normal answer is a drawn address, in [`Layout::interp_bias`]: this image
+/// is `libc` as much as it is the loader on this userland, so an address it
+/// shares with every other process is a supply of return addresses and function
+/// pointers available to anything that can write a pointer anywhere. The fixed
+/// one stays as the fallback for the case the draw cannot serve - an interpreter
+/// too large to fit below the region the process `mmap`s from - which is a
+/// property of the file rather than of the randomiser.
+///
+/// It cannot go at zero with the program either way: an interpreter is position
+/// independent, its segments count from zero, and mapping it there would land it
+/// on top of the program's own first pages.
 const INTERP_BASE: usize = 0x0000_0000_7000_0000;
 
 /// Why a user image refused to spawn. The syscall layer maps these onto
@@ -514,6 +668,16 @@ impl Mm {
 struct Task {
     /// Must stay put for as long as the task exists.
     context: Context,
+    /// Whether the hardware floating-point registers currently hold *this*
+    /// task's state - the whole of the lazy-FPU bookkeeping, and the reason
+    /// `context.fpu` is not written on every switch.
+    ///
+    /// At most one task may have it set, and only the running one: the switch
+    /// saves and clears it on the way out, and the `#NM` handler sets it when
+    /// it loads an image the switch set `CR0.TS` for. A task that has never run
+    /// a floating-point instruction therefore keeps `false` for its whole life
+    /// and never costs either a save or a restore.
+    fpu_live: bool,
     priority: Priority,
     /// `None` only for the boot task, whose stack belongs to the bootloader.
     stack: Option<Stack>,
@@ -613,6 +777,22 @@ struct Task {
     /// applied by masking the mode at every create, which is the only place
     /// it is ever read.
     umask: u32,
+    /// The OOM-killer's score adjustment and the floor of it: the two numbers
+    /// Linux keeps as `sig->oom_score_adj` and `sig->oom_score_adj_min`, and
+    /// which `/proc/<pid>/oom_score_adj` reads and writes.
+    ///
+    /// Linux keeps them in the thread group's `signal_struct`; one task per
+    /// process here, so they are per-task fields that behave the same way -
+    /// inherited across `fork`, kept across `exec`. The floor is the point of
+    /// the pair: a process may make itself as unkillable as it likes once, but
+    /// going *below* what it has already asked for needs `CAP_SYS_RESOURCE`,
+    /// which stops a privileged process from being talked back into the line
+    /// by something it later runs. Nothing in this kernel scores a process for
+    /// killing yet, so the pair is state with no policy on it - but the file
+    /// has to hand back what it was given, or a write to `oom_score_adj` would
+    /// read as a lie the next time anything asks.
+    oom_score_adj: i32,
+    oom_score_adj_min: i32,
     /// The process's resource limits, the `RLIMIT_*` table `getrlimit`/
     /// `setrlimit`/`prlimit64` read and write and `/proc/<pid>/limits` prints.
     /// Inherited whole across fork and exec, the way a limit belongs to the
@@ -629,9 +809,16 @@ struct Task {
     brk_base: usize,
     brk_pages: usize,
     /// Per-process mmap cursor: where the next `mmap(MAP_ANONYMOUS)` that
-    /// does not name an address starts looking. Each process starts at
-    /// `MMAP_BASE` and only moves forward; no other process shares this.
+    /// does not name an address starts looking. Each process starts where its
+    /// layout drew it and only moves downward; no other process shares this.
     mmap_cursor: usize,
+    /// One past the highest address this process's stack may use.
+    ///
+    /// Part of the same drawn layout as `brk_base` and `mmap_cursor`, and kept
+    /// for the same reason: it is not a constant any more. Stack growth answers
+    /// "is this address still mine?" with it, and a process that grew past its
+    /// own top would be mapping over whatever the kernel had put below it.
+    stack_top: usize,
     /// The path this process was started from - what `/proc/self/exe` reads
     /// through. Empty for tasks that never had an image (kernel tasks, the
     /// boot task).
@@ -818,6 +1005,10 @@ impl Task {
             priority: Priority::NORMAL,
             stack: None,
             exited: false,
+            // The boot task has never run a floating-point instruction, and
+            // nothing loaded registers for it - whatever the bootloader left in
+            // them is not its state.
+            fpu_live: false,
             mm: Mm::new(TaskId(0), 0, alloc::vec::Vec::new()),
             released: false,
             tgid: TaskId(0),
@@ -842,9 +1033,12 @@ impl Task {
             rlimits: default_rlimits(),
             seccomp_strict: false,
             umask: crate::syscall::DEFAULT_UMASK,
+            oom_score_adj: 0,
+            oom_score_adj_min: 0,
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
+            stack_top: USER_STACK_TOP,
             exe: alloc::string::String::new(),
             argv: alloc::sync::Arc::new(alloc::vec::Vec::new()),
             child_tid: 0,
@@ -898,8 +1092,106 @@ impl Table {
     fn enter(&mut self, id: TaskId) -> (*mut Context, *const Context) {
         self.prepare(id);
         let from = self.current;
+        self.hand_over_fpu(from, id);
         self.current = id;
         (self.context_of(from), self.context_of(id))
+    }
+
+    /// The floating-point half of a switch, on the near side of it.
+    ///
+    /// The leaving task's registers are written out only if they are actually
+    /// its own - `fpu_live` says so - and the entering task is marked as not
+    /// holding the registers, with `CR0.TS` left to the assembly to set (see
+    /// `mpos_context_switch`: doing it here would put the kernel in the window
+    /// where a floating-point instruction faults with the table lock held).
+    ///
+    /// Writing the leaving task out here, rather than in the switch itself, is
+    /// what makes the save correct at all: this runs while the outgoing task is
+    /// still the one on the CPU, and the kernel between its last ring-3
+    /// instruction and this point never touches an XMM register, so the
+    /// registers are uncontroversially its. One consequence is worth naming: a
+    /// task that is stopped or preempted always has a current `context.fpu`,
+    /// which is exactly what `PTRACE_GETFPREGS` reads.
+    fn hand_over_fpu(&mut self, from: TaskId, to: TaskId) {
+        if self.task(from).fpu_live {
+            // Safe: `fpu_live` implies `CR0.TS` is clear - the only two things
+            // that set the bit are this function and the switch it feeds, and
+            // both clear the flag of every task they aim the bit at.
+            debug_assert!(!crate::arch::context::fpu_trapped());
+            let task = self.task_mut(from);
+            unsafe { crate::arch::context::save_live_fpu(&mut task.context.fpu) };
+            task.fpu_live = false;
+        }
+        self.task_mut(to).fpu_live = false;
+    }
+
+    /// The floating-point image a child of `id` starts with.
+    ///
+    /// `fork` and a thread-creating `clone` copy the creator's registers, and
+    /// `bootstrap` would otherwise hand the child the architectural reset state.
+    /// Under the lazy scheme the *live* registers are the creator's only while
+    /// `fpu_live` says so; when it does not, the registers belong to no task at
+    /// all - the last owner had them written out on the way past - and copying
+    /// them would hand the child whichever program happened to hold them last.
+    /// The authoritative copy is then the one already in `context.fpu`.
+    ///
+    /// Writing the creator's image back first, while it is still the running
+    /// task, is also what keeps `PTRACE_GETFPREGS` honest: a running task's
+    /// saved block is stale by design, and this and the switch are the only two
+    /// places that make it current.
+    fn inherit_fpu(&mut self, id: TaskId) -> crate::arch::context::FpuState {
+        let task = self.task_mut(id);
+        if task.fpu_live {
+            debug_assert!(!crate::arch::context::fpu_trapped());
+            // Safe: `fpu_live` implies `CR0.TS` clear, by the same argument as
+            // in `hand_over_fpu`.
+            unsafe { crate::arch::context::save_live_fpu(&mut task.context.fpu) };
+        }
+        let bytes = task.context.fpu.to_bytes();
+        crate::arch::context::FpuState::from_bytes(&bytes)
+    }
+
+    /// Make `id`'s saved floating-point block current before somebody reads it.
+    ///
+    /// A block is stale in exactly one situation: its task is running and still
+    /// owns the registers, because every switch out of a task writes them back.
+    /// The tracer's usual subject is a *stopped* task, so this is normally a
+    /// no-op; it is here so that a caller asking about the running task gets its
+    /// real state rather than whatever was last saved.
+    fn sync_fpu(&mut self, id: TaskId) {
+        let live = self
+            .tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|task| task.fpu_live);
+        if live {
+            let task = self.task_mut(id);
+            // Safe: `fpu_live` implies `CR0.TS` clear.
+            unsafe { crate::arch::context::save_live_fpu(&mut task.context.fpu) };
+        }
+    }
+
+    /// Give the running task the floating-point registers back, loading its
+    /// image if the switch did not.
+    ///
+    /// Called from the `#NM` handler, which is the only thing that can be
+    /// running when the registers are in question: `CR0.TS` is set by the
+    /// switch and cleared here, so a task that has already reclaimed its
+    /// registers (a kernel-mode use, or a second fault for any other reason)
+    /// finds `fpu_live` set and does not load the image over its own live state.
+    fn reclaim_fpu(&mut self) {
+        // Safe: the caller is the `#NM` handler, so the bit is set - clearing
+        // it is what lets the faulting instruction be re-executed.
+        unsafe { crate::arch::context::claim_live_fpu() };
+        let id = self.current;
+        let task = self.task_mut(id);
+        if !task.fpu_live {
+            // Safe: the image is this task's own, 16-byte aligned because
+            // `FpuState` is the first member of `Context`, and the registers
+            // were just released to it.
+            unsafe { crate::arch::context::restore_fpu(&task.context.fpu) };
+            task.fpu_live = true;
+        }
     }
 
     /// Aim the CPU at the task that is about to run: its address space under
@@ -952,8 +1244,23 @@ impl Table {
     /// `block_until` is pulled out of the sleep queue so it can act on it.
     /// A periodic timer reloads from where it was due, coalescing any
     /// periods a late check skipped; a one-shot disarms.
+    ///
+    /// This runs on every scheduler turn and on every clock tick, so the scan
+    /// of all 64 slots is skipped entirely while `ITIMER_ARMED` says no task has
+    /// an `ITIMER_REAL` - which is the state of every machine that never calls
+    /// `setitimer`, and so of almost every program in the image.
     fn check_itimers(&mut self) {
+        if !ITIMER_ARMED.load(Ordering::Relaxed) {
+            return;
+        }
         let now = timer::ticks();
+        // Recomputed rather than trusted as "set": the one thing that can
+        // disarm a timer without going through `itimer_swap` is a task exiting
+        // while one is armed, and a flag that stayed set forever would cost the
+        // full scan on every turn for the rest of the boot. One extra scan
+        // after the last timer goes away is the price of never being stale in
+        // the dangerous direction - saying "none armed" while one is.
+        let mut any_armed = false;
         for (i, slot) in self.tasks.iter_mut().enumerate() {
             let Some(task) = slot.as_mut() else {
                 continue;
@@ -964,6 +1271,7 @@ impl Table {
             let Some(state) = task.itimers[ITIMER_REAL].as_ref() else {
                 continue;
             };
+            any_armed = true;
             if now < state.deadline {
                 continue;
             }
@@ -985,6 +1293,7 @@ impl Table {
                 _ => task.itimers[ITIMER_REAL] = None,
             }
         }
+        ITIMER_ARMED.store(any_armed, Ordering::Relaxed);
     }
 
     /// The scheduler's whole turn: fire timers, bury the dead, move the
@@ -1039,6 +1348,7 @@ impl Table {
 
         self.tasks[slot] = Some(Task {
             context,
+            fpu_live: false,
             priority,
             stack: Some(stack),
             exited: false,
@@ -1066,9 +1376,12 @@ impl Table {
             rlimits: default_rlimits(),
             seccomp_strict: false,
             umask: crate::syscall::DEFAULT_UMASK,
+            oom_score_adj: 0,
+            oom_score_adj_min: 0,
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
+            stack_top: USER_STACK_TOP,
             exe: alloc::string::String::new(),
             argv: alloc::sync::Arc::new(alloc::vec::Vec::new()),
             child_tid: 0,
@@ -1178,7 +1491,7 @@ impl Table {
                     let owner = task.tgid.0 as u32;
                     for file in &files {
                         let inode = file.inode();
-                        crate::vfs::locks::release(
+                        crate::vfs::locks::release_process(
                             crate::vfs::mount::fs_id_of_inode(&inode),
                             file.metadata().ino,
                             owner,
@@ -1189,6 +1502,14 @@ impl Table {
                     // while the counts still say who owns them.
                     crate::net::socket::close_sockets_at_exit(&files);
                     crate::vfs::inotify::close_at_exit(&files);
+                    // The evdev clients this process was reading as go with it:
+                    // a position is keyed by an address that will be reused, and
+                    // an inherited one is a reader that has read nothing it did.
+                    #[cfg(target_os = "none")]
+                    crate::drivers::virtio::input::close_at_exit(&files);
+                    // And the input devices the process had made for itself.
+                    #[cfg(target_os = "none")]
+                    crate::drivers::uinput::close_at_exit(&files);
                     queue_release(files);
                 }
             }
@@ -1399,7 +1720,6 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         "spawn_init() was called before sched::init()"
     );
     let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
-    let user_rsp = initial_stack_rsp(argv, env, "").ok_or(SpawnError::ArgsTooBig)?;
     // Whether init has an interpreter depends on which init it is. The kernel
     // used to start its own program, statically linked, when the initramfs was
     // the root and no filesystem was up to read a loader from. The machine now
@@ -1411,6 +1731,12 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
         None => None,
     };
+    // The interpreter first, because the layout has to know about it: the two
+    // are stacked against each other rather than drawn independently, so that no
+    // draw can drop one on top of the other.
+    let layout = new_layout(&image, interp.as_ref());
+    let user_rsp =
+        initial_stack_rsp(argv, env, "", layout.stack_top).ok_or(SpawnError::ArgsTooBig)?;
 
     with_table(|t| {
         let slot = INIT_PID.0;
@@ -1421,18 +1747,10 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         drop_retired(INIT_PID);
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        let loaded = load_user(&mut space, &image, interp.as_ref());
-        write_arg_block(space.root(), user_rsp, argv, env, "", &image, loaded.base);
+        let loaded = load_user(&mut space, &image, interp.as_ref(), &layout);
+        write_arg_block(space.root(), user_rsp, argv, env, "", &loaded);
 
         let root = space.root();
-        let brk_base = image
-            .segments
-            .iter()
-            .map(|s| s.vaddr + s.memsz)
-            .max()
-            .map_or(0, |end| {
-                (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
-            });
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
@@ -1440,6 +1758,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
 
         t.tasks[slot] = Some(Task {
             context,
+            fpu_live: false,
             priority: Priority::NORMAL,
             stack: Some(stack),
             exited: false,
@@ -1473,9 +1792,12 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             rlimits: default_rlimits(),
             seccomp_strict: false,
             umask: crate::syscall::DEFAULT_UMASK,
-            brk_base,
+            oom_score_adj: 0,
+            oom_score_adj_min: 0,
+            brk_base: loaded.brk,
             brk_pages: 0,
-            mmap_cursor: crate::syscall::MMAP_BASE,
+            mmap_cursor: layout.mmap_top,
+            stack_top: loaded.stack_top,
             exe: alloc::string::String::new(),
             // The one record of how init was started: `/proc/1/cmdline` and
             // `ps` both read it back, and an empty one reads as a process
@@ -1517,7 +1839,6 @@ pub fn try_spawn_user(
         "spawn_user() was called before sched::init()"
     );
     let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
-    let user_rsp = initial_stack_rsp(argv, env, exe).ok_or(SpawnError::ArgsTooBig)?;
     // The interpreter, found the same way `execve` finds it. This used to pass
     // none, on the assumption that only `execve` starts dynamic programs -
     // which held only while every program the kernel started itself was static.
@@ -1530,32 +1851,26 @@ pub fn try_spawn_user(
         Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
         None => None,
     };
+    let layout = new_layout(&image, interp.as_ref());
+    let user_rsp =
+        initial_stack_rsp(argv, env, exe, layout.stack_top).ok_or(SpawnError::ArgsTooBig)?;
 
     with_table(|t| {
         let slot = t.alloc_slot();
         drop_retired(TaskId(slot));
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        let loaded = load_user(&mut space, &image, interp.as_ref());
+        let loaded = load_user(&mut space, &image, interp.as_ref(), &layout);
         // Read before the space moves into the task: a thread switches to
         // this root, and the group is what remembers it.
         let root = space.root();
-
-        let brk_base = image
-            .segments
-            .iter()
-            .map(|s| s.vaddr + s.memsz)
-            .max()
-            .map_or(0, |end| {
-                (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
-            });
 
         // The argument block is written last, into the stack this task will
         // land on. It is placed from its *top* down - the strings grow
         // towards the program's entry point - and it may span pages, so the
         // write resolves the stack's frames as it crosses them rather than
         // assuming the block lives in one.
-        write_arg_block(space.root(), user_rsp, argv, env, exe, &image, loaded.base);
+        write_arg_block(space.root(), user_rsp, argv, env, exe, &loaded);
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
@@ -1580,6 +1895,7 @@ pub fn try_spawn_user(
 
         t.tasks[slot] = Some(Task {
             context,
+            fpu_live: false,
             priority,
             stack: Some(stack),
             exited: false,
@@ -1605,11 +1921,14 @@ pub fn try_spawn_user(
             ctty: t.task(parent).ctty,
             identity: t.task(parent).identity.clone(),
             umask: t.task(parent).umask,
+            oom_score_adj: t.task(parent).oom_score_adj,
+            oom_score_adj_min: t.task(parent).oom_score_adj_min,
             rlimits: t.task(parent).rlimits,
             seccomp_strict: t.task(parent).seccomp_strict,
-            brk_base,
+            brk_base: loaded.brk,
             brk_pages: 0,
-            mmap_cursor: crate::syscall::MMAP_BASE,
+            mmap_cursor: layout.mmap_top,
+            stack_top: loaded.stack_top,
             exe: alloc::string::String::from(exe),
             argv: alloc::sync::Arc::new(argv.to_vec()),
             child_tid: 0,
@@ -1660,7 +1979,12 @@ pub fn try_spawn_user(
 /// array above it.
 const AUXV_WORDS: usize = 32; // 16 (type, value) pairs, AT_NULL included.
 
-fn initial_stack_rsp(argv: &[String], env: &[String], exe: &str) -> Option<usize> {
+fn initial_stack_rsp(
+    argv: &[String],
+    env: &[String],
+    exe: &str,
+    stack_top: usize,
+) -> Option<usize> {
     let arg_bytes: usize = argv.iter().map(|s| s.len() + 1).sum();
     let env_bytes: usize = env.iter().map(|s| s.len() + 1).sum();
     // The AT_EXECFN string: its own copy when the caller knows the path,
@@ -1682,13 +2006,13 @@ fn initial_stack_rsp(argv: &[String], env: &[String], exe: &str) -> Option<usize
     // 16 bytes of random data for the AT_RANDOM auxv entry.
     let random_bytes = 16usize;
     let total = words_bytes + random_bytes + arg_bytes + env_bytes + execfn_bytes;
-    let rsp = (USER_STACK_TOP - total) & !15;
+    let rsp = (stack_top - total) & !15;
     // The block has to land on the pages the loader maps. Everything below
     // them is demand-paged, and the fault that would claim one has nothing to
     // fault on yet: the program has not started. Linux bounds the block by
     // `ARG_MAX` and lets it span pages; this is the same shape at the size of
     // the stack a program starts with.
-    (USER_STACK_TOP - rsp <= USER_STACK_PAGES * PAGE_SIZE).then_some(rsp)
+    (stack_top - rsp <= USER_STACK_PAGES * PAGE_SIZE).then_some(rsp)
 }
 
 /// Fill the initial stack page with the argument block [`initial_stack_rsp`]
@@ -1697,9 +2021,10 @@ fn initial_stack_rsp(argv: &[String], env: &[String], exe: &str) -> Option<usize
 ///
 /// # Safety
 ///
-/// The frame must back the page at `USER_STACK_TOP - PAGE_SIZE`, and
-/// `user_rsp` must be the pointer [`initial_stack_rsp`] computed for the same
-/// `argv` and `env`, with the whole block inside that one page.
+/// The frame must back the pages between `loaded.stack_top` and the `user_rsp`
+/// [`initial_stack_rsp`] computed from the same `argv` and `env` - the two are
+/// one layout, and a block written against a different stack top lands in
+/// whichever pages *that* layout mapped.
 ///
 /// `exe` is the execution path the `AT_EXECFN` entry points at, the string a
 /// libc derives `progname` from by scanning it for NUL. It must be
@@ -1712,8 +2037,7 @@ fn write_arg_block(
     argv: &[String],
     env: &[String],
     exe: &str,
-    image: &elf::Image,
-    at_base: usize,
+    loaded: &Loaded,
 ) {
     // The block is built here and copied to the user stack in one piece. It
     // may span pages - a *program* is not a pathname, and a completion helper
@@ -1726,7 +2050,7 @@ fn write_arg_block(
     // The address space is named by its root rather than taken as "the
     // current one": a task being spawned is not running yet, so its stack is
     // not the stack the kernel is on.
-    let total = USER_STACK_TOP - user_rsp;
+    let total = loaded.stack_top - user_rsp;
     let mut block = alloc::vec![0u8; total];
     let base = user_rsp;
 
@@ -1796,13 +2120,7 @@ fn write_arg_block(
     };
 
     // Auxiliary vector entries.
-    auxv(
-        &mut block[off..],
-        image,
-        at_base,
-        random_vaddr,
-        execfn_vaddr,
-    );
+    auxv(&mut block[off..], loaded, random_vaddr, execfn_vaddr);
 
     assert!(
         write_user_of(root, base, &block),
@@ -1818,11 +2136,14 @@ fn write_arg_block(
 /// and 16 random bytes at `random_vaddr` for the stack guard. `execfn` is
 /// the virtual address of `argv[0]`'s string, what `AT_EXECFN` points at.
 ///
-/// `at_base` is where the program interpreter was loaded, and is the one
-/// entry a dynamically linked program cannot do without: it is how the
-/// interpreter finds itself, since nothing told it where it was put. Zero
-/// means the program is static.
-fn auxv(buf: &mut [u8], image: &elf::Image, at_base: usize, random_vaddr: usize, execfn: usize) {
+/// Every address in here is a *placed* one, which is the whole reason the vector
+/// is written from [`Loaded`] rather than from the parsed image: `AT_PHDR` and
+/// `AT_ENTRY` are how a libc and an interpreter find the program they were
+/// handed, and a program moved from the addresses it was linked with is exactly
+/// the case where the two differ. `AT_BASE` is the one entry a dynamically linked
+/// program cannot do without - it is how the interpreter finds *itself*, since
+/// nothing told it where it was put - and zero means the program is static.
+fn auxv(buf: &mut [u8], loaded: &Loaded, random_vaddr: usize, execfn: usize) {
     let mut off = 0usize;
 
     // Helper: write one auxv entry (type, value) and advance.
@@ -1836,12 +2157,12 @@ fn auxv(buf: &mut [u8], image: &elf::Image, at_base: usize, random_vaddr: usize,
         }};
     }
 
-    entry!(3, image.phdr_addr); // AT_PHDR
-    entry!(4, image.phent); // AT_PHENT
-    entry!(5, image.phnum); // AT_PHNUM
+    entry!(3, loaded.at_phdr); // AT_PHDR
+    entry!(4, loaded.phent); // AT_PHENT
+    entry!(5, loaded.phnum); // AT_PHNUM
     entry!(6, PAGE_SIZE); // AT_PAGESZ
-    entry!(7, at_base); // AT_BASE (0 = no dynamic linker)
-    entry!(9, image.entry); // AT_ENTRY
+    entry!(7, loaded.base); // AT_BASE (0 = no dynamic linker)
+    entry!(9, loaded.at_entry); // AT_ENTRY
     // The ids are the ones the new image will run with, which after a set-uid
     // exec are not the ones the caller had. libc reads them here rather than
     // asking, and a program that found the wrong answer would take the wrong
@@ -1867,16 +2188,38 @@ fn auxv(buf: &mut [u8], image: &elf::Image, at_base: usize, random_vaddr: usize,
 
 /// Where the pieces of a loaded program ended up, which is what the initial
 /// stack has to describe to the libc that reads it.
+///
+/// Every address here is a *placed* one: the image's own `entry` and `phdr_addr`
+/// are offsets from where it was put, and a libc told the offset instead of the
+/// address walks off the end of its own memory looking for its program headers.
+/// That is the whole reason this structure exists next to [`Layout`] rather than
+/// as a few more arguments - the summing happens once, here, and cannot be
+/// forgotten in the four places that read them afterwards.
 struct Loaded {
     /// The address control is transferred to. With an interpreter this is the
     /// interpreter's entry point rather than the program's: the interpreter
     /// is what finishes setting the process up, and it finds the program
     /// through `AT_ENTRY`.
     entry: usize,
+    /// What `AT_ENTRY` says: the *program's* entry, wherever the program
+    /// landed - which is not the address the process starts at when there is an
+    /// interpreter, and is the same address when there is not.
+    at_entry: usize,
+    /// What `AT_PHDR` says: the program header table, wherever it landed. The
+    /// libc's TLS setup reads this and walks `phnum` entries of `phent` bytes.
+    at_phdr: usize,
+    phnum: usize,
+    phent: usize,
     /// The interpreter's load address, reported on the initial stack as
     /// `AT_BASE`. Zero when the program is static, which is what the ABI uses
     /// to mean "there is no interpreter".
     base: usize,
+    /// The stack top this program was laid out against, repeated here so that
+    /// the argument block and the pages under it agree without a third value
+    /// having to be threaded between them.
+    stack_top: usize,
+    /// The first address above the image, where the heap begins.
+    brk: usize,
     /// Every frame that was mapped for this process, for the reaper to give
     /// back when it exits.
     frames: Vec<usize>,
@@ -1885,9 +2228,10 @@ struct Loaded {
 /// Map every page of `image` into `space` at `base` - file bytes, the zero
 /// tail of each segment past them - and record the frames as it goes.
 ///
-/// `base` is the load address. It is zero for the program itself, whose
-/// headers name absolute addresses, and [`INTERP_BASE`] for an interpreter,
-/// which is position independent and must not land on the program.
+/// `base` is the load address: the interpreter's is [`INTERP_BASE`], and a
+/// position-independent program's is the address its layout drew. A fixed one
+/// keeps zero, because the addresses in its own instructions are the ones it
+/// expects to run at.
 fn map_image(space: &mut AddressSpace, image: &Image<'_>, base: usize, frames: &mut Vec<usize>) {
     for segment in &image.segments {
         let vaddr = base + segment.vaddr;
@@ -1924,19 +2268,28 @@ fn map_image(space: &mut AddressSpace, image: &Image<'_>, base: usize, frames: &
     }
 }
 
-/// Apply `image`'s R_X86_64_RELATIVE relocations, each writing `addend` at
-/// `offset` through the direct map.
+/// Apply `image`'s R_X86_64_RELATIVE relocations for a load address of `base`.
 ///
 /// Only the program gets this treatment; an interpreter relocates itself from
 /// `AT_BASE` before it does anything else, and a second pass here would be
 /// doing a libc's job with a different idea of where it starts.
-fn apply_rela(space: &AddressSpace, image: &Image<'_>) {
+///
+/// Both halves of the record move with the load address, and the second one is
+/// easy to miss: `r_offset` says *where* to write, in the addresses the image
+/// was linked with, while `r_addend` is the *pointer* to write - an address
+/// too. The relocation's whole meaning is "this word is an address, and here is
+/// the one it should have been", so placing the image somewhere else has to
+/// move the value as well as the slot. A static-pie loaded at a bias with only
+/// `r_offset` shifted ends up with a table of pointers into the layout it was
+/// linked for, and the first dereference of one is a fault in the middle of the
+/// program's own data.
+fn apply_rela(space: &AddressSpace, image: &Image<'_>, base: usize) {
     for &(offset, addend) in &image.rela {
-        if let Some(phys) = space.phys_for_virt(offset) {
-            let ptr =
-                (mm::phys_to_virt(phys & !(PAGE_SIZE - 1)) + (offset % PAGE_SIZE)) as *mut u64;
+        let addr = base + offset;
+        if let Some(phys) = space.phys_for_virt(addr) {
+            let ptr = (mm::phys_to_virt(phys & !(PAGE_SIZE - 1)) + (addr % PAGE_SIZE)) as *mut u64;
             unsafe {
-                ptr.write(addend as u64);
+                ptr.write((addend + base as i64) as u64);
             }
         }
     }
@@ -1972,24 +2325,41 @@ fn interpreter_bytes(image: &Image<'_>) -> Result<Option<Vec<u8>>, SpawnError> {
 /// the user stack, and report where everything landed.
 ///
 /// The interpreter is loaded first and at [`INTERP_BASE`]; the program follows
-/// at the addresses its own headers name. Nothing here tries to link the two
-/// together beyond handing over `AT_BASE`, `AT_PHDR` and `AT_ENTRY` on the
-/// initial stack: resolving symbols, mapping shared libraries and jumping to
-/// the program's entry is the interpreter's whole purpose, and a kernel that
-/// did any of it would be guessing at a contract it is not party to.
-fn load_user(space: &mut AddressSpace, image: &Image<'_>, interp: Option<&Image<'_>>) -> Loaded {
+/// at `layout.bias` plus the addresses its own headers name, which is zero for a
+/// fixed-address image and a drawn address for a position-independent one.
+/// Nothing here tries to link the two together beyond handing over `AT_BASE`,
+/// `AT_PHDR` and `AT_ENTRY` on the initial stack: resolving symbols, mapping
+/// shared libraries and jumping to the program's entry is the interpreter's
+/// whole purpose, and a kernel that did any of it would be guessing at a
+/// contract it is not party to.
+///
+/// That last sentence also decides who relocates. An image with an interpreter
+/// is relocated *by* it - `AT_PHDR` is enough for the loader to find the address
+/// it was loaded at, which is why the value handed over is the placed one rather
+/// than the linked one - so the kernel's own relocation pass runs only for a
+/// static image, where nobody else will ever do the job. Doing it for both would
+/// add the load bias twice to every pointer the program reads out of its own
+/// data.
+fn load_user(
+    space: &mut AddressSpace,
+    image: &Image<'_>,
+    interp: Option<&Image<'_>>,
+    layout: &Layout,
+) -> Loaded {
     let mut frames = Vec::new();
 
     let base = match interp {
         Some(interp) => {
-            map_image(space, interp, INTERP_BASE, &mut frames);
-            INTERP_BASE
+            map_image(space, interp, layout.interp_bias, &mut frames);
+            layout.interp_bias
         }
         None => 0,
     };
 
-    map_image(space, image, 0, &mut frames);
-    apply_rela(space, image);
+    map_image(space, image, layout.bias, &mut frames);
+    if interp.is_none() {
+        apply_rela(space, image, layout.bias);
+    }
 
     for index in 0..USER_STACK_PAGES {
         let frame = mm::alloc_frames(0).expect("out of frames for the user stack");
@@ -2003,7 +2373,7 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>, interp: Option<&Image<
             // one the argument block is written into from the top down. The
             // block may reach past it, so the pages below are mapped here
             // too - it is the *stack* the loader lays out, not one page.
-            virt: USER_STACK_TOP - (index + 1) * PAGE_SIZE,
+            virt: layout.stack_top - (index + 1) * PAGE_SIZE,
             phys: frame,
             length: PAGE_SIZE,
             flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
@@ -2014,13 +2384,28 @@ fn load_user(space: &mut AddressSpace, image: &Image<'_>, interp: Option<&Image<
     // otherwise. The interpreter's own entry is a vaddr in a shared object,
     // so it only means anything once the base is added.
     let entry = match interp {
-        Some(interp) => INTERP_BASE + interp.entry,
-        None => image.entry,
+        Some(interp) => base + interp.entry,
+        None => layout.bias + image.entry,
     };
+    let brk_end = image
+        .segments
+        .iter()
+        .map(|segment| segment.vaddr + segment.memsz)
+        .max();
 
     Loaded {
         entry,
+        at_entry: layout.bias + image.entry,
+        at_phdr: layout.bias + image.phdr_addr,
+        phnum: image.phnum,
+        phent: image.phent,
         base,
+        stack_top: layout.stack_top,
+        // The heap starts on the page above the highest thing the image owns -
+        // placed addresses, since a program that asked `brk` where it was and got
+        // the address it was *linked* for would be told about a region that is
+        // not its own.
+        brk: brk_end.map_or(0, |end| pframe::align_up(layout.bias + end, PAGE_SIZE)),
         frames,
     }
 }
@@ -2387,7 +2772,17 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: signal::SigInfo) -> bool {
                 task.trace.continued = true;
             }
         }
-        t.sched.wake(id);
+        // A stop signal has nothing to say to a task that is already stopped,
+        // and waking it would say the opposite of the signal: the park a group
+        // stop sits in is held by the scheduler's sleep, so a wake releases it
+        // and the task runs on with a stop nobody ended. `kill -STOP` on a
+        // *running* task still has to wake it, or the stop waits for the next
+        // syscall boundary - and one that arrives while it is parked in a
+        // `PTRACE_ATTACH`'s own queue is the case a debugger's target is in.
+        let held = signal::stops_by_default(sig) && task.trace.stop.is_some_and(|stop| stop.group);
+        if !held {
+            t.sched.wake(id);
+        }
         true
     })
 }
@@ -2478,6 +2873,41 @@ pub fn current_umask() -> u32 {
 /// narrowed it to the twelve bits a mode can hold.
 pub fn set_current_umask(mask: u32) {
     with_table(|t| t.task_mut(t.current).umask = mask);
+}
+
+/// The OOM score adjustment of `pid` and the floor of it, as
+/// `/proc/<pid>/oom_score_adj` reads the pair. `None` when no such task exists
+/// - which is what makes the file go away with the process it described.
+#[cfg(target_os = "none")]
+pub fn oom_score_adj_of(pid: usize) -> Option<(i32, i32)> {
+    with_table(|t| {
+        t.tasks
+            .get(pid)
+            .and_then(Option::as_ref)
+            .map(|tk| (tk.oom_score_adj, tk.oom_score_adj_min))
+    })
+}
+
+/// Write `pid`'s OOM score adjustment, taking the floor down with it when the
+/// new value asks for a more protective one - Linux's `sig->oom_score_adj_min`,
+/// the record of the most protective value this process has ever been given.
+/// `false` says the process is gone, so a write racing an exit reports the
+/// vanished file instead of pretending to have changed it.
+///
+/// Who may lower the floor is not decided here: that is a rule about the
+/// writer, and the file answers it where the errnos are mapped.
+#[cfg(target_os = "none")]
+pub fn set_oom_score_adj(pid: usize, value: i32) -> bool {
+    with_table(|t| match t.tasks.get_mut(pid) {
+        Some(Some(task)) => {
+            task.oom_score_adj = value;
+            if value < task.oom_score_adj_min {
+                task.oom_score_adj_min = value;
+            }
+            true
+        }
+        _ => false,
+    })
 }
 
 /// The group ids the running task holds - real, effective and saved.
@@ -2989,6 +3419,7 @@ pub fn set_trace_regs(id: TaskId, regs: &[u64; abi::uregs::COUNT]) -> bool {
 /// least once since it last ran.
 pub fn trace_fpu(id: TaskId) -> Option<[u8; crate::arch::context::FPU_BYTES]> {
     with_table(|t| {
+        t.sync_fpu(id);
         t.tasks
             .get(id.0)?
             .as_ref()
@@ -3574,23 +4005,63 @@ pub fn resume_traced(id: TaskId, signal: u8, arm: bool) -> bool {
 
 /// Break the tracer link: `PTRACE_DETACH`, and the tracer's own death.
 ///
-/// The tracee is resumed on the way out - a task left stopped with nobody to
-/// resume it would sit there for the machine's life, which is a worse outcome
-/// than running on with an unfinished trace.
+/// Whether the tracee comes back with this is not one answer but three, and they
+/// are told apart by whose stop it is - see the body. What is always true is
+/// that the *trace* is over: the link, the arming and the signal the attach
+/// injected all go, because a tracee that kept them would be waiting on a tracer
+/// that has gone.
 pub fn detach_traced(id: TaskId, signal: u8) -> bool {
     with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
         Some(task) if !task.exited => {
             task.trace.tracer = None;
             task.trace.armed = false;
-            if let Some(reported) = task.trace.stop.and_then(|stop| stop.delivering) {
-                task.signals &= !signal::bit(reported);
+            // Measured against Linux, a detach has three cases:
+            //
+            // * `attach` then `detach(0)` without ever `wait`ing, and the target
+            //   runs on. The `SIGSTOP` the attach injected is still merely
+            //   pending here, and dropping it is the whole difference: kept, the
+            //   target stops itself on the way out of whatever syscall it is in,
+            //   with no tracer left and nothing on the machine but a `SIGCONT`
+            //   that could end that stop.
+            // * The same, after the stop has been reported. That stop is the one
+            //   parked with `delivering` set, so ending it is the first case one
+            //   step later.
+            // * A process the user stopped *before* the attach stays stopped
+            //   after the detach, and stays stopped even when the detach names
+            //   `SIGCONT` - the signal a detach injects goes to the tracee, not
+            //   to its stop. That stop is the task's own, and only a `SIGCONT`
+            //   somebody actually sends ends it.
+            if task
+                .trace
+                .stop
+                .is_some_and(|stop| stop.delivering.is_some())
+            {
+                task.trace.stop = None;
             }
-            task.trace.stop = None;
-            task.trace.regs = None;
+            for stop_sig in [
+                signal::SIGSTOP,
+                signal::SIGTSTP,
+                signal::SIGTTIN,
+                signal::SIGTTOU,
+            ] {
+                task.signals &= !signal::bit(stop_sig);
+            }
             if signal != 0 {
                 queue_signal(task, signal, signal::SigInfo::user(signal, 0, 0));
             }
-            t.sched.wake(id);
+            // The register file stays where the tracer left it: Linux writes a
+            // `PTRACE_SETREGS` straight into the task's own frame, so edits made
+            // before the detach belong to the task from then on. `trace.regs` is
+            // only read back by the park this task is leaving, and the next stop
+            // overwrites it with a fresh snapshot.
+            //
+            // Waking follows the same three-way split, and for the third case it
+            // is the thing to *not* do: a stopped task is held asleep by `park`,
+            // so a wake here would release the very stop the detach was told to
+            // leave alone.
+            if task.trace.stop.is_none() {
+                t.sched.wake(id);
+            }
             true
         }
         _ => false,
@@ -4909,6 +5380,13 @@ pub fn check_itimer() {
 /// Install `new` as the running task's timer `which`, reporting what was
 /// there - the value-plus-interval pair `setitimer`'s old_value wants.
 pub fn itimer_swap(which: usize, new: Option<ItimerState>) -> Option<ItimerSnapshot> {
+    // Before the table lock: this is the one place a timer appears, so it is
+    // where the scan's fast path has to be told to look again. Disarming does
+    // not clear it - another task may still have one armed, and the scan is
+    // what finds out.
+    if which == ITIMER_REAL && new.is_some() {
+        ITIMER_ARMED.store(true, Ordering::Relaxed);
+    }
     with_table(|t| {
         let task = t.task_mut(t.current);
         let old = task.itimers[which];
@@ -4979,6 +5457,19 @@ pub fn deliver_pending_signal() {
 /// queue is empty.
 pub fn wait_for_interrupt() {
     idle();
+}
+
+/// The `#NM` (device-not-available) trap: a task used a floating-point
+/// instruction before its registers had been loaded back, which is the deferred
+/// half of the switch.
+///
+/// Interrupts arrive here already off, and this takes the table lock the same
+/// way any other handler does - which is safe because a fault of this kind can
+/// only be raised by ring-3 code: the kernel is built `soft-float`, so nothing
+/// between the switch setting `CR0.TS` and this handler was ever holding the
+/// lock with a vector instruction in flight.
+pub fn device_not_available() {
+    with_table(|t| t.reclaim_fpu());
 }
 
 /// The one path off a task's stack.
@@ -5138,12 +5629,10 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         let mut context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
         // The child's floating-point registers are its creator's: they are part
         // of what `fork` and a thread-creating `clone` copy, and `bootstrap`
-        // would otherwise hand over the architectural reset state. The live
-        // registers *are* the creator's at this point - the kernel touches none
-        // of them, so the syscall it is inside did not disturb them, and any
-        // preemption since it was switched in restored them from its own saved
-        // block.
-        unsafe { context::save_live_fpu(&mut context.fpu) };
+        // would otherwise hand over the architectural reset state. `inherit_fpu`
+        // reads them out of the parent - from the registers while they are still
+        // the parent's, from the parent's saved block when they are no longer.
+        context.fpu = t.inherit_fpu(parent_id);
 
         // Create the child's address space by sharing all parent pages COW.
         let mut child_space = AddressSpace::new();
@@ -5170,22 +5659,32 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         // writability alone would skip it and leave the *parent* writable while
         // the child's copy stays read-only - which is the bug this whole dance
         // exists to avoid.
+        //
+        // One flush for the whole loop, at the end: the PTE write is what makes
+        // the page read-only, but the CPU keeps using the translations it
+        // already has until the TLB is dropped, and doing that per page asked
+        // the machine to re-walk the parent's entire address space once for
+        // every writable page it owns - the single largest cost in a fork of a
+        // large process. Nothing runs on this address space between the first
+        // `set_cow_bit_quietly` and the flush, because this *is* the task that
+        // owns it, inside its own syscall.
         if let Some(parent_space) = &mut t.task_mut(parent_id).space {
             for &(virt, _phys, flags) in &parent_pages {
                 if flags.contains(MapFlags::COW) || !flags.contains(MapFlags::WRITE) {
                     continue;
                 }
-                // Keep everything the page had except write permission: hardening
-                // it to `READ | USER` would silently take away execute on a page
-                // that is both, and a COW copy made from it later would stay
-                // non-executable forever.
-                parent_space.protect(virt, crate::mm::PAGE_SIZE, flags & !MapFlags::WRITE);
-                parent_space.set_cow_bit(virt);
+                // Everything the page had except write permission, in one PTE
+                // write: hardening it to `READ | USER` would silently take away
+                // execute on a page that is both, and a COW copy made from it
+                // later would stay non-executable forever.
+                parent_space.set_cow_bit_quietly(virt);
             }
+            parent_space.flush_if_active();
         }
 
         t.tasks[slot] = Some(Task {
             context,
+            fpu_live: false,
             priority: parent_priority,
             stack: Some(stack),
             exited: false,
@@ -5225,11 +5724,17 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             ctty: t.task(parent_id).ctty,
             identity: t.task(parent_id).identity.clone(),
             umask: t.task(parent_id).umask,
+            oom_score_adj: t.task(parent_id).oom_score_adj,
+            oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             rlimits: t.task(parent_id).rlimits,
             seccomp_strict: t.task(parent_id).seccomp_strict,
             brk_base: parent_brk_base,
             brk_pages: parent_brk_pages,
             mmap_cursor: parent_mmap_cursor,
+            // The child's memory is its parent's, addresses included: a stack
+            // that started somewhere else would leave the copied page tables
+            // describing a region the child does not own.
+            stack_top: t.task(parent_id).stack_top,
             exe: parent_exe,
             argv: parent_argv,
             // `CLONE_CHILD_SETTID` parks the child's tid where the child can
@@ -5283,8 +5788,6 @@ pub fn exec_replace(
     exe: &str,
 ) -> Result<(usize, usize), SpawnError> {
     let image = elf::parse(bytes).ok_or(SpawnError::NotExecutable)?;
-    let user_rsp = initial_stack_rsp(argv, env, exe).ok_or(SpawnError::ArgsTooBig)?;
-
     // A dynamically linked program names the interpreter that has to run
     // before it does. That is a path into the filesystem, and this is the only
     // place with both the path and the authority to follow it - which is why
@@ -5294,6 +5797,13 @@ pub fn exec_replace(
         Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
         None => None,
     };
+    // A fresh layout with the fresh image. This is the moment ASLR belongs to:
+    // a `fork` copies the parent's addresses because it copies its memory, but
+    // an `exec` throws that memory away, so the new program is under no
+    // obligation - and gets no benefit - from starting where the old one did.
+    let layout = new_layout(&image, interp.as_ref());
+    let user_rsp =
+        initial_stack_rsp(argv, env, exe, layout.stack_top).ok_or(SpawnError::ArgsTooBig)?;
 
     with_table(|t| {
         let id = t.current;
@@ -5324,23 +5834,24 @@ pub fn exec_replace(
         // registers, because they are what the new program runs with until the
         // next switch, and the task's saved block, because that is what a switch
         // to it would restore.
+        //
+        // The claim comes first: `fninit` is a floating-point instruction, and
+        // under the lazy scheme a task that never touched the FPU is running
+        // with `CR0.TS` set, so resetting without claiming would trap here - in
+        // the kernel, with the table lock held. Claiming is also the honest
+        // record of what follows: once the reset block is in the live registers
+        // this task genuinely owns them, and saying so saves the new image a
+        // pointless fault in its first `memcpy`.
+        unsafe { crate::arch::context::claim_live_fpu() };
         unsafe { crate::arch::context::reset_live_fpu() };
         task.context.fpu = crate::arch::context::FpuState::reset();
+        task.fpu_live = true;
 
         // --- Build new address space ---
         let mut space = AddressSpace::new();
-        let loaded = load_user(&mut space, &image, interp.as_ref());
+        let loaded = load_user(&mut space, &image, interp.as_ref(), &layout);
 
-        let brk_base = image
-            .segments
-            .iter()
-            .map(|s| s.vaddr + s.memsz)
-            .max()
-            .map_or(0, |end| {
-                (end + crate::mm::pframe::PAGE_SIZE - 1) & !(crate::mm::pframe::PAGE_SIZE - 1)
-            });
-
-        write_arg_block(space.root(), user_rsp, argv, env, exe, &image, loaded.base);
+        write_arg_block(space.root(), user_rsp, argv, env, exe, &loaded);
 
         // --- Reset process state ---
         //
@@ -5359,9 +5870,10 @@ pub fn exec_replace(
         // kernel does not yet, and the threads that were there keep the old
         // group until they exit.
         task.mm = Mm::new(id, new_root, loaded.frames);
-        task.brk_base = brk_base;
+        task.brk_base = loaded.brk;
         task.brk_pages = 0;
-        task.mmap_cursor = crate::syscall::MMAP_BASE;
+        task.mmap_cursor = layout.mmap_top;
+        task.stack_top = loaded.stack_top;
         task.exe = alloc::string::String::from(exe);
         // The program that was running is being replaced, and so is the
         // command line that described it: a process that `exec`s is the same
@@ -5387,9 +5899,22 @@ pub fn exec_replace(
                     to_close.push(fd);
                 }
             }
+            // The descriptions are held until the batch is whole, because the
+            // question each of them is asked - "is this the last reference?" -
+            // can only be answered while every one of them is still counted.
+            let mut closing = alloc::vec::Vec::new();
             for fd in to_close {
+                if let Ok(file) = fds.clone_at(fd) {
+                    closing.push(file);
+                }
                 let _ = fds.close(fd);
             }
+            #[cfg(target_os = "none")]
+            {
+                crate::drivers::virtio::input::close_at_exit(&closing);
+                crate::drivers::uinput::close_at_exit(&closing);
+            }
+            drop(closing);
         }
 
         // Point the CPU at the new image. Dropping the old address space left it
@@ -5471,16 +5996,23 @@ fn split_cow(space: &mut crate::arch::paging::AddressSpace, mm: &Mm, virt: usize
 /// because a push happens next to the stack pointer and a wild pointer does
 /// not; and it must stay above the stack's floor. Anything else is still the
 /// process's own fault to bear.
+///
+/// Both ends of that region are the process's own, not the kernel's: the floor
+/// is measured from the stack top the process was *laid out* with, which every
+/// program draws afresh at `exec`. A growth check against the old constant would
+/// hand a process pages above the stack it was given, in a region its own page
+/// tables say nothing about.
 pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
-    if addr >= USER_STACK_TOP {
-        return false;
-    }
     let page = addr & !(PAGE_SIZE - 1);
     if rsp < page || rsp - page > STACK_GROWTH_SLACK {
         return false;
     }
     with_table(|t| {
         let id = t.current;
+        let stack_top = t.task(id).stack_top;
+        if addr >= stack_top {
+            return false;
+        }
         // RLIMIT_STACK is the floor, read from the faulting task rather than a
         // compile-time constant: a soft limit below the reserved region stops
         // growth early (SIGSEGV beyond it), and a raised or infinite one is
@@ -5491,7 +6023,7 @@ pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
             .get(3)
             .map_or(USER_STACK_MAX as u64, |r| r.cur)
             .min(USER_STACK_MAX as u64) as usize;
-        if page < USER_STACK_TOP - stack_max {
+        if page < stack_top - stack_max {
             return false;
         }
         // The group's space, for the same reason a copy-on-write fault looks
@@ -5631,6 +6163,8 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let ctty = parent.ctty;
         let identity = parent.identity.clone();
         let umask = parent.umask;
+        let oom_score_adj = parent.oom_score_adj;
+        let oom_score_adj_min = parent.oom_score_adj_min;
         let rlimits = parent.rlimits;
         let seccomp_strict = parent.seccomp_strict;
         let priority = parent.priority;
@@ -5640,6 +6174,10 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let brk_base = parent.brk_base;
         let brk_pages = parent.brk_pages;
         let mmap_cursor = parent.mmap_cursor;
+        // The main stack belongs to the process, and so does where it ends: a
+        // thread that grew one of its own pages past that bound would be growth
+        // the leader's layout never reserved room for.
+        let stack_top = parent.stack_top;
         let exe = parent.exe.clone();
         let argv = alloc::sync::Arc::clone(&parent.argv);
         let parent_tls = parent.tls;
@@ -5651,17 +6189,14 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         // Interrupts stay off until the thread's `iretq` restores the flags it
         // was created with, exactly as a fork child's does.
         let mut context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
-        // The child's floating-point registers are its creator's: they are part
-        // of what `fork` and a thread-creating `clone` copy, and `bootstrap`
-        // would otherwise hand over the architectural reset state. The live
-        // registers *are* the creator's at this point - the kernel touches none
-        // of them, so the syscall it is inside did not disturb them, and any
-        // preemption since it was switched in restored them from its own saved
-        // block.
-        unsafe { context::save_live_fpu(&mut context.fpu) };
+        // The child's floating-point registers are its creator's, read the same
+        // way `fork`'s child reads them: from the registers if the parent still
+        // holds them, from its saved block if it does not.
+        context.fpu = t.inherit_fpu(parent_id);
 
         t.tasks[slot] = Some(Task {
             context,
+            fpu_live: false,
             priority,
             stack: Some(stack),
             exited: false,
@@ -5709,11 +6244,14 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             // same creation mask - a thread creates files as its process does.
             identity,
             umask,
+            oom_score_adj,
+            oom_score_adj_min,
             rlimits,
             seccomp_strict,
             brk_base,
             brk_pages,
             mmap_cursor,
+            stack_top,
             exe,
             argv,
             child_tid: if request.flags & nr::CLONE_CHILD_SETTID != 0 {

@@ -33,6 +33,11 @@ pub mod console;
 pub mod date;
 #[cfg(target_os = "none")]
 pub mod drivers;
+/// evdev's record window and its clients: which reader sees which event, and
+/// what a grab does to the answer. Not target-gated - the driver that fills the
+/// window needs a virtio ring and a clock, but the policy over it is arithmetic,
+/// and arithmetic is worth a host test.
+pub mod evdev;
 /// Kernel logging: `tracing` events, formatted onto the serial console.
 /// Ungated so the level names and the command-line parsing stay testable on
 /// the host; only the subscriber that writes to COM1 is machine-specific.
@@ -42,6 +47,11 @@ pub mod mm;
 /// its tests are the conformance programs that run on the machine.
 #[cfg(target_os = "none")]
 pub mod net;
+/// The PCI devices the machine has, and the files `/sys` and `/proc` describe
+/// them with. Not target-gated: the model and every spelling are pure, and the
+/// formats pciutils parses deserve tests a host can run. Only the port I/O
+/// that *finds* the devices is machine-dependent, and that lives in `drivers`.
+pub mod pci;
 /// The kernel's random source, which `/dev/urandom` and `getrandom(2)` both
 /// read. Not target-gated: it runs on the host so its tests can prove the one
 /// property that matters - that two reads are not the same bytes.
@@ -54,6 +64,10 @@ pub mod syscall;
 /// nothing here needs hardware, and the wire format is worth testing
 /// on the host.
 pub mod uevent;
+/// uinput's interface: the requests and bitmaps a userspace program declares an
+/// input device with. Not target-gated, for the same reason as `evdev` - the
+/// arithmetic is worth a host test, and the device that uses it is bare metal.
+pub mod uinput;
 pub mod vfs;
 
 #[cfg(target_os = "none")]

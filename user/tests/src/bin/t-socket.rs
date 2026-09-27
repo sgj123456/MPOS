@@ -83,10 +83,12 @@ fn main() {
     }
 
     // AF_UNIX is spoken for: the path family opens, and t-unix is the
-    // test of what it answers. The refusals that remain are the family
-    // *types* this kernel still declines - a datagram unix socket gets
-    // EOPNOTSUPP at the type line, and an AppleTalk-style family still
-    // gets EAFNOSUPPORT at the family line.
+    // test of what it answers. STREAM, DGRAM and SEQPACKET all open -
+    // the last because udevd cannot start without it, served as the
+    // byte stream this family does have (the kernel's SOCK_SEQPACKET
+    // note tells the whole trade). The refusals that remain are the
+    // family/type pairs with no story at all: SEQPACKET over IPv4 is
+    // ESOCKTNOSUPPORT, and an AppleTalk-style family is EAFNOSUPPORT.
     match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
         Ok(fd) => {
             r.check("socket(AF_UNIX, SOCK_STREAM) opens the path family", true);
@@ -99,11 +101,10 @@ fn main() {
             );
         }
     }
-    let err = socket(AddressFamily::UNIX, SocketType::SEQPACKET, None).unwrap_err();
-    r.check_errno(
-        "a unix type without a kernel story is EOPNOTSUPP",
-        err,
-        rustix::io::Errno::OPNOTSUPP,
+    let seqpacket = socket(AddressFamily::UNIX, SocketType::SEQPACKET, None);
+    r.check(
+        "socket(AF_UNIX, SOCK_SEQPACKET) opens - udevd's control socket shape",
+        seqpacket.is_ok(),
     );
     let err = socket(AddressFamily::INET, SocketType::SEQPACKET, None).unwrap_err();
     r.check_errno(

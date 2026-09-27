@@ -14,12 +14,48 @@ pub(crate) const EXTENT_ROOT_BYTES: usize = 60;
 /// ext4 allows five levels; deeper than that is a corrupt tree, not a big
 /// one, and walking it would recurse into whatever the child block says.
 pub(crate) const EXTENT_MAX_DEPTH: u16 = 5;
-/// The top bit of `ee_len` marks an extent that is allocated but not written:
-/// a hole that has a block behind it. Reads see zeros, writes clear it.
-pub(crate) const EXTENT_UNWRITTEN: u16 = 1 << 15;
-/// The most a written extent can cover: the length field's other fifteen
-/// bits, minus the one reserved value of zero.
+/// The longest run one entry can describe: `EXT_INIT_MAX_LEN`, half the
+/// sixteen-bit length field.
 pub(crate) const EXTENT_INIT_MAX: u16 = 32768;
+
+/// The length an extent entry covers, and whether it is *unwritten*: blocks
+/// that are allocated but hold nothing yet, which read as zeros.
+///
+/// ext4 keeps no flag bit beside the length - the length **is** the flag. A
+/// value of at most 32768 is a written extent of that many blocks; a larger
+/// one is an unwritten extent of `ee_len - 32768` blocks, because an
+/// unwritten run can never be the full 32768 long.
+///
+/// The boundary is the whole reason this is a function rather than a mask.
+/// 32768 is a legal *written* length - it is the most one entry can cover - so
+/// testing the top bit reads the largest extent a filesystem can write as a
+/// zero-length hole, and every block of it comes back as zeros. That is not a
+/// rare shape: any file large enough for the allocator to cap a run at exactly
+/// 32768 blocks has one, which is how a 180 MB shared library read as 128 MB
+/// of zeros and loading it failed with "Exec format error".
+pub(crate) fn ext_len(raw: u16) -> (u64, bool) {
+    if raw <= EXTENT_INIT_MAX {
+        (raw as u64, false)
+    } else {
+        ((raw - EXTENT_INIT_MAX) as u64, true)
+    }
+}
+
+/// The length field [`ext_len`] reads, written back: a written run is its
+/// length and an unwritten one is its length plus 32768.
+///
+/// Anything that copies an extent entry - a truncate rewriting the head of a
+/// run it kept - has to go through here. Writing the length alone turns an
+/// unwritten run into a written one, and a hole the file never wrote becomes
+/// whatever the block's last owner left on the disk.
+pub(crate) fn ext_raw_len(len: u64, unwritten: bool) -> u16 {
+    let len = len as u16;
+    if unwritten {
+        len + EXTENT_INIT_MAX
+    } else {
+        len
+    }
+}
 
 // ---- extent node images, pure over bytes ----
 
@@ -106,9 +142,11 @@ pub(crate) fn ext_insert(node: &mut [u8], at: usize) {
     ext_set_entries(node, count + 1);
 }
 
-/// Leaf entry `i`: the logical block it starts at, its length, and the
-/// physical block that run begins on. The length's top bit is the unwritten
-/// flag rather than part of the number, so callers mask before using it.
+/// Leaf entry `i`: the logical block it starts at, its raw length field, and
+/// the physical block that run begins on.
+///
+/// The length comes back raw because it is two things at once - see
+/// [`ext_len`], which is the only thing that should read it.
 pub(crate) fn ext_leaf(node: &[u8], i: usize) -> (u32, u16, u64) {
     let at = EXTENT_HEADER + i * EXTENT_ENTRY;
     let start = le32(node, at + 8) as u64 | ((le16(node, at + 6) as u64) << 32);

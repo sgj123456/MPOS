@@ -48,9 +48,19 @@ pub(crate) const AF_INET6: u16 = 10;
 pub(crate) const SOCK_STREAM: u16 = 1;
 pub(crate) const SOCK_DGRAM: u16 = 2;
 pub(crate) const SOCK_RAW: u16 = 3;
-/// `SOCK_SEQPACKET`: message boundaries over a stream. Nothing here carries
-/// them, but the number is part of the ABI and is named to be answered, not
-/// to be mistaken for something else.
+/// `SOCK_SEQPACKET`: message boundaries over a stream.
+///
+/// Nothing here carries the boundaries, and both doors serve the type as the
+/// byte stream this family does have. That is a trade, not an oversight:
+/// udevd creates *both* shapes - its control socket is a `SOCK_SEQPACKET`
+/// socket and its worker notification channel a `SOCK_SEQPACKET` socketpair -
+/// and a refusal at either one does not withhold a feature, it stops the
+/// device manager from starting at all ("error initializing udev control
+/// socket"), after which every device on the machine goes untagged and no
+/// compositor can see a keyboard. What udevd sends over them is one byte at a
+/// time, which a stream carries correctly; a caller that needed the
+/// boundaries themselves would be the one to tell the difference, and nothing
+/// on this machine is one.
 const SOCK_SEQPACKET: u16 = 5;
 const SOCK_NONBLOCK: u32 = 0o4000;
 const SOCK_CLOEXEC: u32 = 0o2000000;
@@ -85,9 +95,12 @@ const SO_PEERCRED: usize = 17;
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
 /// `recvmsg` flags: ask for received descriptors to be `O_CLOEXEC`, and the
-/// kernel's signal that control data was dropped for want of room.
+/// kernel's two signals about a delivery that did not fit - `MSG_CTRUNC` for
+/// control data dropped for want of room, `MSG_TRUNC` for a datagram cut short
+/// of the caller's buffer.
 const MSG_CMSG_CLOEXEC: usize = 0x10000;
 const MSG_CTRUNC: i32 = 0x8;
+const MSG_TRUNC: i32 = 0x20;
 /// One `cmsghdr` on x86_64: a `size_t` length then two `int`s, padded to a
 /// word - `CMSG_ALIGN(16)`, so the data always starts at offset 16.
 const CMSG_HDRLEN: usize = 16;
@@ -471,12 +484,41 @@ fn recvmsg_netlink(
     name: usize,
     namelen: u32,
     handle: usize,
+    dontwait: bool,
 ) -> isize {
+    // A blocking read on an empty queue *waits*: that is what a device listener
+    // is - udevd's workers and `udevadm monitor` park here between events and
+    // expect to sleep until one arrives. Answering `EAGAIN` anyway sends such a
+    // caller round its own loop at full speed, consuming CPU the way a spinlock
+    // lost does, and - because udevd's manager and its workers then never settle
+    // on a quiet machine it can shut down - it is why a `killall udevd` hung.
+    // Only `MSG_DONTWAIT` or `O_NONBLOCK` earns `EAGAIN`, as it does on Linux.
+    if !dontwait {
+        let waited = park_until(|| crate::uevent::ready(handle));
+        if waited != 0 {
+            return waited;
+        }
+    }
     // A datagram is delivered whole or not at all; a caller with a shorter
     // buffer gets what fits, as Linux's datagram sockets do.
-    let Some(event) = crate::uevent::recv(handle) else {
+    //
+    // The bytes are the kernel's legacy uevent block - `add@/devices/...\0`
+    // then the `KEY=value\0` entries - with no `struct nlmsghdr` in front.
+    // That is deliberate and measured: an attempt to wrap them in a header
+    // here made `udevadm monitor` print no more than it did before, and it took
+    // the initramfs's own listeners (which read the block directly, and are the
+    // reason `/run/udev/data` holds anything at boot) from parsing it at all.
+    // The bytes are the kernel's legacy uevent block (`add@/devices/...\0` then
+    // the `KEY=value\0` entries) with no `struct nlmsghdr` in front, which is
+    // what `nlplug-findfs` reads and what the initramfs depends on: wrapping
+    // them in a header was tried, and while `udevd` and `udevadm monitor` went
+    // on receiving the same bytes, the initramfs stopped finding its block
+    // devices at all. A listener that wants a netlink frame is the open
+    // question; the boot is not the place to answer it.
+    let Some((seq, event)) = crate::uevent::recv(handle) else {
         return err::EAGAIN;
     };
+    let _ = seq;
     let n = event.len().min(len);
     unsafe {
         core::ptr::copy_nonoverlapping(event.as_ptr(), buf as *mut u8, n);
@@ -689,9 +731,12 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         // `if_nametoindex` opens one as the mere handle for its
         // `SIOCGIFINDEX` ioctl, so a refusal turns every device-name
         // lookup on this kernel into "can't find device". What the family
-        // still lacks is the datagram *transfer* - SEQPACKET and the
-        // connectionless send paths are the documented v1 gap.
-        if typ != SOCK_STREAM as u32 && typ != SOCK_DGRAM as u32 {
+        // still lacks is the datagram *transfer* - the connectionless send
+        // paths are the documented v1 gap.
+        //
+        // SEQPACKET is accepted for a stronger version of the same reason;
+        // see the type's own note above.
+        if typ != SOCK_STREAM as u32 && typ != SOCK_DGRAM as u32 && typ != SOCK_SEQPACKET as u32 {
             return err::EOPNOTSUPP;
         }
         let sock = crate::net::unix::alloc(typ as u16);
@@ -1078,7 +1123,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // a previous `connect` pinned, and without either it is `ENOTCONN`.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         if let Some(sock) = file.inode().as_unix() {
-            if sock.is_dgram() {
+            if sock.carries_messages() {
                 if !crate::syscall::buffer_ok(buf, len, false, from_user) {
                     return err::EFAULT;
                 }
@@ -1183,7 +1228,7 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
     // stream, the shape every caller in this image uses it in.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         if let Some(sock) = file.inode().as_unix() {
-            if sock.is_dgram() {
+            if sock.carries_messages() {
                 let (name, namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
                     Ok(fields) => fields,
                     Err(e) => return e,
@@ -1477,7 +1522,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     // message truncates it, discarding the rest, as unix datagrams do.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         if let Some(sock) = file.inode().as_unix() {
-            if sock.is_dgram() {
+            if sock.carries_messages() {
                 if !crate::syscall::buffer_ok(buf, len, true, from_user) {
                     return err::EFAULT;
                 }
@@ -1619,7 +1664,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     // sender's name back through `msg_name`.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         if let Some(sock) = file.inode().as_unix() {
-            if sock.is_dgram() {
+            if sock.carries_messages() {
                 let (name, _namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
                     Ok(fields) => fields,
                     Err(e) => return e,
@@ -1641,8 +1686,8 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
                     return err::EAGAIN;
                 }
                 let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-                return match crate::net::unix::recv_dgram(sock, out) {
-                    Ok((n, from)) => {
+                return match crate::net::unix::recv_dgram_cred(sock, out) {
+                    Ok((n, from, cred, cut)) => {
                         if name != 0 {
                             let peer = from.unwrap_or_default();
                             let bytes = crate::net::unix::sockaddr_un_bytes(&peer);
@@ -1657,6 +1702,34 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
                                 );
                                 ((msghdr + 8) as *mut u32).write_unaligned(bytes.len() as u32);
                             }
+                        }
+                        // The sender's credentials ride along when the reader
+                        // asked for them, and `msg_controllen` says how much
+                        // space the kernel actually used either way - leaving
+                        // the caller's capacity in place would have it walk a
+                        // control buffer nobody filled.
+                        //
+                        // `msg_flags` has two independent reports in it, and a
+                        // caller can only act on them if they are not confused
+                        // for each other: `MSG_CTRUNC` for control data the
+                        // buffer could not hold, `MSG_TRUNC` for the message
+                        // itself. A short return value cannot tell those apart -
+                        // a datagram that exactly filled its buffer and one that
+                        // was cut off look identical from the count alone.
+                        let want = if sock.passcred() { Some(cred) } else { None };
+                        let (used, ctrunc) = unsafe {
+                            emit_unix_control(msghdr, Vec::new(), want, false, from_user)
+                        };
+                        let mut flags = 0;
+                        if ctrunc {
+                            flags |= MSG_CTRUNC;
+                        }
+                        if cut {
+                            flags |= MSG_TRUNC;
+                        }
+                        unsafe {
+                            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags);
+                            ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(used);
                         }
                         n as isize
                     }
@@ -1697,7 +1770,15 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             // caller meant to keep.
             return err::EOPNOTSUPP;
         }
-        if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
+        // A handover that is already due, and no bytes to go with it, is the
+        // one case where reading would park forever on something the caller
+        // already has in hand: a `sendmsg` that carried descriptors and no
+        // bytes leaves the stream exactly where it was, so its record is due
+        // the moment it is queued and no byte will ever arrive *with* it. Ask
+        // before reading, so the read can answer with the record instead.
+        let empty_handover =
+            on_channel(&file, |c| c.scm_due()).unwrap_or(false) && !file.inode().poll_ready().read;
+        if dontwait(fd, args[2]) && !file.inode().poll_ready().read && !empty_handover {
             return err::EAGAIN;
         }
         let mut n = 0isize;
@@ -1705,11 +1786,18 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             if !crate::syscall::buffer_ok(buf, len, true, from_user) {
                 return err::EFAULT;
             }
-            let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-            n = match file.read(out) {
-                Ok(n) => n as isize,
-                Err(e) => return crate::syscall::err_of(e),
-            };
+            if !empty_handover {
+                let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+                n = match file.read(out) {
+                    Ok(n) => n as isize,
+                    Err(e) => return crate::syscall::err_of(e),
+                };
+            }
+            // Zero bytes, deliberately: the caller gets the descriptors and a
+            // stream that has not ended. A receiver that sees a short read must
+            // consult its control buffer before concluding end-of-stream - which
+            // is the cost of asking for a record that has no bytes to arrive
+            // with, and the alternative is the deadlock it replaces.
         }
         // Pop any descriptor handover queued for this channel and decide
         // whether the peer's credentials ride along.
@@ -1807,7 +1895,15 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         return e;
     }
     if crate::uevent::exists(handle) {
-        return recvmsg_netlink(msghdr, buf, len, name, namelen, handle);
+        return recvmsg_netlink(
+            msghdr,
+            buf,
+            len,
+            name,
+            namelen,
+            handle,
+            dontwait(fd, args[2]),
+        );
     }
     let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
     let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
@@ -2089,8 +2185,14 @@ fn raw_recv(
     nonblock: bool,
 ) -> Result<(usize, Option<IpEndpoint>), isize> {
     loop {
-        // Receive into a temporary buffer inside the `with` closure, then
-        // copy the whole packet to the caller's buffer.
+        // The packet is received straight into the caller's buffer. It used to
+        // land in a fresh 1500-byte `Vec` that was then copied out, which is one
+        // heap allocation and one extra pass over up to a full MTU per datagram
+        // - and the copy had a second cost: a packet larger than the caller's
+        // buffer was detected *after* the allocation had been filled, so the
+        // refusal came with the memory already spent. `recv_slice` answers
+        // `Truncated` for that case instead, which is the same `EMSGSIZE` with
+        // nothing to allocate.
         let result: Option<Result<(usize, Option<IpEndpoint>), isize>> =
             super::with(handle, |stack, entry| {
                 stack.poll_once();
@@ -2102,27 +2204,21 @@ fn raw_recv(
                     return Err(err::ENOTSOCK);
                 };
                 let sock = stack.sockets.get_mut::<raw_sock::Socket>(*sock_handle);
-                let mut tmp = alloc::vec![0u8; 1500];
-                let n = match sock.recv_slice(&mut tmp) {
+                let n = match sock.recv_slice(out) {
                     Ok(n) => n,
                     Err(raw_sock::RecvError::Exhausted) => return Err(err::EWOULDBLOCK),
                     Err(raw_sock::RecvError::Truncated) => return Err(err::EMSGSIZE),
                 };
-                tmp.truncate(n);
-                if n > out.len() {
-                    return Err(err::EMSGSIZE);
-                }
                 // The source address is the IP header's sender, which is
                 // also what Linux's `recvfrom` names for a raw socket.
                 let src = if n >= 20 {
                     Some(IpEndpoint::new(
-                        IpAddress::v4(tmp[12], tmp[13], tmp[14], tmp[15]),
+                        IpAddress::v4(out[12], out[13], out[14], out[15]),
                         0,
                     ))
                 } else {
                     None
                 };
-                out[..n].copy_from_slice(&tmp);
                 Ok((n, src))
             });
         match result {
@@ -2680,17 +2776,15 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
         _ => return err::EAFNOSUPPORT,
     }
     let type_bits = raw_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
-    match type_bits {
-        t if t == SOCK_STREAM as u32 => {}
-        // Pairs that carry message boundaries rather than a byte stream: real
-        // shapes on Linux, and shapes this kernel does not have. Answering
-        // plainly beats answering wrongly - a caller that gets a pair here
-        // would go on to rely on boundaries that are not there.
-        t if t == SOCK_DGRAM as u32 || t == SOCK_SEQPACKET as u32 => {
-            return err::EOPNOTSUPP;
-        }
+    let message_pair = match type_bits {
+        t if t == SOCK_STREAM as u32 => false,
+        // The two types that carry messages: a pair of these is two ends
+        // pointing at each other, each `write` one whole message in the
+        // other's queue. udevd's worker notification channel is one of them,
+        // and it is what its workers announce themselves with.
+        t if t == SOCK_DGRAM as u32 || t == SOCK_SEQPACKET as u32 => true,
         _ => return err::ESOCKTNOSUPPORT,
-    }
+    };
     if protocol != 0 {
         return err::EPROTONOSUPPORT;
     }
@@ -2698,7 +2792,18 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
         return err::EFAULT;
     }
 
-    let (first, second) = crate::vfs::pipe::DuplexEnd::pair();
+    // The pair carries the credentials of the process that made it: each
+    // end's peer is the other half, and the other half was created here. This
+    // is what `getsockopt(SO_PEERCRED)` answers on Linux, and what a
+    // compositor's `wl_client_create` asks a launcher socket.
+    let creator = crate::net::unix::self_cred();
+    let (first, second) = if message_pair {
+        let (a, b) = crate::net::unix::pair(type_bits as u16);
+        (a as Arc<dyn Inode>, b as Arc<dyn Inode>)
+    } else {
+        let (a, b) = crate::vfs::pipe::DuplexEnd::pair((creator.pid, creator.uid, creator.gid));
+        (a as Arc<dyn Inode>, b as Arc<dyn Inode>)
+    };
     let fd0 = match crate::vfs::file::open_inode(first) {
         Ok(fd) => fd,
         Err(e) => return crate::syscall::err_of(e),
@@ -3035,6 +3140,28 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
             _ => err::ENOPROTOOPT,
         };
     }
+    // A `socketpair` end takes the same two knobs, for the same reason it
+    // answers the same reads: the caller that sets `SO_PASSCRED` on it is the
+    // one that will read `SO_PEERCRED` back.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(pair) = file.inode().as_duplex()
+    {
+        if level != SOL_SOCKET {
+            return err::ENOPROTOOPT;
+        }
+        if optval == 0 || optlen < 4 || !crate::syscall::buffer_ok(optval, 4, false, from_user) {
+            return err::EINVAL;
+        }
+        let val = unsafe { (optval as *const i32).read_unaligned() };
+        return match optname {
+            SO_PASSCRED => {
+                pair.set_passcred(val != 0);
+                0
+            }
+            SO_REUSEADDR | SO_SNDBUF | SO_RCVBUF | SO_KEEPALIVE | SO_LINGER => 0,
+            _ => err::ENOPROTOOPT,
+        };
+    }
     // A vsock socket is not in the network registry; its options are the
     // recorded-no-op kind - the four every stream socket is asked for at
     // setup, accepted by name so a caller's setup never fails on a family
@@ -3136,12 +3263,33 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen_ptr) =
         (args[0] as i32, args[1], args[2], args[3], args[4]);
     // A unix socket's own options, answered before the network registry (which
-    // it is not part of). `SO_PEERCRED` is the authentication read: the peer's
-    // `ucred` captured when the connection was made. `SO_PASSCRED` reads back
+    // it is not part of) - and the same answers for the anonymous pair
+    // `socketpair(2)` makes, which is not in it either. `SO_PEERCRED` is the
+    // authentication read: the peer's `ucred`, captured when the connection was
+    // made or, for a pair, when it was created. `SO_PASSCRED` reads back
     // whether the reader asked for credentials on every message.
-    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_unix()
-    {
+    //
+    // The pair is not a corner case: it is the channel a compositor uses to
+    // launch its own clients, and libwayland asks it `SO_PEERCRED` before it
+    // will take the descriptor at all - a pair that fell through to the
+    // registry's `ENOTSOCK` cost weston every client it starts, which is what
+    // it did.
+    let channel = crate::sched::current_fds()
+        .clone_at(fd)
+        .ok()
+        .and_then(|file| {
+            let inode = file.inode();
+            inode
+                .as_unix()
+                .map(|s| (s.peer_cred().unwrap_or_default(), s.passcred()))
+                .or_else(|| {
+                    inode.as_duplex().map(|d| {
+                        let (pid, uid, gid) = d.peer_cred();
+                        (crate::net::unix::UCred { pid, uid, gid }, d.passcred())
+                    })
+                })
+        });
+    if let Some((c, passcred)) = channel {
         if level != SOL_SOCKET {
             return err::ENOPROTOOPT;
         }
@@ -3163,7 +3311,6 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
             return err::EINVAL;
         }
         if cred {
-            let c = sock.peer_cred().unwrap_or_default();
             unsafe {
                 if cap >= 4 {
                     (optval as *mut u32).write_unaligned(c.pid);
@@ -3177,7 +3324,7 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
             }
         } else {
             let value: i32 = match optname {
-                SO_PASSCRED => sock.passcred() as i32,
+                SO_PASSCRED => passcred as i32,
                 SO_TYPE => SOCK_STREAM as i32,
                 // No error is ever pending between calls on a unix channel.
                 SO_ERROR => 0,

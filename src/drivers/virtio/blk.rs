@@ -188,6 +188,12 @@ impl VirtioBlk {
         let sectors = device.capacity();
         assert!(sectors > 0, "virtio-blk reports a zero-capacity disk");
 
+        // The device is this driver's from here, which is what `lspci -k`
+        // reads back. Recorded after the transport and the device both came
+        // up, so a claim means a driver really bound rather than merely
+        // matched.
+        pci::claim(&func, super::PCI_DRIVER);
+
         Some(Arc::new(VirtioBlk {
             device: Mutex::new(RefCell::new(device)),
             sectors,

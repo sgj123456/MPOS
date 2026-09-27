@@ -164,7 +164,7 @@ fn kernel_main(info: &BootInfo) {
 
     // Whether the console should *also* mirror to the serial wire once it is on
     // the framebuffer. Default on (mirror mode, the historical `run` behaviour);
-    // a `mpos.nomirror` boot - gui mode, from `cargo xtask run --console gui` -
+    // a `mpos.nomirror` boot - gui mode, from `cargo xtask run --mode gui` -
     // asks for the window alone and leaves the wire quiet after takeover.
     mpos::console::set_mirror_wanted(
         !boot::cmdline()
@@ -176,7 +176,7 @@ fn kernel_main(info: &BootInfo) {
     // kernel console never moves onto the framebuffer - the scanout is left
     // for a rootful Wayland compositor to draw, and the render task only
     // presents when that compositor asks (`FBIOPAN_DISPLAY`), never paints a
-    // text grid over it. `cargo xtask run --console compositor` sets it.
+    // text grid over it. `cargo xtask run --mode weston` sets it.
     mpos::console::set_compositor(
         boot::cmdline()
             .split_whitespace()
@@ -203,6 +203,7 @@ fn kernel_main(info: &BootInfo) {
         check_vfs();
     }
 
+    init_pci();
     init_blk();
     init_net();
     init_virtio();
@@ -335,6 +336,25 @@ fn init_vfs(info: &BootInfo) {
     // disk in it, and `/init` mounting its own got `EBUSY` and kept the crippled
     // one. Devices belong to whoever mounts /dev, and on this machine that is
     // the initramfs's own init script.
+}
+
+/// Walk the PCI bus once, and publish what is on it.
+///
+/// This is the first thing that touches a device, and it has to be: describing
+/// a BAR means asking the device what it decodes, which means writing all ones
+/// into the register and reading back what it answers. Done here, before any
+/// driver has claimed anything, the only registers disturbed are ones nothing
+/// has used yet - and every one of them is written back. Done later, a device
+/// could be asked to answer for an address nobody assigned it while a driver
+/// was mid-transfer.
+///
+/// What it publishes is what `/sys` and `/proc` describe the machine from. The
+/// *drivers* come after, and record themselves with [`drivers::pci::claim`], so
+/// `lspci -k` names a driver that really did bind rather than one that merely
+/// matches.
+fn init_pci() {
+    let count = drivers::pci::init();
+    println!("pci: {count} functions enumerated");
 }
 
 fn init_blk() {

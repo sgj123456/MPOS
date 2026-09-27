@@ -17,8 +17,14 @@
 //! kernel never touches those registers, so a syscall does not disturb them, but
 //! it does *preempt*, and the program that runs next has no reason to leave the
 //! registers as it found them. That state is [`FpuState`], carried in the first
-//! 512 bytes of every [`Context`], and moved by the `fxsave`/`fxrstor` pair in
-//! `mpos_context_switch`.
+//! 512 bytes of every [`Context`], and handled *lazily*: `mpos_context_switch`
+//! sets `CR0.TS` on the task it enters instead of loading anything, so a task
+//! that never runs a floating-point instruction never pays for a 512-byte move
+//! it would not read, and the `#NM` its first such instruction provokes is what
+//! restores its own image. The outgoing half stays eager and is done in Rust -
+//! [`Context`]'s caller writes the leaving task's registers out before the
+//! switch, because that is the last moment at which they are uncontroversially
+//! its own.
 //!
 //! Leaving it out is not a missing optimisation, it is a wrong answer that shows
 //! up as memory corruption. musl's `__init_tp` builds `{td, td}` in `xmm0`, makes
@@ -31,6 +37,8 @@
 //! read-only first page of its image.
 
 use core::arch::global_asm;
+
+use x86_64::registers::control::{Cr0, Cr0Flags};
 
 /// The 512 bytes `fxsave` and `fxrstor` move: the x87 control/status/tag words,
 /// the eight x87 registers, `MXCSR` and the sixteen XMM registers.
@@ -80,6 +88,11 @@ impl FpuState {
     /// The address `fxsave`/`fxrstor` take, for the assembly to use.
     fn ptr_mut(&mut self) -> *mut u8 {
         self.bytes.as_mut_ptr()
+    }
+
+    /// The same address for the read-only half: `fxrstor` reads the image.
+    fn ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
     }
 
     /// The image as a plain array, for a tracer to hand to ring 3.
@@ -142,6 +155,50 @@ pub unsafe fn reset_live_fpu() {
             "fninit",
             "ldmxcsr [{mxcsr}]",
             mxcsr = in(reg) &raw const DEFAULT_MXCSR,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Clear `CR0.TS`, so floating-point instructions execute instead of trapping.
+///
+/// Two callers, and both are saying the same thing - "the registers are the
+/// running task's now": the `#NM` handler, immediately before it loads the
+/// image it trapped for, and [`reset_live_fpu`]'s caller on `execve`, which is
+/// about to make the registers hold a reset state nobody else can claim.
+///
+/// # Safety
+///
+/// Whoever calls this owns the registers from here until the next switch. If
+/// another task's image is in them, this does not move it out - it makes the
+/// next floating-point instruction read that task's state and then destroy it.
+pub unsafe fn claim_live_fpu() {
+    unsafe {
+        Cr0::update(|flags| flags.remove(Cr0Flags::TASK_SWITCHED));
+    }
+}
+
+/// Whether the CPU is currently refusing floating-point instructions.
+pub fn fpu_trapped() -> bool {
+    Cr0::read().contains(Cr0Flags::TASK_SWITCHED)
+}
+
+/// Load a saved image back into the hardware registers.
+///
+/// `CR0.TS` has to be clear already - `fxrstor` faults on it like any other
+/// floating-point instruction - which is what [`claim_live_fpu`] is for. The
+/// pair is the two halves of the deferred restore the `#NM` handler performs.
+///
+/// # Safety
+///
+/// Same requirement as [`save_live_fpu`], plus that the caller has actually
+/// claimed the registers: loading an image on top of one another task still
+/// owns loses that task's state.
+pub unsafe fn restore_fpu(state: &FpuState) {
+    unsafe {
+        core::arch::asm!(
+            "fxrstor [{ptr}]",
+            ptr = in(reg) state.ptr(),
             options(nostack, preserves_flags),
         );
     }
@@ -309,6 +366,12 @@ pub unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
 /// them is the job of whoever enabled them in the first place - a critical
 /// section's release, or the `iretq` of the interrupt that caused the preemption.
 ///
+/// The task entered resumes with `CR0.TS` set and its floating-point image *not*
+/// loaded; the `#NM` handler is what finishes the job. Unlike the general
+/// registers this is not a detail the caller may skip: nothing else on the way
+/// in would restore the image, so a caller that bypasses this function to resume
+/// a task has to arrange the restore itself.
+///
 /// Switching to the context that is already running is a no-op rather than a
 /// fault: the save and the restore cancel out.
 ///
@@ -429,26 +492,27 @@ global_asm!(
     ".p2align 4",
     "mpos_context_switch:",
     "    cli",
-    // The floating-point half of the switch. `fxsave`/`fxrstor` want a
-    // 16-byte-aligned operand, which is why `FpuState` is 512 bytes of
-    // `align(16)` at offset zero: `[rdi]` and `[rsi]` are the *Contexts*
-    // themselves, and every one of them is 16-byte-aligned because the struct
-    // starts with an aligned member.
+    // The floating-point state is deliberately *not* moved here. It used to be
+    // an unconditional `fxsave`/`fxrstor` pair on the 512 bytes at offset zero
+    // of each `Context`, which cost every switch - including the overwhelming
+    // majority between tasks that never touch an XMM register - the price of
+    // two 512-byte memory operations.
     //
-    // `clts` is insurance rather than necessity - nothing here ever sets
-    // `CR0.TS`, so a lazy-FPU scheme is not in use and the bit is already
-    // clear. But `fxsave` raises `#NM` if it is ever set, and `#NM` has no
-    // handler here, so the cost of being wrong about that is a panic on the
-    // first switch. One instruction, once per switch, buys the guarantee.
+    // It is lazy now: the task being left has already had its registers written
+    // out by `sched::Table::hand_over_fpu`, which runs in Rust while the
+    // outgoing task is still the one on the CPU (so its live state is genuinely
+    // its own), and the task being entered gets `CR0.TS` set below so its first
+    // floating-point instruction traps into the `#NM` handler and restores its
+    // own image then. A program that never uses the FPU pays one instruction.
     //
-    // The pair is done before the integer registers are touched: neither
-    // instruction uses a register of its own, and doing it first means the
-    // saved image describes the CPU as the task left it rather than as the
-    // switch's own prologue left it. (The prologue is integer-only, so the two
-    // orderings are in fact identical today; the ordering is what keeps them
-    // identical if that ever changes.)
-    "    clts",
-    "    fxsave [rdi]",
+    // The `CR0.TS` write has to happen *here* rather than in the Rust handover:
+    // between that call and this switch the kernel is still running on the
+    // outgoing task's stack, and setting `TS` there would put the whole
+    // scheduler in the window where a floating-point instruction - were there
+    // one in the kernel, which `soft-float` says there is not - would fault
+    // with the table lock held. On this side of `mov rsp` the only instructions
+    // left are integer register moves and `ret`. `rax` is caller-saved, so
+    // clobbering it is within the ABI of an `extern "C"` call.
     "    push rbx",
     "    push rbp",
     "    push r12",
@@ -458,10 +522,13 @@ global_asm!(
     "    pushfq",
     "    mov [rdi + {sp}], rsp",
     "    mov rsp, [rsi + {sp}]",
-    // The incoming task's registers, loaded while rsi is still the pointer to
-    // them - the pops below never touch rsi, so the two could be swapped, but
-    // this reads as "aim at the new task, then restore it".
-    "    fxrstor [rsi]",
+    // `CR0.TS`: the incoming task's floating-point registers are *not* in the
+    // hardware yet, so its first use of them must fault. Whoever claims them
+    // clears the bit again in `claim_live_fpu`, which is the same place that
+    // loads the image.
+    "    mov rax, cr0",
+    "    or rax, 8",
+    "    mov cr0, rax",
     "    popfq",
     "    pop r15",
     "    pop r14",

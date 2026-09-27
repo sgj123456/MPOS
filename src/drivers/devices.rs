@@ -288,9 +288,13 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // find a device by the pair of its sysfs `dev` number and this node, so
     // each is also announced with `SUBSYSTEM=input` and DEVNAME pointing at
     // the /dev/input path it actually lives under.
+    // `/dev/input` exists whether or not the bus answered with a device: it is
+    // where `uinput` puts the devices userland makes, and a directory that only
+    // appears when the machine happens to have a keyboard is a directory a
+    // program cannot depend on.
+    let input_dir = dev.register_dir("input");
     let evdevs = crate::drivers::virtio::input::nodes();
-    if !evdevs.is_empty() {
-        let input_dir = dev.register_dir("input");
+    {
         for (index, node) in evdevs.iter().enumerate() {
             let name = alloc::format!("event{index}");
             let major = crate::drivers::virtio::input::INPUT_MAJOR;
@@ -298,7 +302,17 @@ pub fn standard_devfs() -> Arc<DevFs> {
             input_dir.insert(&name, node.clone());
             crate::uevent::publish(&crate::uevent::Event {
                 action: "add",
-                devpath: alloc::format!("/devices/virtual/input/input{index}"),
+                // The event node's own path, not the input device it reports
+                // through. Linux's uevent for `/dev/input/event0` is
+                // `DEVPATH=.../input0/event0` beside `DEVNAME=input/event0`,
+                // and udev keys its database entry by the syspath the event
+                // names - so announcing the parent with the child's devnum
+                // stores an entry that neither `udevadm info` on the event node
+                // nor libinput can find. The device is then never tagged
+                // `ID_INPUT`, libinput's seat enumeration passes every one of
+                // them by, and weston comes up with a screen and "no input
+                // devices found".
+                devpath: alloc::format!("/devices/virtual/input/input{index}/{name}"),
                 subsystem: "input",
                 devname: alloc::format!("input/{name}"),
                 major,
@@ -306,6 +320,23 @@ pub fn standard_devfs() -> Arc<DevFs> {
             });
         }
     }
+
+    // `/dev/uinput`: the interface a program makes an input device of its own
+    // through. It hands the created devices' nodes into the same `/dev/input`,
+    // and takes the next number after the ones the bus answered with, so a
+    // synthetic device is `event2` on a machine with a keyboard and a tablet.
+    dev.register_node(
+        "uinput",
+        crate::drivers::uinput::Uinput::new(input_dir, evdevs.len()),
+    );
+    crate::uevent::publish(&crate::uevent::Event {
+        action: "add",
+        devpath: alloc::string::String::from("/devices/virtual/misc/uinput"),
+        subsystem: "misc",
+        devname: alloc::string::String::from("uinput"),
+        major: crate::uinput::MAJOR,
+        minor: crate::uinput::MINOR,
+    });
 
     // The DRM/KMS card. A compositor that drives the display through KMS (not
     // the raw framebuffer) opens `/dev/dri/card0`, makes dumb buffers, and
@@ -323,8 +354,8 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // not a boundary).
     {
         let dri = dev.register_dir("dri");
-        dri.insert("card0", crate::drivers::drm::DrmCard::new(0x9100));
-        dri.insert("renderD128", crate::drivers::drm::DrmCard::new(0x9200));
+        dri.insert("card0", crate::drivers::drm::DrmCard::new(0x9100, 0));
+        dri.insert("renderD128", crate::drivers::drm::DrmCard::new(0x9200, 128));
     }
 
     if let Some(raw) = crate::blk::raw_disk() {

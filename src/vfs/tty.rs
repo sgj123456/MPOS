@@ -1325,6 +1325,23 @@ pub struct Tty {
     dev_id: (u32, u32),
 }
 
+/// `KDSETMODE`/`KDGETMODE`: the console's video mode, Linux's values.
+pub const KD_TEXT: u32 = 0x00;
+/// The console is not drawing: a session owns the screen.
+pub const KD_GRAPHICS: u32 = 0x01;
+
+/// `KDSKBMODE`/`KDGKBMODE`: the keyboard's translation mode, Linux's values.
+/// Only two are meaningful to this kernel - `K_XLATE`, the normal text console,
+/// and `K_OFF`, which stops keystrokes reaching the terminal at all. The others
+/// (`K_RAW`, `K_MEDIUMRAW`, `K_UNICODE`) change how bytes are *translated* for
+/// a tty that is reading them, and here the raw scancodes already reach their
+/// consumer through evdev rather than through a tty.
+pub const K_RAW: u32 = 0x00;
+pub const K_XLATE: u32 = 0x01;
+pub const K_MEDIUMRAW: u32 = 0x02;
+pub const K_UNICODE: u32 = 0x03;
+pub const K_OFF: u32 = 0x04;
+
 impl Tty {
     pub const fn new(dev_id: (u32, u32), output: TtyOutput) -> Tty {
         Tty {
@@ -1333,6 +1350,28 @@ impl Tty {
             foreground: Mutex::new(RefCell::new(None)),
             output: Mutex::new(RefCell::new(output)),
             dev_id,
+        }
+    }
+
+    /// Which of the six virtual consoles this terminal *is*, 1-based, or `None`
+    /// for a terminal that is not one: a `/dev/pts` slave, a pty master.
+    ///
+    /// The console's modes - `KDSETMODE`'s video mode and `KDSKBMODE`'s keyboard
+    /// mode - are kept per console, so an ioctl on a tty has to say which
+    /// console it means before it can mean anything. A slave's device number is
+    /// its console number already (`(4, n)` is `/dev/tty<n>`), and `/dev/tty0` -
+    /// "the console I am on now", which is what a seat manager opens - names the
+    /// active one rather than a console of its own.
+    pub fn vc_number(&self) -> Option<u32> {
+        match self.dev_id {
+            (4, n) if (1..=crate::vfs::pty::VC_COUNT).contains(&n) => Some(n),
+            // `(4, 0)` is `/dev/tty0`, "the console I am on now", and `(4, 64)`
+            // is the boot console's own tty - which is what a seat manager holds
+            // before it has asked for a console by number. Both mean the active
+            // one. A host build has no console mux running to be active.
+            #[cfg(target_os = "none")]
+            (4, 0) | (4, 64) => Some(crate::vfs::vcmux::active()),
+            _ => None,
         }
     }
 

@@ -19,8 +19,10 @@
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
@@ -37,22 +39,64 @@ pub struct Event {
     pub minor: u32,
 }
 
+/// Which separator a field of a uevent record has to keep out of its own bytes.
+///
+/// The record is built out of two of them: the NUL that ends every line, and
+/// the `@` that separates the action from the devpath on the first one. A name
+/// carrying either is indistinguishable from the boundary it pretends to be,
+/// and the line that gets forged out of it is one udevd acts on. Nothing in
+/// this kernel mints such a name - a device name comes from the driver that
+/// registers it, and a devpath from the device tree - so this is the seam where
+/// that stops being an assumption about callers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Split {
+    /// `action@devpath`: `@` means something here.
+    AtAndNul,
+    /// A `KEY=value` line, where only the NUL ends anything.
+    Nul,
+}
+
+fn field(value: &str, split: Split) -> impl Iterator<Item = u8> + '_ {
+    value
+        .bytes()
+        .filter(move |&byte| byte != 0 && (split != Split::AtAndNul || byte != b'@'))
+}
+
 impl Event {
     /// The envp block a listener parses: the message line, then the keys.
     ///
     /// The keys are the ones `nlplug-findfs` reads (ACTION, DEVPATH, SUBSYSTEM,
     /// DEVNAME, MAJOR, MINOR), spelled the way Linux spells them - userland
     /// decides what to do next from exactly these.
+    ///
+    /// The `SEQNUM` line is the one that is easy to leave out and expensive
+    /// to omit. It is not decoration: `udevd` orders its event queue by it
+    /// (`is_devpath_busy` compares each event's number against the one it is
+    /// waiting behind), so a kernel that sends every event with the same
+    /// number - which is what sending none of them amounts to, the property
+    /// reading back as zero - tells udevd that every event is still waiting
+    /// behind another. It then queues them all and starts none: no rules run,
+    /// no device is tagged `ID_INPUT`, and no compositor ever sees a
+    /// keyboard. Linux appends the line last, from a counter bumped once per
+    /// send, and that is what this does.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_seq().0
+    }
+
+    /// [`encode`](Self::encode) with the sequence number the message carries,
+    /// so the netlink header can be built with the same number the payload
+    /// names - `nlmsg_seq` and `SEQNUM=` are one fact, and a listener that
+    /// compares one against the other cannot be told anything by two answers.
+    pub fn encode_seq(&self) -> (Vec<u8>, u64) {
         let mut out = Vec::new();
-        out.extend_from_slice(self.action.as_bytes());
+        out.extend(field(self.action, Split::AtAndNul));
         out.push(b'@');
-        out.extend_from_slice(self.devpath.as_bytes());
+        out.extend(field(&self.devpath, Split::AtAndNul));
         out.push(0);
         let mut key = |k: &str, v: &str| {
             out.extend_from_slice(k.as_bytes());
             out.push(b'=');
-            out.extend_from_slice(v.as_bytes());
+            out.extend(field(v, Split::Nul));
             out.push(0);
         };
         key("ACTION", self.action);
@@ -63,9 +107,22 @@ impl Event {
         }
         key("MAJOR", &alloc::format!("{}", self.major));
         key("MINOR", &alloc::format!("{}", self.minor));
+        let seqnum = SEQNUM.fetch_add(1, Ordering::Relaxed) + 1;
+        key("SEQNUM", &alloc::format!("{}", seqnum));
         out.push(0);
-        out
+        (out, seqnum)
     }
+}
+
+/// The number of the last event sent, as Linux's `uevent_seqnum` counts it:
+/// bumped once per event, never reused. `/sys/kernel/uevent_seqnum` reports it
+/// and every message carries it, which is what lets a listener tell "this
+/// arrived after that" from two copies of one event.
+static SEQNUM: AtomicU64 = AtomicU64::new(0);
+
+/// How many events have been sent, for `/sys/kernel/uevent_seqnum`.
+pub fn seqnum() -> u64 {
+    SEQNUM.load(Ordering::Relaxed)
 }
 
 /// A netlink socket, as far as the kernel is concerned: a queue of events and
@@ -78,7 +135,12 @@ struct Subscriber {
     /// The groups the socket bound to; the kernel broadcasts only to sockets
     /// that asked for this group.
     groups: u32,
-    queue: VecDeque<Vec<u8>>,
+    /// A shared buffer rather than a `Vec` each: the publisher runs inside a
+    /// critical section, and handing one more listener a copy of the event must
+    /// not mean allocating there - see [`publish`].
+    /// Each entry is the event's sequence number and its bytes: the number is
+    /// what the netlink header carries, beside the copy in the payload.
+    queue: VecDeque<(u64, Arc<Vec<u8>>)>,
 }
 
 /// The one group a kobject-uevent socket has: kernel-originated events.
@@ -112,7 +174,14 @@ pub fn open() -> usize {
             id,
             bound: false,
             groups: 0,
-            queue: VecDeque::new(),
+            // Sized here, in task context, so that the publisher never has to
+            // grow it: [`publish`] runs inside a critical section, and
+            // `VecDeque::push_back` reallocating there is an allocation with
+            // the interrupts masked - the same hazard as copying the event, and
+            // the reason a cold-plug that a listener was watching wrote nothing
+            // at all. `QUEUE_MAX` is also the cap the publisher drops at, so the
+            // length can never reach the capacity and force a reallocation.
+            queue: VecDeque::with_capacity(QUEUE_MAX),
         });
         id
     })
@@ -143,7 +212,7 @@ pub fn bind(id: usize, groups: u32) {
 }
 
 /// The next event waiting for this socket, or `None` when there is none.
-pub fn recv(id: usize) -> Option<Vec<u8>> {
+pub fn recv(id: usize) -> Option<(u64, Arc<Vec<u8>>)> {
     critical_section::with(|cs| {
         SUBSCRIBERS
             .borrow(cs)
@@ -180,7 +249,20 @@ pub fn exists(id: usize) -> bool {
 /// second path is how a listener that started *after* the devices existed
 /// (an initramfs is exactly that) gets told about them.
 pub fn publish(event: &Event) {
-    let encoded = event.encode();
+    // Built *before* the critical section, and shared rather than copied.
+    //
+    // This is a writer's path: it runs from device registration and from a
+    // write to a device's `uevent` attribute, and the machine has to keep
+    // working while a listener is attached - which is exactly when it is used.
+    // Cloning the encoded bytes per subscriber allocated inside a section with
+    // the interrupts masked, and the allocator's lock belongs to whichever task
+    // last held it: with `udevd` running and queueing events, that write could
+    // spin there with the holder unable to run, and the cold-plug stalled on the
+    // first device it announced. A refcount bump allocates nothing, so the
+    // section now holds only list surgery.
+    let (bytes, seq) = event.encode_seq();
+    let encoded = Arc::new(bytes);
+    let mut queued = false;
     critical_section::with(|cs| {
         for sub in SUBSCRIBERS.borrow(cs).borrow_mut().iter_mut() {
             if sub.bound && sub.groups & GROUP_KERNEL != 0 {
@@ -189,10 +271,21 @@ pub fn publish(event: &Event) {
                 if sub.queue.len() >= QUEUE_MAX {
                     sub.queue.pop_front();
                 }
-                sub.queue.push_back(encoded.clone());
+                sub.queue.push_back((seq, Arc::clone(&encoded)));
+                queued = true;
             }
         }
     });
+    // An event nobody is woken for is an event that never arrives. The listeners
+    // on this bus are `udevd`'s workers and `udevadm monitor`, parked in
+    // `poll(2)`; their wake list belongs to the network stack, which on a quiet
+    // machine does not poll at all - so the queue filled, the daemon slept
+    // through it, and its database stayed empty. Woken, it reads what was
+    // queued and the cold-plug completes.
+    #[cfg(target_os = "none")]
+    if queued {
+        crate::net::wake_waiters();
+    }
 }
 
 /// The device numbering the whole system agrees on.
@@ -294,12 +387,50 @@ mod tests {
         let text = String::from_utf8(an_event().encode())
             .expect("the encoding is utf8")
             .replace('\0', "|");
+        // The number itself is the kernel's counter, shared by every event the
+        // machine has sent - so the test pins the line, not the value.
+        assert!(text.ends_with("||"), "{text:?} ends with its terminator");
+        let fields: Vec<&str> = text.trim_end_matches("||").split('|').collect();
+        assert_eq!(fields[0], "add@/devices/virtio/block/vda3");
         assert_eq!(
-            text,
-            "add@/devices/virtio/block/vda3|ACTION=add|\
-             DEVPATH=/devices/virtio/block/vda3|SUBSYSTEM=block|\
-             DEVNAME=vda3|MAJOR=254|MINOR=3||"
+            &fields[1..fields.len() - 1],
+            [
+                "ACTION=add",
+                "DEVPATH=/devices/virtio/block/vda3",
+                "SUBSYSTEM=block",
+                "DEVNAME=vda3",
+                "MAJOR=254",
+                "MINOR=3"
+            ]
         );
+        let seqnum = fields
+            .last()
+            .expect("a last field")
+            .strip_prefix("SEQNUM=")
+            .expect("the number is last, as Linux appends it");
+        assert!(seqnum.parse::<u64>().is_ok(), "{seqnum:?} is a number");
+    }
+
+    #[test]
+    fn every_event_carries_a_later_number_than_the_last() {
+        // What udevd's queue is ordered by: `is_devpath_busy` compares an
+        // event's number with the one it is waiting behind, so two events that
+        // shared a number would both be deferred forever - queued and never
+        // started, which is a device manager that does nothing at all.
+        let _bus = bus_lock();
+        let first = seqnum_of(&an_event().encode());
+        let second = seqnum_of(&an_event().encode());
+        assert!(second > first, "{second} follows {first}");
+        assert_eq!(seqnum(), second, "and the counter says so");
+    }
+
+    /// The `SEQNUM=` value out of an encoded event.
+    fn seqnum_of(encoded: &[u8]) -> u64 {
+        let text = String::from_utf8(encoded.to_vec()).expect("utf8");
+        text.split('\0')
+            .find_map(|field| field.strip_prefix("SEQNUM="))
+            .and_then(|n| n.parse().ok())
+            .expect("a sequence number")
     }
 
     #[test]
@@ -316,9 +447,9 @@ mod tests {
         assert!(!ready(other), "a socket that never bound stays empty");
 
         let event = recv(watcher).expect("the event is there");
-        assert!(event.starts_with(b"add@"), "the message line comes first");
+        assert!(event.1.starts_with(b"add@"), "the message line comes first");
         assert!(
-            event.ends_with(&[0, 0]),
+            event.1.ends_with(&[0, 0]),
             "the block ends with the empty entry that terminates it"
         );
 

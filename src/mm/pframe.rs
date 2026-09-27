@@ -195,7 +195,22 @@ impl Buddy {
             frame + (1 << order) <= self.frames,
             "free of a block outside this zone"
         );
-        debug_assert!(self.state(frame) == 0, "double free of frame {frame}");
+        // A frame already sitting on a free list is a block two owners have
+        // handed back, and the merge below cannot tell the second one from a
+        // legitimate block: it links the same page into two lists, the next two
+        // allocations of this order hand one page to both callers, and the
+        // damage surfaces much later as some unrelated program reading another's
+        // memory - a user fault, a corrupted page table, a machine that resets
+        // with nothing to say about itself. So it is named here, where it is
+        // still provable, in the build that actually ships: a `debug_assert` is
+        // compiled out of a release kernel, and a release kernel is the one a
+        // double free kills.
+        if self.state(frame) != 0 {
+            panic!(
+                "double free of {phys:#x} (frame {frame}, state {}, order {order})",
+                self.state(frame)
+            );
+        }
 
         // The block is no longer anybody's: clear the one count that mattered so
         // a later allocation of this page starts from a clean slate.

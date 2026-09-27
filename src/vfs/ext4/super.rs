@@ -254,6 +254,23 @@ impl Super {
         }
         let first_data_block = le32(bytes, 20);
         let block_size = 1024usize << log_block_size;
+        // `s_first_data_block` is 0 or 1 by the format - the block the
+        // superblock sits in, which is the first one on a 1024-byte filesystem
+        // and the second on the layouts that reserve block 0 for a boot sector.
+        // Both halves matter here rather than being tidiness: the recorded
+        // position of the superblock is the distance from that block's start to
+        // byte 1024, so a claim larger than that distance is not an unusual
+        // layout but an underflow, and the pair (1, 4096) is exactly that.
+        if first_data_block > 1 || first_data_block as usize * block_size > SUPERBLOCK_AT as usize {
+            return Err("ext2 superblock does not sit inside its own first block");
+        }
+        // The same arithmetic runs the other way when the allocator starts
+        // reserving inodes: group 0's first candidate is `s_first_ino` minus
+        // one, and a superblock that says nothing is reserved answers zero,
+        // which has no minus one.
+        if first_ino == 0 {
+            return Err("ext2 reserves no inodes, which its own layout cannot mean");
+        }
         // The descriptor stride is written down from rev 1 onwards; before
         // that it is 32 by definition, and a zero means "not written down"
         // rather than "no descriptors".

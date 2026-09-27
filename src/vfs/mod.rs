@@ -462,6 +462,14 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// The `/dev/uinput` device this is, if it is one - how the `'U'`-typed
+    /// ioctls reach the devices userland makes. Same shape as
+    /// [`Self::as_evdev`], for the same reason.
+    #[cfg(target_os = "none")]
+    fn as_uinput(&self) -> Option<&crate::drivers::uinput::Uinput> {
+        None
+    }
+
     /// The `memfd` this node is, if it is one - how `fcntl`'s sealing
     /// (`F_ADD_SEALS`/`F_GET_SEALS`) reaches the seal state of an anonymous
     /// shared buffer. Gated with the `memfd` module, which the host has no
@@ -559,6 +567,52 @@ pub trait Inode: Send + Sync {
 
     fn poll_unsubscribe(&self, id: crate::sched::policy::TaskId) {
         let _ = id;
+    }
+
+    /// [`Self::read_at`] on behalf of a named client.
+    ///
+    /// Almost every node answers the same thing whoever is asking, and the
+    /// default says so. A node whose answer *depends on the client* overrides
+    /// this: an evdev node is the one that does today, because the events in it
+    /// belong to whoever holds `EVIOCGRAB` - so a read there has to know who is
+    /// asking before it can even decide whether to wait.
+    ///
+    /// The identity is the open file description's own address
+    /// ([`crate::vfs::File::ofd`]), which is the key the same arbitrations
+    /// already use: one description is one client, whatever names it.
+    fn read_at_client(&self, offset: u64, buf: &mut [u8], client: u64) -> VfsResult<usize> {
+        let _ = client;
+        self.read_at(offset, buf)
+    }
+
+    /// [`Self::write_at`] on behalf of a named client, with the same reason and
+    /// the same identity as [`Self::read_at_client`].
+    ///
+    /// A write needs it for the mirror of the read's problem: an evdev node's
+    /// records belong to a grab, and a `/dev/uinput` description *is* a device -
+    /// what gets written has to land in the device belonging to the description
+    /// that wrote it, which an offset cannot say.
+    fn write_at_client(&self, offset: u64, buf: &[u8], client: u64) -> VfsResult<usize> {
+        let _ = client;
+        self.write_at(offset, buf)
+    }
+
+    /// [`Self::poll_ready`] for a named client. A node whose readiness differs
+    /// between its clients overrides this; the default is the clientless
+    /// answer, which is right for every node that has only one readiness to
+    /// report.
+    fn poll_ready_client(&self, client: u64) -> Ready {
+        let _ = client;
+        self.poll_ready()
+    }
+
+    /// [`Self::poll_subscribe`] for a named client: the wait is registered as
+    /// *this* client's, so a wake can be held back from a client that has
+    /// nothing coming - which is what keeps a non-owner of a grabbed evdev
+    /// device asleep instead of waking on every one of the owner's events.
+    fn poll_subscribe_client(&self, client: u64, id: crate::sched::policy::TaskId) {
+        let _ = client;
+        self.poll_subscribe(id);
     }
 
     /// Where a symbolic link points. Anything that is not a link answers

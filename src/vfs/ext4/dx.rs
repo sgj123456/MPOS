@@ -350,25 +350,29 @@ impl Core {
         trim_dir_tail(&mut leaf_page, limit);
         let mut map: Vec<(u32, usize, usize)> = Vec::new();
         let mut at = 0;
+        let mut tiled = true;
         while at < limit {
-            let rec = le16(&leaf_page, at + 4) as usize;
-            assert!(
-                rec >= DIRENT_HEADER && at + rec <= limit,
-                "corrupt ext2 directory: entry at {at} claims {rec} bytes"
-            );
+            let Some(rec) = entry_rec(&leaf_page, at, limit) else {
+                tiled = false;
+                break;
+            };
             let ino = le32(&leaf_page, at);
-            let name_len = leaf_page[at + 6] as usize;
-            if ino != 0 && name_len != 0 {
-                let hash = dx_hash_name(
-                    &leaf_page[at + 8..at + 8 + name_len],
-                    hash_version,
-                    self.sb.hash_seed,
-                    self.sb.hash_unsigned,
-                )
-                .unwrap_or(0);
+            let name = entry_name(&leaf_page, at, rec);
+            if ino != 0 && !name.is_empty() {
+                let hash =
+                    dx_hash_name(name, hash_version, self.sb.hash_seed, self.sb.hash_unsigned)
+                        .unwrap_or(0);
                 map.push((hash, at, rec));
             }
             at += rec;
+        }
+        // A leaf whose entries do not tile the block cannot be split: the
+        // operation moves every entry in it, and an entry the walk could not
+        // reach would simply be gone from the directory afterwards. `Corrupt`
+        // refuses the insert and leaves the block alone, which is the whole
+        // reason the walk above stops rather than asserting.
+        if !tiled {
+            return Err(VfsError::Corrupt);
         }
         map.sort_by_key(|entry| entry.0);
 

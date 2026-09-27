@@ -4,11 +4,16 @@ impl Core {
     // ---- block mapping ----
 
     /// Pointer `i` of an indirect block; `None` for zero, i.e. unmapped.
+    ///
+    /// A pointer past the end of the volume is unmapped too. The word is a
+    /// `u32`, so on a filesystem with 4 KiB blocks it can name a block the
+    /// disk does not have, and the caller's answer for a hole is already the
+    /// right one for that: read as zeros, never written to.
     pub(crate) fn ptr_at(&self, block: u64, i: usize) -> Option<u64> {
         let mut bytes = [0u8; 4];
         self.read_bytes(block, i * 4, &mut bytes);
         let value = le32(&bytes, 0);
-        (value != 0).then_some(value as u64)
+        (value != 0 && self.block_is_live(value as u64)).then_some(value as u64)
     }
 
     pub(crate) fn put_ptr(&self, block: u64, i: usize, value: u32) {
@@ -25,11 +30,16 @@ impl Core {
     /// ext2 holds a block map and a tree side by side, and guessing wrong
     /// reads a file's first extent as a pointer to somebody else's data.
     pub(crate) fn bmap_lookup(&self, d: &InodeData, l: u64) -> Option<u64> {
-        if self.is_extent_mapped(d) {
+        let block = if self.is_extent_mapped(d) {
             self.extent_lookup(d, l)
         } else {
             self.block_map_lookup(d, l)
-        }
+        };
+        // The same rule as a block map's entry, one layer up: an extent's
+        // `ee_block` is a 32-bit word, so a tree can name a block past the
+        // volume even when the volume itself is consistent. `None` is what the
+        // caller already has for "this logical block maps nowhere".
+        block.filter(|&block| self.block_is_live(block))
     }
 
     /// Map logical block `l` for writing, allocating anything missing. Returns
@@ -41,11 +51,20 @@ impl Core {
         ino: u32,
         l: u64,
     ) -> VfsResult<(u64, bool)> {
-        if self.is_extent_mapped(d) {
+        let mapped = if self.is_extent_mapped(d) {
             self.extent_ensure(d, ino, l)
         } else {
             self.block_map_ensure(d, l)
+        }?;
+        // A block that exists has to be a block the volume has. Everything the
+        // allocator hands out is, so a number that is not is one read out of
+        // the inode - and the write that was asked for is refused rather than
+        // landing somewhere outside the filesystem, where a later mount would
+        // find two owners of one block.
+        if !self.block_is_live(mapped.0) {
+            return Err(VfsError::Corrupt);
         }
+        Ok(mapped)
     }
 
     /// Drop every mapping an inode has. The two shapes empty differently: a
@@ -170,14 +189,14 @@ impl Core {
             if depth == 0 {
                 for i in 0..count {
                     let (first, raw_len, start) = ext_leaf(&node, i);
-                    let len = (raw_len & !EXTENT_UNWRITTEN) as u64;
+                    let (len, unwritten) = ext_len(raw_len);
                     // Entries are sorted by logical block, so one that starts
                     // past `l` says every later one does too.
                     if l < first as u64 {
                         return None;
                     }
                     if l < first as u64 + len {
-                        return if raw_len & EXTENT_UNWRITTEN != 0 {
+                        return if unwritten {
                             None
                         } else {
                             Some(start + (l - first as u64))
@@ -274,16 +293,17 @@ impl Core {
         let mut at = count;
         for i in 0..count {
             let (first, raw_len, start) = ext_leaf(node, i);
-            let len = (raw_len & !EXTENT_UNWRITTEN) as u64;
+            let (len, unwritten) = ext_len(raw_len);
             if l < first as u64 {
                 at = i;
                 break;
             }
             if l < first as u64 + len {
                 // An unwritten extent already has the block; "initialising"
-                // it is exactly this, taking the top bit off its length.
-                if raw_len & EXTENT_UNWRITTEN != 0 {
-                    ext_write_leaf(node, i, first, raw_len & !EXTENT_UNWRITTEN, start);
+                // it is exactly this, writing its length back as the written
+                // one it now is - the same number, read the other way.
+                if unwritten {
+                    ext_write_leaf(node, i, first, len as u16, start);
                 }
                 return Ok((start + (l - first as u64), false, None));
             }
@@ -298,11 +318,15 @@ impl Core {
             // folding back together.
             if at > 0 {
                 let (first, raw_len, start) = ext_leaf(node, at - 1);
-                let len = raw_len & !EXTENT_UNWRITTEN;
-                if raw_len & EXTENT_UNWRITTEN == 0
-                    && len < EXTENT_INIT_MAX - 1
-                    && first as u64 + len as u64 == l
-                    && start + len as u64 == block
+                let (len, unwritten) = ext_len(raw_len);
+                // The length may grow by one only while the run stays a
+                // written one: 32768 is the longest a written extent can be,
+                // and one more than that would be read as an *unwritten*
+                // extent of one block.
+                if !unwritten
+                    && len < EXTENT_INIT_MAX as u64
+                    && first as u64 + len == l
+                    && start + len == block
                 {
                     ext_write_leaf(node, at - 1, first, raw_len + 1, start);
                     return Ok((block, true, None));
@@ -310,8 +334,9 @@ impl Core {
             }
             if at < count {
                 let (first, raw_len, start) = ext_leaf(node, at);
-                if raw_len & EXTENT_UNWRITTEN == 0
-                    && raw_len < EXTENT_INIT_MAX - 1
+                let (len, unwritten) = ext_len(raw_len);
+                if !unwritten
+                    && len < EXTENT_INIT_MAX as u64
                     && first as u64 == l + 1
                     && start == block + 1
                 {
@@ -347,7 +372,7 @@ impl Core {
     }
 
     pub(crate) fn ext_load(&self, block: u64) -> VfsResult<Vec<u8>> {
-        if block >= self.sb.blocks_count {
+        if !self.block_is_live(block) {
             return Err(VfsError::Corrupt);
         }
         let mut node = vec![0u8; self.block_size()];
@@ -476,7 +501,8 @@ impl Core {
         for i in 0..ext_entries(node) {
             if depth == 0 {
                 let (_first, raw_len, start) = ext_leaf(node, i);
-                for n in 0..(raw_len & !EXTENT_UNWRITTEN) as u64 {
+                let (len, _unwritten) = ext_len(raw_len);
+                for n in 0..len {
                     self.free_block(start + n);
                 }
             } else {
@@ -515,8 +541,7 @@ impl Core {
         let mut kept = 0usize;
         for i in 0..entries {
             let (first, raw_len, start) = ext_leaf(&root, i);
-            let len = (raw_len & !EXTENT_UNWRITTEN) as u64;
-            let unwritten = raw_len & EXTENT_UNWRITTEN != 0;
+            let (len, unwritten) = ext_len(raw_len);
             let first = first as u64;
             if first >= keep_blocks {
                 // Entirely past the cut: give the run back, drop the entry.
@@ -538,10 +563,12 @@ impl Core {
                     }
                     freed += len - keep_len;
                 }
-                ext_write_leaf(&mut root, kept, first as u32, keep_len as u16, start);
+                let raw = ext_raw_len(keep_len, unwritten);
+                ext_write_leaf(&mut root, kept, first as u32, raw, start);
             } else {
                 // Entirely kept: move it down to the compacted slot.
-                ext_write_leaf(&mut root, kept, first as u32, len as u16, start);
+                let raw = ext_raw_len(len, unwritten);
+                ext_write_leaf(&mut root, kept, first as u32, raw, start);
             }
             kept += 1;
         }

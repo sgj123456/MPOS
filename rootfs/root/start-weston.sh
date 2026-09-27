@@ -19,7 +19,7 @@
 # service is not up - a live image that predates it, a runlevel that was
 # emptied - and brings seatd up itself before handing over.
 #
-# Run it from a compositor boot (cargo xtask run --console compositor):
+# Run it from a weston boot (cargo xtask run --mode weston):
 #     ./start-weston.sh [extra weston args...]
 
 set -eu

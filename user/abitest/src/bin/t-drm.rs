@@ -31,10 +31,11 @@ use core::panic::PanicInfo;
 /// libdrm builds, with the two halves the other way around. The sizes only
 /// matter for the direction bits, not for matching.
 const fn ioc_d(nr: usize, size: usize) -> usize {
-    (3 << 30) | (size << 16) | (nr << 8) | (b'd' as usize)
+    (3 << 30) | (size << 16) | ((b'd' as usize) << 8) | nr
 }
 const NR_GET_CAP: usize = 0x0c;
 const NR_GETRESOURCES: usize = 0xa0;
+const NR_GETPLANERESOURCES: usize = 0xb5;
 const NR_SETCRTC: usize = 0xa2;
 const NR_GETPROPERTY: usize = 0xaa;
 const NR_ADDFB: usize = 0xae;
@@ -47,13 +48,18 @@ const NR_MAP_DUMB: usize = 0xb3;
 const NR_GETFB: usize = 0xad;
 const NR_ADDFB2: usize = 0xb8;
 const NR_OBJ_GETPROPERTIES: usize = 0xb9;
+const NR_VERSION: usize = 0x00;
 const NR_SET_VERSION: usize = 0x07;
 const NR_GET_MAGIC: usize = 0x02;
 const NR_AUTH_MAGIC: usize = 0x11;
 const NR_GEM_CLOSE: usize = 0x09;
 
 const O_RDWR: usize = 2;
-const EVENT_FLIP_COMPLETE: u32 = 0x8000_0002;
+/// `DRM_EVENT_FLIP_COMPLETE`, as the UAPI spells it. libdrm dispatches on
+/// this field, so its value is not the card's to choose - a test that took
+/// the card's word for it agreed with a card whose flip events no compositor
+/// would ever act on.
+const EVENT_FLIP_COMPLETE: u32 = 0x02;
 const CRTC_ID: u32 = 34;
 
 /// Little-endian u32 out of a byte buffer at `at` (the UAPI structs are
@@ -101,6 +107,41 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_true(&mut failed, b"one CRTC", word(36) == 1);
     lin::check_true(&mut failed, b"one connector", word(40) == 1);
     lin::check_true(&mut failed, b"one encoder", word(44) == 1);
+
+    // GETPLANERESOURCES: the one KMS list whose pointer comes *before* its
+    // count (`plane_id_ptr@0`, `count_planes@8`), which is exactly the order
+    // a card can get wrong and still look plausible - libdrm sizes its array
+    // from the count and hands the pointer back in the second call, so a
+    // kernel that reads the count from offset 0 reads half of a pointer and
+    // then writes through a zero-length allocation. Pinned here so the layout
+    // cannot drift again.
+    let mut pres = [0u8; 16];
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_GETPLANERESOURCES, 16),
+        pres.as_mut_ptr() as usize,
+    );
+    lin::check_eq(&mut failed, b"GETPLANERESOURCES succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"one plane, counted at offset 8",
+        u32_at(&pres, 8) as isize,
+        1,
+    );
+    let mut plane_ids = [0u32; 1];
+    pres[0..8].copy_from_slice(&(plane_ids.as_mut_ptr() as usize as u64).to_ne_bytes());
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_GETPLANERESOURCES, 16),
+        pres.as_mut_ptr() as usize,
+    );
+    lin::check_eq(&mut failed, b"the plane list fills", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"the plane is the one this card has",
+        plane_ids[0] as isize,
+        36,
+    );
 
     // CREATE_DUMB: 64x64 @ 32bpp -> pitch 256, size 16384, handle >= 1.
     let mut dumb = [0u8; 32];
@@ -303,7 +344,10 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     // OBJ_GETPROPERTIES on the plane: the `type` property that classifies it
-    // - what weston picks its primary plane by.
+    // - what weston picks its primary plane by - and the frame properties an
+    // atomic commit writes (`FB_ID`, the two rectangles, the blend mode).
+    // The list is sized from the count the first call answered, which is the
+    // two-call contract every KMS list ioctl follows.
     let mut pprops = [0u8; 28];
     pprops[20..24].copy_from_slice(&36u32.to_ne_bytes()); // obj_id: the plane
     pprops[24..28].copy_from_slice(&0xeeee_eeeeu32.to_ne_bytes()); // DRM_MODE_OBJECT_PLANE
@@ -313,8 +357,14 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         pprops.as_mut_ptr() as usize,
     );
     lin::check_eq(&mut failed, b"the plane carries properties", r, 0);
-    let mut pids = [0u32; 1];
-    let mut pvals = [0u64; 1];
+    let plane_count = u32::from_ne_bytes([pprops[16], pprops[17], pprops[18], pprops[19]]) as usize;
+    lin::check_true(
+        &mut failed,
+        b"the plane carries a frame's worth of properties",
+        plane_count >= 5,
+    );
+    let mut pids = [0u32; 16];
+    let mut pvals = [0u64; 16];
     pprops[0..8].copy_from_slice(&(pids.as_mut_ptr() as usize as u64).to_ne_bytes());
     pprops[8..16].copy_from_slice(&(pvals.as_mut_ptr() as usize as u64).to_ne_bytes());
     let r = lin::ioctl(
@@ -335,6 +385,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         pvals[0] as isize,
         1,
     );
+    lin::check_true(
+        &mut failed,
+        b"the plane carries FB_ID and the source rectangle",
+        pids[..plane_count.min(16)].contains(&75) && pids[..plane_count.min(16)].contains(&79),
+    );
 
     // GETPROPERTY: weston finds its properties by *name*, so the id the
     // connector's list advertised must answer under the name weston asks
@@ -347,6 +402,49 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         &mut failed,
         b"GETPROPERTY names the property CRTC_ID",
         unsafe { core::slice::from_raw_parts(gp.as_ptr().add(24), 7) == b"CRTC_ID" },
+    );
+
+    // VERSION: the two-call shape libdrm's `drmGetVersion` drives the request
+    // in, and the reason a card cannot answer it however it likes. The first
+    // call brings a null pointer and a zero length and asks how long the name
+    // is; the caller then allocates exactly that many bytes *plus one*, hands
+    // the block back with the same length in the field - where it means "this
+    // much room" - and after the second call writes its own terminator at
+    // `name[name_len]`. So an answer that outgrows the first one, or a name
+    // written into the pointer field instead of through the pointer, puts that
+    // terminator outside the caller's block: weston died in libdrm, on a write
+    // to a page nobody had mapped, over exactly this.
+    let mut ver = [0u8; 64];
+    let r = lin::ioctl(fd, ioc_d(NR_VERSION, 64), ver.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"VERSION sizing call succeeds", r, 0);
+    let name_len = u64_at(&ver, 16) as usize;
+    lin::check_true(&mut failed, b"VERSION answers a name length", name_len > 0);
+    lin::check_true(
+        &mut failed,
+        b"VERSION answers no date or description",
+        u64_at(&ver, 32) == 0 && u64_at(&ver, 48) == 0,
+    );
+
+    let mut block = [0u8; 64];
+    let block_ptr = block.as_mut_ptr() as usize;
+    lin::check_true(
+        &mut failed,
+        b"the name fits the block the caller would allocate",
+        name_len + 1 <= block.len(),
+    );
+    ver[24..32].copy_from_slice(&(block_ptr as u64).to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_VERSION, 64), ver.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"VERSION fill call succeeds", r, 0);
+    let name_len2 = u64_at(&ver, 16) as usize;
+    lin::check_true(
+        &mut failed,
+        b"VERSION does not outgrow the room the caller brought",
+        name_len2 <= name_len,
+    );
+    lin::check_true(
+        &mut failed,
+        b"VERSION wrote the name through the pointer, not over it",
+        &block[..name_len2] == &b"mpos"[..] && u64_at(&ver, 24) == block_ptr as u64,
     );
 
     // SET_VERSION: request the 1.4 KMS interface, read the driver's 1.1.

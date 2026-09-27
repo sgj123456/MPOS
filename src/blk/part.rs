@@ -189,10 +189,28 @@ pub fn partitions(dev: &dyn BlockDev) -> Vec<(u64, u64)> {
 
     // A protective MBR - one whose first entry claims the whole disk as type
     // 0xEE - is the marker that a GPT follows.
-    if mbr[446 + 4] == 0xEE {
-        return gpt_entries(dev);
-    }
-    mbr_entries(&mbr)
+    let entries = if mbr[446 + 4] == 0xEE {
+        gpt_entries(dev)
+    } else {
+        mbr_entries(&mbr)
+    };
+
+    // Every finder above this one checks the range it is about to hand out
+    // against the device. This has to as well, or the two halves of the module
+    // disagree about what is on the disk: `devfs` builds one node per entry
+    // this returns, so an entry the table invented is a `/dev/vda4` that opens
+    // and reads, and answers with whatever the driver's own clamp happens to
+    // leave in the buffer. A table names partitions; the disk decides whether
+    // it has them.
+    let capacity = dev.capacity_sectors();
+    entries
+        .into_iter()
+        .filter(|&(start, sectors)| {
+            start
+                .checked_add(sectors)
+                .is_some_and(|end| end <= capacity)
+        })
+        .collect()
 }
 
 /// The four entries of a classic MBR, skipping the empty ones.

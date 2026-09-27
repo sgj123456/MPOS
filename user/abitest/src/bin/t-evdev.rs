@@ -8,6 +8,13 @@
 //! is `EINVAL`, which is what lets a reader tell a keyboard from a tablet
 //! without guessing. This is the surface that turns "every node reads as a
 //! null device" (the old behaviour) into a device `libinput` will classify.
+//!
+//! The read rule is pinned here too: while one description holds the grab, a
+//! reader that is not it is told nothing - neither the records nor a readable
+//! answer - and two readers of one node each keep their own copy of what the
+//! device has produced. Nothing presses the keyboard during a sweep, so the
+//! events come from a device the test makes for itself through `/dev/uinput`,
+//! which is the interface Linux gives a program that has to inject input.
 
 #![no_std]
 #![no_main]
@@ -20,12 +27,60 @@ use core::panic::PanicInfo;
 const EV_SYN: usize = 0x00;
 const EV_KEY: usize = 0x01;
 
+/// `poll(2)`'s readable bit, as `poll.h` spells it.
+const POLLIN: i16 = 0x001;
+
 /// `_IOC(dir, 'E', nr, size)`: the evdev request word, type byte `E`.
 const fn ioc(dir: usize, nr: usize, size: usize) -> usize {
-    (dir << 30) | (size << 16) | (nr << 8) | (b'E' as usize)
+    (dir << 30) | (size << 16) | ((b'E' as usize) << 8) | nr
 }
 const IOC_READ: usize = 2;
 const IOC_WRITE: usize = 1;
+
+/// The same `_IOC` spelling for the `'U'` family `/dev/uinput` lives in: its
+/// requests carry the type byte `U` where evdev's carry `E`, and everything
+/// else about the word - direction, size, number - is spelled the same way.
+const fn uio(dir: usize, nr: usize, size: usize) -> usize {
+    (dir << 30) | (size << 16) | ((b'U' as usize) << 8) | nr
+}
+
+/// `UI_DEV_CREATE` / `UI_DEV_DESTROY`: `_IO('U', 1)` and `_IO('U', 2)`.
+const UI_DEV_CREATE: usize = uio(0, 1, 0);
+const UI_DEV_DESTROY: usize = uio(0, 2, 0);
+/// `UI_DEV_SETUP`: `_IOW('U', 3, struct uinput_setup)`, 92 bytes of it.
+const UI_DEV_SETUP: usize = uio(IOC_WRITE, 3, UINPUT_SETUP_SIZE);
+/// `UI_GET_VERSION`: `_IOR('U', 45, unsigned int)`.
+const UI_GET_VERSION: usize = uio(IOC_READ, 45, 4);
+/// The bit-setters, `_IOW('U', n, int)`.
+const UI_SET_EVBIT: usize = uio(IOC_WRITE, 100, 4);
+const UI_SET_KEYBIT: usize = uio(IOC_WRITE, 101, 4);
+
+/// `struct uinput_setup`: `struct input_id` (four `u16`s), the name, and the
+/// force-feedback effect count. The name field is the 80 bytes between them.
+const UINPUT_SETUP_SIZE: usize = 92;
+
+/// The code this test reports and the `SYN_REPORT` that frames it the way every
+/// input device frames its events. `EV_SYN`/`EV_KEY` above are the types.
+const SYN_REPORT: u16 = 0x00;
+const KEY_A: u16 = 30;
+
+/// One `struct input_event`: two `long`s of timestamp, then type, code and
+/// value - the same 24 bytes a read of an evdev node returns.
+const RECORD: usize = 24;
+
+/// Build the two records one keystroke is: the key going down, then the frame
+/// it belongs to.
+fn keystroke(value: i32) -> [u8; RECORD * 2] {
+    let mut bytes = [0u8; RECORD * 2];
+    let mut put = |at: usize, ty: u16, code: u16, value: i32| {
+        bytes[at + 16..at + 18].copy_from_slice(&ty.to_ne_bytes());
+        bytes[at + 18..at + 20].copy_from_slice(&code.to_ne_bytes());
+        bytes[at + 20..at + 24].copy_from_slice(&value.to_ne_bytes());
+    };
+    put(0, EV_KEY as u16, KEY_A, value);
+    put(RECORD, EV_SYN as u16, SYN_REPORT, 0);
+    bytes
+}
 
 fn eviocgbit(fd: i32, evtype: usize, out: &mut [u8]) -> isize {
     let req = ioc(IOC_READ, 0x20 + evtype, out.len());
@@ -97,12 +152,61 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EINVAL,
     );
 
-    // EVIOCGRAB: the seat claim is accepted.
+    // EVIOCGRAB - the seat claim, and who it belongs to. A grab is one
+    // descriptor's claim on the device, so a second *independent* open of the
+    // same node contends with it (`EBUSY`, the answer a compositor must be able
+    // to tell its caller), while the claimant asking again is just holding it.
+    // And the claim dies with the descriptor that made it, so a compositor that
+    // was killed does not leave the keyboard unclaimable.
     let on: i32 = 1;
-    let r = lin::ioctl(fd, ioc(IOC_WRITE, 0x90, 4), &on as *const i32 as usize);
-    lin::check_eq(&mut failed, b"EVIOCGRAB is accepted", r, 0);
+    let off: i32 = 0;
+    let grab = |fd: i32, v: &i32| lin::ioctl(fd, ioc(IOC_WRITE, 0x90, 4), v as *const i32 as usize);
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCGRAB claims the device",
+        grab(fd, &on),
+        0,
+    );
+    let other = lin::openat(lin::AT_FDCWD, b"/dev/input/event0\0", lin::O_RDONLY, 0) as i32;
+    lin::check_true(
+        &mut failed,
+        b"a second open() of the node succeeds",
+        other >= 0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"a second descriptor is refused the same device",
+        grab(other, &on),
+        lin::EBUSY,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the holder may claim it again",
+        grab(fd, &on),
+        0,
+    );
+    lin::check_eq(&mut failed, b"the holder releases", grab(fd, &off), 0);
+    lin::check_eq(
+        &mut failed,
+        b"and the other descriptor takes it",
+        grab(other, &on),
+        0,
+    );
+    // Closing the claimant, with no release asked for, is a release.
+    let _ = lin::close(other);
+    lin::check_eq(
+        &mut failed,
+        b"a grab dies with the descriptor that took it",
+        grab(fd, &on),
+        0,
+    );
+    let _ = lin::ioctl(fd, ioc(IOC_WRITE, 0x90, 4), &off as *const i32 as usize);
 
-    // EVIOCGNAME still returns the device's own name.
+    // EVIOCGNAME still returns the device's own name, and answers with its
+    // length *without* the NUL a C string ends with - `strlcpy`'s contract, and
+    // the count a caller sizes its own buffer from. A device whose name carries
+    // a terminator of its own (the virtio config's) must not count that either:
+    // the answer is where the string ends, which is the first NUL in the buffer.
     let mut name = [0u8; 64];
     let n = lin::ioctl(
         fd,
@@ -110,6 +214,13 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         name.as_mut_ptr() as usize,
     );
     lin::check_true(&mut failed, b"EVIOCGNAME returns a non-empty name", n > 0);
+    let ends = name.iter().position(|&b| b == 0).unwrap_or(name.len()) as isize;
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCGNAME's answer is the name's length without the NUL",
+        n,
+        ends,
+    );
 
     let _ = lin::close(fd);
 
@@ -178,6 +289,268 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"a pointer/tablet device advertises EV_ABS",
         saw_abs,
     );
+
+    // --- whose events are they? ---
+    //
+    // The machine has no hands: nothing presses the keyboard during a sweep, so
+    // the device the rule is about is one this test makes for itself. `/dev/uinput`
+    // is where that happens - the descriptor *is* a device - and it is the same
+    // interface Linux gives a program that has to inject input, so what is pinned
+    // here is the real thing rather than a test hook.
+    let ui = lin::openat(lin::AT_FDCWD, b"/dev/uinput\0", lin::O_RDWR, 0) as i32;
+    lin::check_true(&mut failed, b"/dev/uinput opens", ui >= 0);
+    if ui >= 0 {
+        let mut version: u32 = 0;
+        lin::check_eq(
+            &mut failed,
+            b"UI_GET_VERSION succeeds",
+            lin::ioctl(ui, UI_GET_VERSION, &mut version as *mut u32 as usize),
+            0,
+        );
+        lin::check_true(&mut failed, b"the interface has a version", version > 0);
+
+        let bit =
+            |fd: i32, req: usize, value: i32| lin::ioctl(fd, req, &value as *const i32 as usize);
+        lin::check_eq(
+            &mut failed,
+            b"UI_SET_EVBIT declares EV_SYN",
+            bit(ui, UI_SET_EVBIT, EV_SYN as i32),
+            0,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"UI_SET_EVBIT declares EV_KEY",
+            bit(ui, UI_SET_EVBIT, EV_KEY as i32),
+            0,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"UI_SET_KEYBIT declares KEY_A",
+            bit(ui, UI_SET_KEYBIT, KEY_A as i32),
+            0,
+        );
+        // A bit the request cannot carry is EINVAL, not silence.
+        lin::check_eq(
+            &mut failed,
+            b"a key beyond KEY_MAX is EINVAL",
+            bit(ui, UI_SET_KEYBIT, 0x300),
+            lin::EINVAL,
+        );
+
+        // The name and id the device will report, in `struct uinput_setup`.
+        let mut setup = [0u8; UINPUT_SETUP_SIZE];
+        for (i, word) in [3u16, 0x1234, 0x5678, 1u16].into_iter().enumerate() {
+            setup[i * 2..i * 2 + 2].copy_from_slice(&word.to_ne_bytes());
+        }
+        let named = b"mpos-uitest";
+        setup[8..8 + named.len()].copy_from_slice(named);
+        lin::check_eq(
+            &mut failed,
+            b"UI_DEV_SETUP succeeds",
+            lin::ioctl(ui, UI_DEV_SETUP, setup.as_ptr() as usize),
+            0,
+        );
+        // Creating before the interface knows what to call the device is
+        // EINVAL, and the interface does know now.
+        lin::check_eq(
+            &mut failed,
+            b"UI_DEV_CREATE succeeds",
+            lin::ioctl(ui, UI_DEV_CREATE, 0),
+            0,
+        );
+
+        // Where did it appear? The machine's own devices took event0 and
+        // event1, so the new one is the next free number; the name is what
+        // identifies it, which is how a program finds its own device without
+        // being told.
+        let paths: [&[u8]; 8] = [
+            b"/dev/input/event0\0",
+            b"/dev/input/event1\0",
+            b"/dev/input/event2\0",
+            b"/dev/input/event3\0",
+            b"/dev/input/event4\0",
+            b"/dev/input/event5\0",
+            b"/dev/input/event6\0",
+            b"/dev/input/event7\0",
+        ];
+        let mut synth = -1i32;
+        let mut which = 0usize;
+        for (index, path) in paths.iter().enumerate() {
+            let fd = lin::openat(lin::AT_FDCWD, path, lin::O_RDONLY, 0) as i32;
+            if fd < 0 {
+                continue;
+            }
+            let mut name = [0u8; 64];
+            let n = lin::ioctl(
+                fd,
+                ioc(IOC_READ, 0x06, name.len()),
+                name.as_mut_ptr() as usize,
+            );
+            // The name is what identifies it: the number is whatever the
+            // machine happened to leave free.
+            if n as usize == named.len() && &name[..n as usize] == named {
+                synth = fd;
+                which = index;
+                break;
+            }
+            let _ = lin::close(fd);
+        }
+        lin::check_true(
+            &mut failed,
+            b"the device appears as /dev/input/eventN and reports its own name",
+            synth >= 0,
+        );
+
+        if synth >= 0 {
+            // The second descriptor comes through the same path the search
+            // reached first, so the test does not depend on which number the
+            // machine happened to leave free.
+            let second = lin::openat(lin::AT_FDCWD, paths[which], lin::O_RDONLY, 0) as i32;
+            lin::check_true(&mut failed, b"a second reader can open it", second >= 0);
+
+            let readable = |fd: i32| -> bool {
+                let mut fds = [lin::PollFd {
+                    fd,
+                    events: POLLIN,
+                    revents: 0,
+                }];
+                lin::poll(&mut fds, 0) > 0 && fds[0].revents & POLLIN != 0
+            };
+
+            // A keystroke, reported by the device the test made.
+            let frame = keystroke(1);
+            lin::check_eq(
+                &mut failed,
+                b"a write of whole records is accepted",
+                lin::write(ui, &frame),
+                frame.len() as isize,
+            );
+            lin::check_true(
+                &mut failed,
+                b"and a write that is not whole records is EINVAL",
+                lin::write(ui, &frame[..frame.len() - 1]) == lin::EINVAL,
+            );
+
+            let mut buf = [0u8; RECORD * 2];
+            lin::check_true(&mut failed, b"the reader sees the record", readable(synth));
+            let n = lin::read(synth, &mut buf);
+            lin::check_eq(
+                &mut failed,
+                b"a read returns the whole frame",
+                n,
+                (RECORD * 2) as isize,
+            );
+            lin::check_eq(
+                &mut failed,
+                b"the record carries the event the test reported",
+                u16::from_ne_bytes([buf[16], buf[17]]) as isize,
+                EV_KEY as isize,
+            );
+            lin::check_eq(
+                &mut failed,
+                b"its code and value are the ones written",
+                (u16::from_ne_bytes([buf[18], buf[19]]) as isize) << 16
+                    | i32::from_ne_bytes([buf[20], buf[21], buf[22], buf[23]]) as isize,
+                ((KEY_A as isize) << 16) | 1,
+            );
+
+            // The bug this test exists for: a second reader of one node must
+            // still have its own copy of what the first one read. Under one
+            // shared queue the read above left it with nothing.
+            lin::check_true(
+                &mut failed,
+                b"the second reader still has its own copy",
+                readable(second),
+            );
+            lin::check_true(
+                &mut failed,
+                b"while the first has run out of its own",
+                !readable(synth),
+            );
+            let n = lin::read(second, &mut buf);
+            lin::check_eq(
+                &mut failed,
+                b"and reads the same frame for itself",
+                n,
+                (RECORD * 2) as isize,
+            );
+
+            // The grab: the device's events are the grabber's, and a reader that
+            // is not it is told nothing - not the records, and not a readable
+            // answer either.
+            lin::check_eq(
+                &mut failed,
+                b"the reader claims the device",
+                grab(synth, &on),
+                0,
+            );
+            let more = keystroke(1);
+            lin::check_eq(
+                &mut failed,
+                b"the owner writes through the grabbed device",
+                lin::write(ui, &more),
+                more.len() as isize,
+            );
+            lin::check_true(
+                &mut failed,
+                b"the owner is told it is readable",
+                readable(synth),
+            );
+            lin::check_true(
+                &mut failed,
+                b"a non-owner of a grabbed device is not",
+                !readable(second),
+            );
+            let n = lin::read(synth, &mut buf);
+            lin::check_eq(
+                &mut failed,
+                b"the owner reads its own event",
+                n,
+                (RECORD * 2) as isize,
+            );
+
+            lin::check_eq(&mut failed, b"the owner releases", grab(synth, &off), 0);
+            // What arrived under the grab was the grabber's alone, so the other
+            // reader does not get it when the grab ends.
+            lin::check_true(
+                &mut failed,
+                b"a release does not hand the window over",
+                !readable(second),
+            );
+            let after = keystroke(0);
+            lin::write(ui, &after);
+            lin::check_true(
+                &mut failed,
+                b"but the next record is the other reader's",
+                readable(second),
+            );
+
+            // Destroying the device takes it away from the name and ends the
+            // stream for everyone still holding a descriptor to it.
+            lin::check_eq(
+                &mut failed,
+                b"UI_DEV_DESTROY succeeds",
+                lin::ioctl(ui, UI_DEV_DESTROY, 0),
+                0,
+            );
+            lin::check_true(
+                &mut failed,
+                b"the node is gone from /dev/input",
+                lin::openat(lin::AT_FDCWD, paths[which], lin::O_RDONLY, 0) < 0,
+            );
+            let mut tail = [0u8; RECORD * 2];
+            lin::check_eq(
+                &mut failed,
+                b"and a reader still holding one is at the end of input",
+                lin::read(synth, &mut tail),
+                0,
+            );
+
+            let _ = lin::close(synth);
+            let _ = lin::close(second);
+        }
+        let _ = lin::close(ui);
+    }
 
     lin::done(failed)
 }

@@ -12,7 +12,9 @@
 //! smaller than the message truncates that message and nothing after it;
 //! a `connect` pins the destination for later writes and a second connect
 //! answers `EISCONN`; naming a destination on a connected send is `EISCONN`
-//! too; `SEQPACKET` stays the documented refusal; a datagram aimed at a
+//! too; `SEQPACKET` opens - udevd's control-socket shape - and is served
+//! as the stream this family carries until a pair connects it; a datagram
+//! aimed at a
 //! stream listener's name is `ECONNREFUSED`, because no queue of messages
 //! lives behind it; and a full receive queue answers the sender `EAGAIN`
 //! rather than dropping what was sent.
@@ -87,7 +89,10 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let _ = lin::unlinkat(lin::AT_FDCWD, FULL_NAME, 0);
     let _ = lin::unlinkat(lin::AT_FDCWD, STREAM_NAME, 0);
 
-    // The sockets open; SEQPACKET does not.
+    // The three shapes of the path family open. SEQPACKET is udevd's
+    // control-socket shape: a *named* one is served as the stream this
+    // family carries - `listen` succeeds on it where a datagram answers
+    // EOPNOTSUPP - and only a connected pair carries messages.
     let rs = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, lin::SOCK_DGRAM, 0) as i32;
     lin::check_true(
         &mut failed,
@@ -100,12 +105,15 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         5, /* SOCK_SEQPACKET */
         0,
     );
-    lin::check_eq(
-        &mut failed,
-        b"SOCK_SEQPACKET keeps the refusal",
-        sp,
-        lin::EOPNOTSUPP,
-    );
+    lin::check_true(&mut failed, b"SOCK_SEQPACKET opens", sp >= 0);
+    if sp >= 0 {
+        lin::check_eq(
+            &mut failed,
+            b"a named SOCK_SEQPACKET socket is served as a stream: listen succeeds",
+            lin::listen(sp as i32, 4),
+            0,
+        );
+    }
     let cs = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, lin::SOCK_DGRAM, 0) as i32;
     lin::check_true(&mut failed, b"a second datagram socket opens", cs >= 0);
 

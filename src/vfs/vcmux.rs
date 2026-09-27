@@ -31,6 +31,85 @@ use crate::sched::policy::TaskId;
 /// The virtual console currently on the wire, 1-based.
 static ACTIVE: AtomicU32 = AtomicU32::new(1);
 
+/// Each console's video mode (`KD_TEXT`/`KD_GRAPHICS`) and keyboard mode
+/// (`K_XLATE`, `K_OFF`, ...), indexed 1-based like the consoles themselves.
+///
+/// Two arrays rather than a small struct per console because each is read on a
+/// path that already exists and must not take a lock to find out: the render
+/// task asking whether this console should be painted at all, and the mux
+/// asking whether a keystroke belongs to a shell. `KDSETMODE` and `KDSKBMODE`
+/// write them, which is what makes a seat's handover mean something instead of
+/// being a request that was accepted and forgotten.
+static KD_MODE: [AtomicU32; crate::vfs::pty::VC_COUNT as usize + 1] =
+    [const { AtomicU32::new(crate::vfs::tty::KD_TEXT) }; crate::vfs::pty::VC_COUNT as usize + 1];
+static KB_MODE: [AtomicU32; crate::vfs::pty::VC_COUNT as usize + 1] =
+    [const { AtomicU32::new(crate::vfs::tty::K_XLATE) }; crate::vfs::pty::VC_COUNT as usize + 1];
+
+/// The slot a console's mode lives in, or `None` for a number that is not one
+/// of the consoles this machine has.
+fn slot(vc: u32) -> Option<usize> {
+    if vc == 0 || vc > crate::vfs::pty::VC_COUNT {
+        None
+    } else {
+        Some(vc as usize)
+    }
+}
+
+/// `KDSETMODE`: put a console in text or graphics mode. Refused for a console
+/// that does not exist.
+pub fn set_kd_mode(vc: u32, mode: u32) -> bool {
+    match slot(vc) {
+        Some(at) => {
+            KD_MODE[at].store(mode, Ordering::Relaxed);
+            // Taking the screen back is a change the render task has to notice
+            // even though no console was switched: the framebuffer holds
+            // whatever the compositor last drew, so the whole grid goes stale.
+            crate::drivers::video::render::notify();
+            true
+        }
+        None => false,
+    }
+}
+
+/// `KDGETMODE`, and the answer for a console that is not one of ours is text -
+/// there is nothing there to have taken the screen.
+pub fn kd_mode(vc: u32) -> u32 {
+    match slot(vc) {
+        Some(at) => KD_MODE[at].load(Ordering::Relaxed),
+        None => crate::vfs::tty::KD_TEXT,
+    }
+}
+
+/// `KDSKBMODE`: which translation this console's keyboard is in.
+pub fn set_kb_mode(vc: u32, mode: u32) -> bool {
+    match slot(vc) {
+        Some(at) => {
+            KB_MODE[at].store(mode, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `KDGKBMODE`, defaulting to `K_XLATE` as a console Linux never heard of would.
+pub fn kb_mode(vc: u32) -> u32 {
+    match slot(vc) {
+        Some(at) => KB_MODE[at].load(Ordering::Relaxed),
+        None => crate::vfs::tty::K_XLATE,
+    }
+}
+
+/// Whether the console on the screen is one the kernel should be drawing.
+///
+/// A session that has put its console in `KD_GRAPHICS` owns that screen: the
+/// text grid still exists and still scrolls, but painting it would overwrite
+/// the compositor's output a line at a time - which is exactly what a login
+/// shell echoing one keystroke did to weston, because every key the machine
+/// sees is also fed to the active console.
+pub fn painted() -> bool {
+    kd_mode(active()) != crate::vfs::tty::KD_GRAPHICS
+}
+
 /// A `^A` has been seen and the next byte decides what it meant.
 static PENDING_PREFIX: AtomicBool = AtomicBool::new(false);
 
@@ -48,6 +127,41 @@ pub fn ready() -> bool {
 /// The virtual console currently on the wire, 1-based.
 pub fn active() -> u32 {
     ACTIVE.load(Ordering::Relaxed)
+}
+
+/// `VT_ACTIVATE`'s way in: make console `to` the one on the screen.
+///
+/// `false` says the number is not one of this machine's consoles, which is what
+/// Linux answers `EINVAL` for. The `^A`-digit path uses the same door, so a
+/// session's activation and an operator's keystroke cannot disagree about what
+/// switching means.
+pub fn activate(to: u32) -> bool {
+    if slot(to).is_none() {
+        return false;
+    }
+    switch(to);
+    true
+}
+
+/// `VT_OPENQRY`: the lowest console that no one has taken over as their
+/// terminal, or `None` when all of them are spoken for - which is what Linux
+/// answers `ENXIO` for.
+///
+/// "Taken over" is asked of the console's own reader: a getty that has opened
+/// `/dev/tty3` and is waiting on it has claimed that console for a session, and
+/// one nobody has read from is still free for a seat manager to point a second
+/// session at.
+pub fn free_console() -> Option<u32> {
+    (1..=crate::vfs::pty::VC_COUNT).find(|vc| {
+        crate::vfs::pty::lookup(*vc).is_none_or(|pty| pty.slave().foreground().is_none())
+    })
+}
+
+/// `VT_SETMODE`'s `waitv`: park until console `want` is the active one. Nothing
+/// else can move the console while this sleeps, so the condition is checked
+/// again on every wake and the wait is honest rather than a returned promise.
+pub fn wait_active(want: u32) {
+    crate::sched::block_until(|| active() == want);
 }
 
 /// Spawn the pump task. Called once, at handoff: before init runs there is no
@@ -131,6 +245,16 @@ pub fn input(byte: u8) {
 }
 
 fn forward(byte: u8) {
+    // Note what does *not* happen here: a `KDSKBMODE(K_OFF)` the session on a
+    // console wrote does not stop these bytes. On Linux that mode belongs to
+    // the AT keyboard, and the machine's other input path - the serial line a
+    // person is watching and typing at - carries on regardless. Turning the
+    // keyboard off there is what a compositor does to the *text* console, and
+    // the text console's half of that is the screen, not the wire: see
+    // [`painted`], which is where the compositor's ownership is honoured. A
+    // drop here instead left the machine with no way to reach its own shell
+    // after weston exited, because nothing restores a mode the session set on
+    // the way out.
     let Some(pty) = crate::vfs::pty::lookup(active()) else {
         return;
     };

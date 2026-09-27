@@ -606,6 +606,27 @@ impl AddressSpace {
     /// Used by fork after `protect` strips WRITE: the PTE still has the old
     /// flags, and this adds the COW marker.
     pub fn set_cow_bit(&self, virt: usize) {
+        self.set_cow_bit_quietly(virt);
+        self.flush_if_active();
+    }
+
+    /// [`set_cow_bit`] without the TLB flush, for a caller that is marking a
+    /// whole address space and will flush once at the end.
+    ///
+    /// The flush is the expensive half: it drops every translation the process
+    /// owns, so a `fork` that marks ten thousand pages would ask the CPU to
+    /// re-walk them ten thousand times - once per page, for pages the process
+    /// is about to touch anyway. Deferring it makes the walk that follows the
+    /// only one that costs anything, which is what [`flush_if_active`] is for.
+    ///
+    /// Safety is a caller contract rather than a type: until the flush, the CPU
+    /// may be holding writable translations for pages this just made read-only,
+    /// so nothing may run on this address space in between. That is true for
+    /// fork - it is inside a syscall, and the task that owns the space is the
+    /// one making the call.
+    ///
+    /// [`flush_if_active`]: AddressSpace::flush_if_active
+    pub fn set_cow_bit_quietly(&self, virt: usize) {
         let aligned_virt = crate::mm::pframe::align_down(virt, crate::mm::PAGE_SIZE);
         let mut table = self.root;
         for level in (0..4).rev() {
@@ -619,12 +640,19 @@ impl AddressSpace {
                 // Set the COW bit and clear WRITE.
                 let new = (entry | COW_BIT) & !WRITABLE;
                 unsafe { (entry_ptr as *mut u64).write_volatile(new) };
-                if self.root == active_root() {
-                    activate(self.root);
-                }
                 return;
             }
             table = (entry & ADDR_MASK) as usize;
+        }
+    }
+
+    /// Drop the whole TLB if this is the address space the CPU is translating
+    /// through. The one flush a batch of [`set_cow_bit_quietly`] calls owes.
+    ///
+    /// [`set_cow_bit_quietly`]: AddressSpace::set_cow_bit_quietly
+    pub fn flush_if_active(&self) {
+        if self.root == active_root() {
+            activate(self.root);
         }
     }
 

@@ -70,6 +70,19 @@ static DIRTY: AtomicBool = AtomicBool::new(false);
 /// interrupt handler): it only sets a flag and wakes the task.
 pub fn notify() {
     DIRTY.store(true, Ordering::Relaxed);
+    wake_task();
+}
+
+/// Wake the render task so that it looks at its condition again.
+///
+/// Every flag the task waits on needs this, and the reason is the kind of sleep
+/// it takes: `block_until` parks with no deadline - "until someone wakes me" -
+/// so a condition that becomes true without a wake is a condition the task will
+/// not read until something *else* happens to wake it. On an idle machine
+/// nothing else does, which is what turned a `/dev/fb0` write into two tasks
+/// waiting for each other: the request counter said there was work, and nothing
+/// said "look".
+fn wake_task() {
     let pid = RENDER_PID.load(Ordering::Relaxed);
     if pid != 0 {
         crate::sched::wake(TaskId(pid as usize));
@@ -103,6 +116,14 @@ pub fn spawn(
         // settles into its present loop.
         notify();
     }
+}
+
+/// Whether a writer is waiting for a frame it has already put in the buffer.
+///
+/// The task's other reason to wake, alongside a dirty console - and the only
+/// one on a compositor boot, where there is no console grid to repaint.
+fn pending() -> bool {
+    REQ.load(Ordering::Relaxed) > DONE.load(Ordering::Relaxed)
 }
 
 fn task() {
@@ -153,25 +174,35 @@ fn task() {
     let mut last_paint = 0u64;
     loop {
         // Wake the moment a screen changes - a keystroke should repaint now,
-        // not on the next beat - or when a compositor writer asks for a
-        // present. Never storming: sleep out the rest of the frame interval.
-        crate::sched::block_until(|| {
-            DIRTY.load(Ordering::Relaxed)
-                || REQ.load(Ordering::Relaxed) > DONE.load(Ordering::Relaxed)
-        });
+        // not on the next beat - or when a writer asks for a frame it has
+        // already put in the buffer. An idle machine does neither, and this
+        // wait has no deadline, so an idle console really does cost nothing.
+        crate::sched::block_until(|| DIRTY.load(Ordering::Relaxed) || pending());
         DIRTY.store(false, Ordering::Relaxed);
+
+        // The beat coalesces *repaints*, not *requests*. A repaint is work
+        // nobody asked for, and deferring it by a frame is invisible; a request
+        // has a writer parked in `write(2)` until its frame leaves, so pacing it
+        // at the beat would make a 4 KiB write cost a frame and a screenful
+        // cost a minute - which is what a `/dev/fb0` writer would have paid.
         let now = crate::arch::timer::ticks();
-        if now.saturating_sub(last_paint) < FRAME_TICKS {
+        if !pending() && now.saturating_sub(last_paint) < FRAME_TICKS {
             crate::sched::sleep_ticks(FRAME_TICKS - (now - last_paint));
         }
         last_paint = crate::arch::timer::ticks();
 
         // Copy the changed screen's cells under the lock (a fixed memcpy), then
         // paint from the copy with the clock live. The flush is outside both.
-        // In a compositor boot there is no console grid to paint - the pixels
-        // are the compositor's already in the buffer - so this whole step is
-        // skipped and only the `req > done` present below ever runs.
-        let painted = if present_only {
+        // Two boots have no console grid to paint: a compositor boot, where the
+        // pixels are already in the buffer, and any moment the console on the
+        // screen has been put in graphics mode by the session that took it - the
+        // grid still scrolls, and painting it would overwrite weston's output
+        // with a login prompt one keystroke at a time.
+        let painted = if present_only || !crate::vfs::vcmux::painted() {
+            // Forget which console was last shown: when the screen comes back,
+            // whatever is on it belongs to something else, and the whole grid
+            // needs redrawing rather than the changed rows.
+            last_shown = 0;
             false
         } else {
             let shown = vcmux::active() as usize;
@@ -206,11 +237,15 @@ fn task() {
             }
         };
 
+        // The sequence this frame answers for, read *before* the flush: a
+        // request that arrives after this load is not in the frame, so marking
+        // it done would let its writer return with its pixels still only in the
+        // buffer - the one thing the write-through promise says cannot happen.
         let req = REQ.load(Ordering::Relaxed);
         let done = DONE.load(Ordering::Relaxed);
         if painted || req > done {
             let _ = device.flush();
-            DONE.store(REQ.load(Ordering::Relaxed), Ordering::Relaxed);
+            DONE.store(req, Ordering::Relaxed);
             let waiters =
                 critical_section::with(|cs| core::mem::take(&mut *WAITERS.borrow(cs).borrow_mut()));
             for id in waiters {
@@ -223,6 +258,12 @@ fn task() {
 /// `write(2)` on `/dev/fb0`: block until the pixels this caller put in the
 /// buffer have been flushed to the host, keeping the node's documented
 /// write-through promise.
+///
+/// The request is a *notification* as much as a counter. The task sleeps
+/// without a deadline, so bumping `REQ` and not waking it leaves the work
+/// unread - and the writer below waiting for a flush that nothing is going to
+/// make. Every caller of this is a producer talking to a sleeper, which is why
+/// the wake belongs here rather than at each of them.
 pub fn request_flush_blocking() {
     if !running() {
         return;
@@ -235,6 +276,10 @@ pub fn request_flush_blocking() {
             waiters.push(me);
         }
     });
+    // Registered before the wake, so a task that flushes immediately still
+    // finds this writer to wake; and woken after registering, so the request
+    // is read at all.
+    wake_task();
     crate::sched::block_until(|| DONE.load(Ordering::Relaxed) >= seq);
     critical_section::with(|cs| {
         WAITERS.borrow(cs).borrow_mut().retain(|&w| w != me);

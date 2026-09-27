@@ -338,7 +338,11 @@ impl Epoll {
             entries.retain(|entry| alive(caller, entry));
             let capacity = out.capacity();
             for entry in entries.iter_mut() {
-                let ready = entry.file.inode().poll_ready();
+                // As the description that registered the interest, not as
+                // whoever is calling: a node whose readiness is per-client
+                // (an evdev node with a grab on it) has to answer about the
+                // descriptor that is being waited on.
+                let ready = entry.file.inode().poll_ready_client(entry.file.ofd());
                 let bits = report(entry, ready);
                 if bits != 0 && out.len() < capacity {
                     out.push(Reported {
@@ -368,7 +372,10 @@ impl Epoll {
     pub fn subscribe_waits(&self, id: crate::sched::policy::TaskId) {
         critical_section::with(|cs| {
             for entry in self.state.borrow(cs).borrow().iter() {
-                entry.file.inode().poll_subscribe(id);
+                entry
+                    .file
+                    .inode()
+                    .poll_subscribe_client(entry.file.ofd(), id);
             }
         });
     }
@@ -396,11 +403,13 @@ impl Epoll {
     /// permits itself.
     pub fn any_ready(&self) -> bool {
         critical_section::with(|cs| {
-            self.state
-                .borrow(cs)
-                .borrow()
-                .iter()
-                .any(|entry| !entry.dead && report(entry, entry.file.inode().poll_ready()) != 0)
+            self.state.borrow(cs).borrow().iter().any(|entry| {
+                !entry.dead
+                    && report(
+                        entry,
+                        entry.file.inode().poll_ready_client(entry.file.ofd()),
+                    ) != 0
+            })
         })
     }
 }
@@ -689,7 +698,7 @@ mod tests {
         let (table, ep, epfd) = epoll_fd();
         let (read_end, _write_end) = pipe::pair();
         let pfd = watch(&table, read_end);
-        let (a, _b) = pipe::DuplexEnd::pair();
+        let (a, _b) = pipe::DuplexEnd::pair((0, 0, 0));
         let sfd = watch(&table, a);
 
         assert_eq!(ep.ctl(&table, epfd, EPOLL_CTL_ADD, pfd, EPOLLIN, 0), Ok(()));

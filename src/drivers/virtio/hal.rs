@@ -128,7 +128,7 @@ pub fn transport_all(device_ids: &[u16]) -> alloc::vec::Vec<PciTransport> {
             func.command_on(COMMAND_ON);
             let (bus, device, function) = func.bdf();
             let mut root = pci_root();
-            PciTransport::new::<HalImpl, _>(
+            let transport = PciTransport::new::<HalImpl, _>(
                 &mut root,
                 DeviceFunction {
                     bus,
@@ -136,7 +136,11 @@ pub fn transport_all(device_ids: &[u16]) -> alloc::vec::Vec<PciTransport> {
                     function,
                 },
             )
-            .ok()
+            .ok()?;
+            // The function is this driver's from here, which is what
+            // `lspci -k` reads back.
+            pci::claim(&func, super::PCI_DRIVER);
+            Some(transport)
         })
         .collect()
 }

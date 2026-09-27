@@ -18,6 +18,8 @@
 //!   finished" without also being told to stop answering;
 //! * the descriptors survive `execve`, so the helper really can use one as
 //!   its standard input;
+//! * a `SOCK_SEQPACKET` pair - udevd's worker notification channel - opens
+//!   too, and its writes arrive as whole messages, boundaries kept;
 //! * the refusals name the right thing: Linux answers a *family* it does not
 //!   know with `EAFNOSUPPORT`, a family it knows but has no pair operation
 //!   for with `EOPNOTSUPP`, and a protocol the pair cannot carry with
@@ -216,6 +218,52 @@ fn main() {
             "a type no Unix socket has is ESOCKTNOSUPPORT",
             err,
             Errno::SOCKTNOSUPPORT,
+        ),
+    }
+
+    // The message pair: udevd's worker notification channel is a
+    // `SOCK_SEQPACKET` socketpair, and what it carries is one-byte
+    // announcements that must arrive as separate messages, not coalesce.
+    // A pair of these opens, and each write is one whole message the
+    // reading end takes one at a time.
+    match socketpair(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::empty(),
+        None,
+    ) {
+        Ok((m, n)) => {
+            r.check("a SOCK_SEQPACKET pair is created", true);
+            r.check("the first message goes in", write(&m, b"add").is_ok());
+            r.check(
+                "and the second goes in behind it",
+                write(&m, b"del").is_ok(),
+            );
+            let mut buf = [0u8; 16];
+            match read(&n, &mut buf) {
+                Ok(got) => r.check(
+                    &format!("the peer reads the first message whole ({got} bytes)"),
+                    &buf[..got] == b"add",
+                ),
+                Err(err) => r.check(
+                    &format!("the peer reads the first message whole (got {err})"),
+                    false,
+                ),
+            }
+            match read(&n, &mut buf) {
+                Ok(got) => r.check(
+                    &format!("then the second, still as its own message ({got} bytes)"),
+                    &buf[..got] == b"del",
+                ),
+                Err(err) => r.check(
+                    &format!("then the second, still as its own message (got {err})"),
+                    false,
+                ),
+            }
+        }
+        Err(err) => r.check(
+            &format!("a SOCK_SEQPACKET pair is created (got {err})"),
+            false,
         ),
     }
 

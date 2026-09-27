@@ -80,14 +80,14 @@ mod util;
 
 pub(crate) use self::cache::Cache;
 pub(crate) use self::dirent::{
-    DIRENT_HEADER, dir_find, dir_init, dir_take, dir_try_insert, dir_walk, dirent_len,
-    trim_dir_tail, write_dirent,
+    DIRENT_HEADER, dir_find, dir_init, dir_take, dir_try_insert, dir_walk, dirent_len, entry_name,
+    entry_rec, trim_dir_tail, write_dirent,
 };
 pub(crate) use self::extent::{
-    EXTENT_ENTRY, EXTENT_HEADER, EXTENT_INIT_MAX, EXTENT_MAX_DEPTH, EXTENT_ROOT_BYTES,
-    EXTENT_UNWRITTEN, ExtInsert, ExtSplit, ext_depth, ext_entries, ext_index, ext_init_header,
-    ext_insert, ext_leaf, ext_max, ext_ok, ext_put_root, ext_root, ext_set_entries,
-    ext_write_index, ext_write_leaf,
+    EXTENT_ENTRY, EXTENT_HEADER, EXTENT_INIT_MAX, EXTENT_MAX_DEPTH, EXTENT_ROOT_BYTES, ExtInsert,
+    ExtSplit, ext_depth, ext_entries, ext_index, ext_init_header, ext_insert, ext_leaf, ext_len,
+    ext_max, ext_ok, ext_put_root, ext_raw_len, ext_root, ext_set_entries, ext_write_index,
+    ext_write_leaf,
 };
 pub(crate) use self::hash::dx_hash_name;
 pub(crate) use self::inode::{
@@ -149,6 +149,13 @@ impl Core {
     }
 
     fn mount(dev: Arc<dyn BlockDev>) -> Result<Core, &'static str> {
+        // The superblock sits at byte 1024 and is 1024 bytes long, so a device
+        // shorter than two KiB cannot hold one - and reading past the end of a
+        // real disk is a request the block driver answers by refusing the
+        // mount loudly rather than quietly. Ask the question before the read.
+        if dev.capacity_sectors() * 512 < SUPERBLOCK_AT + SUPERBLOCK_BYTES as u64 {
+            return Err("device is too small to hold a filesystem");
+        }
         // The superblock is read before the cache exists: the cache's slot
         // size is one of the things it decides.
         let mut bytes = [0u8; SUPERBLOCK_BYTES];
@@ -165,11 +172,30 @@ impl Core {
                 "ext4: volume has a journal; mounted read-only until the journal is maintained\n"
             ));
         }
+        let block_size = 1024usize << sb.log_block_size;
+        // The device decides how large a filesystem may be. `s_blocks_count` is
+        // disk data, and it is the bound every later block number is believed
+        // against - so a volume claiming more blocks than the disk holds would
+        // not just be lying about itself, it would quietly make every pointer
+        // inside it pass a check that had stopped meaning anything. Linux
+        // refuses at mount for the same reason.
+        //
+        // `SECTOR` is the unit `BlockDev` speaks in: the trait's offsets are
+        // multiples of 512 bytes, whatever a device's own geometry says.
+        const SECTOR: u64 = 512;
+        sb.blocks_count
+            .checked_mul(block_size as u64)
+            .filter(|claimed| *claimed <= dev.capacity_sectors() * SECTOR)
+            .ok_or("ext4 is larger than the device it sits on")?;
+        // A volume that ends at or before its own first data block holds
+        // nothing, and the group count below subtracts it.
+        if sb.blocks_count <= u64::from(sb.first_data_block) {
+            return Err("ext4 ends before its first data block");
+        }
         let groups =
             (sb.blocks_count - sb.first_data_block as u64).div_ceil(sb.blocks_per_group as u64);
         let groups = u32::try_from(groups)
             .map_err(|_| "ext4 has more groups than this driver can address")?;
-        let block_size = 1024usize << sb.log_block_size;
         let core = Core {
             // The mount starts in the mode the format can honour: a journal
             // nobody maintains and a volume that never recorded a clean
@@ -180,7 +206,7 @@ impl Core {
             dev,
             sb,
             groups,
-            cache: Mutex::new(RefCell::new(Cache::new(block_size))),
+            cache: Mutex::new(RefCell::new(Cache::new())),
             inodes: Mutex::new(RefCell::new(BTreeMap::new())),
         };
         // Checksummed volumes are verified at mount, the way the kernel's
@@ -205,6 +231,19 @@ impl Core {
     /// which counts filesystem blocks - the same quantity in a different unit,
     /// and the one mistake that makes `stat` report a file eight times its
     /// size on a 4 KiB filesystem.
+    /// Whether `block` is a block this volume has.
+    ///
+    /// The one question every block number read off the disk has to answer
+    /// before it is used, and the reason it is asked where the number is
+    /// *decoded* rather than where it is consumed is that only the decoding
+    /// site knows what to do about a refusal: a directory entry's answer is
+    /// "no such file", an extent's is "this tree is corrupt", the allocator's
+    /// is "not this group". By the time a number reaches the cache it has
+    /// usually passed through code with no error channel at all.
+    fn block_is_live(&self, block: u64) -> bool {
+        block < self.sb.blocks_count
+    }
+
     fn block_units(&self, flags: u32) -> u32 {
         if flags & INODE_HUGE_FILE_FL != 0 {
             1
@@ -232,15 +271,23 @@ impl Core {
             off,
             block
         );
-        // A block number at or past the end of the filesystem is what a
-        // misextracted pointer looks like, and the device below answers it
-        // with an I/O error that names nothing. Refuse it here, where the
-        // number still has an identity.
-        assert!(
-            block < self.sb.blocks_count,
+        // The net under every decoding site. A block number that got this far
+        // and is past the end of the volume means somewhere above read a
+        // pointer the disk invented, and the somewhere that knows what to do
+        // about that has already had its chance: `bmap_lookup` answers "hole",
+        // `ext_load` answers `Corrupt`, the allocator skips the group. What
+        // must not happen is the machine going down over a number, which is
+        // what an `assert!` here would be - the same mistake the block driver
+        // below would make of it, with a bare I/O error for an answer.
+        debug_assert!(
+            self.block_is_live(block),
             "ext2 block {block} is past the end of the filesystem ({} blocks)",
             self.sb.blocks_count
         );
+        if !self.block_is_live(block) {
+            dst.fill(0);
+            return;
+        }
         critical_section::with(|cs| {
             let mut cache = self.cache.borrow(cs).borrow_mut();
             let page = cache.slot(&*self.dev, block, block_size);
@@ -252,6 +299,18 @@ impl Core {
     /// reports a modification. Write-through in one step: the disk never
     /// trails the cache.
     fn update_block(&self, block: u64, f: impl FnOnce(&mut [u8]) -> bool) -> bool {
+        debug_assert!(
+            self.block_is_live(block),
+            "ext2 write to block {block}, past the end of the filesystem",
+        );
+        if !self.block_is_live(block) {
+            // Nothing was read and nothing is written: a block the volume does
+            // not have cannot be modified, and `false` is exactly what this
+            // function already means when `f` declined to change anything. The
+            // allocator's loop reads that as "not this group", which is the
+            // right answer for a group whose descriptor pointed off the disk.
+            return false;
+        }
         let block_size = self.block_size();
         critical_section::with(|cs| {
             let mut cache = self.cache.borrow(cs).borrow_mut();
@@ -274,14 +333,23 @@ impl Core {
     }
 
     fn read_inode(&self, ino: u32) -> InodeData {
-        let (block, off) = self.inode_pos(ino);
+        // An inode the volume cannot name reads as the zeroed record, which is
+        // what an untouched table slot holds: no blocks, no links, size zero.
+        // Every operation on it then fails the way an operation on an empty
+        // file fails, instead of the way a read of a block outside the disk
+        // fails.
+        let Some((block, off)) = self.inode_pos(ino) else {
+            return InodeData::parse(&[0u8; INODE_PARSED]);
+        };
         let mut bytes = [0u8; INODE_PARSED];
         self.read_bytes(block, off, &mut bytes);
         InodeData::parse(&bytes)
     }
 
     fn write_inode(&self, ino: u32, data: &InodeData) {
-        let (block, off) = self.inode_pos(ino);
+        let Some((block, off)) = self.inode_pos(ino) else {
+            return;
+        };
         let mut bytes = [0u8; INODE_PARSED];
         data.store(&mut bytes);
         // An inode with extra space carries its own checksum - and every
@@ -424,6 +492,14 @@ impl Core {
             let at = g as usize * desc_size;
             let block = self.sb.first_data_block as u64 + 1 + (at / bs) as u64;
             let off = at % bs;
+            if !self.block_is_live(block) {
+                // The descriptor table is longer than the volume it describes.
+                // The groups past the end cannot be read, so they cannot be
+                // verified either; the walk stops there and the mount stands,
+                // because an unreadable descriptor is no evidence that the
+                // volume is bad - only that this one is out of reach.
+                break;
+            }
             self.dev.read_at(block * bs as u64, &mut page);
             let mut d = page[off..off + desc_size].to_vec();
             let stored = le16(&d, 30);
@@ -447,7 +523,7 @@ impl Core {
                 } else {
                     0
                 };
-            if blk_sum != 0 && g0.block_bitmap != 0 {
+            if blk_sum != 0 && g0.block_bitmap != 0 && self.block_is_live(g0.block_bitmap) {
                 self.dev.read_at(g0.block_bitmap * bs as u64, &mut page);
                 let want = if self.sb.has_metadata_csum {
                     self::csum::bitmap_csum(self.sb.csum_seed, &page)
@@ -471,6 +547,13 @@ impl Core {
             return;
         }
         let g = self.group(group);
+        if !self.group_is_live(&g) {
+            // A descriptor whose bitmaps are not on the disk has nothing to
+            // checksum, and writing a checksum over the answer a read of an
+            // absent block would have given is how a small piece of damage
+            // becomes a volume that no longer mounts.
+            return;
+        }
         let bs = self.block_size();
         let mut blk = vec![0u8; bs];
         self.dev.read_at(g.block_bitmap * bs as u64, &mut blk);
@@ -1022,7 +1105,9 @@ impl Inode for Ext4Ino {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let data = self.fs.read_inode(self.ino);
+        // `mut` for one reason: a read may move the access time (see the
+        // `relatime` block at the end), and nothing else here touches the inode.
+        let mut data = self.fs.read_inode(self.ino);
         let kind = data.kind();
         if kind != NodeKind::File {
             // A directory is a directory; a link is a name, and reading
@@ -1055,6 +1140,21 @@ impl Inode for Ext4Ino {
             }
             done += n;
             pos += n as u64;
+        }
+        // `relatime` - Linux's default, and the only shape of "update the
+        // access time on read" that is not a device write per read. The access
+        // time moves only when the recorded one has nothing to say since: it
+        // predates the inode's own change time (so something has happened to
+        // the file since it was last looked at), or it is more than a day old.
+        // A read that is the second look at the same state therefore costs
+        // nothing, which is what keeps this off the hot path §10.5 is about.
+        if done > 0 {
+            let stamp = now();
+            const DAY: u32 = 86_400;
+            if data.atime < data.ctime || data.atime + DAY < stamp {
+                data.atime = stamp;
+                self.fs.write_inode(self.ino, &data);
+            }
         }
         Ok(done)
     }
@@ -1457,7 +1557,73 @@ mod tests {
         assert!(Ext4Fs::mount(Arc::new(MemDev::new(128))).is_err());
     }
 
-    /// Reproduce how fish reads its `default.theme`: a multi-line file whose
+    /// Two superblock words say where the format's own bookkeeping starts, and
+    /// both are consumed by subtraction on the way there: the recorded position
+    /// of the superblock is the distance from its block's start to byte 1024,
+    /// and the first inode group 0's allocator may offer is `s_first_ino` less
+    /// one. A volume that names a block past the one holding its own
+    /// superblock - the pair (1, 4096), or any number above 1 - or that claims
+    /// to reserve nothing, is therefore not an unusual layout but an underflow,
+    /// and `Super::parse` answers it as the refusal it is rather than as a
+    /// mount that panics on its first read.
+    #[test]
+    fn a_superblock_that_underflows_its_own_geometry_is_refused() {
+        for (at, value, what) in [
+            (20, 2u32, "a first data block past the superblock's own"),
+            (20, u32::MAX, "a first data block no block size reaches"),
+            (84, 0u32, "a volume that reserves no inodes at all"),
+        ] {
+            let dev = format();
+            critical_section::with(|cs| {
+                let mut disk = dev.bytes.borrow(cs).borrow_mut();
+                put32(&mut disk, 1024 + at, value);
+            });
+            assert!(
+                Ext4Fs::mount(Arc::new(dev)).is_err(),
+                "{what} mounted anyway"
+            );
+        }
+    }
+
+    /// The device is what makes `s_blocks_count` a bound worth trusting: every
+    /// block number read later is checked against it, so a volume that claims
+    /// more blocks than the disk holds does not merely describe itself
+    /// wrongly - it makes every check that would catch a lying pointer agree
+    /// with the lie. Refused at mount, the way Linux refuses it.
+    #[test]
+    fn a_volume_larger_than_its_device_is_refused() {
+        let dev = format();
+        // The fixture's device is 128 blocks of 1024 bytes; claim a thousand
+        // times that, which is the shape of a number a broken or invented
+        // superblock carries.
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            put32(&mut disk, 1024 + 4, 128 * 1000);
+        });
+        assert!(
+            Ext4Fs::mount(Arc::new(dev)).is_err(),
+            "a filesystem wider than its disk mounted"
+        );
+    }
+
+    /// The same claim in the *high* half of a 64-bit `s_blocks_count`: the
+    /// multiplication that turns blocks into bytes is the check, and it has to
+    /// survive a number that overflows it rather than wrapping into the range
+    /// the device can hold.
+    #[test]
+    fn a_block_count_that_overflows_its_own_byte_count_is_refused() {
+        let dev = format();
+        ext4_feature(&dev, 1024 + 96, INCOMPAT_64BIT);
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            put32(&mut disk, 1024 + 4, u32::MAX);
+            put32(&mut disk, 1024 + 336, u32::MAX); // the high half of the count
+        });
+        assert!(
+            Ext4Fs::mount(Arc::new(dev)).is_err(),
+            "a block count whose byte count overflows mounted"
+        );
+    }
     /// values contain spaces and `=` (`--background=cyan`), consumed in many
     /// small chunked `read_at` calls and split on tabs. This is the exact byte
     /// path a corrupted theme read would ride through, so pinning it rules the
@@ -1664,6 +1830,44 @@ mod tests {
         assert_ne!(file.ctime(), ctime_before, "ctime moved with the change");
         assert_ne!(file.ctime(), 111);
         assert_ne!(file.ctime(), 222);
+    }
+
+    #[test]
+    fn a_read_bumps_atime_once_and_relatime_leaves_the_rest_alone() {
+        // Linux's default mount is `relatime`: a read moves the access time only
+        // when the recorded one predates the inode's change time, or is a day
+        // old. The rule is not decoration - the access time lives in the inode,
+        // so a read that always updates it is a read that always writes to the
+        // device, which is the read path §10.5 exists to make faster.
+        let dev = Arc::new(format());
+        let fs = mounted(dev.clone());
+        let root = fs.root();
+        let file = root.create("watched", NodeKind::File).expect("create");
+        file.write_at(0, b"payload").unwrap();
+        let stale = file.atime();
+        assert!(
+            stale < file.ctime(),
+            "the write moved ctime past an atime nothing has read since"
+        );
+
+        // The first read sees a file that has changed since it was last looked
+        // at, so the stamp moves.
+        assert_eq!(read_all(&*file, 16), b"payload");
+        let first = file.atime();
+        assert!(first > stale, "a read after a change bumps atime");
+
+        // The second read sees nothing new: same inode, no change in between, so
+        // neither the stamp nor the disk is touched.
+        assert_eq!(read_all(&*file, 16), b"payload");
+        assert_eq!(file.atime(), first, "a second read moves nothing");
+
+        // A write re-opens the gap, and the next read answers it again.
+        file.write_at(0, b"PAYLOAD").unwrap();
+        assert_eq!(read_all(&*file, 16), b"PAYLOAD");
+        assert!(
+            file.atime() > first,
+            "a read after a fresh write bumps again"
+        );
     }
 
     #[test]
@@ -2627,6 +2831,119 @@ mod tests {
                 put32(&mut disk, 1024 + 1020, c);
             }
         });
+    }
+
+    #[test]
+    fn an_extent_of_exactly_32768_blocks_is_a_run_and_not_a_hole() {
+        // `ee_len` is not a length with a flag beside it: ext4 keeps the
+        // unwritten bit *in* the length, where at most 32768 means a written
+        // run of that many blocks and anything larger means an unwritten run
+        // of `ee_len - 32768`. So 32768 - the longest run one entry can
+        // describe, and the shape the allocator produces for any file big
+        // enough to need capping - is a *written* extent.
+        //
+        // Testing the top bit instead makes exactly that extent a zero-length
+        // hole, and a hole reads as zeros: 128 MiB of a shared library came
+        // back blank that way, which is what "Exec format error" from a
+        // `dlopen` of it looks like from userland.
+        let dev = format_ext4();
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            ext4_put_header(&mut disk, 11, 1, 0);
+            ext4_put_extent(
+                &mut disk,
+                11,
+                0,
+                0,
+                EXTENT_INIT_MAX,
+                EXT4_HELLO_BLOCK as u64,
+            );
+        });
+        let fs = mounted(Arc::new(dev));
+        let hello = fs.root().lookup("hello").expect("hello is there");
+        assert_eq!(read_all(&*hello, 11), b"hello world".to_vec());
+    }
+
+    #[test]
+    fn an_extent_longer_than_that_is_the_unwritten_one() {
+        // The other side of the same rule: 32769 is not a written run of
+        // 32769 blocks - it is an *unwritten* run of one, and its block reads
+        // as zeros however much data the disk behind it happens to hold.
+        let dev = format_ext4();
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            ext4_put_header(&mut disk, 11, 1, 0);
+            ext4_put_extent(
+                &mut disk,
+                11,
+                0,
+                0,
+                EXTENT_INIT_MAX + 1,
+                EXT4_HELLO_BLOCK as u64,
+            );
+        });
+        let fs = mounted(Arc::new(dev));
+        let hello = fs.root().lookup("hello").expect("hello is there");
+        assert_eq!(read_all(&*hello, 11), vec![0u8; 11]);
+    }
+
+    #[test]
+    fn the_unwritten_bit_is_the_length_and_nothing_else() {
+        // The rule itself, at the boundaries: written up to and including
+        // 32768, unwritten above it with the run one shorter than the field.
+        assert_eq!(ext_len(0), (0, false));
+        assert_eq!(ext_len(1), (1, false));
+        assert_eq!(ext_len(EXTENT_INIT_MAX - 1), (32767, false));
+        assert_eq!(ext_len(EXTENT_INIT_MAX), (32768, false));
+        assert_eq!(ext_len(EXTENT_INIT_MAX + 1), (1, true));
+        assert_eq!(ext_len(u16::MAX), (32767, true));
+        // And a field written back is the field it was.
+        for raw in [
+            0u16,
+            1,
+            EXTENT_INIT_MAX - 1,
+            EXTENT_INIT_MAX,
+            EXTENT_INIT_MAX + 1,
+            u16::MAX,
+        ] {
+            let (len, unwritten) = ext_len(raw);
+            assert_eq!(ext_raw_len(len, unwritten), raw, "{raw} round-trips");
+        }
+    }
+
+    #[test]
+    fn truncating_a_file_with_a_hole_in_it_keeps_the_hole() {
+        // The length field *is* the flag, so anything that copies an extent
+        // entry has to copy it as the field it was. A truncate that rewrote a
+        // hole as a plain length would turn it into a written run, and the
+        // file would then read whatever the block's last owner left on the
+        // disk.
+        let dev = format_ext4();
+        critical_section::with(|cs| {
+            let mut disk = dev.bytes.borrow(cs).borrow_mut();
+            ext4_put_header(&mut disk, 11, 1, 0);
+            // Two blocks, unwritten: `ee_len` is the length plus 32768.
+            ext4_put_extent(
+                &mut disk,
+                11,
+                0,
+                0,
+                2 + EXTENT_INIT_MAX,
+                EXT4_HELLO_BLOCK as u64,
+            );
+        });
+        let fs = mounted(Arc::new(dev));
+        let hello = fs.root().lookup("hello").expect("hello is there");
+        assert_eq!(read_all(&*hello, 11), vec![0u8; 11]);
+
+        // Shrink it, so the entry is rewritten to the head of the run...
+        hello.truncate(1).expect("truncate");
+        assert_eq!(read_all(&*hello, 1), vec![0u8; 1]);
+        // ...and the head is still marked unwritten.
+        let data = fs.core.read_inode(11);
+        let root = ext_root(&data);
+        let (_first, raw_len, _start) = ext_leaf(&root, 0);
+        assert_eq!(ext_len(raw_len), (1, true));
     }
 
     #[test]

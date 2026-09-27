@@ -46,6 +46,12 @@ pub fn init() {
             .segment_not_present
             .set_handler_fn(segment_not_present);
         table.alignment_check.set_handler_fn(alignment_check);
+        // Vector 7: raised by the first floating-point instruction a task runs
+        // after a switch set `CR0.TS`, which is how the deferred half of the
+        // FPU switch is delivered. Not an error path - it is the mechanism.
+        table
+            .device_not_available
+            .set_handler_fn(device_not_available);
 
         table[pic::IRQ0_VECTOR].set_handler_fn(timer);
         // IRQ4 is COM1 on every PC that has one: the console's input arrives
@@ -129,45 +135,62 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
-    if user_fault_or_die(&frame) {
+    if user_fault_or_die(&frame, 0) {
         return;
     }
     fatal("#DE divide error", &frame, 0)
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-    if user_fault_or_die(&frame) {
+    if user_fault_or_die(&frame, 0) {
         return;
     }
     fatal("#UD invalid opcode", &frame, 0)
 }
 
 extern "x86-interrupt" fn stack_segment(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame) {
+    if user_fault_or_die(&frame, code) {
         return;
     }
     fatal("#SS stack segment", &frame, code)
 }
 
 extern "x86-interrupt" fn segment_not_present(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame) {
+    if user_fault_or_die(&frame, code) {
         return;
     }
     fatal("#NP segment not present", &frame, code)
 }
 
 extern "x86-interrupt" fn alignment_check(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame) {
+    if user_fault_or_die(&frame, code) {
         return;
     }
     fatal("#AC alignment check", &frame, code)
 }
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
-    if user_fault_or_die(&frame) {
+    if user_fault_or_die(&frame, code) {
         return;
     }
     fatal("#GP general protection", &frame, code)
+}
+
+/// `#NM`, vector 7 - no error code, and no frame to inspect.
+///
+/// The lazy half of the floating-point switch, and therefore *not* a fault to
+/// report: the task that took it has just run its first vector instruction since
+/// it was switched in, and what it needs is its own registers loaded and
+/// `CR0.TS` cleared. Nothing here can fail - the image is the task's own and is
+/// 16-byte aligned by construction - so there is no path out of it that does not
+/// end in the instruction being re-executed.
+///
+/// A trap taken in ring 0 would mean the kernel itself ran a floating-point
+/// instruction, which `soft-float` says never happens; the handler is the same
+/// either way, and it is written to be, because the alternative is a dead
+/// machine rather than a diagnostic.
+extern "x86-interrupt" fn device_not_available(_frame: InterruptStackFrame) {
+    crate::sched::device_not_available();
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {
@@ -250,6 +273,12 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         crate::sched::preempt();
         return;
     }
+    // The report is the whole point of this path, and on a GUI or compositor
+    // boot the console is the framebuffer - so without pulling it back to the
+    // wire first, a kernel that dies here leaves the reader with a vanished
+    // machine and no explanation. The same move as `fatal` and the panic
+    // handler in `main`.
+    crate::console::force_serial();
     crate::println!(
         "\nKERNEL PANIC: #PF at {:#x} ({:?}) rip {:#x} cs {:#x} rsp {:#x}",
         addr,
@@ -258,7 +287,65 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         frame.code_segment.0,
         frame.stack_pointer
     );
+    // One address is a coincidence; the chain is the diagnosis. A kernel fault
+    // is noticed at the instruction that touched the bad address, and what the
+    // reader needs is *how the kernel got there* - which, without a frame
+    // pointer to walk, means the words on the faulting stack that can only be
+    // return addresses into kernel text. Printed here rather than left to a
+    // host-side script for the reason the report is printed at all: on a GUI or
+    // compositor boot this is the only copy that leaves the machine.
+    report_frames(frame.stack_pointer.as_u64() as usize);
     crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_FAILURE)
+}
+
+/// How many words of the faulting kernel stack are walked for return addresses.
+///
+/// Deep enough to cross a syscall's frame and the scheduler step underneath it,
+/// and bounded because the walk reads memory the fault may itself have damaged.
+const FRAME_SCAN_WORDS: usize = 96;
+
+/// Print the return addresses on the stack of a fault that is about to be fatal.
+///
+/// x86-64 code this kernel builds carries no frame pointer, so there is nothing
+/// to *walk* - but a kernel return address is recognisable by being in kernel
+/// text, and a stack full of them is the call chain in order of freshness. That
+/// is the difference between "a #PF writing 0x0 at one instruction" and "the
+/// exec path, from `execve`, got there through these four functions", which is
+/// the question a reader of a dead machine is asking.
+///
+/// Printed as plain addresses rather than resolved here: the symbol table is
+/// what the host has, not what the kernel kept, and a page fault is the worst
+/// possible moment to go looking for it.
+fn report_frames(rsp: usize) {
+    const KERNEL_TEXT: u64 = 0xffff_ffff_8000_0000;
+    const KERNEL_TEXT_END: u64 = 0xffff_ffff_c000_0000;
+    crate::println!("  return addresses on the fault's kernel stack:");
+    // Bounded by the stack the task was actually given: the walk reads memory,
+    // and the only memory it may read without asking anybody is the block the
+    // scheduler allocated for this task's own kernel stack.
+    let Some((base, top)) = crate::sched::current_stack_range() else {
+        crate::println!("    (no kernel stack to read)");
+        return;
+    };
+    if rsp < base || rsp >= top {
+        crate::println!("    (rsp {rsp:#x} is outside this task's stack {base:#x}..{top:#x})");
+        return;
+    }
+    let room = ((top - rsp) / 8).min(FRAME_SCAN_WORDS);
+    let mut printed = 0usize;
+    for i in 0..room {
+        let value = unsafe { core::ptr::read_unaligned((rsp + i * 8) as *const u64) };
+        if value >= KERNEL_TEXT && value < KERNEL_TEXT_END {
+            crate::println!("    rsp+{:#05x} {:#018x}", i * 8, value);
+            printed += 1;
+            if printed >= 16 {
+                break;
+            }
+        }
+    }
+    if printed == 0 {
+        crate::println!("    (none: the fault took the stack with it)");
+    }
 }
 
 /// How many times one instruction may fault unresolvably before the task stuck
@@ -325,9 +412,39 @@ fn pf_diag(addr: usize, rip: usize) {
     };
 
     let Some(entry) = crate::arch::paging::leaf_pte(page) else {
+        // The bytes of the instruction that faulted, up to the end of its own
+        // page: a faulting access is usually one instruction whose operand
+        // went bad, and the bytes name it - `48 89` is a store, `f4` is
+        // musl's `a_crash`, an `0f` prefix says which SSE form it is.
+        let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
+        let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
+        // And how far the *mapped* pages reach around the hole. A dereference
+        // of a pointer that went bad lands a page or two from something real,
+        // and the run says so; an access into a mapping the kernel never
+        // filled in lands at the bottom of a long run of absent pages, and
+        // only the length of that run tells the two apart. Bounded, because
+        // the answer is a hint and the handler must not walk the address
+        // space looking for it.
+        let mut lo = page;
+        for _ in 0..64 {
+            if lo >= page_size && crate::arch::paging::leaf_pte(lo - page_size).is_some() {
+                lo -= page_size;
+            } else {
+                break;
+            }
+        }
+        let mut hi = page + page_size;
+        for _ in 0..64 {
+            if hi < (1 << 47) && crate::arch::paging::leaf_pte(hi).is_some() {
+                hi += page_size;
+            } else {
+                break;
+            }
+        }
         crate::println!(
-            "PFDIAG page={page:#x} NOT MAPPED task={:?} rip={rip:#x}",
-            crate::sched::current().0
+            "PFDIAG page={page:#x} NOT MAPPED task={:?} rip={rip:#x} mapped=[{lo:#x}..{hi:#x}) bytes={:02x?}",
+            crate::sched::current().0,
+            bytes
         );
         return;
     };
@@ -407,6 +524,12 @@ fn pf_diag(addr: usize, rip: usize) {
 /// hold whatever the interrupted code left on its stack. They are printed, but
 /// for a ring-0 fault they are not a stack pointer and not a segment.
 fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
+    // The report is the whole reason for the last-resort path, so it has to
+    // reach the host: on a GUI or compositor boot the console lives in the
+    // framebuffer, and a machine that dies with its report painted into a
+    // window nobody is looking at leaves the reader with a vanished QEMU and
+    // no explanation. Same move as the panic handler in `main`.
+    crate::console::force_serial();
     crate::println!("\nKERNEL PANIC: {}", name);
     // A non-zero error code on a `#GP` *is* a selector, and a selector is only
     // worth printing if it is named: index in the GDT, and both privilege bits.
@@ -462,28 +585,86 @@ fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
         },
         frame.code_segment.0 & 3
     );
+    report_frames(frame.stack_pointer.as_u64() as usize);
     crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_FAILURE)
 }
 
-/// If the faulting rip is in the lower half (user mode), deliver SIGSEGV and
-/// return `true`.  Otherwise return `false` so the caller can panic.
+/// If the faulting rip is in the lower half (user mode), end the task or send
+/// it a signal, and return `true`. Otherwise return `false` so the caller can
+/// panic.
 ///
 /// The one printed line matters more than it looks: a `#GP` in ring 3 means
-/// user code attempted something the CPU refuses - loading a selector whose
-/// RPL is below CPL, most commonly - and the only evidence that it happened
-/// is this line. Silently converting it to a signal leaves the fault's
-/// selector, which is the diagnostic, on the floor.
-fn user_fault_or_die(frame: &InterruptStackFrame) -> bool {
+/// user code attempted something the CPU refuses - `hlt` outside ring 0, a
+/// non-canonical operand, an SSE access the FPU state does not allow - and the
+/// only evidence that it happened is this line. Silently converting it to a
+/// signal leaves the bytes, which are the diagnostic, on the floor.
+///
+/// The *first* fault is reported in full - the error code, the bytes of the
+/// instruction the CPU refused, and the stack pointer it refused them on -
+/// because the interesting ring-3 `#GP`s are one instruction made illegal by
+/// kernel state the process cannot see, and the bytes name it. The rest are
+/// the process retrying the same instruction, which Linux logs too, rate
+/// limited, and which would otherwise bury the first one.
+///
+/// What happens after the report is the same answer the `#PF` path gives, and
+/// for the same reason: a signal queued here is delivered at a *syscall*
+/// boundary, and a faulting instruction never reaches one, so returning to it
+/// only faults again. A default disposition is therefore death here (with the
+/// signal number as the exit code), and a task that installed a handler is
+/// ended once it has faulted at the same instruction
+/// [`FAULT_REPEAT_LIMIT`] times - the handler cannot be entered from a trap
+/// frame either way, and a death with a reason beats a flood. `hlt` is the
+/// case that made this visible: it is musl's `a_crash()`, the instruction its
+/// allocator runs when it has found the heap corrupted, and a compositor that
+/// hits it used to spin instead of dying.
+fn user_fault_or_die(frame: &InterruptStackFrame, code: u64) -> bool {
     let rip = frame.instruction_pointer.as_u64() as usize;
     if rip < (1 << 47) {
+        if !GP_REPORTED.swap(true, Ordering::Relaxed) {
+            // Only up to the end of the page the instruction is on: a read
+            // past it would fault inside the handler, and a double fault
+            // would take the machine down instead of reporting anything.
+            let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
+            let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
+            crate::println!(
+                "  #GP code {:#x} rip {:#x} rsp {:#x} rflags {:#x}",
+                code,
+                rip,
+                frame.stack_pointer.as_u64(),
+                frame.cpu_flags.bits()
+            );
+            crate::println!("  bytes at rip: {:02x?}", bytes);
+        }
         crate::println!(
             "user #GP/#SS/#NP at rip {:#x} cs {:#x}",
             rip,
             frame.code_segment.0
         );
         crate::sched::send_signal(crate::sched::current(), 11); // SIGSEGV
+        if crate::sched::current_disposition(11).is_default() {
+            crate::sched::exit(-11);
+        }
+        if fault_repeats(rip) {
+            crate::println!(
+                "task {} died of SIGSEGV it could not be handed: #GP {code:#x} at {rip:#x}, \
+                 the same fault {FAULT_REPEAT_LIMIT} times over, and a handler is installed",
+                crate::sched::current().0
+            );
+            crate::sched::exit(-11);
+        }
         crate::sched::preempt();
         return true;
     }
     false
 }
+
+/// The bytes of an instruction fit in a 16-byte window, which is also the
+/// longest x86-64 instruction: reading up to the end of the faulting page is
+/// what keeps the report from faulting itself.
+const PAGE_SIZE: usize = 4096;
+
+/// Whether the full report of the first ring-3 `#GP` has been printed. A
+/// process that returns from its own SIGSEGV handler faults again on the very
+/// next instruction, so the console sees the same fault thousands of times;
+/// one full report is what a reader needs.
+static GP_REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

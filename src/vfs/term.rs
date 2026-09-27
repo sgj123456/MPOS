@@ -167,7 +167,15 @@ impl Grid {
     }
 
     pub fn mark_all_dirty(&mut self) {
-        self.dirty = (1u64 << self.rows) - 1;
+        // `Grid::new` clamps rows to exactly `MAX_ROWS`, so the full mask is
+        // the 64-row case and not an unreachable one - and `1 << 64` is the
+        // shift that has no answer. Every other row count wants the low
+        // `rows` bits, which is what it gets.
+        self.dirty = if self.rows >= MAX_ROWS {
+            u64::MAX
+        } else {
+            (1u64 << self.rows) - 1
+        };
     }
 
     fn mark(&mut self, row: usize) {
@@ -381,7 +389,18 @@ impl Grid {
     fn csi(&mut self, b: u8) {
         match b {
             b'0'..=b'9' => {
-                self.cur = self.cur * 10 + (b - b'0') as u16;
+                // Accumulated in the `u16` the parameter field is, and
+                // saturating rather than wrapping: a program may print as many
+                // digits as it likes (`printf '\e[%dH' 11111111111111` needs no
+                // privilege at all), and a row number that ran past 65535 and
+                // came back small would move the cursor to somewhere the
+                // program never asked for. Clamped at the top, every user of
+                // the value then treats it as "as far as the screen goes",
+                // which is what an absurd parameter means.
+                self.cur = self
+                    .cur
+                    .saturating_mul(10)
+                    .saturating_add((b - b'0') as u16);
                 self.seen_digit = true;
             }
             b';' | b':' => self.push_param(),
@@ -767,6 +786,41 @@ mod tests {
         g.feed(b"hi");
         assert_eq!(&row_text(&g, 0), "hi        ");
         assert_eq!(g.cursor(), (0, 2));
+    }
+
+    /// A CSI parameter longer than the field that holds it has to saturate
+    /// rather than wrap. Digits are free - one `printf` of any program on the
+    /// console sends `\e[11111111111H` - and a row number that came back small
+    /// would move the cursor somewhere the sender never asked for, which is a
+    /// wrong screen rather than a refused one. Clamped at the top of the field
+    /// it means "as far as there is", and every setter is already `.min()`-ed
+    /// against the grid, so the answer is the last row and last column.
+    #[test]
+    fn a_csi_parameter_longer_than_its_field_saturates() {
+        let mut g = Grid::new(4, 10);
+        // One parameter to `H` is the row, and the column takes its default of
+        // the first - so the saturated value has to land bottom-left, not
+        // anywhere the wrap-around of `99999999999999` would have put it.
+        g.feed(b"\x1b[99999999999999H");
+        assert_eq!(g.cursor(), (3, 0));
+        // The same arithmetic decides a scroll region, which refuses a range
+        // that does not fit rather than clamping it.
+        g.feed(b"\x1b[1;99999999999999r\x1b[2;3H");
+        assert_eq!(g.cursor(), (1, 2));
+    }
+
+    /// A screen of exactly `MAX_ROWS` rows is not a taller screen: `Grid::new`
+    /// clamps the request to that, so it is the one height whose full dirty
+    /// mask cannot be written as `1 << rows - 1` - the shift would be by the
+    /// width of the mask itself, which is the arithmetic bug `reset_to_boot`
+    /// walked into on every boot at 1024 pixels of height.
+    #[test]
+    fn a_max_height_screen_marks_every_row_dirty() {
+        let mut g = Grid::new(MAX_ROWS, 20);
+        assert_eq!(g.rows(), MAX_ROWS);
+        g.reset_to_boot(b"one line\n");
+        assert_eq!(g.take_dirty(), u64::MAX, "the whole screen was not marked");
+        assert_eq!(g.take_dirty(), 0, "and the mask clears as it is taken");
     }
 
     #[test]

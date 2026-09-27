@@ -180,6 +180,22 @@ pub(crate) struct Stack {
     device: NicDevice,
     sockets: SocketSet<'static>,
     entries: Vec<Option<Entry>>,
+    /// Sockets whose last descriptor is gone but whose teardown is still on the
+    /// wire.
+    ///
+    /// `close(2)` has to unbind the fd immediately - the caller's whole point in
+    /// closing is that the descriptor is free for reuse - but smoltcp only puts
+    /// the `FIN` (or the `RST` an aborting `SO_LINGER` asks for) out from its
+    /// poll loop. Removing the socket at that instant is how a close ends up
+    /// saying nothing at all, and the peer finding out by writing into a void.
+    ///
+    /// They are listed here instead of discovered from the socket set because
+    /// the registry slot that named them is already gone, and the list is
+    /// bounded because a peer that stops answering may cost a slot, but not the
+    /// set: past [`TEARDOWN_MAX`] the oldest is torn off without ceremony, which
+    /// is exactly the abrupt close this is here to avoid - and the right price
+    /// for one, rather than for thousands.
+    teardown: Vec<SocketHandle>,
     next_ephemeral: u16,
     /// Tasks parked on any socket's readiness, registered through
     /// [`subscribe`] and woken by [`service`] after every poll. One flat
@@ -211,6 +227,9 @@ pub(crate) const MTU_FLOOR: usize = 68;
 /// link that claims more only lies to whoever reads it back.
 pub(crate) const MTU_CEIL: usize = 65536;
 
+/// How many closed-but-still-tearing-down sockets the stack carries at once.
+const TEARDOWN_MAX: usize = 32;
+
 impl Stack {
     /// Advance the interface once: drain received frames into smoltcp, hand
     /// it queued segments to transmit, let its timers retransmit and answer.
@@ -222,6 +241,33 @@ impl Stack {
         }
         let now = now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        self.reap_teardown();
+    }
+
+    /// Free the sockets whose teardown finished after their last descriptor
+    /// went - see [`Stack::teardown`]. Checked after the poll rather than
+    /// inside it, because a socket reaches `Closed` by the very processing this
+    /// poll performs.
+    fn reap_teardown(&mut self) {
+        if self.teardown.is_empty() || !self.eth_up {
+            return;
+        }
+        let mut finished: Vec<SocketHandle> = Vec::new();
+        for h in self.teardown.iter() {
+            let sock = self.sockets.get_mut::<tcp::Socket>(*h);
+            // `Closed` is the end of the graceful machine *and* the state an
+            // aborted socket is dropped into - and smoltcp emits the reset from
+            // there, during the poll this runs after. So one condition covers
+            // both teardowns, and reaping after the poll is what lets the reset
+            // actually leave before the socket disappears.
+            if matches!(sock.state(), tcp::State::Closed) {
+                finished.push(*h);
+            }
+        }
+        for h in finished {
+            self.sockets.remove(h);
+            self.teardown.retain(|&x| x != h);
+        }
     }
 
     /// Draw the next anonymous local port.
@@ -470,7 +516,29 @@ pub(crate) fn free_entry(handle: usize) {
             Channel::Inet6 => None,
         };
         if let Some(h) = owned {
-            stack.sockets.remove(h);
+            // A TCP socket's last close is the one that has something left to
+            // say. `close()` on smoltcp does not transmit - it marks the socket
+            // closing and waits for the poll loop to put the `FIN` out - so
+            // removing it here would delete the packet that has not been sent
+            // yet, and the peer would learn about the close by writing into a
+            // closed port. The other kinds are connectionless: nothing is
+            // outstanding, and their buffers come back now.
+            if matches!(&entry.channel, Channel::Tcp { .. }) {
+                stack.sockets.get_mut::<tcp::Socket>(h).close();
+                // Bounded, and the oldest goes first: 32 unanswered teardowns is
+                // already more than any real peer owes a machine that closed on
+                // it, and the alternative is a set that fills up and refuses new
+                // sockets forever.
+                if stack.teardown.len() >= TEARDOWN_MAX {
+                    if let Some(oldest) = stack.teardown.first().copied() {
+                        stack.teardown.remove(0);
+                        stack.sockets.remove(oldest);
+                    }
+                }
+                stack.teardown.push(h);
+            } else {
+                stack.sockets.remove(h);
+            }
         }
     });
 }
@@ -515,6 +583,23 @@ pub(crate) fn subscribe(id: crate::sched::policy::TaskId) {
 /// is what makes an interrupted wait's cleanup unconditional.
 pub(crate) fn unsubscribe(id: crate::sched::policy::TaskId) {
     with_stack(|stack| stack.waiters.retain(|w| *w != id));
+}
+
+/// Wake everything parked on a socket, without touching the network.
+///
+/// A wake only means "look again": each waiter re-reads its own condition and
+/// sleeps on if nothing has changed, so waking the whole list is cheap and
+/// never wrong. This is the entry a *device* event needs. A uevent becomes
+/// ready on a netlink socket long before the next frame arrives, and on a
+/// machine with nothing to receive - which a cold-plug is exactly - a listener
+/// that is only ever woken by network traffic never wakes at all. That is how
+/// `udevd` ended up with an empty database here: the events were queued, the
+/// daemon was asleep, and `udevadm trigger` returned having changed nothing.
+pub(crate) fn wake_waiters() {
+    let waiters = with_stack(|stack| stack.waiters.clone()).unwrap_or_default();
+    for id in waiters {
+        crate::sched::wake(id);
+    }
 }
 
 /// The interrupt-shaped entry into the stack: poll, wake the registered
@@ -881,6 +966,7 @@ pub fn init() -> bool {
             device,
             sockets: SocketSet::new(Vec::new()),
             entries: Vec::new(),
+            teardown: Vec::new(),
             next_ephemeral: EPHEMERAL_MIN,
             waiters: Vec::new(),
             eth_up: true,

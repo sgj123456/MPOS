@@ -15,7 +15,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::config::{ConsoleMode, QemuConfig};
+use crate::config::{QemuConfig, RunMode};
 use crate::utils;
 
 /// What the machine boots from, which is the one thing an image run and a user
@@ -31,46 +31,47 @@ pub enum Boot {
 
 /// Where the guest's serial line and framebuffer go.
 pub enum Console {
-    /// An interactive `run`, laid out per [`ConsoleMode`]: which of the window
+    /// An interactive `run`, laid out per [`RunMode`]: which of the window
     /// and the serial terminal actually show the console.
-    Run(ConsoleMode),
+    Run(RunMode),
     /// A file, which is what a test run reads its verdict out of. Always
     /// headless: no window, the whole console on the wire to the log.
     File(String),
 }
 
-/// Where this crate records which [`ConsoleMode`] is baked into the image's
-/// `mpos.cmdline`. The guest learns its console from that file, which lives
-/// inside the disk image; the marker lets `run` decide, without mounting
+/// Where this crate records which [`RunMode`] is baked into the image's
+/// `mpos.cmdline`. The guest learns its console policy from that file, which
+/// lives inside the disk image; the marker lets `run` decide, without mounting
 /// anything as root, whether the image already says what the user asked for.
-fn console_marker_path(build_dir: &Path) -> PathBuf {
+///
+/// The file is still named `console.mode` from before the option was `--console`.
+/// It is a cache, not an interface: renaming it would read as "nothing baked" and
+/// make every existing image look as if it needed a root rebuild to say what it
+/// already does.
+fn mode_marker_path(build_dir: &Path) -> PathBuf {
     build_dir.join("console.mode")
 }
 
 /// The mode last baked into the image. A missing marker - an image built before
-/// the run modes existed - reads as [`ConsoleMode::Mirror`], which is exactly
+/// the run modes existed - reads as [`RunMode::Mirror`], which is exactly
 /// what such an image boots as (no `mpos.headless`/`nomirror`, mirror on).
-pub fn baked_console(build_dir: &Path) -> ConsoleMode {
-    fs::read_to_string(console_marker_path(build_dir))
+pub fn baked_mode(build_dir: &Path) -> RunMode {
+    fs::read_to_string(mode_marker_path(build_dir))
         .ok()
-        .and_then(|text| ConsoleMode::parse(&text))
-        .unwrap_or(ConsoleMode::Mirror)
+        .and_then(|text| RunMode::parse(&text))
+        .unwrap_or(RunMode::Mirror)
 }
 
-pub fn set_baked_console(build_dir: &Path, mode: ConsoleMode) -> Result<()> {
-    fs::write(console_marker_path(build_dir), mode.name()).with_context(|| {
-        format!(
-            "Failed to record the console mode in {}",
-            build_dir.display()
-        )
-    })
+pub fn set_baked_mode(build_dir: &Path, mode: RunMode) -> Result<()> {
+    fs::write(mode_marker_path(build_dir), mode.name())
+        .with_context(|| format!("Failed to record the baked mode in {}", build_dir.display()))
 }
 
-/// Whether the image's baked console differs from `desired`, so a `run` must
+/// Whether the mode baked into the image differs from `desired`, so a `run` must
 /// take root to rewrite `mpos.cmdline` before booting. No image means nothing to
 /// switch (the build that makes it will bake `desired` anyway).
-pub fn needs_console_switch(build_dir: &Path, desired: ConsoleMode) -> bool {
-    utils::image_path(build_dir).exists() && baked_console(build_dir) != desired
+pub fn needs_mode_switch(build_dir: &Path, desired: RunMode) -> bool {
+    utils::image_path(build_dir).exists() && baked_mode(build_dir) != desired
 }
 
 /// The QEMU command line both `run` and `test` boot with.
@@ -302,7 +303,7 @@ pub fn run_qemu(
     profile: &str,
     artefacts_ready: bool,
     needs_build: bool,
-    console: ConsoleMode,
+    mode: RunMode,
 ) -> Result<()> {
     if needs_build {
         println!("run: the image is missing or out of date; building it");
@@ -378,7 +379,7 @@ pub fn run_qemu(
         &ovmf_dir,
         &vars,
         Boot::Image(image.clone()),
-        Console::Run(console),
+        Console::Run(mode),
         &share,
     );
 
@@ -440,7 +441,7 @@ mod tests {
             vsock: false,
             audio: false,
             display: None,
-            console: ConsoleMode::Mirror,
+            mode: RunMode::Mirror,
         }
     }
 
@@ -450,7 +451,7 @@ mod tests {
             Path::new("/ovmf"),
             Path::new("/build/OVMF_VARS.4m.fd"),
             boot,
-            Console::Run(ConsoleMode::Mirror),
+            Console::Run(RunMode::Mirror),
             Path::new("/build/9p-share"),
         )
     }
@@ -555,7 +556,7 @@ mod tests {
         assert_eq!(after(&file, "-display").as_deref(), Some("none"));
     }
 
-    fn run_args(config: &QemuConfig, mode: ConsoleMode) -> Vec<String> {
+    fn run_args(config: &QemuConfig, mode: RunMode) -> Vec<String> {
         machine_args(
             config,
             Path::new("/ovmf"),
@@ -572,17 +573,17 @@ mod tests {
 
         // mirror: a window for the framebuffer, and the serial line on stdio so
         // the terminal shows the same console.
-        let mirror = run_args(&cfg, ConsoleMode::Mirror);
+        let mirror = run_args(&cfg, RunMode::Mirror);
         assert_eq!(after(&mirror, "-display").as_deref(), Some("sdl"));
         assert_eq!(after(&mirror, "-serial").as_deref(), Some("chardev:stdio0"));
 
         // gui: a window, and the serial line discarded rather than watched.
-        let gui = run_args(&cfg, ConsoleMode::Gui);
+        let gui = run_args(&cfg, RunMode::Gui);
         assert_eq!(after(&gui, "-display").as_deref(), Some("sdl"));
         assert_eq!(after(&gui, "-serial").as_deref(), Some("file:/dev/null"));
 
         // terminal: no window at all - the console is the serial line, on stdio.
-        let terminal = run_args(&cfg, ConsoleMode::Terminal);
+        let terminal = run_args(&cfg, RunMode::Terminal);
         assert_eq!(after(&terminal, "-display").as_deref(), Some("none"));
         assert_eq!(
             after(&terminal, "-serial").as_deref(),

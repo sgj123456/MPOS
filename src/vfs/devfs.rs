@@ -345,6 +345,17 @@ impl DevDirNode {
                 .insert(String::from(name), inode);
         });
     }
+
+    /// Take a node back out of this directory, and say whether it was there.
+    ///
+    /// A device userland made and then destroyed needs this: its name was
+    /// allocated to it for as long as it exists, and a `/dev/input/eventN` that
+    /// outlives its device is a name that opens onto nothing - and one the next
+    /// device of that kind can never be given, since names here are not reused
+    /// by accident.
+    pub(crate) fn remove(&self, name: &str) -> bool {
+        critical_section::with(|cs| self.children.borrow(cs).borrow_mut().remove(name).is_some())
+    }
 }
 
 impl Inode for DevDirNode {

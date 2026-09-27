@@ -132,6 +132,23 @@ impl File {
         self.inode.clone()
     }
 
+    /// The identity of this open file description, as everything that
+    /// arbitrates *per description* spells it.
+    ///
+    /// `flock` owns a whole-file lock by it, `EVIOCGRAB` claims a seat by it,
+    /// and an evdev read has to know its own client by it, because those three
+    /// questions have the same answer: one description is one reader, however
+    /// many descriptors name it (`dup`, or an inherited fd - one address, one
+    /// identity) and however few processes are involved (two `open`s are two
+    /// addresses, two identities).
+    ///
+    /// It is the address of the `File` itself. Nothing dereferences it: it is
+    /// a key, meaningful for exactly as long as the description is alive,
+    /// which is what makes the address the right value to use.
+    pub fn ofd(&self) -> u64 {
+        self as *const File as u64
+    }
+
     /// The open flag word, as `fcntl(F_GETFL)` reports it.
     pub fn status(&self) -> u32 {
         self.status.load(Ordering::Relaxed)
@@ -152,7 +169,11 @@ impl File {
 
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         let pos = self.pos.load(Ordering::Relaxed);
-        let n = self.inode.read_at(pos, buf)?;
+        // The description is named, not just its position: a node whose answer
+        // depends on *which* client is asking - an evdev node's is, because its
+        // events belong to whoever holds `EVIOCGRAB` - cannot tell who that is
+        // from an offset alone.
+        let n = self.inode.read_at_client(pos, buf, self.ofd())?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
@@ -184,7 +205,7 @@ impl File {
         } else {
             self.pos.load(Ordering::Relaxed)
         };
-        let n = self.inode.write_at(pos, buf)?;
+        let n = self.inode.write_at_client(pos, buf, self.ofd())?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
         // The one IN_MODIFY chokepoint of the userland write paths: every
         // write/writev/pwrite/splice/copy handler reaches the inode through
@@ -542,6 +563,32 @@ pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
         None => inode,
     };
     current_table().install(Arc::new(File::new(inode)))
+}
+
+/// Call `tell` once for each description in `files` that the batch holds every
+/// reference to, naming it by its [`File::ofd`].
+///
+/// This is the exit path's question - "which of these descriptions is really
+/// gone?" - and it is a question about *references*, not descriptors: a `dup`
+/// that outlives the batch is the same reader, and a description several of the
+/// batch's slots name is one description. `inotify`'s close events, `flock`'s
+/// owners and the input layer's per-client state all have to answer it the same
+/// way, so the rule is written once, here, next to the type it is about.
+pub fn for_each_last(files: &[Arc<File>], mut tell: impl FnMut(&Arc<File>, u64)) {
+    let mut seen: Vec<u64> = Vec::new();
+    for file in files {
+        let ofd = file.ofd();
+        if seen.contains(&ofd) {
+            continue;
+        }
+        let total = Arc::strong_count(file);
+        let in_batch = files.iter().filter(|other| other.ofd() == ofd).count();
+        if total != in_batch {
+            continue;
+        }
+        seen.push(ofd);
+        tell(file, ofd);
+    }
 }
 
 /// Open a fresh description on an inode already in hand - a pipe end, whose

@@ -10,11 +10,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// How `cargo xtask run` puts the console in front of the user. Three shapes,
-/// each agreeing on both the QEMU wiring and the guest boot flag, because a
-/// console that shows in two places at once needs both sides to know the plan.
+/// How `cargo xtask run` boots the whole machine: one word that decides the
+/// QEMU wiring *and* the guest's console policy together, because a machine that
+/// shows its console in two places has to have agreed on that in both. Named
+/// `mode` rather than `console` for exactly that reason - it is not a console
+/// setting, it is which machine this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsoleMode {
+pub enum RunMode {
     /// Serial is the whole console: no window, the GPU never engages, and the
     /// wire is the *lossless* sink. `mpos.headless` on the guest line, QEMU
     /// `-display none` with the serial on stdio.
@@ -27,15 +29,19 @@ pub enum ConsoleMode {
     /// console shows in the window and the terminal at once. `mpos.mirror`, QEMU
     /// `-display {backend}` with the serial on stdio. This is the default.
     Mirror,
-    /// A rootful Wayland compositor's canvas: the window is there and the GPU is
-    /// present, but the kernel console never takes the framebuffer - `/dev/fb0`
-    /// and the scanout belong to the compositor. `mpos.compositor`, QEMU
+    /// The window a rootful Wayland compositor paints, with the kernel console
+    /// kept off the framebuffer: `/dev/fb0` and the scanout belong to the
+    /// compositor, and the serial line still carries the log. QEMU
     /// `-display {backend}` with the serial on stdio.
-    Compositor,
+    ///
+    /// Named for the compositor that runs here, because that is what the mode
+    /// is for; the boot word it bakes stays `mpos.compositor`, which is the
+    /// kernel's own ABI and is read by name in `src/main.rs`.
+    Weston,
 }
 
-impl ConsoleMode {
-    /// Parse the `[qemu] console` value / `--console` argument. Case- and
+impl RunMode {
+    /// Parse the `[qemu] mode` value / `--mode` argument. Case- and
     /// space-insensitive; anything unrecognised is `None` so the caller can
     /// report it rather than silently booting a different mode.
     pub fn parse(text: &str) -> Option<Self> {
@@ -43,7 +49,7 @@ impl ConsoleMode {
             "terminal" => Some(Self::Terminal),
             "gui" => Some(Self::Gui),
             "mirror" => Some(Self::Mirror),
-            "compositor" | "weston" => Some(Self::Compositor),
+            "weston" | "compositor" => Some(Self::Weston),
             _ => None,
         }
     }
@@ -57,7 +63,7 @@ impl ConsoleMode {
             Self::Terminal => "mpos.headless",
             Self::Gui => "mpos.nomirror",
             Self::Mirror => "mpos.mirror",
-            Self::Compositor => "mpos.compositor",
+            Self::Weston => "mpos.compositor",
         }
     }
 
@@ -69,18 +75,23 @@ impl ConsoleMode {
     /// Whether this mode routes the serial line to the user's terminal (stdio),
     /// as opposed to leaving it attached to nothing. Gui drops it.
     pub fn serial_to_stdio(self) -> bool {
-        matches!(self, Self::Terminal | Self::Mirror | Self::Compositor)
+        matches!(self, Self::Terminal | Self::Mirror | Self::Weston)
     }
 
-    /// The lowercase name, used for the `build/console.mode` marker this crate
-    /// keeps of what was last baked into the image, and for the
-    /// `MPOS_XTASK_CONSOLE` hand-off into the privileged build.
+    /// The word this mode is written down with: in the `[qemu] mode` value, in
+    /// the `build/console.mode` marker of what the image was last baked with, and
+    /// in the `MPOS_XTASK_MODE` hand-off into the privileged build.
+    ///
+    /// The marker keeps its old name on purpose. It is a cache of what is
+    /// already in the image, and a new filename reads as "nothing was baked",
+    /// which sends `run` through a root refresh of the boot files - a mount this
+    /// host cannot even do without the loop module - to say nothing changed.
     pub fn name(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
             Self::Gui => "gui",
             Self::Mirror => "mirror",
-            Self::Compositor => "compositor",
+            Self::Weston => "weston",
         }
     }
 }
@@ -141,10 +152,10 @@ pub struct QemuConfig {
     /// the serial log - which then goes quiet once the console moves to the
     /// framebuffer. A `test` boot ignores this and always runs headless.
     pub display: Option<String>,
-    /// The standing console shape for `run`, overridable per invocation with
-    /// `--console`. Defaults to [`ConsoleMode::Mirror`] - the window with a
+    /// The standing mode for `run`, overridable per invocation with `--mode`.
+    /// Defaults to [`RunMode::Mirror`] - the window with a
     /// best-effort serial copy - which is what `run` did before the modes split.
-    pub console: ConsoleMode,
+    pub mode: RunMode,
 }
 
 #[derive(Debug)]
@@ -248,12 +259,12 @@ impl QemuConfig {
                 .filter(|text| !text.trim().is_empty()),
             // A name this crate does not recognise is not an error at load -
             // `test` never boots a window and must not fail on a typo it ignores
-            // - so it falls back to the default here. `run --console` reports an
+            // - so it falls back to the default here. `run --mode` reports an
             // unknown word directly when it parses the flag.
-            console: values
-                .remove("console")
-                .and_then(|text| ConsoleMode::parse(&text))
-                .unwrap_or(ConsoleMode::Mirror),
+            mode: values
+                .remove("mode")
+                .and_then(|text| RunMode::parse(&text))
+                .unwrap_or(RunMode::Mirror),
         }
     }
 }
@@ -435,41 +446,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn console_modes_round_trip_and_name_their_boot_flag() {
+    fn run_modes_round_trip_and_name_their_boot_flag() {
         // The words the user types, the flag the kernel reads, and the name the
         // marker keeps must all line up, because a mode that parses but bakes the
-        // wrong flag boots the console in a mode nobody asked for.
+        // wrong flag boots the machine in a mode nobody asked for.
         for (text, mode, flag) in [
-            ("terminal", ConsoleMode::Terminal, "mpos.headless"),
-            ("gui", ConsoleMode::Gui, "mpos.nomirror"),
-            ("mirror", ConsoleMode::Mirror, "mpos.mirror"),
+            ("terminal", RunMode::Terminal, "mpos.headless"),
+            ("gui", RunMode::Gui, "mpos.nomirror"),
+            ("mirror", RunMode::Mirror, "mpos.mirror"),
+            // The compositor mode is `weston` to the command line and
+            // `mpos.compositor` to the kernel: the second is the boot word
+            // `src/main.rs` reads, so renaming the first must not quietly move
+            // the second.
+            ("weston", RunMode::Weston, "mpos.compositor"),
         ] {
-            assert_eq!(ConsoleMode::parse(text), Some(mode));
+            assert_eq!(RunMode::parse(text), Some(mode));
             // Case- and space-insensitive: the name comes from a config file a
             // person edits by hand.
             assert_eq!(
-                ConsoleMode::parse(&format!("  {}  ", text.to_uppercase())),
+                RunMode::parse(&format!("  {}  ", text.to_uppercase())),
                 Some(mode)
             );
             assert_eq!(mode.cmdline_flag(), flag);
             assert_eq!(mode.name(), text);
         }
-        assert_eq!(ConsoleMode::parse("anything-else"), None);
+        assert_eq!(RunMode::parse("anything-else"), None);
         // Only terminal drops the window; only gui drops the serial line.
-        assert!(!ConsoleMode::Terminal.has_window());
-        assert!(ConsoleMode::Mirror.has_window() && ConsoleMode::Gui.has_window());
-        assert!(ConsoleMode::Terminal.serial_to_stdio());
-        assert!(ConsoleMode::Mirror.serial_to_stdio());
-        assert!(!ConsoleMode::Gui.serial_to_stdio());
+        assert!(!RunMode::Terminal.has_window());
+        assert!(RunMode::Mirror.has_window() && RunMode::Gui.has_window());
+        assert!(RunMode::Terminal.serial_to_stdio());
+        assert!(RunMode::Mirror.serial_to_stdio());
+        assert!(!RunMode::Gui.serial_to_stdio());
     }
 
     #[test]
-    fn an_absent_console_config_defaults_to_mirror() {
-        // The `[qemu]` block may not name `console` at all; the default must be
+    fn the_pre_rename_spellings_still_read_as_the_same_modes() {
+        // `compositor` was the mode's name before the option became `--mode`, and
+        // an image baked then records it in `build/console.mode`. Reading that as
+        // "an unknown mode, so default to mirror" would tell `run` the image
+        // carries the wrong flag and send it through a root rebuild of the boot
+        // files for no reason - so the old word must land on the same variant.
+        assert_eq!(RunMode::parse("compositor"), Some(RunMode::Weston));
+        let mut values = HashMap::new();
+        values.insert("mode".to_string(), "weston".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        assert_eq!(config.mode, RunMode::Weston);
+        assert!(values.is_empty(), "the `mode` key was not consumed");
+    }
+
+    #[test]
+    fn an_absent_mode_config_defaults_to_mirror() {
+        // The `[qemu]` block may not name `mode` at all; the default must be
         // the pre-split behaviour (window + serial mirror), not an error.
         let mut values = HashMap::new();
         let config = QemuConfig::from_values(&mut values, "mpos".to_string());
-        assert_eq!(config.console, ConsoleMode::Mirror);
+        assert_eq!(config.mode, RunMode::Mirror);
     }
 
     #[test]

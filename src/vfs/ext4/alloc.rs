@@ -3,6 +3,27 @@ use super::*;
 impl Core {
     // ---- groups and allocation ----
 
+    /// Whether every pointer a group's descriptor offers is a block the volume
+    /// has.
+    ///
+    /// A descriptor is the one structure whose numbers *everything* else is
+    /// read through - the two bitmaps the allocator writes and the inode table
+    /// every inode is found in - so a single bad word in it turns each of those
+    /// reads into a request for a block outside the filesystem. Refusing the
+    /// group is the answer with the smallest blast radius: the allocator moves
+    /// on to the next one, and a read of an inode it holds comes back as the
+    /// empty record that means "no such file".
+    pub(crate) fn group_is_live(&self, g: &Group) -> bool {
+        // Each pointer is checked where it starts, not for the run it covers:
+        // the last group of a real volume legitimately has a table that is
+        // truncated by the end of the disk, and e2fsck leaves it alone. A slot
+        // past that end is refused by `inode_pos`, which knows which slot it is
+        // asking for.
+        self.block_is_live(g.block_bitmap)
+            && self.block_is_live(g.inode_bitmap)
+            && self.block_is_live(g.inode_table)
+    }
+
     pub(crate) fn group(&self, g: u32) -> Group {
         assert!(g < self.groups, "ext2 group {g} out of range");
         let block_size = self.block_size();
@@ -136,7 +157,7 @@ impl Core {
         let per_group = self.sb.blocks_per_group as u64;
         for g in 0..self.groups {
             let group = self.group(g);
-            if group.free_blocks == 0 {
+            if group.free_blocks == 0 || !self.group_is_live(&group) {
                 continue;
             }
             let first = self.sb.first_data_block as u64 + g as u64 * per_group;
@@ -208,7 +229,7 @@ impl Core {
         let per_group = self.sb.inodes_per_group as u64;
         for g in 0..self.groups {
             let group = self.group(g);
-            if group.free_inodes == 0 {
+            if group.free_inodes == 0 || !self.group_is_live(&group) {
                 continue;
             }
             // Group 0's bitmap starts with the reserved inodes; allocation
@@ -230,10 +251,15 @@ impl Core {
                 found.is_some()
             });
             if let Some(ino) = found {
-                assert!(
-                    ino <= self.sb.inodes_count as u64,
-                    "ext2 inode bitmap offered inode {ino} past the end"
-                );
+                // The bitmap offered a number the volume says it does not have.
+                // Both words are disk data and neither is authoritative over
+                // the other, so the honest answer is that the volume is
+                // inconsistent: refuse the allocation and leave the bit set -
+                // an inode marked used that is not costs one slot, while the
+                // reverse hands one inode to two owners.
+                if ino > self.sb.inodes_count as u64 {
+                    return Err(VfsError::Corrupt);
+                }
                 // An inode taken from the table's never-used tail moves the
                 // group's unused count down with it: that count is not an
                 // opinion about free space but a promise about which table
@@ -241,7 +267,9 @@ impl Core {
                 // promised-virgin tail is the error e2fsck names.
                 self.push_itable_high_water(g, ((ino - 1) % per_group) as u32);
                 self.bump_free(g, 0, -1);
-                let (block, off) = self.inode_pos(ino as u32);
+                let Some((block, off)) = self.inode_pos(ino as u32) else {
+                    return Err(VfsError::Corrupt);
+                };
                 let size = self.sb.inode_size as usize;
                 self.update_block(block, |page| {
                     page[off..off + size].fill(0);
@@ -260,9 +288,25 @@ impl Core {
     pub(crate) fn free_block(&self, block: u64) {
         let per_group = self.sb.blocks_per_group as u64;
         let first = self.sb.first_data_block as u64;
+        // The number arrives out of an inode's own mapping, so it is disk data.
+        // One below the first data block would underflow the subtraction here
+        // and one in a group past the volume would index a descriptor that does
+        // not exist. Neither is this filesystem's block to give back, and
+        // leaving its bit set is the safe direction to be wrong in: the count
+        // comes out one block short, where freeing a block twice hands the same
+        // one to two owners.
+        if block < first {
+            return;
+        }
         let g = ((block - first) / per_group) as u32;
+        if g >= self.groups {
+            return;
+        }
         let bit = (block - first) % per_group;
         let group = self.group(g);
+        if !self.group_is_live(&group) {
+            return;
+        }
         self.update_block(group.block_bitmap, |page| {
             page[(bit / 8) as usize] &= !(1u8 << (bit % 8));
             true
@@ -324,11 +368,20 @@ impl Core {
     /// Release an inode whose last name is gone: its data blocks first, then
     /// its bitmap bit. Each block puts its own count back as it goes, so
     /// only the inode is counted here.
+    /// Release an inode whose last name is gone: its data blocks first, then
+    /// its bitmap bit. Each block puts its own count back as it goes, so
+    /// only the inode is counted here.
     pub(crate) fn free_inode(&self, ino: u32) {
+        if !self.inode_is_live(ino) {
+            return;
+        }
         self.free_blocks_of(&self.read_inode(ino));
         let g = (ino - 1) / self.sb.inodes_per_group;
         let index = (ino - 1) % self.sb.inodes_per_group;
         let group = self.group(g);
+        if !self.group_is_live(&group) {
+            return;
+        }
         self.update_block(group.inode_bitmap, |page| {
             page[(index / 8) as usize] &= !(1u8 << (index % 8));
             true
@@ -336,15 +389,39 @@ impl Core {
         self.bump_free(g, 0, 1);
     }
 
-    /// Block and offset of inode `ino` inside its group's inode table.
-    pub(crate) fn inode_pos(&self, ino: u32) -> (u64, usize) {
+    /// Whether `ino` is a number that could name an inode of this volume at
+    /// all, decided from the superblock alone: inode 0 is reserved, every
+    /// position below is counted from 1, and the table cannot hold more than
+    /// `groups * inodes_per_group` of them. Whether the group it lands in is a
+    /// group this disk really has is the next question, and
+    /// [`inode_pos`](Self::inode_pos) answers that one.
+    pub(crate) fn inode_is_live(&self, ino: u32) -> bool {
+        ino != 0
+            && ino <= self.sb.inodes_count
+            && u64::from(ino - 1) < u64::from(self.groups) * u64::from(self.sb.inodes_per_group)
+    }
+
+    /// Block and offset of inode `ino`, or `None` when the volume has no such
+    /// place.
+    ///
+    /// `Ext4Fs::inode_of` hands out a handle for any `u32`, and a directory
+    /// entry can carry any `u32` too, so this is where an invented inode number
+    /// stops being a read request for a block outside the filesystem. The
+    /// answer for it is the same one the format has for an empty table slot:
+    /// there is no record there, which every caller already reads as a file
+    /// that does not exist.
+    pub(crate) fn inode_pos(&self, ino: u32) -> Option<(u64, usize)> {
+        if !self.inode_is_live(ino) {
+            return None;
+        }
         let index = (ino - 1) % self.sb.inodes_per_group;
-        let group = (ino - 1) / self.sb.inodes_per_group;
-        let table = self.group(group).inode_table;
+        let group = self.group(((ino - 1) / self.sb.inodes_per_group) as u32);
+        if !self.group_is_live(&group) {
+            return None;
+        }
         let off = index as usize * self.sb.inode_size as usize;
-        (
-            table + (off / self.block_size()) as u64,
-            off % self.block_size(),
-        )
+        let block = group.inode_table + (off / self.block_size()) as u64;
+        self.block_is_live(block)
+            .then_some((block, off % self.block_size()))
     }
 }

@@ -1,0 +1,10 @@
+# /dev is mounted, and this service must not mount it again.
+#
+# The initramfs mounts devtmpfs on /dev before it hands the machine over
+# (`initramfs/init`), and that mount survives the pivot - so by the time the
+# `devfs` service runs there is nothing to do. Left to itself the script would
+# *remount* /dev with its own options, which on this kernel is a second mount
+# request over a live filesystem for no gain. udev needs the service only for
+# the name (`need sysfs dev-mount`), so it runs and does nothing, which is
+# what the comment in `xtask/src/rootfs.rs` promises.
+skip_mount_dev="yes"

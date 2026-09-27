@@ -51,14 +51,28 @@ pub enum LockClass {
     Whole,
 }
 
-/// One held lock: a range `[start, end)` of one file, owned by one process, in
-/// one class. `end` is [`INF`] for an open-ended (whole-file, or a `l_len` of
+/// One held lock: a range `[start, end)` of one file, in one class, held by
+/// `owner`. `end` is [`INF`] for an open-ended (whole-file, or a `l_len` of
 /// zero) lock.
+///
+/// `owner` is *whose lock this counts as being*, which is a different question
+/// per class because Linux draws the line in two places:
+///
+/// * a **record** (`fcntl`) lock belongs to the **thread group**, so the same
+///   process locking a range twice replaces its own lock rather than fighting
+///   itself, and any descriptor it closes drops the lot;
+/// * a **whole-file** (`flock`) lock belongs to the **open file description**,
+///   so two independent `open()`s of one file in *one* process conflict, while
+///   `dup`ing an fd keeps sharing the one lock.
+///
+/// `pid` is the process that holds it either way - what `F_GETLK` reports as
+/// `l_pid`, and what says whether the holder is still alive.
 #[derive(Clone, Copy, Debug)]
 pub struct Lock {
     pub dev: u64,
     pub ino: u64,
-    pub owner: u32,
+    pub owner: u64,
+    pub pid: u32,
     pub class: LockClass,
     pub kind: LockKind,
     pub start: i64,
@@ -104,12 +118,15 @@ fn overlaps(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
 }
 
 /// Does `existing` conflict with a request by `owner` in `class` for `kind`
-/// over `[start, end)`? Only another process's lock conflicts, only a lock of
+/// over `[start, end)`? `owner` is the *class-appropriate* identity, so this is
+/// where Linux's two lines are drawn: same owner means the same process (a
+/// record lock) or the same open file description (a `flock`), and such a
+/// request replaces the lock it meets rather than fighting it. Only a lock of
 /// the same family conflicts, and read locks never block read locks - an
 /// exclusive request fights any overlap, a shared one only an exclusive holder.
 pub fn conflicts(
     existing: &Lock,
-    owner: u32,
+    owner: u64,
     class: LockClass,
     kind: LockKind,
     start: i64,
@@ -130,7 +147,7 @@ pub fn remove_range(
     locks: &mut Vec<Lock>,
     dev: u64,
     ino: u64,
-    owner: u32,
+    owner: u64,
     class: LockClass,
     lo: i64,
     hi: i64,
@@ -164,7 +181,7 @@ pub fn find_conflict(
     locks: &[Lock],
     dev: u64,
     ino: u64,
-    owner: u32,
+    owner: u64,
     class: LockClass,
     kind: LockKind,
     lo: i64,
@@ -176,12 +193,15 @@ pub fn find_conflict(
 }
 
 /// Apply a set/unlock: drop the owner's overlapping locks in the class, then
-/// record the new one unless `kind` is `None` (an unlock).
+/// record the new one unless `kind` is `None` (an unlock). `pid` is recorded
+/// with it for `F_GETLK` and for the liveness check, whatever `owner` was
+/// keyed on.
 pub fn apply_set(
     locks: &mut Vec<Lock>,
     dev: u64,
     ino: u64,
-    owner: u32,
+    owner: u64,
+    pid: u32,
     class: LockClass,
     kind: Option<LockKind>,
     lo: i64,
@@ -193,6 +213,7 @@ pub fn apply_set(
             dev,
             ino,
             owner,
+            pid,
             class,
             kind: k,
             start: lo,
@@ -211,7 +232,7 @@ static FILE_LOCKS: Mutex<RefCell<Vec<Lock>>> = Mutex::new(RefCell::new(Vec::new(
 /// Drop every lock whose `owner` no longer names a live task.
 #[cfg(target_os = "none")]
 fn prune_dead(locks: &mut Vec<Lock>) {
-    locks.retain(|l| crate::sched::snapshot(l.owner as usize).is_some());
+    locks.retain(|l| crate::sched::snapshot(l.pid as usize).is_some());
 }
 
 /// `F_GETLK`: the first conflicting lock in the class, or `None`.
@@ -219,7 +240,7 @@ fn prune_dead(locks: &mut Vec<Lock>) {
 pub fn query(
     dev: u64,
     ino: u64,
-    owner: u32,
+    owner: u64,
     class: LockClass,
     kind: LockKind,
     lo: i64,
@@ -238,7 +259,8 @@ pub fn query(
 pub fn set(
     dev: u64,
     ino: u64,
-    owner: u32,
+    owner: u64,
+    pid: u32,
     class: LockClass,
     kind: Option<LockKind>,
     lo: i64,
@@ -249,10 +271,10 @@ pub fn set(
         prune_dead(&mut table);
         if let Some(k) = kind {
             if let Some(i) = find_conflict(&table, dev, ino, owner, class, k, lo, hi) {
-                return Err(table[i].owner);
+                return Err(table[i].pid);
             }
         }
-        apply_set(&mut table, dev, ino, owner, class, kind, lo, hi);
+        apply_set(&mut table, dev, ino, owner, pid, class, kind, lo, hi);
         if kind.is_none() {
             wake_waiters(dev, ino);
         }
@@ -260,14 +282,43 @@ pub fn set(
     })
 }
 
-/// Release the process's locks of *both* classes on `(dev, ino)` - what closing
-/// a descriptor does.
+/// Release the locks that go away when one descriptor closes.
+///
+/// The two classes drop differently, because they are owned differently:
+///
+/// * every **record** lock the *process* holds on this file goes - POSIX's rule
+///   and the one that surprises people, since a lock taken through one fd is
+///   lost by closing an unrelated fd to the same file;
+/// * the **whole-file** lock goes only if it was this open file description's,
+///   so a second `open()` of the same file keeps its `flock` when the first is
+///   closed, and `dup`ed descriptors drop it only with the last of them.
 #[cfg(target_os = "none")]
-pub fn release(dev: u64, ino: u64, owner: u32) {
+pub fn release_on_close(dev: u64, ino: u64, pid: u32, ofd: u64) {
     critical_section::with(|cs| {
         let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
         let before = table.len();
-        table.retain(|l| !(l.dev == dev && l.ino == ino && l.owner == owner));
+        table.retain(|l| {
+            !(l.dev == dev
+                && l.ino == ino
+                && (match l.class {
+                    LockClass::Record => l.pid == pid,
+                    LockClass::Whole => l.owner == ofd,
+                }))
+        });
+        if table.len() != before {
+            wake_waiters(dev, ino);
+        }
+    });
+}
+
+/// Release every lock a *process* held on `(dev, ino)`, in either class - what
+/// process exit does, since its descriptions die with it.
+#[cfg(target_os = "none")]
+pub fn release_process(dev: u64, ino: u64, pid: u32) {
+    critical_section::with(|cs| {
+        let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
+        let before = table.len();
+        table.retain(|l| !(l.dev == dev && l.ino == ino && l.pid == pid));
         if table.len() != before {
             wake_waiters(dev, ino);
         }
@@ -291,7 +342,7 @@ static LOCK_WAITERS: Mutex<RefCell<Vec<Waiter>>> = Mutex::new(RefCell::new(Vec::
 pub fn is_free(
     dev: u64,
     ino: u64,
-    owner: u32,
+    owner: u64,
     class: LockClass,
     kind: Option<LockKind>,
     lo: i64,
@@ -314,7 +365,8 @@ pub fn is_free(
 pub fn set_or_arm(
     dev: u64,
     ino: u64,
-    owner: u32,
+    owner: u64,
+    pid: u32,
     class: LockClass,
     tid: usize,
     kind: Option<LockKind>,
@@ -336,7 +388,7 @@ pub fn set_or_arm(
                 return false;
             }
         }
-        apply_set(&mut table, dev, ino, owner, class, kind, lo, hi);
+        apply_set(&mut table, dev, ino, owner, pid, class, kind, lo, hi);
         if kind.is_none() {
             wake_waiters(dev, ino);
         }
@@ -380,11 +432,12 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    fn lock(owner: u32, class: LockClass, kind: LockKind, start: i64, end: i64) -> Lock {
+    fn lock(owner: u64, class: LockClass, kind: LockKind, start: i64, end: i64) -> Lock {
         Lock {
             dev: 1,
             ino: 1,
             owner,
+            pid: owner as u32,
             class,
             kind,
             start,
@@ -484,17 +537,17 @@ mod tests {
     fn whole_file_locks_arbitrate_like_the_rest() {
         let mut t = Vec::new();
         assert_eq!(
-            set_on(&mut t, 7, LockClass::Whole, LockKind::Write, 0, INF),
+            set_on(&mut t, 7, 7, LockClass::Whole, LockKind::Write, 0, INF),
             Ok(())
         );
         // Another writer of the same class is refused across the whole file.
         assert_eq!(
-            set_on(&mut t, 8, LockClass::Whole, LockKind::Write, 0, INF),
+            set_on(&mut t, 8, 8, LockClass::Whole, LockKind::Write, 0, INF),
             Err(7)
         );
         // An `fcntl` writer of the other class is not affected.
         assert_eq!(
-            set_on(&mut t, 8, LockClass::Record, LockKind::Write, 0, 100),
+            set_on(&mut t, 8, 8, LockClass::Record, LockKind::Write, 0, 100),
             Ok(())
         );
     }
@@ -503,11 +556,11 @@ mod tests {
     fn set_records_and_refuses_on_conflict() {
         let mut t = Vec::new();
         assert_eq!(
-            set_on(&mut t, 7, LockClass::Record, LockKind::Write, 0, 100),
+            set_on(&mut t, 7, 7, LockClass::Record, LockKind::Write, 0, 100),
             Ok(())
         );
         assert_eq!(
-            set_on(&mut t, 8, LockClass::Record, LockKind::Write, 50, 60),
+            set_on(&mut t, 8, 8, LockClass::Record, LockKind::Write, 50, 60),
             Err(7)
         );
         assert_eq!(
@@ -516,13 +569,13 @@ mod tests {
             Some(7)
         );
         assert_eq!(
-            set_on(&mut t, 8, LockClass::Record, LockKind::Read, 0, 50),
+            set_on(&mut t, 8, 8, LockClass::Record, LockKind::Read, 0, 50),
             Err(7)
         );
         let mut both = Vec::new();
-        set_on(&mut both, 7, LockClass::Record, LockKind::Read, 0, 50).unwrap();
+        set_on(&mut both, 7, 7, LockClass::Record, LockKind::Read, 0, 50).unwrap();
         assert_eq!(
-            set_on(&mut both, 8, LockClass::Record, LockKind::Read, 10, 40),
+            set_on(&mut both, 8, 8, LockClass::Record, LockKind::Read, 10, 40),
             Ok(())
         );
     }
@@ -530,8 +583,8 @@ mod tests {
     #[test]
     fn unlock_splits_a_wide_lock_into_its_remainders() {
         let mut t = Vec::new();
-        set_on(&mut t, 7, LockClass::Record, LockKind::Write, 0, 100).unwrap();
-        apply_set(&mut t, 1, 1, 7, LockClass::Record, None, 40, 60);
+        set_on(&mut t, 7, 7, LockClass::Record, LockKind::Write, 0, 100).unwrap();
+        apply_set(&mut t, 1, 1, 7, 7, LockClass::Record, None, 40, 60);
         let mine: Vec<(i64, i64)> = t
             .iter()
             .filter(|l| l.owner == 7)
@@ -543,8 +596,8 @@ mod tests {
     #[test]
     fn relock_by_the_holder_replaces_its_own_range() {
         let mut t = Vec::new();
-        set_on(&mut t, 7, LockClass::Record, LockKind::Write, 0, 100).unwrap();
-        set_on(&mut t, 7, LockClass::Record, LockKind::Write, 80, 100).unwrap();
+        set_on(&mut t, 7, 7, LockClass::Record, LockKind::Write, 0, 100).unwrap();
+        set_on(&mut t, 7, 7, LockClass::Record, LockKind::Write, 80, 100).unwrap();
         assert_eq!(t.len(), 2);
         let mut ranges: Vec<(i64, i64)> = t.iter().map(|l| (l.start, l.end)).collect();
         ranges.sort();
@@ -554,16 +607,47 @@ mod tests {
     // A table-local `set` for the pure tests (the real one takes the global).
     fn set_on(
         t: &mut Vec<Lock>,
-        owner: u32,
+        owner: u64,
+        pid: u32,
         class: LockClass,
         kind: LockKind,
         lo: i64,
         hi: i64,
     ) -> Result<(), u32> {
         if let Some(i) = find_conflict(t, 1, 1, owner, class, kind, lo, hi) {
-            return Err(t[i].owner);
+            return Err(t[i].pid);
         }
-        apply_set(t, 1, 1, owner, class, Some(kind), lo, hi);
+        apply_set(t, 1, 1, owner, pid, class, Some(kind), lo, hi);
         Ok(())
+    }
+
+    /// `flock` is owned by the open file description and `fcntl` by the
+    /// process, so the same two facts must come out differently in the two
+    /// classes - which is exactly what the single `owner` field is for.
+    #[test]
+    fn a_whole_file_lock_divides_processes_by_description_not_by_pid() {
+        let mut t = Vec::new();
+        // One process (pid 7), two independent `open()`s: descriptions 101
+        // and 102. Linux refuses the second `LOCK_EX` with EWOULDBLOCK.
+        assert!(set_on(&mut t, 101, 7, LockClass::Whole, LockKind::Write, 0, INF).is_ok());
+        assert_eq!(
+            set_on(&mut t, 102, 7, LockClass::Whole, LockKind::Write, 0, INF),
+            Err(7),
+            "a second description of the same process still contends"
+        );
+        // A `dup` shares the description, so it shares the lock - and a shared
+        // request from the same description coexists with its own exclusive one
+        // rather than deadlocking the caller against itself.
+        assert!(set_on(&mut t, 101, 7, LockClass::Whole, LockKind::Read, 0, INF).is_ok());
+        // The record class reads the same pair the other way: one process never
+        // conflicts with itself, whichever descriptor asked.
+        let mut r = Vec::new();
+        assert!(set_on(&mut r, 7, 7, LockClass::Record, LockKind::Write, 0, 10).is_ok());
+        assert!(set_on(&mut r, 7, 7, LockClass::Record, LockKind::Write, 0, 10).is_ok(),);
+        assert_eq!(
+            r.len(),
+            1,
+            "the second replaced the first rather than joining it"
+        );
     }
 }

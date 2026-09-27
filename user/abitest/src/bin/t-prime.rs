@@ -23,7 +23,7 @@ use core::panic::PanicInfo;
 /// `DRM_IOCTL_BASE` is `'d'` (0x64); a request is the `_IOC` word, and this
 /// kernel dispatches on the `nr` byte (bits 8..15).
 const fn ioc_d(nr: usize, size: usize) -> usize {
-    (3 << 30) | (size << 16) | (nr << 8) | (b'd' as usize)
+    (3 << 30) | (size << 16) | ((b'd' as usize) << 8) | nr
 }
 const NR_CREATE_DUMB: usize = 0xb2;
 const NR_MAP_DUMB: usize = 0xb3;

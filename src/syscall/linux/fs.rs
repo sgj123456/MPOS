@@ -250,6 +250,14 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
                 file.mark_opened_for(flags & O_ACCMODE != 0);
                 crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_OPEN, "");
+                // An evdev client's read position starts here, at the
+                // description that will do the reading: Linux hands a client
+                // its own event buffer at `open`, so an event that arrives
+                // before the first read is still that client's to read.
+                #[cfg(target_os = "none")]
+                if let Some(ev) = file.inode().as_evdev() {
+                    ev.opened(file.ofd());
+                }
             }
             // `O_CLOEXEC` is part of the open flags, not a property of the file:
             // it says the descriptor must not survive the next `execve`. Left
@@ -376,13 +384,12 @@ pub(super) fn fstat(args: [usize; ARG_COUNT]) -> isize {
 /// `flock(fd, operation)` - the advisory whole-file lock `apk` takes on its
 /// database before it will touch it.
 ///
-/// A real implementation would track per-open-file-description lock state and
-/// arbitrate `LOCK_SH`/`LOCK_EX` between them. This kernel has one user and,
-/// in practice, one locker at a time, so the honest shape of the answer is:
-/// validate the fd, grant every lock, release nothing. The lock is then held
-/// for the life of the description and freed when the kernel reaps it - which
-/// is exactly the invariant single-locker callers rely on. `LOCK_UN` (8) is
-/// a no-op because nothing was ever recorded.
+/// Owned by the **open file description**, not the process, which is Linux's
+/// rule and the one that makes `flock` usable for the `apk` database lock: two
+/// independent `open()`s of one file in *one* process contend with each other,
+/// while a `dup`ed descriptor shares the lock its original was given. So the
+/// owner below is the description's identity, and only `release_on_close` knows
+/// which locks die with it.
 pub(super) fn flock(args: [usize; ARG_COUNT]) -> isize {
     let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
         Ok(file) => file,
@@ -409,14 +416,19 @@ pub(super) fn flock(args: [usize; ARG_COUNT]) -> isize {
         let inode = file.inode();
         let dev = crate::vfs::mount::fs_id_of_inode(&inode);
         let ino = file.metadata().ino;
-        let owner = crate::sched::current_tgid().0 as u32;
+        // The description, not the caller: `dup` shares an `Arc<File>`, so the
+        // same pointer *is* the same open file description, and two `open()`s
+        // of one file are two pointers however few processes are involved.
+        let ofd = Arc::as_ptr(&file) as u64;
+        let pid = crate::sched::current_tgid().0 as u32;
         // A whole-file lock covers `[0, infinity)`, in the `Whole` class that
         // never interacts with an `fcntl` record lock, and it blocks unless
         // `LOCK_NB` was asked for.
         return lock_take(
             dev,
             ino,
-            owner,
+            ofd,
+            pid,
             crate::vfs::locks::LockClass::Whole,
             kind,
             0,
@@ -1942,7 +1954,8 @@ mod flock_off {
 fn lock_take(
     dev: u64,
     ino: u64,
-    owner: u32,
+    owner: u64,
+    pid: u32,
     class: crate::vfs::locks::LockClass,
     kind: Option<crate::vfs::locks::LockKind>,
     lo: i64,
@@ -1951,14 +1964,14 @@ fn lock_take(
 ) -> isize {
     use crate::vfs::locks;
     if !block {
-        return match locks::set(dev, ino, owner, class, kind, lo, hi) {
+        return match locks::set(dev, ino, owner, pid, class, kind, lo, hi) {
             Ok(()) => 0,
             Err(_holder) => err::EAGAIN,
         };
     }
     let me = crate::sched::current().0;
     loop {
-        if locks::set_or_arm(dev, ino, owner, class, me, kind, lo, hi) {
+        if locks::set_or_arm(dev, ino, owner, pid, class, me, kind, lo, hi) {
             locks::disarm(me);
             return 0;
         }
@@ -2002,7 +2015,11 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
     let dev = crate::vfs::mount::fs_id_of_inode(&inode);
     let ino = meta.ino;
     let size = meta.size as i64;
-    let owner = crate::sched::current_tgid().0 as u32;
+    // A record lock is the *process's*: one thread group's second request on a
+    // range it already holds replaces the first rather than deadlocking on it,
+    // and `pid` (the same value here) is what `F_GETLK` reports as `l_pid`.
+    let owner = crate::sched::current_tgid().0 as u64;
+    let pid = crate::sched::current_tgid().0 as u32;
 
     let (lo, hi) = match locks::resolve_range(l_whence, l_start, l_len, size, file.pos() as i64) {
         Some(r) => r,
@@ -2062,6 +2079,7 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
                 dev,
                 ino,
                 owner,
+                pid,
                 LockClass::Record,
                 kind,
                 lo,
@@ -2171,18 +2189,21 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     // is what stops a caller waiting on a closed fd from sleeping forever. A
     // negative fd is not a closed one but a placeholder, and is skipped rather
     // than reported: the check below zero-answers it, so it never counts.
-    let mut nodes: Vec<Option<Arc<dyn Inode>>> = Vec::with_capacity(nfds);
+    let mut nodes: Vec<Option<PollWatch>> = Vec::with_capacity(nfds);
     for index in 0..nfds {
         let at = fds + index * POLLFD_SIZE;
         let fd = unsafe { (at as *const i32).read_unaligned() };
-        let node = crate::sched::current_fds()
+        let watch = crate::sched::current_fds()
             .clone_at(fd)
             .ok()
-            .map(|file| file.inode());
-        if let Some(node) = &node {
-            node.poll_subscribe(me);
+            .map(|file| PollWatch {
+                ofd: file.ofd(),
+                node: file.inode(),
+            });
+        if let Some(watch) = &watch {
+            watch.node.poll_subscribe_client(watch.ofd, me);
         }
-        nodes.push(node);
+        nodes.push(watch);
     }
 
     let ready: isize = loop {
@@ -2233,12 +2254,12 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
                     return false;
                 }
                 let events = unsafe { ((at + POLLFD_EVENTS) as *const i16).read_unaligned() };
-                let Some(node) = &nodes[index] else {
+                let Some(watch) = &nodes[index] else {
                     // A dead fd has POLLNVAL waiting for the caller: the
                     // wait ends so the report can be made.
                     return true;
                 };
-                let ready = node.poll_ready();
+                let ready = watch.node.poll_ready_client(watch.ofd);
                 (events & POLLIN != 0 && ready.read) || (events & POLLOUT != 0 && ready.write)
             })
         };
@@ -2250,8 +2271,8 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         }
     };
 
-    for node in nodes.iter().flatten() {
-        node.poll_unsubscribe(me);
+    for watch in nodes.iter().flatten() {
+        watch.node.poll_unsubscribe(me);
     }
     if ready < 0 {
         return err::EINTR;
@@ -2259,10 +2280,22 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     ready
 }
 
+/// One descriptor a wait is watching: the node, and the open file description
+/// that named it.
+///
+/// The description travels beside the node because a node whose readiness
+/// depends on *which* client is asking - an evdev node with a grab on it - cannot
+/// answer from the node alone. `poll` and `select` are the two paths that ask
+/// this way; `epoll` keeps the same pairing in its own interest entries.
+struct PollWatch {
+    node: Arc<dyn Inode>,
+    ofd: u64,
+}
+
 /// Fill in \`revents\` for every entry and answer how many have something.
-fn check_ready(fds: usize, nodes: &[Option<Arc<dyn Inode>>]) -> usize {
+fn check_ready(fds: usize, nodes: &[Option<PollWatch>]) -> usize {
     let mut count = 0;
-    for (index, node) in nodes.iter().enumerate() {
+    for (index, watch) in nodes.iter().enumerate() {
         let at = fds + index * POLLFD_SIZE;
         let fd = unsafe { (at as *const i32).read_unaligned() };
         let events = unsafe { ((at + POLLFD_EVENTS) as *const i16).read_unaligned() };
@@ -2277,10 +2310,10 @@ fn check_ready(fds: usize, nodes: &[Option<Arc<dyn Inode>>]) -> usize {
         let revents = if fd < 0 {
             0
         } else {
-            match node {
+            match watch {
                 None => POLLNVAL,
-                Some(node) => {
-                    let ready = node.poll_ready();
+                Some(watch) => {
+                    let ready = watch.node.poll_ready_client(watch.ofd);
                     let mut bits = 0;
                     if events & POLLIN != 0 && ready.read {
                         bits |= POLLIN;
@@ -2313,6 +2346,9 @@ fn check_ready(fds: usize, nodes: &[Option<Arc<dyn Inode>>]) -> usize {
 struct SelectWatch {
     fd: i32,
     node: Option<Arc<dyn Inode>>,
+    /// The description that named it, for the nodes whose readiness depends on
+    /// which client is asking - the same pairing [`PollWatch`] carries.
+    ofd: u64,
     want_read: bool,
     want_write: bool,
 }
@@ -2323,7 +2359,7 @@ fn watch_ready(watch: &SelectWatch) -> (bool, bool) {
     let Some(node) = &watch.node else {
         return (false, false);
     };
-    let ready = node.poll_ready();
+    let ready = node.poll_ready_client(watch.ofd);
     (
         watch.want_read && ready.read,
         watch.want_write && ready.write,
@@ -2408,6 +2444,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         watches.push(SelectWatch {
             fd: fd as i32,
             node: Some(file.inode()),
+            ofd: file.ofd(),
             want_read: r,
             want_write: w,
         });
@@ -2419,7 +2456,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
     let me = crate::sched::current();
     for watch in &watches {
         if let Some(node) = &watch.node {
-            node.poll_subscribe(me);
+            node.poll_subscribe_client(watch.ofd, me);
         }
     }
 
@@ -2681,11 +2718,19 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
     // the reason the lock is keyed by the file and the owner, not the fd.
     #[cfg(target_os = "none")]
     {
+        // An evdev seat grab dies with its descriptor, the way a `flock` does -
+        // which is what lets a compositor that was killed (or a test that closed
+        // the device) leave the keyboard claimable instead of grabbing it from
+        // beyond its own grave.
+        if let Some(ev) = file.inode().as_evdev() {
+            ev.set_grab(false, file.ofd());
+        }
         let inode = file.inode();
-        crate::vfs::locks::release(
+        crate::vfs::locks::release_on_close(
             crate::vfs::mount::fs_id_of_inode(&inode),
             file.metadata().ino,
             crate::sched::current_tgid().0 as u32,
+            Arc::as_ptr(&file) as u64,
         );
     }
     match crate::vfs::close(fd) {
@@ -2694,6 +2739,21 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
     }
     crate::net::socket::close_last_socket(&file);
     crate::vfs::inotify::close_last(&file);
+    // The evdev client's read position dies with the description too - and it
+    // is asked *after* the close, where "last" is knowable: a `dup` is the same
+    // reader and has to keep its place, so only the descriptor that took the
+    // final reference forgets it.
+    #[cfg(target_os = "none")]
+    if Arc::strong_count(&file) == 1 {
+        if let Some(ev) = file.inode().as_evdev() {
+            ev.forget(file.ofd());
+        }
+        // And the device a `/dev/uinput` description made goes with it - the
+        // node out of `/dev/input`, its readers told the stream has ended.
+        if let Some(ui) = file.inode().as_uinput() {
+            ui.forget(file.ofd());
+        }
+    }
     0
 }
 
@@ -3648,41 +3708,12 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 _ => err::ENOTTY,
             }
         }
-        request if (request & 0xc0ff_ffff) == (0x8000_0000 | ((b'E' as u32) << 8) | 0x06) => {
-            // EVIOCGNAME: the input device's name for itself - the string
-            // the host filled the virtio device's config with, which is how
-            // an evdev reader tells a keyboard from a tablet without
-            // reading events. The request word carries the caller's
-            // buffer size in the _IOC size field, so the limit is read out
-            // of the request rather than being a separate argument; the
-            // string is written NUL-terminated and the answer is how many
-            // bytes it took, as the ioctl returns the count of any read.
-            let size = ((request >> 16) & 0x3fff) as usize;
-            if size == 0 {
-                return err::EINVAL;
-            }
-            let file = match crate::sched::current_fds().clone_at(fd) {
-                Ok(f) => f,
-                Err(e) => return err_of(e),
-            };
-            // The inode is bound first, for the same lifetime reason as the
-            // framebuffer arms above it.
-            let inode = file.inode();
-            let Some(evdev) = inode.as_evdev() else {
-                return err::ENOTTY;
-            };
-            if !buffer_ok(buf, size, true, from_user) {
-                return err::EFAULT;
-            }
-            let name = evdev.name().as_bytes();
-            let n = name.len().min(size - 1);
-            unsafe {
-                core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
-                (buf as *mut u8).add(n).write_volatile(0);
-            }
-            n as isize
-        }
         request if family_nr(request, b'E').is_some() => evdev_ioctl(fd, request, buf, from_user),
+        // uinput (`'U'`-typed): how a program makes an input device of its own.
+        // The descriptor *is* the device, so every request here is about the one
+        // this open file description owns.
+        #[cfg(target_os = "none")]
+        request if family_nr(request, b'U').is_some() => uinput_ioctl(fd, request, buf, from_user),
         // Console-ownership (`'V'`-typed VT_*) and keyboard/video-mode
         // (`'K'`-typed KD*) ioctls, which a seat manager drives the line
         // through when it takes a terminal away from the text console and
@@ -3728,31 +3759,34 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// `magic` - or `None` when the request does not belong to the family.
 ///
 /// Linux lays an `_IOC` word out with the family byte at bits 8..15 and the
-/// command number in the low byte, and that is the shape every real binary
-/// sends: libdrm, libseat, mesa, all of them. This kernel's own ABI tests
-/// were written with the two bytes swapped, and the family dispatch grew to
-/// match them - so both spellings are recognized, the family byte saying
-/// which half the number lives in. The command ranges the families use never
-/// collide with the magic bytes, so the two spellings cannot be confused.
+/// command number in the low byte, and filters a family's requests by
+/// `_IOC_TYPE(request) == magic` - nothing else. That filter is the whole
+/// function: a request whose *number* happens to be another family's magic byte
+/// must not be read as that other family's, which is exactly what a fallback
+/// that also matched on the low byte did. `KDSKBMODE` is `_IO('K', 0x45)`, and
+/// evdev's family byte is `'E'` = 0x45, so the seat manager's "take the keyboard
+/// off the console" call was answered as an evdev request on a tty and refused
+/// with `ENOTTY` - a real `KDSKBMODE` failing for looking like someone else.
+/// The two spellings are not symmetrical either: every number a family uses
+/// collides with some other family's byte, so which one wins depends on the
+/// order the arms are written in, and that is not a protocol.
 fn family_nr(request: u32, magic: u8) -> Option<u32> {
-    let magic = magic as u32;
-    if (request >> 8) & 0xff == magic {
+    if (request >> 8) & 0xff == magic as u32 {
         Some(request & 0xff)
-    } else if request & 0xff == magic {
-        Some((request >> 8) & 0xff)
     } else {
         None
     }
 }
 
 /// The virtual-terminal (`'V'`-typed) ioctls a seat manager uses to own the
-/// console a compositor runs on. mpos has a single console and no multiplexed
-/// VTs to switch between, so these are answered from that one reality rather
-/// than emulated as a fleet: the queries report the console as it is, and the
-/// actions that would move or re-mode a VT succeed by doing nothing, because
-/// there is nowhere else to move it to. A `seatd` that cannot get past this
-/// dance never hands the card to weston, which is why the reads carry sane
-/// values rather than a flat success.
+/// console a compositor runs on. The machine has six of them (`/dev/tty1`..6,
+/// pty-backed screens the console multiplexer shows one at a time), so the
+/// queries name the one actually on the screen and the switches move it; the
+/// obsolete or do-nothing ones - `VT_SENDSIG`, `VT_DISALLOCATE`, the two resize
+/// forms, whose answer `TIOCGWINSZ` carries - succeed without doing anything,
+/// which is what they mean. A `seatd` that cannot get past this dance never
+/// hands the card to weston, which is why the reads answer from live state
+/// rather than a flat success.
 fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let size = ((request >> 16) & 0x3fff) as usize;
     let Some(nr) = family_nr(request, b'V') else {
@@ -3768,9 +3802,20 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     }
     use core::mem::size_of;
     match nr {
-        0x00 => err::EIO,
-        // VT_OPENQRY: no free VT to point at, this one console is all there is
-        // and it is already the one in hand.
+        // VT_OPENQRY -> int: the next console a second session could take. The
+        // machine has six, so "there is nowhere else to put you" is not the
+        // honest answer while any of them is unclaimed; ENXIO is what Linux
+        // says when all of them are taken.
+        0x00 => {
+            let Some(free) = crate::vfs::vcmux::free_console() else {
+                return err::ENXIO;
+            };
+            if !buffer_ok(buf, 4, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut i32).write_unaligned(free as i32) };
+            0
+        }
         0x01 => {
             // VT_GETMODE -> struct vt_mode { mode, waitv, relsig, acqsig, frsig }.
             // Report automatic switching (`VT_AUTO`), no signals, so a manager
@@ -3786,22 +3831,41 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
         0x02 => 0, // VT_SETMODE: accept whatever mode is asked for.
         0x03 => {
             // VT_GETSTATE -> struct vt_stat { v_mode, v_num, v_state } (shorts).
-            // The one console, in text mode, active.
+            // The console on the screen, the mode it is in, and the bit of
+            // itself: what a session reads back to know where it has landed, so
+            // it has to be the console that is actually shown rather than a
+            // constant that happens to be right until something switches.
             if !buffer_ok(buf, size_of::<[u16; 3]>(), true, from_user) {
                 return err::EFAULT;
             }
+            let shown = crate::vfs::vcmux::active();
             unsafe {
                 let p = buf as *mut u16;
-                p.write_unaligned(0); // v_mode: not in raw/graphics (text)
-                p.add(1).write_unaligned(1); // v_num: console 1
-                p.add(2).write_unaligned(0); // v_state: active
+                p.write_unaligned(crate::vfs::vcmux::kd_mode(shown) as u16);
+                p.add(1).write_unaligned(shown as u16);
+                p.add(2).write_unaligned(1u16 << (shown - 1).min(15));
             }
             0
         }
-        0x04 => 0, // VT_SENDSIG: nothing to signal.
-        0x05 => 1, // VT_RELDISP: agree the display can be released.
-        0x06 => 0, // VT_ACTIVATE: already the console asked for.
-        0x07 => 0, // VT_WAITACTIVE: it is active now, so return at once.
+        0x04 => 0, // VT_SENDSIG: obsolete in Linux, and nothing signals here.
+        // VT_RELDISP: agree. A session in `VT_PROCESS` mode asks this before it
+        // takes the screen, and the only answer that lets the switch go ahead is
+        // success - refusing would strand the session holding a console it has
+        // already been told to give up.
+        0x05 => 1,
+        // VT_ACTIVATE -> int: make that console the one on the screen.
+        0x06 => {
+            if crate::vfs::vcmux::activate(buf as u32) {
+                0
+            } else {
+                err::EINVAL
+            }
+        }
+        // VT_WAITACTIVE -> int: park until that console is the active one.
+        0x07 => {
+            crate::vfs::vcmux::wait_active(buf as u32);
+            0
+        }
         0x08 => 0, // VT_DISALLOCATE: nothing to free.
         0x09 => 0, // VT_RESIZE: the window size comes from TIOCGWINSZ instead.
         0x0a => 0, // VT_RESIZEX: same.
@@ -3809,12 +3873,20 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     }
 }
 
-/// The keyboard/video-mode (`'K'`-typed) ioctls that bracket a VT handover:
-/// put the keyboard in raw so the compositor gets scancodes, and put the
+/// The keyboard/video-mode (`'K'`-typed) ioctls that bracket a VT handover: put
+/// the keyboard in a mode where the console stops eating the keys, and put the
 /// console in graphics mode so the framebuffer is not painted over by the text
-/// driver. On the compositor boot the scanout is already not the console's, and
-/// the keyboard already reaches input as events, so these record nothing -
-/// they only have to succeed for a seat manager to complete the switch.
+/// driver.
+///
+/// Both *are* recorded, per console (`crate::vfs::vcmux`), because a seat
+/// manager's whole handover is these two words: `weston` through `seatd` sets its
+/// console graphics and its keyboard off, and the kernel that accepts both and
+/// remembers nothing keeps drawing the login prompt over the compositor's screen
+/// - one keystroke at a time, because the shell still echoes what it was handed.
+///
+/// The command numbers are `<linux/kd.h>`'s: `KDSETMODE 0x4B3A`,
+/// `KDGETMODE 0x4B3B`, `KDGKBMODE 0x4B44`, `KDSKBMODE 0x4B45`, so the low byte of
+/// the request word after the `'K'` magic is `0x3a`, `0x3b`, `0x44` and `0x45`.
 fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let Some(nr) = family_nr(request, b'K') else {
         return err::ENOTTY;
@@ -3823,33 +3895,72 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
-    if file.inode().as_tty().is_none() {
+    // Which of the six consoles this descriptor is the terminal of. A tty that
+    // is not one of them - a `/dev/pts` slave, a master - has no screen and no
+    // keyboard mode to set, and Linux's answer for it is the same one as for a
+    // tty that is not a console at all.
+    let Some(vc) = file.inode().as_tty().and_then(|t| t.vc_number()) else {
         return err::ENOTTY;
-    }
+    };
+    use crate::vfs::tty::{K_MEDIUMRAW, K_OFF, K_RAW, K_UNICODE, K_XLATE, KD_GRAPHICS, KD_TEXT};
     match nr {
-        // KDGETMODE (0x0b) and KDGKBMODE (0x2c) are reads that report the
-        // current mode; the rest (KDSETMODE 0x0a, KDSKBMODE 0x36, and the
-        // led/keymap setters) are accepted.
-        0x0b => {
-            // KDGETMODE -> int: 0 (KD_TEXT). The compositor's ownership of the
-            // scanout is decided by the boot mode, not by this field, so
-            // reporting text keeps the console's own view consistent.
+        // KDSETMODE -> int argument: the console's video mode.
+        0x3a => {
+            let mode = match request_arg(buf) as u32 {
+                KD_TEXT | KD_GRAPHICS => request_arg(buf) as u32,
+                // The two obsolete text modes, folded to the one they meant.
+                2 | 3 => KD_TEXT,
+                _ => return err::EINVAL,
+            };
+            if !crate::vfs::vcmux::set_kd_mode(vc, mode) {
+                return err::EINVAL;
+            }
+            0
+        }
+        // KDGETMODE <- int: what that console's screen is doing.
+        0x3b => {
             if !buffer_ok(buf, 4, true, from_user) {
                 return err::EFAULT;
             }
-            unsafe { (buf as *mut i32).write_unaligned(0) };
+            unsafe { (buf as *mut i32).write_unaligned(crate::vfs::vcmux::kd_mode(vc) as i32) };
             0
         }
-        0x2c => {
-            // KDGKBMODE -> int: K_XLINUX (0x04), a raw-ish scancode mode.
+        // KDSKBMODE -> int: the keyboard's translation mode for this console.
+        0x45 => {
+            if !matches!(
+                request_arg(buf) as u32,
+                K_RAW | K_XLATE | K_MEDIUMRAW | K_UNICODE | K_OFF
+            ) {
+                return err::EINVAL;
+            }
+            if !crate::vfs::vcmux::set_kb_mode(vc, request_arg(buf) as u32) {
+                return err::EINVAL;
+            }
+            0
+        }
+        // KDGKBMODE <- int.
+        0x44 => {
             if !buffer_ok(buf, 4, true, from_user) {
                 return err::EFAULT;
             }
-            unsafe { (buf as *mut i32).write_unaligned(0x04) };
+            unsafe { (buf as *mut i32).write_unaligned(crate::vfs::vcmux::kb_mode(vc) as i32) };
             0
         }
+        // The led, keymap and sound setters: this kernel has no PC keyboard
+        // controller to drive and its keymap is compiled in, so they are
+        // accepted as the no-ops they ask for rather than refused - a seat
+        // manager treats a failure here as the console being unusable.
         _ => 0,
     }
+}
+
+/// The int argument an `_IO` console ioctl carries in its third argument.
+///
+/// `KDSETMODE` and `KDSKBMODE` are `_IO` - no buffer - and the mode is passed as
+/// the plain value, so it is already in the register the syscall layer handed
+/// over. It arrives where `buf` is for these requests.
+fn request_arg(buf: usize) -> i32 {
+    buf as i32
 }
 
 /// The evdev (`'E'`-typed) ioctl set libinput reads to classify a device
@@ -3857,11 +3968,89 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 /// 30-31, the number in whichever half the family byte did not take (see
 /// [`family_nr`]) and the caller's buffer size in 16-29; the
 /// number selects which question this is. Reads answer from the node's
-/// frozen capability picture (`drivers/virtio/input.rs`); the handful of
-/// writes this kernel honors (`EVIOCGRAB`, and the keymap/force-feedback
-/// settings) are accepted rather than refused, since refusing a seat grab
-/// or a repeat-rate write would stop a compositor that only wanted them to
-/// take effect quietly.
+/// frozen capability picture (`drivers/virtio/input.rs`); the keymap and
+/// force-feedback writes are accepted rather than refused, since a compositor
+/// that only wanted them to take effect quietly should not be stopped by a
+/// repeat rate this kernel does not have. `EVIOCGRAB` is the one write with a
+/// real answer to give: it belongs to the calling descriptor, and a device
+/// already claimed answers `EBUSY`.
+/// The `'U'`-typed requests: `/dev/uinput`, where userland makes input devices.
+///
+/// The plumbing lives here rather than in the driver because reading a caller's
+/// structure and checking its pointer is the same work for every device, and
+/// because the errno a refusal carries is the ABI's business; what the driver
+/// owns is the effect - which bit was declared, which device was made.
+fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
+    use core::mem::size_of;
+    let size = ((request >> 16) & 0x3fff) as usize;
+    let dir = (request >> 30) & 0x3;
+    let Some(nr) = family_nr(request, b'U') else {
+        return err::ENOTTY;
+    };
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    let Some(dev) = inode.as_uinput() else {
+        return err::ENOTTY;
+    };
+    let ofd = file.ofd();
+
+    // Every bit-setter carries one `int`: the bit's number.
+    if let Some(set) = crate::uinput::bit_request(nr) {
+        if size < size_of::<i32>() || !buffer_ok(buf, size_of::<i32>(), false, from_user) {
+            return err::EINVAL;
+        }
+        let code = unsafe { (buf as *const i32).read_unaligned() } as usize;
+        return if dev.set_bit(ofd, set, code) {
+            0
+        } else {
+            err::EINVAL
+        };
+    }
+    match (dir, nr) {
+        (0, crate::uinput::DEV_CREATE) => {
+            if dev.create(ofd) {
+                0
+            } else {
+                err::EINVAL
+            }
+        }
+        (0, crate::uinput::DEV_DESTROY) => {
+            dev.destroy(ofd);
+            0
+        }
+        (1, crate::uinput::DEV_SETUP) => {
+            if size < crate::uinput::SETUP_SIZE
+                || !buffer_ok(buf, crate::uinput::SETUP_SIZE, false, from_user)
+            {
+                return err::EINVAL;
+            }
+            // Read the caller's structure in one go: it is fixed-size and
+            // plain, and this is the only place its layout is depended on.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(buf as *const u8, crate::uinput::SETUP_SIZE) };
+            match crate::uinput::parse_setup(bytes) {
+                Some((name, id, _effects)) => {
+                    dev.setup(ofd, name, id);
+                    0
+                }
+                None => err::EINVAL,
+            }
+        }
+        (2, crate::uinput::GET_VERSION) => {
+            let version = crate::uinput::VERSION;
+            if size < size_of::<u32>() || !buffer_ok(buf, size_of::<u32>(), true, from_user) {
+                return err::EINVAL;
+            }
+            unsafe { (buf as *mut u32).write_unaligned(version) };
+            0
+        }
+        _ => err::ENOTTY,
+    }
+}
+
 fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let size = ((request >> 16) & 0x3fff) as usize;
     let dir = (request >> 30) & 0x3;
@@ -3904,20 +4093,35 @@ fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
             give(&b)
         }
         (2, 0x06) => {
-            // EVIOCGNAME: the device's name, NUL-terminated, capped by size.
+            // EVIOCGNAME: the device's name for itself - the string the host
+            // filled the virtio device's config with, which is how an evdev
+            // reader tells a keyboard from a tablet without reading events. The
+            // request word carries the caller's buffer size in the `_IOC` size
+            // field, so the limit comes out of the request rather than being a
+            // separate argument.
+            //
+            // Three details are `strlcpy`'s, and they are what a caller has
+            // always been promised. The name is what stands before its *first*
+            // NUL: a device reports a C string, and the terminator the virtio
+            // config carries is not part of it. A size of zero is the length
+            // query, answered with the length and no copy. And the answer is
+            // that length *excluding* the terminating NUL even when the copy had
+            // to be cut short - which is how a caller with a buffer too small
+            // learns that the name did not fit.
+            let name = ev.name().as_bytes();
+            let text = name.split(|&byte| byte == 0).next().unwrap_or(&[]);
             if size == 0 {
-                return err::EINVAL;
+                return text.len() as isize;
             }
             if !buffer_ok(buf, size, true, from_user) {
                 return err::EFAULT;
             }
-            let name = ev.name().as_bytes();
-            let n = name.len().min(size - 1);
+            let n = text.len().min(size - 1);
             unsafe {
-                core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
+                core::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
                 (buf as *mut u8).add(n).write_volatile(0);
             }
-            (n + 1) as isize
+            text.len() as isize
         }
         (2, 0x09) => give(ev.prop_bits()), // EVIOCGPROP
         (2, 0x20..=0x3f) => {
@@ -3949,13 +4153,20 @@ fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
         }
         // Writes.
         (1, 0x90) => {
-            // EVIOCGRAB: remember the seat grab; never refused here.
+            // EVIOCGRAB: claim the device for *this* open file description, and
+            // refuse a claim on a device somebody else holds with the `EBUSY`
+            // the man page spells. Keyed on the description because that is what
+            // makes the claim die with `close(2)` below rather than outliving it
+            // in whatever process happens to have the device open twice.
             if size_of::<i32>() > size || !buffer_ok(buf, size_of::<i32>(), false, from_user) {
                 return err::EINVAL;
             }
             let on = unsafe { (buf as *const i32).read_unaligned() } != 0;
-            ev.set_grab(on);
-            0
+            if ev.set_grab(on, file.ofd()) {
+                0
+            } else {
+                err::EBUSY
+            }
         }
         (1, 0x80) | (1, 0x81) | (1, 0x82) | (1, 0x83) | (1, 0x91) | (1, 0x04) => {
             // EVIOCSFF/CRMFF, EVIOCREVOKE, EVIOCSREP/KEYCODE: accepted quietly.

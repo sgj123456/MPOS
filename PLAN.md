@@ -1,4 +1,3 @@
-
 # MPOS Feature Roadmap
 
 Missing essential features, prioritized by impact on real-world workload compatibility.
@@ -17,14 +16,26 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
 - [x] P2 Signal delivery — frame · mask · siginfo (§2)
 - [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3)
-  - [ ] read/write enforce against held locks; flock per-OFD not per-process (§3.2)
-  - [ ] ext4 `atime` bumped on read (§3.3)
+  - [x] `flock` owned by the open file description, record locks by the process
+        (`t-filelock`) · read/write deliberately *not* enforced: Linux advisory
+        locks never refuse an `open`ed read, and mandatory mode is a deprecated
+        per-file opt-in (§3.2)
+  - [x] ext4 `atime` bumped on read, with Linux's `relatime` rule so a read
+        that sees no change costs no device write (§3.3)
 
 **Networking (Phase 4)**
-- [~] 4.1 AF_UNIX `SOCK_STREAM` — bind/listen/connect/accept · data path ·
-      `SCM_RIGHTS` · `SCM_CREDENTIALS` · `SO_PEERCRED` (`t-unix-scm`) done
-  - [ ] `SOCK_DGRAM` datagram transfer (opens today, no transfer)
-  - [ ] per-skb cmsg boundaries on `SOCK_STREAM` (today: one per send)
+- [x] 4.1 AF_UNIX — `SOCK_STREAM` bind/listen/connect/accept · data path ·
+      `SCM_RIGHTS` · `SCM_CREDENTIALS` · `SO_PEERCRED`, and `SOCK_DGRAM`
+      datagram transfer with whole-message boundaries and per-message
+      `SCM_CREDENTIALS` for a `SO_PASSCRED` reader (`t-unix-scm`, `t-socketpair`)
+  - [x] per-send cmsg boundaries on `SOCK_STREAM`: each handover carries the
+        stream position its send ended at, and a read stops there, so two sends
+        of one byte each arrive as two deliveries with their own descriptors
+        (`t-unix-scm`)
+  - [x] a *data-less* `sendmsg`'s handover is delivered on the read that asks
+        for it: the record is due the moment it is queued and no byte will ever
+        arrive *with* it, so the read answers with the record and a zero-byte
+        return instead of parking on a byte that cannot come (`t-unix-scm`)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
 - [~] 4.3 TCP options — round-trip all; `TCP_NODELAY`/`SO_KEEPALIVE` reach smoltcp
   - [ ] `SO_REUSEADDR` / `SO_LINGER` / buffer sizes still record-only (§4.3)
@@ -52,47 +63,118 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
       page-flip + vblank events) for a software/pixman compositor. No 3D/virgl,
       no `GBM`/`EGL` (§7.1)
 - [x] 7.2 Input — virtio-input evdev: capability ioctls (`EVIOCGBIT`/`EVIOCGABS`/
-      …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents (§7.2)
+      …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents, and
+      events that belong to the description that grabbed them (§7.2)
 - [ ] 7.3 AHCI/SATA (stretch)
+- [x] `/dev/uinput` — a virtual input device a userspace program creates and
+      writes events into: the self-test's hands, so `t-evdev` pins *whose* event
+      a record is on the machine and not only in the host unit tests. Gets a
+      `/dev/input` node and an `add` uevent; no `/sys/class/input` entry (sysfs
+      builds its tree once at boot), no `UI_ABS_SETUP`, no force feedback (§7.2)
 
 **Wayland compositor (weston) support** — the cross-cutting work a rootful
 compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
-`cargo xtask run --console compositor`):
+`cargo xtask run --mode weston`):
 - [x] Peer credential + fd passing (SCM_RIGHTS/`SO_PEERCRED`) — Stage 0 (see §4.1)
 - [x] libinput device classification — evdev capability ioctls — Stage 1, `t-evdev`
 - [x] Device discovery — `/dev/input`, `/sys/class/input`, input uevents — Stage 2
 - [x] `wl_shm` buffers — `memfd_create` + frame-aliased shared mappings — Stage 3, `t-memfd-shm`
 - [x] Framebuffer present — `FBIOPAN_DISPLAY`/`FBIO_WAITFORVSYNC` + a pointer
-      (virtio-tablet) + `--console compositor` (kernel frees the scanout) — Stage 4, `t-fbdev`
+      (virtio-tablet) + `--mode weston` (kernel frees the scanout) — Stage 4, `t-fbdev`
 - [x] DRM/KMS surface — `/dev/dri/card0` (UAPI ioctl + struct ABI, dumb buffers,
       page-flip, vblank events) for DRM-backend compositors — Stage 5, `t-drm`
 - [ ] 3D / GL / virgl / Mesa-`GBM`+`EGL` — deliberately out of scope
-- [ ] evdev readiness is polled at tick granularity (no interrupt wake);
-      `EVIOCGRAB` is accepted but not enforced per-owner
+- [x] a parked evdev reader - direct, `select`, or an `epoll` interest like a
+      compositor's - is woken by the service task when a record lands, instead of
+      at the next tick; the wait re-checks the queue as it parks, so an event
+      between a failed read and the sleep cannot be lost
+- [x] `EVIOCGRAB` is per-owner: a second descriptor is refused `EBUSY`, a
+      re-claim by the holder is not, and the claim dies with its descriptor
+      (`t-evdev`)
+  - [x] and the device is the owner's while it holds it: a reader that is not
+        the grabber is told nothing - not the records, and not a readable answer
+        either - because every client has a *position* in the device's window
+        rather than a turn at one shared queue. Two readers of an *ungrabbed*
+        node each see every event, which the shared queue could not do either
+        (whoever read first consumed it for everybody)
+- [x] udevd's worker channel works, which is the difference between a keyboard
+      and none: a `SOCK_SEQPACKET` *pair* had a message queue that `send_dgram`
+      refused to write into, because the check asked "is this a `SOCK_DGRAM`?"
+      rather than "does this end carry messages?" - and a message no one can
+      send is a device that never gets an `ID_INPUT` property, which is what
+      `weston.ini`'s `require-input=false` has been standing in for (`t-udev-worker`)
+  - [ ] `SOCK_SEQPACKET` still carries no boundaries over a *named* socket (the
+        stream this family has), which is the one documented divergence left on
+        the path from `udevadm` to a tagged device node
 
 **Security (Phase 8)**
-- [ ] 8.1 ASLR (mmap/stack/load-address randomization)
+- [~] 8.0 **a userspace process could panic the kernel** - fixed for the case
+      that was reproducing (a ramfs file grew as one `Vec`, and a 128 MiB
+      contiguous `realloc` is an order the buddy allocator never serves), and
+      tmpfs now has a byte budget answering `ENOSPC`. Still open: the global
+      allocator's failure path is `panic!`, so any other unbounded user-driven
+      growth still ends the machine (§8.0)
+- [x] 8.1 ASLR — `ET_DYN` load bias, interpreter base, stack top and the `mmap`
+      region are drawn per `exec`; a fixed-address image keeps its own address,
+      because that is what a fixed address means (§8.1)
 - [~] 8.2 seccomp — `STRICT` done; `FILTER` *(blocked: BPF runner)*
 - [x] 8.3 user stack canary (`AT_RANDOM`) (§8.3)
 
 **Performance (Phase 10)**
 - [x] 10.1 Network latency — event-driven waits + virtio-net MSI-X (`ping` 7.5→0.3 ms)
-- [ ] 10.2 Context-switch/fork cost — PCID · lazy FPU · one TLB flush/fork · smaller stacks
-- [ ] 10.3 Syscall path — itimer-armed flag · fault-driven user-buffer copy
-- [ ] 10.4 Pipes + per-frame allocations · [ ] 10.5 ext4/virtio-blk read path
-- [ ] 10.6 Serial TX ring · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
+- [~] 10.2 Context-switch/fork cost — lazy FPU · one TLB flush/fork · smaller
+      stacks all landed, with the numbers in §10.2; PCID recorded as a decision
+      rather than attempted (the audit it needs is in §10.2)
+- [~] 10.3 Syscall path — itimer-armed flag landed; the fault-driven user-buffer
+      copy is not, and §10.3 says why the pre-walk it removes does not exist
+- [~] 10.4 Pipes + per-frame allocations — the pipe ring and the raw-receive
+      temporary landed, with numbers in §10.4; the frame pool is not, and §10.4
+      also records the larger finding that a pipe *handover* costs two ticks
+- [~] 10.5 ext4/virtio-blk read path — the set-associative cache landed with its
+      device-read counts in §10.5; readahead and blk pipelining are each other's
+      prerequisite and neither is measurable until the test machine has a disk
+- [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
+      rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
 **Architectures (Phase 9 — far future)**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
 ### Suggested next moves (highest impact, tractable)
-1. **P10.2 / P10.3 performance** — biggest interactive-latency/throughput wins, marked High.
-2. **4.1 `SOCK_DGRAM` transfer** — completes the AF_UNIX family for dbus/systemd paths.
-3. **5.1/5.2 anonymous demand paging** — unblocks true shared `fork` frames *and* real `MADV_DONTNEED`.
-4. **Weston polish** — evdev wake-on-event (kill the tick-poll latency for input),
-   a per-buffer mmap offset manager (replace the `handle<<X` encoding), and the
-   remaining DRM objects (`ADDFB2`, atomic) if a compositor needs them.
-5. **4.3 remaining socket options** — small, self-contained.
+
+Landed since this list was written: `flock` is owned by the open file
+description while record locks stay per-process (`t-filelock`), `EVIOCGRAB` is
+per-descriptor with Linux's `EBUSY` and dies on close (`t-evdev`), ext4 updates
+`atime` under `relatime`, two board entries that were already true are marked
+so (AF_UNIX `SOCK_DGRAM` transfer, the serial TX ring), and evdev's read rule is
+finished: a reader that is not the grabber is told nothing while the grab is
+held, and two readers of one node each keep their own copy (§7.2, `t-evdev`).
+
+What is left, in the order that keeps each step verifiable on its own:
+
+1. **`SO_REUSEADDR` / `SO_LINGER` / buffer sizes** (§4.3) - self-contained, and
+   each has a test that can only be written once the behaviour is real.
+2. **Per-message cmsg boundaries on `SOCK_STREAM`** (§4.1) - the handover queue
+   is already a FIFO *per send*; what it lacks is the byte offset each send
+   finished at, so a read that swallows two sends reports one control chain.
+   Needs the pipe ring to carry marks, which is why it is not a small patch.
+3. **ASLR** (§8.1) - `ET_DYN` (static-pie) is already loaded and RELA-relocated
+   at base 0, so the work is a load bias plus `AT_PHDR`/`AT_BASE`/`AT_ENTRY`
+   shifted with it, then the stack and mmap gaps. Every static-pie binary in the
+   image is a test of the auxv arithmetic.
+4. **Anonymous demand paging** (§5.1 + §5.2) - the prerequisite both items name,
+   and the only one that changes the mm fault path for everything.
+5. **`seccomp` FILTER** (§8.2) then **namespaces** (§6.3) - one a BPF evaluator
+   over `seccomp_data`, the other a set of decisions (which namespaces, and what
+   each one must observably isolate) that should be made before code.
+6. **The wake latency before anything else in this family** - the two
+   measurements that disagree with their own plan both land on it: `wait4` costs
+   8 ms whether the child owned 32 MiB or nothing (§10.2), and a pipe handover
+   costs 8.0 ms for the same two ticks (§10.4). Both are 250 Hz ticks on a task
+   that has already been woken, so a blocking syscall's round trip has a floor
+   of ~8 ms on this machine and no amount of work removed from the syscall
+   itself will move it. `t-forkcost` and `t-pipecost` are the instruments.
+   After that, §10.5's disk-backed instrument and the frame pool, then each of
+   these wants a before/after number - and the number is allowed to say "no".
 
 ---
 
@@ -108,7 +190,9 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
 - **Display / input**: virtio-gpu 2D scanout exposed as `/dev/fb0` (mmap +
   fbdev ioctls + pan/vsync) and a DRM/KMS `/dev/dri/card0` (UAPI ABI, dumb
   buffers, page-flip + vblank) for a software compositor; virtio-input evdev
-  (`/dev/input/eventN`, capability ioctls) with a keyboard + tablet
+  (`/dev/input/eventN`, capability ioctls, and events that belong to the
+  description holding `EVIOCGRAB`) with a keyboard + tablet, and `/dev/uinput`
+  for a program that needs an input device of its own
 - **Buffer sharing**: `memfd_create` whose `MAP_SHARED` mapping aliases real
   frames, so a compositor and a client sharing one descriptor see the same bytes
 - **Scheduler**: 4-level priority + round-robin, COW fork, demand-paged stack
@@ -294,9 +378,9 @@ other kinds falling back to the `.`/`..` convention).
 ### 3.2 File Locking (fcntl F_SETLK) — **DONE**
 
 POSIX record locks are real: a global table keyed by `(dev, ino)`, each entry
-`{owner (tgid), class, kind, [start,end)}`, in `src/vfs/locks.rs` (the range
-math, conflict rule and split-on-relock are host-tested). Both lock families live
-in that one table but never see each other - a `class` of `Record` (`fcntl`
+`{owner, pid, class, kind, [start,end)}`, in `src/vfs/locks.rs` (the range math,
+conflict rule and split-on-relock are host-tested). Both lock families live in
+that one table but never see each other - a `class` of `Record` (`fcntl`
 `F_SETLK`/`F_GETLK`/`F_SETLKW`) and `Whole` (`flock`) conflict only within the
 class, as Linux defines the two to be independent. `F_SETLK` takes or drops a
 byte range and refuses a blocked request with `EAGAIN`; `F_GETLK` reports the
@@ -304,20 +388,25 @@ first conflicting lock (its kind, range and holder pid) or clears to `F_UNLCK`;
 `F_SETLKW` blocks and wakes on release. `flock(LOCK_SH|LOCK_EX|LOCK_UN)` covers
 the whole file (`[0, infinity)`), shared/exclusive arbitration identical to the
 record locks, and blocks unless `LOCK_NB`. A holder that dies is pruned on the
-next grant/query, and closing a descriptor drops that process's locks on the
-file.
+next grant/query.
 
-*Remaining:* `read`/`write` do not yet enforce against held locks; and `flock`
-is tracked per-process rather than per-open-file-description, so two independent
-`open`s in one process that Linux would let coexist are arbitrated as one here.
+`owner` is deliberately *not* the same thing in the two classes, because Linux
+draws the line in two places: a record lock is owned by the thread group, a
+`flock` by the open file description (the `Arc<File>` the fd table shares, so a
+`dup` shares the lock and a second `open()` does not). `release_on_close`
+applies the two different rules - POSIX's "closing any descriptor drops the
+process's record locks", and "the flock dies with its own description" - and
+`user/abitest/src/bin/t-filelock.rs` pins both, with the contending-second-`open`
+and the sharing-`dup` cases side by side.
 
-**Changes**:
-- Add `locks: Vec<FileLock>` to `File` or per-inode lock table
-- `F_SETLK`: record lock (F_RDLCK or F_WRLCK) for (pid, fd, offset, len)
-- `F_GETLK`: scan for conflicts, return `F_UNLCK` if none
-- `F_SETLKW`: block until lock available
-- `read`/`write`: check for conflicting locks (F_WRLCK blocks reads, F_RDLCK blocks writes)
-- `close`: release all locks for the closing fd
+*Not a gap:* `read`/`write` do not consult the lock table, which is what Linux
+does. These are **advisory** locks: nothing refuses a `read` that walks over
+another process's `F_WRLCK`. Linux's mandatory mode is a per-file opt-in -
+setgid with the group-exec bit cleared, on a mount that allows it - and is
+documented as broken and deprecated; adopting it here would be a divergence
+rather than a completion. What the two families *are* used for here is
+cooperation: `apk` and `fish` take the locks, and callers that hold one refuse
+the other.
 
 ### 3.3 File Timestamps — **DONE** (ext4; ramfs legacy calls remain)
 
@@ -405,11 +494,21 @@ pid/uid/gid - the identity a dbus broker authenticates on. The handover rides
 the connection's `PipeState` beside the bytes it travels with, so a descriptor
 never taken is closed when the queue drops, and the peer's credentials are
 captured at `connect`/`accept`/`socketpair`. v1 divergences: on `SOCK_STREAM`
-the kernel keeps one cmsg boundary per send rather than per skb (a data-less
-`sendmsg`'s handover is delivered on the next read), a sender's
+the kernel keeps one cmsg boundary per send rather than per skb, a sender's
 `SCM_CREDENTIALS` opt-in is accepted but the kernel always fills the peer's
 real ids (no impersonation), and `SO_PEERCRED`/`SO_PASSCRED` are the unix
 `connect` path's - a `socketpair` carries descriptors but not credentials.
+
+A *data-less* `sendmsg` used to be the one deadlock left in the family: the
+record rode a byte boundary and there was no byte, so the read parked on a
+descriptor it already had. `PipeEnd::scm_due` now lets the read see that the
+front record is due before it decides to wait, and the read returns the record
+with zero bytes rather than waiting for the stream to advance - which is the
+one case where a `recvmsg` on a stream can answer 0 and not mean end-of-stream,
+so a receiver that takes a short read has to look at its control buffer before
+concluding the peer is gone. That is the price of the record, and the
+alternative was a hang; `t-unix-scm` pins both the delivery and the
+non-blocking second read that follows it.
 
 ### 4.2 ICMP Improvements — **DONE**
 
@@ -447,6 +546,50 @@ plus `SO_TYPE`/`SO_ERROR`. `SO_RCVBUF`/`SO_SNDBUF` report the stack's default
 disable Nagle coalescing, `SO_KEEPALIVE` not issuing probe packets, and
 `SO_LINGER` not honoured at `close`. The flags are stored and queried but do not
 yet change packet behaviour.
+
+**Start here, in this order.** First the fact that bounds everything else in this
+section: **IPv4 `listen(2)` is refused with `EOPNOTSUPP`**, pinned deliberately in
+`user/tests/src/bin/t-tcp.rs` - the stack is outbound-only, no accept, so no
+in-guest server can run and no local socket pair exists to observe a teardown
+with. Adding `listen`/`accept` (a listening smoltcp socket + a `TcpSocketSet`
+passive-open slot + an inode per accepted connection) is therefore the first
+§4.3 item, not a footnote to it, and it is also what `dbus`, a local `nginx`, and
+any `ssh` *server* on this machine would need.
+
+**Second is done, and was measured rather than assumed**: a plain `close(2)`
+reached `net::free_entry`, which called `sockets.remove(handle)` on the spot,
+while smoltcp only puts the `FIN` out from its poll loop after the socket is
+marked closing (`shutdown(2)` did call `close()`; the last close did not). A
+closing socket is now marked and parked in `Stack::teardown` - bounded, because a
+peer that stops answering may cost a slot but not the set - and `reap_teardown`
+frees it after the poll that carries its last segment, so the descriptor is gone
+when the caller asks and the wire still gets its four packets. `t-tcp-close` + a
+host-side listener through slirp (`10.0.2.2:4599` → host `127.0.0.1:4599`) shows
+the peer receiving the bytes *and* end-of-stream instead of sitting until it
+gives up.
+
+That producer went missing once, with the consumer, the bounded list and this
+paragraph all still in place - `TEARDOWN_MAX` sitting unread was the only clue,
+and a suite that passes says nothing, because `t-tcp-close` reports `skip:` and
+passes whenever no host listener is up. Re-measured with the listener running:
+both of its connections (the orderly close and the `SO_LINGER{on,0}` one) reach
+`GOT-FIN`. The lesson is that the probe is only an instrument when somebody
+holds it: run it with the listener up before believing this section.
+
+`SO_LINGER{l_onoff=1, l_linger=0}` - "reset, discard unread" - is the one close
+shape this stack still cannot do, and it is left orderly on purpose rather than
+faked: smoltcp 0.13's `abort()` only moves the socket to `Closed` and transmits
+nothing (its resets are reply-driven, emitted when a packet *arrives* for a
+closed socket), so calling it would make the close *silent*, which is worse than
+the `FIN` the peer gets now. Honouring it needs an actual reset on egress.
+
+*Remaining after those:* `SO_REUSEADDR` applied at `bind`/`listen` (a TIME_WAIT
+rebind allowance, which needs the listening side to exist first), `SO_KEEPALIVE`
+probe packets, and a reset on egress for `SO_LINGER{on, 0}`. `SO_RCVBUF`/`SO_SNDBUF` cannot be honoured per
+socket as things stand: smoltcp sizes its buffers when the socket set is built,
+so a real answer needs either a set rebuilt per requested size or a limit applied
+in the mpos read/write queue - and until one of those exists the options should
+say so rather than round-trip a number that changes nothing.
 
 ### 4.4 Netlink Write Operations — **DONE**
 
@@ -530,6 +673,44 @@ Used by debuggers and checkpoint/restore tools.
 ## Phase 6: Process Management Enhancements (Low-Medium Priority)
 
 ### 6.1 ptrace (Debugger Support) — **DONE**
+
+`PTRACE_DETACH` used to return 0 and leave the tracee stopped. The cause was not
+the stop it was in but the one it had not reached: `PTRACE_ATTACH` injects a
+`SIGSTOP`, and while the tracee is still inside its current syscall that signal
+is merely *pending*. A detach that only ends an in-progress stop therefore hands
+back a process which stops itself on the way out of that syscall - with no tracer
+left, and nothing on the machine but a `SIGCONT` that could end it. The test
+demonstrated it by hanging the machine for ten minutes with every earlier check
+printing `ok:`, until a bounded `WNOHANG` poll replaced the blocking `waitpid`.
+
+The three cases are Linux's, and were measured against it before being matched
+(`t-ptrace-attach` pins all three):
+
+| Sequence | Linux | Now |
+|---|---|---|
+| `attach`, `detach(0)`, never `wait`ing | target runs on | the pending stop signal is dropped by the detach |
+| `attach`, report the stop, `detach(0)` | target runs on | the stop parked with `delivering` set is ended |
+| `kill -STOP`, `attach`, `detach(0)` - or `detach(SIGCONT)` | stays stopped | the stop is left alone, and no wake is sent |
+
+The third row is the one that decides the shape of the code: the signal a detach
+injects goes to the *tracee*, not to its stop, so naming `SIGCONT` does not end a
+group stop the user asked for - and a `wait` on that child stays empty. Which is
+also why the wake is now conditional everywhere: a task parked in a group stop is
+held there by the scheduler's sleep, so a detach that woke it would release the
+very stop it had just decided to leave. The companion rule is in the signal
+sender - a stop signal arriving for a task already in a group stop has nothing to
+say to it, and must not wake it either.
+
+Dropping the `SIGSTOP` *pending* bit in the third case is not an invention: after
+`kill -STOP` + attach + `detach(0)`, one outside `kill -CONT` returns Linux's
+process to running rather than re-stopping it, which is only possible if the
+attach's own signal did not outlive the detach.
+
+What is *not* modelled: Linux reports a `PTRACE_EVENT_STOP` to a tracer that
+attaches to an already-stopped task, so that the tracer's first `wait` returns
+before anything is detached. Here that stop stays the parent's news, which is why
+the test attaches without waiting - the same thing `strace -p` on a suspended job
+would see.
 
 `handle_ptrace` (proc.rs) implements the debugger set: `TRACEME`, `ATTACH`,
 `DETACH`, `CONT`, `SYSCALL`, `SINGLESTEP`, `KILL`, `INTERRUPT`,
@@ -648,8 +829,107 @@ dispatcher in `fs.rs`). Nodes live at `/dev/input/eventN` (major 13, minor
 `/sys/class/input/eventN/{dev,uevent}` - so udev/`libinput` enumerate them the
 way Linux's do. Keyboard events also feed the console line discipline as before.
 The QEMU machine attaches `virtio-keyboard-pci` **and** `virtio-tablet-pci` (a
-pointer). v1: readiness is polled at tick granularity (no interrupt wake) and
-the grab is recorded, not arbitrated per owner.
+pointer). A reader - blocking, `select`, or an `epoll` interest - is woken by
+the service task the moment a record lands, and a grab is arbitrated per open
+file description: `EBUSY` to a second claimant, released when the claimant's
+descriptor closes.
+
+**Who a record belongs to** is Linux's other half, and it is done. While the
+grab is held, a reader that is not the grabber is told nothing - neither the
+records, nor a readable answer from `poll` - and two readers of an *ungrabbed*
+node each see every event, which the single shared queue could not do either
+(whoever read first consumed it for everybody).
+
+The device keeps one *window* of records and gives every client a *position* in
+it (`src/evdev.rs`) instead of handing each client a buffer of its own the way
+Linux does: the same picture with the copying shared. A position is a sequence
+number in the device's record stream rather than an index into the window, so
+the window dropping its oldest record - the bound that keeps an unread device
+from pinning memory forever - moves the floor under a client instead of shifting
+what it has not read, and a client that fell further behind than the window is
+long resumes at the oldest record still held: the accounting Linux does with
+`SYN_DROPPED`. A client is an open file description (`File::ofd`), the same key
+the grab and `flock` already arbitrate by; its position is taken when the
+description opens the node and forgotten when the description's last descriptor
+closes, so an address that is reused cannot inherit a reader's place. While the
+grab is held the non-owners' positions are lifted past the records that were the
+grabber's, so a release hands the window to nobody - the records the grabber did
+not read are still its own.
+
+The policy sits in `src/evdev.rs` rather than in the driver, because the driver
+is bare metal and the policy is arithmetic: nine host tests pin it (two readers
+each see every record; a client that appears late does not read the backlog; a
+grab keeps the records from every other reader; a release does not hand the
+window over; a position below the window resumes at the floor; only the clients
+a record is *for* are woken - so a non-owner is not woken to find nothing; a
+short buffer is `EINVAL`; a forgotten client starts at the end of the window;
+the clientless read is not the grabber). What `t-evdev` adds on the machine is
+the *shape* of the rule, because the host sends no keystrokes during a run:
+`poll` on a non-owner is never ready while the grab is held, the owner's own
+answer is unchanged by its grab, and - when a record was queued, which the test
+reports rather than assumes - draining one reader leaves the other's copy
+intact. That last one is the assertion a shared queue fails, so a run with a
+record to work with does discriminate; a run without one says so in its own
+output. A *blocking* read by a non-owner of a grabbed device is the one case
+that cannot be asserted from inside the guest without a keystroke, and the
+`readable`/`take` pair in the unit tests covers it.
+
+One divergence, recorded rather than papered over: `read_at` with no client - a
+kernel reader that never named a description, which is the VFS's own `read_file`
+and a `splice` source - reads as a client of its own, keyed 0, an address no
+description can have. `read`/`readv`/`pread` all arrive through `File::read` and
+so carry the real description; the clientless reader sees only what arrives after
+it first reads, and someone else's grab excludes it, which is what Linux's
+`pread` on a grabbed device from a non-owner means.
+
+**The self-test's hands: `/dev/uinput`.** Everything above could be pinned on
+the machine except one thing - a rule about *whose* event a record is needs a
+record, and the self-test host sends no keystrokes. `src/uinput.rs` (the
+interface's arithmetic) and `src/drivers/uinput.rs` (the device) close that. A
+program opens `/dev/uinput`, declares what its device can report
+(`UI_SET_EVBIT`, `UI_SET_KEYBIT` and the rest of the family), names it
+(`UI_DEV_SETUP`), and asks for it to exist (`UI_DEV_CREATE`) - at which point it
+appears as the next free `/dev/input/eventN` with the ordinary evdev face, and
+every whole `struct input_event` written to the descriptor is what that device
+reports. `UI_DEV_DESTROY`, closing the descriptor, or the process exiting takes
+it away again, node and all: the descriptor *is* the device, so a `dup` is one
+device and a second `open` is another. The arithmetic - which request means which
+bit, what a write has to be shaped like, how `struct uinput_setup` is laid out -
+is ungated and has six host tests of its own; the device is bare metal, like the
+driver it feeds.
+
+`t-evdev` now makes a device, finds it by the name it gave it, and pins the rule
+with records it reported itself: both readers see the frame; draining one leaves
+the other its copy - the assertion a shared queue fails; while the grab is held
+the owner is readable and the non-owner is not, and the owner reads its own
+event; a release hands nothing over; the next record is the other reader's
+again; and destroying the device takes the node out of `/dev/input` and ends the
+stream for a descriptor still holding it. None of it depends on the host, so it
+runs on every sweep.
+
+What a uinput device does *not* get, recorded because it is the shape of the
+thing and not a defect: a `/sys/class/input/eventN` tree - `sysfs` builds its own
+tree once at boot and has no runtime registration - so `udev`/`libinput` will
+not classify a device made this way. That is enough for the conformance suite,
+which opens the node directly, and not enough for a compositor; it is a `sysfs`
+job rather than an input one. `UI_ABS_SETUP` and force feedback are not
+implemented either: a synthetic device has no axes and answers `EVIOCGABS`
+`EINVAL`, which is the honest answer for one whose geometry nobody described.
+
+Writing the test found an ABI defect that had been there since the ioctls were
+added, and this work fixed it: `EVIOCGNAME` answered with the length *including*
+the terminating NUL, and a virtio device's name kept the config's own terminator
+*inside* the string - so a caller that used the answer as a length counted a byte
+that is not part of the name (a 20-character keyboard name came back as 22).
+Linux's answer is `strlcpy`'s: the name is what stands before its first NUL, a
+size of zero is the length query (answered without copying), and the answer is
+that length *excluding* the terminator even when the copy had to be cut short,
+which is how a caller with a small buffer learns the name did not fit. The
+standalone arm that served sizes whose low byte is zero - the 256-byte buffer
+`libevdev` passes - answered differently from the family handler, so it is gone
+and one branch answers for every size. `t-evdev` pins the rule without
+hardcoding any host's name: the answer must equal the position of the first NUL
+in the buffer it wrote.
 
 ### 7.3 AHCI/SATA (stretch)
 
@@ -663,13 +943,105 @@ the grab is recorded, not arbitrated per owner.
 
 ## Phase 8: Security Hardening (Low Priority)
 
-### 8.1 ASLR (Address Space Layout Randomization)
+### 8.0 A userspace process could panic the kernel — **fixed: a file is not one buffer**
 
-**Changes**:
-- Randomize mmap base address per process (currently fixed)
-- Randomize stack base address
-- PIE support already exists (`ET_DYN` ELF) — just randomize load address
-- Use `rand::next_u64()` for randomization seed
+`dd if=/dev/zero of=/tmp/x bs=1M count=700` used to end in a kernel panic and
+QEMU exit `35`. The cause is now read off the machine's own report rather than
+inferred, and it was neither of the two things first written here:
+
+    KERNEL PANIC: memory allocation of 134217728 bytes failed
+      last 8 syscalls: nr 1 (write) ...
+
+Not ramfs being unbounded, and not the ext4 block cache (fixed at 512 preallocated
+slots). It was a **ramfs file's own storage**: one `Vec<u8>`, so growing a file
+means a `realloc` for one *contiguous* run - doubling to 128 MiB - which is not a
+shortage of memory but an order the buddy allocator never serves. The machine died
+with bytes still in hand.
+
+**Fixed** by the shape Linux uses: `Chunked`, a file as a list of 64 KiB chunks,
+so growth allocates 64 KiB at a time however large the file gets
+(`vfs/ramfs.rs`, `a_file_is_chunks_and_not_one_contiguous_run`). The invariant the
+first version got wrong is worth stating because nothing else on the page says it:
+**every chunk but the last is whole**, because a chunk that stops being last has
+bytes after it now - a 5-byte interior chunk makes `len()` lie about everything
+that follows, which three existing file tests caught at once.
+
+Also landed, as the tmpfs behaviour this kernel genuinely lacked: a per-mount byte
+budget, charged *before* allocating and answered with `ENOSPC`
+(`Usage`, `a_full_mount_answers_enospc_instead_of_growing`), with room returned on
+truncate-down and on the last reference dropping rather than on `unlink` - a
+deleted-but-open file still occupies its bytes. The budget guard checks what the
+machine could actually hand over: free frames **plus the heap's own cached
+bytes**, since the heap keeps what it has taken and `free` never rises again.
+
+`t-fill-ramfs` covers the end-to-end property (refused, not dead) and one
+non-obvious trap it found: `ftruncate(0)` leaves the descriptor's offset where it
+was, so the next write asks for a hundreds-of-megabytes hole and is refused
+*correctly* - a test that forgets to `lseek` back measures the kernel's manners,
+not its memory.
+
+**Still open, and it is the rest of the original item**: the global allocator's
+failure path is still `panic!`, so any *other* unbounded user-driven growth - the
+page tables of a process that maps too much, a `Vec` in another filesystem path -
+still ends the machine. The remaining work is step 2 and 3 of the old plan: make
+user-facing allocation fallible end to end (`ENOMEM` out of the syscall, not a
+panic) and give a process that runs the memory out something to lose besides the
+kernel.
+
+### 8.1 ASLR — **DONE** (four landmarks; `ET_EXEC`'s own address deliberately not one of them)
+
+Measured on Linux before writing any of it, over 64 runs of the same program
+each time: a position-independent binary's code base, its heap anchor and its
+`mmap` page all move by amounts of the order of a tebibyte, and a process's
+stack top moves too. The same program linked `-no-pie` kept its code address at
+`0x401156` in every single run while its stack and its `mmap` page went on
+moving. That last row is the shape of this feature: **a fixed-address image must
+not be moved**, because the absolute addresses its own instructions carry were
+chosen at link time, and "randomising" it produces a program that cannot start
+rather than one that is hard to attack.
+
+What is drawn per `exec`, in `Layout` (`src/sched/runtime.rs`):
+
+| Landmark | Range | Notes |
+|---|---|---|
+| `ET_DYN` image load bias | a tebibyte's worth, page-aligned | `map_image` places every segment at `bias + vaddr`, and `AT_PHDR`/`AT_ENTRY`/`brk` are the *placed* addresses |
+| The interpreter's base | the same, stacked below `mmap` | This is `libc` on this userland - a fixed base here is a supply of return addresses identical in every process |
+| Stack top | 8 MiB | Linux bounds this by memory and rlimit, so the number is not portable; 8 MiB is what keeps the whole region clear of the image below |
+| The `mmap` region's start | a tebibyte's worth | `mmap_cursor` starts here and grows down as before |
+
+The regions are **stacked rather than drawn independently** - `mmap`'s start,
+then the interpreter below it, then the image below that, with a fresh draw
+between each pair - so no draw can land one region on top of another, and the
+top of a placed image is always below `MMAP_BASE`, which is what keeps a bias
+from walking a program's pages up into the kernel half. `fork` draws nothing: a
+child that inherited its parent's pages at addresses of its own had would not
+have inherited its parent's pages.
+
+Relocation had to be settled to get here, and the answer is Linux's: **the
+kernel relocates only an image that has no interpreter.** A dynamic one is
+relocated by that interpreter, which finds the program's load address from
+`AT_PHDR` - so a kernel that also applied the table would add the load bias to
+every pointer twice. That pass used to run for both kinds, which was invisible
+only while the bias was always zero, because writing `addend` twice and writing
+`addend + 0` twice land in the same place.
+
+`t-aslr` pins the parts a running program can see: it forks, `execve`s *itself*
+in a reporting mode, and compares what two fresh runs say about themselves - the
+stack and the `mmap` page differ, the code address and the heap anchor do not.
+Self-exec is why it can do that without a shell, a fixture, or a runner that
+passes arguments it does not pass to anything else. What it cannot cover is the
+load bias, because every program in that initramfs is `ET_EXEC` and none of them
+has an address the kernel is allowed to choose; that half is covered by the
+desktop image, where every binary is a dynamic `ET_DYN` and a bias applied to
+the mappings but not to `AT_PHDR` means the machine never reaches a login
+prompt.
+
+**Not done, and each one is a decision rather than an oversight**: no `vdso`
+(there is none to move); the stack's range is our bound, not Linux's
+memory-sized one; and the draws are 28 bits of page granularity where Linux
+gives an `ET_DYN` base rather more. Adding `listen`/`accept`-shaped inbound TCP
+(§4.3) and a `MAP_FIXED`-free `mmap` hole review would both want this layout
+re-examined, which is worth knowing before either is attempted.
 
 ### 8.2 seccomp
 
@@ -760,80 +1132,335 @@ subsystem below names the same shape of fix: make the event end the wait.
 - Measured by `t-netlat` (20 ICMP echo rounds to 127.0.0.1): 7.5 ms → 0.3 ms
   average, 74 µs floor - the remainder is slirp's own path through the host.
 
-### 10.2 Context-Switch and Fork Cost — planned
+### 10.2 Context-Switch and Fork Cost — **PARTIAL** (three of four landed, measured)
 
-**Why**: every task switch saves and restores 512 B of FPU state
-(`fxsave`/`fxrstor` unconditionally), rewrites CR3 with a full TLB flush (no
-PCID, no global pages), and `fork` walks the entire address space to mark
-pages COW with two PTE writes per page. A busybox fork+exec pays all three.
+**Why**: every task switch saved and restored 512 B of FPU state
+(`fxsave`/`fxrstor` unconditionally), rewrote CR3 with a full TLB flush, and
+`fork` walked the entire address space to mark pages COW with a flush after
+every page. A busybox fork+exec paid all three.
 
-| Change | Where |
-|---|---|
-| Enable PCID (`CR4.PCIDE`), keep per-process TLB entries across switches | `arch/x86_64/paging.rs` |
-| Save FPU state lazily: set TS, save on first `#NM`, restore on switch in | `arch/x86_64/context.rs` |
-| One TLB flush per fork instead of per-page `protect` calls | `sched/runtime.rs` |
-| Kernel stacks smaller than the fixed 64 KiB per task | `sched/runtime.rs` |
+| Change | Where | State |
+|---|---|---|
+| Save FPU state lazily: `CR0.TS` on the task entered, its `#NM` restores it | `arch/x86_64/context.rs`, `idt.rs`, `sched/runtime.rs` | **done** |
+| One TLB flush per fork instead of per-page `protect` calls | `sched/runtime.rs`, `arch/x86_64/paging.rs` | **done** |
+| Kernel stacks smaller than the fixed 64 KiB per task | `sched/runtime.rs` | **done** |
+| Enable PCID (`CR4.PCIDE`), keep per-process TLB entries across switches | `arch/x86_64/paging.rs` | **not done** — the argument is below |
 
-### 10.3 Syscall Path — planned
+**The lazy FPU.** `mpos_context_switch` no longer touches the 512 bytes of
+`FpuState` at the head of each `Context`; it sets `CR0.TS` on the task it
+enters, and that task's first floating-point instruction traps into the `#NM`
+handler, which clears the bit and loads the image. The saving half stays eager
+and moved into Rust (`Table::hand_over_fpu`), because that is the last moment
+at which the outgoing task's registers are uncontroversially its own. A task's
+`fpu_live` flag says whether the hardware holds its state, so the FPU is written
+out only when it was actually used: a program that never executes a vector
+instruction - which is most of this image, and all of a shell's `fork`+`exec` -
+pays one `mov cr0` per switch and nothing else. `fork`/`clone` read the
+creator's image through `Table::inherit_fpu` (registers when live, its saved
+block when not) and `execve` claims the registers before `fninit`, because a
+task that never used the FPU is running with `TS` set. The property the whole
+scheme rests on - that the register file belongs to a task and not to the CPU -
+was already pinned by `t-fpu-across-switch`, which stores two distinguishable
+bit patterns to `xmm7` across a `sched_yield`; it passes unchanged, and it
+exercises the deferred restore on both sides.
 
-**Why**: every syscall pays a scan of all 64 task slots for itimers whether
-any is armed, and every user-buffer operation walks four page-table levels
-per page to validate it. Both are fixed costs on the hottest path in the
-kernel.
+**The fork flush.** `parent_space.protect(..) + set_cow_bit(..)` per page became
+`set_cow_bit_quietly(..)` per page and one `flush_if_active()` after the loop.
+What that removes is 16384 CR3 writes for a parent with 8192 pages, and the
+per-page `update_flags` round trip that re-derived the PTE's flags from the
+walk's own report - the quiet form sets the COW bit and clears `WRITE` in one
+write and leaves the rest of the entry alone, which also stops the fork from
+dropping `ACCESSED`/`DIRTY` on the parent's pages.
 
-| Change | Where |
-|---|---|
-| A global "any itimer armed" flag; `check_itimers` skips the scan when clear | `sched/runtime.rs`, `syscall/mod.rs` |
-| Validate user buffers with the copy itself (fault handler catches `EFAULT`) instead of a pre-walk | `arch/x86_64/paging.rs`, `syscall/mod.rs` |
+**What the machine says.** `t-forkcost` (new, and in the suite) runs the *same*
+fork/exit/wait loop twice: once with a 32 MiB arena mapped in the parent, and
+once after `munmap` has given it back. The second parent has a few pages of
+address space instead of 8192, so anything that scales with the mapping shrinks
+by three orders of magnitude.
 
-### 10.4 Pipes and Per-Frame Allocations — planned
+| 220 cycles, 200 timed | `fork` | `wait4` |
+|---|---|---|
+| 32 MiB parent, per-page flush (the old shape) | 349.0 µs | 7650.8 µs |
+| 32 MiB parent, one flush (this change) | 350.9 µs | 7648.9 µs |
+| no arena at all, one flush | **17.0 µs** | 7982.8 µs |
 
-**Why**: pipe reads and writes move bytes one at a time through a `VecDeque`
+Three things fall out of that, and the first two are corrections to what this
+section said before the measurement existed.
+
+**The fork flush change is not measurable, and the reason is not subtle.** Sixteen
+thousand CR3 writes moved the fork by 0.5% - inside the noise - because a CR3
+write is not a TLB flush on this machine: QEMU runs with `-accel kvm`, the
+guest's translations are tagged (`VPID`), and loading a CR3 is a tag switch
+rather than an invalidation. The change is kept because it is strictly less work
+and the smaller of the two shapes, but nobody should read a speedup into it.
+
+**The cost of a `fork` is the mapping, and the cost of the `wait4` after it is
+not.** Taking the arena away cuts the fork from 351 µs to 17 µs - twenty-one
+times - and leaves the `wait4` where it was, at *eight milliseconds either way*.
+An earlier draft of this section read the second row as the child's exit and its
+8192 frame references coming home (`release_user_frames`), and the third row
+refutes it: a parent reaping a child that owned nothing pays exactly the same
+8 ms. The frame release is not the cost.
+
+**What 8 ms is, and why it matters more than anything in this section.** It is
+two ticks of this build's 250 Hz clock, and it shows up in the two places a task
+can park: the `wait4` above, and the pipe handover in §10.4, where a 64 KiB
+transfer costs 8.0 ms for the same reason. Both are the disease §10.1 cured for
+sockets - a blocking wait that ends on the scheduler's tick rather than on the
+event that satisfies it (see §10.4, where the same 16 MiB moves at 7 MiB/s
+behind a task boundary and 2611 MiB/s without one). It is a fixed latency on
+every blocking call in the system rather than a cost proportional to any work,
+which is why it is worth more than the flush, the marking, and the frame pool
+put together. `t-forkcost`'s two-phase shape is the instrument for it: a change
+that ends a wait on its event will move the top row's `wait4` and the bottom
+row's together.
+
+**Why PCID is not done, and it is a decision rather than an oversight.** Three
+things have to be true before `CR4.PCIDE` pays for itself, and only the first is
+straightforward. (1) Each address space needs a stable PCID and a way to
+invalidate a *recycled* one - manageable, with 4096 of them and 64 task slots.
+(2) The kernel half must be mapped `GLOBAL`, or every process carries its own
+copy of the kernel's translations in the TLB: the `G` bit is only honoured on
+the entry that maps a page, so making the kernel half global means setting it on
+the bootloader's huge-page leaves, and `page_flags` deliberately leaves it off
+today for exactly this reason. Without it, a PCID switch trades one flush for a
+per-address-space replication of the kernel's working set. (3) Every existing
+CR3 write has to be re-audited for *which* PCIDs it must invalidate: with
+`PCIDE` on, `activate(root)` invalidates the PCID written and leaves the others
+alone, so `map_mmio` and the kernel-half table walks - which is where a write
+adds a mapping every address space must see - would leave stale entries in every
+*other* PCID, which is a wrong translation rather than a slow one. On top of
+that, the workload here is `fork`+`exec`, and every `exec` builds a fresh
+`AddressSpace` with a fresh PCID, so the reuse PCID is paid for is rare by
+construction: the win would be the parent's entries surviving a child's
+lifetime, which the table above suggests is not where the time goes anyway.
+Recorded rather than attempted, so the next person starts from the audit list
+rather than from the idea.
+
+### 10.3 Syscall Path — **PARTIAL** (the cheap half landed)
+
+**Why**: every scheduler turn and every clock tick scanned all 64 task slots
+for an armed interval timer whether any process had armed one, and every
+user-buffer operation walked four page-table levels per page.
+
+| Change | Where | State |
+|---|---|---|
+| A global "any itimer armed" flag; `check_itimers` skips the scan when clear | `sched/runtime.rs` | **done** |
+| Validate user buffers with the copy itself (fault handler catches `EFAULT`) | `arch/x86_64/paging.rs`, `syscall/mod.rs` | **not done** — the argument is below |
+
+**The itimer flag.** `ITIMER_ARMED` is set by `itimer_swap` - which is the only
+place a timer is ever armed, because no task inherits one and `exec` clears them
+- and recomputed *by the scan itself* when it runs. That ordering is the point:
+a task that exits while armed disarms a timer without going through
+`itimer_swap`, so a flag that was only ever "set on arm" would stay set for the
+rest of the boot and quietly restore the full scan. Recomputing costs one extra
+scan after the last timer goes away and makes the flag wrong only in the
+direction of running the scan - never in the direction of skipping a timer that
+is due. Only `ITIMER_REAL` is tracked, because it is the only one that is a
+wall-clock deadline the scheduler has to honour.
+
+**Why the fault-driven copy is not here.** The plan's premise does not survive
+reading the code. There is no pre-walk separate from the copy: `read_user` and
+`write_user` translate one page at a time *as they copy*, through the direct
+map, and a read is therefore one walk per page, not two. Only the write
+direction walks twice, and the second walk is the copy-on-write probe
+(`is_cow_page` before `translate`) - which is a handful of loads against the
+page-table entries the walk just touched, next to a `memcpy` of the same page.
+Deferring all of it to the CPU's own address translation would mean the kernel
+dereferencing a user pointer, and then a `#PF` taken in **ring 0** on a bad
+pointer has to become `EFAULT` rather than a panic: that needs an
+exception-table/fixup mechanism (identify the faulting RIP as inside the copy
+routine, redirect the trap frame to a landing pad, resume), and getting the RIP
+range check wrong turns a real kernel bug into a silent `EFAULT`. The safe shape
+is kept: the kernel never dereferences a user pointer, so a bad one cannot fault
+at all. What is left as a possible future is the one-walk dedup of the write
+path, which is a strict reduction in work with no measurable claim attached.
+
+### 10.4 Pipes and Per-Frame Allocations — **PARTIAL** (two of three, measured)
+
+**Why**: pipe reads and writes moved bytes one at a time through a `VecDeque`
 (`pop_front`/`extend(iter().copied())`), and the network path allocates and
-frees a fresh `Vec` per frame in each direction (TX build, RX copy, raw
-recv's 1500-byte temporary).
+frees a fresh `Vec` per frame in each direction.
+
+| Change | Where | State |
+|---|---|---|
+| A ring buffer with slice copies for pipe data | `vfs/pipe.rs` | **done** |
+| The raw receive temporary sized from the actual datagram, or on the stack | `net/socket.rs` | **done** |
+| A pool of frame buffers behind the smoltcp device seam | `net/mod.rs` | not done |
+
+**The pipe.** `PipeState::data` is now a [`Ring`] over a `Vec` whose live bytes
+are `bytes[start..]`: storage taken lazily, reclaimed when the reader catches the
+writer, and the dead prefix dropped with one `drain` on the pass where the
+arrival would otherwise pass `CAPACITY`. A read is one slice copy and a write is
+one `extend_from_slice`, where the old shape was 8192 deque operations for a
+`PIPE_BUF` round trip. `t-pipecost` (new, and in the suite) measures it in two
+phases, because the two turn out to answer different questions:
+
+| 16 MiB through one pipe | before | after |
+|---|---|---|
+| one process, 4096-byte units (data path only) | 61.7 ms - 259 MiB/s | 6.1 ms - **2611 MiB/s** |
+| two processes, 64 KiB chunks (a pipeline) | 2047.5 ms - 7 MiB/s | 2047.4 ms - 7 MiB/s |
+
+The first row is the change: ten times the throughput, which is what two slice
+copies per 4096 bytes instead of 8192 deque operations buys.
+
+**The second row is the finding, and it is bigger than the change.** A
+two-process transfer did not move at all - 2047.5 ms to 2047.4 ms - and the
+arithmetic says why: 2047 ms over 256 chunks is **8.0 ms per 64 KiB handover**,
+which is exactly two of the 4 ms ticks this build runs at (250 Hz). The bytes
+are not the cost; the *handover* is, and it is the same disease §10.1 cured for
+sockets - a blocking wait that ends on the scheduler's tick rather than on the
+event that satisfies it. It also puts the two rows side by side in the most
+useful way possible: the same 16 MiB, through the same pipe, at 7 MiB/s when it
+has to cross a task boundary and 2611 MiB/s when it does not. Whatever fixes the
+handover is worth a factor of three hundred here, and nothing else in this
+section is worth a factor of ten. `t-pipecost` is the instrument for it, and it
+is deliberately in the suite so the fix has a number waiting for it.
+
+**The raw receive.** `raw_recv` filled a fresh `alloc::vec![0u8; 1500]` and then
+copied it into the caller's buffer. It now receives straight into `out`: no
+allocation, no second pass over a full MTU, and the "packet larger than the
+caller's buffer" case is `recv_slice`'s own `Truncated` - the same `EMSGSIZE`,
+detected before anything has been allocated for it. Behaviourally identical for
+every packet the MTU admits, which is all the old 1500-byte temporary could
+hold either.
+
+**Not done: the frame pool.** The three allocations the plan names for the
+network path are the TX build, the RX copy and the raw temporary; the raw one is
+gone, and the other two want a pool behind the smoltcp device seam that hands
+buffers back rather than freeing them. That is a change to the seam itself
+rather than to a call site, and it wants the same treatment as the two above: an
+instrument first - a datagram-per-second count with and without the pool - so
+that it is landed with a number rather than with a diff.
+
+### 10.5 Filesystem and Block Read Path — **PARTIAL** (the verifiable one landed)
+
+**Why**: ext4's cache was a 512-slot direct-mapped array that thrashes on large
+working sets, path resolution reads a directory block per component on a miss,
+and each 4 KiB write leaves for the device as eight 512-byte synchronous
+requests. Write-through stays: crash visibility is a deliberate semantic, and
+only the read side is being tuned.
+
+| Change | Where | State |
+|---|---|---|
+| Set-associative cache with victim selection | `vfs/ext4/cache.rs` | **done** |
+| Sequential readahead past the block being asked for | `vfs/ext4/` | not done |
+| virtio-blk interrupt-driven completions and multi-request pipelining | `drivers/virtio/blk.rs` | not done |
+
+**The cache.** Four-way set-associative, least-recently-used within a set, over
+fast-lazily-allocated slots - and the set count kept at the 512 that the original
+`ls` measurement justified, so the change is *only* about collision and not about
+size. A block's set is `block % CACHE_SETS`; an empty way takes it first, and
+otherwise the way whose block was asked for longest ago, dated on every access
+including hits (dating only misses would make the policy "first loaded" rather
+than "least recently used"). Slots no longer allocate their 4 KiB buffer at mount
+- a slot takes its buffer the first time it holds a block - which is what makes
+`CACHE_SLOTS` 2048 total slots (8 MiB, if a filesystem ever touches all of them)
+affordable, and which also removes a fixed 2 MiB per mount that used to be paid
+whether or not anything was read.
+
+The instrument is a host unit test, not a clock, because a cache's quality is a
+*count*: a mock `BlockDev` that counts reads per block and answers with a pattern
+derived from the block number, so a slot handed back for the wrong block fails as
+content rather than as slowness. The numbers are the same on every machine and
+under TCG or KVM, which is why they are worth writing down:
+
+| Trace | direct-mapped (before) | 4-way LRU (after) |
+|---|---|---|
+| four blocks a set-count apart, accessed round-robin, 4096 accesses | **4096 reads** (0% hits) | **4 reads** |
+| a 2048-block sequential scan | 2048 reads | 2048 reads |
+| one hot block read between 2048 scan blocks | <=5 reads of it | <=5 reads of it |
+
+The first row is why the ways are there: a working set of four blocks that share
+a set - four groups' inode tables, say - made a direct-mapped cache *not a
+cache*, with every access evicting what the next one wanted. The second and third
+rows are the traces that must not regress, and the second is also the honest
+limit of this change: a sequential scan has no reuse in it, so no cache can help
+it, and the two runs read the same 2048 blocks either way. 63 ext4 host tests
+cover the driver through the new cache, including a byte-for-byte read of a large
+file and a mount of an image the host's `mke2fs` made.
+
+**Why the other two are not done, and it is one reason between them.** They
+cannot be measured, and they are each other's prerequisite. `BlockDev::read_at`
+is capped at one 4 KiB page per call by its own contract - "drivers bounce through
+a single page-sized, physically contiguous buffer" - so readahead cannot ask the
+device for fewer, larger reads; it can only issue the same reads earlier, and
+this kernel's block driver is synchronous and polled, so "earlier" overlaps
+nothing. Readahead becomes worth having exactly when item 3 gives the device
+asynchronous completions it can be pipelined behind, and until then it is a
+prefetch into a cache that the reader is about to miss anyway.
+
+The measurement gap is the real prerequisite, and it is worth stating plainly:
+the test machine boots the conformance suite *without a disk*, so no `t-*` program
+exercises the block driver or the ext4 read path at all - the numbers above exist
+only because the cache policy is pure enough to drive from a host test. Either
+item would be landed blind. What both want first is a disk-backed test path: an
+ext4 image attached to the test machine plus a program that reads a large file
+from it and reports throughput, which is a `xtask` selftest change and a new
+`t-*` - and which would give readahead and pipelining the same kind of instrument
+`t-pipecost` gave the pipe. Recorded as the prerequisite rather than skipped.
+
+### 10.6 Serial Output — **DONE**
+
+**Why it mattered**: UART transmit used to be polled with the console lock held;
+on real hardware a 60-byte line costs ~5 ms of machine-wide stall (QEMU's
+emulated 16550 never blocks, which is why it does not show here). The kernel's
+own hot paths log nothing, so this only bit on the day they did - which is what
+a `bat` over a minified stylesheet turned into a machine that looked dead.
 
 | Change | Where |
 |---|---|
-| Slice copies (`extend_from_slice`) or a ring buffer for pipe data | `vfs/pipe.rs` |
-| A pool of frame buffers behind the smoltcp device seam | `net/mod.rs` |
-| The raw receive temporary sized from the actual datagram, or on the stack | `net/socket.rs` |
-
-### 10.5 Filesystem and Block Read Path — planned
-
-**Why**: ext4's cache is a 512-slot direct-mapped array that thrashes on
-large working sets, path resolution reads a directory block per component on
-a miss, and each 4 KiB write leaves for the device as eight 512-byte
-synchronous requests. Write-through stays: crash visibility is a deliberate
-semantic, and only the read side is being tuned.
-
-| Change | Where |
-|---|---|
-| Sequential readahead past the block being asked for | `vfs/ext4/` |
-| Set-associative cache with victim selection | `vfs/ext4/cache.rs` |
-| virtio-blk interrupt-driven completions and multi-request pipelining (the MSI-X ground is laid in 10.1) | `drivers/virtio/blk.rs` |
-
-### 10.6 Serial Output — planned
-
-**Why**: UART transmit is polled with the console lock held; on real
-hardware a 60-byte line costs ~5 ms of machine-wide stall (QEMU's emulated
-16550 never blocks, which is why it does not show here). The kernel's own
-hot paths log nothing - this matters the day they do.
-
-| Change | Where |
-|---|---|
-| A transmit ring drained by the TX-held interrupt; `write` only enqueues | `drivers/serial.rs`, `arch/x86_64/idt.rs` |
+| A transmit ring drained by the TX-held interrupt; `write` only enqueues and parks on a full ring, re-arming before *every* park so a write larger than one drain burst cannot sleep unannounced | `drivers/serial.rs`, `console.rs` |
+| The framebuffer console's serial **mirror** is best-effort: it hands bytes to the ring and returns, so a host terminal that cannot keep up drops bytes rather than throttling the window or the console mux | `console.rs` (`serial_mirror_now`) |
 
 ### 10.7 Sub-Tick Sleeps — planned
+
+**Two measurements now say the gap is wider than "sleeps round to ticks".** A
+task that is *woken* - not sleeping on a deadline, but parked in `block_until`
+and made runnable by an event - does not resume for what looks like two ticks,
+and it does so on two paths that were not in this section's list:
+
+| measured | figure | instrument |
+|---|---|---|
+| `wait4` reaping a child, whatever that child owned | ~8.0 ms, unchanged when the child's 32 MiB address space is taken away | `t-forkcost` (§10.2) |
+| a 64 KiB pipe handover between two processes | 8.0 ms per chunk, 7 MiB/s, while the same bytes move at 2611 MiB/s without a task boundary | `t-pipecost` (§10.4) |
+
+Both are 8.0 ms at a 4 ms tick, and neither scales with any work the call does,
+which is why they are worth more than anything else in this family: they are a
+floor on every blocking syscall's round trip. The *mechanism is not identified* -
+`Scheduler::wake` does push the task straight into the ready queue and
+`Table::next_turn` does pick from it, so the two ticks are not obvious from the
+code - and that is exactly why the two instruments are in the suite: whatever
+fixes it has a number waiting, and a fix that explains it should be able to say
+which of the two ticks it removed.
 
 **Why**: the tick is the smallest unit a sleep can name (4 ms at 250 Hz).
 Event-driven waits ended the network's dependence on it; the remaining
 callers - `nanosleep`, timerfd, TCP retransmit pacing - still round to whole
 ticks.
 
-| Change | Where |
-|---|---|
-| LAPIC one-shot timer programmed per sleep, PIT kept as the periodic floor | `arch/x86_64/` (new `lapic-timer`), `sched/policy.rs` |
+**What is already there, and what is actually missing**: reading time is *not*
+the gap. `timer::since_boot_nanos()` already resolves below the tick from the
+TSC, with `CYCLES_PER_TICK` calibrated from two observed ticks - so a
+`nanosleep(200µs)` knows precisely when it is late. The gap is the *wake*:
+`sleep_ticks` parks the task on the tick counter, so the smallest unit of
+sleeping is still one PIT interrupt. Design the change around arming a deadline,
+not around a finer clock.
+
+**The order that stays bootable** - the timer is what the whole scheduler rests
+on, so each step must be green before the next:
+
+| Step | Change | Where |
+|---|---|---|
+| 1 | Program the LAPIC timer once, in **one-shot**, from a calibrated count: divide by 16, measure the bus cycles per tick against the PIT *before* enabling, and refuse to go sub-tick at all when the calibration says the LAPIC timer is not ticking (KVM/TCG differ here). | `arch/x86_64/lapic.rs`, `arch/x86_64/timer.rs` |
+| 2 | A vector for it in the IDT, and a handler that wakes only the task whose deadline armed it - not the whole tick pass, which would put the cost back. Keep the PIT as the periodic floor so a lost one-shot cannot stall the machine: the tick still advances time, the one-shot only sharpens the wake-up. | `arch/x86_64/idt.rs`, `sched/` |
+| 3 | `sleep_ns`, and have `nanosleep`/timerfd/`block_until_deadline` take it: below one remaining tick arm the one-shot, otherwise park on the tick as now. The deadline a wait already carries is in ticks today - widening it to nanoseconds is the edit everything else hangs on. | `sched/policy.rs`, `sched/runtime.rs`, `vfs/timerfd.rs` |
+| 4 | Measure it: a guest test that sleeps 1 ms twenty times and asserts the elapsed `since_boot_nanos()` is near 20 ms and *not* near 80 ms (twenty 4 ms ticks). Without the number the change is a claim. | `user/abitest/src/bin/` |
+
+**The trap to watch**: one-shot timers and *interrupt coalescing* fight. If a
+one-shot is armed while another is pending, arming must not push the earlier
+deadline out - a task whose wake-up got postponed by somebody else's sleep is a
+latency bug that only shows under load, which is where it will be found first.
 
 ---
 

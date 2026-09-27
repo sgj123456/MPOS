@@ -42,7 +42,14 @@ pub fn shebang(bytes: &[u8]) -> Option<(String, Option<String>)> {
     }
     let end = bytes.len().min(SHEBANG_LINE_MAX);
     let line = &bytes[2..end];
-    let line = match line.iter().position(|&b| b == b'\n') {
+    // The line ends at a newline *or* at a NUL, which is Linux's behaviour
+    // (`binfmt_script` measures it with `strnlen`): a binary that happens to
+    // open with `#!` then names the interpreter up to the first byte that is
+    // not part of a name, instead of naming one whose path contains it. That
+    // matters because the string produced here goes to the filesystem as a
+    // path, and a path with a NUL in the middle is not a truncated name - it
+    // is a name that cannot exist, handed to `execve` as if it did.
+    let line = match line.iter().position(|&b| b == b'\n' || b == 0) {
         Some(at) => &line[..at],
         None => line,
     };

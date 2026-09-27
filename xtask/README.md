@@ -77,7 +77,7 @@ cargo xtask [global flags] <command>
 | --- | --- | --- | --- |
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
-| 控制台模式 | `--console <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `[qemu] console`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `[qemu] console`, else `mirror`) |
+| 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror` / `weston`（默认取 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror`/`weston` (defaults to `[qemu] mode`, else `mirror`) |
 
 ### 子命令 | Commands
 
@@ -114,9 +114,10 @@ cargo xtask run         # 开窗启动
 # 改了内核代码后反复验证 | iterate after editing the kernel
 cargo xtask run         # 自动判断是否要重建，只重编必要部分
 
-# 选控制台模式启动 | boot in a chosen console mode
-cargo xtask run --console gui        # 只看窗口 | window only
-cargo xtask run --console terminal   # 只看串口终端 | serial terminal only
+# 选运行模式启动 | boot in a chosen mode
+cargo xtask run --mode gui        # 只看窗口 | window only
+cargo xtask run --mode terminal   # 只看串口终端 | serial terminal only
+cargo xtask run --mode weston     # 窗口留给合成器 | window for the compositor
 
 # 跑完整自测 | full self-test
 cargo test  -p mpos --lib --target x86_64-unknown-linux-gnu   # 只跑宿主单测
@@ -168,25 +169,33 @@ watch only the serial log — though the console now renders to the framebuffer,
 
 ---
 
-## `run` 的三种控制台模式 | Three `run` console modes
+## `run` 的四种运行模式 | The four `run` modes
 
-`cargo xtask run` 用 `--console` 选择控制台怎么呈现（缺省取 `rootfs.toml` 里的
-`[qemu] console`，再缺省为 `mirror`）。三种模式让 QEMU 的接线（`-display` /
-`-serial`）和客机的引导参数（`mpos.*`）保持一致：
+`cargo xtask run` 用 `--mode` 一次决定整机怎么启动（缺省取 `rootfs.toml` 里的
+`[qemu] mode`，再缺省为 `mirror`）。这个名字说的是整机模式而不是控制台选项：窗口、
+串口以及客机自己的控制台策略必须一起定下来，所以是一个词。四种模式让 QEMU 的接线
+（`-display` / `-serial`）和客机的引导参数（`mpos.*`）保持一致：
 
 | 模式 | mode | 画面 | QEMU 接线 | 客机引导参数 |
 | --- | --- | --- | --- | --- |
 | 终端 | `terminal` | 只有串口终端，无窗口，GPU 不参与 | `-display none` + 串口走 stdio | `mpos.headless` |
 | 图形 | `gui` | 只有 framebuffer 窗口，切换后串口静默 | `-display <后端>` + 串口丢弃 | `mpos.nomirror` |
 | 镜像 | `mirror` | 窗口为主，串口尽力跟一份 | `-display <后端>` + 串口走 stdio | `mpos.mirror` |
+| 合成器 | `weston` | 窗口归 weston，控制台不占 framebuffer；串口仍有日志 | `-display <后端>` + 串口走 stdio | `mpos.compositor` |
 
-切换很快：`--console` 指定的模式会随特权子步骤刷新**只改引导文件**（`rootfs`
+切换很快：`--mode` 指定的模式会随特权子步骤刷新**只改引导文件**（`rootfs`
 本来就跳过重装 Alpine），重写镜像里的 `mpos.cmdline`；`build/console.mode`
-记录档让 `run` 在镜像已是该模式时**跳过提权**。
+记录档让 `run` 在镜像已是该模式时**跳过提权**（该文件名沿用旧称：它只是缓存，
+改名会让每个既有镜像看起来都需要重新烘焙一次）。
 
-`cargo xtask run` picks how the console is shown with `--console` (default from
-`rootfs.toml`'s `[qemu] console`, else `mirror`). Each mode keeps the QEMU wiring
-and the guest boot flag in step:
+`weston` 一词是给人看的模式名，客机读到的引导字仍是 `mpos.compositor`——那是
+`src/main.rs` 里的内核 ABI，不随 CLI 改名。
+
+`cargo xtask run` picks the whole machine with `--mode` (default from
+`rootfs.toml`'s `[qemu] mode`, else `mirror`). The word is about the machine, not
+about a console setting: the window, the serial line and the guest's own console
+policy have to be decided together, so each mode keeps the QEMU wiring and the
+guest boot flag in step:
 
 - **terminal** — serial only, no window, GPU never engaged (`mpos.headless`).
   The wire is the *lossless* console.
@@ -194,11 +203,17 @@ and the guest boot flag in step:
   console moves over (`mpos.nomirror`).
 - **mirror** — the window plus a **best-effort** copy on the serial line, so the
   same console shows in the window and the terminal at once (`mpos.mirror`).
+- **weston** — the window belongs to the compositor: the kernel console never takes
+  the framebuffer, so a typed line cannot paint over weston, while the boot log
+  still rides the serial line. The boot word it bakes stays `mpos.compositor`,
+  which is the kernel's own ABI, read by name in `src/main.rs`.
 
 Switching is fast: the requested mode rides into the privileged step, which
 refreshes **only the boot files** (`rootfs` already skips the Alpine reinstall) and
 rewrites `mpos.cmdline`; a `build/console.mode` marker lets `run` skip the root
-step when the image already carries that mode.
+step when the image already carries that mode. (That marker keeps its old
+`console.mode` filename on purpose: it is a cache, and a new name would read as
+"nothing baked" and make every existing image look like it needed a rebuild.)
 
 > **镜像不再拖累图形 | The mirror no longer throttles the window.** 镜像模式下
 > 串口是尽力而为的：洪水般的输出（`yes`、`bat`）可能让串口那份记录丢字节，

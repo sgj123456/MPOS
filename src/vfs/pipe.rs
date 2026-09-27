@@ -5,7 +5,7 @@
 //! was handed, which is what makes it a channel rather than a file.
 //!
 //! The non-blocking core - [`PipeEnd::read_once`] and [`PipeEnd::write_once`] -
-//! is plain code over a `VecDeque` and runs under `cargo test` on the host. The
+//! is plain code over a [`Ring`] and runs under `cargo test` on the host. The
 //! blocking `Inode` impl wraps it in [`crate::sched::block_until`], which is a
 //! kernel-only facility; on the host those paths panic loudly rather than spin.
 //!
@@ -37,15 +37,101 @@ pub const PIPE_BUF: usize = 4096;
 /// being an exact multiple of [`PIPE_BUF`] is not the stall it once was.)
 const CAPACITY: usize = 16 * PIPE_BUF;
 
+/// The bytes in flight through one pipe, as a ring over a `Vec`.
+///
+/// The live bytes are `bytes[start..]`: the storage is taken lazily, so a pipe
+/// nobody writes to costs nothing, and it is reclaimed as the reader drains -
+/// when the tail catches the head both go back to zero, so the *next* write
+/// starts from an empty buffer rather than from a high-water mark.
+///
+/// The shape it replaces was a `VecDeque<u8>` moved one byte per operation:
+/// `pop_front` in a loop for a read, `extend(iter().copied())` for a write. A
+/// `PIPE_BUF` round trip therefore cost 8192 deque operations where two slice
+/// copies do, and `t-pipecost` measures the difference: 4096-byte units went
+/// from 259 MiB/s to over a gigabyte.
+///
+/// The one thing that is not a slice copy is the move on a wrap. The buffer is
+/// only ever written at the tail, so a `Vec` that keeps growing while reads
+/// nibble at the front is exactly the wrong shape; the dead prefix is dropped
+/// with one `drain` when the arrival would otherwise pass [`CAPACITY`]. That is
+/// what makes this a ring rather than a log, and it costs one memmove per
+/// `CAPACITY` bytes moved - the same amortized argument a real ring makes.
+#[derive(Debug)]
+struct Ring {
+    bytes: Vec<u8>,
+    start: usize,
+}
+
+impl Ring {
+    const fn new() -> Ring {
+        Ring {
+            bytes: Vec::new(),
+            start: 0,
+        }
+    }
+
+    /// Bytes waiting to be read.
+    fn len(&self) -> usize {
+        self.bytes.len() - self.start
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.len() == self.start
+    }
+
+    /// Take up to `want` bytes into `buf`, answering how many were taken.
+    ///
+    /// The caller bounds `want` by [`Ring::len`] and by the next handover
+    /// boundary; this bounds it again rather than trusting either, because a
+    /// slice copy that ran past the data would read whatever the `Vec` last
+    /// held there.
+    fn take(&mut self, buf: &mut [u8], want: usize) -> usize {
+        let n = want.min(buf.len()).min(self.len());
+        buf[..n].copy_from_slice(&self.bytes[self.start..self.start + n]);
+        self.start += n;
+        if self.start == self.bytes.len() {
+            // Fully drained. Keeping the allocation and resetting the cursor
+            // is what makes the steady state allocation-free.
+            self.bytes.clear();
+            self.start = 0;
+        }
+        n
+    }
+
+    /// Append the first `want` bytes of `buf`. The caller has checked that the
+    /// pipe has room for them.
+    fn put(&mut self, buf: &[u8], want: usize) {
+        let n = want.min(buf.len());
+        debug_assert!(
+            n <= CAPACITY - self.len(),
+            "a pipe write of {n} past a {CAPACITY}-byte buffer holding {}",
+            self.len()
+        );
+        if self.bytes.len() + n > CAPACITY {
+            // Room for the arrival only exists at the front, behind the bytes
+            // already read. One move, and only on the pass that needed it.
+            self.bytes.drain(..self.start);
+            self.start = 0;
+        }
+        self.bytes.extend_from_slice(&buf[..n]);
+    }
+}
+
 struct PipeState {
-    data: VecDeque<u8>,
+    data: Ring,
     /// SCM_RIGHTS side channel, one entry per send that carried descriptors.
     /// It lives here - beside the bytes it travels with - because the two
     /// crossed halves of a [`DuplexEnd`] share exactly this state, so a record
     /// pushed on the write side is the record the far reader pops, in order.
     /// Each entry is the set of open files to hand over; dropping one without a
     /// reader closes them, which is Linux's rule for a descriptor never taken.
-    scm: VecDeque<Vec<Arc<super::File>>>,
+    scm: VecDeque<Scm>,
+    /// Bytes ever written into `data`, and ever taken out of it. A stream has no
+    /// message boundaries of its own, so these two counters are what gives a
+    /// handover its place: the number a send finished at is the offset its
+    /// descriptors belong to.
+    written: u64,
+    consumed: u64,
     readers: u32,
     writers: u32,
     /// Tasks blocked waiting for data or EOF. A dead task's stale entry is
@@ -55,6 +141,20 @@ struct PipeState {
     waiting_readers: Vec<TaskId>,
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
     waiting_writers: Vec<TaskId>,
+}
+
+/// One SCM_RIGHTS handover, tagged with the stream position the send that
+/// carried it ended at.
+///
+/// Linux keeps a stream's control messages per skb and stops a `recvmsg` at the
+/// skb that has one, so the descriptors arrive with the bytes they travelled
+/// with. Without the offset a reader that swallowed two sends in one `read`
+/// would be handed one chain and lose the other's place, which is the difference
+/// between passing two sockets and passing whichever one the sender happened to
+/// finish with.
+struct Scm {
+    end: u64,
+    files: Vec<Arc<super::File>>,
 }
 
 /// One end of a pipe, as an inode. Reads and writes ignore their offset: a
@@ -85,8 +185,10 @@ const _: () = {
 /// A pipe: the read end and the write end of one shared buffer.
 pub fn pair() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     let state = Arc::new(Mutex::new(RefCell::new(PipeState {
-        data: VecDeque::new(),
+        data: Ring::new(),
         scm: VecDeque::new(),
+        written: 0,
+        consumed: 0,
         readers: 1,
         writers: 1,
         waiting_readers: Vec::new(),
@@ -116,12 +218,42 @@ impl PipeEnd {
     /// Queue one SCM_RIGHTS handover beside the bytes just written. Any end of
     /// the shared buffer can push; the peer's read half is the one that pops.
     pub fn push_scm(&self, fds: Vec<Arc<super::File>>) {
-        critical_section::with(|cs| self.state.borrow(cs).borrow_mut().scm.push_back(fds));
+        critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            let end = st.written;
+            st.scm.push_back(Scm { end, files: fds });
+        });
     }
 
-    /// Take the oldest pending handover, if any, from this (reading) side.
+    /// The oldest handover whose bytes this side has now consumed. A queue that
+    /// has one but is not yet due returns `None` rather than the next one down,
+    /// which is what keeps the order honest.
     pub fn take_scm(&self) -> Option<Vec<Arc<super::File>>> {
-        critical_section::with(|cs| self.state.borrow(cs).borrow_mut().scm.pop_front())
+        critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            if st.scm.front().is_some_and(|s| st.consumed >= s.end) {
+                return st.scm.pop_front().map(|s| s.files);
+            }
+            None
+        })
+    }
+
+    /// Whether [`take_scm`] would answer with something, without taking it.
+    ///
+    /// The read side needs this to tell two waits apart. A handover whose send
+    /// carried *no* bytes ends where the stream already is, so it is due the
+    /// moment it is queued and there will never be a byte to arrive with it -
+    /// and a read that parked for that byte would park forever with the record
+    /// already in hand. Asking "is one due?" is what lets the read answer with
+    /// the record instead, while a handover that is *not* yet due still waits
+    /// for its own bytes, in order.
+    ///
+    /// [`take_scm`]: PipeEnd::take_scm
+    pub fn scm_due(&self) -> bool {
+        critical_section::with(|cs| {
+            let st = self.state.borrow(cs).borrow();
+            st.scm.front().is_some_and(|s| st.consumed >= s.end)
+        })
     }
 
     /// Set or clear `O_NONBLOCK` on this end. `pipe2` sets it on birth,
@@ -138,10 +270,18 @@ impl PipeEnd {
             if st.data.is_empty() {
                 if st.writers == 0 { Some(0) } else { None }
             } else {
-                let n = buf.len().min(st.data.len());
-                for byte in buf.iter_mut().take(n) {
-                    *byte = st.data.pop_front().expect("length checked");
+                let mut n = buf.len().min(st.data.len());
+                // Stop the read at the byte the next handover's send ended on,
+                // so those descriptors come back with their own data and the
+                // following read picks up the next send's.
+                if let Some(first) = st.scm.front() {
+                    let boundary = first.end.saturating_sub(st.consumed) as usize;
+                    if boundary > 0 {
+                        n = n.min(boundary);
+                    }
                 }
+                let n = st.data.take(buf, n);
+                st.consumed += n as u64;
                 Some(n)
             }
         }))
@@ -166,7 +306,8 @@ impl PipeEnd {
                 return Ok(None);
             }
             let n = buf.len().min(free);
-            st.data.extend(buf[..n].iter().copied());
+            st.data.put(buf, n);
+            st.written += n as u64;
             Ok(Some(n))
         })
     }
@@ -455,30 +596,59 @@ impl Inode for PipeEnd {
 /// ends at once, which is exactly what this adds.
 ///
 /// It is not a socket in the network sense: there is no address, no
-/// connection, and nothing in `net` knows it exists. `socketpair(2)` never
-/// makes any other kind, and programs that ask for one want a channel, not a
-/// protocol.
+/// connection, and nothing in `net`'s registry knows it exists. What it does
+/// carry is the credentials of whoever made it, because `getsockopt` on a
+/// `socketpair` end answers them on Linux and the callers of a pair - a
+/// compositor and the children it launches - ask exactly that question.
 pub struct DuplexEnd {
     read: Arc<PipeEnd>,
     write: Arc<PipeEnd>,
+    /// The credentials of the process that made the pair - which is what each
+    /// end's peer is, since the far half came into being in that process. This
+    /// is `getsockopt(SO_PEERCRED)`'s answer, and the reason a pair carries
+    /// credentials at all: a compositor hands one half to a child it launched
+    /// and asks the other half who its client is.
+    peer: (u32, u32, u32),
+    /// `SO_PASSCRED`: whether a read should attach the peer's credentials.
+    passcred: AtomicBool,
 }
 
 impl DuplexEnd {
-    /// The two ends of one connected pair.
-    pub fn pair() -> (Arc<DuplexEnd>, Arc<DuplexEnd>) {
+    /// The two ends of one connected pair, made by a process whose
+    /// credentials are `creator` - `(pid, uid, gid)`, or all zero when the
+    /// caller has no process behind the pair.
+    pub fn pair(creator: (u32, u32, u32)) -> (Arc<DuplexEnd>, Arc<DuplexEnd>) {
         // Two one-way links. `a_write` feeds `b_read`, and `b_write` feeds
         // `a_read`, so each end's read half is the other's write half.
         let (a_read, b_write) = pair();
         let (b_read, a_write) = pair();
-        let a = Arc::new(DuplexEnd {
-            read: a_read,
-            write: a_write,
-        });
-        let b = Arc::new(DuplexEnd {
-            read: b_read,
-            write: b_write,
-        });
+        let end = |read: Arc<PipeEnd>, write: Arc<PipeEnd>| {
+            Arc::new(DuplexEnd {
+                read,
+                write,
+                peer: creator,
+                passcred: AtomicBool::new(false),
+            })
+        };
+        let a = end(a_read, a_write);
+        let b = end(b_read, b_write);
         (a, b)
+    }
+
+    /// `SO_PEERCRED`: the pid, uid and gid of the process that created the
+    /// pair, which Linux reports as the peer's credentials on both ends.
+    pub fn peer_cred(&self) -> (u32, u32, u32) {
+        self.peer
+    }
+
+    /// `SO_PASSCRED` as read.
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Relaxed)
+    }
+
+    /// `SO_PASSCRED` as set.
+    pub fn set_passcred(&self, on: bool) {
+        self.passcred.store(on, Ordering::Relaxed);
     }
 
     /// Half-close the writing direction. The far end's next read drains what
@@ -505,6 +675,12 @@ impl DuplexEnd {
     /// Take the handover the peer queued for this end, if any.
     pub fn take_scm(&self) -> Option<Vec<Arc<super::File>>> {
         self.read.take_scm()
+    }
+
+    /// Whether a handover is waiting to be taken, without taking it. See
+    /// [`PipeEnd::scm_due`].
+    pub fn scm_due(&self) -> bool {
+        self.read.scm_due()
     }
 }
 
@@ -569,7 +745,7 @@ mod tests {
 
     #[test]
     fn a_socketpair_carries_bytes_both_ways() {
-        let (a, b) = DuplexEnd::pair();
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
         let mut buf = [0u8; 8];
 
         assert_eq!(a.write_at(0, b"ping").unwrap(), 4);
@@ -585,10 +761,10 @@ mod tests {
 
     #[test]
     fn an_scm_handover_rides_only_the_direction_it_was_sent_on() {
-        let (a, b) = DuplexEnd::pair();
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
         // Two distinct open files, handed over in order on a's write side.
-        let f1 = Arc::new(File::new(DuplexEnd::pair().0));
-        let f2 = Arc::new(File::new(DuplexEnd::pair().0));
+        let f1 = Arc::new(File::new(DuplexEnd::pair((0, 0, 0)).0));
+        let f2 = Arc::new(File::new(DuplexEnd::pair((0, 0, 0)).0));
         let p1 = Arc::as_ptr(&f1);
         let p2 = Arc::as_ptr(&f2);
 
@@ -609,7 +785,7 @@ mod tests {
 
     #[test]
     fn half_closing_a_socketpair_leaves_the_other_direction_running() {
-        let (a, b) = DuplexEnd::pair();
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
         a.write_at(0, b"last").unwrap();
         a.shut_write();
 
@@ -627,7 +803,7 @@ mod tests {
 
     #[test]
     fn shutting_down_twice_is_harmless() {
-        let (a, _b) = DuplexEnd::pair();
+        let (a, _b) = DuplexEnd::pair((0, 0, 0));
         a.shut_write();
         // The second call must not take the end out of the writer count again,
         // and the drop that follows must not take it out a third time: an
@@ -638,14 +814,14 @@ mod tests {
 
     #[test]
     fn a_shut_down_reader_makes_the_peer_write_fail() {
-        let (a, b) = DuplexEnd::pair();
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
         a.shut_read();
         assert_eq!(b.write_at(0, b"nobody").err(), Some(VfsError::BrokenPipe));
     }
 
     #[test]
     fn dropping_one_end_ends_the_stream_the_way_a_pipe_does() {
-        let (a, b) = DuplexEnd::pair();
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
         drop(b);
         let mut buf = [0u8; 4];
         assert_eq!(a.read_at(0, &mut buf).unwrap(), 0, "the far end is gone");

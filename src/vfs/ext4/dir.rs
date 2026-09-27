@@ -3,12 +3,25 @@ use super::*;
 impl Core {
     // ---- directories ----
 
+    /// The physical blocks of a directory, as far as its size reaches.
+    ///
+    /// A directory's `i_size` and its block map are two separate facts stored
+    /// in two separate places, and on a volume that has been damaged - or
+    /// invented - they need not agree. A logical block the mapping does not
+    /// hold is skipped rather than trusted: it names no entries, which is what
+    /// reading an unmapped block would have answered anyway. The walk this
+    /// replaces took the agreement of the two as a promise and `expect`ed on
+    /// it, which makes a mismatch a dead kernel.
+    fn dir_blocks(&self, dir: &InodeData) -> Vec<u64> {
+        let block_size = self.block_size() as u64;
+        (0..dir.size / block_size)
+            .filter_map(|l| self.bmap_lookup(dir, l))
+            .collect()
+    }
+
     pub(crate) fn dir_lookup(&self, dir: &InodeData, name: &str) -> VfsResult<Option<u32>> {
         let block_size = self.block_size();
-        for l in 0..dir.size / block_size as u64 {
-            let block = self
-                .bmap_lookup(dir, l)
-                .expect("a directory block was never mapped");
+        for block in self.dir_blocks(dir) {
             let mut page = vec![0u8; block_size];
             self.read_bytes(block, 0, &mut page);
             if let Some(ino) = dir_find(&page, name) {
@@ -24,10 +37,7 @@ impl Core {
     pub(crate) fn dir_entries(&self, dir: &InodeData) -> VfsResult<Vec<(String, NodeKind)>> {
         let block_size = self.block_size();
         let mut found = Vec::new();
-        for l in 0..dir.size / block_size as u64 {
-            let block = self
-                .bmap_lookup(dir, l)
-                .expect("a directory block was never mapped");
+        for block in self.dir_blocks(dir) {
             let mut page = vec![0u8; block_size];
             self.read_bytes(block, 0, &mut page);
             dir_walk(&page, |_ino, ftype, name| {
@@ -90,17 +100,15 @@ impl Core {
     ) -> VfsResult<()> {
         let block_size = self.block_size();
         let limit = self.leaf_limit(block_size);
-        let blocks = dir.size / block_size as u64;
-        for l in 0..blocks {
-            let block = self
-                .bmap_lookup(dir, l)
-                .expect("a directory block was never mapped");
+        for block in self.dir_blocks(dir) {
             if self.update_dir_block(block, dir_ino, dir.generation, |page| {
                 dir_try_insert(page, limit, name, child, ftype)
             }) {
                 return Ok(());
             }
         }
+        // Nothing fit, so the directory grows by one block past the ones it has.
+        let blocks = dir.size / block_size as u64;
         let (block, _allocated) = self.bmap_ensure(dir, dir_ino, blocks)?;
         self.update_dir_block(block, dir_ino, dir.generation, |page| {
             write_dirent(page, 0, child, limit, name, ftype);
@@ -128,11 +136,7 @@ impl Core {
         dir_ino: u32,
         name: &str,
     ) -> VfsResult<u32> {
-        let block_size = self.block_size();
-        for l in 0..dir.size / block_size as u64 {
-            let block = self
-                .bmap_lookup(dir, l)
-                .expect("a directory block was never mapped");
+        for block in self.dir_blocks(dir) {
             let mut found = None;
             self.update_dir_block(block, dir_ino, dir.generation, |page| {
                 dir_take(page, name, &mut found)
