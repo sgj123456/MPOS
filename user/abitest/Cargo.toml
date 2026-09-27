@@ -15,6 +15,14 @@
 # check, a final `PASS`/`FAILED` line, exit 0 on pass, 1 on failure, 101 from
 # the panic path. `cargo xtask test` runs each one in the guest and reads the
 # exit status.
+#
+# The programs live in two subdirectories, split by what a test needs:
+#
+#   src/bin/syscall/      one syscall family's ABI contract on self-contained
+#                         resources (fds, tmpfs files, a fork of itself)
+#   src/bin/integration/  a device, the network, another process image, or a
+#                         subsystem run end to end - including the timing
+#                         instruments t-forkcost / t-pipecost / t-netlat
 [package]
 name = "mpos-user-abi"
 version = "0.1.0"
@@ -24,3 +32,435 @@ build = "build.rs"
 # The binaries are named `t-<syscall>`, one per syscall family, so the test
 # run's output says which one is missing.
 [lints.cargo]
+
+[[bin]]
+name = "t-aslr"
+path = "src/bin/integration/t-aslr.rs"
+
+[[bin]]
+name = "t-dns"
+path = "src/bin/integration/t-dns.rs"
+
+[[bin]]
+name = "t-drm-args"
+path = "src/bin/integration/t-drm-args.rs"
+
+[[bin]]
+name = "t-drm"
+path = "src/bin/integration/t-drm.rs"
+
+[[bin]]
+name = "t-epoll-socket"
+path = "src/bin/integration/t-epoll-socket.rs"
+
+[[bin]]
+name = "t-evdev"
+path = "src/bin/integration/t-evdev.rs"
+
+[[bin]]
+name = "t-fbdev"
+path = "src/bin/integration/t-fbdev.rs"
+
+[[bin]]
+name = "t-fill-ramfs"
+path = "src/bin/integration/t-fill-ramfs.rs"
+
+[[bin]]
+name = "t-forkcost"
+path = "src/bin/integration/t-forkcost.rs"
+
+[[bin]]
+name = "t-fpu-across-switch"
+path = "src/bin/integration/t-fpu-across-switch.rs"
+
+[[bin]]
+name = "t-ioctl"
+path = "src/bin/integration/t-ioctl.rs"
+
+[[bin]]
+name = "t-memfd-shm"
+path = "src/bin/integration/t-memfd-shm.rs"
+
+[[bin]]
+name = "t-netlat"
+path = "src/bin/integration/t-netlat.rs"
+
+[[bin]]
+name = "t-netlink"
+path = "src/bin/integration/t-netlink.rs"
+
+[[bin]]
+name = "t-pipecost"
+path = "src/bin/integration/t-pipecost.rs"
+
+[[bin]]
+name = "t-prime"
+path = "src/bin/integration/t-prime.rs"
+
+[[bin]]
+name = "t-rawicmp"
+path = "src/bin/integration/t-rawicmp.rs"
+
+[[bin]]
+name = "t-seat"
+path = "src/bin/integration/t-seat.rs"
+
+[[bin]]
+name = "t-sh"
+path = "src/bin/integration/t-sh.rs"
+
+[[bin]]
+name = "t-tcp-close"
+path = "src/bin/integration/t-tcp-close.rs"
+
+[[bin]]
+name = "t-udev-worker"
+path = "src/bin/integration/t-udev-worker.rs"
+
+[[bin]]
+name = "t-uevent"
+path = "src/bin/integration/t-uevent.rs"
+
+[[bin]]
+name = "t-access"
+path = "src/bin/syscall/t-access.rs"
+
+[[bin]]
+name = "t-arch-prctl"
+path = "src/bin/syscall/t-arch-prctl.rs"
+
+[[bin]]
+name = "t-brk"
+path = "src/bin/syscall/t-brk.rs"
+
+[[bin]]
+name = "t-chdir"
+path = "src/bin/syscall/t-chdir.rs"
+
+[[bin]]
+name = "t-clock-gettime"
+path = "src/bin/syscall/t-clock-gettime.rs"
+
+[[bin]]
+name = "t-clone"
+path = "src/bin/syscall/t-clone.rs"
+
+[[bin]]
+name = "t-copy-file-range"
+path = "src/bin/syscall/t-copy-file-range.rs"
+
+[[bin]]
+name = "t-dup"
+path = "src/bin/syscall/t-dup.rs"
+
+[[bin]]
+name = "t-dup2"
+path = "src/bin/syscall/t-dup2.rs"
+
+[[bin]]
+name = "t-dup3"
+path = "src/bin/syscall/t-dup3.rs"
+
+[[bin]]
+name = "t-enosys"
+path = "src/bin/syscall/t-enosys.rs"
+
+[[bin]]
+name = "t-epoll"
+path = "src/bin/syscall/t-epoll.rs"
+
+[[bin]]
+name = "t-eventfd"
+path = "src/bin/syscall/t-eventfd.rs"
+
+[[bin]]
+name = "t-execve"
+path = "src/bin/syscall/t-execve.rs"
+
+[[bin]]
+name = "t-exit-group"
+path = "src/bin/syscall/t-exit-group.rs"
+
+[[bin]]
+name = "t-faccessat"
+path = "src/bin/syscall/t-faccessat.rs"
+
+[[bin]]
+name = "t-faccessat2"
+path = "src/bin/syscall/t-faccessat2.rs"
+
+[[bin]]
+name = "t-fallocate"
+path = "src/bin/syscall/t-fallocate.rs"
+
+[[bin]]
+name = "t-fchmodat2"
+path = "src/bin/syscall/t-fchmodat2.rs"
+
+[[bin]]
+name = "t-fcntl"
+path = "src/bin/syscall/t-fcntl.rs"
+
+[[bin]]
+name = "t-filelock"
+path = "src/bin/syscall/t-filelock.rs"
+
+[[bin]]
+name = "t-fionbio"
+path = "src/bin/syscall/t-fionbio.rs"
+
+[[bin]]
+name = "t-fork"
+path = "src/bin/syscall/t-fork.rs"
+
+[[bin]]
+name = "t-fstat"
+path = "src/bin/syscall/t-fstat.rs"
+
+[[bin]]
+name = "t-futex"
+path = "src/bin/syscall/t-futex.rs"
+
+[[bin]]
+name = "t-getcwd"
+path = "src/bin/syscall/t-getcwd.rs"
+
+[[bin]]
+name = "t-getdents64"
+path = "src/bin/syscall/t-getdents64.rs"
+
+[[bin]]
+name = "t-getpid"
+path = "src/bin/syscall/t-getpid.rs"
+
+[[bin]]
+name = "t-getrandom"
+path = "src/bin/syscall/t-getrandom.rs"
+
+[[bin]]
+name = "t-getuid"
+path = "src/bin/syscall/t-getuid.rs"
+
+[[bin]]
+name = "t-inotify"
+path = "src/bin/syscall/t-inotify.rs"
+
+[[bin]]
+name = "t-kill"
+path = "src/bin/syscall/t-kill.rs"
+
+[[bin]]
+name = "t-link"
+path = "src/bin/syscall/t-link.rs"
+
+[[bin]]
+name = "t-lseek"
+path = "src/bin/syscall/t-lseek.rs"
+
+[[bin]]
+name = "t-madvise"
+path = "src/bin/syscall/t-madvise.rs"
+
+[[bin]]
+name = "t-mkdirat"
+path = "src/bin/syscall/t-mkdirat.rs"
+
+[[bin]]
+name = "t-mmap-reserve-commit"
+path = "src/bin/syscall/t-mmap-reserve-commit.rs"
+
+[[bin]]
+name = "t-mmap"
+path = "src/bin/syscall/t-mmap.rs"
+
+[[bin]]
+name = "t-mount"
+path = "src/bin/syscall/t-mount.rs"
+
+[[bin]]
+name = "t-mprotect"
+path = "src/bin/syscall/t-mprotect.rs"
+
+[[bin]]
+name = "t-mremap"
+path = "src/bin/syscall/t-mremap.rs"
+
+[[bin]]
+name = "t-munmap"
+path = "src/bin/syscall/t-munmap.rs"
+
+[[bin]]
+name = "t-nanosleep"
+path = "src/bin/syscall/t-nanosleep.rs"
+
+[[bin]]
+name = "t-newfstatat"
+path = "src/bin/syscall/t-newfstatat.rs"
+
+[[bin]]
+name = "t-openat"
+path = "src/bin/syscall/t-openat.rs"
+
+[[bin]]
+name = "t-openat2"
+path = "src/bin/syscall/t-openat2.rs"
+
+[[bin]]
+name = "t-pipe2"
+path = "src/bin/syscall/t-pipe2.rs"
+
+[[bin]]
+name = "t-poll"
+path = "src/bin/syscall/t-poll.rs"
+
+[[bin]]
+name = "t-posix"
+path = "src/bin/syscall/t-posix.rs"
+
+[[bin]]
+name = "t-prctl"
+path = "src/bin/syscall/t-prctl.rs"
+
+[[bin]]
+name = "t-preadv2"
+path = "src/bin/syscall/t-preadv2.rs"
+
+[[bin]]
+name = "t-prlimit64"
+path = "src/bin/syscall/t-prlimit64.rs"
+
+[[bin]]
+name = "t-process-vm"
+path = "src/bin/syscall/t-process-vm.rs"
+
+[[bin]]
+name = "t-ptrace-attach"
+path = "src/bin/syscall/t-ptrace-attach.rs"
+
+[[bin]]
+name = "t-pty"
+path = "src/bin/syscall/t-pty.rs"
+
+[[bin]]
+name = "t-read"
+path = "src/bin/syscall/t-read.rs"
+
+[[bin]]
+name = "t-readlink"
+path = "src/bin/syscall/t-readlink.rs"
+
+[[bin]]
+name = "t-readv"
+path = "src/bin/syscall/t-readv.rs"
+
+[[bin]]
+name = "t-renameat2"
+path = "src/bin/syscall/t-renameat2.rs"
+
+[[bin]]
+name = "t-rseq"
+path = "src/bin/syscall/t-rseq.rs"
+
+[[bin]]
+name = "t-rt-sigaction"
+path = "src/bin/syscall/t-rt-sigaction.rs"
+
+[[bin]]
+name = "t-rt-sigprocmask"
+path = "src/bin/syscall/t-rt-sigprocmask.rs"
+
+[[bin]]
+name = "t-sched-getaffinity"
+path = "src/bin/syscall/t-sched-getaffinity.rs"
+
+[[bin]]
+name = "t-set-robust-list"
+path = "src/bin/syscall/t-set-robust-list.rs"
+
+[[bin]]
+name = "t-set-tid-address"
+path = "src/bin/syscall/t-set-tid-address.rs"
+
+[[bin]]
+name = "t-sigaltstack"
+path = "src/bin/syscall/t-sigaltstack.rs"
+
+[[bin]]
+name = "t-signal-delivery"
+path = "src/bin/syscall/t-signal-delivery.rs"
+
+[[bin]]
+name = "t-signalfd"
+path = "src/bin/syscall/t-signalfd.rs"
+
+[[bin]]
+name = "t-splice"
+path = "src/bin/syscall/t-splice.rs"
+
+[[bin]]
+name = "t-statfs"
+path = "src/bin/syscall/t-statfs.rs"
+
+[[bin]]
+name = "t-statx"
+path = "src/bin/syscall/t-statx.rs"
+
+[[bin]]
+name = "t-sync"
+path = "src/bin/syscall/t-sync.rs"
+
+[[bin]]
+name = "t-syslog"
+path = "src/bin/syscall/t-syslog.rs"
+
+[[bin]]
+name = "t-timerfd"
+path = "src/bin/syscall/t-timerfd.rs"
+
+[[bin]]
+name = "t-truncate"
+path = "src/bin/syscall/t-truncate.rs"
+
+[[bin]]
+name = "t-umask"
+path = "src/bin/syscall/t-umask.rs"
+
+[[bin]]
+name = "t-uname"
+path = "src/bin/syscall/t-uname.rs"
+
+[[bin]]
+name = "t-unix-dgram"
+path = "src/bin/syscall/t-unix-dgram.rs"
+
+[[bin]]
+name = "t-unix-scm"
+path = "src/bin/syscall/t-unix-scm.rs"
+
+[[bin]]
+name = "t-unix"
+path = "src/bin/syscall/t-unix.rs"
+
+[[bin]]
+name = "t-unlinkat"
+path = "src/bin/syscall/t-unlinkat.rs"
+
+[[bin]]
+name = "t-wait4"
+path = "src/bin/syscall/t-wait4.rs"
+
+[[bin]]
+name = "t-waitid"
+path = "src/bin/syscall/t-waitid.rs"
+
+[[bin]]
+name = "t-write"
+path = "src/bin/syscall/t-write.rs"
+
+[[bin]]
+name = "t-writev"
+path = "src/bin/syscall/t-writev.rs"
+
+[[bin]]
+name = "t-xattr"
+path = "src/bin/syscall/t-xattr.rs"

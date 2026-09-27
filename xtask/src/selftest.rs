@@ -4,12 +4,13 @@
 //!
 //! 1. The host unit tests - the arch-independent core of the kernel (`cargo
 //!    test --lib`) and xtask's own.
-//! 2. The user test programs. The ABI conformance suite (`user/abitest`) and
-//!    the std-side tests (`user/tests`) are built, packed into an initramfs,
-//!    and booted in QEMU without a disk: the test `/init` runs every `/bin/t-*`
-//!    it finds, prints a `=== PASS`/`=== FAIL` verdict per program, and ends
-//!    the machine with `poweroff -f`, which the kernel turns into QEMU's debug
-//!    exit. The serial console is captured to a file and parsed here.
+//! 2. The user test programs. The ABI conformance suite (`user/abitest`, split
+//!    into `src/bin/syscall/` and `src/bin/integration/`) and the std-side tests
+//!    (`user/tests`) are built, packed into an initramfs, and booted in QEMU
+//!    without a disk: the test `/init` runs every `/bin/t-*` it finds, prints a
+//!    `=== PASS`/`=== FAIL` verdict per program, and ends the machine with
+//!    `poweroff -f`, which the kernel turns into QEMU's debug exit. The serial
+//!    console is captured to a file and parsed here.
 //! 3. Nothing from stage 2 lands in the image `cargo xtask run` boots: the
 //!    test initramfs is a separate archive under the build directory, the boot
 //!    disk is a virtual FAT QEMU synthesizes from a directory (`fat:`), and no
@@ -135,23 +136,39 @@ fn build_user_tests() -> Result<Vec<UserTest>> {
         ),
     ];
     for (src_dir, out_dir) in sources {
-        for entry in fs::read_dir(&src_dir)
-            .with_context(|| format!("Failed to read {}", src_dir.display()))?
-        {
-            let source = entry?.path();
-            if source.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let name = source.file_stem().unwrap().to_string_lossy().to_string();
-            let binary = out_dir.join(&name);
-            if !binary.exists() {
-                bail!("The build produced no binary for {name}");
-            }
-            tests.push(UserTest { name, binary });
-        }
+        collect_user_tests(&src_dir, &out_dir, &mut tests)?;
     }
     tests.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(tests)
+}
+
+/// Find every test program under `src_dir`, recursing into subdirectories.
+///
+/// The ABI suite is split by what a test needs - `syscall/` for a self-contained
+/// syscall family, `integration/` for a device, the network, or a subsystem run
+/// end to end - so its programs no longer sit directly in `src/bin`; the std-side
+/// suite is still flat, which the same walk covers. The binary keeps the file's
+/// name, which is what a `/bin/t-*` run and the verdict line are keyed on.
+fn collect_user_tests(src_dir: &Path, out_dir: &Path, tests: &mut Vec<UserTest>) -> Result<()> {
+    for entry in
+        fs::read_dir(src_dir).with_context(|| format!("Failed to read {}", src_dir.display()))?
+    {
+        let source = entry?.path();
+        if source.is_dir() {
+            collect_user_tests(&source, out_dir, tests)?;
+            continue;
+        }
+        if source.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let name = source.file_stem().unwrap().to_string_lossy().to_string();
+        let binary = out_dir.join(&name);
+        if !binary.exists() {
+            bail!("The build produced no binary for {name}");
+        }
+        tests.push(UserTest { name, binary });
+    }
+    Ok(())
 }
 
 fn target_dir() -> Result<PathBuf> {

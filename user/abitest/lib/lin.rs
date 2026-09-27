@@ -316,6 +316,9 @@ pub const MAP_FAILED: isize = -1;
 pub const SIGBUS: i32 = 7;
 pub const SIGSEGV: i32 = 11;
 pub const SIGPIPE: i32 = 13;
+/// The terminal's window changed size. It is what a full-screen program
+/// redraws on, and it is raised by `TIOCSWINSZ`.
+pub const SIGWINCH: i32 = 28;
 /// First real-time signal; the strace shows SIGRT_1 and SIGRT_2 unblocked.
 pub const SIGRT_1: i32 = 34;
 pub const SIGRT_2: i32 = 35;
@@ -392,6 +395,7 @@ pub const DT_LNK: u8 = 10;
 
 /// ioctl requests.
 pub const TIOCGWINSZ: usize = 0x5413;
+pub const TIOCSWINSZ: usize = 0x5414;
 pub const TCGETS: usize = 0x5401;
 pub const TCSETS: usize = 0x5402;
 /// The pty master's pair: the slave's `/dev/pts` number, and the lock
@@ -826,6 +830,52 @@ pub fn memfd_create(name: &[u8], flags: usize) -> isize {
 
 pub fn mprotect(addr: usize, len: usize, prot: usize) -> isize {
     sys3(nr::MPROTECT, addr, len, prot)
+}
+
+/// The size of the stack [`thread_stack_top`] hands a spawned thread: 32 KiB,
+/// the anonymous mapping `t-clone` and `t-futex` both give their thread.
+pub const THREAD_STACK_BYTES: usize = 0x8000;
+
+/// A fresh thread stack, answered as the address to spawn it on - the first
+/// byte *past* the mapping, because `mpos_thread_create`'s child pops its entry
+/// point from just below there. A negative answer is the mapping's own errno.
+///
+/// This is the spawn scaffold `t-clone` and `t-futex` share: map the stack,
+/// report it, and call [`thread_create`] with the top.
+pub fn thread_stack_top() -> isize {
+    let base = mmap(
+        0,
+        THREAD_STACK_BYTES,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if base <= 0 {
+        base
+    } else {
+        base + THREAD_STACK_BYTES as isize
+    }
+}
+
+/// The address the read/write EFAULT tests map their `PROT_NONE` guard page at:
+/// far from the image base and the kernel's mmap bump, and the same in every
+/// test that wants one.
+pub const GUARD_PAGE: usize = 0x5000_0000;
+
+/// Map [`GUARD_PAGE`] read-unreachable and answer its address, or a negative
+/// errno. A `PROT_NONE` page is the stand-in for the unmapped page Linux's own
+/// EFAULT tests use: the kernel may neither read nor write it, which is what
+/// makes a `read` into it and a `write` out of it both `EFAULT`.
+pub fn guard_page() -> isize {
+    mmap(
+        GUARD_PAGE,
+        4096,
+        PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        -1,
+        0,
+    )
 }
 
 /// The program break: 0 asks where it is, anything else moves it.
@@ -2171,6 +2221,59 @@ pub const MSG_CTRUNC: usize = 0x8;
 pub const MSG_DONTWAIT: usize = 0x40;
 pub const MSG_PEEK: usize = 0x2;
 
+/// The control message that carries one descriptor over a unix socket: a
+/// `struct cmsghdr` (`cmsg_len`, `SOL_SOCKET`, `SCM_RIGHTS`) followed by the
+/// `int` fd in its data, laid out by hand because there is no libc here to
+/// build it.
+///
+/// `t-memfd-shm` and `t-prime` both hand a handle to a forked child this way,
+/// and both used to spell the same 32-byte slot out themselves.
+#[repr(C, align(8))]
+pub struct ScmRights {
+    w: [usize; 4],
+}
+
+impl ScmRights {
+    pub const fn new() -> Self {
+        ScmRights { w: [0; 4] }
+    }
+
+    /// The slot's address, for a `MsgHdr`'s `msg_control`.
+    pub fn control_ptr(&mut self) -> usize {
+        self.w.as_mut_ptr() as usize
+    }
+
+    /// Write `fd` into the slot and answer the `msg_controllen` to pass with
+    /// it - `CMSG_SPACE(4)`, one header plus one `int`.
+    ///
+    /// # Safety
+    /// The slot must stay put and alive until the `sendmsg`/`recvmsg` that is
+    /// handed [`ScmRights::control_ptr`] has returned; the kernel reads or
+    /// writes it for the duration of that call.
+    pub unsafe fn one_fd(&mut self, fd: i32) -> usize {
+        unsafe {
+            let b = self.w.as_mut_ptr() as *mut u8;
+            core::ptr::write_bytes(b, 0, 32);
+            (b as *mut usize).write_unaligned(cmsg_len(4));
+            (b.add(8) as *mut i32).write_unaligned(SOL_SOCKET as i32);
+            (b.add(12) as *mut i32).write_unaligned(SCM_RIGHTS);
+            (b.add(16) as *mut i32).write_unaligned(fd);
+            cmsg_space(4)
+        }
+    }
+
+    /// The descriptor a `recvmsg` wrote back into the slot.
+    pub fn recv_fd(&self) -> i32 {
+        unsafe { *((self.w.as_ptr() as *const u8).add(16) as *const i32) }
+    }
+}
+
+impl Default for ScmRights {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `sendmsg(fd, msg, flags)`.
 pub fn sendmsg(fd: i32, msg: &mut MsgHdr, flags: usize) -> isize {
     sys3(SYS_SENDMSG, fd as usize, msg as *mut MsgHdr as usize, flags)
@@ -2530,3 +2633,438 @@ pub fn connect_un(fd: i32, addr: &SockAddrUn, len: usize) -> isize {
 pub fn accept4_un(fd: i32, addr: *mut SockAddrUn, len: *mut u32, flags: usize) -> isize {
     sys4(nr::ACCEPT4, fd as usize, addr as usize, len as usize, flags)
 }
+
+// ---------------------------------------------------------------------------
+// The completion set and the calls those tests brought with them
+// ---------------------------------------------------------------------------
+
+/// The `struct open_how` of `openat2(2)`: the flags, the create mode and the
+/// path-resolution the caller wants, each a `__u64`.
+#[repr(C)]
+pub struct OpenHow {
+    pub flags: u64,
+    pub mode: u64,
+    pub resolve: u64,
+}
+
+impl OpenHow {
+    pub const fn new(flags: usize, mode: usize, resolve: usize) -> Self {
+        OpenHow {
+            flags: flags as u64,
+            mode: mode as u64,
+            resolve: resolve as u64,
+        }
+    }
+}
+
+/// `RESOLVE_*`: the path-resolution bits of `openat2(2)`.
+pub const RESOLVE_NO_XDEV: usize = 0x01;
+pub const RESOLVE_NO_MAGICLINKS: usize = 0x02;
+pub const RESOLVE_NO_SYMLINKS: usize = 0x04;
+pub const RESOLVE_BENEATH: usize = 0x08;
+pub const RESOLVE_IN_ROOT: usize = 0x10;
+pub const RESOLVE_CACHED: usize = 0x20;
+
+/// `openat2(dirfd, path, how, size)` - `size` is `sizeof(struct open_how)`.
+pub fn openat2(dirfd: i32, path: &[u8], how: &OpenHow, size: usize) -> isize {
+    sys4(
+        nr::OPENAT2,
+        dirfd as usize,
+        path.as_ptr() as usize,
+        how as *const OpenHow as usize,
+        size,
+    )
+}
+
+/// The 120-byte Linux x86_64 `struct statfs`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Statfs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
+}
+
+impl Statfs {
+    pub const fn new() -> Self {
+        Statfs {
+            f_type: 0,
+            f_bsize: 0,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_fsid: [0; 2],
+            f_namelen: 0,
+            f_frsize: 0,
+            f_flags: 0,
+            f_spare: [0; 4],
+        }
+    }
+}
+
+impl Default for Statfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `statfs(path, buf)`.
+pub fn statfs(path: &[u8], buf: &mut Statfs) -> isize {
+    sys2(
+        nr::STATFS,
+        path.as_ptr() as usize,
+        buf as *mut Statfs as usize,
+    )
+}
+
+/// `fstatfs(fd, buf)`.
+pub fn fstatfs(fd: i32, buf: &mut Statfs) -> isize {
+    sys2(nr::FSTATFS, fd as usize, buf as *mut Statfs as usize)
+}
+
+/// `fdatasync(fd)` - the flush the data alone needs.
+pub fn fdatasync(fd: i32) -> isize {
+    sys1(nr::FDATASYNC, fd as usize)
+}
+
+/// `syncfs(fd)` - flush the filesystem one descriptor belongs to.
+pub fn syncfs(fd: i32) -> isize {
+    sys1(nr::SYNCFS, fd as usize)
+}
+
+/// The `SPLICE_F_*` flag bits.
+pub const SPLICE_F_MOVE: usize = 0x01;
+pub const SPLICE_F_NONBLOCK: usize = 0x02;
+pub const SPLICE_F_MORE: usize = 0x04;
+pub const SPLICE_F_GIFT: usize = 0x08;
+
+/// `splice(fd_in, off_in, fd_out, off_out, len, flags)`: the offsets are
+/// `loff_t *`s, passed raw here so a caller can spell "null" as 0 - which the
+/// pipe end requires and the file end reads as "the descriptor's own cursor".
+pub fn splice(
+    fd_in: i32,
+    off_in: usize,
+    fd_out: i32,
+    off_out: usize,
+    len: usize,
+    flags: usize,
+) -> isize {
+    sys6(
+        nr::SPLICE,
+        fd_in as usize,
+        off_in,
+        fd_out as usize,
+        off_out,
+        len,
+        flags,
+    )
+}
+
+/// `EFD_*`: the create flags `eventfd(2)` takes.
+pub const EFD_SEMAPHORE: usize = 0x1;
+pub const EFD_NONBLOCK: usize = 0x800;
+pub const EFD_CLOEXEC: usize = 0o200_0000;
+
+/// `eventfd(initval, flags)` - a counter a process can wait on.
+pub fn eventfd(initval: u32, flags: usize) -> isize {
+    sys2(nr::EVENTFD, initval as usize, flags)
+}
+
+/// `SFD_*`: the flags `signalfd4` takes.
+pub const SFD_NONBLOCK: usize = 0x800;
+pub const SFD_CLOEXEC: usize = 0o200_0000;
+
+/// `signalfd(fd, mask, sizemask)` - the original spelling, with no flags.
+pub fn signalfd(fd: i32, mask: &[u8; 8], sizemask: usize) -> isize {
+    sys3(nr::SIGNALFD, fd as usize, mask.as_ptr() as usize, sizemask)
+}
+
+/// `signalfd4(fd, mask, sizemask, flags)`.
+pub fn signalfd4(fd: i32, mask: &[u8; 8], sizemask: usize, flags: usize) -> isize {
+    sys4(
+        nr::SIGNALFD4,
+        fd as usize,
+        mask.as_ptr() as usize,
+        sizemask,
+        flags,
+    )
+}
+
+/// The 128-byte `struct signalfd_siginfo`, with the four words a reader
+/// branches on: the signal, its code and the pid it came from.
+#[repr(C)]
+pub struct SignalFdInfo {
+    pub bytes: [u8; 128],
+}
+
+impl SignalFdInfo {
+    pub const fn new() -> Self {
+        SignalFdInfo { bytes: [0; 128] }
+    }
+    pub fn signo(&self) -> i32 {
+        let b = &self.bytes[0..4];
+        i32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+    }
+    pub fn code(&self) -> i32 {
+        let b = &self.bytes[8..12];
+        i32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+    }
+    pub fn pid(&self) -> i32 {
+        let b = &self.bytes[12..16];
+        i32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+    }
+}
+
+impl Default for SignalFdInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The `SIGCHLD`/`CLD_EXITED` pair a `signalfd` read reports.
+pub const SIGCHLD: i32 = 17;
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+
+/// One `i32` word out of a 128-byte `siginfo_t` / `signalfd_siginfo`, at the
+/// byte offset the x86_64 ABI puts it at: `si_signo` 0, `si_code` 8, `si_pid`
+/// 16, `si_status` 24.
+pub fn siginfo_i32(buf: &[u8; 128], at: usize) -> i32 {
+    i32::from_ne_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
+
+/// `process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`.
+pub fn process_vm_readv(pid: i32, local: &[Iovec], remote: &[Iovec], flags: usize) -> isize {
+    sys6(
+        nr::PROCESS_VM_READV,
+        pid as usize,
+        local.as_ptr() as usize,
+        local.len(),
+        remote.as_ptr() as usize,
+        remote.len(),
+        flags,
+    )
+}
+
+/// `process_vm_writev(...)` - the same, in the other direction.
+pub fn process_vm_writev(pid: i32, local: &[Iovec], remote: &[Iovec], flags: usize) -> isize {
+    sys6(
+        nr::PROCESS_VM_WRITEV,
+        pid as usize,
+        local.as_ptr() as usize,
+        local.len(),
+        remote.as_ptr() as usize,
+        remote.len(),
+        flags,
+    )
+}
+
+/// The `PR_*` options `prctl(2)` names in this kernel.
+pub const PR_SET_NAME: usize = 15;
+pub const PR_GET_NAME: usize = 16;
+pub const PR_GET_SECCOMP: usize = 21;
+pub const PR_SET_SECCOMP: usize = 22;
+pub const SECCOMP_MODE_STRICT: usize = 1;
+
+/// `prctl(op, a2, a3, a4, a5)`.
+pub fn prctl(op: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    sys5(nr::PRCTL, op, a2, a3, a4, a5)
+}
+
+/// `waitid`'s `idtype` and `options` words.
+pub const P_ALL: usize = 0;
+pub const P_PID: usize = 1;
+pub const WEXITED: usize = 4;
+pub const WSTOPPED: usize = 2;
+pub const WCONTINUED: usize = 8;
+pub const WNOWAIT: usize = 0x0100_0000;
+
+/// `AT_SYMLINK_FOLLOW`: `linkat`'s "follow the source name" flag.
+pub const AT_SYMLINK_FOLLOW: usize = 0x400;
+
+/// `symlinkat(target, newdirfd, linkpath)`.
+pub fn symlinkat(target: &[u8], newdirfd: i32, linkpath: &[u8]) -> isize {
+    sys3(
+        nr::SYMLINKAT,
+        target.as_ptr() as usize,
+        newdirfd as usize,
+        linkpath.as_ptr() as usize,
+    )
+}
+
+/// `readlinkat(dirfd, path, buf)`.
+pub fn readlinkat(dirfd: i32, path: &[u8], buf: &mut [u8]) -> isize {
+    sys4(
+        nr::READLINKAT,
+        dirfd as usize,
+        path.as_ptr() as usize,
+        buf.as_mut_ptr() as usize,
+        buf.len(),
+    )
+}
+
+/// The `XATTR_*` flags `setxattr` takes.
+pub const XATTR_CREATE: usize = 0x1;
+pub const XATTR_REPLACE: usize = 0x2;
+
+/// `setxattr(path, name, value, size, flags)`.
+pub fn setxattr(path: &[u8], name: &[u8], value: &[u8], flags: usize) -> isize {
+    sys5(
+        nr::SETXATTR,
+        path.as_ptr() as usize,
+        name.as_ptr() as usize,
+        value.as_ptr() as usize,
+        value.len(),
+        flags,
+    )
+}
+
+/// `lsetxattr(...)` - the same, naming a link rather than its target.
+pub fn lsetxattr(path: &[u8], name: &[u8], value: &[u8], flags: usize) -> isize {
+    sys5(
+        nr::LSETXATTR,
+        path.as_ptr() as usize,
+        name.as_ptr() as usize,
+        value.as_ptr() as usize,
+        value.len(),
+        flags,
+    )
+}
+
+/// `fsetxattr(fd, name, value, size, flags)`.
+pub fn fsetxattr(fd: i32, name: &[u8], value: &[u8], flags: usize) -> isize {
+    sys5(
+        nr::FSETXATTR,
+        fd as usize,
+        name.as_ptr() as usize,
+        value.as_ptr() as usize,
+        value.len(),
+        flags,
+    )
+}
+
+/// `getxattr(path, name, value, size)`.
+pub fn getxattr(path: &[u8], name: &[u8], value: &mut [u8]) -> isize {
+    sys4(
+        nr::GETXATTR,
+        path.as_ptr() as usize,
+        name.as_ptr() as usize,
+        value.as_mut_ptr() as usize,
+        value.len(),
+    )
+}
+
+/// `lgetxattr(...)`.
+pub fn lgetxattr(path: &[u8], name: &[u8], value: &mut [u8]) -> isize {
+    sys4(
+        nr::LGETXATTR,
+        path.as_ptr() as usize,
+        name.as_ptr() as usize,
+        value.as_mut_ptr() as usize,
+        value.len(),
+    )
+}
+
+/// `fgetxattr(fd, name, value, size)`.
+pub fn fgetxattr(fd: i32, name: &[u8], value: &mut [u8]) -> isize {
+    sys4(
+        nr::FGETXATTR,
+        fd as usize,
+        name.as_ptr() as usize,
+        value.as_mut_ptr() as usize,
+        value.len(),
+    )
+}
+
+/// `listxattr(path, list, size)`.
+pub fn listxattr(path: &[u8], list: &mut [u8]) -> isize {
+    sys3(
+        nr::LISTXATTR,
+        path.as_ptr() as usize,
+        list.as_mut_ptr() as usize,
+        list.len(),
+    )
+}
+
+/// `llistxattr(...)`.
+pub fn llistxattr(path: &[u8], list: &mut [u8]) -> isize {
+    sys3(
+        nr::LLISTXATTR,
+        path.as_ptr() as usize,
+        list.as_mut_ptr() as usize,
+        list.len(),
+    )
+}
+
+/// `flistxattr(fd, list, size)`.
+pub fn flistxattr(fd: i32, list: &mut [u8]) -> isize {
+    sys3(
+        nr::FLISTXATTR,
+        fd as usize,
+        list.as_mut_ptr() as usize,
+        list.len(),
+    )
+}
+
+/// `removexattr(path, name)`.
+pub fn removexattr(path: &[u8], name: &[u8]) -> isize {
+    sys2(
+        nr::REMOVEXATTR,
+        path.as_ptr() as usize,
+        name.as_ptr() as usize,
+    )
+}
+
+/// `lremovexattr(path, name)`.
+pub fn lremovexattr(path: &[u8], name: &[u8]) -> isize {
+    sys2(
+        nr::LREMOVEXATTR,
+        path.as_ptr() as usize,
+        name.as_ptr() as usize,
+    )
+}
+
+/// `fremovexattr(fd, name)`.
+pub fn fremovexattr(fd: i32, name: &[u8]) -> isize {
+    sys2(nr::FREMOVEXATTR, fd as usize, name.as_ptr() as usize)
+}
+
+// The calls this kernel still answers `ENOSYS` for. They are deliberately not
+// in `nr.rs`: no dispatch arm names them, and the point of the probe test is
+// that the *number* is what Linux uses while the kernel has no arm for it.
+pub const SYS_KEYCTL: u64 = 250;
+pub const SYS_FANOTIFY_INIT: u64 = 300;
+pub const SYS_FANOTIFY_MARK: u64 = 301;
+pub const SYS_USERFAULTFD: u64 = 323;
+pub const SYS_IO_URING_SETUP: u64 = 425;
+pub const SYS_IO_URING_ENTER: u64 = 426;
+pub const SYS_IO_URING_REGISTER: u64 = 427;
+
+/// The file types `S_IFMT` can name that the syscall tests branch on beyond
+/// the regular/directory pair already above.
+pub const S_IFLNK: u32 = 0xA000;
+pub const S_IFSOCK: u32 = 0xC000;
+
+/// The two `open` flags the newer file tests pass: truncate on open, and
+/// append-mode writes.
+pub const O_TRUNC: usize = 0o1000;
+pub const O_APPEND: usize = 0o2000;
+
+/// The superblock magics `statfs` reports, exactly as the kernel's
+/// `fstype_magic` spells them.
+pub const RAMFS_MAGIC: u64 = 0x858458F6;
+pub const TMPFS_MAGIC: u64 = 0x01021994;
+pub const EXT_SUPER_MAGIC: u64 = 0x0000EF53;
+pub const PROC_SUPER_MAGIC: u64 = 0x00009FA0;
+pub const SYSFS_MAGIC: u64 = 0x62656572;
