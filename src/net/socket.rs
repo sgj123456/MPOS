@@ -1121,28 +1121,27 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // report it as no socket at all. The name, when the caller gives one,
     // is a `sockaddr_un`; when it does not, the send is aimed at the peer
     // a previous `connect` pinned, and without either it is `ENOTCONN`.
-    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-        if let Some(sock) = file.inode().as_unix() {
-            if sock.carries_messages() {
-                if !crate::syscall::buffer_ok(buf, len, false, from_user) {
-                    return err::EFAULT;
-                }
-                let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
-                let dest = if args[4] != 0 {
-                    let raw = match read_sockaddr_un(args[4], args[5], from_user) {
-                        Ok(raw) => raw,
-                        Err(e) => return e,
-                    };
-                    match crate::net::unix::sockaddr_un_path(&raw) {
-                        Ok(path) => Some(path),
-                        Err(e) => return e,
-                    }
-                } else {
-                    None
-                };
-                return crate::net::unix::send_dgram(sock, data, dest.as_deref());
-            }
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_unix()
+        && sock.carries_messages()
+    {
+        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+            return err::EFAULT;
         }
+        let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+        let dest = if args[4] != 0 {
+            let raw = match read_sockaddr_un(args[4], args[5], from_user) {
+                Ok(raw) => raw,
+                Err(e) => return e,
+            };
+            match crate::net::unix::sockaddr_un_path(&raw) {
+                Ok(path) => Some(path),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
+        return crate::net::unix::send_dgram(sock, data, dest.as_deref());
     }
     // A connected pair's end: the send *is* a write. There is no destination
     // to parse and no control data this kernel carries, so the whole of the
@@ -1226,32 +1225,31 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
     // the same single-message send `sendto` reaches. Control data is not
     // carried on a datagram send here - `SCM_RIGHTS` rides the connected
     // stream, the shape every caller in this image uses it in.
-    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-        if let Some(sock) = file.inode().as_unix() {
-            if sock.carries_messages() {
-                let (name, namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
-                    Ok(fields) => fields,
-                    Err(e) => return e,
-                };
-                let dest = if name != 0 {
-                    let raw = match read_sockaddr_un(name, namelen as usize, from_user) {
-                        Ok(raw) => raw,
-                        Err(e) => return e,
-                    };
-                    match crate::net::unix::sockaddr_un_path(&raw) {
-                        Ok(path) => Some(path),
-                        Err(e) => return e,
-                    }
-                } else {
-                    None
-                };
-                let mut data: Vec<u8> = Vec::new();
-                if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
-                    return e;
-                }
-                return crate::net::unix::send_dgram(sock, &data, dest.as_deref());
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_unix()
+        && sock.carries_messages()
+    {
+        let (name, namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        let dest = if name != 0 {
+            let raw = match read_sockaddr_un(name, namelen as usize, from_user) {
+                Ok(raw) => raw,
+                Err(e) => return e,
+            };
+            match crate::net::unix::sockaddr_un_path(&raw) {
+                Ok(path) => Some(path),
+                Err(e) => return e,
             }
+        } else {
+            None
+        };
+        let mut data: Vec<u8> = Vec::new();
+        if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
+            return e;
         }
+        return crate::net::unix::send_dgram(sock, &data, dest.as_deref());
     }
     // A connected pair's end, in scatter-gather form: gather, then write.
     // No name is legal to send to, but an `SCM_RIGHTS` control buffer names
@@ -1520,34 +1518,33 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     // the `src_addr` slots - which is the whole reason `recvfrom` exists
     // beside `read` on a socket of this shape. A buffer smaller than the
     // message truncates it, discarding the rest, as unix datagrams do.
-    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-        if let Some(sock) = file.inode().as_unix() {
-            if sock.carries_messages() {
-                if !crate::syscall::buffer_ok(buf, len, true, from_user) {
-                    return err::EFAULT;
-                }
-                if args[3] & MSG_PEEK != 0 {
-                    return err::EOPNOTSUPP;
-                }
-                if dontwait(fd, args[3]) && !file.inode().poll_ready().read {
-                    return err::EAGAIN;
-                }
-                let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-                return match crate::net::unix::recv_dgram(sock, out) {
-                    Ok((n, from)) => {
-                        if args[4] != 0 {
-                            let name = from.unwrap_or_default();
-                            let r = crate::net::unix::write_named(&name, args[4], args[5]);
-                            if r != 0 {
-                                return r;
-                            }
-                        }
-                        n as isize
-                    }
-                    Err(e) => crate::syscall::err_of(e),
-                };
-            }
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_unix()
+        && sock.carries_messages()
+    {
+        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+            return err::EFAULT;
         }
+        if args[3] & MSG_PEEK != 0 {
+            return err::EOPNOTSUPP;
+        }
+        if dontwait(fd, args[3]) && !file.inode().poll_ready().read {
+            return err::EAGAIN;
+        }
+        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+        return match crate::net::unix::recv_dgram(sock, out) {
+            Ok((n, from)) => {
+                if args[4] != 0 {
+                    let name = from.unwrap_or_default();
+                    let r = crate::net::unix::write_named(&name, args[4], args[5]);
+                    if r != 0 {
+                        return r;
+                    }
+                }
+                n as isize
+            }
+            Err(e) => crate::syscall::err_of(e),
+        };
     }
     // The read side of a connected pair's end. A peek would need to look at
     // the front of the pipe's queue without taking it, which a pipe cannot
@@ -1662,81 +1659,79 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     // first iovec (the stack wants contiguity, and a syslog-sized message
     // fits the first iovec of every caller this image has), and the
     // sender's name back through `msg_name`.
-    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-        if let Some(sock) = file.inode().as_unix() {
-            if sock.carries_messages() {
-                let (name, _namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
-                    Ok(fields) => fields,
-                    Err(e) => return e,
-                };
-                let (buf, len) = match first_iovec(iov, iovlen, from_user) {
-                    Some(pair) => pair,
-                    None => return err::EINVAL,
-                };
-                if len == 0 {
-                    return err::EINVAL;
-                }
-                if args[2] & MSG_PEEK != 0 {
-                    return err::EOPNOTSUPP;
-                }
-                if !crate::syscall::buffer_ok(buf, len, true, from_user) {
-                    return err::EFAULT;
-                }
-                if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
-                    return err::EAGAIN;
-                }
-                let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-                return match crate::net::unix::recv_dgram_cred(sock, out) {
-                    Ok((n, from, cred, cut)) => {
-                        if name != 0 {
-                            let peer = from.unwrap_or_default();
-                            let bytes = crate::net::unix::sockaddr_un_bytes(&peer);
-                            if !crate::syscall::buffer_ok(name, bytes.len(), true, from_user) {
-                                return err::EFAULT;
-                            }
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    bytes.as_ptr(),
-                                    name as *mut u8,
-                                    bytes.len(),
-                                );
-                                ((msghdr + 8) as *mut u32).write_unaligned(bytes.len() as u32);
-                            }
-                        }
-                        // The sender's credentials ride along when the reader
-                        // asked for them, and `msg_controllen` says how much
-                        // space the kernel actually used either way - leaving
-                        // the caller's capacity in place would have it walk a
-                        // control buffer nobody filled.
-                        //
-                        // `msg_flags` has two independent reports in it, and a
-                        // caller can only act on them if they are not confused
-                        // for each other: `MSG_CTRUNC` for control data the
-                        // buffer could not hold, `MSG_TRUNC` for the message
-                        // itself. A short return value cannot tell those apart -
-                        // a datagram that exactly filled its buffer and one that
-                        // was cut off look identical from the count alone.
-                        let want = if sock.passcred() { Some(cred) } else { None };
-                        let (used, ctrunc) = unsafe {
-                            emit_unix_control(msghdr, Vec::new(), want, false, from_user)
-                        };
-                        let mut flags = 0;
-                        if ctrunc {
-                            flags |= MSG_CTRUNC;
-                        }
-                        if cut {
-                            flags |= MSG_TRUNC;
-                        }
-                        unsafe {
-                            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags);
-                            ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(used);
-                        }
-                        n as isize
-                    }
-                    Err(e) => crate::syscall::err_of(e),
-                };
-            }
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_unix()
+        && sock.carries_messages()
+    {
+        let (name, _namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        let (buf, len) = match first_iovec(iov, iovlen, from_user) {
+            Some(pair) => pair,
+            None => return err::EINVAL,
+        };
+        if len == 0 {
+            return err::EINVAL;
         }
+        if args[2] & MSG_PEEK != 0 {
+            return err::EOPNOTSUPP;
+        }
+        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+            return err::EFAULT;
+        }
+        if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
+            return err::EAGAIN;
+        }
+        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+        return match crate::net::unix::recv_dgram_cred(sock, out) {
+            Ok((n, from, cred, cut)) => {
+                if name != 0 {
+                    let peer = from.unwrap_or_default();
+                    let bytes = crate::net::unix::sockaddr_un_bytes(&peer);
+                    if !crate::syscall::buffer_ok(name, bytes.len(), true, from_user) {
+                        return err::EFAULT;
+                    }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            name as *mut u8,
+                            bytes.len(),
+                        );
+                        ((msghdr + 8) as *mut u32).write_unaligned(bytes.len() as u32);
+                    }
+                }
+                // The sender's credentials ride along when the reader
+                // asked for them, and `msg_controllen` says how much
+                // space the kernel actually used either way - leaving
+                // the caller's capacity in place would have it walk a
+                // control buffer nobody filled.
+                //
+                // `msg_flags` has two independent reports in it, and a
+                // caller can only act on them if they are not confused
+                // for each other: `MSG_CTRUNC` for control data the
+                // buffer could not hold, `MSG_TRUNC` for the message
+                // itself. A short return value cannot tell those apart -
+                // a datagram that exactly filled its buffer and one that
+                // was cut off look identical from the count alone.
+                let want = if sock.passcred() { Some(cred) } else { None };
+                let (used, ctrunc) =
+                    unsafe { emit_unix_control(msghdr, Vec::new(), want, false, from_user) };
+                let mut flags = 0;
+                if ctrunc {
+                    flags |= MSG_CTRUNC;
+                }
+                if cut {
+                    flags |= MSG_TRUNC;
+                }
+                unsafe {
+                    ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags);
+                    ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(used);
+                }
+                n as isize
+            }
+            Err(e) => crate::syscall::err_of(e),
+        };
     }
     // The read side of a connected pair's end, in scatter-gather form: one
     // contiguous read into the first iovec, plus the control chain a unix
@@ -2844,7 +2839,7 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
 /// (it owns the family and path rules); this reads the bytes and lets it
 /// answer them.
 fn read_sockaddr_un(ptr: usize, len: usize, from_user: bool) -> Result<alloc::vec::Vec<u8>, isize> {
-    if ptr == 0 || len < 3 || len > 2 + crate::net::unix::SUN_PATH_MAX {
+    if ptr == 0 || !(3..=2 + crate::net::unix::SUN_PATH_MAX).contains(&len) {
         return Err(err::EINVAL);
     }
     if !crate::syscall::buffer_ok(ptr, len, false, from_user) {
@@ -3043,21 +3038,21 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
     // node itself. Everything else is a network socket, or is not one at all.
     // A connected unix socket half-closes through the same channel a
     // socketpair end does - the `unix_end` the file doors already route by.
-    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
-        if file.inode().unix_id() != 0 {
-            let Some(end) = file.inode().unix_end() else {
-                // ENOTCONN is Linux's answer to shutdown on a socket that
-                // never connected; an unconnected unix fd is exactly that.
-                return err::ENOTCONN;
-            };
-            if how == SHUT_RD || how == SHUT_RDWR {
-                end.shut_read();
-            }
-            if how == SHUT_WR || how == SHUT_RDWR {
-                end.shut_write();
-            }
-            return 0;
+    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
+        && file.inode().unix_id() != 0
+    {
+        let Some(end) = file.inode().unix_end() else {
+            // ENOTCONN is Linux's answer to shutdown on a socket that
+            // never connected; an unconnected unix fd is exactly that.
+            return err::ENOTCONN;
+        };
+        if how == SHUT_RD || how == SHUT_RDWR {
+            end.shut_read();
         }
+        if how == SHUT_WR || how == SHUT_RDWR {
+            end.shut_write();
+        }
+        return 0;
     }
     if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
         && let Some(end) = file.inode().as_duplex()

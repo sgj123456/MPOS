@@ -335,7 +335,7 @@ fn report_frames(rsp: usize) {
     let mut printed = 0usize;
     for i in 0..room {
         let value = unsafe { core::ptr::read_unaligned((rsp + i * 8) as *const u64) };
-        if value >= KERNEL_TEXT && value < KERNEL_TEXT_END {
+        if (KERNEL_TEXT..KERNEL_TEXT_END).contains(&value) {
             crate::println!("    rsp+{:#05x} {:#018x}", i * 8, value);
             printed += 1;
             if printed >= 16 {

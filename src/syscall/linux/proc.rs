@@ -386,14 +386,15 @@ pub(super) fn handle_gettid() -> isize {
     crate::sched::current().0 as isize
 }
 
-/// `prctl(option, ...)` — the miscellaneous process-control call.
-///
-/// `PR_SET_NAME` and `PR_GET_NAME` (15/16) are the ones userland actually
-/// exercises here - `mdev` names itself so `ps` shows a tidy label, and a
-/// `ps` is not built yet. The options that would touch privileges, dump
-/// core flags or endianness touch things this kernel does not model, so
-/// they are accepted and dropped: a caller checking the exit status wants
-/// success, and one reading a value gets zero.
+// `prctl(option, ...)` - the miscellaneous process-control call.
+//
+// `PR_SET_NAME` and `PR_GET_NAME` (15/16) are the ones userland actually
+// exercises here - `mdev` names itself so `ps` shows a tidy label, and a
+// `ps` is not built yet. The options that would touch privileges, dump
+// core flags or endianness touch things this kernel does not model, so
+// they are accepted and dropped: a caller checking the exit status wants
+// success, and one reading a value gets zero.
+//
 // `prctl` lives in `abi`: the option table is argument shaping, and that is
 // the half the host tests read.
 
@@ -805,7 +806,7 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             // (checked_add yields None) is out of range, same as too-large.
             if addr
                 .checked_add(8)
-                .map_or(true, |end| end > abi::uregs::BYTES)
+                .is_none_or(|end| end > abi::uregs::BYTES)
             {
                 return err::EIO;
             }
@@ -1828,11 +1829,11 @@ pub(super) fn handle_getpgid(args: [usize; ARG_COUNT]) -> isize {
         n if n > 0 => TaskId(n as usize),
         _ => return err::EINVAL,
     };
-    let r = match crate::sched::pgid_of(target) {
+
+    match crate::sched::pgid_of(target) {
         Some(pgid) => pgid.0 as isize,
         None => err::ESRCH,
-    };
-    r
+    }
 }
 
 // ---- init's own calls: reboot, sigtimedwait, umask, sendfile -------------
@@ -2803,12 +2804,12 @@ pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
             };
             crate::sched::futex::wait_bitset(uaddr, val as u32, bitset, deadline)
         }
-        nr::FUTEX_WAKE => crate::sched::futex::wake(uaddr, val as usize) as isize,
+        nr::FUTEX_WAKE => crate::sched::futex::wake(uaddr, val) as isize,
         nr::FUTEX_WAKE_BITSET => {
             if val3 == 0 {
                 return err::EINVAL;
             }
-            crate::sched::futex::wake_bitset(uaddr, val as usize, val3 as u32) as isize
+            crate::sched::futex::wake_bitset(uaddr, val, val3 as u32) as isize
         }
         // Linux has a dozen operations this kernel does not serve, and they are
         // not all the same kind of absence. `FUTEX_REQUEUE` and its compare
@@ -2870,8 +2871,8 @@ fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u6
     ))
 }
 
-/// `sched_getaffinity` / `sched_setaffinity` / the robust-list and rseq
-/// registrations live in `abi` - see the note above `futex`.
+// `sched_getaffinity` / `sched_setaffinity` / the robust-list and rseq
+// registrations live in `abi` - see the note above `futex`.
 
 // ---------------------------------------------------------------------------
 // The calls an ordinary libc reaches for

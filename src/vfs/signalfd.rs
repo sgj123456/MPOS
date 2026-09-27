@@ -62,7 +62,7 @@ impl Inode for SignalFd {
 
     fn metadata(&self) -> Metadata {
         Metadata {
-            ino: 0x6000_0000 + self.ino as u64,
+            ino: 0x6000_0000 + self.ino,
             kind: NodeKind::CharDev,
             size: 0,
         }

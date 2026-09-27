@@ -64,7 +64,7 @@ impl Inode for EventFd {
         Metadata {
             // Event descriptors are anonymous; the number only has to be one
             // nothing else claims.
-            ino: 0x5000_0000 + self.ino as u64,
+            ino: 0x5000_0000 + self.ino,
             kind: NodeKind::CharDev,
             size: 0,
         }

@@ -26,6 +26,17 @@ use super::{FileSystem, Inode, NodeKind, VfsError, VfsResult, resolve_opt};
 /// Linux's own limit is 40.
 const SYMLINK_HOPS: usize = 40;
 
+/// One mount as `/proc/mounts` and `/proc/self/mountinfo` print it: the mount
+/// point's node, the source and filesystem name `mount(2)` was given, and the
+/// two flags that decide how the line reads.
+type MountRow = (
+    Arc<dyn Inode>,
+    alloc::string::String,
+    alloc::string::String,
+    bool,
+    bool,
+);
+
 /// One active mount: `at` is the directory inode in the parent filesystem,
 /// `root` is the root of the mounted one.
 struct Mount {
@@ -222,7 +233,7 @@ impl Vfs {
             } else {
                 trimmed == mp || (trimmed.starts_with(mp) && trimmed[mp.len()..].starts_with('/'))
             };
-            if inside && best.as_ref().map_or(true, |b| point.0.len() > b.0.len()) {
+            if inside && best.as_ref().is_none_or(|b| point.0.len() > b.0.len()) {
                 best = Some(point.clone());
             }
         }
@@ -951,7 +962,7 @@ impl Vfs {
                 // mount sits on - how the mount table asks - or the mounted
                 // filesystem's own root, how a walk through the mount sees
                 // it. Both spell `/proc` here.
-                if Arc::ptr_eq(&child, &target) || Arc::ptr_eq(&reached, &target) {
+                if Arc::ptr_eq(&child, target) || Arc::ptr_eq(&reached, target) {
                     return Some(path);
                 }
                 if kind == NodeKind::Dir {
@@ -981,14 +992,8 @@ impl Vfs {
         let (root_fstype, root_source, root_read_only, entries) = critical_section::with(|cs| {
             let fstype = self.root_fstype.borrow(cs).borrow().clone();
             let source = self.root_source.borrow(cs).borrow().clone();
-            let ro = self.root_read_only.borrow(cs).borrow().clone();
-            let entries: Vec<(
-                Arc<dyn Inode>,
-                alloc::string::String,
-                alloc::string::String,
-                bool,
-                bool,
-            )> = self
+            let ro = *self.root_read_only.borrow(cs).borrow();
+            let entries: Vec<MountRow> = self
                 .mounts
                 .borrow(cs)
                 .borrow()

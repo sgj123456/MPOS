@@ -424,7 +424,7 @@ pub(super) fn flock(args: [usize; ARG_COUNT]) -> isize {
         // A whole-file lock covers `[0, infinity)`, in the `Whole` class that
         // never interacts with an `fcntl` record lock, and it blocks unless
         // `LOCK_NB` was asked for.
-        return lock_take(
+        lock_take(
             dev,
             ino,
             ofd,
@@ -434,7 +434,7 @@ pub(super) fn flock(args: [usize; ARG_COUNT]) -> isize {
             0,
             crate::vfs::locks::INF,
             op & LOCK_NB == 0,
-        );
+        )
     }
     #[cfg(not(target_os = "none"))]
     {
@@ -962,7 +962,7 @@ fn resolve_time(ts: &Utimespec, keep: u64, now: u64) -> Option<u64> {
 /// the everyday shape, not a corner. A null `times` sets both clocks to now; the
 /// `UTIME_NOW` / `UTIME_OMIT` sentinels resolve per clock.
 pub(super) fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let (dirfd, path_ptr, times_ptr, flags) = (args[0] as i32, args[1], args[2], args[3] as usize);
+    let (dirfd, path_ptr, times_ptr, flags) = (args[0] as i32, args[1], args[2], args[3]);
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return err::EINVAL;
     }
@@ -1927,7 +1927,7 @@ pub(super) fn fcntl(args: [usize; ARG_COUNT]) -> isize {
             let fds = crate::sched::current_fds();
             match fds.install_at_least(file, arg as i32) {
                 Ok(new) => {
-                    let _ = fds.fd_flags_set(new, FD_CLOEXEC as u32);
+                    let _ = fds.fd_flags_set(new, FD_CLOEXEC);
                     new as isize
                 }
                 Err(e) => err_of(e),
@@ -2023,6 +2023,12 @@ mod flock_off {
 /// a waiter atomically, and `block_until_deadline` re-checks the condition under
 /// the scheduler's own lock before parking, so a release is never missed). A
 /// `kind` of `None` is an unlock.
+///
+/// The arguments are the lock request itself - device, inode, owner, pid,
+/// class, kind and the byte range - which the two callers below already hold
+/// as separate values, plus `block`, which is the one thing `F_SETLKW` adds
+/// to `F_SETLK`.
+#[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "none")]
 fn lock_take(
     dev: u64,
@@ -2589,9 +2595,10 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
                 .iter()
                 .any(|watch| matches!(watch_ready(watch), (true, _) | (_, true)))
         };
-        match crate::sched::block_until_deadline(any_ready, floor) {
-            crate::sched::WaitEnd::Interrupted => break -1,
-            _ => {}
+        if let crate::sched::WaitEnd::Interrupted =
+            crate::sched::block_until_deadline(any_ready, floor)
+        {
+            break -1;
         }
         ready = watches.iter().map(watch_ready).collect();
     };
@@ -5041,7 +5048,7 @@ pub(super) fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
         return 0;
     }
     let (parent_path, name) = match absolute.rsplit_once('/') {
-        Some((p, n)) if p.is_empty() => (String::from("/"), n),
+        Some(("", n)) => (String::from("/"), n),
         Some((p, n)) => (String::from(p), n),
         None => return err::ENOENT,
     };
@@ -5115,9 +5122,9 @@ fn epoll_create(flags: usize) -> isize {
 ///
 /// The refusal order is the man page's: an operation outside the three
 /// answers EINVAL before a descriptor is looked at; a number that is not
-/// open answers EBADF; an open number that is not an epoll answers EINVAL
-/// - the line between "the number is bad" and "the thing it names is the
-/// wrong kind".
+/// open answers EBADF; an open number that is not an epoll answers EINVAL -
+/// the line between "the number is bad" and "the thing it names is the wrong
+/// kind".
 pub(super) fn handle_epoll_ctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (epfd, op, fd, event) = (args[0] as i32, args[1], args[2] as i32, args[3]);
     if !matches!(

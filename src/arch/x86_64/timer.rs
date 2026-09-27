@@ -86,13 +86,13 @@ pub fn since_boot_nanos() -> u64 {
     let tick_ns = 1_000_000_000 / TICK_HZ as u64;
     let ticks = TICKS.load(Ordering::Relaxed);
     let cpt = CYCLES_PER_TICK.load(Ordering::Relaxed);
-    let fraction = if cpt == 0 {
-        0
-    } else {
-        let since = rdtsc().wrapping_sub(LAST_TICK_TSC.load(Ordering::Relaxed));
-        (since % cpt) * tick_ns / cpt
-    };
-    ticks * tick_ns + fraction
+    // Before calibration there is no fraction to add and the divisor below
+    // would be zero: the whole ticks are all the clock has.
+    if cpt == 0 {
+        return ticks * tick_ns;
+    }
+    let since = rdtsc().wrapping_sub(LAST_TICK_TSC.load(Ordering::Relaxed));
+    ticks * tick_ns + (since % cpt) * tick_ns / cpt
 }
 
 /// Busy-wait for roughly `ms` milliseconds. Only for boot-time tests and

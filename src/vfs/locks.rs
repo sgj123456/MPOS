@@ -177,6 +177,13 @@ pub fn remove_range(
 
 /// The index of the first lock in `locks` that conflicts with the request - what
 /// `F_GETLK` reports and `F_SETLK` refuses on.
+///
+/// The argument list is a lock request spelled out - device, inode, owner,
+/// class, kind and the byte range - which every caller here already holds as
+/// separate values, and which `set` and `set_or_arm` take in the same order.
+/// A struct would move the same seven fields to each call site and give the
+/// bundle a name nothing else needs.
+#[allow(clippy::too_many_arguments)]
 pub fn find_conflict(
     locks: &[Lock],
     dev: u64,
@@ -196,6 +203,7 @@ pub fn find_conflict(
 /// record the new one unless `kind` is `None` (an unlock). `pid` is recorded
 /// with it for `F_GETLK` and for the liveness check, whatever `owner` was
 /// keyed on.
+#[allow(clippy::too_many_arguments)] // the same lock request, plus its `pid`
 pub fn apply_set(
     locks: &mut Vec<Lock>,
     dev: u64,
@@ -255,6 +263,7 @@ pub fn query(
 
 /// `F_SETLK` / `flock` (non-blocking): take or drop a lock in `class`, refusing
 /// with the conflicting owner's pid. `None` `kind` is an unlock.
+#[allow(clippy::too_many_arguments)] // the same lock request, plus its `pid`
 #[cfg(target_os = "none")]
 pub fn set(
     dev: u64,
@@ -269,10 +278,10 @@ pub fn set(
     critical_section::with(|cs| {
         let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
         prune_dead(&mut table);
-        if let Some(k) = kind {
-            if let Some(i) = find_conflict(&table, dev, ino, owner, class, k, lo, hi) {
-                return Err(table[i].pid);
-            }
+        if let Some(k) = kind
+            && let Some(i) = find_conflict(&table, dev, ino, owner, class, k, lo, hi)
+        {
+            return Err(table[i].pid);
         }
         apply_set(&mut table, dev, ino, owner, pid, class, kind, lo, hi);
         if kind.is_none() {
@@ -361,6 +370,7 @@ pub fn is_free(
 /// `tid` as a waiter so a later release wakes it. `true` means the caller now
 /// holds it (or the unlock was applied); `false` means it must block. The check
 /// and the arming share one lock so a release racing the sleep is never missed.
+#[allow(clippy::too_many_arguments)] // the same lock request, plus pid and waiter
 #[cfg(target_os = "none")]
 pub fn set_or_arm(
     dev: u64,
@@ -376,17 +386,17 @@ pub fn set_or_arm(
     critical_section::with(|cs| {
         let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
         prune_dead(&mut table);
-        if let Some(k) = kind {
-            if find_conflict(&table, dev, ino, owner, class, k, lo, hi).is_some() {
-                let mut waiters = LOCK_WAITERS.borrow(cs).borrow_mut();
-                if !waiters
-                    .iter()
-                    .any(|w| w.tid == tid && w.dev == dev && w.ino == ino)
-                {
-                    waiters.push(Waiter { tid, dev, ino });
-                }
-                return false;
+        if let Some(k) = kind
+            && find_conflict(&table, dev, ino, owner, class, k, lo, hi).is_some()
+        {
+            let mut waiters = LOCK_WAITERS.borrow(cs).borrow_mut();
+            if !waiters
+                .iter()
+                .any(|w| w.tid == tid && w.dev == dev && w.ino == ino)
+            {
+                waiters.push(Waiter { tid, dev, ino });
             }
+            return false;
         }
         apply_set(&mut table, dev, ino, owner, pid, class, kind, lo, hi);
         if kind.is_none() {

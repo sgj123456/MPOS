@@ -75,10 +75,18 @@ static DATA_DEV: spin::Once<alloc::sync::Arc<dyn mpos::blk::BlockDev>> = spin::O
 /// enforces that `RDI` holds what this function was compiled to expect, and a
 /// wrong guess has to be a panic and not a wild read.
 ///
+/// # Safety
+///
+/// The caller is the loader's jump to this symbol, with `RDI` holding the
+/// record it wrote. Nothing chooses this call from Rust, and the pointer is
+/// dereferenced before it can be validated - the check above happens *after*
+/// the read - so the validity of `handoff` is the caller's contract and not
+/// something this function can establish.
+///
 /// [`Handoff`]: mpos::boot::handoff::Handoff
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(handoff: *const boot::handoff::Handoff) -> ! {
+pub unsafe extern "C" fn _start(handoff: *const boot::handoff::Handoff) -> ! {
     // Serial first: it depends on nothing the loader wrote, so it is usable even
     // if the record turns out to be the wrong one and `collect` panics below.
     mpos::console::init();
@@ -421,7 +429,6 @@ fn init_blk() {
 /// unmount - because they were never in a mount table userland can read.
 /// Everything the boot needs - the block devices to mount from, the
 /// filesystem types to mount - is reachable through `mount(2)` instead.
-
 fn check_mm(info: &BootInfo) {
     // M0: the global allocator works.
     {

@@ -27,8 +27,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+use tracing::Level;
 use tracing::field::{Field, Visit};
-use tracing::{Event, Level, Metadata};
+#[cfg(target_os = "none")]
+use tracing::{Event, Metadata};
 
 /// A rank that compares like verbosity: bigger is more verbose. `Level` itself
 /// is a struct of static names and cannot be matched as a constant pattern, so

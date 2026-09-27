@@ -39,6 +39,13 @@ use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
 /// and no parent rather than skipping one that has already gone.
 type Generator = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// What a writable generated file does with a write: how `sysctl -w` and
+/// OpenRC's `hostname` service name the system.
+type Writer = Box<dyn Fn(&str) -> VfsResult<()> + Send + Sync>;
+
+/// A directory's fixed children: each entry with the kind it was added with.
+type Entries = Mutex<RefCell<BTreeMap<String, (Arc<dyn Inode>, NodeKind)>>>;
+
 /// One generated file. Its size is its content's, recomputed on every
 /// `stat` - a file whose contents are "how long has the machine been up"
 /// does not have a size that stays still, and pretending otherwise is the
@@ -84,7 +91,7 @@ impl Inode for ProcFile {
 struct ProcCtl {
     ino: Ino,
     read: Generator,
-    write: Box<dyn Fn(&str) -> VfsResult<()> + Send + Sync>,
+    write: Writer,
 }
 
 impl Inode for ProcCtl {
@@ -183,7 +190,7 @@ struct ProcDir {
     /// Each entry with its kind, recorded as it is added: a listing must not
     /// have to ask a node what it is, because asking a generated file is what
     /// generates it.
-    entries: Mutex<RefCell<BTreeMap<String, (Arc<dyn Inode>, NodeKind)>>>,
+    entries: Entries,
     /// The children that are not in `entries` because they are not fixed.
     dynamic: Option<Arc<dyn Dynamic>>,
 }

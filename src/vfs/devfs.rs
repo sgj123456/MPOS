@@ -17,6 +17,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -127,8 +128,7 @@ impl Inode for DevBlockNode {
         // sector. The sector-sized window covering the request is read, and
         // the part that was asked for is copied out of it.
         let (first, covered) = window_for(offset, len as u64, end);
-        let mut window = Vec::new();
-        window.resize(covered as usize, 0);
+        let mut window = vec![0; covered as usize];
         self.dev.read_at(first, &mut window);
         let from = (offset - first) as usize;
         buf[..len].copy_from_slice(&window[from..from + len]);
@@ -148,8 +148,7 @@ impl Inode for DevBlockNode {
         // that does not cover whole sectors has to read them first, or it
         // would erase the bytes around what it was given.
         let (first, covered) = window_for(offset, len as u64, end);
-        let mut window = Vec::new();
-        window.resize(covered as usize, 0);
+        let mut window = vec![0; covered as usize];
         let at = (offset - first) as usize;
         self.dev.read_at(first, &mut window);
         window[at..at + len].copy_from_slice(&buf[..len]);

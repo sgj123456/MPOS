@@ -529,11 +529,11 @@ pub(crate) fn free_entry(handle: usize) {
                 // already more than any real peer owes a machine that closed on
                 // it, and the alternative is a set that fills up and refuses new
                 // sockets forever.
-                if stack.teardown.len() >= TEARDOWN_MAX {
-                    if let Some(oldest) = stack.teardown.first().copied() {
-                        stack.teardown.remove(0);
-                        stack.sockets.remove(oldest);
-                    }
+                if stack.teardown.len() >= TEARDOWN_MAX
+                    && let Some(oldest) = stack.teardown.first().copied()
+                {
+                    stack.teardown.remove(0);
+                    stack.sockets.remove(oldest);
                 }
                 stack.teardown.push(h);
             } else {

@@ -579,10 +579,10 @@ static KEYMAP: Mutex<RefCell<crate::vfs::term::keymap::Keymap>> =
 /// `EV_KEY`, the event type a keyboard press is.
 const EV_KEY: u16 = 1;
 
-/// The event types whose code bitmap `/sys` publishes, with the number of bits
-/// Linux declares for each. The count is not the device's: it is the *type's*
-/// - `EV_KEY` covers `KEY_MAX` whatever a keyboard implements - and it is what
-/// decides how many words the attribute is printed in.
+/// The event types whose code bitmap `/sys` publishes, with the number of
+/// bits Linux declares for each. The count is not the device's: it is the
+/// *type's* - `EV_KEY` covers `KEY_MAX` whatever a keyboard implements - and
+/// it is what decides how many words the attribute is printed in.
 ///
 /// `ev` is the one that matters most: `udev`'s `input_id` builtin finds the
 /// input device behind an `eventN` node by walking up to the first parent with
@@ -605,11 +605,11 @@ pub const CAPABILITY_BYTES: usize = 0x300 / 8;
 ///
 /// Two consumers, deliberately: every event is encoded onto its device's
 /// `/dev/input/eventN` node (an evdev program reads records from there), *and*
-/// - when a display is up, i.e. not headless - keyboard events are translated to
-/// console bytes and fed to the active virtual console through the same funnel
-/// a serial keystroke uses. Routing happens *after* the critical section, so the
-/// echo the keystroke provokes can take the pty's parking branch rather than
-/// growing a queue unbounded under the lock.
+/// when a display is up - i.e. not headless - keyboard events are translated
+/// to console bytes and fed to the active virtual console through the same
+/// funnel a serial keystroke uses. Routing happens *after* the critical
+/// section, so the echo the keystroke provokes can take the pty's parking
+/// branch rather than growing a queue unbounded under the lock.
 pub fn service() {
     let to_console = !crate::console::headless();
     let mut routed = [0u8; 64];
@@ -628,13 +628,14 @@ pub fn service() {
             let to_console = to_console && !node.is_grabbed();
             while let Some(event) = device.pop_pending_event() {
                 node.push(&event);
-                if to_console && event.event_type == EV_KEY {
-                    if let Some((bytes, cnt)) = keymap.event(event.code, event.value as i32) {
-                        for &b in &bytes[..cnt] {
-                            if n < routed.len() {
-                                routed[n] = b;
-                                n += 1;
-                            }
+                if to_console
+                    && event.event_type == EV_KEY
+                    && let Some((bytes, cnt)) = keymap.event(event.code, event.value as i32)
+                {
+                    for &b in &bytes[..cnt] {
+                        if n < routed.len() {
+                            routed[n] = b;
+                            n += 1;
                         }
                     }
                 }

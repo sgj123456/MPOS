@@ -205,7 +205,7 @@ fn encode(value: u8, status_b: u8) -> u8 {
     if status_b & STATUS_B_BINARY != 0 {
         value
     } else {
-        (value / 10) << 4 | value % 10
+        ((value / 10) << 4) | (value % 10)
     }
 }
 

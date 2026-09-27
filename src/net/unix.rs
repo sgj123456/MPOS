@@ -794,7 +794,7 @@ pub(crate) fn connect(
     }
     loop {
         let outcome = critical_section::with(|cs| {
-            let lst = {
+            {
                 let mut stl = listener.state.borrow(cs).borrow_mut();
                 let backlog = match stl.backlog {
                     Some(b) => b,
@@ -826,8 +826,7 @@ pub(crate) fn connect(
                 // socket `accept` mints can report them as its peer.
                 stl.pending.push_back((server, connector_cred));
                 ConnectOutcome::Connected(waiters)
-            };
-            lst
+            }
         });
         match outcome {
             ConnectOutcome::Connected(waiters) => {

@@ -35,13 +35,21 @@
 //! the ext2/ext4 driver lives by.
 
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+
+use crate::vfs::{NodeKind, VfsError};
+
+// The device-dependent half's imports, gated with that half: on the host this
+// module is the wire format and its parsers only, so the types the *filesystem*
+// is built from would be dead weight there.
+#[cfg(target_os = "none")]
+use crate::vfs::{FileSystem, Inode, Metadata, VfsResult};
+#[cfg(target_os = "none")]
+use alloc::sync::{Arc, Weak};
+#[cfg(target_os = "none")]
 use core::cell::RefCell;
-
+#[cfg(target_os = "none")]
 use critical_section::Mutex;
-
-use crate::vfs::{FileSystem, Inode, Metadata, NodeKind, VfsError, VfsResult};
 
 // ---------------------------------------------------------------------------
 // The wire: message types, and the encoder/decoder helpers. Pure code,

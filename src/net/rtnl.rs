@@ -470,9 +470,7 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 // link is the same word. Either one answers here, `LOCAL`
                 // winning if both appear - which is what `ip addr add`
                 // sends and what a plain `IFA_ADDRESS` caller expects.
-                if ty == IFA_LOCAL {
-                    addr = be32(value);
-                } else if ty == IFA_ADDRESS && addr.is_none() {
+                if ty == IFA_LOCAL || (ty == IFA_ADDRESS && addr.is_none()) {
                     addr = be32(value);
                 }
             });
@@ -671,10 +669,10 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 let requested = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
                 up = Some(requested & IFF_UP != 0);
             }
-            if let Some(up) = up {
-                if let Err(e) = crate::net::set_link_up(index, up) {
-                    return e;
-                }
+            if let Some(up) = up
+                && let Err(e) = crate::net::set_link_up(index, up)
+            {
+                return e;
             }
             if let Some(mtu) = mtu {
                 if index != ETH_INDEX {
@@ -867,15 +865,20 @@ fn route_msg(
     gateway: [u8; 4],
     prefsrc: Option<[u8; 4]>,
 ) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.push(2); // rtm_family: AF_INET
-    payload.push(dst_len);
-    payload.push(0); // rtm_src_len
-    payload.push(0); // rtm_tos
-    payload.push(254); // rtm_table: RT_TABLE_MAIN
-    payload.push(4); // rtm_protocol: RTPROT_STATIC
-    payload.push(0); // rtm_scope: RT_SCOPE_UNIVERSE
-    payload.push(1); // rtm_type: RTN_UNICAST
+    // `struct rtmsg`, field by field. Every entry carries its own comment so
+    // the formatter keeps one field per line: without it, the uncommented
+    // `dst_len` is joined to the `rtm_src_len` beside it and the list stops
+    // reading as a struct.
+    let mut payload = vec![
+        2,       // rtm_family: AF_INET
+        dst_len, // rtm_dst_len
+        0,       // rtm_src_len
+        0,       // rtm_tos
+        254,     // rtm_table: RT_TABLE_MAIN
+        4,       // rtm_protocol: RTPROT_STATIC
+        0,       // rtm_scope: RT_SCOPE_UNIVERSE
+        1,       // rtm_type: RTN_UNICAST
+    ];
     // rtm_flags closes `struct rtmsg` at 12 bytes. Skipping it shifts every
     // attribute four bytes early: a strict caller reads the four attribute
     // bytes that should have been flags as `rta_len`, sees the zero payload of
@@ -902,11 +905,13 @@ fn addr_msg(
     name: &str,
     scope: u8,
 ) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.push(2); // ifa_family: AF_INET
-    payload.push(prefix);
-    payload.push(IFA_F_PERMANENT); // ifa_flags
-    payload.push(scope);
+    // `struct ifaddrmsg`, field by field.
+    let mut payload = vec![
+        2,               // ifa_family: AF_INET
+        prefix,          // ifa_prefixlen
+        IFA_F_PERMANENT, // ifa_flags
+        scope,           // ifa_scope
+    ];
     payload.extend(index.to_le_bytes());
     payload.extend(rtattr(IFA_ADDRESS, &ip));
     payload.extend(rtattr(IFA_LOCAL, &ip));

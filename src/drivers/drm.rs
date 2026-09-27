@@ -547,7 +547,7 @@ fn fill_version(buf: usize) -> isize {
     0
 }
 
-fn libc_EINVAL() -> isize {
+fn libc_einval() -> isize {
     -22
 }
 
@@ -591,10 +591,10 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
     // caller actually made. A request this card does not implement is not
     // checked here at all: it is refused below, as `ENOTTY`, without having
     // touched anything.
-    if let Some((len, writable)) = arg_shape(nr) {
-        if !crate::syscall::buffer_ok(arg, len, writable, true) {
-            return -14; // EFAULT
-        }
+    if let Some((len, writable)) = arg_shape(nr)
+        && !crate::syscall::buffer_ok(arg, len, writable, true)
+    {
+        return -14; // EFAULT
     }
     match nr {
         NR_VERSION => fill_version(arg),
@@ -781,7 +781,7 @@ fn set_client_cap(arg: usize) -> isize {
     // refusal. The old shape here accepted only `1`, so a client clearing a
     // cap it had turned on was told the cap was unavailable.
     if value > 1 {
-        return libc_EINVAL();
+        return libc_einval();
     }
     match capability {
         // The caps this card's own objects back, plus the ones that only say
@@ -809,7 +809,7 @@ fn set_client_cap(arg: usize) -> isize {
         CLIENT_CAP_CURSOR_PLANE_HOTSPOT | CLIENT_CAP_PLANE_COLOR_PIPELINE => -95,
         // A capability number the driver has never heard of is not "not
         // supported", it is not a request at all, and Linux says so.
-        _ => libc_EINVAL(),
+        _ => libc_einval(),
     }
 }
 
@@ -827,7 +827,7 @@ fn set_version(arg: usize) -> isize {
         // refused the way newer userland is on an older kernel.
         let (major, minor) = if di_major >= 0 && (di_major > 0 || di_minor > 0) {
             if di_major > 1 || di_minor > 4 {
-                return libc_EINVAL();
+                return libc_einval();
             }
             (di_major, di_minor)
         } else {
@@ -996,7 +996,7 @@ fn handle_is_dumb(st: &DrmState, handle: u32) -> bool {
 /// the same errno Linux uses.
 fn copy_to_scanout(st: &DrmState, fb_id: u32) -> isize {
     if !fb_fits(st, fb_id) {
-        return libc_EINVAL();
+        return libc_einval();
     }
     let fb = st
         .fbs
@@ -1049,7 +1049,7 @@ fn set_crtc(arg: usize) -> isize {
     let crtc_id = unsafe { ((arg + 12) as *const u32).read_unaligned() };
     let fb_id = unsafe { ((arg + 16) as *const u32).read_unaligned() };
     if crtc_id != CRTC_ID {
-        return libc_EINVAL();
+        return libc_einval();
     }
     // fb_id 0 is "disable the CRTC": accepted, and nothing is drawn. Any
     // other id must be a framebuffer the card made, whose pixels are put
@@ -1083,7 +1083,7 @@ fn get_encoder(arg: usize) -> isize {
         let p = arg as *mut u32;
         let want = p.read_unaligned();
         if want != 0 && want != ENCODER_ID {
-            return libc_EINVAL();
+            return libc_einval();
         }
         p.write_unaligned(ENCODER_ID);
         p.add(1).write_unaligned(ENCODER_TYPE);
@@ -1102,7 +1102,7 @@ fn get_connector(arg: usize) -> isize {
     // mm_width@64, mm_height@68, subpixel@72, pad@76.
     let want = unsafe { ((arg + 48) as *const u32).read_unaligned() };
     if want != 0 && want != CONNECTOR_ID {
-        return libc_EINVAL();
+        return libc_einval();
     }
     let (w, h) = crtc_mode_dims();
     // The connector's two properties and their current values - what
@@ -1245,7 +1245,7 @@ fn get_property(arg: usize) -> isize {
             &[-1i64 as u64, i32::MAX as u64],
             &[],
         ),
-        _ => return libc_EINVAL(),
+        _ => return libc_einval(),
     };
     unsafe {
         // The name, NUL-padded into its 32-byte field.
@@ -1326,7 +1326,7 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
         // the same kind of write: there is no asynchronous engine here to
         // wait for, so the value is accepted and forgotten.
         (PLANE_ID, PROP_BLEND) | (PLANE_ID, PROP_IN_FENCE_FD) => {}
-        _ => return libc_EINVAL(),
+        _ => return libc_einval(),
     }
     0
 }
@@ -1340,7 +1340,7 @@ fn set_connector_prop(prop_id: u32, value: u64) -> isize {
         match prop_id {
             PROP_CRTC_ID => st.conn_crtc = value as u32,
             PROP_DPMS => st.dpms = value as u32,
-            _ => return libc_EINVAL(),
+            _ => return libc_einval(),
         };
         0
     })
@@ -1355,7 +1355,7 @@ fn set_property(arg: usize) -> isize {
     let prop_id = unsafe { ((arg + 8) as *const u32).read_unaligned() };
     let connector_id = unsafe { ((arg + 12) as *const u32).read_unaligned() };
     if connector_id != CONNECTOR_ID {
-        return libc_EINVAL();
+        return libc_einval();
     }
     set_connector_prop(prop_id, value)
 }
@@ -1380,7 +1380,7 @@ fn obj_set_property(arg: usize) -> isize {
         (OBJECT_CONNECTOR, CONNECTOR_ID) | (OBJECT_CRTC, CRTC_ID) | (OBJECT_PLANE, PLANE_ID)
     );
     if !matches_type {
-        return libc_EINVAL();
+        return libc_einval();
     }
     let shown = prop_id == PROP_PLANE_FB_ID;
     let rc = critical_section::with(|cs| {
@@ -1391,7 +1391,7 @@ fn obj_set_property(arg: usize) -> isize {
             // state that names it moves.
             let fb = value as u32;
             if fb != 0 && !fb_fits(&st, fb) {
-                return libc_EINVAL();
+                return libc_einval();
             }
             match copy_to_scanout(&st, fb) {
                 0 => st.current_fb = fb,
@@ -1440,11 +1440,11 @@ fn mode_atomic(arg: usize) -> isize {
     if flags & !KNOWN_FLAGS != 0
         || flags & (ATOMIC_TEST_ONLY | PAGE_FLIP_EVENT) == (ATOMIC_TEST_ONLY | PAGE_FLIP_EVENT)
     {
-        return libc_EINVAL();
+        return libc_einval();
     }
     if count_objs == 0 || objs.is_null() || counts.is_null() || props.is_null() || values.is_null()
     {
-        return libc_EINVAL();
+        return libc_einval();
     }
     // The two per-object arrays are read `count_objs` times each, so they are
     // checked for that many elements before the first read: this request is
@@ -1466,7 +1466,7 @@ fn mode_atomic(arg: usize) -> isize {
         for i in 0..count_objs {
             sum += unsafe { counts.add(i).read_unaligned() } as usize;
             if sum > MAX_ATOMIC_PROPS {
-                return libc_EINVAL();
+                return libc_einval();
             }
         }
         sum
@@ -1502,13 +1502,13 @@ fn mode_atomic(arg: usize) -> isize {
             && blob != 0
             && !mode_blob_fits(&st, blob)
         {
-            return libc_EINVAL();
+            return libc_einval();
         }
         if let Some(fb) = plan.plane_fb
             && fb != 0
             && !fb_fits(&st, fb)
         {
-            return libc_EINVAL();
+            return libc_einval();
         }
         if flags & ATOMIC_TEST_ONLY != 0 {
             // A rehearsal: the answer is the one the checks above gave.
@@ -1600,7 +1600,7 @@ impl Commit {
                 | (PLANE_ID, PROP_IN_FENCE_FD)
         ) || (obj == PLANE_ID && (PROP_SRC_X..=PROP_CRTC_H).contains(&prop));
         if !known {
-            return Err(libc_EINVAL());
+            return Err(libc_einval());
         }
         if obj == CRTC_ID && prop == PROP_MODE_ID {
             self.mode_blob = Some(value as u32);
@@ -1651,7 +1651,7 @@ fn create_blob(arg: usize) -> isize {
     let data = unsafe { (arg as *const u64).read_unaligned() } as *const u8;
     let length = unsafe { ((arg + 8) as *const u32).read_unaligned() } as usize;
     if length == 0 || length > MAX_BLOB || data.is_null() {
-        return libc_EINVAL();
+        return libc_einval();
     }
     // The bytes are the caller's, and this is a read of them: a length the
     // card will copy and an address that is not mapped are the two ways this
@@ -1695,7 +1695,7 @@ fn get_propblob(arg: usize) -> isize {
             .and_then(|b| b.as_ref())
             .cloned()
     }) else {
-        return libc_EINVAL();
+        return libc_einval();
     };
     unsafe {
         if want as usize >= bytes.len()
@@ -1721,7 +1721,7 @@ fn destroy_blob(arg: usize) -> isize {
                 *slot = None;
                 0
             }
-            _ => libc_EINVAL(),
+            _ => libc_einval(),
         }
     })
 }
@@ -1867,7 +1867,7 @@ fn obj_get_properties(arg: usize) -> isize {
             _ => None,
         }
     }) else {
-        return libc_EINVAL();
+        return libc_einval();
     };
     unsafe {
         let want = ((arg + 16) as *const u32).read_unaligned();
@@ -1950,7 +1950,7 @@ fn add_fb(arg: usize) -> isize {
             unsafe { (arg as *mut u32).write_unaligned(id) };
             0
         }
-        None => libc_EINVAL(),
+        None => libc_einval(),
     }
 }
 
@@ -1969,12 +1969,12 @@ fn add_fb2(arg: usize) -> isize {
     let offset = unsafe { ((arg + 52) as *const u32).read_unaligned() };
     let modifier = unsafe { ((arg + 68) as *const u64).read_unaligned() };
     if offset != 0 || modifier != 0 {
-        return libc_EINVAL();
+        return libc_einval();
     }
     let (bpp, depth) = match format {
         DRM_FORMAT_XRGB8888 | DRM_FORMAT_XBGR8888 => (32, 24),
         DRM_FORMAT_ARGB8888 | DRM_FORMAT_ABGR8888 => (32, 32),
-        _ => return libc_EINVAL(),
+        _ => return libc_einval(),
     };
     let id = critical_section::with(|cs| {
         insert_fb(
@@ -1992,7 +1992,7 @@ fn add_fb2(arg: usize) -> isize {
             unsafe { (arg as *mut u32).write_unaligned(id) };
             0
         }
-        None => libc_EINVAL(),
+        None => libc_einval(),
     }
 }
 
@@ -2009,7 +2009,7 @@ fn get_fb(arg: usize) -> isize {
             .filter_map(|f| f.as_ref())
             .find(|f| f.id == id)
         else {
-            return libc_EINVAL();
+            return libc_einval();
         };
         unsafe {
             ((arg + 4) as *mut u32).write_unaligned(fb.width);
@@ -2031,7 +2031,7 @@ fn get_fb(arg: usize) -> isize {
 /// is the refusal Linux makes too.
 fn destroy_handle(handle: usize) -> isize {
     if handle == 0 {
-        return libc_EINVAL();
+        return libc_einval();
     }
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
@@ -2044,7 +2044,7 @@ fn destroy_handle(handle: usize) -> isize {
                 *slot = None;
                 0
             }
-            _ => libc_EINVAL(),
+            _ => libc_einval(),
         }
     })
 }
@@ -2106,7 +2106,7 @@ fn prime_handle_to_fd(arg: usize) -> isize {
         Some(buf)
     });
     let Some(buf) = buf else {
-        return libc_EINVAL();
+        return libc_einval();
     };
     // The descriptor, in the caller's own table, under the caller's own
     // descriptor ceiling.
@@ -2114,7 +2114,7 @@ fn prime_handle_to_fd(arg: usize) -> isize {
     let fd = match crate::sched::current_fds().install(file) {
         Ok(fd) => fd,
         Err(crate::vfs::VfsError::TooManyDescriptors) => return -24, // EMFILE
-        Err(_) => return libc_EINVAL(),
+        Err(_) => return libc_einval(),
     };
     if flags & DRM_CLOEXEC != 0 {
         let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
@@ -2140,7 +2140,7 @@ fn prime_fd_to_handle(arg: usize) -> isize {
     // must outlive the statement that asks for it.
     let inode = file.inode();
     let Some(buf) = inode.as_dmabuf() else {
-        return libc_EINVAL(); // not a dma-buf descriptor
+        return libc_einval(); // not a dma-buf descriptor
     };
     let handle = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
@@ -2170,7 +2170,7 @@ fn prime_fd_to_handle(arg: usize) -> isize {
         handle
     });
     if handle == 0 {
-        return libc_EINVAL(); // the handle table is full
+        return libc_einval(); // the handle table is full
     }
     unsafe { (arg as *mut u32).write_unaligned(handle) };
     0
@@ -2182,7 +2182,7 @@ fn page_flip(arg: usize) -> isize {
     let crtc_id = unsafe { (arg as *const u32).read_unaligned() };
     let fb_id = unsafe { ((arg + 4) as *const u32).read_unaligned() };
     if crtc_id != CRTC_ID {
-        return libc_EINVAL();
+        return libc_einval();
     }
     let rc = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
@@ -2227,7 +2227,7 @@ fn create_dumb(arg: usize) -> isize {
     let width = unsafe { ((arg + 4) as *const u32).read_unaligned() };
     let bpp = unsafe { ((arg + 8) as *const u32).read_unaligned() };
     if bpp == 0 || width == 0 || height == 0 {
-        return libc_EINVAL();
+        return libc_einval();
     }
     let handle = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
@@ -2257,7 +2257,7 @@ fn map_dumb(arg: usize) -> isize {
     // struct drm_mode_map_dumb: handle@0, pad@4, offset@8(u64).
     let handle = unsafe { (arg as *const u32).read_unaligned() } as usize;
     if handle == 0 {
-        return libc_EINVAL();
+        return libc_einval();
     }
     // Encode the buffer's slot into the mmap offset so `mmap_frame` can find
     // it from the absolute page index the kernel's mmap hands it.

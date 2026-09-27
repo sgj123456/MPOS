@@ -787,14 +787,14 @@ pub fn close_last(file: &Arc<crate::vfs::file::File>) {
 pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>]) {
     let mut seen: Vec<*const crate::vfs::file::File> = Vec::new();
     for file in files {
-        let ptr = Arc::as_ptr(file) as *const crate::vfs::file::File;
+        let ptr = Arc::as_ptr(file);
         if seen.contains(&ptr) {
             continue;
         }
         let total = Arc::strong_count(file);
         let in_batch = files
             .iter()
-            .filter(|other| Arc::as_ptr(other) as *const crate::vfs::file::File == ptr)
+            .filter(|other| core::ptr::eq(Arc::as_ptr(other), ptr))
             .count();
         if total == in_batch {
             seen.push(ptr);
