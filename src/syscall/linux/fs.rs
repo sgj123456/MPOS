@@ -3048,23 +3048,36 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
         }
         0x5413 => {
-            // TIOCGWINSZ: report 80x25. `isatty` is a call to this on musl,
-            // so it has to work on a tty and fail everywhere else - and the
-            // "everywhere else" is load-bearing: a program that finds its
-            // stdin a terminal when it is a pipe draws the wrong conclusion
-            // about where its input came from. fish's `source`, piped a
-            // script on stdin, asked exactly that question and gave up.
+            // TIOCGWINSZ: the shape of the terminal the descriptor names.
+            // `isatty` is a call to this on musl, so it has to work on a tty and
+            // fail everywhere else - and the "everywhere else" is load-bearing:
+            // a program that finds its stdin a terminal when it is a pipe draws
+            // the wrong conclusion about where its input came from. fish's
+            // `source`, piped a script on stdin, asked exactly that question and
+            // gave up.
+            //
+            // The size is the terminal's own, not a constant: a virtual console
+            // is painted by the framebuffer console, so its window is the grid
+            // that console draws - and answering 80x25 there is what drew a
+            // `vim` into the corner of a screen instead of over it (80 of its
+            // 128 columns and 25 of its 48 rows on a 1024x768 display). See
+            // `Tty::window_size`.
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
             };
-            if file.inode().as_tty().is_none() {
+            // The inode is bound first: `as_tty` borrows from it, and a
+            // temporary `Arc` borrowed through would be gone before the
+            // answer it lent was read.
+            let inode = file.inode();
+            let Some(tty) = inode.as_tty() else {
                 return err::ENOTTY;
-            }
+            };
+            let (rows, cols) = tty.window_size();
             if buffer_ok(buf, 8, true, from_user) {
                 unsafe {
-                    (buf as *mut u16).write_unaligned(25);
-                    (buf as *mut u16).add(1).write_unaligned(80);
+                    (buf as *mut u16).write_unaligned(rows);
+                    (buf as *mut u16).add(1).write_unaligned(cols);
                     (buf as *mut u16).add(2).write_unaligned(0);
                     (buf as *mut u16).add(3).write_unaligned(0);
                 }
@@ -3072,6 +3085,42 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             } else {
                 err::EFAULT
             }
+        }
+        0x5414 => {
+            // TIOCSWINSZ: the other half of the pair - a terminal emulator
+            // naming the window its programs should draw in.
+            //
+            // The size lands on the *terminal*, where both ends of a pair read
+            // the same one: an emulator sets it on the master, the program
+            // inside reads it on the slave, and that is the whole of how a pty
+            // knows how big it is. A *change* is also the one thing a
+            // full-screen program cannot notice by itself, so the foreground
+            // group is told - `SIGWINCH`, by the same route a `Ctrl-C` takes.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            // The inode is bound first, as above: `as_tty` borrows from it.
+            let inode = file.inode();
+            let Some(tty) = inode.as_tty() else {
+                return err::ENOTTY;
+            };
+            if !buffer_ok(buf, 8, false, from_user) {
+                return err::EFAULT;
+            }
+            let (rows, cols) = unsafe {
+                (
+                    (buf as *const u16).read_unaligned(),
+                    (buf as *const u16).add(1).read_unaligned(),
+                )
+            };
+            if tty.set_window_size(rows, cols) {
+                // A virtual console stores it and keeps answering its screen
+                // (see `Tty::set_window_size`), so this is a redraw of the same
+                // size there - harmless, and it is what the ABI promises.
+                tty.signal_window_change();
+            }
+            0
         }
         0x540E => {
             // TIOCSCTTY: make the descriptor's tty the controlling terminal.

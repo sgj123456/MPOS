@@ -53,6 +53,10 @@ pub const SIGSTOP: u8 = 19;
 pub const SIGTSTP: u8 = 20;
 pub const SIGTTIN: u8 = 21;
 pub const SIGTTOU: u8 = 22;
+/// The terminal's window changed size. Nothing happens by default - a program
+/// that cares catches it and redraws, and one that does not carries on - which
+/// is why it joins `SIGCHLD` as the table's other "do nothing".
+pub const SIGWINCH: u8 = 28;
 
 /// How many signal numbers a process can hold a disposition for. `Pending` is
 /// a `u32`, so 1..=31 are the numbers this kernel can name at all; the zero
@@ -208,7 +212,7 @@ pub enum DefaultAction {
 /// (`SIGINT`, `SIGTERM`, `SIGPIPE`, `SIGALRM`) are in that group.
 pub fn default_action(sig: u8) -> DefaultAction {
     match sig {
-        SIGCHLD => DefaultAction::Ignore,
+        SIGCHLD | SIGWINCH => DefaultAction::Ignore,
         SIGCONT => DefaultAction::Continue,
         SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => DefaultAction::Stop,
         _ => DefaultAction::Terminate,
@@ -357,6 +361,7 @@ mod tests {
         assert_eq!(SIGCONT, 18);
         assert_eq!(SIGSTOP, 19);
         assert_eq!(SIGTSTP, 20);
+        assert_eq!(SIGWINCH, 28);
     }
 
     /// `signal(7)`: the default action of a signal with no handler is what
@@ -369,6 +374,9 @@ mod tests {
         assert_eq!(default_action(SIGKILL), DefaultAction::Terminate);
         assert_eq!(default_action(SIGTERM), DefaultAction::Terminate);
         assert_eq!(default_action(SIGCHLD), DefaultAction::Ignore);
+        // A resize must not kill the program being resized, so this is the
+        // other number whose default action is to do nothing.
+        assert_eq!(default_action(SIGWINCH), DefaultAction::Ignore);
         assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
         for sig in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
             assert_eq!(default_action(sig), DefaultAction::Stop);

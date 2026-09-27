@@ -40,7 +40,7 @@ use super::termios::{
 use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
 #[cfg(target_os = "none")]
-use crate::sched::signal::SIGINT;
+use crate::sched::signal::{SIGINT, SIGWINCH};
 
 const LF: u8 = b'\n';
 const CR: u8 = b'\r';
@@ -1323,6 +1323,11 @@ pub struct Tty {
     output: Mutex<RefCell<TtyOutput>>,
     /// What `st_rdev` reports.
     dev_id: (u32, u32),
+    /// The window a program is told it has, in `(rows, columns)`, for a
+    /// terminal whose size the kernel cannot know: what `TIOCSWINSZ` last set,
+    /// and 25x80 until an emulator says otherwise. A virtual console stores it
+    /// too but is answered from its screen instead - see [`Tty::window_size`].
+    winsize: Mutex<RefCell<(u16, u16)>>,
 }
 
 /// `KDSETMODE`/`KDGETMODE`: the console's video mode, Linux's values.
@@ -1350,6 +1355,67 @@ impl Tty {
             foreground: Mutex::new(RefCell::new(None)),
             output: Mutex::new(RefCell::new(output)),
             dev_id,
+            winsize: Mutex::new(RefCell::new((25, 80))),
+        }
+    }
+
+    /// The window a program is told it has, in `(rows, columns)` - what
+    /// `TIOCGWINSZ` answers.
+    ///
+    /// A *virtual console* answers the size of the screen it is painted on: the
+    /// framebuffer console is that console's terminal emulator, so the grid it
+    /// draws into *is* the window, and it is computed from the scanout at
+    /// `CELL_W`x`CELL_H` (see `drivers/video/render.rs`). Answering anything
+    /// else is how a full-screen program came to lay itself out in the corner
+    /// of the screen: this used to be a constant 25x80, so on a 1024x768
+    /// display - a 128x48 grid - `vim` drew 80 of its 128 columns and 25 of its
+    /// 48 rows and left the rest blank.
+    ///
+    /// Anything else - the serial wire, a `/dev/ptmx` pair - answers what
+    /// `TIOCSWINSZ` last set, and 25x80 until an emulator says otherwise: the
+    /// kernel has no way to know how wide a terminal on the other end of a wire
+    /// is, and Linux has no better answer for a `ttyS0` either.
+    pub fn window_size(&self) -> (u16, u16) {
+        // Asked rather than cached, so a console whose screen changed under it
+        // - a different scanout, a console the mux moved - answers correctly
+        // with no bookkeeping to keep in step.
+        if let Some(vc) = self.vc_number()
+            && let Some((rows, cols)) =
+                super::term::with_screen(vc as usize, |g| (g.rows(), g.cols()))
+        {
+            return (rows as u16, cols as u16);
+        }
+        critical_section::with(|cs| *self.winsize.borrow(cs).borrow())
+    }
+
+    /// Record a window size - `TIOCSWINSZ` - and report whether it *changed*,
+    /// which is the caller's cue to raise `SIGWINCH`.
+    ///
+    /// A virtual console stores it and does not answer it: the screen is that
+    /// console's real size and [`window_size`](Self::window_size) prefers it, so
+    /// a `stty rows` on one is accepted and has no effect rather than answering
+    /// a number that disagrees with what is being painted. On a terminal where
+    /// nothing else knows the size, this is the size.
+    pub fn set_window_size(&self, rows: u16, cols: u16) -> bool {
+        critical_section::with(|cs| {
+            let mut size = self.winsize.borrow(cs).borrow_mut();
+            let changed = *size != (rows, cols);
+            *size = (rows, cols);
+            changed
+        })
+    }
+
+    /// Tell the foreground group the window changed - `SIGWINCH`, the one signal
+    /// a full-screen program redraws on.
+    ///
+    /// The same seam an interrupt takes, and for the same reason: a pipeline is
+    /// one job and every process in it has the same window, so a resize aimed at
+    /// the job is aimed at all of it. A program that does not catch it carries
+    /// on, which is what the default action says.
+    #[cfg(target_os = "none")]
+    pub fn signal_window_change(&self) {
+        if let Some(pgid) = self.foreground() {
+            crate::sched::send_signal_group(pgid, SIGWINCH);
         }
     }
 
@@ -1777,7 +1843,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{Action, Key, LineDiscipline};
+    use super::{Action, Key, LineDiscipline, Tty, TtyOutput};
     use crate::vfs::termios::{ECHO, ECHOCTL, ICANON, ICRNL, ISIG, VERASE, VMIN};
 
     fn fed(bytes: &[u8]) -> LineDiscipline {
@@ -2355,5 +2421,39 @@ mod tests {
         assert_eq!(LineDiscipline::csi_key(b'~', b"5"), Some(Key::PageUp));
         assert_eq!(LineDiscipline::csi_key(b'R', b"41;5"), None);
         assert_eq!(LineDiscipline::ss3_key(b'H'), Some(Key::Home));
+    }
+
+    /// A virtual console's window is the screen it is painted on, which is what
+    /// stops a full-screen program laying itself out in the corner of one.
+    ///
+    /// The two halves matter equally: the grid is the answer when there *is*
+    /// one, and the answer a terminal with no screen of its own gets must not
+    /// change. Six is used as the console number because no other test here
+    /// makes a screen, so the "before" half of this cannot be reading somebody
+    /// else's grid.
+    #[test]
+    fn a_console_reports_its_screens_window_and_others_do_not() {
+        let console = Tty::new((4, 6), TtyOutput::Discard);
+        // No screen yet - a headless machine, or before the render task has
+        // made one - keeps the shape this kernel has always answered.
+        assert_eq!(console.window_size(), (25, 80));
+
+        crate::vfs::term::make_screen(6, 50, 160);
+        assert_eq!(console.window_size(), (50, 160));
+
+        // A `/dev/ptmx` pair is not a console however many screens exist, so
+        // what it reports is what `TIOCSWINSZ` set - which is the only way a
+        // pty's size can be known at all, its emulator being in userspace.
+        let pair = Tty::new((136, 3), TtyOutput::Discard);
+        assert_eq!(pair.window_size(), (25, 80));
+        assert!(pair.set_window_size(30, 100), "a new size is a change");
+        assert_eq!(pair.window_size(), (30, 100));
+        assert!(!pair.set_window_size(30, 100), "setting it again is not");
+
+        // A console stores a set size and goes on answering its screen: the
+        // screen is what is being painted, and a number that disagreed with it
+        // would be the same lie the corner-drawing bug came from.
+        assert!(console.set_window_size(30, 100));
+        assert_eq!(console.window_size(), (50, 160));
     }
 }
