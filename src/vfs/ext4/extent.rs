@@ -132,7 +132,7 @@ pub(crate) fn ext_init_header(node: &mut [u8], depth: u16) {
 pub(crate) fn ext_insert(node: &mut [u8], at: usize) {
     let count = ext_entries(node);
     assert!(
-        count + 1 <= ext_max(node),
+        count < ext_max(node),
         "extent node holds {count} of {} entries already",
         ext_max(node)
     );
@@ -176,4 +176,138 @@ pub(crate) fn ext_write_index(node: &mut [u8], i: usize, first: u32, child: u64)
     set32(node, at + 4, child as u32);
     set16(node, at + 8, (child >> 32) as u16);
     set16(node, at + 10, 0);
+}
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use super::*;
+
+    /// A node image of `depth`, in the sixty bytes an inode's `i_block` gives
+    /// the tree's root.
+    fn root(depth: u16) -> [u8; EXTENT_ROOT_BYTES] {
+        let mut node = [0u8; EXTENT_ROOT_BYTES];
+        ext_init_header(&mut node, depth);
+        node
+    }
+
+    /// The length field is the unwritten flag, and the boundary is the whole
+    /// reason it is a function and not a mask: 32768 is the longest *written*
+    /// run, and a top-bit test reads it as a zero-length hole.
+    #[test]
+    fn the_length_is_the_flag_at_its_own_boundary() {
+        assert_eq!(ext_len(0), (0, false));
+        assert_eq!(ext_len(1), (1, false));
+        assert_eq!(ext_len(32767), (32767, false));
+        assert_eq!(ext_len(EXTENT_INIT_MAX), (EXTENT_INIT_MAX as u64, false));
+        assert_eq!(ext_len(EXTENT_INIT_MAX + 1), (1, true));
+        assert_eq!(
+            ext_len(u16::MAX),
+            ((u16::MAX - EXTENT_INIT_MAX) as u64, true)
+        );
+    }
+
+    /// Every raw value round-trips through read-then-write, which is the
+    /// property a truncate rewriting a run's head depends on: a length written
+    /// back without its flag turns a hole into whatever the block last held.
+    #[test]
+    fn a_length_written_back_is_the_one_that_was_read() {
+        for raw in [
+            0u16,
+            1,
+            4096,
+            32767,
+            EXTENT_INIT_MAX,
+            EXTENT_INIT_MAX + 1,
+            u16::MAX,
+        ] {
+            let (len, unwritten) = ext_len(raw);
+            assert_eq!(ext_raw_len(len, unwritten), raw, "raw {raw}");
+        }
+    }
+
+    #[test]
+    fn an_empty_node_carries_the_magic_and_says_how_many_fit() {
+        let node = root(0);
+        assert!(ext_ok(&node));
+        assert_eq!(ext_entries(&node), 0);
+        assert_eq!(ext_depth(&node), 0);
+        assert_eq!(ext_max(&node), 4, "sixty bytes hold four extents");
+
+        // A whole block holds the same header and eighty-odd entries.
+        let mut block = [0u8; 4096];
+        ext_init_header(&mut block, 1);
+        assert!(ext_ok(&block));
+        assert_eq!(ext_max(&block), (4096 - EXTENT_HEADER) / EXTENT_ENTRY);
+        assert_eq!(ext_depth(&block), 1);
+    }
+
+    /// A block number is 48 bits, and the top half lives in the length field's
+    /// neighbour - a read that drops it names the wrong block on any volume
+    /// whose data start above 2^32 sectors.
+    #[test]
+    fn a_leaf_entry_carries_a_block_above_the_32_bit_line() {
+        let mut node = root(0);
+        ext_insert(&mut node, 0);
+        ext_write_leaf(&mut node, 0, 1234, 7, 0x1_2345_6789);
+        assert_eq!(ext_entries(&node), 1);
+        assert_eq!(ext_leaf(&node, 0), (1234, 7, 0x1_2345_6789));
+    }
+
+    #[test]
+    fn an_index_entry_carries_the_child_block_everywhere() {
+        let mut node = root(1);
+        ext_insert(&mut node, 0);
+        ext_write_index(&mut node, 0, 99, 0xffff_0000_0001);
+        assert_eq!(ext_index(&node, 0), (99, 0xffff_0000_0001));
+    }
+
+    /// Inserting in the middle opens a hole and shifts the rest up - the shift
+    /// is what keeps the entries sorted by logical block, which every lookup
+    /// below assumes.
+    #[test]
+    fn inserting_opens_a_hole_and_shifts_the_rest_up() {
+        let mut node = root(0);
+        for i in 0..3 {
+            ext_insert(&mut node, i);
+            ext_write_leaf(&mut node, i, i as u32, 1, 100 + i as u64);
+        }
+        ext_insert(&mut node, 1);
+        ext_write_leaf(&mut node, 1, 42, 2, 4242);
+
+        assert_eq!(ext_entries(&node), 4);
+        assert_eq!(ext_leaf(&node, 0), (0, 1, 100));
+        assert_eq!(ext_leaf(&node, 1), (42, 2, 4242));
+        assert_eq!(ext_leaf(&node, 2), (1, 1, 101));
+        assert_eq!(ext_leaf(&node, 3), (2, 1, 102));
+    }
+
+    /// A node that is full is a node that splits; inserting into one anyway is
+    /// a bug the assert turns into a message rather than an overwrite of
+    /// whatever follows the image in memory.
+    #[test]
+    #[should_panic(expected = "holds 4 of 4")]
+    fn inserting_into_a_full_node_panics_rather_than_overflowing() {
+        let mut node = root(0);
+        for i in 0..4 {
+            ext_insert(&mut node, i);
+        }
+        ext_insert(&mut node, 0);
+    }
+
+    /// The root image is the inode's own fifteen words, and reading it back
+    /// must be the same words - an inode that loses its tree on a write-back
+    /// is a file with no blocks.
+    #[test]
+    fn the_root_image_is_the_inodes_fifteen_words() {
+        let mut data = InodeData::parse(&[0u8; 128]);
+        for (i, word) in data.block.iter_mut().enumerate() {
+            *word = 0x1000_0000 + i as u32;
+        }
+        let image = ext_root(&data);
+        assert!(!ext_ok(&image), "the words are not a header");
+
+        let mut back = InodeData::parse(&[0u8; 128]);
+        ext_put_root(&mut back, &image);
+        assert_eq!(back.block, data.block);
+    }
 }

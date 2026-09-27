@@ -342,3 +342,231 @@ pub(crate) struct Group {
     pub(crate) free_blocks: u32,
     pub(crate) free_inodes: u32,
 }
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use super::*;
+
+    /// A superblock that parses: revision 0, 1 KiB blocks, no feature bits at
+    /// all - the shape an old ext2 has, and the least a driver can be asked
+    /// to read. Every test below is this image with one word changed, so what
+    /// it refuses is attributable to that word.
+    fn minimal() -> Vec<u8> {
+        let mut bytes = vec![0u8; SUPERBLOCK_AT as usize];
+        set16(&mut bytes, 56, MAGIC);
+        set16(&mut bytes, 58, STATE_VALID_FS);
+        set32(&mut bytes, 32, 8 * 1024); // blocks_per_group
+        set32(&mut bytes, 40, 1024); // inodes_per_group
+        bytes
+    }
+
+    /// The refusal message of a superblock that does not parse. `Super` has no
+    /// `Debug` to hand `unwrap_err`, and the message is the whole answer
+    /// anyway.
+    fn refusal(bytes: &[u8]) -> &'static str {
+        match Super::parse(bytes) {
+            Ok(_) => panic!("the superblock parsed, and this test expected a refusal"),
+            Err(e) => e,
+        }
+    }
+
+    /// The buffer has to reach the `s_hash_flags` word the parse always reads
+    /// (offset 352), which is why it is a whole superblock and not 60 bytes.
+    #[test]
+    fn a_minimal_superblock_parses_and_says_what_it_is() {
+        let sb = Super::parse(&minimal()).expect("a minimal ext2 superblock");
+        assert_eq!(sb.log_block_size, 0);
+        assert_eq!(sb.inode_size, 128);
+        assert_eq!(sb.first_ino, 11);
+        assert_eq!(sb.blocks_per_group, 8192);
+        assert_eq!(sb.inodes_per_group, 1024);
+        assert_eq!(sb.desc_size, GROUP_DESC_BYTES as u16);
+        assert!(!sb.has_extents, "no extents bit, no extent trees");
+        assert!(!sb.has_64bit);
+        assert!(!sb.has_journal);
+        assert!(!sb.must_read_only, "a clean ext2 is writable");
+        assert_eq!(sb.sb_block, 0);
+        assert_eq!(sb.sb_off, SUPERBLOCK_AT as usize);
+    }
+
+    /// The magic is the first word asked about: without it the bytes are not
+    /// a superblock at all, and no later field is worth reading.
+    #[test]
+    fn a_wrong_magic_is_refused_before_anything_else() {
+        let mut bytes = minimal();
+        set16(&mut bytes, 56, 0x1234);
+        assert_eq!(refusal(&bytes), "no ext2 magic at byte 1024");
+    }
+
+    /// One word per refusal, so a mount that fails says which word failed.
+    #[test]
+    fn each_field_the_driver_cannot_read_is_refused_by_its_own_name() {
+        let mut bytes = minimal();
+        set32(&mut bytes, 24, 3); // 8 KiB blocks
+        assert_eq!(refusal(&bytes), "ext2 block size above 4096 is unsupported");
+
+        let mut bytes = minimal();
+        set32(&mut bytes, 28, 1); // fragments differ from blocks
+        assert_eq!(refusal(&bytes), "ext2 fragments are unsupported");
+
+        // A feature this driver understands well enough to refuse.
+        let mut bytes = minimal();
+        set32(&mut bytes, 96, 1 << 16); // INCOMPAT_ENCRYPT
+        assert_eq!(
+            refusal(&bytes),
+            "ext4 carries features this driver refuses rather than misreads"
+        );
+
+        // A feature nobody here has heard of.
+        let mut bytes = minimal();
+        set32(&mut bytes, 96, 1 << 20);
+        assert_eq!(
+            refusal(&bytes),
+            "ext4 carries features this driver does not know about"
+        );
+
+        let mut bytes = minimal();
+        set32(&mut bytes, 100, 1 << 20);
+        assert_eq!(
+            refusal(&bytes),
+            "ext4 carries features this driver does not know about"
+        );
+
+        let mut bytes = minimal();
+        set32(&mut bytes, 92, 1 << 20);
+        assert_eq!(
+            refusal(&bytes),
+            "ext4 carries compatible features this driver does not know about"
+        );
+    }
+
+    /// The two group-shape words are not decoration: every walk of the
+    /// bitmap and inode table is strided by them.
+    #[test]
+    fn the_group_shape_is_checked() {
+        let mut bytes = minimal();
+        set32(&mut bytes, 32, 4096); // not eight blocks per KiB
+        assert_eq!(
+            refusal(&bytes),
+            "ext2 blocks-per-group is not the standard eight per KiB"
+        );
+
+        let mut bytes = minimal();
+        set32(&mut bytes, 40, 0);
+        assert_eq!(
+            refusal(&bytes),
+            "ext2 superblock claims zero inodes per group"
+        );
+    }
+
+    /// `64bit` puts the high half of the block count - and of every block
+    /// number - in a second word, and a driver that ignores it sees a large
+    /// filesystem as a small one.
+    #[test]
+    fn the_64bit_bit_reads_the_high_half_of_the_block_count() {
+        let mut bytes = minimal();
+        set32(&mut bytes, 96, INCOMPAT_64BIT);
+        set32(&mut bytes, 4, 0x1234);
+        set32(&mut bytes, 336, 2);
+        let sb = Super::parse(&bytes).expect("64bit is a feature it knows");
+        assert!(sb.has_64bit);
+        assert_eq!(sb.blocks_count, (2u64 << 32) | 0x1234);
+    }
+
+    /// The feature bits the driver keeps are read out of the same word.
+    #[test]
+    fn the_feature_bits_are_read_out_of_their_own_words() {
+        let mut bytes = minimal();
+        set32(&mut bytes, 96, INCOMPAT_EXTENTS);
+        let sb = Super::parse(&bytes).expect("extents are supported");
+        assert!(sb.has_extents);
+
+        let mut bytes = minimal();
+        set32(&mut bytes, 100, ROCOMPAT_METADATA_CSUM);
+        // The superblock's own checksum is the first 1020 bytes from an
+        // all-ones start; write the honest one so only the bit is under test.
+        let csum = csum::sb_csum(&bytes[..1020]);
+        set32(&mut bytes, 1020, csum);
+        let sb = Super::parse(&bytes).expect("metadata_csum is readable");
+        assert!(sb.has_metadata_csum);
+        assert!(!sb.must_read_only, "an honest checksum keeps it writable");
+    }
+
+    /// A volume that was not unmounted cleanly, or that carries a journal
+    /// this driver will not maintain, is read-only rather than refused: an
+    /// image worth reading is worth reading.
+    #[test]
+    fn a_dirty_or_journalled_volume_mounts_read_only() {
+        let mut bytes = minimal();
+        set16(&mut bytes, 58, 0); // no EXT2_VALID_FS
+        let sb = Super::parse(&bytes).expect("a dirty ext2 still parses");
+        assert!(sb.must_read_only, "not cleanly unmounted");
+
+        let mut bytes = minimal();
+        set32(&mut bytes, 92, COMPAT_HAS_JOURNAL);
+        let sb = Super::parse(&bytes).expect("a journalled ext2 still parses");
+        assert!(sb.has_journal);
+        assert!(sb.must_read_only, "no journal is maintained here");
+    }
+
+    /// A stale `s_checksum` means the first 1020 bytes already disagree with
+    /// whoever wrote them, so the volume mounts read-only rather than being
+    /// trusted.
+    #[test]
+    fn a_stale_superblock_checksum_mounts_read_only() {
+        let mut bytes = minimal();
+        set32(&mut bytes, 100, ROCOMPAT_METADATA_CSUM);
+        let csum = csum::sb_csum(&bytes[..1020]);
+        set32(&mut bytes, 1020, csum);
+        // Change a byte the checksum covers without updating it.
+        set32(&mut bytes, 40, 2048);
+        let sb = Super::parse(&bytes).expect("the fields still parse");
+        assert!(sb.must_read_only);
+    }
+
+    /// The recorded position of the superblock is the distance from
+    /// `s_first_data_block` to byte 1024; a claim larger than that distance
+    /// is not a layout, it is an underflow.
+    #[test]
+    fn the_superblocks_own_position_is_the_distance_from_its_first_block() {
+        let mut bytes = minimal();
+        set32(&mut bytes, 20, 1); // 1 KiB blocks: block 1 is the superblock's
+        let sb = Super::parse(&bytes).expect("a 1 KiB filesystem may start at 1");
+        assert_eq!(sb.sb_block, 1);
+        assert_eq!(sb.sb_off, 0, "the superblock sits at the block's start");
+
+        // The same claim on a 4 KiB filesystem puts the superblock 3 KiB
+        // before the block it names.
+        let mut bytes = minimal();
+        set32(&mut bytes, 24, 2); // 4096-byte blocks
+        set32(&mut bytes, 28, 2); // fragments agree
+        set32(&mut bytes, 32, 8 * 4096);
+        set32(&mut bytes, 20, 1);
+        assert_eq!(
+            refusal(&bytes),
+            "ext2 superblock does not sit inside its own first block"
+        );
+    }
+
+    /// The descriptor stride is written down from revision 1 on; a value
+    /// outside the range every format uses is a table no walk can stride.
+    #[test]
+    fn an_unusable_descriptor_stride_is_refused() {
+        let mut bytes = minimal();
+        set32(&mut bytes, 76, 1); // revision 1
+        set16(&mut bytes, 88, 256); // inode_size
+        set32(&mut bytes, 84, 11); // first_ino
+        set16(&mut bytes, 254, 100); // not a descriptor size
+        assert_eq!(refusal(&bytes), "ext4 group descriptor size is unusable");
+
+        // A revision-1 image with the honest stride reads it from the field.
+        let mut bytes = minimal();
+        set32(&mut bytes, 76, 1);
+        set16(&mut bytes, 254, 64);
+        set16(&mut bytes, 88, 256);
+        set32(&mut bytes, 84, 11);
+        let sb = Super::parse(&bytes).expect("a 64-byte stride is the format's own");
+        assert_eq!(sb.desc_size, 64);
+        assert_eq!(sb.inode_size, 256);
+    }
+}

@@ -213,7 +213,7 @@ impl Core {
                 } else {
                     0
                 };
-            if idx + 1 <= per.saturating_sub(was) {
+            if idx < per.saturating_sub(was) {
                 return false;
             }
             let unused = per - (idx + 1);
@@ -415,7 +415,7 @@ impl Core {
             return None;
         }
         let index = (ino - 1) % self.sb.inodes_per_group;
-        let group = self.group(((ino - 1) / self.sb.inodes_per_group) as u32);
+        let group = self.group((ino - 1) / self.sb.inodes_per_group);
         if !self.group_is_live(&group) {
             return None;
         }

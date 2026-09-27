@@ -125,6 +125,135 @@ pub(crate) fn dx_insert_entry(
     dx_set_count(page, entries_at, count + 1);
 }
 
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use super::*;
+
+    /// A minimal index root: the two words an htree checks before it walks
+    /// anything, then the info block at 24.
+    fn root(hash_version: u8, info_length: u8, indirect_levels: u8, unused_flags: u8) -> Vec<u8> {
+        let mut page = vec![0u8; 128];
+        page[28] = hash_version;
+        page[29] = info_length;
+        page[30] = indirect_levels;
+        page[31] = unused_flags;
+        page
+    }
+
+    /// A root is walked only when its info block is the shape this driver
+    /// knows; anything else falls back to a linear insert rather than walking
+    /// a tree it cannot trust.
+    #[test]
+    fn a_root_parses_only_its_own_shape() {
+        let parsed = DxRoot::parse(&root(1, 8, 0, 0)).expect("a well-formed root");
+        assert_eq!(parsed.hash_version, 1);
+        assert_eq!(parsed.indirect_levels, 0);
+        assert_eq!(
+            parsed.entries_at, 32,
+            "the entries begin past the info block"
+        );
+
+        // Hash versions 0..=2 are the ones with a hash this driver computes.
+        assert_eq!(
+            DxRoot::parse(&root(2, 8, 0, 0)).map(|r| r.hash_version),
+            Some(2)
+        );
+        assert!(
+            DxRoot::parse(&root(3, 8, 0, 0)).is_none(),
+            "an unknown hash version is not walked"
+        );
+        // One intermediate level is all an ext2/ext4 without `largedir` has.
+        assert!(DxRoot::parse(&root(1, 8, 1, 0)).is_some());
+        assert!(
+            DxRoot::parse(&root(1, 8, 2, 0)).is_none(),
+            "a tree deeper than the format this driver makes"
+        );
+        // The info length is 8 in every tree anyone has made, and the flag
+        // word's low bit is the "this index is broken" marker.
+        assert!(
+            DxRoot::parse(&root(1, 12, 0, 0)).is_none(),
+            "info length other than eight"
+        );
+        assert!(
+            DxRoot::parse(&root(1, 8, 0, 1)).is_none(),
+            "an index flagged broken"
+        );
+    }
+
+    /// The first word of the info block must be zero - anything else is a
+    /// block that is not this structure.
+    #[test]
+    fn a_root_with_a_nonzero_reserved_word_is_not_an_index() {
+        let mut page = root(1, 8, 0, 0);
+        set32(&mut page, 24, 1);
+        assert!(DxRoot::parse(&page).is_none());
+    }
+
+    /// Entry 0 is not an entry: its two halves are the count and the limit,
+    /// and the real entries begin behind it. Entry `i` beyond that is an
+    /// eight-byte pair - the hash, then the block, whose top four bits are
+    /// reserved and never part of the number.
+    #[test]
+    fn an_entry_is_a_hash_and_a_block_behind_a_mask() {
+        let mut page = vec![0u8; 64];
+        let at = 32;
+        dx_set_count(&mut page, at, 2);
+        set16(&mut page, at, 9); // the limit word, entry 0's low half
+        set32(&mut page, at + 8, 0x1234_5678); // entry 1's hash
+        set32(&mut page, at + 12, 0xf000_0001); // its block, reserved bits set
+        set32(&mut page, at + 16, 0xffff_ffff); // entry 2's hash
+
+        assert_eq!(dx_count(&page, at), 2);
+        assert_eq!(dx_limit(&page, at), 9);
+        assert_eq!(dx_entry_hash(&page, at, 1), 0x1234_5678);
+        assert_eq!(
+            dx_entry_block(&page, at, 1),
+            1,
+            "the reserved top four bits are not part of the block"
+        );
+        assert_eq!(dx_entry_hash(&page, at, 2), 0xffff_ffff);
+    }
+
+    /// A root holds the block less `.`, `..`, the info block and the
+    /// eight-byte tail, one entry per eight bytes - the 123 a real 1 KiB
+    /// `mkfs` records.
+    #[test]
+    fn a_root_holds_what_the_block_leaves_it() {
+        assert_eq!(dx_root_limit(1024, 8), 123);
+        assert_eq!(dx_root_limit(4096, 8), (4096 - 12 - 12 - 8 - 8) / 8);
+        // An intermediate block has no `.`/`..` - just the fake dirent header
+        // that stands in for them.
+        assert_eq!(dx_node_limit(4096), (4096 - DIRENT_HEADER - 8) / 8);
+        assert_eq!(dx_node_limit(1024), (1024 - DIRENT_HEADER - 8) / 8);
+    }
+
+    /// Inserting puts the new pair in the slot *behind* the one it names and
+    /// shifts what follows up - the ordering every probe below relies on.
+    /// With entry 0 the header, inserting behind it lands at index 1.
+    #[test]
+    fn an_insert_puts_the_pair_behind_the_slot_it_names() {
+        let mut page = vec![0u8; 64];
+        let at = 32;
+        dx_set_count(&mut page, at, 2); // the header and one real entry
+        set32(&mut page, at + 8, 10);
+        set32(&mut page, at + 12, 100);
+
+        dx_insert_entry(&mut page, at, 0, 5, 50);
+
+        assert_eq!(dx_count(&page, at), 3);
+        assert_eq!(
+            (dx_entry_hash(&page, at, 1), dx_entry_block(&page, at, 1)),
+            (5, 50),
+            "the new pair went into the slot behind the one named"
+        );
+        assert_eq!(
+            (dx_entry_hash(&page, at, 2), dx_entry_block(&page, at, 2)),
+            (10, 100),
+            "the entry that was there shifted up"
+        );
+    }
+}
+
 impl Core {
     /// Walk the index to the leaf that owns `hash`, validating every level
     /// against the shape it must have. `Err` is "not a tree this driver
@@ -312,6 +441,12 @@ impl Core {
     /// register the new leaf in the index level above (`parent`) right after
     /// the old one. Then put the new entry into whichever half its hash
     /// belongs to.
+    ///
+    /// Splitting is the one operation that needs every part of the node at
+    /// once - the directory, its inode number, the entry being added, the
+    /// hash the level is keyed by and the hash being inserted - because each
+    /// half of the pair is written from the other's state.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dx_split_leaf(
         &self,
         dir: &mut InodeData,
@@ -337,7 +472,7 @@ impl Core {
         self.read_bytes(parent_disk, 0, &mut parent_page);
 
         // The new leaf is the block after every current one.
-        let new_logical = dir.size as u64 / block_size as u64;
+        let new_logical = dir.size / block_size as u64;
         let new_disk = self.bmap_ensure(dir, dir_ino, new_logical)?.0;
         dir.size += block_size as u64;
         dir.blocks += self.block_units(dir.flags);
@@ -439,6 +574,11 @@ impl Core {
     /// has a slot: the node's upper half of entries moves to a fresh block,
     /// and the root's entry naming the old node gains a sibling for the new
     /// one, keyed by the first hash that moved.
+    ///
+    /// The same reason as the leaf split below: the two blocks that trade
+    /// entries are each described by a node, a disk address and a page, and
+    /// all six have to be in hand at once.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dx_split_node(
         &self,
         dir: &mut InodeData,
@@ -456,7 +596,7 @@ impl Core {
         let icount2 = icount - icount1;
         let hash2 = dx_entry_hash(node_page, node_frame.entries_at, icount1);
 
-        let new_logical = dir.size as u64 / block_size as u64;
+        let new_logical = dir.size / block_size as u64;
         let new_disk = self.bmap_ensure(dir, dir_ino, new_logical)?.0;
         dir.size += block_size as u64;
         dir.blocks += self.block_units(dir.flags);

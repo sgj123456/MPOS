@@ -195,3 +195,160 @@ pub(crate) fn dx_hash_name(
     }
     Some(hash)
 }
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use super::*;
+
+    const IV: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+
+    /// A byte enters a hash word sign-extended (the legacy flavor) or
+    /// zero-filled (the unsigned one) - the single place the two differ.
+    #[test]
+    fn a_byte_enters_the_word_signed_or_zero_filled() {
+        assert_eq!(byte_of(0x7f, false), 0x7f);
+        assert_eq!(byte_of(0x7f, true), 0x7f);
+        assert_eq!(byte_of(0x80, false), 0xffff_ff80);
+        assert_eq!(byte_of(0x80, true), 0x80);
+        assert_eq!(byte_of(0xff, false), 0xffff_ffff);
+        assert_eq!(byte_of(0xff, true), 0xff);
+    }
+
+    /// Four bytes pack big-endian into one word, and the rest of the buffer is
+    /// filled with the length repeated - MD4's padding, computed before the
+    /// bytes are read.
+    #[test]
+    fn four_bytes_pack_big_endian_and_the_rest_is_padding() {
+        let mut out = [0u32; 8];
+        str2hashbuf(b"abcd", &mut out, true);
+        assert_eq!(out[0], 0x6162_6364);
+        for word in &out[1..] {
+            assert_eq!(*word, 0x0404_0404, "the length, four times over");
+        }
+    }
+
+    /// A short name packs into one word and the padding still fills the rest:
+    /// two bytes are never dropped, they are shifted up over the padding.
+    #[test]
+    fn a_short_name_packs_into_one_word_and_pads_the_rest() {
+        let mut out = [0u32; 8];
+        str2hashbuf(b"ab", &mut out, true);
+        assert_eq!(out[0], 0x0202_6162); // 'a' then 'b' over the two-byte padding
+        for word in &out[1..] {
+            assert_eq!(*word, 0x0202_0202);
+        }
+    }
+
+    /// A byte above 127 is where the two flavors part company, and only there:
+    /// for an ASCII name the signed and unsigned hashes are the same value.
+    #[test]
+    fn the_two_flavors_differ_only_above_ascii() {
+        let mut signed = [0u32; 8];
+        let mut unsigned = [0u32; 8];
+        str2hashbuf(b"hello", &mut signed, false);
+        str2hashbuf(b"hello", &mut unsigned, true);
+        assert_eq!(signed, unsigned, "an ASCII name hashes the same either way");
+
+        let mut signed = [0u32; 8];
+        let mut unsigned = [0u32; 8];
+        str2hashbuf(&[0xff], &mut signed, false);
+        str2hashbuf(&[0xff], &mut unsigned, true);
+        assert_ne!(signed[0], unsigned[0], "a high byte is where they differ");
+    }
+
+    /// One MD4 round: `a + f(b, c, d) + x`, rotated left by `s`.
+    #[test]
+    fn an_md4_round_is_a_sum_and_a_rotation() {
+        // f = 0 leaves the sum and the rotation, written out.
+        let zero = |_x: u32, _y: u32, _z: u32| 0;
+        assert_eq!(md4_round(zero, 0, 9, 9, 9, 1, 0), 1);
+        assert_eq!(md4_round(zero, 0, 9, 9, 9, 1, 4), 0x10);
+        assert_eq!(md4_round(zero, 0, 9, 9, 9, 0x8000_0001, 1), 3);
+        // f = z ^ (x & (y ^ z)) is MD4's own first round; here it only has to
+        // be the function it is handed.
+        let f = |x: u32, y: u32, z: u32| z ^ (x & (y ^ z));
+        assert_eq!(
+            md4_round(f, 0, 0, 0, 0xffff_ffff, 0, 0),
+            0xffff_ffff,
+            "f(0, 0, ~0) is ~0"
+        );
+    }
+
+    /// The legacy hash of the empty name is the initial word shifted up, which
+    /// is the whole of the hash with no bytes to fold in.
+    #[test]
+    fn the_legacy_hash_of_nothing_is_its_initial_word() {
+        assert_eq!(dx_hack_hash(b"", false), 0x12a3_fe2d << 1);
+        assert_eq!(dx_hack_hash(b"", true), 0x12a3_fe2d << 1);
+    }
+
+    /// The hash an index sorts by: the versions are the ones it implements,
+    /// and the unsigned flag renumbers the signed ones onto them.
+    #[test]
+    fn a_name_hashes_only_for_the_versions_this_driver_writes() {
+        let seed = [0x1234_5678, 0x9abc_def0, 0x0f1e_2d3c, 0x4b5a_6978];
+        for version in 0..=5u8 {
+            assert!(
+                dx_hash_name(b"name", version, seed, false).is_some(),
+                "version {version}"
+            );
+        }
+        assert!(dx_hash_name(b"name", 6, seed, false).is_none());
+        assert!(dx_hash_name(b"name", 0xff, seed, false).is_none());
+    }
+
+    /// The unsigned flag is not a second algorithm: it renumbers the signed
+    /// version onto the unsigned one, so asking for one and asking for the
+    /// other by its number are the same question.
+    #[test]
+    fn the_unsigned_flag_renumbers_the_version_it_names() {
+        let seed = [1, 2, 3, 4];
+        for version in 0..=2u8 {
+            assert_eq!(
+                dx_hash_name(b"some-name", version, seed, true),
+                dx_hash_name(b"some-name", version + 3, seed, false),
+                "version {version} with the unsigned flag"
+            );
+        }
+    }
+
+    /// Every hash is even - the low bit is reserved to mark a leaf that
+    /// continues the previous one - and the seed is part of the answer.
+    #[test]
+    fn a_hash_is_even_and_the_seed_is_part_of_it() {
+        let seed = [1, 2, 3, 4];
+        for version in 0..=5u8 {
+            let hash = dx_hash_name(b"anything", version, seed, false).unwrap();
+            assert_eq!(hash & 1, 0, "version {version} produced an odd hash");
+        }
+        assert_ne!(
+            dx_hash_name(b"name", 1, [1, 2, 3, 4], false),
+            dx_hash_name(b"name", 1, [4, 3, 2, 1], false),
+            "the seed is a salt, not decoration"
+        );
+        // An empty name hashes too: the transforms simply never run.
+        assert!(dx_hash_name(b"", 1, [0; 4], false).is_some());
+    }
+
+    /// The two transforms are the published ones (Linux's `fs/ext4/hash.c`,
+    /// line for line), and this is the value they produce for a fixed input -
+    /// a regression pin rather than a derivation: every index this driver
+    /// ever wrote is sorted by these numbers, so a change here is a change to
+    /// what a Linux that later mounts the image will find.
+    #[test]
+    fn the_transforms_are_locked_to_their_published_vectors() {
+        let mut buf = IV;
+        half_md4_transform(&mut buf, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            buf,
+            [0x8970_0c05, 0xf254_f422, 0xba86_39e5, 0x4e2d_6a7c],
+            "the half-MD4 of the IV over eight words"
+        );
+
+        // The TEA round mixes only the first two words; the last two come back
+        // as the IV's, which is itself part of the shape worth pinning.
+        let mut tea = IV;
+        tea_transform(&mut tea, &[0, 1, 2, 3]);
+        assert_eq!(tea, [0x4189_3e50, 0x763b_7485, IV[2], IV[3]]);
+    }
+}

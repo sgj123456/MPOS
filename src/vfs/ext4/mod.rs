@@ -792,8 +792,8 @@ impl Inode for Ext4Ino {
     /// This is what makes a package install real. `apk` writes each extracted
     /// file's mode through `open(O_CREAT, mode)` and through `chmod`, and a
     /// kernel that accepts both and stores neither hands every binary back as
-    /// 0644: a setuid helper like `doas` or `sudo` then refuses to run at all
-    /// - "not installed setuid" - and an executable script comes out
+    /// 0644: a setuid helper like `doas` or `sudo` then refuses to run at all -
+    /// "not installed setuid" - and an executable script comes out
     /// non-executable, which is the same gate OpenRC's service check is built
     /// on. The bits above the twelve are the node's *kind*, which the inode
     /// already carries and this must not disturb.
@@ -1247,15 +1247,15 @@ impl Inode for Ext4Ino {
             // Zero the bytes past the new end inside the last kept block, so a
             // later grow does not resurrect the truncated tail.
             let tail = (len % block_size) as usize;
-            if tail > 0 {
-                if let Some(block) = self.fs.bmap_lookup(&data, keep_blocks - 1) {
-                    self.fs.update_block(block, |page| {
-                        for b in &mut page[tail..] {
-                            *b = 0;
-                        }
-                        true
-                    });
-                }
+            if tail > 0
+                && let Some(block) = self.fs.bmap_lookup(&data, keep_blocks - 1)
+            {
+                self.fs.update_block(block, |page| {
+                    for b in &mut page[tail..] {
+                        *b = 0;
+                    }
+                    true
+                });
             }
             data.blocks = data
                 .blocks
