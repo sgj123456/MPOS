@@ -7,12 +7,12 @@
 //! (SIGPIPE on a broken pipe) and what a process could be told (SIGINT,
 //! SIGTERM, SIGKILL). More arrive with the tty's foreground-process concept.
 //!
-//! Every signal here is fatal by default. A disposition can be *recorded*
-//! (`rt_sigaction`) but not yet *honoured*: no user frame is ever built for a
-//! handler, so "delivered" and "dies of" are still the same thing. Recording
-//! them is not busywork - it is what lets a query answer `SIG_DFL` with a
-//! zeroed struct, and later what lets a handler become real without changing
-//! the syscall's shape.
+//! A disposition is both recorded (`rt_sigaction`) and *honoured*: the syscall
+//! return path builds an `rt_sigframe` for a handler (`build_frame`,
+//! `crate::syscall::linux::proc`) and `rt_sigreturn` comes back out of it, so
+//! "delivered" and "dies of it" are no longer the same thing. What a signal
+//! does when the task has no handler is the [`default_action`] table, which is
+//! why that table exists at all rather than a single "fatal" answer.
 
 /// Interrupt from the keyboard, once there is a keyboard.
 pub const SIGINT: u8 = 2;
@@ -23,6 +23,14 @@ pub const SIGINT: u8 = 2;
 pub const SIGTRAP: u8 = 5;
 /// Termination, the kind that cannot be caught, blocked or ignored.
 pub const SIGKILL: u8 = 9;
+/// The two the kernel has no opinion about, which is precisely why the console
+/// uses them: a virtual terminal in `VT_PROCESS` mode is told to hand the
+/// screen back by `relsig` and told it has the screen again by `acqsig`, and
+/// those are `SIGUSR1` and `SIGUSR2` in every seat manager's `struct vt_mode`.
+/// Fatal by default - a session that wants to keep its display must install a
+/// handler, which is the agreement `VT_SETMODE` makes.
+pub const SIGUSR1: u8 = 10;
+pub const SIGUSR2: u8 = 12;
 /// Write on a pipe with no one left to read it.
 pub const SIGPIPE: u8 = 13;
 /// The clock a program asked for: `alarm`, `setitimer(ITIMER_REAL)`.
@@ -130,8 +138,9 @@ impl Default for Actions {
 }
 
 impl Action {
-    /// Take the default action: terminate. Every signal this kernel names is
-    /// fatal by default, so "default" and "die of it" are the same thing.
+    /// Run the signal's default action, whatever the [`default_action`] table
+    /// says that is: for most of them terminate, but not for the stop and
+    /// resume group, which is the reason this is not simply "fatal".
     pub fn is_default(&self) -> bool {
         self.handler == SIG_DFL
     }
@@ -227,8 +236,9 @@ pub fn stops_by_default(sig: u8) -> bool {
 /// The alternate stack `sigaltstack` installs, if any.
 ///
 /// `sp` is the region's base, as the caller gave it - not its top, which is
-/// where a stack pointer would start. Nothing switches to it yet: a handler
-/// would have to be about to run, and none ever is.
+/// where a stack pointer would start. A handler installed with `SA_ONSTACK`
+/// runs on it, which is what `build_frame` switches the frame's `rsp` to
+/// (`crate::syscall::linux::proc`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AltStack {
     pub sp: usize,
@@ -355,6 +365,8 @@ mod tests {
         assert_eq!(SIGINT, 2);
         assert_eq!(SIGTRAP, 5);
         assert_eq!(SIGKILL, 9);
+        assert_eq!(SIGUSR1, 10);
+        assert_eq!(SIGUSR2, 12);
         assert_eq!(SIGPIPE, 13);
         assert_eq!(SIGTERM, 15);
         assert_eq!(SIGCHLD, 17);
@@ -378,6 +390,12 @@ mod tests {
         // other number whose default action is to do nothing.
         assert_eq!(default_action(SIGWINCH), DefaultAction::Ignore);
         assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
+        // The console's handover signals kill a session that did not install a
+        // handler, and that is the point: `VT_SETMODE(VT_PROCESS)` is a
+        // promise to answer `VT_RELDISP`, and a session that cannot keep it
+        // must not be trusted with the screen.
+        assert_eq!(default_action(SIGUSR1), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGUSR2), DefaultAction::Terminate);
         for sig in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
             assert_eq!(default_action(sig), DefaultAction::Stop);
             assert!(stops_by_default(sig));

@@ -30,6 +30,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
@@ -119,6 +120,21 @@ const NR_GETFB: u32 = 0xad;
 const NR_ADDFB: u32 = 0xae;
 const NR_RMFB: u32 = 0xaf;
 const NR_PAGE_FLIP: u32 = 0xb0;
+/// The lease family, `<drm_mode.h>`'s numbers: `MODE_CREATE_LEASE` 0xd3,
+/// `MODE_LIST_LESSES` 0xd4, `MODE_REVOKE_LEASE` 0xd5, `MODE_GET_LEASE` 0xd6.
+/// A lease is not a second driver: it is a card descriptor whose set of legal
+/// object ids is a subset, and the only new object in the whole family is the
+/// file descriptor `CREATE_LEASE` hands back.
+const NR_MODE_CREATE_LEASE: u32 = 0xd3;
+const NR_MODE_LIST_LESSES: u32 = 0xd4;
+const NR_MODE_REVOKE_LEASE: u32 = 0xd5;
+const NR_MODE_GET_LEASE: u32 = 0xd6;
+/// `DRM_MODE_LEASE_IMMUTABLE`: the lessor promises not to revoke. Recorded and
+/// reported, *not* enforced below - see [`LeaseSet`].
+const LEASE_IMMUTABLE: u32 = 1;
+/// `DRM_MODE_SEAL_ALL`: seal every sealing option there is. Same honesty: the
+/// flag is stored so a caller reads back what it asked for, and nothing more.
+const LEASE_SEAL_ALL: u32 = 4;
 const NR_CREATE_DUMB: u32 = 0xb2;
 const NR_MAP_DUMB: u32 = 0xb3;
 const NR_DESTROY_DUMB: u32 = 0xb4;
@@ -147,9 +163,12 @@ const NR_PRIME_FD_TO_HANDLE: u32 = 0x2e;
 /// `_DROP_MASTER`. They are `_IO` (no argument), so `arg` is null for them
 /// and they must be answered before the read-buffer check in `drm_ioctl`. A
 /// seat manager reaches them through libdrm when it hands the card to a
-/// compositor. mpos has one card and whoever opened it is its master, so
-/// all three succeed by doing nothing - refusing `SET_MASTER` is what stops
-/// weston from ever getting a master fd it can set a mode on.
+/// compositor, and the answer has to mean something rather than merely
+/// succeed: refusing `SET_MASTER` outright is what stops weston ever getting a
+/// master fd it can set a mode on (its `drmIsMaster` probe is an `AUTH`), and
+/// accepting it without *recording* which console the master sits on is what
+/// lets a compositor keep painting the screen after its VT has been switched
+/// away. See [`master_request`] and [`master_ok`].
 const NR_AUTH: u32 = 0x1c;
 const NR_SET_MASTER: u32 = 0x1e;
 const NR_DROP_MASTER: u32 = 0x1f;
@@ -223,10 +242,6 @@ const CLIENT_CAP_PLANE_COLOR_PIPELINE: u64 = 7;
 /// `DRM_CLOEXEC == O_CLOEXEC` on Linux: mark the handed-out descriptor the
 /// way `open(O_CLOEXEC)` would.
 const DRM_CLOEXEC: u32 = 0x80000;
-/// The magic `GET_MAGIC` hands out. Any value is self-consistent on a card
-/// whose master is whoever opened it; what matters is that the pair of calls
-/// exists for libdrm's setup to make.
-const MAGIC: u32 = u32::from_le_bytes(*b"MPOS");
 
 /// `DRM_MODE_OBJECT_CRTC` / `_CONNECTOR` / `_PLANE`: the object-type tags of
 /// `OBJ_GETPROPERTIES`/`OBJ_SETPROPERTY`.
@@ -572,13 +587,19 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         Ok(f) => f,
         Err(_) => return -9, // EBADF
     };
-    if file.inode().as_drm().is_none() {
+    let inode = file.inode();
+    let Some(card) = inode.as_drm() else {
         return -25; // ENOTTY
-    }
+    };
+    // Which of the card's two names this is: `card0`'s minor 0 is the one that
+    // owns the screen, `renderD128`'s 128 is an allocation handle and is never
+    // asked to prove it owns anything.
+    let minor = card.minor();
+    let ofd = file.ofd();
     // Master/auth requests carry no argument, so answer them before the
     // `arg == 0` fault check below would reject a legitimate no-buffer call.
     if matches!(nr, NR_AUTH | NR_SET_MASTER | NR_DROP_MASTER) {
-        return 0;
+        return master_request(nr, minor, ofd);
     }
     // The caller's argument struct, validated before a single field of it is
     // read or written.
@@ -600,17 +621,21 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
     {
         return -14; // EFAULT
     }
+    // The presentation requests, refused before a byte of the request is read
+    // or a row of it is copied into the scanout: a compositor whose console has
+    // been switched away from must lose the screen at the same moment it loses
+    // the ioctl, not paint one more frame and be told no afterwards.
+    if !master_ok(nr, minor, ofd) {
+        return -13; // EACCES
+    }
     match nr {
         NR_VERSION => fill_version(arg),
         NR_GET_CAP => get_cap(arg),
         NR_SET_CLIENT_CAP => set_client_cap(arg),
-        NR_GET_MAGIC => {
-            // struct drm_auth { drm_magic_t magic; } - the token `AUTH_MAGIC`
-            // accepts below. One master, so the token names nothing.
-            unsafe { (arg as *mut u32).write_unaligned(MAGIC) };
-            0
-        }
-        NR_AUTH_MAGIC => 0, // the only master authenticates its own magic
+        NR_GET_MAGIC => take_magic(minor, ofd, arg),
+        // `struct drm_auth { drm_magic_t magic; }` again, read this way round:
+        // the token the *other* client was given, spent by the master.
+        NR_AUTH_MAGIC => auth_magic(ofd, unsafe { (arg as *const u32).read_unaligned() }),
         NR_SET_VERSION => set_version(arg),
         NR_GEM_CLOSE | NR_DESTROY_DUMB => {
             // struct drm_gem_close / drm_mode_destroy_dumb: handle@0. The
@@ -623,7 +648,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_PRIME_FD_TO_HANDLE => prime_fd_to_handle(arg),
         NR_GETRESOURCES => get_resources(arg),
         NR_GETCRTC => get_crtc(arg),
-        NR_SETCRTC => set_crtc(arg),
+        NR_SETCRTC => set_crtc(arg, card.lease()),
         NR_GETENCODER => get_encoder(arg),
         NR_GETCONNECTOR => get_connector(arg),
         NR_GETPLANERESOURCES => {
@@ -674,11 +699,550 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
             });
             0
         }
-        NR_PAGE_FLIP => page_flip(arg),
+        NR_PAGE_FLIP => page_flip(arg, card.lease()),
+        NR_MODE_CREATE_LEASE => create_lease(card, minor, ofd, arg),
+        NR_MODE_LIST_LESSES => list_leases(card, arg),
+        NR_MODE_REVOKE_LEASE => revoke_lease(card, ofd, arg),
+        NR_MODE_GET_LEASE => get_lease(arg),
         NR_CREATE_DUMB => create_dumb(arg),
         NR_MAP_DUMB => map_dumb(arg),
         _ => -25, // ENOTTY
     }
+}
+
+/// Which open file description holds the master, 0 for nobody.
+///
+/// The master belongs to a *description*, not a process, because that is the
+/// only identity that survives the way a seat manager actually hands a
+/// compositor its card: `SCM_RIGHTS` passes the descriptor, and both ends then
+/// refer to one `File` with one address (`crate::vfs::File::ofd`) - the same key
+/// `flock` and `EVIOCGRAB` arbitrate by. A master recorded against a pid would
+/// be lost the moment weston, rather than seatd, called the next ioctl.
+static MASTER_OFD: AtomicU64 = AtomicU64::new(0);
+/// The thread group that holds it, for the `KDSETMODE` check further down. Linux
+/// does not need this because its tty carries a pointer to the DRM `master`;
+/// this kernel has no object that spans the two, so the process is the closest
+/// thing to one.
+static MASTER_PID: AtomicU64 = AtomicU64::new(0);
+/// The console master was taken on lives in `crate::vfs::vcmux`, not here: it
+/// is the console layer's fact - the same one `KDSETMODE` and `VT_ACTIVATE`
+/// write - and reading it from two places would only let the two disagree.
+/// Whether the master has been revoked by a console switch since it was held:
+/// the one edge in this card's life a compositor can hear without polling,
+/// because it turns the card fd's readability into `POLLHUP`.
+static REVOKED: AtomicBool = AtomicBool::new(false);
+
+/// A magic the master has been handed and not yet spent: the token, and the
+/// description it names.
+type PendingMagic = (u32, u64);
+
+/// The tokens on the card, the descriptions they name, and the descriptions the
+/// master has authenticated.
+///
+/// Linux keeps these as a `drm_magic_list` per `drm_master` plus an `auth` list
+/// per file private, and because its masters are real objects the lists are
+/// shared between the fds of one session. mpos has exactly one master at a
+/// time, which collapses both lists to one table each - and the collapse is the
+/// reason a token here is *global* rather than per-master: it names a
+/// description, and only the master's right to spend it is checked at
+/// `AUTH_MAGIC`.
+static MAGICS: critical_section::Mutex<RefCell<Vec<PendingMagic>>> =
+    critical_section::Mutex::new(RefCell::new(Vec::new()));
+static AUTH_OFD: critical_section::Mutex<RefCell<Vec<u64>>> =
+    critical_section::Mutex::new(RefCell::new(Vec::new()));
+/// The next token to hand out. Non-zero, and never reused within a boot, so a
+/// token is unambiguous even after its description has closed.
+static NEXT_MAGIC: AtomicU32 = AtomicU32::new(1);
+
+/// `DRM_IOCTL_SET_MASTER` / `_DROP_MASTER` / `_AUTH`, which carry no argument
+/// and so are answered before the request's buffer is checked.
+///
+/// mpos has one card and one screen, and the whole point of these three is not
+/// arbitration between competing masters (there is nobody to arbitrate
+/// between) but the *handover*: a compositor that cannot get past `SET_MASTER`
+/// never gets an fd it may set a mode on, and one that is never told it lost
+/// the screen paints over the text console forever. So taking the master
+/// records which console it was taken on, and losing that console revokes it.
+///
+/// The render node is exempt throughout: Mesa's GBM allocates buffers on
+/// `renderD128` precisely because a GL client is not the display master, and a
+/// card that asked it to prove otherwise would take the renderer down with it.
+fn master_request(nr: u32, minor: u32, ofd: u64) -> isize {
+    if minor != 0 {
+        // Not a request a render node answers with anything but success; it has
+        // no screen to own, and libdrm asks anyway on its way to an allocation.
+        return 0;
+    }
+    match nr {
+        NR_SET_MASTER => {
+            // Linux's `SET_MASTER` is *void*: it never fails, and it takes the
+            // card from whoever held it. That is not sloppiness - it is the
+            // recovery path. A compositor that regains its console calls
+            // `SET_MASTER` again and must succeed unconditionally, because the
+            // alternative is a session that lost a race with a `^A` and can
+            // never come back. Taking the master therefore ends the previous
+            // holder's claim, drops the authentications it granted, and leaves
+            // any unspent tokens in place: a token names a *description*, not a
+            // master, and Linux's `DROP_MASTER` keeps those lists too.
+            let previous = MASTER_OFD.swap(ofd, Ordering::Relaxed);
+            if previous != 0 && previous != ofd {
+                critical_section::with(|cs| AUTH_OFD.borrow(cs).borrow_mut().clear());
+            }
+            let vc = current_console();
+            MASTER_PID.store(crate::sched::current_tgid().0 as u64, Ordering::Relaxed);
+            crate::vfs::vcmux::set_master_vc(vc.unwrap_or(0));
+            // A fresh master on a console that still holds the screen clears
+            // the hang-up it was revoked under; a master on a console that is
+            // not on the screen stays revoked, which is the honest state.
+            if crate::vfs::vcmux::master_holds_screen() {
+                REVOKED.store(false, Ordering::Relaxed);
+            }
+            0
+        }
+        NR_DROP_MASTER => {
+            // Also void, and also unconditional: releasing the master is always
+            // allowed, including from a description that is not the master (the
+            // call is a no-op for it rather than an error).
+            if MASTER_OFD.load(Ordering::Relaxed) == ofd {
+                MASTER_OFD.store(0, Ordering::Relaxed);
+                MASTER_PID.store(0, Ordering::Relaxed);
+                crate::vfs::vcmux::set_master_vc(0);
+                REVOKED.store(false, Ordering::Relaxed);
+            }
+            0
+        }
+        // `DRM_IOCTL_AUTH` - the one request whose *failure* libdrm reads as
+        // "you are the master". `drmIsMaster` opens with it, and weston's DRM
+        // backend refuses to build a display device on a descriptor it cannot
+        // prove owns the card, so a card that answered this the other way round
+        // is a card no compositor will drive.
+        _ => {
+            if MASTER_OFD.load(Ordering::Relaxed) == ofd {
+                -22 // EINVAL: the master cannot authenticate itself to itself
+            } else {
+                -13 // EACCES
+            }
+        }
+    }
+}
+
+/// `DRM_IOCTL_GET_MAGIC`: mint a token naming the calling description, for the
+/// master to spend on it.
+///
+/// One outstanding token per description, which is Linux's rule and is what the
+/// list below enforces by removing an old entry before adding the new one: a
+/// client that asks twice must not be authenticatable twice, and a master that
+/// holds a stale token should hear nothing rather than something surprising.
+fn take_magic(minor: u32, ofd: u64, arg: usize) -> isize {
+    if arg == 0 {
+        return -14; // EFAULT: `struct drm_auth` is the whole request
+    }
+    if minor != 0 {
+        // The render node has no master to authenticate to; libdrm does not ask,
+        // and an answer of "no token for you" would be more honest than a token
+        // nothing can spend.
+        return -13; // EACCES
+    }
+    let token = NEXT_MAGIC.fetch_add(1, Ordering::Relaxed);
+    critical_section::with(|cs| {
+        let mut m = MAGICS.borrow(cs).borrow_mut();
+        m.retain(|&(_, owner)| owner != ofd);
+        m.push((token, ofd));
+    });
+    // `struct drm_auth { __u32 magic; }`
+    unsafe { (arg as *mut u32).write_unaligned(token) };
+    0
+}
+
+/// `DRM_IOCTL_AUTH_MAGIC`: the master spends a token to let *another*
+/// description drive the card. The caller must be the master (Linux's
+/// `EACCES`), the token must still exist, and it is consumed either way.
+fn auth_magic(caller: u64, token: u32) -> isize {
+    if !is_master(caller) {
+        return -13; // EACCES: only the master may let someone else in
+    }
+    let named = critical_section::with(|cs| {
+        let mut m = MAGICS.borrow(cs).borrow_mut();
+        m.iter()
+            .position(|&(t, _)| t == token)
+            .map(|at| m.remove(at).1)
+    });
+    match named {
+        Some(owner) => {
+            critical_section::with(|cs| {
+                let mut a = AUTH_OFD.borrow(cs).borrow_mut();
+                if !a.contains(&owner) {
+                    a.push(owner);
+                }
+            });
+            0
+        }
+        // An unknown or already-spent token. Linux answers EACCES here as well:
+        // the caller proved nothing about the token it named.
+        None => -13,
+    }
+}
+
+/// The console the calling task is on, which is the console its session was
+/// given when the seat manager opened it. `(4, 0)` and `(4, 64)` mean "the one
+/// on the screen now", and `Tty::vc_number` already resolves both.
+fn current_console() -> Option<u32> {
+    let (major, minor) = crate::sched::controlling_tty_of_current()?;
+    crate::vfs::tty::by_dev_id((major, minor))?.vc_number()
+}
+
+/// Whether the calling task's console is the one a DRM master holds. Linux lets
+/// this answer stand in for a *terminal*'s foreground at `KDSETMODE`, because the
+/// driver that owns the screen is allowed to say what is drawn on it; a seat
+/// manager that has taken the card but not yet re-opened its own console tty is
+/// the ordinary case it exists for.
+///
+/// The identity checked here is the task's, not the descriptor's, because
+/// `KDSETMODE` arrives on a tty fd and cannot name the card fd it is talking
+/// about - which is also why the answer is "somebody in this process holds the
+/// card", not "this fd is authenticated".
+pub fn card_grabbed_by_current() -> bool {
+    if !master_held() {
+        return false;
+    }
+    let tgid = crate::sched::current_tgid();
+    MASTER_PID.load(Ordering::Relaxed) == tgid.0 as u64
+}
+
+/// Whether anybody holds the card at all. The console the holder named is a
+/// separate question (`crate::vfs::vcmux::master_vc`), because a holder that
+/// named none - a session with no controlling terminal, which is what a test
+/// program has - has no console to lose and so must not be treated as one.
+pub fn master_held() -> bool {
+    MASTER_OFD.load(Ordering::Relaxed) != 0
+}
+
+/// Whether this description is the one that holds the master. Input uses it to
+/// tell "the grab belongs to the session on the screen" from "somebody's grab
+/// outlived their claim on the screen".
+pub fn is_master(ofd: u64) -> bool {
+    ofd != 0 && MASTER_OFD.load(Ordering::Relaxed) == ofd
+}
+
+/// Whether this description may drive the screen: the master itself, or one the
+/// master has authenticated with a token. This is Linux's `drm_is_current_master`
+/// answer to `DRM_AUTH`-gated requests, and the whole reason a client of a
+/// compositor (a `weston-simple-dmabuf-egl`, an XWayland) can page-flip without
+/// ever being a master of its own.
+fn is_authorized(ofd: u64) -> bool {
+    is_master(ofd) || critical_section::with(|cs| AUTH_OFD.borrow(cs).borrow().contains(&ofd))
+}
+
+/// Refuse a presentation request from a description that is neither the master
+/// nor authenticated by it, or from a master whose console is no longer the one
+/// on the screen.
+///
+/// The gate is asked before the request's struct is even read, and *not*
+/// applied to the render node, so GBM keeps allocating and `mmap`ing while the
+/// compositor that owns the screen is the only thing that can be locked out.
+///
+/// The second half of the condition is what the console work is about: a page
+/// flip from a session that has lost its console is the mouse-move that paints a
+/// compositor over a text VT, and the frame it commits is already in the scanout
+/// by the time the answer comes back.
+fn master_ok(nr: u32, minor: u32, ofd: u64) -> bool {
+    if minor != 0 || !PRESENTATION.contains(&nr) {
+        return true;
+    }
+    let Some(vc) = crate::vfs::vcmux::master_vc() else {
+        // Either nobody has claimed the card, or whoever did never named a
+        // console to lose. A compositor's first `SETCRTC` can arrive before its
+        // seat manager's `SET_MASTER`, and a machine whose kernel refused it
+        // there would be a machine that cannot show a mode at all - so an
+        // unbound card serves its holder, and only a card bound to a console
+        // can be revoked from one.
+        return true;
+    };
+    if !crate::vfs::vcmux::holds_screen(vc) {
+        revoke();
+        return false;
+    }
+    is_authorized(ofd)
+}
+
+/// Queue a flip-completion event, *after* the frame it reports has been
+/// flushed to the host.
+///
+/// The order is the point. A completion queued at commit time reports a frame
+/// that has not left the machine yet, and a compositor that schedules against it
+/// (which is precisely what `DRM_CAP_TIMESTAMP_MONOTONIC` promises it may do) is
+/// then pacing itself against an event that arrives early, every frame, by
+/// however long the present takes. `request_flush_blocking()` has returned by
+/// now, so `since_boot_nanos` is the landing instant and the render task has
+/// already counted the boundary (which is what `FBIO_WAITFORVSYNC` waits on).
+///
+/// This is the closest thing the machine has to a vertical blank, and the name
+/// says so rather than claiming one: there is no display controller here to be
+/// in blank, only a frame that has gone and one that has not.
+fn queue_flip_event(sequence: u32, user_data: u64) {
+    let now = crate::arch::timer::since_boot_nanos();
+    critical_section::with(|cs| {
+        STATE
+            .borrow(cs)
+            .borrow_mut()
+            .events
+            .push_back(drm_event::Vblank {
+                type_: EVENT_FLIP_COMPLETE,
+                length: 32,
+                user_data,
+                time_sec: (now / 1_000_000_000) as u32,
+                time_usec: ((now % 1_000_000_000) / 1000) as u32,
+                sequence,
+                crtc: CRTC_ID,
+            });
+    });
+    // A reader parked in `poll`/`select` on the card fd was waiting for this
+    // byte; say so, rather than leaving it to the next tick's re-check.
+    wake_card_readers();
+}
+
+/// The tasks parked on the card fd's readability.
+static CARD_WAITERS: critical_section::Mutex<RefCell<Vec<crate::sched::policy::TaskId>>> =
+    critical_section::Mutex::new(RefCell::new(Vec::new()));
+
+/// Wake whoever is polling the card. Called on every frame boundary as well as
+/// on a queued event, because the two questions a card reader asks - "is there
+/// an event?" and "has my flip landed?" - are answered at the same moment.
+fn wake_card_readers() {
+    let waiters = critical_section::with(|cs| CARD_WAITERS.borrow(cs).borrow().clone());
+    for id in waiters {
+        crate::sched::wake(id);
+    }
+}
+
+/// The render task has presented a frame: tell anyone waiting on the card that
+/// the boundary moved.
+pub fn frame_landed() {
+    wake_card_readers();
+}
+
+/// Whether a lease permits the object `id`. An unleased descriptor is the whole
+/// card, so it permits whatever the card has.
+fn leased(lease: Option<&LeaseSet>, id: u32) -> bool {
+    lease.is_none_or(|l| l.holds(id))
+}
+
+/// `DRM_IOCTL_MODE_CREATE_LEASE`: the master hands a subset of the card's
+/// objects to somebody else, as a *file descriptor*.
+///
+/// `struct drm_mode_create_lease { __u64 objects_ptr, __u32 object_count,
+/// __u32 flags, __u32 fd, __u32 __pad }`. The objects are read the way every
+/// other id list on this card is read - `user_array` first, then element by
+/// element - and the fd is installed the way `PRIME_HANDLE_TO_FD` installs its
+/// dma-buf: a new `File`, the lowest free slot, `O_CLOEXEC` if the caller asked.
+///
+/// Only the master may lease. That is not a courtesy: a lease *is* a claim on
+/// the screen, and letting an unauthorised descriptor mint one would be a way to
+/// take the screen without ever calling `SET_MASTER`.
+fn create_lease(card: &DrmCard, minor: u32, caller: u64, arg: usize) -> isize {
+    if minor != 0 || !is_master(caller) {
+        return -13; // EACCES
+    }
+    let objects_ptr = unsafe { (arg as *const u64).read_unaligned() } as usize;
+    let count = unsafe { ((arg + 8) as *const u32).read_unaligned() } as usize;
+    let flags = unsafe { ((arg + 12) as *const u32).read_unaligned() };
+    if count == 0 || objects_ptr == 0 {
+        return -22; // EINVAL
+    }
+    // The two flags this card knows. `IMMUTABLE` and `SEAL_ALL` are recorded on
+    // the lease and read back; neither is enforced, which is spelled out on
+    // [`LeaseSet`] rather than hidden here.
+    if flags & !(LEASE_IMMUTABLE | LEASE_SEAL_ALL | DRM_CLOEXEC) != 0 {
+        return -22; // EINVAL
+    }
+    // Linux bounds a lease at 16 objects; this card has four KMS objects in
+    // total, so the bound is met by construction and asked only to catch a
+    // caller whose count was garbage.
+    if count > 16 {
+        return -7; // E2BIG
+    }
+    let ids = unsafe { core::slice::from_raw_parts(objects_ptr as *const u32, count) };
+    for id in ids {
+        // Every id must be one this card actually has - and for a lease out of
+        // a lease, one its own lease covers. A lease cannot widen what it was
+        // given, which is the whole safety property of the family.
+        if !known_object(*id) || !leased(card.lease(), *id) {
+            return -22; // EINVAL
+        }
+    }
+    let lease = card.lease_of(ids.to_vec(), flags);
+    let fd = match crate::vfs::open_inode(lease) {
+        Ok(fd) => fd,
+        Err(_) => return -24, // EMFILE
+    };
+    if flags & DRM_CLOEXEC != 0 {
+        // A failed `FD_SETFD` on a descriptor we just made is not this request's
+        // failure to report; the lease is real and the flag is the caller's own
+        // `exec` hygiene.
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    unsafe { ((arg + 16) as *mut u32).write_unaligned(fd as u32) };
+    0
+}
+
+/// `DRM_IOCTL_MODE_GET_LEASE`: read a lease fd back - which objects it covers,
+/// and what it was sealed with. The caller names the descriptor in `fd`, and on
+/// a kernel with one card and one lease holder the descriptor answering the
+/// request *is* the one being asked about: an fd belonging to another process is
+/// refused the same `EINVAL` Linux gives a lease that does not exist.
+fn get_lease(arg: usize) -> isize {
+    let want_fd = unsafe { ((arg + 16) as *const u32).read_unaligned() } as i32;
+    let Ok(current) = crate::sched::current_fds().clone_at(want_fd) else {
+        return -22; // EINVAL: there is no such descriptor to ask about
+    };
+    let inode = current.inode();
+    // The descriptor is looked up in the *caller's* table, so the only fd that
+    // can answer is one this process holds - which is the same restriction
+    // Linux imposes by walking the caller's own file-private lease list.
+    let Some(card) = inode.as_drm() else {
+        return -22;
+    };
+    let Some(lease) = card.lease() else {
+        return -22;
+    };
+    let ids = lease.objects();
+    unsafe { (arg as *mut u32).write_unaligned(ids.len() as u32) };
+    let ptr = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
+    if !ids.is_empty() && ptr != 0 && user_array(ptr, ids.len(), 4, true) {
+        let out = ptr as *mut u32;
+        for (i, id) in ids.iter().enumerate() {
+            unsafe { out.add(i).write_unaligned(*id) };
+        }
+    }
+    0
+}
+
+/// The card's four fixed KMS object ids. Property ids are *not* leaseable:
+/// Linux leases connectors, crtcs and planes, and nothing else.
+fn known_object(id: u32) -> bool {
+    matches!(id, CRTC_ID | ENCODER_ID | CONNECTOR_ID | PLANE_ID)
+}
+
+/// `DRM_IOCTL_MODE_LIST_LESSES`: how many leases this descriptor handed out,
+/// and - given room - which of the card's objects are under one.
+///
+/// `struct drm_mode_get_lease { __u32 count_objects, __u32 pad, __u64
+/// objects_ptr }`. The count is always rewritten; the array is filled only when
+/// the caller brought room for it, which is the same two-call shape
+/// `GETRESOURCES` uses.
+fn list_leases(card: &DrmCard, arg: usize) -> isize {
+    let Some(lease) = card.lease() else {
+        // The card itself has no lease list to enumerate: on Linux this is the
+        // lessor's file private, and a plain card descriptor has never leased
+        // anything from itself.
+        unsafe { (arg as *mut u32).write_unaligned(0) };
+        return 0;
+    };
+    let ids = lease.objects();
+    unsafe { (arg as *mut u32).write_unaligned(ids.len() as u32) };
+    // The caller's `count_objects` is both the answer slot and, on the sizing
+    // call, zero: read it back *after* writing, which is what Linux's
+    // `list_len` comparison does with the value the caller brought.
+    let want = unsafe { (arg as *const u32).read_unaligned() } as usize;
+    let ptr = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
+    if want >= ids.len() && ptr != 0 && user_array(ptr, ids.len(), 4, true) {
+        let out = ptr as *mut u32;
+        for (i, id) in ids.iter().enumerate() {
+            unsafe { out.add(i).write_unaligned(*id) };
+        }
+    }
+    0
+}
+
+/// `DRM_IOCTL_MODE_REVOKE_LEASE`: the lessor takes a lease back by the
+/// descriptor number it handed out.
+///
+/// The card cannot look the fd up in the *lessor's* table from here (the ioctl
+/// arrives with the lessor's descriptor, and the lease fd may live in another
+/// process entirely), so Linux marks the lease's file private dead. Here the
+/// lease's own object list is emptied, which refuses every later request that
+/// names an object - the same practical effect for the one card this kernel has.
+fn revoke_lease(_card: &DrmCard, caller: u64, arg: usize) -> isize {
+    // The number names a descriptor in the *caller's* table, and the caller is
+    // the one entitled to take a lease back: a lease may only be revoked by
+    // whoever holds the master that made it.
+    if !is_master(caller) {
+        return -13; // EACCES
+    }
+    let target = unsafe { (arg as *const u32).read_unaligned() } as i32;
+    let Ok(file) = crate::sched::current_fds().clone_at(target) else {
+        return -22; // EINVAL: no such descriptor to take back
+    };
+    let inode = file.inode();
+    let Some(leased) = inode.as_drm().and_then(|c| c.lease()) else {
+        return -22; // EINVAL: the descriptor is not a lease
+    };
+    leased.revoke();
+    0
+}
+
+/// The requests that put pixels on the screen. Everything else the card serves
+/// without asking who owns it: enumerating the topology, making and mapping
+/// buffers, reading back properties. `RMFB` is here because a framebuffer the
+/// CRTC is driving is a framebuffer that cannot be removed, and that is the
+/// master's business rather than an allocator's.
+const PRESENTATION: &[u32] = &[
+    NR_SETCRTC,
+    NR_PAGE_FLIP,
+    NR_MODE_ATOMIC,
+    NR_OBJ_SETPROPERTY,
+    NR_RMFB,
+];
+
+/// The master has lost its console: stop it driving the scanout, and make the
+/// card fd say so.
+fn revoke() {
+    if REVOKED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Drain what is queued rather than holding it back. A compositor blocked in
+    // `poll` on the card fd, waiting for the flip-completion event its own
+    // commit promised, is not resumed by a `POLLHUP` it cannot see until the
+    // events it already waited for are read: it would sit there with its frames
+    // never landing and its session never ending. Empty the queue first and let
+    // the hang-up close it.
+    critical_section::with(|cs| STATE.borrow(cs).borrow_mut().events.clear());
+}
+
+/// A description closed its last reference: it holds nothing any more, and no
+/// token or authentication may name it.
+///
+/// The removal is unconditional rather than "only if it was the master" because
+/// a closed description's address is *reusable*: a token left behind for an
+/// `Arc<File>` that has since been freed would one day name a different file,
+/// and that is a use-after-free dressed up as an authorisation.
+pub fn master_closed(ofd: u64) {
+    if ofd == 0 {
+        return;
+    }
+    critical_section::with(|cs| {
+        MAGICS
+            .borrow(cs)
+            .borrow_mut()
+            .retain(|&(_, owner)| owner != ofd);
+        AUTH_OFD
+            .borrow(cs)
+            .borrow_mut()
+            .retain(|&owner| owner != ofd);
+    });
+    if MASTER_OFD.load(Ordering::Relaxed) == ofd {
+        MASTER_OFD.store(0, Ordering::Relaxed);
+        MASTER_PID.store(0, Ordering::Relaxed);
+        REVOKED.store(false, Ordering::Relaxed);
+        crate::vfs::vcmux::set_master_vc(0);
+    }
+}
+
+/// Whether the card fd should report hang-up: true from the moment a master
+/// loses its console until it either re-takes it (`SET_MASTER` after the
+/// `acqsig`, which is weston's own recovery path) or lets go of the descriptor.
+pub fn revoked() -> bool {
+    REVOKED.load(Ordering::Relaxed)
 }
 
 /// The caller's argument for request `nr`: how many bytes the kernel touches,
@@ -718,9 +1282,18 @@ fn arg_shape(nr: u32) -> Option<(usize, bool)> {
         NR_DESTROY_BLOB => (4, false), // struct drm_mode_destroy_blob
         NR_GETFB => (28, true),        // struct drm_mode_fb_cmd
         NR_ADDFB => (28, false),
-        NR_ADDFB2 => (104, false),     // struct drm_mode_fb_cmd2
-        NR_RMFB => (4, false),         // struct drm_mode_rmfb
-        NR_PAGE_FLIP => (24, false),   // struct drm_mode_crtc_page_flip
+        NR_ADDFB2 => (104, false),   // struct drm_mode_fb_cmd2
+        NR_RMFB => (4, false),       // struct drm_mode_rmfb
+        NR_PAGE_FLIP => (24, false), // struct drm_mode_crtc_page_flip
+        // `struct drm_mode_create_lease`: objects pointer, count, flags, the fd
+        // that comes back, padding - 24 bytes, and both read and written.
+        NR_MODE_CREATE_LEASE => (24, true), // struct drm_mode_create_lease
+        NR_MODE_LIST_LESSES => (16, true),  // struct drm_mode_get_lease
+        NR_MODE_REVOKE_LEASE => (8, false), // struct drm_mode_revoke_lease
+        // `struct drm_mode_get_lease` is the *create* struct minus the flags:
+        // objects pointer, count, the fd being asked about, padding - 24 bytes.
+        NR_MODE_GET_LEASE => (24, true), // struct drm_mode_get_lease is 16; the
+        // 24-byte form is CREATE's answer
         NR_CREATE_DUMB => (32, true),  // struct drm_mode_create_dumb
         NR_MAP_DUMB => (16, true),     // struct drm_mode_map_dumb
         NR_DESTROY_DUMB => (4, false), // struct drm_mode_destroy_dumb
@@ -950,8 +1523,23 @@ fn write_mode(buf: *mut u8, clock_khz: u32, w: u32, h: u32) {
     }
 }
 
-fn crtc_mode_dims() -> (u32, u32) {
-    // The scanout geometry, if the GPU is present; else a fallback.
+/// The size the connector advertises as its available mode: what the host last
+/// asked for, whether or not the scanout has been driven to it. `GETCONNECTOR`
+/// and `GETCRTC` report this, because it is the mode a compositor re-probes for
+/// after a hotplug uevent and may then commit.
+fn advertised_mode_dims() -> (u32, u32) {
+    match crate::drivers::virtio::gpu::global() {
+        Some(gpu) => gpu.advertised_dims(),
+        None => (1024, 768),
+    }
+}
+
+/// The size the scanout is actually driven at: the block a pixel copy writes
+/// into, and the ceiling a committed framebuffer has to fit once any resize this
+/// very commit asked for has landed. It equals [`advertised_mode_dims`] except
+/// in the window between the host asking for a new size and a compositor
+/// committing it.
+fn programmed_mode_dims() -> (u32, u32) {
     match crate::drivers::virtio::gpu::global() {
         Some(gpu) => gpu.dims(),
         None => (1024, 768),
@@ -967,10 +1555,15 @@ fn crtc_mode_dims() -> (u32, u32) {
 /// device carrying `HOTPLUG=1`. A compositor's udev monitor is watching exactly
 /// that - weston's DRM backend logs "[udev] HOTPLUG event" and re-probes its
 /// connectors - and a re-probe is where the new mode is found, because
-/// `GETCONNECTOR` and `GETCRTC` report whatever `crtc_mode_dims` says now.
+/// `GETCONNECTOR` and `GETCRTC` report the size the connector advertises, which
+/// is what [`advertised_mode_dims`] answers.
 ///
-/// Called by the render task after it has rebuilt the scanout, so the mode a
-/// compositor reads back is the mode the hardware is actually driving.
+/// Called by the render task when a host event teaches it a new size, *before*
+/// anything is rebuilt: the announcement is the question, not the answer. The
+/// scanout only follows once a compositor commits the advertised mode through a
+/// modeset. A machine with no compositor to commit - a plain text console - takes
+/// the uevent and drives nothing, which is exactly how Linux's fbcon behaves for
+/// a connector nobody re-modes.
 pub fn display_changed() {
     crate::uevent::publish(&crate::uevent::Event {
         action: "change",
@@ -997,6 +1590,16 @@ pub fn display_changed() {
 /// exactly this question, which is why it is a separate answer from the copy
 /// that follows it.
 fn fb_fits(st: &DrmState, fb_id: u32) -> bool {
+    let (screen_w, screen_h) = programmed_mode_dims();
+    fb_fits_at(st, fb_id, screen_w, screen_h)
+}
+
+/// Whether `fb_id` fits a screen of `screen_w`x`screen_h`. `fb_fits` asks it of
+/// the size now programmed; an atomic commit that carries a new mode asks it of
+/// the size that commit is about to drive, because the framebuffer a compositor
+/// builds for a fresh mode is the size of that mode, not of the screen that has
+/// not been resized yet.
+fn fb_fits_at(st: &DrmState, fb_id: u32, screen_w: u32, screen_h: u32) -> bool {
     let Some(fb) = st
         .fbs
         .iter()
@@ -1008,7 +1611,6 @@ fn fb_fits(st: &DrmState, fb_id: u32) -> bool {
     if !handle_is_dumb(st, fb.handle) {
         return false;
     }
-    let (screen_w, screen_h) = crtc_mode_dims();
     fb.bpp == 32 && fb.width <= screen_w && fb.height <= screen_h
 }
 /// Whether `handle` names a buffer this card can scan out - which is what
@@ -1066,7 +1668,7 @@ fn get_crtc(arg: usize) -> isize {
     // crtc_id@12, fb_id@16, x@20, y@24, gamma_size@28, mode_valid@32, mode@36.
     critical_section::with(|cs| {
         let st = STATE.borrow(cs).borrow();
-        let (w, h) = crtc_mode_dims();
+        let (w, h) = advertised_mode_dims();
         unsafe {
             let p = arg as *mut u8;
             (p.add(12) as *mut u32).write_unaligned(CRTC_ID);
@@ -1078,12 +1680,33 @@ fn get_crtc(arg: usize) -> isize {
     0
 }
 
-fn set_crtc(arg: usize) -> isize {
+fn set_crtc(arg: usize, lease: Option<&LeaseSet>) -> isize {
     // struct drm_mode_crtc: crtc_id@12, fb_id@16, x@20,y@24, ...
     let crtc_id = unsafe { ((arg + 12) as *const u32).read_unaligned() };
     let fb_id = unsafe { ((arg + 16) as *const u32).read_unaligned() };
-    if crtc_id != CRTC_ID {
+    if crtc_id != CRTC_ID || !leased(lease, crtc_id) {
         return libc_einval();
+    }
+    // A legacy modeset carries its mode inline (`drm_mode_crtc.mode` at +36,
+    // whose hdisplay is at +4 and vdisplay at +14). When the caller names the
+    // size the connector advertises but the scanout does not yet drive, that is
+    // a resize asked of the kernel - taken here, before the copy, because the
+    // copy writes into the resized block. Any other mode (the size already
+    // driven, a zeroed mode, or one the host never offered) leaves the geometry
+    // alone, and a framebuffer that does not fit is refused by the copy as
+    // before. Weston drives the atomic path; this keeps the legacy door honest.
+    if fb_id != 0 {
+        let hdisplay = unsafe { ((arg + 40) as *const u16).read_unaligned() } as u32;
+        let vdisplay = unsafe { ((arg + 50) as *const u16).read_unaligned() } as u32;
+        let (adv_w, adv_h) = advertised_mode_dims();
+        if hdisplay > 0
+            && vdisplay > 0
+            && (hdisplay, vdisplay) == (adv_w, adv_h)
+            && (hdisplay, vdisplay) != programmed_mode_dims()
+            && !crate::drivers::video::render::resize_blocking(hdisplay, vdisplay)
+        {
+            return libc_einval();
+        }
     }
     // fb_id 0 is "disable the CRTC": accepted, and nothing is drawn. Any
     // other id must be a framebuffer the card made, whose pixels are put
@@ -1138,7 +1761,7 @@ fn get_connector(arg: usize) -> isize {
     if want != 0 && want != CONNECTOR_ID {
         return libc_einval();
     }
-    let (w, h) = crtc_mode_dims();
+    let (w, h) = advertised_mode_dims();
     // The connector's two properties and their current values - what
     // `OBJ_GETPROPERTIES` also answers, on the path libdrm fills in through
     // `drmModeGetConnector`.
@@ -1528,29 +2151,64 @@ fn mode_atomic(arg: usize) -> isize {
         }
     }
 
+    // The commit's own `user_data` rides back in the completion event, which is
+    // how a compositor that commits for several devices tells them apart -
+    // libdrm hands it to the flip handler as its `data` argument.
+    let want_event = flags & PAGE_FLIP_EVENT != 0;
+    let user_data = unsafe { ((arg + 48) as *const u64).read_unaligned() };
+    // Validate the plan's geometry under the lock, but apply nothing yet. A
+    // commit that carries a new mode has to resize the scanout, and that parks
+    // on the render task, so it cannot happen inside a critical section. This
+    // first section answers "can this commit be honoured" and, when it can and
+    // it moves the geometry, names the size to drive the scanout to.
+    let (rc, resize_to) = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        let mut resize_to: Option<(u32, u32)> = None;
+        // A mode this card cannot show is refused before anything moves.
+        if let Some(blob) = plan.mode_blob.filter(|b| *b != 0) {
+            match (mode_fits(&st, blob), mode_size(&st, blob)) {
+                (true, Some(dims)) => resize_to = Some(dims),
+                _ => return (libc_einval(), None),
+            }
+        }
+        // The framebuffer is judged against the size this commit will drive -
+        // for a resize that is the committed mode, not the scanout that has not
+        // been rebuilt yet, because the buffer a compositor builds for a new
+        // mode is that mode's size.
+        let (cur_w, cur_h) = programmed_mode_dims();
+        let (fit_w, fit_h) = resize_to.unwrap_or((cur_w, cur_h));
+        if let Some(fb) = plan.plane_fb.filter(|f| *f != 0)
+            && !fb_fits_at(&st, fb, fit_w, fit_h)
+        {
+            return (libc_einval(), None);
+        }
+        // A rehearsal is answered by the checks above and drives no resize.
+        if flags & ATOMIC_TEST_ONLY != 0 {
+            return (0, None);
+        }
+        (0, resize_to)
+    });
+    if rc != 0 {
+        return rc;
+    }
+
+    // The scanout rebuild a new mode asks for, done on the render task's hands
+    // because it owns the device - and outside the section, because it parks. A
+    // size the host will not do comes back as the same `EINVAL` Linux gives a
+    // modeset the panel refuses.
+    if let Some((w, h)) = resize_to
+        && (w, h) != programmed_mode_dims()
+        && !crate::drivers::video::render::resize_blocking(w, h)
+    {
+        return libc_einval();
+    }
+
+    // Apply, now that any resize has moved the geometry under it.
+    let mut seq = 0u32;
     let rc = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
-        // The refusals, before anything moves: a mode this card cannot show,
-        // and a buffer it cannot scan out.
-        if let Some(blob) = plan.mode_blob
-            && blob != 0
-            && !mode_blob_fits(&st, blob)
-        {
-            return libc_einval();
-        }
-        if let Some(fb) = plan.plane_fb
-            && fb != 0
-            && !fb_fits(&st, fb)
-        {
-            return libc_einval();
-        }
-        if flags & ATOMIC_TEST_ONLY != 0 {
-            // A rehearsal: the answer is the one the checks above gave.
-            return 0;
-        }
-
-        // Apply. The plane's buffer is the one entry that moves pixels; the
-        // rest is the state a compositor reads back, recorded exactly as the
+        // The plane's buffer is the one entry that moves pixels; the rest is
+        // the state a compositor reads back, recorded exactly as the
         // single-property ioctls record it.
         for (obj, prop, value) in plan.entries() {
             if obj == PLANE_ID && prop == PROP_PLANE_FB_ID {
@@ -1576,30 +2234,18 @@ fn mode_atomic(arg: usize) -> isize {
         }
         if flags & PAGE_FLIP_EVENT != 0 {
             st.seq = st.seq.wrapping_add(1);
-            let seq = st.seq;
-            // `CLOCK_MONOTONIC`, as `DRM_CAP_TIMESTAMP_MONOTONIC` promises and
-            // as `clock_gettime` answers it: the compositor schedules its next
-            // frame against this number.
-            let now = crate::arch::timer::since_boot_nanos();
-            // The commit's own `user_data` rides back in the event, which is
-            // how a compositor that commits for several devices tells them
-            // apart - libdrm hands it to the flip handler as its `data`.
-            let user_data = unsafe { ((arg + 48) as *const u64).read_unaligned() };
-            st.events.push_back(drm_event::Vblank {
-                type_: EVENT_FLIP_COMPLETE,
-                length: 32,
-                user_data,
-                time_sec: (now / 1_000_000_000) as u32,
-                time_usec: ((now % 1_000_000_000) / 1000) as u32,
-                sequence: seq,
-                crtc: CRTC_ID,
-            });
+            seq = st.seq;
         }
         0
     });
-    // Present: the scanout is flushed once the commit has landed.
     if rc == 0 {
+        // Present, *then* report: the commit's completion event is queued once
+        // the frame has actually gone to the host, so its timestamp is the
+        // landing rather than the request. See [`queue_flip_event`].
         crate::drivers::video::render::request_flush_blocking();
+        if want_event {
+            queue_flip_event(seq, user_data);
+        }
     }
     rc
 }
@@ -1658,23 +2304,31 @@ impl Commit {
 /// refusal instead of a walk over the caller's memory.
 const MAX_ATOMIC_PROPS: usize = 512;
 
-/// Whether the blob `id` holds a `drmModeModeInfo` this card can show. The
-/// mode comes from the connector's own list, so a commit that binds one of
-/// those is the only commit that fits; a mode for another panel would need a
-/// different scanout, and there is one.
-fn mode_blob_fits(st: &DrmState, id: u32) -> bool {
-    let Some(bytes) = st.blobs.get(id as usize - 1).and_then(|b| b.as_ref()) else {
-        return false;
-    };
+/// The `hdisplay`/`vdisplay` of the `drmModeModeInfo` stored in blob `id`, if it
+/// is there and long enough to be one.
+fn mode_size(st: &DrmState, id: u32) -> Option<(u32, u32)> {
+    let bytes = st.blobs.get(id as usize - 1).and_then(|b| b.as_ref())?;
     // struct drm_mode_modeinfo: clock@0, hdisplay@4, hsync_start@6,
     // hsync_end@8, htotal@10, hskew@12, vdisplay@14, ...
     if bytes.len() < 68 {
-        return false;
+        return None;
     }
     let hdisplay = u16::from_le_bytes([bytes[4], bytes[5]]);
     let vdisplay = u16::from_le_bytes([bytes[14], bytes[15]]);
-    let (w, h) = crtc_mode_dims();
-    hdisplay as u32 == w && vdisplay as u32 == h
+    Some((hdisplay as u32, vdisplay as u32))
+}
+
+/// Whether the blob `id` holds a `drmModeModeInfo` this card can show. The mode
+/// comes from the connector's own list, so a commit that binds one of those
+/// fits: either the size the connector advertises now - the one the host asked
+/// for and which this very commit will drive the scanout to - or the size
+/// already programmed, for a commit that keeps the geometry and only rebinds a
+/// buffer. A mode for a panel the host never offered fits neither.
+fn mode_fits(st: &DrmState, id: u32) -> bool {
+    let Some((w, h)) = mode_size(st, id) else {
+        return false;
+    };
+    (w, h) == advertised_mode_dims() || (w, h) == programmed_mode_dims()
 }
 
 /// `CREATE_BLOB`: store a property's bytes and hand back an id. A mode is one
@@ -2210,46 +2864,37 @@ fn prime_fd_to_handle(arg: usize) -> isize {
     0
 }
 
-fn page_flip(arg: usize) -> isize {
+fn page_flip(arg: usize, lease: Option<&LeaseSet>) -> isize {
     // struct drm_mode_crtc_page_flip: crtc_id@0, fb_id@4, flags@8, reserved@12,
     // user_data@16.
     let crtc_id = unsafe { (arg as *const u32).read_unaligned() };
     let fb_id = unsafe { ((arg + 4) as *const u32).read_unaligned() };
-    if crtc_id != CRTC_ID {
+    if crtc_id != CRTC_ID || !leased(lease, crtc_id) {
         return libc_einval();
     }
+    // DRM_MODE_PAGE_FLIP_EVENT (0x1) asks for the completion event.
+    let flags = unsafe { ((arg + 8) as *const u32).read_unaligned() };
+    let user_data = unsafe { ((arg + 16) as *const u64).read_unaligned() };
+    let want_event = flags & PAGE_FLIP_EVENT != 0;
     let rc = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         let rc = copy_to_scanout(&st, fb_id);
+        let mut seq = 0;
         if rc == 0 {
             st.current_fb = fb_id;
             st.seq = st.seq.wrapping_add(1);
-            let seq = st.seq;
-            // DRM_MODE_PAGE_FLIP_EVENT (0x1) asks for the completion event.
-            let flags = unsafe { ((arg + 8) as *const u32).read_unaligned() };
-            let user_data = unsafe { ((arg + 16) as *const u64).read_unaligned() };
-            if flags & 0x1 != 0 {
-                // The timestamp is `CLOCK_MONOTONIC` - the clock
-                // `DRM_CAP_TIMESTAMP_MONOTONIC` promises, and the one the
-                // compositor schedules its next frame against. Reading the
-                // RTC anchor here instead would put an epoch-based number
-                // where weston expects seconds since boot.
-                let now = crate::arch::timer::since_boot_nanos();
-                st.events.push_back(drm_event::Vblank {
-                    type_: EVENT_FLIP_COMPLETE,
-                    length: 32,
-                    user_data,
-                    time_sec: (now / 1_000_000_000) as u32,
-                    time_usec: ((now % 1_000_000_000) / 1000) as u32,
-                    sequence: seq,
-                    crtc: CRTC_ID,
-                });
-            }
+            seq = st.seq;
         }
-        rc
+        (rc, seq)
     });
+    let (rc, seq) = rc;
     if rc == 0 {
         crate::drivers::video::render::request_flush_blocking();
+        // The completion is queued *after* the frame has gone out, and carries
+        // that moment's timestamp - see [`queue_flip_event`].
+        if want_event {
+            queue_flip_event(seq, user_data);
+        }
     }
     rc
 }
@@ -2306,13 +2951,101 @@ pub struct DrmCard {
     ino: u64,
     /// The DRM minor this name is: 0 for `card0`, 128 for `renderD128`. DRM's
     /// major is 226 by convention (fixed since XFree86), and the render node's
-    /// minor is the card index plus 128.
+    /// minor is the card index plus 128. A lease gets one of its own (see
+    /// [`DrmCard::lease`]), because `fstat` on a lease fd must not be
+    /// indistinguishable from `fstat` on the card it came from.
     minor: u32,
+    /// The objects this descriptor may drive, or `None` for the whole card.
+    ///
+    /// A lease is *only* this: a subset of the card's object ids, plus the fact
+    /// that its holder is treated as a master of them. Everything else - the
+    /// dumb buffers, the framebuffers, the event queue - is the one shared card
+    /// state, exactly as on Linux, where a lease is a `drm_file` pointing at the
+    /// same `drm_device` with a list of allowed object ids attached.
+    lease: Option<Arc<LeaseSet>>,
+}
+
+/// The object ids one lease descriptor may drive, and the flags it was made
+/// with.
+///
+/// `sealed` is the flags the lessor passed, reported back by `GET_LEASE` and
+/// `LIST_LESSES`-adjacent queries. It is *recorded, not enforced*: an
+/// `IMMUTABLE` lease can still be revoked by its lessor here, and a sealed one
+/// still lets its holder do everything the object ids allow. That is the honest
+/// shape of the gap - Linux's sealing refuses *plane and mode* changes on the
+/// leased object, which is a property set this virtual card does not have, and a
+/// kernel that pretended to seal would be refusing requests it cannot explain.
+pub struct LeaseSet {
+    objects: critical_section::Mutex<RefCell<Vec<u32>>>,
+    sealed: u32,
+}
+
+impl LeaseSet {
+    fn new(objects: Vec<u32>, sealed: u32) -> LeaseSet {
+        LeaseSet {
+            objects: critical_section::Mutex::new(RefCell::new(objects)),
+            sealed,
+        }
+    }
+
+    /// Whether this lease permits the KMS object `id`.
+    pub fn holds(&self, id: u32) -> bool {
+        critical_section::with(|cs| self.objects.borrow(cs).borrow().contains(&id))
+    }
+
+    /// The object ids, as `MODE_GET_LEASE` and `MODE_LIST_LESSES` report them.
+    pub fn objects(&self) -> Vec<u32> {
+        critical_section::with(|cs| self.objects.borrow(cs).borrow().clone())
+    }
+
+    pub fn sealed(&self) -> u32 {
+        self.sealed
+    }
+
+    /// `MODE_REVOKE_LEASE`: the lessor takes the lease back, which empties it.
+    ///
+    /// The descriptor is not torn down - Linux does not do that either, it marks
+    /// the lease's file private dead - so a holder that keeps using it finds
+    /// every object it names refused, which is the same practical effect on the
+    /// one card this kernel has.
+    fn revoke(&self) {
+        critical_section::with(|cs| self.objects.borrow(cs).borrow_mut().clear());
+    }
 }
 
 impl DrmCard {
     pub fn new(ino: u64, minor: u32) -> Arc<DrmCard> {
-        Arc::new(DrmCard { ino, minor })
+        Arc::new(DrmCard {
+            ino,
+            minor,
+            lease: None,
+        })
+    }
+
+    /// A lease of this card: a fresh inode number, the next lease minor, and the
+    /// object ids it may drive.
+    fn lease_of(&self, objects: Vec<u32>, sealed: u32) -> Arc<DrmCard> {
+        static LEASE_INO: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0x9110);
+        static LEASE_MINOR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(64);
+        Arc::new(DrmCard {
+            ino: LEASE_INO.fetch_add(1, Ordering::Relaxed),
+            minor: LEASE_MINOR.fetch_add(1, Ordering::Relaxed),
+            lease: Some(Arc::new(LeaseSet::new(objects, sealed))),
+        })
+    }
+
+    /// The object ids this descriptor may drive, for the requests that name an
+    /// object by id. `None` is the whole card.
+    pub fn lease(&self) -> Option<&LeaseSet> {
+        self.lease.as_deref()
+    }
+
+    /// Which of the card's names this node is: 0 = `card0`, the master's screen;
+    /// 128 = `renderD128`, an allocation handle that is never asked who owns the
+    /// display.
+    pub fn minor(&self) -> u32 {
+        self.minor
     }
 
     /// Whether a `read` would return an event now.
@@ -2372,6 +3105,36 @@ impl Inode for DrmCard {
             read: Self::has_event(),
             write: true,
         }
+    }
+
+    /// The card reports hang-up once its master has lost the console.
+    ///
+    /// This is the only notice a compositor gets that does not depend on it
+    /// asking: weston parks in `poll` on the card fd inside `drmHandleEvent`,
+    /// and a master that has been revoked has nothing left to wait *for* - its
+    /// flips are refused, so no completion event will ever arrive to wake it.
+    /// Without the bit the session is not merely frozen, it is frozen with the
+    /// keyboard and the pointer still pointed at it.
+    fn poll_hup(&self) -> bool {
+        revoked()
+    }
+
+    /// A card reader parks on this list and is woken by the frame that carries
+    /// its event, which is what takes this node off the "readiness nobody can
+    /// announce" list `poll_select`'s comment describes.
+    fn poll_subscribe(&self, id: crate::sched::policy::TaskId) {
+        critical_section::with(|cs| {
+            let mut v = CARD_WAITERS.borrow(cs).borrow_mut();
+            if !v.contains(&id) {
+                v.push(id);
+            }
+        });
+    }
+
+    fn poll_unsubscribe(&self, id: crate::sched::policy::TaskId) {
+        critical_section::with(|cs| {
+            CARD_WAITERS.borrow(cs).borrow_mut().retain(|&w| w != id);
+        });
     }
 
     /// Map a dumb buffer's page. The buffer is chosen from the absolute page

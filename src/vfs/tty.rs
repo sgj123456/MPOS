@@ -1420,6 +1420,24 @@ impl Tty {
         }
     }
 
+    /// Tell the foreground group what the console's `struct vt_mode` named for
+    /// this event: `relsig` says hand the screen back, `acqsig` says it is
+    /// yours again. Which one is the caller's decision, not this one's, so the
+    /// number arrives as an argument rather than as two more constants here.
+    ///
+    /// The job, not the session: a compositor and the shell it left behind are
+    /// different processes in the same job, and on Linux the signal goes to the
+    /// foreground group that `VT_SETMODE` was answered by. A session that
+    /// installed no handler dies of it, which is the correct outcome for a
+    /// promise it could not keep - and the reason an unanswered release is
+    /// bounded by a deadline rather than by this signal alone.
+    #[cfg(target_os = "none")]
+    pub fn signal_console(&self, sig: u8) {
+        if let Some(pgid) = self.foreground() {
+            crate::sched::send_signal_group(pgid, sig);
+        }
+    }
+
     /// Which of the six virtual consoles this terminal *is*, 1-based, or `None`
     /// for a terminal that is not one: a `/dev/pts` slave, a pty master.
     ///
@@ -1779,6 +1797,59 @@ impl Inode for ControllingTty {
 
     /// No scheduler on the host, so no process to ask; the pair tests drive
     /// terminals directly rather than through this name.
+    #[cfg(not(target_os = "none"))]
+    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+        Err(VfsError::NoDevice)
+    }
+}
+
+/// `/dev/tty0`: the virtual console currently on the screen.
+///
+/// The name carries Linux's own device number - `(4, 0)`, "the current VT" -
+/// and `stat` must keep reporting *that*, because it is how a caller tells the
+/// alias apart from the console it happens to point at. What the *descriptor*
+/// becomes is the other half: Linux's `tty_open` for driver 0, inode 0 resolves
+/// the alias through `vt_consalloc` and hands back the foreground console's own
+/// `tty_struct`, so a seat manager that opens `/dev/tty0` finds itself holding
+/// `/dev/tty3` - and `ttyname(3)` on that descriptor says `tty3`, not `tty0`.
+///
+/// mpos used to register the console tty under this name, which made every
+/// `/dev/tty0` descriptor a second `(4, 64)`: `ttyname` said `ttyS0`, and the
+/// foreground-process-group rule a VT's ownership answers by was unreadable
+/// because no terminal that number named had a foreground at all.
+pub struct Tty0;
+
+impl Inode for Tty0 {
+    fn seekable(&self) -> bool {
+        false
+    }
+
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: 0,
+            kind: NodeKind::CharDev,
+            size: 0,
+        }
+    }
+
+    /// Linux's number for the name, kept distinct from the console's `(4, 64)`
+    /// so `stat` can tell the two apart even though they open the same way.
+    fn rdev(&self) -> Option<(u32, u32)> {
+        Some((4, 0))
+    }
+
+    /// The open lands on the console currently shown. A host build has no
+    /// console mux and no foreground console to name, which is the same answer
+    /// [`ControllingTty`] gives for the same reason.
+    #[cfg(target_os = "none")]
+    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+        let shown = super::vcmux::active();
+        let tty = super::pty::lookup(shown)
+            .map(|pty| pty.slave().clone())
+            .unwrap_or_else(global);
+        Ok(Some(tty as Arc<dyn Inode>))
+    }
+
     #[cfg(not(target_os = "none"))]
     fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
         Err(VfsError::NoDevice)

@@ -41,6 +41,10 @@ const fn ior(magic: u8, nr: usize, size: usize) -> usize {
 const VT: u8 = b'V';
 const KD: u8 = b'K';
 const DRM: u8 = b'd';
+/// `_IOW` - the caller's struct is read by the kernel.
+const fn iow(magic: u8, nr: usize, size: usize) -> usize {
+    ioc(1, magic, nr, size)
+}
 
 /// `<linux/vt.h>`, whose requests are `_IO(VT, n)` and so start at zero:
 /// OPENQRY 0x00, GETMODE 0x01, SETMODE 0x02, GETSTATE 0x03, SENDSIG 0x04,
@@ -48,6 +52,7 @@ const DRM: u8 = b'd';
 const NR_VT_OPENQRY: usize = 0x00;
 const NR_VT_GETMODE: usize = 0x01;
 const NR_VT_GETSTATE: usize = 0x03;
+const NR_VT_RELDISP: usize = 0x05;
 const NR_VT_ACTIVATE: usize = 0x06;
 const NR_VT_WAITACTIVE: usize = 0x07;
 /// `<linux/kd.h>`: KDSETMODE 0x3a, KDGETMODE 0x3b, KDGKBMODE 0x44,
@@ -60,6 +65,11 @@ const NR_KDSKBMODE: usize = 0x45;
 const NR_DRM_AUTH: usize = 0x1c;
 const NR_DRM_SET_MASTER: usize = 0x1e;
 const NR_DRM_DROP_MASTER: usize = 0x1f;
+/// `<drm.h>`'s authentication pair, both `_IOW('d', n, struct drm_auth)` where
+/// `struct drm_auth` is one `__u32`: the token a client mints for itself, and
+/// the number the master spends to authorise that client's descriptor.
+const NR_DRM_GET_MAGIC: usize = 0x02;
+const NR_DRM_AUTH_MAGIC: usize = 0x11;
 
 /// `KD_TEXT` / `KD_GRAPHICS`.
 const KD_TEXT: usize = 0x00;
@@ -72,6 +82,24 @@ const K_OFF: usize = 0x04;
 const O_RDWR: usize = 2;
 const ENOTTY: isize = -25;
 const EINVAL: isize = -22;
+const EACCES: isize = -13;
+
+/// `struct vt_mode`'s `mode` field.
+const VT_AUTO: u8 = 1;
+const VT_PROCESS: u8 = 0;
+/// The seat manager's `relsig`/`acqsig`: `SIGUSR1` and `SIGUSR2`.
+const SIGUSR1: u8 = 10;
+const SIGUSR2: u8 = 12;
+/// `VT_SETMODE` is `_IOW('V', 0x02, struct vt_mode)`, so unlike its neighbours
+/// it does carry a size, and a kernel that decoded it as `_IO` would read zero
+/// bytes of a caller that wrote eight.
+const NR_VT_SETMODE: usize = 0x02;
+
+/// `struct vt_mode` in the shape the ioctl layer expects: eight bytes, the
+/// padding the caller's struct has.
+fn vt_mode_bytes(mode: u8, waitv: u8, rel: u8, acq: u8, fr: u8) -> [u8; 8] {
+    [mode, waitv, rel, acq, fr, 0, 0, 0]
+}
 
 /// `struct vt_stat`'s `v_mode`, `v_num`, `v_state` - three shorts.
 fn stat_shorts(buf: &[u8], at: usize) -> u16 {
@@ -105,12 +133,75 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         KD_TEXT as isize,
     );
 
-    // VT_GETMODE -> struct vt_mode: automatic switching, so a manager leaves
-    // the console in the mode it is already in.
+    // VT_GETMODE -> struct vt_mode: a console nobody has claimed is automatic,
+    // which is what tells a manager it can put its session here without asking
+    // permission first.
     let mut vm = [0u8; 8];
     let r = lin::ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as usize);
     lin::check_eq(&mut failed, b"VT_GETMODE succeeds", r, 0);
-    lin::check_true(&mut failed, b"VT_GETMODE reports VT_AUTO", vm[0] == 1);
+    lin::check_eq(
+        &mut failed,
+        b"a free console reports VT_AUTO",
+        vm[0] as isize,
+        VT_AUTO as isize,
+    );
+
+    // VT_SETMODE is where a handover stops being decoration. A session that
+    // wants the screen asks for `VT_PROCESS`, names the two signals the kernel
+    // will use, and *must* find both back: a mode the kernel accepted and
+    // forgot is a mode that cannot be relied on, and the whole `relsig` dance
+    // depends on the console on the screen knowing it was asked to be asked.
+    let want = vt_mode_bytes(VT_PROCESS, 0, SIGUSR1, SIGUSR2, 0);
+    lin::check_eq(
+        &mut failed,
+        b"VT_SETMODE(VT_PROCESS) succeeds",
+        lin::ioctl(tty, iow(VT, NR_VT_SETMODE, 8), want.as_ptr() as usize),
+        0,
+    );
+    let r = lin::ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"VT_GETMODE after SETMODE succeeds", r, 0);
+    lin::check_true(
+        &mut failed,
+        b"VT_GETMODE reads back the mode and both signals",
+        vm == want,
+    );
+
+    // The `EINVAL` set is `<linux/vt.h>`'s and each reason is its own: an
+    // unknown mode, the same signal for giving the screen up and taking it.
+    let junk = vt_mode_bytes(77, 0, SIGUSR1, SIGUSR2, 0);
+    lin::check_eq(
+        &mut failed,
+        b"VT_SETMODE with an unknown mode is EINVAL",
+        lin::ioctl(tty, iow(VT, NR_VT_SETMODE, 8), junk.as_ptr() as usize),
+        EINVAL,
+    );
+    let same = vt_mode_bytes(VT_PROCESS, 0, SIGUSR1, SIGUSR1, 0);
+    lin::check_eq(
+        &mut failed,
+        b"VT_SETMODE with relsig == acqsig is EINVAL",
+        lin::ioctl(tty, iow(VT, NR_VT_SETMODE, 8), same.as_ptr() as usize),
+        EINVAL,
+    );
+    // The mode the two refusals above did *not* take is still the one set,
+    // because a refused SETMODE that half-wrote its struct is worse than one
+    // that was never answered at all.
+    let r = lin::ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"VT_GETMODE after the refusals succeeds", r, 0);
+    lin::check_true(
+        &mut failed,
+        b"a refused VT_SETMODE changed nothing",
+        vm == want,
+    );
+
+    // VT_RELDISP is an answer to a question, and nobody has asked this console
+    // anything yet: a session that could complete a switch it was never offered
+    // would be taking the screen rather than handing it over.
+    lin::check_eq(
+        &mut failed,
+        b"VT_RELDISP with no release outstanding is EINVAL",
+        lin::ioctl(tty, io(VT, NR_VT_RELDISP), 1),
+        EINVAL,
+    );
 
     // VT_OPENQRY: a console number, and not the one already in hand - a second
     // session has somewhere else to go.
@@ -225,6 +316,24 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::ioctl(tty, io(KD, NR_KDSETMODE), KD_TEXT),
         0,
     );
+    // Back to automatic before the program ends, for the same reason the
+    // keyboard mode is restored: a console left in `VT_PROCESS` makes every
+    // later `^A` wait for an answer from a session that has already exited, and
+    // the machine is left switching consoles on a timer.
+    let auto = vt_mode_bytes(VT_AUTO, 0, 0, 0, 0);
+    lin::check_eq(
+        &mut failed,
+        b"VT_SETMODE(VT_AUTO) restores",
+        lin::ioctl(tty, iow(VT, NR_VT_SETMODE, 8), auto.as_ptr() as usize),
+        0,
+    );
+    let r = lin::ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"VT_GETMODE after the restore succeeds", r, 0);
+    lin::check_true(
+        &mut failed,
+        b"the console is back in automatic mode",
+        vm[0] == VT_AUTO,
+    );
     let r = lin::ioctl(tty, io(KD, NR_KDGETMODE), kd.as_mut_ptr() as usize);
     lin::check_eq(&mut failed, b"KDGETMODE after the restore", r, 0);
     lin::check_eq(
@@ -257,23 +366,149 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let card = lin::openat(lin::AT_FDCWD, b"/dev/dri/card0\0", O_RDWR, 0) as i32;
     lin::check_true(&mut failed, b"/dev/dri/card0 opens", card >= 0);
     if card >= 0 {
+        // The card is unclaimed on a test boot, so this session can take it -
+        // and having taken it, it is the only one that may set a mode.
         lin::check_eq(
             &mut failed,
             b"DRM SET_MASTER succeeds (no arg)",
             lin::ioctl(card, io(DRM, NR_DRM_SET_MASTER), 0),
             0,
         );
+        // `drmIsMaster` asks with AUTH, and reads its *failure* as "I am the
+        // master": `EACCES` for a non-master, `EINVAL` for the one that is.
+        // A card that answered 0 here would be a card weston refuses to build a
+        // display device on, and a card that answered EACCES to its master would
+        // be a card no compositor can ever start on.
+        lin::check_eq(
+            &mut failed,
+            b"DRM AUTH as the master is EINVAL",
+            lin::ioctl(card, io(DRM, NR_DRM_AUTH), 0),
+            EINVAL,
+        );
+        let card2 = lin::openat(lin::AT_FDCWD, b"/dev/dri/card0\0", O_RDWR, 0) as i32;
+        lin::check_true(
+            &mut failed,
+            b"/dev/dri/card0 opens a second time",
+            card2 >= 0,
+        );
+        if card2 >= 0 {
+            // A second open is a second *file description*, and a description is
+            // what holds the master - but taking it away from the first is not
+            // an error. Linux's `SET_MASTER` is `void`, because it is the
+            // recovery path: a compositor that lost its console to a `^A` calls
+            // it again when it wins the console back, and a `SET_MASTER` that
+            // could answer "no, somebody else has it" is a compositor that can
+            // never come back. What the steal does is end the first
+            // description's claim, which its next probe reports.
+            lin::check_eq(
+                &mut failed,
+                b"a second descriptor takes the master (SET_MASTER is void)",
+                lin::ioctl(card2, io(DRM, NR_DRM_SET_MASTER), 0),
+                0,
+            );
+            lin::check_eq(
+                &mut failed,
+                b"and the first descriptor is no longer the master",
+                lin::ioctl(card, io(DRM, NR_DRM_AUTH), 0),
+                EACCES,
+            );
+            // Authentication is the master's to grant, and the grant names a
+            // *description*: `GET_MAGIC` by the client, `AUTH_MAGIC` spent by
+            // the master, and the client may then drive the screen without ever
+            // having been a master itself. That is how a compositor lets a
+            // wayland client page-flip at all.
+            let mut tok = [0u8; 4];
+            lin::check_eq(
+                &mut failed,
+                b"GET_MAGIC on the client succeeds",
+                lin::ioctl(
+                    card2,
+                    iow(DRM, NR_DRM_GET_MAGIC, 4),
+                    tok.as_mut_ptr() as usize,
+                ),
+                0,
+            );
+            lin::check_true(
+                &mut failed,
+                b"GET_MAGIC hands out a nonzero token",
+                u32::from_ne_bytes([tok[0], tok[1], tok[2], tok[3]]) != 0,
+            );
+            let mut spend = tok;
+            // `card` takes the master back, and the token survives the swap: it
+            // names its own description, not the master that was in place when
+            // it was minted.
+            lin::check_eq(
+                &mut failed,
+                b"the first descriptor takes the master back",
+                lin::ioctl(card, io(DRM, NR_DRM_SET_MASTER), 0),
+                0,
+            );
+            // Spending is the master's operation, and `card2` is not the master
+            // any more - so the very number it was given is now worthless in its
+            // own hands.
+            lin::check_eq(
+                &mut failed,
+                b"a non-master cannot spend a token",
+                lin::ioctl(
+                    card2,
+                    iow(DRM, NR_DRM_AUTH_MAGIC, 4),
+                    spend.as_mut_ptr() as usize,
+                ),
+                EACCES,
+            );
+            lin::check_eq(
+                &mut failed,
+                b"the master spends the token on the client",
+                lin::ioctl(
+                    card,
+                    iow(DRM, NR_DRM_AUTH_MAGIC, 4),
+                    spend.as_mut_ptr() as usize,
+                ),
+                0,
+            );
+            // The authenticated descriptor still is not the master - an
+            // authorisation buys the right to drive the screen, not the right to
+            // authorise anybody else. `AUTH` is the master probe, and it says no.
+            lin::check_eq(
+                &mut failed,
+                b"an authenticated descriptor is not thereby the master",
+                lin::ioctl(card2, io(DRM, NR_DRM_AUTH), 0),
+                EACCES,
+            );
+            // A spent token is gone: authorising is not something a master can
+            // do twice with the same number.
+            lin::check_eq(
+                &mut failed,
+                b"a spent token is refused",
+                lin::ioctl(
+                    card,
+                    iow(DRM, NR_DRM_AUTH_MAGIC, 4),
+                    spend.as_mut_ptr() as usize,
+                ),
+                EACCES,
+            );
+            // `DROP_MASTER` is void too, including from a description that is
+            // not the master - there it is simply a no-op rather than an error.
+            lin::check_eq(
+                &mut failed,
+                b"DROP_MASTER from a non-master is allowed",
+                lin::ioctl(card2, io(DRM, NR_DRM_DROP_MASTER), 0),
+                0,
+            );
+        }
         lin::check_eq(
             &mut failed,
             b"DRM DROP_MASTER succeeds (no arg)",
             lin::ioctl(card, io(DRM, NR_DRM_DROP_MASTER), 0),
             0,
         );
+        // And having dropped it, the same descriptor is no longer the master, so
+        // the probe's answer flips the other way.
         lin::check_eq(
             &mut failed,
-            b"DRM AUTH succeeds (no arg)",
+            b"DRM AUTH after DROP_MASTER is EACCES",
             lin::ioctl(card, io(DRM, NR_DRM_AUTH), 0),
-            0,
+            EACCES,
         );
     }
 

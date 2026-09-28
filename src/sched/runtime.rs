@@ -3072,6 +3072,16 @@ pub fn current_real_owner() -> (u32, u32) {
     (id.ruid, id.rgid)
 }
 
+/// Whether the running task is superuser, by its real id - the test Linux
+/// substitutes for `CAP_SYS_ADMIN` on a kernel without namespaces, which is what
+/// the console's ioctls ask when a caller is not the terminal's own foreground
+/// session. Real rather than effective because that is the id `tty_ioctl`'s
+/// checks read (`uid_eq(tty_audit_uid(...))` aside, the console has never been a
+/// place where a setuid bit bought you someone else's screen).
+pub fn current_is_root() -> bool {
+    current_identity().ruid == 0
+}
+
 pub fn become_session_leader() {
     with_table(|t| {
         let id = t.current;

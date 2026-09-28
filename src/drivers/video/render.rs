@@ -21,7 +21,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use critical_section::Mutex;
 use virtio_drivers::device::gpu::VirtIOGpu;
@@ -55,9 +55,13 @@ static REQ: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 static WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
 
-/// Whether the task only *presents* (a compositor owns the scanout) rather than
-/// painting the console. Set once by [`spawn`]; the task never takes the console
-/// over and never paints a text grid when this is true.
+/// Whether a userspace compositor owns the scanout, so the console must not be
+/// taken over onto it. Set once by [`spawn`] from the `mpos.compositor` boot
+/// word. It has never meant "no text grids" - the grids exist on this boot too,
+/// because a virtual console the compositor releases has to be drawn by
+/// somebody - it means "do not call [`crate::console::takeover`]": the kernel's
+/// log rides the serial wire and the window shows whatever is on the screen the
+/// console multiplexer says is on it.
 static PRESENT_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// A screen changed and needs repainting. Set by whoever feeds a grid, so the
@@ -65,11 +69,41 @@ static PRESENT_ONLY: AtomicBool = AtomicBool::new(false);
 /// and the task clears it when it repaints.
 static DIRTY: AtomicBool = AtomicBool::new(false);
 
-/// The host asked for a different display size. Set by the virtio service task,
-/// which is what polls the GPU's device configuration for the host's event (see
+/// How many frames have been flushed to the host. `FBIO_WAITFORVSYNC` and the
+/// DRM flip events read this as "the frame boundary moved"; it is a count and
+/// not a clock, because the only boundary this machine has is a frame it
+/// presented. Calling it a vblank counter would be a lie the ABI cannot tell.
+static LANDINGS: AtomicU64 = AtomicU64::new(0);
+
+/// The frame boundary counter: how many frames have gone to the host since boot.
+pub fn landings() -> u64 {
+    LANDINGS.load(Ordering::Relaxed)
+}
+
+/// The host's display changed shape. Set by the virtio service task, which is
+/// what polls the GPU's device configuration for the host's event (see
 /// `virtio::gpu::take_display_event`), and taken by the render task, which is
 /// the only context that may touch the device.
-static RESIZE: AtomicBool = AtomicBool::new(false);
+///
+/// It requests a *probe*, not a resize: the task re-reads `GET_DISPLAY_INFO`,
+/// records the new size as the connector's advertised mode and fires a hotplug
+/// uevent. It does not touch the scanout - the screen follows only when a KMS
+/// master commits a mode of that size, which arrives through [`resize_blocking`].
+/// This is the Linux virtio-gpu split: the driver learns and announces, the
+/// compositor drives.
+static PROBE: AtomicBool = AtomicBool::new(false);
+
+/// A scanout rebuild a modeset has asked for, as `width << 32 | height`; zero
+/// when none is pending. The render task owns the device and its control queue,
+/// so a DRM commit cannot resize on its own: it publishes the target here, bumps
+/// `RESIZE_SEQ`, and parks until `RESIZE_ACK` catches up. One request in flight
+/// at a time, because only the card's single master may commit a mode and its
+/// commits are serial.
+static RESIZE_TARGET: AtomicUsize = AtomicUsize::new(0);
+static RESIZE_SEQ: AtomicU32 = AtomicU32::new(0);
+static RESIZE_ACK: AtomicU32 = AtomicU32::new(0);
+static RESIZE_OK: AtomicBool = AtomicBool::new(false);
+static RESIZE_WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
 
 /// Nudge the render task to repaint soon. Called after any byte is painted into
 /// a grid. Cheap and safe from any context (a keystroke's echo runs from the
@@ -79,16 +113,53 @@ pub fn notify() {
     wake_task();
 }
 
-/// Tell the render task the host wants the display at a different size.
+/// Tell the render task the host's display changed size.
 ///
 /// Called by the virtio service task, which notices the host's event while
-/// polling; *doing* something about it is the render task's because it owns the
-/// device and is the only caller of `flush`. The task re-reads the size itself,
-/// so a burst of events - a window drag sends one per motion event - costs one
-/// rebuild per frame rather than one per event.
-pub fn request_resize() {
-    RESIZE.store(true, Ordering::Relaxed);
+/// polling; *acting* on it is the render task's because it owns the device and is
+/// the only caller of `flush`. The action is a probe, not a resize, so a burst of
+/// events - a window drag sends one per motion event - costs one re-query per
+/// frame rather than a rebuild per event.
+pub fn request_display_probe() {
+    PROBE.store(true, Ordering::Relaxed);
     wake_task();
+}
+
+/// Rebuild the scanout at the size a modeset committed, and answer whether the
+/// host accepted it.
+///
+/// The DRM ioctl that carries a compositor's mode cannot resize the virtio-gpu
+/// itself - the render task owns the device - so it hands the target to that task
+/// and parks here until the rebuild is done, exactly the request/park discipline
+/// `/dev/fb0`'s write-through uses. The return is the host's answer: `true` means
+/// the scanout now drives `width`x`height`, `false` that it refused and the old
+/// screen is back - the caller turns that into `EINVAL`, the answer Linux gives a
+/// modeset the panel will not do.
+pub fn resize_blocking(width: u32, height: u32) -> bool {
+    if !running() {
+        return false;
+    }
+    let me = crate::sched::current();
+    RESIZE_TARGET.store(
+        ((width as usize) << 32) | height as usize,
+        Ordering::Relaxed,
+    );
+    let seq = RESIZE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    critical_section::with(|cs| {
+        let mut waiters = RESIZE_WAITERS.borrow(cs).borrow_mut();
+        if !waiters.contains(&me) {
+            waiters.push(me);
+        }
+    });
+    // Registered before the wake, so a task that rebuilds immediately still finds
+    // this caller to wake. The target was stored before the sequence, so a task
+    // that sees `RESIZE_SEQ` advanced has a target to build.
+    wake_task();
+    crate::sched::block_until(|| RESIZE_ACK.load(Ordering::Relaxed) >= seq);
+    critical_section::with(|cs| {
+        RESIZE_WAITERS.borrow(cs).borrow_mut().retain(|&w| w != me);
+    });
+    RESIZE_OK.load(Ordering::Relaxed)
 }
 
 /// Wake the render task so that it looks at its condition again.
@@ -115,8 +186,9 @@ pub fn running() -> bool {
 
 /// Hand the device and its buffer view to a new render task. Called once, from
 /// the boot, when a display was found and the machine is not headless.
-/// `present_only` leaves the scanout to a userspace compositor: the task never
-/// takes the console over and only flushes when `/dev/fb0` work asks.
+/// `present_only` says a userspace compositor owns the scanout: the task still
+/// paints the consoles, but the kernel console is never moved onto the screen,
+/// and a frame only reaches the window when something has asked for it.
 pub fn spawn(
     device: VirtIOGpu<HalImpl, PciTransport>,
     view: Arc<VirtioGpuDev>,
@@ -130,8 +202,8 @@ pub fn spawn(
     let id = crate::sched::spawn_permanent(task, crate::sched::Priority::NORMAL);
     RENDER_PID.store(id.0 as u32, Ordering::Relaxed);
     if present_only {
-        // Nothing drives `notify` in this mode; wake the task once so it
-        // settles into its present loop.
+        // Nothing drives `notify` in this mode until the first frame is asked
+        // for; wake the task once so it settles into its present loop.
         notify();
     }
 }
@@ -163,13 +235,20 @@ fn task() {
 
     // One screen per virtual console, so switching preserves each one's
     // contents - something the single shared wire could never do. Index `n`
-    // is `/dev/ttyN`. Skipped for a compositor boot: the scanout is not the
-    // console's, so no grid is made and the console is never taken over.
+    // is `/dev/ttyN`. Made on every boot with a display, a compositor's
+    // included: the consoles are drawn wherever the mux says one of them is on
+    // the screen, and a compositor's claim on the scanout is only good while its
+    // own console holds it.
     let present_only = PRESENT_ONLY.load(Ordering::Relaxed);
-    if !present_only {
-        for vc in 1..=VC_COUNT as usize {
-            term::make_screen(vc, rows, cols);
-        }
+    for vc in 1..=VC_COUNT as usize {
+        term::make_screen(vc, rows, cols);
+    }
+    if present_only {
+        // A compositor boot draws the consoles from here on but never takes the
+        // kernel's log off the wire: the boot log is on the serial line and the
+        // screens fill in as their shells speak.
+        crate::console::set_grids_live();
+    } else {
         // The screens exist now: replay the boot log onto the console being shown
         // and move output from the wire to the framebuffer.
         crate::console::takeover();
@@ -194,7 +273,10 @@ fn task() {
         // already put in the buffer. An idle machine does neither, and this
         // wait has no deadline, so an idle console really does cost nothing.
         crate::sched::block_until(|| {
-            DIRTY.load(Ordering::Relaxed) || pending() || RESIZE.load(Ordering::Relaxed)
+            DIRTY.load(Ordering::Relaxed)
+                || pending()
+                || PROBE.load(Ordering::Relaxed)
+                || RESIZE_TARGET.load(Ordering::Relaxed) != 0
         });
         DIRTY.store(false, Ordering::Relaxed);
 
@@ -209,34 +291,57 @@ fn task() {
         }
         last_paint = crate::arch::timer::ticks();
 
-        // The host asking for a different display, taken before the paint so
-        // that this frame already uses the new geometry - and after the beat,
-        // because the beat is what turns a drag's stream of events into one
-        // rebuild per frame (the task re-reads the size, so every event after
-        // the first of a frame finds nothing left to do).
-        if RESIZE.swap(false, Ordering::Relaxed)
-            && let Some((width, height)) = resize(&mut device, &view, present_only)
-        {
-            fb_w = width as usize;
-            fb_h = height as usize;
-            fb_phys = view.fb_phys();
-            fb_len = view.fb_len();
-            rows = (fb_h / CELL_H).clamp(1, MAX_ROWS);
-            cols = (fb_w / CELL_W).max(1);
-            scratch = vec![blank; rows * cols];
-            // Whatever was on the screen belongs to the old one: paint the
-            // whole grid rather than the rows that changed since.
-            last_shown = 0;
+        // The host's display changed shape, taken after the beat so a drag's
+        // stream of events costs one re-query per frame. This is a *probe*: it
+        // learns the new size and announces it, and leaves the scanout alone -
+        // nothing here rebuilds the screen. The screen follows only when a
+        // compositor, having read the new advertised mode, commits it below.
+        if PROBE.swap(false, Ordering::Relaxed) {
+            probe_display(&mut device, &view);
+        }
+
+        // A modeset committed a size the scanout does not yet drive and parked in
+        // `resize_blocking`. Taken before the paint so this frame already uses the
+        // new geometry. Rebuild, answer the parked caller, and - if the host
+        // accepted - retarget the paint to the new block.
+        let target = RESIZE_TARGET.swap(0, Ordering::Relaxed);
+        if target != 0 {
+            let width = (target >> 32) as u32;
+            let height = target as u32;
+            let ok = resize_to(&mut device, &view, width, height);
+            RESIZE_OK.store(ok, Ordering::Relaxed);
+            RESIZE_ACK.store(RESIZE_SEQ.load(Ordering::Relaxed), Ordering::Relaxed);
+            let waiters = critical_section::with(|cs| {
+                core::mem::take(&mut *RESIZE_WAITERS.borrow(cs).borrow_mut())
+            });
+            for id in waiters {
+                crate::sched::wake(id);
+            }
+            if ok {
+                fb_w = width as usize;
+                fb_h = height as usize;
+                fb_phys = view.fb_phys();
+                fb_len = view.fb_len();
+                rows = (fb_h / CELL_H).clamp(1, MAX_ROWS);
+                cols = (fb_w / CELL_W).max(1);
+                scratch = vec![blank; rows * cols];
+                // Whatever was on the screen belongs to the old one: paint the
+                // whole grid rather than the rows that changed since.
+                last_shown = 0;
+            }
         }
 
         // Copy the changed screen's cells under the lock (a fixed memcpy), then
         // paint from the copy with the clock live. The flush is outside both.
-        // Two boots have no console grid to paint: a compositor boot, where the
-        // pixels are already in the buffer, and any moment the console on the
-        // screen has been put in graphics mode by the session that took it - the
-        // grid still scrolls, and painting it would overwrite weston's output
-        // with a login prompt one keystroke at a time.
-        let painted = if present_only || !crate::vfs::vcmux::painted() {
+        // Two moments have no console to show: a session that holds the card
+        // and has its console on the screen in graphics mode owns it, and a
+        // compositor boot before anybody has claimed the card at all - the
+        // window is promised to the compositor there, so the kernel's log stays
+        // on the wire until the seat hands the card over and the first flip
+        // lands, and the console takes the screen back the moment its own
+        // `^A` wins the negotiation.
+        let claimed = crate::drivers::drm::master_held();
+        let painted = if present_only && !claimed || !crate::vfs::vcmux::painted() {
             // Forget which console was last shown: when the screen comes back,
             // whatever is on it belongs to something else, and the whole grid
             // needs redrawing rather than the changed rows.
@@ -283,43 +388,76 @@ fn task() {
         let done = DONE.load(Ordering::Relaxed);
         if painted || req > done {
             let _ = device.flush();
+            // The frame has left. This is the moment a page-flip completion is
+            // *about*, and it is the only moment in this kernel that honestly
+            // means "the pixels are where they were asked to be" - so it is what
+            // `drivers::drm` timestamps its flip events with, what a card reader
+            // is woken by, and what `FBIO_WAITFORVSYNC` waits for.
+            LANDINGS.fetch_add(1, Ordering::Relaxed);
             DONE.store(req, Ordering::Relaxed);
             let waiters =
                 critical_section::with(|cs| core::mem::take(&mut *WAITERS.borrow(cs).borrow_mut()));
             for id in waiters {
                 crate::sched::wake(id);
             }
+            crate::drivers::drm::frame_landed();
         }
     }
 }
 
-/// Rebuild the scanout at the size the host now wants, and tell the rest of
-/// the machine that the display changed.
+/// Learn the size the host now wants, and - if it is new - advertise it as the
+/// connector's available mode and fire a hotplug uevent.
 ///
-/// This is where a QEMU window resize turns into a screen of the same size. The
-/// host keeps the size it wants in the GPU's own device configuration, and asks
-/// for it with an event the service task polls; what it actually *is* comes from
-/// `GET_DISPLAY_INFO`, and it can differ from what the machine is driving in
-/// either direction (a fullscreen toggle asks for a *smaller* size, too).
+/// This is the entire kernel response to a QEMU window resize. It reads
+/// `GET_DISPLAY_INFO` and records the answer as the size the connector offers;
+/// it does *not* touch the scanout. A compositor that owns the card sees the
+/// uevent, re-probes, finds the new preferred mode and commits it, which is the
+/// only thing that rebuilds the screen (see [`resize_to`]). A text console with
+/// nobody to commit leaves the scanout at the size it was driven at - Linux's
+/// fbcon behaves the same way.
 ///
-/// `None` means the geometry did not change: the host reports a zero-pixel
-/// display when it has none attached (a headless QEMU answers every query with
-/// nothing, which is not a request for an empty screen), QEMU sends the event
-/// for a window *move* as well as a resize, and a size the host refuses leaves
-/// the screen it had. The first two are no-ops, and the third rebuilds what was
-/// there and says so - in every case the next event may try again.
-fn resize(
-    device: &mut VirtIOGpu<HalImpl, PciTransport>,
-    view: &Arc<VirtioGpuDev>,
-    present_only: bool,
-) -> Option<(u32, u32)> {
+/// A zero size means no display is attached (a headless QEMU answers every query
+/// with nothing, which is not a request for an empty screen) and is ignored; so
+/// is a QEMU window *move*, which sends the event with an unchanged size.
+fn probe_display(device: &mut VirtIOGpu<HalImpl, PciTransport>, view: &Arc<VirtioGpuDev>) {
     let (width, height) = match device.resolution() {
         Ok((width, height)) if width > 0 && height > 0 => (width, height),
-        _ => return None,
+        _ => return,
     };
+    // `set_advertised` answers whether the size actually moved, so a burst that
+    // re-reports the same shape - a drag, a window move - fires no uevent.
+    if view.set_advertised(width, height) {
+        crate::drivers::drm::display_changed();
+        let (cur_w, cur_h) = view.dims();
+        crate::println!(
+            "virtio-gpu: host wants {width}x{height}; still driving {cur_w}x{cur_h} until a compositor commits it"
+        );
+    }
+}
+
+/// Rebuild the scanout at the size a compositor committed, and answer whether the
+/// host took it.
+///
+/// This is the piece the kernel no longer does on its own: it runs only when a
+/// KMS master's modeset asks for a size the scanout does not yet drive, and the
+/// target is that committed size rather than something read from the host. The
+/// old screen is preserved into the new block (a resize that blanked the window
+/// until the compositor repainted would be worse than the corner it is fixing),
+/// the console grids follow the new geometry, and a host refusal puts the old
+/// size back and reports `false` so the ioctl can answer `EINVAL`.
+///
+/// Returns `true` when the scanout now drives the requested size (including the
+/// no-op case where it already did), `false` when the host refused and the
+/// screen was restored.
+fn resize_to(
+    device: &mut VirtIOGpu<HalImpl, PciTransport>,
+    view: &Arc<VirtioGpuDev>,
+    width: u32,
+    height: u32,
+) -> bool {
     let (old_w, old_h) = view.dims();
     if (width, height) == (old_w, old_h) {
-        return None;
+        return true;
     }
     let old_phys = view.fb_phys();
     let old_len = view.fb_len();
@@ -333,19 +471,22 @@ fn resize(
     let slice = match device.change_resolution(width, height) {
         Ok(slice) => slice,
         Err(_) => {
-            // The host refused the new size - and asking tore the old scanout
-            // down, so the machine has no screen at all until one is built. Put
-            // the size it had back, which at least leaves the machine as it was:
-            // the block the old screen lived in is left pinned and unused rather
-            // than handed to the allocator while it may still be readable, so
-            // the price of a refused resize is one leaked screen.
+            // The host refused the committed size - and asking tore the old
+            // scanout down, so the machine has no screen at all until one is
+            // built. Put the size it had back, which at least leaves the machine
+            // as it was: the block the old screen lived in is left pinned and
+            // unused rather than handed to the allocator while it may still be
+            // readable, so the price of a refused resize is one leaked screen.
+            // The refused size is taken out of the advertised mode too, so a
+            // re-probe can offer what the host will actually do next time.
             let Ok(slice) = device.change_resolution(old_w, old_h) else {
-                return None;
+                return false;
             };
             let (fb_len, fb_phys) = adopt(slice, old_w, old_h, old_phys, old_w, old_h, old_len);
             view.resized(old_w, old_h, fb_phys, fb_len);
+            view.set_advertised(old_w, old_h);
             crate::println!("virtio-gpu: {width}x{height} refused; staying at {old_w}x{old_h}");
-            return None;
+            return false;
         }
     };
     let (fb_len, fb_phys) = adopt(slice, width, height, old_phys, old_w, old_h, old_len);
@@ -359,27 +500,25 @@ fn resize(
     }
 
     view.resized(width, height, fb_phys, fb_len);
+    // The scanout now drives what was advertised, so the two agree again.
+    view.set_advertised(width, height);
 
-    if !present_only {
-        // The console owns the screen and its grid *is* the screen's size, so
-        // the grids are rebuilt - at the *new* cell count, computed here rather
-        // than passed in, because that is the point - and the boot log replayed
-        // onto the one being shown. A resize costs the scrollback, which is the
-        // honest price: the other virtual consoles' contents are not kept
-        // anywhere but in their own grids.
-        let rows = (height as usize / CELL_H).clamp(1, MAX_ROWS);
-        let cols = (width as usize / CELL_W).max(1);
-        for vc in 1..=VC_COUNT as usize {
-            term::make_screen(vc, rows, cols);
-        }
+    // The console's grid *is* the screen's size, so the grids are rebuilt - at
+    // the *new* cell count, computed here rather than passed in, because that is
+    // the point - and the boot log replayed onto the one being shown. A resize
+    // costs the scrollback, which is the honest price: the other virtual
+    // consoles' contents are not kept anywhere but in their own grids. On a
+    // compositor boot the grids are resized the same way and the kernel's log is
+    // left on the wire, but whoever owns the scanout has just committed this size
+    // itself, so it needs no further telling.
+    let rows = (height as usize / CELL_H).clamp(1, MAX_ROWS);
+    let cols = (width as usize / CELL_W).max(1);
+    for vc in 1..=VC_COUNT as usize {
+        term::make_screen(vc, rows, cols);
+    }
+    if !crate::console::compositor() {
         crate::console::takeover();
     }
-
-    // Whoever owns the scanout has to be *told*: a compositor takes its mode
-    // from the connector, and a mode change it is not told about is a mode it
-    // never sets - which is exactly the bug this whole path exists for. Linux
-    // announces it as a DRM hotplug uevent, and that is what this publishes.
-    crate::drivers::drm::display_changed();
 
     // Said out loud, like the boot's own `virtio-gpu: WxH at /dev/fb0` line and
     // for the same reason: the size of the screen is the first thing anyone
@@ -389,7 +528,7 @@ fn resize(
         "virtio-gpu: display {old_w}x{old_h} -> {width}x{height}, {} KiB at /dev/fb0",
         fb_len / 1024
     );
-    Some((width, height))
+    true
 }
 
 /// Take a freshly created scanout into service: pin its frames, put what was on

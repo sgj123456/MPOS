@@ -85,6 +85,18 @@ extra_packages = [
     # with "Failed to load module: ... desktop-shell.so: No such file or
     # directory" and never draws anything.
     "weston-shell-desktop",
+    # The pointer's own artwork. Weston draws the cursor from an Xcursor theme,
+    # and this image shipped none - /usr/share/icons held only the `hicolor`
+    # icon tree, which has no `cursors/` - so weston drew the small built-in
+    # arrow libwayland-cursor carries for exactly that case: one fixed image
+    # that does not follow the output scale and does not survive being scaled,
+    # which is the whole of a pointer that "does not grow, only blurs".
+    # `breeze-cursors` is cursor-only - no icon tree to carry, and the only
+    # libraries it wants are the ones its loader already needs - and it ships
+    # every shape at 16..96 px, so a request in that range is a native image
+    # rather than a resample. Which theme weston picks is named in
+    # /etc/xdg/weston/weston.ini.
+    "breeze-cursors",
     # `lspci`/`setpci`, which read the tree `/sys/bus/pci` and `/proc/bus/pci`
     # publish. Nothing in the boot needs them; they are here because the PCI
     # tree exists to be read by exactly this program.
@@ -185,9 +197,17 @@ audio = true
 #              console shows in the window and the terminal at once. The mirror
 #              is non-blocking: under a flood the serial transcript may drop
 #              bytes, but the window never stalls;
-#   weston   - the window is the compositor's: the kernel console never takes the
-#              framebuffer, so weston keeps the screen and a typed line never
-#              paints over it, while the boot log still rides the serial line.
+#   weston   - the window is the compositor's for as long as its own virtual
+#              console is the one on the screen: the kernel console never moves
+#              onto the framebuffer and a typed line never paints over weston,
+#              while the boot log still rides the serial line. Nothing starts
+#              the compositor - `./start-weston.sh` in root's home does, once the
+#              login prompt appears. Switch away with `^A 1`..`^A 6`: the session
+#              is asked to release the display, its page flips start coming back
+#              EACCES, and the window shows the console you switched to. The wire
+#              keeps carrying the kernel log and the shells either way, so this
+#              is the one mode where the window and the terminal are
+#              deliberately different views.
 # Unset means mirror, which is what `run` did before the modes were split. A
 # `cargo xtask test` boot ignores this and always runs headless.
 mode = "weston"

@@ -2867,6 +2867,21 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         if let Some(ui) = file.inode().as_uinput() {
             ui.forget(file.ofd());
         }
+        // The DRM master belongs to the open file description, so it dies with
+        // the last reference to it: a compositor that is killed - or a test that
+        // simply closes the card - must not leave the machine holding a screen
+        // nobody can drive. Asked after the close, for the same reason as the
+        // read position above.
+        if file.inode().as_drm().is_some() {
+            crate::drivers::drm::master_closed(file.ofd());
+        }
+        // The same for a console's promises: `VT_SETMODE` was a session's word
+        // that it would answer `relsig`, and the session is gone.
+        if let Some(tty) = file.inode().as_tty()
+            && let Some(vc) = tty.vc_number()
+        {
+            crate::vfs::vcmux::abandon(vc);
+        }
     }
     0
 }
@@ -3732,10 +3747,20 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             0
         }
         0x4622 => {
-            // FBIO_WAITFORVSYNC: a frame-pacing wait. There is no vertical
-            // blank to hold on, so this answers the wait at once; a
-            // compositor then paces itself. Accepted on a framebuffer so a
-            // client's flip loop is not met with `ENOTTY`.
+            // FBIO_WAITFORVSYNC: a frame-pacing wait, which this now genuinely
+            // is - it sleeps until the next frame the render task *presents*.
+            // The honest name for that boundary is a landing, not a vertical
+            // blank: there is no display controller here to be blanking, only a
+            // frame that has gone to the host and one that has not, and pacing
+            // against the former is what a client of this device means.
+            //
+            // A bounded wait rather than an unbounded one, because the thing it
+            // waits for is a frame, and a machine that is presenting no frames -
+            // a headless boot, a window the host has stopped taking input for -
+            // must still answer a client that asked to be paced. The timeout is
+            // the pace itself: 40 ms is a frame at a third of the nominal rate,
+            // so a caller that loops on this gets roughly frame-shaped
+            // behaviour, and never gets a hang.
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
@@ -3743,6 +3768,14 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             if file.inode().as_fb().is_none() {
                 return err::ENOTTY;
             }
+            let from = crate::drivers::video::render::landings();
+            // 10 ticks at this kernel's 250 Hz clock: 40 ms, a frame and a half
+            // at the nominal 60 Hz the connector's mode says.
+            let deadline = crate::arch::timer::ticks() + 10;
+            crate::sched::block_until_deadline(
+                || crate::drivers::video::render::landings() != from,
+                deadline,
+            );
             0
         }
         0x541B => {
@@ -3958,6 +3991,21 @@ fn family_nr(request: u32, magic: u8) -> Option<u32> {
 /// which is what they mean. A `seatd` that cannot get past this dance never
 /// hands the card to weston, which is why the reads answer from live state
 /// rather than a flat success.
+///
+/// `VT_SETMODE` and `VT_RELDISP` are the two that cannot be flat successes, and
+/// they are the reason the console's mode is recorded at all: a session that
+/// asks to be consulted before its screen is taken away (`VT_PROCESS`) has to
+/// find, on the other side of a `relsig`, that the kernel really did wait for
+/// its answer - and has to be able to *refuse* it. The policy lives in
+/// `crate::vfs::vtmode`; this is the argument checking and the errno mapping.
+///
+/// Every request that *names* a console - as opposed to asking what consoles
+/// exist - also asks who is calling, and the answer Linux gives is the same for
+/// all of them: `EPERM` unless the descriptor is the terminal's own foreground
+/// job or the caller is superuser. That gate is what makes a hand-over a
+/// conversation between the session that holds the screen and the one that
+/// wants it, rather than anything holding a `/dev/tty` fd being able to silence
+/// a compositor's `relsig`, or to answer it.
 fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let size = ((request >> 16) & 0x3fff) as usize;
     let Some(nr) = family_nr(request, b'V') else {
@@ -3968,9 +4016,14 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
-    if file.inode().as_tty().is_none() {
+    let tty_inode = file.inode();
+    let Some(tty) = tty_inode.as_tty() else {
         return err::ENOTTY;
-    }
+    };
+    // `VT_OPENQRY` and `VT_GETSTATE` only ask where things are, and Linux lets
+    // any tty's descriptor read those; the rest either write a console's mode,
+    // answer for one, or move the screen.
+    let owns_it = || tty.is_foreground(crate::sched::current()) || crate::sched::current_is_root();
     use core::mem::size_of;
     match nr {
         // VT_OPENQRY -> int: the next console a second session could take. The
@@ -3987,11 +4040,17 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
             unsafe { (buf as *mut i32).write_unaligned(free as i32) };
             0
         }
+        // VT_GETMODE -> struct vt_mode { mode, waitv, relsig, acqsig, frsig }.
+        // Read back what `VT_SETMODE` wrote, because a seat manager asks this to
+        // find out whether the console it has is already promised to someone -
+        // and because a mode the kernel accepted and forgot is a mode nobody can
+        // rely on. `size` is the caller's `sizeof(struct vt_mode)`, so an older,
+        // shorter struct gets the prefix it sized for rather than a fault.
         0x01 => {
-            // VT_GETMODE -> struct vt_mode { mode, waitv, relsig, acqsig, frsig }.
-            // Report automatic switching (`VT_AUTO`), no signals, so a manager
-            // leaves the console in the mode it already runs in.
-            let out = [1u8, 0, 0, 0, 0, 0, 0, 0]; // mode=VT_AUTO, rest zero
+            let Some(vc) = tty.vc_number() else {
+                return err::EINVAL;
+            };
+            let out = crate::vfs::vcmux::vt_mode(vc).to_bytes();
             let n = size.min(out.len());
             if !buffer_ok(buf, n, true, from_user) {
                 return err::EFAULT;
@@ -3999,7 +4058,30 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
             unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, n) };
             0
         }
-        0x02 => 0, // VT_SETMODE: accept whatever mode is asked for.
+        // VT_SETMODE <- struct vt_mode. `_IO`, so the struct is read from the
+        // request's own size rather than from a nonzero one: the eight bytes a
+        // caller that wrote `<linux/vt.h>`'s struct gives, or fewer.
+        0x02 => {
+            if !owns_it() {
+                return err::EPERM;
+            }
+            let Some(vc) = tty.vc_number() else {
+                return err::EINVAL;
+            };
+            let n = size.min(8);
+            if !buffer_ok(buf, n, false, from_user) {
+                return err::EFAULT;
+            }
+            let mut bytes = [0u8; 8];
+            unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, bytes.as_mut_ptr(), n) };
+            let mode = crate::vfs::vtmode::VtMode::from_bytes(&bytes);
+            match crate::vfs::vcmux::set_vt_mode(vc, mode) {
+                Ok(()) => 0,
+                // A console that is not one of ours, or a mode that is not a
+                // mode: Linux has one answer for both.
+                Err(_) => err::EINVAL,
+            }
+        }
         0x03 => {
             // VT_GETSTATE -> struct vt_stat { v_mode, v_num, v_state } (shorts).
             // The console on the screen, the mode it is in, and the bit of
@@ -4019,21 +4101,55 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
             0
         }
         0x04 => 0, // VT_SENDSIG: obsolete in Linux, and nothing signals here.
-        // VT_RELDISP: agree. A session in `VT_PROCESS` mode asks this before it
-        // takes the screen, and the only answer that lets the switch go ahead is
-        // success - refusing would strand the session holding a console it has
-        // already been told to give up.
-        0x05 => 1,
-        // VT_ACTIVATE -> int: make that console the one on the screen.
-        0x06 => {
-            if crate::vfs::vcmux::activate(buf as u32) {
+        // VT_RELDISP: the answer to a `relsig`, and the third argument is the
+        // answer itself - nonzero agrees to hand the screen over, zero refuses.
+        // Only the console a release is outstanding on may answer; anything else
+        // is Linux's `EINVAL`, because a session that replies to a question
+        // nobody asked would be completing someone else's switch.
+        0x05 => {
+            if !owns_it() {
+                return err::EPERM;
+            }
+            let Some(vc) = tty.vc_number() else {
+                return err::EINVAL;
+            };
+            // Success is the *answer*, not the switch: Linux's `VT_RELDISP`
+            // returns 0 whether the session agreed or refused, and the
+            // difference is the argument it was given. `EINVAL` is reserved for
+            // the console that was never asked - which is what stops a session
+            // from completing someone else's hand-over.
+            if crate::vfs::vcmux::release_ack(vc, buf != 0) {
                 0
             } else {
                 err::EINVAL
             }
         }
-        // VT_WAITACTIVE -> int: park until that console is the active one.
+        // VT_ACTIVATE -> int: make that console the one on the screen, and
+        // *wait* for the console currently shown to be asked if it asked to be
+        // asked. This is Linux's `vt_release`: `relsig`, then a 60-second sleep
+        // on the answer. A refusal is `EBUSY` rather than silence, because a
+        // session that activates a compositor's console wants to know it lost,
+        // not to poll `VT_GETSTATE` and guess.
+        0x06 => {
+            if !owns_it() {
+                return err::EPERM;
+            }
+            match crate::vfs::vcmux::wait_activate(buf as u32) {
+                crate::vfs::vcmux::Activated::Taken | crate::vfs::vcmux::Activated::Already => 0,
+                crate::vfs::vcmux::Activated::Refused => err::EBUSY,
+                // Linux's timeout path completes the switch anyway; a caller
+                // that sees this re-reads `VT_GETSTATE` and finds the answer.
+                crate::vfs::vcmux::Activated::TimedOut => err::EBUSY,
+                crate::vfs::vcmux::Activated::Interrupted => err::EINTR,
+                crate::vfs::vcmux::Activated::Inval => err::EINVAL,
+            }
+        }
+        // VT_WAITACTIVE -> int: park until that console is the active one,
+        // wakeable by the release that finally moves it.
         0x07 => {
+            if !owns_it() {
+                return err::EPERM;
+            }
             crate::vfs::vcmux::wait_active(buf as u32);
             0
         }
@@ -4070,13 +4186,32 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     // is not one of them - a `/dev/pts` slave, a master - has no screen and no
     // keyboard mode to set, and Linux's answer for it is the same one as for a
     // tty that is not a console at all.
-    let Some(vc) = file.inode().as_tty().and_then(|t| t.vc_number()) else {
+    let tty_inode = file.inode();
+    let Some(tty) = tty_inode.as_tty() else {
         return err::ENOTTY;
     };
+    // Which of the six consoles this descriptor is the terminal of. A tty that
+    // is not one of them - a `/dev/pts` slave, a master - has no screen and no
+    // keyboard mode to set, and Linux's answer for it is the same one as for a
+    // tty that is not a console at all.
+    let Some(vc) = tty.vc_number() else {
+        return err::ENOTTY;
+    };
+    // Who may change a console's video mode: on Linux the caller must either
+    // hold the DRM card (`master` or `authenticated` - the driver that owns the
+    // screen is the one allowed to say what is drawn on it) or be the console's
+    // foreground job. Answering only the second half would let a compositor's
+    // *own* seat manager be refused on a console it had just taken; answering
+    // only the first would refuse a text login its own `reset`.
+    let owns_card = crate::drivers::drm::card_grabbed_by_current();
+    let owns_it = tty.is_foreground(crate::sched::current()) || crate::sched::current_is_root();
     use crate::vfs::tty::{K_MEDIUMRAW, K_OFF, K_RAW, K_UNICODE, K_XLATE, KD_GRAPHICS, KD_TEXT};
     match nr {
         // KDSETMODE -> int argument: the console's video mode.
         0x3a => {
+            if !(owns_card || owns_it) {
+                return err::EPERM;
+            }
             let mode = match request_arg(buf) as u32 {
                 KD_TEXT | KD_GRAPHICS => request_arg(buf) as u32,
                 // The two obsolete text modes, folded to the one they meant.
@@ -4097,7 +4232,14 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
             0
         }
         // KDSKBMODE -> int: the keyboard's translation mode for this console.
+        // The keyboard belongs to the console's own session, so unlike the video
+        // mode this is not something the card's holder gets to say - which is
+        // exactly why `K_OFF` must never be the only way to stop a console
+        // reading the machine's keys.
         0x45 => {
+            if !owns_it {
+                return err::EPERM;
+            }
             if !matches!(
                 request_arg(buf) as u32,
                 K_RAW | K_XLATE | K_MEDIUMRAW | K_UNICODE | K_OFF

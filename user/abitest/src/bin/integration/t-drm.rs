@@ -16,6 +16,13 @@
 //! `AUTH_MAGIC` pair, `GEM_CLOSE` releasing a handle - and the render node
 //! (`renderD128`) making and mapping a dumb buffer of its own, the door GBM
 //! allocates through.
+//!
+//! Before any of that, the identity walk a Rust compositor makes with nothing
+//! but the card's device number: `/sys/dev/char/226:0/device/drm` has to
+//! resolve and has to name the two nodes of the one GPU, because a card that
+//! cannot answer is refused as "the provided file descriptor does not refer to
+//! a DRM node" - which is where niri stopped, not libdrm, whose test for the
+//! same question is a different and weaker one. See `src/vfs/sysfs.rs`.
 
 #![no_std]
 #![no_main]
@@ -52,6 +59,7 @@ const NR_VERSION: usize = 0x00;
 const NR_SET_VERSION: usize = 0x07;
 const NR_GET_MAGIC: usize = 0x02;
 const NR_AUTH_MAGIC: usize = 0x11;
+const NR_SET_MASTER: usize = 0x1e;
 const NR_GEM_CLOSE: usize = 0x09;
 
 const O_RDWR: usize = 2;
@@ -466,7 +474,18 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         1,
     );
 
-    // The magic handshake, as a master authenticating itself.
+    // The magic handshake, as a master authenticating itself. The master is
+    // taken first because Linux's `AUTH_MAGIC` is *the master's* operation: a
+    // card with no master refuses it `EACCES` rather than quietly letting a
+    // random descriptor mint an authorisation for itself. `SET_MASTER` is `_IO`
+    // - no argument, no size - so the request word carries a zero length and
+    // the third ioctl argument is a plain 0, not a pointer.
+    lin::check_eq(
+        &mut failed,
+        b"SET_MASTER succeeds",
+        lin::ioctl(fd, ioc_d(NR_SET_MASTER, 0), 0),
+        0,
+    );
     let mut magic = [0u8; 4];
     let r = lin::ioctl(fd, ioc_d(NR_GET_MAGIC, 4), magic.as_mut_ptr() as usize);
     lin::check_eq(&mut failed, b"GET_MAGIC succeeds", r, 0);
@@ -495,6 +514,94 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"GEM_CLOSE refuses a dead handle",
         r,
         lin::EINVAL,
+    );
+
+    // The identity walk a Rust compositor makes before it opens anything, and
+    // the one no `/dev` node can answer. `DrmNode::from_path("/dev/dri/card0")`
+    // is a `stat` of the node - which is where 226:0 comes from - and then two
+    // questions only sysfs answers, either of which a card that fails them is
+    // refused for: "the provided file descriptor does not refer to a DRM
+    // node". First, whether `/sys/dev/char/226:0/device/drm` exists; then what
+    // that directory lists, since its entries are the node *names* of the one
+    // GPU, matched by prefix (`card`, `renderD`) to find the render node the
+    // compositor goes on to open. niri stopped exactly here, with the node, its
+    // `st_rdev` and the class entry all correct, so the chain is pinned as a
+    // rule rather than as a spelling: it must resolve, it must be a directory,
+    // and it must name the two nodes this machine really has.
+    let mut st: lin::Stat = unsafe { core::mem::zeroed() };
+    lin::check_eq(
+        &mut failed,
+        b"the card's number reaches its GPU's drm/",
+        lin::stat(b"/sys/dev/char/226:0/device/drm\0", &mut st),
+        0,
+    );
+    lin::check_true(
+        &mut failed,
+        b"and what it reaches is a directory",
+        st.st_mode & lin::S_IFMT == lin::S_IFDIR,
+    );
+
+    let entries = lin::openat(
+        lin::AT_FDCWD,
+        b"/sys/dev/char/226:0/device/drm\0",
+        lin::O_RDONLY | lin::O_DIRECTORY,
+        0,
+    ) as i32;
+    lin::check_true(&mut failed, b"the GPU's drm/ lists", entries >= 0);
+    if entries >= 0 {
+        let mut saw_card = false;
+        let mut saw_render = false;
+        for _ in 0..4 {
+            let mut buf = [0u8; 512];
+            let n = lin::getdents64(entries, &mut buf);
+            if n <= 0 {
+                break;
+            }
+            let chunk = &buf[..n as usize];
+            let mut off = 0usize;
+            while off < chunk.len() {
+                match lin::parse_dirent64(&chunk[off..]) {
+                    Some((d, reclen)) => {
+                        if d.name == b"card0" {
+                            saw_card = true;
+                        }
+                        if d.name == b"renderD128" {
+                            saw_render = true;
+                        }
+                        off += reclen;
+                    }
+                    None => off = chunk.len(),
+                }
+            }
+        }
+        // The names, not just the count: the crate takes the first entry with
+        // the type's prefix and then requires `/dev/dri/<name>` to exist, so a
+        // listing that named a node this machine does not have would send a
+        // compositor after a render node it cannot open.
+        lin::check_true(&mut failed, b"the listing names card0", saw_card);
+        lin::check_true(&mut failed, b"and renderD128", saw_render);
+        let _ = lin::close(entries);
+    }
+    // The render node's own number walks the same chain to the same place: a
+    // compositor that opened the render node is handed 226:128 and asks again.
+    // The two `device` links have to be the *same* directory - one card carries
+    // both names - or the parent a compositor reads the sibling node's name
+    // from is a different GPU than the one it opened.
+    let mut rst: lin::Stat = unsafe { core::mem::zeroed() };
+    lin::check_eq(
+        &mut failed,
+        b"the render node's number reaches drm/ too",
+        lin::stat(b"/sys/dev/char/226:128/device/drm\0", &mut rst),
+        0,
+    );
+    let mut a: lin::Stat = unsafe { core::mem::zeroed() };
+    let mut b: lin::Stat = unsafe { core::mem::zeroed() };
+    let ra = lin::stat(b"/sys/dev/char/226:0/device\0", &mut a);
+    let rb = lin::stat(b"/sys/dev/char/226:128/device\0", &mut b);
+    lin::check_true(
+        &mut failed,
+        b"both numbers hang from one GPU",
+        ra == 0 && rb == 0 && a.st_ino == b.st_ino,
     );
 
     // The render node: the same card under GBM's allocation door, where a

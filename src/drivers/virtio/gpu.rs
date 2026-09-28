@@ -64,6 +64,17 @@ pub struct Scanout {
     pub fb_len: usize,
 }
 
+/// Pack a width and height into the single `usize` the desired size is stored
+/// in, so the two halves are never observed as a mismatched pair.
+fn pack_dims(width: u32, height: u32) -> usize {
+    ((width as usize) << 32) | height as usize
+}
+
+/// The inverse of [`pack_dims`].
+fn unpack_dims(packed: usize) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
+}
+
 pub struct VirtioGpuDev {
     /// The scanout, as the device was last set up with it. Not a constant: the
     /// host can ask for a different size at any time - a QEMU window resize or a
@@ -77,6 +88,19 @@ pub struct VirtioGpuDev {
     /// being the screen would be writing into whatever the allocator gave
     /// those frames to next.
     mapped: AtomicBool,
+    /// The size the host currently wants, packed `width << 32 | height` so the
+    /// two are read as one value. This is what the connector *advertises* as its
+    /// available mode - the mode a compositor re-probes for and may commit - and
+    /// it is deliberately separate from [`scanout`][Self::scanout], the size the
+    /// scanout is *actually driven at*. On a host event the driver learns a new
+    /// `desired` and fires a hotplug uevent without touching the scanout; the
+    /// scanout only follows when a KMS master commits a mode of that size, which
+    /// is how Linux's virtio-gpu driver behaves. They are equal at boot and
+    /// after any committed resize; they differ only in the window between the
+    /// host asking and a compositor agreeing. A text console with no compositor
+    /// to commit leaves them unequal forever - the screen stays the size it was
+    /// driven at, exactly as Linux's fbcon does.
+    desired: AtomicUsize,
 }
 
 impl VirtioGpuDev {
@@ -146,6 +170,22 @@ impl VirtioGpuDev {
         (scanout.width, scanout.height)
     }
 
+    /// The size the connector advertises as its available mode - what the host
+    /// last asked for, whether or not the scanout has been driven to it. A
+    /// compositor reads this through `GETCONNECTOR`/`GETCRTC` when it re-probes
+    /// after a hotplug uevent; a pixel copy never does, and uses [`dims`][Self::dims].
+    pub fn advertised_dims(&self) -> (u32, u32) {
+        unpack_dims(self.desired.load(Ordering::Relaxed))
+    }
+
+    /// Record the size the host wants. Returns whether it actually changed, so
+    /// the caller only fires a hotplug uevent on a real new mode rather than on
+    /// every window move that re-reports the same size.
+    pub fn set_advertised(&self, width: u32, height: u32) -> bool {
+        let want = pack_dims(width, height);
+        self.desired.swap(want, Ordering::Relaxed) != want
+    }
+
     /// The size of the pixel buffer in bytes - `smem_len` in
     /// `fb_fix_screeninfo` terms.
     pub fn fb_len(&self) -> usize {
@@ -213,6 +253,7 @@ impl VirtioGpuDev {
                 fb_len,
             })),
             mapped: AtomicBool::new(false),
+            desired: AtomicUsize::new(pack_dims(dims.0, dims.1)),
         });
 
         // The pages now have more than one kind of owner: the device DMAes

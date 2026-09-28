@@ -635,6 +635,10 @@ pub const CAPABILITY_BYTES: usize = 0x300 / 8;
 /// branch rather than growing a queue unbounded under the lock.
 pub fn service() {
     let to_console = !crate::console::headless();
+    // Whether the session that owns the card still owns the screen. Read once
+    // per tick and outside the critical section below, since it asks the
+    // console mux, which keeps its own state.
+    let session_active = crate::vfs::vcmux::session_active();
     let mut routed = [0u8; 64];
     let mut n = 0usize;
     critical_section::with(|cs| {
@@ -647,10 +651,47 @@ pub fn service() {
             // what that means here: the keystrokes stop being *also* console
             // input, so a compositor's typing does not land on the shell
             // sitting behind it. The node still gets every event - that is
-            // where the compositor reads them from.
-            let to_console = to_console && !node.is_grabbed();
+            // where the compositor reads them from - *while its session holds
+            // the screen*. After a switch the claim is all that is left, and a
+            // claim outlived its screen must not swallow the machine's input,
+            // so the events go to the console instead; they are dropped for
+            // the grabbed node rather than queued, which is what a compositor
+            // that comes back to its seat expects anyway - a stream of frames
+            // from a session nobody was looking at is not a resume point, it
+            // is a backlog of stale motion.
+            let grabbed = node.is_grabbed();
+            // A claim on the device keeps the keyboard off the console for
+            // exactly as long as the claimer's session is on the screen. That
+            // conjunction - not the grab alone - is the hand-over: a test or a
+            // console program that grabs a device, and a compositor that has
+            // released its screen, must not swallow the machine's input.
+            let compositor_holds = grabbed && session_active;
+            // The node keeps the event unless the claim is stale: while the
+            // compositor is on the screen (so it reads it), and when nobody has
+            // grabbed at all (so a future evdev reader finds it). A grab
+            // outlived by its screen drops the event rather than queueing it,
+            // because a backlog of frames from a session nobody was watching is
+            // stale motion, not a resume point.
+            let delivers = !grabbed || session_active;
+            // The console's turn is *not* the complement of the node's: with no
+            // grab on the device both happen, which is what a plain GUI console
+            // needs - the keystroke reaches the shell *and* sits on the node for
+            // anyone reading evdev. It is the complement of the compositor's
+            // hold, and only that, that takes the keyboard from the shell.
+            //
+            // `KDSKBMODE(K_OFF)` then takes the keys away from *this* console's
+            // session as well, which is what it is for on Linux - the mode
+            // belongs to the virtual console's keyboard, not to the machine's.
+            // The serial line is the machine's, and it is unaffected: a
+            // compositor must be able to silence the console it is drawing on
+            // without silencing the only wire a person can still type into.
+            let keymap_on =
+                crate::vfs::vcmux::kb_mode(crate::vfs::vcmux::active()) != crate::vfs::tty::K_OFF;
+            let to_console = to_console && !compositor_holds && keymap_on;
             while let Some(event) = device.pop_pending_event() {
-                node.push(&event);
+                if delivers {
+                    node.push(&event);
+                }
                 if to_console
                     && event.event_type == EV_KEY
                     && let Some((bytes, cnt)) = keymap.event(event.code, event.value as i32)

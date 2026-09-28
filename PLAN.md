@@ -80,10 +80,14 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [~] 7.1 Display — `/dev/fb0` (mmap + FBIOGET_* + PAN/VSYNC present) and
       `/dev/dri/card0` + `/dev/dri/renderD128` (resources, dumb buffers, addfb2,
       atomic commits, page-flip + vblank events, PRIME both ways) — which with
-      Mesa's GBM and EGL is weston-on-GL, in software — and the scanout now
-      *follows the host's display size*, so a resized or fullscreened QEMU window
-      is a resized screen with a pointer that reaches all of it. No 3D/virgl, no
-      sync objects, no format modifiers, no EDID (§7.1, §7.4)
+      Mesa's GBM and EGL is weston-on-GL, in software — and a resized or
+      fullscreened QEMU window *follows Linux's virtio-gpu semantics*: the kernel
+      re-reads the host's size, advertises it as the connector's mode and fires a
+      `HOTPLUG=1` uevent, then leaves the scanout alone until the KMS master (an
+      atomic `MODE_ID` or legacy `SETCRTC`) commits it — and only that commit, run
+      on the render task, drives `change_resolution`. A text console with no
+      compositor to commit keeps the size it booted at, exactly as Linux's fbcon
+      does. No 3D/virgl, no sync objects, no format modifiers, no EDID (§7.1, §7.4)
 - [x] 7.2 Input — virtio-input evdev: capability ioctls (`EVIOCGBIT`/`EVIOCGABS`/
       …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents, and
       events that belong to the description that grabbed them (§7.2)
@@ -105,6 +109,12 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
       (virtio-tablet) + `--mode weston` (kernel frees the scanout) — Stage 4, `t-fbdev`
 - [x] DRM/KMS surface — `/dev/dri/card0` (UAPI ioctl + struct ABI, dumb buffers,
       page-flip, vblank events) for DRM-backend compositors — Stage 5, `t-drm`
+- [x] **the screen has an owner** — `VT_SETMODE`'s `VT_PROCESS` negotiation
+      (relsig → `VT_RELDISP`, bounded by a deadline and by a second `^A`), a DRM
+      master bound to a console and revocable from it, `EACCES` on every
+      presentation request from a session that lost its console, and `POLLHUP` on
+      the card fd; before this a `^A` to a text VT lost the screen back to
+      weston on the next mouse move (§7.1, `t-seat`)
 - [x] Mesa `GBM`+`EGL`+GLES — served through `/dev/dri/renderD128` and PRIME, in
       software (llvmpipe); it is how weston's DRM backend runs at all
 - [ ] 3D / virgl / venus (`DRM_VIRTGPU_*`) — deliberately out of scope, and the
@@ -122,6 +132,13 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
         rather than a turn at one shared queue. Two readers of an *ungrabbed*
         node each see every event, which the shared queue could not do either
         (whoever read first consumed it for everybody)
+- [x] a `--mode gui` terminal takes keyboard input — with the serial line
+      discarded the only path in is virtio-input, and a keystroke reaches the
+      active console's shell unless a compositor is *both* grabbing the device and
+      holding the screen; that conjunction, not the grab alone, is what takes the
+      keyboard off the shell, so a plain GUI console (nothing has grabbed the
+      device) is typable again — as is the same console after `^A` moves its
+      session off the screen while a stale claim survives (§7.1, `input::service`)
 - [x] udevd's worker channel works, which is the difference between a keyboard
       and none (`t-udev-worker`). Getting there took two findings, and the first
       draft of this line named the wrong channel, so the correction is the
@@ -226,8 +243,31 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
         the path from `udevadm` to a tagged device node
 
 **Compositors beyond weston (niri, wlroots)** — what a *second* compositor family
-needs on top of the line above. The analysis is §7.4, and none of it has been
-run, so these are steps rather than results:
+needs on top of the line above. The analysis is §7.4. One of these steps has now
+been walked - niri 26.04 was booted in the guest and stopped on the first line of
+it - so the entries say which they are:
+- [x] the **sysfs side of a DRM node's identity**. A reader that holds nothing
+      but a card's device number now reaches the GPU that node belongs to and
+      that GPU's `drm/` listing (`/sys/dev/char/226:N/device/drm`), which is what
+      the Rust `drm` crate's `is_device_drm` stats and what its `dev_path` reads
+      by name to find the sibling node. niri's first stop was exactly this
+      missing directory - it refused a card whose `/dev` node and `st_rdev` were
+      both right as "the provided file descriptor does not refer to a DRM node"
+      (§7.4). Pinned by a host test. **niri was booted again since**, and stopped
+      on the same sentence of the same panic for a second reason: the chain was
+      in the kernel and the card was still refused, because the `..` inside a
+      link's own target could not be resolved on a machine-sized root filesystem
+      (§7.4)
+- [x] the **`..` in a symlink's target**: a relative target is spliced beside
+      the link it came from, and the names walked to reach that link *are* the
+      ancestors the target climbs - so the walk now keeps them instead of
+      restarting from the link's directory and searching the whole tree for each
+      parent (`Vfs::parent_of`, bounded, and silent when the bound is reached).
+      It is not display work, and it was not only niri's problem: a root with 483
+      directories at depth four or less spends that search's budget before it
+      reaches any depth, so every `../../` link in `/sys` failed at once - the
+      card's identity, the parent's node names, and the input nodes' `device`
+      links with them (§7.4)
 - [~] the DRM surface a **wlroots pixman** compositor needs — a primary node with
       `SET_MASTER`, `DRM_CAP_DUMB_BUFFER`, `CREATE_DUMB`/`MAP_DUMB`,
       `PRIME_HANDLE_TO_FD`, `ADDFB`/`MODE_ATOMIC` — is already in place, which
@@ -250,8 +290,12 @@ run, so these are steps rather than results:
       `DRM_CAP_ADDFB2_MODIFIERS`, `FB_DAMAGE_CLIPS`, `OUT_FENCE_PTR`, and
       `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` — refused today, and asked for
       precisely by the virtualized drivers (§7.4)
-- [ ] `MODE_GETFB2`, the `MODE_CREATE_LEASE` family, `MODE_CURSOR`/`MODE_CURSOR2`
-      and the legacy gamma pair (§7.4)
+- [x] the `MODE_CREATE_LEASE` family — a lease is a card descriptor restricted
+      to a list of object ids, mintable only by the master, unable to widen
+      itself, revocable by its lessor, and readable back through `GET_LEASE`
+      (`t-drm-lease`)
+- [ ] `MODE_GETFB2`, `MODE_CURSOR`/`MODE_CURSOR2` and the legacy gamma pair
+      (§7.4)
 - [ ] `/proc/<pid>/maps` — absent, and read by Mesa's allocator paths, LLVM and
       most crash reporters (§Remaining)
 
@@ -1261,11 +1305,15 @@ task that owns the GPU (the only `flush()` caller).
   `GETENCODER`/`GETCONNECTOR`/`GETPLANE`/`GETPLANERESOURCES`,
   `GETPROPERTY`/`SETPROPERTY`/`GETPROPBLOB`/`CREATE_BLOB`/`DESTROY_BLOB`,
   `ADDFB`/`ADDFB2`/`RMFB`/`GETFB`, `PAGE_FLIP`, `MODE_ATOMIC`,
-  `OBJ_GETPROPERTIES`/`OBJ_SETPROPERTY`, `SET_MASTER`/`DROP_MASTER`, and GEM
-  dumb buffers (`CREATE_DUMB`/`MAP_DUMB`/`DESTROY_DUMB`) whose `mmap` aliases
-  real pages with the same per-mapping frame reference discipline the memfd
-  uses. A page flip is applied to the scanout and reports back as a
-  flip-completion `drmEvent` readable (and pollable) on the card fd.
+  `OBJ_GETPROPERTIES`/`OBJ_SETPROPERTY`, and GEM dumb buffers
+  (`CREATE_DUMB`/`MAP_DUMB`/`DESTROY_DUMB`) whose `mmap` aliases real pages with
+  the same per-mapping frame reference discipline the memfd uses. A page flip is
+  applied to the scanout and reports back as a flip-completion `drmEvent`
+  readable (and pollable) on the card fd. `SET_MASTER`/`DROP_MASTER` are a real
+  claim rather than a success: the master belongs to an open file description,
+  is bound to the console the caller is on, and loses the screen - `EACCES` on
+  every presentation request, the queued events drained, `POLLHUP` on the card
+  fd - the moment that console is switched away from (§7.1).
 - **The render node, PRIME and the GL stack.** `/dev/dri/renderD128` is the
   same card state under the render minor, which is the node GBM opens to
   allocate; `PRIME_HANDLE_TO_FD`/`FD_TO_HANDLE` (both directions, so
@@ -1282,10 +1330,13 @@ task that owns the GPU (the only `flush()` caller).
 
 v1 divergences: one fixed connector/crtc/encoder/plane; one synthesized mode
 (the GPU's size at 60 Hz, `PREFERRED|DRIVER`), no `EDID` blob and
-`mm_width`/`mm_height` of zero; vblank is synthesized at the frame beat (no
-hardware interrupt); dumb-buffer mmap uses a `handle << log2(PAGES_PER_BUFFER)`
-offset encoding rather than a DRM VMA manager; no per-client DRM leasing
-(`MODE_CREATE_LEASE` and its family); `IN_FENCE_FD` exists and is stored but no
+`mm_width`/`mm_height` of zero; a flip-completion event is stamped
+with the frame's landing (the render task's present), not the commit, and the
+card fd announces it - but there is no vertical blank and no `WAIT_VBLANK`; dumb-buffer mmap uses a `handle << log2(PAGES_PER_BUFFER)`
+offset encoding rather than a DRM VMA manager; leasing is a restricted
+descriptor but `DRM_MODE_SEAL_ALL` and `LEASE_IMMUTABLE` are recorded and not
+enforced, so a sealed lease can still be revoked and a sealed object still
+accepts a mode change; `IN_FENCE_FD` exists and is stored but no
 fence is ever waited on, so a compositor that passes one is told nothing about
 it - and no `OUT_FENCE_PTR` at all. `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` and
 the colour-pipeline cap are refused `EOPNOTSUPP`, the first of which the
@@ -1351,6 +1402,148 @@ group, by the same route a `Ctrl-C` takes: a pipeline is one job and every
 process in it has the same window, and the signal is the only way a running
 full-screen program learns it has been resized. `stty rows`/`cols` and `resize`
 are what that pair is for.
+
+**Who may paint the screen: `VT_PROCESS` and a master that can be taken away.**
+The symptom was specific and it was measured by hand rather than by a test: on a
+`--mode weston` boot, switching to a text console and then *moving the mouse*
+gave the compositor its screen back. Three absences produced that, and they were
+all in the same place - nobody had ever asked the question "is this screen
+yours?" on a compositor boot:
+
+* `src/drivers/video/render.rs` tested `present_only ||` **before**
+  `vcmux::painted()`, so on a `mpos.compositor` boot the veto existed and was
+  never consulted.
+* Every presentation request (`SETCRTC`, `PAGE_FLIP`, `MODE_ATOMIC`, a
+  `SETPROPERTY` that moves a plane, `RMFB`) applied its pixels and *then* asked
+  the render task to flush, unconditionally - so a refused flip would still have
+  painted.
+* `SET_MASTER`/`DROP_MASTER`/`AUTH` answered `0` and recorded nothing,
+  `VT_SETMODE` accepted any struct without reading it, `VT_GETMODE` always
+  reported `VT_AUTO`, and `VT_RELDISP` always agreed. A session therefore could
+  not be told it had lost anything, and could not refuse.
+
+The ABI is pinned in `src/vfs/vtmode.rs`, which holds no clock, no tasks and no
+signals so that a host build can argue with the whole negotiation: `struct
+vt_mode`'s eight bytes (`mode, waitv, relsig, acqsig, frsig`, padding
+zero-and-read-zero on `VT_GETMODE`, which is a `_IOR` of exactly that size), the
+`EINVAL` set `<linux/vt.h>` uses (unknown mode, `relsig == acqsig`, a signal
+number that is not a signal), and the rule that a refused request is *settled*
+rather than left pending - a refusal is modelled apart from a release precisely
+so that an unrelated later switch cannot be forced through by a timer that is
+counting a conversation nobody is having. Note that `VT_SETMODE` is
+`_IOW('V', 2, struct vt_mode)` while every other request in the family is `_IO`:
+a kernel that decoded the size from the group rather than the request would read
+zero bytes of a caller that wrote eight, and `t-seat` now writes the `_IOW` form
+for exactly that reason.
+
+The mechanism is in `src/vfs/vcmux.rs`. `^A <digit>` and `VT_ACTIVATE` share one
+decision (`vtmode::Table::request_switch`) and differ in who sleeps: the
+keystroke arrives from the serial interrupt handler and cannot park, so it starts
+the negotiation and the mux task's deadline finishes it, while a session's
+`VT_ACTIVATE` goes through `wait_activate` and sleeps on the answer the way
+Linux's `vt_release` does. Neither can therefore disagree about whether a console
+has to be consulted. Leaving
+a `VT_PROCESS` console sends its foreground group `relsig` - `SIGUSR1`/`SIGUSR2`,
+now named in `src/sched/signal.rs`, both fatal by default, which is the correct
+outcome for a session that asked to be consulted and installed no handler - and
+*the screen does not move* until that console answers `VT_RELDISP`. Two things
+bound the wait, because a wedged compositor must not own the machine: the
+requesting task sleeps to Linux's own deadline - `60 * HZ`, 15000 ticks here, the
+`vt_release` timeout - and a `^A` to the console already being asked forces the
+switch through on the spot. The timer is the backstop; the keystroke is the
+escape hatch, and it is the kernel-side one, which is what `CtrlAltFx` is on a
+real console - not something a *session* is offered, so a session's
+`VT_ACTIVATE` can be refused and will be told so, with `EBUSY`.
+
+The master is now a claim rather than a formality. It belongs to the *open file
+description* (`File::ofd`), because that is the only identity that survives the
+way a seat manager actually hands over a card - `SCM_RIGHTS` passes the
+descriptor, and seatd's and weston's fds are one description - and it is bound to
+the console its taker was on, read from the controlling tty at `SET_MASTER` time.
+`AUTH` answers `EACCES` to a non-master and `EINVAL` to the master, which is
+inverted from what one would write by instinct and is exactly what libdrm's
+`drmIsMaster` reads. When the bound console stops being the one on the screen -
+which is *only* ever measured as `holds_screen()`: master's console, on the
+screen, in `KD_GRAPHICS` - the card drains its queued events and reports
+`POLLHUP`, because a compositor parked in `poll` inside `drmHandleEvent` waiting
+for a flip that will now never complete is not merely frozen, it is frozen with
+the keyboard pointed at it. Releasing the master on the last close follows the
+`EVIOCGRAB` precedent beside it, for the same reason: a killed compositor must
+not hold a screen from beyond its own grave.
+
+Two judgement calls are load-bearing and both came out of watching what broke
+first. A master *not* bound to any console - a test program with no controlling
+tty - is allowed to keep driving and is never allowed to veto the text console,
+so `master_vc()` and `master_holds_screen()` are different questions answered
+separately. And the render task now builds the six console grids on a compositor
+boot too, because taking the veto away from `present_only` without giving the
+text VT something to show replaces a stolen screen with a black one; `takeover()`
+is still not called, so the kernel log and the `^A` keystroke keep riding the
+serial wire and `--mode weston` keeps its promise about which window is which.
+The grids are fed but not drawn until somebody holds the card, which is what
+keeps the pre-seat window empty rather than filling it with a boot log the mode
+says belongs to the compositor. Input follows the same fact from the other side:
+`virtio/input.rs` delivers a grabbed node's events only while the grabbing
+session holds the screen, and hands the keystrokes to the console when it does
+not - the complement of a rule that used to be merely "grabbed means not the
+console", which left a released VT with a keyboard that reached nobody.
+
+Rejected: reordering `present_only` and `painted()` on its own, which fixes the
+symptom by handing the loser the screen and the winner nothing; and refusing a
+flip *after* committing it, which is what the ordering at the four presentation
+sites would have made natural, and which paints the frame it just refused.
+
+**Closing the remaining gaps to Linux.** The shape above was deliberately looser
+than Linux in six places, and each is now the ABI it imitates rather than an
+approximation of it:
+
+* `/dev/tty0` is its own inode, `(4, 0)`, and every open of it resolves through
+  `Inode::open_replacement` to the console actually on the screen - so `ttyname`
+  on a descriptor opened that way says `tty3`, and a foreground-process-group
+  rule has something to be a rule *about*. It used to be the console tty
+  registered a second time, which made it `(4, 64)` and left the `(4, 0)` arm of
+  `Tty::vc_number` unreachable.
+* `VT_SETMODE`, `VT_RELDISP`, `VT_ACTIVATE`, `VT_WAITACTIVE` and `VT_OPENQRY` ask
+  who is calling: the terminal's own foreground job, or superuser. Without that,
+  any process holding a `/dev/tty` fd could answer a compositor's `relsig` for
+  it, or write its mode. `KDSETMODE` keeps Linux's second door as well - the
+  holder of the card may set a console's video mode, because the driver that owns
+  the screen is what says what is drawn on it.
+* `KDSKBMODE(K_OFF)` now swallows keystrokes, *for the virtual console only*. The
+  first attempt at this dropped them in the console mux, which also carries the
+  serial line, and produced a machine that could be locked out of its own shell;
+  the mode belongs to the console's keyboard, and the serial wire is the
+  machine's, so `virtio/input.rs` consults it and `vcmux::forward` does not, and
+  a session's last tty close restores `K_XLATE` alongside the mode it already
+  restored.
+* `GET_MAGIC` mints a per-descriptor, one-shot token and `AUTH_MAGIC` is the
+  master's to spend, which is how a compositor lets a client's descriptor
+  page-flip without making it a master. A spent token is gone, an unknown one is
+  `EACCES`, and closing a descriptor retires both its tokens and its
+  authorisation - a token's whole purpose is to name a file description, and a
+  freed one would name whatever lived at that address next.
+* `SET_MASTER` and `DROP_MASTER` are `void`, which is not the shape one writes by
+  instinct: taking the card *steals* it and ends the previous holder's claim,
+  because `SET_MASTER` is also the recovery path for a compositor that lost its
+  console to a `^A` and just won it back. A refusal there would leave the screen
+  permanently promised to a session that no longer has it.
+* `MODE_CREATE_LEASE` / `LIST_LESSES` / `GET_LEASE` / `REVOKE_LEASE` exist: a
+  lease is the same card state behind a descriptor restricted to a list of object
+  ids, only the master may mint one, a lease may not lease out what it was not
+  given, and revoking empties it while leaving the descriptor open, which is what
+  Linux's dead file private looks like from the holder's side. `IMMUTABLE` and
+  `SEAL_ALL` are recorded and reported and *not* enforced - the honest
+  half-measure, since sealing there refuses property changes this synthesized
+  card does not have.
+
+And a flip-completion event is now queued *after* `request_flush_blocking()`
+returns, so its timestamp is the frame's landing rather than the commit, and the
+card fd gains a wake list (`poll_subscribe`) instead of relying on the tick
+re-check `poll_select`'s comment lists it under. `FBIO_WAITFORVSYNC` waits for
+that boundary with a 40 ms budget. It is called a landing everywhere in the code,
+because there is no display controller here to be in blank; `WAIT_VBLANK` and its
+sequence requests are still `ENOTTY` rather than an answer that would be a
+clock this kernel does not have.
 
 ### 7.2 Input: virtio-input (evdev) — **DONE**
 
@@ -1526,7 +1719,54 @@ socket - `SCM_RIGHTS`, which this kernel already has (`t-unix-scm`) - and weston
 takes its card that way today, which is the model to follow. All of it is rootfs
 and init work.
 
-#### What niri needs, and the two things that stop it
+#### What niri needs, and the two things that still stop it
+
+**Where it stopped first, measured.** niri 26.04, booted in the guest, does not
+reach the renderer at all - it dies in the TTY backend's setup with
+
+    thread 'main' panicked at src/main.rs:186:6:
+    called `Result::unwrap()` on an `Err` value: error initializing the TTY backend
+    Caused by:
+        0: error opening the primary GPU DRM node
+        1: the provided file descriptor does not refer to a DRM node
+
+which is `DrmNode::from_path("/dev/dri/card0")` failing its *identity* check.
+niri's own helper had already found the card through eudev, and the node itself
+was fine - the right path, an `st_rdev` of 226:0 - because the `drm` crate on
+Linux asks sysfs a second question:
+
+    let path = format!("/sys/dev/char/{}:{}/device/drm", major(dev), minor(dev));
+    stat(path.as_str()).is_ok()
+
+That is: the node's parent GPU, and the parent's `drm/` directory, whose entries
+are the node *names* of one GPU. This tree had everything about the card except
+that chain - the node, its class entry, the number's index - so a perfectly good
+card was refused. It now has it (`src/vfs/sysfs.rs`: each node's `device` link,
+and the parent's `drm/{card0,renderD128}`), which is also the directory
+`node_with_type(NodeType::Render)` reads to hand niri `/dev/dri/renderD128` for
+`NIRI_PRIMARY_GPU`-free startup. Worth knowing when reading a compositor log:
+libdrm's test for the same question is weaker - `fstat` plus a look for
+`/dev/dri/card*` - which is why weston never noticed the difference.
+
+**Where it stopped second, measured the same way.** A second boot of niri 26.04,
+on a kernel carrying that chain, stopped on the same line of the same panic. The
+tree was right - `/sys/dev/char/226:0`, its `device` link, the parent's
+`drm/{card0,renderD128}` listing - and the card was still refused as "not a DRM
+node", because resolving that path is not one lookup: `226:0` is a link to
+`../../devices/virtual/drm/card0`, whose `device` is a link to `../../virtio-gpu`,
+and the second link's two `..` have to reach the directory that names `card0` -
+a node four levels down. The walk answered `..` by *searching* the tree for the
+parent (`Vfs::parent_of`), a walk bounded at 512 directories that returns nothing
+when the bound is reached. On the guest's root filesystem - 483 directories at
+depth four or less, before the pseudo-filesystems are counted - that budget is
+spent before the search gets that deep, so the `..` stood still, `virtio-gpu` was
+looked up inside `card0`, and the answer was `ENOENT`. Measured by the host test
+that now pins it: the same chain resolves with 480 directories under the root and
+fails at 500. The hole was that a splice threw the walk's chain away (`base =
+here`) and re-derived it by searching; it now keeps it, and the search is left
+where it belongs - a `..` whose base is a cwd, whose ancestors nothing has
+walked. niri has not been booted since *that* fix either, so what it meets next
+is again read off its source rather than measured, and it is the renderer below.
 
 niri's TTY backend is `GpuManager<GbmGlesBackend<GlesRenderer>>` and nothing
 else - there is no pixman renderer in it - and, worse for this kernel, it
@@ -1592,7 +1832,7 @@ answers the names it needs: `CRTC_ID`, `ACTIVE`, `MODE_ID`, `FB_ID`, `type`,
 #### The gap, as a list
 
 Devices and ioctls, roughly in the order the compositors reach for them:
-`MODE_CREATE_LEASE`/`LIST_LESSEES`/`GET_LEASE`/`REVOKE_LEASE`; `MODE_GETFB2`;
+`MODE_GETFB2`;
 `CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE`; `MODE_CURSOR`/`MODE_CURSOR2` and
 `MODE_GETGAMMA`/`MODE_SETGAMMA` (the legacy pair niri falls back to); the
 `SYNCOBJ_*` family (`CREATE`, `DESTROY`, `HANDLE_TO_FD`, `FD_TO_HANDLE`, `WAIT`,

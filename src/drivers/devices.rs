@@ -192,10 +192,12 @@ pub fn standard_devfs() -> Arc<DevFs> {
     dev.register_node("ttyS0", tty.clone());
     dev.register_node("tty", Arc::new(crate::vfs::tty::ControllingTty));
     // `/dev/tty0` - "the current VT", the name a seat manager opens to ask
-    // the console as a whole about its VT state and switch it. mpos has one
-    // console, so the name is that console seen a second time; the VT and KD
-    // ioctls answer from the single-console reality whoever asks them.
-    dev.register_node("tty0", tty.clone());
+    // the console as a whole about its VT state and switch it. It carries
+    // Linux's own `(4, 0)` and every open resolves to the console actually on
+    // the screen, which is what makes a *foreground* rule expressible: a
+    // descriptor for the shared console object has no foreground group of its
+    // own to check, and a descriptor for `tty3` does.
+    dev.register_node("tty0", Arc::new(crate::vfs::tty::Tty0));
     dev.register("console", Arc::new(ConsoleDev));
     // The virtual consoles: the slave ends of the pty pairs minted at boot.
     // A getty respawns on `tty1`..`tty6` the way a stock inittab asks, and

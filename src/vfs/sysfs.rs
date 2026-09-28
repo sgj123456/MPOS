@@ -679,11 +679,33 @@ impl SysFs {
         // opens what answers as its primary GPU. A tree without this class
         // is a machine with no display, however good /dev/dri is; eudev
         // reads exactly the two attributes below.
-        #[cfg(target_os = "none")]
+        //
+        // The GPU the two nodes belong to is built beside them, because in
+        // Linux a DRM node is a child of the device it drives rather than a
+        // device of its own. A reader holding nothing but an open card
+        // descriptor reaches that parent in two hops out of the node -
+        // `device`, then the parent's `drm/`, whose entries are the node
+        // *names* of one GPU - and it is an identity check, not a
+        // convenience: the Rust `drm` crate's `is_device_drm` is a `stat` of
+        // `/sys/dev/char/226:N/device/drm`, and its `dev_path` then matches
+        // the entries below by prefix (`card`, `renderD`) to find the sibling
+        // node. Without the directory, a card whose `/dev` node and `st_rdev`
+        // are both correct is refused as "the provided file descriptor does
+        // not refer to a DRM node" - which is where niri died, before it had
+        // drawn anything, with libdrm's different test (`fstat` plus a look
+        // for `/dev/dri/card*`) happily passing.
+        //
+        // Nothing here asks the hardware, so this is not gated on
+        // `target_os`: a tree the host cannot build is a tree nothing pins,
+        // and the chain above is exactly the kind of shape that rots.
         {
             let drm = class.add_dir("drm", next);
             next += 1;
             let drm_root = virtual_root.add_dir("drm", next);
+            next += 1;
+            let gpu = virtual_root.add_dir("virtio-gpu", next);
+            next += 1;
+            let gpu_drm = gpu.add_dir("drm", next);
             next += 1;
             for (name, minor, devnode) in [
                 ("card0", 0u32, "dri/card0"),
@@ -739,6 +761,30 @@ impl SysFs {
                     Arc::new(SysSymlink {
                         ino: next,
                         target: String::from("../../../class/drm"),
+                    }),
+                );
+                next += 1;
+                // The GPU this node belongs to. The parent is the same
+                // directory for both nodes - one card carries both names - so
+                // the link is what makes them siblings rather than two trees
+                // that agree by hand.
+                dir.add(
+                    "device",
+                    Arc::new(SysSymlink {
+                        ino: next,
+                        target: String::from("../../virtio-gpu"),
+                    }),
+                );
+                next += 1;
+                // And the node under the parent's `drm/`, by name, as a link
+                // back to the node itself: that listing is the whole answer to
+                // "which other names does this GPU have", and a copy of the
+                // node here would be a second device to keep in step.
+                gpu_drm.add(
+                    name,
+                    Arc::new(SysSymlink {
+                        ino: next,
+                        target: alloc::format!("../../drm/{}", name),
                     }),
                 );
                 next += 1;
@@ -1117,6 +1163,28 @@ mod tests {
             .unwrap_or_else(|e| panic!("{path} did not resolve: {e:?}"))
     }
 
+    /// The same walk on a root that has `fillers` other directories in it.
+    ///
+    /// Which is the difference between this tree and a machine: the guest's
+    /// root filesystem carries 483 directories at depth four or less, so a walk
+    /// that answers `..` by *searching* the tree for each parent spends its
+    /// budget before it reaches anything this deep - and every relative link
+    /// target in `/sys` names its parent with `..`.
+    fn resolve_on_a_full_root(fs: &Arc<SysFs>, path: &str, fillers: usize) -> Arc<dyn Inode> {
+        let vfs = crate::vfs::mount::Vfs::new();
+        let root = crate::vfs::ramfs::RamFs::new();
+        vfs.mount_root(&*root);
+        root.root().create("sys", NodeKind::Dir).unwrap();
+        for i in 0..fillers {
+            root.root()
+                .create(&alloc::format!("d{i:04}"), NodeKind::Dir)
+                .unwrap();
+        }
+        vfs.mount("/sys", &**fs).unwrap();
+        vfs.resolve(path)
+            .unwrap_or_else(|e| panic!("{path} did not resolve: {e:?}"))
+    }
+
     fn text(node: &Arc<dyn Inode>) -> String {
         let mut buf = [0u8; 512];
         let n = node.read_at(0, &mut buf).expect("a read");
@@ -1303,6 +1371,108 @@ mod tests {
         // A number nothing carries is not there: an index that invented an
         // entry would hand a caller a device that does not exist.
         assert!(blocks.lookup("254:9").is_err());
+    }
+
+    #[test]
+    fn a_card_leads_to_the_node_names_the_drm_crate_reads() {
+        // The identity chain the Rust `drm` crate walks from an open card, and
+        // the one niri panicked on: `DrmNode::from_path("/dev/dri/card0")`
+        // stats the node, is handed 226:0, and then has only sysfs left to ask
+        // - whether `/sys/dev/char/226:0/device/drm` exists at all (its
+        // `is_device_drm`), and which names it lists (its `dev_path`, matching
+        // by prefix to find the sibling node). A tree with everything else
+        // right and this directory missing answers the first question "no":
+        // "the provided file descriptor does not refer to a DRM node".
+        let fs = fs();
+        for number in ["226:0", "226:128"] {
+            let parent = resolve(&fs, &alloc::format!("/sys/dev/char/{number}/device"));
+            assert_eq!(parent.metadata().kind, NodeKind::Dir);
+            let nodes = resolve(&fs, &alloc::format!("/sys/dev/char/{number}/device/drm"));
+            assert_eq!(nodes.metadata().kind, NodeKind::Dir);
+            let names: Vec<String> = nodes
+                .read_dir()
+                .expect("a listing")
+                .into_iter()
+                .map(|(name, _kind)| name)
+                .collect();
+            // The rule `dev_path` applies: the first entry whose name starts
+            // with the type's prefix, taken only if the `/dev` node it names
+            // exists. `/dev/dri/card0` and `/dev/dri/renderD128` are the two
+            // the device registry registers, so both prefixes must answer -
+            // and answer with the name that node really has, since that name
+            // is the path the crate hands back.
+            assert_eq!(
+                names
+                    .iter()
+                    .find(|name| name.starts_with("card"))
+                    .map(String::as_str),
+                Some("card0")
+            );
+            assert_eq!(
+                names
+                    .iter()
+                    .find(|name| name.starts_with("renderD"))
+                    .map(String::as_str),
+                Some("renderD128")
+            );
+            // No third name: an entry whose `/dev` node does not exist is a
+            // node the crate finds and then rejects, which reads to a
+            // compositor as a GPU with no render node at all.
+            assert_eq!(names.len(), 2, "one GPU, two names: {names:?}");
+        }
+
+        // One card under three names - the device tree's directory, the class
+        // entry, and the number's index - and they have to be the same node: a
+        // compositor picks the card up by class and then identifies it by
+        // number, and two nodes would be two cards.
+        assert_eq!(
+            resolve(&fs, "/sys/dev/char/226:0").metadata().ino,
+            resolve(&fs, "/sys/class/drm/card0").metadata().ino,
+            "the class entry and the device number are one card"
+        );
+        // And one parent for both nodes, which is what makes them siblings: a
+        // compositor asks the card it opened for the *name* of its render
+        // node through exactly this directory.
+        assert_eq!(
+            resolve(&fs, "/sys/dev/char/226:0/device").metadata().ino,
+            resolve(&fs, "/sys/dev/char/226:128/device").metadata().ino,
+            "both nodes hang from the one GPU"
+        );
+    }
+
+    #[test]
+    fn the_cards_identity_chain_survives_a_full_root() {
+        // The same chain, on a root with a machine's number of directories in
+        // it. niri hit this one *after* the chain above existed: the `device`
+        // link was in the kernel and the card was still refused as "the
+        // provided file descriptor does not refer to a DRM node", because the
+        // `..` in the link's own target could not be resolved on a tree this
+        // size (see `a_links_target_climbs_the_chain_rather_than_searching_for_it`).
+        // The 600 directories are the guest's 483 in miniature.
+        let fs = fs();
+        let drm = resolve_on_a_full_root(&fs, "/sys/dev/char/226:0/device/drm", 600);
+        assert_eq!(drm.metadata().kind, NodeKind::Dir);
+        // The names `dev_path` matches by prefix, read on the same full root:
+        // this is what hands the compositor its sibling node, so a chain that
+        // resolves to the wrong directory is as bad as one that does not.
+        let names: Vec<String> = drm
+            .read_dir()
+            .expect("a listing")
+            .into_iter()
+            .map(|(name, _kind)| name)
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .find(|name| name.starts_with("renderD"))
+                .map(String::as_str),
+            Some("renderD128")
+        );
+        for number in ["226:0", "226:128"] {
+            let parent =
+                resolve_on_a_full_root(&fs, &alloc::format!("/sys/dev/char/{number}/device"), 600);
+            assert_eq!(parent.metadata().kind, NodeKind::Dir);
+        }
     }
 
     #[test]

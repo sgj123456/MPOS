@@ -181,7 +181,7 @@ watch only the serial log — though the console now renders to the framebuffer,
 | 终端 | `terminal` | 只有串口终端，无窗口，GPU 不参与 | `-display none` + 串口走 stdio | `mpos.headless` |
 | 图形 | `gui` | 只有 framebuffer 窗口，切换后串口静默 | `-display <后端>` + 串口丢弃 | `mpos.nomirror` |
 | 镜像 | `mirror` | 窗口为主，串口尽力跟一份 | `-display <后端>` + 串口走 stdio | `mpos.mirror` |
-| 合成器 | `weston` | 窗口归 weston，控制台不占 framebuffer；串口仍有日志 | `-display <后端>` + 串口走 stdio | `mpos.compositor` |
+| 合成器 | `weston` | 窗口归 weston（其 VT 在屏期间，由 root 的 `start-weston.sh` 启动）；`^A 1..6` 切走后窗口显示该控制台，串口始终有日志 | `-display <后端>` + 串口走 stdio | `mpos.compositor` |
 
 切换很快：`--mode` 指定的模式会随特权子步骤刷新**只改引导文件**（`rootfs`
 本来就跳过重装 Alpine），重写镜像里的 `mpos.cmdline`；`build/console.mode`
@@ -203,10 +203,16 @@ guest boot flag in step:
   console moves over (`mpos.nomirror`).
 - **mirror** — the window plus a **best-effort** copy on the serial line, so the
   same console shows in the window and the terminal at once (`mpos.mirror`).
-- **weston** — the window belongs to the compositor: the kernel console never takes
+- **weston** — the window belongs to the compositor for as long as its own
+  virtual console is the one on the screen: the kernel console never moves onto
   the framebuffer, so a typed line cannot paint over weston, while the boot log
-  still rides the serial line. The boot word it bakes stays `mpos.compositor`,
-  which is the kernel's own ABI, read by name in `src/main.rs`.
+  still rides the serial line. Nothing launches the compositor; root's
+  `./start-weston.sh` does, once the login prompt appears. `^A 1`..`^A 6`
+  switches away anyway — the session is asked to release the display (and a
+  session in `VT_PROCESS` is *asked*, which is why `^A` twice is the escape
+  hatch), its page flips start answering `EACCES`, and the window shows the
+  console you moved to. The boot word it bakes stays `mpos.compositor`, which is
+  the kernel's own ABI, read by name in `src/main.rs`.
 
 Switching is fast: the requested mode rides into the privileged step, which
 refreshes **only the boot files** (`rootfs` already skips the Alpine reinstall) and

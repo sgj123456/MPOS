@@ -59,9 +59,11 @@ pub fn spawn_service() {
             // GPU's device configuration, and one word read a tick is what
             // notices it - the same cheap poll as the two above, and the
             // reason a display resize needs no interrupt. The *size* is not
-            // read here: the render task owns the device and does the rebuild.
+            // read here and the screen is not rebuilt here: the render task
+            // owns the device, re-reads the size and advertises it as a hotplug
+            // uevent, and the scanout only follows a compositor's commit.
             if crate::drivers::video::render::running() && gpu::take_display_event() {
-                crate::drivers::video::render::request_resize();
+                crate::drivers::video::render::request_display_probe();
             }
             crate::sched::sleep_ticks(1);
         },

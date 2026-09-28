@@ -44,9 +44,13 @@ pub fn set_headless(on: bool) {
 
 /// `mpos.compositor` on the command line: the GPU is present and `/dev/fb0`
 /// is live, but the framebuffer belongs to a userspace compositor, not to the
-/// kernel console. The render task then only presents frames the compositor
-/// asks for and never paints a text grid onto the scanout, and the console
-/// stays on the serial wire.
+/// kernel console, and the kernel's own log stays on the serial wire.
+///
+/// It has never meant "no text console exists", though, and since the screen is
+/// *shared* - the compositor holds it while its virtual console is the one on
+/// the screen, and hands it back when that console is switched away from - the
+/// grids have to be made on this boot too. What the flag decides is which
+/// backend the *kernel* log goes to, not whether the terminals are drawn.
 static COMPOSITOR: AtomicBool = AtomicBool::new(false);
 
 pub fn set_compositor(on: bool) {
@@ -56,6 +60,31 @@ pub fn set_compositor(on: bool) {
 /// Whether this boot hands the framebuffer to a compositor.
 pub fn compositor() -> bool {
     COMPOSITOR.load(Ordering::Relaxed)
+}
+
+/// Whether the console's bytes are being *drawn* - that one screen exists and
+/// the render task can paint it - as opposed to whether the framebuffer is the
+/// console's *only* sink, which is what [`gpu_mode`] answers.
+///
+/// The two are the same question on every boot but a compositor's, and that is
+/// the whole reason for splitting them: on a weston boot the kernel log stays on
+/// the serial wire (the scanout belongs to the compositor), and yet the virtual
+/// consoles still have to be *somewhere*, because a text VT the compositor has
+/// released is a VT somebody has to be able to read. Feeding a grid that does
+/// not exist yet is a no-op the terminal layer already handles, so a compositor
+/// boot turns this on with its other grids at the moment they are made and the
+/// console keeps its wire until then and afterwards.
+static GRIDS_LIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn grids_live() -> bool {
+    gpu_mode() || GRIDS_LIVE.load(Ordering::Relaxed)
+}
+
+/// Flip [`grids_live`] on. Called by the render task as it makes the grids, and
+/// only for a compositor boot - on any other boot [`takeover`] reaches the same
+/// state by way of [`set_gpu`].
+pub fn set_grids_live() {
+    GRIDS_LIVE.store(true, Ordering::Relaxed);
 }
 
 /// Whether the boot mode *asks* for the serial mirror at all, before the console
@@ -197,15 +226,23 @@ pub fn write_bytes(bytes: &[u8]) {
     // brought up to a screen that already shows the boot log rather than born
     // mid-story. Fixed-size, never allocates, safe from the interrupt path.
     record(bytes);
-    if gpu_mode() {
+    if grids_live() {
         // Kernel console text lands on the virtual console currently on screen,
         // exactly as Linux prints onto the foreground VT. Once its grid exists
         // (after the render task made it) this paints; before, the ring above
         // still catches it for the replay.
         crate::vfs::term::with_screen(active_grid(), |g| g.feed(bytes));
         crate::drivers::video::render::notify();
-        if mirror_serial() {
-            serial_mirror_now(bytes);
+        // On a compositor boot the wire is the console's backend rather than its
+        // mirror, and the difference is only how much the sender is willing to
+        // wait for it: an authoritative write parks until the hardware has
+        // taken everything, a mirror drops what does not fit.
+        if gpu_mode() {
+            if mirror_serial() {
+                serial_mirror_now(bytes);
+            }
+        } else {
+            serial_bytes(bytes);
         }
         return;
     }
@@ -221,9 +258,17 @@ pub fn write_bytes(bytes: &[u8]) {
 /// also go out the wire, so the same console shows in the terminal window as
 /// well. On a headless boot (no framebuffer) the wire is the only sink.
 pub fn vc_output(vc: u32, bytes: &[u8]) {
+    if !grids_live() {
+        serial_bytes(bytes);
+        return;
+    }
+    crate::vfs::term::with_screen(vc as usize, |g| g.feed(bytes));
+    crate::drivers::video::render::notify();
+    // The same split as [`write_bytes`]: on a compositor boot the shells' text
+    // is drawn *and* goes out the wire, because the wire is what the person
+    // watching is reading; once the console has handed the screen to the GPU the
+    // mirror is optional, and `--mode gui` is exactly the boot that declines it.
     if gpu_mode() {
-        crate::vfs::term::with_screen(vc as usize, |g| g.feed(bytes));
-        crate::drivers::video::render::notify();
         if mirror_serial() {
             serial_mirror_now(bytes);
         }

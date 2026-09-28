@@ -747,15 +747,22 @@ impl Vfs {
 
         // The names still to walk. Owned, because meeting a link rewrites what
         // is left: the link's target goes in front of the names that followed
-        // it, and the whole thing is walked again.
+        // it, and the walk continues from there.
         let mut todo: VecDeque<String> = path::components(path)?
             .map(String::from)
             .collect::<Vec<_>>()
             .into();
-        // Where the walk restarts from, which a link's target can move: an
-        // absolute target goes back to the root, a relative one stays beside
-        // the link it came from.
-        let mut base = start;
+        // The walk so far, and the only record of where it has been: `stack[0]`
+        // is where it started - the root for an absolute path, the caller's cwd
+        // for a relative one - and the last entry is the directory the next
+        // name is looked up in. The chain is what answers `..`, which is why it
+        // outlives a link: a relative target is spliced *beside* the link it
+        // came from, so the names already walked are exactly the ancestors the
+        // target's own `..` has to reach. A walk that dropped the chain would
+        // have to *search* for each of those parents instead - one bounded
+        // whole-tree search per `..`, `parent_of` - and a search that gives up
+        // leaves the `..` standing still.
+        let mut stack: Vec<Arc<dyn Inode>> = alloc::vec![start];
         let mut hops = 0;
         // Whether the walk's current context is inside a *bind* alias. Linux
         // copies no child mounts into a plain bind - only `MS_REC` carries
@@ -770,18 +777,14 @@ impl Vfs {
         let mut bound = false;
 
         loop {
-            // The logical chain from `base`. Length 1 means "at `base`", where
-            // `..` stays put as POSIX says it must.
-            let mut stack: Vec<Arc<dyn Inode>> = alloc::vec![base.clone()];
             let mut met_link = false;
 
             while let Some(comp) = todo.pop_front() {
                 match comp.as_str() {
                     "." => {}
-                    // POSIX: `/..` is `/`, so the last entry never pops. The
-                    // first `..` is the one an inode cannot answer: the stack
-                    // holds the walk so far, and at the base there is no walk
-                    // yet, so the base's own parent has to be looked for.
+                    // POSIX: `/..` is `/`, so the last entry never pops. Every
+                    // other `..` is one step back along the chain the walk
+                    // built on its way down.
                     ".." => {
                         // Leaving a directory is a search of it as much as
                         // entering one is: Linux asks for the execute bit
@@ -798,8 +801,17 @@ impl Vfs {
                             // an ordinary walk would have said so by looking a
                             // name up in it.
                             return Err(VfsError::NotDir);
-                        } else if let Some(parent) = self.parent_of(&stack[0]) {
-                            stack[0] = parent;
+                        } else if !self.is_root(&stack[0]) {
+                            // A chain of one means the walk has not descended
+                            // from where it started, so the parent above it is
+                            // the one thing the chain cannot supply: an
+                            // absolute path starts at the root, whose `..` is
+                            // itself, and anything else is a caller's cwd, whose
+                            // ancestry the kernel is not holding. That is the
+                            // only parent search left, and it is bounded.
+                            if let Some(parent) = self.parent_of(&stack[0]) {
+                                stack[0] = parent;
+                            }
                         }
                     }
                     name => {
@@ -857,8 +869,10 @@ impl Vfs {
                                 continue;
                             }
                             // Splice the target in front of whatever was still
-                            // to come and start over. `here`, not the link, is
-                            // what a relative target is relative to.
+                            // to come. `here`, not the link, is what a relative
+                            // target is relative to - and `here` is what the
+                            // chain ends at, so a relative splice keeps every
+                            // ancestor the walk has walked.
                             let target = child.readlink()?;
                             // `components` only splits absolute paths, so a
                             // relative target is walked as the absolute path
@@ -877,16 +891,16 @@ impl Vfs {
                                 .into();
                             next.extend(todo);
                             todo = next;
-                            base = if target.starts_with('/') {
-                                critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
-                                    .ok_or(VfsError::NoRoot)?
-                            } else {
-                                here
-                            };
                             if target.starts_with('/') {
-                                // The restart is from the real root, not from
-                                // inside the alias, so the bind context ends
-                                // with the path it was walked on.
+                                // An absolute target names a path from the real
+                                // root, so the names after it are looked up
+                                // there and the walk to the link - and any bind
+                                // alias it came through - is behind it.
+                                stack.truncate(1);
+                                stack[0] = critical_section::with(|cs| {
+                                    self.root.borrow(cs).borrow().clone()
+                                })
+                                .ok_or(VfsError::NoRoot)?;
                                 bound = false;
                             }
                             met_link = true;
@@ -1039,6 +1053,15 @@ impl Vfs {
         lines
     }
 
+    /// Whether `node` is the root of this tree - which answers `..` without a
+    /// search, because `/..` is `/`: the root is the one node whose parent the
+    /// walk must *not* go looking for. Nothing names the root, so the search
+    /// would spend its whole budget learning what this comparison knows.
+    fn is_root(&self, node: &Arc<dyn Inode>) -> bool {
+        critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+            .is_some_and(|root| Arc::ptr_eq(&root, node))
+    }
+
     /// The directory that names `target`, found by walking down from the root.
     ///
     /// A node does not know its parent. A directory is a *name edge* in
@@ -1046,6 +1069,12 @@ impl Vfs {
     /// an inode is to look for the edge that names it - which is a walk of the
     /// tree. It is what makes `..` mean anything from a cwd, since a relative
     /// path starts at an inode and not at a name.
+    ///
+    /// This is the *fallback*, for a `..` whose ancestors no walk has seen:
+    /// everything a path walked from the root brings its own chain, and so does
+    /// a symlink's target, which is spliced beside the link it came from
+    /// ([`Self::resolve_from`]). What is left is a path relative to a cwd,
+    /// whose parent the caller's inode cannot name.
     ///
     /// A mounted filesystem is handled by the edge that carries it: the search
     /// steps into the mount and compares against the mounted root, so `..` out
@@ -1394,6 +1423,44 @@ mod tests {
         assert_eq!(vfs.resolve("/a/missing").err(), Some(VfsError::NoEntry));
         // A file in the middle of a path is not a directory.
         assert_eq!(vfs.resolve("/a/f/x").err(), Some(VfsError::NotDir));
+    }
+
+    #[test]
+    fn a_links_target_climbs_the_chain_rather_than_searching_for_it() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        // A root with enough in it that looking for a parent *by searching the
+        // tree* gives up - which is what a real root filesystem looks like, and
+        // why the search is not something a `..` can lean on. The count is the
+        // budget's own: `parent_of` stops after `VISITS_MAX` directories.
+        for i in 0..600 {
+            root.create(&alloc::format!("d{i:04}"), NodeKind::Dir)
+                .unwrap();
+        }
+        let a = root.create("a", NodeKind::Dir).unwrap();
+        let b = a.create("b", NodeKind::Dir).unwrap();
+        let target = b.create("target", NodeKind::Dir).unwrap();
+        target.create("file", NodeKind::File).unwrap();
+        let c = b.create("c", NodeKind::Dir).unwrap();
+        let deep = c.create("deep", NodeKind::Dir).unwrap();
+        // `/a/b/c/deep/link` names `/a/b/target`, which is the shape every
+        // `/sys/dev/char/N:M/device` link has: a target that climbs out of the
+        // directory the link sits in. Walking it needs the two ancestors `../..`
+        // names, and the walk has them - it came down through them - so nothing
+        // has to be looked for.
+        deep.symlink("link", "../../target").unwrap();
+
+        assert!(
+            Arc::ptr_eq(&vfs.resolve("/a/b/c/deep/link").unwrap(), &target),
+            "a relative target resolves beside the link it came from"
+        );
+        // And the walk continues *through* the link, which is where a failed
+        // climb shows up as a name not found in the wrong directory.
+        vfs.resolve("/a/b/c/deep/link/file").unwrap();
+        assert_eq!(
+            vfs.resolve("/a/b/c/deep/link/missing").err(),
+            Some(VfsError::NoEntry)
+        );
     }
 
     #[test]
