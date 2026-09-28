@@ -3107,6 +3107,8 @@ fn sync_nonblocking(file: &crate::vfs::File, status: u32) {
     let on = status & crate::vfs::file::O_NONBLOCK != 0;
     if let Some(pipe) = file.inode().as_pipe() {
         pipe.set_nonblocking(on);
+    } else if let Some(ev) = file.inode().as_evdev() {
+        ev.set_nonblocking(on);
     } else if let Some(eventfd) = file.inode().as_eventfd() {
         eventfd.set_nonblocking(on);
     } else if let Some(inotify) = file.inode().as_inotify() {

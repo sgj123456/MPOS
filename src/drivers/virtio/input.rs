@@ -28,6 +28,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use critical_section::Mutex;
 use virtio_drivers::device::input::{AbsInfo, VirtIOInput};
@@ -188,6 +189,14 @@ pub struct EvdevNode {
     /// where one client's position was moved and another's was not.
     records: Mutex<RefCell<Records>>,
     caps: EvdevCaps,
+    /// `O_NONBLOCK` on the description that opened this node: a read with no
+    /// record waiting answers `EAGAIN` rather than parking. It is not a nicety
+    /// for a compositor but the shape of its main loop - `libinput` opens every
+    /// evdev node with `O_NONBLOCK` and pumps it from `epoll`, so a read that
+    /// parked where Linux answered `EAGAIN` stops the compositor at its first
+    /// empty poll: no repaint, no timers, and the next device in the
+    /// enumeration never added.
+    nonblocking: AtomicBool,
 }
 
 impl EvdevNode {
@@ -205,7 +214,15 @@ impl EvdevNode {
             index,
             records: Mutex::new(RefCell::new(Records::new())),
             caps,
+            nonblocking: AtomicBool::new(false),
         })
+    }
+
+    /// Mirror the description's `O_NONBLOCK` into the node, where the blocking
+    /// actually happens. Called on open and by `fcntl(F_SETFL)`/`FIONBIO`, the
+    /// same two paths every other blocking node is told by.
+    pub fn set_nonblocking(&self, on: bool) {
+        self.nonblocking.store(on, Ordering::Relaxed);
     }
 
     /// The device's own name for itself, as `EVIOCGNAME` reports it - the
@@ -439,6 +456,12 @@ impl Inode for EvdevNode {
                 Some(0) => {}
                 Some(n) => return Ok(n),
                 None => return Err(VfsError::Invalid),
+            }
+            // The description asked not to wait, and there is nothing to hand
+            // it: `EAGAIN`, which is how a caller that polls the node learns
+            // there is nothing yet without its whole loop stopping here.
+            if self.nonblocking.load(Ordering::Relaxed) {
+                return Err(VfsError::Again);
             }
             if crate::sched::has_deliverable_signal() {
                 return Ok(0);
