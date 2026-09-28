@@ -472,18 +472,37 @@ impl Inode for PipeEnd {
         false
     }
 
+    /// `pipe_poll`'s rule: a read is ready while bytes are *waiting*, and the
+    /// end of the stream is not a read condition at all - it is the hang-up
+    /// below. Keeping the two apart is what lets a waiter end on either, and
+    /// one waiter in particular has to: udev's `spawn_wait` reads its child's
+    /// pipe with epoll and takes only `EPOLLHUP` as "the program is done", so
+    /// an end-of-stream reported as `EPOLLIN` alone leaves it reading 0 in a
+    /// loop until its event timeout expires.
     fn poll_ready(&self) -> Ready {
         critical_section::with(|cs| {
             let st = self.state.borrow(cs).borrow();
             Ready {
-                // Data waiting, or the end of it: with no writers left, a read
-                // answers 0 rather than waiting, and that is readable too.
-                read: !st.data.is_empty() || st.writers == 0,
+                read: !st.data.is_empty(),
                 // Room for something, or a write that is about to fail: with no
                 // readers left, a write answers EPIPE rather than waiting.
                 write: st.readers == 0 || st.data.len() < CAPACITY,
             }
         })
+    }
+
+    /// The stream's writing side is gone: every reader's next read drains what
+    /// is buffered and then answers 0. Read off the same counter
+    /// [`Self::poll_ready`] reads, so the two answers cannot disagree.
+    fn poll_hup(&self) -> bool {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().writers == 0)
+    }
+
+    /// The stream's reading side is gone: a write answers `EPIPE`. That is
+    /// `EPOLLERR` on a pipe, and the pair with [`Self::poll_hup`] completes
+    /// `pipe_poll`'s two conditions.
+    fn poll_err(&self) -> bool {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().readers == 0)
     }
 
     fn poll_subscribe(&self, id: TaskId) {
@@ -685,11 +704,33 @@ impl DuplexEnd {
 }
 
 impl Inode for DuplexEnd {
+    /// A socketpair is not a pipe and Linux does not answer it like one: the
+    /// read half keeps `EPOLLIN` when the peer has gone - `unix_poll` sets
+    /// `EPOLLIN` and `EPOLLHUP` together once the peer closed - where a pipe
+    /// drops the read condition and reports the hang-up alone. Both readings
+    /// are honest here (a read does answer 0 either way); the socket's is the
+    /// tolerant one, and it is what the socketpair's own callers were written
+    /// against, so the pipe's news is added *beside* it rather than replacing
+    /// it.
     fn poll_ready(&self) -> Ready {
         Ready {
-            read: self.read.poll_ready().read,
+            read: self.read.poll_ready().read || self.read.poll_hup(),
             write: self.write.poll_ready().write,
         }
+    }
+
+    /// The peer is gone altogether: nobody is writing into this end and nobody
+    /// is reading what it writes. A *half*-close is only the first of those,
+    /// and Linux calls it something else again - `EPOLLRDHUP` with `EPOLLIN`,
+    /// not a hang-up - so the two directions have to agree before this is true.
+    fn poll_hup(&self) -> bool {
+        self.read.poll_hup() && self.write.poll_err()
+    }
+
+    /// Never: a socket has error conditions (a pending `sk_err`), but a peer
+    /// that has simply gone is the hang-up above, not one of them.
+    fn poll_err(&self) -> bool {
+        false
     }
 
     /// Neither half of a socketpair is seekable, for the same reason a pipe
@@ -980,5 +1021,68 @@ mod tests {
         let (read_end, write_end) = pair();
         assert_eq!(read_end.read_at(0, &mut []).unwrap(), 0);
         assert_eq!(write_end.write_at(0, b"").unwrap(), 0);
+    }
+
+    /// `pipe_poll`'s two conditions, and the one that is easy to get wrong:
+    /// the end of the stream is a *hang-up*, not another way of being
+    /// readable. A waiter that ends on `EPOLLHUP` alone - udev's
+    /// `spawn_wait`, whose epoll loop takes a read's 0 as "ask again" and
+    /// the hang-up as "done" - can only finish while the two stay apart.
+    #[test]
+    fn end_of_stream_is_a_hang_up_and_not_a_read_condition() {
+        let (read_end, write_end) = pair();
+
+        // A writer still attached and nothing buffered: neither condition.
+        assert!(!read_end.poll_ready().read);
+        assert!(!read_end.poll_hup());
+        assert!(!read_end.poll_err());
+
+        // Bytes waiting: readable, and not hung up.
+        write_end.write_at(0, b"x").unwrap();
+        assert!(read_end.poll_ready().read);
+        assert!(!read_end.poll_hup());
+
+        // The writer goes, with the byte still unread: both, as Linux
+        // reports both.
+        drop(write_end);
+        assert!(read_end.poll_ready().read);
+        assert!(read_end.poll_hup());
+
+        // Drained: the read condition is gone and the hang-up is what is
+        // left. This is the state the udev waiter has to be able to see.
+        let mut buf = [0u8; 1];
+        assert_eq!(read_end.read_at(0, &mut buf).unwrap(), 1);
+        assert!(!read_end.poll_ready().read);
+        assert!(read_end.poll_hup());
+        assert!(!read_end.poll_err(), "this end is the reader, and it lives");
+    }
+
+    /// The other half of the same rule, plus the socketpair's difference: a
+    /// write end whose readers are gone reports the *error* condition, and a
+    /// socketpair keeps its peer-closed news readable as well (`unix_poll`
+    /// sets `EPOLLIN` and `EPOLLHUP` together, where a pipe does not).
+    #[test]
+    fn a_lost_reader_is_an_error_and_a_socketpair_stays_readable() {
+        let (read_end, write_end) = pair();
+        assert!(!write_end.poll_err());
+        assert!(!write_end.poll_hup(), "the writer counts itself");
+        drop(read_end);
+        assert!(write_end.poll_err(), "nobody left to write to");
+        assert!(
+            write_end.poll_ready().write,
+            "a write answers EPIPE, not a wait"
+        );
+
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        drop(b);
+        assert!(a.poll_hup(), "the peer closed, both directions with it");
+        assert!(
+            !a.poll_err(),
+            "and a socket calls that a hang-up, not an error"
+        );
+        assert!(
+            a.poll_ready().read,
+            "a unix socket answers end-of-stream as readable too"
+        );
     }
 }

@@ -144,6 +144,11 @@ pub(super) const POLLFD_EVENTS: usize = 4;
 /// What a caller may ask `poll` to watch for, and what it is told happened.
 pub(super) const POLLIN: i16 = 0x001;
 pub(super) const POLLOUT: i16 = 0x004;
+/// `POLLERR` and `POLLHUP`: the node's peer is gone. They are not askable -
+/// `poll` sets them on a descriptor whatever `events` said, which is why they
+/// are reported beside the mask rather than filtered through it.
+pub(super) const POLLERR: i16 = 0x008;
+pub(super) const POLLHUP: i16 = 0x010;
 /// `POLLNVAL`: the descriptor is not open. Counting it is what stops a
 /// caller waiting on a closed fd from sleeping forever.
 pub(super) const POLLNVAL: i16 = 0x020;
@@ -2793,6 +2798,8 @@ mod tests {
         // poll(2)
         assert_eq!(POLLIN, 0x001);
         assert_eq!(POLLOUT, 0x004);
+        assert_eq!(POLLERR, 0x008);
+        assert_eq!(POLLHUP, 0x010);
         assert_eq!(POLLNVAL, 0x020);
         assert_eq!(POLLFD_SIZE, 8);
         assert_eq!(POLLFD_EVENTS, 4);

@@ -373,15 +373,37 @@ impl SysFs {
         // and drop everything inside it without a word.
         let virtual_root = devices.add_dir("virtual", next);
         next += 1;
-        // Every device number in this tree, with the class entry that carries
-        // it. Collected as the classes are built because `/sys/dev` below is
-        // the one place they are needed together, and a second walk of the
-        // tree to find them would be a second definition of the same fact.
+        // Every device number in this tree, with the `/sys`-relative path of
+        // the device that carries it and which of `/sys/dev`'s two directories
+        // it belongs in. Collected as the classes are built because `/sys/dev`
+        // below is the one place they are needed together, and a second walk of
+        // the tree to find them would be a second definition of the same fact.
+        //
+        // The path is the *device tree's*, not the class entry's, wherever the
+        // device has one - Linux's driver core points `/sys/dev/char/M:m` at
+        // the device itself (`../../devices/...`), and a reader that resolves
+        // the link is expected to land on the device, not on another link to
+        // it. libudev resolves exactly one hop, and libinput leans on the
+        // answer: `evdev_device_have_same_syspath` re-derives the device from
+        // its own `fstat` devnum and refuses the device unless the two
+        // *strings* are equal. With a class-shaped link they are
+        // `/devices/virtual/input/input0/event0` and `/class/input/event0`,
+        // the check fails silently, and weston reports "failed to create input
+        // device" for a keyboard that is otherwise perfectly well tagged.
+        //
+        // Block devices are the exception, and honestly so: they have no
+        // directory under `/sys/devices` in this tree, so their class entry is
+        // where they really live.
         let mut devnodes: Vec<(&'static str, String, u32, u32)> = Vec::new();
         for (name, major, minor, _whole) in numbering.devices.iter() {
             let dir = block.add_dir(name, next);
             next += 1;
-            devnodes.push(("block", name.clone(), *major, *minor));
+            devnodes.push((
+                "block",
+                alloc::format!("class/block/{}", name),
+                *major,
+                *minor,
+            ));
             // The numbers, as `/dev` nodes are made from them.
             let numbers = alloc::format!("{}:{}\n", major, minor);
             let numbers: &'static str = Box::leak(numbers.into_boxed_str());
@@ -635,7 +657,12 @@ impl SysFs {
                 );
                 next += 1;
 
-                devnodes.push(("input", name.clone(), major, minor));
+                devnodes.push((
+                    "input",
+                    alloc::format!("devices/virtual/input/{}/{}", device_name, name),
+                    major,
+                    minor,
+                ));
             }
         }
 
@@ -668,7 +695,12 @@ impl SysFs {
                 // sees a card with no subsystem and no tags.
                 let dir = drm_root.add_dir(name, next);
                 next += 1;
-                devnodes.push(("drm", String::from(name), 226, minor));
+                devnodes.push((
+                    "drm",
+                    alloc::format!("devices/virtual/drm/{}", name),
+                    226,
+                    minor,
+                ));
                 // DRM's major, fixed as a convention since XFree86; the
                 // minors are the card index and 128 + index.
                 let numbers = alloc::format!("226:{}\n", minor);
@@ -724,18 +756,15 @@ impl SysFs {
         // device the same way. A tree without it is a tree in which a device
         // node cannot be identified at all.
         //
-        // The target is the class entry rather than a `/sys/devices/...` path
-        // because that is where these devices really live here; a reader
-        // resolves the link and finds the device either way.
         let dev = fs.root.add_dir("dev", next);
         next += 1;
         let chars = dev.add_dir("char", next);
         next += 1;
         let blocks = dev.add_dir("block", next);
         next += 1;
-        for (class_name, name, major, minor) in devnodes {
+        for (class_name, where_it_lives, major, minor) in devnodes {
             let numbers = alloc::format!("{}:{}", major, minor);
-            let target = alloc::format!("../../class/{}/{}", class_name, name);
+            let target = alloc::format!("../../{}", where_it_lives);
             let dir = if class_name == "block" {
                 &blocks
             } else {
@@ -1019,13 +1048,15 @@ mod tests {
         // "add" and gets an event it would never have heard.
         let fs = fs();
         let watcher = crate::uevent::open();
-        crate::uevent::bind(watcher, 1);
+        crate::uevent::bind(watcher, 0, 1).expect("a fresh socket binds");
         let block = block_dir(&fs);
         let (name, _) = block.read_dir().unwrap().into_iter().next().unwrap();
         let uevent = block.lookup(&name).unwrap().lookup("uevent").unwrap();
         assert_eq!(uevent.write_at(0, b"add").unwrap(), 3);
 
-        let (_, event) = crate::uevent::recv(watcher).expect("the re-announcement");
+        let event = crate::uevent::recv(watcher)
+            .expect("the re-announcement")
+            .bytes;
         let text = String::from_utf8(event.to_vec()).unwrap();
         assert!(text.starts_with("add@"));
         assert!(text.contains(&alloc::format!("DEVNAME={}", name)));
@@ -1312,11 +1343,13 @@ mod tests {
         let _bus = crate::uevent::test_bus::take();
         let fs = pci_fs();
         let watcher = crate::uevent::open();
-        crate::uevent::bind(watcher, 1);
+        crate::uevent::bind(watcher, 0, 1).expect("a fresh socket binds");
         let uevent = resolve(&fs, "/sys/bus/pci/devices/0000:00:03.0/uevent");
         assert_eq!(uevent.write_at(0, b"add").unwrap(), 3);
 
-        let (_, event) = crate::uevent::recv(watcher).expect("the re-announcement");
+        let event = crate::uevent::recv(watcher)
+            .expect("the re-announcement")
+            .bytes;
         let text = String::from_utf8(event.to_vec()).unwrap();
         assert!(text.starts_with("add@/devices/pci0000:00/0000:00:03.0"));
         assert!(text.contains("SUBSYSTEM=pci"));

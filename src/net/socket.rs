@@ -175,6 +175,19 @@ fn rtnl_handle_of_fd(fd: i32) -> Option<usize> {
     crate::net::rtnl::exists(handle).then_some(handle)
 }
 
+/// The device-event socket behind `fd`, if it is one.
+///
+/// The uevent family has to be recognised *before* the IPv4 tail of the send
+/// path: its address is a 12-byte `sockaddr_nl`, and a reader that expects a
+/// `sockaddr_in` sees a short buffer and answers `EINVAL` - which is exactly how
+/// `udev_monitor_send_device`'s handoff to a worker came to fail, with the
+/// device manager killing every worker that would not take its message.
+fn uevent_handle_of_fd(fd: i32) -> Option<usize> {
+    let file = crate::sched::current_fds().clone_at(fd).ok()?;
+    let handle = file.inode().socket_handle();
+    crate::uevent::exists(handle).then_some(handle)
+}
+
 /// `recv(2)`'s "do not sleep" flag, as `linux/socket.h` spells it:
 /// `MSG_DONTWAIT` is `0x40`. (`0x4000` is `MSG_CMSG_CLOEXEC`/`MSG_NOSIGNAL`'s
 /// bit - a test that sends that and waits for `EAGAIN` hangs, which is how
@@ -468,18 +481,23 @@ fn park_until(ready: impl Fn() -> bool) -> isize {
     }
 }
 
-/// Receive one device event.
+/// Receive one device event, or one message a peer sent on the same socket.
 ///
 /// Three things go back beyond the payload, and a real listener needs all
 /// three to accept the message at all:
 ///
-///   * `msg_name` - a `sockaddr_nl` with `nl_pid = 0`, which is how a netlink
-///     peer is told "this came from the kernel" rather than from another
-///     process.
-///   * `SCM_CREDENTIALS` - `uid 0, gid 0, pid 0`. `nlplug-findfs` drops every
-///     message that arrives without credentials, which makes this the
-///     difference between an initramfs that finds its root and one that waits
-///     forever.
+///   * `msg_name` - a `sockaddr_nl` carrying the address the *delivery* came
+///     from: `nl_pid 0` on group 1 for a kernel event, which is how a netlink
+///     peer is told "this came from the kernel", and the sender's own port id
+///     for a message another process sent - which is what a worker compares
+///     against the sender its manager told it to trust.
+///   * `SCM_CREDENTIALS` - `uid 0, gid 0, pid 0` for a kernel event.
+///     `nlplug-findfs` drops every message that arrives without credentials,
+///     which makes this the difference between an initramfs that finds its
+///     root and one that waits forever; libudev's monitor demands the record
+///     too, and drops a message whose sender is not root. So a peer's message
+///     carries the peer's real ids, and no message can claim an origin it did
+///     not come from.
 ///   * `msg_flags`, cleared: nothing here is truncated or exceptional.
 fn recvmsg_netlink(
     msghdr: usize,
@@ -519,29 +537,34 @@ fn recvmsg_netlink(
     // on receiving the same bytes, the initramfs stopped finding its block
     // devices at all. A listener that wants a netlink frame is the open
     // question; the boot is not the place to answer it.
-    let Some((seq, event)) = crate::uevent::recv(handle) else {
+    let Some(message) = crate::uevent::recv(handle) else {
         return err::EAGAIN;
     };
-    let _ = seq;
+    let _ = message.seq;
+    let event = &message.bytes;
     let n = event.len().min(len);
     unsafe {
         core::ptr::copy_nonoverlapping(event.as_ptr(), buf as *mut u8, n);
     }
 
     if name != 0 && namelen != 0 {
-        let addr = name as *mut u8;
+        // The address the *delivery* says, not the sender's own bind: a kernel
+        // event comes from `nl_pid 0` on group 1, a worker's handoff is a
+        // unicast that reports the manager's port id and no group, and a
+        // broadcast reports the group it went to. Linux fills `msg_name` the
+        // same way, and libudev decides whether to trust a message by comparing
+        // this port id against the one it was told to expect.
         unsafe {
-            core::ptr::write_bytes(addr, 0, 12);
-            (addr as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
-            // nl_pid 0 is the kernel; nl_groups 1 is the group this arrived on.
-            (addr.add(8) as *mut u32).write_unaligned(1);
-            // msg_namelen is the socklen_t in-out at msghdr + 8.
-            ((msghdr + 8) as *mut u32).write_unaligned(12);
+            core::ptr::write_bytes(name as *mut u8, 0, 12);
         }
+        write_sockaddr_nl(name, msghdr + 8, message.from_pid, message.group);
     }
 
-    // Control data, if the caller left room for it. The values are fixed
-    // because the kernel is always the sender here.
+    // Control data, if the caller left room for it: who sent this, in the
+    // `SCM_CREDENTIALS` shape every listener here reads. The kernel's own
+    // messages carry the all-zero credentials a listener recognises them by,
+    // and a peer's carry its real ids - so a message cannot claim an origin it
+    // did not come from.
     const SOL_SOCKET: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
     const CMSG_LEN: usize = 16 + 12; // header + struct ucred
@@ -554,10 +577,10 @@ fn recvmsg_netlink(
             (at as *mut u64).write_unaligned(CMSG_LEN as u64); // cmsg_len
             (at.add(8) as *mut i32).write_unaligned(SOL_SOCKET); // cmsg_level
             (at.add(12) as *mut i32).write_unaligned(SCM_CREDENTIALS); // cmsg_type
-            // struct ucred { pid, uid, gid } - the kernel's own.
-            (at.add(16) as *mut i32).write_unaligned(0);
-            (at.add(20) as *mut u32).write_unaligned(0);
-            (at.add(24) as *mut u32).write_unaligned(0);
+            // struct ucred { pid, uid, gid }.
+            (at.add(16) as *mut i32).write_unaligned(message.cred.pid as i32);
+            (at.add(20) as *mut u32).write_unaligned(message.cred.uid);
+            (at.add(24) as *mut u32).write_unaligned(message.cred.gid);
             ((msghdr + 40) as *mut usize).write_unaligned(CMSG_LEN);
         }
     } else if control_len != 0 {
@@ -618,6 +641,47 @@ fn parse_sockaddr_in(ptr: usize, len: usize, from_user: bool) -> Result<IpEndpoi
         addr: IpAddress::Ipv4(addr),
         port,
     })
+}
+
+/// `struct sockaddr_nl`: family, pad, `nl_pid`, `nl_groups` - the 12-byte
+/// address a netlink call carries.
+///
+/// The refusals are Linux's, measured on the uevent family: a length short of
+/// the struct is `EINVAL`, and so is a family that is not `AF_NETLINK` - which
+/// is *not* what the IPv4 reader answers for a family it does not speak
+/// (`EAFNOSUPPORT`), and the difference is visible from a caller that probes.
+/// An unreadable pointer is still `EFAULT`.
+fn parse_sockaddr_nl(ptr: usize, len: usize, from_user: bool) -> Result<(u32, u32), isize> {
+    const SOCKADDR_NL_SIZE: usize = 12;
+    if len < SOCKADDR_NL_SIZE {
+        return Err(err::EINVAL);
+    }
+    if ptr == 0 || !crate::syscall::buffer_ok(ptr, SOCKADDR_NL_SIZE, false, from_user) {
+        return Err(err::EFAULT);
+    }
+    let family = unsafe { (ptr as *const u16).read_unaligned() };
+    if family != crate::uevent::AF_NETLINK {
+        return Err(err::EINVAL);
+    }
+    let pid = unsafe { ((ptr + 4) as *const u32).read_unaligned() };
+    let groups = unsafe { ((ptr + 8) as *const u32).read_unaligned() };
+    Ok((pid, groups))
+}
+
+/// Write a `sockaddr_nl` and the length that goes with it - `getsockname`'s
+/// answer for a netlink socket, and the `msg_name` a receive fills in.
+fn write_sockaddr_nl(ptr: usize, len_ptr: usize, pid: u32, groups: u32) {
+    const SOCKADDR_NL_SIZE: usize = 12;
+    unsafe {
+        let at = |offset: usize| (ptr + offset) as *mut u8;
+        (at(0) as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
+        (at(2) as *mut u16).write_unaligned(0); // nl_pad
+        (at(4) as *mut u32).write_unaligned(pid); // nl_pid
+        (at(8) as *mut u32).write_unaligned(groups); // nl_groups
+        if len_ptr != 0 {
+            (len_ptr as *mut u32).write_unaligned(SOCKADDR_NL_SIZE as u32);
+        }
+    }
 }
 
 /// Write a `sockaddr_in` and the length that goes with it: the shape
@@ -1109,6 +1173,26 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
 pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     let fd = args[0] as i32;
     let (buf, len) = (args[1], args[2]);
+    // A device-event socket's write side: udev's manager hands an event to one
+    // worker by unicasting to that worker's port id, and publishes the
+    // processed device to the group its listeners joined. The payload is opaque
+    // - libudev defines it - and the address is the 12-byte `sockaddr_nl`, which
+    // is why this has to come before the IPv4 tail (see `uevent_handle_of_fd`).
+    if let Some(handle) = uevent_handle_of_fd(fd) {
+        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+            return err::EFAULT;
+        }
+        let dest = if args[4] != 0 {
+            match parse_sockaddr_nl(args[4], args[5], from_user) {
+                Ok(pair) => Some(pair),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
+        let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+        return crate::uevent::send(handle, dest, data, crate::uevent::self_cred());
+    }
     // A route-netlink socket takes the payload whole: the netlink message
     // protocol lives in the data, and the destination sockaddr is the
     // kernel's own netlink address, not one to parse as an IP endpoint.
@@ -1213,6 +1297,29 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
 /// the destination comes from `msg_name`, if there is one.
 pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
     let fd = args[0] as i32;
+    // The device-event socket in scatter-gather form, which is the call udev's
+    // manager actually makes: `sendmsg` with the device's properties in one
+    // iovec and the worker's address in `msg_name`. Both iovecs and the header
+    // are read the same way the other families read them.
+    if let Some(handle) = uevent_handle_of_fd(fd) {
+        let (name, namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        let dest = if name != 0 {
+            match parse_sockaddr_nl(name, namelen as usize, from_user) {
+                Ok(pair) => Some(pair),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
+        let mut data: Vec<u8> = Vec::new();
+        if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
+            return e;
+        }
+        return crate::uevent::send(handle, dest, &data, crate::uevent::self_cred());
+    }
     if let Some(handle) = rtnl_handle_of_fd(fd) {
         let (_name, _namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
             Ok(fields) => fields,
@@ -2323,21 +2430,20 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
     if let Ok(handle) = socket_handle_of_fd(args[0] as i32)
         && crate::uevent::exists(handle)
     {
-        // `struct sockaddr_nl`: family, pad, pid, groups. Only the group mask
-        // matters - `nlplug-findfs` binds with all groups set, which is how a
-        // listener says "tell me about every device event".
-        const SOCKADDR_NL_SIZE: usize = 12;
-        let addr = args[1];
-        if !crate::syscall::buffer_ok(addr, SOCKADDR_NL_SIZE, false, from_user) {
-            return err::EFAULT;
-        }
-        let family = unsafe { (addr as *const u16).read_unaligned() };
-        if family != crate::uevent::AF_NETLINK {
-            return err::EINVAL;
-        }
-        let groups = unsafe { ((addr + 8) as *const u32).read_unaligned() };
-        crate::uevent::bind(handle, groups);
-        return 0;
+        // `struct sockaddr_nl`: family, pad, `nl_pid`, `nl_groups`. Both
+        // fields matter here and for different reasons: the groups say which
+        // events the socket wants - `nlplug-findfs` binds with every group set,
+        // which is how a listener says "tell me about every device event" -
+        // and the port id is the address a peer unicasts to. Zero asks for one,
+        // which is what libudev does and then reads back with `getsockname`.
+        let (pid, groups) = match parse_sockaddr_nl(args[1], args[2], from_user) {
+            Ok(pair) => pair,
+            Err(e) => return e,
+        };
+        return match crate::uevent::bind(handle, pid, groups) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
     }
     if let Ok(handle) = socket_handle_of_fd(args[0] as i32)
         && crate::net::rtnl::exists(handle)
@@ -2905,6 +3011,26 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
             return crate::net::vsock::write_sockaddr_vm(addr_ptr, len_ptr, cid, port);
         }
     }
+    // A device-event socket names itself with the same `sockaddr_nl`, and here
+    // the answer is not ceremony: libudev reads its monitor's port id back from
+    // `getsockname` and hands it to the sockets that may unicast to it, so an
+    // answer of zero - or a refusal - is a monitor nobody can hand a device to.
+    if let Some(handle) = uevent_handle_of_fd(fd) {
+        const SOCKADDR_NL_SIZE: usize = 12;
+        if addr_ptr == 0
+            || len_ptr == 0
+            || !crate::syscall::buffer_ok(addr_ptr, SOCKADDR_NL_SIZE, true, true)
+            || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+        {
+            return err::EFAULT;
+        }
+        // A socket that never bound reports the all-zero address, which is what
+        // Linux answers and what libudev's own comment about "usually, but not
+        // necessarily the pid" is about.
+        let (pid, groups) = crate::uevent::port_of(handle).unwrap_or((0, 0));
+        write_sockaddr_nl(addr_ptr, len_ptr, pid, groups);
+        return 0;
+    }
     // A route-netlink session names itself with a `sockaddr_nl`, not a
     // `sockaddr_in`. The port id `bind` assigned is the one thing a caller
     // needs from here: fastfetch's default-route probe reads it back and
@@ -2921,14 +3047,7 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
             return err::EFAULT;
         }
         let pid = crate::net::rtnl::portid(handle).unwrap_or(0);
-        unsafe {
-            let at = |offset: usize| (addr_ptr + offset) as *mut u8;
-            (at(0) as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
-            (at(2) as *mut u16).write_unaligned(0); // nl_pad
-            (at(4) as *mut u32).write_unaligned(pid); // nl_pid
-            (at(8) as *mut u32).write_unaligned(0); // nl_groups
-            (len_ptr as *mut u32).write_unaligned(SOCKADDR_NL_SIZE as u32);
-        }
+        write_sockaddr_nl(addr_ptr, len_ptr, pid, 0);
         return 0;
     }
     let handle = match socket_handle_of_fd(fd) {
@@ -3141,6 +3260,28 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
 /// (`poll`) and `SO_REUSEADDR` is moot while one process binds at a time.
 pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen) = (args[0] as i32, args[1], args[2], args[3], args[4]);
+    // A device-event socket takes the two knobs a listener sets on it:
+    // `SO_PASSCRED`, which libudev turns on for every monitor it makes and then
+    // *requires* to be honoured - it drops a message whose control chain carries
+    // no credentials - and the ordinary bookkeeping options, accepted by name so
+    // a caller's setup never fails on this family.
+    if let Some(handle) = uevent_handle_of_fd(fd) {
+        if level != SOL_SOCKET {
+            return err::ENOPROTOOPT;
+        }
+        if optval == 0 || optlen < 4 || !crate::syscall::buffer_ok(optval, 4, false, from_user) {
+            return err::EINVAL;
+        }
+        let val = unsafe { (optval as *const i32).read_unaligned() };
+        return match optname {
+            SO_PASSCRED => {
+                crate::uevent::set_passcred(handle, val != 0);
+                0
+            }
+            SO_REUSEADDR | SO_SNDBUF | SO_RCVBUF | SO_KEEPALIVE | SO_LINGER => 0,
+            _ => err::ENOPROTOOPT,
+        };
+    }
     // A unix socket is not in the network registry either; its options are the
     // credential knobs. `SO_PASSCRED` is the one that matters: it makes every
     // read carry the peer's `SCM_CREDENTIALS`. A sender's `SCM_CREDENTIALS`
@@ -3292,6 +3433,30 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
 pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen_ptr) =
         (args[0] as i32, args[1], args[2], args[3], args[4]);
+    // A device-event socket is not in the network registry either. What a caller
+    // asks it is `SO_PASSCRED`, which reads back what `setsockopt` was told; the
+    // rest is the permissive answer the other families give an option they do
+    // not model.
+    if let Some(handle) = uevent_handle_of_fd(fd) {
+        if level != SOL_SOCKET {
+            return err::ENOPROTOOPT;
+        }
+        if optval == 0 || optlen_ptr == 0 {
+            return err::EFAULT;
+        }
+        if !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user) {
+            return err::EFAULT;
+        }
+        let value: i32 = match optname {
+            SO_PASSCRED => crate::uevent::passcred(handle) as i32,
+            _ => 0,
+        };
+        unsafe {
+            (optval as *mut i32).write_unaligned(value);
+            (optlen_ptr as *mut u32).write_unaligned(4);
+        }
+        return 0;
+    }
     // A unix socket's own options, answered before the network registry (which
     // it is not part of) - and the same answers for the anonymous pair
     // `socketpair(2)` makes, which is not in it either. `SO_PEERCRED` is the

@@ -17,8 +17,8 @@ use super::abi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EFD_NONBLOCK, EFD_SEMAPHORE,
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW,
     FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_RDWR, O_TMPFILE,
-    O_TRUNC, O_WRONLY, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLIN, POLLNVAL, POLLOUT,
-    StatTimes, normalize_path, write_stat,
+    O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLHUP, POLLIN,
+    POLLNVAL, POLLOUT, StatTimes, normalize_path, write_stat,
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
 use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X_OK};
@@ -2188,10 +2188,12 @@ fn record_lock(_fd: i32, _cmd: usize, _arg: usize) -> isize {
 /// exactly what happened before this existed.
 ///
 /// Readiness comes from the node itself, since only it knows: a pipe is
-/// readable when it holds data *or* when its last writer has gone, because
-/// both are cases where a read returns instead of waiting. Waiting is done
-/// through the node's own wakeup list, so the arrival that ends the wait is
-/// the same arrival that would have ended a blocking read.
+/// readable while it holds data, and the loss of its writer is the hang-up
+/// beside that rather than a way of *being* readable - the distinction Linux's
+/// `pipe_poll` draws, and the one a waiter that "ends on hang-up or nothing"
+/// depends on. Waiting is done through the node's own wakeup list, so the
+/// arrival that ends the wait is the same arrival that would have ended a
+/// blocking read.
 ///
 /// `poll` and `ppoll` are the same wait in different clocks, and the difference
 /// is not cosmetic: `poll`'s timeout is a millisecond count and a negative one
@@ -2339,7 +2341,15 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
                     return true;
                 };
                 let ready = watch.node.poll_ready_client(watch.ofd);
-                (events & POLLIN != 0 && ready.read) || (events & POLLOUT != 0 && ready.write)
+                // The hang-up and error conditions count as an arrival even
+                // when the caller asked for neither: Linux reports them to
+                // every waiter, and a wait that slept through one would sleep
+                // past the only report there will ever be.
+                let node = watch.node.as_ref();
+                let forced = node.poll_hup() || node.poll_err();
+                forced
+                    || (events & POLLIN != 0 && ready.read)
+                    || (events & POLLOUT != 0 && ready.write)
             })
         };
         if matches!(
@@ -2392,13 +2402,23 @@ fn check_ready(fds: usize, nodes: &[Option<PollWatch>]) -> usize {
             match watch {
                 None => POLLNVAL,
                 Some(watch) => {
-                    let ready = watch.node.poll_ready_client(watch.ofd);
+                    let node = watch.node.as_ref();
+                    let ready = node.poll_ready_client(watch.ofd);
                     let mut bits = 0;
                     if events & POLLIN != 0 && ready.read {
                         bits |= POLLIN;
                     }
                     if events & POLLOUT != 0 && ready.write {
                         bits |= POLLOUT;
+                    }
+                    // Outside the caller's interest on purpose - `poll` in the
+                    // kernel reports them whether or not `events` asked, which
+                    // is what tells a waiter that its peer has gone.
+                    if node.poll_hup() {
+                        bits |= POLLHUP;
+                    }
+                    if node.poll_err() {
+                        bits |= POLLERR;
                     }
                     bits
                 }
@@ -2434,14 +2454,23 @@ struct SelectWatch {
 
 /// What one watched descriptor can do right now, mapped through the caller's
 /// interest. `poll_ready` is the same source `poll` consults.
+///
+/// The hang-up and error conditions are not part of that interest and are not
+/// filtered by it: Linux's `select` counts a descriptor as ready when the
+/// condition mask carries `EPOLLHUP` or `EPOLLERR`, in the read set and (for
+/// the error alone) in the write set. A `select` that skipped them would leave
+/// a caller parked on a peer that has already gone - the one case where no
+/// further event is coming to wake it.
 fn watch_ready(watch: &SelectWatch) -> (bool, bool) {
     let Some(node) = &watch.node else {
         return (false, false);
     };
     let ready = node.poll_ready_client(watch.ofd);
+    let hup = node.poll_hup();
+    let err = node.poll_err();
     (
-        watch.want_read && ready.read,
-        watch.want_write && ready.write,
+        watch.want_read && (ready.read || hup || err),
+        watch.want_write && (ready.write || err),
     )
 }
 
@@ -4252,6 +4281,22 @@ fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
                 (buf as *mut u8).add(n).write_volatile(0);
             }
             text.len() as isize
+        }
+        (2, 0x07) | (2, 0x08) => {
+            // EVIOCGPHYS/EVIOCGUNIQ: the device's physical path and its
+            // unique id. A virtio input device has neither - they are
+            // strings the kernel's input core fills from the driver, and
+            // none of them puts one here.
+            //
+            // The answer is `ENOENT`, not `ENOTTY`, and it has to be:
+            // libevdev's `libevdev_set_fd` tolerates a failure here only
+            // when errno is `ENOENT` ("uinput has no phys"), the way Linux's
+            // own `str_to_user` answers for a NULL attribute. An `ENOTTY`
+            // makes the whole read fatal, and the failure surfaces far from
+            // here: libinput gives up with "failed to create input device"
+            // for every node on the machine, and weston comes up with a
+            // screen and no keyboard.
+            err::ENOENT
         }
         (2, 0x09) => give(ev.prop_bits()), // EVIOCGPROP
         (2, 0x20..=0x3f) => {

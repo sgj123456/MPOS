@@ -55,11 +55,14 @@ pub const EPOLLIN: u32 = 0x001;
 pub const EPOLLPRI: u32 = 0x002;
 /// EPOLLOUT: a write would not block.
 pub const EPOLLOUT: u32 = 0x004;
-/// EPOLLERR: an error condition on the descriptor. Linux reports this one
-/// whether it was asked for or not; no node here reports it at all.
+/// EPOLLERR: an error condition on the descriptor - on a pipe, its reading
+/// side is gone. Reported whether or not the caller asked for it, which is
+/// [`crate::vfs::Inode::poll_err`]'s contract.
 pub const EPOLLERR: u32 = 0x008;
-/// EPOLLHUP: a hang-up on the descriptor. As with EPOLLERR: watched for
-/// free on Linux, never produced here.
+/// EPOLLHUP: a hang-up on the descriptor - on a pipe, its writing side is
+/// gone. Reported whether or not the caller asked for it, like `EPOLLERR`,
+/// and udev's `spawn_wait` is the waiter that made the distinction between
+/// this and `EPOLLIN` matter: it ends on this bit alone.
 pub const EPOLLHUP: u32 = 0x010;
 pub const EPOLLRDNORM: u32 = 0x040;
 pub const EPOLLRDBAND: u32 = 0x080;
@@ -342,8 +345,9 @@ impl Epoll {
                 // whoever is calling: a node whose readiness is per-client
                 // (an evdev node with a grab on it) has to answer about the
                 // descriptor that is being waited on.
-                let ready = entry.file.inode().poll_ready_client(entry.file.ofd());
-                let bits = report(entry, ready);
+                let inode = entry.file.inode();
+                let ready = inode.poll_ready_client(entry.file.ofd());
+                let bits = report(entry, ready, inode.poll_hup(), inode.poll_err());
                 if bits != 0 && out.len() < capacity {
                     out.push(Reported {
                         events: bits,
@@ -404,11 +408,16 @@ impl Epoll {
     pub fn any_ready(&self) -> bool {
         critical_section::with(|cs| {
             self.state.borrow(cs).borrow().iter().any(|entry| {
-                !entry.dead
-                    && report(
-                        entry,
-                        entry.file.inode().poll_ready_client(entry.file.ofd()),
-                    ) != 0
+                if entry.dead {
+                    return false;
+                }
+                let inode = entry.file.inode();
+                report(
+                    entry,
+                    inode.poll_ready_client(entry.file.ofd()),
+                    inode.poll_hup(),
+                    inode.poll_err(),
+                ) != 0
             })
         })
     }
@@ -436,7 +445,15 @@ fn ready_bits(ready: Ready) -> u8 {
 /// The events `entry` owes a wait that looks right now: the conditions the
 /// caller asked for that hold, level-triggered unless the entry asked for
 /// edges, and nothing at all for a one-shot that has already fired.
-fn report(entry: &Entry, ready: Ready) -> u32 {
+///
+/// `hup` and `err` are the node's own answers to `poll_hup`/`poll_err`, and
+/// they are *not* filtered through the caller's interest: Linux reports
+/// `EPOLLHUP` and `EPOLLERR` to every waiter that registered the descriptor,
+/// asked for or not. A wait that wants them must have them, because they are
+/// often the only report there will ever be again - and one waiter reads only
+/// them: udev's `spawn_wait` ends on `EPOLLHUP`, so a pipe whose writer has
+/// exited has to say so in this word rather than by staying readable.
+fn report(entry: &Entry, ready: Ready, hup: bool, err: bool) -> u32 {
     if entry.dead {
         return 0;
     }
@@ -464,6 +481,15 @@ fn report(entry: &Entry, ready: Ready) -> u32 {
     }
     if write {
         bits |= EPOLLOUT | EPOLLWRNORM;
+    }
+    // The two that are nobody's request to make, and are level conditions
+    // rather than edges whatever the entry asked for: a hang-up is a fact
+    // about the descriptor, not a transition in it.
+    if hup {
+        bits |= EPOLLHUP;
+    }
+    if err {
+        bits |= EPOLLERR;
     }
     bits
 }
@@ -565,7 +591,7 @@ mod tests {
 
     use crate::syscall::err;
     use crate::vfs::file::{FdTable, File};
-    use crate::vfs::pipe;
+    use crate::vfs::pipe::{self, DuplexEnd};
     use crate::vfs::ramfs::RamFs;
     use crate::vfs::{FileSystem, Inode, NodeKind};
 
@@ -950,6 +976,65 @@ mod tests {
             shallow.ctl(&t2, shallow_fd, EPOLL_CTL_ADD, head2_fd, EPOLLIN, 0),
             Ok(())
         );
+    }
+
+    /// `EPOLLHUP`: a node's hang-up reaches a wait that never asked for it,
+    /// and once the pipe is drained it is the *whole* of the report. Both
+    /// halves matter to the same caller - udev's `spawn_wait` reads the
+    /// child's pipe with epoll, treats a read of 0 as "ask again" and ends
+    /// the wait on `EPOLLHUP` alone, so a pipe that stayed readable at
+    /// end-of-stream left the device manager parked until its event timeout
+    /// expired, two minutes into a boot, with every `ID_INPUT` tag unwritten.
+    #[test]
+    fn a_hang_up_reaches_a_wait_that_asked_for_something_else() {
+        let (table, ep, epfd) = epoll_fd();
+        let (read_end, write_end) = pipe::pair();
+        let rfd = watch(&table, read_end.clone());
+        assert_eq!(ep.ctl(&table, epfd, EPOLL_CTL_ADD, rfd, EPOLLIN, 9), Ok(()));
+
+        let mut out = Vec::with_capacity(4);
+
+        // Data with the writer still there: readable, and not hung up.
+        write_end.write_at(0, b"done\n").unwrap();
+        ep.collect(&table, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].events, EPOLLIN | EPOLLRDNORM);
+
+        // The writer exits: `EPOLLIN|EPOLLHUP`, Linux's answer for a pipe
+        // with data and no writing side.
+        drop(write_end);
+        ep.collect(&table, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].events & EPOLLHUP != 0, "the hang-up arrives unasked");
+        assert!(out[0].events & EPOLLIN != 0, "and the byte is still there");
+
+        // Drained: the hang-up alone is left, and it is still a report.
+        let mut buf = [0u8; 5];
+        assert_eq!(read_end.read_at(0, &mut buf).unwrap(), 5);
+        ep.collect(&table, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].events, EPOLLHUP);
+        assert_eq!(out[0].data, 9, "the caller's word comes back with it");
+    }
+
+    /// A socketpair tells the same story the other way round: the peer's
+    /// departure is a hang-up *and* a readable answer, which is `unix_poll`'s
+    /// pair of bits rather than `pipe_poll`'s one.
+    #[test]
+    fn a_socketpair_reports_readable_and_hung_up() {
+        let (table, ep, epfd) = epoll_fd();
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let afd = watch(&table, a.clone());
+        assert_eq!(ep.ctl(&table, epfd, EPOLL_CTL_ADD, afd, EPOLLIN, 0), Ok(()));
+
+        let mut out = Vec::with_capacity(4);
+        ep.collect(&table, &mut out);
+        assert!(out.is_empty(), "a live peer reports nothing");
+
+        drop(b);
+        ep.collect(&table, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].events, EPOLLIN | EPOLLRDNORM | EPOLLHUP);
     }
 
     /// `count` epoll instances, each installed in `table` and each watching

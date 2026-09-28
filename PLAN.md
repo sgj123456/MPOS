@@ -127,17 +127,52 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
       return), so the worker channel itself is closed. The boot also says what is
       next, and it is not the tag: `worker [11] did not accept message -22
       (Invalid argument), kill it` - see the item below.
-  - [ ] **the manager's handoff to a worker** — `udev_monitor_send_device(monitor,
-        worker->monitor, dev)` hands the device to the worker over
-        `NETLINK_KOBJECT_UEVENT`, and this kernel answers `EINVAL` because the
-        call is `sendto(sock, buf, count, 0, &snl, 12)` with a 12-byte `struct
-        sockaddr_nl` that the send path reads as a `sockaddr_in` and refuses for
-        being short of 16 bytes. It needs a *userspace* netlink write side for
-        the uevent family - a port id per subscriber, unicast delivery by
-        `nl_pid`, group delivery for a send with no destination address, the
-        payload left opaque - and until it exists the manager kills every worker
-        that refuses the handoff, which is why `/dev/input/event0` still carries
-        no `ID_INPUT` even though udevd now hears its workers
+  - [x] **the manager's handoff to a worker** — `udev_monitor_send_device(monitor,
+        worker->monitor, dev)` hands the device over `NETLINK_KOBJECT_UEVENT`, and
+        the family had no write side at all: the call is `sendmsg` with a 12-byte
+        `struct sockaddr_nl`, which the send path read as a `sockaddr_in` and
+        refused for being short of 16 bytes (`EINVAL`), after which the manager
+        killed every worker that would not take its message. The uevent family
+        now carries userland messages: a port id per socket (the process's pid
+        when it is free, a unique number otherwise - Linux's order of preference,
+        and libudev reads its own back with `getsockname`), unicast by `nl_pid`,
+        group delivery for a send with no port id, the sender's address and
+        credentials stamped on every delivery, and the payload left opaque
+        because the wire format is libudev's. **Verified on the desktop image**:
+        `/dev/input/event0` now carries `ID_INPUT=1`, `ID_INPUT_KEY=1` and
+        `ID_INPUT_KEYBOARD=1`, `/run/udev/data/c13:64` holds them, and the kernel
+        log has no handoff failures left (§4.4 has the measured rules,
+        `t-uevent` the pins)
+  - [x] **and the handoff was only the first of three reasons libinput would not
+        take the device** - the other two are in the interfaces a compositor
+        *reads* rather than in the events, and neither is a defect the log
+        names. `evdev_device_have_same_syspath` re-derives a device's `/dev`
+        node from its own `fstat` devnum and refuses it unless the string it
+        resolves is the one udev gave it, so `/sys/dev/char/M:m` has to point
+        at the *device* and not at another link to it - it pointed at
+        `../../class/input/event0`, the two answers disagreed, and the keyboard
+        was dropped without a word. The links carry the device tree's own path
+        now (`../../devices/virtual/...`), block devices excepted because this
+        tree has no device directory for them. And `EVIOCGPHYS`/`EVIOCGUNIQ`
+        answered `ENOTTY` for the strings a virtio input device does not have,
+        where `libevdev`'s `libevdev_set_fd` tolerates that failure only for
+        `ENOENT` - the errno Linux's own `str_to_user` returns for a NULL
+        attribute - so the wrong one made the whole read fatal, and libinput
+        gave up with "failed to create input device" for every node on the
+        machine (§7.2, both pinned by `t-evdev`)
+  - [x] **and a node's hang-up had to become sayable** - the wait udev parks on
+        reads only that. `spawn_wait` watches its child's pipe with epoll, takes
+        a read of 0 as "look again" and ends on `EPOLLHUP` alone, so an
+        end-of-stream reported only as `EPOLLIN` left the device manager sitting
+        on every `IMPORT{program}` rule until its own event timeout expired.
+        `Inode` therefore answers `poll_hup`/`poll_err` beside `poll_ready`: a
+        pipe's read end calls a lost writer a hang-up and its write end calls a
+        lost reader an error, while a socketpair folds the peer's departure into
+        the hang-up and stays readable beside it, because `unix_poll` sets
+        `EPOLLIN` and `EPOLLHUP` together where `pipe_poll` drops the read
+        condition. `poll`, `select` and `epoll` report the pair whether or not
+        the caller asked for them, which is Linux's rule and sometimes the only
+        report a parked waiter will ever get (§1.1, `t-epoll` pins the shape)
   - [ ] `SOCK_SEQPACKET` still carries no boundaries over a *named* socket (the
         stream this family has), which is the one documented divergence left on
         the path from `udevadm` to a tagged device node
@@ -253,6 +288,28 @@ is created with `listen(sock, 0)` - and that is fixed and pinned too (§4.1).
 Both were measured against Linux first, and both are files the board's own entry
 had described the wrong way round.
 
+**The step behind it landed the same way**: the manager's handoff to a worker
+runs over `NETLINK_KOBJECT_UEVENT`, and that family had no write side, so the
+device manager killed every worker it could not hand an event to. It has one now
+- port ids, unicast, groups, stamped credentials, measured rule by rule and
+pinned by both `uevent`'s host tests and `t-uevent` (§4.4) - and the desktop
+image ends the chain the plan started from: `/dev/input/event0` carries
+`ID_INPUT_KEYBOARD=1`, which is the tag libinput classifies a keyboard by. What
+is left on that path is one divergence, not a blocker: a *named* `SOCK_SEQPACKET`
+connection is served as the byte stream this family has, which is the board's
+remaining bullet.
+
+**Getting the tag took three more of the same kind of reading**, and each one is
+a place where a compositor's question was answered with the wrong *shape*
+rather than with no answer: `/sys/dev/char/M:m` pointed at the class entry
+instead of the device the class names (a string comparison libinput makes),
+`EVIOCGPHYS`/`EVIOCGUNIQ` said `ENOTTY` where `libevdev` accepts only `ENOENT`
+for what a device does not have, and a pipe reported its writer's departure as
+`EPOLLIN` rather than as the `EPOLLHUP` that udev's `spawn_wait` ends on. The
+board's own two bullets carry each, and none of the three needs a subsystem:
+they are an errno, a link target and a node's answer to a question nothing here
+was asking before (§7.2, §1.1).
+
 What is left, in the order that keeps each step verifiable on its own:
 
 1. **The loopback, and then §4.3's listener** - `listen`/`accept` is that
@@ -283,7 +340,7 @@ What is left, in the order that keeps each step verifiable on its own:
 - **Filesystems**: ramfs, ext2/ext4 (write-through), devfs, procfs, sysfs, devpts
 - **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net; AF_INET + AF_UNIX
   (path `SOCK_STREAM`, with `SCM_RIGHTS` fd passing + `SO_PEERCRED`) + netlink
-  (read + uevent)
+  (route and uevent, each with its read and write sides)
 - **Display / input**: virtio-gpu 2D scanout exposed as `/dev/fb0` (mmap +
   fbdev ioctls + pan/vsync) and a DRM/KMS `/dev/dri/card0` with its
   `/dev/dri/renderD128` (UAPI ABI, dumb buffers, addfb2, atomic commits,
@@ -342,11 +399,10 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   smoltcp socket (Nagle off; probe timer armed at Linux's default interval).
   `getsockopt` reads back every stored option. Still record-only (no stack
   effect): `SO_REUSEADDR` (moot with one binder), buffer sizes, `SO_LINGER`.
-- **4.4** netlink's *route* half is written (`RTM_NEWADDR`/`NEWROUTE`/`NEWLINK`
-  applied to the live stack, §4.4). Its *uevent* half has no write side at all:
-  a userspace `sendto` on a `NETLINK_KOBJECT_UEVENT` socket is refused `EINVAL`
-  (a 12-byte `sockaddr_nl` read as a `sockaddr_in`), which is what stops udevd
-  from handing an event to one of its workers (§4.4's closing note).
+- **4.4** both halves of netlink are written: the route half reconfigures the
+  live stack (`RTM_NEWADDR`/`NEWROUTE`/`NEWLINK`, §4.4), and the uevent half now
+  carries userland messages — port ids, unicast, groups and credentials — which
+  is what udevd's handoff to a worker needs (§4.4's closing note).
 - **5.1 / 5.2** `MAP_SHARED|MAP_ANONYMOUS` is served but aliased frames do not
   cross a plain `fork`, and `MADV_DONTNEED` does not free pages — both need
   anonymous **demand paging** + per-VMA backing tracking in the `#PF` handler.
@@ -385,6 +441,15 @@ one-shot (`EPOLLONESHOT` with MOD re-arm), `EPOLLEXCLUSIVE` vocabulary,
 close-time entry reaping, and readiness from the same `poll_ready` the
 poll(2) family consults — so a wait hears about data the instant it
 arrives.
+
+The hang-up and error conditions are the pair that is *not* an interest:
+`Inode::poll_hup`/`poll_err` answer them, and `poll`, `select` and `epoll`
+report them to every waiter whether or not it asked, because they are often
+the last report a descriptor will ever give — udev's `spawn_wait` ends on
+`EPOLLHUP` and nothing else (§7.2), so a pipe that stayed quiet about its
+writer's exit parked the device manager until its own timeout expired.
+`t-epoll` pins the shape in the guest and `vfs/pipe`'s tests pin the answers
+on both ends of a pipe and of a socketpair.
 
 ### 1.2 timerfd (High) — implemented in `src/vfs/timerfd.rs`
 
@@ -791,29 +856,42 @@ endianness addresses are not.
 - `ip addr`/`ip route`/`ip link` dumps read the live tables, not constants
 - The `ifreq` ioctl set `ip link set` and `if_nametoindex` ride on
 
-**The other netlink protocol has no write side, and that is now the blocker on
-the udevd path.** `NETLINK_ROUTE` is written; `NETLINK_KOBJECT_UEVENT` is a
-read-only channel the kernel publishes into, and udev needs the userspace half of
-it: the device manager hands each event to one of its workers with
-`udev_monitor_send_device(monitor, worker->monitor, dev)`, which is a
-`sendto(2)` on a uevent socket carrying a 12-byte `struct sockaddr_nl`. The send
-path here reads that address as a `sockaddr_in` - `len < SOCKADDR_IN_LEN` - and
-answers `EINVAL`, so the handoff fails and udevd kills the worker that refused it.
-The desktop image says so out loud, after the worker channel itself was fixed
-(§4.1): `udevd[9]: worker [11] did not accept message -22 (Invalid argument),
-kill it`, and no device gets an `ID_INPUT` while it happens.
+**The other netlink protocol has no write side. That was the last blocker on the
+udevd path, and it is written now.** `NETLINK_ROUTE` was already applied to the
+live stack; `NETLINK_KOBJECT_UEVENT` was a read-only channel the kernel
+publishes into, and udev needs the userspace half of it: the device manager
+hands an event to one of its workers with `udev_monitor_send_device(monitor,
+worker->monitor, dev)` - a `sendmsg(2)` on a uevent socket carrying a 12-byte
+`struct sockaddr_nl` - and publishes the processed device to the group every
+listener joined. The send path here read that address as a `sockaddr_in`
+(`len < SOCKADDR_IN_LEN`) and answered `EINVAL`, so the handoff failed and udevd
+killed the worker that refused it: `worker [11] did not accept message -22
+(Invalid argument), kill it`, with no device tagged while it happened.
 
-What the fix needs, in the shape this kernel would have to grow: a `sockaddr_nl`
-parser for the uevent family (12 bytes, `nl_pid` in native order), a *port id*
-per subscriber (Linux gives a socket bound with `nl_pid == 0` an identity of its
-own, which is what a unicast handoff is addressed to), unicast delivery by
-`nl_pid` into the destination's existing queue, group delivery for a send with no
-destination address, and the payload left opaque - udev's monitor wire format
-(`struct udev_monitor_netlink_header` followed by the device's properties as
-NUL-separated `KEY=value` pairs) is libudev's to define, not the kernel's. Not
-attempted here: the fetch of eudev's `udev-monitor.c` that would pin the port-id
-bookkeeping did not come back, and a netlink bus is not a change to make from a
-guess.
+What the family grew, and it is measured rather than recalled - `libudev-monitor.c`
+for the shape udev uses, this host's kernel for the semantics:
+
+| Question | Measured answer |
+|---|---|
+| where a port id comes from | the process's pid when it is free, a hash-derived id when it is not (libudev's own comment: "usually, but not necessarily the pid"); an unbound socket is given one by its first send |
+| binding a port id another socket holds | `EADDRINUSE`; binding twice (even to add a group) is `EINVAL` |
+| a unicast | delivered to the port id; the receiver's `msg_name` is the *sender's* `nl_pid` with `nl_groups == 0`; an unknown or closed port id is `ECONNREFUSED`; the sender never receives its own |
+| a group send | goes to the **lowest** group in the mask (Linux computes `ffs` of it: `nl_groups = 6` reaches group 2 and not group 4); the receiver is told the *destination group* as `msg_name.nl_groups`; the sender is not told; an empty group is not an error - the byte count comes back anyway, which is what libudev's "a multicast `ECONNREFUSED` would be expected" tolerates |
+| a send with no port id and no group | accepted, and addressed to the kernel |
+| a 12-byte `sockaddr_nl` | the shape that works; a short address or a family that is not `AF_NETLINK` is `EINVAL` (not `EAFNOSUPPORT`) |
+| credentials | with `SO_PASSCRED` every received message carries `SCM_CREDENTIALS` with the sender's real ids; without it there is no control data at all |
+| `getsockname` before bind | the all-zero address, not an error |
+
+The policy is `uevent`'s and is host-tested - nine tests over port ids, unicast,
+groups (including the `ffs` artifact), the full-queue `ENOBUFS` a handoff must
+hear rather than lose, and the autobind - while `t-uevent` pins the shape
+end-to-end in the guest: two sockets, `SO_PASSCRED`, a `sendmsg` to the port id
+`getsockname` reported, the payload, the source address and the credentials, and
+the three refusals. **And the boot says the same:** `/dev/input/event0` carries
+`ID_INPUT=1`, `ID_INPUT_KEY=1` and `ID_INPUT_KEYBOARD=1`, and
+`/run/udev/data/c13:64` holds them - which is the tag libinput classifies a
+keyboard by, and the end of the chain that began with a worker's zero-byte
+message.
 
 ---
 
@@ -1168,6 +1246,23 @@ standalone arm that served sizes whose low byte is zero - the 256-byte buffer
 and one branch answers for every size. `t-evdev` pins the rule without
 hardcoding any host's name: the answer must equal the position of the first NUL
 in the buffer it wrote.
+
+**Two more findings came out of the same boot, and both are about what a
+*classifier* asks rather than about input.** `EVIOCGPHYS`/`EVIOCGUNIQ` answered
+`ENOTTY` for the strings a virtio input device does not have, and `libevdev`'s
+`libevdev_set_fd` tolerates a failure there only when the errno is `ENOENT` -
+which is what Linux's own `str_to_user` returns for a NULL attribute - so the
+wrong one made the whole read fatal, far from the ioctl that caused it: libinput
+gave up with "failed to create input device" for *every* node on the machine,
+and a compositor came up with a screen and no keyboard. And the
+`/sys/dev/char/M:m` / `/sys/dev/block/M:m` links pointed at the class entry
+rather than at the device that entry names; a reader resolves them to identify a
+node, and `evdev_device_have_same_syspath` compares the *strings* a device's own
+`fstat` devnum and the path udev gave it resolve to, so two answers that disagree
+is a device libinput drops silently. They carry the *device tree's* path now
+(`../../devices/virtual/...`), block devices excepted because this tree has no
+device directory for them. `t-evdev` pins the two errnos; the sysfs side is
+`src/vfs/sysfs.rs`'s own tests.
 
 ### 7.3 AHCI/SATA (stretch)
 

@@ -138,6 +138,37 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let r = lin::ioctl(fd, ioc(IOC_READ, 0x02, 8), id.as_mut_ptr() as usize);
     lin::check_eq(&mut failed, b"EVIOCGID succeeds", r, 0);
 
+    // EVIOCGPHYS and EVIOCGUNIQ: a virtio input device has neither string,
+    // and the answer has to be ENOENT. It may not simply be "unsupported":
+    // libevdev's `libevdev_set_fd` tolerates a failure here *only* for
+    // ENOENT, exactly as Linux's `str_to_user` answers for a NULL attribute,
+    // so an ENOTTY makes the whole read fatal - libinput gives up on every
+    // node on the machine with "failed to create input device", and a
+    // compositor comes up with a screen and no keyboard.
+    let mut text = [0u8; 64];
+    let r = lin::ioctl(
+        fd,
+        ioc(IOC_READ, 0x07, text.len()),
+        text.as_mut_ptr() as usize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCGPHYS answers ENOENT, not ENOTTY",
+        r,
+        lin::ENOENT,
+    );
+    let r = lin::ioctl(
+        fd,
+        ioc(IOC_READ, 0x08, text.len()),
+        text.as_mut_ptr() as usize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCGUNIQ answers ENOENT, not ENOTTY",
+        r,
+        lin::ENOENT,
+    );
+
     // EVIOCGABS on a keyboard axis: EINVAL, the device has no absolute axis.
     let mut abs = [0u8; 24];
     let r = lin::ioctl(

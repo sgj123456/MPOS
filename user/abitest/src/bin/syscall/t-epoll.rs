@@ -275,6 +275,60 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         1,
     );
 
+    // The hang-up: reported whether or not the caller asked for it, and the
+    // *whole* report once the pipe is drained. Both halves matter to the same
+    // waiter - udev's `spawn_wait`, which watches its child's pipe with epoll,
+    // takes a read of 0 as "look again" and ends the wait on EPOLLHUP alone -
+    // so an end-of-stream reported as EPOLLIN alone left the device manager
+    // parked on every `IMPORT{program}` rule until its event timeout expired,
+    // and the `ID_INPUT` tag a compositor needs arrived two minutes into the
+    // boot instead of with the device.
+    let mut gone: [i32; 2] = [-1; 2];
+    lin::check_eq(
+        &mut failed,
+        b"a second pipe is made",
+        lin::pipe2(&mut gone, 0),
+        0,
+    );
+    unsafe { EVENTS[0] = event(lin::EPOLLIN, 0x55) };
+    let r = lin::epoll_ctl(epfd, lin::EPOLL_CTL_ADD, gone[0], unsafe {
+        &raw mut EVENTS[0] as *mut lin::EpollEvent
+    });
+    lin::check_eq(&mut failed, b"its read end is added", r, 0);
+    lin::check_eq(&mut failed, b"the writer is closed", lin::close(gone[1]), 0);
+    let n = lin::epoll_wait(
+        epfd,
+        unsafe { &raw mut EVENTS as *mut lin::EpollEvent },
+        8,
+        200,
+    );
+    lin::check_eq(&mut failed, b"a hang-up ends the wait", n, 1);
+    lin::check_true(
+        &mut failed,
+        b"it carries EPOLLHUP though only EPOLLIN was asked for",
+        events_of(0) & lin::EPOLLHUP != 0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the caller's data word rides with it",
+        data_of(0) as isize,
+        0x55,
+    );
+    // A second look finds the hang-up still there: it is a state, not an
+    // edge, and a wait that missed it once must be able to see it again.
+    lin::check_eq(
+        &mut failed,
+        b"the hang-up reports again",
+        lin::epoll_wait(
+            epfd,
+            unsafe { &raw mut EVENTS as *mut lin::EpollEvent },
+            8,
+            0,
+        ),
+        1,
+    );
+    let _ = lin::close(gone[0]);
+
     // Closing a watched descriptor ends its entry: the operations that
     // name it answer ENOENT, the shape Linux's close-time removal gives.
     lin::check_eq(

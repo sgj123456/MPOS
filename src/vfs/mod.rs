@@ -556,6 +556,33 @@ pub trait Inode: Send + Sync {
         Ready::ALL
     }
 
+    /// Whether the node's peer has gone for good: `POLLHUP`, `EPOLLHUP`.
+    ///
+    /// A different question from [`Self::poll_ready`], which answers what a
+    /// call would *do*, and the two must not be folded together: Linux raises
+    /// the hang-up and error conditions whether or not the caller asked for
+    /// them, and a waiter that only ever hears "readable" cannot tell a slow
+    /// writer from one that has finished. udev's `spawn_wait` is exactly such
+    /// a waiter - read off its own binary, it watches its child's pipe with
+    /// epoll and ends the wait on `EPOLLHUP` alone, *never* on a read that
+    /// answered 0 - so a kernel that never raises the bit leaves the device
+    /// manager parked on every `IMPORT{program}` rule until its own event
+    /// timeout expires. That was the difference between a keyboard tagged at
+    /// boot and the same keyboard tagged two minutes later.
+    ///
+    /// Default false: a node with no peer to lose - a file, an eventfd - has
+    /// nothing to hang up.
+    fn poll_hup(&self) -> bool {
+        false
+    }
+
+    /// Whether the node's peer is gone in the other direction: `POLLERR`,
+    /// `EPOLLERR`. Same contract as [`Self::poll_hup`], and the same reason for
+    /// being asked separately.
+    fn poll_err(&self) -> bool {
+        false
+    }
+
     /// Ask to be woken when this node may have become ready, and stop asking.
     ///
     /// `poll` calls this before it sleeps and the matching `unsubscribe` after,

@@ -13,6 +13,31 @@
 //! recognises kernel origin - not by trusting a field, but by the credentials
 //! the kernel stamps on what it sends: `uid 0`, `nl_pid 0`.
 //!
+//! **And userland sends on it too, which is the other half of udev.** The
+//! device manager hands each event to one of its workers with a *unicast* to
+//! that worker's own monitor socket (`udev_monitor_send_device(monitor,
+//! worker->monitor, dev)`), and becomes a listener's news only because it
+//! *broadcasts* the processed device to the group `udevadm monitor` joined. So
+//! this module also owns the family's write side: every socket has a port id
+//! (`nl_pid`), unicast is addressed to one, a send with a group mask and no port
+//! id goes to every socket that joined it, and each queued message carries the
+//! address and the credentials its reader is told it came from.
+//!
+//! That half is measured against Linux rather than recalled, because udev's
+//! protocol is built on the details. `NETLINK_KOBJECT_UEVENT`, this host's
+//! kernel: a socket bound with `nl_pid == 0` is given the process's pid when
+//! that number is free and a hash-derived one when it is not ("usually, but not
+//! necessarily the pid", as libudev's own comment puts it); binding a port id
+//! another socket holds is `EADDRINUSE`, and binding twice is `EINVAL`; a
+//! unicast reaches its destination and reports the *sender's* port id with
+//! `nl_groups == 0`, an unknown port id is `ECONNREFUSED`, and the sender never
+//! receives its own message; a group send reports the *destination group* as the
+//! source's `nl_groups`, reaches the lowest group in the mask (Linux computes
+//! `ffs` of it, so `nl_groups = 6` reaches group 2 and not group 4) and never the
+//! sender, and returns the byte count even when the group is empty; a send with
+//! neither a port id nor a group is accepted and goes to the kernel's own
+//! address; and a socket that never bound is given a port id by its first send.
+//!
 //! Also here: the numbering. A device's `major:minor` is what `/sys` reports,
 //! what `/dev` nodes are made from, and what a listener matches events
 //! against, so the kernel computes it once. See [`Numbering`].
@@ -22,9 +47,11 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use critical_section::Mutex;
+
+use crate::syscall::err;
 
 /// One device event, in the shape userland reads it.
 pub struct Event {
@@ -125,22 +152,81 @@ pub fn seqnum() -> u64 {
     SEQNUM.load(Ordering::Relaxed)
 }
 
-/// A netlink socket, as far as the kernel is concerned: a queue of events and
-/// whether its owner asked to receive them.
+/// A netlink socket, as far as the kernel is concerned: an address, a queue of
+/// messages and whether its owner asked to receive them.
 struct Subscriber {
     id: usize,
-    /// Whether `bind(2)` has been called. An unbound socket receives nothing,
-    /// which is what Linux does with one.
+    /// Whether `bind(2)` - or the implicit bind a first send performs - has
+    /// named this socket. An unbound socket receives nothing, which is what
+    /// Linux does with one, and has no port id for anyone to address.
     bound: bool,
-    /// The groups the socket bound to; the kernel broadcasts only to sockets
-    /// that asked for this group.
+    /// The `nl_pid` a peer writes to reach this socket. Not assumed to be a
+    /// pid: Linux hands out the process's pid when it is free and a
+    /// hash-derived number when it is not, and libudev's own comment says so
+    /// ("usually, but not necessarily the pid") because it reads its address
+    /// back with `getsockname` rather than guessing.
+    pid: u32,
+    /// The groups the socket joined; a broadcast goes to every socket whose
+    /// mask intersects the destination's, and the kernel's own events go to
+    /// [`GROUP_KERNEL`] alone.
     groups: u32,
-    /// A shared buffer rather than a `Vec` each: the publisher runs inside a
-    /// critical section, and handing one more listener a copy of the event must
-    /// not mean allocating there - see [`publish`].
-    /// Each entry is the event's sequence number and its bytes: the number is
-    /// what the netlink header carries, beside the copy in the payload.
-    queue: VecDeque<(u64, Arc<Vec<u8>>)>,
+    /// `SO_PASSCRED`: the owner wants each message stamped with its sender's
+    /// credentials. Recorded rather than acted on - every message this module
+    /// delivers carries them, which is a deliberate divergence from Linux's
+    /// gate and the reason a listener that never asked still recognises the
+    /// kernel by `uid 0`.
+    passcred: bool,
+    /// A shared buffer rather than a `Vec` each: a send runs inside a critical
+    /// section, and handing one more recipient a copy of the message must not
+    /// mean allocating there - see [`publish`].
+    queue: VecDeque<Message>,
+}
+
+/// One message waiting in a socket's queue, with the address and the identity a
+/// reader is told it came from.
+///
+/// The address is *not* the sender's own bind - Linux fills `msg_name` from the
+/// delivery: a unicast reports the sender's `nl_pid` and `nl_groups == 0`, a
+/// broadcast reports the destination group in `nl_groups`, and a kernel event
+/// reports the all-zero address every listener recognises.
+pub struct Message {
+    /// The event's sequence number, for a kernel-published event.
+    pub seq: u64,
+    pub bytes: Arc<Vec<u8>>,
+    /// The sender's `nl_pid`: 0 is the kernel.
+    pub from_pid: u32,
+    /// The group the message was broadcast to, or 0 if it was unicast.
+    pub group: u32,
+    /// The sender's credentials. All zero for the kernel's own messages, which
+    /// is how a listener tells kernel origin from a peer's.
+    pub cred: Cred,
+}
+
+/// `struct ucred`: who sent a message. The uevent family's own copy of the
+/// type, because `net::unix` is bare-metal only and this module is not.
+#[derive(Clone, Copy, Default)]
+pub struct Cred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// The running task's credentials; the host build has no task table and
+/// answers zeros, which is what the queue logic that a host test drives wants.
+pub fn self_cred() -> Cred {
+    #[cfg(target_os = "none")]
+    {
+        let (uid, gid) = crate::sched::current_real_owner();
+        Cred {
+            pid: crate::sched::current_tgid().0 as u32,
+            uid,
+            gid,
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        Cred::default()
+    }
 }
 
 /// The one group a kobject-uevent socket has: kernel-originated events.
@@ -148,6 +234,20 @@ const GROUP_KERNEL: u32 = 1;
 
 /// How many events one socket may have waiting.
 const QUEUE_MAX: usize = 256;
+
+/// Where assigned port ids start.
+///
+/// Above the range a pid occupies in practice, so an assigned id cannot be
+/// mistaken for one - and monotonic rather than hashed, which is the one place
+/// this departs from Linux: a hash can collide and is retried, a counter cannot
+/// and does not need to be. Reuse is not modelled either; Linux's `nl_pid`
+/// values are recycled with the processes behind them, and nothing in this
+/// machine addresses a socket that has gone.
+const PORT_BASE: u32 = 0x4000_0000;
+
+/// Hands out [`PORT_BASE`]-upwards port ids. Monotonic, so no two sockets are
+/// ever given the same one.
+static NEXT_PORT: AtomicU32 = AtomicU32::new(PORT_BASE);
 
 /// Where netlink handles start. The network stack's registry numbers its
 /// entries from one and `socket_handle_of_fd` cannot tell the two tables
@@ -173,7 +273,9 @@ pub fn open() -> usize {
         SUBSCRIBERS.borrow(cs).borrow_mut().push(Subscriber {
             id,
             bound: false,
+            pid: 0,
             groups: 0,
+            passcred: false,
             // Sized here, in task context, so that the publisher never has to
             // grow it: [`publish`] runs inside a critical section, and
             // `VecDeque::push_back` reallocating there is an allocation with
@@ -194,10 +296,59 @@ pub fn close(id: usize) {
     });
 }
 
-/// `bind(2)`: from here on the socket receives events. `groups` is the
-/// netlink group mask; a listener that wants everything - as `nlplug-findfs`
-/// does, binding with `nl_groups = -1` - gets all of them.
-pub fn bind(id: usize, groups: u32) {
+/// `bind(2)`: name the socket and join groups.
+///
+/// `pid` is the `nl_pid` the caller asked for: zero means "give me one", which
+/// is what every daemon asks and what libudev reads back with `getsockname`.
+/// The three refusals are Linux's and each was measured: a socket that is
+/// already bound is `EINVAL` (a second `bind` is not how groups are added), an
+/// explicit port id another socket holds is `EADDRINUSE`, and a socket this
+/// module does not own is `EBADF`.
+pub fn bind(id: usize, pid: u32, groups: u32) -> Result<(), isize> {
+    let prefer = self_cred().pid;
+    critical_section::with(|cs| {
+        let mut subs = SUBSCRIBERS.borrow(cs).borrow_mut();
+        if !subs.iter().any(|s| s.id == id) {
+            return Err(err::EBADF);
+        }
+        if subs.iter().any(|s| s.id == id && s.bound) {
+            return Err(err::EINVAL);
+        }
+        if pid != 0 && subs.iter().any(|s| s.bound && s.pid == pid) {
+            return Err(err::EADDRINUSE);
+        }
+        let assigned = if pid != 0 {
+            pid
+        } else {
+            assign_port(&subs, prefer)
+        };
+        if let Some(sub) = subs.iter_mut().find(|s| s.id == id) {
+            sub.bound = true;
+            sub.pid = assigned;
+            sub.groups = groups;
+        }
+        Ok(())
+    })
+}
+
+/// The address a socket was bound to, for `getsockname`: the port id and the
+/// group mask, or `None` for a socket that never bound - which Linux reports as
+/// the all-zero address rather than as an error.
+pub fn port_of(id: usize) -> Option<(u32, u32)> {
+    critical_section::with(|cs| {
+        SUBSCRIBERS
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .find(|s| s.id == id)
+            .filter(|s| s.bound)
+            .map(|s| (s.pid, s.groups))
+    })
+}
+
+/// `setsockopt(SO_PASSCRED)`. See [`Subscriber::passcred`] for what it does and
+/// does not change.
+pub fn set_passcred(id: usize, on: bool) {
     critical_section::with(|cs| {
         if let Some(sub) = SUBSCRIBERS
             .borrow(cs)
@@ -205,14 +356,169 @@ pub fn bind(id: usize, groups: u32) {
             .iter_mut()
             .find(|s| s.id == id)
         {
-            sub.bound = true;
-            sub.groups = groups;
+            sub.passcred = on;
         }
     });
 }
 
+/// Whether the socket's owner asked for credentials. Read back by
+/// `getsockopt`, and by the receive path for the one thing the option decides
+/// here: nothing - every message is stamped - so the two agree with what the
+/// caller asked for.
+pub fn passcred(id: usize) -> bool {
+    critical_section::with(|cs| {
+        SUBSCRIBERS
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.passcred)
+            .unwrap_or(false)
+    })
+}
+
+/// The next free port id: the caller's own pid when nothing holds it, and a
+/// number from the counter otherwise. Linux's own order of preference.
+fn assign_port(subs: &[Subscriber], prefer: u32) -> u32 {
+    if prefer != 0 && !subs.iter().any(|s| s.bound && s.pid == prefer) {
+        return prefer;
+    }
+    loop {
+        let candidate = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+        if !subs.iter().any(|s| s.bound && s.pid == candidate) {
+            return candidate;
+        }
+    }
+}
+
+/// One userland send: `sendto`/`sendmsg` on a device-event socket, and what
+/// udevd's manager uses to hand an event to a worker.
+///
+/// `dest` is the address the caller named - `(nl_pid, nl_groups)` - or `None`
+/// for a send with no address at all, which Linux treats as the kernel's own
+/// address. The errnos are the measured ones: a unicast to a port id nobody
+/// holds is `ECONNREFUSED`, a unicast into a queue with no room is `ENOBUFS`
+/// (Linux would rather tell the sender than drop a handoff on the floor), and a
+/// broadcast is accepted whether or not anybody is in the group - which is what
+/// libudev relies on when it says a multicast `ECONNREFUSED` would be
+/// "expected", and better than that here.
+///
+/// The payload is opaque. What libudev puts in it - `struct
+/// udev_monitor_netlink_header`, then the device's properties - is the
+/// library's protocol, not the kernel's.
+pub fn send(id: usize, dest: Option<(u32, u32)>, data: &[u8], cred: Cred) -> isize {
+    // Built outside the critical section, as `publish` does, so the section
+    // holds only list surgery. One allocation, shared by every recipient.
+    let encoded = Arc::new(data.to_vec());
+    let mut queued = false;
+    let answer = critical_section::with(|cs| {
+        let mut subs = SUBSCRIBERS.borrow(cs).borrow_mut();
+        let Some(index) = subs.iter().position(|s| s.id == id) else {
+            return err::EBADF;
+        };
+        // A socket that never bound is named by its first send, which is what
+        // Linux's autobind does and what makes a reply's source address
+        // something a peer can answer.
+        if !subs[index].bound {
+            let assigned = assign_port(&subs, cred.pid);
+            subs[index].bound = true;
+            subs[index].pid = assigned;
+        }
+        let from = subs[index].pid;
+        match dest {
+            // No address, or the kernel's own: accepted, and there is no
+            // reader on this side of the kernel to queue it for.
+            None | Some((0, 0)) => data.len() as isize,
+            Some((pid, 0)) => {
+                let Some(target) = subs
+                    .iter_mut()
+                    .find(|s| s.id != id && s.bound && s.pid == pid)
+                else {
+                    return err::ECONNREFUSED;
+                };
+                if target.queue.len() >= QUEUE_MAX {
+                    return err::ENOBUFS;
+                }
+                target.queue.push_back(Message {
+                    seq: 0,
+                    bytes: Arc::clone(&encoded),
+                    from_pid: from,
+                    group: 0,
+                    cred,
+                });
+                queued = true;
+                data.len() as isize
+            }
+            // A broadcast: every member but the sender, which Linux does not
+            // deliver to and udev's manager would only have to filter out.
+            //
+            // One group, not the whole mask: Linux computes `ffs(nl_groups)`
+            // and delivers to that group alone, so a caller that sets two bits
+            // reaches only the lower one - measured (`nl_groups = 6` reaches
+            // group 2 and not group 4, `nl_groups = 12` reaches group 4 and not
+            // 8). Every daemon here sets one bit, and matching the artifact
+            // costs nothing while a divergence would be one more thing to know.
+            Some((0, mask)) => {
+                let group = mask & mask.wrapping_neg();
+                for sub in subs.iter_mut() {
+                    if sub.id == id || !sub.bound || sub.groups & group == 0 {
+                        continue;
+                    }
+                    if sub.queue.len() >= QUEUE_MAX {
+                        sub.queue.pop_front();
+                    }
+                    sub.queue.push_back(Message {
+                        seq: 0,
+                        bytes: Arc::clone(&encoded),
+                        from_pid: from,
+                        group,
+                        cred,
+                    });
+                    queued = true;
+                }
+                data.len() as isize
+            }
+            // A port id *and* a group: Linux treats the port id as the
+            // destination and the group as what the message reports, which is
+            // the unicast case with a different `nl_groups` in the answer.
+            Some((pid, mask)) => {
+                let Some(target) = subs
+                    .iter_mut()
+                    .find(|s| s.id != id && s.bound && s.pid == pid)
+                else {
+                    return err::ECONNREFUSED;
+                };
+                if target.queue.len() >= QUEUE_MAX {
+                    return err::ENOBUFS;
+                }
+                target.queue.push_back(Message {
+                    seq: 0,
+                    bytes: Arc::clone(&encoded),
+                    from_pid: from,
+                    group: mask,
+                    cred,
+                });
+                queued = true;
+                data.len() as isize
+            }
+        }
+    });
+    // A message nobody is woken for is a message that never arrives: the
+    // listeners on this bus park in `poll(2)`, and a worker waiting for a
+    // handoff is exactly that. The wake list belongs to the network stack -
+    // which on a quiet machine does not poll at all - so it is called here,
+    // outside every borrow, the discipline `publish` documents.
+    #[cfg(target_os = "none")]
+    if queued {
+        crate::net::wake_waiters();
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = queued;
+    answer
+}
+
 /// The next event waiting for this socket, or `None` when there is none.
-pub fn recv(id: usize) -> Option<(u64, Arc<Vec<u8>>)> {
+pub fn recv(id: usize) -> Option<Message> {
     critical_section::with(|cs| {
         SUBSCRIBERS
             .borrow(cs)
@@ -271,7 +577,17 @@ pub fn publish(event: &Event) {
                 if sub.queue.len() >= QUEUE_MAX {
                     sub.queue.pop_front();
                 }
-                sub.queue.push_back((seq, Arc::clone(&encoded)));
+                sub.queue.push_back(Message {
+                    seq,
+                    bytes: Arc::clone(&encoded),
+                    // The kernel's own address and credentials: `nl_pid 0`,
+                    // `nl_groups 1` (the group this went to), and a zero
+                    // `ucred`. That is how a listener tells a kernel event from
+                    // a peer's without trusting anything in the payload.
+                    from_pid: 0,
+                    group: GROUP_KERNEL,
+                    cred: Cred::default(),
+                });
                 queued = true;
             }
         }
@@ -441,16 +757,29 @@ mod tests {
         publish(&an_event());
         assert!(!ready(watcher), "an unbound socket receives nothing");
 
-        bind(watcher, 1);
+        bind(watcher, 0, GROUP_KERNEL).expect("a fresh socket binds");
         publish(&an_event());
         assert!(ready(watcher));
         assert!(!ready(other), "a socket that never bound stays empty");
 
         let event = recv(watcher).expect("the event is there");
-        assert!(event.1.starts_with(b"add@"), "the message line comes first");
         assert!(
-            event.1.ends_with(&[0, 0]),
+            event.bytes.starts_with(b"add@"),
+            "the message line comes first"
+        );
+        assert!(
+            event.bytes.ends_with(&[0, 0]),
             "the block ends with the empty entry that terminates it"
+        );
+        assert_eq!(
+            (event.from_pid, event.group),
+            (0, GROUP_KERNEL),
+            "a kernel event comes from the kernel, on the kernel's group"
+        );
+        assert_eq!(
+            (event.cred.uid, event.cred.pid),
+            (0, 0),
+            "and with the credentials a listener recognises it by"
         );
 
         // Draining works, and it terminates. Not "the queue is empty
@@ -474,7 +803,7 @@ mod tests {
     fn a_bounded_queue_keeps_the_newest_events() {
         let _bus = bus_lock();
         let watcher = open();
-        bind(watcher, 1);
+        bind(watcher, 0, GROUP_KERNEL).expect("a fresh socket binds");
         for _ in 0..QUEUE_MAX + 8 {
             publish(&an_event());
         }
@@ -484,5 +813,197 @@ mod tests {
         }
         assert_eq!(delivered, QUEUE_MAX, "the queue is bounded, not unbounded");
         close(watcher);
+    }
+
+    // -----------------------------------------------------------------
+    // The write side: what udevd's manager does with an event it has read,
+    // which is hand it to one worker by port id.
+    // -----------------------------------------------------------------
+
+    /// One bound socket with a port id of its own, released at the end.
+    fn a_bound_listener(groups: u32) -> usize {
+        let id = open();
+        bind(id, 0, groups).expect("a fresh socket binds");
+        id
+    }
+
+    #[test]
+    fn a_bound_socket_gets_an_address_and_the_rules_around_it() {
+        let _bus = bus_lock();
+        let first = open();
+        let (pid, _) = {
+            bind(first, 0, 0).expect("a zero pid asks for one");
+            port_of(first).expect("a bound socket has an address")
+        };
+        assert_ne!(pid, 0, "a socket bound with pid 0 is given one");
+
+        // Binding a port id another socket holds is `EADDRINUSE`, which is what
+        // a daemon that named itself after a stale pid has to hear.
+        let second = open();
+        assert_eq!(bind(second, pid, 0), Err(err::EADDRINUSE));
+        // And a socket that is already bound may not bind again - not to add a
+        // group either, which is Linux's `EINVAL` and not a merge.
+        assert_eq!(bind(first, 0, 0), Err(err::EINVAL));
+
+        // An explicit free port id is honoured as given.
+        let third = open();
+        bind(third, 0x1234_5678, GROUP_KERNEL).expect("a free explicit id binds");
+        assert_eq!(port_of(third), Some((0x1234_5678, GROUP_KERNEL)));
+
+        // An unbound socket reports no address at all, which is Linux's
+        // all-zero answer rather than an error.
+        let unbound = open();
+        assert_eq!(port_of(unbound), None);
+        assert_eq!(bind(999_999, 0, 0), Err(err::EBADF));
+
+        for id in [first, second, third, unbound] {
+            close(id);
+        }
+    }
+
+    #[test]
+    fn a_unicast_reaches_one_socket_and_names_its_sender() {
+        let _bus = bus_lock();
+        let manager = a_bound_listener(0);
+        let worker = a_bound_listener(0);
+        let empty = a_bound_listener(0);
+        let (manager_pid, _) = port_of(manager).expect("bound");
+        let (worker_pid, _) = port_of(worker).expect("bound");
+
+        assert_eq!(
+            send(manager, Some((worker_pid, 0)), b"handoff", Cred::default()),
+            7,
+            "a unicast answers the byte count"
+        );
+        let got = recv(worker).expect("the handoff is in the worker's queue");
+        assert_eq!(&got.bytes[..], b"handoff");
+        assert_eq!(got.from_pid, manager_pid, "the source is the sender");
+        assert_eq!(got.group, 0, "a unicast arrives on no group");
+        assert!(recv(manager).is_none(), "the sender does not get its own");
+        assert!(recv(empty).is_none(), "and nobody else does either");
+
+        // A port id nothing holds is refused - "nothing holds" being the case a
+        // daemon meets when the socket it used to talk to is gone, so the
+        // closed socket is what this asks.
+        let (gone_pid, _) = port_of(empty).expect("bound");
+        close(empty);
+        assert_eq!(
+            send(manager, Some((gone_pid, 0)), b"x", Cred::default()),
+            err::ECONNREFUSED
+        );
+        // The address a message reports is the *sender's*, and the credentials
+        // ride with it: that is how the worker's manager is recognised.
+        let cred = Cred {
+            pid: 42,
+            uid: 0,
+            gid: 0,
+        };
+        send(manager, Some((worker_pid, 0)), b"again", cred);
+        let got = recv(worker).expect("the second handoff");
+        assert_eq!(got.cred.pid, 42, "the sender's credentials came with it");
+
+        for id in [manager, worker] {
+            close(id);
+        }
+    }
+
+    #[test]
+    fn a_broadcast_goes_to_the_group_and_never_to_its_sender() {
+        let _bus = bus_lock();
+        let udev_group = 2;
+        let sender = a_bound_listener(0);
+        let member = a_bound_listener(udev_group);
+        let other_group = a_bound_listener(4);
+        let (member_pid, _) = port_of(member).expect("bound");
+        let (sender_pid, _) = port_of(sender).expect("bound");
+        let _ = member_pid;
+
+        assert_eq!(
+            send(sender, Some((0, udev_group)), b"news", Cred::default()),
+            4,
+            "a broadcast answers the byte count"
+        );
+        let got = recv(member).expect("the member is told");
+        assert_eq!(&got.bytes[..], b"news");
+        assert_eq!(got.from_pid, sender_pid);
+        assert_eq!(
+            got.group, udev_group,
+            "the source reports the group it was sent to, as Linux does"
+        );
+        assert!(recv(other_group).is_none(), "another group is not told");
+        assert!(recv(sender).is_none(), "and the sender is not told");
+
+        // A group with nobody in it is still a successful send - libudev
+        // tolerates `ECONNREFUSED` here, and answering the count is better than
+        // being tolerated.
+        assert_eq!(
+            send(sender, Some((0, 16)), b"nobody", Cred::default()),
+            6,
+            "an empty group is not an error"
+        );
+        // A mask with two bits reaches the *lower* group only, which is what
+        // Linux's `ffs` does and what was measured: `nl_groups = 6` reaches
+        // group 2 and not group 4.
+        let lower = a_bound_listener(2);
+        let higher = a_bound_listener(4);
+        assert_eq!(send(sender, Some((0, 2 | 4)), b"mixed", Cred::default()), 5);
+        let got = recv(lower).expect("the lower group is told");
+        assert_eq!(got.group, 2, "and it is told the group it went to");
+        assert!(
+            recv(higher).is_none(),
+            "the higher bit of the mask is not a destination"
+        );
+        // The kernel's own address (no port id, no group) is accepted and has
+        // no reader here.
+        assert_eq!(send(sender, Some((0, 0)), b"kernel", Cred::default()), 6);
+        assert_eq!(send(sender, None, b"kernel", Cred::default()), 6);
+
+        for id in [sender, member, other_group, lower, higher] {
+            close(id);
+        }
+    }
+
+    #[test]
+    fn a_first_send_names_a_socket_that_never_bound() {
+        let _bus = bus_lock();
+        let quiet = open();
+        let listener = a_bound_listener(0);
+        let (listener_pid, _) = port_of(listener).expect("bound");
+        assert_eq!(port_of(quiet), None, "nothing bound it");
+
+        assert_eq!(
+            send(quiet, Some((listener_pid, 0)), b"hello", Cred::default()),
+            5
+        );
+        let (pid, groups) = port_of(quiet).expect("the send named it");
+        assert_ne!(pid, 0, "with a port id of its own");
+        assert_eq!(groups, 0, "and no groups it never asked for");
+        let got = recv(listener).expect("delivered");
+        assert_eq!(got.from_pid, pid, "which is the address it is known by");
+
+        close(quiet);
+        close(listener);
+    }
+
+    #[test]
+    fn a_full_unicast_queue_is_refused_rather_than_dropped() {
+        let _bus = bus_lock();
+        let sender = a_bound_listener(0);
+        let worker = a_bound_listener(0);
+        let (worker_pid, _) = port_of(worker).expect("bound");
+
+        for _ in 0..QUEUE_MAX {
+            assert!(send(sender, Some((worker_pid, 0)), b"x", Cred::default()) > 0);
+        }
+        // A handoff that cannot be queued has to be *said*: a dropped one is an
+        // event udevd waits for forever, where an errno lets it retry or kill
+        // the worker it cannot reach.
+        assert_eq!(
+            send(sender, Some((worker_pid, 0)), b"x", Cred::default()),
+            err::ENOBUFS
+        );
+
+        close(sender);
+        close(worker);
     }
 }

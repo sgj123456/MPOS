@@ -78,6 +78,66 @@ fn receive(fd: i32, buf: &mut [u8], flags: usize, ctl: &mut [usize; 4]) -> (isiz
     (got, msg.msg_controllen)
 }
 
+/// A `struct sockaddr_nl` aimed at somebody else: family, pad, port id, groups.
+/// The harness passes addresses as the 16-byte `SockAddrIn`, of which the first
+/// twelve bytes are the netlink address.
+fn nl_addr_to(pid: u32, groups: u32) -> lin::SockAddrIn {
+    let pid = pid.to_le_bytes();
+    let grp = groups.to_le_bytes();
+    lin::SockAddrIn {
+        family: AF_NETLINK as u16,
+        port: 0,
+        addr: pid,
+        zero: [grp[0], grp[1], grp[2], grp[3], 0, 0, 0, 0],
+    }
+}
+
+/// The `nl_pid` and `nl_groups` out of a written `sockaddr_nl`.
+fn nl_address(addr: &lin::SockAddrIn) -> (u32, u32) {
+    (
+        u32::from_le_bytes(addr.addr),
+        u32::from_le_bytes([addr.zero[0], addr.zero[1], addr.zero[2], addr.zero[3]]),
+    )
+}
+
+/// One `recvmsg` that also asks for the sender's address, and reports what came
+/// back: the payload length, `msg_namelen`, the control length and the address.
+fn receive_from(
+    fd: i32,
+    buf: &mut [u8],
+    flags: usize,
+    ctl: &mut [usize; 4],
+    name: &mut [u8; 16],
+) -> (isize, u32, usize) {
+    let mut iov = [lin::IoVec {
+        base: buf.as_mut_ptr() as usize,
+        len: buf.len(),
+    }];
+    let mut msg = lin::MsgHdr::default();
+    msg.msg_name = name.as_mut_ptr() as usize;
+    msg.msg_namelen = 16;
+    msg.msg_iov = iov.as_mut_ptr() as usize;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctl.as_mut_ptr() as usize;
+    msg.msg_controllen = core::mem::size_of_val(ctl);
+    let got = lin::recvmsg(fd, &mut msg, flags);
+    (got, msg.msg_namelen, msg.msg_controllen)
+}
+
+/// The `(pid, uid, gid)` of the one `SCM_CREDENTIALS` at the head of a control
+/// buffer, or `None` when the record is not there or is not that.
+fn credentials(ctl: &[usize; 4], controllen: usize) -> Option<(i32, u32, u32)> {
+    if controllen < 28 || ctl[0] != 28 {
+        return None;
+    }
+    let level = ctl[1] as u32;
+    let ctype = (ctl[1] >> 32) as u32;
+    if level != lin::SOL_SOCKET as u32 || ctype != 2 {
+        return None;
+    }
+    Some((ctl[2] as u32 as i32, (ctl[2] >> 32) as u32, ctl[3] as u32))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn mpos_user_main(_argc: i32, _argv: *const *const u8) -> ! {
     let _ = lin::write(1, b"t-uevent\n");
@@ -166,6 +226,180 @@ pub extern "C" fn mpos_user_main(_argc: i32, _argv: *const *const u8) -> ! {
     let mut status = 0i32;
     let _ = lin::waitpid(pid as usize, &mut status, 0);
     let _ = lin::close(fd as i32);
+
+    // ---------------------------------------------------------------------
+    // The other half of udev: userland *sending*. `udev_monitor_send_device`
+    // hands a device to one worker with a unicast to that worker's own monitor
+    // socket - `sendmsg` with a 12-byte `sockaddr_nl` and the device's
+    // properties in the iovec - and the worker drops the message unless the
+    // sender's credentials came with it. Both monitors bind with `nl_pid == 0`
+    // and read their address back with `getsockname`; that address is what the
+    // manager addresses the handoff to.
+    // ---------------------------------------------------------------------
+    let manager = lin::socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT) as i32;
+    let worker = lin::socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT) as i32;
+    lin::check_true(
+        &mut failed,
+        b"a manager and a worker socket open",
+        manager > 0 && worker > 0,
+    );
+    if manager > 0 && worker > 0 {
+        let unspecific = nl_addr_to(0, 0);
+        lin::check_eq(
+            &mut failed,
+            b"both bind asking for a port id",
+            lin::bind(manager, &unspecific) + lin::bind(worker, &unspecific),
+            0,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"SO_PASSCRED is accepted on the worker's monitor",
+            lin::setsockopt_int(worker, lin::SOL_SOCKET, lin::SO_PASSCRED, 1),
+            0,
+        );
+
+        let mut mine = nl_addr_to(0, 0);
+        let mut theirs = nl_addr_to(0, 0);
+        let got_name = lin::getsockname(manager, &mut mine);
+        let got_theirs = lin::getsockname(worker, &mut theirs);
+        let (manager_pid, _) = nl_address(&mine);
+        let (worker_pid, _) = nl_address(&theirs);
+        lin::check_true(
+            &mut failed,
+            b"getsockname hands back the port id the kernel assigned",
+            got_name == 0
+                && got_theirs == 0
+                && manager_pid != 0
+                && worker_pid != 0
+                && manager_pid != worker_pid,
+        );
+
+        // The handoff itself: one message, addressed to the worker's port id.
+        let payload = b"libudev\0\xfe\xed\xca\xfeACTION=add\0DEVNAME=event0\0";
+        let dest = nl_addr_to(worker_pid, 0);
+        let mut iov = [lin::IoVec {
+            base: payload.as_ptr() as usize,
+            len: payload.len(),
+        }];
+        let mut msg = lin::MsgHdr::default();
+        msg.msg_name = &dest as *const lin::SockAddrIn as usize;
+        msg.msg_namelen = 12;
+        msg.msg_iov = iov.as_mut_ptr() as usize;
+        msg.msg_iovlen = 1;
+        lin::check_eq(
+            &mut failed,
+            b"the manager's sendmsg to a port id is accepted",
+            lin::sendmsg(manager, &mut msg, 0),
+            payload.len() as isize,
+        );
+
+        let mut buf = [0u8; 256];
+        let mut ctl = [0usize; 4];
+        let mut name = [0u8; 16];
+        let (got, namelen, controllen) = receive_from(worker, &mut buf, 0, &mut ctl, &mut name);
+        lin::check_eq(
+            &mut failed,
+            b"the worker receives the handoff whole",
+            got,
+            payload.len() as isize,
+        );
+        lin::check_true(
+            &mut failed,
+            b"and the payload is the bytes the manager sent",
+            got == payload.len() as isize && &buf[..payload.len()] == payload,
+        );
+        let source_pid = u32::from_le_bytes([name[4], name[5], name[6], name[7]]);
+        let source_groups = u32::from_le_bytes([name[8], name[9], name[10], name[11]]);
+        lin::check_true(
+            &mut failed,
+            b"with the sender's port id as the source address, on no group",
+            namelen == 12 && source_pid == manager_pid && source_groups == 0,
+        );
+        lin::check_true(
+            &mut failed,
+            b"and the sender's credentials, which is what a monitor demands",
+            credentials(&ctl, controllen)
+                .map(|(pid, uid, _)| pid == lin::getpid() as i32 && uid == 0)
+                .unwrap_or(false),
+        );
+
+        // The refusals udev's own error handling is written against: nobody at
+        // that port id, an address too short to be a `sockaddr_nl`, and a
+        // family this is not.
+        let gone = lin::socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT) as i32;
+        let mut gone_addr = nl_addr_to(0, 0);
+        let _ = lin::bind(gone, &unspecific);
+        let _ = lin::getsockname(gone, &mut gone_addr);
+        let (gone_pid, _) = nl_address(&gone_addr);
+        let _ = lin::close(gone);
+        let gone_dest = nl_addr_to(gone_pid, 0);
+        msg.msg_name = &gone_dest as *const lin::SockAddrIn as usize;
+        msg.msg_namelen = 12;
+        lin::check_eq(
+            &mut failed,
+            b"a unicast to a port id nobody holds is ECONNREFUSED",
+            lin::sendmsg(manager, &mut msg, 0),
+            lin::ECONNREFUSED,
+        );
+
+        let short_dest = nl_addr_to(worker_pid, 0);
+        msg.msg_name = &short_dest as *const lin::SockAddrIn as usize;
+        msg.msg_namelen = 8;
+        lin::check_eq(
+            &mut failed,
+            b"an address shorter than a sockaddr_nl is EINVAL",
+            lin::sendmsg(manager, &mut msg, 0),
+            lin::EINVAL,
+        );
+
+        let mut wrong_family = nl_addr_to(worker_pid, 0);
+        wrong_family.family = 2; /* AF_INET */
+        msg.msg_name = &wrong_family as *const lin::SockAddrIn as usize;
+        msg.msg_namelen = 12;
+        lin::check_eq(
+            &mut failed,
+            b"and a family that is not AF_NETLINK is EINVAL too",
+            lin::sendmsg(manager, &mut msg, 0),
+            lin::EINVAL,
+        );
+
+        // A broadcast: the group a listener joined, and not the sender.
+        let udev_group: u32 = 2;
+        let member = lin::socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT) as i32;
+        lin::check_eq(
+            &mut failed,
+            b"a listener joins a group by binding to it",
+            lin::bind(member, &nl_addr_to(0, udev_group)),
+            0,
+        );
+        let group_dest = nl_addr_to(0, udev_group);
+        msg.msg_name = &group_dest as *const lin::SockAddrIn as usize;
+        msg.msg_namelen = 12;
+        lin::check_eq(
+            &mut failed,
+            b"a broadcast is accepted",
+            lin::sendmsg(manager, &mut msg, 0),
+            payload.len() as isize,
+        );
+        let (got, _, _) = receive_from(member, &mut buf, 0, &mut ctl, &mut name);
+        let source_groups = u32::from_le_bytes([name[8], name[9], name[10], name[11]]);
+        lin::check_true(
+            &mut failed,
+            b"the group's member is told, on the group it was sent to",
+            got == payload.len() as isize && source_groups == udev_group,
+        );
+        let (nothing, _, _) = receive_from(manager, &mut buf, MSG_DONTWAIT, &mut ctl, &mut name);
+        lin::check_eq(
+            &mut failed,
+            b"and the sender is not told about its own broadcast",
+            nothing,
+            lin::EAGAIN,
+        );
+        let _ = lin::close(member);
+        let _ = lin::close(manager);
+        let _ = lin::close(worker);
+    }
+
     lin::done(failed)
 }
 
