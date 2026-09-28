@@ -140,6 +140,12 @@ impl Inode for DmaBuf {
     fn as_dmabuf(&self) -> Option<&DmaBuf> {
         Some(self)
     }
+
+    /// A dma-buf exists to be aliased: the importer's mapping must be the
+    /// exporter's pages, or nothing it draws reaches the screen.
+    fn frame_backed(&self) -> bool {
+        true
+    }
 }
 
 impl Drop for DmaBuf {

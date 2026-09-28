@@ -55,8 +55,12 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
 
 **Memory (Phase 5)**
+- [x] anonymous **demand paging** — a `mmap` is an address space and a page
+      arrives on the fault that needs it; `mincore` answers from the page tables,
+      so an untouched range reads as mapped and not resident (`t-mmap-demand`)
 - [~] 5.1 Shared anon `mmap` — served; aliased frames don't cross a plain `fork`
-- [~] 5.2 `madvise` — validated; `MADV_DONTNEED` no-op *(blocked: anon demand paging)*
+- [~] 5.2 `madvise` — validated; `MADV_DONTNEED` a no-op over a demand-paged
+      region (the paging it was blocked on has landed; the release is next)
 - [x] 5.3 `process_vm_readv`/`writev` (§5.3)
 
 **Process (Phase 6)**

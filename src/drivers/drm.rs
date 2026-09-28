@@ -2368,4 +2368,10 @@ impl Inode for DrmCard {
     fn as_drm(&self) -> Option<&DrmCard> {
         Some(self)
     }
+
+    /// A dumb buffer is real memory the card scans out; its mapping must be
+    /// those pages, so the mapping is frame-backed.
+    fn frame_backed(&self) -> bool {
+        true
+    }
 }

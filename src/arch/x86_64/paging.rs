@@ -895,7 +895,20 @@ pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
     let mut page = align_down(start, PAGE_SIZE);
     while page < end {
         let Some((_, flags)) = translate(page) else {
-            return false;
+            // A page of a mapping the process has made but not touched: there
+            // is nothing in the tables to read, so the VMA table is what says
+            // whether the address is the caller's and whether the access is
+            // one it permits. A range with no VMA behind it is still refused -
+            // that is a pointer the process never mapped.
+            //
+            // Only the absent case changes. A page that is *present* is decided
+            // by its PTE exactly as before, which is what keeps the fast path
+            // free of the VMA table and of the cost the lock and the scan add.
+            if !crate::sched::kernel_lazy_accessible(page, write) {
+                return false;
+            }
+            page += PAGE_SIZE;
+            continue;
         };
         if !flags.contains(MapFlags::USER) {
             return false;
@@ -930,6 +943,12 @@ pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
 /// A page the space will not let be written is left alone rather than forced:
 /// a process that made its clear-tid word read-only loses the wake that word
 /// would carry, not the machine.
+///
+/// The check is written out here rather than routed through [`user_accessible`]
+/// on purpose. That function asks the scheduler what a *lazily-mapped* page
+/// means, and this one runs with the task table already borrowed - the caller
+/// has just brought the page in through the table it holds, so re-entering to
+/// ask about it again would be a second `&mut Table` for no new information.
 pub fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
     if at == 0 || at.checked_add(4).is_none_or(|end| end > USER_END) {
         return false;
@@ -939,7 +958,16 @@ pub fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
     // so nothing this function runs on disappears when the switch happens.
     let saved = active_root();
     activate(root);
-    let ok = user_accessible(at, 4, true);
+    let ok = match translate(at) {
+        // A copy-on-write page counts as writable: the store below is answered
+        // by the fault handler, which splits it - the caller has already asked
+        // for that split, and this is the same permission `user_accessible`
+        // grants, decided from the PTE alone.
+        Some((_, flags)) => {
+            flags.contains(MapFlags::USER) && (flags.contains(MapFlags::WRITE) || is_cow_page(at))
+        }
+        None => false,
+    };
     if ok {
         unsafe { core::ptr::write_volatile(at as *mut u32, value) };
     }

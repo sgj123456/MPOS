@@ -7,6 +7,16 @@
 //! paging-structure bug nothing else here can reach, because it is the only one
 //! where the *tables* and the *leaf* are created at different times.
 //!
+//! With anonymous demand paging there is a second, larger gap between those two
+//! moments, and this test is now the pin for both. The reservation backs
+//! nothing at all - the `mmap` records the range and stops - so the commit has
+//! to be visible to a fault that arrives later, from a page the process has
+//! never touched: `mprotect` must rewrite the *VMA's* permissions, not only the
+//! page tables', or every page of the freshly committed region would be refused
+//! (or worse, mapped read-only) when the first store reached it. The walk below
+//! touches every page of the region precisely because the tables it needs are
+//! built one page at a time by whoever gets there first.
+//!
 //! The U/S bit is not the leaf's to decide. The CPU ANDs it along the walk, so
 //! a single upper level with U=0 makes its whole subtree a supervisor page
 //! however the leaf reads - and a table is made once and then shared with

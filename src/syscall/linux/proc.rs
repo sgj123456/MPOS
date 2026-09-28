@@ -2161,7 +2161,7 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
     let base = match (fixed, want) {
         // Linux: a fixed request *takes* the range, replacing what is there.
         (true, Some(addr)) => {
-            crate::sched::release_user_frames(crate::sched::unmap_user(addr, len));
+            crate::sched::munmap_user(addr, len);
             addr
         }
         // A fixed request for an address that cannot be honoured is an error,
@@ -2193,25 +2193,34 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         mf |= MapFlags::USER;
     }
 
-    for (index, page) in (base..base + len).step_by(PAGE_SIZE).enumerate() {
-        // The one file mapping that must not be a copy: a node that owns
-        // shareable memory - the GPU's framebuffer - answers with the
-        // physical frame itself, and the mapping *is* that memory, so a
-        // program drawing into its mapping is drawing on the screen. The
-        // frames are pinned by the node that offered them, which is what
-        // keeps this map - and every unmap, fork and exit that follows it -
-        // from handing the device's memory back to the allocator.
-        let shared = backing.as_ref().and_then(|file| {
-            file.inode()
-                .mmap_frame((offset / PAGE_SIZE) as u64 + index as u64)
-        });
-        let frame = match shared {
-            Some(frame) => frame,
-            None => {
+    // The mapping is recorded, not filled: the address space *is* the mapping,
+    // and the page behind an address appears the first time it is touched. That
+    // is what makes a large `mmap` a statement about addresses rather than a
+    // claim on memory - and it is the whole of §5.1/§5.2's prerequisite, since
+    // a page that can arrive on a fault is a page `MADV_DONTNEED` may take away
+    // again.
+    match &backing {
+        // Anonymous memory: private frames of the process's own, and - once
+        // §2.2's shared object is in hand - the aliased kind.
+        None => crate::sched::map_anon(base, len, mf),
+        // A node that owns real pages: the mapping aliases them, and the page
+        // each fault needs comes from `mmap_frame`. This is the memfd, the
+        // framebuffer and a dma-buf - and, since a wl_shm pool and a scanout
+        // both live or die by aliasing, the only shape those can be.
+        Some(file) if file.inode().frame_backed() => {
+            crate::sched::map_frames(base, len, mf, file.inode(), offset);
+        }
+        // An ordinary file: the bytes are read in now, because a mapping of a
+        // file this kernel does not page is a copy of what the file held and
+        // nothing tracks the file afterwards. That is the whole of a reader's
+        // `MAP_PRIVATE`, and what the dynamic linker maps a shared object with
+        // before `mprotect`ing the parts it wants writable.
+        Some(file) => {
+            let inode = file.inode();
+            for page in (base..base + len).step_by(PAGE_SIZE) {
                 // The pages of a replaced range are gone; these are fresh
-                // ones, zeroed as POSIX promises for anonymous memory and as
-                // the tail of a file mapping promises past the end of the
-                // file.
+                // ones, zeroed as POSIX promises, and the tail of a mapping
+                // past the end of the file keeps the zeros a short read leaves.
                 let frame = match crate::mm::alloc_frames(0) {
                     Some(frame) => frame,
                     None => return err::ENOMEM,
@@ -2224,28 +2233,20 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
                 };
                 dest.fill(0);
 
-                if let Some(file) = &backing {
-                    // Copy what the file has for this page. A short read
-                    // ends the copy rather than failing it: the last page
-                    // of a mapping is rarely full, and the zeros already
-                    // there are the right answer for the rest.
-                    let inode = file.inode();
-                    let start = offset + (page - base);
-                    let mut done = 0;
-                    while done < PAGE_SIZE {
-                        match inode.read_at((start + done) as u64, &mut dest[done..]) {
-                            Ok(0) => break,
-                            Ok(n) => done += n,
-                            Err(_) => break,
-                        }
+                let start = offset + (page - base);
+                let mut done = 0;
+                while done < PAGE_SIZE {
+                    match inode.read_at((start + done) as u64, &mut dest[done..]) {
+                        Ok(0) => break,
+                        Ok(n) => done += n,
+                        Err(_) => break,
                     }
                 }
-                frame
-            }
-        };
 
-        if crate::sched::current_map_user(page, frame, mf) < 0 {
-            return err::ENOMEM;
+                if crate::sched::current_map_user(page, frame, mf) < 0 {
+                    return err::ENOMEM;
+                }
+            }
         }
     }
 
@@ -2290,30 +2291,46 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
         return err::EINVAL;
     }
 
-    // Every page has to be mapped: mremap moves mappings, and a hole has
-    // nothing in it to move. Whether each page is *reachable from ring 3* is
-    // kept, so a `PROT_NONE` page stays one after the move.
+    // Every page has to be part of the mapping: mremap moves mappings, and a
+    // hole has nothing in it to move. A *lazily*-mapped page counts as mapped
+    // even though no frame is behind it, which is why the two questions are
+    // asked separately - the frame travels if there is one, and the VMA travels
+    // either way, so an untouched page of the old range becomes an untouched
+    // page of the new one rather than an `EFAULT`. Whether each page is
+    // *reachable from ring 3* is kept, so a `PROT_NONE` page stays one.
     let mut frames = alloc::vec::Vec::new();
     for page in (old_addr..old_addr + old).step_by(PAGE_SIZE) {
-        let Some(frame) = crate::sched::user_frame_at(page) else {
+        if !crate::sched::user_mapped(page) {
             return err::EFAULT;
+        }
+        let frame = crate::sched::user_frame_at(page);
+        let reachable = match frame {
+            Some(_) => crate::arch::paging::user_accessible(page, PAGE_SIZE, false),
+            // No page to read the bits from, so the VMA is what says whether
+            // the address was the process's to reach.
+            None => {
+                crate::sched::vma_prot_at(page).is_some_and(|prot| prot.contains(MapFlags::USER))
+            }
         };
-        let reachable = crate::arch::paging::user_accessible(page, PAGE_SIZE, false);
         frames.push((frame, reachable));
     }
 
     if !to_fixed {
         // A shrink, or a grow into the pages just above.
         if new <= old {
-            crate::sched::release_user_frames(crate::sched::unmap_user(old_addr + new, old - new));
+            crate::sched::munmap_user(old_addr + new, old - new);
             return old_addr as isize;
         }
         if crate::sched::user_range_free(old_addr + old, new - old) {
-            return if add_pages(old_addr + old, new - old) {
-                old_addr as isize
-            } else {
-                err::ENOMEM
-            };
+            // The grown tail is fresh anonymous memory: the range is claimed
+            // and its pages arrive as they are touched, which is the same
+            // zeros the eager mapping used to hand over.
+            crate::sched::map_anon(
+                old_addr + old,
+                new - old,
+                MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+            );
+            return old_addr as isize;
         }
         if !may_move {
             return err::ENOMEM;
@@ -2333,7 +2350,7 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
         {
             return err::EINVAL;
         }
-        crate::sched::release_user_frames(crate::sched::unmap_user(new_addr, new));
+        crate::sched::munmap_user(new_addr, new);
         new_addr
     } else {
         match free_range(new, crate::sched::get_mmap_cursor()) {
@@ -2345,9 +2362,21 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
         }
     };
 
+    // The mapping's *description* comes out of the old place before anything
+    // moves: the VMAs are what remember which object a page comes from, and a
+    // range that arrived lazily at the old address must arrive lazily at the
+    // new one rather than as somebody else's memory.
+    let taken = crate::sched::take_vmas(old_addr, old);
+    let delta = dest as isize - old_addr as isize;
+
     // The pages go down before the old ones come away, so a mapping that
-    // cannot be placed leaves the original intact rather than half moved.
+    // cannot be placed leaves the original intact rather than half moved. A
+    // page that was never touched has no frame to carry, and is placed by the
+    // VMA reinserted below.
     for (index, (frame, reachable)) in frames.iter().enumerate() {
+        let Some(frame) = frame else {
+            continue;
+        };
         let mut mf = MapFlags::READ | MapFlags::WRITE;
         if *reachable {
             mf |= MapFlags::USER;
@@ -2356,29 +2385,23 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
             return err::ENOMEM;
         }
     }
-    if !add_pages(dest + old, new - old) {
-        return err::ENOMEM;
+    for vma in taken {
+        crate::sched::insert_vma(
+            vma.start.wrapping_add_signed(delta),
+            vma.end.wrapping_add_signed(delta),
+            vma.prot,
+            vma.kind,
+        );
     }
+    crate::sched::map_anon(
+        dest + old,
+        new - old,
+        MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+    );
     // The frames moved with the mapping, so this frees nothing.
     crate::sched::unmap_user(old_addr, old);
 
     dest as isize
-}
-
-/// Map `len` fresh, zeroed, process-owned pages at `virt`.
-fn add_pages(virt: usize, len: usize) -> bool {
-    use crate::mm::pframe::PAGE_SIZE;
-    for page in (virt..virt + len).step_by(PAGE_SIZE) {
-        let Some(frame) = crate::mm::alloc_frames(0) else {
-            return false;
-        };
-        unsafe { core::ptr::write_bytes(crate::mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
-        let flags = MapFlags::READ | MapFlags::WRITE | MapFlags::USER;
-        if crate::sched::current_map_user(page, frame, flags) < 0 {
-            return false;
-        }
-    }
-    true
 }
 
 /// The first run of `len` bytes, page-aligned and below the mmap base, that
@@ -2406,14 +2429,18 @@ fn free_range(len: usize, cursor: usize) -> Option<(usize, usize)> {
 /// `munmap(addr, length)` — drop mappings.
 ///
 /// Linux rounds the range outwards to whole pages and ignores holes, which is
-/// what [`crate::sched::unmap_user`] does. The frames come back to the
-/// allocator because nothing can reach them once the entries are gone.
+/// what [`crate::sched::munmap_user`] does. Both halves of the mapping go: the
+/// VMAs, which is what makes the address the process's, and the frames the
+/// pages held, which come back to the allocator because nothing can reach them
+/// once the entries are gone. A page of a lazily-mapped range that was never
+/// touched has no frame to release, and releasing the VMA is the whole of
+/// giving it back.
 pub(super) fn handle_munmap(args: [usize; ARG_COUNT]) -> isize {
     let (addr, length) = (args[0], args[1]);
     if !addr.is_multiple_of(crate::mm::pframe::PAGE_SIZE) || length == 0 {
         return err::EINVAL;
     }
-    crate::sched::release_user_frames(crate::sched::unmap_user(addr, length));
+    crate::sched::munmap_user(addr, length);
     0
 }
 
@@ -2440,7 +2467,7 @@ pub(super) fn handle_mprotect(args: [usize; ARG_COUNT]) -> isize {
     if prot != 0 {
         mf |= MapFlags::USER;
     }
-    crate::sched::protect_user(addr, len, mf);
+    crate::sched::protect_user_range(addr, len, mf);
     0
 }
 

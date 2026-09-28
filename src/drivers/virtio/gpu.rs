@@ -228,6 +228,12 @@ impl Inode for FbDev {
         (index < pages).then(|| self.0.fb_phys + index * PAGE_SIZE)
     }
 
+    /// The framebuffer is the page itself: a mapping of it is the scanout, so
+    /// it must alias the pinned frames rather than copy them.
+    fn frame_backed(&self) -> bool {
+        true
+    }
+
     /// The framebuffer this node is - how the fbdev ioctls reach the
     /// resolution and the buffer without the syscall layer knowing where
     /// framebuffers live.

@@ -671,10 +671,13 @@ pub fn handle_msync(args: [usize; ARG_COUNT]) -> isize {
 }
 
 /// `mincore(addr, len, vec)` — which pages of a range are resident, one
-/// byte each. Everything this kernel maps is resident — file pages are
-/// read in at map time and nothing pages out — so the vec is a run of
-/// ones, and the questions the caller is really asking are whether the
-/// range is mapped at all and whether the vec is large enough.
+/// byte each. The answer comes from the page tables, so a range that is
+/// mapped but whose pages have never been touched reads as *not* resident -
+/// which is the truth, and the point: with anonymous demand paging a
+/// mapping is an address space, and the pages behind it appear on use. The
+/// questions the caller is really asking are whether the range is mapped at
+/// all (an unmapped page is `ENOMEM`, the man page's own answer) and whether
+/// the vec is large enough.
 pub fn handle_mincore(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (addr, len, vec) = (args[0], args[1], args[2]);
     if addr % PAGE_SIZE != 0 {
@@ -685,12 +688,16 @@ pub fn handle_mincore(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         return err::EFAULT;
     }
     for i in 0..pages {
-        // A hole in the range is ENOMEM, the man page's own answer for
-        // memory this kernel never mapped.
-        if crate::sched::user_frame_at(addr + i * PAGE_SIZE).is_none() {
+        let page = addr + i * PAGE_SIZE;
+        // A hole in the range is ENOMEM: nothing claims the address.
+        if !crate::sched::user_mapped(page) {
             return err::ENOMEM;
         }
-        unsafe { (vec as *mut u8).add(i).write_unaligned(1) };
+        // Resident means a frame is there *now*; a lazily-mapped page that has
+        // not been touched is mapped and not resident, and saying so is the
+        // whole of what this call is for.
+        let resident = crate::sched::user_frame_at(page).is_some() as u8;
+        unsafe { (vec as *mut u8).add(i).write_unaligned(resident) };
     }
     0
 }
@@ -724,7 +731,10 @@ fn lock_range(addr: usize, len: usize) -> isize {
     }
     let mut page = addr;
     while page < end {
-        if crate::sched::user_frame_at(page).is_none() {
+        // A page that is *claimed* counts: with demand paging the range is the
+        // process's from `mmap`, and a page nobody has touched is one this
+        // kernel has nothing to page out either.
+        if !crate::sched::user_mapped(page) {
             return err::ENOMEM;
         }
         page += PAGE_SIZE;

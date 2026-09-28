@@ -274,6 +274,10 @@ name = "t-mmap"
 path = "src/bin/syscall/t-mmap.rs"
 
 [[bin]]
+name = "t-mmap-demand"
+path = "src/bin/syscall/t-mmap-demand.rs"
+
+[[bin]]
 name = "t-mount"
 path = "src/bin/syscall/t-mount.rs"
 

@@ -444,6 +444,20 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// Whether [`Self::mmap_frame`] is this node's real answer rather than the
+    /// default "no".
+    ///
+    /// `mmap` asks *before* it maps a single page, and that is what makes such
+    /// a mapping lazy: a range of a node that answers here is recorded as a
+    /// frame-backed VMA and populated a page at a time from [`Self::mmap_frame`]
+    /// as the program touches it - the same aliasing the eager loop used to
+    /// give, with the pages arriving on the fault that needs them rather than
+    /// all of them up front. A node that does not override this gets the
+    /// read-in copy, which is what every ordinary file wants.
+    fn frame_backed(&self) -> bool {
+        false
+    }
+
     /// The framebuffer this node is, if it is one - how `FBIOGET_*` reaches
     /// the resolution and the buffer facts without the ioctl layer knowing
     /// where framebuffers live. Same shape as [`Self::as_tty`], for the

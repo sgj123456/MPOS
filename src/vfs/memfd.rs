@@ -255,6 +255,12 @@ impl Inode for Memfd {
         })
     }
 
+    /// A memfd is the archetypal frame-backed node: every mapping of it must
+    /// alias the same pages, not copy them.
+    fn frame_backed(&self) -> bool {
+        true
+    }
+
     fn as_memfd(&self) -> Option<&Memfd> {
         Some(self)
     }

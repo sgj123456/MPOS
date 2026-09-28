@@ -480,13 +480,31 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::mincore(page, 4096, vec),
         0,
     );
-    lin::check_true(&mut failed, b"the page is resident", unsafe { VEC[0] == 1 });
+    // Anonymous demand paging: the address is the process's from the `mmap`,
+    // and nothing is behind it until it is touched. `mincore` answers from the
+    // page tables, so a freshly mapped page reads as mapped and *not*
+    // resident - which is the truth, and the point.
+    lin::check_true(
+        &mut failed,
+        b"a freshly mapped page is mapped and not yet resident",
+        unsafe { VEC[0] == 0 },
+    );
     lin::check_eq(
         &mut failed,
         b"mincore on an unaligned range answers EINVAL",
         lin::mincore(page + 1, 4096, vec),
         lin::EINVAL,
     );
+    unsafe { core::ptr::write_volatile(page as *mut u8, 1) };
+    lin::check_eq(
+        &mut failed,
+        b"mincore after touching the page succeeds",
+        lin::mincore(page, 4096, vec),
+        0,
+    );
+    lin::check_true(&mut failed, b"the touched page is resident", unsafe {
+        VEC[0] == 1
+    });
     lin::check_eq(&mut failed, b"mlock succeeds", lin::mlock(page, 4096), 0);
     lin::check_eq(
         &mut failed,

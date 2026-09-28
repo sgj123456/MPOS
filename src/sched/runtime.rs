@@ -38,6 +38,7 @@ use crate::arch::paging::{self, AddressSpace};
 use crate::arch::{idle, timer};
 use crate::mm::elf::{self, Image};
 use crate::mm::vm::{MapFlags, Mapping};
+use crate::mm::vma::{Vma, VmaKind, VmaTable};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{Priority, Scheduler, TaskId};
 use crate::sched::signal;
@@ -606,6 +607,16 @@ pub struct Mm {
     /// stack and heap. Dropping the address space frees its tables but never
     /// these, so the reaper returns them by hand.
     frames: Mutex<RefCell<Vec<usize>>>,
+    /// The group's virtual memory areas: which ranges exist, with what
+    /// permissions, and what backs each one.
+    ///
+    /// This is Linux's `mm->mmap`, and it is what makes a mapping an *address
+    /// space* rather than a set of pre-allocated frames: a range with no page
+    /// behind it yet is still mapped, and a fault inside it is answered from
+    /// the [`crate::mm::vma`] entry instead of by SIGSEGV. The per-group
+    /// placement is deliberate - threads share one address space, so they
+    /// share one table, and `fork` copies it.
+    vmas: Mutex<RefCell<VmaTable>>,
     /// The thread that started the process: its id is the group's pid, and
     /// `getpid` answers it from any of the threads.
     leader: TaskId,
@@ -635,10 +646,52 @@ impl Mm {
             live: core::sync::atomic::AtomicUsize::new(1),
             root_value: root,
             frames: Mutex::new(RefCell::new(frames)),
+            vmas: Mutex::new(RefCell::new(VmaTable::new())),
             leader,
             clear_tid: Mutex::new(RefCell::new(None)),
             membarrier: core::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Put a whole VMA table in place: what `fork` hands its child, whose
+    /// memory is its parent's - address space included.
+    fn set_vmas(&self, vmas: VmaTable) {
+        critical_section::with(|cs| *self.vmas.borrow(cs).borrow_mut() = vmas);
+    }
+
+    /// A copy of the table, for a child about to be given its own.
+    fn vma_snapshot(&self) -> VmaTable {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow().clone())
+    }
+
+    /// The VMA covering `virt`, if the group has one.
+    fn vma_at(&self, virt: usize) -> Option<Vma> {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow().lookup(virt).cloned())
+    }
+
+    /// Whether a VMA covers `virt`.
+    fn vma_covers(&self, virt: usize) -> bool {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow().covers(virt))
+    }
+
+    fn vma_insert(&self, vma: Vma) {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().insert(vma));
+    }
+
+    fn vma_remove_range(&self, start: usize, end: usize) {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().remove_range(start, end));
+    }
+
+    fn vma_take_range(&self, start: usize, end: usize) -> Vec<Vma> {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().take_range(start, end))
+    }
+
+    fn vma_set_prot(&self, start: usize, end: usize, prot: MapFlags) {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().set_prot(start, end, prot));
+    }
+
+    fn vma_gaps(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow().gaps(start, end))
     }
 
     /// The `membarrier` registrations this group has made. See
@@ -1595,11 +1648,20 @@ impl Table {
             return;
         };
         let mm = task.mm.clone();
-        let Some(space) = task.space.as_mut() else {
+        let Some(root) = task.space.as_ref().map(|space| space.root()) else {
             return;
         };
-        let root = space.root();
-        split_cow(space, &mm, address);
+        if let Some(space) = self.tasks[owner.0].as_mut().and_then(|t| t.space.as_mut()) {
+            split_cow(space, &mm, address);
+        }
+        // The word can sit in a page the group has never touched - a thread's
+        // TLS is mapped on demand by its libc. The store below is made in ring
+        // 0, where a fault is a panic rather than a copy, so the page is
+        // brought in here, where the table is already borrowed and asking for
+        // it again would be a second `&mut Table`.
+        if paging::phys_for_virt_of(root, address).is_none() {
+            populate_in(self, root, address, true);
+        }
         crate::arch::paging::write_user_u32(root, address, 0);
     }
 
@@ -2186,7 +2248,7 @@ fn write_arg_block(
     auxv(&mut block[off..], loaded, random_vaddr, execfn_vaddr);
 
     assert!(
-        write_user_of(root, base, &block),
+        write_user_of_at(root, base, &block, false),
         "the argument block did not fit"
     );
 }
@@ -4352,7 +4414,20 @@ fn user_byte_address(virt: usize, write: bool) -> Option<usize> {
     if write && crate::arch::paging::is_cow_page(page) && !resolve_cow_fault(page) {
         return None;
     }
-    let (phys, flags) = crate::arch::paging::translate(virt)?;
+    let (phys, flags) = match crate::arch::paging::translate(virt) {
+        Some(found) => found,
+        // A page of a mapping the process has not touched yet. The walk that
+        // just failed is the same walk the CPU would do, so the answer is the
+        // fault handler's: bring the page in and try once more. A miss with no
+        // VMA behind it is still a refusal - that is a process handing the
+        // kernel an address it never mapped.
+        None => {
+            if !resolve_anon_fault(virt, write) {
+                return None;
+            }
+            crate::arch::paging::translate(virt)?
+        }
+    };
     if !flags.contains(MapFlags::USER) {
         return None;
     }
@@ -4415,7 +4490,7 @@ pub fn read_user_of(root: usize, virt: usize, bytes: &mut [u8]) -> bool {
         let page_end =
             crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
         let chunk = core::cmp::min(page_end - at, bytes.len() - done);
-        let Some(phys) = paging::user_phys_for_virt_of(root, at) else {
+        let Some(phys) = resolve_page_of(root, at, false, true) else {
             return false;
         };
         let src =
@@ -4430,13 +4505,25 @@ pub fn read_user_of(root: usize, virt: usize, bytes: &mut [u8]) -> bool {
 /// [`read_user_of`], and so the same notes apply: the `USER` bit is asked for,
 /// and a copy-on-write page is not broken.
 pub fn write_user_of(root: usize, virt: usize, bytes: &[u8]) -> bool {
+    write_user_of_at(root, virt, bytes, true)
+}
+
+/// [`write_user_of`] with the demand-paging half made optional.
+///
+/// `populate` is `false` for the one caller that already holds the task table -
+/// the `exec`/spawn path writes the argument block into a freshly built stack
+/// while `with_table` is on the stack, and taking it again to look for a miss
+/// would be a second `&mut Table`. That stack's pages are mapped eagerly by the
+/// loader, so the miss this gives up on cannot happen; the flag keeps the
+/// impossibility checked rather than assumed.
+fn write_user_of_at(root: usize, virt: usize, bytes: &[u8], populate: bool) -> bool {
     let mut done = 0;
     while done < bytes.len() {
         let at = virt + done;
         let page_end =
             crate::mm::pframe::align_down(at, crate::mm::PAGE_SIZE) + crate::mm::PAGE_SIZE;
         let chunk = core::cmp::min(page_end - at, bytes.len() - done);
-        let Some(phys) = paging::user_phys_for_virt_of(root, at) else {
+        let Some(phys) = resolve_page_of(root, at, true, populate) else {
             return false;
         };
         let dest =
@@ -4445,6 +4532,26 @@ pub fn write_user_of(root: usize, virt: usize, bytes: &[u8]) -> bool {
         done += chunk;
     }
     true
+}
+
+/// The frame behind `virt` in the address space `root` names, bringing the page
+/// in first when it is one of a mapping nobody has touched yet.
+///
+/// The demand-paging twin of the `user_phys_for_virt_of` walk, and the reason
+/// the cross-process copy paths had to change at all: the walk reads page
+/// tables, and a lazy page has no entry to read - so a missing page that a VMA
+/// covers is populated rather than reported as `EFAULT`.
+fn resolve_page_of(root: usize, virt: usize, write: bool, populate: bool) -> Option<usize> {
+    match paging::user_phys_for_virt_of(root, virt) {
+        Some(phys) => Some(phys),
+        None if populate => {
+            if !populate_user_page_at(root, virt, write) {
+                return None;
+            }
+            paging::user_phys_for_virt_of(root, virt)
+        }
+        None => None,
+    }
 }
 
 /// Read `bytes` from the running process at `virt`, one page at a time.
@@ -5148,22 +5255,18 @@ pub fn user_frame_at(virt: usize) -> Option<usize> {
     })
 }
 
-/// Whether every page of `virt..virt + len` is still unmapped in the current
+/// Whether every page of `virt..virt + len` is still unclaimed in the current
 /// task's address space.
 ///
 /// This is what decides whether an `mmap` address is a hint worth taking, and
-/// whether a `MAP_FIXED` request has anything to replace.
+/// whether a `MAP_FIXED` request has anything to replace. A page counts as
+/// taken when a VMA covers it even if no frame is there yet: a lazily-mapped
+/// range *is* the process's, and placing a second mapping over it would leave
+/// two VMAs describing one address.
 pub fn user_range_free(virt: usize, len: usize) -> bool {
-    with_table(|t| {
-        let owner = t.space_owner(current());
-        let task = t.task(owner);
-        let Some(space) = task.space.as_ref() else {
-            return false;
-        };
-        (0..len)
-            .step_by(crate::mm::pframe::PAGE_SIZE)
-            .all(|offset| space.phys_for_virt(virt + offset).is_none())
-    })
+    (0..len)
+        .step_by(crate::mm::pframe::PAGE_SIZE)
+        .all(|offset| !user_mapped(virt + offset))
 }
 
 /// Take the mappings covering `virt..virt + len` away from the current task,
@@ -5210,6 +5313,286 @@ pub fn release_user_frames(frames: alloc::vec::Vec<usize>) {
             crate::mm::free_frames(frame, 0);
         }
     });
+}
+
+// --- Virtual memory areas, and the demand paging they make possible ---------
+//
+// A mapping is an *address space*: `mmap` records a VMA and stops, and the page
+// behind an address appears the first time somebody touches it. Both directions
+// that can touch it go through [`populate_in`] - a real `#PF` from ring 3, and
+// a kernel copy that walks the page tables and finds nothing - because the two
+// must give the same answer, and a page that exists for one of them and not the
+// other is a bug with two faces.
+
+/// The process whose address space is rooted at `root`, if any.
+///
+/// A walk of the task table rather than a lookup, and it is deliberate: the
+/// caller has a CR3 value, not a task id, because the two places that need this
+/// (the fault handler, and the clear-tid store the scheduler makes on a dying
+/// thread's behalf) run in contexts where "the current task" is exactly the
+/// thing that is not known. A thread owns no space of its own, so the answer is
+/// the group leader.
+fn owner_of_root(t: &Table, root: usize) -> Option<TaskId> {
+    t.tasks.iter().enumerate().find_map(|(slot, task)| {
+        let space = task.as_ref()?.space.as_ref()?;
+        (space.root() == root).then_some(TaskId(slot))
+    })
+}
+
+/// Bring in the page `virt` names, in the address space `root` names.
+///
+/// This is the one place a lazily-mapped page is created. It looks the VMA up,
+/// checks the access against what the range permits, takes a frame - fresh and
+/// zeroed for anonymous memory, the backing's own page for a frame-backed
+/// mapping - maps it with the range's permissions, and records it as a frame
+/// the group owns so the reaper returns it.
+///
+/// `false` means the address is not the process's to touch: no VMA covers it, or
+/// the range does not permit the access. Every caller turns that into the
+/// refusal it already had - `SIGSEGV` from the fault handler, `EFAULT` from a
+/// kernel copy - so a page that is merely *absent* is distinguishable from one
+/// that is not there at all, and only the former is ever created.
+fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) -> bool {
+    let page = pframe::align_down(virt, PAGE_SIZE);
+    let Some(owner) = owner_of_root(t, root) else {
+        return false;
+    };
+    // Normalised to the group: a thread's slot holds no space, and the frames
+    // belong to the group either way.
+    let owner = t.space_owner(owner);
+    let Some(task) = t.tasks[owner.0].as_mut() else {
+        return false;
+    };
+    let mm = Arc::clone(&task.mm);
+    let Some(space) = task.space.as_mut() else {
+        return false;
+    };
+    let Some(vma) = mm.vma_at(page) else {
+        return false;
+    };
+    if !vma.permits(write) {
+        return false;
+    }
+    let frame = match &vma.kind {
+        VmaKind::Anon => {
+            let Some(frame) = mm::alloc_frames(0) else {
+                return false;
+            };
+            // A page nobody has written reads as zeros - it is a hole in the
+            // program's memory, not whatever the frame's last owner left there.
+            unsafe { core::ptr::write_bytes(mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
+            frame
+        }
+        VmaKind::Frames { inode, offset } => {
+            // The page of the *object* this address corresponds to. The offset
+            // travels with the address through every split (see `mm::vma`), so
+            // this is the same page the eager loop used to map.
+            let index = ((offset + (page - vma.start)) / PAGE_SIZE) as u64;
+            match inode.mmap_frame(index) {
+                Some(frame) => frame,
+                None => return false,
+            }
+        }
+    };
+    let mapped = space
+        .try_map(Mapping {
+            virt: page,
+            phys: frame,
+            length: PAGE_SIZE,
+            flags: vma.prot,
+        })
+        .is_ok();
+    if !mapped {
+        // Somebody is already there. On one core that cannot happen between the
+        // miss and here, but a `PROT_NONE` reserve that was never populated can
+        // still be met, and the frame must go back rather than leak.
+        crate::mm::free_frames(frame, 0);
+        return false;
+    }
+    mm.own(frame);
+    true
+}
+
+/// The `#PF` entry: resolve a fault on a lazily-mapped page, the way
+/// [`resolve_cow_fault`] resolves one on a page a `fork` still shares.
+///
+/// The address space is taken from CR3 rather than from the current task,
+/// because the two can differ - the scheduler writes a dying thread's clear-tid
+/// word after switching the CPU to that thread's tables - and the tables the
+/// fault came through are the ones that decide what the address means.
+pub fn resolve_anon_fault(virt: usize, write: bool) -> bool {
+    let root = paging::active_root();
+    with_table(|t| populate_in(t, root, virt, write))
+}
+
+/// [`resolve_anon_fault`] for an address space named by its root rather than by
+/// whatever CR3 holds: the cross-process half, what `process_vm_readv` and a
+/// tracer's `PTRACE_POKEDATA` reach a lazily-mapped page through.
+pub fn populate_user_page_at(root: usize, virt: usize, write: bool) -> bool {
+    with_table(|t| populate_in(t, root, virt, write))
+}
+
+/// Whether the kernel may treat the *absent* page holding `virt` as one it can
+/// touch, because a VMA backs it and the access is permitted.
+///
+/// `buffer_ok` asks this before a syscall does a raw copy, so a range the
+/// process has legally mapped but not touched is not refused as `EFAULT`. The
+/// answer is restricted to anonymous ranges on purpose: populating one costs
+/// nothing but a frame, while populating a frame-backed page calls into the
+/// node that owns it - and the DRM ioctl path validates a caller's array
+/// *while holding the card's lock*, then writes through it, so a page that
+/// needed the card to answer a fault would be a lock taken twice. A
+/// frame-backed page must be present before the kernel will look at it, which
+/// is the rule the eager mapping this replaces enforced by never leaving one
+/// absent.
+pub fn kernel_lazy_accessible(virt: usize, write: bool) -> bool {
+    let root = paging::active_root();
+    with_table(|t| {
+        let Some(owner) = owner_of_root(t, root) else {
+            return false;
+        };
+        let owner = t.space_owner(owner);
+        match t.task(owner).mm.vma_at(pframe::align_down(virt, PAGE_SIZE)) {
+            Some(vma) => matches!(&vma.kind, VmaKind::Anon) && vma.permits(write),
+            None => false,
+        }
+    })
+}
+
+/// The frame list and VMA table of the current task's group.
+fn current_mm() -> Arc<Mm> {
+    with_table(|t| Arc::clone(&t.task(t.space_owner(t.current)).mm))
+}
+
+/// Record a private anonymous mapping of `virt..virt + len`.
+///
+/// Nothing is allocated: the address space is the whole of the mapping, and the
+/// frames arrive as the program touches them. `flags` is what each page will be
+/// mapped with, and what an access is checked against.
+pub fn map_anon(virt: usize, len: usize, flags: MapFlags) {
+    if len == 0 {
+        return;
+    }
+    current_mm().vma_insert(Vma::new(virt, virt + len, flags, VmaKind::Anon));
+}
+
+/// Record a mapping of `virt..virt + len` backed by `inode`'s own frames,
+/// starting at page `offset` of that object. This is what `memfd`, the
+/// framebuffer and a dma-buf get, and what a shared anonymous mapping is made
+/// of: the pages are the object's, shared by every mapping of it.
+pub fn map_frames(
+    virt: usize,
+    len: usize,
+    flags: MapFlags,
+    inode: Arc<dyn crate::vfs::Inode>,
+    offset: usize,
+) {
+    if len == 0 {
+        return;
+    }
+    current_mm().vma_insert(Vma::new(
+        virt,
+        virt + len,
+        flags,
+        VmaKind::Frames { inode, offset },
+    ));
+}
+
+/// `munmap`'s two halves at once: forget the VMAs covering `virt..virt + len`
+/// and hand back the frames the present pages held.
+///
+/// The order matters. The table goes first, so that a page released here is not
+/// also reachable through a stale VMA - which is what `release_user_frames`
+/// relies on when it asks the group to forget the frame.
+pub fn munmap_user(virt: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = virt.saturating_add(len);
+    current_mm().vma_remove_range(virt, end);
+    release_user_frames(unmap_user(virt, len));
+}
+
+/// `mprotect`'s two halves: the VMAs get the new permissions so that a page
+/// faulted in later comes up with them, and the pages already present are
+/// re-flagged where they lie.
+pub fn protect_user_range(virt: usize, len: usize, flags: MapFlags) {
+    if len == 0 {
+        return;
+    }
+    current_mm().vma_set_prot(virt, virt.saturating_add(len), flags);
+    protect_user(virt, len, flags);
+}
+
+/// Whether an address is the current process's: a page is there, or a VMA says
+/// one belongs there.
+///
+/// The distinction from [`user_frame_at`] is the whole point of demand paging:
+/// a mapping is *claimed* at `mmap` time and *filled* on touch, so "is this
+/// address mapped?" and "is there a frame behind it?" are different questions.
+pub fn user_mapped(virt: usize) -> bool {
+    with_table(|t| {
+        let owner = t.space_owner(t.current);
+        let task = t.task(owner);
+        task.space
+            .as_ref()
+            .and_then(|space| space.phys_for_virt(virt))
+            .is_some()
+            || task.mm.vma_covers(virt)
+    })
+}
+
+/// The permissions the current process has on `virt`, if a VMA covers it.
+///
+/// Used where the *range* decides what a later fault will be allowed to do -
+/// `MADV_DONTNEED` dropping pages that must come back writable, `mremap`
+/// carrying a mapping's permissions with it.
+pub fn vma_prot_at(virt: usize) -> Option<MapFlags> {
+    with_table(|t| {
+        let owner = t.space_owner(t.current);
+        t.task(owner)
+            .mm
+            .vma_at(pframe::align_down(virt, PAGE_SIZE))
+            .map(|vma| vma.prot)
+    })
+}
+
+/// The VMAs covering `virt..virt + len` in the current process, clipped to the
+/// range, with the table left empty there.
+///
+/// `mremap` takes a mapping's backing out of one place and puts it in another,
+/// and the VMAs are what remember which backing that is.
+pub fn take_vmas(virt: usize, len: usize) -> Vec<Vma> {
+    if len == 0 {
+        return Vec::new();
+    }
+    current_mm().vma_take_range(virt, virt.saturating_add(len))
+}
+
+/// The parts of `virt..virt + len` the current process has not already claimed.
+pub fn vma_gaps(virt: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    current_mm().vma_gaps(virt, virt.saturating_add(len))
+}
+
+/// Put a VMA back, backing and all - how `mremap` completes a move.
+pub fn insert_vma(virt: usize, end: usize, flags: MapFlags, kind: VmaKind) {
+    if virt >= end {
+        return;
+    }
+    current_mm().vma_insert(Vma::new(virt, end, flags, kind));
+}
+
+/// Claim `virt..virt + len` for anonymous memory without disturbing what is
+/// already there: the shape a heap growth wants, where a guard page a libc
+/// mapped inside the range must survive.
+pub fn claim_anon_gaps(virt: usize, len: usize, flags: MapFlags) {
+    let mm = current_mm();
+    for (start, end) in mm.vma_gaps(virt, virt.saturating_add(len)) {
+        mm.vma_insert(Vma::new(start, end, flags, VmaKind::Anon));
+    }
 }
 
 /// `brk(addr)` — per-task program break (heap end).
@@ -5260,6 +5643,11 @@ pub fn brk(addr: usize) -> isize {
         }
         let grown_to = task.brk_base + task.brk_pages * PAGE_SIZE;
         if frontier < grown_to {
+            // The description goes with the pages: a heap that shrank is no
+            // longer the process's past the new break, so `munmap`/`madvise`
+            // and a later `fork` must not see it there. The range is the tail
+            // above the break, which is where a `brk` shrink always cuts.
+            task.mm.vma_remove_range(frontier, grown_to);
             let dropped = match task.space.as_mut() {
                 Some(space) => space.unmap(frontier, grown_to - frontier),
                 None => alloc::vec::Vec::new(),
@@ -5306,6 +5694,26 @@ pub fn brk(addr: usize) -> isize {
                 return crate::syscall::err::ENOMEM;
             }
             task.mm.own(frame);
+        }
+
+        // The pages the break grew over become a VMA too, so that `munmap`,
+        // `madvise` and `fork` see one table rather than two - the heap used to
+        // be the one region whose mapping only the page tables knew about.
+        //
+        // Only the *newly* added range is claimed, and only where nothing else
+        // already is: a libc is free to have mapped inside the space the break
+        // is about to grow into - musl's mallocng puts a `PROT_NONE` guard over
+        // the first page of a fresh heap - and that mapping is its own, not the
+        // break's.
+        if frontier > grown_to {
+            for (start, end) in task.mm.vma_gaps(grown_to, frontier) {
+                task.mm.vma_insert(Vma::new(
+                    start,
+                    end,
+                    MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+                    VmaKind::Anon,
+                ));
+            }
         }
 
         task.brk_pages = needed_pages;
@@ -5641,6 +6049,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         parent_mmap_cursor,
         parent_tls,
         parent_pages,
+        parent_vmas,
     ) = with_table(|t| {
         let parent_id = t.current;
         let parent = t.task(parent_id);
@@ -5664,6 +6073,13 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
                 parent_pages.push((virt, phys, flags));
             });
         }
+        // The parent's VMAs come across whole. The child's address space is the
+        // parent's - the same ranges with the same permissions and the same
+        // backing - so a mapping the parent had not touched is one the child has
+        // not touched either, and costs nothing to duplicate. That is what makes
+        // a `fork` of a process with a large untouched `mmap` cheap: only the
+        // *present* pages below are walked at all.
+        let parent_vmas = parent.mm.vma_snapshot();
         (
             parent_id,
             parent_has_space,
@@ -5678,6 +6094,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             parent_mmap_cursor,
             parent_tls,
             parent_pages,
+            parent_vmas,
         )
     });
 
@@ -5776,7 +6193,11 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
                 },
                 ..*state
             }),
-            mm: Mm::new(TaskId(slot), child_root, child_frames),
+            mm: {
+                let mm = Mm::new(TaskId(slot), child_root, child_frames);
+                mm.set_vmas(parent_vmas);
+                mm
+            },
             released: false,
             tgid: TaskId(slot),
             signals: 0,

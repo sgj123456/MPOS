@@ -217,6 +217,27 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         return; // The faulting instruction retries and succeeds.
     }
 
+    // A page of a mapping the process has made but never touched. The order
+    // against the two neighbours is the whole of the reasoning: a *present* page
+    // that is copy-on-write is handled above, so a page reaching here is absent
+    // and a COW split could not have been what it wanted; and the stack is
+    // handled below because a stack fault is a growth the stack's own bounds
+    // decide, over a region with no VMA to find.
+    //
+    // Unlike the COW case this is not gated on the fault being a write. A read
+    // of an address that has never been written is exactly what a demand-paged
+    // mapping is for, and the populate tells the two apart the only way that
+    // matters: the VMA's permissions decide, so a read of a `PROT_NONE` page is
+    // still refused and still a signal.
+    if user_address
+        && crate::sched::resolve_anon_fault(
+            addr,
+            code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+        )
+    {
+        return; // The page is there now; the instruction retries.
+    }
+
     // A push past the end of what the loader mapped is an ordinary thing for a
     // program to do, and Linux answers it by extending the stack. The bounds
     // that make that safe - how far below `rsp`, and how far down in total -

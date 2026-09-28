@@ -7,12 +7,14 @@
 pub mod elf;
 pub mod pframe;
 pub mod vm;
+pub mod vma;
 
 #[cfg(target_os = "none")]
 pub mod heap;
 
 pub use pframe::{Buddy, MAX_ORDER, PAGE_SHIFT, PAGE_SIZE, Pmm};
 pub use vm::{KernelSections, MapFlags, Mapping};
+pub use vma::{Vma, VmaKind, VmaTable};
 
 #[cfg(target_os = "none")]
 use crate::boot::BootInfo;
