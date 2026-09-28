@@ -25,6 +25,7 @@
 //! node waits until fds are per-process (M12), when a shell can open one;
 //! until then nothing user side names this device.
 
+use alloc::borrow::Cow;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -34,8 +35,8 @@ use core::cell::RefCell;
 use critical_section::Mutex;
 
 use super::termios::{
-    ECHO, ECHOCTL, ICANON, ICRNL, IEXTEN, IGNCR, INLCR, ISIG, ISTRIP, IXON, Termios, VEOF, VERASE,
-    VINTR, VKILL, VLNEXT, VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VWERASE,
+    ECHO, ECHOCTL, ICANON, ICRNL, IEXTEN, IGNCR, INLCR, ISIG, ISTRIP, IXON, ONLCR, OPOST, Termios,
+    VEOF, VERASE, VINTR, VKILL, VLNEXT, VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VWERASE,
 };
 use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
@@ -1444,8 +1445,28 @@ impl Tty {
     /// Send bytes to this terminal's wire. Called for echo, for `write(2)`, and
     /// for the answers the line discipline gives a cursor query - so all three
     /// land on the same wire the terminal is attached to.
+    ///
+    /// It is also where output post-processing happens, and for the same
+    /// reason: this is the one place every byte the terminal *says* passes
+    /// through, whichever of the three produced it. `OPOST|ONLCR` turn a line
+    /// feed into carriage-return-line feed, which is the difference between a
+    /// terminal and a printer - see [`Termios::console_default`] for why this
+    /// kernel used not to.
     fn write_out(&self, bytes: &[u8]) {
         let output = critical_section::with(|cs| *self.output.borrow(cs).borrow());
+        let oflag = critical_section::with(|cs| self.ld.borrow(cs).borrow().termios().oflag);
+        // The rest of the output flags - `OCRNL`, `ONOCR`, `ONLRET`, `OLCUC`,
+        // tab expansion - are off in every default and in what a shell sets,
+        // and each is a rule about a printer or a different line discipline.
+        // Honouring this one is what a screen needs; the others would be
+        // inventions until something asked for them.
+        let processed: Cow<[u8]> =
+            if oflag & OPOST != 0 && oflag & ONLCR != 0 && bytes.contains(&LF) {
+                Cow::Owned(newline_expanded(bytes))
+            } else {
+                Cow::Borrowed(bytes)
+            };
+        let bytes: &[u8] = &processed;
         #[cfg(target_os = "none")]
         match output {
             TtyOutput::Serial => crate::console::write_bytes(bytes),
@@ -1619,6 +1640,24 @@ impl Tty {
             }
         }
     }
+}
+
+/// `ONLCR`: every line feed goes out as carriage return followed by line feed.
+///
+/// The carriage return is *inserted*, not appended: it is what puts the cursor
+/// back in column zero before the line feed moves it down, which is the whole
+/// difference between starting a new line and stepping to the right. A `\r` the
+/// program sent itself is left alone - `OCRNL` is the flag that would rewrite
+/// one, and nothing sets it.
+fn newline_expanded(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.iter().filter(|&&b| b == LF).count());
+    for &byte in bytes {
+        if byte == LF {
+            out.push(CR);
+        }
+        out.push(byte);
+    }
+    out
 }
 
 /// The machine's own terminal: the console - `ttyS0` on COM1, where every

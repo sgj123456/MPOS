@@ -4,10 +4,14 @@
 //! Pinned here: opening `/dev/ptmx` mints a *new* pair and hands back its
 //! master; `TIOCGPTN` on the master names the number the slave appears under
 //! in `/dev/pts`; `TIOCSPTLCK` with zero is `unlockpt`, and before it a
-//! master still answers. The master is a byte channel, not a terminal - its
-//! `TCGETS` answers ENOTTY, the slave's succeeds. Bytes written at the master
-//! are typed at the slave's line discipline (canonical mode, so `hi\r` reads
-//! back as `hi\n`), and what the slave prints is read at the master. The
+//! master still answers. A pair is *one* terminal with two ends, so the
+//! terminal ioctls answer on both - the master included, which is how a
+//! supervisor that holds nothing else decides it can do job control. Bytes
+//! written at the master are typed at the slave's line discipline (canonical
+//! mode, so `hi\r` reads back as `hi\n`), and what the slave prints is read at
+//! the master - through the output post-processing a terminal owes its
+//! emulator, so a printed newline arrives as carriage return and line feed
+//! rather than as the line feed that would staircase every line of it. The
 //! *window* is the pair's too - `TIOCSWINSZ` on the master is what
 //! `TIOCGWINSZ` on the slave reports, which is how an emulator sizes the
 //! programs inside it.
@@ -191,14 +195,26 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // Slave to master: what the slave prints is what the master reads. The
     // echo of the typed line is in the master's queue ahead of it, so that
-    // goes down the drain first.
+    // goes down the drain first. It is four bytes and not three: the echo of
+    // Enter is a line feed, and the terminal driver owes a *terminal* a
+    // carriage return with it (`ONLCR`, on in the default termios) - a bare
+    // line feed would leave the emulator's cursor where the line ended and
+    // every line after it would start one column further right.
     let got = lin::read(master, unsafe { &mut *core::ptr::addr_of_mut!(ECHO) });
     lin::check_eq(
         &mut failed,
         b"the typed line's echo reached the master",
         got,
-        3,
+        4,
     );
+    unsafe {
+        let echo: [u8; 4] = core::ptr::read(core::ptr::addr_of!(ECHO).cast());
+        lin::check_true(
+            &mut failed,
+            b"the echo of Enter carries carriage return and line feed",
+            &echo == b"hi\r\n",
+        );
+    }
     let r = lin::write(slave, b"out\n");
     lin::check_eq(&mut failed, b"the slave write is taken whole", r, 4);
     let got = lin::read(master, unsafe {
@@ -208,14 +224,14 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         &mut failed,
         b"the master read sees the slave's bytes",
         got,
-        4,
+        5,
     );
     unsafe {
-        let line: [u8; 4] = core::ptr::read(core::ptr::addr_of!(SLAVE_TO_MASTER).cast());
+        let line: [u8; 5] = core::ptr::read(core::ptr::addr_of!(SLAVE_TO_MASTER).cast());
         lin::check_true(
             &mut failed,
-            b"the bytes are the ones printed",
-            &line == b"out\n",
+            b"the printed newline arrives as carriage return and line feed",
+            &line == b"out\r\n",
         );
     }
 

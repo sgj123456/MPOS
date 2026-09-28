@@ -606,6 +606,7 @@ mod tests {
 
     use super::{Ptmx, PtyMaster, PtySlave, allocate, lookup, open_count, pairs};
     use crate::vfs::Inode;
+    use crate::vfs::termios::{ONLCR, OPOST};
 
     fn drain_master(pty: &super::Pty) -> Vec<u8> {
         let mut out = Vec::new();
@@ -619,9 +620,13 @@ mod tests {
     fn a_slave_line_arrives_whole_at_the_master() {
         let pty = allocate(900, (136, 900));
         // A shell writes a line through its slave's write path; the master
-        // reads back exactly those bytes.
+        // reads back those bytes with the newline a *terminal* owes its reader:
+        // `ONLCR` is on in the default termios, so the program's `LF` leaves as
+        // `CR LF`. A bare `LF` would move the emulator's cursor down without
+        // returning it, and every line after the first would start in the
+        // column the last one ended in - the staircase weston-terminal showed.
         assert_eq!(pty.slave().write_at(0, b"echo hi\n").unwrap(), 8);
-        assert_eq!(&drain_master(&pty), b"echo hi\n");
+        assert_eq!(&drain_master(&pty), b"echo hi\r\n");
 
         // The other direction: bytes typed at the master are typed at the
         // slave's line discipline. What the master sees back is the *echo* -
@@ -630,10 +635,26 @@ mod tests {
         for &b in b"ls\r" {
             pty.slave().receive_byte(b);
         }
-        assert_eq!(&drain_master(&pty), b"ls\n");
+        assert_eq!(&drain_master(&pty), b"ls\r\n");
         let mut buf = [0u8; 8];
         let n = pty.slave().take_ready(&mut buf).unwrap();
+        // Input is a different road from output: the reader gets the line with
+        // one newline, because the carriage return Enter sends was translated
+        // *in* (`ICRNL`) and never became a character of its own.
         assert_eq!(&buf[..n], b"ls\n");
+    }
+
+    #[test]
+    fn a_program_may_turn_the_newline_translation_off() {
+        let pty = allocate(904, (136, 904));
+        // A full-screen program puts its terminal in raw mode and draws every
+        // cell itself: it must get out exactly what it wrote, cursor control
+        // included, with nothing rewritten behind its back.
+        let mut tio = pty.slave().termios();
+        tio.oflag &= !(OPOST | ONLCR);
+        pty.slave().set_termios(tio);
+        assert_eq!(pty.slave().write_at(0, b"line\n").unwrap(), 5);
+        assert_eq!(&drain_master(&pty), b"line\n");
     }
 
     #[test]

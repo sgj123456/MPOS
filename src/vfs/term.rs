@@ -223,9 +223,12 @@ impl Grid {
         match b {
             0x1b => self.state = State::Esc,
             // A console treats a line feed as "start of the next line" - CR and
-            // LF together - the way the tty's ONLCR did on the serial wire. The
-            // guest writes bare `\n`; without the home here every line would
-            // keep the previous column and staircase rightward.
+            // LF together - because that is what a screen does with it: the
+            // cursor goes home *and* down. The tty's `ONLCR` asks the wire for
+            // the same thing, but the kernel console never goes through a tty -
+            // `console::write_bytes` prints straight at this grid - so the rule
+            // is kept here as well, for the bare `\n` the boot log and a
+            // driver's own prints still carry.
             b'\n' | 0x0b | 0x0c => {
                 self.col = 0;
                 self.line_feed();

@@ -91,11 +91,28 @@ pub struct Termios {
 
 impl Termios {
     /// What a console is set to before anyone asks for anything else: line by
-    /// line, echoed, interruptible, Enter arriving as a newline.
+    /// line, echoed, interruptible, Enter arriving as a newline - and output
+    /// post-processed, which is what makes a newline *mean* a new line.
     ///
-    /// `OPOST`/`ONLCR` are deliberately *not* set. The bytes a task writes go
-    /// straight out to a host terminal that is already doing its own newline
-    /// translation; adding ours would make every line end in `\r\r\n`.
+    /// `OPOST|ONLCR` are Linux's own default (`tty_std_termios`), and they are
+    /// the pair a terminal cannot do without. A screen is a *column* as well as
+    /// a cursor: a bare `LF` moves down and leaves the carriage where it was,
+    /// so each line starts where the last one ended and the text staircases to
+    /// the right - one column of indent per line, which is exactly how it
+    /// reads. Something has to turn a program's `\n` into `\r\n`, and the
+    /// terminal driver is the only thing in a position to: the other end of a
+    /// `/dev/pts` pair is a *terminal emulator*, which by definition does no
+    /// translation of its own.
+    ///
+    /// These used to be off, and the reasoning is worth writing down because it
+    /// is right about one case and wrong about the rest. The bytes a task
+    /// writes on the *serial* console do reach a host that translates: QEMU
+    /// writes the guest's `LF` to its own stdout, which is a host pty, and the
+    /// host's line discipline turns it into `CR LF` before the host terminal
+    /// emulator sees it. So the serial console looked correct without them -
+    /// because a different machine's terminal driver was doing this kernel's
+    /// job. Inside the guest there is no host in the path, and a compositor's
+    /// terminal shows the staircase.
     pub const fn console_default() -> Termios {
         let mut cc = [0u8; NCCS];
         cc[VINTR] = 0x03; // ^C
@@ -113,7 +130,7 @@ impl Termios {
         cc[VTIME] = 0;
         Termios {
             iflag: ICRNL | IXON | BRKINT | IMAXBEL | IUTF8,
-            oflag: 0,
+            oflag: OPOST | ONLCR,
             cflag: CS8 | CREAD | B38400,
             lflag: ISIG | ICANON | IEXTEN | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE,
             line: 0,
