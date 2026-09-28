@@ -182,6 +182,24 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
         condition. `poll`, `select` and `epoll` report the pair whether or not
         the caller asked for them, which is Linux's rule and sometimes the only
         report a parked waiter will ever get (§1.1, `t-epoll` pins the shape)
+  - [x] **and the read itself had to stop parking** - the fourth gap, and the one
+        the other three hid. `libinput` opens every evdev node with `O_NONBLOCK`
+        and pumps it from `epoll`; this node's read never looked at the flag, so
+        the first read with an empty record window parked on the service task's
+        wakeup list. weston therefore created `event0`, logged it as a keyboard,
+        and then stopped - no pointer, no failure, its event loop gone with
+        nobody left to answer the input it was waiting for. `EAGAIN` is what
+        Linux answers there and what libinput's loop is built around; the bit is
+        mirrored into the node by the same `sync_nonblocking` every other
+        blocking node here is told by, so nothing invented a second route for it
+        (043c9c6). **Verified on the desktop image in the mode weston actually
+        runs in** (`cargo xtask run --mode weston`; the kernel console is off the
+        scanout, so the serial line is trustworthy as well as readable): one run
+        logs `event0 - QEMU Virtio Keyboard: is tagged by udev as: Keyboard ...
+        device is a keyboard`, `event1 - QEMU Virtio Tablet: is tagged by udev
+        as: Mouse ... device is a pointer`, `libinput: configuring device` for
+        both, and both associated with output `Virtual-1` - where before it was
+        `failed to create input device` twice and `no input devices found`
   - [ ] `SOCK_SEQPACKET` still carries no boundaries over a *named* socket (the
         stream this family has), which is the one documented divergence left on
         the path from `udevadm` to a tagged device node
