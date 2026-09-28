@@ -54,6 +54,15 @@ pub fn spawn_service() {
         || loop {
             input::service();
             crate::net::vsock::service();
+            // The host's own events for the display. A window resize or a
+            // fullscreen toggle arrives as `VIRTIO_GPU_EVENT_DISPLAY` in the
+            // GPU's device configuration, and one word read a tick is what
+            // notices it - the same cheap poll as the two above, and the
+            // reason a display resize needs no interrupt. The *size* is not
+            // read here: the render task owns the device and does the rebuild.
+            if crate::drivers::video::render::running() && gpu::take_display_event() {
+                crate::drivers::video::render::request_resize();
+            }
             crate::sched::sleep_ticks(1);
         },
         crate::sched::Priority::NORMAL,

@@ -3692,13 +3692,18 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             if !buffer_ok(buf, FB_FIX_SIZE, true, from_user) {
                 return err::EFAULT;
             }
-            let (width, _) = fb.dims();
+            // One snapshot of the scanout, so the address and the length it
+            // answers with are the same buffer's: a resize between the two
+            // would hand a program a mapping length that belongs to another
+            // screen.
+            let scanout = fb.scanout();
+            let width = scanout.width;
             unsafe {
                 core::ptr::write_bytes(buf as *mut u8, 0, FB_FIX_SIZE);
                 let bytes = b"virtio-gpu";
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
-                ((buf + 16) as *mut u64).write_unaligned(fb.fb_phys() as u64); // smem_start
-                ((buf + 24) as *mut u32).write_unaligned(fb.fb_len() as u32); // smem_len
+                ((buf + 16) as *mut u64).write_unaligned(scanout.fb_phys as u64); // smem_start
+                ((buf + 24) as *mut u32).write_unaligned(scanout.fb_len as u32); // smem_len
                 ((buf + 28) as *mut u32).write_unaligned(0); // type: packed pixels
                 ((buf + 36) as *mut u32).write_unaligned(2); // visual: truecolor
                 ((buf + 48) as *mut u32).write_unaligned(width * 4); // line_length

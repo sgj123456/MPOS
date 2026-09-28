@@ -25,6 +25,7 @@
 
 use alloc::sync::Arc;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use critical_section::Mutex;
 use virtio_drivers::device::gpu::VirtIOGpu;
@@ -42,13 +43,40 @@ const DEVICE_GPU: &[u16] = &[0x1050];
 /// program understands, and the one a display would show if it were there.
 const FALLBACK: (u32, u32) = (1024, 768);
 
+/// The scanout's geometry, read and written as one value.
+///
+/// One value rather than four fields, because callers do not use them one at a
+/// time: a compositor's flip takes the width and the buffer address together and
+/// copies rows into the block the address names using the pitch the width
+/// implies. Read separately across a resize, the two can be a pair that never
+/// existed - the width of one screen with the address of another - and a
+/// *shrinking* screen makes that an out-of-bounds write, not a wrong pixel. The
+/// lock is the same `critical_section::Mutex<RefCell<_>>` every other piece of
+/// shared state here uses, so reading it is one interrupt-off section.
+#[derive(Clone, Copy)]
+pub struct Scanout {
+    pub width: u32,
+    pub height: u32,
+    /// Where the pixel buffer lives, as the device addresses it. The direct map
+    /// turns it back into a pointer the kernel can copy through.
+    pub fb_phys: usize,
+    /// The buffer's length in bytes.
+    pub fb_len: usize,
+}
+
 pub struct VirtioGpuDev {
-    width: u32,
-    height: u32,
-    /// Where the pixel buffer lives, as the device addresses it. The direct
-    /// map turns it back into a pointer the kernel can copy through.
-    fb_phys: usize,
-    fb_len: usize,
+    /// The scanout, as the device was last set up with it. Not a constant: the
+    /// host can ask for a different size at any time - a QEMU window resize or a
+    /// fullscreen toggle is exactly that - and the driver follows by rebuilding
+    /// the resource ([`VirtioGpuDev::resized`], and the resize step in
+    /// `drivers::video::render`).
+    scanout: Mutex<RefCell<Scanout>>,
+    /// Whether userland has ever mapped the pixels. A resize would like to
+    /// hand the old block back to the allocator, and must not while a mapping
+    /// of it may still exist: a program writing through a mapping that stopped
+    /// being the screen would be writing into whatever the allocator gave
+    /// those frames to next.
+    mapped: AtomicBool,
 }
 
 impl VirtioGpuDev {
@@ -59,11 +87,14 @@ impl VirtioGpuDev {
     /// the buffer, so a reader past the end sees end of input rather than
     /// whatever the device's DMA block happens to neighbor.
     fn read(&self, offset: u64, buf: &mut [u8]) -> usize {
-        let at = (offset as usize).min(self.fb_len);
-        let len = buf.len().min(self.fb_len - at);
+        let Scanout {
+            fb_phys, fb_len, ..
+        } = self.scanout();
+        let at = (offset as usize).min(fb_len);
+        let len = buf.len().min(fb_len - at);
         unsafe {
             core::ptr::copy_nonoverlapping(
-                (mm::phys_to_virt(self.fb_phys) + at) as *const u8,
+                (mm::phys_to_virt(fb_phys) + at) as *const u8,
                 buf.as_mut_ptr(),
                 len,
             );
@@ -76,12 +107,15 @@ impl VirtioGpuDev {
     /// same contract a write-through disk keeps. The device itself is owned by
     /// the render task, so this asks that task to flush and parks until it has.
     fn write(&self, offset: u64, buf: &[u8]) -> usize {
-        let at = (offset as usize).min(self.fb_len);
-        let len = buf.len().min(self.fb_len - at);
+        let Scanout {
+            fb_phys, fb_len, ..
+        } = self.scanout();
+        let at = (offset as usize).min(fb_len);
+        let len = buf.len().min(fb_len - at);
         critical_section::with(|_| unsafe {
             core::ptr::copy_nonoverlapping(
                 buf.as_ptr(),
-                (mm::phys_to_virt(self.fb_phys) + at) as *mut u8,
+                (mm::phys_to_virt(fb_phys) + at) as *mut u8,
                 len,
             );
         });
@@ -92,23 +126,56 @@ impl VirtioGpuDev {
         len
     }
 
-    /// The resolution the framebuffer was built at - what
-    /// `FBIOGET_VSCREENLINFO` reports and what a program drawing rows needs.
+    /// The scanout as it is now: geometry and block together.
+    ///
+    /// A caller that needs two of these numbers must take them from *one*
+    /// snapshot - see [`Scanout`] for the write that reading them separately
+    /// would allow.
+    pub fn scanout(&self) -> Scanout {
+        critical_section::with(|cs| *self.scanout.borrow(cs).borrow())
+    }
+
+    /// The resolution the framebuffer is driving - what `FBIOGET_VSCREENLINFO`
+    /// reports and what a program drawing rows needs.
+    ///
+    /// It is the *current* one, which a resize can change under a caller: the
+    /// value is read here rather than assumed to hold, so a program that asks
+    /// again gets the screen that is actually being driven.
     pub fn dims(&self) -> (u32, u32) {
-        (self.width, self.height)
+        let scanout = self.scanout();
+        (scanout.width, scanout.height)
     }
 
     /// The size of the pixel buffer in bytes - `smem_len` in
     /// `fb_fix_screeninfo` terms.
     pub fn fb_len(&self) -> usize {
-        self.fb_len
+        self.scanout().fb_len
     }
 
     /// The physical address of the buffer - what `fb_fix_screeninfo` calls
     /// `smem_start`, and what the pin below keeps out of the allocator's
     /// hands once userland holds a mapping of it.
     pub fn fb_phys(&self) -> usize {
-        self.fb_phys
+        self.scanout().fb_phys
+    }
+
+    /// Whether userland ever mapped the pixels - asked before a resize returns
+    /// the old block to the allocator (see the `mapped` field).
+    pub fn mapped(&self) -> bool {
+        self.mapped.load(Ordering::Relaxed)
+    }
+
+    /// A new scanout: the geometry and the block it lives in, as
+    /// `drivers::video::render` set them up after a resize.
+    pub fn resized(&self, width: u32, height: u32, fb_phys: usize, fb_len: usize) {
+        critical_section::with(|cs| {
+            *self.scanout.borrow(cs).borrow_mut() = Scanout {
+                width,
+                height,
+                fb_phys,
+                fb_len,
+            };
+        });
     }
 
     /// Probe the PCI bus and bring up the first virtio-gpu device: ask the
@@ -119,6 +186,13 @@ impl VirtioGpuDev {
     /// the device itself, moved out - the render task is its sole owner, and
     /// the only thing that may call `flush` on it.
     pub fn init() -> Option<(Arc<Self>, VirtIOGpu<HalImpl, PciTransport>)> {
+        // The window the host reports its own events in, taken now because the
+        // transport that could name it is consumed below. Without it the
+        // display size is whatever it was at boot, for good.
+        if let Some(config) = super::hal::device_config(DEVICE_GPU) {
+            CONFIG.store(config, Ordering::Relaxed);
+        }
+
         let mut device = VirtIOGpu::<HalImpl, _>::new(transport(DEVICE_GPU)?).ok()?;
 
         let dims = match device.resolution() {
@@ -132,10 +206,13 @@ impl VirtioGpuDev {
         let pages = fb_len.div_ceil(PAGE_SIZE);
 
         let dev = Arc::new(VirtioGpuDev {
-            width: dims.0,
-            height: dims.1,
-            fb_phys,
-            fb_len,
+            scanout: Mutex::new(RefCell::new(Scanout {
+                width: dims.0,
+                height: dims.1,
+                fb_phys,
+                fb_len,
+            })),
+            mapped: AtomicBool::new(false),
         });
 
         // The pages now have more than one kind of owner: the device DMAes
@@ -148,6 +225,40 @@ impl VirtioGpuDev {
 
         Some((dev, device))
     }
+}
+
+/// Where the device's own configuration lives, as an MMIO address: the window
+/// holding `events_read` and `events_clear`. Zero when the machine has no GPU,
+/// which is the same as "nothing to poll".
+static CONFIG: AtomicUsize = AtomicUsize::new(0);
+
+/// `VIRTIO_GPU_EVENT_DISPLAY`: bit 0 of `events_read`, set by the host when the
+/// display it wants this machine to drive changed shape.
+const EVENT_DISPLAY: u32 = 1;
+
+/// Whether the host has asked for a different display since the last look,
+/// taking the event out of `events_read` as it answers.
+///
+/// This is where a window resize enters the kernel, and it is a plain read of
+/// the device configuration rather than a control-queue round trip: the host
+/// sets the bit and raises a config-change interrupt, and a kernel that polls -
+/// this one does - reads the bit instead of taking the interrupt. What the size
+/// actually *is* is a `GET_DISPLAY_INFO` command, and that is only worth
+/// spending once this says there is a reason to.
+pub fn take_display_event() -> bool {
+    let at = CONFIG.load(Ordering::Relaxed);
+    if at == 0 {
+        return false;
+    }
+    let events = unsafe { (at as *const u32).read_volatile() };
+    if events & EVENT_DISPLAY == 0 {
+        return false;
+    }
+    // `events_clear` is the word after `events_read`, and writing the bit back
+    // is the acknowledgement: a bit left set would ask the same question on
+    // every tick.
+    unsafe { (at as *mut u32).add(1).write_volatile(EVENT_DISPLAY) };
+    true
 }
 
 /// The device the boot found, if it found one - the buffer view only. The
@@ -194,6 +305,13 @@ impl FbDev {
     pub fn fb_phys(&self) -> usize {
         self.0.fb_phys()
     }
+
+    /// The scanout as it is now, for a caller that needs more than one of its
+    /// numbers to agree - `FBIOGET_FSCREENINFO` reports the address *and* the
+    /// length of the buffer in one struct.
+    pub fn scanout(&self) -> Scanout {
+        self.0.scanout()
+    }
 }
 
 impl Inode for FbDev {
@@ -201,7 +319,7 @@ impl Inode for FbDev {
         Metadata {
             ino: 0x9001,
             kind: NodeKind::CharDev,
-            size: self.0.fb_len as u64,
+            size: self.0.fb_len() as u64,
         }
     }
 
@@ -222,10 +340,20 @@ impl Inode for FbDev {
     /// The `index`-th page of the framebuffer, as a physical address
     /// `mmap` can map. Frames reach userland through here, which is why
     /// the device pinned them at boot.
+    ///
+    /// The mapping is recorded as taken: a resize may not return the block it
+    /// was made from to the allocator while it exists (see
+    /// [`VirtioGpuDev::resized`] and the `mapped` field).
     fn mmap_frame(&self, index: u64) -> Option<usize> {
         let index = index as usize;
-        let pages = self.0.fb_len.div_ceil(PAGE_SIZE);
-        (index < pages).then(|| self.0.fb_phys + index * PAGE_SIZE)
+        let Scanout {
+            fb_phys, fb_len, ..
+        } = self.0.scanout();
+        let pages = fb_len.div_ceil(PAGE_SIZE);
+        (index < pages).then(|| {
+            self.0.mapped.store(true, Ordering::Relaxed);
+            fb_phys + index * PAGE_SIZE
+        })
     }
 
     /// The framebuffer is the page itself: a mapping of it is the scanout, so

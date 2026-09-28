@@ -65,11 +65,29 @@ static PRESENT_ONLY: AtomicBool = AtomicBool::new(false);
 /// and the task clears it when it repaints.
 static DIRTY: AtomicBool = AtomicBool::new(false);
 
+/// The host asked for a different display size. Set by the virtio service task,
+/// which is what polls the GPU's device configuration for the host's event (see
+/// `virtio::gpu::take_display_event`), and taken by the render task, which is
+/// the only context that may touch the device.
+static RESIZE: AtomicBool = AtomicBool::new(false);
+
 /// Nudge the render task to repaint soon. Called after any byte is painted into
 /// a grid. Cheap and safe from any context (a keystroke's echo runs from the
 /// interrupt handler): it only sets a flag and wakes the task.
 pub fn notify() {
     DIRTY.store(true, Ordering::Relaxed);
+    wake_task();
+}
+
+/// Tell the render task the host wants the display at a different size.
+///
+/// Called by the virtio service task, which notices the host's event while
+/// polling; *doing* something about it is the render task's because it owns the
+/// device and is the only caller of `flush`. The task re-reads the size itself,
+/// so a burst of events - a window drag sends one per motion event - costs one
+/// rebuild per frame rather than one per event.
+pub fn request_resize() {
+    RESIZE.store(true, Ordering::Relaxed);
     wake_task();
 }
 
@@ -133,17 +151,15 @@ fn task() {
         return;
     };
 
-    let (fb_w, fb_h) = {
-        let (w, h) = view.dims();
-        (w as usize, h as usize)
-    };
-    let fb_phys = view.fb_phys();
-    let fb_len = view.fb_len();
+    let mut fb_w = view.dims().0 as usize;
+    let mut fb_h = view.dims().1 as usize;
+    let mut fb_phys = view.fb_phys();
+    let mut fb_len = view.fb_len();
 
     // Fill the whole scanout: a 1280x800 display at 8x16 is 160x50 cells, so
     // the text uses the window instead of a small corner of it.
-    let rows = (fb_h / CELL_H).clamp(1, MAX_ROWS);
-    let cols = (fb_w / CELL_W).max(1);
+    let mut rows = (fb_h / CELL_H).clamp(1, MAX_ROWS);
+    let mut cols = (fb_w / CELL_W).max(1);
 
     // One screen per virtual console, so switching preserves each one's
     // contents - something the single shared wire could never do. Index `n`
@@ -177,7 +193,9 @@ fn task() {
         // not on the next beat - or when a writer asks for a frame it has
         // already put in the buffer. An idle machine does neither, and this
         // wait has no deadline, so an idle console really does cost nothing.
-        crate::sched::block_until(|| DIRTY.load(Ordering::Relaxed) || pending());
+        crate::sched::block_until(|| {
+            DIRTY.load(Ordering::Relaxed) || pending() || RESIZE.load(Ordering::Relaxed)
+        });
         DIRTY.store(false, Ordering::Relaxed);
 
         // The beat coalesces *repaints*, not *requests*. A repaint is work
@@ -190,6 +208,26 @@ fn task() {
             crate::sched::sleep_ticks(FRAME_TICKS - (now - last_paint));
         }
         last_paint = crate::arch::timer::ticks();
+
+        // The host asking for a different display, taken before the paint so
+        // that this frame already uses the new geometry - and after the beat,
+        // because the beat is what turns a drag's stream of events into one
+        // rebuild per frame (the task re-reads the size, so every event after
+        // the first of a frame finds nothing left to do).
+        if RESIZE.swap(false, Ordering::Relaxed)
+            && let Some((width, height)) = resize(&mut device, &view, present_only)
+        {
+            fb_w = width as usize;
+            fb_h = height as usize;
+            fb_phys = view.fb_phys();
+            fb_len = view.fb_len();
+            rows = (fb_h / CELL_H).clamp(1, MAX_ROWS);
+            cols = (fb_w / CELL_W).max(1);
+            scratch = vec![blank; rows * cols];
+            // Whatever was on the screen belongs to the old one: paint the
+            // whole grid rather than the rows that changed since.
+            last_shown = 0;
+        }
 
         // Copy the changed screen's cells under the lock (a fixed memcpy), then
         // paint from the copy with the clock live. The flush is outside both.
@@ -253,6 +291,181 @@ fn task() {
             }
         }
     }
+}
+
+/// Rebuild the scanout at the size the host now wants, and tell the rest of
+/// the machine that the display changed.
+///
+/// This is where a QEMU window resize turns into a screen of the same size. The
+/// host keeps the size it wants in the GPU's own device configuration, and asks
+/// for it with an event the service task polls; what it actually *is* comes from
+/// `GET_DISPLAY_INFO`, and it can differ from what the machine is driving in
+/// either direction (a fullscreen toggle asks for a *smaller* size, too).
+///
+/// `None` means the geometry did not change: the host reports a zero-pixel
+/// display when it has none attached (a headless QEMU answers every query with
+/// nothing, which is not a request for an empty screen), QEMU sends the event
+/// for a window *move* as well as a resize, and a size the host refuses leaves
+/// the screen it had. The first two are no-ops, and the third rebuilds what was
+/// there and says so - in every case the next event may try again.
+fn resize(
+    device: &mut VirtIOGpu<HalImpl, PciTransport>,
+    view: &Arc<VirtioGpuDev>,
+    present_only: bool,
+) -> Option<(u32, u32)> {
+    let (width, height) = match device.resolution() {
+        Ok((width, height)) if width > 0 && height > 0 => (width, height),
+        _ => return None,
+    };
+    let (old_w, old_h) = view.dims();
+    if (width, height) == (old_w, old_h) {
+        return None;
+    }
+    let old_phys = view.fb_phys();
+    let old_len = view.fb_len();
+
+    // The old block is *still pinned* as the crate tears the resource down, and
+    // that is on purpose: `dma_dealloc` refuses a pinned range, so the frames the
+    // old screen was drawn from are still ours to read below. What was on the
+    // screen goes back on it in the same call - a resize that blanked the window
+    // until the compositor happened to repaint would be worse than the corner it
+    // is fixing.
+    let slice = match device.change_resolution(width, height) {
+        Ok(slice) => slice,
+        Err(_) => {
+            // The host refused the new size - and asking tore the old scanout
+            // down, so the machine has no screen at all until one is built. Put
+            // the size it had back, which at least leaves the machine as it was:
+            // the block the old screen lived in is left pinned and unused rather
+            // than handed to the allocator while it may still be readable, so
+            // the price of a refused resize is one leaked screen.
+            let Ok(slice) = device.change_resolution(old_w, old_h) else {
+                return None;
+            };
+            let (fb_len, fb_phys) = adopt(slice, old_w, old_h, old_phys, old_w, old_h, old_len);
+            view.resized(old_w, old_h, fb_phys, fb_len);
+            crate::println!("virtio-gpu: {width}x{height} refused; staying at {old_w}x{old_h}");
+            return None;
+        }
+    };
+    let (fb_len, fb_phys) = adopt(slice, width, height, old_phys, old_w, old_h, old_len);
+
+    // The old block is the allocator's again - unless userland has mapped the
+    // pixels, because then a mapping exists that would go on writing into frames
+    // the allocator is free to hand to someone else.
+    if !view.mapped() {
+        mm::unpin_frames(old_phys, old_len);
+        mm::free_frames(old_phys, order_of(old_len));
+    }
+
+    view.resized(width, height, fb_phys, fb_len);
+
+    if !present_only {
+        // The console owns the screen and its grid *is* the screen's size, so
+        // the grids are rebuilt - at the *new* cell count, computed here rather
+        // than passed in, because that is the point - and the boot log replayed
+        // onto the one being shown. A resize costs the scrollback, which is the
+        // honest price: the other virtual consoles' contents are not kept
+        // anywhere but in their own grids.
+        let rows = (height as usize / CELL_H).clamp(1, MAX_ROWS);
+        let cols = (width as usize / CELL_W).max(1);
+        for vc in 1..=VC_COUNT as usize {
+            term::make_screen(vc, rows, cols);
+        }
+        crate::console::takeover();
+    }
+
+    // Whoever owns the scanout has to be *told*: a compositor takes its mode
+    // from the connector, and a mode change it is not told about is a mode it
+    // never sets - which is exactly the bug this whole path exists for. Linux
+    // announces it as a DRM hotplug uevent, and that is what this publishes.
+    crate::drivers::drm::display_changed();
+
+    // Said out loud, like the boot's own `virtio-gpu: WxH at /dev/fb0` line and
+    // for the same reason: the size of the screen is the first thing anyone
+    // debugging a display wants to know, and it just changed under them. After
+    // the grids are rebuilt, so the line lands on the screen that exists now.
+    crate::println!(
+        "virtio-gpu: display {old_w}x{old_h} -> {width}x{height}, {} KiB at /dev/fb0",
+        fb_len / 1024
+    );
+    Some((width, height))
+}
+
+/// Take a freshly created scanout into service: pin its frames, put what was on
+/// the old screen onto it, and hand back the block's length and address for
+/// [`VirtioGpuDev::resized`].
+///
+/// Both the resize and its failure path do exactly these three things, differing
+/// only in the sizes they name, which is why they are one function.
+fn adopt(
+    slice: &mut [u8],
+    width: u32,
+    height: u32,
+    old_phys: usize,
+    old_w: u32,
+    old_h: u32,
+    old_len: usize,
+) -> (usize, usize) {
+    let fb_len = slice.len();
+    let fb_phys = mm::virt_to_phys(slice.as_ptr() as usize);
+    mm::pin_frames(fb_phys, fb_len.div_ceil(mm::PAGE_SIZE) * mm::PAGE_SIZE);
+    restore(
+        slice,
+        width as usize,
+        height as usize,
+        old_phys,
+        old_w as usize,
+        old_h as usize,
+        old_len,
+    );
+    (fb_len, fb_phys)
+}
+
+/// Put what was on the old scanout back on the new one: the rectangle the two
+/// share, row by row.
+///
+/// Row by row because the two buffers have different pitches - each is its own
+/// width times four bytes - so a whole-buffer copy would smear every row after
+/// the first. `old` is the block the crate has just released and has not yet
+/// handed back (see the caller): the frames are still readable, and the range
+/// is exactly `old_phys .. old_phys + old_len`.
+fn restore(
+    new: &mut [u8],
+    new_w: usize,
+    new_h: usize,
+    old_phys: usize,
+    old_w: usize,
+    old_h: usize,
+    old_len: usize,
+) {
+    if new_w == 0 || old_w == 0 {
+        return;
+    }
+    // SAFETY: `old_phys` is the framebuffer the device was driving until this
+    // call, pinned for the machine's life and not yet returned to the allocator,
+    // so the direct map reaches all of `old_len` bytes of it.
+    let old =
+        unsafe { core::slice::from_raw_parts(mm::phys_to_virt(old_phys) as *const u8, old_len) };
+    let rows = old_h.min(new_h);
+    let bytes = old_w.min(new_w) * 4;
+    for y in 0..rows {
+        let (src, dst) = (y * old_w * 4, y * new_w * 4);
+        new[dst..dst + bytes].copy_from_slice(&old[src..src + bytes]);
+    }
+}
+
+/// The buddy order `HalImpl::dma_alloc` gave a block of `len` bytes: its page
+/// count rounded up to a power of two.
+///
+/// The HAL's arithmetic, spelled here because a driver that has to free one of
+/// those blocks *by hand* - the crate frees its own `Dma`, but only after this
+/// path has copied what was on the screen out of it - has to name the same
+/// order the allocator was asked for.
+fn order_of(len: usize) -> usize {
+    len.div_ceil(mm::PAGE_SIZE)
+        .next_power_of_two()
+        .trailing_zeros() as usize
 }
 
 /// `write(2)` on `/dev/fb0`: block until the pixels this caller put in the

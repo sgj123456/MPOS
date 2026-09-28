@@ -157,6 +157,31 @@ pub fn pin_frames(phys: usize, len: usize) {
     });
 }
 
+/// Release a range [`pin_frames`] marked: the frames are the allocator's
+/// again, exactly as they were before the pin.
+///
+/// The one caller is a display resize, which rebuilds the GPU's scanout at the
+/// size the host now wants and returns the block the old one lived in
+/// (`drivers::video::render`). It exists because the *address of the screen*
+/// changes: pinning a framebuffer for the machine's life is right while there
+/// is exactly one framebuffer, and wrong once the host can ask for another
+/// one - a window drag sends a resize per event, and a pin per resize would
+/// strand a screenful of frames each time.
+///
+/// Only the exact range is dropped, so a caller cannot unpin something it did
+/// not pin; nothing else guards the call because there is one pin site and one
+/// unpin site, and the geometry both use travels with the framebuffer.
+#[cfg(target_os = "none")]
+pub fn unpin_frames(phys: usize, len: usize) {
+    let end = phys.checked_add(len).expect("a pinned range does not wrap");
+    critical_section::with(|cs| {
+        PINNED
+            .borrow(cs)
+            .borrow_mut()
+            .retain(|&(start, stop)| !(start == phys && stop == end));
+    });
+}
+
 /// Whether `phys` lies inside a pinned range. The check is a small walk of a
 /// tiny list - it only runs on the free path of an order-0 page, and the
 /// answer it protects is a screen's worth of DMA memory.

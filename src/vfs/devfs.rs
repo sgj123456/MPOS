@@ -589,6 +589,7 @@ fn announce(name: &str, subsystem: &'static str, major: u32, minor: u32) {
         devname: String::from(name),
         major,
         minor,
+        extra: &[],
     });
 }
 

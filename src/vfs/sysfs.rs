@@ -252,6 +252,7 @@ impl Inode for SysPciEvent {
             devname: self.event.devname.clone(),
             major: self.event.major,
             minor: self.event.minor,
+            extra: self.event.extra,
         });
         Ok(buf.len())
     }
@@ -319,6 +320,7 @@ impl Inode for SysEventAttr {
             devname: self.event.devname.clone(),
             major: self.event.major,
             minor: self.event.minor,
+            extra: self.event.extra,
         });
         Ok(buf.len())
     }
@@ -426,6 +428,7 @@ impl SysFs {
                         devname: name.clone(),
                         major: *major,
                         minor: *minor,
+                        extra: &[],
                     },
                 }),
             );
@@ -528,6 +531,7 @@ impl SysFs {
                             devname: String::new(),
                             major: 0,
                             minor: 0,
+                            extra: &[],
                         },
                     }),
                 );
@@ -630,6 +634,7 @@ impl SysFs {
                             devname: alloc::format!("input/{}", name),
                             major,
                             minor,
+                            extra: &[],
                         },
                     }),
                 );
@@ -724,6 +729,7 @@ impl SysFs {
                             devname: String::from(devnode),
                             major: 226,
                             minor,
+                            extra: &[],
                         },
                     }),
                 );
@@ -954,6 +960,7 @@ fn add_pci_attributes(
                 devname: String::new(),
                 major: 0,
                 minor: 0,
+                extra: &[],
             },
         }),
     );

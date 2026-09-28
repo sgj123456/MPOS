@@ -80,8 +80,10 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [~] 7.1 Display — `/dev/fb0` (mmap + FBIOGET_* + PAN/VSYNC present) and
       `/dev/dri/card0` + `/dev/dri/renderD128` (resources, dumb buffers, addfb2,
       atomic commits, page-flip + vblank events, PRIME both ways) — which with
-      Mesa's GBM and EGL is weston-on-GL, in software. No 3D/virgl, no sync
-      objects, no format modifiers, no EDID (§7.1, §7.4)
+      Mesa's GBM and EGL is weston-on-GL, in software — and the scanout now
+      *follows the host's display size*, so a resized or fullscreened QEMU window
+      is a resized screen with a pointer that reaches all of it. No 3D/virgl, no
+      sync objects, no format modifiers, no EDID (§7.1, §7.4)
 - [x] 7.2 Input — virtio-input evdev: capability ioctls (`EVIOCGBIT`/`EVIOCGABS`/
       …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents, and
       events that belong to the description that grabbed them (§7.2)
@@ -1288,6 +1290,42 @@ fence is ever waited on, so a compositor that passes one is told nothing about
 it - and no `OUT_FENCE_PTR` at all. `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` and
 the colour-pipeline cap are refused `EOPNOTSUPP`, the first of which the
 virtualized drivers are the ones that ask for.
+
+**The scanout follows the host's display size.** The resolution used to be the
+one `GET_DISPLAY_INFO` answered at boot and nothing else, which is a bug the
+moment a QEMU window is resized or fullscreened: the host keeps the size it now
+wants in the GPU's own device configuration (`events_read`, with
+`VIRTIO_GPU_EVENT_DISPLAY` set and a config-change interrupt raised), and a guest
+that never reads it goes on driving a 1024x768 scanout inside a 1920x1080 window.
+What that looks like is a desktop confined to the top-left corner with a pointer
+that cannot leave it - the report this fixes - because the window is showing the
+guest's screen unscaled and the compositor's output *is* the guest's screen.
+
+So the once-a-tick virtio service task now reads that one word
+(`virtio::gpu::take_display_event`, an MMIO read, not a control-queue round trip:
+`GET_DISPLAY_INFO` is only spent once the bit says there is a reason), and hands
+the work to the render task, which owns the device. The task re-reads the size,
+rebuilds the scanout resource at it (`change_resolution`), repins the new frames,
+copies what was on the screen into the new one - the old block is still pinned
+across the teardown, deliberately, so the pixels survive the swap - returns the
+old block to the allocator (unless userland mapped the pixels, in which case it
+stays pinned: a stale mapping that writes into recycled frames is worse than a
+leaked screen), publishes the new geometry to `/dev/fb0` and the DRM card, and
+rebuilds the console's grids to the new cell count.
+
+And it tells userland, which is the half that makes the pointer work: a mode
+change is announced as a **`change` uevent carrying `HOTPLUG=1`** on the card
+device (`drm::display_changed`) - the DRM uapi has no hotplug event type, and
+`libdrm`'s `drmHandleEvent` refuses a type it does not know - and a compositor's
+udev monitor re-probes its connectors on exactly that word (weston's DRM backend
+logs "[udev] HOTPLUG event"), finds the new mode from `GETCONNECTOR`/`GETCRTC`,
+and re-modesets. `Event` gained the `extra` key list for those subsystem words,
+which is where Linux's `envp` extras live too.
+
+Two costs are real and named: a resize costs the console's scrollback (the grids
+are rebuilt from the log ring, as at boot), and a drag's stream of window events
+is coalesced by the render beat into one rebuild per frame rather than one per
+event.
 
 **The console's text grid, and the window it reports.** The framebuffer console
 paints an 8x16 bitmap grid sized from the scanout (1024x768 is 128x48 cells,

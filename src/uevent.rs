@@ -64,6 +64,16 @@ pub struct Event {
     pub devname: String,
     pub major: u32,
     pub minor: u32,
+    /// The `KEY=value` lines this device's subsystem adds beyond the words
+    /// every event carries.
+    ///
+    /// Linux has the same slot - its `envp` is the kernel's own lines plus
+    /// whatever the caller appended - and a listener reads the extras as the
+    /// reason the event happened. The one this kernel sends is `HOTPLUG=1` on
+    /// a DRM connector change, which is the word a compositor's udev monitor
+    /// matches on: weston's DRM backend re-probes its connectors for that
+    /// property and logs nothing for an event without it.
+    pub extra: &'static [(&'static str, &'static str)],
 }
 
 /// Which separator a field of a uevent record has to keep out of its own bytes.
@@ -134,6 +144,11 @@ impl Event {
         }
         key("MAJOR", &alloc::format!("{}", self.major));
         key("MINOR", &alloc::format!("{}", self.minor));
+        // The subsystem's own words, before the sequence number: Linux appends
+        // its extras in the same place, and `SEQNUM` is last there too.
+        for &(name, value) in self.extra {
+            key(name, value);
+        }
         let seqnum = SEQNUM.fetch_add(1, Ordering::Relaxed) + 1;
         key("SEQNUM", &alloc::format!("{}", seqnum));
         out.push(0);
@@ -692,6 +707,7 @@ mod tests {
             devname: String::from("vda3"),
             major: 254,
             minor: 3,
+            extra: &[],
         }
     }
 
@@ -725,6 +741,31 @@ mod tests {
             .strip_prefix("SEQNUM=")
             .expect("the number is last, as Linux appends it");
         assert!(seqnum.parse::<u64>().is_ok(), "{seqnum:?} is a number");
+    }
+
+    /// The word a compositor matches on, pinned as a *position* as well as a
+    /// value: a listener reads the block in order, and Linux puts a subsystem's
+    /// own keys between the kernel's fixed ones and the sequence number.
+    #[test]
+    fn a_subsystems_own_keys_travel_in_the_block() {
+        let _bus = bus_lock();
+        let mut event = an_event();
+        event.subsystem = "drm";
+        event.action = "change";
+        event.extra = &[("HOTPLUG", "1")];
+        let text = String::from_utf8(event.encode())
+            .expect("the encoding is utf8")
+            .replace('\0', "|");
+        let fields: Vec<&str> = text.trim_end_matches("||").split('|').collect();
+        assert_eq!(
+            &fields[fields.len() - 3..],
+            ["MINOR=3", "HOTPLUG=1", fields[fields.len() - 1]],
+            "{fields:?} carry the extra key before the sequence number"
+        );
+        assert!(
+            fields.last().expect("a last field").starts_with("SEQNUM="),
+            "{fields:?} still end with the counter"
+        );
     }
 
     #[test]

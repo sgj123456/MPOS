@@ -144,3 +144,20 @@ pub fn transport_all(device_ids: &[u16]) -> alloc::vec::Vec<PciTransport> {
         })
         .collect()
 }
+
+/// The virtio *device configuration* window of the first device answering one
+/// of `device_ids`: the space a driver polls for events the device itself
+/// reports.
+///
+/// The transport reads this space at bring-up and keeps what it read; a driver
+/// whose device can be told something *while the machine runs* has to look
+/// again later, and this is the address it looks at. `virtio-gpu` is the one
+/// caller: the host raises `VIRTIO_GPU_EVENT_DISPLAY` in `events_read` when the
+/// display it wants us to drive changes shape, and nothing else in this kernel
+/// can see a window resize.
+pub fn device_config(device_ids: &[u16]) -> Option<usize> {
+    let func = pci::find_any(VENDOR_VIRTIO, device_ids)
+        .into_iter()
+        .next()?;
+    super::msix::device_config_of(&func)
+}

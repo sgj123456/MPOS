@@ -317,6 +317,7 @@ pub fn standard_devfs() -> Arc<DevFs> {
                 devname: alloc::format!("input/{name}"),
                 major,
                 minor,
+                extra: &[],
             });
         }
     }
@@ -336,6 +337,7 @@ pub fn standard_devfs() -> Arc<DevFs> {
         devname: alloc::string::String::from("uinput"),
         major: crate::uinput::MAJOR,
         minor: crate::uinput::MINOR,
+        extra: &[],
     });
 
     // The DRM/KMS card. A compositor that drives the display through KMS (not

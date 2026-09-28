@@ -42,6 +42,10 @@ const CRTC_ID: u32 = 34;
 const ENCODER_ID: u32 = 33;
 const CONNECTOR_ID: u32 = 35;
 const PLANE_ID: u32 = 36;
+/// DRM's major number - `DRM_MAJOR` in the kernel's own headers, and the number
+/// every `/sys/class/drm/cardN/dev` prints and every uevent about a card
+/// carries. Fixed since XFree86 4.x.
+const DRM_MAJOR: u32 = 226;
 /// Fixed property ids, allocated the same way: `OBJ_GETPROPERTIES` and
 /// `GETPROPERTY` have to agree on them, and nothing else cares what they are.
 /// `CRTC_ID` and `DPMS` live on the connector, `ACTIVE` on the CRTC, and
@@ -954,6 +958,31 @@ fn crtc_mode_dims() -> (u32, u32) {
     }
 }
 
+/// The CRTC's mode changed under userland: announce it the way Linux does.
+///
+/// This is what makes a compositor follow a display that changed size, and it is
+/// a *uevent* rather than an event on the card's fd: the DRM uapi has no
+/// hotplug event type (`libdrm`'s `drmHandleEvent` refuses a type it does not
+/// know), so Linux announces a mode change as a `change` uevent on the card
+/// device carrying `HOTPLUG=1`. A compositor's udev monitor is watching exactly
+/// that - weston's DRM backend logs "[udev] HOTPLUG event" and re-probes its
+/// connectors - and a re-probe is where the new mode is found, because
+/// `GETCONNECTOR` and `GETCRTC` report whatever `crtc_mode_dims` says now.
+///
+/// Called by the render task after it has rebuilt the scanout, so the mode a
+/// compositor reads back is the mode the hardware is actually driving.
+pub fn display_changed() {
+    crate::uevent::publish(&crate::uevent::Event {
+        action: "change",
+        devpath: alloc::string::String::from("/devices/virtual/drm/card0"),
+        subsystem: "drm",
+        devname: alloc::string::String::from("dri/card0"),
+        major: DRM_MAJOR,
+        minor: 0,
+        extra: &[("HOTPLUG", "1")],
+    });
+}
+
 /// Copy `fb_id`'s pixels into the GPU's scanout buffer - the step that makes
 /// a `SETCRTC`/`PAGE_FLIP` a presentation rather than bookkeeping. The rows
 /// go one by one because the two pitches differ: the dumb buffer's is
@@ -1009,13 +1038,18 @@ fn copy_to_scanout(st: &DrmState, fb_id: u32) -> isize {
         .get(fb.handle as usize - 1)
         .and_then(|s| s.as_ref())
         .expect("fb_fits checked the buffer is there");
-    let (screen_w, screen_h) = crtc_mode_dims();
-    // A headless machine has no scanout to draw to; the bookkeeping is still
-    // right, and the flush after is the no-op it already is there.
+    // The mode and the block it names are read as *one* value, not two: a
+    // resize can land between them, and the width of one screen with the address
+    // of another is a copy that runs off the end of a screen that just got
+    // smaller (`virtio::gpu::Scanout`).
     let Some(gpu) = crate::drivers::virtio::gpu::global() else {
+        // A headless machine has no scanout to draw to; the bookkeeping is still
+        // right, and the flush after is the no-op it already is there.
         return 0;
     };
-    let scanout = phys_to_virt(gpu.fb_phys()) as *mut u8;
+    let scanout_info = gpu.scanout();
+    let (screen_w, screen_h) = (scanout_info.width, scanout_info.height);
+    let scanout = phys_to_virt(scanout_info.fb_phys) as *mut u8;
     let scan_pitch = screen_w as usize * 4;
     let row = (fb.width as usize * 4).min(scan_pitch);
     let rows = (fb.height as usize).min(screen_h as usize);
@@ -2303,7 +2337,7 @@ impl Inode for DrmCard {
     /// whose driver cannot be named ("MESA-LOADER: failed to retrieve device
     /// information", which is what the log said before this existed).
     fn rdev(&self) -> Option<(u32, u32)> {
-        Some((226, self.minor))
+        Some((DRM_MAJOR, self.minor))
     }
 
     /// Serve the next queued DRM event, as `drmGetEventsReady`/a reader of the

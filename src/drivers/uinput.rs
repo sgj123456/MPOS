@@ -173,6 +173,7 @@ impl Uinput {
                 devname: alloc::format!("input/{name}"),
                 major: INPUT_MAJOR,
                 minor: input_minor(index),
+                extra: &[],
             });
         }
         true

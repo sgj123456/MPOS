@@ -29,6 +29,10 @@ const PCI_CAP_ID_MSIX: u8 = 0x11;
 const PCI_CAP_ID_VNDR: u8 = 0x09;
 /// The virtio vendor capability's type byte for the common configuration.
 const VIRTIO_CAP_COMMON_CFG: u8 = 0x01;
+/// ...and for the device's own configuration, where a device keeps the state
+/// that is not a queue: `virtio-gpu`'s `events_read` is the one this kernel
+/// reads through it.
+const VIRTIO_CAP_DEVICE_CFG: u8 = 0x04;
 
 /// `MSI-X Message Control`, bit 15: the function starts delivering its
 /// interrupts as memory writes.
@@ -118,6 +122,44 @@ fn map_structure(at: usize, span: usize) -> usize {
     crate::mm::map_mmio(at & !(crate::mm::PAGE_SIZE - 1), span) + at % crate::mm::PAGE_SIZE
 }
 
+/// The MMIO window of the vendor capability whose `cfg_type` is `want`, or
+/// `None` when the function has no such structure.
+///
+/// A virtio 1.0 function exposes its structures - common configuration,
+/// notification area, ISR, device configuration - as vendor capabilities that
+/// name a BAR and an offset. Walking them is the same walk for every caller,
+/// so it lives here once.
+fn vendor_cap_window(func: &pci::Func, want: u8) -> Option<usize> {
+    let mut cap = find_cap(func, PCI_CAP_ID_VNDR);
+    while let Some(this) = cap {
+        let (bus, slot, function) = func.bdf();
+        // The vendor capability's private half: cap_len, cfg_type, then the
+        // BAR and offset of the structure (virtio 1.0, 4.1.4.3).
+        let header = pci::read32(bus, slot, function, this);
+        let cfg_type = (header >> 24) as u8;
+        let bar = pci::read32(bus, slot, function, this + 4) as u8 & 0x7;
+        let offset = pci::read32(bus, slot, function, this + 8);
+        cap = find_next(func, this);
+        if cfg_type == want {
+            let addr = bar_address(func, bar)?;
+            return Some(map_structure(addr + offset as usize, 0x1000));
+        }
+    }
+    None
+}
+
+/// The virtio *device configuration* window of `func`: the space holding the
+/// state a driver polls for the device's own events.
+///
+/// The crate reads this space once, at bring-up, and guards the read with a
+/// generation counter - a value read while the host is writing it is not worth
+/// trusting. A driver that has to look *again*, because the host can change
+/// something under it while the machine runs, needs the address rather than a
+/// snapshot, and this is it.
+pub fn device_config_of(func: &pci::Func) -> Option<usize> {
+    vendor_cap_window(func, VIRTIO_CAP_DEVICE_CFG)
+}
+
 /// Enable MSI-X on `func` and arm entry 0 at `vector`.
 ///
 /// The entry is written masked first and unmasked last, so the device can
@@ -176,25 +218,8 @@ pub fn enable(func: &pci::Func, vector: u8) -> bool {
 pub fn set_queue_vectors(func: &pci::Func) -> bool {
     // The virtio structures are all in the vendor capability; the one this
     // wants is the common configuration, which may not be the first of them.
-    let mut cap = find_cap(func, PCI_CAP_ID_VNDR);
-    let common = loop {
-        let Some(this) = cap else {
-            return false;
-        };
-        let (bus, slot, function) = func.bdf();
-        // The vendor capability's private half: cap_len, cfg_type, then the
-        // BAR and offset of the structure (virtio 1.0, 4.1.4.3).
-        let header = pci::read32(bus, slot, function, this);
-        let cfg_type = (header >> 24) as u8;
-        let bar = pci::read32(bus, slot, function, this + 4) as u8 & 0x7;
-        let offset = pci::read32(bus, slot, function, this + 8);
-        cap = find_next(func, this);
-        if cfg_type == VIRTIO_CAP_COMMON_CFG {
-            let Some(addr) = bar_address(func, bar) else {
-                return false;
-            };
-            break map_structure(addr + offset as usize, 0x1000);
-        }
+    let Some(common) = vendor_cap_window(func, VIRTIO_CAP_COMMON_CFG) else {
+        return false;
     };
 
     // The common configuration is MMIO: every field is a volatile word at
