@@ -58,9 +58,11 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [x] anonymous **demand paging** — a `mmap` is an address space and a page
       arrives on the fault that needs it; `mincore` answers from the page tables,
       so an untouched range reads as mapped and not resident (`t-mmap-demand`)
-- [~] 5.1 Shared anon `mmap` — served; aliased frames don't cross a plain `fork`
-- [~] 5.2 `madvise` — validated; `MADV_DONTNEED` a no-op over a demand-paged
-      region (the paging it was blocked on has landed; the release is next)
+- [x] 5.1 Shared anon `mmap` — an unnamed object, so aliased frames cross a plain
+      `fork` (`t-mmap-shared-fork`)
+- [x] 5.2 `madvise` — `MADV_DONTNEED` releases the pages and the next touch
+      refills them; `MADV_FREE` and a shared mapping's cross-process drop stay
+      deliberate no-ops and say why (§5.2)
 - [x] 5.3 `process_vm_readv`/`writev` (§5.3)
 
 **Process (Phase 6)**
@@ -255,9 +257,11 @@ run, so these are steps rather than results:
 - [~] 8.0 **a userspace process could panic the kernel** - fixed for the case
       that was reproducing (a ramfs file grew as one `Vec`, and a 128 MiB
       contiguous `realloc` is an order the buddy allocator never serves), and
-      tmpfs now has a byte budget answering `ENOSPC`. Still open: the global
-      allocator's failure path is `panic!`, so any other unbounded user-driven
-      growth still ends the machine (§8.0)
+      tmpfs now has a byte budget answering `ENOSPC`; demand paging also took
+      "maps too much" off the list, since a mapping is now an address space and
+      backs nothing until it is touched. Still open: the global allocator's
+      failure path is `panic!`, so any other unbounded user-driven growth still
+      ends the machine (§8.0)
 - [x] 8.1 ASLR — `ET_DYN` load bias, interpreter base, stack top and the `mmap`
       region are drawn per `exec`; a fixed-address image keeps its own address,
       because that is what a fixed address means (§8.1)
@@ -355,13 +359,17 @@ they are an errno, a link target and a node's answer to a question nothing here
 was asking before (§7.2, §1.1).
 
 What is left, in the order that keeps each step verifiable on its own. **The
-list's first item is done**: §4.3's listener landed on top of the loopback that
-had to come first, so a program inside the machine can now serve one - both
+list's first two items are done**: §4.3's listener landed on top of the loopback
+that had to come first, so a program inside the machine can now serve one - both
 halves measured against Linux and pinned by `t-tcp-listen`, and the section
-rewritten around them (§4.3.1-§4.3.2).
+rewritten around them (§4.3.1-§4.3.2) - and anonymous demand paging, with the two
+things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
+`t-mmap-shared-fork`).
 
-1. **Anonymous demand paging** (§5.1 + §5.2) - the prerequisite both items name,
-   and the only one that changes the mm fault path for everything.
+1. **Anonymous demand paging** (§5.1 + §5.2) - the prerequisite both items named,
+   and the only one that changed the mm fault path for everything. Landed: a
+   `mmap` is an address space, a page arrives on the fault that needs it, and
+   `MADV_DONTNEED` gives it back again (`t-mmap-demand`).
 2. **`seccomp` FILTER's plumbing** (§8.2 - its runner has landed and is
    host-tested; what is left is the per-task list, the two install paths and the
    gate, which is a bounded piece of wiring rather than a feature), then
@@ -457,9 +465,14 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   live stack (`RTM_NEWADDR`/`NEWROUTE`/`NEWLINK`, §4.4), and the uevent half now
   carries userland messages — port ids, unicast, groups and credentials — which
   is what udevd's handoff to a worker needs (§4.4's closing note).
-- **5.1 / 5.2** `MAP_SHARED|MAP_ANONYMOUS` is served but aliased frames do not
-  cross a plain `fork`, and `MADV_DONTNEED` does not free pages — both need
-  anonymous **demand paging** + per-VMA backing tracking in the `#PF` handler.
+- **5.1 / 5.2** closed. A mapping is a VMA (`mm::vma`) and the page behind an
+  address arrives on the fault that needs it, which is what let
+  `MAP_SHARED|MAP_ANONYMOUS` become an unnamed `Memfd` whose aliased frames
+  cross a plain `fork`, and `MADV_DONTNEED` release pages that the next touch
+  refills (`t-mmap-demand`, `t-mmap-shared-fork`). What stays a no-op says why
+  in §5.2 - `MADV_FREE` has no pressure model to honour, and a shared mapping's
+  pages are dropped for the caller's mapping rather than for the object, which
+  needs a reverse map of mappings this kernel does not keep.
 - **6.3** namespaces: `unshare`/`setns` validate but return `EOPNOTSUPP`; no
   real mount/pid/net namespace isolation.
 - **4.1** AF_UNIX is answered for `SOCK_STREAM` (see Phase 4), including
@@ -1035,27 +1048,57 @@ message.
 
 ## Phase 5: Memory Management Enhancements (Medium Priority)
 
-### 5.1 Shared Anonymous mmap — **DONE** (served; single-space caveat)
+### 5.1 Shared Anonymous mmap — **DONE**
 
-`mmap(MAP_SHARED | MAP_ANONYMOUS)` no longer returns `ENOSYS` - it is served as
-an anonymous mapping of the process's memory. Threads sharing one address space
-(`CLONE_VM`) genuinely see each other's writes through it, which is what modern
-code uses shared-anonymous mappings for. A plain `fork`ed child sees a copy
-(the pages are not aliased through a shared backing object); true parent/child
-shared frames would need an anonymous `Inode` shared across mappings - the one
-nuance this kernel does not model.
+`mmap(MAP_SHARED | MAP_ANONYMOUS)` is a *shared object*, not a private range:
+the mapping is a frame-backed VMA over a fresh unnamed `Memfd` - the same frame
+store `memfd_create` hands out, with real pages grown on demand, refcounted and
+released when the last mapping of it goes. Nobody holds a descriptor for it and
+nobody needs to: the mapping's VMA is its only name, and `fork` copies that.
 
-### 5.2 madvise — **PARTIAL** (validated; page-release blocked on demand paging)
+That is what makes the aliasing survive a plain `fork`. Both processes keep the
+same object, and the one rule that would have broken it is stated where the walk
+is: **`fork` does not mark a frame-backed range's pages copy-on-write**, and it
+does not harden them in the parent either. A copy-on-write flag there would turn
+the first store on either side into a private frame, which is the sharing the
+mechanism exists to keep. The `memfd` and dma-buf mappings get the same rule, so
+"aliased frames don't cross a plain `fork`" is no longer a documented divergence
+anywhere. `t-mmap-shared-fork` pins both directions - the child's write read by
+the parent after a `wait4`, and the parent's write after the `fork` read by a
+child the pipe held back - because only the second fails for a mapping that was
+copied before the fork.
 
-`madvise` is no longer a blanket `0`: it answers `EINVAL` for a range whose
-start is not page-aligned (Linux's rule), and recognises the `MADV_*` advisories
-as successful no-ops.
+### 5.2 madvise — **DONE**
 
-*Blocked:* `MADV_DONTNEED` does **not** yet free pages, because this kernel maps
-regions eagerly and the page-fault handler grows only the stack - there is no
-anonymous demand-paging to re-populate a dropped page, so freeing one would make
-the next access fault into a SIGSEGV. Real `MADV_DONTNEED` (and the read-ahead
-hints) first need general anonymous on-demand paging in the `#PF` handler.
+`madvise` answers `EINVAL` for a range whose start is not page-aligned (Linux's
+rule) and recognises the `MADV_*` advisories, of which one now does something:
+`MADV_DONTNEED` walks the range and drops the pages a VMA covers, leaving the
+mapping in place so the next access is an ordinary fault. What that fault
+produces is what the backing decides, which is Linux's rule in Linux's words -
+"repopulating the memory contents from ... the underlying mapped file ... or
+zero-fill-on-demand pages for anonymous private mappings". A private anonymous
+page comes back freshly zeroed (its frame is gone, so a new one is allocated);
+a page of a frame-backed range comes back from the object behind it, which still
+holds it. `t-madvise` pins both, and `t-mmap-demand` shows the release and the
+refill across a 64 MiB arena.
+
+The other advisories stay the recognised no-ops they are, and two of them are
+deliberate rather than unfinished:
+
+* **`MADV_FREE`** keeps its no-op. Its contract is that the pages *may* be
+  reclaimed but their contents are still there until memory pressure arrives,
+  and this kernel has no pressure model - returning the frames immediately would
+  be wrong rather than merely different.
+* **`MADV_DONTNEED` on a shared mapping** does the per-mapping half of what Linux
+  does. Linux drops the pages for everyone mapped to the object, which needs the
+  object's reverse map of mappings (`i_mmap`) to find them; this kernel's object
+  has no such index, and dropping the frames while another mapping still points
+  at them would be a use-after-free rather than a saving. So the pages here are
+  dropped for the caller's mapping and the object keeps its own copy, which the
+  next fault finds - the "repopulate from the underlying mapped file" half of
+  the promise, which is the half that is observable without the index. Nothing
+  beyond that is claimed; `t-madvise` pins the single-process case and
+  `t-mmap-shared-fork` the fork case.
 
 ### 5.3 Process_vm_readv / Process_vm_writev — **DONE**
 
@@ -1494,9 +1537,9 @@ answers the names it needs: `CRTC_ID`, `ACTIVE`, `MODE_ID`, `FB_ID`, `type`,
   anonymous memory made executable: `MAP_PRIVATE|MAP_ANON` and then `mprotect`
   `RW`→`RX` or straight `RWX`, which `mmap`/`mprotect` already allow. It wants
   threads for `LP_NUM_THREADS`, a writable `$XDG_CACHE_HOME/mesa_shader_cache`,
-  and `madvise(MADV_DONTNEED)` to give its scratch back - a **no-op here**
-  (§5.2), so that last one is a growth problem rather than a correctness one, and
-  the same prerequisite the memory phase already names.
+  and `madvise(MADV_DONTNEED)` to give its scratch back - which is real now
+  (§5.2), so the scratch it releases is memory the machine gets back rather than
+  a mapping that only grows.
 - **lavapipe** (software Vulkan) is the same stack one layer up, plus the Vulkan
   loader and an ICD manifest: userspace work that puts `vulkaninfo`-class probing
   and a Vulkan-based renderer within reach on a machine with no GPU 3D.
@@ -1531,10 +1574,11 @@ today, and asked for precisely by the virtualized drivers.
 
 Syscalls and memory, the parts this section cannot fix from inside the display
 driver: **threads** (`clone(CLONE_THREAD)`, §6.4); `/proc/<pid>/maps`, absent and
-read by Mesa's allocator paths, LLVM and most crash reporters; anonymous demand
-paging and a real `MADV_DONTNEED` (§5.1/§5.2); and the frame pool (§10.4), since
-the renderer families allocate scratch in tens of megabytes where the current
-per-frame accounting was never sized for it.
+read by Mesa's allocator paths, LLVM and most crash reporters; and the frame pool
+(§10.4), since the renderer families allocate scratch in tens of megabytes where
+the current per-frame accounting was never sized for it. Anonymous demand paging
+and `MADV_DONTNEED` used to be on that list - they are §5.1/§5.2's rewrite now,
+and the scratch a renderer gives back is memory the machine can use again.
 
 Services, which are rootfs work: `sway`/`niri` with their libraries
 (`libdisplay-info`, `libseat`, `xkbcommon`, `pango`/`cairo` and the fonts *and
@@ -1560,8 +1604,9 @@ Each step stands on its own, which is the only reason the order is this one:
    compositor that is not single-threaded and every Vulkan driver.
 5. **`DRM_VIRTGPU_*`, then virgl in the image.** The largest item and the only
    one that makes niri possible.
-6. **`/proc/<pid>/maps`**, `MADV_DONTNEED` and the frame pool: the supporting
-   cast, wanted by everything above and by nothing in particular.
+6. **`/proc/<pid>/maps`** and the frame pool: the supporting cast, wanted by
+   everything above and by nothing in particular. (`MADV_DONTNEED` was on this
+   line; §5.2 has it now.)
 
 ---
 
@@ -1605,9 +1650,13 @@ was, so the next write asks for a hundreds-of-megabytes hole and is refused
 not its memory.
 
 **Still open, and it is the rest of the original item**: the global allocator's
-failure path is still `panic!`, so any *other* unbounded user-driven growth - the
-page tables of a process that maps too much, a `Vec` in another filesystem path -
-still ends the machine. The remaining work is step 2 and 3 of the old plan: make
+failure path is still `panic!`, so any *other* unbounded user-driven growth - a
+`Vec` in another filesystem path, the page tables a process that touches enough of
+what it mapped will need - still ends the machine. Anonymous demand paging
+(§5.1/§5.2) took the cheapest half of that away: mapping too much is now a
+statement about addresses rather than a claim on memory, so the
+map-a-tebibyte-and-never-touch-it shape this item was written around costs one
+VMA and nothing else. What remains is the work the old plan named: make
 user-facing allocation fallible end to end (`ENOMEM` out of the syscall, not a
 panic) and give a process that runs the memory out something to lose besides the
 kernel.

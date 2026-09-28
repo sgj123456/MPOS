@@ -270,6 +270,10 @@ name = "t-mmap-reserve-commit"
 path = "src/bin/syscall/t-mmap-reserve-commit.rs"
 
 [[bin]]
+name = "t-mmap-shared-fork"
+path = "src/bin/syscall/t-mmap-shared-fork.rs"
+
+[[bin]]
 name = "t-mmap"
 path = "src/bin/syscall/t-mmap.rs"
 

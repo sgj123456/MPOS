@@ -173,6 +173,17 @@ pub(super) const PROT_EXEC: usize = 0x4;
 pub(super) const MREMAP_MAYMOVE: usize = 0x1;
 pub(super) const MREMAP_FIXED: usize = 0x2;
 
+/// `madvise(2)`'s advice numbers. Only the one this kernel acts on is named;
+/// the rest are the recognised no-ops the handler accepts without effect, and
+/// spelling a number here for one of those would suggest it did something.
+///
+/// `MADV_DONTNEED` is the one whose contract is about the pages rather than
+/// about a hint: after it, later accesses "will see a zero-filled page" for a
+/// private anonymous range, and the pages of a shared one are taken from the
+/// object behind it. Both are now answerable, because a mapping is an address
+/// space and the next touch refills it.
+pub(super) const MADV_DONTNEED: usize = 4;
+
 // ---------------------------------------------------------------------------
 // eventfd(2) flag bits
 // ---------------------------------------------------------------------------
@@ -2813,6 +2824,7 @@ mod tests {
         assert_eq!(PROT_EXEC, 0x4);
         assert_eq!(MREMAP_MAYMOVE, 0x1);
         assert_eq!(MREMAP_FIXED, 0x2);
+        assert_eq!(MADV_DONTNEED, 4);
         // eventfd(2)
         assert_eq!(EFD_SEMAPHORE, 1);
         assert_eq!(EFD_NONBLOCK, 0x800);

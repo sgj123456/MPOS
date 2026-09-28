@@ -493,6 +493,31 @@ impl AddressSpace {
         }
     }
 
+    /// Map a page as a genuinely *shared* frame: the same physical page in two
+    /// address spaces, at full permissions and with no copy-on-write bit.
+    ///
+    /// This is the sibling [`Self::map_cow`] deliberately is not, and the rule
+    /// it carries is the whole of what makes a shared mapping shared across a
+    /// `fork`. A frame-backed mapping - a `memfd`, the unnamed object behind
+    /// `MAP_SHARED|MAP_ANONYMOUS`, a dma-buf, the framebuffer - exists so that
+    /// two mappings watch each other's writes; marking its pages copy-on-write
+    /// would turn the first store on either side into a private copy, and the
+    /// sharing would be broken by the very mechanism meant to preserve it.
+    /// Both processes map the frame writable and both own a reference to it, so
+    /// it is released when the last of them lets go.
+    pub fn map_shared(&mut self, virt: usize, phys: usize, flags: MapFlags) {
+        let mut flags = flags;
+        // The COW bit is not a hardware permission and must not travel into a
+        // page that is meant to be written in place.
+        flags.remove(MapFlags::COW);
+        self.map(Mapping {
+            virt,
+            phys,
+            length: PAGE_SIZE,
+            flags,
+        });
+    }
+
     /// Resolve a copy-on-write fault: allocate a fresh frame, copy the contents,
     /// update the mapping to writable (clearing the COW bit), and report both
     /// frames.

@@ -2036,18 +2036,33 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
 /// `madvise(addr, length, advice)` — a hint about a mapping.
 ///
 /// A range that does not begin on a page boundary is not one the kernel can
-/// locate, so it answers `EINVAL` the way Linux does. The advisories themselves
-/// are accepted without effect: this kernel maps a region eagerly and grows only
-/// the stack on fault, so there is no demand-paging hole for `MADV_DONTNEED` to
-/// release into (a page it dropped here would fault again and - with no
-/// anonymous re-population in the fault handler - die). Freeing memory on
-/// `MADV_DONTNEED` therefore waits on anonymous demand paging, tracked in PLAN
-/// 5.2; recognising the call and rejecting a misaligned range is the whole of
-/// what is honest to do until then.
+/// locate, so it answers `EINVAL` the way Linux does.
+///
+/// `MADV_DONTNEED` is the one advice whose contract is about the pages rather
+/// than a hint, and it is real now that a mapping is an address space: it drops
+/// the pages the range has, and the next access refills them. What "refill"
+/// means is what the backing decides, which is exactly Linux's rule - a private
+/// anonymous page comes back as a fresh zero-filled one, and a page of a shared
+/// or file-backed mapping comes back from the object behind it. The other
+/// advisories stay the recognised no-ops they are, and `MADV_FREE` is
+/// deliberately among them: its "the pages may be reclaimed but the contents are
+/// still there until pressure" contract is a policy this kernel has no pressure
+/// model for, and handing the frames back immediately would be *wrong* rather
+/// than merely different.
 pub(super) fn handle_madvise(args: [usize; ARG_COUNT]) -> isize {
     use crate::mm::pframe::PAGE_SIZE;
-    if args[0] & (PAGE_SIZE - 1) != 0 {
+    let (addr, len, advice) = (args[0], args[1], args[2]);
+    if addr & (PAGE_SIZE - 1) != 0 {
         return err::EINVAL;
+    }
+    if advice == super::abi::MADV_DONTNEED && len != 0 {
+        // A range that runs past the address space is clamped rather than
+        // allowed to take the machine down: the pages beyond it do not exist,
+        // and there is nothing there to drop.
+        let end = addr.saturating_add(len).min(USER_LIMIT);
+        if end > addr {
+            crate::sched::madvise_dontneed(addr, end - addr);
+        }
     }
     0
 }
@@ -2073,20 +2088,24 @@ const USER_LIMIT: usize = 1 << 47;
 /// `mmap(addr, length, prot, flags, fd, offset)` — map memory, from a file or
 /// from nothing.
 ///
-/// A file mapping is read in at the moment it is made: the pages are private
-/// copies of what the file held, and nothing tracks the file afterwards. That
-/// is the whole of `MAP_PRIVATE` for a reader, and it is what the dynamic
-/// linker needs - it maps a shared object read-only, parses it, and then
-/// `mprotect`s the pieces it wants writable.
+/// What a mapping *is* depends on what backs it, and there are three shapes:
 ///
-/// `MAP_SHARED` is served by that same read-in whenever a file backs the
-/// mapping. A reader cannot tell the two apart - no write of its lands back
-/// in the file either way - and real programs reach for the shared spelling
-/// for plain reads: apk's index reader maps the fetched `APKINDEX` with
-/// `MAP_SHARED` and refuses the whole update when the kernel says that is
-/// unimplemented. Only the anonymous shape is refused, because that is the
-/// one whose contract - two processes watching each other's writes through
-/// shared frames - mpos genuinely does not keep.
+/// * **Anonymous.** Private memory is a range of the process's own, zero-filled
+///   on first touch; `MAP_SHARED` makes it an unnamed object (`Memfd`) the pages
+///   alias, so a `fork`ed child and its parent watch each other's writes through
+///   it. Either way nothing is allocated here - the mapping is the address space,
+///   and the pages arrive on the faults that need them (§5.1).
+/// * **Frame-backed.** A node that answers [`crate::vfs::Inode::frame_backed`] -
+///   a `memfd` descriptor, a dma-buf, the GPU framebuffer, a DRM dumb buffer -
+///   hands out its own pages, and the mapping *is* those pages: a program
+///   drawing into its mapping of the framebuffer is drawing on the screen. The
+///   pages come from the object on the fault that asks for them, so the aliasing
+///   the eager version gave is kept without mapping a screenful up front.
+/// * **An ordinary file.** Read in at the moment the mapping is made: the pages
+///   are private copies of what the file held, and nothing tracks the file
+///   afterwards. That is the whole of `MAP_PRIVATE` for a reader, and it is what
+///   the dynamic linker needs - it maps a shared object read-only, parses it,
+///   and then `mprotect`s the pieces it wants writable.
 ///
 /// The address handling is Linux's, and two details of it are load-bearing for
 /// a real libc:
@@ -2099,9 +2118,10 @@ const USER_LIMIT: usize = 1 << 47;
 /// * Without `MAP_FIXED` the address is only a hint, and a hint that is still
 ///   in use is simply not taken: the mapping goes wherever there is room.
 ///
-/// `PROT_NONE` maps the pages *present but unreachable from ring 3* rather than
-/// leaving them unmapped, so a later `mprotect` can hand them back with their
-/// contents intact.
+/// `PROT_NONE` maps a range the process may not reach rather than leaving it
+/// unmapped, so a later `mprotect` can hand it back with its permissions
+/// changed - and, since the range has no pages either way, with nothing lost in
+/// between.
 pub(super) fn handle_mmap(args: [usize; ARG_COUNT]) -> isize {
     handle_mmap_impl(args)
 }
@@ -2113,25 +2133,20 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         (args[0], args[1], args[2], args[3], args[4] as i32, args[5]);
 
     let anon = flags & MAP_ANONYMOUS != 0;
-    // Shared and private are accepted alike: below a mapping is filled eagerly
-    // into the process's own frames, so a shared one reads back the same bytes
-    // and only differs across a plain `fork` (see the note on anonymous shared
-    // mappings). Recorded here so the flag is deliberately, not accidentally,
-    // uniform.
-    let _shared = flags & MAP_SHARED != 0;
+    // Shared and private anonymous memory are different objects now. A private
+    // range is the process's own pages, zero-filled on first touch. A *shared*
+    // one is an anonymous object the mapping aliases - the unnamed `Memfd`
+    // built below - so two mappings of it, or a parent and a child across a
+    // `fork`, watch each other's writes through the very same frames. That is
+    // the §5.1 gap closed: before the VMA table the mapping was a private range
+    // that happened to be shared between threads, and a plain `fork` gave the
+    // child a copy.
+    let shared = flags & MAP_SHARED != 0;
     let fixed = flags & MAP_FIXED != 0;
 
     if length == 0 {
         return err::EINVAL;
     }
-    // `MAP_SHARED` is accepted for anonymous and read-only file mappings alike.
-    // A shared *anonymous* mapping is served as an anonymous mapping of the
-    // process's own memory: threads (`CLONE_VM`) share one address space and so
-    // genuinely see each other's writes through it - the case modern code uses
-    // `MAP_SHARED|MAP_ANONYMOUS` for - while a `fork`ed child sees a copy. True
-    // parent/child *shared* frames across a plain `fork` would need a shared
-    // backing object this kernel does not keep; that difference only surfaces
-    // there, and serving the mapping beats refusing it with `ENOSYS`.
 
     // What the mapping is filled from. The descriptor is ignored when the
     // mapping is anonymous, as Linux ignores it.
@@ -2200,8 +2215,20 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
     // a page that can arrive on a fault is a page `MADV_DONTNEED` may take away
     // again.
     match &backing {
-        // Anonymous memory: private frames of the process's own, and - once
-        // §2.2's shared object is in hand - the aliased kind.
+        // A shared anonymous mapping is an *object*: an unnamed `Memfd`, which
+        // is the same frame store a `memfd_create` descriptor is - real pages,
+        // grown on demand, refcounted, and released when the last mapping of it
+        // goes. Nobody holds a descriptor for this one, and nobody needs to:
+        // the mapping's VMA is its only name, and `fork` copies that. Every
+        // property the memfd path already has (aliasing, sharing, release) is
+        // inherited rather than rebuilt for the anonymous case.
+        None if shared => {
+            let object = crate::vfs::memfd::Memfd::new(super::fs::next_anon_ino(), 0);
+            object.set_len(len).ok();
+            crate::sched::map_frames(base, len, mf, object, 0);
+        }
+        // Private anonymous memory: frames of the process's own, zero-filled on
+        // first touch.
         None => crate::sched::map_anon(base, len, mf),
         // A node that owns real pages: the mapping aliases them, and the page
         // each fault needs comes from `mmap_frame`. This is the memfd, the

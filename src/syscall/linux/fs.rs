@@ -1853,7 +1853,12 @@ pub(super) fn handle_signalfd(args: [usize; ARG_COUNT], flags: usize, from_user:
 }
 
 /// A number for a descriptor that has no name to be numbered by.
-fn next_anon_ino() -> crate::vfs::Ino {
+/// The next inode number for a node with no filesystem behind it: an eventfd, a
+/// memfd, and the unnamed object a `MAP_SHARED|MAP_ANONYMOUS` mapping is. One
+/// counter for all three, because the number's only job is to be distinct from
+/// every other anonymous node's - `fstat` reports it and the DRM identity table
+/// keys on it.
+pub(super) fn next_anon_ino() -> crate::vfs::Ino {
     use core::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)

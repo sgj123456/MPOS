@@ -146,8 +146,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         -1,
         0,
     );
-    // Phase 5.1: a shared anonymous mapping is served (a usable region), not
-    // refused. It used to answer ENOSYS; check it maps and can be written.
+    // Phase 5.1: a shared anonymous mapping is served as an *object* - an
+    // unnamed memfd the mapping aliases - so it is a usable region and two
+    // processes across a `fork` watch each other's writes through it. It used
+    // to answer ENOSYS, and then to be a private range that merely happened to
+    // be shared between threads.
     let mapped = (r as isize) > 0;
     lin::check_true(
         &mut failed,

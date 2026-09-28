@@ -18,7 +18,9 @@
 //!   ring-3 read fault populated it);
 //! * a syscall that fills a caller's buffer works on a page that is not there
 //!   yet (the kernel-copy half: `buffer_ok` must accept it, and the store that
-//!   follows must be able to reach it).
+//!   follows must be able to reach it);
+//! * `MADV_DONTNEED` gives the pages back and the next touch zero-fills them,
+//!   which is only a promise a kernel with demand paging can make.
 //!
 //! The last one is the interesting one. `getrandom` validates the buffer with
 //! `buffer_ok` and then fills it through the caller's own page tables, in ring
@@ -192,6 +194,45 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         &mut failed,
         b"the bytes the kernel filled are readable through the mapping",
         written != 0,
+    );
+
+    // --- the pages can be given back, and come again ---
+    //
+    // `MADV_DONTNEED` is answerable for the same reason the mapping is:
+    // dropping a page leaves an address that the next fault refills. The page
+    // that was written before the advice reads as *zero* afterwards - a fresh
+    // page, not the old one with its bytes - which is the promise the man page
+    // makes and the assertion a no-op fails.
+    lin::check_eq(
+        &mut failed,
+        b"MADV_DONTNEED over the arena answers 0",
+        lin::madvise(arena, ARENA_BYTES, lin::MADV_DONTNEED),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"mincore after the advice answers 0",
+        lin::mincore(arena, ARENA_BYTES, vec),
+        0,
+    );
+    let mut still_resident = 0usize;
+    for i in 0..ARENA_PAGES {
+        if unsafe { vec.add(i).read() } != 0 {
+            still_resident += 1;
+        }
+    }
+    lin::check_eq(
+        &mut failed,
+        b"the advice released every page of the arena",
+        still_resident as isize,
+        0,
+    );
+    let released = unsafe { (arena as *const u8).read_volatile() };
+    lin::check_eq(
+        &mut failed,
+        b"the written page is zero-filled again",
+        released as isize,
+        0,
     );
 
     lin::check_eq(

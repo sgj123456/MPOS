@@ -5524,6 +5524,65 @@ pub fn protect_user_range(virt: usize, len: usize, flags: MapFlags) {
     protect_user(virt, len, flags);
 }
 
+/// `madvise(MADV_DONTNEED)` over `virt..virt + len`: give the range's pages
+/// back, leaving the mapping itself in place.
+///
+/// The mapping stays, so the next access is an ordinary fault and the page
+/// comes back from whatever backs the range - and *that* is the whole of the
+/// advice's contract, which is why it took demand paging to answer. A private
+/// anonymous page comes back freshly zeroed (its frame is gone, so the fault
+/// allocates a new one); a page of a frame-backed range - a memfd, a
+/// framebuffer, or the unnamed object a shared anonymous mapping is made of -
+/// comes back from the object, which still holds it. Linux says the same thing
+/// in the same words: "subsequent accesses ... will result in either
+/// repopulating the memory contents from ... the underlying mapped file ... or
+/// zero-fill-on-demand pages for anonymous private mappings".
+///
+/// Only pages a VMA covers are touched. That is not a nicety: the program
+/// image and the stack are mapped but have no VMA, and dropping one of those
+/// would leave an address that no rule says how to refill.
+pub fn madvise_dontneed(virt: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = virt.saturating_add(len);
+    with_table(|t| {
+        let owner = t.space_owner(t.current);
+        let Some(task) = t.tasks[owner.0].as_mut() else {
+            return;
+        };
+        let mm = Arc::clone(&task.mm);
+        let Some(space) = task.space.as_mut() else {
+            return;
+        };
+        let mut dropped = Vec::new();
+        let mut page = pframe::align_down(virt, PAGE_SIZE);
+        while page < end {
+            if !mm.vma_covers(page) {
+                page += PAGE_SIZE;
+                continue;
+            }
+            // The whole run of covered pages in one unmapping, so a range that
+            // is all one VMA - the common case - is one page-table walk and one
+            // TLB flush rather than one of each per page.
+            let run = page;
+            while page < end && mm.vma_covers(page) {
+                page += PAGE_SIZE;
+            }
+            dropped.extend(space.unmap(run, page - run));
+        }
+        // The frames are the mapping's own references. For an `Anon` page this
+        // is the last one, so the frame goes back to the allocator and the
+        // "zero-filled page" the caller is promised really is a new one; for a
+        // frame-backed page it is one of several, and the object's copy is what
+        // the next fault finds.
+        for frame in dropped {
+            mm.disown(frame);
+            crate::mm::free_frames(frame, 0);
+        }
+    });
+}
+
 /// Whether an address is the current process's: a page is there, or a VMA says
 /// one belongs there.
 ///
@@ -6123,6 +6182,19 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         // the parent's, from the parent's saved block when they are no longer.
         context.fpu = t.inherit_fpu(parent_id);
 
+        // The child's address space is not a copy of every page: a
+        // *frame-backed* range - a memfd, a dma-buf, the framebuffer, or the
+        // unnamed object behind `MAP_SHARED|MAP_ANONYMOUS` - is an object both
+        // processes are supposed to watch through, so its present pages cross
+        // the fork mapped writable and marked nothing. The ranges are collected
+        // here, alongside the pages, so the two loops below agree about which
+        // pages are which.
+        let shared: Vec<(usize, usize)> = parent_vmas
+            .iter()
+            .filter(|vma| matches!(vma.kind, VmaKind::Frames { .. }))
+            .map(|vma| (vma.start, vma.end))
+            .collect();
+
         // Create the child's address space by sharing all parent pages COW.
         let mut child_space = AddressSpace::new();
         let mut child_frames = Vec::new();
@@ -6133,9 +6205,18 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             // until the last of them lets go.
             crate::mm::clone_frame_ref(phys);
             child_frames.push(phys);
-            // Map it in the child as COW: read-only for now, with the COW bit
-            // marking it for the fault handler.
-            child_space.map_cow(virt, phys, flags);
+            // A page of a shared object is mapped as itself, at the permissions
+            // it already has. A page that is *already* copy-on-write is an
+            // exception, and deliberately: an older `fork` marked it, and the
+            // frame it would otherwise share is one that flag already governs.
+            if !flags.contains(MapFlags::COW) && shared.iter().any(|&(s, e)| s <= virt && virt < e)
+            {
+                child_space.map_shared(virt, phys, flags);
+            } else {
+                // Map it in the child as COW: read-only for now, with the COW
+                // bit marking it for the fault handler.
+                child_space.map_cow(virt, phys, flags);
+            }
         }
 
         // Make the parent's writable pages COW too, or the child's copy would be
@@ -6160,6 +6241,14 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         if let Some(parent_space) = &mut t.task_mut(parent_id).space {
             for &(virt, _phys, flags) in &parent_pages {
                 if flags.contains(MapFlags::COW) || !flags.contains(MapFlags::WRITE) {
+                    continue;
+                }
+                // A page of a shared object stays writable in the parent too.
+                // Hardening it would not protect anything - the child's copy is
+                // deliberately writable - and it would make the parent's *next*
+                // write take a private copy of a frame the child is watching,
+                // which is precisely the sharing this exists to keep.
+                if shared.iter().any(|&(s, e)| s <= virt && virt < e) {
                     continue;
                 }
                 // Everything the page had except write permission, in one PTE
