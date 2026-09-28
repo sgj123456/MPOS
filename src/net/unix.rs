@@ -40,8 +40,12 @@
 //!   has no filesystem node, hence no part of this design that would hold
 //!   it, and no target daemon reaches for it.
 //! * a bound *stream* socket that was never `listen`ed answers
-//!   `ECONNREFUSED`; Linux's implicit backlog-zero rendezvous is state
-//!   this kernel declines to model, and both daemons call `listen`. A
+//!   `ECONNREFUSED`; Linux's implicit rendezvous at a socket nobody
+//!   listened on is state this kernel declines to model, and both daemons
+//!   call `listen`. A `listen` with a *zero* backlog is a different thing
+//!   and is modelled: Linux's admission test is `queue_len > backlog`, so
+//!   `listen(fd, 0)` is a queue of one - which is the call eudev's control
+//!   socket makes ([`admits_one_more`] has the measurement). A
 //!   bound *datagram* socket needs no `listen` - there is nothing to
 //!   queue up to; its queue is open from the bind.
 //! * a datagram queue holds [`RECVQ_MAX`] messages and refuses more with
@@ -800,7 +804,7 @@ pub(crate) fn connect(
                     Some(b) => b,
                     None => return ConnectOutcome::Refused,
                 };
-                if stl.pending.len() >= backlog {
+                if !admits_one_more(backlog, stl.pending.len()) {
                     return ConnectOutcome::Full;
                 }
                 // The pair's own credential slot stays empty: this conduit is
@@ -890,7 +894,7 @@ fn room_wait(listener: &Arc<UnixSock>) {
         critical_section::with(|cs| {
             let st = listener.state.borrow(cs).borrow();
             match st.backlog {
-                Some(b) => st.pending.len() < b,
+                Some(b) => admits_one_more(b, st.pending.len()),
                 None => true, // the listener died while we waited
             }
         })
@@ -982,10 +986,26 @@ pub(crate) fn listen(sock: &UnixSock, backlog: i32) -> Result<(), isize> {
     Ok(())
 }
 
+/// Whether a listener whose queue is `pending` deep admits one more
+/// connection, given the backlog its `listen` named.
+///
+/// Linux's rule, and it is an off-by-one worth writing down: `unix_recvq_full`
+/// compares the queue's length to `sk_max_ack_backlog` with `>`, so `listen(fd,
+/// n)` admits `n + 1` connections before the next one is refused, and
+/// `listen(fd, 0)` admits exactly one. That is not a curiosity - it is the
+/// number eudev's control socket is created with (`listen(uctrl->sock, 0)` in
+/// `udev-ctrl.c`), and a kernel that read "a zero backlog never admits" out of
+/// the man page left `udevadm` unable to reach the daemon at all. Measured
+/// against the host kernel before being written: backlogs 0, 1, 2 and 3
+/// admitted 1, 2, 3 and 4 connections, with the next `connect` answering
+/// `EAGAIN`.
+fn admits_one_more(backlog: usize, pending: usize) -> bool {
+    pending <= backlog
+}
+
 /// The backlog rule, pure: negative is `EINVAL`, over `SOMAXCONN` is
-/// clamped (Linux since 2.4.22), zero means the smallest queue there is -
-/// and in this kernel a zero backlog never admits a connection, which is
-/// Linux's listen-backlog-zero behavior as closely as a push queue gets.
+/// clamped (Linux since 2.4.22), and zero is a real queue of one - see
+/// [`admits_one_more`] for the arithmetic and the measurement behind it.
 pub(crate) fn clamp_backlog(backlog: i32) -> Option<usize> {
     if backlog < 0 {
         return None;
@@ -1246,11 +1266,13 @@ pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&str>) -> is
     // would answer - `ECONNREFUSED`.
     //
     // The test is "carries messages", not "is a datagram socket", and the
-    // difference is udevd: its worker channel is a `SOCK_SEQPACKET` pair, which
-    // has exactly the queue this is looking for, and a check written against the
-    // one type name refused the message at the sender. The manager then sat on
-    // the receive end of a channel nothing had ever queued, and the device
-    // manager that tags every keyboard on the machine stopped working.
+    // difference is the *sequenced-packet* pair: a `socketpair(AF_UNIX,
+    // SOCK_SEQPACKET, ...)` half has exactly the queue this is looking for
+    // while its type name is neither `SOCK_STREAM` nor `SOCK_DGRAM`, so a check
+    // written against the one type name refused the message at the sender - and
+    // `t-udev-worker` carries that case. (udevd's own *worker* channel is a
+    // `SOCK_DGRAM` pair and would have been admitted either way; the seqpacket
+    // shape is the one that would have kept failing.)
     if !target.carries_messages() {
         return err::ECONNREFUSED;
     }

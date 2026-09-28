@@ -381,6 +381,64 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::close(server2);
 
+    // `listen(2)`'s backlog is one deeper than the number it names, and the
+    // number that makes that visible is zero - which is not a curiosity: it is
+    // what eudev's control socket is created with (`listen(uctrl->sock, 0)` in
+    // `udev-ctrl.c`), so a kernel that read the man page as "a zero backlog
+    // never admits" left `udevadm` unable to reach the daemon at all. Linux's
+    // admission test is `queue_len > backlog`, and measured against the host
+    // kernel backlogs 0, 1, 2 and 3 admitted 1, 2, 3 and 4 connections before
+    // the next `connect` was refused `EAGAIN`.
+    let shallow = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1, 0) as i32;
+    let (ba, bl) = lin::SockAddrUn::new(b"/tmp/t-unix-backlog.sock");
+    lin::check_eq(
+        &mut failed,
+        b"a listener with a zero backlog binds",
+        lin::bind_un(shallow, &ba, bl),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"listen(0) opens a queue of one, not a closed door",
+        lin::listen(shallow, 0),
+        0,
+    );
+    // The connector has to be nonblocking for a full queue to answer rather
+    // than park: `0o4000` is both `SOCK_NONBLOCK`'s bit and `O_NONBLOCK`.
+    let eager = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1, 0) as i32;
+    let _ = lin::fcntl(eager, lin::F_SETFL, lin::O_NONBLOCK);
+    lin::check_eq(
+        &mut failed,
+        b"the one connection a zero backlog admits gets in",
+        lin::connect_un(eager, &ba, bl),
+        0,
+    );
+    let too_late = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1, 0) as i32;
+    let _ = lin::fcntl(too_late, lin::F_SETFL, lin::O_NONBLOCK);
+    lin::check_eq(
+        &mut failed,
+        b"and the next one is EAGAIN while the queue is full",
+        lin::connect_un(too_late, &ba, bl),
+        lin::EAGAIN,
+    );
+    let taken = lin::accept4_un(shallow, core::ptr::null_mut(), core::ptr::null_mut(), 0) as i32;
+    lin::check_true(
+        &mut failed,
+        b"accept drains the connection the backlog was holding",
+        taken >= 0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and room for a new one appears with it",
+        lin::connect_un(too_late, &ba, bl),
+        0,
+    );
+    let _ = lin::close(taken);
+    let _ = lin::close(eager);
+    let _ = lin::close(too_late);
+    lin::close(shallow);
+    let _ = lin::unlinkat(lin::AT_FDCWD, b"/tmp/t-unix-backlog.sock", 0);
+
     // A bound socket that never listened refuses streams (the kernel's
     // documented divergence from Linux's backlog-zero rendezvous).
     let nosock = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1, 0) as i32;
@@ -444,7 +502,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::close(after);
     lin::close(reacher);
     lin::close(nosock);
-    let _ = lin::unlinkat(lin::AT_FDCWD, b"/tmp/t-unix-nolisten.sock ", 0);
+    let _ = lin::unlinkat(lin::AT_FDCWD, b"/tmp/t-unix-nolisten.sock\0", 0);
     lin::close(client);
     lin::close(client2);
     lin::close(server);

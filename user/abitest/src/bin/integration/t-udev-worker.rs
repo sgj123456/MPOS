@@ -13,21 +13,41 @@
 //! display and no input. The string comes out of `udevd.c`'s worker receive, and
 //! the neighbouring strings in the same binary (`ignoring worker message with
 //! invalid size`, `ignoring worker message without valid PID`) say what happens
-//! *after* a receive that worked: so the failure is the `recvmsg(2)` itself, on
-//! the `SOCK_SEQPACKET` socketpair the manager makes before it forks any worker.
+//! *after* a receive that worked: so the failure is the `recvmsg(2)` itself.
 //!
-//! That call has a shape, and a test that copies anything else passes without
-//! covering it: no `msg_name`, one iovec the size of the worker's message
-//! struct, a control buffer of `CMSG_SPACE(sizeof(struct ucred))`, and
-//! `SO_PASSCRED` set on the receiving end so the kernel attaches the sender's
-//! credentials. The pair is created with `SOCK_CLOEXEC|SOCK_NONBLOCK` folded
-//! into the type word, which is how every modern caller writes it, and the type
-//! itself is neither `SOCK_STREAM` nor `SOCK_DGRAM` - the two shapes a socket
-//! layer is most likely to have to hand.
+//! **The shape of that call, read off eudev's own source** (`udevd.c`, where
+//! `worker_watch` is made and `worker_returned` reads it):
 //!
-//! Each case below is one part of that shape, and each names itself on failure,
-//! because "udevd stops working" is a long way from "a seqpacket receive with no
-//! `msg_name` answered `EINVAL`".
+//! ```text
+//! socketpair(AF_LOCAL, SOCK_DGRAM|SOCK_CLOEXEC, 0, worker_watch)
+//! setsockopt(worker_watch[READ_END], SOL_SOCKET, SO_PASSCRED, &one, sizeof(one))
+//! struct worker_message {};                    /* no members: sizeof == 0 */
+//! loop_write(worker_watch[WRITE_END], &message, sizeof(message), false)
+//! recvmsg(fd_worker, &msg, MSG_DONTWAIT)       /* iov_len == 0, CMSG_SPACE(ucred) */
+//! ```
+//!
+//! So the worker's message is **zero bytes** - the credentials *are* the
+//! payload, which is the classic `SCM_CREDENTIALS` use of a message that carries
+//! nothing - and the manager's receive offers an iovec whose length is zero. A
+//! kernel that answered `EINVAL` for a zero-length data room therefore answered
+//! `EINVAL` for every worker return, left udevd's loop stuck on the failing
+//! read, and cost the machine every device tag it has.
+//!
+//! The first section below is that shape exactly, because it is the one that
+//! was wrong. The rest is the family around it, and none of it is decoration: a
+//! receive with **no room for the credentials** must still take the message and
+//! report `MSG_CTRUNC`, a zero-length buffer against a **non-empty** message
+//! must take it and report `MSG_TRUNC` (the message's own length is its
+//! boundary, not the caller's buffer), `read(2)` with a zero-length buffer must
+//! leave the queue alone (`vfs_read`'s short-circuit) while `recv(2)` with one
+//! must consume, and the credentials' `pid` must be the *sender's* - the manager
+//! looks its worker up by that number.
+//!
+//! The seqpacket cases at the end cover the other channel udevd opens, its
+//! control socket: a named `SOCK_SEQPACKET` listener is served as the byte
+//! stream this family has, and a paired one carries whole messages. Both are
+//! shapes a socket layer is likely to have to hand, and neither is what the
+//! worker channel uses.
 
 #![no_std]
 #![no_main]
@@ -75,6 +95,58 @@ fn worker_recv(fd: i32, buf: &mut [u8], ctl: &mut [u8]) -> (isize, usize, usize)
     (rc, msg.msg_controllen, msg.msg_flags)
 }
 
+/// The manager's receive as the shipped eudev spells it, which is the shape
+/// this test exists for: the iovec's length is `iov_len` - **zero** for the
+/// worker protocol, because `struct worker_message` has no members - the
+/// message is taken if one stands in the queue (`MSG_DONTWAIT`, because
+/// eudev's loop ends on `EAGAIN`), and a control buffer of
+/// `CMSG_SPACE(sizeof(struct ucred))` is offered for the sender's credentials.
+/// `iov_len` is a parameter so the same call can be aimed at a non-empty
+/// message; the base pointer is still a real buffer, the way eudev's points at
+/// its own empty struct.
+fn manager_recv(
+    fd: i32,
+    buf: &mut [u8],
+    iov_len: usize,
+    ctl: &mut [u8],
+    flags: usize,
+) -> (isize, usize, usize) {
+    let mut iov = lin::Iovec {
+        base: buf.as_mut_ptr(),
+        len: iov_len,
+    };
+    let mut msg = lin::MsgHdr {
+        msg_name: 0,
+        msg_namelen: 0,
+        _pad: 0,
+        msg_iov: core::ptr::addr_of_mut!(iov) as usize,
+        msg_iovlen: 1,
+        msg_control: ctl.as_mut_ptr() as usize,
+        msg_controllen: ctl.len(),
+        msg_flags: 0,
+    };
+    let rc = lin::recvmsg(fd, &mut msg, flags);
+    (rc, msg.msg_controllen, msg.msg_flags)
+}
+
+/// The sender's pid out of an `SCM_CREDENTIALS` chain, or -1 when the chain
+/// does not hold a well-formed one. The worker protocol looks the sender up by
+/// exactly this number, so a kernel that filled the field with anything else -
+/// the *reader's* pid, say - would attribute every worker's reply to the wrong
+/// process.
+fn credential_pid(ctl: &[u8], controllen: usize) -> isize {
+    if controllen < lin::cmsg_space(UCRED) {
+        return -1;
+    }
+    let head = unsafe { &*(ctl.as_ptr() as *const lin::Cmsghdr) };
+    if head.cmsg_level != lin::SOL_SOCKET as i32 || head.cmsg_type != lin::SCM_CREDENTIALS {
+        return -1;
+    }
+    // struct ucred { pid_t pid; uid_t uid; gid_t gid; } just past the header.
+    let cred = unsafe { &*(ctl.as_ptr().add(lin::cmsg_align(16)) as *const [u32; 3]) };
+    cred[0] as isize
+}
+
 /// Send one message from the other end, with nothing attached to it.
 fn worker_send(fd: i32, data: &[u8]) -> isize {
     let mut iov = lin::Iovec {
@@ -118,6 +190,165 @@ fn sole_credentials(ctl: &[u8], controllen: usize) -> bool {
 pub extern "C" fn mpos_user_main(_argc: i32, _argv: *const *const u8) -> ! {
     lin::puts(b"t-udev-worker\n");
     let mut failed = false;
+
+    // ---------------------------------------------------------------------
+    // First: the shape the shipped eudev uses, which is the one the boot log
+    // was complaining about. A `SOCK_DGRAM` pair, `SO_PASSCRED` on the
+    // manager's end, a worker whose whole message is zero bytes, and a
+    // manager receive offering a zero-length iovec.
+    // ---------------------------------------------------------------------
+    let mut real = [0i32; 2];
+    let opened = lin::socketpair(lin::AF_UNIX, lin::SOCK_DGRAM | SOCK_CLOEXEC, 0, &mut real);
+    lin::check_eq(
+        &mut failed,
+        b"the worker channel is a SOCK_DGRAM|SOCK_CLOEXEC pair",
+        opened,
+        0,
+    );
+    if opened == 0 {
+        lin::check_eq(
+            &mut failed,
+            b"SO_PASSCRED is accepted on the manager's end",
+            lin::setsockopt_int(real[0], lin::SOL_SOCKET, lin::SO_PASSCRED, 1),
+            0,
+        );
+
+        // The worker's message, byte for byte: `struct worker_message` has no
+        // members, so this is a zero-length `write(2)` - and it must still be a
+        // message, not a write that did nothing.
+        lin::check_eq(
+            &mut failed,
+            b"a worker's zero-byte message is accepted",
+            lin::write(real[1], &[]),
+            0,
+        );
+        let mut ready = [lin::PollFd {
+            fd: real[0],
+            events: POLLIN,
+            revents: 0,
+        }];
+        lin::check_true(
+            &mut failed,
+            b"and the manager's end reports it readable",
+            lin::poll(&mut ready, 0) > 0,
+        );
+
+        let mut body = [0u8; 8];
+        let mut ctl = [0u8; lin::cmsg_space(UCRED) + 8];
+        let (rc, controllen, flags) =
+            manager_recv(real[0], &mut body, 0, &mut ctl, lin::MSG_DONTWAIT);
+        lin::check_eq(
+            &mut failed,
+            b"the manager's zero-length receive answers 0, not EINVAL",
+            rc,
+            0,
+        );
+        lin::check_true(
+            &mut failed,
+            b"with the worker's credentials attached to it",
+            rc == 0 && sole_credentials(&ctl, controllen),
+        );
+        lin::check_true(
+            &mut failed,
+            b"and nothing truncated about a message that held no bytes",
+            flags & (lin::MSG_CTRUNC | MSG_TRUNC) == 0,
+        );
+        // eudev's loop reads until the queue says `EAGAIN`, so that is the
+        // answer the second call must give - a kernel that had left the
+        // message queued would spin here exactly as udevd did.
+        let (again, _, _) = manager_recv(real[0], &mut body, 0, &mut ctl, lin::MSG_DONTWAIT);
+        lin::check_eq(
+            &mut failed,
+            b"the message was consumed, so the next receive is EAGAIN",
+            again,
+            lin::EAGAIN,
+        );
+
+        // The pid is the whole protocol: the manager finds its worker by the
+        // sender's `ucred.pid`. A forked worker is the case that matters,
+        // because the sender is then not the process that made the pair.
+        let child = lin::fork();
+        if child == 0 {
+            lin::exit(lin::write(real[1], &[]).max(0) as i32);
+        }
+        let mut status = 0i32;
+        let _ = lin::waitpid(child as usize, &mut status, 0);
+        let mut ctl = [0u8; lin::cmsg_space(UCRED) + 8];
+        let (rc, controllen, _) = manager_recv(real[0], &mut body, 0, &mut ctl, lin::MSG_DONTWAIT);
+        lin::check_true(
+            &mut failed,
+            b"a forked worker's reply carries its own pid, not the manager's",
+            rc == 0 && credential_pid(&ctl, controllen) == child,
+        );
+
+        // A non-empty message against the same zero-length iovec: taken, and
+        // reported as truncated rather than refused. The message's own length
+        // is its boundary.
+        let three = [1u8, 2, 3];
+        let _ = lin::write(real[1], &three);
+        let (rc, controllen, flags) =
+            manager_recv(real[0], &mut body, 0, &mut ctl, lin::MSG_DONTWAIT);
+        lin::check_eq(
+            &mut failed,
+            b"a zero-length buffer still takes a message that has bytes",
+            rc,
+            0,
+        );
+        lin::check_true(
+            &mut failed,
+            b"and MSG_TRUNC says the three bytes were dropped",
+            flags & MSG_TRUNC != 0 && credential_pid(&ctl, controllen) == lin::getpid(),
+        );
+
+        // A receive with no room for the credentials at all: the message is
+        // still taken, and `MSG_CTRUNC` is how the caller learns the control
+        // data did not fit.
+        let _ = lin::write(real[1], &[]);
+        let mut msg = lin::MsgHdr {
+            msg_name: 0,
+            msg_namelen: 0,
+            _pad: 0,
+            msg_iov: 0,
+            msg_iovlen: 0,
+            msg_control: 0,
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+        let mut iov = lin::Iovec {
+            base: body.as_mut_ptr(),
+            len: 0,
+        };
+        msg.msg_iov = core::ptr::addr_of_mut!(iov) as usize;
+        msg.msg_iovlen = 1;
+        let rc = lin::recvmsg(real[0], &mut msg, lin::MSG_DONTWAIT);
+        lin::check_true(
+            &mut failed,
+            b"a receive with no control room still takes the message (MSG_CTRUNC)",
+            rc == 0 && msg.msg_flags & lin::MSG_CTRUNC != 0,
+        );
+
+        // `read(2)` is not `recv(2)`: a zero-length read returns 0 and leaves
+        // the queue exactly as it was (`vfs_read`'s short-circuit), where the
+        // receive family consumes. udevd uses `recvmsg`, but a reader that
+        // used `read` must not silently lose a worker's reply.
+        let _ = lin::write(real[1], &[]);
+        lin::check_eq(
+            &mut failed,
+            b"read(fd, buf, 0) answers 0",
+            lin::read(real[0], &mut []),
+            0,
+        );
+        let (still, _, _) = manager_recv(real[0], &mut body, 0, &mut ctl, lin::MSG_DONTWAIT);
+        lin::check_eq(
+            &mut failed,
+            b"and leaves the message queued for the receive that asks for it",
+            still,
+            0,
+        );
+
+        let _ = lin::close(real[0]);
+        let _ = lin::close(real[1]);
+    }
 
     // The pair as the manager makes it: seqpacket, with the two flag bits folded
     // into the type the way `socketpair` is called in every modern program.

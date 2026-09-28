@@ -102,11 +102,42 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
         node each see every event, which the shared queue could not do either
         (whoever read first consumed it for everybody)
 - [x] udevd's worker channel works, which is the difference between a keyboard
-      and none: a `SOCK_SEQPACKET` *pair* had a message queue that `send_dgram`
-      refused to write into, because the check asked "is this a `SOCK_DGRAM`?"
-      rather than "does this end carry messages?" - and a message no one can
-      send is a device that never gets an `ID_INPUT` property, which is what
-      `weston.ini`'s `require-input=false` has been standing in for (`t-udev-worker`)
+      and none (`t-udev-worker`). Getting there took two findings, and the first
+      draft of this line named the wrong channel, so the correction is the
+      interesting part: the *worker* channel is a **`SOCK_DGRAM`** pair
+      (`socketpair(AF_LOCAL, SOCK_DGRAM|SOCK_CLOEXEC, 0, worker_watch)`, read
+      straight off eudev's `udevd.c`) whose whole message is **zero bytes** -
+      `struct worker_message` has no members, so `sizeof` is 0, the worker's
+      `loop_write` is a zero-length `write(2)`, and the sender's
+      `SCM_CREDENTIALS` *are* the payload the manager looks its worker up by.
+      The kernel therefore has to (a) queue a zero-byte message and (b) hand it
+      over to a `recvmsg` whose iovec has length zero - and (b) was `EINVAL` for
+      every worker return, which left udevd's loop sitting on the failing read,
+      spinning "failed to receive message: Invalid argument", with every device
+      on the machine untagged. Both halves of the rule, and the `read(2)`-versus-
+      `recv(2)` distinction beside it (`read` with a zero-length buffer touches
+      nothing; `recvmsg` consumes), were measured against Linux before being
+      written. The earlier `SOCK_SEQPACKET` work - a *paired* seqpacket end
+      carrying messages, so that `send_dgram`'s "does this end carry messages?"
+      test stops asking "is this a `SOCK_DGRAM`?" - was real and stays; it is the
+      shape the *control* socket's connections have, but it was never the channel
+      the log came from.
+      **Verified on the desktop image**: after the fix a boot's `dmesg` carries
+      *zero* "failed to receive message" lines (it was ~282, one per worker
+      return), so the worker channel itself is closed. The boot also says what is
+      next, and it is not the tag: `worker [11] did not accept message -22
+      (Invalid argument), kill it` - see the item below.
+  - [ ] **the manager's handoff to a worker** — `udev_monitor_send_device(monitor,
+        worker->monitor, dev)` hands the device to the worker over
+        `NETLINK_KOBJECT_UEVENT`, and this kernel answers `EINVAL` because the
+        call is `sendto(sock, buf, count, 0, &snl, 12)` with a 12-byte `struct
+        sockaddr_nl` that the send path reads as a `sockaddr_in` and refuses for
+        being short of 16 bytes. It needs a *userspace* netlink write side for
+        the uevent family - a port id per subscriber, unicast delivery by
+        `nl_pid`, group delivery for a send with no destination address, the
+        payload left opaque - and until it exists the manager kills every worker
+        that refuses the handoff, which is why `/dev/input/event0` still carries
+        no `ID_INPUT` even though udevd now hears its workers
   - [ ] `SOCK_SEQPACKET` still carries no boundaries over a *named* socket (the
         stream this family has), which is the one documented divergence left on
         the path from `udevadm` to a tagged device node
@@ -212,6 +243,16 @@ descriptors come back with their own bytes; `t-unix-scm` pins it at line 610,
 "one byte, not two"), and ASLR (§8.1, whose own section records the four
 landmarks, the stacked draws, and the `ET_EXEC`-must-not-move rule).
 
+**And the udevd worker channel is *actually* answered now**, which needed the
+shape read off eudev's source rather than guessed from the log: the channel is a
+`SOCK_DGRAM` pair carrying a **zero-byte** message whose credentials are the
+payload, so the rule that had to exist is "a message receive with no data room
+consumes the message and answers 0" (§4.1). A `listen` backlog turned out to be
+one deeper than the number it names in the same sitting - eudev's control socket
+is created with `listen(sock, 0)` - and that is fixed and pinned too (§4.1).
+Both were measured against Linux first, and both are files the board's own entry
+had described the wrong way round.
+
 What is left, in the order that keeps each step verifiable on its own:
 
 1. **The loopback, and then §4.3's listener** - `listen`/`accept` is that
@@ -301,9 +342,11 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   smoltcp socket (Nagle off; probe timer armed at Linux's default interval).
   `getsockopt` reads back every stored option. Still record-only (no stack
   effect): `SO_REUSEADDR` (moot with one binder), buffer sizes, `SO_LINGER`.
-- **4.4** netlink is read-only: `ip addr add` / `ip route add` / `ip link set`
-  get an ACK but do not actually reconfigure the stack (RTM_NEWADDR/NEWROUTE/
-  NEWLINK write side).
+- **4.4** netlink's *route* half is written (`RTM_NEWADDR`/`NEWROUTE`/`NEWLINK`
+  applied to the live stack, §4.4). Its *uevent* half has no write side at all:
+  a userspace `sendto` on a `NETLINK_KOBJECT_UEVENT` socket is refused `EINVAL`
+  (a 12-byte `sockaddr_nl` read as a `sockaddr_in`), which is what stops udevd
+  from handing an event to one of its workers (§4.4's closing note).
 - **5.1 / 5.2** `MAP_SHARED|MAP_ANONYMOUS` is served but aliased frames do not
   cross a plain `fork`, and `MADV_DONTNEED` does not free pages — both need
   anonymous **demand paging** + per-VMA backing tracking in the `#PF` handler.
@@ -312,7 +355,8 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
 - **4.1** AF_UNIX is answered for `SOCK_STREAM` (see Phase 4), including
   `SCM_RIGHTS` descriptor handover and `SCM_CREDENTIALS`/`SO_PEERCRED` peer
   authentication — a real dbus broker can now both connect its clients and
-  name them. What the family still lacks is `SOCK_DGRAM` datagram transfer.
+  name them — and for `SOCK_DGRAM`, message-for-message. What the family still
+  lacks is message boundaries on a *named* `SOCK_SEQPACKET` connection.
 
 ---
 
@@ -541,13 +585,13 @@ mkdirat rule), connect needs `W_OK` on the node.
 Deliberate divergences from Linux (each asserted in `t-unix`/
 `t-unix-rustix`): the abstract namespace answers `EINVAL`; a connect to a
 bound-but-never-listened name is `ECONNREFUSED` rather than Linux's
-implicit backlog-0 rendezvous; ext4 refuses socket nodes (`EOPNOTSUPP` -
-`/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so only `bind` creates a
-socket name; `getpeername` answers `AF_UNIX` with an empty path (accepted
-peers carry no name). `SOCK_DGRAM` unix sockets now *open* - musl's
-`if_nametoindex` asks for one as the handle for its own `SIOCGIFINDEX`
-ioctl, and a refusal turned every device-name lookup into "can't find
-device" - but the datagram transfer itself is the documented v1 gap.
+implicit rendezvous at a socket nobody listened on; ext4 refuses socket
+nodes (`EOPNOTSUPP` - `/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so
+only `bind` creates a socket name; `getpeername` answers `AF_UNIX` with an
+empty path (accepted peers carry no name). `SOCK_DGRAM` unix sockets are
+served whole-message (`t-unix-dgram`), and so is a `SOCK_SEQPACKET` *pair*;
+a *named* `SOCK_SEQPACKET` connection is served as the byte stream this
+family has, which is the one divergence left in the family.
 
 **`SCM_RIGHTS` / `SCM_CREDENTIALS` / `SO_PEERCRED` are now answered** (see
 `t-unix-scm`): a unix (or socketpair) `sendmsg` can hand live descriptors
@@ -573,6 +617,36 @@ so a receiver that takes a short read has to look at its control buffer before
 concluding the peer is gone. That is the price of the record, and the
 alternative was a hang; `t-unix-scm` pins both the delivery and the
 non-blocking second read that follows it.
+
+**A message may be zero bytes long, and receiving one may offer no room.** The
+rule sounds like a corner and is not: eudev's worker channel is a
+`socketpair(AF_LOCAL, SOCK_DGRAM|SOCK_CLOEXEC, 0, ...)` whose whole message is
+zero bytes - `struct worker_message` has no members, so the worker's
+`loop_write` is a zero-length `write(2)`, and the credentials that arrive with
+it *are* the payload the manager looks its worker up by - and the manager's
+`recvmsg` therefore offers an iovec whose length is zero. That shape answered
+`EINVAL`, which left udevd's loop stuck on the failing read and every device on
+the machine untagged (the board's `t-udev-worker` entry carries the whole
+story). What the family now does is Linux's, measured one call at a time before
+it was written: a `recv`/`recvfrom`/`recvmsg` with a zero-byte data buffer
+**consumes** the front message and answers 0, still delivering
+`SCM_CREDENTIALS` when the reader asked and there is room (`MSG_CTRUNC` when
+there is not), and `MSG_TRUNC` when the message was longer than the buffer -
+the message's own length is its boundary, not the caller's buffer. `read(2)` is
+the exception, and it is a *file-level* one rather than a socket rule:
+`vfs_read` short-circuits a zero-length count, so `read(fd, buf, 0)` touches
+nothing at all while `recv(fd, buf, 0)` takes a message. `netlink` follows the
+same rule (a `NETLINK_USERSOCK` socket that sent itself a message was the
+measurement).
+
+**And a `listen` backlog is one deeper than the number it names.** Linux's
+admission test is `queue_len > backlog`, so `listen(fd, 0)` is a queue of one -
+which this kernel read as "never admits" until eudev's control socket turned up
+created with exactly `listen(uctrl->sock, 0)` (`udev-ctrl.c`), leaving `udevadm`
+unable to reach the daemon at all. Measured on the host: backlogs 0..=3
+admitted 1, 2, 3 and 4 connections before the next `connect` answered `EAGAIN`.
+`t-unix` pins the depth and the room an `accept` returns; the divergence that
+remains is the *unlistened* name, which is still `ECONNREFUSED`.
 
 ### 4.2 ICMP Improvements — **DONE**
 
@@ -705,9 +779,9 @@ reaches it by - `SIOCGIFFLAGS`/`SIOCSIFFLAGS`/`SIOCSIFMTU`/`SIOCGIFINDEX`
 (the one musl's `if_nametoindex` needs), `SIOCGIFMTU`, `SIOCGIFTXQLEN`/
 `SIOCGIFHWADDR` (whose numbers 0x8942/0x8927 had been swapped, answering
 the MAC for a txqueue-length request). Two helper gaps this opened: AF_UNIX
-`SOCK_DGRAM` now *opens* (musl's `if_nametoindex` asks for it as the bare
-handle for its own `SIOCGIFINDEX`), with the datagram transfer still the
-documented gap; and `IFLA_TXQLEN`/`IFLA_MTU` are native-order words, the
+`SOCK_DGRAM` had to *open* (musl's `if_nametoindex` asks for it as the bare
+handle for its own `SIOCGIFINDEX`; the datagram transfer itself has since
+landed - see §4.1); and `IFLA_TXQLEN`/`IFLA_MTU` are native-order words, the
 endianness addresses are not.
 
 **Changes**:
@@ -716,6 +790,30 @@ endianness addresses are not.
 - `RTM_NEWLINK`/`RTM_SETLINK`: link up/down (a real poll gate), MTU, name
 - `ip addr`/`ip route`/`ip link` dumps read the live tables, not constants
 - The `ifreq` ioctl set `ip link set` and `if_nametoindex` ride on
+
+**The other netlink protocol has no write side, and that is now the blocker on
+the udevd path.** `NETLINK_ROUTE` is written; `NETLINK_KOBJECT_UEVENT` is a
+read-only channel the kernel publishes into, and udev needs the userspace half of
+it: the device manager hands each event to one of its workers with
+`udev_monitor_send_device(monitor, worker->monitor, dev)`, which is a
+`sendto(2)` on a uevent socket carrying a 12-byte `struct sockaddr_nl`. The send
+path here reads that address as a `sockaddr_in` - `len < SOCKADDR_IN_LEN` - and
+answers `EINVAL`, so the handoff fails and udevd kills the worker that refused it.
+The desktop image says so out loud, after the worker channel itself was fixed
+(§4.1): `udevd[9]: worker [11] did not accept message -22 (Invalid argument),
+kill it`, and no device gets an `ID_INPUT` while it happens.
+
+What the fix needs, in the shape this kernel would have to grow: a `sockaddr_nl`
+parser for the uevent family (12 bytes, `nl_pid` in native order), a *port id*
+per subscriber (Linux gives a socket bound with `nl_pid == 0` an identity of its
+own, which is what a unicast handoff is addressed to), unicast delivery by
+`nl_pid` into the destination's existing queue, group delivery for a send with no
+destination address, and the payload left opaque - udev's monitor wire format
+(`struct udev_monitor_netlink_header` followed by the device's properties as
+NUL-separated `KEY=value` pairs) is libudev's to define, not the kernel's. Not
+attempted here: the fetch of eudev's `udev-monitor.c` that would pin the port-id
+bookkeeping did not come back, and a netlink bus is not a change to make from a
+guess.
 
 ---
 
@@ -1973,6 +2071,16 @@ It fired on every failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` and printed up 
 `[msgtrace]` lines from inside the dispatcher. The hunt it belonged to is recorded as finished
 in §4.1's udevd note, so it was leftover scaffolding standing in the one path every syscall
 crosses. **Removed, and the four arms are plain calls again** (§11.2 Step A).
+
+The class is worth watching, because it happened twice: the same hunt later left a second
+instrument behind - a `[recvtrace]` wrapper around `net::socket::handle_recvmsg` (the original
+function renamed `recvmsg_inner`, a logging body around it, and `console.rs`'s `DMESG_CAP`
+temporarily raised so the ring would not evict the lines). It was still there when the session
+that added it ended, with the bug it was hunting found by reading eudev's source instead: the
+`recvmsg` that failed was `EINVAL` for a *zero-length iovec* (§4.1). **Removed**, and the
+wrapper collapsed back into one function; the per-task cost of the shape is that a diagnostic
+in the dispatcher or the socket layer is easy to leave, and neither is in anybody's diff when
+the session ends.
 
 #### 11.1.7 — V-7: orphan and duplicate machine modules — **DONE**
 

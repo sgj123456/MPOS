@@ -168,6 +168,18 @@ impl File {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
+        // A zero-length read is `vfs_read`'s own short-circuit: the file is not
+        // touched at all, and here that is a rule with a consequence rather
+        // than a courtesy. A *message* - what a datagram socket holds - is
+        // consumed by a receive, so passing an empty buffer down to the node
+        // would eat a datagram and answer 0 for it. The `recv(2)` family is the
+        // other half of that pair and *does* consume a message with no data
+        // room (a zero-byte message is a message: eudev's worker channel is
+        // nothing but zero-byte messages), which is why the short-circuit
+        // belongs to this door and not to the socket.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let pos = self.pos.load(Ordering::Relaxed);
         // The description is named, not just its position: a node whose answer
         // depends on *which* client is asking - an evdev node's is, because its

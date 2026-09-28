@@ -50,17 +50,21 @@ pub(crate) const SOCK_DGRAM: u16 = 2;
 pub(crate) const SOCK_RAW: u16 = 3;
 /// `SOCK_SEQPACKET`: message boundaries over a stream.
 ///
-/// Nothing here carries the boundaries, and both doors serve the type as the
-/// byte stream this family does have. That is a trade, not an oversight:
-/// udevd creates *both* shapes - its control socket is a `SOCK_SEQPACKET`
-/// socket and its worker notification channel a `SOCK_SEQPACKET` socketpair -
-/// and a refusal at either one does not withhold a feature, it stops the
-/// device manager from starting at all ("error initializing udev control
-/// socket"), after which every device on the machine goes untagged and no
-/// compositor can see a keyboard. What udevd sends over them is one byte at a
-/// time, which a stream carries correctly; a caller that needed the
-/// boundaries themselves would be the one to tell the difference, and nothing
-/// on this machine is one.
+/// The type opens, and it is served in one of two ways, decided by whether a
+/// peer is paired with it. A *paired* one - a `socketpair` half - carries whole
+/// messages, because that is exactly the machinery a `SOCK_DGRAM` pair already
+/// has and a pair is what wants it (`carries_messages` in `net::unix` picks the
+/// branch). A *named* one is served as the byte stream this family has, and that
+/// is a trade rather than an oversight: udevd's control socket is created as
+/// `socket(AF_LOCAL, SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC)` and bound at
+/// `/run/udev/control`, and a refusal at that call does not withhold a feature,
+/// it stops the device manager from starting at all ("error initializing udev
+/// control socket"), after which every device on the machine goes untagged and
+/// no compositor sees a keyboard. What travels over the control connection is
+/// one fixed-size `struct udev_ctrl_msg_wire` per `sendmsg`, and a stream
+/// carries one call at a time correctly; a caller that needed the boundary of a
+/// *partial* message would be the one to tell the difference, and nothing on
+/// this machine is one (`net::unix`'s header keeps the divergence on the list).
 const SOCK_SEQPACKET: u16 = 5;
 const SOCK_NONBLOCK: u32 = 0o4000;
 const SOCK_CLOEXEC: u32 = 0o2000000;
@@ -1631,12 +1635,16 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(fields) => fields,
             Err(e) => return e,
         };
-        let Some((buf, len)) = first_iovec(iov, iovlen, from_user) else {
-            return err::EINVAL;
-        };
-        if len == 0 {
-            return err::EINVAL;
+        // The same zero-byte data room the unix branch below takes: netlink is
+        // a message queue, so a receive with nothing to read into still
+        // consumes the front message and answers zero. Measured rather than
+        // assumed, on a `NETLINK_USERSOCK` socket that sent itself a message:
+        // `recvmsg` with an empty iovec returned 0 with `MSG_TRUNC` set, and
+        // the next real receive found the queue empty.
+        if iovlen > 0 && !crate::syscall::buffer_ok(iov, iovlen * 16, false, from_user) {
+            return err::EFAULT;
         }
+        let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
         // args[2] is the flags word: `MSG_DONTWAIT` here means the caller
         // wants an answer only if one is queued.
         let Some(msg) = rtnl_answer(handle, args[2], fd) else {
@@ -1644,7 +1652,14 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         };
         let n = msg.len().min(len);
         unsafe {
-            core::ptr::copy_nonoverlapping(msg.as_ptr(), buf as *mut u8, n);
+            // `msg_flags` says what a short count cannot: the message did not
+            // fit, so the rest of it is gone. Written either way, so a caller
+            // never reads back a stale word.
+            let flags = if n < msg.len() { MSG_TRUNC } else { 0 };
+            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags as i32);
+            if n > 0 {
+                core::ptr::copy_nonoverlapping(msg.as_ptr(), buf as *mut u8, n);
+            }
             if name != 0 && namelen != 0 {
                 let at = |offset: usize| (name + offset) as *mut u8;
                 (at(0) as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
@@ -1667,13 +1682,26 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(fields) => fields,
             Err(e) => return e,
         };
-        let (buf, len) = match first_iovec(iov, iovlen, from_user) {
-            Some(pair) => pair,
-            None => return err::EINVAL,
-        };
-        if len == 0 {
-            return err::EINVAL;
+        // A message receive is allowed to bring *no data room at all* - one
+        // iovec whose length is zero, or no iovec - and that is a receive, not
+        // a refusal. A message's own length is its boundary, not the caller's
+        // buffer: Linux consumes the front message, answers zero, and still
+        // hands over the control data a reader asked for. The shape is not
+        // exotic: eudev's worker channel is a `SOCK_DGRAM` pair whose whole
+        // message is *zero bytes* (an empty `struct worker_message`, so the
+        // sender's `loop_write` is a zero-length `write(2)` and the sender's
+        // credentials are the payload), and a kernel that answered `EINVAL`
+        // here left udevd spinning on "failed to receive message: Invalid
+        // argument" with every device on the machine untagged.
+        //
+        // The iovec *array* is still validated first, so a caller whose iovec
+        // pointer is unreadable gets `EFAULT` rather than a silent zero-length
+        // receive out of a bad pointer - "no iovec" and "an iovec I cannot
+        // read" are not the same answer.
+        if iovlen > 0 && !crate::syscall::buffer_ok(iov, iovlen * 16, false, from_user) {
+            return err::EFAULT;
         }
+        let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
         if args[2] & MSG_PEEK != 0 {
             return err::EOPNOTSUPP;
         }
@@ -1683,7 +1711,14 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
             return err::EAGAIN;
         }
-        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+        // An empty buffer is a real `&mut [u8]` rather than a null slice: the
+        // receive's own bookkeeping is what carries the answer here, and a
+        // null pointer with a zero length is not a slice Rust will accept.
+        let out: &mut [u8] = if len == 0 {
+            &mut []
+        } else {
+            unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) }
+        };
         return match crate::net::unix::recv_dgram_cred(sock, out) {
             Ok((n, from, cred, cut)) => {
                 if name != 0 {
