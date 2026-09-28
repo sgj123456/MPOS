@@ -25,6 +25,27 @@
 //! QEMU's user networking always hands out. DNS is not served by the kernel -
 //! musl resolves in userspace over UDP sockets, which is why the UDP path has
 //! to work but no resolver lives here.
+//!
+//! # Two fabrics, because a route lookup is destination-only
+//!
+//! The loopback is real here - `127.0.0.1` is an address of an interface whose
+//! device hands every transmitted frame back to the receiver - and it is a
+//! *second* interface with a *second* socket set, which is the part that is not
+//! optional. smoltcp's `Interface::route` answers `Some(dst)` when the
+//! interface carries an address in `dst`'s prefix and otherwise hands the
+//! question to the route table; and `Interface::poll` walks every socket in the
+//! set it is given. One interface with one set therefore cannot serve both
+//! wires: a `127.0.0.1` connect would either match eth0's default route and
+//! leave by the NIC, or - with `127.0.0.0/8` added to eth0 - route "directly"
+//! and still leave by the NIC. So a socket belongs to exactly one of the two,
+//! [`Home`] records which, and it is decided by the first call that names an
+//! address (`bind`, `connect`, `sendto`), since smoltcp has no operation that
+//! moves a socket between sets.
+//!
+//! A raw socket is the one kind that cannot choose: its destination is a
+//! per-call argument and one socket cannot serve two sets, so it stays on eth0
+//! - which is why `ping 127.0.0.1` still travels the virtual wire (and still
+//! works, through slirp) rather than the loopback.
 
 pub mod rtnl;
 pub mod socket;
@@ -44,7 +65,8 @@ use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address,
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol,
+    Ipv4Address,
 };
 
 use crate::drivers::virtio::net::VirtioNet;
@@ -85,6 +107,10 @@ const UDP_PAYLOAD_BYTES: usize = 4 * 1024;
 /// and the endpoint state the syscalls layered on top of it maintain.
 pub(crate) enum Channel {
     Tcp {
+        /// Which interface's socket set the handle belongs to. A TCP socket is
+        /// created on eth0 - the common case - and moved to the loopback when
+        /// the first address it is given is one.
+        home: Home,
         handle: SocketHandle,
         /// What `bind` recorded, if it ran. `connect` takes this as its
         /// source - a stream socket has nothing to bind before it connects,
@@ -92,6 +118,7 @@ pub(crate) enum Channel {
         local: Option<IpEndpoint>,
     },
     Udp {
+        home: Home,
         handle: SocketHandle,
         /// The endpoint `connect` pinned, if it did. `send` without a target
         /// uses it; `sendto` overrides per call.
@@ -112,11 +139,35 @@ pub(crate) enum Channel {
     /// A raw IP socket: sends and receives complete IP packets with a given
     /// protocol number. `ping` uses this with `IPPROTO_ICMP` (1) to send
     /// ICMP echo requests and receive replies.
+    ///
+    /// Always [`Home::Eth`], and it is the one channel whose home is not a
+    /// decision: a raw socket's destination is a per-call argument (`sendto`),
+    /// so a socket that could be aimed at the loopback *and* at the wire would
+    /// have to be in both sets. Keeping it on the wire is what leaves
+    /// `ping 127.0.0.1` behaving exactly as it did - it travels the virtual
+    /// wire, and slirp answers it.
     Raw {
+        home: Home,
         handle: SocketHandle,
         /// The IP protocol number this socket is bound to (e.g. 1 for ICMP).
         protocol: u8,
     },
+}
+
+/// Which of the stack's two interfaces a socket belongs to.
+///
+/// Two, not one, because routing here is by destination alone (see the module
+/// header): a socket must be polled by the interface that can actually carry
+/// its packets, and smoltcp has no way to move one between socket sets. The
+/// value is a *fact about the socket* rather than a property of the address,
+/// because it is decided once - by the first `bind`/`connect`/`sendto` - and
+/// every later lookup resolves the handle through it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Home {
+    /// `eth0`: the virtio NIC and QEMU's user network.
+    Eth,
+    /// `lo`: the loopback device, carrying `127.0.0.0/8`.
+    Lo,
 }
 
 /// The syscall-visible facts about one socket, indexed by handle - the number
@@ -174,11 +225,56 @@ impl Default for SockOpts {
     }
 }
 
+/// One interface, the device that carries it and the sockets that live on it.
+///
+/// The three always move together: an interface is polled *over* a device and
+/// *with* a socket set, and smoltcp lets a socket move between sets by no
+/// operation at all - so the grouping is not tidiness, it is the fact that
+/// makes [`Home`] a decision rather than a lookup. The device is a type
+/// parameter because the two fabrics have different ones ([`NicDevice`] and
+/// smoltcp's own loopback), and only [`Stack::poll_home`] needs them unified.
+struct Fabric<D> {
+    iface: Interface,
+    device: D,
+    sockets: SocketSet<'static>,
+    /// The `ip link set <dev> up|down` bit. Down, this fabric stops being
+    /// polled, which is what makes a downed link read as a downed link: frames
+    /// are neither sent nor received - including on the loopback, which is why
+    /// the flag is here rather than a courtesy in the link dump.
+    up: bool,
+}
+
+/// Advance one fabric, if `ip link set` has left it up. A free function rather
+/// than a method because the two fabrics are different types: the match that
+/// picks one cannot bind them to a single name, but each arm can call this.
+fn poll_fabric<D: Device>(fabric: &mut Fabric<D>, now: SmolInstant) {
+    if fabric.up {
+        fabric
+            .iface
+            .poll(now, &mut fabric.device, &mut fabric.sockets);
+    }
+}
+
+/// Begin a TCP handshake on a socket of one fabric. `Interface::context` is a
+/// mutable borrow of the interface that must stay live across the socket's own
+/// `connect`, so the two field borrows belong in one place - here - rather than
+/// at every call site.
+fn connect_in<D: Device>(
+    fabric: &mut Fabric<D>,
+    h: SocketHandle,
+    remote: IpEndpoint,
+    local: IpListenEndpoint,
+) -> Result<(), tcp::ConnectError> {
+    let sock = fabric.sockets.get_mut::<tcp::Socket>(h);
+    sock.connect(fabric.iface.context(), remote, local)
+}
+
 /// Everything the network stack owns, in one place behind one lock.
 pub(crate) struct Stack {
-    iface: Interface,
-    device: NicDevice,
-    sockets: SocketSet<'static>,
+    /// eth0: the virtio NIC and QEMU's user network.
+    eth: Fabric<NicDevice>,
+    /// lo: `127.0.0.0/8`, carried by smoltcp's own loopback device.
+    lo: Fabric<smoltcp::phy::Loopback>,
     entries: Vec<Option<Entry>>,
     /// Sockets whose last descriptor is gone but whose teardown is still on the
     /// wire.
@@ -194,8 +290,9 @@ pub(crate) struct Stack {
     /// bounded because a peer that stops answering may cost a slot, but not the
     /// set: past [`TEARDOWN_MAX`] the oldest is torn off without ceremony, which
     /// is exactly the abrupt close this is here to avoid - and the right price
-    /// for one, rather than for thousands.
-    teardown: Vec<SocketHandle>,
+    /// for one, rather than for thousands. The home rides with the handle
+    /// because the socket to reap is in one of two sets.
+    teardown: Vec<(Home, SocketHandle)>,
     next_ephemeral: u16,
     /// Tasks parked on any socket's readiness, registered through
     /// [`subscribe`] and woken by [`service`] after every poll. One flat
@@ -204,15 +301,6 @@ pub(crate) struct Stack {
     /// again if it is still false, which is the same licence `poll(2)` gives
     /// itself, and one list is less state to keep consistent.
     waiters: Vec<crate::sched::policy::TaskId>,
-    /// Whether eth0 is administratively up - the `ip link set` bit. Down, the
-    /// interface stops being polled, which is what makes a downed link read
-    /// as a downed link: frames are neither sent nor received, and a `ping`
-    /// through it goes unanswered rather than failing in some other way.
-    eth_up: bool,
-    /// The loopback's flag - a session-level courtesy that mirrors what the
-    /// stack itself already answers (the 127.0.0.1 traffic never touches the
-    /// wire), so `ip link show` reports the bit a setter wrote.
-    lo_up: bool,
     /// eth0's name, settable by `ip link set eth0 name X` - what the link
     /// dump reports and what the address labels are derived from.
     eth_name: String,
@@ -231,17 +319,52 @@ pub(crate) const MTU_CEIL: usize = 65536;
 const TEARDOWN_MAX: usize = 32;
 
 impl Stack {
-    /// Advance the interface once: drain received frames into smoltcp, hand
-    /// it queued segments to transmit, let its timers retransmit and answer.
-    /// A link administratively down does not advance - the whole point of
-    /// `ip link set eth0 down` is that the machine stops talking.
-    fn poll_once(&mut self) {
-        if !self.eth_up {
-            return;
+    /// The socket set a socket with this home lives in.
+    fn sockets_mut(&mut self, home: Home) -> &mut SocketSet<'static> {
+        match home {
+            Home::Eth => &mut self.eth.sockets,
+            Home::Lo => &mut self.lo.sockets,
         }
+    }
+
+    /// Poll one fabric: advance its interface over its device and its own set,
+    /// unless `ip link set` has taken it down.
+    fn poll_home(&mut self, home: Home, now: SmolInstant) {
+        match home {
+            Home::Eth => poll_fabric(&mut self.eth, now),
+            Home::Lo => poll_fabric(&mut self.lo, now),
+        }
+    }
+
+    /// Advance every interface that is up once: drain received frames into
+    /// smoltcp, hand it queued segments to transmit, let its timers retransmit
+    /// and answer. A link administratively down does not advance - the whole
+    /// point of `ip link set eth0 down` is that the machine stops talking.
+    ///
+    /// The loopback is polled second and unconditionally on its own flag: a
+    /// socket it carries must progress even when the NIC is down, which is the
+    /// one thing the single-interface version could not express.
+    fn poll_once(&mut self) {
         let now = now();
-        self.iface.poll(now, &mut self.device, &mut self.sockets);
+        self.poll_home(Home::Eth, now);
+        self.poll_home(Home::Lo, now);
         self.reap_teardown();
+    }
+
+    /// Start a TCP handshake on `h`, which lives in `home`'s set: the socket's
+    /// own `connect` needs the interface's routing context *beside* the socket,
+    /// and those are two fields of one `Fabric`.
+    pub(crate) fn tcp_connect(
+        &mut self,
+        home: Home,
+        h: SocketHandle,
+        remote: IpEndpoint,
+        local: IpListenEndpoint,
+    ) -> Result<(), tcp::ConnectError> {
+        match home {
+            Home::Eth => connect_in(&mut self.eth, h, remote, local),
+            Home::Lo => connect_in(&mut self.lo, h, remote, local),
+        }
     }
 
     /// Free the sockets whose teardown finished after their last descriptor
@@ -249,24 +372,28 @@ impl Stack {
     /// inside it, because a socket reaches `Closed` by the very processing this
     /// poll performs.
     fn reap_teardown(&mut self) {
-        if self.teardown.is_empty() || !self.eth_up {
+        if self.teardown.is_empty() {
             return;
         }
-        let mut finished: Vec<SocketHandle> = Vec::new();
-        for h in self.teardown.iter() {
-            let sock = self.sockets.get_mut::<tcp::Socket>(*h);
+        let mut finished: Vec<usize> = Vec::new();
+        for i in 0..self.teardown.len() {
+            let (home, h) = self.teardown[i];
             // `Closed` is the end of the graceful machine *and* the state an
             // aborted socket is dropped into - and smoltcp emits the reset from
             // there, during the poll this runs after. So one condition covers
             // both teardowns, and reaping after the poll is what lets the reset
             // actually leave before the socket disappears.
-            if matches!(sock.state(), tcp::State::Closed) {
-                finished.push(*h);
+            if matches!(
+                self.sockets_mut(home).get_mut::<tcp::Socket>(h).state(),
+                tcp::State::Closed
+            ) {
+                finished.push(i);
             }
         }
-        for h in finished {
-            self.sockets.remove(h);
-            self.teardown.retain(|&x| x != h);
+        // Backwards, so each index still names the entry it was recorded for.
+        for i in finished.into_iter().rev() {
+            let (home, h) = self.teardown.remove(i);
+            self.sockets_mut(home).remove(h);
         }
     }
 
@@ -280,20 +407,20 @@ impl Stack {
         port
     }
 
-    /// Add a freshly built socket to the socket set and hand back its handle.
-    pub(crate) fn add_tcp(&mut self) -> SocketHandle {
+    /// Add a freshly built TCP socket to `home`'s set and hand back its handle.
+    pub(crate) fn add_tcp(&mut self, home: Home) -> SocketHandle {
         let rx = tcp::SocketBuffer::new(alloc::vec![0u8; TCP_RX_BYTES]);
         let tx = tcp::SocketBuffer::new(alloc::vec![0u8; TCP_TX_BYTES]);
-        self.sockets.add(tcp::Socket::new(rx, tx))
+        self.sockets_mut(home).add(tcp::Socket::new(rx, tx))
     }
 
     /// The same for a datagram socket.
-    pub(crate) fn add_udp(&mut self) -> SocketHandle {
+    pub(crate) fn add_udp(&mut self, home: Home) -> SocketHandle {
         let rx_meta = alloc::vec![udp::PacketMetadata::EMPTY; UDP_PACKET_SLOTS];
         let tx_meta = alloc::vec![udp::PacketMetadata::EMPTY; UDP_PACKET_SLOTS];
         let rx = udp::PacketBuffer::new(rx_meta, alloc::vec![0u8; UDP_PAYLOAD_BYTES]);
         let tx = udp::PacketBuffer::new(tx_meta, alloc::vec![0u8; UDP_PAYLOAD_BYTES]);
-        self.sockets.add(udp::Socket::new(rx, tx))
+        self.sockets_mut(home).add(udp::Socket::new(rx, tx))
     }
 
     /// A raw IP socket bound to the given protocol number. The buffers are
@@ -302,7 +429,7 @@ impl Stack {
     const RAW_RX_BYTES: usize = 4 * 1024;
     const RAW_TX_BYTES: usize = 4 * 1024;
 
-    pub(crate) fn add_raw(&mut self, protocol: u8) -> SocketHandle {
+    pub(crate) fn add_raw(&mut self, home: Home, protocol: u8) -> SocketHandle {
         let rx = raw_sock::PacketBuffer::new(
             alloc::vec![raw_sock::PacketMetadata::EMPTY; 4],
             alloc::vec![0u8; Self::RAW_RX_BYTES],
@@ -311,7 +438,7 @@ impl Stack {
             alloc::vec![raw_sock::PacketMetadata::EMPTY; 4],
             alloc::vec![0u8; Self::RAW_TX_BYTES],
         );
-        self.sockets.add(raw_sock::Socket::new(
+        self.sockets_mut(home).add(raw_sock::Socket::new(
             None,
             Some(ip_to_smoltcp_protocol(protocol)),
             rx,
@@ -322,6 +449,64 @@ impl Stack {
     /// The next anonymous local port for `stack` callers inside a `with`.
     pub(crate) fn ephemeral(&mut self) -> u16 {
         self.alloc_ephemeral()
+    }
+
+    /// Move a TCP socket to `want`'s set, if it is not already there and has
+    /// not been used yet, and report the home it lives in from now on.
+    ///
+    /// The move has to happen *before* the call that names the address - a
+    /// `bind` that only records the endpoint, a `connect` about to start - and
+    /// it is only safe then: a socket that has begun a handshake carries state
+    /// smoltcp has no way to hand to another set, so this removes and adds a
+    /// *fresh* socket and every byte the old one held is deliberately nothing.
+    /// `Closed` is exactly "nothing has happened yet" for a TCP socket: our own
+    /// `bind` does not touch it (it records the endpoint in the registry and
+    /// defers to `connect`), and the states past it are the handshake's.
+    pub(crate) fn settle_tcp(&mut self, home: &mut Home, h: &mut SocketHandle, want: Home) {
+        if *home == want {
+            return;
+        }
+        debug_assert!(
+            matches!(
+                self.sockets_mut(*home).get_mut::<tcp::Socket>(*h).state(),
+                tcp::State::Closed
+            ),
+            "a TCP socket that has left Closed cannot change interface"
+        );
+        self.sockets_mut(*home).remove(*h);
+        *h = self.add_tcp(want);
+        *home = want;
+    }
+
+    /// The same for a datagram socket. The caller's precondition is the same
+    /// one, spelled in the registry rather than the socket: `!bound &&
+    /// peer.is_none()`, checked *before* `sock.bind` runs - smoltcp keeps a
+    /// bound UDP socket's name, and a new socket would lose it silently.
+    pub(crate) fn settle_udp(&mut self, home: &mut Home, h: &mut SocketHandle, want: Home) {
+        if *home == want {
+            return;
+        }
+        self.sockets_mut(*home).remove(*h);
+        *h = self.add_udp(want);
+        *home = want;
+    }
+}
+
+/// Which interface a destination address belongs to.
+///
+/// The whole of the routing decision, and deliberately the only rule: smoltcp
+/// routes by destination alone, so a socket aimed at `127.0.0.0/8` must be in
+/// the loopback's set and everything else in eth0's. The wildcard address
+/// (`0.0.0.0`), a port-0 bind and an unbound socket all land on eth0 - which is
+/// where Linux's wildcard listener lives too, and the one place this diverges
+/// is that a wildcard listener here does not also answer a loopback client
+/// (there is no second socket to answer it with; see `PLAN.md` §4.3).
+pub(crate) fn home_of(addr: IpAddress) -> Home {
+    match addr {
+        IpAddress::Ipv4(v4) => match v4.octets() {
+            [127, ..] => Home::Lo,
+            _ => Home::Eth,
+        },
     }
 }
 
@@ -372,30 +557,29 @@ pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> 
     };
     with_stack(|st| {
         let mut rows = Vec::new();
+        // A handle is resolved *after* the entry borrow ends: both the entry
+        // table and the socket sets live inside this one `Stack`, so reading a
+        // socket while iterating the entries is two borrows of the same value.
+        // Collecting the TCP handles first is the whole of the fix, and UDP
+        // needs none of it - its row comes from the recorded endpoints.
+        let mut connected: Vec<(u64, Home, SocketHandle, Option<IpEndpoint>)> = Vec::new();
         for (idx, slot) in st.entries.iter().enumerate() {
             let Some(entry) = slot else { continue };
             let inode = (idx + 1) as u64;
             match &entry.channel {
-                Channel::Tcp { handle, local } if tcp => {
-                    let sock = st.sockets.get::<tcp::Socket>(*handle);
-                    let local_ep = sock.local_endpoint().or(*local).unwrap_or_else(zero);
-                    let remote_ep = sock.remote_endpoint().unwrap_or_else(zero);
-                    rows.push(crate::vfs::procfs::NetRow {
-                        local: row_of(local_ep),
-                        remote: row_of(remote_ep),
-                        state: tcp_proc_state(sock),
-                        uid: 0,
-                        inode,
-                    });
+                Channel::Tcp {
+                    home,
+                    handle,
+                    local,
+                } if tcp => {
+                    connected.push((inode, *home, *handle, *local));
                 }
                 Channel::Udp { local, peer, .. } if !tcp => {
                     // UDP reports the bound/connected endpoints the entry
                     // records; its datagram "state" is 0, as Linux shows.
-                    let local_ep = (*local).unwrap_or_else(zero);
-                    let remote_ep = (*peer).unwrap_or_else(zero);
                     rows.push(crate::vfs::procfs::NetRow {
-                        local: row_of(local_ep),
-                        remote: row_of(remote_ep),
+                        local: row_of((*local).unwrap_or_else(zero)),
+                        remote: row_of((*peer).unwrap_or_else(zero)),
                         state: 0,
                         uid: 0,
                         inode,
@@ -403,6 +587,18 @@ pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> 
                 }
                 _ => {}
             }
+        }
+        for (inode, home, handle, local) in connected {
+            let sock = st.sockets_mut(home).get::<tcp::Socket>(handle);
+            let local_ep = sock.local_endpoint().or(local).unwrap_or_else(zero);
+            let remote_ep = sock.remote_endpoint().unwrap_or_else(zero);
+            rows.push(crate::vfs::procfs::NetRow {
+                local: row_of(local_ep),
+                remote: row_of(remote_ep),
+                state: tcp_proc_state(sock),
+                uid: 0,
+                inode,
+            });
         }
         rows
     })
@@ -444,17 +640,25 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
         };
         let owned = match (family, typ) {
             (socket::AF_INET, socket::SOCK_STREAM) => Channel::Tcp {
-                handle: stack.add_tcp(),
+                // Created on eth0 because that is what most sockets are for;
+                // the first address the socket is given moves it to the
+                // loopback if that is where it belongs. See `Home`.
+                home: Home::Eth,
+                handle: stack.add_tcp(Home::Eth),
                 local: None,
             },
             (socket::AF_INET, socket::SOCK_DGRAM) => Channel::Udp {
-                handle: stack.add_udp(),
+                home: Home::Eth,
+                handle: stack.add_udp(Home::Eth),
                 peer: None,
                 bound: false,
                 local: None,
             },
             (socket::AF_INET, socket::SOCK_RAW) => Channel::Raw {
-                handle: stack.add_raw(protocol as u8),
+                // The one channel that never moves: a raw socket's destination
+                // is per call, so it cannot be tied to one interface's set.
+                home: Home::Eth,
+                handle: stack.add_raw(Home::Eth, protocol as u8),
                 protocol: protocol as u8,
             },
             // The IPv6 stub: an entry with no smoltcp socket behind it.
@@ -508,14 +712,14 @@ pub(crate) fn free_entry(handle: usize) {
             return;
         };
         let owned = match &entry.channel {
-            Channel::Tcp { handle, .. } => Some(*handle),
-            Channel::Udp { handle, .. } => Some(*handle),
-            Channel::Raw { handle, .. } => Some(*handle),
+            Channel::Tcp { home, handle, .. } => Some((*home, *handle)),
+            Channel::Udp { home, handle, .. } => Some((*home, *handle)),
+            Channel::Raw { home, handle, .. } => Some((*home, *handle)),
             // The IPv6 stub owns no smoltcp socket; the registry slot is all
             // there is to free.
             Channel::Inet6 => None,
         };
-        if let Some(h) = owned {
+        if let Some((home, h)) = owned {
             // A TCP socket's last close is the one that has something left to
             // say. `close()` on smoltcp does not transmit - it marks the socket
             // closing and waits for the poll loop to put the `FIN` out - so
@@ -524,20 +728,20 @@ pub(crate) fn free_entry(handle: usize) {
             // closed port. The other kinds are connectionless: nothing is
             // outstanding, and their buffers come back now.
             if matches!(&entry.channel, Channel::Tcp { .. }) {
-                stack.sockets.get_mut::<tcp::Socket>(h).close();
+                stack.sockets_mut(home).get_mut::<tcp::Socket>(h).close();
                 // Bounded, and the oldest goes first: 32 unanswered teardowns is
                 // already more than any real peer owes a machine that closed on
                 // it, and the alternative is a set that fills up and refuses new
                 // sockets forever.
                 if stack.teardown.len() >= TEARDOWN_MAX
-                    && let Some(oldest) = stack.teardown.first().copied()
+                    && let Some((old_home, oldest)) = stack.teardown.first().copied()
                 {
                     stack.teardown.remove(0);
-                    stack.sockets.remove(oldest);
+                    stack.sockets_mut(old_home).remove(oldest);
                 }
-                stack.teardown.push(h);
+                stack.teardown.push((home, h));
             } else {
-                stack.sockets.remove(h);
+                stack.sockets_mut(home).remove(h);
             }
         }
     });
@@ -613,7 +817,7 @@ pub(crate) fn wake_waiters() {
 pub fn irq_service() {
     let waiters = with_stack(|stack| {
         stack.poll_once();
-        stack.device.net.ack_interrupt();
+        stack.eth.device.net.ack_interrupt();
         stack.waiters.clone()
     })
     .unwrap_or_default();
@@ -653,9 +857,28 @@ pub(crate) struct LinkFacts {
 }
 
 /// eth0's IPv4 addresses, in the order the interface holds them.
+///
+/// eth0's and not "the addresses this machine has": the loopback's are
+/// [`lo_addrs`], because a route dump has to say *which* interface an address
+/// belongs to and the two are separate interfaces here.
 pub(crate) fn ipv4_addrs() -> Vec<AddrFacts> {
+    addrs_of(Home::Eth)
+}
+
+/// The loopback's IPv4 addresses. One, as the machine is configured - but read
+/// from the live interface rather than from a constant, so §4.4's "the dumps
+/// read the live tables" stays true for the interface that is actually up.
+pub(crate) fn lo_addrs() -> Vec<AddrFacts> {
+    addrs_of(Home::Lo)
+}
+
+fn addrs_of(home: Home) -> Vec<AddrFacts> {
     with_stack(|st| {
-        st.iface
+        let iface = match home {
+            Home::Eth => &st.eth.iface,
+            Home::Lo => &st.lo.iface,
+        };
+        iface
             .ip_addrs()
             .iter()
             .filter_map(|cidr| match cidr {
@@ -673,11 +896,13 @@ pub(crate) fn ipv4_addrs() -> Vec<AddrFacts> {
     .unwrap_or_default()
 }
 
-/// The routing table as it stands, one entry per prefix.
+/// The routing table as it stands, one entry per prefix. eth0's table: the
+/// loopback has none, which is the fact that keeps a lo-set socket aimed off-box
+/// silent rather than leaky.
 pub(crate) fn routes() -> Vec<RouteFacts> {
     with_stack(|st| {
         let mut out = Vec::new();
-        st.iface.routes_mut().update(|storage| {
+        st.eth.iface.routes_mut().update(|storage| {
             for route in storage.iter() {
                 let (dst, dst_len) = match route.cidr {
                     IpCidr::Ipv4(v4) => (v4.address().octets(), v4.prefix_len()),
@@ -705,11 +930,11 @@ pub(crate) fn routes() -> Vec<RouteFacts> {
 /// The whole of what a link dump reports, or `None` with no stack behind it.
 pub(crate) fn link_facts() -> Option<LinkFacts> {
     with_stack(|st| LinkFacts {
-        lo_up: st.lo_up,
-        eth_up: st.eth_up,
+        lo_up: st.lo.up,
+        eth_up: st.eth.up,
         eth_name: st.eth_name.clone(),
-        mtu: st.device.mtu as u32,
-        mac: st.device.net.mac(),
+        mtu: st.eth.device.mtu as u32,
+        mac: st.eth.device.net.mac(),
     })
 }
 
@@ -717,7 +942,7 @@ pub(crate) fn link_facts() -> Option<LinkFacts> {
 /// carries, which is what a route dump reports as `RTA_PREFSRC` and what
 /// `fastfetch` reads as the machine's local IP.
 pub(crate) fn primary_ipv4() -> Option<[u8; 4]> {
-    with_stack(|st| st.iface.ipv4_addr().map(|a| a.octets())).flatten()
+    with_stack(|st| st.eth.iface.ipv4_addr().map(|a| a.octets())).flatten()
 }
 
 /// `ip addr add` on eth0: the address the interface does not yet carry. An
@@ -731,7 +956,7 @@ pub(crate) fn add_ipv4_addr(ip: [u8; 4], prefix: u8) -> Result<(), isize> {
             prefix,
         );
         let mut rc = Ok(());
-        st.iface.update_ip_addrs(|addrs| {
+        st.eth.iface.update_ip_addrs(|addrs| {
             if addrs.contains(&cidr) {
                 rc = Err(crate::syscall::err::EEXIST);
                 return;
@@ -751,7 +976,7 @@ pub(crate) fn add_ipv4_addr(ip: [u8; 4], prefix: u8) -> Result<(), isize> {
 pub(crate) fn del_ipv4_addr(ip: [u8; 4]) -> Result<(), isize> {
     with_stack(|st| {
         let mut rc = Err(crate::syscall::err::EADDRNOTAVAIL);
-        st.iface.update_ip_addrs(|addrs| {
+        st.eth.iface.update_ip_addrs(|addrs| {
             let hit = addrs.iter().position(|a| match a {
                 IpCidr::Ipv4(v4) => v4.address().octets() == ip,
                 // See `ipv4_addrs` for why the wildcard is gated.
@@ -782,7 +1007,7 @@ pub(crate) fn add_route(dst: [u8; 4], dst_len: u8, gateway: [u8; 4]) -> Result<(
             gateway[0], gateway[1], gateway[2], gateway[3],
         ));
         let mut rc = Ok(());
-        st.iface.routes_mut().update(|storage| {
+        st.eth.iface.routes_mut().update(|storage| {
             if storage.iter().any(|r| r.cidr == cidr) {
                 rc = Err(crate::syscall::err::EEXIST);
                 return;
@@ -812,7 +1037,7 @@ pub(crate) fn del_route(dst: [u8; 4], dst_len: u8) -> Result<(), isize> {
             dst_len,
         );
         let mut rc = Err(crate::syscall::err::ESRCH);
-        st.iface.routes_mut().update(|storage| {
+        st.eth.iface.routes_mut().update(|storage| {
             if let Some(pos) = storage.iter().position(|r| r.cidr == want) {
                 storage.remove(pos);
                 rc = Ok(());
@@ -823,17 +1048,18 @@ pub(crate) fn del_route(dst: [u8; 4], dst_len: u8) -> Result<(), isize> {
     .unwrap_or(Err(crate::syscall::err::ENODEV))
 }
 
-/// `ip link set <dev> up|down`. Index 1 is the loopback, whose flag is
-/// recorded and reported; index 2 is eth0, whose down state the stack
-/// honours. Anything else is `ENODEV`.
+/// `ip link set <dev> up|down`. Index 1 is the loopback, index 2 is eth0; each
+/// flag gates its own interface's polling, so a downed link really stops
+/// carrying frames - including the loopback, which is no longer a device that
+/// cannot be turned off. Anything else is `ENODEV`.
 pub(crate) fn set_link_up(index: u32, up: bool) -> Result<(), isize> {
     with_stack(|st| match index {
         1 => {
-            st.lo_up = up;
+            st.lo.up = up;
             Ok(())
         }
         2 => {
-            st.eth_up = up;
+            st.eth.up = up;
             Ok(())
         }
         _ => Err(crate::syscall::err::ENODEV),
@@ -847,7 +1073,7 @@ pub(crate) fn set_link_up(index: u32, up: bool) -> Result<(), isize> {
 pub(crate) fn set_mtu(mtu: u32) -> Result<(), isize> {
     with_stack(|st| {
         if (MTU_FLOOR..=MTU_CEIL).contains(&(mtu as usize)) {
-            st.device.mtu = mtu as usize;
+            st.eth.device.mtu = mtu as usize;
             Ok(())
         } else {
             Err(crate::syscall::err::EINVAL)
@@ -892,8 +1118,10 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
     let polled = with(handle, |stack, entry| {
         stack.poll_once();
         match &entry.channel {
-            Channel::Tcp { handle: h, .. } => {
-                let sock = stack.sockets.get_mut::<tcp::Socket>(*h);
+            Channel::Tcp {
+                home, handle: h, ..
+            } => {
+                let sock = stack.sockets_mut(*home).get_mut::<tcp::Socket>(*h);
                 let closing = matches!(
                     sock.state(),
                     tcp::State::CloseWait
@@ -907,15 +1135,19 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
                     write: sock.can_send(),
                 }
             }
-            Channel::Udp { handle: h, .. } => {
-                let sock = stack.sockets.get_mut::<udp::Socket>(*h);
+            Channel::Udp {
+                home, handle: h, ..
+            } => {
+                let sock = stack.sockets_mut(*home).get_mut::<udp::Socket>(*h);
                 crate::vfs::Ready {
                     read: sock.can_recv(),
                     write: sock.can_send(),
                 }
             }
-            Channel::Raw { handle: h, .. } => {
-                let sock = stack.sockets.get_mut::<raw_sock::Socket>(*h);
+            Channel::Raw {
+                home, handle: h, ..
+            } => {
+                let sock = stack.sockets_mut(*home).get_mut::<raw_sock::Socket>(*h);
                 crate::vfs::Ready {
                     read: sock.can_recv(),
                     write: sock.can_send(),
@@ -960,17 +1192,45 @@ pub fn init() -> bool {
         GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3],
     ));
 
+    // The loopback: smoltcp's own device, which hands every transmitted frame
+    // back to the next receive. It carries `127.0.0.0/8` - the prefix Linux
+    // gives `lo`, so the whole range routes here rather than only the one
+    // address - and it has no routes at all, which is deliberate: a socket in
+    // its set aimed at anything off-box finds no route and emits nothing,
+    // rather than leaking onto the wire it was kept away from.
+    //
+    // It borrows eth0's MAC because Linux's `lo` has no hardware address and
+    // smoltcp's Ethernet medium insists on one, and because a self-addressed
+    // first packet resolves by ARP against ourselves - the answer has to be the
+    // address the frame was sent to.
+    let mut lo_device = smoltcp::phy::Loopback::new(Medium::Ethernet);
+    let mut lo_iface = Interface::new(
+        Config::new(HardwareAddress::Ethernet(EthernetAddress(mac))),
+        &mut lo_device,
+        now(),
+    );
+    lo_iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8));
+    });
+
     critical_section::with(|cs| {
         *NET.borrow(cs).borrow_mut() = Some(Stack {
-            iface,
-            device,
-            sockets: SocketSet::new(Vec::new()),
+            eth: Fabric {
+                iface,
+                device,
+                sockets: SocketSet::new(Vec::new()),
+                up: true,
+            },
+            lo: Fabric {
+                iface: lo_iface,
+                device: lo_device,
+                sockets: SocketSet::new(Vec::new()),
+                up: true,
+            },
             entries: Vec::new(),
             teardown: Vec::new(),
             next_ephemeral: EPHEMERAL_MIN,
             waiters: Vec::new(),
-            eth_up: true,
-            lo_up: true,
             eth_name: String::from("eth0"),
         });
     });

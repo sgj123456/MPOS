@@ -749,19 +749,37 @@ fn flags_of(up: bool, loopback: bool) -> u32 {
     }
 }
 
-/// `RTM_GETADDR`'s answer: the loopback's one address and every address the
-/// interface carries, in the order the stack holds them. The label is the
+/// `RTM_GETADDR`'s answer: the loopback's addresses and every address eth0
+/// carries, in the order each interface holds them. The label is the
 /// interface's name - `eth0` for the first address, `eth0:1` for the second,
 /// the alias convention `ip addr` prints.
+///
+/// Both halves are read from the live interfaces rather than from constants,
+/// which is what §4.4 promises and what the loopback's promotion made
+/// observable: `lo` is a real interface carrying a real `127.0.0.0/8`, so
+/// printing a remembered `127.0.0.1` would be a dump that could disagree with
+/// the stack it describes.
 fn dump_addrs(seq: u32, pid: u32) -> Vec<Vec<u8>> {
     let mut v = Vec::new();
     let Some(facts) = crate::net::link_facts() else {
         return vec![done(seq, pid)];
     };
-    // The loopback's address is reported whatever its flag says: an address
+    // The loopback's addresses are reported whatever its flag says: an address
     // outlives the link's up-ness (Linux reports both states), and callers
-    // walking `getifaddrs` expect 127.0.0.1 to be there.
-    v.push(addr_msg(seq, pid, LO_INDEX, 8, [127, 0, 0, 1], "lo", 254));
+    // walking `getifaddrs` expect 127.0.0.1 to be there. One, as the machine
+    // is configured, and the label needs no alias suffix because Linux does not
+    // number `lo`'s addresses.
+    for addr in crate::net::lo_addrs() {
+        v.push(addr_msg(
+            seq,
+            pid,
+            LO_INDEX,
+            addr.prefix,
+            addr.ip,
+            "lo",
+            254,
+        ));
+    }
     for (n, addr) in crate::net::ipv4_addrs().into_iter().enumerate() {
         let label = if n == 0 {
             facts.eth_name.clone()

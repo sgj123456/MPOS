@@ -1064,18 +1064,30 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
     // poll ticks - so the lock is dropped for every one of those.
     let started = super::with(handle, |stack, entry| {
         stack.poll_once();
-        let (sock_handle, local) = match &entry.channel {
-            Channel::Tcp { handle, local } => (*handle, *local),
-            _ => return Err(err::ENOTSOCK),
+        let Channel::Tcp {
+            home,
+            handle: sock_handle,
+            local,
+        } = &mut entry.channel
+        else {
+            return Err(err::ENOTSOCK);
         };
+        // The destination decides which interface carries this socket - the
+        // first address a connecting socket is given, and the same rule a
+        // `bind` applies. Free here for the same reason: nothing has used the
+        // socket yet.
+        let want = super::home_of(endpoint.addr);
+        stack.settle_tcp(home, sock_handle, want);
         // The source port is settled before the socket is borrowed: drawing
         // an ephemeral port needs the whole stack, and the borrow of the
         // socket would be in the way.
-        let port = match local {
+        let port = match *local {
             Some(local) if local.port != 0 => local.port,
             _ => stack.ephemeral(),
         };
-        let sock = stack.sockets.get_mut::<tcp::Socket>(sock_handle);
+        let sock = stack
+            .sockets_mut(*home)
+            .get_mut::<tcp::Socket>(*sock_handle);
         match sock.state() {
             tcp::State::Established | tcp::State::SynReceived => return Err(err::EISCONN),
             tcp::State::Closed => {}
@@ -1084,8 +1096,7 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
         // The smoltcp connect refuses port 0, so there is no "let it pick" -
         // the ephemeral allocation is ours to do, as it is on Linux.
         let local = IpListenEndpoint { addr: None, port };
-        let cx = stack.iface.context();
-        match sock.connect(cx, endpoint, local) {
+        match stack.tcp_connect(*home, *sock_handle, endpoint, local) {
             Ok(()) => Ok(()),
             Err(tcp::ConnectError::InvalidState) => Err(err::EALREADY),
             Err(tcp::ConnectError::Unaddressable) => Err(err::EADDRNOTAVAIL),
@@ -1108,13 +1119,16 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
             let Channel::Tcp {
+                home,
                 handle: sock_handle,
                 ..
             } = &entry.channel
             else {
                 return Err(err::ENOTSOCK);
             };
-            let sock = stack.sockets.get_mut::<tcp::Socket>(*sock_handle);
+            let sock = stack
+                .sockets_mut(*home)
+                .get_mut::<tcp::Socket>(*sock_handle);
             match sock.state() {
                 tcp::State::Established | tcp::State::SynReceived => Ok(true),
                 tcp::State::Closed => Err(err::ECONNREFUSED),
@@ -1141,13 +1155,17 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
             super::with(handle, |stack, entry| {
                 stack.poll_once();
                 let Channel::Tcp {
+                    home,
                     handle: sock_handle,
                     ..
                 } = &entry.channel
                 else {
                     return true;
                 };
-                let state = stack.sockets.get_mut::<tcp::Socket>(*sock_handle).state();
+                let state = stack
+                    .sockets_mut(*home)
+                    .get_mut::<tcp::Socket>(*sock_handle)
+                    .state();
                 !matches!(state, tcp::State::SynSent)
             })
             .unwrap_or(true)
@@ -1477,13 +1495,16 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
             let Channel::Tcp {
+                home,
                 handle: sock_handle,
                 ..
             } = &entry.channel
             else {
                 return Err(err::ENOTSOCK);
             };
-            let sock = stack.sockets.get_mut::<tcp::Socket>(*sock_handle);
+            let sock = stack
+                .sockets_mut(*home)
+                .get_mut::<tcp::Socket>(*sock_handle);
             if !sock.may_send() {
                 // The connection is over - reset, timed out or shut down.
                 // Writing into it reports the break, as EPIPE.
@@ -1527,6 +1548,7 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
         let e = park_until(|| {
             super::with(handle, |stack, entry| {
                 let Channel::Tcp {
+                    home,
                     handle: sock_handle,
                     ..
                 } = &entry.channel
@@ -1534,7 +1556,7 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
                     return true;
                 };
                 stack
-                    .sockets
+                    .sockets_mut(*home)
                     .get_mut::<tcp::Socket>(*sock_handle)
                     .can_send()
             })
@@ -1552,6 +1574,7 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
     let sent = super::with(handle, |stack, entry| {
         stack.poll_once();
         let Channel::Udp {
+            home,
             handle: sock_handle,
             peer,
             bound,
@@ -1564,14 +1587,24 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
             return Err(err::EDESTADDRREQ);
         };
         if !*bound {
+            // The destination decides the interface for a socket that was
+            // never bound - the implicit bind on first send is the first
+            // address it is given, so it settles here exactly as a real
+            // `bind` would.
+            let want = super::home_of(target.addr);
+            stack.settle_udp(home, sock_handle, want);
             let port = stack.ephemeral();
-            let sock = stack.sockets.get_mut::<udp::Socket>(*sock_handle);
+            let sock = stack
+                .sockets_mut(*home)
+                .get_mut::<udp::Socket>(*sock_handle);
             if sock.bind(IpListenEndpoint { addr: None, port }).is_err() {
                 return Err(err::EADDRINUSE);
             }
             *bound = true;
         }
-        let sock = stack.sockets.get_mut::<udp::Socket>(*sock_handle);
+        let sock = stack
+            .sockets_mut(*home)
+            .get_mut::<udp::Socket>(*sock_handle);
         match sock.send_slice(data, target) {
             Ok(()) => {
                 // Queued is not sent: the extra poll puts the datagram on
@@ -2147,13 +2180,16 @@ fn tcp_recv(
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
             let Channel::Tcp {
+                home,
                 handle: sock_handle,
                 ..
             } = &entry.channel
             else {
                 return RecvStep::Err(err::ENOTSOCK);
             };
-            let sock = stack.sockets.get_mut::<tcp::Socket>(*sock_handle);
+            let sock = stack
+                .sockets_mut(*home)
+                .get_mut::<tcp::Socket>(*sock_handle);
             match sock.recv_slice(out) {
                 Ok(0) => RecvStep::Wait,
                 Ok(n) => RecvStep::Got(n, None),
@@ -2190,6 +2226,7 @@ fn udp_recv(
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
             let Channel::Udp {
+                home,
                 handle: sock_handle,
                 bound,
                 ..
@@ -2199,13 +2236,17 @@ fn udp_recv(
             };
             if !*bound {
                 let port = stack.ephemeral();
-                let sock = stack.sockets.get_mut::<udp::Socket>(*sock_handle);
+                let sock = stack
+                    .sockets_mut(*home)
+                    .get_mut::<udp::Socket>(*sock_handle);
                 if sock.bind(IpListenEndpoint { addr: None, port }).is_err() {
                     return RecvStep::Err(err::EADDRINUSE);
                 }
                 *bound = true;
             }
-            let sock = stack.sockets.get_mut::<udp::Socket>(*sock_handle);
+            let sock = stack
+                .sockets_mut(*home)
+                .get_mut::<udp::Socket>(*sock_handle);
             match sock.recv_slice(out) {
                 Ok((n, meta)) => RecvStep::Got(n, Some(meta.endpoint)),
                 Err(udp::RecvError::Exhausted) => RecvStep::Wait,
@@ -2249,13 +2290,16 @@ fn raw_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
     let sent = super::with(handle, |stack, entry| {
         stack.poll_once();
         let Channel::Raw {
+            home,
             handle: sock_handle,
             protocol,
         } = &entry.channel
         else {
             return Err(err::ENOTSOCK);
         };
-        let sock = stack.sockets.get_mut::<raw_sock::Socket>(*sock_handle);
+        let sock = stack
+            .sockets_mut(*home)
+            .get_mut::<raw_sock::Socket>(*sock_handle);
         // Build a complete IPv4 packet: 20-byte header + ICMP payload.
         let total_len = 20 + data.len();
         if total_len > 65535 {
@@ -2334,13 +2378,16 @@ fn raw_recv(
             super::with(handle, |stack, entry| {
                 stack.poll_once();
                 let Channel::Raw {
+                    home,
                     handle: sock_handle,
                     ..
                 } = &entry.channel
                 else {
                     return Err(err::ENOTSOCK);
                 };
-                let sock = stack.sockets.get_mut::<raw_sock::Socket>(*sock_handle);
+                let sock = stack
+                    .sockets_mut(*home)
+                    .get_mut::<raw_sock::Socket>(*sock_handle);
                 let n = match sock.recv_slice(out) {
                     Ok(n) => n,
                     Err(raw_sock::RecvError::Exhausted) => return Err(err::EWOULDBLOCK),
@@ -2479,10 +2526,21 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
     };
     let bound = super::with(handle, |stack, entry| {
         match &mut entry.channel {
-            Channel::Tcp { local, .. } => {
+            Channel::Tcp {
+                home,
+                handle: sock_handle,
+                local,
+            } => {
                 if local.is_some() {
                     return Err(err::EINVAL);
                 }
+                // The address decides which interface carries this socket, and
+                // it is decided here because `bind` is the first call that can
+                // name one: `127.0.0.1` is the loopback's, anything else -
+                // including the wildcard - eth0's. The socket has not been
+                // touched yet, so the move is free; see `Stack::settle_tcp`.
+                let want = super::home_of(endpoint.addr);
+                stack.settle_tcp(home, sock_handle, want);
                 // A port of 0 means "pick one", and it is picked here rather
                 // than at connect: `getsockname` has to be able to answer
                 // before the caller connects to anything, which is the whole
@@ -2522,6 +2580,7 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
             // per-call destination.
             Channel::Raw { .. } => Ok(()),
             Channel::Udp {
+                home,
                 handle: sock_handle,
                 bound,
                 local,
@@ -2534,12 +2593,20 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                     IpAddress::Ipv4(v4) if v4.is_unspecified() => None,
                     other => Some(other),
                 };
+                // The address decides the interface, exactly as it does for a
+                // stream socket - and it has to be decided *before* the bind,
+                // because that is the call that gives this socket state a new
+                // one could not carry.
+                let want = super::home_of(endpoint.addr);
+                stack.settle_udp(home, sock_handle, want);
                 let port = if endpoint.port == 0 {
                     stack.ephemeral()
                 } else {
                     endpoint.port
                 };
-                let sock = stack.sockets.get_mut::<udp::Socket>(*sock_handle);
+                let sock = stack
+                    .sockets_mut(*home)
+                    .get_mut::<udp::Socket>(*sock_handle);
                 match sock.bind(IpListenEndpoint { addr, port }) {
                     Ok(()) => {
                         *bound = true;
@@ -3068,6 +3135,7 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
         stack.poll_once();
         match &entry.channel {
             Channel::Tcp {
+                home,
                 handle: sock_handle,
                 local,
             } => match local {
@@ -3078,7 +3146,7 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
                 // source port and hands it to the stack, which knows it even
                 // though nothing here recorded it.
                 None => stack
-                    .sockets
+                    .sockets_mut(*home)
                     .get_mut::<tcp::Socket>(*sock_handle)
                     .local_endpoint()
                     .unwrap_or(UNSPECIFIED_ENDPOINT),
@@ -3145,10 +3213,13 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
         stack.poll_once();
         match &entry.channel {
             Channel::Tcp {
+                home,
                 handle: sock_handle,
                 ..
             } => {
-                let sock = stack.sockets.get_mut::<tcp::Socket>(*sock_handle);
+                let sock = stack
+                    .sockets_mut(*home)
+                    .get_mut::<tcp::Socket>(*sock_handle);
                 if !sock.is_active() {
                     return Err(err::ENOTCONN);
                 }
@@ -3234,10 +3305,14 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
     };
     let done = super::with(handle, |stack, entry| match &entry.channel {
         Channel::Tcp {
+            home,
             handle: sock_handle,
             ..
         } => {
-            stack.sockets.get_mut::<tcp::Socket>(*sock_handle).close();
+            stack
+                .sockets_mut(*home)
+                .get_mut::<tcp::Socket>(*sock_handle)
+                .close();
         }
         Channel::Udp { .. } => {}
         // Raw sockets are connectionless; nothing to tear down.
@@ -3369,7 +3444,9 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
         // not merely remembered; `get_mut` downcasts and panics on a mismatch,
         // so it is only ever called with a handle this `Entry` owns as TCP.
         let tcp_sock = match entry.channel {
-            Channel::Tcp { handle: h, .. } => Some(h),
+            Channel::Tcp {
+                home, handle: h, ..
+            } => Some((home, h)),
             _ => None,
         };
         match (level, optname) {
@@ -3379,11 +3456,11 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                 // Turning keep-alive on arms smoltcp's probe timer; the interval
                 // is Linux's default `TCP_KEEPINTVL`, which is the pace it then
                 // holds the socket to.
-                if let Some(h) = tcp_sock {
+                if let Some((home, h)) = tcp_sock {
                     let interval = (val != 0)
                         .then(|| smoltcp::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
                     stack
-                        .sockets
+                        .sockets_mut(home)
                         .get_mut::<tcp::Socket>(h)
                         .set_keep_alive(interval);
                 }
@@ -3407,9 +3484,9 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                 entry.opts.nodelay = val != 0;
                 // `TCP_NODELAY` is Nagle switched off, exactly the inverse of
                 // the flag smoltcp names.
-                if let Some(h) = tcp_sock {
+                if let Some((home, h)) = tcp_sock {
                     stack
-                        .sockets
+                        .sockets_mut(home)
                         .get_mut::<tcp::Socket>(h)
                         .set_nagle_enabled(val == 0);
                 }

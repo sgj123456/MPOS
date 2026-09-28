@@ -38,6 +38,15 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         return instead of parking on a byte that cannot come (`t-unix-scm`)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
 - [~] 4.3 TCP options — round-trip all; `TCP_NODELAY`/`SO_KEEPALIVE` reach smoltcp
+  - [x] the loopback is a real wire — `lo` is an interface over smoltcp's own
+        loopback device carrying `127.0.0.0/8`, and a socket's interface is
+        decided by the first address it is given, because the stack now keeps
+        one `Fabric` (interface + device + socket set) per wire and smoltcp has
+        no way to move a socket between them (`t-udp-loopback`). This is the
+        prerequisite `listen`/`accept` cannot be *tested* without, and raw/ICMP
+        sockets deliberately stay on eth0's (§4.3)
+  - [ ] `listen`/`accept` on IPv4 — the passive-open side and the inode per
+        accepted connection, which the loopback above makes verifiable (§4.3)
   - [ ] `SO_REUSEADDR` / `SO_LINGER` / buffer sizes still record-only (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
 
@@ -312,12 +321,14 @@ was asking before (§7.2, §1.1).
 
 What is left, in the order that keeps each step verifiable on its own:
 
-1. **The loopback, and then §4.3's listener** - `listen`/`accept` is that
-   section's first item and it cannot be *tested* until a connection can be made
-   inside the guest at all: this harness forwards no host port, and the stack has
-   no 127.0.0.1 path, which is what §4.3's own "no local socket pair exists"
-   refers to. §4.3 now spells out why the loopback is a step of its own rather
-   than a footnote to `listen`, and what it costs.
+1. **§4.3's listener, now that the loopback behind it is real** - `listen`/
+   `accept` is that section's first item and it cannot be *tested* until a
+   connection can be made inside the guest at all: this harness forwards no host
+   port, which is what §4.3's own "no local socket pair exists" refers to. The
+   prerequisite landed first and separately - `lo` carries `127.0.0.0/8` over
+   smoltcp's loopback device, with a socket set per interface and the home
+   decided by the first address (`t-udp-loopback`) - so what is left is the
+   passive-open side the listener itself is made of.
 2. **Anonymous demand paging** (§5.1 + §5.2) - the prerequisite both items name,
    and the only one that changes the mm fault path for everything.
 3. **`seccomp` FILTER's plumbing** (§8.2 - its runner has landed and is
@@ -338,7 +349,9 @@ What is left, in the order that keeps each step verifiable on its own:
 - **Uniprocessor** — single core, `critical_section::Mutex<RefCell<T>>`
 - **Signals** — handlers delivered via `rt_sigframe`, mask enforcement, `sigqueue` siginfo payloads
 - **Filesystems**: ramfs, ext2/ext4 (write-through), devfs, procfs, sysfs, devpts
-- **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net; AF_INET + AF_UNIX
+- **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net and a real loopback
+  (`lo` = `127.0.0.0/8` over smoltcp's loopback device, one socket set per
+  interface); AF_INET + AF_UNIX
   (path `SOCK_STREAM`, with `SCM_RIGHTS` fd passing + `SO_PEERCRED`) + netlink
   (route and uevent, each with its read and write sides)
 - **Display / input**: virtio-gpu 2D scanout exposed as `/dev/fb0` (mmap +
@@ -759,23 +772,45 @@ passive-open slot + an inode per accepted connection) is therefore the first
 §4.3 item, not a footnote to it, and it is also what `dbus`, a local `nginx`, and
 any `ssh` *server* on this machine would need.
 
-**And the loopback has to come before it, which is a step of its own.** A listener
-nobody can connect to is a feature this suite cannot test: the harness forwards
-no host port (`-netdev user` with no `hostfwd`), and the stack has no 127.0.0.1
-path at all - `ip link show lo` *reports* a loopback because `rtnl` fills in the
-shape a reader expects, but nothing answers a segment sent to it. So an in-guest
-client is the only client there can be, and that means making loopback real
-first. The cost is not the device - a `Device` that hands a transmitted frame
-back on the next receive is fifty lines - it is that **smoltcp cannot route it
-with one socket set**. Its route lookup is *destination-only*
-(`Routes::lookup(addr)`; `Interface::route` answers `in_same_network(dst)` or the
-best matching route), so given a shared set, `eth0`'s poll would claim a
-127.0.0.1 socket, match its default route, and put the segment on the wire. Two
-interfaces therefore mean two socket sets, and a socket cannot move between them
-(smoltcp has no such operation), so a socket with no address yet has no home: the
-set is decided by the first `bind`/`connect`/`sendto` - which is a change to when
-a socket joins a set, and to every place that looks one up by handle. That is the
-real shape of "add `listen`": the listener inode is the easy half.
+**And the loopback has to come before it, and it is done.** A listener nobody
+can connect to is a feature this suite cannot test: the harness forwards no host
+port (`-netdev user` with no `hostfwd`), so an in-guest client is the only client
+there can be - and until this landed the stack had no 127.0.0.1 path at all.
+`ip link show lo` *reported* a loopback because `rtnl` filled in the shape a
+reader expects, but nothing answered a segment sent to it.
+
+`lo` is now a real interface over **smoltcp's own `Loopback` device** (gated on
+the `alloc` feature, which this crate already enables) carrying `127.0.0.0/8` and
+no routes, and `Stack::lo_up` gates its poll like eth0's own flag - so it was not
+fifty lines of device after all, it was zero. What was *not* free is the sentence
+that follows, and it is the whole shape of the step: **smoltcp cannot route it
+with one socket set.** Its route lookup is *destination-only*
+(`Interface::route` answers `in_same_network(dst)` or the best matching route,
+`iface/interface/mod.rs:1010,1014`), and `Interface::poll` walks every socket in
+the set it is handed - so a shared set would have `eth0` claim a 127.0.0.1 socket
+and put the segment on the wire, whether or not `127.0.0.0/8` was added to eth0.
+
+Two interfaces therefore mean two socket sets, and a socket cannot move between
+them (smoltcp has no such operation), so a socket with no address yet has no
+home: `Stack` is now two `Fabric`s (interface + device + set + its own up flag,
+with `sockets_mut(home)`/`poll_home(home)` resolving a handle), a `channel` of
+`Tcp`/`Udp`/`Raw` carries a `home: Home`, and the set is decided by the first
+`bind`/`connect`/`sendto` - which is a change to when a socket joins a set, and
+to every one of the ~33 places that looks one up by handle. The move itself is
+only ever applied to a socket nothing has used yet (`Closed` for TCP,
+`!bound` for UDP), and it is applied *before* the call that names the address,
+so the fresh socket it swaps in is deliberately empty.
+
+Two deliberate boundaries, both recorded rather than hidden. A **raw socket
+never moves**: its destination is a per-call argument, so one socket cannot
+serve two sets, and leaving it on eth0 is what keeps `ping 127.0.0.1` behaving
+exactly as it did (it travels the virtual wire, and slirp answers - which is
+what `t-netlat` measures). And a **wildcard listener** would live on eth0's
+fabric, so a loopback client could not reach it; that gap is the listener's, and
+`listen` is the next step. `t-udp-loopback` pins what the loopback does: two
+datagram sockets in one process exchanging a payload over `127.0.0.1`, an
+unbound sender relocated by its destination (with the sender named back on the
+loopback), and a datagram to a port nobody holds answered by nothing at all.
 
 **Second is done, and was measured rather than assumed**: a plain `close(2)`
 reached `net::free_entry`, which called `sockets.remove(handle)` on the spot,
