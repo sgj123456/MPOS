@@ -74,15 +74,19 @@ fn main() {
         err != rustix::io::Errno::OPNOTSUPP,
     );
 
-    // Accepting connections is not implemented, and the answer says so
-    // rather than pretending: `EOPNOTSUPP` is what Linux gives for a call
-    // the stack has no support for at all. Pinned here so the gap is a fact
-    // in the log instead of a surprise for a server that tries.
+    // `listen` on an IPv4 socket succeeds now - the passive-open side is real,
+    // and `t-tcp-listen` is where it is exercised end to end. What is pinned
+    // here is only that this call no longer answers `EOPNOTSUPP`: this file
+    // held that refusal deliberately ("a stack that answers success for a
+    // handshake nobody completed hands every program a socket to nowhere"), so
+    // the check that the refusal is gone belongs next to the comment that
+    // explained it. The socket is bound to the wildcard above, so this is also
+    // the case that does not need a loopback address to be listening.
     match listen(&sock, 1) {
-        Ok(()) => r.check("listen on an IPv4 socket is refused with EOPNOTSUPP, not faked (unix sockets listen; the network stack does not yet)", false),
+        Ok(()) => r.check("listen on a bound IPv4 socket succeeds", true),
         Err(err) => r.check(
-            &format!("listen on an IPv4 socket is refused with EOPNOTSUPP, not faked (got {err})"),
-            err == rustix::io::Errno::OPNOTSUPP,
+            &format!("listen on a bound IPv4 socket succeeds (got {err})"),
+            false,
         ),
     }
 

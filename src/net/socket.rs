@@ -1475,6 +1475,16 @@ fn send_common(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bo
         if v6.unwrap_or(false) {
             return err::ENETUNREACH;
         }
+        // A listening socket is a socket with no connection, and Linux names
+        // that rather than the descriptor: `send` on one is `EPIPE` (measured
+        // on this host's kernel). It is not `ENOTSOCK`, which is what the
+        // stream path below would answer for a channel it does not recognise.
+        let listening = super::with(handle, |_, entry| {
+            matches!(entry.channel, Channel::TcpListen { .. })
+        });
+        if listening.unwrap_or(false) {
+            return err::EPIPE;
+        }
     }
     match typ {
         Some(SOCK_STREAM) => tcp_send(handle, data, nonblock),
@@ -2146,6 +2156,16 @@ fn recv_common(
         if v6.unwrap_or(false) {
             return err::ENETUNREACH;
         }
+        // A listening socket has no data of its own to read - the connections
+        // it has accepted are their own descriptors - and Linux answers
+        // `ENOTCONN` for that (measured), not the `ENOTSOCK` the stream path
+        // below would give a channel it does not recognise.
+        let listening = super::with(handle, |_, entry| {
+            matches!(entry.channel, Channel::TcpListen { .. })
+        });
+        if listening.unwrap_or(false) {
+            return err::ENOTCONN;
+        }
     }
     let received = match typ {
         Some(SOCK_STREAM) => tcp_recv(handle, out, nonblock),
@@ -2526,6 +2546,10 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
     };
     let bound = super::with(handle, |stack, entry| {
         match &mut entry.channel {
+            // A listening socket's name is what its pool is bound to; Linux
+            // answers `EINVAL` for a second `bind` on one (measured), and a
+            // name the pool did not use would be a lie `getsockname` tells.
+            Channel::TcpListen { .. } => Err(err::EINVAL),
             Channel::Tcp {
                 home,
                 handle: sock_handle,
@@ -2630,9 +2654,13 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
     }
 }
 
-/// `listen(fd, backlog)` - a unix listener's queue opens here; the network
-/// sockets keep the straight refusal (their accept machinery, with the
-/// handshake and the half-close states it implies, is not built).
+/// `listen(fd, backlog)` - a unix listener's queue opens here, and an IPv4
+/// socket's passive-open side opens in `net::tcp_listen`.
+///
+/// The two are separate because the families are: a unix listener is its own
+/// inode with its own queue, where an IPv4 listener is a pool of smoltcp
+/// sockets behind a registry entry. What they share is the call, and the
+/// refusal for everything else.
 pub(crate) fn handle_listen(args: [usize; 6], _from_user: bool) -> isize {
     if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
         if let Some(sock) = file.inode().as_unix() {
@@ -2647,6 +2675,14 @@ pub(crate) fn handle_listen(args: [usize; 6], _from_user: bool) -> isize {
         if let Some(sock) = file.inode().as_vsock() {
             return crate::net::vsock::listen(sock, args[1] as i32);
         }
+    }
+    // The IPv4 family: a `SocketInode` whose handle this registry holds.
+    // Anything else - a netlink or rtnetlink session, a descriptor that is
+    // not a socket - keeps the straight refusal it always had.
+    if let Ok(handle) = socket_handle_of_fd(args[0] as i32)
+        && let Some(answer) = crate::net::tcp_listen(handle, args[1] as i32)
+    {
+        return answer;
     }
     err::EOPNOTSUPP
 }
@@ -2698,6 +2734,24 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
             crate::net::vsock::write_sockaddr_vm(addr_ptr, len_ptr, peer.cid as u32, peer.port);
         }
         return new_fd as isize;
+    }
+    // The IPv4 listener: its completed connections are the queue the poll
+    // fills, and accepting one is claiming a socket the pool has already
+    // finished a handshake on. Linux's refusals, measured: a bound socket that
+    // is not listening is `EINVAL`, and an empty queue on a non-blocking
+    // listener is `EAGAIN`.
+    if let Ok(handle) = socket_handle_of_fd(fd) {
+        let listener_id = super::with(handle, |_, entry| match entry.channel {
+            Channel::TcpListen { id, .. } => Some(id),
+            _ => None,
+        });
+        match listener_id {
+            Some(Some(id)) => {
+                return accept_tcp(handle, id, fd, addr_ptr, len_ptr, flags);
+            }
+            Some(None) => return err::EINVAL,
+            None => {}
+        }
     }
     // The borrow that asks "is this a unix socket, and which id" cannot
     // outlive the statement; the id, and the Arc the registry hands back
@@ -2753,24 +2807,129 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
 /// The flags are validated first, before the socket is looked at - the
 /// man page's own order, and the one that matters to a caller probing for
 /// the feature: an unknown bit is `EINVAL` whatever the socket is doing.
-/// The two known bits belong to the descriptor an accepted connection
-/// would arrive on, and this kernel's accept is the honest refusal the
-/// flag-less form gives, so they are accepted and unused - the same
-/// treatment `pipe2` gives a flag it cannot yet honour.
-pub(crate) fn handle_accept4(args: [usize; 6], from_user: bool) -> isize {
+/// The two known bits belong to the descriptor the accepted connection
+/// arrives on, and now that every family accepts through one body they are
+/// honoured for all of them - the IPv4 listener sets `O_NONBLOCK` and
+/// `FD_CLOEXEC` on the descriptor it hands back, exactly as the unix and vsock
+/// listeners already did.
+pub(crate) fn handle_accept4(args: [usize; 6], _from_user: bool) -> isize {
     const SOCK_CLOEXEC: usize = 0o200_0000;
     const SOCK_NONBLOCK: usize = 0x800;
     if args[3] & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
         return err::EINVAL;
     }
-    // The flags belong to the descriptor an accepted socket arrives on -
-    // a unix or vsock listener honours them; the network refusal stays.
-    if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
-        && (file.inode().as_unix().is_some() || file.inode().as_vsock().is_some())
+    accept_common(args[0] as i32, args[1], args[2], args[3])
+}
+
+/// The descriptor flags `accept` and `accept4` share, as `accept4` spells them.
+const SOCK_CLOEXEC_F: usize = 0o200_0000;
+const SOCK_NONBLOCK_F: usize = 0x800;
+
+/// An IPv4 `accept`: claim one completed connection from the listener's queue
+/// and give it a descriptor of its own.
+///
+/// The queue is filled by the poll, so this polls before every look and parks
+/// on the same question `poll(2)` asks of a listener - `listener_has_pending`
+/// - which means a waiter that is woken cannot find the queue empty, and a take
+/// that finds it empty cannot have missed a wake.
+fn accept_tcp(
+    handle: usize,
+    id: usize,
+    fd: i32,
+    addr_ptr: usize,
+    len_ptr: usize,
+    flags: usize,
+) -> isize {
+    let nonblock =
+        flags & SOCK_NONBLOCK_F != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    // The caller's address slot, validated before anything is claimed: a
+    // connection taken off the queue and then not reportable would be a
+    // connection lost, which is the ordering `recvfrom` already keeps.
+    if addr_ptr != 0
+        && let Err(e) = validate_source_slot(Some((addr_ptr, len_ptr)))
     {
-        return accept_common(args[0] as i32, args[1], args[2], args[3]);
+        return e;
     }
-    handle_accept(args, from_user)
+    loop {
+        let step = super::with(handle, |stack, _| {
+            stack.poll_once();
+            stack.listener_take(id)
+        });
+        match step {
+            Some(Some((home, sock_handle))) => {
+                return install_accepted(home, sock_handle, addr_ptr, len_ptr, flags, nonblock);
+            }
+            Some(None) => {
+                if nonblock {
+                    return err::EAGAIN;
+                }
+            }
+            None => return err::EBADF,
+        }
+        if crate::sched::has_deliverable_signal() {
+            return err::EINTR;
+        }
+        let arrived = || {
+            super::with(handle, |stack, _| {
+                stack.poll_once();
+                stack.listener_has_pending(id)
+            })
+            .unwrap_or(true)
+        };
+        if park_until(arrived) == err::EINTR {
+            return err::EINTR;
+        }
+    }
+}
+
+/// Turn one completed connection into a descriptor: the registry entry, the
+/// inode, and the flags the caller asked for.
+fn install_accepted(
+    home: super::Home,
+    sock_handle: smoltcp::iface::SocketHandle,
+    addr_ptr: usize,
+    len_ptr: usize,
+    flags: usize,
+    nonblock: bool,
+) -> isize {
+    // The peer's address is read *before* the socket becomes an entry: it is
+    // the connection's own fact, and the entry hands the same socket to
+    // whoever calls `getpeername` later, so the answer must not depend on how
+    // it was first asked for.
+    let peer = crate::net::tcp_peer(home, sock_handle);
+    // `local` is left unset on purpose: `getsockname` then reads the socket's
+    // own endpoint, which is the connection's address rather than whatever the
+    // listener was bound to. That is the same answer `bind` would have
+    // recorded, and one source of truth instead of two.
+    let handle = match super::adopt_socket(
+        Channel::Tcp {
+            home,
+            handle: sock_handle,
+            local: None,
+        },
+        SOCK_STREAM,
+    ) {
+        Ok(handle) => handle,
+        Err(e) => return e,
+    };
+    let new_fd = match crate::vfs::open_inode(Arc::new(SocketInode { handle })) {
+        Ok(fd) => fd,
+        Err(e) => return crate::syscall::err_of(e),
+    };
+    if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(new_fd) {
+        file.set_status(crate::vfs::file::O_NONBLOCK);
+    }
+    if flags & SOCK_CLOEXEC_F != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(new_fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    // The caller's `addr`/`addrlen`, when present: the peer a connection came
+    // from, which is what Linux writes back for an accepted connection.
+    if addr_ptr != 0 && len_ptr != 0 {
+        if let Some(peer) = peer {
+            let _ = write_sockaddr_in(addr_ptr, len_ptr, peer);
+        }
+    }
+    new_fd as isize
 }
 
 /// One `struct mmsghdr`: a full `struct msghdr` (56 bytes) followed by the
@@ -3134,6 +3293,10 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
     let endpoint = super::with(handle, |stack, entry| {
         stack.poll_once();
         match &entry.channel {
+            // A listener answers with the name its pool listens on, which is
+            // the bound address or the wildcard Linux's implicit bind chose -
+            // `0.0.0.0:port`, exactly as Linux reports it.
+            Channel::TcpListen { local, .. } => *local,
             Channel::Tcp {
                 home,
                 handle: sock_handle,
@@ -3212,6 +3375,10 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
     let endpoint = super::with(handle, |stack, entry| {
         stack.poll_once();
         match &entry.channel {
+            // A listener is connected to nobody, which is what Linux answers
+            // here (measured), and the same errno an inactive TCP socket gets
+            // below.
+            Channel::TcpListen { .. } => return Err(err::ENOTCONN),
             Channel::Tcp {
                 home,
                 handle: sock_handle,
@@ -3319,6 +3486,11 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
         Channel::Raw { .. } => {}
         // Nothing is connected, so there is nothing to tear down.
         Channel::Inet6 => {}
+        // A listener has no connection to shut down and Linux still answers
+        // success for both halves (measured), so the pool is left alone: the
+        // connections it has already accepted are their own descriptors, and
+        // the queue goes on filling until the listener itself closes.
+        Channel::TcpListen { .. } => {}
     });
     match done {
         Some(()) => 0,

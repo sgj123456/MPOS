@@ -52,6 +52,7 @@ pub mod socket;
 pub mod unix;
 pub mod vsock;
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -136,6 +137,24 @@ pub(crate) enum Channel {
     /// that shape keeps musl's dual-family resolve honest; refusing the
     /// socket outright turns the whole lookup into EAFNOSUPPORT.
     Inet6,
+    /// A `listen`ing TCP socket: the passive-open side, which smoltcp has no
+    /// socket of its own for.
+    ///
+    /// smoltcp's `tcp::Socket` is *one* connection - a listening socket that
+    /// completes a handshake stops listening - so a listener here is a **pool**
+    /// of sockets in `Listen` plus the queue of the ones that completed, kept
+    /// in [`Stack::listeners`] under `id`. That is the shape smoltcp's own
+    /// `listen` doc points at: re-listening an open socket needs an `abort`
+    /// first, "but this means that incoming connections can actually get
+    /// aborted between the abort() and the next listen()". The channel names
+    /// the pool rather than a socket because there is no one socket to name.
+    TcpListen {
+        id: usize,
+        /// The address the pool listens on, for `getsockname`: the caller's
+        /// bound name, or the wildcard Linux's implicit bind gives an unbound
+        /// `listen`.
+        local: IpEndpoint,
+    },
     /// A raw IP socket: sends and receives complete IP packets with a given
     /// protocol number. `ping` uses this with `IPPROTO_ICMP` (1) to send
     /// ICMP echo requests and receive replies.
@@ -269,6 +288,52 @@ fn connect_in<D: Device>(
     sock.connect(fabric.iface.context(), remote, local)
 }
 
+/// One `listen`ing socket's passive-open machinery: the pool of sockets
+/// currently in `Listen`, and the queue of connections that completed a
+/// handshake and are waiting for an `accept`.
+///
+/// The pool is the shape smoltcp forces (see [`Channel::TcpListen`]) and it is
+/// also where the backlog is honoured. A socket that completes a handshake
+/// *leaves* the pool - smoltcp's socket is the connection now - so the pool is
+/// refilled after every poll from what the queue leaves room for, and when the
+/// queue is full it is not refilled at all: the next `SYN` then finds no
+/// listening socket and is dropped, which is what a full backlog does on Linux
+/// too, and it costs no `abort` to arrange.
+pub(crate) struct Listener {
+    /// Which interface's set the pool lives in. A listener is bound to one
+    /// address, so it is on one wire, and every connection it hands out
+    /// inherits this.
+    home: Home,
+    /// The address the pool listens on, in the form smoltcp wants it: the
+    /// wildcard is `addr: None` here, and `0.0.0.0` in the channel.
+    local: IpListenEndpoint,
+    /// What the caller asked `listen` for. Linux admits while `queue_len >
+    /// backlog`, so this is "one deeper than it names" - the same rule the
+    /// unix family was measured into (§4.1).
+    backlog: usize,
+    /// Sockets in `Listen`. Between one and [`LISTEN_POOL_MAX`].
+    listening: Vec<SocketHandle>,
+    /// Completed connections, in arrival order. Bounded by `backlog + 1` plus
+    /// whatever the pool had in flight when the queue filled.
+    accepted: VecDeque<SocketHandle>,
+}
+
+/// How many sockets one listener may keep in `Listen` at once.
+///
+/// Each `tcp::Socket` is 80 KiB of buffers, so this is a memory decision rather
+/// than a semantic one - and it is a small number because it bounds *simultaneous
+/// handshakes*, not the backlog: a burst deeper than this relies on the peer's
+/// own retransmission, exactly as a queue drop would. Four is enough to complete
+/// several connections in one poll without leaving 640 KiB of buffers on a
+/// socket that will never use them.
+const LISTEN_POOL_MAX: usize = 4;
+
+/// The pool depth a backlog justifies: at least one socket has to be listening
+/// or nothing can ever connect.
+fn pool_depth(backlog: usize) -> usize {
+    backlog.clamp(1, LISTEN_POOL_MAX)
+}
+
 /// Everything the network stack owns, in one place behind one lock.
 pub(crate) struct Stack {
     /// eth0: the virtio NIC and QEMU's user network.
@@ -276,6 +341,10 @@ pub(crate) struct Stack {
     /// lo: `127.0.0.0/8`, carried by smoltcp's own loopback device.
     lo: Fabric<smoltcp::phy::Loopback>,
     entries: Vec<Option<Entry>>,
+    /// The passive-open state behind every `listen`ing socket, indexed by the
+    /// id a [`Channel::TcpListen`] carries. Slots are reused, so a listener
+    /// that goes away costs nothing but a `None`.
+    listeners: Vec<Option<Listener>>,
     /// Sockets whose last descriptor is gone but whose teardown is still on the
     /// wire.
     ///
@@ -348,7 +417,208 @@ impl Stack {
         let now = now();
         self.poll_home(Home::Eth, now);
         self.poll_home(Home::Lo, now);
+        // After the poll, because a handshake completes *by* it: the socket
+        // that moved from `Listen` to established is the one this has to move
+        // from the pool to the queue, and the pool it refills is what lets the
+        // next connection in.
+        self.service_listeners();
         self.reap_teardown();
+    }
+
+    /// Move every completed handshake out of a listener's pool and into its
+    /// accept queue, then refill the pool from what the queue leaves room for.
+    ///
+    /// This is what a listener *is* here, and it has to run inside the poll
+    /// rather than at `accept`: the handshake is smoltcp's, it advances only
+    /// when the interface is polled, and a socket that stopped listening is a
+    /// socket no further connection can arrive on until this refills.
+    fn service_listeners(&mut self) {
+        for id in 0..self.listeners.len() {
+            let Some((home, local, backlog, depth)) = self.listeners[id]
+                .as_ref()
+                .map(|l| (l.home, l.local, l.backlog, pool_depth(l.backlog)))
+            else {
+                continue;
+            };
+
+            // 1. Sort the pool: a socket that left `Listen` is a connection.
+            // Taken out whole so the borrow of `listeners` ends before the
+            // socket set is touched at all.
+            let pool = self.listeners[id]
+                .as_mut()
+                .map(|l| core::mem::take(&mut l.listening))
+                .unwrap_or_default();
+            let mut idle: Vec<SocketHandle> = Vec::with_capacity(pool.len());
+            let mut done: Vec<SocketHandle> = Vec::new();
+            let mut dead: Vec<SocketHandle> = Vec::new();
+            for h in pool {
+                match self.tcp_socket(home, h).state() {
+                    // Waiting for the next connection: the socket *is* the
+                    // listener it was listening as.
+                    tcp::State::Listen => idle.push(h),
+                    // A handshake under way. It stays in the pool (there is
+                    // nothing to accept yet) and leaves it on the poll that
+                    // completes it - which is why more than one is kept.
+                    tcp::State::SynReceived => idle.push(h),
+                    // Complete: this socket is a connection now, and the
+                    // queue is where `accept` looks.
+                    tcp::State::Established | tcp::State::CloseWait => done.push(h),
+                    // A handshake that died - smoltcp aborts a SYN-RECEIVED
+                    // socket to `Closed` once its retransmissions run out - or
+                    // a connection that ended before anybody accepted it. It
+                    // is not listening any more, so it goes and the refill
+                    // below replaces it: keeping it would shrink the pool one
+                    // dead handshake at a time until nothing could connect.
+                    _ => dead.push(h),
+                }
+            }
+            for h in dead {
+                self.sockets_mut(home).remove(h);
+            }
+
+            // 2. Refill, bounded by what the queue can still take. A full
+            // queue leaves the pool empty on purpose: with nothing in
+            // `Listen`, the next `SYN` is dropped by smoltcp rather than
+            // answered and immediately refused, which is how a full backlog
+            // behaves on Linux and needs no `abort` (which this stack cannot
+            // turn into a reset anyway - smoltcp emits resets in reply to an
+            // arriving packet, not as an egress of their own).
+            let queued = self.listeners[id]
+                .as_ref()
+                .map(|l| l.accepted.len())
+                .unwrap_or(0);
+            let room = (backlog + 1).saturating_sub(queued + done.len());
+            let want = room.min(depth);
+            let mut listening = idle;
+            while listening.len() < want {
+                let h = self.add_tcp(home);
+                if self.tcp_socket(home, h).listen(local).is_err() {
+                    // Only an open socket refuses, and a socket this fresh is
+                    // not one; a refusal here would leave a stray, so drop it
+                    // rather than grow the pool with something unlisted.
+                    self.sockets_mut(home).remove(h);
+                    break;
+                }
+                listening.push(h);
+            }
+
+            if let Some(l) = self.listeners[id].as_mut() {
+                l.listening = listening;
+                l.accepted.extend(done);
+            }
+        }
+    }
+
+    /// One of this stack's TCP sockets, in whichever set its home names.
+    fn tcp_socket(&mut self, home: Home, h: SocketHandle) -> &mut tcp::Socket<'static> {
+        self.sockets_mut(home).get_mut::<tcp::Socket>(h)
+    }
+
+    /// Turn a bound, still-pristine TCP socket into a listener: build the
+    /// pool, register it, and hand back the id the channel carries.
+    ///
+    /// `first` is the socket the caller already owns - reusing it saves an
+    /// 80 KiB allocation and is safe because the caller has established it is
+    /// pristine (see [`Stack::settle_tcp`]).
+    pub(crate) fn open_listener(
+        &mut self,
+        home: Home,
+        local: IpListenEndpoint,
+        backlog: usize,
+        first: SocketHandle,
+    ) -> usize {
+        let depth = pool_depth(backlog);
+        let mut listening: Vec<SocketHandle> = Vec::with_capacity(depth);
+        while listening.len() + 1 < depth {
+            listening.push(self.add_tcp(home));
+        }
+        listening.push(first);
+        // A socket that refuses to listen is dropped rather than carried: the
+        // only refusal this can meet is an open socket, which the caller has
+        // already excluded, so this is the belt to that braces.
+        listening.retain(|h| self.tcp_socket(home, *h).listen(local).is_ok());
+        let listener = Listener {
+            home,
+            local,
+            backlog,
+            listening,
+            accepted: VecDeque::new(),
+        };
+        match self.listeners.iter().position(|slot| slot.is_none()) {
+            Some(i) => {
+                self.listeners[i] = Some(listener);
+                i
+            }
+            None => {
+                self.listeners.push(Some(listener));
+                self.listeners.len() - 1
+            }
+        }
+    }
+
+    /// Tear a listener down: every socket it holds goes, and the slot is
+    /// freed.
+    ///
+    /// The connections still in the queue are closed rather than abandoned,
+    /// which gets their `FIN` out through the ordinary teardown discipline - a
+    /// definite end for a client that connected, where Linux answers `RST`.
+    /// That divergence is the documented one (§4.3): smoltcp's resets are
+    /// emitted in reply to an arriving packet, so an unsolicited reset is not
+    /// something this stack can send at all, and a `FIN` is the honest
+    /// substitute.
+    fn close_listener(&mut self, id: usize) {
+        let Some(listener) = self.listeners.get_mut(id).and_then(|slot| slot.take()) else {
+            return;
+        };
+        let home = listener.home;
+        // A socket still in `Listen` has nothing outstanding and no state
+        // anybody is waiting on: it is removed, not closed.
+        for h in listener.listening {
+            self.sockets_mut(home).remove(h);
+        }
+        for h in listener.accepted {
+            self.tcp_socket(home, h).close();
+            if self.teardown.len() >= TEARDOWN_MAX
+                && let Some((old_home, oldest)) = self.teardown.first().copied()
+            {
+                self.teardown.remove(0);
+                self.sockets_mut(old_home).remove(oldest);
+            }
+            self.teardown.push((home, h));
+        }
+    }
+
+    /// Hand one completed connection to `accept`: the id and the socket, or
+    /// `None` when the queue is empty.
+    pub(crate) fn listener_take(&mut self, id: usize) -> Option<(Home, SocketHandle)> {
+        let listener = self.listeners.get_mut(id)?.as_mut()?;
+        let h = listener.accepted.pop_front()?;
+        Some((listener.home, h))
+    }
+
+    /// Whether this listener has a connection waiting - the question `accept`
+    /// parks on, and the same one `poll(2)` reports it readable for.
+    pub(crate) fn listener_has_pending(&self, id: usize) -> bool {
+        self.listeners
+            .get(id)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|l| !l.accepted.is_empty())
+    }
+
+    /// Re-set a listener's backlog. Linux accepts a second `listen` and lets it
+    /// change the queue length, rather than refusing the call, so this is what
+    /// the second one does; the pool follows on the next poll.
+    fn set_backlog(&mut self, id: usize, backlog: usize) {
+        if let Some(l) = self.listeners.get_mut(id).and_then(|slot| slot.as_mut()) {
+            l.backlog = backlog;
+        }
+    }
+
+    /// Whether a TCP socket is still in `Closed` - the precondition for every
+    /// act that needs the socket to carry no state, which is `listen` and the
+    /// move between fabrics. A socket that is open has started something.
+    fn tcp_is_closed(&mut self, home: Home, h: SocketHandle) -> bool {
+        matches!(self.tcp_socket(home, h).state(), tcp::State::Closed)
     }
 
     /// Start a TCP handshake on `h`, which lives in `home`'s set: the socket's
@@ -585,6 +855,18 @@ pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> 
                         inode,
                     });
                 }
+                // A listener is one row, in `LISTEN`, on the address it
+                // listens on - which is where `ss`/`netstat` find a server.
+                // The pool behind it is not a connection and has no row.
+                Channel::TcpListen { local, .. } if tcp => {
+                    rows.push(crate::vfs::procfs::NetRow {
+                        local: row_of(*local),
+                        remote: row_of(zero()),
+                        state: 10,
+                        uid: 0,
+                        inode,
+                    });
+                }
                 _ => {}
             }
         }
@@ -691,6 +973,124 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
     })
 }
 
+/// Register an `Entry` for a socket that already exists and hand back its
+/// handle - what `accept` needs, where the smoltcp socket is one the listener's
+/// pool completed rather than one this call builds.
+///
+/// `EBADF` with no stack behind it, matching the register path's `ENETDOWN`
+/// being reserved for "there is no network card": a descriptor cannot be
+/// waiting to be accepted on a stack that was never up.
+pub(crate) fn adopt_socket(channel: Channel, typ: u16) -> Result<usize, isize> {
+    critical_section::with(|cs| {
+        let mut net = NET.borrow(cs).borrow_mut();
+        let Some(stack) = net.as_mut() else {
+            return Err(crate::syscall::err::ENETDOWN);
+        };
+        let entry = Entry {
+            family: socket::AF_INET,
+            typ,
+            channel,
+            opts: SockOpts::default(),
+        };
+        Ok(match stack.entries.iter().position(|slot| slot.is_none()) {
+            Some(pos) => {
+                stack.entries[pos] = Some(entry);
+                pos + 1
+            }
+            None => {
+                stack.entries.push(Some(entry));
+                stack.entries.len()
+            }
+        })
+    })
+}
+
+/// `listen(2)` on an IPv4 socket: open the passive-open side, or re-set the
+/// backlog of one already open.
+///
+/// `None` when the handle is not this registry's - a netlink or rtnetlink
+/// socket, which the caller answers `EOPNOTSUPP` for as it always did.
+///
+/// The rules are Linux's, each measured on this host's kernel before being
+/// written:
+///
+///   * `listen` on an **unbound** socket succeeds: it implicitly binds the
+///     wildcard address and an ephemeral port, and `getsockname` then reports
+///     `0.0.0.0:port`.
+///   * `listen` on an **already listening** socket succeeds and re-sets the
+///     backlog.
+///   * `listen` on a **connected** socket is `EINVAL`.
+///   * `listen` on a **datagram or raw** socket is `EOPNOTSUPP` - which is
+///     what `t-udp` already pins.
+pub(crate) fn tcp_listen(handle: usize, backlog: i32) -> Option<isize> {
+    with(handle, |stack, entry| {
+        // Negative backlogs are zero, as Linux clamps them; the ceiling is
+        // `LISTEN_POOL_MAX` in practice because that is all the pool grows to.
+        let backlog = backlog.max(0) as usize;
+        let (mut home, mut sock_handle, local) = match &entry.channel {
+            Channel::TcpListen { id, .. } => {
+                stack.set_backlog(*id, backlog);
+                return 0;
+            }
+            Channel::Tcp {
+                home,
+                handle,
+                local,
+            } => (*home, *handle, *local),
+            _ => return crate::syscall::err::EOPNOTSUPP,
+        };
+        // A socket that has already connected - or been shut down - is not
+        // something `listen` can turn around; Linux answers `EINVAL`, and the
+        // pool would have to be built on a socket carrying another
+        // connection's state, which smoltcp cannot hand on.
+        if !stack.tcp_is_closed(home, sock_handle) {
+            return crate::syscall::err::EINVAL;
+        }
+        let endpoint = match local {
+            Some(l) => l,
+            None => {
+                // The implicit bind: the socket is named before it can listen,
+                // because a listener with no port is not a listener.
+                let port = stack.ephemeral();
+                IpEndpoint {
+                    addr: IpAddress::v4(0, 0, 0, 0),
+                    port,
+                }
+            }
+        };
+        // Which wire: the bound address decides, exactly as it does for
+        // `bind` and `connect`, and this is the last moment the socket can
+        // move - `listen` is what gives it state.
+        let want = home_of(endpoint.addr);
+        stack.settle_tcp(&mut home, &mut sock_handle, want);
+        // smoltcp wants the wildcard as an absent address rather than as
+        // `0.0.0.0`, and the two spellings have to agree with what
+        // `getsockname` will report.
+        let listen_at = match endpoint.addr {
+            IpAddress::Ipv4(v4) if v4.is_unspecified() => IpListenEndpoint {
+                addr: None,
+                port: endpoint.port,
+            },
+            other => IpListenEndpoint {
+                addr: Some(other),
+                port: endpoint.port,
+            },
+        };
+        let id = stack.open_listener(home, listen_at, backlog, sock_handle);
+        entry.channel = Channel::TcpListen {
+            id,
+            local: endpoint,
+        };
+        0
+    })
+}
+
+/// The peer a completed connection was accepted from, for the address `accept`
+/// writes back.
+pub(crate) fn tcp_peer(home: Home, h: SocketHandle) -> Option<IpEndpoint> {
+    with_stack(|st| st.tcp_socket(home, h).remote_endpoint()).flatten()
+}
+
 /// Tear down socket `handle`: its registry slot goes empty and its smoltcp
 /// socket is removed from the set, which frees its buffers.
 pub(crate) fn free_entry(handle: usize) {
@@ -711,13 +1111,21 @@ pub(crate) fn free_entry(handle: usize) {
         let Some(entry) = stack.entries[idx].take() else {
             return;
         };
+        // A listener owns a *pool* of sockets and a queue of connections, not
+        // one socket, so its teardown is its own act: the queued connections
+        // are closed (see `Stack::close_listener`), the ordinary teardown path
+        // is for one socket, and neither the pool nor the channel has one.
+        if let Channel::TcpListen { id, .. } = &entry.channel {
+            stack.close_listener(*id);
+            return;
+        }
         let owned = match &entry.channel {
             Channel::Tcp { home, handle, .. } => Some((*home, *handle)),
             Channel::Udp { home, handle, .. } => Some((*home, *handle)),
             Channel::Raw { home, handle, .. } => Some((*home, *handle)),
             // The IPv6 stub owns no smoltcp socket; the registry slot is all
-            // there is to free.
-            Channel::Inet6 => None,
+            // there is to free. The listener returned above.
+            Channel::Inet6 | Channel::TcpListen { .. } => None,
         };
         if let Some((home, h)) = owned {
             // A TCP socket's last close is the one that has something left to
@@ -1153,6 +1561,17 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
                     write: sock.can_send(),
                 }
             }
+            // A listener is readable when a connection is waiting to be
+            // accepted and never writable - Linux's answer, and what makes a
+            // `poll`/`select`/`epoll` accept loop work without blocking.
+            Channel::TcpListen { id, .. } => crate::vfs::Ready {
+                read: stack
+                    .listeners
+                    .get(*id)
+                    .and_then(|slot| slot.as_ref())
+                    .is_some_and(|l| !l.accepted.is_empty()),
+                write: false,
+            },
             // The IPv6 stub has no queues to ask and no route anywhere:
             // never ready, which a caller only reaches if it polls without
             // having tried to connect - and connect already said no.
@@ -1228,6 +1647,7 @@ pub fn init() -> bool {
                 up: true,
             },
             entries: Vec::new(),
+            listeners: Vec::new(),
             teardown: Vec::new(),
             next_ephemeral: EPHEMERAL_MIN,
             waiters: Vec::new(),

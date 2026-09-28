@@ -37,17 +37,21 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         arrive *with* it, so the read answers with the record and a zero-byte
         return instead of parking on a byte that cannot come (`t-unix-scm`)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
-- [~] 4.3 TCP options — round-trip all; `TCP_NODELAY`/`SO_KEEPALIVE` reach smoltcp
+- [~] 4.3 TCP — the loopback and the listener are done; three options are not
   - [x] the loopback is a real wire — `lo` is an interface over smoltcp's own
         loopback device carrying `127.0.0.0/8`, and a socket's interface is
         decided by the first address it is given, because the stack now keeps
         one `Fabric` (interface + device + socket set) per wire and smoltcp has
-        no way to move a socket between them (`t-udp-loopback`). This is the
-        prerequisite `listen`/`accept` cannot be *tested* without, and raw/ICMP
-        sockets deliberately stay on eth0's (§4.3)
-  - [ ] `listen`/`accept` on IPv4 — the passive-open side and the inode per
-        accepted connection, which the loopback above makes verifiable (§4.3)
-  - [ ] `SO_REUSEADDR` / `SO_LINGER` / buffer sizes still record-only (§4.3)
+        no way to move a socket between them (`t-udp-loopback`). Raw/ICMP
+        sockets deliberately stay on eth0's (§4.3.1)
+  - [x] `listen`/`accept` on IPv4 — a listener is a *pool* of listening sockets
+        plus the queue of the ones that completed, refilled after every poll;
+        the contract is Linux's, each rule measured first, and closing a
+        listener `FIN`s its unaccepted queue because an unsolicited `RST` is
+        not a packet smoltcp can send (§4.3.2, `t-tcp-listen`)
+  - [ ] `SO_REUSEADDR` (the TIME_WAIT rebind allowance, now that the listening
+        side exists to observe it) / `SO_LINGER{on,0}`'s egress reset / buffer
+        sizes still record-only (§4.3.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
 
 **Memory (Phase 5)**
@@ -337,27 +341,28 @@ board's own two bullets carry each, and none of the three needs a subsystem:
 they are an errno, a link target and a node's answer to a question nothing here
 was asking before (§7.2, §1.1).
 
-What is left, in the order that keeps each step verifiable on its own:
+What is left, in the order that keeps each step verifiable on its own. **The
+list's first item is done**: §4.3's listener landed on top of the loopback that
+had to come first, so a program inside the machine can now serve one - both
+halves measured against Linux and pinned by `t-tcp-listen`, and the section
+rewritten around them (§4.3.1-§4.3.2).
 
-1. **§4.3's listener, now that the loopback behind it is real** - `listen`/
-   `accept` is that section's first item and it cannot be *tested* until a
-   connection can be made inside the guest at all: this harness forwards no host
-   port, which is what §4.3's own "no local socket pair exists" refers to. The
-   prerequisite landed first and separately - `lo` carries `127.0.0.0/8` over
-   smoltcp's loopback device, with a socket set per interface and the home
-   decided by the first address (`t-udp-loopback`) - so what is left is the
-   passive-open side the listener itself is made of.
-2. **Anonymous demand paging** (§5.1 + §5.2) - the prerequisite both items name,
+1. **Anonymous demand paging** (§5.1 + §5.2) - the prerequisite both items name,
    and the only one that changes the mm fault path for everything.
-3. **`seccomp` FILTER's plumbing** (§8.2 - its runner has landed and is
+2. **`seccomp` FILTER's plumbing** (§8.2 - its runner has landed and is
    host-tested; what is left is the per-task list, the two install paths and the
    gate, which is a bounded piece of wiring rather than a feature), then
    **namespaces** (§6.3) - a set of decisions (which namespaces, and what each
    one must observably isolate) that should be made before code.
-4. **§10.5's disk-backed instrument, then the frame pool** - the two remaining
+3. **§10.5's disk-backed instrument, then the frame pool** - the two remaining
    members of the performance family with a plan and no number. Both are
    measurable today, and each wants a before/after figure with the disk in
    place - and the number is allowed to say "no".
+4. **`SO_REUSEADDR` at `bind`/`listen`** (§4.3.3) - small, and newly *possible*:
+   a `TIME_WAIT` rebind is a fact about the listening side, which now exists.
+   The other two options left in that section need things this kernel cannot do
+   yet (an unsolicited reset on egress; smoltcp buffers sized after the set is
+   built), and each says so where it is defined.
 
 ---
 
@@ -369,7 +374,8 @@ What is left, in the order that keeps each step verifiable on its own:
 - **Filesystems**: ramfs, ext2/ext4 (write-through), devfs, procfs, sysfs, devpts
 - **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net and a real loopback
   (`lo` = `127.0.0.0/8` over smoltcp's loopback device, one socket set per
-  interface); AF_INET + AF_UNIX
+  interface); IPv4 TCP listens and accepts (a local server runs); AF_INET +
+  AF_UNIX
   (path `SOCK_STREAM`, with `SCM_RIGHTS` fd passing + `SO_PEERCRED`) + netlink
   (route and uevent, each with its read and write sides)
 - **Display / input**: virtio-gpu 2D scanout exposed as `/dev/fb0` (mmap +
@@ -426,10 +432,14 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   that `fastfetch`/probing callers reacted to; a real xattr store remains future.
 
 **Foundational behaviours (implemented syscalls, incomplete semantics):**
-- **4.3** socket options: `TCP_NODELAY` and `SO_KEEPALIVE` now reach the live
-  smoltcp socket (Nagle off; probe timer armed at Linux's default interval).
-  `getsockopt` reads back every stored option. Still record-only (no stack
-  effect): `SO_REUSEADDR` (moot with one binder), buffer sizes, `SO_LINGER`.
+- **4.3** the family has a listener and a loopback now: `listen`/`accept` on
+  IPv4 are served by a pool of listening sockets (`t-tcp-listen`), `lo` is a
+  real interface over smoltcp's loopback device (`t-udp-loopback`), and the
+  stack keeps one socket set per wire. Socket options: `TCP_NODELAY` and
+  `SO_KEEPALIVE` reach the live smoltcp socket (Nagle off; probe timer armed at
+  Linux's default interval) and `getsockopt` reads back every stored option;
+  `SO_REUSEADDR` (moot with one binder), buffer sizes and `SO_LINGER` are still
+  record-only.
 - **4.4** both halves of netlink are written: the route half reconfigures the
   live stack (`RTM_NEWADDR`/`NEWROUTE`/`NEWLINK`, §4.4), and the uevent half now
   carries userland messages — port ids, unicast, groups and credentials — which
@@ -766,7 +776,108 @@ Current: auto echo reply only. No user-facing ICMP socket.
 - `sendto`/`recvfrom` on raw ICMP socket
 - Enable `ping` command to work
 
-### 4.3 TCP Socket Options — **PARTIAL** (stored + reported; not yet honored)
+### 4.3 TCP: the loopback, the listener, and the options — **PARTIAL**
+
+Three things live in this section and two of them are done. The **loopback**
+(4.3.1) and **`listen`/`accept`** (4.3.2) are real; the **socket options**
+(4.3.3) are the part still open, and of the six, three steer the stack and three
+are stored and read back without changing a packet.
+
+#### 4.3.1 The loopback is a real wire — **DONE**
+
+`lo` used to be a name the link dump filled in: `rtnl` reported `127.0.0.1/8`
+because a reader expects it there, and a segment sent to that address left by the
+NIC and was never seen again. It is now an interface over **smoltcp's own
+`Loopback` device** (gated on `alloc`, which this crate already enables)
+carrying `127.0.0.0/8`, with no routes and its own up flag - so the device this
+section kept promising as "fifty lines" turned out to be zero lines, and what was
+left was the shape.
+
+The shape is that **smoltcp cannot route it with one socket set.** Its route
+lookup is *destination-only* - `Interface::route` answers `in_same_network(dst)`
+or the best matching route (`iface/interface/mod.rs:1010,1014`) - and
+`Interface::poll` walks every socket in the set it is handed, so a shared set
+would have eth0 claim a `127.0.0.1` socket and put the segment on the wire,
+whether or not `127.0.0.0/8` was added to eth0. Two interfaces therefore mean two
+socket sets, and smoltcp has no operation that moves a socket between them.
+
+So `Stack` is two `Fabric`s (interface + device + set + its own up flag, with
+`sockets_mut(home)`/`poll_home(home)` resolving a handle), a socket's channel
+carries a `home`, and the home is decided by the first call that names an
+address - `bind`, `connect`, `sendto` - through one rule: `127.0.0.0/8` is the
+loopback's, everything else (the wildcard included) is eth0's. A socket created
+before then is *relocated* by swapping it for a fresh one in the right set, which
+is only ever done to a socket nothing has used yet (`Closed` for TCP, `!bound`
+for UDP) and always before the call that would consume it.
+
+Two boundaries, recorded rather than hidden. A **raw socket never moves**: its
+destination is a per-call argument, so one socket cannot serve two sets - which
+is what keeps `ping 127.0.0.1` behaving exactly as it did, travelling the virtual
+wire where slirp answers it, as `t-netlat` measures. And a **wildcard listener**
+lives on eth0's fabric, so a loopback client does not reach it; the bound
+`127.0.0.1` case is the supported one.
+
+`t-udp-loopback` is the instrument: two datagram sockets in one process
+exchanging a payload over `127.0.0.1`, an unbound sender relocated by its
+destination (with the sender named back *on the loopback*, which is the assertion
+a stack that forgot the move fails), and a datagram to a port nobody holds
+answered by nothing at all.
+
+#### 4.3.2 `listen` and `accept` — **DONE**
+
+smoltcp has no listening socket: a `tcp::Socket` is *one* connection, and one
+that completes a handshake stops listening. Its own `listen` doc points at the
+answer - a pool, re-listed as each connection completes - so a listener here is a
+**pool** of sockets in `Listen` (at most `LISTEN_POOL_MAX = 4`, because each is
+80 KiB of buffers) plus the **queue** of the ones that completed, kept in
+`Stack::listeners` and serviced after every poll: a socket that left `Listen` for
+`Established` or `CloseWait` becomes a queued connection, one whose handshake
+died is dropped and replaced, and the pool is refilled from what the queue leaves
+room for. A full queue refills nothing, so the next `SYN` finds no listener and
+is dropped - Linux's own answer to a full backlog - rather than being answered
+and then abruptly refused.
+
+The contract is Linux's, and each rule was measured on this host's kernel before
+it was written:
+
+| Call | Answer |
+|---|---|
+| `listen` on an unbound socket | succeeds: it implicitly binds `0.0.0.0` and an ephemeral port, and `getsockname` reports `0.0.0.0:port` |
+| `listen` on a bound socket | succeeds; `getsockname` reports the bound name |
+| `listen` again | succeeds, re-setting the backlog |
+| `listen` on a connected socket | `EINVAL` |
+| `bind` on a listening socket | `EINVAL` |
+| `accept` with nothing queued, blocking | waits, woken by the poll that fills the queue |
+| `accept` with nothing queued, non-blocking | `EAGAIN` |
+| `accept` on a bound-but-not-listening socket | `EINVAL` |
+| `recv` on a listener | `ENOTCONN` |
+| `send` on a listener | `EPIPE` (recorded, not pinned: Linux also raises `SIGPIPE` here, and this kernel raises no signal for a broken channel at all) |
+| `getpeername` on a listener | `ENOTCONN` |
+| `shutdown` on a listener | succeeds for either half, and the queue is left alone |
+| accepted `getsockname`/`getpeername` | the connection's own and its peer's names |
+| `connect` where nothing listens | `ECONNREFUSED` - smoltcp resets an unclaimed segment, so the loopback answers rather than timing out |
+| backlog admission | `queue_len > backlog`, one deeper than the number it names - the rule §4.1 measured on the unix family |
+
+`accept4`'s `SOCK_CLOEXEC`/`SOCK_NONBLOCK` are honoured for this family too; they
+had been accepted and dropped while the refusal was the whole implementation.
+`/proc/net/tcp` reports a listener as one `LISTEN` row on its bound address (the
+pool behind it is not a connection and has no row), and `poll`/`select`/`epoll`
+report a listener readable exactly when the queue is non-empty - the same
+question `accept` parks on, so a waiter that is woken cannot find the queue empty.
+
+What closing a listener does with the connections still in its queue is a
+recorded divergence: they are closed, which gets a `FIN` out through the ordinary
+teardown discipline, where Linux sends `RST`. That is the same limitation
+`SO_LINGER{on,0}` has below - smoltcp's resets are emitted in reply to an
+arriving packet, so an unsolicited reset is not something this stack can send.
+
+`t-tcp-listen` pins the whole shape: a server bound to `127.0.0.1:0`, a client
+that connects over the loopback, the accept with both names read back, bytes both
+ways, the client's *half*-close read as end-of-stream while the other direction
+still carries, a second sequential connection (which is what fails if the pool
+never refills), and every refusal in the table above.
+
+#### 4.3.3 The options — **PARTIAL** (three still record-only)
 
 `setsockopt`/`getsockopt` are no longer a no-op: each socket's registry `Entry`
 carries a `SockOpts`, and the common options round-trip with the correct ABI —
@@ -775,72 +886,29 @@ as 4-byte ints, `SO_LINGER` as an 8-byte `struct linger` (in-out length honoured
 plus `SO_TYPE`/`SO_ERROR`. `SO_RCVBUF`/`SO_SNDBUF` report the stack's default
 (64 KiB) until changed; unknown options are accepted and read back as 0.
 
-*Remaining (real effect, into smoltcp):* `SO_REUSEADDR` not yet applied at
-`bind`/`listen` (no TIME_WAIT rebind allowance), `TCP_NODELAY` not wired to
-disable Nagle coalescing, `SO_KEEPALIVE` not issuing probe packets, and
-`SO_LINGER` not honoured at `close`. The flags are stored and queried but do not
-yet change packet behaviour.
+*Remaining (real effect, into smoltcp):* three. `SO_REUSEADDR` is not applied at
+`bind`/`listen` - it needs an allowance for a rebind over a socket still in
+`TIME_WAIT`, which is now observable because the listening side exists (4.3.2).
+`SO_LINGER` is not honoured at `close` - see 4.3.4 for why the reset it asks for
+is not something this stack can send. And `SO_RCVBUF`/`SO_SNDBUF` cannot be
+honoured per socket at all until smoltcp's buffers stop being sized once at set
+construction. Two that used to be on this list are not: `TCP_NODELAY` reaches
+the live socket (`set_nagle_enabled`), and `SO_KEEPALIVE` arms smoltcp's probe
+timer at Linux's default interval.
 
-**Start here, in this order.** First the fact that bounds everything else in this
-section: **IPv4 `listen(2)` is refused with `EOPNOTSUPP`**, pinned deliberately in
-`user/tests/src/bin/t-tcp.rs` - the stack is outbound-only, no accept, so no
-in-guest server can run and no local socket pair exists to observe a teardown
-with. Adding `listen`/`accept` (a listening smoltcp socket + a `TcpSocketSet`
-passive-open slot + an inode per accepted connection) is therefore the first
-§4.3 item, not a footnote to it, and it is also what `dbus`, a local `nginx`, and
-any `ssh` *server* on this machine would need.
+#### 4.3.4 `close(2)`, and the teardown the descriptor could not wait for — **DONE**
 
-**And the loopback has to come before it, and it is done.** A listener nobody
-can connect to is a feature this suite cannot test: the harness forwards no host
-port (`-netdev user` with no `hostfwd`), so an in-guest client is the only client
-there can be - and until this landed the stack had no 127.0.0.1 path at all.
-`ip link show lo` *reported* a loopback because `rtnl` filled in the shape a
-reader expects, but nothing answered a segment sent to it.
-
-`lo` is now a real interface over **smoltcp's own `Loopback` device** (gated on
-the `alloc` feature, which this crate already enables) carrying `127.0.0.0/8` and
-no routes, and `Stack::lo_up` gates its poll like eth0's own flag - so it was not
-fifty lines of device after all, it was zero. What was *not* free is the sentence
-that follows, and it is the whole shape of the step: **smoltcp cannot route it
-with one socket set.** Its route lookup is *destination-only*
-(`Interface::route` answers `in_same_network(dst)` or the best matching route,
-`iface/interface/mod.rs:1010,1014`), and `Interface::poll` walks every socket in
-the set it is handed - so a shared set would have `eth0` claim a 127.0.0.1 socket
-and put the segment on the wire, whether or not `127.0.0.0/8` was added to eth0.
-
-Two interfaces therefore mean two socket sets, and a socket cannot move between
-them (smoltcp has no such operation), so a socket with no address yet has no
-home: `Stack` is now two `Fabric`s (interface + device + set + its own up flag,
-with `sockets_mut(home)`/`poll_home(home)` resolving a handle), a `channel` of
-`Tcp`/`Udp`/`Raw` carries a `home: Home`, and the set is decided by the first
-`bind`/`connect`/`sendto` - which is a change to when a socket joins a set, and
-to every one of the ~33 places that looks one up by handle. The move itself is
-only ever applied to a socket nothing has used yet (`Closed` for TCP,
-`!bound` for UDP), and it is applied *before* the call that names the address,
-so the fresh socket it swaps in is deliberately empty.
-
-Two deliberate boundaries, both recorded rather than hidden. A **raw socket
-never moves**: its destination is a per-call argument, so one socket cannot
-serve two sets, and leaving it on eth0 is what keeps `ping 127.0.0.1` behaving
-exactly as it did (it travels the virtual wire, and slirp answers - which is
-what `t-netlat` measures). And a **wildcard listener** would live on eth0's
-fabric, so a loopback client could not reach it; that gap is the listener's, and
-`listen` is the next step. `t-udp-loopback` pins what the loopback does: two
-datagram sockets in one process exchanging a payload over `127.0.0.1`, an
-unbound sender relocated by its destination (with the sender named back on the
-loopback), and a datagram to a port nobody holds answered by nothing at all.
-
-**Second is done, and was measured rather than assumed**: a plain `close(2)`
-reached `net::free_entry`, which called `sockets.remove(handle)` on the spot,
-while smoltcp only puts the `FIN` out from its poll loop after the socket is
-marked closing (`shutdown(2)` did call `close()`; the last close did not). A
-closing socket is now marked and parked in `Stack::teardown` - bounded, because a
-peer that stops answering may cost a slot but not the set - and `reap_teardown`
-frees it after the poll that carries its last segment, so the descriptor is gone
-when the caller asks and the wire still gets its four packets. `t-tcp-close` + a
-host-side listener through slirp (`10.0.2.2:4599` → host `127.0.0.1:4599`) shows
-the peer receiving the bytes *and* end-of-stream instead of sitting until it
-gives up.
+Measured rather than assumed: a plain `close(2)` reached `net::free_entry`, which
+called `sockets.remove(handle)` on the spot, while smoltcp only puts the `FIN` out
+from its poll loop after the socket is marked closing (`shutdown(2)` did call
+`close()`; the last close did not). A closing socket is now marked and parked in
+`Stack::teardown` - bounded, because a peer that stops answering may cost a slot
+but not the set - and `reap_teardown` frees it after the poll that carries its
+last segment, so the descriptor is gone when the caller asks and the wire still
+gets its four packets. `t-tcp-close` + a host-side listener through slirp
+(`10.0.2.2:4599` → host `127.0.0.1:4599`) shows the peer receiving the bytes
+*and* end-of-stream instead of sitting until it gives up. (The socket to reap
+lives in one of two sets now, so the list carries its home - see 4.3.1.)
 
 That producer went missing once, with the consumer, the bounded list and this
 paragraph all still in place - `TEARDOWN_MAX` sitting unread was the only clue,
@@ -855,11 +923,15 @@ shape this stack still cannot do, and it is left orderly on purpose rather than
 faked: smoltcp 0.13's `abort()` only moves the socket to `Closed` and transmits
 nothing (its resets are reply-driven, emitted when a packet *arrives* for a
 closed socket), so calling it would make the close *silent*, which is worse than
-the `FIN` the peer gets now. Honouring it needs an actual reset on egress.
+the `FIN` the peer gets now. Honouring it needs an actual reset on egress - the
+same missing primitive that makes closing a listener `FIN` its unaccepted queue
+instead of resetting it (4.3.2).
 
-*Remaining after those:* `SO_REUSEADDR` applied at `bind`/`listen` (a TIME_WAIT
-rebind allowance, which needs the listening side to exist first), `SO_KEEPALIVE`
-probe packets, and a reset on egress for `SO_LINGER{on, 0}`. `SO_RCVBUF`/`SO_SNDBUF` cannot be honoured per
+*Remaining after those:* `SO_REUSEADDR` applied at `bind`/`listen` — a rebind
+allowance over a socket still in `TIME_WAIT`, which the listener above is what
+makes observable at all, and which is the next thing in this section; 
+`SO_KEEPALIVE` probe packets; and a reset on egress for `SO_LINGER{on, 0}`.
+`SO_RCVBUF`/`SO_SNDBUF` cannot be honoured per
 socket as things stand: smoltcp sizes its buffers when the socket set is built,
 so a real answer needs either a set rebuilt per requested size or a limit applied
 in the mpos read/write queue - and until one of those exists the options should
