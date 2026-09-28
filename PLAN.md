@@ -172,7 +172,10 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
         `ENOENT` - the errno Linux's own `str_to_user` returns for a NULL
         attribute - so the wrong one made the whole read fatal, and libinput
         gave up with "failed to create input device" for every node on the
-        machine (§7.2, both pinned by `t-evdev`)
+        machine (§7.2; `t-evdev` pins the `phys`/`uniq` answer *and* the link's
+        one-hop target - against the string udev knows the device by, so the
+        comparison libinput makes is the thing held, not the spelling of the
+        path)
   - [x] **and a node's hang-up had to become sayable** - the wait udev parks on
         reads only that. `spawn_wait` watches its child's pipe with epoll, takes
         a read of 0 as "look again" and ends on `EPOLLHUP` alone, so an
@@ -203,7 +206,13 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
         device is a keyboard`, `event1 - QEMU Virtio Tablet: is tagged by udev
         as: Mouse ... device is a pointer`, `libinput: configuring device` for
         both, and both associated with output `Virtual-1` - where before it was
-        `failed to create input device` twice and `no input devices found`
+        `failed to create input device` twice and `no input devices found`.
+        That run is an operator's, though, and a compositor's keyboard is too
+        much to leave resting on one: `t-evdev` pins the read rule in the gate -
+        an empty node opened `O_NONBLOCK`, and the same node with the bit set
+        through `fcntl(F_SETFL)` afterwards, each answering `EAGAIN` instead of
+        parking - so a fifth time this regresses, the sweep says so and no one
+        has to watch weston's log for the silence
   - [ ] `SOCK_SEQPACKET` still carries no boundaries over a *named* socket (the
         stream this family has), which is the one documented divergence left on
         the path from `udevadm` to a tagged device node

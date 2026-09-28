@@ -253,6 +253,68 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         ends,
     );
 
+    // --- the read a compositor's main loop actually makes ---
+    //
+    // `libinput` opens every evdev node with `O_NONBLOCK` and pumps it from
+    // `epoll`, so an empty read has to answer `EAGAIN` and leave the caller
+    // running. This is the fourth of the gaps that stood between udev and a
+    // compositor's keyboard, and the one the other three hid: with the sysfs
+    // paths, the `phys`/`uniq` answer and epoll's hang-up in place, weston
+    // created `event0`, logged it as a keyboard, and then said nothing more -
+    // not the pointer, not a failure - its event loop parked on a read Linux
+    // would have answered `EAGAIN`, with nobody left to handle the input it was
+    // waiting for. A node that answers the data case and stops at the empty one
+    // is a node no event-driven reader can pump.
+    //
+    // Nothing presses this machine's keyboard during a sweep, so the queue is
+    // empty by construction and the answer is the flag's, not the device's.
+    // Both routes into the flag are pinned, because a node that honours only
+    // one of them works for some callers and not others: the `open` that was
+    // born with it, and `fcntl(F_SETFL)` afterwards - the two paths that meet in
+    // the same `sync_nonblocking`.
+    let mut spare = [0u8; RECORD];
+    let nb = lin::openat(
+        lin::AT_FDCWD,
+        b"/dev/input/event0\0",
+        lin::O_RDONLY | lin::O_NONBLOCK,
+        0,
+    ) as i32;
+    lin::check_true(&mut failed, b"an evdev node opens O_NONBLOCK", nb >= 0);
+    if nb >= 0 {
+        lin::check_eq(
+            &mut failed,
+            b"an empty nonblocking evdev read answers EAGAIN, not a park",
+            lin::read(nb, &mut spare),
+            lin::EAGAIN,
+        );
+        let _ = lin::close(nb);
+    }
+    let blocking = lin::openat(lin::AT_FDCWD, b"/dev/input/event0\0", lin::O_RDONLY, 0) as i32;
+    lin::check_true(&mut failed, b"an evdev node opens blocking", blocking >= 0);
+    if blocking >= 0 {
+        let flags = lin::fcntl(blocking, lin::F_GETFL, 0);
+        lin::check_true(
+            &mut failed,
+            b"and reports no O_NONBLOCK of its own",
+            flags >= 0 && flags as usize & lin::O_NONBLOCK == 0,
+        );
+        if flags >= 0 {
+            lin::check_eq(
+                &mut failed,
+                b"F_SETFL sets the bit on an evdev descriptor",
+                lin::fcntl(blocking, lin::F_SETFL, flags as usize | lin::O_NONBLOCK),
+                0,
+            );
+            lin::check_eq(
+                &mut failed,
+                b"and the empty read is EAGAIN through that route too",
+                lin::read(blocking, &mut spare),
+                lin::EAGAIN,
+            );
+        }
+        let _ = lin::close(blocking);
+    }
+
     let _ = lin::close(fd);
 
     // --- device discovery (what udev/libinput actually enumerate through) ---
@@ -264,6 +326,8 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     }
     // /sys/class/input/event0/dev carries the major:minor the node answers to,
     // which is the pairing udev matches a uevent against.
+    let mut numbers = [0u8; 16];
+    let mut numbers_len = 0usize;
     let sdev = lin::openat(
         lin::AT_FDCWD,
         b"/sys/class/input/event0/dev\0",
@@ -284,6 +348,63 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             b"its dev number is the input major (13:...)",
             n >= 3 && &content[..3] == b"13:",
         );
+        if n > 0 {
+            // The attribute ends in a newline; the number is the part before
+            // it, because that is the name the reverse index carries.
+            let mut end = n as usize;
+            while end > 0 && (content[end - 1] == b'\n' || content[end - 1] == b'\r') {
+                end -= 1;
+            }
+            numbers[..end].copy_from_slice(&content[..end]);
+            numbers_len = end;
+        }
+    }
+
+    // `/sys/dev/char/M:m`: how a *number* becomes a device, and the check
+    // libinput makes before it will take one. A compositor holds an open
+    // descriptor and no path, so `evdev_device_have_same_syspath` re-derives
+    // the device from that descriptor's devnum and refuses it unless the path
+    // it lands on is, string for string, the one udev handed it. `libudev`
+    // resolves exactly *one* hop of this link, so the target has to be the
+    // device tree's own path (`devices/virtual/input/input0/event0`) and not
+    // another link to it (`class/input/event0`): with the class-shaped target
+    // the two answers disagreed, the keyboard was dropped without a word, and
+    // weston reported "failed to create input device" for a node udev had
+    // tagged perfectly. Pinned as the rule rather than as the spelling - the
+    // number's link and the class link must resolve to the same string, and it
+    // must live under `/devices` - so a tree that reorganises is still held to
+    // the comparison libinput actually makes.
+    if numbers_len > 0 {
+        let prefix = b"/sys/dev/char/";
+        let mut path = [0u8; 64];
+        path[..prefix.len()].copy_from_slice(prefix);
+        path[prefix.len()..prefix.len() + numbers_len].copy_from_slice(&numbers[..numbers_len]);
+        path[prefix.len() + numbers_len] = 0;
+        let path = &path[..prefix.len() + numbers_len + 1];
+
+        let mut link = [0u8; 128];
+        let ln = lin::readlink(path, &mut link);
+        let mut class_link = [0u8; 128];
+        let cn = lin::readlink(b"/sys/class/input/event0\0", &mut class_link);
+        let into_devices = ln > 0 && link[..ln as usize].starts_with(b"../../devices/");
+        lin::check_true(
+            &mut failed,
+            b"the devnum link resolves into the device tree, not to a class entry",
+            into_devices,
+        );
+        let same = ln > 0 && ln == cn && link[..ln as usize] == class_link[..cn as usize];
+        lin::check_true(
+            &mut failed,
+            b"and to the same path udev knows the device by",
+            same,
+        );
+        if !same {
+            lin::puts(b"  /sys/dev/char link: ");
+            lin::puts(&link[..ln.max(0) as usize]);
+            lin::puts(b"\n  /sys/class link:    ");
+            lin::puts(&class_link[..cn.max(0) as usize]);
+            lin::puts(b"\n");
+        }
     }
 
     // A pointer device (the tablet) advertises EV_ABS and answers its axis
