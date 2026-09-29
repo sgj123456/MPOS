@@ -21,6 +21,12 @@ pub const SIGINT: u8 = 2;
 /// signal that arrived, or a single step. It is also the one a `SIGTRAP`
 /// handler would run for, though nothing here raises it any other way.
 pub const SIGTRAP: u8 = 5;
+/// The keyboard's quit — `VQUIT`, `^\`, a `SIGINT` whose default is more
+/// forceful. On Linux this is where a core dump comes from; this kernel has
+/// no dump to write, so the default action is the plain terminate every
+/// other unnamed signal answers with, and a program that wants the
+/// distinction catches it.
+pub const SIGQUIT: u8 = 3;
 /// Termination, the kind that cannot be caught, blocked or ignored.
 pub const SIGKILL: u8 = 9;
 /// The two the kernel has no opinion about, which is precisely why the console
@@ -67,9 +73,27 @@ pub const SIGTTOU: u8 = 22;
 pub const SIGWINCH: u8 = 28;
 
 /// How many signal numbers a process can hold a disposition for. `Pending` is
-/// a `u32`, so 1..=31 are the numbers this kernel can name at all; the zero
-/// slot is left in so a signal number indexes its own entry.
+/// a `u64`, so 1..=63 are the numbers this kernel can name at all; the zero
+/// slot is left in so a signal number indexes its own entry. Dispositions stop
+/// at 31 — the real-time range has no handler storage, which `rt_sigaction`
+/// says out loud with `EINVAL`.
 pub const SIGNALS: usize = 32;
+
+/// `SIGRTMIN`, the first real-time signal and the only one this kernel ever
+/// generates itself: musl's `SIGEV_THREAD` timers target a helper thread with
+/// exactly this number, and a kernel without it is one on which every
+/// `timer_create`-with-a-callback program — vim among them — fails its
+/// timeout setup and dies on the redraw path that follows the failure.
+/// Dispositions are still refused for it; a process-directed wait
+/// (`rt_sigtimedwait`, a blocked mask) is the whole surface it needs.
+pub const SIGRTMIN: u8 = 32;
+
+/// How many `siginfo_t` slots a task keeps. One per signal the kernel itself
+/// can queue, which is 1..=31 plus [`SIGRTMIN`]: the timer expiry that targets
+/// a thread is the one record `rt_sigtimedwait` must hand back complete, with
+/// `SI_TIMER` in `si_code` — musl's helper thread checks exactly that field
+/// before it calls the callback.
+pub const SIGINFO_SLOTS: usize = SIGNALS + 1;
 
 /// The two dispositions that are not a function address: take the default
 /// action, or do nothing at all.
@@ -85,6 +109,23 @@ pub const SA_RESTORER: usize = 0x0400_0000;
 pub const SA_ONSTACK: usize = 0x0800_0000;
 pub const SA_NODEFER: usize = 0x4000_0000;
 pub const SA_RESETHAND: usize = 0x8000_0000;
+
+/// `SA_RESTART`: the caller asked the interrupted syscall to be run again after
+/// its handler returns, rather than to come back as `EINTR`.
+///
+/// Recorded, not acted on. The kernel's reads answer `EINTR` for every
+/// interrupted call, restarted or not, and that is the half a caller can
+/// survive: it is what breaks `vim`'s blocked read so its own loop re-issues
+/// it. The rewind that would make the restart invisible is the named gap, and
+/// its shape is on the board beside the measurement that shows what Linux
+/// really does. `strace` sees `read(...) = ? ERESTARTSYS`, then
+/// `rt_sigreturn({mask=[]}) = 0` followed by a genuine second `read` with the
+/// caller's original arguments.
+///
+/// It is spelled here because a program is already setting it: musl's `sigaction`
+/// copies the caller's flags word into the disposition, and a disposition the
+/// kernel cannot name is one it cannot report back.
+pub const SA_RESTART: usize = 0x1000_0000;
 
 /// The bytes of `struct rt_sigframe` on x86_64, which is what the kernel
 /// pushes on a handler's stack:
@@ -334,15 +375,42 @@ impl SigInfo {
     }
 }
 
-/// A pending-signal set: one bit per signal number.
-pub type Pending = u32;
+/// A pending-signal set: one bit per signal number, with bit *n* naming
+/// signal *n*.
+///
+/// The layout is the kernel's own, and deliberately not the wire's: a libc's
+/// `sigset_t` holds signal *n* in bit *n-1*, and every syscall that crosses
+/// the boundary converts through [`from_wire`] / [`to_wire`] rather than
+/// storing one side's bits under the other side's reading. The two spellings
+/// are one shift apart, and a kernel that mixed them would block the
+/// neighbouring signal to the one asked for — an off-by-one that no test
+/// inside the kernel could see, because both sides of it speak the same
+/// wrong language. The ABI tests pin the *wire* half by number.
+pub type Pending = u64;
 
 pub fn bit(sig: u8) -> Pending {
-    1 << (sig % 32)
+    1 << (sig % 64)
 }
 
 pub fn add(set: &mut Pending, sig: u8) {
     *set |= bit(sig);
+}
+
+/// A libc's `sigset_t` as it arrives on the syscall boundary: signal *n* in
+/// bit *n-1*.
+///
+/// The highest bit the wire can carry is signal 64, which no call here can
+/// name; it is dropped, and the caller that wants the whole real-time range
+/// finds the refusal in the dispositions it still cannot set.
+pub fn from_wire(raw: u64) -> Pending {
+    raw << 1
+}
+
+/// The kernel's pending set as a libc's `sigset_t`: signal *n* back into bit
+/// *n-1*, which is the shape every caller of `rt_sigprocmask`'s `oldset` and
+/// `rt_sigpending` reads.
+pub fn to_wire(set: Pending) -> u64 {
+    set >> 1
 }
 
 /// Take the lowest-numbered pending signal out of the set, if any.
@@ -363,6 +431,7 @@ mod tests {
     fn numbers_are_pinned() {
         // These are the traditional values; the libc will bind them as is.
         assert_eq!(SIGINT, 2);
+        assert_eq!(SIGQUIT, 3);
         assert_eq!(SIGTRAP, 5);
         assert_eq!(SIGKILL, 9);
         assert_eq!(SIGUSR1, 10);

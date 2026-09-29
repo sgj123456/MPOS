@@ -788,9 +788,19 @@ fn master_request(nr: u32, minor: u32, ofd: u64) -> isize {
             if previous != 0 && previous != ofd {
                 critical_section::with(|cs| AUTH_OFD.borrow(cs).borrow_mut().clear());
             }
-            let vc = current_console();
+            let vc = current_console().unwrap_or_else(crate::vfs::vcmux::active);
             MASTER_PID.store(crate::sched::current_tgid().0 as u64, Ordering::Relaxed);
-            crate::vfs::vcmux::set_master_vc(vc.unwrap_or(0));
+            // The master is always bound to a console. A holder with no
+            // controlling terminal - seatd taking the card before it hands the
+            // fd to weston, or a launch chain that never ran `TIOCSCTTY` - is
+            // bound to the console on the screen at the moment master is taken,
+            // which is the console the compositor is driving. An *unbound*
+            // master could never be revoked from a `^A` switch: `master_ok`
+            // passes it, `painted()` says the text console may draw, and the two
+            // then race on one scanout - the mouse that repaints a text VT, and
+            // the flicker of a shell and a compositor overwriting each other.
+            // Binding here is what makes "losing the console revokes it" true.
+            crate::vfs::vcmux::set_master_vc(vc);
             // A fresh master on a console that still holds the screen clears
             // the hang-up it was revoked under; a master on a console that is
             // not on the screen stays revoked, which is the honest state.
@@ -950,8 +960,10 @@ fn master_ok(nr: u32, minor: u32, ofd: u64) -> bool {
         return true;
     }
     let Some(vc) = crate::vfs::vcmux::master_vc() else {
-        // Either nobody has claimed the card, or whoever did never named a
-        // console to lose. A compositor's first `SETCRTC` can arrive before its
+        // Nobody has claimed the card. (A *held* master is always bound now:
+        // `SET_MASTER` falls back to the console on the screen, so `None` here
+        // means "no master", not "a master that named no console".) A
+        // compositor's first `SETCRTC` can arrive before its
         // seat manager's `SET_MASTER`, and a machine whose kernel refused it
         // there would be a machine that cannot show a mode at all - so an
         // unbound card serves its holder, and only a card bound to a console
@@ -1207,6 +1219,83 @@ fn revoke() {
     // never landing and its session never ending. Empty the queue first and let
     // the hang-up close it.
     critical_section::with(|cs| STATE.borrow(cs).borrow_mut().events.clear());
+}
+
+/// The screen moved onto a console that is not the master's: take the
+/// presentation away *now*, not on the master's next try.
+///
+/// `master_ok` refuses a lost master lazily, on the next `SETCRTC`/`PAGE_FLIP` -
+/// enough to stop its pixels landing, not enough to tell the compositor it has
+/// lost the screen. A compositor that is never told parks quietly in `poll`, and
+/// when its console comes back it still believes it holds the card, so it re-draws
+/// only on the next input event: the switch to the desktop shows a stale screen
+/// until the mouse moves. Linux is not so quiet - the VT move takes the master,
+/// the compositor reads the hang-up, releases and re-takes its session, and
+/// repaints the moment the console returns. This is that call: revoke on the
+/// switch, then wake the parked reader so the `POLLHUP` is seen. The master's
+/// recovery - `SET_MASTER` after its `acqsig` - clears the hang-up again (see
+/// [`revoked`]), which is what makes the switch *back* repaint without a mouse.
+pub fn revoke_now() {
+    if !master_held() {
+        return;
+    }
+    // Only a master that has actually lost the screen. A master whose console is
+    // still the one on the screen keeps presenting.
+    if crate::vfs::vcmux::master_holds_screen() {
+        return;
+    }
+    revoke();
+    // The compositor is parked in `poll` on the card fd waiting for a frame that
+    // will now never land; wake it so the hang-up closes its wait and it can
+    // pause and, on the `acqsig`, come back.
+    wake_card_readers();
+}
+
+/// The screen has moved back onto the DRM master's console: give it the card
+/// again and put its picture back on the scanout, the way Linux's VT switch
+/// re-grants the master and the compositor's re-commit re-shows it.
+///
+/// `revoke_now` stopped the master presenting while its console was away, and
+/// the text render filled the screen in its place - so the desktop's pixels are
+/// gone from the scanout even though the master's committed framebuffer is still
+/// the card's `current_fb` (weston keeps rendering into its dumb buffer whether or
+/// not it can present, and only a *mouse* event makes it flip a fresh one). Relying
+/// on the compositor to re-commit is what left a stale screen until the mouse moved.
+/// So the kernel does the re-present itself, exactly as Linux hands the master back
+/// and forces the output to be re-applied on `VT_ACTIVATE`: clear the hang-up, then
+/// ask the render task - the only flusher - to copy `current_fb` onto the scanout
+/// and flush. The desktop is back on the very frame that switched to it.
+pub fn grant_and_resent() {
+    if !master_held() {
+        return;
+    }
+    // Only when the master's console is genuinely back on the screen, in graphics
+    // mode - otherwise there is nothing to hand back and the text console keeps it.
+    if !crate::vfs::vcmux::master_holds_screen() {
+        return;
+    }
+    // The hang-up was because it lost the console; the console is back.
+    REVOKED.store(false, Ordering::Relaxed);
+    if critical_section::with(|cs| STATE.borrow(cs).borrow().current_fb) != 0 {
+        crate::drivers::video::render::request_re_present();
+    }
+    // A reader parked in `poll` on the card fd now sees the fd live again, not
+    // hang-up, and its next flip will land.
+    wake_card_readers();
+}
+
+/// Copy the master's current framebuffer onto the scanout. The render task's
+/// re-present path (`drivers::video::render::request_re_present`) calls this as
+/// the one flusher, then flushes. Unlike a compositor's own flip this is the
+/// kernel's act, so it is not gated by `master_ok` - it is what hands the screen
+/// back. Returns 0 on success, the `copy_to_scanout` error if there is no frame
+/// to show.
+pub fn re_present_now() -> isize {
+    critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        let fb = st.current_fb;
+        if fb == 0 { 0 } else { copy_to_scanout(&st, fb) }
+    })
 }
 
 /// A description closed its last reference: it holds nothing any more, and no
@@ -2963,6 +3052,10 @@ pub struct DrmCard {
     /// state, exactly as on Linux, where a lease is a `drm_file` pointing at the
     /// same `drm_device` with a list of allowed object ids attached.
     lease: Option<Arc<LeaseSet>>,
+    /// The node's mode and owner - `chmod`/`chown`/udev's rules on `card0`
+    /// stick here and are what `stat` and the permission checks read
+    /// (see `crate::vfs::devfs::NodePerms`).
+    perms: crate::vfs::devfs::NodePerms,
 }
 
 /// The object ids one lease descriptor may drive, and the flags it was made
@@ -3019,6 +3112,7 @@ impl DrmCard {
             ino,
             minor,
             lease: None,
+            perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
         })
     }
 
@@ -3032,6 +3126,7 @@ impl DrmCard {
             ino: LEASE_INO.fetch_add(1, Ordering::Relaxed),
             minor: LEASE_MINOR.fetch_add(1, Ordering::Relaxed),
             lease: Some(Arc::new(LeaseSet::new(objects, sealed))),
+            perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
         })
     }
 
@@ -3061,6 +3156,26 @@ impl Inode for DrmCard {
             kind: NodeKind::CharDev,
             size: 0,
         }
+    }
+
+    fn keeps_modes(&self) -> bool {
+        self.perms.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        self.perms.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.perms.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.perms.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        self.perms.set_owner(uid, gid);
     }
 
     /// The device number `stat` reports: DRM's major 226 and this name's

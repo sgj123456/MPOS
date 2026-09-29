@@ -114,6 +114,10 @@ name = "t-sh"
 path = "src/bin/integration/t-sh.rs"
 
 [[bin]]
+name = "t-sock-flags"
+path = "src/bin/integration/t-sock-flags.rs"
+
+[[bin]]
 name = "t-tcp-close"
 path = "src/bin/integration/t-tcp-close.rs"
 
@@ -386,6 +390,10 @@ name = "t-sched-getaffinity"
 path = "src/bin/syscall/t-sched-getaffinity.rs"
 
 [[bin]]
+name = "t-seccomp"
+path = "src/bin/syscall/t-seccomp.rs"
+
+[[bin]]
 name = "t-set-robust-list"
 path = "src/bin/syscall/t-set-robust-list.rs"
 
@@ -426,12 +434,36 @@ name = "t-syslog"
 path = "src/bin/syscall/t-syslog.rs"
 
 [[bin]]
+name = "t-timer-create"
+path = "src/bin/syscall/t-timer-create.rs"
+
+[[bin]]
 name = "t-timerfd"
 path = "src/bin/syscall/t-timerfd.rs"
 
 [[bin]]
 name = "t-truncate"
 path = "src/bin/syscall/t-truncate.rs"
+
+[[bin]]
+name = "t-tty-eintr"
+path = "src/bin/syscall/t-tty-eintr.rs"
+
+[[bin]]
+name = "t-tty-query"
+path = "src/bin/syscall/t-tty-query.rs"
+
+[[bin]]
+name = "t-dsp"
+path = "src/bin/syscall/t-dsp.rs"
+
+[[bin]]
+name = "t-dhcp"
+path = "src/bin/integration/t-dhcp.rs"
+
+[[bin]]
+name = "t-tty-vtime"
+path = "src/bin/syscall/t-tty-vtime.rs"
 
 [[bin]]
 name = "t-umask"

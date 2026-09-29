@@ -286,6 +286,74 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         back == 0,
     );
 
+    // `MAP_FIXED_NOREPLACE` (Linux 4.17): the address is mandatory but an
+    // occupied range is refused with `EEXIST`, not relocated and not replaced -
+    // what separates it from a plain hint (ignored when in use) and from
+    // `MAP_FIXED` (takes the range). And `MAP_HUGETLB` with no huge-page pool is
+    // the honest `ENOMEM`, never a silent 4 KiB page that would let the caller
+    // believe it had huge pages.
+    {
+        const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
+        const MAP_HUGETLB: usize = 0x4_0000;
+        let nr_at = GUARD + 0x20_0000;
+        let nr = lin::mmap(
+            nr_at,
+            4096,
+            lin::PROT_READ | lin::PROT_WRITE,
+            lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"MAP_FIXED_NOREPLACE on a free range answers the exact address",
+            nr,
+            nr_at as isize,
+        );
+        let nr2 = lin::mmap(
+            nr_at,
+            4096,
+            lin::PROT_READ | lin::PROT_WRITE,
+            lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"MAP_FIXED_NOREPLACE over a live range is EEXIST, not relocated",
+            nr2,
+            lin::EEXIST,
+        );
+        let conflict = lin::mmap(
+            0,
+            4096,
+            lin::PROT_READ | lin::PROT_WRITE,
+            lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | lin::MAP_FIXED | MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"MAP_FIXED together with MAP_FIXED_NOREPLACE is EINVAL",
+            conflict,
+            lin::EINVAL,
+        );
+        let huge = lin::mmap(
+            0,
+            4096,
+            lin::PROT_READ | lin::PROT_WRITE,
+            lin::MAP_PRIVATE | lin::MAP_ANONYMOUS | MAP_HUGETLB,
+            -1,
+            0,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"MAP_HUGETLB is refused with ENOMEM, not a silent 4 KiB page",
+            huge,
+            lin::ENOMEM,
+        );
+    }
+
     lin::done(failed)
 }
 

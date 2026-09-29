@@ -47,6 +47,7 @@
 //! - which is why `ping 127.0.0.1` still travels the virtual wire (and still
 //! works, through slirp) rather than the loopback.
 
+pub mod packet;
 pub mod rtnl;
 pub mod socket;
 pub mod unix;
@@ -803,6 +804,30 @@ pub(crate) fn with<R>(handle: usize, f: impl FnOnce(&mut Stack, &mut Entry) -> R
 
 /// Run `f` with the stack alone - for operations that do not have a socket
 /// open yet (`socket()` itself) or span several (`close_sockets_at_exit`).
+/// eth0's hardware address - the one number a packet socket's frames must
+/// carry as their source, read from the live device rather than restated.
+pub(crate) fn packet_mac() -> Option<[u8; 6]> {
+    with_stack(|st| st.eth.device.net.mac())
+}
+
+/// Hand one complete Ethernet frame to the device, outside the stack lock
+/// (the Arc outlives the borrow, and the transmit is the driver's own).
+/// `ENETDOWN` with no card; a refused queue is `EIO`, not a lost silence.
+pub(crate) fn packet_transmit(frame: &[u8]) -> Result<usize, isize> {
+    let device: Option<Arc<crate::drivers::virtio::net::VirtioNet>> =
+        with_stack(|st| st.eth.device.net.clone());
+    match device {
+        Some(device) => {
+            if device.transmit(frame) {
+                Ok(frame.len())
+            } else {
+                Err(crate::syscall::err::EIO)
+            }
+        }
+        None => Err(crate::syscall::err::ENETDOWN),
+    }
+}
+
 pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
     critical_section::with(|cs| {
         let mut net = NET.borrow(cs).borrow_mut();
@@ -1738,6 +1763,10 @@ impl Device for NicDevice {
             self.pending = self.net.poll();
         }
         let frame = self.pending.take()?;
+        // The packet sockets see the frame before the stack decides whether
+        // it is any of the IP layer's business - which is the whole point of
+        // the family (see `packet`).
+        packet::deliver(&frame);
         Some((
             FrameRx { frame },
             FrameTx {

@@ -122,17 +122,21 @@ impl HvcDev {
 }
 
 impl crate::vfs::devfs::CharDevice for HvcDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
+    fn read(&self, buf: &mut [u8]) -> crate::vfs::VfsResult<usize> {
         if buf.is_empty() {
-            return 0;
+            return Ok(0);
         }
         loop {
             let got = self.0.drain(buf);
             if got > 0 {
-                return got;
+                return Ok(got);
             }
+            // A signal the caller can catch ends the wait with `EINTR`, not
+            // with 0: on this door 0 *is* end of input, and a program told its
+            // hypervisor console had closed would stop reading instead of
+            // retrying after its handler ran.
             if crate::sched::has_deliverable_signal() {
-                return 0;
+                return Err(crate::vfs::VfsError::Interrupted);
             }
             crate::sched::sleep_ticks(1);
         }

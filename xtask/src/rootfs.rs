@@ -54,7 +54,7 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // without reinstalling Alpine.
     let mode = effective_mode()?;
 
-    if !needs_rebuild(build_dir, profile)? && crate::qemu::baked_mode(build_dir) == mode {
+    if !needs_rebuild(build_dir, profile)? && crate::qemu::baked_mode(build_dir) == Some(mode) {
         println!("rootfs: up to date");
         return Ok(());
     }
@@ -1103,13 +1103,13 @@ fn install_boot_files(
             // `rootfstype` is for the initramfs's mount, not for the kernel:
             // the loader hands the whole line over, and the kernel ignores
             // what it does not know. Naming it here keeps the init script
-            // from guessing. The trailing `mpos.*` word is the console mode
-            // `cargo xtask run` put the image in (see `RunMode`).
-            "root={} rootfstype={} rootflags=rw console={} {}\n",
+            // from guessing. The `console=` words are the consoles the run mode
+            // asks for (see `RunMode`), and they are all the kernel is told
+            // about how this image was meant to be shown.
+            "root={} rootfstype={} rootflags=rw {}\n",
             config.root_device,
             config.filesystem,
-            config.serial_port,
-            mode.cmdline_flag()
+            mode.cmdline_consoles(&config.serial_port)
         ),
     )?;
     Ok(())

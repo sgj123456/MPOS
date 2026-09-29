@@ -8,13 +8,17 @@
 
 use alloc::sync::Arc;
 
+use crate::vfs::VfsResult;
 use crate::vfs::devfs::{CharDevice, DevFs};
 
 /// The console as the line discipline has it.
 pub struct TtyDev;
 
 impl CharDevice for TtyDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
+    /// The line discipline's own answer, including its `EINTR`: a program
+    /// blocked on the console is waiting on the same signal rule as a program
+    /// blocked on any other terminal.
+    fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         crate::vfs::tty::global().read(buf)
     }
 
@@ -28,8 +32,8 @@ impl CharDevice for TtyDev {
 pub struct ConsoleDev;
 
 impl CharDevice for ConsoleDev {
-    fn read(&self, _buf: &mut [u8]) -> usize {
-        0
+    fn read(&self, _buf: &mut [u8]) -> VfsResult<usize> {
+        Ok(0)
     }
 
     fn write(&self, buf: &[u8]) -> usize {
@@ -42,8 +46,8 @@ impl CharDevice for ConsoleDev {
 pub struct NullDev;
 
 impl CharDevice for NullDev {
-    fn read(&self, _buf: &mut [u8]) -> usize {
-        0
+    fn read(&self, _buf: &mut [u8]) -> VfsResult<usize> {
+        Ok(0)
     }
 
     fn write(&self, buf: &[u8]) -> usize {
@@ -60,8 +64,8 @@ impl CharDevice for NullDev {
 pub struct KmsgDev;
 
 impl CharDevice for KmsgDev {
-    fn read(&self, _buf: &mut [u8]) -> usize {
-        0
+    fn read(&self, _buf: &mut [u8]) -> VfsResult<usize> {
+        Ok(0)
     }
 
     fn write(&self, buf: &[u8]) -> usize {
@@ -84,9 +88,9 @@ impl CharDevice for KmsgDev {
 pub struct FullDev;
 
 impl CharDevice for FullDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
+    fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         buf.fill(0);
-        buf.len()
+        Ok(buf.len())
     }
 
     fn write(&self, _buf: &[u8]) -> usize {
@@ -102,9 +106,9 @@ impl CharDevice for FullDev {
 pub struct ZeroDev;
 
 impl CharDevice for ZeroDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
+    fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         buf.fill(0);
-        buf.len()
+        Ok(buf.len())
     }
 
     fn write(&self, buf: &[u8]) -> usize {
@@ -126,9 +130,9 @@ impl CharDevice for ZeroDev {
 pub struct RandomDev;
 
 impl CharDevice for RandomDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
+    fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         crate::rand::fill(buf);
-        buf.len()
+        Ok(buf.len())
     }
 
     fn write(&self, buf: &[u8]) -> usize {
@@ -148,13 +152,13 @@ impl CharDevice for RandomDev {
 pub struct HwrngDev(Arc<crate::drivers::virtio::rng::VirtioRng>);
 
 impl CharDevice for HwrngDev {
-    fn read(&self, buf: &mut [u8]) -> usize {
+    fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         // The count is the device's own answer: how many bytes the host
         // actually generated, which for a healthy device is the whole
         // buffer and for a quiet one is a short read - the shape every
         // stream answers with, and the one a caller retrying a short read
         // expects.
-        self.0.fill(buf)
+        Ok(self.0.fill(buf))
     }
 
     fn write(&self, buf: &[u8]) -> usize {

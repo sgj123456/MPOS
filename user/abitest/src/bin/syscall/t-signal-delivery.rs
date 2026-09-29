@@ -20,9 +20,11 @@
 //!     `si_code == SI_QUEUE` and the caller's `si_value` word - where a bare
 //!     `kill` reads back `SI_USER` (Phase 2.3).
 //!
-//! The masks here follow mpos's own convention, shared by `blocked`, the
-//! pending set and `rt_sigpending`: bit *n* names signal *n*, not the libc's
-//! bit *n-1*. The kernel never sees the libc spelling, so a test that speaks
+//! The masks here are the wire's `sigset_t`, as a libc spells it and as
+//! `t-rt-sigprocmask` pins it: bit *n* holds signal *n+1*. The kernel keeps its
+//! own arithmetic internally and converts at the syscall boundary, so a test
+//! that speaks to the raw syscall speaks the ABI's language, not the
+//! implementation's. The kernel never sees the libc spelling, so a test that speaks
 //! to the raw syscall speaks the kernel's.
 
 #![no_std]
@@ -129,7 +131,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // goes on the stack on the unblock's own return, so `RAN` is one by the
     // time that call is back.
     reset();
-    let bit = 1u64 << lin::SIGTERM;
+    // The wire's mask, as a libc spells it: signal *n* in bit *n-1* (the
+    // convention `t-rt-sigprocmask` pins). The kernel converts at the call.
+    let bit = 1u64 << (lin::SIGTERM - 1);
     let r = lin::rt_sigprocmask(lin::SIG_BLOCK, &bit, core::ptr::null_mut());
     lin::check_eq(&mut failed, b"blocking SIGTERM succeeds", r, 0);
     let r = lin::kill(lin::getpid() as i32, lin::SIGTERM);

@@ -475,6 +475,33 @@ pub fn action_data(ret: u32) -> u32 {
     ret & 0x0000_ffff
 }
 
+/// Whether this kernel implements the action, which is the whole content of
+/// `seccomp(2)`'s availability probe.
+///
+/// Every constant below appears because the gate does what Linux does with it,
+/// and each of those was measured rather than assumed (PLAN.md §8.2 holds the
+/// observations). Two kinds of word are refused:
+///
+/// * an action this kernel does not implement - which today is only
+///   `USER_NOTIF`, whose whole purpose is to hand the call to a userspace
+///   supervisor this machine has no way to summon; and
+/// * an action with anything in its **data half**. Measured on Linux: asking
+///   about `ERRNO|1` is refused, so the probe is a question about eight whole
+///   words and not about their high halves. A caller can be confident that a
+///   "supported" answer covers the errno it intends to use, because it cannot
+///   make the probe say yes about an errno at all.
+///
+/// Refusing matters more than the answer looks like it should. The probe exists
+/// because Linux treats an action it does not know as `KILL_PROCESS`, so a
+/// program asks *before* it relies on one; answering yes to something not
+/// implemented lets a filter kill its own process instead of falling back.
+pub fn supported(ret: u32) -> bool {
+    matches!(
+        ret,
+        RET_KILL_THREAD | RET_KILL_PROCESS | RET_TRAP | RET_ERRNO | RET_TRACE | RET_LOG | RET_ALLOW
+    )
+}
+
 /// The architecture word a filter checks first, as the block's own bytes.
 pub fn data_bytes(nr: i32, ip: u64, args: [u64; 6]) -> [u8; DATA_BYTES] {
     let mut out = [0u8; DATA_BYTES];
@@ -668,6 +695,32 @@ mod tests {
         ])
         .expect("parses");
         assert_eq!(Program::run(&p, &data_bytes(0, 0, [0; 6])), 7);
+    }
+
+    #[test]
+    fn the_availability_probe_answers_only_about_actions_this_kernel_does() {
+        // Everything the gate implements, and nothing else. `USER_NOTIF` is the
+        // refusal that costs something: it is the only action in the set the
+        // probe will not vouch for, because summoning the supervisor it names
+        // is not a thing this machine can do.
+        for yes in [
+            RET_KILL_THREAD,
+            RET_KILL_PROCESS,
+            RET_TRAP,
+            RET_ERRNO,
+            RET_TRACE,
+            RET_LOG,
+            RET_ALLOW,
+        ] {
+            assert!(supported(yes), "{yes:#x} is implemented");
+        }
+        assert!(!supported(RET_USER_NOTIF));
+        assert!(!supported(0x1234_0000));
+        // Measured on Linux: a word with anything in its data half is refused,
+        // even though the action in its high half is one that is supported.
+        assert!(!supported(RET_ERRNO | 1));
+        assert!(!supported(RET_TRAP | 1));
+        assert!(!supported(RET_ALLOW | 1));
     }
 
     #[test]

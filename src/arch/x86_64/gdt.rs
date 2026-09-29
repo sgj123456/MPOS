@@ -6,10 +6,14 @@
 //! nothing had to reshuffle selectors to make room.
 //!
 //! The TSS is a single static rather than per-CPU state because there is one
-//! core, and it exists for exactly one field: `RSP0`, the stack the CPU loads
-//! on every transition from ring 3 - a syscall or an interrupt. The scheduler
-//! rewrites it on every dispatch, so a user task always traps onto its own
-//! kernel stack; tasks that never leave ring 0 never cause the CPU to read it.
+//! core, and it exists for two fields. `RSP0` is the stack the CPU loads on every
+//! transition from ring 3 - a syscall or an interrupt - and the scheduler rewrites
+//! it on every dispatch, so a user task always traps onto its own kernel stack;
+//! tasks that never leave ring 0 never cause the CPU to read it.
+//! `interrupt_stack_table` is the array of *last-resort* stacks the CPU switches
+//! to for the few vectors that name one (`IST`), and it is what lets a fault be
+//! reported when the stack it landed on is the thing that is broken - see
+//! [`set_ist`] and `super::idt`'s double-fault stack.
 
 use core::cell::UnsafeCell;
 
@@ -56,6 +60,15 @@ static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
 /// Four from the front: `reserved_1` is a `u32` and `RSP0` is the member right
 /// after it. Nothing else in the struct comes before them.
 const RSP0_OFFSET: usize = 4;
+
+/// Where `interrupt_stack_table` sits in that same packed struct, in bytes from
+/// its own address: `reserved_1` (4) + `privilege_stack_table` (3 x 8 = 24) +
+/// `reserved_2` (4). Seven slots, `slot 0` being the hardware `IST1`.
+///
+/// Same reason as [`RSP0_OFFSET`] for spelling it as an address instead of a
+/// field: the struct is `repr(C, packed(4))`, so a reference into it is not
+/// something the compiler will hand out.
+const IST_OFFSET: usize = 32;
 
 /// The two words the `syscall` entry needs before it has anything else: a
 /// kernel stack to push on, and somewhere to put a register while it gets
@@ -159,6 +172,47 @@ pub fn set_kernel_stack(top: usize) {
         // Keep the `syscall` fast path's view of the kernel stack in step with
         // the TSS; `swapgs` in the entry exposes this to kernel code.
         *ENTRY_SCRATCH.kernel_rsp.get() = top;
+    }
+}
+
+/// Point hardware `IST<index + 1>` at `top`, so a vector installed with that
+/// index runs on a stack the CPU loads regardless of what the faulting stack
+/// pointer holds.
+///
+/// The CPU reads this array when it takes a fault whose IDT entry names an IST
+/// slot - double fault, NMI, machine check - and it reads it *before* pushing
+/// anything, which is the whole reason it exists: a fault taken while the kernel
+/// stack is unusable (overflowed off its bottom, or walked over by a wild write)
+/// cannot push the frame that would report it. Without an IST stack the failed
+/// push becomes a double fault, the double fault cannot push its own frame either,
+/// and the third fault is a triple fault: the CPU resets, `cargo xtask run` passes
+/// `-no-reboot`, and QEMU exits without writing a single byte of explanation. This
+/// is the difference between a machine that dies and a machine that says how.
+///
+/// `index` is the software one (0 = `IST1`), the same numbering
+/// `EntryOptions::set_stack_index` uses.
+///
+/// ## Safety
+///
+/// The caller is giving the CPU an address to load `RSP` from on a fault, so it
+/// has to be the *top* of a region that is mapped for as long as the machine is
+/// up, 16-byte aligned (the frame the CPU pushes assumes a stack aligned the way a
+/// `call` would leave it), and not shared with any other vector that can nest.
+pub unsafe fn set_ist(index: usize, top: usize) {
+    unsafe {
+        debug_assert_eq!(
+            core::ptr::addr_of!((*TSS.0.get()).interrupt_stack_table) as usize
+                - TSS.0.get() as usize,
+            IST_OFFSET,
+            "the IST array's byte offset in the packed TSS moved"
+        );
+        debug_assert!(index < 7, "the TSS has seven IST slots");
+        debug_assert_eq!(top % 16, 0, "an IST stack top must be 16-byte aligned");
+        let slot = (TSS.0.get() as *mut u8).add(IST_OFFSET + index * 8) as *mut u64;
+        // `write_unaligned` for the same reason `set_kernel_stack` uses it: this
+        // field is only 4-byte aligned inside the packed struct, and the CPU reads
+        // it with an ordinary unaligned load.
+        core::ptr::write_unaligned(slot, top as u64);
     }
 }
 

@@ -5,12 +5,15 @@
 //! writes hwclock sends to `/dev/rtc0`.
 //!
 //! Pinned here on fd 0, the console: TIOCGWINSZ writes the window the
-//! kernel serves, zeroing the pixel fields too. The size is 25x80 on this
-//! machine because a test boot is headless, so there is no console screen
-//! for the answer to come from; a boot with a framebuffer answers the grid
-//! it paints instead (128x48 on a 1024x768 display), which is what stops a
-//! full-screen program laying itself out in the corner of the screen, and
-//! that rule is pinned on the host, where a screen can be made
+//! kernel serves, zeroing the pixel fields too. The answer is the *screen's*
+//! grid in cells whenever the machine has a screen - the test boot's QEMU
+//! carries a virtio-gpu, so that is what it answers - and the 25x80 fallback
+//! only when there is no screen at all. Checking it against
+//! `FBIOGET_VSCREENINFO`/`8x16` rather than against a number of its own is
+//! what keeps it that rule: a full-screen program lays itself out in the
+//! window it was told, so a console whose answer changed mid-run would be
+//! the corner-of-the-screen bug this rule exists to prevent. The same rule is
+//! pinned on the host, where a screen can be made
 //! (`vfs::tty::tests::a_console_reports_its_screens_window_and_others_do_not`).
 //! TCGETS answers 0 and describes a console - a line at a time, echoed,
 //! interruptible - and TCSETS changes what it describes, so a shell that
@@ -26,6 +29,7 @@
 mod lin;
 
 use core::panic::PanicInfo;
+use lin::{ECHO, ICANON, ISIG, Termios, VEOF, VINTR};
 
 static mut WS: lin::Winsize = lin::Winsize {
     ws_row: 0,
@@ -50,28 +54,19 @@ const RNDGETENTCNT: usize = 0x8004_5200;
 const RNDADDENTROPY: usize = 0x4008_5202;
 const RTC_RD_TIME: usize = 0x8024_7409;
 const RTC_SET_TIME: usize = 0x4024_740A;
+const FBIOGET_VSCREENINFO: usize = 0x4600;
+/// The cell the kernel's console font draws: the framebuffer console *is*
+/// `/dev/tty0`'s emulator and its grid *is* that terminal's window, so the
+/// window in cells is the screen in pixels divided by this. `vfs/term` embeds
+/// the 8x16 `vga8x16` font it draws with, and `TIOCGWINSZ` on `/dev/ttyN`
+/// answers `Grid::rows/cols` - the same numbers, which is why they are checked
+/// against the screen rather than against a number a headless machine picked.
+const CELL_W: isize = 8;
+const CELL_H: isize = 16;
 
-/// The `struct termios` glibc hands an ioctl: four flag words, a line
-/// discipline, 32 control characters, then two speeds.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Termios {
-    iflag: u32,
-    oflag: u32,
-    cflag: u32,
-    lflag: u32,
-    line: u8,
-    cc: [u8; 32],
-    ispeed: u32,
-    ospeed: u32,
-}
-
-const ISIG: u32 = 0x0001;
-const ICANON: u32 = 0x0002;
-const ECHO: u32 = 0x0008;
-const VINTR: usize = 0;
-const VEOF: usize = 4;
-
+/// The `struct termios` glibc hands an ioctl, and the `c_lflag` bits and `c_cc`
+/// indices this program reads: they live in `lin` beside the other ABI shapes,
+/// because putting a terminal in raw mode is not one test's private business.
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-ioctl\n");
@@ -80,18 +75,50 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let r = lin::ioctl(0, lin::TIOCGWINSZ, &raw mut WS as usize);
     lin::check_eq(&mut failed, b"TIOCGWINSZ on the console succeeds", r, 0);
     let ws = unsafe { &*(&raw mut WS as *const lin::Winsize) };
-    lin::check_eq(
-        &mut failed,
-        b"the console reports 25 rows",
-        ws.ws_row as isize,
-        25,
-    );
-    lin::check_eq(
-        &mut failed,
-        b"the console reports 80 columns",
-        ws.ws_col as isize,
-        80,
-    );
+    // The console's window, checked against the screen it draws on. A machine
+    // with a display has a framebuffer console of that display's size whatever
+    // its kernel log rides on; a machine with no display at all answers the
+    // 25x80 fallback. What is *not* pinned is a boot-shaped answer: the same
+    // machine has to give the same window all run long, which is what a
+    // console whose size followed the DRM master got wrong.
+    let fb = lin::openat(lin::AT_FDCWD, b"/dev/fb0\0", lin::O_RDONLY, 0) as i32;
+    if fb >= 0 {
+        let mut var = [0u8; 160];
+        let r = lin::ioctl(fb, FBIOGET_VSCREENINFO, var.as_mut_ptr() as usize);
+        lin::check_eq(&mut failed, b"FBIOGET_VSCREENINFO sizes the screen", r, 0);
+        let xres = u32::from_ne_bytes([var[0], var[1], var[2], var[3]]) as isize;
+        let yres = u32::from_ne_bytes([var[4], var[5], var[6], var[7]]) as isize;
+        // The grid is the screen counted in cells, which is exactly what the
+        // render task computes: columns floor-divide (`Grid` caps rows, not
+        // columns) and rows are capped at `vfs/term::MAX_ROWS`, 64 - a height no
+        // test screen reaches.
+        lin::check_eq(
+            &mut failed,
+            b"the console's rows are the screen's",
+            ws.ws_row as isize,
+            (yres / CELL_H).min(64),
+        );
+        lin::check_eq(
+            &mut failed,
+            b"the console's columns are the screen's",
+            ws.ws_col as isize,
+            xres / CELL_W,
+        );
+        lin::close(fb);
+    } else {
+        lin::check_eq(
+            &mut failed,
+            b"with no screen the console reports 25 rows",
+            ws.ws_row as isize,
+            25,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"with no screen the console reports 80 columns",
+            ws.ws_col as isize,
+            80,
+        );
+    }
     lin::check_eq(
         &mut failed,
         b"the pixel fields are zeroed, not left to the caller",

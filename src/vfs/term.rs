@@ -1,17 +1,22 @@
 //! The terminal emulator: a cell grid a byte-stream is painted into.
 //!
-//! The line discipline in [`super::tty`] has always answered the *questions* a
-//! program asks a terminal (where is the cursor, what are you) and forwarded
-//! everything else raw to the host, which did the drawing. This module is that
-//! drawer: it consumes the same ANSI byte-stream and keeps the screen it
-//! describes - a grid of cells, each a character with a resolved foreground and
-//! background - so the framebuffer has something to blit.
+//! The line discipline in [`super::tty`] answers the *questions* a program asks
+//! its terminal (where is the cursor, what are you) - but only where the kernel is
+//! the terminal that owns the screen, which is where this grid is. Wherever a real
+//! emulator sits at the other end of a wire, the discipline forwards the question
+//! unanswered and that emulator answers it; see
+//! [`super::tty::Attached`] for the measurement that decided it.
 //!
 //! Deliberately a second parser alongside `note_output`. The two answer to
 //! different masters - one shapes what leaves on the wire, this shapes what is
 //! shown - and merging them would put the whole tested input behavior on the
-//! line for a rendering change. They both understand CSI; parsing twice is
-//! memory-cheap next to the wire it replaces.
+//! line for a rendering change. What they do **not** have twice is the cursor:
+//! both drive the one [`cursor::Cursor`], because a program that is told one
+//! position by `ESC [ 6 n` and sees another on the screen has been told a lie, and
+//! `vfs::tty::tests::the_report_and_the_screen_never_disagree_about_the_cursor`
+//! runs one stream through both and asserts the pair matches. Parsing twice is
+//! memory-cheap next to the wire it replaces; a second cursor model is not cheap
+//! at all, and was the bug.
 //!
 //! The grid is allocated once at [`Grid::new`] and `feed` never allocates, so
 //! it is safe to drive from the serial interrupt handler: a keystroke's echo
@@ -19,12 +24,15 @@
 //! at 32 rows (the dirty mask is a `u32`), which 80x25 fits with room to spare.
 
 pub mod blit;
+pub mod cursor;
 pub mod font;
 pub mod keymap;
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+
+use cursor::{Cursor, Scroll};
 
 use critical_section::Mutex;
 
@@ -63,25 +71,18 @@ enum State {
 }
 
 /// A parked copy of the main screen, kept while an alternate screen shows.
-struct Snapshot {
+struct Parked {
     cells: Vec<Cell>,
-    row: usize,
-    col: usize,
-    top: usize,
-    bottom: usize,
+    cursor: cursor::Snapshot,
 }
 
 /// A screen of cells with a cursor, a scroll region and a pending pen.
+///
+/// The cursor is [`Cursor`], the one state the line discipline also answers a
+/// position report from: see [`cursor`] for why a screen cannot own two of them.
 pub struct Grid {
-    rows: usize,
-    cols: usize,
+    cur: Cursor,
     cells: Vec<Cell>,
-    row: usize,
-    col: usize,
-    saved_row: usize,
-    saved_col: usize,
-    top: usize,
-    bottom: usize,
     pen_fg: Rgb,
     pen_bg: Rgb,
     pen_bold: bool,
@@ -90,12 +91,12 @@ pub struct Grid {
     dirty: u64,
     /// The main screen parked while an alternate screen (a full-page `less`, a
     /// `vi`) is showing, so leaving it restores what was there.
-    alt: Option<Snapshot>,
+    alt: Option<Parked>,
     // Escape decoder, carried across `feed` so a split sequence holds.
     state: State,
     params: [u16; PARAM_MAX],
     nparam: usize,
-    cur: u16,
+    digit: u16,
     seen_digit: bool,
     priv_marker: u8,
 }
@@ -105,15 +106,8 @@ impl Grid {
         let rows = rows.clamp(1, MAX_ROWS);
         let cols = cols.max(1);
         Grid {
-            rows,
-            cols,
+            cur: Cursor::new(rows, cols),
             cells: vec![Self::blank(); rows * cols],
-            row: 0,
-            col: 0,
-            saved_row: 0,
-            saved_col: 0,
-            top: 0,
-            bottom: rows - 1,
             pen_fg: DEFAULT_FG,
             pen_bg: DEFAULT_BG,
             pen_bold: false,
@@ -123,7 +117,7 @@ impl Grid {
             state: State::Ground,
             params: [0u16; PARAM_MAX],
             nparam: 0,
-            cur: 0,
+            digit: 0,
             seen_digit: false,
             priv_marker: 0,
         }
@@ -138,20 +132,20 @@ impl Grid {
     }
 
     pub fn rows(&self) -> usize {
-        self.rows
+        self.cur.rows()
     }
 
     pub fn cols(&self) -> usize {
-        self.cols
+        self.cur.cols()
     }
 
     /// The cursor, for `ESC [ 6 n` and for the blitter's block.
     pub fn cursor(&self) -> (usize, usize) {
-        (self.row, self.col)
+        self.cur.pos()
     }
 
     pub fn cell(&self, row: usize, col: usize) -> Cell {
-        self.cells[row * self.cols + col]
+        self.cells[row * self.cols() + col]
     }
 
     pub fn cells(&self) -> &[Cell] {
@@ -171,10 +165,10 @@ impl Grid {
         // the 64-row case and not an unreachable one - and `1 << 64` is the
         // shift that has no answer. Every other row count wants the low
         // `rows` bits, which is what it gets.
-        self.dirty = if self.rows >= MAX_ROWS {
+        self.dirty = if self.rows() >= MAX_ROWS {
             u64::MAX
         } else {
-            (1u64 << self.rows) - 1
+            (1u64 << self.rows()) - 1
         };
     }
 
@@ -190,13 +184,14 @@ impl Grid {
         // where the block is drawn, not any cell - so it marks no row dirty on
         // its own. Remember where the cursor was and dirty the rows it left and
         // entered, or the block would stay painted at its old pixel.
-        let before = (self.row, self.col);
+        let before = self.cur.pos();
         for &b in bytes {
             self.byte(b);
         }
-        if (self.row, self.col) != before {
+        let after = self.cur.pos();
+        if after != before {
             self.mark(before.0);
-            self.mark(self.row);
+            self.mark(after.0);
         }
     }
 
@@ -230,19 +225,12 @@ impl Grid {
             // is kept here as well, for the bare `\n` the boot log and a
             // driver's own prints still carry.
             b'\n' | 0x0b | 0x0c => {
-                self.col = 0;
+                self.cur.carriage_return();
                 self.line_feed();
             }
-            b'\r' => self.col = 0,
-            0x08 => {
-                if self.col > 0 {
-                    self.col -= 1;
-                }
-            }
-            0x09 => {
-                let next = (self.col / 8 + 1) * 8;
-                self.col = next.min(self.cols - 1);
-            }
+            b'\r' => self.cur.carriage_return(),
+            0x08 => self.cur.backspace(1),
+            0x09 => self.cur.tab(),
             0x07 => {}
             0x20..=0x7e | 0xa0..=0xff => self.print(b),
             _ => {}
@@ -250,51 +238,52 @@ impl Grid {
     }
 
     fn print(&mut self, b: u8) {
-        // Defensive: the cursor is clamped wherever a sequence sets it, but a
-        // display glitch must never crash the machine, so a stray out-of-range
-        // row is pulled back onto the grid before it can be indexed.
-        if self.row >= self.rows {
-            self.row = self.rows - 1;
-        }
-        if self.col >= self.cols {
-            self.col = 0;
-            self.line_feed();
+        // Where the glyph goes, and whether the screen has to move first, is
+        // [`Cursor`]'s decision - the pending wrap and the region bottom included -
+        // because the same arithmetic is what answers a program's cursor report.
+        // A scroll happens *before* the cell is written: the region shifts up, the
+        // cursor stays on its bottom line, and that line is the blank the shift
+        // left behind.
+        let (row, col, scroll) = self.cur.print();
+        match scroll {
+            Scroll::Up => self.scroll_up(),
+            Scroll::Down => self.scroll_down(),
+            Scroll::None => {}
         }
         let fg = if self.pen_bold {
             brighten(self.pen_fg)
         } else {
             self.pen_fg
         };
-        let idx = self.row * self.cols + self.col;
-        self.cells[idx] = Cell {
-            ch: b,
-            fg,
-            bg: self.pen_bg,
-        };
-        self.mark(self.row);
-        self.col += 1;
+        // A cell outside the grid is not a state `Cursor` can produce; indexing
+        // defensively anyway keeps a display glitch from ending the machine.
+        let idx = row * self.cols() + col;
+        if let Some(cell) = self.cells.get_mut(idx) {
+            *cell = Cell {
+                ch: b,
+                fg,
+                bg: self.pen_bg,
+            };
+        }
+        self.mark(row);
     }
 
     fn line_feed(&mut self) {
-        if self.row == self.bottom {
+        if self.cur.line_feed() == Scroll::Up {
             self.scroll_up();
-        } else if self.row + 1 < self.rows {
-            self.row += 1;
         }
     }
 
     fn reverse_line_feed(&mut self) {
-        if self.row == self.top {
+        if self.cur.reverse_line_feed() == Scroll::Down {
             self.scroll_down();
-        } else if self.row > 0 {
-            self.row -= 1;
         }
     }
 
     /// Shift the scroll region up one row and blank the bottom of the region.
     fn scroll_up(&mut self) {
-        let cols = self.cols;
-        let (top, bottom) = (self.top, self.bottom);
+        let cols = self.cols();
+        let (top, bottom) = self.cur.region();
         let src = (top + 1) * cols;
         let dst = top * cols;
         let len = (bottom - top) * cols;
@@ -315,8 +304,8 @@ impl Grid {
 
     /// Shift the scroll region down one row and blank its top (reverse index).
     fn scroll_down(&mut self) {
-        let cols = self.cols;
-        let (top, bottom) = (self.top, self.bottom);
+        let cols = self.cols();
+        let (top, bottom) = self.cur.region();
         let src = top * cols;
         let dst = (top + 1) * cols;
         let len = (bottom - top) * cols;
@@ -341,7 +330,7 @@ impl Grid {
                 self.state = State::Csi;
                 self.params = [0u16; PARAM_MAX];
                 self.nparam = 0;
-                self.cur = 0;
+                self.digit = 0;
                 self.seen_digit = false;
                 self.priv_marker = 0;
             }
@@ -356,18 +345,16 @@ impl Grid {
                 self.state = State::Ground;
             }
             b'E' => {
-                self.col = 0;
+                self.cur.carriage_return();
                 self.line_feed();
                 self.state = State::Ground;
             }
             b'7' => {
-                self.saved_row = self.row;
-                self.saved_col = self.col;
+                self.cur.save();
                 self.state = State::Ground;
             }
             b'8' => {
-                self.row = self.saved_row;
-                self.col = self.saved_col;
+                self.cur.restore();
                 self.state = State::Ground;
             }
             b'c' => {
@@ -400,8 +387,8 @@ impl Grid {
                 // program never asked for. Clamped at the top, every user of
                 // the value then treats it as "as far as the screen goes",
                 // which is what an absurd parameter means.
-                self.cur = self
-                    .cur
+                self.digit = self
+                    .digit
                     .saturating_mul(10)
                     .saturating_add((b - b'0') as u16);
                 self.seen_digit = true;
@@ -420,16 +407,16 @@ impl Grid {
 
     fn push_param(&mut self) {
         if self.nparam < PARAM_MAX {
-            self.params[self.nparam] = self.cur;
+            self.params[self.nparam] = self.digit;
             self.nparam += 1;
         }
-        self.cur = 0;
+        self.digit = 0;
         self.seen_digit = false;
     }
 
     fn finish_param(&mut self) {
         if self.nparam < PARAM_MAX && (self.seen_digit || self.nparam == 0) {
-            self.params[self.nparam] = self.cur;
+            self.params[self.nparam] = self.digit;
             self.nparam += 1;
         }
     }
@@ -450,45 +437,43 @@ impl Grid {
     fn dispatch(&mut self, cmd: u8) {
         let np = self.nparam;
         match cmd {
-            b'A' => self.row = self.row.saturating_sub(self.p(0, 1) as usize),
-            b'B' => self.row = (self.row + self.p(0, 1) as usize).min(self.rows - 1),
-            b'C' => self.col = (self.col + self.p(0, 1) as usize).min(self.cols - 1),
-            b'D' => self.col = self.col.saturating_sub(self.p(0, 1) as usize),
+            // Every arm here is a call into [`Cursor`], and the discipline that
+            // answers a cursor report calls the same ones from the same bytes.
+            // A move this list does not have is a move the screen will make that
+            // the report then denies.
+            b'A' => self.cur.up(self.p(0, 1) as usize),
+            b'B' | b'e' => self.cur.down(self.p(0, 1) as usize),
+            b'C' | b'a' => self.cur.right(self.p(0, 1) as usize),
+            b'D' => self.cur.left(self.p(0, 1) as usize),
             b'E' => {
-                self.col = 0;
-                self.row = (self.row + self.p(0, 1) as usize).min(self.rows - 1);
+                self.cur.carriage_return();
+                self.cur.down(self.p(0, 1) as usize);
             }
             b'F' => {
-                self.col = 0;
-                self.row = self.row.saturating_sub(self.p(0, 1) as usize);
+                self.cur.carriage_return();
+                self.cur.up(self.p(0, 1) as usize);
             }
-            b'G' | b'`' => self.col = (self.p(0, 1) as usize - 1).min(self.cols - 1),
-            b'd' => self.row = (self.p(0, 1) as usize - 1).min(self.rows - 1),
-            b'H' | b'f' => {
-                self.row = (self.p(0, 1) as usize - 1).min(self.rows - 1);
-                self.col = (self.p(1, 1) as usize - 1).min(self.cols - 1);
-            }
+            b'G' | b'`' => self.cur.set_column(self.p(0, 1) as usize),
+            b'd' => self.cur.set_line(self.p(0, 1) as usize),
+            b'H' | b'f' => self
+                .cur
+                .move_to(self.p(0, 1) as usize, self.p(1, 1) as usize),
             b'J' => self.erase_display(self.param_at(0).unwrap_or(0)),
             b'K' => self.erase_line(self.param_at(0).unwrap_or(0)),
             b'm' => self.sgr(np),
             b'r' => {
-                let top = self.p(0, 1) as usize - 1;
-                let bot = self.p(1, self.rows as u16) as usize - 1;
-                if top < bot && bot < self.rows {
-                    self.top = top;
-                    self.bottom = bot;
-                    self.row = self.top;
-                    self.col = 0;
+                // `DECSTBM`: the region, and the cursor goes to its top left -
+                // which is what a status line's author expects, and what the
+                // discipline has to report afterwards.
+                let top = self.p(0, 1) as usize;
+                let bot = self.p(1, self.rows() as u16) as usize;
+                if self.cur.set_region(top, bot) {
+                    let (t, _) = self.cur.region();
+                    self.cur.move_to(t + 1, 1);
                 }
             }
-            b's' => {
-                self.saved_row = self.row;
-                self.saved_col = self.col;
-            }
-            b'u' => {
-                self.row = self.saved_row;
-                self.col = self.saved_col;
-            }
+            b's' => self.cur.save(),
+            b'u' => self.cur.restore(),
             b'h' | b'l' if self.priv_marker == b'?' => {
                 let on = cmd == b'h';
                 for i in 0..np {
@@ -514,25 +499,30 @@ impl Grid {
     }
 
     fn erase_display(&mut self, mode: u16) {
+        let (row, col) = self.cur.pos();
+        let (rows, cols) = (self.rows(), self.cols());
         match mode {
-            0 => self.fill(self.row, self.col, self.rows, self.cols),
-            1 => self.fill(0, 0, self.row, self.col + 1),
-            _ => self.fill(0, 0, self.rows, self.cols),
+            0 => self.fill(row, col, rows, cols),
+            1 => self.fill(0, 0, row, col + 1),
+            _ => self.fill(0, 0, rows, cols),
         }
     }
 
     fn erase_line(&mut self, mode: u16) {
+        let (row, col) = self.cur.pos();
+        let cols = self.cols();
         match mode {
-            0 => self.fill(self.row, self.col, self.row + 1, self.cols),
-            1 => self.fill(self.row, 0, self.row + 1, self.col + 1),
-            _ => self.fill(self.row, 0, self.row + 1, self.cols),
+            0 => self.fill(row, col, row + 1, cols),
+            1 => self.fill(row, 0, row + 1, col + 1),
+            _ => self.fill(row, 0, row + 1, cols),
         }
     }
 
     /// Blank cells in [ (r0,c0), (r1,c1) ), marking each changed row.
     fn fill(&mut self, r0: usize, c0: usize, r1: usize, c1: usize) {
-        let cols = self.cols;
-        for r in r0.min(self.rows)..r1.min(self.rows) {
+        let cols = self.cols();
+        let rows = self.rows();
+        for r in r0.min(rows)..r1.min(rows) {
             for c in c0.min(cols)..c1.min(cols) {
                 self.cells[r * cols + c] = Cell {
                     ch: b' ',
@@ -545,11 +535,9 @@ impl Grid {
     }
 
     fn reset(&mut self) {
-        self.fill(0, 0, self.rows, self.cols);
-        self.row = 0;
-        self.col = 0;
-        self.top = 0;
-        self.bottom = self.rows - 1;
+        let (rows, cols) = (self.rows(), self.cols());
+        self.fill(0, 0, rows, cols);
+        self.cur.reset();
         self.pen_fg = DEFAULT_FG;
         self.pen_bg = DEFAULT_BG;
         self.pen_bold = false;
@@ -562,20 +550,16 @@ impl Grid {
         if self.alt.is_some() {
             return;
         }
-        self.alt = Some(Snapshot {
+        self.alt = Some(Parked {
             cells: core::mem::take(&mut self.cells),
-            row: self.row,
-            col: self.col,
-            top: self.top,
-            bottom: self.bottom,
+            // The cursor and its region travel with the cells they belong to:
+            // leaving the alternate screen has to put both back, or the program
+            // that comes after finds itself on a line the shell already wrote.
+            cursor: self.cur.take_alt(),
         });
         // Reuse the allocation `take` left behind is impossible (it's now in the
         // snapshot), so build a fresh blank screen of the same shape.
-        self.cells = vec![Self::blank(); self.rows * self.cols];
-        self.row = 0;
-        self.col = 0;
-        self.top = 0;
-        self.bottom = self.rows - 1;
+        self.cells = vec![Self::blank(); self.rows() * self.cols()];
         self.mark_all_dirty();
     }
 
@@ -583,10 +567,7 @@ impl Grid {
     fn exit_alt(&mut self) {
         if let Some(saved) = self.alt.take() {
             self.cells = saved.cells;
-            self.row = saved.row;
-            self.col = saved.col;
-            self.top = saved.top;
-            self.bottom = saved.bottom;
+            self.cur.resume_alt(saved.cursor);
             self.mark_all_dirty();
         }
     }

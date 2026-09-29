@@ -196,12 +196,14 @@ fn build_frame(
     }
 
     // The mask to put back on the way out - what the process had blocked when
-    // the signal arrived.
+    // the signal arrived. A libc reads this as the wire's `sigset_t`, so it
+    // goes out through the same conversion `rt_sigprocmask` brings its sets in
+    // through; `rt_sigreturn` converts on the way back.
     let blocked = crate::sched::current_blocked();
     put_word(
         &mut bytes,
         SIGFRAME_UCONTEXT + UCONTEXT_SIGMASK,
-        blocked as usize,
+        crate::sched::signal::to_wire(blocked) as usize,
     );
 
     // A `siginfo_t`: signo, errno, code, and - for a signal that names a
@@ -343,7 +345,12 @@ pub(super) fn handle_rt_sigreturn(regs_ptr: *mut ()) -> isize {
 
     let mut mask = [0u8; 8];
     if crate::sched::read_user(frame + SIGFRAME_UCONTEXT + UCONTEXT_SIGMASK, &mut mask) {
-        crate::sched::set_current_blocked(u32::from_le_bytes(mask[..4].try_into().unwrap()));
+        // The frame's saved mask is the wire's `sigset_t` — a libc reads it as
+        // one — so it comes back through the same conversion the install went
+        // out through.
+        crate::sched::set_current_blocked(crate::sched::signal::from_wire(u64::from_le_bytes(
+            mask,
+        )));
     }
 
     get_word(&bytes, sc::RAX) as isize
@@ -1889,7 +1896,6 @@ pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
 /// A fatal signal that arrives from *outside* the set still kills the waiter
 /// on each pass, exactly as `block_until` does for every blocking call.
 pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    const SI_USER: i32 = 0;
     /// The bytes of `siginfo_t` on x86_64.
     const SIGINFO_BYTES: usize = 128;
 
@@ -1897,14 +1903,16 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
     if sigsetsize != 8 {
         return err::EINVAL;
     }
-    let mut wanted = 0u32;
+    let mut wanted = 0u64;
     if set_ptr != 0 {
         if !buffer_ok(set_ptr, 8, true, from_user) {
             return err::EFAULT;
         }
-        wanted = unsafe { (set_ptr as *const u32).read_unaligned() };
+        wanted = unsafe { (set_ptr as *const u64).read_unaligned() };
     }
-    let wanted = wanted
+    // The wire's set, converted to the kernel's mask arithmetic — the same
+    // boundary `rt_sigprocmask` works at.
+    let wanted = crate::sched::signal::from_wire(wanted)
         & !(crate::sched::signal::bit(crate::sched::signal::SIGKILL))
         & !(crate::sched::signal::bit(crate::sched::signal::SIGSTOP));
 
@@ -1927,15 +1935,36 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
     };
 
     loop {
-        if let Some(sig) = crate::sched::take_signal_in_set(wanted) {
+        if let Some((sig, record)) = crate::sched::take_signal_in_set(wanted) {
             if info != 0 {
                 if !buffer_ok(info, SIGINFO_BYTES, false, from_user) {
                     return err::EFAULT;
                 }
+                // The record the signal was queued with, not a generic one:
+                // `si_code` is what a waiter branches on - musl's
+                // `SIGEV_THREAD` helper only runs its callback for
+                // `SI_TIMER`, which is the whole difference between a POSIX
+                // timer working and a program that hangs waiting for a
+                // timeout the kernel said it set.
+                //
+                // The `union` at offset 16 is written in the shape every
+                // sender here uses - `si_pid`/`si_uid` for a `kill`, and the
+                // `union sigval` at 24 for both that and a timer, which is
+                // where both variants put it. A `SI_TIMER` record's
+                // `si_tid`/`si_overrun` slots (16 and 20) are left zero: no
+                // caller in this image reads them, and `timer_getoverrun` is
+                // the ABI the count is asked through.
                 unsafe {
                     core::ptr::write_bytes(info as *mut u8, 0, SIGINFO_BYTES);
-                    (info as *mut i32).write_unaligned(sig as i32); // si_signo
-                    ((info + 8) as *mut i32).write_unaligned(SI_USER); // si_code
+                    (info as *mut i32).write_unaligned(record.signo); // si_signo
+                    ((info + 4) as *mut i32).write_unaligned(record.errno); // si_errno
+                    ((info + 8) as *mut i32).write_unaligned(record.code); // si_code
+                    ((info + 16) as *mut i32).write_unaligned(record.pid); // si_pid
+                    ((info + 20) as *mut i32).write_unaligned(record.uid); // si_uid
+                    // The `union sigval`, at the offset the `si_value` of a
+                    // queued signal lives in the ABI's layout - the same word
+                    // `sigqueue`'s handler reads.
+                    ((info + 24) as *mut u64).write_unaligned(record.value);
                 }
             }
             return sig as isize;
@@ -2078,7 +2107,8 @@ use crate::mm::vm::MapFlags;
 // The `mmap`/`mprotect`/`mremap` flag bits are Linux's numbering, pinned in
 // `abi` with the rest of the flag words.
 use super::abi::{
-    MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE, PROT_EXEC, PROT_WRITE,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_HUGETLB, MAP_SHARED, MREMAP_FIXED,
+    MREMAP_MAYMOVE, PROT_EXEC, PROT_WRITE,
 };
 
 /// One past the highest address a process may map: the lower half of the
@@ -2143,9 +2173,22 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
     // child a copy.
     let shared = flags & MAP_SHARED != 0;
     let fixed = flags & MAP_FIXED != 0;
+    let no_replace = flags & MAP_FIXED_NOREPLACE != 0;
 
     if length == 0 {
         return err::EINVAL;
+    }
+    // `MAP_FIXED` takes the range and `MAP_FIXED_NOREPLACE` refuses to - asking
+    // for both is not a thing a caller can mean, and Linux says so with `EINVAL`
+    // rather than picking one.
+    if fixed && no_replace {
+        return err::EINVAL;
+    }
+    // There is no huge-page pool here. The honest answer to a caller that asked
+    // for one is the `ENOMEM` Linux gives when the reserve is unavailable - not
+    // a silent 4 KiB mapping that would let the caller believe it got huge pages.
+    if flags & MAP_HUGETLB != 0 {
+        return err::ENOMEM;
     }
 
     // What the mapping is filled from. The descriptor is ignored when the
@@ -2183,6 +2226,18 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         // not something to paper over by mapping elsewhere: the caller is
         // relying on the address.
         (true, None) => return err::EINVAL,
+        // `MAP_FIXED_NOREPLACE`: the address is mandatory, but an occupied range
+        // is refused with `EEXIST` rather than relocated. This is the whole
+        // point of the flag over a plain hint - the caller will not accept the
+        // mapping landing anywhere else - so an in-use address must not be
+        // silently moved to a free run below.
+        (false, Some(addr)) if no_replace => {
+            if crate::sched::user_range_free(addr, len) {
+                addr
+            } else {
+                return err::EEXIST;
+            }
+        }
         // Without `MAP_FIXED` the address is only a hint, and one that is
         // already in use is simply not taken.
         (false, Some(addr)) if crate::sched::user_range_free(addr, len) => addr,
@@ -2611,6 +2666,243 @@ pub(super) fn handle_alarm(args: [usize; ARG_COUNT]) -> isize {
     match crate::sched::itimer_swap(crate::sched::ITIMER_REAL, new) {
         Some(s) if s.remaining_ticks > 0 => s.remaining_ticks.div_ceil(hz) as isize,
         _ => 0,
+    }
+}
+
+/// The bytes of `struct sigevent` on x86_64: `sigev_value` (a `union sigval`),
+/// the signal number, the notification kind, and the union that `SIGEV_THREAD_ID`
+/// reads its `sigev_notify_thread_id` out of at offset 16.
+const SIGEVENT_SIZE: usize = 32;
+/// The bytes of `struct itimerspec`: two `struct timespec`s, `it_interval`
+/// then `it_value`.
+const ITIMERSPEC_SIZE: usize = 32;
+
+/// `timer_create(clockid, sigevent*, timer_t*)` — make a POSIX interval timer.
+///
+/// The shape a libc actually sends, measured rather than read off the man
+/// page: musl's `SIGEV_THREAD` — what `timer_create` with a callback compiles
+/// to — is a *helper thread* blocked in `sigwaitinfo`, plus a kernel timer
+/// with `sigev_notify = SIGEV_THREAD_ID` aimed at that thread's tid carrying
+/// `SIGRTMIN`. So the notification kinds this kernel must honour to make a
+/// callback timer work are `SIGEV_THREAD_ID` (below) and `SIGEV_NONE`; the
+/// bare `SIGEV_SIGNAL` is honoured too, aimed at the creating task.
+///
+/// Two divergences are recorded here rather than hidden. A timer belongs to
+/// the *task* that created it, not to its thread group: `timer_delete` from a
+/// sibling finds nothing, where Linux's process-wide table would. And a
+/// process-directed expiry (`SIGEV_SIGNAL`) goes to the creating task rather
+/// than Linux's "the first thread that does not block it" — a difference no
+/// caller in this image can observe, because the one program that uses the
+/// family (vim, through musl) aims its timers at a thread.
+///
+/// A `clockid` this kernel has no clock for — the CPU-time clocks, whose
+/// accounting does not exist here — is `EINVAL`, as is an out-of-range
+/// `sigev_notify`, a signal number the kernel cannot queue, or a
+/// `SIGEV_THREAD_ID` naming a thread outside the caller's group: a timer
+/// aimed at another process's thread is a way to signal a process the caller
+/// may have no right to signal.
+pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    use crate::sched::{SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID, TimerNotify};
+
+    const CLOCK_REALTIME: usize = 0;
+    const CLOCK_MONOTONIC: usize = 1;
+    const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+    const CLOCK_MONOTONIC_RAW: usize = 4;
+    const CLOCK_REALTIME_COARSE: usize = 5;
+    const CLOCK_MONOTONIC_COARSE: usize = 6;
+    const CLOCK_BOOTTIME: usize = 7;
+    const CLOCK_TAI: usize = 11;
+
+    let (clockid, event, out) = (args[0], args[1], args[2]);
+    // The clocks whose timeout this kernel can honour. `REALTIME` and
+    // `MONOTONIC` (and `BOOTTIME`/`TAI`, which name the same tick counter with
+    // a different epoch) are measured against the one clock the machine keeps.
+    //
+    // The rest are refused with the errno Linux itself uses, measured on a
+    // 6.x kernel rather than read off a man page: the CPU-time clocks (2, 3)
+    // and the raw/coarse pair (4, 5, 6) answer `EOPNOTSUPP` there - "this
+    // clock exists, and this timer cannot be built on it" - and the alarm
+    // clocks (8, 9) answer `EPERM` because they need `CAP_WAKE_ALARM`, a
+    // capability this kernel does not model. A number no clock has is
+    // `EINVAL`, which is also Linux's answer. Refusing the CPU clocks is
+    // deliberate: this kernel keeps no per-task CPU accounting, and a timer
+    // that was accepted and silently never fired would be worse than one that
+    // says so.
+    match clockid {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => {}
+        CLOCK_PROCESS_CPUTIME_ID
+        | 3 /* CLOCK_THREAD_CPUTIME_ID */
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE
+        | 8 /* CLOCK_REALTIME_ALARM */
+        | 9 /* CLOCK_BOOTTIME_ALARM */ => return err::EOPNOTSUPP,
+        _ => return err::EINVAL,
+    }
+    if out == 0 || !buffer_ok(out, 4, true, from_user) {
+        return err::EFAULT;
+    }
+
+    // A NULL `sigevent` is the man page's own spelling of the default: a
+    // `SIGALRM` to the process with a null payload.
+    let (signo, value, notify) = if event == 0 {
+        (crate::sched::signal::SIGALRM, 0u64, TimerNotify::Signal)
+    } else {
+        if !buffer_ok(event, SIGEVENT_SIZE, false, from_user) {
+            return err::EFAULT;
+        }
+        let (value, signo, kind, tid) = unsafe {
+            (
+                (event as *const u64).read_unaligned(),
+                ((event + 8) as *const i32).read_unaligned(),
+                ((event + 12) as *const i32).read_unaligned(),
+                ((event + 16) as *const i32).read_unaligned(),
+            )
+        };
+        let kind = kind as u32;
+        if kind != SIGEV_NONE && kind != SIGEV_SIGNAL && kind != SIGEV_THREAD_ID {
+            return err::EINVAL;
+        }
+        if kind == SIGEV_NONE {
+            (0, value, TimerNotify::None)
+        } else {
+            // The range this kernel can queue: 1..=31 plus `SIGRTMIN` (32),
+            // which is the number musl's helper waits on. A disposition
+            // cannot be installed for 32 — that gap is unchanged — but a
+            // *wait* for it is what the timer machinery needs, and it has it.
+            if signo <= 0 || signo > crate::sched::signal::SIGRTMIN as i32 {
+                return err::EINVAL;
+            }
+            if kind == SIGEV_THREAD_ID {
+                if tid <= 0 {
+                    return err::EINVAL;
+                }
+                (
+                    signo as u8,
+                    value,
+                    TimerNotify::Thread(TaskId(tid as usize)),
+                )
+            } else {
+                (signo as u8, value, TimerNotify::Signal)
+            }
+        }
+    };
+
+    // The tid is validated against the caller's thread group inside the
+    // scheduler's table, where the group is known.
+    let slot = match crate::sched::timer_alloc(signo, value, notify) {
+        Ok(slot) => slot,
+        Err(e) => return e,
+    };
+    // The id the caller holds. Linux hands out an `int`; a libc widens it into
+    // its `timer_t`, so four bytes out is the whole answer.
+    unsafe { (out as *mut i32).write_unaligned(slot as i32) };
+    0
+}
+
+/// `timer_settime(timerid, flags, new_value, old_value)`.
+///
+/// `TIMER_ABSTIME` is `EINVAL`, for the same reason `clock_nanosleep` refuses
+/// it: this kernel keeps one clock and has no absolute time domain to measure
+/// an absolute deadline against. A relative deadline is what every caller in
+/// this image asks for, and the honest refusal is the man page's own errno.
+/// Both fields of the new `itimerspec` are validated (a `tv_nsec` outside
+/// `[0, 1e9)`, a negative second) before anything is armed, and a zero
+/// `it_value` disarms without clearing the interval, exactly as Linux's does.
+pub(super) fn handle_timer_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    use crate::sched::TIMER_ABSTIME;
+    let (id, flags, new_ptr, old_ptr) = (args[0], args[1], args[2], args[3]);
+    if flags & !(TIMER_ABSTIME as usize) != 0 {
+        return err::EINVAL;
+    }
+    if flags & TIMER_ABSTIME as usize != 0 {
+        return err::EINVAL;
+    }
+    if new_ptr == 0 || !buffer_ok(new_ptr, ITIMERSPEC_SIZE, false, from_user) {
+        return err::EFAULT;
+    }
+    if old_ptr != 0 && !buffer_ok(old_ptr, ITIMERSPEC_SIZE, true, from_user) {
+        return err::EFAULT;
+    }
+    let (isec, insec, vsec, vnsec) = unsafe {
+        let word = |n: usize| (new_ptr as *const i64).add(n).read_unaligned();
+        (word(0), word(1), word(2), word(3))
+    };
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    // `struct itimerspec` is `{ it_interval, it_value }` — the interval first.
+    let interval_ticks = match abi::timespec_ticks(isec, insec, hz) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let value_ticks = match abi::timespec_ticks(vsec, vnsec, hz) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let deadline = if value_ticks == 0 {
+        None
+    } else {
+        Some(crate::arch::timer::ticks() + value_ticks)
+    };
+    // The old state is read and replaced under one table borrow, so a caller
+    // that arms and reads back in one call cannot see a state that never
+    // existed.
+    let Some((old_interval, old_remaining)) = crate::sched::timer_arm(id, interval_ticks, deadline)
+    else {
+        return err::EINVAL;
+    };
+    if old_ptr != 0 {
+        unsafe { write_itimerspec(old_ptr, old_interval, old_remaining) };
+    }
+    0
+}
+
+/// `timer_gettime(timerid, curr_value)` — the interval and the time left, in
+/// a `struct itimerspec`. A disarmed or expired-then-one-shot timer answers a
+/// zero value with its interval intact, which is what Linux reports.
+pub(super) fn handle_timer_gettime(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let (id, ptr) = (args[0], args[1]);
+    if ptr == 0 || !buffer_ok(ptr, ITIMERSPEC_SIZE, true, from_user) {
+        return err::EFAULT;
+    }
+    let Some((interval, remaining)) = crate::sched::timer_state(id) else {
+        return err::EINVAL;
+    };
+    unsafe { write_itimerspec(ptr, interval, remaining) };
+    0
+}
+
+/// `timer_getoverrun(timerid)` — how many expiries arrived while the previous
+/// signal was still unread.
+pub(super) fn handle_timer_getoverrun(args: [usize; ARG_COUNT]) -> isize {
+    match crate::sched::timer_overrun(args[0]) {
+        Some(count) => count as isize,
+        None => err::EINVAL,
+    }
+}
+
+/// `timer_delete(timerid)` — free the timer. The id dies with it.
+pub(super) fn handle_timer_delete(args: [usize; ARG_COUNT]) -> isize {
+    if crate::sched::timer_remove(args[0]) {
+        0
+    } else {
+        err::EINVAL
+    }
+}
+
+/// Write `(interval, remaining)` ticks out as a `struct itimerspec`, the
+/// interval at offset 0 and the value at 16.
+/// # Safety
+/// `at` must be a writable user address for 32 bytes, as the callers checked.
+unsafe fn write_itimerspec(at: usize, interval_ticks: u64, remaining_ticks: u64) {
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    let nsec_per_tick = 1_000_000_000 / hz;
+    let split = |ticks: u64| (ticks / hz, (ticks % hz) * nsec_per_tick);
+    let (isec, insec) = split(interval_ticks);
+    let (vsec, vnsec) = split(remaining_ticks);
+    unsafe {
+        for (n, word) in [isec, insec, vsec, vnsec].iter().enumerate() {
+            (at as *mut u64).add(n).write_unaligned(*word);
+        }
     }
 }
 

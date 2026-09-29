@@ -150,7 +150,7 @@ here, read by `disk`/`rootfs`/`initramfs`/`run`:
 | `[rootfs]` | | Alpine 镜像站 / 分支 / 架构、`repos`、文件系统类型、磁盘大小 `image_size`/`esp_size`、`base_packages` 与 `extra_packages` | Alpine mirror/branch/arch, filesystem, image sizes, package lists |
 | `[system]` | | 主机名、时区、语言、`dns`（覆盖 `/etc/resolv.conf`）、`root_password` | hostname, timezone, locale, DNS, root password |
 | `[user]` | | 除 root 外额外创建的账户（`name` 为空则跳过） | the non-root account (empty `name` skips it) |
-| `[qemu]` | | `memory`、`cpus`、`vsock`、`audio`、`display`、`console`、`extra_args` | memory, cpus, vsock, audio, display backend, console mode, extra QEMU args |
+| `[qemu]` | | `memory`、`cpus`、`vsock`、`audio`、`display`、`mode`、`extra_args` | memory, cpus, vsock, audio, display backend, run mode, extra QEMU args |
 
 > 需要写进根文件系统的具体文件（`/etc/inittab`、`/etc/network/interfaces`、
 > `/etc/resolv.conf`、`/etc/doas.conf` 等）作为真实文件放在 `rootfs/` 目录树里；
@@ -172,54 +172,67 @@ watch only the serial log — though the console now renders to the framebuffer,
 ## `run` 的四种运行模式 | The four `run` modes
 
 `cargo xtask run` 用 `--mode` 一次决定整机怎么启动（缺省取 `rootfs.toml` 里的
-`[qemu] mode`，再缺省为 `mirror`）。这个名字说的是整机模式而不是控制台选项：窗口、
-串口以及客机自己的控制台策略必须一起定下来，所以是一个词。四种模式让 QEMU 的接线
-（`-display` / `-serial`）和客机的引导参数（`mpos.*`）保持一致：
+`[qemu] mode`，再缺省为 `mirror`）。窗口和串口怎么接线是启动方的事；客机只被告知
+一件事——它有哪些控制台——而这件事用的是 Linux 自己的参数 `console=`：
 
 | 模式 | mode | 画面 | QEMU 接线 | 客机引导参数 |
 | --- | --- | --- | --- | --- |
-| 终端 | `terminal` | 只有串口终端，无窗口，GPU 不参与 | `-display none` + 串口走 stdio | `mpos.headless` |
-| 图形 | `gui` | 只有 framebuffer 窗口，切换后串口静默 | `-display <后端>` + 串口丢弃 | `mpos.nomirror` |
-| 镜像 | `mirror` | 窗口为主，串口尽力跟一份 | `-display <后端>` + 串口走 stdio | `mpos.mirror` |
-| 合成器 | `weston` | 窗口归 weston（其 VT 在屏期间，由 root 的 `start-weston.sh` 启动）；`^A 1..6` 切走后窗口显示该控制台，串口始终有日志 | `-display <后端>` + 串口走 stdio | `mpos.compositor` |
+| 终端 | `terminal` | 只有串口终端，无窗口 | `-display none` + 串口走 stdio | `console=ttyS0` |
+| 图形 | `gui` | 只有 framebuffer 窗口，切换后串口静默 | `-display <后端>` + 串口丢弃 | `console=tty0` |
+| 镜像 | `mirror` | 窗口为主，串口尽力跟一份 | `-display <后端>` + 串口走 stdio | `console=ttyS0 console=tty0` |
+| 合成器 | `weston` | 窗口归 weston（其 VT 在屏期间，由 root 的 `start-weston.sh` 启动）；`^A 1..6` 切走后窗口显示该控制台，串口始终有日志 | `-display <后端>` + 串口走 stdio | `console=ttyS0` |
+
+客机那一列只有 `console=` 一个词，规则也是 Linux 的：可以重复，列上的每一个都收日志，
+**最后一个**是首选控制台（写不下去就等、不丢字节的那一个）。于是「镜像」不再是一个
+新概念，它就是"两个都列上、framebuffer 在后"；「终端」和「合成器」给客机的引导参数
+完全相同——把窗口让给合成器是运行时的事实（weston 会 `SET_MASTER` 拿走光栅、用
+`KDSETMODE(KD_GRAPHICS)` 声明屏幕归它画），不是命令行能说的事。命令行的形状因此
+不再随"这个镜像打算怎么给人看"而变。
+
+`--mode terminal` 也仍然会探测显示设备、`/dev/fb0` 仍然可用：控制台不在屏幕上，
+不等于设备不在机器上。
 
 切换很快：`--mode` 指定的模式会随特权子步骤刷新**只改引导文件**（`rootfs`
 本来就跳过重装 Alpine），重写镜像里的 `mpos.cmdline`；`build/console.mode`
 记录档让 `run` 在镜像已是该模式时**跳过提权**（该文件名沿用旧称：它只是缓存，
-改名会让每个既有镜像看起来都需要重新烘焙一次）。
-
-`weston` 一词是给人看的模式名，客机读到的引导字仍是 `mpos.compositor`——那是
-`src/main.rs` 里的内核 ABI，不随 CLI 改名。
+改名会让每个既有镜像看起来都需要重新烘焙一次）。早于运行模式的镜像没有这个记录档，
+它会被刷新——那种镜像的命令行只写了 `console=ttyS0`，在现在的内核读来就是"串口是
+唯一的控制台"，和它当初的启动方式并不相同。
 
 `cargo xtask run` picks the whole machine with `--mode` (default from
-`rootfs.toml`'s `[qemu] mode`, else `mirror`). The word is about the machine, not
-about a console setting: the window, the serial line and the guest's own console
-policy have to be decided together, so each mode keeps the QEMU wiring and the
-guest boot flag in step:
+`rootfs.toml`'s `[qemu] mode`, else `mirror`). How the window and the serial line
+are wired is the launcher's business; the guest is told exactly one thing - which
+consoles it has - and that is said in Linux's own word, `console=`:
 
-- **terminal** — serial only, no window, GPU never engaged (`mpos.headless`).
-  The wire is the *lossless* console.
-- **gui** — the framebuffer window only; the serial line carries nothing after the
-  console moves over (`mpos.nomirror`).
-- **mirror** — the window plus a **best-effort** copy on the serial line, so the
-  same console shows in the window and the terminal at once (`mpos.mirror`).
-- **weston** — the window belongs to the compositor for as long as its own
-  virtual console is the one on the screen: the kernel console never moves onto
-  the framebuffer, so a typed line cannot paint over weston, while the boot log
-  still rides the serial line. Nothing launches the compositor; root's
-  `./start-weston.sh` does, once the login prompt appears. `^A 1`..`^A 6`
-  switches away anyway — the session is asked to release the display (and a
-  session in `VT_PROCESS` is *asked*, which is why `^A` twice is the escape
-  hatch), its page flips start answering `EACCES`, and the window shows the
-  console you moved to. The boot word it bakes stays `mpos.compositor`, which is
-  the kernel's own ABI, read by name in `src/main.rs`.
+- **terminal** — serial only, no window (`console=ttyS0`). The wire is the
+  *lossless* console: it is the only one, so it is also the preferred one. The
+  display device is still probed and `/dev/fb0` still answers; nothing is drawn
+  on it.
+- **gui** — the framebuffer window only (`console=tty0`); the serial line carries
+  nothing, and is not a console at all.
+- **mirror** — both consoles, framebuffer preferred (`console=ttyS0
+  console=tty0`): the window takes the console over once the framebuffer is up,
+  and the wire keeps a **best-effort** copy of the same text.
+- **weston** — `console=ttyS0`, the same list terminal boots with: the kernel
+  console has no business on a screen a compositor is driving, and what makes
+  this a compositor boot is runtime, not boot-time. weston opens the card and
+  takes `DRM_IOCTL_SET_MASTER`, which binds the master to its console, and
+  `KDSETMODE`'s `KD_GRAPHICS` is its own word that the screen is its to draw.
+  Nothing launches the compositor; root's `./start-weston.sh` does, once the login
+  prompt appears. `^A 1`..`^A 6` switches away anyway — the session is asked to
+  release the display (and a session in `VT_PROCESS` is *asked*, which is why `^A`
+  twice is the escape hatch), its page flips start answering `EACCES`, and the
+  window shows the console you moved to.
 
 Switching is fast: the requested mode rides into the privileged step, which
 refreshes **only the boot files** (`rootfs` already skips the Alpine reinstall) and
 rewrites `mpos.cmdline`; a `build/console.mode` marker lets `run` skip the root
 step when the image already carries that mode. (That marker keeps its old
 `console.mode` filename on purpose: it is a cache, and a new name would read as
-"nothing baked" and make every existing image look like it needed a rebuild.)
+"nothing baked" and make every existing image look like it needed a rebuild. An
+image with no marker at all was built before the run modes existed and is
+refreshed: its line names the wire alone, which the kernel now reads as exactly
+that.)
 
 > **镜像不再拖累图形 | The mirror no longer throttles the window.** 镜像模式下
 > 串口是尽力而为的：洪水般的输出（`yes`、`bat`）可能让串口那份记录丢字节，

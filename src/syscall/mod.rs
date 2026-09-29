@@ -264,6 +264,13 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         // ENOTCONN: the door is a socket's, and no connection stands
         // behind it - Linux's read(2) answer on an unconnected socket.
         VfsError::NotConnected => err::ENOTCONN,
+        // EINTR: the node was about to block and a catchable signal ended the
+        // wait instead, having consumed nothing. This is what lets a full-screen
+        // program's own timeout (SIGALRM from `alarm`/`setitimer`) or a resize
+        // (SIGWINCH) break a terminal read - the measured Linux answer, and the
+        // reason `vim` stops redrawing on a kernel where a blocked read sleeps
+        // through the signal instead.
+        VfsError::Interrupted => err::EINTR,
     }
 }
 

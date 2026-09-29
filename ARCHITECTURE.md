@@ -235,10 +235,17 @@ Details worth knowing:
   `src/main.rs` verifies it twice — before the handoff and again after `spawn_init`, which is
   the deepest call the boot task ever makes.
 - **Boot words on the command line** (`mpos.cmdline`, or QEMU-generated): `mpos.selftest`
-  runs the milestone checks, `mpos.headless` keeps the console on serial, `mpos.mirror` /
-  `mpos.nomirror` decide whether the framebuffer console also copies to serial,
-  `mpos.compositor` keeps the kernel console off the scanout so weston can own it.
-  `cargo xtask run --mode terminal|gui|mirror|weston` is what sets these.
+  runs the milestone checks, and `console=` names the consoles the kernel's log goes to —
+  `console=ttyS0` the serial wire, `console=tty0` the virtual console on the framebuffer. The
+  parameter may be repeated, output goes to every console named, and the last is the preferred
+  one; a value naming a console this kernel does not have is reported and ignored. There is no
+  word for *how the machine was launched*, because that is not a fact about the machine: a
+  QEMU booted without a window still has a virtio-gpu and still reports a display mode, so
+  only the command line can say whether the framebuffer console is one of the consoles.
+  `cargo xtask run --mode terminal|gui|mirror|weston` picks the list
+  (`src/boot/console_list.rs` reads it, `xtask/src/config.rs` writes it), and a compositor's
+  claim on the scanout is arbitrated at runtime through the DRM master and `KDSETMODE`
+  (`src/vfs/vcmux.rs`), never at boot.
 
 ---
 
@@ -400,18 +407,19 @@ yet — this is the audit, and `PLAN.md` Phase 11 is the work list.
 
 | # | Violation | Evidence | Plan |
 |---|---|---|---|
-| V-1 | `Inode` downcasts to concrete devices and networks | `src/vfs/mod.rs:453–546` defines `as_fb`, `as_evdev`, `as_uinput`, `as_drm`, `as_vsock`, `as_unix` as default-`None` trait methods. Adding a device type means editing the VFS trait | Phase 11 B |
+| V-1 | `Inode` downcasts to concrete devices and networks | `src/vfs/mod.rs:453–546` defines `as_fb`, `as_evdev`, `as_uinput`, `as_drm`, `as_vsock`, `as_unix` as default-`None` trait methods. Adding a device type means editing the VFS trait. **Widened by the in-flight AF_PACKET work: `as_packet` → `net::packet::PacketSock` joins the list** | Phase 11 B |
 | V-2 | Per-device ioctl ABI parsed in the syscall layer | `src/syscall/linux/fs.rs` (6 311 lines) switches on DRM (`:3751`), fbdev (`:3561`), RTC (`:3677`), uinput (`:4001`) and TTY request numbers | Phase 11 B |
 | V-3 | The scheduler performs other subsystems' per-process cleanup | `sched/runtime.rs` calls `net::socket::close_sockets_at_exit`, `vfs::inotify::close_at_exit`, `drivers::virtio::input::close_at_exit`, `drivers::uinput::close_at_exit` on task exit | Phase 11 C |
 | V-4 | The terminal emulator and console mux live inside the VFS | `vfs/term/` holds the cell grid, keys and an embedded `vga8x16.bin` font; `vfs/vcmux.rs`, `vfs/pty.rs`, `vfs/tty.rs` (2 359 lines) implement the console; `console.rs` reaches *into* `vfs::term::with_screen` to render | Phase 11 D |
-| V-5 | A driver calls back into the syscall layer | `drivers/drm.rs:595,741` call `crate::syscall::buffer_ok` to validate user pointers | Phase 11 B |
+| V-5 | A driver calls back into the syscall layer | `drivers/drm.rs` calls `crate::syscall::buffer_ok` to validate user pointers. **Widened by the in-flight sound work: `drivers/virtio/sound.rs` names `crate::syscall::linux::abi` and `crate::syscall::err::` (7 sites)** | Phase 11 B |
 | V-6 | A debug trace sat in the dispatch hot path | `syscall/linux/mod.rs::trace_msg`, self-labelled `TEMPORARY (udevd worker-channel hunt)`, wrote `[msgtrace]` lines from any failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` | **Done** (Phase 11 A) |
 | V-7 | Dead and duplicate machine modules | `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` were not declared in `arch/x86_64/mod.rs` at all; `qemu.rs` was byte-identical to `drivers/qemu.rs`. Three PCI modules existed (`arch/x86_64/pci.rs` was a stale earlier copy of `drivers/pci.rs`), two RTC, two serial | **Done** (Phase 11 A) — all three deleted, `drivers/rtc` renamed `drivers/rtc_dev` |
 | V-8 | Cross-architecture config pointed at a missing file | `.cargo/config.toml` set `link-arg=--script=arch/aarch64/linker.ld`; only `arch/x86_64/linker.ld` exists, so the `aarch64-unknown-none` build could not link | **Done** (Phase 11 A) — the profile is gone, and `PLAN.md` §9.1 keeps what a port needs |
-| V-9 | The network layer validates user pointers with the syscall layer's helper | `net/socket.rs` and `net/unix.rs` call `crate::syscall::buffer_ok` / `err_of` throughout; the dependency is for two pure functions that have no business owning the direction | Phase 11 E |
+| V-9 | The network layer validates user pointers with the syscall layer's helper | `net/socket.rs` and `net/unix.rs` call `crate::syscall::buffer_ok` / `err_of` throughout; the dependency is for two pure functions that have no business owning the direction. **Widened by the in-flight AF_PACKET work: `net/packet.rs:333,351,352` adds three more `buffer_ok` callers, and `net/vsock.rs` / `net/rtnl.rs` / `net/mod.rs` were measured to hold pre-audit callers §9 had not listed** | Phase 11 E |
 | V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | Accepted by design; document only |
 | V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs:3527` is `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs:48` gates `pub mod net` on `target_os = "none"`; 3 tests never run | Phase 11 F |
 | V-12 | The tree was mid-refactor and did not build for the host | The uncommitted work renamed `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edited `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` failed to compile | **Resolved** — finished and committed; the gate is green (`PLAN.md` §11.1.12) |
+| V-13 | Memory knows about files: `mm` calls up into `vfs` | `src/mm/vma.rs:28` does `use crate::vfs::Inode;` (file-backed VMAs name an inode), committed in eb4b337 after this audit — the `AGENTS.md` boundary table says `mm` may depend on `boot` only. The file-backed mapping needs *a* mapped-object trait; `Inode` is the wrong one to name | Open — Phase 11 should fold this into the `mm`/`vfs` seam work; no new callers allowed |
 
 **The dependency direction to aim for** (used as the acceptance criterion in Phase 11):
 

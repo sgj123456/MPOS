@@ -154,6 +154,17 @@ pub const FUTEX_CLOCK_REALTIME: usize = 256;
 pub const SCHED_SETAFFINITY: u64 = 203;
 pub const SCHED_GETAFFINITY: u64 = 204;
 pub const SET_TID_ADDRESS: u64 = 218;
+/// The POSIX interval timer family, `timer_create(2)`: create, arm, read,
+/// count overruns, delete - five consecutive numbers, as the x86_64 table
+/// spells them. A libc reaches for these through `timer_create` for any
+/// program that asks for a timeout callback; musl's `SIGEV_THREAD` spelling
+/// is a helper thread woken by a `SIGEV_THREAD_ID` timer targeting it with
+/// `SIGRTMIN`, which is the shape `handle_timer_create` answers.
+pub const TIMER_CREATE: u64 = 222;
+pub const TIMER_SETTIME: u64 = 223;
+pub const TIMER_GETTIME: u64 = 224;
+pub const TIMER_GETOVERRUN: u64 = 225;
+pub const TIMER_DELETE: u64 = 226;
 pub const CLOCK_GETTIME: u64 = 228;
 pub const CLOCK_NANOSLEEP: u64 = 230;
 pub const EXIT_GROUP: u64 = 231;
@@ -644,6 +655,11 @@ mod tests {
         assert_eq!(SCHED_SETAFFINITY, 203);
         assert_eq!(SCHED_GETAFFINITY, 204);
         assert_eq!(RT_SIGTIMEDWAIT, 128);
+        assert_eq!(TIMER_CREATE, 222);
+        assert_eq!(TIMER_SETTIME, 223);
+        assert_eq!(TIMER_GETTIME, 224);
+        assert_eq!(TIMER_GETOVERRUN, 225);
+        assert_eq!(TIMER_DELETE, 226);
         assert_eq!(CLOCK_GETRES, 229);
         assert_eq!(CLOCK_GETTIME, 228);
         assert_eq!(CLOCK_NANOSLEEP, 230);

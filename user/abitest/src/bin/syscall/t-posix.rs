@@ -339,17 +339,19 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"vhangup succeeds", lin::vhangup(), 0);
 
     // seccomp(2), as this kernel implements it (PLAN 8.2): STRICT latches
-    // for real, FILTER installs a program, and the availability probe
-    // answers the empty set. What is pinned for FILTER here is only that
-    // the program is *read before anything is decided*: a null one is
-    // `EFAULT` rather than a success that confined nobody. (A malformed
-    // program is `EINVAL`, and the filters themselves are argued in
-    // `seccomp.rs`'s host tests, where a BPF program can be run against
-    // made-up syscall numbers.) The strict checks are done
+    // for real, FILTER installs a program, and the availability probe answers
+    // which actions this kernel actually implements. What is pinned for
+    // FILTER here is only that the program is *read before anything is
+    // decided*: a null one is `EFAULT` rather than a success that confined
+    // nobody. (A malformed program is `EINVAL`, and the filters themselves are
+    // argued in `seccomp.rs`'s host tests, where a BPF program can be run
+    // against made-up syscall numbers.) The strict checks are done
     // non-destructively - once latched, this program's next `getpid` is a
     // fatal call - and the latch itself is proved in a child, whose death
     // by SIGKILL is the whole of what Linux promises a strict thread that
-    // reaches for anything else.
+    // reaches for anything else. The eight actions and each one's answer are
+    // `t-seccomp`'s; this line pins only that a word naming no action at all
+    // is refused rather than granted.
     lin::check_eq(
         &mut failed,
         b"seccomp with an unknown op answers EINVAL",
@@ -368,14 +370,22 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::seccomp(1, 0, 0),
         lin::EFAULT,
     );
+    // 99 is nobody's action: an unknown one would kill the process that
+    // relied on it, which is why a caller asks first and why the answer has
+    // to be a refusal. The caller's own word is left alone - Linux's return
+    // value carries the answer, and there is nothing to write back.
     let mut avail = 99u32;
     lin::check_eq(
         &mut failed,
-        b"the availability probe succeeds",
+        b"the availability probe refuses an action this kernel does not implement",
         lin::seccomp(2, 0, &raw mut avail as usize),
-        0,
+        lin::EOPNOTSUPP,
     );
-    lin::check_true(&mut failed, b"no action is available", avail == 0);
+    lin::check_true(
+        &mut failed,
+        b"a refused probe leaves the caller's word alone",
+        avail == 99,
+    );
     {
         let kid = lin::fork();
         if kid == 0 {

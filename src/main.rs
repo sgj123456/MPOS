@@ -37,6 +37,7 @@ use alloc::vec::Vec;
 
 use mpos::arch::{self, interrupts, paging, timer};
 use mpos::blk;
+use mpos::boot::console_list::ConsoleList;
 use mpos::boot::{self, BootInfo};
 use mpos::drivers;
 use mpos::mm::{self, MapFlags, Mapping, PAGE_SIZE};
@@ -155,41 +156,24 @@ fn kernel_main(info: &BootInfo) {
     // and serial chatter between the real initialisation and init. They run only
     // when the command line carries `mpos.selftest` - which `cargo xtask test`
     // adds and the real rootfs boot does not - so a normal boot pays none of it.
-    let selftest = boot::cmdline()
-        .split_whitespace()
-        .any(|a| a == "mpos.selftest");
+    let cmdline = boot::cmdline();
+    let has = |word: &str| cmdline.split_whitespace().any(|a| a == word);
 
-    // Head-lessness decides whether the console is ever allowed to move to the
-    // GPU framebuffer. `cargo xtask test` sets it (with `mpos.selftest`) so the
-    // whole boot stays on the serial log the harness reads; an interactive
-    // `run` does not, and gets the framebuffer. A headless machine still has a
-    // virtio-gpu, so this can only be a command-line fact, not device presence.
-    mpos::console::set_headless(
-        boot::cmdline()
-            .split_whitespace()
-            .any(|a| a == "mpos.headless"),
-    );
+    let selftest = has("mpos.selftest");
 
-    // Whether the console should *also* mirror to the serial wire once it is on
-    // the framebuffer. Default on (mirror mode, the historical `run` behaviour);
-    // a `mpos.nomirror` boot - gui mode, from `cargo xtask run --mode gui` -
-    // asks for the window alone and leaves the wire quiet after takeover.
-    mpos::console::set_mirror_wanted(
-        !boot::cmdline()
-            .split_whitespace()
-            .any(|a| a == "mpos.nomirror"),
-    );
-
-    // A compositor boot keeps the GPU device and `/dev/fb0` live, but the
-    // kernel console never moves onto the framebuffer - the scanout is left
-    // for a rootful Wayland compositor to draw, and the render task only
-    // presents when that compositor asks (`FBIOPAN_DISPLAY`), never paints a
-    // text grid over it. `cargo xtask run --mode weston` sets it.
-    mpos::console::set_compositor(
-        boot::cmdline()
-            .split_whitespace()
-            .any(|a| a == "mpos.compositor"),
-    );
+    // Which consoles carry the kernel log, in Linux's spelling: every `console=`
+    // word names one, and the last is the preferred one - the sink whose writes
+    // park until the hardware has taken them rather than being dropped. Nothing
+    // else about how this machine was launched reaches the kernel: there is no
+    // "gui" or "terminal" word here, and a word naming a console this kernel does
+    // not have is reported and ignored rather than guessed at.
+    //
+    // A device-presence test could not answer this question instead: a QEMU
+    // booted without a window still has a virtio-gpu and still reports a display
+    // mode. The command line is the one place the answer actually is.
+    mpos::console::set_console_list(ConsoleList::from_cmdline(cmdline, |unknown| {
+        println!("console={unknown}: no such console here, ignored");
+    }));
 
     init_mm();
     if selftest {
@@ -1278,15 +1262,18 @@ fn check_ipc() {
         tty.receive_byte(b);
     }
     let mut line = [0u8; 32];
-    let n = tty.read(&mut line);
+    // Every one of these reads is fed before it is asked, so it never blocks -
+    // and a boot task with no signal dispositions cannot be interrupted either.
+    // The `expect` is the honest form of "this answer cannot be an error here".
+    let n = tty.read(&mut line).expect("a fed tty read answers a count");
     assert_eq!(&line[..n], b"hello\n", "backspace did not edit the line");
 
     for &b in b"gate\n\x04" {
         tty.receive_byte(b);
     }
-    let n = tty.read(&mut line);
+    let n = tty.read(&mut line).expect("a fed tty read answers a count");
     assert_eq!(&line[..n], b"gate\n");
-    let n = tty.read(&mut line);
+    let n = tty.read(&mut line).expect("a fed tty read answers a count");
     assert_eq!(n, 0, "Ctrl-D on an empty line is EOF");
 
     // Blocking fd 0 read through the gate.
@@ -1431,18 +1418,13 @@ fn init_virtio() {
             "virtio-gpu: {width}x{height}, {} KiB at /dev/fb0",
             gpu.fb_len() / 1024
         );
-        // Hand the device to the render task and move the console to it - but
-        // only when there is a display to render to. A headless boot keeps the
-        // whole console on the serial wire and drops the device unused, so the
-        // DMA spin never runs and `/dev/fb0` still exists for any program that
-        // opens it.
-        if mpos::console::headless() {
-            drop(device);
-        } else {
-            // A compositor boot keeps the device and the present engine but
-            // tells the render task never to take the console onto the screen.
-            mpos::drivers::video::render::spawn(device, gpu, mpos::console::compositor());
-        }
+        // Hand the device to the render task whenever the probe found one. This
+        // is not a console decision: `/dev/fb0` is a device a program may open,
+        // and a session may claim the card to drive the scanout itself, whatever
+        // the kernel's own console list says. What the list decides is whether
+        // the kernel's log moves onto the screen, and the task reads that for
+        // itself.
+        mpos::drivers::video::render::spawn(device, gpu);
     }
 
     let inputs = mpos::drivers::virtio::input::init();

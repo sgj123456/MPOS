@@ -172,6 +172,31 @@ fn put(fb: &mut [u8], stride: usize, x: usize, y: usize, color: Rgb) {
     }
 }
 
+/// Fill the whole `fb` with one colour - the paper of a fresh screen.
+///
+/// `paint_cells` walks the *grid's* dirty rows and leaves everything else alone,
+/// which is right for a keystroke and wrong for a console switch: the region a
+/// text grid never covers - the rows past `MAX_ROWS` on a tall screen, the bottom
+/// and right margins where the pixels do not divide into whole cells, and above
+/// all the picture a compositor left in the scanout - would otherwise survive the
+/// switch as a stale band. Filling first gives the new console a clean screen to
+/// paint onto, so a switch shows the console and not a band of what was there.
+pub fn fill_background(fb: &mut [u8], fb_w: usize, fb_h: usize, color: Rgb) {
+    let (b, g, r) = (color[2], color[1], color[0]);
+    // Fill every whole pixel the buffer holds, and no more than `fb` can reach.
+    // Driving the whole slice (rather than only `fb_w * fb_h` cells) means the
+    // margins a grid leaves empty - and any pixel the scanout has but the console
+    // does not - are cleared too, which is the whole point on a switch.
+    let pixels = (fb_w * fb_h).min(fb.len() / 4);
+    for i in 0..pixels {
+        let at = i * 4;
+        fb[at] = b;
+        fb[at + 1] = g;
+        fb[at + 2] = r;
+        fb[at + 3] = 0x00;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +227,21 @@ mod tests {
         paint(&grid, &mut fb, 20, 40, (0, 0), 0b00);
         let at = 16 * 20 * 4;
         assert_eq!(&fb[at..at + 4], &[7, 7, 7, 7], "no dirty row, no repaint");
+    }
+
+    #[test]
+    fn fill_background_reaches_every_pixel_and_drops_the_old_picture() {
+        // A buffer pre-filled with a foreign (compositor) picture: the fill must
+        // clear it down to the last row, not just the cells a repaint would have
+        // drawn over - the band a switch must never leave behind.
+        let mut fb = vec![0xAB; 20 * 40 * 4];
+        fill_background(&mut fb, 20, 40, [0x11, 0x22, 0x33]);
+        assert_eq!(px(&fb, 20, 0, 0), [0x11, 0x22, 0x33], "top-left cleared");
+        assert_eq!(
+            px(&fb, 20, 19, 39),
+            [0x11, 0x22, 0x33],
+            "bottom-right cleared, past any small grid's reach"
+        );
+        assert_eq!(fb[40 * 20 * 4 - 1], 0x00, "alpha byte cleared like put");
     }
 }

@@ -16,13 +16,14 @@
 //! theirs.
 //!
 //! The keyboard *also* being the machine's console input is what
-//! [`service`] does when the framebuffer console is up (not a headless boot):
+//! [`service`] does when a text console is live (`crate::console::vt_live`):
 //! keyboard events are translated to bytes and routed to the active virtual
 //! console, exactly as a serial keystroke would be. The `/dev/input` node stays
 //! a second, separate consumer - a program that wants raw events opens the node
 //! and reads records, the way every evdev client since the beginning does. On a
-//! headless boot there is no framebuffer console, so only the nodes move and the
-//! serial UART keeps sole ownership of the shell's input.
+//! machine that has no framebuffer console at all - a boot whose console list
+//! names the wire alone and no session has claimed the card - only the nodes
+//! move, and the serial UART keeps sole ownership of the shell's input.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -197,6 +198,10 @@ pub struct EvdevNode {
     /// empty poll: no repaint, no timers, and the next device in the
     /// enumeration never added.
     nonblocking: AtomicBool,
+    /// The node's mode and owner, kept so `chmod`/`chown` - udev's
+    /// `MODE=0660 GROUP=input` among them - stick and are what `stat` and the
+    /// permission checks read (see `crate::vfs::devfs::NodePerms`).
+    perms: crate::vfs::devfs::NodePerms,
 }
 
 impl EvdevNode {
@@ -215,6 +220,7 @@ impl EvdevNode {
             records: Mutex::new(RefCell::new(Records::new())),
             caps,
             nonblocking: AtomicBool::new(false),
+            perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
         })
     }
 
@@ -369,7 +375,38 @@ impl EvdevNode {
     }
 
     fn push(&self, event: &virtio_drivers::device::input::InputEvent) {
-        self.inject(event.event_type, event.code, event.value as i32);
+        let value = self.clamp_abs(event.event_type, event.code, event.value as i32);
+        self.inject(event.event_type, event.code, value);
+    }
+
+    /// Bring an `EV_ABS` report inside the `[min, max]` this node advertises for
+    /// that axis through `EVIOCGABS`.
+    ///
+    /// The virtio-tablet's absolute value is produced by the host against the
+    /// *host window* geometry, which during a resize is not the size the guest
+    /// scanout is driven at; QEMU relays it without clamping, so a raw value can
+    /// exceed the `0x7FFF` the device config declares. libinput maps a position
+    /// as `(value - min) / (max - min)`, and a value past `max` puts the pointer
+    /// off the screen - and warns, every such event, that the axis is outside its
+    /// own range. Clamping to the advertised range keeps the pointer on the
+    /// screen and makes the two - what the device says and what it sends - agree.
+    /// Only the position axes are touched; every other event passes through.
+    fn clamp_abs(&self, event_type: u16, code: u16, value: i32) -> i32 {
+        if event_type != EV_ABS as u16 {
+            return value;
+        }
+        // `min`/`max` are the axis' own geometry as `eviocgabs` reads it back; a
+        // code with no advertised range (uinput, or an axis not in the table) is
+        // left exactly as it arrived rather than clamped to a guess.
+        let abs = self.caps.abs.iter().find(|(c, _)| *c as u16 == code);
+        match abs {
+            Some((_, info)) => {
+                let min = info.min as i32;
+                let max = info.max as i32;
+                value.clamp(min, max)
+            }
+            None => value,
+        }
     }
 
     /// Take the device away: every reader is woken, and the next look at it is
@@ -428,6 +465,26 @@ impl Inode for EvdevNode {
         }
     }
 
+    fn keeps_modes(&self) -> bool {
+        self.perms.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        self.perms.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.perms.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.perms.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        self.perms.set_owner(uid, gid);
+    }
+
     /// The device number `stat` reports: input's major 13, and the minor
     /// [`input_minor`] gives the device.
     ///
@@ -463,8 +520,13 @@ impl Inode for EvdevNode {
             if self.nonblocking.load(Ordering::Relaxed) {
                 return Err(VfsError::Again);
             }
+            // A catchable signal ends the wait with `EINTR`, not with 0. The
+            // two answers mean opposite things on this door and only one of
+            // them is retryable: 0 is what a device taken away answers (the
+            // branch above), so a reader told its stream had ended stops
+            // reading for good - which is what libinput does with it.
             if crate::sched::has_deliverable_signal() {
-                return Ok(0);
+                return Err(VfsError::Interrupted);
             }
             // On the record, not on the clock. The service task that harvests
             // the virtio ring wakes this client the moment a record lands, so a
@@ -628,13 +690,18 @@ pub const CAPABILITY_BYTES: usize = 0x300 / 8;
 ///
 /// Two consumers, deliberately: every event is encoded onto its device's
 /// `/dev/input/eventN` node (an evdev program reads records from there), *and*
-/// when a display is up - i.e. not headless - keyboard events are translated
-/// to console bytes and fed to the active virtual console through the same
-/// funnel a serial keystroke uses. Routing happens *after* the critical
-/// section, so the echo the keystroke provokes can take the pty's parking
-/// branch rather than growing a queue unbounded under the lock.
+/// when a text console is live - see [`crate::console::vt_live`] - keyboard
+/// events are translated to console bytes and fed to the active virtual console
+/// through the same funnel a serial keystroke uses. Routing happens *after* the
+/// critical section, so the echo the keystroke provokes can take the pty's
+/// parking branch rather than growing a queue unbounded under the lock.
 pub fn service() {
-    let to_console = !crate::console::headless();
+    // Whether a keystroke can reach a screen at all: a boot whose console list
+    // names the wire alone keeps the console there, and this path is the
+    // framebuffer console's keyboard, so there is nothing here to feed - until
+    // somebody claims the card, at which point a text console can come back to
+    // the screen and `grids_live` makes a text console live again.
+    let screen_live = crate::console::vt_live();
     // Whether the session that owns the card still owns the screen. Read once
     // per tick and outside the critical section below, since it asks the
     // console mux, which keeps its own state.
@@ -687,20 +754,64 @@ pub fn service() {
             // without silencing the only wire a person can still type into.
             let keymap_on =
                 crate::vfs::vcmux::kb_mode(crate::vfs::vcmux::active()) != crate::vfs::tty::K_OFF;
-            let to_console = to_console && !compositor_holds && keymap_on;
+            // Whether the console on the screen has been put in graphics mode by
+            // the session driving it - which is the compositor's own word, via
+            // `KDSETMODE`, that the screen is its to draw and the text shell
+            // underneath is not to be typed at. This - not the grab, and not the
+            // master/console binding, which `delivers` above still uses to decide
+            // whether a grabbed node is fed or dropped - is what takes the
+            // keyboard off the shell: while the active console is graphics, a
+            // keystroke belongs to the compositor and only to it, whether or not
+            // libinput has taken `EVIOCGRAB` on the node yet. A `--mode gui` text
+            // console is `KD_TEXT`, so this is false there and the shell keeps
+            // its keyboard exactly as the plain-console case requires.
+            let graphics = crate::vfs::vcmux::kd_mode(crate::vfs::vcmux::active())
+                == crate::vfs::tty::KD_GRAPHICS;
+            let console_wants = screen_live && !compositor_holds && !graphics && keymap_on;
+            // Whether the mux just saw a `^A` and is waiting for the byte that
+            // completes it. Read once a tick, outside the per-event loop, since
+            // the mux consumes the latch asynchronously and the whole escape
+            // sequence normally arrives within this one batch.
+            let mux_wants = crate::vfs::vcmux::mux_wants();
             while let Some(event) = device.pop_pending_event() {
+                // The node is fed first and independently of the console, so a
+                // mouse (`EV_REL`) event is never lost to the console-routing
+                // check below - only keyboard events are ever routed to a shell.
                 if delivers {
                     node.push(&event);
                 }
-                if to_console
-                    && event.event_type == EV_KEY
-                    && let Some((bytes, cnt)) = keymap.event(event.code, event.value as i32)
-                {
-                    for &b in &bytes[..cnt] {
-                        if n < routed.len() {
-                            routed[n] = b;
-                            n += 1;
-                        }
+                if event.event_type != EV_KEY {
+                    continue;
+                }
+                let Some((bytes, cnt)) = keymap.event(event.code, event.value as i32) else {
+                    continue;
+                };
+                // What the keyboard owes the console mux. `console_wants` is the
+                // shell's ordinary turn - the console not held by a compositor,
+                // in text mode, keyboard not off. On top of it the operator's
+                // escape must always reach the mux on a screen boot, even while a
+                // compositor owns the keyboard: `^A` itself, and the byte right
+                // after it once the mux has latched the `^A` (`mux_wants`) - which
+                // is how `^A <digit>` completes. An escape hatch that only works
+                // when the compositor agrees is no hatch, and a machine wedged on
+                // the compositor has no compositor left to let you out; the serial
+                // line already reaches the mux unconditionally, and this is the
+                // keyboard's half of that door. Every other byte honours
+                // `console_wants`, so a compositor's typing stays off the shell.
+                if !console_wants && !screen_live {
+                    continue;
+                }
+                let escape = screen_live && (mux_wants || bytes[..cnt].contains(&0x01));
+                if !(console_wants || escape) {
+                    continue;
+                }
+                for &b in &bytes[..cnt] {
+                    if !console_wants && b != 0x01 && !mux_wants {
+                        continue;
+                    }
+                    if n < routed.len() {
+                        routed[n] = b;
+                        n += 1;
                     }
                 }
             }

@@ -861,6 +861,37 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         return fd as isize;
     }
 
+    // AF_PACKET: the link layer, answered by `src/net/packet.rs`. Its own
+    // path for the same reason the other registry-free families took one:
+    // this family works *before* the machine has an address - that is the
+    // whole reason for it - and what it needs from the stack is the NIC,
+    // not the IP layer's cooperation.
+    if domain == crate::net::packet::AF_PACKET {
+        let raw_type = args[1] as u32;
+        let nonblock = raw_type & SOCK_NONBLOCK != 0;
+        let cloexec = raw_type & SOCK_CLOEXEC != 0;
+        let typ = raw_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if typ != SOCK_DGRAM as u32 {
+            // SOCK_DGRAM only. `SOCK_RAW` would hand frames up with their
+            // Ethernet header and put that header's source MAC on the
+            // caller to invent per send; building it here is a named gap,
+            // and `EOPNOTSUPP` is the refusal the caller can branch on.
+            return err::EOPNOTSUPP;
+        }
+        let sock = crate::net::packet::open(args[2] as u16);
+        let fd = match crate::vfs::open_inode(sock) {
+            Ok(fd) => fd,
+            Err(e) => return crate::syscall::err_of(e),
+        };
+        if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+            file.set_status(crate::vfs::file::O_NONBLOCK);
+        }
+        if cloexec {
+            let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+        }
+        return fd as isize;
+    }
+
     if domain != AF_INET && domain != AF_INET6 {
         return err::EAFNOSUPPORT;
     }
@@ -913,6 +944,15 @@ pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
     // A vsock socket retires by its own registry id: the device is told -
     // the connection reset, the listener's port unlistened - and the slot
     // goes empty.
+    // A packet socket retires from the tap's list on its last close; the
+    // queue itself goes with the Arc, and the weak registry entry is what
+    // must stop receiving frames.
+    if let Some(sock) = file.inode().as_packet() {
+        if Arc::strong_count(file) == 1 {
+            crate::net::packet::retire_for(sock);
+        }
+        return;
+    }
     let vsock_id = file.inode().vsock_id();
     if vsock_id != 0 {
         if Arc::strong_count(file) == 1 {
@@ -1221,6 +1261,44 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
         return crate::net::rtnl::send(handle, data);
     }
+    // A packet socket's send: the destination is a `sockaddr_ll` - a MAC on
+    // the link, not an endpoint in the stack - and the Ethernet header is
+    // this kernel's to build, which is what the `SOCK_DGRAM` shape of the
+    // family promises and what `parse_sll_from_user` here makes the caller
+    // name instead of writing.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_packet()
+    {
+        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+            return err::EFAULT;
+        }
+        let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+        let dst = if args[4] != 0 {
+            match crate::net::packet::parse_sll_from_user(args[4], args[5], from_user) {
+                Ok(sll) => {
+                    // The send side reads only the address: `sll_hatype` is
+                    // the bind's business on Linux too. A six-byte address
+                    // is the destination; none means the broadcast this
+                    // client without one is asking for.
+                    if sll.halen > 6 {
+                        return err::EINVAL;
+                    }
+                    let mut mac = [0xffu8; 6];
+                    if sll.halen == 6 {
+                        mac.copy_from_slice(&sll.addr[..6]);
+                    }
+                    mac
+                }
+                Err(e) => return e,
+            }
+        } else {
+            [0xffu8; 6]
+        };
+        return match crate::net::packet::send(sock, dst, data) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
     // A unix *datagram* send is the one send whose destination is a name,
     // so it cannot come through the channel doors - an unconnected
     // datagram socket has no channel, and `channel_of_fd` below would
@@ -1306,7 +1384,9 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     } else {
         None
     };
-    let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    // `MSG_DONTWAIT` on the send must earn `EAGAIN` from a full queue, not
+    // block: the wait decision reads the call flags too, like the receive side.
+    let nonblock = dontwait(fd, args[3]);
     send_common(handle, data, dst, nonblock)
 }
 
@@ -1459,7 +1539,7 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
     } else {
         None
     };
-    let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    let nonblock = dontwait(fd, args[2]);
     send_common(handle, &data, dst, nonblock)
 }
 
@@ -1668,6 +1748,51 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         }
         return n as isize;
     }
+    // A packet socket's receive: one frame per call, its payload only (the
+    // `SOCK_DGRAM` promise), and the sender's *link* address for the
+    // `src_addr` slots - a `sockaddr_ll` naming the frame's source MAC and
+    // type, which is how a DHCP client checks who answered.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_packet()
+    {
+        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+            return err::EFAULT;
+        }
+        if args[3] & MSG_PEEK != 0 {
+            return err::EOPNOTSUPP;
+        }
+        let frame = if dontwait(fd, args[3]) {
+            match sock.try_recv() {
+                Some(frame) => frame,
+                None => return err::EAGAIN,
+            }
+        } else {
+            sock.recv_blocking()
+        };
+        let (payload, src, proto) = frame;
+        let n = payload.len().min(len);
+        unsafe {
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
+        }
+        if args[4] != 0 {
+            if !crate::syscall::buffer_ok(
+                args[4],
+                crate::net::packet::SOCKADDR_LL_LEN,
+                true,
+                from_user,
+            ) {
+                return err::EFAULT;
+            }
+            crate::net::packet::write_sll(proto, &src, args[4]);
+            if args[5] != 0 && crate::syscall::buffer_ok(args[5], 4, true, from_user) {
+                unsafe {
+                    (args[5] as *mut u32)
+                        .write_unaligned(crate::net::packet::SOCKADDR_LL_LEN as u32);
+                }
+            }
+        }
+        return n as isize;
+    }
     // The datagram receive: one message per call, the sender's name for
     // the `src_addr` slots - which is the whole reason `recvfrom` exists
     // beside `read` on a socket of this shape. A buffer smaller than the
@@ -1769,7 +1894,18 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     if let Err(e) = validate_source_slot(src) {
         return e;
     }
-    let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    if args[3] & MSG_PEEK != 0 {
+        // `MSG_PEEK` without consuming is not implemented on the IP path. The
+        // honest answer is `EOPNOTSUPP`, matching the `AF_UNIX`, `NETLINK` and
+        // `PACKET` families above; the old behaviour - consume the datagram and
+        // report success - silently destroyed a byte the caller expected to read
+        // again. Real peek-preserving delivery is a named sub-gap (§12.2).
+        return err::EOPNOTSUPP;
+    }
+    // The wait is decided by the call flags too, not only the descriptor's
+    // `O_NONBLOCK`: `MSG_DONTWAIT` earns `EAGAIN` here as it does for the other
+    // families, which is what `dontwait` already encodes.
+    let nonblock = dontwait(fd, args[3]);
     recv_common(handle, out, src, nonblock)
 }
 
@@ -2086,7 +2222,12 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         );
     }
     let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-    let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
+    if args[2] & MSG_PEEK != 0 {
+        // As in `recvfrom`: the IP path does not peek without consuming, and
+        // refuses honestly rather than eating the datagram. §12.2 B2.
+        return err::EOPNOTSUPP;
+    }
+    let nonblock = dontwait(fd, args[2]);
     let n = match recv_common(handle, out, src, nonblock) {
         n if n >= 0 => n as usize,
         e => return e,
@@ -2488,6 +2629,21 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                     Err(e) => return e,
                 };
             return crate::net::vsock::bind(sock, port);
+        }
+        // A packet socket's bind records the interface index it is aimed at.
+        // One interface exists, so the record changes nothing a filter would
+        // not already give - but a second, *different* bind is refused the
+        // way Linux refuses rebinding.
+        if let Some(sock) = file.inode().as_packet() {
+            let sll = match crate::net::packet::parse_sll_from_user(args[1], args[2], from_user) {
+                Ok(sll) => sll,
+                Err(e) => return e,
+            };
+            return if sock.set_bound(sll.ifindex) {
+                0
+            } else {
+                err::EINVAL
+            };
         }
     }
     // The netlink probes look up the *network registry's* handle - a unix
@@ -3236,6 +3392,12 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
             let (cid, port) = crate::net::vsock::sockname(sock);
             return crate::net::vsock::write_sockaddr_vm(addr_ptr, len_ptr, cid, port);
         }
+        // A packet socket's name is its `sockaddr_ll`: the socket's own
+        // protocol number, eth0's index, and the device's MAC - the address
+        // a frame it sends will carry as its source.
+        if let Some(sock) = file.inode().as_packet() {
+            return crate::net::packet::sockname(sock, addr_ptr, len_ptr);
+        }
     }
     // A device-event socket names itself with the same `sockaddr_nl`, and here
     // the answer is not ceremony: libudev reads its monitor's port id back from
@@ -3507,6 +3669,24 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
 /// (`poll`) and `SO_REUSEADDR` is moot while one process binds at a time.
 pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen) = (args[0] as i32, args[1], args[2], args[3], args[4]);
+    // A packet socket's `SOL_PACKET` knobs: group membership, on a machine
+    // whose tap hands every socket every frame of the socket's type (see
+    // `packet`), is a request for something that is already true - so adding
+    // or dropping it succeeds and records nothing it would misreport.
+    // Anything else is the family's `ENOPROTOOPT`, Linux's own answer for a
+    // level a socket does not carry.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && file.inode().as_packet().is_some()
+    {
+        const SOL_PACKET: usize = 263;
+        const PACKET_ADD_MEMBERSHIP: usize = 1;
+        const PACKET_DROP_MEMBERSHIP: usize = 2;
+        if level == SOL_PACKET && matches!(optname, PACKET_ADD_MEMBERSHIP | PACKET_DROP_MEMBERSHIP)
+        {
+            return 0;
+        }
+        return err::ENOPROTOOPT;
+    }
     // A device-event socket takes the two knobs a listener sets on it:
     // `SO_PASSCRED`, which libudev turns on for every monitor it makes and then
     // *requires* to be honoured - it drops a message whose control chain carries

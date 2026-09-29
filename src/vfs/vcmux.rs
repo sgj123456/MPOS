@@ -214,18 +214,27 @@ fn vt_with<T: Copy>(f: impl FnOnce(&mut vtmode::Table) -> T) -> Option<T> {
     critical_section::with(|cs| VT.borrow(cs).borrow_mut().as_mut().map(f))
 }
 
-/// `VT_SETMODE`: record what console `vc`'s session promises about the screen.
+/// `VT_SETMODE`: record what console `vc`'s session promises about the screen,
+/// and the process (`pid`) whose promise it is.
 ///
 /// `None` is `EINVAL`: not one of this machine's consoles. `Some(Err(_))` is the
 /// mode itself being nonsense (an unknown `mode`, a signal number that is not a
 /// signal, `relsig == acqsig`), and a console with a stale promise is not
 /// allowed to keep it - see [`vtmode::Table::set_mode`].
 ///
+/// The pid is not decoration. Linux keeps it as `vc->vt_pid` and sends both
+/// handover signals to *that process* (`kill_pid(vc->vt_pid, …)`), which is what
+/// lets a seat manager write the mode on a console and close the descriptor
+/// before the compositor ever opens one. Aimed at the terminal's foreground
+/// group instead, `acqsig` - which every seat manager names as `SIGUSR2` - kills
+/// whichever session happens to be in the foreground: the compositor leaving on
+/// its own terms, or a shell that never asked to be consulted.
+///
 /// A mode that takes a console *out* of graphics ownership has to be repainted
 /// now, exactly as `KDSETMODE` does: the scanout holds whatever the compositor
 /// last drew, and nothing else will tell the render task it may have it back.
-pub fn set_vt_mode(vc: u32, mode: VtMode) -> Result<(), Option<vtmode::ModeError>> {
-    let outcome = vt_with(|t| t.set_mode(vc, mode));
+pub fn set_vt_mode(vc: u32, mode: VtMode, pid: u32) -> Result<(), Option<vtmode::ModeError>> {
+    let outcome = vt_with(|t| t.set_mode(vc, mode, pid));
     match outcome {
         None => Err(None),
         Some(result) => {
@@ -245,13 +254,25 @@ pub fn vt_mode(vc: u32) -> VtMode {
 
 /// `VT_ACTIVATE`, and `^A <digit>`: ask for console `to` to be on the screen.
 ///
+/// **Neither of them waits, and that is Linux's answer rather than a shortcut.**
+/// `VT_ACTIVATE` is `set_console()`: it records `want_console`, schedules the
+/// console callback and returns 0 (`vt_ioctl.c`); the callback is
+/// `change_console()`, which is where the releasing console's `relsig` goes out,
+/// and the switch happens later - when that session answers `VT_RELDISP`, or never,
+/// if it does not. So the session that asks for a screen another console is
+/// holding is *not* parked on the answer, and the same call is what an operator's
+/// keystroke makes, from a context that could not sleep anyway.
+///
+/// That is also the only shape that works for a seat manager. seatd's `vt_switch`
+/// writes `VT_SETMODE(VT_PROCESS)` on the console it is standing on and then calls
+/// `VT_ACTIVATE` for the one it wants - so the promise that owes the `relsig` is
+/// seatd's own, and a `VT_ACTIVATE` that slept on that answer would have the keeper
+/// blocked in the very call its own answer is supposed to unblock. The promise is
+/// now aimed at the process that wrote it, so a waiting `VT_ACTIVATE` would have
+/// deadlocked the seat manager for the whole length of the release deadline.
+///
 /// `false` says the number is not one of this machine's consoles, which is what
-/// Linux answers `EINVAL` for. **This one never blocks**, and that is the
-/// difference between the two doors: `^A` arrives from the serial interrupt
-/// handler, which cannot sleep, so an operator's keystroke starts the
-/// negotiation and the mux task's deadline finishes it. A session's own
-/// `VT_ACTIVATE` sleeps instead - see [`wait_activate`], which is Linux's
-/// `vt_release`.
+/// Linux answers `ENXIO` for.
 pub fn request_activate(to: u32, force: bool) -> bool {
     match vt_with(|t| t.request_switch(to, now(), force)) {
         Some(Some(decision)) => {
@@ -261,101 +282,6 @@ pub fn request_activate(to: u32, force: bool) -> bool {
         // `None` inside: not one of this machine's consoles. `None` outside: no
         // console mux yet, which is the same answer from a session's side.
         _ => false,
-    }
-}
-
-/// What a session's `VT_ACTIVATE` ended up being told.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Activated {
-    /// The console is on the screen now - either nothing had to be asked, or it
-    /// was asked and answered.
-    Taken,
-    /// The console already had the screen.
-    Already,
-    /// The console on the screen refused to give it up. Linux's `vt_release`
-    /// answers `-EBUSY` for this, and the refusal stands until the holding
-    /// session lets go.
-    Refused,
-    /// The screen never came free inside the wait. Linux gives the requester
-    /// `-EBUSY` too, and *completes the switch* on the timeout - the wait is
-    /// bounded, not permanent.
-    TimedOut,
-    /// A signal arrived while waiting. The negotiation is still in flight
-    /// (Linux leaves it there as well: `relsig` was sent, and the console on the
-    /// screen has not answered yet), so a retry sees the same wait, not a new
-    /// `relsig`.
-    Interrupted,
-    /// Not one of this machine's consoles.
-    Inval,
-}
-
-/// `VT_ACTIVATE`: ask for console `to`, and sleep until the answer.
-///
-/// Linux's `vt_release`: send the releasing console its `relsig`, park the
-/// *requesting task* on `wait_event_interruptible_timeout(..., 60*HZ)`, and let
-/// the console's `VT_RELDISP` - or the timeout - wake it. The requester sleeps,
-/// not the kernel: a session that activates a console a compositor is holding
-/// discovers the refusal by being told, not by polling `VT_GETSTATE` and hoping.
-pub fn wait_activate(to: u32) -> Activated {
-    let started = now();
-    let Some(decision) = (match vt_with(|t| t.request_switch(to, started, false)) {
-        Some(Some(decision)) => Some(decision),
-        // `None` inside: not one of this machine's consoles; `None` outside: no
-        // console mux yet, which from a session's side is the same answer.
-        _ => None,
-    }) else {
-        return Activated::Inval;
-    };
-    let mut release_from = match decision {
-        Decision::SwitchNow { to } => {
-            complete_switch(to);
-            return Activated::Taken;
-        }
-        Decision::Already { .. } => return Activated::Already,
-        Decision::Refused { .. } => {
-            apply(decision);
-            return Activated::Refused;
-        }
-        // Ours is the release already in flight; it was signalled for whoever
-        // asked first, so we join the wait rather than asking the console twice.
-        Decision::Waiting { release } => release.from,
-        Decision::BeginRelease { release, .. } => {
-            apply(decision);
-            release.from
-        }
-    };
-    add_release_waiter(crate::sched::current());
-    let end = started + vtmode::RELEASE_TIMEOUT_TICKS;
-    loop {
-        let released =
-            vt_with(|t| t.active() == to || t.release().is_none_or(|r| r.from != release_from))
-                .unwrap_or(true);
-        if released {
-            remove_release_waiter(crate::sched::current());
-            return Activated::Taken;
-        }
-        match crate::sched::block_until_deadline(|| false, end) {
-            crate::sched::WaitEnd::Deadline => {
-                remove_release_waiter(crate::sched::current());
-                // The timeout does not abandon the switch: the mux's own
-                // expiry completes it a moment later, which is Linux's order
-                // (`vt_release` returns and `vt_activate` goes on).
-                return Activated::TimedOut;
-            }
-            crate::sched::WaitEnd::Interrupted => {
-                remove_release_waiter(crate::sched::current());
-                return Activated::Interrupted;
-            }
-            // Woken for some other reason - the console answered, or someone
-            // else's switch moved the screen. Re-read the table, and notice if
-            // the console being asked has changed underneath us (a second
-            // release started while we slept is a second answer to wait for).
-            crate::sched::WaitEnd::Condition => {
-                if let Some(from) = vt_with(|t| t.release().map(|r| r.from)).flatten() {
-                    release_from = from;
-                }
-            }
-        }
     }
 }
 
@@ -372,27 +298,12 @@ pub fn wait_active(want: u32) {
     remove_active_waiter(me);
 }
 
-/// The tasks parked in `VT_ACTIVATE`, and the tasks parked per-console in
-/// `VT_WAITACTIVE`. Both are Linux's `vc_wait` queue, split in two because the
-/// predicates differ: one waits for the *release* to end, the other for a named
-/// console to be the one on the screen.
-static RELEASE_WAITERS: CsMutex<core::cell::RefCell<Vec<TaskId>>> =
-    CsMutex::new(core::cell::RefCell::new(Vec::new()));
+/// The tasks parked per-console in `VT_WAITACTIVE`: Linux's `vt_event_waitqueue`
+/// entry for a `VT_EVENT_SWITCH`, which is the one wait the console layer really
+/// does sleep in. `VT_ACTIVATE` is not on that list, because Linux's
+/// `VT_ACTIVATE` never sleeps - see [`request_activate`].
 static ACTIVE_WAITERS: CsMutex<core::cell::RefCell<Vec<(u32, TaskId)>>> =
     CsMutex::new(core::cell::RefCell::new(Vec::new()));
-
-fn add_release_waiter(id: TaskId) {
-    critical_section::with(|cs| {
-        let mut v = RELEASE_WAITERS.borrow(cs).borrow_mut();
-        if !v.contains(&id) {
-            v.push(id);
-        }
-    });
-}
-
-fn remove_release_waiter(id: TaskId) {
-    critical_section::with(|cs| RELEASE_WAITERS.borrow(cs).borrow_mut().retain(|&w| w != id));
-}
 
 fn add_active_waiter(want: u32, id: TaskId) {
     critical_section::with(|cs| {
@@ -418,10 +329,6 @@ fn remove_active_waiter(id: TaskId) {
 /// parks again on the same entry, which is what keeps a wake from having to
 /// race the re-registration.
 fn wake_waiters() {
-    let release = critical_section::with(|cs| RELEASE_WAITERS.borrow(cs).borrow().clone());
-    for id in release {
-        crate::sched::wake(id);
-    }
     let active: Vec<TaskId> = critical_section::with(|cs| {
         ACTIVE_WAITERS
             .borrow(cs)
@@ -465,13 +372,22 @@ pub fn release_ack(vc: u32, agree: bool) -> bool {
     }
 }
 
-/// Let go of a console: a session's last descriptor closed, so any promise it
-/// made about this screen dies with it.
+/// A session's last descriptor of console `vc` closed: take its word about the
+/// *keyboard* back, so a `K_OFF` left behind by a process that has gone cannot
+/// leave a respawned getty reading nothing.
+///
+/// What this does **not** do is drop the console's `VT_PROCESS` promise, and it is
+/// worth saying why in the place where a reader would otherwise put it. A promise
+/// belongs to the process that wrote `VT_SETMODE`, not to the descriptor, and the
+/// process that writes it closes that descriptor on purpose: seatd's `vt_open` is
+/// open, `VT_SETMODE(VT_PROCESS)`, `KDSKBMODE`, `KDSETMODE`, `close(ttyfd)` - all
+/// before the compositor it serves has the screen. Clearing the promise here, even
+/// only when the closer is the keeper, would unmake the claim in the same breath as
+/// it is made, and the compositor's frames would be back to racing the text console
+/// for one scanout. Linux ends a promise in two places and neither is a close: the
+/// keeper writes `VT_AUTO` (`vt_close`), or `kill_pid` fails at the next handover
+/// and `reset_vc` runs - which is [`reset_console`].
 pub fn abandon(vc: u32) {
-    vt_with(|t| t.abandon(vc));
-    // A `KDSKBMODE` was a session's word about *its* keyboard, and the session
-    // is gone: the console takes its keyboard mode back, or a `K_OFF` written on
-    // the way out would leave a respawned getty with no keys to read.
     set_kb_mode(vc, crate::vfs::tty::K_XLATE);
     wake_waiters();
 }
@@ -489,37 +405,52 @@ fn apply(decision: Decision) {
         Decision::SwitchNow { to } => complete_switch(to),
         // Asking for the screen you already have moves nothing; it only lifted
         // a refusal, which the table has already done.
-        Decision::Already { .. }
-        | Decision::Waiting { .. }
-        | Decision::Refused { frsig: None, .. } => {}
-        // The console asking was told no, by the console on the screen. Its
-        // `frsig` is the only way it learns that without polling.
-        Decision::Refused {
-            to,
-            frsig: Some(sig),
-            ..
-        } => signal_group(to, sig),
+        Decision::Already { .. } | Decision::Waiting { .. } => {}
+        // Nothing is sent for a refusal. Linux ignores `frsig` - it writes zero
+        // over the field at `VT_SETMODE` time - and the session that asked is the
+        // one calling `VT_ACTIVATE`, which reads the refusal off its own return.
+        Decision::Refused { .. } => {}
         Decision::BeginRelease { release, relsig } => {
-            // A console that named `VT_PROCESS` but no `relsig` can never
-            // answer, so there is nothing to send: the table has already made
-            // its deadline *now*, and the mux's next look forces the switch.
-            if let Some(sig) = relsig {
-                signal_group(release.from, sig);
+            // A console that cannot be asked cannot be waited for either: no
+            // signal named, or no process left holding the promise. Linux's
+            // answer to the second is `kill_pid` failing and `reset_vc` running,
+            // after which the switch is a plain one - so the table's deadline is
+            // not what ends this wait, the absence of a keeper is.
+            let Some(promise) = relsig else {
+                reset_console(release.from);
+                complete_switch(release.to);
+                return;
+            };
+            if !send_promise(promise) {
+                reset_console(release.from);
+                complete_switch(release.to);
             }
         }
     }
 }
 
-/// Send `sig` to the foreground process group of console `vc`, if it has one.
+/// Hand a promise its signal - to the process that wrote `VT_SETMODE`, and to
+/// nothing else - and answer whether there was anybody left to hand it to. That
+/// answer is the whole of how the console layer learns its promise has no keeper:
+/// Linux gets it from `kill_pid`'s return value for the same reason.
+fn send_promise(promise: vtmode::Promise) -> bool {
+    crate::sched::send_signal_process(crate::sched::TaskId(promise.pid as usize), promise.sig)
+}
+
+/// Linux's `reset_vc`, as far as this layer owns it: the keeper is gone, so the
+/// console stops claiming a screen and starts being drawn on again.
 ///
-/// A console with no session reading it has nobody to tell, which is also the
-/// common case for a `frsig` on a machine with one login: the refusal is
-/// recorded either way, and the next `VT_GETSTATE` says where the screen is.
-fn signal_group(vc: u32, sig: u8) {
-    let Some(pty) = crate::vfs::pty::lookup(vc) else {
-        return;
-    };
-    pty.slave().signal_console(sig);
+/// The `KD_TEXT` is the half that matters to the person at the keyboard. Linux's
+/// comment on the same failure says why: "it saves the agony when the X server
+/// dies and the screen remains blanked due to KD_GRAPHICS". Without it a dead
+/// compositor leaves a machine whose text console is correct, woken, and
+/// invisible.
+fn reset_console(vc: u32) {
+    if vt_with(|t| t.reset(vc)).unwrap_or(false) {
+        set_kd_mode(vc, crate::vfs::tty::KD_TEXT);
+        crate::drivers::video::render::notify();
+        wake_waiters();
+    }
 }
 
 /// Whether the console session the DRM master belongs to is the one on the
@@ -546,19 +477,30 @@ fn complete_switch(to: u32) {
         return;
     }
     switch(to);
+    // Move the pure table's notion of the on-screen console in step with the
+    // `ACTIVE` atomic. `request_switch` asks "is `to` the console already on the
+    // screen" and "which console's `VT_PROCESS` promise do I honour" from the
+    // table's `active`; if it is left at its boot value, every switch after the
+    // first negotiates against console 1 no matter what is really shown - so a
+    // compositor's release signal is sent to the wrong session, or not at all,
+    // and the handover the whole model turns on silently stops happening.
+    vt_with(|t| t.complete_switch(to));
     // The screen moved: every task parked in `VT_ACTIVATE` or `VT_WAITACTIVE`
     // was waiting for exactly this, and the mux has a new console to pump.
     wake_waiters();
-    // The session that now has the screen is told so, if it asked to be told:
-    // that is what a compositor's `acqsig` handler is for - it re-takes the DRM
-    // master and repaints, which is the recovery path after a switch and away.
-    let acqsig = vt_with(|t| t.mode(to))
-        .flatten()
-        .filter(|m| m.mode == vtmode::VT_PROCESS);
-    if let Some(m) = acqsig
-        && m.acqsig != 0
+    // The session that now has the screen is told so, if it asked to be told and
+    // if the process that asked is still there to be told: `acqsig` is how a
+    // compositor knows to re-take the DRM master and repaint, which is the
+    // recovery path after a switch away. It goes to the keeper of the promise, as
+    // Linux's `vt_acquire` sends it to `vc->vt_pid` - and if that process is gone,
+    // Linux resets the console rather than leaving a claim nobody holds, which is
+    // what puts the text back on the screen instead of behind a dead compositor's
+    // graphics mode.
+    let acquire = vt_with(|t| t.promise(to, vtmode::Signal::Acquire)).flatten();
+    if let Some(promise) = acquire
+        && !send_promise(promise)
     {
-        signal_group(to, m.acqsig);
+        reset_console(to);
     }
 }
 
@@ -585,6 +527,15 @@ fn wake_task() {
 /// A `^A` has been seen and the next byte decides what it meant.
 static PENDING_PREFIX: AtomicBool = AtomicBool::new(false);
 
+/// Whether the mux is holding a `^A` and waiting for its follower. A keystroke
+/// source that normally withholds bytes from the mux - because a compositor
+/// owns the keyboard on the screen - must still hand over *this* one byte, so
+/// `^A <digit>` completes and the operator is never locked out of the console
+/// they cannot see. Read-only: the mux itself is what consumes the latch.
+pub fn mux_wants() -> bool {
+    PENDING_PREFIX.load(Ordering::Relaxed)
+}
+
 /// The mux task's id, so an input-time switch can wake it - the task parks on
 /// the old console's master, and the switch changes what it should park on.
 static MUX_TASK: AtomicU32 = AtomicU32::new(0);
@@ -610,9 +561,10 @@ pub fn active() -> u32 {
 /// parks to the negotiation's deadline - so an unanswered `VT_RELDISP` costs
 /// nobody's keystroke, and the operator always keeps a way to read the machine.
 ///
-/// The session's own `VT_ACTIVATE` does wait, and waits differently: see
-/// [`wait_activate`]. The two share the decision (`vtmode::Table::request_switch`)
-/// and differ only in who sleeps.
+/// The session's own `VT_ACTIVATE` goes through this same door and for the same
+/// reason - Linux's `VT_ACTIVATE` is `set_console()`, which schedules the switch
+/// and returns without waiting for the answer - so an operator's keystroke and a
+/// session's activation cannot disagree about what switching means.
 ///
 /// A second `^A` naming the console already being asked is the force that ends
 /// the negotiation without an answer, which is why the request carries the
@@ -657,7 +609,7 @@ pub fn init() {
     // `tty1` and a host that sees one serial port are only reconcilable if
     // somebody says how.
     crate::console::write_bytes(
-        b"console mux: shells on tty1..tty6 (pty-backed); ^A 1..6 switches\n",
+        b"console mux: shells on tty1..tty6 (pty-backed); ^A 1..6 switches; VT_PROCESS promises belong to the process that wrote them; #DF runs on an IST stack\n",
     );
 }
 
@@ -771,15 +723,37 @@ fn switch(to: u32) {
     // The pump is parked on the old console's master; the switch changed what
     // it waits for, and only a wake can make it look.
     wake_task();
-    // On the framebuffer, tell the renderer to show the new console now.
-    if crate::console::gpu_mode() {
+    // Tell the renderer to show the new console now. This is the whole of the
+    // switch being *visible* without another keystroke: the render task repaints
+    // the newly active console the moment it wakes, and only a wake makes it
+    // look. The gate is `grids_live`, not `gpu_mode`, because on a compositor
+    // boot the kernel log never leaves the wire (`gpu_mode` is false there for
+    // the machine's whole life) yet the text VTs the compositor releases still
+    // have grids the renderer owns - and switching *to* or *away from* such a VT
+    // has to repaint then, not on the next mouse move. A boot with no grids at
+    // all (headless, or a serial console before any framebuffer) has nothing to
+    // wake, and its switch is narrated on the wire below instead.
+    if crate::console::grids_live() {
         crate::drivers::video::render::notify();
     }
+    // The screen has moved, and with it the DRM master's right to drive it. Two
+    // directions, each the complement of the other, mirroring Linux where the VT
+    // switch itself hands the card over - the compositor is not trusted to notice:
+    //   - Away from the master's console: `revoke_now` stops its pixels landing
+    //     and hangs up the card fd, so it pauses rather than racing the text
+    //     render for the scanout.
+    //   - Back onto it: `grant_and_resent` clears the hang-up *and* re-presents the
+    //     master's committed framebuffer, because a compositor re-commits only on
+    //     its own input - a mouse move - and would otherwise leave the desktop
+    //     hidden behind the text that filled the screen while it was away. The
+    //     switch back is visible on the frame that switched, not on the next event.
+    crate::drivers::drm::revoke_now();
+    crate::drivers::drm::grant_and_resent();
     // On the shared serial wire a word in the kernel's own voice tells the eye
-    // which console the next bytes belong to. On the framebuffer it is not
-    // needed - each console is its own screen, and the switch itself is the
-    // join - so say nothing and let the redraw speak.
-    if !crate::console::gpu_mode() {
+    // which console the next bytes belong to. Where a framebuffer is drawing the
+    // consoles it is not needed - each console is its own screen, and the switch
+    // itself is the join - so say nothing and let the redraw speak.
+    if !crate::console::grids_live() {
         crate::console::write_bytes(alloc::format!("\r\n[tty{to}]\r\n").as_bytes());
     }
 }

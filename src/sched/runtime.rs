@@ -125,6 +125,14 @@ const STACK_CANARY: u64 = 0x6d70_6f73_5f73_746b;
 /// charged against consumed CPU time and are checked where that time is counted.
 static ITIMER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// The same flag for the `timer_create` family, and for the same reason: the
+/// scan in [`Table::check_posix_timers`] is skipped entirely while no task has
+/// a POSIX timer armed, which is the state of a machine running anything but
+/// the program that asked for one. Set by the arm call, cleared by the scan
+/// when it finds none - wrong only in the safe direction, "run the scan".
+static POSIX_TIMERS_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Slot 0 belongs to whatever was running when [`init`] was called. It adopts
 /// that stack instead of getting one, so there is nothing of ours to free.
 const BOOT_SLOT: usize = 0;
@@ -587,6 +595,70 @@ pub struct ItimerSnapshot {
     pub remaining_ticks: u64,
 }
 
+/// How many POSIX interval timers (`timer_create`) one task may hold. Linux
+/// bounds them by `RLIMIT_SIGPENDING` — thousands — and grows them on the
+/// heap; a fixed slot count bounds the same surface by construction, and the
+/// programs that real: vim keeps one. A create past the last slot answers
+/// `EAGAIN`, which is the errno a caller that probes reads as "out of
+/// resources" — and the message musl hands back through `timer_create`.
+pub const TIMER_SLOTS: usize = 8;
+
+/// The `sigev_notify` values `timer_create` accepts, as the ABI numbers them.
+pub const SIGEV_NONE: u32 = 0;
+pub const SIGEV_SIGNAL: u32 = 1;
+pub const SIGEV_THREAD_ID: u32 = 4;
+
+/// `TIMER_ABSTIME`: `timer_settime`'s flag that names a deadline on the clock
+/// rather than a delay from now.
+pub const TIMER_ABSTIME: u32 = 1;
+
+/// One POSIX interval timer: what it does when it fires, and whether it is
+/// still counting.
+#[derive(Clone, Copy)]
+pub struct PosixTimer {
+    /// The reload value in ticks, as `it_interval` spelled it. A one-shot
+    /// timer has none; a periodic one reloads from where it was due, the same
+    /// coalescing rule the itimers follow.
+    interval_ticks: u64,
+    /// The absolute tick the timer fires at. `None` is a disarmed timer —
+    /// a `timer_settime` with a zero value, or a one-shot that has fired.
+    /// The record stays either way: Linux keeps a timer valid until it is
+    /// deleted, and `timer_gettime` of an expired one-shot answers zero.
+    deadline: Option<u64>,
+    /// The signal the expiry raises, in 1..=32 — 1..=31 being the range a
+    /// disposition can name and 32 (`SIGRTMIN`) the number musl's
+    /// `SIGEV_THREAD` helper waits on.
+    signo: u8,
+    /// The `union sigval` the creator asked the expiry to carry.
+    value: u64,
+    /// Where the signal goes: nowhere (`SIGEV_NONE`), the creating task
+    /// (`SIGEV_SIGNAL`), or the named thread of the creator's group
+    /// (`SIGEV_THREAD_ID`). A process-directed expiry aiming at the creator
+    /// rather than "any thread that does not block it" is the one
+    /// simplification this table owns, and it is spelled out on
+    /// `handle_timer_create`, where its one real consumer cannot see it.
+    notify: TimerNotify,
+    /// Expiries that found the previous signal still pending — the overrun
+    /// count `timer_getoverrun` reports. Standard signals are not queued, so
+    /// an expiry that arrives while the last one is unread has nowhere to go
+    /// but this counter, which is exactly what the count means.
+    overrun: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TimerNotify {
+    None,
+    Signal,
+    Thread(TaskId),
+}
+
+impl PosixTimer {
+    /// Whether an expiry is due, and what should happen after it.
+    fn expired(&self, now: u64) -> bool {
+        self.deadline.is_some_and(|d| now >= d)
+    }
+}
+
 /// A thread group's memory: the frames behind its mappings, how many threads
 /// are still running on it, and where a leaving thread says so.
 ///
@@ -820,7 +892,7 @@ struct Task {
     /// The `siginfo_t` behind each pending signal, indexed like `signals`. A
     /// standard signal is not queued, so one record per number is all the ABI
     /// implies; this is what lets a `sigqueue` payload reach the handler.
-    siginfo: [signal::SigInfo; signal::SIGNALS],
+    siginfo: [signal::SigInfo; signal::SIGINFO_SLOTS],
     /// The signals this task has blocked with `rt_sigprocmask`. A blocked
     /// signal stays pending until it is unblocked, which is what makes a
     /// critical section able to say "not now" and be obeyed.
@@ -955,6 +1027,10 @@ struct Task {
     /// ticks the board has; the other two are recorded but never fire, for
     /// want of per-task CPU accounting.
     itimers: [Option<ItimerState>; 3],
+    /// The POSIX interval timers `timer_create` made, indexed by the id the
+    /// call answered with. A timer belongs to the task that created it, not
+    /// to its thread group - the divergence `handle_timer_create` records.
+    timers: [Option<PosixTimer>; TIMER_SLOTS],
     /// What a tracer has made of this task, if anything.
     trace: Tracing,
 }
@@ -1127,7 +1203,7 @@ impl Task {
             user_entry: None,
             user_resume: None,
             signals: 0,
-            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
+            siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -1154,6 +1230,7 @@ impl Task {
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
+            timers: [None; TIMER_SLOTS],
             trace: Tracing::default(),
         }
     }
@@ -1406,11 +1483,124 @@ impl Table {
         ITIMER_ARMED.store(any_armed, Ordering::Relaxed);
     }
 
+    /// Fire every POSIX interval timer whose deadline has passed.
+    ///
+    /// The itimer scan above and this one are two scans over the same slots
+    /// for the same reason: a `timer_create` timer can aim at a *thread*, so
+    /// its expiry may queue a signal on a task other than the one that owns
+    /// it, and writing that cross-task queueing inline in one pass would hold
+    /// two `&mut` tasks at once. So the pass runs in three steps: read the
+    /// table to see what each target is (its group, its pending set), walk
+    /// the timers and decide, then deliver - one `&mut` borrow at a time.
+    /// The armed flags are separate from the itimer's, so a machine with one
+    /// kind of timer and not the other never scans for the other.
+    fn check_posix_timers(&mut self) {
+        if !POSIX_TIMERS_ARMED.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = timer::ticks();
+        // Step 1: what the scan needs about every task, without holding any
+        // of them mutably. A signal queued in this pass is also tracked in
+        // `fresh` below, so a second timer aiming at the same thread in the
+        // same pass still counts an overrun rather than double-queueing.
+        let mut targets: alloc::vec::Vec<(TaskId, TaskId, bool, signal::Pending)> =
+            alloc::vec::Vec::with_capacity(MAX_TASKS);
+        for (i, slot) in self.tasks.iter().enumerate() {
+            if let Some(task) = slot {
+                targets.push((TaskId(i), task.tgid, task.exited, task.signals));
+            }
+        }
+        // Step 2: walk the timers and decide what each expiry does.
+        let mut deliver: alloc::vec::Vec<(TaskId, u8, signal::SigInfo)> = alloc::vec::Vec::new();
+        let mut fresh: alloc::vec::Vec<(TaskId, u8)> = alloc::vec::Vec::new();
+        let mut any_armed = false;
+        for (i, slot) in self.tasks.iter_mut().enumerate() {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+            if task.exited {
+                continue;
+            }
+            let owner = TaskId(i);
+            let owner_tgid = task.tgid;
+            for timer in task.timers.iter_mut().flatten() {
+                if !timer.expired(now) {
+                    if timer.deadline.is_some() {
+                        any_armed = true;
+                    }
+                    continue;
+                }
+                // Reload before anything else, so an expiry is never lost to
+                // a refusal below: a periodic timer coalesces the periods a
+                // late check skipped exactly the way an itimer does, and a
+                // one-shot disarms.
+                match timer.deadline {
+                    Some(d) if timer.interval_ticks > 0 => {
+                        let mut next = d + timer.interval_ticks;
+                        while next <= now {
+                            next += timer.interval_ticks;
+                        }
+                        timer.deadline = Some(next);
+                        any_armed = true;
+                    }
+                    _ => timer.deadline = None,
+                }
+                // Who the expiry targets: nowhere, the creating task, or the
+                // named thread - resolved here, because a `SIGEV_THREAD_ID`
+                // thread can have left the group since the timer was made. A
+                // timer whose thread is gone stays armed and silent, which is
+                // what Linux's does; only the delivery is skipped.
+                let target = match timer.notify {
+                    TimerNotify::None => continue,
+                    TimerNotify::Signal => Some(owner),
+                    TimerNotify::Thread(t) => targets
+                        .iter()
+                        .find(|(id, _, _, _)| *id == t)
+                        .filter(|(_, tgid, exited, _)| !*exited && *tgid == owner_tgid)
+                        .map(|(id, _, _, _)| *id),
+                };
+                let Some(target_id) = target else {
+                    continue;
+                };
+                // A standard signal is not queued, so an expiry that finds
+                // its own last signal unread has nowhere to go but the
+                // overrun count - Linux's own semantics for this class.
+                let pending_there = targets
+                    .iter()
+                    .find(|(id, _, _, _)| *id == target_id)
+                    .is_some_and(|(_, _, _, signals)| *signals & signal::bit(timer.signo) != 0)
+                    || fresh.contains(&(target_id, timer.signo));
+                if pending_there {
+                    timer.overrun += 1;
+                } else {
+                    timer.overrun = 0;
+                    let mut info = signal::SigInfo::timer(timer.signo);
+                    info.value = timer.value;
+                    fresh.push((target_id, timer.signo));
+                    deliver.push((target_id, timer.signo, info));
+                }
+            }
+        }
+        // Step 3: deliver, one target at a time, and wake it. The record goes
+        // through `queue_signal`, so the pending bit and its `siginfo_t` are
+        // set together the way every other raise site sets them.
+        for (target, signo, info) in deliver {
+            if let Some(task) = self.tasks.get_mut(target.0).and_then(Option::as_mut) {
+                if !task.exited {
+                    queue_signal(task, signo, info);
+                    self.sched.wake(target);
+                }
+            }
+        }
+        POSIX_TIMERS_ARMED.store(any_armed, Ordering::Relaxed);
+    }
+
     /// The scheduler's whole turn: fire timers, bury the dead, move the
     /// clock on, choose. `None` means there is nothing to run and the caller
     /// should idle.
     fn next_turn(&mut self) -> Option<(*mut Context, *const Context)> {
         self.check_itimers();
+        self.check_posix_timers();
         self.reap();
         self.sched.advance(timer::ticks());
         let picked = self.sched.pick();
@@ -1471,7 +1661,7 @@ impl Table {
             user_entry: None,
             user_resume: None,
             signals: 0,
-            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
+            siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -1498,6 +1688,7 @@ impl Table {
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
+            timers: [None; TIMER_SLOTS],
             trace: Tracing::default(),
         });
         TaskId(slot)
@@ -1891,7 +2082,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             user_entry: Some((loaded.entry, user_rsp)),
             user_resume: None,
             signals: 0,
-            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
+            siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -1927,6 +2118,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
+            timers: [None; TIMER_SLOTS],
             trace: Tracing::default(),
         });
         t.sched.push_ready(INIT_PID, Priority::NORMAL);
@@ -2029,7 +2221,7 @@ pub fn try_spawn_user(
             user_entry: Some((loaded.entry, user_rsp)),
             user_resume: None,
             signals: 0,
-            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
+            siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -2059,6 +2251,7 @@ pub fn try_spawn_user(
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
+            timers: [None; TIMER_SLOTS],
             trace: Tracing::default(),
         });
         let id = TaskId(slot);
@@ -2705,14 +2898,30 @@ pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
 }
 
 /// Whether the running task has a signal that would interrupt a blocking
-/// wait: pending, unblocked, and not ignored. The table-borrowing shape of
+/// wait: pending, unblocked, and not discarded. The table-borrowing shape of
 /// [`has_deliverable_signal`], for a check inside `schedule`, where the table
 /// is already borrowed and no second borrow may be taken.
+///
+/// "Discarded" is wider than `SIG_IGN`, and the difference is measured rather
+/// than inferred: a blocked `read` survived a `SIGCHLD` whose child exited, a
+/// `SIGWINCH` nobody had trapped, a `SIGURG` and a `SIGCONT` - each still at
+/// `SIG_DFL`, none of them ending the wait, every one of them left blocked
+/// until a watchdog signal broke it. A signal whose *default action* is to be
+/// ignored is as much thrown away as one set to `SIG_IGN`, so it cannot be the
+/// reason a syscall comes back `EINTR`.
+///
+/// This is what makes a full-screen program's resize an interruption only when
+/// it has a handler for the resize - which is exactly when redrawing is what the
+/// signal was ever for.
 fn table_has_deliverable(t: &Table) -> bool {
     let task = t.task(t.current);
     let mut ready = task.signals & !task.blocked;
     while let Some(sig) = signal::take(&mut ready) {
-        if task.dispositions.get(sig).is_ignore() {
+        let action = task.dispositions.get(sig);
+        if action.is_ignore()
+            || (action.is_default()
+                && matches!(signal::default_action(sig), signal::DefaultAction::Ignore))
+        {
             continue;
         }
         return true;
@@ -2727,7 +2936,8 @@ fn table_has_deliverable(t: &Table) -> bool {
 /// answers an interruptible wait with `EINTR` when a catchable, unblocked
 /// signal is pending, and leaves the signal itself for the syscall gate to
 /// deliver on the way out - the handler runs there, where a register file
-/// exists to build its frame on. Ignored signals are not pending
+/// exists to build its frame on. Discarded signals - `SIG_IGN`, and `SIG_DFL`
+/// for a signal whose default action is to be ignored - are not pending
 /// interruptions and do not count, same as in [`take_deliverable_signal`].
 pub fn has_deliverable_signal() -> bool {
     with_table(|t| table_has_deliverable(t))
@@ -2810,12 +3020,39 @@ pub fn wake(id: TaskId) -> bool {
     with_table(|t| t.sched.wake(id))
 }
 
+/// Whether a signal is discarded at the moment it is generated, because the
+/// task has said it does not want it.
+///
+/// A disposition of `SIG_IGN` means exactly "never deliver this", and Linux
+/// discards such a signal at generation rather than letting it sit pending.
+/// The difference is observable and was a real bug here: a self-ignored
+/// `SIGALRM` (or any ignored signal) left in the pending set becomes
+/// deliverable again the moment the disposition changes back to `SIG_DFL` -
+/// the *default action* then running for a signal the process had explicitly
+/// refused - and `rt_sigpending` reports a signal no handler will ever take.
+///
+/// `SIGCONT` is the one exception, and on purpose: ignoring it does not mean
+/// "do not resume me". Its effect is on the task's *state* - a stopped task is
+/// resumed by it - and Linux carries that out even under `SIG_IGN`. The state
+/// change lives in [`send_signal_info`], below the pending-set write this
+/// guards, so it stays.
+fn discarded_when_generated(task: &Task, sig: u8) -> bool {
+    sig != signal::SIGCONT && task.dispositions.get(sig).is_ignore()
+}
+
 /// Add `sig` to `task`'s pending set and store the `siginfo_t` a handler will
 /// read for it. The one place a bit and its record are set together, so no
 /// raise site can leave a handler looking at a zeroed `signo`.
+///
+/// An ignored signal never gets here in effect: `task`'s disposition decides,
+/// and the kernel's own raises (a timer expiry, a broken pipe, a child's exit)
+/// follow the same rule a `kill` does.
 fn queue_signal(task: &mut Task, sig: u8, info: signal::SigInfo) {
+    if discarded_when_generated(task, sig) {
+        return;
+    }
     signal::add(&mut task.signals, sig);
-    if (sig as usize) < signal::SIGNALS {
+    if (sig as usize) < signal::SIGINFO_SLOTS {
         task.siginfo[sig as usize] = info;
     }
 }
@@ -2871,9 +3108,16 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: signal::SigInfo) -> bool {
         let Some(task) = t.tasks.get_mut(id.0).and_then(Option::as_mut) else {
             return false;
         };
-        signal::add(&mut task.signals, sig);
-        if (sig as usize) < signal::SIGNALS {
-            task.siginfo[sig as usize] = info;
+        // An ignored signal is discarded as it is generated: the process has
+        // said it does not want it, and a bit left pending would come back to
+        // life - with its *default* action - the moment the disposition
+        // changed. `SIGCONT` is exempt, and the state change it carries is
+        // below this: ignoring a resume does not mean "stay stopped".
+        if !discarded_when_generated(task, sig) {
+            signal::add(&mut task.signals, sig);
+            if (sig as usize) < signal::SIGINFO_SLOTS {
+                task.siginfo[sig as usize] = info;
+            }
         }
         // `SIGCONT` is the one signal whose effect is on the *state* of a task        // rather than on its pending set, and this is the only place a task's
         // state can be changed from outside it.
@@ -3137,6 +3381,44 @@ pub fn send_signal_group(pgid: TaskId, sig: u8) -> bool {
     delivered
 }
 
+/// The live tasks of one thread group: the process that a pid names.
+pub fn process_members(tgid: TaskId) -> alloc::vec::Vec<TaskId> {
+    with_table(|t| {
+        t.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.as_ref()
+                    .is_some_and(|task| task.tgid == tgid && !task.exited)
+            })
+            .map(|(slot, _)| TaskId(slot))
+            .collect()
+    })
+}
+
+/// Linux's `kill_pid(vc->vt_pid, sig, 1)`: hand `sig` to one *process* - every
+/// live thread of the group `tgid` leads - and answer the question the console
+/// layer actually acts on: whether that process still exists at all.
+///
+/// The answer matters more than the delivery. `VT_SETMODE`'s `VT_PROCESS` is a
+/// promise made by a process, and Linux's `change_console` and `vt_acquire` send
+/// its `relsig`/`acqsig` to the recorded pid precisely so that the death of that
+/// process is *heard* - as `kill_pid` failing - at the next handover. That is
+/// what lets a dead compositor's screen be taken back on the spot (`reset_vc`,
+/// and the switch falls through as if the console had been `VT_AUTO`) instead of
+/// stranding it behind a timer nobody living can answer. A sender that reported
+/// only success would leave the console with no way to learn its promise has no
+/// keeper left, and a promise aimed at a *terminal* rather than at the process
+/// that made it is worse still: it kills whichever session happens to be in the
+/// foreground when the signal goes out.
+pub fn send_signal_process(tgid: TaskId, sig: u8) -> bool {
+    let mut delivered = false;
+    for id in process_members(tgid) {
+        delivered |= send_signal(id, sig);
+    }
+    delivered
+}
+
 /// `setpgid(pid, pgid)` — put a task into a process group, creating the group
 /// when the caller names the task's own id.
 ///
@@ -3274,7 +3556,7 @@ pub fn take_deliverable_siginfo() -> Option<(u8, signal::SigInfo)> {
 /// `SIGKILL`, whose whole point is that it cannot be caught anywhere else. A
 /// blocked signal in `mask` is exactly the one that can be waited for, which
 /// is what makes `sigwait` work.
-pub fn take_signal_in_set(mask: signal::Pending) -> Option<u8> {
+pub fn take_signal_in_set(mask: signal::Pending) -> Option<(u8, signal::SigInfo)> {
     with_table(|t| {
         let id = t.current;
         let task = t.task_mut(id);
@@ -3282,7 +3564,15 @@ pub fn take_signal_in_set(mask: signal::Pending) -> Option<u8> {
         match signal::take(&mut ready) {
             Some(sig) => {
                 task.signals &= !signal::bit(sig);
-                Some(sig)
+                // The record comes out with the bit it belongs to: the
+                // `siginfo_t` a waiter reads has to be the one the sender
+                // left, not a fresh `SI_USER` one - musl's `SIGEV_THREAD`
+                // helper checks `si_code == SI_TIMER` before running the
+                // callback a POSIX timer exists to make.
+                let slot = (sig as usize).min(signal::SIGINFO_SLOTS - 1);
+                let record = task.siginfo[slot];
+                task.siginfo[slot] = signal::SigInfo::ZERO;
+                Some((sig, record))
             }
             None => None,
         }
@@ -4599,6 +4889,19 @@ pub fn exit(code: isize) -> ! {
         }
         t.task_mut(id).exited = true;
         record_retired(id, code, t.task(id).trace.tracer);
+
+        // Everything the task owned is given back *here*, at its exit, which
+        // is Linux's own moment for it (`do_exit` closes the files and tears
+        // down the `mm` before the parent is told anything). Waiting for the
+        // reap instead - which is where this used to happen, and what the
+        // function's own doc said was wrong - left a corpse holding its whole
+        // address space and every descriptor it had open for as long as nobody
+        // waited for it. An unreaped pid 1-less orphan then held the DRM
+        // master and its seat session against the next compositor, and a
+        // process with a large `mm` (a compositor's llvmpipe arenas, say) kept
+        // every frame it had allocated. Only the slot and the exit code stay
+        // now, which is what a zombie is.
+        t.release_exited();
 
         // Whoever was waiting on this task as its parent is woken here, in
         // the same critical section that made the condition true: either it
@@ -5958,6 +6261,113 @@ pub fn itimer_snapshot(which: usize) -> Option<ItimerSnapshot> {
     })
 }
 
+/// Make the running task a POSIX timer, answering the id `timer_t` names it
+/// by, or the errno the refusal carries.
+///
+/// `target` is the thread a `SIGEV_THREAD_ID` expiry aims at; the table is
+/// what can check it belongs to the caller's thread group, which is Linux's
+/// own validation - a timer aimed at another process's thread is a way to
+/// signal a process the caller may have no right to signal.
+///
+/// A timer is born disarmed, exactly as Linux's is: `timer_create` only makes
+/// the record, and `timer_settime` is what arms it. The new timer's slot is
+/// the lowest free one - ids are the caller's to hold, not a sequence to
+/// read meaning into.
+pub fn timer_alloc(signo: u8, value: u64, notify: TimerNotify) -> Result<usize, isize> {
+    with_table(|t| {
+        if let TimerNotify::Thread(target) = notify {
+            let ok = task_ok_for_timer(t, target).is_some_and(|grp| grp == t.task(t.current).tgid);
+            if !ok {
+                return Err(crate::syscall::err::EINVAL);
+            }
+        }
+        let task = t.task_mut(t.current);
+        let slot = (0..TIMER_SLOTS).find(|&s| task.timers[s].is_none());
+        let Some(slot) = slot else {
+            return Err(crate::syscall::err::EAGAIN);
+        };
+        task.timers[slot] = Some(PosixTimer {
+            interval_ticks: 0,
+            deadline: None,
+            signo,
+            value,
+            notify,
+            overrun: 0,
+        });
+        Ok(slot)
+    })
+}
+
+/// The thread group a task belongs to, for the `SIGEV_THREAD_ID` check, or
+/// `None` when no such task is alive.
+fn task_ok_for_timer(t: &Table, target: TaskId) -> Option<TaskId> {
+    t.tasks
+        .get(target.0)
+        .and_then(Option::as_ref)
+        .filter(|task| !task.exited)
+        .map(|task| task.tgid)
+}
+
+/// Arm or disarm the running task's timer `slot`, reporting the state it
+/// replaced as `(interval, remaining)` ticks - the pair `timer_settime`'s
+/// `old_value` wants. `None` is an id that names no timer of this task's.
+///
+/// `deadline` is `None` for a disarm and `Some(ticks)` for an arm; the caller
+/// has already converted the timespec and refused the absolute spelling this
+/// kernel cannot honour.
+pub fn timer_arm(slot: usize, interval_ticks: u64, deadline: Option<u64>) -> Option<(u64, u64)> {
+    if deadline.is_some() {
+        POSIX_TIMERS_ARMED.store(true, Ordering::Relaxed);
+    }
+    with_table(|t| {
+        let task = t.task_mut(t.current);
+        let timer = task.timers.get_mut(slot)?.as_mut()?;
+        let old = (
+            timer.interval_ticks,
+            timer
+                .deadline
+                .map_or(0, |d| d.saturating_sub(timer::ticks())),
+        );
+        timer.interval_ticks = interval_ticks;
+        timer.deadline = deadline;
+        Some(old)
+    })
+}
+
+/// Read a timer's `(interval, remaining)` in ticks, for `timer_gettime`.
+/// `None` is an id that names no timer of this task's; a disarmed timer
+/// answers zero remaining, exactly as Linux's does.
+pub fn timer_state(slot: usize) -> Option<(u64, u64)> {
+    with_table(|t| {
+        let timer = t.task(t.current).timers.get(slot)?.as_ref()?;
+        Some((
+            timer.interval_ticks,
+            timer
+                .deadline
+                .map_or(0, |d| d.saturating_sub(timer::ticks())),
+        ))
+    })
+}
+
+/// The overrun count `timer_getoverrun` reports, or `None` for an id that
+/// names no timer of this task's.
+pub fn timer_overrun(slot: usize) -> Option<u32> {
+    with_table(|t| Some(t.task(t.current).timers.get(slot)?.as_ref()?.overrun))
+}
+
+/// Free a timer's slot. The id dies with it: a later use of the same number
+/// is `EINVAL`, whether or not the slot has been handed out again, because a
+/// timer that was deleted is not a timer whatever occupies its slot now.
+pub fn timer_remove(slot: usize) -> bool {
+    with_table(|t| {
+        let task = t.task_mut(t.current);
+        match task.timers.get_mut(slot) {
+            Some(slot @ Some(_)) => slot.take().is_some(),
+            _ => false,
+        }
+    })
+}
+
 pub fn preempt() {
     if !STARTED.load(Ordering::Relaxed) || current() == SCHED_ID {
         return;
@@ -6300,8 +6710,15 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             released: false,
             tgid: TaskId(slot),
             signals: 0,
-            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
-            blocked: 0,
+            siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
+            // The mask is inherited, as POSIX says a child's is: a program
+            // that blocks a signal and then forks expects the child to start
+            // with it blocked too. The *dispositions* above are deliberately
+            // not inherited (this kernel starts every process at `SIG_DFL`),
+            // but a mask is not a disposition - it is the caller saying "not
+            // now", and a child that un-blocked what its parent held would
+            // take a signal the parent meant to handle itself.
+            blocked: t.task(parent_id).blocked,
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds: Arc::new(parent_fds.duplicate()),
@@ -6345,6 +6762,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
                 parent_tls
             },
             itimers: [None; 3],
+            timers: [None; TIMER_SLOTS],
             trace: Tracing::default(),
         });
 
@@ -6763,6 +7181,13 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let seccomp_filters = parent.seccomp_filters.clone();
         let priority = parent.priority;
         let dispositions = parent.dispositions;
+        // The new thread's signal mask is its creator's, copied: POSIX says a
+        // thread inherits the creating thread's mask, and musl's `SIGEV_THREAD`
+        // helper depends on it - `timer_create` blocks `SIGRTMIN` in the
+        // creating thread and the helper *thread* is what waits on it, so a
+        // thread that started unblocked would take the timer's signal as a
+        // fatal default action instead of waiting for it.
+        let blocked = parent.blocked;
         let cwd = parent.cwd.clone();
         let cwd_path = parent.cwd_path.clone();
         let brk_base = parent.brk_base;
@@ -6815,8 +7240,12 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
                 ..*state
             }),
             signals: 0,
-            siginfo: [signal::SigInfo::ZERO; signal::SIGNALS],
-            blocked: 0,
+            siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
+            // Inherited from the creator (see where `blocked` is read above):
+            // the mask a thread starts with is the one the thread that made it
+            // held, which is what makes `timer_create`'s `SIGEV_THREAD`
+            // helper able to wait for `SIGRTMIN` at all.
+            blocked,
             // Linux shares the handler table under `CLONE_SIGHAND`; this
             // kernel copies it, so a thread that installs a handler does not
             // install it for its siblings. Nothing in this system's userland
@@ -6860,6 +7289,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
                 parent_tls
             },
             itimers: [None; 3],
+            timers: [None; TIMER_SLOTS],
             trace: Tracing::default(),
             mm: {
                 mm.join();

@@ -29,11 +29,18 @@ use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
 /// The whole surface of a character device, in the only units that make sense
 /// for one: bytes in, bytes out.
 ///
-/// `read` returning 0 is end of input, matching the `Inode` contract. A
+/// `read` returning `Ok(0)` is end of input, matching the `Inode` contract. A
 /// device with nothing to say yet may block instead: the tty does, and it is
 /// the device's own business to decide, not this trait's.
+///
+/// A read therefore answers a `VfsResult`, because a blocking device has a
+/// third answer a byte count cannot carry: a signal ended the wait, and the
+/// caller must be told `EINTR` rather than be handed 0 - which on the read side
+/// means the terminal closed. A program that blocked in `read` on its own
+/// terminal and had it interrupted by its `SIGALRM` timeout is exactly the
+/// caller that cannot afford to be told its terminal is gone.
 pub trait CharDevice: Send + Sync {
-    fn read(&self, buf: &mut [u8]) -> usize;
+    fn read(&self, buf: &mut [u8]) -> VfsResult<usize>;
     fn write(&self, buf: &[u8]) -> usize;
 
     /// The error a write should report instead of succeeding, if any.
@@ -46,6 +53,73 @@ pub trait CharDevice: Send + Sync {
     fn write_error(&self) -> Option<VfsError> {
         None
     }
+
+    /// The device's own `ioctl` answer, if this device speaks any request:
+    /// the full `_IOC` word and the caller's argument, whose validity as a
+    /// buffer the syscall layer has already checked. `None` - the answer for
+    /// every device without an ioctl surface - says the request is as
+    /// unknown here as it would be on Linux, and the syscall answers
+    /// `ENOTTY`. A device that has the request and refuses *it* answers
+    /// `Some(EINVAL)`, because refusal is the device's answer to give, not
+    /// the dispatcher's.
+    fn ioctl(&self, _request: u32, _arg: usize) -> Option<isize> {
+        None
+    }
+}
+
+/// The mode and ownership one device node keeps, behind the same
+/// `critical_section` door everything else in this filesystem uses.
+///
+/// A device's *existence* belongs to its driver, but its permissions belong
+/// to the machine: Linux's devtmpfs creates each node with the driver's
+/// default mode - a strict one, `0600 root:root`, until the filesystem predates
+/// the mount - and it is udev's rules that hand back `0660 root:tty` and
+/// friends. For those rules to be more than a log line, `chmod(2)` and
+/// `chown(2)` on a device node have to *stick*: a node that answers success
+/// while keeping nothing is the silent approximation this kernel's rules put
+/// above any convenience, and it is what `stat` reported a mode that no check
+/// ever read.
+///
+/// A device inode that is its own `Inode` implementation - the tty, the DRM
+/// card, an event node - holds one of these and forwards the five trait
+/// methods to it; that is the whole of the mode story for that node.
+pub struct NodePerms {
+    mode: Mutex<RefCell<u32>>,
+    owner: Mutex<RefCell<(u32, u32)>>,
+}
+
+impl NodePerms {
+    /// The node's mode at birth, and its owner. Numbers are the low twelve
+    /// permission bits only; the kind bits belong to [`Metadata::kind`].
+    pub const fn new(mode: u32, uid: u32, gid: u32) -> NodePerms {
+        NodePerms {
+            mode: Mutex::new(RefCell::new(mode)),
+            owner: Mutex::new(RefCell::new((uid, gid))),
+        }
+    }
+
+    /// The five answers an `Inode` forwards - see [`Inode::keeps_modes`].
+    /// `keeps` is true by construction: a node carrying one of these is a
+    /// node that stores what it is told.
+    pub fn keeps(&self) -> bool {
+        true
+    }
+
+    pub fn mode(&self) -> u32 {
+        critical_section::with(|cs| *self.mode.borrow(cs).borrow())
+    }
+
+    pub fn set_mode(&self, mode: u32) {
+        critical_section::with(|cs| *self.mode.borrow(cs).borrow_mut() = mode & 0o7777);
+    }
+
+    pub fn owner(&self) -> (u32, u32) {
+        critical_section::with(|cs| *self.owner.borrow(cs).borrow())
+    }
+
+    pub fn set_owner(&self, uid: u32, gid: u32) {
+        critical_section::with(|cs| *self.owner.borrow(cs).borrow_mut() = (uid, gid));
+    }
 }
 
 /// One registered device, as an inode.
@@ -55,11 +129,42 @@ struct DevNode {
     /// The device number `st_rdev` reports - the identity libc's `ttyname`
     /// matches descriptors by when it walks `/dev`.
     dev_id: (u32, u32),
+    /// What `chmod(2)`/`chown(2)` on this node leave behind, and what the
+    /// permission checks read. Devices are born `0666 root:root` here - the
+    /// mode `stat` already reported for them before any of this existed, and
+    /// the number udev's rules then tighten or hand out by group. The named
+    /// gap in `PLAN.md` keeps Linux's *devtmpfs* birth (`0600` until udev);
+    /// what this commit ends is the silence, not that difference.
+    perms: NodePerms,
 }
 
 impl Inode for DevNode {
     fn rdev(&self) -> Option<(u32, u32)> {
         Some(self.dev_id)
+    }
+
+    fn keeps_modes(&self) -> bool {
+        self.perms.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        self.perms.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.perms.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.perms.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        self.perms.set_owner(uid, gid);
+    }
+
+    fn as_chardev(&self) -> Option<&dyn CharDevice> {
+        Some(&*self.dev)
     }
     fn metadata(&self) -> Metadata {
         Metadata {
@@ -71,7 +176,7 @@ impl Inode for DevNode {
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        Ok(self.dev.read(buf))
+        self.dev.read(buf)
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
@@ -475,6 +580,7 @@ impl DevFs {
             ino,
             dev,
             dev_id: (major, minor),
+            perms: NodePerms::new(0o666, 0, 0),
         });
         critical_section::with(|cs| {
             let prev = self
@@ -633,7 +739,7 @@ mod tests {
     use critical_section::Mutex;
 
     use super::{CharDevice, DevFs};
-    use crate::vfs::{File, FileSystem, NodeKind, VfsError};
+    use crate::vfs::{File, FileSystem, NodeKind, VfsError, VfsResult};
 
     /// Emits its bytes once, then end of input.
     struct Source {
@@ -642,14 +748,14 @@ mod tests {
     }
 
     impl CharDevice for Source {
-        fn read(&self, buf: &mut [u8]) -> usize {
+        fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
             let start = self.taken.fetch_add(buf.len(), Ordering::Relaxed);
             if start >= self.bytes.len() {
-                return 0;
+                return Ok(0);
             }
             let end = (start + buf.len()).min(self.bytes.len());
             buf[..end - start].copy_from_slice(&self.bytes[start..end]);
-            end - start
+            Ok(end - start)
         }
 
         fn write(&self, _buf: &[u8]) -> usize {
@@ -663,8 +769,8 @@ mod tests {
     }
 
     impl CharDevice for Sink {
-        fn read(&self, _buf: &mut [u8]) -> usize {
-            0
+        fn read(&self, _buf: &mut [u8]) -> VfsResult<usize> {
+            Ok(0)
         }
 
         fn write(&self, buf: &[u8]) -> usize {
@@ -742,6 +848,40 @@ mod tests {
         let fs = DevFs::new();
         fs.register("null", sink());
         fs.register("null", sink());
+    }
+
+    #[test]
+    fn chmod_on_a_device_sticks_and_is_policed() {
+        // The whole point of the node storing a mode: an answer of success
+        // to `chmod` means the number is really there afterwards, and the
+        // permission checks read it - which, before this, they could not,
+        // and a udev `MODE=` rule was a line of logs and nothing else.
+        let fs = DevFs::new();
+        fs.register("sink", sink());
+        let node = fs.root().lookup("sink").unwrap();
+        assert!(node.keeps_modes(), "a device node keeps what it is told");
+        assert_eq!(node.mode(), 0o666, "and is born at the Linux stream mode");
+
+        let writable_by_anyone = (1u32, 1u32);
+        assert!(crate::vfs::may_as(writable_by_anyone, &node, crate::vfs::W_OK).is_ok());
+
+        node.set_mode(0o600);
+        assert_eq!(node.mode(), 0o600);
+        assert_eq!(
+            crate::vfs::may_as(writable_by_anyone, &node, crate::vfs::W_OK).err(),
+            Some(VfsError::Access),
+            "the tightened mode is what the next check sees"
+        );
+        assert!(
+            crate::vfs::may_as((0, 0), &node, crate::vfs::W_OK).is_ok(),
+            "and root still reaches it, the way CAP_DAC_OVERRIDE does"
+        );
+
+        // chown moves the triads along with it: the new owner reads what the
+        // old root grant took away.
+        node.set_owner(1, 1);
+        assert_eq!(node.owner(), (1, 1));
+        assert!(crate::vfs::may_as(writable_by_anyone, &node, crate::vfs::W_OK).is_ok());
     }
 
     #[test]

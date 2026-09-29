@@ -420,6 +420,9 @@ pub const SIGALRM: i32 = 14;
 /// `sigqueue` carrying a payload, and an interval timer's expiry.
 pub const SI_USER: i32 = 0;
 pub const SI_QUEUE: i32 = -1;
+/// `SI_TIMER`: the record a POSIX timer's expiry carries - the code musl's
+/// `SIGEV_THREAD` helper checks before it calls a callback.
+pub const SI_TIMER: i32 = -2;
 
 /// clock ids.
 pub const CLOCK_REALTIME: usize = 0;
@@ -635,6 +638,51 @@ pub struct Winsize {
     pub ws_xpixel: u16,
     pub ws_ypixel: u16,
 }
+
+/// `struct termios`, the shape `TCGETS` and `TCSETS` carry: four flag words, a
+/// line-discipline number, the control characters, then the two speeds.
+///
+/// Spelled once, here, because putting a terminal into raw mode is not one
+/// test's business: it is what every caller of the read side has to do to ask
+/// what the kernel then answers - a full-screen program, a `VMIN`/`VTIME` wait,
+/// an interrupt key - and a second spelling of the same ABI in a second program
+/// is a second answer to a question the ABI already settled.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Termios {
+    pub iflag: u32,
+    pub oflag: u32,
+    pub cflag: u32,
+    pub lflag: u32,
+    pub line: u8,
+    pub cc: [u8; 32],
+    pub ispeed: u32,
+    pub ospeed: u32,
+}
+
+/// `c_lflag` bits a test names.
+pub const ISIG: u32 = 0x0001;
+pub const ICANON: u32 = 0x0002;
+pub const ECHO: u32 = 0x0008;
+
+/// `c_cc` indices a test names. `VMIN`/`VTIME` are the pair a non-canonical
+/// read is built on, and they are only meaningful in that mode: see
+/// `t-tty-vtime`.
+pub const VINTR: usize = 0;
+pub const VEOF: usize = 4;
+pub const VTIME: usize = 5;
+pub const VMIN: usize = 6;
+
+/// `struct itimerval`: the reload interval, then the time left to run.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Itimerval {
+    pub it_interval: TimeVal,
+    pub it_value: TimeVal,
+}
+
+/// The wall-clock interval timer, the one that answers with `SIGALRM`.
+pub const ITIMER_REAL: usize = 0;
 
 /// `struct utsname`, six 65-byte fields: 390 bytes.
 #[repr(C)]
@@ -1266,6 +1314,101 @@ pub fn timerfd_gettime(fd: i32, curr_value: &mut Itimerspec) -> isize {
     )
 }
 
+// --- POSIX interval timers (timer_create(2)) --------------------------------
+
+/// `SIGRTMIN`: the first real-time signal, and the number musl's
+/// `SIGEV_THREAD` helper waits on. This kernel queues and masks it; a
+/// disposition for it is still refused.
+pub const SIGRTMIN: i32 = 32;
+
+/// The `sigev_notify` values `timer_create` accepts. `SIGEV_THREAD` (2) is a
+/// libc invention - it never reaches the kernel, which sees the
+/// `SIGEV_THREAD_ID` timer the libc built underneath it.
+pub const SIGEV_NONE: i32 = 0;
+pub const SIGEV_SIGNAL: i32 = 1;
+pub const SIGEV_THREAD_ID: i32 = 4;
+
+/// `TIMER_ABSTIME`: `timer_settime`'s absolute-deadline flag.
+pub const TIMER_ABSTIME: usize = 1;
+
+/// `struct sigevent` as musl lays it out: the `union sigval` first, then the
+/// signal number and the notification kind, then the union whose
+/// `sigev_notify_thread_id` sits at offset 16 - the shape the tid arrives in.
+#[repr(C)]
+pub struct SigEvent {
+    pub value: u64,
+    pub signo: i32,
+    pub notify: i32,
+    pub tid: i32,
+    pub _pad: i32,
+}
+
+impl SigEvent {
+    pub fn new() -> Self {
+        SigEvent {
+            value: 0,
+            signo: 0,
+            notify: SIGEV_NONE,
+            tid: 0,
+            _pad: 0,
+        }
+    }
+}
+
+/// `timer_create(clockid, sigevent, timer_t *)`: make a POSIX interval timer.
+/// The id comes back as the `int` the kernel hands out.
+pub fn timer_create(clockid: usize, event: *const SigEvent, id: *mut i32) -> isize {
+    sys3(nr::TIMER_CREATE, clockid, event as usize, id as usize)
+}
+
+/// `timer_settime(timerid, flags, new_value, old_value)`.
+pub fn timer_settime(
+    id: i32,
+    flags: usize,
+    new_value: &Itimerspec,
+    old_value: *mut Itimerspec,
+) -> isize {
+    sys4(
+        nr::TIMER_SETTIME,
+        id as usize,
+        flags,
+        new_value as *const Itimerspec as usize,
+        old_value as usize,
+    )
+}
+
+/// `timer_gettime(timerid, curr_value)`.
+pub fn timer_gettime(id: i32, curr_value: &mut Itimerspec) -> isize {
+    sys2(
+        nr::TIMER_GETTIME,
+        id as usize,
+        curr_value as *mut Itimerspec as usize,
+    )
+}
+
+/// `timer_getoverrun(timerid)`.
+pub fn timer_getoverrun(id: i32) -> isize {
+    sys1(nr::TIMER_GETOVERRUN, id as usize)
+}
+
+/// `timer_delete(timerid)`.
+pub fn timer_delete(id: i32) -> isize {
+    sys1(nr::TIMER_DELETE, id as usize)
+}
+
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)`: take a signal out of the
+/// pending set without running anything - the shape a libc's `sigwaitinfo`
+/// and the helper thread behind `SIGEV_THREAD` both use.
+pub fn rt_sigtimedwait(set: *const u64, info: *mut SigInfo, timeout: *const TimeSpec) -> isize {
+    sys4(
+        nr::RT_SIGTIMEDWAIT,
+        set as usize,
+        info as usize,
+        timeout as usize,
+        8,
+    )
+}
+
 // --- inotify(7) -------------------------------------------------------------
 
 /// `inotify_init1`'s flags: the `O_` pair under the header's other names.
@@ -1692,6 +1835,110 @@ pub fn parse_dirent64(buf: &[u8]) -> Option<(Dirent64<'_>, usize)> {
 /// Device ioctl: `TIOCGWINSZ`, `TCGETS`, and friends.
 pub fn ioctl(fd: i32, request: usize, arg: usize) -> isize {
     sys3(nr::IOCTL, fd as usize, request, arg)
+}
+
+/// `tcgetattr(fd)`: the terminal's settings, or `None` when the descriptor is
+/// not a terminal (or the kernel says otherwise).
+pub fn tcgetattr(fd: i32) -> Option<Termios> {
+    let mut tio = Termios {
+        iflag: 0,
+        oflag: 0,
+        cflag: 0,
+        lflag: 0,
+        line: 0,
+        cc: [0; 32],
+        ispeed: 0,
+        ospeed: 0,
+    };
+    (ioctl(fd, TCGETS, &raw mut tio as usize) == 0).then_some(tio)
+}
+
+/// `tcsetattr(fd, TCSANOW, tio)`: `TCSETS` is that trio, and the kernel this
+/// suite runs on has no output queue to drain, so `when` is not worth a word.
+pub fn tcsetattr(fd: i32, tio: &Termios) -> isize {
+    ioctl(fd, TCSETS, &raw const *tio as usize)
+}
+
+/// `setitimer(which, new, old)`: arm an interval timer, and take back what was
+/// there. `new` of `None` is the man page's "disarm", spelled as a zero struct -
+/// which is what `old` must still be written, so the zero lives in a binding.
+pub fn setitimer(which: usize, new: Option<&Itimerval>, old: &mut Itimerval) -> isize {
+    let zero = Itimerval {
+        it_interval: TimeVal {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: TimeVal {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    let new_ptr = match new {
+        Some(t) => t as *const Itimerval as usize,
+        None => &zero as *const Itimerval as usize,
+    };
+    sys3(
+        nr::SETITIMER,
+        which,
+        new_ptr,
+        old as *mut Itimerval as usize,
+    )
+}
+
+/// Milliseconds on the monotonic clock, which is the only clock a test of a
+/// wait can measure against: the wall clock can be set from under it.
+pub fn monotonic_ms() -> u64 {
+    let mut ts = TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if clock_gettime(CLOCK_MONOTONIC, &mut ts) != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
+/// Sleep, in milliseconds - the delay a test needs to have bytes land *after*
+/// the read they are answering has started.
+pub fn sleep_ms(ms: u64) {
+    let req = TimeSpec {
+        tv_sec: (ms / 1000) as i64,
+        tv_nsec: ((ms % 1000) as i64) * 1_000_000,
+    };
+    let mut rem = TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let _ = nanosleep(&req, &mut rem);
+}
+
+/// `/dev/pts/<n>` spelled into `buf` from the number `TIOCGPTN` answered, NUL
+/// terminated, returned as the slice to open. The caller keeps the storage
+/// because this suite's programs are `no_std` and have no heap of their own.
+///
+/// One spelling, because minting a pair and opening its slave is not one test's
+/// business: it is how any program here gets a terminal it can drive from both
+/// ends.
+pub fn pts_path<'a>(n: usize, buf: &'a mut [u8]) -> &'a [u8] {
+    const PREFIX: &[u8] = b"/dev/pts/";
+    let at = PREFIX.len();
+    buf[..at].copy_from_slice(PREFIX);
+    let mut digits = [0u8; 10];
+    let mut len = 0;
+    let mut rest = n;
+    loop {
+        digits[len] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        len += 1;
+        if rest == 0 {
+            break;
+        }
+    }
+    for (i, &d) in digits[..len].iter().rev().enumerate() {
+        buf[at + i] = d;
+    }
+    buf[at + len] = 0;
+    &buf[..at + len + 1]
 }
 
 /// `mount(source, target, fstype, flags, NULL)`: hang a filesystem, or -

@@ -305,17 +305,27 @@ impl Pty {
     /// The master's blocking read. The console multiplexer is the reader in
     /// practice: it parks here until the slave prints, then carries the bytes
     /// to the serial wire. The reader joins the wake list for the length of
-    /// the read, the way [`Tty::read`] does on the slave side.
+    /// the read, the way [`Tty::read`] does on the slave side - and like that
+    /// read, it ends with `EINTR` when a catchable signal arrives, because a
+    /// terminal program that owns this end has the same timeouts aimed at it as
+    /// the program on the slave end does. The master has no `VMIN`/`VTIME`
+    /// clock: a master read is raw, and the queue either has a frame or does
+    /// not.
     #[cfg(target_os = "none")]
-    fn read_master(&self, buf: &mut [u8]) -> usize {
+    fn read_master(&self, buf: &mut [u8]) -> VfsResult<usize> {
         let id = crate::sched::current();
         self.subscribe_master(id);
         let got = loop {
-            crate::sched::block_until(|| self.master_ready());
+            match crate::sched::block_until_deadline(|| self.master_ready(), u64::MAX) {
+                crate::sched::WaitEnd::Interrupted => break Err(VfsError::Interrupted),
+                // Woken by output, or by anything else that ends a sleep: the
+                // look below is what decides, and a lost race costs one pass.
+                crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => {}
+            }
             if let Some(bytes) = self.take_master(buf.len()) {
                 let n = bytes.len().min(buf.len());
                 buf[..n].copy_from_slice(&bytes[..n]);
-                break n;
+                break Ok(n);
             }
             // Another reader won the race; there may be more coming.
         };
@@ -426,7 +436,32 @@ pub fn master_input(number: u32, bytes: &[u8]) {
 /// and Linux answers that the same way: no read, no write, just the open.
 pub struct Ptmx;
 
+/// `/dev/ptmx` is one shared inode, and its mode is one shared record:
+/// `chmod` on the name sticks for every later open, the way Linux's single
+/// misc node behaves (see `devfs::NodePerms`).
+static PTMX_PERMS: super::devfs::NodePerms = super::devfs::NodePerms::new(0o666, 0, 0);
+
 impl Inode for Ptmx {
+    fn keeps_modes(&self) -> bool {
+        PTMX_PERMS.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        PTMX_PERMS.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        PTMX_PERMS.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        PTMX_PERMS.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        PTMX_PERMS.set_owner(uid, gid);
+    }
+
     /// The pty multiplexer has no position either: `lseek` is `ESPIPE`.
     fn seekable(&self) -> bool {
         false
@@ -516,7 +551,7 @@ impl Inode for PtyMaster {
             return Ok(0);
         }
         #[cfg(target_os = "none")]
-        return Ok(self.pty.read_master(buf));
+        return self.pty.read_master(buf);
         // On the host there is no scheduler to park in; the tests drive the
         // pair through `Pty`'s own methods instead.
         #[cfg(not(target_os = "none"))]
@@ -637,7 +672,7 @@ mod tests {
         }
         assert_eq!(&drain_master(&pty), b"ls\r\n");
         let mut buf = [0u8; 8];
-        let n = pty.slave().take_ready(&mut buf).unwrap();
+        let n = pty.slave().take_now(&mut buf).unwrap();
         // Input is a different road from output: the reader gets the line with
         // one newline, because the carriage return Enter sends was translated
         // *in* (`ICRNL`) and never became a character of its own.

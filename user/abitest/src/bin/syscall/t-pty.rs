@@ -63,28 +63,13 @@ static mut ECHO: [u8; 16] = [0; 16];
 static mut PATH: [u8; 20] = [0; 20];
 static mut SLAVE_LINE: [u8; 8] = [0; 8];
 
-/// `/dev/pts/<n>` spelled into `PATH` from the number `TIOCGPTN` answered.
-fn slave_path(mut n: usize) -> &'static [u8] {
-    const PREFIX: [u8; 9] = *b"/dev/pts/";
-    unsafe {
-        let at = PREFIX.len();
-        PATH[..at].copy_from_slice(&PREFIX);
-        let mut digits = [0u8; 10];
-        let mut len = 0;
-        loop {
-            digits[len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            len += 1;
-            if n == 0 {
-                break;
-            }
-        }
-        for (i, &d) in digits[..len].iter().rev().enumerate() {
-            PATH[at + i] = d;
-        }
-        PATH[at + len] = 0;
-        core::slice::from_raw_parts(core::ptr::addr_of!(PATH).cast(), at + len + 1)
-    }
+/// `/dev/pts/<n>` spelled into `PATH` from the number `TIOCGPTN` answered -
+/// the spelling lives in `lin`, because opening a pair's slave is how any
+/// program here gets a terminal it can drive from both ends.
+fn slave_path(n: usize) -> &'static [u8] {
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(PATH) };
+    let path = lin::pts_path(n, buf);
+    unsafe { core::slice::from_raw_parts(path.as_ptr(), path.len()) }
 }
 
 #[unsafe(no_mangle)]

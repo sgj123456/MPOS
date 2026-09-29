@@ -193,6 +193,19 @@ pub enum VfsError {
     /// reads at all", which would misdescribe a socket one call before it
     /// connects.
     NotConnected,
+    /// EINTR: a wait this node was about to take was ended by a signal the
+    /// caller can catch, and **nothing was consumed** - no byte read, no byte
+    /// written, no offset moved. A node reports this rather than answering a
+    /// count, because both of the counts it could otherwise pick are lies: 0
+    /// on the read side means end of input, which is how this kernel's tty
+    /// once mistook a timeout for a closed terminal, and a full count would
+    /// claim bytes that never arrived.
+    ///
+    /// The measured Linux answer to a blocking terminal `read` interrupted by
+    /// a catchable `SIGALRM`, `SIGWINCH` or `SIGCHLD` is `-1/EINTR` with the
+    /// handler having run first, for every one of those signals - the wait is
+    /// interruptible as a rule, not per signal.
+    Interrupted,
 }
 
 pub type VfsResult<T> = Result<T, VfsError>;
@@ -513,12 +526,30 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// The character stream this node wraps, if it is one - how a device
+    /// family's ioctls reach the device without the dispatcher knowing which
+    /// device implements them: the `'P'`-typed OSS requests on `/dev/dsp`
+    /// ask the *stream* for its rate and format, and the stream is the one
+    /// that knows. Same shape as [`Self::as_drm`], for the same reason.
+    fn as_chardev(&self) -> Option<&dyn devfs::CharDevice> {
+        None
+    }
+
     /// The vsock socket this node is, if it is one - the borrow form of the
     /// id the close paths check, for the socket syscalls that operate on
     /// the socket's own state. Gated with the `net` module, like
     /// [`Self::as_unix`], which this mirrors family for family.
     #[cfg(target_os = "none")]
     fn as_vsock(&self) -> Option<&crate::net::vsock::VsockSock> {
+        None
+    }
+
+    /// The AF_PACKET socket this node is, if it is one - the door the
+    /// socket syscalls use to hand a link-layer send, bind, or name query
+    /// to `crate::net::packet` without knowing the family's plumbing. Gated
+    /// with the `net` module, like [`Self::as_vsock`].
+    #[cfg(target_os = "none")]
+    fn as_packet(&self) -> Option<&crate::net::packet::PacketSock> {
         None
     }
 

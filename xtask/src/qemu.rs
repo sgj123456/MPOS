@@ -52,14 +52,19 @@ fn mode_marker_path(build_dir: &Path) -> PathBuf {
     build_dir.join("console.mode")
 }
 
-/// The mode last baked into the image. A missing marker - an image built before
-/// the run modes existed - reads as [`RunMode::Mirror`], which is exactly
-/// what such an image boots as (no `mpos.headless`/`nomirror`, mirror on).
-pub fn baked_mode(build_dir: &Path) -> RunMode {
+/// The mode last baked into the image, or `None` for an image that carries no
+/// marker at all - one built before the run modes existed.
+///
+/// A missing marker is deliberately not read as [`RunMode::Mirror`]: such an
+/// image's command line says `console=ttyS0` and nothing else, and the kernel
+/// now reads that the way Linux does - the wire is the *only* console. A mirror
+/// image has to name the framebuffer console too, so the two are different
+/// machines and the caller gets to decide what to do about it, rather than being
+/// told a mode the image does not carry.
+pub fn baked_mode(build_dir: &Path) -> Option<RunMode> {
     fs::read_to_string(mode_marker_path(build_dir))
         .ok()
         .and_then(|text| RunMode::parse(&text))
-        .unwrap_or(RunMode::Mirror)
 }
 
 pub fn set_baked_mode(build_dir: &Path, mode: RunMode) -> Result<()> {
@@ -69,9 +74,10 @@ pub fn set_baked_mode(build_dir: &Path, mode: RunMode) -> Result<()> {
 
 /// Whether the mode baked into the image differs from `desired`, so a `run` must
 /// take root to rewrite `mpos.cmdline` before booting. No image means nothing to
-/// switch (the build that makes it will bake `desired` anyway).
+/// switch (the build that makes it will bake `desired` anyway), and an image with
+/// no marker at all differs from every mode - its line predates the console list.
 pub fn needs_mode_switch(build_dir: &Path, desired: RunMode) -> bool {
-    utils::image_path(build_dir).exists() && baked_mode(build_dir) != desired
+    utils::image_path(build_dir).exists() && baked_mode(build_dir) != Some(desired)
 }
 
 /// The QEMU command line both `run` and `test` boot with.

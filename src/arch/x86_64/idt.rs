@@ -29,6 +29,24 @@ pub fn breakpoints_caught() -> u64 {
     BREAKPOINTS_CAUGHT.load(Ordering::Relaxed)
 }
 
+/// The stack the CPU loads `RSP` from when it takes a double fault: the vector
+/// that reports "the stack I was going to report on was the thing that faulted".
+///
+/// 32 KiB for a last report that consists of a few formatted lines onto the
+/// serial wire and one port write, with room for the format machinery and the
+/// `current_stack_range()` check that keeps the return-address walk inside memory
+/// it is allowed to read. It is ordinary `.bss`, so it is mapped for the whole
+/// life of the machine, and nothing else is given it: a `#DF` that nested inside a
+/// `#DF` would overwrite it, and that third fault is a triple fault whether the
+/// stack is shared or not.
+#[repr(C, align(16))]
+struct FaultStack([u8; 32 * 1024]);
+
+/// The `#DF` stack, and the software IST slot it is published in: slot 0 is the
+/// hardware `IST1`, which is what `set_stack_index` counts from.
+static DOUBLE_FAULT_STACK: FaultStack = FaultStack([0; 32 * 1024]);
+const DOUBLE_FAULT_IST: usize = 0;
+
 pub fn init() {
     let idt = IDT.call_once(|| {
         let mut table = InterruptDescriptorTable::new();
@@ -36,7 +54,28 @@ pub fn init() {
         table.divide_error.set_handler_fn(divide_error);
         table.breakpoint.set_handler_fn(breakpoint);
         table.invalid_opcode.set_handler_fn(invalid_opcode);
-        table.double_fault.set_handler_fn(double_fault);
+        // The one vector that gets a stack of its own, and it is not a
+        // tidiness. Every other fault pushes its frame on the stack it just found
+        // unusable; if that push is what failed, the fault promotes to `#DF`, and a
+        // `#DF` with no IST slot pushes *its* frame on the same broken stack and
+        // promotes again - to a triple fault. The CPU then resets, `cargo xtask
+        // run` passes `-no-reboot` (xtask/src/qemu.rs), and QEMU walks out without
+        // the kernel writing one byte of explanation: the report of a kernel that
+        // ran off the end of its own stack is exactly the report that cannot be
+        // made from that stack. So the CPU is given a stack that does not depend on
+        // the fault, and `fatal()` gets to say which vector, at which `rip`, ended
+        // the machine.
+        unsafe {
+            super::gdt::set_ist(
+                DOUBLE_FAULT_IST,
+                core::ptr::addr_of!(DOUBLE_FAULT_STACK) as usize
+                    + core::mem::size_of::<FaultStack>(),
+            );
+            table
+                .double_fault
+                .set_handler_fn(double_fault)
+                .set_stack_index(DOUBLE_FAULT_IST as u16);
+        }
         table
             .general_protection_fault
             .set_handler_fn(general_protection);

@@ -11,32 +11,33 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 /// How `cargo xtask run` boots the whole machine: one word that decides the
-/// QEMU wiring *and* the guest's console policy together, because a machine that
-/// shows its console in two places has to have agreed on that in both. Named
-/// `mode` rather than `console` for exactly that reason - it is not a console
-/// setting, it is which machine this is.
+/// QEMU wiring *and* the consoles the guest is told to use, because a machine
+/// that shows its console in two places has to have agreed on that in both.
+///
+/// The guest half is a `console=` list and nothing else (see
+/// [`RunMode::cmdline_consoles`]); the window and the serial line are the
+/// launcher's, and no mode word ever reaches the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
-    /// Serial is the whole console: no window, the GPU never engages, and the
-    /// wire is the *lossless* sink. `mpos.headless` on the guest line, QEMU
-    /// `-display none` with the serial on stdio.
+    /// Serial is the whole console, and the only one: `console=ttyS0` on the
+    /// guest line, QEMU `-display none` with the serial on stdio.
     Terminal,
-    /// The framebuffer window only: the GPU is the console, and the serial wire
-    /// carries nothing once the console moves over. `mpos.nomirror`, QEMU
-    /// `-display {backend}` with `-serial none`.
+    /// The framebuffer window only: `console=tty0`, QEMU `-display {backend}`
+    /// with the serial line discarded.
     Gui,
     /// The window plus a best-effort copy out the serial line, so the same
-    /// console shows in the window and the terminal at once. `mpos.mirror`, QEMU
-    /// `-display {backend}` with the serial on stdio. This is the default.
+    /// console shows in the window and the terminal at once: `console=ttyS0
+    /// console=tty0`, QEMU `-display {backend}` with the serial on stdio. This
+    /// is the default.
     Mirror,
     /// The window a rootful Wayland compositor paints, with the kernel console
-    /// kept off the framebuffer: `/dev/fb0` and the scanout belong to the
-    /// compositor, and the serial line still carries the log. QEMU
-    /// `-display {backend}` with the serial on stdio.
+    /// kept off the framebuffer: `console=ttyS0`, QEMU `-display {backend}`
+    /// with the serial on stdio.
     ///
-    /// Named for the compositor that runs here, because that is what the mode
-    /// is for; the boot word it bakes stays `mpos.compositor`, which is the
-    /// kernel's own ABI and is read by name in `src/main.rs`.
+    /// Named for the compositor that runs here, because that is what the mode is
+    /// for. The guest is told only where its log goes; `/dev/fb0` and the
+    /// scanout reach the compositor through the DRM master it takes at runtime,
+    /// not through anything this mode bakes.
     Weston,
 }
 
@@ -54,16 +55,23 @@ impl RunMode {
         }
     }
 
-    /// The word this mode adds to the guest command line. The kernel reads
-    /// `mpos.headless` to keep the console on the wire, `mpos.nomirror` to skip
-    /// the serial mirror after it moves to the framebuffer, and treats the
-    /// absence of both (or `mpos.mirror`) as the mirroring default.
-    pub fn cmdline_flag(self) -> &'static str {
+    /// The consoles this mode asks the guest to use, written the way Linux has
+    /// always written them: `console=` words, read by `src/boot/console_list.rs`.
+    ///
+    /// This is the whole of what a mode tells the kernel. The order carries the
+    /// meaning: Linux gives the log to every console on the list and treats the
+    /// last as the preferred one, so a wire-then-framebuffer list means the window
+    /// takes the console over once the framebuffer is up while the wire keeps a
+    /// best-effort copy, and the wire alone stays authoritative and lossless.
+    ///
+    /// The serial port's name comes from the rootfs config rather than being
+    /// spelled here: it is the same name the image's getty runs on, and one
+    /// machine has one serial port.
+    pub fn cmdline_consoles(self, serial_port: &str) -> String {
         match self {
-            Self::Terminal => "mpos.headless",
-            Self::Gui => "mpos.nomirror",
-            Self::Mirror => "mpos.mirror",
-            Self::Weston => "mpos.compositor",
+            Self::Terminal | Self::Weston => format!("console={serial_port}"),
+            Self::Gui => "console=tty0".to_string(),
+            Self::Mirror => format!("console={serial_port} console=tty0"),
         }
     }
 
@@ -446,19 +454,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_modes_round_trip_and_name_their_boot_flag() {
-        // The words the user types, the flag the kernel reads, and the name the
-        // marker keeps must all line up, because a mode that parses but bakes the
-        // wrong flag boots the machine in a mode nobody asked for.
-        for (text, mode, flag) in [
-            ("terminal", RunMode::Terminal, "mpos.headless"),
-            ("gui", RunMode::Gui, "mpos.nomirror"),
-            ("mirror", RunMode::Mirror, "mpos.mirror"),
-            // The compositor mode is `weston` to the command line and
-            // `mpos.compositor` to the kernel: the second is the boot word
-            // `src/main.rs` reads, so renaming the first must not quietly move
-            // the second.
-            ("weston", RunMode::Weston, "mpos.compositor"),
+    fn run_modes_round_trip_and_name_their_console_list() {
+        // The words the user types, the `console=` list the kernel reads, and the
+        // name the marker keeps must all line up, because a mode that parses but
+        // bakes the wrong consoles boots the machine in a mode nobody asked for.
+        for (text, mode, consoles) in [
+            ("terminal", RunMode::Terminal, "console=ttyS0"),
+            ("gui", RunMode::Gui, "console=tty0"),
+            // Mirror is two consoles with the framebuffer preferred, which is
+            // what the word has always meant: Linux writes the log to every
+            // console on the list and the last is the preferred one, so mirror
+            // is a list and needs no word of its own.
+            ("mirror", RunMode::Mirror, "console=ttyS0 console=tty0"),
+            // Weston keeps the log on the wire alone, exactly as terminal does.
+            // What makes it a compositor boot is a session claiming the card at
+            // runtime, and that is not a fact a command line can carry.
+            ("weston", RunMode::Weston, "console=ttyS0"),
         ] {
             assert_eq!(RunMode::parse(text), Some(mode));
             // Case- and space-insensitive: the name comes from a config file a
@@ -467,7 +478,7 @@ mod tests {
                 RunMode::parse(&format!("  {}  ", text.to_uppercase())),
                 Some(mode)
             );
-            assert_eq!(mode.cmdline_flag(), flag);
+            assert_eq!(mode.cmdline_consoles("ttyS0"), consoles);
             assert_eq!(mode.name(), text);
         }
         assert_eq!(RunMode::parse("anything-else"), None);
@@ -477,6 +488,23 @@ mod tests {
         assert!(RunMode::Terminal.serial_to_stdio());
         assert!(RunMode::Mirror.serial_to_stdio());
         assert!(!RunMode::Gui.serial_to_stdio());
+        // And the list has to agree with that wiring: the one mode that discards
+        // the serial line is the one mode whose list does not name it. A mode
+        // that says one thing to QEMU and another to the kernel is the failure
+        // this whole pairing exists to prevent.
+        for mode in [
+            RunMode::Terminal,
+            RunMode::Gui,
+            RunMode::Mirror,
+            RunMode::Weston,
+        ] {
+            assert_eq!(
+                mode.serial_to_stdio(),
+                mode.cmdline_consoles("ttyS0").contains("ttyS0"),
+                "{} disagrees with itself about the serial line",
+                mode.name()
+            );
+        }
     }
 
     #[test]
@@ -484,8 +512,9 @@ mod tests {
         // `compositor` was the mode's name before the option became `--mode`, and
         // an image baked then records it in `build/console.mode`. Reading that as
         // "an unknown mode, so default to mirror" would tell `run` the image
-        // carries the wrong flag and send it through a root rebuild of the boot
-        // files for no reason - so the old word must land on the same variant.
+        // carries the wrong consoles and send it through a root rebuild of the
+        // boot files for no reason - so the old word must land on the same
+        // variant.
         assert_eq!(RunMode::parse("compositor"), Some(RunMode::Weston));
         let mut values = HashMap::new();
         values.insert("mode".to_string(), "weston".to_string());

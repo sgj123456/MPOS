@@ -55,6 +55,9 @@ const NR_VT_GETSTATE: usize = 0x03;
 const NR_VT_RELDISP: usize = 0x05;
 const NR_VT_ACTIVATE: usize = 0x06;
 const NR_VT_WAITACTIVE: usize = 0x07;
+/// `VT_WAITUNTIL` - Linux's `vt_waitrelease`: the same park, with a
+/// `0` that means "nothing to wait for" instead of a range error.
+const NR_VT_WAITUNTIL: usize = 0x0c;
 /// `<linux/kd.h>`: KDSETMODE 0x3a, KDGETMODE 0x3b, KDGKBMODE 0x44,
 /// KDSKBMODE 0x45.
 const NR_KDSETMODE: usize = 0x3a;
@@ -82,6 +85,10 @@ const K_OFF: usize = 0x04;
 const O_RDWR: usize = 2;
 const ENOTTY: isize = -25;
 const EINVAL: isize = -22;
+/// `VT_ACTIVATE`/`VT_WAITACTIVE` on a console number the machine cannot have is
+/// Linux's `ENXIO` (`vt_ioctl.c`: `arg == 0 || arg > MAX_NR_CONSOLES`), not the
+/// `EINVAL` an unusable *mode* gets.
+const ENXIO: isize = -6;
 const EACCES: isize = -13;
 
 /// `struct vt_mode`'s `mode` field.
@@ -90,6 +97,9 @@ const VT_PROCESS: u8 = 0;
 /// The seat manager's `relsig`/`acqsig`: `SIGUSR1` and `SIGUSR2`.
 const SIGUSR1: u8 = 10;
 const SIGUSR2: u8 = 12;
+/// What seatd names `frsig` (`common/terminal.h`'s `FRSIG` on Linux) - the field
+/// Linux ignores, and so the one the kernel must not read back.
+const SIGIO: u8 = 29;
 /// `VT_SETMODE` is `_IOW('V', 0x02, struct vt_mode)`, so unlike its neighbours
 /// it does carry a size, and a kernel that decoded it as `_IO` would read zero
 /// bytes of a caller that wrote eight.
@@ -166,6 +176,32 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         vm == want,
     );
 
+    // `frsig` is the one field of `struct vt_mode` Linux does not keep:
+    // `vt_setmode` copies the caller's struct and then writes zero over that byte
+    // ("the frsig is ignored, so we set it to 0"), and no refusal signal is ever
+    // sent - the refused session learns it from its own `VT_ACTIVATE` return or a
+    // `VT_GETSTATE`. seatd names `SIGIO` there, so a kernel that stored it would be
+    // reading back a number that owes the caller nothing.
+    let with_fr = vt_mode_bytes(VT_PROCESS, 0, SIGUSR1, SIGUSR2, SIGIO);
+    lin::check_eq(
+        &mut failed,
+        b"VT_SETMODE with frsig named succeeds",
+        lin::ioctl(tty, iow(VT, NR_VT_SETMODE, 8), with_fr.as_ptr() as usize),
+        0,
+    );
+    let r = lin::ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as usize);
+    lin::check_eq(
+        &mut failed,
+        b"VT_GETMODE after the frsig call succeeds",
+        r,
+        0,
+    );
+    lin::check_true(
+        &mut failed,
+        b"frsig is ignored and reads back zero, the rest survives",
+        vm[4] == 0 && vm[0] == VT_PROCESS && vm[2] == SIGUSR1 && vm[3] == SIGUSR2,
+    );
+
     // The `EINVAL` set is `<linux/vt.h>`'s and each reason is its own: an
     // unknown mode, the same signal for giving the screen up and taking it.
     let junk = vt_mode_bytes(77, 0, SIGUSR1, SIGUSR2, 0);
@@ -210,7 +246,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"VT_OPENQRY succeeds", r, 0);
 
     // Taking the console that is already active is what `VT_ACTIVATE` means for
-    // a session opened on its own console, and waiting on it returns.
+    // a session opened on its own console. The call does not wait for anything:
+    // Linux's `VT_ACTIVATE` is `set_console()`, which records the request, wakes
+    // the console callback that sends any `relsig`, and returns 0 - the switch
+    // completes when the console on the screen answers `VT_RELDISP`, which is why
+    // a seat manager can stand on a `VT_PROCESS` console and ask for another one
+    // without blocking itself out of the answer.
     lin::check_eq(
         &mut failed,
         b"VT_ACTIVATE on the current console succeeds",
@@ -224,12 +265,41 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         0,
     );
     // A console number the machine does not have is refused, not swallowed:
-    // a seat manager reads a success here as "the screen is mine".
+    // a seat manager reads a success here as "the screen is mine". Linux answers
+    // `ENXIO` for exactly this argument, reserving `EINVAL` for a bad *mode*.
     lin::check_eq(
         &mut failed,
-        b"VT_ACTIVATE on a console that does not exist is EINVAL",
+        b"VT_ACTIVATE on a console that does not exist is ENXIO",
         lin::ioctl(tty, io(VT, NR_VT_ACTIVATE), 600),
-        EINVAL,
+        ENXIO,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"VT_ACTIVATE 0 is ENXIO",
+        lin::ioctl(tty, io(VT, NR_VT_ACTIVATE), 0),
+        ENXIO,
+    );
+    // VT_WAITUNTIL: `arg == 0` is Linux's "nothing to wait for" - a plain
+    // success without touching the screen - and a console the machine does
+    // not have is the same `ENXIO` `vt_waitactive` gives. The console that
+    // is already active ends the wait on the spot.
+    lin::check_eq(
+        &mut failed,
+        b"VT_WAITUNTIL 0 answers 0 at once",
+        lin::ioctl(tty, io(VT, NR_VT_WAITUNTIL), 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"VT_WAITUNTIL on a console that does not exist is ENXIO",
+        lin::ioctl(tty, io(VT, NR_VT_WAITUNTIL), 600),
+        ENXIO,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"VT_WAITUNTIL on the active console returns",
+        lin::ioctl(tty, io(VT, NR_VT_WAITUNTIL), first as usize),
+        0,
     );
 
     // KDSETMODE(KD_GRAPHICS) -> KDGETMODE reads it back. This pair is the

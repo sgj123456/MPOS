@@ -14,7 +14,13 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 
 **Core (Phases 1–3)**
 - [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
-- [x] P2 Signal delivery — frame · mask · siginfo (§2)
+- [~] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2)
+  - [x] a trapped signal ends a blocking terminal read with `EINTR` and one
+        nobody trapped and nobody cares about does not (`t-tty-eintr`); the
+        `VMIN`/`VTIME` pair decides what a read waits for at all
+        (`t-tty-vtime`) (§2.5)
+  - [ ] `SA_RESTART` is recorded, not acted on — the interrupted call always
+        comes back `EINTR` instead of being rewound and re-run (§2.5)
 - [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3)
   - [x] `flock` owned by the open file description, record locks by the process
         (`t-filelock`) · read/write deliberately *not* enforced: Linux advisory
@@ -53,6 +59,12 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         side exists to observe it) / `SO_LINGER{on,0}`'s egress reset / buffer
         sizes still record-only (§4.3.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
+- [~] 4.5 `AF_PACKET` — the link layer is a socket: `SOCK_DGRAM` `bind`/
+      `sendto`/`recvfrom`/`getsockname`, a tap at the NIC seam that feeds a client
+      before the IP layer has decided the frame is anybody's, and a userland DHCP
+      client *can* ask for an address now (`t-dhcp`). Named gaps: `SOCK_RAW`'s
+      header-included frames are `EOPNOTSUPP`, and the boot itself still ships no
+      client — the static default stays until `udhcpc` is wired (§4.5)
 
 **Memory (Phase 5)**
 - [x] anonymous **demand paging** — a `mmap` is an address space and a page
@@ -67,13 +79,31 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 
 **Process (Phase 6)**
 - [x] 6.1 ptrace (§6.1) · [x] 6.2 real rlimits incl. NOFILE/STACK (§6.2) · [x] 6.4 identity/cap calls (§6.4)
+- [x] teardown at **exit**, not at reap: an exited task gives back its address
+      space and every descriptor the moment it exits, which is Linux's own
+      moment for it (`do_exit` closes the files and tears the `mm` down before
+      the parent is told). It used to hold all of it until `wait(2)` collected
+      the corpse — so an unreaped pid held its frames (a killed compositor kept
+      every llvmpipe arena it had allocated) and, worse, held its descriptors:
+      the DRM master, a seat manager's connection, pipes, POSIX locks. That is
+      what kept a fresh compositor out of the seat after a `kill`, and what
+      could leave a pipeline reader waiting for an end-of-file that never came.
+      Only the slot and the exit code stay now, which is all a zombie is.
 - [ ] 6.3 Namespaces — `unshare`/`setns` return `EOPNOTSUPP` (no isolation) (§6.3)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (anon shared buffers, §7/Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
-- [ ] real-time signals 32..=64 (needs 64-bit pending masks throughout) (§2.3)
+- [~] real-time signals: `SIGRTMIN` (32) is queued, masked and waited for — the
+      number musl's `SIGEV_THREAD` helper needs, and the pending mask is 64-bit
+      now — but 33..=64 have no queueable number and 32..=64 still have no
+      disposition storage (`rt_sigaction` answers `EINVAL`) (§2.3, §Remaining)
+- [x] POSIX timers 222–226 — `vim`'s startup probe. The five calls are routed,
+      the expiry scan is the scheduler's tick, and the `SIGEV_THREAD_ID` +
+      `SIGRTMIN` shape musl builds for a callback timer works end to end; the
+      shapes were re-measured on Linux 6.x (a null `evp` is
+      `SIGEV_SIGNAL`/`SIGALRM`; CPU-time clocks are `EOPNOTSUPP`) (§Remaining)
 - [ ] `io_uring_setup`/`enter`/`register` — deferred by design (§1.3)
 
 **Drivers (Phase 7)**
@@ -88,6 +118,36 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
       on the render task, drives `change_resolution`. A text console with no
       compositor to commit keeps the size it booted at, exactly as Linux's fbcon
       does. No 3D/virgl, no sync objects, no format modifiers, no EDID (§7.1, §7.4)
+  - [ ] the compositor's **mouse cursor is not painted**, and the measurements
+        say it is not this kernel's doing. What was observed, in order: the
+        desktop-shell commits a 40×40 ARGB8888 cursor buffer to a grown `wl_shm`
+        pool and sends `wl_pointer.set_cursor(surface, 5, 5)` (client-side
+        `WAYLAND_DEBUG`, no protocol error); the pointer's motion reaches the
+        compositor and is forwarded to the client with the right coordinates;
+        the compositor repaints and its frames *do* reach the scanout (the panel
+        clock ticks in a screendump 75 s later); and the cursor is absent from
+        the scanout at every pointer position (screendumps at two positions are
+        byte-identical). Both sides of the plumbing were then probed directly:
+        the Xcursor file parses as 11 images of 16..96 px with sane hotspots,
+        the pool's `ftruncate`/`posix_fallocate`/`MAP_SHARED` remap keeps its
+        bytes, and a *grown* `memfd` is coherent across two processes (a child's
+        write at +8192 is read back by the parent through its own remapping, and
+        by `pread`). With the kernel ruled out at every reachable point, what is
+        left is libweston's cursor path — and the one cursor that shows is the
+        built-in fallback arrow (no `cursor-theme`), because it is small enough
+        to be in the very first frame; a themed cursor, loaded a few hundred
+        milliseconds later, never is. Recorded so the next reader starts from
+        the measurements rather than repeating them.
+  - [x] **which consoles the kernel has is a `console=` list**, and nothing about
+        how the machine was launched reaches it: `mpos.headless` /
+        `mpos.nomirror` / `mpos.mirror` / `mpos.compositor` are gone, the kernel
+        reads `console=ttyS0` (the wire) and `console=tty0` (the virtual console
+        on the framebuffer), gives the log to every console named and parks on the
+        last — so mirror is that list with the framebuffer last, gui is the
+        framebuffer alone, and terminal and weston are the same one-word list
+        (§7.1c). Two gaps are named there: `console=ttyN` pinning is refused
+        rather than approximated, and `/dev/console` has no preferred-console
+        plumbing.
 - [x] 7.2 Input — virtio-input evdev: capability ioctls (`EVIOCGBIT`/`EVIOCGABS`/
       …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents, and
       events that belong to the description that grabbed them (§7.2)
@@ -107,6 +167,11 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
 - [x] `wl_shm` buffers — `memfd_create` + frame-aliased shared mappings — Stage 3, `t-memfd-shm`
 - [x] Framebuffer present — `FBIOPAN_DISPLAY`/`FBIO_WAITFORVSYNC` + a pointer
       (virtio-tablet) + `--mode weston` (kernel frees the scanout) — Stage 4, `t-fbdev`
+  - [x] a pointer with real artwork — `weston.ini` names `cursor-theme=
+        breeze_cursors` and a `cursor-size`; `breeze-cursors` was already in the
+        image, but with no theme named weston drew only the fixed ~16px arrow
+        libwayland-cursor builds in, which is what made the cursor look tiny and
+        the theme "not applied" (a shell-config fix, not a kernel one)
 - [x] DRM/KMS surface — `/dev/dri/card0` (UAPI ioctl + struct ABI, dumb buffers,
       page-flip, vblank events) for DRM-backend compositors — Stage 5, `t-drm`
 - [x] **the screen has an owner** — `VT_SETMODE`'s `VT_PROCESS` negotiation
@@ -115,6 +180,85 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
       presentation request from a session that lost its console, and `POLLHUP` on
       the card fd; before this a `^A` to a text VT lost the screen back to
       weston on the next mouse move (§7.1, `t-seat`)
+  - [x] **and that owner is never invisible.** A master taken by a holder with no
+        controlling tty — seatd handing weston the card, or a launch chain that
+        skipped `TIOCSCTTY` — used to bind to *no console* at all, and an unbound
+        master could not be revoked: `master_ok` passed it, `painted()` said the
+        text console was free to draw, and the two raced on one scanout (the mouse
+        that repaints a text VT, the shell-and-compositor flicker). `SET_MASTER`
+        now binds to the console on the screen when the taker names none, so every
+        held master has a console to lose.
+  - [x] **and the negotiation tracks the screen.** `complete_switch` advances the
+        pure handover table's `active` alongside the `ACTIVE` atomic; left at its
+        boot value it asked console 1's `VT_PROCESS` promise on every switch after
+        the first, so a compositor's `relsig` went to the wrong session (or none).
+  - [x] **and the keyboard follows the screen, not the grab.** A keystroke reaches
+        the shell unless the active console is in `KD_GRAPHICS` — the compositor's
+        own `KDSETMODE` word that the screen is its to draw — so a compositor's
+        typing does not land on the shell behind it whether or not libinput has
+        taken `EVIOCGRAB` yet; a `--mode gui` text console (`KD_TEXT`) keeps its
+        keyboard (`input::service`)
+  - [x] **and the promise belongs to a process, not to a terminal.**
+        `relsig`/`acqsig` go to the process that wrote `VT_SETMODE` - Linux's
+        `vc->vt_pid`, delivered with `kill_pid` - and not to whichever group holds
+        the foreground when the signal goes out. Two rules come with it: the last
+        close of the descriptor that wrote a promise does *not* end it (seatd's
+        `vt_open` sets the mode and closes the tty before the compositor has the
+        screen, so clearing on close unmakes the claim in the same breath it is
+        made), and a promise whose keeper has died is ended at the delivery that
+        cannot land - Linux's `reset_vc`: `VT_AUTO`, no signals, `KD_TEXT`, the
+        switch proceeds. Before this, quitting weston with `^C` handed `SIGUSR2` to
+        the compositor or to the login shell - `ash` calling it "User defined
+        signal 2" while the desktop was dying mid-release - and the seat was left
+        occupied, so `./start-weston.sh` could not be run a second time. Measured
+        against `drivers/tty/vt/{vt.c,vt_ioctl.c}`; pinned by `vtmode`'s host tests
+        and by `t-seat` (§7.1)
+  - [x] **and `VT_ACTIVATE` does not wait**, because Linux's is `set_console()`:
+        the request is recorded, the console callback runs the negotiation, and the
+        ioctl returns 0. The sleeping form here was attributed to a `vt_release`
+        timeout that is not in the current console code at all - and it would have
+        deadlocked a seat manager once the promise was aimed where Linux aims it,
+        since the process asking for the switch is the keeper of the answer the
+        wait is for. `VT_WAITACTIVE` is the one console ioctl that sleeps, and
+        stays so; a console number the machine has not got is `ENXIO` (§7.1,
+        `t-seat`)
+  - [x] **a terminal question is answered by the emulator that owns the screen, and
+        by exactly one of them.** Measured on Linux: a pty pair's line discipline
+        forwards `ESC [ 6 n`, `5 n`, `c`, `? 6 n`, `OSC 11 ; ?` and `DCS 1 + q`
+        byte for byte to the master and answers none of them (6 of 6 runs). This
+        kernel answered everywhere - and so told a shell on a `--mode terminal`
+        boot where its cursor was according to a screen nobody drew. `fish`'s
+        prompt spacing pads the dangling line out to the *reported* column count
+        (measured: `stty cols 40` turned the pad from 80 cells to 40 while the
+        report still counted 80), so on any window wider than the guess nothing
+        wraps and the `CR` + `ESC [ K` that close the block erase the line
+        `echo -n hello` had just printed. `Attached` now decides per write from who
+        reads the master, and the cursor a report answers with is the cursor the
+        grid paints: both drive one `term::cursor::Cursor` - window size, scroll
+        region, deferred autowrap, scroll at the bottom, `DECSTBM`, save/restore,
+        `ESC D/E/M`, alternate screen, and the echo of what was typed, which the old
+        private model never saw. Pinned by the 37-stream report/grid parity test and
+        the answering-and-forwarding pair on the host, and by `t-tty-query` in the
+        guest (§7.1b). Three gaps named there: the answering half needs a boot with
+        a framebuffer to be pinnable at all; a serial line's real width is not
+        knowable from the guest, which is also Linux's answer; and one byte is still
+        counted as one cell, which is wrong for UTF-8 and needs a measurement first.
+  - [x] **a last-resort stack for `#DF`.** No IST slot existed anywhere and the TSS
+        carried `RSP0` alone, so a fault whose kernel stack could not take a frame -
+        overflowed off its bottom, or walked over by a wild write - promoted to
+        `#DF`, which could not push either, and the third fault reset the CPU into
+        QEMU's `-no-reboot` exit without the kernel writing one byte: a machine that
+        vanished with no panic was structurally unreportable. `#DF` now runs on its
+        own 32 KiB stack, so `fatal()` names the vector and the `rip` (remaining,
+        named: no NMI or machine-check handler is installed, so only `#DF` has the
+        last resort - §7.1)
+- [x] `start-weston.sh` survives being run twice — it asks whether a seatd is
+      *answering* rather than whether `/run/seatd.sock` exists (a socket path
+      outlives the daemon that bound it, here as on Linux), removes the stale name
+      before a new daemon tries to bind it, and starts seatd in its own session:
+      the script `exec`s into weston, so a seatd backgrounded there shared the
+      compositor's process group and `^C` on the console - which signals the whole
+      foreground group - used to kill the seat manager along with the desktop
 - [x] Mesa `GBM`+`EGL`+GLES — served through `/dev/dri/renderD128` and PRIME, in
       software (llvmpipe); it is how weston's DRM backend runs at all
 - [ ] 3D / virgl / venus (`DRM_VIRTGPU_*`) — deliberately out of scope, and the
@@ -311,8 +455,17 @@ it - so the entries say which they are:
 - [x] 8.1 ASLR — `ET_DYN` load bias, interpreter base, stack top and the `mmap`
       region are drawn per `exec`; a fixed-address image keeps its own address,
       because that is what a fixed address means (§8.1)
-- [~] 8.2 seccomp — `STRICT` done; `FILTER` *(blocked: BPF runner)*
 - [x] 8.3 user stack canary (`AT_RANDOM`) (§8.3)
+- [~] 8.2 seccomp — STRICT latches; FILTER installs, evaluates and gates a real
+      call, and every one of its eight actions was measured against Linux before
+      being written (four were wrong here: the kills are `SIGSYS` and not
+      `SIGKILL`, an unrecognised action kills like `KILL_PROCESS`, `TRACE` with
+      nobody attached fails the call with `ENOSYS`, and a caught `SIGSYS` leaves
+      the caller its own `rax`). The availability probe answers the truth about
+      which actions are implemented. `t-seccomp` pins each. Remaining, named:
+      **`PTRACE_EVENT_SECCOMP`** — the tracer stop with the option set; the
+      option is refused rather than half-served, so `TRACE` today means "allow"
+      (§8.2)
 
 **Performance (Phase 10)**
 - [x] 10.1 Network latency — event-driven waits + virtio-net MSI-X (`ping` 7.5→0.3 ms)
@@ -346,6 +499,30 @@ it - so the entries say which they are:
       module behind it is settled (§11)
 - [ ] 11.G a depgraph ratchet, so the measured cycle count cannot grow back (§11)
 
+**ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
+
+Calls that are *accepted* and answer success but do less than Linux — the §4 "silent success"
+class, absent from the board until now. Ordered §12.4. The green gate reached a summary
+(`=== SUMMARY pass=130 fail=2`); the two reds are the in-flight `t-dsp`/`t-dhcp`, not Phase 12.
+
+- [x] 12.0 restore the green baseline — `t-tty-vtime`'s `VMIN>0`/`VTIME` read hung because
+      `block_until_deadline` swallowed the clock-restart wake; fixed with an `input_count` the
+      partial-byte park wakes on (`tty.rs`, §12.4a). `t-tty-vtime`/`t-tty-eintr` now `=== PASS`.
+- [~] 12.A honest-refusal batch — `signalfd` `SFD_CLOEXEC` + unknown-flag `EINVAL` and `mmap`
+      flag validation (`MAP_FIXED_NOREPLACE`→`EEXIST`, `MAP_FIXED|NOREPLACE`→`EINVAL`,
+      `MAP_HUGETLB`→`ENOMEM`) **landed and gated** (`t-signalfd`, `t-mmap` carry the counterfactual
+      pins). `rseq`→`ENOSYS` was **reverted** — `t-rseq` pins the accept contract and rule 1 protects
+      it; keep the documented scope boundary (optional: write `cpu_id`=0 at registration). Still open:
+      `prctl` unknown → `EINVAL` (needs the known options backed by real state, not a blunt refuse,
+      plus a measured list of what `weston`/`apk`/busybox actually call); `kd_ioctl`/evdev
+      accept-refuse moved to the device (pairs with 11.B2, one device per commit) (§12.1)
+- [ ] 12.B contract-completion batch, gated on the full run: access mode enforced after `open`
+      (`O_RDONLY`+`write`→`EBADF`); IPv4 `MSG_PEEK`/`MSG_DONTWAIT` made consistent with the other
+      families; `get_robust_list`; `vhangup`; `set/getpriority` round-trip (correct the board);
+      `times`/`getrusage` CPU accounting as a named gap (§12.2)
+- [ ] 12.C stale rationale comments folded into the commits that change the behaviour they
+      describe (`mod.rs:624`, `fs.rs:1062`, the `getpriority` "Done" entry) (§12.3)
+
 ### Suggested next moves (highest impact, tractable)
 
 Landed since this list was written: `flock` is owned by the open file
@@ -355,6 +532,11 @@ per-descriptor with Linux's `EBUSY` and dies on close (`t-evdev`), ext4 updates
 so (AF_UNIX `SOCK_DGRAM` transfer, the serial TX ring), and evdev's read rule is
 finished: a reader that is not the grabber is told nothing while the grab is
 held, and two readers of one node each keep their own copy (§7.2, `t-evdev`).
+
+**A new item the `AF_PACKET` landing opened (§4.5)**: wire a DHCP client into
+the boot — `udhcpc -s` under OpenRC *and* an address path for the selftest
+initramfs — so the kernel's static default can retire from being the answer to
+being the fallback. `t-dhcp` already proves the mechanism the client will ride.
 
 **And the wake latency, which was the first item on this list, is fixed** - one
 tick on every blocking wait, because the boot task's `park()` halted the core
@@ -416,11 +598,15 @@ things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
    and the only one that changed the mm fault path for everything. Landed: a
    `mmap` is an address space, a page arrives on the fault that needs it, and
    `MADV_DONTNEED` gives it back again (`t-mmap-demand`).
-2. **`seccomp` FILTER's plumbing** (§8.2 - its runner has landed and is
-   host-tested; what is left is the per-task list, the two install paths and the
-   gate, which is a bounded piece of wiring rather than a feature), then
-   **namespaces** (§6.3) - a set of decisions (which namespaces, and what each
-   one must observably isolate) that should be made before code.
+2. **namespaces** (§6.3) - a set of decisions (which namespaces, and what each
+   one must observably isolate) that should be made before code. It is the last
+   item on the old list without a number beside it, and it stays first here:
+   `seccomp` FILTER's plumbing - the per-task list, the two install paths and
+   the gate - has landed, was then measured action by action against Linux
+   (four of its answers were wrong), and is pinned by `t-seccomp`. What is left
+   of §8.2 is one named piece, the `PTRACE_EVENT_SECCOMP` stop, and nothing
+   asks for it: `PTRACE_SETOPTIONS` refuses the option, so no tracer on this
+   machine can be waiting for a stop it will not get (§8.2).
 3. **§10.5's disk-backed instrument, then the frame pool** - the two remaining
    members of the performance family with a plan and no number. Both are
    measurable today, and each wants a before/after figure with the disk in
@@ -484,6 +670,59 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   mount monitors).
 - `keyctl` (250) — kernel keyring; needed by `keyutils`/some TLS/pam stacks.
 
+**POSIX timers (`timer_create` 222, `timer_settime` 223, `timer_gettime` 224,
+`timer_getoverrun` 225, `timer_delete` 226): implemented** (`t-timer-create`).
+The number that used to be blamed for a hang was `vim`'s: its `timers` feature
+asks for 222 while drawing, and the failure that followed the refusal is what
+§2.5's follow-up is about — the redraw path then dereferenced a null timeout
+flag and died. What the family answers, measured on a 6.x Linux at the
+raw-syscall level so nobody has to re-derive it:
+
+- `timer_create(CLOCK_REALTIME, NULL, &id)` succeeds and the expiry queues
+  **`SIGALRM`** — a null `evp` is `SIGEV_SIGNAL` with `sigev_signo = SIGALRM`
+  (measured by blocking `SIGALRM` and reading `rt_sigpending`), **not** the
+  `SIGEV_NONE` an earlier revision of this note claimed. The id handed back is
+  a small per-process integer, not a pointer, and a bogus id answers `EINVAL`
+  on all five calls — **not** the `EBADF` the man page claims.
+- The accepted clocks, measured: `REALTIME`(0), `MONOTONIC`(1),
+  `PROCESS_CPUTIME_ID`(2), `THREAD_CPUTIME_ID`(3), `BOOTTIME`(7) and `TAI`(11)
+  are accepted; `MONOTONIC_RAW`(4) and the two `*_COARSE` clocks answer
+  **`EOPNOTSUPP`**; the two `*_ALARM` clocks answer `EPERM` (they need
+  `CAP_WAKE_ALARM`); a number no clock has is `EINVAL`. This kernel accepts
+  `REALTIME`/`MONOTONIC`/`BOOTTIME`/`TAI` — one tick clock under four names —
+  and refuses the CPU-time clocks with `EOPNOTSUPP`, because it keeps no
+  per-task CPU accounting: a timer accepted and never fired would be worse than
+  one that says so.
+- `sigev_notify` outside `{NONE, SIGNAL, THREAD_ID}` is `EINVAL` (including
+  `SIGEV_THREAD`(2), which is a libc value that never reaches the kernel). A
+  signal number runs `1..=64` on Linux; this kernel stops at `SIGRTMIN` (32),
+  and refuses the range above it — the real-time gap below — rather than
+  accepting a number with no disposition storage behind it.
+- `TIMER_ABSTIME` is `EINVAL` here, the same refusal `clock_nanosleep` makes:
+  one clock, no absolute domain (§2 records that choice).
+- `SIGEV_THREAD_ID` aims the expiry at one thread of the caller's group (a tid
+  outside it is `EINVAL`, as on Linux); `timer_getoverrun` on a fresh timer
+  answers 0.
+- **The shape musl actually builds works end to end.** `timer_create(...,
+  SIGEV_THREAD)` is a helper thread blocked in a wait plus a `SIGEV_THREAD_ID`
+  timer carrying `SIGRTMIN`; this kernel queues the expiry with `SI_TIMER`
+  siginfo and the caller's `sigval`, and `rt_sigtimedwait` hands the record
+  back with `si_code` intact — the one field musl checks before calling the
+  callback. That needed three things beyond the timer table: `SIGRTMIN` as a
+  queueable number, a 64-bit pending mask (the "64-bit pending masks
+  throughout" this file asked for), and the signal **mask inherited across
+  `clone`/`fork`** — musl blocks `SIGRTMIN` before creating the helper and the
+  helper is what waits on it.
+- Divergences: a timer belongs to the *task* that created it, not to its thread
+  group; ids are the lowest free slot (Linux never reuses an id); the expiry
+  runs on the scheduler's tick, so a deadline is tick-quantised and a 50 ms arm
+  reads back as 52 ms — rounded up, never early.
+
+The prerequisite named here was right: "a per-task list of armed clocks the
+scheduler's tick scan can run down" is `sched::Table::check_posix_timers`,
+behind its own armed flag, so a machine that never calls `timer_create` never
+scans for one.
+
 **Other missing (lower priority):**
 - `userfaultfd` (323) — lazy-copy / CRIU-style migration; niche.
 - `tid_add_object` / `tgid_add_object` (rseq side-objects) — rare.
@@ -521,6 +760,22 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   needs a reverse map of mappings this kernel does not keep.
 - **6.3** namespaces: `unshare`/`setns` validate but return `EOPNOTSUPP`; no
   real mount/pid/net namespace isolation.
+- **Terminal size, and the "only the first few dozen lines" report.** A
+  full-screen program lays itself out in the window `TIOCGWINSZ` names, so the
+  answer is the display, not a default. Measured on Linux: a *fresh* pty pair
+  nobody has sized answers **0 rows and 0 columns** (success, zeroed struct),
+  `TIOCSWINSZ` on either end is visible on both because the window belongs to the
+  pair, a resize of a pty whose slave is blocked in `read` runs its
+  `SIGWINCH` through to that read as `EINTR`, and `TIOCGWINSZ` on a regular file
+  is `ENOTTY`. This kernel answers 25x80 for an unsized pair instead of 0x0 —
+  closer to what a program can survive, and a deliberate divergence — and a
+  virtual console answers the screen it paints on (§7.1's resize rule), whose
+  grid is clamped at `MAX_ROWS = 64` while a 1024x768 console is 128x48. The
+  clamp is what a "the file is longer than the screen" complaint lands on: it has
+  to be re-measured on the current tree, because the seat/resize work in flight
+  changed exactly this path, and `vi` on a large file was reported as showing a
+  few dozen lines *and* freezing — the freezing half is now §2.5, and the layout
+  half needs a boot to confirm.
 - **4.1** AF_UNIX is answered for `SOCK_STREAM` (see Phase 4), including
   `SCM_RIGHTS` descriptor handover and `SCM_CREDENTIALS`/`SO_PEERCRED` peer
   authentication — a real dbus broker can now both connect its clients and
@@ -644,6 +899,104 @@ by `rt_sigpending`, and delivered on unblock (2.2); and that a `sigqueue`
 payload arrives as `SI_QUEUE` with its `si_value` intact (2.3). The host
 side pins the `si_code` values and the siginfo table.
 
+The two waits a signal has to reach are pinned by
+`user/abitest/src/bin/syscall/t-tty-eintr.rs` (a trapped `SIGALRM` ends a
+blocked terminal read with `EINTR`, the handler having run first, and the
+retried read still gets the line typed while it was not reading; the same
+timer with `SIG_IGN` does *not* interrupt it) and
+`t-tty-vtime.rs` (the `VMIN`/`VTIME` table, timing included).
+
+### 2.5 Interruptible waits, and `VMIN`/`VTIME` — implemented
+
+A blocking read of a terminal is the wait almost every interactive program
+sits in, so its two rules are the two most expensive ones to get wrong.
+
+**It ends on a signal the caller will actually run a handler for.** Measured
+on Linux, per signal, with `strace`: `SIGALRM`, `SIGWINCH` and `SIGCHLD` each
+give `read(...) = ? ERESTARTSYS`, then the handler, then
+`rt_sigreturn({mask=[]}) = -1 EINTR` — the interrupting is universal, not
+per-signal. And measured in the other direction: a signal whose *default
+action* is to be ignored, still at `SIG_DFL`, does not interrupt anything —
+a `SIGCHLD` from an exiting child, a `SIGWINCH` nobody trapped, a `SIGURG`, a
+`SIGCONT` each left the read blocked for its full watchdog. So
+`table_has_deliverable` skips `SIG_IGN` **and** `SIG_DFL`-with-an-ignore
+default; without that second half a shell's own read of its terminal would
+come back `EINTR` after every job it runs.
+
+The kernel's own answer is `-EINTR` with nothing consumed, which is what
+`VfsError::Interrupted` (→ `err_of` → `EINTR`) carries from the node up to the
+dispatch, and `CharDevice::read` returns a `VfsResult` for the same reason: a
+0 on the read side means end of input, and a program told its terminal closed
+stops reading instead of retrying after its handler ran. `block_until` stays
+what it always was — fatal signals only — for the waits that are the
+scheduler's or the boot task's own; the interruptible ones go through
+`block_until_deadline`, which is also where a `VTIME` clock is read.
+
+**`VMIN`/`VTIME` is an inter-byte clock, not a deadline on the read.** The man
+page is ambiguous about what `VTIME` times; the table below is what a pty
+answer was, on Linux, for the cases a text editor branches on (all reproduced
+by `LineDiscipline::read_wait`'s host tests):
+
+| mode | `VMIN`/`VTIME` | queued | Linux answered |
+|---|---|---|---|
+| raw | `0`/`0` | nothing | 0 bytes, 0 ms |
+| raw | `0`/`0` | 3 bytes land at 100 ms | 0 bytes at 0 ms — the poll does not wait for them |
+| raw | `1`/`0` | nothing | blocked (watchdog `EINTR` at 2 s) |
+| raw | `1`/`0` | 1 byte at 100 ms | 1 byte at 100 ms |
+| raw | `0`/`5` | nothing | 0 bytes at 503 ms |
+| raw | `0`/`5` | 3 bytes at 100 ms | 3 bytes at 100 ms |
+| raw | `0`/`2` | 1 byte at 100 ms | 1 byte at 100 ms, not at 300 |
+| raw | `2`/`5` | 1 byte at 100 ms | 1 byte at 604 ms — `VTIME` after the **byte** |
+| raw | `2`/`5` | bytes at 100 ms and 300 ms | 2 bytes at 304 ms |
+| raw | `2`/`5` | bytes at 100 ms and 900 ms | first read 1 byte at 608 ms; second read 1 byte at 1300 ms |
+| raw | `3`/`5` | 5 bytes at 100 ms | 5 bytes at 100 ms — `VMIN` is a floor |
+| raw | `3`/`5` | 2 bytes at 100 ms | 2 bytes at 604 ms |
+| raw | `5`/`0` | 2 bytes at 100 ms | blocked at 2 s with the 2 bytes still queued |
+| canonical | `1`/`5` | "abc", no newline | blocked at 4 s |
+| canonical | `1`/`5` | "abc" at 0, newline at 1200 ms | 4 bytes at 1200 ms |
+| canonical | `0`/`5` | nothing, then `^D` | 0 bytes at the instant of the `^D`; the next read blocks again |
+| raw + `O_NONBLOCK` | `0`/`5` | nothing | `-1/EAGAIN` at 0 ms — `O_NONBLOCK` outranks the clock |
+
+Three consequences the previous code got wrong, all of them the same freeze:
+
+- readiness was `out.len() >= VMIN.max(1)`, with the comment that `VMIN == 0`
+  would "make every read return nothing at all, which reads as end-of-file".
+  `VMIN == 0` is not an EOF: it is the poll, and the answer is 0 bytes without
+  waiting. busybox `vi` and `vim` set `VMIN=0/VTIME=1` to tell a lone `ESC`
+  from the start of an escape sequence, so pressing escape wedged them with the
+  terminal still open.
+- `VTIME` was read by nothing anywhere in the kernel, so no read could ever
+  answer a timeout.
+- the wait was `block_until`, which wakes for a signal and then goes back to
+  sleep. `vim`'s timeouts are `SIGALRM`, and a resize is `SIGWINCH`; both
+  arrived, were seen, and were thrown away.
+
+Named gaps this leaves, each with the reason it is not here yet:
+
+- **`SA_RESTART`.** Recorded in the disposition, never acted on: an interrupted
+  call always comes back `EINTR`. The rewind Linux really does — measured as
+  `rt_sigreturn({mask[]} = 0` followed by a second `read` with the caller's
+  original arguments — needs the per-syscall restartable set decided first
+  (`poll`/`ppoll`/`select` are deliberately *not* restarted here, and rewinding
+  them would be a handler loop that never returns), and a frame flag to carry
+  the verdict: `build_frame` would store `sc::RIP = regs.rcx - 2` and
+  `sc::RAX = nr` for a restartable call, and `rt_sigreturn` needs no change
+  because the frame *is* the record. What that costs a caller today: a program
+  that sets `SA_RESTART` and does not check `EINTR` treats its own wake-up as
+  an I/O error.
+- **`O_NONBLOCK` on a terminal.** Measured above: `-1/EAGAIN`, and `VTIME` is
+  not consulted. Plumbing it to `Inode::read_at_client` is the work; the pipe
+  shape is already pinned by `t-fionbio.rs`.
+- **The other bare `block_until` waits.** `pipe.rs` (read and write),
+  `eventfd.rs`, `signalfd.rs`, `inotify.rs`, `unix.rs` and the pty master's
+  write backpressure all sleep through a catchable signal today, exactly as the
+  tty did; `VfsError::Interrupted` makes each of them a one-line change with a
+  test beside it, which is why they are listed rather than half-done.
+- **Canonical mode ignores both** — `VMIN` included. That is POSIX's wording
+  ("non-canonical") and the measured 4-second block above, so nothing is
+  missing here; it is recorded because the pair *looks* like it applies.
+
+
 ---
 
 ## Phase 3: Filesystem Enhancements (Medium Priority)
@@ -726,6 +1079,16 @@ through the same `Inode::set_times` path.
 - Directory **search** (`may_search`, `X_OK` on each path component) is enforced during resolution (`mount.rs`, `open`), not just on the final node.
 - The sticky bit gates name removal; `access`/`faccessat` use real ids unless `AT_EACCESS`; `setuid`/`setgid` execution and `chmod`'s clearing of those bits by a non-owner follow Linux.
 - A filesystem that keeps no modes (`keeps_modes() == false`) is not policed, so invented permissions never refuse.
+- **devfs nodes keep modes and owners now.** Before this a `chmod` on any device
+  node answered success and stored nothing — udev's `MODE=`/`GROUP=` rules were
+  logs, and `stat` showed a number no check ever read. Every `/dev` inode class
+  (the generic stream node, the ttys, the DRM card and its leases, evdev,
+  `uinput`, `fb0`, `ptmx`) carries a `devfs::NodePerms` and answers
+  `keeps_modes() == true`, so the triads below decide what the device really
+  means. Devices are born `0666 root:root` — the number `stat` already gave them —
+  where Linux's devtmpfs births `0600` and lets udev widen it; that difference is
+  the named remainder, and it needs per-class birth modes and group-name
+  resolution, not another mechanism.
 - Host-tested: `a_triad_decides_who_may_do_what` (incl. supplementary groups), `root_passes_everything_but_execute_on_a_file_nobody_made_runnable`, `may_as_answers_for_the_node_and_the_identity_it_is_given`.
 
 ### 3.5 /proc Enhancements — **DONE**
@@ -1092,6 +1455,50 @@ message.
 
 ---
 
+### 4.5 `AF_PACKET` — the link layer as a socket — **PARTIAL**, two gaps named
+
+The kernel had been the last word on the machine's address with no door for
+userland to overrule it: `10.0.2.15` was a boot-time constant and `EAFNOSUPPORT`
+was the answer to every client that wanted to negotiate one. `src/net/packet.rs`
+opens that door in the shape Linux spells: `socket(AF_PACKET, SOCK_DGRAM,
+htons(proto))`, a tap hung on the NIC seam (`NicDevice::receive` hands every
+frame to the sockets *before* the stack decides whose business it is — which is
+the point: a BOOTP reply for an addressless machine is nobody's business in the
+IP sense), `sendto` with a `sockaddr_ll` whose Ethernet header this kernel
+builds from the device's own MAC, per-socket bounded rings with the oldest-frame
+drop, and `bind`/`getsockname`/`recvfrom` answering through the same
+`sockaddr_ll` (`linux/if_packet.h`'s real offsets: 20 bytes, address at 12).
+`SOL_PACKET` membership requests succeed because the tap already sees every
+frame of the socket's type; every other level is `ENOPROTOOPT`, Linux's own
+answer.
+
+The named gaps, each with what it waits on:
+
+* `SOCK_RAW` — frames *with* their header on both sides. It is `EOPNOTSUPP`
+  because a caller that writes its own header writes a source MAC this kernel
+  cannot vouch for; the honest shape needs the header passed through untouched
+  and the length checked, not invented.
+* The boot still has no client. The *mechanism* is what `t-dhcp` pins — a
+  hand-built DHCPDISCOVER to the broadcast and slirp's BOOTREPLY read back with
+  its transaction id — but wiring `busybox udhcpc -s` into OpenRC (and giving
+  the selftest initramfs one too, or its network tests ride the static default)
+  is the remaining move before the static bring-up can be retired. Until it
+  happens the static 10.0.2.15 is a boot *default* over a live interface, not
+  a decision the kernel reserves: `RTM_NEWADDR` and now `AF_PACKET` both
+  overrule it.
+* The parsers over `sockaddr_ll` and the Ethernet frame have no host-side pin.
+  `AGENTS.md` §4 asks every new parser for a fuzz target, and `net/packet.rs`
+  has none — not from oversight but from the §6 trap that gates the whole `net`
+  module on `target_os = "none"` (`src/lib.rs:48`), so neither a host unit test
+  nor a `fuzz/` target can even reach it, and `net/socket.rs`'s annotated test
+  module stands as the standing proof of that (V-11). The only pin today is
+  `t-dhcp` on the machine. The gap closes when the wire-format halves —
+  `sockaddr_ll` decode, header parse, ring accounting — move to an ungated pure
+  module the way `evdev` and `uinput` already do, and gain a fuzz target there.
+  Until then this line is the recorded reason, not a silent exemption.
+
+---
+
 ## Phase 5: Memory Management Enhancements (Medium Priority)
 
 ### 5.1 Shared Anonymous mmap — **DONE**
@@ -1388,7 +1795,8 @@ which is how a full-screen program came to draw into the top-left corner of the
 screen - `vim` laid out 80 of 128 columns and 25 of 48 rows and left the rest
 blank, which is the bug that reported it. `/dev/tty0` and `/dev/console` name
 the console *currently shown*, so they answer the same way; both fall back to
-80x25 when no screen exists, which is also every headless boot.
+80x25 when there is no screen at all - a machine with no display, which is not the
+same thing as a boot that merely keeps its log on the serial wire (§7.1c).
 
 **The other half of that pair is `TIOCSWINSZ`**, and it is the one that matters
 where the kernel *cannot* know the size: a terminal emulator in userspace - one
@@ -1436,24 +1844,57 @@ a kernel that decoded the size from the group rather than the request would read
 zero bytes of a caller that wrote eight, and `t-seat` now writes the `_IOW` form
 for exactly that reason.
 
-The mechanism is in `src/vfs/vcmux.rs`. `^A <digit>` and `VT_ACTIVATE` share one
-decision (`vtmode::Table::request_switch`) and differ in who sleeps: the
-keystroke arrives from the serial interrupt handler and cannot park, so it starts
-the negotiation and the mux task's deadline finishes it, while a session's
-`VT_ACTIVATE` goes through `wait_activate` and sleeps on the answer the way
-Linux's `vt_release` does. Neither can therefore disagree about whether a console
-has to be consulted. Leaving
-a `VT_PROCESS` console sends its foreground group `relsig` - `SIGUSR1`/`SIGUSR2`,
-now named in `src/sched/signal.rs`, both fatal by default, which is the correct
-outcome for a session that asked to be consulted and installed no handler - and
-*the screen does not move* until that console answers `VT_RELDISP`. Two things
-bound the wait, because a wedged compositor must not own the machine: the
-requesting task sleeps to Linux's own deadline - `60 * HZ`, 15000 ticks here, the
-`vt_release` timeout - and a `^A` to the console already being asked forces the
-switch through on the spot. The timer is the backstop; the keystroke is the
-escape hatch, and it is the kernel-side one, which is what `CtrlAltFx` is on a
-real console - not something a *session* is offered, so a session's
-`VT_ACTIVATE` can be refused and will be told so, with `EBUSY`.
+The mechanism is in `src/vfs/vcmux.rs`, and both halves of it were then measured
+against `drivers/tty/vt/vt.c` and `drivers/tty/vt/vt_ioctl.c`, which moved them.
+
+`^A <digit>` and `VT_ACTIVATE` share one decision
+(`vtmode::Table::request_switch`) and **neither one waits**. Linux's `VT_ACTIVATE`
+is `set_console()`: record `want_console`, schedule the console callback - which
+is `change_console()`, and that is where the releasing console's `relsig` goes out -
+and return 0. There is no `vt_release` sleep anywhere in the current console code,
+and a waiting `VT_ACTIVATE` is not merely un-Linux-like, it deadlocks a seat
+manager: `vt_switch` writes `VT_SETMODE(VT_PROCESS)` on the console it is standing
+on and then asks for a different one, so the promise that owes the answer is the
+asker's own, and the asker is parked inside the call its answer would unblock.
+`VT_WAITACTIVE` is the one console ioctl that sleeps - `vt_event_waitqueue`,
+interruptible, no timeout - and it still does.
+
+Leaving a `VT_PROCESS` console sends its `relsig` - `SIGUSR1`/`SIGUSR2`, named in
+`src/sched/signal.rs`, both fatal by default - **to the process that wrote
+`VT_SETMODE`, and to nobody else**. That is Linux's `vc->vt_pid`: `vt_setmode`
+stores `get_pid(task_pid(current))`, and `vt_acquire`/`change_console` deliver with
+`kill_pid(vc->vt_pid, …)`. Aiming those two signals at the console's *foreground
+group* was this kernel's earlier shape, and it is why
+`cargo xtask run --mode weston` could not be run twice: seatd's `vt_open` is
+`open /dev/ttyN`, `VT_SETMODE`, `KDSKBMODE`, `KDSETMODE`, `close(ttyfd)` - so the
+group in the foreground when a handover signal went out was weston's (which is
+what `ash` reporting `User defined signal 2`, i.e. `strsignal(12)`, was saying when
+the desktop was being quit with `^C`) or the login shell's, and neither has a
+`SIGUSR2` handler for a promise it never made. Two rules come out of the same
+measurement and both are pinned in `vtmode`'s host tests: a promise is **not**
+ended by the last close of the descriptor that wrote it - that close is the normal
+case, and clearing there would unmake the claim in the breath it was made - and a
+promise whose keeper has died ends where Linux ends it, at the delivery that cannot
+land, running Linux's `reset_vc` (`VT_AUTO`, no signals named, and the console back
+to `KD_TEXT` so the text that replaces it is actually visible) instead of waiting
+on a ghost.
+
+The deadline that bounds a *wedged* keeper - 15000 ticks, `RELEASE_TIMEOUT_TICKS` -
+is this kernel's own, not Linux's: with no timeout and no answer, Linux's pending
+switch simply sits until the session speaks or the box is rebooted. Keeping a bound,
+plus the operator's second `^A` forcing the switch through, is what stops one stuck
+compositor owning the machine. `frsig` is dropped on the way in, as Linux drops it
+("the frsig is ignored, so we set it to 0"), so a refusal is heard only as the
+requester's own `VT_ACTIVATE` return or a `VT_GETSTATE`; and a console number the
+machine does not have is `ENXIO`, not `EINVAL`.
+
+What that still leaves as named gaps: Linux holds a refcounted `struct pid`, so a
+promise can never be inherited by an unrelated process later given the same
+number, while this kernel stores the reusable task slot - closing that wants a
+per-task generation count; `VT_SETMODE` here refuses `relsig == acqsig` and a
+signal number outside 1..=31, both of which Linux accepts without looking; and the
+only vector with an IST stack is `#DF` (see §11.1's last-resort entry), with no
+NMI or machine-check handler installed at all.
 
 The master is now a claim rather than a formality. It belongs to the *open file
 description* (`File::ofd`), because that is the only identity that survives the
@@ -1503,7 +1944,8 @@ approximation of it:
   rule has something to be a rule *about*. It used to be the console tty
   registered a second time, which made it `(4, 64)` and left the `(4, 0)` arm of
   `Tty::vc_number` unreachable.
-* `VT_SETMODE`, `VT_RELDISP`, `VT_ACTIVATE`, `VT_WAITACTIVE` and `VT_OPENQRY` ask
+* `VT_SETMODE`, `VT_RELDISP`, `VT_ACTIVATE`, `VT_WAITACTIVE`, `VT_WAITUNTIL`
+  and `VT_OPENQRY` ask
   who is calling: the terminal's own foreground job, or superuser. Without that,
   any process holding a `/dev/tty` fd could answer a compositor's `relsig` for
   it, or write its mode. `KDSETMODE` keeps Linux's second door as well - the
@@ -1544,6 +1986,244 @@ that boundary with a 40 ms budget. It is called a landing everywhere in the code
 because there is no display controller here to be in blank; `WAIT_VBLANK` and its
 sequence requests are still `ENOTTY` rather than an answer that would be a
 clock this kernel does not have.
+
+### 7.1b What the console answers, and what it deliberately does not
+
+A terminal question (`ESC [ 6 n`, `ESC [ 5 n`, `ESC [ c`, an `OSC 10/11 ; ?`, a
+`DCS 1 + q`) is answered by exactly one thing: the emulator that owns the screen
+those bytes are drawn on. Which one that is, is a per-terminal question, and this
+kernel used to answer it wrong in the one direction that is invisible until a
+program is damaged by it.
+
+The measurement that settled it, on Linux against a pty pair - slave in raw mode,
+`ECHO` off, `VMIN=0/VTIME=1`, each of six sequences written to the slave and both
+ends read: `ESC [ 6 n`, `ESC [ ? 6 n`, `ESC [ 5 n`, `ESC [ c`, `OSC 11 ; ? BEL`
+and `DCS 1 + q … ST` each arrived at the master **byte for byte**, and **none** of
+them was answered (6 of 6 runs, no queue at the slave within `VTIME`). A pty is a
+wire; the emulator holding the master has the cursor, the window and the
+capabilities. `drivers/tty/vt/vt.c` answers the same questions for a VT because
+there the kernel *is* the emulator.
+
+What this kernel did instead was answer everywhere, and `fish` showed the cost.
+Measured on the guest (`--mode terminal`, `fish 4.8.1`, `TERM=linux`, root's shell
+on the serial console): the shell's own reader log says
+`Writing terminal command QueryCursorPosition` then `Received cursor position
+report y: 24 x: 0` - the question was answered here, and never reached the wire,
+because answering also swallows it. And `stty size` reported `25 80` while
+`fish`'s prompt-spacing block padded the dangling line out to exactly the
+*reported* column count: `stty cols 40` changed the block from 80 filler cells to
+40, while the cursor report kept counting against 80. On a window wider than the
+number the kernel guessed, the filler never reaches the margin, no wrap happens,
+and the `CR` + `ESC [ K` that close the block erase the line the command printed -
+which is why `echo -n hello` disappeared under the next prompt here and did not on
+a real terminal, whose emulator knows its own width and answers truthfully.
+
+So the rule is now `src/vfs/tty.rs`'s `Attached`, decided per write by
+`Tty::kernel_draws`, and it is not "is this a virtual console" - all six consoles
+are pty pairs too, and what distinguishes them is who reads the master:
+
+| the bytes land on | who answers a question |
+|---|---|
+| a grid the kernel has made (`term::has_screen`, i.e. a framebuffer boot) | the kernel, and the question is kept off the wire |
+| the serial wire alone, no grid (`--mode terminal`) | the person's terminal, reached by the forwarded question |
+| a `/dev/pts` master a process holds | that process's emulator |
+| `Discard` - a terminal with nothing behind it | the kernel, because silence there is a hang |
+
+The second half of the same fix: the cursor a report answers with is now the
+cursor the screen is drawn with. Both the discipline and `term::Grid` drive one
+`src/vfs/term/cursor.rs` - the window size, the scroll region, deferred autowrap,
+line feed at the region's bottom, `DECSTBM`, save/restore (`ESC 7/8`, `CSI s/u`),
+`ESC D/E/M`, the alternate screen - and
+`vfs::tty::tests::the_report_and_the_screen_never_disagree_about_the_cursor`
+feeds 37 streams through both and asserts one pair of numbers out of each. The
+discipline's own `Screen` is gone: it was a 25x80 guess, pinned at row 24 forever
+because it clamped instead of scrolling, blind to `TIOCSWINSZ`, and it did not see
+the echo of what was typed at it (echo now goes through the same tracking).
+
+What is answered is now exactly what `drivers/tty/vt/vt.c` answers, and the rest
+is a gap named here rather than approximated:
+
+* `csi_ECMA`'s `case 'c'`: `if (!vc->vc_par[0]) respond_ID(tty);`, and
+  `respond_ID`'s entire answer is the VT102 id `"\033[?6c"`. So `ESC [ c` and
+  `ESC [ 0 c` are answered, and nothing else in that family is.
+* `csi_DEC`'s `case 'c'` is **not a question at all**: `CSI ? Ps c` is the console's
+  *cursor-type set* (`vc_cursor_type = CUR_SIZE(par…)`). This is what the bug that
+  found this section was made of: the `linux` terminfo the editors here read
+  builds its cursor capabilities out of sets - `civis=\E[?25l\E[?1c`,
+  `cnorm=\E[?25h\E[?0c`, `cvvis=\E[?25h\E[?8c` - and vim writes `civis` on every
+  command line it paints and again as it leaves. Answering a set queues a reply no
+  one asked and no one reads; it waits in the input queue as typed text for
+  whoever reads next, so quitting vim left `9c9c` on the prompt and busybox tried
+  to run it (`-sh: 9c9c: not found`). Measured with `strace` on the guest: two
+  `write(1, "…\033[?1c…")` with no `read(0, …)` after them, and two answers of
+  `\033[?62;1;2;6;7;8;9c` queued.
+* `csi_ECMA`/`csi_DEC` both handle `case 'n'` with the same 5/6 test, so
+  `ESC [ ? 6 n` is the same question as `ESC [ 6 n`. It was not treated as one:
+  the swallow was measured off the raw parameter *bytes* (`params.first()` is
+  `?`) while the answer was measured off the parsed ones, so the private form left
+  unanswered - a caller waiting on a reply the console does send. `first_query_param`
+  is now the one parse both halves read.
+* `EPgt`/`EPeq`/`EPlt` sequences - which is `CSI > c`, the secondary Device
+  Attributes request - reach neither handler, so the console does not answer them
+  and neither does this one. It travels to the wire instead of being answered with
+  an identity invented here.
+
+Two gaps with names, not stubs: the cursor type a `CSI ? Ps c` asks for is not
+drawn (there is no `vc_cursor_type` behind this console's cursor, which has one
+state - `Grid::cursor_visible`), and a `--mode terminal` boot with a real terminal
+on the far end therefore does not get the blinking or shape that sequence asks
+for. Pinned on the host by `a_cursor_type_set_is_forwarded_and_never_answered`,
+`a_device_attributes_query_is_answered_and_not_forwarded`,
+`a_secondary_device_attributes_query_is_forwarded_not_answered`,
+`a_query_to_a_terminal_the_kernel_does_not_draw_travels_unanswered` and
+`a_query_to_a_screen_the_kernel_draws_is_answered_and_kept_off_the_wire`, and in
+the guest by `t-tty-query`, which drives one end of a pty pair as the program and
+reads the other as the emulator - so "answered and not forwarded" and "not
+answered, and therefore forwarded" are two different observable queues rather than
+a reading of the same one. Quitting vim on the built image, which is how this was
+reported, now leaves the prompt empty; it used to leave `9c9c` and
+`-sh: 9c9c: not found`.
+
+Three more, each with the prerequisite it is waiting for:
+
+* **The answering half cannot be pinned by a booted test.** `cargo xtask test`
+  boots with no display, so no grid exists, so every question a booted program
+  asks of a `/dev/pts` or a console pair is forwarded - which is the right answer
+  for that boot and pins nothing about the case where the kernel draws the screen.
+  `t-tty-query` covers the forwarding half end to end; the answering half rests on
+  the host tests above until the gate grows a framebuffer boot.
+* **A serial console's width is not knowable from the guest**, and Linux has no
+  better answer for a `ttyS0` either: `stty cols 120` is the fix a person types,
+  and a forwarding boot no longer needs it, because the terminal at the other end
+  reports its own geometry now. What *was* wrong - guessing `80` and then also
+  answering the question so that nothing could correct it - is fixed. A terminal
+  that wants to say its size (`IAC SB WILLSYNCD?`-style negotiation, or `ESC [ 2048 ) 0`)
+  is not implemented and is not pretended to be.
+* **Cell counting for a non-ASCII glyph is unmeasured, so it is unfixed.** Both
+  models count one byte as one cell, which is what `Grid` has always drawn and what
+  the cursor inherits from it - consistent, and wrong for a UTF-8 terminal in
+  exactly the way a `⏎` (3 bytes, 1 cell) shows up. Aligning it needs a
+  measurement of wide/narrow cell advance on a real Linux console first; that, not
+  a per-byte guess, is the number to copy. Same for `CSI S`/`T`, `L`/`M`, `@`/`*`,
+  `P`/`X`, `DECSTR`, `DECCOLM` and origin mode (`DECOM`), which neither model
+  implements: a sequence nobody acts on moves nobody's cursor, so the report and
+  the screen still agree, and each stays a gap rather than a half-implementation.
+
+* **The kernel's line editor is gone; `n_tty`'s is what remains.** The canonical
+  mode used to keep a 64-line history for the up arrow, walk it with the arrow
+  and `^P`/`^N`, offer `^A`/`^B`/`^E`/`^F`/`^K`/`^L`/`^T`, and recognise an
+  `ESC [ A` as one key rather than as characters — all of it a *line editor's*
+  job on Linux, where `n_tty` claims exactly ERASE/KILL/WERASE/REPRINT/LNEXT and
+  types every other byte into the line, arrows' `ESC [ A` included. The shells
+  and editors on this image (fish, vi) run the terminal raw and bring their own
+  editing, so the kernel's editor served nobody and disagreed with `read(2)`
+  about what a canonical line contains. Canonical mode now: unclaimed control
+  bytes are characters (echoed as their `ECHOCTL` `^X` form, and `ESC [ A`
+  reaches a canonical reader inside its line), kill/werase erase from the end
+  with `\b \b`, and `^R` reprints the line without replaying a prompt the
+  discipline never owned. Pinned in the host tests
+  (`a_typed_escape_sequence_reaches_the_reader_with_the_line`,
+  `unclaimed_control_bytes_are_typed_into_the_line`,
+  `vreprint_redraws_the_pending_line`) and in the guest by
+  `t-tty-query`'s cooked half.
+
+---
+
+### 7.1c Which consoles the kernel has — **DONE**, two gaps named
+
+**The kernel used to be told how it was launched, which is not a fact about a
+machine.** `cargo xtask run --mode terminal|gui|mirror|weston` picked one of four
+words — `mpos.headless`, `mpos.nomirror`, `mpos.mirror`, `mpos.compositor` — and
+the kernel re-derived its whole console policy from it: whether the framebuffer
+console was *the* console, whether the serial wire also got the bytes, and whether
+the GPU was engaged at all. The first three are one question in three costumes.
+The fourth — "is there a window?" — is a fact about the *host*, and the machine
+cannot discover it either: a QEMU booted with `-display none` still has a
+virtio-gpu and still answers `GET_DISPLAY_INFO` with a mode (that is the note the
+headless flag used to carry to justify itself). So the old shape had a word that
+was neither a machine fact, like a device, nor a Linux one.
+
+What replaced it is the parameter Linux has always used for exactly this:
+`console=`. `src/boot/console_list.rs` reads it — allocation-free, because it runs
+at the top of the boot task before the heap exists — and the rules are Linux's:
+
+* every `console=` word names a console, and the log goes to all of them;
+* the **last** one is preferred: its writes park until the hardware has taken them,
+  where a peer sink is written best-effort, so a slow host terminal can never
+  throttle the console somebody is reading;
+* a value naming a console this machine does not have is reported and ignored, as
+  Linux reports and ignores one.
+
+Two names are accepted: `ttyS0`, the wire, and `tty0`, the virtual console on the
+screen (Linux's spelling for "the console currently displayed"). The four run modes
+became four lists — `console=ttyS0` for terminal and weston, `console=tty0` for gui,
+`console=ttyS0 console=tty0` for mirror — so mirror stopped being a flag pair and
+became an *order*, and terminal and weston became the same list, because what
+differs between them (a compositor driving the scanout) is runtime, not boot-time.
+
+**The rule the design rests on, and what was not measured.** "The log goes to
+every console named, and the last is preferred" is `kernel-parameters.txt`. The
+reading this kernel depends on is stronger: a console *not* named is not a console
+at all. That is what makes `console=ttyS0` alone mean "the wire and nothing else",
+and therefore what lets `--mode terminal` be a one-word list instead of needing a
+headless flag. It is the rule in `register_console()`, which drops a console the
+command line did not ask for once a preferred console has been chosen — **read out
+of the console registration code, not measured on a machine here.** The half that
+*was* measured has its own record above: `SET_MASTER`, `VT_PROCESS` and
+`KDSETMODE` were measured against `vt.c`/`vt_ioctl.c` when the seat landed.
+
+**The display device is engaged on every boot now.** A wire-only boot used to
+`drop` the GPU and never hand it to the render task; that was the same flag doing a
+second job. With the flag gone the task is spawned whenever the probe finds a
+device, because `/dev/fb0` is a device a program may open and a session may claim
+the card, whatever the kernel's own console list says. What the list decides is
+only whether the kernel's *log* moves onto the screen.
+
+**The grids are made whenever there is a display.** Six grids sized to the
+scanout (160x50 cells on a 1280x800 window) are made when the render task starts,
+in every mode, exactly as the compositor path always did; the console list decides
+only whether the kernel's *log* moves onto them. The alternative was tried first
+and rejected on measurement: make them lazily, on the first
+`DRM_IOCTL_SET_MASTER`, since that is the moment the scanout can be handed to a
+text console and therefore the moment a released VT has to be drawable — six grids
+cheaper on a boot that never draws. `t-ioctl` caught what that costs: it failed
+with `the console reports 25 rows (got 50, want 25)` and `80 columns (got 160,
+want 80)`, because the tests that take DRM master (`t-seat`, `t-drm*`) run earlier
+in the same suite, so the console's window *changed under it* mid-run. A console
+whose geometry depends on who holds the card is neither Linux's answer — fbcon
+binds to the display whatever the DRM master is doing — nor a stable one, and the
+test was right to say so. What it pins now is the rule: the console's window is the
+screen's grid in cells whenever there is a screen (checked against the
+framebuffer's own `FBIOGET_VSCREENINFO` and the 8x16 font), and 25x80 only when
+there is none. The cost is real and accepted: six grids on every boot that has a
+display, including a `cargo xtask test` boot that never shows them, which is what a
+machine whose display device is up pays.
+
+**`cargo xtask test` on this change.** All milestone markers (`M0_OK` … `M8_OK`,
+`All ready`), 131 user programs built, 114 `=== RUN`, 112 `=== PASS` - and the run
+does **not** reach `=== SUMMARY`, because `t-tty-vtime` hangs and times it out (the
+pre-existing red `AGENTS.md` records, unchanged by this work). One FAIL:
+`t-stdresolve`, 19 of 20 live DNS rounds, one `baidu.com` lookup answering
+`EAI_AGAIN` while this host was also running the build; every other network program
+passed and it passed in the previous run, which is the shape `AGENTS.md` says to
+read as load. `t-ioctl` passes on the new rule (the log shows `the console's rows
+are the screen's`). The 14 programs after `t-tty-vtime` in name order never ran -
+`t-dsp`, `t-udev-worker`, `t-uevent`, `t-umask`, `t-uname`, `t-unix`, `t-unix-dgram`,
+`t-unix-scm`, `t-unlinkat`, `t-wait4`, `t-waitid`, `t-write`, `t-writev`, `t-xattr` -
+which is a limit of this tree and not of this change: the hang is where the suite
+stopped before it too.
+
+**Two gaps with names, not stubs.**
+
+* `console=tty1`..`console=tty6` — Linux's "pin the log to that VT" — is *refused*
+  rather than approximated: this console writes to the VT that is on screen, which
+  is `tty0`'s meaning, so answering the word while doing something else would be
+  the private dialect the conventions refuse. The value is reported as unknown and
+  the boot proceeds on the consoles it did name.
+* `/dev/console` has no preferred-console plumbing: it follows the console
+  currently on screen, and the list's preference decides only the write policy.
+  Linux makes the last `console=` both the preferred console's device and the
+  routing rule; only the second half exists here.
 
 ### 7.2 Input: virtio-input (evdev) — **DONE**
 
@@ -1675,6 +2355,31 @@ is a device libinput drops silently. They carry the *device tree's* path now
 (`../../devices/virtual/...`), block devices excepted because this tree has no
 device directory for them. `t-evdev` pins the two errnos; the sysfs side is
 `src/vfs/sysfs.rs`'s own tests.
+
+### 7.2b `/dev/dsp`: the OSS parameters belong to the writer — **DONE**
+
+The virtio-sound driver used to decide everything at boot — S16LE, two channels,
+44.1 kHz "or the nearest", and a header comment that openly said no userland
+existed to ask. On Linux those numbers are *negotiated per open*, through the
+`'P'`-typed `SNDCTL_DSP_*` family in `linux/soundcard.h`, and a program that
+cannot ask cannot fall back either. The family now answers on `/dev/dsp`:
+
+* `SPEED`, `STEREO`, `CHANNELS` and `SETFMT` (and `GETFMTS`, `GETBLKSIZE`,
+  `GETOSPACE`/`GETISPACE`, `RESET`/`SYNC`/`POST`) — with the rounding rule read
+  off the header's semantics: a rate that is not on the device's list moves the
+  stream to the *nearest one it has* — nearest by relative distance, which is
+  what `44100 → 48000` and `10000 → 11025` agree on — and the ioctl answers what
+  the stream settled on rather than what was asked (`abi::oss_round_rate`,
+  host-tested). A real reconfiguration is a stop → `SET_PARAMS` → prepare →
+  start cycle on the device itself, and a refused one restores the old
+  parameters and answers `EINVAL`.
+* The refusals are answers too: `SETFRAGMENT`/`SUBDIVIDE` (the buffer geometry
+  is this driver's `SET_PARAMS` constant today) and `NONBLOCK` (the hand-off
+  blocks in the device; a flag that promised otherwise would be the lie this
+  kernel's rules put above the feature) each answer `EINVAL` by name.
+* Pinned by the request words' `_IOC` recomputation (host, `abi::oss_tests`) and
+  end-to-end in the guest (`t-dsp`, including `fstat` showing a `chmod` that
+  stuck).
 
 ### 7.3 AHCI/SATA (stretch)
 
@@ -2008,26 +2713,81 @@ re-examined, which is worth knowing before either is attempted.
   `exit` and `sigreturn`; every other syscall is fatal (`SIGKILL`), matching
   Linux's `do_exit(SIGKILL)` on a strict violation. The latch is per-task,
   cannot be cleared, survives `exec` and is inherited across `fork`/`clone`.
-- `SECCOMP_MODE_FILTER` — **done and wired**. The program, its validation and
-  its evaluation are `src/seccomp.rs` (classic BPF with the packet idioms left
-  out, one description of the instruction set shared by the validator and the
-  interpreter, forward-only jumps that must land inside the program, an
-  out-of-range load ending the program with `KILL_THREAD`, and the stacked
-  action order compared as a *signed* field so `KILL_PROCESS` outranks `ALLOW`);
-  nine host tests run real filter shapes over it. The plumbing that reaches it is
-  in too: `Task::seccomp_filters` is a cumulative per-thread list inherited across
-  `fork` and kept across `exec`; `seccomp(2)`'s op 1 and
-  `prctl(PR_SET_SECCOMP, 2)` both go through one `install_seccomp_filter`, which
-  copies the program out of the caller's memory and validates it *in full* before
-  anything is stored (`EINVAL` for a malformed program, `EFAULT` for an unreadable
-  one, `EACCES` for a caller that is not root, `EINVAL` for any flag - `TSYNC` is
-  not modelled and a caller must not think it got it); a machine-wide armed flag
-  keeps an unfiltered syscall to one relaxed load; and the gate acts on the answer
-  *before* the table runs - allow/log/trace pass, `ERRNO` fails the call, `TRAP`
-  raises `SIGSYS`, the kill actions and anything unimplemented refuse it - with
-  `PR_GET_SECCOMP` answering 2 once a filter is installed. **Still missing**: its
-  guest test (`t-prctl` is where the pins belong) and the action probe, which
-  answers the empty set rather than the truth about what this kernel supports.
+- `SECCOMP_MODE_FILTER` — **done, wired, and measured action by action**. The
+  program, its validation and its evaluation are `src/seccomp.rs` (classic BPF
+  with the packet idioms left out, one description of the instruction set shared
+  by the validator and the interpreter, forward-only jumps that must land inside
+  the program, an out-of-range load ending the program with `KILL_THREAD`, and
+  the stacked action order compared as a *signed* field so `KILL_PROCESS`
+  outranks `ALLOW`); the plumbing is `Task::seccomp_filters` — a cumulative
+  per-thread list inherited across `fork` and kept across `exec` — reached
+  through one `install_seccomp_filter` from both `seccomp(2)`'s op 1 and
+  `prctl(PR_SET_SECCOMP, 2)`, which copies the program out of the caller and
+  validates it *in full* before anything is stored (`EINVAL` malformed, `EFAULT`
+  unreadable, `EACCES` for a caller that is not root, `EINVAL` for any flag), a
+  machine-wide armed flag that keeps an unfiltered syscall to one relaxed load,
+  and a gate that acts on the answer *before* the table runs.
+
+**The eight answers were then measured**, one child per action and a control
+beside every table, because four of them were not what this kernel did:
+
+| Action | What Linux does (measured, 7.2.7) | Before | Now |
+|---|---|---|---|
+| `ALLOW`, `LOG` | the call proceeds | same | same |
+| `ERRNO\|d` | returns `-d` — and `d == 0` is a *successful* 0 | same | same |
+| `TRAP` | no handler: killed by `SIGSYS`. With one: the handler runs, the call never happens, and the caller reads its own `rax` back (`getppid` answered 110, `getpid` 39 — the number, not a value) | `SIGSYS`, then `-ENOSYS` | `SIGSYS`, then `nr` |
+| `KILL_THREAD` | killed by **`SIGSYS`**, not `SIGKILL` | `SIGKILL` | `SIGSYS` |
+| `KILL_PROCESS` | killed by **`SIGSYS`** | `SIGKILL` | `SIGSYS` |
+| `TRACE`, nobody tracing | the call fails with **`ENOSYS`** | allowed | `ENOSYS` |
+| `USER_NOTIF`, no listener | the call fails with `ENOSYS` | `ENOSYS` | same |
+| anything unrecognised | killed by `SIGSYS` — the man page's "treated as `KILL_PROCESS`", confirmed here | `-ENOSYS` returned | killed |
+
+Three drafts of that measurement were wrong in ways that produced plausible
+numbers, which is why the control exists and why it is written down: judging
+*every* syscall with the action measures libc's collapse rather than the kernel
+(every line read `SIGSEGV`); `BPF_LD|BPF_W|BPF_ABS` is **0x20** and not 0x00, and
+writing 0x00 makes it `ld #0` — after which every conditional filter quietly
+judged nothing; and a parent that reads its child's pipe to EOF before waiting
+hangs for ever when that child is *stopped* holding the write end. The control —
+filtering `getpid` to `EPERM` must fail `getpid` with errno 1 while `gettid`
+answers normally — caught each in turn.
+
+- `SECCOMP_GET_ACTION_AVAIL` — **done, and it answers the truth**. Supported
+  ⇒ 0, with the caller's own word left alone (Linux's return value carries the
+  answer; there is nothing to write back); not implemented — today only
+  `USER_NOTIF`, whose purpose is to hand the call to a userspace supervisor this
+  machine cannot summon — or carrying *any* data bits, however supported the
+  action in them is (`ERRNO|1` is refused, measured), ⇒ `EOPNOTSUPP`; a `flags`
+  it would have to ignore ⇒ `EINVAL`; an unreadable pointer ⇒ `EFAULT`. Before
+  this it answered success and wrote 0 for every question, so a caller that
+  asked learned nothing at all — and since the probe exists precisely because
+  Linux kills the process for an action it does not know, answering "no" to
+  everything was at least survivable, while answering "yes" to something not
+  implemented would not have been.
+- **Pins.** `t-seccomp` is new and holds one line per fact: the probe's table
+  including the data-bits refusal, one child per fatal action (each is killed by
+  signal 31 and each must run before this process installs anything, because a
+  filter is inherited and the more restrictive of several decides), the two
+  refusals that leave the caller alive answering `ENOSYS`, `LOG` letting the call
+  through, then install + the `ERRNO` answer + `PR_GET_SECCOMP` reading 2 + a
+  second filter judging another number (the list is cumulative) + inheritance in
+  a child that installs nothing + stacking, proved by a `TRAP` installed on top
+  of an inherited `ERRNO` winning the decision. `t-posix`'s probe line — it used
+  to assert the empty-set answer — now expects `EOPNOTSUPP` for a word naming no
+  action at all.
+- **Remaining, named: `PTRACE_EVENT_SECCOMP`.** The third case of `TRACE` is a
+  tracer that has set `PTRACE_O_TRACESECCOMP` getting its own stop, carrying the
+  action's data in `PTRACE_GETEVENTMSG`. This kernel cannot produce it, so
+  `PTRACE_SETOPTIONS` refuses the bit with the same `EINVAL` Linux gives for one
+  it does not know — every traced caller is therefore the no-option kind, whose
+  behaviour *is* Linux's. Building that stop is what would make `TRACE` mean
+  notify rather than allow.
+- **Not measured, and recorded rather than guessed**: strict mode's own violation
+  signal. `seccomp(SECCOMP_SET_MODE_STRICT)` answers `EINVAL` on this machine for
+  every argument shape tried, including after `PR_SET_NO_NEW_PRIVS` and with
+  `args == NULL`, which is what an outer sandbox filtering `seccomp(op = 0)`
+  looks like. Strict therefore keeps `SIGKILL`, the documented answer, and
+  `t-posix`'s pin of it stands unchanged.
 
 ### 8.3 User Stack Canary — **DONE** (kernel side)
 
@@ -2964,6 +3724,194 @@ doing them before the next device or the next per-open-file resource is added.
 
 ---
 
+## Phase 12: ABI truthfulness — **AUDIT DONE, NOTHING FIXED**
+
+Phase 11 is about *who names whom*: the shape of the tree, with no user-visible defect. This
+phase is the other half of the review question every change here gets asked (`AGENTS.md` §7):
+*is that Linux's answer, or a shape that looks like it?* A gap that is honestly refused
+(`ENOSYS`/`EOPNOTSUPP`/`EINVAL`) is already Linux's answer for a kernel that cannot do the call,
+so it is not a defect and takes no work here. What this phase collects is the cases that are
+**not** honestly refused — a call or an `ioctl` that is *accepted*, answers success, and then
+does less than Linux did. Those are the ones `AGENTS.md` §4 calls the single worst thing this
+codebase can do: a program comes to believe something false and stops asking.
+
+The audit method mirrors §11.0 — reproducible, and worth re-running: grep every syscall and
+device-`ioctl` arm that returns `0`/`ESUCCESS` and read what it actually did; compare against
+the Linux behaviour, which for each entry below is either measured here or marked with its
+confidence. Three of the entries (A1, B1, B2) were re-confirmed against the source in the
+working tree; the rest are as found by the sweep and each carries the same bar — confirm on a
+real Linux before landing a change that could send a program down a fallback it would not
+otherwise take.
+
+Two hard truths the audit surfaced, before any individual line:
+
+- **The board is not currently green.** `AGENTS.md` §3 records the working tree's in-flight tty
+  read-path rewrite as red (`t-tty-vtime` hangs, `t-tty-eintr` fails two checks, `t-netlat` is a
+  load flake). That is a *newer* state than §11.1.12's "green", which described the last
+  committed baseline (Step A). **Nothing in this phase is verifiable until the gate is green
+  again**, so restoring it is task zero, ahead of B and C.
+- **Some of these are recorded as `Done` where they are not.** `PLAN.md`'s own table lists
+  `getpriority` as done; it returns a hardcoded 20 with no round-trip (B5). The board being true
+  is a standing rule (§8 of `AGENTS.md`), so correcting it is part of this phase, not a
+  side effect.
+
+### 12.0 The dependency direction this phase assumes
+
+No new dependency design: the target layering is already recorded in §11.2 and mirrored in
+`ARCHITECTURE.md` §9, and this phase works *within* it, not against it. The two rules that
+matter for the fixes below are the ones §11.2 states: **nothing below `syscall` names
+`syscall`**, and **nothing outside `vfs` names the VFS's concrete device types**. The device-
+`ioctl` truthfulness fixes (A2, A3) are the same moves §11 Step B2 makes — a request number's
+"accept or refuse" decision belongs with the driver that owns the device, not in the
+`syscall/linux/fs.rs` switchboard — so wherever a fix here and a Phase-11 step touch the same
+code, land them together rather than editing the switchboard twice.
+
+### 12.1 Group A — silent success on a question Linux refuses
+
+Purely narrowing changes with a clear Linux answer; each is "refuse honestly", the cheapest and
+lowest-risk kind, and the most direct violation of §4. Land with a host test and a probe.
+
+| # | Where | Linux's answer | What this kernel does | Fix |
+|---|---|---|---|---|
+| A1 | `abi.rs:1209` `handle_prctl` catch-all `_ => 0` | unknown option `EINVAL`; `PR_GET_NAME` returns `comm` | **any** unmodelled option returns 0 (confirmed); `PR_GET_NAME` writes a 16-byte zero name | `_ => EINVAL`; implement `PR_SET_NAME`/`PR_GET_NAME` against the task `comm`, or refuse it too. The test at `abi.rs:2487` pins today's `=> 0` — update it with the change, do not delete the intent. |
+| A2 | `fs.rs:4365` `kd_ioctl` catch-all `_ => 0` | read-family fills the buffer; unknown `EINVAL`/`ENOTTY` | every other `K`-family request returns 0 and leaves the caller's buffer uninitialised | move the accept/refuse decision to the console device (Step B2 shape); unknown → `ENOTTY`. |
+| A3 | `fs.rs:4573` evdev write requests | `EVIOCREVOKE` revokes access; `EVIOCSFF` needs a ff device | `EVIOCSFF`/`EVIOCSREP`/`EVIOCREVOKE`/`KEYCODE` set-ops all return 0 doing nothing — **`EVIOCREVOKE` silently does not revoke** (a security semantic) | `EVIOCSFF` → `ENODEV` (no force-feedback device); implement or `EOPNOTSUPP` the rest; read side's all-zero `EVIOCGREP`/`KEY*` must not be paired with a write-side "success". |
+| A4 | `fs.rs` `handle_signalfd` | `SFD_CLOEXEC` sets `FD_CLOEXEC`; unknown flags `EINVAL` | only `SFD_NONBLOCK` recognised; `SFD_CLOEXEC` dropped, unknown flags accepted silently | honour `SFD_CLOEXEC`, `EINVAL` on the unknown bits. |
+| A5 | `proc.rs:2158` `mmap` flags | `MAP_FIXED_NOREPLACE` → `EEXIST` on collision; `MAP_HUGETLB` with no huge pages → `ENOMEM` | unknown/reserved flags ignored; `MAP_FIXED_NOREPLACE` (`0x100000`) treated as a plain hint and re-located on collision — breaks the "this address or fail" contract; `MAP_HUGETLB` silently gives a 4K page | validate the bits; `NOREPLACE` must fail with `EEXIST`; `HUGETLB` must be `ENOMEM` here. |
+| A6 | `abi.rs` `rseq` registration | registers per-thread `rseq` state; well-formed registration → `0` | returns `0` for a valid call, validates the shape, does not maintain `cpu_id` afterwards | **keep the accept** (`t-rseq` pins it; `ENOSYS` broke it and rule 1 protects the test). The honest addition is to write `cpu_id` = 0 at registration (true on one CPU), not a refusal. Downgraded from a "silent-success gap" to a documented scope boundary. |
+
+**Landed this pass (each with its counterfactual pin, AGENTS.md checklist rule 4):**
+
+- **A4 signalfd** — `handle_signalfd` now honours `SFD_CLOEXEC` (sets `FD_CLOEXEC`) and answers
+  `EINVAL` on any bit outside `{SFD_NONBLOCK, SFD_CLOEXEC}`. Pinned in `t-signalfd` (the unknown-flag
+  `EINVAL` and the `F_GETFD` close-on-exec readback both fail without the change). `t-signalfd` `===
+  PASS`.
+- **A5 mmap** — `handle_mmap_impl` now treats `MAP_FIXED_NOREPLACE` as "this address or fail"
+  (`EEXIST` on an occupied range instead of relocating), refuses `MAP_FIXED | MAP_FIXED_NOREPLACE`
+  with `EINVAL`, and refuses `MAP_HUGETLB` with `ENOMEM` instead of a silent 4 KiB page. It does
+  **not** add a strict unknown-flag whitelist, because Linux accepts `MAP_STACK`/`MAP_NORESERVE`/
+  `MAP_POPULATE` as no-ops and musl's thread stacks rely on that — a blunt "reject everything else"
+  would itself be a non-Linux answer. Pinned in `t-mmap` (NOREPLACE exact-address success, `EEXIST`
+  on collision, conflict `EINVAL`, `HUGETLB` `ENOMEM`). All four `t-mmap*` programs `=== PASS`.
+- **A6 rseq — re-examined and NOT refused.** The plan said `rseq` → `ENOSYS`, but a tracked
+  conformance program `t-rseq` pins "a well-formed registration returns `0`", which is exactly what a
+  kernel with `rseq` answers on Linux; `ENOSYS` broke it, and rule 1 says the code changes, not the
+  test. Reading `t-rseq`'s own doc, the accept-and-not-maintain-`cpu_id` behaviour is a *documented,
+  pinned scope boundary* (glibc's startup just needs registration to pass, and on one CPU the
+  `cpu_id` has nothing to be wrong about), not an unrecorded silent success. So the A6 premise was
+  a misclassification; the honest move is an *addition* (write `cpu_id` = 0 into the caller's block at
+  registration), tracked below, never a refusal.
+
+**Deferred with its prerequisite named (not attempted blindly):**
+
+- **A1 prctl** — the catch-all `_ => 0` is a real silent-success, but the honest fix is a *whitelist*,
+  not a blanket `EINVAL`: Linux answers `0` for options it models (`PR_SET_DUMPABLE`, `PR_CAPBSET_*`,
+  `PR_SET_KEEPCAPS`, `PR_SET_NO_NEW_PRIVS`, …) and `EINVAL` only for numbers it does not know, and it
+  answers `PR_GET_NAME` with the task `comm`. So closing A1 first needs the task-`comm`/dumpable/
+  no-new-privs state implemented and the running stack's (`weston`/`apk`/busybox) actual `prctl` calls
+  measured on a real Linux, then verified against those workloads — which a headless self-test does
+  not exercise. A blunt refuse would send a probing program down a fallback; that is the wrong shape
+  of wrong.
+- **A2/A3 kd + evdev** — explicitly paired with Phase-11 Step B2 (move each device's ioctl
+  accept/refuse down to the driver). Editing the `syscall/linux/fs.rs` ioctl switchboard now would
+  add calls along the V-2 edge the next refactor removes, against checklist rules 5 and 7 (a refactor
+  and a behaviour change in one diff). Land them with Step B, one device at a time.
+
+### 12.2 Group B — accepted, but the full contract is not implemented
+
+These need a real behaviour, not just a refusal, so each carries more risk: a narrowing change
+sends the caller down a path it would not otherwise take. Confirm on Linux first; land with a
+conformance program.
+
+| # | Where | Linux's answer | What this kernel does | Fix / decision |
+|---|---|---|---|---|
+| **B1** | `fs.rs:2760`/`2793` `handle_read`/`handle_write` (+ `readv`/`writev`); `opened_for_write` in `vfs/file.rs:195` is read only by `inotify.rs` | writing an `O_RDONLY` fd → `EBADF`; reading a `W`-only fd → `EBADF` | **access mode is enforced at `open` but never afterwards** (confirmed) — `open(O_RDONLY)` then `write()` succeeds | store the `O_ACCMODE` on the description; the read/write/writev/readv entry points refuse a mismatch with `EBADF`. Blast radius is real (weston, `apk`, busybox all depend on this), so gate on the full run, not just host tests. |
+| **B2** | IPv4 tails at `socket.rs:1387`/`1540`/`1895`/`2212` — compute `nonblock` from `O_NONBLOCK` only | `MSG_PEEK` does not consume; `MSG_DONTWAIT` earns `EAGAIN` | **`MSG_PEEK` on TCP/UDP consumes the datagram and returns success** (confirmed silent data corruption); `MSG_DONTWAIT` is ignored (only `O_NONBLOCK` consulted) | at minimum make IPv4 consistent with the families that already do the right thing: route the wait decision through `dontwait(fd, flags)` and return `EOPNOTSUPP` on `MSG_PEEK`; real `MSG_PEEK` over the IP path is then a named sub-gap. |
+| B3 | `abi.rs:1534` `get_robust_list` `ENOSYS` while `set_robust_list` (`1523`) is accepted | x86_64 has the call and returns the registered head | asymmetric — `set` accepted, `get` refuses | implement `get` to return the head `set` registered, or make `set` honest; the comment's "Linux returns ENOSYS for a kernel without the call" reasoning does not hold on x86_64. |
+| B4 | `posix.rs:798` `vhangup` → constant 0 | hangs up the controlling terminal | returns success; the kernel *does* have controlling-tty bookkeeping (`TIOCSCTTY` exists), so the "we have no tty to hang up" comment is stale | implement against the tty, or `EOPNOTSUPP` — not a silent 0. |
+| B5 | `posix.rs:616`/`633` `setpriority` discarded, `getpriority` constant 20 | round-trips the nice value | no round-trip; **`PLAN.md` records this as `Done`** (the table around line 821) | give it a stored per-task nice value, or correct the board and refuse. |
+| B6 | `proc.rs:3231`/`3251` `times()`/`getrusage()` all-zero `tms`/rusage | advances with CPU time | always zero — programs that wait on CPU time read 0 forever | name it a gap (needs the clock plumbed per-task); a zero is only honest if the board says so. |
+
+### 12.3 Group C — rationale comments that no longer describe the code
+
+Cosmetic to a caller, but they mislead the next reviewer, so fix in the same commits as the
+behaviour they describe:
+
+- `mod.rs:624` says "a signal handler is never called" — contradicted by `deliver_signal`.
+- `fs.rs:1062` says `AT_REMOVEDIR` is "ignored" — the code correctly forks rmdir/unlink now.
+- The `getpriority`/`setpriority` "Done" board entry (see B5).
+
+### 12.4 Order
+
+1. **Restore the green gate.** Fix `t-tty-eintr`'s two test-side expectation bugs — `AGENTS.md`
+   §3 already states the kernel's answers (`EINTR`, 3 bytes) are the measured Linux ones and the
+   test compares against `-lin::EINTR` (`+4`) and expects two bytes for a three-byte `"hi\n"` —
+   and reconcile `t-tty-vtime` with the in-flight `VMIN`/`VTIME`/`EINTR` read-path rewrite. Treat
+   a lone red `t-netlat` as load. **This blocks everything below.**
+2. **Group A** — the honest-refusal batch. Each is small, host-testable, and purely narrowing.
+   Pair A2/A3 with Phase-11 Step B2 where they touch the same device-`ioctl` code.
+3. **Group B** — the contract-completion batch, one behaviour at a time, each pinned by a `t-*`
+   program and gated on the full run. B1 first (largest blast radius, most important), then B2.
+4. **Group C** — fold the comment fixes into the commit that changes the behaviour they describe.
+
+### 12.4a Root cause of the step-1 block — `t-tty-vtime` (diagnosed, fix designed)
+
+Measured on the current tree: the guest suite reaches 115 verdicts and stops inside
+`t-tty-vtime`, right after `ok: VMIN=2/VTIME=5 is accepted` — it never reaches a `=== SUMMARY`.
+`t-tty-eintr` now PASSes (the two expectation bugs `AGENTS.md` §3 recorded are already corrected
+in the tree: it compares against `lin::EINTR` (`-4`) and expects 3 bytes for `"hi\n"`). So the
+single remaining red is this one hang, and it is a *wiring* bug, not a policy bug: `read_wait`
+(`tty.rs:1163`) returns the correct `VMIN>0`/`VTIME` decision and its host tests pass.
+
+The bug is an agreement mismatch between `read_blocking` and `block_until_deadline`:
+
+- `block_until_deadline(cond, deadline)` (`runtime.rs:2868`) is a **condition loop**: it returns
+  only when `cond()` is true, a signal is deliverable, or `timer::ticks() >= deadline`; on any
+  other wake its schedule closure re-parks it.
+- For `VMIN>0` with an empty queue, `read_wait` returns `UntilInput`, which `read_blocking`
+  maps to `deadline = u64::MAX` with `cond = has_ready()` (tty.rs:1741,1755). `has_ready()` in
+  non-canonical mode needs `out.len() >= VMIN`, so one partial byte leaves it false.
+- `receive_byte` (tty.rs:1550-1556) *does* wake the reader for a partial byte
+  (`byte_restarts_clock()` → clone the waiters → `sched::wake(id)`), but `block_until_deadline`
+  wakes, re-tests `has_ready()` (still false), sees `deadline == MAX`, and **re-parks** — so the
+  clock-restart wake is swallowed and the read never re-derives the real `UntilTick(last_byte +
+  span)` deadline. It sleeps forever.
+
+The `tty.rs` comment "a wake from anything else is simply another look" (read_blocking:1757)
+assumes every wake surfaces to the caller; `block_until_deadline` does not honour that.
+
+**Fix (additive, no change to the shared scheduler primitive):** give `LineDiscipline` an
+`input_count: u64` bumped in `note_input_tick`, and for a pass whose wait is clock-restarting
+(`byte_restarts_clock()`), snapshot `base = input_count` before parking and pass the predicate
+`has_ready() || input_count != base`. A byte arrival then changes `input_count`, ends the park,
+and `read_blocking` re-derives `UntilTick(last_byte + span)` — which arms the real deadline and
+delivers the partial bytes one `VTIME` after the **last** byte, matching the measurement. This
+cannot busy-spin (the predicate only flips on a real arrival) and leaves the canonical, `VTIME==0`
+and `VMIN==0` parks on their current `has_ready()` predicate untouched.
+
+**Landed and verified.** The fix is in `tty.rs` (an `input_count: u64` on `LineDiscipline`
+bumped in `note_input_tick`, and a `byte_restarts_clock()` read parks on
+`has_ready() || input_moved(base)`). After it, `cargo xtask test` runs to completion:
+`t-tty-vtime`, `t-tty-eintr` and `t-tty-query` all report `=== PASS`, the run reaches
+`=== SUMMARY pass=130 fail=2`, and QEMU exits 33. The two remaining reds are **not** tty and
+**not** Phase 12 — `t-dsp` and `t-dhcp` are other in-flight new programs: `t-dsp` fails wholesale
+because the self-test machine boots with `-audiodev none` (no `/dev/dsp`), and `t-dhcp` is the
+not-yet-wired DHCP boot path (§4.5 board). `t-netlat` passed this run. So the green-gate work
+*in Phase 12's scope* is done; the gate reaches a summary, and `fail={t-dsp, t-dhcp}` is the
+known non-Phase-12 baseline the Group-A regression check compares against.
+
+### 12.5 Deliberately not in this phase
+
+- Anything already honestly refused. `fanotify`/`keyctl`/`userfaultfd`/namespaces and the
+  `_ => ENOSYS` dispatch arm are correct answers, not gaps to close here.
+- `SO_REUSEADDR`/`SO_LINGER`/buffer sizes (`record-only`) and the missing `/proc/<pid>/maps` —
+  already tracked in §4.3 / the ABI board; this phase does not duplicate them.
+- Real `MSG_PEEK` over TCP/UDP, real `rseq` state, real per-task CPU accounting: named here as
+  sub-gaps, planned where the prerequisite (peek-preserving delivery, the clock, the
+  scheduler's own timekeeping) is scheduled.
+
+---
+
 ## Priority Summary
 
 | Phase | Effort | Impact | Blocks |
@@ -2979,6 +3927,7 @@ doing them before the next device or the next per-open-file resource is added.
 | **P9: Architectures** | ~4 weeks | Low | aarch64, RISC-V |
 | **P10: Performance** | 10.1 done; rest ~3 weeks | High (10.2-10.3) / Medium (rest) | Interactive latency, throughput |
 | **P11: Architectural debt** | A done; B–C ~3–5 weeks; D–G ~1 week | High (maintainability) — the number was 22 mutual module pairs, and Step A took it to 21 | Every later phase: nothing can be tested or refactored in isolation (§11) |
+| **P12: ABI truthfulness** | gate restore ~days; Group A ~2 days; Group B ~1–2 weeks | High (correctness) — nine accepted-but-false answers, none recorded until now | Programs that trust a false success (§12) |
 
 **Recommended order**: P1 -> P2 -> P3 -> P4 -> P5 -> P6 -> P7 -> P8 -> P9
 

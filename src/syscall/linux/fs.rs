@@ -1824,8 +1824,13 @@ pub(super) fn handle_memfd_create(args: [usize; ARG_COUNT], from_user: bool) -> 
     fd as isize
 }
 
-/// `signalfd(fd, mask, flags)` - signals as a descriptor. The mask is read and
-/// honoured in the one way this kernel has signals to wait for: child exits.
+/// `signalfd(fd, mask, flags)` - signals as a descriptor.
+///
+/// The mask is read, converted from the wire's `sigset_t` (signal *n* in bit
+/// *n-1*) into the kernel's own spelling, and kept: the descriptor reports the
+/// signals that are both blocked by the reading task and named there, which is
+/// `signalfd(2)`'s contract and the whole reason a compositor's `SIGTERM` can
+/// be noticed at all.
 ///
 /// `flags` sits in the fourth slot of the `signalfd4` ABI musl makes; the
 /// plain number routes a zero here, because the original spelling has no
@@ -1833,19 +1838,34 @@ pub(super) fn handle_memfd_create(args: [usize; ARG_COUNT], from_user: bool) -> 
 /// flag word and drop the caller's nonblock silently.
 pub(super) fn handle_signalfd(args: [usize; ARG_COUNT], flags: usize, from_user: bool) -> isize {
     const SFD_NONBLOCK: usize = 0x800;
-    // Only the mask's validity is checked: this kernel reports child exits,
-    // and a caller that asked for others asked for signals it cannot get here.
+    const SFD_CLOEXEC: usize = 0x80000;
+    if flags & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
+        // `signalfd4` has only these two bits. A word with anything else set is
+        // refused rather than silently accepted - the same shape `timerfd` and
+        // the other `*_create(2)` calls give, and the honest answer for a caller
+        // that asked for a flag this descriptor has no meaning for.
+        return err::EINVAL;
+    }
     if !crate::syscall::buffer_ok(args[1], 8, false, from_user) {
         return err::EFAULT;
     }
+    let wire = unsafe { (args[1] as *const u64).read_unaligned() };
+    let mask = crate::sched::signal::from_wire(wire);
     let nonblock = flags & SFD_NONBLOCK != 0;
     let fd = match crate::vfs::open_inode(crate::vfs::signalfd::SignalFd::new(
         next_anon_ino(),
+        mask,
         nonblock,
     )) {
         Ok(fd) => fd,
         Err(e) => return err_of(e),
     };
+    if flags & SFD_CLOEXEC != 0 {
+        // `SFD_CLOEXEC` is not cosmetic: without it the descriptor leaks across
+        // `exec`, which is exactly what a compositor that installs a signalfd
+        // and then runs a helper would not want.
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
     if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
@@ -2875,8 +2895,20 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         if file.inode().as_drm().is_some() {
             crate::drivers::drm::master_closed(file.ofd());
         }
-        // The same for a console's promises: `VT_SETMODE` was a session's word
-        // that it would answer `relsig`, and the session is gone.
+        // The keyboard's mode goes back with the session that wrote it, so a
+        // `K_OFF` left behind by a process that is gone cannot strand a respawned
+        // getty with no keys to read.
+        //
+        // The console's `VT_PROCESS` promise deliberately does *not* go back here,
+        // which is the opposite of what this hook used to do. A promise belongs to
+        // the process that wrote `VT_SETMODE`, and the process that writes it
+        // closes the descriptor on purpose - seatd's `vt_open` sets the mode and
+        // `close(ttyfd)`s before the compositor it serves has the screen - so
+        // clearing a promise at a close unmakes the claim in the same breath it is
+        // made, and the text console is back to racing the compositor for one
+        // scanout. Linux notices a dead keeper where the signal is actually owed
+        // (`kill_pid` failing, then `reset_vc`); so does this kernel - see
+        // `crate::vfs::vcmux::abandon` for the whole of the reasoning.
         if let Some(tty) = file.inode().as_tty()
             && let Some(vc) = tty.vc_number()
         {
@@ -3955,6 +3987,36 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             Some(nr) => crate::drivers::drm::drm_ioctl(fd, nr, buf),
             None => err::ENOTTY,
         },
+        // The OSS dsp family (`'P'`-typed), on whichever character stream the
+        // descriptor opened: the stream's rate, channels and format belong to
+        // whoever writes its bytes, which is the whole point of the family
+        // and the thing this kernel used to decide at boot instead. The
+        // dispatcher validates the caller's buffer against the `_IOC` word's
+        // own direction and size; what the device answers is the answer.
+        request if family_nr(request, b'P').is_some() => {
+            let size = ((request >> 16) & 0x3fff) as usize;
+            let dir = (request >> 30) & 3;
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            let inode = file.inode();
+            let Some(device) = inode.as_chardev() else {
+                return err::ENOTTY;
+            };
+            if size > 0 {
+                // `_IOC_WRITE` is the kernel reading the caller's buffer,
+                // `_IOC_READ` the kernel writing it - and `_IOWR` promises
+                // both, which is why the two bits are checked separately.
+                if dir & 1 != 0 && !buffer_ok(buf, size, false, from_user) {
+                    return err::EFAULT;
+                }
+                if dir & 2 != 0 && !buffer_ok(buf, size, true, from_user) {
+                    return err::EFAULT;
+                }
+            }
+            device.ioctl(request, buf).unwrap_or(err::ENOTTY)
+        }
         _ => err::ENOTTY,
     }
 }
@@ -4075,7 +4137,11 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
             let mut bytes = [0u8; 8];
             unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, bytes.as_mut_ptr(), n) };
             let mode = crate::vfs::vtmode::VtMode::from_bytes(&bytes);
-            match crate::vfs::vcmux::set_vt_mode(vc, mode) {
+            // The promise belongs to the process writing it, and is remembered as
+            // that: `relsig`/`acqsig` are sent to this pid and to no one else,
+            // which is Linux's `vc->vt_pid` and what lets a seat manager set the
+            // mode on a console it is about to close.
+            match crate::vfs::vcmux::set_vt_mode(vc, mode, crate::sched::current_tgid().0 as u32) {
                 Ok(()) => 0,
                 // A console that is not one of ours, or a mode that is not a
                 // mode: Linux has one answer for both.
@@ -4124,25 +4190,27 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
                 err::EINVAL
             }
         }
-        // VT_ACTIVATE -> int: make that console the one on the screen, and
-        // *wait* for the console currently shown to be asked if it asked to be
-        // asked. This is Linux's `vt_release`: `relsig`, then a 60-second sleep
-        // on the answer. A refusal is `EBUSY` rather than silence, because a
-        // session that activates a compositor's console wants to know it lost,
-        // not to poll `VT_GETSTATE` and guess.
+        // VT_ACTIVATE -> int: ask for that console to be the one on the screen.
+        // Linux's answer is `set_console()`: record the request, schedule the
+        // console callback - which is where the releasing console's `relsig` goes
+        // out - and return 0. It does not wait for the answer, and neither does
+        // this; `vcmux::request_activate` says why a waiting version would
+        // deadlock the seat manager that owes the answer. A number that is not one
+        // of this machine's consoles is Linux's `ENXIO` (`arg == 0 || arg >
+        // MAX_NR_CONSOLES`), and a session that wants to know when the screen
+        // actually moved has `VT_WAITACTIVE`, the one console ioctl that waits.
         0x06 => {
             if !owns_it() {
                 return err::EPERM;
             }
-            match crate::vfs::vcmux::wait_activate(buf as u32) {
-                crate::vfs::vcmux::Activated::Taken | crate::vfs::vcmux::Activated::Already => 0,
-                crate::vfs::vcmux::Activated::Refused => err::EBUSY,
-                // Linux's timeout path completes the switch anyway; a caller
-                // that sees this re-reads `VT_GETSTATE` and finds the answer.
-                crate::vfs::vcmux::Activated::TimedOut => err::EBUSY,
-                crate::vfs::vcmux::Activated::Interrupted => err::EINTR,
-                crate::vfs::vcmux::Activated::Inval => err::EINVAL,
+            let to = buf as u32;
+            if to == 0 || to > crate::vfs::pty::VC_COUNT {
+                return err::ENXIO;
             }
+            if !crate::vfs::vcmux::request_activate(to, false) {
+                return err::ENXIO;
+            }
+            0
         }
         // VT_WAITACTIVE -> int: park until that console is the active one,
         // wakeable by the release that finally moves it.
@@ -4156,6 +4224,24 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
         0x08 => 0, // VT_DISALLOCATE: nothing to free.
         0x09 => 0, // VT_RESIZE: the window size comes from TIOCGWINSZ instead.
         0x0a => 0, // VT_RESIZEX: same.
+        // VT_WAITUNTIL -> int: Linux's `vt_waitrelease`, and its two answers
+        // are one short: `arg == 0` means "nothing to wait for" and returns 0
+        // without looking at the screen; anything else parks in exactly
+        // `VT_WAITACTIVE`'s way, and a console this machine does not have is
+        // `ENXIO` (`vt_waitactive`'s own range check).
+        0x0c => {
+            if !owns_it() {
+                return err::EPERM;
+            }
+            if buf == 0 {
+                return 0;
+            }
+            if buf as u32 > crate::vfs::pty::VC_COUNT {
+                return err::ENXIO;
+            }
+            crate::vfs::vcmux::wait_active(buf as u32);
+            0
+        }
         _ => err::ENOTTY,
     }
 }

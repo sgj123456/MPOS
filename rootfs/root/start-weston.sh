@@ -19,6 +19,15 @@
 # service is not up - a live image that predates it, a runlevel that was
 # emptied - and brings seatd up itself before handing over.
 #
+# It therefore has to get two things right about a seat manager that outlives
+# the desktop it serves, and both of them were bugs here once: it must ask
+# whether a seatd is *answering* rather than whether `/run/seatd.sock` exists
+# (a socket path survives its owner's death), and it must not start one inside
+# weston's own process group (`^C` signals the whole foreground group, and the
+# script `exec`s into weston, so the two shared a group - quitting the desktop
+# killed the seat manager with it, and the next run found only the stale
+# socket). See the notes at each step below.
+#
 # Run it from a weston boot (cargo xtask run --mode weston):
 #     ./start-weston.sh [extra weston args...]
 
@@ -32,12 +41,37 @@ mkdir -p "$XDG_RUNTIME_DIR"
 chmod 0700 "$XDG_RUNTIME_DIR"
 
 SOCK=/run/seatd.sock
+PIDFILE=/run/seatd.pid
 
-# Bring up a seatd if the service is not already listening. `-g wheel` lets the
-# wheel group (this user is in it) reach the socket.
-if [ ! -e "$SOCK" ]; then
+# Is there a seatd *answering*? A socket file is not the daemon: a unix socket's
+# path stays in the filesystem after its owner dies (here and on Linux - nothing
+# unlinks it), so `[ -e $SOCK ]` says only that some seatd once bound this name.
+# A test on the file alone was the bug: quit the desktop, the seatd that this
+# script started is gone, the stale `$SOCK` is left behind, and every later run
+# dials a name nobody listens on - libseat reads the instant end-of-file as
+# "Could not poll connection: I/O error" and gives up on the seat.
+seatd_alive() {
+    pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+        pid="$(pidof seatd 2>/dev/null | cut -d' ' -f1 || true)"
+    fi
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+if ! seatd_alive; then
     mkdir -p /run
-    seatd -g wheel &
+    # Drop the name the dead daemon left, or the new one cannot bind it and
+    # answers EADDRINUSE - which is how "restart the seat manager" turns into "no
+    # seat manager at all, and a socket file that looks like one".
+    rm -f "$SOCK"
+    # `setsid`, and this is the other half of the same bug. A non-interactive
+    # shell has no job control, so a background job it starts stays in the
+    # shell's own process group - and this shell `exec`s into weston, so that
+    # group *is* the compositor's. `^C` on the console signals the whole
+    # foreground group (`src/vfs/tty.rs`: `send_signal_group`), which used to
+    # take the seat manager down with the desktop it was serving. A new session
+    # keeps `^C` an ordinary keystroke for weston alone.
+    setsid seatd -g wheel </dev/null >/tmp/seatd.log 2>&1 &
     # Give the daemon a moment to bind the socket before weston connects.
     i=0
     while [ ! -e "$SOCK" ] && [ "$i" -lt 20 ]; do
@@ -46,6 +80,8 @@ if [ ! -e "$SOCK" ]; then
     done
     if [ ! -e "$SOCK" ]; then
         echo "start-weston: seatd did not create $SOCK" >&2
+        echo "--- /tmp/seatd.log ---" >&2
+        cat /tmp/seatd.log >&2
         exit 1
     fi
 fi

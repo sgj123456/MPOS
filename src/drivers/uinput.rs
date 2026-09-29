@@ -84,6 +84,9 @@ pub struct Uinput {
     /// bus's own devices are in, because that is where an evdev reader looks.
     input_dir: Arc<DevDirNode>,
     state: Mutex<RefCell<State>>,
+    /// The node's mode and owner, kept so `chmod`/`chown` stick (see
+    /// `crate::vfs::devfs::NodePerms`).
+    perms: crate::vfs::devfs::NodePerms,
 }
 
 impl Uinput {
@@ -93,6 +96,7 @@ impl Uinput {
     pub(crate) fn new(input_dir: Arc<DevDirNode>, first_index: usize) -> Arc<Uinput> {
         Arc::new(Uinput {
             input_dir,
+            perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
             state: Mutex::new(RefCell::new(State {
                 clients: Vec::new(),
                 next_index: first_index,
@@ -257,6 +261,26 @@ pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>]) {
 }
 
 impl Inode for Uinput {
+    fn keeps_modes(&self) -> bool {
+        self.perms.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        self.perms.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.perms.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.perms.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        self.perms.set_owner(uid, gid);
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x9f00,

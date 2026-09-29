@@ -43,7 +43,7 @@ behind `#[cfg(target_os = "none")]`, which is what keeps the host build free of 
 | Feature | Description |
 |---------|-------------|
 | **Own UEFI loader** | `mpos-boot` reads the kernel, the initramfs and the command line off the ESP, builds the page tables and the higher-half mapping, applies the kernel's relocations and jumps — then stops existing. No third-party bootloader, no ISO |
-| **Linux ABI compatible** | 247 Linux x86_64 syscall numbers are named and routed; musl binaries (Alpine, busybox, `apk`, `fish`, weston) run unmodified |
+| **Linux ABI compatible** | 252 Linux x86_64 syscall numbers are named and routed; musl binaries (Alpine, busybox, `apk`, `fish`, weston) run unmodified |
 | **Framebuffer console** | virtio-gpu 2D scanout, a kernel console that *moves onto it* after boot, virtual consoles (`Ctrl-A 1..6`; the image runs a `getty` on `tty1`..`tty4`), and a best-effort serial mirror that never throttles the window |
 | **DRM/KMS + fbdev** | `/dev/fb0` with the fbdev ioctls and `/dev/dri/card0` speaking the Linux DRM UAPI — dumb buffers, page flip, vblank events, render node, PRIME. This is the path **weston** takes: its DRM backend through `seatd`, with Mesa's software GL (llvmpipe) over GBM dumb buffers. No GPU-side 3D and no virgl |
 | **Input** | virtio-keyboard and virtio-tablet as evdev nodes (`/dev/input/eventN`, capability ioctls, per-open-file grab), plus `/dev/uinput` so a program can create a device of its own |
@@ -74,7 +74,7 @@ graph TB
 
     subgraph KernelSpace["Kernel Space (Ring 0)"]
         subgraph Gate["Syscall gate"]
-            SYSCALL["syscall / sysret<br/>247 numbers routed"]
+            SYSCALL["syscall / sysret<br/>252 numbers routed"]
         end
 
         subgraph VFSLayer["vfs"]
@@ -230,10 +230,14 @@ graph LR
 
 ## Syscalls
 
-`src/syscall/linux/nr.rs` names **247 Linux x86_64 syscall numbers**; every one of them is
-routed by the dispatch table in `src/syscall/linux/mod.rs`, and roughly 229 do real work — the
+`src/syscall/linux/nr.rs` names **252 Linux x86_64 syscall numbers**; every one of them is
+routed by the dispatch table in `src/syscall/linux/mod.rs`, and roughly 234 do real work — the
 handful that do not answer `ENOSYS`, which `PLAN.md` tracks as the remaining ABI gap
-(`fanotify`, `keyctl`, `userfaultfd`, real-time signals 32–64, `io_uring`).
+(`fanotify`, `keyctl`, `userfaultfd`, real-time signals 33–64, `io_uring`). The POSIX interval
+timers (`timer_create` 222 … `timer_delete` 226) joined that set with the five numbers they are;
+`SIGRTMIN` (32) is queued, masked and waited for — the one real-time number musl's
+`SIGEV_THREAD` helper needs — while a *disposition* for it, and the range above it, is still
+refused.
 
 Where the handlers live, and why the files are as big as they are:
 
@@ -314,15 +318,17 @@ cargo xtask run          # boot it; rebuilds first if anything is stale
 The kernel boots, brings up the initramfs, pivots into the Alpine root filesystem and drops you
 into an interactive shell — in the QEMU window, with the kernel log on the serial line.
 
-`cargo xtask run` takes a mode that decides the window, the serial line and the guest's own
-console policy together:
+`cargo xtask run` takes a mode that decides how the window and the serial line are wired, and
+which consoles the guest is told it has. The guest is told with Linux's own `console=` words,
+and nothing else: every console on the list receives the log and the last one is the preferred
+console — the one whose writes wait rather than being dropped.
 
-| Mode | What you get |
-|------|--------------|
-| `terminal` | Serial only, no window, the GPU never engages — the lossless log |
-| `gui` | The framebuffer window only; the serial line goes quiet after takeover |
-| `mirror` | The window plus a best-effort copy on the serial line (the default) |
-| `weston` | The window belongs to the compositor: the kernel console never takes the scanout |
+| Mode | What you get | Guest `console=` |
+|------|--------------|------------------|
+| `terminal` | Serial only, no window — the lossless log; `/dev/fb0` still exists, nothing is drawn on it | `console=ttyS0` |
+| `gui` | The framebuffer window only; the serial line goes quiet after takeover | `console=tty0` |
+| `mirror` | The window plus a best-effort copy on the serial line (the default) | `console=ttyS0 console=tty0` |
+| `weston` | The window belongs to the compositor, which claims the scanout at runtime | `console=ttyS0` |
 
 ```bash
 cargo xtask run --mode terminal      # watch the boot log

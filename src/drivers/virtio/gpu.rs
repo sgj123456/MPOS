@@ -325,11 +325,11 @@ pub fn global() -> Option<Arc<VirtioGpuDev>> {
 /// rather than a `CharDevice`, because its face is bigger than a stream:
 /// reads and writes at offsets, `mmap` of the pixels themselves, and the
 /// two `FBIOGET_*` ioctls the fbdev ABI is entered through.
-pub struct FbDev(Arc<VirtioGpuDev>);
+pub struct FbDev(Arc<VirtioGpuDev>, crate::vfs::devfs::NodePerms);
 
 impl FbDev {
     pub fn new(dev: Arc<VirtioGpuDev>) -> Self {
-        FbDev(dev)
+        FbDev(dev, crate::vfs::devfs::NodePerms::new(0o666, 0, 0))
     }
 
     /// The resolution the framebuffer was built at.
@@ -356,6 +356,26 @@ impl FbDev {
 }
 
 impl Inode for FbDev {
+    fn keeps_modes(&self) -> bool {
+        self.1.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        self.1.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.1.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.1.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        self.1.set_owner(uid, gid);
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x9001,

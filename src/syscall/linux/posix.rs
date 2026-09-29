@@ -927,9 +927,15 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
 /// honoured: it latches the thread to the four-call allow-list (`read`,
 /// `write`, `exit`, `sigreturn`) enforced at dispatch, irreversible for the
 /// thread's life. Filter mode installs a classic-BPF program
-/// (`SECCOMP_SET_MODE_FILTER`), and the availability probe returns the empty
-/// set, so a caller that asks whether an action is supported is told no rather
-/// than left to guess.
+/// (`SECCOMP_SET_MODE_FILTER`), whose evaluation and eight actions are
+/// `src/seccomp.rs` and the gate above.
+///
+/// `SECCOMP_GET_ACTION_AVAIL` answers **the truth about which of those eight
+/// this kernel implements**, which is the whole point of the call existing: it
+/// is asked before a filter relies on an action, precisely because Linux kills
+/// the process on one it does not know. An "is this available?" that answered
+/// no for everything was a request not to be asked, and a program told no falls
+/// back; the risk was never answering no, it was answering yes.
 pub fn handle_seccomp(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SET_MODE_STRICT: usize = 0;
     const SET_MODE_FILTER: usize = 1;
@@ -948,11 +954,29 @@ pub fn handle_seccomp(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             0
         }
         SET_MODE_FILTER => super::abi::install_seccomp_filter(args[2], args[1], from_user),
+        // The three answers the probe has, all measured: `EOPNOTSUPP` for an
+        // action this kernel does not implement (Linux's own refusal, and not
+        // `EINVAL`, which is reserved for an operand that is wrong), `EINVAL`
+        // for a `flags` it would have to ignore, and `EFAULT` for a pointer it
+        // cannot read. The order is the operands' own order - a caller that got
+        // both wrong hears about the flag, which is the answer it can act on.
         GET_ACTION_AVAIL => {
-            if args[2] == 0 || !buffer_ok(args[2], 4, true, from_user) {
+            if args[1] != 0 {
+                return err::EINVAL;
+            }
+            // `write = false`: this is a read of the caller's word. The pointer
+            // must be readable rather than writable, and asking for write
+            // permission here would fail a caller that put its action in
+            // read-only memory - which is what `const`-declared data is.
+            if args[2] == 0 || !buffer_ok(args[2], 4, false, from_user) {
                 return err::EFAULT;
             }
-            unsafe { (args[2] as *mut u32).write_unaligned(0) };
+            let asked = unsafe { (args[2] as *const u32).read_unaligned() };
+            if !crate::seccomp::supported(asked) {
+                return err::EOPNOTSUPP;
+            }
+            // Linux leaves the caller's word alone - the return value is what
+            // carries the answer, and there is nothing useful to write back.
             0
         }
         _ => err::EINVAL,
@@ -987,6 +1011,11 @@ pub fn handle_setdomainname(args: [usize; ARG_COUNT]) -> isize {
 /// waiting, as a mask. The pending set is not the blocked set: a signal can
 /// be both (arrived, and held back from delivery), and the man page's
 /// contract is that this answers about the arrivals alone.
+///
+/// The answer goes out in the wire's `sigset_t` (signal *n* in bit *n-1*), the
+/// same conversion `rt_sigprocmask` takes its sets in through: the kernel's own
+/// arithmetic names signal *n* by bit *n*, and a caller reading the kernel's
+/// spelling would see every signal one place off.
 pub fn handle_rt_sigpending(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (set, sigsetsize) = (args[0], args[1]);
     if sigsetsize != 8 {
@@ -995,8 +1024,8 @@ pub fn handle_rt_sigpending(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     if set == 0 || !buffer_ok(set, 8, true, from_user) {
         return err::EFAULT;
     }
-    let pending = crate::sched::current_pending();
-    unsafe { (set as *mut u64).write_unaligned(pending as u64) };
+    let pending = crate::sched::signal::to_wire(crate::sched::current_pending());
+    unsafe { (set as *mut u64).write_unaligned(pending) };
     0
 }
 
@@ -1086,7 +1115,8 @@ pub fn handle_rt_sigsuspend(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     if mask_ptr == 0 || !buffer_ok(mask_ptr, 8, false, from_user) {
         return err::EFAULT;
     }
-    let wanted = unsafe { (mask_ptr as *const u64).read_unaligned() } as u32;
+    let wanted =
+        crate::sched::signal::from_wire(unsafe { (mask_ptr as *const u64).read_unaligned() });
     // The two the kernel keeps for itself cannot be waited *in* either.
     let reserved = crate::sched::signal::bit(crate::sched::signal::SIGKILL)
         | crate::sched::signal::bit(crate::sched::signal::SIGSTOP);

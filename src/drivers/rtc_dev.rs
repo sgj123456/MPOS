@@ -36,8 +36,8 @@ use crate::vfs::{VfsError, VfsResult};
 pub struct RtcDev;
 
 impl CharDevice for RtcDev {
-    fn read(&self, _buf: &mut [u8]) -> usize {
-        0
+    fn read(&self, _buf: &mut [u8]) -> crate::vfs::VfsResult<usize> {
+        Ok(0)
     }
 
     fn write(&self, buf: &[u8]) -> usize {

@@ -63,6 +63,10 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
     // The whole check sits behind one relaxed load of a machine-wide flag, so a
     // machine that never installs a filter - every boot in this image - pays
     // nothing for the feature.
+    //
+    // Every arm below was measured against this developer's Linux rather than
+    // read off the man page, because three of them are not what the man page
+    // sounds like; §8.2 holds the numbers and the two drafts that were wrong.
     if crate::seccomp::any_installed() {
         let mut data_args = [0u64; 6];
         for (slot, arg) in data_args.iter_mut().zip(args) {
@@ -70,42 +74,61 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         }
         let data = crate::seccomp::data_bytes(nr as i32, proc::user_ip(regs_ptr), data_args);
         if let Some(answer) = crate::sched::run_seccomp_filters(&data) {
+            use crate::sched::signal::SIGSYS;
             use crate::seccomp as sc;
             match sc::action(answer) {
                 // Allow, and the log action that also allows: this kernel has
                 // one loglevel and no per-filter audit sink, so a filter asking
-                // for its decision to be recorded gets the decision.
+                // for its decision to be recorded gets the decision. Measured:
+                // `LOG` lets the call through exactly as `ALLOW` does.
                 sc::RET_ALLOW | sc::RET_LOG => {}
-                // `TRACE` with no tracer attached is an allow, which is the
-                // ABI's own rule - the program is waiting for a supervisor
-                // that never came, and refusing the call would hang it.
-                sc::RET_TRACE => {}
+                // `ERRNO`: the call does not happen, and the errno is the data
+                // half verbatim - including the case that surprises, a data
+                // half of 0, which answers a *successful* 0 rather than an
+                // error. Measured: `-data` for both.
                 sc::RET_ERRNO => return -(sc::action_data(answer) as isize),
+                // `TRAP`: `SIGSYS`, raised instead of the call. With no handler
+                // - the default action, and every case a real program has - the
+                // process dies of it. With one, Linux's handler returns into
+                // the caller's own registers, so the caller reads back whatever
+                // it had in `rax`, which on x86_64 is the number it just asked
+                // for: `getppid` measured as answering 110. The return below is
+                // that observation rather than a choice, and ENOSYS here would
+                // have been the plausible-looking wrong answer.
                 sc::RET_TRAP => {
-                    // `SIGSYS`, and the call does not happen: a program that
-                    // catches it and returns from the handler resumes *after*
-                    // the syscall, which is what makes this a usable
-                    // single-step hook.
-                    crate::sched::send_signal(
-                        crate::sched::current(),
-                        crate::sched::signal::SIGSYS,
-                    );
+                    crate::sched::send_signal(crate::sched::current(), SIGSYS);
+                    return nr as isize;
+                }
+                // `TRACE`: a tracer that never asked for
+                // `PTRACE_O_TRACESECCOMP` lets the call through, and that
+                // option is refused by `PTRACE_SETOPTIONS` here, so every
+                // traced caller on this machine is that kind of tracer. Nobody
+                // tracing: the call fails with `ENOSYS`, which is the measured
+                // answer and the one that is *not* what "trace" sounds like.
+                sc::RET_TRACE => {
+                    if !crate::sched::has_tracer(crate::sched::current()) {
+                        return err::ENOSYS;
+                    }
+                }
+                // `USER_NOTIF` hands the call to a userspace supervisor, and
+                // this kernel has none to hand it to. Measured: Linux with no
+                // listener fails the call with `ENOSYS`, so refusing it is not
+                // a fallback but the answer for the machine it is running on.
+                sc::RET_USER_NOTIF => return err::ENOSYS,
+                // The kills, and any value not recognised above: all of them
+                // end the task with **`SIGSYS`**, which is what Linux's
+                // `RET_KILL_THREAD` and `RET_KILL_PROCESS` actually deliver -
+                // `SIGKILL` was this kernel's answer before it was measured,
+                // and would have been the wrong signal to hang the change on.
+                // An unrecognised action falling here is deliberate too: the
+                // man page says Linux treats those as `KILL_PROCESS`, and a
+                // filter returning an invented action was seen to kill the
+                // process with SIGSYS. Allowing instead would have been the
+                // one direction a sandbox cannot survive being wrong in.
+                _ => {
+                    crate::sched::send_signal(crate::sched::current(), SIGSYS);
                     return err::ENOSYS;
                 }
-                sc::RET_KILL_THREAD | sc::RET_KILL_PROCESS => {
-                    // This kernel has no threads to kill apart from the
-                    // process's, so the two are the same act here.
-                    crate::sched::send_signal(
-                        crate::sched::current(),
-                        crate::sched::signal::SIGKILL,
-                    );
-                    return err::ENOSYS;
-                }
-                // `USER_NOTIF` asks for a supervisor this kernel has no way to
-                // summon, and an action it does not know must not be allowed by
-                // default: both refuse the call, which is the safe direction to
-                // be wrong in.
-                _ => return err::ENOSYS,
             }
         }
     }
@@ -265,6 +288,16 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::GETITIMER => proc::handle_getitimer(args),
         nr::SETITIMER => proc::handle_setitimer(args),
         nr::ALARM => proc::handle_alarm(args),
+        // The POSIX interval timer family. `timer_create` is what a libc
+        // reaches for when a program asks for a *callback* on a timeout
+        // (`SIGEV_THREAD`), which musl spells as a helper thread plus a
+        // `SIGEV_THREAD_ID` timer carrying `SIGRTMIN` - the shape
+        // `proc::handle_timer_create` answers.
+        nr::TIMER_CREATE => proc::handle_timer_create(args, from_user),
+        nr::TIMER_SETTIME => proc::handle_timer_settime(args, from_user),
+        nr::TIMER_GETTIME => proc::handle_timer_gettime(args, from_user),
+        nr::TIMER_GETOVERRUN => proc::handle_timer_getoverrun(args),
+        nr::TIMER_DELETE => proc::handle_timer_delete(args),
         nr::SYSINFO => proc::handle_sysinfo(args),
         nr::CLOCK_GETTIME => proc::handle_clock_gettime(args),
         nr::GETTIMEOFDAY => proc::handle_gettimeofday(args),
@@ -476,11 +509,14 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
     if ret == super::err::EOPNOTSUPP {
         // The one case where the number is not the information: `ioctl` is a
         // thousand requests behind one number, and the request word is what
-        // says which device was asked for what.
+        // says which device was asked for what. The fd-bearing calls
+        // (`write`, `fallocate`, `llseek`, the xattr `f`-forms ...) name a
+        // descriptor rather than a number too, so a refused `write` is only
+        // diagnosable by which file it was aimed at - print that.
         if nr == nr::IOCTL {
             note_eopnotsupp_ioctl(args[0] as i32, args[1] as u32);
         } else {
-            note_eopnotsupp(nr);
+            note_eopnotsupp(nr, args[0] as i32);
         }
     }
     ret
@@ -522,10 +558,13 @@ fn note_enosys(nr: u64) {
 /// the number once. "Not supported" is a legitimate answer a libc probes for -
 /// `O_TMPFILE` on a filesystem without it, a `SEEK_HOLE` no driver answers -
 /// and printing it on every occurrence turned one such call into a line per
-/// attempt on the console.
-fn note_eopnotsupp(nr: u64) {
+/// attempt on the console. `fd` is the call's first argument, which for the
+/// descriptor-taking syscalls names the file that refused - `write(1)` alone
+/// only says *a* write was refused, not whose - so it is printed beside it.
+/// Path-taking calls name nothing useful in `fd`, and there it is noise.
+fn note_eopnotsupp(nr: u64, fd: i32) {
     if abi::mark_unsupported(nr) {
-        crate::print!("mpos: syscall {nr} -> EOPNOTSUPP\n");
+        crate::print!("mpos: syscall {nr} (fd {fd}) -> EOPNOTSUPP\n");
     }
 }
 
@@ -665,6 +704,13 @@ fn rt_sigprocmask(args: [usize; 6]) -> isize {
         }
         requested = unsafe { (set as *const u64).read_unaligned() };
     }
+    // The wire's `sigset_t` holds signal *n* in bit *n-1*; the kernel's mask
+    // arithmetic names signal *n* by bit *n* (`signal::Pending`), and this
+    // boundary is where the two spellings are told apart. Converting here is
+    // what makes a libc's `sigaddset(SIGTERM)` actually block `SIGTERM` rather
+    // than its neighbour — the off-by-one both sides could otherwise live
+    // with happily, because no test inside the kernel speaks the wire.
+    let requested = crate::sched::signal::from_wire(requested);
 
     // The query half is answered first and from the mask as it stands, which
     // is what makes the common `rt_sigprocmask(0, NULL, &old, 8)` a pure read.
@@ -673,15 +719,14 @@ fn rt_sigprocmask(args: [usize; 6]) -> isize {
         if !super::buffer_ok(old, 8, true, true) {
             return err::EFAULT;
         }
-        unsafe { (old as *mut u64).write_unaligned(current as u64) };
+        unsafe { (old as *mut u64).write_unaligned(crate::sched::signal::to_wire(current)) };
     }
 
     if set != 0 {
-        let wanted = requested as u32;
         let next = match how {
-            SIG_BLOCK => current | wanted,
-            SIG_UNBLOCK => current & !wanted,
-            _ => wanted,
+            SIG_BLOCK => current | requested,
+            SIG_UNBLOCK => current & !requested,
+            _ => requested,
         };
         // Two signals cannot be blocked by anyone: they are how the kernel
         // stops a process that has stopped listening, and a mask that could

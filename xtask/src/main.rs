@@ -176,8 +176,13 @@ fn main() -> Result<()> {
 
     // The host wiring follows the mode the user asked for (or, with no
     // `--mode`, the mode the image is already baked in), so the window and
-    // the serial line always match the guest's own console policy.
-    let boot_mode = run_mode.unwrap_or_else(|| qemu::baked_mode(&build_dir));
+    // the serial line always match the consoles the guest was told to use. An
+    // image with no marker has just been refreshed above (`needs_mode_switch`
+    // is true for one whatever mode was asked for), so the fallback is only
+    // read on a build that is about to happen anyway.
+    let boot_mode = run_mode
+        .or_else(|| qemu::baked_mode(&build_dir))
+        .unwrap_or(config::RunMode::Mirror);
 
     let result = dispatch(
         cli.command,

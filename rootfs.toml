@@ -27,7 +27,8 @@ repos = ["main", "community"]
 filesystem = "ext4"
 # How the guest sees the root device (virtio disk in QEMU)
 root_device = "/dev/vda2"
-# Serial port the kernel's console goes to
+# Serial port the kernel's console goes to, named on the kernel command line as
+# `console=ttyS0`. It is the same name the image's getty runs on.
 serial_port = "ttyS0"
 # Disk image size
 image_size = "2G"
@@ -187,27 +188,30 @@ vsock = true
 # or newer for the card to exist at all.
 audio = true
 # How `cargo xtask run` boots the machine, overridable per invocation with
-# `--mode <mode>`. One word for the whole shape, because the window, the serial
-# line and the guest's own console policy have to agree on it together:
-#   terminal - serial only, no window, the GPU never engages (the whole console
-#              rides ttyS0, losslessly);
-#   gui      - the framebuffer window only, the serial line carries nothing once
-#              the console moves over;
-#   mirror   - the window plus a best-effort copy on the serial line, so the same
-#              console shows in the window and the terminal at once. The mirror
-#              is non-blocking: under a flood the serial transcript may drop
-#              bytes, but the window never stalls;
-#   weston   - the window is the compositor's for as long as its own virtual
-#              console is the one on the screen: the kernel console never moves
-#              onto the framebuffer and a typed line never paints over weston,
-#              while the boot log still rides the serial line. Nothing starts
-#              the compositor - `./start-weston.sh` in root's home does, once the
-#              login prompt appears. Switch away with `^A 1`..`^A 6`: the session
-#              is asked to release the display, its page flips start coming back
-#              EACCES, and the window shows the console you switched to. The wire
-#              keeps carrying the kernel log and the shells either way, so this
-#              is the one mode where the window and the terminal are
-#              deliberately different views.
+# `--mode <mode>`. One word picks both the QEMU wiring and the consoles the guest
+# is told to use, because the window and the guest's own console have to agree:
+#   terminal - serial only, no window. The guest is given `console=ttyS0`, so the
+#              wire is its only console and the whole boot rides it losslessly;
+#              the display device is still probed, and `/dev/fb0` still answers,
+#              but nothing is drawn on it;
+#   gui      - the framebuffer window only: `console=tty0`, and the serial line
+#              carries nothing once the console moves over;
+#   mirror   - `console=ttyS0 console=tty0`: the window takes the console over
+#              once the framebuffer is up, and the wire keeps a best-effort copy
+#              of the same text. The copy is non-blocking, so under a flood the
+#              serial transcript may drop bytes while the window never stalls;
+#   weston   - `console=ttyS0`, and the window belongs to the compositor for as
+#              long as its own virtual console is the one on the screen: the
+#              kernel console never moves onto the framebuffer and a typed line
+#              never paints over weston, while the boot log rides the serial
+#              line. Nothing starts the compositor - `./start-weston.sh` in
+#              root's home does, once the login prompt appears. Switch away with
+#              `^A 1`..`^A 6`: the session is asked to release the display, its
+#              page flips start coming back EACCES, and the window shows the
+#              console you switched to. The wire keeps carrying the kernel log
+#              and the shells either way, so this is the one mode where the
+#              window and the terminal are deliberately different views.
 # Unset means mirror, which is what `run` did before the modes were split. A
-# `cargo xtask test` boot ignores this and always runs headless.
+# `cargo xtask test` boot ignores this: its command line is its own, and it names
+# the wire alone.
 mode = "weston"

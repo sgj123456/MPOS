@@ -16,10 +16,10 @@
 //! * `VT_AUTO` - the default: switching to or away from it is unconditional, and
 //!   the kernel does as asked.
 //! * `VT_PROCESS` - switching *away* is a request, not an act. The kernel marks
-//!   the console releasing, sends its foreground group `relsig`, and does not
-//!   move the screen until that session calls `VT_RELDISP` to agree (or
-//!   `VT_RELDISP(0)` to refuse). A session that wants the screen at all - which
-//!   is any compositor - is in this mode, because the alternative is a text
+//!   the console releasing, sends `relsig` to the process that promised to answer
+//!   it, and does not move the screen until that session calls `VT_RELDISP` to
+//!   agree (or `VT_RELDISP(0)` to refuse). A session that wants the screen at all -
+//!   which is any compositor - is in this mode, because the alternative is a text
 //!   console painting over its frames between two keystrokes.
 //!
 //! Two things make the mode worth its complexity, and both are the reason it is
@@ -36,11 +36,45 @@
 //!   parking a queue, so there is at most one [`Release`] in flight, not a
 //!   pending stack per console.
 //!
-//! The `EINVAL` set of `VT_SETMODE` is Linux's: an unknown mode, `relsig ==
-//! acqsig`, or a signal number that is not a signal. And like Linux, the
+//! The one `EINVAL` Linux checks is an unknown `mode`; it looks at none of the
+//! four signal bytes. This kernel also refuses `relsig == acqsig` and a signal
+//! number that is not a signal, which are two refusals Linux does not make - kept
+//! because a promise either of them describes cannot be kept, and named as a
+//! deviation rather than left to be discovered as a surprise. And like Linux, the
 //! console *on the screen* is the one that gets consulted - which is what makes
 //! `VT_SETMODE` a promise about this session's own screen rather than an
 //! instruction to whoever happens to be holding it.
+//!
+//! # Who a promise belongs to
+//!
+//! `VT_PROCESS` is a promise made by a *process*, and Linux keeps it as one:
+//! `VT_SETMODE` stores `vc->vt_pid = get_pid(task_pid(current))`
+//! (`vt_ioctl.c`), and the two signals that carry the handover are sent with
+//! `kill_pid(vc->vt_pid, vc->vt_mode.relsig, 1)` and the same for `acqsig` - to
+//! that process, never to whichever group happens to hold the terminal.
+//!
+//! That is not a detail. A seat manager opens the console, writes
+//! `VT_SETMODE(VT_PROCESS)`, and **closes the descriptor again** before the
+//! compositor it serves ever touches the screen - seatd's `vt_open()` is exactly
+//! that sequence - so the promise outlives the fd that made it by design, and it
+//! is the process, not the terminal, that answers `VT_RELDISP`. Aimed at the
+//! console's foreground group instead, `acqsig` - which every seat manager names
+//! as `SIGUSR2` - lands on whatever session is in the foreground: the compositor
+//! being killed on its way out instead of being told its screen came free, or a
+//! shell that never asked about the screen at all and has no `SIGUSR2` handler.
+//!
+//! And a promise whose process is gone must stop being a promise. Linux notices
+//! at the moment it would have to send: `kill_pid` answering nonzero means the
+//! keeper died, so `reset_vc()` puts the console back to `VT_AUTO`, `KD_TEXT`
+//! and no signals, and the switch proceeds *now* rather than waiting out the
+//! 60-second window for an answer no living process can give. Both halves are
+//! here: the table records the keeper and hands its number out beside every
+//! signal ([`Promise`]), and [`Table::reset`] is `reset_vc`'s table half.
+//!
+//! `frsig` is ignored, as Linux ignores it ("the frsig is ignored, so we set it
+//! to 0"): `VT_SETMODE` stores zero there, `VT_GETMODE` reads zero back, and a
+//! refusal sends nothing at all - the requester learns of it from its own
+//! `VT_ACTIVATE`, which answers `EBUSY`.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -55,20 +89,26 @@ pub const VT_PROCESS: u8 = 0;
 /// else is an `EINVAL` from `VT_SETMODE` rather than a signal nobody can raise.
 pub const MAX_SIGNAL: u8 = 31;
 
-/// How long a release may be waited for, in clock ticks: Linux's
-/// `wait_event_interruptible_timeout(..., 60 * HZ)` in `vt_release`, counted
-/// from the tick the `relsig` went out. This kernel's clock is 250 Hz, so the
-/// figure is 15000 ticks.
+/// How long a release may be waited for, in clock ticks: 60 seconds at this
+/// kernel's 250 Hz.
 ///
-/// The number is Linux's because the wait it bounds is Linux's wait, and a
-/// shorter one would silently let a compositor be killed mid-page-flip on a
-/// machine that is merely slow. Nothing here depends on it for reachability:
-/// the operator's escape is `^A` typed twice, which forces the switch on the
-/// spot, and a session's escape is that its own `relsig` handler answers
-/// `VT_RELDISP`. Both are faster than the timer by design, so the timer is the
-/// last resort rather than the ordinary path - and the ordinary path for a
-/// *person* (the console mux's own wait) is a kernel task that re-examines the
-/// negotiation whether or not anybody answers.
+/// **This bound is ours, not Linux's, and the difference is worth stating**: the
+/// current console code has no timeout on a process-controlled switch at all.
+/// `change_console()` sends `relsig` and returns; if the session never answers
+/// `VT_RELDISP`, the pending switch simply sits there until the session does answer
+/// or the box is rebooted. What Linux does notice is a *dead* keeper - `kill_pid`
+/// fails and `reset_vc` runs - and that half this kernel has too, at the same
+/// moment ([`crate::vfs::vcmux`] aims the signal at the process and resets the
+/// console when nobody is left to receive it).
+///
+/// So the deadline is what the mux has always been for: a session that is wedged
+/// rather than dead - holding the screen, answering nothing, blocking nothing -
+/// must not cost a person the use of the machine. It is the last resort, not the
+/// ordinary path: the ordinary paths are the session's own `VT_RELDISP`, the
+/// operator's second `^A`, and the reset on a keeper that has died.
+///
+/// Nothing here depends on the figure for reachability, and a shorter one would
+/// silently kill a compositor mid-page-flip on a machine that is merely slow.
 pub const RELEASE_TIMEOUT_TICKS: u64 = 60 * 250;
 
 /// Whether a signal number is one a `vt_mode` may name. Zero is "no signal",
@@ -142,16 +182,21 @@ impl VtMode {
     }
 
     /// Whether this mode is one `VT_SETMODE` would accept.
+    ///
+    /// `frsig` is not looked at, because Linux ignores it: `VT_SETMODE` copies
+    /// the caller's struct and then writes zero over that one field, so a number
+    /// there is neither stored nor acted on, and refusing the call for it would
+    /// be this kernel inventing a rule the caller's own man page does not have.
     pub fn validate(&self) -> Result<(), ModeError> {
         if self.mode != VT_AUTO && self.mode != VT_PROCESS {
             return Err(ModeError::BadMode);
         }
-        if !signal_ok(self.relsig) || !signal_ok(self.acqsig) || !signal_ok(self.frsig) {
+        if !signal_ok(self.relsig) || !signal_ok(self.acqsig) {
             return Err(ModeError::BadSignal);
         }
-        // Linux refuses this outright: one process group cannot be told two
-        // opposite things by the same number, and a session that meant
-        // "no signal" for both would have written zeroes.
+        // Linux refuses neither of these; this kernel does, for the reason in
+        // the variant's own note - one keeper cannot be told two opposite things
+        // by the same number. Named as a deviation in `PLAN.md`.
         if self.relsig != 0 && self.relsig == self.acqsig {
             return Err(ModeError::SameSignal);
         }
@@ -162,13 +207,23 @@ impl VtMode {
 /// Why a `VT_SETMODE` was refused. Each of these is `EINVAL` to the caller;
 /// the split exists so a host test can pin that the *reason* was checked, not
 /// just that something failed.
+///
+/// Only [`ModeError::BadMode`] is Linux's refusal: `vt_setmode` checks
+/// `tmp.mode != VT_AUTO && tmp.mode != VT_PROCESS` and nothing else about the
+/// four signal bytes. The other two are this kernel refusing a call Linux would
+/// accept, kept because both describe a promise that cannot be kept - and named
+/// as a deviation in `PLAN.md` rather than left to be discovered as a surprise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeError {
-    /// `mode` is neither `VT_AUTO` nor `VT_PROCESS`.
+    /// `mode` is neither `VT_AUTO` nor `VT_PROCESS`. Linux's `EINVAL`.
     BadMode,
-    /// A signal field names something that is not a signal.
+    /// A signal field names something that is not a signal. Not Linux's - it
+    /// checks nothing here, and a number over `SIGRTMAX` only reaches the caller
+    /// as `kill_pid`'s failure at the next handover.
     BadSignal,
-    /// `relsig == acqsig`.
+    /// `relsig == acqsig`. Not Linux's either: one keeper cannot be told two
+    /// opposite things by the same number, and a session that meant "no signal"
+    /// for both would have written zeroes.
     SameSignal,
 }
 
@@ -179,6 +234,37 @@ pub struct Release {
     pub from: u32,
     pub to: u32,
     pub started: u64,
+}
+
+/// Which of a console's two handover signals a caller wants. There is no third:
+/// Linux ignores `frsig`, and a refusal is answered by the requester's own
+/// `VT_ACTIVATE` returning `EBUSY`, not by a signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    /// "Hand the screen back" - the answer comes as `VT_RELDISP`.
+    Release,
+    /// "The screen is yours" - what a compositor uses to re-take the card.
+    Acquire,
+}
+
+/// A signal the console layer owes, and the process it is aimed at: Linux's
+/// `kill_pid(vc->vt_pid, vc->vt_mode.relsig, 1)` as one value, so the two cannot
+/// be separated by a caller that remembers the number and forgets who named it.
+///
+/// A signal here is only ever sent to `pid`. That is the whole point of the
+/// struct: the promise was made by one process, and a handover signal that
+/// follows the *terminal* instead would strike whichever session is in the
+/// foreground when it goes out - a compositor on its way out, or a shell that
+/// never asked to be consulted and has no handler for `SIGUSR2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Promise {
+    /// The signal number the promise named.
+    pub sig: u8,
+    /// The thread group that wrote `VT_SETMODE` - the only thing `sig` may be
+    /// sent to. Linux holds a refcounted `struct pid`; this kernel has the slot
+    /// number, which a later process can be given after the keeper dies (see the
+    /// named gap in `PLAN.md`).
+    pub pid: u32,
 }
 
 /// What the caller of [`Table::request_switch`] is told to do next. The table
@@ -194,22 +280,22 @@ pub enum Decision {
     /// `relsig` a second time.
     Waiting { release: Release },
     /// `to` is refused, because the console on the screen said no and `to` is
-    /// not that console. `frsig` goes to `to`'s foreground group, if it named
-    /// one.
-    Refused {
-        refusing: u32,
-        to: u32,
-        frsig: Option<u8>,
-    },
+    /// not that console. **Nothing is sent** - Linux ignores `frsig` and sends
+    /// no refusal signal at all; the requester learns of the refusal from its own
+    /// `VT_ACTIVATE`, which answers `EBUSY`, or from `VT_GETSTATE`.
+    Refused { refusing: u32, to: u32 },
     /// You are the console on the screen, asking for the screen you already
     /// have: `VT_ACTIVATE`'s successful no-op, and the one case where a
     /// standing refusal is lifted.
     Already { to: u32 },
-    /// The console on the screen is in `VT_PROCESS`: send `relsig` to its
-    /// foreground group and leave the screen where it is until it answers.
+    /// The console on the screen is in `VT_PROCESS`: send `relsig` to the
+    /// process that promised, and leave the screen where it is until it answers.
+    /// `None` is a console that cannot be asked - it named no signal - which the
+    /// caller must treat as a release that is already overdue rather than a wait
+    /// nobody can end.
     BeginRelease {
         release: Release,
-        relsig: Option<u8>,
+        relsig: Option<Promise>,
     },
 }
 
@@ -221,6 +307,11 @@ pub enum Decision {
 /// and the ioctl turns that into `EINVAL`.
 pub struct Table {
     modes: Vec<VtMode>,
+    /// Which process made each console's `VT_PROCESS` promise, 0 for nobody.
+    /// Kept beside the mode rather than inside it because `VtMode` is the wire
+    /// struct - eight bytes that `VT_GETMODE` writes back - and the keeper is not
+    /// on the wire: Linux stores it in `struct vc_data`, not in `vt_mode`.
+    keepers: Vec<u32>,
     active: u32,
     /// The negotiation in flight, if any.
     release: Option<Release>,
@@ -238,6 +329,7 @@ impl Table {
     pub fn new(count: u32) -> Table {
         Table {
             modes: vec![VtMode::AUTO; count as usize + 1],
+            keepers: vec![0; count as usize + 1],
             active: 1,
             release: None,
             refusing: 0,
@@ -275,21 +367,29 @@ impl Table {
         self.release.is_some_and(|r| r.from == vc)
     }
 
-    /// `VT_SETMODE`: record a console's mode.
+    /// `VT_SETMODE`: record a console's mode, and the process `pid` that made it
+    /// its promise.
     ///
     /// `None` means `vc` is not one of this machine's consoles.
+    ///
+    /// Linux ignores `frsig` - `vc->vt_mode = tmp; /* the frsig is ignored, so we
+    /// set it to 0 */` - so what is *stored* here has it zeroed, and that is what
+    /// `VT_GETMODE` reads back. A caller that set it (seatd sets `SIGIO`) cannot
+    /// be told a refusal by that number, because no refusal signal is ever sent.
     ///
     /// Leaving `VT_PROCESS` clears a negotiation this console was holding up: a
     /// session that stops asking to be consulted has, by that act, agreed. That
     /// is what makes `^A` work again after a compositor exits without cleaning
     /// up after itself.
-    pub fn set_mode(&mut self, vc: u32, mode: VtMode) -> Result<(), Option<ModeError>> {
+    pub fn set_mode(&mut self, vc: u32, mode: VtMode, pid: u32) -> Result<(), Option<ModeError>> {
         if vc == 0 || self.modes.get(vc as usize).is_none() {
             return Err(None);
         }
         mode.validate().map_err(Some)?;
-        self.modes[vc as usize] = mode;
-        if mode.mode != VT_PROCESS {
+        let stored = VtMode { frsig: 0, ..mode };
+        self.modes[vc as usize] = stored;
+        self.keepers[vc as usize] = if stored.mode == VT_PROCESS { pid } else { 0 };
+        if stored.mode != VT_PROCESS {
             if let Some(release) = self.release
                 && release.from == vc
             {
@@ -300,6 +400,67 @@ impl Table {
             }
         }
         Ok(())
+    }
+
+    /// The promise console `vc` holds: the signal `which` names and the process
+    /// it must be sent to, or `None` when there is no promise, no signal, or no
+    /// keeper to receive it. `None` is the answer that ends a wait rather than
+    /// starting one - see [`Table::deadline`].
+    pub fn promise(&self, vc: u32, which: Signal) -> Option<Promise> {
+        let mode = self.modes.get(vc as usize)?;
+        if mode.mode != VT_PROCESS {
+            return None;
+        }
+        let sig = match which {
+            Signal::Release => mode.relsig,
+            Signal::Acquire => mode.acqsig,
+        };
+        if sig == 0 {
+            return None;
+        }
+        let pid = self.keepers.get(vc as usize).copied().unwrap_or(0);
+        if pid == 0 {
+            return None;
+        }
+        Some(Promise { sig, pid })
+    }
+
+    /// `reset_vc`, the table half: a promise whose keeper has died is no
+    /// promise, so the console goes back to automatic with no signals named and
+    /// no keeper, and anything it was holding up is over. Linux's other half -
+    /// the console's `KD_TEXT` - belongs to the caller, which owns the screen.
+    ///
+    /// Returns whether the console had anything to take away, so the caller does
+    /// not repaint a console that was already automatic.
+    ///
+    /// This and the keeper writing `VT_AUTO` itself (`seat.c`'s `vt_close` does
+    /// exactly that on the way out) are the only two ways a promise ends. There is
+    /// deliberately **no** hook on the last close of the console's descriptor: a
+    /// seat manager opens the console, writes `VT_SETMODE(VT_PROCESS)` and closes
+    /// the fd before the compositor it serves ever touches the screen - `vt_open`
+    /// is open, set mode, set keyboard, set graphics, `close(ttyfd)` - so ending a
+    /// promise at that close, even one ended only by the process that wrote it,
+    /// would erase the claim the moment it is made and put the compositor's screen
+    /// back in the hands of whatever the text console draws next. The promise is a
+    /// process's, not a descriptor's; that is what Linux's `vc->vt_pid` is for, and
+    /// its own comment on the alternative says why it was not taken ("tracking tty
+    /// count may be undesirable").
+    pub fn reset(&mut self, vc: u32) -> bool {
+        if vc == 0 || self.modes.get(vc as usize).is_none() {
+            return false;
+        }
+        let had = self.modes[vc as usize].mode == VT_PROCESS;
+        self.modes[vc as usize] = VtMode::AUTO;
+        self.keepers[vc as usize] = 0;
+        if let Some(release) = self.release
+            && release.from == vc
+        {
+            self.release = None;
+        }
+        if self.refusing == vc {
+            self.refusing = 0;
+        }
+        had
     }
 
     /// `VT_ACTIVATE`, and the `^A <digit>` path: ask for console `to` to be the
@@ -326,7 +487,6 @@ impl Table {
             return Some(Decision::Refused {
                 refusing: self.refusing,
                 to,
-                frsig: self.signal(self.refusing, |m| m.frsig),
             });
         }
         // Already negotiating. The target moves - a person who types `^A 3`
@@ -357,7 +517,7 @@ impl Table {
         self.release = Some(release);
         Some(Decision::BeginRelease {
             release,
-            relsig: self.signal(release.from, |m| m.relsig),
+            relsig: self.promise(release.from, Signal::Release),
         })
     }
 
@@ -404,7 +564,7 @@ impl Table {
     /// length of a timer it can never be rescued by.
     pub fn deadline(&self) -> Option<u64> {
         let release = self.release?;
-        if self.signal(release.from, |m| m.relsig).is_none() {
+        if self.promise(release.from, Signal::Release).is_none() {
             return Some(release.started);
         }
         Some(release.started + RELEASE_TIMEOUT_TICKS)
@@ -423,32 +583,6 @@ impl Table {
         self.release = None;
         self.refusing = 0;
         Some(to)
-    }
-
-    /// A negotiation that will never be answered, ended by the console's owner
-    /// letting go of the terminal - a getty respawning over a dead session, a
-    /// compositor's fd closing. Without it the next `^A` waits on a ghost.
-    ///
-    /// The mode goes back to `VT_AUTO` with it, which is what Linux does when
-    /// the last descriptor of a session closes: a promise to answer `relsig`
-    /// belongs to a process, and the process is gone. Leaving `VT_PROCESS`
-    /// behind would strand the next switch on a promise nobody is alive to keep.
-    pub fn abandon(&mut self, vc: u32) {
-        if let Some(release) = self.release
-            && release.from == vc
-        {
-            self.release = None;
-        }
-        if self.refusing == vc {
-            self.refusing = 0;
-        }
-        if vc != 0 && self.modes.len() > vc as usize {
-            self.modes[vc as usize] = VtMode::AUTO;
-        }
-    }
-
-    fn signal(&self, vc: u32, which: impl Fn(&VtMode) -> u8) -> Option<u8> {
-        self.modes.get(vc as usize).map(which).filter(|s| *s != 0)
     }
 }
 
@@ -469,6 +603,12 @@ mod tests {
     use super::*;
 
     const FOUR: u32 = 4;
+    /// The process that makes every promise in these tests - Linux's
+    /// `task_pid(current)` at the moment of `VT_SETMODE`.
+    const KEEPER: u32 = 7;
+    /// Some other process, which must never be able to let go of a promise that
+    /// is not its own.
+    const STRANGER: u32 = 8;
 
     fn process(rel: u8, acq: u8) -> VtMode {
         VtMode {
@@ -508,17 +648,21 @@ mod tests {
     /// with what a stock Linux box answers with.
     #[test]
     fn a_fresh_console_is_automatic() {
-        let t = Table::new(FOUR);
+        let mut t = Table::new(FOUR);
         assert_eq!(t.active(), 1);
         assert_eq!(t.mode(1), Some(VtMode::AUTO));
         assert_eq!(t.mode(0), None);
         assert_eq!(t.mode(FOUR + 1), None);
+        // Nothing promised, so nothing to send anywhere.
+        assert_eq!(t.promise(1, Signal::Release), None);
+        assert!(!t.reset(1));
     }
 
-    /// `VT_SETMODE`'s `EINVAL` set, each reason on its own so a policy that
-    /// stops checking one of them fails a named test rather than a merged one.
+    /// `VT_SETMODE`'s refusals, each reason on its own so a policy that stops
+    /// checking one of them fails a named test rather than a merged one. Only the
+    /// first is Linux's.
     #[test]
-    fn setmode_refuses_the_modes_linux_refuses() {
+    fn setmode_refuses_the_modes_it_refuses() {
         let mut t = Table::new(FOUR);
         assert_eq!(
             t.set_mode(
@@ -526,7 +670,8 @@ mod tests {
                 VtMode {
                     mode: 7,
                     ..VtMode::AUTO
-                }
+                },
+                KEEPER
             ),
             Err(Some(ModeError::BadMode))
         );
@@ -534,14 +679,15 @@ mod tests {
             t.set_mode(
                 1,
                 VtMode {
-                    frsig: 32,
+                    relsig: 32,
                     ..VtMode::AUTO
-                }
+                },
+                KEEPER
             ),
             Err(Some(ModeError::BadSignal))
         );
         assert_eq!(
-            t.set_mode(1, process(10, 10)),
+            t.set_mode(1, process(10, 10), KEEPER),
             Err(Some(ModeError::SameSignal))
         );
         // Two zeroes are the same number and not the same request: that pair
@@ -552,13 +698,14 @@ mod tests {
                 VtMode {
                     mode: VT_PROCESS,
                     ..VtMode::AUTO
-                }
+                },
+                KEEPER
             ),
             Ok(())
         );
         // A console this machine does not have is EINVAL, not a silent no-op.
-        assert_eq!(t.set_mode(FOUR + 1, VtMode::AUTO), Err(None));
-        assert_eq!(t.set_mode(0, VtMode::AUTO), Err(None));
+        assert_eq!(t.set_mode(FOUR + 1, VtMode::AUTO, KEEPER), Err(None));
+        assert_eq!(t.set_mode(0, VtMode::AUTO, KEEPER), Err(None));
         assert_eq!(
             t.mode(1),
             Some(VtMode {
@@ -566,19 +713,104 @@ mod tests {
                 ..VtMode::AUTO
             })
         );
-        t.set_mode(1, VtMode::AUTO).unwrap();
+        t.set_mode(1, VtMode::AUTO, KEEPER).unwrap();
         assert_eq!(t.mode(1), Some(VtMode::AUTO));
     }
 
     /// An accepted mode has to *read back*, or a compositor's screen is painted
     /// over by the text console one keystroke later and nothing was remembered.
+    /// `frsig` is the field that does not read back: Linux ignores it.
     #[test]
     fn an_accepted_mode_reads_back() {
         let mut t = Table::new(FOUR);
         let m = process(10, 12);
-        assert_eq!(t.set_mode(1, m), Ok(()));
+        assert_eq!(t.set_mode(1, m, KEEPER), Ok(()));
         assert_eq!(t.mode(1), Some(m));
         assert_eq!(t.mode(2), Some(VtMode::AUTO));
+        // "the frsig is ignored, so we set it to 0" - `vt_setmode`, measured.
+        // A caller that named one (seatd names `SIGIO`) reads zero back, and no
+        // refusal is ever sent with it.
+        let with_frsig = VtMode {
+            frsig: 29,
+            ..process(10, 12)
+        };
+        assert_eq!(t.set_mode(2, with_frsig, KEEPER), Ok(()));
+        assert_eq!(
+            t.mode(2),
+            Some(VtMode {
+                frsig: 0,
+                ..process(10, 12)
+            })
+        );
+        // And a number that is not a signal is not refused either, for the same
+        // reason: it is dropped before it can be stored or sent.
+        assert_eq!(
+            t.set_mode(
+                3,
+                VtMode {
+                    frsig: 200,
+                    ..process(10, 12)
+                },
+                KEEPER
+            ),
+            Ok(())
+        );
+        assert_eq!(t.mode(3).unwrap().frsig, 0);
+    }
+
+    /// The promise names its keeper: `relsig` and `acqsig` are aimed at the
+    /// process that wrote `VT_SETMODE`, and nothing else. This is the whole of
+    /// why a seat manager can set the mode on a console and close the descriptor,
+    /// and why the signal cannot land on whichever session is in the foreground
+    /// when it goes out.
+    #[test]
+    fn a_promise_names_the_process_that_made_it() {
+        let mut t = Table::new(FOUR);
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
+        assert_eq!(
+            t.promise(1, Signal::Release),
+            Some(Promise {
+                sig: 10,
+                pid: KEEPER
+            })
+        );
+        assert_eq!(
+            t.promise(1, Signal::Acquire),
+            Some(Promise {
+                sig: 12,
+                pid: KEEPER
+            })
+        );
+        // A signal the console never named is no promise to anyone.
+        assert_eq!(t.promise(2, Signal::Release), None);
+        // Leaving VT_PROCESS retires the keeper with the mode: a later promise is
+        // a later process's, not this one's.
+        t.set_mode(1, VtMode::AUTO, STRANGER).unwrap();
+        assert_eq!(t.promise(1, Signal::Release), None);
+    }
+
+    /// A `VT_PROCESS` console whose keeper is gone - a promise recorded with no
+    /// process behind it, which is what a keeper of 0 means here - has nobody to
+    /// ask, so it must not own the screen for the length of a timer.
+    #[test]
+    fn a_promise_with_no_keeper_is_not_a_wait() {
+        let mut t = Table::new(FOUR);
+        t.set_mode(1, process(10, 12), 0).unwrap();
+        assert_eq!(t.mode(1).unwrap().mode, VT_PROCESS);
+        assert_eq!(t.promise(1, Signal::Release), None);
+        assert_eq!(
+            t.request_switch(3, 100, false).unwrap(),
+            Decision::BeginRelease {
+                release: Release {
+                    from: 1,
+                    to: 3,
+                    started: 100
+                },
+                relsig: None
+            }
+        );
+        assert_eq!(t.deadline(), Some(100));
+        assert_eq!(t.expired(100), Some(3));
     }
 
     /// The whole point: leaving a `VT_PROCESS` console is a request, and the
@@ -586,7 +818,7 @@ mod tests {
     #[test]
     fn switching_away_from_a_process_console_asks_first() {
         let mut t = Table::new(FOUR);
-        t.set_mode(1, process(10, 12)).unwrap();
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
         let d = t.request_switch(3, 100, false).unwrap();
         assert_eq!(
             d,
@@ -596,7 +828,10 @@ mod tests {
                     to: 3,
                     started: 100
                 },
-                relsig: Some(10)
+                relsig: Some(Promise {
+                    sig: 10,
+                    pid: KEEPER
+                })
             }
         );
         // Nothing has moved yet, and the same request now says "already asked".
@@ -620,7 +855,7 @@ mod tests {
     #[test]
     fn an_agreed_release_completes_the_switch() {
         let mut t = Table::new(FOUR);
-        t.set_mode(1, process(10, 12)).unwrap();
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
         t.request_switch(3, 100, false).unwrap();
         assert_eq!(t.release_ack(1, true), Ack::Complete { from: 1, to: 3 });
         assert!(!t.is_releasing(1));
@@ -635,27 +870,20 @@ mod tests {
     #[test]
     fn only_the_releasing_console_may_answer() {
         let mut t = Table::new(FOUR);
-        t.set_mode(1, process(10, 12)).unwrap();
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
         t.request_switch(3, 100, false).unwrap();
         assert_eq!(t.release_ack(2, true), Ack::NotReleasing);
         assert_eq!(t.release_ack(3, true), Ack::NotReleasing);
         assert_eq!(t.active(), 1);
     }
 
-    /// A refusal holds the screen and is *repeated* to anyone else who asks,
-    /// with `frsig` - which is how a dead compositor stops being a machine no
-    /// one can move.
+    /// A refusal holds the screen and is *repeated* to anyone else who asks.
+    /// Nothing is sent: Linux ignores `frsig` and sends no refusal signal, and
+    /// the requester's own `VT_ACTIVATE` is what answers `EBUSY`.
     #[test]
     fn a_refusal_holds_the_screen_until_its_owner_lets_go() {
         let mut t = Table::new(FOUR);
-        t.set_mode(
-            1,
-            VtMode {
-                frsig: 21,
-                ..process(10, 12)
-            },
-        )
-        .unwrap();
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
         t.request_switch(3, 100, false).unwrap();
         assert_eq!(t.release_ack(1, false), Ack::Refused { to: 3 });
         assert_eq!(t.active(), 1);
@@ -664,14 +892,10 @@ mod tests {
         assert_eq!(t.release(), None);
         assert_eq!(t.deadline(), None);
         assert_eq!(t.expired(10_000), None);
-        // Another console asking gets the refusal, and tty1's `frsig`.
+        // Another console asking gets the refusal, and nothing else.
         assert_eq!(
             t.request_switch(4, 200, false).unwrap(),
-            Decision::Refused {
-                refusing: 1,
-                to: 4,
-                frsig: Some(21)
-            }
+            Decision::Refused { refusing: 1, to: 4 }
         );
         // The console that refused asking for its own screen back is the
         // one case that lifts it.
@@ -688,7 +912,10 @@ mod tests {
                     to: 4,
                     started: 220
                 },
-                relsig: Some(10)
+                relsig: Some(Promise {
+                    sig: 10,
+                    pid: KEEPER
+                })
             }
         );
     }
@@ -698,7 +925,7 @@ mod tests {
     #[test]
     fn forcing_ends_the_negotiation_immediately() {
         let mut t = Table::new(FOUR);
-        t.set_mode(1, process(10, 12)).unwrap();
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
         t.request_switch(3, 100, false).unwrap();
         assert_eq!(
             t.request_switch(3, 110, true).unwrap(),
@@ -714,7 +941,7 @@ mod tests {
     #[test]
     fn a_release_nobody_can_answer_expires_at_once() {
         let mut t = Table::new(FOUR);
-        t.set_mode(1, process(0, 12)).unwrap();
+        t.set_mode(1, process(0, 12), KEEPER).unwrap();
         t.request_switch(2, 100, false).unwrap();
         assert_eq!(t.deadline(), Some(100));
         assert_eq!(t.expired(100), Some(2));
@@ -726,7 +953,7 @@ mod tests {
     #[test]
     fn a_signalled_release_gets_the_whole_window() {
         let mut t = Table::new(FOUR);
-        t.set_mode(1, process(10, 12)).unwrap();
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
         t.request_switch(2, 0, false).unwrap();
         assert_eq!(t.deadline(), Some(RELEASE_TIMEOUT_TICKS));
         assert_eq!(t.expired(RELEASE_TIMEOUT_TICKS - 1), None);
@@ -761,36 +988,85 @@ mod tests {
         assert_eq!(t.expired(0), None);
     }
 
-    /// A session that exits without putting its mode back must not strand the
-    /// screen: letting go of the console ends the wait it started, and the next
-    /// request is forced rather than negotiated, because there is nobody left
-    /// to answer.
+    /// A promise is ended by its keeper writing `VT_AUTO`, or by the layer
+    /// noticing the keeper is gone - and by nothing else. Nothing in this table
+    /// ends one on a descriptor close, because the process that makes it (a seat
+    /// manager) closes that descriptor before the screen is anyone's: an
+    /// end-on-close rule of any shape erases the claim in the same breath as it is
+    /// made, which is how `VT_PROCESS` becomes a mode that does nothing.
     #[test]
-    fn abandoning_a_console_ends_the_wait_it_started() {
+    fn a_promise_ends_only_when_its_keeper_hands_it_back() {
         let mut t = Table::new(FOUR);
-        t.set_mode(1, process(10, 12)).unwrap();
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
         t.request_switch(3, 100, false).unwrap();
-        t.abandon(1);
-        assert_eq!(t.release(), None);
-        assert_eq!(t.mode(1), Some(VtMode::AUTO));
+
+        // A switch that goes through, a refusal, an expiry: none of them quietly
+        // drop the promise, because it is not the negotiation's to give up.
+        assert!(t.is_releasing(1));
         assert_eq!(
-            t.request_switch(3, 300, false).unwrap(),
-            Decision::SwitchNow { to: 3 }
+            t.promise(1, Signal::Release),
+            Some(Promise {
+                sig: 10,
+                pid: KEEPER
+            })
         );
-        // Dropping back to VT_AUTO does the same thing from the other side.
-        let mut t = Table::new(FOUR);
-        t.set_mode(1, process(10, 12)).unwrap();
-        t.request_switch(3, 100, false).unwrap();
-        t.set_mode(1, VtMode::AUTO).unwrap();
-        assert_eq!(t.release(), None);
-        // And a console that refused, then lost its session, stops refusing:
-        // the veto belonged to a process that is gone.
-        let mut t = Table::new(FOUR);
-        t.set_mode(1, process(10, 12)).unwrap();
-        t.request_switch(3, 100, false).unwrap();
         assert_eq!(t.release_ack(1, false), Ack::Refused { to: 3 });
         assert_eq!(t.refusing(), 1);
-        t.abandon(1);
-        assert_eq!(t.refusing(), 0);
+        assert_eq!(
+            t.promise(1, Signal::Acquire),
+            Some(Promise {
+                sig: 12,
+                pid: KEEPER
+            })
+        );
+
+        // A second process writing the mode replaces the promise wholesale - the
+        // keeper changes with it, which is Linux's `put_pid(old); vt_pid = new`.
+        t.set_mode(1, process(10, 12), STRANGER).unwrap();
+        assert_eq!(
+            t.promise(1, Signal::Release),
+            Some(Promise {
+                sig: 10,
+                pid: STRANGER
+            })
+        );
+
+        // And the keeper's own word ends it.
+        t.set_mode(1, VtMode::AUTO, STRANGER).unwrap();
+        assert_eq!(t.promise(1, Signal::Release), None);
+        assert_eq!(t.mode(1), Some(VtMode::AUTO));
+        // ...or the layer discovering there is nobody to ask.
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
+        t.request_switch(3, 200, false).unwrap();
+        assert!(t.is_releasing(1));
+        assert!(t.reset(1));
+        assert_eq!(t.release(), None);
+        assert_eq!(t.mode(1), Some(VtMode::AUTO));
+    }
+
+    /// The other way a promise dies: the keeper is noticed gone at the moment a
+    /// signal would have gone to it, which is Linux's `kill_pid` failure followed
+    /// by `reset_vc`. Everything the console was holding up has to stop being
+    /// held up, or one dead compositor strands the machine.
+    #[test]
+    fn resetting_a_console_takes_the_promise_and_the_wait() {
+        let mut t = Table::new(FOUR);
+        t.set_mode(1, process(10, 12), KEEPER).unwrap();
+        t.request_switch(3, 100, false).unwrap();
+        assert!(t.is_releasing(1));
+        // A console that was already automatic has nothing to take away.
+        assert!(!t.reset(2));
+        assert!(t.reset(1));
+        assert_eq!(t.mode(1), Some(VtMode::AUTO));
+        assert_eq!(t.promise(1, Signal::Release), None);
+        assert_eq!(t.promise(1, Signal::Acquire), None);
+        assert_eq!(t.release(), None);
+        assert_eq!(t.deadline(), None);
+        // And the acqsig that would have fired when the screen came to console 1
+        // has nowhere to go either.
+        assert_eq!(
+            t.request_switch(3, 200, false).unwrap(),
+            Decision::SwitchNow { to: 3 }
+        );
     }
 }

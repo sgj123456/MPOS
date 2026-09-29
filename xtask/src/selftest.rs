@@ -342,14 +342,13 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     )?;
     fs::copy(utils::kernel_path(profile)?, esp.join("mpos.elf"))?;
     fs::copy(tar, esp.join("initramfs.tar"))?;
-    // `mpos.selftest` is the switch the kernel reads to run its milestone
-    // checks (the half-second clock wait and the scheduler sleeps). A normal
-    // boot leaves it off and goes straight to init; the test boot wants every
-    // check run, so it asks for them here.
-    fs::write(
-        esp.join("mpos.cmdline"),
-        "console=ttyS0 mpos.selftest mpos.headless\n",
-    )?;
+    // Two words, both load-bearing. `console=ttyS0` makes the serial wire the
+    // test boot's only console, so every line the harness reads is the whole of
+    // what the machine said - there is no second console to be missing it on.
+    // `mpos.selftest` is the switch the kernel reads to run its milestone checks
+    // (the half-second clock wait and the scheduler sleeps); a normal boot leaves
+    // it off and goes straight to init, and the test boot wants every check run.
+    fs::write(esp.join("mpos.cmdline"), "console=ttyS0 mpos.selftest\n")?;
 
     let ovmf_dir = qemu::find_ovmf()?;
     let vars = utils::ovmf_vars_path(build_dir);

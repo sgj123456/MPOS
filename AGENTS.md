@@ -68,7 +68,7 @@ the network.
 | `cargo xtask build` | Kernel + UEFI loader | no |
 | `cargo xtask all` | Kernel, initramfs, disk image, root filesystem | yes |
 | `cargo xtask run` | Boot in QEMU, rebuilding if anything is stale | when needed |
-| `cargo xtask run --mode terminal\|gui\|mirror\|weston` | Same, with the window/serial/console policy chosen together | when needed |
+| `cargo xtask run --mode terminal\|gui\|mirror\|weston` | Same, with the QEMU wiring and the guest's `console=` list chosen together | when needed |
 | `cargo xtask test` | **The gate.** Host unit tests, then every user test program booted in QEMU | no |
 | `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` | Just the host unit tests | no |
 | `cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu` | xtask's own unit tests | no |
@@ -119,19 +119,204 @@ leak into the image `cargo xtask run` boots.
 
 ### Current verification state (as of this commit)
 
-The tree is green: `cargo xtask test` ends with `498 passed` host unit tests, `29` from xtask,
-`=== SUMMARY pass=120 fail=0` from the guest suite and QEMU exit `33`. The in-flight refactor
-this section used to warn about — the `user/abitest` programs moving into `syscall/` and
-`integration/`, with edits across `vfs/ext4`, `vfs/tty.rs` and the syscall layer — is finished
-and committed, and `PLAN.md` §11.1.12 records the resolution.
+**Two programs are red; the state below is the measured run, quoted from its own
+summary line.**
 
-The standing rule is unchanged, and it is about the *run* rather than the tree: never report
-"tests pass" from a stale run. Re-run the gate, and quote the summary line and the exit code it
-printed.
+- Host unit tests: `566 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
+  plus `29 passed` from `mpos-xtask`. Measured on this tree. (The `t-sync` `[[bin]]` entry
+  that an in-flight edit had dropped is restored, so the guest gate builds and runs it
+  from current sources rather than riding a stale artifact.)
+- The guest suite reached `=== SUMMARY pass=131 fail=2` (133 built) with QEMU exit code 33.
+  The read-path reconciliation landed: `t-tty-vtime`, `t-tty-eintr` and `t-tty-query` all
+  print `=== PASS`, as do `t-timer-create`, `t-signalfd` and `t-signal-delivery`.
+  The two red programs are both **new pins of this commit's own work**, not old
+  regressions:
+  - `t-dsp` — `/dev/dsp` does not open (`EBADF`/`ENOENT` cascade over every ioctl and the
+    `chmod`): the sound driver's dsp node is not actually registered in the booted
+    machine, so the node work and its test have to be reconciled before `PLAN.md`'s
+    dsp entry can claim anything.
+  - `t-dhcp` — the DHCPDISCOVER goes out whole through `AF_PACKET`, but no BOOTREPLY
+    comes back within five seconds. Whether that is this kernel's tap or slirp's timing
+    is not yet measured; `t-netlat` was green in the same run, so the single-red-as-load
+    excuse does not cover it.
+  Both are red *here* and must not be reported as passing anywhere until re-run.
+
+The standing rule is unchanged: never report "tests pass" from a stale run. Re-run the gate,
+and quote the summary line and the exit code it printed — or say plainly that it did not get
+there.
 
 ---
 
 ## 4. Code conventions
+
+### Every design here is Linux's behaviour — never a toy version of it
+
+This is the rule that governs every other convention in this file, so it comes
+first among them.
+
+MPOS exists so that **unmodified Linux binaries run on it**. That means the value
+of anything added here is exactly how well it answers the question a real program
+actually asks, and it also means the failure modes are asymmetric: a question
+answered with the wrong *shape* sends the caller down a path it cannot recover
+from, while a question answered with the honest errno sends it down its own
+fallback. Nearly-right is worse than absent.
+
+So there are no toy implementations, no "temporary" designs, and nothing meant to
+be filled in later. Concretely:
+
+1. **Measure before designing.** Behaviour a real program depends on is observed
+   on a real Linux first, and the observation is written down with the number
+   next to the claim (§4.1's zero-byte `recvmsg`, §7.2's `EVIOCGPHYS` errno and
+   §8.2's kill actions all started as a measurement). A design argued from a man
+   page alone has repeatedly been wrong, because the man page does not say which
+   half of the rule a caller actually branches on.
+2. **Answer truthfully, or refuse.** If this kernel cannot do what Linux does,
+   it says so in the only language a caller reads: `ENOSYS` for a call that does
+   not exist here, `EOPNOTSUPP` for one that exists but cannot do that,
+   `EINVAL` for an argument it refuses, `EACCES`/`EPERM` for one it will not
+   grant. The `_ => ENOSYS` arm in `src/syscall/linux/mod.rs` is an honest
+   answer and should stay crowded. **Returning success for something not
+   implemented is the single worst thing this codebase can do** — it is how a
+   program comes to believe something false and stops asking.
+3. **No private dialects.** A flag, struct or protocol gets its Linux shape, not
+   a shape this kernel's implementation finds convenient. Two designs that are
+   behaviourally the same today split the moment a third program reads them.
+4. **Refuse rather than approximate.** When the honest alternative to doing it
+   properly is doing it *nearly*, refuse: an action this machine does not
+   implement is `EOPNOTSUPP` from its availability probe instead of quietly
+   allowed (§8.2), and a namespace that isolates nothing is `EOPNOTSUPP` rather
+   than a namespace (§6.3).
+5. **A gap gets a name, not a stub.** Whatever cannot be built today is recorded
+   in `PLAN.md` as a named gap with its measurement and its missing prerequisite
+   beside it — the board's `[~]` entries exist to hold exactly those. A `TODO`
+   in shipped code, a handler that does nothing and returns 0, or a shape that
+   looks finished while silently doing less, are all the same violation.
+6. **A gap gets a pin, or it is not done.** A behaviour landed is a behaviour: host unit test, `t-*` program, or both (§5 says where
+   each kind goes). "Works, verified by hand once" is how this repository lost
+   the same input bug four times.
+
+The rejected alternative is "implement the common case now and tighten it later".
+Its cost has been paid here several times, and it is always paid in debugging
+rather than in writing: udevd untagging every device on the machine, libinput
+dropping every node, a compositor logging a device and then stopping with no
+pointer — each came from an answer that was *nearly* right, and each took longer
+to find than silence would have.
+
+### The five standing checklist rules
+
+Every change is checked against these five before it lands. They are a checklist,
+not decoration — the first governs *what* may go in, the next two *how* it must
+be shaped, and the last two *what* it must carry with it.
+
+1. **Kernel-space discipline.** Follow the Linux standard for what belongs in a
+   kernel: a non-kernel feature stays out of the kernel. Policy that Linux runs
+   in userspace (device management, filesystem utilities, networking daemons) is
+   not this kernel's job; the kernel provides the ABI userspace expects and
+   nothing more.
+2. **High cohesion, low coupling.** Before adding a feature, locate the module
+   that owns the concept, and keep the call graph between modules narrow. If the
+   change would reach into another module's internals, that is a signal the
+   feature is being placed in the wrong module.
+3. **No toy or temporary designs.** Every feature is implemented the Linux way —
+   the same flags, structs, errnos and semantics, measured on real Linux where a
+   program branches on them. This is the governing rule above stated as a
+   checklist item; it is repeated here so it is caught on every pass, and it is
+   never waived for convenience.
+4. **Every behaviour ships with a pin that would fail without it.** A bug fix or
+   a new feature is landed only when the same commit carries a test that would
+   have failed before the change and passes after it — a new unit test, a case
+   added to the existing test module, or a `t-*` program that covers the
+   area. The judgement criterion is exactly that counterfactual: a test that
+   passes with and without the change pins nothing, so it does not count as the
+   pin. A fix without a pin is how the same input bug was lost four times; a
+   feature without a pin is how a gap gets reported as done.
+5. **Respect the designed dependency graph.** Modules depend on each other only
+   along the edges the design allows. Before adding a cross-module dependency,
+   draw (or update) the dependency graph first — `ARCHITECTURE.md` is where the
+   layering facts live — and make the change fit it, not the other way round. A
+   new upward or back edge (e.g. a VFS module calling into a driver's private
+   internals) is a design violation even when it compiles.
+
+### Module boundaries
+
+Rule 5 says to respect the graph; this is the graph. `ARCHITECTURE.md` §2 holds
+the full mermaid diagram with every real `crate::` reference, §3 the ownership
+table and §9 the measured violations — this table is the working copy, and the
+two files must move together.
+
+The intended shape is a one-way stack. A module may call **downward only**
+into what the table's "may depend on" column lists; everything else is a
+boundary violation.
+
+| Module | Owns | May depend on | Must never |
+|---|---|---|---|
+| `main.rs` | Boot sequence, milestone checks, panic handler | anything (it is the wiring) | hold reusable logic — that lives in the lib |
+| `syscall/` (ABI) | Numbers, `abi.rs` facts, dispatch, handlers | `vfs`, `sched`, `mm`, `drivers`, `net`, services | be a per-device ioctl switchboard (V-2) |
+| `vfs/` | `Inode`/`FileSystem`, mounts, fd table, every filesystem, pipes/epoll/timerfd/signalfd | `sched`, `mm`, `blk`, `pci` | downcast to concrete devices through the `Inode` trait (V-1); own the terminal emulator (V-4) |
+| `sched/` | Task table, priority bands, sleep/block, signals, futex | `mm`, `arch`, `binfmt` | host another subsystem's per-process cleanup (V-3) |
+| `mm/` | Buddy frames, slab heap, mapping plans, ELF loader | `boot` | know files, tasks or devices |
+| `arch/` | GDT/IDT, PIC/LAPIC, paging, context switch, syscall gate, timer, ports | `mm` (via its own re-exports only) | be named from outside `arch::` — `arch/mod.rs` re-exports the uniform surface |
+| `console/` | Log ring, serial, framebuffer switch, the six virtual consoles | `arch` | reach into `vfs::term` for the grid (V-4) |
+| `net/` | smoltcp, socket registry, AF_INET/UNIX/NETLINK/VSOCK | `drivers`, `sched`, `uevent` | validate user pointers with `syscall::buffer_ok` (V-9) |
+| `drivers/` | virtio, DRM/KMS, render task, evdev/uinput, PCI config, serial, RTC | `mm`, `pci`, `sched` | call back into `syscall` (V-5) or parse ioctl ABI (V-2) |
+| Services — `blk`, `pci`, `rand`, `uevent`, `binfmt`, `date`, `logging`, `sync`, `evdev`, `uinput`, `seccomp` | One concern each, pure logic, host-compiled where possible | each other and `arch` as drawn | accumulate state that makes them a layer |
+
+Two rules make the table usable rather than decorative:
+
+1. **An existing violation is not precedent.** §9's V-1…V-5 and V-9 are edges
+   that are real today and are being removed in Phase 11. Code may not add a
+   *new* caller along a violation edge, and may not widen one; working around
+   a violation is how it stays removable.
+2. **A needed edge changes the design record first.** If a legitimate new
+   dependency is genuinely missing from §2's graph, update `ARCHITECTURE.md`
+   (§2 diagram and §3 table) in the same commit, with the reason — the graph is
+   the contract, so a diff that contradicts it is the diff that is wrong.
+
+### The extending standing rules
+
+The five above govern placement and shape; these seven govern what a change
+carries with it and what it may not touch. Each exists because of a mode of
+failure this repository has actually paid for.
+
+1. **A test is a contract, not an obstacle.** When the gate goes red, the code
+   changes, not the test. Deleting or weakening a test to make it pass is the
+   same violation as returning success for something unimplemented. Where the
+   test's *expectation* is genuinely wrong — as `t-tty-eintr` was, comparing
+   against `-lin::EINTR` and a two-byte line — the commit body carries the
+   measurement that proves the kernel's answer is Linux's answer.
+2. **Every new parser gets a fuzz target.** Any place the kernel reads
+   user- or wire-supplied bytes — an ioctl argument, an ELF section, a network
+   packet — joins the 18 targets in `fuzz/` in the same commit, or the change
+   says in `PLAN.md` why it does not. The parsers are where the crashes live;
+   that is the whole reason the directory exists.
+3. **A published ABI is append-only.** Syscall numbers, struct layouts and ioctl
+   encodings are contracts once they ship, because a running musl binary reads
+   them at its own address. Changing a shipped shape is exactly the wrong-shape
+   answer §4 calls unrecoverable: it sends every caller down a path it cannot
+   detect. Renumber, repack or reinterpret something already landed only with an
+   explicit migration written down in `PLAN.md`.
+4. **A user-driven allocation must answer "what is the worst case".** The
+   global allocator still panics on failure (`PLAN.md` §8.0), so unbounded
+   user-controlled growth can end the machine. Until that gap is closed, any
+   new path whose allocation volume a user program can steer carries a bound —
+   a capped count, a checked length, or an honest `ENOMEM` at the limit.
+5. **Interrupt context does none of: sleep, allocate, or walk an unbounded
+   structure.** An IRQ handler follows the hard-interrupt version of the
+   lock-poll-try-unlock-park pattern: bounded work, no lock that a preempted
+   task may hold, deferral to a lower half or a parked task when the work is
+   not bounded. The uniprocessor rule makes this cheap to get right and cheap
+   to lose — a spin on a preempted holder is the §4 deadlock, with the machine
+   stopped on it.
+6. **A performance change ships with before/after numbers.** `PLAN.md` §10 is
+   the ledger and it is only true if entries are measurements. An optimisation
+   without a measured cost is how the idle `hlt` bug stayed invisible until a
+   tick was being burned on every wake — if there is no number, it is not a
+   performance change, it is a guess, and guesses go through the normal review.
+7. **One intent per commit.** A refactor and a behaviour change in the same
+   diff cannot carry the §7 body — there is no single *why* to write down, and
+   the review question ("is that Linux's answer?") cannot be asked of a diff
+   that is answering two questions. Split them: the refactor lands first, green
+   on its own, then the change.
 
 ### The `no_std` split is the central convention
 
@@ -190,8 +375,10 @@ so unbounded user-driven growth can kill the kernel (`PLAN.md` §8.0).
    `posix.rs` (identity, capabilities, scheduling, clocks). Argument validation and comment
    contracts belong with the handler; pure ABI facts (flag values, struct layouts, encodings)
    belong in `abi.rs`, which is host-compiled so they can be tested.
-4. A syscall with no implementation must fall through to the `_ => ENOSYS` arm. Do not invent a
-   silent success.
+4. A syscall with no implementation must fall through to the `_ => ENOSYS` arm.
+   Do not invent a silent success, and do not ship a handler that answers 0 while
+   doing less than Linux does — see the rule above for why that is the wrong
+   direction to be wrong in, and for what to write in `PLAN.md` instead.
 5. Add a conformance program under `user/abitest/src/bin/syscall/t-<name>.rs` **and** a
    matching `[[bin]]` entry in `user/abitest/Cargo.toml` — see the next recipe.
 6. Update `PLAN.md`: the "Remaining ABI support" list and the TODO board are the project's
@@ -229,8 +416,10 @@ are the models to copy.
 - A package → `rootfs.toml` (`base_packages` / `extra_packages`) or `initramfs.toml`.
 - A partition, filesystem type, image size, hostname, DNS, or QEMU memory/display/console →
   `rootfs.toml`. The parser is deliberately small: `key = value` plus arrays.
-- Anything about how the machine boots → the `mpos.*` words read in `src/main.rs` and the
-  `--mode` that sets them in `xtask/src/qemu.rs`.
+- Anything about how the machine boots → `mpos.selftest` and the `console=` list, both read in
+  `src/main.rs` through `src/boot/console_list.rs`, and the `--mode` that writes the list in
+  `xtask/src/config.rs` / `xtask/src/rootfs.rs`. The kernel is told which consoles it has and
+  nothing about how it was launched.
 
 ### Touch the boot handoff
 
@@ -268,6 +457,11 @@ The **body carries the why**: what was observed, what was measured, what was rej
 repository's history is the project's design record — a commit that only restates the diff is
 out of place. Use `git log` on the file you are about to change before you change it; the
 rationale for most of the structure is in there.
+
+The review question every change here gets asked is *is that Linux's answer, or a shape that
+looks like it?* Something that cannot be Linux's today says so in the errno it returns and
+takes a named gap in `PLAN.md` in the same commit — see §4. A silent approximation does not
+get to wait for someone to notice it.
 
 Never commit `build/`, `target/`, `build-test/` or anything under `.workbuddy/`, `.qoder/`,
 `.codely-cli/` — all gitignored.

@@ -12,6 +12,12 @@
 #[cfg(all(any(target_os = "none", test), target_arch = "x86_64"))]
 pub mod handoff;
 
+/// The consoles this boot writes its kernel log to, read off the command line
+/// the way Linux reads `console=`. Not target-gated: walking a command line is
+/// pure, and the policy it yields is exactly the kind of thing a host test
+/// should be able to argue with.
+pub mod console_list;
+
 use core::fmt;
 
 /// Room for every region a firmware's memory map can carry after the loader has

@@ -7,18 +7,30 @@
 //! which is how a shell does its own editing and how arrow keys reach it as
 //! the sequences a terminal actually sent.
 //!
-//! Editing is more than backspace. The cursor moves through the line, arrows
-//! walk the history, and keys arrive as escape sequences - `ESC [ D` for left,
-//! `ESC [ 3 ~` for delete, `ESC O A` for up - which have to be recognised as
-//! one key rather than as four typed characters. Sequences with no editing
-//! meaning, including a terminal's answers to what a shell asked it (`ESC[6n`
-//! gets `ESC[41;5R` back), are dropped rather than typed: that is the
-//! difference between a working arrow key and a prompt full of `[41;5R`.
+//! Editing is backspace, line-kill and word-erase, and nothing more: a
+//! cursor, a history the up arrow walks, an escape sequence recognised as one
+//! key - all of that is a line editor's job, and the shells and editors here
+//! (fish, vi) run the terminal in raw mode and bring their own. A canonical
+//! reader on Linux gets exactly what was typed, control bytes and `ESC [ A`
+//! included, delivered when the line is completed; this discipline does the
+//! same, and echoes a control byte as its `^X` form the way `n_tty` does with
+//! `ECHOCTL`. Sequences are input like any other character.
+//!
+//! Output is input's other half, and a question written *out* is answered here
+//! only when this kernel is the terminal that owns the screen. Measured on Linux,
+//! a pty pair's line discipline forwards `ESC [ 6 n` and its cousins byte for byte
+//! and answers none of them, because the emulator holding the master has the
+//! cursor; the console driver answers the same question for a VT, because there
+//! the kernel is the one drawing it. [`Attached`] is that decision, and the
+//! discipline's cursor is the [`crate::vfs::term::cursor`] the grid paints with, so
+//! a report cannot describe a screen that is not the one being shown.
 //!
 //! [`LineDiscipline`] is the pure state machine and runs under `cargo test` on
 //! the host. [`Tty`] owns one under a mutex, echoes to the console as bytes are
-//! received, and turns `read` into a blocking read via
-//! [`crate::sched::block_until`].
+//! received, and turns `read` into a blocking, *interruptible* wait via
+//! [`crate::sched::block_until_deadline`] - Linux's answer to a signal that a
+//! process can catch is to end the read with `EINTR`, and the clock half of the
+//! same wait is what `VMIN`/`VTIME` mean.
 //!
 //! The standard descriptors fd 0, 1 and 2 are three open descriptions of this
 //! one inode, created at start-up (`vfs::file::init_standard`). A `/dev/tty`
@@ -34,14 +46,15 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 
+use super::term::cursor::Cursor;
 use super::termios::{
-    ECHO, ECHOCTL, ICANON, ICRNL, IEXTEN, IGNCR, INLCR, ISIG, ISTRIP, IXON, ONLCR, OPOST, Termios,
-    VEOF, VERASE, VINTR, VKILL, VLNEXT, VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VWERASE,
+    ECHO, ECHOCTL, ICANON, ICRNL, IGNCR, INLCR, ISIG, ISTRIP, IXON, ONLCR, OPOST, Termios, VEOF,
+    VERASE, VINTR, VKILL, VLNEXT, VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VTIME, VWERASE,
 };
 use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
 #[cfg(target_os = "none")]
-use crate::sched::signal::{SIGINT, SIGWINCH};
+use crate::sched::signal::{SIGINT, SIGQUIT, SIGTSTP, SIGWINCH};
 
 const LF: u8 = b'\n';
 const CR: u8 = b'\r';
@@ -50,11 +63,12 @@ const CR: u8 = b'\r';
 /// is typing.
 const BACKSPACE: u8 = 0x08;
 
-/// How many entered lines the up arrow can walk back through.
-const HISTORY_MAX: usize = 64;
 /// How many bytes of an escape sequence's parameters are gathered before the
 /// sequence is given up as a mistake.
 const CSI_MAX: usize = 16;
+/// How many parameters one CSI is read for. `;`-separated beyond this is a
+/// sequence nobody means, and the modes a `h`/`l` can carry fit inside it.
+const PARAMS_MAX: usize = 8;
 /// Cap on the body of an OSC string tracked on the output, so a colour query
 /// can be recognised; a longer run is a colour *set*, which is just forwarded.
 const OSC_MAX: usize = 32;
@@ -75,10 +89,23 @@ fn osc_color_query(body: &[u8]) -> Option<(usize, &'static str)> {
         None
     }
 }
-/// How much of the current output line is remembered for redrawing. A prompt
-/// fits comfortably; a program that prints a screenful without a newline does
-/// not need to be replayed by the editor.
-const PROMPT_MAX: usize = 128;
+/// Whether the kernel console's own voice - `TtyOutput::Serial`, `/dev/console`
+/// and `ttyS0` - is being painted on a grid the kernel owns.
+///
+/// `console::write_bytes` feeds the active grid while one exists and the serial
+/// wire when it does not, so this is the whole of the question "is there a
+/// terminal behind these bytes that can answer for itself". The module that
+/// knows is bare-metal only, and on the host nothing is ever painted, which is
+/// also the honest answer there.
+#[cfg(target_os = "none")]
+fn kernel_console_has_grids() -> bool {
+    crate::console::grids_live()
+}
+
+#[cfg(not(target_os = "none"))]
+fn kernel_console_has_grids() -> bool {
+    false
+}
 
 /// What one input byte asked for, beyond being edited into the line.
 ///
@@ -90,10 +117,19 @@ pub enum Action {
     None,
     /// The foreground reader is to be interrupted.
     Interrupt,
+    /// The foreground reader is to be told to quit — the terminal's `VQUIT`
+    /// character, `SIGQUIT` to the foreground group.
+    Quit,
+    /// The foreground reader is to be suspended — the terminal's `VSUSP`
+    /// character, `SIGTSTP` to the foreground group, the one a job-control
+    /// shell then reports as `[1]+ Stopped` and brings back with `fg`.
+    Suspend,
 }
 
-/// Where an escape sequence has got to. Anything other than [`Ground`](Self::Ground)
-/// means bytes are being gathered into a key, not typed into a line.
+/// Where an output escape sequence has got to. Anything other than
+/// [`Ground`](Self::Ground) means bytes of a sequence are being gathered on
+/// the way *out*, held from the wire until the sequence resolves. Input has no
+/// such state: what a shell types is characters, all of them, like `n_tty`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Esc {
     Ground,
@@ -101,8 +137,6 @@ enum Esc {
     Start,
     /// Saw `ESC [`: control sequence, parameters being gathered.
     Csi,
-    /// Saw `ESC O`: single-shift, one byte left to read.
-    Ss3,
     /// Saw `ESC ]`: an operating-system command, ended by BEL.
     Osc,
     /// A sequence that swallows exactly one more byte - a character-set
@@ -110,84 +144,80 @@ enum Esc {
     One,
 }
 
-/// A key that is not a character: what the arrow, editing and keypad keys
-/// send.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Key {
-    Up,
-    Down,
-    Left,
-    Right,
-    Home,
-    End,
-    Delete,
-    PageUp,
-    PageDown,
-}
-
-/// Where the cursor is on the screen, as far as this kernel can tell.
+/// The terminal a discipline's output is attached to: who draws it, and how big
+/// it is.
 ///
-/// A shell asks the terminal where the cursor is (`ESC[6n`) before it draws
-/// anything, and waits for the answer before it reads another key. Nobody
-/// answers a question asked into a serial port unless the line discipline
-/// does - so it keeps enough of a display in mind to answer, and lets the
-/// host terminal do the drawing.
-#[derive(Clone, Copy, Debug)]
-struct Screen {
-    row: usize,
-    col: usize,
-    rows: usize,
-    cols: usize,
+/// Both halves exist because the line discipline used to guess at them.
+///
+/// `kernel_draws` is the answer to the one question that decides whether an
+/// `ESC [ 6 n` is answered here or sent on its way: *is this kernel the terminal
+/// emulator for these bytes?* Measured on Linux, a pty pair's line discipline
+/// interprets nothing on the output side at all - `ESC [ 6 n`, `ESC [ 5 n`,
+/// `ESC [ c`, `ESC [ ? 6 n`, an `OSC 11 ; ?` and a `DCS 1 + q` each arrived at the
+/// master byte for byte, and none of them was answered: `/dev/pts` is a wire, and
+/// the thing at the other end of it is the terminal. The console driver answers
+/// those same questions for a VT, because there the kernel *is* the emulator.
+/// This kernel answered them everywhere, and so told a shell sitting on a serial
+/// line about a cursor it could not see: `fish` pads the line it is about to
+/// overwrite out to the width it was told, and the wrap that would have preserved
+/// the command's output with it.
+///
+/// `rows`/`cols` are the size that same terminal reports to `TIOCGWINSZ`, and they
+/// are taken here because a cursor counted against one size while a window is
+/// reported at another tells a program twice. Measured with `stty cols 40` on a
+/// shell whose cursor report was still being computed against `80`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attached {
+    pub kernel_draws: bool,
+    pub rows: usize,
+    pub cols: usize,
 }
 
-impl Screen {
-    const fn new() -> Screen {
-        Screen {
-            row: 0,
-            col: 0,
+impl Attached {
+    /// A terminal the kernel neither draws nor owns the size of: what a `/dev/pts`
+    /// pair looks like to its line discipline, and the shape host tests that do
+    /// not care about the answering half use.
+    pub const fn downstream() -> Attached {
+        Attached {
+            kernel_draws: false,
             rows: 25,
             cols: 80,
         }
     }
 
-    fn put(&mut self) {
-        self.col += 1;
-        if self.col >= self.cols {
-            self.col = 0;
-            self.newline();
+    /// The kernel is the emulator, at this size.
+    pub const fn kernel(rows: usize, cols: usize) -> Attached {
+        Attached {
+            kernel_draws: true,
+            rows,
+            cols,
         }
     }
+}
 
-    fn newline(&mut self) {
-        if self.row + 1 < self.rows {
-            self.row += 1;
-        }
-        self.col = 0;
-    }
-
-    fn left(&mut self, n: usize) {
-        self.col = self.col.saturating_sub(n);
-    }
-
-    fn right(&mut self, n: usize) {
-        self.col = (self.col + n).min(self.cols - 1);
-    }
-
-    fn up(&mut self, n: usize) {
-        self.row = self.row.saturating_sub(n);
-    }
-
-    fn down(&mut self, n: usize) {
-        self.row = (self.row + n).min(self.rows - 1);
-    }
-
-    /// Tab stops every eight columns, which is where every terminal puts them.
-    fn tab(&mut self) {
-        self.col = ((self.col / 8) + 1) * 8;
-        if self.col >= self.cols {
-            self.col = self.cols - 1;
-        }
-    }
+/// How a blocking non-canonical read waits, as [`LineDiscipline::read_wait`]
+/// decides it.
+///
+/// The four states are the four answers a program can branch on, and they are
+/// not interchangeable: `Empty` and an end of input both hand the caller zero
+/// bytes, but only one of them says the terminal closed, so they travel by
+/// different doors (`Empty` is reported by the read itself, an end of input by
+/// [`LineDiscipline::take`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadWait {
+    /// There is something to take: a queued answer, an end of input, or the
+    /// `VMIN` bytes the read asked for.
+    Ready,
+    /// Take nothing, wait for nothing, answer 0 bytes now: the `VMIN == 0` with
+    /// `VTIME == 0` poll, whose empty queue is a complete answer.
+    Empty,
+    /// Wait for input with no clock. Ends when a read decision becomes
+    /// available, or a signal interrupts it.
+    UntilInput,
+    /// Wait until this tick, which is the read's `VTIME` clock running out.
+    /// The caller compares it with its own clock and re-asks on every pass,
+    /// because an arriving byte moves it.
+    UntilTick(u64),
 }
 
 /// The editing state machine: input bytes in through [`receive`](Self::receive),
@@ -207,32 +237,19 @@ pub struct LineDiscipline {
     /// A read taken over this reports 0: the end of input, which is not a
     /// character and never becomes one.
     eof: bool,
-    /// The line being typed, and where the cursor stands within it.
+    /// The line being typed, appended to at its end until it is completed.
+    /// `n_tty` has no cursor into this buffer and neither does this one - the
+    /// keys that move one belong to a line editor, in raw mode, in userspace.
     pending: Vec<u8>,
-    cursor: usize,
     /// What the console should show, since the last drain.
     echo: Vec<u8>,
     /// The settings that decide everything above.
     tio: Termios,
-    /// Where an escape sequence has got to.
-    esc: Esc,
-    /// The parameter bytes of a `CSI` sequence in flight: `ESC [ 1 ; 5 A`.
-    csi: Vec<u8>,
     /// Taken literally rather than as a control character: set by `^V`.
     literal: bool,
-    /// Lines already entered, newest last, for the up and down arrows.
-    history: Vec<Vec<u8>>,
-    /// Which history line is on screen, if one is.
-    hist_at: Option<usize>,
-    /// The line being typed when the up arrow was first pressed, so coming
-    /// back down past the newest history returns it.
-    stash: Vec<u8>,
-    /// What has been printed on the current output line - the shell's prompt,
-    /// in practice. Redrawing the input line means printing it again, and a
-    /// discipline that only sees its own echo has no other way to know it.
-    prompt: Vec<u8>,
-    /// Where an escape sequence in the *output* has got to, so the prompt
-    /// recorder swallows the whole sequence instead of storing a stray `[`.
+    /// Where an escape sequence in the *output* has got to, so the cursor
+    /// model swallows the whole sequence instead of mistaking a stray `[` for
+    /// a column.
     out_esc: Esc,
     /// The parameters of an output sequence in flight, for the ones whose
     /// numbers mean something - a cursor move, or a question.
@@ -253,8 +270,30 @@ pub struct LineDiscipline {
     /// back - so nothing of it goes out until it resolves. See
     /// [`LineDiscipline::note_output`].
     out_held: Vec<u8>,
-    /// Where the cursor stands, to answer a shell that asks.
-    screen: Screen,
+    /// Where the cursor stands, on the screen the kernel draws when it is the
+    /// terminal. Shared type with the renderer, so a report cannot describe a
+    /// cursor the screen does not have.
+    screen: Cursor,
+    /// The main screen's cursor, parked while an alternate screen is showing
+    /// (`CSI ? 47 / 1047 / 1049 h`), which is what `less` and `vi` leave behind
+    /// them. Kept apart from [`LineDiscipline::screen`] because the screen it
+    /// belongs to is not the one being counted right now.
+    alt_cursor: Option<super::term::cursor::Snapshot>,
+    /// The tick the last input byte landed, kept only for a non-canonical
+    /// read's `VTIME` clock - which Linux measures *between bytes*, not from
+    /// the moment the read asked (measured: `VMIN=2/VTIME=5` with one byte
+    /// arriving 100 ms in returns that byte 500 ms after it landed, not 500 ms
+    /// after the read began). The discipline stores the number rather than
+    /// reading a clock, so the whole wait policy stays host-testable; a host
+    /// that never feeds it a tick sees 0.
+    last_byte: u64,
+    /// How many input bytes have landed. A blocking non-canonical read whose
+    /// `VTIME` clock is started by a byte parks on this count changing, not only
+    /// on a completed read: one partial byte does not satisfy `VMIN`, so the
+    /// wake that re-anchors the inter-byte clock would otherwise be swallowed by
+    /// `block_until_deadline`'s condition loop and the read would sleep forever.
+    /// See the read-path note in `PLAN.md` §12.4a.
+    input_count: u64,
 }
 
 impl Default for LineDiscipline {
@@ -270,35 +309,25 @@ impl LineDiscipline {
             answer: VecDeque::new(),
             eof: false,
             pending: Vec::new(),
-            cursor: 0,
             echo: Vec::new(),
             tio: Termios::console_default(),
-            esc: Esc::Ground,
-            csi: Vec::new(),
             literal: false,
-            history: Vec::new(),
-            hist_at: None,
-            stash: Vec::new(),
-            prompt: Vec::new(),
             out_esc: Esc::Ground,
             out_params: Vec::new(),
             out_osc: Vec::new(),
             out_dcs: false,
             in_string_seq: false,
             out_held: Vec::new(),
-            screen: Screen::new(),
+            screen: Cursor::new(25, 80),
+            alt_cursor: None,
+            last_byte: 0,
+            input_count: 0,
         }
     }
 
     /// Feed one input byte, queueing whatever the console should echo, and
     /// report anything the byte asked for beyond editing.
     pub fn receive(&mut self, byte: u8) -> Action {
-        // Mid-sequence, a byte belongs to the sequence. Raw mode never gets
-        // here: it hands every byte over unexamined.
-        if self.esc != Esc::Ground {
-            self.esc_byte(byte);
-            return Action::None;
-        }
         if self.literal {
             self.literal = false;
             self.insert(byte);
@@ -312,10 +341,20 @@ impl LineDiscipline {
                 self.echo_control(b'^', b'C');
                 return Action::Interrupt;
             }
-            // No SIGQUIT and no job control yet: the keys are recognised so
-            // they do not become input, and then have nothing to do.
-            if byte == self.tio.cc[VQUIT] || byte == self.tio.cc[VSUSP] {
-                return Action::None;
+            // The other two ISIG keys. Both go to the foreground group like
+            // the interrupt does; what differs is only the signal they carry,
+            // and the disposition decides the rest: a process that ignores or
+            // catches `SIGTSTP` runs on (vim's `mch_suspend` relies on
+            // exactly that to suspend itself in two steps), while the default
+            // action — a stop the shell sees through `WUNTRACED` — is what
+            // makes Ctrl-Z the keyboard's "put this job in the background".
+            if byte == self.tio.cc[VQUIT] {
+                self.echo_control(b'^', b'\\');
+                return Action::Quit;
+            }
+            if byte == self.tio.cc[VSUSP] {
+                self.echo_control(b'^', b'Z');
+                return Action::Suspend;
             }
         }
         // Flow control is between the terminal and the line, not part of it.
@@ -363,10 +402,6 @@ impl LineDiscipline {
         let reprint = self.tio.cc[VREPRINT];
         let lnext = self.tio.cc[VLNEXT];
         match byte {
-            b'\x1b' if self.tio.lflag & IEXTEN != 0 => {
-                self.esc = Esc::Start;
-                Action::None
-            }
             LF => {
                 self.complete_line();
                 Action::None
@@ -405,127 +440,78 @@ impl LineDiscipline {
                 Action::None
             }
             b if b == reprint => {
-                self.echo.push(CR);
-                self.redraw();
+                if self.echo_on() {
+                    self.echo.push(CR);
+                    self.echo.extend_from_slice(b"\x1b[K");
+                    self.echo.extend_from_slice(&self.pending);
+                }
                 Action::None
             }
             b if b == lnext => {
                 self.literal = true;
                 Action::None
             }
-            // The keys a real line editor offers. A shell that runs in raw
-            // mode brings its own; these are for the one this kernel edits.
-            // The control characters termios can name are matched above, so
-            // these are the ones it cannot: a program that moves ^D elsewhere
-            // gets 0x04 as an ordinary byte rather than a surprise.
-            0x01 => {
-                self.go_home();
-                Action::None
-            } // ^A
-            0x02 => self.go_left(), // ^B
-            0x05 => {
-                self.go_end();
-                Action::None
-            } // ^E
-            0x06 => self.go_right(), // ^F
-            0x0b => {
-                self.kill_to_end();
-                Action::None
-            } // ^K
-            0x0c => self.clear_screen(), // ^L
-            0x0e => self.history_next(), // ^N
-            0x10 => self.history_prev(), // ^P
-            0x14 => {
-                self.transpose();
-                Action::None
-            } // ^T
-            // Printable, and the bytes of a UTF-8 character beyond ASCII.
-            b if b >= 0x20 && b != 0x7f => {
+            // Everything else is a character of the line, control bytes
+            // included - `ESC`, `^A`, `^T`. `n_tty` claims exactly the termios
+            // specials above and types the rest, and a canonical reader that
+            // wants an arrow key's bytes reads them off the line like anyone
+            // else. A shell that edits brings its own editor, in raw mode.
+            b => {
                 self.insert(b);
                 Action::None
             }
-            // Any other control byte has no editing meaning; keep it out of
-            // the line rather than passing it through raw.
-            _ => Action::None,
         }
     }
 
     // --- editing the line ---
 
+    /// Type one byte at the end of the line, and show it. A control byte is
+    /// shown as its `^X` form when `ECHOCTL` is on, the way `n_tty`'s
+    /// `echo_char` does: an `ESC` typed at a canonical prompt leaves `^[` on
+    /// the screen and the byte itself in the line.
     fn insert(&mut self, byte: u8) {
-        if self.cursor >= self.pending.len() {
-            self.pending.push(byte);
+        self.pending.push(byte);
+        if !self.echo_on() {
+            return;
+        }
+        if byte != b'\t' && byte != LF && (byte < 0x20 || byte == 0x7f) {
+            if self.tio.lflag & ECHOCTL != 0 {
+                self.echo.push(b'^');
+                self.echo.push(byte | 0x40);
+            }
         } else {
-            self.pending.insert(self.cursor, byte);
-        }
-        self.cursor += 1;
-        if self.echo_on() {
             self.echo.push(byte);
-            // Typed into the middle: everything after the cursor has to be
-            // pushed along on screen, and the cursor put back where it was.
-            if self.cursor < self.pending.len() {
-                self.echo.extend_from_slice(&self.pending[self.cursor..]);
-                self.echo_left(self.pending.len() - self.cursor);
-            }
         }
     }
 
+    /// `VERASE`: chop the last character off the line. There is no cursor to
+    /// delete behind, because there is no way to move one.
     fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor -= 1;
-        self.pending.remove(self.cursor);
-        if self.echo_on() {
-            if self.cursor == self.pending.len() {
-                // Erase on a terminal: step back, blank, step back again.
-                self.echo.extend_from_slice(b"\x08 \x08");
-            } else {
-                self.redraw();
-            }
+        if self.pending.pop().is_some() && self.echo_on() {
+            // Erase on a terminal: step back, blank, step back again.
+            self.echo.extend_from_slice(b"\x08 \x08");
         }
     }
 
-    /// Delete under the cursor, which is what the Delete key does - the key
-    /// `erase` is not, since that one deletes behind it.
-    fn delete_at_cursor(&mut self) {
-        if self.cursor >= self.pending.len() {
-            return;
-        }
-        self.pending.remove(self.cursor);
-        if self.echo_on() {
-            // DCH: delete one character under the cursor, closing the gap.
-            self.echo.extend_from_slice(b"\x1b[P");
-        }
-    }
-
+    /// `VKILL`: the whole line, each character erased the way `^H` erases
+    /// one (`ECHOKE`'s rendering in `n_tty`).
     fn kill_line(&mut self) {
-        if self.pending.is_empty() {
+        let n = self.pending.len();
+        if n == 0 {
             return;
         }
         self.pending.clear();
-        self.cursor = 0;
         if self.echo_on() {
-            self.redraw();
+            for _ in 0..n {
+                self.echo.extend_from_slice(b"\x08 \x08");
+            }
         }
     }
 
-    fn kill_to_end(&mut self) {
-        if self.cursor >= self.pending.len() {
-            return;
-        }
-        self.pending.truncate(self.cursor);
-        if self.echo_on() {
-            self.echo.extend_from_slice(b"\x1b[K");
-        }
-    }
-
-    /// `^W`: the word behind the cursor, and the spaces in front of it.
+    /// `^W`: the word behind the end of the line, and the spaces in front of
+    /// it.
     fn erase_word(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let mut end = self.cursor;
+        let mut end = self.pending.len();
         while end > 0 && self.pending[end - 1] == b' ' {
             end -= 1;
         }
@@ -533,124 +519,12 @@ impl LineDiscipline {
         while start > 0 && self.pending[start - 1] != b' ' {
             start -= 1;
         }
-        self.pending.drain(start..self.cursor);
-        self.cursor = start;
+        let erased = self.pending.len() - start;
+        self.pending.truncate(start);
         if self.echo_on() {
-            self.redraw();
-        }
-    }
-
-    /// `^T`: swap the two characters behind the cursor.
-    fn transpose(&mut self) {
-        if self.cursor < 2 || self.cursor > self.pending.len() {
-            return;
-        }
-        self.pending.swap(self.cursor - 2, self.cursor - 1);
-        if self.echo_on() {
-            self.redraw();
-        }
-    }
-
-    fn go_left(&mut self) -> Action {
-        if self.cursor == 0 {
-            return Action::None;
-        }
-        self.cursor -= 1;
-        if self.echo_on() {
-            self.echo.extend_from_slice(b"\x1b[D");
-        }
-        Action::None
-    }
-
-    fn go_right(&mut self) -> Action {
-        if self.cursor >= self.pending.len() {
-            return Action::None;
-        }
-        self.cursor += 1;
-        if self.echo_on() {
-            self.echo.extend_from_slice(b"\x1b[C");
-        }
-        Action::None
-    }
-
-    fn go_home(&mut self) -> Action {
-        if self.cursor == 0 {
-            return Action::None;
-        }
-        self.cursor = 0;
-        if self.echo_on() {
-            self.echo.push(CR);
-            self.echo_right(self.prompt.len());
-        }
-        Action::None
-    }
-
-    fn go_end(&mut self) -> Action {
-        if self.cursor >= self.pending.len() {
-            return Action::None;
-        }
-        let n = self.pending.len() - self.cursor;
-        self.cursor = self.pending.len();
-        if self.echo_on() {
-            self.echo_right(n);
-        }
-        Action::None
-    }
-
-    fn clear_screen(&mut self) -> Action {
-        if self.echo_on() {
-            self.echo.extend_from_slice(b"\x1b[2J\x1b[H");
-            self.redraw();
-        }
-        Action::None
-    }
-
-    // --- history ---
-
-    fn history_prev(&mut self) -> Action {
-        if self.history.is_empty() {
-            return Action::None;
-        }
-        if self.hist_at.is_none() {
-            self.stash = self.pending.clone();
-            self.hist_at = Some(self.history.len());
-        }
-        let at = self.hist_at.unwrap_or(self.history.len());
-        if at == 0 {
-            return Action::None;
-        }
-        self.hist_at = Some(at - 1);
-        self.pending = self.history[at - 1].clone();
-        self.cursor = self.pending.len();
-        self.redraw();
-        Action::None
-    }
-
-    fn history_next(&mut self) -> Action {
-        let at = match self.hist_at {
-            Some(at) => at,
-            None => return Action::None,
-        };
-        if at + 1 < self.history.len() {
-            self.hist_at = Some(at + 1);
-            self.pending = self.history[at + 1].clone();
-        } else {
-            // Past the newest: back to what was being typed before.
-            self.hist_at = None;
-            self.pending = core::mem::take(&mut self.stash);
-        }
-        self.cursor = self.pending.len();
-        self.redraw();
-        Action::None
-    }
-
-    fn remember(&mut self, line: &[u8]) {
-        if line.is_empty() || self.history.last().map(Vec::as_slice) == Some(line) {
-            return;
-        }
-        self.history.push(line.to_vec());
-        if self.history.len() > HISTORY_MAX {
-            self.history.remove(0);
+            for _ in 0..erased {
+                self.echo.extend_from_slice(b"\x08 \x08");
+            }
         }
     }
 
@@ -662,9 +536,6 @@ impl LineDiscipline {
             self.echo.push(LF);
         }
         let line = core::mem::take(&mut self.pending);
-        self.cursor = 0;
-        self.hist_at = None;
-        self.remember(&line[..line.len() - 1]);
         self.out.extend(line.iter().copied());
     }
 
@@ -674,9 +545,6 @@ impl LineDiscipline {
             self.echo.push(LF);
         }
         let line = core::mem::take(&mut self.pending);
-        self.cursor = 0;
-        self.hist_at = None;
-        self.remember(&line);
         self.out.extend(line);
     }
 
@@ -696,24 +564,6 @@ impl LineDiscipline {
         }
     }
 
-    fn echo_left(&mut self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        self.echo.extend_from_slice(b"\x1b[");
-        self.echo.extend_from_slice(Self::decimal(n).as_slice());
-        self.echo.push(b'D');
-    }
-
-    fn echo_right(&mut self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        self.echo.extend_from_slice(b"\x1b[");
-        self.echo.extend_from_slice(Self::decimal(n).as_slice());
-        self.echo.push(b'C');
-    }
-
     fn decimal(mut n: usize) -> Vec<u8> {
         let mut digits = [0u8; 8];
         let mut at = digits.len();
@@ -728,192 +578,23 @@ impl LineDiscipline {
         digits[at..].to_vec()
     }
 
-    /// Put the line on screen again from the prompt onwards - after a history
-    /// move, a word erased mid-line, or a `^L`.
-    fn redraw(&mut self) {
-        if !self.echo_on() {
-            return;
-        }
-        self.echo.push(CR);
-        self.echo.extend_from_slice(&self.prompt);
-        // EL: erase to the end of the line, so a shorter line leaves nothing
-        // of the longer one behind it.
-        self.echo.extend_from_slice(b"\x1b[K");
-        self.echo.extend_from_slice(&self.pending);
-        let back = self.pending.len() - self.cursor;
-        self.echo_left(back);
-    }
-
-    // --- escape sequences ---
-
-    fn esc_byte(&mut self, byte: u8) {
-        match self.esc {
-            Esc::Ground => {}
-            Esc::Start => match byte {
-                b'[' => {
-                    self.esc = Esc::Csi;
-                    self.csi.clear();
-                }
-                b'O' => self.esc = Esc::Ss3,
-                b']' => self.esc = Esc::Osc,
-                // A character-set choice: `ESC ( B`. One byte, no meaning here.
-                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => self.esc = Esc::One,
-                b'P' | b'X' | b'^' | b'_' => self.esc = Esc::Osc,
-                // `ESC ESC` starts over, anything else is not a sequence after
-                // all: drop it and carry on with the next byte.
-                b'\x1b' => {}
-                _ => self.esc = Esc::Ground,
-            },
-            Esc::Csi => match byte {
-                // Parameters and intermediates: `1`, `;`, `5`, `?`.
-                0x20..=0x3f => {
-                    if self.csi.len() < CSI_MAX {
-                        self.csi.push(byte);
-                    }
-                }
-                // The final byte ends the sequence and says what key it was.
-                0x40..=0x7e => {
-                    let params = core::mem::take(&mut self.csi);
-                    self.esc = Esc::Ground;
-                    if let Some(key) = Self::csi_key(byte, &params) {
-                        self.apply(key);
-                    }
-                }
-                // A control byte mid-sequence: the sequence is nonsense.
-                _ => {
-                    self.csi.clear();
-                    self.esc = Esc::Ground;
-                }
-            },
-            Esc::Ss3 => {
-                self.esc = Esc::Ground;
-                if let Some(key) = Self::ss3_key(byte) {
-                    self.apply(key);
-                }
-            }
-            Esc::Osc => {
-                // Ended by BEL, or by `ESC \`.
-                if byte == 0x07 {
-                    self.esc = Esc::Ground;
-                } else if byte == b'\x1b' {
-                    self.esc = Esc::One;
-                }
-            }
-            Esc::One => self.esc = Esc::Ground,
-        }
-    }
-
-    /// What key a `CSI` sequence was, if it was a key at all.
-    ///
-    /// A modifier comes as an extra parameter - `ESC [ 1 ; 5 C` is Ctrl-right -
-    /// and is ignored: a shifted arrow is still the arrow, which is what
-    /// whoever held the modifier meant to press.
-    fn csi_key(final_byte: u8, params: &[u8]) -> Option<Key> {
-        let (first, _modifier) = Self::params(params);
-        match final_byte {
-            b'A' => Some(Key::Up),
-            b'B' => Some(Key::Down),
-            b'C' => Some(Key::Right),
-            b'D' => Some(Key::Left),
-            b'E' => Some(Key::Down),
-            b'H' => Some(Key::Home),
-            b'F' => Some(Key::End),
-            b'P' => Some(Key::Delete),
-            b'~' => match first {
-                1 | 7 => Some(Key::Home),
-                3 => Some(Key::Delete),
-                4 | 8 => Some(Key::End),
-                5 => Some(Key::PageUp),
-                6 => Some(Key::PageDown),
-                _ => None,
-            },
-            // Everything else - a cursor position report, a mode set, a
-            // question answered - is not a key, and is not typed either.
-            _ => None,
-        }
-    }
-
-    /// What key an `ESC O` sequence was: the same arrows, in the mode an
-    /// application asks a terminal to use.
-    fn ss3_key(byte: u8) -> Option<Key> {
-        match byte {
-            b'A' => Some(Key::Up),
-            b'B' => Some(Key::Down),
-            b'C' => Some(Key::Right),
-            b'D' => Some(Key::Left),
-            b'H' => Some(Key::Home),
-            b'F' => Some(Key::End),
-            _ => None,
-        }
-    }
-
-    /// The first and last numeric parameters of a sequence. A parameter left
-    /// out - `ESC [ ; 5 A` - means its default, which for these is 1, and a
-    /// bare `ESC [ A` is the same as `ESC [ 1 A`.
-    fn params(bytes: &[u8]) -> (usize, usize) {
-        let mut nums = [1usize; 4];
-        let mut count = 0usize;
-        let mut cur: Option<usize> = None;
-        for &b in bytes {
-            if b.is_ascii_digit() {
-                let d = (b - b'0') as usize;
-                cur = Some(cur.unwrap_or(0) * 10 + d);
-            } else if count < nums.len() {
-                nums[count] = cur.take().unwrap_or(1);
-                count += 1;
-            } else {
-                cur = None;
-            }
-        }
-        if count < nums.len() {
-            nums[count] = cur.take().unwrap_or(1);
-            count += 1;
-        }
-        let first = nums[0];
-        let last = nums[count.saturating_sub(1)];
-        (first, if last == 0 { 1 } else { last })
-    }
-
-    fn apply(&mut self, key: Key) {
-        match key {
-            Key::Up => {
-                self.history_prev();
-            }
-            Key::Down => {
-                self.history_next();
-            }
-            Key::Left => {
-                self.go_left();
-            }
-            Key::Right => {
-                self.go_right();
-            }
-            Key::Home => {
-                self.go_home();
-            }
-            Key::End => {
-                self.go_end();
-            }
-            Key::Delete => self.delete_at_cursor(),
-            // No scrolling buffer to page through yet.
-            Key::PageUp | Key::PageDown => {}
-        }
-    }
-
     // --- the reader's side ---
 
-    /// Record what went out on the console, so a redrawn input line can be put
-    /// back where the prompt left it.
-    ///
-    /// Only what is printed while nothing is being typed is worth keeping:
-    /// once there is a line being edited, the rest of the output line is the
-    /// editor's own echo and would be replayed twice.
+    /// Run the output-side model of the screen a discipline's bytes travel to:
+    /// the cursor the grid paints with, and the questions a written sequence
+    /// asks.
     ///
     /// Returns what `write_at` should put on the wire instead of the caller's
     /// buffer: the same bytes minus the questions this line discipline answers
     /// itself, and minus the bytes of any sequence still in flight. `None` -
     /// the common case - means forward everything untouched.
-    pub fn note_output(&mut self, bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    pub fn note_output(&mut self, bytes: &[u8], term: &Attached) -> Option<alloc::vec::Vec<u8>> {
+        // The size the cursor is counted against is the size the terminal
+        // reports, or the two answers a program can ask for disagree.
+        if self.screen.rows() != term.rows || self.screen.cols() != term.cols {
+            self.screen.set_size(term.rows, term.cols);
+        }
+        let kernel_draws = term.kernel_draws;
         // A question the discipline answers itself must not also reach the
         // wire: whatever real terminal sits beyond it would answer too, and
         // that second answer comes back as typed input - the ghost `R` a
@@ -929,8 +610,8 @@ impl LineDiscipline {
         // typed input, and every `bat` prompt ended up holding
         // `]10;rgb:abab/b2b2/bfbf`.
         // Nothing in sight of a sequence, and none carried over: the state
-        // machine still has to run - the cursor and the prompt line are what
-        // answer a later `ESC [ 6n` - but no byte needs a second home, so the
+        // machine still has to run - the cursor it keeps is what answers a
+        // later `ESC [ 6n` - but no byte needs a second home, so the
         // buffer is not allocated at all. `bat` renders by writing one colour
         // token per `write(2)`, tens of thousands of them for a minified
         // stylesheet, and this is the hot path of every one.
@@ -963,7 +644,7 @@ impl LineDiscipline {
                             self.out_osc.push(b);
                         }
                     } else {
-                        answered = self.finish_osc();
+                        answered = self.finish_osc(kernel_draws);
                     }
                 }
                 (Esc::Osc, 0x1b) => {
@@ -1003,6 +684,37 @@ impl LineDiscipline {
                 }
                 // A character-set choice: `ESC ( B`, one byte more.
                 (Esc::Start, 0x20..=0x2f) => self.out_esc = Esc::One,
+                // The single-character cursor controls. They travel on - whoever
+                // draws the screen needs them as much as the discipline does -
+                // but they move the cursor a later report answers with, so the
+                // model moves with them. A sequence the model stops following is
+                // a position the shell is told wrong, which is the whole bug this
+                // rewrite is about.
+                (Esc::Start, b'D') => {
+                    self.screen.line_feed();
+                    self.out_esc = Esc::Ground;
+                }
+                (Esc::Start, b'E') => {
+                    self.screen.carriage_return();
+                    self.screen.line_feed();
+                    self.out_esc = Esc::Ground;
+                }
+                (Esc::Start, b'M') => {
+                    self.screen.reverse_line_feed();
+                    self.out_esc = Esc::Ground;
+                }
+                (Esc::Start, b'7') => {
+                    self.screen.save();
+                    self.out_esc = Esc::Ground;
+                }
+                (Esc::Start, b'8') => {
+                    self.screen.restore();
+                    self.out_esc = Esc::Ground;
+                }
+                (Esc::Start, b'c') => {
+                    self.screen.reset();
+                    self.out_esc = Esc::Ground;
+                }
                 (Esc::Start, _) => self.out_esc = Esc::Ground,
                 // Parameters and intermediates; the sequence ends on the
                 // final byte, which is anything from `@` to `~`.
@@ -1014,21 +726,19 @@ impl LineDiscipline {
                 (Esc::Csi, _) => {
                     let params = core::mem::take(&mut self.out_params);
                     self.out_esc = Esc::Ground;
-                    // A question this discipline answers itself never travels,
-                    // so the host terminal beyond it cannot give a second
-                    // answer that would come back as typed input: DSR (`5n`/
-                    // `6n`) and Device Attributes (`c`, primary or `>c`
-                    // secondary).
-                    answered = (b == b'n' && matches!(params.first(), Some(b'5') | Some(b'6')))
-                        || b == b'c';
-                    self.output_csi(b, &params);
+                    // Where the kernel draws the screen, a question this
+                    // discipline answers never travels: whatever real terminal
+                    // sits beyond the wire would answer it a second time, and that
+                    // second answer comes back as typed input. Where something
+                    // else draws it, nothing is answered and nothing is swallowed.
+                    answered = self.output_csi(b, &params, kernel_draws);
                 }
                 (Esc::One, b'\\') if self.in_string_seq => {
                     // `ESC \` is the ST terminator of the string in flight.
                     answered = if self.out_dcs {
-                        self.finish_dcs()
+                        self.finish_dcs(kernel_draws)
                     } else {
-                        self.finish_osc()
+                        self.finish_osc(kernel_draws)
                     };
                 }
                 (Esc::One, _) => {
@@ -1037,25 +747,30 @@ impl LineDiscipline {
                     self.out_dcs = false;
                 }
                 (Esc::Ground, LF) => {
-                    self.prompt.clear();
-                    self.screen.newline();
+                    // A console reads a bare line feed as a newline - home and
+                    // down - which is what the renderer's grid does with it too.
+                    self.screen.carriage_return();
+                    self.screen.line_feed();
                 }
-                (Esc::Ground, CR) => {
-                    self.prompt.clear();
-                    self.screen.col = 0;
+                // Vertical tab and form feed are a newline to a screen as well;
+                // `^L` is the shell's reprint, and the grid treats all three the
+                // same way, so this must too.
+                (Esc::Ground, 0x0b | 0x0c) => {
+                    self.screen.carriage_return();
+                    self.screen.line_feed();
                 }
-                (Esc::Ground, 0x08) => {
-                    self.prompt.pop();
-                    self.screen.left(1);
-                }
+                (Esc::Ground, CR) => self.screen.carriage_return(),
+                (Esc::Ground, 0x08) => self.screen.backspace(1),
                 (Esc::Ground, 0x09) => self.screen.tab(),
                 // A bell says nothing and moves nothing.
                 (Esc::Ground, 0x07) => {}
-                (Esc::Ground, _) if self.pending.is_empty() && self.prompt.len() < PROMPT_MAX => {
-                    self.prompt.push(b);
-                    self.screen.put();
+                // The byte class the grid prints, and nothing else. Counting a
+                // control byte as a cell is how a report comes back a column
+                // ahead of the screen.
+                (Esc::Ground, b'\x20'..=b'\x7e' | b'\xa0'..=b'\xff') => {
+                    self.screen.print();
                 }
-                _ => self.screen.put(),
+                _ => {}
             }
             // The sequence ended: what it held goes on the wire, unless this
             // discipline answered it, in which case it goes nowhere.
@@ -1086,75 +801,238 @@ impl LineDiscipline {
         }
     }
 
-    /// One finished output sequence: move the cursor this line discipline is
-    /// pretending to have, or answer the question the sequence asked.
-    fn output_csi(&mut self, final_byte: u8, params: &[u8]) {
+    /// One finished output sequence: move the cursor this kernel's model of the
+    /// screen keeps, and answer the question the sequence asked - if, and only if,
+    /// this kernel is the terminal that owns that screen.
+    ///
+    /// `kernel_draws` is that decision and the only place it is made. Where it is
+    /// `false` the sequence travels on and nothing is answered, because whatever
+    /// sits at the other end of the wire *is* the terminal and knows where its own
+    /// cursor stands. Measured on Linux: a pty pair's line discipline forwarded
+    /// `ESC [ 6 n`, `ESC [ 5 n`, `ESC [ c`, `ESC [ ? 6 n`, `OSC 11 ; ?` and
+    /// `DCS 1 + q` byte for byte to the master and answered none of them. Answering
+    /// anyway is what cost `fish` its output here: the shell pads the dangling line
+    /// out to the width it was told, and a width guessed at `80` in front of a
+    /// window of any other size never reaches the margin, never wraps, and the
+    /// `\r` and `ESC [ K` that follow erase the line the command just printed.
+    ///
+    /// `true` says the discipline answered it itself, which is what tells the
+    /// caller to keep the bytes off the wire. Which sequences are questions and
+    /// which are answered is one decision read from one place: it used to be two,
+    /// the swallow measured off the raw parameter *bytes* and the answer off the
+    /// parsed ones, so `ESC [ ? 6 n` - a cursor question the DEC-private marker
+    /// makes no difference to - was forwarded unanswered while `ESC [ 6 n` was
+    /// answered. A question the console does not answer is a caller that waits, so
+    /// both markers answer here, as Linux's `csi_DEC` and `csi_ECMA` both do.
+    ///
+    /// Every arm that moves the cursor calls [`Cursor`], and
+    /// [`crate::vfs::term::Grid`] calls the same ones from the same bytes, because
+    /// a report that describes a cursor the screen does not have is the exact
+    /// failure this function used to have.
+    fn output_csi(&mut self, final_byte: u8, params: &[u8], kernel_draws: bool) -> bool {
         let (first, second) = Self::params(params);
+        let private = params
+            .iter()
+            .any(|b| matches!(b, b'?' | b'<' | b'=' | b'>'));
         match final_byte {
             b'A' => self.screen.up(first),
             b'B' | b'e' => self.screen.down(first),
             b'C' | b'a' => self.screen.right(first),
             b'D' => self.screen.left(first),
             b'E' => {
+                self.screen.carriage_return();
                 self.screen.down(first);
-                self.screen.col = 0;
             }
             b'F' => {
+                self.screen.carriage_return();
                 self.screen.up(first);
-                self.screen.col = 0;
             }
-            b'G' | b'`' => self.screen.col = first.saturating_sub(1),
-            b'd' => self.screen.row = first.saturating_sub(1),
-            b'H' | b'f' => {
-                self.screen.row = first.saturating_sub(1);
-                self.screen.col = second.saturating_sub(1);
-            }
-            // Erasing. `2J` clears the screen and homes the cursor, which is
-            // what a `clear` sends and what `^L` asks for.
-            b'J' => {
-                if first >= 2 {
-                    self.screen.row = 0;
-                    self.screen.col = 0;
+            b'G' | b'`' => self.screen.set_column(first),
+            b'd' => self.screen.set_line(first),
+            b'H' | b'f' => self.screen.move_to(first, second),
+            // Erasing moves nothing. `CSI 2 J` clears the screen and leaves the
+            // cursor where it was - which is what the grid does, so it is what a
+            // report has to say. `clear` and `^L` send the `CSI H` that homes
+            // explicitly, and this used to home on the erase itself.
+            b'J' | b'K' => {}
+            // `DECSTBM`: the region the cursor moves inside, then the cursor to
+            // the region's top left. The grid does both; a report that knows only
+            // one of them is a position the screen disagrees with.
+            b'r' => {
+                let (top, bottom) = Self::two_params(params, self.screen.rows());
+                if self.screen.set_region(top, bottom) {
+                    let (t, _) = self.screen.region();
+                    self.screen.move_to(t + 1, 1);
                 }
             }
-            b'K' => {}
-            b'n' => {
+            b's' => self.screen.save(),
+            b'u' => self.screen.restore(),
+            // The alternate screen. `less`, `vi` and a pager's `-e` draw over a
+            // cleared window and, on leaving, put the screen back; the grid parks
+            // its cells and this model parks the cursor with them, or the shell
+            // that resumes is told a position the screen gave back pages ago.
+            b'h' | b'l' if params.contains(&b'?') => {
+                let on = final_byte == b'h';
+                let (modes, count) = Self::parse_params(params);
+                for &mode in modes.iter().take(count) {
+                    match mode {
+                        47 | 1047 | 1049 => {
+                            // Idempotent in both directions, like the grid: a
+                            // second enter must not lose the parked cursor, and an
+                            // exit nobody parked for moves nothing.
+                            if on && self.alt_cursor.is_none() {
+                                self.alt_cursor = Some(self.screen.take_alt());
+                            } else if !on && let Some(saved) = self.alt_cursor.take() {
+                                self.screen.resume_alt(saved);
+                            }
+                        }
+                        // Cursor visibility, the key modes, wrap mode: all drawn
+                        // with, none of them a cursor move.
+                        _ => {}
+                    }
+                }
+            }
+            b'n' if kernel_draws => {
                 // A question. `5n` asks whether the terminal is there; `6n`
                 // asks where the cursor is, and a shell waits for the answer
                 // before it reads another key - so the answer goes back the
-                // way a terminal's would: as input.
-                if first == 5 {
+                // way a terminal's would: as input. The DEC-private marker
+                // changes nothing: Linux answers `n` from `csi_DEC` exactly as
+                // from `csi_ECMA`.
+                let asked = Self::first_query_param(params);
+                if asked == 5 {
                     self.answer(b"\x1b[0n");
-                } else if first == 6 {
+                    return true;
+                } else if asked == 6 {
+                    let (row, col) = self.screen.pos();
                     self.answer(b"\x1b[");
-                    let row = Self::decimal(self.screen.row + 1);
+                    let row = Self::decimal(row + 1);
                     self.answer(&row);
                     self.answer(b";");
-                    let col = Self::decimal(self.screen.col + 1);
+                    let col = Self::decimal(col + 1);
                     self.answer(&col);
                     self.answer(b"R");
+                    return true;
                 }
             }
-            // Device Attributes. A program that cannot consult a terminfo file
-            // - `set_color`'s capability probe, a shell choosing its theme -
-            // asks the terminal what it is by sending `CSI c` (primary) or
-            // `CSI > c` (secondary) and reading the reply. Answered here, and
-            // swallowed from the wire below, so the host does not also reply and
-            // have its answer land as typed input.
-            b'c' => {
-                if params.contains(&b'>') {
-                    // Secondary: terminal type 0, a fixed firmware version.
-                    self.answer(b"\x1b>0;10;0c");
-                } else {
-                    // Primary: a VT220-class terminal with the common
-                    // rectangular/highlight/cursor-ext extensions advertised.
-                    self.answer(b"\x1b[?62;1;2;6;7;8;9c");
-                }
+            // Device Attributes. The console answers exactly one shape of this:
+            // `csi c`/`csi 0 c`, and `respond_ID()`'s answer is the VT102 ID
+            // `\e[?6c` - which is the whole of its Device-Attributes vocabulary,
+            // no `CSI > c` (secondary DA) and no seven-parameter feature list.
+            //
+            // `CSI ? Ps c` is not a question at all: it is `csi_DEC`'s
+            // *cursor-type set*, and the `linux` terminfo the shells and editors
+            // here read builds its cursor capabilities out of it - `civis` is
+            // `\e[?25l\e[?1c`, `cnorm` is `\e[?25h\e[?0c`, `cvvis` is
+            // `\e[?25h\e[?8c`. vim writes `civis` and `cnorm` on every command
+            // line it paints and again as it leaves. Answering those sets is
+            // what left `9c9c` sitting on the prompt after vim exited: two
+            // replies no one had asked for, queued as input, whose tails the
+            // shell then read as typed text and tried to run.
+            b'c' if kernel_draws && !private && Self::first_query_param(params) == 0 => {
+                self.answer(b"\x1b[?6c");
+                return true;
             }
-            // Everything else - colours, modes, scrolling regions - is drawn
-            // by the host terminal and costs the cursor nothing.
+            // Everything else - colours, the modes, what this kernel does not
+            // draw - costs the cursor nothing and is answered by nobody here.
             _ => {}
         }
+        false
+    }
+
+    /// The first and last numeric parameters of a sequence. A parameter left
+    /// out - `ESC [ ; 5 A` - means its default, which for these is 1, and a
+    /// bare `ESC [ A` is the same as `ESC [ 1 A`.
+    fn params(bytes: &[u8]) -> (usize, usize) {
+        let mut nums = [1usize; 4];
+        let mut count = 0usize;
+        let mut cur: Option<usize> = None;
+        for &b in bytes {
+            if b.is_ascii_digit() {
+                let d = (b - b'0') as usize;
+                cur = Some(cur.unwrap_or(0) * 10 + d);
+            } else if count < nums.len() {
+                nums[count] = cur.take().unwrap_or(1);
+                count += 1;
+            } else {
+                cur = None;
+            }
+        }
+        if count < nums.len() {
+            nums[count] = cur.take().unwrap_or(1);
+            count += 1;
+        }
+        let first = nums[0];
+        let last = nums[count.saturating_sub(1)];
+        (first, if last == 0 { 1 } else { last })
+    }
+
+    /// A CSI's parameters as numbers, up to [`PARAMS_MAX`] of them, and how many
+    /// were read. A private marker (`?`, `>`, `<`, `=`) and an intermediate
+    /// (`0x20..=0x2f`) are not parameters; an unwritten one is zero, which is what
+    /// makes `ESC [ ; 5 r` a region whose top is the default.
+    fn parse_params(bytes: &[u8]) -> ([usize; PARAMS_MAX], usize) {
+        let mut out = [0usize; PARAMS_MAX];
+        let mut count = 0usize;
+        let mut value = 0usize;
+        let mut seen = false;
+        for &b in bytes {
+            match b {
+                b'?' | b'<' | b'=' | b'>' | 0x20..=0x2f if !seen => continue,
+                b'0'..=b'9' => {
+                    value = value * 10 + (b - b'0') as usize;
+                    seen = true;
+                }
+                b';' | b':' => {
+                    if count < PARAMS_MAX {
+                        out[count] = value;
+                        count += 1;
+                    }
+                    value = 0;
+                    seen = false;
+                }
+                _ => break,
+            }
+        }
+        if seen && count < PARAMS_MAX {
+            out[count] = value;
+            count += 1;
+        } else if count == 0 {
+            // No digits at all: one parameter, and it is the default zero.
+            out[0] = 0;
+            count = 1;
+        }
+        (out, count)
+    }
+
+    /// A CSI's first two parameters, with the second defaulting to `bottom` when
+    /// the sequence leaves it out - which is what `DECSTBM` wants (`ESC [ 3 r` is
+    /// "from line 3 to the bottom of the screen") and not what a cursor move wants.
+    fn two_params(bytes: &[u8], bottom: usize) -> (usize, usize) {
+        let (p, n) = Self::parse_params(bytes);
+        let top = if n > 0 && p[0] != 0 { p[0] } else { 1 };
+        let bot = if n > 1 && p[1] != 0 { p[1] } else { bottom };
+        (top, bot)
+    }
+
+    /// The value of a CSI's first parameter, read the way Linux's console reads
+    /// a question: the private marker (`?`, `>`, `<`, `=`) and any intermediate
+    /// are not parameters, and an unwritten parameter is `0` - so `ESC [ c`,
+    /// `ESC [ 0 c` and `ESC [ ? 6 n` ask for `c`-question 0, 0 and a cursor
+    /// report. [`Self::params`] cannot serve here: it takes the marker for the
+    /// first parameter and defaults an omitted one to `1`, which is right for a
+    /// cursor movement and wrong for a question.
+    fn first_query_param(bytes: &[u8]) -> usize {
+        let mut value = 0usize;
+        for b in bytes {
+            match b {
+                b'?' | b'<' | b'=' | b'>' => continue,
+                0x20..=0x2f => continue,
+                b'0'..=b'9' => value = value * 10 + (b - b'0') as usize,
+                _ => break,
+            }
+        }
+        value
     }
 
     /// Reply the way a terminal replies: on the input side.
@@ -1162,17 +1040,19 @@ impl LineDiscipline {
         self.answer.extend(bytes.iter().copied());
     }
 
-    /// An OSC string ended (on BEL). If its body was a colour *query*, answer
-    /// it and record the bytes for swallowing so the host cannot answer a
-    /// second time; otherwise leave it to be forwarded as a colour set.
-    /// An OSC string ended (on BEL or ST). If its body was a colour *query*,
-    /// answer it - and report that the query was answered, so the caller keeps
-    /// it off the wire and the host cannot answer a second time.
-    fn finish_osc(&mut self) -> bool {
+    /// An OSC string ended (on BEL or ST). If its body was a colour *query* and
+    /// this kernel is the terminal, answer it - and report that it was answered, so
+    /// the caller keeps it off the wire and the real terminal cannot answer a second
+    /// time. Where a real terminal is downstream the query is neither answered nor
+    /// swallowed: it is that terminal's question to answer.
+    fn finish_osc(&mut self, kernel_draws: bool) -> bool {
         self.out_esc = Esc::Ground;
         self.in_string_seq = false;
         self.out_dcs = false;
         let payload = core::mem::take(&mut self.out_osc);
+        if !kernel_draws {
+            return false;
+        }
         let (index, rgb) = match osc_color_query(&payload) {
             Some(v) => v,
             None => return false,
@@ -1188,14 +1068,17 @@ impl LineDiscipline {
 
     /// A DCS string ended (on ST). A capability query (`ESC P 1 + q <hex>`,
     /// XTGETTCap - what fish/neovim/tmux use to ask a terminal its dynamic
-    /// capabilities) is answered with an empty reply and kept off the wire, so
-    /// the caller stops waiting and the host cannot answer a second time. Any
-    /// other DCS is left to be forwarded.
-    fn finish_dcs(&mut self) -> bool {
+    /// capabilities) is answered here with an empty reply, and kept off the wire,
+    /// only when this kernel is the terminal. Any other DCS, and every DCS where a
+    /// real terminal is downstream, is left to be forwarded.
+    fn finish_dcs(&mut self, kernel_draws: bool) -> bool {
         self.out_esc = Esc::Ground;
         self.in_string_seq = false;
         self.out_dcs = false;
         let body = core::mem::take(&mut self.out_osc);
+        if !kernel_draws {
+            return false;
+        }
         if body.starts_with(b"1+q") {
             self.answer(b"\x1bP1+r\x1b\\");
             return true;
@@ -1210,9 +1093,7 @@ impl LineDiscipline {
     pub fn set_termios(&mut self, tio: Termios) {
         let was_canonical = self.tio.lflag & ICANON != 0;
         self.tio = tio;
-        // A sequence in flight belonged to the settings that were.
-        self.esc = Esc::Ground;
-        self.csi.clear();
+        // A held literal belonged to the settings that were.
         self.literal = false;
         // What was being typed belongs to whoever reads next, not to the mode
         // that was: a shell switching out of canonical mode mid-keystroke
@@ -1228,6 +1109,33 @@ impl LineDiscipline {
         core::mem::take(&mut self.echo)
     }
 
+    /// `VMIN`, in the only sense Linux gives it in non-canonical mode: a
+    /// *minimum* number of bytes a read wants, where 0 means "whatever is
+    /// there, and nothing is an answer".
+    fn vmin(&self) -> u8 {
+        self.tio.cc[VMIN]
+    }
+
+    /// `VTIME`, in deciseconds. 0 means the read has no clock at all.
+    fn vtime(&self) -> u8 {
+        self.tio.cc[VTIME]
+    }
+
+    /// Whether the queue holds the bytes a read considers ready.
+    ///
+    /// An answer and an end of input come first: a shell that asked where the
+    /// cursor is must not have its reply sit behind a `VMIN` it never set, and
+    /// an EOF is a complete answer in itself.
+    ///
+    /// Non-canonical mode then reads `VMIN` as the measured minimum - which
+    /// means `VMIN == 0` makes *any* byte ready. The `.max(1)` that used to
+    /// stand here was argued from "a read returning nothing looks like
+    /// end-of-file", and that is exactly the case Linux answers without
+    /// blocking; `VMIN == 0` is how busybox `vi` and `vim` disambiguate a bare
+    /// `ESC`, so forbidding it froze them with the escape key held down. The
+    /// zero-byte answer is not ambiguous here, because an end of input travels
+    /// as a completed read and this state says only "wait" or "answer 0 now" -
+    /// see [`read_wait`](Self::read_wait).
     pub fn has_ready(&self) -> bool {
         if !self.answer.is_empty() || self.eof {
             return true;
@@ -1235,11 +1143,88 @@ impl LineDiscipline {
         if self.tio.lflag & ICANON != 0 {
             !self.out.is_empty()
         } else {
-            // Raw, and `VMIN` is how many bytes a read waits for. One is the
-            // usual answer, and zero would make every read return nothing at
-            // all, which reads as end-of-file, so one it is.
-            self.out.len() >= self.tio.cc[VMIN].max(1) as usize
+            !self.out.is_empty() && self.out.len() >= self.vmin() as usize
         }
+    }
+
+    /// The wait a blocking read owes its caller, given the tick the read
+    /// started at and how many ticks a decisecond is.
+    ///
+    /// Every branch of this table is a measurement on Linux, not a reading of
+    /// the man page, which is ambiguous about what `VTIME` times. The shape it
+    /// found is that `VTIME` is an **inter-byte** clock in non-canonical mode:
+    ///
+    /// | `VMIN`/`VTIME` | queued | measured |
+    /// |---|---|---|
+    /// | any | an answer, or an end of input | read it now |
+    /// | any, canonical | a partial line | blocks (4 s measured): canonical mode consults neither `VMIN` nor `VTIME`, only a line terminator or EOF |
+    /// | `0`/`0` | nothing | **0 bytes immediately** - the poll answer |
+    /// | `>0`/`0` | fewer than `VMIN` | blocks indefinitely, however many are queued |
+    /// | `0`/`>0` | nothing | 0 bytes one `VTIME` after the read *began* (503 ms at `VTIME=5`) |
+    /// | `0`/`>0` | any | those bytes **as they arrive** (100 ms at `VTIME=2`, not 300) |
+    /// | `>0`/`>0` | fewer than `VMIN` | what is queued, one `VTIME` after the **last** byte landed |
+    /// | `>0`/`>0` | at least `VMIN` | everything queued, immediately: 5 bytes at once for `VMIN=3` |
+    ///
+    /// `entry` anchors only the `VMIN == 0` clock, and `last_byte` the other;
+    /// a caller that has no clock hands 0 for both and gets a wait that can
+    /// only end when input arrives, which is the host-visible half of the rule.
+    pub fn read_wait(&self, entry: u64, ticks_per_ds: u64) -> ReadWait {
+        if self.has_ready() {
+            return ReadWait::Ready;
+        }
+        // Canonical: a read waits for a line, and nothing else ends the wait.
+        if self.tio.lflag & ICANON != 0 {
+            return ReadWait::UntilInput;
+        }
+        let (vmin, vtime) = (self.vmin(), self.vtime());
+        if vmin == 0 && vtime == 0 {
+            // The poll: an empty queue is the answer, and it is 0 bytes rather
+            // than an end of input - which is why the read reports it itself
+            // instead of going through `take`, whose 0-byte slice *is* an EOF.
+            return ReadWait::Empty;
+        }
+        if vtime == 0 {
+            return ReadWait::UntilInput;
+        }
+        let span = (vtime as u64).saturating_mul(ticks_per_ds);
+        if vmin == 0 {
+            // Bytes that land are taken as they arrive, so the clock is only
+            // there to answer an empty queue - and it runs from the read's own
+            // start, not from a byte that never came.
+            return ReadWait::UntilTick(entry.saturating_add(span));
+        }
+        // `VMIN > 0`: with nothing queued there is no clock to run - the read
+        // waits for a first byte with unlimited patience - and once bytes are
+        // there the clock is the gap since the last one arrived.
+        if self.out.is_empty() {
+            return ReadWait::UntilInput;
+        }
+        ReadWait::UntilTick(self.last_byte.saturating_add(span))
+    }
+
+    /// Whether a byte arriving must wake a reader that is still not satisfied,
+    /// because it starts or restarts that reader's `VTIME` clock.
+    ///
+    /// Without this a `VMIN=2/VTIME=5` read sleeps through the first byte - the
+    /// byte makes no read decision on its own - and then wakes only when its
+    /// own deadline passes, which by then was computed from a queue this byte
+    /// just changed. The extra wake is what re-anchors the clock, and it is how
+    /// the measured "a late byte is delivered 500 ms after it arrives" happens.
+    pub fn byte_restarts_clock(&self) -> bool {
+        self.tio.lflag & ICANON == 0 && self.vtime() > 0
+    }
+
+    /// Record the tick an input byte landed at, for [`read_wait`](Self::read_wait).
+    pub fn note_input_tick(&mut self, tick: u64) {
+        self.last_byte = tick;
+        self.input_count = self.input_count.wrapping_add(1);
+    }
+
+    /// The running count of input bytes landed. A clock-restarting read snapshots
+    /// this before parking and wakes when it changes; see `input_count` on the
+    /// struct.
+    pub fn input_count(&self) -> u64 {
+        self.input_count
     }
 
     /// Take what a read asked for: at most `want` bytes, and in canonical
@@ -1324,6 +1309,12 @@ pub struct Tty {
     output: Mutex<RefCell<TtyOutput>>,
     /// What `st_rdev` reports.
     dev_id: (u32, u32),
+    /// The node's mode and owner: `chmod`/`chown` on a real terminal - and
+    /// udev's cold-plug rules for `0620 root:tty` - land here and are read
+    /// back by `stat` and by the permission checks. Born `0666 root:root`,
+    /// the number `stat` already gave these nodes before any of this existed
+    /// (see `devfs::NodePerms`).
+    perms: super::devfs::NodePerms,
     /// The window a program is told it has, in `(rows, columns)`, for a
     /// terminal whose size the kernel cannot know: what `TIOCSWINSZ` last set,
     /// and 25x80 until an emulator says otherwise. A virtual console stores it
@@ -1356,6 +1347,7 @@ impl Tty {
             foreground: Mutex::new(RefCell::new(None)),
             output: Mutex::new(RefCell::new(output)),
             dev_id,
+            perms: super::devfs::NodePerms::new(0o666, 0, 0),
             winsize: Mutex::new(RefCell::new((25, 80))),
         }
     }
@@ -1406,6 +1398,60 @@ impl Tty {
         })
     }
 
+    /// Whose screen this terminal's bytes land on, and how big it is - the two
+    /// facts the line discipline needs and cannot work out for itself.
+    ///
+    /// Read per write rather than cached, for the same reason
+    /// [`window_size`](Self::window_size) is: a console whose screen changed under
+    /// it - a scanout resized, a grid the render task has only just made - has to
+    /// be answered from what is true now, or the cursor report and the `TIOCGWINSZ`
+    /// report split apart, which is the failure this exists to prevent.
+    pub fn attached(&self) -> Attached {
+        let (rows, cols) = self.window_size();
+        Attached {
+            kernel_draws: self.kernel_draws(),
+            rows: rows as usize,
+            cols: cols as usize,
+        }
+    }
+
+    /// Whether *this kernel* is the terminal emulator for this terminal's output:
+    /// whether the bytes it is asked to draw end up in a screen the kernel owns.
+    ///
+    /// This is the question a `ESC [ 6 n` turns on, and it is not the question
+    /// "is this a virtual console". The six consoles are pty pairs like any
+    /// `/dev/pts`, and what makes them different is only who reads the master:
+    ///
+    /// * the console multiplexer, which hands the bytes to a [`crate::vfs::term`]
+    ///   grid - the kernel draws the screen, so the kernel answers, because there
+    ///   is no one else who knows where that cursor is, and a shell that asks and
+    ///   is refused waits forever;
+    /// * the serial wire, when no grid exists (`--mode terminal`) - the person's
+    ///   own terminal window is the emulator, it has the cursor, and Linux's
+    ///   measured answer for a pty pair is that the line discipline forwards the
+    ///   query untouched. This kernel answering instead is what put a guessed
+    ///   `80` in front of a window that is not `80` wide, and let `fish` erase the
+    ///   line its own command had just printed;
+    /// * a process holding the master (`/dev/pts` under a terminal program) - the
+    ///   same forwarding, and the same measurement.
+    ///
+    /// `Discard` answers `true` on being asked nothing else: a terminal with no
+    /// wire behind it has no other responder, and silence there is a hang.
+    fn kernel_draws(&self) -> bool {
+        let output = critical_section::with(|cs| *self.output.borrow(cs).borrow());
+        match output {
+            TtyOutput::Discard => true,
+            // The kernel console's own voice: `console::write_bytes` paints the
+            // active grid for as long as a grid exists, and the wire alone when it
+            // does not.
+            TtyOutput::Serial => kernel_console_has_grids(),
+            TtyOutput::Pty(_) => match self.vc_number() {
+                Some(vc) => super::term::has_screen(vc as usize),
+                None => false,
+            },
+        }
+    }
+
     /// Tell the foreground group the window changed - `SIGWINCH`, the one signal
     /// a full-screen program redraws on.
     ///
@@ -1417,24 +1463,6 @@ impl Tty {
     pub fn signal_window_change(&self) {
         if let Some(pgid) = self.foreground() {
             crate::sched::send_signal_group(pgid, SIGWINCH);
-        }
-    }
-
-    /// Tell the foreground group what the console's `struct vt_mode` named for
-    /// this event: `relsig` says hand the screen back, `acqsig` says it is
-    /// yours again. Which one is the caller's decision, not this one's, so the
-    /// number arrives as an argument rather than as two more constants here.
-    ///
-    /// The job, not the session: a compositor and the shell it left behind are
-    /// different processes in the same job, and on Linux the signal goes to the
-    /// foreground group that `VT_SETMODE` was answered by. A session that
-    /// installed no handler dies of it, which is the correct outcome for a
-    /// promise it could not keep - and the reason an unanswered release is
-    /// bounded by a deadline rather than by this signal alone.
-    #[cfg(target_os = "none")]
-    pub fn signal_console(&self, sig: u8) {
-        if let Some(pgid) = self.foreground() {
-            crate::sched::send_signal_group(pgid, sig);
         }
     }
 
@@ -1504,12 +1532,41 @@ impl Tty {
     /// is delivered to whoever is reading. Runs with interrupts off for the
     /// length of the edit, which is nothing next to the byte's arrival rate.
     pub fn receive_byte(&self, byte: u8) {
+        let attached = self.attached();
         let (echo, action, waiters, foreground) = critical_section::with(|cs| {
             let mut ld = self.ld.borrow(cs).borrow_mut();
             let action = ld.receive(byte);
+            // Stamp the arrival before deciding who to wake: a `VMIN > 0` read
+            // with a `VTIME` set has its clock anchored here, and only the
+            // reader itself can re-read it - so a byte that does not complete a
+            // read decision still has to wake it. See
+            // [`LineDiscipline::byte_restarts_clock`].
+            #[cfg(target_os = "none")]
+            ld.note_input_tick(crate::arch::timer::ticks());
             let echo = ld.take_echo();
+            // Echo is output like any other: the cursor moves for the characters
+            // the console shows, so the model of the screen has to follow it. A
+            // discipline that only counted what a program wrote would report a
+            // cursor the printed line had already left behind - and the answer is
+            // the bytes a *later* line is replayed from, so the forward decision
+            // the discipline makes here is thrown away on purpose.
+            if !echo.is_empty() {
+                let _ = ld.note_output(&echo, &attached);
+            }
+            // Two different wakes, and only one of them may take the list.
+            // A completed read has bytes to hand over, so every waiter is
+            // woken and removed - a reader re-arms on each pass of
+            // `read_blocking`, which is what makes the removal safe. A clock
+            // restart has nothing to give anyone: it only tells a waiting read
+            // that the deadline it computed is now stale. Taking the list for
+            // *that* would silently unsubscribe the waiters that do not re-arm
+            // themselves - `poll`, `select` and above all `epoll`, which
+            // subscribes once per wait - and an epoll subscriber dropped from
+            // the list never hears about the next line.
             let waiters = if ld.has_ready() {
                 core::mem::take(&mut *self.waiters.borrow(cs).borrow_mut())
+            } else if ld.byte_restarts_clock() {
+                self.waiters.borrow(cs).borrow().clone()
             } else {
                 Vec::new()
             };
@@ -1527,10 +1584,27 @@ impl Tty {
             // and Ctrl-C is aimed at the job. It is also what keeps the shell
             // alive - a shell sitting in `wait` has left the foreground group,
             // so the signal never reaches it.
-            if action == Action::Interrupt
-                && let Some(pgid) = foreground
-            {
-                crate::sched::send_signal_group(pgid, SIGINT);
+            //
+            // The quit and the suspend take the same route, and for the same
+            // reason: Ctrl-\ and Ctrl-Z are aimed at the job as much as Ctrl-C
+            // is. `SIGTSTP`'s destination is the one that matters most, because
+            // a job the keyboard stopped is a job the shell has to be told
+            // about: stopping only the reader would leave the rest of the
+            // pipeline running behind a stopped `wait`, which is not a job
+            // state anything can name.
+            if let Some(pgid) = foreground {
+                match action {
+                    Action::Interrupt => {
+                        crate::sched::send_signal_group(pgid, SIGINT);
+                    }
+                    Action::Quit => {
+                        crate::sched::send_signal_group(pgid, SIGQUIT);
+                    }
+                    Action::Suspend => {
+                        crate::sched::send_signal_group(pgid, SIGTSTP);
+                    }
+                    Action::None => {}
+                }
             }
         }
         #[cfg(not(target_os = "none"))]
@@ -1582,13 +1656,29 @@ impl Tty {
         critical_section::with(|cs| self.ld.borrow(cs).borrow().has_ready())
     }
 
+    /// Whether an input byte has landed since `base` was read. The wake predicate
+    /// a clock-restarting non-canonical read parks on, so a partial byte that
+    /// re-anchors its `VTIME` clock ends the park instead of being swallowed.
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    fn input_moved(&self, base: u64) -> bool {
+        critical_section::with(|cs| self.ld.borrow(cs).borrow().input_count() != base)
+    }
+
     /// Blocking read: in canonical mode at most one line, in raw mode as much
-    /// as is there, and 0 once input has ended. Never errors; the size is
-    /// what the syscall returns.
+    /// as the `VMIN`/`VTIME` table allows, and 0 once input has ended.
+    ///
+    /// It answers `EINTR` when a signal the caller can catch ends the wait.
+    /// That is Linux's answer - measured for `SIGALRM`, `SIGWINCH` and
+    /// `SIGCHLD` alike, with the handler run before the return - and it is the
+    /// only way a full-screen program's own timeout breaks a read at all:
+    /// without it the signal woke the task, found the queue still empty, and
+    /// sent it back to sleep forever. `vim` and busybox `vi` both wait on
+    /// exactly this, which is where "it drew the screen and then stopped
+    /// responding to everything" came from.
     #[cfg(target_os = "none")]
-    pub fn read(&self, buf: &mut [u8]) -> usize {
+    pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         if buf.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let id = crate::sched::current();
         // The waiter is registered inside `read_blocking`, re-armed on every
@@ -1614,16 +1704,21 @@ impl Tty {
     /// The same contract without a scheduler. On the host, tty reads block by
     /// construction, so only the discipline itself is testable.
     #[cfg(not(target_os = "none"))]
-    pub fn read(&self, buf: &mut [u8]) -> usize {
+    pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         let _ = buf;
         panic!("blocking tty reads need the kernel scheduler; test LineDiscipline instead");
     }
 
-    /// Take what a read would take, without blocking - the pair tests on the
-    /// host, which cannot park a task but still want to see a typed line
-    /// arrive whole at the slave.
-    #[cfg(all(test, not(target_os = "none")))]
-    pub(crate) fn take_ready(&self, buf: &mut [u8]) -> Option<usize> {
+    /// Take what a read would take, without blocking and without waiting.
+    ///
+    /// `None` means there was nothing to take; the empty `Some(0)` is the end
+    /// of input, which is what [`LineDiscipline::take`] means by it. Both the
+    /// kernel's wait loop and the host's tests need exactly this - the tests
+    /// cannot park a task but still want to see a typed line arrive whole at
+    /// the slave - and sharing it is what keeps the two halves from drifting
+    /// apart on the one question this read answers.
+    #[cfg(any(test, target_os = "none"))]
+    pub(crate) fn take_now(&self, buf: &mut [u8]) -> Option<usize> {
         critical_section::with(|cs| {
             let mut ld = self.ld.borrow(cs).borrow_mut();
             let bytes = ld.take(buf.len())?;
@@ -1634,8 +1729,14 @@ impl Tty {
     }
 
     #[cfg(target_os = "none")]
-    fn read_blocking(&self, buf: &mut [u8]) -> usize {
+    fn read_blocking(&self, buf: &mut [u8]) -> VfsResult<usize> {
         let id = crate::sched::current();
+        // The read's own start, which is the anchor for the `VMIN == 0` clock
+        // and only for that one: with `VMIN > 0` the clock runs between bytes
+        // and the discipline is where that stamp lives.
+        let entry = crate::arch::timer::ticks();
+        // One decisecond, in ticks - the unit `VTIME` is written in.
+        let ticks_per_ds = crate::arch::timer::TICK_HZ as u64 / 10;
         loop {
             // Re-arm the waiter on every pass, not once. `receive_byte` wakes
             // by taking the WHOLE waiter list, so a reader that loses a line to
@@ -1648,13 +1749,60 @@ impl Tty {
                 w.retain(|&x| x != id);
                 w.push(id);
             });
-            crate::sched::block_until(|| self.has_ready());
-            let got = critical_section::with(|cs| self.ld.borrow(cs).borrow_mut().take(buf.len()));
-            // `None` means another reader took it first; wait for the next one.
-            if let Some(bytes) = got {
-                let n = bytes.len().min(buf.len());
-                buf[..n].copy_from_slice(&bytes[..n]);
-                return n;
+            // The wait is re-decided on every pass, because every pass may have
+            // changed the two things it depends on: the settings (a program
+            // switches to raw mode between reads) and the bytes that arrived.
+            let (wait, clock_base) = critical_section::with(|cs| {
+                let ld = self.ld.borrow(cs).borrow();
+                // A clock-restarting non-canonical read parks until a byte
+                // changes this count, not only until a read completes. One
+                // partial byte does not satisfy `VMIN`, so the wake that
+                // re-anchors the inter-byte `VTIME` clock would otherwise be
+                // swallowed by `block_until_deadline`'s condition loop and the
+                // read would sleep past its own deadline. `None` keeps the
+                // completed-read wake for canonical and `VTIME == 0` reads. See
+                // `PLAN.md` §12.4a.
+                let base = if ld.byte_restarts_clock() {
+                    Some(ld.input_count())
+                } else {
+                    None
+                };
+                (ld.read_wait(entry, ticks_per_ds), base)
+            });
+            let deadline = match wait {
+                ReadWait::Empty => return Ok(0),
+                ReadWait::Ready => {
+                    if let Some(n) = self.take_now(buf) {
+                        return Ok(n);
+                    }
+                    continue;
+                }
+                ReadWait::UntilInput => u64::MAX,
+                ReadWait::UntilTick(due) => {
+                    if crate::arch::timer::ticks() >= due {
+                        // The clock ran out with a decision owed. Nothing here
+                        // needs to know *which* clock case it is: an empty queue
+                        // at this point can only be the `VMIN == 0` one, because
+                        // `VMIN > 0` with an empty queue answers `UntilInput`
+                        // instead - so `0` is the timeout's own answer and never
+                        // a stolen EOF.
+                        return Ok(self.take_now(buf).unwrap_or(0));
+                    }
+                    due
+                }
+            };
+            let ended = match clock_base {
+                Some(base) => crate::sched::block_until_deadline(
+                    || self.has_ready() || self.input_moved(base),
+                    deadline,
+                ),
+                None => crate::sched::block_until_deadline(|| self.has_ready(), deadline),
+            };
+            match ended {
+                crate::sched::WaitEnd::Interrupted => return Err(VfsError::Interrupted),
+                // Woken by input, or by the clock: the pass above re-reads both,
+                // and a wake from anything else is simply another look.
+                crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => {}
             }
         }
     }
@@ -1761,7 +1909,32 @@ pub fn by_dev_id(dev_id: (u32, u32)) -> Option<Arc<Tty>> {
 /// login that froze forever for want of a SIGCONT nobody would send.
 pub struct ControllingTty;
 
+/// The alias names keep one shared mode, the way Linux's single `/dev/tty`
+/// and `/dev/tty0` inodes do: a `chmod` on the name sticks for every process
+/// that opens it, and `stat` reports what was set.
+static CONTROLLING_PERMS: super::devfs::NodePerms = super::devfs::NodePerms::new(0o666, 0, 0);
+static TTY0_PERMS: super::devfs::NodePerms = super::devfs::NodePerms::new(0o666, 0, 0);
+
 impl Inode for ControllingTty {
+    fn keeps_modes(&self) -> bool {
+        CONTROLLING_PERMS.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        CONTROLLING_PERMS.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        CONTROLLING_PERMS.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        CONTROLLING_PERMS.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        CONTROLLING_PERMS.set_owner(uid, gid);
+    }
     /// A terminal has no position - `lseek(2)` on one is `ESPIPE` - and
     /// saying otherwise is what makes a reader drop the bytes it meant to
     /// push back.
@@ -1820,6 +1993,25 @@ impl Inode for ControllingTty {
 pub struct Tty0;
 
 impl Inode for Tty0 {
+    fn keeps_modes(&self) -> bool {
+        TTY0_PERMS.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        TTY0_PERMS.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        TTY0_PERMS.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        TTY0_PERMS.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        TTY0_PERMS.set_owner(uid, gid);
+    }
     fn seekable(&self) -> bool {
         false
     }
@@ -1871,6 +2063,26 @@ impl Inode for Tty {
         }
     }
 
+    fn keeps_modes(&self) -> bool {
+        self.perms.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        self.perms.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.perms.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.perms.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        self.perms.set_owner(uid, gid);
+    }
+
     /// Termios ioctls are answered by the device, and a descriptor only says
     /// which device it is by handing back the inode it points at.
     fn as_tty(&self) -> Option<&Tty> {
@@ -1914,16 +2126,18 @@ impl Inode for Tty {
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        Ok(self.read(buf))
+        self.read(buf)
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
         // Output can be input: a shell that asks where the cursor is gets
         // its answer here, and a reader waiting on that answer has to be
-        // woken exactly as if the bytes had been typed.
+        // woken exactly as if the bytes had been typed - but only where this
+        // kernel is the terminal the question was asked of.
+        let attached = self.attached();
         let (forwarded, waiters) = critical_section::with(|cs| {
             let mut ld = self.ld.borrow(cs).borrow_mut();
-            let forwarded = ld.note_output(buf);
+            let forwarded = ld.note_output(buf, &attached);
             let waiters = if ld.has_ready() {
                 core::mem::take(&mut *self.waiters.borrow(cs).borrow_mut())
             } else {
@@ -1953,8 +2167,14 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{Action, Key, LineDiscipline, Tty, TtyOutput};
-    use crate::vfs::termios::{ECHO, ECHOCTL, ICANON, ICRNL, ISIG, VERASE, VMIN};
+    use super::{Action, Attached, CR, LineDiscipline, ReadWait, Tty, TtyOutput};
+    use crate::vfs::termios::{ECHO, ECHOCTL, ICANON, ICRNL, ISIG, VEOF, VERASE, VMIN, VTIME};
+
+    /// The kernel is the terminal, at the size it reports: what every
+    /// existing case here pins, because each of them was written while the
+    /// discipline answered every question unconditionally. The forwarding
+    /// half has its own cases below.
+    const KERNEL: Attached = Attached::kernel(25, 80);
 
     fn fed(bytes: &[u8]) -> LineDiscipline {
         let mut ld = LineDiscipline::new();
@@ -2016,12 +2236,13 @@ mod tests {
     }
 
     #[test]
-    fn control_bytes_without_editing_meaning_are_dropped() {
+    fn unclaimed_control_bytes_are_typed_into_the_line() {
         let mut ld = fed(b"\x01\x02x\n");
-        // ^A and ^B move the cursor rather than being typed, and at the start
-        // of an empty line there is nowhere to move, so nothing is echoed.
-        assert_eq!(ld.take_echo(), b"x\n");
-        assert_eq!(lines(&mut ld), vec![b"x\n".to_vec()]);
+        // ^A and ^B are not termios specials, so on Linux they are characters
+        // of the line - and so here. `ECHOCTL` is what renders them as `^A`
+        // and `^B` on the screen without that being what is in the buffer.
+        assert_eq!(ld.take_echo(), b"^A^Bx\n");
+        assert_eq!(lines(&mut ld), vec![b"\x01\x02x\n".to_vec()]);
     }
 
     #[test]
@@ -2055,163 +2276,87 @@ mod tests {
         assert_eq!(lines(&mut ld), vec![b"hi!\n".to_vec()]);
     }
 
-    // --- arrow keys and friends: the point of the whole exercise ---
+    #[test]
+    fn ctrl_z_asks_for_a_suspend_and_never_enters_the_line() {
+        // The terminal's other job-control key: `VSUSP` (0x1a) is shown as
+        // `^Z` and becomes a signal, never input — the same contract as the
+        // interrupt, because a suspended reader's line is as much the
+        // terminal's to keep as a killed reader's.
+        let mut ld = LineDiscipline::new();
+        let _ = ld.receive(b'v');
+        assert_eq!(ld.receive(0x1a), Action::Suspend);
+        assert!(!ld.has_ready(), "a suspend completes no line");
+        assert_eq!(ld.take_echo(), b"v^Z\n", "the suspend is shown, not typed");
+
+        // A program that catches SIGTSTP (as vim does) and stops itself
+        // deliberately resumes to the same line it left.
+        let _ = ld.receive(b'i');
+        let _ = ld.receive(b'm');
+        let _ = ld.receive(b'\n');
+        assert_eq!(lines(&mut ld), vec![b"vim\n".to_vec()]);
+    }
 
     #[test]
-    fn arrow_keys_are_one_key_each_and_not_four_characters() {
-        let mut ld = fed(b"ls");
-        for &b in b"\x1b[D" {
+    fn ctrl_backslash_asks_for_a_quit_and_never_enters_the_line() {
+        // `VQUIT` (0x1c) completes the ISIG trio: `^\` on the screen, a
+        // SIGQUIT to the foreground group, and no byte for the reader.
+        let mut ld = LineDiscipline::new();
+        let _ = ld.receive(b'q');
+        assert_eq!(ld.receive(0x1c), Action::Quit);
+        assert!(!ld.has_ready(), "a quit completes no line");
+        assert_eq!(ld.take_echo(), b"q^\\\n", "the quit is shown, not typed");
+    }
+
+    #[test]
+    fn isig_keys_are_ordinary_bytes_once_isig_is_off() {
+        // The three keys belong to `ISIG`, not to the terminal: with the flag
+        // off they are input — a raw-mode reader reading them is the point of
+        // turning the flag off.
+        let mut ld = raw_ld();
+        let mut tio = ld.termios();
+        tio.lflag &= !ISIG;
+        ld.set_termios(tio);
+        assert_eq!(ld.receive(0x03), Action::None);
+        assert_eq!(ld.receive(0x1a), Action::None);
+        assert_eq!(ld.receive(0x1c), Action::None);
+        assert_eq!(ld.take(8), Some(vec![0x03, 0x1a, 0x1c]));
+    }
+
+    // --- typed sequences: characters, not keys ---
+
+    #[test]
+    fn a_typed_escape_sequence_reaches_the_reader_with_the_line() {
+        // An arrow at a canonical prompt is five characters like any other,
+        // delivered when the line is: what `n_tty` does, and what the shells
+        // and editors here do not ask of it because they read in raw mode.
+        let mut ld = LineDiscipline::new();
+        for &b in b"ab\x1b[A\n" {
             assert_eq!(ld.receive(b), Action::None);
         }
-        assert_eq!(
-            ld.line(),
-            b"ls".to_vec(),
-            "left moved the cursor, not the text"
-        );
-        let _ = ld.receive(b'x');
-        // Typed between the two characters: `lxs`.
-        assert_eq!(ld.line(), b"lxs".to_vec());
-
-        let _ = ld.receive(b'\n');
-        assert_eq!(
-            lines(&mut ld),
-            vec![b"lxs\n".to_vec()],
-            "no `[`, `D` or ESC reached the line"
-        );
+        // The `ESC` is *shown* as `^[` by ECHOCTL; the buffer holds the byte.
+        assert_eq!(ld.take_echo(), b"ab^[[A\n");
+        assert_eq!(lines(&mut ld), vec![b"ab\x1b[A\n".to_vec()]);
     }
 
     #[test]
-    fn a_modified_arrow_still_just_moves_the_cursor() {
-        // `ESC [ 1 ; 3 C`: Alt-right. The modifier is not typed either.
-        let mut ld = fed(b"ab");
-        for &b in b"\x1b[1;3C" {
-            let _ = ld.receive(b);
-        }
-        let _ = ld.receive(b'!');
-        assert_eq!(ld.line(), b"ab!".to_vec());
-    }
-
-    #[test]
-    fn the_delete_key_removes_under_the_cursor() {
-        let mut ld = fed(b"abc");
-        for &b in b"\x1b[D\x1b[D" {
-            let _ = ld.receive(b);
-        }
-        for &b in b"\x1b[3~" {
-            let _ = ld.receive(b);
-        }
-        assert_eq!(ld.line(), b"ac".to_vec());
-    }
-
-    #[test]
-    fn a_cursor_position_report_is_not_typed() {
-        // A shell asks `ESC[6n`; the terminal answers `ESC[41;5R`. That answer
-        // is for the shell, never for the line - and used to arrive as
-        // `[41;5R` typed at the prompt.
+    fn a_terminal_answer_typed_back_at_the_line_is_input_like_any_other() {
+        // A shell asks `ESC[6n` in raw mode and the `ESC[41;5R` answer is read
+        // there too. If those report bytes land at a *canonical* reader, they
+        // are characters of its line - the same thing Linux hands it - not
+        // something this discipline recognises and drops.
         let mut ld = LineDiscipline::new();
         for &b in b"\x1b[41;5R" {
             assert_eq!(ld.receive(b), Action::None);
         }
-        assert_eq!(ld.line(), Vec::<u8>::new());
-        assert!(!ld.has_ready());
+        ld.receive(b'\n');
+        assert_eq!(lines(&mut ld), vec![b"\x1b[41;5R\n".to_vec()]);
     }
 
     #[test]
-    fn modified_and_ss3_arrows_are_still_arrows() {
-        let mut ld = fed(b"ab");
-        // Ctrl-left: `ESC [ 1 ; 5 D`.
-        for &b in b"\x1b[1;5D" {
-            let _ = ld.receive(b);
-        }
-        let _ = ld.receive(b'X');
-        assert_eq!(ld.line(), b"aXb".to_vec());
-
-        // Application cursor mode: `ESC O C` is right, `ESC O A` is up.
-        let mut ld = fed(b"ab");
-        for &b in b"\x1bOC" {
-            let _ = ld.receive(b);
-        }
-        let _ = ld.receive(b'Z');
-        assert_eq!(ld.line(), b"abZ".to_vec());
-    }
-
-    #[test]
-    fn up_and_down_walk_the_history() {
-        let mut ld = fed(b"one\n");
-        let _ = lines(&mut ld);
-        let mut ld = {
-            ld.receive(b't');
-            ld.receive(b'w');
-            ld.receive(b'o');
-            ld.receive(b'\n');
-            ld
-        };
-        let _ = lines(&mut ld);
-        let _ = ld.take_echo();
-
-        // Up: the last line comes back.
-        for &b in b"\x1b[A" {
-            let _ = ld.receive(b);
-        }
-        assert_eq!(ld.line(), b"two".to_vec());
-
-        // Up again: the one before it.
-        for &b in b"\x1b[A" {
-            let _ = ld.receive(b);
-        }
-        assert_eq!(ld.line(), b"one".to_vec());
-
-        // Down twice returns to what was being typed: nothing.
-        for &b in b"\x1b[B" {
-            let _ = ld.receive(b);
-        }
-        assert_eq!(ld.line(), b"two".to_vec());
-        for &b in b"\x1b[B" {
-            let _ = ld.receive(b);
-        }
-        assert_eq!(ld.line(), Vec::<u8>::new());
-
-        let _ = ld.receive(b'\n');
-        assert_eq!(lines(&mut ld), vec![b"\n".to_vec()], "history is not input");
-    }
-
-    #[test]
-    fn history_keeps_what_was_being_typed_when_up_was_pressed() {
-        let mut ld = fed(b"first\n");
-        let _ = lines(&mut ld);
-        ld.receive(b'p');
-        ld.receive(b'a');
-        ld.receive(b'r');
-        ld.receive(b't');
-        for &b in b"\x1b[A" {
-            ld.receive(b);
-        }
-        assert_eq!(ld.line(), b"first".to_vec());
-        for &b in b"\x1b[B" {
-            ld.receive(b);
-        }
-        assert_eq!(
-            ld.line(),
-            b"part".to_vec(),
-            "down came back to the half-typed line"
-        );
-    }
-
-    #[test]
-    fn the_emacs_keys_edit_the_line() {
-        // ^A home, ^E end, ^K kill to end, ^U kill whole line, ^W a word.
-        let mut ld = fed(b"hello world");
-        ld.receive(0x01); // ^A
-        ld.receive(0x0e); // ^N: nothing below, no history yet
-        assert_eq!(ld.line(), b"hello world".to_vec());
-
-        let mut ld = fed(b"hello world");
-        for _ in 0..5 {
-            ld.receive(0x02); // ^B, back five
-        }
-        ld.receive(0x0b); // ^K
-        assert_eq!(ld.line(), b"hello ".to_vec());
-
+    fn kill_and_werase_erase_from_the_end_of_the_line() {
+        // `^W` (VWERASE) takes the last word and its spaces; `^U` (VKILL) the
+        // whole line. Both chop at the end, because there is no cursor - and
+        // the other emacs keys (^A..^T) are not specials at all.
         let mut ld = fed(b"one two three");
         ld.receive(0x17); // ^W
         assert_eq!(ld.line(), b"one two ".to_vec());
@@ -2223,13 +2368,173 @@ mod tests {
 
     // --- termios: what a shell asks for is what it gets ---
 
-    fn raw_ld() -> LineDiscipline {
+    /// A terminal in the mode a full-screen program puts it in, with the
+    /// `VMIN`/`VTIME` pair it asked for. Line editing and echo are off; `^C`
+    /// still interrupts, because that is a signal rule, not an editing one.
+    fn raw(vmin: u8, vtime: u8) -> LineDiscipline {
         let mut ld = LineDiscipline::new();
         let mut tio = ld.termios();
         tio.lflag &= !(ICANON | ECHO);
-        tio.cc[VMIN] = 1;
+        tio.cc[VMIN] = vmin;
+        tio.cc[VTIME] = vtime;
         ld.set_termios(tio);
         ld
+    }
+
+    fn raw_ld() -> LineDiscipline {
+        raw(1, 0)
+    }
+
+    /// One decisecond - the unit `VTIME` is written in - in ticks, at the
+    /// kernel's own 250 Hz. `read_wait` takes it as an argument rather than
+    /// reading the clock, which is what lets this table run on the host.
+    const DS: u64 = 25;
+
+    #[test]
+    fn a_poll_answers_zero_bytes_without_waiting() {
+        // `VMIN == 0` with `VTIME == 0` is the read that never sleeps: measured
+        // to return 0 in 0 ms, and to return 0 even when bytes land a moment
+        // later, because it is not waiting for them.
+        let mut ld = raw(0, 0);
+        assert_eq!(ld.read_wait(0, DS), ReadWait::Empty);
+        ld.receive(b'x');
+        assert_eq!(
+            ld.read_wait(0, DS),
+            ReadWait::Ready,
+            "with a byte queued, the same read takes it"
+        );
+    }
+
+    #[test]
+    fn vmin_zero_counts_any_byte_and_times_from_the_reads_entry() {
+        // This is the shape busybox `vi` and `vim` ask for to tell a bare `ESC`
+        // from the start of an escape sequence: give me whatever arrives, and if
+        // nothing arrives within a decisecond, tell me so with zero bytes.
+        // Measured: 0 bytes after 102 ms at `VTIME=1`, and the 1 byte that
+        // landed at 100 ms returned at 100 ms rather than at 300.
+        let mut ld = raw(0, 1);
+        assert_eq!(ld.read_wait(1_000, DS), ReadWait::UntilTick(1_025));
+        ld.receive(b'\x1b');
+        assert!(ld.has_ready(), "VMIN == 0 makes any byte a full answer");
+        assert_eq!(ld.read_wait(1_000, DS), ReadWait::Ready);
+    }
+
+    #[test]
+    fn vmin_above_one_times_from_the_last_byte_not_the_first() {
+        // Measured, and the reason the clock is anchored where it is:
+        // `VMIN=2/VTIME=5` with one byte arriving at 100 ms returned that byte at
+        // 604 ms - one VTIME after the byte - and a *second* read then returned
+        // the byte that landed at 900 ms at 1300 ms, one VTIME after that one.
+        let mut ld = raw(2, 5);
+        assert_eq!(
+            ld.read_wait(0, DS),
+            ReadWait::UntilInput,
+            "with an empty queue there is no clock running yet, and a read must \
+             not answer 0 here: that answer means end of input on this door"
+        );
+        ld.receive(b'1');
+        ld.note_input_tick(1_000);
+        assert_eq!(
+            ld.read_wait(0, DS),
+            ReadWait::UntilTick(1_125),
+            "anchored on the byte, not on the read's entry"
+        );
+        ld.receive(b'2');
+        ld.note_input_tick(1_300);
+        assert_eq!(
+            ld.read_wait(0, DS),
+            ReadWait::Ready,
+            "VMIN is satisfied, so the read takes everything queued"
+        );
+        // `VMIN` is a minimum, and the whole queue goes: measured as 5 bytes
+        // returned at once for `VMIN=3`.
+        let mut ld = raw(3, 5);
+        for &b in b"abcde" {
+            ld.receive(b);
+        }
+        assert_eq!(ld.read_wait(0, DS), ReadWait::Ready);
+        assert_eq!(ld.take(64), Some(b"abcde".to_vec()));
+    }
+
+    #[test]
+    fn a_clock_below_vmin_never_runs_on_an_empty_queue() {
+        // The case the old `.max(1)` stood in the way of, in its other half:
+        // measured, `VMIN=5/VTIME=0` with 2 bytes queued was still blocked at
+        // 2 s, and `VMIN=3/VTIME=5` with 2 queued answered those 2 at 604 ms.
+        // So only a *non-empty* queue below `VMIN` has a clock.
+        let mut ld = raw(5, 0);
+        for &b in b"12" {
+            ld.receive(b);
+        }
+        assert_eq!(ld.read_wait(0, DS), ReadWait::UntilInput);
+        let mut ld = raw(5, 5);
+        assert_eq!(ld.read_wait(400, DS), ReadWait::UntilInput);
+        for &b in b"12" {
+            ld.receive(b);
+        }
+        ld.note_input_tick(900);
+        assert_eq!(ld.read_wait(400, DS), ReadWait::UntilTick(1_025));
+    }
+
+    #[test]
+    fn canonical_mode_consults_neither_vmin_nor_vtime() {
+        // Measured: canonical with `VMIN=1/VTIME=5` and "abc" typed without a
+        // newline was still blocked at 4 s; the line came back whole, 1200 ms
+        // later, when the newline arrived. POSIX calls the pair non-canonical
+        // only, and this is what that wording costs a program to learn.
+        let mut ld = LineDiscipline::new();
+        let mut tio = ld.termios();
+        tio.cc[VMIN] = 1;
+        tio.cc[VTIME] = 5;
+        ld.set_termios(tio);
+        for &b in b"abc" {
+            ld.receive(b);
+        }
+        assert_eq!(ld.read_wait(0, DS), ReadWait::UntilInput);
+        ld.receive(CR);
+        assert_eq!(ld.read_wait(0, DS), ReadWait::Ready);
+    }
+
+    #[test]
+    fn an_answer_or_an_eof_outranks_any_clock() {
+        // A shell that asked where the cursor is must get its reply, and a
+        // reader at the end of its input must be told so, whatever `VMIN` says.
+        let mut ld = raw(3, 5);
+        ld.answer(b"\x1b[41;5R");
+        assert_eq!(ld.read_wait(0, DS), ReadWait::Ready);
+        let mut ld = LineDiscipline::new();
+        let eof = ld.termios().cc[VEOF];
+        assert_eq!(ld.receive(eof), Action::None);
+        assert_eq!(
+            ld.read_wait(0, DS),
+            ReadWait::Ready,
+            "the end of input is an answer, and the only one that repeats as 0"
+        );
+        assert_eq!(ld.take(8), Some(Vec::new()), "reported once");
+        assert_eq!(
+            ld.read_wait(0, DS),
+            ReadWait::UntilInput,
+            "and then the next read blocks again, exactly as a fresh one does"
+        );
+    }
+
+    #[test]
+    fn a_byte_below_vmin_still_wakes_the_waiting_reader() {
+        // Without this the waiter list is left holding a reader whose clock the
+        // byte just changed, and the late byte would only be delivered when a
+        // *stale* deadline ran out. This is the wake that makes the measured
+        // "delivered 500 ms after it arrives" happen at all.
+        assert!(raw(2, 5).byte_restarts_clock());
+        assert!(
+            !raw(2, 0).byte_restarts_clock(),
+            "with no clock there is nothing for the byte to restart"
+        );
+        let mut ld = LineDiscipline::new();
+        ld.receive(b'a');
+        assert!(
+            !ld.byte_restarts_clock(),
+            "canonical mode has no clock, so a typed byte is not a wake"
+        );
     }
 
     #[test]
@@ -2318,23 +2623,23 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_is_remembered_and_replayed_when_the_line_is_redrawn() {
-        let mut ld = LineDiscipline::new();
-        ld.note_output(b"/ # ");
-        ld.receive(b'l');
-        ld.receive(b's');
+    fn vreprint_redraws_the_pending_line() {
+        // `^R` (VREPRINT) is the one termios special that repaints: the line
+        // so far, after an erase-to-end. There is no prompt to replay, because
+        // the discipline was never the one drawing between the prompt and the
+        // input - a line editor in raw mode is.
+        let mut ld = fed(b"hi");
         let _ = ld.take_echo();
-        // A redraw has to put the line back after the prompt, not at column 0.
-        ld.receive(0x15); // ^U
-        assert_eq!(ld.take_echo(), b"\r/ # \x1b[K");
+        ld.receive(0x12); // ^R
+        assert_eq!(ld.take_echo(), b"\r\x1b[Khi");
     }
 
     #[test]
     fn a_cursor_position_query_is_answered_on_the_input_side() {
         // What a shell sends before it draws anything, and waits for.
         let mut ld = LineDiscipline::new();
-        ld.note_output(b"/ # ");
-        ld.note_output(b"\x1b[6n");
+        ld.note_output(b"/ # ", &KERNEL);
+        ld.note_output(b"\x1b[6n", &KERNEL);
         // One-based, and the cursor is four characters along: row 1, column 5.
         assert_eq!(ld.take(16), Some(b"\x1b[1;5R".to_vec()));
 
@@ -2345,40 +2650,265 @@ mod tests {
     #[test]
     fn the_cursor_answers_where_it_actually_is() {
         let mut ld = LineDiscipline::new();
-        ld.note_output(b"a line\n");
-        ld.note_output(b"xy");
-        ld.note_output(b"\x1b[6n");
+        ld.note_output(b"a line\n", &KERNEL);
+        ld.note_output(b"xy", &KERNEL);
+        ld.note_output(b"\x1b[6n", &KERNEL);
         assert_eq!(ld.take(16), Some(b"\x1b[2;3R".to_vec()));
+    }
+
+    /// The other half of the decision, and the half this kernel got wrong where
+    /// a real terminal was downstream: a question asked of a terminal the kernel
+    /// does not draw is neither answered nor swallowed.
+    ///
+    /// Measured on Linux against a pty pair - the slave written to in raw mode
+    /// with `ECHO` off, the master read as the emulator would - all six of these
+    /// arrived at the master byte for byte and none was answered, in 6 of 6 runs.
+    /// Answering them here instead is what cost `fish` its output on the serial
+    /// boot: the shell pads the dangling line out to the width it is *told*, so a
+    /// guessed `80` in front of a window of any other width never reaches the
+    /// margin, never wraps, and the `CR` and `ESC [ K` that follow erase the line
+    /// the command had just printed. The terminal at the other end of the wire
+    /// knows both numbers; this kernel knew neither.
+    #[test]
+    fn a_query_to_a_terminal_the_kernel_does_not_draw_travels_unanswered() {
+        let wire = Attached::downstream();
+        for (query, name) in [
+            (b"\x1b[6n".as_slice(), "cursor position"),
+            (b"\x1b[?6n".as_slice(), "the DEC-private cursor position"),
+            (b"\x1b[5n".as_slice(), "device status"),
+            (b"\x1b[c".as_slice(), "device attributes"),
+            (b"\x1b]11;?\x07".as_slice(), "the background colour query"),
+            (
+                b"\x1bP1+q636f6c6f7273\x1b\\".as_slice(),
+                "the capability query",
+            ),
+        ] {
+            let mut ld = LineDiscipline::new();
+            // Nothing is answered: no bytes queued for the reader, and nothing
+            // held back from the wire either.
+            let fwd = ld.note_output(query, &wire);
+            assert!(
+                fwd.is_none(),
+                "{name}: the query must travel exactly as it came, got {fwd:?}"
+            );
+            assert!(
+                !ld.has_ready(),
+                "{name}: nothing may be queued as input by a query this kernel \
+                 is not the terminal for"
+            );
+        }
+    }
+
+    /// And the same six, asked of a screen the kernel draws, are answered here -
+    /// because nothing else can be, and a caller that is refused waits forever.
+    #[test]
+    fn a_query_to_a_screen_the_kernel_draws_is_answered_and_kept_off_the_wire() {
+        let mut ld = LineDiscipline::new();
+        ld.note_output(b"hello", &KERNEL);
+        let fwd = ld.note_output(b"\x1b[6n", &KERNEL);
+        assert_eq!(fwd, Some(Vec::new()), "the answered query does not travel");
+        assert_eq!(ld.take(16), Some(b"\x1b[1;6R".to_vec()));
+
+        let mut ld = LineDiscipline::new();
+        assert_eq!(ld.note_output(b"\x1b[5n", &KERNEL), Some(Vec::new()));
+        assert_eq!(ld.take(16), Some(b"\x1b[0n".to_vec()));
+    }
+
+    /// A cursor is counted against the same window the terminal reports, because
+    /// a program reads both. Measured on the guest: `stty cols 40` moved the
+    /// reported window and the cursor report kept counting to `80`.
+    #[test]
+    fn the_cursor_is_counted_against_the_window_the_terminal_reports() {
+        let mut ld = LineDiscipline::new();
+        // Fill the line of a 40-column terminal, and ask.
+        let line = vec![b'x'; 40];
+        ld.note_output(&line, &Attached::kernel(10, 40));
+        ld.note_output(b"\x1b[6n", &Attached::kernel(10, 40));
+        assert_eq!(
+            ld.take(16),
+            Some(b"\x1b[1;40R".to_vec()),
+            "the last cell of the fortieth column, not a column of an 80-wide guess"
+        );
+
+        // The next line: the wrap happens at the margin that was reported.
+        ld.note_output(b"y", &Attached::kernel(10, 40));
+        ld.note_output(b"\x1b[6n", &Attached::kernel(10, 40));
+        assert_eq!(ld.take(16), Some(b"\x1b[2;2R".to_vec()));
+
+        // And a resize is felt immediately: the same discipline, a narrower screen.
+        ld.note_output(b"\x1b[H", &Attached::kernel(10, 40));
+        ld.note_output(&vec![b'z'; 25], &Attached::kernel(10, 12));
+        ld.note_output(b"\x1b[6n", &Attached::kernel(10, 12));
+        assert_eq!(
+            ld.take(16),
+            Some(b"\x1b[3;2R".to_vec()),
+            "twelve columns is the screen now"
+        );
+    }
+
+    /// The invariant the two halves of the terminal layer were split to keep: for
+    /// one byte stream, the cursor the renderer moved to and the cursor a position
+    /// report answers with are the *same pair*. The renderer and the line
+    /// discipline parse separately - one shapes pixels, one shapes a wire - and this
+    /// is what stops those two parses from being two opinions.
+    ///
+    /// Every stream here is a sequence the discipline used not to follow at all:
+    /// the scroll region, save/restore, the alternate screen, a line feed off the
+    /// bottom, a line longer than the screen.
+    #[test]
+    fn the_report_and_the_screen_never_disagree_about_the_cursor() {
+        use crate::vfs::term::Grid;
+        const ROWS: usize = 6;
+        const COLS: usize = 10;
+        let long = vec![b'q'; COLS * 3 + 4];
+        let streams: Vec<&[u8]> = alloc::vec![
+            b"hello",
+            b"a\nbb\nccc",
+            b"tab\there",
+            b"back\x08\x08",
+            &long,
+            b"\x1b[3;5Hx",
+            b"\x1b[H",
+            b"\x1b[999;999Hx",
+            b"\x1b[2J",
+            b"\x1b[2J\x1b[H",
+            b"\x1b[10;1",
+            b"\x1b[10d\x1b[9:9H",
+            b"\x1b[4;10r\x1bH",
+            b"\x1b[3r\x1b[9;3H",
+            // Region, save/restore and the alternate screen each have to be seen
+            // *by what happens next*: a stream that ends on a position both models
+            // would give would pin nothing. So each is followed by the move that
+            // only the correct region / saved pair / parked cursor explains.
+            b"\x1b[4;5r\x1b[4H1\n2\n3\n4",
+            b"\x1b[4;5r\x1b[5Hx\n",
+            b"\x1b[s\x1b[6;9H\x1b[u\x1b[B",
+            b"\x1b7\x1b[6;9H\x1b8\x1b[A",
+            b"\x1b[3;3H\x1b[?1049h\x1b[6;9H\x1b[?1049l",
+            b"\x1b[3;3H\x1b[?1049h\x1b[2J\x1b[?1049l\x1b[B",
+            b"\x1b[s\x1b[5;9H\x1b[u",
+            b"\x1b7\x1b[2;2H\x1b8",
+            b"\x1bM\x1bM",
+            b"\x1bD\x1bD",
+            b"\x1bE\x1bE",
+            b"\x1b[?1049h\x1b[3;4H",
+            b"\x1b[?1049hmore\x1b[?1049l",
+            b"main\x1b[?1049halt\x1b[?1049l\x1b[1;1H",
+            b"\x1b[C\x1b[C\x1b[D",
+            b"\x1b[A\x1b[B\x1b[E\x1b[F",
+            b"\x1b[5e\x1b[3a",
+            b"\x1b[6n",
+            b"\x1b[10b",
+            b"\x1b[38;5;196mred\x1b[0m",
+            b"\x1b]0;title\x07after",
+            b"\x1b(B ascii",
+        ];
+        for stream in streams {
+            let mut grid = Grid::new(ROWS, COLS);
+            grid.feed(stream);
+            let mut ld = LineDiscipline::new();
+            ld.note_output(stream, &Attached::kernel(ROWS, COLS));
+            assert_eq!(
+                grid.cursor(),
+                ld.screen.pos(),
+                "the screen and the report disagreed after {:?} (grid {:?}, \
+                 report {:?})",
+                core::str::from_utf8(stream).unwrap_or("<bytes>"),
+                grid.cursor(),
+                ld.screen.pos()
+            );
+        }
     }
 
     #[test]
     fn a_device_status_query_gets_the_terminals_ok() {
         let mut ld = LineDiscipline::new();
-        ld.note_output(b"\x1b[5n");
+        ld.note_output(b"\x1b[5n", &KERNEL);
         assert_eq!(ld.take(16), Some(b"\x1b[0n".to_vec()));
     }
 
-    /// `set_color` and a shell picking its theme ask the terminal what it is
-    /// with a Device Attributes query. It must be answered on the input side,
-    /// and swallowed on the output side, so the host cannot answer a second
-    /// time and have its reply arrive as typed input.
+    /// `set_color` and a program with no terminfo to consult ask the terminal
+    /// what it is with `CSI c`. Linux's `csi_ECMA` answers that one shape, and
+    /// `respond_ID()`'s answer is the VT102 ID - so that is the answer here,
+    /// given on the input side and swallowed on the output side so the host
+    /// cannot answer a second time and have its reply arrive as typed input.
     #[test]
     fn a_device_attributes_query_is_answered_and_not_forwarded() {
         let mut ld = LineDiscipline::new();
-        // Primary DA (`CSI c`): a VT220-class answer.
-        let fwd = ld.note_output(b"\x1b[c");
-        assert_eq!(ld.take(64), Some(b"\x1b[?62;1;2;6;7;8;9c".to_vec()));
+        let fwd = ld.note_output(b"\x1b[c", &KERNEL);
+        assert_eq!(ld.take(64), Some(b"\x1b[?6c".to_vec()));
         assert!(
             fwd.is_some() && fwd.unwrap().is_empty(),
             "the query is swallowed"
         );
 
-        // Secondary DA (`CSI > c`): the terminal-identity answer.
-        let fwd = ld.note_output(b"\x1b[>c");
-        assert_eq!(ld.take(64), Some(b"\x1b>0;10;0c".to_vec()));
+        // `CSI 0 c` is the same request. An unwritten parameter is `0` for a
+        // question, which is not the `1` a cursor movement leaves it at.
+        let mut ld = LineDiscipline::new();
+        let fwd = ld.note_output(b"\x1b[0c", &KERNEL);
+        assert_eq!(ld.take(64), Some(b"\x1b[?6c".to_vec()));
+        assert!(fwd.is_some() && fwd.unwrap().is_empty());
+
+        // `CSI 1 c` asks for nothing: the console answers only `0`.
+        let mut ld = LineDiscipline::new();
+        assert!(ld.note_output(b"\x1b[1c", &KERNEL).is_none());
+        assert!(ld.take(64).is_none(), "no reply to a nonzero parameter");
+    }
+
+    /// The `linux` terminfo that every editor here reads builds its cursor
+    /// capabilities out of `CSI ? Ps c`: `civis` is `\e[?25l\e[?1c`, `cnorm` is
+    /// `\e[?25h\e[?0c`, `cvvis` is `\e[?25h\e[?8c`. Linux's `csi_DEC` treats
+    /// them as a cursor-type *set* and answers nothing - and that is why vim
+    /// leaves nothing behind, because it writes both `civis` and `cnorm` again
+    /// as it exits and never reads a reply to either. An answer to a set is a
+    /// reply no one consumes: it waits in the input queue as typed text for
+    /// whoever reads next, which is the `9c9c` that showed up on the prompt
+    /// after vim quit.
+    #[test]
+    fn a_cursor_type_set_is_forwarded_and_never_answered() {
+        for seq in [
+            b"\x1b[?1c".as_slice(),
+            b"\x1b[?0c".as_slice(),
+            b"\x1b[?8c".as_slice(),
+        ] {
+            let mut ld = LineDiscipline::new();
+            assert!(
+                ld.note_output(seq, &KERNEL).is_none(),
+                "{seq:?} is a set, so it travels untouched"
+            );
+            assert!(ld.take(64).is_none(), "{seq:?} earns no reply");
+        }
+
+        // vim's own command-line pair, as it is written: one buffer, two sets.
+        let mut ld = LineDiscipline::new();
+        assert!(ld.note_output(b"\x1b[?25l\x1b[?1c", &KERNEL).is_none());
+        assert!(ld.take(64).is_none(), "and the pair still answers nothing");
+    }
+
+    /// `CSI > c` (secondary DA) asks for an identity the Linux console does not
+    /// have: `EPgt` reaches neither `csi_DEC` nor `csi_ECMA`, so it answers
+    /// nothing. It travels to the wire, where a real terminal may answer it,
+    /// rather than being answered here with an identity invented for it.
+    #[test]
+    fn a_secondary_device_attributes_query_is_forwarded_not_answered() {
+        let mut ld = LineDiscipline::new();
+        assert!(ld.note_output(b"\x1b[>c", &KERNEL).is_none());
+        assert!(ld.take(64).is_none(), "no identity is claimed here");
+    }
+
+    /// The DEC-private marker changes nothing about `ESC [ 6 n`: Linux answers
+    /// `n` from `csi_DEC` exactly as from `csi_ECMA`. Here the marker used to
+    /// parse as the first parameter, so the private form travelled unanswered
+    /// and a caller that asked it waited for a reply the console never sends.
+    #[test]
+    fn a_private_cursor_query_is_answered_once_and_not_forwarded() {
+        let mut ld = LineDiscipline::new();
+        ld.note_output(b"/ # ", &KERNEL);
+        let fwd = ld.note_output(b"\x1b[?6n", &KERNEL);
+        assert_eq!(ld.take(16), Some(b"\x1b[1;5R".to_vec()));
         assert!(
             fwd.is_some() && fwd.unwrap().is_empty(),
-            "the query is swallowed"
+            "the answer and the swallow are one decision"
         );
     }
 
@@ -2388,7 +2918,7 @@ mod tests {
     fn a_colour_sequence_is_forwarded_not_answered() {
         let mut ld = LineDiscipline::new();
         assert!(
-            ld.note_output(b"\x1b[32m").is_none(),
+            ld.note_output(b"\x1b[32m", &KERNEL).is_none(),
             "nothing to answer, so nothing swallowed"
         );
         assert!(ld.take(16).is_none(), "no reply is queued");
@@ -2401,7 +2931,7 @@ mod tests {
     #[test]
     fn a_background_colour_query_is_answered_and_not_forwarded() {
         let mut ld = LineDiscipline::new();
-        let fwd = ld.note_output(b"\x1b]11;?\x07");
+        let fwd = ld.note_output(b"\x1b]11;?\x07", &KERNEL);
         assert_eq!(
             ld.take(64),
             Some(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\".to_vec()),
@@ -2413,7 +2943,10 @@ mod tests {
         );
 
         // A colour *set* (`11;rgb:...`) is not a question: forwarded, no reply.
-        assert!(ld.note_output(b"\x1b]11;rgb:0000/0000/0000\x07").is_none());
+        assert!(
+            ld.note_output(b"\x1b]11;rgb:0000/0000/0000\x07", &KERNEL)
+                .is_none()
+        );
         assert!(ld.take(64).is_none());
     }
 
@@ -2426,7 +2959,7 @@ mod tests {
     fn an_xtgettcap_query_is_answered_and_not_forwarded() {
         let mut ld = LineDiscipline::new();
         // A query for the capability `colors` (hex 636f6c6f7273), ST-terminated.
-        let fwd = ld.note_output(b"\x1bP1+q636f6c6f7273\x1b\\");
+        let fwd = ld.note_output(b"\x1bP1+q636f6c6f7273\x1b\\", &KERNEL);
         assert_eq!(
             ld.take(64),
             Some(b"\x1bP1+r\x1b\\".to_vec()),
@@ -2448,14 +2981,14 @@ mod tests {
     fn a_query_split_across_writes_never_reaches_the_wire() {
         let mut ld = LineDiscipline::new();
         // `bat`'s own shape: the body in one write, the BEL in the next.
-        let head = ld.note_output(b"\x1b]10;?");
+        let head = ld.note_output(b"\x1b]10;?", &KERNEL);
         assert_eq!(
             head,
             Some(Vec::new()),
             "the head of an unresolved sequence is held, not sent"
         );
         assert_eq!(
-            ld.note_output(b"\x07"),
+            ld.note_output(b"\x07", &KERNEL),
             Some(Vec::new()),
             "and answering it drops the whole of it"
         );
@@ -2468,26 +3001,11 @@ mod tests {
         // A sequence that turns out to be ordinary output must still arrive,
         // in order, once it resolves - holding is a delay, not a loss.
         let mut ld = LineDiscipline::new();
-        assert_eq!(ld.note_output(b"\x1b[31"), Some(Vec::new()));
+        assert_eq!(ld.note_output(b"\x1b[31", &KERNEL), Some(Vec::new()));
         assert_eq!(
-            ld.note_output(b"m"),
+            ld.note_output(b"m", &KERNEL),
             Some(b"\x1b[31m".to_vec()),
             "the colour set travels whole"
-        );
-    }
-
-    #[test]
-    fn output_escape_sequences_are_not_mistaken_for_a_prompt() {
-        let mut ld = LineDiscipline::new();
-        ld.note_output(b"\x1b[32m");
-        ld.note_output(b"$ ");
-        ld.receive(b'x');
-        let _ = ld.take_echo();
-        ld.receive(0x15);
-        assert_eq!(
-            ld.take_echo(),
-            b"\r$ \x1b[K",
-            "the colour sequence is not part of the prompt"
         );
     }
 
@@ -2500,37 +3018,16 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_escape_and_a_ruined_sequence_are_dropped() {
+    fn an_incomplete_escape_is_a_character_and_the_line_survives() {
+        // There is no sequence state on the input side to get stuck in: a
+        // lone `ESC` is a byte of the line, and nothing that follows it is
+        // special because of it - the same answer Linux gives.
         let mut ld = LineDiscipline::new();
         ld.receive(b'\x1b');
-        ld.receive(b'x'); // not a sequence after all: both bytes dropped
-        assert_eq!(ld.line(), Vec::<u8>::new());
-
-        // A sequence that never ends - too many parameters to be a key - is
-        // given up on rather than left hanging over the next thing typed.
-        let mut ld = LineDiscipline::new();
-        for &b in b"\x1b[" {
-            ld.receive(b);
-        }
-        for _ in 0..40 {
-            ld.receive(b'9');
-            ld.receive(b';');
-        }
-        ld.receive(b'A');
-        assert_eq!(ld.line(), Vec::<u8>::new());
-        // And the next line typed is unaffected.
-        ld.receive(b'o');
-        ld.receive(b'k');
-        assert_eq!(ld.line(), b"ok".to_vec());
-    }
-
-    #[test]
-    fn keys_are_decoded_from_their_sequences() {
-        assert_eq!(LineDiscipline::csi_key(b'A', b""), Some(Key::Up));
-        assert_eq!(LineDiscipline::csi_key(b'~', b"3"), Some(Key::Delete));
-        assert_eq!(LineDiscipline::csi_key(b'~', b"5"), Some(Key::PageUp));
-        assert_eq!(LineDiscipline::csi_key(b'R', b"41;5"), None);
-        assert_eq!(LineDiscipline::ss3_key(b'H'), Some(Key::Home));
+        ld.receive(b'x');
+        assert_eq!(ld.line(), b"\x1bx".to_vec());
+        ld.receive(b'\n');
+        assert_eq!(lines(&mut ld), vec![b"\x1bx\n".to_vec()]);
     }
 
     /// A virtual console's window is the screen it is painted on, which is what

@@ -164,6 +164,15 @@ pub(super) const FD_SETSIZE: usize = 1024;
 pub(super) const MAP_SHARED: usize = 0x01;
 pub(super) const MAP_FIXED: usize = 0x10;
 pub(super) const MAP_ANONYMOUS: usize = 0x20;
+/// `MAP_FIXED_NOREPLACE` (since Linux 4.17): the address is mandatory like
+/// `MAP_FIXED`, but an occupied range is refused with `EEXIST` instead of being
+/// replaced. The caller is asking "this address or fail", which the plain
+/// no-`MAP_FIXED` hint cannot say.
+pub(super) const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
+/// `MAP_HUGETLB`: back the mapping with huge pages. This kernel has no huge-page
+/// pool, so the honest answer is the one Linux gives when the reserve is not
+/// available - `ENOMEM` - never a silent 4 KiB mapping that pretends otherwise.
+pub(super) const MAP_HUGETLB: usize = 0x4_0000;
 /// `mprotect`'s protection bits. Readable (0x1) is what a present page is,
 /// which is why only the other two are named here.
 pub(super) const PROT_WRITE: usize = 0x2;
@@ -1068,6 +1077,25 @@ pub(crate) fn itimerval_ms(
     Ok((value_ms, interval_ms))
 }
 
+/// One `struct timespec` of a `timer_settime`'s `struct itimerspec`, as a tick
+/// count: validated the way Linux validates it and rounded *up*, so a timer
+/// armed for "half a tick from now" fires one tick from now rather than
+/// immediately - the same never-early rule the other timeout conversions here
+/// keep.
+///
+/// A negative `tv_sec`, or a `tv_nsec` outside `[0, 1e9)`, is the man page's
+/// `EINVAL`; `tv_sec` large enough to overflow the tick arithmetic saturates
+/// rather than wraps, because a caller that asks for a sleep past the end of
+/// the machine's clock has asked for "as late as possible", not "now".
+pub(crate) fn timespec_ticks(sec: i64, nsec: i64, hz: u64) -> Result<u64, isize> {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(err::EINVAL);
+    }
+    let ticks = (sec as u64).saturating_mul(hz);
+    let nanos_per_tick = 1_000_000_000 / hz;
+    Ok(ticks.saturating_add((nsec as u64).div_ceil(nanos_per_tick)))
+}
+
 // ---------------------------------------------------------------------------
 // prctl(2): the option this kernel models
 // ---------------------------------------------------------------------------
@@ -1518,8 +1546,17 @@ pub(crate) fn handle_get_robust_list(_args: [usize; crate::syscall::ARG_COUNT]) 
 
 /// `rseq(rseq, len, flags, sig)` — register the restartable-sequence block.
 ///
-/// Registration succeeds and nothing is maintained afterwards. Linux rejects
-/// a length other than `sizeof(struct rseq)` = 32 and any flag but 0.
+/// Registration succeeds for a well-formed request and the argument shape is
+/// validated (`sizeof(struct rseq)` = 32, `flags` = 0), which is exactly what a
+/// libc's startup needs to get past - glibc registers the block at load time.
+/// The kernel deliberately does *not* then maintain the block's `cpu_id` field on
+/// preemption; that is this call's documented scope, pinned by `t-rseq`, and on a
+/// uniprocessor there is no second CPU for the field to be wrong about. Keeping
+/// the guarantee Linux provides for a second core is a named gap, not something
+/// to refuse: a kernel with `rseq` answers `0` here, so answering `ENOSYS` would
+/// break the startup contract `t-rseq` pins (rule 1: the code changes, not the
+/// test). The honest *addition* would be to write `cpu_id` (always 0 here) into
+/// the caller's block at registration - tracked below, not attempted as a refusal.
 pub(crate) fn handle_rseq(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     let (_rseq, len, flags) = (args[0], args[1], args[2]);
     if len != 32 || flags != 0 {
@@ -1738,6 +1775,81 @@ pub(crate) fn mark_missing_futex_op(op: usize) -> bool {
     };
     let mask = 1u64 << (op % 64);
     word.fetch_or(mask, Ordering::Relaxed) & mask == 0
+}
+
+// ---------------------------------------------------------------------------
+// The OSS dsp family (`'P'`-typed requests), for `/dev/dsp`
+// ---------------------------------------------------------------------------
+//
+// The request words were read off this machine's `linux/soundcard.h`, which
+// spells them with the `_SIO`/`_SIOR`/`_SIOWR` macros - aliases of the
+// standard `_IOC` layout (`dir << 30 | size << 16 | type << 8 | nr`) - so the
+// magic byte the words carry is `'P'`, not the `'M'` a BSD port once used.
+// A binary compiled against that header asks with exactly these numbers, and
+// the whole point of the family is that the *writer* owns the parameters:
+// rate, channels and format are negotiated here, not chosen at boot.
+
+/// `_SIO('P', 0)`: drop whatever the stream holds.
+pub const SNDCTL_DSP_RESET: u32 = 0x0000_5000;
+/// `_SIO('P', 1)`: wait for held audio to play out.
+pub const SNDCTL_DSP_SYNC: u32 = 0x0000_5001;
+/// `_SIOWR('P', 2, int)`: get/set the sample rate, in Hz.
+pub const SNDCTL_DSP_SPEED: u32 = 0xC004_5002;
+/// `_SIOWR('P', 3, int)`: set 0 = mono, 1 = stereo; the answer is what was set.
+pub const SNDCTL_DSP_STEREO: u32 = 0xC004_5003;
+/// `_SIOWR('P', 4, int)`: the current fragment (block) size in bytes.
+pub const SNDCTL_DSP_GETBLKSIZE: u32 = 0xC004_5004;
+/// `_SIOWR('P', 5, int)`: select one `AFMT_*` format; the answer is the one
+/// the device runs, or 0 for none of them.
+pub const SNDCTL_DSP_SETFMT: u32 = 0xC004_5005;
+/// `_SIOWR('P', 6, int)`: get/set the channel count.
+pub const SNDCTL_DSP_CHANNELS: u32 = 0xC004_5006;
+/// `_SIO('P', 8)`: kick a held output - a no-op where writes go straight out.
+pub const SNDCTL_DSP_POST: u32 = 0x0000_5008;
+/// `_SIOWR('P', 9, int)`: subdivide the fragments. Unimplemented: EINVAL.
+pub const SNDCTL_DSP_SUBDIVIDE: u32 = 0xC004_5009;
+/// `_SIOWR('P', 10, int)`: `fragsize | fragcount << 16`. Unimplemented: EINVAL.
+pub const SNDCTL_DSP_SETFRAGMENT: u32 = 0xC004_500A;
+/// `_SIOR('P', 11, int)`: the mask of formats this device speaks.
+pub const SNDCTL_DSP_GETFMTS: u32 = 0x8004_500B;
+/// `_SIOR('P', 12, audio_buf_info)`: free space on the output side.
+pub const SNDCTL_DSP_GETOSPACE: u32 = 0x8010_500C;
+/// `_SIOR('P', 13, audio_buf_info)`: free space on the input side - which
+/// this device's stream does not have, and says so with an empty one.
+pub const SNDCTL_DSP_GETISPACE: u32 = 0x8010_500D;
+/// `_SIO('P', 14)`: turn non-blocking writes on. Unimplemented: EINVAL -
+/// the write here blocks *inside* the device hand-off, and no flag on the
+/// descriptor changes that; accepting the word while writes went on blocking
+/// would be the false answer this kernel's rules forbid.
+pub const SNDCTL_DSP_NONBLOCK: u32 = 0x0000_500E;
+
+/// `AFMT_S16_LE`, the one format this device's writers are promised.
+pub const AFMT_S16_LE: u32 = 0x0000_0010;
+
+/// The size of `struct audio_buf_info`: four host-order `int`s - fragments,
+/// fragstotal, fragsize, bytes.
+pub const AUDIO_BUF_INFO_SIZE: usize = 16;
+
+/// The rate to hand a device that was asked for `requested` Hz and supports
+/// the listed ones - the rounding OSS does rather than refusing, and the
+/// caller is answered with what was *settled on*, which is the same contract.
+/// `None` when the device offers nothing to round to.
+pub fn oss_round_rate(requested: u32, supported: &[u32]) -> Option<u32> {
+    /// Relative distance, in thousandths: 8 kHz away from 44.1 kHz and 48 kHz
+    /// away from 44.1 kHz are not the same complaint, and a linear-absolute
+    /// minimum would always answer a 44100 request with 48000 - the rounding
+    /// the measured device does not make.
+    fn rel(a: u32, b: u32) -> u64 {
+        let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+        if lo == 0 {
+            return u64::MAX;
+        }
+        (hi - lo) as u64 * 1000 / lo as u64
+    }
+    supported
+        .iter()
+        .min_by_key(|rate| rel(**rate, requested))
+        .copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,6 +2401,39 @@ mod tests {
         );
     }
 
+    /// `timer_settime(2)`: a `struct timespec` to ticks at the machine's
+    /// 250 Hz, validated like Linux's and rounded up - an armed timer must
+    /// never fire before the duration its caller named has passed.
+    #[test]
+    fn a_timer_timespec_validates_and_rounds_up_to_whole_ticks() {
+        // The PIT's rate, spelled here rather than read from `arch` because
+        // this module is host-compiled and `arch` is not; the machine-side
+        // callers pass `arch::timer::TICK_HZ`, which is this number.
+        const HZ: u64 = 250;
+        // Zero is the disarm spelling, not an error - the caller decides.
+        assert_eq!(timespec_ticks(0, 0, HZ), Ok(0));
+        // A whole second is exactly HZ ticks.
+        assert_eq!(timespec_ticks(2, 0, HZ), Ok(2 * HZ));
+        // 50 ms at 250 Hz is 12.5 ticks: the answer is 13, never 12, because
+        // 12 ticks would fire half a millisecond early. vim arms 50 ms
+        // timeouts and a timer that fires early is one that never times out.
+        assert_eq!(timespec_ticks(0, 50_000_000, HZ), Ok(13));
+        // 4 ms is exactly one tick; 4 ms minus one nanosecond is still two -
+        // rounding up is the whole point.
+        assert_eq!(timespec_ticks(0, 4_000_000, HZ), Ok(1));
+        assert_eq!(timespec_ticks(0, 3_999_999, HZ), Ok(1));
+        // The man page's EINVALs: a negative second, a nanosecond at or past
+        // a billion, a negative nanosecond.
+        assert_eq!(timespec_ticks(-1, 0, HZ), Err(crate::syscall::err::EINVAL));
+        assert_eq!(
+            timespec_ticks(0, 1_000_000_000, HZ),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(timespec_ticks(0, -1, HZ), Err(crate::syscall::err::EINVAL));
+        // A second count large enough to overflow saturates.
+        assert_eq!(timespec_ticks(i64::MAX, 999_999_999, HZ), Ok(u64::MAX));
+    }
+
     /// `select(2)`/`pselect6(2)`: the sub-second field is validated against
     /// its own unit, and a clock that has gone wrong is refused rather than
     /// wrapped into the past.
@@ -2623,6 +2768,10 @@ mod tests {
             crate::syscall::err::ENOSYS
         );
 
+        // `rseq` registration is a documented scope boundary (see the handler):
+        // the well-formed call answers `0` so a libc's startup gets past, and the
+        // argument shape is validated. `t-rseq` pins the same contract from the
+        // guest; this pins it on the host.
         assert_eq!(handle_rseq([0x1000, 32, 0, 0, 0, 0]), 0);
         assert_eq!(
             handle_rseq([0x1000, 20, 0, 0, 0, 0]),
@@ -3006,5 +3155,53 @@ mod tests {
         assert_eq!(buffer[3 + 32], 0);
         write_syscall_info(base, false, 0, &[0; 6], 0, 0, 7);
         assert_eq!(buffer[3 + 32], 0);
+    }
+}
+
+/// The OSS request words, recomputed from the `_IOC` layout they are spelled
+/// with in `linux/soundcard.h` - the header on a real machine that says these
+/// are what a compiled binary sends.
+#[cfg(test)]
+mod oss_tests {
+    use super::*;
+
+    const fn ioc(dir: u32, size: u32, type_: u8, nr: u8) -> u32 {
+        (dir << 30) | (size << 16) | ((type_ as u32) << 8) | nr as u32
+    }
+
+    #[test]
+    fn the_dsp_request_words_are_the_soundcard_ones() {
+        assert_eq!(SNDCTL_DSP_RESET, ioc(0, 0, b'P', 0));
+        assert_eq!(SNDCTL_DSP_SYNC, ioc(0, 0, b'P', 1));
+        assert_eq!(SNDCTL_DSP_SPEED, ioc(3, 4, b'P', 2));
+        assert_eq!(SNDCTL_DSP_STEREO, ioc(3, 4, b'P', 3));
+        assert_eq!(SNDCTL_DSP_GETBLKSIZE, ioc(3, 4, b'P', 4));
+        assert_eq!(SNDCTL_DSP_SETFMT, ioc(3, 4, b'P', 5));
+        assert_eq!(SNDCTL_DSP_CHANNELS, ioc(3, 4, b'P', 6));
+        assert_eq!(SNDCTL_DSP_POST, ioc(0, 0, b'P', 8));
+        assert_eq!(SNDCTL_DSP_SUBDIVIDE, ioc(3, 4, b'P', 9));
+        assert_eq!(SNDCTL_DSP_SETFRAGMENT, ioc(3, 4, b'P', 10));
+        assert_eq!(SNDCTL_DSP_GETFMTS, ioc(2, 4, b'P', 11));
+        assert_eq!(SNDCTL_DSP_GETOSPACE, ioc(2, 16, b'P', 12));
+        assert_eq!(SNDCTL_DSP_GETISPACE, ioc(2, 16, b'P', 13));
+        assert_eq!(SNDCTL_DSP_NONBLOCK, ioc(0, 0, b'P', 14));
+        assert_eq!(AUDIO_BUF_INFO_SIZE, 16);
+        // The numbers themselves, as the header's expansion gives them: a
+        // regression here changes which word reaches which device family.
+        assert_eq!(SNDCTL_DSP_SPEED, 0xC004_5002);
+        assert_eq!(SNDCTL_DSP_GETOSPACE, 0x8010_500C);
+    }
+
+    #[test]
+    fn a_requested_rate_rounds_to_the_nearest_the_device_has() {
+        // Measured against the rounding `snd-pcm-oss` reports back: 44100 onto
+        // a device that has it is 44100; onto one that does not, it is the
+        // closest - by relative distance, so 48000 answers here and not some
+        // lower rate that is further in percent.
+        assert_eq!(oss_round_rate(44100, &[44100, 48000, 96000]), Some(44100));
+        assert_eq!(oss_round_rate(44100, &[8000, 22050, 48000]), Some(48000));
+        assert_eq!(oss_round_rate(10000, &[8000, 11025]), Some(11025));
+        assert_eq!(oss_round_rate(0, &[8000]), Some(8000));
+        assert_eq!(oss_round_rate(44100, &[]), None);
     }
 }

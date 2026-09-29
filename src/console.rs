@@ -12,59 +12,61 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use critical_section::Mutex;
 
+use crate::boot::console_list::ConsoleList;
+
 pub struct Console;
 
 /// Where the console's bytes land once the GPU framebuffer takes over.
 ///
-/// `Serial` is the boot answer and the permanent headless answer; `Gpu` is
-/// flipped once, when the render task owns the scanout. The switch is read from
+/// `Serial` is the boot answer and the answer on a boot whose console list names
+/// the wire alone; `Gpu` is flipped once, when the render task owns the scanout
+/// and the framebuffer console is one of the consoles. The switch is read from
 /// the serial interrupt path, so it is a plain atomic, never a lock - for the
 /// same reason `drivers::serial` keeps no lock (see its module doc).
 const BACKEND_SERIAL: u8 = 0;
 const BACKEND_GPU: u8 = 1;
 static BACKEND: AtomicU8 = AtomicU8::new(BACKEND_SERIAL);
 
-/// Mirror kernel-console bytes onto the serial wire as well as drawing them.
+/// The consoles this boot writes its log to, from `console=` on the command
+/// line (see [`crate::boot::console_list`]).
 ///
-/// On while there is no GPU (and on a panic, so the report reaches the host);
-/// on in headless mode, which is how `cargo xtask test` keeps reading its log;
-/// off for an interactive GPU boot, because a mirror would send the `bat` flood
-/// back down the one wire and undo the whole feature.
-static MIRROR_SERIAL: AtomicBool = AtomicBool::new(true);
+/// Three booleans rather than one value because these are the three questions
+/// the write path actually asks, and that path is reached from the serial
+/// interrupt, where an atomic load is the only safe read - the same reason
+/// `drivers::serial` keeps no lock. They begin as the wire alone, which is where
+/// a boot's first lines go; [`set_console_list`] replaces them once the command
+/// line has been read.
+static SERIAL_SINK: AtomicBool = AtomicBool::new(true);
+static VT_SINK: AtomicBool = AtomicBool::new(false);
+static SERIAL_PREFERRED: AtomicBool = AtomicBool::new(true);
 
-/// `mpos.headless` on the command line. A headless QEMU still has a virtio-gpu
-/// (it answers with a fallback mode), so head-lessness is a command-line fact,
-/// not a device-presence one; when it is set the GPU is never engaged at all.
-static HEADLESS: AtomicBool = AtomicBool::new(false);
-
-/// Record the `mpos.headless` boot flag. Called once, from the kernel entry.
-pub fn set_headless(on: bool) {
-    HEADLESS.store(on, Ordering::Relaxed);
+/// Take the console list the command line named. Called once, from the entry.
+///
+/// What is *not* here is as load-bearing as what is: there is no "mirror" flag
+/// and no "compositor" flag, because both are consequences of this list. A wire
+/// that is one of the consoles is written; a wire that is the preferred console
+/// is written *losslessly*; and a framebuffer console that is not one of the
+/// consoles is simply never taken over. That is what lets a boot describe itself
+/// with the parameter Linux uses instead of a word for how it was launched.
+pub fn set_console_list(list: ConsoleList) {
+    SERIAL_SINK.store(list.has_serial(), Ordering::Relaxed);
+    VT_SINK.store(list.has_vt(), Ordering::Relaxed);
+    SERIAL_PREFERRED.store(list.prefers_serial(), Ordering::Relaxed);
 }
 
-/// `mpos.compositor` on the command line: the GPU is present and `/dev/fb0`
-/// is live, but the framebuffer belongs to a userspace compositor, not to the
-/// kernel console, and the kernel's own log stays on the serial wire.
-///
-/// It has never meant "no text console exists", though, and since the screen is
-/// *shared* - the compositor holds it while its virtual console is the one on
-/// the screen, and hands it back when that console is switched away from - the
-/// grids have to be made on this boot too. What the flag decides is which
-/// backend the *kernel* log goes to, not whether the terminals are drawn.
-static COMPOSITOR: AtomicBool = AtomicBool::new(false);
-
-pub fn set_compositor(on: bool) {
-    COMPOSITOR.store(on, Ordering::Relaxed);
+/// Whether the serial wire is one of this boot's consoles.
+pub fn serial_is_sink() -> bool {
+    SERIAL_SINK.load(Ordering::Relaxed)
 }
 
-/// Whether this boot hands the framebuffer to a compositor.
-pub fn compositor() -> bool {
-    COMPOSITOR.load(Ordering::Relaxed)
+/// Whether the framebuffer's virtual console is one of this boot's consoles.
+pub fn vt_is_sink() -> bool {
+    VT_SINK.load(Ordering::Relaxed)
 }
 
 /// Whether the console's bytes are being *drawn* - that one screen exists and
-/// the render task can paint it - as opposed to whether the framebuffer is the
-/// console's *only* sink, which is what [`gpu_mode`] answers.
+/// the render task can paint it - as opposed to whether the framebuffer console
+/// is the console the kernel is writing to, which is what [`gpu_mode`] answers.
 ///
 /// The two are the same question on every boot but a compositor's, and that is
 /// the whole reason for splitting them: on a weston boot the kernel log stays on
@@ -81,34 +83,23 @@ pub fn grids_live() -> bool {
 }
 
 /// Flip [`grids_live`] on. Called by the render task as it makes the grids, and
-/// only for a compositor boot - on any other boot [`takeover`] reaches the same
-/// state by way of [`set_gpu`].
+/// only for a boot whose virtual console is *not* one of the consoles - on any
+/// other boot [`takeover`] reaches the same state by way of [`set_gpu`].
 pub fn set_grids_live() {
     GRIDS_LIVE.store(true, Ordering::Relaxed);
 }
 
-/// Whether the boot mode *asks* for the serial mirror at all, before the console
-/// reaches the framebuffer. Set from the command line (`mpos.nomirror` clears
-/// it) and read once by [`takeover`] to decide `MIRROR_SERIAL`. Default on, so a
-/// boot that says nothing keeps mirroring the console to the wire as it did
-/// before the gui/terminal run modes existed.
-static MIRROR_WANTED: AtomicBool = AtomicBool::new(true);
-
-/// Record whether this boot wants the console mirrored to the serial wire once
-/// the framebuffer takes over. Called once, from the kernel entry; off only for a
-/// `mpos.nomirror` (gui-mode) boot.
-pub fn set_mirror_wanted(on: bool) {
-    MIRROR_WANTED.store(on, Ordering::Relaxed);
-}
-
-/// Whether the boot mode asked for the serial mirror. Read by [`takeover`].
-pub fn mirror_wanted() -> bool {
-    MIRROR_WANTED.load(Ordering::Relaxed)
-}
-
-/// Whether this machine was booted with no display (selftest, headless CI).
-pub fn headless() -> bool {
-    HEADLESS.load(Ordering::Relaxed)
+/// Whether a text console is live anywhere: the framebuffer console is one of
+/// this boot's consoles, or the grids exist because the screen can be handed to
+/// one (a compositor boot).
+///
+/// This is what "the console somebody is looking at" means to a subsystem that
+/// has to decide whether an event belongs to a shell - the keyboard is the one
+/// caller today - and it is deliberately not `vt_is_sink()`: on a compositor
+/// boot keystrokes still belong to a text console, because the screen can be
+/// switched to one.
+pub fn vt_live() -> bool {
+    vt_is_sink() || grids_live()
 }
 
 /// Whether the framebuffer is drawing the console.
@@ -116,29 +107,23 @@ pub fn gpu_mode() -> bool {
     BACKEND.load(Ordering::Relaxed) == BACKEND_GPU
 }
 
-/// Hand the console to the GPU. Ignored while headless, which is the point of
-/// the headless flag: no scanout, no DMA, the wire stays the whole display.
+/// Hand the console to the GPU - the framebuffer console becomes the console the
+/// kernel writes to. Ignored when it is not one of this boot's consoles, which is
+/// the old headless veto stated in the terms the command line actually uses: a
+/// console the boot never asked for is never taken.
 pub fn set_gpu() {
-    if !headless() {
+    if vt_is_sink() {
         BACKEND.store(BACKEND_GPU, Ordering::Relaxed);
     }
 }
 
-/// Pull the console back to the serial wire and mirror onto it. The panic path
-/// uses this so a report is always on the host's serial, GPU or not.
+/// Pull the console back to the serial wire. The panic path uses this so a report
+/// always reaches the host, GPU or not - and it makes the wire one of the
+/// consoles even on a boot whose command line did not name it, because a report
+/// that reached nobody is not a report.
 pub fn force_serial() {
     BACKEND.store(BACKEND_SERIAL, Ordering::Relaxed);
-    MIRROR_SERIAL.store(true, Ordering::Relaxed);
-}
-
-/// Turn the serial mirror on or off, as the boot mode and takeover require.
-pub fn set_mirror_serial(on: bool) {
-    MIRROR_SERIAL.store(on, Ordering::Relaxed);
-}
-
-/// Whether kernel-console bytes are also going out the serial wire.
-pub fn mirror_serial() -> bool {
-    MIRROR_SERIAL.load(Ordering::Relaxed)
+    SERIAL_SINK.store(true, Ordering::Relaxed);
 }
 
 impl Write for Console {
@@ -221,6 +206,30 @@ pub fn dmesg_capacity() -> usize {
     DMESG_CAP
 }
 
+/// Hand console bytes to the serial wire, as one of this boot's consoles.
+///
+/// A sink that is not the preferred one is written best-effort: the bytes go
+/// into the transmit ring and the caller returns, so a host terminal that cannot
+/// keep up drops them instead of throttling the console somebody is reading. The
+/// preferred console writes through the parking path and loses nothing.
+///
+/// Which of the two the wire is follows the command line, and that is what
+/// replaced the old mirror/nomirror flag pair: `console=ttyS0` alone makes the
+/// wire preferred, so every line is lossless; in a `console=ttyS0 console=tty0`
+/// boot the wire stays authoritative until the framebuffer console has actually
+/// taken over, which is what keeps a boot's early lines - the ones printed
+/// before any screen exists - lossless on the wire.
+fn wire_bytes(bytes: &[u8]) {
+    if !serial_is_sink() {
+        return;
+    }
+    if gpu_mode() && !SERIAL_PREFERRED.load(Ordering::Relaxed) {
+        serial_mirror_now(bytes);
+    } else {
+        serial_bytes(bytes);
+    }
+}
+
 pub fn write_bytes(bytes: &[u8]) {
     // Keep a copy of what the console has said, so the framebuffer can be
     // brought up to a screen that already shows the boot log rather than born
@@ -233,20 +242,8 @@ pub fn write_bytes(bytes: &[u8]) {
         // still catches it for the replay.
         crate::vfs::term::with_screen(active_grid(), |g| g.feed(bytes));
         crate::drivers::video::render::notify();
-        // On a compositor boot the wire is the console's backend rather than its
-        // mirror, and the difference is only how much the sender is willing to
-        // wait for it: an authoritative write parks until the hardware has
-        // taken everything, a mirror drops what does not fit.
-        if gpu_mode() {
-            if mirror_serial() {
-                serial_mirror_now(bytes);
-            }
-        } else {
-            serial_bytes(bytes);
-        }
-        return;
     }
-    serial_bytes(bytes);
+    wire_bytes(bytes);
 }
 
 /// A virtual console's own printed bytes - what the shell on `/dev/ttyN` wrote.
@@ -254,27 +251,18 @@ pub fn write_bytes(bytes: &[u8]) {
 /// Distinct from [`write_bytes`] (the kernel console): these belong to one
 /// screen, whichever produced them, so a flood on a background console updates
 /// that console's grid and is simply not on screen until you switch to it. On
-/// the framebuffer they paint that grid; and when the serial mirror is on they
-/// also go out the wire, so the same console shows in the terminal window as
-/// well. On a headless boot (no framebuffer) the wire is the only sink.
+/// the framebuffer they paint that grid; and when the serial wire is one of the
+/// consoles they also go out the wire, so the same console shows in the terminal
+/// window as well. On a boot whose only console is the wire, the wire is the
+/// only sink.
 pub fn vc_output(vc: u32, bytes: &[u8]) {
     if !grids_live() {
-        serial_bytes(bytes);
+        wire_bytes(bytes);
         return;
     }
     crate::vfs::term::with_screen(vc as usize, |g| g.feed(bytes));
     crate::drivers::video::render::notify();
-    // The same split as [`write_bytes`]: on a compositor boot the shells' text
-    // is drawn *and* goes out the wire, because the wire is what the person
-    // watching is reading; once the console has handed the screen to the GPU the
-    // mirror is optional, and `--mode gui` is exactly the boot that declines it.
-    if gpu_mode() {
-        if mirror_serial() {
-            serial_mirror_now(bytes);
-        }
-    } else {
-        serial_bytes(bytes);
-    }
+    wire_bytes(bytes);
 }
 
 /// The grid index of the console currently shown, by its `/dev/ttyN` number.
@@ -303,13 +291,12 @@ fn record(bytes: &[u8]) {
 
 /// Hand the console to the framebuffer: replay the boot log onto the freshly
 /// made screen, then switch. Called by the render task once its screen exists,
-/// so there is no window between "GPU is the backend" and "there is a screen to
-/// paint." Whether the serial wire *also* mirrors the console is the boot mode's
-/// choice ([`mirror_wanted`]): mirror mode does, gui mode stays quiet. When it
-/// mirrors it does so best-effort - [`serial_mirror_now`] hands the bytes to the
-/// transmit ring and returns, never parking the caller - so a host terminal that
-/// cannot keep up drops serial bytes instead of stalling the framebuffer and the
-/// console mux behind it.
+/// so there is no window between "GPU is the console" and "there is a screen to
+/// paint." Whether the serial wire *also* carries the console is not decided
+/// here - it was never a property of this switch, only of the console list: a
+/// wire the boot named is written by [`wire_bytes`], best-effort once the
+/// framebuffer has taken over, so a host terminal that cannot keep up drops
+/// bytes instead of stalling the framebuffer and the console mux behind it.
 pub fn takeover() {
     let snapshot: Vec<u8> = critical_section::with(|cs| {
         let mut out = Vec::with_capacity(LOG.borrow(cs).borrow().len());
@@ -320,20 +307,19 @@ pub fn takeover() {
         g.reset_to_boot(&snapshot);
     });
     set_gpu();
-    set_mirror_serial(mirror_wanted());
 }
 
 /// Mirror console bytes onto the serial wire without ever blocking the producer.
 ///
-/// This is the framebuffer console's serial mirror - the copy of the screen's
-/// text that also goes out the wire so a plain terminal can watch the same
-/// console. Unlike [`serial_bytes`] (the *authoritative* write, which parks
-/// until the hardware takes everything so nothing is lost), the mirror is
-/// best-effort: the bytes are handed to the transmit ring and we return, and
-/// whatever the ring has no room for is dropped. That is the whole point - a
-/// slow host terminal must never throttle the framebuffer, and the caller here
-/// is often the console mux or a `println!` whose progress the machine cannot
-/// afford to stall on the wire's speed.
+/// This is the peer-sink write: the copy that follows the console out the wire
+/// when the wire is one of the consoles but not the preferred one. Unlike
+/// [`serial_bytes`] (the preferred console's write, which parks until the
+/// hardware takes everything so nothing is lost), the mirror is best-effort: the
+/// bytes are handed to the transmit ring and we return, and whatever the ring
+/// has no room for is dropped. That is the whole point - a slow host terminal
+/// must never throttle the console, and the caller here is often the console mux
+/// or a `println!` whose progress the machine cannot afford to stall on the
+/// wire's speed.
 ///
 /// Before the transmitter interrupts - early boot, or an interrupt context that
 /// cannot reach the ring - there is nothing to hand over to, so this falls back

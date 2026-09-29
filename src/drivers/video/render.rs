@@ -55,15 +55,6 @@ static REQ: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 static WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
 
-/// Whether a userspace compositor owns the scanout, so the console must not be
-/// taken over onto it. Set once by [`spawn`] from the `mpos.compositor` boot
-/// word. It has never meant "no text grids" - the grids exist on this boot too,
-/// because a virtual console the compositor releases has to be drawn by
-/// somebody - it means "do not call [`crate::console::takeover`]": the kernel's
-/// log rides the serial wire and the window shows whatever is on the screen the
-/// console multiplexer says is on it.
-static PRESENT_ONLY: AtomicBool = AtomicBool::new(false);
-
 /// A screen changed and needs repainting. Set by whoever feeds a grid, so the
 /// render task wakes on the next keystroke instead of waiting out its beat -
 /// and the task clears it when it repaints.
@@ -104,6 +95,21 @@ static RESIZE_SEQ: AtomicU32 = AtomicU32::new(0);
 static RESIZE_ACK: AtomicU32 = AtomicU32::new(0);
 static RESIZE_OK: AtomicBool = AtomicBool::new(false);
 static RESIZE_WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// Re-present the DRM master's current framebuffer onto the scanout. Set by
+/// `drm::grant_and_resent` when the screen moves back onto the master's console:
+/// the text render overwrote the desktop's pixels, and the compositor will not
+/// re-commit them on its own until a mouse event, so the kernel shows the master's
+/// last frame here instead - the switch back is then visible on the same frame, not
+/// on the next input. Taken and cleared by the render task, the only flusher.
+static RE_PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// Ask the render task to re-present the compositor's framebuffer and flush.
+/// Called from the mux's VT-switch path; wakes the task so it happens now.
+pub fn request_re_present() {
+    RE_PRESENT.store(true, Ordering::Relaxed);
+    wake_task();
+}
 
 /// Nudge the render task to repaint soon. Called after any byte is painted into
 /// a grid. Cheap and safe from any context (a keystroke's echo runs from the
@@ -179,33 +185,28 @@ fn wake_task() {
 }
 
 /// Whether the framebuffer console is live. Cleared if the task was never
-/// spawned (headless), so `console` and `/dev/fb0` know not to route bytes here.
+/// spawned (no display), so `console` and `/dev/fb0` know not to route bytes
+/// here. Note this is not "the kernel console is on the screen": a boot that
+/// keeps its log on the wire still has a render task, because `/dev/fb0` is a
+/// device a program may open and the scanout may be handed to a text console.
 pub fn running() -> bool {
     RENDER_PID.load(Ordering::Relaxed) != 0
 }
 
 /// Hand the device and its buffer view to a new render task. Called once, from
-/// the boot, when a display was found and the machine is not headless.
-/// `present_only` says a userspace compositor owns the scanout: the task still
-/// paints the consoles, but the kernel console is never moved onto the screen,
-/// and a frame only reaches the window when something has asked for it.
-pub fn spawn(
-    device: VirtIOGpu<HalImpl, PciTransport>,
-    view: Arc<VirtioGpuDev>,
-    present_only: bool,
-) {
-    PRESENT_ONLY.store(present_only, Ordering::Relaxed);
+/// the boot, when a display was found.
+///
+/// What the task does with the screen follows the console list, and this function
+/// does not decide any of it: the framebuffer console's being one of the
+/// consoles is what moves the kernel's log onto it, and a session claiming the
+/// card is what brings the grids up for a screen somebody else is driving.
+pub fn spawn(device: VirtIOGpu<HalImpl, PciTransport>, view: Arc<VirtioGpuDev>) {
     critical_section::with(|cs| {
         *DEVICE.borrow(cs).borrow_mut() = Some(device);
         *VIEW.borrow(cs).borrow_mut() = Some(view);
     });
     let id = crate::sched::spawn_permanent(task, crate::sched::Priority::NORMAL);
     RENDER_PID.store(id.0 as u32, Ordering::Relaxed);
-    if present_only {
-        // Nothing drives `notify` in this mode until the first frame is asked
-        // for; wake the task once so it settles into its present loop.
-        notify();
-    }
 }
 
 /// Whether a writer is waiting for a frame it has already put in the buffer.
@@ -234,24 +235,34 @@ fn task() {
     let mut cols = (fb_w / CELL_W).max(1);
 
     // One screen per virtual console, so switching preserves each one's
-    // contents - something the single shared wire could never do. Index `n`
-    // is `/dev/ttyN`. Made on every boot with a display, a compositor's
-    // included: the consoles are drawn wherever the mux says one of them is on
-    // the screen, and a compositor's claim on the scanout is only good while its
-    // own console holds it.
-    let present_only = PRESENT_ONLY.load(Ordering::Relaxed);
+    // contents - something the single shared wire could never do. Index `n` is
+    // `/dev/ttyN`.
+    //
+    // Made whenever there is a display, whatever the console list says, and for
+    // one reason with two faces: a virtual console a compositor releases has to
+    // be drawable by somebody, and the console's *window* - what `TIOCGWINSZ`
+    // answers and what a full-screen program lays itself out in - is this grid,
+    // so that number has to be the same in every mode rather than one that moves
+    // the moment a session claims the card.
+    //
+    // The rejected alternative was to make them on the first `SET_MASTER`: six
+    // grids cheaper on a boot that never draws, but the console's geometry then
+    // depends on who holds the card - which is neither Linux's answer (fbcon
+    // binds to the display whatever the DRM master is doing) nor a stable one.
+    // `t-ioctl` is what caught it: it read 160x50 where the same boot had
+    // answered 80x25 earlier, because a `SET_MASTER` had happened in between.
     for vc in 1..=VC_COUNT as usize {
         term::make_screen(vc, rows, cols);
     }
-    if present_only {
-        // A compositor boot draws the consoles from here on but never takes the
-        // kernel's log off the wire: the boot log is on the serial line and the
-        // screens fill in as their shells speak.
-        crate::console::set_grids_live();
-    } else {
-        // The screens exist now: replay the boot log onto the console being shown
-        // and move output from the wire to the framebuffer.
+    if crate::console::vt_is_sink() {
+        // The framebuffer console is one of this boot's consoles: replay the boot
+        // log onto the console being shown, and move output from the wire to it.
         crate::console::takeover();
+    } else {
+        // The kernel's log stays on the wire, but the screens exist: a text
+        // console the compositor releases is drawn from here on, and the shells
+        // fill in as they speak.
+        crate::console::set_grids_live();
     }
 
     // A scratch copy of one screen's cells, reused every frame, so the pixel
@@ -276,6 +287,7 @@ fn task() {
             DIRTY.load(Ordering::Relaxed)
                 || pending()
                 || PROBE.load(Ordering::Relaxed)
+                || RE_PRESENT.load(Ordering::Relaxed)
                 || RESIZE_TARGET.load(Ordering::Relaxed) != 0
         });
         DIRTY.store(false, Ordering::Relaxed);
@@ -331,6 +343,19 @@ fn task() {
             }
         }
 
+        // The screen moved back onto the DRM master's console. Re-show the
+        // compositor's committed frame now: the text render filled the scanout
+        // while the master was away, and the master re-commits only on its own
+        // input, so without this the desktop stays hidden until a mouse move.
+        // `re_present_now` copies `current_fb` over the scanout (the kernel's own
+        // path, not gated as a compositor's flip would be), and the flush below
+        // puts it on the window - the very frame the switch landed on.
+        let resent = if RE_PRESENT.swap(false, Ordering::Relaxed) {
+            crate::drivers::drm::re_present_now() == 0
+        } else {
+            false
+        };
+
         // Copy the changed screen's cells under the lock (a fixed memcpy), then
         // paint from the copy with the clock live. The flush is outside both.
         // Two moments have no console to show: a session that holds the card
@@ -341,7 +366,8 @@ fn task() {
         // lands, and the console takes the screen back the moment its own
         // `^A` wins the negotiation.
         let claimed = crate::drivers::drm::master_held();
-        let painted = if present_only && !claimed || !crate::vfs::vcmux::painted() {
+        let painted = if !crate::console::vt_is_sink() && !claimed || !crate::vfs::vcmux::painted()
+        {
             // Forget which console was last shown: when the screen comes back,
             // whatever is on it belongs to something else, and the whole grid
             // needs redrawing rather than the changed rows.
@@ -362,6 +388,17 @@ fn task() {
                             fb_len,
                         )
                     };
+                    // A switch shows a different console than the one whose
+                    // picture is in the scanout. Paint alone would leave the
+                    // region the new grid does not cover - the rows past MAX_ROWS
+                    // on a tall screen, the margins where the pixels do not divide
+                    // into cells, and above all the band a compositor left behind
+                    // - as a stale strip of the old screen. Clear the whole
+                    // scanout to the console's paper first, then paint the grid
+                    // onto it, so the switch shows the console and not a band.
+                    if switched {
+                        blit::fill_background(fb, fb_w, fb_h, DEFAULT_BG);
+                    }
                     blit::paint_cells(
                         &scratch,
                         f.rows,
@@ -386,7 +423,7 @@ fn task() {
         // buffer - the one thing the write-through promise says cannot happen.
         let req = REQ.load(Ordering::Relaxed);
         let done = DONE.load(Ordering::Relaxed);
-        if painted || req > done {
+        if painted || resent || req > done {
             let _ = device.flush();
             // The frame has left. This is the moment a page-flip completion is
             // *about*, and it is the only moment in this kernel that honestly
@@ -516,7 +553,7 @@ fn resize_to(
     for vc in 1..=VC_COUNT as usize {
         term::make_screen(vc, rows, cols);
     }
-    if !crate::console::compositor() {
+    if crate::console::vt_is_sink() {
         crate::console::takeover();
     }
 
