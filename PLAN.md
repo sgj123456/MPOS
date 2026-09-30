@@ -172,7 +172,13 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [x] 7.2 Input — virtio-input evdev: capability ioctls (`EVIOCGBIT`/`EVIOCGABS`/
       …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents, and
       events that belong to the description that grabbed them (§7.2)
-- [ ] 7.3 AHCI/SATA (stretch)
+- [~] 7.3 AHCI/SATA (stretch) — **the design is settled and written down in §7.3;
+      the driver is not written.** The reason it needed a design first is that a
+      SATA disk is a *second* disk, and `Numbering::of_boot_disk` plus
+      `announce_block`'s devpath currently describe exactly one; §7.3 has the
+      naming decision (`sda`, major 8, `/devices/ahci/block/sda` - Linux's, not a
+      private one), the two-halves order (the numbering refactor lands green on
+      its own, then the driver), and the mechanical shape of the HBA path
 - [x] `/dev/uinput` — a virtual input device a userspace program creates and
       writes events into: the self-test's hands, so `t-evdev` pins *whose* event
       a record is on the machine and not only in the host unit tests. Gets a
@@ -3009,13 +3015,117 @@ cannot ask cannot fall back either. The family now answers on `/dev/dsp`:
   always real; the guest half landed with the ID fix and the user-address DMA fix that
   followed it.
 
-### 7.3 AHCI/SATA (stretch)
+### 7.3 AHCI/SATA (stretch) — **PLANNED; the decisions are below, the driver is not written**
 
-**Why**: Real hardware support beyond virtio.
+**Why**: real hardware support beyond virtio. Every block device this kernel has
+driven so far hangs off a virtio transport, so the storage path is only ever
+exercised on a machine that already has the paravirtualisation the kernel needs
+for everything else. A SATA controller is the other half of that sentence: a
+device with its own register file, its own DMA rules and its own failure modes,
+on hardware QEMU presents with one `-device`.
 
-- AHCI HBA driver
-- ATA IDENTIFY, READ SECTORS, WRITE SECTORS
-- GPT partition detection (already have partition scanner)
+**What it is not**: it is not on the compositor path. §7.4's list is about pixels
+and none of it touches storage. It is on this board because the kernel's answer to
+"what is a disk" is currently *one driver wide*, and a second driver is what turns
+that answer into a claim rather than an accident. Deliberately out of scope: NCQ,
+ATAPI, port multipliers, hotplug and 28-bit LBA. One controller, one port,
+`IDENTIFY`, `READ DMA EXT`, `WRITE DMA EXT`, `FLUSH CACHE EXT`.
+
+#### A disk has a *name* now, and that is the part to settle first
+
+`crate::uevent::Numbering::of_boot_disk` is the one function the whole system
+agrees on for what a block device is called: `/dev` builds its nodes from it,
+`/sys/class/block/*/dev` prints it, `/proc/partitions` lists it, and a uevent
+listener matches an event against it. It is hard-coded - `vda`, major 254
+(`VIRTIO_BLK_MAJOR`), the boot disk's partitions - and every one of those names
+hangs under a hard-coded devpath, `/devices/virtio/block/<name>`.
+
+That is right while there is one disk and wrong the moment there are two. Linux's
+answer is the one to copy rather than invent, because it is the answer userland
+already reads: a SCSI/SATA disk is `sda`, major **8**, minor 0, partitions at
+1.., and `/dev/vda` and `/dev/sda` are two devices no program treats as synonyms.
+A kernel that called a SATA disk `vda` would be publishing a private dialect in
+the one place §4.3 cares about most - a name.
+
+| | virtio-blk | AHCI |
+|---|---|---|
+| name | `vda`, `vda1`… | `sda`, `sda1`… |
+| major | 254 (`VIRTIO_BLK_MAJOR`) | 8 (`SCSI_DISK_MAJOR`) |
+| minor | 0 for the disk, 1.. for partitions | the same rule |
+| devpath | `/devices/virtio/block/vda3` | `/devices/ahci/block/sda` |
+
+So the work has two halves and the smaller one comes first, which is §4 rule 7's
+own advice ("the refactor lands first, green on its own, then the change"): the
+numbering becomes the numbering of *the disks this machine has*, built from the
+block devices that actually came up, with the devpath a fact carried per disk
+rather than derived from the name. That refactor changes nothing while there is
+one disk - and it is testable anyway, because `sysfs`'s and `procfs`'s host tests
+already build `Numbering` literals by hand, so a *second* disk's rendering in
+`/proc/partitions` and under `/sys/class/block` can be pinned with no hardware at
+all.
+
+#### The driver, mechanically
+
+- **Probe by class code, not by vendor.** `crate::pci::find` matches vendor and
+  device ids, which is what a virtio device has and what a SATA controller does
+  not: the class is `01`/`06`/`01` - mass storage, SATA, AHCI 1.0 - and
+  `Device::class_code()` already computes exactly that. Enumerating
+  `pci::devices()` and matching the class is the whole of the discovery.
+- **The register file is BAR5** (`ABAR`), a memory BAR, so it is *not* in the
+  direct map: `mm::map_mmio` is the existing window for exactly this, the same
+  call `virtio`'s `Hal` makes for its own BAR. `COMMAND_MEMORY_SPACE` and
+  `COMMAND_BUS_MASTER` have to be turned on first, as `VirtioBlk::init` does.
+- **Bring-up is the spec's reset sequence**: set `GHC.AE`, clear `GHC.HR`, wait
+  for it to clear, read `CAP`/`PI`, and for the first implemented port whose
+  `PxSSTS.DET` says "device present, PHY up" (3) run `PxCMD.ST` off → `FRE` off →
+  set `PxCLB`/`PxFB` → `FRE` on → `ST` on. Every wait is bounded, because this
+  runs on the boot path of a machine that may have no such disk: a controller that
+  never answers has to end in `None` rather than in a `hlt`.
+- **Four aligned allocations**, each its own frames: the command list (1 KiB,
+  1 KiB-aligned), the received-FIS area (256 B, 256-byte-aligned), one command
+  table whose command header is 128-byte-aligned, and a page-sized bounce buffer
+  for the data - the same single physically-contiguous page the [`BlockDev`]
+  contract already promises every caller, so this driver is not the one that has
+  to copy twice. `mm::alloc_frames` + `mm::phys_to_virt` is the pair `HalImpl`
+  already uses.
+- **One command at a time.** `PxCI` takes one bit; the driver waits for it to
+  clear and *then* reads `PxTFD`/`PxIS` for the error bits rather than treating
+  the bit clearing as success. An ATA error reports itself in `PxTFD.ERR` with the
+  command already retired, so a driver that checked only the bit would call a
+  failed read a successful one - the shape §4.2 forbids.
+- **`IDENTIFY` is the discovery** (`0xEC`, the device's 256 words read into the
+  bounce page): the LBA48 capacity in words 100..103 becomes
+  `capacity_sectors`, and a device that will not identify itself is a plain
+  `None` - there is no honest way to present one.
+- **`flush` is `FLUSH CACHE EXT`** (`0xEA`), answering `true` only when the
+  command completed without an error, which is what `BlockDev::flush` asks of a
+  device that has a cache.
+
+#### The machine, and the pin
+
+The self-test machine boots its ESP through virtio-blk and must keep doing so: the
+point of the SATA disk is that there are *two* disks, not that the boot moved. So
+the test boot gains an `ich9-ahci` controller with one raw disk image attached
+(`-device ich9-ahci,id=ahci`, a `-drive …,if=none`, and an `ide-hd` on `ahci.0`),
+which is a change in `xtask/src/qemu.rs`'s `Boot::Esp` arm plus a file for
+`xtask/src/selftest.rs` to make - not `machine.toml`'s `extra_args`, which would
+leave the wiring invisible to the tree the gate is run from.
+
+`main.rs` tries virtio-blk first and AHCI second, so a machine with either boots
+and a machine with both has both. The pin is a guest program that opens
+`/dev/sda`, reads sector 0, writes a sector and reads it back, checks
+`/proc/partitions` names it with major 8, and checks that the capacity `IDENTIFY`
+reported is the capacity the reads can actually reach - a capacity that is
+*reported* but not *readable* being the failure a wrong `PxCLB`/`PRDT` setup
+really has.
+
+#### One thing that is a choice rather than a gap
+
+The controller's interrupt is not wired to anything, and `BlockDev` has no
+interrupt-driven path: the driver polls `PxCI`. That is honest rather than
+temporary - a uniprocessor kernel driving one command at a time has nothing to do
+while it waits - and it is the same choice `virtio`'s synchronous paths already
+make.
 
 ---
 
