@@ -126,7 +126,7 @@ pub fn machine_args(
         format!("if=pflash,format=raw,unit=1,file={}", vars.display()),
     ]);
 
-    match boot {
+    match &boot {
         Boot::Image(image) => args.extend([
             "-drive".into(),
             format!(
@@ -150,6 +150,31 @@ pub fn machine_args(
             "-device".into(),
             "virtio-blk-pci,drive=hd0".into(),
         ]),
+    }
+
+    // And a *second* disk on a real controller, which the self-test machine
+    // always gets: the ESP above arrives through virtio, and this one arrives
+    // through an AHCI controller, so the machine the `t-ahci` pins run on has
+    // two disks from two drivers (`PLAN.md` §7.3). The image lives beside the
+    // ESP, because `Boot::Esp` carries the ESP's own path and nothing else -
+    // its directory is the one fact both ends already agree on.
+    //
+    // Attached unconditionally rather than "if the file exists": a test machine
+    // that is supposed to have a SATA disk and quietly does not would report
+    // `t-ahci` failing for a reason that is not the driver's.
+    if let Boot::Esp(esp) = &boot {
+        let disk = esp
+            .parent()
+            .expect("the ESP path has a directory")
+            .join(crate::selftest::SATA_TEST_IMAGE);
+        args.extend([
+            "-drive".into(),
+            format!("file={},format=raw,if=none,id=sd0", disk.display()),
+            "-device".into(),
+            "ich9-ahci,id=ahci".into(),
+            "-device".into(),
+            "ide-hd,drive=sd0,bus=ahci.0".into(),
+        ]);
     }
 
     // The name the guest's DHCP client reports, and the network the socket

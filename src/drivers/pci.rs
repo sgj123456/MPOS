@@ -208,6 +208,17 @@ pub struct Func {
 }
 
 impl Func {
+    /// The function at one bus/device/function address.
+    ///
+    /// For a driver that found its device by *class* rather than by id, which is
+    /// what a storage controller has and what `crate::pci::devices()` enumerates:
+    /// the three numbers are what such a driver has, and the command register is
+    /// what it needs next. `find` cannot answer that question - there is no
+    /// vendor/device pair worth naming for "any SATA controller".
+    pub fn at(bus: u8, slot: u8, func: u8) -> Func {
+        Func { bus, slot, func }
+    }
+
     fn vendor(&self) -> u16 {
         read16(self.bus, self.slot, self.func, 0x00)
     }

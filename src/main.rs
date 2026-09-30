@@ -363,27 +363,48 @@ fn init_blk() {
     // the diskless path the boot used to take when the command line named no
     // root. Nothing below this can run without a device to read, and none of it
     // is load-bearing for a kernel that is going to sit in the initramfs.
-    let Some(dev) = drivers::virtio::blk::VirtioBlk::init() else {
-        println!("blk: no virtio-blk device answered on the PCI bus");
+    // The boot disk, from whichever controller has one. Both are tried rather
+    // than either: a machine can have the paravirtual disk the image builder
+    // attaches *and* a real SATA controller, and then it has two disks under two
+    // names (`PLAN.md` §7.3). The first one brought up is the boot disk, whose
+    // partitions the early userland mounts.
+    if let Some(dev) = drivers::virtio::blk::VirtioBlk::init() {
+        let sectors = dev.capacity_sectors();
+        println!(
+            "virtio-blk: vda, {} sectors ({} MiB)",
+            sectors,
+            sectors * 512 / MIB as u64
+        );
+        // The name, the major and the tree position are the *driver's* facts,
+        // said once where the driver is brought up: a virtio disk is `vda` under
+        // major 254 in the virtio tree, a SATA disk is `sda` under major 8 in the
+        // SATA one. Everything that names a disk to userland reads them from
+        // there rather than deciding for itself (`uevent::Numbering`).
+        blk::add_disk(
+            "vda",
+            mpos::uevent::VIRTIO_BLK_MAJOR,
+            "/devices/virtio/block",
+            dev,
+        );
+    }
+    if let Some(dev) = drivers::ahci::init() {
+        let sectors = dev.capacity_sectors();
+        println!(
+            "ahci: sda, {} sectors ({} MiB)",
+            sectors,
+            sectors * 512 / MIB as u64
+        );
+        blk::add_disk(
+            "sda",
+            mpos::uevent::SCSI_DISK_MAJOR,
+            "/devices/ahci/block",
+            dev,
+        );
+    }
+    let Some(dev) = blk::raw_disk() else {
+        println!("blk: no disk answered on the PCI bus, so there is nothing to mount");
         return;
     };
-    let sectors = dev.capacity_sectors();
-    println!(
-        "virtio-blk: {} sectors ({} MiB)",
-        sectors,
-        sectors * 512 / MIB as u64
-    );
-    // The name, the major and the tree position are the *driver's* facts, said
-    // once where the driver is brought up: a virtio disk is `vda` under major
-    // 254 in the virtio tree, and a SATA disk is `sda` under major 8 in the
-    // SATA one. Everything that names a disk to userland reads them from here
-    // rather than deciding for itself (`uevent::Numbering`).
-    blk::add_disk(
-        "vda",
-        mpos::uevent::VIRTIO_BLK_MAJOR,
-        "/devices/virtio/block",
-        dev.clone(),
-    );
 
     // The data partition is a second disk filesystem - ext2 or ext4, whichever
     // the image builder made; the same driver reads both - and it is the only thing

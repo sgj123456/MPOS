@@ -4,6 +4,10 @@
 //! `arch::x86_64` or `blk`. They are architecture-aware (using port I/O,
 //! PCI enumeration) but are not part of the core architecture abstraction.
 
+/// AHCI/SATA, the block driver beside the paravirtual one. Gated like `drm`:
+/// its whole body is volatile register access and DMA frames.
+#[cfg(target_os = "none")]
+pub mod ahci;
 pub mod devices;
 #[cfg(target_os = "none")]
 pub mod drm;

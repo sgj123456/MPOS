@@ -646,6 +646,63 @@ pub struct BlockEntry {
 /// Major used for virtio block devices, as Linux assigns it.
 pub const VIRTIO_BLK_MAJOR: u32 = 254;
 
+/// Major used for SCSI and SATA disks, as Linux assigns it.
+///
+/// A SATA disk is `sda` and *not* `vda`, and the major is half of why: two disks
+/// from two drivers are told apart by userland through their numbers before it
+/// has read anything else, and `/proc/partitions` is where it reads them. A
+/// kernel that numbered a SATA disk under 254 would be claiming it came from a
+/// driver it did not come from.
+pub const SCSI_DISK_MAJOR: u32 = 8;
+
+impl BlockEntry {
+    /// The names one disk contributes to the numbering: the disk itself, then
+    /// its partitions.
+    ///
+    /// A disk with no partition table contributes its own name and nothing else,
+    /// which is the answer to the question the single-disk version got wrong: it
+    /// gated the whole disk on having a partition table, so an unpartitioned
+    /// disk had *no* name at all - not `/dev/sda`, not a line in
+    /// `/proc/partitions`, nothing a program could open. That is a disk a
+    /// partitioner cannot partition. Linux numbers the whole disk whatever is on
+    /// it (`/dev/sda` exists before and after `fdisk`), and the block layer is a
+    /// name for storage rather than a name for a partition table.
+    ///
+    /// A pure function of what a disk is, rather than a walk over the machine's
+    /// disks, so that this rule can be pinned on the host - where there is no
+    /// disk to have no partition table on.
+    pub fn of_disk(
+        name: &str,
+        major: u32,
+        devpath: &'static str,
+        capacity_sectors: u64,
+        partitions: &[(u64, u64)],
+    ) -> Vec<BlockEntry> {
+        let mut out = Vec::with_capacity(partitions.len() + 1);
+        out.push(BlockEntry {
+            name: String::from(name),
+            major,
+            minor: 0,
+            whole: true,
+            devpath,
+            sectors: capacity_sectors,
+        });
+        for (index, &(_, sectors)) in partitions.iter().enumerate() {
+            // The partition minors come from the table order, which is what
+            // `/sys` reports and what mkinitfs's `vda*` names mean.
+            out.push(BlockEntry {
+                name: alloc::format!("{name}{}", index + 1),
+                major,
+                minor: (index + 1) as u32,
+                whole: false,
+                devpath,
+                sectors,
+            });
+        }
+        out
+    }
+}
+
 impl Numbering {
     /// The numbering of every disk this machine has, and of their partitions.
     ///
@@ -654,34 +711,14 @@ impl Numbering {
     pub fn of_this_machine() -> Numbering {
         let mut devices = Vec::new();
         for disk in crate::blk::disks() {
-            let table = crate::blk::part::partitions(disk.dev.as_ref());
-            // A disk nobody has partitioned is still a disk a program may want
-            // to look at - this gate is the old single-disk rule kept as it was
-            // (see §7.3: it is the first thing the second disk driver has to
-            // decide about), and it is per disk rather than per machine.
-            if table.is_empty() {
-                continue;
-            }
-            devices.push(BlockEntry {
-                name: disk.name.clone(),
-                major: disk.major,
-                minor: 0,
-                whole: true,
-                devpath: disk.devpath,
-                sectors: disk.dev.capacity_sectors(),
-            });
-            for (index, (_, sectors)) in table.into_iter().enumerate() {
-                // The partition minors come from the table order, which is
-                // what `/sys` reports and what mkinitfs's `vda*` names mean.
-                devices.push(BlockEntry {
-                    name: alloc::format!("{}{}", disk.name, index + 1),
-                    major: disk.major,
-                    minor: (index + 1) as u32,
-                    whole: false,
-                    devpath: disk.devpath,
-                    sectors,
-                });
-            }
+            let partitions = crate::blk::part::partitions(disk.dev.as_ref());
+            devices.extend(BlockEntry::of_disk(
+                &disk.name,
+                disk.major,
+                disk.devpath,
+                disk.dev.capacity_sectors(),
+                &partitions,
+            ));
         }
         Numbering { devices }
     }
@@ -732,6 +769,42 @@ pub(crate) mod test_bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A disk with nothing on it is still a disk, and it must still have a name.
+    ///
+    /// The single-disk version gated the whole disk on having a partition table,
+    /// so an unpartitioned disk had no name at all: no `/dev/sda`, no line in
+    /// `/proc/partitions`, nothing a program could open - which includes the
+    /// partitioner that would have put a table on it. The measured card's own
+    /// shape is Linux's: the whole disk exists before and after `fdisk`.
+    #[test]
+    fn a_disk_with_no_partition_table_still_has_a_name() {
+        let one = BlockEntry::of_disk("sda", 8, "/devices/ahci/block", 8192, &[]);
+        assert_eq!(one.len(), 1, "the disk itself, and no partitions");
+        assert_eq!(one[0].name, "sda");
+        assert_eq!(one[0].minor, 0);
+        assert!(one[0].whole);
+        assert_eq!(one[0].sectors, 8192, "and its size is its own");
+        assert_eq!(one[0].devpath, "/devices/ahci/block");
+
+        // With a table, the disk comes first and then the partitions in order,
+        // numbered from 1 and carrying their own sizes.
+        let three = BlockEntry::of_disk(
+            "vda",
+            254,
+            "/devices/virtio/block",
+            4096,
+            &[(2048, 1024), (3072, 1024)],
+        );
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[0].name, "vda");
+        assert_eq!(three[1].name, "vda1");
+        assert_eq!(three[1].minor, 1);
+        assert!(!three[1].whole);
+        assert_eq!(three[1].sectors, 1024);
+        assert_eq!(three[2].name, "vda2");
+        assert_eq!(three[2].minor, 2);
+    }
 
     /// The bus is global, so the tests that publish on it take turns: a test
     /// that counts what it receives cannot also receive another test's events.

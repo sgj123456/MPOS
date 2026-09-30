@@ -26,6 +26,12 @@ use anyhow::{Context, Result, bail};
 use crate::qemu;
 use crate::utils;
 
+/// The SATA disk the test machine is given, and how big it is. Named here and
+/// used by `qemu`'s `Boot::Esp` arm through the same build directory, so the
+/// file that is made and the file that is attached are one name.
+pub const SATA_TEST_IMAGE: &str = "test-sata.img";
+pub const SATA_TEST_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The verdict lines the test `/init` prints around every program, and the
 /// summary line the parse below counts on. The markers are deliberately
 /// shaped so a test's own output cannot forge a verdict: no test prints
@@ -418,6 +424,19 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // (the half-second clock wait and the scheduler sleeps); a normal boot leaves
     // it off and goes straight to init, and the test boot wants every check run.
     fs::write(esp.join("mpos.cmdline"), "console=ttyS0 mpos.selftest\n")?;
+
+    // A SATA disk beside the ESP, so the test machine has *two* disks from two
+    // drivers: the ESP reaches the guest through virtio-blk, and this one
+    // through the AHCI controller the `Boot::Esp` arm attaches. It is what
+    // `t-ahci` reads, writes and reads back, which is the only way a driver
+    // whose every line is a volatile register access gets pinned at all
+    // (`PLAN.md` §7.3). Sparse and small: the test writes one sector and reads
+    // it back, and nothing else in the suite touches it.
+    let sata = build_dir.join(SATA_TEST_IMAGE);
+    if sata.metadata().map(|m| m.len()).unwrap_or(0) != SATA_TEST_BYTES {
+        let file = fs::File::create(&sata)?;
+        file.set_len(SATA_TEST_BYTES)?;
+    }
 
     let ovmf_dir = qemu::find_ovmf()?;
     let vars = utils::ovmf_vars_path(build_dir);

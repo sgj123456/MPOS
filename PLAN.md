@@ -172,13 +172,15 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [x] 7.2 Input — virtio-input evdev: capability ioctls (`EVIOCGBIT`/`EVIOCGABS`/
       …), `/dev/input/eventN` + `/sys/class/input` + `SUBSYSTEM=input` uevents, and
       events that belong to the description that grabbed them (§7.2)
-- [~] 7.3 AHCI/SATA (stretch) — **the design is settled and written down in §7.3;
-      the driver is not written.** The reason it needed a design first is that a
-      SATA disk is a *second* disk, and `Numbering::of_boot_disk` plus
-      `announce_block`'s devpath currently describe exactly one; §7.3 has the
-      naming decision (`sda`, major 8, `/devices/ahci/block/sda` - Linux's, not a
-      private one), the two-halves order (the numbering refactor lands green on
-      its own, then the driver), and the mechanical shape of the HBA path
+- [x] 7.3 AHCI/SATA (stretch) — **done**, and the stretch item turned out to carry
+      a real one: a SATA disk is a *second* disk, so the block layer learned to
+      hold more than one and to name each under its own driver's name, major and
+      device-tree position (`vda`/254/`/devices/virtio/block`, `sda`/8/`/devices/ahci/block`).
+      The driver probes by class code, drives one command at a time through slot 0
+      and checks `PxTFD` after `PxCI` clears rather than trusting the bit, and
+      `t-ahci` pins the whole path on the machine. Two of its decisions were
+      corrected by booting it - `PxSIG` is not the presence question, and an
+      unpartitioned disk still has a name - and both are written down in §7.3
 - [x] `/dev/uinput` — a virtual input device a userspace program creates and
       writes events into: the self-test's hands, so `t-evdev` pins *whose* event
       a record is on the machine and not only in the host unit tests. Gets a
@@ -3015,21 +3017,21 @@ cannot ask cannot fall back either. The family now answers on `/dev/dsp`:
   always real; the guest half landed with the ID fix and the user-address DMA fix that
   followed it.
 
-### 7.3 AHCI/SATA (stretch) — **PLANNED; the decisions are below, the driver is not written**
+### 7.3 AHCI/SATA (stretch) — **DONE: the driver, the second disk, and what measuring it corrected**
 
-**Why**: real hardware support beyond virtio. Every block device this kernel has
-driven so far hangs off a virtio transport, so the storage path is only ever
-exercised on a machine that already has the paravirtualisation the kernel needs
-for everything else. A SATA controller is the other half of that sentence: a
-device with its own register file, its own DMA rules and its own failure modes,
-on hardware QEMU presents with one `-device`.
+**Why**: real hardware support beyond virtio. Every block device this kernel had
+driven hung off a virtio transport, so the storage path was only ever exercised on
+a machine that already has the paravirtualisation the kernel needs for everything
+else. A SATA controller is the other half of that sentence: a device with its own
+register file, its own DMA rules and its own failure modes, on hardware QEMU
+presents with one `-device`.
 
 **What it is not**: it is not on the compositor path. §7.4's list is about pixels
-and none of it touches storage. It is on this board because the kernel's answer to
-"what is a disk" is currently *one driver wide*, and a second driver is what turns
-that answer into a claim rather than an accident. Deliberately out of scope: NCQ,
-ATAPI, port multipliers, hotplug and 28-bit LBA. One controller, one port,
-`IDENTIFY`, `READ DMA EXT`, `WRITE DMA EXT`, `FLUSH CACHE EXT`.
+and none of it touches storage. It is here because the kernel's answer to "what is
+a disk" was *one driver wide*, and a second driver is what turns that answer into
+a claim rather than an accident. Deliberately out of scope: NCQ, ATAPI, port
+multipliers, hotplug and 28-bit LBA. One controller, one port, `IDENTIFY`,
+`READ DMA EXT`, `WRITE DMA EXT`, `FLUSH CACHE EXT`.
 
 #### A disk has a *name* now, and that is the part to settle first
 
@@ -3126,6 +3128,54 @@ interrupt-driven path: the driver polls `PxCI`. That is honest rather than
 temporary - a uniprocessor kernel driving one command at a time has nothing to do
 while it waits - and it is the same choice `virtio`'s synchronous paths already
 make.
+
+#### What was built, and the two things the machine corrected
+
+`src/drivers/ahci.rs` is the driver: probe by class code, BAR5 through
+`mm::map_mmio`, the spec's reset sequence, stop-the-port-then-point-it-at-our-memory
+bring-up, four aligned DMA pages, one command at a time through slot 0, and
+`IDENTIFY`/`READ DMA EXT`/`WRITE DMA EXT`/`FLUSH CACHE EXT`. The numbering
+refactor it needed landed first (`c1e5932`), `main.rs` brings up virtio-blk and
+then AHCI so a machine can have both, and the test machine gets an `ich9-ahci`
+with a 4 MiB disk beside its ESP. `t-ahci` is the pin - 16 checks over
+`/dev/sda` - because every line of the driver is a volatile access to hardware
+and no host test can reach any of it.
+
+**Two things the first working version got wrong, both found by booting it, and
+both worth a line because they are the kind of mistake the design could not have
+predicted.** The first is `PxSIG`. The design said "refuse anything that is not
+the ATA signature `0x00000101`", which is what the spec's table suggests. The
+measured controller reports **`0xffffffff` on the port that has the disk on it**
+until that port has been brought up, so the gate rejected every port and the boot
+printed no SATA disk at all. The signature is not the presence question -
+`PxSSTS.DET` is, and it said `0x113` ("device present, PHY up") correctly all
+along - so the driver now refuses exactly one thing, the ATAPI signature
+`0xeb140101`, and lets `IDENTIFY` decide what a disk is. That is also the shape
+Linux's `ata_dev_classify` has: ATAPI, SEMB, PM and ZAC are named, and everything
+else is a disk.
+
+The second is the **unpartitioned disk**, which the numbering refactor deliberately
+left as it was and flagged (§7.3 said the driver would answer it). The old rule
+gated a disk's whole name on its having a partition table, so an unpartitioned
+disk had no `/dev/sda`, no line in `/proc/partitions` and nothing a program could
+open - including the partitioner that would have put a table on it. The test
+image is 4 MiB of zeros with no table, so this arrived immediately: `/dev/sda`
+did not exist and `t-ahci` failed at its first check. The rule is now the one
+Linux has - the whole disk is numbered whatever is on it - with a host test in
+`uevent` for the empty-table case, and that is why the numbering carries the
+disk's own size rather than deriving a partition's.
+
+**Gate, quoted from its own summary**: host `618 passed`, `mpos-xtask 36 passed`,
+guest `=== SUMMARY pass=132 fail=0 (132 built)`, QEMU exit 33, with the boot
+printing both disks -
+
+    virtio-blk: vda, 1032192 sectors (504 MiB)
+    ahci: sda, 8192 sectors (4 MiB)
+
+- and `t-ahci` `=== PASS` over 16 checks. The 8192 sectors are `IDENTIFY`'s
+answer and the file's own size, which is the first of the two claims the program
+separates: a capacity that is *reported* and one that is *reachable* are
+different claims, and the pins check both.
 
 ---
 
