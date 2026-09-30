@@ -1920,6 +1920,18 @@ pub(super) fn handle_memfd_create(args: [usize; ARG_COUNT], from_user: bool) -> 
         Ok(fd) => fd,
         Err(e) => return err_of(e),
     };
+    // The name is not only validated, it is kept - as Linux keeps it, in the
+    // one spelling both of the readers of it expect: `readlink
+    // /proc/self/fd/<n>` and the last column of `/proc/<pid>/maps` each answer
+    // `/memfd:<name> (deleted)` on Linux, the `(deleted)` because a memfd has
+    // no name in any directory to be found under. Measured on Linux 7.2.7,
+    // including the empty name (`memfd_create("", 0)` reports `/memfd:
+    // (deleted)`); this used to discard the name, which left a `wl_shm` pool's
+    // mapping with a blank column where a compositor's log would say which
+    // buffer it was.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        file.set_label(alloc::format!("/memfd:{name} (deleted)"));
+    }
     if flags & crate::vfs::memfd::MFD_CLOEXEC != 0 {
         let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
     }

@@ -2314,7 +2314,21 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         None if shared => {
             let object = crate::vfs::memfd::Memfd::new(super::fs::next_anon_ino(), 0);
             object.set_len(len).ok();
-            crate::sched::map_frames(base, len, mf, object, 0);
+            // Named as Linux names a mapping of a memfd with no name of its
+            // own, which is what this object is: `/memfd: (deleted)` - measured
+            // on Linux 7.2.7 for `mmap(MAP_SHARED, memfd_create("", 0))`. Linux
+            // reaches the same *shape* through `/dev/zero (deleted)`, which is
+            // an artefact of its own implementation; the object here really is a
+            // memfd, and this is the truthful name for it.
+            crate::sched::map_frames(
+                base,
+                len,
+                mf,
+                object,
+                0,
+                true,
+                Some(alloc::sync::Arc::from("/memfd: (deleted)")),
+            );
         }
         // Private anonymous memory: frames of the process's own, zero-filled on
         // first touch.
@@ -2324,7 +2338,15 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         // framebuffer and a dma-buf - and, since a wl_shm pool and a scanout
         // both live or die by aliasing, the only shape those can be.
         Some(file) if file.inode().frame_backed() => {
-            crate::sched::map_frames(base, len, mf, file.inode(), offset);
+            // The name the mapping reports, taken from the descriptor now
+            // because taking it later means searching the filesystem tree for
+            // the inode (see `File::display_name`). A descriptor that was never
+            // opened by a path has none, and gets a blank column - which is what
+            // Linux prints for a mapping it cannot name either.
+            let name = file
+                .label()
+                .map(|path| alloc::sync::Arc::from(path.as_str()));
+            crate::sched::map_frames(base, len, mf, file.inode(), offset, shared, name);
         }
         // An ordinary file: the bytes are read in now, because a mapping of a
         // file this kernel does not page is a copy of what the file held and
@@ -2363,6 +2385,14 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
                     return err::ENOMEM;
                 }
             }
+            // Every page is present, so this mapping has no VMA and no fault
+            // will ever describe it; it is recorded beside the table so that
+            // `/proc/<pid>/maps` can report it - under the name of the file it
+            // was copied from, which is the one thing about it a reader wants.
+            let name = file
+                .label()
+                .map(|path| alloc::sync::Arc::from(path.as_str()));
+            crate::sched::record_eager_range(base, base + len, mf, name);
         }
     }
 

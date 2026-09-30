@@ -463,8 +463,12 @@ it - so the entries say which they are:
       (`t-drm-lease`)
 - [ ] `MODE_GETFB2`, `MODE_CURSOR`/`MODE_CURSOR2` and the legacy gamma pair
       (§7.4)
-- [ ] `/proc/<pid>/maps` — absent, and read by Mesa's allocator paths, LLVM and
-      most crash reporters (§Remaining)
+- [x] `/proc/<pid>/maps` — the file a crash reporter reads to find a program's
+      base address: every mapping in Linux's six-field format, with the name
+      column where Linux puts it (`t-maps`). Two named gaps: an image's and a
+      private file mapping's line carries no `offset`/`inode` (this kernel reads
+      such a file in rather than paging it, so no object is left to name), and
+      `smaps` is not written (§7.4, §Remaining)
 
 **Security (Phase 8)**
 - [~] 8.0 **a userspace process could panic the kernel** - fixed for the case
@@ -883,11 +887,53 @@ scans for one.
 **Other missing (lower priority):**
 - `userfaultfd` (323) — lazy-copy / CRIU-style migration; niche.
 - `tid_add_object` / `tgid_add_object` (rseq side-objects) — rare.
-- **`/proc/<pid>/maps`** — not a syscall and not yet a file: the per-process
-  directory carries `fd`, `stat` and `cmdline` and stops there. It is listed
-  here because it is ABI, not a feature of a debugger: Mesa's allocator paths,
-  LLVM and most crash reporters read it, and anything that reports where a
-  mapping came from has nowhere to look (§7.4).
+- **`/proc/<pid>/maps` — answered.** The per-process directory carries it, in
+  Linux's exact format: `start-end perms offset dev inode name`, addresses as
+  lowercase hex, the offset zero-padded, `dev` as `%02x:%02x`, and the name in
+  the fixed column Linux uses (73, measured across address and inode widths on
+  7.2.7) when there is one - which is what makes the last field addressable
+  whatever the width before it. The perms word's fourth character is the
+  `MAP_SHARED` bit, so it is carried on the mapping rather than guessed from
+  what backs it: a `memfd` mapped `MAP_PRIVATE` aliases the same frames and is
+  still `p`. Three sources feed one file, because the address space is recorded
+  in three places: the VMA table (`mmap`, `mprotect`, `brk`), a list of ranges
+  the *loader* filled (see below), and the program break, which is what gives a
+  range the `[heap]` name - applied by address, since this kernel's heap is an
+  ordinary anonymous mapping. `[stack]` is recorded when the stack is laid out
+  and stretched down as the stack grows, so a program reading its own maps from
+  deep in a call is not told about a stack that stops above it.
+  **What the work needed, and it is the interesting part:** `execve` maps an
+  image's pages *eagerly* - it fills every page as it loads - so an image leaves
+  **no VMAs at all**, and the same is true of a `MAP_PRIVATE` mapping of an
+  ordinary file. A maps file built from the VMA table alone would therefore
+  omit the one line a crash reporter actually wants: the program's own code.
+  The loader's ranges and the private file mappings are recorded *beside* the
+  table (`mm::vma::MappedRange`) rather than put in it, and the reason is the
+  fault path rather than tidiness: recording them as `VmaKind::Anon` VMAs would
+  make an address that should take a fault - one whose frame a `munmap` or a
+  `MADV_DONTNEED` gave back - silently refill with zeros, which for a program's
+  own code means blank bytes where the file's bytes belong. The cost of that
+  choice is named with it: those ranges are the *load's* record and not the
+  current state, so a `munmap` or `mprotect` over one of them - a dynamic
+  program's `RELRO` pass does the second on every start - is not reflected in
+  the report where a VMA would have been edited. `t-maps` pins the lines, not
+  the mutation, so closing this needs a `forget_ranges`/`reprotect` on the
+  recorded list before it can be pinned.
+  **Two divergences, pinned as divergences:** an image's and a private file
+  mapping's line reports `dev` `00:00` and inode `0`, because there is no object
+  left to name - and `00:00` is what this kernel's own `stat` reports for every
+  filesystem, so the two files agree rather than disagreeing. And a *shared
+  anonymous* mapping is named `/memfd: (deleted)`, which is Linux's own name for
+  a nameless `memfd` mapping (measured: `memfd_create("", 0)` + `MAP_SHARED`
+  reports exactly that), because that is what the object here is; Linux reaches
+  the same shape through `/dev/zero (deleted)`, which is an artefact of its own
+  implementation.
+  `memfd_create` now *keeps* the name it used to only validate, as
+  `/memfd:<name> (deleted)` - the spelling both of its readers expect, measured
+  on Linux - so a `wl_shm` pool's mapping says which buffer it is instead of
+  leaving the column blank.
+  Not written: `/proc/<pid>/smaps` (per-mapping `Rss`/`VmFlags` and the rest),
+  and `/proc/<pid>/numa_maps`.
 - Extended attributes (`getxattr`/`setxattr`/`listxattr`/`removexattr` + `l`/`f`
   forms, 188–199) — **answered**: arguments and target are validated (so a bad
   path is still `ENOENT`/`EFAULT`, a bad fd `EBADF`), then `EOPNOTSUPP`, because
@@ -3070,10 +3116,11 @@ sending whole frames), `OUT_FENCE_PTR`, `IN_FORMATS` with
 today, and asked for precisely by the virtualized drivers.
 
 Syscalls and memory, the parts this section cannot fix from inside the display
-driver: `/proc/<pid>/maps`, absent and
-read by Mesa's allocator paths, LLVM and most crash reporters; and the frame pool
-(§10.4), since the renderer families allocate scratch in tens of megabytes where
-the current per-frame accounting was never sized for it. Threads used to head
+driver: `/proc/<pid>/maps` **landed** (§Remaining has the file and the two
+divergences it carries) - a crash reporter now has somewhere to look for a
+program's base address; and the frame pool (§10.4), since the renderer families
+allocate scratch in tens of megabytes where the current per-frame accounting was
+never sized for it. Threads used to head
 this list and are §6.4's now - landed. Anonymous demand paging
 and `MADV_DONTNEED` used to be on that list - they are §5.1/§5.2's rewrite now,
 and the scratch a renderer gives back is memory the machine can use again.
@@ -3103,9 +3150,11 @@ Each step stands on its own, which is the only reason the order is this one:
    is worth knowing the step is behind us before the property families.
 5. **`DRM_VIRTGPU_*`, then virgl in the image.** The largest item and the only
    one that makes niri possible.
-6. **`/proc/<pid>/maps`** and the frame pool: the supporting cast, wanted by
+6. ~~**`/proc/<pid>/maps`**~~ and the frame pool: the supporting cast, wanted by
    everything above and by nothing in particular. (`MADV_DONTNEED` was on this
-   line; §5.2 has it now.)
+   line, and §5.2 has it now; `maps` is §Remaining's, and it is written - see
+   the board's entry for the two things it needed, the loader's recorded ranges
+   and the `MAP_SHARED` bit the perms column reports.)
 
 ---
 
@@ -4640,8 +4689,9 @@ why.)
 
 - Anything already honestly refused. `fanotify`/`keyctl`/`userfaultfd`/namespaces and the
   `_ => ENOSYS` dispatch arm are correct answers, not gaps to close here.
-- `SO_LINGER`/buffer sizes (`record-only`) and the missing `/proc/<pid>/maps` —
-  already tracked in §4.3 / the ABI board; this phase does not duplicate them.
+- `SO_LINGER`/buffer sizes (`record-only`) and `/proc/<pid>/smaps` (its sibling
+  `maps` is answered now) — already tracked in §4.3 / the ABI board; this phase
+  does not duplicate them.
   (`SO_REUSEADDR` was on this list and is not any more: it is applied at
   `bind`/`listen`, §4.3.3.)
 - Real `MSG_PEEK` over TCP/UDP, real `rseq` state, real per-task CPU accounting: named here as

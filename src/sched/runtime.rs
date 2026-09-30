@@ -38,7 +38,7 @@ use crate::arch::paging::{self, AddressSpace};
 use crate::arch::{idle, timer};
 use crate::mm::elf::{self, Image};
 use crate::mm::vm::{MapFlags, Mapping};
-use crate::mm::vma::{Vma, VmaKind, VmaTable};
+use crate::mm::vma::{MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{Priority, Scheduler, TaskId};
 use crate::sched::signal;
@@ -689,6 +689,10 @@ pub struct Mm {
     /// placement is deliberate - threads share one address space, so they
     /// share one table, and `fork` copies it.
     vmas: Mutex<RefCell<VmaTable>>,
+    /// The ranges mapped *eagerly* - every page filled as it was mapped, so no
+    /// address in one ever faults. Here rather than in `vmas` for the reason
+    /// [`MappedRange`] gives. Only `/proc/<pid>/maps` reads this.
+    eager: Mutex<RefCell<Vec<MappedRange>>>,
     /// The thread that started the process: its id is the group's pid, and
     /// `getpid` answers it from any of the threads.
     leader: TaskId,
@@ -744,11 +748,25 @@ impl Mm {
     }
 
     fn new(leader: TaskId, root: usize, frames: Vec<usize>) -> Arc<Mm> {
+        Mm::with_eager(leader, root, frames, Vec::new())
+    }
+
+    /// A group whose address space already has eagerly-mapped ranges in it:
+    /// what `load_user` laid out, and what a private file `mmap` copied. `fork`
+    /// and `clone` are the other callers - a child's address space is its
+    /// parent's, so its report is too.
+    fn with_eager(
+        leader: TaskId,
+        root: usize,
+        frames: Vec<usize>,
+        eager: Vec<MappedRange>,
+    ) -> Arc<Mm> {
         Arc::new(Mm {
             live: core::sync::atomic::AtomicUsize::new(1),
             root_value: root,
             frames: Mutex::new(RefCell::new(frames)),
             vmas: Mutex::new(RefCell::new(VmaTable::new())),
+            eager: Mutex::new(RefCell::new(eager)),
             leader,
             clear_tid: Mutex::new(RefCell::new(None)),
             membarrier: core::sync::atomic::AtomicUsize::new(0),
@@ -770,6 +788,41 @@ impl Mm {
     /// A copy of the table, for a child about to be given its own.
     fn vma_snapshot(&self) -> VmaTable {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow().clone())
+    }
+
+    /// The eagerly-mapped ranges of this address space, folded into the runs a
+    /// maps line describes. The folding happens here rather than on the way in
+    /// because a mapping can be recorded in pieces (a segment list, a page loop)
+    /// and only the reader cares that they are one line.
+    fn eager_ranges(&self) -> Vec<MappedRange> {
+        merge_ranges(critical_section::with(|cs| {
+            self.eager.borrow(cs).borrow().clone()
+        }))
+    }
+
+    /// Add one eagerly-mapped range, for `/proc/<pid>/maps` to report. Called by
+    /// the loader and by a private file `mmap`; see [`MappedRange`] for why
+    /// neither put a VMA in the table instead.
+    fn record_range(&self, range: MappedRange) {
+        critical_section::with(|cs| self.eager.borrow(cs).borrow_mut().push(range));
+    }
+
+    /// Stretch the reported `[stack]` range down to `page`.
+    ///
+    /// A stack is a region a program descends into rather than a fixed
+    /// allocation, so the line `/proc/<pid>/maps` prints has to follow it -
+    /// otherwise a program reading its own maps from deep in a call sees a
+    /// stack that stopped 64 KiB above where it is standing.
+    fn grow_stack_range(&self, page: usize) {
+        critical_section::with(|cs| {
+            for range in self.eager.borrow(cs).borrow_mut().iter_mut() {
+                // The loader adds exactly one range with this name, and nothing
+                // else in this list carries a bracketed one.
+                if range.name.as_deref() == Some("[stack]") && page < range.start {
+                    range.start = page;
+                }
+            }
+        });
     }
 
     /// The VMA covering `virt`, if the group has one.
@@ -2199,11 +2252,12 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
     // hands over to the root filesystem's init - and on this userland that is
     // a link to busybox, which is dynamically linked. Both cases are the same
     // call: an image that names no interpreter reads none.
-    let interp_bytes = interpreter_bytes(&image)?;
-    let interp = match &interp_bytes {
-        Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
+    let interp_file = interpreter_bytes(&image)?;
+    let interp = match &interp_file {
+        Some((bytes, _)) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
         None => None,
     };
+    let interp_name = interp_file.as_ref().map(|(_, path)| path.as_str());
     // The interpreter first, because the layout has to know about it: the two
     // are stacked against each other rather than drawn independently, so that no
     // draw can drop one on top of the other.
@@ -2220,7 +2274,14 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
         drop_retired(INIT_PID);
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        let loaded = load_user(&mut space, &image, interp.as_ref(), &layout);
+        let loaded = load_user(
+            &mut space,
+            &image,
+            interp.as_ref(),
+            &layout,
+            "",
+            interp_name,
+        );
         write_arg_block(space.root(), user_rsp, argv, env, "", &loaded);
 
         let root = space.root();
@@ -2238,7 +2299,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             body: None,
             space: Some(space),
             user: true,
-            mm: Mm::new(TaskId(slot), root, loaded.frames),
+            mm: Mm::with_eager(TaskId(slot), root, loaded.frames, loaded.ranges),
             released: false,
             tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),
@@ -2324,11 +2385,12 @@ pub fn try_spawn_user(
     // the machine to is one of them, and a dynamic program started at its own
     // entry point runs before its relocations are applied: the first call
     // through the GOT jumps to nothing.
-    let interp_bytes = interpreter_bytes(&image)?;
-    let interp = match &interp_bytes {
-        Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
+    let interp_file = interpreter_bytes(&image)?;
+    let interp = match &interp_file {
+        Some((bytes, _)) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
         None => None,
     };
+    let interp_name = interp_file.as_ref().map(|(_, path)| path.as_str());
     let layout = new_layout(&image, interp.as_ref());
     let user_rsp =
         initial_stack_rsp(argv, env, exe, layout.stack_top).ok_or(SpawnError::ArgsTooBig)?;
@@ -2338,7 +2400,14 @@ pub fn try_spawn_user(
         drop_retired(TaskId(slot));
         let stack = Stack::new();
         let mut space = AddressSpace::new();
-        let loaded = load_user(&mut space, &image, interp.as_ref(), &layout);
+        let loaded = load_user(
+            &mut space,
+            &image,
+            interp.as_ref(),
+            &layout,
+            exe,
+            interp_name,
+        );
         // Read before the space moves into the task: a thread switches to
         // this root, and the group is what remembers it.
         let root = space.root();
@@ -2380,7 +2449,7 @@ pub fn try_spawn_user(
             body: None,
             space: Some(space),
             user: true,
-            mm: Mm::new(TaskId(slot), root, loaded.frames),
+            mm: Mm::with_eager(TaskId(slot), root, loaded.frames, loaded.ranges),
             released: false,
             tgid: TaskId(slot),
             user_entry: Some((loaded.entry, user_rsp)),
@@ -2708,6 +2777,10 @@ struct Loaded {
     stack_top: usize,
     /// The first address above the image, where the heap begins.
     brk: usize,
+    /// What the loader put where, folded into the runs `/proc/<pid>/maps`
+    /// prints: the program's segments, the interpreter's, and the stack. See
+    /// [`MappedRange`] for why these are not VMAs.
+    ranges: Vec<MappedRange>,
     /// Every frame that was mapped for this process, for the reaper to give
     /// back when it exits.
     frames: Vec<usize>,
@@ -2796,7 +2869,9 @@ fn apply_rela(space: &AddressSpace, image: &Image<'_>, base: usize) {
 ///
 /// The bytes come back unparsed because the parsed [`Image`] borrows from
 /// them; the caller keeps the bytes alive for as long as it holds the image.
-fn interpreter_bytes(image: &Image<'_>) -> Result<Option<Vec<u8>>, SpawnError> {
+/// The path comes back beside them because `/proc/<pid>/maps` names the
+/// interpreter's segments with it, and this is the one place that resolved it.
+fn interpreter_bytes(image: &Image<'_>) -> Result<Option<(Vec<u8>, String)>, SpawnError> {
     let Some(path) = &image.interp else {
         return Ok(None);
     };
@@ -2805,7 +2880,7 @@ fn interpreter_bytes(image: &Image<'_>) -> Result<Option<Vec<u8>>, SpawnError> {
     // the program itself was fine, and what could not be followed is the path
     // it names.
     crate::vfs::read_file(path)
-        .map(Some)
+        .map(|bytes| Some((bytes, String::from(path))))
         .map_err(|_| SpawnError::NoInterpreter)
 }
 
@@ -2833,18 +2908,23 @@ fn load_user(
     image: &Image<'_>,
     interp: Option<&Image<'_>>,
     layout: &Layout,
+    program_name: &str,
+    interp_name: Option<&str>,
 ) -> Loaded {
     let mut frames = Vec::new();
+    let mut ranges = Vec::new();
 
     let base = match interp {
         Some(interp) => {
             map_image(space, interp, layout.interp_bias, &mut frames);
+            segment_ranges(interp, layout.interp_bias, interp_name, &mut ranges);
             layout.interp_bias
         }
         None => 0,
     };
 
     map_image(space, image, layout.bias, &mut frames);
+    segment_ranges(image, layout.bias, Some(program_name), &mut ranges);
     if interp.is_none() {
         apply_rela(space, image, layout.bias);
     }
@@ -2867,6 +2947,17 @@ fn load_user(
             flags: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
         });
     }
+    // The stack is one line in `/proc/<pid>/maps`, and Linux brackets its name
+    // because it is not a file: `[stack]`. What is reported is the range the
+    // loader mapped, which is the same thing Linux's VMA starts as - the pages
+    // a program grows below it are added to the same range as it takes them
+    // (`Table::grow_stack`), so the line follows the stack down.
+    ranges.push(MappedRange {
+        start: layout.stack_top - USER_STACK_PAGES * PAGE_SIZE,
+        end: layout.stack_top,
+        prot: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+        name: Some(Arc::from("[stack]")),
+    });
 
     // Control goes to the interpreter when there is one, and to the program
     // otherwise. The interpreter's own entry is a vaddr in a shared object,
@@ -2894,7 +2985,37 @@ fn load_user(
         // the address it was *linked* for would be told about a region that is
         // not its own.
         brk: brk_end.map_or(0, |end| pframe::align_up(layout.bias + end, PAGE_SIZE)),
+        ranges: merge_ranges(ranges),
         frames,
+    }
+}
+
+/// Record what one image's segments occupy, at the load address they were
+/// placed at, so `/proc/<pid>/maps` can report them.
+///
+/// The page granularity and the permission word are `map_image`'s own: it
+/// aligns each segment out to whole pages and maps them `READ | USER` plus
+/// whatever the segment asked for. Anything else here would report a range
+/// that is not the range a program can reach.
+fn segment_ranges(
+    image: &Image<'_>,
+    base: usize,
+    name: Option<&str>,
+    ranges: &mut Vec<MappedRange>,
+) {
+    for segment in &image.segments {
+        let vaddr = base + segment.vaddr;
+        let mut prot = MapFlags::READ | MapFlags::USER;
+        prot.insert(segment.flags & (MapFlags::WRITE | MapFlags::EXEC));
+        ranges.push(MappedRange {
+            start: pframe::align_down(vaddr, PAGE_SIZE),
+            end: pframe::align_up(vaddr + segment.memsz, PAGE_SIZE),
+            prot,
+            // An empty name is no name: a kernel-started task's `exe` is empty
+            // (there is no path it was run by), and a maps line with an empty
+            // column is not the shape a reader parses.
+            name: name.filter(|name| !name.is_empty()).map(Arc::from),
+        });
     }
 }
 
@@ -5735,6 +5856,59 @@ pub fn snapshots() -> alloc::vec::Vec<TaskSnapshot> {
     })
 }
 
+/// Everything `/proc/<pid>/maps` reports about one process, in one place.
+///
+/// Three sources, because the address space is described by three: the VMA
+/// table holds what `mmap`, `mprotect` and `brk` put there, [`MappedRange`]
+/// holds what the loader laid out (`MappedRange` explains why those are not in
+/// the table), and the heap range is the program break, whose *name* - `[heap]`
+/// - is a reporting convention rather than anything the mapping stores.
+pub struct MapFacts {
+    pub vmas: VmaTable,
+    pub eager: Vec<MappedRange>,
+    /// `[start, end)` of the program break, or `None` for a process that never
+    /// asked for a heap.
+    pub heap: Option<(usize, usize)>,
+}
+
+/// Record a range whose pages were mapped eagerly, for `/proc/<pid>/maps`.
+///
+/// This is what a `MAP_PRIVATE` mapping of an ordinary file needs and what its
+/// VMA cannot say: the mapping has no VMA at all, because every page of it was
+/// read in at `mmap` time and no address in it will ever fault. See
+/// [`MappedRange`].
+pub fn record_eager_range(start: usize, end: usize, prot: MapFlags, name: Option<Arc<str>>) {
+    if start >= end {
+        return;
+    }
+    current_mm().record_range(MappedRange {
+        start,
+        end,
+        prot,
+        name,
+    });
+}
+
+/// The address space of the process `pid`, for `/proc/<pid>/maps`. `None` when
+/// nothing answers to the pid, which is `ENOENT` from the read.
+pub fn map_facts(pid: usize) -> Option<MapFacts> {
+    with_table(|t| {
+        let task = t.tasks.get(pid)?.as_ref()?;
+        if !task.user {
+            return None;
+        }
+        let heap = (task.brk_pages > 0).then(|| {
+            let start = task.brk_base;
+            (start, start + task.brk_pages * pframe::PAGE_SIZE)
+        });
+        Some(MapFacts {
+            vmas: task.mm.vma_snapshot(),
+            eager: task.mm.eager_ranges(),
+            heap,
+        })
+    })
+}
+
 /// One task, by pid or tid. `None` when no user task answers to it, which is
 /// what turns into `ENOENT` from a read of `/proc/<pid>` - the same answer
 /// Linux gives for a pid that has already been reaped.
@@ -6019,7 +6193,7 @@ fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) -> bool {
             unsafe { core::ptr::write_bytes(mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
             frame
         }
-        VmaKind::Frames { inode, offset } => {
+        VmaKind::Frames { inode, offset, .. } => {
             // The page of the *object* this address corresponds to. The offset
             // travels with the address through every split (see `mm::vma`), so
             // this is the same page the eager loop used to map.
@@ -6116,22 +6290,38 @@ pub fn map_anon(virt: usize, len: usize, flags: MapFlags) {
 /// starting at page `offset` of that object. This is what `memfd`, the
 /// framebuffer and a dma-buf get, and what a shared anonymous mapping is made
 /// of: the pages are the object's, shared by every mapping of it.
+///
+/// `shared` is the `MAP_SHARED` bit the caller asked for, which the mapping
+/// keeps because `/proc/<pid>/maps` reports it - a `memfd` mapped
+/// `MAP_PRIVATE` is the same object and still not a shared mapping. `name` is
+/// what that file prints for this line, resolved from the descriptor *now*
+/// because resolving it later means walking the filesystem tree (see
+/// [`crate::vfs::File::display_name`]).
 pub fn map_frames(
     virt: usize,
     len: usize,
     flags: MapFlags,
     inode: Arc<dyn crate::vfs::Inode>,
     offset: usize,
+    shared: bool,
+    name: Option<Arc<str>>,
 ) {
     if len == 0 {
         return;
     }
-    current_mm().vma_insert(Vma::new(
-        virt,
-        virt + len,
-        flags,
-        VmaKind::Frames { inode, offset },
-    ));
+    current_mm().vma_insert(
+        Vma::new(
+            virt,
+            virt + len,
+            flags,
+            VmaKind::Frames {
+                inode,
+                offset,
+                shared,
+            },
+        )
+        .named(name),
+    );
 }
 
 /// `munmap`'s two halves at once: forget the VMAs covering `virt..virt + len`
@@ -6864,6 +7054,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         parent_tls,
         parent_pages,
         parent_vmas,
+        parent_eager,
     ) = with_table(|t| {
         let parent_id = t.current;
         let parent = t.task(parent_id);
@@ -6894,6 +7085,10 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         // a `fork` of a process with a large untouched `mmap` cheap: only the
         // *present* pages below are walked at all.
         let parent_vmas = parent.mm.vma_snapshot();
+        // And so does what the parent was *loaded* with: a child's address
+        // space is its parent's, so `/proc/<pid>/maps` says the same thing on
+        // either side of the fork.
+        let parent_eager = parent.mm.eager_ranges();
         (
             parent_id,
             parent_has_space,
@@ -6909,6 +7104,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             parent_tls,
             parent_pages,
             parent_vmas,
+            parent_eager,
         )
     });
 
@@ -7038,7 +7234,10 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
                 ..*state
             }),
             mm: {
-                let mm = Mm::new(TaskId(slot), child_root, child_frames);
+                // A child's address space is its parent's, so what the parent
+                // was *loaded* with is the child's report too - `/proc` on
+                // either says the same thing.
+                let mm = Mm::with_eager(TaskId(slot), child_root, child_frames, parent_eager);
                 mm.set_vmas(parent_vmas);
                 mm
             },
@@ -7143,11 +7342,12 @@ pub fn exec_replace(
     // before it does. That is a path into the filesystem, and this is the only
     // place with both the path and the authority to follow it - which is why
     // the interpreter is read here rather than inside the loader.
-    let interp_bytes = interpreter_bytes(&image)?;
-    let interp = match &interp_bytes {
-        Some(bytes) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
+    let interp_file = interpreter_bytes(&image)?;
+    let interp = match &interp_file {
+        Some((bytes, _)) => Some(elf::parse(bytes).ok_or(SpawnError::NoInterpreter)?),
         None => None,
     };
+    let interp_name = interp_file.as_ref().map(|(_, path)| path.as_str());
     // A fresh layout with the fresh image. This is the moment ASLR belongs to:
     // a `fork` copies the parent's addresses because it copies its memory, but
     // an `exec` throws that memory away, so the new program is under no
@@ -7200,7 +7400,14 @@ pub fn exec_replace(
 
         // --- Build new address space ---
         let mut space = AddressSpace::new();
-        let loaded = load_user(&mut space, &image, interp.as_ref(), &layout);
+        let loaded = load_user(
+            &mut space,
+            &image,
+            interp.as_ref(),
+            &layout,
+            exe,
+            interp_name,
+        );
 
         write_arg_block(space.root(), user_rsp, argv, env, exe, &loaded);
 
@@ -7220,7 +7427,7 @@ pub fn exec_replace(
         // with threads running is a case Linux handles by ending them; this
         // kernel does not yet, and the threads that were there keep the old
         // group until they exit.
-        task.mm = Mm::new(id, new_root, loaded.frames);
+        task.mm = Mm::with_eager(id, new_root, loaded.frames, loaded.ranges);
         task.brk_base = loaded.brk;
         task.brk_pages = 0;
         task.mmap_cursor = layout.mmap_top;
@@ -7410,6 +7617,11 @@ pub fn resolve_stack_growth(addr: usize, rsp: usize) -> bool {
             return false;
         }
         task.mm.own(frame);
+        // The stack's reported range follows it down, so a program deep in a
+        // recursion does not read a `[stack]` line that stops 64 KiB below
+        // where it is actually standing. Linux's `[stack]` line covers the
+        // VMA, which grows the same way.
+        task.mm.grow_stack_range(page);
         true
     })
 }

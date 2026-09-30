@@ -274,6 +274,10 @@ name = "t-madvise"
 path = "src/bin/syscall/t-madvise.rs"
 
 [[bin]]
+name = "t-maps"
+path = "src/bin/syscall/t-maps.rs"
+
+[[bin]]
 name = "t-mkdirat"
 path = "src/bin/syscall/t-mkdirat.rs"
 

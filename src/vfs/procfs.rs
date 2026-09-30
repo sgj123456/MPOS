@@ -29,6 +29,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use critical_section::Mutex;
 
 use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
+use crate::mm::vm::MapFlags;
 
 /// What a generated file reads back as: a function of the moment.
 ///
@@ -736,6 +737,180 @@ fn statm_line(pid: usize) -> Option<String> {
     ))
 }
 
+/// The column a mapping's name starts in, on Linux.
+///
+/// Measured, not recalled: over process images with 12- and 16-digit addresses
+/// and with inodes of several widths, every named line of `/proc/self/maps` on
+/// Linux 7.2.7 puts its first name byte at offset 73, and an unnamed line ends
+/// after the single space that would have preceded one. That is `seq_pad`'s
+/// fixed column, and it is what makes the file readable by `awk '{print $6}'`
+/// whatever the address width.
+const MAPS_NAME_COLUMN: usize = 73;
+
+/// One line of `/proc/<pid>/maps`, with every field already resolved.
+///
+/// The fields are resolved *before* the formatting because the two halves
+/// belong on different sides of the host boundary: this struct and
+/// [`format_maps`] are the ABI, and they are compiled for the host so a unit
+/// test can pin the exact bytes. Gathering them asks the scheduler and the
+/// inode layer, which only exist on the machine.
+pub struct MapLine {
+    pub start: usize,
+    pub end: usize,
+    /// The permissions bits, as `mmap` left them.
+    pub prot: MapFlags,
+    /// `MAP_SHARED`, which is the fourth permission character.
+    pub shared: bool,
+    /// Byte offset into the backing object.
+    pub offset: u64,
+    /// The st_dev pair to print. Both zero for a mapping with no file behind
+    /// it, and for a file on this kernel - `stat` reports zero there too, so
+    /// the two agree rather than disagreeing.
+    pub dev: (u32, u32),
+    pub inode: u64,
+    /// What goes in the last column, or `None` for a blank one.
+    pub name: Option<String>,
+}
+
+/// Render `/proc/<pid>/maps`: one line per mapping, in address order.
+///
+/// Linux's layout exactly - `start-end perms offset dev inode name` - because
+/// the file is parsed rather than read: `pmap`, `lsof`-style tools and every
+/// crash reporter split it on whitespace and index into it.
+pub fn format_maps(lines: &[MapLine]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        let perms = [
+            if line.prot.contains(MapFlags::READ) {
+                'r'
+            } else {
+                '-'
+            },
+            if line.prot.contains(MapFlags::WRITE) {
+                'w'
+            } else {
+                '-'
+            },
+            if line.prot.contains(MapFlags::EXEC) {
+                'x'
+            } else {
+                '-'
+            },
+            if line.shared { 's' } else { 'p' },
+        ];
+        // `%08lx` with a 64-bit value: eight digits at least, and every digit a
+        // full-width address needs - which is why a line's address field is
+        // 12 or 16 characters long rather than fixed.
+        let mut rendered = alloc::format!(
+            "{:08x}-{:08x} {} {:08x} {:02x}:{:02x} {} ",
+            line.start,
+            line.end,
+            perms.iter().collect::<String>(),
+            line.offset,
+            line.dev.0,
+            line.dev.1,
+            line.inode,
+        );
+        // An unnamed mapping is the prefix and the space that would have
+        // preceded a name - not a padded line with an empty column, which is
+        // what a reader that counts spaces would trip over.
+        if let Some(name) = &line.name {
+            while rendered.len() < MAPS_NAME_COLUMN {
+                rendered.push(' ');
+            }
+            rendered.push_str(name);
+        }
+        out.push_str(&rendered);
+        out.push('\n');
+    }
+    out
+}
+
+/// `/proc/<pid>/maps`: every range in the process's address space.
+///
+/// Three sources, because the address space is recorded in three places: the
+/// VMA table holds what `mmap`, `mprotect` and `brk` put there, the loader's
+/// recorded ranges hold what `execve` and a private file mapping filled in
+/// eagerly (neither leaves a VMA - see [`crate::mm::vma::MappedRange`]), and the
+/// program break is what names the heap.
+///
+/// What this cannot report, and does not pretend to: a mapping's `offset` and
+/// `inode` when the pages are a *copy* of a file rather than the file's own
+/// pages. This kernel reads such a file in rather than paging it, so there is
+/// no object left to name - the mapping gets the file's name and zeroes for the
+/// two columns, and `PLAN.md` §7.4 records the gap.
+#[cfg(target_os = "none")]
+fn maps_of(pid: usize) -> Option<String> {
+    use crate::mm::vma::{Vma, VmaKind};
+
+    let facts = crate::sched::map_facts(pid)?;
+
+    // `[heap]` is a reporting convention rather than a mapping's own name, so
+    // it is applied here, by range: Linux prints it for the break's VMA, and
+    // the break's VMA here is an ordinary anonymous one (see `sched::brk`).
+    let heap_name = |vma: &Vma| -> Option<String> {
+        let (start, end) = facts.heap?;
+        (vma.start >= start && vma.end <= end && vma.name.is_none()).then(|| String::from("[heap]"))
+    };
+
+    let mut lines: Vec<MapLine> = Vec::new();
+    for vma in facts.vmas.iter() {
+        let (offset, dev, inode, shared) = match &vma.kind {
+            VmaKind::Anon => (0, (0, 0), 0, false),
+            VmaKind::Frames {
+                inode,
+                offset,
+                shared,
+            } => (
+                *offset as u64,
+                // A device node reports the device it is; a file reports the
+                // filesystem it is on, and this kernel's `stat` says zero for
+                // every filesystem, so the two files that read the same fact
+                // do not disagree about it.
+                inode.rdev().unwrap_or((0, 0)),
+                inode.metadata().ino,
+                *shared,
+            ),
+        };
+        let name = match &vma.name {
+            Some(name) => Some(String::from(&**name)),
+            None => heap_name(vma),
+        };
+        lines.push(MapLine {
+            start: vma.start,
+            end: vma.end,
+            prot: vma.prot,
+            shared,
+            offset,
+            dev,
+            inode,
+            name,
+        });
+    }
+    for range in &facts.eager {
+        lines.push(MapLine {
+            start: range.start,
+            end: range.end,
+            prot: range.prot,
+            // Eagerly-filled ranges are a private copy or an image: `private`,
+            // which is what Linux prints for both.
+            shared: false,
+            offset: 0,
+            dev: (0, 0),
+            inode: 0,
+            name: range.name.as_deref().map(String::from),
+        });
+    }
+
+    lines.sort_by_key(|line| (line.start, line.end));
+    Some(format_maps(&lines))
+}
+
+#[cfg(not(target_os = "none"))]
+fn maps_of(_pid: usize) -> Option<String> {
+    None
+}
+
 /// `/proc/<pid>/cmdline`: the argument vector, NUL-separated, with a NUL
 /// after the last one.
 ///
@@ -985,6 +1160,7 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
         maybe_file(move || stat_line(pid, pid)),
     );
     node.add("statm", NodeKind::File, maybe_file(move || statm_line(pid)));
+    node.add("maps", NodeKind::File, maybe_file(move || maps_of(pid)));
     #[cfg(target_os = "none")]
     node.add(
         "limits",
@@ -1908,6 +2084,96 @@ mod tests {
             text.starts_with("major minor  #blocks  name\n\n"),
             "{text:?}"
         );
+    }
+
+    /// The named-line shape, pinned against a line Linux actually printed: the
+    /// two are byte for byte the same, which is the only specification
+    /// `/proc/<pid>/maps` has.
+    #[test]
+    fn a_named_mapping_lands_in_the_column_linux_prints_it_in() {
+        let text = format_maps(&[MapLine {
+            start: 0x7f7986_e00000,
+            end: 0x7f7987_3f4000,
+            prot: MapFlags::READ | MapFlags::USER,
+            shared: false,
+            offset: 0,
+            dev: (0x103, 0x03),
+            inode: 15_656_790,
+            name: Some(String::from("/usr/lib/locale/locale-archive")),
+        }]);
+        assert!(
+            text.starts_with("7f7986e00000-7f79873f4000 r--p 00000000 103:03 15656790"),
+            "{text:?}"
+        );
+        assert_eq!(
+            text.find('/'),
+            Some(MAPS_NAME_COLUMN),
+            "the name starts where Linux starts it"
+        );
+        assert!(
+            text.ends_with("/usr/lib/locale/locale-archive\n"),
+            "{text:?}"
+        );
+        // Everything between the inode and the name is the padding, and the
+        // padding is spaces - a tab there would break a reader that counts.
+        let prefix = "7f7986e00000-7f79873f4000 r--p 00000000 103:03 15656790".len();
+        assert!(
+            text[prefix..MAPS_NAME_COLUMN].bytes().all(|b| b == b' '),
+            "the name column is reached with spaces: {:?}",
+            &text[prefix..MAPS_NAME_COLUMN]
+        );
+    }
+
+    /// An unnamed mapping is the prefix and the space a name would have
+    /// followed - *not* a line padded out to the name column with nothing in
+    /// it, which is what Linux prints and what a reader splitting on
+    /// whitespace can tell apart from a name of spaces.
+    #[test]
+    fn an_unnamed_mapping_ends_after_the_space_no_name_followed() {
+        let text = format_maps(&[MapLine {
+            start: 0x7f7987_61b000,
+            end: 0x7f7987_623000,
+            prot: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+            shared: false,
+            offset: 0,
+            dev: (0, 0),
+            inode: 0,
+            name: None,
+        }]);
+        assert_eq!(text, "7f798761b000-7f7987623000 rw-p 00000000 00:00 0 \n");
+        assert!(text.len() < MAPS_NAME_COLUMN);
+    }
+
+    /// The fourth permission character is the *shared* bit, and the other
+    /// three are the mapping's own bits - a `PROT_NONE` range prints `---p`
+    /// rather than a plausible-looking `r`, because it is not readable.
+    #[test]
+    fn the_permission_word_spells_the_mapping_out() {
+        let word = |prot: MapFlags, shared: bool| {
+            let text = format_maps(&[MapLine {
+                start: 0x1000,
+                end: 0x2000,
+                prot,
+                shared,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name: None,
+            }]);
+            // `00001000-00002000 r--p ...`: 8 + 1 + 8 + 1 bytes before the
+            // permission word.
+            String::from(&text[18..22])
+        };
+        assert_eq!(word(MapFlags::READ | MapFlags::USER, false), "r--p");
+        assert_eq!(
+            word(MapFlags::READ | MapFlags::WRITE | MapFlags::USER, true),
+            "rw-s"
+        );
+        assert_eq!(
+            word(MapFlags::READ | MapFlags::EXEC | MapFlags::USER, false),
+            "r-xp"
+        );
+        assert_eq!(word(MapFlags::empty(), false), "---p");
     }
 
     /// Read a whole generated file, the way `cat` does.

@@ -39,9 +39,19 @@ pub enum VmaKind {
     /// offset into that object that `start` corresponds to, so the page a fault
     /// names is `offset + (virt - start)`, and a split or a move adjusts it
     /// with the address.
+    ///
+    /// `shared` is whether the caller asked for `MAP_SHARED`, and it is the
+    /// mapping's own bit rather than the object's: a `memfd` mapped
+    /// `MAP_PRIVATE` aliases the same frames but is *not* a shared mapping -
+    /// Linux prints it `p`, and a write through it is a private fault that
+    /// never reaches the object. It is what the fourth column of
+    /// `/proc/<pid>/maps` reports, and the two are not derivable from each
+    /// other: the object says what the pages *are*, this says what the caller
+    /// asked for.
     Frames {
         inode: Arc<dyn Inode>,
         offset: usize,
+        shared: bool,
     },
 }
 
@@ -52,12 +62,76 @@ impl VmaKind {
     fn same_object(&self, other: &VmaKind) -> bool {
         match (self, other) {
             (VmaKind::Anon, VmaKind::Anon) => true,
-            (VmaKind::Frames { inode: a, .. }, VmaKind::Frames { inode: b, .. }) => {
-                Arc::ptr_eq(a, b)
-            }
+            (
+                VmaKind::Frames {
+                    inode: a,
+                    shared: sa,
+                    ..
+                },
+                VmaKind::Frames {
+                    inode: b,
+                    shared: sb,
+                    ..
+                },
+            ) => Arc::ptr_eq(a, b) && sa == sb,
             _ => false,
         }
     }
+}
+
+/// A range of the address space whose pages were filled *eagerly*, recorded
+/// for `/proc/<pid>/maps` to report.
+///
+/// Two things make these, and they are the same thing twice: `execve`, which
+/// loads an image's bytes as it goes (`sched::load_user`), and a `MAP_PRIVATE`
+/// mapping of an ordinary file, which reads the file's bytes in and keeps
+/// nothing of the file afterwards (`handle_mmap`). Both fill every page at the
+/// moment they map it, so no address in either ever faults.
+///
+/// That is why this is a separate type from [`Vma`] and not a kind of one.
+/// A [`Vma`] exists to answer a fault, and there is no fault to answer here.
+/// Recording these as `VmaKind::Anon` VMAs would *invent* one: a page that
+/// `MADV_DONTNEED` had given back, or that a `munmap` had freed underneath a
+/// stale address, would be silently refilled with zeros where the address
+/// space rightly takes a fault - and a program's own code would come back as
+/// blank bytes rather than as the bytes the file holds.
+///
+/// So these ranges are kept *beside* the table, where only the reader of
+/// `/proc/<pid>/maps` looks. What that reader loses is the difference between
+/// a mapping whose pages are the file's and one that is a copy of it, and a
+/// file-backed mapping's `offset` and `inode` - none of which this kernel's
+/// file mappings keep anywhere. That is a named gap in `PLAN.md` §7.4, not a
+/// hidden one.
+#[derive(Clone)]
+pub struct MappedRange {
+    pub start: usize,
+    pub end: usize,
+    pub prot: MapFlags,
+    pub name: Option<Arc<str>>,
+}
+
+impl MappedRange {
+    /// Whether `next` continues this range, so a segment list can be reported
+    /// as the runs a reader expects rather than one line per ELF segment.
+    fn abuts(&self, next: &MappedRange) -> bool {
+        self.end == next.start && self.prot == next.prot && same_name(&self.name, &next.name)
+    }
+}
+
+/// Fold a load's range list into the runs a maps line describes: adjacent
+/// pieces with the same permissions and the same name are one range. An
+/// image's text segment is usually two of them (`r--` then `r-x`) and its data
+/// two more, which is exactly how Linux prints them.
+pub fn merge_ranges(mut ranges: Vec<MappedRange>) -> Vec<MappedRange> {
+    ranges.sort_unstable_by_key(|r| r.start);
+    let mut merged: Vec<MappedRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        match merged.last_mut() {
+            Some(last) if last.abuts(&range) => last.end = range.end,
+            _ => merged.push(range),
+        }
+    }
+    merged
 }
 
 /// One page-granular range of the address space, `[start, end)`.
@@ -70,6 +144,17 @@ pub struct Vma {
     /// exactly the absence of `USER`.
     pub prot: MapFlags,
     pub kind: VmaKind,
+    /// What this mapping is called, when it has a name: the path a file-backed
+    /// mapping came from, or a bracketed convention like `[heap]`.
+    ///
+    /// Linux keeps the same fact as `vma->vm_file` plus its `[stack]`/`[heap]`
+    /// conventions, and it is there for one reader: `/proc/<pid>/maps`. The
+    /// name is *stored* rather than looked up because the lookup is a walk of
+    /// the whole filesystem tree - `crate::vfs::File::display_name` says so -
+    /// and a maps file with a mapping per page would do that walk once per
+    /// line. `Arc<str>` and not `String` so that `Clone`, which every split
+    /// does, copies a pointer.
+    pub name: Option<Arc<str>>,
 }
 
 impl Vma {
@@ -80,7 +165,14 @@ impl Vma {
             end,
             prot,
             kind,
+            name: None,
         }
+    }
+
+    /// The same mapping, with a name for `/proc/<pid>/maps` to print.
+    pub fn named(mut self, name: impl Into<Option<Arc<str>>>) -> Vma {
+        self.name = name.into();
+        self
     }
 
     pub fn covers(&self, virt: usize) -> bool {
@@ -105,9 +197,14 @@ impl Vma {
         }
         let kind = match &self.kind {
             VmaKind::Anon => VmaKind::Anon,
-            VmaKind::Frames { inode, offset } => VmaKind::Frames {
+            VmaKind::Frames {
+                inode,
+                offset,
+                shared,
+            } => VmaKind::Frames {
                 inode: Arc::clone(inode),
                 offset: offset + (start - self.start),
+                shared: *shared,
             },
         };
         Some(Vma {
@@ -115,6 +212,7 @@ impl Vma {
             end,
             prot: self.prot,
             kind,
+            name: self.name.clone(),
         })
     }
 
@@ -122,7 +220,7 @@ impl Vma {
     /// permissions, same object, and - for a frame-backed one - the offset
     /// where this range's own arithmetic puts it.
     fn abuts(&self, next: &Vma) -> bool {
-        if self.end != next.start || self.prot != next.prot {
+        if self.end != next.start || self.prot != next.prot || !same_name(&self.name, &next.name) {
             return false;
         }
         if !self.kind.same_object(&next.kind) {
@@ -135,6 +233,19 @@ impl Vma {
             }
             _ => false,
         }
+    }
+}
+
+/// Whether two mappings carry the same name. Compared by *string* rather than
+/// by pointer, because the names of two mappings of one file are built by two
+/// separate resolutions of it - and a missed merge is a maps file with two
+/// lines where Linux has one, which is worse than the pointer comparison
+/// saving a byte-by-byte walk of a path.
+fn same_name(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -318,6 +429,7 @@ mod tests {
             VmaKind::Frames {
                 inode: Arc::clone(inode),
                 offset,
+                shared: true,
             },
         )
     }
@@ -392,6 +504,65 @@ mod tests {
             }
             _ => panic!("the halves are no longer frame-backed"),
         }
+    }
+
+    #[test]
+    fn a_shared_bit_the_two_halves_do_not_agree_on_is_two_areas() {
+        let object = fake(7);
+        let mut table = VmaTable::new();
+        table.insert(frames(0x1000, 0x2000, RW, &object, 0));
+        // The same object and the same offset continuation, but asked for
+        // privately: a `memfd` mapped `MAP_PRIVATE` aliases the frames and is
+        // still not the mapping its neighbour is.
+        table.insert(Vma::new(
+            0x2000,
+            0x3000,
+            RW,
+            VmaKind::Frames {
+                inode: Arc::clone(&object),
+                offset: 0x1000,
+                shared: false,
+            },
+        ));
+        assert_eq!(table.len(), 2, "a private mapping is its own area");
+    }
+
+    #[test]
+    fn a_name_splits_an_area_and_a_shared_one_folds_it_back() {
+        let mut table = VmaTable::new();
+        table.insert(anon(0x1000, 0x2000, RW).named(Arc::from("/bin/one")));
+        table.insert(anon(0x2000, 0x3000, RW).named(Arc::from("/bin/two")));
+
+        assert_eq!(table.len(), 2, "two names, two lines");
+
+        // The same name reaches back over the split, because the two halves
+        // describe one thing: this is what makes a file mapped in two pieces
+        // by one caller print as one line, as Linux prints it.
+        table.insert(anon(0x2000, 0x3000, RW).named(Arc::from("/bin/one")));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.iter().next().unwrap().end, 0x3000);
+
+        let mut named_and_not = VmaTable::new();
+        named_and_not.insert(anon(0x1000, 0x2000, RW).named(Arc::from("/bin/one")));
+        named_and_not.insert(anon(0x2000, 0x3000, RW));
+        assert_eq!(
+            named_and_not.len(),
+            2,
+            "a name and no name are not one area"
+        );
+    }
+
+    #[test]
+    fn a_split_keeps_the_name_on_both_halves() {
+        let mut table = VmaTable::new();
+        table.insert(anon(0x1000, 0x4000, RW).named(Arc::from("[heap]")));
+        table.insert(anon(0x2000, 0x3000, MapFlags::READ | MapFlags::USER));
+
+        let low = table.lookup(0x1000).unwrap();
+        let high = table.lookup(0x3000).unwrap();
+        assert_eq!(low.name.as_deref(), Some("[heap]"));
+        assert_eq!(high.name.as_deref(), Some("[heap]"));
+        assert_eq!(table.lookup(0x2000).unwrap().name, None);
     }
 
     #[test]

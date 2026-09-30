@@ -135,12 +135,19 @@ leak into the image `cargo xtask run` boots.
 
 **Nothing is red. The state below is the measured run, quoted from its own summary line.**
 
-- Host unit tests: `576 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
+- Host unit tests: `582 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
   plus `36 passed` from `mpos-xtask`. Measured on this tree.
-- The guest suite reached `=== SUMMARY pass=128 fail=0` (128 built) with QEMU exit code 33, with
-  `9 of 137 user tests left out by tests.toml` — the `external`, `slow` and `diagnostic` groups,
+- The guest suite reached `=== SUMMARY pass=129 fail=0` (129 built) with QEMU exit code 33, with
+  `9 of 138 user tests left out by tests.toml` — the `external`, `slow` and `diagnostic` groups,
   which is what makes the sweep's verdict a statement about the kernel. `--groups diagnostic`
   was run on its own to prove the flag reaches the guest (`128 staged`, `t-sh` in the count).
+  `/proc/<pid>/maps` (plan §7.4 and §Remaining) is green end to end: `t-maps` printed
+  `=== PASS` over 29 checks, and the ones that matter are the lines a crash reporter reads —
+  the program's own image reported under its own path with the code segment `r-xp` (which is
+  *not* in the VMA table, since `execve` fills those pages eagerly), a private anonymous mapping
+  as `rw-p` with no name and no object, a shared one as `rw-s` named `/memfd: (deleted)`, a
+  `memfd` mapping named `/memfd:t-maps-buf (deleted)` with its name starting in Linux's column
+  73, and `[stack]`/`[heap]` covering the frame and the break.
   The UTS namespace (plan §6.3, step 1) is green end to end: `t-ns-uts` prints `=== PASS`,
   holding both halves of the property that makes a namespace one — a child that unshares reports
   `inside` through `uname` *and* through both `/proc/sys/kernel` files while the parent that did
