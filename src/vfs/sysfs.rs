@@ -335,7 +335,7 @@ impl SysFs {
     /// The tree for the machine as it is: the boot disk, its partitions, and
     /// every PCI function the boot found.
     pub fn new() -> Arc<SysFs> {
-        SysFs::with(Numbering::of_boot_disk(), crate::pci::devices())
+        SysFs::with(Numbering::of_this_machine(), crate::pci::devices())
     }
 
     /// The tree for a given set of block devices, and no PCI bus. The host has
@@ -397,17 +397,18 @@ impl SysFs {
         // directory under `/sys/devices` in this tree, so their class entry is
         // where they really live.
         let mut devnodes: Vec<(&'static str, String, u32, u32)> = Vec::new();
-        for (name, major, minor, _whole) in numbering.devices.iter() {
+        for entry in numbering.devices.iter() {
+            let name = &entry.name;
             let dir = block.add_dir(name, next);
             next += 1;
             devnodes.push((
                 "block",
                 alloc::format!("class/block/{}", name),
-                *major,
-                *minor,
+                entry.major,
+                entry.minor,
             ));
             // The numbers, as `/dev` nodes are made from them.
-            let numbers = alloc::format!("{}:{}\n", major, minor);
+            let numbers = alloc::format!("{}:{}\n", entry.major, entry.minor);
             let numbers: &'static str = Box::leak(numbers.into_boxed_str());
             dir.add(
                 "dev",
@@ -423,11 +424,14 @@ impl SysFs {
                     ino: next,
                     event: Event {
                         action: "add",
-                        devpath: alloc::format!("/devices/virtio/block/{}", name),
+                        // The tree position comes from the disk's own driver,
+                        // so a SATA disk is filed under the SATA controller
+                        // rather than under virtio with the rest.
+                        devpath: alloc::format!("{}/{}", entry.devpath, name),
                         subsystem: "block",
                         devname: name.clone(),
-                        major: *major,
-                        minor: *minor,
+                        major: entry.major,
+                        minor: entry.minor,
                         extra: &[],
                     },
                 }),
@@ -1048,15 +1052,37 @@ impl FileSystem for SysFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uevent::BlockEntry;
 
     fn fs() -> Arc<SysFs> {
         // A machine with a disk, since the host has none: the same shape the
         // kernel sees, so the tree and its attributes are exercised here.
         SysFs::with_devices(Numbering {
             devices: alloc::vec![
-                (String::from("vda"), 254, 0, true),
-                (String::from("vda1"), 254, 1, false),
-                (String::from("vda2"), 254, 2, false),
+                BlockEntry {
+                    name: String::from("vda"),
+                    major: 254,
+                    minor: 0,
+                    whole: true,
+                    devpath: "/devices/virtio/block",
+                    sectors: 20 * 1024 * 1024,
+                },
+                BlockEntry {
+                    name: String::from("vda1"),
+                    major: 254,
+                    minor: 1,
+                    whole: false,
+                    devpath: "/devices/virtio/block",
+                    sectors: 1024,
+                },
+                BlockEntry {
+                    name: String::from("vda2"),
+                    major: 254,
+                    minor: 2,
+                    whole: false,
+                    devpath: "/devices/virtio/block",
+                    sectors: 20 * 1024 * 1024 - 1024,
+                },
             ],
         })
     }
@@ -1120,6 +1146,59 @@ mod tests {
         crate::uevent::close(watcher);
     }
 
+    /// A second disk is numbered under *its own* name, major and tree position.
+    ///
+    /// This is what the numbering being a list of the machine's disks buys, and
+    /// the counterfactual is exact: the devpath used to be derived from the
+    /// name - `/devices/virtio/block/<name>` in three files - so this fixture's
+    /// SATA disk would have been filed under the virtio tree, and a device event
+    /// would have pointed a listener at a bus the disk is not on.
+    #[test]
+    fn a_second_disk_is_numbered_under_its_own_name_and_tree() {
+        let _bus = crate::uevent::test_bus::take();
+        let fs = SysFs::with_devices(Numbering {
+            devices: alloc::vec![
+                BlockEntry {
+                    name: String::from("vda"),
+                    major: 254,
+                    minor: 0,
+                    whole: true,
+                    devpath: "/devices/virtio/block",
+                    sectors: 20_971_520,
+                },
+                BlockEntry {
+                    name: String::from("sda"),
+                    major: 8,
+                    minor: 0,
+                    whole: true,
+                    devpath: "/devices/ahci/block",
+                    sectors: 4_194_304,
+                },
+            ],
+        });
+        let block = block_dir(&fs);
+        let sda = block.lookup("sda").expect("the SATA disk is in the tree");
+
+        // The numbers, which is how userland tells the two disks apart: a
+        // virtio disk is major 254 and a SATA one is major 8.
+        let mut buf = [0u8; 16];
+        let n = sda.lookup("dev").unwrap().read_at(0, &mut buf).unwrap();
+        assert_eq!(core::str::from_utf8(&buf[..n]).unwrap().trim(), "8:0");
+
+        // And the tree position, which is the part a name cannot say.
+        let watcher = crate::uevent::open();
+        crate::uevent::bind(watcher, 0, 1, 0).expect("a fresh socket binds");
+        assert_eq!(
+            sda.lookup("uevent").unwrap().write_at(0, b"add").unwrap(),
+            3
+        );
+        let event = crate::uevent::recv(watcher).expect("the event").bytes;
+        let text = String::from_utf8(event.to_vec()).unwrap();
+        assert!(text.contains("DEVPATH=/devices/ahci/block/sda"), "{text}");
+        assert!(text.contains("DEVNAME=sda"), "{text}");
+        crate::uevent::close(watcher);
+    }
+
     /// One PCI function, with nothing assigned to its BARs.
     fn a_function(bus: u8, dev: u8, func: u8) -> Device {
         Device::fixture(bus, dev, func)
@@ -1143,7 +1222,14 @@ mod tests {
 
         SysFs::with(
             Numbering {
-                devices: alloc::vec![(String::from("vda"), 254, 0, true)],
+                devices: alloc::vec![BlockEntry {
+                    name: String::from("vda"),
+                    major: 254,
+                    minor: 0,
+                    whole: true,
+                    devpath: "/devices/virtio/block",
+                    sectors: 20 * 1024 * 1024,
+                }],
             },
             alloc::vec![disk, bridge, behind],
         )

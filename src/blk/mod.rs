@@ -13,41 +13,91 @@
 
 pub mod part;
 
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use critical_section::Mutex;
 
-/// The disk the kernel booted from, as the block layer sees it. Set once at
-/// boot; everything that needs to name the disk to userland - the devfs
-/// builder above all - asks here rather than keeping its own copy.
-static RAW: Mutex<RefCell<Option<Arc<dyn BlockDev>>>> = Mutex::new(RefCell::new(None));
+/// One disk the kernel has, named the way userland will name it.
+///
+/// Everything here except the device itself is a *name*. The kernel's disks are
+/// told apart by userland through `/dev`, `/proc/partitions` and
+/// `/sys/class/block`, and all three agree on which of them is `vda` because
+/// this record says so once.
+pub struct Disk {
+    /// The name under `/dev`: `vda`, `sda`.
+    pub name: String,
+    /// The major this name is numbered under - Linux's `VIRTIO_BLK_MAJOR` (254)
+    /// for a virtio disk, `SCSI_DISK_MAJOR` (8) for a SATA one. A major is what
+    /// tells two drivers' disks apart, so it is a fact about the *driver* and
+    /// travels with the disk rather than being derived from the name.
+    pub major: u32,
+    /// The device-tree prefix this disk and its partitions hang under:
+    /// `/devices/virtio/block`, `/devices/ahci/block`. Also a fact about the
+    /// driver - a name does not say where its device came from, and a kernel
+    /// that guessed would file a SATA disk under the virtio tree.
+    pub devpath: &'static str,
+    pub dev: Arc<dyn BlockDev>,
+}
 
-/// Record the boot disk. A second call is ignored: the boot disk does not
-/// change, and whichever caller won keeps the name.
-pub fn set_raw_disk(dev: Arc<dyn BlockDev>) {
+/// Every disk the kernel has brought up, in the order it found them. The first
+/// is the boot disk, whose partitions the early userland mounts.
+///
+/// A list rather than one slot because this kernel can have more than one disk:
+/// the paravirtual block device is what the image builder attaches, and a real
+/// SATA controller is what a second driver is for. Nothing above this cares
+/// which came first except the boot path, which asks for the boot disk by name.
+static DISKS: Mutex<RefCell<Vec<Disk>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// Record a disk the kernel has, under the name, number and tree position its
+/// driver gives it. Called once per disk, by the driver that brought it up.
+///
+/// The name is asserted unique because it is what userland *opens*: two disks
+/// answering to `/dev/vda` would be two devices behind one name, which is a
+/// worse failure than a boot that stops.
+pub fn add_disk(name: &str, major: u32, devpath: &'static str, dev: Arc<dyn BlockDev>) {
     critical_section::with(|cs| {
-        let mut raw = RAW.borrow(cs).borrow_mut();
-        if raw.is_none() {
-            *raw = Some(dev);
-        }
+        let mut disks = DISKS.borrow(cs).borrow_mut();
+        assert!(
+            !disks.iter().any(|disk| disk.name == name),
+            "disk {name} was added twice"
+        );
+        disks.push(Disk {
+            name: String::from(name),
+            major,
+            devpath,
+            dev,
+        });
     });
 }
 
-/// The boot disk, if the block layer has one yet. The devfs builder asks
-/// here for the names it publishes as `/dev/vda*`.
-/// How many partitions the boot disk's table holds. The device names
-/// (`/dev/vda1`...), their `/sys` numbering and the uevents that announce
-/// them all count off this.
-pub fn partition_count() -> usize {
-    match raw_disk() {
-        Some(raw) => part::partitions(raw.as_ref()).len(),
-        None => 0,
+/// The disks the kernel has, for the callers that name them to userland: the
+/// devfs builder, `/proc/partitions` and `/sys/class/block`.
+pub fn disks() -> Vec<Disk> {
+    critical_section::with(|cs| DISKS.borrow(cs).borrow().iter().map(clone_disk).collect())
+}
+
+fn clone_disk(disk: &Disk) -> Disk {
+    Disk {
+        name: disk.name.clone(),
+        major: disk.major,
+        devpath: disk.devpath,
+        dev: disk.dev.clone(),
     }
 }
 
+/// The disk the kernel booted from: the first one brought up. The boot path
+/// looking for its data partition asks here rather than keeping its own copy.
 pub fn raw_disk() -> Option<Arc<dyn BlockDev>> {
-    critical_section::with(|cs| RAW.borrow(cs).borrow().clone())
+    critical_section::with(|cs| {
+        DISKS
+            .borrow(cs)
+            .borrow()
+            .first()
+            .map(|disk| disk.dev.clone())
+    })
 }
 
 pub trait BlockDev: Send + Sync {

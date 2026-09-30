@@ -366,15 +366,23 @@ pub fn standard_devfs() -> Arc<DevFs> {
         dri.insert("renderD128", crate::drivers::drm::DrmCard::new(0x9200, 128));
     }
 
-    if let Some(raw) = crate::blk::raw_disk() {
-        dev.register_block("vda", raw.clone());
-        for (index, (start, sectors)) in crate::blk::part::partitions(raw.as_ref())
+    // Every disk the kernel brought up, each under the name its own driver
+    // gave it, with its partitions beside it. The disk itself is a window over
+    // the whole device and each partition is a window over its own slice, so
+    // what userland opens is the same storage either way.
+    for disk in crate::blk::disks() {
+        dev.register_block(&disk.name, disk.dev.clone());
+        for (index, (start, sectors)) in crate::blk::part::partitions(disk.dev.as_ref())
             .into_iter()
             .enumerate()
         {
             dev.register_block(
-                &alloc::format!("vda{}", index + 1),
-                Arc::new(crate::blk::part::Window::new(raw.clone(), start, sectors)),
+                &alloc::format!("{}{}", disk.name, index + 1),
+                Arc::new(crate::blk::part::Window::new(
+                    disk.dev.clone(),
+                    start,
+                    sectors,
+                )),
             );
         }
     }

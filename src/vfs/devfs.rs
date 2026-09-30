@@ -591,7 +591,7 @@ impl DevFs {
                 .insert(String::from(name), node);
             assert!(prev.is_none(), "device {name} registered twice");
         });
-        announce(name, subsystem_of(name), 0, 0);
+        announce(name, subsystem_of(name), "/devices/virtual", 0, 0);
     }
 
     /// Add an empty directory under `name`, for the mountpoints userland
@@ -682,15 +682,10 @@ impl DevFs {
 /// what an initramfs looking for its root does. The bus itself lives with the
 /// network stack's module tree, so on the host (where there is no network
 /// stack and nothing listening) this is a no-op.
-fn announce(name: &str, subsystem: &'static str, major: u32, minor: u32) {
-    let devpath = if subsystem == "block" {
-        alloc::format!("/devices/virtio/block/{}", name)
-    } else {
-        alloc::format!("/devices/virtual/{}", name)
-    };
+fn announce(name: &str, subsystem: &'static str, devpath: &str, major: u32, minor: u32) {
     crate::uevent::publish(&crate::uevent::Event {
         action: "add",
-        devpath,
+        devpath: alloc::format!("{devpath}/{name}"),
         subsystem,
         devname: String::from(name),
         major,
@@ -702,9 +697,15 @@ fn announce(name: &str, subsystem: &'static str, major: u32, minor: u32) {
 /// Announce a block device, with the numbering `/sys` and `/dev` agree on:
 /// a listener matches an event against a device by exactly these numbers.
 fn announce_block(name: &str) {
-    let numbering = crate::uevent::Numbering::of_boot_disk();
+    let numbering = crate::uevent::Numbering::of_this_machine();
     let (major, minor, _whole) = numbering.find(name).unwrap_or((0, 0, false));
-    announce(name, "block", major, minor);
+    // The tree the name hangs under comes from the numbering, which got it from
+    // the disk's own driver: a virtio disk and a SATA disk are the same shape
+    // here and not the same device, and only the driver knows which it is.
+    let devpath = numbering
+        .devpath_of(name)
+        .unwrap_or("/devices/virtual/block");
+    announce(name, "block", devpath, major, minor);
 }
 
 /// The subsystem a device belongs to, by the name it is registered under.

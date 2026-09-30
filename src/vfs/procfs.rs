@@ -1441,11 +1441,14 @@ fn partition_row(name: &str, major: u32, minor: u32, sectors: u64) -> String {
     alloc::format!("{major:4} {minor:4} {:10} {name}\n", sectors / 2)
 }
 
-/// `/proc/partitions`: the boot disk and its partitions, one per line.
+/// `/proc/partitions`: every disk this machine has and its partitions, one per
+/// line.
 ///
-/// The names and numbers come from [`crate::uevent::Numbering`] - the same
-/// numbering `/dev` nodes are minted from and `/sys/class/block/*/dev` prints -
-/// so the three cannot name the same partition differently.
+/// The names, the numbers *and* the sizes come from
+/// [`crate::uevent::Numbering`] - the same table `/dev` nodes are minted from
+/// and `/sys/class/block/*/dev` prints - so the three cannot name the same
+/// partition differently, and this file does not have to go back to the storage
+/// to find out how big anything is.
 ///
 /// Its existence is load-bearing in a way a missing file usually is not.
 /// `fdisk -l` opens it before it does anything else, and an `ENOENT` there
@@ -1454,22 +1457,21 @@ fn partition_row(name: &str, major: u32, minor: u32, sectors: u64) -> String {
 /// hundred bytes into the program's own read-only image, which says nothing at
 /// all about the missing file.
 fn partitions() -> String {
+    partitions_text(&crate::uevent::Numbering::of_this_machine())
+}
+
+/// [`partitions`] over a numbering, so the rendering can be checked without a
+/// machine that has disks: the kernel hands it the table it built from the
+/// disks it really brought up, and a host test hands it one it wrote down.
+fn partitions_text(numbering: &crate::uevent::Numbering) -> String {
     let mut out = String::from("major minor  #blocks  name\n\n");
-    let Some(raw) = crate::blk::raw_disk() else {
-        return out;
-    };
-    let table = crate::blk::part::partitions(raw.as_ref());
-    for (name, major, minor, whole) in crate::uevent::Numbering::of_boot_disk().devices {
-        let sectors = if whole {
-            raw.capacity_sectors()
-        } else {
-            // Partitions take minors 1.. in table order, so the minor is the
-            // index into the table plus one.
-            table
-                .get((minor as usize).saturating_sub(1))
-                .map_or(0, |(_, sectors)| *sectors)
-        };
-        out.push_str(&partition_row(&name, major, minor, sectors));
+    for entry in numbering.devices.iter() {
+        out.push_str(&partition_row(
+            &entry.name,
+            entry.major,
+            entry.minor,
+            entry.sectors,
+        ));
     }
     out
 }
@@ -2072,6 +2074,59 @@ mod tests {
             partition_row("vda3", 254, 3, 131_072 * 2),
             " 254    3     131072 vda3\n"
         );
+    }
+
+    /// Every disk this machine has, each under its own major and with its own
+    /// size - and the size comes out of the table rather than being read back
+    /// from the storage, which is what makes `/proc/partitions`, `/dev` and
+    /// `/sys/class/block` three renderings of one table instead of three
+    /// readers of a disk.
+    ///
+    /// The counterfactual is the second disk: while the numbering was "the
+    /// boot disk and its partitions" there was one size in this file, and a
+    /// renderer that used it for everything would show the SATA disk as the
+    /// size of the virtio one.
+    #[test]
+    fn partitions_lists_every_disk_the_machine_has() {
+        use crate::uevent::BlockEntry;
+        let numbering = crate::uevent::Numbering {
+            devices: alloc::vec![
+                BlockEntry {
+                    name: String::from("vda"),
+                    major: 254,
+                    minor: 0,
+                    whole: true,
+                    devpath: "/devices/virtio/block",
+                    sectors: 20_971_520,
+                },
+                BlockEntry {
+                    name: String::from("vda1"),
+                    major: 254,
+                    minor: 1,
+                    whole: false,
+                    devpath: "/devices/virtio/block",
+                    sectors: 262_144,
+                },
+                BlockEntry {
+                    name: String::from("sda"),
+                    major: 8,
+                    minor: 0,
+                    whole: true,
+                    devpath: "/devices/ahci/block",
+                    sectors: 4_194_304,
+                },
+            ],
+        };
+        let text = partitions_text(&numbering);
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), "major minor  #blocks  name");
+        assert_eq!(lines.next().unwrap(), "");
+        assert!(text.contains(" 10485760 vda\n"), "{text}");
+        assert!(text.contains(" 131072 vda1\n"), "{text}");
+        assert!(text.contains(" 2097152 sda\n"), "{text}");
+        // Each name under the major its own driver gave it, which is how a
+        // program tells the two disks apart without asking either driver.
+        assert!(text.contains("   8    0 "), "{text}");
     }
 
     /// A machine with no block device still gets the header and its blank

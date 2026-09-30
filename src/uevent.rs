@@ -613,29 +613,74 @@ pub fn publish(event: &Event) {
 /// nodes are made from it, and a listener matching an event against a device
 /// compares it. One function computes it, so the three cannot disagree.
 pub struct Numbering {
-    /// (name under /dev, major, minor, whether it is a whole disk)
-    pub devices: Vec<(String, u32, u32, bool)>,
+    pub devices: Vec<BlockEntry>,
+}
+
+/// One name in that numbering, with everything its three readers need.
+///
+/// This used to be a tuple of a name and two numbers, and each reader derived
+/// the rest for itself - which is how `/devices/virtio/block/<name>` came to be
+/// spelled out in three files, and why the third of them would have had to
+/// guess what a `sda` hangs under. A name does not say which driver a disk came
+/// from, so the tree position travels with the disk
+/// ([`crate::blk::Disk::devpath`]) and is carried here rather than derived.
+pub struct BlockEntry {
+    /// The name under `/dev`, and the `DEVNAME` a listener matches on.
+    pub name: String,
+    pub major: u32,
+    pub minor: u32,
+    /// Whether this name is a whole disk rather than a partition of one. The
+    /// two are numbered the same way and read differently: only a partition's
+    /// minor is an index into a partition table.
+    pub whole: bool,
+    /// The device-tree prefix the name hangs under, without the name:
+    /// `/devices/virtio/block`.
+    pub devpath: &'static str,
+    /// What the name refers to, in 512-byte sectors - the `#blocks` column
+    /// `/proc/partitions` prints, and the one thing about a block device that
+    /// is neither a name nor a number but is read by a program that opens this
+    /// file to decide what to mount.
+    pub sectors: u64,
 }
 
 /// Major used for virtio block devices, as Linux assigns it.
 pub const VIRTIO_BLK_MAJOR: u32 = 254;
 
 impl Numbering {
-    /// The numbering of the disk the kernel booted from and its partitions.
-    pub fn of_boot_disk() -> Numbering {
+    /// The numbering of every disk this machine has, and of their partitions.
+    ///
+    /// Built from [`crate::blk::disks`], so a disk enters userland's namespace
+    /// by being brought up rather than by being the one the kernel booted from.
+    pub fn of_this_machine() -> Numbering {
         let mut devices = Vec::new();
-        let count = crate::blk::partition_count();
-        if count > 0 {
-            devices.push((String::from("vda"), VIRTIO_BLK_MAJOR, 0, true));
-            for index in 0..count {
+        for disk in crate::blk::disks() {
+            let table = crate::blk::part::partitions(disk.dev.as_ref());
+            // A disk nobody has partitioned is still a disk a program may want
+            // to look at - this gate is the old single-disk rule kept as it was
+            // (see §7.3: it is the first thing the second disk driver has to
+            // decide about), and it is per disk rather than per machine.
+            if table.is_empty() {
+                continue;
+            }
+            devices.push(BlockEntry {
+                name: disk.name.clone(),
+                major: disk.major,
+                minor: 0,
+                whole: true,
+                devpath: disk.devpath,
+                sectors: disk.dev.capacity_sectors(),
+            });
+            for (index, (_, sectors)) in table.into_iter().enumerate() {
                 // The partition minors come from the table order, which is
-                // what `/sys` reports and what mkinitfs's vda* names mean.
-                devices.push((
-                    alloc::format!("vda{}", index + 1),
-                    VIRTIO_BLK_MAJOR,
-                    (index + 1) as u32,
-                    false,
-                ));
+                // what `/sys` reports and what mkinitfs's `vda*` names mean.
+                devices.push(BlockEntry {
+                    name: alloc::format!("{}{}", disk.name, index + 1),
+                    major: disk.major,
+                    minor: (index + 1) as u32,
+                    whole: false,
+                    devpath: disk.devpath,
+                    sectors,
+                });
             }
         }
         Numbering { devices }
@@ -645,8 +690,17 @@ impl Numbering {
     pub fn find(&self, name: &str) -> Option<(u32, u32, bool)> {
         self.devices
             .iter()
-            .find(|(n, _, _, _)| n == name)
-            .map(|(_, major, minor, whole)| (*major, *minor, *whole))
+            .find(|entry| entry.name == name)
+            .map(|entry| (entry.major, entry.minor, entry.whole))
+    }
+
+    /// The device-tree prefix a name hangs under, for the devpath a device
+    /// event about it carries.
+    pub fn devpath_of(&self, name: &str) -> Option<&'static str> {
+        self.devices
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.devpath)
     }
 }
 

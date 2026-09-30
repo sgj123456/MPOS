@@ -373,7 +373,17 @@ fn init_blk() {
         sectors,
         sectors * 512 / MIB as u64
     );
-    blk::set_raw_disk(dev.clone());
+    // The name, the major and the tree position are the *driver's* facts, said
+    // once where the driver is brought up: a virtio disk is `vda` under major
+    // 254 in the virtio tree, and a SATA disk is `sda` under major 8 in the
+    // SATA one. Everything that names a disk to userland reads them from here
+    // rather than deciding for itself (`uevent::Numbering`).
+    blk::add_disk(
+        "vda",
+        mpos::uevent::VIRTIO_BLK_MAJOR,
+        "/devices/virtio/block",
+        dev.clone(),
+    );
 
     // The data partition is a second disk filesystem - ext2 or ext4, whichever
     // the image builder made; the same driver reads both - and it is the only thing
