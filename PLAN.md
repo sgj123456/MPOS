@@ -3245,7 +3245,7 @@ publishes four of them, in `src/drivers/drm.rs`, each one true:
 | `non-desktop` | connector | immutable range 0..1, value 0 | this is a panel, not a headset |
 | `max bpc` | connector | range 8..8, value 8 | the scanout is eight bits per channel; a range of one value means a write of 16 is `EINVAL` rather than a success that changes no pixels |
 | `vrr_capable` | connector | immutable range 0..1, value 0 | the refresh rate cannot vary, and saying so is what stops a compositor asking |
-| `IN_FORMATS` | plane | immutable blob | one linear modifier over all four formats `GETPLANE` reports and `ADDFB2` accepts - one array feeds all three, so they cannot drift |
+| `IN_FORMATS` | plane | immutable blob | one linear modifier over the two formats `GETPLANE` reports and `ADDFB2` accepts - one array feeds all three, so they cannot drift |
 
 The connector's `mm_width`/`mm_height` now come from the EDID's own centimetre
 fields times ten (the relation the measurement found: 30 cm and 19 cm reported
@@ -3260,6 +3260,35 @@ the other direction, and the reason the two are pinned together. A cap answered
 cannot bind. `DRM_CAP_ASYNC_PAGE_FLIP` is answered 0 and *named* in the match
 rather than left to the catch-all: tearing flips are not missing here, they are
 a presentation mode this card does not have.
+
+**And the format list itself was wrong in two ways at once, both found by
+arithmetic against `<drm_fourcc.h>`.** `fourcc_code` packs the four named
+characters low byte first, so the card's `DRM_FORMAT_ARGB8888` - `0x3432_4152` -
+decodes to "RA24", which is `DRM_FORMAT_RGBA8888`; the real `ARGB8888` is
+`0x3432_5241`. `DRM_FORMAT_ABGR8888` had the same slip, `0x3432_4142` being
+"BA24" (`BGRA8888`) rather than "AB24". So `ADDFB2` was accepting two formats it
+never named and **refusing the one it did** - and since a cursor buffer is
+`ARGB8888` by definition, that is why the cursor plane below could not have bound
+one.
+
+Correcting the names exposed the second problem. `XRGB8888` ("XR24") and
+`XBGR8888` ("XB24") are the *same* 32-bit word read the other way round in
+memory: B,G,R,X against R,G,B,X. Presentation here is a verbatim row copy into a
+BGRA block and nothing in the path swaps channels the way a real plane's scaler
+does, so a card accepting both would show one of them with red and blue
+exchanged - silently, at full frame rate. The accepted set is therefore narrowed
+to the two spellings whose bytes are the order the scanout actually holds,
+`XRGB8888` and `ARGB8888`, and the other two are refused rather than accepted
+into wrong pixels. `GETPLANE`, `IN_FORMATS` and `ADDFB2` all read the one
+`PLANE_FORMATS` array, so all three moved together.
+
+The byte order is measured, not assumed, and the instrument is this repository's
+own: `vfs::term::blit`'s `put` writes a pixel as blue, green, red, 0, and that
+console has been showing correct colours since it was written. It agrees with
+`drivers::virtio::gpu`'s module comment ("BGRA, row-major") and with
+`B8G8R8A8_UNORM` being virtio-gpu's default scanout format. A real card lists
+`RA24` as well, because real hardware converts; this one does not, and now says
+so instead of pretending.
 
 `GAMMA_LUT`/`GAMMA_LUT_SIZE`, `VRR_ENABLED`, `panel orientation`,
 `subconnector`, `FB_DAMAGE_CLIPS` and `OUT_FENCE_PTR` are **absent**, and each

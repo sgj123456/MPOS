@@ -129,14 +129,9 @@ const BPC_HERE: u64 = 8;
 /// The formats the one plane scans out, in the order `GETPLANE` reports them -
 /// which is the order the `IN_FORMATS` bitmask indexes, so the plane's list and
 /// the blob are built from this one array and cannot drift apart. `ADDFB2`
-/// accepts exactly these four, which is the third place the same set has to
+/// accepts exactly these two, which is the third place the same set has to
 /// agree.
-const PLANE_FORMATS: [u32; 4] = [
-    DRM_FORMAT_XRGB8888,
-    DRM_FORMAT_ARGB8888,
-    DRM_FORMAT_XBGR8888,
-    DRM_FORMAT_ABGR8888,
-];
+const PLANE_FORMATS: [u32; 2] = [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
 /// `DRM_MODE_CONNECTOR_VIRTUAL` / `DRM_MODE_ENCODER_VIRTUAL`.
 const CONNECTOR_TYPE: u32 = 15;
 const ENCODER_TYPE: u32 = 5;
@@ -363,13 +358,33 @@ const PAGE_FLIP_EVENT: u32 = 0x1;
 /// and no attacker can use to fill the kernel's heap through one ioctl.
 const MAX_BLOB: usize = 1 << 20;
 
-/// The 32-bit fourccs `ADDFB2` accepts - every BGRA-order spelling of a
-/// 32-bit pixel this scanout can show. `fourcc_code('X','R','2','4')` and
-/// friends, little-endian.
+/// The 32-bit fourccs `ADDFB2` accepts: the two spellings whose *bytes* are in
+/// the order this scanout holds - blue, green, red, then an unused or alpha byte.
+///
+/// `fourcc_code` packs the four named characters low byte first, so
+/// `DRM_FORMAT_ARGB8888` is `0x3432_5241` ("AR24") and its bytes in memory are
+/// B, G, R, A - the same order as `XRGB8888`, which differs only in what the
+/// fourth byte means. `DRM_FORMAT_XBGR8888` ("XB24") is that 32-bit word read the
+/// other way round in memory, bytes R, G, B, X, and `ABGR8888` with it.
+///
+/// Those two are therefore *refused*, which is a narrower list than this card
+/// used to publish. Presentation here is a verbatim row copy into a BGRA block
+/// (`drivers::virtio::gpu`) and nothing in the path can swap channels the way a
+/// real plane's scaler does, so accepting them would put a client's red where
+/// its blue belongs, silently and at full frame rate. `IN_FORMATS` is the same
+/// statement in the other direction, and `t-drm-props` pins that the two agree.
+///
+/// The byte order is measured rather than assumed: `vfs::term::blit`'s `put`
+/// writes a pixel as blue, green, red, 0, and that is the console this machine
+/// has been showing correctly since it was written.
+///
+/// Both constants also had to be *corrected* rather than merely narrowed. The
+/// pair here used to be `0x3432_4152` and `0x3432_4142`, which decode to "RA24"
+/// (`RGBA8888`) and "BA24" (`BGRA8888`) - so `ADDFB2` was accepting two formats
+/// it never named and refusing the one it did, which is how the cursor plane's
+/// buffer format came to be un-bindable.
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
-const DRM_FORMAT_ARGB8888: u32 = 0x3432_4152;
-const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
-const DRM_FORMAT_ABGR8888: u32 = 0x3432_4142;
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 /// `DRM_MODE_FB_MODIFIERS`: the bit in `struct drm_mode_fb_cmd2.flags` that says
 /// the `modifier[]` array is meaningful. Named at module scope because both
 /// directions read it - `ADDFB2` refuses a modifier that arrives without it, and
@@ -3083,8 +3098,8 @@ fn add_fb2(arg: usize) -> isize {
         0
     };
     let (bpp, depth) = match format {
-        DRM_FORMAT_XRGB8888 | DRM_FORMAT_XBGR8888 => (32, 24),
-        DRM_FORMAT_ARGB8888 | DRM_FORMAT_ABGR8888 => (32, 32),
+        DRM_FORMAT_XRGB8888 => (32, 24),
+        DRM_FORMAT_ARGB8888 => (32, 32),
         _ => return libc_einval(),
     };
     let id = critical_section::with(|cs| {

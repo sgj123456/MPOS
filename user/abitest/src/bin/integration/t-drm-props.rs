@@ -443,14 +443,20 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let format_count = get32(&plane, 20) as usize;
     lin::check_eq(
         &mut failed,
-        b"four formats, which is what ADDFB2 accepts",
+        b"two formats: the two byte orders this scanout can actually show",
         format_count as isize,
-        4,
+        2,
     );
     lin::check_true(
         &mut failed,
         b"and the first is XRGB8888",
         formats[0] == FORMAT_XRGB8888,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and the second is ARGB8888, the layout a cursor buffer is in",
+        formats[1] as isize,
+        0x3432_5241,
     );
 
     match property_id(fd, PLANE_ID, OBJECT_PLANE, b"IN_FORMATS") {
@@ -486,7 +492,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
                 get32(&bytes, 16) as isize,
                 1,
             );
-            // 24 + 4 * n, rounded up to eight - which for four formats is 40.
+            // 24 + 4 * n, rounded up to eight - which for two formats is 32.
             let modifiers = get32(&bytes, 20) as usize;
             lin::check_eq(
                 &mut failed,
