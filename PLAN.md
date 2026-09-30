@@ -97,14 +97,20 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
       what kept a fresh compositor out of the seat after a `kill`, and what
       could leave a pipeline reader waiting for an end-of-file that never came.
       Only the slot and the exit code stay now, which is all a zombie is.
-- [ ] 6.3 Namespaces — **design decided, nothing built** (§6.3). Four of the
-      eight have something observable to isolate and are ordered UTS → MNT →
-      PID → NET, each with its own `t-ns-*` pin that holds the child's view
-      differ *and the parent's not*; USER, IPC, CGROUP and TIME keep refusing,
-      because a namespace with nothing behind it isolates nothing. `unshare`/
-      `setns` still answer `EOPNOTSUPP`, now with Linux's real flag numbers (a
-      mount-namespace request had been answered `EINVAL`, because `CLONE_NEWNS`
-      was spelled with `CLONE_THREAD`'s value)
+- [~] 6.3 Namespaces — **UTS is built** (§6.3); MNT, PID and NET are designed
+      and not built. Eight kinds, four of them with something observable to
+      isolate, ordered UTS → MNT → PID → NET, each with its own `t-ns-*` pin that
+      holds the child's view differ *and the parent's not* — `t-ns-uts` is the
+      first of them. `unshare(CLONE_NEWUTS)` hands the caller a **copy** of its
+      two names, and `sethostname`/`setdomainname`/`uname`/
+      `/proc/sys/kernel/{hostname,domainname}` all read the caller's; the other
+      seven answer `EOPNOTSUPP`, and `setns` still answers `EINVAL`/`EBADF`
+      because no namespace can be named by a descriptor here (`/proc/<pid>/ns/*`
+      does not exist). USER, IPC, CGROUP and TIME keep refusing, because a
+      namespace with nothing behind it isolates nothing. The flag table is
+      Linux's, which it was not before this work (a mount-namespace request had
+      been answered `EINVAL`, because `CLONE_NEWNS` was spelled with
+      `CLONE_THREAD`'s value)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (anon shared buffers, §7/Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
@@ -729,16 +735,18 @@ things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
    and the only one that changed the mm fault path for everything. Landed: a
    `mmap` is an address space, a page arrives on the fault that needs it, and
    `MADV_DONTNEED` gives it back again (`t-mmap-demand`).
-2. **namespaces** (§6.3) - **the decisions are made and written down, and that
-   was the item**: which of the eight kinds this kernel can isolate
-   *observably*, in what order they are worth building (UTS → MNT → PID → NET),
-   what each must isolate through every door a program can read it by, and
-   which four keep refusing because there is nothing behind them to isolate
-   (USER, IPC, CGROUP, TIME). The build order and the per-namespace `t-ns-*`
-   pins are §6.3's; the first step (UTS: a per-task pair of names, inherited by
-   `fork` and *copied* by `unshare`) is small and needs nothing else to be true.
-   The pass that wrote the record also found the call's flag table two flags
-   off (§6.3's closing table), which is fixed and pinned.
+2. **namespaces** (§6.3) - **step 1 is built: UTS.** A task holds an `Arc` to the
+   two names `uname` reports; `fork`/`clone` hand it on by reference and
+   `unshare(CLONE_NEWUTS)` hands the caller a copy, so a `sethostname` inside is
+   invisible outside - held by `t-ns-uts` on both sides, and by four host tests
+   over the flag verdict. The section's own record now carries what the step
+   cost, the two measurements behind the capability gate, and four named gaps
+   (`clone(CLONE_NEWUTS)`; the six thread-group flags for a caller that has
+   siblings; `setns`, which still cannot name a namespace; the sysctl files,
+   which procfs does not mode-police). **MNT is next** and is the one containers
+   actually need; its prerequisite is the interesting part - a per-process root,
+   which is a divergence worth fixing on its own, since `chroot` here moves the
+   whole machine's.
    `seccomp` FILTER's plumbing - the per-task list, the two install paths and
    the gate - has landed, was then measured action by action against Linux
    (four of its answers were wrong), and is pinned by `t-seccomp`. What is left
@@ -790,7 +798,7 @@ things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
 - **Scheduler**: 4-level priority + round-robin, COW fork, demand-paged stack
 - **Network latency**: event-driven socket waits + virtio-net MSI-X interrupts;
   loopback `ping 127.0.0.1` 7.5 ms → 0.3 ms (10.1 done)
-- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.1 / 4.2 / 4.4 / 5.1 done; 4.3 / 5.2 partial; 6.3 design decided (nothing built); 7.1 / 7.2 answered (Wayland-compositor support: see the TODO Board).
+- **Phases 1–3 complete**; 5.3 / 6.1 / 6.2 / 6.4 done; 4.1 / 4.2 / 4.4 / 5.1 done; 4.3 / 5.2 partial; 6.3 UTS built, MNT/PID/NET designed; 7.1 / 7.2 answered (Wayland-compositor support: see the TODO Board).
 
 ### Remaining ABI support (gaps + services)
 
@@ -904,11 +912,16 @@ scans for one.
   in §5.2 - `MADV_FREE` has no pressure model to honour, and a shared mapping's
   pages are dropped for the caller's mapping rather than for the object, which
   needs a reverse map of mappings this kernel does not keep.
-- **6.3** namespaces: `unshare`/`setns` validate the flags (now with Linux's
-  real numbers) but return `EOPNOTSUPP`; no real mount/pid/net namespace
-  isolation. The build order and what each kind must observably isolate are
-  decided and written down in §6.3 - UTS, MNT, PID, NET in that order, and
-  USER/IPC/CGROUP/TIME refused until the thing they would isolate exists.
+- **6.3** namespaces: **UTS is served.** `unshare(CLONE_NEWUTS)` hands the caller
+  a copy of its two names, and `sethostname`/`setdomainname`/`uname`/
+  `/proc/sys/kernel/{hostname,domainname}` all read the caller's namespace -
+  `t-ns-uts` holds both halves of that, the child's view differing *and* the
+  parent's not. The other seven kinds and `setns` still refuse, now with Linux's
+  real flag numbers and with the served/unserved distinction decided before
+  anything is unshared. There is no mount, pid or net isolation. The build order
+  - MNT, PID, NET next, each with its own `t-ns-*` - and what each kind must
+  observably isolate are §6.3's, which now also carries what step 1 cost and the
+  four gaps it left named.
 - **Terminal size, and the "only the first few dozen lines" report.** A
   full-screen program lays itself out in the window `TIOCGWINSZ` names, so the
   answer is the display, not a default. Measured on Linux: a *fresh* pty pair
@@ -1865,16 +1878,18 @@ rather than returning constants:
   as the stack floor (SIGSEGV beyond it; capped at the reserved region for a
   raised/infinite one).
 
-### 6.3 Namespace Support — **DECISIONS MADE, NOTHING BUILT**
+### 6.3 Namespace Support — **UTS BUILT; THE OTHER THREE DESIGNED**
 
 Two calls (`unshare`, `setns`), eight kinds of namespace, and one of each kind
-today. Nothing here is implemented, and this section is the *decision record*
-rather than a to-do list, because the decisions are what §6.3 kept being
-deferred for: which of the eight this kernel can isolate observably, in what
-order they are worth building, and what each one costs the layers that would
-have to grow a per-namespace answer. The code is unchanged, and `unshare` /
-`setns` answer as they did - which is not a placeholder but the honest answer for
-a machine with one of each.
+until this pass. Most of this section is still the *decision record* rather than
+a to-do list, because the decisions are what §6.3 kept being deferred for: which
+of the eight this kernel can isolate observably, in what order they are worth
+building, and what each one costs the layers that would have to grow a
+per-namespace answer. **The first of the four decisions has since been built** -
+`CLONE_NEWUTS`, in `src/uts.rs` and the `Task` field that holds it - so the
+table below reads "build first" as done and the rest as designed. "Step 1,
+landed", at the end of this section, is what the step actually cost, what it
+measured, and what it deliberately did not do.
 
 **The rule that decides the list is §4's rule 4** - refuse rather than
 approximate. A namespace that isolates nothing is not a namespace, it is a
@@ -1887,7 +1902,7 @@ the build list.
 
 | flag | what it must observably isolate | verdict |
 |---|---|---|
-| `CLONE_NEWUTS` | `uname`'s `nodename`/`domainname`: `sethostname` in one namespace must not be visible in another, through **all three** doors | **build first** |
+| `CLONE_NEWUTS` | `uname`'s `nodename`/`domainname`: `sethostname` in one namespace must not be visible in another, through **all three** doors | **built** - "Step 1, landed" below |
 | `CLONE_NEWNS` | the mount table *and the root*: a `mount` in one namespace invisible in another, and `chroot`/`pivot_root` giving a container its own `/` | **build second** |
 | `CLONE_NEWPID` | the numbers a process *sees*: a child of the new namespace is pid 1 to itself, and `/proc` is numbered per reader | **build third - the expensive one** |
 | `CLONE_NEWNET` | interfaces, addresses, routes and the socket table: a socket bound in one namespace is not reachable from another | **build fourth** |
@@ -1987,7 +2002,7 @@ fails:
 
 | program | the unshared side | the parent's side |
 |---|---|---|
-| `t-ns-uts` | `sethostname("inside")`, then `uname`'s `nodename` reads `inside` | `uname` still reads the old name, and `/proc/sys/kernel/hostname` agrees |
+| `t-ns-uts` | a child that unshares reports `inside`/`inside.test` through `uname` **and** both sysctls, and a task that unshares keeps the names it had | the parent that did not unshare still reports the old names, its own three doors still agree, and a child forked *before* a refused mixed word keeps sharing the parent's namespace |
 | `t-ns-mnt` | `mount` a tmpfs at a directory, then read it back | the parent's `/proc/mounts` does not carry it, and the directory is empty there |
 | `t-ns-pid` | the first child is pid 1 to itself (`getpid`), and `/proc/1` names it | the real number is unchanged, and `/proc/<that number>` still names it |
 | `t-ns-net` | a socket bound to a port is reachable from inside | the same port is free in the parent's namespace, and a connect to it is refused |
@@ -2009,6 +2024,86 @@ already useful and the wire is a separate question. USER, IPC, CGROUP and TIME
 stay refused, each with the reason in the table above, and each is worth
 revisiting only when the thing it would isolate exists (§8.2's seccomp and §7.4's
 compositor work are both more urgent).
+
+**Step 1, landed: UTS.** The shape the paragraph above predicted was the shape it
+took, which is worth recording because it is the claim this section was written
+to test: a `Uts` object holding the two names (`src/uts.rs`, not target-gated,
+so the copy rule is host-tested), a `Task::uts: Arc<Uts>` field, `fork`/`clone`/
+`spawn_thread`/`try_spawn_user` inheriting the `Arc` by reference, and
+`unshare(CLONE_NEWUTS)` replacing the caller's with `Uts::copied()` - Linux's
+`copy_utsname`, so the new namespace *starts* from the old one's names and only
+then diverges.
+
+**The three doors were the whole of the cost, and one of them was already
+broken.** `sethostname`/`setdomainname` wrote a pair of process-wide `String`s
+in `vfs::procfs`; `uname`'s `nodename` read them; and `/proc/sys/kernel/hostname`
+read them. Making the home *the caller's* was the edit. What the edit found is
+that the domain half of the pair had never been wired: `uname` reported the
+literal `(none)` and `/proc/sys/kernel/domainname` hardcoded the same string on
+its read *and dropped every write*, so `setdomainname(2)` had no observable
+effect through any door at all. Both now read the caller's namespace, which is
+what makes the three agree about *which* namespace they are answering for - the
+property `t-ns-uts` holds with one `Doors::agree()`.
+
+**The capability gate is on all four doors, measured rather than recalled.**
+Run as a non-root caller on this host's kernel (7.2.7): `sethostname(NULL, 100)`,
+`sethostname(name, -1)` and `sethostname(name, 65)` all answer **`EPERM`** - so
+the `CAP_SYS_ADMIN` check comes *before* the length check and before the pointer
+check, not beside them - and the same holds for `setdomainname`, for
+`unshare(CLONE_NEWUTS)` and for every `CLONE_NEW*` bit. The kernel's test for the
+capability is the effective-uid one the entropy ioctls already use. The sysctl
+files get their own gate for a different reason: on Linux the *file's mode*
+(0644) is what refuses a non-root writer, and procfs here keeps no per-node
+modes, so the capability is checked in the write policy and answers `EACCES` -
+the errno Linux's own door gives. That the mode is not really there to check is a
+named divergence below.
+
+Two measurements decided the flag word's shape, and both are Linux's:
+
+| as a non-root caller | Linux 7.2.7 | this kernel |
+|---|---|---|
+| `unshare(CLONE_NEWUTS)` | `EPERM` | `EPERM` |
+| `unshare(CLONE_NEWUTS\|CLONE_NEWNS)` | `EPERM` | `EOPNOTSUPP`, **nothing unshared** |
+| `unshare(CLONE_NEWNS)` | `EPERM` | `EOPNOTSUPP` |
+| `unshare(CLONE_NEWUTS\|0x1000)` | `EINVAL` | `EINVAL` |
+| `unshare(CLONE_THREAD)` | `0` | `0` |
+
+The two rows that are not Linux's are the deliberate ones: a namespace this
+kernel does not *serve* is `EOPNOTSUPP` rather than `EPERM`, because `EPERM`
+would send the caller looking for a capability that does not help; and the
+unserved bit is decided before any grant, so a mixed word unshares nothing.
+Linux's `ksys_unshare` does not work that way - it walks the word and a later
+failure leaves an earlier unshare done - and the atomicity is what `t-ns-uts`'s
+witness child pins: it is forked *before* the refused call, so a rename the
+parent makes afterwards is a rename it sees only if the two are still one
+namespace. The whole verdict is a pure function over the word and the caller's
+privilege (`abi::unshare_verdict`), which is where the four host tests argue with
+it.
+
+**Named gaps, each with what it waits on.**
+
+* **`clone(CLONE_NEWUTS)`** - the *child* getting the copy - is still `EINVAL`:
+  `validate_clone_flags` refuses namespace bits wholesale, and it says so. Serving
+  it is a separate decision (where in `copy_process`'s order the copy happens,
+  and what `CLONE_NEWUTS|CLONE_THREAD` means for a group that shares an address
+  space) and it wants its own measurement, so the `EINVAL` stands as "this call
+  cannot do that here" rather than as a half-built grant.
+* **The six thread-group flags still answer `0` for a caller that has siblings.**
+  Linux refuses with `EINVAL` there, because the descriptor table or the handler
+  table really is shared. This kernel answers `0` for every caller, which is
+  Linux's answer only for a single-threaded one - and since threads exist now
+  (`t-clone`), the old comment's premise ("a process is its own only thread") is
+  no longer universally true. Splitting a resource off from one's siblings is
+  what is not modelled.
+* **`setns` still cannot name a namespace**, and that is now the interesting
+  half: `/proc/<pid>/ns/<kind>` does not exist, so there is no descriptor for the
+  call to check a type against, and it answers `EINVAL`/`EBADF` - all it can
+  learn. The design above (each namespace object an inode whose open descriptor
+  *is* the namespace) is unchanged and still the plan for the second step.
+* **`/proc/sys/kernel/{hostname,domainname}` are not mode-policed.** procfs keeps
+  no per-node modes, so the capability check in the write policy is what refuses
+  a non-root writer, and it answers `EACCES` - the right errno by the right
+  argument for the wrong mechanism.
 
 **And the flag table under all of this was wrong until this pass.** A caller does
 not send a flag *name*; it sends the number `unshare(2)` documents, and this read
@@ -2038,6 +2133,10 @@ the six thread-group flags are a genuine no-op here (a process is its own only
 thread and already owns all six - the answer is the truth, not a courtesy); and
 `EINVAL` is decided before the namespace refusal, which is Linux's order. All of
 it is pinned by `t-posix`.
+
+`CLONE_NEWUTS` no longer answers `EOPNOTSUPP` - it is the one namespace this
+kernel serves, and the row above is the measurement the *unserved* seven still
+give ("Step 1, landed" earlier in this section).
 
 ### 6.4 Additional Process Syscalls — **DONE**
 

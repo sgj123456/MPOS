@@ -1299,68 +1299,43 @@ fn partitions() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The name of this machine.
+// The name of this machine, as the caller's namespace spells it.
 // ---------------------------------------------------------------------------
 
-/// The system's hostname, as `sethostname` last set it and as
-/// `/proc/sys/kernel/hostname` reports it.
+/// The name the *caller's* namespace calls itself - `uname(2)`'s `nodename`,
+/// `hostname(1)`'s answer, and the contents of `/proc/sys/kernel/hostname`.
 ///
-/// It starts as the kernel's own name rather than empty, because the first
-/// thing an init prints is usually a banner with the hostname in it and an
-/// empty name there reads as a failure to look one up.
-static HOSTNAME: Mutex<RefCell<String>> = Mutex::new(RefCell::new(String::new()));
-
-/// The name this machine calls itself.
+/// The pair of names used to be kept here as one process-wide value, which was
+/// "one fact, one home" only for as long as there was one UTS namespace - and
+/// there is more than one the moment a program calls
+/// `unshare(CLONE_NEWUTS)`. They live in `crate::uts` now, one object per
+/// namespace, and these four functions ask the *running task* which one it is
+/// in. That is what makes the door that writes the file and the door that reads
+/// it talk about the same namespace, which is the whole of what
+/// `/proc/sys/kernel/hostname` means.
 pub fn hostname() -> String {
-    critical_section::with(|cs| {
-        let name = HOSTNAME.borrow(cs).borrow();
-        if name.is_empty() {
-            String::from(DEFAULT_HOSTNAME)
-        } else {
-            name.clone()
-        }
-    })
+    crate::sched::current_uts().nodename()
 }
 
-/// Give the machine a name. `sethostname(2)` spells it through here, and so
-/// does a write to `/proc/sys/kernel/hostname` - one fact, two doors, which
-/// is why the name is kept here rather than in either caller.
+/// Give the caller's namespace a name. `sethostname(2)` spells it through here,
+/// and so does a write to `/proc/sys/kernel/hostname` - one fact, two doors, one
+/// namespace behind both.
 pub fn set_hostname(name: &str) {
-    critical_section::with(|cs| {
-        *HOSTNAME.borrow(cs).borrow_mut() = String::from(name);
-    });
+    crate::sched::current_uts().set_nodename(name);
 }
 
-/// The name before anyone sets one.
-const DEFAULT_HOSTNAME: &str = "mpos";
-
-/// The name this machine's network domain is, set through `setdomainname(2)`.
-/// As with the hostname: one fact, one home, so a call that sets it and a
-/// reader that reports it cannot disagree. The default is `(none)`, which is
-/// what Linux's own `uname` reports for a machine nobody named.
-static DOMAINNAME: Mutex<RefCell<String>> = Mutex::new(RefCell::new(String::new()));
-
-/// The domain this machine belongs to, `(none)` until somebody names it.
+/// The domain the caller's namespace belongs to: `(none)` until somebody names
+/// it, which is what Linux reports for a machine nobody named. Read by
+/// `uname(2)` and by `/proc/sys/kernel/domainname`.
 pub fn domainname() -> String {
-    critical_section::with(|cs| {
-        let name = DOMAINNAME.borrow(cs).borrow();
-        if name.is_empty() {
-            String::from(DEFAULT_DOMAINNAME)
-        } else {
-            name.clone()
-        }
-    })
+    crate::sched::current_uts().domainname()
 }
 
-/// Name the domain. `setdomainname(2)` lands here.
+/// Name the caller's namespace's domain. `setdomainname(2)` lands here, and so
+/// does a write to `/proc/sys/kernel/domainname`.
 pub fn set_domainname(name: &str) {
-    critical_section::with(|cs| {
-        *DOMAINNAME.borrow(cs).borrow_mut() = String::from(name);
-    });
+    crate::sched::current_uts().set_domainname(name);
 }
-
-/// The domain before anyone sets one.
-const DEFAULT_DOMAINNAME: &str = "(none)";
 
 /// The filesystem itself.
 pub struct ProcFs {
@@ -1551,6 +1526,17 @@ impl ProcFs {
             ctl(
                 || alloc::format!("{}\n", hostname()),
                 |name| {
+                    // On Linux this write is gated by the file's own mode
+                    // (`/proc/sys/kernel/*` is 0644), and procfs here keeps no
+                    // per-node modes to enforce - so the capability the adjacent
+                    // syscall checks is checked here too, and a non-root writer
+                    // is refused by the door as well as by `sethostname(2)`.
+                    // `EACCES` is Linux's answer for this door, and it is what
+                    // `VfsError::Access` carries. `current_owner` is the
+                    // effective id, which is the one a capability is about.
+                    if crate::sched::current_owner().0 != 0 {
+                        return Err(VfsError::Access);
+                    }
                     if name.len() > 64 {
                         return Err(VfsError::Invalid);
                     }
@@ -1562,7 +1548,26 @@ impl ProcFs {
         kernel.add(
             "domainname",
             NodeKind::File,
-            ctl(|| String::from("(none)\n"), |_| Ok(())),
+            // The hostname's twin, and under the same rule: the file reports
+            // what `uname` reports, and a write is the same 64-byte-capped set
+            // `setdomainname(2)` performs. It used to hardcode `(none)` on the
+            // read *and* drop the write, which left `setdomainname(2)` with no
+            // observable effect through any door at all - the call stored a name
+            // nothing could see.
+            ctl(
+                || alloc::format!("{}\n", domainname()),
+                |name| {
+                    // The hostname's rule, for the hostname's reason.
+                    if crate::sched::current_owner().0 != 0 {
+                        return Err(VfsError::Access);
+                    }
+                    if name.len() > 64 {
+                        return Err(VfsError::Invalid);
+                    }
+                    set_domainname(name);
+                    Ok(())
+                },
+            ),
         );
         kernel.add(
             "pid_max",

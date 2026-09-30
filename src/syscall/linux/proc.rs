@@ -3067,16 +3067,33 @@ pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
     0
 }
 
-/// `sethostname(name, len)` — give the machine the name `uname` reports.
+/// `sethostname(name, len)` — give the caller's namespace the name `uname`
+/// reports.
 ///
 /// It used to answer 0 and remember nothing, which is why every boot began
 /// with the same name and why `hostname` and `uname -n` could not be made to
 /// agree. The name is kept where `/proc/sys/kernel/hostname` reads it, so the
 /// two are one fact: a service that writes the file and a program that calls
 /// `uname` see the same string.
+///
+/// It is the *namespace's* name and not the machine's, which is what Linux has
+/// said since UTS namespaces existed: the name lives in `crate::uts` and this
+/// writes the running task's copy of it, so a program that called
+/// `unshare(CLONE_NEWUTS)` first renames only what is inside its own namespace
+/// (`t-ns-uts` pins both halves).
 pub(super) fn handle_sethostname(args: [usize; ARG_COUNT]) -> isize {
     let ptr = args[0];
     let len = args[1];
+    // `CAP_SYS_ADMIN`, and it is checked **first**: measured on a real kernel as
+    // a non-root caller, `sethostname(NULL, 100)` answers `EPERM` - not `EFAULT`
+    // for the null pointer and not `EINVAL` for the length. The capability on a
+    // UTS namespace is the one Linux gates every namespace's contents on, so it
+    // outranks the argument checks rather than sitting beside them. The
+    // effective-uid test is the one the entropy ioctls use for the same
+    // capability.
+    if crate::sched::current_identity().euid != 0 {
+        return err::EPERM;
+    }
     // Longer than a `utsname` field is refused rather than cut: the name is
     // kept in that field, and a caller that asked for seventy bytes would be
     // given back a name it never chose without being told it had been
@@ -3134,7 +3151,12 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         write_str(130, env!("CARGO_PKG_VERSION")); // release
         write_str(195, "#1 SMP PREEMPT mpos"); // version
         write_str(260, "x86_64"); // machine
-        write_str(325, "(none)"); // domainname
+        // domainname: read from the caller's namespace, the same one
+        // `setdomainname(2)` writes and `/proc/sys/kernel/domainname` reports.
+        // It used to be the constant `(none)` here, which made the third door
+        // disagree with the other two: a program that set a domain and then
+        // asked `uname` was told the domain it had just set was `(none)`.
+        write_str(325, &crate::vfs::procfs::domainname());
     }
     0
 }

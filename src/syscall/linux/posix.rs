@@ -1031,85 +1031,56 @@ pub fn handle_clock_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 
 /// `unshare(flags)` — leave namespaces.
 ///
-/// There is one of each kind and nobody to leave it into, so the `CLONE_NEW*`
-/// bits name promises this kernel cannot keep and are answered the way a
-/// known-but-unservable request is, `EOPNOTSUPP`. A bit that names nothing
-/// `unshare` can do is `EINVAL`. And the flags that ask for something a *thread
-/// group* shares are a genuine no-op here: this kernel has no thread group - a
-/// process is its own only thread and already owns its address space, its fd
-/// table and its handlers - so there is nothing to split off, which is the
-/// answer Linux gives a single-threaded caller too (see [`CLONE_SEPARABLE`]).
+/// **One namespace is served: `CLONE_NEWUTS`.** Its whole effect is that the
+/// caller gets a *copy* of the two names it was reading — Linux's
+/// `copy_utsname` — so the caller goes on reporting the names it reported a
+/// moment ago and can now change them without the change being visible to the
+/// namespace it came from. `t-ns-uts` holds both halves: the child's view
+/// differs *and* the parent's does not, which is the assertion a "namespace"
+/// that is really a shared global fails. The other seven keep answering
+/// `EOPNOTSUPP`, because a namespace with nothing behind it isolates nothing;
+/// the build order and each kind's reason are the plan's §6.3.
 ///
-/// **The numbers are the man page's, and two of them were wrong.** A caller
-/// does not send a flag *name*; it sends the number `unshare(2)` documents. This
-/// read `CLONE_NEWNS` as `0x1_0000` - which is `CLONE_THREAD` - and
-/// `CLONE_NEWTIME` as `0x8_0000`, which is `CLONE_SETTLS` and is not a
-/// namespace at all. So a program asking to unshare the mount namespace was
-/// answered `EINVAL` (as though it had asked for something undefined) while a
-/// program passing `CLONE_THREAD` was answered `EOPNOTSUPP` (as though it had
-/// asked for a mount namespace). Measured on this host's kernel, one call per
-/// child: `0x2_0000` and `0x80` answer `EPERM` - the two bits that really are
-/// namespace flags, refused for want of `CAP_SYS_ADMIN` - and `0x8_0000`
-/// answers `EINVAL`, which is the difference the spelling hides.
+/// The flag word itself is argued with in `abi::unshare_verdict`, which is where
+/// the three refusals live: an unrecognised bit is `EINVAL` *ahead* of
+/// everything (measured — `CLONE_PIDFD|CLONE_NEWNS` is `EINVAL` on a real
+/// kernel, not the namespace's `EPERM`); an unserved namespace is
+/// `EOPNOTSUPP` **for the whole word**, so nothing is unshared; and a served one
+/// asked for without `CAP_SYS_ADMIN` is `EPERM`. The whole-word refusal is a
+/// deliberate divergence from Linux's `ksys_unshare`, which unshares as it walks
+/// the word and can leave a caller halfway with nothing saying so.
+///
+/// The thread-group flags are accepted as the no-ops they are for a caller that
+/// has no other thread to split from — and Linux answers `0` for all six there
+/// too, measured one child per flag (`CLONE_VM`, `CLONE_FS`, `CLONE_FILES`,
+/// `CLONE_SIGHAND`, `CLONE_THREAD`, `CLONE_SYSVSEM`). For a caller that *does*
+/// have siblings the two answers part company: Linux refuses with `EINVAL`
+/// because the resource really is shared, and this kernel still answers `0`
+/// because splitting a descriptor table or a handler table off from one's
+/// siblings is not modelled — a named gap (`PLAN.md` §6.3), not an answer this
+/// call pretends to have.
+///
+/// One more gap rides with the call rather than the namespace:
+/// `clone(CLONE_NEWUTS)` — the *child* getting the copy — is still `EINVAL` from
+/// `validate_clone_flags`, which refuses namespace bits wholesale. Serving it is
+/// a separate decision (where in `copy_process`'s order the copy happens, and
+/// what `CLONE_NEWUTS|CLONE_THREAD` means for a group that shares an address
+/// space) and it wants its own measurement, so it is named here rather than
+/// half-built.
 pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
-    /// The eight namespaces, read off `include/uapi/linux/sched.h`.
-    ///
-    /// `CLONE_NEWTIME` is the one worth staring at: Linux puts it at `0x80`, in
-    /// the low byte the `CSIGNAL` range lives in, so "a `CLONE_NEW*` is a bit in
-    /// the high half" is a rule the header does not follow and a reader must
-    /// not assume.
-    const CLONE_NEWTIME: usize = 0x0000_0080;
-    const CLONE_NEWNS: usize = 0x0002_0000;
-    const CLONE_NEWCGROUP: usize = 0x0200_0000;
-    const CLONE_NEWUTS: usize = 0x0400_0000;
-    const CLONE_NEWIPC: usize = 0x0800_0000;
-    const CLONE_NEWUSER: usize = 0x1000_0000;
-    const CLONE_NEWPID: usize = 0x2000_0000;
-    const CLONE_NEWNET: usize = 0x4000_0000;
-    const NAMESPACES: usize = CLONE_NEWTIME
-        | CLONE_NEWNS
-        | CLONE_NEWCGROUP
-        | CLONE_NEWUTS
-        | CLONE_NEWIPC
-        | CLONE_NEWUSER
-        | CLONE_NEWPID
-        | CLONE_NEWNET;
-
-    /// What `unshare` splits off from a *thread group*: the address space, the
-    /// fs info, the descriptor table, the signal handlers, the group itself and
-    /// the SysV semaphore undo list.
-    ///
-    /// Each is a no-op for a caller that has no other thread to split from, and
-    /// Linux answers `0` for every one of them on a single-threaded process
-    /// (measured, one child per flag: `CLONE_VM`, `CLONE_FS`, `CLONE_FILES`,
-    /// `CLONE_SIGHAND`, `CLONE_THREAD` and `CLONE_SYSVSEM`). That is the truth
-    /// here rather than a courtesy: a process this kernel runs shares none of
-    /// the six with anybody, so there is nothing the call could take away.
-    const CLONE_VM: usize = 0x0000_0100;
-    const CLONE_FS: usize = 0x0000_0200;
-    const CLONE_FILES: usize = 0x0000_0400;
-    const CLONE_SIGHAND: usize = 0x0000_0800;
-    const CLONE_THREAD: usize = 0x0001_0000;
-    const CLONE_SYSVSEM: usize = 0x0004_0000;
-    const CLONE_SEPARABLE: usize =
-        CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
-
-    let flags = args[0];
-    // An unrecognised bit is refused first, ahead of the namespaces: Linux
-    // answers `EINVAL` for it even when a namespace flag rides beside it
-    // (measured: `CLONE_PIDFD|CLONE_NEWNS` is `EINVAL`, not the namespace's
-    // `EPERM`). `CLONE_PIDFD` and `CLONE_IO` are the two real flags in that
-    // class - both meaningless to `unshare` and both `EINVAL` (measured) - and
-    // so is any bit nobody ever defined.
-    if flags & !(NAMESPACES | CLONE_SEPARABLE) != 0 {
-        return err::EINVAL;
+    // `CAP_SYS_ADMIN` is the gate on every privileged namespace kind, and the
+    // test for it is the effective-uid one the entropy ioctls already use for
+    // the same capability: a namespace is not a thing a setuid bit should buy.
+    let privileged = crate::sched::current_identity().euid == 0;
+    match super::abi::unshare_verdict(args[0], privileged) {
+        Err(e) => e,
+        Ok(bits) => {
+            if bits & crate::syscall::linux::nr::CLONE_NEWUTS != 0 {
+                crate::sched::unshare_uts();
+            }
+            0
+        }
     }
-    if flags & NAMESPACES != 0 {
-        return err::EOPNOTSUPP;
-    }
-    // Zero included: a call that asked to unshare nothing has nothing to do,
-    // which is what Linux answers for it too.
-    0
 }
 
 /// `setns(fd, nstype)` — join a namespace a descriptor names. No namespace
@@ -1184,12 +1155,26 @@ pub fn handle_seccomp(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
 }
 
-/// `setdomainname(name, len)` — name the domain. The storage is the
-/// hostname's twin: one fact, one home, so the call that sets it and the
-/// reader that reports it cannot disagree. The length bound is the
-/// `utsname` field's, as `sethostname`'s is.
+/// `setdomainname(name, len)` — name the domain. The storage is the hostname's
+/// twin: one fact, one home, so the call that sets it and the readers that
+/// report it cannot disagree. The length bound is the `utsname` field's, as
+/// `sethostname`'s is.
+///
+/// Like the hostname it names the running task's *namespace*, so a caller that
+/// unshared first names only its own. And like the hostname it used to be
+/// stored somewhere nothing read: `uname` reported the literal `(none)` and
+/// `/proc/sys/kernel/domainname` hardcoded the same string while dropping every
+/// write, so this call had no observable effect through any door. Both readers
+/// go through the namespace now (the plan's §6.3 has the whole account).
 pub fn handle_setdomainname(args: [usize; ARG_COUNT]) -> isize {
     let (ptr, len) = (args[0], args[1]);
+    // The same `CAP_SYS_ADMIN` gate, in the same place: measured on a real
+    // kernel as a non-root caller, `setdomainname(NULL, 100)` answers `EPERM`,
+    // so the capability is decided before the length and the pointer just as it
+    // is for `sethostname`.
+    if crate::sched::current_identity().euid != 0 {
+        return err::EPERM;
+    }
     if len > 64 {
         return err::EINVAL;
     }

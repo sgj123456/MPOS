@@ -1707,6 +1707,20 @@ pub fn setns(fd: i32, nstype: usize) -> isize {
     sys2(nr::SETNS, fd as usize, nstype)
 }
 
+/// `sethostname(name, len)`: name the caller's UTS namespace.
+///
+/// The name is the `len` bytes at `name`, not a C string - which is what Linux
+/// copies, and what makes a name with a NUL inside it a name rather than a
+/// shorter name.
+pub fn sethostname(name: &[u8]) -> isize {
+    sys2(nr::SETHOSTNAME, name.as_ptr() as usize, name.len())
+}
+
+/// `setdomainname(name, len)`: name the domain of the caller's UTS namespace.
+pub fn setdomainname(name: &[u8]) -> isize {
+    sys2(nr::SETDOMAINNAME, name.as_ptr() as usize, name.len())
+}
+
 /// `tgkill(tgid, tid, sig)`.
 pub fn tgkill(tgid: isize, tid: isize, sig: usize) -> isize {
     sys3(nr::TGKILL, tgid as usize, tid as usize, sig)

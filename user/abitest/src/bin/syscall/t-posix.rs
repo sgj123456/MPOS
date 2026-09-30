@@ -467,12 +467,20 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         );
     }
 
-    // The namespace pair: nothing to unshare, nothing to join. Every number
+    // The namespace flag word: one kind served, seven refused, and the numbers
+    // matters because a caller sends the number and not the name. Every value
     // below is `include/uapi/linux/sched.h`'s, and each was measured on a real
     // kernel before being written down - which is what caught this block
     // asserting `0x1_0000` was `CLONE_NEWNS`: that is `CLONE_THREAD`, and Linux
     // answers 0 for it. The mount namespace is `0x2_0000`, and a program asking
     // for it was being told `EINVAL` as though the bit were undefined.
+    //
+    // `unshare(CLONE_NEWNS)` is the row where this kernel and Linux part
+    // company, and deliberately: Linux answers `EPERM` there for want of
+    // `CAP_SYS_ADMIN`, and this answers `EOPNOTSUPP` because there is no second
+    // mount table to be given even to root. That is the plan's refuse-rather-
+    // than-approximate rule, and a caller told `EPERM` would go looking for a
+    // capability that does not help.
     lin::check_eq(&mut failed, b"unshare(0) succeeds", lin::unshare(0), 0);
     lin::check_eq(
         &mut failed,
@@ -486,15 +494,23 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::unshare(0x0000_0080),
         lin::EOPNOTSUPP,
     );
+    // CLONE_NEWUTS is the one namespace this kernel *serves*, and this line
+    // used to assert `EOPNOTSUPP` along with the other seven: it is the pin that
+    // moved with the measurement when UTS landed (plan §6.3, step 1). All it can
+    // pin here is that the call is granted, which is exactly what the other
+    // seven do not get; what the copy buys - and that the namespace it came from
+    // does not follow - is `t-ns-uts`'s subject.
     lin::check_eq(
         &mut failed,
-        b"unshare CLONE_NEWUTS answers EOPNOTSUPP",
+        b"unshare CLONE_NEWUTS is served (the one namespace built so far)",
         lin::unshare(0x0400_0000),
-        lin::EOPNOTSUPP,
+        0,
     );
-    // The thread-group flags: a process here is its own only thread and owns
-    // all six already, so there is nothing to split off and the answer is the
-    // no-op Linux gives a single-threaded caller.
+    // The thread-group flags: a task with no sibling of its own to split from
+    // owns all six already, so there is nothing to take away and the answer is
+    // the no-op Linux gives a single-threaded caller. (For a caller that *does*
+    // have siblings Linux answers `EINVAL` and this kernel still answers 0 - a
+    // named gap in plan §6.3, not a claim that they were split.)
     lin::check_eq(
         &mut failed,
         b"unshare CLONE_THREAD is the no-op it is on Linux",

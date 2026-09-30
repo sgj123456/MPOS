@@ -83,6 +83,12 @@ pub mod uevent;
 /// input device with. Not target-gated, for the same reason as `evdev` - the
 /// arithmetic is worth a host test, and the device that uses it is bare metal.
 pub mod uinput;
+/// The UTS namespace: the two names `uname(2)` reports, as the object a task
+/// holds rather than as a pair of machine-wide strings. Ungated because the
+/// interesting half is *ownership* - a copy starts from the original's names
+/// and then diverges - which is arithmetic over two `String`s and worth a host
+/// test; the task table that decides whose namespace is whose is bare metal.
+pub mod uts;
 pub mod vfs;
 
 #[cfg(target_os = "none")]

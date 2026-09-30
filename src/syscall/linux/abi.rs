@@ -991,6 +991,74 @@ pub(crate) fn validate_clone_flags(
 }
 
 // ---------------------------------------------------------------------------
+// unshare(2): the flag word
+// ---------------------------------------------------------------------------
+
+/// Decide what `unshare(flags)` does to the caller, from its word and its
+/// privilege, before anything is touched.
+///
+/// The answer is the set of namespace bits that really are going to be copied,
+/// so the handler can run one step per served namespace and - the half that
+/// matters - so that a refusal happens *before* any of them. That atomicity is a
+/// deliberate divergence from Linux, whose `ksys_unshare` unshares as it goes: by
+/// the time a later flag fails, an earlier one's effect has already landed. A
+/// caller here that asks for two namespaces and gets an error learns that
+/// *neither* happened, instead of being left halfway with nothing saying so -
+/// which is the direction the plan's refuse-rather-than-approximate rule prefers,
+/// and it means the served set can grow without a caller ever observing a
+/// half-built word.
+///
+/// The three refusals, in the order Linux decides them:
+///
+/// * A bit that is neither a namespace nor something `unshare` can split off is
+///   `EINVAL`. An invalid bit outranks a namespace beside it - measured on this
+///   host's kernel, `CLONE_PIDFD|CLONE_NEWNS` answers `EINVAL` and not the
+///   namespace's `EPERM` - which is why the unknown-bit test comes first.
+/// * A namespace this kernel does not *serve* is `EOPNOTSUPP`, and nothing is
+///   unshared. `EOPNOTSUPP` rather than `EPERM`, even for a caller that has the
+///   privilege: this is not a permissions answer, it is "this machine has one of
+///   those and no way to make a second", and a caller told `EPERM` would go
+///   looking for a capability that does not help.
+/// * A namespace that *is* served, asked for by a caller without
+///   `CAP_SYS_ADMIN` - the gate Linux puts on every privileged kind - is
+///   `EPERM`.
+pub(crate) fn unshare_verdict(flags: usize, privileged: bool) -> Result<usize, isize> {
+    use crate::syscall::linux::nr as n;
+
+    /// What `unshare` can split off from a *thread group*: the address space,
+    /// the fs info, the descriptor table, the signal handlers, the group itself
+    /// and the SysV semaphore undo list.
+    ///
+    /// Each is a genuine no-op for a caller with no other thread to split from,
+    /// and Linux answers `0` for every one of them on a single-threaded process
+    /// (measured, one child per flag: `CLONE_VM`, `CLONE_FS`, `CLONE_FILES`,
+    /// `CLONE_SIGHAND`, `CLONE_THREAD` and `CLONE_SYSVSEM`). The divergence for a
+    /// caller that *does* have siblings is named where the handler is.
+    const SEPARABLE: usize = n::CLONE_VM
+        | n::CLONE_FS
+        | n::CLONE_FILES
+        | n::CLONE_SIGHAND
+        | n::CLONE_THREAD
+        | n::CLONE_SYSVSEM;
+
+    /// The namespace kinds this kernel can isolate observably. One, so far: the
+    /// build order and the reason for it are the plan's §6.3.
+    const SERVED: usize = n::CLONE_NEWUTS;
+
+    if flags & !(n::CLONE_NAMESPACES | SEPARABLE) != 0 {
+        return Err(err::EINVAL);
+    }
+    let asked = flags & n::CLONE_NAMESPACES;
+    if asked & !SERVED != 0 {
+        return Err(err::EOPNOTSUPP);
+    }
+    if asked != 0 && !privileged {
+        return Err(err::EPERM);
+    }
+    Ok(asked)
+}
+
+// ---------------------------------------------------------------------------
 // reboot(2): the magic cmd words
 // ---------------------------------------------------------------------------
 
@@ -2428,6 +2496,92 @@ mod tests {
         assert_eq!(
             validate_clone_flags(n::CLONE_DETACHED | n::CLONE_UNTRACED | n::CLONE_FILES, 0, 0),
             Ok((0, n::CLONE_DETACHED | n::CLONE_UNTRACED | n::CLONE_FILES))
+        );
+    }
+
+    /// `unshare(2)`: which words are granted, which are refused and why, and -
+    /// the half a caller cannot recover from - that a refusal decides before
+    /// anything is unshared.
+    ///
+    /// Every row below is a line of the plan's §6.3 record, and the two that
+    /// changed this pass are the ones worth reading: `CLONE_NEWUTS` used to be
+    /// `EOPNOTSUPP` for everybody and is now served, and the *word* that mixes a
+    /// served namespace with an unserved one is refused whole rather than
+    /// half-applied.
+    #[test]
+    fn unshare_grants_only_what_it_can_copy_and_refuses_the_rest_whole() {
+        use crate::syscall::err;
+        use crate::syscall::linux::nr as n;
+
+        // Nothing asked, nothing done - and this is Linux's answer too.
+        assert_eq!(unshare_verdict(0, true), Ok(0));
+        assert_eq!(unshare_verdict(0, false), Ok(0));
+
+        // The one served namespace: granted with the privilege, refused
+        // without it, and the verdict names the bit so the caller can act.
+        assert_eq!(unshare_verdict(n::CLONE_NEWUTS, true), Ok(n::CLONE_NEWUTS));
+        assert_eq!(unshare_verdict(n::CLONE_NEWUTS, false), Err(err::EPERM));
+
+        // The seven this kernel has one of and no way to make a second. Served
+        // namespace or not, the answer is the same for both privileged and
+        // unprivileged callers: this is not a permissions answer.
+        for bit in [
+            n::CLONE_NEWTIME,
+            n::CLONE_NEWNS,
+            n::CLONE_NEWCGROUP,
+            n::CLONE_NEWIPC,
+            n::CLONE_NEWUSER,
+            n::CLONE_NEWPID,
+            n::CLONE_NEWNET,
+        ] {
+            assert_eq!(
+                unshare_verdict(bit, true),
+                Err(err::EOPNOTSUPP),
+                "{bit:#x} was granted with no namespace behind it"
+            );
+            assert_eq!(unshare_verdict(bit, false), Err(err::EOPNOTSUPP));
+        }
+
+        // A word that mixes the served one with an unserved one is refused
+        // whole - `Err`, so the handler copies nothing - where Linux's
+        // `ksys_unshare` would already have unshared the first part by the time
+        // the second failed.
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWUTS | n::CLONE_NEWNS, true),
+            Err(err::EOPNOTSUPP)
+        );
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWNS | n::CLONE_NEWUTS, false),
+            Err(err::EOPNOTSUPP),
+            "the unserved bit is decided before the privilege is consulted"
+        );
+
+        // The six thread-group flags are accepted as the no-ops they are on a
+        // caller that owns all six already, and they do not smuggle a namespace
+        // grant out with them.
+        assert_eq!(unshare_verdict(n::CLONE_THREAD, true), Ok(0));
+        assert_eq!(
+            unshare_verdict(n::CLONE_VM | n::CLONE_FS | n::CLONE_FILES, false),
+            Ok(0)
+        );
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWUTS | n::CLONE_FILES, true),
+            Ok(n::CLONE_NEWUTS)
+        );
+
+        // A bit that is neither is `EINVAL`, and it outranks a namespace beside
+        // it - measured on a real kernel, where `CLONE_PIDFD|CLONE_NEWNS` is
+        // `EINVAL` rather than the namespace's `EPERM`.
+        assert_eq!(unshare_verdict(0x1, true), Err(err::EINVAL));
+        assert_eq!(unshare_verdict(n::CLONE_SETTLS, true), Err(err::EINVAL));
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWNS | 0x1000, true),
+            Err(err::EINVAL)
+        );
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWUTS | 0x1000, true),
+            Err(err::EINVAL),
+            "an invalid bit is decided before a grant"
         );
     }
 

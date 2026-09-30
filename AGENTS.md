@@ -135,12 +135,18 @@ leak into the image `cargo xtask run` boots.
 
 **Nothing is red. The state below is the measured run, quoted from its own summary line.**
 
-- Host unit tests: `570 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
+- Host unit tests: `576 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
   plus `36 passed` from `mpos-xtask`. Measured on this tree.
-- The guest suite reached `=== SUMMARY pass=127 fail=0` (127 built) with QEMU exit code 33, with
-  `9 of 136 user tests left out by tests.toml` — the `external`, `slow` and `diagnostic` groups,
+- The guest suite reached `=== SUMMARY pass=128 fail=0` (128 built) with QEMU exit code 33, with
+  `9 of 137 user tests left out by tests.toml` — the `external`, `slow` and `diagnostic` groups,
   which is what makes the sweep's verdict a statement about the kernel. `--groups diagnostic`
   was run on its own to prove the flag reaches the guest (`128 staged`, `t-sh` in the count).
+  The UTS namespace (plan §6.3, step 1) is green end to end: `t-ns-uts` prints `=== PASS`,
+  holding both halves of the property that makes a namespace one — a child that unshares reports
+  `inside` through `uname` *and* through both `/proc/sys/kernel` files while the parent that did
+  not unshare keeps the names it started with, and a child forked *before* a refused
+  `CLONE_NEWUTS|CLONE_NEWNS` word still shares the parent's namespace, which is what pins "a
+  refusal unshares nothing" rather than merely asserting the errno.
   The ABI-honesty batch is green in the booted machine: `t-prctl`, `t-times`, `t-priority`,
   `t-fadvise`, `t-evdev`, `t-ioctl`, `t-openat`, `t-statx`, `t-truncate`, `t-rseq` and
   `t-posix` all print `=== PASS`, and so do the two programs that were the gate's standing red

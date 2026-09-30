@@ -1057,6 +1057,19 @@ struct Task {
     /// and group, in that order. Root until something changes it, inherited
     /// across `fork`, preserved by `exec`.
     identity: Identity,
+    /// The UTS namespace this task reads its names from: `uname(2)`'s `nodename`
+    /// and `domainname`, and the pair `/proc/sys/kernel/{hostname,domainname}`
+    /// report and write.
+    ///
+    /// An `Arc` rather than the two names themselves, because a namespace is
+    /// something tasks *share*: a child inherits its creator's by reference and
+    /// goes on reporting the same names until it asks for its own, at which
+    /// point `unshare(CLONE_NEWUTS)` hands it a copy - Linux's `copy_utsname` -
+    /// and the two diverge. Two owned `String`s per task would pass every test a
+    /// single task can write and read like a different mechanism the first time
+    /// a parent renamed itself after a `fork`. `src/uts.rs` holds the object and
+    /// the rule; this field is only whose it is.
+    uts: Arc<crate::uts::Uts>,
     /// The file-creation mask, `0o022` until something calls `umask`.
     ///
     /// It belongs to the process and not to the machine: a shell sets its own
@@ -1337,6 +1350,9 @@ impl Task {
             session: TaskId(0),
             ctty: None,
             identity: Identity::default(),
+            // A kernel task starts in the machine's own namespace, the one
+            // every task is born in until something unshares.
+            uts: crate::uts::init(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -1796,6 +1812,9 @@ impl Table {
             session: TaskId(0),
             ctty: None,
             identity: Identity::default(),
+            // A kernel task starts in the machine's own namespace, the one
+            // every task is born in until something unshares.
+            uts: crate::uts::init(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -2243,6 +2262,8 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             ctty: None,
             // Init starts as root, like everything the kernel itself spawns.
             identity: Identity::default(),
+            // ...and in the machine's own namespace, the one a boot begins in.
+            uts: crate::uts::init(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -2377,6 +2398,10 @@ pub fn try_spawn_user(
             session: t.task(parent).session,
             ctty: t.task(parent).ctty,
             identity: t.task(parent).identity.clone(),
+            // Inherited, not copied: a program the kernel starts shares the
+            // namespace of whatever started it until it unshares, which is the
+            // rule `fork` follows for the same reason.
+            uts: Arc::clone(&t.task(parent).uts),
             umask: t.task(parent).umask,
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
@@ -3494,6 +3519,41 @@ pub fn current_comm_bytes() -> [u8; 16] {
         }
         out
     })
+}
+
+/// The UTS namespace the running task reads its names from - `uname`'s
+/// `nodename` and `domainname`, and what `/proc/sys/kernel/{hostname,domainname}`
+/// report.
+///
+/// The `Arc` is cloned out of the table and the table's lock dropped before the
+/// caller asks the namespace anything, so reading a name cannot happen with the
+/// scheduler's lock held while it allocates the `String` it hands back. That is
+/// the same shape as `current_fds` above, and for the same reason.
+#[cfg(target_os = "none")]
+pub fn current_uts() -> Arc<crate::uts::Uts> {
+    with_table(|t| Arc::clone(&t.task(t.current).uts))
+}
+
+/// Give the running task a namespace of its own: `unshare(CLONE_NEWUTS)`.
+///
+/// The new namespace is a **copy** of the old one - Linux's `copy_utsname`,
+/// reached from `create_new_namespaces` - so the caller keeps reporting the names
+/// it was already reporting and can now change them without the namespace it came
+/// from following. The second half is the whole feature: a caller handed an
+/// *empty* namespace would have its own `uname` change under it at the instant of
+/// the call, which is not what a program asking for its own namespace is asking
+/// for, and would make the call a way to lose state rather than to isolate it.
+///
+/// Only the calling task moves. A thread of the same process is deliberately left
+/// pointing at the old namespace, which is the same thing Linux's per-task
+/// `nsproxy` means - `unshare` splits the *caller* from its process, and a thread
+/// that wanted to drag its siblings along would have to say so.
+#[cfg(target_os = "none")]
+pub fn unshare_uts() {
+    with_table(|t| {
+        let fresh = t.task(t.current).uts.copied();
+        t.task_mut(t.current).uts = fresh;
+    });
 }
 
 /// Charge one clock tick of CPU time to the running task's process group,
@@ -7007,6 +7067,10 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             session: t.task(parent_id).session,
             ctty: t.task(parent_id).ctty,
             identity: t.task(parent_id).identity.clone(),
+            // A fork child is in its parent's namespace, by reference: the two
+            // go on reporting one set of names until one of them unshares. A
+            // copy here would give a `fork` the effect `unshare` is for.
+            uts: Arc::clone(&t.task(parent_id).uts),
             umask: t.task(parent_id).umask,
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
@@ -7449,6 +7513,11 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let session = parent.session;
         let ctty = parent.ctty;
         let identity = parent.identity.clone();
+        // A thread is its process: the same namespaces, by reference. Linux
+        // makes the same promise from the other side - `CLONE_THREAD` shares
+        // the creator's `nsproxy` - so a thread that unshared would split from
+        // its own process, which is not what a thread is.
+        let uts = alloc::sync::Arc::clone(&parent.uts);
         let umask = parent.umask;
         let oom_score_adj = parent.oom_score_adj;
         let oom_score_adj_min = parent.oom_score_adj_min;
@@ -7543,6 +7612,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             // ...and the same identity, group and user words alike, and the
             // same creation mask - a thread creates files as its process does.
             identity,
+            uts,
             umask,
             oom_score_adj,
             oom_score_adj_min,

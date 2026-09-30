@@ -497,6 +497,38 @@ pub const CLONE_DETACHED: usize = 0x0040_0000;
 pub const CLONE_UNTRACED: usize = 0x0080_0000;
 pub const CLONE_CHILD_SETTID: usize = 0x0100_0000;
 
+// The eight namespace flags, where `clone`/`unshare` put "give me a namespace
+// of my own" in the same word as "share this part of me with the child".
+//
+// They live in `nr.rs` and not beside either handler because two calls read
+// them - `unshare(2)` and `clone(2)` - and a table copied into both would be
+// two tables. `CLONE_NEWTIME` is the one worth staring at: Linux puts it at
+// `0x80`, inside the low byte the exit signal (`CSIGNAL`, 0..=0x7f) lives in,
+// so "a `CLONE_NEW*` is a bit in the high half" is a rule the header does not
+// follow and a reader must not assume. Both of those were spelled wrong here
+// once (`CLONE_NEWNS` as `CLONE_THREAD`, `CLONE_NEWTIME` as `CLONE_SETTLS`),
+// which is this file's whole reason for existing.
+pub const CLONE_NEWTIME: usize = 0x0000_0080;
+pub const CLONE_NEWNS: usize = 0x0002_0000;
+pub const CLONE_NEWCGROUP: usize = 0x0200_0000;
+pub const CLONE_NEWUTS: usize = 0x0400_0000;
+pub const CLONE_NEWIPC: usize = 0x0800_0000;
+pub const CLONE_NEWUSER: usize = 0x1000_0000;
+pub const CLONE_NEWPID: usize = 0x2000_0000;
+pub const CLONE_NEWNET: usize = 0x4000_0000;
+
+/// All eight namespace bits at once - the mask that says "these bits are
+/// namespace requests, not sharing requests", which is the distinction both
+/// callers have to make before they can answer anything.
+pub const CLONE_NAMESPACES: usize = CLONE_NEWTIME
+    | CLONE_NEWNS
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWNET;
+
 // ---------------------------------------------------------------------------
 // Tests: every number against the Linux x86_64 syscall table
 // ---------------------------------------------------------------------------
@@ -738,6 +770,71 @@ mod tests {
         ] {
             assert!(bit & 0xff == 0, "flag bit {bit:#x} reaches into CSIGNAL");
             assert!(bit.count_ones() == 1, "flag bit {bit:#x} is not one bit");
+        }
+    }
+
+    /// The eight namespace flags, pinned apart from the sharing flags above
+    /// because one of them would fail that loop's own rule.
+    ///
+    /// `CLONE_NEWTIME` is `0x80`, inside the low byte the sharing flags stay
+    /// clear of - so a table written from the pattern "a `CLONE_NEW*` is a bit
+    /// in the high half" gets it wrong, and this file got it wrong: it read
+    /// `CLONE_NEWTIME` as `CLONE_SETTLS` and `CLONE_NEWNS` as `CLONE_THREAD`.
+    /// The two errors compound into the one shape that is worst to debug, an
+    /// *answered* call: a program asking to unshare the mount namespace was
+    /// told `EINVAL` as though the bit were undefined, while a program passing
+    /// `CLONE_THREAD` was refused a namespace it never asked for. Both are
+    /// measured on a real kernel and pinned here.
+    #[test]
+    fn namespace_flags_match_include_uapi_linux_sched_h() {
+        assert_eq!(CLONE_NEWTIME, 0x0000_0080);
+        assert_eq!(CLONE_NEWNS, 0x0002_0000);
+        assert_eq!(CLONE_NEWCGROUP, 0x0200_0000);
+        assert_eq!(CLONE_NEWUTS, 0x0400_0000);
+        assert_eq!(CLONE_NEWIPC, 0x0800_0000);
+        assert_eq!(CLONE_NEWUSER, 0x1000_0000);
+        assert_eq!(CLONE_NEWPID, 0x2000_0000);
+        assert_eq!(CLONE_NEWNET, 0x4000_0000);
+
+        for bit in [
+            CLONE_NEWTIME,
+            CLONE_NEWNS,
+            CLONE_NEWCGROUP,
+            CLONE_NEWUTS,
+            CLONE_NEWIPC,
+            CLONE_NEWUSER,
+            CLONE_NEWPID,
+            CLONE_NEWNET,
+        ] {
+            assert_eq!(bit.count_ones(), 1, "namespace bit {bit:#x} is not one bit");
+            assert_ne!(
+                CLONE_NAMESPACES & bit,
+                0,
+                "{bit:#x} is missing from the mask"
+            );
+        }
+        assert_eq!(CLONE_NAMESPACES.count_ones(), 8);
+
+        // The overlap that makes the table easy to write wrongly, asserted as
+        // the fact it is rather than left as an absence: this is the only
+        // namespace bit that shares the `CSIGNAL` byte.
+        assert_eq!(CLONE_NEWTIME & 0xff, 0x80);
+
+        // And no *sharing* flag is also a namespace, which is the specific
+        // mistake - `CLONE_THREAD` written where `CLONE_NEWNS` belongs.
+        for bit in [
+            CLONE_VM,
+            CLONE_FS,
+            CLONE_FILES,
+            CLONE_SIGHAND,
+            CLONE_THREAD,
+            CLONE_SYSVSEM,
+        ] {
+            assert_eq!(
+                CLONE_NAMESPACES & bit,
+                0,
+                "{bit:#x} is spelled as both a sharing flag and a namespace"
+            );
         }
     }
 
