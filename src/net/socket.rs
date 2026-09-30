@@ -2746,25 +2746,29 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                 // own `connect` refuses port 0 and takes the source port as an
                 // argument.
                 let port = if endpoint.port == 0 {
-                    stack.ephemeral()
+                    match stack.bind_ephemeral(endpoint.addr, entry.opts.reuseaddr) {
+                        Some(port) => port,
+                        // Every port in the range is held - `EADDRINUSE`, which
+                        // is what Linux answers when the ephemeral pool is
+                        // exhausted rather than a name the caller chose.
+                        None => return Err(err::EADDRINUSE),
+                    }
                 } else {
+                    // One name, one socket. Nothing underneath tracks the
+                    // ownership - smoltcp binds each socket on its own and the
+                    // interface only picks between them when it polls - so the
+                    // table that sees every socket is where the check has to
+                    // live. `SO_REUSEADDR` is read here, where it means
+                    // something: a `TIME-WAIT` holder is the one name a bind
+                    // may take back, and only from a caller that asked
+                    // (`net::Stack::tcp_name_taken`). This entry is lifted out
+                    // of its slot while the closure runs, so it cannot match
+                    // itself.
+                    if stack.tcp_name_taken(endpoint, entry.opts.reuseaddr) {
+                        return Err(err::EADDRINUSE);
+                    }
                     endpoint.port
                 };
-                // One name, one socket. Nothing underneath tracks the
-                // ownership - smoltcp binds each socket on its own and the
-                // interface only picks between them when it polls - so the
-                // table that sees every socket is where the check has to live.
-                // This entry is lifted out of its slot while the closure runs,
-                // so it cannot match itself.
-                let taken = stack.entries.iter().any(|slot| {
-                    matches!(slot, Some(super::Entry {
-                        channel: Channel::Tcp { local: Some(l), .. },
-                        ..
-                    }) if l.port == port)
-                });
-                if taken {
-                    return Err(err::EADDRINUSE);
-                }
                 *local = Some(IpEndpoint {
                     addr: endpoint.addr,
                     port,
@@ -3024,15 +3028,28 @@ fn accept_tcp(
         return e;
     }
     loop {
-        let step = super::with(handle, |stack, _| {
+        // The listener's own options come out with the connection: Linux copies
+        // `SO_REUSEADDR` onto a socket when it is accepted, and that inherited
+        // bit is what lets a restart take the port back from the `TIME-WAIT`
+        // 4-tuple this very connection will leave behind (see
+        // `install_accepted` and `net::Stack::tcp_name_taken`).
+        let step = super::with(handle, |stack, entry| {
             stack.poll_once();
-            stack.listener_take(id)
+            (stack.listener_take(id), entry.opts.reuseaddr)
         });
         match step {
-            Some(Some((home, sock_handle))) => {
-                return install_accepted(home, sock_handle, addr_ptr, len_ptr, flags, nonblock);
+            Some((Some((home, sock_handle)), reuse)) => {
+                return install_accepted(
+                    home,
+                    sock_handle,
+                    addr_ptr,
+                    len_ptr,
+                    flags,
+                    nonblock,
+                    reuse,
+                );
             }
-            Some(None) => {
+            Some((None, _)) => {
                 if nonblock {
                     return err::EAGAIN;
                 }
@@ -3064,6 +3081,7 @@ fn install_accepted(
     len_ptr: usize,
     flags: usize,
     nonblock: bool,
+    reuseaddr: bool,
 ) -> isize {
     // The peer's address is read *before* the socket becomes an entry: it is
     // the connection's own fact, and the entry hands the same socket to
@@ -3074,6 +3092,13 @@ fn install_accepted(
     // own endpoint, which is the connection's address rather than whatever the
     // listener was bound to. That is the same answer `bind` would have
     // recorded, and one source of truth instead of two.
+    // `reuseaddr` is the listener's, carried across: Linux's
+    // `inet_csk_clone_lock` copies `SO_REUSEADDR` onto the accepted socket, and
+    // that is load-bearing rather than tidiness - a server that closed first
+    // leaves *this* connection in `TIME-WAIT` holding the port it listened on,
+    // and a restart may only take that port back if the holder had the option
+    // set too (`net::Stack::tcp_name_taken`). Without the inheritance the
+    // option would not do the one thing it exists for.
     let handle = match super::adopt_socket(
         Channel::Tcp {
             home,
@@ -3081,6 +3106,10 @@ fn install_accepted(
             local: None,
         },
         SOCK_STREAM,
+        super::SockOpts {
+            reuseaddr,
+            ..Default::default()
+        },
     ) {
         Ok(handle) => handle,
         Err(e) => return e,
@@ -3680,10 +3709,13 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
 /// `setsockopt(fd, level, optname, optval, optlen)`.
 ///
 /// Every option is remembered so `getsockopt` reads back what the caller set.
-/// Two of them also reach the stack: `TCP_NODELAY` switches Nagle off on the
-/// live socket and `SO_KEEPALIVE` arms its probe timer. The rest - buffer
-/// sizes, linger, reuse - are recorded only: timeouts live in user code
-/// (`poll`) and `SO_REUSEADDR` is moot while one process binds at a time.
+/// Three of them also reach the stack: `TCP_NODELAY` switches Nagle off on the
+/// live socket, `SO_KEEPALIVE` arms its probe timer, and `SO_REUSEADDR` is read
+/// by `bind`'s conflict rule - where it says something about a *name* the
+/// socket holds or is refused, not about the connection
+/// (`net::Stack::tcp_name_taken`). The rest - buffer sizes and linger - are
+/// recorded only: the timeouts they ask for live in user code (`poll`), and the
+/// reset `SO_LINGER{on,0}` wants is not a packet this stack can send (§4.3.4).
 pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen) = (args[0] as i32, args[1], args[2], args[3], args[4]);
     // A packet socket's `SOL_PACKET` knobs: group membership, on a machine

@@ -362,7 +362,14 @@ pub(crate) struct Stack {
     /// is exactly the abrupt close this is here to avoid - and the right price
     /// for one, rather than for thousands. The home rides with the handle
     /// because the socket to reap is in one of two sets.
-    teardown: Vec<(Home, SocketHandle)>,
+    ///
+    /// The third field is whether the socket had `SO_REUSEADDR` set when it was
+    /// closed, and it is kept because a name outlives its descriptor: a
+    /// `TIME-WAIT` 4-tuple still refuses `bind` for as long as it is here, and
+    /// the option that lets a restart take that name back has to be read from
+    /// the *holder* as well as from the caller (see
+    /// [`Stack::tcp_name_taken`]).
+    teardown: Vec<(Home, SocketHandle, bool)>,
     next_ephemeral: u16,
     /// Tasks parked on any socket's readiness, registered through
     /// [`subscribe`] and woken by [`service`] after every poll. One flat
@@ -394,6 +401,16 @@ impl Stack {
         match home {
             Home::Eth => &mut self.eth.sockets,
             Home::Lo => &mut self.lo.sockets,
+        }
+    }
+
+    /// The same set, read-only - what a question about a socket's *state*
+    /// needs, and all `tcp_name_taken` is allowed, since it runs while the
+    /// registry entry being bound is borrowed away from the stack.
+    fn sockets(&self, home: Home) -> &SocketSet<'static> {
+        match home {
+            Home::Eth => &self.eth.sockets,
+            Home::Lo => &self.lo.sockets,
         }
     }
 
@@ -567,7 +584,7 @@ impl Stack {
     /// emitted in reply to an arriving packet, so an unsolicited reset is not
     /// something this stack can send at all, and a `FIN` is the honest
     /// substitute.
-    fn close_listener(&mut self, id: usize) {
+    fn close_listener(&mut self, id: usize, reuse: bool) {
         let Some(listener) = self.listeners.get_mut(id).and_then(|slot| slot.take()) else {
             return;
         };
@@ -577,15 +594,19 @@ impl Stack {
         for h in listener.listening {
             self.sockets_mut(home).remove(h);
         }
+        // `reuse` is the listener's own `SO_REUSEADDR`, which is also what an
+        // accepted connection carries (Linux copies it across at accept, and
+        // `install_accepted` does the same) - so it is the flag each of these
+        // still-undelivered connections holds its name with.
         for h in listener.accepted {
             self.tcp_socket(home, h).close();
             if self.teardown.len() >= TEARDOWN_MAX
-                && let Some((old_home, oldest)) = self.teardown.first().copied()
+                && let Some((old_home, oldest, _)) = self.teardown.first().copied()
             {
                 self.teardown.remove(0);
                 self.sockets_mut(old_home).remove(oldest);
             }
-            self.teardown.push((home, h));
+            self.teardown.push((home, h, reuse));
         }
     }
 
@@ -648,7 +669,7 @@ impl Stack {
         }
         let mut finished: Vec<usize> = Vec::new();
         for i in 0..self.teardown.len() {
-            let (home, h) = self.teardown[i];
+            let (home, h, _) = self.teardown[i];
             // `Closed` is the end of the graceful machine *and* the state an
             // aborted socket is dropped into - and smoltcp emits the reset from
             // there, during the poll this runs after. So one condition covers
@@ -663,7 +684,7 @@ impl Stack {
         }
         // Backwards, so each index still names the entry it was recorded for.
         for i in finished.into_iter().rev() {
-            let (home, h) = self.teardown.remove(i);
+            let (home, h, _) = self.teardown.remove(i);
             self.sockets_mut(home).remove(h);
         }
     }
@@ -676,6 +697,116 @@ impl Stack {
             self.next_ephemeral = EPHEMERAL_MIN;
         }
         port
+    }
+
+    /// Draw an ephemeral port that is *free* for `addr`, which is what a bind
+    /// that named port 0 gets on Linux: the kernel chooses, and it never
+    /// chooses a name it would then refuse.
+    ///
+    /// The draw has to check at all only because of `TIME-WAIT`: an implicit
+    /// bind that landed on a closed connection's port would be `EADDRINUSE`
+    /// for a port the caller never named, while Linux would simply have picked
+    /// the next one. `None` is the whole range spoken for - `EADDRINUSE`, and
+    /// it takes a machine with 28 000 sockets on one address to reach.
+    pub(crate) fn bind_ephemeral(&mut self, addr: IpAddress, reuse: bool) -> Option<u16> {
+        // One turn of the range and no more: the counter returns to where it
+        // started, and past that there is nothing left that has not been tried.
+        let span = EPHEMERAL_MAX - EPHEMERAL_MIN + 1;
+        for _ in 0..span {
+            let port = self.alloc_ephemeral();
+            if !self.tcp_name_taken(IpEndpoint { addr, port }, reuse) {
+                return Some(port);
+            }
+        }
+        None
+    }
+
+    /// Whether `local` is a name this stack has already given to somebody else,
+    /// for a `bind` (or the implicit bind behind `listen`) that asked for
+    /// `SO_REUSEADDR` or did not.
+    ///
+    /// Linux's rule, measured on this host's kernel before it was written
+    /// (`PLAN.md` §4.3.3 carries the table). One clause decides every row:
+    ///
+    /// > a holder that is **listening** always keeps its name; any other
+    /// > holder gives it up to a caller that set `SO_REUSEADDR` *and* whose
+    /// > holder had set it too.
+    ///
+    /// The measurements that produced it, all on `127.0.0.1` with the
+    /// holder's own `SO_REUSEADDR` and the new socket's varied independently:
+    ///
+    /// | the name is held by | holder's | new socket's | bind |
+    /// |---|---|---|---|
+    /// | a listening socket | either | either | `EADDRINUSE` |
+    /// | a `TIME-WAIT` 4-tuple | no | yes | `EADDRINUSE` |
+    /// | a `TIME-WAIT` 4-tuple | yes | no | `EADDRINUSE` |
+    /// | a `TIME-WAIT` 4-tuple | yes | yes | **succeeds** |
+    /// | an established connection | either | not both | `EADDRINUSE` |
+    /// | a bound, never-connected socket | yes | yes | **succeeds** |
+    ///
+    /// So "the new socket asked for it" is *not* enough, which is the shape one
+    /// writes from the man page and the reason this was measured: a restart
+    /// comes back onto its own port because the listener set the option and the
+    /// connections it accepted *inherited* it (also measured, and why
+    /// `install_accepted` hands it on), not because the new socket asked
+    /// loudly. And the exemption is not about `TIME-WAIT` at all - a bound or
+    /// established socket grants it too, which is what lets a port be rebound
+    /// while a connection is still open on it.
+    ///
+    /// Two names on one port collide when either is the wildcard or when they
+    /// are the same address (see [`names_overlap`]).
+    ///
+    /// The scan is over the *registry* - plus the teardown list, which is where
+    /// a closed connection lives until it is reaped - rather than over one
+    /// socket set, and that is not tidiness: the two fabrics are one address
+    /// space to the caller, and which set this stack happens to keep a socket
+    /// in is not a fact a bind may depend on.
+    pub(crate) fn tcp_name_taken(&self, local: IpEndpoint, reuse: bool) -> bool {
+        let held = |names: IpEndpoint, listening: bool, holder_reuse: bool| {
+            names_overlap(names, local) && (listening || !(reuse && holder_reuse))
+        };
+        self.entries.iter().flatten().any(|e| match &e.channel {
+            // A connection, or a bound socket that has not connected: its name
+            // is the one `bind` recorded, and failing that the one the socket
+            // itself carries - an accepted connection records nothing (`local`
+            // is `None`) and answers `getsockname` from its own endpoint, so
+            // that is the name to hold it to here as well.
+            Channel::Tcp {
+                home,
+                handle,
+                local,
+            } => {
+                let Some(names) = (*local).or_else(|| self.tcp_name_at(*home, *handle)) else {
+                    return false;
+                };
+                held(names, false, e.opts.reuseaddr)
+            }
+            Channel::TcpListen { local: names, .. } => held(*names, true, e.opts.reuseaddr),
+            _ => false,
+        }) || self.teardown.iter().any(|(home, h, holder_reuse)| {
+            self.tcp_name_at(*home, *h)
+                .is_some_and(|names| held(names, false, *holder_reuse))
+        })
+    }
+
+    /// The name the TCP socket at `home`/`h` still holds, if it holds one.
+    ///
+    /// A socket that is listening answers from its listen endpoint rather than
+    /// from a 4-tuple; those reach here through the registry (`TcpListen`), so
+    /// this is the connected and closing half. The 4-tuple survives every state
+    /// down to `Closed`, which is the state `reap_teardown` removes - and a
+    /// socket past its last packet holds nothing, which is why `Closed` is not
+    /// a name.
+    ///
+    /// One divergence rides here with the rule: smoltcp's wait is ten seconds
+    /// where Linux's is sixty (`TCP_TIMEWAIT_LEN`), so a name comes back
+    /// sooner on this machine. The rule about *who* may take it is the same.
+    fn tcp_name_at(&self, home: Home, h: SocketHandle) -> Option<IpEndpoint> {
+        let sock = self.sockets(home).get::<tcp::Socket>(h);
+        if matches!(sock.state(), tcp::State::Closed) {
+            return None;
+        }
+        sock.local_endpoint()
     }
 
     /// Add a freshly built TCP socket to `home`'s set and hand back its handle.
@@ -761,6 +892,20 @@ impl Stack {
         *h = self.add_udp(want);
         *home = want;
     }
+}
+
+/// Whether two bound names are the same name, in the sense a second `bind`
+/// cares about: the same port, and either the same address or the wildcard on
+/// one side.
+///
+/// The wildcard is the half that is easy to leave out and wrong to: `0.0.0.0`
+/// promises every address this machine has, so it overlaps `127.0.0.1:80` as
+/// much as it overlaps itself (measured - the specific bind beside a wildcard
+/// one is `EADDRINUSE`), while `127.0.0.1:80` and `127.0.0.2:80` are two names
+/// and both stand.
+fn names_overlap(a: IpEndpoint, b: IpEndpoint) -> bool {
+    let wild = |addr: IpAddress| matches!(addr, IpAddress::Ipv4(v4) if v4.is_unspecified());
+    a.port == b.port && (a.addr == b.addr || wild(a.addr) || wild(b.addr))
 }
 
 /// Which interface a destination address belongs to.
@@ -1005,7 +1150,15 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
 /// `EBADF` with no stack behind it, matching the register path's `ENETDOWN`
 /// being reserved for "there is no network card": a descriptor cannot be
 /// waiting to be accepted on a stack that was never up.
-pub(crate) fn adopt_socket(channel: Channel, typ: u16) -> Result<usize, isize> {
+///
+/// `opts` is the option set the new socket starts with rather than
+/// [`SockOpts::default`] for one caller: an accepted connection inherits the
+/// listener's `SO_REUSEADDR`, which is Linux's behaviour (`inet_csk_clone_lock`
+/// copies it) and the fact that makes a restart work at all - the connections
+/// the listener accepted are what sits in `TIME-WAIT` holding its port, and the
+/// option that lets the next bind take that port back has to be read from
+/// *them* as well as from the caller (`Stack::tcp_name_taken`).
+pub(crate) fn adopt_socket(channel: Channel, typ: u16, opts: SockOpts) -> Result<usize, isize> {
     critical_section::with(|cs| {
         let mut net = NET.borrow(cs).borrow_mut();
         let Some(stack) = net.as_mut() else {
@@ -1015,7 +1168,7 @@ pub(crate) fn adopt_socket(channel: Channel, typ: u16) -> Result<usize, isize> {
             family: socket::AF_INET,
             typ,
             channel,
-            opts: SockOpts::default(),
+            opts,
         };
         Ok(match stack.entries.iter().position(|slot| slot.is_none()) {
             Some(pos) => {
@@ -1075,12 +1228,17 @@ pub(crate) fn tcp_listen(handle: usize, backlog: i32) -> Option<isize> {
             Some(l) => l,
             None => {
                 // The implicit bind: the socket is named before it can listen,
-                // because a listener with no port is not a listener.
-                let port = stack.ephemeral();
-                IpEndpoint {
-                    addr: IpAddress::v4(0, 0, 0, 0),
-                    port,
-                }
+                // because a listener with no port is not a listener. The
+                // wildcard is the address Linux gives it, and the port is one
+                // nothing else holds - the same rule `bind` applies, because it
+                // is the same act (see [`Stack::tcp_name_taken`]). A listener
+                // that had to be refused here would be one this stack cannot
+                // name at all, which is `EADDRINUSE` and not a silent overlap.
+                let addr = IpAddress::v4(0, 0, 0, 0);
+                let Some(port) = stack.bind_ephemeral(addr, entry.opts.reuseaddr) else {
+                    return crate::err::EADDRINUSE;
+                };
+                IpEndpoint { addr, port }
             }
         };
         // Which wire: the bound address decides, exactly as it does for
@@ -1141,7 +1299,7 @@ pub(crate) fn free_entry(handle: usize) {
         // are closed (see `Stack::close_listener`), the ordinary teardown path
         // is for one socket, and neither the pool nor the channel has one.
         if let Channel::TcpListen { id, .. } = &entry.channel {
-            stack.close_listener(*id);
+            stack.close_listener(*id, entry.opts.reuseaddr);
             return;
         }
         let owned = match &entry.channel {
@@ -1167,12 +1325,12 @@ pub(crate) fn free_entry(handle: usize) {
                 // it, and the alternative is a set that fills up and refuses new
                 // sockets forever.
                 if stack.teardown.len() >= TEARDOWN_MAX
-                    && let Some((old_home, oldest)) = stack.teardown.first().copied()
+                    && let Some((old_home, oldest, _)) = stack.teardown.first().copied()
                 {
                     stack.teardown.remove(0);
                     stack.sockets_mut(old_home).remove(oldest);
                 }
-                stack.teardown.push((home, h));
+                stack.teardown.push((home, h, entry.opts.reuseaddr));
             } else {
                 stack.sockets_mut(home).remove(h);
             }

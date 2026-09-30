@@ -43,7 +43,8 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         arrive *with* it, so the read answers with the record and a zero-byte
         return instead of parking on a byte that cannot come (`t-unix-scm`)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
-- [~] 4.3 TCP — the loopback and the listener are done; three options are not
+- [~] 4.3 TCP — the loopback, the listener and `SO_REUSEADDR` are done; two
+      options are not
   - [x] the loopback is a real wire — `lo` is an interface over smoltcp's own
         loopback device carrying `127.0.0.0/8`, and a socket's interface is
         decided by the first address it is given, because the stack now keeps
@@ -55,9 +56,16 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         the contract is Linux's, each rule measured first, and closing a
         listener `FIN`s its unaccepted queue because an unsolicited `RST` is
         not a packet smoltcp can send (§4.3.2, `t-tcp-listen`)
-  - [ ] `SO_REUSEADDR` (the TIME_WAIT rebind allowance, now that the listening
-        side exists to observe it) / `SO_LINGER{on,0}`'s egress reset / buffer
-        sizes still record-only (§4.3.3)
+  - [x] `SO_REUSEADDR` at `bind`/`listen` — and the rule it gates is *not* "the
+        new socket asked": measured on Linux, a holder that is **listening**
+        keeps its name whatever either side says, while any other holder
+        (a `TIME-WAIT` 4-tuple, an established connection, a bound socket)
+        yields it only to a caller that set the option **and** whose holder had
+        set it too — which is why Linux copies the option onto an accepted
+        socket, and why a restart comes back onto its own port (`t-tcp-listen`)
+        (§4.3.3)
+  - [ ] `SO_LINGER{on,0}`'s egress reset / buffer sizes still record-only
+        (§4.3.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
 - [~] 4.5 `AF_PACKET` — the link layer is a socket: `SOCK_DGRAM` `bind`/
       `sendto`/`recvfrom`/`getsockname`, a tap at the NIC seam that feeds a client
@@ -701,11 +709,18 @@ things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
    members of the performance family with a plan and no number. Both are
    measurable today, and each wants a before/after figure with the disk in
    place - and the number is allowed to say "no".
-4. **`SO_REUSEADDR` at `bind`/`listen`** (§4.3.3) - small, and newly *possible*:
-   a `TIME_WAIT` rebind is a fact about the listening side, which now exists.
-   The other two options left in that section need things this kernel cannot do
-   yet (an unsolicited reset on egress; smoltcp buffers sized after the set is
-   built), and each says so where it is defined.
+4. ~~**`SO_REUSEADDR` at `bind`/`listen`** (§4.3.3)~~ **Landed.** It was the one
+   item here expected to be small, and the work was: the answer was not, because
+   measuring it first showed the option does not mean what it is usually
+   written up as. A holder that is *listening* never yields its name, and every
+   other holder yields it only to a caller that set the option **and** whose
+   holder had set it too - so a restart survives its own `TIME-WAIT`
+   connections because Linux copies the option onto them at `accept`, not
+   because the new socket asked. All thirteen answers are pinned by
+   `t-tcp-listen`, which still runs unchanged on a Linux host. The other two
+   options left in that section need things this kernel cannot do yet (an
+   unsolicited reset on egress; smoltcp buffers sized after the set is built),
+   and each says so where it is defined.
 
 ---
 
@@ -834,7 +849,8 @@ scans for one.
   stack keeps one socket set per wire. Socket options: `TCP_NODELAY` and
   `SO_KEEPALIVE` reach the live smoltcp socket (Nagle off; probe timer armed at
   Linux's default interval) and `getsockopt` reads back every stored option;
-  `SO_REUSEADDR` (moot with one binder), buffer sizes and `SO_LINGER` are still
+  `SO_REUSEADDR` is applied at `bind`/`listen` (the holder's option counts as
+  much as the caller's - §4.3.3), while buffer sizes and `SO_LINGER` are still
   record-only.
 - **4.4** both halves of netlink are written: the route half reconfigures the
   live stack (`RTM_NEWADDR`/`NEWROUTE`/`NEWLINK`, §4.4), and the uevent half now
@@ -1304,10 +1320,11 @@ Current: auto echo reply only. No user-facing ICMP socket.
 
 ### 4.3 TCP: the loopback, the listener, and the options — **PARTIAL**
 
-Three things live in this section and two of them are done. The **loopback**
-(4.3.1) and **`listen`/`accept`** (4.3.2) are real; the **socket options**
-(4.3.3) are the part still open, and of the six, three steer the stack and three
-are stored and read back without changing a packet.
+Three things live in this section, and the **loopback** (4.3.1) and
+**`listen`/`accept`** (4.3.2) are done. The **socket options** (4.3.3) are the
+part still open, and of the six, four now steer the stack - `TCP_NODELAY`,
+`SO_KEEPALIVE`, `SO_REUSEADDR`'s bind arbitration - while two are stored and read
+back without changing a packet.
 
 #### 4.3.1 The loopback is a real wire — **DONE**
 
@@ -1403,7 +1420,7 @@ ways, the client's *half*-close read as end-of-stream while the other direction
 still carries, a second sequential connection (which is what fails if the pool
 never refills), and every refusal in the table above.
 
-#### 4.3.3 The options — **PARTIAL** (three still record-only)
+#### 4.3.3 The options — **PARTIAL** (two still record-only)
 
 `setsockopt`/`getsockopt` are no longer a no-op: each socket's registry `Entry`
 carries a `SockOpts`, and the common options round-trip with the correct ABI —
@@ -1412,15 +1429,78 @@ as 4-byte ints, `SO_LINGER` as an 8-byte `struct linger` (in-out length honoured
 plus `SO_TYPE`/`SO_ERROR`. `SO_RCVBUF`/`SO_SNDBUF` report the stack's default
 (64 KiB) until changed; unknown options are accepted and read back as 0.
 
-*Remaining (real effect, into smoltcp):* three. `SO_REUSEADDR` is not applied at
-`bind`/`listen` - it needs an allowance for a rebind over a socket still in
-`TIME_WAIT`, which is now observable because the listening side exists (4.3.2).
-`SO_LINGER` is not honoured at `close` - see 4.3.4 for why the reset it asks for
-is not something this stack can send. And `SO_RCVBUF`/`SO_SNDBUF` cannot be
-honoured per socket at all until smoltcp's buffers stop being sized once at set
-construction. Two that used to be on this list are not: `TCP_NODELAY` reaches
-the live socket (`set_nagle_enabled`), and `SO_KEEPALIVE` arms smoltcp's probe
-timer at Linux's default interval.
+**`SO_REUSEADDR` is applied at `bind`/`listen`, and the rule it gates is not the
+one the man page suggests.** That is the finding, so the measurement comes
+first. On this host's kernel, `127.0.0.1`, with the holder's own
+`SO_REUSEADDR` and the new socket's varied independently, and with the holder in
+each of the states a name can be in:
+
+| the name is held by | holder's `SO_REUSEADDR` | new socket's | `bind` |
+|---|---|---|---|
+| a listening socket, open | either | either | `EADDRINUSE` |
+| a `TIME-WAIT` 4-tuple | no | **yes** | `EADDRINUSE` |
+| a `TIME-WAIT` 4-tuple | yes | no | `EADDRINUSE` |
+| a `TIME-WAIT` 4-tuple | yes | yes | **succeeds** |
+| an established connection, listener closed | either | not both | `EADDRINUSE` |
+| an established connection, listener closed | yes | yes | **succeeds** |
+| a bound, never-connected socket | yes | yes | **succeeds** |
+
+Three things fall out of that, and two of them are corrections to what this
+option is usually described as doing:
+
+* **The new socket's word is not enough.** The row where the holder did not set
+  the option is `EADDRINUSE` *however loudly the new socket asks*. What makes a
+  restart work is the other direction: Linux copies `SO_REUSEADDR` onto a socket
+  when it is **accepted** (measured, `inet_csk_clone_lock`), so the listener's
+  option is inherited by the connections that will later sit in `TIME-WAIT` on
+  its port. A restart comes back because the *dead connections* had the option,
+  not because the new socket does.
+* **The exemption is not about `TIME-WAIT`.** A bound-but-unconnected socket and
+  a live established connection both yield their name to a caller when both
+  sides asked - so a port can be rebound while a connection is still open on it,
+  and a listener can then *share* that name with it (measured: the new listener
+  answers a fresh client while the old connection keeps its own). `TIME-WAIT` is
+  simply the state this is usually noticed in.
+* **A listener never yields.** Two live listeners on one name is what
+  `SO_REUSEPORT` is for - it is not implemented here, and setting `SO_REUSEADDR`
+  on *both* is not a substitute on Linux either (measured).
+
+So `net::Stack::tcp_name_taken` is one clause over one table of holders: a
+listening holder always conflicts; every other holder conflicts unless both it
+and the caller set the option. The names it compares are the registry's recorded
+ones plus, for a connection that recorded none (an accepted socket answers
+`getsockname` from its own 4-tuple), the socket's own endpoint - and
+`names_overlap` is the address half of the rule: the same port and either the
+same address or the wildcard on one side, so `127.0.0.1:80` and `127.0.0.2:80`
+coexist while either is refused beside `0.0.0.0:80` (measured). The holder's own
+flag has to outlive its descriptor, so `Stack::teardown` carries it beside the
+socket it named. The ephemeral pick behind a `bind(port 0)` (and behind
+`listen`'s implicit bind) goes through the same predicate, which is what keeps an
+implicit bind from landing on a `TIME-WAIT` port it would then have to refuse for
+a name the caller never chose.
+
+`t-tcp-listen` carries all of it - thirteen checks, every one of which is a line
+of the table, plus "the restarted listener is *usable*" (a fresh client connects
+to the taken-back name and its bytes arrive) and "a listener can share a name
+with an open connection, and both serve". The whole test also runs on a Linux
+host unchanged, which is the instrument: the same assertions that the guest must
+satisfy are the ones a real kernel satisfies.
+
+*Remaining (real effect, into smoltcp):* two. `SO_LINGER` is not honoured at
+`close` - see 4.3.4 for why the reset it asks for is not something this stack can
+send. `SO_RCVBUF`/`SO_SNDBUF` cannot be honoured per socket at all until
+smoltcp's buffers stop being sized once at set construction. Three that used to
+be on this list are not: `TCP_NODELAY` reaches the live socket
+(`set_nagle_enabled`), `SO_KEEPALIVE` arms smoltcp's probe timer at Linux's
+default interval, and `SO_REUSEADDR` is the rule above.
+
+Two named gaps ride with the rule rather than the option. The predicate lives in
+`net/mod.rs`, which is gated `target_os = "none"` (`src/lib.rs:48`), so it has no
+host unit test - the guest program is the pin, the same situation `AF_PACKET`'s
+parsers are in (§4.5). And **smoltcp's `TIME-WAIT` is ten seconds**
+(`CLOSE_DELAY`) where Linux's is sixty (`TCP_TIMEWAIT_LEN`), so this machine
+gives a name back six times sooner. The rule about *who* may take it is
+identical; only the wait is short.
 
 #### 4.3.4 `close(2)`, and the teardown the descriptor could not wait for — **DONE**
 
@@ -1453,15 +1533,15 @@ the `FIN` the peer gets now. Honouring it needs an actual reset on egress - the
 same missing primitive that makes closing a listener `FIN` its unaccepted queue
 instead of resetting it (4.3.2).
 
-*Remaining after those:* `SO_REUSEADDR` applied at `bind`/`listen` — a rebind
-allowance over a socket still in `TIME_WAIT`, which the listener above is what
-makes observable at all, and which is the next thing in this section; 
-`SO_KEEPALIVE` probe packets; and a reset on egress for `SO_LINGER{on, 0}`.
-`SO_RCVBUF`/`SO_SNDBUF` cannot be honoured per
+*Remaining after those:* `SO_KEEPALIVE` probe packets; and a reset on egress for
+`SO_LINGER{on, 0}`. `SO_RCVBUF`/`SO_SNDBUF` cannot be honoured per
 socket as things stand: smoltcp sizes its buffers when the socket set is built,
 so a real answer needs either a set rebuilt per requested size or a limit applied
 in the mpos read/write queue - and until one of those exists the options should
-say so rather than round-trip a number that changes nothing.
+say so rather than round-trip a number that changes nothing. `SO_REUSEADDR` used
+to be on this line and is not any more: it is applied at `bind`/`listen` now
+(§4.3.3), and the rebind allowance it gates turned out to be a rule about the
+*holder's* option as much as the caller's.
 
 ### 4.4 Netlink Write Operations — **DONE**
 
@@ -4216,8 +4296,10 @@ The gate has no known red baseline any more; a new red is a regression, full sto
 
 - Anything already honestly refused. `fanotify`/`keyctl`/`userfaultfd`/namespaces and the
   `_ => ENOSYS` dispatch arm are correct answers, not gaps to close here.
-- `SO_REUSEADDR`/`SO_LINGER`/buffer sizes (`record-only`) and the missing `/proc/<pid>/maps` —
+- `SO_LINGER`/buffer sizes (`record-only`) and the missing `/proc/<pid>/maps` —
   already tracked in §4.3 / the ABI board; this phase does not duplicate them.
+  (`SO_REUSEADDR` was on this list and is not any more: it is applied at
+  `bind`/`listen`, §4.3.3.)
 - Real `MSG_PEEK` over TCP/UDP, real `rseq` state, real per-task CPU accounting: named here as
   sub-gaps, planned where the prerequisite (peek-preserving delivery, the clock, the
   scheduler's own timekeeping) is scheduled.

@@ -24,11 +24,14 @@
 use rustix::fd::OwnedFd;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
+use rustix::net::sockopt::{set_socket_reuseaddr, socket_reuseaddr};
 use rustix::net::{
     AddressFamily, RecvFlags, SendFlags, Shutdown, SocketAddrAny, SocketAddrV4, SocketType, accept,
     acceptfrom, bind, connect, getpeername, getsockname, listen, recvfrom, send, shutdown, socket,
 };
 use std::net::Ipv4Addr;
+use std::thread;
+use std::time::Duration;
 
 /// The address that names the loopback, and the only one a server can be
 /// reached at from inside this machine.
@@ -361,6 +364,265 @@ fn main() {
     }
     drop(unbound);
     drop(server);
+
+    // `SO_REUSEADDR`, and the single exemption it gates. Every answer below was
+    // measured on a real kernel first (`PLAN.md` §4.3.3 has the table), and the
+    // rule they add up to is not the one the man page suggests:
+    //
+    //   a holder that is *listening* keeps its name; any other holder yields it
+    //   only to a caller that set `SO_REUSEADDR` **and** whose holder had set it
+    //   too.
+    //
+    // The second half is the surprising one, and it is what makes the option
+    // work in practice: a server sets it on the listener, its accepted
+    // connections inherit it (Linux copies it across, and the row below pins
+    // that this kernel does too), and *that* is why a restart can take back the
+    // port its own dead connections are holding.
+    //
+    // `try_bind` is the whole instrument: bind with the option set or not, and
+    // keep the descriptor on success so the name stays held.
+    fn try_bind(addr: &SocketAddrV4, reuse: bool) -> Result<OwnedFd, Errno> {
+        let s = stream();
+        if reuse {
+            let _ = set_socket_reuseaddr(&s, true);
+        }
+        bind(&s, addr).map(|()| s)
+    }
+    let loopback = SocketAddrV4::new(LOOPBACK, 0);
+
+    // A listener's own name is never given away, whatever the two sockets say:
+    // two live listeners on one name is what `SO_REUSEPORT` is for, and this
+    // kernel does not implement it - setting the option on both is not enough
+    // on Linux either.
+    let live = stream();
+    r.check(
+        "a listener can set SO_REUSEADDR",
+        set_socket_reuseaddr(&live, true).is_ok(),
+    );
+    let _ = bind(&live, &loopback);
+    let _ = listen(&live, 1);
+    let live_addr = getsockname(&live)
+        .ok()
+        .and_then(as_v4)
+        .expect("the live listener's name");
+    for (tag, reuse) in [("without", false), ("with", true)] {
+        match try_bind(&live_addr, reuse) {
+            Err(err) => r.check(
+                &format!("a listening name is EADDRINUSE {tag} SO_REUSEADDR (got {err})"),
+                err == Errno::ADDRINUSE,
+            ),
+            Ok(_) => r.check(
+                &format!("a listening name is EADDRINUSE {tag} SO_REUSEADDR (it bound)"),
+                false,
+            ),
+        }
+    }
+
+    // A connection that ends with *this* side closing first leaves its 4-tuple
+    // in `TIME-WAIT`, holding the name the listener was bound to. Accepting it
+    // from a listener that asked for the option is the shape a server has, and
+    // the inherited bit is what a restart leans on.
+    let srv = stream();
+    let _ = set_socket_reuseaddr(&srv, true);
+    let _ = bind(&srv, &loopback);
+    let _ = listen(&srv, 4);
+    let srv_addr = getsockname(&srv)
+        .ok()
+        .and_then(as_v4)
+        .expect("the server's name");
+    let first_client = stream();
+    let first_conn = match connect(&first_client, &srv_addr).and_then(|()| accept(&srv)) {
+        Ok(conn) => conn,
+        Err(err) => {
+            r.check(
+                &format!("the connection whose close makes the TIME-WAIT is made (got {err})"),
+                false,
+            );
+            println!("FAILED");
+            std::process::exit(1);
+        }
+    };
+    r.check(
+        "an accepted connection inherits the listener's SO_REUSEADDR",
+        socket_reuseaddr(&first_conn).unwrap_or(false),
+    );
+    // The listener goes first, then the connection it accepted - so the
+    // *server's* side is the active closer and its 4-tuple is the one that
+    // lingers - then the client, whose `FIN` is what lets the server's socket
+    // finish rather than sit in `FIN-WAIT`. The sleep is the polls: the stack
+    // advances on the service task's beat, and the transition is on the wire,
+    // not in this process.
+    drop(srv);
+    drop(first_conn);
+    drop(first_client);
+    thread::sleep(Duration::from_millis(250));
+
+    // Without the option the name is gone for as long as the 4-tuple lives,
+    // which is the whole reason the option exists.
+    match try_bind(&srv_addr, false) {
+        Err(err) => r.check(
+            &format!("a TIME-WAIT name is EADDRINUSE without SO_REUSEADDR (got {err})"),
+            err == Errno::ADDRINUSE,
+        ),
+        Ok(_) => r.check(
+            "a TIME-WAIT name is EADDRINUSE without SO_REUSEADDR (it bound)",
+            false,
+        ),
+    }
+    let rebind = match try_bind(&srv_addr, true) {
+        Ok(sock) => {
+            r.check("and comes back to a restart that asks for it", true);
+            sock
+        }
+        Err(err) => {
+            r.check(
+                &format!("and comes back to a restart that asks for it (got {err})"),
+                false,
+            );
+            println!("FAILED");
+            std::process::exit(1);
+        }
+    };
+    // The taken-back name has to be *usable*, not merely accepted: a listener
+    // on it answers a fresh client, whose 4-tuple is its own and so is not the
+    // one still winding down.
+    match listen(&rebind, 1) {
+        Ok(()) => r.check("the restart listens on the name it took back", true),
+        Err(err) => r.check(
+            &format!("the restart listens on the name it took back (got {err})"),
+            false,
+        ),
+    }
+    let fresh = stream();
+    match connect(&fresh, &srv_addr).and_then(|()| accept(&rebind)) {
+        Ok(conn) => {
+            r.check("and a fresh client reaches it", true);
+            let carried = send(&fresh, REQUEST, SendFlags::empty())
+                .is_ok_and(|n| n == REQUEST.len())
+                && recvfrom(&conn, &mut buf, RecvFlags::empty())
+                    .is_ok_and(|(n, _, _)| n == REQUEST.len() && &buf[..n] == REQUEST);
+            r.check("carrying its own bytes", carried);
+            drop(conn);
+        }
+        Err(err) => r.check(&format!("and a fresh client reaches it (got {err})"), false),
+    }
+    drop(fresh);
+
+    // The row that decides whether the rule was read right: the holder did
+    // *not* have the option, so the new socket's own is not enough.
+    let noopt = stream();
+    let _ = bind(&noopt, &loopback);
+    let _ = listen(&noopt, 1);
+    let noopt_addr = getsockname(&noopt)
+        .ok()
+        .and_then(as_v4)
+        .expect("the second server's name");
+    let noopt_client = stream();
+    let noopt_conn = match connect(&noopt_client, &noopt_addr).and_then(|()| accept(&noopt)) {
+        Ok(conn) => conn,
+        Err(err) => {
+            r.check(
+                &format!("the optionless server's connection is made (got {err})"),
+                false,
+            );
+            println!("FAILED");
+            std::process::exit(1);
+        }
+    };
+    r.check(
+        "an accepted connection of an optionless listener inherits nothing",
+        !socket_reuseaddr(&noopt_conn).unwrap_or(true),
+    );
+    drop(noopt);
+    drop(noopt_conn);
+    drop(noopt_client);
+    thread::sleep(Duration::from_millis(250));
+    match try_bind(&noopt_addr, true) {
+        Err(err) => r.check(
+            &format!("a holder without the option keeps its name (got {err})"),
+            err == Errno::ADDRINUSE,
+        ),
+        Ok(_) => r.check(
+            "a holder without the option keeps its name (it bound)",
+            false,
+        ),
+    }
+
+    // And the exemption is not about `TIME-WAIT` at all: a *live* connection
+    // holds the name by the same clause, so a port can be taken back while a
+    // connection is still open on it - `SO_REUSEPORT` and `SO_REUSEADDR` are
+    // two different promises and neither of them is "nothing else may use
+    // this".
+    let held = stream();
+    let _ = set_socket_reuseaddr(&held, true);
+    let _ = bind(&held, &loopback);
+    let _ = listen(&held, 4);
+    let held_addr = getsockname(&held)
+        .ok()
+        .and_then(as_v4)
+        .expect("the third server's name");
+    let held_client = stream();
+    let held_conn = match connect(&held_client, &held_addr).and_then(|()| accept(&held)) {
+        Ok(conn) => conn,
+        Err(err) => {
+            r.check(
+                &format!("the long-lived server's connection is made (got {err})"),
+                false,
+            );
+            println!("FAILED");
+            std::process::exit(1);
+        }
+    };
+    // The listener goes; the *connection* stays open and is the holder now.
+    drop(held);
+    thread::sleep(Duration::from_millis(100));
+    match try_bind(&held_addr, false) {
+        Err(err) => r.check(
+            &format!("a live connection holds its name without the option (got {err})"),
+            err == Errno::ADDRINUSE,
+        ),
+        Ok(_) => r.check(
+            "a live connection holds its name without the option (it bound)",
+            false,
+        ),
+    }
+    let shared = match try_bind(&held_addr, true) {
+        Ok(sock) => {
+            r.check("and yields it when both sides asked", true);
+            sock
+        }
+        Err(err) => {
+            r.check(
+                &format!("and yields it when both sides asked (got {err})"),
+                false,
+            );
+            println!("FAILED");
+            std::process::exit(1);
+        }
+    };
+    // Usable, again: the listener that now shares the name with the open
+    // connection answers a client of its own, while the connection keeps the
+    // one it already had.
+    let listens_anyway = listen(&shared, 1).is_ok();
+    let fresh2 = stream();
+    let both_carry = match connect(&fresh2, &held_addr).and_then(|()| accept(&shared)) {
+        Ok(conn) => {
+            let carried = send(&fresh2, REQUEST, SendFlags::empty())
+                .is_ok_and(|n| n == REQUEST.len())
+                && recvfrom(&conn, &mut buf, RecvFlags::empty())
+                    .is_ok_and(|(n, _, _)| n == REQUEST.len() && &buf[..n] == REQUEST);
+            drop(conn);
+            carried
+        }
+        Err(_) => false,
+    };
+    r.check(
+        "a listener can share a name with an open connection, and both serve",
+        listens_anyway && both_carry,
+    );
+    drop(fresh2);
+    drop(held_conn);
+    drop(held_client);
 
     if r.failed {
         println!("FAILED");
