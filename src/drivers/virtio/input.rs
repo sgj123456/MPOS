@@ -1104,8 +1104,8 @@ pub fn service() {
             // whether a grabbed node is fed or dropped - is what takes the
             // keyboard off the shell: while the active console is graphics, a
             // keystroke belongs to the compositor and only to it, whether or not
-            // libinput has taken `EVIOCGRAB` on the node yet. A `--mode gui` text
-            // console is `KD_TEXT`, so this is false there and the shell keeps
+            // libinput has taken `EVIOCGRAB` on the node yet. A `--mode mirror`
+            // text console is `KD_TEXT`, so this is false there and the shell keeps
             // its keyboard exactly as the plain-console case requires.
             let graphics = crate::vfs::vcmux::kd_mode(crate::vfs::vcmux::active())
                 == crate::vfs::tty::KD_GRAPHICS;

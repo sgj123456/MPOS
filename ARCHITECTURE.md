@@ -242,7 +242,9 @@ Details worth knowing:
   word for *how the machine was launched*, because that is not a fact about the machine: a
   QEMU booted without a window still has a virtio-gpu and still reports a display mode, so
   only the command line can say whether the framebuffer console is one of the consoles.
-  `cargo xtask run --mode terminal|gui|mirror|weston` picks the list
+  `cargo xtask run --mode terminal|gui|mirror` picks the list — three words for the two questions
+  a mode can actually answer (is there a window, and is the framebuffer one of the consoles), and
+  `gui` is the wire-alone list with a window attached
   (`src/boot/console_list.rs` reads it, `xtask/src/config.rs` writes it), and a compositor's
   claim on the scanout is arbitrated at runtime through the DRM master and `KDSETMODE`
   (`src/vfs/vcmux.rs`), never at boot.

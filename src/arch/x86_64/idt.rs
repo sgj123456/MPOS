@@ -341,8 +341,8 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         crate::sched::preempt();
         return;
     }
-    // The report is the whole point of this path, and on a GUI or compositor
-    // boot the console is the framebuffer - so without pulling it back to the
+    // The report is the whole point of this path, and on a `--mode mirror` boot
+    // the console is the framebuffer - so without pulling it back to the
     // wire first, a kernel that dies here leaves the reader with a vanished
     // machine and no explanation. The same move as `fatal` and the panic
     // handler in `main`.
@@ -593,7 +593,7 @@ fn pf_diag(addr: usize, rip: usize) {
 /// for a ring-0 fault they are not a stack pointer and not a segment.
 fn fatal(name: &str, frame: &InterruptStackFrame, code: u64) -> ! {
     // The report is the whole reason for the last-resort path, so it has to
-    // reach the host: on a GUI or compositor boot the console lives in the
+    // reach the host: on a `--mode mirror` boot the console lives in the
     // framebuffer, and a machine that dies with its report painted into a
     // window nobody is looking at leaves the reader with a vanished QEMU and
     // no explanation. Same move as the panic handler in `main`.

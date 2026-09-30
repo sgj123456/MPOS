@@ -189,7 +189,7 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 
 **Wayland compositor (weston) support** — the cross-cutting work a rootful
 compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
-`cargo xtask run --mode weston`):
+`cargo xtask run --mode gui`):
 - [x] Peer credential + fd passing (SCM_RIGHTS/`SO_PEERCRED`) — Stage 0 (see §4.1)
 - [x] libinput device classification — evdev capability ioctls — Stage 1, `t-evdev`
 - [x] Device discovery — `/dev/input`, `/sys/class/input`, input uevents — Stage 2
@@ -2819,6 +2819,39 @@ became four lists — `console=ttyS0` for terminal and weston, `console=tty0` fo
 `console=ttyS0 console=tty0` for mirror — so mirror stopped being a flag pair and
 became an *order*, and terminal and weston became the same list, because what
 differs between them (a compositor driving the scanout) is runtime, not boot-time.
+
+**Four lists were one list too many, and three modes are the honest count.** That
+last sentence is the reason the fourth word went away: a mode that tells the guest
+exactly what another mode tells it was never a fourth machine. `weston`/`compositor`
+is deleted, and `gui` — which had been the fourth shape, `console=tty0` with the
+serial line sent to `/dev/null` — is the wire-alone list with a window on it. What
+is left is the two questions a mode can actually answer: is there a window, and is
+the framebuffer one of the guest's consoles. So `terminal` and `gui` share
+`console=ttyS0` and differ only in `-display`; `gui` and `mirror` share the QEMU
+wiring and differ only in one `console=tty0`. Every mode now puts the wire on stdio,
+which deletes a branch rather than adding one: the mode that discarded the serial
+line discarded the kernel log with it, and a log nobody can read is not a machine
+anybody wants — that was the one mode whose wiring and console list could disagree
+about the wire, and `run_modes_round_trip_and_name_their_console_list` used to spend
+half its assertions policing that agreement.
+
+`weston` is *not* kept as a synonym for `gui`, and that cost a shape change in the
+config layer. `[qemu] mode` used to fall back to `mirror` when it could not parse
+the word (so a `cargo xtask test` boot, which attaches no window, would not fail on
+a typo it never uses) — a fallback that is now the wrong answer, because the retired
+word names a machine whose consoles differ from the default's. `QemuConfig` therefore
+stores the key as text (`mode_text`) and `run_mode()` resolves it at the two places
+that boot a window: absent or blank means `mirror`, an unknown word is an error. The
+image marker keeps its `build/console.mode` name and its old contents read as "no
+marker": an image baked as `weston` costs one boot-file refresh to rename it, and the
+`mpos.cmdline` it rewrites is already `gui`'s.
+
+Records elsewhere in this file that say `--mode weston` are measurements of the boot
+that name described, and are not rewritten; today they are read as `--mode gui`. The
+reverse reading is the one to watch: a record that says `--mode gui` and describes a
+console *on* the framebuffer — line 308's "with the serial line discarded", the
+`KD_TEXT` console of line 228 — was measured on the shape that word then had, and is
+today's `--mode mirror`.
 
 **The rule the design rests on, and what was not measured.** "The log goes to
 every console named, and the last is preferred" is `kernel-parameters.txt`. The

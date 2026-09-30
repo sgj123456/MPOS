@@ -33,10 +33,11 @@ struct Cli {
     profile: Option<String>,
 
     /// How to boot the machine (default: `[qemu] mode` in `machine.toml`, or
-    /// mirror): `terminal` (serial only, no window), `gui` (window only, the
-    /// console on the framebuffer), `mirror` (both at once), or `weston` (the
-    /// window is the compositor's, and the console stays off the framebuffer).
-    /// Global so `cargo xtask run --mode weston` accepts it after the
+    /// mirror): `terminal` (serial only, no window), `gui` (the whole machine —
+    /// a window with every device behind it, and the kernel console kept off the
+    /// framebuffer so a compositor can take the screen), or `mirror` (`gui` plus
+    /// the console drawn in the window too, so both views show the same text).
+    /// Global so `cargo xtask run --mode gui` accepts it after the
     /// subcommand, where a plain parent flag would be rejected.
     #[arg(long, value_name = "MODE", global = true)]
     mode: Option<String>,
@@ -126,9 +127,7 @@ fn main() -> Result<()> {
     // already baked. The desired mode travels to the privileged half through
     // `MPOS_XTASK_MODE`.
     let run_mode = match cli.mode.as_deref() {
-        Some(text) => Some(config::RunMode::parse(text).ok_or_else(|| {
-            anyhow::anyhow!("unknown mode {text:?}; expected terminal, gui, mirror or weston")
-        })?),
+        Some(text) => Some(config::RunMode::parse_strict(text)?),
         // With no `--mode`, `run` boots the mode `machine.toml` names rather
         // than whatever the image happens to have been baked with. Reading it
         // here is what makes editing that key cheap: `needs_mode_switch` below
@@ -136,8 +135,13 @@ fn main() -> Result<()> {
         // same path `--mode` takes - where before, the key lived in
         // `rootfs.toml` and changing it marked the whole image stale and
         // reinstalled the Alpine tree for one line of `mpos.cmdline`.
+        //
+        // A key naming a word this crate no longer has - `weston` was one - is
+        // reported here rather than defaulted: the consoles baked differ between
+        // the modes, so booting the default instead would be a machine nobody asked
+        // for. `test` never reaches this and so never fails on it.
         None if matches!(cli.command, Commands::Run) => {
-            Some(config::QemuConfig::load_default()?.mode)
+            Some(config::QemuConfig::load_default()?.run_mode()?)
         }
         None => None,
     };

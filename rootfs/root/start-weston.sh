@@ -28,7 +28,9 @@
 # killed the seat manager with it, and the next run found only the stale
 # socket). See the notes at each step below.
 #
-# Run it from a weston boot (cargo xtask run --mode weston):
+# Run it from a gui boot (cargo xtask run --mode gui), at root's login prompt on
+# the serial terminal - the window stays the compositor's to fill, so it is blank
+# until this script runs weston:
 #     ./start-weston.sh [extra weston args...]
 
 set -eu

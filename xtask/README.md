@@ -77,7 +77,7 @@ cargo xtask [global flags] <command>
 | --- | --- | --- | --- |
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
-| 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror` / `weston`（默认取 `machine.toml` 的 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror`/`weston` (defaults to `[qemu] mode` in `machine.toml`, else `mirror`) |
+| 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `machine.toml` 的 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `[qemu] mode` in `machine.toml`, else `mirror`) |
 | 测试分组 | `--groups <A,B>` | 仅 `test`：除分组外的测试之外再跑这些分组（取代 `tests.toml` 的 `default`）| `test` only: run these groups *in addition* to the ungrouped tests (replaces the file's `default`) |
 | 全部分组 | `--all-groups` | 仅 `test`：连非默认分组一起跑 | `test` only: run every group, including the ones left out by default |
 
@@ -117,9 +117,9 @@ cargo xtask run         # 开窗启动
 cargo xtask run         # 自动判断是否要重建，只重编必要部分
 
 # 选运行模式启动 | boot in a chosen mode
-cargo xtask run --mode gui        # 只看窗口 | window only
 cargo xtask run --mode terminal   # 只看串口终端 | serial terminal only
-cargo xtask run --mode weston     # 窗口留给合成器 | window for the compositor
+cargo xtask run --mode gui        # 整机：窗口 + 控制台不进 framebuffer | the whole machine
+cargo xtask run --mode mirror     # 窗口和终端同时看到控制台 | both views at once
 
 # 跑完整自测 | full self-test
 cargo test  -p mpos --lib --target x86_64-unknown-linux-gnu   # 只跑宿主单测
@@ -222,7 +222,7 @@ are both said out loud.
 
 ---
 
-## `run` 的四种运行模式 | The four `run` modes
+## `run` 的三种运行模式 | The three `run` modes
 
 `cargo xtask run` 用 `--mode` 一次决定整机怎么启动（缺省取 `machine.toml` 里的
 `[qemu] mode`，再缺省为 `mirror`）。窗口和串口怎么接线是启动方的事；客机只被告知
@@ -231,26 +231,37 @@ are both said out loud.
 | 模式 | mode | 画面 | QEMU 接线 | 客机引导参数 |
 | --- | --- | --- | --- | --- |
 | 终端 | `terminal` | 只有串口终端，无窗口 | `-display none` + 串口走 stdio | `console=ttyS0` |
-| 图形 | `gui` | 只有 framebuffer 窗口，切换后串口静默 | `-display <后端>` + 串口丢弃 | `console=tty0` |
+| 图形 | `gui` | 全设备的机器：窗口归运行时拿走光栅的那一位（未有人 claim 时窗口留白），串口始终有日志 | `-display <后端>` + 串口走 stdio | `console=ttyS0` |
 | 镜像 | `mirror` | 窗口为主，串口尽力跟一份 | `-display <后端>` + 串口走 stdio | `console=ttyS0 console=tty0` |
-| 合成器 | `weston` | 窗口归 weston（其 VT 在屏期间，由 root 的 `start-weston.sh` 启动）；`^A 1..6` 切走后窗口显示该控制台，串口始终有日志 | `-display <后端>` + 串口走 stdio | `console=ttyS0` |
+
+只有两个问题要回答——有没有窗口、framebuffer 算不算客机的控制台——所以模式只有三个。
+第三个问题曾经由 `weston`/`compositor` 这个词来"回答"，但它给客机的引导参数和
+`terminal` 一字不差：把窗口让给合成器是运行时的事实（weston 会 `SET_MASTER` 拿走光栅、
+用 `KDSETMODE(KD_GRAPHICS)` 声明屏幕归它画），命令行从来不能说这件事。于是那个词
+并进了 `gui`——`gui` 就是"带窗口的完整机器"，控制台不进 framebuffer，串口无损地带着
+日志；而 `gui` 与 `mirror` 的 QEMU 接线完全相同，只差客机列表里那一个 `console=tty0`。
+
+三个模式都把串口接到 stdio。以前有一个模式把串口丢进 `/dev/null`，它同时也把内核日志
+丢了；现在没有那种接法，因此也就没有"接线和客机列表对不上串口"的可能。
 
 客机那一列只有 `console=` 一个词，规则也是 Linux 的：可以重复，列上的每一个都收日志，
 **最后一个**是首选控制台（写不下去就等、不丢字节的那一个）。于是「镜像」不再是一个
-新概念，它就是"两个都列上、framebuffer 在后"；「终端」和「合成器」给客机的引导参数
-完全相同——把窗口让给合成器是运行时的事实（weston 会 `SET_MASTER` 拿走光栅、用
-`KDSETMODE(KD_GRAPHICS)` 声明屏幕归它画），不是命令行能说的事。命令行的形状因此
-不再随"这个镜像打算怎么给人看"而变。
+新概念，它就是"两个都列上、framebuffer 在后"。命令行的形状因此不再随"这个镜像打算怎么
+给人看"而变。
 
 `--mode terminal` 也仍然会探测显示设备、`/dev/fb0` 仍然可用：控制台不在屏幕上，
 不等于设备不在机器上。
 
+一个这个词组里没有的名字（包括已经删除的 `weston` 与 `compositor`）在 `run` 处是
+错误，不是默认值：它们烘焙的 `console=` 列表不同，静默回退等于启动一台没人要求的机器。
+`test` 不开窗口，所以永远不读这个键，也不会被它的拼写错误绊住。
+
 切换很快：`--mode` 指定的模式会随特权子步骤刷新**只改引导文件**（`rootfs`
 本来就跳过重装 Alpine），重写镜像里的 `mpos.cmdline`；`build/console.mode`
 记录档让 `run` 在镜像已是该模式时**跳过提权**（该文件名沿用旧称：它只是缓存，
-改名会让每个既有镜像看起来都需要重新烘焙一次）。早于运行模式的镜像没有这个记录档，
-它会被刷新——那种镜像的命令行只写了 `console=ttyS0`，在现在的内核读来就是"串口是
-唯一的控制台"，和它当初的启动方式并不相同。
+改名会让每个既有镜像看起来都需要重新烘焙一次）。早于运行模式的镜像、以及上一次以
+`weston` 烘焙的镜像都没有这个记录档可读，因此各花一次刷新——后者的命令行本来就是
+`gui` 的那一条，刷新只是给记录档改名。
 
 `cargo xtask run` picks the whole machine with `--mode` (default from
 `machine.toml`'s `[qemu] mode`, else `mirror`). How the window and the serial line
@@ -261,21 +272,32 @@ consoles it has - and that is said in Linux's own word, `console=`:
   *lossless* console: it is the only one, so it is also the preferred one. The
   display device is still probed and `/dev/fb0` still answers; nothing is drawn
   on it.
-- **gui** — the framebuffer window only (`console=tty0`); the serial line carries
-  nothing, and is not a console at all.
+- **gui** — the whole machine: a window with every device behind it, and
+  `console=ttyS0`, so the kernel console has no business on a screen a compositor
+  is driving. What makes it a compositor boot is runtime, not boot-time: weston
+  opens the card and takes `DRM_IOCTL_SET_MASTER`, which binds the master to its
+  console, and `KDSETMODE`'s `KD_GRAPHICS` is its own word that the screen is its
+  to draw. Nothing launches the compositor; root's `./start-weston.sh` does, once
+  the login prompt appears **on the serial terminal** — until a session claims the
+  card the window is the compositor's to fill and stays blank. `^A 1`..`^A 6`
+  switches away anyway — the session is asked to release the display (and a session
+  in `VT_PROCESS` is *asked*, which is why `^A` twice is the escape hatch), its page
+  flips start answering `EACCES`, and the window shows the console you moved to.
+  This is the mode that used to be called `weston`; it told the guest exactly what
+  `terminal` tells it, so the word carried no machine of its own.
 - **mirror** — both consoles, framebuffer preferred (`console=ttyS0
   console=tty0`): the window takes the console over once the framebuffer is up,
-  and the wire keeps a **best-effort** copy of the same text.
-- **weston** — `console=ttyS0`, the same list terminal boots with: the kernel
-  console has no business on a screen a compositor is driving, and what makes
-  this a compositor boot is runtime, not boot-time. weston opens the card and
-  takes `DRM_IOCTL_SET_MASTER`, which binds the master to its console, and
-  `KDSETMODE`'s `KD_GRAPHICS` is its own word that the screen is its to draw.
-  Nothing launches the compositor; root's `./start-weston.sh` does, once the login
-  prompt appears. `^A 1`..`^A 6` switches away anyway — the session is asked to
-  release the display (and a session in `VT_PROCESS` is *asked*, which is why `^A`
-  twice is the escape hatch), its page flips start answering `EACCES`, and the
-  window shows the console you moved to.
+  and the wire keeps a **best-effort** copy of the same text. Same QEMU wiring as
+  `gui`, one `console=tty0` apart.
+
+All three put the serial line on stdio. One mode used to send it to `/dev/null`,
+and it threw the kernel log away with it; with nothing left to discard, a mode can
+no longer disagree with itself about the wire.
+
+A word neither source recognises - including the retired `weston` and `compositor` -
+is an error at `run`, not a default: the modes bake different `console=` lists, so
+silently booting `mirror` would be a machine nobody asked for. `test` never attaches
+a window, so it never reads the key and cannot be tripped by its spelling.
 
 Switching is fast: the requested mode rides into the privileged step, which
 refreshes **only the boot files** (`rootfs` already skips the Alpine reinstall) and
@@ -283,9 +305,10 @@ rewrites `mpos.cmdline`; a `build/console.mode` marker lets `run` skip the root
 step when the image already carries that mode. (That marker keeps its old
 `console.mode` filename on purpose: it is a cache, and a new name would read as
 "nothing baked" and make every existing image look like it needed a rebuild. An
-image with no marker at all was built before the run modes existed and is
-refreshed: its line names the wire alone, which the kernel now reads as exactly
-that.)
+image with no marker at all was built before the run modes existed, and one baked
+as `weston` has a marker nothing reads any more; each costs the one refresh. The
+second one's command line is already `gui`'s, so that refresh only renames the
+marker.)
 
 > **镜像不再拖累图形 | The mirror no longer throttles the window.** 镜像模式下
 > 串口是尽力而为的：洪水般的输出（`yes`、`bat`）可能让串口那份记录丢字节，
@@ -299,11 +322,15 @@ that.)
 
 ## 在 `run` 的虚拟机里操作 | Interacting with the running guest
 
-- **画面 | Picture**：`gui` / `mirror` 模式下 shell 与内核日志渲染到 QEMU 的图形
-  窗口（framebuffer 控制台）；`mirror` 还会在串口尽力跟一份，`terminal` 则只有串口。
-  In `gui`/`mirror` the shells and kernel log render into the QEMU window
-  (the framebuffer console); `mirror` also copies to the serial line best-effort,
-  and `terminal` shows only the serial line.
+- **画面 | Picture**：`mirror` 把 shell 与内核日志都渲染到 QEMU 的图形窗口（framebuffer
+  是客机的控制台）；`gui` 把这个窗口让给合成器——没有人 claim 这张卡时它是留白的，
+  内核日志因此始终只在串口上，`./start-weston.sh` 之后窗口归 weston，`^A 1..6` 切走时
+  窗口显示你切到的那个控制台；`terminal` 则只有串口。
+  In `mirror` the shells and the kernel log both render into the QEMU window (the
+  framebuffer is one of the guest's consoles); in `gui` that window is the
+  compositor's — blank until a session claims the card, which is why the kernel log
+  stays on the wire, weston's once `./start-weston.sh` runs it, and the console you
+  switched to after `^A 1..6`; `terminal` shows only the serial line.
 - **键盘 | Keyboard**：直接在图形窗口里输入（virtio-input）。
   Type directly into the window (virtio-input).
 - **虚拟终端切换 | Virtual consoles**：`Ctrl-A` 然后数字 `1`–`6` 在六个 `/dev/ttyN`

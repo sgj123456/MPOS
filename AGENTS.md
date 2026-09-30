@@ -70,7 +70,7 @@ the network.
 | `cargo xtask build` | Kernel + UEFI loader | no |
 | `cargo xtask all` | Kernel, initramfs, disk image, root filesystem | yes |
 | `cargo xtask run` | Boot in QEMU, rebuilding if anything is stale | when needed |
-| `cargo xtask run --mode terminal\|gui\|mirror\|weston` | Same, with the QEMU wiring and the guest's `console=` list chosen together | when needed |
+| `cargo xtask run --mode terminal\|gui\|mirror` | Same, with the QEMU wiring and the guest's `console=` list chosen together - three modes because there are two questions: is there a window, and is the framebuffer one of the guest's consoles | when needed |
 | `cargo xtask test` | **The gate.** Host unit tests, then every user test program booted in QEMU | no |
 | `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` | Just the host unit tests | no |
 | `cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu` | xtask's own unit tests | no |

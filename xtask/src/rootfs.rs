@@ -22,14 +22,15 @@ use crate::utils;
 /// Reading it from the machine's own file is what makes a mode change cheap:
 /// the key is not in `rootfs.toml`, so it cannot mark the image stale, and the
 /// only thing a new mode costs is the boot-file refresh below.
+///
+/// A word neither source recognises is an error rather than the default, in both
+/// halves: this is the step that writes `mpos.cmdline`, so a silent fallback would
+/// put consoles the user never asked for inside the image.
 fn effective_mode() -> Result<RunMode> {
-    if let Some(text) = std::env::var("MPOS_XTASK_MODE").ok()
-        && let Some(mode) = RunMode::parse(&text)
-    {
-        return Ok(mode);
+    if let Ok(text) = std::env::var("MPOS_XTASK_MODE") {
+        return RunMode::parse_strict(&text);
     }
-    let qemu = QemuConfig::load_default()?;
-    Ok(qemu.mode)
+    QemuConfig::load_default()?.run_mode()
 }
 
 pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {

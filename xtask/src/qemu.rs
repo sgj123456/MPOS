@@ -53,14 +53,18 @@ fn mode_marker_path(build_dir: &Path) -> PathBuf {
 }
 
 /// The mode last baked into the image, or `None` for an image that carries no
-/// marker at all - one built before the run modes existed.
+/// marker the current xtask recognises - one built before the run modes existed,
+/// or one baked when `weston` was a mode word and is not one any more.
 ///
 /// A missing marker is deliberately not read as [`RunMode::Mirror`]: such an
 /// image's command line says `console=ttyS0` and nothing else, and the kernel
 /// now reads that the way Linux does - the wire is the *only* console. A mirror
 /// image has to name the framebuffer console too, so the two are different
 /// machines and the caller gets to decide what to do about it, rather than being
-/// told a mode the image does not carry.
+/// told a mode the image does not carry. A retired word reads the same way, and
+/// costs the same one boot-file refresh: the line it rewrote is unchanged for the
+/// mode that absorbed it (`weston`'s `console=ttyS0` *is* `gui`'s), so the refresh
+/// only renames the marker.
 pub fn baked_mode(build_dir: &Path) -> Option<RunMode> {
     fs::read_to_string(mode_marker_path(build_dir))
         .ok()
@@ -209,7 +213,7 @@ pub fn machine_args(
         // A pointer, so a compositor has somewhere to route the mouse. The
         // tablet is absolute (a host cursor position maps straight onto it),
         // which is what a windowed display feeds, so it is the form that
-        // actually moves a weston pointer rather than a relative mouse the
+        // actually moves a compositor's pointer rather than a relative mouse the
         // SDL window would have to grab and release.
         "-device".into(),
         "virtio-tablet-pci".into(),
@@ -282,18 +286,17 @@ pub fn machine_args(
                 "none".to_string()
             };
             args.extend(["-display".into(), display]);
-            if mode.serial_to_stdio() {
-                args.extend([
-                    "-chardev".into(),
-                    "stdio,id=stdio0,mux=off,signal=off".into(),
-                    "-serial".into(),
-                    "chardev:stdio0".into(),
-                ]);
-            } else {
-                // gui: the console lives in the window alone, so the serial
-                // line is discarded rather than watched in the terminal.
-                args.extend(["-serial".into(), "file:/dev/null".into()]);
-            }
+            // The wire is on stdio in every mode. It used to be dropped for the
+            // one mode whose guest console list did not name it either, which made
+            // the two halves agree by losing the log; with the modes collapsed onto
+            // the consoles they actually name, there is no mode left that has a
+            // serial line it does not want to show.
+            args.extend([
+                "-chardev".into(),
+                "stdio,id=stdio0,mux=off,signal=off".into(),
+                "-serial".into(),
+                "chardev:stdio0".into(),
+            ]);
         }
         Console::File(log) => args.extend([
             "-display".into(),
@@ -474,7 +477,7 @@ mod tests {
             vsock: false,
             audio: false,
             display: None,
-            mode: RunMode::Mirror,
+            mode_text: None,
         }
     }
 
@@ -601,19 +604,36 @@ mod tests {
     }
 
     #[test]
-    fn each_run_mode_wires_the_window_and_the_serial_line_differently() {
+    fn the_window_is_the_only_wiring_a_mode_changes() {
+        // The collapse of four modes to three says exactly this: the serial line
+        // is on stdio in every mode, and `-display` is the only switch. What a mode
+        // actually decides beyond that is the guest's `console=` list
+        // (`config.rs`), which is a file inside the image and not a QEMU argument.
+        //
+        // `gui` and `mirror` therefore wire identically on purpose, and pinning
+        // that is the point: were they to differ here, the fourth mode word would
+        // have been carrying a real difference after all.
         let cfg = config("1024", 1, &[]);
-
-        // mirror: a window for the framebuffer, and the serial line on stdio so
-        // the terminal shows the same console.
-        let mirror = run_args(&cfg, RunMode::Mirror);
-        assert_eq!(after(&mirror, "-display").as_deref(), Some("sdl"));
-        assert_eq!(after(&mirror, "-serial").as_deref(), Some("chardev:stdio0"));
-
-        // gui: a window, and the serial line discarded rather than watched.
-        let gui = run_args(&cfg, RunMode::Gui);
-        assert_eq!(after(&gui, "-display").as_deref(), Some("sdl"));
-        assert_eq!(after(&gui, "-serial").as_deref(), Some("file:/dev/null"));
+        for mode in [RunMode::Gui, RunMode::Mirror] {
+            let args = run_args(&cfg, mode);
+            assert_eq!(
+                after(&args, "-display").as_deref(),
+                Some("sdl"),
+                "{} wants a window",
+                mode.name()
+            );
+            assert_eq!(
+                after(&args, "-serial").as_deref(),
+                Some("chardev:stdio0"),
+                "{} watches the wire",
+                mode.name()
+            );
+            assert!(
+                !args.iter().any(|a| a.contains("/dev/null")),
+                "{} throws the serial line away",
+                mode.name()
+            );
+        }
 
         // terminal: no window at all - the console is the serial line, on stdio.
         let terminal = run_args(&cfg, RunMode::Terminal);
@@ -621,6 +641,22 @@ mod tests {
         assert_eq!(
             after(&terminal, "-serial").as_deref(),
             Some("chardev:stdio0")
+        );
+
+        // ...and that one word is the whole of what separates it from a windowed
+        // boot. Every device is attached in all three modes; only the guest's
+        // `console=` list, which lives in the image, says anything else.
+        let gui = run_args(&cfg, RunMode::Gui);
+        let mut only_the_window_differs = terminal;
+        let at = only_the_window_differs
+            .iter()
+            .position(|arg| arg == "-display")
+            .unwrap()
+            + 1;
+        only_the_window_differs[at] = "sdl".to_string();
+        assert_eq!(
+            only_the_window_differs, gui,
+            "a mode switched something in QEMU besides the window"
         );
     }
 }

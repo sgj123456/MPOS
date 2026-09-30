@@ -319,7 +319,8 @@ cargo xtask run          # boot it; rebuilds first if anything is stale
 ```
 
 The kernel boots, brings up the initramfs, pivots into the Alpine root filesystem and drops you
-into an interactive shell — in the QEMU window, with the kernel log on the serial line.
+into an interactive shell — on the serial line, with a QEMU window beside it for whatever claims
+the display.
 
 `cargo xtask run` takes a mode that decides how the window and the serial line are wired, and
 which consoles the guest is told it has. The guest is told with Linux's own `console=` words,
@@ -329,14 +330,18 @@ console — the one whose writes wait rather than being dropped.
 | Mode | What you get | Guest `console=` |
 |------|--------------|------------------|
 | `terminal` | Serial only, no window — the lossless log; `/dev/fb0` still exists, nothing is drawn on it | `console=ttyS0` |
-| `gui` | The framebuffer window only; the serial line goes quiet after takeover | `console=tty0` |
+| `gui` | The whole machine: a window with every device behind it, kept off the kernel console so a compositor can claim the scanout at runtime, with the log riding the serial line | `console=ttyS0` |
 | `mirror` | The window plus a best-effort copy on the serial line (the default) | `console=ttyS0 console=tty0` |
-| `weston` | The window belongs to the compositor, which claims the scanout at runtime | `console=ttyS0` |
 
 ```bash
 cargo xtask run --mode terminal      # watch the boot log
-cargo xtask run --mode weston        # hand the display to weston
+cargo xtask run --mode gui           # the window for weston
 ```
+
+Three modes, because there are two questions — is there a window, and is the framebuffer one of
+the guest's consoles. A fourth word (`weston`) used to answer the second one by repeating
+`terminal`'s list, which was never a fact a command line could carry: a compositor takes the
+screen at runtime, through `DRM_IOCTL_SET_MASTER` and `KDSETMODE`.
 
 `xtask/README.md` documents every command, flag and environment variable, in English and
 Chinese. In short:

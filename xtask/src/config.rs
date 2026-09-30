@@ -17,28 +17,41 @@ use anyhow::{Context, Result};
 /// The guest half is a `console=` list and nothing else (see
 /// [`RunMode::cmdline_consoles`]); the window and the serial line are the
 /// launcher's, and no mode word ever reaches the kernel.
+///
+/// There are three of these because there are exactly two questions to answer,
+/// and the third word used to hide that: does the machine have a window, and is
+/// the framebuffer one of the guest's consoles. Every mode puts the serial line
+/// on stdio — the mode that discarded it discarded the kernel log with it, and a
+/// log nobody can read is not a reason to have a mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
     /// Serial is the whole console, and the only one: `console=ttyS0` on the
     /// guest line, QEMU `-display none` with the serial on stdio.
     Terminal,
-    /// The framebuffer window only: `console=tty0`, QEMU `-display {backend}`
-    /// with the serial line discarded.
+    /// The whole machine: a window with every device behind it, the serial line
+    /// on stdio, and the framebuffer deliberately *not* one of the guest's
+    /// consoles — so the kernel's log never moves onto a screen somebody else is
+    /// driving.
+    ///
+    /// The guest line is `terminal`'s, and that is the honest shape of it: what
+    /// makes this a compositor boot is a session claiming the card at runtime
+    /// (`DRM_IOCTL_SET_MASTER`, then `KDSETMODE(KD_GRAPHICS)`, arbitrated in
+    /// `src/vfs/vcmux.rs`), which is not a fact a command line can carry. Nothing
+    /// here launches the compositor — root's `./start-weston.sh` does, once the
+    /// login prompt appears — and `^A 1`..`^A 6` switches away from it anyway,
+    /// because the virtual consoles exist and are drawn the moment the session
+    /// releases the screen.
+    ///
+    /// This is what the mode called `weston` used to be, and it is the same
+    /// window with the kernel console off the framebuffer: a mode word that told
+    /// the guest nothing but which wire carries its log was not a fourth machine,
+    /// it was `terminal` plus a display.
     Gui,
     /// The window plus a best-effort copy out the serial line, so the same
     /// console shows in the window and the terminal at once: `console=ttyS0
     /// console=tty0`, QEMU `-display {backend}` with the serial on stdio. This
     /// is the default.
     Mirror,
-    /// The window a rootful Wayland compositor paints, with the kernel console
-    /// kept off the framebuffer: `console=ttyS0`, QEMU `-display {backend}`
-    /// with the serial on stdio.
-    ///
-    /// Named for the compositor that runs here, because that is what the mode is
-    /// for. The guest is told only where its log goes; `/dev/fb0` and the
-    /// scanout reach the compositor through the DRM master it takes at runtime,
-    /// not through anything this mode bakes.
-    Weston,
 }
 
 impl RunMode {
@@ -50,9 +63,23 @@ impl RunMode {
             "terminal" => Some(Self::Terminal),
             "gui" => Some(Self::Gui),
             "mirror" => Some(Self::Mirror),
-            "weston" | "compositor" => Some(Self::Weston),
             _ => None,
         }
+    }
+
+    /// The same parse, but a word this crate does not have is an error rather
+    /// than a `None` the caller might quietly default over.
+    ///
+    /// The default matters here: `weston` and `compositor` were mode words and
+    /// are not any more, and a `machine.toml` still naming one would otherwise
+    /// boot a mirror machine at someone who asked for a compositor.
+    pub fn parse_strict(text: &str) -> Result<Self> {
+        Self::parse(text).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown run mode {:?}; expected terminal, gui or mirror",
+                text.trim()
+            )
+        })
     }
 
     /// The consoles this mode asks the guest to use, written the way Linux has
@@ -64,26 +91,25 @@ impl RunMode {
     /// takes the console over once the framebuffer is up while the wire keeps a
     /// best-effort copy, and the wire alone stays authoritative and lossless.
     ///
+    /// Two modes therefore share one list — `terminal` and `gui` — and differ only
+    /// in whether the launcher attached a window to the machine, because the
+    /// framebuffer console and the window are two different questions.
+    ///
     /// The serial port's name comes from the rootfs config rather than being
     /// spelled here: it is the same name the image's getty runs on, and one
     /// machine has one serial port.
     pub fn cmdline_consoles(self, serial_port: &str) -> String {
         match self {
-            Self::Terminal | Self::Weston => format!("console={serial_port}"),
-            Self::Gui => "console=tty0".to_string(),
+            Self::Terminal | Self::Gui => format!("console={serial_port}"),
             Self::Mirror => format!("console={serial_port} console=tty0"),
         }
     }
 
-    /// Whether this mode wants a QEMU window at all. Only terminal does not.
+    /// Whether this mode wants a QEMU window at all. Only terminal does not;
+    /// every mode watches the serial line on stdio, so there is nothing left for
+    /// a second such predicate to distinguish.
     pub fn has_window(self) -> bool {
         !matches!(self, Self::Terminal)
-    }
-
-    /// Whether this mode routes the serial line to the user's terminal (stdio),
-    /// as opposed to leaving it attached to nothing. Gui drops it.
-    pub fn serial_to_stdio(self) -> bool {
-        matches!(self, Self::Terminal | Self::Mirror | Self::Weston)
     }
 
     /// The word this mode is written down with: in the `[qemu] mode` value, in
@@ -99,7 +125,6 @@ impl RunMode {
             Self::Terminal => "terminal",
             Self::Gui => "gui",
             Self::Mirror => "mirror",
-            Self::Weston => "weston",
         }
     }
 }
@@ -161,10 +186,10 @@ pub struct QemuConfig {
     /// the serial log - which then goes quiet once the console moves to the
     /// framebuffer. A `test` boot ignores this and always runs headless.
     pub display: Option<String>,
-    /// The standing mode for `run`, overridable per invocation with `--mode`.
-    /// Defaults to [`RunMode::Mirror`] - the window with a
-    /// best-effort serial copy - which is what `run` did before the modes split.
-    pub mode: RunMode,
+    /// The word `[qemu] mode` holds, kept as text: see
+    /// [`QemuConfig::run_mode`] for when it becomes a [`RunMode`] and why a word
+    /// this crate does not have may not become the default one.
+    pub mode_text: Option<String>,
 }
 
 #[derive(Debug)]
@@ -288,14 +313,27 @@ impl QemuConfig {
             display: values
                 .remove("display")
                 .filter(|text| !text.trim().is_empty()),
-            // A name this crate does not recognise is not an error at load -
-            // `test` never boots a window and must not fail on a typo it ignores
-            // - so it falls back to the default here. `run --mode` reports an
-            // unknown word directly when it parses the flag.
-            mode: values
-                .remove("mode")
-                .and_then(|text| RunMode::parse(&text))
-                .unwrap_or(RunMode::Mirror),
+            // The word is stored rather than resolved here, because the load is
+            // shared with `test` — which boots no window at all and must not fail
+            // on a mode name it never uses. The mode is resolved at the two places
+            // that actually boot a window, in [`Self::run_mode`].
+            mode_text: values.remove("mode"),
+        }
+    }
+
+    /// The standing mode for `run`, overridable per invocation with `--mode`.
+    ///
+    /// An absent or blank key is [`RunMode::Mirror`] — the machine `run` booted
+    /// before the modes were split — while a key naming a word this crate does not
+    /// have is an error. That difference is the whole reason the text is kept:
+    /// `weston` was a mode word and is not one any more, and a `machine.toml` still
+    /// naming it would otherwise be defaulted into a mirror boot at someone who
+    /// asked for a compositor. The consoles the two modes bake differ (`console=`
+    /// with and without `tty0`), so the wrong default is not a cosmetic one.
+    pub fn run_mode(&self) -> Result<RunMode> {
+        match self.mode_text.as_deref().map(str::trim) {
+            None | Some("") => Ok(RunMode::Mirror),
+            Some(text) => RunMode::parse_strict(text),
         }
     }
 }
@@ -582,16 +620,16 @@ mod tests {
         // bakes the wrong consoles boots the machine in a mode nobody asked for.
         for (text, mode, consoles) in [
             ("terminal", RunMode::Terminal, "console=ttyS0"),
-            ("gui", RunMode::Gui, "console=tty0"),
+            // Gui is terminal's list with a window attached: the framebuffer is
+            // not one of this boot's consoles precisely so that a session which
+            // claims the card at runtime finds it free, and the wire keeps the log
+            // losslessly while nothing is drawn over it.
+            ("gui", RunMode::Gui, "console=ttyS0"),
             // Mirror is two consoles with the framebuffer preferred, which is
             // what the word has always meant: Linux writes the log to every
             // console on the list and the last is the preferred one, so mirror
             // is a list and needs no word of its own.
             ("mirror", RunMode::Mirror, "console=ttyS0 console=tty0"),
-            // Weston keeps the log on the wire alone, exactly as terminal does.
-            // What makes it a compositor boot is a session claiming the card at
-            // runtime, and that is not a fact a command line can carry.
-            ("weston", RunMode::Weston, "console=ttyS0"),
         ] {
             assert_eq!(RunMode::parse(text), Some(mode));
             // Case- and space-insensitive: the name comes from a config file a
@@ -604,29 +642,24 @@ mod tests {
             assert_eq!(mode.name(), text);
         }
         assert_eq!(RunMode::parse("anything-else"), None);
-        // Only terminal drops the window; only gui drops the serial line.
+        // Only terminal drops the window, and no mode drops the serial line any
+        // more — so the guest's list and the launcher's wiring can never disagree
+        // about the wire again: every list names it.
         assert!(!RunMode::Terminal.has_window());
-        assert!(RunMode::Mirror.has_window() && RunMode::Gui.has_window());
-        assert!(RunMode::Terminal.serial_to_stdio());
-        assert!(RunMode::Mirror.serial_to_stdio());
-        assert!(!RunMode::Gui.serial_to_stdio());
-        // And the list has to agree with that wiring: the one mode that discards
-        // the serial line is the one mode whose list does not name it. A mode
-        // that says one thing to QEMU and another to the kernel is the failure
-        // this whole pairing exists to prevent.
-        for mode in [
-            RunMode::Terminal,
-            RunMode::Gui,
-            RunMode::Mirror,
-            RunMode::Weston,
-        ] {
-            assert_eq!(
-                mode.serial_to_stdio(),
+        assert!(RunMode::Gui.has_window() && RunMode::Mirror.has_window());
+        for mode in [RunMode::Terminal, RunMode::Gui, RunMode::Mirror] {
+            assert!(
                 mode.cmdline_consoles("ttyS0").contains("ttyS0"),
-                "{} disagrees with itself about the serial line",
+                "{} leaves the wire out of the consoles it names",
                 mode.name()
             );
         }
+        // And the two modes that share a list differ in exactly one word: the
+        // framebuffer console, which is the only console question a mode may answer.
+        assert_eq!(
+            RunMode::Gui.cmdline_consoles("ttyS0"),
+            RunMode::Terminal.cmdline_consoles("ttyS0")
+        );
     }
 
     #[test]
@@ -796,19 +829,38 @@ mod tests {
     }
 
     #[test]
-    fn the_pre_rename_spellings_still_read_as_the_same_modes() {
-        // `compositor` was the mode's name before the option became `--mode`, and
-        // an image baked then records it in `build/console.mode`. Reading that as
-        // "an unknown mode, so default to mirror" would tell `run` the image
-        // carries the wrong consoles and send it through a root rebuild of the
-        // boot files for no reason - so the old word must land on the same
-        // variant.
-        assert_eq!(RunMode::parse("compositor"), Some(RunMode::Weston));
-        let mut values = HashMap::new();
-        values.insert("mode".to_string(), "weston".to_string());
-        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
-        assert_eq!(config.mode, RunMode::Weston);
-        assert!(values.is_empty(), "the `mode` key was not consumed");
+    fn a_mode_word_that_was_retired_is_an_error_not_a_default() {
+        // `weston` and `compositor` named a mode and now name nothing: the
+        // machine they described is `gui`. What must not happen is the leftover
+        // word in someone's `machine.toml` being *defaulted* — a defaulted load
+        // would bake `console=ttyS0 console=tty0` for a person who asked for a
+        // compositor and never notice, which is the one shape of wrong answer this
+        // file's whole `run_mode` split exists to refuse.
+        assert_eq!(RunMode::parse("weston"), None);
+        assert_eq!(RunMode::parse("compositor"), None);
+        for word in ["weston", "compositor"] {
+            let mut values = HashMap::new();
+            values.insert("mode".to_string(), word.to_string());
+            let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+            assert!(values.is_empty(), "the `mode` key was not consumed");
+            let error = config.run_mode().unwrap_err().to_string();
+            assert!(
+                error.contains(word) && error.contains("expected terminal, gui or mirror"),
+                "{error}"
+            );
+        }
+        // The repository's own machine file is a machine this xtask can boot.
+        // Cheap to assert, and it is exactly the file that carried the retired word.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the repository root");
+        let machine = QemuConfig::load(&root.join("machine.toml"), &root.join("rootfs.toml"))
+            .expect("machine.toml parses");
+        assert_eq!(
+            machine.run_mode().unwrap(),
+            RunMode::Gui,
+            "the standing machine `cargo xtask run` boots"
+        );
     }
 
     #[test]
@@ -817,7 +869,11 @@ mod tests {
         // the pre-split behaviour (window + serial mirror), not an error.
         let mut values = HashMap::new();
         let config = QemuConfig::from_values(&mut values, "mpos".to_string());
-        assert_eq!(config.mode, RunMode::Mirror);
+        assert_eq!(config.run_mode().unwrap(), RunMode::Mirror);
+        // A blank value is the same absence, the way a blank `display` is.
+        values.insert("mode".to_string(), "   ".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        assert_eq!(config.run_mode().unwrap(), RunMode::Mirror);
     }
 
     #[test]

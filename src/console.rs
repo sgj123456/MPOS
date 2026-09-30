@@ -69,7 +69,7 @@ pub fn vt_is_sink() -> bool {
 /// is the console the kernel is writing to, which is what [`gpu_mode`] answers.
 ///
 /// The two are the same question on every boot but a compositor's, and that is
-/// the whole reason for splitting them: on a weston boot the kernel log stays on
+/// the whole reason for splitting them: on a `gui` boot the kernel log stays on
 /// the serial wire (the scanout belongs to the compositor), and yet the virtual
 /// consoles still have to be *somewhere*, because a text VT the compositor has
 /// released is a VT somebody has to be able to read. Feeding a grid that does
