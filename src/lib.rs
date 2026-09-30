@@ -33,6 +33,13 @@ pub mod console;
 pub mod date;
 #[cfg(target_os = "none")]
 pub mod drivers;
+/// The two DRM blobs a KMS driver publishes as bytes: an EDID, and the
+/// `IN_FORMATS` list of which format-and-modifier pairs a plane scans out.
+/// Ungated because both are pure encoders and the bytes are what a reader
+/// parses - `drivers/drm.rs` holds the card's state and talks to the GPU, so
+/// nothing inside it can be checked off the machine, and an EDID one field out
+/// of place is a display no compositor can name.
+pub mod drm_blob;
 /// The errno table: the numbers every layer answers "no" with. Sits at the
 /// crate root precisely so that refusing in Linux's language never requires
 /// naming the `syscall` layer from below it.
