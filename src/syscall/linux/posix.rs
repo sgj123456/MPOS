@@ -1029,36 +1029,87 @@ pub fn handle_clock_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     0
 }
 
-/// `unshare(flags)` — leave namespaces. There is one of each kind and
-/// nobody to leave it into: a flags word of zero names nothing to
-/// unshare and succeeds, the `CLONE_NEW*` bits name promises this kernel
-/// cannot keep and are answered the way a known-but-unservable request is,
-/// and the bits nobody ever defined are EINVAL.
+/// `unshare(flags)` — leave namespaces.
+///
+/// There is one of each kind and nobody to leave it into, so the `CLONE_NEW*`
+/// bits name promises this kernel cannot keep and are answered the way a
+/// known-but-unservable request is, `EOPNOTSUPP`. A bit that names nothing
+/// `unshare` can do is `EINVAL`. And the flags that ask for something a *thread
+/// group* shares are a genuine no-op here: this kernel has no thread group - a
+/// process is its own only thread and already owns its address space, its fd
+/// table and its handlers - so there is nothing to split off, which is the
+/// answer Linux gives a single-threaded caller too (see [`CLONE_SEPARABLE`]).
+///
+/// **The numbers are the man page's, and two of them were wrong.** A caller
+/// does not send a flag *name*; it sends the number `unshare(2)` documents. This
+/// read `CLONE_NEWNS` as `0x1_0000` - which is `CLONE_THREAD` - and
+/// `CLONE_NEWTIME` as `0x8_0000`, which is `CLONE_SETTLS` and is not a
+/// namespace at all. So a program asking to unshare the mount namespace was
+/// answered `EINVAL` (as though it had asked for something undefined) while a
+/// program passing `CLONE_THREAD` was answered `EOPNOTSUPP` (as though it had
+/// asked for a mount namespace). Measured on this host's kernel, one call per
+/// child: `0x2_0000` and `0x80` answer `EPERM` - the two bits that really are
+/// namespace flags, refused for want of `CAP_SYS_ADMIN` - and `0x8_0000`
+/// answers `EINVAL`, which is the difference the spelling hides.
 pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
-    const CLONE_NEWNS: usize = 0x0001_0000;
+    /// The eight namespaces, read off `include/uapi/linux/sched.h`.
+    ///
+    /// `CLONE_NEWTIME` is the one worth staring at: Linux puts it at `0x80`, in
+    /// the low byte the `CSIGNAL` range lives in, so "a `CLONE_NEW*` is a bit in
+    /// the high half" is a rule the header does not follow and a reader must
+    /// not assume.
+    const CLONE_NEWTIME: usize = 0x0000_0080;
+    const CLONE_NEWNS: usize = 0x0002_0000;
     const CLONE_NEWCGROUP: usize = 0x0200_0000;
     const CLONE_NEWUTS: usize = 0x0400_0000;
     const CLONE_NEWIPC: usize = 0x0800_0000;
     const CLONE_NEWUSER: usize = 0x1000_0000;
     const CLONE_NEWPID: usize = 0x2000_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
-    const CLONE_NEWTIME: usize = 0x0008_0000;
-    const NEW_BITS: usize = CLONE_NEWNS
+    const NAMESPACES: usize = CLONE_NEWTIME
+        | CLONE_NEWNS
         | CLONE_NEWCGROUP
         | CLONE_NEWUTS
         | CLONE_NEWIPC
         | CLONE_NEWUSER
         | CLONE_NEWPID
-        | CLONE_NEWNET
-        | CLONE_NEWTIME;
+        | CLONE_NEWNET;
+
+    /// What `unshare` splits off from a *thread group*: the address space, the
+    /// fs info, the descriptor table, the signal handlers, the group itself and
+    /// the SysV semaphore undo list.
+    ///
+    /// Each is a no-op for a caller that has no other thread to split from, and
+    /// Linux answers `0` for every one of them on a single-threaded process
+    /// (measured, one child per flag: `CLONE_VM`, `CLONE_FS`, `CLONE_FILES`,
+    /// `CLONE_SIGHAND`, `CLONE_THREAD` and `CLONE_SYSVSEM`). That is the truth
+    /// here rather than a courtesy: a process this kernel runs shares none of
+    /// the six with anybody, so there is nothing the call could take away.
+    const CLONE_VM: usize = 0x0000_0100;
+    const CLONE_FS: usize = 0x0000_0200;
+    const CLONE_FILES: usize = 0x0000_0400;
+    const CLONE_SIGHAND: usize = 0x0000_0800;
+    const CLONE_THREAD: usize = 0x0001_0000;
+    const CLONE_SYSVSEM: usize = 0x0004_0000;
+    const CLONE_SEPARABLE: usize =
+        CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
+
     let flags = args[0];
-    if flags == 0 {
-        return 0;
-    }
-    if flags & !NEW_BITS != 0 {
+    // An unrecognised bit is refused first, ahead of the namespaces: Linux
+    // answers `EINVAL` for it even when a namespace flag rides beside it
+    // (measured: `CLONE_PIDFD|CLONE_NEWNS` is `EINVAL`, not the namespace's
+    // `EPERM`). `CLONE_PIDFD` and `CLONE_IO` are the two real flags in that
+    // class - both meaningless to `unshare` and both `EINVAL` (measured) - and
+    // so is any bit nobody ever defined.
+    if flags & !(NAMESPACES | CLONE_SEPARABLE) != 0 {
         return err::EINVAL;
     }
-    err::EOPNOTSUPP
+    if flags & NAMESPACES != 0 {
+        return err::EOPNOTSUPP;
+    }
+    // Zero included: a call that asked to unshare nothing has nothing to do,
+    // which is what Linux answers for it too.
+    0
 }
 
 /// `setns(fd, nstype)` — join a namespace a descriptor names. No namespace

@@ -97,7 +97,10 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
       what kept a fresh compositor out of the seat after a `kill`, and what
       could leave a pipeline reader waiting for an end-of-file that never came.
       Only the slot and the exit code stay now, which is all a zombie is.
-- [ ] 6.3 Namespaces — `unshare`/`setns` return `EOPNOTSUPP` (no isolation) (§6.3)
+- [ ] 6.3 Namespaces — `unshare`/`setns` return `EOPNOTSUPP` (no isolation), now
+      with Linux's real flag numbers: `CLONE_NEWNS` was spelled `CLONE_THREAD`'s
+      value and `CLONE_NEWTIME` `CLONE_SETTLS`'s, so a mount-namespace request
+      was answered `EINVAL` (§6.3)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (anon shared buffers, §7/Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
@@ -1822,7 +1825,7 @@ rather than returning constants:
   as the stack floor (SIGSEGV beyond it; capped at the reserved region for a
   raised/infinite one).
 
-### 6.3 Namespace Support (Minimal) — **stub**
+### 6.3 Namespace Support (Minimal) — **stub**, and its flag table was wrong
 
 `unshare`/`setns` exist and validate the `CLONE_NEW*` bits (unknown → `EINVAL`),
 but a request to actually enter a namespace returns `EOPNOTSUPP` - there is one
@@ -1830,6 +1833,38 @@ of each kind and no isolation machinery behind it. Real `CLONE_NEWNS` mount
 namespaces (or any other) are not implemented; the syscalls fail cleanly rather
 than pretend. (Not one-shot implementable: needs per-namespace mount/root/pid
 state threaded through the VFS and scheduler, and guest verification.)
+
+**Two of the eight numbers were wrong, and measuring is what showed it.** A
+caller does not send a flag *name*; it sends the number `unshare(2)` documents,
+and this read `CLONE_NEWNS` as `0x1_0000` - which is `CLONE_THREAD` - and
+`CLONE_NEWTIME` as `0x8_0000`, which is `CLONE_SETTLS` and is not a namespace at
+all. The effect was the worst shape the conventions name: a program asking to
+unshare the mount namespace was told `EINVAL`, as though it had sent something
+undefined, while a program passing `CLONE_THREAD` was told `EOPNOTSUPP`, as
+though it had asked for a mount namespace. Nothing caught it because the pin in
+`t-posix` had been written from the same misremembering - it asserted
+`unshare(0x1_0000)` was `CLONE_NEWNS` - which is exactly the case rule 1's
+carve-out is for: the test changed with the measurement, not the code.
+
+The measurements, one call per child on this host's kernel, and the table the
+implementation now holds:
+
+| flags | Linux | why |
+|---|---|---|
+| `0x2_0000` (`CLONE_NEWNS`) | `EPERM` | a namespace flag, refused for want of `CAP_SYS_ADMIN` |
+| `0x80` (`CLONE_NEWTIME`) | `EPERM` | the same; Linux puts this one in the *low* byte |
+| `0x8_0000` (`CLONE_SETTLS`) | `EINVAL` | not a namespace and not something `unshare` can do |
+| `CLONE_VM`/`FS`/`FILES`/`SIGHAND`/`THREAD`/`SYSVSEM` | `0` | thread-group splits, and a single-threaded caller has nothing to split |
+| `CLONE_PIDFD`, `CLONE_IO` | `EINVAL` | real flags, meaningless to `unshare` |
+| `CLONE_PIDFD\|CLONE_NEWNS` | `EINVAL` | an invalid bit outranks a namespace beside it |
+
+So the eight namespaces are `0x80`, `0x2_0000`, `0x0200_0000` … `0x4000_0000`;
+the six thread-group flags are a genuine no-op here (a process is its own only
+thread and already owns all six - the answer is the truth, not a courtesy); and
+`EINVAL` is decided before the namespace refusal, which is Linux's order. All
+of it is pinned by `t-posix`. `setns` is unchanged: it answers `EINVAL` for an
+open descriptor and `EBADF` for a closed number, which is all it can learn while
+no namespace is reachable through one.
 
 ### 6.4 Additional Process Syscalls — **DONE**
 

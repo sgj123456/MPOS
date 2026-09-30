@@ -467,18 +467,74 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         );
     }
 
-    // The namespace pair: nothing to unshare, nothing to join.
+    // The namespace pair: nothing to unshare, nothing to join. Every number
+    // below is `include/uapi/linux/sched.h`'s, and each was measured on a real
+    // kernel before being written down - which is what caught this block
+    // asserting `0x1_0000` was `CLONE_NEWNS`: that is `CLONE_THREAD`, and Linux
+    // answers 0 for it. The mount namespace is `0x2_0000`, and a program asking
+    // for it was being told `EINVAL` as though the bit were undefined.
     lin::check_eq(&mut failed, b"unshare(0) succeeds", lin::unshare(0), 0);
     lin::check_eq(
         &mut failed,
         b"unshare CLONE_NEWNS answers EOPNOTSUPP",
-        lin::unshare(0x0001_0000),
+        lin::unshare(0x0002_0000),
         lin::EOPNOTSUPP,
     );
     lin::check_eq(
         &mut failed,
+        b"unshare CLONE_NEWTIME answers EOPNOTSUPP",
+        lin::unshare(0x0000_0080),
+        lin::EOPNOTSUPP,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"unshare CLONE_NEWUTS answers EOPNOTSUPP",
+        lin::unshare(0x0400_0000),
+        lin::EOPNOTSUPP,
+    );
+    // The thread-group flags: a process here is its own only thread and owns
+    // all six already, so there is nothing to split off and the answer is the
+    // no-op Linux gives a single-threaded caller.
+    lin::check_eq(
+        &mut failed,
+        b"unshare CLONE_THREAD is the no-op it is on Linux",
+        lin::unshare(0x0001_0000),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"unshare CLONE_FILES|CLONE_FS is a no-op",
+        lin::unshare(0x0000_0600),
+        0,
+    );
+    // `CLONE_SETTLS` is not a namespace and not something `unshare` can do:
+    // Linux answers EINVAL for it, and this is the value the file used to spell
+    // `CLONE_NEWTIME`.
+    lin::check_eq(
+        &mut failed,
+        b"unshare CLONE_SETTLS answers EINVAL",
+        lin::unshare(0x0008_0000),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"unshare CLONE_PIDFD answers EINVAL",
+        lin::unshare(0x0000_1000),
+        lin::EINVAL,
+    );
+    // An undefined bit is refused ahead of the namespaces beside it, which is
+    // Linux's order (measured: `CLONE_PIDFD|CLONE_NEWNS` is EINVAL, not the
+    // namespace's EPERM).
+    lin::check_eq(
+        &mut failed,
         b"unshare with a non-namespace bit answers EINVAL",
         lin::unshare(0x1),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"an undefined bit outranks a namespace bit",
+        lin::unshare(0x0002_1000),
         lin::EINVAL,
     );
     let mut pipe_fds: [i32; 2] = [-1; 2];
