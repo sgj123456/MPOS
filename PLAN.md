@@ -444,14 +444,18 @@ it - so the entries say which they are:
       wake for `pthread_join`, `exit_group` on the group, and `getpid`/`gettid`
       answering the group and the task. Pinned by `t-clone` (§6.4). What the
       compositors beyond weston still want is elsewhere on this list
-- [~] DRM sync objects — the `SYNCOBJ_*` family, including `SYNCOBJ_EVENTFD`
+- [x] DRM sync objects — the `SYNCOBJ_*` family, including `SYNCOBJ_EVENTFD`
       (which Smithay probes before it will expose `wp_linux_drm_syncobj_v1`),
       with `IN_FENCE_FD`/`OUT_FENCE_PTR` given the behaviour their names promise
-      (§7.4). **Measured, not yet built**: the family's semantics are pinned by
-      four instrument programs run against the real card, and they disagree with
-      the sources in the one place that decides the design - see §7.4's
-      "What the sync object family answers". Nothing is dispatched to yet, and
-      `IN_FENCE_FD` is still the property this card accepts and ignores
+      (§7.4). The semantics were **measured on the real card before any of it was
+      written**, and they disagree with the sources in the one place that decides
+      the design: an object with no fence is refused rather than treated as
+      ready. `src/drm_sync.rs` holds the state machine with nine host tests,
+      `t-drm-sync` pins 103 checks including a waiter woken by another task, and
+      `IN_FENCE_FD` is now waited for rather than stored and ignored.
+      `DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE` are `1`; the gaps left
+      are named in §7.4 (an out-fence that is already through, and no
+      `TIMELINE`-flag behaviour to give the two flags this host's header has)
 - [ ] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
       the only one that lets niri, which rejects software EGL outright, run at
       all; virgl and venus are both built on it (§7.4)
@@ -2332,11 +2336,18 @@ card fd announces it - but there is no vertical blank and no `WAIT_VBLANK`; dumb
 offset encoding rather than a DRM VMA manager; leasing is a restricted
 descriptor but `DRM_MODE_SEAL_ALL` and `LEASE_IMMUTABLE` are recorded and not
 enforced, so a sealed lease can still be revoked and a sealed object still
-accepts a mode change; `IN_FENCE_FD` exists and is stored but no
-fence is ever waited on, so a compositor that passes one is told nothing about
-it - and no `OUT_FENCE_PTR` at all. `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` and
+accepts a mode change; and `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` and
 the colour-pipeline cap are refused `EOPNOTSUPP`, the first of which the
 virtualized drivers are the ones that ask for.
+
+**The two fences a commit carries are no longer that list's example.**
+`IN_FENCE_FD` used to be "stored but nothing waits on it", and there was no
+`OUT_FENCE_PTR` at all; both are now real - a commit handed an acquire fence is
+ordered behind it before a pixel is copied, and a commit asked for an out-fence
+writes back a descriptor the caller can wait on - and the `SYNCOBJ_*` family
+that gives them something to name is dispatched. See "What the sync object
+family answers" below for what the family means here, which is measured rather
+than assumed.
 
 **The scanout follows the host's display size.** The resolution used to be the
 one `GET_DISPLAY_INFO` answered at boot and nothing else, which is a bug the
@@ -3397,7 +3408,7 @@ Services, which are rootfs work: `sway`/`niri` with their libraries
 writable font cache* those need), `vulkan-loader` with an ICD, and the
 compositor-starting half weston already models.
 
-#### What the sync object family answers, measured before it is built
+#### What the sync object family answers, measured and then built
 
 `SYNCOBJ_*` is the last item on the list above besides `DRM_VIRTGPU_*`, and its
 design is now written from measurement rather than from the sources, because the
@@ -3483,6 +3494,27 @@ an event loop - which is why it is the probe Smithay makes before it will expose
 real card, so this card answering `1` is a statement it has to make true rather
 than a capability it can decline.
 
+**What was then built, and the one place it is deliberately narrower.** The
+twelve requests are dispatched, `src/drm_sync.rs` holds the state machine with
+nine host tests and `t-drm-sync` pins 103 checks in the booted machine - the
+family's whole shape, the descriptor handover in both directions, a waiter woken
+by *another task* rather than merely told it would be, and the two commit fences
+end to end. Two names are worth putting beside the work. The **handle table is
+per open file description**, which is what makes two clients each have a handle 1
+and is the reason `SYNCOBJ_HANDLE_TO_FD` is the request the wayland protocol is
+built on; a record dies with its description, and the object itself lives on
+while a descriptor names it. And the **out-fence a commit writes back is already
+through** when the caller has it, because this card presents synchronously: the
+flush has returned before the commit does, so the honest fence is a retired one.
+That is a narrower answer than a real card's - a caller cannot use it to learn
+about a frame that is still in flight, because there is no in-flight frame - and
+it is the same absence as `DRM_CAP_ASYNC_PAGE_FLIP` being 0.
+
+**Gate, quoted from its own summary**: host `615 passed`; `mpos-xtask 36 passed`;
+guest `=== SUMMARY pass=131 fail=0 (131 built)`, QEMU exit 33, `9 of 140 user
+tests left out by tests.toml` (the same nine as before, `t-drm-sync` being a
+tenth program that runs). `t-drm-sync` printed `=== PASS` over 103 checks.
+
 #### Order
 
 Each step stands on its own, which is the only reason the order is this one:
@@ -3495,9 +3527,12 @@ Each step stands on its own, which is the only reason the order is this one:
 2. **The property and cap families above.** No new subsystem: `GETPROPERTY`,
    `GETPROPBLOB` and one client cap, each observable from userspace
    (`drm_info`, `modetest`) before any compositor is involved.
-3. **DRM sync objects**, with `IN_FENCE_FD`/`OUT_FENCE_PTR` given the behaviour
-   their names promise - which is what makes explicit sync real rather than
-   merely accepted.
+3. ~~**DRM sync objects**~~ **Landed**, with `IN_FENCE_FD`/`OUT_FENCE_PTR` given
+   the behaviour their names promise - which is what makes explicit sync real
+   rather than merely accepted. The step was measured before it was written, and
+   the measurement is the part worth keeping: see "What the sync object family
+   answers" above for what this card means by a sync object and how it differs
+   from the sources.
 4. ~~**Threads** (§6.4)~~ **Landed** - not a display item, but on the critical path
    of every compositor that is not single-threaded and every Vulkan driver, so it
    is worth knowing the step is behind us before the property families.

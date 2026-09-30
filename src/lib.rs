@@ -46,6 +46,14 @@ pub mod drm_blob;
 /// arithmetic on the presentation path - a 64x64 blend clipped at four edges,
 /// where being wrong at one edge and right at three is the normal way it fails.
 pub mod drm_cursor;
+/// The DRM sync objects' state machine: what a `SYNCOBJ_*` request answers, in
+/// the one place a host test can reach it. The driver next to it is never
+/// compiled off the machine, and this is the family where the authorities
+/// disagree - the upstream sources read a sync object with no fence as already
+/// signaled and the real card refuses it (`PLAN.md` §7.4) - so the decisions are
+/// written down here with a test per rule instead of being buried in a `match`
+/// only a boot can exercise.
+pub mod drm_sync;
 /// The errno table: the numbers every layer answers "no" with. Sits at the
 /// crate root precisely so that refusing in Linux's language never requires
 /// naming the `syscall` layer from below it.

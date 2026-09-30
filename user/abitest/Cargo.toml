@@ -58,6 +58,10 @@ name = "t-drm-props"
 path = "src/bin/integration/t-drm-props.rs"
 
 [[bin]]
+name = "t-drm-sync"
+path = "src/bin/integration/t-drm-sync.rs"
+
+[[bin]]
 name = "t-epoll-socket"
 path = "src/bin/integration/t-epoll-socket.rs"
 

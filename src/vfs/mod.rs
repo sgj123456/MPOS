@@ -533,6 +533,26 @@ pub trait Inode: Send + Sync {
         None
     }
 
+    /// The DRM sync object this node is, if it is one - the descriptor
+    /// `SYNCOBJ_HANDLE_TO_FD` with `flags == 0` answers, and the object
+    /// `SYNCOBJ_FD_TO_HANDLE` takes back the other way, which is how one
+    /// process's timeline becomes another's. Gated with the `drm` module, for
+    /// the same reason as [`Self::as_drm`].
+    #[cfg(target_os = "none")]
+    fn as_syncobj_fd(&self) -> Option<&crate::drivers::drm::SyncObjFd> {
+        None
+    }
+
+    /// The `sync_file` this node is, if it is one - a fence behind a descriptor.
+    /// It is what `SYNCOBJ_HANDLE_TO_FD` with `EXPORT_SYNC_FILE` answers and what
+    /// a commit's out-fence leaves in the caller's table, and it is readable when
+    /// the fence has retired, which is the whole of what such a descriptor is
+    /// for. Gated with the `drm` module.
+    #[cfg(target_os = "none")]
+    fn as_sync_file(&self) -> Option<&crate::drivers::drm::SyncFileFd> {
+        None
+    }
+
     /// The character stream this node wraps, if it is one - how a device
     /// family's ioctls reach the device without the dispatcher knowing which
     /// device implements them: the `'P'`-typed OSS requests on `/dev/dsp`

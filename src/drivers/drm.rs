@@ -89,13 +89,17 @@ const PROP_CRTC_Y: u32 = 82;
 const PROP_CRTC_W: u32 = 83;
 const PROP_CRTC_H: u32 = 84;
 const PROP_BLEND: u32 = 85;
-/// The fence a client's buffer arrives behind. Nothing on this machine has an
-/// asynchronous engine to wait for - the renderer is llvmpipe writing through
-/// the CPU, and the buffers are its own memory - so the value is accepted and
-/// recorded nowhere. Accepting it matters all the same: weston adds this
-/// property to a commit whenever a client handed it a buffer with an acquire
-/// fence, and a card without the property fails the whole commit rather than
-/// the one entry.
+/// The fence a client's buffer arrives behind: a `sync_file` descriptor a commit
+/// is ordered behind before a pixel of it is copied.
+///
+/// It was accepted and recorded nowhere for as long as the `SYNCOBJ_*` family
+/// did not exist, because a value with nothing to name is a value this card
+/// could not honour - and weston adds this property to a commit whenever a
+/// client handed it a buffer with an acquire fence, so a card *without* the
+/// property failed the whole commit rather than the one entry. Now the family is
+/// there and the wait is real; what is left of the old shape is that the wait is
+/// always over at once, because nothing on this machine can leave a fence
+/// unsignaled. See `mode_atomic` for that reasoning in full.
 const PROP_IN_FENCE_FD: u32 = 86;
 /// The properties §7.4 lists as "what a compositor finds by name", of which
 /// this card has the four its hardware can back and no more.
@@ -121,6 +125,15 @@ const PROP_NON_DESKTOP: u32 = 88;
 const PROP_MAX_BPC: u32 = 89;
 const PROP_VRR_CAPABLE: u32 = 90;
 const PROP_IN_FORMATS: u32 = 94;
+/// The plane's `OUT_FENCE_PTR`: a *pointer* in the caller's memory where the
+/// commit writes back a fence descriptor for the frame it just committed.
+///
+/// It is the other half of `IN_FENCE_FD`, and the half this card was missing
+/// entirely - the list in `PLAN.md` §7.4 has it absent, because amdgpu does not
+/// publish one either. The measured shape on a card that does is a range whose
+/// two ends are 0 and the whole 64-bit span, since the value is an address and
+/// not a number with a meaning of its own.
+const PROP_OUT_FENCE_PTR: u32 = 95;
 /// The connector's property list, in one place: `GETCONNECTOR` and
 /// `OBJ_GETPROPERTIES` both report it, and a client that read it from one and
 /// not the other would see two different connectors.
@@ -253,6 +266,50 @@ const NR_GEM_CLOSE: u32 = 0x09;
 const NR_AUTH_MAGIC: u32 = 0x11;
 const NR_PRIME_HANDLE_TO_FD: u32 = 0x2d;
 const NR_PRIME_FD_TO_HANDLE: u32 = 0x2e;
+
+/// The sync object family, `<drm.h>`'s numbers, in the two runs the header puts
+/// them in. `CREATE`..`SIGNAL` sit between the lease family and `GETFB2`, and the
+/// later four were added years after them - which is why a request number is
+/// never inferred from the one next to it.
+///
+/// The whole family is decided by `crate::drm_sync`, where the rules are written
+/// down with a host test each; what is here is the argument marshalling and the
+/// table of objects.
+const NR_SYNCOBJ_CREATE: u32 = 0xbf;
+const NR_SYNCOBJ_DESTROY: u32 = 0xc0;
+const NR_SYNCOBJ_HANDLE_TO_FD: u32 = 0xc1;
+const NR_SYNCOBJ_FD_TO_HANDLE: u32 = 0xc2;
+const NR_SYNCOBJ_WAIT: u32 = 0xc3;
+const NR_SYNCOBJ_RESET: u32 = 0xc4;
+const NR_SYNCOBJ_SIGNAL: u32 = 0xc5;
+const NR_SYNCOBJ_TIMELINE_WAIT: u32 = 0xca;
+const NR_SYNCOBJ_QUERY: u32 = 0xcb;
+const NR_SYNCOBJ_TRANSFER: u32 = 0xcc;
+const NR_SYNCOBJ_TIMELINE_SIGNAL: u32 = 0xcd;
+const NR_SYNCOBJ_EVENTFD: u32 = 0xcf;
+
+/// `DRM_SYNCOBJ_CREATE_SIGNALED`: the object starts with a fence behind it.
+const SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and its import twin: the
+/// descriptor is a `sync_file` over a fence rather than the object itself.
+const SYNCOBJ_EXPORT_SYNC_FILE: u32 = 1 << 0;
+const SYNCOBJ_IMPORT_SYNC_FILE: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_*_FLAGS_TIMELINE` on both directions. This host's header has it
+/// and the older upstream one does not; the measured card accepts it and does
+/// not require it, so it is accepted here and changes nothing.
+const SYNCOBJ_FLAGS_TIMELINE: u32 = 1 << 1;
+/// The wait flags. `ALL` and `FOR_SUBMIT` are the two with behaviour;
+/// `AVAILABLE` and `DEADLINE` are accepted and mean nothing to a card with no
+/// engine to schedule against.
+const SYNCOBJ_WAIT_ALL: u32 = 1 << 0;
+const SYNCOBJ_WAIT_FOR_SUBMIT: u32 = 1 << 1;
+const SYNCOBJ_WAIT_AVAILABLE: u32 = 1 << 2;
+const SYNCOBJ_WAIT_DEADLINE: u32 = 1 << 3;
+/// `DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED`. Nothing here is submitted and
+/// unsignaled, so the last submitted point and the last signaled one are the
+/// same number and the flag changes no answer - which is why it is accepted
+/// rather than refused.
+const SYNCOBJ_QUERY_LAST_SUBMITTED: u32 = 1 << 0;
 /// Session-ownership requests - `DRM_IOCTL_AUTH` / `_SET_MASTER` /
 /// `_DROP_MASTER`. They are `_IO` (no argument), so `arg` is null for them
 /// and they must be answered before the read-buffer check in `drm_ioctl`. A
@@ -320,6 +377,17 @@ const CAP_ADDFB2_MODIFIERS: u64 = 0x10;
 /// this card does not have. There is no engine presenting outside the frame
 /// boundary, so the `PAGE_FLIP_ASYNC` flag it gates has nothing to mean.
 const CAP_ASYNC_PAGE_FLIP: u64 = 0x07;
+/// `DRM_CAP_SYNCOBJ`: whether the card has the sync object family at all. The
+/// real card answers 1, so answering 1 here is a promise the `SYNCOBJ_*` arms
+/// below have to keep rather than a capability this card can decline.
+const CAP_SYNCOBJ: u64 = 0x13;
+/// `DRM_CAP_SYNCOBJ_TIMELINE`: whether those objects can carry a point.
+///
+/// It is the one Smithay asks before it will expose `wp_linux_drm_syncobj_v1`,
+/// and the protocol is *only* about timelines - a client hands the compositor a
+/// point on its own timeline rather than a fence per frame. So this is the cap
+/// that decides whether explicit sync exists on this machine at all.
+const CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
 /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES`: the client wants the plane objects the
 /// card has, which is how a compositor finds a primary plane to scan out on.
 const CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
@@ -633,6 +701,13 @@ struct DrmState {
     /// Queued `drmEvent` objects awaiting `read` on the card fd: (type,
     /// payload-u64-words). Only flip-completion is produced.
     events: VecDeque<drm_event::Vblank>,
+    /// The sync objects clients have made, each with the open file description
+    /// that made it - which is what makes a handle mean something to exactly one
+    /// client. A record dies with its descriptor (`DESTROY`, or the last
+    /// reference to the description closing), and the object itself lives on
+    /// while a `SYNCOBJ_HANDLE_TO_FD` descriptor names it, which is the sharing
+    /// the descriptor exists for.
+    syncobjs: Vec<Option<SyncObjRec>>,
 }
 
 mod drm_event {
@@ -682,6 +757,7 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     prime: Vec::new(),
     seq: 0,
     events: VecDeque::new(),
+    syncobjs: Vec::new(),
 }));
 
 /// The `drm_version` answer: this is not a real driver, so report the KMS ABI
@@ -901,6 +977,22 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_MODE_LIST_LESSES => list_leases(card, arg),
         NR_MODE_REVOKE_LEASE => revoke_lease(card, ofd, arg),
         NR_MODE_GET_LEASE => get_lease(arg),
+        // The sync object family. Every one of these is per *client* - the
+        // handle a request names means something only next to the description
+        // that made it - which is why they are the only arms here that take
+        // `ofd`, and why two clients can each have a handle 1.
+        NR_SYNCOBJ_CREATE => syncobj_create(ofd, arg),
+        NR_SYNCOBJ_DESTROY => syncobj_destroy(ofd, arg),
+        NR_SYNCOBJ_HANDLE_TO_FD => syncobj_handle_to_fd(ofd, arg),
+        NR_SYNCOBJ_FD_TO_HANDLE => syncobj_fd_to_handle(ofd, arg),
+        NR_SYNCOBJ_WAIT => syncobj_wait(ofd, arg),
+        NR_SYNCOBJ_RESET => syncobj_reset(ofd, arg),
+        NR_SYNCOBJ_SIGNAL => syncobj_signal(ofd, arg),
+        NR_SYNCOBJ_TIMELINE_WAIT => syncobj_timeline_wait(ofd, arg),
+        NR_SYNCOBJ_QUERY => syncobj_query(ofd, arg),
+        NR_SYNCOBJ_TRANSFER => syncobj_transfer(ofd, arg),
+        NR_SYNCOBJ_TIMELINE_SIGNAL => syncobj_timeline_signal(ofd, arg),
+        NR_SYNCOBJ_EVENTFD => syncobj_eventfd(ofd, arg),
         NR_CREATE_DUMB => create_dumb(arg),
         NR_MAP_DUMB => map_dumb(arg),
         _ => -25, // ENOTTY
@@ -1529,6 +1621,16 @@ pub fn master_closed(ofd: u64) {
         REVOKED.store(false, Ordering::Relaxed);
         crate::vfs::vcmux::set_master_vc(0);
     }
+    // And the sync objects it made. A handle is per *description*, so a
+    // description that is gone has nobody left who could name one - and the
+    // objects themselves are not dropped here: a `SYNCOBJ_HANDLE_TO_FD`
+    // descriptor that outlived the client still holds the one it names, which is
+    // the whole reason that descriptor exists.
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        st.syncobjs
+            .retain(|rec| rec.as_ref().is_none_or(|rec| rec.owner != ofd));
+    });
 }
 
 /// Whether the card fd should report hang-up: true from the moment a master
@@ -1608,6 +1710,31 @@ fn arg_shape(nr: u32) -> Option<(usize, bool)> {
         NR_CREATE_DUMB => (32, true),  // struct drm_mode_create_dumb
         NR_MAP_DUMB => (16, true),     // struct drm_mode_map_dumb
         NR_DESTROY_DUMB => (4, false), // struct drm_mode_destroy_dumb
+        // The sync object family. The two wait structs are the ones worth
+        // reading twice: this host's `drm.h` has grown a trailing
+        // `deadline_nsec` on each, so they are 40 and 48 bytes and *not* the 32
+        // and 40 the older upstream headers describe. A caller built against the
+        // old layout sends a request word eight bytes short, and every wait in
+        // the family answers `EINVAL` - which is exactly what the instrument
+        // programs measured before the sizes were corrected, and why the numbers
+        // here are the header's rather than a recollection of one.
+        NR_SYNCOBJ_CREATE => (8, true),   // struct drm_syncobj_create
+        NR_SYNCOBJ_DESTROY => (8, false), // struct drm_syncobj_destroy
+        NR_SYNCOBJ_HANDLE_TO_FD => (24, true), // struct drm_syncobj_handle
+        NR_SYNCOBJ_FD_TO_HANDLE => (24, true), // struct drm_syncobj_handle
+        NR_SYNCOBJ_WAIT => (40, true),    // struct drm_syncobj_wait
+        NR_SYNCOBJ_RESET | NR_SYNCOBJ_SIGNAL => (16, false), // drm_syncobj_array
+        NR_SYNCOBJ_TIMELINE_WAIT => (48, true), // drm_syncobj_timeline_wait
+        // `struct drm_syncobj_timeline_array` is read *and* written: `QUERY`
+        // fills the points array, and the two signals read it.
+        NR_SYNCOBJ_QUERY
+        | NR_SYNCOBJ_TRANSFER
+        | NR_SYNCOBJ_TIMELINE_SIGNAL
+        | NR_SYNCOBJ_EVENTFD => match nr {
+            NR_SYNCOBJ_QUERY | NR_SYNCOBJ_TIMELINE_SIGNAL => (24, true),
+            NR_SYNCOBJ_TRANSFER => (32, true), // struct drm_syncobj_transfer
+            _ => (24, true),                   // struct drm_syncobj_eventfd
+        },
         _ => return None,
     })
 }
@@ -1647,6 +1774,11 @@ fn get_cap(arg: usize) -> isize {
         // an `ADDFB2` that refused every modifier would be the caller building
         // a buffer it cannot then bind.
         CAP_ADDFB2_MODIFIERS => 1,
+        // Both answered 1, and made true below rather than merely advertised:
+        // the family is dispatched, `SYNCOBJ_EVENTFD` is the probe a compositor
+        // makes before it will expose the explicit-sync protocol, and a timeline
+        // is a shape these objects really have once a point is submitted.
+        CAP_SYNCOBJ | CAP_SYNCOBJ_TIMELINE => 1,
         // Named rather than left to the catch-all: this is *not* "unsupported
         // for now". A tearing flip is a mode of presentation this card does not
         // have - there is no engine to present outside the frame boundary - so
@@ -2382,15 +2514,22 @@ fn get_property(arg: usize) -> isize {
                 ("Coverage", BLEND_COVERAGE),
             ],
         ),
-        // A signed descriptor number: -1 means "no fence", which is what
-        // every commit here carries. The range is the one the kernel gives
-        // it, so a caller reading the shape back sees what it expects.
+        // A signed descriptor number: -1 means "no fence". The range is the one
+        // the kernel gives it, so a caller reading the shape back sees what it
+        // expects. It is now honoured rather than stored: a commit that carries
+        // one waits for it before a pixel moves.
         PROP_IN_FENCE_FD => (
             "IN_FENCE_FD",
             PROP_RANGE | PROP_SIGNED_RANGE,
             &[-1i64 as u64, i32::MAX as u64],
             &[],
         ),
+        // The other half: a pointer in the caller's memory where the commit
+        // writes back a fence descriptor for the frame it committed. The range
+        // is the whole 64-bit span because the value is an address - there is no
+        // smaller number that means anything, which is also why it is a range
+        // and not a `PROP_UINT`.
+        PROP_OUT_FENCE_PTR => ("OUT_FENCE_PTR", PROP_RANGE, &[0, u64::MAX], &[]),
         // The connector's `EDID`: a blob, and `IMMUTABLE` because a client that
         // could write it would be claiming to be the monitor. Its *value* is
         // the blob id the card publishes, which is what `OBJ_GETPROPERTIES`
@@ -2512,10 +2651,16 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
         (CURSOR_PLANE_ID, PROP_CRTC_Y) => st.cursor_pos.1 = value as i32,
         // Pre-multiplied or coverage alpha: the scanout carries the
         // compositor's finished frame, so the answer is recorded nowhere -
-        // there is nothing below it to blend against. The acquire fence is
-        // the same kind of write: there is no asynchronous engine here to
-        // wait for, so the value is accepted and forgotten.
-        (PLANE_ID, PROP_BLEND) | (PLANE_ID, PROP_IN_FENCE_FD) => {}
+        // there is nothing below it to blend against.
+        (PLANE_ID, PROP_BLEND) => {}
+        // The two fence properties are not values to *record* anywhere: a
+        // commit that carries one acts on it - the in-fence is waited for before
+        // the copy, the out-fence pointer is written back after the flush - and
+        // the single-property door cannot honour either, because a fence handed
+        // to a request that presents nothing has nothing to be ordered against.
+        // A real card refuses both there too, for the same reason: they are
+        // atomic-only.
+        (PLANE_ID, PROP_IN_FENCE_FD) | (PLANE_ID, PROP_OUT_FENCE_PTR) => return libc_einval(),
         _ => return libc_einval(),
     }
     0
@@ -2689,6 +2834,44 @@ fn mode_atomic(arg: usize) -> isize {
     // libdrm hands it to the flip handler as its `data` argument.
     let want_event = flags & PAGE_FLIP_EVENT != 0;
     let user_data = unsafe { ((arg + 48) as *const u64).read_unaligned() };
+    // The acquire fence, resolved before any lock is taken: a descriptor number
+    // is the caller's business, and looking one up takes the fd table's own
+    // lock. It is the buffer behind this fence that the copy is about to read,
+    // so a commit that cannot resolve one has nothing to apply - and it is
+    // refused here, before a pixel moves, rather than half-applied.
+    //
+    // What `IN_FENCE_FD` names is a `sync_file`, which is what the other half of
+    // the family hands out; a descriptor of any other kind is `EINVAL`, the same
+    // answer Linux's `sync_file_get_fence` gives.
+    let in_fence = match plan.in_fence_fd {
+        None | Some(-1) => None,
+        Some(fd) => {
+            let Ok(file) = crate::sched::current_fds().clone_at(fd) else {
+                return -9; // EBADF
+            };
+            let inode = file.inode();
+            let Some(sync_file) = inode.as_sync_file() else {
+                return libc_einval();
+            };
+            Some(sync_file.fence())
+        }
+    };
+    // The behaviour the property's name promises: the pixels are not read until
+    // the fence says the buffer is the caller's to read.
+    //
+    // On this machine that wait is *provably* immediate, and the reason is worth
+    // writing down rather than leaving as a hope: nothing on this card can make
+    // an unsignaled fence reachable from a descriptor. Every fence a client can
+    // obtain is either one `SYNCOBJ_HANDLE_TO_FD` exported - which refuses an
+    // object with no fence, and every fence here retires before the object is
+    // told about it - or an out-fence, whose descriptor is written back only
+    // after the frame has gone. So `has_retired` is true of every fence this
+    // loop can see, and it is a `block_until` rather than a bounded wait because
+    // the day that stops being true is the day an engine exists - which is the
+    // same day this comment has to be rewritten.
+    if let Some(fence) = &in_fence {
+        crate::sched::block_until(|| fence.has_retired());
+    }
     // Validate the plan's geometry under the lock, but apply nothing yet. A
     // commit that carries a new mode has to resize the scanout, and that parks
     // on the render task, so it cannot happen inside a critical section. This
@@ -2758,6 +2941,14 @@ fn mode_atomic(arg: usize) -> isize {
                 st.current_fb = fb;
                 continue;
             }
+            // The two fence properties are the commit's own business and are
+            // not state to record: the acquire fence has already been waited
+            // for, and the out-fence pointer is written back below, once the
+            // frame has gone. Recording them here would put a descriptor number
+            // and a caller's address into the state a compositor reads back.
+            if obj == PLANE_ID && matches!(prop, PROP_IN_FENCE_FD | PROP_OUT_FENCE_PTR) {
+                continue;
+            }
             let rc = set_object_prop(&mut st, obj, prop, value);
             if rc != 0 {
                 return rc;
@@ -2792,10 +2983,34 @@ fn mode_atomic(arg: usize) -> isize {
                 }
             });
         }
+        // The out-fence's descriptor, made *before* the frame is flushed, so
+        // that a caller with no descriptor left hears `EMFILE` from a commit
+        // that presented nothing rather than from one that presented a frame
+        // with no fence to report it.
+        //
+        // The fence is built armed and retired after the flush, because that is
+        // the transition a fence is for: it describes "the frame has gone", and
+        // the flush is the instant that becomes true. The descriptor's *number*
+        // is written into the caller's memory last of all, so there is no task
+        // that could be handed an armed one - the card has one task in this
+        // window, and it is the one doing the flushing.
+        let mut out_fence = None;
+        if plan.out_fence_ptr.is_some() {
+            let fence = crate::drm_sync::Fence::armed();
+            let file = Arc::new(crate::vfs::File::new(SyncFileFd::new(fence.clone())));
+            let Ok(fd) = crate::sched::current_fds().install(file) else {
+                return -24; // EMFILE
+            };
+            out_fence = Some((fd, fence));
+        }
         // Present, *then* report: the commit's completion event is queued once
         // the frame has actually gone to the host, so its timestamp is the
         // landing rather than the request. See [`queue_flip_event`].
         crate::drivers::video::render::request_flush_blocking();
+        if let (Some((fd, fence)), Some(ptr)) = (&out_fence, plan.out_fence_ptr) {
+            fence.retire();
+            unsafe { (ptr as *mut i32).write_unaligned(*fd) };
+        }
         if want_event {
             queue_flip_event(seq, user_data);
         }
@@ -2813,6 +3028,15 @@ struct Commit {
     order: Vec<(u32, u32, u64)>,
     mode_blob: Option<u32>,
     plane_fb: Option<u32>,
+    /// `IN_FENCE_FD`'s value: the descriptor the commit was handed, or -1 for
+    /// the property's own spelling of "no fence". Kept as a number here and
+    /// resolved to a fence before any lock is taken, because a descriptor number
+    /// is the caller's business and looking one up is the fd table's.
+    in_fence_fd: Option<i32>,
+    /// `OUT_FENCE_PTR`'s value: where the commit writes back the descriptor it
+    /// makes. Validated as the caller's memory the moment it arrives, so the
+    /// write at the end of a successful commit cannot fault in the kernel.
+    out_fence_ptr: Option<usize>,
 }
 
 impl Commit {
@@ -2831,6 +3055,7 @@ impl Commit {
                 | (PLANE_ID, PROP_PLANE_CRTC_ID)
                 | (PLANE_ID, PROP_BLEND)
                 | (PLANE_ID, PROP_IN_FENCE_FD)
+                | (PLANE_ID, PROP_OUT_FENCE_PTR)
                 | (CURSOR_PLANE_ID, PROP_PLANE_FB_ID)
                 | (CURSOR_PLANE_ID, PROP_PLANE_CRTC_ID)
                 | (CURSOR_PLANE_ID, PROP_CRTC_X)
@@ -2844,6 +3069,23 @@ impl Commit {
         }
         if obj == PLANE_ID && prop == PROP_PLANE_FB_ID {
             self.plane_fb = Some(value as u32);
+        }
+        if obj == PLANE_ID && prop == PROP_IN_FENCE_FD {
+            // Sign-extended by the caller because the property is a signed
+            // range; -1 is the spelling of "no fence".
+            self.in_fence_fd = Some(value as i32);
+        }
+        if obj == PLANE_ID && prop == PROP_OUT_FENCE_PTR {
+            // The value is an address this card will write four bytes to once
+            // the frame has gone, so it is checked here - where the value
+            // arrives, and before anything has been applied - rather than at the
+            // write. `0` is the property saying "no fence wanted", which is not
+            // an address at all.
+            let ptr = value as usize;
+            if ptr != 0 && !crate::uaccess::buffer_ok(ptr, 4, true, true) {
+                return Err(-14); // EFAULT
+            }
+            self.out_fence_ptr = (ptr != 0).then_some(ptr);
         }
         self.order.push((obj, prop, value));
         Ok(())
@@ -3164,7 +3406,7 @@ fn obj_get_properties(arg: usize) -> isize {
                         PROP_BLEND,
                         PROP_IN_FENCE_FD,
                         PROP_IN_FORMATS,
-                        0,
+                        PROP_OUT_FENCE_PTR,
                         0,
                     ],
                     [
@@ -3183,10 +3425,14 @@ fn obj_get_properties(arg: usize) -> isize {
                         -1i64 as u64,
                         // The plane's format-and-modifier list, as a blob id.
                         DRIVER_BLOB_IN_FORMATS as u64,
+                        // `OUT_FENCE_PTR` has no value to read back: it is a
+                        // pointer the *caller* supplies for one commit, and
+                        // after that commit it is the caller's variable, not
+                        // this card's state.
                         0,
                         0,
                     ],
-                    14usize,
+                    15usize,
                 ))
             }
             // The cursor plane's properties, and the list is deliberately short:
@@ -3733,6 +3979,882 @@ fn prime_fd_to_handle(arg: usize) -> isize {
     }
     unsafe { (arg as *mut u32).write_unaligned(handle) };
     0
+}
+
+/// One sync object as *this card* keeps it: the handle a client named it by, the
+/// open file description that made it, the state machine `crate::drm_sync`
+/// decides with, and the eventfd registrations waiting on it.
+///
+/// The handle is per *description* rather than per card, which is Linux's shape
+/// and the reason the family is usable at all: two clients each get their own
+/// numbering, and passing a `SYNCOBJ_HANDLE_TO_FD` descriptor between them is
+/// what makes one client's timeline waitable by another.
+struct SyncObjRec {
+    owner: u64,
+    handle: u32,
+    obj: Arc<crate::drm_sync::SyncObj>,
+    /// One entry per `SYNCOBJ_EVENTFD` call. Each fires at most once - that is
+    /// what was measured, and it is what makes "register, signal, read one"
+    /// composable.
+    events: Vec<SyncEvent>,
+}
+
+/// One `SYNCOBJ_EVENTFD` registration: the counter to bump, the point it was
+/// asked about, and whether it has already been handed its one increment.
+struct SyncEvent {
+    /// The eventfd node itself, held as a node rather than as a number: a
+    /// registration outlives the request that made it, and the increment it owes
+    /// later has to reach a counter that is still there. This is the reference
+    /// Linux's `eventfd_ctx_fdget` takes for the same reason.
+    counter: Arc<dyn Inode>,
+    /// The point asked about. Zero is not a point: it is the request saying
+    /// "whatever this object is", which is how a plain binary object is
+    /// registered, and the measured card fires that one on the fence alone.
+    point: u64,
+    /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE`: fire when *a fence exists* rather
+    /// than when the point is covered.
+    available: bool,
+    fired: bool,
+}
+
+/// Cap on the sync objects one card tracks. Linux numbers them from an idr with
+/// no ceiling of its own; this card has to bound a table a client can grow
+/// (`AGENTS.md` §4.4), and no compositor is within two orders of magnitude of
+/// this one.
+const MAX_SYNCOBJS: usize = 256;
+/// Cap on the handles one `SYNCOBJ_WAIT` may name. The real card accepted 300;
+/// this is the point past which the count is a corrupted struct rather than a
+/// request.
+const MAX_SYNC_WAIT: usize = 4096;
+
+/// The sync objects' state machine, in the one place a host test can reach it.
+/// What it means is documented there and measured in `PLAN.md` §7.4.
+///
+/// The descriptor `SYNCOBJ_HANDLE_TO_FD` with `flags == 0` answers: an anonymous
+/// file that *is* the sync object, so a second description that takes it in
+/// (`SCM_RIGHTS`, or simply a `dup`) can `SYNCOBJ_FD_TO_HANDLE` the same object
+/// into its own handle table. That sharing is the whole point of the protocol it
+/// exists for - `wp_linux_drm_syncobj_v1` passes one between the client that
+/// rendered and the compositor that will wait.
+pub struct SyncObjFd {
+    ino: u64,
+    obj: Arc<crate::drm_sync::SyncObj>,
+}
+
+impl SyncObjFd {
+    fn new(obj: Arc<crate::drm_sync::SyncObj>) -> Arc<SyncObjFd> {
+        static NEXT: AtomicU64 = AtomicU64::new(0x9200);
+        Arc::new(SyncObjFd {
+            ino: NEXT.fetch_add(1, Ordering::Relaxed),
+            obj,
+        })
+    }
+
+    /// The object behind the descriptor, for the import that installs a handle
+    /// for it in another table.
+    pub fn object(&self) -> Arc<crate::drm_sync::SyncObj> {
+        self.obj.clone()
+    }
+}
+
+impl Inode for SyncObjFd {
+    fn metadata(&self) -> Metadata {
+        // Anonymous, like every other descriptor that is not a file: the number
+        // only has to be one nothing else claims, and `fstat` is the only
+        // reporter.
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::CharDev,
+            size: 0,
+        }
+    }
+
+    fn as_syncobj_fd(&self) -> Option<&SyncObjFd> {
+        Some(self)
+    }
+}
+
+/// The descriptor `SYNCOBJ_HANDLE_TO_FD` with `EXPORT_SYNC_FILE` answers, and
+/// the one a commit's out-fence leaves in the caller's table: `struct sync_file`,
+/// a fence behind a file descriptor.
+///
+/// It is a *readable* descriptor - `poll` reports `POLLIN` once the fence has
+/// retired - and that readiness is the only thing it has to say, which is why
+/// there is no `read_at` here: a caller waits on it or hands it to someone who
+/// will.
+pub struct SyncFileFd {
+    ino: u64,
+    fence: Arc<crate::drm_sync::Fence>,
+}
+
+impl SyncFileFd {
+    fn new(fence: Arc<crate::drm_sync::Fence>) -> Arc<SyncFileFd> {
+        static NEXT: AtomicU64 = AtomicU64::new(0x9300);
+        Arc::new(SyncFileFd {
+            ino: NEXT.fetch_add(1, Ordering::Relaxed),
+            fence,
+        })
+    }
+
+    /// The fence behind the descriptor, for `FD_TO_HANDLE` with
+    /// `IMPORT_SYNC_FILE`.
+    pub fn fence(&self) -> Arc<crate::drm_sync::Fence> {
+        self.fence.clone()
+    }
+}
+
+impl Inode for SyncFileFd {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::CharDev,
+            size: 0,
+        }
+    }
+
+    /// A `sync_file` is readable exactly when its fence has retired - Linux's
+    /// answer, and the one a compositor's event loop is built on.
+    fn poll_ready(&self) -> Ready {
+        Ready {
+            read: self.fence.has_retired(),
+            write: false,
+        }
+    }
+
+    fn as_sync_file(&self) -> Option<&SyncFileFd> {
+        Some(self)
+    }
+}
+
+/// The object a `SyncObjFd` holds, behind one more `Arc` so that the descriptor
+/// type can live here while the object's own type lives in the host-tested leaf
+/// module.
+///
+/// The extra indirection is deliberate rather than accidental: `crate::drm_sync`
+/// knows nothing about descriptors, and a `pub fn` on it that returned an `Arc`
+/// of its own type would be the same thing without the wrapper. This is the
+/// wrapper.
+///
+/// (The alias's fields are `pub(crate)` in spirit; see `drm_sync::SyncObjectAlias`.)
+fn syncobj_lookup(st: &DrmState, owner: u64, handle: u32) -> Option<Arc<crate::drm_sync::SyncObj>> {
+    st.syncobjs
+        .iter()
+        .flatten()
+        .find(|rec| rec.owner == owner && rec.handle == handle)
+        .map(|rec| rec.obj.clone())
+}
+
+/// Resolve every handle of a `WAIT`-shaped request before any condition is
+/// looked at: a request that names an object the caller does not have is refused
+/// as a whole rather than partly answered, which is the same property the
+/// commit path keeps with its plan.
+fn syncobj_resolve(
+    st: &DrmState,
+    owner: u64,
+    handles: &[u32],
+) -> Result<Vec<Arc<crate::drm_sync::SyncObj>>, isize> {
+    let mut out = Vec::with_capacity(handles.len());
+    for &handle in handles {
+        match syncobj_lookup(st, owner, handle) {
+            Some(obj) => out.push(obj),
+            None => return Err(-2), // ENOENT
+        }
+    }
+    Ok(out)
+}
+
+/// The handle array of a `SYNCOBJ_WAIT`/`_RESET`/`_SIGNAL`-shaped request.
+///
+/// `count == 0` is a successful no-op on the measured card and not an error, so
+/// it is answered before the pointer is looked at - and a null pointer with a
+/// non-zero count is `EFAULT`, which is what the kernel's own `copy_from_user`
+/// of the array would give.
+fn syncobj_handles(ptr: usize, count: usize) -> Result<Vec<u32>, isize> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > MAX_SYNC_WAIT {
+        return Err(libc_einval());
+    }
+    if ptr == 0 || !user_array(ptr, count, 4, false) {
+        return Err(-14); // EFAULT
+    }
+    Ok(unsafe { core::slice::from_raw_parts(ptr as *const u32, count) }.to_vec())
+}
+
+/// A DRM absolute `CLOCK_MONOTONIC` deadline in nanoseconds, as the tick
+/// deadline `block_until_deadline` keeps.
+///
+/// Zero is "do not wait" and not "wait for one tick": the measured card answers
+/// `ETIME` at once when a `WAIT_FOR_SUBMIT` cannot be satisfied, so the deadline
+/// has to be *now* - which is what `block_until_deadline` reports on its first
+/// pass. A negative timeout is the header's "wait for ever".
+fn wait_deadline(nsec: i64) -> u64 {
+    if nsec < 0 {
+        return u64::MAX;
+    }
+    let per_tick = 1_000_000_000u64 / crate::arch::timer::TICK_HZ as u64;
+    let left = (nsec as u64).saturating_sub(crate::arch::timer::since_boot_nanos());
+    crate::arch::timer::ticks().saturating_add(left / per_tick.max(1))
+}
+
+/// Park until `satisfied` holds, the deadline passes, or a signal arrives, and
+/// answer the errno the request owes. Returns 0 when the wait ended because the
+/// condition held.
+///
+/// The objects are the ones a waiter has to be registered on: a sync object's
+/// readiness changes when *another task submits a fence to it*, and that task has
+/// no way to find a sleeper it was not told about - the same lock-poll-try-unlock-
+/// park shape `vfs::eventfd` uses for its counter.
+fn syncobj_park(
+    objs: &[Arc<crate::drm_sync::SyncObj>],
+    nsec: i64,
+    satisfied: impl Fn() -> bool,
+) -> isize {
+    let me = crate::sched::current();
+    for obj in objs {
+        obj.subscribe(me);
+    }
+    let end = crate::sched::block_until_deadline(&satisfied, wait_deadline(nsec));
+    for obj in objs {
+        obj.unsubscribe(me);
+    }
+    match end {
+        crate::sched::WaitEnd::Condition => 0,
+        crate::sched::WaitEnd::Deadline => -62,   // ETIME
+        crate::sched::WaitEnd::Interrupted => -4, // EINTR
+    }
+}
+
+/// Whether one handle of a wait array is satisfied. `point == 0` is a plain
+/// object's question, which is "is a fence behind it" - the measured card's
+/// reading, where a point that was never asked about is not asked about.
+fn syncobj_one_ready(obj: &crate::drm_sync::SyncObj, point: u64, for_submit: bool) -> bool {
+    obj.ready((point != 0).then_some(point), for_submit)
+}
+
+/// The readiness of a whole `WAIT` array: `all` is
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL`, and otherwise *any* satisfied handle ends
+/// the wait.
+fn syncobj_any_ready(
+    objs: &[Arc<crate::drm_sync::SyncObj>],
+    points: &[u64],
+    for_submit: bool,
+    all: bool,
+) -> bool {
+    if all {
+        objs.iter()
+            .zip(points.iter())
+            .all(|(obj, &point)| syncobj_one_ready(obj, point, for_submit))
+    } else {
+        objs.iter()
+            .zip(points.iter())
+            .any(|(obj, &point)| syncobj_one_ready(obj, point, for_submit))
+    }
+}
+
+/// Which handle of the array the answer's `first_signaled` names: the first one
+/// that is satisfied. `WAIT_ALL` has no such index to give and the measured card
+/// leaves the field alone for it, so this is only meaningful for the `any` shape.
+fn syncobj_first_ready(
+    objs: &[Arc<crate::drm_sync::SyncObj>],
+    points: &[u64],
+    for_submit: bool,
+) -> u32 {
+    objs.iter()
+        .zip(points.iter())
+        .position(|(obj, &point)| syncobj_one_ready(obj, point, for_submit))
+        .unwrap_or(0) as u32
+}
+
+/// Hand the eventfd registrations on a record whatever they have come due - the
+/// increment each was promised, once.
+fn fire_sync_events(rec: &mut SyncObjRec) {
+    for event in rec.events.iter_mut() {
+        if event.fired {
+            continue;
+        }
+        let due = if event.available {
+            // `WAIT_AVAILABLE`: a fence existing is the whole question.
+            rec.obj.has_fence()
+        } else {
+            // Point 0 is not a point: it is the request saying "whatever this
+            // object is", which is how a plain binary syncobj is registered.
+            let point = (event.point != 0).then_some(event.point);
+            rec.obj.ready(point, false)
+        };
+        if due {
+            event.fired = true;
+            // One increment, saturating, which is what wakes whoever is in
+            // `poll` on the eventfd - the reader an event loop already has. The
+            // write is the counter node's own, so it carries the same wake the
+            // eventfd's `write` syscall does rather than a second one beside it.
+            let _ = Inode::write_at(&*event.counter, 0, &1u64.to_ne_bytes());
+        }
+    }
+}
+
+/// `SYNCOBJ_CREATE`: a new object, and the handle that names it.
+///
+/// `DRM_SYNCOBJ_CREATE_SIGNALED` is the difference between an object every
+/// request about a fence will refuse and one with a fence already behind it -
+/// measured, and the opposite reading from the upstream sources, which treat
+/// *both* as signaled. `PLAN.md` §7.4 has the measurement.
+fn syncobj_create(owner: u64, arg: usize) -> isize {
+    // struct drm_syncobj_create: handle@0, flags@4.
+    let flags = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    if flags & !SYNCOBJ_CREATE_SIGNALED != 0 {
+        return libc_einval();
+    }
+    let handle = critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let st = &mut *st;
+        if st.syncobjs.len() >= MAX_SYNCOBJS {
+            return 0;
+        }
+        // Lowest free number *for this description*, which is what Linux's idr
+        // gives and what a test that creates and destroys in a loop sees.
+        let mut handle = 1u32;
+        while syncobj_lookup(st, owner, handle).is_some() {
+            handle += 1;
+        }
+        st.syncobjs.push(Some(SyncObjRec {
+            owner,
+            handle,
+            obj: crate::drm_sync::SyncObj::new(flags & SYNCOBJ_CREATE_SIGNALED != 0),
+            events: Vec::new(),
+        }));
+        handle
+    });
+    if handle == 0 {
+        return libc_einval(); // the table is full
+    }
+    unsafe { (arg as *mut u32).write_unaligned(handle) };
+    0
+}
+
+/// `SYNCOBJ_DESTROY`: the handle stops naming anything.
+///
+/// The object itself lives on while a `SYNCOBJ_HANDLE_TO_FD` descriptor names it,
+/// which is exactly the sharing the descriptor exists for. A registration that
+/// has not fired never will, which is what the measured card does: destroying the
+/// object leaves the eventfd at zero rather than handing it an increment for a
+/// point nobody will reach.
+fn syncobj_destroy(owner: u64, arg: usize) -> isize {
+    let handle = unsafe { (arg as *const u32).read_unaligned() };
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let st = &mut *st;
+        // A handle that names nothing is `EINVAL` here and `ENOENT` from the
+        // requests that *operate* on an object. Both were measured that way.
+        let Some(slot) = st.syncobjs.iter_mut().find(|rec| {
+            rec.as_ref()
+                .is_some_and(|rec| rec.owner == owner && rec.handle == handle)
+        }) else {
+            return libc_einval();
+        };
+        *slot = None;
+        st.syncobjs.retain(Option::is_some);
+        0
+    })
+}
+
+/// `SYNCOBJ_HANDLE_TO_FD`: the object behind a descriptor.
+///
+/// Two descriptors come out of this, and which one is asked for is
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`. Without it the descriptor
+/// *is* the object and another description can name the same timeline; with it
+/// the descriptor is a `sync_file` over the fence the object holds, so a caller
+/// that only wants to wait on one gets nothing that could be handed on. The
+/// export refuses an object with no fence, which the measured card does and the
+/// sources do not - there is nothing to export.
+fn syncobj_handle_to_fd(owner: u64, arg: usize) -> isize {
+    // struct drm_syncobj_handle: handle@0, flags@4, fd@8, pad@12, point@16.
+    let handle = unsafe { (arg as *const u32).read_unaligned() };
+    let flags = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    if flags & !(SYNCOBJ_EXPORT_SYNC_FILE | SYNCOBJ_FLAGS_TIMELINE | DRM_CLOEXEC) != 0 {
+        return libc_einval();
+    }
+    let obj = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        syncobj_lookup(&st, owner, handle)
+    });
+    let Some(obj) = obj else {
+        return -2; // ENOENT
+    };
+    let want_file = flags & SYNCOBJ_EXPORT_SYNC_FILE != 0;
+    let inode: Arc<dyn Inode> = if want_file {
+        match obj.fence() {
+            Some(fence) => SyncFileFd::new(fence),
+            None => return libc_einval(),
+        }
+    } else {
+        SyncObjFd::new(obj)
+    };
+    let file = Arc::new(crate::vfs::File::new(inode));
+    let fd = match crate::sched::current_fds().install(file) {
+        Ok(fd) => fd,
+        Err(crate::vfs::VfsError::TooManyDescriptors) => return -24, // EMFILE
+        Err(_) => return libc_einval(),
+    };
+    if flags & DRM_CLOEXEC != 0 {
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
+    unsafe { ((arg + 8) as *mut i32).write_unaligned(fd) };
+    0
+}
+
+/// `SYNCOBJ_FD_TO_HANDLE`: a descriptor's object, under a handle in the caller's
+/// own table.
+///
+/// The two directions take the two descriptors `HANDLE_TO_FD` makes, and they do
+/// not take each other's: without the flag the descriptor must *be* the object
+/// (and `handle` must be 0, because a new name is the only thing this can
+/// produce), while with `IMPORT_SYNC_FILE` it must be a `sync_file` and `handle`
+/// must name an object that already exists, whose fence is then replaced. Asking
+/// for a new handle with the import flag is `ENOENT` on the measured card - and
+/// that is the whole difference between the two, so it is pinned rather than
+/// smoothed over.
+fn syncobj_fd_to_handle(owner: u64, arg: usize) -> isize {
+    let handle = unsafe { (arg as *const u32).read_unaligned() };
+    let flags = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    let fd = unsafe { ((arg + 8) as *const i32).read_unaligned() };
+    if flags & !(SYNCOBJ_IMPORT_SYNC_FILE | SYNCOBJ_FLAGS_TIMELINE) != 0 {
+        return libc_einval();
+    }
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(_) => return -9, // EBADF
+    };
+    let inode = file.inode();
+    if flags & SYNCOBJ_IMPORT_SYNC_FILE != 0 {
+        // The object is named first, so that a caller which has neither hears
+        // the same answer the measured card gives rather than the fd's.
+        let Some(target) = critical_section::with(|cs| {
+            let st = STATE.borrow(cs).borrow();
+            syncobj_lookup(&st, owner, handle)
+        }) else {
+            return -2; // ENOENT
+        };
+        let Some(sync_file) = inode.as_sync_file() else {
+            return libc_einval();
+        };
+        target.submit(sync_file.fence(), None);
+        critical_section::with(|cs| {
+            let mut st = STATE.borrow(cs).borrow_mut();
+            sync_events_left(&mut st, owner, handle);
+        });
+        return 0;
+    }
+    if handle != 0 {
+        // Without the import flag there is nothing to replace.
+        return libc_einval();
+    }
+    let Some(syncobj_fd) = inode.as_syncobj_fd() else {
+        return libc_einval();
+    };
+    let object = syncobj_fd.object();
+    let handle = critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let st = &mut *st;
+        if st.syncobjs.len() >= MAX_SYNCOBJS {
+            return 0;
+        }
+        let mut handle = 1u32;
+        while syncobj_lookup(st, owner, handle).is_some() {
+            handle += 1;
+        }
+        st.syncobjs.push(Some(SyncObjRec {
+            owner,
+            handle,
+            obj: object,
+            events: Vec::new(),
+        }));
+        handle
+    });
+    if handle == 0 {
+        return libc_einval();
+    }
+    unsafe { (arg as *mut u32).write_unaligned(handle) };
+    0
+}
+
+/// `SYNCOBJ_WAIT`: wait for the fences behind a list of objects.
+///
+/// The measured rule that makes this unlike the sources: **an object with no
+/// fence is refused**, not treated as already signaled, unless the caller said
+/// `WAIT_FOR_SUBMIT` - in which case there is something to wait for after all and
+/// the wait parks until another task submits a fence. Without that flag a wait on
+/// an empty object could never end, which is why the card answers `EINVAL` rather
+/// than blocking.
+fn syncobj_wait(owner: u64, arg: usize) -> isize {
+    // struct drm_syncobj_wait: handles@0, timeout_nsec@8, count_handles@16,
+    // flags@20, first_signaled@24, pad@28, deadline_nsec@32.
+    let ptr = unsafe { (arg as *const u64).read_unaligned() } as usize;
+    let timeout = unsafe { ((arg + 8) as *const i64).read_unaligned() };
+    let count = unsafe { ((arg + 16) as *const u32).read_unaligned() } as usize;
+    let flags = unsafe { ((arg + 20) as *const u32).read_unaligned() };
+    const KNOWN: u32 =
+        SYNCOBJ_WAIT_ALL | SYNCOBJ_WAIT_FOR_SUBMIT | SYNCOBJ_WAIT_AVAILABLE | SYNCOBJ_WAIT_DEADLINE;
+    if flags & !KNOWN != 0 {
+        return libc_einval();
+    }
+    let handles = match syncobj_handles(ptr, count) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    if handles.is_empty() {
+        return 0;
+    }
+    let objs = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        syncobj_resolve(&st, owner, &handles)
+    });
+    let objs = match objs {
+        Ok(objs) => objs,
+        Err(e) => return e,
+    };
+    let all = flags & SYNCOBJ_WAIT_ALL != 0;
+    let for_submit = flags & SYNCOBJ_WAIT_FOR_SUBMIT != 0;
+    // No point is named: a plain object's whole question is whether a fence is
+    // behind it.
+    let points = alloc::vec![0u64; objs.len()];
+    let satisfied = || syncobj_any_ready(&objs, &points, for_submit, all);
+    if !for_submit && !satisfied() {
+        // An object with no fence, and no promise that one is coming.
+        return libc_einval();
+    }
+    if !satisfied() {
+        let rc = syncobj_park(&objs, timeout, satisfied);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    if !all {
+        let first = syncobj_first_ready(&objs, &points, for_submit);
+        unsafe { ((arg + 24) as *mut u32).write_unaligned(first) };
+    }
+    0
+}
+
+/// `SYNCOBJ_TIMELINE_WAIT`: the same, for a point on each object.
+///
+/// Two rules are this request's own. An object that has never had a point
+/// submitted is **not a timeline**, and asking it about a point is `EINVAL`
+/// rather than a wait that could never end. And `WAIT_FOR_SUBMIT` again settles
+/// on the fence's presence: the measured card answers `ok` to a point it has
+/// never reached, as soon as something is behind the object.
+fn syncobj_timeline_wait(owner: u64, arg: usize) -> isize {
+    // struct drm_syncobj_timeline_wait: handles@0, points@8, timeout_nsec@16,
+    // count_handles@24, flags@28, first_signaled@32, pad@36, deadline_nsec@40.
+    let handles_ptr = unsafe { (arg as *const u64).read_unaligned() } as usize;
+    let points_ptr = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
+    let timeout = unsafe { ((arg + 16) as *const i64).read_unaligned() };
+    let count = unsafe { ((arg + 24) as *const u32).read_unaligned() } as usize;
+    let flags = unsafe { ((arg + 28) as *const u32).read_unaligned() };
+    const KNOWN: u32 =
+        SYNCOBJ_WAIT_ALL | SYNCOBJ_WAIT_FOR_SUBMIT | SYNCOBJ_WAIT_AVAILABLE | SYNCOBJ_WAIT_DEADLINE;
+    if flags & !KNOWN != 0 {
+        return libc_einval();
+    }
+    let handles = match syncobj_handles(handles_ptr, count) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    if handles.is_empty() {
+        return 0;
+    }
+    if points_ptr == 0 || !user_array(points_ptr, count, 8, false) {
+        return -14; // EFAULT
+    }
+    let points = unsafe { core::slice::from_raw_parts(points_ptr as *const u64, count) }.to_vec();
+    let objs = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        syncobj_resolve(&st, owner, &handles)
+    });
+    let objs = match objs {
+        Ok(objs) => objs,
+        Err(e) => return e,
+    };
+    if objs.iter().any(|obj| !obj.is_timeline()) {
+        return libc_einval(); // a point was never submitted, so there is none to wait on
+    }
+    let all = flags & SYNCOBJ_WAIT_ALL != 0;
+    let for_submit = flags & SYNCOBJ_WAIT_FOR_SUBMIT != 0;
+    let satisfied = || syncobj_any_ready(&objs, &points, for_submit, all);
+    if !for_submit && !satisfied() {
+        return libc_einval();
+    }
+    if !satisfied() {
+        let rc = syncobj_park(&objs, timeout, satisfied);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    if !all {
+        let first = syncobj_first_ready(&objs, &points, for_submit);
+        unsafe { ((arg + 32) as *mut u32).write_unaligned(first) };
+    }
+    0
+}
+
+/// `SYNCOBJ_RESET`: the objects stop holding anything.
+///
+/// A handle that names nothing is `ENOENT` here, unlike `DESTROY`'s `EINVAL` -
+/// both measured, and the difference is the one Linux draws: destroying a name
+/// that is not there is an argument error, while operating on a name that is not
+/// there is a missing object.
+fn syncobj_reset(owner: u64, arg: usize) -> isize {
+    // struct drm_syncobj_array: handles@0, count_handles@8.
+    let ptr = unsafe { (arg as *const u64).read_unaligned() } as usize;
+    let count = unsafe { ((arg + 8) as *const u32).read_unaligned() } as usize;
+    let handles = match syncobj_handles(ptr, count) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    let objs = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        syncobj_resolve(&st, owner, &handles)
+    });
+    let objs = match objs {
+        Ok(objs) => objs,
+        Err(e) => return e,
+    };
+    for obj in &objs {
+        obj.reset();
+    }
+    0
+}
+
+/// `SYNCOBJ_SIGNAL`: a fence is submitted to each object, retired already.
+///
+/// On this card that is all a signal can be - there is no engine to hand the
+/// work to, so the fence it leaves is one that has retired by the time the
+/// request returns. `TIMELINE_SIGNAL` is the same write with a point attached.
+fn syncobj_signal(owner: u64, arg: usize) -> isize {
+    let ptr = unsafe { (arg as *const u64).read_unaligned() } as usize;
+    let count = unsafe { ((arg + 8) as *const u32).read_unaligned() } as usize;
+    let handles = match syncobj_handles(ptr, count) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    let objs = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        syncobj_resolve(&st, owner, &handles)
+    });
+    let objs = match objs {
+        Ok(objs) => objs,
+        Err(e) => return e,
+    };
+    for obj in &objs {
+        obj.submit(crate::drm_sync::Fence::retired(), None);
+    }
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        for &handle in &handles {
+            sync_events_left(&mut st, owner, handle);
+        }
+    });
+    0
+}
+
+/// `SYNCOBJ_TIMELINE_SIGNAL`: submit a fence at a point.
+///
+/// This is the request that *makes* an object a timeline, which is why there is
+/// no gate here for one that is not: the measured card accepts it on a plain
+/// object and answers its `QUERY` with the point afterwards. Points are accepted
+/// below the object's own too, and move nothing - a point that could go backwards
+/// would let a wait on a point already passed fail again.
+fn syncobj_timeline_signal(owner: u64, arg: usize) -> isize {
+    // struct drm_syncobj_timeline_array: handles@0, points@8, count@16, flags@20.
+    let handles_ptr = unsafe { (arg as *const u64).read_unaligned() } as usize;
+    let points_ptr = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
+    let count = unsafe { ((arg + 16) as *const u32).read_unaligned() } as usize;
+    let flags = unsafe { ((arg + 20) as *const u32).read_unaligned() };
+    if flags != 0 {
+        return libc_einval();
+    }
+    let handles = match syncobj_handles(handles_ptr, count) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    if count == 0 {
+        return 0;
+    }
+    if points_ptr == 0 || !user_array(points_ptr, count, 8, false) {
+        return -14; // EFAULT
+    }
+    let points = unsafe { core::slice::from_raw_parts(points_ptr as *const u64, count) }.to_vec();
+    let objs = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        syncobj_resolve(&st, owner, &handles)
+    });
+    let objs = match objs {
+        Ok(objs) => objs,
+        Err(e) => return e,
+    };
+    for (obj, &point) in objs.iter().zip(points.iter()) {
+        obj.submit(crate::drm_sync::Fence::retired(), Some(point));
+    }
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        for &handle in &handles {
+            sync_events_left(&mut st, owner, handle);
+        }
+    });
+    0
+}
+
+/// `SYNCOBJ_QUERY`: how far each timeline has got.
+///
+/// An object that has never had a point reports 0, and so does one that was
+/// reset, which is the same statement: `RESET` takes the point back to zero.
+/// This is the one request in the family that does not need a fence, because
+/// "how far has this got" has an answer even when the answer is nothing.
+fn syncobj_query(owner: u64, arg: usize) -> isize {
+    let handles_ptr = unsafe { (arg as *const u64).read_unaligned() } as usize;
+    let points_ptr = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
+    let count = unsafe { ((arg + 16) as *const u32).read_unaligned() } as usize;
+    let flags = unsafe { ((arg + 20) as *const u32).read_unaligned() };
+    if flags & !SYNCOBJ_QUERY_LAST_SUBMITTED != 0 {
+        return libc_einval();
+    }
+    let handles = match syncobj_handles(handles_ptr, count) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    if count == 0 {
+        return 0;
+    }
+    if points_ptr == 0 || !user_array(points_ptr, count, 8, true) {
+        return -14; // EFAULT
+    }
+    let objs = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        syncobj_resolve(&st, owner, &handles)
+    });
+    let objs = match objs {
+        Ok(objs) => objs,
+        Err(e) => return e,
+    };
+    // Every point is written, including the zeros: the array is the caller's
+    // output and a point left alone would be a number the card never said.
+    unsafe {
+        for (i, obj) in objs.iter().enumerate() {
+            (points_ptr as *mut u64).add(i).write_unaligned(obj.point());
+        }
+    }
+    0
+}
+
+/// `SYNCOBJ_TRANSFER`: move a fence from one object to another.
+///
+/// Measured on the real card: the request needs *one* fence between its two ends
+/// and refuses it with `EINVAL` when neither has one, which is also the honest
+/// answer - a transfer that carries nothing and reports success is the silent
+/// no-op `AGENTS.md` §4.2 forbids. The destination's point moves to `dst_point`
+/// when one was named, with no check that it went up.
+fn syncobj_transfer(owner: u64, arg: usize) -> isize {
+    // struct drm_syncobj_transfer: src@0, dst@4, src_point@8, dst_point@16,
+    // flags@24.
+    let src = unsafe { (arg as *const u32).read_unaligned() };
+    let dst = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    let dst_point = unsafe { ((arg + 16) as *const u64).read_unaligned() };
+    let flags = unsafe { ((arg + 24) as *const u32).read_unaligned() };
+    if flags != 0 {
+        return libc_einval();
+    }
+    let (src_obj, dst_obj) = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        (
+            syncobj_lookup(&st, owner, src),
+            syncobj_lookup(&st, owner, dst),
+        )
+    });
+    let (Some(src_obj), Some(dst_obj)) = (src_obj, dst_obj) else {
+        return -2; // ENOENT
+    };
+    let some_fence = src_obj.has_fence() || dst_obj.has_fence();
+    if !some_fence {
+        return libc_einval();
+    }
+    match src_obj.fence() {
+        Some(fence) => dst_obj.submit(fence, (dst_point != 0).then_some(dst_point)),
+        // The source carries nothing, so only the destination's own point moves;
+        // its fence (the one that made this request legal) is left where it is.
+        None => {
+            if dst_point != 0 {
+                dst_obj.submit_point(dst_point);
+            }
+        }
+    }
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        sync_events_left(&mut st, owner, dst);
+    });
+    0
+}
+
+/// `SYNCOBJ_EVENTFD`: a sync object's arrival, as an increment on a counter.
+///
+/// This is the request an event loop uses, and the one Smithay probes before it
+/// will expose `wp_linux_drm_syncobj_v1` at all - a compositor that has to wait
+/// for a client's timeline cannot afford a thread per wait. Each call registers
+/// *one* increment: two registrations and one signal read back as 2, and a
+/// registration whose point is already covered fires before the request returns.
+fn syncobj_eventfd(owner: u64, arg: usize) -> isize {
+    // struct drm_syncobj_eventfd: handle@0, flags@4, point@8, fd@16, pad@20.
+    let handle = unsafe { (arg as *const u32).read_unaligned() };
+    let flags = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    let point = unsafe { ((arg + 8) as *const u64).read_unaligned() };
+    let fd = unsafe { ((arg + 16) as *const i32).read_unaligned() };
+    // `WAIT_AVAILABLE` is meaningful here; the rest of the wait flags are not,
+    // and the measured card refuses anything else with `EINVAL`.
+    if flags & !SYNCOBJ_WAIT_AVAILABLE != 0 {
+        return libc_einval();
+    }
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(_) => return -9, // EBADF
+    };
+    // The node, not the number: the increment this registration may owe later
+    // has to reach a counter that is still there, which is the reference
+    // Linux's `eventfd_ctx_fdget` takes for the same reason.
+    let counter = file.inode();
+    if counter.as_eventfd().is_none() {
+        return libc_einval(); // not a counter anything could increment
+    }
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let st = &mut *st;
+        let Some(rec) = st
+            .syncobjs
+            .iter_mut()
+            .flatten()
+            .find(|rec| rec.owner == owner && rec.handle == handle)
+        else {
+            return -2; // ENOENT
+        };
+        rec.events.push(SyncEvent {
+            counter,
+            point,
+            available: flags & SYNCOBJ_WAIT_AVAILABLE != 0,
+            fired: false,
+        });
+        // A point that is already covered, or a fence already behind it, owes
+        // its increment now rather than at the next signal.
+        fire_sync_events(rec);
+        0
+    })
+}
+
+/// Fire the registrations a request may have made due, by handle.
+fn sync_events_left(st: &mut DrmState, owner: u64, handle: u32) {
+    for rec in st.syncobjs.iter_mut().flatten() {
+        if rec.owner == owner && rec.handle == handle {
+            fire_sync_events(rec);
+        }
+    }
 }
 
 fn page_flip(arg: usize, lease: Option<&LeaseSet>) -> isize {
