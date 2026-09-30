@@ -77,7 +77,7 @@ cargo xtask [global flags] <command>
 | --- | --- | --- | --- |
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
-| 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror` / `weston`（默认取 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror`/`weston` (defaults to `[qemu] mode`, else `mirror`) |
+| 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror` / `weston`（默认取 `machine.toml` 的 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror`/`weston` (defaults to `[qemu] mode` in `machine.toml`, else `mirror`) |
 
 ### 子命令 | Commands
 
@@ -96,7 +96,7 @@ cargo xtask [global flags] <command>
 
 | 变量 | variable | 作用 | meaning |
 | --- | --- | --- | --- |
-| `MEM` | `MEM=2048` | 覆盖本次启动的内存(MB)，优先于 `[qemu] memory` | one-off memory override, wins over `[qemu] memory` |
+| `MEM` | `MEM=2048` | 覆盖本次启动的内存(MB)，优先于 `machine.toml` 的 `[qemu] memory` | one-off memory override, wins over `[qemu] memory` in `machine.toml` |
 | `ACCEL` | `ACCEL=kvm` / `tcg` | 强制 QEMU 加速器，否则自动探测 | force the accelerator, else autodetected |
 | `MPOS_TEST_TIMEOUT` | 秒 seconds | `test` 里虚拟机最长运行时间（默认 900） | per-VM timeout for `test` (default 900s) |
 | `MPOS_BUILD_DIR` | path | 默认构建目录 | default build directory |
@@ -139,18 +139,31 @@ code rather than a stale image.
 
 ---
 
-## 配置：`rootfs.toml`（仓库根目录 | repo root）
+## 配置：`rootfs.toml` 与 `machine.toml`（仓库根目录 | repo root）
 
-镜像里装什么、开机用什么，都由根目录的 `rootfs.toml` 决定，被 `disk`/`rootfs`/
-`initramfs`/`run` 读取。主要分节 | the image's contents and boot behaviour live
-here, read by `disk`/`rootfs`/`initramfs`/`run`:
+配置分成两个文件，分界不是按大小而是按**代价**：`rootfs.toml` 的 mtime 决定要不要重装
+Alpine 全树（三十多个包，走网络），`machine.toml` 里改任何东西都不会动镜像。
 
-| 分节 | section | 内容 | contents |
+The configuration is two files, and the line between them is cost rather than
+tidiness: `rootfs.toml`'s mtime is what decides whether the Alpine tree is
+reinstalled, so nothing that is not part of the image lives there.
+
+| 文件 | file | 内容 | contents |
 | --- | --- | --- | --- |
-| `[rootfs]` | | Alpine 镜像站 / 分支 / 架构、`repos`、文件系统类型、磁盘大小 `image_size`/`esp_size`、`base_packages` 与 `extra_packages` | Alpine mirror/branch/arch, filesystem, image sizes, package lists |
-| `[system]` | | 主机名、时区、语言、`dns`（覆盖 `/etc/resolv.conf`）、`root_password` | hostname, timezone, locale, DNS, root password |
-| `[user]` | | 除 root 外额外创建的账户（`name` 为空则跳过） | the non-root account (empty `name` skips it) |
-| `[qemu]` | | `memory`、`cpus`、`vsock`、`audio`、`display`、`mode`、`extra_args` | memory, cpus, vsock, audio, display backend, run mode, extra QEMU args |
+| `rootfs.toml` | | **镜像里装什么**：`[rootfs]`（镜像站/分支/架构、`repos`、文件系统、磁盘几何 `image_size`/`esp_size`、包列表）、`[system]`（主机名、时区、语言、`dns`、`root_password`）、`[user]` | **what the image contains**: Alpine source, repositories, filesystem, disk geometry, package lists, hostname/timezone/locale/dns/root password, the extra account |
+| `machine.toml` | | **拿什么启动它**：`[qemu]` 的 `memory`、`cpus`、`vsock`、`audio`、`display`、`extra_args`、`mode` | **what it is booted on**: memory, cpus, vsock, audio, window backend, extra QEMU args, the standing run mode |
+
+两个键跨在线上，都是**读过去**而不是各写一份：`[system] hostname` 也用作 QEMU DHCP
+告诉客机的名字，`[rootfs] serial_port` 同时是引导控制台与镜像里 getty 的名字——它们存
+在镜像那侧（是写进镜像的），`machine.toml` 那侧读它。
+
+Two keys cross the line and both are read *through* rather than duplicated:
+`[system] hostname` is also the name QEMU's DHCP server is told, and
+`[rootfs] serial_port` names both the boot console and the image's getty. They are
+stored with the image, which is where they are written, and the machine half reads
+them from there. `image_size`/`esp_size` stay with the image because changing
+either re-makes the partitions and their filesystems — a rebuild that file should
+ask for.
 
 > 需要写进根文件系统的具体文件（`/etc/inittab`、`/etc/network/interfaces`、
 > `/etc/resolv.conf`、`/etc/doas.conf` 等）作为真实文件放在 `rootfs/` 目录树里；
@@ -171,7 +184,7 @@ watch only the serial log — though the console now renders to the framebuffer,
 
 ## `run` 的四种运行模式 | The four `run` modes
 
-`cargo xtask run` 用 `--mode` 一次决定整机怎么启动（缺省取 `rootfs.toml` 里的
+`cargo xtask run` 用 `--mode` 一次决定整机怎么启动（缺省取 `machine.toml` 里的
 `[qemu] mode`，再缺省为 `mirror`）。窗口和串口怎么接线是启动方的事；客机只被告知
 一件事——它有哪些控制台——而这件事用的是 Linux 自己的参数 `console=`：
 
@@ -200,7 +213,7 @@ watch only the serial log — though the console now renders to the framebuffer,
 唯一的控制台"，和它当初的启动方式并不相同。
 
 `cargo xtask run` picks the whole machine with `--mode` (default from
-`rootfs.toml`'s `[qemu] mode`, else `mirror`). How the window and the serial line
+`machine.toml`'s `[qemu] mode`, else `mirror`). How the window and the serial line
 are wired is the launcher's business; the guest is told exactly one thing - which
 consoles it has - and that is said in Linux's own word, `console=`:
 

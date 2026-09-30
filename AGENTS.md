@@ -34,7 +34,8 @@ program booted in QEMU, or both.
 | `user/staging/` | Scratch sources not wired into any build. Do not assume they are dead — but do not build them either |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**. 18 libFuzzer targets over the kernel's parsers |
 | `arch/x86_64/linker.ld` | Kernel linker script, referenced from `.cargo/config.toml` |
-| `rootfs/`, `rootfs.toml` | The guest image's contents and boot configuration |
+| `rootfs/`, `rootfs.toml` | The guest image's contents: the overlay tree and the packages, hostname, disk geometry it is built from |
+| `machine.toml` | What that image is *booted* on — memory, cpus, devices, the standing run mode. Host-side only, so editing it never reinstalls the image |
 | `initramfs/`, `initramfs.toml` | The early userspace's contents and package list |
 | `build/`, `target/`, `build-test/` | Build output and scratch. Never edit, never commit |
 
@@ -418,8 +419,16 @@ are the models to copy.
   tree for the early userspace). The trees are overlays applied *after* anything written from
   the toml, so a file in the tree wins.
 - A package → `rootfs.toml` (`base_packages` / `extra_packages`) or `initramfs.toml`.
-- A partition, filesystem type, image size, hostname, DNS, or QEMU memory/display/console →
-  `rootfs.toml`. The parser is deliberately small: `key = value` plus arrays.
+- A partition, filesystem type, image size, hostname or DNS → `rootfs.toml`. The parser is
+  deliberately small: `key = value` plus arrays.
+- Anything about the *machine* the image boots on — memory, cpus, `vsock`, `audio`, the
+  window backend, the standing run mode, extra QEMU arguments → `machine.toml`, **not**
+  `rootfs.toml`. This is a cost rule and not a tidy one: `rootfs.toml`'s mtime is what decides
+  whether the Alpine tree is reinstalled (`rootfs::needs_full_install`), so a key that has
+  nothing to do with the image's contents would charge a full package install for a memory
+  size. `xtask/src/config.rs`'s `the_machine_and_the_image_keep_their_own_keys` fails if a
+  machine key drifts back, and `image_size`/`esp_size` stay in `rootfs.toml` because changing
+  either re-makes the partitions.
 - Anything about how the machine boots → `mpos.selftest` and the `console=` list, both read in
   `src/main.rs` through `src/boot/console_list.rs`, and the `--mode` that writes the list in
   `xtask/src/config.rs` / `xtask/src/rootfs.rs`. The kernel is told which consoles it has and

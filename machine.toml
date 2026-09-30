@@ -1,0 +1,84 @@
+# machine.toml - the machine `run` and `test` boot the image on.
+#
+# This is the *host* half of the build: how QEMU is wired, and how much of the
+# host's resources the guest is given. None of it is copied into the image, so
+# editing it must never invalidate one - which is the whole reason it is not in
+# `rootfs.toml`. That file's stamp is compared against the file's mtime, so
+# anything written there costs a full reinstall of the Alpine tree (thirty-odd
+# packages over the network) even when what changed was a memory size.
+#
+# The two files divide like this:
+#
+#   rootfs.toml   what the image *contains* - the packages, the files written
+#                 into it, and its own disk geometry (`image_size`, `esp_size`:
+#                 changing those re-makes the partitions and filesystems, so a
+#                 rebuild is exactly what should happen).
+#   machine.toml  what the image is *booted on* - the window, the memory, the
+#                 devices QEMU attaches, and the standing run mode.
+#
+# Two keys cross that line, and both are read through rather than duplicated:
+# `[system] hostname` in `rootfs.toml` is also the name QEMU's DHCP server is
+# told (one machine has one name, so it lives where it is written into the
+# image), and `[rootfs] serial_port` names the port the boot console and the
+# getty share. Neither is a key of this file.
+#
+# A device this file turns off is a device the guest does without; a run
+# overrides the memory for one boot with `MEM=`.
+
+[qemu]
+memory = "2048"
+# Processors. One is QEMU's default; a second one is what exercises the kernel's
+# bring-up of another processor, which is why the option is here.
+cpus = 1
+# Appended to the QEMU command line verbatim, after everything the build
+# computes. One argument per element, and an element may not contain a comma -
+# the list is comma-separated on the way in.
+extra_args = []
+# The virtio-vsock device (`-device virtio-vsock-pci,guest-cid=3`), for
+# `socket(AF_VSOCK)` to the host: the guest's cid is 3, the host answers on
+# cid 2. Off unless the host has the vhost kernel module it needs - QEMU
+# refuses to start without it, and a boot that never starts is worse than a
+# machine with no vsock. `ls /dev/vhost-vsock` is how you know.
+vsock = true
+# The virtio-sound card, with an audio backend that plays nowhere: the guest
+# exercises the driver and /dev/dsp, the host hears silence. Needs QEMU 8.2
+# or newer for the card to exist at all.
+audio = true
+# The QEMU display backend for an interactive `run` (`-display`), so the
+# framebuffer console has a window to show itself in. Absent means `sdl`; name
+# another backend your QEMU was built with, or `none` to watch only the serial
+# log - which then goes quiet once the console moves to the framebuffer. A
+# `test` boot ignores this and always runs headless.
+# display = "gtk"
+# How `cargo xtask run` boots the machine, overridable per invocation with
+# `--mode <mode>`. One word picks both the QEMU wiring and the consoles the guest
+# is told to use, because the window and the guest's own console have to agree:
+#   terminal - serial only, no window. The guest is given `console=ttyS0`, so the
+#              wire is its only console and the whole boot rides it losslessly;
+#              the display device is still probed, and `/dev/fb0` still answers,
+#              but nothing is drawn on it;
+#   gui      - the framebuffer window only: `console=tty0`, and the serial line
+#              carries nothing once the console moves over;
+#   mirror   - `console=ttyS0 console=tty0`: the window takes the console over
+#              once the framebuffer is up, and the wire keeps a best-effort copy
+#              of the same text. The copy is non-blocking, so under a flood the
+#              serial transcript may drop bytes while the window never stalls;
+#   weston   - `console=ttyS0`, and the window belongs to the compositor for as
+#              long as its own virtual console is the one on the screen: the
+#              kernel console never moves onto the framebuffer and a typed line
+#              never paints over weston, while the boot log rides the serial
+#              line. Nothing starts the compositor - `./start-weston.sh` in
+#              root's home does, once the login prompt appears. Switch away with
+#              `^A 1`..`^A 6`: the session is asked to release the display, its
+#              page flips start coming back EACCES, and the window shows the
+#              console you switched to. The wire keeps carrying the kernel log
+#              and the shells either way, so this is the one mode where the
+#              window and the terminal are deliberately different views.
+# Unset means mirror, which is what `run` did before the modes were split. A
+# `cargo xtask test` boot ignores this: its command line is its own, and it names
+# the wire alone.
+#
+# This one key is also baked into the image (`mpos.cmdline`), so changing it is
+# the one edit here that touches a build - and `run` notices the difference and
+# refreshes the *boot files* alone rather than reinstalling the root filesystem.
+mode = "weston"

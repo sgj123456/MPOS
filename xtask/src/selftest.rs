@@ -369,7 +369,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // the bind would fail before the guest boots.
     let share = build_dir.join("test-9p-share");
     fs::create_dir_all(&share)?;
-    let mut config = crate::config::QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
+    let mut config = crate::config::QemuConfig::load_default()?;
     // A test boot never needs the host vsock bus, and claiming `guest-cid=3`
     // collides with any VM already running on this host (a concurrent
     // `cargo xtask run`, say) - which would abort QEMU before the guest boots

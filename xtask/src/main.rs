@@ -32,12 +32,12 @@ struct Cli {
     #[arg(long)]
     profile: Option<String>,
 
-    /// How to boot the machine (default: `[qemu] mode`, or mirror):
-    /// `terminal` (serial only, no window), `gui` (window only, the console on
-    /// the framebuffer), `mirror` (both at once), or `weston` (the window is the
-    /// compositor's, and the console stays off the framebuffer). Global so
-    /// `cargo xtask run --mode weston` accepts it after the subcommand, where a
-    /// plain parent flag would be rejected.
+    /// How to boot the machine (default: `[qemu] mode` in `machine.toml`, or
+    /// mirror): `terminal` (serial only, no window), `gui` (window only, the
+    /// console on the framebuffer), `mirror` (both at once), or `weston` (the
+    /// window is the compositor's, and the console stays off the framebuffer).
+    /// Global so `cargo xtask run --mode weston` accepts it after the
+    /// subcommand, where a plain parent flag would be rejected.
     #[arg(long, value_name = "MODE", global = true)]
     mode: Option<String>,
 
@@ -117,6 +117,16 @@ fn main() -> Result<()> {
         Some(text) => Some(config::RunMode::parse(text).ok_or_else(|| {
             anyhow::anyhow!("unknown mode {text:?}; expected terminal, gui, mirror or weston")
         })?),
+        // With no `--mode`, `run` boots the mode `machine.toml` names rather
+        // than whatever the image happens to have been baked with. Reading it
+        // here is what makes editing that key cheap: `needs_mode_switch` below
+        // then sees the difference and refreshes the image's *boot files*, the
+        // same path `--mode` takes - where before, the key lived in
+        // `rootfs.toml` and changing it marked the whole image stale and
+        // reinstalled the Alpine tree for one line of `mpos.cmdline`.
+        None if matches!(cli.command, Commands::Run) => {
+            Some(config::QemuConfig::load_default()?.mode)
+        }
         None => None,
     };
     if matches!(cli.command, Commands::Run)

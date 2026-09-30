@@ -376,8 +376,10 @@ for `cargo xtask test`, which boots a directory QEMU synthesizes as virtual FAT.
 
 ### What goes in the image
 
-`rootfs.toml` decides the packages, the filesystem, the sizes, the hostname, DNS, the user
-account and the QEMU wiring; `initramfs.toml` does the same for the early userspace. Concrete
+`rootfs.toml` decides the packages, the filesystem, the sizes, the hostname, DNS and the user
+account; `machine.toml` decides what the image is booted on (memory, cpus, devices, the window,
+the standing run mode), which is a separate file so that tuning the machine cannot invalidate
+the image; `initramfs.toml` does the same for the early userspace. Concrete
 files live as real files under `rootfs/` and `initramfs/`, overlaid *after* anything written
 from the toml — so a file in the tree wins, which is how `/etc/inittab`, `/etc/network/interfaces`
 and `/init` are edited.
@@ -573,7 +575,8 @@ mpos/
 ├── fuzz/                    # libFuzzer targets (its own workspace)
 ├── arch/x86_64/linker.ld    # the kernel linker script
 ├── rootfs/                  # files overlaid into the Alpine root filesystem
-├── rootfs.toml              # what the image contains and how it boots
+├── rootfs.toml              # what the guest image contains
+├── machine.toml             # what that image is booted on (host resources, run mode)
 ├── initramfs/               # files overlaid into the early userspace (init lives here)
 ├── initramfs.toml           # what the early userspace contains
 ├── .cargo/config.toml       # targets, rustflags and the `cargo xtask` alias

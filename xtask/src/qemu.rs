@@ -376,8 +376,10 @@ pub fn run_qemu(
     fs::create_dir_all(&share)?;
 
     // The machine's own settings: memory, processors, the name the guest
-    // reports, and whatever `extra_args` adds.
-    let config = QemuConfig::load(&utils::project_root()?.join("rootfs.toml"))?;
+    // reports, and whatever `extra_args` adds. They come from `machine.toml`
+    // rather than the image's config, so tuning the machine never reinstalls
+    // the image.
+    let config = QemuConfig::load_default()?;
     // The host wiring follows the mode the caller asked for, so the window, the
     // serial line and the guest's own console policy always agree.
     let args = machine_args(

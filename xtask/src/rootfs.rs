@@ -17,15 +17,18 @@ use crate::utils;
 
 /// The mode to bake into the image: an explicit `MPOS_XTASK_MODE`
 /// (what `cargo xtask run --mode X` hands the privileged build) wins over
-/// `[qemu] mode` in `rootfs.toml`, which itself defaults to mirror.
+/// `[qemu] mode` in `machine.toml`, which itself defaults to mirror.
+///
+/// Reading it from the machine's own file is what makes a mode change cheap:
+/// the key is not in `rootfs.toml`, so it cannot mark the image stale, and the
+/// only thing a new mode costs is the boot-file refresh below.
 fn effective_mode() -> Result<RunMode> {
     if let Some(text) = std::env::var("MPOS_XTASK_MODE").ok()
         && let Some(mode) = RunMode::parse(&text)
     {
         return Ok(mode);
     }
-    let root = utils::project_root()?;
-    let qemu = QemuConfig::load(&root.join("rootfs.toml"))?;
+    let qemu = QemuConfig::load_default()?;
     Ok(qemu.mode)
 }
 

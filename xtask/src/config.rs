@@ -135,8 +135,9 @@ pub struct QemuConfig {
     pub memory: String,
     pub cpus: u32,
     /// The name the guest reports to QEMU's DHCP server. It is the same
-    /// `hostname` the rootfs config writes into the image: one machine has one
-    /// name, and the file has one key for it.
+    /// `hostname` the rootfs config writes into the image - read from there
+    /// rather than named again here, because the one place it is *stored* is
+    /// where the image is told it (`[system] hostname`).
     pub hostname: String,
     /// Passed through to `qemu-system-x86_64` verbatim, after everything this
     /// crate computes. The escape hatch for the one option a run needs and
@@ -232,17 +233,39 @@ impl InitramfsConfig {
 }
 
 impl QemuConfig {
-    /// The machine `run` and `test` boot on, read out of `rootfs.toml`.
+    /// The machine `run` and `test` boot on: `[qemu]` in `machine.toml`, plus
+    /// the image's own hostname.
+    ///
+    /// The machine half lives in its own file because `rootfs.toml`'s mtime is
+    /// what decides whether the Alpine tree is reinstalled
+    /// (`rootfs::needs_full_install`), and a memory size has no business
+    /// triggering one. What is read from `rootfs.toml` is one key - `[system]
+    /// hostname`, which is also the name QEMU's DHCP server is told - and it is
+    /// read rather than repeated because the guest's name is written into the
+    /// image, so that is where it lives. One fact, one home, two readers.
     ///
     /// A missing file is the defaults rather than an error: `test` builds no
-    /// image, and a kernel test run must not need the file that describes one.
-    pub fn load(path: &Path) -> Result<Self> {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return Ok(Self::from_values(&mut HashMap::new(), default_hostname()));
+    /// image, and a kernel test run must not need the files that describe one.
+    /// A missing `machine.toml` therefore gets the default machine, and a
+    /// missing `rootfs.toml` the default name.
+    pub fn load(machine_path: &Path, rootfs_path: &Path) -> Result<Self> {
+        let mut values = match std::fs::read_to_string(machine_path) {
+            Ok(content) => parse_simple_toml(&content)?,
+            Err(_) => HashMap::new(),
         };
-        let mut values = parse_simple_toml(&content)?;
-        let hostname = values.remove("hostname").unwrap_or_else(default_hostname);
+        let hostname = std::fs::read_to_string(rootfs_path)
+            .ok()
+            .and_then(|content| parse_simple_toml(&content).ok())
+            .and_then(|mut image| image.remove("hostname"))
+            .unwrap_or_else(default_hostname);
         Ok(Self::from_values(&mut values, hostname))
+    }
+
+    /// Both files resolved from the repository root, which is what every caller
+    /// wants: `machine.toml` for the machine, `rootfs.toml` for the name.
+    pub fn load_default() -> Result<Self> {
+        let root = crate::utils::project_root()?;
+        Self::load(&root.join("machine.toml"), &root.join("rootfs.toml"))
     }
 
     fn from_values(values: &mut HashMap<String, String>, hostname: String) -> Self {
@@ -505,6 +528,77 @@ mod tests {
                 mode.name()
             );
         }
+    }
+
+    #[test]
+    fn the_machine_and_the_image_keep_their_own_keys() {
+        // The repository's own two files, read through the parser the build
+        // uses. This is the pin for the split's whole purpose: a machine key
+        // that drifts back into `rootfs.toml` starts charging a full package
+        // install for a memory size, and nothing else in the tree would notice.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the repository root");
+        let machine = std::fs::read_to_string(root.join("machine.toml"))
+            .expect("machine.toml is the machine half of the configuration");
+        let image = std::fs::read_to_string(root.join("rootfs.toml")).expect("rootfs.toml");
+        let machine_keys = parse_simple_toml(&machine).unwrap();
+        let image_keys = parse_simple_toml(&image).unwrap();
+
+        // The machine half is all there...
+        for key in ["memory", "cpus", "extra_args", "vsock", "audio", "mode"] {
+            assert!(machine_keys.contains_key(key), "machine.toml lost {key}");
+        }
+        // ...and none of it is in the file whose mtime decides whether Alpine
+        // is reinstalled.
+        for key in [
+            "memory",
+            "cpus",
+            "extra_args",
+            "vsock",
+            "audio",
+            "display",
+            "mode",
+        ] {
+            assert!(
+                !image_keys.contains_key(key),
+                "rootfs.toml names {key}: editing it would reinstall the image"
+            );
+        }
+        // The two facts the machine half reads *through* stay where the image
+        // is told them: its own name, and the serial port the console and the
+        // getty share.
+        assert!(
+            image_keys.contains_key("hostname"),
+            "the name lives with the image"
+        );
+        assert!(image_keys.contains_key("serial_port"));
+        // And the disk geometry stays there on purpose - changing it re-makes
+        // the partitions, which is a rebuild this file should ask for.
+        assert!(image_keys.contains_key("image_size") && image_keys.contains_key("esp_size"));
+    }
+
+    #[test]
+    fn the_machine_config_reads_its_name_from_the_image() {
+        // Two files, one fact between them: `hostname` is stored where it is
+        // written into the image and read here, so the guest's own name and the
+        // name QEMU's DHCP server is told cannot drift apart.
+        let dir = std::env::temp_dir().join(format!("mpos-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let machine = dir.join("machine.toml");
+        let image = dir.join("rootfs.toml");
+        std::fs::write(&machine, "[qemu]\nmemory = \"512\"\ncpus = 2\n").unwrap();
+        std::fs::write(&image, "[system]\nhostname = \"probe\"\n").unwrap();
+
+        let config = QemuConfig::load(&machine, &image).unwrap();
+        assert_eq!(config.memory, "512");
+        assert_eq!(config.cpus, 2);
+        assert_eq!(config.hostname, "probe");
+        // A missing machine file is the default machine, not an error: `test`
+        // booting must not need either file to exist.
+        let absent = QemuConfig::load(&dir.join("nowhere.toml"), &dir.join("nowhere.toml"));
+        assert_eq!(absent.unwrap().hostname, "mpos");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

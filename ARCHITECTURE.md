@@ -54,7 +54,7 @@ flowchart TB
     XTASK -->|"cargo build"| UA
     XTASK -->|"packs"| TAR["initramfs.tar"]
     XTASK -->|"assembles"| IMG["build/mpos-uefi-x86_64.img"]
-    XTASK -->|"reads"| CFG["rootfs.toml<br/>initramfs.toml<br/>rootfs/ · initramfs/"]
+    XTASK -->|"reads"| CFG["rootfs.toml · machine.toml<br/>initramfs.toml<br/>rootfs/ · initramfs/"]
     FUZZ -->|"host build of the lib"| K
     BOOT -->|"loads mpos.elf + initramfs.tar<br/>+ mpos.cmdline"| IMG
     K -->|"ELF loader, PT_INTERP-free<br/>static ET_EXEC"| U
