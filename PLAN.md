@@ -476,7 +476,10 @@ it - so the entries say which they are:
 - [x] the `MODE_CREATE_LEASE` family — a lease is a card descriptor restricted
       to a list of object ids, mintable only by the master, unable to widen
       itself, revocable by its lessor, and readable back through `GET_LEASE`
-      (`t-drm-lease`)
+      (`t-drm-lease`). **The four request numbers were wrong and are now
+      `drm.h`'s**: they were written down as `0xd3`..`0xd6`, thirteen too high,
+      so every real caller reached the dispatch catch-all and heard `ENOTTY` -
+      see §7.4 (`t-drm-lease` now pins them against the header's literals)
 - [x] the legacy KMS queries a compositor falls back to — `MODE_GETFB2`, which
       reads a framebuffer back with its fourcc, its modifier and its plane
       arrays (`t-drm`), and the two pairs this card *refuses by name* rather
@@ -2559,6 +2562,28 @@ approximation of it:
   `SEAL_ALL` are recorded and reported and *not* enforced - the honest
   half-measure, since sealing there refuses property changes this synthesized
   card does not have.
+
+**Those four requests were numbered wrongly, and it is the one bug in this file
+that no test in the repository could have caught.** They were written as
+`0xd3`..`0xd6`; `<drm.h>` puts the family at `0xc6`..`0xc9`, and both copies of
+the header on the development host - `/usr/include/drm/drm.h` and libdrm's -
+agree. Thirteen too high means the request misses every arm of the dispatch
+`match` and lands in the `_ => -25` catch-all, so a lease cost a real caller an
+`ENOTTY`: libdrm's `drmModeCreateLease` sends `0xc6`, and it never reached
+`create_lease` at all. The doc comment beside the constants said the numbers came
+from `<drm_mode.h>`, which is where they do not live - ioctl numbers are
+`<drm.h>`'s - and that is most of how it happened.
+
+`t-drm-lease` was green throughout for a reason worth stating: it built its four
+requests from *the same constants the driver matched on*, so the test and the
+driver agreed about a number no userspace ever sends. A test whose expectation is
+drawn from the value it is checking agrees with any value at all, which makes it
+no test. The fix is therefore two-sided. The constants are `drm.h`'s, and the
+test now compares each request word against a **literal from the header** -
+`ioc_d(0xc6, 24)` and its three siblings - written out in the check rather than
+read from the constant beside it, so the four disagree the moment either side
+drifts. The other sixty-odd `NR_*` constants in the file were checked the same
+way against the same header and all agree; this was the only family that did not.
 
 And a flip-completion event is now queued *after* `request_flush_blocking()`
 returns, so its timestamp is the frame's landing rather than the commit, and the

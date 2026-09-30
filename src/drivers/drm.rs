@@ -199,15 +199,30 @@ const NR_GETFB2: u32 = 0xce;
 /// with the hotspot at the end, which is why both are served by one handler.
 const NR_MODE_CURSOR: u32 = 0xa3;
 const NR_MODE_CURSOR2: u32 = 0xbb;
-/// The lease family, `<drm_mode.h>`'s numbers: `MODE_CREATE_LEASE` 0xd3,
-/// `MODE_LIST_LESSES` 0xd4, `MODE_REVOKE_LEASE` 0xd5, `MODE_GET_LEASE` 0xd6.
+/// The lease family, `<drm.h>`'s numbers: `MODE_CREATE_LEASE` 0xc6,
+/// `MODE_LIST_LESSEES` 0xc7, `MODE_GET_LEASE` 0xc8, `MODE_REVOKE_LEASE` 0xc9.
 /// A lease is not a second driver: it is a card descriptor whose set of legal
 /// object ids is a subset, and the only new object in the whole family is the
 /// file descriptor `CREATE_LEASE` hands back.
-const NR_MODE_CREATE_LEASE: u32 = 0xd3;
-const NR_MODE_LIST_LESSES: u32 = 0xd4;
-const NR_MODE_REVOKE_LEASE: u32 = 0xd5;
-const NR_MODE_GET_LEASE: u32 = 0xd6;
+///
+/// The four were written down as 0xd3..0xd6 first, and that is not a family the
+/// UAPI has: `drm.h` puts it at 0xc6..0xc9, which is what every real caller
+/// sends - libdrm's `drmModeCreateLease` and its three siblings. A request
+/// numbered thirteen too high misses every arm of the dispatch `match` and is
+/// answered `ENOTTY` by the catch-all, so the whole family was unreachable from
+/// userspace while `t-drm-lease` stayed green: that test built its requests from
+/// these same four constants, and an expectation taken from the thing it checks
+/// agrees with any value at all. It now pins them against `<drm.h>`'s literals
+/// instead, which is the check that would have caught this.
+///
+/// The mistake is worth naming because it is the general shape: a number a
+/// caller and a driver must *agree* on cannot be pinned by a test that only ever
+/// exercises the two against each other. Something outside the pair has to hold
+/// the value, and here that is the header.
+const NR_MODE_CREATE_LEASE: u32 = 0xc6;
+const NR_MODE_LIST_LESSES: u32 = 0xc7;
+const NR_MODE_REVOKE_LEASE: u32 = 0xc9;
+const NR_MODE_GET_LEASE: u32 = 0xc8;
 /// `DRM_MODE_LEASE_IMMUTABLE`: the lessor promises not to revoke. Recorded and
 /// reported, *not* enforced below - see [`LeaseSet`].
 const LEASE_IMMUTABLE: u32 = 1;

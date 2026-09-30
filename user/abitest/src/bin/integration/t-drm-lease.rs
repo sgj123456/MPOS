@@ -36,10 +36,10 @@ const NR_GETRESOURCES: usize = 0xa0;
 const NR_CREATE_DUMB: usize = 0xb2;
 const NR_ADDFB: usize = 0xae;
 const NR_PAGE_FLIP: usize = 0xb0;
-const NR_MODE_CREATE_LEASE: usize = 0xd3;
-const NR_MODE_LIST_LESSES: usize = 0xd4;
-const NR_MODE_REVOKE_LEASE: usize = 0xd5;
-const NR_MODE_GET_LEASE: usize = 0xd6;
+const NR_MODE_CREATE_LEASE: usize = 0xc6;
+const NR_MODE_LIST_LESSES: usize = 0xc7;
+const NR_MODE_REVOKE_LEASE: usize = 0xc9;
+const NR_MODE_GET_LEASE: usize = 0xc8;
 const NR_SET_MASTER: usize = 0x1e;
 const NR_DROP_MASTER: usize = 0x1f;
 
@@ -91,6 +91,43 @@ const fn io_k(nr: usize) -> usize {
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-drm-lease\n");
     let mut failed = false;
+
+    // The four request numbers, against `<drm.h>`'s own, written out here as
+    // literals rather than read from the constant beside them.
+    //
+    // This is the whole reason the family was dead on arrival. The driver
+    // carried 0xd3..0xd6, every real caller sends 0xc6..0xc9, and nothing here
+    // could tell: the test built its requests from the same four constants the
+    // driver matched them with, so the two agreed about a number that no
+    // userspace ever sends - `drmModeCreateLease` got `ENOTTY` from the
+    // dispatch catch-all, while this program passed. A pin whose expectation
+    // comes from the value it is checking agrees with any value at all, so the
+    // expectation is the header's literal and the exercise below is an
+    // exercise rather than the contract.
+    lin::check_eq(
+        &mut failed,
+        b"MODE_CREATE_LEASE is drm.h's 0xc6",
+        ioc_d(NR_MODE_CREATE_LEASE, 24) as isize,
+        ioc_d(0xc6, 24) as isize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"MODE_LIST_LESSEES is drm.h's 0xc7",
+        ioc_d(NR_MODE_LIST_LESSES, 16) as isize,
+        ioc_d(0xc7, 16) as isize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"MODE_GET_LEASE is drm.h's 0xc8",
+        ioc_d(NR_MODE_GET_LEASE, 24) as isize,
+        ioc_d(0xc8, 24) as isize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"MODE_REVOKE_LEASE is drm.h's 0xc9",
+        ioc_d(NR_MODE_REVOKE_LEASE, 8) as isize,
+        ioc_d(0xc9, 8) as isize,
+    );
 
     let card = lin::openat(lin::AT_FDCWD, b"/dev/dri/card0\0", O_RDWR, 0) as i32;
     lin::check_true(&mut failed, b"/dev/dri/card0 opens", card >= 0);
