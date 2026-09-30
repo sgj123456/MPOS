@@ -557,7 +557,13 @@ it - so the entries say which they are:
       not, and is the last item left here
 - [~] 10.5 ext4/virtio-blk read path — the set-associative cache landed with its
       device-read counts in §10.5; readahead and blk pipelining are each other's
-      prerequisite and neither is measurable until the test machine has a disk
+      prerequisite. **§7.3 moved this one step on**: the test machine now has a
+      writable disk of its own (`/dev/sda` on an AHCI controller, 4 MiB, beside
+      the read-only FAT ESP the boot comes from), so the block layer can be
+      measured in the guest rather than only against a mock. What is still
+      missing is a *filesystem* on it - a partition table and an ext4 - because
+      what §10.5 wants to count is ext4's reads, and a bare device has no
+      readahead to measure
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
@@ -2291,7 +2297,30 @@ What genuinely remains is narrower, and each item is named rather than implied:
 
 ---
 
-## Phase 7: Device Drivers (Low Priority)
+## Phase 7: Device Drivers — **7.1, 7.2 and 7.3 are done; §7.4 has two steps left**
+
+The device work is finished: display, input, and now storage. §7.4 is a different
+kind of thing - it is *analysis* of the compositors beyond weston, written from
+their sources and the UAPI rather than measured here, and two of its six ordered
+steps remain (§7.4's own list). One item under 7.1 is also still open and is
+written down there rather than here: weston's desktop-shell does not paint its
+pointer, and the measurements say so far that it is not this kernel's doing.
+
+Two things this phase measured are worth carrying forward, because both were
+*surprises that booting found rather than reading*: the cursor plane's composition
+is the one piece of arithmetic on the presentation path and lives in
+`src/drm_cursor.rs` with host tests, and the sync object family's semantics
+disagree with the upstream sources in the one place that decides its design, which
+is why they were measured on a real card before any of it was written (§7.4). The
+third, from §7.3, is the same shape one layer down: a driver whose every line is a
+register access has no host test to fail, so its two wrong decisions - `PxSIG` is
+not the presence question, and an unpartitioned disk still has a name - were found
+only by booting it.
+
+**Gate for the phase, quoted from its own summary**: host `618 passed`,
+`mpos-xtask 36 passed`, guest `=== SUMMARY pass=132 fail=0 (132 built)`, QEMU exit
+33, `cargo fmt --check` clean and `cargo clippy` clean on the bare-metal target and
+on `mpos-xtask`.
 
 ### 7.1 Display: virtio-gpu (framebuffer + DRM/KMS) — **ANSWERED** (2D / software)
 
