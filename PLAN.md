@@ -451,12 +451,28 @@ it - so the entries say which they are:
 - [ ] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
       the only one that lets niri, which rejects software EGL outright, run at
       all; virgl and venus are both built on it (§7.4)
-- [ ] the property families a compositor finds by name: `EDID`, `non-desktop`,
-      `max bpc`, `panel orientation`, `vrr_capable`/`VRR_ENABLED`,
-      `GAMMA_LUT`/`GAMMA_LUT_SIZE`, `IN_FORMATS` with
-      `DRM_CAP_ADDFB2_MODIFIERS`, `FB_DAMAGE_CLIPS`, `OUT_FENCE_PTR`, and
-      `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` — refused today, and asked for
-      precisely by the virtualized drivers (§7.4)
+- [~] the property families a compositor finds by name. **Four are built, and
+      the list said seven**: `EDID` (a real 128-byte EDID 1.4 base block, and
+      the connector's `mm_width`/`mm_height` are its own centimetre fields times
+      ten), `non-desktop` and `vrr_capable` (both immutable *ranges* of 0 and 1,
+      measured - not the bools the sources suggest), `max bpc` (a range of
+      exactly one value: the scanout is 8 bpc and nothing can raise it), and
+      `IN_FORMATS` on the plane with `DRM_CAP_ADDFB2_MODIFIERS` answered 1 -
+      which `ADDFB2` then honours, taking `DRM_MODE_FB_MODIFIERS` with the
+      linear modifier and refusing any other. Three are deliberately **absent**,
+      each for the reason `modetest -c -p` against a real card gives: there is
+      no gamma LUT to hold `GAMMA_LUT`/`GAMMA_LUT_SIZE` and no VRR engine behind
+      `VRR_ENABLED`, so a property whose write changes nothing would be the §4.2
+      lie; and `FB_DAMAGE_CLIPS` and `OUT_FENCE_PTR` are absent on a real card
+      too, because they are driver opt-ins. `panel orientation` and
+      `subconnector` are absent for the same measured reason - the real eDP
+      output carries neither. Pinned by `t-drm-props` (53 checks) (§7.4)
+- [x] the two blobs those properties point at, as pure encoders in
+      `src/drm_blob.rs` with 15 host tests - `drivers/drm.rs` is kernel-only, so
+      the bytes a real reader parses had to live somewhere a host can check
+      them. Verified against `edid-decode` rather than only against the module's
+      own decoder, which caught a real bug (a descriptor's first two bytes)
+      (§7.4)
 - [x] the `MODE_CREATE_LEASE` family — a lease is a card descriptor restricted
       to a list of object ids, mintable only by the master, unable to widen
       itself, revocable by its lessor, and readable back through `GET_LEASE`
@@ -3144,6 +3160,42 @@ the reminder the whole section is written around: a property family a
 *compositor* looks up by name is one the driver may legitimately not have, so
 the honest answer for this card is absence plus the `drm_info`-visible reason -
 not a blob property invented to make the list look complete.
+
+**What was then built, and what was left absent on purpose.** The card now
+publishes four of them, in `src/drivers/drm.rs`, each one true:
+
+| property | object | shape here | why |
+|---|---|---|---|
+| `EDID` | connector | immutable blob | a real 128-byte EDID 1.4 base block from `crate::drm_blob`, rebuilt when the host resizes the window - the detailed timing *is* the advertised mode |
+| `non-desktop` | connector | immutable range 0..1, value 0 | this is a panel, not a headset |
+| `max bpc` | connector | range 8..8, value 8 | the scanout is eight bits per channel; a range of one value means a write of 16 is `EINVAL` rather than a success that changes no pixels |
+| `vrr_capable` | connector | immutable range 0..1, value 0 | the refresh rate cannot vary, and saying so is what stops a compositor asking |
+| `IN_FORMATS` | plane | immutable blob | one linear modifier over all four formats `GETPLANE` reports and `ADDFB2` accepts - one array feeds all three, so they cannot drift |
+
+The connector's `mm_width`/`mm_height` now come from the EDID's own centimetre
+fields times ten (the relation the measurement found: 30 cm and 19 cm reported
+as 300x190), and `subpixel` is written as the 0 a real connected connector
+reports.
+
+`DRM_CAP_ADDFB2_MODIFIERS` is answered 1 *and* made true: `ADDFB2` takes
+`DRM_MODE_FB_MODIFIERS` with `DRM_FORMAT_MOD_LINEAR` and refuses any other
+modifier with `EINVAL` - which is the `IN_FORMATS` list saying the same thing in
+the other direction, and the reason the two are pinned together. A cap answered
+1 over an `ADDFB2` that refused every modifier is a caller building a buffer it
+cannot bind. `DRM_CAP_ASYNC_PAGE_FLIP` is answered 0 and *named* in the match
+rather than left to the catch-all: tearing flips are not missing here, they are
+a presentation mode this card does not have.
+
+`GAMMA_LUT`/`GAMMA_LUT_SIZE`, `VRR_ENABLED`, `panel orientation`,
+`subconnector`, `FB_DAMAGE_CLIPS` and `OUT_FENCE_PTR` are **absent**, and each
+absence is the measurement's rather than an omission: a real card carries
+gamma and VRR properties because its driver can honour them, carries
+`subconnector` and `panel orientation` only on connectors that have one (the
+measured eDP output has neither), and carries neither of the last two at all.
+A property whose write changes nothing is the silent success `AGENTS.md` §4
+forbids. The one thing that *is* missing without a hardware reason is
+`DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`, and it belongs with the cursor plane in
+the `MODE_CURSOR` work rather than here.
 
 Syscalls and memory, the parts this section cannot fix from inside the display
 driver: `/proc/<pid>/maps` **landed** (§Remaining has the file and the two

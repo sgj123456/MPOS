@@ -54,6 +54,10 @@ name = "t-drm-lease"
 path = "src/bin/integration/t-drm-lease.rs"
 
 [[bin]]
+name = "t-drm-props"
+path = "src/bin/integration/t-drm-props.rs"
+
+[[bin]]
 name = "t-epoll-socket"
 path = "src/bin/integration/t-epoll-socket.rs"
 

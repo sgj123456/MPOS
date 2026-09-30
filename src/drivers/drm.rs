@@ -87,6 +87,56 @@ const PROP_BLEND: u32 = 85;
 /// fence, and a card without the property fails the whole commit rather than
 /// the one entry.
 const PROP_IN_FENCE_FD: u32 = 86;
+/// The properties §7.4 lists as "what a compositor finds by name", of which
+/// this card has the four its hardware can back and no more.
+///
+/// The set is a *measurement* before it is a list. `modetest -c -p` against the
+/// real card on the development host reports which of these families a driver
+/// creates, and the answer is not "all of them": `subconnector` is on the
+/// connectors that have one, `panel orientation` and `FB_DAMAGE_CLIPS` and
+/// `OUT_FENCE_PTR` are absent, and `GAMMA_LUT`/`VRR_ENABLED` are there because
+/// amdgpu has a gamma LUT and a VRR engine to honour them with. This card has
+/// neither, and a property whose write changes nothing is the §4.2 lie - so the
+/// four below are what is left, each of them true:
+///
+///   * `EDID` - the bytes of a display this kernel synthesizes.
+///   * `non-desktop` - an *immutable range* with the values 0 and 1, not the
+///     bool the sources suggest; measured on a real connector.
+///   * `max bpc` - a range, and here a range of exactly one value, because the
+///     scanout is eight bits per channel and no property can raise it.
+///   * `vrr_capable` - an immutable range reporting 0: this display cannot
+///     vary its refresh rate, and saying so is what stops a compositor asking.
+const PROP_EDID: u32 = 87;
+const PROP_NON_DESKTOP: u32 = 88;
+const PROP_MAX_BPC: u32 = 89;
+const PROP_VRR_CAPABLE: u32 = 90;
+const PROP_IN_FORMATS: u32 = 94;
+/// The connector's property list, in one place: `GETCONNECTOR` and
+/// `OBJ_GETPROPERTIES` both report it, and a client that read it from one and
+/// not the other would see two different connectors.
+const CONNECTOR_PROPS: [u32; 6] = [
+    PROP_CRTC_ID,
+    PROP_DPMS,
+    PROP_EDID,
+    PROP_NON_DESKTOP,
+    PROP_MAX_BPC,
+    PROP_VRR_CAPABLE,
+];
+/// What `max bpc` reports: the scanout is BGRA32 and nothing here can change
+/// it, so the range has one value and a caller asking for 10 or 12 or 16 is
+/// told `EINVAL` rather than being handed a number that changes nothing.
+const BPC_HERE: u64 = 8;
+/// The formats the one plane scans out, in the order `GETPLANE` reports them -
+/// which is the order the `IN_FORMATS` bitmask indexes, so the plane's list and
+/// the blob are built from this one array and cannot drift apart. `ADDFB2`
+/// accepts exactly these four, which is the third place the same set has to
+/// agree.
+const PLANE_FORMATS: [u32; 4] = [
+    DRM_FORMAT_XRGB8888,
+    DRM_FORMAT_ARGB8888,
+    DRM_FORMAT_XBGR8888,
+    DRM_FORMAT_ABGR8888,
+];
 /// `DRM_MODE_CONNECTOR_VIRTUAL` / `DRM_MODE_ENCODER_VIRTUAL`.
 const CONNECTOR_TYPE: u32 = 15;
 const ENCODER_TYPE: u32 = 5;
@@ -215,6 +265,17 @@ const CURSOR_SIZE: u64 = 64;
 /// atomic modesetting", and the compositor exits without ever sending a
 /// commit.
 const CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
+/// `DRM_CAP_ADDFB2_MODIFIERS`: whether `ADDFB2` honours `DRM_MODE_FB_MODIFIERS`.
+/// Answered 1, and `add_fb2` below is where that is made true - it takes the
+/// flag with the linear modifier and refuses any other.
+const CAP_ADDFB2_MODIFIERS: u64 = 0x10;
+/// `DRM_CAP_ASYNC_PAGE_FLIP`: whether a flip can be requested that tears.
+///
+/// 0, and named rather than left to the catch-all, because the difference
+/// matters to a reader: this is not a capability that is missing yet, it is one
+/// this card does not have. There is no engine presenting outside the frame
+/// boundary, so the `PAGE_FLIP_ASYNC` flag it gates has nothing to mean.
+const CAP_ASYNC_PAGE_FLIP: u64 = 0x07;
 /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES`: the client wants the plane objects the
 /// card has, which is how a compositor finds a primary plane to scan out on.
 const CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
@@ -448,6 +509,22 @@ struct DrmState {
     /// Property blobs, by id (1-based, as every id space here is). A mode
     /// arrives as one, and so does a damage-rectangle list.
     blobs: Vec<Option<Vec<u8>>>,
+    /// The two blobs the *driver* publishes: the connector's `EDID` bytes and
+    /// the plane's `IN_FORMATS`.
+    ///
+    /// They are fields rather than entries in `blobs` because their ids are
+    /// handed to clients that must not be able to take them away: destroying a
+    /// blob id that a property still holds is a no-op on Linux (the property
+    /// owns a reference), and two id spaces is how that is true here without a
+    /// refcount. A driver blob's id is [`DRIVER_BLOB_EDID`] or
+    /// [`DRIVER_BLOB_IN_FORMATS`], both far above anything the client table
+    /// hands out.
+    edid_bytes: Option<Vec<u8>>,
+    /// The size the EDID was built for, so a host resize rebuilds it: its
+    /// detailed timing *is* the mode being advertised, and the two move
+    /// together.
+    edid_dims: (u32, u32),
+    in_formats_bytes: Option<Vec<u8>>,
     /// The PRIME identity table (see [`PrimeRecord`]).
     prime: Vec<PrimeRecord>,
     /// Sequence number for flip/vblank events, echoed back to the reader.
@@ -493,6 +570,9 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     plane_dst: (0, 0, 0, 0),
     plane_src: (0, 0, 0, 0),
     blobs: Vec::new(),
+    edid_bytes: None,
+    edid_dims: (0, 0),
+    in_formats_bytes: None,
     prime: Vec::new(),
     seq: 0,
     events: VecDeque::new(),
@@ -1419,6 +1499,18 @@ fn get_cap(arg: usize) -> isize {
         CAP_TIMESTAMP_MONOTONIC => 1,
         CAP_CRTC_IN_VBLANK_EVENT => 1,
         CAP_CURSOR_WIDTH | CAP_CURSOR_HEIGHT => CURSOR_SIZE,
+        // True, and only because `ADDFB2` honours the flag this advertises: a
+        // commit may carry `DRM_MODE_FB_MODIFIERS` with the linear modifier,
+        // which is the only one a dumb buffer is ever in. A cap answered 1 over
+        // an `ADDFB2` that refused every modifier would be the caller building
+        // a buffer it cannot then bind.
+        CAP_ADDFB2_MODIFIERS => 1,
+        // Named rather than left to the catch-all: this is *not* "unsupported
+        // for now". A tearing flip is a mode of presentation this card does not
+        // have - there is no engine to present outside the frame boundary - so
+        // a compositor looking for it is told no, and one that ignores the cap
+        // and asks anyway is refused the `PAGE_FLIP_ASYNC` flag it would need.
+        CAP_ASYNC_PAGE_FLIP => 0,
         _ => 0,
     };
     unsafe { ((arg + 8) as *mut u64).write_unaligned(value) };
@@ -1851,13 +1943,32 @@ fn get_connector(arg: usize) -> isize {
         return libc_einval();
     }
     let (w, h) = advertised_mode_dims();
-    // The connector's two properties and their current values - what
+    // The connector's properties and their current values - what
     // `OBJ_GETPROPERTIES` also answers, on the path libdrm fills in through
-    // `drmModeGetConnector`.
+    // `drmModeGetConnector`. The EDID's *bytes* are built here too, so that a
+    // client which reads the property and then fetches the blob finds it; the
+    // immutable ones report the one value they have.
     let (crtc_value, dpms_value) = critical_section::with(|cs| {
-        let st = STATE.borrow(cs).borrow();
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let _ = edid_blob_bytes(&mut st);
         (st.conn_crtc as u64, st.dpms as u64)
     });
+    const CONNECTOR_PROPS: [u32; 6] = [
+        PROP_CRTC_ID,
+        PROP_DPMS,
+        PROP_EDID,
+        PROP_NON_DESKTOP,
+        PROP_MAX_BPC,
+        PROP_VRR_CAPABLE,
+    ];
+    let connector_values: [u64; 6] = [
+        crtc_value,
+        dpms_value,
+        DRIVER_BLOB_EDID as u64,
+        0, // non-desktop: this is a real display, not a head-mounted one
+        BPC_HERE,
+        0, // vrr_capable: the refresh rate cannot vary
+    ];
     unsafe {
         let p = arg as *mut u8;
         // Fill a single mode into modes_ptr if the caller asked for it.
@@ -1869,17 +1980,24 @@ fn get_connector(arg: usize) -> isize {
         (p.add(32) as *mut u32).write_unaligned(1); // count_modes
         // The property ids and values, when the caller has room for them.
         let count_props = (p.add(36) as *const u32).read_unaligned();
-        (p.add(36) as *mut u32).write_unaligned(2); // count_props
+        (p.add(36) as *mut u32).write_unaligned(CONNECTOR_PROPS.len() as u32);
         let props_ptr = ((p.add(16) as *const u64).read_unaligned()) as *mut u32;
-        if count_props >= 2 && !props_ptr.is_null() && user_array(props_ptr as usize, 2, 4, true) {
-            props_ptr.write_unaligned(PROP_CRTC_ID);
-            props_ptr.add(1).write_unaligned(PROP_DPMS);
+        if count_props >= CONNECTOR_PROPS.len() as u32
+            && !props_ptr.is_null()
+            && user_array(props_ptr as usize, CONNECTOR_PROPS.len(), 4, true)
+        {
+            for (index, prop) in CONNECTOR_PROPS.iter().enumerate() {
+                props_ptr.add(index).write_unaligned(*prop);
+            }
         }
         let values_ptr = ((p.add(24) as *const u64).read_unaligned()) as *mut u64;
-        if count_props >= 2 && !values_ptr.is_null() && user_array(values_ptr as usize, 2, 8, true)
+        if count_props >= CONNECTOR_PROPS.len() as u32
+            && !values_ptr.is_null()
+            && user_array(values_ptr as usize, CONNECTOR_PROPS.len(), 8, true)
         {
-            values_ptr.write_unaligned(crtc_value);
-            values_ptr.add(1).write_unaligned(dpms_value);
+            for (index, value) in connector_values.iter().enumerate() {
+                values_ptr.add(index).write_unaligned(*value);
+            }
         }
         (p.add(40) as *mut u32).write_unaligned(1); // count_encoders
         let enc_ptr = ((p as *const u64).read_unaligned()) as *mut u32;
@@ -1891,8 +2009,17 @@ fn get_connector(arg: usize) -> isize {
         (p.add(52) as *mut u32).write_unaligned(CONNECTOR_TYPE);
         (p.add(56) as *mut u32).write_unaligned(1); // connector_type_id
         (p.add(60) as *mut u32).write_unaligned(CONNECTED); // connection
-        (p.add(64) as *mut u32).write_unaligned(0); // mm_width
-        (p.add(68) as *mut u32).write_unaligned(0);
+        // The physical size, taken from the EDID's own centimetre fields and
+        // reported as the millimetres a connector reports them in - ten times
+        // the field, which is the relation the measurement found (30 cm and
+        // 19 cm on a real panel gave exactly 300x190 here).
+        let (mm_w, mm_h) = crate::drm_blob::size_mm(w, h);
+        (p.add(64) as *mut u32).write_unaligned(mm_w);
+        (p.add(68) as *mut u32).write_unaligned(mm_h);
+        // Sub-pixel order: 0, the unknown value. Measured on a real connected
+        // eDP connector, which also reported 0 - so this is the honest default
+        // rather than an invented arrangement of a virtual display's pixels.
+        (p.add(72) as *mut u32).write_unaligned(crate::drm_blob::SUBPIXEL_UNKNOWN);
     }
     0
 }
@@ -1912,13 +2039,21 @@ fn get_plane(arg: usize) -> isize {
         p.add(2).write_unaligned(fb_id); // fb_id
         p.add(3).write_unaligned(1); // possible_crtcs: bit 0
         p.add(4).write_unaligned(0); // gamma_size
-        // The format list, when the caller has room for it.
+        // The format list, when the caller has room for it. All four the plane
+        // scans out and `ADDFB2` accepts, in the order the `IN_FORMATS` bitmask
+        // indexes - one array so that the plane's list, the blob's bitmask and
+        // the accept-list cannot disagree.
         let want = p.add(5).read_unaligned();
         let formats = ((arg + 24) as *const u64).read_unaligned() as *mut u32;
-        if want >= 1 && !formats.is_null() && user_array(formats as usize, 1, 4, true) {
-            formats.write_unaligned(DRM_FORMAT_XRGB8888);
+        if want >= PLANE_FORMATS.len() as u32
+            && !formats.is_null()
+            && user_array(formats as usize, PLANE_FORMATS.len(), 4, true)
+        {
+            for (index, format) in PLANE_FORMATS.iter().enumerate() {
+                formats.add(index).write_unaligned(*format);
+            }
         }
-        p.add(5).write_unaligned(1); // count_format_types
+        p.add(5).write_unaligned(PLANE_FORMATS.len() as u32); // count_format_types
     }
     0
 }
@@ -1991,6 +2126,25 @@ fn get_property(arg: usize) -> isize {
             &[-1i64 as u64, i32::MAX as u64],
             &[],
         ),
+        // The connector's `EDID`: a blob, and `IMMUTABLE` because a client that
+        // could write it would be claiming to be the monitor. Its *value* is
+        // the blob id the card publishes, which is what `OBJ_GETPROPERTIES`
+        // reports; this is the shape.
+        PROP_EDID => ("EDID", PROP_BLOB | PROP_IMMUTABLE, &[], &[]),
+        // Measured on a real connector, and not what the sources suggest: this
+        // is a *range* with the two values 0 and 1, not a bool.
+        PROP_NON_DESKTOP => ("non-desktop", PROP_RANGE | PROP_IMMUTABLE, &[0, 1], &[]),
+        // The scanout is eight bits per channel and no property can change
+        // that, so the range has one value - a caller asking for 16 is refused
+        // rather than handed a number that would change nothing.
+        PROP_MAX_BPC => ("max bpc", PROP_RANGE, &[BPC_HERE, BPC_HERE], &[]),
+        // Also a range, also measured: every DP output on the real card carries
+        // this, at 0 where the sink cannot vary its rate - which is this
+        // display, so it reports 0 and a compositor stops asking.
+        PROP_VRR_CAPABLE => ("vrr_capable", PROP_RANGE | PROP_IMMUTABLE, &[0, 1], &[]),
+        // The plane's format-and-modifier list, as the blob `drm_blob::in_formats`
+        // builds: one linear modifier over every format the plane reports.
+        PROP_IN_FORMATS => ("IN_FORMATS", PROP_BLOB | PROP_IMMUTABLE, &[], &[]),
         _ => return libc_einval(),
     };
     unsafe {
@@ -2045,6 +2199,15 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
         (CONNECTOR_ID, PROP_DPMS) => st.dpms = value as u32,
         (CRTC_ID, PROP_ACTIVE) => st.crtc_active = value != 0,
         (CRTC_ID, PROP_MODE_ID) => st.crtc_mode_id = value as u32,
+        // The one connector property that is settable and has a range. A value
+        // the range does not hold is refused rather than accepted, which is
+        // what makes the one-value range mean something: `max bpc` 16 here is
+        // `EINVAL`, not a success that changes no pixels.
+        (CONNECTOR_ID, PROP_MAX_BPC) => {
+            if value != BPC_HERE {
+                return libc_einval();
+            }
+        }
         // The plane's buffer is the one write this function does not make:
         // its caller has already put the pixels on the scanout (a commit
         // applies it, a lone property write shows it), and what records the
@@ -2457,6 +2620,46 @@ fn create_blob(arg: usize) -> isize {
     0
 }
 
+/// The ids the card's own blobs answer to.
+///
+/// A client's blob ids are small and allocated lowest-first; these are far
+/// above anything that table will reach, so `get_propblob` can tell the two
+/// apart and `DESTROY_BLOB` cannot free what a property is holding.
+const DRIVER_BLOB_EDID: u32 = 0x4000_0001;
+const DRIVER_BLOB_IN_FORMATS: u32 = 0x4000_0002;
+
+/// What the synthesized display calls itself. A compositor shows this in its
+/// settings panel and in `wl_output`, which is the whole reason an EDID carries
+/// a name descriptor.
+const MONITOR_NAME: &str = "MPOS Virtual";
+
+/// The connector's `EDID`, built on first use and rebuilt whenever the host has
+/// resized the window - the blob's detailed timing is the mode being advertised,
+/// so a stale one would describe a display this card no longer is.
+fn edid_blob_bytes(st: &mut DrmState) -> &[u8] {
+    let dims = advertised_mode_dims();
+    if st.edid_bytes.is_none() || st.edid_dims != dims {
+        st.edid_dims = dims;
+        st.edid_bytes =
+            Some(crate::drm_blob::edid_base_block(dims.0, dims.1, MONITOR_NAME).to_vec());
+    }
+    st.edid_bytes.as_deref().unwrap_or(&[])
+}
+
+/// The plane's `IN_FORMATS`: one modifier entry covering every format in
+/// [`PLANE_FORMATS`], because a dumb buffer here is always linear. Built once -
+/// neither the format list nor the modifier set depends on anything that can
+/// change.
+fn in_formats_blob_bytes(st: &mut DrmState) -> &[u8] {
+    if st.in_formats_bytes.is_none() {
+        st.in_formats_bytes = Some(crate::drm_blob::in_formats(
+            &PLANE_FORMATS,
+            crate::drm_blob::FORMAT_MOD_LINEAR,
+        ));
+    }
+    st.in_formats_bytes.as_deref().unwrap_or(&[])
+}
+
 /// `GETPROPBLOB`: the bytes a blob holds, in the two-call shape every KMS
 /// list uses - the length is always written, the data only when the caller
 /// has room for it.
@@ -2466,11 +2669,18 @@ fn get_propblob(arg: usize) -> isize {
     let want = unsafe { ((arg + 4) as *const u32).read_unaligned() };
     let data = unsafe { ((arg + 8) as *const u64).read_unaligned() } as *mut u8;
     let Some(bytes) = critical_section::with(|cs| {
-        let st = STATE.borrow(cs).borrow();
-        st.blobs
-            .get(id.wrapping_sub(1) as usize)
-            .and_then(|b| b.as_ref())
-            .cloned()
+        let mut st = STATE.borrow(cs).borrow_mut();
+        match id {
+            // The card's own blobs, built on demand: a client that asks for the
+            // EDID before anything has asked for the property still gets it.
+            DRIVER_BLOB_EDID => Some(edid_blob_bytes(&mut st).to_vec()),
+            DRIVER_BLOB_IN_FORMATS => Some(in_formats_blob_bytes(&mut st).to_vec()),
+            _ => st
+                .blobs
+                .get(id.wrapping_sub(1) as usize)
+                .and_then(|b| b.as_ref())
+                .cloned(),
+        }
     }) else {
         return libc_einval();
     };
@@ -2488,9 +2698,18 @@ fn get_propblob(arg: usize) -> isize {
 
 /// `DESTROY_BLOB`: drop a blob's bytes. A blob id that names nothing is the
 /// `EINVAL` Linux answers.
+///
+/// A *driver's* blob id is the one exception, and it succeeds while dropping
+/// nothing: the property still holds the blob, which is exactly what happens on
+/// Linux when a client destroys a blob id it read off a property - the id goes
+/// and the blob stays. Freeing the EDID here would leave the connector's
+/// property naming nothing.
 fn destroy_blob(arg: usize) -> isize {
     // struct drm_mode_destroy_blob { u32 blob_id@0; }
     let id = unsafe { (arg as *const u32).read_unaligned() };
+    if id == DRIVER_BLOB_EDID || id == DRIVER_BLOB_IN_FORMATS {
+        return 0;
+    }
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         match st.blobs.get_mut(id.wrapping_sub(1) as usize) {
@@ -2521,10 +2740,10 @@ fn obj_get_properties(arg: usize) -> isize {
                 [
                     PROP_CRTC_ID,
                     PROP_DPMS,
-                    0,
-                    0,
-                    0,
-                    0,
+                    PROP_EDID,
+                    PROP_NON_DESKTOP,
+                    PROP_MAX_BPC,
+                    PROP_VRR_CAPABLE,
                     0,
                     0,
                     0,
@@ -2539,10 +2758,12 @@ fn obj_get_properties(arg: usize) -> isize {
                 [
                     st.conn_crtc as u64,
                     st.dpms as u64,
-                    0,
-                    0,
-                    0,
-                    0,
+                    // The blob *id*, which is what a client hands to
+                    // `GETPROPBLOB`; the bytes are not this reply's business.
+                    DRIVER_BLOB_EDID as u64,
+                    0, // non-desktop
+                    BPC_HERE,
+                    0, // vrr_capable
                     0,
                     0,
                     0,
@@ -2554,7 +2775,7 @@ fn obj_get_properties(arg: usize) -> isize {
                     0,
                     0,
                 ],
-                2usize,
+                CONNECTOR_PROPS.len(),
             )),
             (OBJECT_CRTC, CRTC_ID) => Some((
                 [
@@ -2616,7 +2837,7 @@ fn obj_get_properties(arg: usize) -> isize {
                         PROP_CRTC_H,
                         PROP_BLEND,
                         PROP_IN_FENCE_FD,
-                        0,
+                        PROP_IN_FORMATS,
                         0,
                         0,
                     ],
@@ -2634,11 +2855,12 @@ fn obj_get_properties(arg: usize) -> isize {
                         dh as u64,
                         BLEND_PREMULT,
                         -1i64 as u64,
-                        0,
+                        // The plane's format-and-modifier list, as a blob id.
+                        DRIVER_BLOB_IN_FORMATS as u64,
                         0,
                         0,
                     ],
-                    13usize,
+                    14usize,
                 ))
             }
             _ => None,
@@ -2744,10 +2966,30 @@ fn add_fb2(arg: usize) -> isize {
     let handle = unsafe { ((arg + 20) as *const u32).read_unaligned() };
     let pitch = unsafe { ((arg + 36) as *const u32).read_unaligned() };
     let offset = unsafe { ((arg + 52) as *const u32).read_unaligned() };
+    let flags = unsafe { ((arg + 16) as *const u32).read_unaligned() };
     let modifier = unsafe { ((arg + 68) as *const u64).read_unaligned() };
-    if offset != 0 || modifier != 0 {
+    // A plane offset other than the start of the buffer is still refused: the
+    // scanout copies the buffer from its beginning and has nowhere to start
+    // part-way in.
+    if offset != 0 {
         return libc_einval();
     }
+    // The modifier, which `DRM_CAP_ADDFB2_MODIFIERS` promises this card takes:
+    // the flag has to be set to carry one, and the only one it can take is
+    // `LINEAR` - a dumb buffer's layout. Anything else, including a modifier
+    // named without the flag, is the `EINVAL` Linux answers for a format and
+    // modifier pair this plane cannot scan out; the pair *is* listed in
+    // `IN_FORMATS`, which is the same truth in the other direction.
+    const FB_MODIFIERS: u32 = 1 << 1;
+    let modifier = if flags & FB_MODIFIERS != 0 {
+        if modifier != crate::drm_blob::FORMAT_MOD_LINEAR {
+            return libc_einval();
+        }
+        modifier
+    } else {
+        0
+    };
+    let _ = modifier;
     let (bpp, depth) = match format {
         DRM_FORMAT_XRGB8888 | DRM_FORMAT_XBGR8888 => (32, 24),
         DRM_FORMAT_ARGB8888 | DRM_FORMAT_ABGR8888 => (32, 32),

@@ -135,10 +135,10 @@ leak into the image `cargo xtask run` boots.
 
 **Nothing is red. The state below is the measured run, quoted from its own summary line.**
 
-- Host unit tests: `582 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
+- Host unit tests: `596 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
   plus `36 passed` from `mpos-xtask`. Measured on this tree.
-- The guest suite reached `=== SUMMARY pass=129 fail=0` (129 built) with QEMU exit code 33, with
-  `9 of 138 user tests left out by tests.toml` — the `external`, `slow` and `diagnostic` groups,
+- The guest suite reached `=== SUMMARY pass=130 fail=0` (130 built) with QEMU exit code 33, with
+  `9 of 139 user tests left out by tests.toml` — the `external`, `slow` and `diagnostic` groups,
   which is what makes the sweep's verdict a statement about the kernel. `--groups diagnostic`
   was run on its own to prove the flag reaches the guest (`128 staged`, `t-sh` in the count).
   `/proc/<pid>/maps` (plan §7.4 and §Remaining) is green end to end: `t-maps` printed
@@ -148,6 +148,12 @@ leak into the image `cargo xtask run` boots.
   as `rw-p` with no name and no object, a shared one as `rw-s` named `/memfd: (deleted)`, a
   `memfd` mapping named `/memfd:t-maps-buf (deleted)` with its name starting in Linux's column
   73, and `[stack]`/`[heap]` covering the frame and the break.
+  The DRM property families (§7.4) are green too: `t-drm-props` printed `=== PASS` over 53
+  checks — the connector's `EDID` reading back as a checksum-clean 128-byte EDID 1.4 whose
+  centimetre fields are the `mm_width`/`mm_height` the connector reported, `non-desktop` and
+  `vrr_capable` as the immutable *ranges* a real card reports rather than bools, `max bpc` as a
+  range of one value with a write of 16 refused, the plane's `IN_FORMATS` blob with its format
+  array and modifier bitmask, and `ADDFB2` honouring the modifier flag the cap advertises.
   The UTS namespace (plan §6.3, step 1) is green end to end: `t-ns-uts` prints `=== PASS`,
   holding both halves of the property that makes a namespace one — a child that unshares reports
   `inside` through `uname` *and* through both `/proc/sys/kernel` files while the parent that did

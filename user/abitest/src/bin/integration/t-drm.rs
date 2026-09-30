@@ -310,11 +310,14 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_eq(&mut failed, b"OBJ_GETPROPERTIES succeeds", r, 0);
     let count = u32::from_ne_bytes([props[16], props[17], props[18], props[19]]);
-    lin::check_eq(
+    // The *set* is the card's business and its own test's: `t-drm-props` pins
+    // the six a real connector carries and the shape of each. What this file
+    // needs is that the two it reads are there at all, and that the list can be
+    // walked - so it asks for the two by index and no more.
+    lin::check_true(
         &mut failed,
-        b"the connector carries properties",
-        count as isize,
-        2,
+        b"the connector carries at least the two properties this file reads",
+        count >= 2,
     );
     let mut prop_ids = [0u32; 2];
     let mut prop_values = [0u64; 2];
