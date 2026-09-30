@@ -54,6 +54,11 @@ const NR_MAP_DUMB: usize = 0xb3;
 /// the version handshake, the auth pair, and the handle release.
 const NR_GETFB: usize = 0xad;
 const NR_GETFB2: usize = 0xce;
+const NR_GETPLANE: usize = 0xb6;
+const NR_MODE_CURSOR: usize = 0xa3;
+const NR_MODE_CURSOR2: usize = 0xbb;
+/// The card's second plane: the one that carries the pointer.
+const CURSOR_PLANE_ID: u32 = 37;
 const NR_ADDFB2: usize = 0xb8;
 const NR_OBJ_GETPROPERTIES: usize = 0xb9;
 const NR_VERSION: usize = 0x00;
@@ -133,11 +138,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"GETPLANERESOURCES succeeds", r, 0);
     lin::check_eq(
         &mut failed,
-        b"one plane, counted at offset 8",
+        b"two planes, counted at offset 8",
         u32_at(&pres, 8) as isize,
-        1,
+        2,
     );
-    let mut plane_ids = [0u32; 1];
+    let mut plane_ids = [0u32; 2];
     pres[0..8].copy_from_slice(&(plane_ids.as_mut_ptr() as usize as u64).to_ne_bytes());
     let r = lin::ioctl(
         fd,
@@ -147,7 +152,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"the plane list fills", r, 0);
     lin::check_eq(
         &mut failed,
-        b"the plane is the one this card has",
+        b"the first is the primary plane",
         plane_ids[0] as isize,
         36,
     );
@@ -405,6 +410,167 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"GETFB2 of an unknown framebuffer is EINVAL",
         lin::ioctl(fd, ioc_d(NR_GETFB2, 104), g4.as_mut_ptr() as usize),
         -22,
+    );
+
+    // --- the cursor plane ----------------------------------------------------
+    // The plane list is two now, and the second one has to be *described* as the
+    // cursor: a compositor finds its cursor plane by asking about each id here and
+    // reading the `type` property back. Before this, `GETPLANE` ignored the id it
+    // was given and answered with the primary plane for every question, which is
+    // why the test asks about both ids and about one that is not there.
+    let mut pl_res = [0u8; 16];
+    let mut plane_ids = [0u32; 4];
+    pl_res[0..8].copy_from_slice(&(plane_ids.as_mut_ptr() as usize as u64).to_ne_bytes());
+    pl_res[8..12].copy_from_slice(&4u32.to_ne_bytes()); // count_planes: room for four
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_GETPLANERESOURCES, 16),
+        pl_res.as_mut_ptr() as usize,
+    );
+    lin::check_eq(&mut failed, b"the plane list is read", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"two planes, where there used to be one",
+        u32_at(&pl_res, 8) as isize,
+        2,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and the second is the cursor plane",
+        plane_ids[1] as isize,
+        CURSOR_PLANE_ID as isize,
+    );
+
+    // The cursor plane's own format list: `ARGB8888` alone, which is the layout a
+    // cursor buffer is in and the format this card used to refuse.
+    let mut cp = [0u8; 32];
+    let mut cp_formats = [0u32; 4];
+    cp[0..4].copy_from_slice(&CURSOR_PLANE_ID.to_ne_bytes());
+    cp[24..32].copy_from_slice(&(cp_formats.as_mut_ptr() as usize as u64).to_ne_bytes());
+    cp[20..24].copy_from_slice(&4u32.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_GETPLANE, 32), cp.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"the cursor plane is described", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"it reports the id it was asked about",
+        u32_at(&cp, 0) as isize,
+        CURSOR_PLANE_ID as isize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"one format, not the primary plane's two",
+        u32_at(&cp, 20) as isize,
+        1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and it is ARGB8888, the layout a cursor carries its alpha in",
+        cp_formats[0] as isize,
+        0x3432_5241,
+    );
+
+    // A plane id the card does not have: refused, rather than answered with
+    // whichever plane happened to be looked at first.
+    let mut bogus_plane = [0u8; 32];
+    bogus_plane[0..4].copy_from_slice(&9999u32.to_ne_bytes());
+    lin::check_eq(
+        &mut failed,
+        b"GETPLANE of a plane that is not there is ENOENT",
+        lin::ioctl(
+            fd,
+            ioc_d(NR_GETPLANE, 32),
+            bogus_plane.as_mut_ptr() as usize,
+        ),
+        -2,
+    );
+
+    // The cursor requests themselves. `flags` has to name one of the two things -
+    // bind or move - and a request that says neither is EINVAL.
+    let mut cur = [0u8; 36];
+    cur[4..8].copy_from_slice(&34u32.to_ne_bytes()); // crtc_id
+    lin::check_eq(
+        &mut failed,
+        b"MODE_CURSOR with no flags at all is EINVAL",
+        lin::ioctl(fd, ioc_d(NR_MODE_CURSOR, 28), cur.as_mut_ptr() as usize),
+        -22,
+    );
+    // A bit outside the pair, which is a request this card cannot be asked.
+    cur[0..4].copy_from_slice(&0x8u32.to_ne_bytes()); // flags: neither BO nor MOVE
+    lin::check_eq(
+        &mut failed,
+        b"and a flag outside the pair is EINVAL too",
+        lin::ioctl(fd, ioc_d(NR_MODE_CURSOR, 28), cur.as_mut_ptr() as usize),
+        -22,
+    );
+    // An image that is not a framebuffer: the `handle` is an fb id here, and the
+    // UAPI calls that field "driver specific", so this card's choice *is* the ABI
+    // - which is exactly why it needs pinning.
+    cur[0..4].copy_from_slice(&0x1u32.to_ne_bytes()); // flags: BO
+    cur[16..20].copy_from_slice(&64u32.to_ne_bytes()); // width
+    cur[20..24].copy_from_slice(&64u32.to_ne_bytes()); // height
+    cur[24..28].copy_from_slice(&0xffffu32.to_ne_bytes()); // handle: no such fb
+    lin::check_eq(
+        &mut failed,
+        b"MODE_CURSOR binding a framebuffer that does not exist is EINVAL",
+        lin::ioctl(fd, ioc_d(NR_MODE_CURSOR, 28), cur.as_mut_ptr() as usize),
+        -22,
+    );
+
+    // A real cursor image: ARGB8888 over the same dumb buffer, which is what a
+    // compositor makes. It binds, and `GETPLANE` reports it bound.
+    let mut cfb = [0u8; 104];
+    cfb[4..8].copy_from_slice(&64u32.to_ne_bytes()); // width
+    cfb[8..12].copy_from_slice(&64u32.to_ne_bytes()); // height
+    cfb[12..16].copy_from_slice(&0x3432_5241u32.to_ne_bytes()); // DRM_FORMAT_ARGB8888
+    cfb[20..24].copy_from_slice(&handle.to_ne_bytes()); // handles[0]
+    cfb[36..40].copy_from_slice(&256u32.to_ne_bytes()); // pitches[0]
+    let r = lin::ioctl(fd, ioc_d(NR_ADDFB2, 104), cfb.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"an ARGB8888 framebuffer binds", r, 0);
+    let cursor_fb = u32_at(&cfb, 0);
+    cur[24..28].copy_from_slice(&cursor_fb.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_MODE_CURSOR, 28), cur.as_mut_ptr() as usize);
+    lin::check_eq(
+        &mut failed,
+        b"and MODE_CURSOR binds it to the cursor plane",
+        r,
+        0,
+    );
+    let mut cp2 = [0u8; 32];
+    cp2[0..4].copy_from_slice(&CURSOR_PLANE_ID.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_GETPLANE, 32), cp2.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"the cursor plane reads back", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"with that framebuffer bound to it",
+        u32_at(&cp2, 8) as isize,
+        cursor_fb as isize,
+    );
+
+    // `MODE_CURSOR2` moves it, hotspot and all. Where it landed is read back by
+    // `t-drm-props`, which has the property-name lookup this file does not.
+    cur[0..4].copy_from_slice(&0x2u32.to_ne_bytes()); // flags: MOVE
+    cur[8..12].copy_from_slice(&10i32.to_ne_bytes()); // x
+    cur[12..16].copy_from_slice(&20i32.to_ne_bytes()); // y
+    cur[28..32].copy_from_slice(&1i32.to_ne_bytes()); // hot_x
+    cur[32..36].copy_from_slice(&1i32.to_ne_bytes()); // hot_y
+    let r = lin::ioctl(fd, ioc_d(NR_MODE_CURSOR2, 36), cur.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"MODE_CURSOR2 moves the pointer", r, 0);
+
+    // And a zero-sized image turns it off, which is how libdrm spells it.
+    cur[0..4].copy_from_slice(&0x1u32.to_ne_bytes()); // flags: BO
+    cur[16..20].copy_from_slice(&0u32.to_ne_bytes()); // width
+    cur[20..24].copy_from_slice(&0u32.to_ne_bytes()); // height
+    let r = lin::ioctl(fd, ioc_d(NR_MODE_CURSOR, 28), cur.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"a zero-sized cursor turns it off", r, 0);
+    let mut cp3 = [0u8; 32];
+    cp3[0..4].copy_from_slice(&CURSOR_PLANE_ID.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_GETPLANE, 32), cp3.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"the cursor plane reads back again", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"with nothing bound, so the pointer is gone",
+        u32_at(&cp3, 8) as isize,
+        0,
     );
 
     // OBJ_GETPROPERTIES on the connector: the two-call list shape, and the

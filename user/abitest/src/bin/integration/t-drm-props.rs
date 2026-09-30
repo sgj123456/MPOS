@@ -37,6 +37,7 @@ const NR_GETPROPERTY: usize = 0xaa;
 const NR_GETPROPBLOB: usize = 0xac;
 const NR_DESTROY_BLOB: usize = 0xbe;
 const NR_GETPLANE: usize = 0xb6;
+const NR_MODE_CURSOR2: usize = 0xbb;
 const NR_ADDFB2: usize = 0xb8;
 const NR_OBJ_GETPROPERTIES: usize = 0xb9;
 const NR_OBJ_SETPROPERTY: usize = 0xba;
@@ -45,6 +46,8 @@ const NR_CREATE_DUMB: usize = 0xb2;
 /// The connector and plane this card has, and the object-type tags.
 const CONNECTOR_ID: u32 = 35;
 const PLANE_ID: u32 = 36;
+/// The cursor plane, the card's second one.
+const CURSOR_PLANE_ID: u32 = 37;
 const OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const OBJECT_PLANE: u32 = 0xeeee_eeee;
 
@@ -426,6 +429,65 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             );
         }
         None => lin::check_true(&mut failed, b"the connector has max bpc", false),
+    }
+
+    // --- the cursor plane's type, and where the pointer is -----------------------------
+    // `type` is how a compositor tells a cursor plane from an overlay, and the
+    // difference is the whole reason the plane exists: with `type` = Cursor it
+    // drives the pointer through the kernel, and without it, it draws the pointer
+    // into its own framebuffer. Read by name rather than by id, because the id is
+    // this card's numbering and the name is the ABI.
+    match property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, b"type") {
+        Some((id, value)) => {
+            let prop = property(fd, id).expect("the cursor plane's type property");
+            lin::check_true(
+                &mut failed,
+                b"the second plane carries an enumerated type",
+                prop.flags & PROP_ENUM != 0,
+            );
+            lin::check_eq(
+                &mut failed,
+                b"and its type is Cursor, which is how a compositor finds it",
+                value as isize,
+                2,
+            );
+        }
+        None => lin::check_true(
+            &mut failed,
+            b"the cursor plane carries a type property",
+            false,
+        ),
+    }
+
+    // A move with no image bound still moves the pointer, and where it landed is
+    // readable - `CRTC_X`/`CRTC_Y` are the plane's steering state rather than a
+    // copy of it, which is the one place this plane differs in kind from the
+    // primary plane's recorded rectangles.
+    let mut cur = [0u8; 36];
+    put32(&mut cur, 0, 0x2); // flags: DRM_MODE_CURSOR_MOVE
+    put32(&mut cur, 4, 34); // crtc_id
+    put32(&mut cur, 8, 77); // x
+    put32(&mut cur, 12, 88); // y
+    put32(&mut cur, 28, 1); // hot_x
+    put32(&mut cur, 32, 1); // hot_y
+    lin::check_eq(
+        &mut failed,
+        b"MODE_CURSOR2 moves the pointer",
+        lin::ioctl(fd, ioc_d(NR_MODE_CURSOR2, 36), cur.as_mut_ptr() as usize),
+        0,
+    );
+    match property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, b"CRTC_X") {
+        Some((_, value)) => lin::check_eq(
+            &mut failed,
+            b"and the plane reports where it landed",
+            value as isize,
+            77,
+        ),
+        None => lin::check_true(
+            &mut failed,
+            b"CRTC_X is one of the plane's properties",
+            false,
+        ),
     }
 
     // --- the plane's formats and its IN_FORMATS blob -----------------------------------

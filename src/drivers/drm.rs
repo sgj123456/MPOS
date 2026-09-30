@@ -43,6 +43,16 @@ const CRTC_ID: u32 = 34;
 const ENCODER_ID: u32 = 33;
 const CONNECTOR_ID: u32 = 35;
 const PLANE_ID: u32 = 36;
+/// The cursor plane, the card's second plane.
+///
+/// It is a *plane* rather than only the legacy `MODE_CURSOR` door because that is
+/// what a compositor looks for: weston picks its cursor plane out of the plane
+/// list by the `type` property and drives it atomically, and only falls back to
+/// drawing the pointer into its own framebuffer when there is none. A card with
+/// cursor *hardware* and no cursor plane is a real configuration - the UAPI
+/// documents it - but it is not this one, and the difference matters because a
+/// compositor that cannot find the plane will not ask for it.
+const CURSOR_PLANE_ID: u32 = 37;
 /// DRM's major number - `DRM_MAJOR` in the kernel's own headers, and the number
 /// every `/sys/class/drm/cardN/dev` prints and every uevent about a card
 /// carries. Fixed since XFree86 4.x.
@@ -132,6 +142,16 @@ const BPC_HERE: u64 = 8;
 /// accepts exactly these two, which is the third place the same set has to
 /// agree.
 const PLANE_FORMATS: [u32; 2] = [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
+/// The cursor plane's formats, which is a shorter list for a measured reason:
+/// `modetest -p` on the real amdgpu card reports `formats: AR24` for every one
+/// of its cursor planes. A cursor is alpha-blended, so the format that carries
+/// alpha is the one it is in; the opaque spelling is what a primary plane has.
+const CURSOR_FORMATS: [u32; 1] = [DRM_FORMAT_ARGB8888];
+/// `DRM_MODE_CURSOR_BO` and `DRM_MODE_CURSOR_MOVE`: the two things a cursor
+/// request can ask for, and `DRM_MODE_CURSOR_FLAGS` the mask of both.
+const CURSOR_BO: u32 = 0x01;
+const CURSOR_MOVE: u32 = 0x02;
+const CURSOR_FLAGS: u32 = 0x03;
 /// `DRM_MODE_CONNECTOR_VIRTUAL` / `DRM_MODE_ENCODER_VIRTUAL`.
 const CONNECTOR_TYPE: u32 = 15;
 const ENCODER_TYPE: u32 = 5;
@@ -175,6 +195,10 @@ const NR_MODE_SETGAMMA: u32 = 0xa5;
 const NR_CRTC_GET_SEQUENCE: u32 = 0x3b;
 const NR_CRTC_QUEUE_SEQUENCE: u32 = 0x3c;
 const NR_GETFB2: u32 = 0xce;
+/// The two spellings of the cursor request. `MODE_CURSOR2` is the same struct
+/// with the hotspot at the end, which is why both are served by one handler.
+const NR_MODE_CURSOR: u32 = 0xa3;
+const NR_MODE_CURSOR2: u32 = 0xbb;
 /// The lease family, `<drm_mode.h>`'s numbers: `MODE_CREATE_LEASE` 0xd3,
 /// `MODE_LIST_LESSES` 0xd4, `MODE_REVOKE_LEASE` 0xd5, `MODE_GET_LEASE` 0xd6.
 /// A lease is not a second driver: it is a card descriptor whose set of legal
@@ -338,6 +362,9 @@ const PROP_OBJECT: u32 = 1 << 6;
 const PROP_SIGNED_RANGE: u32 = 1 << 7;
 /// `DRM_PLANE_TYPE_PRIMARY`: the one plane is the CRTC's primary surface.
 const PLANE_TYPE_PRIMARY: u64 = 1;
+/// `DRM_PLANE_TYPE_CURSOR`, the `type` value that makes the second plane the
+/// cursor rather than an overlay.
+const PLANE_TYPE_CURSOR: u64 = 2;
 /// `DRM_MODE_PROP_BLEND`'s two enum values, as the kernel spells them:
 /// pre-multiplied alpha, and straight "coverage" alpha.
 const BLEND_PREMULT: u64 = 0;
@@ -548,6 +575,18 @@ struct DrmState {
     plane_crtc: u32,
     plane_dst: (u32, u32, u32, u32),
     plane_src: (u32, u32, u32, u32),
+    /// The cursor plane: the framebuffer bound to it, the CRTC it serves, where
+    /// its hotspot sits on the scanout, and how far into the image that hotspot
+    /// is (what `MODE_CURSOR2`'s `hot_x`/`hot_y` carry, and 0,0 for the older
+    /// struct, whose arrow-tip convention it defaults to).
+    ///
+    /// These are *not* the primary plane's kind of bookkeeping - they are what
+    /// the composition reads on every flush, which is how a pointer moves
+    /// without the compositor redrawing anything.
+    cursor_fb: u32,
+    cursor_crtc: u32,
+    cursor_pos: (i32, i32),
+    cursor_hotspot: (i32, i32),
     /// Property blobs, by id (1-based, as every id space here is). A mode
     /// arrives as one, and so does a damage-rectangle list.
     blobs: Vec<Option<Vec<u8>>>,
@@ -567,6 +606,11 @@ struct DrmState {
     /// together.
     edid_dims: (u32, u32),
     in_formats_bytes: Option<Vec<u8>>,
+    /// The cursor plane's own `IN_FORMATS`, from [`CURSOR_FORMATS`] and this
+    /// card's one linear modifier. Separate from the primary plane's for the
+    /// reason a real card keeps them separate: a format list is a fact about a
+    /// *plane*, and the two planes do not scan the same set.
+    cursor_in_formats_bytes: Option<Vec<u8>>,
     /// The PRIME identity table (see [`PrimeRecord`]).
     prime: Vec<PrimeRecord>,
     /// Sequence number for flip/vblank events, echoed back to the reader.
@@ -611,10 +655,15 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     plane_crtc: CRTC_ID,
     plane_dst: (0, 0, 0, 0),
     plane_src: (0, 0, 0, 0),
+    cursor_fb: 0,
+    cursor_crtc: CRTC_ID,
+    cursor_pos: (0, 0),
+    cursor_hotspot: (0, 0),
     blobs: Vec::new(),
     edid_bytes: None,
     edid_dims: (0, 0),
     in_formats_bytes: None,
+    cursor_in_formats_bytes: None,
     prime: Vec::new(),
     seq: 0,
     events: VecDeque::new(),
@@ -789,10 +838,11 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
             unsafe {
                 let ids = (arg as *const u64).read_unaligned() as *mut u32;
                 let want = ((arg + 8) as *const u32).read_unaligned();
-                if want >= 1 && !ids.is_null() && user_array(ids as usize, 1, 4, true) {
+                if want >= 1 && !ids.is_null() && user_array(ids as usize, 2, 4, true) {
                     ids.write_unaligned(PLANE_ID);
+                    ids.add(1).write_unaligned(CURSOR_PLANE_ID);
                 }
-                ((arg + 8) as *mut u32).write_unaligned(1);
+                ((arg + 8) as *mut u32).write_unaligned(2);
             }
             0
         }
@@ -829,6 +879,9 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
             0
         }
         NR_PAGE_FLIP => page_flip(arg, card.lease()),
+        // The cursor plane's legacy door. Both spellings carry the same request
+        // with the hotspot appended to the second, so one handler serves them.
+        NR_MODE_CURSOR | NR_MODE_CURSOR2 => mode_cursor(arg, nr == NR_MODE_CURSOR2, card.lease()),
         NR_MODE_CREATE_LEASE => create_lease(card, minor, ofd, arg),
         NR_MODE_LIST_LESSES => list_leases(card, arg),
         NR_MODE_REVOKE_LEASE => revoke_lease(card, ofd, arg),
@@ -1333,6 +1386,13 @@ const PRESENTATION: &[u32] = &[
     NR_MODE_ATOMIC,
     NR_OBJ_SETPROPERTY,
     NR_RMFB,
+    // The cursor is presentation too, and belongs here for the reason the list
+    // exists: a master that has lost its console must stop putting pixels on the
+    // screen, and a pointer that keeps moving on someone else's screen is pixels.
+    // The server drawing the opposite way round - a cloned output whose cursor is
+    // handled per-client - is a driver that would not use this list at all.
+    NR_MODE_CURSOR,
+    NR_MODE_CURSOR2,
 ];
 
 /// The master has lost its console: stop it driving the scanout, and make the
@@ -1499,6 +1559,8 @@ fn arg_shape(nr: u32) -> Option<(usize, bool)> {
         NR_GETPROPBLOB => (16, true),  // struct drm_mode_get_blob
         NR_DESTROY_BLOB => (4, false), // struct drm_mode_destroy_blob
         NR_GETFB => (28, true),        // struct drm_mode_fb_cmd
+        NR_MODE_CURSOR => (28, false), // struct drm_mode_cursor
+        NR_MODE_CURSOR2 => (36, false), // struct drm_mode_cursor2
         NR_GETFB2 => (104, true),      // struct drm_mode_fb_cmd2, in and out
         // The legacy gamma pair, `struct drm_mode_crtc_lut`. Both are
         // `DRM_IOWR` in `<drm.h>`, so the struct is validated writable - which
@@ -1594,7 +1656,9 @@ fn get_cap(arg: usize) -> isize {
 /// without this cap with "Kernel DRM KMS does not support
 /// DRM_CLIENT_CAP_ATOMIC" and exits. The plane-color cap stays refused,
 /// because no plane here has a color pipeline, and so does the cursor-plane
-/// hotspot, because there is no cursor plane to carry one.
+/// hotspot, because there is no `HOTSPOT_X`/`HOTSPOT_Y` plane property for it to
+/// be about - which is what a real card's cursor planes measure as well, and a
+/// different question from whether the card has a cursor at all.
 fn set_client_cap(arg: usize) -> isize {
     // struct drm_set_client_cap { u64 capability; u64 value; }
     let capability = unsafe { (arg as *const u64).read_unaligned() };
@@ -1625,10 +1689,17 @@ fn set_client_cap(arg: usize) -> isize {
         | CLIENT_CAP_ASPECT_RATIO
         | CLIENT_CAP_WRITEBACK_CONNECTORS => 0,
         // Refused because the object behind them does not exist here: no
-        // plane with a color pipeline, no cursor plane with a hotspot to
-        // carry. `EOPNOTSUPP` is Linux's answer for a cap the driver declares
-        // it does not do - the check is the driver's own feature, and this
-        // card answers it honestly.
+        // plane with a color pipeline, and no `HOTSPOT_X`/`HOTSPOT_Y` plane
+        // property for the cursor cap to be about. That last one is the
+        // *measurement* rather than a shortcut - `modetest -p` on the real
+        // amdgpu card reports `type`, `IN_FORMATS` and `IN_FORMATS_ASYNC` as
+        // the only properties on any of its four cursor planes, with no
+        // hotspot property anywhere in the machine - so a real card refuses
+        // this cap's premise too, and a driver opting in is what the cap is
+        // for. Having a cursor *plane* is not the same thing: the hotspot a
+        // compositor needs is also carried by `MODE_CURSOR2`'s struct, which
+        // this card honours. `EOPNOTSUPP` is Linux's answer for a cap the
+        // driver declares it does not do, and this card answers it honestly.
         CLIENT_CAP_CURSOR_PLANE_HOTSPOT | CLIENT_CAP_PLANE_COLOR_PIPELINE => -95,
         // A capability number the driver has never heard of is not "not
         // supported", it is not a request at all, and Linux says so.
@@ -1835,6 +1906,27 @@ pub fn display_changed() {
 /// it made, 32bpp, no larger than the mode. A `TEST_ONLY` atomic commit asks
 /// exactly this question, which is why it is a separate answer from the copy
 /// that follows it.
+/// Whether `fb_id` names a framebuffer the cursor plane can show: one this card
+/// made, in the format a cursor carries its alpha in, and no larger than the
+/// 64x64 this card answers for `DRM_CAP_CURSOR_WIDTH`/`HEIGHT`.
+///
+/// Both doors to the cursor plane - the legacy `MODE_CURSOR` and the atomic
+/// `FB_ID` - ask this one question, so that a framebuffer one of them accepts
+/// cannot be refused by the other. `MODE_CURSOR` additionally checks the
+/// `width`/`height` the caller wrote against the framebuffer's own, because the
+/// legacy struct makes the caller state them and believing the statement would
+/// let a caller describe an image that is not the one being composited.
+fn cursor_fb_ok(st: &DrmState, fb_id: u32) -> bool {
+    st.fbs.iter().filter_map(|f| f.as_ref()).any(|f| {
+        f.id == fb_id
+            && f.format == DRM_FORMAT_ARGB8888
+            && f.width > 0
+            && f.height > 0
+            && f.width <= CURSOR_SIZE as u32
+            && f.height <= CURSOR_SIZE as u32
+    })
+}
+
 fn fb_fits(st: &DrmState, fb_id: u32) -> bool {
     let (screen_w, screen_h) = programmed_mode_dims();
     fb_fits_at(st, fb_id, screen_w, screen_h)
@@ -1906,7 +1998,79 @@ fn copy_to_scanout(st: &DrmState, fb_id: u32) -> isize {
             dumb.copy_span(y * dumb.pitch as usize, scanout.add(y * scan_pitch), row);
         }
     }
+    // The pointer goes on last, over the frame that was just copied. See
+    // [`paint_cursor`] for why this is the right place for it.
+    paint_cursor(st, scanout, screen_w, screen_h);
     0
+}
+
+/// Draw the cursor plane onto the scanout, over whatever the framebuffer copy has
+/// just put there.
+///
+/// This is the step a real card does in its display controller, and this one has
+/// to do in software: there is no engine to composite an overlay, so the cursor is
+/// blended into the scanout block by the same pass that fills it. Doing it *here*,
+/// at the end of every copy, is what makes the two orderings come out right
+/// without either side knowing about the other - a compositor's flip lands *under*
+/// the pointer rather than erasing it, and a `MODE_CURSOR` move re-copies the
+/// framebuffer (through `request_re_present`) and re-blends, so the pointer moves
+/// without the compositor redrawing anything.
+///
+/// A cursor this card cannot show is skipped rather than refused here: whether a
+/// framebuffer may be *bound* is decided where it is bound (`MODE_CURSOR`, the
+/// plane's `FB_ID`), and by the time a flush runs the only question left is
+/// whether there is something to draw.
+fn paint_cursor(st: &DrmState, scanout: *mut u8, screen_w: u32, screen_h: u32) {
+    if st.cursor_fb == 0 {
+        return;
+    }
+    let Some((handle, w, h, pitch)) = st
+        .fbs
+        .iter()
+        .filter_map(|f| f.as_ref())
+        .find(|f| f.id == st.cursor_fb)
+        .map(|f| (f.handle, f.width, f.height, f.pitch))
+    else {
+        return;
+    };
+    // A cursor image is at most 64x64 at the alignment's pitch, which is what
+    // `DRM_CAP_CURSOR_WIDTH`/`HEIGHT` answer and what a real card's cursor planes
+    // are. The bound is stated *before* the allocation rather than checked after
+    // it, because the global allocator still panics on failure: `ADDFB2` accepts
+    // any geometry that fits inside the buffer, so without this a caller could
+    // reach a 64 MiB gather through a "cursor" a million pixels wide
+    // (`AGENTS.md`'s worst-case rule). A pitch above 256 is the same refusal by
+    // another route - a 64-wide ARGB row needs 256 bytes.
+    if w == 0 || h == 0 || w > CURSOR_SIZE as u32 || h > CURSOR_SIZE as u32 || pitch > 256 {
+        return;
+    }
+    let Some(dumb) = handle
+        .checked_sub(1)
+        .and_then(|slot| st.dumb.get(slot as usize))
+        .and_then(|d| d.as_ref())
+    else {
+        return;
+    };
+    // The image is a dumb buffer whose pages are separate frames, so it is
+    // gathered into one flat block the composition can index by row.
+    let len = pitch as usize * h as usize;
+    let mut image = alloc::vec![0u8; len];
+    dumb.copy_span(0, image.as_mut_ptr(), len);
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(scanout, screen_w as usize * screen_h as usize * 4)
+    };
+    let _ = crate::drm_cursor::compose(
+        dst,
+        screen_w as usize * 4,
+        screen_w as usize,
+        screen_h as usize,
+        &image,
+        pitch as usize,
+        w as usize,
+        h as usize,
+        st.cursor_hotspot,
+        st.cursor_pos,
+    );
 }
 
 fn get_crtc(arg: usize) -> isize {
@@ -2097,29 +2261,49 @@ fn get_plane(arg: usize) -> isize {
     // possible_crtcs@12, gamma_size@16, count_format_types@20,
     // format_type_ptr@24. The format list is the two-call shape the KMS
     // list ioctls all use: count first, the array once there is room.
-    let fb_id = critical_section::with(|cs| STATE.borrow(cs).borrow().current_fb);
+    //
+    // The `plane_id` selects *which* plane is described, and this card used to
+    // ignore it: every request answered with the primary plane, so a caller
+    // asking about the cursor plane was described the one it had not asked for.
+    // That is not a detail once there are two - a compositor finds its cursor
+    // plane by asking about each id `GETPLANERESOURCES` gave it and reading the
+    // `type` back - so an id this card does not have is refused, the way Linux's
+    // `drm_plane_find` refuses one.
+    let want = unsafe { (arg as *const u32).read_unaligned() };
+    let (formats, fb_id) = match want {
+        PLANE_ID => (
+            &PLANE_FORMATS[..],
+            critical_section::with(|cs| STATE.borrow(cs).borrow().current_fb),
+        ),
+        CURSOR_PLANE_ID => (
+            &CURSOR_FORMATS[..],
+            critical_section::with(|cs| STATE.borrow(cs).borrow().cursor_fb),
+        ),
+        // No plane has that id, which is `ENOENT` - the answer the rest of this
+        // file gives for an object id it does not know.
+        _ => return -2,
+    };
     unsafe {
         let p = arg as *mut u32;
-        p.write_unaligned(PLANE_ID); // plane_id
+        p.write_unaligned(want); // plane_id: the one that was asked about
         p.add(1).write_unaligned(CRTC_ID); // crtc_id: the CRTC it serves
         p.add(2).write_unaligned(fb_id); // fb_id
         p.add(3).write_unaligned(1); // possible_crtcs: bit 0
-        p.add(4).write_unaligned(0); // gamma_size
-        // The format list, when the caller has room for it. All four the plane
-        // scans out and `ADDFB2` accepts, in the order the `IN_FORMATS` bitmask
-        // indexes - one array so that the plane's list, the blob's bitmask and
-        // the accept-list cannot disagree.
-        let want = p.add(5).read_unaligned();
-        let formats = ((arg + 24) as *const u64).read_unaligned() as *mut u32;
-        if want >= PLANE_FORMATS.len() as u32
-            && !formats.is_null()
-            && user_array(formats as usize, PLANE_FORMATS.len(), 4, true)
+        p.add(4).write_unaligned(0); // gamma_size: neither plane has a LUT
+        // The format list, when the caller has room for it: this plane's own, so
+        // that the cursor plane answers `ARGB8888` alone and the primary answers
+        // the two opaque/alpha spellings it scans.
+        let count = p.add(5).read_unaligned();
+        let formats_ptr = ((arg + 24) as *const u64).read_unaligned() as *mut u32;
+        if count >= formats.len() as u32
+            && !formats_ptr.is_null()
+            && user_array(formats_ptr as usize, formats.len(), 4, true)
         {
-            for (index, format) in PLANE_FORMATS.iter().enumerate() {
-                formats.add(index).write_unaligned(*format);
+            for (index, format) in formats.iter().enumerate() {
+                formats_ptr.add(index).write_unaligned(*format);
             }
         }
-        p.add(5).write_unaligned(PLANE_FORMATS.len() as u32); // count_format_types
+        p.add(5).write_unaligned(formats.len() as u32); // count_format_types
     }
     0
 }
@@ -2295,6 +2479,22 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
         (PLANE_ID, PROP_CRTC_Y) => st.plane_dst.1 = value as u32,
         (PLANE_ID, PROP_CRTC_W) => st.plane_dst.2 = value as u32,
         (PLANE_ID, PROP_CRTC_H) => st.plane_dst.3 = value as u32,
+        // The cursor plane, which unlike the primary plane's rectangles *does*
+        // act on what it is told: `CRTC_X`/`CRTC_Y` are where the pointer is, and
+        // the very next flush draws it there. `FB_ID` is checked by the same
+        // question the legacy `MODE_CURSOR` asks, so a framebuffer one door
+        // accepts cannot be refused by the other - and `0` is "show nothing",
+        // which is always allowed.
+        (CURSOR_PLANE_ID, PROP_PLANE_FB_ID) => {
+            let fb = value as u32;
+            if fb != 0 && !cursor_fb_ok(st, fb) {
+                return libc_einval();
+            }
+            st.cursor_fb = fb;
+        }
+        (CURSOR_PLANE_ID, PROP_PLANE_CRTC_ID) => st.cursor_crtc = value as u32,
+        (CURSOR_PLANE_ID, PROP_CRTC_X) => st.cursor_pos.0 = value as i32,
+        (CURSOR_PLANE_ID, PROP_CRTC_Y) => st.cursor_pos.1 = value as i32,
         // Pre-multiplied or coverage alpha: the scanout carries the
         // compositor's finished frame, so the answer is recorded nowhere -
         // there is nothing below it to blend against. The acquire fence is
@@ -2523,6 +2723,10 @@ fn mode_atomic(arg: usize) -> isize {
 
     // Apply, now that any resize has moved the geometry under it.
     let mut seq = 0u32;
+    // A commit that touches the cursor plane has to rebuild the scanout even
+    // though it carried no new frame: the pointer is drawn *in* that rebuild, so
+    // a move that did not re-copy would leave it where it was.
+    let mut cursor_touched = false;
     let rc = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         // The plane's buffer is the one entry that moves pixels; the rest is
@@ -2543,6 +2747,9 @@ fn mode_atomic(arg: usize) -> isize {
             if rc != 0 {
                 return rc;
             }
+            if obj == CURSOR_PLANE_ID {
+                cursor_touched = true;
+            }
         }
         // A commit that binds a mode also makes the CRTC active, the way the
         // kernel's own modeset path does: a mode bound to an inactive CRTC is
@@ -2557,6 +2764,19 @@ fn mode_atomic(arg: usize) -> isize {
         0
     });
     if rc == 0 {
+        // A commit that moved the pointer carried no new frame, and the pointer is
+        // drawn in the copy - so the master's framebuffer is copied again here,
+        // with the new position, before the flush that makes it visible. Same
+        // reasoning as `mode_cursor`'s, and the reason an atomic cursor move and a
+        // legacy one are equally prompt.
+        if cursor_touched {
+            critical_section::with(|cs| {
+                let st = STATE.borrow(cs).borrow();
+                if st.current_fb != 0 {
+                    let _ = copy_to_scanout(&st, st.current_fb);
+                }
+            });
+        }
         // Present, *then* report: the commit's completion event is queued once
         // the frame has actually gone to the host, so its timestamp is the
         // landing rather than the request. See [`queue_flip_event`].
@@ -2596,6 +2816,10 @@ impl Commit {
                 | (PLANE_ID, PROP_PLANE_CRTC_ID)
                 | (PLANE_ID, PROP_BLEND)
                 | (PLANE_ID, PROP_IN_FENCE_FD)
+                | (CURSOR_PLANE_ID, PROP_PLANE_FB_ID)
+                | (CURSOR_PLANE_ID, PROP_PLANE_CRTC_ID)
+                | (CURSOR_PLANE_ID, PROP_CRTC_X)
+                | (CURSOR_PLANE_ID, PROP_CRTC_Y)
         ) || (obj == PLANE_ID && (PROP_SRC_X..=PROP_CRTC_H).contains(&prop));
         if !known {
             return Err(libc_einval());
@@ -2693,6 +2917,10 @@ fn create_blob(arg: usize) -> isize {
 /// apart and `DESTROY_BLOB` cannot free what a property is holding.
 const DRIVER_BLOB_EDID: u32 = 0x4000_0001;
 const DRIVER_BLOB_IN_FORMATS: u32 = 0x4000_0002;
+/// The cursor plane's `IN_FORMATS`, which is its own blob because the formats are
+/// the plane's rather than the card's - one array per plane, each over the
+/// modifier this card's buffers are always in.
+const DRIVER_BLOB_CURSOR_IN_FORMATS: u32 = 0x4000_0003;
 
 /// What the synthesized display calls itself. A compositor shows this in its
 /// settings panel and in `wl_output`, which is the whole reason an EDID carries
@@ -2726,6 +2954,21 @@ fn in_formats_blob_bytes(st: &mut DrmState) -> &[u8] {
     st.in_formats_bytes.as_deref().unwrap_or(&[])
 }
 
+/// The cursor plane's `IN_FORMATS`, built the same way from its own shorter list.
+/// A format list is a fact about a *plane*, which is why a real card publishes one
+/// per plane and why this is a second blob rather than a second use of the first:
+/// a compositor asking a cursor plane what it can scan must not be told what the
+/// primary plane scans.
+fn cursor_in_formats_blob_bytes(st: &mut DrmState) -> &[u8] {
+    if st.cursor_in_formats_bytes.is_none() {
+        st.cursor_in_formats_bytes = Some(crate::drm_blob::in_formats(
+            &CURSOR_FORMATS,
+            crate::drm_blob::FORMAT_MOD_LINEAR,
+        ));
+    }
+    st.cursor_in_formats_bytes.as_deref().unwrap_or(&[])
+}
+
 /// `GETPROPBLOB`: the bytes a blob holds, in the two-call shape every KMS
 /// list uses - the length is always written, the data only when the caller
 /// has room for it.
@@ -2741,6 +2984,7 @@ fn get_propblob(arg: usize) -> isize {
             // EDID before anything has asked for the property still gets it.
             DRIVER_BLOB_EDID => Some(edid_blob_bytes(&mut st).to_vec()),
             DRIVER_BLOB_IN_FORMATS => Some(in_formats_blob_bytes(&mut st).to_vec()),
+            DRIVER_BLOB_CURSOR_IN_FORMATS => Some(cursor_in_formats_blob_bytes(&mut st).to_vec()),
             _ => st
                 .blobs
                 .get(id.wrapping_sub(1) as usize)
@@ -2773,7 +3017,8 @@ fn get_propblob(arg: usize) -> isize {
 fn destroy_blob(arg: usize) -> isize {
     // struct drm_mode_destroy_blob { u32 blob_id@0; }
     let id = unsafe { (arg as *const u32).read_unaligned() };
-    if id == DRIVER_BLOB_EDID || id == DRIVER_BLOB_IN_FORMATS {
+    if id == DRIVER_BLOB_EDID || id == DRIVER_BLOB_IN_FORMATS || id == DRIVER_BLOB_CURSOR_IN_FORMATS
+    {
         return 0;
     }
     critical_section::with(|cs| {
@@ -2929,6 +3174,59 @@ fn obj_get_properties(arg: usize) -> isize {
                     14usize,
                 ))
             }
+            // The cursor plane's properties, and the list is deliberately short:
+            // `type` so a compositor can find it, `FB_ID`/`CRTC_ID` so it can be
+            // bound and unbound, `CRTC_X`/`CRTC_Y` for where the pointer is, and
+            // its own `IN_FORMATS`.
+            //
+            // No `SRC_*`/`CRTC_W`/`CRTC_H`, because this card's cursor has no
+            // scaler and no crop: the image is drawn whole, at its own size, with
+            // its hotspot on the pointer. A property that is published and then
+            // not honoured is the silent success `AGENTS.md` §4 forbids, so the
+            // plane offers exactly what it does - narrower than a real card, which
+            // is why `PLAN.md` §7.4 carries it as a named gap rather than as a
+            // finished list. No `pixel blend mode` either, which is the measurement
+            // rather than a choice: a real card's cursor planes carry it nowhere,
+            // because a cursor is always premultiplied.
+            (OBJECT_PLANE, CURSOR_PLANE_ID) => Some((
+                [
+                    PROP_TYPE,
+                    PROP_PLANE_FB_ID,
+                    PROP_PLANE_CRTC_ID,
+                    PROP_CRTC_X,
+                    PROP_CRTC_Y,
+                    PROP_IN_FORMATS,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                [
+                    PLANE_TYPE_CURSOR,
+                    st.cursor_fb as u64,
+                    st.cursor_crtc as u64,
+                    st.cursor_pos.0 as i64 as u64,
+                    st.cursor_pos.1 as i64 as u64,
+                    DRIVER_BLOB_CURSOR_IN_FORMATS as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                6usize,
+            )),
             _ => None,
         }
     }) else {
@@ -3455,6 +3753,127 @@ fn page_flip(arg: usize, lease: Option<&LeaseSet>) -> isize {
         }
     }
     rc
+}
+
+/// `MODE_CURSOR`/`MODE_CURSOR2`: bind the cursor image and move it - the legacy
+/// door to the cursor plane, and the one a compositor that has not found the plane
+/// in the plane list still has.
+///
+/// One handler for both requests, because `struct drm_mode_cursor2` is
+/// `drm_mode_cursor` with the hotspot appended and nothing else differs.
+/// `MODE_CURSOR`'s hotspot is 0,0, which is exactly the arrow-tip convention the
+/// older struct was written around: its top-left pixel is the point.
+///
+/// `flags` says which of the two things is being asked for - `CURSOR_BO` binds an
+/// image, `CURSOR_MOVE` moves it - and Linux refuses a request that asks for
+/// neither, or for a bit outside the pair, so this does too. The two may be asked
+/// for together, which is what a compositor does on the frame it first shows a
+/// pointer.
+///
+/// **The `handle` is a framebuffer id here.** The UAPI calls that field a "driver
+/// specific handle", which is the header declining to define one: there is no
+/// Linux-wide answer to match, and this card's answer is the id `ADDFB`/`ADDFB2`
+/// handed back - the object it has to composite. Inventing a second name for the
+/// same framebuffer would be the private dialect the UAPI avoided creating.
+/// `width`/`height` are the caller's own statement of the image's size, so they are
+/// checked against the framebuffer rather than believed.
+///
+/// A cursor the plane cannot show is refused *here*, where it is bound, rather
+/// than silently not drawn later: an image larger than the 64x64
+/// `DRM_CAP_CURSOR_WIDTH`/`HEIGHT` answers for, or one that is not `ARGB8888`
+/// (the format a cursor carries its alpha in). An unknown CRTC is `EINVAL`, which
+/// is what this file has always answered for an object id the request cannot use.
+/// Linux's `drm_crtc_find` says `ENOENT` instead, and the whole file is the other
+/// convention, so the cursor follows the file rather than introducing a second
+/// answer for the same mistake inside one driver.
+fn mode_cursor(arg: usize, hot: bool, lease: Option<&LeaseSet>) -> isize {
+    // struct drm_mode_cursor: flags@0, crtc_id@4, x@8(s32), y@12(s32),
+    // width@16, height@20, handle@24; drm_mode_cursor2 adds hot_x@28, hot_y@32.
+    let flags = unsafe { (arg as *const u32).read_unaligned() };
+    let crtc_id = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    let x = unsafe { ((arg + 8) as *const i32).read_unaligned() };
+    let y = unsafe { ((arg + 12) as *const i32).read_unaligned() };
+    let width = unsafe { ((arg + 16) as *const u32).read_unaligned() };
+    let height = unsafe { ((arg + 20) as *const u32).read_unaligned() };
+    let handle = unsafe { ((arg + 24) as *const u32).read_unaligned() };
+    let hotspot = if hot {
+        (
+            unsafe { ((arg + 28) as *const i32).read_unaligned() },
+            unsafe { ((arg + 32) as *const i32).read_unaligned() },
+        )
+    } else {
+        // The older struct has no hotspot at all, and its convention is the
+        // image's top-left pixel.
+        (0, 0)
+    };
+    if flags == 0 || flags & !CURSOR_FLAGS != 0 {
+        return libc_einval();
+    }
+    if crtc_id != CRTC_ID || !leased(lease, crtc_id) {
+        return libc_einval();
+    }
+
+    if flags & CURSOR_BO != 0 {
+        // A zero-sized image is "turn the cursor off", which is how Linux spells
+        // it and how libdrm's `drmModeSetCursor(fd, crtc, 0, 0, 0)` says it.
+        if width == 0 && height == 0 {
+            critical_section::with(|cs| STATE.borrow(cs).borrow_mut().cursor_fb = 0);
+        } else {
+            let showable = critical_section::with(|cs| {
+                let st = STATE.borrow(cs).borrow();
+                cursor_fb_ok(&st, handle)
+                    && st
+                        .fbs
+                        .iter()
+                        .filter_map(|f| f.as_ref())
+                        .any(|f| f.id == handle && f.width == width && f.height == height)
+            });
+            if !showable {
+                return libc_einval();
+            }
+            critical_section::with(|cs| {
+                let mut st = STATE.borrow(cs).borrow_mut();
+                st.cursor_fb = handle;
+            });
+        }
+    }
+    // A move carries the position whether or not it also carried an image, and
+    // `MODE_CURSOR2`'s hotspot moves with the pointer for the same reason.
+    if flags & CURSOR_MOVE != 0 {
+        critical_section::with(|cs| {
+            let mut st = STATE.borrow(cs).borrow_mut();
+            st.cursor_pos = (x, y);
+            st.cursor_hotspot = hotspot;
+        });
+    } else if flags & CURSOR_BO != 0 {
+        // An image and no move: the pointer stays where it was and the new image
+        // lands under it, but a hotspot that was only just supplied still has to
+        // be taken, or the image would sit at the old one's offset.
+        critical_section::with(|cs| {
+            STATE.borrow(cs).borrow_mut().cursor_hotspot = hotspot;
+        });
+    }
+
+    // Present. Nothing was committed, so nothing else would rebuild the scanout -
+    // and the pointer is drawn *in* that rebuild, so the master's frame is copied
+    // again here, with the new image and position, and flushed. This is what
+    // `SETCRTC` and `PAGE_FLIP` do for their own frames, and it is why a cursor
+    // move is as prompt as a commit: the compositor does not redraw, and the
+    // kernel does not wait for one to.
+    let rc = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        if st.current_fb == 0 {
+            // Nothing is on the screen to draw a pointer over. The image and
+            // position are recorded, so the pointer appears with the next commit -
+            // the honest outcome rather than inventing a screen to draw on.
+            return 0;
+        }
+        copy_to_scanout(&st, st.current_fb)
+    });
+    if rc == 0 {
+        crate::drivers::video::render::request_flush_blocking();
+    }
+    0
 }
 
 fn create_dumb(arg: usize) -> isize {

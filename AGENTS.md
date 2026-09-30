@@ -165,6 +165,19 @@ leak into the image `cargo xtask run` boots.
   were answered without the struct being looked at. `GETCRTC` now writes `gamma_size` 0 instead
   of leaving the caller's `malloc`ed bytes in the field, which is pinned the same way the mode
   name is — by poisoning the word first.
+  The cursor plane (§7.4) is green in both halves: `t-drm` passes over the two-plane
+  list, the cursor plane's own `ARGB8888`-only format list, `GETPLANE` on an id the card
+  does not have being refused (`ENOENT`, where every id used to be answered with the
+  primary plane), `MODE_CURSOR` refusing a `flags` word that names neither bind nor move
+  and a `handle` that is not a framebuffer, an `ARGB8888` framebuffer binding to the plane
+  and reading back through `GETPLANE`, `MODE_CURSOR2` moving it, and a zero-sized image
+  turning it off; `t-drm-props` passes over the cursor plane's `type` reading back as
+  `Cursor` (found by property *name*, since the name is the ABI and the id is this card's
+  numbering) and over `CRTC_X` reporting where a move put the pointer, which is what makes
+  that plane's rectangles steering rather than the primary plane's recorded state. The
+  blend itself is the one piece of arithmetic on the presentation path and lives in
+  `src/drm_cursor.rs` with 10 host tests — `ARGB8888` over `BGRA`, premultiplied, hotspot
+  pinned, clipped at all four edges — which is why the host count moved from 596 to 606.
   The UTS namespace (plan §6.3, step 1) is green end to end: `t-ns-uts` prints `=== PASS`,
   holding both halves of the property that makes a namespace one — a child that unshares reports
   `inside` through `uname` *and* through both `/proc/sys/kernel` files while the parent that did

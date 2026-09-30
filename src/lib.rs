@@ -40,6 +40,12 @@ pub mod drivers;
 /// nothing inside it can be checked off the machine, and an EDID one field out
 /// of place is a display no compositor can name.
 pub mod drm_blob;
+/// The DRM cursor's composition: an `ARGB8888` image blended over the `BGRA`
+/// scanout at the pointer, in the one place a host test can reach it. The
+/// driver next to it is never compiled off the machine, and this is the only
+/// arithmetic on the presentation path - a 64x64 blend clipped at four edges,
+/// where being wrong at one edge and right at three is the normal way it fails.
+pub mod drm_cursor;
 /// The errno table: the numbers every layer answers "no" with. Sits at the
 /// crate root precisely so that refusing in Linux's language never requires
 /// naming the `syscall` layer from below it.

@@ -486,7 +486,14 @@ it - so the entries say which they are:
       leaving the caller's `malloc`ed bytes there, and all four requests gained
       the argument check Linux's ioctl layer does before a handler can refuse
       them (`t-drm-args`) (§7.4)
-- [ ] `MODE_CURSOR`/`MODE_CURSOR2` and the cursor plane they drive (§7.4)
+- [x] `MODE_CURSOR`/`MODE_CURSOR2` and the cursor plane they drive — a real
+      second plane with `type` = Cursor that `GETPLANERESOURCES`/`GETPLANE`
+      report, so a compositor drives the pointer through the kernel instead of
+      drawing it into its own buffer (`t-drm`), the pointer composited by the one
+      flusher in a host-tested pure function (`src/drm_cursor.rs`, 10 host tests),
+      and `CRTC_X`/`CRTC_Y` that steer rather than merely record (`t-drm-props`).
+      `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` stays refused, which the measurement
+      shows is what a real card does (§7.4)
 - [x] `/proc/<pid>/maps` — the file a crash reporter reads to find a program's
       base address: every mapping in Linux's six-field format, with the name
       column where Linux puts it (`t-maps`). Two named gaps: an image's and a
@@ -3123,8 +3130,8 @@ answers the names it needs: `CRTC_ID`, `ACTIVE`, `MODE_ID`, `FB_ID`, `type`,
 Devices and ioctls, roughly in the order the compositors reach for them:
 `MODE_GETFB2` ✅; `CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE` ✅ (refused, with the
 reason); `MODE_CURSOR`/`MODE_CURSOR2` and `MODE_GETGAMMA`/`MODE_SETGAMMA` (the
-legacy pair niri falls back to) - the gamma pair ✅ (refused, with the reason),
-the cursor still open; the
+legacy pair niri falls back to) - both ✅, the gamma pair refused with the reason
+and the cursor pair driving a real second plane; the
 `SYNCOBJ_*` family (`CREATE`, `DESTROY`, `HANDLE_TO_FD`, `FD_TO_HANDLE`, `WAIT`,
 `SIGNAL`, `RESET`, `QUERY`, `TRANSFER`, `TIMELINE_WAIT`, `TIMELINE_SIGNAL`,
 `EVENTFD`) with `DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE`; and
@@ -3193,8 +3200,53 @@ there is no `HOTSPOT_X` and no `HOTSPOT_Y` anywhere in the machine. So a real ca
 with four real cursor planes refuses that cap's premise too, which makes it a
 driver opt-in rather than the compositor-facing family the sentence implied - the
 same finding, and the same correction, as `FB_DAMAGE_CLIPS` and `OUT_FENCE_PTR`
-further down that table. The cursor plane work is where the cap's answer belongs,
-and it now has this measurement to build on rather than a guess.
+further down that table.
+
+**The cursor is a plane now, and the cap is still refused for the reason the
+measurement gives.** The card has a second plane whose `type` is Cursor, listed by
+`GETPLANERESOURCES` and described by `GETPLANE`; the `plane_id` a `GETPLANE`
+carries finally selects *which* plane answers, where it used to be ignored
+entirely and every question was answered with the primary plane - a bug on its own,
+and a blocker for a second plane, since a compositor finds its cursor plane by
+asking about each id and reading `type` back. `MODE_CURSOR` and `MODE_CURSOR2` are
+the legacy door to the same plane; they are in the `PRESENTATION` list with the
+other requests that put pixels on the screen, because a pointer that keeps moving
+after the master loses its console is pixels.
+
+`DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` stays refused, and the measurement is why:
+`modetest -p` reports `type`, `IN_FORMATS` and `IN_FORMATS_ASYNC` as the *only*
+properties on any of the real card's four cursor planes, with no `HOTSPOT_X` or
+`HOTSPOT_Y` anywhere in the machine. Having a cursor plane is a different question
+from publishing hotspot properties, and the hotspot itself is not lost - it is in
+`MODE_CURSOR2`'s struct, which this card honours, and a compositor that needs it
+subtracts it from the position it asks for. So the cap is refused because there is
+no property for it to be about, which is exactly what a real card's cursor planes
+measure as.
+
+**The composition is the one thing here that is arithmetic, so it is the one thing
+in its own host-tested module.** There is no display controller to composite an
+overlay, so the cursor is blended into the scanout block by the same pass that fills
+it: `src/drm_cursor.rs` holds that blend - `ARGB8888` over `BGRA`, premultiplied,
+hotspot-pinned, clipped at all four edges in one intersection computed up front -
+with ten `cargo test` cases beside it, following `drm_blob.rs` and `evdev.rs`. The
+driver calls it at the end of every `copy_to_scanout`, which is what makes the two
+orderings come out right without either side knowing about the other: a
+compositor's flip lands *under* the pointer rather than erasing it, and a
+`MODE_CURSOR` move re-copies and re-blends, so the pointer moves without the
+compositor redrawing anything. The `ARGB8888` in that sentence is the format the
+fourcc correction above had to land first.
+
+**Two gaps in this area are named rather than filled.** The cursor plane publishes
+`type`, `FB_ID`, `CRTC_ID`, `CRTC_X`, `CRTC_Y` and its own `IN_FORMATS` - no
+`SRC_*`/`CRTC_W`/`CRTC_H`, because this card's cursor has no scaler and no crop and
+a published-then-ignored property is the silent success `AGENTS.md` §4 forbids. A
+compositor that wants to crop or scale a cursor will not find the properties and
+will do it itself, which is the honest outcome but is narrower than a real card. And
+an unknown CRTC in `MODE_CURSOR` is `EINVAL`, which is what this file has always
+answered for an object it cannot use, where Linux's `drm_crtc_find` says `ENOENT`;
+the whole file would have to move together for that to change, so the cursor follows
+the file rather than splitting it. The cursor plane work is where the cap's answer belongs,
+and it had this measurement to build on rather than a guess.
 
 Properties and caps, cheap one at a time and load-bearing in aggregate: `EDID`
 (a blob - with non-zero `mm_width`/`mm_height` and a `subconnector`, if anything
