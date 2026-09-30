@@ -154,6 +154,17 @@ leak into the image `cargo xtask run` boots.
   `vrr_capable` as the immutable *ranges* a real card reports rather than bools, `max bpc` as a
   range of one value with a write of 16 refused, the plane's `IN_FORMATS` blob with its format
   array and modifier bitmask, and `ADDFB2` honouring the modifier flag the cap advertises.
+  The legacy KMS queries §7.4 keeps in its gap list are answered, three of them by refusal, and
+  both halves are green: `t-drm` passes over the `MODE_GETFB2` round trip (the fourcc, the
+  modifier, the pitch and handle, the zeroed unused planes, and the fourcc a legacy `ADDFB`
+  makes the card *derive* from its bpp/depth pair) and `t-drm-args` passes over the refusals and
+  the argument check in front of each — `MODE_GETGAMMA`/`MODE_SETGAMMA` `EINVAL` (no LUT), and
+  `CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE` `ENOTTY` (no vblank, the answer §7.1 recorded),
+  each one `EFAULT` rather than its errno when the struct's address is not the caller's, which
+  is the behaviour that actually changed: before this they fell to the dispatch catch-all and
+  were answered without the struct being looked at. `GETCRTC` now writes `gamma_size` 0 instead
+  of leaving the caller's `malloc`ed bytes in the field, which is pinned the same way the mode
+  name is — by poisoning the word first.
   The UTS namespace (plan §6.3, step 1) is green end to end: `t-ns-uts` prints `=== PASS`,
   holding both halves of the property that makes a namespace one — a child that unshares reports
   `inside` through `uname` *and* through both `/proc/sys/kernel` files while the parent that did

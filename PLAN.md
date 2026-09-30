@@ -477,8 +477,16 @@ it - so the entries say which they are:
       to a list of object ids, mintable only by the master, unable to widen
       itself, revocable by its lessor, and readable back through `GET_LEASE`
       (`t-drm-lease`)
-- [ ] `MODE_GETFB2`, `MODE_CURSOR`/`MODE_CURSOR2` and the legacy gamma pair
-      (§7.4)
+- [x] the legacy KMS queries a compositor falls back to — `MODE_GETFB2`, which
+      reads a framebuffer back with its fourcc, its modifier and its plane
+      arrays (`t-drm`), and the two pairs this card *refuses by name* rather
+      than by falling off the dispatch `match`: the legacy gamma pair (`EINVAL`;
+      no LUT behind it) and `CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE` (`ENOTTY`;
+      no vblank behind them). `GETCRTC` now writes `gamma_size` 0 instead of
+      leaving the caller's `malloc`ed bytes there, and all four requests gained
+      the argument check Linux's ioctl layer does before a handler can refuse
+      them (`t-drm-args`) (§7.4)
+- [ ] `MODE_CURSOR`/`MODE_CURSOR2` and the cursor plane they drive (§7.4)
 - [x] `/proc/<pid>/maps` — the file a crash reporter reads to find a program's
       base address: every mapping in Linux's six-field format, with the name
       column where Linux puts it (`t-maps`). Two named gaps: an image's and a
@@ -3113,13 +3121,80 @@ answers the names it needs: `CRTC_ID`, `ACTIVE`, `MODE_ID`, `FB_ID`, `type`,
 #### The gap, as a list
 
 Devices and ioctls, roughly in the order the compositors reach for them:
-`MODE_GETFB2`;
-`CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE`; `MODE_CURSOR`/`MODE_CURSOR2` and
-`MODE_GETGAMMA`/`MODE_SETGAMMA` (the legacy pair niri falls back to); the
+`MODE_GETFB2` ✅; `CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE` ✅ (refused, with the
+reason); `MODE_CURSOR`/`MODE_CURSOR2` and `MODE_GETGAMMA`/`MODE_SETGAMMA` (the
+legacy pair niri falls back to) - the gamma pair ✅ (refused, with the reason),
+the cursor still open; the
 `SYNCOBJ_*` family (`CREATE`, `DESTROY`, `HANDLE_TO_FD`, `FD_TO_HANDLE`, `WAIT`,
 `SIGNAL`, `RESET`, `QUERY`, `TRANSFER`, `TIMELINE_WAIT`, `TIMELINE_SIGNAL`,
 `EVENTFD`) with `DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE`; and
 `DRM_VIRTGPU_*`.
+
+**Four of those requests are answered now, and three of the four answers are
+refusals - deliberately.** `MODE_GETFB2` (0xce) is a real implementation:
+`struct drm_mode_fb_cmd2` goes in as an `fb_id` and comes back carrying the
+geometry, the fourcc, the modifier flag and the four plane arrays, which is the
+one thing libdrm's `drmModeGetFB2` exists for that `GETFB` cannot say. Two
+details there are the same lesson this section already records twice. First, a
+legacy `ADDFB` names its layout as bits per pixel plus depth because its struct
+predates fourcc codes, so `GETFB2` on such a framebuffer reports a format the
+card *derived*; `legacy_fb_format` derives it exactly the way
+`drm_mode_legacy_fb_format` does for the two depths this card can scan out (24 ->
+`XRGB8888`, 32 -> `ARGB8888`), which are the two `ADDFB2` already maps, so the
+two doors report the same fourcc for the same pixels rather than two dialects of
+one fact. Second, the three planes this card does not have are written as
+*zeros*, not skipped: libdrm reads `handles`/`pitches`/`offsets`/`modifier` as
+four-element arrays whose meaningful length is "how many are non-zero", so a
+kernel that left them alone would describe a four-plane buffer over addresses the
+caller never provided. `t-drm` pins the round trip, both spellings, and the zeroed
+planes.
+
+`MODE_GETGAMMA`/`MODE_SETGAMMA` (0xa4/0xa5) are refused `EINVAL`, and that is the
+same decision as the `GAMMA_LUT`/`GAMMA_LUT_SIZE` absence above rather than a
+separate one: there is no colour ramp to read or write. A caller is told the shape
+before it asks, because `GETCRTC` now writes `gamma_size` 0 - it wrote nothing
+there at all before, which left a `malloc`ed struct's garbage in a field libdrm
+reads, the identical failure the mode-name comment in `write_mode` describes.
+`EINVAL` is Linux's answer for a CRTC whose `gamma_size` is zero. **It is the one
+number in this file taken from Linux's source rather than measured on a card, and
+it is recorded as such:** no machine here has a CRTC without a gamma table to
+measure - the amdgpu CRTC next door reports `GAMMA_LUT_SIZE` 4096 - and in the
+3.7 tree `drm_mode_setgamma` answers `-EINVAL` to a `gamma_size` the CRTC cannot
+hold and `-ENOSYS` only to a *missing callback*, a distinction a CRTC with no
+table never reaches. A refusal rather than an accepted no-op, because `OK` from
+`MODE_SETGAMMA` is a compositor believing it applied a colour transformation no
+pixel will ever show.
+
+`CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE` (0x3b/0x3c) are refused `ENOTTY`, which
+is §7.1's recorded answer for the other vblank door - `WAIT_VBLANK` and its
+sequence facility - and the same argument decides both: both requests are about a
+*clock*, and this card's only boundary is a frame it presented.
+`drivers::video::render::landings` states the constraint in its own comment,
+"Calling it a vblank counter would be a lie the ABI cannot tell", and `st.seq`
+counts *commits* rather than periodic boundaries, so there is no truthful number
+to put in the reply. Naming the two in the dispatch `match` is what makes the
+answer this card's rather than the catch-all's; two spellings of "I cannot tell
+you about vblanks" that disagreed would be the private dialect `AGENTS.md` §4.3
+forbids.
+
+All four also gained the argument check that `arg_shape` exists to perform, and
+that is the only *behaviour* that changes for the two refused pairs: Linux's ioctl
+layer copies every DRM struct in before a handler can refuse it, so a caller whose
+pointer is not its own memory now hears `EFAULT` where before these answered
+`ENOTTY` without ever looking at the struct. `t-drm-args` pins that per request,
+beside the errnos.
+
+**One sentence earlier in this section is now known to be wrong.** It says
+`DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` is "the one thing that *is* missing without
+a hardware reason". Measured with `modetest -p` on the same amdgpu card: each
+CRTC has four planes, the cursor planes report `formats: AR24` and `gamma size 0`,
+and their **only** properties are `type`, `IN_FORMATS` and `IN_FORMATS_ASYNC` -
+there is no `HOTSPOT_X` and no `HOTSPOT_Y` anywhere in the machine. So a real card
+with four real cursor planes refuses that cap's premise too, which makes it a
+driver opt-in rather than the compositor-facing family the sentence implied - the
+same finding, and the same correction, as `FB_DAMAGE_CLIPS` and `OUT_FENCE_PTR`
+further down that table. The cursor plane work is where the cap's answer belongs,
+and it now has this measurement to build on rather than a guess.
 
 Properties and caps, cheap one at a time and load-bearing in aggregate: `EDID`
 (a blob - with non-zero `mm_width`/`mm_height` and a `subconnector`, if anything

@@ -170,6 +170,16 @@ const NR_GETFB: u32 = 0xad;
 const NR_ADDFB: u32 = 0xae;
 const NR_RMFB: u32 = 0xaf;
 const NR_PAGE_FLIP: u32 = 0xb0;
+/// The four requests §7.4's list names that this card answers by *refusing*
+/// rather than by falling off the end of the dispatch `match`, plus `GETFB2`.
+/// Naming them is the difference between "not implemented" and "deliberately
+/// not this card's": a caller is owed the second, and `PLAN.md` §7.4 owes the
+/// reason beside it. See `gamma_refused` and `sequence_refused`.
+const NR_MODE_GETGAMMA: u32 = 0xa4;
+const NR_MODE_SETGAMMA: u32 = 0xa5;
+const NR_CRTC_GET_SEQUENCE: u32 = 0x3b;
+const NR_CRTC_QUEUE_SEQUENCE: u32 = 0x3c;
+const NR_GETFB2: u32 = 0xce;
 /// The lease family, `<drm_mode.h>`'s numbers: `MODE_CREATE_LEASE` 0xd3,
 /// `MODE_LIST_LESSES` 0xd4, `MODE_REVOKE_LEASE` 0xd5, `MODE_GET_LEASE` 0xd6.
 /// A lease is not a second driver: it is a card descriptor whose set of legal
@@ -360,6 +370,12 @@ const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 const DRM_FORMAT_ARGB8888: u32 = 0x3432_4152;
 const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
 const DRM_FORMAT_ABGR8888: u32 = 0x3432_4142;
+/// `DRM_MODE_FB_MODIFIERS`: the bit in `struct drm_mode_fb_cmd2.flags` that says
+/// the `modifier[]` array is meaningful. Named at module scope because both
+/// directions read it - `ADDFB2` refuses a modifier that arrives without it, and
+/// `GETFB2` sets it only for a framebuffer that was made with one, which is the
+/// same statement about the same array.
+const FB_MODIFIERS: u32 = 1 << 1;
 
 /// A dumb buffer's pages are found in the mmap address space at
 /// `handle * PAGES_PER_BUFFER * PAGE`, so `mmap_frame` can decode the buffer
@@ -462,6 +478,17 @@ struct Framebuffer {
     pitch: u32,
     bpp: u32,
     depth: u32,
+    /// The fourcc this framebuffer was made from: what `ADDFB2` was given, or
+    /// what Linux's `drm_mode_legacy_fb_format` synthesizes from `bpp`/`depth`
+    /// for the legacy `ADDFB`, whose struct has no format field at all. `0` when
+    /// neither names one, which `GETFB2` reports as such rather than inventing a
+    /// layout the caller did not ask for. [`legacy_fb_format`] is that mapping.
+    format: u32,
+    /// The format modifier, `0` unless `ADDFB2` carried
+    /// `DRM_MODE_FB_MODIFIERS`. Kept rather than discarded so that `GETFB2` can
+    /// report how the framebuffer was actually made; the plane is linear either
+    /// way, which is the only modifier `ADDFB2` accepts.
+    modifier: u64,
 }
 
 /// The identity record of one dma-buf this card has been involved with: the
@@ -766,6 +793,13 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_GETPROPBLOB => get_propblob(arg),
         NR_DESTROY_BLOB => destroy_blob(arg),
         NR_GETFB => get_fb(arg),
+        // The two-call framebuffer query with the format in it, which the
+        // legacy `GETFB` above cannot spell.
+        NR_GETFB2 => get_fb2(arg),
+        // Refused, and named so that the refusal is this card's answer rather
+        // than the catch-all's. Both carry a measurement in their doc comment.
+        NR_MODE_GETGAMMA | NR_MODE_SETGAMMA => gamma_refused(),
+        NR_CRTC_GET_SEQUENCE | NR_CRTC_QUEUE_SEQUENCE => sequence_refused(),
         NR_ADDFB => add_fb(arg),
         NR_ADDFB2 => add_fb2(arg),
         NR_RMFB => {
@@ -1450,6 +1484,22 @@ fn arg_shape(nr: u32) -> Option<(usize, bool)> {
         NR_GETPROPBLOB => (16, true),  // struct drm_mode_get_blob
         NR_DESTROY_BLOB => (4, false), // struct drm_mode_destroy_blob
         NR_GETFB => (28, true),        // struct drm_mode_fb_cmd
+        NR_GETFB2 => (104, true),      // struct drm_mode_fb_cmd2, in and out
+        // The legacy gamma pair, `struct drm_mode_crtc_lut`. Both are
+        // `DRM_IOWR` in `<drm.h>`, so the struct is validated writable - which
+        // is a statement about the struct, not about the three arrays it names:
+        // a `GETGAMMA` fills the arrays the caller's pointers aim at, and this
+        // card never gets that far (see `gamma_refused`).
+        NR_MODE_GETGAMMA | NR_MODE_SETGAMMA => (32, true),
+        // The CRTC-sequence pair, `struct drm_crtc_get_sequence` and
+        // `struct drm_crtc_queue_sequence`, both `DRM_IOWR` as well.
+        //
+        // The row matters more than it looks: these two are *refused*, and
+        // Linux's ioctl layer copies every DRM struct in before the handler can
+        // refuse it, so a caller whose pointer is not its own memory hears
+        // `EFAULT` rather than the refusal. Without the row this card answered
+        // `ENOTTY` without ever looking at the struct.
+        NR_CRTC_GET_SEQUENCE | NR_CRTC_QUEUE_SEQUENCE => (24, true),
         NR_ADDFB => (28, false),
         NR_ADDFB2 => (104, false),   // struct drm_mode_fb_cmd2
         NR_RMFB => (4, false),       // struct drm_mode_rmfb
@@ -1854,6 +1904,15 @@ fn get_crtc(arg: usize) -> isize {
             let p = arg as *mut u8;
             (p.add(12) as *mut u32).write_unaligned(CRTC_ID);
             (p.add(16) as *mut u32).write_unaligned(st.current_fb);
+            // `gamma_size` at 28, written rather than left alone, and the reason
+            // is the same one `write_mode` gives for the mode's name: the
+            // caller's struct is its own uninitialised memory - libdrm allocates
+            // it with `malloc` - so a field this card does not fill is a number
+            // the caller reads as garbage. This card has no gamma table at all
+            // (see `gamma_refused`), which makes 0 the truthful report rather
+            // than a missing one, and it is the number that tells a caller the
+            // legacy gamma pair is not worth asking about.
+            (p.add(28) as *mut u32).write_unaligned(0);
             (p.add(32) as *mut u32).write_unaligned(1); // mode_valid
             write_mode(p.add(36), (w * h * 60) / 1000, w, h);
         }
@@ -1953,14 +2012,6 @@ fn get_connector(arg: usize) -> isize {
         let _ = edid_blob_bytes(&mut st);
         (st.conn_crtc as u64, st.dpms as u64)
     });
-    const CONNECTOR_PROPS: [u32; 6] = [
-        PROP_CRTC_ID,
-        PROP_DPMS,
-        PROP_EDID,
-        PROP_NON_DESKTOP,
-        PROP_MAX_BPC,
-        PROP_VRR_CAPABLE,
-    ];
     let connector_values: [u64; 6] = [
         crtc_value,
         dpms_value,
@@ -2889,39 +2940,75 @@ fn obj_get_properties(arg: usize) -> isize {
     0
 }
 
-/// Bind a dumb buffer to a fresh framebuffer id. The handle must be one the
-/// card made or imported, and the geometry must be a shape the scanout can
-/// show: 32bpp, nonzero, with a pitch wide enough for a row. `ADDFB` and
-/// `ADDFB2` differ only in how they spell those facts.
-fn insert_fb(
-    st: &mut DrmState,
-    handle: u32,
+/// What a caller says a framebuffer *is*, gathered into one value so that
+/// [`insert_fb`] takes one thing rather than seven.
+///
+/// The two doors fill it differently, and that is the point: `ADDFB`'s struct
+/// has no format field, so `format` there is synthesized from `bpp`/`depth` by
+/// [`legacy_fb_format`], and its `modifier` is always 0 because the struct
+/// cannot carry one. `ADDFB2`'s fourcc and modifier are the caller's own words.
+/// Both then store the same record, which is what lets `GETFB2` answer in terms
+/// of the framebuffer rather than in terms of the request that made it.
+struct FbShape {
     width: u32,
     height: u32,
     pitch: u32,
     bpp: u32,
     depth: u32,
-) -> Option<u32> {
+    format: u32,
+    modifier: u64,
+}
+
+/// Bind a dumb buffer to a fresh framebuffer id. The handle must be one the
+/// card made or imported, and the geometry must be a shape the scanout can
+/// show: 32bpp, nonzero, with a pitch wide enough for a row. `ADDFB` and
+/// `ADDFB2` differ only in how they spell those facts.
+fn insert_fb(st: &mut DrmState, handle: u32, shape: FbShape) -> Option<u32> {
     let slot = handle as usize;
     // The handle's buffer must exist - and the geometry it comes with has to
     // be a shape the scanout can show: the handle's own bpp (the scanout is
     // a 32-bit BGRA surface, whatever the ADDFB claims), nonzero, with a
     // pitch wide enough for a row.
     let dumb = st.dumb.get(slot.checked_sub(1)?).and_then(|d| d.as_ref())?;
-    if dumb.bpp != 32 || bpp != 32 || width == 0 || height == 0 || pitch < width * 4 {
+    if dumb.bpp != 32
+        || shape.bpp != 32
+        || shape.width == 0
+        || shape.height == 0
+        || shape.pitch < shape.width * 4
+    {
         return None;
     }
     let id = st.fbs.len() as u32 + 100;
     st.fbs.push(Some(Framebuffer {
         id,
         handle,
-        width,
-        height,
-        pitch,
-        bpp,
-        depth,
+        width: shape.width,
+        height: shape.height,
+        pitch: shape.pitch,
+        bpp: shape.bpp,
+        depth: shape.depth,
+        format: shape.format,
+        modifier: shape.modifier,
     }));
     Some(id)
+}
+
+/// The fourcc Linux's `drm_mode_legacy_fb_format` synthesizes for a legacy
+/// `ADDFB`, which names its layout as bits per pixel plus depth because the
+/// struct predates fourcc codes entirely.
+///
+/// Only the two depths this card can *scan out* are mapped, and they are the
+/// same two its `ADDFB2` maps: depth 24 is `XRGB8888` and depth 32 is
+/// `ARGB8888`, which is what `ADDFB2`'s own fourcc table says for the same
+/// pixels. Answering anything else would be a format `GETFB2` reports and
+/// `ADDFB2` refuses, so an `ADDFB` at any other depth reports `0` - "made
+/// without a format" - rather than a layout nothing here would produce.
+fn legacy_fb_format(bpp: u32, depth: u32) -> u32 {
+    match (bpp, depth) {
+        (32, 24) => DRM_FORMAT_XRGB8888,
+        (32, 32) => DRM_FORMAT_ARGB8888,
+        _ => 0,
+    }
 }
 
 fn add_fb(arg: usize) -> isize {
@@ -2937,11 +3024,15 @@ fn add_fb(arg: usize) -> isize {
         insert_fb(
             &mut STATE.borrow(cs).borrow_mut(),
             handle,
-            width,
-            height,
-            pitch,
-            bpp,
-            depth,
+            FbShape {
+                width,
+                height,
+                pitch,
+                bpp,
+                depth,
+                format: legacy_fb_format(bpp, depth),
+                modifier: 0,
+            },
         )
     });
     match id {
@@ -2980,7 +3071,9 @@ fn add_fb2(arg: usize) -> isize {
     // named without the flag, is the `EINVAL` Linux answers for a format and
     // modifier pair this plane cannot scan out; the pair *is* listed in
     // `IN_FORMATS`, which is the same truth in the other direction.
-    const FB_MODIFIERS: u32 = 1 << 1;
+    // Kept for `GETFB2` to report: the plane is linear either way, but *how*
+    // the framebuffer was made is a fact the caller asked for and this card
+    // knows.
     let modifier = if flags & FB_MODIFIERS != 0 {
         if modifier != crate::drm_blob::FORMAT_MOD_LINEAR {
             return libc_einval();
@@ -2989,7 +3082,6 @@ fn add_fb2(arg: usize) -> isize {
     } else {
         0
     };
-    let _ = modifier;
     let (bpp, depth) = match format {
         DRM_FORMAT_XRGB8888 | DRM_FORMAT_XBGR8888 => (32, 24),
         DRM_FORMAT_ARGB8888 | DRM_FORMAT_ABGR8888 => (32, 32),
@@ -2999,11 +3091,15 @@ fn add_fb2(arg: usize) -> isize {
         insert_fb(
             &mut STATE.borrow(cs).borrow_mut(),
             handle,
-            width,
-            height,
-            pitch,
-            bpp,
-            depth,
+            FbShape {
+                width,
+                height,
+                pitch,
+                bpp,
+                depth,
+                format,
+                modifier,
+            },
         )
     });
     match id {
@@ -3040,6 +3136,122 @@ fn get_fb(arg: usize) -> isize {
         }
         0
     })
+}
+
+/// `GETFB2`: the framebuffer's identity *with its format*, which the legacy
+/// `GETFB` above cannot spell.
+///
+/// `struct drm_mode_fb_cmd2` is input and output at once: `fb_id` goes in and
+/// the geometry, the fourcc, the modifier and the plane arrays come back. That
+/// is the whole reason libdrm's `drmModeGetFB2` exists next to
+/// `drmModeGetFB` - a compositor handed a framebuffer it did not make (out of
+/// a lease, or from another client) can learn what to map, which the legacy
+/// struct's `bpp`/`depth` pair cannot say.
+///
+/// **Every byte of the caller's struct is written, including the three planes
+/// this card does not have.** The caller allocated those 104 bytes with
+/// `malloc`, and libdrm reads `handles`, `pitches`, `offsets` and `modifier` as
+/// four-element arrays whose meaningful length is "how many are non-zero" - so a
+/// struct only half-filled is a framebuffer the caller believes has four planes
+/// over four addresses it never provided. That is the same failure the mode-name
+/// comment in `write_mode` describes, one field over. The three unused planes
+/// are therefore written as zeros, and `flags` reports whether `modifier[0]`
+/// means anything, which is precisely the flag `ADDFB2` had to be given for the
+/// modifier to have been one.
+///
+/// An unknown `fb_id` is `EINVAL`, matching `get_fb` rather than the `ENOENT` a
+/// fresh reading of Linux might suggest: the two spellings of this question are
+/// answered alike here, and `t-drm-args` already pins that answer for the older
+/// one.
+fn get_fb2(arg: usize) -> isize {
+    // struct drm_mode_fb_cmd2: fb_id@0, width@4, height@8, pixel_format@12,
+    // flags@16, handles[4]@20, pitches[4]@36, offsets[4]@52, modifier[4]@68.
+    let id = unsafe { (arg as *const u32).read_unaligned() };
+    critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        let Some(fb) = st
+            .fbs
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .find(|f| f.id == id)
+        else {
+            return libc_einval();
+        };
+        unsafe {
+            let p = arg as *mut u8;
+            let w32 = |off: usize, v: u32| (p.add(off) as *mut u32).write_unaligned(v);
+            let w64 = |off: usize, v: u64| (p.add(off) as *mut u64).write_unaligned(v);
+            w32(4, fb.width);
+            w32(8, fb.height);
+            w32(12, fb.format);
+            w32(16, if fb.modifier != 0 { FB_MODIFIERS } else { 0 });
+            for plane in 0..4usize {
+                let first = plane == 0;
+                // One plane holds the buffer and the rest say "unused", which
+                // every reader of the struct spells as a zero.
+                w32(20 + plane * 4, if first { fb.handle } else { 0 });
+                w32(36 + plane * 4, if first { fb.pitch } else { 0 });
+                w32(52 + plane * 4, 0); // offsets: the buffer starts at its start
+                w64(68 + plane * 8, if first { fb.modifier } else { 0 });
+            }
+        }
+        0
+    })
+}
+
+/// `MODE_GETGAMMA`/`MODE_SETGAMMA` - the legacy gamma pair - refused for a CRTC
+/// with no gamma table.
+///
+/// This is the door a compositor older than the `GAMMA_LUT` blob property reads
+/// a colour ramp through, and this card has no ramp to read: no
+/// colour-management engine, nothing behind the property, and §7.4 records
+/// `GAMMA_LUT`/`GAMMA_LUT_SIZE` as **deliberately absent** for that same reason.
+/// `GETCRTC` now reports `gamma_size` 0, so a caller is told the shape before it
+/// asks, and this is what it hears if it asks anyway.
+///
+/// `EINVAL` is Linux's answer for such a CRTC: `drm_mode_getgamma` and
+/// `drm_mode_setgamma` refuse a CRTC whose `gamma_size` is zero before they
+/// reach the driver's `gamma_get`/`gamma_set` callback - in the 3.7 tree
+/// `setgamma` returns `-EINVAL` on a `gamma_size` the CRTC cannot hold and
+/// `-ENOSYS` only for a missing callback, which is a distinction a CRTC with no
+/// table never gets to. The *number* is from Linux's `drivers/gpu/drm/drm_crtc.c`
+/// rather than from a measurement on this machine, because no card here has a
+/// CRTC without a gamma table to measure: the amdgpu CRTC next door reports
+/// `GAMMA_LUT_SIZE` 4096. It is recorded as such in `PLAN.md` §7.4.
+///
+/// A refusal rather than an accepted no-op, because `OK` from `MODE_SETGAMMA`
+/// is a compositor believing it applied a colour transformation no pixel will
+/// ever show - the silent success `AGENTS.md` §4 forbids.
+fn gamma_refused() -> isize {
+    libc_einval()
+}
+
+/// `CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE` refused: this card has no vertical
+/// blank to report a sequence against.
+///
+/// `GET_SEQUENCE` asks for the CRTC's *vblank* counter and a nanosecond timestamp
+/// of the last one; `QUEUE_SEQUENCE` asks to be told by `DRM_EVENT_CRTC_SEQUENCE`
+/// when that counter reaches a number the caller names. Both are questions about
+/// a clock, and this card has none: the only boundary it has is a frame it
+/// presented, which is `drivers::video::render::landings` and the flip sequence
+/// `st.seq`, and those count *commits* rather than periodic boundaries.
+/// `LANDINGS`' own comment already states the rule this refusal follows -
+/// "Calling it a vblank counter would be a lie the ABI cannot tell" - and §7.1
+/// recorded the same decision for `WAIT_VBLANK` and its sequence facility:
+/// `ENOTTY` rather than an answer that would be a clock this kernel does not
+/// have.
+///
+/// `ENOTTY` is also what these two requests already fell through to, since
+/// neither was in the dispatch `match` at all. Naming them here is what makes the
+/// answer deliberate rather than an accident of the catch-all, and it is the same
+/// answer §7.1 recorded for the other vblank door - one card with two spellings
+/// of "I cannot tell you about vblanks" that disagreed would be the private
+/// dialect `AGENTS.md` §4.3 forbids. What actually changes for a caller is the
+/// `arg_shape` row: Linux's ioctl layer copies every DRM struct in before a
+/// handler can refuse it, so a bad pointer now hears `EFAULT` where before this
+/// answered `ENOTTY` without ever looking at the struct.
+fn sequence_refused() -> isize {
+    -25 // ENOTTY
 }
 
 /// Release a GEM handle - the one path `GEM_CLOSE` and `DESTROY_DUMB` both

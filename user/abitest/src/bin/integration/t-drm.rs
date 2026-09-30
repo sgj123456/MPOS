@@ -53,6 +53,7 @@ const NR_MAP_DUMB: usize = 0xb3;
 /// framebuffer readback, the fourcc ADDFB, the connector's property list,
 /// the version handshake, the auth pair, and the handle release.
 const NR_GETFB: usize = 0xad;
+const NR_GETFB2: usize = 0xce;
 const NR_ADDFB2: usize = 0xb8;
 const NR_OBJ_GETPROPERTIES: usize = 0xb9;
 const NR_VERSION: usize = 0x00;
@@ -297,6 +298,114 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(&mut failed, b"ADDFB2 succeeds", r, 0);
     let fb2_id = u32::from_ne_bytes([fb2[0], fb2[1], fb2[2], fb2[3]]);
     lin::check_true(&mut failed, b"ADDFB2 returns a framebuffer id", fb2_id != 0);
+
+    // GETFB2: the same binding read back *with its format*, which is the whole
+    // reason libdrm has a second call. `struct drm_mode_fb_cmd2` is in and out
+    // at once, so the request goes back with `fb_id` in the bytes the answer
+    // comes back in.
+    //
+    // Every field below is one a caller that inherited this framebuffer needs,
+    // and the three *unused* planes are checked as zeros: libdrm reads
+    // `handles`/`pitches`/`offsets`/`modifier` as four-element arrays whose
+    // length is "however many are non-zero", so a kernel that left them alone
+    // would be describing a four-plane buffer over addresses the caller never
+    // provided - the same class of mistake as the mode name weston's `strdup`
+    // once walked off the end of.
+    let mut g2 = [0u8; 104];
+    g2[0..4].copy_from_slice(&fb2_id.to_ne_bytes()); // fb_id
+    let r = lin::ioctl(fd, ioc_d(NR_GETFB2, 104), g2.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"GETFB2 succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"GETFB2 reports the width",
+        u32_at(&g2, 4) as isize,
+        64,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"GETFB2 reports the height",
+        u32_at(&g2, 8) as isize,
+        64,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"GETFB2 reports the fourcc ADDFB2 bound",
+        u32_at(&g2, 12) as isize,
+        0x3432_5258,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and no modifier flag, since none was carried",
+        u32_at(&g2, 16) as isize,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and the handle behind it",
+        u32_at(&g2, 20) as isize,
+        handle as isize,
+    );
+    lin::check_eq(&mut failed, b"and the pitch", u32_at(&g2, 36) as isize, 256);
+    lin::check_eq(
+        &mut failed,
+        b"and a zero offset, since the buffer starts at its start",
+        u32_at(&g2, 52) as isize,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and a single plane, with the second handle zeroed",
+        u32_at(&g2, 24) as isize,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and the fourth pitch zeroed",
+        u32_at(&g2, 48) as isize,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and the second modifier zeroed",
+        u64_at(&g2, 76) as isize,
+        0,
+    );
+
+    // The legacy ADDFB names its layout as bpp plus depth, because its struct
+    // predates fourcc codes - so GETFB2 on such a framebuffer is answering with
+    // a format the card *derived*. Depth 24 over 32bpp is XRGB8888, the same
+    // pair ADDFB2 spells directly, which is what makes the two doors agree.
+    let mut leg = [0u8; 28];
+    leg[4..8].copy_from_slice(&64u32.to_ne_bytes()); // width
+    leg[8..12].copy_from_slice(&64u32.to_ne_bytes()); // height
+    leg[12..16].copy_from_slice(&256u32.to_ne_bytes()); // pitch
+    leg[16..20].copy_from_slice(&32u32.to_ne_bytes()); // bpp
+    leg[20..24].copy_from_slice(&24u32.to_ne_bytes()); // depth
+    leg[24..28].copy_from_slice(&handle.to_ne_bytes()); // handle
+    let r = lin::ioctl(fd, ioc_d(NR_ADDFB, 28), leg.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"a legacy ADDFB succeeds too", r, 0);
+    let leg_id = u32_at(&leg, 0);
+    let mut g3 = [0u8; 104];
+    g3[0..4].copy_from_slice(&leg_id.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_GETFB2, 104), g3.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"GETFB2 reads a legacy framebuffer back", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"and derives XRGB8888 from 32bpp depth 24, as Linux's legacy mapping does",
+        u32_at(&g3, 12) as isize,
+        0x3432_5258,
+    );
+
+    // A framebuffer id the card never made: `EINVAL`, the same answer the
+    // legacy GETFB gives, so the two spellings of the question agree.
+    let mut g4 = [0u8; 104];
+    g4[0..4].copy_from_slice(&0xffffu32.to_ne_bytes());
+    lin::check_eq(
+        &mut failed,
+        b"GETFB2 of an unknown framebuffer is EINVAL",
+        lin::ioctl(fd, ioc_d(NR_GETFB2, 104), g4.as_mut_ptr() as usize),
+        -22,
+    );
 
     // OBJ_GETPROPERTIES on the connector: the two-call list shape, and the
     // CRTC_ID/DPMS pair a compositor drives the connector by.
