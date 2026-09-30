@@ -744,6 +744,17 @@ impl Numbering {
 /// Taking turns on the one global bus, for tests. The crate has no `std` and
 /// the host build has no `spin`, so this is a lock made of one atomic - which
 /// is all a test that must not see another test's events needs.
+///
+/// **Every test that *publishes* has to take it, not only every test that
+/// reads.** The bus is one global list of subscribers and a test that registers
+/// a device publishes `add` events into every bound socket, including another
+/// test's: this is what `devfs`'s tests do, and the omissions were silent for as
+/// long as they were because the one test that counts exactly (`QUEUE_MAX` of
+/// them) happened to be bounded at exactly that number either way. Adding a
+/// foreign event to a full queue pushes one of the counted ones out, so the
+/// count comes up short - and the reverse race, a publish landing while the
+/// counter drains, makes it one too long. The fix belongs to the publisher:
+/// `let _bus = crate::uevent::test_bus::take();` before the first `register`.
 #[cfg(test)]
 pub(crate) mod test_bus {
     use core::sync::atomic::{AtomicBool, Ordering};

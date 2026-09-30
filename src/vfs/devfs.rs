@@ -790,6 +790,7 @@ mod tests {
 
     #[test]
     fn devices_appear_by_name_and_report_their_kind() {
+        let _bus = crate::uevent::test_bus::take();
         let fs = DevFs::new();
         fs.register(
             "null",
@@ -809,6 +810,7 @@ mod tests {
 
     #[test]
     fn a_stream_reads_in_order_through_the_description_cursor() {
+        let _bus = crate::uevent::test_bus::take();
         let fs = DevFs::new();
         fs.register(
             "src",
@@ -831,6 +833,7 @@ mod tests {
 
     #[test]
     fn writes_land_in_the_device() {
+        let _bus = crate::uevent::test_bus::take();
         let fs = DevFs::new();
         let dev = sink();
         fs.register("sink", dev.clone());
@@ -846,6 +849,7 @@ mod tests {
     #[test]
     #[should_panic = "registered twice"]
     fn registering_the_same_name_twice_is_a_bug() {
+        let _bus = crate::uevent::test_bus::take();
         let fs = DevFs::new();
         fs.register("null", sink());
         fs.register("null", sink());
@@ -857,6 +861,7 @@ mod tests {
         // to `chmod` means the number is really there afterwards, and the
         // permission checks read it - which, before this, they could not,
         // and a udev `MODE=` rule was a line of logs and nothing else.
+        let _bus = crate::uevent::test_bus::take();
         let fs = DevFs::new();
         fs.register("sink", sink());
         let node = fs.root().lookup("sink").unwrap();
@@ -917,6 +922,7 @@ mod tests {
 
     #[test]
     fn read_dir_lists_every_registered_device() {
+        let _bus = crate::uevent::test_bus::take();
         let fs = DevFs::new();
         fs.register("null", sink());
         fs.register("sink", sink());
