@@ -1,18 +1,20 @@
 //! t-prctl - the process-control call's option table.
 //!
-//! Pinned here, per prctl(2): `PR_GET_NAME` fills a 16-byte buffer and answers
-//! 0, `PR_SET_NAME` is accepted, `PR_GET_SECCOMP` answers 0 while the process
-//! is unconfined, entering the BPF filter mode with no program is refused
-//! with `EFAULT` before anything is installed, and an option the handler does
-//! not name is accepted as a no-op.
+//! Pinned here, per prctl(2): the name pair round-trips - a `PR_SET_NAME`
+//! stores the caller's bytes and `PR_GET_NAME` reads them back, NUL-terminated
+//! within the sixteen-byte `TASK_COMM_LEN` slot - and a name that fills that
+//! slot whole is *truncated and accepted*, not refused, as Linux truncates it;
+//! `PR_GET_SECCOMP` answers 0 while the process is unconfined; entering the BPF
+//! filter mode with no program is refused with `EFAULT` before anything is
+//! installed; and an option the handler does not model is refused with
+//! `EINVAL`, the way Linux's `prctl` default arm answers a number it does not
+//! know.
 //!
-//! Where mpos diverges: this kernel remembers no per-task name. `PR_GET_NAME`
-//! therefore answers sixteen zero bytes rather than the name an earlier
-//! `PR_SET_NAME` stored, and `PR_SET_NAME` is a request the handler does not
-//! even name - it falls through the same `_ => 0` arm as every other option
-//! outside the table. The re-read below pins that "accepted, not remembered"
-//! pair explicitly. (`PR_GET_NAME` insists on a real 16-byte buffer and
-//! answers `EFAULT` otherwise, which this wrapper cannot reach.)
+//! The name round-trip is the behaviour this program exists to pin: `PR_SET_NAME`
+//! used to fall through the same `_ => 0` arm as every unmodelled option -
+//! accepted and dropped - and `PR_GET_NAME` answered sixteen zeroes, so the
+//! read-back below would have found no name. It now does, which is what makes
+//! this the counterfactual for the change.
 //!
 //! The strict-mode latch is deliberately *not* tested here: once
 //! `PR_SET_SECCOMP` with `SECCOMP_MODE_STRICT` is granted, the process dies on
@@ -40,8 +42,16 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-prctl\n");
     let mut failed = false;
 
-    // PR_GET_NAME: a 16-byte buffer comes back all zero, because mpos
-    // remembers no name to report. The 0xAA seed proves the write.
+    // The name pair round-trips: what PR_SET_NAME stores is what PR_GET_NAME
+    // hands back, NUL-terminated inside the slot. The 0xAA seed proves the
+    // read-back is the kernel's write, not the buffer's initial state.
+    let requested = b"renamed\0";
+    lin::check_eq(
+        &mut failed,
+        b"PR_SET_NAME accepts a NUL-terminated name",
+        lin::prctl(lin::PR_SET_NAME, requested.as_ptr() as usize, 0, 0, 0),
+        0,
+    );
     let mut name = [0xAAu8; 16];
     lin::check_eq(
         &mut failed,
@@ -51,24 +61,29 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_true(
         &mut failed,
-        b"PR_GET_NAME answers 16 zero bytes (mpos remembers no name)",
-        name.iter().all(|&b| b == 0),
+        b"the name round-trips: PR_GET_NAME reads back what PR_SET_NAME stored",
+        &name[..7] == b"renamed" && name[7] == 0,
     );
 
-    // PR_SET_NAME: accepted, and deliberately not remembered.
-    let requested = b"t-prctl\0";
+    // A name that fills the whole slot is truncated and accepted, not refused.
+    // Measured on Linux: sixteen characters with no NUL inside `TASK_COMM_LEN`
+    // answer `0`, and `PR_GET_NAME` then reads back fifteen. This kernel used to
+    // answer `EFAULT` there - the wrong-shape answer in §4.2's sense, because a
+    // program that named itself sixteen bytes long would take its
+    // "the kernel would not name me" fallback on a kernel that did name it.
+    let long = [b'x'; 16];
     lin::check_eq(
         &mut failed,
-        b"PR_SET_NAME accepts a NUL-terminated name",
-        lin::prctl(lin::PR_SET_NAME, requested.as_ptr() as usize, 0, 0, 0),
+        b"PR_SET_NAME truncates a name that fills the slot, it does not refuse it",
+        lin::prctl(lin::PR_SET_NAME, long.as_ptr() as usize, 0, 0, 0),
         0,
     );
     let mut name = [0xAAu8; 16];
     let _ = lin::prctl(lin::PR_GET_NAME, name.as_mut_ptr() as usize, 0, 0, 0);
     lin::check_true(
         &mut failed,
-        b"the name was not remembered: PR_GET_NAME is still zeroed",
-        name.iter().all(|&b| b == 0),
+        b"fifteen characters survive the cut and the slot ends in NUL",
+        name[..15] == [b'x'; 15] && name[15] == 0,
     );
 
     // PR_GET_SECCOMP: a fresh process is unconfined.
@@ -89,12 +104,14 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EFAULT,
     );
 
-    // An option the handler does not name is accepted and dropped.
+    // An option the handler does not model is refused, the way Linux's `prctl`
+    // default arm answers a number it does not know - not the silent `0` this
+    // kernel used to hand back for every unmodelled option.
     lin::check_eq(
         &mut failed,
-        b"an unknown option answers 0, accepted as a no-op",
+        b"an unknown option is refused with EINVAL",
         lin::prctl(0x7fff, 0, 0, 0, 0),
-        0,
+        lin::EINVAL,
     );
 
     lin::done(failed)

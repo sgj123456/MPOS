@@ -1101,7 +1101,7 @@ mod tests {
         // "add" and gets an event it would never have heard.
         let fs = fs();
         let watcher = crate::uevent::open();
-        crate::uevent::bind(watcher, 0, 1).expect("a fresh socket binds");
+        crate::uevent::bind(watcher, 0, 1, 0).expect("a fresh socket binds");
         let block = block_dir(&fs);
         let (name, _) = block.read_dir().unwrap().into_iter().next().unwrap();
         let uevent = block.lookup(&name).unwrap().lookup("uevent").unwrap();
@@ -1520,7 +1520,7 @@ mod tests {
         let _bus = crate::uevent::test_bus::take();
         let fs = pci_fs();
         let watcher = crate::uevent::open();
-        crate::uevent::bind(watcher, 0, 1).expect("a fresh socket binds");
+        crate::uevent::bind(watcher, 0, 1, 0).expect("a fresh socket binds");
         let uevent = resolve(&fs, "/sys/bus/pci/devices/0000:00:03.0/uevent");
         assert_eq!(uevent.write_at(0, b"add").unwrap(), 3);
 

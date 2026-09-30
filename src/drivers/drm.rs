@@ -617,7 +617,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
     // checked here at all: it is refused below, as `ENOTTY`, without having
     // touched anything.
     if let Some((len, writable)) = arg_shape(nr)
-        && !crate::syscall::buffer_ok(arg, len, writable, true)
+        && !crate::uaccess::buffer_ok(arg, len, writable, true)
     {
         return -14; // EFAULT
     }
@@ -1404,7 +1404,7 @@ fn user_array(ptr: usize, count: usize, elem: usize, write: bool) -> bool {
         return false;
     }
     match count.checked_mul(elem) {
-        Some(bytes) => crate::syscall::buffer_ok(ptr, bytes, write, true),
+        Some(bytes) => crate::uaccess::buffer_ok(ptr, bytes, write, true),
         None => false,
     }
 }

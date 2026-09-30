@@ -30,6 +30,31 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     if fd < 0 {
         lin::done(failed);
     }
+
+    // memfd_create's flag vocabulary is closed: an unknown bit is EINVAL, and
+    // `MFD_HUGETLB` is refused with `EOPNOTSUPP` rather than answered with an
+    // ordinary memfd the caller believes is huge-backed (this kernel has no
+    // hugepages). Both are counterfactual - the old handler looked only at
+    // `MFD_CLOEXEC` and created the fd for any flag at all.
+    const MFD_HUGETLB: usize = 0o004;
+    lin::check_eq(
+        &mut failed,
+        b"memfd_create with an unknown flag (0x1000) is EINVAL",
+        lin::memfd_create(b"m\0", 0x1000),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"memfd_create with MFD_HUGETLB is EOPNOTSUPP, not a fake ordinary fd",
+        lin::memfd_create(b"m\0", MFD_HUGETLB),
+        lin::EOPNOTSUPP,
+    );
+    // A recognised flag still creates the pool, so the gate is not blanket.
+    lin::check_true(
+        &mut failed,
+        b"memfd_create with MFD_ALLOW_SEALING alone still hands back a fd",
+        lin::memfd_create(b"m\0", lin::MFD_ALLOW_SEALING) >= 0,
+    );
     lin::check_eq(
         &mut failed,
         b"ftruncate sizes the pool",

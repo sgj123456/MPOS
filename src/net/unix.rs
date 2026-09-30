@@ -933,10 +933,10 @@ pub(crate) fn accept_once(
             return Ok((end, peer));
         }
         if nonblock {
-            return Err(crate::syscall::err::EAGAIN);
+            return Err(crate::err::EAGAIN);
         }
         if !accept_blocking_step(sock) {
-            return Err(crate::syscall::err::EAGAIN);
+            return Err(crate::err::EAGAIN);
         }
     }
 }
@@ -978,7 +978,7 @@ pub(crate) fn listen(sock: &UnixSock, backlog: i32) -> Result<(), isize> {
     if sock.typ == SOCK_DGRAM {
         return Err(err::EOPNOTSUPP);
     }
-    let cap = clamp_backlog(backlog).ok_or(crate::syscall::err::EINVAL)?;
+    let cap = clamp_backlog(backlog).ok_or(crate::err::EINVAL)?;
     critical_section::with(|cs| {
         let mut st = sock.state.borrow(cs).borrow_mut();
         st.backlog = Some(cap);
@@ -1026,7 +1026,7 @@ pub(crate) fn clamp_backlog(backlog: i32) -> Option<usize> {
 /// NUL) with the same arm that refuses an empty path; and valid UTF-8,
 /// because the kernel's path vocabulary is `String`.
 pub(crate) fn sockaddr_un_path(raw: &[u8]) -> Result<String, isize> {
-    let einval = || Err(crate::syscall::err::EINVAL);
+    let einval = || Err(crate::err::EINVAL);
     if raw.len() < 3 || raw.len() > 2 + SUN_PATH_MAX {
         return einval();
     }
@@ -1041,7 +1041,7 @@ pub(crate) fn sockaddr_un_path(raw: &[u8]) -> Result<String, isize> {
         // path); this kernel's path keys are `String`s with a length, so
         // the same 108-byte name can be taken whole.
         None => {
-            let name = core::str::from_utf8(body).map_err(|_| crate::syscall::err::EINVAL)?;
+            let name = core::str::from_utf8(body).map_err(|_| crate::err::EINVAL)?;
             return Ok(name.to_string());
         }
     };
@@ -1051,7 +1051,7 @@ pub(crate) fn sockaddr_un_path(raw: &[u8]) -> Result<String, isize> {
     if end == 0 {
         return einval(); // the abstract namespace, refused (module header)
     }
-    let name = core::str::from_utf8(&body[..end]).map_err(|_| crate::syscall::err::EINVAL)?;
+    let name = core::str::from_utf8(&body[..end]).map_err(|_| crate::err::EINVAL)?;
     Ok(name.to_string())
 }
 
@@ -1071,7 +1071,7 @@ use alloc::vec::Vec;
 // The syscall faces: bind's node, the address writer
 // ---------------------------------------------------------------------------
 
-use crate::syscall::err;
+use crate::err;
 
 /// Plant the filesystem half of a bind, then record the table half.
 ///
@@ -1096,7 +1096,7 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
     let cwd = crate::sched::current_cwd();
     let parent = match crate::vfs::resolve_opt(parent_path, Some(cwd)) {
         Ok(dir) => dir,
-        Err(e) => return crate::syscall::err_of(e),
+        Err(e) => return crate::uaccess::err_of(e),
     };
     // The last component must be free, whatever kind of thing occupies it
     // (Linux refuses both a live socket and a plain file under the name);
@@ -1105,13 +1105,13 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
         return err::EADDRINUSE;
     }
     if let Err(e) = crate::vfs::may_create_in(&parent) {
-        return crate::syscall::err_of(e);
+        return crate::uaccess::err_of(e);
     }
     let node = match parent.create(name, NodeKind::Socket) {
         Ok(created) => created,
         Err(VfsError::Exists) => return err::EADDRINUSE,
         Err(VfsError::Unsupported) => return err::EOPNOTSUPP,
-        Err(e) => return crate::syscall::err_of(e),
+        Err(e) => return crate::uaccess::err_of(e),
     };
     node.set_mode(0o755);
     let key = (
@@ -1160,7 +1160,7 @@ pub(crate) fn write_named(path: &str, addr_ptr: usize, len_ptr: usize) -> isize 
     if len_ptr == 0 {
         return err::EFAULT;
     }
-    if !crate::syscall::buffer_ok(len_ptr, 4, true, true) {
+    if !crate::uaccess::buffer_ok(len_ptr, 4, true, true) {
         return err::EFAULT;
     }
     let want = unsafe { (len_ptr as *const u32).read_unaligned() } as usize;
@@ -1169,7 +1169,7 @@ pub(crate) fn write_named(path: &str, addr_ptr: usize, len_ptr: usize) -> isize 
     // whole answer. A nonzero `addrlen` with a null pointer is the caller
     // breaking their own word - EFAULT, the man page's.
     if want > 0 {
-        if addr_ptr == 0 || !crate::syscall::buffer_ok(addr_ptr, want, true, true) {
+        if addr_ptr == 0 || !crate::uaccess::buffer_ok(addr_ptr, want, true, true) {
             return err::EFAULT;
         }
         let n = bytes.len().min(want);
@@ -1192,7 +1192,7 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
     let cwd = crate::sched::current_cwd();
     let node = match crate::vfs::resolve_opt(path, Some(cwd)) {
         Ok(node) => node,
-        Err(e) => return crate::syscall::err_of(e),
+        Err(e) => return crate::uaccess::err_of(e),
     };
     if node.metadata().kind != NodeKind::Socket {
         return err::ECONNREFUSED;
@@ -1201,7 +1201,7 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
     // anyone is listening; the order only shows to a caller that has
     // neither, and the permission first is the man page's.
     if let Err(e) = crate::vfs::may_access(&node, crate::vfs::W_OK) {
-        return crate::syscall::err_of(e);
+        return crate::uaccess::err_of(e);
     }
     // Already connected sockets cannot connect again.
     if sock.end_of().is_some() || sock.dgram_connected() {
@@ -1246,7 +1246,7 @@ pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&str>) -> is
             let cwd = crate::sched::current_cwd();
             let node = match crate::vfs::resolve_opt(path, Some(cwd)) {
                 Ok(node) => node,
-                Err(e) => return crate::syscall::err_of(e),
+                Err(e) => return crate::uaccess::err_of(e),
             };
             if node.metadata().kind != NodeKind::Socket {
                 return err::ECONNREFUSED;

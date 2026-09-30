@@ -119,27 +119,31 @@ leak into the image `cargo xtask run` boots.
 
 ### Current verification state (as of this commit)
 
-**Two programs are red; the state below is the measured run, quoted from its own
-summary line.**
+**Nothing is red. The state below is the measured run, quoted from its own summary line.**
 
-- Host unit tests: `566 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
-  plus `29 passed` from `mpos-xtask`. Measured on this tree. (The `t-sync` `[[bin]]` entry
-  that an in-flight edit had dropped is restored, so the guest gate builds and runs it
-  from current sources rather than riding a stale artifact.)
-- The guest suite reached `=== SUMMARY pass=131 fail=2` (133 built) with QEMU exit code 33.
-  The read-path reconciliation landed: `t-tty-vtime`, `t-tty-eintr` and `t-tty-query` all
-  print `=== PASS`, as do `t-timer-create`, `t-signalfd` and `t-signal-delivery`.
-  The two red programs are both **new pins of this commit's own work**, not old
-  regressions:
-  - `t-dsp` — `/dev/dsp` does not open (`EBADF`/`ENOENT` cascade over every ioctl and the
-    `chmod`): the sound driver's dsp node is not actually registered in the booted
-    machine, so the node work and its test have to be reconciled before `PLAN.md`'s
-    dsp entry can claim anything.
-  - `t-dhcp` — the DHCPDISCOVER goes out whole through `AF_PACKET`, but no BOOTREPLY
-    comes back within five seconds. Whether that is this kernel's tap or slirp's timing
-    is not yet measured; `t-netlat` was green in the same run, so the single-red-as-load
-    excuse does not cover it.
-  Both are red *here* and must not be reported as passing anywhere until re-run.
+- Host unit tests: `570 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
+  plus `29 passed` from `mpos-xtask`. Measured on this tree.
+- The guest suite reached `=== SUMMARY pass=136 fail=0` (136 built) with QEMU exit code 33.
+  The ABI-honesty batch is green in the booted machine: `t-prctl`, `t-times`, `t-priority`,
+  `t-fadvise`, `t-evdev`, `t-ioctl`, `t-openat`, `t-statx`, `t-truncate`, `t-rseq` and
+  `t-posix` all print `=== PASS`, and so do the two programs that were the gate's standing red
+  baseline for the whole of Phase 12:
+  - `t-dsp` — was red because the sound driver looked for the wrong PCI ID (`0x1055`; the card is
+    `0x1059`), so `/dev/dsp` was never registered, and then panicked the kernel on its first
+    write because the driver handed a **user** address to the DMA mapping. Both fixed
+    (`PLAN.md` §12.4a). The boot line is now
+    `virtio-sound: 44100 Hz, 2 channels at /dev/dsp`.
+  - `t-dhcp` — was red because the *test* built a malformed DISCOVER (IPv4 destination written at
+    the UDP port offset, BOOTP magic cookie 28 bytes early), so slirp correctly ignored it. The
+    kernel's `AF_PACKET` receive path was never at fault, and no assertion was relaxed to get
+    here.
+- One thing this tree got wrong and the host suite could not see: `VfsError::Revoked` was
+  added for `EVIOCREVOKE` and mapped in one `err_of`, but the `err_of` the machine builds is
+  the *other*, `#[cfg(target_os = "none")]` one, and it was left non-exhaustive — so
+  `cargo build --target x86_64-unknown-none` failed while `cargo test` was green. Fixed by
+  mapping `Revoked` to `ENODEV` in the machine arm. This is `ARCHITECTURE.md` V-11's trap in
+  its plainest form: when a module has a host body and a machine body, both move or the
+  change does not build. Run the bare-metal target on every pass, not only the host suite.
 
 The standing rule is unchanged: never report "tests pass" from a stale run. Re-run the gate,
 and quote the summary line and the exit code it printed — or say plainly that it did not get
@@ -256,14 +260,14 @@ boundary violation.
 | `sched/` | Task table, priority bands, sleep/block, signals, futex | `mm`, `arch`, `binfmt` | host another subsystem's per-process cleanup (V-3) |
 | `mm/` | Buddy frames, slab heap, mapping plans, ELF loader | `boot` | know files, tasks or devices |
 | `arch/` | GDT/IDT, PIC/LAPIC, paging, context switch, syscall gate, timer, ports | `mm` (via its own re-exports only) | be named from outside `arch::` — `arch/mod.rs` re-exports the uniform surface |
-| `console/` | Log ring, serial, framebuffer switch, the six virtual consoles | `arch` | reach into `vfs::term` for the grid (V-4) |
+| `console/` | Log ring, serial, framebuffer switch, the six virtual consoles | `arch`, `boot` (the boot-supplied console list) | reach into `vfs::term` for the grid (V-4) |
 | `net/` | smoltcp, socket registry, AF_INET/UNIX/NETLINK/VSOCK | `drivers`, `sched`, `uevent` | validate user pointers with `syscall::buffer_ok` (V-9) |
 | `drivers/` | virtio, DRM/KMS, render task, evdev/uinput, PCI config, serial, RTC | `mm`, `pci`, `sched` | call back into `syscall` (V-5) or parse ioctl ABI (V-2) |
-| Services — `blk`, `pci`, `rand`, `uevent`, `binfmt`, `date`, `logging`, `sync`, `evdev`, `uinput`, `seccomp` | One concern each, pure logic, host-compiled where possible | each other and `arch` as drawn | accumulate state that makes them a layer |
+| Services — `blk`, `pci`, `rand`, `uevent`, `binfmt`, `date`, `logging`, `sync`, `evdev`, `uinput`, `seccomp`, `err` | One concern each, pure logic, host-compiled where possible. `err` is the errno table: the leaf every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
 
 Two rules make the table usable rather than decorative:
 
-1. **An existing violation is not precedent.** §9's V-1…V-5 and V-9 are edges
+1. **An existing violation is not precedent.** §9's V-1…V-5, V-9 and V-13 are edges
    that are real today and are being removed in Phase 11. Code may not add a
    *new* caller along a violation edge, and may not widen one; working around
    a violation is how it stays removable.
@@ -443,6 +447,7 @@ is no shared crate between them by design. Change all three, and keep the loader
 | A `net/*` host test does not run | `src/lib.rs` gates the whole `net` module on `target_os = "none"`; `net/socket.rs`'s test module is annotated for the host and is consequently unreachable |
 | Something in `user/staging/` looks like a missing test | It is deliberate scratch space; check `user/abitest` and `user/tests` for the live version first |
 | `build-test/` contains scripts and logs from past debugging sessions | Scratch. Do not build on them, do not commit them (they are gitignored as `/build*`) |
+| Two `cargo xtask test` runs in one tree report nonsense | They share `build/test-initramfs.tar`, `build/test-esp` and `build/test-serial.log`, so one run reads a log the other is still writing and counts the programs it cannot see as failed. The measured symptom is a harness line like "115 of 136 did not pass" beside a serial log that ends `=== SUMMARY pass=134 fail=2`. Trust the log's own summary line and `=== END`, and re-run alone; the same collision can flash a transient compile error in a file nobody touched |
 
 ---
 

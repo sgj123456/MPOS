@@ -186,6 +186,13 @@ pub enum VfsError {
     /// all - POSIX's answer, and the one a shell reads as "job control off"
     /// rather than as a terminal it does not own.
     NoDevice,
+    /// ENODEV: the descriptor's access to its device has been revoked. An
+    /// evdev file description on which `EVIOCREVOKE` was asked is dead to its
+    /// reader - every later `read` and `ioctl` answers `ENODEV` - which is
+    /// Linux's `evdev_read`/`evdev_ioctl` behaviour for a client carrying the
+    /// revoke bit, and the seat mechanism that retakes a device from a
+    /// compositor that no longer owns it.
+    Revoked,
     /// ENOTCONN: an operation that needs a connection found none. The
     /// listening and unnamed ends of an AF_UNIX socket read through the
     /// file door answer this - Linux's `read(2)` on a socket that is not
@@ -1294,6 +1301,28 @@ mod tests {
             &vfs.resolve_from("link", here.clone()).unwrap(),
             &here.lookup("f").unwrap()
         ));
+        // A *dangling* link is the case that decides whether the no-follow walk
+        // is honest: `lstat` of it answers the link, not `ENOENT` for its missing
+        // target, and `open(..., O_NOFOLLOW)` answers `ELOOP` rather than
+        // following into a target that is not there. Both hang on this walk
+        // looking the last name up without ever reading its target - measured on
+        // Linux, where `stat(symlink, AT_SYMLINK_NOFOLLOW)` on
+        // `slink -> /does-not-exist` succeeds and reports `S_IFLNK`.
+        let dangling = here.symlink("gone", "/nowhere").unwrap();
+        assert_eq!(
+            dangling.metadata().kind,
+            NodeKind::Symlink,
+            "the no-follow walk must reach the link, not its absent target"
+        );
+        assert!(Arc::ptr_eq(
+            &vfs.resolve_no_follow("gone", here.clone()).unwrap(),
+            &dangling
+        ));
+        // The following walk is the one that refuses, exactly as `stat(2)` does.
+        assert_eq!(
+            vfs.resolve_from("gone", here.clone()).err(),
+            Some(VfsError::NoEntry)
+        );
         assert_eq!(
             vfs.resolve_no_follow("missing", root).err(),
             Some(VfsError::NoEntry)

@@ -295,9 +295,11 @@ pub const GETRLIMIT: u64 = 97;
 pub const SETRLIMIT: u64 = 160;
 /// `pselect6(2)`: `select` with a signal mask and a nanosecond timeout.
 pub const PSELECT6: u64 = 270;
-/// `fadvise64(2)`: a hint about future access. Nothing here prefetches, so
-/// every advice is accepted and ignored - which is what Linux does for the
-/// advice it does not act on.
+/// `fadvise64(2)`: a hint about future access. This kernel prefetches nothing,
+/// so a *recognised* advice is accepted and ignored (best-effort, no observable
+/// promise) - but the vocabulary is closed: an advice past `NOREUSE`, an
+/// unopened descriptor and a pipe are refused with `EINVAL`/`EBADF`/`ESPIPE`,
+/// exactly as Linux answers them (measured). See `handle_fadvise64`.
 pub const FADVISE64: u64 = 221;
 /// `get_robust_list(2)`: the read half of the robust-futex list. Threads
 /// are not implemented, so there is no list to hand back.

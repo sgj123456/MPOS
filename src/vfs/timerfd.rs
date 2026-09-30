@@ -95,7 +95,7 @@ pub fn clock_ok(clockid: usize) -> bool {
 /// every timespec-carrying call validates it.
 pub fn ticks_of_timespec(sec: u64, nsec: u64, hz: u64) -> Result<u64, isize> {
     if nsec >= 1_000_000_000 {
-        return Err(crate::syscall::err::EINVAL);
+        return Err(crate::err::EINVAL);
     }
     // Saturation is the shape of an honest timer: a caller that named more
     // nanoseconds than a tick count can hold asked for a very long wait,
@@ -454,7 +454,7 @@ mod tests {
         TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET, TimerFd, cancel_on_clock_set, clock_ok,
         ticks_of_timespec, timespec_of_ticks,
     };
-    use crate::syscall::err;
+    use crate::err;
     use crate::vfs::{Inode, VfsError};
 
     /// The flags, clockids and layout are the ABI, pinned against the

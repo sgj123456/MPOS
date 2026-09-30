@@ -183,6 +183,165 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EINVAL,
     );
 
+    // EVIOCSFF / EVIOCRMFF / EVIOCSKEYCODE / EVIOCGKEYCODE - the per-device
+    // capability refusals. Measured on real Linux: an evdev node with no
+    // force-feedback answers `ENOSYS` to the FF requests (evdev keys them on
+    // `test_bit(EV_FF)`), and a node with no per-device keycodes array answers
+    // `EINVAL` to the keycode get and set. This machine's virtio nodes carry
+    // neither, so those are the answers here. The counterfactual is the point:
+    // the kernel used to return `0` to all four - success for an effect queued
+    // and a key remapped that nothing actually stored, the §4.2 violation. The
+    // FF refusal rests on the device's own `EV_FF` picture (the code bitmap,
+    // empty below); EVIOCGKEYCODE and its `_V2` share command number 0x04 and
+    // both take the same refusal, as do the two keymap-set spellings.
+    let mut ffbit = [0u8; 8];
+    let _ = eviocgbit(fd, 0x15 /* EV_FF */, &mut ffbit);
+    lin::check_true(
+        &mut failed,
+        b"the keyboard advertises no EV_FF codes (why FF is refused)",
+        ffbit.iter().all(|&b| b == 0),
+    );
+    let mut ff_effect = [0u8; 48];
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCSFF on a device with no force-feedback is ENOSYS",
+        lin::ioctl(
+            fd,
+            ioc(IOC_WRITE, 0x80, ff_effect.len()),
+            ff_effect.as_mut_ptr() as usize,
+        ),
+        lin::ENOSYS,
+    );
+    let mut effect_id = 0i32;
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCRMFF is ENOSYS too",
+        lin::ioctl(
+            fd,
+            ioc(IOC_WRITE, 0x81, 4),
+            &mut effect_id as *mut i32 as usize,
+        ),
+        lin::ENOSYS,
+    );
+    let mut keypair = [0u32; 2];
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCSKEYCODE on a node with no keycodes array is EINVAL",
+        lin::ioctl(fd, ioc(IOC_WRITE, 0x04, 8), keypair.as_mut_ptr() as usize),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCGKEYCODE is EINVAL, not a zeroed success",
+        lin::ioctl(fd, ioc(IOC_READ, 0x04, 8), keypair.as_mut_ptr() as usize),
+        lin::EINVAL,
+    );
+
+    // EVIOCGREP / EVIOCSREP: the key repeat, now a stored per-device value
+    // guarded on EV_REP (measured Linux: a device that advertises it returns
+    // its real (delay, period), one that does not answers ENOSYS - never the
+    // old zeroed-buffer success). The set-then-get round-trip is the
+    // counterfactual: previously EVIOCSREP fell through to ENOTTY and
+    // EVIOCGREP answered give(&[]) leaving the caller's two ints untouched,
+    // so nothing here could store or report a value.
+    const EV_REP_BIT: usize = 0x14; // 20, byte 2 bit 4 of the type bitmap
+    let advertises_rep = types[EV_REP_BIT / 8] & (1 << (EV_REP_BIT % 8)) != 0;
+    if advertises_rep {
+        let mut rep = [0u32; 2];
+        lin::check_eq(
+            &mut failed,
+            b"EVIOCGREP on an EV_REP device succeeds",
+            lin::ioctl(fd, ioc(IOC_READ, 0x03, 8), rep.as_mut_ptr() as usize),
+            0,
+        );
+        lin::check_true(
+            &mut failed,
+            b"and reports a real (delay, period)",
+            rep[0] > 0 && rep[1] > 0,
+        );
+        let set = [600u32, 50u32];
+        lin::check_eq(
+            &mut failed,
+            b"EVIOCSREP stores the repeat",
+            lin::ioctl(fd, ioc(IOC_WRITE, 0x03, 8), set.as_ptr() as usize),
+            0,
+        );
+        let mut back = [0u32; 2];
+        lin::check_eq(
+            &mut failed,
+            b"and EVIOCGREP reads it back",
+            lin::ioctl(fd, ioc(IOC_READ, 0x03, 8), back.as_mut_ptr() as usize),
+            0,
+        );
+        lin::check_true(
+            &mut failed,
+            b"the round-trip carries what was set",
+            back[0] == 600 && back[1] == 50,
+        );
+    } else {
+        let mut rep = [0u32; 2];
+        lin::check_eq(
+            &mut failed,
+            b"EVIOCGREP on a device without EV_REP is ENOSYS",
+            lin::ioctl(fd, ioc(IOC_READ, 0x03, 8), rep.as_mut_ptr() as usize),
+            lin::ENOSYS,
+        );
+    }
+
+    // EVIOCGKEY/LED/SND/SW: the pressed/switch-state getters. Measured on real
+    // Linux: each copies `min(len, bitmap_bytes)` current-state bytes AND
+    // returns that count (KEY bitmap = 96, LED/SND/SW = 8) - never a bare 0 with
+    // nothing written. Nothing is held down during a sweep, so the picture is
+    // zeros of that length. The old arm answered `give(&[])`: success (0) with
+    // the caller's buffer left as-is. Filling the buffers with a sentinel and
+    // requiring the count plus the overwrite is the counterfactual.
+    let mut keystate = [0xAAu8; 128];
+    let r = lin::ioctl(
+        fd,
+        ioc(IOC_READ, 0x18, keystate.len()),
+        keystate.as_mut_ptr() as usize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCGKEY returns the key bitmap size (96), not a bare 0",
+        r,
+        96,
+    );
+    lin::check_true(
+        &mut failed,
+        b"and the key state reads as all-released (zero), not the sentinel",
+        keystate[..96].iter().all(|&b| b == 0),
+    );
+    // A buffer shorter than the bitmap is filled short - the returned count is
+    // `min(len, bitmap)`, which is how a caller sizes its own read.
+    let mut short = [0xAAu8; 8];
+    lin::check_eq(
+        &mut failed,
+        b"a short EVIOCGKEY buffer is filled to its own length",
+        lin::ioctl(
+            fd,
+            ioc(IOC_READ, 0x18, short.len()),
+            short.as_mut_ptr() as usize,
+        ),
+        8,
+    );
+    let mut sw = [0xAAu8; 64];
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCGSW returns its 8-byte switch bitmap",
+        lin::ioctl(fd, ioc(IOC_READ, 0x1b, sw.len()), sw.as_mut_ptr() as usize),
+        8,
+    );
+    // EVIOCGMTSLOTS: measured EINVAL on a node without multi-touch, and no evdev
+    // node here is a multitouch device. The old arm answered 0 (give(&[])).
+    let mut mt = [0u8; 8];
+    lin::check_eq(
+        &mut failed,
+        b"EVIOCGMTSLOTS on a non-multitouch node is EINVAL",
+        lin::ioctl(fd, ioc(IOC_READ, 0x0a, mt.len()), mt.as_mut_ptr() as usize),
+        lin::EINVAL,
+    );
+
     // EVIOCGRAB - the seat claim, and who it belongs to. A grab is one
     // descriptor's claim on the device, so a second *independent* open of the
     // same node contends with it (`EBUSY`, the answer a compositor must be able
@@ -675,6 +834,74 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
                 &mut failed,
                 b"but the next record is the other reader's",
                 readable(second),
+            );
+
+            // --- EVIOCREVOKE: take the device back from a reader ---
+            //
+            // The seat mechanism. Per Linux's own `evdev.c` (`case EVIOCREVOKE:
+            // if (p) return -EINVAL; else return evdev_revoke(...)`), the
+            // argument must be NULL - any non-NULL pointer is `EINVAL` - and the
+            // request revokes this description. It is one-way: there is no ioctl
+            // to give the descriptor back (the caller closes and reopens), so a
+            // revoked description calling `EVIOCREVOKE(NULL)` again is just the
+            // idempotent revoke (`0`), never a restore. Once revoked, every read
+            // and every other ioctl on the descriptor answers `ENODEV` - only
+            // `EVIOCREVOKE` itself still gets through. A revoked read returns at
+            // once (not a park), so this is safe on a blocking descriptor.
+            //
+            // The old pins here asserted the wrong shape - that arg `1` revoked
+            // and arg `0` *restored* - which a correct `ioctl(fd, EVIOCREVOKE,
+            // NULL)` (arg `0`) contradicts: on Linux that revokes, not restores.
+            // The test changed with the source measurement, not the code (rule 1's
+            // exception), because the pin had encoded a divergence from Linux.
+            let revoke = |fd: i32, arg: usize| lin::ioctl(fd, ioc(IOC_WRITE, 0x91, 4), arg);
+            // The revoke target is `second` (a reader of its own that the rest
+            // of the sweep no longer needs un-revoked); the destroyed-device
+            // end-of-input check below still runs on `synth`, which this leaves
+            // readable. Revocation is one-way and per-client, exactly as Linux.
+            lin::check_eq(
+                &mut failed,
+                b"EVIOCREVOKE(NULL) revokes the descriptor",
+                revoke(second, 0),
+                0,
+            );
+            let mut dead = [0u8; RECORD];
+            lin::check_eq(
+                &mut failed,
+                b"a read of a revoked descriptor is ENODEV",
+                lin::read(second, &mut dead),
+                lin::ENODEV,
+            );
+            let mut v = 0i32;
+            lin::check_eq(
+                &mut failed,
+                b"and any other ioctl on it is ENODEV too",
+                lin::ioctl(second, ioc(IOC_READ, 0x01, 4), &mut v as *mut i32 as usize),
+                lin::ENODEV,
+            );
+            // A non-NULL arg is refused - the `_IOW(..., int)` shape takes no
+            // value, Linux demands NULL.
+            lin::check_eq(
+                &mut failed,
+                b"EVIOCREVOKE with a non-NULL argument is EINVAL",
+                revoke(second, 1),
+                lin::EINVAL,
+            );
+            // And it is one-way: the descriptor stays revoked (the idempotent
+            // NULL revoke answers `0`; a later read is still `ENODEV`). There is
+            // no restore - that is exactly the difference from the old model.
+            lin::check_eq(
+                &mut failed,
+                b"EVIOCREVOKE(NULL) again is an idempotent 0, not a restore",
+                revoke(second, 0),
+                0,
+            );
+            let mut v2 = 0i32;
+            lin::check_eq(
+                &mut failed,
+                b"the descriptor is still revoked - there is no reverse ioctl",
+                lin::ioctl(second, ioc(IOC_READ, 0x01, 4), &mut v2 as *mut i32 as usize),
+                lin::ENODEV,
             );
 
             // Destroying the device takes it away from the name and ends the

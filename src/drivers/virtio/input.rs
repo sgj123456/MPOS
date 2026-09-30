@@ -29,7 +29,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use critical_section::Mutex;
 use virtio_drivers::device::input::{AbsInfo, VirtIOInput};
@@ -198,6 +198,14 @@ pub struct EvdevNode {
     /// empty poll: no repaint, no timers, and the next device in the
     /// enumeration never added.
     nonblocking: AtomicBool,
+    /// The key repeat the device reports through `EVIOCGREP` and remembers from
+    /// `EVIOCSREP`, in milliseconds - delay then period. Linux's input core
+    /// defaults these to `250` and `33` (`REP_DELAY`/`REP_PERIOD`), measured
+    /// here on a real keyboard's `EVIOCGREP`; a device that advertises `EV_REP`
+    /// answers with them and stores what a caller sets, rather than the
+    /// zeroed-buffer false-success this node used to hand back.
+    rep_delay: AtomicU32,
+    rep_period: AtomicU32,
     /// The node's mode and owner, kept so `chmod`/`chown` - udev's
     /// `MODE=0660 GROUP=input` among them - stick and are what `stat` and the
     /// permission checks read (see `crate::vfs::devfs::NodePerms`).
@@ -220,6 +228,8 @@ impl EvdevNode {
             records: Mutex::new(RefCell::new(Records::new())),
             caps,
             nonblocking: AtomicBool::new(false),
+            rep_delay: AtomicU32::new(250),
+            rep_period: AtomicU32::new(33),
             perms: crate::vfs::devfs::NodePerms::new(0o666, 0, 0),
         })
     }
@@ -291,6 +301,33 @@ impl EvdevNode {
         &self.caps.prop_bits
     }
 
+    /// Whether the device advertises event type `evtype` in its own type
+    /// picture - the same bit `EVIOCGBIT(EV_SYN)` exposes. Linux keys several
+    /// ioctls' support on exactly this (`test_bit(EV_FF, ...)` for force
+    /// feedback, `EV_REP` for the repeat rate), so the answer belongs here, on
+    /// the device, not to a guess in the syscall layer.
+    pub fn supports_type(&self, evtype: u8) -> bool {
+        self.caps
+            .type_bits
+            .get(evtype as usize / 8)
+            .is_some_and(|byte| byte & (1u8 << (evtype % 8)) != 0)
+    }
+
+    /// The repeat `EVIOCGREP` reports: `(delay, period)` in milliseconds.
+    pub fn repeat(&self) -> (u32, u32) {
+        (
+            self.rep_delay.load(Ordering::Relaxed),
+            self.rep_period.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `EVIOCSREP`: store the repeat a caller set, so the next `EVIOCGREP`
+    /// reads it back - the round-trip Linux's input core provides.
+    pub fn set_repeat(&self, delay: u32, period: u32) {
+        self.rep_delay.store(delay, Ordering::Relaxed);
+        self.rep_period.store(period, Ordering::Relaxed);
+    }
+
     /// Whether some description currently holds the device.
     pub fn is_grabbed(&self) -> bool {
         self.grab_owner() != 0
@@ -329,6 +366,302 @@ impl EvdevNode {
     /// it never saw.
     pub fn forget(&self, ofd: u64) {
         with_records(&self.records, |records| records.forget(ofd));
+    }
+
+    /// Revoke (`on`) or restore this description's access to the device -
+    /// `EVIOCREVOKE`. A revoke must also break a reader parked in `read`, so the
+    /// waits belonging to `ofd` are woken outside the lock, exactly as
+    /// [`EvdevNode::close`] wakes them when the device goes away.
+    pub fn eviorevoke(&self, ofd: u64, on: bool) {
+        let waiting = with_records(&self.records, |records| {
+            records.set_revoked(ofd, on);
+            records.waiters_of(ofd)
+        });
+        for id in waiting {
+            crate::sched::wake(id);
+        }
+    }
+
+    /// Whether this description's access has been revoked: the read and ioctl
+    /// paths turn the fact into `ENODEV`.
+    pub fn is_revoked(&self, ofd: u64) -> bool {
+        with_records(&self.records, |records| records.is_revoked(ofd))
+    }
+
+    /// Serve one of this evdev node's `'E'`-typed ioctls. The ABI layer has
+    /// already resolved the descriptor to this node and checked the request's
+    /// magic byte, so `request & 0xff` is the command number and the `_IOC`
+    /// word's size/direction fields drive the buffer copies. This is Linux's
+    /// `evdev_unlocked_ioctl`: the device - not the syscall switchboard - owns
+    /// its request vocabulary and answers every read from its own state. It
+    /// reaches a caller's memory only through `crate::uaccess`, the same
+    /// leaf a driver validates a user pointer with (V-9, closed by B3).
+    pub fn ioctl(&self, ofd: u64, request: u32, buf: usize, from_user: bool) -> isize {
+        use crate::err;
+        use crate::uaccess::buffer_ok;
+        use core::mem::size_of;
+        let size = ((request >> 16) & 0x3fff) as usize;
+        let dir = (request >> 30) & 0x3;
+        let nr = request & 0xff;
+        // A revoked description answers `ENODEV` to every request it makes of
+        // the device from here on - Linux's `evdev` gates each op on
+        // `client->revoked` - with the single exception of `EVIOCREVOKE`
+        // itself, which stays serviceable (a revoked client calling it again is
+        // the idempotent revoke Linux allows; `EVIOCREVOKE` is one-way and
+        // there is no ioctl to reverse it).
+        if (dir, nr) != (1, 0x91) && self.is_revoked(ofd) {
+            return err::ENODEV;
+        }
+        // Copy `src` into the caller's read buffer, no more than it asked for.
+        let give = |src: &[u8]| -> isize {
+            let n = src.len().min(size);
+            if n == 0 {
+                return 0;
+            }
+            if !buffer_ok(buf, n, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr(), buf as *mut u8, n);
+            }
+            0
+        };
+        // A pressed/switch-state getter (`EVIOCGKEY`/`LED`/`SND`/`SW`): Linux
+        // copies `min(len, bitmap_bytes)` bytes of the current state - and
+        // returns *that count*, not `0` (measured: KEY=96, LED/SND/SW=8 at rest,
+        // on both a mouse and a keyboard, so the size is the global `<TYPE>_MAX`
+        // bitmap `BITS_TO_LONGS(MAX+1)*8`, not the device's used codes). This
+        // kernel keeps no pressed state, so the picture is that many zero bytes;
+        // the point of the count is that a caller learns the real bitmap size
+        // and a buffer shorter than it is filled short, exactly as on Linux -
+        // never the old `give(&[])` that answered success having written nothing.
+        let give_state = |bitmap_bytes: usize| -> isize {
+            let n = size.min(bitmap_bytes);
+            if n == 0 {
+                return 0;
+            }
+            if !buffer_ok(buf, n, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe {
+                core::ptr::write_bytes(buf as *mut u8, 0, n);
+            }
+            n as isize
+        };
+        match (dir, nr) {
+            // Reads.
+            (2, 0x01) => give(&1i32.to_ne_bytes()), // EVIOCGVERSION
+            (2, 0x02) => {
+                // EVIOCGID: struct input_id {u16 bustype,vendor,product,version}.
+                let id = self.id();
+                let mut b = [0u8; 8];
+                for (i, w) in id.iter().enumerate() {
+                    b[i * 2..i * 2 + 2].copy_from_slice(&w.to_ne_bytes());
+                }
+                give(&b)
+            }
+            (2, 0x06) => {
+                // EVIOCGNAME: the device's name for itself - the string the host
+                // filled the virtio device's config with, which is how an evdev
+                // reader tells a keyboard from a tablet without reading events.
+                // The request word carries the caller's buffer size in the `_IOC`
+                // size field, so the limit comes out of the request rather than
+                // being a separate argument.
+                //
+                // Three details are `strlcpy`'s, and they are what a caller has
+                // always been promised. The name is what stands before its *first*
+                // NUL: a device reports a C string, and the terminator the virtio
+                // config carries is not part of it. A size of zero is the length
+                // query, answered with the length and no copy. And the answer is
+                // that length *excluding* the terminating NUL even when the copy
+                // had to be cut short - which is how a caller with a buffer too
+                // small learns that the name did not fit.
+                let name = self.name().as_bytes();
+                let text = name.split(|&byte| byte == 0).next().unwrap_or(&[]);
+                if size == 0 {
+                    return text.len() as isize;
+                }
+                if !buffer_ok(buf, size, true, from_user) {
+                    return err::EFAULT;
+                }
+                let n = text.len().min(size - 1);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+                    (buf as *mut u8).add(n).write_volatile(0);
+                }
+                text.len() as isize
+            }
+            (2, 0x07) | (2, 0x08) => {
+                // EVIOCGPHYS/EVIOCGUNIQ: the device's physical path and its
+                // unique id. A virtio input device has neither - they are
+                // strings the kernel's input core fills from the driver, and
+                // none of them puts one here.
+                //
+                // The answer is `ENOENT`, not `ENOTTY`, and it has to be:
+                // libevdev's `libevdev_set_fd` tolerates a failure here only
+                // when errno is `ENOENT` ("uinput has no phys"), the way Linux's
+                // own `str_to_user` answers for a NULL attribute. An `ENOTTY`
+                // makes the whole read fatal, and the failure surfaces far from
+                // here: libinput gives up with "failed to create input device"
+                // for every node on the machine, and weston comes up with a
+                // screen and no keyboard.
+                err::ENOENT
+            }
+            (2, 0x09) => give(self.prop_bits()), // EVIOCGPROP
+            (2, 0x20..=0x3f) => {
+                // EVIOCGBIT(evtype): the supported-type or -code bitmap.
+                let mut tmp = [0u8; 64];
+                let n = self.eviocgbit((nr - 0x20) as u8, &mut tmp);
+                give(&tmp[..n])
+            }
+            (2, 0x40..=0x7f) => {
+                // EVIOCGABS(axis): struct input_absinfo, six ints.
+                match self.eviocgabs((nr - 0x40) as u8) {
+                    Some(a) => {
+                        let mut b = [0u8; 6 * size_of::<i32>()];
+                        for (i, v) in a.iter().enumerate() {
+                            b[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+                        }
+                        give(&b)
+                    }
+                    // An axis the device does not have is EINVAL, as Linux's
+                    // input_get_absinfo answers.
+                    None => err::EINVAL,
+                }
+            }
+            (2, 0x84) => give(&0i32.to_ne_bytes()), // EVIOCGEFFECTS
+            (2, 0x18) => give_state(96),            // EVIOCGKEY: BITS_TO_LONGS(KEY_MAX+1)*8
+            (2, 0x19) => give_state(8),             // EVIOCGLED
+            (2, 0x1a) => give_state(8),             // EVIOCGSND
+            (2, 0x1b) => give_state(8),             // EVIOCGSW
+            (2, 0x0a) => {
+                // EVIOCGMTSLOTS: the multi-touch slot values. Measured on a node
+                // without multi-touch this is `EINVAL`, and no evdev node here is
+                // a multitouch device (virtio-input's tablets are single-pointer,
+                // no `ABS_MT_SLOT`), so `EINVAL` is Linux's answer for these
+                // shapes. A real multi-touch node would return the per-slot value
+                // arrays - a device that does not exist here, so the request is
+                // refused, not faked with the old `give(&[])` success.
+                err::EINVAL
+            }
+            (2, 0x03) => {
+                // EVIOCGREP: the key repeat. Measured on real Linux: a device that
+                // advertises `EV_REP` returns its `(delay, period)` in ms - the
+                // input core's `250`/`33` by default - and one that does not
+                // answers `ENOSYS`. The node now stores the pair (defaulted to
+                // Linux's own values), so the get reports the device's real
+                // picture instead of the old `give(&[])`, which answered success
+                // while leaving the caller's two ints whatever memory held. The
+                // device's `EV_REP` bit is what the refusal rests on, exactly as
+                // `evdev` keys it.
+                if !self.supports_type(0x14 /* EV_REP */) {
+                    return err::ENOSYS;
+                }
+                let (delay, period) = self.repeat();
+                let mut b = [0u8; 8];
+                b[0..4].copy_from_slice(&delay.to_ne_bytes());
+                b[4..8].copy_from_slice(&period.to_ne_bytes());
+                give(&b)
+            }
+            (2, 0x04) => {
+                // EVIOCGKEYCODE / EVIOCGKEYCODE_V2: the current keymap entry.
+                // Measured on real Linux: a device with no input keycodes array
+                // answers `EINVAL`, a keyboard that has one returns the mapping.
+                // An evdev node here models no per-device keycodes array (the
+                // console keymap is compiled in, not reachable through the input
+                // device), which is the keymapless shape Linux refuses with
+                // `EINVAL`. The arm used to answer `give(&[])` - success while
+                // leaving the caller's struct untouched, the §4.2 false-success
+                // this removes.
+                err::EINVAL
+            }
+            // Writes.
+            (1, 0x90) => {
+                // EVIOCGRAB: claim the device for *this* open file description,
+                // and refuse a claim on a device somebody else holds with the
+                // `EBUSY` the man page spells. Keyed on the description because
+                // that is what makes the claim die with `close(2)` below rather
+                // than outliving it in whatever process happens to have the
+                // device open twice.
+                if size_of::<i32>() > size || !buffer_ok(buf, size_of::<i32>(), false, from_user) {
+                    return err::EINVAL;
+                }
+                let on = unsafe { (buf as *const i32).read_unaligned() } != 0;
+                if self.set_grab(on, ofd) {
+                    0
+                } else {
+                    err::EBUSY
+                }
+            }
+            (1, 0x91) => {
+                // EVIOCREVOKE. Per Linux's `evdev.c` - `case EVIOCREVOKE: if (p)
+                // return -EINVAL; else return evdev_revoke(...)` - the argument
+                // must be NULL: any non-NULL pointer is refused with `EINVAL`,
+                // and the request revokes this description. It is *one-way*:
+                // there is no ioctl to give the descriptor back (the caller
+                // closes and reopens), so a revoked description calling this
+                // again is just the idempotent revoke (`0`) - the entry check
+                // above keeps `EVIOCREVOKE` itself serviceable on a revoked fd
+                // for exactly that. Revoking is what makes the entry check bite:
+                // every later read and ioctl on this descriptor answers `ENODEV`,
+                // and a parked reader is woken - the seat mechanism that takes a
+                // device back from a reader that no longer owns it. The old arm
+                // read `arg` as a *value* (`1` revoke, `0` restore, `>1`
+                // `EINVAL`) - the wrong shape: a correct `ioctl(fd, EVIOCREVOKE,
+                // NULL)` (arg `0`) landed in the restore branch and did the
+                // opposite of what the caller asked, and there was a reversible
+                // state Linux never had.
+                if buf != 0 {
+                    return err::EINVAL;
+                }
+                self.eviorevoke(ofd, true);
+                0
+            }
+            (1, 0x80) | (1, 0x81) => {
+                // EVIOCSFF / EVIOCRMFF: queue or erase a force-feedback effect.
+                // Measured on real Linux (every device here): a node without
+                // `EV_FF` answers `ENOSYS` to both - `evdev` keys them on
+                // `test_bit(EV_FF)`. No evdev node on this machine advertises
+                // `EV_FF` (virtio-input and uinput carry no effect types here)
+                // and the kernel implements no effect store, so `ENOSYS` is
+                // Linux's answer for exactly this device shape. The old `0` told
+                // a caller an effect was queued when nothing was - success for a
+                // thing not done. The request is device-driven in the sense
+                // Linux means: the device's own `EV_FF` picture is what the
+                // refusal rests on.
+                err::ENOSYS
+            }
+            (1, 0x04) => {
+                // EVIOCSKEYCODE / EVIOCSKEYCODE_V2: remap one key. Measured: a
+                // device with no keycodes array answers `EINVAL`, a keyboard
+                // stores the mapping and returns `0`. An evdev node here has no
+                // per-device keycodes array (see the get above), so `EINVAL` is
+                // Linux's answer for the device's real shape; the old `0` claimed
+                // a remap no reader would ever observe. `EVIOCREVOKE` is no
+                // longer in this group - it is implemented above, because its
+                // revoke has one unambiguous shape.
+                err::EINVAL
+            }
+            (1, 0x03) => {
+                // EVIOCSREP: set the key repeat. Guarded on the device's `EV_REP`
+                // bit like the get (measured: `ENOSYS` where the device does not
+                // carry repeat). Linux reads the two ints out of the caller's
+                // buffer with `get_user`, so a bad pointer is `EFAULT` and a
+                // valid one is stored and answered `0` - the round-trip
+                // `EVIOCGREP` above then reports.
+                if !self.supports_type(0x14 /* EV_REP */) {
+                    return err::ENOSYS;
+                }
+                if !buffer_ok(buf, size_of::<u32>() * 2, false, from_user) {
+                    return err::EFAULT;
+                }
+                let delay = unsafe { (buf as *const u32).read_unaligned() };
+                let period = unsafe { (buf as *const u32).add(1).read_unaligned() };
+                self.set_repeat(delay, period);
+                0
+            }
+            _ => err::ENOTTY,
+        }
     }
 
     /// Whether a record is waiting for the client `ofd` right now.
@@ -503,6 +836,14 @@ impl Inode for EvdevNode {
     /// input: an event stream has no end.
     fn read_at_client(&self, _offset: u64, buf: &mut [u8], client: u64) -> VfsResult<usize> {
         loop {
+            // A revoked description is not at the end of input (the `closed()`
+            // branch below, which answers `0`); it has lost access outright, and
+            // every read answers `ENODEV` - Linux's `evdev_read` once the client
+            // carries the revoke bit. Checked first, because a revoked reader
+            // must not block waiting for records it can never be given.
+            if self.is_revoked(client) {
+                return Err(VfsError::Revoked);
+            }
             if with_records(&self.records, |records| records.closed()) {
                 // The device was taken away under this reader. An event stream
                 // with no device behind it is at its end, which is the
@@ -538,6 +879,7 @@ impl Inode for EvdevNode {
             self.subscribe(client, me);
             crate::sched::block_until(|| {
                 self.device_closed()
+                    || self.is_revoked(client)
                     || self.readable(client)
                     || crate::sched::has_deliverable_signal()
             });

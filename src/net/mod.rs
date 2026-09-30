@@ -821,10 +821,10 @@ pub(crate) fn packet_transmit(frame: &[u8]) -> Result<usize, isize> {
             if device.transmit(frame) {
                 Ok(frame.len())
             } else {
-                Err(crate::syscall::err::EIO)
+                Err(crate::err::EIO)
             }
         }
-        None => Err(crate::syscall::err::ENETDOWN),
+        None => Err(crate::err::ENETDOWN),
     }
 }
 
@@ -943,7 +943,7 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
     critical_section::with(|cs| {
         let mut net = NET.borrow(cs).borrow_mut();
         let Some(stack) = net.as_mut() else {
-            return Err(crate::syscall::err::ENETDOWN);
+            return Err(crate::err::ENETDOWN);
         };
         let owned = match (family, typ) {
             (socket::AF_INET, socket::SOCK_STREAM) => Channel::Tcp {
@@ -976,8 +976,8 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
             // family does not carry - SOCK_SEQPACKET over IPv4 - is
             // EPROTONOSUPPORT. A caller walking a getaddrinfo list uses
             // the first to skip to the next answer.
-            (socket::AF_INET, _) => return Err(crate::syscall::err::EPROTONOSUPPORT),
-            _ => return Err(crate::syscall::err::EAFNOSUPPORT),
+            (socket::AF_INET, _) => return Err(crate::err::EPROTONOSUPPORT),
+            _ => return Err(crate::err::EAFNOSUPPORT),
         };
         let entry = Entry {
             family,
@@ -1009,7 +1009,7 @@ pub(crate) fn adopt_socket(channel: Channel, typ: u16) -> Result<usize, isize> {
     critical_section::with(|cs| {
         let mut net = NET.borrow(cs).borrow_mut();
         let Some(stack) = net.as_mut() else {
-            return Err(crate::syscall::err::ENETDOWN);
+            return Err(crate::err::ENETDOWN);
         };
         let entry = Entry {
             family: socket::AF_INET,
@@ -1062,14 +1062,14 @@ pub(crate) fn tcp_listen(handle: usize, backlog: i32) -> Option<isize> {
                 handle,
                 local,
             } => (*home, *handle, *local),
-            _ => return crate::syscall::err::EOPNOTSUPP,
+            _ => return crate::err::EOPNOTSUPP,
         };
         // A socket that has already connected - or been shut down - is not
         // something `listen` can turn around; Linux answers `EINVAL`, and the
         // pool would have to be built on a socket carrying another
         // connection's state, which smoltcp cannot hand on.
         if !stack.tcp_is_closed(home, sock_handle) {
-            return crate::syscall::err::EINVAL;
+            return crate::err::EINVAL;
         }
         let endpoint = match local {
             Some(l) => l,
@@ -1391,16 +1391,16 @@ pub(crate) fn add_ipv4_addr(ip: [u8; 4], prefix: u8) -> Result<(), isize> {
         let mut rc = Ok(());
         st.eth.iface.update_ip_addrs(|addrs| {
             if addrs.contains(&cidr) {
-                rc = Err(crate::syscall::err::EEXIST);
+                rc = Err(crate::err::EEXIST);
                 return;
             }
             if addrs.push(cidr).is_err() {
-                rc = Err(crate::syscall::err::ENOBUFS);
+                rc = Err(crate::err::ENOBUFS);
             }
         });
         rc
     })
-    .unwrap_or(Err(crate::syscall::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV))
 }
 
 /// `ip addr del`: the local address itself names the entry, whatever prefix
@@ -1408,7 +1408,7 @@ pub(crate) fn add_ipv4_addr(ip: [u8; 4], prefix: u8) -> Result<(), isize> {
 /// `EADDRNOTAVAIL`.
 pub(crate) fn del_ipv4_addr(ip: [u8; 4]) -> Result<(), isize> {
     with_stack(|st| {
-        let mut rc = Err(crate::syscall::err::EADDRNOTAVAIL);
+        let mut rc = Err(crate::err::EADDRNOTAVAIL);
         st.eth.iface.update_ip_addrs(|addrs| {
             let hit = addrs.iter().position(|a| match a {
                 IpCidr::Ipv4(v4) => v4.address().octets() == ip,
@@ -1423,7 +1423,7 @@ pub(crate) fn del_ipv4_addr(ip: [u8; 4]) -> Result<(), isize> {
         });
         rc
     })
-    .unwrap_or(Err(crate::syscall::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV))
 }
 
 /// `ip route add`: a destination prefix and the router it leaves by. The
@@ -1442,7 +1442,7 @@ pub(crate) fn add_route(dst: [u8; 4], dst_len: u8, gateway: [u8; 4]) -> Result<(
         let mut rc = Ok(());
         st.eth.iface.routes_mut().update(|storage| {
             if storage.iter().any(|r| r.cidr == cidr) {
-                rc = Err(crate::syscall::err::EEXIST);
+                rc = Err(crate::err::EEXIST);
                 return;
             }
             let route = Route {
@@ -1452,12 +1452,12 @@ pub(crate) fn add_route(dst: [u8; 4], dst_len: u8, gateway: [u8; 4]) -> Result<(
                 expires_at: None,
             };
             if storage.push(route).is_err() {
-                rc = Err(crate::syscall::err::ENOBUFS);
+                rc = Err(crate::err::ENOBUFS);
             }
         });
         rc
     })
-    .unwrap_or(Err(crate::syscall::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV))
 }
 
 /// `ip route del`: the destination prefix names the route. No such route is
@@ -1469,7 +1469,7 @@ pub(crate) fn del_route(dst: [u8; 4], dst_len: u8) -> Result<(), isize> {
             IpAddress::Ipv4(Ipv4Address::new(dst[0], dst[1], dst[2], dst[3])),
             dst_len,
         );
-        let mut rc = Err(crate::syscall::err::ESRCH);
+        let mut rc = Err(crate::err::ESRCH);
         st.eth.iface.routes_mut().update(|storage| {
             if let Some(pos) = storage.iter().position(|r| r.cidr == want) {
                 storage.remove(pos);
@@ -1478,7 +1478,7 @@ pub(crate) fn del_route(dst: [u8; 4], dst_len: u8) -> Result<(), isize> {
         });
         rc
     })
-    .unwrap_or(Err(crate::syscall::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV))
 }
 
 /// `ip link set <dev> up|down`. Index 1 is the loopback, index 2 is eth0; each
@@ -1495,9 +1495,9 @@ pub(crate) fn set_link_up(index: u32, up: bool) -> Result<(), isize> {
             st.eth.up = up;
             Ok(())
         }
-        _ => Err(crate::syscall::err::ENODEV),
+        _ => Err(crate::err::ENODEV),
     })
-    .unwrap_or(Err(crate::syscall::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV))
 }
 
 /// `ip link set eth0 mtu N`. The floor is the smallest an IPv4 datagram can
@@ -1509,10 +1509,10 @@ pub(crate) fn set_mtu(mtu: u32) -> Result<(), isize> {
             st.eth.device.mtu = mtu as usize;
             Ok(())
         } else {
-            Err(crate::syscall::err::EINVAL)
+            Err(crate::err::EINVAL)
         }
     })
-    .unwrap_or(Err(crate::syscall::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV))
 }
 
 /// `ip link set eth0 name X`: one to fifteen bytes, and not the name the
@@ -1521,15 +1521,15 @@ pub(crate) fn set_mtu(mtu: u32) -> Result<(), isize> {
 pub(crate) fn set_eth_name(name: &str) -> Result<(), isize> {
     with_stack(|st| {
         if name.is_empty() || name.len() > 15 {
-            return Err(crate::syscall::err::EINVAL);
+            return Err(crate::err::EINVAL);
         }
         if name == "lo" {
-            return Err(crate::syscall::err::EEXIST);
+            return Err(crate::err::EEXIST);
         }
         st.eth_name = String::from(name);
         Ok(())
     })
-    .unwrap_or(Err(crate::syscall::err::ENODEV))
+    .unwrap_or(Err(crate::err::ENODEV))
 }
 
 /// What a descriptor on this socket could do right now, for `poll(2)`.

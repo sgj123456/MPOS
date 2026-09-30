@@ -177,7 +177,7 @@ pub fn wait_bitset(address: usize, expected: u32, bitset: u32, deadline: Option<
         unregister(address, current);
         // The errno constants are already negative: negating one here would
         // hand the caller +11 and turn "look again" into a nonsense success.
-        return crate::syscall::err::EAGAIN;
+        return crate::err::EAGAIN;
     }
 
     // The sleep names the deadline, not "never" when there is one: the
@@ -197,8 +197,8 @@ pub fn wait_bitset(address: usize, expected: u32, bitset: u32, deadline: Option<
     unregister(address, current);
     match woken {
         super::WaitEnd::Condition => 0,
-        super::WaitEnd::Deadline => crate::syscall::err::ETIMEDOUT,
-        super::WaitEnd::Interrupted => crate::syscall::err::EINTR,
+        super::WaitEnd::Deadline => crate::err::ETIMEDOUT,
+        super::WaitEnd::Interrupted => crate::err::EINTR,
     }
 }
 

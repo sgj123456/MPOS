@@ -41,7 +41,20 @@ use crate::syscall::linux::abi::{
 };
 
 /// The modern device ID; virtio-sound never had a legacy form.
-const DEVICE_SOUND: &[u16] = &[0x1055];
+///
+/// `0x1040 + VIRTIO_ID_SOUND`, and `VIRTIO_ID_SOUND` is **25** (`/usr/include/
+/// linux/virtio_ids.h`), so the ID is `0x1059` - confirmed against the machine
+/// this kernel boots on, where QEMU's `info pci` lists the card QEMU creates for
+/// `-device virtio-sound-pci` as `1af4:1059`.
+///
+/// It used to read `0x1055`, which is device 21 and names no sound card. The
+/// lookup therefore never matched, `init` took its `Probe::Absent` path - which
+/// stays silent, because a machine with no card is a quieter boot, not a failed
+/// one - and `/dev/dsp` was never registered. Every OSS call then answered
+/// `ENOENT`/`EBADF` and the whole of `t-dsp` went red while the driver itself was
+/// fine. A wrong ID on the *absent* branch is invisible by construction: the
+/// bug's only trace is the device that never appears.
+const DEVICE_SOUND: &[u16] = &[0x1059];
 
 /// One period of audio, and the buffer the device holds behind the stream.
 /// Four KiB is a quarter second of S16 stereo at 44100 Hz - long enough that
@@ -87,6 +100,23 @@ pub struct VirtioSnd {
     /// is always little-endian S16 in this driver - the one format the
     /// device was required to have at probe - so it needs no half here.
     params: Mutex<RefCell<(u32, u8)>>,
+    /// The DMA-able staging buffer, one period of bytes, allocated once at
+    /// probe from the kernel's own heap.
+    ///
+    /// It exists because `write(2)` hands the driver a slice of the *caller's*
+    /// memory (`handle_write` builds it straight over the user buffer), and the
+    /// virtio crate turns a buffer's address into an address the device can
+    /// read with `mm::virt_to_phys` (`drivers::virtio::hal`) - which is only
+    /// defined on the direct map. Feeding it a user address is a kernel panic
+    /// that ends the machine, and that is exactly what the first real `/dev/dsp`
+    /// write did once the card was found. So the bytes are copied here, and the
+    /// address handed to the device is always the kernel's.
+    ///
+    /// This is also Linux's shape: ALSA's dsp write path `copy_from_user`s into
+    /// the DMA ring rather than mapping the caller's pages. The copy is one
+    /// period at a time, so its size is a constant of this driver and not a
+    /// number the caller steers.
+    stage: Mutex<RefCell<Vec<u8>>>,
 }
 
 impl VirtioSnd {
@@ -94,15 +124,27 @@ impl VirtioSnd {
     /// once the device has consumed all of it. A refusal is a short write:
     /// the `CharDevice` contract counts bytes, and a caller that sent ten
     /// and hears "six" knows to try again for the rest.
+    ///
+    /// `buf` is the caller's memory, so no byte of it goes to the device
+    /// directly: each piece is copied into `stage` first, and `stage`'s address
+    /// is the one the crate hands to the DMA path. See [`VirtioSnd::stage`].
     fn play(&self, buf: &[u8]) -> usize {
-        critical_section::with(|cs| {
-            let mut device = self.device.borrow(cs).borrow_mut();
-            if device.pcm_xfer(self.stream, buf).is_ok() {
-                buf.len()
-            } else {
-                0
+        let period = PERIOD_BYTES as usize;
+        let mut sent = 0;
+        while sent < buf.len() {
+            let want = (buf.len() - sent).min(period);
+            let accepted = critical_section::with(|cs| {
+                let mut stage = self.stage.borrow(cs).borrow_mut();
+                stage[..want].copy_from_slice(&buf[sent..sent + want]);
+                let mut device = self.device.borrow(cs).borrow_mut();
+                device.pcm_xfer(self.stream, &stage[..want]).is_ok()
+            });
+            if !accepted {
+                break;
             }
-        })
+            sent += want;
+        }
+        sent
     }
 
     /// The rate and channel count the stream runs at right now - what a
@@ -119,13 +161,13 @@ impl VirtioSnd {
     /// stream is left running its old ones.
     fn configure(&self, rate: u32, channels: u8) -> Result<(u32, u8), isize> {
         let Some(actual) = oss_round_rate(rate, &self.rates) else {
-            return Err(crate::syscall::err::EINVAL);
+            return Err(crate::err::EINVAL);
         };
         if self.format() == (actual, channels) {
             return Ok((actual, channels));
         }
         if channels < self.ch_min || channels > self.ch_max {
-            return Err(crate::syscall::err::EINVAL);
+            return Err(crate::err::EINVAL);
         }
         critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
@@ -158,7 +200,7 @@ impl VirtioSnd {
                 Ok((actual, channels))
             } else {
                 let _ = apply(old.0, old.1);
-                Err(crate::syscall::err::EINVAL)
+                Err(crate::err::EINVAL)
             }
         })
     }
@@ -247,6 +289,7 @@ impl VirtioSnd {
             ch_min,
             ch_max,
             params: Mutex::new(RefCell::new((rate, channels))),
+            stage: Mutex::new(RefCell::new(alloc::vec![0u8; PERIOD_BYTES as usize])),
         }))
     }
 }
@@ -376,7 +419,7 @@ impl crate::vfs::devfs::CharDevice for DspDev {
             // family itself reserves for a parameter it will not take, and
             // each is named in `PLAN.md` with what it would need.
             SNDCTL_DSP_SUBDIVIDE | SNDCTL_DSP_SETFRAGMENT | SNDCTL_DSP_NONBLOCK => {
-                Some(crate::syscall::err::EINVAL)
+                Some(crate::err::EINVAL)
             }
             SNDCTL_DSP_SPEED => {
                 let want = read_int(arg);
@@ -399,7 +442,7 @@ impl crate::vfs::devfs::CharDevice for DspDev {
                 let channels: u8 = match want {
                     0 => 1,
                     1 => 2,
-                    _ => return Some(crate::syscall::err::EINVAL),
+                    _ => return Some(crate::err::EINVAL),
                 };
                 match self.0.configure(rate, channels) {
                     Ok(_) => {
@@ -417,7 +460,7 @@ impl crate::vfs::devfs::CharDevice for DspDev {
                     return Some(0);
                 }
                 if want > u8::MAX as i32 {
-                    return Some(crate::syscall::err::EINVAL);
+                    return Some(crate::err::EINVAL);
                 }
                 match self.0.configure(rate, want as u8) {
                     Ok((_, actual)) => {
@@ -444,7 +487,7 @@ impl crate::vfs::devfs::CharDevice for DspDev {
                     // caller's number is left alone - what OSS answers zero
                     // for, this kernel will not paper over with a success.
                     write_int(arg, 0);
-                    Some(crate::syscall::err::EINVAL)
+                    Some(crate::err::EINVAL)
                 }
             }
             SNDCTL_DSP_GETFMTS => {

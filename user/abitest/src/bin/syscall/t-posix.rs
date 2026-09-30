@@ -307,6 +307,48 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EINVAL,
     );
 
+    // sched_setscheduler/sched_setparam validate the SCHED_OTHER priority,
+    // which the policy's band fixes at zero. Measured on a real host: passing
+    // a nonzero priority for SCHED_OTHER is EINVAL, and this kernel used to
+    // answer 0 while dropping it - the accept-and-drop this pass removes.
+    let prio_zero = 0i32;
+    let prio_five = 5i32;
+    let prio_seven = 7i32;
+    lin::check_eq(
+        &mut failed,
+        b"sched_setscheduler(SCHED_OTHER, prio 0) succeeds",
+        lin::sched_setscheduler(0, 0, &raw const prio_zero),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"sched_setscheduler(SCHED_OTHER, prio 5) is EINVAL",
+        lin::sched_setscheduler(0, 0, &raw const prio_five),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"sched_setparam(prio 0) succeeds",
+        lin::sched_setparam(0, &raw const prio_zero),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"sched_setparam(prio 7) is EINVAL",
+        lin::sched_setparam(0, &raw const prio_seven),
+        lin::EINVAL,
+    );
+    // The task is still at the priority it was: a refused set left nothing in
+    // force, so getparam answers 0 after the EINVAL above.
+    prio = -1;
+    lin::check_eq(
+        &mut failed,
+        b"sched_getparam still answers 0 after the refused sets",
+        lin::sched_getparam(0, &raw mut prio),
+        0,
+    );
+    lin::check_eq(&mut failed, b"the priority is 0", prio as isize, 0);
+
     // The machine: one core, node zero, the default persona.
     let mut cpu = 99u32;
     let mut node = 99u32;
@@ -336,7 +378,18 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::personality(0x1000),
         lin::EINVAL,
     );
-    lin::check_eq(&mut failed, b"vhangup succeeds", lin::vhangup(), 0);
+    // vhangup: this program never acquired a controlling terminal with
+    // TIOCSCTTY, so `current->signal->tty` is none and Linux's
+    // `SYSCALL_DEFINE0(vhangup)` answers `ENOTTY`, not the `0` it reserves for
+    // hanging up a terminal that exists. The old pin asserted `0` — that was
+    // mpos's unconditional success, not Linux's answer for a caller with no
+    // terminal to hang up, so it is corrected here to the measured `ENOTTY`.
+    lin::check_eq(
+        &mut failed,
+        b"vhangup answers ENOTTY with no controlling terminal",
+        lin::vhangup(),
+        lin::ENOTTY,
+    );
 
     // seccomp(2), as this kernel implements it (PLAN 8.2): STRICT latches
     // for real, FILTER installs a program, and the availability probe answers

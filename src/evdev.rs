@@ -130,6 +130,10 @@ struct Client {
     ofd: u64,
     /// The sequence number of the next record this client will read.
     pos: u64,
+    /// Whether `EVIOCREVOKE` has taken this description's access away. A
+    /// revoked client reads nothing and answers `ENODEV` - the device is gone
+    /// to it, though the descriptor itself stays open until its owner closes it.
+    revoked: bool,
 }
 
 /// The records one input device has produced, and the readers of them.
@@ -255,9 +259,12 @@ impl Records {
     /// While some description holds the grab, the records belong to it, and a
     /// reader that is not it is told nothing - not the grabber's records under
     /// another name, and not a false "not ready" that would be indistinguishable
-    /// from an idle device. It waits, which is what Linux does.
+    /// from an idle device. It waits, which is what Linux does. A description
+    /// whose access `EVIOCREVOKE` has revoked is excluded the same way: it reads
+    /// nothing and is never woken on a new record - the driver turns that state
+    /// into `ENODEV` via [`Records::is_revoked`] before this is even consulted.
     fn may_read(&self, ofd: u64) -> bool {
-        !self.closed && (self.grab == 0 || self.grab == ofd)
+        !self.closed && !self.is_revoked(ofd) && (self.grab == 0 || self.grab == ofd)
     }
 
     /// Take the device away. Nothing more will be pushed, and whoever is
@@ -270,6 +277,43 @@ impl Records {
     /// Whether the device has been taken away.
     pub fn closed(&self) -> bool {
         self.closed
+    }
+
+    /// Revoke (`on`) or restore a description's access to this device - the
+    /// `EVIOCREVOKE` seat mechanism. It marks the client for `ofd` (making one
+    /// if it has not read yet, since a revoke can arrive before any read), and
+    /// Linux never refuses it: the answer is always success once the shape is
+    /// right, so `true` is returned whatever.
+    pub fn set_revoked(&mut self, ofd: u64, on: bool) {
+        match self.clients.iter_mut().find(|c| c.ofd == ofd) {
+            Some(client) => client.revoked = on,
+            None => self.clients.push(Client {
+                ofd,
+                pos: self.window.start(),
+                revoked: on,
+            }),
+        }
+    }
+
+    /// Whether `ofd`'s access has been revoked - the fact the read and ioctl
+    /// paths turn into `ENODEV`.
+    pub fn is_revoked(&self, ofd: u64) -> bool {
+        self.clients
+            .iter()
+            .find(|c| c.ofd == ofd)
+            .is_some_and(|c| c.revoked)
+    }
+
+    /// Every wait parked on the client `ofd`, so the caller can wake them
+    /// outside the lock: a revoke must break a reader parked in `read`, the way
+    /// the device going away does, not leave it asleep on records it can no
+    /// longer see.
+    pub fn waiters_of(&self, ofd: u64) -> Vec<TaskId> {
+        self.waiters
+            .iter()
+            .filter(|&&(c, _)| c == ofd)
+            .map(|&(_, id)| id)
+            .collect()
     }
 
     /// Every registered wait, whichever client it belongs to.
@@ -288,7 +332,11 @@ impl Records {
             return client.pos;
         }
         let pos = self.window.start();
-        self.clients.push(Client { ofd, pos });
+        self.clients.push(Client {
+            ofd,
+            pos,
+            revoked: false,
+        });
         pos
     }
 
@@ -319,7 +367,11 @@ impl Records {
             Some(at) => at,
             None => {
                 let pos = self.window.start();
-                self.clients.push(Client { ofd, pos });
+                self.clients.push(Client {
+                    ofd,
+                    pos,
+                    revoked: false,
+                });
                 self.clients.len() - 1
             }
         };
@@ -392,6 +444,46 @@ mod tests {
         assert_eq!(drain(&mut records, 1), Some(vec![0, 1]));
         assert_eq!(drain(&mut records, 2), Some(vec![0, 1]));
         assert_eq!(drain(&mut records, 1), Some(vec![]));
+    }
+
+    /// `EVIOCREVOKE` takes a description's access away and gives it back. A
+    /// revoked client is not readable and reads nothing - not even a record that
+    /// arrives while it is revoked, which stays its own for when it is restored.
+    /// A revoke before the client has read still marks it, because Linux never
+    /// refuses the request once the argument is right.
+    #[test]
+    fn a_revoked_client_reads_nothing_until_it_is_revoked_back() {
+        let mut records = Records::new();
+        records.opened(1);
+        push(&mut records, &[7]);
+
+        assert!(
+            records.readable(1),
+            "a normal client with a record is readable"
+        );
+        assert_eq!(drain(&mut records, 1), Some(vec![7]));
+
+        records.set_revoked(1, true);
+        assert!(records.is_revoked(1), "the revoke is recorded");
+        push(&mut records, &[8]);
+        assert!(
+            !records.readable(1),
+            "a revoked client is not readable, even with a record waiting"
+        );
+        assert_eq!(
+            records.take(1, &mut [0u8; RECORD * 8]),
+            Some(0),
+            "and it takes nothing"
+        );
+
+        records.set_revoked(1, false);
+        assert!(!records.is_revoked(1), "un-revoking clears it");
+        assert!(records.readable(1), "a restored client reads again");
+        assert_eq!(
+            drain(&mut records, 1),
+            Some(vec![8]),
+            "the record that landed while it was revoked is still its own"
+        );
     }
 
     /// A description that appears after the events did has missed them, which is

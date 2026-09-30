@@ -468,16 +468,32 @@ pub fn handle_sched_setscheduler(args: [usize; ARG_COUNT], from_user: bool) -> i
     const SCHED_OTHER: usize = 0;
     const SCHED_FIFO: usize = 1;
     const SCHED_RR: usize = 2;
-    let (pid, policy) = (args[0] as isize, args[1]);
+    let (pid, policy, param) = (args[0] as isize, args[1], args[2]);
     if live_thread(pid).is_none() {
         return err::ESRCH;
     }
     match policy {
-        SCHED_OTHER => 0,
+        // SCHED_OTHER is this scheduler, so switching to it is the success it
+        // is on Linux - but only with the priority zero the policy's band
+        // allows. Measured on a real host: `sched_setscheduler(0, SCHED_OTHER,
+        // &{.sched_priority = 5})` answers `EINVAL`, the same answer
+        // `sched_setparam` gives for a nonzero priority. Returning `0` while
+        // ignoring the param was an accept-and-drop - a caller that set a
+        // priority and read `sched_getparam` to confirm it would have been
+        // handed a `0` that was never actually asked for. The `EFAULT`/range
+        // checks mirror `setparam` exactly.
+        SCHED_OTHER => {
+            if param == 0 || !buffer_ok(param, 4, false, from_user) {
+                return err::EFAULT;
+            }
+            if unsafe { (param as *const i32).read_unaligned() } != 0 {
+                return err::EINVAL;
+            }
+            0
+        }
         // The param is still validated for the refused policies, the same
         // way Linux validates before refusing with EPERM.
         SCHED_FIFO | SCHED_RR => {
-            let param = args[2];
             if param != 0 && !buffer_ok(param, 4, false, from_user) {
                 return err::EFAULT;
             }
@@ -552,9 +568,9 @@ pub fn handle_sched_rr_get_interval(args: [usize; ARG_COUNT], from_user: bool) -
 pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SCHED_ATTR_SIZE: usize = 48;
     let (pid, attr, flags) = (args[0] as isize, args[1], args[2]);
-    if live_thread(pid).is_none() {
+    let Some(target) = live_thread(pid) else {
         return err::ESRCH;
-    }
+    };
     if flags != 0 {
         return err::EINVAL;
     }
@@ -572,7 +588,20 @@ pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         return err::EINVAL;
     }
     match policy {
-        0 if (-20..=19).contains(&nice) => 0,
+        // SCHED_OTHER: apply the nice to the same per-task slot `setpriority`
+        // writes and `sched_getattr` reads, so the value is real and round-trips
+        // - B5's fix for `getpriority` applied to this modern door. Returning `0`
+        // while dropping the nice (as this arm used to) was the §4.2
+        // success-for-a-thing-not-done. The scheduler's bands stay the policy's,
+        // so the nice carries no weight effect here (the named sub-gap
+        // `setpriority` shares), but the stored value is honest.
+        0 if (-20..=19).contains(&nice) => {
+            if crate::sched::set_nice(target, nice) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
         0 => err::EINVAL,
         1..=6 => err::EOPNOTSUPP,
         _ => err::EINVAL,
@@ -581,14 +610,14 @@ pub fn handle_sched_setattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 
 /// `sched_getattr(pid, attr, size, flags)` — the attributes in force,
 /// written into the caller's struct up to the smaller of the two sizes.
-/// The answer is the 48-byte first version: SCHED_OTHER, nice zero,
-/// priority zero, no flags.
+/// The answer is the 48-byte first version: SCHED_OTHER, the task's real
+/// nice, priority zero, no flags.
 pub fn handle_sched_getattr(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SCHED_ATTR_SIZE: usize = 48;
     let (pid, attr, size, flags) = (args[0] as isize, args[1], args[2], args[3]);
-    if live_thread(pid).is_none() {
+    let Some(target) = live_thread(pid) else {
         return err::ESRCH;
-    }
+    };
     if flags != 0 {
         return err::EINVAL;
     }
@@ -598,10 +627,17 @@ pub fn handle_sched_getattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     if attr == 0 || !buffer_ok(attr, SCHED_ATTR_SIZE, true, from_user) {
         return err::EFAULT;
     }
+    // Read the task's real nice from the same per-task slot `setpriority` and
+    // `sched_setattr` write - not a hardcoded 0 - so a caller sees the value the
+    // kernel is actually running the task at. A hardcoded 0 was the same
+    // wrong-as-a-lie `getpriority` had before B5: it reported a number no matter
+    // what had been set.
+    let nice = crate::sched::nice_of(target).unwrap_or(0);
     unsafe {
         core::ptr::write_bytes(attr as *mut u8, 0, SCHED_ATTR_SIZE);
         (attr as *mut u32).write_unaligned(SCHED_ATTR_SIZE as u32);
         ((attr + 4) as *mut u32).write_unaligned(0); // policy: SCHED_OTHER
+        ((attr + 16) as *mut i32).write_unaligned(nice);
     }
     0
 }
@@ -610,38 +646,131 @@ pub fn handle_sched_getattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 ///
 /// The raw system call answers in the kernel's own 40..1 encoding - the
 /// man page's C-library/kernel differences note is explicit that the
-/// 20-nice translation is the wrapper's - so the value this hands back
-/// for the default nice is 20, and a caller that trusted the raw shape
-/// and one that trusted the wrapper's both read the same answer.
+/// `20-nice` translation is the wrapper's - so a task at nice 0 answers 20.
+/// Over a set (a process group, a user's processes) Linux reports the *highest
+/// priority*, i.e. the lowest nice, in the set, and `ESRCH` when the set is
+/// empty. Each nice is now a real per-task value that `setpriority` records, so
+/// a set-then-get round-trips instead of always reading 20.
 pub fn handle_getpriority(args: [usize; ARG_COUNT]) -> isize {
     const PRIO_PROCESS: usize = 0;
     const PRIO_PGRP: usize = 1;
     const PRIO_USER: usize = 2;
-    let (which, _who) = (args[0], args[1]);
-    if !matches!(which, PRIO_PROCESS | PRIO_PGRP | PRIO_USER) {
-        return err::EINVAL;
+    let (which, who) = (args[0], args[1]);
+    // Resolve the set to its live nice values; `None`/empty means no target.
+    let nices: Option<alloc::vec::Vec<i32>> = match which {
+        PRIO_PROCESS => {
+            let pid = if who == 0 {
+                crate::sched::current().0
+            } else {
+                who
+            };
+            crate::sched::nice_of(pid).map(|n| alloc::vec![n])
+        }
+        PRIO_PGRP => {
+            let pgid = if who == 0 {
+                crate::sched::pgid_of(crate::sched::current())
+            } else {
+                Some(crate::sched::TaskId(who))
+            };
+            pgid.map(|g| {
+                crate::sched::group_members(g)
+                    .into_iter()
+                    .filter_map(|id| crate::sched::nice_of(id.0))
+                    .collect::<alloc::vec::Vec<i32>>()
+            })
+        }
+        PRIO_USER => {
+            let ruid = if who == 0 {
+                crate::sched::current_identity().ruid
+            } else {
+                who as u32
+            };
+            let ns: alloc::vec::Vec<i32> = crate::sched::uid_members(ruid)
+                .into_iter()
+                .filter_map(|id| crate::sched::nice_of(id.0))
+                .collect();
+            if ns.is_empty() { None } else { Some(ns) }
+        }
+        _ => return err::EINVAL,
+    };
+    match nices {
+        // Highest priority in the set = lowest nice; Linux's raw encoding is
+        // `20 - nice`, so the lowest nice gives the largest answer.
+        Some(ns) if !ns.is_empty() => 20 - *ns.iter().min().unwrap_or(&0) as isize,
+        _ => err::ESRCH,
     }
-    20 - 0 // the kernel encoding of nice 0
 }
 
-/// `setpriority(which, who, prio)` — set the nice value. No nice is
-/// implemented - the scheduler's bands are its policy, and a caller cannot
-/// move a task between them - so the call is its validations and the
-/// success: `which` must be one of the three, and the value must be
-/// inside -20..19, the range the man page allows the unprivileged caller
-/// the lower half of and root all of.
+/// `setpriority(which, who, prio)` — set the nice value.
+///
+/// The nice is now stored on the task (the scheduler's priority *bands* remain
+/// its policy and a caller cannot move a task between them, so the value has no
+/// weight effect here - a named sub-gap), but the call is no longer a
+/// accept-and-drop: over `PRIO_PROCESS` it targets the caller (or the named
+/// process, `ESRCH` if it is gone), and over `PRIO_PGRP`/`PRIO_USER` it applies
+/// to every member, `ESRCH` when the set is empty. The `-20..19` range and the
+/// `which` validation are Linux's; the unprivileged-lowering rule is moot for
+/// this single-rooted kernel, which accepts the whole range.
 pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
     const PRIO_PROCESS: usize = 0;
     const PRIO_PGRP: usize = 1;
     const PRIO_USER: usize = 2;
-    let (which, _who, prio) = (args[0], args[1], args[2] as isize);
+    let (which, who, prio) = (args[0], args[1], args[2] as isize);
     if !matches!(which, PRIO_PROCESS | PRIO_PGRP | PRIO_USER) {
         return err::EINVAL;
     }
     if !(-20..=19).contains(&prio) {
         return err::EINVAL;
     }
-    0
+    let prio = prio as i32;
+    match which {
+        PRIO_PROCESS => {
+            let pid = if who == 0 {
+                crate::sched::current().0
+            } else {
+                who
+            };
+            // `set_nice` answers `false` when the process is gone (or was never
+            // there), which is Linux's `ESRCH` for `setpriority(PRIO_PROCESS,
+            // pid, ..)` on a pid that does not name a task.
+            if crate::sched::set_nice(pid, prio) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+        PRIO_PGRP => {
+            let pgid = if who == 0 {
+                crate::sched::pgid_of(crate::sched::current())
+            } else {
+                Some(crate::sched::TaskId(who))
+            };
+            let members = pgid.map(crate::sched::group_members).unwrap_or_default();
+            if members.is_empty() {
+                return err::ESRCH;
+            }
+            for id in members {
+                crate::sched::set_nice(id.0, prio);
+            }
+            0
+        }
+        _ => {
+            // PRIO_USER.
+            let ruid = if who == 0 {
+                crate::sched::current_identity().ruid
+            } else {
+                who as u32
+            };
+            let members = crate::sched::uid_members(ruid);
+            if members.is_empty() {
+                return err::ESRCH;
+            }
+            for id in members {
+                crate::sched::set_nice(id.0, prio);
+            }
+            0
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -791,12 +920,33 @@ pub fn handle_personality(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
-/// `vhangup()` — virtually hang up the controlling terminal. There is no
-/// controlling-terminal bookkeeping here to hang up, and the caller —
-/// root, which is the only caller the man page permits — is owed the
-/// success rather than a refusal about a model that does not exist.
+/// `vhangup()` — virtually hang up the controlling terminal.
+///
+/// Linux hangs up `current->signal->tty` and answers `0`; when the caller has
+/// no controlling terminal, `SYSCALL_DEFINE0(vhangup)` answers `-ENOTTY` — there
+/// is no terminal to hang up, and the success a caller who has none is not owed.
+/// That is the case a daemonised or headless caller (and every `t-*` program the
+/// self-test runs, none of which has acquired a terminal with `TIOCSCTTY`)
+/// reaches, so it is answered with the honest `ENOTTY` rather than a `0` that
+/// claims a hang-up this call never performed.
+///
+/// When a controlling terminal *does* exist this answers `EOPNOTSUPP`, not the
+/// `0` Linux would give after hanging the terminal up: the kernel keeps the
+/// controlling-terminal bookkeeping (`TIOCSCTTY` records one, `Task::ctty` holds
+/// it) but has no tty-layer operation that re-initialises the terminal and turns
+/// already-open descriptors into `EIO`. Returning the success anyway would be
+/// the §4.2 "silently did the thing you didn't do" this batch exists to remove;
+/// a refusal tells a logout/getty the truth - it then tears the terminal down by
+/// closing its own descriptors, which is what it does next regardless. The
+/// hang-up itself is `PLAN.md` §12.2 B4, a tty-layer feature. This branch is
+/// reached only by a caller that has acquired a terminal, which no headless
+/// self-test program does, so it is not gate-exercised - but a fake `0` is not
+/// made honest by being untested.
 pub fn handle_vhangup(_args: [usize; ARG_COUNT]) -> isize {
-    0
+    match crate::sched::controlling_tty_of_current() {
+        None => err::ENOTTY,
+        Some(_) => err::EOPNOTSUPP,
+    }
 }
 
 /// `getcpu(cpu, node, tcache)` — which processor and NUMA node the caller

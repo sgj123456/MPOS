@@ -35,7 +35,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let fd = lin::socket(lin::AF_INET as usize, lin::SOCK_DGRAM, 0) as i32;
-    lin::check_true(&mut failed, b"a UDP (AF_INET, SOCK_DGRAM) socket opens", fd >= 0);
+    lin::check_true(
+        &mut failed,
+        b"a UDP (AF_INET, SOCK_DGRAM) socket opens",
+        fd >= 0,
+    );
 
     let mut buf = [0u8; 16];
 

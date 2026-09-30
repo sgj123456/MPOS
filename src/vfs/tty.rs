@@ -1635,6 +1635,132 @@ impl Tty {
         crate::sched::pgid_of(id) == Some(pgid)
     }
 
+    /// Serve the console's `'K'`-typed (keyboard/display-mode) ioctls. The ABI
+    /// layer resolved the descriptor to this tty, read its console number, and
+    /// asked the card driver whether the caller holds the screen — that last
+    /// question stays in the syscall layer because the console (this vfs module)
+    /// must not reach up into `drivers`; `owns_card` is handed down. Everything
+    /// else — which mode a number selects, what the console stores, and which
+    /// requests this device declines — is the console's own to answer, so it
+    /// lives here on the device rather than in the syscall switchboard (V-2).
+    /// This is `Tty`'s `KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/
+    /// `KDGKBTYPE` serving, byte-for-byte the answers the switchboard gave, and
+    /// V-4 will carry it when the console moves out of the VFS into a driver.
+    #[cfg(target_os = "none")]
+    pub fn kd_ioctl(
+        &self,
+        vc: u32,
+        request: u32,
+        buf: usize,
+        from_user: bool,
+        owns_card: bool,
+    ) -> isize {
+        use crate::err;
+        use crate::uaccess::buffer_ok;
+        let nr = request & 0xff;
+        // The caller may change the keyboard mode if it is this console's own
+        // foreground job or root — the video mode additionally accepts the card's
+        // holder (`owns_card`, answered by the caller layer).
+        let owns_it =
+            self.is_foreground(crate::sched::current()) || crate::sched::current_is_root();
+        // KDSETMODE/KDSKBMODE are `_IO`: the int argument is the plain value the
+        // syscall layer handed over where `buf` is for these requests.
+        let arg = buf as i32;
+        match nr {
+            // KDSETMODE -> int argument: the console's video mode.
+            0x3a => {
+                if !(owns_card || owns_it) {
+                    return err::EPERM;
+                }
+                let mode = match arg as u32 {
+                    KD_TEXT | KD_GRAPHICS => arg as u32,
+                    // The two obsolete text modes, folded to the one they meant.
+                    2 | 3 => KD_TEXT,
+                    _ => return err::EINVAL,
+                };
+                if !crate::vfs::vcmux::set_kd_mode(vc, mode) {
+                    return err::EINVAL;
+                }
+                0
+            }
+            // KDGETMODE <- int: what that console's screen is doing.
+            0x3b => {
+                if !buffer_ok(buf, 4, true, from_user) {
+                    return err::EFAULT;
+                }
+                unsafe { (buf as *mut i32).write_unaligned(crate::vfs::vcmux::kd_mode(vc) as i32) };
+                0
+            }
+            // KDSKBMODE -> int: the keyboard's translation mode for this console.
+            // The keyboard belongs to the console's own session, so unlike the
+            // video mode this is not something the card's holder gets to say —
+            // which is exactly why `K_OFF` must never be the only way to stop a
+            // console reading the machine's keys.
+            0x45 => {
+                if !owns_it {
+                    return err::EPERM;
+                }
+                if !matches!(
+                    arg as u32,
+                    K_RAW | K_XLATE | K_MEDIUMRAW | K_UNICODE | K_OFF
+                ) {
+                    return err::EINVAL;
+                }
+                if !crate::vfs::vcmux::set_kb_mode(vc, arg as u32) {
+                    return err::EINVAL;
+                }
+                0
+            }
+            // KDGKBMODE <- int.
+            0x44 => {
+                if !buffer_ok(buf, 4, true, from_user) {
+                    return err::EFAULT;
+                }
+                unsafe { (buf as *mut i32).write_unaligned(crate::vfs::vcmux::kb_mode(vc) as i32) };
+                0
+            }
+            // KDGKBTYPE <- unsigned char: the keyboard model the console reports.
+            // A read — the caller hands a one-byte buffer expecting it filled —
+            // so it cannot fall through to the setter accept below, which would
+            // answer success while leaving that byte whatever the stack held.
+            // Linux's answer is the constant `KB_101`, its header noting "this is
+            // what we always answer" (`/usr/include/linux/kd.h`: the AT/ps2 model
+            // id the driver reports regardless of what is actually plugged in), so
+            // this kernel gives the same one.
+            0x33 => {
+                if !buffer_ok(buf, 1, true, from_user) {
+                    return err::EFAULT;
+                }
+                unsafe {
+                    (buf as *mut u8).write_unaligned(2 /* KB_101 */)
+                };
+                0
+            }
+            // The rest of the `K` family is PC-console state this kernel does not
+            // own: the LED lights (`KDGETLED`/`KDSETLED`) and flags
+            // (`KDGKBLED`/`KDSKBLED`), the speaker tone (`KDMKTONE`/`KIOCSOUND`),
+            // the video-plane iob and map/unmap (`KDADDIO`..`KDUNMAPDISP`), the
+            // font, colour-map and screen/scatter maps (`GIO_FONT`..`PIO_CMAP`),
+            // the meta-key handling and the keymap/diacritic tables
+            // (`KDGKBMETA`..`KDSKBDIACRUC`). There is no 8042 keyboard controller
+            // here, no loadable console font or keymap, and the screen belongs to
+            // DRM — so Linux's *reads* for these return live per-console state this
+            // kernel has nowhere to source, and its *writes* would take effect on
+            // hardware that is not present. The old catch-all returned `0` for all
+            // of them, the §4.2 success-for-a-thing-not-done in its worst shape.
+            // §4.4 says refuse what the machine cannot do: a number inside the `K`
+            // command block is a real console ioctl this device declines
+            // (`EOPNOTSUPP`), one outside it is not a console ioctl (`ENOTTY`).
+            _ => {
+                if matches!(nr, 0x2f..=0x71 | 0xfa..=0xfb) {
+                    err::EOPNOTSUPP
+                } else {
+                    err::ENOTTY
+                }
+            }
+        }
+    }
+
     /// The process group an interrupt would reach, if any.
     pub fn foreground(&self) -> Option<TaskId> {
         critical_section::with(|cs| *self.foreground.borrow(cs).borrow())

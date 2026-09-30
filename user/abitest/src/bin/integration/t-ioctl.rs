@@ -41,6 +41,9 @@ static mut TERMIOS: [u8; 64] = [0xFF; 64];
 /// The one-word answer slot for FIONREAD/RNDGETENTCNT, and the pool-info
 /// pair RNDADDENTROPY takes, and the nine ints of `struct rtc_time`.
 static mut WORD: i32 = -1;
+/// KDGKBTYPE's one-byte answer, seeded to a value no keyboard model uses so a
+/// read that answers 0 without filling it is caught rather than believed.
+static mut KBTYPE: u8 = 0xFF;
 static mut POOLINFO: [i32; 2] = [0; 2];
 static mut RTCTIME: [i32; 9] = [-1; 9];
 
@@ -52,9 +55,14 @@ static mut RTCTIME: [i32; 9] = [-1; 9];
 const FIONREAD: usize = 0x541B;
 const RNDGETENTCNT: usize = 0x8004_5200;
 const RNDADDENTROPY: usize = 0x4008_5202;
+const RNDZAPENTCNT: usize = 0x5204; // _IO('R', 0x04): no arg, no direction
 const RTC_RD_TIME: usize = 0x8024_7409;
 const RTC_SET_TIME: usize = 0x4024_740A;
 const FBIOGET_VSCREENINFO: usize = 0x4600;
+/// KDGKBTYPE: a `_IOR` over the console's 'K' family, one byte out - the
+/// keyboard model the console reports. `0x4B33` as `/usr/include/linux/kd.h`
+/// spells it (dir read, size 1, 'K' at bits 8..15, command 0x33).
+const KDGKBTYPE: usize = 0x4B33;
 /// The cell the kernel's console font draws: the framebuffer console *is*
 /// `/dev/tty0`'s emulator and its grid *is* that terminal's window, so the
 /// window in cells is the screen in pixels divided by this. `vfs/term` embeds
@@ -224,6 +232,57 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         0,
     );
 
+    // KDGKBTYPE on the console: a read that must *fill* the caller's byte, not
+    // just answer 0. Linux reports the constant KB_101 whatever is plugged in
+    // (kd.h: "this is what we always answer"). The buffer starts at 0xFF, so
+    // this also pins the false-success that used to live here: the request fell
+    // through to the console's setter accept, returning 0 with the byte left
+    // uninitialised - a keyboard model the reader would then act on.
+    let r = lin::ioctl(0, KDGKBTYPE, &raw mut KBTYPE as usize);
+    lin::check_eq(&mut failed, b"KDGKBTYPE on the console succeeds", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"KDGKBTYPE fills the byte with KB_101, not a stale stack value",
+        unsafe { *(&raw mut KBTYPE as *const u8) } as isize,
+        2,
+    );
+
+    // ---- The rest of the console `K` family is refused, not faked ----
+    //
+    // KDGETLED (0x31) is a READ of live LED state this kernel has no controller
+    // to source, and KDSETLED (0x32) a WRITE to hardware that is not present.
+    // Both used to fall through to `_ => 0`: the getter left the caller's int as
+    // stack garbage while claiming success (the KDGKBTYPE-style lie), the setter
+    // claimed an effect nothing performed. They are now EOPNOTSUPP - a real
+    // console ioctl this device declines. A number outside the 'K' command block
+    // (0x4B80, nr 0x80) is not a console ioctl at all and answers ENOTTY. All
+    // counterfactual against the old blanket 0. Serving these per-device is the
+    // Phase 11 B2 move.
+    const KDGETLED: usize = 0x4B31;
+    const KDSETLED: usize = 0x4B32;
+    const KD_UNKNOWN: usize = 0x4B80;
+    let r = lin::ioctl(0, KDGETLED, &raw mut KBTYPE as usize);
+    lin::check_eq(
+        &mut failed,
+        b"KDGETLED is refused EOPNOTSUPP, not 0 with a stale buffer",
+        r,
+        lin::EOPNOTSUPP,
+    );
+    let r = lin::ioctl(0, KDSETLED, 3);
+    lin::check_eq(
+        &mut failed,
+        b"KDSETLED is refused EOPNOTSUPP, not a fake success",
+        r,
+        lin::EOPNOTSUPP,
+    );
+    let r = lin::ioctl(0, KD_UNKNOWN, 0);
+    lin::check_eq(
+        &mut failed,
+        b"a 'K'-typed number outside the command block is ENOTTY",
+        r,
+        lin::ENOTTY,
+    );
+
     // ---- The entropy pool, as seedrng asks of it ----
     static URANDOM: [u8; 13] = *b"/dev/urandom\0";
     static RTC0: [u8; 10] = *b"/dev/rtc0\0";
@@ -257,6 +316,51 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     }
     let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut POOLINFO as usize);
     lin::check_eq(&mut failed, b"RNDADDENTROPY is accepted", r, 0);
+
+    // RNDZAPENTCNT: a privileged clear. This generator has no drainable entropy
+    // count, so it is refused EOPNOTSUPP rather than answered with the old `0`
+    // that claimed a clearing `RNDGETENTCNT` - still full - contradicted one
+    // moment later (§4.4: refuse what you cannot do, do not fake it).
+    let r = lin::ioctl(urandom as i32, RNDZAPENTCNT, 0);
+    lin::check_eq(
+        &mut failed,
+        b"RNDZAPENTCNT is refused EOPNOTSUPP, not a fake 0",
+        r,
+        lin::EOPNOTSUPP,
+    );
+
+    // The capability gate, measured on Linux: every mutating RND ioctl is EPERM
+    // without CAP_SYS_ADMIN (and EPERM comes *before* the buffer copy). Lower
+    // the effective user only - ruid and the saved id stay 0, so the privilege
+    // is reclaimable - and the RNDADDENTROPY that answered 0 just above now
+    // answers EPERM. That is the counterfactual: the old handler returned 0
+    // regardless of who asked.
+    lin::check_eq(
+        &mut failed,
+        b"setresuid lowers euid (ruid/saved stay 0)",
+        lin::setresuid(-1, 65534, -1),
+        0,
+    );
+    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut POOLINFO as usize);
+    lin::check_eq(
+        &mut failed,
+        b"RNDADDENTROPY without CAP_SYS_ADMIN is EPERM",
+        r,
+        lin::EPERM,
+    );
+    let r = lin::ioctl(urandom as i32, RNDZAPENTCNT, 0);
+    lin::check_eq(
+        &mut failed,
+        b"and RNDZAPENTCNT without the capability is EPERM",
+        r,
+        lin::EPERM,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"euid is restored to 0",
+        lin::setresuid(-1, 0, -1),
+        0,
+    );
 
     // A device that is not the pool refuses the pool's requests, and the
     // pool refuses the clock's - the families are keyed on the device, not

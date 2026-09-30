@@ -82,6 +82,33 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         0,
     );
 
+    // --- the advice vocabulary is closed, not a blanket accept ---
+    //
+    // Linux answers `EINVAL` for an advice number it does not name; a kernel
+    // that answers `0` for one is making a promise it was never asked to keep
+    // (§4.2), and this is the shape that used to be here. `5` is one of the
+    // retired `MADV_*` slots and `0xffff` is past the recognised block; both
+    // are rejected, while a real hint is still accepted - so the gate is the
+    // vocabulary, not a refusal of everything.
+    lin::check_eq(
+        &mut failed,
+        b"a retired advice number (5) answers EINVAL, not a silent 0",
+        lin::madvise(0x5000_2000, PAGE, 5),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"an advice past the block (0xffff) answers EINVAL",
+        lin::madvise(0x5000_2000, PAGE, 0xffff),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"a recognised hint (MADV_WILLNEED = 3) is still accepted",
+        lin::madvise(0x5000_2000, PAGE, 3),
+        0,
+    );
+
     // --- the private promise: a released page comes back zero ---
     let page = 0x5000_6000;
     lin::check_eq(

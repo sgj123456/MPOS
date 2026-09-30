@@ -33,7 +33,7 @@ use core::cell::RefCell;
 use critical_section::Mutex;
 
 use crate::drivers::virtio::vsock::VirtioVsock;
-use crate::syscall::err;
+use crate::err;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use virtio_drivers::device::socket::{VsockAddr, VsockEvent, VsockEventType};
 
@@ -818,8 +818,8 @@ pub fn peername(sock: &VsockSock) -> Option<(u32, u32)> {
 pub fn write_sockaddr_vm(ptr: usize, len_ptr: usize, cid: u32, port: u32) -> isize {
     if ptr == 0
         || len_ptr == 0
-        || !crate::syscall::buffer_ok(ptr, SOCKADDR_VM_LEN, true, true)
-        || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+        || !crate::uaccess::buffer_ok(ptr, SOCKADDR_VM_LEN, true, true)
+        || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
     {
         return err::EFAULT;
     }
@@ -841,7 +841,7 @@ pub fn parse_sockaddr_vm(ptr: usize, len: usize, from_user: bool) -> Result<(u32
     if ptr == 0 || len < SOCKADDR_VM_LEN {
         return Err(err::EINVAL);
     }
-    if !crate::syscall::buffer_ok(ptr, SOCKADDR_VM_LEN, false, from_user) {
+    if !crate::uaccess::buffer_ok(ptr, SOCKADDR_VM_LEN, false, from_user) {
         return Err(err::EFAULT);
     }
     let raw = unsafe { core::slice::from_raw_parts(ptr as *const u8, SOCKADDR_VM_LEN) };

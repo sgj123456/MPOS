@@ -144,6 +144,32 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EOPNOTSUPP,
     );
 
+    // The flag word is validated, not ignored: a bit outside the three `eventfd2`
+    // knows is `EINVAL`, refused before the descriptor is made. A kernel that
+    // accepted an unknown bit and did nothing with it told the caller it had the
+    // descriptor it asked for when it did not - the §4.2 false success.
+    lin::check_eq(
+        &mut failed,
+        b"an unknown eventfd flag bit is EINVAL",
+        lin::eventfd(0, 0x40),
+        lin::EINVAL,
+    );
+    // EFD_CLOEXEC actually sets close-on-exec - read it back, the way SFD_CLOEXEC
+    // is pinned. Silently dropping it would leak the descriptor across exec.
+    let cloexec = lin::eventfd(0, lin::EFD_CLOEXEC) as i32;
+    lin::check_true(
+        &mut failed,
+        b"eventfd(0, EFD_CLOEXEC) hands back a descriptor",
+        cloexec >= 0,
+    );
+    let fl = lin::fcntl(cloexec, lin::F_GETFD, 0);
+    lin::check_true(
+        &mut failed,
+        b"EFD_CLOEXEC is reflected in the descriptor's close-on-exec flag",
+        fl >= 0 && (fl as usize & lin::FD_CLOEXEC) != 0,
+    );
+    let _ = lin::close(cloexec);
+
     let _ = lin::close(fd);
     let _ = lin::close(start);
     lin::done(failed)

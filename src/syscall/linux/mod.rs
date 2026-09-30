@@ -330,7 +330,17 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::SCHED_SETAFFINITY => abi::handle_sched_setaffinity(args),
         nr::SCHED_GETAFFINITY => abi::handle_sched_getaffinity(args),
         nr::SET_ROBUST_LIST => abi::handle_set_robust_list(args),
-        nr::RSEQ => abi::handle_rseq(args),
+        // `RSEQ` deliberately has no arm: it falls through to the `_ => ENOSYS`
+        // below. The kernel does not carry the per-thread registration that
+        // maintaining `cpu_id`/`node_id`/`mm_cid` (and honouring
+        // `RSEQ_FLAG_UNREGISTER`) requires, so the honest answer is "not
+        // available" - which is exactly the fallback a libc that probes `rseq`
+        // and finds none is written to take. A former arm returned `0` for a
+        // well-formed registration without writing any field the ABI contract
+        // puts in the caller's block; §4.2 forbids that, and the caller it was
+        // written for (glibc) registers at length 33/alignment 64 on a current
+        // kernel, a shape that arm rejected anyway, so it honoured neither.
+        // Doing `rseq` for real is a named gap. See `PLAN.md` A6.
         nr::CLEANUP_AFTER_KTHREAD => 0,
 
         // --- the calls an ordinary libc reaches for ---
@@ -622,10 +632,16 @@ struct UserSigAction {
 /// bytes it happened to have there, which for a fresh process means sentinels,
 /// not `SIG_DFL`.
 ///
-/// The disposition is recorded per process and is not yet acted on: no
-/// handler is ever called, because no user frame is built for one. A signal
-/// still kills the process it lands on. What is stored is therefore read back
-/// verbatim rather than interpreted.
+/// The disposition is recorded per process and it *is* acted on: a caught
+/// signal builds an `rt_sigframe` and runs the handler on the task's return
+/// path (`signal::build_frame`), and a signal nobody catches or ignores takes
+/// its `default_action`. This used to read "no handler is ever called, because
+/// no user frame is built for one" - that stopped being true when signal
+/// delivery landed, and the handler-running path is what `t-signal-delivery`
+/// and `t-tty-eintr` now pin. What is recorded but not yet honoured is
+/// `SA_RESTART`: an interrupted call comes back `EINTR` rather than being
+/// re-run, named as a gap in `PLAN.md` §2.5. The stored `old` disposition is
+/// read back verbatim.
 #[cfg(target_os = "none")]
 fn sigaction(args: [usize; 6]) -> isize {
     let (sig, act, old) = (args[0], args[1], args[2]);

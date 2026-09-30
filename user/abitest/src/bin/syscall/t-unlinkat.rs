@@ -83,6 +83,38 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::ENOENT,
     );
 
+    // An unknown flag bit is EINVAL, and the name survives: Linux refuses a
+    // flag that is not AT_REMOVEDIR before it resolves anything. This kernel
+    // used to route only on AT_REMOVEDIR and silently accepted the rest, so a
+    // bogus flag removed the file anyway - the wrong shape of answer.
+    let fd = lin::openat(lin::AT_FDCWD, &FILE, O_CREAT | lin::O_RDWR, 0o644);
+    lin::check_true(
+        &mut failed,
+        b"creating the flag-test file opens it",
+        fd >= 0,
+    );
+    if fd >= 0 {
+        let _ = lin::close(fd as i32);
+    }
+    let r = lin::unlinkat(lin::AT_FDCWD, &FILE, 0x1000);
+    lin::check_eq(
+        &mut failed,
+        b"unlinkat with an unknown flag (0x1000) answers EINVAL",
+        r,
+        lin::EINVAL,
+    );
+    let r = lin::openat(lin::AT_FDCWD, &FILE, lin::O_RDONLY, 0);
+    lin::check_true(
+        &mut failed,
+        b"the refused unlink leaves the file in place",
+        r >= 0,
+    );
+    if r >= 0 {
+        let _ = lin::close(r as i32);
+    }
+    // A recognised flag still works, so the gate is not a blanket refusal.
+    let _ = lin::unlinkat(lin::AT_FDCWD, &FILE, 0);
+
     lin::done(failed)
 }
 

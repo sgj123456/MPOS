@@ -254,7 +254,7 @@ pub(crate) fn deliver(frame: &[u8]) {
 pub(crate) fn send(sock: &PacketSock, dst_mac: [u8; 6], payload: &[u8]) -> Result<usize, isize> {
     let mac = crate::net::packet_mac();
     let Some(mac) = mac else {
-        return Err(crate::syscall::err::ENETDOWN);
+        return Err(crate::err::ENETDOWN);
     };
     let mut frame = Vec::with_capacity(14 + payload.len());
     frame.extend_from_slice(&dst_mac);
@@ -329,8 +329,8 @@ pub(crate) fn parse_sll_from_user(
     len: usize,
     from_user: bool,
 ) -> Result<SockaddrLl, isize> {
-    use crate::syscall::err;
-    if len < SOCKADDR_LL_LEN || !crate::syscall::buffer_ok(ptr, len, false, from_user) {
+    use crate::err;
+    if len < SOCKADDR_LL_LEN || !crate::uaccess::buffer_ok(ptr, len, false, from_user) {
         return Err(err::EINVAL);
     }
     let mut raw = [0u8; SOCKADDR_LL_LEN];
@@ -345,11 +345,11 @@ pub(crate) fn parse_sll_from_user(
 /// `getsockname` on the socket: its `htons` protocol, eth0's index, and the
 /// device's own MAC.
 pub(crate) fn sockname(sock: &PacketSock, addr: usize, len_ptr: usize) -> isize {
-    use crate::syscall::err;
+    use crate::err;
     if addr == 0
         || len_ptr == 0
-        || !crate::syscall::buffer_ok(addr, SOCKADDR_LL_LEN, true, true)
-        || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+        || !crate::uaccess::buffer_ok(addr, SOCKADDR_LL_LEN, true, true)
+        || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
     {
         return err::EFAULT;
     }

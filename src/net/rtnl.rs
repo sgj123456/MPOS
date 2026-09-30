@@ -159,7 +159,7 @@ pub fn bind(handle: usize, requested: u32) -> isize {
                 .iter()
                 .any(|(h, s)| *h != handle && s.portid == requested)
         {
-            return crate::syscall::err::EADDRINUSE;
+            return crate::err::EADDRINUSE;
         }
         // Already named? Linux keeps the first binding. Unknown handle? The
         // second pass below misses it and says so.
@@ -179,7 +179,7 @@ pub fn bind(handle: usize, requested: u32) -> isize {
         };
         match table.iter_mut().find(|(h, _)| *h == handle) {
             Some((_, session)) => session.portid = pid,
-            None => return crate::syscall::err::EBADF,
+            None => return crate::err::EBADF,
         }
         0
     })
@@ -248,7 +248,7 @@ pub fn recv_blocking(handle: usize) -> Option<Vec<u8>> {
 /// answer so the caller can pair them.
 pub fn send(handle: usize, msg: &[u8]) -> isize {
     if msg.len() < 16 {
-        return crate::syscall::err::EINVAL;
+        return crate::err::EINVAL;
     }
     let ty = u16::from_le_bytes([msg[4], msg[5]]);
     let flags = u16::from_le_bytes([msg[6], msg[7]]);
@@ -443,24 +443,24 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             // `struct ifaddrmsg` is eight bytes: family, prefix, flags,
             // scope, then the interface index.
             let Some(body) = msg.get(16..) else {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             };
             if body.len() < 8 {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             if body[0] != AF_INET {
                 // The one family the stack speaks. IPv6 address requests
                 // would need the stack's IPv6 half, which is not built.
-                return crate::syscall::err::EAFNOSUPPORT;
+                return crate::err::EAFNOSUPPORT;
             }
             let index = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             if index != ETH_INDEX {
                 // `lo` holds one address and it is not this kernel's to
                 // change; any other index names no device at all.
                 return if index == LO_INDEX {
-                    crate::syscall::err::EOPNOTSUPP
+                    crate::err::EOPNOTSUPP
                 } else {
-                    crate::syscall::err::ENODEV
+                    crate::err::ENODEV
                 };
             }
             let mut addr = None;
@@ -475,22 +475,22 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 }
             });
             if !ok {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             let Some(addr) = addr else {
                 // No address to add is Linux's `EINVAL` ("invalid argument
                 // for a prefix with no address in it").
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             };
             let prefix = body[1];
             if prefix > 32 {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             let rc = crate::net::add_ipv4_addr(addr.to_be_bytes(), prefix);
             match rc {
                 Ok(()) => 0,
                 // `ip addr replace` is the caller settling its own conflict.
-                Err(e) if e == crate::syscall::err::EEXIST && flags & NLM_F_REPLACE != 0 => {
+                Err(e) if e == crate::err::EEXIST && flags & NLM_F_REPLACE != 0 => {
                     let _ = crate::net::del_ipv4_addr(addr.to_be_bytes());
                     crate::net::add_ipv4_addr(addr.to_be_bytes(), prefix)
                         .err()
@@ -501,20 +501,20 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
         }
         RTM_DELADDR => {
             let Some(body) = msg.get(16..) else {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             };
             if body.len() < 8 {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             if body[0] != AF_INET {
-                return crate::syscall::err::EAFNOSUPPORT;
+                return crate::err::EAFNOSUPPORT;
             }
             let index = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             if index != ETH_INDEX {
                 return if index == LO_INDEX {
-                    crate::syscall::err::EOPNOTSUPP
+                    crate::err::EOPNOTSUPP
                 } else {
-                    crate::syscall::err::ENODEV
+                    crate::err::ENODEV
                 };
             }
             let mut addr = None;
@@ -524,10 +524,10 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 }
             });
             if !ok {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             let Some(addr) = addr else {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             };
             match crate::net::del_ipv4_addr(addr.to_be_bytes()) {
                 Ok(()) => 0,
@@ -538,17 +538,17 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             // `struct rtmsg` is twelve bytes: family, dst_len, src_len, tos,
             // table, protocol, scope, type, then four bytes of flags.
             let Some(body) = msg.get(16..) else {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             };
             if body.len() < 12 {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             if body[0] != AF_INET {
-                return crate::syscall::err::EAFNOSUPPORT;
+                return crate::err::EAFNOSUPPORT;
             }
             let dst_len = body[1];
             if dst_len > 32 {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             let mut dst = 0u32;
             let mut gateway = None;
@@ -558,7 +558,7 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 _ => {}
             });
             if !ok {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             let Some(gateway) = gateway else {
                 // A route with no gateway names an on-link prefix - the
@@ -566,7 +566,7 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 // smoltcp's design, and a second spelling of it would be a
                 // route the stack cannot express. Linux accepts one; this
                 // kernel says what it means instead of pretending.
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             };
             // The destination is the network, not the address: the host
             // bits a caller left set are not part of the prefix, and
@@ -581,7 +581,7 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             let rc = crate::net::add_route(dst.to_be_bytes(), dst_len, gateway.to_be_bytes());
             match rc {
                 Ok(()) => 0,
-                Err(e) if e == crate::syscall::err::EEXIST && flags & NLM_F_REPLACE != 0 => {
+                Err(e) if e == crate::err::EEXIST && flags & NLM_F_REPLACE != 0 => {
                     let _ = crate::net::del_route(dst.to_be_bytes(), dst_len);
                     crate::net::add_route(dst.to_be_bytes(), dst_len, gateway.to_be_bytes())
                         .err()
@@ -592,17 +592,17 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
         }
         RTM_DELROUTE => {
             let Some(body) = msg.get(16..) else {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             };
             if body.len() < 12 {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             if body[0] != AF_INET {
-                return crate::syscall::err::EAFNOSUPPORT;
+                return crate::err::EAFNOSUPPORT;
             }
             let dst_len = body[1];
             if dst_len > 32 {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             let mut dst = 0u32;
             let ok = for_each_attr(body, 12, |ty, value| {
@@ -611,7 +611,7 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 }
             });
             if !ok {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             // No `RTA_DST` at all is the default route - the prefix of
             // length zero, which is what `ip route del default` sends.
@@ -629,18 +629,18 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             // `struct ifinfomsg` is sixteen bytes: family, two bytes of
             // padding, type, index, flags, change mask.
             let Some(body) = msg.get(16..) else {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             };
             if body.len() < 16 {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             let index = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             if index == 0 && flags & NLM_F_CREATE != 0 {
                 // `ip link add`: no device to create, and no way to pretend.
-                return crate::syscall::err::EOPNOTSUPP;
+                return crate::err::EOPNOTSUPP;
             }
             if index != LO_INDEX && index != ETH_INDEX {
-                return crate::syscall::err::ENODEV;
+                return crate::err::ENODEV;
             }
             let change = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
             let mut up: Option<bool> = None;
@@ -659,7 +659,7 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                 }
             });
             if !ok {
-                return crate::syscall::err::EINVAL;
+                return crate::err::EINVAL;
             }
             // The `ifi_change` mask is what says the request means its
             // flags: `ip link set eth0 down` sends flags with only IFF_UP
@@ -676,7 +676,7 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             }
             if let Some(mtu) = mtu {
                 if index != ETH_INDEX {
-                    return crate::syscall::err::EOPNOTSUPP;
+                    return crate::err::EOPNOTSUPP;
                 }
                 if let Err(e) = crate::net::set_mtu(mtu) {
                     return e;
@@ -684,10 +684,10 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             }
             if let Some(name) = name {
                 if index != ETH_INDEX {
-                    return crate::syscall::err::EOPNOTSUPP;
+                    return crate::err::EOPNOTSUPP;
                 }
                 let Ok(name) = core::str::from_utf8(&name) else {
-                    return crate::syscall::err::EINVAL;
+                    return crate::err::EINVAL;
                 };
                 if let Err(e) = crate::net::set_eth_name(name) {
                     return e;
@@ -695,8 +695,8 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             }
             0
         }
-        RTM_DELLINK => crate::syscall::err::EOPNOTSUPP,
-        _ => crate::syscall::err::EOPNOTSUPP,
+        RTM_DELLINK => crate::err::EOPNOTSUPP,
+        _ => crate::err::EOPNOTSUPP,
     }
 }
 

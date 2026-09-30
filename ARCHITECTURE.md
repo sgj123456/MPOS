@@ -121,7 +121,7 @@ flowchart TB
         RAND["rand<br/>ChaCha20"]
         UEVENT["uevent<br/>kobject events over netlink"]
         BOOTMOD["boot<br/>handoff record"]
-        BINFMT["binfmt · date · evdev · uinput · logging · sync"]
+        BINFMT["binfmt · date · evdev · uinput · logging · sync · err · uaccess"]
     end
 
     MAIN --> SYSCALL
@@ -183,11 +183,11 @@ today; §9 explains what they are.
 | Memory | `src/mm/` | Buddy frame allocator (order 0–12), slab heap (16–2048 B), mapping plans, the ELF64 loader | Know about files, tasks or devices |
 | Scheduler | `src/sched/` | The 64-slot task table, priority bands + round-robin, sleep/block deadlines, signal state, futex | Be the place where a subsystem's per-process cleanup lives (see V-3) |
 | VFS | `src/vfs/` | The `Inode`/`FileSystem` traits, mounts and path resolution, the fd table, every filesystem (ramfs, ext2/ext4, procfs, sysfs, devfs, devpts, p9, tmpfs), pipes, epoll, timerfd, eventfd, signalfd, inotify, locks, memfd/dmabuf | Contain the terminal emulator and the console mux (see V-4) |
-| Networking | `src/net/` | smoltcp integration, the socket registry and its handles, AF_INET/AF_UNIX/AF_NETLINK/AF_VSOCK, netlink route writes | Validate user pointers itself (it currently borrows `syscall::buffer_ok`) |
+| Networking | `src/net/` | smoltcp integration, the socket registry and its handles, AF_INET/AF_UNIX/AF_NETLINK/AF_VSOCK, netlink route writes | Reach up into `syscall` to validate a user pointer (it borrows the `crate::uaccess` leaf — see V-9, closed by B3) |
 | Drivers | `src/drivers/` | virtio (blk, net, gpu, input, console, rng, sound, 9p, vsock, MSI-X), DRM/KMS, the render task, evdev/uinput, PCI config space, the serial console, the RTC, the QEMU debug-exit port | Parse a device's ioctl ABI (that is `syscall/linux/fs.rs` today — see V-2) |
 | Console | `src/console.rs` | Log ring, serial output, the switch to the framebuffer, the six virtual consoles | Reach into `vfs::term` for the grid (see V-4) |
 | ABI | `src/syscall/` | Numbers (`nr.rs`), pure ABI facts and argument validation (`abi.rs`), the dispatch table, and the handlers (`fs.rs`, `proc.rs`, `posix.rs`) | Grow past the point where one file is a device-ioctl switchboard (see V-2) |
-| Services | `src/blk/`, `src/pci.rs`, `src/rand.rs`, `src/uevent.rs`, `src/binfmt.rs`, `src/date.rs`, `src/logging.rs`, `src/sync/` | One concern each, host-compiled where the logic is pure | — |
+| Services | `src/blk/`, `src/pci.rs`, `src/rand.rs`, `src/uevent.rs`, `src/binfmt.rs`, `src/date.rs`, `src/logging.rs`, `src/sync/`, `src/err.rs`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
 
 ---
 
@@ -332,6 +332,17 @@ Two notes on the table above, both of them about trusting a measured number:
   the count was one too high and the denominator was never defined. `PLAN.md` §11.0 now carries
   the re-measured figures and names what participates, so the number and its scope arrive
   together.
+- Re-measured at the AF_PACKET/sound landing (the commit that added V-13 and the `err` module),
+  the weights above are stale in both directions. **Gone:** `pci→drivers` (the only remaining
+  mention is a doc comment) and `evdev→vfs` — dropping `drivers↔pci` leaves 20 mutual pairs.
+  **Much wider than the rows say:** `drivers→vfs` is 72 refs across ten carrier files (the row
+  names two), `arch→sched` is 26, `syscall→console` is 6. **Real but never drawn in §2:**
+  `sched→seccomp` (12), `syscall→seccomp` (5), `console→boot` (1). **Removed by that commit:**
+  `uevent→syscall` (the errno table now lives at the crate root as `crate::err`, which cost
+  ~110 below-`syscall` constant refs their upward edge across `net`, `sched`, `vfs`, `uevent`
+  and `sound`) and `uevent→sched` (credentials are assembled by `net::socket::task_identity`,
+  an allowed edge, and `bind` takes the preferred port id as a parameter). The SCC verdict
+  stands: the remaining edges still make the module graph one component at this granularity.
 
 ---
 
@@ -402,24 +413,26 @@ a `cfg` that is always false.
 
 ## 9. Known layering violations
 
-Each item names the evidence and the plan item that addresses it. Nothing here has been fixed
-yet — this is the audit, and `PLAN.md` Phase 11 is the work list.
+Each item names the evidence and the plan item that addresses it. The `Done`/`Resolved` rows
+are items this table caught and later work closed; an *Open* or *Widened* row is live debt, and
+`PLAN.md` Phase 11 is the work list.
 
 | # | Violation | Evidence | Plan |
 |---|---|---|---|
 | V-1 | `Inode` downcasts to concrete devices and networks | `src/vfs/mod.rs:453–546` defines `as_fb`, `as_evdev`, `as_uinput`, `as_drm`, `as_vsock`, `as_unix` as default-`None` trait methods. Adding a device type means editing the VFS trait. **Widened by the in-flight AF_PACKET work: `as_packet` → `net::packet::PacketSock` joins the list** | Phase 11 B |
-| V-2 | Per-device ioctl ABI parsed in the syscall layer | `src/syscall/linux/fs.rs` (6 311 lines) switches on DRM (`:3751`), fbdev (`:3561`), RTC (`:3677`), uinput (`:4001`) and TTY request numbers | Phase 11 B |
+| V-2 | Per-device ioctl ABI parsed in the syscall layer | `src/syscall/linux/fs.rs` switches on fbdev/RTC/uinput and TTY request numbers. **Progress (B2):** the DRM (`'d`) family already routed to `drivers::drm::drm_ioctl`; B2 moved the **evdev (`'E`) family to `drivers::virtio::input::EvdevNode::ioctl`** and the **KD (`'K`) family to `vfs::tty::Tty::kd_ioctl`** — each device now owns its accept/reject vocabulary, fd-resolution kept at the syscall boundary. For `kd` the DRM `card_grabbed_by_current()` answer is handed *down* as an `owns_card` argument, so `vfs::tty` never names `drivers` (no new upward edge). Both guest-verified `pass=136 fail=0`. **Remaining:** the `'V'` (`vt_ioctl`) and uinput families still in `fs.rs` | Phase 11 B |
 | V-3 | The scheduler performs other subsystems' per-process cleanup | `sched/runtime.rs` calls `net::socket::close_sockets_at_exit`, `vfs::inotify::close_at_exit`, `drivers::virtio::input::close_at_exit`, `drivers::uinput::close_at_exit` on task exit | Phase 11 C |
 | V-4 | The terminal emulator and console mux live inside the VFS | `vfs/term/` holds the cell grid, keys and an embedded `vga8x16.bin` font; `vfs/vcmux.rs`, `vfs/pty.rs`, `vfs/tty.rs` (2 359 lines) implement the console; `console.rs` reaches *into* `vfs::term::with_screen` to render | Phase 11 D |
-| V-5 | A driver calls back into the syscall layer | `drivers/drm.rs` calls `crate::syscall::buffer_ok` to validate user pointers. **Widened by the in-flight sound work: `drivers/virtio/sound.rs` names `crate::syscall::linux::abi` and `crate::syscall::err::` (7 sites)** | Phase 11 B |
+| V-5 | A driver calls back into the syscall layer | `drivers/drm.rs` validated user pointers via `crate::syscall::buffer_ok`; **B3 closed that half — it now names `crate::uaccess::buffer_ok`.** The remaining edge is `drivers/virtio/sound.rs` naming `crate::syscall::linux::abi` for ioctl ABI constants (its former `crate::syscall::err::` refs already became `crate::err`); that is the device-ioctl-ABI concern (V-2), not the two helpers | Phase 11 B |
 | V-6 | A debug trace sat in the dispatch hot path | `syscall/linux/mod.rs::trace_msg`, self-labelled `TEMPORARY (udevd worker-channel hunt)`, wrote `[msgtrace]` lines from any failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` | **Done** (Phase 11 A) |
 | V-7 | Dead and duplicate machine modules | `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` were not declared in `arch/x86_64/mod.rs` at all; `qemu.rs` was byte-identical to `drivers/qemu.rs`. Three PCI modules existed (`arch/x86_64/pci.rs` was a stale earlier copy of `drivers/pci.rs`), two RTC, two serial | **Done** (Phase 11 A) — all three deleted, `drivers/rtc` renamed `drivers/rtc_dev` |
 | V-8 | Cross-architecture config pointed at a missing file | `.cargo/config.toml` set `link-arg=--script=arch/aarch64/linker.ld`; only `arch/x86_64/linker.ld` exists, so the `aarch64-unknown-none` build could not link | **Done** (Phase 11 A) — the profile is gone, and `PLAN.md` §9.1 keeps what a port needs |
-| V-9 | The network layer validates user pointers with the syscall layer's helper | `net/socket.rs` and `net/unix.rs` call `crate::syscall::buffer_ok` / `err_of` throughout; the dependency is for two pure functions that have no business owning the direction. **Widened by the in-flight AF_PACKET work: `net/packet.rs:333,351,352` adds three more `buffer_ok` callers, and `net/vsock.rs` / `net/rtnl.rs` / `net/mod.rs` were measured to hold pre-audit callers §9 had not listed** | Phase 11 E |
+| V-9 | The network layer validates user pointers with the syscall layer's helper | **Closed by B3.** `buffer_ok`/`user_accessible`/`MAX_IO`/`err_of` moved to the crate-root leaf `src/uaccess.rs`; the 99 below-`syscall` call-sites in `net/{socket,unix,packet,vsock}.rs` and `drivers/drm.rs` now name `crate::uaccess::*`, so no layer below `syscall` reaches up for a page walk or an errno mapping. `syscall` re-exports the same names for its own handlers, and the bare-metal build is green (the `cfg(target_os = "none")` split of `err_of`/`user_accessible` moved intact — V-11's lesson held) | **Done** (Phase 11 B3) |
 | V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | Accepted by design; document only |
 | V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs:3527` is `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs:48` gates `pub mod net` on `target_os = "none"`; 3 tests never run | Phase 11 F |
 | V-12 | The tree was mid-refactor and did not build for the host | The uncommitted work renamed `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edited `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` failed to compile | **Resolved** — finished and committed; the gate is green (`PLAN.md` §11.1.12) |
 | V-13 | Memory knows about files: `mm` calls up into `vfs` | `src/mm/vma.rs:28` does `use crate::vfs::Inode;` (file-backed VMAs name an inode), committed in eb4b337 after this audit — the `AGENTS.md` boundary table says `mm` may depend on `boot` only. The file-backed mapping needs *a* mapped-object trait; `Inode` is the wrong one to name | Open — Phase 11 should fold this into the `mm`/`vfs` seam work; no new callers allowed |
+| V-14 | The uevent bus reached up into `syscall` and `sched` | Found at the AF_PACKET/sound re-audit: `uevent.rs` used `crate::syscall::err` for its refusals and a `self_cred()` that read the task table (`crate::sched::current_real_owner`/`current_tgid`) — a service naming the ABI layer violated §9's own acceptance rule, and the task-table reach made the bus untestable in isolation | **Done** — the errno table moved to the crate root (`src/err.rs`, re-exported through `syscall`), and credentials/the preferred bind port id are now assembled by the caller `net::socket::task_identity` (allowed `net→sched`) and passed in as plain values; `uevent` compiles on the host with no upward edge |
 
 **The dependency direction to aim for** (used as the acceptance criterion in Phase 11):
 

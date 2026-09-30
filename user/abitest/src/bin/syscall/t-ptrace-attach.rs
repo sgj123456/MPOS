@@ -36,6 +36,7 @@ static PIDFILE: &[u8] = b"/tmp/t-ptrace-attach.pid\0";
 const SYS_PTRACE: u64 = 101;
 const PTRACE_ATTACH: usize = 16;
 const PTRACE_DETACH: usize = 17;
+const PTRACE_SETSIGINFO: usize = 0x4203;
 const SIGCONT: usize = 18;
 const SIGSTOP: usize = 19;
 const WNOHANG: usize = 1;
@@ -101,6 +102,19 @@ pub extern "C" fn mpos_user_main(_argc: i32, _argv: *const *const u8) -> ! {
     }
     lin::check_true(&mut failed, b"a child to attach to exists", child > 0);
     if child > 0 {
+        // Before anything is attached: PTRACE_SETSIGINFO on a live but
+        // untraced pid is ESRCH, because a `siginfo_t` can only be planted on
+        // a task already stopped under us. This kernel used to answer `0` here
+        // for any pid - a success for a request with no tracee behind it.
+        // (Linux's own `ptrace_check_attach` refuses the not-a-stopped-tracee
+        // case with ESRCH before it ever copies the struct.) Placed before the
+        // ATTACH below, since attaching turns the child into a stopped tracee.
+        lin::check_eq(
+            &mut failed,
+            b"PTRACE_SETSIGINFO on a live but untraced child is ESRCH, not a silent 0",
+            ptrace(PTRACE_SETSIGINFO, child as usize),
+            lin::ESRCH,
+        );
         lin::check_eq(
             &mut failed,
             "attaching to my own child by the pid fork gave me".as_bytes(),

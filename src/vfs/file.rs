@@ -13,7 +13,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
@@ -49,6 +49,20 @@ pub const O_APPEND: u32 = 0o2000;
 /// and are not file status - Linux's `F_GETFL` does not report them either.
 pub const OPEN_STATUS_FLAGS: u32 = 0o3 | O_APPEND | O_NONBLOCK;
 
+/// The access mode an open description was made under, as the low two bits of
+/// `O_ACCMODE`. `File::read`/`File::write` refuse a mismatch with `EBADF`, which
+/// is Linux's answer for `write()` on an `O_RDONLY` descriptor and the reverse.
+///
+/// The default is [`ACC_RDWR`] - permissive - because only a path `open` records
+/// a real mode. Descriptions made another way (a socket via `socket`, a pipe end,
+/// an `eventfd`/`timerfd`/`signalfd`/`memfd`) inherit the default and stay
+/// readable and writable, which is right for objects whose direction is not an
+/// `O_ACCMODE` at all. A forgotten `set_access` therefore leaves the description
+/// permissive rather than wrongly refusing.
+const ACC_RDONLY: u8 = 0;
+const ACC_WRONLY: u8 = 1;
+const ACC_RDWR: u8 = 2;
+
 /// An open file description: an inode plus where the next read/write lands.
 pub struct File {
     inode: Arc<dyn Inode>,
@@ -63,6 +77,10 @@ pub struct File {
     /// description keeps is the changeable `F_SETFL` half, not the access
     /// mode it was opened under.
     opened_for_write: core::sync::atomic::AtomicBool,
+    /// The `O_ACCMODE` this description was opened under, for the read/write
+    /// `EBADF` refusal. [`ACC_RDWR`] unless a path `open` recorded a narrower
+    /// mode; see the `ACC_*` constants.
+    access: AtomicU8,
     /// The path this description was opened by, when the caller that made it
     /// knew one.
     ///
@@ -83,6 +101,7 @@ impl File {
             inode,
             pos: AtomicU64::new(0),
             opened_for_write: core::sync::atomic::AtomicBool::new(false),
+            access: AtomicU8::new(ACC_RDWR),
             status: core::sync::atomic::AtomicU32::new(0),
             label: Mutex::new(RefCell::new(None)),
         }
@@ -168,6 +187,9 @@ impl File {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
+        // Wrong-mode first, before the empty-buffer short-circuit: Linux answers a
+        // `read(2)` on an `O_WRONLY` descriptor with `EBADF` even for length 0.
+        self.check_readable()?;
         // A zero-length read is `vfs_read`'s own short-circuit: the file is not
         // touched at all, and here that is a rule with a consequence rather
         // than a courtesy. A *message* - what a datagram socket holds - is
@@ -197,6 +219,50 @@ impl File {
             .store(write, core::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Record the `O_ACCMODE` a path `open` made this description under, so the
+    /// read/write entry points can refuse a mismatch with `EBADF` as Linux does.
+    /// The argument is the low two bits of the open flags (`0` read, `1` write,
+    /// `2` read-write).
+    pub fn set_access(&self, accmode: u32) {
+        self.access.store((accmode & 0o3) as u8, Ordering::Relaxed);
+    }
+
+    /// The `read(2)` door refuses an `O_WRONLY` descriptor with `EBADF` - Linux's
+    /// answer, and the check is here rather than in each handler so every read
+    /// path (`read`/`readv`/`pread`/`preadv2`) shares it. A zero-length read still
+    /// short-circuits first only when the mode permits reading at all; Linux
+    /// refuses the wrong-mode `read(2, buf, 0)` with `EBADF` too.
+    fn check_readable(&self) -> VfsResult<()> {
+        if self.access.load(Ordering::Relaxed) == ACC_WRONLY {
+            return Err(VfsError::BadFd);
+        }
+        Ok(())
+    }
+
+    /// The `write(2)` door refuses an `O_RDONLY` descriptor with `EBADF`, the same
+    /// per-description rule as [`Self::check_readable`], covering
+    /// `write`/`writev`/`pwrite`/`pwritev2`/`splice`/`copy_file_range`.
+    fn check_writable(&self) -> VfsResult<()> {
+        if self.may_write() {
+            Ok(())
+        } else {
+            Err(VfsError::BadFd)
+        }
+    }
+
+    /// Whether this description may change the file's bytes at all - the fact
+    /// behind [`Self::check_writable`], asked directly by the operations that
+    /// write without being a `write(2)`: `ftruncate` and `fallocate`, which owe
+    /// their own errno (`EINVAL` and `EBADF`) rather than the door's.
+    ///
+    /// Every "does this descriptor allow a write" question goes through here.
+    /// Two spellings of the same rule is how a third mode - or a fourth
+    /// write-shaped operation - comes to be enforced in one place and missed in
+    /// the other.
+    pub(crate) fn may_write(&self) -> bool {
+        self.access.load(Ordering::Relaxed) != ACC_RDONLY
+    }
+
     /// Whether this description was opened for writing.
     pub fn opened_for_write(&self) -> bool {
         self.opened_for_write
@@ -204,6 +270,9 @@ impl File {
     }
 
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
+        // Wrong-mode first, as for `read`: Linux answers a `write(2)` on an
+        // `O_RDONLY` descriptor with `EBADF`, including for a zero-length write.
+        self.check_writable()?;
         // `O_APPEND` decides the position here rather than at the open,
         // because that is what the flag promises: the end of the file *now*,
         // re-read on every write, so a description held open while somebody
@@ -809,5 +878,38 @@ mod tests {
         assert!(table.get(2).is_ok());
         assert_eq!(table.dup2(7, 1).err(), Some(VfsError::BadFd));
         assert_eq!(table.get(1).err(), Some(VfsError::BadFd));
+    }
+
+    /// The access mode is enforced after the open, as Linux does: `write()` on an
+    /// `O_RDONLY` description and `read()` on an `O_WRONLY` one answer `EBADF`.
+    /// Before this, `File::read`/`write` never consulted the mode, so an `O_RDONLY`
+    /// description happily took a write - the silent-success this pins against.
+    /// The default (no `set_access`) is read-write, which is what keeps a
+    /// description made by anything other than a path `open` - a socket, a pipe
+    /// end, an `eventfd` - permissive, since its direction is not an `O_ACCMODE`.
+    #[test]
+    fn access_mode_is_enforced_after_open() {
+        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+
+        // A fresh description is permissive: this is the anonymous-object case.
+        let both = File::new(inode.clone());
+        assert_eq!(both.write(b"hi").unwrap(), 2);
+
+        // Opened read-only: the write is refused before anything is touched, and
+        // even a zero-length write cannot sneak past the mode check.
+        let rd = File::new(inode.clone());
+        rd.set_access(0); // O_RDONLY
+        assert_eq!(rd.write(b"x").err(), Some(VfsError::BadFd));
+        assert_eq!(rd.write(b"").err(), Some(VfsError::BadFd));
+        assert!(!rd.may_write(), "and the fact is one question, not two");
+        let mut buf = [0u8; 8];
+        assert_eq!(rd.read(&mut buf).unwrap(), 2, "the read still works");
+
+        // Opened write-only: the read is refused, the write is not.
+        let wr = File::new(inode);
+        wr.set_access(1); // O_WRONLY
+        assert_eq!(wr.read(&mut buf).err(), Some(VfsError::BadFd));
+        assert_eq!(wr.write(b"y").unwrap(), 1);
+        assert!(wr.may_write(), "write-only may still write");
     }
 }

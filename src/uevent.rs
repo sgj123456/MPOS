@@ -51,7 +51,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
-use crate::syscall::err;
+use crate::err;
 
 /// One device event, in the shape userland reads it.
 pub struct Event {
@@ -226,24 +226,6 @@ pub struct Cred {
     pub gid: u32,
 }
 
-/// The running task's credentials; the host build has no task table and
-/// answers zeros, which is what the queue logic that a host test drives wants.
-pub fn self_cred() -> Cred {
-    #[cfg(target_os = "none")]
-    {
-        let (uid, gid) = crate::sched::current_real_owner();
-        Cred {
-            pid: crate::sched::current_tgid().0 as u32,
-            uid,
-            gid,
-        }
-    }
-    #[cfg(not(target_os = "none"))]
-    {
-        Cred::default()
-    }
-}
-
 /// The one group a kobject-uevent socket has: kernel-originated events.
 const GROUP_KERNEL: u32 = 1;
 
@@ -315,12 +297,16 @@ pub fn close(id: usize) {
 ///
 /// `pid` is the `nl_pid` the caller asked for: zero means "give me one", which
 /// is what every daemon asks and what libudev reads back with `getsockname`.
+/// `prefer` is the requesting process's pid - Linux's first choice for an
+/// auto-assigned port id - and the *caller* supplies it: the task table lives
+/// under the syscall/net layers, and this module keeps its host testability by
+/// never reaching up for it (the host build passes 0, and a zero preference
+/// falls through to the counter).
 /// The three refusals are Linux's and each was measured: a socket that is
 /// already bound is `EINVAL` (a second `bind` is not how groups are added), an
 /// explicit port id another socket holds is `EADDRINUSE`, and a socket this
 /// module does not own is `EBADF`.
-pub fn bind(id: usize, pid: u32, groups: u32) -> Result<(), isize> {
-    let prefer = self_cred().pid;
+pub fn bind(id: usize, pid: u32, groups: u32, prefer: u32) -> Result<(), isize> {
     critical_section::with(|cs| {
         let mut subs = SUBSCRIBERS.borrow(cs).borrow_mut();
         if !subs.iter().any(|s| s.id == id) {
@@ -798,7 +784,7 @@ mod tests {
         publish(&an_event());
         assert!(!ready(watcher), "an unbound socket receives nothing");
 
-        bind(watcher, 0, GROUP_KERNEL).expect("a fresh socket binds");
+        bind(watcher, 0, GROUP_KERNEL, 0).expect("a fresh socket binds");
         publish(&an_event());
         assert!(ready(watcher));
         assert!(!ready(other), "a socket that never bound stays empty");
@@ -844,7 +830,7 @@ mod tests {
     fn a_bounded_queue_keeps_the_newest_events() {
         let _bus = bus_lock();
         let watcher = open();
-        bind(watcher, 0, GROUP_KERNEL).expect("a fresh socket binds");
+        bind(watcher, 0, GROUP_KERNEL, 0).expect("a fresh socket binds");
         for _ in 0..QUEUE_MAX + 8 {
             publish(&an_event());
         }
@@ -864,7 +850,7 @@ mod tests {
     /// One bound socket with a port id of its own, released at the end.
     fn a_bound_listener(groups: u32) -> usize {
         let id = open();
-        bind(id, 0, groups).expect("a fresh socket binds");
+        bind(id, 0, groups, 0).expect("a fresh socket binds");
         id
     }
 
@@ -873,29 +859,53 @@ mod tests {
         let _bus = bus_lock();
         let first = open();
         let (pid, _) = {
-            bind(first, 0, 0).expect("a zero pid asks for one");
+            bind(first, 0, 0, 0).expect("a zero pid asks for one");
             port_of(first).expect("a bound socket has an address")
         };
         assert_ne!(pid, 0, "a socket bound with pid 0 is given one");
 
+        // A caller-supplied preferred pid is Linux's first choice for the
+        // auto-assigned port id, taken when free - the fact `net::socket`
+        // now hands down from the task table instead of `uevent` reaching up
+        // for it. The counter stays the fallback for a zero preference (the
+        // host build) and a taken pid, both pinned above and below.
+        let preferred = open();
+        bind(preferred, 0, 0, 4242).expect("a zero pid with a preference");
+        assert_eq!(
+            port_of(preferred).expect("bound").0,
+            4242,
+            "the free preference is honoured, as Linux's autobind does"
+        );
+        // And a preference another socket already holds falls through to the
+        // counter rather than failing or stealing it.
+        let clash = open();
+        bind(clash, 0, 0, 4242).expect("a taken preference still binds");
+        assert_ne!(
+            port_of(clash).expect("bound").0,
+            4242,
+            "the held preference is not given twice"
+        );
+        close(preferred);
+        close(clash);
+
         // Binding a port id another socket holds is `EADDRINUSE`, which is what
         // a daemon that named itself after a stale pid has to hear.
         let second = open();
-        assert_eq!(bind(second, pid, 0), Err(err::EADDRINUSE));
+        assert_eq!(bind(second, pid, 0, 0), Err(err::EADDRINUSE));
         // And a socket that is already bound may not bind again - not to add a
         // group either, which is Linux's `EINVAL` and not a merge.
-        assert_eq!(bind(first, 0, 0), Err(err::EINVAL));
+        assert_eq!(bind(first, 0, 0, 0), Err(err::EINVAL));
 
         // An explicit free port id is honoured as given.
         let third = open();
-        bind(third, 0x1234_5678, GROUP_KERNEL).expect("a free explicit id binds");
+        bind(third, 0x1234_5678, GROUP_KERNEL, 0).expect("a free explicit id binds");
         assert_eq!(port_of(third), Some((0x1234_5678, GROUP_KERNEL)));
 
         // An unbound socket reports no address at all, which is Linux's
         // all-zero answer rather than an error.
         let unbound = open();
         assert_eq!(port_of(unbound), None);
-        assert_eq!(bind(999_999, 0, 0), Err(err::EBADF));
+        assert_eq!(bind(999_999, 0, 0, 0), Err(err::EBADF));
 
         for id in [first, second, third, unbound] {
             close(id);

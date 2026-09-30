@@ -198,6 +198,10 @@ name = "t-faccessat2"
 path = "src/bin/syscall/t-faccessat2.rs"
 
 [[bin]]
+name = "t-fadvise"
+path = "src/bin/syscall/t-fadvise.rs"
+
+[[bin]]
 name = "t-fallocate"
 path = "src/bin/syscall/t-fallocate.rs"
 
@@ -332,6 +336,14 @@ path = "src/bin/syscall/t-poll.rs"
 [[bin]]
 name = "t-posix"
 path = "src/bin/syscall/t-posix.rs"
+
+[[bin]]
+name = "t-priority"
+path = "src/bin/syscall/t-priority.rs"
+
+[[bin]]
+name = "t-times"
+path = "src/bin/syscall/t-times.rs"
 
 [[bin]]
 name = "t-prctl"

@@ -51,6 +51,25 @@ pub(super) const AT_EMPTY_PATH: usize = 0x1000;
 /// `unlinkat`'s spelling of `rmdir`: the flag says which of the two
 /// operations the caller means, it is not an optimisation.
 pub(super) const AT_REMOVEDIR: usize = 0x200;
+/// `statx`'s `AT_NO_AUTOMOUNT`: don't trigger an automount on the final
+/// component. This kernel has no automounting, so it is a legal no-op.
+pub(crate) const AT_NO_AUTOMOUNT: usize = 0x800;
+/// The `statx` synchronisation-type bits (`AT_STATX_FORCE_SYNC` 0x2000 and
+/// `AT_STATX_DONT_SYNC` 0x4000; `AS_STAT` is the zero, the default). A single
+/// non-networked filesystem cannot honour or violate a cache sync, so these
+/// bits are accepted as no-ops - but they are still *legal* and must not be
+/// rejected.
+pub(crate) const AT_STATX_SYNC_TYPE: usize = 0x6000;
+
+/// Whether a `statx` flag word is inside Linux's vocabulary. `AT_SYMLINK_NOFOLLOW`
+/// and `AT_EMPTY_PATH` are honoured by the handler; `AT_NO_AUTOMOUNT` and the
+/// sync-type bits are accepted as no-ops (one non-networked filesystem has
+/// nothing to automount or sync). A bit outside the set is `EINVAL`. Measured on
+/// a current host: the accepted set is exactly `{0x100, 0x800, 0x1000, 0x2000,
+/// 0x4000}`; `0x10000` and `0x100000` answer `EINVAL`.
+pub(crate) fn statx_flags_are_known(flags: usize) -> bool {
+    flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) == 0
+}
 
 // ---------------------------------------------------------------------------
 // open(2) flag bits
@@ -101,6 +120,15 @@ pub(super) const O_DIRECTORY: usize = 0o20_0000;
 /// because Linux reads the pairing - the bit without the flag - as EINVAL
 /// before it reads anything else.
 pub(super) const O_TMPFILE: usize = 0o2000_0000;
+/// `O_NOFOLLOW`: if the final path component is a symbolic link, the open
+/// fails with `ELOOP` rather than following it. Intermediate components are
+/// still followed, so this is a guarantee about the *last* name only - the one
+/// a caller uses to refuse opening something a symlink points at (the classic
+/// `/tmp` world-writable-dir defence). Measured on the host:
+/// `open(symlink, O_NOFOLLOW)` is `ELOOP`, `open(regular, O_NOFOLLOW)`
+/// succeeds. It is an open-only bit, not a status flag: it never shows back in
+/// `F_GETFL`'s value, so it is consumed at the open and not stored.
+pub(super) const O_NOFOLLOW: usize = 0o40_0000;
 
 // ---------------------------------------------------------------------------
 // fcntl(2) commands and descriptor flags
@@ -192,6 +220,22 @@ pub(super) const MREMAP_FIXED: usize = 0x2;
 /// object behind it. Both are now answerable, because a mapping is an address
 /// space and the next touch refills it.
 pub(super) const MADV_DONTNEED: usize = 4;
+
+/// Whether `advice` is one of the values `madvise(2)`'s vocabulary knows, and
+/// so one the handler may answer at all. Linux's `madvise` rejects an advice
+/// it does not recognise with `EINVAL`; a kernel that answers `0` for a number
+/// no one gave it is the §4.2 success-for-a-thing-not-done, and the one shape a
+/// probing caller cannot tell from a real acceptance. The set below is the
+/// measured one — probed on a current host (`madvise` on a mapped anonymous
+/// page, advice `0..=110`), which returns `0` for exactly these and `EINVAL`
+/// for the gaps `5`, `6`, `7` (the deleted `MADV_*` numbers), `9`
+/// (`MADV_REMOVE`, which faults on an anonymous range) and everything above
+/// the recognised block except `102`/`103`. Of these only `MADV_DONTNEED`
+/// (`4`) carries a promise this kernel keeps with work; the rest are best-effort
+/// hints whose acceptance is truthful, and the handler gives `4` its page-drop.
+pub(crate) fn madvise_advice_is_known(advice: usize) -> bool {
+    matches!(advice, 0..=4 | 8 | 10..=24 | 102 | 103)
+}
 
 // ---------------------------------------------------------------------------
 // eventfd(2) flag bits
@@ -1172,23 +1216,76 @@ pub(super) fn install_seccomp_filter(prog_ptr: usize, flags: usize, from_user: b
 
 /// `prctl(option, ...)` — the miscellaneous process-control call.
 ///
-/// `PR_GET_NAME` (16) is the one userland actually exercises here. The
-/// options that would touch privileges, dump core flags or endianness touch
-/// things this kernel does not model, so they are accepted and dropped.
+/// The name pair is what userland actually exercises here, and it round-trips:
+/// `PR_SET_NAME` (15) stores the caller's bytes in the group's `comm` slot and
+/// `PR_GET_NAME` (16) hands them back — or, when no one has set one, the image
+/// basename `comm_of` derives, which is what Linux reports too. The seccomp
+/// pair answers and latches what `seccomp(2)` does. Every other option - the
+/// privilege, dump-core and endianness flags, the capability bounding set - is
+/// refused with `EINVAL`, exactly as Linux's `prctl` default arm (kernel/sys.c):
+/// an option this kernel does not model is not silently reported as done. An
+/// option is accepted only once MPOS backs it with real state, never with an
+/// empty `0` (§4.2). The gate that boots the whole initramfs is the evidence
+/// that no running program relies on one of these being a silent no-op.
 pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
+    const PR_SET_NAME: usize = 15;
     const PR_GET_SECCOMP: usize = 21;
     const PR_SET_SECCOMP: usize = 22;
     const PR_GET_NAME: usize = 16;
+    // `TASK_COMM_LEN`: the fixed slot both name options speak of.
     const NAME_LEN: usize = 16;
     const SECCOMP_MODE_STRICT: usize = 1;
     const SECCOMP_MODE_FILTER: usize = 2;
     match args[0] {
+        // Linux reads at most `TASK_COMM_LEN` bytes of the caller's string,
+        // stores what fits and forces the last byte to NUL: a name that runs the
+        // full sixteen without a terminator is *truncated and accepted*, not
+        // refused (measured: sixteen `'a'` with a non-NUL seventeenth answers `0`,
+        // and `PR_GET_NAME` then reads back fifteen characters). The arm used to
+        // answer `EFAULT` there, which sends a program that named itself sixteen
+        // bytes long down a fallback it would not take on Linux. A name that ends
+        // inside the slot is unaffected: the copy stops at its NUL and the tail
+        // stays zero.
+        PR_SET_NAME => {
+            let buf = args[1];
+            if buf == 0 || !buffer_ok(buf, 1, false, true) {
+                return err::EFAULT;
+            }
+            let mut name = [0u8; NAME_LEN];
+            let mut i = 0;
+            while i < NAME_LEN {
+                // Revalidate only at a page crossing: within one page the first
+                // validated byte stands for all of them, exactly as the path
+                // reader assumes, and a contiguous scan reaches every boundary
+                // address on its way in. A name whose bytes run off the mapping
+                // faults there instead of reading unbacked memory.
+                if (buf + i) & 0xfff == 0 && !buffer_ok(buf + i, 1, false, true) {
+                    return err::EFAULT;
+                }
+                let byte = unsafe { ((buf + i) as *const u8).read_unaligned() };
+                if byte == 0 {
+                    break;
+                }
+                name[i] = byte;
+                i += 1;
+            }
+            // Whether the loop ended at a NUL or at the slot's edge, the last
+            // byte is forced to zero: that is the truncation, and it is why no
+            // length bookkeeping is needed below.
+            name[NAME_LEN - 1] = 0;
+            crate::sched::set_current_comm(&name);
+            0
+        }
         PR_GET_NAME => {
             let buf = args[1];
             if buf == 0 || !buffer_ok(buf, NAME_LEN, true, true) {
                 return err::EFAULT;
             }
-            unsafe { core::ptr::write_bytes(buf as *mut u8, 0, NAME_LEN) };
+            // The group's `comm` verbatim: the `PR_SET_NAME` bytes if one was
+            // set, else the derived basename — the name Linux reads back, not
+            // the sixteen zeroes that used to stand for "we have no name".
+            let name = crate::sched::current_comm_bytes();
+            unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, NAME_LEN) };
             0
         }
         // The seccomp pair is the older spelling of what the `seccomp(2)`
@@ -1215,7 +1312,16 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
             SECCOMP_MODE_FILTER => install_seccomp_filter(args[2], 0, true),
             _ => err::EINVAL,
         },
-        _ => 0,
+        // Every option not named above is refused with `EINVAL`, exactly as
+        // Linux's `prctl` `default:` arm (kernel/sys.c). Returning `0` here -
+        // the old catch-all - was the §4.2 "success for a thing not done" this
+        // batch exists to remove: a caller of `PR_SET_DUMPABLE`, `PR_CAPBSET_*`,
+        // `PR_SET_NO_NEW_PRIVS` and friends was told the kernel had done
+        // something it had not. `EINVAL` sends it down the same fallback Linux
+        // gives an option this kernel does not model; a specific option is only
+        // accepted once MPOS backs it with real state (as the name and seccomp
+        // pairs above are), never with an empty success.
+        _ => err::EINVAL,
     }
 }
 
@@ -1241,12 +1347,25 @@ pub(crate) fn handle_umask(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
 
 /// `getrandom(buf, len, flags)` — fill `buf` with random bytes.
 ///
-/// The same stream `/dev/urandom` reads from. `GRND_RANDOM` and
-/// `GRND_NONBLOCK` are accepted and ignored: there is one generator, it is
-/// always ready, and it never blocks - which is the behaviour both flags are
-/// asking about.
+/// The same stream `/dev/urandom` reads from. `GRND_NONBLOCK`, `GRND_RANDOM`
+/// and `GRND_AUTOCONF` are accepted and ignored: there is one generator, it is
+/// always ready, and it never blocks - which is the behaviour all three flags
+/// are asking about, so none of them can be violated. The flag *word*, though,
+/// is a closed set: a bit outside the three Linux refuses with `EINVAL`
+/// (measured on the host: `0x100` is rejected, and the flags are checked before
+/// the zero-length short-circuit), and a caller that handed one here used a
+/// spelling this kernel was never asked to honour. Silently filling the buffer
+/// regardless of the flag word - which the old handler did, discarding `flags`
+/// entirely - was a §4.2 accept-and-drop.
 pub(crate) fn handle_getrandom(args: [usize; crate::syscall::ARG_COUNT], from_user: bool) -> isize {
-    let (buf, len, _flags) = (args[0], args[1], args[2]);
+    const GRND_NONBLOCK: usize = 0x1;
+    const GRND_RANDOM: usize = 0x2;
+    const GRND_AUTOCONF: usize = 0x4;
+    const KNOWN: usize = GRND_NONBLOCK | GRND_RANDOM | GRND_AUTOCONF;
+    let (buf, len, flags) = (args[0], args[1], args[2]);
+    if flags & !KNOWN != 0 {
+        return err::EINVAL;
+    }
     if len == 0 {
         return 0;
     }
@@ -1527,40 +1646,54 @@ pub(crate) fn handle_sched_setaffinity(args: [usize; crate::syscall::ARG_COUNT])
 
 /// `set_robust_list(head, len)` — register the robust-futex list head.
 ///
-/// The head's contents are never touched; Linux pins the size to
-/// `sizeof(struct robust_list_head)` = 24 and rejects anything else.
+/// The head is filed away so `get_robust_list` can read it back, and Linux pins
+/// the size to `sizeof(struct robust_list_head)` = 24, rejecting anything else.
+/// What is *not* yet done is walking the list to release held futexes when the
+/// thread leaves - that is the feature `set` arms on Linux, and it is a named gap
+/// (`PLAN.md` §12.2 B3); storing the head is what makes the registration +
+/// `get` pair truthful rather than a `set` that claims a list it cannot return.
 pub(crate) fn handle_set_robust_list(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
-    let (_head, len) = (args[0], args[1]);
+    let (head, len) = (args[0], args[1]);
     if len != 24 {
         return err::EINVAL;
     }
+    crate::sched::set_robust_head(head);
     0
 }
 
-/// `get_robust_list(pid, head, len)` — the read half of the robust-futex
-/// list. Threads are not implemented, so no process has a list, and Linux
-/// answers `ENOSYS` for a kernel built without the call.
-pub(crate) fn handle_get_robust_list(_args: [usize; crate::syscall::ARG_COUNT]) -> isize {
-    err::ENOSYS
-}
-
-/// `rseq(rseq, len, flags, sig)` — register the restartable-sequence block.
+/// `get_robust_list(pid, head, len)` — the read half of the robust-futex list.
 ///
-/// Registration succeeds for a well-formed request and the argument shape is
-/// validated (`sizeof(struct rseq)` = 32, `flags` = 0), which is exactly what a
-/// libc's startup needs to get past - glibc registers the block at load time.
-/// The kernel deliberately does *not* then maintain the block's `cpu_id` field on
-/// preemption; that is this call's documented scope, pinned by `t-rseq`, and on a
-/// uniprocessor there is no second CPU for the field to be wrong about. Keeping
-/// the guarantee Linux provides for a second core is a named gap, not something
-/// to refuse: a kernel with `rseq` answers `0` here, so answering `ENOSYS` would
-/// break the startup contract `t-rseq` pins (rule 1: the code changes, not the
-/// test). The honest *addition* would be to write `cpu_id` (always 0 here) into
-/// the caller's block at registration - tracked below, not attempted as a refusal.
-pub(crate) fn handle_rseq(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
-    let (_rseq, len, flags) = (args[0], args[1], args[2]);
-    if len != 32 || flags != 0 {
-        return err::EINVAL;
+/// Answers the head `set_robust_list` registered (and the size Linux pins, 24).
+/// `pid` of 0 or the caller's own tgid names the running process; threads are
+/// not implemented, so any other pid has no list here and `ESRCH` is the honest
+/// answer, the same way `prlimit64` treats a request for a process it will not
+/// reach.
+pub(crate) fn handle_get_robust_list(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
+    let (pid, head_out, len_out) = (args[0] as i32, args[1], args[2]);
+    #[cfg(target_os = "none")]
+    let is_self = pid == 0 || pid as usize == crate::sched::current_tgid().0;
+    // A host build has no processes, so every request is the current one.
+    #[cfg(not(target_os = "none"))]
+    let is_self = true;
+    if !is_self {
+        return err::ESRCH;
+    }
+    // Both output pointers must name somewhere to write. `buffer_ok` does not
+    // refuse null on its own (the machine build's user-range check passes a
+    // null, which is not a user address), so - like `PR_GET_NAME` - the null is
+    // caught explicitly before anything is written through it.
+    if head_out == 0
+        || len_out == 0
+        || !buffer_ok(head_out, 8, true, true)
+        || !buffer_ok(len_out, 8, true, true)
+    {
+        return err::EFAULT;
+    }
+    let head = crate::sched::robust_head();
+    unsafe {
+        (head_out as *mut usize).write_unaligned(head);
+        // `sizeof(struct robust_list_head)` - what Linux writes back as `len`.
+        (len_out as *mut usize).write_unaligned(24);
     }
     0
 }
@@ -2484,28 +2617,66 @@ mod tests {
         assert_eq!(itimerval_ms(0, 0, 0, 0), Ok((0, 0)));
     }
 
-    /// `prctl(2)`: `PR_GET_NAME` writes the 16-byte name slot (empty here),
-    /// a null buffer is EFAULT, and every other option is accepted.
+    /// `prctl(2)`: the name pair round-trips through the `comm` slot - a name
+    /// `PR_SET_NAME` stores is what `PR_GET_NAME` hands back; a null faults for
+    /// both, an unterminated name is refused, and an unmodelled option is still
+    /// accepted rather than refused.
     #[test]
-    fn prctl_answers_the_name_query_and_accepts_the_rest() {
-        let mut buf = [0xABu8; 16];
-        let args = [16, buf.as_mut_ptr() as usize, 0, 0, 0, 0];
-        assert_eq!(handle_prctl(args), 0);
-        assert!(
-            buf.iter().all(|&b| b == 0),
-            "the name slot reads back empty"
-        );
+    fn prctl_stores_and_reports_the_process_name() {
+        const PR_SET_NAME: usize = 15;
+        const PR_GET_NAME: usize = 16;
 
-        // A null buffer has nowhere to put the name.
+        // A terminated name copies in and reads back verbatim, NUL-padded.
+        let mut src = [0u8; 16];
+        src[..6].copy_from_slice(b"worker");
         assert_eq!(
-            handle_prctl([16, 0, 0, 0, 0, 0]),
-            crate::syscall::err::EFAULT
+            handle_prctl([PR_SET_NAME, src.as_ptr() as usize, 0, 0, 0, 0]),
+            0
         );
 
-        // Every other option - PR_SET_NAME from a kernel with no name to
-        // keep, privilege flips, endianness - is accepted and dropped.
-        assert_eq!(handle_prctl([15, 0x1000, 0, 0, 0, 0]), 0);
-        assert_eq!(handle_prctl([0x1337, 0, 0, 0, 0, 0]), 0);
+        let mut buf = [0xABu8; 16];
+        assert_eq!(
+            handle_prctl([PR_GET_NAME, buf.as_mut_ptr() as usize, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(&buf[..6], b"worker", "the name round-trips");
+        assert_eq!(buf[6], 0, "the slot past the name is the terminator");
+
+        // A null buffer faults in either direction.
+        assert_eq!(handle_prctl([PR_GET_NAME, 0, 0, 0, 0, 0]), err::EFAULT);
+        assert_eq!(handle_prctl([PR_SET_NAME, 0, 0, 0, 0, 0]), err::EFAULT);
+
+        // A name with no NUL inside the sixteen-byte slot is *truncated and
+        // accepted*, not refused: measured on Linux, sixteen `'a'` with a non-NUL
+        // seventeenth answers `0` and `PR_GET_NAME` then reads back fifteen
+        // characters. The arm used to answer `EFAULT`, which sends a caller that
+        // named itself sixteen bytes long down a fallback it would not take on
+        // Linux.
+        let long = [b'x'; 17];
+        assert_eq!(
+            handle_prctl([PR_SET_NAME, long.as_ptr() as usize, 0, 0, 0, 0]),
+            0,
+            "an unterminated-in-slot name is accepted"
+        );
+        let mut buf = [0xABu8; 16];
+        assert_eq!(
+            handle_prctl([PR_GET_NAME, buf.as_mut_ptr() as usize, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            &buf[..15],
+            &[b'x'; 15],
+            "fifteen characters survive the cut"
+        );
+        assert_eq!(buf[15], 0, "and the slot's last byte is the terminator");
+
+        // An option this kernel does not model is refused with `EINVAL`, the
+        // way Linux's `prctl` default arm answers a number it does not know -
+        // never the old accepted-and-dropped `0` that claimed a thing it did not do.
+        assert_eq!(
+            handle_prctl([0x1337, 0, 0, 0, 0, 0]),
+            crate::syscall::err::EINVAL
+        );
     }
 
     /// The `PR_SET_SECCOMP` / `PR_GET_SECCOMP` pair latches strict mode the
@@ -2577,6 +2748,25 @@ mod tests {
         // always ready and never blocks, which is what both ask about.
         let args = [a.as_mut_ptr() as usize, 8, 1 | 2, 0, 0, 0];
         assert_eq!(handle_getrandom(args, false), 8);
+        // The flag word is a closed set: a bit outside {NONBLOCK, RANDOM,
+        // AUTOCONF} is EINVAL, checked before the zero-length short-circuit.
+        // Both counterfactual - the old handler discarded `flags`.
+        assert_eq!(
+            handle_getrandom([a.as_mut_ptr() as usize, 8, 0x100, 0, 0, 0], false),
+            err::EINVAL,
+            "an unknown GRND_* bit is EINVAL"
+        );
+        assert_eq!(
+            handle_getrandom([a.as_mut_ptr() as usize, 0, 0x100, 0, 0, 0], false),
+            err::EINVAL,
+            "flags are checked before the len==0 short-circuit"
+        );
+        // The new GRND_AUTOCONF bit is accepted (measured on the host).
+        assert_eq!(
+            handle_getrandom([a.as_mut_ptr() as usize, 8, 4, 0, 0, 0], false),
+            8,
+            "GRND_AUTOCONF is a known bit and is accepted"
+        );
     }
 
     /// `getrlimit(2)`/`prlimit64(2)`: the resources a static binary reads -
@@ -2752,10 +2942,14 @@ mod tests {
         assert!(long[8..].iter().all(|&b| b == 0));
     }
 
-    /// The registration calls a libc's startup makes: `set_robust_list`
-    /// pins its length to 24, `rseq` to 32 with a zero flag word, and the
-    /// read half of the robust list is answered ENOSYS exactly as a kernel
-    /// built without it answers.
+    /// The registration calls a libc's startup makes: `set_robust_list` pins its
+    /// length to 24 and its head round-trips through `get_robust_list`. The
+    /// robust pair is the point: a `set` that filed nothing and a `get` that only
+    /// ever answered `ENOSYS` could not round-trip, so the read half returning
+    /// what the write half stored is the contract this pins. (`rseq` is not here
+    /// on purpose: the kernel carries no registration for it and the dispatch
+    /// answers `ENOSYS`, so there is no handler to unit-test - `t-rseq` pins that
+    /// refusal at the syscall boundary.)
     #[test]
     fn startup_registrations_check_their_abi_sizes() {
         assert_eq!(handle_set_robust_list([0x1000, 24, 0, 0, 0, 0]), 0);
@@ -2763,23 +2957,29 @@ mod tests {
             handle_set_robust_list([0x1000, 32, 0, 0, 0, 0]),
             crate::syscall::err::EINVAL
         );
+
+        // The head `set` filed comes back through `get`, with Linux's pinned
+        // `sizeof(struct robust_list_head)` = 24 as the length.
+        let mut head_out = 0usize;
+        let mut len_out = 0usize;
+        assert_eq!(
+            handle_get_robust_list([
+                0,
+                &raw mut head_out as usize,
+                &raw mut len_out as usize,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(head_out, 0x1000, "the registered head reads back");
+        assert_eq!(len_out, 24, "get reports the list head's size");
+
+        // Null output pointers are EFAULT, not a silent answer.
         assert_eq!(
             handle_get_robust_list([0, 0, 0, 0, 0, 0]),
-            crate::syscall::err::ENOSYS
-        );
-
-        // `rseq` registration is a documented scope boundary (see the handler):
-        // the well-formed call answers `0` so a libc's startup gets past, and the
-        // argument shape is validated. `t-rseq` pins the same contract from the
-        // guest; this pins it on the host.
-        assert_eq!(handle_rseq([0x1000, 32, 0, 0, 0, 0]), 0);
-        assert_eq!(
-            handle_rseq([0x1000, 20, 0, 0, 0, 0]),
-            crate::syscall::err::EINVAL
-        );
-        assert_eq!(
-            handle_rseq([0x1000, 32, 1, 0, 0, 0]),
-            crate::syscall::err::EINVAL
+            crate::syscall::err::EFAULT
         );
     }
 
@@ -2983,6 +3183,58 @@ mod tests {
         assert_eq!(SIGINFO_BYTES, 128);
         assert_eq!(RLIM_NLIMITS, 16);
         assert_eq!(RLIM_INFINITY, u64::MAX);
+    }
+
+    /// `madvise`'s advice vocabulary is a closed set: Linux answers `EINVAL`
+    /// for a number it does not name. The predicate below is what the handler
+    /// gates on, so a garbage advice can no longer be answered with a silent
+    /// success. The counterfactual is the deleted/absent numbers the real host
+    /// refuses — `5`, `6`, `7` (the retired `MADV_*`), `9` (`MADV_REMOVE`, which
+    /// faults on an anonymous range), and a value past the block like `9999` —
+    /// all `false`, against the recognised hints (`0..=4`, `8`, `10..=24`) all
+    /// `true`.
+    #[test]
+    fn madvise_advice_gate_matches_linux_known_set() {
+        // The recognised hints and the one that does work (DONTNEED = 4).
+        for a in [0usize, 1, 2, 3, 4, 8, 10, 11, 14, 21, 23, 24, 102, 103] {
+            assert!(madvise_advice_is_known(a), "advice {a} is a known value");
+        }
+        // The retired/absent numbers Linux rejects with EINVAL.
+        for a in [5usize, 6, 7, 9, 25, 26, 50, 99, 100, 101, 104, 9999] {
+            assert!(
+                !madvise_advice_is_known(a),
+                "advice {a} is not a known value"
+            );
+        }
+    }
+
+    /// `statx`'s flag word is a closed set, the same discipline. The handler
+    /// gated `_ => EINVAL`-style now on this predicate; the counterfactual is
+    /// the unknown bits the old handler discarded. Measured on the host:
+    /// `{0x100, 0x800, 0x1000, 0x2000, 0x4000}` (and any combination of them)
+    /// are accepted; `0x10000` and `0x100000` are `EINVAL`.
+    #[test]
+    fn statx_flag_gate_matches_linux_known_set() {
+        // The recognised bits, singly and combined.
+        for f in [
+            0usize,
+            0x100,
+            0x800,
+            0x1000,
+            0x2000,
+            0x4000,
+            0x100 | 0x800,
+            0x1000 | 0x4000,
+        ] {
+            assert!(statx_flags_are_known(f), "flag {f:#x} is a known value");
+        }
+        // A bit outside the set is not.
+        for f in [0x10000usize, 0x100000, 0x200, 0x400, 0x80, 0x100 | 0x10000] {
+            assert!(
+                !statx_flags_are_known(f),
+                "flag {f:#x} is not a known value"
+            );
+        }
     }
 
     /// The `ptrace` request numbers, against the ptrace(2) man page's x86_64

@@ -239,6 +239,17 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         EINVAL,
     );
 
+    // VT_SENDSIG (0x04) was removed from the vt driver years ago; measured on a
+    // current console the request falls through the kernel's switch and answers
+    // ENOTTY - not the 0 this arm used to return for a command that does nothing
+    // anywhere. Pinning the refusal is the counterfactual against that 0.
+    lin::check_eq(
+        &mut failed,
+        b"VT_SENDSIG answers ENOTTY (the command is gone from Linux)",
+        lin::ioctl(tty, io(VT, 0x04), 0),
+        ENOTTY,
+    );
+
     // VT_OPENQRY: a console number, and not the one already in hand - a second
     // session has somewhere else to go.
     let mut qry = [0u8; 4];

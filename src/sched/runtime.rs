@@ -705,6 +705,36 @@ pub struct Mm {
     /// keeps it on the `mm` too. A thread's `Mm` *is* the group's, so the `Arc`
     /// gives these semantics for free.
     membarrier: core::sync::atomic::AtomicUsize,
+    /// The robust-futex list head this process registered with
+    /// `set_robust_list`, kept so `get_robust_list` can answer it. Like the
+    /// membarrier registrations it lives on the group, not the task: a libc
+    /// registers one list per thread, threads are not implemented, so the group
+    /// has the one. Walking the list to release held futexes at thread exit is a
+    /// separate, named gap - storing the head is what makes `get` honest.
+    robust_head: core::sync::atomic::AtomicUsize,
+    /// The `comm` a process set with `PR_SET_NAME`, as a 16-byte NUL-terminated
+    /// name; all-zero means none was set, and `comm_of` then falls back to the
+    /// image's basename. Lives on the group like the other per-process facts
+    /// above; `/proc/<pid>/comm` and `PR_GET_NAME` both report it, which is the
+    /// whole reason `PR_SET_NAME` is honest rather than accepted-and-dropped.
+    comm_name: [core::sync::atomic::AtomicU8; 16],
+    /// CPU time the group has spent with the core executing *its* tasks, in
+    /// internal clock ticks (the 250 Hz tick), split user / system by the ring
+    /// the timer interrupt took the core out of. On the group, not the task,
+    /// because `times()` and `getrusage(RUSAGE_SELF)` are process-wide in Linux
+    /// and the `Arc`-shared `Mm` is what a process is here: every thread's ticks
+    /// land in the same two counters. Aggregating *reaped children* into
+    /// `cutime`/`cstime` (and `RUSAGE_CHILDREN`) is a separate named gap -
+    /// `PLAN.md` §12.2 B6.
+    cpu_utime: core::sync::atomic::AtomicU64,
+    cpu_stime: core::sync::atomic::AtomicU64,
+    /// The CPU of this process's *reaped* children, accumulated by
+    /// [`Mm::absorb_child`] at the reap: `Linux` folds a waited child's
+    /// `utime + cutime` into the parent's `cutime`. Zero until a child is
+    /// collected. What `tms_cutime`/`tms_cstime` and `getrusage(RUSAGE_CHILDREN)`
+    /// report.
+    cpu_cutime: core::sync::atomic::AtomicU64,
+    cpu_cstime: core::sync::atomic::AtomicU64,
 }
 
 impl Mm {
@@ -722,6 +752,12 @@ impl Mm {
             leader,
             clear_tid: Mutex::new(RefCell::new(None)),
             membarrier: core::sync::atomic::AtomicUsize::new(0),
+            robust_head: core::sync::atomic::AtomicUsize::new(0),
+            comm_name: [const { core::sync::atomic::AtomicU8::new(0) }; 16],
+            cpu_utime: core::sync::atomic::AtomicU64::new(0),
+            cpu_stime: core::sync::atomic::AtomicU64::new(0),
+            cpu_cutime: core::sync::atomic::AtomicU64::new(0),
+            cpu_cstime: core::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -778,6 +814,83 @@ impl Mm {
     fn register_membarrier(&self, barrier: usize) {
         self.membarrier
             .fetch_or(barrier, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The robust-futex list head this process registered, `0` for none.
+    fn robust_head(&self) -> usize {
+        self.robust_head.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record the robust-futex list head from `set_robust_list`. The last
+    /// registration wins, as on Linux: a thread re-registering replaces its
+    /// list rather than stacking another.
+    fn set_robust_head(&self, head: usize) {
+        self.robust_head
+            .store(head, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The 16-byte name set by `PR_SET_NAME`, all-zero when none was. `comm_of`
+    /// falls back to the image basename when the first byte is zero.
+    fn comm_name_bytes(&self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        for (slot, out) in self.comm_name.iter().zip(b.iter_mut()) {
+            *out = slot.load(core::sync::atomic::Ordering::Relaxed);
+        }
+        b
+    }
+
+    /// Store the `PR_SET_NAME` name: copy the caller's bytes up to the first
+    /// NUL or the 16th, zero-filling the tail, so the stored array is always a
+    /// NUL-terminated name within `TASK_COMM_LEN`.
+    fn set_comm_name(&self, name: &[u8]) {
+        for i in 0..16 {
+            let byte = match name.get(i).copied() {
+                Some(0) | None => 0,
+                Some(b) => b,
+            };
+            self.comm_name[i].store(byte, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Add one clock tick of CPU time to the group, split by the ring the tick
+    /// interrupted: the core was in this process's user code, or in the kernel
+    /// on its behalf. Two atomic increments - safe from the timer interrupt and
+    /// allocation-free, as an interrupt handler must be.
+    fn charge_tick(&self, in_user: bool) {
+        let counter = if in_user {
+            &self.cpu_utime
+        } else {
+            &self.cpu_stime
+        };
+        counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The group's CPU time in internal clock ticks, as `(user, system,
+    /// child-user, child-system)` - the four `times()` reports and the pair
+    /// behind each `getrusage` direction.
+    fn cpu_all(&self) -> (u64, u64, u64, u64) {
+        (
+            self.cpu_utime.load(core::sync::atomic::Ordering::Relaxed),
+            self.cpu_stime.load(core::sync::atomic::Ordering::Relaxed),
+            self.cpu_cutime.load(core::sync::atomic::Ordering::Relaxed),
+            self.cpu_cstime.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Fold a reaped child's CPU into this process's child totals - Linux's
+    /// accounting on `wait`: the parent's `cutime` grows by the child's own
+    /// `utime` plus the child's own `cutime` (its children, already folded in),
+    /// the same for system. Saturating, so no exit can wrap the counter.
+    fn absorb_child(&self, child: (u64, u64, u64, u64)) {
+        let (cu, su, ccu, csu) = child;
+        self.cpu_cutime.fetch_add(
+            cu.saturating_add(ccu),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        self.cpu_cstime.fetch_add(
+            su.saturating_add(csu),
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Swap one frame for another, in place: the copy-on-write path replaces
@@ -968,6 +1081,15 @@ struct Task {
     /// read as a lie the next time anything asks.
     oom_score_adj: i32,
     oom_score_adj_min: i32,
+    /// The nice value, the `-20..19` number `setpriority` records and
+    /// `getpriority` reports (in the raw syscall's `20-nice` encoding). Like
+    /// `oom_score_adj` it is state this kernel keeps honestly rather than
+    /// schedules by: the scheduler's priority *bands* are its policy and a
+    /// caller cannot move a task between them, so the nice has no weight effect
+    /// here (a named sub-gap) - but a program that set it and read it back must
+    /// see what it set, or the call is the silent-success `PLAN.md` §4 forbids.
+    /// Inherited across `fork`, kept across `exec`, as Linux keeps it.
+    nice: i32,
     /// The process's resource limits, the `RLIMIT_*` table `getrlimit`/
     /// `setrlimit`/`prlimit64` read and write and `/proc/<pid>/limits` prints.
     /// Inherited whole across fork and exec, the way a limit belongs to the
@@ -1221,6 +1343,7 @@ impl Task {
             umask: crate::syscall::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
+            nice: 0,
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -1679,6 +1802,7 @@ impl Table {
             umask: crate::syscall::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
+            nice: 0,
             brk_base: 0,
             brk_pages: 0,
             mmap_cursor: crate::syscall::MMAP_BASE,
@@ -1864,6 +1988,7 @@ impl Table {
 
     fn reap(&mut self) {
         self.release_exited();
+        let mut folds: alloc::vec::Vec<(TaskId, (u64, u64, u64, u64))> = alloc::vec::Vec::new();
         for (slot, entry) in self.tasks.iter_mut().enumerate() {
             let Some(task) = entry else { continue };
             if !task.exited {
@@ -1876,6 +2001,15 @@ impl Table {
             );
             if exit_code_pending(TaskId(slot)) {
                 continue;
+            }
+
+            // A waited child's CPU folds into its parent's child totals before
+            // the slot is freed - Linux accumulates on `wait`. Captured here and
+            // applied after the loop, because `self.tasks[parent]` cannot be
+            // borrowed while `iter_mut` holds the table. Kernel/boot tasks have
+            // no parent, so nothing is folded for them.
+            if let Some(parent) = task.parent {
+                folds.push((parent, task.mm.cpu_all()));
             }
 
             let stack = task
@@ -1891,6 +2025,15 @@ impl Table {
             );
             mm::free_pages(stack.base, stack.order);
             *entry = None;
+        }
+        // The table borrow is released, so the parent's `Mm` is reachable now.
+        // Saturating, so a child cannot wrap the parent's counter; a parent whose
+        // slot is already gone has nobody left to report the child to (the
+        // reparent-to-init edge, beyond what the waited case needs).
+        for (parent, child) in folds {
+            if let Some(parent_task) = self.tasks.get(parent.0).and_then(|slot| slot.as_ref()) {
+                parent_task.mm.absorb_child(child);
+            }
         }
     }
 }
@@ -2106,6 +2249,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             umask: crate::syscall::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
+            nice: 0,
             brk_base: loaded.brk,
             brk_pages: 0,
             mmap_cursor: layout.mmap_top,
@@ -2236,6 +2380,7 @@ pub fn try_spawn_user(
             umask: t.task(parent).umask,
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
+            nice: t.task(parent).nice,
             rlimits: t.task(parent).rlimits,
             seccomp_strict: t.task(parent).seccomp_strict,
             // A filter is inherited, not shared: the child gets its own copy of
@@ -3279,6 +3424,114 @@ pub fn set_oom_score_adj(pid: usize, value: i32) -> bool {
     })
 }
 
+/// `pid`'s nice value, or `None` when no such live task exists. Backs
+/// `getpriority`'s `PRIO_PROCESS`.
+#[cfg(target_os = "none")]
+pub fn nice_of(pid: usize) -> Option<i32> {
+    with_table(|t| {
+        t.tasks
+            .get(pid)
+            .and_then(Option::as_ref)
+            .filter(|tk| !tk.exited)
+            .map(|tk| tk.nice)
+    })
+}
+
+/// Set `pid`'s nice value. `false` says the process is gone (or was never
+/// there), which `setpriority` reports as `ESRCH`.
+#[cfg(target_os = "none")]
+pub fn set_nice(pid: usize, value: i32) -> bool {
+    with_table(|t| match t.tasks.get_mut(pid) {
+        Some(Some(task)) if !task.exited => {
+            task.nice = value;
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The live tasks whose real uid is `ruid`. Backs `getpriority`/`setpriority`'s
+/// `PRIO_USER`.
+#[cfg(target_os = "none")]
+pub fn uid_members(ruid: u32) -> alloc::vec::Vec<TaskId> {
+    with_table(|t| {
+        t.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.as_ref()
+                    .is_some_and(|task| task.identity.ruid == ruid && !task.exited)
+            })
+            .map(|(slot, _)| TaskId(slot))
+            .collect()
+    })
+}
+
+/// Record the running process's `comm` from `PR_SET_NAME`: `name` is the
+/// caller's bytes, stored NUL-terminated within the 16 that `TASK_COMM_LEN`
+/// allows. This is what makes `PR_SET_NAME` do something - and `/proc`'s `comm`
+/// and `PR_GET_NAME` report it - instead of accepting and dropping.
+#[cfg(target_os = "none")]
+pub fn set_current_comm(name: &[u8]) {
+    with_table(|t| t.task(t.current).mm.set_comm_name(name));
+}
+
+/// The running process's `comm` as the 16 bytes `PR_GET_NAME` hands back: the
+/// `PR_SET_NAME` bytes verbatim if one was set, else the derived basename packed
+/// NUL-terminated - matching Linux, which reports the image name, not nothing.
+#[cfg(target_os = "none")]
+pub fn current_comm_bytes() -> [u8; 16] {
+    with_table(|t| {
+        let task = t.task(t.current);
+        let stored = task.mm.comm_name_bytes();
+        if stored[0] != 0 {
+            return stored;
+        }
+        let derived = comm_of(task);
+        let mut out = [0u8; 16];
+        for (slot, &b) in out.iter_mut().zip(derived.as_bytes().iter().take(15)) {
+            *slot = b;
+        }
+        out
+    })
+}
+
+/// Charge one clock tick of CPU time to the running task's process group,
+/// attributed user or system by the ring the timer interrupt took the core out
+/// of. Called from the tick handler before it preempts, so the ticks land on the
+/// task that was actually running. Two atomic increments - no allocation, no
+/// sleep, bounded, as `AGENTS.md` rule 5 requires of interrupt context.
+#[cfg(target_os = "none")]
+pub fn charge_cpu(in_user: bool) {
+    if !STARTED.load(Ordering::Relaxed) {
+        return;
+    }
+    // Read `current` through the same `get(...).and_then(as_ref)` the panic
+    // path uses, not `task()` - `task()` asserts a slot exists and the tick can
+    // land while `current` names a slot that is momentarily empty. Nobody to
+    // charge means the tick is simply not attributed; the machine is whole.
+    with_table(|t| {
+        if let Some(task) = t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            task.mm.charge_tick(in_user);
+        }
+    });
+}
+
+/// The running process's CPU time in internal clock ticks, `(user, system)`.
+/// `times()` and `getrusage(RUSAGE_SELF)` read it and convert to their own
+/// units; there is no per-thread split because there are no threads here, and a
+/// group's `Mm` is where the whole process's ticks gather. `(0, 0)` before the
+/// scheduler runs or if `current` names no live task.
+#[cfg(target_os = "none")]
+pub fn current_cpu_ticks() -> (u64, u64, u64, u64) {
+    with_table(
+        |t| match t.tasks.get(t.current.0).and_then(|slot| slot.as_ref()) {
+            Some(task) => task.mm.cpu_all(),
+            None => (0, 0, 0, 0),
+        },
+    )
+}
+
 /// The group ids the running task holds - real, effective and saved.
 ///
 /// Linux asks this as "is the file's group one of the caller's?", and this
@@ -3430,27 +3683,27 @@ pub fn send_signal_process(tgid: TaskId, sig: u8) -> bool {
 pub fn set_pgid(id: TaskId, pgid: TaskId) -> isize {
     with_table(|t| {
         let Some(target) = t.tasks.get(id.0).and_then(Option::as_ref) else {
-            return crate::syscall::err::ESRCH;
+            return crate::err::ESRCH;
         };
         let (parent, leader_of) = (target.parent, target.pgid);
         if pgid.0 >= MAX_TASKS {
-            return crate::syscall::err::EPERM;
+            return crate::err::EPERM;
         }
         // A caller may move itself, or a child that has not yet exec'd - and
         // the second is the case a shell actually uses.
         if id != t.current && parent != Some(t.current) {
-            return crate::syscall::err::ESRCH;
+            return crate::err::ESRCH;
         }
         // A group leader cannot leave the group it leads: the group is named
         // after it, and there would be nothing left to name.
         if leader_of == id && id != pgid {
-            return crate::syscall::err::EPERM;
+            return crate::err::EPERM;
         }
         // The group must already exist - either because this task is about to
         // become its leader, or because somebody is in it.
         let exists = pgid == id || t.tasks.iter().flatten().any(|task| task.pgid == pgid);
         if !exists {
-            return crate::syscall::err::EPERM;
+            return crate::err::EPERM;
         }
         t.task_mut(id).pgid = pgid;
         0
@@ -5369,6 +5622,16 @@ fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
 /// truncation takes the cut on a character boundary, since a name in UTF-8
 /// with a byte cut through the middle of one is not a name at all.
 fn comm_of(task: &Task) -> alloc::string::String {
+    // A name set with `PR_SET_NAME` wins over the derived one, as it does on
+    // Linux - the whole point of the call is to override what `comm` shows.
+    // The stored bytes are an arbitrary byte string (Linux's `comm` is not
+    // guaranteed UTF-8), so lossy-decode for the `String` `/proc` reports; the
+    // exact bytes are handed to `PR_GET_NAME` by a different path.
+    let stored = task.mm.comm_name_bytes();
+    if stored[0] != 0 {
+        let end = stored.iter().position(|&b| b == 0).unwrap_or(stored.len());
+        return alloc::string::String::from_utf8_lossy(&stored[..end]).into_owned();
+    }
     let named = if !task.exe.is_empty() {
         task.exe.as_str()
     } else {
@@ -5516,7 +5779,7 @@ pub fn current_map_user(virt: usize, frame: usize, flags: crate::mm::vm::MapFlag
                 length: crate::mm::pframe::PAGE_SIZE,
                 flags,
             }),
-            None => return -crate::syscall::err::EINVAL,
+            None => return -crate::err::EINVAL,
         };
         match mapped {
             Ok(()) => {
@@ -5525,7 +5788,7 @@ pub fn current_map_user(virt: usize, frame: usize, flags: crate::mm::vm::MapFlag
                 task.mm.own(frame);
                 virt as isize
             }
-            Err(crate::arch::paging::PageTaken) => -crate::syscall::err::EEXIST,
+            Err(crate::arch::paging::PageTaken) => -crate::err::EEXIST,
         }
     })
 }
@@ -6011,7 +6274,7 @@ pub fn brk(addr: usize) -> isize {
         // hole that gives the address space its Linux shape. A break that far
         // up is a runaway allocation, not a request to honor.
         if frontier >= crate::syscall::MMAP_BASE {
-            return crate::syscall::err::ENOMEM;
+            return crate::err::ENOMEM;
         }
         let grown_to = task.brk_base + task.brk_pages * PAGE_SIZE;
         if frontier < grown_to {
@@ -6044,7 +6307,7 @@ pub fn brk(addr: usize) -> isize {
             }
             let frame = match crate::mm::alloc_frames(0) {
                 Some(f) => f,
-                None => return crate::syscall::err::ENOMEM,
+                None => return crate::err::ENOMEM,
             };
             unsafe {
                 let ptr = crate::mm::phys_to_virt(frame) as *mut u8;
@@ -6063,7 +6326,7 @@ pub fn brk(addr: usize) -> isize {
             };
             if !mapped {
                 crate::mm::free_frames(frame, 0);
-                return crate::syscall::err::ENOMEM;
+                return crate::err::ENOMEM;
             }
             task.mm.own(frame);
         }
@@ -6122,6 +6385,18 @@ pub fn membarrier_registrations() -> usize {
 /// Record a `membarrier` registration for the running task's process.
 pub fn register_membarrier(barrier: usize) {
     with_table(|t| t.task(t.current).mm.register_membarrier(barrier));
+}
+
+/// The robust-futex list head the running task's process registered, `0` for
+/// none. Backs `get_robust_list`.
+pub fn robust_head() -> usize {
+    with_table(|t| t.task(t.current).mm.robust_head())
+}
+
+/// Record the robust-futex list head from `set_robust_list` for the running
+/// task's process.
+pub fn set_robust_head(head: usize) {
+    with_table(|t| t.task(t.current).mm.set_robust_head(head));
 }
 
 /// Set the mmap cursor for the current task.
@@ -6278,13 +6553,13 @@ pub fn timer_alloc(signo: u8, value: u64, notify: TimerNotify) -> Result<usize, 
         if let TimerNotify::Thread(target) = notify {
             let ok = task_ok_for_timer(t, target).is_some_and(|grp| grp == t.task(t.current).tgid);
             if !ok {
-                return Err(crate::syscall::err::EINVAL);
+                return Err(crate::err::EINVAL);
             }
         }
         let task = t.task_mut(t.current);
         let slot = (0..TIMER_SLOTS).find(|&s| task.timers[s].is_none());
         let Some(slot) = slot else {
-            return Err(crate::syscall::err::EAGAIN);
+            return Err(crate::err::EAGAIN);
         };
         task.timers[slot] = Some(PosixTimer {
             interval_ticks: 0,
@@ -6581,7 +6856,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
     // task is meaningless, and Linux answers ENOMEM for a process it cannot
     // duplicate.
     if !parent_has_space {
-        return crate::syscall::err::ENOMEM;
+        return crate::err::ENOMEM;
     }
 
     // Phase 2: Allocate a slot and build the child state.
@@ -6735,6 +7010,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             umask: t.task(parent_id).umask,
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
+            nice: t.task(parent_id).nice,
             rlimits: t.task(parent_id).rlimits,
             seccomp_strict: t.task(parent_id).seccomp_strict,
             seccomp_filters: t.task(parent_id).seccomp_filters.clone(),
@@ -7160,7 +7436,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
     // first thing either of them did would corrupt the other. Linux leaves
     // this to the caller; refusing is the kinder answer.
     if request.child_stack == 0 {
-        return crate::syscall::err::EINVAL;
+        return crate::err::EINVAL;
     }
 
     let child_id = with_table(|t| {
@@ -7176,6 +7452,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let umask = parent.umask;
         let oom_score_adj = parent.oom_score_adj;
         let oom_score_adj_min = parent.oom_score_adj_min;
+        let nice = parent.nice;
         let rlimits = parent.rlimits;
         let seccomp_strict = parent.seccomp_strict;
         let seccomp_filters = parent.seccomp_filters.clone();
@@ -7269,6 +7546,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             umask,
             oom_score_adj,
             oom_score_adj_min,
+            nice,
             rlimits,
             seccomp_strict,
             seccomp_filters,

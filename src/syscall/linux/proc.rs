@@ -1034,10 +1034,26 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             }
             0
         }
-        // Accepted and discarded: the signal a tracee actually receives is the
-        // one the tracer names on the resume, and a `siginfo_t` planted here
-        // would describe it wrongly rather than more fully.
-        abi::PTRACE_SETSIGINFO => 0,
+        // `PTRACE_SETSIGINFO`: the tracer would replace the `siginfo_t` the
+        // tracee sees on the next delivery. This kernel does not carry a custom
+        // siginfo into a signal frame - the tracee's delivered signal is the one
+        // named on the resume, synthesized from its number - so the honest answer
+        // is `EOPNOTSUPP`, the §4.4 "an action this machine does not implement"
+        // refusal a probing tracer falls back from. The old arm returned `0` for
+        // any `pid` while reading nothing: a not-a-tracee got a success where
+        // Linux answers `ESRCH`, a bad buffer a success where Linux answers
+        // `EFAULT` (it copies the struct first), and a good one a success that
+        // silently discarded it - the worst §4.2 shape of all three. The checks
+        // run in Linux's order: attach state, then the copy, then the refusal.
+        abi::PTRACE_SETSIGINFO => {
+            if crate::sched::stop_of(id).is_none() {
+                return err::ESRCH;
+            }
+            if !buffer_ok(data, abi::SIGINFO_BYTES, false, from_user) {
+                return err::EFAULT;
+            }
+            err::EOPNOTSUPP
+        }
         // Letting the tracee go on. `SYSCALL` re-arms the syscall trace and
         // `CONT` does not; `SINGLESTEP` is answered as a `SYSCALL` because this
         // kernel has no single-step trap, and a tracer that asked for one gets
@@ -1521,7 +1537,17 @@ pub(super) fn handle_nanosleep(args: [usize; ARG_COUNT], from_user: bool) -> isi
 /// duration.
 pub(super) fn handle_clock_nanosleep(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const TIMER_ABSTIME: usize = 0x1;
-    let (_clk_id, flags, req) = (args[0], args[1], args[2]);
+    let (clk_id, flags, req) = (args[0], args[1], args[2]);
+    // A clock this kernel does not keep is `EINVAL` before anything else, the way
+    // Linux answers it (measured: `clock_nanosleep(999, ...)` is `EINVAL`; only
+    // the ids `clock_gettime` names are sleepable). The old handler discarded
+    // `clk_id`, so a request to sleep on a nonexistent clock slept on the
+    // default and answered `0` - a success for a clock never named. (Unrecognised
+    // *flag* bits past `TIMER_ABSTIME` are ignored here and by Linux alike, per
+    // the same measurement, so they need no gate.)
+    if !matches!(clk_id, 0..=9 | 11) {
+        return err::EINVAL;
+    }
     if flags & TIMER_ABSTIME != 0 {
         return err::EINVAL;
     }
@@ -2082,6 +2108,14 @@ pub(super) fn handle_madvise(args: [usize; ARG_COUNT]) -> isize {
     use crate::mm::pframe::PAGE_SIZE;
     let (addr, len, advice) = (args[0], args[1], args[2]);
     if addr & (PAGE_SIZE - 1) != 0 {
+        return err::EINVAL;
+    }
+    // An advice the vocabulary does not name is EINVAL, the way Linux answers
+    // a number no one gave it. Returning `0` for one was the accept-and-drop
+    // this gate removes: a caller probing a hint it does not expect to be
+    // supported gets the honest refusal and falls back, rather than a success
+    // for a request this kernel was never asked to keep.
+    if !super::abi::madvise_advice_is_known(advice) {
         return err::EINVAL;
     }
     if advice == super::abi::MADV_DONTNEED && len != 0 {
@@ -2954,6 +2988,20 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     const CLOCK_MONOTONIC_COARSE: usize = 6;
     const CLOCK_BOOTTIME: usize = 7;
     let (clk_id, tp) = (args[0], args[1]);
+    // The clock id is checked before the destination, the way Linux is: a clock
+    // the kernel does not keep is `EINVAL` whatever the `tp` is. Measured on the
+    // host, `clock_gettime` accepts exactly `{0..=9, 11}` (`REALTIME`,
+    // `MONOTONIC`, the two cputime clocks, `MONOTONIC_RAW`, the two coarse
+    // clocks, `BOOTTIME`, the two alarm clocks and `TAI`) and answers `EINVAL`
+    // for the `10` gap and every id from `12` up - including garbage like `42`
+    // and `999`. The old handler fell through to wall-clock time for any id that
+    // was not one of its monotonic list, so `clock_gettime(999, &ts)` returned `0`
+    // with a number - the §4.2 success-for-a-thing-not-done: a caller probing
+    // whether a clock exists was handed a plausible reading for a clock this
+    // kernel never named.
+    if !matches!(clk_id, 0..=9 | 11) {
+        return err::EINVAL;
+    }
     if tp == 0 {
         return err::EFAULT;
     }
@@ -3246,34 +3294,57 @@ pub(super) fn handle_time(args: [usize; ARG_COUNT]) -> isize {
     secs as isize
 }
 
+/// Convert an internal tick count (the PIT runs at `TICK_HZ`) into the `USER_HZ`
+/// clock ticks Linux's `times()` reports. Linux truncates; so does this. `100`
+/// is the `CLK_TCK` musl hardcodes and hands to `sysconf(_SC_CLK_TCK)`, so a
+/// caller converting ticks to seconds divides by 100 and must get the same unit
+/// back from the kernel - otherwise its CPU arithmetic is off by `TICK_HZ/100`.
+fn clock_ticks_to_user_hz(ticks: u64) -> u64 {
+    ticks * 100 / crate::arch::timer::TICK_HZ as u64
+}
+
 /// `times(buf)` — this process's CPU time, in clock ticks.
 ///
-/// `struct tms { clock_t tms_utime, tms_stime, tms_cutime, tms_cstime; }`.
-/// This kernel does not account CPU time per task - a task runs whenever it
-/// is scheduled and nothing clocks it - so all four report zero, which is
-/// what a system with no accounting says. The returned value is the tick
-/// count since boot: elapsed time, the thing the call is also specified to
-/// hand back for a caller doing its own arithmetic.
+/// `struct tms { clock_t tms_utime, tms_stime, tms_cutime, tms_cstime; }`, four
+/// `long`s. The timer interrupt charges the running task's group `Mm` user or
+/// system by the ring it interrupted, so `tms_utime`/`tms_stime` are the calling
+/// process's real split CPU, reported in `USER_HZ` ticks; a reaped child's CPU
+/// folds into `tms_cutime`/`tms_cstime` at the reap (Linux accumulates on
+/// `wait`). The returned value is the elapsed clock, in the same `USER_HZ`
+/// unit, so `(utime+stime)/elapsed` is unit-correct.
 pub(super) fn handle_times(args: [usize; ARG_COUNT]) -> isize {
     let buf = args[0];
+    let elapsed = clock_ticks_to_user_hz(crate::arch::timer::ticks());
     if buf == 0 {
-        return crate::arch::timer::ticks() as isize;
+        return elapsed as isize;
     }
     if !buffer_ok(buf, 32, true, true) {
         return err::EFAULT;
     }
+    let (utime, stime, cutime, cstime) = crate::sched::current_cpu_ticks();
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, 32);
+        let put = |off: usize, ticks: u64| {
+            ((buf + off) as *mut i64).write_unaligned(clock_ticks_to_user_hz(ticks) as i64)
+        };
+        put(0, utime);
+        put(8, stime);
+        put(16, cutime);
+        put(24, cstime);
     }
-    crate::arch::timer::ticks() as isize
+    elapsed as isize
 }
 
 /// `getrusage(who, usage)` — resource use for self or for reaped children.
 ///
-/// `struct rusage` leads with two `timeval`s of CPU time and follows with
-/// fourteen `long` counters. None of it is measured here, so the struct is
-/// zeroed and handed back - an honest "nothing spent" rather than a number
-/// invented to look plausible. `RUSAGE_CHILDREN` is answered the same way.
+/// `struct rusage` opens with two `struct timeval`s (`ru_utime` then `ru_stime`)
+/// and follows with fourteen `long` counters. `RUSAGE_SELF` reports the calling
+/// process's real split CPU as the timer accumulated it; a `timeval` is absolute
+/// wall-clock, so the tick count is divided by `TICK_HZ` for seconds and the
+/// remainder scaled to microseconds. The fourteen byte/page counters are not
+/// measured, so they stay zero - an honest "nothing measured" rather than a
+/// plausible number. `RUSAGE_CHILDREN` reports the CPU of children already waited
+/// for, which the reap folded into this process's child totals.
 pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
     const RUSAGE_SELF: usize = 0;
     const RUSAGE_CHILDREN: usize = -1isize as usize;
@@ -3287,6 +3358,28 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
     }
     unsafe {
         core::ptr::write_bytes(usage as *mut u8, 0, RUSAGE_SIZE);
+    }
+    // `RUSAGE_SELF` is the process's own split CPU; `RUSAGE_CHILDREN` is the
+    // CPU of children already waited for, which the reap folded into the
+    // parent's child totals.
+    let (utime, stime) = match who {
+        RUSAGE_SELF => {
+            let (u, s, _, _) = crate::sched::current_cpu_ticks();
+            (u, s)
+        }
+        _ => {
+            let (_, _, cu, cs) = crate::sched::current_cpu_ticks();
+            (cu, cs)
+        }
+    };
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    unsafe {
+        let put = |off: usize, ticks: u64| {
+            ((usage + off) as *mut i64).write_unaligned((ticks / hz) as i64);
+            ((usage + off + 8) as *mut i64).write_unaligned(((ticks % hz) * 1_000_000 / hz) as i64);
+        };
+        put(0, utime); // ru_utime {sec, usec}
+        put(16, stime); // ru_stime {sec, usec}
     }
     0
 }

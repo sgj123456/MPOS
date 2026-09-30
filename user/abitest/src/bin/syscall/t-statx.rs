@@ -143,6 +143,61 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         );
     }
 
+    // ---- the flag word is a closed set, and NOFOLLOW is honoured ----
+    //
+    // A bit outside {NOFOLLOW, NO_AUTOMOUNT, EMPTY_PATH, the sync bits} is
+    // EINVAL. Measured on the host: 0x10000 is rejected. The old handler
+    // discarded `flags`, so any bit was accepted.
+    static LINK: [u8; 18] = *b"/tmp/t-statx_link\0";
+    let r = lin::statx(lin::AT_FDCWD, &MOTD, 0x10000, lin::STATX_BASIC_STATS, stx);
+    lin::check_eq(
+        &mut failed,
+        b"statx with an unknown flag bit (0x10000) is EINVAL",
+        r,
+        lin::EINVAL,
+    );
+    // AT_SYMLINK_NOFOLLOW reports the link, not its target: a lstat-style statx
+    // the old handler could not answer, because it ignored the flag and always
+    // resolved through the link to the regular file.
+    let _ = lin::unlinkat(lin::AT_FDCWD, &LINK, 0);
+    let r = lin::symlink(&MOTD, &LINK);
+    lin::check_eq(&mut failed, b"the symlink is made", r, 0);
+    let r = lin::statx(lin::AT_FDCWD, &LINK, 0, lin::STATX_BASIC_STATS, stx);
+    lin::check_eq(
+        &mut failed,
+        b"statx through the link follows it (S_IFREG)",
+        r,
+        0,
+    );
+    unsafe {
+        lin::check_true(
+            &mut failed,
+            b"without NOFOLLOW the target's regular-file mode is reported",
+            (*stx).stx_mode as u32 & lin::S_IFMT == lin::S_IFREG,
+        );
+    }
+    let r = lin::statx(
+        lin::AT_FDCWD,
+        &LINK,
+        lin::AT_SYMLINK_NOFOLLOW,
+        lin::STATX_BASIC_STATS,
+        stx,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"statx with AT_SYMLINK_NOFOLLOW succeeds",
+        r,
+        0,
+    );
+    unsafe {
+        lin::check_true(
+            &mut failed,
+            b"with NOFOLLOW the link itself is reported (S_IFLNK), not its target",
+            (*stx).stx_mode as u32 & lin::S_IFMT == lin::S_IFLNK,
+        );
+    }
+    let _ = lin::unlinkat(lin::AT_FDCWD, &LINK, 0);
+
     lin::done(failed)
 }
 

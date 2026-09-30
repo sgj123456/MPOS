@@ -182,7 +182,7 @@ impl Epoll {
         events: u32,
         data: u64,
     ) -> Result<(), isize> {
-        use crate::syscall::err;
+        use crate::err;
 
         // Entries whose number no longer names their description come out
         // first, so every question below - EEXIST, ENOENT, EPERM - is asked
@@ -506,10 +506,10 @@ fn nesting_check(this: &Epoll, target: &Epoll) -> Result<(), isize> {
         if core::ptr::eq(ep, this) {
             // The instance being registered is already among this one's
             // ancestors: a circle, not a nest.
-            return Err(crate::syscall::err::ELOOP);
+            return Err(crate::err::ELOOP);
         }
         if depth == 0 {
-            return Err(crate::syscall::err::ELOOP);
+            return Err(crate::err::ELOOP);
         }
         let nested = critical_section::with(|cs| {
             ep.state
@@ -589,7 +589,7 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::syscall::err;
+    use crate::err;
     use crate::vfs::file::{FdTable, File};
     use crate::vfs::pipe::{self, DuplexEnd};
     use crate::vfs::ramfs::RamFs;

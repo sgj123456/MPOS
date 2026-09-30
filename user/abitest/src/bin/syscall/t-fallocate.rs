@@ -174,6 +174,20 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EBADF,
     );
 
+    // A regular file opened read-only: fallocate is a write, so the descriptor
+    // is refused EBADF and nothing is grown (measured on the host). The old
+    // handler resized a read-only descriptor's file - a §4.2 write done on a
+    // descriptor that must not write.
+    let ro = lin::openat(lin::AT_FDCWD, &PATH, lin::O_RDONLY, 0) as i32;
+    lin::check_true(&mut failed, b"the file reopens read-only", ro >= 0);
+    lin::check_eq(
+        &mut failed,
+        b"fallocate on an O_RDONLY fd answers EBADF",
+        lin::fallocate(ro, 0, 0, 4096),
+        lin::EBADF,
+    );
+    let _ = lin::close(ro);
+
     let _ = lin::close(fds[0]);
     let _ = lin::close(fds[1]);
     let _ = lin::close(fd);

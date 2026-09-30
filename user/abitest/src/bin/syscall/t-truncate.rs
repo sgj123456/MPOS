@@ -262,6 +262,44 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     let _ = lin::close(fd);
+
+    // ftruncate on a read-only descriptor is EINVAL, and the file is left
+    // whole - the resize is a write, so a descriptor that may not write is
+    // refused. Measured on the host: Linux answers EINVAL (not EBADF) and does
+    // not change the size. Counterfactual: the old handler resized it happily.
+    let ro = lin::openat(lin::AT_FDCWD, PATH, lin::O_RDONLY, 0) as i32;
+    lin::check_true(&mut failed, b"the file reopens read-only", ro >= 0);
+    lin::check_eq(
+        &mut failed,
+        b"ftruncate on an O_RDONLY fd answers EINVAL",
+        lin::ftruncate(ro, 5),
+        lin::EINVAL,
+    );
+    let mut st2 = zero_stat();
+    lin::check_eq(
+        &mut failed,
+        b"the refused ftruncate leaves the size unchanged",
+        lin::fstat(ro, &raw mut st2),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the size is still thirteen after the refused resize",
+        st2.st_size as isize,
+        13,
+    );
+    // A write-opened descriptor is still resized, so the gate is the access
+    // mode, not a blanket refusal.
+    let rw = lin::openat(lin::AT_FDCWD, PATH, lin::O_WRONLY, 0) as i32;
+    lin::check_true(&mut failed, b"the file reopens write-only", rw >= 0);
+    lin::check_eq(
+        &mut failed,
+        b"ftruncate on an O_WRONLY fd succeeds",
+        lin::ftruncate(rw, 7),
+        0,
+    );
+    let _ = lin::close(ro);
+    let _ = lin::close(rw);
     let _ = lin::unlinkat(lin::AT_FDCWD, PATH, 0);
     lin::done(failed)
 }

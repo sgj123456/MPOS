@@ -33,6 +33,10 @@ pub mod console;
 pub mod date;
 #[cfg(target_os = "none")]
 pub mod drivers;
+/// The errno table: the numbers every layer answers "no" with. Sits at the
+/// crate root precisely so that refusing in Linux's language never requires
+/// naming the `syscall` layer from below it.
+pub mod err;
 /// evdev's record window and its clients: which reader sees which event, and
 /// what a grab does to the answer. Not target-gated - the driver that fills the
 /// window needs a virtio ring and a clock, but the policy over it is arithmetic,
@@ -65,6 +69,11 @@ pub mod sched;
 pub mod seccomp;
 pub mod sync;
 pub mod syscall;
+/// The userland-boundary primitives - validate a caller's pointer, and turn a
+/// `VfsError` into the errno userland reads. They live at the crate root so a
+/// layer *below* `syscall` (net, a driver) can reach them without naming the
+/// ABI layer for a page walk; `syscall` re-exports them for its own handlers.
+pub mod uaccess;
 /// Device events: what the kernel tells userland when a device
 /// appears, and the netlink socket they travel over. Not target-gated:
 /// nothing here needs hardware, and the wire format is worth testing

@@ -21,37 +21,37 @@ pub use runtime::{
     ItimerState, MAX_TASKS, Redirect, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID, STACK_ORDER,
     SpawnError, Stop, TIMER_ABSTIME, TaskSnapshot, TimerNotify, WaitEnd, WaitEvent,
     acquire_controlling_tty, become_session_leader, block_until, block_until_child_event,
-    block_until_code, block_until_deadline, brk, check_itimer, child_event, child_event_pending,
-    child_exited_unreaped, claim_anon_gaps, clone, continued_report_pending,
-    controlling_tty_of_current, current, current_blocked, current_cwd, current_cwd_path,
-    current_disposition, current_exe, current_fds, current_groups, current_identity,
-    current_is_root, current_is_seccomp_strict, current_map_user, current_owner, current_pending,
-    current_pgid, current_real_owner, current_rlimit, current_stack_range, current_tgid,
-    current_tls, current_umask, deliver_pending_signal, descriptor_numbers, descriptors_of,
-    detach_traced, device_not_available, discard_exit_code, exec_replace, exec_trap, exit,
-    exit_code, exit_group, fork, fork_trap, get_mmap_cursor, group_members, group_stop,
-    has_children, has_deliverable_signal, has_live_child, has_seccomp_filter, has_tracer, init,
-    insert_vma, is_child, is_stopped, itimer_snapshot, itimer_swap, kernel_lazy_accessible,
-    madvise_dontneed, map_anon, map_frames, membarrier_registrations, move_user_page, munmap_user,
-    oom_score_adj_of, parent_of, pause, permanent_tasks, pgid_of, poll_any_child,
-    poll_any_child_event, populate_user_page_at, preempt, process_members, protect_user,
-    protect_user_range, read_sigchld, read_user, read_user_of, register_membarrier,
+    block_until_code, block_until_deadline, brk, charge_cpu, check_itimer, child_event,
+    child_event_pending, child_exited_unreaped, claim_anon_gaps, clone, continued_report_pending,
+    controlling_tty_of_current, current, current_blocked, current_comm_bytes, current_cpu_ticks,
+    current_cwd, current_cwd_path, current_disposition, current_exe, current_fds, current_groups,
+    current_identity, current_is_root, current_is_seccomp_strict, current_map_user, current_owner,
+    current_pending, current_pgid, current_real_owner, current_rlimit, current_stack_range,
+    current_tgid, current_tls, current_umask, deliver_pending_signal, descriptor_numbers,
+    descriptors_of, detach_traced, device_not_available, discard_exit_code, exec_replace,
+    exec_trap, exit, exit_code, exit_group, fork, fork_trap, get_mmap_cursor, group_members,
+    group_stop, has_children, has_deliverable_signal, has_live_child, has_seccomp_filter,
+    has_tracer, init, insert_vma, is_child, is_stopped, itimer_snapshot, itimer_swap,
+    kernel_lazy_accessible, madvise_dontneed, map_anon, map_frames, membarrier_registrations,
+    move_user_page, munmap_user, nice_of, oom_score_adj_of, parent_of, pause, permanent_tasks,
+    pgid_of, poll_any_child, poll_any_child_event, populate_user_page_at, preempt, process_members,
+    protect_user, protect_user_range, read_sigchld, read_user, read_user_of, register_membarrier,
     release_user_frames, reset_disposition, resolve_anon_fault, resolve_cow_fault, resolve_script,
-    resolve_stack_growth, resume_traced, rlimits_of, run_seccomp_filters, send_signal,
+    resolve_stack_growth, resume_traced, rlimits_of, robust_head, run_seccomp_filters, send_signal,
     send_signal_group, send_signal_info, send_signal_process, session_of_tty, set_brk_base,
-    set_clear_tid, set_current_blocked, set_current_identity, set_current_rlimit, set_current_tls,
-    set_current_umask, set_cwd, set_cwd_path, set_mmap_cursor, set_oom_score_adj, set_pgid,
-    set_seccomp_filter, set_seccomp_strict, set_signal_action, set_signal_alt_stack, set_trace_fpu,
-    set_trace_options, set_trace_regs, set_tracer, signal_action, signal_alt_stack, sleep_ticks,
-    snapshot, snapshots, space_root_of, spawn, spawn_permanent, spawn_user, started,
-    stop_at_syscall, stop_of, take_child_event, take_continued_report, take_deliverable_siginfo,
-    take_deliverable_signal, take_exit_code, take_exit_code_current, take_fatal_signal,
-    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_count,
-    thread_snapshots, timer_alloc, timer_arm, timer_overrun, timer_remove, timer_state, tls_of,
-    trace_fpu, trace_options, trace_regs, trace_signal_stop, trace_syscall, tracer_of,
-    try_spawn_user, unmap_user, user_frame_at, user_mapped, user_range_free, vfork, vma_gaps,
-    vma_prot_at, wait_any_child, wait_any_child_event, wait_for_interrupt, wake, write_user,
-    write_user_of, yield_now,
+    set_clear_tid, set_current_blocked, set_current_comm, set_current_identity, set_current_rlimit,
+    set_current_tls, set_current_umask, set_cwd, set_cwd_path, set_mmap_cursor, set_nice,
+    set_oom_score_adj, set_pgid, set_robust_head, set_seccomp_filter, set_seccomp_strict,
+    set_signal_action, set_signal_alt_stack, set_trace_fpu, set_trace_options, set_trace_regs,
+    set_tracer, signal_action, signal_alt_stack, sleep_ticks, snapshot, snapshots, space_root_of,
+    spawn, spawn_permanent, spawn_user, started, stop_at_syscall, stop_of, take_child_event,
+    take_continued_report, take_deliverable_siginfo, take_deliverable_signal, take_exit_code,
+    take_exit_code_current, take_fatal_signal, take_pending_event, take_signal_in_set,
+    take_stop_report, take_vmas, task_count, thread_snapshots, timer_alloc, timer_arm,
+    timer_overrun, timer_remove, timer_state, tls_of, trace_fpu, trace_options, trace_regs,
+    trace_signal_stop, trace_syscall, tracer_of, try_spawn_user, uid_members, unmap_user,
+    user_frame_at, user_mapped, user_range_free, vfork, vma_gaps, vma_prot_at, wait_any_child,
+    wait_any_child_event, wait_for_interrupt, wake, write_user, write_user_of, yield_now,
 };
 
 /// A host build has no processes, so no creator: root, which is what a node
@@ -170,3 +170,59 @@ pub fn descriptor_numbers(_pid: usize) -> alloc::vec::Vec<usize> {
 
 #[cfg(not(target_os = "none"))]
 pub fn register_membarrier(_barrier: usize) {}
+
+/// The robust-list head, with no task table to keep it on. The host build is a
+/// single-process test harness, so one slot stands for "the current process"
+/// and lets `set_robust_list`/`get_robust_list` round-trip under test; the
+/// machine build reads and writes the real per-group head in `runtime`.
+#[cfg(not(target_os = "none"))]
+static HOST_ROBUST_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_os = "none"))]
+pub fn robust_head() -> usize {
+    HOST_ROBUST_HEAD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_robust_head(head: usize) {
+    HOST_ROBUST_HEAD.store(head, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `PR_SET_NAME` slot with no task table to keep it on. The host build is
+/// a single-process test harness, so one 16-byte array stands for "the current
+/// process's comm" and lets `PR_SET_NAME` be read back by `PR_GET_NAME` under
+/// test; the machine build reads and writes the group's real slot in `runtime`.
+#[cfg(not(target_os = "none"))]
+static HOST_COMM: [core::sync::atomic::AtomicU8; 16] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; 16];
+
+#[cfg(not(target_os = "none"))]
+pub fn set_current_comm(name: &[u8]) {
+    for i in 0..16 {
+        let byte = match name.get(i).copied() {
+            Some(0) | None => 0,
+            Some(b) => b,
+        };
+        HOST_COMM[i].store(byte, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn current_comm_bytes() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (slot, cell) in out.iter_mut().zip(HOST_COMM.iter()) {
+        *slot = cell.load(core::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// With no timer interrupt on the host there is nothing to charge, and no group
+/// to charge it to. `current_cpu_ticks` answers `(0, 0)`; the machine build reads
+/// the running group's real counters in `runtime`.
+#[cfg(not(target_os = "none"))]
+pub fn charge_cpu(_in_user: bool) {}
+
+#[cfg(not(target_os = "none"))]
+pub fn current_cpu_ticks() -> (u64, u64, u64, u64) {
+    (0, 0, 0, 0)
+}

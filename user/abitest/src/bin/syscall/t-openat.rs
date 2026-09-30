@@ -24,6 +24,7 @@ static BIN: [u8; 5] = *b"/bin\0";
 static SH: [u8; 3] = *b"sh\0";
 static X: [u8; 2] = *b"x\0";
 static NEW: [u8; 18] = *b"/tmp/t-openat_new\0";
+static LINK: [u8; 19] = *b"/tmp/t-openat_link\0";
 
 // The flag bits come from the shared header rather than being spelled here:
 // this file once carried its own `O_EXCL = 0o400`, which is `O_NOCTTY`, and
@@ -112,6 +113,49 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EEXIST,
     );
     let _ = lin::close(fd as i32);
+
+    // ---- O_NOFOLLOW is honoured ----
+    //
+    // A symlink to the file made above: O_NOFOLLOW must refuse the final
+    // component with ELOOP, while the same open without it still follows. The
+    // old handler defined no O_NOFOLLOW, so the flagged open followed the link
+    // and answered success - a dropped security guarantee. Counterfactual.
+    let _ = lin::unlinkat(lin::AT_FDCWD, &LINK, 0);
+    let r = lin::symlink(&NEW, &LINK);
+    lin::check_eq(
+        &mut failed,
+        b"the symlink to the made file is created",
+        r,
+        0,
+    );
+    let r = lin::openat(lin::AT_FDCWD, &LINK, lin::O_RDONLY | lin::O_NOFOLLOW, 0);
+    lin::check_eq(
+        &mut failed,
+        b"openat on a symlink with O_NOFOLLOW answers ELOOP",
+        r,
+        lin::ELOOP,
+    );
+    let fd = lin::openat(lin::AT_FDCWD, &LINK, lin::O_RDONLY, 0);
+    lin::check_true(
+        &mut failed,
+        b"the same open without O_NOFOLLOW still follows the link",
+        fd >= 0,
+    );
+    if fd >= 0 {
+        let _ = lin::close(fd as i32);
+    }
+    // O_NOFOLLOW on a regular (non-link) name is no obstacle.
+    let fd = lin::openat(lin::AT_FDCWD, &NEW, lin::O_RDONLY | lin::O_NOFOLLOW, 0);
+    lin::check_true(
+        &mut failed,
+        b"O_NOFOLLOW on a regular file still opens it",
+        fd >= 0,
+    );
+    if fd >= 0 {
+        let _ = lin::close(fd as i32);
+    }
+    let _ = lin::unlinkat(lin::AT_FDCWD, &LINK, 0);
+    let _ = lin::unlinkat(lin::AT_FDCWD, &NEW, 0);
 
     lin::done(failed)
 }

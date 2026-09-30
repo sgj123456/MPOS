@@ -99,6 +99,17 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
 
     // --- a DISCOVER, octet by octet: 20 IP + 8 UDP + 264 BOOTP+options ---
     const TOTAL: usize = 292;
+    // The two bases the fields are named against. The IPv4 destination is
+    // header-relative 16 (bytes 20..24 are the UDP port pair), and the BOOTP
+    // message starts 28 bytes in - so its magic cookie, at BOOTP-relative 236,
+    // is byte 264 of this buffer, not byte 236. Both were once written at the
+    // wrong base, and the packet left the machine addressed to 0.0.0.0 with no
+    // cookie in it: `sendto` returned the whole length - the kernel sends the
+    // bytes it is handed - and the host's BOOTP server, having nothing to
+    // recognise, never answered. The bug was in this construction, not in the
+    // door it is testing.
+    const IP_DST: usize = 16;
+    const BOOTP: usize = 28;
     let mut pkt = [0u8; TOTAL];
     // IPv4 header
     pkt[0] = 0x45;
@@ -106,7 +117,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     pkt[8] = 64; // ttl
     pkt[9] = 17; // UDP
     // src 0.0.0.0 (as an addressless client sends), dst 255.255.255.255
-    pkt[20..24].copy_from_slice(&[255, 255, 255, 255]);
+    pkt[IP_DST..IP_DST + 4].copy_from_slice(&[255, 255, 255, 255]);
     let ip_csum = cksum(&pkt[0..20]).to_be_bytes();
     pkt[10..12].copy_from_slice(&ip_csum);
     // UDP: bootp client port 68 to server port 67; a zero checksum is legal
@@ -115,22 +126,22 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     pkt[20 + 2..20 + 4].copy_from_slice(&67u16.to_be_bytes());
     pkt[20 + 4..20 + 6].copy_from_slice(&((TOTAL - 20) as u16).to_be_bytes());
     // BOOTP request, starting at the UDP payload (offset 28)
-    pkt[28] = 1; // op = BOOTREQUEST
-    pkt[29] = 1; // htype = Ethernet
-    pkt[30] = 6; // hlen
-    pkt[32..36].copy_from_slice(&0x4d504f53u32.to_be_bytes()); // xid
-    pkt[38..40].copy_from_slice(&0x8000u16.to_be_bytes()); // broadcast flag
-    pkt[56..62].copy_from_slice(&mac); // chaddr
-    pkt[236..240].copy_from_slice(&[99, 130, 83, 99]); // magic cookie
+    pkt[BOOTP] = 1; // op = BOOTREQUEST
+    pkt[BOOTP + 1] = 1; // htype = Ethernet
+    pkt[BOOTP + 2] = 6; // hlen
+    pkt[BOOTP + 4..BOOTP + 8].copy_from_slice(&0x4d504f53u32.to_be_bytes()); // xid
+    pkt[BOOTP + 10..BOOTP + 12].copy_from_slice(&0x8000u16.to_be_bytes()); // broadcast flag
+    pkt[BOOTP + 28..BOOTP + 34].copy_from_slice(&mac); // chaddr
+    pkt[BOOTP + 236..BOOTP + 240].copy_from_slice(&[99, 130, 83, 99]); // magic cookie
     // options: message-type DISCOVER, client-id, end.
-    pkt[240] = 53;
-    pkt[241] = 1;
-    pkt[242] = 1;
-    pkt[243] = 61;
-    pkt[244] = 7;
-    pkt[245] = 1;
-    pkt[246..252].copy_from_slice(&mac);
-    pkt[252] = 255;
+    pkt[BOOTP + 240] = 53;
+    pkt[BOOTP + 241] = 1;
+    pkt[BOOTP + 242] = 1;
+    pkt[BOOTP + 243] = 61;
+    pkt[BOOTP + 244] = 7;
+    pkt[BOOTP + 245] = 1;
+    pkt[BOOTP + 246..BOOTP + 252].copy_from_slice(&mac);
+    pkt[BOOTP + 252] = 255;
 
     // The destination: the broadcast. With `halen` left zero the kernel
     // reads "no link address named", which for `SOCK_DGRAM` means the

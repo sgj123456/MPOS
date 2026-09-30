@@ -115,8 +115,16 @@ pub fn enable() {
     x86_64::instructions::interrupts::enable();
 }
 
-extern "x86-interrupt" fn timer(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
     super::timer::tick();
+    // Charge the tick to the process that was running before the interrupt,
+    // attributed user or system by the ring the core was left in: a code
+    // segment equal to the user selector means the tick caught the task in its
+    // own ring-3 code (`utime`), anything else means the kernel was running on
+    // its behalf (`stime`). Charged before the EOI and the preempt, so the tick
+    // lands on the task that actually held the core.
+    let in_user = frame.code_segment == crate::arch::gdt::user_selectors().0;
+    crate::sched::charge_cpu(in_user);
     // EOI before preempting: once the scheduler switches away this handler does
     // not return until the task is resumed, and an unacknowledged PIC would
     // block every interrupt until then.

@@ -37,6 +37,25 @@ fn clock_gettime_raw(clk_id: usize, tp: usize) -> isize {
     ret
 }
 
+/// `clock_nanosleep(clk_id, flags, req, rem)` raw, so a request to sleep on a
+/// clock that does not exist can be shown refused before it touches the sleep.
+fn clock_nanosleep_raw(clk_id: usize, flags: usize, req: usize, rem: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") lin::nr::CLOCK_NANOSLEEP as isize => ret,
+            in("rdi") clk_id,
+            in("rsi") flags,
+            in("rdx") req,
+            in("r10") rem,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::puts(b"t-clock-gettime\n");
@@ -118,6 +137,65 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         &mut failed,
         b"the sleep moved the monotonic clock by 40 ms to 5 s",
         elapsed_ms >= 40 && elapsed_ms <= 5000,
+    );
+
+    // The clock-id vocabulary is closed: Linux accepts exactly {0..=9, 11} and
+    // answers EINVAL for the 10 gap and every id from 12 up (measured). This
+    // kernel used to fall through to wall-clock time for any id outside its
+    // monotonic list, so clock_gettime(999, &ts) answered 0 with a plausible
+    // number - a success for a clock never named.
+    let mut probe = lin::TimeSpec {
+        tv_sec: -1,
+        tv_nsec: -1,
+    };
+    lin::check_eq(
+        &mut failed,
+        b"clock_gettime(10) - a gap in the id set - is EINVAL",
+        lin::clock_gettime(10, &mut probe),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"clock_gettime(999) is EINVAL, not a silent wall reading",
+        lin::clock_gettime(999, &mut probe),
+        lin::EINVAL,
+    );
+    // A recognised-but-unserved-static id is still accepted (TAI = 11), so the
+    // gate is the vocabulary, not a refusal of everything past the first few.
+    lin::check_eq(
+        &mut failed,
+        b"clock_gettime(11 / CLOCK_TAI) answers 0",
+        lin::clock_gettime(11, &mut probe),
+        0,
+    );
+
+    // clock_nanosleep shares the gate: a nonexistent clock is EINVAL before it
+    // sleeps, rather than sleeping on the default and answering 0.
+    let one_ns = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 1,
+    };
+    let mut rem = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    lin::check_eq(
+        &mut failed,
+        b"clock_nanosleep(999) on a nonexistent clock is EINVAL",
+        clock_nanosleep_raw(999, 0, &raw const one_ns as usize, &raw mut rem as usize),
+        lin::EINVAL,
+    );
+    // A real clock still sleeps (relative, flags 0).
+    lin::check_eq(
+        &mut failed,
+        b"clock_nanosleep(CLOCK_MONOTONIC) answers 0",
+        clock_nanosleep_raw(
+            lin::CLOCK_MONOTONIC,
+            0,
+            &raw const one_ns as usize,
+            &raw mut rem as usize,
+        ),
+        0,
     );
 
     lin::done(failed)

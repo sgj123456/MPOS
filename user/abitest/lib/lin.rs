@@ -280,7 +280,9 @@ pub const EINVAL: isize = -22;
 pub const ENOTTY: isize = -25;
 pub const EIO: isize = -5;
 pub const ENOSPC: isize = -28;
+pub const ESPIPE: isize = -29;
 pub const ERANGE: isize = -34;
+pub const ELOOP: isize = -40;
 pub const ENOSYS: isize = -38;
 /// The errnos of the POSIX completion set: permission, cross-device,
 /// unsupported operation, and the cancellation a CANCEL_ON_SET timer
@@ -355,6 +357,8 @@ pub const O_RDWR: usize = 2;
 pub const O_CREAT: usize = 0o100;
 pub const O_EXCL: usize = 0o200;
 pub const O_DIRECTORY: usize = 0o200_000;
+/// O_NOFOLLOW: refuse to follow a symbolic link at the final path component.
+pub const O_NOFOLLOW: usize = 0o40_0000;
 pub const O_CLOEXEC: usize = 0x8000_0;
 /// `O_NONBLOCK`: `pipe2`'s other flag, and the one bit `F_SETFL`/`F_GETFL`
 /// carries that changes how a descriptor behaves.
@@ -1128,6 +1132,13 @@ pub fn pipe2(fds: &mut [i32; 2], flags: usize) -> isize {
     sys2(nr::PIPE2, fds.as_mut_ptr() as usize, flags)
 }
 
+/// `posix_fadvise(fd, offset, len, advice)` — the raw `fadvise64` call. At the
+/// syscall ABI it answers `0` or a negative errno directly (the libc wrapper
+/// negates it), and the x86_64 argument order is `(fd, offset, len, advice)`.
+pub fn fadvise64(fd: i32, offset: usize, len: usize, advice: usize) -> isize {
+    sys4(nr::FADVISE64, fd as usize, offset, len, advice)
+}
+
 /// Remove `path` relative to `dirfd`; `AT_REMOVEDIR` removes a directory.
 pub fn unlinkat(dirfd: i32, path: &[u8], flags: usize) -> isize {
     sys3(nr::UNLINKAT, dirfd as usize, path.as_ptr() as usize, flags)
@@ -1593,6 +1604,20 @@ pub fn setpriority(which: usize, who: usize, prio: isize) -> isize {
     sys3(nr::SETPRIORITY, which, who, prio as usize)
 }
 
+/// `sched_setattr(attr, flags)` on the calling thread (`pid` 0). `attr` is a
+/// 48-byte `struct sched_attr`: `size` at offset 0, `sched_policy` at 4,
+/// `sched_nice` at 16.
+pub fn sched_setattr(attr: *const u8, flags: usize) -> isize {
+    sys3(nr::SCHED_SETATTR, 0, attr as usize, flags)
+}
+
+/// `sched_getattr(attr, size, flags)` on the calling thread (`pid` 0). The
+/// kernel writes its answer into `attr` up to the smaller of `size` and the
+/// 48-byte version it knows.
+pub fn sched_getattr(attr: *mut u8, size: usize, flags: usize) -> isize {
+    sys4(nr::SCHED_GETATTR, 0, attr as usize, size, flags)
+}
+
 /// `sched_getscheduler(pid)`.
 pub fn sched_getscheduler(pid: isize) -> isize {
     sys1(nr::SCHED_GETSCHEDULER, pid as usize)
@@ -1601,6 +1626,18 @@ pub fn sched_getscheduler(pid: isize) -> isize {
 /// `sched_getparam(pid, param)`: one `int` priority out.
 pub fn sched_getparam(pid: isize, param: *mut i32) -> isize {
     sys2(nr::SCHED_GETPARAM, pid as usize, param as usize)
+}
+
+/// `sched_setparam(pid, param)`: `param` is a one-`int` `struct sched_param`
+/// carrying `sched_priority`.
+pub fn sched_setparam(pid: isize, param: *const i32) -> isize {
+    sys2(nr::SCHED_SETPARAM, pid as usize, param as usize)
+}
+
+/// `sched_setscheduler(pid, policy, param)`: `param` is the same one-`int`
+/// `struct sched_param`.
+pub fn sched_setscheduler(pid: isize, policy: usize, param: *const i32) -> isize {
+    sys3(nr::SCHED_SETSCHEDULER, pid as usize, policy, param as usize)
 }
 
 /// `sched_get_priority_max(policy)` / `sched_get_priority_min(policy)`.
@@ -2058,7 +2095,8 @@ pub const MREMAP_MAYMOVE: usize = 0x1;
 /// `MREMAP_FIXED`: move to exactly the address named in the fifth argument.
 pub const MREMAP_FIXED: usize = 0x2;
 
-/// `madvise(addr, len, advice)` - accepted and answered 0.
+/// `madvise(addr, len, advice)` - recognised advice answered 0, an advice
+/// outside the vocabulary answered EINVAL.
 pub fn madvise(addr: usize, len: usize, advice: usize) -> isize {
     sys3(nr::MADVISE, addr, len, advice)
 }

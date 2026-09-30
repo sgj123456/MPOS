@@ -37,7 +37,12 @@ pub extern "C" fn mpos_user_main(_argc: i32, _argv: *const *const u8) -> ! {
     let mut failed = false;
 
     let _ = lin::unlinkat(lin::AT_FDCWD, PATH, 0);
-    let fd = lin::openat(lin::AT_FDCWD, PATH, lin::O_WRONLY | O_CREAT, 0o644);
+    // Opened read-write, not write-only: the test reads the head back with
+    // `pread` further down, and on Linux a read on an `O_WRONLY` descriptor is
+    // `EBADF` - a `write`-only fd cannot be read no matter what was written.
+    // The access mode is now enforced (Phase 12 §12.2 B1), so this fd must ask
+    // for both directions the way any program that reads back its own write must.
+    let fd = lin::openat(lin::AT_FDCWD, PATH, lin::O_RDWR | O_CREAT, 0o644);
     if fd < 0 {
         lin::die(b"t-fill-ramfs: cannot create the file to fill\n");
     }

@@ -16,9 +16,9 @@ use super::abi;
 use super::abi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EFD_NONBLOCK, EFD_SEMAPHORE,
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW,
-    FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_RDWR, O_TMPFILE,
-    O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLHUP, POLLIN,
-    POLLNVAL, POLLOUT, StatTimes, normalize_path, write_stat,
+    FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR,
+    O_TMPFILE, O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLHUP,
+    POLLIN, POLLNVAL, POLLOUT, StatTimes, normalize_path, write_stat,
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
 use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X_OK};
@@ -152,6 +152,21 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
     {
         return err::EEXIST;
     }
+    // O_NOFOLLOW: the caller asked that the open not traverse a symbolic link
+    // at the final component. Walk to the parent and look the last name up
+    // without following it; if it is a link, ELOOP (measured on the host:
+    // open(symlink, O_NOFOLLOW) is ELOOP, open(regular, O_NOFOLLOW) succeeds,
+    // and intermediate links are still followed by the no-follow resolver's
+    // parent walk). The old handler defined no O_NOFOLLOW at all, so the bit
+    // was silently dropped and the open followed the very link the caller said
+    // to stop at - the classic `/tmp` defence, and a §4.2 accept-and-drop with
+    // security meaning.
+    if flags & O_NOFOLLOW != 0
+        && let Ok(inode) = crate::vfs::global().resolve_no_follow(path, base.clone())
+        && inode.metadata().kind == NodeKind::Symlink
+    {
+        return err::ELOOP;
+    }
     let opened = match crate::vfs::open_opt(path, Some(base.clone())) {
         Ok(fd) => Ok(fd),
         Err(crate::vfs::VfsError::NoEntry) if flags & O_CREAT != 0 => {
@@ -249,6 +264,14 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             // `IN_OPEN` report rides the same clone.
             if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
                 file.mark_opened_for(flags & O_ACCMODE != 0);
+                // Record the `O_ACCMODE` itself, not just "wrote-ish": `File::read`
+                // and `File::write` refuse a mismatch with `EBADF` from here on,
+                // which is Linux's answer for `write()` on an `O_RDONLY` fd and the
+                // reverse. The `status` word also keeps these bits for
+                // `F_GETFL`, but the enforcement reads this dedicated field so a
+                // later `F_SETFL` (which must not be able to change the access mode)
+                // cannot reopen a refused direction.
+                file.set_access((flags & O_ACCMODE) as u32);
                 crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_OPEN, "");
                 // An evdev client's read position starts here, at the
                 // description that will do the reading: Linux hands a client
@@ -465,6 +488,18 @@ pub(super) fn ftruncate(args: [usize; ARG_COUNT]) -> isize {
     if file.metadata().kind != NodeKind::File {
         return err::EINVAL;
     }
+    // `ftruncate` is a write, so a descriptor opened read-only is refused - and
+    // the file is left whole. Measured on the host: `ftruncate` on an
+    // `O_RDONLY` fd answers `EINVAL` and the size is unchanged, while an
+    // `O_WRONLY` fd truncates happily (`0`, size follows) - so the rule is
+    // "may it write?", which is `File::may_write`, not `check_writable`: this
+    // call's own errno is `EINVAL` where the `write(2)` door owes `EBADF`. A
+    // descriptor that never carried a path `open` (a socket, a pipe, an
+    // anonymous buffer) holds the permissive default and is unaffected - and it
+    // fails the file check above anyway.
+    if !file.may_write() {
+        return err::EINVAL;
+    }
     match file.inode().truncate(length as u64) {
         Ok(()) => {
             crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_MODIFY, "");
@@ -640,8 +675,18 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
 /// are not, and the mask says so. The struct is zeroed through `stx_mnt_id`
 /// (152 bytes) first, so fields the caller did not ask about read as absent.
 pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let (dirfd, path_ptr, _flags, mask, buf) =
+    let (dirfd, path_ptr, flags, mask, buf) =
         (args[0] as i32, args[1], args[2], args[3] as u32, args[4]);
+    // A flag word outside Linux's statx vocabulary is EINVAL, and
+    // `AT_SYMLINK_NOFOLLOW` is honoured, not ignored: the old handler discarded
+    // it (`_flags`) and always resolved the link, so an `lstat`-style statx
+    // (which `ls -l`, `stat` and uutils reach for) reported the *target's*
+    // metadata while claiming success - a success with data describing the wrong
+    // node, the §4.2 wrong-shape answer. `fstatat` already split here; statx now
+    // does the same.
+    if !abi::statx_flags_are_known(flags) {
+        return err::EINVAL;
+    }
     let path = match cstr_arg(path_ptr, true) {
         Ok(path) => path,
         Err(e) => return e,
@@ -649,7 +694,7 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // An empty path names the descriptor, but only when the caller said so:
     // Linux requires AT_EMPTY_PATH and answers ENOENT for the unannounced form.
     let (meta, rdev, stored, nlink, owner, times) = if path.is_empty() {
-        if _flags & AT_EMPTY_PATH == 0 {
+        if flags & AT_EMPTY_PATH == 0 {
             return err::ENOENT;
         }
         match crate::sched::current_fds().clone_at(dirfd) {
@@ -675,7 +720,15 @@ pub(super) fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Ok(base) => base,
             Err(e) => return e,
         };
-        match crate::vfs::resolve_opt(&path, Some(base)) {
+        // `AT_SYMLINK_NOFOLLOW` asks for the link, not its target: take the same
+        // parent-and-name no-follow walk `fstatat`'s `lstat` uses, rather than
+        // the following resolver.
+        let resolved = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            crate::vfs::global().resolve_no_follow(&path, base)
+        } else {
+            crate::vfs::resolve_opt(&path, Some(base))
+        };
+        match resolved {
             Ok(inode) => (
                 inode.metadata(),
                 inode.rdev(),
@@ -1059,9 +1112,21 @@ pub(super) fn chdir(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
-/// `unlinkat(dirfd, path, flags)` - `AT_REMOVEDIR` is accepted and ignored:
-/// removal goes through the same unlink either way.
+/// `unlinkat(dirfd, path, flags)` - `AT_REMOVEDIR` picks which operation this
+/// is: with the flag it is `rmdir`, without it `unlink`. The body below routes
+/// the two separately; an earlier note here called the flag "accepted and
+/// ignored", which was untrue the moment the rmdir/unlink split landed.
 pub(super) fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    // Linux rejects a flag bit that is not `AT_REMOVEDIR` with `EINVAL` before
+    // it resolves anything (measured: `unlinkat(fd, path, 0x1000)` is `EINVAL`
+    // and leaves the file in place). Routing only on the `AT_REMOVEDIR` bit
+    // silently accepted every other flag and removed the name anyway - a
+    // promise-shaped answer a caller could not detect, and the wrong *shape* of
+    // one (it deletes where Linux declines). The check is first, the way Linux
+    // words it.
+    if args[2] & !AT_REMOVEDIR != 0 {
+        return err::EINVAL;
+    }
     // `AT_REMOVEDIR` is `unlinkat` spelling `rmdir`: the flag is not an
     // optimisation, it is how the caller says which of the two operations it
     // means, and getting it wrong either removes a directory that still holds
@@ -1775,12 +1840,22 @@ pub(super) fn handle_pivot_root(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) 
 /// entire contract, and it is what a program with a worker uses instead of a
 /// pipe.
 pub(super) fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
-    if args[1] & EFD_SEMAPHORE != 0 {
+    let flags = args[1];
+    // `eventfd2`'s three flags are `EFD_SEMAPHORE`, `EFD_CLOEXEC` (`== O_CLOEXEC`)
+    // and `EFD_NONBLOCK` (`== O_NONBLOCK`). Any other bit is `EINVAL`, refused
+    // before anything else - the way Linux checks the flag word first. Silently
+    // accepting an unknown bit and then ignoring it would tell the caller it got
+    // the descriptor it asked for when it did not (the same §4.2 shape `signalfd`
+    // had before its flag word was validated).
+    if flags & !(EFD_SEMAPHORE | EFD_NONBLOCK | O_CLOEXEC) != 0 {
+        return err::EINVAL;
+    }
+    if flags & EFD_SEMAPHORE != 0 {
         // The counter is taken whole here; a caller that asked for one-per-read
         // asked for something else, and saying so beats doing something close.
         return err::EOPNOTSUPP;
     }
-    let nonblocking = args[1] & EFD_NONBLOCK != 0;
+    let nonblocking = flags & EFD_NONBLOCK != 0;
     let fd = match crate::vfs::open_inode(crate::vfs::eventfd::EventFd::new(
         next_anon_ino(),
         args[0] as u32 as u64,
@@ -1789,6 +1864,11 @@ pub(super) fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
         Ok(fd) => fd,
         Err(e) => return err_of(e),
     };
+    if flags & O_CLOEXEC != 0 {
+        // `EFD_CLOEXEC` is not cosmetic: without it the descriptor leaks across
+        // `exec`, the same leak `SFD_CLOEXEC` closed.
+        let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    }
     if nonblocking && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         file.set_status(crate::vfs::file::O_NONBLOCK);
     }
@@ -1806,7 +1886,29 @@ pub(super) fn handle_eventfd(args: [usize; ARG_COUNT]) -> isize {
 #[cfg(target_os = "none")]
 pub(super) fn handle_memfd_create(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const NAME_MAX: usize = 255;
+    // The `MFD_*` vocabulary, measured on a current host: `MFD_CLOEXEC`/
+    // `MFD_ALLOW_SEALING` are honoured here, `MFD_HUGETLB` and its size bits
+    // (`MFD_HUGE_MASK << MFD_HUGE_SHIFT`) are real Linux flags, and a bit
+    // outside that set - or a size bit without `MFD_HUGETLB` beside it - is
+    // `EINVAL`. This kernel has no hugepage backing, so `MFD_HUGETLB` is
+    // refused with `EOPNOTSUPP` rather than quietly returning an ordinary memfd
+    // the caller believes is huge-backed: a success that promises pages this
+    // machine cannot hand over is exactly the §4.2 lie the flag audit removes.
+    const MFD_HUGETLB: usize = 0o004;
+    const MFD_HUGE_SHIFT: usize = 26;
+    const MFD_HUGE_MASK: usize = 0x3f;
+    const MFD_HUGE_BITS: usize = MFD_HUGE_MASK << MFD_HUGE_SHIFT;
+    const MFD_KNOWN: usize = crate::vfs::memfd::MFD_CLOEXEC
+        | crate::vfs::memfd::MFD_ALLOW_SEALING
+        | MFD_HUGETLB
+        | MFD_HUGE_BITS;
     let flags = args[1];
+    if flags & !MFD_KNOWN != 0 || (flags & MFD_HUGE_BITS != 0 && flags & MFD_HUGETLB == 0) {
+        return err::EINVAL;
+    }
+    if flags & MFD_HUGETLB != 0 {
+        return err::EOPNOTSUPP;
+    }
     let name = match crate::syscall::cstr_arg(args[0], from_user) {
         Ok(name) => name,
         Err(e) => return e,
@@ -3858,15 +3960,38 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     0
                 }
                 Some(1) | Some(2) => {
-                    // RNDADDTOENTCNT / RNDADDENTROPY: credited entropy this
-                    // kernel has no accounting to receive. The argument is
-                    // still checked the way the request shape demands.
+                    // RNDADDTOENTCNT / RNDADDENTROPY. Measured on real Linux
+                    // these are gated on `CAP_SYS_ADMIN`: an unprivileged
+                    // caller gets `EPERM` (and gets it before any buffer copy,
+                    // which is why the capability check comes first here too).
+                    if crate::sched::current_identity().euid != 0 {
+                        return err::EPERM;
+                    }
                     if !buffer_ok(buf, 8, false, from_user) {
                         return err::EFAULT;
                     }
+                    // Privileged: this kernel's random source is one always
+                    // seeded ChaCha20 stream, not a drainable accumulator, so
+                    // the pool is already as full as it gets and a credit is a
+                    // genuine no-op success - the observable state ("entropy
+                    // available", which `RNDGETENTCNT` reports) is unchanged
+                    // and true. `0` here is honest, not the §4.2 lie.
                     0
                 }
-                Some(3) | Some(4) => 0, // RNDCLEARPOOL / RNDZAPENTCNT: no-arg
+                Some(3) | Some(4) => {
+                    // RNDCLEARPOOL / RNDZAPENTCNT. Gated on the same capability
+                    // (measured `EPERM` unprivileged), checked first. A
+                    // privileged clear, though, has nothing to clear: this
+                    // generator holds no entropy count that a `zap` could
+                    // drain, so answering the old `0` claimed a clearing that
+                    // `RNDGETENTCNT` - still full - contradicted one moment
+                    // later. §4.4: an action this machine cannot perform is
+                    // refused (`EOPNOTSUPP`), not quietly reported done.
+                    if crate::sched::current_identity().euid != 0 {
+                        return err::EPERM;
+                    }
+                    err::EOPNOTSUPP
+                }
                 _ => err::ENOTTY,
             }
         }
@@ -4166,7 +4291,11 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
             }
             0
         }
-        0x04 => 0, // VT_SENDSIG: obsolete in Linux, and nothing signals here.
+        // VT_SENDSIG was removed from the vt driver years ago; measured on a
+        // current console the request falls through the kernel's switch and
+        // answers `ENOTTY`, not the `0` this arm used to return for a command
+        // that does nothing anywhere.
+        0x04 => err::ENOTTY,
         // VT_RELDISP: the answer to a `relsig`, and the third argument is the
         // answer itself - nonzero agrees to hand the screen over, zero refuses.
         // Only the console a release is outstanding on may answer; anything else
@@ -4261,9 +4390,9 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 /// `KDGETMODE 0x4B3B`, `KDGKBMODE 0x4B44`, `KDSKBMODE 0x4B45`, so the low byte of
 /// the request word after the `'K'` magic is `0x3a`, `0x3b`, `0x44` and `0x45`.
 fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
-    let Some(nr) = family_nr(request, b'K') else {
+    if (request >> 8) & 0xff != b'K' as u32 {
         return err::ENOTTY;
-    };
+    }
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
         Err(e) => return err_of(e),
@@ -4276,90 +4405,17 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let Some(tty) = tty_inode.as_tty() else {
         return err::ENOTTY;
     };
-    // Which of the six consoles this descriptor is the terminal of. A tty that
-    // is not one of them - a `/dev/pts` slave, a master - has no screen and no
-    // keyboard mode to set, and Linux's answer for it is the same one as for a
-    // tty that is not a console at all.
     let Some(vc) = tty.vc_number() else {
         return err::ENOTTY;
     };
-    // Who may change a console's video mode: on Linux the caller must either
-    // hold the DRM card (`master` or `authenticated` - the driver that owns the
-    // screen is the one allowed to say what is drawn on it) or be the console's
-    // foreground job. Answering only the second half would let a compositor's
-    // *own* seat manager be refused on a console it had just taken; answering
-    // only the first would refuse a text login its own `reset`.
+    // Whether the caller holds the DRM card is the one question the console
+    // cannot answer for itself: the card driver sits above the VFS and the
+    // console device must not reach up into it, so the syscall layer - which may
+    // name `drivers` - asks it here and hands the answer down. Every other
+    // decision in the `K` family is the console's own to make, in `Tty::kd_ioctl`
+    // - the ioctl-to-device move (V-2), with the DRM edge kept on this side.
     let owns_card = crate::drivers::drm::card_grabbed_by_current();
-    let owns_it = tty.is_foreground(crate::sched::current()) || crate::sched::current_is_root();
-    use crate::vfs::tty::{K_MEDIUMRAW, K_OFF, K_RAW, K_UNICODE, K_XLATE, KD_GRAPHICS, KD_TEXT};
-    match nr {
-        // KDSETMODE -> int argument: the console's video mode.
-        0x3a => {
-            if !(owns_card || owns_it) {
-                return err::EPERM;
-            }
-            let mode = match request_arg(buf) as u32 {
-                KD_TEXT | KD_GRAPHICS => request_arg(buf) as u32,
-                // The two obsolete text modes, folded to the one they meant.
-                2 | 3 => KD_TEXT,
-                _ => return err::EINVAL,
-            };
-            if !crate::vfs::vcmux::set_kd_mode(vc, mode) {
-                return err::EINVAL;
-            }
-            0
-        }
-        // KDGETMODE <- int: what that console's screen is doing.
-        0x3b => {
-            if !buffer_ok(buf, 4, true, from_user) {
-                return err::EFAULT;
-            }
-            unsafe { (buf as *mut i32).write_unaligned(crate::vfs::vcmux::kd_mode(vc) as i32) };
-            0
-        }
-        // KDSKBMODE -> int: the keyboard's translation mode for this console.
-        // The keyboard belongs to the console's own session, so unlike the video
-        // mode this is not something the card's holder gets to say - which is
-        // exactly why `K_OFF` must never be the only way to stop a console
-        // reading the machine's keys.
-        0x45 => {
-            if !owns_it {
-                return err::EPERM;
-            }
-            if !matches!(
-                request_arg(buf) as u32,
-                K_RAW | K_XLATE | K_MEDIUMRAW | K_UNICODE | K_OFF
-            ) {
-                return err::EINVAL;
-            }
-            if !crate::vfs::vcmux::set_kb_mode(vc, request_arg(buf) as u32) {
-                return err::EINVAL;
-            }
-            0
-        }
-        // KDGKBMODE <- int.
-        0x44 => {
-            if !buffer_ok(buf, 4, true, from_user) {
-                return err::EFAULT;
-            }
-            unsafe { (buf as *mut i32).write_unaligned(crate::vfs::vcmux::kb_mode(vc) as i32) };
-            0
-        }
-        // The led, keymap and sound setters: this kernel has no PC keyboard
-        // controller to drive and its keymap is compiled in, so they are
-        // accepted as the no-ops they ask for rather than refused - a seat
-        // manager treats a failure here as the console being unusable.
-        _ => 0,
-    }
-}
-
-/// The int argument an `_IO` console ioctl carries in its third argument.
-///
-/// `KDSETMODE` and `KDSKBMODE` are `_IO` - no buffer - and the mode is passed as
-/// the plain value, so it is already in the register the syscall layer handed
-/// over. It arrives where `buf` is for these requests.
-fn request_arg(buf: usize) -> i32 {
-    buf as i32
+    tty.kd_ioctl(vc, request, buf, from_user, owns_card)
 }
 
 /// The evdev (`'E'`-typed) ioctl set libinput reads to classify a device
@@ -4451,11 +4507,12 @@ fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 }
 
 fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
-    let size = ((request >> 16) & 0x3fff) as usize;
-    let dir = (request >> 30) & 0x3;
-    let Some(nr) = family_nr(request, b'E') else {
-        return err::ENOTTY;
-    };
+    // Resolve the descriptor to its evdev node here, at the user boundary - the
+    // bad-fd `EBADF` and the not-an-evdev-node `ENOTTY` are the syscall layer's
+    // to give - then hand the decoded request to the device. Every accept/reject
+    // decision for the `'E'` family now lives in `EvdevNode::ioctl` (the input
+    // driver), not in this switchboard: Linux's `evdev_unlocked_ioctl` is the
+    // device's, and the node answers each request from its own state.
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
         Err(e) => return err_of(e),
@@ -4464,131 +4521,7 @@ fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let Some(ev) = inode.as_evdev() else {
         return err::ENOTTY;
     };
-    use core::mem::size_of;
-    // Copy `src` into the caller's read buffer, no more than it asked for.
-    let give = |src: &[u8]| -> isize {
-        let n = src.len().min(size);
-        if n == 0 {
-            return 0;
-        }
-        if !buffer_ok(buf, n, true, from_user) {
-            return err::EFAULT;
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), buf as *mut u8, n);
-        }
-        0
-    };
-    match (dir, nr) {
-        // Reads.
-        (2, 0x01) => give(&1i32.to_ne_bytes()), // EVIOCGVERSION
-        (2, 0x02) => {
-            // EVIOCGID: struct input_id {u16 bustype,vendor,product,version}.
-            let id = ev.id();
-            let mut b = [0u8; 8];
-            for (i, w) in id.iter().enumerate() {
-                b[i * 2..i * 2 + 2].copy_from_slice(&w.to_ne_bytes());
-            }
-            give(&b)
-        }
-        (2, 0x06) => {
-            // EVIOCGNAME: the device's name for itself - the string the host
-            // filled the virtio device's config with, which is how an evdev
-            // reader tells a keyboard from a tablet without reading events. The
-            // request word carries the caller's buffer size in the `_IOC` size
-            // field, so the limit comes out of the request rather than being a
-            // separate argument.
-            //
-            // Three details are `strlcpy`'s, and they are what a caller has
-            // always been promised. The name is what stands before its *first*
-            // NUL: a device reports a C string, and the terminator the virtio
-            // config carries is not part of it. A size of zero is the length
-            // query, answered with the length and no copy. And the answer is
-            // that length *excluding* the terminating NUL even when the copy had
-            // to be cut short - which is how a caller with a buffer too small
-            // learns that the name did not fit.
-            let name = ev.name().as_bytes();
-            let text = name.split(|&byte| byte == 0).next().unwrap_or(&[]);
-            if size == 0 {
-                return text.len() as isize;
-            }
-            if !buffer_ok(buf, size, true, from_user) {
-                return err::EFAULT;
-            }
-            let n = text.len().min(size - 1);
-            unsafe {
-                core::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
-                (buf as *mut u8).add(n).write_volatile(0);
-            }
-            text.len() as isize
-        }
-        (2, 0x07) | (2, 0x08) => {
-            // EVIOCGPHYS/EVIOCGUNIQ: the device's physical path and its
-            // unique id. A virtio input device has neither - they are
-            // strings the kernel's input core fills from the driver, and
-            // none of them puts one here.
-            //
-            // The answer is `ENOENT`, not `ENOTTY`, and it has to be:
-            // libevdev's `libevdev_set_fd` tolerates a failure here only
-            // when errno is `ENOENT` ("uinput has no phys"), the way Linux's
-            // own `str_to_user` answers for a NULL attribute. An `ENOTTY`
-            // makes the whole read fatal, and the failure surfaces far from
-            // here: libinput gives up with "failed to create input device"
-            // for every node on the machine, and weston comes up with a
-            // screen and no keyboard.
-            err::ENOENT
-        }
-        (2, 0x09) => give(ev.prop_bits()), // EVIOCGPROP
-        (2, 0x20..=0x3f) => {
-            // EVIOCGBIT(evtype): the supported-type or -code bitmap.
-            let mut tmp = [0u8; 64];
-            let n = ev.eviocgbit((nr - 0x20) as u8, &mut tmp);
-            give(&tmp[..n])
-        }
-        (2, 0x40..=0x7f) => {
-            // EVIOCGABS(axis): struct input_absinfo, six ints.
-            match ev.eviocgabs((nr - 0x40) as u8) {
-                Some(a) => {
-                    let mut b = [0u8; 6 * size_of::<i32>()];
-                    for (i, v) in a.iter().enumerate() {
-                        b[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
-                    }
-                    give(&b)
-                }
-                // An axis the device does not have is EINVAL, as Linux's
-                // input_get_absinfo answers.
-                None => err::EINVAL,
-            }
-        }
-        (2, 0x84) => give(&0i32.to_ne_bytes()), // EVIOCGEFFECTS
-        (2, 0x03) | (2, 0x04) | (2, 0x0a) | (2, 0x18) | (2, 0x19) | (2, 0x1a) | (2, 0x1b) => {
-            // EVIOCGREP/KEYCODE/MTSLOTS/KEY/LED/SND/SW: state this kernel does
-            // not track, so a zeroed picture of the asked-for length.
-            give(&[])
-        }
-        // Writes.
-        (1, 0x90) => {
-            // EVIOCGRAB: claim the device for *this* open file description, and
-            // refuse a claim on a device somebody else holds with the `EBUSY`
-            // the man page spells. Keyed on the description because that is what
-            // makes the claim die with `close(2)` below rather than outliving it
-            // in whatever process happens to have the device open twice.
-            if size_of::<i32>() > size || !buffer_ok(buf, size_of::<i32>(), false, from_user) {
-                return err::EINVAL;
-            }
-            let on = unsafe { (buf as *const i32).read_unaligned() } != 0;
-            if ev.set_grab(on, file.ofd()) {
-                0
-            } else {
-                err::EBUSY
-            }
-        }
-        (1, 0x80) | (1, 0x81) | (1, 0x82) | (1, 0x83) | (1, 0x91) | (1, 0x04) => {
-            // EVIOCSFF/CRMFF, EVIOCREVOKE, EVIOCSREP/KEYCODE: accepted quietly.
-            0
-        }
-        _ => err::ENOTTY,
-    }
+    ev.ioctl(file.ofd(), request, buf, from_user)
 }
 /// whatever name it currently carries - is 2. `None` names no device, which
 /// the interface ioctls answer with `ENODEV`.
@@ -5354,10 +5287,28 @@ pub(super) fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> is
 /// accepted and does nothing - which is what Linux does for the advices it
 /// does not act on. The descriptor still has to be real.
 pub(super) fn handle_fadvise64(args: [usize; ARG_COUNT]) -> isize {
-    match crate::sched::current_fds().clone_at(args[0] as i32) {
-        Ok(_) => 0,
-        Err(e) => err_of(e),
+    // `posix_fadvise(2)` is a hint, but the hint's vocabulary is closed and the
+    // descriptor's kind still matters. Measured on a current host: advice
+    // `0..=5` (`NORMAL`, `RANDOM`, `SEQUENTIAL`, `WILLNEED`, `DONTNEED`,
+    // `NOREUSE`) answers `0`, an advice past the set answers `EINVAL`, a number
+    // that is not open answers `EBADF`, and a pipe answers `ESPIPE` - there is
+    // no byte range to give advice about. Returning `0` for any advice on any
+    // open descriptor was the accept-and-drop this removes: an unknown advice
+    // got a success it was never owed, and a pipe was told it had a page cache.
+    // This kernel prefetches nothing, so a *recognised* hint answered `0` is
+    // truthful (best-effort, no observable promise); the refusals are what make
+    // the vocabulary honest.
+    let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(file) => file,
+        Err(e) => return err_of(e),
+    };
+    if !matches!(args[3], 0..=5) {
+        return err::EINVAL;
     }
+    if file.inode().as_pipe().is_some() {
+        return err::ESPIPE;
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -5879,6 +5830,14 @@ pub(super) fn handle_fallocate(args: [usize; ARG_COUNT]) -> isize {
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
+    // `fallocate` is a write to the file's block range, so a descriptor not
+    // opened for writing is refused `EBADF` before the range is examined
+    // (measured on the host: `fallocate(O_RDONLY)` is `EBADF` and nothing
+    // changes) - the same write-mode demand `ftruncate` now makes and the
+    // general "operations that write require a writable descriptor" rule.
+    if !file.may_write() {
+        return err::EBADF;
+    }
     match file.metadata().kind {
         // A pipe's metadata answers `File` - the vocabulary's only word for
         // an unnamed channel - but it has no byte range to lay out, so it

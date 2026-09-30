@@ -34,9 +34,23 @@ use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use super::Channel;
-use crate::syscall::err;
+use crate::err;
 use crate::vfs::pipe::DuplexEnd;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError};
+
+/// The running task's credentials, in the shape `uevent` sends are stamped
+/// with, plus the pid a zero-`nl_pid` bind prefers.
+///
+/// They are read here and handed down as plain words rather than fetched
+/// inside `uevent`: the scheduler's task table lives under this layer and not
+/// under the event bus, and the bus that carries `/sys` announcements keeps
+/// its host build free of a task table by never reaching up for one. Read
+/// outside any socket lock, the way `net::unix::self_cred` does.
+fn task_identity() -> (crate::uevent::Cred, u32) {
+    let (uid, gid) = crate::sched::current_real_owner();
+    let pid = crate::sched::current_tgid().0 as u32;
+    (crate::uevent::Cred { pid, uid, gid }, pid)
+}
 
 // --- the Linux constants the ABI spells by number ---
 pub(crate) const AF_UNIX: u16 = 1;
@@ -244,7 +258,7 @@ unsafe fn collect_scm_rights(
         if control == 0 || clen < CMSG_HDRLEN {
             return Ok(Vec::new());
         }
-        if !crate::syscall::buffer_ok(control, clen, false, from_user) {
+        if !crate::uaccess::buffer_ok(control, clen, false, from_user) {
             return Err(err::EINVAL);
         }
         let base = control as *const u8;
@@ -291,7 +305,7 @@ unsafe fn emit_unix_control(
         let control = ((msghdr + MSGHDR_CONTROL) as *const usize).read_unaligned();
         let capacity = ((msghdr + MSGHDR_CONTROLLEN) as *const usize).read_unaligned();
         let writable =
-            control != 0 && crate::syscall::buffer_ok(control, capacity, true, from_user);
+            control != 0 && crate::uaccess::buffer_ok(control, capacity, true, from_user);
         let mut used = 0usize;
         let mut trunc = false;
 
@@ -627,7 +641,7 @@ fn parse_sockaddr_in(ptr: usize, len: usize, from_user: bool) -> Result<IpEndpoi
     if ptr == 0 || len < SOCKADDR_IN_LEN {
         return Err(err::EINVAL);
     }
-    if !crate::syscall::buffer_ok(ptr, SOCKADDR_IN_LEN, false, from_user) {
+    if !crate::uaccess::buffer_ok(ptr, SOCKADDR_IN_LEN, false, from_user) {
         return Err(err::EFAULT);
     }
     let raw = unsafe { slice::from_raw_parts(ptr as *const u8, SOCKADDR_IN_LEN) };
@@ -656,7 +670,7 @@ fn parse_sockaddr_nl(ptr: usize, len: usize, from_user: bool) -> Result<(u32, u3
     if len < SOCKADDR_NL_SIZE {
         return Err(err::EINVAL);
     }
-    if ptr == 0 || !crate::syscall::buffer_ok(ptr, SOCKADDR_NL_SIZE, false, from_user) {
+    if ptr == 0 || !crate::uaccess::buffer_ok(ptr, SOCKADDR_NL_SIZE, false, from_user) {
         return Err(err::EFAULT);
     }
     let family = unsafe { (ptr as *const u16).read_unaligned() };
@@ -687,8 +701,8 @@ fn write_sockaddr_nl(ptr: usize, len_ptr: usize, pid: u32, groups: u32) {
 /// Write a `sockaddr_in` and the length that goes with it: the shape
 /// `recvfrom`, `getsockname` and `getpeername` owe their callers.
 fn write_sockaddr_in(ptr: usize, len_ptr: usize, endpoint: IpEndpoint) -> Result<(), isize> {
-    if !crate::syscall::buffer_ok(ptr, SOCKADDR_IN_LEN, true, true)
-        || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+    if !crate::uaccess::buffer_ok(ptr, SOCKADDR_IN_LEN, true, true)
+        || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
     {
         return Err(err::EFAULT);
     }
@@ -720,8 +734,8 @@ fn validate_source_slot(src: Option<(usize, usize)>) -> Result<(), isize> {
     if addr_ptr == 0 || len_ptr == 0 {
         return Err(err::EFAULT);
     }
-    if !crate::syscall::buffer_ok(addr_ptr, SOCKADDR_IN_LEN, true, true)
-        || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+    if !crate::uaccess::buffer_ok(addr_ptr, SOCKADDR_IN_LEN, true, true)
+        || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
     {
         return Err(err::EFAULT);
     }
@@ -759,7 +773,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
                 let handle = crate::net::rtnl::open();
                 let fd = match crate::vfs::open_inode(Arc::new(NlRouteInode { handle })) {
                     Ok(fd) => fd,
-                    Err(e) => return crate::syscall::err_of(e),
+                    Err(e) => return crate::uaccess::err_of(e),
                 };
                 if (args[1] as u32) & SOCK_NONBLOCK != 0
                     && let Ok(file) = crate::sched::current_fds().clone_at(fd)
@@ -773,7 +787,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         let handle = crate::uevent::open();
         let fd = match crate::vfs::open_inode(Arc::new(SocketInode { handle })) {
             Ok(fd) => fd,
-            Err(e) => return crate::syscall::err_of(e),
+            Err(e) => return crate::uaccess::err_of(e),
         };
         if (args[1] as u32) & SOCK_NONBLOCK != 0
             && let Ok(file) = crate::sched::current_fds().clone_at(fd)
@@ -810,7 +824,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         let sock = crate::net::unix::alloc(typ as u16);
         let fd = match crate::vfs::open_inode(sock) {
             Ok(fd) => fd,
-            Err(e) => return crate::syscall::err_of(e),
+            Err(e) => return crate::uaccess::err_of(e),
         };
         if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
             file.set_status(crate::vfs::file::O_NONBLOCK);
@@ -850,7 +864,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         };
         let fd = match crate::vfs::open_inode(sock) {
             Ok(fd) => fd,
-            Err(e) => return crate::syscall::err_of(e),
+            Err(e) => return crate::uaccess::err_of(e),
         };
         if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
             file.set_status(crate::vfs::file::O_NONBLOCK);
@@ -881,7 +895,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         let sock = crate::net::packet::open(args[2] as u16);
         let fd = match crate::vfs::open_inode(sock) {
             Ok(fd) => fd,
-            Err(e) => return crate::syscall::err_of(e),
+            Err(e) => return crate::uaccess::err_of(e),
         };
         if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
             file.set_status(crate::vfs::file::O_NONBLOCK);
@@ -920,7 +934,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     };
     let fd = match crate::vfs::open_inode(Arc::new(SocketInode { handle })) {
         Ok(fd) => fd,
-        Err(e) => return crate::syscall::err_of(e),
+        Err(e) => return crate::uaccess::err_of(e),
     };
     if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         file.set_status(crate::vfs::file::O_NONBLOCK);
@@ -1237,7 +1251,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // - libudev defines it - and the address is the 12-byte `sockaddr_nl`, which
     // is why this has to come before the IPv4 tail (see `uevent_handle_of_fd`).
     if let Some(handle) = uevent_handle_of_fd(fd) {
-        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
         }
         let dest = if args[4] != 0 {
@@ -1249,13 +1263,14 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
             None
         };
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
-        return crate::uevent::send(handle, dest, data, crate::uevent::self_cred());
+        let (cred, _) = task_identity();
+        return crate::uevent::send(handle, dest, data, cred);
     }
     // A route-netlink socket takes the payload whole: the netlink message
     // protocol lives in the data, and the destination sockaddr is the
     // kernel's own netlink address, not one to parse as an IP endpoint.
     if let Some(handle) = rtnl_handle_of_fd(fd) {
-        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
         }
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
@@ -1269,7 +1284,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
         && let Some(sock) = file.inode().as_packet()
     {
-        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
         }
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
@@ -1309,7 +1324,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         && let Some(sock) = file.inode().as_unix()
         && sock.carries_messages()
     {
-        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
         }
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
@@ -1332,7 +1347,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // call is the bytes; a caller that names a destination on a connected
     // socket is told so, as Linux does.
     if let Some(file) = channel_of_fd(fd) {
-        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
         }
         if args[4] != 0 {
@@ -1345,7 +1360,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         return file
             .write(data)
             .map(|n| n as isize)
-            .unwrap_or_else(crate::syscall::err_of);
+            .unwrap_or_else(crate::uaccess::err_of);
     }
     // A vsock socket: the send is a protocol packet, chunked and
     // credit-checked by the device, not a write into a pipe of the
@@ -1355,7 +1370,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
         && let Some(sock) = file.inode().as_vsock()
     {
-        if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
         }
         if args[4] != 0 {
@@ -1372,7 +1387,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         Ok(handle) => handle,
         Err(e) => return e,
     };
-    if !crate::syscall::buffer_ok(buf, len, false, from_user) {
+    if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
         return err::EFAULT;
     }
     let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
@@ -1416,7 +1431,8 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
             return e;
         }
-        return crate::uevent::send(handle, dest, &data, crate::uevent::self_cred());
+        let (cred, _) = task_identity();
+        return crate::uevent::send(handle, dest, &data, cred);
     }
     if let Some(handle) = rtnl_handle_of_fd(fd) {
         let (_name, _namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
@@ -1489,7 +1505,7 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
                 // The bytes did not land, so the handover never happened:
                 // dropping `fds` here closes the descriptors it named, as if
                 // the send had not carried them.
-                return crate::syscall::err_of(e);
+                return crate::uaccess::err_of(e);
             }
         };
         if !fds.is_empty() {
@@ -1724,7 +1740,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     let fd = args[0] as i32;
     let (buf, len) = (args[1], args[2]);
     if let Some(handle) = rtnl_handle_of_fd(fd) {
-        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
         // args[3] is the flags word: `MSG_DONTWAIT` here means the caller
@@ -1755,7 +1771,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
         && let Some(sock) = file.inode().as_packet()
     {
-        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
         if args[3] & MSG_PEEK != 0 {
@@ -1775,7 +1791,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
         }
         if args[4] != 0 {
-            if !crate::syscall::buffer_ok(
+            if !crate::uaccess::buffer_ok(
                 args[4],
                 crate::net::packet::SOCKADDR_LL_LEN,
                 true,
@@ -1784,7 +1800,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
                 return err::EFAULT;
             }
             crate::net::packet::write_sll(proto, &src, args[4]);
-            if args[5] != 0 && crate::syscall::buffer_ok(args[5], 4, true, from_user) {
+            if args[5] != 0 && crate::uaccess::buffer_ok(args[5], 4, true, from_user) {
                 unsafe {
                     (args[5] as *mut u32)
                         .write_unaligned(crate::net::packet::SOCKADDR_LL_LEN as u32);
@@ -1801,7 +1817,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         && let Some(sock) = file.inode().as_unix()
         && sock.carries_messages()
     {
-        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
         if args[3] & MSG_PEEK != 0 {
@@ -1822,14 +1838,14 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
                 }
                 n as isize
             }
-            Err(e) => crate::syscall::err_of(e),
+            Err(e) => crate::uaccess::err_of(e),
         };
     }
     // The read side of a connected pair's end. A peek would need to look at
     // the front of the pipe's queue without taking it, which a pipe cannot
     // do - refusing beats consuming bytes the caller meant to keep.
     if let Some(file) = channel_of_fd(fd) {
-        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
         if args[3] & MSG_PEEK != 0 {
@@ -1842,7 +1858,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         return file
             .read(out)
             .map(|n| n as isize)
-            .unwrap_or_else(crate::syscall::err_of);
+            .unwrap_or_else(crate::uaccess::err_of);
     }
     // The read side of a vsock stream: bytes out of the connection's
     // buffer, the peer's address into the source slot when the caller
@@ -1851,7 +1867,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
         && let Some(sock) = file.inode().as_vsock()
     {
-        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
         if args[3] & MSG_PEEK != 0 {
@@ -1859,8 +1875,8 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         }
         if args[4] != 0
             && (args[5] == 0
-                || !crate::syscall::buffer_ok(args[4], 16, true, true)
-                || !crate::syscall::buffer_ok(args[5], 4, true, true))
+                || !crate::uaccess::buffer_ok(args[4], 16, true, true)
+                || !crate::uaccess::buffer_ok(args[5], 4, true, true))
         {
             return err::EFAULT;
         }
@@ -1882,7 +1898,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         Ok(handle) => handle,
         Err(e) => return e,
     };
-    if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+    if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
         return err::EFAULT;
     }
     let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
@@ -1927,7 +1943,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         // assumed, on a `NETLINK_USERSOCK` socket that sent itself a message:
         // `recvmsg` with an empty iovec returned 0 with `MSG_TRUNC` set, and
         // the next real receive found the queue empty.
-        if iovlen > 0 && !crate::syscall::buffer_ok(iov, iovlen * 16, false, from_user) {
+        if iovlen > 0 && !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
             return err::EFAULT;
         }
         let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
@@ -1984,14 +2000,14 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         // pointer is unreadable gets `EFAULT` rather than a silent zero-length
         // receive out of a bad pointer - "no iovec" and "an iovec I cannot
         // read" are not the same answer.
-        if iovlen > 0 && !crate::syscall::buffer_ok(iov, iovlen * 16, false, from_user) {
+        if iovlen > 0 && !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
             return err::EFAULT;
         }
         let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
         if args[2] & MSG_PEEK != 0 {
             return err::EOPNOTSUPP;
         }
-        if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
         if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
@@ -2010,7 +2026,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
                 if name != 0 {
                     let peer = from.unwrap_or_default();
                     let bytes = crate::net::unix::sockaddr_un_bytes(&peer);
-                    if !crate::syscall::buffer_ok(name, bytes.len(), true, from_user) {
+                    if !crate::uaccess::buffer_ok(name, bytes.len(), true, from_user) {
                         return err::EFAULT;
                     }
                     unsafe {
@@ -2051,7 +2067,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
                 }
                 n as isize
             }
-            Err(e) => crate::syscall::err_of(e),
+            Err(e) => crate::uaccess::err_of(e),
         };
     }
     // The read side of a connected pair's end, in scatter-gather form: one
@@ -2065,7 +2081,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(fields) => fields,
             Err(e) => return e,
         };
-        if !crate::syscall::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
+        if !crate::uaccess::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
             return err::EFAULT;
         }
         let wants_control = unsafe {
@@ -2099,14 +2115,14 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         }
         let mut n = 0isize;
         if len > 0 {
-            if !crate::syscall::buffer_ok(buf, len, true, from_user) {
+            if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
                 return err::EFAULT;
             }
             if !empty_handover {
                 let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
                 n = match file.read(out) {
                     Ok(n) => n as isize,
-                    Err(e) => return crate::syscall::err_of(e),
+                    Err(e) => return crate::uaccess::err_of(e),
                 };
             }
             // Zero bytes, deliberately: the caller gets the descriptors and a
@@ -2170,7 +2186,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(n) => n,
             Err(e) => return e,
         };
-        if !crate::syscall::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
+        if !crate::uaccess::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
             return err::EFAULT;
         }
         unsafe {
@@ -2232,7 +2248,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         n if n >= 0 => n as usize,
         e => return e,
     };
-    if !crate::syscall::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
+    if !crate::uaccess::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
         return err::EFAULT;
     }
     // The one control message this kernel knows is `IP_RECVTTL`: a raw
@@ -2254,7 +2270,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     let capacity = unsafe { ((msghdr + MSGHDR_CONTROLLEN) as *const u64).read_volatile() } as usize;
     let mut attached = false;
     if want_ttl && n >= 20 && control != 0 && capacity >= CMSG_RECVTTL_LEN {
-        if !crate::syscall::buffer_ok(control, CMSG_RECVTTL_LEN, true, from_user) {
+        if !crate::uaccess::buffer_ok(control, CMSG_RECVTTL_LEN, true, from_user) {
             return err::EFAULT;
         }
         let ttl = out[8] as u32;
@@ -2663,7 +2679,8 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
             Ok(pair) => pair,
             Err(e) => return e,
         };
-        return match crate::uevent::bind(handle, pid, groups) {
+        let (_, prefer) = task_identity();
+        return match crate::uevent::bind(handle, pid, groups, prefer) {
             Ok(()) => 0,
             Err(e) => e,
         };
@@ -2679,7 +2696,7 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
         const SOCKADDR_NL_SIZE: usize = 12;
         let addr = args[1];
         if args[2] < SOCKADDR_NL_SIZE
-            || !crate::syscall::buffer_ok(addr, SOCKADDR_NL_SIZE, false, from_user)
+            || !crate::uaccess::buffer_ok(addr, SOCKADDR_NL_SIZE, false, from_user)
         {
             return err::EINVAL;
         }
@@ -2858,7 +2875,7 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
     const SOCK_NONBLOCK_F: usize = 0x800;
     let listener_arc = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
-        Err(e) => return crate::syscall::err_of(e),
+        Err(e) => return crate::uaccess::err_of(e),
     };
     // A vsock listener hands out connections the host already made - the
     // device answered each request the moment it arrived, so accept is a
@@ -2872,7 +2889,7 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
         };
         let new_fd = match crate::vfs::open_inode(sock) {
             Ok(fd) => fd,
-            Err(e) => return crate::syscall::err_of(e),
+            Err(e) => return crate::uaccess::err_of(e),
         };
         if flags & SOCK_NONBLOCK_F != 0
             && let Ok(file) = crate::sched::current_fds().clone_at(new_fd)
@@ -2939,7 +2956,7 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
     let id = sock.id();
     let new_fd = match crate::vfs::open_inode(sock) {
         Ok(fd) => fd,
-        Err(e) => return crate::syscall::err_of(e),
+        Err(e) => return crate::uaccess::err_of(e),
     };
     if flags & SOCK_NONBLOCK_F != 0
         && let Ok(file) = crate::sched::current_fds().clone_at(new_fd)
@@ -3070,7 +3087,7 @@ fn install_accepted(
     };
     let new_fd = match crate::vfs::open_inode(Arc::new(SocketInode { handle })) {
         Ok(fd) => fd,
-        Err(e) => return crate::syscall::err_of(e),
+        Err(e) => return crate::uaccess::err_of(e),
     };
     if nonblock && let Ok(file) = crate::sched::current_fds().clone_at(new_fd) {
         file.set_status(crate::vfs::file::O_NONBLOCK);
@@ -3121,7 +3138,7 @@ pub(crate) fn handle_sendmmsg(args: [usize; 6], from_user: bool) -> isize {
     };
     // The headers are read and the lengths written back, so both
     // directions of the array must be reachable.
-    if !crate::syscall::buffer_ok(msgvec, len, true, from_user) {
+    if !crate::uaccess::buffer_ok(msgvec, len, true, from_user) {
         return err::EFAULT;
     }
 
@@ -3165,11 +3182,11 @@ pub(crate) fn handle_recvmmsg(args: [usize; 6], from_user: bool) -> isize {
         Some(len) => len,
         None => return err::EINVAL,
     };
-    if !crate::syscall::buffer_ok(msgvec, len, true, from_user) {
+    if !crate::uaccess::buffer_ok(msgvec, len, true, from_user) {
         return err::EFAULT;
     }
     let deadline = if timeout != 0 {
-        if !crate::syscall::buffer_ok(timeout, 16, false, from_user) {
+        if !crate::uaccess::buffer_ok(timeout, 16, false, from_user) {
             return err::EFAULT;
         }
         let (sec, nsec) = unsafe {
@@ -3306,7 +3323,7 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
     if protocol != 0 {
         return err::EPROTONOSUPPORT;
     }
-    if out == 0 || !crate::syscall::buffer_ok(out, 2 * size_of::<i32>(), true, from_user) {
+    if out == 0 || !crate::uaccess::buffer_ok(out, 2 * size_of::<i32>(), true, from_user) {
         return err::EFAULT;
     }
 
@@ -3324,7 +3341,7 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
     };
     let fd0 = match crate::vfs::file::open_inode(first) {
         Ok(fd) => fd,
-        Err(e) => return crate::syscall::err_of(e),
+        Err(e) => return crate::uaccess::err_of(e),
     };
     let fd1 = match crate::vfs::file::open_inode(second) {
         Ok(fd) => fd,
@@ -3333,7 +3350,7 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
             // the first back rather than leak a descriptor the caller never
             // learns the number of.
             let _ = crate::vfs::close(fd0);
-            return crate::syscall::err_of(e);
+            return crate::uaccess::err_of(e);
         }
     };
     let fds = [fd0, fd1];
@@ -3365,7 +3382,7 @@ fn read_sockaddr_un(ptr: usize, len: usize, from_user: bool) -> Result<alloc::ve
     if ptr == 0 || !(3..=2 + crate::net::unix::SUN_PATH_MAX).contains(&len) {
         return Err(err::EINVAL);
     }
-    if !crate::syscall::buffer_ok(ptr, len, false, from_user) {
+    if !crate::uaccess::buffer_ok(ptr, len, false, from_user) {
         return Err(err::EFAULT);
     }
     let mut raw = alloc::vec![0u8; len];
@@ -3407,8 +3424,8 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
         const SOCKADDR_NL_SIZE: usize = 12;
         if addr_ptr == 0
             || len_ptr == 0
-            || !crate::syscall::buffer_ok(addr_ptr, SOCKADDR_NL_SIZE, true, true)
-            || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+            || !crate::uaccess::buffer_ok(addr_ptr, SOCKADDR_NL_SIZE, true, true)
+            || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
         {
             return err::EFAULT;
         }
@@ -3429,8 +3446,8 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
         const SOCKADDR_NL_SIZE: usize = 12;
         if addr_ptr == 0
             || len_ptr == 0
-            || !crate::syscall::buffer_ok(addr_ptr, SOCKADDR_NL_SIZE, true, true)
-            || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+            || !crate::uaccess::buffer_ok(addr_ptr, SOCKADDR_NL_SIZE, true, true)
+            || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
         {
             return err::EFAULT;
         }
@@ -3445,8 +3462,8 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
     if addr_ptr == 0 || len_ptr == 0 {
         return err::EFAULT;
     }
-    if !crate::syscall::buffer_ok(addr_ptr, SOCKADDR_IN_LEN, true, true)
-        || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+    if !crate::uaccess::buffer_ok(addr_ptr, SOCKADDR_IN_LEN, true, true)
+        || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
     {
         return err::EFAULT;
     }
@@ -3529,8 +3546,8 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
     if addr_ptr == 0 || len_ptr == 0 {
         return err::EFAULT;
     }
-    if !crate::syscall::buffer_ok(addr_ptr, SOCKADDR_IN_LEN, true, true)
-        || !crate::syscall::buffer_ok(len_ptr, 4, true, true)
+    if !crate::uaccess::buffer_ok(addr_ptr, SOCKADDR_IN_LEN, true, true)
+        || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
     {
         return err::EFAULT;
     }
@@ -3696,7 +3713,7 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
         if level != SOL_SOCKET {
             return err::ENOPROTOOPT;
         }
-        if optval == 0 || optlen < 4 || !crate::syscall::buffer_ok(optval, 4, false, from_user) {
+        if optval == 0 || optlen < 4 || !crate::uaccess::buffer_ok(optval, 4, false, from_user) {
             return err::EINVAL;
         }
         let val = unsafe { (optval as *const i32).read_unaligned() };
@@ -3720,7 +3737,7 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
         if level != SOL_SOCKET {
             return err::ENOPROTOOPT;
         }
-        if optval == 0 || optlen < 4 || !crate::syscall::buffer_ok(optval, 4, false, from_user) {
+        if optval == 0 || optlen < 4 || !crate::uaccess::buffer_ok(optval, 4, false, from_user) {
             return err::EINVAL;
         }
         let val = unsafe { (optval as *const i32).read_unaligned() };
@@ -3747,7 +3764,7 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
         if level != SOL_SOCKET {
             return err::ENOPROTOOPT;
         }
-        if optval == 0 || optlen < 4 || !crate::syscall::buffer_ok(optval, 4, false, from_user) {
+        if optval == 0 || optlen < 4 || !crate::uaccess::buffer_ok(optval, 4, false, from_user) {
             return err::EINVAL;
         }
         let val = unsafe { (optval as *const i32).read_unaligned() };
@@ -3786,7 +3803,7 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     } else {
         4
     };
-    if optval == 0 || optlen < need || !crate::syscall::buffer_ok(optval, need, false, from_user) {
+    if optval == 0 || optlen < need || !crate::uaccess::buffer_ok(optval, need, false, from_user) {
         return err::EINVAL;
     }
     let val = unsafe { (optval as *const i32).read_unaligned() };
@@ -3873,7 +3890,7 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
         if optval == 0 || optlen_ptr == 0 {
             return err::EFAULT;
         }
-        if !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user) {
+        if !crate::uaccess::buffer_ok(optlen_ptr, 4, true, from_user) {
             return err::EFAULT;
         }
         let value: i32 = match optname {
@@ -3920,7 +3937,7 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
         if optval == 0 || optlen_ptr == 0 {
             return err::EFAULT;
         }
-        if !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user) {
+        if !crate::uaccess::buffer_ok(optlen_ptr, 4, true, from_user) {
             return err::EFAULT;
         }
         let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() } as usize;
@@ -3931,7 +3948,7 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
             SO_TYPE => (4, false),
             _ => (4, false),
         };
-        if cap < 4 || !crate::syscall::buffer_ok(optval, need.min(cap), true, from_user) {
+        if cap < 4 || !crate::uaccess::buffer_ok(optval, need.min(cap), true, from_user) {
             return err::EINVAL;
         }
         if cred {
@@ -3979,11 +3996,11 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
         if optval == 0 || optlen_ptr == 0 {
             return err::EFAULT;
         }
-        if !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user) {
+        if !crate::uaccess::buffer_ok(optlen_ptr, 4, true, from_user) {
             return err::EFAULT;
         }
         let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() };
-        if cap < 4 || !crate::syscall::buffer_ok(optval, 4, true, from_user) {
+        if cap < 4 || !crate::uaccess::buffer_ok(optval, 4, true, from_user) {
             return err::EINVAL;
         }
         let value = match optname {
@@ -4009,14 +4026,14 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     if optval == 0 || optlen_ptr == 0 {
         return err::EFAULT;
     }
-    if !crate::syscall::buffer_ok(optlen_ptr, 4, true, from_user) {
+    if !crate::uaccess::buffer_ok(optlen_ptr, 4, true, from_user) {
         return err::EFAULT;
     }
     let cap = unsafe { (optlen_ptr as *const u32).read_unaligned() };
     // `SO_LINGER` answers a `struct linger { int l_onoff; int l_linger; }`, so
     // it is the one option eight bytes wide.
     if (level, optname) == (SOL_SOCKET, SO_LINGER) {
-        if cap < 8 || !crate::syscall::buffer_ok(optval, 8, true, from_user) {
+        if cap < 8 || !crate::uaccess::buffer_ok(optval, 8, true, from_user) {
             return err::EINVAL;
         }
         let (on, t) = super::with(handle, |_, entry| {
@@ -4030,7 +4047,7 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
         }
         return 0;
     }
-    if cap < 4 || !crate::syscall::buffer_ok(optval, 4, true, from_user) {
+    if cap < 4 || !crate::uaccess::buffer_ok(optval, 4, true, from_user) {
         return err::EINVAL;
     }
     let value = match (level, optname) {
@@ -4077,7 +4094,7 @@ fn read_msghdr(ptr: usize, from_user: bool) -> Result<(usize, u32, usize, usize)
     if ptr == 0 {
         return Err(err::EFAULT);
     }
-    if !crate::syscall::buffer_ok(ptr, MSGHDR_SIZE, false, from_user) {
+    if !crate::uaccess::buffer_ok(ptr, MSGHDR_SIZE, false, from_user) {
         return Err(err::EFAULT);
     }
     unsafe {
@@ -4103,7 +4120,7 @@ fn gather_iovecs(
     if iovlen == 0 {
         return Ok(());
     }
-    if iov == 0 || !crate::syscall::buffer_ok(iov, iovlen * 16, false, from_user) {
+    if iov == 0 || !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
         return Err(err::EFAULT);
     }
     for i in 0..iovlen {
@@ -4117,10 +4134,10 @@ fn gather_iovecs(
         if len == 0 {
             continue;
         }
-        if data.len() + len > crate::syscall::MAX_IO {
+        if data.len() + len > crate::uaccess::MAX_IO {
             return Err(err::EINVAL);
         }
-        if !crate::syscall::buffer_ok(ptr, len, false, from_user) {
+        if !crate::uaccess::buffer_ok(ptr, len, false, from_user) {
             return Err(err::EFAULT);
         }
         data.extend_from_slice(unsafe { slice::from_raw_parts(ptr as *const u8, len) });
@@ -4130,7 +4147,7 @@ fn gather_iovecs(
 
 /// The first non-empty iovec, as a raw (pointer, length) pair.
 fn first_iovec(iov: usize, iovlen: usize, from_user: bool) -> Option<(usize, usize)> {
-    if iovlen == 0 || iov == 0 || !crate::syscall::buffer_ok(iov, iovlen * 16, false, from_user) {
+    if iovlen == 0 || iov == 0 || !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
         return None;
     }
     for i in 0..iovlen {
