@@ -444,10 +444,14 @@ it - so the entries say which they are:
       wake for `pthread_join`, `exit_group` on the group, and `getpid`/`gettid`
       answering the group and the task. Pinned by `t-clone` (§6.4). What the
       compositors beyond weston still want is elsewhere on this list
-- [ ] DRM sync objects — the `SYNCOBJ_*` family, including `SYNCOBJ_EVENTFD`
+- [~] DRM sync objects — the `SYNCOBJ_*` family, including `SYNCOBJ_EVENTFD`
       (which Smithay probes before it will expose `wp_linux_drm_syncobj_v1`),
       with `IN_FENCE_FD`/`OUT_FENCE_PTR` given the behaviour their names promise
-      (§7.4)
+      (§7.4). **Measured, not yet built**: the family's semantics are pinned by
+      four instrument programs run against the real card, and they disagree with
+      the sources in the one place that decides the design - see §7.4's
+      "What the sync object family answers". Nothing is dispatched to yet, and
+      `IN_FENCE_FD` is still the property this card accepts and ignores
 - [ ] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
       the only one that lets niri, which rejects software EGL outright, run at
       all; virgl and venus are both built on it (§7.4)
@@ -3392,6 +3396,92 @@ Services, which are rootfs work: `sway`/`niri` with their libraries
 (`libdisplay-info`, `libseat`, `xkbcommon`, `pango`/`cairo` and the fonts *and
 writable font cache* those need), `vulkan-loader` with an ICD, and the
 compositor-starting half weston already models.
+
+#### What the sync object family answers, measured before it is built
+
+`SYNCOBJ_*` is the last item on the list above besides `DRM_VIRTGPU_*`, and its
+design is now written from measurement rather than from the sources, because the
+two disagree about the one question the whole family turns on: **what a syncobj
+that holds no fence means.** Four instrument programs were run against the real
+card (`/dev/dri/renderD128`, AMD `amdgpu`, DRM interface 3.64.0, Linux 7.2.7) -
+one for creation, destruction and the descriptor handover, one for the wait
+family, one for the transfer and eventfd edges, and one for the three rules the
+first three could not separate between them. Everything below is a line one of
+them printed.
+
+**This host's header is ahead of the upstream one in two ways a caller notices.**
+`struct drm_syncobj_wait` and `struct drm_syncobj_timeline_wait` have each grown
+a trailing `__u64 deadline_nsec`, so they are 40 and 48 bytes rather than the 32
+and 40 the older headers describe, and
+`DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE` / `..._FD_TO_HANDLE_FLAGS_TIMELINE`
+exist at `1 << 1` on both directions. The first is not a detail: a program built
+against the old layout sends a request word whose encoded size is eight bytes
+short, and the entire wait family answers `EINVAL` - which is what the first
+instrument run measured, in full, before anyone noticed. It is why every number
+below is quoted with the struct it came from.
+
+**A syncobj either holds a fence or it does not, and "does not" is a refusal
+rather than a success.** This is the divergence from the sources, which treat a
+fence-less binary syncobj as already signaled because there is nothing to wait
+for. Measured here, every request that needs something to wait on refuses a
+fence-less object instead:
+
+| on a fence-less object | measured |
+|---|---|
+| `WAIT`, one handle, timeout `0` or `-1` | `EINVAL` (no blocking without `WAIT_FOR_SUBMIT`) |
+| `WAIT` with `WAIT_FOR_SUBMIT` | blocks; `ETIME` when the timeout expires |
+| `TIMELINE_WAIT` at a point no fence covers | `EINVAL` |
+| `TIMELINE_WAIT` with `WAIT_FOR_SUBMIT` | success as soon as *a* fence exists, whatever the point; `ETIME` otherwise |
+| `HANDLE_TO_FD` with `EXPORT_SYNC_FILE` | `EINVAL` |
+| `EVENTFD` | accepted, and never fires |
+
+So the state a syncobj is in is not "signaled or not" but "has something behind
+it or not", and the operations that *create* one are the whole of how it changes:
+`CREATE` with `SIGNALED`, `SIGNAL`, `TIMELINE_SIGNAL`, `TRANSFER` into it, and
+`FD_TO_HANDLE` with `IMPORT_SYNC_FILE` each leave a fence behind; `CREATE`
+without the flag and `RESET` take it away. A **timeline** is not a kind chosen at
+creation - `CREATE` has no timeline flag - but a syncobj that has had a point
+submitted to it: `TIMELINE_SIGNAL` on a binary syncobj is `ok` and makes it one,
+and `TIMELINE_WAIT` on a syncobj that never had a point is `EINVAL`. `QUERY`
+reports the highest point submitted (0 for one that never was), which is why
+`RESET` on a timeline reads back 0, and why `SIGNAL` - which a timeline also
+accepts - leaves the point where it found it.
+
+The rest of the family, as measured: `TRANSFER` requires only that *one* of its
+two objects hold a fence, otherwise `EINVAL`; it both copies the fence and sets
+the destination's point to `dst_point` when the destination is a timeline, and it
+does not care whether `dst_point` is above or below the point already there.
+`HANDLE_TO_FD` with `flags = 0` answers a **syncobj descriptor** - the anonymous
+file that *is* the syncobj, which is what `wp_linux_drm_syncobj_v1` passes between
+processes - while `EXPORT_SYNC_FILE` answers a **sync-file** descriptor. The two
+are told apart by the import: `FD_TO_HANDLE` with `flags = 0` requires a syncobj
+descriptor and installs a second handle for the same object, while
+`IMPORT_SYNC_FILE` requires a sync-file descriptor **and** a `handle` that names
+an existing syncobj to replace - `handle = 0`, which is how the other direction
+asks for a *new* handle, is `ENOENT` here. A program that follows the descriptor
+matrix wrong gets `EINVAL` from the other direction's entry point, not a second
+object. `EVENTFD` registers a one-shot per call: the eventfd's counter is
+incremented by one when the registered point first becomes covered, immediately
+if it already is, once per registration (registering twice and then signaling
+once reads back `2`), and never if the syncobj is destroyed first.
+
+Two consequences for the work, and they are what the implementation is shaped
+around. **First, nothing on this machine can produce an unsignaled fence** - the
+only fence a client can obtain is a signaled stub, which the instruments confirm
+by never once seeing a wait block on an object that had one - so the whole
+"asynchronous" half of the family collapses into "has a fence yet or not", and
+that is a truth about this card rather than a simplification of it: there is no
+engine here to be in flight, which is the same fact `WAIT_VBLANK` and the CRTC
+sequence pair are refused on. **Second, `WAIT`/`TIMELINE_WAIT` are the only
+blocking requests in the family**, which is what makes them the two that need the
+scheduler: a `WAIT_FOR_SUBMIT` parks until some other request leaves a fence
+behind, and `EVENTFD` is the same wait expressed as a counter for a caller with
+an event loop - which is why it is the probe Smithay makes before it will expose
+`wp_linux_drm_syncobj_v1` at all.
+
+`DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE` are both answered `1` by the
+real card, so this card answering `1` is a statement it has to make true rather
+than a capability it can decline.
 
 #### Order
 
