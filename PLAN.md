@@ -3115,6 +3115,36 @@ sending whole frames), `OUT_FENCE_PTR`, `IN_FORMATS` with
 `DRM_CAP_ADDFB2_MODIFIERS`, and `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` - refused
 today, and asked for precisely by the virtualized drivers.
 
+**The list above was written from the sources, and measuring it corrected three
+of its entries.** `modetest -c -p` against the real card on the development host
+(AMD `amdgpu`, DRM interface 3.64.0, Linux 7.2.7) is the instrument, and what it
+reports is the shape each property really has:
+
+| property | object | flags | shape as measured |
+|---|---|---|---|
+| `EDID` | connector | immutable blob | 128 bytes + extension blocks |
+| `DPMS` | connector | enum | `On=0 Standby=1 Suspend=2 Off=3` |
+| `link-status` | connector | enum | `Good=0 Bad=1` |
+| `non-desktop` | connector | **immutable range** | `values 0 1` - a range, *not* the bool the sources suggest |
+| `max bpc` | connector | range | `values 8 16`, value 16 |
+| `vrr_capable` | **connector** | immutable range | `values 0 1`; every DP/eDP output carries it, with value 0 on the ones whose sink is not VRR |
+| `subconnector` | connector | immutable enum | `Unknown=0 VGA=1 DVI-D=3 DP=10 HDMI=11 Native=15 Wireless=18`, and only on connectors that have one (the eDP output has none) |
+| `VRR_ENABLED` | **CRTC** | range | `values 0 1` |
+| `GAMMA_LUT` / `GAMMA_LUT_SIZE` | **CRTC** | blob / immutable range | size reports `values 0 4294967295`, value 4096 |
+| `IN_FORMATS` | plane | immutable blob | |
+| `FB_DAMAGE_CLIPS` | plane | - | **absent on a real card**, so it is a driver opt-in rather than a family a compositor can rely on |
+| `OUT_FENCE_PTR` | plane | - | **absent on a real card** for the same reason |
+
+Two consequences for this plan, and both change what "add the property" means.
+`non-desktop` and `vrr_capable` are **ranges with two values**, so a card that
+answered them as a `PROP_BOOL` would give a reader a shape it does not expect -
+and `vrr_capable` belongs on the connector while `VRR_ENABLED` belongs on the
+CRTC, which the sources' prose does not make obvious. And the last two rows are
+the reminder the whole section is written around: a property family a
+*compositor* looks up by name is one the driver may legitimately not have, so
+the honest answer for this card is absence plus the `drm_info`-visible reason -
+not a blob property invented to make the list look complete.
+
 Syscalls and memory, the parts this section cannot fix from inside the display
 driver: `/proc/<pid>/maps` **landed** (§Remaining has the file and the two
 divergences it carries) - a crash reporter now has somewhere to look for a
