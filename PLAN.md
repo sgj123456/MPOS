@@ -439,9 +439,11 @@ it - so the entries say which they are:
       makes `WLR_RENDERER=pixman` the cheapest second-compositor experiment there
       is; no wlroots compositor has been booted yet, and that is the whole of
       what is missing (§7.4)
-- [ ] **threads** — `clone(CLONE_THREAD)` answers `ENOSYS`, and every compositor
-      that is not single-threaded, every Mesa worker pool and every Vulkan ICD
-      wants one (§6.4, §7.4)
+- [x] **threads** — `clone(CLONE_THREAD)` puts the child on the caller's memory
+      and its descriptor table, with `CLONE_CHILD_CLEARTID` + a real `futex`
+      wake for `pthread_join`, `exit_group` on the group, and `getpid`/`gettid`
+      answering the group and the task. Pinned by `t-clone` (§6.4). What the
+      compositors beyond weston still want is elsewhere on this list
 - [ ] DRM sync objects — the `SYNCOBJ_*` family, including `SYNCOBJ_EVENTFD`
       (which Smithay probes before it will expose `wp_linux_drm_syncobj_v1`),
       with `IN_FENCE_FD`/`OUT_FENCE_PTR` given the behaviour their names promise
@@ -2131,14 +2133,19 @@ implementation now holds:
 | `CLONE_PIDFD\|CLONE_NEWNS` | `EINVAL` | an invalid bit outranks a namespace beside it |
 
 So the eight namespaces are `0x80`, `0x2_0000`, `0x0200_0000` … `0x4000_0000`;
-the six thread-group flags are a genuine no-op here (a process is its own only
-thread and already owns all six - the answer is the truth, not a courtesy); and
-`EINVAL` is decided before the namespace refusal, which is Linux's order. All of
-it is pinned by `t-posix`.
+the six thread-group flags are a genuine no-op for a caller with no sibling to
+split from, which is what the measurement above was taken on and what Linux
+answers for a single-threaded process; and `EINVAL` is decided before the
+namespace refusal, which is Linux's order. All of it is pinned by `t-posix`.
 
+Two of those rows have moved since, and one of them is now an overstatement.
 `CLONE_NEWUTS` no longer answers `EOPNOTSUPP` - it is the one namespace this
 kernel serves, and the row above is the measurement the *unserved* seven still
-give ("Step 1, landed" earlier in this section).
+give ("Step 1, landed" earlier in this section). And "a process is its own only
+thread" stopped being true when threads landed (§6.4): the six thread-group flags
+are a no-op for the *unshared* caller the table was measured on, and for a caller
+that does have siblings Linux answers `EINVAL` where this kernel still answers
+`0`. That is a named gap in the "Step 1, landed" list rather than a claim.
 
 ### 6.4 Additional Process Syscalls — **DONE**
 
@@ -2155,18 +2162,36 @@ All wired to real handlers in `posix.rs`/`proc.rs`: `getpgrp`, `setreuid`,
 | `capget` | 125 | Get capability state |
 | `capset` | 126 | Set capability state |
 
-One request in this family is deliberately not answered, and it is the largest
-hole left in the process ABI: **`clone(CLONE_THREAD)`** — thread creation —
-answers `ENOSYS`. Everything without it is built (the process-shaped clone, with
-the tid writes, the TLS base and the signal frame the flags name), and a thread
-group would share an address space that the scheduler's exit and space
-accounting does not model yet — this kernel's address spaces are owned by one
-task. Nothing in the shipped image needs a thread, which is how it has lasted;
-everything larger does — a compositor that is not single-threaded, Mesa's worker
-pools (`LP_NUM_THREADS`), any Vulkan ICD, `tracy_client`, `async-io` under
-niri's D-Bus feature (§7.4). The refusal goes through the dispatcher's
-`note_enosys` table with the other two of its kind, so a program that asks is
-told once rather than left waiting.
+**Threads are real, and this section said otherwise for longer than it should
+have.** The paragraph here used to read "one request in this family is
+deliberately not answered, and it is the largest hole left in the process ABI:
+`clone(CLONE_THREAD)` — thread creation — answers `ENOSYS`". That had stopped
+being true at commit `58c6947`, which landed a thread group (`Mm`: the frames
+behind the group's mappings, how many threads run on them, the paging root a
+thread switches to, and where a leaving thread says so), `spawn_thread` reached
+from `sched::clone`, `CLONE_CHILD_CLEARTID` writing zero and waking the futex
+there - which is what `pthread_join` sleeps on - `exit_group(2)` ending every
+thread of a group while `exit(2)` ends only the caller, and `getpid` answering
+the group id while `gettid` answers the task's own. `t-clone` pins it and sits in
+the default sweep: a thread's write is visible to its creator, which is the whole
+difference between a thread and a fork. The stale paragraph was contradicted by a
+green test the gate ran every time, which is the lesson worth keeping from it.
+
+What genuinely remains is narrower, and each item is named rather than implied:
+
+* **`CLONE_SIGHAND` is accepted and the handler table is still copied.** Linux
+  shares it under that flag; here a handler installed by one thread is not
+  installed for its siblings. Nothing in this system's userland does that yet, so
+  a *copy* is the honest version of "not shared" - but it is a divergence and not
+  a completion.
+* **`CLONE_VM` without `CLONE_THREAD` is answered with a copy.** That is
+  `posix_spawn`'s shape met precisely (such a child only ever reads the caller's
+  memory before `execve`), and the doc comment at `sched::clone` says why a copy
+  beats a share there - but it is not the shared address space the flag names.
+* **The rest of the thread ABI** is wired where a caller needs it: the tid
+  writes, the TLS base, the signal mask inherited across `clone`/`fork`,
+  `get_robust_list`, and the per-thread `/proc/<pid>/task` listing
+  (`thread_snapshots`).
 
 ---
 
@@ -2975,11 +3000,14 @@ family - `GET_PARAM`, `RESOURCE_CREATE`, `RESOURCE_INFO`, `SUBMIT_3D`,
 is what virgl (and venus, for Vulkan) is built on, and it is the largest single
 item in this section.
 
-Two smaller blockers sit behind it. **Threads**: `clone(CLONE_THREAD)` is
-`ENOSYS` (§6.4), and a real compositor spawns them - `tracy_client`'s
-profiler thread, `async-io` under the D-Bus feature, and Mesa's own worker pools
-(`LP_NUM_THREADS`; one CPU makes llvmpipe's default single-threaded, but the path
-exists, and Vulkan ICDs use it unconditionally). **Explicit sync**: Smithay will
+Two smaller blockers used to sit behind it, and **the first is no longer one:
+threads are done** (`clone(CLONE_THREAD)`, §6.4 - a task on the caller's memory
+and descriptors, with `CLONE_CHILD_CLEARTID` and a real futex wake for
+`pthread_join`). That matters here precisely because a real compositor spawns
+them: `tracy_client`'s profiler thread, `async-io` under the D-Bus feature, and
+Mesa's own worker pools (`LP_NUM_THREADS`; one CPU makes llvmpipe's default
+single-threaded, but the path exists, and Vulkan ICDs use it unconditionally).
+**Explicit sync is the one that remains**: Smithay will
 not expose `wp_linux_drm_syncobj_v1` at all unless `DRM_IOCTL_SYNCOBJ_EVENTFD`
 answers, and its DRM plane config writes `IN_FENCE_FD` when a fence is present -
 a property this card accepts and then ignores, with no `OUT_FENCE_PTR` beside it.
@@ -3042,10 +3070,11 @@ sending whole frames), `OUT_FENCE_PTR`, `IN_FORMATS` with
 today, and asked for precisely by the virtualized drivers.
 
 Syscalls and memory, the parts this section cannot fix from inside the display
-driver: **threads** (`clone(CLONE_THREAD)`, §6.4); `/proc/<pid>/maps`, absent and
+driver: `/proc/<pid>/maps`, absent and
 read by Mesa's allocator paths, LLVM and most crash reporters; and the frame pool
 (§10.4), since the renderer families allocate scratch in tens of megabytes where
-the current per-frame accounting was never sized for it. Anonymous demand paging
+the current per-frame accounting was never sized for it. Threads used to head
+this list and are §6.4's now - landed. Anonymous demand paging
 and `MADV_DONTNEED` used to be on that list - they are §5.1/§5.2's rewrite now,
 and the scratch a renderer gives back is memory the machine can use again.
 
@@ -3069,8 +3098,9 @@ Each step stands on its own, which is the only reason the order is this one:
 3. **DRM sync objects**, with `IN_FENCE_FD`/`OUT_FENCE_PTR` given the behaviour
    their names promise - which is what makes explicit sync real rather than
    merely accepted.
-4. **Threads** (§6.4) - not a display item, but on the critical path of every
-   compositor that is not single-threaded and every Vulkan driver.
+4. ~~**Threads** (§6.4)~~ **Landed** - not a display item, but on the critical path
+   of every compositor that is not single-threaded and every Vulkan driver, so it
+   is worth knowing the step is behind us before the property families.
 5. **`DRM_VIRTGPU_*`, then virgl in the image.** The largest item and the only
    one that makes niri possible.
 6. **`/proc/<pid>/maps`** and the frame pool: the supporting cast, wanted by
