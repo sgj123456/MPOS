@@ -36,21 +36,85 @@ const SUMMARY_MARKER: &str = "=== SUMMARY";
 /// KVM is not. `MPOS_TEST_TIMEOUT` overrides, in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
-pub fn run_tests(build_dir: &Path, profile: &str) -> Result<()> {
+/// What the caller asked `test` to run: the groups named on the command line
+/// (`--groups external,slow`) and whether every group was asked for
+/// (`--all-groups`). Neither means the `default` list in `tests.toml`.
+pub struct Selection {
+    pub groups: Vec<String>,
+    pub all: bool,
+}
+
+pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Result<()> {
     run_unit_tests()?;
     println!();
 
     utils::build_kernel(profile)?;
     println!();
 
-    let tests = build_user_tests()?;
-    println!("user tests: {} programs built", tests.len());
+    let built = build_user_tests()?;
+    println!("user tests: {} programs built", built.len());
+
+    // Which of them this run boots is the configuration's answer, and the two
+    // refusals below are the ones that keep it honest: a group name nobody
+    // defined, and a name in the file that no program answers to. Both would
+    // otherwise show up only as a smaller number in a summary line.
+    let config = crate::config::TestConfig::load(&utils::project_root()?.join("tests.toml"))?;
+    let unknown = config.unknown(&selection.groups);
+    if !unknown.is_empty() {
+        let known = config.group_names();
+        bail!(
+            "unknown test group(s) {}; tests.toml defines {}",
+            unknown.join(", "),
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        );
+    }
+    let names: Vec<String> = built.iter().map(|test| test.name.clone()).collect();
+    let unmatched = config.unmatched(&names);
+    if !unmatched.is_empty() {
+        bail!(
+            "tests.toml lists {}, which no built test program answers to",
+            unmatched.join(", ")
+        );
+    }
+
+    let selected = config.selection(&selection.groups, selection.all);
+    let tests: Vec<UserTest> = built
+        .iter()
+        .filter(|test| config.runs(&test.name, &selected))
+        .cloned()
+        .collect();
+    let skipped: Vec<&UserTest> = built
+        .iter()
+        .filter(|test| !config.runs(&test.name, &selected))
+        .collect();
+    println!(
+        "user tests: {} staged, {} left out by tests.toml",
+        tests.len(),
+        skipped.len()
+    );
+    // Printed group by group rather than as a list of names, because the reason
+    // is the group: a reader has to be able to see at a glance whether the tests
+    // this run left out are the ones it meant to.
+    for group in config.group_names() {
+        let left: Vec<&str> = skipped
+            .iter()
+            .filter(|test| config.groups_of(&test.name).contains(&group))
+            .map(|test| test.name.as_str())
+            .collect();
+        if !left.is_empty() {
+            println!("  {group:11} {}", left.join(", "));
+        }
+    }
     println!();
 
     let tar = build_test_initramfs(build_dir, &tests)?;
     let (status, log) = boot_tests(build_dir, profile, &tar)?;
 
-    report(&tests, &log, status)
+    report(&tests, built.len(), &log, status)
 }
 
 /// The arch-independent kernel, tested on the host. `--target` is explicit
@@ -82,6 +146,7 @@ fn run_unit_tests() -> Result<()> {
 
 /// One user test program: its name (what appears on a verdict line) and the
 /// built binary.
+#[derive(Clone)]
 struct UserTest {
     name: String,
     binary: PathBuf,
@@ -265,6 +330,10 @@ fn build_test_initramfs(build_dir: &Path, tests: &[UserTest]) -> Result<PathBuf>
 /// because the archive's applet links are the only ones it has; every program
 /// matching `/bin/t-*` is a test, and `poweroff -f` is what ends the run -
 /// the kernel answers `reboot(RB_POWER_OFF)` with QEMU's debug exit.
+///
+/// Which programs are in `/bin` at all *is* the test selection: the guest has
+/// no opinion about which tests it runs, it runs what it was given, so
+/// `tests.toml` decides the sweep simply by deciding what is staged here.
 const TEST_INIT: &str = r#"#!/bin/sh
 # mpos self-test: run every test program in /bin, then end the machine.
 
@@ -431,9 +500,11 @@ fn test_timeout_secs() -> u64 {
 }
 
 /// Reads the run's verdicts off the serial log and answers for every test that
-/// was built: a test that never printed `=== PASS` failed, whether it
-/// crashed, hung or never ran.
-fn report(tests: &[UserTest], log: &Path, status: Option<i32>) -> Result<()> {
+/// was **staged**: a test that never printed `=== PASS` failed, whether it
+/// crashed, hung or never ran. `built` is what the crate produced, so the line
+/// can say how much of it the configuration left out - a sweep that quietly
+/// runs less than it used to is the failure this number is here to catch.
+fn report(tests: &[UserTest], built: usize, log: &Path, status: Option<i32>) -> Result<()> {
     let text = fs::read_to_string(log)
         .with_context(|| format!("Failed to read the serial log at {}", log.display()))?;
 
@@ -465,6 +536,10 @@ fn report(tests: &[UserTest], log: &Path, status: Option<i32>) -> Result<()> {
     } else {
         println!("self-test guest: no summary line - the run did not get to the end");
     }
+    let skipped = built.saturating_sub(tests.len());
+    if skipped > 0 {
+        println!("self-test guest: {skipped} of {built} user tests left out by tests.toml");
+    }
     println!(
         "self-test guest: exit {} (33 is the clean debug exit)",
         status.unwrap_or(-1)
@@ -490,8 +565,13 @@ fn report(tests: &[UserTest], log: &Path, status: Option<i32>) -> Result<()> {
     println!();
     if clean && missing.is_empty() {
         println!(
-            "self-test: all {} user tests passed, unit tests passed",
-            tests.len()
+            "self-test: all {} user tests passed, unit tests passed{}",
+            tests.len(),
+            if skipped > 0 {
+                format!(" ({skipped} not run - see tests.toml)")
+            } else {
+                String::new()
+            }
         );
         Ok(())
     } else {

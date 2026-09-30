@@ -300,6 +300,105 @@ impl QemuConfig {
     }
 }
 
+/// Which user test programs the self-test sweep runs, and which it leaves out.
+///
+/// The file is `tests.toml` at the repository root and its shape is one array
+/// per group - `external = ["t-dns", ...]` - plus `default`, naming the groups a
+/// plain run adds to the ungrouped tests. A test in *no* group always runs: the
+/// default sweep is "everything that is a check of this machine", so leaving one
+/// out has to be a deliberate act with a reason written next to it.
+///
+/// The selection is a pure function of the file and the flags, which is what
+/// makes it host-testable - and it is the one piece of this a mistake would make
+/// invisible, because a sweep that runs fewer tests than it should prints a
+/// smaller number and passes.
+#[derive(Debug, Default, Clone)]
+pub struct TestConfig {
+    /// Groups a plain run adds to the ungrouped tests.
+    default: Vec<String>,
+    /// `(group, tests)` by group name, so the report is stable and a run cannot
+    /// depend on a hash map's iteration order.
+    groups: Vec<(String, Vec<String>)>,
+}
+
+impl TestConfig {
+    /// Read the file. A missing one is **no exclusions**, not an error.
+    ///
+    /// The opposite default is the dangerous one: a sweep that silently skips
+    /// programs because a file it does not strictly need went missing is how a
+    /// suite comes to report success for a machine it never checked.
+    pub fn load(path: &Path) -> Result<Self> {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Ok(Self::default());
+        };
+        let mut values = parse_simple_toml(&content)?;
+        let default = take_list(&mut values, "default", &[]);
+        let mut groups: Vec<(String, Vec<String>)> = values
+            .into_iter()
+            .map(|(name, tests)| (name, parse_package_list(tests)))
+            .collect();
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Self { default, groups })
+    }
+
+    /// The groups a run will use: an explicit list replaces the file's
+    /// `default`, `--all-groups` is every group the file defines, and neither
+    /// means the `default`.
+    pub fn selection(&self, requested: &[String], all: bool) -> Vec<String> {
+        if all {
+            return self.groups.iter().map(|(name, _)| name.clone()).collect();
+        }
+        if requested.is_empty() {
+            return self.default.clone();
+        }
+        requested.to_vec()
+    }
+
+    /// The names in `requested` that this file does not define.
+    pub fn unknown(&self, requested: &[String]) -> Vec<String> {
+        requested
+            .iter()
+            .filter(|name| !self.groups.iter().any(|(group, _)| group == *name))
+            .cloned()
+            .collect()
+    }
+
+    /// The names the file lists that no built program answers to - a group that
+    /// has outlived a test, or a typo in one, either of which would otherwise
+    /// leave that test running unclassified for ever.
+    pub fn unmatched(&self, built: &[String]) -> Vec<String> {
+        self.groups
+            .iter()
+            .flat_map(|(_, tests)| tests.iter())
+            .filter(|test| !built.iter().any(|name| name == *test))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `test` runs under `selection`.
+    pub fn runs(&self, test: &str, selection: &[String]) -> bool {
+        let groups = self.groups_of(test);
+        groups.is_empty()
+            || groups
+                .iter()
+                .any(|group| selection.iter().any(|asked| asked == group))
+    }
+
+    /// The groups `test` is in, by name.
+    pub fn groups_of<'a>(&'a self, test: &str) -> Vec<&'a str> {
+        self.groups
+            .iter()
+            .filter(|(_, tests)| tests.iter().any(|name| name == test))
+            .map(|(group, _)| group.as_str())
+            .collect()
+    }
+
+    /// Every group the file defines, for a message that lists the choices.
+    pub fn group_names(&self) -> Vec<&str> {
+        self.groups.iter().map(|(name, _)| name.as_str()).collect()
+    }
+}
+
 /// Read a `key = true`-style boolean. Anything but an explicit `true` -
 /// absent, empty, any other word - is false: a device that needs the host's
 /// cooperation defaults to off, and the file says so in one word.
@@ -576,6 +675,101 @@ mod tests {
         // And the disk geometry stays there on purpose - changing it re-makes
         // the partitions, which is a rebuild this file should ask for.
         assert!(image_keys.contains_key("image_size") && image_keys.contains_key("esp_size"));
+    }
+
+    fn groups(text: &str) -> TestConfig {
+        let values = parse_simple_toml(text).unwrap();
+        let mut values = values;
+        let default = take_list(&mut values, "default", &[]);
+        let mut groups: Vec<(String, Vec<String>)> = values
+            .into_iter()
+            .map(|(name, tests)| (name, parse_package_list(tests)))
+            .collect();
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+        TestConfig { default, groups }
+    }
+
+    #[test]
+    fn a_test_in_no_group_runs_and_a_grouped_one_does_not() {
+        // The whole contract in one line: being named in a group is what takes a
+        // test out of the default sweep, and naming a group puts it back.
+        let config = groups("default = []\nexternal = [\"t-dns\", \"t-udp\"]\n");
+        assert!(config.runs("t-openat", &config.selection(&[], false)));
+        assert!(!config.runs("t-dns", &config.selection(&[], false)));
+        assert!(config.runs("t-dns", &config.selection(&["external".into()], false)));
+        // A test in two groups runs when *either* is asked for.
+        let both = groups("external = [\"t-dns\"]\nslow = [\"t-dns\", \"t-pipecost\"]\n");
+        assert!(both.runs("t-dns", &both.selection(&["slow".into()], false)));
+        assert!(!both.runs("t-pipecost", &both.selection(&["external".into()], false)));
+        assert_eq!(both.groups_of("t-dns"), vec!["external", "slow"]);
+    }
+
+    #[test]
+    fn the_flags_replace_or_extend_the_files_default() {
+        let config =
+            groups("default = [\"slow\"]\nslow = [\"t-pipecost\"]\nexternal = [\"t-dns\"]\n");
+        // No flag: the file's `default`.
+        assert!(config.runs("t-pipecost", &config.selection(&[], false)));
+        assert!(!config.runs("t-dns", &config.selection(&[], false)));
+        // A named group *replaces* it rather than adding to it - otherwise a
+        // second `--groups` on the command line would be unable to narrow.
+        assert!(!config.runs("t-pipecost", &config.selection(&["external".into()], false)));
+        assert!(config.runs("t-dns", &config.selection(&["external".into()], false)));
+        // Every group, for the run that wants everything.
+        let all = config.selection(&[], true);
+        assert!(config.runs("t-dns", &all) && config.runs("t-pipecost", &all));
+        assert!(config.runs("t-openat", &all), "the ungrouped ones run too");
+    }
+
+    #[test]
+    fn a_missing_file_runs_everything() {
+        // The dangerous default is the other one: a sweep that silently skips
+        // programs because a file went missing reports success for a machine it
+        // never checked.
+        let config = TestConfig::load(Path::new("/nonexistent/tests.toml")).unwrap();
+        assert!(config.runs("t-openat", &config.selection(&[], false)));
+        assert!(config.group_names().is_empty());
+    }
+
+    #[test]
+    fn a_name_nothing_answers_to_is_reported() {
+        let config = groups("external = [\"t-dns\", \"t-gone\"]\n");
+        assert_eq!(
+            config.unmatched(&["t-dns".to_string(), "t-openat".to_string()]),
+            vec!["t-gone"]
+        );
+        assert!(config.unknown(&["nope".to_string()]).len() == 1);
+        assert!(config.unknown(&["external".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn the_shipped_file_keeps_the_internet_out_of_the_default_sweep() {
+        // The repository's own `tests.toml`, through the parser the build uses.
+        // This is the pin for the sweep's determinism: every test that reaches
+        // outside the machine has to be in a group, and the default sweep has to
+        // add none, or a red gate stops meaning "the kernel".
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the repository root");
+        let config = TestConfig::load(&root.join("tests.toml")).unwrap();
+
+        let default = config.selection(&[], false);
+        assert!(
+            default.is_empty(),
+            "the default sweep adds {default:?}: a plain `cargo xtask test` is \
+             supposed to run the ungrouped tests and nothing else"
+        );
+        for test in ["t-dns", "t-stdresolve", "t-udp", "t-tcp-close"] {
+            assert!(
+                config.groups_of(test).contains(&"external"),
+                "{test} reaches outside the machine and is not in `external`"
+            );
+            assert!(!config.runs(test, &default), "{test} would run by default");
+        }
+        // The three groups are named, so a reader can ask for them.
+        for group in ["diagnostic", "external", "slow"] {
+            assert!(config.group_names().contains(&group), "no `{group}` group");
+        }
     }
 
     #[test]

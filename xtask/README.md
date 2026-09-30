@@ -78,6 +78,8 @@ cargo xtask [global flags] <command>
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
 | 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror` / `weston`（默认取 `machine.toml` 的 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror`/`weston` (defaults to `[qemu] mode` in `machine.toml`, else `mirror`) |
+| 测试分组 | `--groups <A,B>` | 仅 `test`：除分组外的测试之外再跑这些分组（取代 `tests.toml` 的 `default`）| `test` only: run these groups *in addition* to the ungrouped tests (replaces the file's `default`) |
+| 全部分组 | `--all-groups` | 仅 `test`：连非默认分组一起跑 | `test` only: run every group, including the ones left out by default |
 
 ### 子命令 | Commands
 
@@ -89,7 +91,7 @@ cargo xtask [global flags] <command>
 | `rootfs` | rootfs | 把 Alpine 根文件系统装进镜像（会顺带更新 initramfs） | install the root filesystem into the image (refreshes the initramfs too) | 是 yes |
 | `run` | run | 在 QEMU 中启动镜像；若产物过期会先自动重建 | boot the image in QEMU, rebuilding first if stale | 视情况 when needed |
 | `all` | all | 一次做完：内核、initramfs、镜像、根文件系统 | build everything in one go | 是 yes |
-| `test` | test | 自测：宿主单元测试 + 在 QEMU 里跑全部用户测试程序并解析结果 | self-test sweep: host unit tests + every user test program booted in QEMU | 否 no |
+| `test` | test | 自测：宿主单元测试 + 在 QEMU 里跑 `tests.toml` 选中的用户测试程序并解析结果 | self-test sweep: host unit tests + the user test programs `tests.toml` selects, booted in QEMU | 否 no |
 | `clean` | clean | 删除 `build/` 与 `target/` | remove the build and target directories | 视情况 when needed |
 
 ### 环境变量 | Environment variables
@@ -179,6 +181,44 @@ ask for.
 `[qemu] display` picks the window backend for `run` (default `sdl`); use `none` to
 watch only the serial log — though the console now renders to the framebuffer, so
 `none` shows no picture. `test` always boots headless and ignores it.
+
+## 配置：`tests.toml` —— 跑哪些用户测试 | which user tests run
+
+`cargo xtask test` 默认只跑**不属于任何分组**的测试程序。一个测试在 `tests.toml` 里被列进
+某个分组，就不再默认运行——因为它需要机器之外的东西（宿主的网络、宿主上的监听进程），
+或者慢、或者只是测量，或者根本不是断言（`t-sh` 是诊断工具）。这么做的收益是门禁的意义
+本身：默认集变红，说的就是内核，而不是网络、宿主的解析器，或恰好很忙的宿主。
+
+`cargo xtask test` runs the tests that are in **no group**. A test listed in a
+group is left out of the default sweep, because it needs something outside the
+machine, or takes seconds, or measures rather than asserts:
+
+| 分组 | group | 为什么默认不跑 | why it is not in the default sweep |
+| --- | --- | --- | --- |
+| `external` | | 需要机器之外的东西：宿主的网络（经 QEMU 用户态栈）或宿主上监听的服务 | needs something outside the machine: the host's network, or a listener on the host |
+| `slow` | | 慢，或只是测量：`t-fill-ramfs` 最多写 1024 MiB，其余是计时仪器 | slow, or measurement rather than assertion |
+| `diagnostic` | | 不是检查：`t-sh` 驱动一个交互 shell 并打印观察 | not a check: it drives an interactive shell and prints what it sees |
+
+```sh
+cargo xtask test                      # 默认集：分组外的全部测试
+cargo xtask test --groups external    # 再多跑 external（命名分组会取代文件里的 default）
+cargo xtask test --groups external,slow
+cargo xtask test --all-groups         # 全部，含 slow / external / diagnostic
+```
+
+`default` 键给出默认额外要跑的分组（出厂为空）。分组名随你加，一个测试也能出现在多个分组
+里，那么在任一被点名的分组下都会跑。两种「静默少跑」都会被拒绝：命令行写了文件里没有的
+分组名会报错并列出可选名字，文件里写了没有任何已构建程序对应的名字也会报错（分组比测试
+活得久，或者拼错了一个名字）。被跳过的测试按分组打印出来，判决只对**装进镜像的那些**要求，
+所以「N built」和「M left out」两件事都说得清楚。
+
+`default` names the groups the sweep adds to the ungrouped tests (empty as
+shipped), group names are yours to add, and a test may appear in several. Two
+kinds of silent narrowing are refused: a group name on the command line that the
+file does not define, and a name in the file that no built program answers to.
+What was skipped is printed group by group, and the verdict check only requires a
+`=== PASS` from the programs that were staged — so "N built" and "M left out"
+are both said out loud.
 
 ---
 

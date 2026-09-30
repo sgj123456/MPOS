@@ -1,0 +1,51 @@
+# tests.toml - which user test programs the self-test sweep runs.
+#
+# `cargo xtask test` builds every program and boots the ones that are in **no
+# group**. A test is left out of that default sweep by being named in a group
+# here, and the reason is always the same shape: it needs something that is not
+# the machine under test, or it measures instead of asserting, or it is not a
+# check at all. What that buys is the only thing a gate is for - a red default
+# sweep means the kernel, rather than the internet, the host's resolver, or a
+# host that happened to be busy.
+#
+#   cargo xtask test                     # the ungrouped tests, plus `default`
+#   cargo xtask test --groups slow       # the ungrouped tests, plus `slow`
+#   cargo xtask test --all-groups        # everything, groups and all
+#
+# A group name the file does not define is an error rather than a quiet no-op,
+# and so is a name here that no built program answers to: running fewer tests
+# than the caller asked for is the one failure this must not have. A test may
+# appear in more than one group, and then runs when any of them is asked for.
+#
+# The parser is the small one `rootfs.toml` uses: `key = value`, one array per
+# key (which may be written across several lines), and section headers are for
+# the reader. Group order in the output follows the name, not the line.
+
+# Groups a plain `cargo xtask test` adds to the ungrouped tests. Empty - the
+# shipped value - means "the ungrouped ones", which is what the sweep should be:
+# everything that is a check of this machine and of nothing else.
+default = []
+
+# Needs something outside the machine: the host's network, through QEMU's
+# user-mode stack, or a program listening on the host. A red one of these is a
+# statement about the internet or the host's own services before it is a
+# statement about the kernel - which is why the default sweep leaves them out,
+# and why they are worth running on purpose.
+#
+#   t-dns, t-stdresolve  resolve real names through the host's resolver
+#   t-udp                sends a DNS query to 10.0.2.3 and reads the answer
+#   t-tcp-close          needs a listener on the host's 127.0.0.1:4599; with
+#                        none it prints `skip:` and passes, so it is a probe
+#                        and not a gate in either state
+external = ["t-dns", "t-stdresolve", "t-tcp-close", "t-udp"]
+
+# Slow, or a measurement rather than an assertion. `t-fill-ramfs` writes up to
+# 1024 MiB a chunk at a time; the other three are instruments whose numbers are
+# the point and whose verdict can depend on how busy the host is (§10.2, §10.4
+# carry their figures).
+slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-pipecost"]
+
+# Not a check at all. `t-sh` execs an interactive busybox ash onto the console
+# and prints what it observes about where the shell stopped; it is here to be
+# run by hand when a shell problem needs looking at.
+diagnostic = ["t-sh"]

@@ -36,6 +36,7 @@ program booted in QEMU, or both.
 | `arch/x86_64/linker.ld` | Kernel linker script, referenced from `.cargo/config.toml` |
 | `rootfs/`, `rootfs.toml` | The guest image's contents: the overlay tree and the packages, hostname, disk geometry it is built from |
 | `machine.toml` | What that image is *booted* on — memory, cpus, devices, the standing run mode. Host-side only, so editing it never reinstalls the image |
+| `tests.toml` | Which user test programs the self-test sweep runs, and which groups it leaves out by default |
 | `initramfs/`, `initramfs.toml` | The early userspace's contents and package list |
 | `build/`, `target/`, `build-test/` | Build output and scratch. Never edit, never commit |
 
@@ -114,6 +115,18 @@ The run must end with a summary **and** QEMU exit code 33 (the `isa-debug-exit` 
 A test that hangs, crashes or never prints `=== PASS` counts as failed. There is no
 `#[ignore]`-style escape hatch here — a test that cannot work must be deleted or made to pass.
 
+**Which programs stage 2 boots is `tests.toml` at the repository root.** Every test is built;
+the ones in a group are left out of the default sweep, and the *staging* is the selection — the
+guest runs whatever `/bin/t-*` it was given. A test in no group always runs, so the default
+sweep is "everything that is a check of this machine", and a red one means the kernel rather
+than the host's network or a busy host. The shipped groups are `external` (needs the host's
+network or a listener on it), `slow` (measurement, or seconds of work) and `diagnostic` (not a
+check at all); `cargo xtask test --groups <a,b>` runs an explicit list in place of the file's
+`default`, and `--all-groups` runs everything. A group name that the file does not define — on
+the command line, or in the file naming a program that does not exist — is an error, because a
+sweep that quietly runs fewer tests than it was asked to is the one failure this must not have.
+A new test therefore lands with a decision about its group, and its silence is the default.
+
 Stage 3 is a non-event by design: the test initramfs is a separate archive under `build/`, and
 the boot disk is a directory QEMU synthesizes as virtual FAT, so nothing from a test run can
 leak into the image `cargo xtask run` boots.
@@ -123,8 +136,11 @@ leak into the image `cargo xtask run` boots.
 **Nothing is red. The state below is the measured run, quoted from its own summary line.**
 
 - Host unit tests: `570 passed` (`cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`),
-  plus `29 passed` from `mpos-xtask`. Measured on this tree.
-- The guest suite reached `=== SUMMARY pass=136 fail=0` (136 built) with QEMU exit code 33.
+  plus `36 passed` from `mpos-xtask`. Measured on this tree.
+- The guest suite reached `=== SUMMARY pass=127 fail=0` (127 built) with QEMU exit code 33, with
+  `9 of 136 user tests left out by tests.toml` — the `external`, `slow` and `diagnostic` groups,
+  which is what makes the sweep's verdict a statement about the kernel. `--groups diagnostic`
+  was run on its own to prove the flag reaches the guest (`128 staged`, `t-sh` in the count).
   The ABI-honesty batch is green in the booted machine: `t-prctl`, `t-times`, `t-priority`,
   `t-fadvise`, `t-evdev`, `t-ioctl`, `t-openat`, `t-statx`, `t-truncate`, `t-rseq` and
   `t-posix` all print `=== PASS`, and so do the two programs that were the gate's standing red
@@ -404,6 +420,12 @@ so unbounded user-driven growth can kill the kernel (`PLAN.md` §8.0).
   syscall stubs; include it with `#[path = "../../../lib/lin.rs"]`.
 - Keep the name `t-<something>`: the test `/init` globs `/bin/t-*` and the verdict line is
   keyed on the name.
+- **Decide its group in `tests.toml`** — the silence is the default, and the default means "it
+  is a check of this machine and of nothing else". A test that reaches outside (the host's
+  network, a listener on the host), or measures rather than asserts, or takes seconds, is named
+  in `external`, `slow` or `diagnostic` instead, and is then run with `--groups`/`--all-groups`.
+  A program that is a diagnostic rather than a check belongs there too, and needs no `PASS`
+  line to be worth keeping — `t-sh` is one.
 
 ### Add a kernel unit test
 

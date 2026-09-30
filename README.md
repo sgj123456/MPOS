@@ -285,8 +285,11 @@ pipeline that earlier revisions of this README described never existed in this f
 authoritative record of what is proven is the test suite, not the markers.
 
 **The real gate is the self-test.** `cargo xtask test` runs the host unit tests and then boots
-every user test program, requiring each to print `=== PASS` and the run to end with a
-`=== SUMMARY` line and QEMU exit code 33. See [Testing](#testing).
+the user test programs `tests.toml` selects — every program that is not in a group — requiring
+each to print `=== PASS` and the run to end with a `=== SUMMARY` line and QEMU exit code 33.
+The tests that need something outside the machine, or that measure rather than assert, are in
+groups and run by name (`--groups`, `--all-groups`), which is what keeps a red gate a statement
+about the kernel. See [Testing](#testing).
 
 ---
 
@@ -346,7 +349,7 @@ Chinese. In short:
 | `cargo xtask rootfs` | Install Alpine into the image (refreshes the initramfs) | yes |
 | `cargo xtask run` | Boot in QEMU, rebuilding when stale | when needed |
 | `cargo xtask all` | All of the above, in order | yes |
-| `cargo xtask test` | Host unit tests + every user test program in QEMU | **no** |
+| `cargo xtask test` | Host unit tests + the user test programs `tests.toml` selects, in QEMU | **no** |
 | `cargo xtask clean` | Remove `build/` and `target/` | when needed |
 
 ---
@@ -437,6 +440,13 @@ It builds the two user test crates, packs them into a throwaway initramfs with a
 A program that hangs, crashes or never prints `=== PASS` counts as a failure, and the run must
 end with the summary line *and* QEMU's clean debug exit (code 33). `MPOS_TEST_TIMEOUT` overrides
 the 900-second budget.
+
+Which programs are booted is `tests.toml`'s answer, not the `/init`'s: the harness stages the
+selected binaries into `/bin` and the guest runs what it was given. A test in no group always
+runs; the shipped groups are `external` (the host's network, or a listener on the host),
+`slow` (measurement, or seconds of work) and `diagnostic` (not a check at all), and
+`cargo xtask test --groups <a,b>` / `--all-groups` runs them on purpose. The sweep prints what
+it left out, group by group, so a smaller number is never mistaken for a smaller suite.
 
 ### 3. The user test programs
 
@@ -577,6 +587,7 @@ mpos/
 ├── rootfs/                  # files overlaid into the Alpine root filesystem
 ├── rootfs.toml              # what the guest image contains
 ├── machine.toml             # what that image is booted on (host resources, run mode)
+├── tests.toml              # which user tests the default sweep runs (and which it leaves out)
 ├── initramfs/               # files overlaid into the early userspace (init lives here)
 ├── initramfs.toml           # what the early userspace contains
 ├── .cargo/config.toml       # targets, rustflags and the `cargo xtask` alias

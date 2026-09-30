@@ -526,12 +526,38 @@ flag audit, `madvise`'s, `posix_fadvise`'s, the `clock_gettime`/`clock_nanosleep
 `=== SUMMARY pass=134 fail=2 (136 built)` with QEMU exit `33`; each new pin (`t-prctl`, `t-posix`,
 `t-times`, `t-rseq`, `t-ioctl`, `t-evdev`, `t-seat`, `t-eventfd`, `t-priority`, `t-madvise`, `t-fadvise`, `t-clock-gettime`, `t-unlinkat`, `t-memfd-shm`, `t-ptrace-attach`, `t-statx`, `t-openat`, `t-truncate`, `t-fallocate`) prints `=== PASS`. The two reds are the
 in-flight `t-dhcp`/`t-dsp` — network and audio, on paths no Phase-12 change touches. **That pair is
-now closed**: the newest measured run reaches `=== SUMMARY pass=136 fail=0 (136 built)` with QEMU
-exit `33`, and the gate has no known red baseline any more — see §12.4a for the sound card's wrong
-PCI ID and the user-address DMA panic behind `t-dsp`, and for the DHCP test's own malformed
-DISCOVER behind `t-dhcp`.
+now closed**: the run that closed it reached `=== SUMMARY pass=136 fail=0 (136 built)` with QEMU
+exit `33` — see §12.4a for the sound card's wrong PCI ID and the user-address DMA panic behind
+`t-dsp`, and for the DHCP test's own malformed DISCOVER behind `t-dhcp`.
 (`t-netlat`/`t-stdresolve` flake in intermittently in their place under load — confirmed
 network-timing reds in the concurrent net work; a confirming run showed `pass=133 fail=2`.)
+
+**The sweep's *set* is now a configuration, and its default is smaller on purpose.** Every test
+is still built, but `tests.toml` at the repository root names the programs the default sweep
+leaves out, and the harness stages only what is selected: `external` (`t-dns`,
+`t-stdresolve`, `t-udp`, `t-tcp-close` — all four need something outside the machine),
+`slow` (`t-fill-ramfs`, `t-forkcost`, `t-netlat`, `t-pipecost`) and `diagnostic` (`t-sh`).
+`cargo xtask test --groups <a,b>` runs an explicit list, `--all-groups` runs everything, and a
+group name the file does not define — or a name in the file that no built program answers to —
+is an error rather than a smaller sweep. The measured default is `=== SUMMARY pass=127 fail=0
+(127 built)` with `9 of 136 user tests left out by tests.toml`, QEMU exit `33`.
+
+Two things that follows from it, both worth stating because they change what a red means:
+
+* **The internet is no longer in the default gate.** `t-dns` and `t-stdresolve` were the two
+  reds that `AGENTS.md` had to call "load flakes"; they, and `t-udp`/`t-tcp-close`, are now run
+  by name. A default red is therefore the kernel's, which is the only property that makes the
+  gate worth reading.
+* **`t-times` has a racy assertion, recorded rather than fixed here.** One gate run of this
+  §'s work was red on `t-times`'s *the elapsed clock advances across a spin* while the check
+  directly after it — that `tms_utime` grew — passed, and a re-run was green. The mechanism is
+  in the arithmetic: `times()` returns the wall tick count and `tms_utime` the process's own
+  CPU tick count, both scaled by the same truncating `ticks * 100 / TICK_HZ`
+  (`handle_times`), so with the process's CPU ticks trailing the wall's by a part of a
+  `USER_HZ` step the CPU one can cross a step boundary while the wall one has not — the loop
+  exits on the CPU counter and compares the wall counter to a base read earlier. The kernel's
+  answers are Linux's; the assertion is the unsound part, and it is left for the pass that
+  touches `t-times` rather than folded into a configuration change.
 
 - [x] 12.0 restore the green baseline — `t-tty-vtime`'s `VMIN>0`/`VTIME` read hung because
       `block_until_deadline` swallowed the clock-restart wake; fixed with an `input_count` the
@@ -4472,7 +4498,12 @@ calls `packet::deliver` before the stack decides the frame is any of its busines
 **Gate, quoted from its own summary**: host `570 passed`; `mpos-xtask 29 passed`; guest
 `=== SUMMARY pass=136 fail=0 (136 built)`, QEMU exit 33, boot line
 `virtio-sound: 44100 Hz, 2 channels at /dev/dsp`, `t-dsp === PASS`, `t-dhcp === PASS`.
-The gate has no known red baseline any more; a new red is a regression, full stop.
+The gate has no known red baseline any more; a new red is a regression, full stop. (The
+`29 passed` and the `136 built` are that run's numbers; `tests.toml` has since taken nine
+programs out of the *default* sweep — every one of them is still built — so a re-run prints
+`=== SUMMARY pass=127 fail=0 (127 built)` with `9 of 136 user tests left out by tests.toml`,
+and xtask's own suite is at `36 passed`. See the Phase 12 board entry for what the split is and
+why.)
 
 ### 12.5 Deliberately not in this phase
 

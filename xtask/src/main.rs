@@ -41,6 +41,18 @@ struct Cli {
     #[arg(long, value_name = "MODE", global = true)]
     mode: Option<String>,
 
+    /// `test`: groups of user tests to run in addition to the ones that are in
+    /// no group (default: the `default` list in `tests.toml`, which is empty).
+    /// A named group *replaces* that list rather than adding to it. Global for
+    /// the same reason `--mode` is - the flag is written after the subcommand.
+    #[arg(long, value_name = "GROUPS", global = true, value_delimiter = ',')]
+    groups: Vec<String>,
+
+    /// `test`: run every group, including the ones `tests.toml` leaves out of
+    /// the default sweep (`external`, `slow`, `diagnostic`).
+    #[arg(long, global = true)]
+    all_groups: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -59,8 +71,8 @@ enum Commands {
     Run,
     /// Build everything: kernel, initramfs, disk image, root filesystem
     All,
-    /// Run the self-tests: host unit tests plus every user test program,
-    /// booted in QEMU from a test initramfs
+    /// Run the self-tests: host unit tests plus the user test programs
+    /// `tests.toml` selects, booted in QEMU from a test initramfs
     Test,
     /// Remove the build and target directories
     Clean,
@@ -201,6 +213,10 @@ fn main() -> Result<()> {
         artefacts_ready,
         run_needs_build,
         boot_mode,
+        selftest::Selection {
+            groups: cli.groups.clone(),
+            all: cli.all_groups,
+        },
     );
 
     // Root wrote into the build directory. Hand the tree back to the user who
@@ -267,6 +283,7 @@ fn dispatch(
     artefacts_ready: bool,
     run_needs_build: bool,
     mode: config::RunMode,
+    tests: selftest::Selection,
 ) -> Result<()> {
     match command {
         Commands::Build => utils::build_kernel(profile),
@@ -288,7 +305,7 @@ fn dispatch(
             rootfs::ensure(build_dir, profile)
         }
         Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build, mode),
-        Commands::Test => selftest::run_tests(build_dir, profile),
+        Commands::Test => selftest::run_tests(build_dir, profile, tests),
         Commands::Clean => utils::clean(build_dir),
     }
 }
