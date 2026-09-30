@@ -16,6 +16,14 @@
 //!   far behind it - the split is what proves the ring attribution is real
 //!   (charge everything to the kernel and this fails);
 //! * values never decrease across successive reads - no double-counting;
+//! * the *elapsed* clock strictly advances across a sleep of known length, and
+//!   only monotonically across a spin - because a spin cannot prove more than
+//!   that. `times()` returns the wall tick count and `tms_utime` the process's
+//!   own CPU tick count, and `handle_times` scales both by the same truncating
+//!   `ticks * 100 / TICK_HZ`; the spin below exits when the *CPU* counter
+//!   crosses a `USER_HZ` step, which can leave the wall clock inside the step
+//!   it has not yet left. Fifty milliseconds is five `USER_HZ` steps and cannot
+//!   be swallowed that way, so the strict form of the check lives there;
 //! * `times(NULL)` still answers the elapsed clock;
 //! * an unknown `getrusage` who is `EINVAL`, and `RUSAGE_CHILDREN` answers
 //!   success with a zeroed buffer (its child aggregation is the documented
@@ -111,8 +119,36 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_true(
         &mut failed,
-        b"the elapsed clock advances across a spin",
-        elapsed1 > elapsed0,
+        b"the elapsed clock never goes backwards across a spin",
+        elapsed1 >= elapsed0,
+    );
+
+    // The *strict* advance is pinned where it is deterministic, which the spin
+    // above cannot be: its exit condition is the process's own CPU counter
+    // crossing a `USER_HZ` step, and both that counter and the wall clock go
+    // through the same truncating `ticks * 100 / TICK_HZ`, so the wall reading
+    // is allowed to land inside the step the CPU one has just left. A sleep of
+    // five steps is not: nothing truncates five steps to nothing.
+    let before_sleep = lin::times(None);
+    let req = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 50_000_000,
+    };
+    let mut rem = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    lin::check_eq(
+        &mut failed,
+        b"a 50 ms sleep answers 0",
+        lin::nanosleep(&req, &mut rem),
+        0,
+    );
+    let after_sleep = lin::times(None);
+    lin::check_true(
+        &mut failed,
+        b"the elapsed clock advances across a 50 ms sleep",
+        after_sleep > before_sleep,
     );
     lin::check_true(
         &mut failed,

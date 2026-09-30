@@ -554,16 +554,18 @@ Two things that follows from it, both worth stating because they change what a r
   reds that `AGENTS.md` had to call "load flakes"; they, and `t-udp`/`t-tcp-close`, are now run
   by name. A default red is therefore the kernel's, which is the only property that makes the
   gate worth reading.
-* **`t-times` has a racy assertion, recorded rather than fixed here.** One gate run of this
+* **`t-times`'s racy assertion is fixed, and the fix is the assertion.** One gate run of this
   §'s work was red on `t-times`'s *the elapsed clock advances across a spin* while the check
-  directly after it — that `tms_utime` grew — passed, and a re-run was green. The mechanism is
-  in the arithmetic: `times()` returns the wall tick count and `tms_utime` the process's own
-  CPU tick count, both scaled by the same truncating `ticks * 100 / TICK_HZ`
-  (`handle_times`), so with the process's CPU ticks trailing the wall's by a part of a
-  `USER_HZ` step the CPU one can cross a step boundary while the wall one has not — the loop
-  exits on the CPU counter and compares the wall counter to a base read earlier. The kernel's
-  answers are Linux's; the assertion is the unsound part, and it is left for the pass that
-  touches `t-times` rather than folded into a configuration change.
+  directly after it — that `tms_utime` grew — passed, and a re-run was green. The mechanism was
+  in the arithmetic and not in the kernel: `times()` returns the wall tick count and
+  `tms_utime` the process's own CPU tick count, both scaled by the same truncating
+  `ticks * 100 / TICK_HZ` (`handle_times`), so the spin — whose exit condition is the *CPU*
+  counter crossing a `USER_HZ` step — can compare two wall readings that floor to the same
+  value. The kernel's answers are Linux's; the assertion was the unsound part, and it is now
+  two checks where there was one. Monotonicity is asserted over the spin, which is all a spin
+  can prove, and the *strict* advance is pinned where it is deterministic: `times(NULL)` read
+  around a 50 ms `nanosleep`, which is five `USER_HZ` steps at the ABI's 100 Hz and so cannot
+  be truncated away.
 
 - [x] 12.0 restore the green baseline — `t-tty-vtime`'s `VMIN>0`/`VTIME` read hung because
       `block_until_deadline` swallowed the clock-restart wake; fixed with an `input_count` the
