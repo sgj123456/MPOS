@@ -323,12 +323,25 @@ pub fn machine_args(
                 ]);
             }
         }
-        Console::File(log) => args.extend([
-            "-display".into(),
-            "none".into(),
-            "-serial".into(),
-            format!("file:{log}"),
-        ]),
+        Console::File(log) => {
+            // A test boot renders nowhere *unless the machine names a display*,
+            // and the exception is not decoration: a `virtio-gpu-gl-pci` device
+            // refuses `-display none` outright - QEMU answers "OpenGL is not
+            // supported by display backend 'none'" and never starts - so
+            // hardcoding it here would make a GL machine untestable, and the GL
+            // half of `DRM_VIRTGPU_*` is exactly the half the default machine
+            // cannot reach. The console stays on the wire either way: the test
+            // image's command line names `ttyS0`, so the transcript is still the
+            // file below, and the display is only somewhere for the device to
+            // draw.
+            let display = config.display.clone().unwrap_or_else(|| "none".to_string());
+            args.extend([
+                "-display".into(),
+                display,
+                "-serial".into(),
+                format!("file:{log}"),
+            ]);
+        }
     }
 
     // The guest's own way out. `reboot(2)` with a stop command ends at
@@ -616,6 +629,28 @@ mod tests {
             Path::new("/build/9p-share"),
         );
         assert_eq!(after(&file, "-display").as_deref(), Some("none"));
+
+        // And a machine that names a display gets it on a *test* boot too, which
+        // is the one thing the file-log boot used not to allow. A
+        // `virtio-gpu-gl-pci` refuses `-display none`, so without this the GL
+        // machine is untestable and the GL half of `DRM_VIRTGPU_*` is reachable
+        // only by hand.
+        let gl_file = machine_args(
+            &custom,
+            Path::new("/ovmf"),
+            Path::new("/build/OVMF_VARS.4m.fd"),
+            Boot::Image(PathBuf::from("/build/mpos.img")),
+            Console::File("/build/test-serial.log".to_string()),
+            Path::new("/build/9p-share"),
+        );
+        assert_eq!(after(&gl_file, "-display").as_deref(), Some("gtk"));
+        // The console is still the wire, whatever the display is: the test
+        // image's own command line names `ttyS0`, and the transcript is still a
+        // file rather than a window.
+        assert_eq!(
+            after(&gl_file, "-serial").as_deref(),
+            Some("file:/build/test-serial.log")
+        );
     }
 
     /// The GPU the machine was wired with, read off the `-device` list the way

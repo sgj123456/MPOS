@@ -1751,19 +1751,29 @@ fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
     // held and no frames borrowed, because the task that answers is the render
     // task and a caller parked while holding either would be a task waiting for
     // something it is itself preventing.
-    let made = if three_d {
-        // A 3D resource belongs to a context, and the context is made here if
-        // this file has not needed one yet - Linux's implicit creation, which is
-        // what makes a later explicit `CONTEXT_INIT` answer `EEXIST`.
-        let ctx = match ensure_context(ofd, 0, b"mpos") {
-            Ok(id) => id,
+    // The context is made *before* the target is consulted, because that is
+    // Linux's order: `virtio_gpu_resource_create_ioctl` calls
+    // `virtio_gpu_create_context` as soon as `has_virgl_3d` is set, and only then
+    // looks at `target`. It is why a `CONTEXT_INIT` after a purely **2D** create
+    // answers `EEXIST` on a virgl card, and matching it is cheaper than
+    // explaining a divergence a caller can see for itself.
+    let ctx = if virgl {
+        match ensure_context(ofd, 0, b"mpos") {
+            Ok(id) => Some(id),
             Err(errno) => {
                 for p in frames.drain(..) {
                     free_frames(p, 0);
                 }
                 return errno;
             }
-        };
+        }
+    } else {
+        None
+    };
+    let made = if three_d {
+        // `three_d` implies `virgl` - the branch above is what keeps a 3D target
+        // out of a card that has no 3D - so the context is always there.
+        let ctx = ctx.expect("a 3D target is a virgl target, and virgl made a context");
         crate::drivers::video::render::job(crate::drivers::video::render::Job::Create3d {
             ctx,
             id,
