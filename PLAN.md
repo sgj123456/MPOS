@@ -3747,6 +3747,46 @@ family - `GET_PARAM`, `RESOURCE_CREATE`, `RESOURCE_INFO`, `SUBMIT_3D`,
 is what virgl (and venus, for Vulkan) is built on, and it is the largest single
 item in this section.
 
+#### Measured: what Linux's card answers, request by request
+
+The family is written from an observation rather than from the UAPI header,
+because the part worth knowing is not in the header at all: **which requests a
+card with no 3D refuses, and with which errno.** The instrument and the full
+table live in `user/staging/virtgpu-probe/` - Alpine's netboot `virt` kernel in
+a twenty-line initramfs, booted on `virtio-gpu-pci` and then on
+`virtio-gpu-gl-pci` + `-display egl-headless,gl=on`. (`virt` and not `lts` for a
+measured reason: the `virt` netboot initramfs already carries `virtio-gpu.ko`,
+`drm.ko`, `drm_kms_helper.ko` and a `modules.dep` whose closure covers them, so
+the 218 MB `modloop-lts` is not needed.) Linux 6.12.110-0-virt, QEMU 11.1.1.
+
+Four things decide the shape, and each is a way a plausible design is wrong:
+
+- **Nothing in the family is `ENOTTY`.** `virtio_gpu_ioctls[]` is registered
+  unconditionally, so every request is *answered* even on a card with no 3D -
+  and they are answered differently. On `virtio-gpu-pci`: `GETPARAM(1)`
+  (3D_FEATURES) is `0`; `GET_CAPS`, `EXECBUFFER` and `TRANSFER_FROM_HOST` are
+  `ENOSYS`; `CONTEXT_INIT`, `RESOURCE_CREATE_BLOB` and a 3D `RESOURCE_CREATE`
+  are `EINVAL`; while `TRANSFER_TO_HOST`, `WAIT` and `MAP` **succeed**. One
+  errno for the whole family would send a caller down a path it cannot recover
+  from, which is §4's wrong-shape failure in its plainest form.
+- **`CONTEXT_INIT` answers `EEXIST` on a virgl card**, because the driver
+  creates a context *implicitly* on first use, so an explicit request arrives
+  second. `GETPARAM(7)` reports the capset mask `6` (VIRGL and VIRGL2), and the
+  device announces two cap sets: id 1 max-version 1 size 308, id 2 max-version
+  2 size 1408.
+- **`RESOURCE_CREATE`'s `target` is the switch.** Without 3D only `2` is
+  accepted, with `depth`, `nr_samples`, `last_level` and `array_size` each
+  capped at 1 (`EINVAL` otherwise); `4` is `EINVAL` there and succeeds with
+  virgl.
+- **`RESOURCE_INFO` answers `size = 4096`** for a 64x64 B8G8R8A8 resource
+  created with `size = 0` - the driver's floor is a page, not `w * h * 4`.
+
+What the instrument does **not** do is capture *Mesa's* own sequence: that wants
+a full Alpine userland with `virtio_gpu_dri.so` and a tracer, not the twenty-line
+initramfs, so "which request the winsys makes in which order" is still a source
+reading rather than an observation here. The directory's README says so, so it
+cannot be mistaken for measured.
+
 Two smaller blockers used to sit behind it, and **the first is no longer one:
 threads are done** (`clone(CLONE_THREAD)`, §6.4 - a task on the caller's memory
 and descriptors, with `CLONE_CHILD_CLEARTID` and a real futex wake for

@@ -114,7 +114,7 @@ drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`PLAN.md` §1
 | `'V'` (0x56) | virtual consoles | `src/vfs/vtmode.rs` | Served: `VT_SETMODE`/`VT_PROCESS` negotiation, `VT_ACTIVATE` non-blocking, `VT_WAITACTIVE` sleeping, `VT_SENDSIG` → `ENOTTY` (measured) |
 | `'K'` (0x4B) | virtual consoles | `src/syscall/linux/fs.rs` `kd_ioctl` | **Refused as a closed set**: five requests served (`KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/`KDGKBTYPE`), the rest of the block `EOPNOTSUPP`, outside it `ENOTTY`. Per-device *serve* from live console state is the Phase-11 B2 move (`PLAN.md` §12.1 A2) |
 | `'b'` (0x62) | dma-buf | `src/syscall/linux/fs.rs` | Served (`SYNC` as the documented coherent-memory no-op, `SET_NAME` a debug label) |
-| `'d'` (0x64) | `/dev/dri/card0`, `renderD128` | `src/drivers/drm.rs` + `src/drm_*.rs` | Served across the compositor surface; gaps are the §7.4 list (3D/virgl, timeline syncobj behaviour, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`) |
+| `'d'` (0x64) | `/dev/dri/card0`, `renderD128` | `src/drivers/drm.rs` + `src/drm_*.rs` | Served across the compositor surface — **except the `DRM_VIRTGPU_*` block (`0x41..=0x4b`), which falls to this card's `ENOTTY` tail and is the one *wrong answer* left here.** Linux registers that family on *every* card and answers it per request, measured on `virtio-gpu-pci`: `GETPARAM(1)` `0`, `MAP`/`WAIT`/`TRANSFER_TO_HOST` succeed, `GET_CAPS`/`EXECBUFFER`/`TRANSFER_FROM_HOST` are `ENOSYS`, `CONTEXT_INIT`/`RESOURCE_CREATE_BLOB`/a 3D `RESOURCE_CREATE` are `EINVAL`. Instrument and table: `user/staging/virtgpu-probe/`; `PLAN.md` §7.4. Other §7.4 gaps: timeline syncobj behaviour, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` |
 | `'P'` (0x50) | `/dev/dsp` | `src/drivers/virtio/sound.rs` | Served; the family's rate/channels/format belong to the writer |
 | `'t'` (0x74) + `0x8024_7009`/`0x4024_700A` | `/dev/rtc0` | `src/drivers/rtc_dev.rs` | Served (`RTC_RD_TIME`/`RTC_SET_TIME`); alarm/interrupt requests `ENOTTY` |
 | `0x12` (block) | `/dev/vda`, `/dev/sda` | `src/blk/`, `src/syscall/linux/fs.rs` | Served; the size trio's buffer direction was the sole outlier and is fixed (§5.1) |
@@ -257,6 +257,16 @@ the commit bodies), and each moved its pin in the same commit.
 - **`devfs` birth modes.** Devices are born `0666 root:root`; `devtmpfs` births `0600`
   and lets udev widen it. Needs per-class birth modes and group-name resolution, not a new
   mechanism (`PLAN.md` §3.4).
+- **The `DRM_VIRTGPU_*` family (`0x41..=0x4b`).** The one *wrong answer* left in §2's `'d'`
+  row: this card's catch-all answers `ENOTTY` for every request in it, and Linux answers
+  each one differently. Measured on `virtio-gpu-pci` (no 3D behind it): `GETPARAM(1)` is
+  `0`, `MAP`/`WAIT`/`TRANSFER_TO_HOST` succeed, `GET_CAPS`/`EXECBUFFER`/`TRANSFER_FROM_HOST`
+  are `ENOSYS`, and `CONTEXT_INIT`/`RESOURCE_CREATE_BLOB`/a 3D `RESOURCE_CREATE` are
+  `EINVAL`. The work splits in two with different prerequisites: the answers above need
+  only the family's own bookkeeping, while `VIRTGPU_PARAM_3D_FEATURES = 1` needs the
+  `virtio-gpu` 3D control queue — which the `virtio-drivers` crate does not implement at
+  all, and does not negotiate. Instrument and full table: `user/staging/virtgpu-probe/`;
+  `PLAN.md` §7.4.
 
 ### 5.3 Needs its prerequisite named before it can be honest
 
