@@ -3,15 +3,17 @@
 <div align="center">
 
 ![Rust 2024](https://img.shields.io/badge/Rust-2024-E8453C?style=for-the-badge&logo=rust&logoColor=white)
-![Target x86_64](https://img.shields.io/badge/Target-x86__64-000000?style=for-the-badge&logo=amd&logoColor=white)
-![Limine v9.6.7](https://img.shields.io/badge/Limine-v9.6.7-4A90D9?style=for-the-badge&logo=gnu&logoColor=white)
-![License MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)
+![目标 x86_64](https://img.shields.io/badge/Target-x86__64-000000?style=for-the-badge&logo=amd&logoColor=white)
+![引导加载器 mpos-boot](https://img.shields.io/badge/Bootloader-mpos--boot-4A90D9?style=for-the-badge&logo=gnu&logoColor=white)
+![许可证 MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)
 
-**里程碑验证操作系统内核**
+**经过里程碑验证的操作系统内核**
 
-一个用 Rust 编写的最小化、经过里程碑式验证的操作系统内核，通过 Limine 协议引导。每个子系统在构建下一个之前都会被证明是正确的——从帧分配器到完整的交互式 Shell。兼容 Linux ABI：基于 musl 的二进制程序可直接运行。
+一个用 Rust 编写的单处理器 x86_64 操作系统内核，由自研的引导加载器在 UEFI 上引导。
+每个子系统在构建下一个之前都会被证明是正确的——从帧分配器到完整的交互式 Shell。
+兼容 Linux ABI：基于 musl 的二进制程序未经修改即可运行。
 
-[快速开始](#-快速开始) · [架构](#-架构) · [系统调用](#-系统调用) · [里程碑](#-里程碑) · [构建](#-构建) · [测试](#-测试) · [English](README.md)
+[快速开始](#快速开始) · [架构](#架构) · [系统调用](#系统调用) · [里程碑检查](#里程碑检查) · [构建](#构建) · [测试](#测试) · [文档](#文档) · [English](README.md)
 
 </div>
 
@@ -19,25 +21,40 @@
 
 ## 概述
 
-**MPOS** 是一个以**里程碑验证**为核心方法论构建的教学和研究型操作系统内核。与其渐进式地构建内核，MPOS 在构建每一层之前都会通过断言和主机端单元测试证明其正确性。
+**MPOS** 是一个以**里程碑验证**方法论为核心构建的教学与研究型操作系统内核：与其层层叠加然后寄希望于正确，
+每一层都在下一层构建之前通过断言和测试被证明是正确的——而且这些证明同时存在于两个地方，任何一处都无法悄然腐化。
 
-内核以 **Rust 库**（`src/lib.rs`）的形式组织，可在主机上进行单元测试（`cargo test --lib --target x86_64-unknown-linux-gnu`），而薄二进制入口（`src/main.rs`）则在 QEMU 上通过 M0 至 M14 的里程碑验证流程。
+- **在主机上。** 与架构无关的逻辑位于内核*库*（`src/lib.rs`）中：帧分配器、映射方案、调度器的策略、
+  路径解析、每个文件系统各自的编码方式、每个设备 ioctl 契约中纯逻辑的那一半。它以
+  `x86_64-unknown-linux-gnu` 为目标编译，用普通的 `cargo test` 运行。
+- **在机器上。** 约 120 个用户态程序在 QEMU 中被引导运行，并且必须报告 `=== PASS`；它们通过真正的
+  `syscall` 指令使用 Linux ABI，系统调用号取自内核自己的 `src/syscall/linux/nr.rs`，
+  因此内核和测试之间不可能在某个号码上产生分歧而其中之一却仍然能构建成功。
+
+依赖机器的代码——描述符表、端口 I/O、virtio 环、引导交接——都被隔离在
+`#[cfg(target_os = "none")]` 之后，这正是主机构建保持与硬件无关的原因。
 
 ### 核心特性
 
-| 特性                 | 说明                                                                                                                              |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| **里程碑验证**       | 每个子系统在构建下一个之前都会被证明正确。串口日志携带标记（`M0_OK` 到 `M14_OK`），由测试框架断言验证。                           |
-| **主机可测试拆分**   | 所有不涉及机器状态的代码都在库 crate 中，通过 `cargo test` 在主机上运行。机器相关代码位于 `#[cfg(target_os = "none")]` 之后。     |
-| **Linux ABI 兼容**   | 实现了约 225 个 Linux x86_64 系统调用。基于 musl 的程序（Alpine、busybox）可直接在内核上运行。                                    |
-| **直写式 ext2/ext4** | 完整的可读写 ext2 和 ext4 实现，采用直写语义——无日志、无脏页追踪、崩溃即可见。                                                    |
-| **优先级调度器**     | 四个优先级带（LOW、NORMAL、HIGH、CRITICAL）之间严格优先级，带内轮转调度，基于截止时间的休眠队列，COW fork，按需分页栈增长。       |
-| **TCP/IP 网络**      | 基于 smoltcp 的协议栈，支持 TCP、UDP、ICMP、ARP，运行在 virtio-net 上。仅支持 AF_INET——足以满足 musl DNS 解析器和 apk HTTP 通信。 |
-| **交互式 Shell**     | Alpine 的 ash shell，支持管道、重定向、环境变量、后台作业，以及可脚本化的 init。                                                  |
+| 特性 | 说明 |
+|---------|-------------|
+| **自研 UEFI 引导加载器** | `mpos-boot` 从 ESP 读取内核、initramfs 和命令行，构建页表和高半区映射，应用内核的重定位然后跳转——之后便不复存在。没有第三方引导加载器，没有 ISO |
+| **Linux ABI 兼容** | 252 个 Linux x86_64 系统调用号被命名并路由；基于 musl 的二进制程序（Alpine、busybox、`apk`、`fish`、weston）未经修改即可运行 |
+| **帧缓冲控制台** | virtio-gpu 2D scanout，一个在引导后*真正迁移到帧缓冲上*的内核控制台，虚拟控制台（`Ctrl-A 1..6`；镜像在 `tty1`..`tty4` 上运行 `getty`），以及一个尽力而为的串口镜像——它绝不会拖累窗口刷新 |
+| **DRM/KMS + fbdev** | 带 fbdev ioctl 的 `/dev/fb0`，以及遵循 Linux DRM UAPI 的 `/dev/dri/card0`——dumb buffer、页面翻转、vblank 事件、render node、PRIME。这正是 **weston** 走的路径：它的 DRM 后端经由 `seatd`，配合 Mesa 的软件 GL（llvmpipe），基于 GBM dumb buffer。没有 GPU 侧 3D，也没有 virgl |
+| **输入** | virtio-keyboard 与 virtio-tablet 以 evdev 节点呈现（`/dev/input/eventN`、能力 ioctl、按打开文件粒度的 grab），外加 `/dev/uinput`，程序可以借此创建属于自己的设备 |
+| **直写式 ext2/ext4** | 完整的可读写 ext2、ext3 和 ext4——extent、目录哈希、4 路组相联块缓存——采用直写（write-through）语义：无日志、无脏页追踪、崩溃即可见 |
+| **优先级调度器** | 四个优先级带（LOW、NORMAL、HIGH、CRITICAL）之间严格优先级，带内轮转，基于截止时间的休眠，COW fork，按需分页的栈增长 |
+| **信号** | 处理函数通过真正的 `rt_sigframe` 投递，掩码强制执行，`sigqueue`/`siginfo` 载荷，`SIGKILL`/`SIGSTOP` 不可屏蔽 |
+| **TCP/IP 网络** | 由 smoltcp 驱动的协议栈，在 virtio-net 上支持 TCP、UDP、原始 ICMP 和 ARP，MSI-X 中断，以及事件驱动的等待——帧到达时唤醒阻塞的读取方，而不是等下一个时钟节拍 |
+| **AF_UNIX** | 基于路径的 `SOCK_STREAM`，支持 `SCM_RIGHTS` 描述符传递、`SCM_CREDENTIALS` 和 `SO_PEERCRED`——足以运行真正的 `dbus` 代理和 `udev` 的工作进程通道 |
+| **交互式 Shell** | Alpine 的 OpenRC 引导后进入由 pty 支撑的 `/dev/tty1` 上的 `getty`（默认四个控制台，在 `rootfs/etc/inittab` 中修改），支持管道、重定向、后台作业和可脚本化的 init |
 
 ---
 
 ## 架构
+
+`ARCHITECTURE.md` 中有完整的模块图、实测的依赖边、引导序列图以及分层规则。这里只是概要。
 
 ### 系统总览
 
@@ -45,114 +62,124 @@
 graph TB
     subgraph UserSpace["用户空间 (Ring 3)"]
         MUSL["musl libc"]
-        ASH["/bin/sh (ash)"]
-        BUSYBOX["busybox 工具"]
-        TESTS["60+ ABI 一致性测试"]
+        SHELL["/bin/sh · fish · busybox"]
+        WESTON["weston (DRM/KMS + GL)"]
+        TESTS["约 120 个 ABI 一致性程序"]
     end
 
     subgraph KernelSpace["内核空间 (Ring 0)"]
-        subgraph SyscallGate["系统调用门 (~225 个 Linux x86_64 调用)"]
-            SYSCALL["syscall / sysret"]
+        subgraph Gate["系统调用门"]
+            SYSCALL["syscall / sysret<br/>路由 252 个调用号"]
         end
 
-        subgraph VFS["VFS 层"]
-            VFS_CORE["Inode trait + 挂载表"]
-            RAMFS["ramfs (initramfs, tmpfs)"]
-            EXT2["ext2/ext4 (读写)"]
-            DEVFS["devfs (/dev/null, tty, console, ...)"]
-            PROCFS["procfs (/proc/meminfo, cmdline, ...)"]
-            SYSFS["sysfs (/sys/class/block, ...)"]
-            DEVPTS["devpts (/dev/pts/*)"]
-            TTY["TTY (行规程)"]
-            PIPE["pipe + socketpair"]
-            SIGNALFD["signalfd / eventfd"]
+        subgraph VFSLayer["vfs"]
+            VFS_CORE["Inode / FileSystem / mount / path"]
+            RAMFS["ramfs · tmpfs · tar"]
+            EXT4["ext2 / ext3 / ext4 (直写)"]
+            PSEUDO["procfs · sysfs · devfs · devpts"]
+            P9FS["9p (宿主共享)"]
+            IPCFS["pipe · epoll · timerfd · eventfd<br/>signalfd · inotify · memfd · dmabuf · locks"]
+            TTYLAYER["tty · pty · term · vcmux"]
         end
 
-        subgraph Process["进程管理"]
-            SCHED["调度器 (4级优先级 + RR)"]
-            SIGNAL["信号处理"]
-            FUTEX["Futex (wait/wake)"]
-            FORK["fork / clone / execve"]
+        subgraph Proc["sched"]
+            SCHED["4 带优先级 + 轮转"]
+            SIGNAL["信号 · futex · ptrace"]
+            EXEC["fork / clone / execve / ELF"]
         end
 
-        subgraph Memory["内存管理"]
-            PMM["伙伴分配器 (order 0-12)"]
-            SLAB["Slab 堆 (16-2048 字节)"]
-            PAGE["4级页表 (W^X)"]
-            COW["写时复制 fork"]
-            ELF["ELF64 加载器"]
+        subgraph Mem["mm"]
+            PMM["Buddy 分配器 (order 0-14)"]
+            SLAB["Slab 堆 (16-2048 B)"]
+            PAGE["4 级分页 · W^X · COW"]
         end
 
-        subgraph Drivers["设备驱动"]
+        subgraph Net["net"]
+            SMOLTCP["smoltcp: TCP · UDP · ICMP · ARP"]
+            UNIXX["AF_UNIX · AF_VSOCK · netlink"]
+        end
+
+        subgraph Drv["drivers"]
             VBLK["virtio-blk"]
-            VNET["virtio-net"]
-            UART["16550 UART"]
-            PCI_BUS["PCI 总线枚举"]
+            VNET["virtio-net + MSI-X"]
+            VGPU["virtio-gpu · DRM · fbdev · render"]
+            VIN["virtio-input · evdev · uinput"]
+            MISC["virtio-rng · virtio-sound · 9p · console · vsock"]
+            PCIBUS["PCI 枚举 · virtio HAL"]
         end
 
-        subgraph Net["网络"]
-            SMOLTCP["smoltcp (TCP/UDP/ICMP/ARP)"]
-            NETLINK["Netlink (rtnl)"]
-        end
+        CONSOLE["console：日志环 · 串口 · 帧缓冲"]
+        ARCHL["arch/x86_64：gdt · idt · pic · lapic · paging · timer"]
     end
 
     MUSL --> SYSCALL
-    ASH --> MUSL
-    BUSYBOX --> MUSL
+    SHELL --> MUSL
+    WESTON --> MUSL
     TESTS --> MUSL
     SYSCALL --> VFS_CORE
     SYSCALL --> SCHED
     SYSCALL --> SMOLTCP
     VFS_CORE --> RAMFS
-    VFS_CORE --> EXT2
-    VFS_CORE --> DEVFS
-    EXT2 --> VBLK
+    VFS_CORE --> EXT4
+    VFS_CORE --> PSEUDO
+    VFS_CORE --> IPCFS
+    EXT4 --> VBLK
     VNET --> SMOLTCP
-    UART --> TTY
+    SMOLTCP --> UNIXX
+    VIN --> TTYLAYER
+    CONSOLE --> TTYLAYER
+    VGPU --> CONSOLE
     SCHED --> PAGE
-    FORK --> COW
+    EXEC --> SLAB
+    PAGE --> PMM
 ```
 
-### 启动流程
+### 引导流程
 
 ```mermaid
 graph TD
-    A["UEFI 固件"] --> B["Limine 引导加载器"]
-    B --> C["_start() — ring 0"]
-    C --> D["console::init() — 16550 UART"]
-    C --> E["mm::init() — 伙伴分配器"]
-    C --> F["gdt + idt + pic + timer"]
-    C --> G["paging::install() — 4级页表, NX, WP"]
-    C --> H["sched::init() — 接管启动任务, 创建调度器任务"]
-    C --> I["vfs::init() — ramfs 根, 解包 initramfs.tar"]
-    C --> J["blk::init() — virtio-blk, GPT 扫描, ext2/ext4 挂载"]
-    C --> K["net::init() — virtio-net, smoltcp, 10.0.2.15/24"]
-    C --> L["rand::init() — ChaCha20 PRNG"]
-    C --> M["里程碑检查 M0–M8"]
-    M --> N["handoff_to_init()"]
-    N --> O["加载 /init → PID 1 (Alpine OpenRC)"]
-    O --> P["/bin/sh 变为交互式"]
+    A["UEFI 固件"] --> B["EFI/BOOT/BOOTX64.EFI — mpos-boot"]
+    B --> B1["从 ESP 读取 mpos.elf、initramfs.tar、mpos.cmdline"]
+    B1 --> B2["内存映射 · 页表 · KERNEL_VIRT_BASE 处的高半区直接映射"]
+    B2 --> B3["重定位 PIE 镜像 · exit boot services"]
+    B3 --> C["_start(handoff) — ring 0，内核栈，中断关闭"]
+    C --> C1["console::init() · enable_user_sse() · handoff::collect()"]
+    C1 --> D["mm::init() → logging::init()"]
+    D --> E["init_arch：gdt · idt · pic · timer · rtc · syscall 门 · paging::install()"]
+    E --> F["init_sched：接管引导任务"]
+    F --> G["init_vfs：ramfs 根，解包 initramfs"]
+    G --> H["init_pci → init_blk：virtio-blk，GPT 扫描，挂载 /mnt"]
+    H --> I["init_net：virtio-net，smoltcp，10.0.2.15/24"]
+    I --> J["init_virtio：rng · console · gpu · input · sound · 9p · vsock"]
+    J --> K["rand::init()：由 RDRAND + 宿主熵源播种的 ChaCha20"]
+    K --> L["handoff_to_init：以 PID 1 启动 /init，引导任务挂起"]
+    L --> M["initramfs /init：挂载 proc · sysfs · devtmpfs"]
+    M --> N["挂载 /dev/vda2 (ext4)，挂载 proc/sys/tmp/run，迁移 /dev，devpts"]
+    N --> O["switch_root /sysroot /sbin/init"]
+    O --> P["OpenRC：服务、devfs、网络"]
+    P --> Q["在 /dev/tty1 上运行 shell (pty 支撑)"]
 ```
+
+内核只挂载它自己的 ramfs 根，别无其他。`/proc`、`/sys`、`/dev`、真正的根以及
+`switch_root` 全部属于 initramfs 的 `/init`（`initramfs/init`），因为一个抢先组装它们的内核
+会留下系统的所有者无法卸载的碎片。
 
 ### 内存管理
 
 ```mermaid
 graph LR
     subgraph Physical
-        PMM["伙伴分配器<br/>order 0-12, 4KB 页<br/>最大连续 16MB"]
+        PMM["Buddy 分配器<br/>order 0-14，4 KiB 页<br/>最大连续 64 MiB<br/>侵入式空闲链表，O(1) 合并"]
     end
-
     subgraph Heap
-        SLAB["Slab 分配器<br/>size classes: 16, 32, 64,<br/>128, 256, 512, 1024, 2048"]
-        LARGE["> 2048B → 直接帧分配"]
+        SLAB["Slab 分配器<br/>16、32、64、128、256、512、1024、2048 B"]
+        LARGE["> 2048 B → 直接分配帧"]
     end
-
     subgraph Virtual
-        PT["4级页表<br/>PML4 → PDPT → PD → PT"]
-        HHDM["直接映射 (1:1)<br/>内核半区, 大页"]
-        USER["用户空间<br/>按需分页, COW"]
+        PT["4 级页表<br/>PML4 → PDPT → PD → PT"]
+        HHDM["直接映射<br/>内核半区，大页"]
+        USER["用户空间<br/>按需分页、COW、W^X、ASLR"]
     end
-
     PMM --> SLAB
     PMM --> LARGE
     PMM --> PT
@@ -160,428 +187,100 @@ graph LR
     PT --> USER
 ```
 
-### 网络数据路径
+### 控制台、显示与输入
 
 ```mermaid
 graph LR
-    A["用户应用<br/>socket()/read()/write()"] --> B["SocketInode<br/>(VFS)"]
-    B --> C["syscall 分发<br/>(fs.rs)"]
-    C --> D["smoltcp socket<br/>(TCP/UDP)"]
-    D --> E["smoltcp 接口<br/>(IP, ARP)"]
-    E --> F["VirtIONet 驱动"]
-    F --> G["virtio-net<br/>PCI MMIO BAR0"]
-    G --> H["QEMU SLIRP<br/>(10.0.2.2)"]
-    H --> I["宿主机网络"]
+    VIN["virtio-input<br/>键盘 + 平板"] --> EVDEV["evdev 窗口<br/>按客户端记录位置"]
+    EVDEV --> INPUT["/dev/input/eventN"]
+    EVDEV --> KEYS["键位映射"]
+    KEYS --> TERM["终端模拟器<br/>6 个虚拟控制台"]
+    TERM --> RENDER["渲染任务<br/>唯一调用 flush() 的人"]
+    RENDER --> GPU["virtio-gpu scanout"]
+    GPU --> FB["/dev/fb0 (fbdev ioctl)"]
+    GPU --> DRM["/dev/dri/card0 (DRM/KMS)<br/>dumb buffer · 页面翻转 · vblank"]
+    SERIAL["串口镜像<br/>尽力而为，绝不拖累"] --> TERM
+    DRM --> WESTON["weston DRM 后端<br/>经由 seatd，软件 GL (llvmpipe)"]
+    UINPUT["/dev/uinput"] --> EVDEV
 ```
 
-### 项目目录
+### 网络数据通路
 
+```mermaid
+graph LR
+    APP["用户程序<br/>socket() / read() / write()"] --> SOCKINODE["socket 节点<br/>(vfs)"]
+    SOCKINODE --> DISPATCH["net::socket 处理函数<br/>缓冲区校验 · errno 形态"]
+    DISPATCH --> REG["socket 注册表<br/>稳定句柄 + 订阅"]
+    REG --> SMOLTCP["smoltcp 接口<br/>TCP · UDP · 原始 ICMP · ARP"]
+    SMOLTCP --> DEVSEAM["设备接缝 (RxToken / TxToken)"]
+    DEVSEAM --> VNETDRV["virtio-net 驱动"]
+    VNETDRV --> MSIX["MSI-X 向量"]
+    VNETDRV --> SLIRP["QEMU SLIRP<br/>10.0.2.2 网关"]
+    SLIRP --> HOST["宿主网络"]
+    MSIX --> WAKE["唤醒订阅者"]
+    WAKE --> REG
 ```
-mpos/
-├── src/
-│   ├── main.rs              # 二进制入口：_start → kernel_main → M0-M14
-│   ├── lib.rs               # 库根（主机可测试）
-│   ├── console.rs           # 内核控制台（dmesg 环形缓冲区、串口输出）
-│   ├── binfmt.rs            # Shebang (#!) 脚本解释器
-│   ├── rand.rs              # ChaCha20 PRNG（RDRAND + boot epoch）
-│   ├── uevent.rs            # Netlink kobject uevent
-│   │
-│   ├── arch/x86_64/         # 架构相关代码
-│   │   ├── context.rs       # 任务上下文切换（寄存器保存/恢复）
-│   │   ├── critical.rs      # critical_section（cli/sti）
-│   │   ├── gdt.rs           # 全局描述符表 + TSS
-│   │   ├── idt.rs           # 中断处理（timer, BP, PF, syscall）
-│   │   ├── paging.rs        # 4级页表、W^X、COW、AddressSpace
-│   │   ├── pci.rs           # PCI 总线枚举
-│   │   ├── pic.rs           # 8259 PIC（IRQ0→32, IRQ4→36）
-│   │   ├── serial.rs        # 16550 UART（COM1, 中断驱动 RX）
-│   │   ├── syscall.rs       # syscall/sysret 门（Ring 3 ↔ Ring 0）
-│   │   ├── timer.rs         # PIT 100 Hz
-│   │   ├── rtc.rs           # CMOS RTC（boot epoch 用于墙钟）
-│   │   └── qemu.rs          # QEMU debug exit
-│   │
-│   ├── mm/                  # 内存管理
-│   │   ├── pframe.rs        # 伙伴帧分配器（MAX_ORDER=12）
-│   │   ├── heap.rs          # Slab 内核堆（size classes 16-2048）
-│   │   ├── elf.rs           # ELF64 加载器（ET_EXEC + ET_DYN/PIE）
-│   │   └── vm.rs            # 映射计划、KernelSections
-│   │
-│   ├── sched/               # 调度器
-│   │   ├── policy.rs        # 优先级带、轮转调度、休眠队列
-│   │   ├── runtime.rs       # 任务表（64 个槽位）、上下文切换、fork/exec
-│   │   ├── signal.rs        # 信号编号、pending 位掩码、dispositions
-│   │   └── futex.rs         # Futex wait/wake
-│   │
-│   ├── vfs/                 # 虚拟文件系统
-│   │   ├── mod.rs           # Inode trait、FileSystem trait、路径解析
-│   │   ├── file.rs          # 打开文件表（fd table）
-│   │   ├── mount.rs         # 挂载表、Vfs struct、pivot_root
-│   │   ├── ramfs.rs         # 内存文件系统
-│   │   ├── ext4.rs          # 可读写 ext2 和 ext4（直写式）
-│   │   ├── devfs.rs         # /dev/null、/dev/zero、/dev/tty、/dev/console 等
-│   │   ├── devpts.rs        # /dev/pts/*（PTY）
-│   │   ├── procfs.rs        # /proc（meminfo、mounts、cmdline、maps、fd 等）
-│   │   ├── sysfs.rs         # /sys（块设备、uevent）
-│   │   ├── tar.rs           # tar（ustar）解包器（initramfs 用）
-│   │   ├── pipe.rs          # pipe + socketpair
-│   │   ├── tty.rs           # TTY 行规程（规范模式、原始模式、转义键）
-│   │   ├── termios.rs       # struct termios 默认值
-│   │   ├── signalfd.rs      # signalfd
-│   │   └── eventfd.rs       # eventfd
-│   │
-│   ├── syscall/             # 系统调用门
-│   │   ├── mod.rs           # 错误码、cstr/argv 解析
-│   │   └── linux/
-│   │       ├── mod.rs       # 完整 Linux x86_64 分发表
-│   │       ├── nr.rs        # 系统调用号常量
-│   │       ├── fs.rs        # 文件相关系统调用
-│   │       └── proc.rs      # 进程相关系统调用
-│   │
-│   ├── blk/                 # 块设备层
-│   │   ├── mod.rs           # BlockDev trait
-│   │   └── part.rs          # GPT/MBR 分区表扫描
-│   │
-│   ├── drivers/             # 设备驱动
-│   │   ├── devices.rs       # 设备注册、uevent 发布
-│   │   ├── pci.rs           # PCI 配置空间（mechanism 1）
-│   │   ├── serial.rs        # 串口初始化、中断驱动读取
-│   │   └── virtio/
-│   │       ├── hal.rs       # VirtIO HAL（DMA、物理/虚拟地址转换）
-│   │       ├── blk.rs       # VirtIO 块设备
-│   │       └── net.rs       # VirtIO 网络设备
-│   │
-│   └── net/                 # 网络
-│       ├── mod.rs           # smoltcp 协议栈、TCP/UDP/raw socket
-│       ├── socket.rs        # Socket inode（AF_INET, AF_NETLINK）
-│       └── rtnl.rs          # Route/netlink（ip 命令支持）
-│
-├── user/                    # 用户空间程序
-│   ├── lib/lin.rs           # Linux ABI 测试框架 + syscall stubs
-│   ├── bin/                 # 57 个 standalone 程序（no_std, ET_EXEC）
-│   │   ├── hello.rs         # M12 示例程序
-│   │   └── t_*.rs           # ABI 一致性测试（每个系统调用族一个）
-│   └── src/bin/             # 7 个 musl 程序（std, rustix）
-│       └── t_*.rs           # socket、rename、rmdir 测试
-│
-├── scripts/
-│   ├── mkvm.sh               # 一键构建（内核 + 用户空间 + 磁盘镜像）
-│   ├── run.sh               # QEMU 启动器（UEFI, virtio-blk, virtio-net）
-│   ├── test.sh              # CI 流程（fmt, clippy, test, build, boot, assert）
-│   ├── fetch-limine.sh      # 获取 Limine v9.6.7 引导加载器
-│   └── cpio-extract.py      # CPIO 归档解压器
-
-│
-├── arch/x86_64/linker.ld    # 位置无关链接脚本
-├── limine.conf              # 引导加载器配置
-├── Cargo.toml               # 工作区根（内核 + user）
-├── rust-toolchain.toml      # Nightly Rust、裸机目标
-└── third_party/limine/      # Limine v9.6.7 二进制文件（gitignored）
-```
-
-### 设计原则
-
-- **库/二进制拆分**：`src/lib.rs` 编译目标为 `x86_64-unknown-linux-gnu`（主机测试）；机器代码通过 `target_os = "none"` 门控。
-- **共享系统调用表**：用户程序通过 `#[path]` 包含 `src/syscall/linux/nr.rs`——内核和用户空间不会在编号上产生分歧。
-- **单处理器简单性**：所有共享状态使用 `critical_section::Mutex<RefCell<T>>`。锁下不睡眠、无自旋锁、无 per-CPU 数据。
-- **伙伴分配器与侵入式空闲链表**：元数据从被管理内存中划出；通过空闲块中的双向链表实现 O(1) 合并。
 
 ---
 
 ## 系统调用
 
-MPOS 实现了约 **225 个 Linux x86_64 系统调用**。POSIX 补全集(epoll、timerfd、*at 家族、身份、调度、内存建议)完全按 man 手册实现,每个标志值、结构布局和 errno 都由主机端测试钉死，与基于 musl 的程序二进制兼容。分发表位于 `src/syscall/linux/mod.rs`。
+`src/syscall/linux/nr.rs` 命名了 **252 个 Linux x86_64 系统调用号**；每一个都由
+`src/syscall/linux/mod.rs` 中的分发表路由，其中约 234 个真正工作——剩下的少数几个回答
+`ENOSYS`，由 `PLAN.md` 作为剩余 ABI 缺口追踪记录（`fanotify`、`keyctl`、`userfaultfd`、
+实时信号 33–64、`io_uring`）。POSIX 间隔定时器（`timer_create` 222 … `timer_delete` 226）
+以它们本来的五个调用号加入了真正工作的集合；`SIGRTMIN`（32）可以被排队、屏蔽和等待——
+那是 musl 的 `SIGEV_THREAD` 辅助函数唯一需要的实时信号号——而针对它的*处置方式*及其上方的
+整个范围仍然被拒绝。
 
-### 文件 I/O
+处理函数所在的位置，以及这些文件为什么这么大：
 
-|  #  | 名称              | 说明                                                    |
-| :-: | ----------------- | ------------------------------------------------------- |
-|  0  | `read`            | 从文件描述符读取                                        |
-|  1  | `write`           | 写入文件描述符                                          |
-|  2  | `open`            | 按路径打开文件                                          |
-|  3  | `close`           | 关闭文件描述符                                          |
-|  4  | `stat`            | 按路径 stat（旧版）                                     |
-|  5  | `fstat`           | 按 fd stat                                              |
-|  6  | `lstat`           | stat 符号链接本身（旧版）                               |
-|  8  | `lseek`           | 移动文件位置                                            |
-| 17  | `pread64`         | 在指定偏移读取（不移动 fd 位置）                        |
-| 18  | `pwrite64`        | 在指定偏移写入                                          |
-| 19  | `readv`           | 分散读                                                  |
-| 20  | `writev`          | 分散写                                                  |
-| 21  | `access`          | 检查路径可访问性                                        |
-| 22  | `pipe`            | 创建管道                                                |
-| 23  | `select`          | fd_set 式 I/O 多路复用                                  |
-| 32  | `dup`             | 复制 fd（最小空闲）                                     |
-| 33  | `dup2`            | 复制 fd 到目标                                          |
-| 40  | `sendfile`        | 内核内部文件拷贝                                        |
-| 72  | `fcntl`           | 文件控制（F_DUPFD、F_GETFD、F_SETFD、F_GETFL、F_SETFL） |
-| 73  | `flock`           | 咨询文件锁（stub）                                      |
-| 74  | `fsync`           | 刷新到存储                                              |
-| 75  | `fdatasync`       | 刷新数据（同 fsync）                                    |
-| 76  | `truncate`        | 按路径截断文件                                          |
-| 77  | `ftruncate`       | 按 fd 截断文件                                          |
-| 79  | `getcwd`          | 获取当前工作目录                                        |
-| 80  | `chdir`           | 切换工作目录                                            |
-| 81  | `fchdir`          | 切换 cwd 到目录 fd                                      |
-| 82  | `rename`          | 重命名路径（旧版）                                      |
-| 83  | `mkdir`           | 创建目录（旧版）                                        |
-| 84  | `rmdir`           | 删除空目录                                              |
-| 85  | `creat`           | 创建或清空文件 —— 1970 年代的写法                       |
-| 86  | `link`            | 创建硬链接（返回 EPERM）                                |
-| 87  | `unlink`          | 删除文件（旧版）                                        |
-| 88  | `symlink`         | 创建符号链接                                            |
-| 89  | `readlink`        | 读取符号链接目标                                        |
-| 90  | `chmod`           | 设置权限位（不强制执行）                                |
-| 91  | `fchmod`          | 按 fd 设置权限位                                        |
-| 92  | `chown`           | 设置所有者（不强制执行）                                |
-| 93  | `fchown`          | 按 fd 设置所有者                                        |
-| 94  | `lchown`          | 设置符号链接所有者                                      |
-| 132 | `utime`           | 设置时间戳,秒精度(旧式)                                 |
-| 133 | `mknod`           | 创建设备/FIFO 节点                                      |
-| 137 | `statfs`          | 获取文件系统统计信息                                    |
-| 138 | `fstatfs`         | 按 fd 获取文件系统统计信息                              |
-| 162 | `sync`            | 刷新脏数据（空操作）                                    |
-| 165 | `mount`           | 挂载文件系统                                            |
-| 166 | `umount2`         | 卸载文件系统                                            |
-| 187 | `readahead`       | 预读提示(本内核积极读入:空操作)                         |
-| 217 | `getdents64`      | 读取目录条目                                            |
-| 235 | `utimes`          | 设置时间戳（旧版）                                      |
-| 257 | `openat`          | 相对于 dirfd 打开                                       |
-| 258 | `mkdirat`         | 相对于 dirfd 创建目录                                   |
-| 259 | `mknodat`         | 相对 dirfd 创建节点                                     |
-| 260 | `fchownat`        | 相对于 dirfd 设置所有者                                 |
-| 261 | `futimesat`       | 相对 dirfd 设置时间戳                                   |
-| 262 | `newfstatat`      | 相对于 dirfd stat                                       |
-| 263 | `unlinkat`        | 相对于 dirfd 删除文件                                   |
-| 264 | `renameat`        | 相对于 dirfds 重命名                                    |
-| 265 | `linkat`          | 相对于 dirfds 创建硬链接（返回 EPERM）                  |
-| 266 | `symlinkat`       | 相对于 dirfd 创建符号链接                               |
-| 267 | `readlinkat`      | 相对于 dirfd 读取符号链接                               |
-| 268 | `fchmodat`        | 相对 dirfd 设置权限位                                   |
-| 269 | `faccessat`       | 相对于 dirfd 检查可访问性                               |
-| 275 | `splice`          | 在管道与文件之间搬移字节                                |
-| 280 | `utimensat`       | 设置时间戳（纳秒精度）                                  |
-| 285 | `fallocate`       | 预分配文件空间                                          |
-| 292 | `dup3`            | 带标志复制 fd                                           |
-| 293 | `pipe2`           | 带标志创建管道                                          |
-| 295 | `preadv`          | 带偏移的矢量读                                          |
-| 296 | `pwritev`         | 带偏移的矢量写                                          |
-| 306 | `syncfs`          | 刷新一个描述符所在的文件系统                            |
-| 316 | `renameat2`       | 带标志重命名                                            |
-| 326 | `copy_file_range` | 内核内部跨文件复制                                      |
-| 332 | `statx`           | 扩展 stat                                               |
-| 437 | `openat2`         | 以 struct open_how 打开(RESOLVE_*:EOPNOTSUPP)           |
+| 处理模块 | 调用号数 | 回答的内容 |
+|---|---:|---|
+| `syscall/linux/fs.rs` | 135 | 一切携带路径或操作文件描述符的调用：`open`/`openat`/`openat2`、`stat`/`statx`、`getdents64`、`renameat2`、`splice`、`mount`、`ioctl`、`fcntl`、管道、`sendfile`、`fallocate`、`statfs` |
+| `syscall/linux/proc.rs` | 50 | 内存与进程机制：`mmap`/`munmap`/`mremap`/`brk`/`mprotect`、`fork`/`clone`/`vfork`、`execve`、`exit_group`、`wait4`/`waitid`、`ptrace`、`process_vm_readv`/`writev`、`nanosleep`、`clock_gettime`、`gettimeofday` |
+| `syscall/linux/posix.rs` | 50 | POSIX 补全集：身份族（`setreuid`、`getresuid`、`capget`……）、能力、`sched_*`、`getpriority`/`setpriority`、内存建议（`msync`、`madvise`、`mlock`）、挂钟设置器、面向自身的信号 |
+| `syscall/linux/abi.rs` | 12 | 纯 ABI 事实——标志值、结构体布局、参数校验、编码——以主机方式编译，因此手册页契约可被单元测试 |
+| `syscall/linux/nr.rs` | — | 调用号本身，被测试套件以 `#[path]` 引入，让内核与测试共享同一张表 |
 
-### 内存
+`ioctl` 值得一提：目前 fbdev、DRM、RTC、uinput、evdev、TTY 和块设备的请求号族都在
+`fs.rs` 中解析，这正是该文件有 6300 行的原因。`PLAN.md` Phase 11（Step B）就是把这些契约
+交还给各自驱动的计划。
 
-|  #  | 名称       | 说明                                  |
-| :-: | ---------- | ------------------------------------- |
-|  9  | `mmap`     | 映射内存（文件支持、匿名、MAP_FIXED） |
-| 10  | `mprotect` | 更改页保护                            |
-| 11  | `munmap`   | 取消内存映射                          |
-| 12  | `brk`      | 更改程序断点                          |
-| 25  | `mremap`   | 调整或移动映射                        |
-| 26  | `msync`    | 同步文件映射(私有副本:空操作)         |
-| 28  | `madvise`  | 内存建议（接受，空操作）              |
-| 149 | `mlock`    | 锁定页(本已全部驻留)                  |
-
-### 进程
-
-|  #  | 名称                | 说明                               |
-| :-: | ------------------- | ---------------------------------- |
-| 39  | `getpid`            | 获取进程（线程组）ID               |
-| 56  | `clone`             | 创建进程或线程                     |
-| 57  | `fork`              | fork 进程                          |
-| 58  | `vfork`             | fork（同 fork）                    |
-| 59  | `execve`            | 执行程序                           |
-| 60  | `exit`              | 终止线程                           |
-| 61  | `wait4`             | 等待子进程退出                     |
-| 62  | `kill`              | 发送信号                           |
-| 63  | `uname`             | 获取系统信息（"mpos" 0.1.0）       |
-| 97  | `getrlimit`         | 获取资源限制                       |
-| 98  | `getrusage`         | 获取资源使用（返回零值）           |
-| 99  | `sysinfo`           | 获取系统信息（运行时间、内存）     |
-| 100 | `times`             | 获取 CPU 时间（时钟滴答）          |
-| 101 | `ptrace`            | 进程跟踪（返回 EPERM）             |
-| 102 | `getuid`            | 获取用户 ID（始终为 0）            |
-| 104 | `getgid`            | 获取组 ID（始终为 0）              |
-| 105 | `setuid`            | 设置用户 ID                        |
-| 106 | `setgid`            | 设置组 ID                          |
-| 107 | `geteuid`           | 获取有效 UID                       |
-| 108 | `getegid`           | 获取有效 GID                       |
-| 109 | `setpgid`           | 设置进程组                         |
-| 110 | `getppid`           | 获取父进程 PID                     |
-| 111 | `getpgrp`           | 获取进程组                         |
-| 112 | `setsid`            | 创建会话                           |
-| 113 | `setreuid`          | 设置真实/有效 UID(仅 root)         |
-| 114 | `setregid`          | 设置真实/有效 GID(仅 root)         |
-| 115 | `getgroups`         | 获取补充组                         |
-| 116 | `setgroups`         | 设置补充组                         |
-| 117 | `setresuid`         | 设置真实/有效/保存 UID             |
-| 118 | `getresuid`         | 获取真实/有效/保存 UID             |
-| 119 | `setresgid`         | 设置真实/有效/保存 GID             |
-| 120 | `getresgid`         | 获取真实/有效/保存 GID             |
-| 122 | `setfsuid`          | 设置文件系统 UID(返回前值)         |
-| 123 | `setfsgid`          | 设置文件系统 GID(返回前值)         |
-| 121 | `getpgid`           | 获取进程的进程组                   |
-| 124 | `getsid`            | 获取会话 ID                        |
-| 125 | `capget`            | 获取能力状态(root:全部许可)        |
-| 126 | `capset`            | 设置能力状态                       |
-| 135 | `personality`       | 执行域(查询 + PER_LINUX)           |
-| 140 | `getpriority`       | 获取 nice 值(内核 20-nice 编码)    |
-| 141 | `setpriority`       | 设置 nice 值(校验,不生效)          |
-| 155 | `pivot_root`        | 切换根文件系统                     |
-| 157 | `prctl`             | 进程控制（PR_GET_NAME 等）         |
-| 160 | `setrlimit`         | 设置资源限制（接受）               |
-| 161 | `chroot`            | 切换根目录                         |
-| 169 | `reboot`            | 重启/关机                          |
-| 170 | `sethostname`       | 设置主机名（接受，不存储）         |
-| 171 | `setdomainname`     | 设置域名(procfs 存储)              |
-| 186 | `gettid`            | 获取线程 ID                        |
-| 200 | `tkill`             | 向线程发送信号                     |
-| 234 | `tgkill`            | 定向进程组中的一个线程发信号       |
-| 201 | `time`              | 获取 epoch 以来的秒数              |
-| 231 | `exit_group`        | 终止所有线程                       |
-| 247 | `waitid`            | 等待子进程（siginfo_t）            |
-| 272 | `unshare`           | 脱离命名空间(不存在:EOPNOTSUPP)    |
-| 273 | `set_robust_list`   | 注册健壮 futex 列表                |
-| 274 | `get_robust_list`   | 获取健壮 futex 列表（返回 ENOSYS） |
-| 309 | `getcpu`            | 所在 CPU 与节点(单核,节点 0)       |
-| 317 | `seccomp`           | 安全计算模式(ENOSYS;探测返回空)    |
-| 302 | `prlimit64`         | 获取/设置资源限制                  |
-| 308 | `setns`             | 加入命名空间(不存在:EINVAL)        |
-| 310 | `process_vm_readv`  | 读另一进程内存                     |
-| 311 | `process_vm_writev` | 写另一进程内存                     |
-| 324 | `membarrier`        | 内存屏障（单核上为空操作）         |
-| 334 | `rseq`              | 注册可重启序列（接受）             |
-
-### 信号
-
-|  #  | 名称              | 说明                                             |
-| :-: | ----------------- | ------------------------------------------------ |
-| 13  | `rt_sigaction`    | 获取/设置信号处置                                |
-| 14  | `rt_sigprocmask`  | 获取/设置信号掩码                                |
-| 15  | `rt_sigreturn`    | 从信号处理程序返回                               |
-| 34  | `pause`           | 等待被捕获的信号(EINTR)                          |
-| 128 | `rt_sigtimedwait` | 等待集合中的信号                                 |
-| 129 | `rt_sigqueueinfo` | 附带 siginfo_t 的 kill(向非自身发 SI_USER:EPERM) |
-| 130 | `rt_sigsuspend`   | 换掩码并等待掩码外的信号                         |
-| 131 | `sigaltstack`     | 获取/设置备用信号栈                              |
-
-### I/O 多路复用
-
-|  #  | 名称            | 说明                                 |
-| :-: | --------------- | ------------------------------------ |
-|  7  | `poll`          | 等待描述符就绪                       |
-| 23  | `select`        | fd_set 式等待                        |
-| 270 | `pselect6`      | select + 纳秒超时 + 信号掩码         |
-| 271 | `ppoll`         | poll + 纳秒超时 + 信号掩码           |
-| 213 | `epoll_create`  | 创建 epoll 实例(size 被忽略但须为正) |
-| 232 | `epoll_wait`    | 从兴趣表收集就绪条目                 |
-| 233 | `epoll_ctl`     | 增改删兴趣表条目                     |
-| 281 | `epoll_pwait`   | 带信号掩码的 epoll_wait              |
-| 291 | `epoll_create1` | 带标志创建 epoll 实例                |
-| 441 | `epoll_pwait2`  | timespec 超时版的 epoll_pwait        |
-
-### 时间与定时器
-
-|  #  | 名称              | 说明                                                |
-| :-: | ----------------- | --------------------------------------------------- |
-| 35  | `nanosleep`       | 休眠 timespec 时长                                  |
-| 36  | `getitimer`       | 获取间隔定时器                                      |
-| 37  | `alarm`           | 一次性闹钟                                          |
-| 38  | `setitimer`       | 设置间隔定时器                                      |
-| 96  | `gettimeofday`    | 获取墙钟时间（timeval）                             |
-| 164 | `settimeofday`    | 设置墙上时钟(移动 RTC 锚点)                         |
-| 228 | `clock_gettime`   | 获取时钟（REALTIME、MONOTONIC、PROCESS_CPUTIME_ID） |
-| 229 | `clock_getres`    | 获取时钟分辨率                                      |
-| 230 | `clock_nanosleep` | 带时钟规范的休眠                                    |
-| 283 | `timerfd_create`  | 以描述符报告的定时器                                |
-| 286 | `timerfd_settime` | 启停(ABSTIME、CANCEL_ON_SET)                        |
-| 287 | `timerfd_gettime` | 剩余时间与间隔                                      |
-
-### 调度
-
-|  #  | 名称                     | 说明                                     |
-| :-: | ------------------------ | ---------------------------------------- |
-| 24  | `sched_yield`            | 让出 CPU                                 |
-| 142 | `sched_setparam`         | 设置调度参数(SCHED_OTHER:零)             |
-| 143 | `sched_getparam`         | 获取调度参数                             |
-| 144 | `sched_setscheduler`     | 设置策略(SCHED_OTHER;FIFO/RR:EOPNOTSUPP) |
-| 145 | `sched_getscheduler`     | 获取策略(恒为 SCHED_OTHER)               |
-| 146 | `sched_get_priority_max` | 策略的最高优先级(man 页表)               |
-| 147 | `sched_get_priority_min` | 策略的最低优先级                         |
-| 148 | `sched_rr_get_interval`  | 轮转切片(timespec)                       |
-| 314 | `sched_setattr`          | 可扩展调度属性(设置)                     |
-| 315 | `sched_getattr`          | 可扩展调度属性(获取)                     |
-| 158 | `arch_prctl`             | 设置 FS/GS 基址（TLS）                   |
-| 202 | `futex`                  | Futex wait/wake                          |
-| 203 | `sched_setaffinity`      | 设置 CPU 亲和性                          |
-| 204 | `sched_getaffinity`      | 获取 CPU 亲和性                          |
-| 218 | `set_tid_address`        | 设置 clear-tid 地址                      |
-
-### 设备 I/O
-
-|  #  | 名称        | 说明                                            |
-| :-: | ----------- | ----------------------------------------------- |
-| 16  | `ioctl`     | 设备控制（TIOCGWINSZ、TCGETS、BLKGETSIZE64 等） |
-| 221 | `fadvise64` | 建议提示（接受，空操作）                        |
-
-### 网络
-
-|  #  | 名称          | 说明                                            |
-| :-: | ------------- | ----------------------------------------------- |
-| 41  | `socket`      | 创建 socket（AF_INET：SOCK_STREAM、SOCK_DGRAM） |
-| 42  | `connect`     | 连接 socket                                     |
-| 43  | `accept`      | 接受连接                                        |
-| 44  | `sendto`      | 发送数据                                        |
-| 45  | `recvfrom`    | 接收数据                                        |
-| 46  | `sendmsg`     | 带辅助数据发送                                  |
-| 47  | `recvmsg`     | 带辅助数据接收                                  |
-| 48  | `shutdown`    | 关闭 socket                                     |
-| 49  | `bind`        | 绑定到地址                                      |
-| 50  | `listen`      | 标记为被动                                      |
-| 51  | `getsockname` | 获取本地地址                                    |
-| 52  | `getpeername` | 获取远程地址                                    |
-| 53  | `socketpair`  | 创建 socket 对                                  |
-| 54  | `setsockopt`  | 设置 socket 选项                                |
-| 55  | `getsockopt`  | 获取 socket 选项                                |
-| 288 | `accept4`     | 带标志的 accept(随后 EOPNOTSUPP:无 TCP accept)  |
-| 299 | `recvmmsg`    | 收多条消息,带超时                               |
-| 307 | `sendmmsg`    | 发多条消息                                      |
-
-### 杂项 / Stub
-
-|  #  | 名称        | 说明                                |
-| :-: | ----------- | ----------------------------------- |
-| 95  | `umask`     | 获取/设置文件创建掩码（不强制执行） |
-| 103 | `syslog`    | 内核日志环,klogctl 0-10 型          |
-| 153 | `vhangup`   | 虚拟挂起终端(空操作)                |
-| 282 | `signalfd`  | 创建信号 fd                         |
-| 289 | `signalfd4` | 带标志创建信号 fd                   |
-| 290 | `eventfd`   | 创建事件计数 fd                     |
+与 Linux 有意为之的分歧按子系统收集在 `PLAN.md` 中——例如 IPv4 上的 `listen(2)` 返回
+`EOPNOTSUPP`（协议栈只支持出站）、`SO_LINGER{on,0}` 保持正常关闭而不是伪造、
+`unshare`/`setns` 先校验再拒绝，以及 `seccomp` 支持 `STRICT` 但不支持 `FILTER`。
+它们记录在那里，而不是藏在这里。
 
 ---
 
-## 里程碑
+## 里程碑检查
 
-每个里程碑在构建下一个子系统之前证明当前子系统正确。
+每个子系统都在下一个构建之前被证明正确，而这些证明的"在机器上"的那一半会向串口日志打印标记。
+它们**仅**在命令行携带 `mpos.selftest` 时才运行——`cargo xtask test` 会设置它，普通引导不会——
+因此普通引导不需要付出这些检查所需的半秒时钟等待和调度器休眠。
 
-| 里程碑  | 子系统             | 验证内容                                                          |
-| :-----: | ------------------ | ----------------------------------------------------------------- |
-| **M0**  | 分配器             | 全局堆分配器端到端工作（Vec、String）                             |
-| **M1**  | 中断               | 时钟以正确频率滴答；断点异常可捕获                                |
-| **M2**  | 帧与堆             | 伙伴分配器分出不重叠的块；Slab 堆满足所有布局                     |
-| **M3**  | 分页               | 内核运行在自己的页表上；W^X 验证；进程获得独立地址空间            |
-| **M4**  | 调度器             | 轮转调度、抢占、休眠、空闲、基于优先级的核窃取                    |
-| **M6**  | 系统调用           | `syscall` 门正确分发；fd 检查工作；通过 dispatch 的 exit 结束任务 |
-| **M7**  | VFS                | ramfs 根、挂载子文件系统、通过 fd 表的多任务文件 I/O              |
-| **M8**  | Initramfs 与 devfs | tar 解包、`/dev/tty`、`/dev/console`、`/dev/null`、`/dev/zero`    |
-| **M9**  | 进程               | ELF 加载到新地址空间；进入 Ring 3；退出码往返验证                 |
-| **M10** | 块设备与 ext2/ext4 | virtio-blk 检测；ext2/ext4 挂载、读取、写入、冷挂载验证           |
-| **M11** | 管道、TTY、信号    | 管道字节传输和 EOF；TTY 行编辑；SIGTERM、SIGKILL、kill(0)         |
-| **M12** | Shell 与核心工具   | Shell、echo、cat、ls、true、false、sleep —— 全部运行在 Ring 3     |
-| **M13** | Init 移交          | `/sbin/init` 成为 PID 1；Shell 通过 UART 中断变为交互式           |
-| **M14** | 退出状态           | Shell `$?` 携带上一条命令的退出码                                 |
+| 标记 | 子系统 | 验证内容 |
+|:------:|-----------|------------------|
+| `M0_OK` | 分配器 | 全局分配器端到端工作（`Vec`、`String`） |
+| `M1_OK` | 中断 | PIT 以预期频率滴答；断点异常可被捕获并返回 |
+| `M2_OK` | 帧与堆 | Buddy 块互不重叠且能正确合并；每个 slab 大小级别都守住自己的契约；堆与帧分配器对"发出去了什么"的意见一致 |
+| `M3_OK` | 分页 | 内核运行在自己的页表上；整个镜像范围内 `text` 为 `r-x`、`rodata` 为 `r--`、`data` 为 `rw-`；用户地址空间彼此隔离并共享同一个内核半区；两者都被拆除且不泄漏一帧 |
+| `M4_OK` | 调度器 | 轮转、抢占、休眠、空闲唤醒、基于优先级的核心窃取；每个任务都被回收，每个栈都被归还 |
+| `M6_OK` | 系统调用 | 分派门在任务内部正确应答；经由分派的 `exit_group` 结束任务 |
+| `M7_OK` | VFS | ramfs 根、一个被路径解析穿越的挂载点、两个任务通过 fd 表读写同一个文件 |
+| `M8_IPC_OK` | 管道、TTY、信号 | 字节在两个任务之间穿过管道；无读取方时的 `EPIPE`；行编辑、回显与 `Ctrl-D`；`SIGTERM`/`SIGKILL` 送达；`kill(0)` 探测正确应答 |
+| `M8_OK` | init 交接 | `/init` 以 PID 1 运行，fork，exec 一个 shell，并保持存活 |
+
+不存在 M5，M8 之上也没有任何检查——验证止步于里程碑编号历史上的那个空缺，而编号保持原样，
+因为 CI 日志和 `PLAN.md` 都引用它。本 README 的早期版本曾描述过一条一路排到 M8 之上的完整
+里程碑流水线，它从未以那种形式存在过；关于什么被证明了的权威记录是测试套件，而不是这些标记。
+
+**真正的门禁是自检。** `cargo xtask test` 先运行主机单元测试，然后引导 `tests.toml` 选中的
+用户测试程序——所有不在任何分组中的程序——要求每个程序打印 `=== PASS`，并且整个运行以
+`=== SUMMARY` 行和 QEMU 退出码 33 结束。需要机器之外东西的程序，或者做测量而非断言的程序，
+被放在分组里并按名字运行（`--groups`、`--all-groups`），这才使红色的门禁依然是关于内核的
+陈述。参见[测试](#测试)。
 
 ---
 
@@ -589,144 +288,354 @@ MPOS 实现了约 **225 个 Linux x86_64 系统调用**。POSIX 补全集(epoll�
 
 ### 前置条件
 
-- **Rust nightly**（包含 `rust-src`、`rustfmt`、`clippy`）
-- **QEMU**（x86_64 或 aarch64）
-- **OVMF** —— QEMU 用它替代 SeaBIOS 的 UEFI 固件（`/usr/share/OVMF/x64/OVMF_CODE.4m.fd`）
-- **python3** —— `scripts/mkfat.py` 无需 loop 设备即可写出 FAT32 卷
-- **parted** —— 划分镜像的 GPT 分区表
-- **mke2fs** / **e2fsprogs** —— 创建 ext2/ext4 数据分区
+- **Rust nightly**，带 `rust-src`、`rustfmt`、`clippy`
+- 四个目标：`x86_64-unknown-none`（内核）、`x86_64-unknown-uefi`（引导加载器）、
+  `x86_64-unknown-linux-musl`（用户程序）、`x86_64-unknown-linux-gnu`（主机测试 + xtask）
+- **QEMU**（`qemu-system-x86_64`）、**OVMF**（`OVMF_CODE.4m.fd` / `OVMF_VARS.4m.fd`）
+- `qemu-img`、`qemu-nbd`、`sfdisk`、`partx`、`blkid`、`mkfs.ext4`、`mkfs.fat`、`tar`、`sudo`
+- 首次构建 `initramfs`/`rootfs` 时需要网络连接（拉取 Alpine 软件包）
 
 ```bash
 rustup toolchain install nightly
 rustup component add rust-src rustfmt clippy --toolchain nightly
-rustup target add x86_64-unknown-none --toolchain nightly
+rustup target add x86_64-unknown-none x86_64-unknown-uefi \
+                   x86_64-unknown-linux-musl x86_64-unknown-linux-gnu
 ```
 
 ### 构建并运行
 
 ```bash
-# 1. 获取 Limine 引导加载器（仅需一次）
-./scripts/fetch-limine.sh
-
-# 2. 构建内核、用户程序和可引导磁盘镜像
-./scripts/mkdisk.sh
-
-# 3. 在 QEMU 中启动
-./scripts/run.sh
+cargo xtask all          # 内核 + 引导加载器 + initramfs + 磁盘镜像 + Alpine rootfs（需要 sudo）
+cargo xtask run          # 引导运行；若有内容过期会先重新构建
 ```
 
-内核将启动，运行 M0–M14 里程碑验证，然后进入交互式 Shell。
+内核引导、拉起 initramfs、pivot 进入 Alpine 根文件系统，然后把你放进一个交互式 shell——
+在串口上、在 QEMU 窗口里，或者两者兼有，取决于下面哪种模式。
+
+`cargo xtask run` 有一个模式参数，它同时决定窗口和串口如何接线，以及客户机被告知拥有哪些
+控制台。对虚拟机的告知使用 Linux 自己的 `console=` 词，仅此而已：列表上的每个控制台都会
+收到日志，而最后一个控制台是首选项——对它的写入会等待，而不是被丢弃。
+
+| 模式 | 你得到什么 | 客户机 `console=` |
+|------|--------------|------------------|
+| `terminal` | 仅串口，无窗口——无损日志；`/dev/fb0` 依然存在，但没有任何东西画在它上面 | `console=ttyS0` |
+| `gui` | 整台机器都在窗口里：文本控制台——日志、虚拟控制台、登录、shell——都显示在那里，宿主终端保持安静，串口线被复制到 `build/serial.log`；合成器在运行时以 `./start-weston.sh` 接管了屏幕 | `console=tty0` |
+| `mirror` | 窗口外加串口上的尽力而为副本（默认） | `console=ttyS0 console=tty0` |
+
+```bash
+cargo xtask run --mode terminal      # 观看引导日志
+cargo xtask run --mode gui           # 在窗口里看这台机器
+```
+
+之所以是三种模式，是因为虚拟机的控制台和启动器的窗口是两个独立的问题，
+而每种模式各自拥有一份答案。命令行永远说不出的是*谁在画屏幕*：合成器在运行时
+通过 `DRM_IOCTL_SET_MASTER` 和 `KDSETMODE` 取得屏幕，无论它在哪种有窗口的模式下启动。
+
+`xtask/README.md` 以中英双语记录了每一条命令、每一个标志和每一个环境变量。简表如下：
+
+| 命令 | 作用 | 需要 root？ |
+|---|---|---|
+| `cargo xtask build` | 内核 + UEFI 引导加载器 | 否 |
+| `cargo xtask initramfs` | 构建 initramfs 归档 | 是 |
+| `cargo xtask disk` | 创建空白 GPT 镜像 | 是 |
+| `cargo xtask rootfs` | 把 Alpine 安装进镜像（会刷新 initramfs） | 是 |
+| `cargo xtask run` | 在 QEMU 中引导，过期时重新构建 | 视需要 |
+| `cargo xtask all` | 以上全部，按顺序 | 是 |
+| `cargo xtask test` | 主机单元测试 + `tests.toml` 选中的用户测试程序，在 QEMU 中 | **否** |
+| `cargo xtask clean` | 删除 `build/` 和 `target/` | 视需要 |
 
 ---
 
 ## 构建
 
-### 仅构建内核
+构建是一个 Cargo workspace，只有一个前端。`xtask` 以你自己的用户身份编译，只在确实需要的
+步骤（写块设备、挂载镜像、`chroot`）上提权，并在完成后把产物交还回来。
 
 ```bash
-cargo build --target x86_64-unknown-none
+cargo xtask build                        # 只构建内核和引导加载器
+cargo build --target x86_64-unknown-none # 同样的东西，不经过 xtask
 ```
 
-### 完整磁盘镜像
+### 磁盘镜像
 
-```bash
-./scripts/mkdisk.sh
-```
+`cargo xtask all` 组装出 `build/mpos-uefi-x86_64.img`：一个带两个分区的 GPT 磁盘。
 
-构建所有内容并组装 4 分区 GPT 磁盘镜像 `build/linux-x86_64.img`：
+| # | 名称 | 类型 | 大小 | 内容 |
+|---|------|------|------|----------|
+| 1 | `efi` | FAT32，可引导 | 128 MiB（来自 `rootfs.toml`） | `EFI/BOOT/BOOTX64.EFI`（引导加载器）、`mpos.elf`、`initramfs.tar`、`mpos.cmdline` |
+| 2 | `system` | ext4 | 2 GiB 镜像的剩余部分 | Alpine 根文件系统——`/sbin/init`、OpenRC、musl、busybox、`apk` |
 
-| 分区      | 类型               | 内容                                              |
-| --------- | ------------------ | ------------------------------------------------- |
-| 1, `ESP`  | FAT32, 34 MiB      | `EFI/BOOT/BOOTX64.EFI`（Limine）、`limine.conf`   |
-| 2, `Boot` | FAT32, 192 MiB     | `mpos.elf`、`initramfs.tar`                       |
-| 3, `Root` | ext2/ext4, 384 MiB | Alpine Linux rootfs（OpenRC、musl、busybox、apk） |
-| 4, `Data` | ext2, 8 MiB        | 种子文件（用于测试的文本文档）                    |
+QEMU 在 OVMF 下直接引导它：没有 ISO，没有光驱，没有 loop 设备，`cargo xtask test`
+也不需要 root——它引导的是一个 QEMU 合成为虚拟 FAT 的目录。
 
-QEMU 直接在 OVMF 下启动——不需要 ISO、不需要光驱、宿主上也不需要 loop 设备。FAT32 卷由 `scripts/mkfat.py` 逐字节写出。
+### 镜像里装什么
 
-### 交叉架构
+`rootfs.toml` 决定软件包、文件系统、大小、主机名、DNS 和用户账户；`machine.toml`
+决定这个镜像被引导在什么样的机器上（内存、CPU、设备、窗口、常驻运行模式），
+它是单独的文件，这样调机器不会让镜像失效；`initramfs.toml` 对早期用户空间做同样的事。
+具体的文件以真实文件的形式放在 `rootfs/` 和 `initramfs/` 之下，在从 toml 写入的任何内容
+*之后*叠加上去——所以目录树里的文件说了算，`/etc/inittab`、`/etc/network/interfaces`
+和 `/init` 就是这样被修改的。
 
-不支持。`.cargo/config.toml` 里已经没有 `aarch64-unknown-none` 配置，`rust-toolchain.toml`
-里也没有这个 target——原来那份配置指向 `arch/aarch64/linker.ld`，而这个链接脚本从来就不存在，
-所以它无法链接（`PLAN.md` Phase 11 Step A 把这份空头承诺删掉了）。`PLAN.md` §9.1 列出了真正的
-aarch64 移植需要什么：异常向量表、GIC、页表、PSCI、通用定时器、UART——这些目前都还没有写。
+### 跨架构
+
+不可用，而且配置也不再假装可用：`.cargo/config.toml` 里没有 `aarch64-unknown-none`
+profile，`rust-toolchain.toml` 里也没有这个目标，因为过去放在那里的那个 profile 指向
+`arch/aarch64/linker.ld`，而这样的脚本从未存在过（`PLAN.md` Phase 11 Step A 移除了它）。
+`PLAN.md` §9.1 列出了一个真正的 aarch64 移植所需要的东西——异常向量、GIC、页表、PSCI、
+通用定时器、UART——其中没有任何一项已经写好。
 
 ---
 
 ## 测试
 
-### 主机端单元测试
+三个层次，其中中间那个是门禁。
+
+### 1. 主机单元测试
 
 ```bash
-cargo test --lib --target x86_64-unknown-linux-gnu
+cargo test -p mpos --lib --target x86_64-unknown-linux-gnu
+cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu
 ```
 
-测试调度器策略、Shell 解析器、VFS 路径解析等架构无关代码。
+内核中 491 个 `#[test]` 函数，外加 `xtask` 中的 25 个。它们覆盖与架构无关的核心：
+buddy 分配器和 slab 堆、调度器的策略与信号状态、路径解析与挂载、ext2/ext3/ext4 编码
+（包括逐字节读取一个大文件，以及挂载主机上 `mke2fs` 生成的镜像）、ext4 块缓存的命中计数、
+ramfs 的分块及其字节预算、管道环、epoll 的就绪规则、evdev 窗口的客户端记账、
+inotify 的合并、文件锁表、键位映射、历法、shebang 解析器和 ABI 常量。
 
-### 完整 CI 流程
+> **`--target` 是必须的。** 根目录的 `.cargo/config.toml` 固定了 `[build] target =
+> "x86_64-unknown-none"`，所以裸的 `cargo test` 会试图在裸机上运行测试。
+
+### 2. 自检扫描——门禁
 
 ```bash
-./scripts/test.sh
+cargo xtask test        # 不需要 root
 ```
 
-运行：
+它构建两个用户测试 crate，把它们打包进一个一次性的 initramfs（附带一个生成的 `/init`），
+无头引导，然后解析串口日志：
 
-1. `cargo fmt --check`
-2. `cargo clippy`（内核和主机目标）
-3. `cargo test --lib`（主机）
-4. 通过 `mkdisk.sh` 构建
-5. 在 QEMU 中启动并捕获串口日志
-6. 断言里程碑标记（`M0_OK` 到 `M14_OK`、`APK_OK`）
-7. 检查 `KERNEL PANIC` 或 `INIT_EXITED`
+```
+=== RUN  t-filelock
+=== PASS t-filelock
+=== SUMMARY pass=120 fail=0
+=== END
+```
 
-### 用户程序
+挂起、崩溃或从未打印 `=== PASS` 的程序算作失败，而且整个运行必须以汇总行*加上*
+QEMU 的干净调试退出（退出码 33）结束。`MPOS_TEST_TIMEOUT` 可以覆盖 900 秒的时间预算。
 
-**60+ ABI 一致性测试**验证 Linux 系统调用接口：
+哪些程序被引导是 `tests.toml` 的回答，不是 `/init` 的：harness 把选中的二进制布放进 `/bin`，
+客户机运行交给它的那些。不在任何分组中的测试总是运行；预置的分组是 `external`（需要宿主网络
+或宿主上的监听进程）、`slow`（测量，或以秒计的工作量）和 `diagnostic`（根本不算检查），
+`cargo xtask test --groups <a,b>` / `--all-groups` 则有意运行它们。扫描会按分组打印它略过了
+什么，所以较小的数字永远不会被误认为较小的测试集。
 
-| 类别         | 测试                                                                                                                                                                                                                                                                                                                              |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **文件 I/O** | `t_read`、`t_write`、`t_openat`、`t_close`、`t_fstat`、`t_newfstatat`、`t_statx`、`t_lseek`、`t_readlink`、`t_getdents64`、`t_unlinkat`、`t_mkdirat`、`t_renameat2`、`t_pipe2`、`t_dup`、`t_dup2`、`t_dup3`、`t_fcntl`、`t_access`、`t_faccessat`、`t_mmap`、`t_munmap`、`t_mprotect`、`t_mremap`、`t_brk`、`t_readv`、`t_writev` |
-| **进程**     | `t_fork`、`t_clone`、`t_execve`、`t_exit_group`、`t_wait4`、`t_kill`、`t_getpid`、`t_gettid`、`t_getppid`、`t_prlimit64`、`t_uname`、`t_arch_prctl`、`t_rseq`、`t_set_robust_list`、`t_set_tid_address`、`t_sched_getaffinity`                                                                                                    |
-| **信号**     | `t_rt_sigaction`、`t_rt_sigprocmask`、`t_sigaltstack`                                                                                                                                                                                                                                                                             |
-| **内存**     | `t_mmap`、`t_munmap`、`t_mprotect`、`t_mremap`、`t_brk`、`t_madvise`                                                                                                                                                                                                                                                              |
-| **时间**     | `t_clock_gettime`、`t_nanosleep`                                                                                                                                                                                                                                                                                                  |
-| **网络**     | `t_socket`、`t_socketpair`、`t_sockopt`、`t_tcp`、`t_udp`                                                                                                                                                                                                                                                                         |
-| **杂项**     | `t_futex`、`t_getrandom`、`t_poll`、`t_ioctl`、`t_rename`、`t_rmdir`、`t_chdir`、`t_getcwd`                                                                                                                                                                                                                                       |
+### 3. 用户测试程序
 
-测试以两种方式编译：standalone `no_std` 二进制（通过 `rustc`）和 musl 二进制（通过 Cargo + `rustix`）。
+约 120 个程序，按每个程序的需要划分：
+
+| 组 | 位置 | 构建方式 | 钉住的内容 |
+|-------|-------|----------|--------------|
+| **纯系统调用** | `user/abitest/src/bin/syscall/`（86 个） | `no_std`、原始 `syscall`、静态 `ET_EXEC` | 一个系统调用族在自足资源上的 ABI 契约：成功的形态、它声称的每一个 errno，以及手册页固定的边界情况 |
+| **集成** | `user/abitest/src/bin/integration/`（22 个） | `no_std`、原始 `syscall` | 一个设备、网络、另一个进程镜像，或一个子系统端到端——外加计时仪器（`t-forkcost`、`t-pipecost`、`t-netlat`） |
+| **std 侧** | `user/tests/src/bin/`（12 个） | 静态 musl + `rustix` | 真正的 musl 程序所使用的接口面，钉住那些从宿主语言最容易固定的行为：socket、名字解析、进程派生 |
+
+`no_std` 程序通过 `#[path = "../../../lib/lin.rs"]` 从内核自己的 `nr.rs` 取调用号，
+所以一个错误的号码是构建失败，而不是一个错误的测试。`std` 测试刻意使用 `rustix`
+而不是内联汇编：手写的 `syscall` 指令可能对一个有错的内核通过，因为 errno 不过是
+寄存器当时碰巧装着的值。
+
+### 4. Fuzzing
+
+`fuzz/` 是一个独立的 workspace，带有 18 个 libFuzzer 目标，覆盖那些决定内核从字节里
+信任什么的解析器：ELF、ustar、ext2/ext4 磁盘结构、分区表、VFS 路径、控制台的转义
+序列解析器、键位映射、PCI BAR 尺寸探测、调度器的策略以及输入协议。
+
+```bash
+cd fuzz
+cargo fuzz run ext4_image
+cargo fuzz list
+```
 
 ---
 
-## 设计说明
+## 项目结构
 
-### 单处理器模型
+```
+mpos/
+├── src/                     # 内核 crate：lib.rs（主机可测）+ main.rs（引导入口）
+│   ├── lib.rs               # 库根——主机构建编译的内容
+│   ├── main.rs              # _start → kernel_main → 里程碑检查 → init 交接 → 挂起
+│   ├── console.rs           # 日志环、串口输出、向帧缓冲的迁移
+│   ├── binfmt.rs            # shebang (#!) 解释器
+│   ├── date.rs              # 公历历法运算
+│   ├── evdev.rs             # evdev 记录窗口与按客户端位置（主机可测）
+│   ├── uinput.rs            # uinput 的接口：请求与位图（主机可测）
+│   ├── pci.rs               # PCI 设备模型与 Linux 的写法（主机可测）
+│   ├── rand.rs              # ChaCha20 PRNG：/dev/urandom、getrandom
+│   ├── uevent.rs            # kobject 事件与 netlink 线格式
+│   ├── logging.rs           # 写入 COM1 的 tracing subscriber
+│   ├── sync/mod.rs          # 加锁纲领（critical_section，绝不用 spin）
+│   │
+│   ├── arch/x86_64/         # 依赖机器的那一半
+│   │   ├── context.rs       #   任务上下文切换、惰性 FPU（CR0.TS + #NM）
+│   │   ├── critical.rs      #   critical_section（cli/sti）
+│   │   ├── gdt.rs           #   GDT + TSS
+│   │   ├── idt.rs           #   中断处理函数（timer、#BP、#PF、#NM、syscall、MSI-X）
+│   │   ├── lapic.rs         #   本地 APIC（EOI、MSI-X 向量编程）
+│   │   ├── paging.rs        #   4 级页表、W^X、COW、AddressSpace
+│   │   ├── pic.rs           #   8259 PIC（IRQ0→32、IRQ4→36）
+│   │   ├── rtc.rs           #   作为挂钟锚点的 CMOS RTC
+│   │   ├── syscall.rs       #   syscall/sysret 门
+│   │   └── timer.rs         #   250 Hz 的 PIT + TSC 亚刻度读数
+│   │
+│   ├── mm/                  # 内存管理
+│   │   ├── pframe.rs        #   buddy 帧分配器（MAX_ORDER 12）
+│   │   ├── heap.rs          #   slab 内核堆（16–2048 B）
+│   │   ├── vm.rs            #   映射方案、KernelSections
+│   │   └── elf.rs           #   ELF64 加载器（ET_EXEC 与 ET_DYN + 重定位）
+│   │
+│   ├── sched/               # 任务
+│   │   ├── policy.rs        #   优先级带、轮转、休眠队列
+│   │   ├── runtime.rs       #   任务表（64 槽）、切换、fork/exec/wait、拆除
+│   │   ├── signal.rs        #   信号编号、挂起位掩码、处置方式
+│   │   └── futex.rs         #   futex 等待/唤醒
+│   │
+│   ├── vfs/                 # 虚拟文件系统
+│   │   ├── mod.rs           #   Inode/FileSystem trait、NodeKind
+│   │   ├── mount.rs         #   Vfs、挂载表、路径解析、pivot_root
+│   │   ├── path.rs          #   路径解析语法
+│   │   ├── file.rs          #   fd 表、CLOEXEC、RLIMIT_NOFILE
+│   │   ├── ramfs.rs         #   ramfs/tmpfs：分块文件、字节预算
+│   │   ├── ext4/            #   ext2/ext3/ext4：super · inode · extent · dir · dx · hash
+│   │   │                    #     · alloc · dirent · csum · mapping · cache
+│   │   ├── procfs.rs        #   /proc：meminfo、stat、mounts、net、sys 开关、按进程
+│   │   ├── sysfs.rs         #   /sys：设备、class、drm、input、uevent
+│   │   ├── devfs.rs         #   /dev 节点类型与请求路由
+│   │   │                    #     （标准节点集在 drivers/devices.rs 中：
+│   │   │                    #      null、zero、tty、console、fb0、dri、rtc0、dsp、hvc0 ……）
+│   │   ├── devpts.rs · pty.rs · tty.rs · termios.rs   # 终端
+│   │   ├── term/            #   终端模拟器：grid · blit · font · keymap
+│   │   ├── vcmux.rs         #   虚拟控制台多路复用器
+│   │   ├── pipe.rs          #   管道与 socketpair（环形缓冲、SCM 移交）
+│   │   ├── epoll.rs · timerfd.rs · eventfd.rs · signalfd.rs · inotify.rs
+│   │   ├── memfd.rs · dmabuf.rs      #   匿名与导出缓冲区
+│   │   ├── locks.rs         #   POSIX 记录锁与 flock
+│   │   ├── p9.rs            #   9p 客户端（宿主共享）
+│   │   └── tar.rs           #   用于 initramfs 的 ustar 解包器
+│   │
+│   ├── net/                 # 网络
+│   │   ├── mod.rs           #   smoltcp 协议栈、注册表、唤醒、netlink 写入侧
+│   │   ├── socket.rs        #   AF_INET / AF_NETLINK socket 系统调用
+│   │   ├── unix.rs          #   AF_UNIX：路径 socket、SCM_RIGHTS、SO_PEERCRED
+│   │   ├── rtnl.rs          #   rtnetlink：addr/route/link，实时生效
+│   │   └── vsock.rs         #   AF_VSOCK
+│   │
+│   ├── drivers/             # 设备
+│   │   ├── pci.rs           #   PCI 配置空间（机制 1）、枚举
+│   │   ├── devices.rs       #   设备注册表、uevent 发布
+│   │   ├── serial.rs        #   COM1：发送环、中断驱动的接收
+│   │   ├── rtc_dev.rs       #   /dev/rtc0（节点；时钟在 arch::x86_64::rtc）
+│   │   ├── qemu.rs          #   isa-debug-exit 测试端口
+│   │   ├── drm.rs           #   /dev/dri/card0：Linux DRM/KMS UAPI
+│   │   ├── uinput.rs        #   /dev/uinput
+│   │   ├── video/           #   渲染任务与呈现引擎
+│   │   └── virtio/          #   hal · blk · net · gpu · input · console · rng
+│   │                        #     · sound · fs9p · vsock · msix
+│   │
+│   ├── syscall/             # ABI
+│   │   ├── mod.rs           #   错误码、用户缓冲区校验、trace 环
+│   │   └── linux/           #   mod（分派）· nr（调用号）· abi · fs · proc · posix
+│   │
+│   ├── blk/                 # BlockDev trait、GPT/MBR 分区扫描
+│   └── boot/                # 引导加载器留下的交接记录
+│
+├── boot/                    # mpos-boot：UEFI 引导加载器（x86_64-unknown-uefi）
+│   └── src/                 # main（有序序列）· elf · vm · handoff
+│
+├── user/                    # 运行在 mpos 上的程序
+│   ├── src/bin/             #   随镜像发布的普通 std 程序（hello.rs）
+│   ├── tests/               #   mpos-user-tests：std 侧测试程序（musl）
+│   ├── abitest/             #   mpos-user-abi：no_std ABI 一致性套件
+│   │   ├── lib/lin.rs       #     harness：syscall 桩、判定协议
+│   │   └── src/bin/         #     syscall/（86 个）· integration/（22 个）
+│   └── staging/             #   草稿源码，未接入任何构建
+│
+├── xtask/                   # 构建/运行/测试前端（见 xtask/README.md）
+├── fuzz/                    # libFuzzer 目标（独立 workspace）
+├── arch/x86_64/linker.ld    # 内核链接脚本
+├── rootfs/                  # 叠加进 Alpine 根文件系统的具体文件
+├── rootfs.toml              # 客户机镜像里有什么
+├── machine.toml             # 这个镜像被引导在什么机器上（宿主资源、运行模式）
+├── tests.toml              # 默认扫描运行哪些用户测试（以及略过哪些）
+├── initramfs/               # 叠加进早期用户空间的具体文件（init 在这里）
+├── initramfs.toml           # 早期用户空间里有什么
+├── .cargo/config.toml       # 目标、rustflags 和 `cargo xtask` 别名
+├── rust-toolchain.toml      # nightly + 四个目标
+├── README.md · README.zh.md · ARCHITECTURE.md · AGENTS.md · PLAN.md
+└── LICENSE
+```
 
-MPOS 运行在单核上。所有共享状态由 `critical_section::Mutex<RefCell<T>>` 保护（中断禁用 = 互斥）。`spin::Mutex` 被刻意不使用——在被抢占的任务上忙等会导致死锁。
+`ARCHITECTURE.md` 把这同一棵树画成了依赖图，附有层与层之间实测的边；
+`AGENTS.md` 是给即将做出改动的人（或任何东西）的精简版指南。
 
-### COW Fork
+---
 
-父子进程间共享的页被标记为只读，使用 COW 位（PTE bit 9）。缺页处理程序分配新帧、复制内容，并在首次写入时重新映射为可写。伙伴分配器中的引用计数跟踪共享帧。
+## 设计原则
 
-### 按需分页栈增长
+- **库/二进制拆分。** crate 是一个库，这样主机才能测试它。机器代码被隔离在
+  `target_os = "none"` 之后；纯逻辑——算术、编码、解析器、策略——留在主机一侧，
+  即使它唯一的调用者是裸机。
+- **一张系统调用表。** 测试套件以 `#[path]` 引入 `src/syscall/linux/nr.rs`，所以内核
+  与测试不可能在某个调用号上悄然漂移而不触发构建失败。
+- **单处理器的简单性。** 所有共享状态都是 `critical_section::Mutex<RefCell<T>>`——
+  关中断*就是*互斥。刻意从不使用 `spin::Mutex`：在本核刚刚抢占的任务持有的锁上忙等
+  会死锁。任何锁下都不休眠。
+- **每一次唤醒都是事件，不是节拍。** 阻塞调用在它等待的那件事上挂起，由到达唤醒，
+  而不是由下一个时钟中断唤醒。正是这一条纪律把回环 `ping` 从 7.5 ms 降到 0.3 ms，
+  把两进程管道交接从 7 MiB/s 提到 10 168 MiB/s（`PLAN.md` §10.1、§10.4）。
+- **没有数字就不作声明。** `PLAN.md` 中的性能改动都带有来自套件内仪器的前后测量——
+  `t-forkcost`、`t-pipecost`、`t-netlat`，或者一个统计设备读取次数的主机测试。
+- **分歧要记录，不要隐藏。** MPOS 有意与 Linux 不同的地方，原因和钉住它的测试都写在
+  特性旁边。
 
-用户栈从 16 页（64 KiB）开始，在缺页时增长，上限为 `USER_STACK_MAX = 8 MiB` 和 `STACK_GROWTH_SLACK = 64 KiB`。缺页处理程序检查当前栈限制，如果在范围内则映射新页。
+### 值得知道的行为
 
-### 直写式 ext2/ext4
+| 行为 | 说明 |
+|---|---|
+| **COW fork** | 共享页被标记为只读并带 COW 位；`#PF` 处理函数在首次写入时复制。帧的引用计数存放在 buddy 分配器中 |
+| **按需分页的栈** | 起始 16 页，出错时增长，受 `RLIMIT_STACK` 约束，检查时留有 `STACK_GROWTH_SLACK` 余量 |
+| **直写式 ext4** | 每次 `write_at()` 都抵达设备。没有日志、没有脏页追踪、没有后台回写：简单，并且构造上崩溃即可见（镜像同样以 `^has_journal,^metadata_csum` 构建，原因一致） |
+| **信号** | 通过真正的 `rt_sigframe` 投递，所以处理函数会被调用，而 `rt_sigreturn` 会恢复被打断的代码。`SIGKILL` 和 `SIGSTOP` 不可屏蔽 |
+| **ASLR** | `ET_DYN` 镜像、它的解释器、栈顶和 `mmap` 区域都在每次 `exec` 时重新抽签；`ET_EXEC` 镜像保持它链接时的地址，因为固定地址的含义就是这个 |
+| **Slab 分配与大请求** | 超过 2048 B 的请求绕过 slab 直接取帧；堆会缓存已释放的空槽，这就是 `/proc/meminfo` 里的"空闲"内存不是全部真相的原因 |
+| **内核 panic 会终结这台机器** | `panic = "abort"`，加上一个打印栈扫描并以 `35` 退出 QEMU 的 panic 处理函数。全局分配器的失败路径仍然是一个 panic——`PLAN.md` §8.0 中的未决项 |
 
-每次 `write_at()` 都立即通过块缓存刷新。无日志、无脏页追踪、无后台回写。简单但正确——崩溃即可见。
+---
 
-### 信号模型
+## 文档
 
-信号被记录但不作为处理程序传递（用户栈上没有信号帧）。每个信号默认是致命的——进程被终止，而不是被调用。`SIGKILL` 和 `SIGSTOP` 无法被阻止。
+| 文件 | 内容 |
+|---|---|
+| `README.md` | 本文件的英文版：MPOS 是什么，以及如何构建、运行和测试 |
+| `README.zh.md` | 本文件：MPOS 是什么，以及如何构建、运行和测试（中文版，与英文版逐节对应） |
+| `ARCHITECTURE.md` | 依赖图、引导与系统调用序列、按层的所有权划分、模块间的实测边，以及分层违规 |
+| `AGENTS.md` | 工作指南：命令、约定、添加系统调用或测试的配方、已知的坑 |
+| `PLAN.md` | 特性路线图与状态板、实测的性能工作，以及 Phase 11——架构债务审计及其整改计划 |
+| `UAPI.md` | 以清单形式呈现的用户空间可见接口面：系统调用、设备 ioctl、结构体布局和标志词汇表，每一行都带着 Linux 的回答、本内核的回答和那个钉子——一份关于什么是*已服务*、什么是*诚实拒绝*、什么是*错误形态*的工作清单 |
+| `xtask/README.md` | 每一条构建/运行命令、标志和环境变量（中英双语） |
+| `fuzz/README.md` | 每个 fuzz 目标的输入是什么 |
 
 ---
 
 ## 许可证
 
-本项目基于 [MIT 许可证](LICENSE) 授权。
+本项目以 [MIT 许可证](LICENSE)授权。
 
 ---
 
 <div align="center">
-<sub>用 Rust 构建——逐个里程碑地证明正确。</sub>
+<sub>用 Rust 构建——逐一里程碑，证明其正确。</sub>
 </div>

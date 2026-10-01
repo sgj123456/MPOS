@@ -71,7 +71,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
 [target.'cfg(not(target_os = "none"))'.dependencies]
 critical-section = { version = "1.2", features = ["std"] }
 
-# x86_64-only: Limine is the x86_64 bootloader, the 16550 driver talks to port
+# x86_64-only: mpos-boot is the x86_64 UEFI loader, the 16550 driver talks to port
 # I/O, and the IDT's one-time init is the only spin::Once user.
 [target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
 uart_16550 = "0.8"

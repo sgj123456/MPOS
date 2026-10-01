@@ -645,7 +645,7 @@ layers; `AGENTS.md` is the short version for anyone (or anything) about to make 
 | File | What it is |
 |---|---|
 | `README.md` | This file: what MPOS is and how to build, run and test it |
-| `README.zh.md` | Chinese translation. **Predates the `cargo xtask` front-end and the current boot flow** — prefer this file where they disagree |
+| `README.zh.md` | Chinese translation, kept in section-by-section correspondence with this file |
 | `ARCHITECTURE.md` | The dependency graphs, the boot and syscall sequences, per-layer ownership, the measured inter-module edges, and the layering violations |
 | `AGENTS.md` | The working guide: commands, conventions, recipes for adding a syscall or a test, known traps |
 | `PLAN.md` | The feature roadmap and status board, the measured performance work, and Phase 11 — the architecture-debt audit and its remediation plan |
