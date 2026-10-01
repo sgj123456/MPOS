@@ -118,6 +118,7 @@ drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`PLAN.md` §1
 | `'P'` (0x50) | `/dev/dsp` | `src/drivers/virtio/sound.rs` | Served; the family's rate/channels/format belong to the writer |
 | `'t'` (0x74) + `0x8024_7009`/`0x4024_700A` | `/dev/rtc0` | `src/drivers/rtc_dev.rs` | Served (`RTC_RD_TIME`/`RTC_SET_TIME`); alarm/interrupt requests `ENOTTY` |
 | `0x12` (block) | `/dev/vda`, `/dev/sda` | `src/blk/`, `src/syscall/linux/fs.rs` | Served; the size trio's buffer direction was the sole outlier and is fixed (§5.1) |
+| `'f'` (0x66) | any file an `open` names | `src/syscall/linux/fs.rs` `fs_flags_ioctl` + `src/vfs/ext4/`, `src/vfs/ramfs.rs` | Served: `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS`, the inode attribute word `lsattr`/`chattr` are made of; the rest of the family `ENOTTY`; a bit this kernel cannot keep `EOPNOTSUPP` and *not stored*; `IMMUTABLE`/`APPEND` need `CAP_LINUX_IMMUTABLE` (§5.1) |
 | `0x89xx` (`SIOC*`) | `eth0` | `src/net/rtnl.rs` (dispatched in `fs.rs`) | Served (`SIOCGIFFLAGS`/`SIOCSIFFLAGS`/`SIOCSIFMTU`/`SIOCGIFINDEX`/`SIOCGIFTXQLEN`/`SIOCGIFHWADDR`) |
 | `0x4600`+ (`FBIO*`) | `/dev/fb0` | `src/drivers/video/` | Served (`FBIOGET_VSCREENINFO`/`GET_FSCREENINFO`/`PAN_DISPLAY`/`WAITFORVSYNC`); `FBIOPUT_VSCREENINFO` refused rather than faked |
 | `0x54xx` (termios/`TIOC*`) | ttys, pty pairs, consoles | `src/vfs/tty.rs`, `src/vfs/pty.rs` | Served: `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`, `TIOCGSID`, `TIOCGPTN`, `TIOCSPTLCK`, `TCGETS`/`TCSETS`, `FIONBIO`, `FIONREAD` — the entropy pair answering `EINVAL` as Linux does, and a regular file/pipe keeping the honest `ENOTTY` (§5.2) |
@@ -147,6 +148,8 @@ same failure in a different type.
 | `open` `O_NOFOLLOW` | `fs.rs` | Served: `ELOOP` on a symlink final component |
 | `mmap` flags | `proc.rs` | Served: `MAP_FIXED_NOREPLACE` → `EEXIST`, conflict `EINVAL`, `MAP_HUGETLB` `ENOMEM`; `MAP_STACK`/`NORESERVE`/`POPULATE` accepted as the no-ops Linux makes them |
 | `prctl` options | `abi.rs` + `src/cred.rs` | Served for the name pair, the seccomp pair, `PR_SET/GET_DUMPABLE`, `PR_SET/GET_KEEPCAPS` and `PR_CAPBSET_READ`/`DROP`; every other option is honestly `EINVAL` |
+| inode attribute flags (`FS_IOC_SETFLAGS`' word) | `src/vfs/mod.rs` (`INODE_FL_VISIBLE` / `INODE_FL_MODIFIABLE`) | Served for the six this kernel keeps — `IMMUTABLE`, `APPEND`, `NODUMP`, `NOATIME`, `SYNC`, `DIRSYNC` — of which the first two are enforced and the ext4 driver's three (`EXTENT`, `INDEX`, `HUGE_FILE`) are readable and not writable; every other bit `EOPNOTSUPP`, and a refused word is *not stored* |
+| the flags a *filesystem* has no attribute word for | `src/vfs/mod.rs` (`Inode::flags` default) | Refused `ENOTTY` on both requests — Linux's answer for a filesystem with no `fileattr` half: procfs, sysfs, devfs, a pipe, a socket |
 
 ---
 
@@ -240,6 +243,37 @@ the commit bodies), and each moved its pin in the same commit.
    that never converges. It is what `niri` was spinning on (`PLAN.md` §7.4). Owner:
    `src/vfs/file.rs` + `src/syscall/linux/fs.rs`. Pin: `t-stat-consistency`, which
    checks both doors on `/tmp` and on `/run/user/0`, in the order the protocol uses.
+
+4. **`lsattr`'s `Not a tty` was an unimplemented ioctl family, and the file it
+   reads did something worse than not exist.** The four commands measured in
+   `PLAN.md` §12.4b turned out to be busybox applets, three of them asking for a
+   file or directory this kernel did not have (`/proc/modules`,
+   `/proc/self/mountinfo`, `/sys/bus/usb/devices`, `/sys/block`) and one asking
+   for a word the `'f'` family never answered. Owners:
+   `src/vfs/procfs.rs`, `src/vfs/sysfs.rs`, `src/syscall/linux/fs.rs`,
+   `src/vfs/ext4/`, `src/vfs/ramfs.rs`. Pins: `t-mountinfo` and `t-fsflags` on
+   the machine, plus host tests for the renderings and the refusals. Closes
+   `PLAN.md` §12.4b.
+
+5. **`/proc/self/mountinfo`'s third field is now the same number `stat` reports,
+   and it had to be.** The column `lsblk` fills by matching it against
+   `/sys/class/block/<name>/dev` was blank because this kernel put the mount
+   table's attachment counter there; the *identity* the counter carries is still
+   there, under `fs_of_path`/`fs_id_of_inode`, and the reported number is
+   `dev_of_path`/`dev_of_inode` — the device behind the filesystem, or an
+   anonymous number for a pseudo-filesystem, which is Linux's own split. The same
+   change makes `/dev/vda2` report its `st_rdev`, which it never had. Owner:
+   `src/vfs/mount.rs` + `src/syscall/linux/fs.rs`. Pin: host tests that a mount
+   record's device is what `stat` answers for its mountpoint, and `t-mountinfo`
+   comparing the file against `stat("/")` on the machine.
+
+6. **`/proc/mounts` and `/proc/self/mountinfo` were leaving the root filesystem
+   out.** The root's record required a *source*, and only a promoted mount ever
+   supplied one, so a kernel-booted root was reported as not mounted at all —
+   to `df`, to `findmnt`, and to `switch_root`'s own grep. Linux prints the
+   filesystem's type there (`rootfs / rootfs rw 0 0`), and this does now.
+   Owner: `src/vfs/mount.rs`. Pin: `t-mountinfo` (the `-`-field line for `/`,
+   and its device against `stat("/")`).
 
 ### 5.2 Small, measured, and not yet landed
 

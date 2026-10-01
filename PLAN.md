@@ -42,6 +42,14 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         per-file opt-in (§3.2)
   - [x] ext4 `atime` bumped on read, with Linux's `relatime` rule so a read
         that sees no change costs no device write (§3.3)
+  - [~] inode attribute flags — `FS_IOC_GETFLAGS`/`SETFLAGS`, `lsattr`/`chattr`'s
+        word, with `IMMUTABLE` and `APPEND` *enforced* rather than stored
+        (`t-fsflags`; ext4 persists `i_flags`, ramfs keeps the same subset) · the
+        flags this kernel cannot honour are `EOPNOTSUPP`, never stored (§12.4b)
+  - [x] the files the machine's `ls*` tools open: `/proc/modules`,
+        `/proc/self/mountinfo` (and `/proc/<pid>/mounts`), `/sys/block` with a
+        partition's `size`/`partition`, and an empty `/sys/bus/usb/devices`
+        (`t-mountinfo`, `t-fsflags`) (§12.4b)
 
 **Networking (Phase 4)**
 - [x] 4.1 AF_UNIX — `SOCK_STREAM` bind/listen/connect/accept · data path ·
@@ -975,6 +983,25 @@ things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
 Syscalls the dispatch still falls through to `ENOSYS` (each prints once via
 `note_enosys`), grouped by what they block. These, plus the four foundational
 behaviours below, are the whole of what is left to reach "full Linux ABI".
+
+**Machines that are not there, and the answers that are honest because of it:**
+- **No USB host controller, and no driver for one.** `/sys/bus/usb/devices` is
+  therefore an empty directory - which is what Linux registers on a machine with
+  no USB - and `lsusb` prints nothing and exits 0. A tree with anything in it
+  would be a device this kernel cannot enumerate; the directory says what is true
+  rather than what is hoped for. (`t-mountinfo` pins the empty directory.)
+- **No loadable modules.** Every driver is compiled into the image, so
+  `/proc/modules` is an empty file - what `lsmod` reads as a header and no rows,
+  exactly as it does on a Linux built with no modules. A file that said "cannot
+  tell you" would be the worse answer, since `lsmod` has no vocabulary for it.
+- **The inode flags this kernel cannot keep** are refused with `EOPNOTSUPP`
+  rather than stored and ignored: compression, encryption, fs-verity, casefold,
+  project inherit, inline data, DAX, no-COW, journal-data, tail-merge, top-of-tree,
+  secure-delete/undelete, AFS magic naming, extended-attribute inodes and the
+  sparse-tail bit. `INODE_FL_VISIBLE`/`INODE_FL_MODIFIABLE` in `src/vfs/mod.rs`
+  is the list, each bit named so a caller is refused for the right reason, and
+  the three the ext4 driver owns (the extent tree, the directory index, the
+  block-counting unit) are readable and not writable (§12.4b).
 
 **File-watch / service infrastructure (the big one for daemons):**
 - `inotify_init1` (294) / `inotify_add_watch` (254) / `inotify_rm_watch` (255) —
@@ -6033,6 +6060,123 @@ left out by tests.toml`. Worth quoting for one reason beyond the green: the test
 QEMU line still reads `-device virtio-gpu-pci`, which is the new key's *default*, so the sweep
 boots exactly the machine it booted before - and that is why a machine key written for an
 interactive `run` cannot silently move the gate.
+
+### 12.4b The machine's own tools, and the inode flag word — **DONE, gate green `pass=139 fail=0`**
+
+Reported from the shell of the running image, four commands that could not run:
+
+```
+mpos:~# lsattr          lsattr: reading ./README: Not a tty
+mpos:~# lsblk           lsblk: can't read '/proc/self/mountinfo': No such file or directory
+mpos:~# lsusb           lsusb: /sys/bus/usb/devices: No such file or directory
+mpos:~# lsmod           lsmod: /proc/modules: No such file or directory
+```
+
+Four different causes, and none of them was the command. The identity of the
+commands came first, because everything else depends on it: **all four are
+busybox 1.38.0-r7 applets** — `/bin/lsblk`, `/bin/lsattr`, `/usr/bin/lsusb` and
+`/sbin/lsmod` are symlinks to `/bin/busybox`, created by the `busybox --install
+-s` that apk's post-install trigger runs inside the build's chroot. That is not
+what Alpine's package index says (`/bin/lsblk` there is util-linux's, `/usr/bin/lsusb`
+is usbutils'), and it is why every interface below was *measured against the
+binary in this image* rather than reasoned from a man page - the image was mounted
+read-only and each applet run under `chroot`, against the host's `/sys`, against
+`/proc` files written by hand, and against synthetic `/sys` trees built to this
+kernel's shape.
+
+Three of the four causes were files that did not exist, and the fourth was worse:
+a *number* that was wrong. `lsattr`'s `Not a tty` is musl's `strerror(ENOTTY)` -
+the `'f'` ioctl family had no handler. `lsblk` died on `/proc/self/mountinfo`,
+which this kernel did not have at all. `lsusb` and `lsmod` asked for a directory
+and a file that were not there. And `lsblk` would have died a second time on
+`/sys/block`, which was also absent - measured: without it, `can't open
+'/sys/block'` and exit 1, whatever else the tree holds.
+
+**The one that was not a missing file: `st_dev`.** `lsblk` builds its MOUNTPOINTS
+column by matching mountinfo's third field against the `dev` numbers
+`/sys/class/block/<name>/dev` publishes. This kernel reported the mount table's
+own attachment counter there - `/` was `0`, the first mount `1` - so even a
+faithfully-shaped mountinfo would have left that column blank, and the same field
+is what `df`'s `Filesystem` column and `findmnt` key on. Measured with a mockup
+before the change: the device table came out right and the mount points column
+came out empty. Linux answers with the *superblock's device*, and `mount(2)`
+resolves the source to one (`lookup_bdev`); the same resolution now happens at
+the same place here, and the number travels with the mount. A pseudo-filesystem
+gets an anonymous number - major 0, from its own counter, as Linux gives one -
+because `0` is not a candidate: a `dev_t` of zero means "no device" and two of
+those compare equal whatever serves them. The mount's attachment identity is kept
+as well, and the two are used for what each is for: the identity keys locks, unix
+sockets and the `EXDEV` decision, the device number is what `stat` reports. The
+same change found `/dev/vda2` reporting `st_rdev` of 0 - `DevBlockNode` had never
+implemented `rdev` - so `ls -l /dev/vda2` had no `254, 2` to print either.
+
+**The flag word, and what makes it worth having.** `FS_IOC_SETFLAGS` that stored
+what it was handed would have closed this report and been worthless: `chattr +i`
+would have protected nothing. So the two bits that mean something are *enforced* -
+`IMMUTABLE` refuses the write, the write-open, the truncate, the removal, the
+rename, the second link and every metadata change; `APPEND` refuses everything a
+truncation would do and every write that is not going to the end - in the helpers
+that already exist for refusals, which is how `unlink`, `rmdir` and the
+copy-and-unlink `rename` is emulated with all refuse together. The four remaining
+flags are accepted because something reads them: `NOATIME` where the access time
+would move, `NODUMP` because its whole meaning is a promise *to userland* that
+reads it back, `SYNC`/`DIRSYNC` because a write-through filesystem already keeps
+that promise. Everything else is `EOPNOTSUPP`, including every bit Linux's own
+`FS_*` vocabulary names and this kernel cannot keep - the list is in "Remaining
+ABI support" above, and `AGENTS.md` §4's second governing rule - "answer
+truthfully, or refuse" - is why it is a refusal rather than a stored bit.
+
+**Two corrections that only the pins could produce.** Writing the enforcement test
+first caught the kernel: `may_create_in` had been given an append-only check, and
+Linux's `may_create` has none - an append-only directory "can only be added to",
+so a name *may* be created in it and only removal is refused. And the gate caught
+a lie older than this work: both `/proc/mounts` and `/proc/self/mountinfo` left
+the root filesystem out entirely, because the root's record required a *source*
+and only a promoted mount ever supplied one - so `/` was reported as not mounted
+at all, to every `df`, every `findmnt`, and `switch_root`'s own grep. Linux prints
+the filesystem's type there (`rootfs / rootfs rw 0 0`), and now so does this.
+
+**Measured, on the real image.** `cargo xtask run --mode terminal`, then at the
+login:
+
+```
+mpos:~# lsattr /root/README /root/start-weston.sh
+--------------e----- /root/README
+--------------e----- /root/start-weston.sh
+mpos:~# lsblk
+NAME            MAJ:MIN  SIZE TYPE MOUNTPOINTS
+vda             254:0   2048M disk
+vda1            254:1    128M part
+vda2            254:2   1918M part /
+mpos:~# lsusb; echo $?
+0
+mpos:~# lsmod; echo $?
+Module                  Size  Used by    Not tainted
+0
+mpos:~# df -h /
+Filesystem                Size      Used Available Use% Mounted on
+/dev/vda2                 1.9G    916.1M   1001.9M  48% /
+mpos:~# chattr +i /root/README; lsattr /root/README
+----i---------e----- /root/README
+mpos:~# echo x >> /root/README
+-sh: can't create /root/README: Operation not permitted
+mpos:~# rm /root/README
+rm: can't remove '/root/README': Operation not permitted
+mpos:~# chattr -i /root/README; echo ok >> /root/README
+```
+
+`lsattr` prints what it prints on this host's ext4; `lsblk` fills the column that
+was blank; `lsusb` and `lsmod` are the honest-empty answers; and `chattr +i` is a
+switch that really closes and really opens.
+
+**Gate, quoted from its own summary**: host `665 passed`; xtask `36 passed`; guest
+`=== SUMMARY pass=139 fail=0 (139 built)`, QEMU exit `33`, with `t-fsflags` and
+`t-mountinfo` among the 139 and `10 of 149 user tests left out by tests.toml`.
+One thing the gate does *not* cover, named rather than assumed: the block tree's
+shape. The test machine boots with no disk at all, so `/sys/block` has nothing in
+it to walk; the shape of a disk's entry, its partitions and their
+`size`/`partition` attributes is pinned by host tests that build the tree from a
+numbering they write down, and the real thing is what the run above shows.
 
 ### 12.5 Deliberately not in this phase
 
