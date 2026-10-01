@@ -1110,13 +1110,90 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_VIRTGPU_MAP => virtgpu_map(arg),
         NR_VIRTGPU_WAIT => virtgpu_wait(arg),
         NR_VIRTGPU_TRANSFER_TO_HOST => virtgpu_transfer_to_host(arg),
-        NR_VIRTGPU_GET_CAPS => crate::drm_virtgpu::CAPS,
+        NR_VIRTGPU_GET_CAPS => virtgpu_get_caps(arg),
         NR_VIRTGPU_EXECBUFFER => crate::drm_virtgpu::EXECBUFFER,
         NR_VIRTGPU_TRANSFER_FROM_HOST => crate::drm_virtgpu::TRANSFER_FROM_HOST,
         NR_VIRTGPU_CONTEXT_INIT => crate::drm_virtgpu::CONTEXT_INIT,
         NR_VIRTGPU_RESOURCE_CREATE_BLOB => crate::drm_virtgpu::RESOURCE_CREATE_BLOB,
         _ => -25, // ENOTTY
     }
+}
+
+/// What the GPU driver negotiated and the cap sets it fetched, published once.
+///
+/// The ioctl path cannot reach the device - the render task owns it - and none
+/// of these values changes after negotiation, so they are handed over once
+/// (`video/render.rs`, at the task's start) rather than asked for per request.
+/// Before that publication this is the "no card" shape, which is what a machine
+/// whose GPU never came up owes a caller: every 3D answer `0`, every 3D request
+/// refused, rather than anything a caller could read as a capability.
+struct Published {
+    /// The card, as `drm_virtgpu::Card` describes it.
+    card: crate::drm_virtgpu::Card,
+    /// How many cap sets the *device* said it had.
+    ///
+    /// Kept apart from `capsets.len()`, which can be smaller: a set whose fetch
+    /// failed is skipped, and the walk stays honest about the others. This is
+    /// what `GET_CAPS`'s `ENOSYS` is gated on, because Linux's gate is the
+    /// device's own count - so a card that offered two sets and produced one
+    /// answers `EINVAL` for the other rather than `ENOSYS` for the family.
+    num_capsets: u32,
+    /// The sets that were fetched, in the order the device named them.
+    capsets: Vec<crate::drm_virtgpu::Capset>,
+}
+
+static PUBLISHED: Mutex<RefCell<Published>> = Mutex::new(RefCell::new(Published {
+    card: crate::drm_virtgpu::Card::NONE,
+    num_capsets: 0,
+    capsets: Vec::new(),
+}));
+
+/// Hand the DRM layer what the GPU driver negotiated.
+///
+/// Called once, by the task that owns the device. It is a plain setter rather
+/// than something the ioctl path could also reach, because there is exactly one
+/// moment at which the answer is knowable and exactly one task that knows it.
+pub fn publish_card(
+    card: crate::drm_virtgpu::Card,
+    num_capsets: u32,
+    capsets: &[crate::drm_virtgpu::Capset],
+) {
+    critical_section::with(|cs| {
+        let mut published = PUBLISHED.borrow(cs).borrow_mut();
+        published.card = card;
+        published.num_capsets = num_capsets;
+        published.capsets.clear();
+        published.capsets.extend_from_slice(capsets);
+    });
+}
+
+/// The card to answer a `DRM_VIRTGPU_*` request from.
+fn card() -> crate::drm_virtgpu::Card {
+    critical_section::with(|cs| PUBLISHED.borrow(cs).borrow().card)
+}
+
+/// How many cap sets the device claimed - see [`Published::num_capsets`].
+fn num_capsets() -> u32 {
+    critical_section::with(|cs| PUBLISHED.borrow(cs).borrow().num_capsets)
+}
+
+/// The cap set `id` offers at `version`, or `None` if it offers neither.
+///
+/// Linux's search, down to the comparison: it accepts `id == cap_set_id` with
+/// `max_version >= cap_set_ver`, so a caller may ask for any version the set is
+/// good for rather than only the newest one it could have named. A set that is
+/// not there, or a version past what it has, is `EINVAL` - which is what `None`
+/// becomes at the one place that asks.
+fn capset(id: u32, version: u32) -> Option<crate::drm_virtgpu::Capset> {
+    critical_section::with(|cs| {
+        PUBLISHED
+            .borrow(cs)
+            .borrow()
+            .capsets
+            .iter()
+            .find(|c| c.id == id && c.max_version >= version)
+            .cloned()
+    })
 }
 
 /// `DRM_VIRTGPU_GETPARAM`: `struct drm_virtgpu_getparam { u64 param; u64 value; }`
@@ -1133,13 +1210,13 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
 /// wrong with the question rather than with its buffer. Measured - `GETPARAM(0)`,
 /// `(9)` and `(100)` all answer `EINVAL` on a real card.
 ///
-/// The card is `NONE` until a driver publishes the one it negotiated: the
-/// answers are a statement about what this kernel can do, and a machine whose
-/// GPU has not come up can do none of it. `drm_virtgpu::Card` carries the rest
-/// of that story.
+/// The card the answers come from is the one the GPU driver published
+/// ([`Published`]); before that publication it is `Card::NONE`, because the
+/// answers are a statement about what this kernel can do and a machine whose GPU
+/// has not come up can do none of it.
 fn virtgpu_getparam(arg: usize) -> isize {
     let param = unsafe { (arg as *const u64).read_unaligned() };
-    let Ok(value) = crate::drm_virtgpu::param(param, &crate::drm_virtgpu::Card::NONE) else {
+    let Ok(value) = crate::drm_virtgpu::param(param, &card()) else {
         return crate::err::EINVAL;
     };
     let out = unsafe { ((arg + 8) as *const u64).read_unaligned() } as *mut i32;
@@ -1147,6 +1224,53 @@ fn virtgpu_getparam(arg: usize) -> isize {
         return crate::err::EFAULT;
     }
     unsafe { out.write_unaligned(value as i32) };
+    0
+}
+
+/// `DRM_VIRTGPU_GET_CAPS`: `struct drm_virtgpu_get_caps { u32 cap_set_id;
+/// u32 cap_set_ver; u64 addr; u32 size; }`, where `addr` is the caller's buffer
+/// and `size` how much of it may be written.
+///
+/// Linux's order, which the measurement backs at every step: a card with no cap
+/// sets at all answers `ENOSYS` for the whole request; a caller that asked for
+/// nothing is `EINVAL`; a set that is not offered, or not at the version asked
+/// for, is `EINVAL`; and only then is the buffer looked at. A copy *smaller* than
+/// the set is a **success** - `min(caller, device)`, which is the half of this
+/// rule a guess gets wrong, and `drm_virtgpu::caps_may_copy` is where it lives.
+///
+/// The bytes come out of the cache the render task built at bring-up, so this
+/// never touches the device. `GET_CAPS` is a request a compositor makes on every
+/// startup, and a control-queue round trip per set would be one per startup.
+fn virtgpu_get_caps(arg: usize) -> isize {
+    // struct drm_virtgpu_get_caps: cap_set_id@0, cap_set_ver@4, addr@8 (u64),
+    // size@16.
+    let id = unsafe { (arg as *const u32).read_unaligned() };
+    let version = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    let addr = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
+    let size = unsafe { ((arg + 16) as *const u32).read_unaligned() };
+
+    if num_capsets() == 0 {
+        return crate::drm_virtgpu::CAPS;
+    }
+    let Some(set) = capset(id, version) else {
+        // Not offered, or a version past what the set has. Linux answers the
+        // same `EINVAL` for both, so there is nothing to tell apart here.
+        return crate::err::EINVAL;
+    };
+    let Ok(copy) = crate::drm_virtgpu::caps_may_copy(size, set.max_size) else {
+        return crate::err::EINVAL;
+    };
+    if !crate::uaccess::buffer_ok(addr, copy, true, true) {
+        return crate::err::EFAULT;
+    }
+    // SAFETY: the destination is the caller's, and `buffer_ok` has just checked
+    // that all `copy` bytes of it are mapped and writable. The source is the
+    // cache's own `Vec`, which is exactly `max_size` bytes: a fetch that came
+    // back short is not cached at all (`gpu_ctrl::get_capset` refuses it), so
+    // `copy <= max_size` is within it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(set.bytes.as_ptr(), addr as *mut u8, copy);
+    }
     0
 }
 

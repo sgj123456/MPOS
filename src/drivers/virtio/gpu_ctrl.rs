@@ -149,6 +149,14 @@ pub struct Gpu {
     /// The rectangle the scanout was last set to, which `flush` needs and
     /// `change_resolution` is the only thing that sets.
     rect: Option<abi::Rect>,
+    /// How many cap sets the device's configuration says it has.
+    ///
+    /// Read once at bring-up, and it is what bounds the walk that builds the
+    /// cap set table: the DRM layer asks `GET_CAPSET_INFO` for indices `0..this`
+    /// and no further, so a device that answered one index more than it has is
+    /// never asked. Zero on a device with no 3D, which is what makes the walk
+    /// empty rather than a reason to skip it.
+    num_capsets: u32,
 }
 
 impl Gpu {
@@ -169,6 +177,12 @@ impl Gpu {
             agreed.contains(abi::Features::RING_INDIRECT_DESC),
             agreed.contains(abi::Features::RING_EVENT_IDX),
         )?;
+        // Read before `finish_init` for the same reason the queue is built
+        // before it: the config space is the transport's, and this is the last
+        // moment this function holds it. A device that has no cap sets answers
+        // zero here, which is the honest bound for the walk that follows.
+        let num_capsets =
+            virtio_drivers::config::read_config!(transport, abi::Config, num_capsets)?;
         transport.finish_init();
 
         Ok(Gpu {
@@ -182,7 +196,13 @@ impl Gpu {
             flight: 0,
             fb: None,
             rect: None,
+            num_capsets,
         })
+    }
+
+    /// How many cap sets the device says it has - see the field's own note.
+    pub fn num_capsets(&self) -> u32 {
+        self.num_capsets
     }
 
     /// What the transport agreed to, which is what every 3D answer is gated on.
@@ -517,8 +537,11 @@ impl Gpu {
     ///
     /// The name is truncated the way Linux's `strscpy` truncates it, to one byte
     /// less than the field so the last byte stays a terminator, and `nlen` is
-    /// what was actually copied rather than what was offered.
-    pub fn ctx_create(&mut self, id: u32, context_init: u32, name: &str) -> Result<(), Error> {
+    /// what was actually copied rather than what was offered. It is bytes rather
+    /// than a `&str` because that is what the field is and what the DRM layer
+    /// has: the name arrives from a user pointer, and refusing a name that is not
+    /// UTF-8 would refuse one Linux accepts.
+    pub fn ctx_create(&mut self, id: u32, context_init: u32, name: &[u8]) -> Result<(), Error> {
         let mut command = abi::CtxCreate {
             header: abi::CtrlHeader {
                 kind: abi::CMD_CTX_CREATE,
@@ -531,7 +554,7 @@ impl Gpu {
         };
         let room = command.debug_name.len() - 1;
         let n = name.len().min(room);
-        command.debug_name[..n].copy_from_slice(&name.as_bytes()[..n]);
+        command.debug_name[..n].copy_from_slice(&name[..n]);
         command.nlen = n as u32;
         self.ok(&command)
     }
@@ -580,18 +603,23 @@ impl Gpu {
         })
     }
 
-    /// Create a 3D resource in context `ctx`, from the caller's own fields.
+    /// Create a 3D resource, from the caller's own fields.
     ///
     /// The whole struct rather than eleven arguments, because every field is the
     /// caller's: the DRM layer has a `drm_virtgpu_resource_create` in its hand
-    /// and the mapping between the two is its business, not this driver's. What
-    /// is *set* here rather than taken is the header's command word and
-    /// `ctx_id` - a resource created under the 2D command, or in the wrong
-    /// context, is one the stream that wants it cannot name.
-    pub fn create_3d(&mut self, ctx: u32, request: &abi::ResourceCreate3d) -> Result<(), Error> {
+    /// and the mapping between the two is its business, not this driver's.
+    ///
+    /// **No context**, and that is Linux's shape rather than an omission:
+    /// `virtio_gpu_cmd_resource_create_3d` fills in the resource fields and
+    /// leaves the header's `ctx_id` zero, so a 3D resource is born unattached
+    /// and the context that may name it is told afterwards by
+    /// [`ctx_attach_resource`][Self::ctx_attach_resource]. The header's command
+    /// word is the one thing set here, because it is the one thing that decides
+    /// whether the device reads these fields as a 3D resource at all.
+    pub fn create_3d(&mut self, request: &abi::ResourceCreate3d) -> Result<(), Error> {
         let mut command = *request;
         command.header.kind = abi::CMD_RESOURCE_CREATE_3D;
-        command.header.ctx_id = ctx;
+        command.header.ctx_id = 0;
         self.ok(&command)
     }
 

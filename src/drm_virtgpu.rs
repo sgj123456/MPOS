@@ -1,20 +1,27 @@
-//! The `DRM_VIRTGPU_*` family: what a card with no 3D behind it answers, and why
+//! The `DRM_VIRTGPU_*` family: what this card answers, card by card, and why
 //! each answer is Linux's.
 //!
 //! The family is how Mesa's virgl driver and every Vulkan-on-virtio-gpu stack
 //! reach the device: `GETPARAM` to learn what the card can do, `EXECBUFFER` to
 //! submit a command stream, `TRANSFER_*` to move pixels, `RESOURCE_CREATE` to
-//! allocate. This card has none of that yet - the 3D control queue and the
-//! resource it would allocate are the work `PLAN.md` §7.4 names - and the point
-//! of this module is the other half of that sentence: what a caller should hear
-//! *in the meantime*.
+//! allocate. There are two machines to answer for - one whose GPU is a
+//! `virtio-gpu-pci` with no 3D behind it, and one whose GPU is a
+//! `virtio-gpu-gl-pci` with virgl - and the point of this module is that the
+//! answers are a *function of which*, not a constant.
 //!
-//! The answer is not "nothing", which is what the card said before: every one of
-//! the eleven requests fell to the DRM tail's `ENOTTY`, and Linux answers that
+//! [`Card`] is that function's input and [`param`] is its most visible arm: the
+//! same request answers `0` and `1` on the two machines. The rest of the family
+//! splits the same way - a card with no cap sets answers `GET_CAPS` `ENOSYS`
+//! while a GL card serves its sets out of [`Capset`] - and the handlers that
+//! make that split live in `drivers/drm.rs`, which is where the resource table
+//! and the per-open-file context are too.
+//!
+//! The answers are not "nothing", which is what the card said before: every one
+//! of the eleven requests fell to the DRM tail's `ENOTTY`, and Linux answers that
 //! code for a request its core does not know, never for one a registered driver
-//! declines. The measurement the answers below are taken from is in
-//! `user/staging/virtgpu-probe/`: a real Linux 6.12 on a `virtio-gpu-pci` card
-//! with no virgl behind it, every request issued and every errno recorded.
+//! declines. The measurement everything here is taken from is in
+//! `user/staging/virtgpu-probe/`: a real Linux 6.12 booted twice on this host,
+//! once per card shape, every request issued and every errno recorded.
 //!
 //! What that measurement says, and what this module encodes, is that **the
 //! refusals are per-request facts rather than one gate on the family**. A card
@@ -60,6 +67,8 @@
 //! Nothing here is `cfg`-gated, for the same reason `drm_sync.rs` and
 //! `drm_blob.rs` are not: these are decisions about numbers, and a decision
 //! about a number is worth a host test rather than a boot.
+
+use alloc::vec::Vec;
 
 use crate::err::{EINVAL, ENOSYS};
 
@@ -189,38 +198,92 @@ pub fn caps_may_copy(caller_size: u32, host_max_size: u32) -> Result<usize, isiz
     Ok(caller_size.min(host_max_size) as usize)
 }
 
-/// What `GET_CAPS` answers: `ENOSYS`, which is Linux's answer on a card whose
-/// device reported no cap sets at all (measured).
+/// One cap set, described and held.
 ///
-/// It is this card's answer even on a GL machine, where the device *would* offer
-/// VIRGL and VIRGL2, and the reason is the same as `3D_FEATURES`'s: fetching a
-/// capset is `GET_CAPSET` on the control queue, and a capset this kernel cannot
-/// fetch is one it cannot hand over. Answering `ENOSYS` rather than an empty
-/// buffer is the difference between "there is nothing here for you" and a
-/// capability word of zeroes a caller would read as a real answer.
+/// The three metadata fields are `GET_CAPSET_INFO`'s answer and `bytes` is the
+/// set itself, fetched once at bring-up rather than per request. That is Linux's
+/// shape too - it keeps a `cap_cache` list and `virtio_gpu_get_caps_ioctl` walks
+/// it before it will talk to the hardware - and the reason is the same here as
+/// there: fetching is a control-queue round trip, and `GET_CAPS` is a request a
+/// caller may make on every startup.
+///
+/// The metadata is kept beside the bytes rather than derived from them because
+/// the two answer different questions: `max_size` is what the *device* promised
+/// (and what bounds a fetch), while `bytes.len()` is what it actually sent. A
+/// device that sent short is one this module refuses to have cached at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Capset {
+    pub id: u32,
+    pub max_version: u32,
+    pub max_size: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// The `GETPARAM(7)` mask for a table of cap sets: bit `n` set means set `n`.
+///
+/// The one place the family's two spellings of the same fact meet. Linux keeps
+/// `capset_id_mask` beside its cap set array for exactly this reason, and the
+/// measured GL card is where they agree: two sets with ids 1 and 2 are the mask
+/// `6`, which is what `GETPARAM(7)` answered.
+///
+/// An id of 32 or more has no bit and is dropped rather than shifted - the
+/// parameter is a `u32` mask, so a set numbered past its width is one no caller
+/// could ever ask for. Nothing measured goes near it; a device that claimed one
+/// would be describing a set its own parameter cannot name.
+pub fn table_mask(capsets: &[Capset]) -> u32 {
+    let mut mask = 0;
+    for capset in capsets {
+        if capset.id < 32 {
+            mask |= 1 << capset.id;
+        }
+    }
+    mask
+}
+
+/// What `GET_CAPS` answers on a card with no cap sets at all: `ENOSYS`.
+///
+/// Linux's gate is `num_capsets == 0`, and the measurement agrees - a
+/// `virtio-gpu-pci` card answers `ENOSYS` to every set asked for. It is **not**
+/// the family's one answer: a GL card has two sets and serves them, which is
+/// what [`Capset`] and [`caps_may_copy`] are for, and the handler that serves
+/// them is `drivers/drm.rs`. `ENOSYS` rather than an empty buffer is the
+/// difference between "there is nothing here for you" and a capability word of
+/// zeroes a caller would read as a real answer.
 pub const CAPS: isize = ENOSYS;
 
-/// `EXECBUFFER` refuses `ENOSYS`: submitting a command stream is the 3D path,
-/// and this kernel has no context to submit it to. Measured as a real card's
-/// answer when no virgl is negotiated.
+/// `EXECBUFFER` on a card with no 3D: `ENOSYS`.
+///
+/// Submitting a command stream is the 3D path, and a card that negotiated no
+/// `VIRGL` has no context to submit it to - which is the measured answer rather
+/// than a guess. Where there *is* a context the request is served, and
+/// `drivers/drm.rs` is where the two are told apart.
 pub const EXECBUFFER: isize = ENOSYS;
 
-/// `TRANSFER_FROM_HOST` refuses `ENOSYS`, and `TRANSFER_TO_HOST` does *not* -
-/// the asymmetry is Linux's and was the least guessable thing in the
-/// measurement: a card without 3D transfers *to* the host through the 2D
-/// command, so the request succeeds, while the reverse direction has only the
-/// 3D command and is refused. This card implements neither yet, so both are
-/// named here rather than left to look symmetric.
+/// `TRANSFER_FROM_HOST` on a card with no 3D: `ENOSYS`.
+///
+/// `TRANSFER_TO_HOST` does **not** refuse, and the asymmetry is Linux's and was
+/// the least guessable thing in the measurement: a card without 3D transfers
+/// *to* the host through the 2D command, so the request succeeds, while the
+/// reverse direction has only the 3D command and is refused. Writing the pair
+/// down rather than leaving them to look symmetric is the point.
 pub const TRANSFER_FROM_HOST: isize = ENOSYS;
 
-/// `CONTEXT_INIT` refuses `EINVAL` - not `ENOSYS`, which is what a guess would
-/// pick. Measured: the driver's gate is `!has_context_init || !has_virgl_3d`
-/// and it answers `EINVAL` for both.
+/// `CONTEXT_INIT` on a card with no 3D: `EINVAL`, not `ENOSYS`.
+///
+/// Measured, and it is what a guess gets wrong: the driver's gate is
+/// `!has_context_init || !has_virgl_3d` and both halves answer `EINVAL`. With
+/// both features the request is served - and on a card whose context is made
+/// lazily it answers `EEXIST` the second time, which is the measurement's most
+/// counter-intuitive line.
 pub const CONTEXT_INIT: isize = EINVAL;
 
-/// `RESOURCE_CREATE_BLOB` refuses `EINVAL`: the driver's blob check answers it
-/// when the device did not offer `VIRTIO_GPU_F_RESOURCE_BLOB`, which a card
-/// without 3D does not.
+/// `RESOURCE_CREATE_BLOB` on a card with no blobs: `EINVAL`.
+///
+/// Measured on **both** cards, GL included: the driver's blob check answers
+/// `EINVAL` when the device did not offer `VIRTIO_GPU_F_RESOURCE_BLOB`, and the
+/// GL card this work was measured against does not. Since this kernel has no
+/// blob command either, the answer is the same wherever the request arrives and
+/// there is no second case to write.
 pub const RESOURCE_CREATE_BLOB: isize = EINVAL;
 
 /// The `target` a 2D resource is created with. The only value a card without 3D
@@ -342,6 +405,36 @@ mod tests {
         // A set the device reports as empty copies nothing and still succeeds:
         // the `0` below is the caller's own size coming back, not an error.
         assert_eq!(caps_may_copy(16, 0), Ok(0));
+    }
+
+    /// The mask and the table are two spellings of one fact, and the measured
+    /// card is where they agree.
+    #[test]
+    fn the_capset_mask_is_the_table() {
+        let capsets = |ids: &[u32]| -> Vec<Capset> {
+            ids.iter()
+                .map(|&id| Capset {
+                    id,
+                    max_version: 1,
+                    max_size: 308,
+                    bytes: Vec::new(),
+                })
+                .collect()
+        };
+        assert_eq!(table_mask(&capsets(&[])), 0);
+        // The measured GL card: VIRGL and VIRGL2, which `GETPARAM(7)` answered
+        // as `6`. If these two ever disagree the card is describing a cap set
+        // its own parameter cannot name.
+        assert_eq!(table_mask(&capsets(&[1, 2])), 6);
+        assert_eq!(table_mask(&capsets(&[1])), 2);
+        assert_eq!(table_mask(&capsets(&[2])), 4);
+        // Order does not matter and neither does a repeat - a device that
+        // listed a set twice offers one set.
+        assert_eq!(table_mask(&capsets(&[2, 1, 1])), 6);
+        // An id with no bit in a `u32` is dropped rather than shifted, which is
+        // the difference between a mask and undefined behaviour.
+        assert_eq!(table_mask(&capsets(&[1, 32, 64])), 2);
+        assert_eq!(table_mask(&capsets(&[31])), 1 << 31);
     }
 
     /// The non-virgl validation is the driver's, field by field.
