@@ -254,7 +254,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             if let Some(path) = label.as_deref()
                 && let Ok(file) = crate::sched::current_fds().clone_at(fd)
             {
-                file.set_dev(crate::vfs::mount::fs_of_path(&absolute(path)).0);
+                file.set_dev(crate::vfs::mount::dev_of_path(&absolute(path)));
             }
             // A directory description remembers the path it was opened by, so
             // a later `fchdir` can give the cwd a name `getcwd` reads back. A
@@ -397,8 +397,8 @@ pub(super) fn fstat(args: [usize; ARG_COUNT]) -> isize {
                 let dev = match file.dev() {
                     Some(dev) => dev,
                     None => match file.label() {
-                        Some(path) => crate::vfs::mount::fs_of_path(&path).0,
-                        None => crate::vfs::mount::fs_id_of_inode(&inode),
+                        Some(path) => crate::vfs::mount::dev_of_path(&path),
+                        None => crate::vfs::mount::dev_of_inode(&inode),
                     },
                 };
                 (
@@ -622,8 +622,8 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
                     let dev = match file.dev() {
                         Some(dev) => dev,
                         None => match file.label() {
-                            Some(path) => crate::vfs::mount::fs_of_path(&path).0,
-                            None => crate::vfs::mount::fs_id_of_inode(&inode),
+                            Some(path) => crate::vfs::mount::dev_of_path(&path),
+                            None => crate::vfs::mount::dev_of_inode(&inode),
                         },
                     };
                     (
@@ -684,7 +684,7 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
             Err(e) => return err_of(e),
         }
     };
-    let (dev, _fstype) = crate::vfs::mount::fs_of_path(&absolute(&path));
+    let dev = crate::vfs::mount::dev_of_path(&absolute(&path));
     write_stat(buf, &meta, dev, rdev, stored, nlink, owner, times)
 }
 
@@ -1742,6 +1742,15 @@ fn mount_new(
         return err::ENOTDIR;
     }
 
+    // The device the source named, when it named one: this is the number
+    // `stat` will report as `st_dev` for everything under the new mount, and
+    // the reason it is decided *here* rather than in the VFS is that this is
+    // where the source stopped being a string and became a device - Linux's
+    // own `lookup_bdev`, in the same place. A type whose source is a name
+    // rather than a path ("proc", "tmpfs", a 9p tag) leaves it `None` and gets
+    // an anonymous number, which is what Linux gives a pseudo-filesystem.
+    let mut source_dev: Option<u64> = None;
+
     let fs: alloc::sync::Arc<dyn crate::vfs::FileSystem> = match fstype {
         // The block types. The source names a device node; the node knows
         // which storage it stands for.
@@ -1756,6 +1765,15 @@ fn mount_new(
             let Some(dev) = dev_node.as_block() else {
                 return err::ENOTBLK;
             };
+            // A block node's own `st_rdev`, which is its identity in the
+            // numbering `/sys/class/block`, `/dev` and a `add` event all agree
+            // on. Taking it from the node rather than re-deriving it from the
+            // source string means a caller that reached the same device by
+            // another name - a bind, a different `/dev` entry - still mounts
+            // it under the device's own number.
+            source_dev = dev_node
+                .rdev()
+                .map(|(major, minor)| crate::uevent::makedev(major, minor));
             match crate::vfs::ext4::Ext4Fs::mount(dev) {
                 Ok(fs) => alloc::sync::Arc::new(fs) as alloc::sync::Arc<dyn crate::vfs::FileSystem>,
                 Err(_) => return err::EINVAL,
@@ -1794,8 +1812,15 @@ fn mount_new(
         _ => return err::ENODEV,
     };
 
-    match crate::vfs::mount::mount_at_opt(target, Some(cwd.clone()), fs, fstype, source, read_only)
-    {
+    match crate::vfs::mount::mount_at_opt(
+        target,
+        Some(cwd.clone()),
+        fs,
+        fstype,
+        source,
+        read_only,
+        source_dev,
+    ) {
         Ok(()) => 0,
         Err(e) => err_of(e),
     }

@@ -200,9 +200,22 @@ impl Inode for DevNode {
 struct DevBlockNode {
     ino: Ino,
     dev: Arc<dyn crate::blk::BlockDev>,
+    /// The device number `st_rdev` reports, and the number a mount of this
+    /// node takes as its filesystem's `st_dev`.
+    ///
+    /// A block device without one is a node whose own identity is missing: `ls
+    /// -l /dev/vda2` has no `254, 2` to print it by, `stat(2)` on it answers
+    /// nothing about which device it is, and a mounted filesystem has no way to
+    /// say which storage it came from - which is exactly the link `lsblk` and
+    /// `df` follow to put a partition and its mount point on one line.
+    dev_id: (u32, u32),
 }
 
 impl Inode for DevBlockNode {
+    fn rdev(&self) -> Option<(u32, u32)> {
+        Some(self.dev_id)
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -660,9 +673,21 @@ impl DevFs {
     /// Add a block device under `name` - the disk itself, or one partition of
     /// it. These are the names `mount(2)` is pointed at, and the reason the
     /// choice of what to mount belongs to userland.
+    ///
+    /// The number the node carries comes from the system's numbering, asked by
+    /// name - the same lookup the `add` event this publishes is built from, so
+    /// `/dev/vda2`'s `st_rdev`, the `dev` attribute `/sys/class/block/vda2`
+    /// publishes and the numbers a listener matches the event by are one fact
+    /// with one source rather than three copies of it. A caller therefore does
+    /// not pass a major and a minor in: only the disk's own driver knows which
+    /// major its disks are numbered under, and it has already said so.
     pub fn register_block(&self, name: &str, dev: Arc<dyn crate::blk::BlockDev>) {
         let ino = self.root.next_ino.fetch_add(1, Ordering::Relaxed);
-        let node: Arc<dyn Inode> = Arc::new(DevBlockNode { ino, dev });
+        let dev_id = crate::uevent::Numbering::of_this_machine()
+            .find(name)
+            .map(|(major, minor, _whole)| (major, minor))
+            .unwrap_or((0, 0));
+        let node: Arc<dyn Inode> = Arc::new(DevBlockNode { ino, dev, dev_id });
         critical_section::with(|cs| {
             let prev = self
                 .root

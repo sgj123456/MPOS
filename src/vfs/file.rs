@@ -92,26 +92,26 @@ pub struct File {
     /// is both slow and, on a path that cannot be reached from the root, has
     /// no answer at all.
     label: Mutex<RefCell<Option<alloc::string::String>>>,
-    /// The filesystem id this description lives on, recorded at open from the
+    /// The device number this description lives on, recorded at open from the
     /// same path the label keeps. `DEV_UNSET` until then.
     ///
     /// `st_dev` is a property of the *file*, and the two doors that report it
     /// have to agree. `stat(path)` looks the answer up by path; a descriptor
     /// cannot, and an inode does not name its own filesystem, so the fallback
-    /// ([`crate::vfs::mount::fs_id_of_inode`]) can only match a mount by its
-    /// *root* inode - a plain file inside a mount therefore answered 0 while
-    /// `stat` on the same path answered the mount's id. A caller that locks a
-    /// file and then verifies the name still names the inode it locked (the
-    /// standard way to close the lock-file race, and what `wayland-backend`
-    /// does on `wayland-N.lock`) compares exactly these two answers, so a
-    /// disagreement is not a wrong number but a retry that never converges.
-    /// Recording the id where the path *is* known fixes it at the source.
-    /// See `PLAN.md` §7.4.
+    /// ([`crate::vfs::mount::dev_of_inode`]) can only match a mount by its
+    /// *root* inode - a plain file inside a mount therefore answered the root
+    /// filesystem's number while `stat` on the same path answered the mount's.
+    /// A caller that locks a file and then verifies the name still names the
+    /// inode it locked (the standard way to close the lock-file race, and what
+    /// `wayland-backend` does on `wayland-N.lock`) compares exactly these two
+    /// answers, so a disagreement is not a wrong number but a retry that never
+    /// converges. Recording the number where the path *is* known fixes it at
+    /// the source. See `PLAN.md` §7.4.
     dev: core::sync::atomic::AtomicU64,
 }
 
-/// `File::dev` before an open has recorded one. `u64::MAX` is not a filesystem
-/// id this mount table ever issues, so it is a safe "nobody said".
+/// `File::dev` before an open has recorded one. `u64::MAX` is not a device
+/// number this mount table ever issues, so it is a safe "nobody said".
 const DEV_UNSET: u64 = u64::MAX;
 
 impl File {

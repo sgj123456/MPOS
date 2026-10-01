@@ -741,6 +741,41 @@ impl Numbering {
     }
 }
 
+/// A major and a minor, packed into the one `dev_t` every reader of this
+/// machine's device numbers decodes again.
+///
+/// This is libc's `makedev` and nothing of this kernel's own, because every
+/// reader of the result decodes it with libc's macro: musl's `major()` and
+/// `minor()`, the `maj:min` a mount record prints, the `dev` attribute
+/// `/sys/class/block` publishes. The layout keeps the low twelve bits of the
+/// major and the low eight of the minor in the first sixteen bits and puts the
+/// *rest* of each above them, which is why both halves are spelled twice here
+/// rather than once. A private packing would be a dialect, and a number that is
+/// not libc's is a number that reads back as a different device.
+///
+/// Every pair this kernel has a name for - virtio's `254:0`, SCSI's `8:0`, a
+/// tty's `4:x` - fits in those low bits, where this is just
+/// `(major << 8) | minor`. It is not written that way because the anonymous
+/// numbers a pseudo-filesystem gets do not fit: `stat` reports those as well,
+/// and a packing that dropped their high bits would report two different
+/// filesystems as one.
+pub const fn makedev(major: u32, minor: u32) -> u64 {
+    ((minor & 0xff) as u64)
+        | (((major & 0xfff) as u64) << 8)
+        | (((minor & !0xff) as u64) << 12)
+        | (((major & !0xfff) as u64) << 32)
+}
+
+/// The major [`makedev`] packed into `dev`.
+pub const fn major_of(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) as u32) | (((dev >> 32) as u32) & !0xfff)
+}
+
+/// The minor [`makedev`] packed into `dev`.
+pub const fn minor_of(dev: u64) -> u32 {
+    ((dev & 0xff) as u32) | (((dev >> 12) as u32) & !0xff)
+}
+
 /// Taking turns on the one global bus, for tests. The crate has no `std` and
 /// the host build has no `spin`, so this is a lock made of one atomic - which
 /// is all a test that must not see another test's events needs.
@@ -1194,5 +1229,42 @@ mod tests {
 
         close(sender);
         close(worker);
+    }
+
+    /// The packing is libc's, and the counterfactual is the reason: every
+    /// reader of these numbers - musl's `major()`/`minor()`, a `maj:min` column,
+    /// a `dev` attribute - decodes with libc's macro, so a round trip through
+    /// our own encode and decode is not the test. The test is the *encoded
+    /// value*, which is the one thing a private packing would get wrong while
+    /// still round-tripping against itself.
+    ///
+    /// The three pairs are the three shapes that exist here: a virtio disk, a
+    /// SCSI one, and a tty, plus an anonymous number - which is the case that
+    /// only survives because the encoding is not `(major << 8) | minor`.
+    #[test]
+    fn the_device_number_is_packed_the_way_libc_decodes_it() {
+        // 254:2 as glibc's makedev lays it out: the low byte of the major above
+        // the low byte of the minor, nothing in the high half.
+        assert_eq!(makedev(254, 2), 0xfe02);
+        assert_eq!(major_of(0xfe02), 254);
+        assert_eq!(minor_of(0xfe02), 2);
+
+        // 8:17 - a SATA disk's first partition.
+        assert_eq!(makedev(8, 17), 0x0811);
+        assert_eq!(major_of(0x0811), 8);
+        assert_eq!(minor_of(0x0811), 17);
+
+        // 4:64 - the first pty-ish tty Linux numbers past the low byte, which is
+        // where the two halves of the minor stop being the same byte.
+        assert_eq!(major_of(makedev(4, 64)), 4);
+        assert_eq!(minor_of(makedev(4, 64)), 64);
+
+        // An anonymous number: major 0, a minor that will not fit in eight bits
+        // once 256 pseudo-filesystems have been mounted. `(major << 8) | minor`
+        // would fold it onto 0:0 and report two filesystems as one.
+        let anon = makedev(0, 300);
+        assert_eq!(major_of(anon), 0);
+        assert_eq!(minor_of(anon), 300);
+        assert_ne!(anon, makedev(0, 44), "whose low byte it shares");
     }
 }

@@ -48,11 +48,28 @@ struct Mount {
     /// what is mounted where, which is the only record there is.
     fstype: alloc::string::String,
     source: alloc::string::String,
-    /// Which filesystem this is, as `stat`'s `st_dev` reports it: a number
-    /// distinct per mounted instance. Userland compares it to tell "the same
-    /// filesystem" from "a different one" - `switch_root`'s safety check is
-    /// exactly that comparison.
+    /// Which filesystem instance this is: a number distinct per mounted
+    /// instance, minted in mounting order. It is this table's own identity for
+    /// a mount - two names for one filesystem share it (a bind borrows it) and
+    /// two attachments of one device do not - and it is what `EXDEV` and
+    /// `switch_root`'s comparison are decided by.
+    ///
+    /// It is *not* what `stat`'s `st_dev` reports. See [`Mount::dev`].
     id: u64,
+    /// What `stat`'s `st_dev` reports for every path this filesystem serves.
+    ///
+    /// Linux's answer, and not the same thing as `id`: for a filesystem with
+    /// storage behind it this is that *device's* number (`254:2` for a root
+    /// mounted from `/dev/vda2`), and for a pseudo-filesystem - procfs, tmpfs,
+    /// a ramfs root - it is an anonymous number, which is what Linux hands
+    /// those too. The two questions a caller asks of the field are both
+    /// answered by it: "is this the same filesystem as that?" (compare two
+    /// paths' `st_dev`) and "which device is this on?" (match it against the
+    /// numbers `/sys/class/block` publishes) - and the second is the one that
+    /// only a device's own number can answer. `lsblk`'s `MOUNTPOINTS` column
+    /// and `df`'s `Filesystem` column are that match, and both are blank
+    /// without it.
+    dev: u64,
     /// Whether `mount -o ro` was asked for. The flag is reported in
     /// /proc/mounts and passed on to the filesystem, which enforces it.
     read_only: bool,
@@ -84,14 +101,35 @@ pub struct Vfs {
     /// turned into a lie the moment an init mounted the root read-only.
     root_fs: Mutex<RefCell<Option<Arc<dyn FileSystem>>>>,
     root_read_only: Mutex<RefCell<bool>>,
-    /// The source of filesystem instance ids: every mount gets one, and
-    /// `stat`'s `st_dev` reports it, which is how userland tells "the same
-    /// filesystem" from "a different one".
+    /// What `stat`'s `st_dev` reports for paths on the root filesystem, on the
+    /// same terms as [`Mount::dev`]: the device behind it when it was mounted
+    /// from one, else an anonymous number. It lives outside the table for the
+    /// same reason `root_fstype` does - the root is reached directly and is not
+    /// an entry to look itself up in.
+    root_dev: Mutex<RefCell<u64>>,
+    /// The source of filesystem instance ids. Ids start at 1: 0 is the root's.
     fs_seq: Mutex<RefCell<u64>>,
-    /// Mountpoint path -> (id, fstype), refreshed whenever the table changes.
-    /// `stat` answers per path, and recomputing the mountpoint paths on every
-    /// stat would be a tree walk per call.
-    mount_points: Mutex<RefCell<Vec<(alloc::string::String, u64, alloc::string::String)>>>,
+    /// The source of *anonymous device numbers*, for a filesystem with no
+    /// device behind it. A separate counter from `fs_seq` because the two are
+    /// different facts about a mount - an attachment order and a reported
+    /// number - and one mount may have the first without the second being
+    /// expressible by it.
+    anon_seq: Mutex<RefCell<u64>>,
+    /// Mountpoint path -> which filesystem serves it, refreshed whenever the
+    /// table changes. `stat` answers per path, and recomputing the mountpoint
+    /// paths on every stat would be a tree walk per call.
+    mount_points: Mutex<RefCell<Vec<MountPoint>>>,
+}
+
+/// One mountpoint, as the readers that answer by path need it.
+#[derive(Clone)]
+struct MountPoint {
+    path: alloc::string::String,
+    /// The instance's identity, for `EXDEV`-style comparisons.
+    id: u64,
+    /// The number that instance reports as `st_dev`.
+    dev: u64,
+    fstype: alloc::string::String,
 }
 
 impl Vfs {
@@ -103,13 +141,18 @@ impl Vfs {
             root_source: Mutex::new(RefCell::new(None)),
             root_fs: Mutex::new(RefCell::new(None)),
             root_read_only: Mutex::new(RefCell::new(false)),
+            root_dev: Mutex::new(RefCell::new(0)),
             fs_seq: Mutex::new(RefCell::new(1)),
+            anon_seq: Mutex::new(RefCell::new(1)),
             mount_points: Mutex::new(RefCell::new(Vec::new())),
         }
     }
 
     /// Install the root filesystem. Once, at boot: a second call is a bug.
     pub fn mount_root(&self, fs: &dyn FileSystem) {
+        // Drawn before the lock is taken: it is its own counter, and a number
+        // minted under this section would be one more thing nested inside it.
+        let dev = self.next_anon_dev();
         critical_section::with(|cs| {
             let mut root = self.root.borrow(cs).borrow_mut();
             assert!(root.is_none(), "the root filesystem is already mounted");
@@ -119,6 +162,7 @@ impl Vfs {
             // unless the tree it stands in answers ramfs/tmpfs magic.
             *self.root_fstype.borrow(cs).borrow_mut() =
                 Some(alloc::string::String::from(fs.name()));
+            *self.root_dev.borrow(cs).borrow_mut() = dev;
         });
     }
 
@@ -127,6 +171,30 @@ impl Vfs {
     pub fn root_inode(&self) -> Arc<dyn Inode> {
         critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
             .expect("no root filesystem is mounted")
+    }
+
+    /// The next anonymous device number, for a filesystem with no device
+    /// behind it.
+    ///
+    /// Linux hands a pseudo-filesystem one of these - major 0, a minor counted
+    /// up from 1 - and reports it as `st_dev` exactly as it reports a disk's
+    /// number. The value being *real* matters more than its being meaningful: a
+    /// caller comparing two paths' `st_dev` to ask "one filesystem or two"
+    /// reads the same field whichever kind of filesystem it is, and 0 is not a
+    /// candidate answer, because a `dev_t` of zero means "no device" and two of
+    /// those compare equal whatever serves them.
+    ///
+    /// No device number this machine has can collide with one: a major of 0 is
+    /// not a block driver's, and virtio's disks are numbered under 254 and SATA's
+    /// under 8.
+    fn next_anon_dev(&self) -> u64 {
+        critical_section::with(|cs| {
+            let seq = self.anon_seq.borrow(cs);
+            let mut seq = seq.borrow_mut();
+            let minor = *seq;
+            *seq += 1;
+            crate::uevent::makedev(0, minor as u32)
+        })
     }
 
     /// Mount `fs` at the directory named by `path`.
@@ -161,12 +229,14 @@ impl Vfs {
                 return Err(VfsError::Busy);
             }
             let id = self.next_fs_id();
+            let dev = self.next_anon_dev();
             mounts.push(Mount {
                 at,
                 root: fs.root(),
                 fstype: alloc::string::String::from(fs.name()),
                 source: alloc::string::String::from("none"),
                 id,
+                dev,
                 read_only: false,
                 fs: None,
                 bind: false,
@@ -189,29 +259,41 @@ impl Vfs {
     }
 
     /// Recompute the mountpoint table: each mount's point named from the root,
-    /// plus the root itself as entry 0. `stat`'s `st_dev` and `statfs`'s type
-    /// both come from here, by longest-prefix match on the path.
+    /// plus the root itself as entry 0. `stat`'s `st_dev`, `statfs`'s type and
+    /// the `st_dev`-by-path comparisons all come from here, by longest-prefix
+    /// match on the path.
     fn refresh_mount_points(&self) {
         // The table is copied out first: naming each mount point walks the
         // tree with `path_of`, and that walk takes the same lock.
-        let (root_fstype, entries) = critical_section::with(|cs| {
+        let (root_fstype, root_dev, entries) = critical_section::with(|cs| {
             let fstype = self.root_fstype.borrow(cs).borrow().clone();
-            let entries: Vec<(Arc<dyn Inode>, u64, alloc::string::String)> = self
+            let dev = *self.root_dev.borrow(cs).borrow();
+            let entries: Vec<(Arc<dyn Inode>, u64, u64, alloc::string::String)> = self
                 .mounts
                 .borrow(cs)
                 .borrow()
                 .iter()
-                .map(|m| (m.at.clone(), m.id, m.fstype.clone()))
+                .map(|m| (m.at.clone(), m.id, m.dev, m.fstype.clone()))
                 .collect();
-            (fstype, entries)
+            (fstype, dev, entries)
         });
-        let mut points: Vec<(alloc::string::String, u64, alloc::string::String)> = Vec::new();
+        let mut points: Vec<MountPoint> = Vec::new();
         if let Some(fstype) = root_fstype {
-            points.push((alloc::string::String::from("/"), 0, fstype));
+            points.push(MountPoint {
+                path: alloc::string::String::from("/"),
+                id: 0,
+                dev: root_dev,
+                fstype,
+            });
         }
-        for (at, id, fstype) in entries {
+        for (at, id, dev, fstype) in entries {
             if let Some(path) = self.path_of(&at) {
-                points.push((path, id, fstype));
+                points.push(MountPoint {
+                    path,
+                    id,
+                    dev,
+                    fstype,
+                });
             }
         }
         critical_section::with(|cs| {
@@ -219,28 +301,72 @@ impl Vfs {
         });
     }
 
-    /// Which filesystem serves `path`: its instance id and type, by the
-    /// deepest mountpoint that prefixes the path. The root, when nothing
-    /// else matches, is id 0.
-    pub fn fs_of_path(&self, path: &str) -> (u64, alloc::string::String) {
+    /// Which filesystem serves `path`, by the deepest mountpoint that prefixes
+    /// it. The root slot is the answer when nothing else matches, which is what
+    /// makes one function the whole of "what serves this path".
+    fn serving_point(&self, path: &str) -> MountPoint {
         let trimmed = super::path::normalize(path);
         let points = critical_section::with(|cs| self.mount_points.borrow(cs).borrow().clone());
-        let mut best: Option<(alloc::string::String, u64, alloc::string::String)> = None;
+        let mut best: Option<MountPoint> = None;
         for point in points.iter() {
-            let mp = point.0.as_str();
+            let mp = point.path.as_str();
             let inside = if mp == "/" {
                 true
             } else {
                 trimmed == mp || (trimmed.starts_with(mp) && trimmed[mp.len()..].starts_with('/'))
             };
-            if inside && best.as_ref().is_none_or(|b| point.0.len() > b.0.len()) {
+            if inside
+                && best
+                    .as_ref()
+                    .is_none_or(|b| point.path.len() > b.path.len())
+            {
                 best = Some(point.clone());
             }
         }
-        match best {
-            Some(point) => (point.1, point.2),
-            None => (0, alloc::string::String::from("unknown")),
-        }
+        best.unwrap_or_else(|| MountPoint {
+            path: alloc::string::String::from("/"),
+            id: 0,
+            dev: critical_section::with(|cs| *self.root_dev.borrow(cs).borrow()),
+            fstype: alloc::string::String::from("unknown"),
+        })
+    }
+
+    /// Which filesystem *instance* serves `path`, and its type. The instance is
+    /// this table's identity for a mount, which is what `EXDEV` and
+    /// `rename`'s "same filesystem?" test ask about; what `stat` reports for
+    /// the path is [`Vfs::dev_of_path`], and for a filesystem with a device
+    /// behind it the two are deliberately different numbers.
+    pub fn fs_of_path(&self, path: &str) -> (u64, alloc::string::String) {
+        let point = self.serving_point(path);
+        (point.id, point.fstype)
+    }
+
+    /// What `stat`'s `st_dev` reports for `path`: the number of the device
+    /// behind the filesystem that serves it, or an anonymous one for a
+    /// pseudo-filesystem.
+    ///
+    /// This is the function `stat` answers with, and the one a mount record's
+    /// `maj:min` column has to agree with - a tool that finds a mount's device
+    /// by `stat`ing its mountpoint and then looks that number up in
+    /// `/proc/self/mountinfo` reads the same value from both only because both
+    /// come from here.
+    pub fn dev_of_path(&self, path: &str) -> u64 {
+        self.serving_point(path).dev
+    }
+
+    /// What `stat`'s `st_dev` reports for a descriptor's inode, which has no
+    /// path to look the answer up by: a mount's own root names that mount;
+    /// anything else is served by the root filesystem.
+    pub fn dev_of_inode(&self, inode: &Arc<dyn Inode>) -> u64 {
+        critical_section::with(|cs| {
+            self.mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .find(|m| Arc::ptr_eq(&m.root, inode))
+                .map(|m| m.dev)
+                .unwrap_or_else(|| *self.root_dev.borrow(cs).borrow())
+        })
     }
 
     /// The filesystem instance that serves `path` - the same longest-prefix
@@ -338,6 +464,10 @@ impl Vfs {
             // and the `root` service's later remount,rw is what lifts it.
             *self.root_fs.borrow(cs).borrow_mut() = m.fs.clone();
             *self.root_read_only.borrow(cs).borrow_mut() = m.read_only;
+            // And its device number travels with it for the same reason: `/` is
+            // the ext4 partition the init mounted, so this is where the root's
+            // `st_dev` stops being an anonymous number and becomes `254:2`.
+            *self.root_dev.borrow(cs).borrow_mut() = m.dev;
             mounts.retain(|e| {
                 named
                     .iter()
@@ -386,6 +516,14 @@ impl Vfs {
     /// syscall has the mountpoint in its hand and the filesystem type and
     /// source as the caller spelled them, and both go into the record that
     /// /proc/mounts later reports.
+    ///
+    /// `dev` is what `stat` will report as `st_dev` for everything under this
+    /// mount: the number of the device the source resolved to, when there was
+    /// one, and `None` for a filesystem with no storage behind it, which takes
+    /// an anonymous number. It is a *parameter* rather than something looked up
+    /// here because resolving a source to a device is the syscall layer's job -
+    /// it is the layer that had the source as a path and walked it to a
+    /// [`crate::blk::BlockDev`] in the first place.
     pub fn mount_at(
         &self,
         at: Arc<dyn Inode>,
@@ -393,6 +531,7 @@ impl Vfs {
         fstype: &str,
         source: &str,
         read_only: bool,
+        dev: Option<u64>,
     ) -> VfsResult<()> {
         if at.metadata().kind != NodeKind::Dir {
             return Err(VfsError::NotDir);
@@ -407,12 +546,17 @@ impl Vfs {
                 return Err(VfsError::Busy);
             }
             let id = self.next_fs_id();
+            let dev = match dev {
+                Some(dev) => dev,
+                None => self.next_anon_dev(),
+            };
             mounts.push(Mount {
                 at,
                 root: fs.root(),
                 fstype: alloc::string::String::from(fstype),
                 source: alloc::string::String::from(source),
                 id,
+                dev,
                 read_only,
                 fs: Some(fs),
                 bind: false,
@@ -427,12 +571,12 @@ impl Vfs {
     /// name, sharing everything about the instance that serves it.
     ///
     /// A bind is not a filesystem; it is a second edge into one. The new
-    /// record borrows the serving instance's id, type, filesystem handle and
-    /// write promise rather than minting its own, because the point of the
-    /// operation is that the two names are the *same* storage: a file written
-    /// through one appears under the other, and `stat` answers one `st_dev`
-    /// from either. The resolver already swaps a mountpoint child for its
-    /// mount's root, and `root` here is simply a node that is not a freshly
+    /// record borrows the serving instance's id, type, device number, filesystem
+    /// handle and write promise rather than minting its own, because the point
+    /// of the operation is that the two names are the *same* storage: a file
+    /// written through one appears under the other, and `stat` answers one
+    /// `st_dev` from either. The resolver already swaps a mountpoint child for
+    /// its mount's root, and `root` here is simply a node that is not a freshly
     /// attached filesystem's - so the crossing itself needs no new machinery.
     ///
     /// What is not here: binding a *file* (the resolver models directory
@@ -456,6 +600,11 @@ impl Vfs {
         // `stat`'s `st_dev` and `statfs` already answer by path, asked of the
         // name the caller gave.
         let (id, fstype) = self.fs_of_path(source_path);
+        // The device number is borrowed with the identity, and it is the reason
+        // a bind is not a filesystem of its own: `/mnt/root` and `/` are one
+        // storage mounted twice, so they answer one `st_dev` - which is exactly
+        // how a tool that lists mounts tells a second name from a second device.
+        let dev = self.dev_of_path(source_path);
         let fs = self.fs_serving_path(source_path);
         let serving_read_only = critical_section::with(|cs| {
             if id == 0 {
@@ -481,6 +630,7 @@ impl Vfs {
                 fstype,
                 source: alloc::string::String::from(source_path),
                 id,
+                dev,
                 // A bind's own `MS_RDONLY` is a promise about writes *through
                 // this name*; it does not reach the shared filesystem, which
                 // the other name may still write through. Nothing in this
@@ -670,7 +820,8 @@ impl Vfs {
             // /proc/mounts still has to say what `/` is and what it came from.
             // Its write promise travels too - a read-only mount read-only
             // stays - together with the filesystem itself, so a later
-            // `remount,rw /` can reach the thing that refuses the writes.
+            // `remount,rw /` can reach the thing that refuses the writes, and
+            // with its device number, which is what `/`'s `st_dev` becomes.
             if let Some(entry) = mounts
                 .iter()
                 .find(|m| Arc::ptr_eq(&m.root, &new_root_inode))
@@ -680,6 +831,7 @@ impl Vfs {
                         m.source.clone(),
                         m.read_only,
                         m.fs.clone(),
+                        m.dev,
                     )
                 })
             {
@@ -687,6 +839,7 @@ impl Vfs {
                 *self.root_source.borrow(cs).borrow_mut() = Some(entry.1);
                 *self.root_read_only.borrow(cs).borrow_mut() = entry.2;
                 *self.root_fs.borrow(cs).borrow_mut() = entry.3;
+                *self.root_dev.borrow(cs).borrow_mut() = entry.4;
             }
             // Every mount in the table was attached somewhere in the old tree -
             // /dev, /tmp, the new root itself - and none of them can be reached
@@ -696,12 +849,14 @@ impl Vfs {
             // whatever the caller attaches next.
             mounts.clear();
             let id = self.next_fs_id();
+            let dev = self.next_anon_dev();
             mounts.push(Mount {
                 at: put_old_inode.clone(),
                 root: old_root,
                 fstype: alloc::string::String::from("ramfs"),
                 source: alloc::string::String::from("initramfs"),
                 id,
+                dev,
                 read_only: false,
                 fs: None,
                 bind: false,
@@ -1238,13 +1393,17 @@ pub fn pivot_root(new_root: &str, put_old: &str) -> VfsResult<()> {
 /// type and source as the caller spelled them. This is the shape `mount(2)`
 /// arrives in, and the reason it exists as a syscall at all: which filesystems
 /// are mounted where is userland's decision to make.
+///
+/// `dev` is what `stat` will report as `st_dev` under this mount - the resolved
+/// source device's number, or `None` for a filesystem with no storage behind it.
 pub fn mount_at(
     target: &str,
     fs: Arc<dyn FileSystem>,
     fstype: &str,
     source: &str,
+    dev: Option<u64>,
 ) -> VfsResult<()> {
-    mount_at_opt(target, None, fs, fstype, source, false)
+    mount_at_opt(target, None, fs, fstype, source, false, dev)
 }
 
 /// [`mount_at`](fn.mount_at.html) resolved against a caller's cwd.
@@ -1255,9 +1414,10 @@ pub fn mount_at_opt(
     fstype: &str,
     source: &str,
     read_only: bool,
+    dev: Option<u64>,
 ) -> VfsResult<()> {
     let at = resolve_opt(target, start)?;
-    STATIC.mount_at(at, fs, fstype, source, read_only)
+    STATIC.mount_at(at, fs, fstype, source, read_only, dev)
 }
 
 /// `mount -o remount,...`: change a mounted filesystem's flags.
@@ -1296,9 +1456,21 @@ pub fn mount_table() -> Vec<(
     STATIC.mount_table()
 }
 
-/// The filesystem instance id serving `path`, with its type.
+/// The filesystem instance id serving `path`, with its type. This is the
+/// instance's *identity*; what `stat` reports for the path is [`dev_of_path`].
 pub fn fs_of_path(path: &str) -> (u64, alloc::string::String) {
     STATIC.fs_of_path(path)
+}
+
+/// What `stat`'s `st_dev` reports for `path`: the number of the device behind
+/// the filesystem that serves it, or an anonymous number for a pseudo-filesystem.
+pub fn dev_of_path(path: &str) -> u64 {
+    STATIC.dev_of_path(path)
+}
+
+/// The same, for an inode with no path - `fstat(2)`'s descriptor shape.
+pub fn dev_of_inode(inode: &Arc<dyn Inode>) -> u64 {
+    STATIC.dev_of_inode(inode)
 }
 
 /// The space accounting of the filesystem that serves `path`, straight from
@@ -1337,8 +1509,13 @@ pub fn fstype_of_inode(inode: &Arc<dyn Inode>) -> alloc::string::String {
 }
 
 /// The filesystem instance id a node belongs to, by identity: a mount's own
-/// root names that mount; anything else names the root filesystem. This is
-/// `st_dev` for a descriptor, which has no path to look the answer up by.
+/// root names that mount; anything else names the root filesystem.
+///
+/// This is the *identity* of the instance - the key two files' lock records
+/// and a socket's address are filed under, and the thing `EXDEV` is decided
+/// by - and not what `stat` reports. A descriptor's `st_dev` is
+/// [`dev_of_inode`], which is a different number whenever the filesystem has a
+/// device behind it.
 pub fn fs_id_of_inode(inode: &Arc<dyn Inode>) -> u64 {
     critical_section::with(|cs| {
         STATIC
@@ -1711,6 +1888,135 @@ mod tests {
                 "{spelling} is served by /mnt"
             );
         }
+    }
+
+    /// `st_dev` is the *device's* number when the filesystem has a device
+    /// behind it, and that is the whole reason a mount records two numbers.
+    ///
+    /// The counterfactual is the failing case this replaced: with one number
+    /// doing both jobs, a root mounted from `/dev/vda2` reported the mount
+    /// table's own attachment counter as `st_dev`, so nothing that reads that
+    /// field to find a device - `lsblk`'s `MOUNTPOINTS` column, `df`'s
+    /// `Filesystem` column, `findmnt` - could ever match a mount back to the
+    /// partition it is on, and every one of them printed a blank instead.
+    #[test]
+    fn a_mounted_device_reports_the_devices_own_number() {
+        let vfs = tree_with_root();
+        vfs.resolve("/")
+            .unwrap()
+            .create("mnt", NodeKind::Dir)
+            .unwrap();
+        let at = vfs.mountpoint_inode("/mnt", None).unwrap();
+        vfs.mount_at(
+            at,
+            RamFs::new(),
+            "ext4",
+            "/dev/vda2",
+            false,
+            Some(crate::uevent::makedev(254, 2)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            vfs.dev_of_path("/mnt"),
+            0xfe02,
+            "254:2 as libc packs it - the number /sys/class/block/vda2 publishes"
+        );
+        assert_eq!(vfs.dev_of_path("/mnt/anything/under/it"), 0xfe02);
+        assert_ne!(
+            vfs.dev_of_path("/mnt"),
+            vfs.fs_of_path("/mnt").0,
+            "which is not the attachment counter, and must not be"
+        );
+
+        // The root filesystem is the pseudo-filesystem in this tree, so it gets
+        // an anonymous number - Linux's answer for a mount with no device, and
+        // not the attachment counter's 0 either.
+        assert_eq!(crate::uevent::major_of(vfs.dev_of_path("/")), 0);
+        assert_ne!(vfs.dev_of_path("/"), 0, "0 is `no device`, not a number");
+        assert_ne!(
+            vfs.dev_of_path("/"),
+            vfs.dev_of_path("/mnt"),
+            "two filesystems, two numbers"
+        );
+    }
+
+    /// Two pseudo-filesystems are two numbers, not one.
+    ///
+    /// "Anonymous" must not mean "the same": a caller that compares two paths'
+    /// `st_dev` to decide whether a rename can be a rename, or whether a tree
+    /// walks off its own filesystem, is answered by this field, and two
+    /// unrelated mounts sharing a number turns a refusal into silent
+    /// corruption. Linux draws each one from its own counter for exactly this.
+    #[test]
+    fn two_pseudo_filesystems_get_two_anonymous_numbers() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        root.create("proc", NodeKind::Dir).unwrap();
+        root.create("sys", NodeKind::Dir).unwrap();
+        for (path, fstype) in [("/proc", "proc"), ("/sys", "sysfs")] {
+            let at = vfs.mountpoint_inode(path, None).unwrap();
+            vfs.mount_at(at, RamFs::new(), fstype, fstype, false, None)
+                .unwrap();
+        }
+
+        let (root_dev, proc_dev, sys_dev) = (
+            vfs.dev_of_path("/"),
+            vfs.dev_of_path("/proc"),
+            vfs.dev_of_path("/sys"),
+        );
+        assert_ne!(proc_dev, sys_dev, "one number each");
+        assert_ne!(proc_dev, root_dev);
+        assert_ne!(proc_dev, 0);
+        // All three are anonymous, i.e. major 0 - which is what keeps them from
+        // ever colliding with a real disk's number.
+        for dev in [root_dev, proc_dev, sys_dev] {
+            assert_eq!(crate::uevent::major_of(dev), 0);
+        }
+    }
+
+    /// Promoting a mount to `/` moves its device number with it.
+    ///
+    /// This is the initramfs's last act: it mounts the real root somewhere,
+    /// calls `pivot_root`, and from that moment `stat("/")` is the number of
+    /// the partition the machine really lives on. A root that kept the ramfs's
+    /// anonymous number would leave every tool that reads `st_dev` by path
+    /// unable to find the root's device - `df /` would be blank on the one
+    /// filesystem everything is on.
+    #[test]
+    fn the_root_keeps_the_device_number_of_the_mount_it_came_from() {
+        let vfs = tree_with_root();
+        vfs.resolve("/")
+            .unwrap()
+            .create("new", NodeKind::Dir)
+            .unwrap();
+        let at = vfs.mountpoint_inode("/new", None).unwrap();
+        vfs.mount_at(
+            at.clone(),
+            RamFs::new(),
+            "ext4",
+            "/dev/vda2",
+            false,
+            Some(crate::uevent::makedev(254, 2)),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::uevent::major_of(vfs.dev_of_path("/")),
+            0,
+            "still ramfs"
+        );
+
+        vfs.move_root(&vfs.resolve("/new").unwrap()).unwrap();
+        assert_eq!(
+            vfs.dev_of_path("/"),
+            0xfe02,
+            "the root is the vda2 mount now, and says so"
+        );
+        assert_eq!(
+            vfs.dev_of_inode(&vfs.root_inode()),
+            0xfe02,
+            "and the descriptor door agrees with the path door"
+        );
     }
 }
 
