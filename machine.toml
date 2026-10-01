@@ -44,6 +44,20 @@ vsock = true
 # exercises the driver and /dev/dsp, the host hears silence. Needs QEMU 8.2
 # or newer for the card to exist at all.
 audio = true
+# The GPU device QEMU attaches (`-device`). `virtio-gpu-pci` is the 2D scanout
+# every boot has used, and it asks nothing of the host. `virtio-gpu-gl-pci` is
+# the same device with the host's `virglrenderer` behind it - the one thing
+# that makes a compositor refusing a *software* EGL device able to run at all
+# (`PLAN.md` §7.4). A GL boot names the display backend's own GL suboption
+# beside it (`display = "gtk,gl=on"`, or `egl-headless,gl=on` for a headless
+# one); the *device* starts without it, because what needs the context is the
+# guest's renderer and not the card.
+#
+# Named as QEMU names it rather than as a boolean, because this host has more
+# than one GL device (`virtio-vga-gl` and a rutabaga/gfxstream variant sit
+# beside the PCI GL card), and a host with a different one should be asked for
+# it here rather than in the xtask's source.
+gpu = "virtio-gpu-pci"
 # The QEMU display backend for an interactive `run` (`-display`), so the
 # framebuffer console has a window to show itself in. Absent means `sdl`; name
 # another backend your QEMU was built with, or `none` to watch only the serial

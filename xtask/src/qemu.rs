@@ -205,11 +205,17 @@ pub fn machine_args(
     // reported by the boot: the entropy source, the GPU, a keyboard, and a
     // console port. None is required by the guest - a missing one boots
     // without it - but the ones a boot verifies are the ones attached.
+    //
+    // The GPU is the machine's choice rather than this function's: the 2D
+    // `virtio-gpu-pci` is the default and needs nothing of the host, while the
+    // GL card named in `machine.toml` is what puts a 3D context within reach
+    // (`PLAN.md` §7.4). Which one it is changes only this word, so the rest of
+    // the machine - and the kernel's own device probe - is the same either way.
     args.extend([
         "-device".into(),
         "virtio-rng-pci".into(),
         "-device".into(),
-        "virtio-gpu-pci".into(),
+        config.gpu.clone(),
         "-device".into(),
         "virtio-keyboard-pci".into(),
         // A pointer, so a compositor has somewhere to route the mouse. The
@@ -496,6 +502,7 @@ mod tests {
             vsock: false,
             audio: false,
             display: None,
+            gpu: "virtio-gpu-pci".to_string(),
             mode_text: None,
         }
     }
@@ -609,6 +616,66 @@ mod tests {
             Path::new("/build/9p-share"),
         );
         assert_eq!(after(&file, "-display").as_deref(), Some("none"));
+    }
+
+    /// The GPU the machine was wired with, read off the `-device` list the way
+    /// QEMU reads it: the card that rides beside the entropy source.
+    fn gpu_of(args: &[String]) -> String {
+        let at = args
+            .iter()
+            .position(|arg| arg == "virtio-rng-pci")
+            .expect("the rng card is attached");
+        args.get(at + 2)
+            .cloned()
+            .expect("the gpu is the -device after the rng card")
+    }
+
+    #[test]
+    fn the_gpu_is_the_machines_choice_and_nothing_elses() {
+        // The default machine is the 2D card every boot before this key had.
+        let plain = config("1024", 1, &[]);
+        let plain_args = args(&plain, Boot::Image(PathBuf::from("/build/mpos.img")));
+        assert_eq!(gpu_of(&plain_args), "virtio-gpu-pci");
+
+        // Naming the GL card is the whole of the difference: exactly one word
+        // of one `-device`. Pinning that makes a boot failure attributable -
+        // a GL machine that will not start differs from a working 2D one by
+        // the card and by nothing else.
+        let mut gl = config("1024", 1, &[]);
+        gl.gpu = "virtio-gpu-gl-pci".to_string();
+        let gl_args = args(&gl, Boot::Image(PathBuf::from("/build/mpos.img")));
+        assert_eq!(gpu_of(&gl_args), "virtio-gpu-gl-pci");
+        assert_eq!(
+            plain_args.len(),
+            gl_args.len(),
+            "a card changed the argument count, so something else moved too"
+        );
+        let differing: Vec<(String, String)> = plain_args
+            .iter()
+            .zip(&gl_args)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+        assert_eq!(
+            differing,
+            vec![(
+                "virtio-gpu-pci".to_string(),
+                "virtio-gpu-gl-pci".to_string()
+            )],
+            "the GPU choice moved something besides the card"
+        );
+
+        // A card is not a mode: every mode boots the machine's own GPU, so
+        // whether a window is wanted and which card the guest is given stay
+        // separate questions.
+        for mode in [RunMode::Terminal, RunMode::Mirror, RunMode::Gui] {
+            assert_eq!(
+                gpu_of(&run_args(&gl, mode)),
+                "virtio-gpu-gl-pci",
+                "{} booted a different GPU",
+                mode.name()
+            );
+        }
     }
 
     fn run_args(config: &QemuConfig, mode: RunMode) -> Vec<String> {

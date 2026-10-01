@@ -184,7 +184,28 @@ pub struct QemuConfig {
     /// name another backend your QEMU was built with, or `none` to watch only
     /// the serial log - which then goes quiet once the console moves to the
     /// framebuffer. A `test` boot ignores this and always runs headless.
+    ///
+    /// The value is passed through verbatim, so a backend's own suboptions are
+    /// written here too: `display = "egl-headless,gl=on"` asks for the GL
+    /// context the GPU below needs, and is the whole of what a headless GL run
+    /// has to say. A `,gl=on` on a backend QEMU was not built with fails at
+    /// QEMU's own hand, which is the honest place for it.
     pub display: Option<String>,
+    /// The GPU device (`-device`), so the machine can be given a card with the
+    /// virgl 3D renderer behind it. `virtio-gpu-pci` is the 2D scanout every
+    /// boot has used; `virtio-gpu-gl-pci` is the same device with the host's
+    /// `virglrenderer` behind it, and it is the one thing that makes a
+    /// compositor refusing a *software* EGL device able to run (`PLAN.md`
+    /// §7.4).
+    ///
+    /// Named as QEMU names it rather than as a boolean, for the same reason
+    /// `display` is: on this host the GL device is `virtio-gpu-gl-pci`, and
+    /// `virtio-vga-gl` and a rutabaga/gfxstream variant sit beside it - a
+    /// host with a different one is asked for it here, without a code change.
+    /// The GL card is not mutually exclusive with a plain display: QEMU starts
+    /// `-device virtio-gpu-gl-pci` against `-display sdl` and the guest simply
+    /// gets a card whose 3D context nothing asked for.
+    pub gpu: String,
     /// The word `[qemu] mode` holds, kept as text: see
     /// [`QemuConfig::run_mode`] for when it becomes a [`RunMode`] and why a word
     /// this crate does not have may not become the default one.
@@ -312,6 +333,16 @@ impl QemuConfig {
             display: values
                 .remove("display")
                 .filter(|text| !text.trim().is_empty()),
+            // The 2D scanout is the default because it is what every boot
+            // before this key had, and because it is the one that needs nothing
+            // of the host. A blank value is the same as an absent one: a key
+            // written and left empty is a mistake, not a request for a device
+            // named "".
+            gpu: values
+                .remove("gpu")
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "virtio-gpu-pci".to_string()),
             // The word is stored rather than resolved here, because the load is
             // shared with `test` — which boots no window at all and must not fail
             // on a mode name it never uses. The mode is resolved at the two places
@@ -681,7 +712,15 @@ mod tests {
         let image_keys = parse_simple_toml(&image).unwrap();
 
         // The machine half is all there...
-        for key in ["memory", "cpus", "extra_args", "vsock", "audio", "mode"] {
+        for key in [
+            "memory",
+            "cpus",
+            "extra_args",
+            "vsock",
+            "audio",
+            "gpu",
+            "mode",
+        ] {
             assert!(machine_keys.contains_key(key), "machine.toml lost {key}");
         }
         // ...and none of it is in the file whose mtime decides whether Alpine
@@ -693,6 +732,7 @@ mod tests {
             "vsock",
             "audio",
             "display",
+            "gpu",
             "mode",
         ] {
             assert!(
@@ -877,6 +917,33 @@ mod tests {
         values.insert("mode".to_string(), "   ".to_string());
         let config = QemuConfig::from_values(&mut values, "mpos".to_string());
         assert_eq!(config.run_mode().unwrap(), RunMode::Mirror);
+    }
+
+    #[test]
+    fn an_absent_gpu_defaults_to_the_two_dimensional_card() {
+        // Every boot before this key had the plain scanout, so an absent `gpu`
+        // must keep exactly that machine - and the GL card is opt-in, because
+        // it asks the host for a renderer the plain one does not.
+        let mut values = HashMap::new();
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        assert_eq!(config.gpu, "virtio-gpu-pci");
+
+        // A key written and left empty is a mistake, not a request for a device
+        // whose QEMU name is "" - which QEMU would refuse at its own hand, a
+        // boot later and a layer away from the typo.
+        let mut values = HashMap::new();
+        values.insert("gpu".to_string(), "   ".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        assert_eq!(config.gpu, "virtio-gpu-pci");
+
+        // A named card is taken as written, and the key is consumed: a value
+        // left in the map is a key this parser does not know, which nothing
+        // downstream would ever notice.
+        let mut values = HashMap::new();
+        values.insert("gpu".to_string(), " virtio-gpu-gl-pci ".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        assert_eq!(config.gpu, "virtio-gpu-gl-pci");
+        assert!(values.is_empty(), "the `gpu` key was not consumed");
     }
 
     #[test]
