@@ -464,6 +464,19 @@ it - so the entries say which they are:
       Wayland socket: wayland-1` where the previous one left a zero-byte lock
       file and nothing else. Pinned by `t-unix` and `t-tcp-listen`, each shown red
       against the kernel built before it (§7.4)
+- [x] the **primary node's resource enumeration** — `GETRESOURCES`' two-call
+      idiom: a zero count beside the dangling non-null pointer an empty `Vec`
+      carries is not `EFAULT`, because Linux copies only when there is something
+      to copy. This was the call niri's `DrmDevice::new` stopped on once its
+      socket existed (`resource_handles()`, "Bad address (os error 14)"), and it
+      fires on every first enumeration - the card has no framebuffers before its
+      first commit. Pinned by `t-drm` (§7.4)
+- [x] the **property shapes a compositor sorts by** — every `OBJECT` property
+      carries its one value, the object-type tag, because a caller reads
+      `values[0]` the moment it sees the flag; drm-rs panicked with "index out of
+      bounds: the len is 0 but the index is 0" where the planes' `FB_ID` and
+      `CRTC_ID` advertised none. Pinned by `t-drm-props` (§7.4, which also names
+      the `ATOMIC` flag this kernel does not model yet)
 - [~] the DRM surface a **wlroots pixman** compositor needs — a primary node with
       `SET_MASTER`, `DRM_CAP_DUMB_BUFFER`, `CREATE_DUMB`/`MAP_DUMB`,
       `PRIME_HANDLE_TO_FD`, `ADDFB`/`MODE_ATOMIC` — is already in place, which
@@ -3827,9 +3840,75 @@ is again read off its source rather than measured, and it is the renderer below.
 >
 > `EFAULT` from the primary node's resource-handle load, and niri is gone within
 > the twenty seconds the probe watched (the renderer refusal below is the rest of
-> that story). Which ioctl that is, and why a buffer the card has a count for is
-> `EFAULT`, is the next measurement rather than this fix's - the same boot's own
-> `strace /bin/true` ran to completion, so the tracer works there.
+> that story).
+>
+> **That call was this kernel's, and it is fixed.** `Error loading resource
+> handles` is smithay's wrapper around drm-rs's `resource_handles()`, which is
+> two calls to `DRM_IOCTL_MODE_GETRESOURCES`: a *sizing* call whose pointers are
+> all null and counts all zero, then a *fill* call whose pointers come from the
+> `Vec`s reserved at the counts the first call reported (`drm-ffi`'s
+> `get_resources`). An empty `Vec`'s `as_mut_ptr()` is Rust's dangling non-null
+> pointer - address 4 for `u32` - so the fill call carries `count_fbs = 0` beside
+> a non-null `fb_id_ptr`, and this kernel read that pointer as "somewhere the
+> caller asked me to write" and answered `EFAULT`. The card has no framebuffers
+> before its first commit, so `count_fbs` is 0 on *every* first enumeration:
+> nothing about the card was wrong, the call was.
+>
+> Linux's rule, measured on this host first with a C probe that makes both calls:
+> the sizing call answers 0 with the counts (`fbs=0 crtcs=4 conns=8 encs=13` on
+> the host's card), and the fill call answers 0 as well - with `fb_id_ptr = 4`
+> and `count_fbs = 0` - because its copy sits inside the count test, so a
+> zero-length array is never dereferenced. `get_resources`' two arms skip an
+> empty array the same way now (`!fbs.is_empty()`, `!ids.is_empty()`), and the
+> *poisoned pointer* rule is untouched: a count that asks for a real id at an
+> address that is not the caller's is still `EFAULT`, which is what the
+> `t-drm-args` check beside it pins from the other side.
+>
+> Pinned by `t-drm`, whose own enumeration does the two-call idiom against a card
+> that has no framebuffer yet - the only state in which this can be observed at
+> all, which is why `t-drm-args` cannot carry it (by the time that program runs,
+> `t-drm` has created one, so its `count_fbs` is 1 and the arm never fires). The
+> kernel built before the fix prints `FAIL: the fill call succeeds with an empty
+> array beside a dangling pointer (got -14, want 0)`; the one after it passes.
+>
+> **The call after that one is the property list, and this time the failure was
+> in the caller.** With the primary node added, niri died one line later - no log
+> message, a panic in drm-rs itself:
+>
+> ```text
+> thread 'main' (28) panicked at .../drm-0.14.1/src/control/mod.rs:497:29:
+> index out of bounds: the len is 0 but the index is 0
+> ```
+>
+> That line is `match values[0]`, which drm-rs evaluates as soon as a property's
+> flags carry `DRM_MODE_PROP_OBJECT` - it reads the property's single value to
+> learn *what kind* of object the property names. Linux gives every `OBJECT`
+> property exactly one such value (`drm_property_create_object` stores the type
+> tag), and this kernel had the planes' `FB_ID` and `CRTC_ID` advertising an
+> empty list, with the connector's `CRTC_ID` carrying a lone `0` - a value drm-rs
+> maps to `ValueType::Unknown` rather than to `CRTC`. So the properties were
+> never *wrong* enough to fail a caller's check; they were wrong enough to make
+> one index off the end of its own array.
+>
+> Measured through libdrm on this host's card before writing it: the connector's
+> `CRTC_ID` and both planes' `CRTC_ID` answer `count_values = 1`,
+> `values[0] = 0xcccccccc` (`DRM_MODE_OBJECT_CRTC`), and a plane's `FB_ID`
+> `0xfbfbfbfb` (`DRM_MODE_OBJECT_FB`) - `0x40` (`OBJECT`) in the flags of all
+> three, with `0x80000000` (`ATOMIC`) beside it. The three properties now carry
+> their tag, and `OBJECT_FB` joins the three tags the file already had
+> (`DRM_MODE_OBJECT_*` out of `<drm_mode.h>`, all four now matching it).
+>
+> Pinned by `t-drm-props`, which asks each of the four by name and checks flags,
+> count and value. Counterfactual, measured in a worktree at the same commit:
+> the kernel built before the fix fails it, the one after passes.
+>
+> **Named, not fixed: the `ATOMIC` flag.** Those properties are
+> `ATOMIC | OBJECT` on Linux, and Linux *hides* them from a client that has not
+> set `DRM_CLIENT_CAP_ATOMIC`; this kernel accepts the cap and stores nothing, so
+> the flag is absent and the properties are shown to every client. Closing it
+> honestly means the cap becoming per-file state and the property lists filtered
+> by it - a change nothing yet asks for (niri sets the cap), so it is written
+> down here rather than half-done.
 >
 > One instrument note for whoever takes it: `strace -f niri` ended *two* earlier
 > boots in `KERNEL PANIC: #GP` from ring 0 (err `0x0`, `rip 0xffffffff8004b01f`,

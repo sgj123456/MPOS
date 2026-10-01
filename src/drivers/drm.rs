@@ -442,11 +442,16 @@ const CLIENT_CAP_PLANE_COLOR_PIPELINE: u64 = 7;
 /// way `open(O_CLOEXEC)` would.
 const DRM_CLOEXEC: u32 = 0x80000;
 
-/// `DRM_MODE_OBJECT_CRTC` / `_CONNECTOR` / `_PLANE`: the object-type tags of
-/// `OBJ_GETPROPERTIES`/`OBJ_SETPROPERTY`.
+/// `DRM_MODE_OBJECT_CRTC` / `_CONNECTOR` / `_PLANE` / `_FB`: the object-type
+/// tags of `OBJ_GETPROPERTIES`/`OBJ_SETPROPERTY`, and the single *value* every
+/// `OBJECT`-typed property carries. The four numbers are `<drm_mode.h>`'s, and
+/// they are also what a caller compares against: drm-rs maps them to the
+/// `ValueType` a property reports (`0xfbfbfbfb` is `Framebuffer`, `0xcccccccc`
+/// is `CRTC`), so a tag answered wrong is a property the caller has no type for.
 const OBJECT_CRTC: u32 = 0xcccc_cccc;
 const OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const OBJECT_PLANE: u32 = 0xeeee_eeee;
+const OBJECT_FB: u32 = 0xfbfb_fbfb;
 /// `DRM_MODE_PROP_*`, on the bit numbers `drm_mode.h` gives them: the legacy
 /// types are `RANGE` (bit 1), `IMMUTABLE` (bit 2), `ENUM` (bit 3), `BLOB`
 /// (bit 4) and `BITMASK` (bit 5 - no property here is one, so it is named
@@ -2918,10 +2923,23 @@ fn get_property(arg: usize) -> isize {
     let prop_id = unsafe { ((arg + 16) as *const u32).read_unaligned() };
     // (name, flags, value list, enum entries as (name, value))
     let (name, flags, values, enums): (&str, u32, &[u64], &[(&str, u64)]) = match prop_id {
-        // An object-typed property: the value is the id of a CRTC (0 for
-        // none). The *current* binding comes from the connector's property
-        // list, not from here - this reports the property's shape.
-        PROP_CRTC_ID => ("CRTC_ID", PROP_OBJECT, &[0], &[]),
+        // An object-typed property: its one value is the *kind* of object it
+        // names, not an id - `drm_property_create_object` stores a single entry
+        // (`values[0] = type`, `num_values = 1`) and a caller reads it to learn
+        // what the property points at. Measured on this host's card through
+        // libdrm: the connector's `CRTC_ID` and the planes' `CRTC_ID` report
+        // `count_values = 1`, `values[0] = 0xcccccccc`, and the planes' `FB_ID`
+        // `values[0] = 0xfbfbfbfb` - `DRM_MODE_OBJECT_CRTC` and `_FB` out of
+        // `<drm_mode.h>`. The *current* binding comes from the connector's
+        // property list, not from here - this reports the property's shape.
+        //
+        // An empty list here is not a smaller truth, it is a broken shape: a
+        // caller that sorts a property by its flags reads `values[0]` as soon
+        // as it sees `OBJECT`, so drm-rs panicked with "index out of bounds: the
+        // len is 0 but the index is 0" (`drm-0.14.1/src/control/mod.rs:497`) and
+        // took niri with it, which is how the planes' `FB_ID` and `CRTC_ID` were
+        // found advertising no values at all.
+        PROP_CRTC_ID => ("CRTC_ID", PROP_OBJECT, &[OBJECT_CRTC as u64], &[]),
         PROP_DPMS => (
             "DPMS",
             PROP_ENUM,
@@ -2940,10 +2958,11 @@ fn get_property(arg: usize) -> isize {
         // The mode an atomic commit binds: a blob, which is a
         // `drmModeModeInfo` as `CREATE_BLOB` stored it.
         PROP_MODE_ID => ("MODE_ID", PROP_BLOB, &[], &[]),
-        // The plane's buffer and the CRTC it feeds - object-typed, so the
-        // value is the framebuffer's or the CRTC's id (0 for "none").
-        PROP_PLANE_FB_ID => ("FB_ID", PROP_OBJECT, &[], &[]),
-        PROP_PLANE_CRTC_ID => ("CRTC_ID", PROP_OBJECT, &[], &[]),
+        // The plane's buffer and the CRTC it feeds - object-typed, so each
+        // carries the one value that names *what kind* of object it points at
+        // (the framebuffer tag and the CRTC tag), as the connector's above does.
+        PROP_PLANE_FB_ID => ("FB_ID", PROP_OBJECT, &[OBJECT_FB as u64], &[]),
+        PROP_PLANE_CRTC_ID => ("CRTC_ID", PROP_OBJECT, &[OBJECT_CRTC as u64], &[]),
         // The source rectangle in 16.16 fixed point and the destination in
         // pixels: the pair that says *where* on the scanout the buffer goes.
         PROP_SRC_X => ("SRC_X", PROP_RANGE, &[0, u32::MAX as u64], &[]),

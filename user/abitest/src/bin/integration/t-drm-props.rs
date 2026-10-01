@@ -49,7 +49,9 @@ const PLANE_ID: u32 = 36;
 /// The cursor plane, the card's second one.
 const CURSOR_PLANE_ID: u32 = 37;
 const OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
+const OBJECT_CRTC: u32 = 0xcccc_cccc;
 const OBJECT_PLANE: u32 = 0xeeee_eeee;
+const OBJECT_FB: u32 = 0xfbfb_fbfb;
 
 const DRM_CAP_ADDFB2_MODIFIERS: u64 = 0x10;
 const DRM_CAP_ASYNC_PAGE_FLIP: u64 = 0x07;
@@ -60,6 +62,8 @@ const PROP_RANGE: u32 = 1 << 1;
 const PROP_ENUM: u32 = 1 << 3;
 const PROP_BLOB: u32 = 1 << 4;
 const PROP_IMMUTABLE: u32 = 1 << 2;
+/// `DRM_MODE_PROP_OBJECT` (`DRM_MODE_PROP_TYPE(n) = n << 6` with n = 1).
+const PROP_OBJECT: u32 = 1 << 6;
 /// `DRM_MODE_FB_MODIFIERS`, which enables the `modifier[]` array of an `ADDFB2`.
 const FB_MODIFIERS: u32 = 1 << 1;
 /// `DRM_FORMAT_XRGB8888`, the layout the guest test's dumb buffer is in.
@@ -457,6 +461,66 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             b"the cursor plane carries a type property",
             false,
         ),
+    }
+
+    // --- the object-typed properties carry their one value -----------------------------
+    // An `OBJECT` property's value is the *kind* of object it points at, and it
+    // has exactly one of them: Linux creates the three below through
+    // `drm_property_create_object`, so `count_values` is 1 and `values[0]` is
+    // `DRM_MODE_OBJECT_CRTC` (`0xcccccccc`) or `_FB` (`0xfbfbfbfb`). Measured
+    // through libdrm on this host's card before it was written: the connector's
+    // `CRTC_ID` and both planes' `CRTC_ID` answer `0xcccccccc`, the planes'
+    // `FB_ID` answers `0xfbfbfbfb`, one value each.
+    //
+    // This is not a cosmetic count: a caller reads `values[0]` as soon as the
+    // flag is set - drm-rs builds the `ValueType` a property reports that way -
+    // so a plane advertising `FB_ID` with an empty list is not a smaller answer,
+    // it is a panic in the caller's hands. That is what it was: niri died with
+    // "index out of bounds: the len is 0 but the index is 0" in
+    // `drm-0.14.1/src/control/mod.rs:497` one line after the primary node was
+    // added.
+    for (label, obj_id, obj_type, name, tag) in [
+        (
+            "the connector's CRTC_ID is an object property with one value",
+            CONNECTOR_ID,
+            OBJECT_CONNECTOR,
+            &b"CRTC_ID"[..],
+            OBJECT_CRTC,
+        ),
+        (
+            "the primary plane's FB_ID is an object property with one value",
+            PLANE_ID,
+            OBJECT_PLANE,
+            &b"FB_ID"[..],
+            OBJECT_FB,
+        ),
+        (
+            "the primary plane's CRTC_ID is an object property with one value",
+            PLANE_ID,
+            OBJECT_PLANE,
+            &b"CRTC_ID"[..],
+            OBJECT_CRTC,
+        ),
+        (
+            "the cursor plane's FB_ID is an object property with one value",
+            CURSOR_PLANE_ID,
+            OBJECT_PLANE,
+            &b"FB_ID"[..],
+            OBJECT_FB,
+        ),
+    ] {
+        let ok = match property_id(fd, obj_id, obj_type, name) {
+            Some((id, _current)) => match property(fd, id) {
+                Some(prop) => {
+                    prop.flags & PROP_OBJECT != 0
+                        && prop.count_values == 1
+                        && prop.values[0] == tag as u64
+                }
+                None => false,
+            },
+            None => false,
+        };
+        lin::check_true(&mut failed, label.as_bytes(), ok);
     }
 
     // A move with no image bound still moves the pointer, and where it landed is

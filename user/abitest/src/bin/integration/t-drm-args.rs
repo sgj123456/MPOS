@@ -139,6 +139,12 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         EFAULT,
     );
 
+    // The *other* half of that rule - a zero count beside the dangling non-null
+    // pointer an empty `Vec` carries, which is not a fault - cannot be pinned
+    // from this file: it needs a card with no framebuffer, and by the time this
+    // program runs, `t-drm` has already created one. It is pinned at that point
+    // instead, in `t-drm`'s own enumeration.
+
     // `CREATE_BLOB`: the bytes are read *from* the caller, so an address that
     // is not the caller's fails the same way - and a kernel that reads it
     // anyway walks off into a page that is not there.

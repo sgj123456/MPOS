@@ -122,6 +122,36 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_true(&mut failed, b"one connector", word(40) == 1);
     lin::check_true(&mut failed, b"one encoder", word(44) == 1);
 
+    // And the second call of that same enumeration, which is the one a
+    // compositor actually reads its ids out of: the counts come back to the
+    // kernel beside buffers reserved at exactly those counts - a real one for
+    // the CRTC, and for the framebuffers this card has not created yet the
+    // dangling non-null pointer an empty `Vec` carries (address 4), because
+    // that is what `drm-ffi`'s `map_ptr!` hands over. A count of zero means
+    // nothing is copied and the pointer is never read; a kernel that validates
+    // it anyway answers `EFAULT` and the device is not added at all. This is
+    // also the only place the empty case can be pinned: it needs a card with no
+    // framebuffer, and this program runs before anything here creates one -
+    // `t-drm-args` runs after, by which time the card has one.
+    let mut fill = [0u8; 64];
+    let mut crtc_ids = [0u32; 1];
+    fill[8..16].copy_from_slice(&(crtc_ids.as_mut_ptr() as usize as u64).to_ne_bytes());
+    fill[0..8].copy_from_slice(&4u64.to_ne_bytes()); // the empty-Vec pointer
+    fill[36..40].copy_from_slice(&1u32.to_ne_bytes()); // count_crtcs
+    fill[32..36].copy_from_slice(&0u32.to_ne_bytes()); // count_fbs: none yet
+    let r = lin::ioctl(fd, ioc_d(NR_GETRESOURCES, 64), fill.as_mut_ptr() as usize);
+    lin::check_eq(
+        &mut failed,
+        b"the fill call succeeds with an empty array beside a dangling pointer",
+        r,
+        0,
+    );
+    lin::check_true(
+        &mut failed,
+        b"and it hands back the CRTC id it counted",
+        crtc_ids[0] != 0,
+    );
+
     // GETPLANERESOURCES: the one KMS list whose pointer comes *before* its
     // count (`plane_id_ptr@0`, `count_planes@8`), which is exactly the order
     // a card can get wrong and still look plausible - libdrm sizes its array
