@@ -86,15 +86,29 @@ bitflags::bitflags! {
 /// The features this kernel asks for, and no others.
 ///
 /// Deliberately not "everything the device offers": a feature accepted and then
-/// unused is a promise this kernel makes to a device that will act on it. The
-/// device's own command-gating bits are absent because the commands they gate do
-/// not exist here yet - `VIRGL` is the one that matters, and asking for it
-/// before there is a context to run would have the device offer a 3D path this
-/// kernel cannot drive. When those commands land they add their bits here, and
-/// the test below is what makes forgetting them fail.
+/// unused is a promise this kernel makes to a device that will act on it. What
+/// is here is what there is a command behind.
+///
+/// `VIRGL` and `CONTEXT_INIT` are asked for because the commands they gate now
+/// exist - `CTX_CREATE` and the rest of the 3D family in
+/// `drivers/virtio/gpu_ctrl.rs` - and asking is the only way to find out whether
+/// the device on the other side has them: the transport hands back the
+/// *intersection*, so a machine whose GPU is `virtio-gpu-pci` agrees to neither
+/// bit and the driver is left answering exactly what it answered before. That
+/// returned word is what [`crate::drm_virtgpu::Card`] is built from, which is
+/// why "did we really negotiate this" and "what does the card say it can do" are
+/// the same question.
+///
+/// A feature whose command is still missing stays out, and the test below is
+/// what makes forgetting to add one fail rather than pass silently:
+/// `RESOURCE_BLOB` and `BLOB_ALIGNMENT` gate blob resources, `RESOURCE_UUID`
+/// gates cross-device sharing, and `EDID` gates a request the DRM layer replaced
+/// with its own synthesized block.
 pub const WANTED_FEATURES: Features = Features::RING_INDIRECT_DESC
     .union(Features::RING_EVENT_IDX)
-    .union(Features::VERSION_1);
+    .union(Features::VERSION_1)
+    .union(Features::VIRGL)
+    .union(Features::CONTEXT_INIT);
 
 /// `VIRTIO_GPU_EVENT_DISPLAY`: bit 0 of `events_read`, raised by the host when
 /// the display it wants this machine to drive changes shape - a window resize
@@ -527,12 +541,19 @@ pub struct CtxResource {
 /// `struct virtio_gpu_cmd_submit`: the head of a `SUBMIT_3D`, which is a
 /// command stream preceded by its length.
 ///
-/// Only the head. On the wire it is followed by `size` bytes of the caller's
-/// stream and then the resource ids the stream refers to - a stream names its
-/// buffers by index, and the id list is how the device resolves them. That tail
-/// is why `SUBMIT_3D` is the one request here that is neither a struct nor a
-/// struct plus a fixed array, and `gpu_ctrl::submit_3d` is where its exact
-/// layout is pinned against the kernel's own `virtio_gpu_cmd_submit`.
+/// Only the head. On the wire it is followed by exactly `size` bytes of the
+/// caller's stream and **nothing else** - no resource list, and the word after
+/// `size` is padding in the plain sense (Linux `memset`s the struct and never
+/// writes it). The stream names the resources it touches by the ids the guest
+/// chose for them, so the device resolves them out of the stream itself; a
+/// caller's `bo_handles` are the *guest's* business, used to reserve and fence
+/// those objects on this side, and never become part of the request. That is
+/// read off `virtio_gpu_cmd_submit` and the scatterlist built beside it in
+/// `virtio_gpu_queue_fenced_ctrl_buffer`, which is the command struct, the data,
+/// the response, and no fourth element.
+///
+/// `gpu_ctrl::submit_3d` builds the request in that shape - the 32-byte struct
+/// and then the bytes, concatenated.
 ///
 /// **The stream is not parsed, here or by Linux.** `virtio_gpu_init_submit`
 /// hands the bytes to the device with `vmemdup_user` without looking at them,
@@ -898,23 +919,26 @@ mod tests {
         assert!(!bad.is(RESP_OK_NODATA));
     }
 
-    /// What this kernel asks for is what the queue is built to support, and
-    /// nothing the device will act on unasked. VIRGL is deliberately absent:
-    /// this change must not negotiate a feature whose commands do not exist yet.
+    /// What this kernel asks for is what it has a command behind, and nothing
+    /// the device will act on unasked.
     #[test]
-    fn the_wanted_features_are_the_queue_ones_and_no_more() {
+    fn the_wanted_features_are_the_queue_ones_and_the_two_3d_ones() {
         assert_eq!(
             WANTED_FEATURES,
             Features::RING_INDIRECT_DESC
                 .union(Features::RING_EVENT_IDX)
                 .union(Features::VERSION_1)
+                .union(Features::VIRGL)
+                .union(Features::CONTEXT_INIT)
         );
+        // Each of these gates something this kernel has no command for: blob
+        // resources and the blob alignment that goes with them, cross-device
+        // sharing by UUID, and the EDID request the DRM layer answers with its
+        // own synthesized block. Asking for one would be a promise, not a wish.
         for absent in [
-            Features::VIRGL,
             Features::EDID,
             Features::RESOURCE_UUID,
             Features::RESOURCE_BLOB,
-            Features::CONTEXT_INIT,
             Features::BLOB_ALIGNMENT,
         ] {
             assert!(
@@ -922,5 +946,13 @@ mod tests {
                 "unasked-for feature {absent:?}"
             );
         }
+        // The two 3D bits are asked for as a pair on purpose. `VIRGL` alone is
+        // usable - a device without `CONTEXT_INIT` gets its context made
+        // implicitly by the first command that needs one, which is the legacy
+        // path - but a device that agrees to `VIRGL` and not to `CONTEXT_INIT`
+        // is one whose `GETPARAM(6)` must answer `0`, and `Card` reads both from
+        // the same agreed word rather than assuming they travel together.
+        assert!(WANTED_FEATURES.contains(Features::VIRGL));
+        assert!(WANTED_FEATURES.contains(Features::CONTEXT_INIT));
     }
 }

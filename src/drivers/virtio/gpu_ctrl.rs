@@ -107,6 +107,16 @@ unsafe impl Send for Frames {}
 pub struct Gpu {
     transport: PciTransport,
     control: VirtQueue<HalImpl, QUEUE_SIZE>,
+    /// The feature word the transport actually agreed to, kept rather than
+    /// discarded once the queue is built.
+    ///
+    /// It is the only honest answer to "can this card run a 3D context": the
+    /// device names what it offers, the driver asks for what it has commands
+    /// behind, and the *intersection* is the truth about both. Reading
+    /// `WANTED_FEATURES` back would be reading the driver's own request, which
+    /// on a `virtio-gpu-pci` machine says `VIRGL` and is wrong - the device
+    /// agreed to neither 3D bit. `crate::drm_virtgpu::Card` is built from this.
+    agreed: abi::Features,
     /// The request being sent, and the response being read. One pair reused for
     /// every command, because `add_notify_wait_pop` does not return until the
     /// device has consumed the first and written the second - so no two commands
@@ -126,6 +136,11 @@ pub struct Gpu {
     /// How many pages `send` currently has, so `reserve` does not reallocate a
     /// block that is already big enough.
     send_pages: usize,
+    /// How many pages `recv` has, for the same reason - and the reason it is
+    /// needed at all is `GET_CAPSET`, whose reply is `24 + capset_max_size`
+    /// bytes rather than one fixed struct. The measured GL card's VIRGL2 set is
+    /// 1408 bytes, so this block grows where the 2D path never made it.
+    recv_pages: usize,
     /// How much of `send` the command in flight occupies. `pixels` hands back the
     /// whole block, and only this much of it is the request.
     flight: usize,
@@ -159,13 +174,26 @@ impl Gpu {
         Ok(Gpu {
             transport,
             control,
+            agreed,
             send: Frames::new(1),
             recv: Frames::new(1),
             send_pages: 1,
+            recv_pages: 1,
             flight: 0,
             fb: None,
             rect: None,
         })
+    }
+
+    /// What the transport agreed to, which is what every 3D answer is gated on.
+    ///
+    /// The DRM layer asks the render task for this once, at bring-up, and builds
+    /// `drm_virtgpu::Card` out of it: `VIRGL` here is `GETPARAM(1)`'s `1`, and
+    /// `CONTEXT_INIT` is `GETPARAM(6)`'s. Nothing else in the kernel is allowed
+    /// to decide a 3D capability from anything but this word - a driver that
+    /// answered from its own request would advertise a context it cannot make.
+    pub fn features(&self) -> abi::Features {
+        self.agreed
     }
 
     /// Make sure the send block can hold `bytes`, growing it if it cannot.
@@ -182,16 +210,45 @@ impl Gpu {
         }
     }
 
+    /// Make sure the receive block can hold `bytes`, growing it if it cannot.
+    ///
+    /// The same physically-contiguous constraint `reserve` has, for the same
+    /// reason, and called from the same place: a virtio descriptor names one
+    /// extent, and `GET_CAPSET`'s answer is the one reply whose length the
+    /// device chooses. The driver sizes it from the `capset_max_size` the device
+    /// itself reported, which is a device-supplied number - so the bound on it
+    /// is `Frames::new`'s, the allocator refusing rather than overcommitting.
+    fn reserve_recv(&mut self, bytes: usize) {
+        let pages = bytes.div_ceil(PAGE_SIZE).max(1);
+        if pages > self.recv_pages {
+            self.recv = Frames::new(pages);
+            self.recv_pages = pages;
+        }
+    }
+
     /// Send one command and hand back the first `rsp_len` bytes of its answer.
     ///
     /// `parts` are concatenated into the send buffer and go out as one
     /// descriptor chain entry, which is how the devices below expect a command:
     /// the header and its fields are one contiguous struct, and so is a struct
     /// with a variable tail (`RESOURCE_ATTACH_BACKING` followed by its
-    /// `MemEntry` list).
+    /// `MemEntry` list, `SUBMIT_3D` followed by its stream).
     fn submit(&mut self, parts: &[&[u8]], rsp_len: usize) -> Result<&[u8], Error> {
+        Ok(self.submit_written(parts, rsp_len)?.0)
+    }
+
+    /// The same, and how many bytes the device says it wrote.
+    ///
+    /// The length is only interesting for the one reply whose size the *device*
+    /// picks - `GET_CAPSET`'s cap set, where "the buffer could have held it" and
+    /// "the device sent it" are different claims and the driver clears the
+    /// buffer between commands, so the difference is zeroes that read as a
+    /// capability word. Everywhere else the answer is a fixed struct the device
+    /// writes in full or not at all, and `rsp_len` is already exact.
+    fn submit_written(&mut self, parts: &[&[u8]], rsp_len: usize) -> Result<(&[u8], usize), Error> {
         let need: usize = parts.iter().map(|part| part.len()).sum();
         self.reserve(need);
+        self.reserve_recv(rsp_len);
         {
             let buf = self.send.pixels();
             let mut at = 0;
@@ -202,21 +259,20 @@ impl Gpu {
             self.flight = at;
         }
         // A reply longer than a header is one the driver reads fields out of, so
-        // the buffer is cleared first: `add_notify_wait_pop` reports how many
-        // bytes the device wrote but does not shorten the slice, and a device
-        // that answered with less than it owed would otherwise have the rest
-        // read back as the *previous* command's reply. A header-only reply needs
-        // no clear - the header is written in full or not at all - and is not
-        // cleared, because `flush` is on the per-frame path.
+        // the buffer is cleared first: the device may write less than it owes,
+        // and a device that did would otherwise have the rest read back as the
+        // *previous* command's reply. A header-only reply needs no clear - the
+        // header is written in full or not at all - and is not cleared, because
+        // `flush` is on the per-frame path.
         if rsp_len > size_of::<abi::CtrlHeader>() {
             self.recv.pixels().fill(0);
         }
-        self.control.add_notify_wait_pop(
+        let written = self.control.add_notify_wait_pop(
             &[&self.send.pixels()[..self.flight]],
             &mut [self.recv.pixels()],
             &mut self.transport,
-        )?;
-        Ok(&self.recv.pixels()[..rsp_len])
+        )? as usize;
+        Ok((&self.recv.pixels()[..rsp_len], written))
     }
 
     /// A command whose whole answer is its `CtrlHeader`.
@@ -444,6 +500,224 @@ impl Gpu {
             resource_id: id,
             padding: 0,
         })
+    }
+
+    /// Create the context `id`, naming the cap set it runs.
+    ///
+    /// `context_init` folds the DRM layer's `ctx_set_params` into the word the
+    /// device reads: the cap set id under [`abi::CONTEXT_INIT_CAPSET_ID_MASK`]
+    /// and the ring count above it. This kernel passes the cap set id and leaves
+    /// the rings zero, which is the single-ring path Mesa's virgl uses.
+    ///
+    /// A device that did not offer `CONTEXT_INIT` still takes this command:
+    /// Linux sends it either way, with the word zero, and the context the first
+    /// command would have made implicitly is the same one. The feature decides
+    /// only whether a *caller* could name the cap set and the ring count, which
+    /// is why there is one method here rather than two.
+    ///
+    /// The name is truncated the way Linux's `strscpy` truncates it, to one byte
+    /// less than the field so the last byte stays a terminator, and `nlen` is
+    /// what was actually copied rather than what was offered.
+    pub fn ctx_create(&mut self, id: u32, context_init: u32, name: &str) -> Result<(), Error> {
+        let mut command = abi::CtxCreate {
+            header: abi::CtrlHeader {
+                kind: abi::CMD_CTX_CREATE,
+                ctx_id: id,
+                ..Default::default()
+            },
+            nlen: 0,
+            context_init,
+            debug_name: [0; 64],
+        };
+        let room = command.debug_name.len() - 1;
+        let n = name.len().min(room);
+        command.debug_name[..n].copy_from_slice(&name.as_bytes()[..n]);
+        command.nlen = n as u32;
+        self.ok(&command)
+    }
+
+    /// Release the context `id`.
+    ///
+    /// The device forgets the context; what it held is the device's to unmake,
+    /// and no resource is released by this - a resource outlives the context
+    /// that could name it.
+    pub fn ctx_destroy(&mut self, id: u32) -> Result<(), Error> {
+        self.ok(&abi::CtxDestroy {
+            header: abi::CtrlHeader {
+                kind: abi::CMD_CTX_DESTROY,
+                ctx_id: id,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Make `resource` reachable to the context `ctx`.
+    ///
+    /// The step between allocating a 3D resource and submitting a stream that
+    /// names it: the stream carries the guest's own resource ids, so the context
+    /// has to have been told which of them it may touch.
+    pub fn ctx_attach_resource(&mut self, ctx: u32, resource: u32) -> Result<(), Error> {
+        self.ctx_resource(abi::CMD_CTX_ATTACH_RESOURCE, ctx, resource)
+    }
+
+    /// The other direction: the context stops being allowed to name `resource`,
+    /// which is what a caller does before releasing it.
+    pub fn ctx_detach_resource(&mut self, ctx: u32, resource: u32) -> Result<(), Error> {
+        self.ctx_resource(abi::CMD_CTX_DETACH_RESOURCE, ctx, resource)
+    }
+
+    /// Both directions of `CTX_{ATTACH,DETACH}_RESOURCE`, which differ in the
+    /// command word and in nothing else.
+    fn ctx_resource(&mut self, kind: u32, ctx: u32, resource: u32) -> Result<(), Error> {
+        self.ok(&abi::CtxResource {
+            header: abi::CtrlHeader {
+                kind,
+                ctx_id: ctx,
+                ..Default::default()
+            },
+            resource_id: resource,
+            padding: 0,
+        })
+    }
+
+    /// Create a 3D resource in context `ctx`, from the caller's own fields.
+    ///
+    /// The whole struct rather than eleven arguments, because every field is the
+    /// caller's: the DRM layer has a `drm_virtgpu_resource_create` in its hand
+    /// and the mapping between the two is its business, not this driver's. What
+    /// is *set* here rather than taken is the header's command word and
+    /// `ctx_id` - a resource created under the 2D command, or in the wrong
+    /// context, is one the stream that wants it cannot name.
+    pub fn create_3d(&mut self, ctx: u32, request: &abi::ResourceCreate3d) -> Result<(), Error> {
+        let mut command = *request;
+        command.header.kind = abi::CMD_RESOURCE_CREATE_3D;
+        command.header.ctx_id = ctx;
+        self.ok(&command)
+    }
+
+    /// Move `request.box3d` of a resource between guest memory and the device,
+    /// in context `ctx`.
+    ///
+    /// One method for both directions because the request is one struct: only
+    /// the command word says which way the pixels go, and every field is
+    /// identical. `to_host` is a `bool` rather than two methods with similar
+    /// names, because the direction is the one thing a caller must not choose
+    /// wrongly.
+    pub fn transfer_host_3d(
+        &mut self,
+        to_host: bool,
+        ctx: u32,
+        request: &abi::TransferHost3d,
+    ) -> Result<(), Error> {
+        let mut command = *request;
+        command.header.kind = if to_host {
+            abi::CMD_TRANSFER_TO_HOST_3D
+        } else {
+            abi::CMD_TRANSFER_FROM_HOST_3D
+        };
+        command.header.ctx_id = ctx;
+        self.ok(&command)
+    }
+
+    /// Submit `stream` to context `ctx`, under the fence id `fence`.
+    ///
+    /// The request is the 32-byte [`abi::CmdSubmit`] followed by the stream and
+    /// nothing else - see that struct's own note for why there is no resource
+    /// list, and for why the bytes are opaque. Nothing in this function walks a
+    /// length that came out of the stream; `size` is the number of bytes copied.
+    ///
+    /// `ring_idx` selects one of the context's command rings and is zero for the
+    /// single-ring path, so a caller cannot get it out of step with the word the
+    /// device reads.
+    ///
+    /// The fence id is the *caller's* to allocate: it is a number a userland
+    /// ioctl gets back (`drm_virtgpu_execbuffer.fence`), so the layer that
+    /// answers that ioctl is the layer that hands it out, and the mailbox
+    /// between here and there stays an errno. `FLAG_FENCE` is what makes the
+    /// answer mean something - the device holds the response until the stream's
+    /// work is done, so returning from here is the work being done rather than
+    /// the bytes being taken. The response *is* the fence.
+    pub fn submit_3d(
+        &mut self,
+        ctx: u32,
+        ring_idx: u8,
+        fence: u64,
+        stream: &[u8],
+    ) -> Result<(), Error> {
+        let size = u32::try_from(stream.len()).map_err(|_| Error::IoError)?;
+        let command = abi::CmdSubmit {
+            header: abi::CtrlHeader {
+                kind: abi::CMD_SUBMIT_3D,
+                flags: abi::FLAG_FENCE,
+                fence_id: fence,
+                ctx_id: ctx,
+                ring_idx,
+                ..Default::default()
+            },
+            size,
+            padding: 0,
+        };
+        let answer = self.submit(
+            &[abi::as_bytes(&command), stream],
+            size_of::<abi::CtrlHeader>(),
+        )?;
+        let answer = abi::read_struct::<abi::CtrlHeader>(answer).ok_or(Error::IoError)?;
+        if answer.is(abi::RESP_OK_NODATA) {
+            Ok(())
+        } else {
+            Err(Error::IoError)
+        }
+    }
+
+    /// Ask the device what its cap set at `index` is.
+    ///
+    /// By index, and the reply is what says which set that is. The DRM layer
+    /// walks the indices once at bring-up to build its table; the ioctl path
+    /// never calls this, it answers out of that table.
+    pub fn get_capset_info(&mut self, index: u32) -> Result<abi::RespCapsetInfo, Error> {
+        let request = abi::GetCapsetInfo {
+            header: abi::CtrlHeader::new(abi::CMD_GET_CAPSET_INFO),
+            capset_index: index,
+            padding: 0,
+        };
+        let bytes = abi::as_bytes(&request);
+        let reply = self.submit(&[bytes], size_of::<abi::RespCapsetInfo>())?;
+        let answer: abi::RespCapsetInfo = abi::read_struct(reply).ok_or(Error::IoError)?;
+        if !answer.header.is(abi::RESP_OK_CAPSET_INFO) {
+            return Err(Error::IoError);
+        }
+        Ok(answer)
+    }
+
+    /// Fetch the cap set `id` at `version` into `out`.
+    ///
+    /// `out` is the caller's buffer and its length is the whole of the bound:
+    /// the device sends `24 + capset_max_size` bytes, and the caller sizes `out`
+    /// from that same number, which the device reported a round trip earlier.
+    /// A device that sent less is refused rather than read, because the driver
+    /// clears the receive buffer between commands - the bytes past what it wrote
+    /// are zeroes, and a capability word of zeroes is one a caller would act on.
+    ///
+    /// Stripping the header is [`abi::resp_capset_payload`]'s job, and this is
+    /// the one request in the protocol where the device decides a length.
+    pub fn get_capset(&mut self, id: u32, version: u32, out: &mut [u8]) -> Result<usize, Error> {
+        let request = abi::GetCapset {
+            header: abi::CtrlHeader::new(abi::CMD_GET_CAPSET),
+            capset_id: id,
+            capset_version: version,
+        };
+        let want = size_of::<abi::CtrlHeader>() + out.len();
+        let bytes = abi::as_bytes(&request);
+        let (reply, written) = self.submit_written(&[bytes], want)?;
+        if written < want {
+            return Err(Error::IoError);
+        }
+        let payload = abi::resp_capset_payload(reply).ok_or(Error::IoError)?;
+        if payload.len() < out.len() {
+            return Err(Error::IoError);
+        }
+        out.copy_from_slice(&payload[..out.len()]);
+        Ok(out.len())
     }
 
     /// Point `scanout_id` at `resource_id`, or at nothing when `resource_id` is
