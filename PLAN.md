@@ -520,14 +520,17 @@ it - so the entries say which they are:
       (`[qemu] gpu` names the card). Both forks §7.4 argued are settled and
       landed — the GPU driver is this kernel's rather than the crate's, and a
       submission reaches the device through the render task's mailbox, which the
-      resource path already uses.       **What still blocks `is_software()` is not the
-      3D queue: it is that libdrm cannot describe the card**, measured in §7.4's
-      second update below — Mesa never selects the virtio driver and
-      `drmGetDevices2` finds no card at all, because `drmGetDevice2` cannot
-      describe it. Serving the sysfs identity the loader reads directly changed
-      nothing, so the next measurement is the guest's udev entry for the card
-      rather than another sysfs attribute. That, not the command family, is the
-      first thing on this entry now.
+      resource path already uses. **What blocked `is_software()` was not the 3D
+      queue but the card's identity, and that is built now**: measured against a
+      working card's own sysfs reads, the node's `device` link had to lead to
+      the display-class PCI function — carrying `vendor`, `device`,
+      `subsystem_vendor`, `subsystem_device`, `uevent` and the `subsystem` link
+      libdrm resolves first — rather than to a `virtual` directory with no
+      attributes at all. §7.4's third update has the log and the pins. **The
+      renderer itself is still unverified**: the GL-card run that would answer
+      "eglinfo reports a non-software device" has not happened, because the
+      console defect below killed every attempt at it. That is the first thing
+      on this entry now, and it is a measurement rather than a build.
 - [~] the property families a compositor finds by name. **Four are built, and
       the list said seven**: `EDID` (a real 128-byte EDID 1.4 base block, and
       the connector's `mm_width`/`mm_height` are its own centimetre fields times
@@ -4080,6 +4083,60 @@ item in this section.
 > there — while the boot prints `virtio-9p: no share on the bus`, so there is no
 > file channel into the guest to work around the first defect with.
 
+> **Update, measured and then built (2026-10-02, the same night): the chain the
+> caller reads, and what this tree now answers.** The first recorder was
+> incomplete, and that is why its answer was too: libdrm opens sysfs through
+> `fopen64`, `open64`, `opendir` and `stat64`, and the first version hooked only
+> `open`/`openat`/`readlink` - so *libdrm's own reads were invisible to it*, and
+> what it showed was Mesa's fallback rather than the parse that fails. With
+> those four doors covered, the same recorder run against a working card on this
+> host gives the target, in this order:
+>
+> ```text
+> opendir   /dev/dri
+> stat64    /dev/dri/{card1,renderD128}
+> open      /dev/dri/renderD128
+> open64    /sys/dev/char/226:128/device/vendor
+> open64    /sys/dev/char/226:128/device/device
+> stat64    /sys/dev/char/226:128/device/drm
+> readlink  /sys/dev/char/226:128/device/subsystem -> ../../../../bus/pci
+> fopen64   /sys/dev/char/226:128/uevent
+> fopen64   /sys/devices/pci0000:00/.../0000:65:00.0/{vendor,device,
+>           subsystem_vendor,subsystem_device,uevent}
+> ```
+>
+> The guest answers the first four and stops: `device/vendor`, `device/device`
+> and `device/subsystem` are `ENOENT` there, because the node's `device` link
+> lands on `/sys/devices/virtual/virtio-gpu` - a directory holding one child
+> (`drm/`) and no attributes at all.
+>
+> **Built, and pinned by a host test that fails on the old tree**: the card now
+> hangs off the display-class PCI function, so `device` leads to a directory
+> that carries `vendor`, `device`, `subsystem_vendor`, `subsystem_device` and
+> `uevent`; `add_pci_attributes` gained the `subsystem` link it never had (which
+> is what libdrm resolves *before* it parses anything else, and gives up when it
+> is missing); and the parent's `drm/` listing was moved with it. That last part
+> had a bug worth recording: the listing's entries climb from the *parent*, one
+> level deeper than the node's own, and leaving them at the old depth made them
+> dangle - a listing whose entries resolve to nothing, which a reader walking
+> `/sys` (udev does, at coldplug) follows into nothing. The test now resolves
+> them, not merely lists them.
+>
+> **The section's first bar is still open, and this is the part not to paper
+> over**: `eglinfo` has not been re-run on the GL card with this kernel. Every
+> attempt died on the console defect above - a multi-kilobyte line is truncated
+> mid-send, at 8 bytes every 60 ms as much as at 16 every 20 - so the run that
+> would answer "non-software renderer" has not happened. What *is* measured: the
+> tree answers every question the working card's log asks, a host test pins it,
+> and the gate is green on a machine with a display-class GPU
+> (`pass=140 fail=0`, exit 33).
+>
+> **And one more machine defect, found by bisection rather than assumed**:
+> `udev failed to start` on this machine, and it is **not** this change - the
+> same image built with the change stashed fails identically, and the gate never
+> sees it because the gate boots an initramfs and not Alpine. It is its own
+> named gap, and it is now the reason a *stock* boot reports no udev at all.
+
 #### Measured: what Linux's card answers, request by request
 
 The family is written from an observation rather than from the UAPI header,
@@ -4606,9 +4663,12 @@ Each step stands on its own, which is the only reason the order is this one:
    only one that makes niri possible. **"Then virgl in the image" is the part
    still open, and it is upstream of the 3D queue**: Mesa does not reach the
    driver at all, because libdrm cannot describe the card — `drmGetDevices2`
-   returns 0 — and serving the sysfs identity the loader reads directly changes
-   nothing (§7.4's second update). The next step is a measurement of the guest's
-   udev entry for `c226:0`, and only then a shape to build.
+   returns 0. That chain is **built** now, from a working card's own sysfs reads
+   (§7.4's third update): the node hangs off the display-class PCI function, and
+   PCI functions carry the `subsystem` link they never had. What is left here is
+   a *measurement*, not a build: the GL-card run that says whether the renderer
+   is off `llvmpipe`, which the console defect below has so far killed every
+   attempt at.
 6. ~~**`/proc/<pid>/maps`**~~ and the frame pool: the supporting cast, wanted by
    everything above and by nothing in particular. (`MADV_DONTNEED` was on this
    line, and §5.2 has it now; `maps` is §Remaining's, and it is written - see

@@ -792,12 +792,54 @@ impl SysFs {
         // `target_os`: a tree the host cannot build is a tree nothing pins,
         // and the chain above is exactly the kind of shape that rots.
         {
+            // The PCI bus, and the devices on it. Built here rather than with
+            // the rest of the classes below, because the DRM nodes hang off
+            // the function that drives them and its directory has to exist
+            // first.
+            let pci = bus.add_dir("pci", next);
+            next += 1;
+            let (after_pci, display) = build_pci(&pci, &devices, pci_devices, next);
+            next = after_pci;
+
             let drm = class.add_dir("drm", next);
             next += 1;
             let drm_root = virtual_root.add_dir("drm", next);
             next += 1;
-            let gpu = virtual_root.add_dir("virtio-gpu", next);
-            next += 1;
+            // Where the card's parent lives. In Linux a DRM node is a child of
+            // the device that drives it, and the caller that matters asks that
+            // parent three questions: `vendor`, `device`, and - resolved, not
+            // read - `subsystem`, which is how it learns *which bus* it is
+            // looking at before it parses anything else. Measured on a working
+            // card and recorded in `PLAN.md` §7.4: libdrm's device parse reads
+            // exactly those three, then the parent's `drm/` listing and its
+            // `uevent`. A card hung from `/sys/devices/virtual/virtio-gpu` - a
+            // directory with no attributes at all - answers none of them,
+            // which is why a machine with 3D behind the card still reported a
+            // software renderer and no renderer at all when GBM asked.
+            //
+            // A machine whose bus has no display function keeps the older
+            // shape: there is no parent to name, and inventing one would be a
+            // claim about a bus nothing found.
+            //
+            // The climb is three levels - `card0` to `drm`, to `virtual`, to
+            // `devices` - and the function's own path is relative to
+            // `/sys/devices`, which is the name a `PCI_SLOT_NAME` carries.
+            let (gpu, path) = match display {
+                Some((dir, path)) => (dir, path),
+                None => {
+                    let dir = virtual_root.add_dir("virtio-gpu", next);
+                    next += 1;
+                    (dir, String::from("virtual/virtio-gpu"))
+                }
+            };
+            let parent = alloc::format!("../../../{}", path);
+            // The `drm/` listing hangs under the *parent*, so the links inside
+            // it climb from there rather than from the node - one level deeper
+            // for every name in the parent's path, plus `devices` and `sys`.
+            // Getting this wrong leaves the listing's entries dangling, which
+            // is worse than an empty listing: a reader that walks `/sys` - udev
+            // does, at coldplug - follows them into nothing.
+            let listing_up = path.matches('/').count() + 2;
             let gpu_drm = gpu.add_dir("drm", next);
             next += 1;
             for (name, minor, devnode) in [
@@ -865,7 +907,7 @@ impl SysFs {
                     "device",
                     Arc::new(SysSymlink {
                         ino: next,
-                        target: String::from("../../virtio-gpu"),
+                        target: parent.clone(),
                     }),
                 );
                 next += 1;
@@ -877,7 +919,7 @@ impl SysFs {
                     name,
                     Arc::new(SysSymlink {
                         ino: next,
-                        target: alloc::format!("../../drm/{}", name),
+                        target: alloc::format!("{}virtual/drm/{}", "../".repeat(listing_up), name),
                     }),
                 );
                 next += 1;
@@ -919,13 +961,11 @@ impl SysFs {
             next += 1;
         }
 
-        // The PCI bus, and the devices on it. The inode numbers are handed out
-        // in one sequence and a device carries many attributes, so this comes
-        // after the classes - nothing but "no two nodes share a number" is a
-        // contract here.
-        let pci = bus.add_dir("pci", next);
-        next += 1;
-        next = build_pci(&pci, &devices, pci_devices, next);
+        // The PCI bus was built above, before the DRM class: the card hangs
+        // off the function that drives it, so the function's directory has to
+        // exist first. A device carries many attributes and the inode numbers
+        // are handed out in one sequence, but nothing but "no two nodes share
+        // a number" is a contract here.
 
         let kernel = fs.root.add_dir("kernel", next);
         next += 1;
@@ -986,13 +1026,19 @@ fn build_pci(
     devices_root: &Arc<SysDir>,
     pci: Vec<Device>,
     mut next: Ino,
-) -> Ino {
+) -> (Ino, Option<(Arc<SysDir>, String)>) {
     let root_bus = devices_root.add_dir("pci0000:00", next);
     next += 1;
     let links = pci_dir.add_dir("devices", next);
     next += 1;
     let drivers = pci_dir.add_dir("drivers", next);
     next += 1;
+
+    // The display function, if the machine has one, and the path it lives at.
+    // The DRM class is built from this: a DRM node hangs off the device that
+    // drives it, so the node's `device` link has to name this directory, and
+    // the tree is walked once rather than searched a second time.
+    let mut display: Option<(Arc<SysDir>, String)> = None;
 
     // Which directory holds the devices of each bus, and where that directory
     // sits under `/sys/devices`. Bus 0 is the root bus's own; any other bus is
@@ -1029,12 +1075,25 @@ fn build_pci(
 
         next = add_pci_attributes(&dir, &drivers, device, &path, next);
 
+        // The display-class function is the one a DRM node belongs to. Linux's
+        // class codes put every GPU under `0x03`, and this kernel drives
+        // exactly one.
+        if device.class == PCI_CLASS_DISPLAY && display.is_none() {
+            display = Some((dir.clone(), path.clone()));
+        }
+
         if let Some(secondary) = device.bridge {
             buses.push((secondary, dir, path));
         }
     }
-    next
+    (next, display)
 }
+
+/// The base class code of a display controller - `0x03`, Linux's
+/// `PCI_CLASS_DISPLAY_VGA`/`_3D`/`_OTHER` family. The class byte is the base
+/// class and the bits below it are the subclass, so this is a comparison on
+/// the byte rather than on [`Device::class_code`].
+const PCI_CLASS_DISPLAY: u8 = 0x03;
 
 /// Hang one device's attributes in its own directory, and return the next free
 /// inode number.
@@ -1105,13 +1164,32 @@ fn add_pci_attributes(
     );
     next += 1;
 
-    // `driver` - the link `lspci -k` follows to name the driver in use. Its
-    // target is relative to the device's own directory, so how far up to go
-    // depends on how deep the device sits: one more level for every bridge
-    // between it and the root bus. And the directory it points at has to
-    // exist, because `realpath` resolves it - a link to nothing names nothing.
+    // How far up a relative link has to climb to reach `/sys`: one level for
+    // every name in the device's path, plus `devices` and `sys`. Both links
+    // below are relative to the device's own directory, so how deep the device
+    // sits decides it - one more level for each bridge between it and the root
+    // bus.
+    let up = path.matches('/').count() + 2;
+
+    // `subsystem` - which bus the device is on. This is not advice for a
+    // reader: libdrm resolves this link to learn which bus it is looking at
+    // *before* it parses the bus-specific attributes, and gives up when it is
+    // missing. Measured on a working card (`PLAN.md` §7.4): it answers
+    // `../../../../bus/pci`, and a DRM node whose parent has no such link is a
+    // device no caller can classify.
+    dir.add(
+        "subsystem",
+        Arc::new(SysSymlink {
+            ino: next,
+            target: alloc::format!("{}bus/pci", "../".repeat(up)),
+        }),
+    );
+    next += 1;
+
+    // `driver` - the link `lspci -k` follows to name the driver in use. The
+    // directory it points at has to exist, because `realpath` resolves it - a
+    // link to nothing names nothing.
     if let Some(driver) = device.driver {
-        let up = path.matches('/').count() + 2;
         if drivers.lookup(driver).is_err() {
             drivers.add_dir(driver, next);
             next += 1;
@@ -1455,6 +1533,117 @@ mod tests {
             },
             alloc::vec![disk, bridge, behind],
         )
+    }
+
+    /// A machine with a disk and a *display* function - the shape a DRM card
+    /// hangs from, and one `pci_fs` deliberately does not have: a display
+    /// function there would change the device list that fixture's own test
+    /// asserts, so the two machines stay separate.
+    fn gpu_fs() -> Arc<SysFs> {
+        let mut gpu = a_function(0, 2, 0);
+        gpu.vendor = 0x1af4;
+        gpu.device = 0x1050;
+        gpu.class = 0x03;
+        gpu.subclass = 0x00;
+        gpu.prog_if = 0x00;
+        gpu.driver = Some("virtio-pci");
+
+        SysFs::with(
+            Numbering {
+                devices: alloc::vec![BlockEntry {
+                    name: String::from("vda"),
+                    major: 254,
+                    minor: 0,
+                    whole: true,
+                    devpath: "/devices/virtio/block",
+                    sectors: 20 * 1024 * 1024,
+                }],
+            },
+            alloc::vec![gpu],
+        )
+    }
+
+    #[test]
+    fn a_card_hangs_off_the_function_that_drives_it() {
+        // What libdrm's device parse reads, measured on a working card and
+        // recorded in `PLAN.md` §7.4: given the descriptor it holds, `vendor`
+        // and `device` off the node's *parent*, the `subsystem` link resolved
+        // to learn which bus it is looking at, the parent's `drm/` listing,
+        // and the parent's `uevent`. This tree carried all of it except the
+        // parent: `device` landed on `virtual/virtio-gpu`, a directory with one
+        // child and no attributes at all, and a machine with 3D behind the card
+        // still reported a software renderer because of it.
+        // Built before the card's own tree, because the helper and the local
+        // cannot both be called `fs`.
+        let bare = fs();
+        let fs = gpu_fs();
+
+        for number in ["226:0", "226:128"] {
+            let parent = resolve(&fs, &alloc::format!("/sys/dev/char/{number}/device"));
+            assert_eq!(parent.metadata().kind, NodeKind::Dir, "a parent to ask");
+
+            // The two attributes it opens, as the function spells them.
+            assert_eq!(text(&parent.lookup("vendor").expect("vendor")), "0x1af4\n");
+            assert_eq!(text(&parent.lookup("device").expect("device")), "0x1050\n");
+
+            // And that it really is the function: the keys `lspci` reads are
+            // the proof that this is not a directory that merely answers the
+            // two names.
+            let uevent = text(&parent.lookup("uevent").expect("uevent"));
+            assert!(uevent.contains("PCI_ID=1AF4:1050"), "{uevent}");
+
+            // The link it resolves before it parses anything else. A device
+            // whose bus cannot be named is a device it refuses, which is what
+            // happens when the parent is a `virtual` directory.
+            assert_eq!(
+                resolve(
+                    &fs,
+                    &alloc::format!("/sys/dev/char/{number}/device/subsystem")
+                )
+                .metadata()
+                .kind,
+                NodeKind::Dir,
+                "the subsystem link resolves to the bus"
+            );
+
+            // And the listing that makes the two nodes siblings, which the
+            // DRM crate reads to hand a compositor its render node. The
+            // entries are *resolved*, not merely listed: the listing hangs
+            // under the parent, so its links have one more level to climb than
+            // the node's own, and a listing whose entries dangle is worse than
+            // an empty one - a reader walking `/sys` (udev, at coldplug)
+            // follows them into nothing, and the boot stalls on it. Names
+            // alone passed a version of this test that shipped exactly that.
+            for (name, expected) in [("card0", "226:0"), ("renderD128", "226:128")] {
+                let node = resolve(
+                    &fs,
+                    &alloc::format!("/sys/dev/char/{number}/device/drm/{name}"),
+                );
+                assert_eq!(node.metadata().kind, NodeKind::Dir, "{name} resolves");
+                assert_eq!(
+                    text(&node.lookup("dev").expect("dev")),
+                    alloc::format!("{expected}\n"),
+                    "{name} is the node it names"
+                );
+            }
+        }
+
+        // A machine with no display function keeps the older shape rather than
+        // pointing at nothing - there is no bus to name, and the card still has
+        // to be a device. Its listing resolves too, with a different number of
+        // levels to climb than the one above: the fallback parent is a name
+        // under `virtual`, the function is a name under `pci0000:00`, and both
+        // are two deep.
+        assert_eq!(
+            resolve(&bare, "/sys/dev/char/226:0/device").metadata().kind,
+            NodeKind::Dir
+        );
+        let fallback = resolve(&bare, "/sys/dev/char/226:0/device/drm/renderD128");
+        assert_eq!(fallback.metadata().kind, NodeKind::Dir);
+        assert_eq!(
+            text(&fallback.lookup("dev").expect("dev")),
+            String::from("226:128\n")
+        );
     }
 
     /// Resolve an absolute path the way a real reader does: `/sys` mounted on
