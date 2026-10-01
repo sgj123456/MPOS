@@ -29,13 +29,80 @@ const SYMLINK_HOPS: usize = 40;
 /// One mount as `/proc/mounts` and `/proc/self/mountinfo` print it: the mount
 /// point's node, the source and filesystem name `mount(2)` was given, and the
 /// two flags that decide how the line reads.
-type MountRow = (
-    Arc<dyn Inode>,
-    alloc::string::String,
-    alloc::string::String,
-    bool,
-    bool,
-);
+/// A mount as the *table* holds it, copied out before anything that walks the
+/// tree runs: naming a mountpoint takes the table's lock, so the walk happens
+/// after the copy rather than under it.
+struct MountEntry {
+    at: Arc<dyn Inode>,
+    mount_id: u64,
+    dev: u64,
+    source: alloc::string::String,
+    fstype: alloc::string::String,
+    read_only: bool,
+    bind: bool,
+}
+
+/// The per-mount options column, as both `/proc/mounts` and mountinfo spell it.
+///
+/// Only what this kernel can be asked for is reported: a caller that reads `ro`
+/// here knows a write will be refused, which is the one thing the column is
+/// for. A bind says so too, because that is how a reader tells a second name
+/// from a real second filesystem - `findmnt` and OpenRC's scan for the mount
+/// under `/run` both key on it.
+fn mount_options(read_only: bool, bind: bool) -> alloc::string::String {
+    alloc::string::String::from(match (read_only, bind) {
+        (true, true) => "ro,bind",
+        (true, false) => "ro",
+        (false, true) => "rw,bind",
+        (false, false) => "rw",
+    })
+}
+
+/// Whether the mountpoint `mountpoint` covers `path`: equal to it, or a
+/// directory prefix of it on a name boundary.
+///
+/// The boundary is the whole of it - `/mntx` is not under `/mnt` - and it is
+/// spelled once because two readers ask it: which mount serves a path, and
+/// which mount a mount hangs under.
+fn mountpoint_covers(mountpoint: &str, path: &str) -> bool {
+    if mountpoint == "/" {
+        return true;
+    }
+    path == mountpoint
+        || (path.starts_with(mountpoint) && path[mountpoint.len()..].starts_with('/'))
+}
+
+/// One mount, as `/proc/mounts` and `/proc/self/mountinfo` report it.
+///
+/// Both files are renderings of this. They are renderings of one fact, "what is
+/// mounted where", and two walks of the mount table that each derived it would
+/// be two answers to the same question. The fields a single file does not use
+/// are here rather than in a second accessor: `mounts` wants only four of them,
+/// while `mountinfo` wants the ids and the device as well, and the walk that
+/// names each mountpoint is the expensive part.
+pub struct MountRecord {
+    /// This mount's own id, unique per attachment and never reused - mountinfo's
+    /// first field. It is *not* [`Mount::id`]: that names the serving instance,
+    /// which a bind alias shares, and a reader that built a tree out of two
+    /// records carrying one id would fold two mounts into one.
+    pub mount_id: u64,
+    /// The id of the mount this one hangs under: the deepest mountpoint that
+    /// prefixes it, or this mount's own id for the root, which hangs under
+    /// nothing - mountinfo's second field.
+    pub parent_id: u64,
+    /// What `stat` reports as `st_dev` for paths on this mount, packed by
+    /// [`crate::uevent::makedev`] - mountinfo's `maj:min` column.
+    pub dev: u64,
+    /// The name `mount(2)` was given for the filesystem, or "none" for one
+    /// mounted without a source.
+    pub source: alloc::string::String,
+    /// Where it is mounted, named from the root.
+    pub path: alloc::string::String,
+    pub fstype: alloc::string::String,
+    /// The per-mount options: exactly what this kernel can be asked for, so a
+    /// reader that sees `ro` knows a write will be refused.
+    pub options: alloc::string::String,
+}
 
 /// One active mount: `at` is the directory inode in the parent filesystem,
 /// `root` is the root of the mounted one.
@@ -56,6 +123,13 @@ struct Mount {
     ///
     /// It is *not* what `stat`'s `st_dev` reports. See [`Mount::dev`].
     id: u64,
+    /// This attachment's own id, unique in the table and never reused: what a
+    /// mount is *named* by when one mount has to be told from another, which is
+    /// what mountinfo's id and parent-id columns are for. Distinct from both
+    /// numbers beside it: a bind's own id is its own while its `id` and `dev`
+    /// belong to the instance it aliases, and two names for one filesystem are
+    /// still two mounts.
+    mount_id: u64,
     /// What `stat`'s `st_dev` reports for every path this filesystem serves.
     ///
     /// Linux's answer, and not the same thing as `id`: for a filesystem with
@@ -107,6 +181,12 @@ pub struct Vfs {
     /// same reason `root_fstype` does - the root is reached directly and is not
     /// an entry to look itself up in.
     root_dev: Mutex<RefCell<u64>>,
+    /// The root's own [`Mount::mount_id`], for mountinfo's first two fields:
+    /// the root is a mount like any other to a reader of that file, and the one
+    /// that hangs under nothing.
+    root_mount_id: Mutex<RefCell<u64>>,
+    /// The source of mount ids: one per attachment, never reused.
+    mount_seq: Mutex<RefCell<u64>>,
     /// The source of filesystem instance ids. Ids start at 1: 0 is the root's.
     fs_seq: Mutex<RefCell<u64>>,
     /// The source of *anonymous device numbers*, for a filesystem with no
@@ -142,6 +222,8 @@ impl Vfs {
             root_fs: Mutex::new(RefCell::new(None)),
             root_read_only: Mutex::new(RefCell::new(false)),
             root_dev: Mutex::new(RefCell::new(0)),
+            root_mount_id: Mutex::new(RefCell::new(0)),
+            mount_seq: Mutex::new(RefCell::new(1)),
             fs_seq: Mutex::new(RefCell::new(1)),
             anon_seq: Mutex::new(RefCell::new(1)),
             mount_points: Mutex::new(RefCell::new(Vec::new())),
@@ -150,9 +232,11 @@ impl Vfs {
 
     /// Install the root filesystem. Once, at boot: a second call is a bug.
     pub fn mount_root(&self, fs: &dyn FileSystem) {
-        // Drawn before the lock is taken: it is its own counter, and a number
-        // minted under this section would be one more thing nested inside it.
+        // Drawn before the lock is taken: they are their own counters, and
+        // numbers minted under this section would be two more things nested
+        // inside it.
         let dev = self.next_anon_dev();
+        let mount_id = self.next_mount_id();
         critical_section::with(|cs| {
             let mut root = self.root.borrow(cs).borrow_mut();
             assert!(root.is_none(), "the root filesystem is already mounted");
@@ -163,6 +247,7 @@ impl Vfs {
             *self.root_fstype.borrow(cs).borrow_mut() =
                 Some(alloc::string::String::from(fs.name()));
             *self.root_dev.borrow(cs).borrow_mut() = dev;
+            *self.root_mount_id.borrow(cs).borrow_mut() = mount_id;
         });
     }
 
@@ -194,6 +279,21 @@ impl Vfs {
             let minor = *seq;
             *seq += 1;
             crate::uevent::makedev(0, minor as u32)
+        })
+    }
+
+    /// The next mount id, for mountinfo's first column: one per *attachment*,
+    /// and never reused, so no two records in any two readings of the file can
+    /// be confused for one another. A bind gets its own here even though it
+    /// borrows the instance's `id` and `dev` - it is a second mount, and
+    /// mountinfo is a list of mounts.
+    fn next_mount_id(&self) -> u64 {
+        critical_section::with(|cs| {
+            let seq = self.mount_seq.borrow(cs);
+            let mut seq = seq.borrow_mut();
+            let id = *seq;
+            *seq += 1;
+            id
         })
     }
 
@@ -230,12 +330,14 @@ impl Vfs {
             }
             let id = self.next_fs_id();
             let dev = self.next_anon_dev();
+            let mount_id = self.next_mount_id();
             mounts.push(Mount {
                 at,
                 root: fs.root(),
                 fstype: alloc::string::String::from(fs.name()),
                 source: alloc::string::String::from("none"),
                 id,
+                mount_id,
                 dev,
                 read_only: false,
                 fs: None,
@@ -468,6 +570,9 @@ impl Vfs {
             // the ext4 partition the init mounted, so this is where the root's
             // `st_dev` stops being an anonymous number and becomes `254:2`.
             *self.root_dev.borrow(cs).borrow_mut() = m.dev;
+            // The root is that mount now, and mountinfo names it by that id
+            // rather than by a number of its own.
+            *self.root_mount_id.borrow(cs).borrow_mut() = m.mount_id;
             mounts.retain(|e| {
                 named
                     .iter()
@@ -550,12 +655,14 @@ impl Vfs {
                 Some(dev) => dev,
                 None => self.next_anon_dev(),
             };
+            let mount_id = self.next_mount_id();
             mounts.push(Mount {
                 at,
                 root: fs.root(),
                 fstype: alloc::string::String::from(fstype),
                 source: alloc::string::String::from(source),
                 id,
+                mount_id,
                 dev,
                 read_only,
                 fs: Some(fs),
@@ -624,12 +731,14 @@ impl Vfs {
             if mounts.iter().any(|m| Arc::ptr_eq(&m.at, &at)) {
                 return Err(VfsError::Busy);
             }
+            let mount_id = self.next_mount_id();
             mounts.push(Mount {
                 at,
                 root: source,
                 fstype,
                 source: alloc::string::String::from(source_path),
                 id,
+                mount_id,
                 dev,
                 // A bind's own `MS_RDONLY` is a promise about writes *through
                 // this name*; it does not reach the shared filesystem, which
@@ -832,6 +941,7 @@ impl Vfs {
                         m.read_only,
                         m.fs.clone(),
                         m.dev,
+                        m.mount_id,
                     )
                 })
             {
@@ -840,6 +950,7 @@ impl Vfs {
                 *self.root_read_only.borrow(cs).borrow_mut() = entry.2;
                 *self.root_fs.borrow(cs).borrow_mut() = entry.3;
                 *self.root_dev.borrow(cs).borrow_mut() = entry.4;
+                *self.root_mount_id.borrow(cs).borrow_mut() = entry.5;
             }
             // Every mount in the table was attached somewhere in the old tree -
             // /dev, /tmp, the new root itself - and none of them can be reached
@@ -850,12 +961,14 @@ impl Vfs {
             mounts.clear();
             let id = self.next_fs_id();
             let dev = self.next_anon_dev();
+            let mount_id = self.next_mount_id();
             mounts.push(Mount {
                 at: put_old_inode.clone(),
                 root: old_root,
                 fstype: alloc::string::String::from("ramfs"),
                 source: alloc::string::String::from("initramfs"),
                 id,
+                mount_id,
                 dev,
                 read_only: false,
                 fs: None,
@@ -1142,70 +1255,90 @@ impl Vfs {
         None
     }
 
-    /// Every mount, as /proc/mounts reports them: source, mountpoint, type.
-    /// The root comes first, then the table in mounting order.
+    /// Every mount, as `/proc/mounts` and `/proc/self/mountinfo` report it: the
+    /// root first, then the table in mounting order.
     ///
-    /// This is the only record of what is mounted where that userland can
-    /// read, and the thing `mountinfo` and `mount -a` are built on.
-    pub fn mount_table(
-        &self,
-    ) -> Vec<(
-        alloc::string::String,
-        alloc::string::String,
-        alloc::string::String,
-        alloc::string::String,
-    )> {
+    /// One walk serves both files. They are two renderings of one fact - what
+    /// is mounted where - and a second walk that derived the same thing would
+    /// be a second answer to the same question; `mounts` prints four of these
+    /// fields and mountinfo wants the ids and the device as well.
+    pub fn mount_records(&self) -> Vec<MountRecord> {
         // The table is copied out first: naming each mount point walks the
         // tree, and that walk takes the same lock. Nested takes of the one
         // critical section are not something to lean on.
-        let (root_fstype, root_source, root_read_only, entries) = critical_section::with(|cs| {
-            let fstype = self.root_fstype.borrow(cs).borrow().clone();
-            let source = self.root_source.borrow(cs).borrow().clone();
-            let ro = *self.root_read_only.borrow(cs).borrow();
-            let entries: Vec<MountRow> = self
-                .mounts
-                .borrow(cs)
-                .borrow()
-                .iter()
-                .map(|m| {
-                    (
-                        m.at.clone(),
-                        m.source.clone(),
-                        m.fstype.clone(),
-                        m.read_only,
-                        m.bind,
-                    )
-                })
-                .collect();
-            (fstype, source, ro, entries)
-        });
-        let mut lines = Vec::new();
+        let (root_fstype, root_source, root_read_only, root_dev, root_mount_id, entries) =
+            critical_section::with(|cs| {
+                let entries: Vec<MountEntry> = self
+                    .mounts
+                    .borrow(cs)
+                    .borrow()
+                    .iter()
+                    .map(|m| MountEntry {
+                        at: m.at.clone(),
+                        mount_id: m.mount_id,
+                        dev: m.dev,
+                        source: m.source.clone(),
+                        fstype: m.fstype.clone(),
+                        read_only: m.read_only,
+                        bind: m.bind,
+                    })
+                    .collect();
+                (
+                    self.root_fstype.borrow(cs).borrow().clone(),
+                    self.root_source.borrow(cs).borrow().clone(),
+                    *self.root_read_only.borrow(cs).borrow(),
+                    *self.root_dev.borrow(cs).borrow(),
+                    *self.root_mount_id.borrow(cs).borrow(),
+                    entries,
+                )
+            });
+        let mut records: Vec<MountRecord> = Vec::new();
         if let (Some(fstype), Some(source)) = (root_fstype, root_source) {
-            lines.push((
+            records.push(MountRecord {
+                mount_id: root_mount_id,
+                // Filled in below, with every other mount's.
+                parent_id: root_mount_id,
+                dev: root_dev,
                 source,
-                alloc::string::String::from("/"),
+                path: alloc::string::String::from("/"),
                 fstype,
-                alloc::string::String::from(if root_read_only { "ro" } else { "rw" }),
-            ));
+                options: mount_options(root_read_only, false),
+            });
         }
-        for (at, source, fstype, read_only, bind) in entries {
-            if let Some(path) = self.path_of(&at) {
-                // The options column. Only what this kernel can be asked for
-                // is reported: a caller that reads "ro" here knows a write
-                // will be refused, which is the one thing the column is for.
-                // A bind says so too, because that is how a reader tells a
-                // second name from a real second filesystem - `findmnt` and
-                // OpenRC's scan for the mount under `/run` both key on it.
-                let options = match (read_only, bind) {
-                    (true, true) => alloc::string::String::from("ro,bind"),
-                    (true, false) => alloc::string::String::from("ro"),
-                    (false, true) => alloc::string::String::from("rw,bind"),
-                    (false, false) => alloc::string::String::from("rw"),
-                };
-                lines.push((source, path, fstype, options));
+        for entry in entries {
+            if let Some(path) = self.path_of(&entry.at) {
+                records.push(MountRecord {
+                    mount_id: entry.mount_id,
+                    parent_id: entry.mount_id,
+                    dev: entry.dev,
+                    source: entry.source,
+                    path,
+                    fstype: entry.fstype,
+                    options: mount_options(entry.read_only, entry.bind),
+                });
             }
         }
-        lines
+        // A mount hangs under the deepest *other* mountpoint that covers it;
+        // the root, which none of them does, hangs under itself - which is how
+        // Linux reports the root of the namespace.
+        let parents: Vec<u64> = (0..records.len())
+            .map(|i| {
+                let me = &records[i];
+                records
+                    .iter()
+                    .filter(|other| {
+                        other.mount_id != me.mount_id
+                            && mountpoint_covers(&other.path, &me.path)
+                            && other.path.len() < me.path.len()
+                    })
+                    .max_by_key(|other| other.path.len())
+                    .map_or(me.mount_id, |other| other.mount_id)
+            })
+            .collect();
+        for (record, parent) in records.iter_mut().zip(parents) {
+            record.parent_id = parent;
+        }
+        records
     }
 
     /// Whether `node` is the root of this tree - which answers `..` without a
@@ -1446,14 +1579,9 @@ pub fn unmount_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
     STATIC.unmount_resolved(&resolved)
 }
 
-/// Every mount, as /proc/mounts reports it.
-pub fn mount_table() -> Vec<(
-    alloc::string::String,
-    alloc::string::String,
-    alloc::string::String,
-    alloc::string::String,
-)> {
-    STATIC.mount_table()
+/// Every mount, as `/proc/mounts` and `/proc/self/mountinfo` report it.
+pub fn mount_records() -> Vec<MountRecord> {
+    STATIC.mount_records()
 }
 
 /// The filesystem instance id serving `path`, with its type. This is the
@@ -1973,6 +2101,62 @@ mod tests {
         for dev in [root_dev, proc_dev, sys_dev] {
             assert_eq!(crate::uevent::major_of(dev), 0);
         }
+    }
+
+    /// The record `/proc/self/mountinfo` prints carries the same number `stat`
+    /// reports for that mount's paths.
+    ///
+    /// This is the one thing the file is *for* - a tool that finds a mount's
+    /// device by `stat`ing its mountpoint, then looks that number up in
+    /// mountinfo to find where the device is mounted - and two walks of the
+    /// table that could disagree are how it stops being true. They come from one
+    /// place, and this is the test that says so.
+    #[test]
+    fn a_mount_records_device_is_the_one_stat_reports_there() {
+        let vfs = tree_with_root();
+        vfs.resolve("/")
+            .unwrap()
+            .create("mnt", NodeKind::Dir)
+            .unwrap();
+        let at = vfs.mountpoint_inode("/mnt", None).unwrap();
+        vfs.mount_at(
+            at,
+            RamFs::new(),
+            "ext4",
+            "/dev/vda2",
+            false,
+            Some(crate::uevent::makedev(254, 2)),
+        )
+        .unwrap();
+
+        // The root is not among them: `/proc/mounts` reports where a filesystem
+        // *came from*, and a root that no mount has been promoted into has no
+        // source to report. (`the_root_keeps_the_device_number_of_the_mount_it
+        // _came_from` above is the promoted case, and the one where the root's
+        // own record exists at all.)
+        let records = vfs.mount_records();
+        assert_eq!(records.len(), 1, "the one mount made here");
+        assert_eq!(records[0].path, "/mnt");
+        for record in &records {
+            assert_eq!(
+                record.dev,
+                vfs.dev_of_path(&record.path),
+                "the record for {} must agree with stat there",
+                record.path
+            );
+            assert_eq!(
+                record.dev,
+                vfs.dev_of_inode(&vfs.resolve(&record.path).unwrap()),
+                "and with the descriptor door, for a mount's own root"
+            );
+        }
+        // And the two doors really do disagree about different filesystems, so
+        // the agreement above is not just everything being one number.
+        assert_ne!(
+            records[0].dev,
+            vfs.dev_of_path("/"),
+            "the root is the ramfs, not the device"
+        );
     }
 
     /// Promoting a mount to `/` moves its device number with it.

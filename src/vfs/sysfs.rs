@@ -361,6 +361,34 @@ impl SysFs {
         let block = class.add_dir("block", 3);
 
         let mut next = 4;
+        // `/sys/block`: the *whole* disks and nothing else, each a link to its
+        // entry in the class directory - Linux's shape, where `/sys/block/<disk>`
+        // is a link into the device tree and a partition is deliberately not
+        // listed here.
+        //
+        // It is not a second spelling of `/sys/class/block`. A reader that wants
+        // every block device walks the class directory; a reader that wants to
+        // know what the machine has *storage* on walks this one, because a
+        // partition is not a disk. `lsblk` builds its table from exactly that
+        // distinction: it lists `/sys/block`, then looks inside each entry for
+        // the partitions, which is why the partitions are real directories
+        // under the disk (below) and not entries of their own.
+        let block_root = fs.root.add_dir("block", next);
+        next += 1;
+        // `/sys/bus/usb/devices`: the USB bus, with nothing on it.
+        //
+        // Empty, and deliberately so. Linux registers the USB bus whether or not
+        // the machine has a host controller, so a machine with no USB has an
+        // empty `devices` directory rather than no directory: `lsusb` opens this
+        // exact path and lists what it finds, and an empty directory is the true
+        // answer - "no USB devices" - where the absent one that used to be here
+        // was an error it reported and exited non-zero on. This kernel has no
+        // xHCI and no driver for one, so nothing will ever appear here; the
+        // directory says what is true about the tree, not what is hoped for.
+        let usb = bus.add_dir("usb", next);
+        next += 1;
+        usb.add_dir("devices", next);
+        next += 1;
         // `/sys/devices`: the tree every device really lives in - the input
         // devices under `virtual/`, the PCI functions under `pci0000:00/`.
         // Built *once*: `add_dir` names a directory in its parent, so a second
@@ -397,27 +425,88 @@ impl SysFs {
         // directory under `/sys/devices` in this tree, so their class entry is
         // where they really live.
         let mut devnodes: Vec<(&'static str, String, u32, u32)> = Vec::new();
+        let text = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        // The disk the partitions that follow belong to. `BlockEntry::of_disk`
+        // contributes a disk and then its own partitions, one disk at a time,
+        // and that order is the whole of what says which partition is whose -
+        // there is no parent to read, and a name does not say it either, since a
+        // partition is named `<disk><n>` and a disk may be called `sda1`.
+        let mut disk_home: Option<(alloc::string::String, Arc<SysDir>)> = None;
         for entry in numbering.devices.iter() {
             let name = &entry.name;
-            let dir = block.add_dir(name, next);
-            next += 1;
-            devnodes.push((
-                "block",
-                alloc::format!("class/block/{}", name),
-                entry.major,
-                entry.minor,
-            ));
+            // Where this device's attributes really live: one home per file.
+            // A whole disk's home is its own class entry; a partition's is
+            // *inside* its disk's, which is where Linux puts it - the partition
+            // is a child of the disk in the device tree - and where a reader
+            // that walks a disk looking for its partitions finds it. The class
+            // entry of a partition is then a link to that one home rather than a
+            // second copy of the same three attributes.
+            let (dir, home) = if entry.whole {
+                let dir = block.add_dir(name, next);
+                next += 1;
+                block_root.add(
+                    name,
+                    Arc::new(SysSymlink {
+                        ino: next,
+                        target: alloc::format!("../class/block/{name}"),
+                    }),
+                );
+                next += 1;
+                disk_home = Some((name.clone(), dir.clone()));
+                (dir, alloc::format!("class/block/{name}"))
+            } else {
+                let (disk_name, parent) = disk_home
+                    .clone()
+                    .expect("a partition is numbered after its own disk");
+                let dir = parent.add_dir(name, next);
+                next += 1;
+                block.add(
+                    name,
+                    Arc::new(SysSymlink {
+                        ino: next,
+                        target: alloc::format!("{disk_name}/{name}"),
+                    }),
+                );
+                next += 1;
+                (dir, alloc::format!("class/block/{disk_name}/{name}"))
+            };
+            devnodes.push(("block", home, entry.major, entry.minor));
             // The numbers, as `/dev` nodes are made from them.
-            let numbers = alloc::format!("{}:{}\n", entry.major, entry.minor);
-            let numbers: &'static str = Box::leak(numbers.into_boxed_str());
             dir.add(
                 "dev",
                 Arc::new(SysFile {
                     ino: next,
-                    content: numbers,
+                    content: text(alloc::format!("{}:{}\n", entry.major, entry.minor)),
                 }),
             );
             next += 1;
+            // What the device is worth, in 512-byte sectors - the unit sysfs
+            // uses, and the one `entry.sectors` is in. A reader that wants bytes
+            // multiplies; `lsblk` prints `SIZE` from this attribute and would
+            // print a partition as empty without it.
+            dir.add(
+                "size",
+                Arc::new(SysFile {
+                    ino: next,
+                    content: text(alloc::format!("{}\n", entry.sectors)),
+                }),
+            );
+            next += 1;
+            // How a partition is told from a disk, and which partition it is.
+            // The attribute exists on partitions only - a whole disk has no
+            // `partition` file, and its *absence* is what says "disk" - and its
+            // value is the partition's number in its table, which is the number
+            // its own name ends with and the minor it was given.
+            if !entry.whole {
+                dir.add(
+                    "partition",
+                    Arc::new(SysFile {
+                        ino: next,
+                        content: text(alloc::format!("{}\n", entry.minor)),
+                    }),
+                );
+                next += 1;
+            }
             dir.add(
                 "uevent",
                 Arc::new(SysEventAttr {
@@ -1095,14 +1184,28 @@ mod tests {
     fn the_tree_is_walkable_the_way_a_listener_walks_it() {
         // /class, then /class/block, then a device, then its attributes -
         // which is `trigger_path("/class", NULL, 2)` in nlplug-findfs.
+        //
+        // The device is reached by *path*, and that is the part worth stating:
+        // a disk's class entry is a directory while a partition's is a link to
+        // the directory inside its disk (Linux's shape, and see
+        // `a_partition_is_a_directory_under_its_disk_and_a_link_beside_it`), so
+        // a walk that went straight through the listing would have to resolve
+        // the link itself. Everything that reads this tree - udev, libmount,
+        // `lsblk` - resolves it, which is what this asserts.
         let fs = fs();
         let block = block_dir(&fs);
+        let mut seen = 0;
         for (name, kind) in block.read_dir().expect("a listing") {
-            assert_eq!(kind, NodeKind::Dir, "{} is a device directory", name);
-            let device = block.lookup(&name).expect("the device");
+            assert!(
+                matches!(kind, NodeKind::Dir | NodeKind::Symlink),
+                "{name} is a device entry, not a {kind:?}"
+            );
+            let device = resolve(&fs, &alloc::format!("/sys/class/block/{name}"));
             device.lookup("dev").expect("dev");
             device.lookup("uevent").expect("uevent");
+            seen += 1;
         }
+        assert_eq!(seen, 3, "vda and both of its partitions");
     }
 
     #[test]
@@ -1110,7 +1213,9 @@ mod tests {
         let fs = fs();
         let block = block_dir(&fs);
         for (name, _kind) in block.read_dir().unwrap() {
-            let dev = block.lookup(&name).unwrap().lookup("dev").unwrap();
+            let dev = resolve(&fs, &alloc::format!("/sys/class/block/{name}"))
+                .lookup("dev")
+                .unwrap();
             let mut buf = [0u8; 16];
             let n = dev.read_at(0, &mut buf).expect("read");
             let text = core::str::from_utf8(&buf[..n]).unwrap().trim();
@@ -1118,6 +1223,123 @@ mod tests {
             assert_eq!(major, "254", "virtio-blk is major 254");
             assert!(minor.parse::<u32>().is_ok());
         }
+    }
+
+    /// The block shape the tools read, verified against one of them.
+    ///
+    /// Measured, not derived: busybox 1.38's `lsblk` - which is what this image's
+    /// `/bin/lsblk` is - was run against mockups of this tree on the host.
+    ///
+    /// * A partition's entry under its disk that is a **directory** holding its
+    ///   own `dev` (and, for `lsblk` to print a size, its own `size`): the full
+    ///   table, `vda`, `vda1`, `vda2` with the mount point of the one that is
+    ///   mounted, `vda3`.
+    /// * The same entry as a **symlink** to the class entry: `lsblk` printed
+    ///   `vda` and no partitions at all, having opened
+    ///   `/sys/block/vda/vda1/dev` and found nothing it accepted as a partition.
+    ///   So the entry under the disk has to be a directory, which is Linux's
+    ///   shape as well - on Linux `/sys/block/vda/vda1` is the partition's own
+    ///   device directory, and it is `/sys/class/block/vda1` that is the link.
+    ///
+    /// Both facts hold at once here because each file has exactly *one* home:
+    /// the directory lives inside the disk, and the class entry is a link to it,
+    /// so `dev` is written once and read by both names.
+    #[test]
+    fn a_partition_is_a_directory_under_its_disk_and_a_link_beside_it() {
+        let fs = fs();
+        let block = block_dir(&fs);
+
+        // The disk is a directory with its own attributes, and its partitions are
+        // directories inside it - which is what a walk of `/sys/block/<disk>`
+        // finds.
+        let disk = resolve(&fs, "/sys/class/block/vda");
+        assert_eq!(disk.metadata().kind, NodeKind::Dir);
+        assert_eq!(at(&fs, "/sys/class/block/vda/dev"), "254:0\n");
+        let disk_listing = disk
+            .read_dir()
+            .expect("a listing")
+            .into_iter()
+            .collect::<Vec<_>>();
+        // The partitions are the *directories* in the disk's entry - its other
+        // children are its own attributes - which is exactly the distinction a
+        // walk looking for partitions makes.
+        let partitions = disk_listing
+            .iter()
+            .filter(|(_, kind)| *kind == NodeKind::Dir)
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(partitions, ["vda1", "vda2"], "both of its partitions");
+
+        // A partition's class entry is a link, and it resolves to the *same*
+        // inode as the entry under the disk - one home, two names, which is how
+        // a reader can be sure the two are one device.
+        let beside = resolve(&fs, "/sys/class/block/vda1");
+        let nested = resolve(&fs, "/sys/class/block/vda/vda1");
+        assert_eq!(
+            beside.metadata().ino,
+            nested.metadata().ino,
+            "the class entry and the nested one are one directory"
+        );
+        assert_eq!(beside.metadata().kind, NodeKind::Dir);
+
+        // And the attributes a tool asks a partition for are all reachable
+        // through either name: its numbers, its size in 512-byte sectors, which
+        // partition it is, and - the one that tells it from a disk - the fact
+        // that `partition` is there at all.
+        assert_eq!(at(&fs, "/sys/class/block/vda1/dev"), "254:1\n");
+        assert_eq!(at(&fs, "/sys/class/block/vda/vda1/dev"), "254:1\n");
+        assert_eq!(at(&fs, "/sys/class/block/vda1/partition"), "1\n");
+        assert_eq!(at(&fs, "/sys/class/block/vda2/partition"), "2\n");
+        // `size` is in 512-byte sectors, which is sysfs's unit and the one the
+        // numbering carries - so it is the fixture's `20 MiB less one KiB`
+        // exactly, not a rounded or byte-scaled version of it.
+        assert_eq!(at(&fs, "/sys/class/block/vda2/size"), "20970496\n");
+        assert!(
+            resolve(&fs, "/sys/class/block/vda")
+                .lookup("partition")
+                .is_err(),
+            "a whole disk is not a partition: the attribute is absent, and its              absence is what says so"
+        );
+
+        // `/sys/block` holds the disk and only the disk - a partition is not
+        // something the machine has storage on.
+        let storage = resolve(&fs, "/sys/block").read_dir().expect("a listing");
+        assert_eq!(
+            storage
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["vda"],
+            "the whole disks, and no partitions among them"
+        );
+        assert_eq!(at(&fs, "/sys/block/vda/dev"), "254:0\n");
+        assert_eq!(at(&fs, "/sys/block/vda/vda1/dev"), "254:1\n");
+
+        // And `/sys/dev/block/<maj>:<min>` reaches the same place, which is how
+        // a tool that holds a device number gets to the device's directory.
+        assert_eq!(at(&fs, "/sys/dev/block/254:2/dev"), "254:2\n");
+        assert_eq!(at(&fs, "/sys/dev/block/254:2/partition"), "2\n");
+    }
+
+    /// `/sys/bus/usb/devices` exists and is empty.
+    ///
+    /// The counterfactual is the failure this fixed: busybox's `lsusb` opens
+    /// this one path, and with it absent it printed
+    /// `/sys/bus/usb/devices: No such file or directory` and exited 1. With it
+    /// present and empty it prints nothing and exits 0 - which is what `lsusb`
+    /// does on a Linux machine with no host controller, because the bus is
+    /// registered whether or not anything is on it. A test that asserted the
+    /// directory *has* something in it would be asserting a USB driver this
+    /// kernel does not have.
+    #[test]
+    fn the_usb_bus_is_present_and_empty() {
+        let fs = fs();
+        let devices = resolve(&fs, "/sys/bus/usb/devices");
+        assert_eq!(devices.metadata().kind, NodeKind::Dir);
+        assert!(
+            devices.read_dir().expect("a listing").is_empty(),
+            "nothing is plugged into a bus this machine does not have"
+        );
     }
 
     #[test]
@@ -1269,6 +1491,12 @@ mod tests {
         vfs.mount("/sys", &**fs).unwrap();
         vfs.resolve(path)
             .unwrap_or_else(|e| panic!("{path} did not resolve: {e:?}"))
+    }
+
+    /// The contents of the file at a `/sys` path, with any link on the way
+    /// resolved - which is how every reader of this tree reads an attribute.
+    fn at(fs: &Arc<SysFs>, path: &str) -> String {
+        text(&resolve(fs, path))
     }
 
     fn text(node: &Arc<dyn Inode>) -> String {

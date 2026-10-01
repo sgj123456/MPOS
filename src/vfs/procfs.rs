@@ -1092,6 +1092,10 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
         NodeKind::File,
         maybe_file(move || children_of(pid, tid)),
     );
+    // A thread sees the same mounts its process does, and asks at its own
+    // name: `/proc/thread-self/mountinfo` is where a threaded program looks.
+    node.add("mounts", NodeKind::File, file(mounts_text));
+    node.add("mountinfo", NodeKind::File, file(mountinfo_text));
     node
 }
 
@@ -1161,6 +1165,17 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     );
     node.add("statm", NodeKind::File, maybe_file(move || statm_line(pid)));
     node.add("maps", NodeKind::File, maybe_file(move || maps_of(pid)));
+    // The mount table, in both spellings, under *every* process rather than
+    // once at the top of `/proc`.
+    //
+    // Linux keeps these two per mount namespace, so their home is the process;
+    // this kernel has one namespace and every process gets the same answer -
+    // but the answer has to be at this name, because `/proc/self/mountinfo` is
+    // the path a program actually opens. `/proc/mounts` is what a shell reads
+    // by hand; the same two files under `/proc/self` are what `libmount`, and
+    // therefore `mount`, `findmnt`, `lsblk` and `df`, read.
+    node.add("mounts", NodeKind::File, file(mounts_text));
+    node.add("mountinfo", NodeKind::File, file(mountinfo_text));
     #[cfg(target_os = "none")]
     node.add(
         "limits",
@@ -1477,9 +1492,108 @@ fn partitions_text(numbering: &crate::uevent::Numbering) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The name of this machine, as the caller's namespace spells it.
+// What is mounted where, in the shape each reader of it expects.
 // ---------------------------------------------------------------------------
 
+/// `/proc/mounts`: the mount table in `fstab`'s six columns - source, mount
+/// point, type, options, dump, pass.
+///
+/// The fourth column is the one that matters: `ro` says a write here will be
+/// refused, and userland reads it to decide whether to remount. The last two
+/// are `dump`'s and `fsck`'s and are zero for everything here, as they are on
+/// Linux for every filesystem no dump or fsck would ever be pointed at.
+fn mounts_text() -> String {
+    let mut out = String::new();
+    for record in super::mount::global().mount_records() {
+        out.push_str(&alloc::format!(
+            "{} {} {} {} 0 0\n",
+            if record.source.is_empty() {
+                "none"
+            } else {
+                &record.source
+            },
+            record.path,
+            record.fstype,
+            record.options
+        ));
+    }
+    out
+}
+
+/// `/proc/self/mountinfo`: the mount table with its identities attached.
+///
+/// A *different file* from `/proc/mounts`, not a longer spelling of it, and the
+/// difference is what it is for. `/proc/mounts` is a list of what is mounted
+/// where; mountinfo is that plus the three numbers a caller needs to *correlate*
+/// the list with the rest of the machine - a unique id per mount, the id of the
+/// mount it hangs under, and the `maj:min` of the device it lives on. The last
+/// is the one that gets used: it is how a tool that has a block device in its
+/// hand (`/sys/class/block/vda2`, say) finds out where that device is mounted,
+/// and `lsblk`'s MOUNTPOINTS column, `findmnt`, `df` and systemd's mount units
+/// are all that correlation.
+///
+/// The format is `proc(5)`'s, ten fields and a separator:
+///
+/// ```text
+/// id parent maj:min root mountpoint options [optional...] - fstype source super-options
+/// ```
+///
+/// `root` is always `/` here: this kernel mounts whole filesystems and has no
+/// subtree mounts, so a mount's root *is* the filesystem's root. The optional
+/// fields between the options and the `-` carry propagation and idmapping
+/// information (`shared:`, `master:`, `uid_map`), none of which this kernel
+/// has: a mount belongs to one namespace and shares with nothing, and an empty
+/// list is what Linux prints for a mount that shares with nothing either.
+fn mountinfo_text() -> String {
+    mountinfo_lines(&super::mount::global().mount_records())
+}
+
+/// [`mountinfo_text`] over a mount table the caller supplies, so the rendering
+/// can be checked without a machine to have mounted anything: the kernel hands
+/// it the table it built from the mounts it really made, and a host test hands
+/// it one it wrote down.
+fn mountinfo_lines(records: &[crate::vfs::mount::MountRecord]) -> String {
+    let mut out = String::new();
+    for record in records {
+        // The device column, in the `maj:min` spelling every reader decodes -
+        // the same two numbers `/sys/class/block/<name>/dev` publishes and
+        // `stat`'s `st_dev` packs, which is the point: a reader that has one of
+        // the three can compare it against this column directly.
+        let dev = alloc::format!(
+            "{}:{}",
+            crate::uevent::major_of(record.dev),
+            crate::uevent::minor_of(record.dev)
+        );
+        // The superblock options are the write promise, and they say the same
+        // thing the per-mount column does only because a mount here has no
+        // per-mount flag the filesystem does not also have.
+        let super_options = if record.options.starts_with("ro") {
+            "ro"
+        } else {
+            "rw"
+        };
+        out.push_str(&alloc::format!(
+            "{} {} {} / {} {} - {} {} {}\n",
+            record.mount_id,
+            record.parent_id,
+            dev,
+            record.path,
+            record.options,
+            record.fstype,
+            if record.source.is_empty() {
+                "none"
+            } else {
+                &record.source
+            },
+            super_options
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The name of this machine, as the caller's namespace spells it.
+// ---------------------------------------------------------------------------
 /// The name the *caller's* namespace calls itself - `uname(2)`'s `nodename`,
 /// `hostname(1)`'s answer, and the contents of `/proc/sys/kernel/hostname`.
 ///
@@ -1534,26 +1648,7 @@ impl ProcFs {
     fn build(&self) {
         // What is mounted where: the only record of it that userland can
         // read, and the thing `mountinfo` and `mount -a` stand on.
-        self.root.add(
-            "mounts",
-            NodeKind::File,
-            file(|| {
-                let mut out = String::new();
-                for (source, path, fstype, options) in super::mount::global().mount_table() {
-                    // The fourth column is the mount options, and it is the one
-                    // that matters: `ro` says a write here will be refused, and
-                    // userland reads it to decide whether to remount.
-                    out.push_str(&alloc::format!(
-                        "{} {} {} {} 0 0\n",
-                        if source.is_empty() { "none" } else { &source },
-                        path,
-                        fstype,
-                        options
-                    ));
-                }
-                out
-            }),
-        );
+        self.root.add("mounts", NodeKind::File, file(mounts_text));
         // Which filesystem types a mount(2) may name. The `nodev` mark is
         // not decoration: a caller mounting a *device* - busybox's mount,
         // probing for the type it was not told - tries the unmarked entries
@@ -1647,6 +1742,16 @@ impl ProcFs {
         );
         self.root
             .add("partitions", NodeKind::File, file(partitions));
+        // `/proc/modules`: what is loaded here, which is nothing.
+        //
+        // Not a stub. This kernel has no loadable modules - every driver is
+        // compiled into the image - and an empty file is how that fact is said
+        // in the shape the reader expects. `lsmod` prints its header and no rows,
+        // exactly as it does on a Linux built with no modules; an *absent* file
+        // is an error the caller has to special-case instead, which is what it
+        // was. Nor is a file that says "cannot tell you" better: the difference
+        // between "none" and "unknown" is the whole value of the file.
+        self.root.add("modules", NodeKind::File, file(String::new));
         self.root.add(
             "stat",
             NodeKind::File,
@@ -2086,6 +2191,92 @@ mod tests {
     /// boot disk and its partitions" there was one size in this file, and a
     /// renderer that used it for everything would show the SATA disk as the
     /// size of the virtio one.
+    /// `/proc/modules` exists, and reads as nothing at all.
+    ///
+    /// The counterfactual is the report that started this: `lsmod` printed
+    /// `/proc/modules: No such file or directory` and exited 1. With the file
+    /// there and empty it prints its header and no rows and exits 0, which is
+    /// what it does on a Linux with no modules - and a file that existed but
+    /// said "unknown" would be the wrong answer in a way `lsmod` could not
+    /// report, since it has no vocabulary for one.
+    #[test]
+    fn modules_is_present_and_empty() {
+        let fs = ProcFs::new();
+        let modules = fs.root().lookup("modules").expect("/proc/modules");
+        assert_eq!(modules.metadata().kind, NodeKind::File);
+        let mut buf = [0u8; 16];
+        assert_eq!(modules.read_at(0, &mut buf).expect("a read"), 0);
+    }
+
+    /// `mountinfo` is parsed by field position and by nothing else, so the
+    /// position of every field is the whole of its contract.
+    ///
+    /// The measurement behind the shape: busybox 1.38's `lsblk` - which is what
+    /// this image's `/bin/lsblk` is - was run on the host against a mockup of
+    /// this tree and a file rendered by this function, and it printed the device
+    /// table *with* its `MOUNTPOINTS` column, matching the mount to the disk by
+    /// the third field alone. Take that field away, or put the attachment
+    /// counter there as the kernel used to, and the column comes out blank.
+    #[test]
+    fn mountinfo_prints_the_fields_proc_5_lists_in_the_order_it_lists_them() {
+        let records = [
+            crate::vfs::mount::MountRecord {
+                mount_id: 1,
+                parent_id: 1,
+                dev: crate::uevent::makedev(0, 1),
+                source: String::from("rootfs"),
+                path: String::from("/"),
+                fstype: String::from("ramfs"),
+                options: String::from("rw"),
+            },
+            crate::vfs::mount::MountRecord {
+                mount_id: 2,
+                parent_id: 1,
+                dev: crate::uevent::makedev(254, 2),
+                source: String::from("/dev/vda2"),
+                path: String::from("/sysroot"),
+                fstype: String::from("ext4"),
+                options: String::from("rw"),
+            },
+            crate::vfs::mount::MountRecord {
+                mount_id: 3,
+                parent_id: 2,
+                dev: crate::uevent::makedev(0, 2),
+                source: String::from("proc"),
+                path: String::from("/sysroot/proc"),
+                fstype: String::from("proc"),
+                options: String::from("ro,bind"),
+            },
+        ];
+        let rendered = mountinfo_lines(&records);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3, "one line per mount");
+
+        let fields: Vec<&str> = lines[1].split(' ').map(|f| f).collect();
+        assert_eq!(fields[0], "2", "field 1: the mount's own id");
+        assert_eq!(fields[1], "1", "field 2: the mount it hangs under");
+        assert_eq!(fields[2], "254:2", "field 3: the device, as maj:min");
+        assert_eq!(fields[3], "/", "field 4: the root of the mount in the fs");
+        assert_eq!(fields[4], "/sysroot", "field 5: where it is mounted");
+        assert_eq!(fields[5], "rw", "field 6: the per-mount options");
+        assert_eq!(fields[6], "-", "field 7: the separator, nothing optional");
+        assert_eq!(fields[7], "ext4", "field 8: the type");
+        assert_eq!(fields[8], "/dev/vda2", "field 9: the source");
+        assert_eq!(fields[9], "rw", "field 10: the superblock options");
+        assert_eq!(fields.len(), 10, "and nothing else - ten fields, no more");
+
+        // The root hangs under itself, which is how Linux reports the root of a
+        // namespace, and a pseudo-filesystem's device is anonymous rather than
+        // absent: 0:1, not the `0:0` that means "no device".
+        assert_eq!(lines[0].split(' ').nth(1), Some("1"), "the root's parent");
+        assert_eq!(lines[0].split(' ').nth(2), Some("0:1"));
+        assert_eq!(lines[2].split(' ').nth(2), Some("0:2"));
+        // A read-only mount says so, and says it in both columns - the third
+        // mount is a bind, so the per-mount options carry both facts.
+        assert_eq!(lines[2].split(' ').nth(5), Some("ro,bind"));
+        assert_eq!(lines[2].split(' ').last(), Some("ro"));
+    }
+
     #[test]
     fn partitions_lists_every_disk_the_machine_has() {
         use crate::uevent::BlockEntry;
