@@ -478,9 +478,16 @@ it - so the entries say which they are:
       `DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE` are `1`; the gaps left
       are named in §7.4 (an out-fence that is already through, and no
       `TIMELINE`-flag behaviour to give the two flags this host's header has)
-- [ ] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
+- [~] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
       the only one that lets niri, which rejects software EGL outright, run at
-      all; virgl and venus are both built on it (§7.4)
+      all; virgl and venus are both built on it (§7.4). **Measured and designed,
+      not yet landed**: the family's answers on both machine shapes are observed
+      (`user/staging/virtgpu-probe/`), the machine can be given a GL card
+      (`[qemu] gpu`), and the two forks are settled in §7.4 — the GPU driver
+      becomes this kernel's rather than the crate's, and a submission reaches
+      the device through the render task's mailbox. The family lands whole or
+      not at all, and §7.4 says why a refusals-only half-serve would be worse
+      than the `ENOTTY` it replaces.
 - [~] the property families a compositor finds by name. **Four are built, and
       the list said seven**: `EDID` (a real 128-byte EDID 1.4 base block, and
       the connector's `mm_width`/`mm_height` are its own centimetre fields times
@@ -3787,6 +3794,51 @@ initramfs, so "which request the winsys makes in which order" is still a source
 reading rather than an observation here. The directory's README says so, so it
 cannot be mistaken for measured.
 
+#### The two decisions the kernel work starts from
+
+With the measurement in hand the kernel work has two forks already settled, and
+both are written down because each rejects an option that looks cheaper.
+
+**The driver becomes this kernel's, not the crate's.** `DRM_VIRTGPU_*` is
+carried by the virtio-gpu *control queue*, and that queue lives inside
+`virtio_drivers::device::gpu::VirtIOGpu` - whose command set stops at `GET_EDID`,
+which negotiates no `VIRGL` feature, and which exposes no accessor for the queue.
+So the family cannot be added from outside the crate. The two ways in are (a)
+vendor `virtio-drivers` 0.13.0 into `vendor/` with a `[patch.crates-io]`, keeping
+the 2D path bit-identical, or (b) own the GPU driver in
+`src/drivers/virtio/gpu_ctrl.rs` on the crate's *public*
+`VirtQueue`/`Hal`/`Transport`, keeping the crate for every other device. **(b) is
+the choice**, and the reason is measured rather than aesthetic: the kernel calls
+exactly **four** things of that crate's GPU device - `new`, `resolution()`,
+`change_resolution()` and `flush()` - and uses neither its EDID parsing (413
+lines the DRM layer replaces with its own synthesized blob) nor its virtio cursor
+queue (the DRM cursor is a real second plane, `drm_cursor.rs`). Vendoring ~13,000
+lines to add ~400 would make every future crate bump a merge, while (b) puts the
+new ABI facts in a host-testable module, which is where §4.6 wants them. What
+(b) puts at risk is a working, pinned 2D path - and the pins (`t-fb`, `t-drm`,
+the boot's own display probe) are what guard it.
+
+**A 3D submission reaches the device through the render task.** The render task
+takes the device out of `DEVICE` at its start and is its sole owner; that is what
+makes `flush` single-caller, as `video/render.rs`'s own header says. A
+compositor's `EXECBUFFER` runs on another task and so cannot touch it. The
+pattern to reuse already exists and is the same shape: `request_flush_blocking`
+is a request counter the task polls plus a parked-waiter list, and the 3D path is
+that handshake generalized into a mailbox. The rejected alternative - handing the
+device to the ioctl path under a shared lock - would make `flush` multi-caller
+and put a control-queue round trip on the synchronous syscall path while the task
+may be mid-flush.
+
+**And the family cannot be half-served**, which is why this section is a plan and
+not a landed change. The measurement makes it explicit: Linux's no-3D card
+*succeeds* at `RESOURCE_CREATE` (target 2), `MAP`, `WAIT` and `TRANSFER_TO_HOST`,
+and answers `ENOENT` only for handles it genuinely does not have. This card has
+no device resources at all, so serving the refusals alone would hand `ENOENT`
+back for handles a Linux card accepts and refuse a `RESOURCE_CREATE` Linux
+completes - a *nearly right* family, which §4 says is worse than an absent one.
+The family therefore lands whole, on top of the control queue, or it does not
+land.
+
 Two smaller blockers used to sit behind it, and **the first is no longer one:
 threads are done** (`clone(CLONE_THREAD)`, §6.4 - a task on the caller's memory
 and descriptors, with `CLONE_CHILD_CLEARTID` and a real futex wake for
@@ -5773,6 +5825,14 @@ programs out of the *default* sweep — every one of them is still built — so 
 `=== SUMMARY pass=127 fail=0 (127 built)` with `9 of 136 user tests left out by tests.toml`,
 and xtask's own suite is at `36 passed`. See the Phase 12 board entry for what the split is and
 why.)
+
+**Re-run with this pass's two commits on top** - the machine's `gpu` key and the §7.4
+measurement, neither of which touches the kernel or the image: xtask's own suite `38 passed`,
+guest `=== SUMMARY pass=137 fail=0 (137 built)` with QEMU exit `33` and `10 of 147 user tests
+left out by tests.toml`. Worth quoting for one reason beyond the green: the test boot's own
+QEMU line still reads `-device virtio-gpu-pci`, which is the new key's *default*, so the sweep
+boots exactly the machine it booted before - and that is why a machine key written for an
+interactive `run` cannot silently move the gate.
 
 ### 12.5 Deliberately not in this phase
 
