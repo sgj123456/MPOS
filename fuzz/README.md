@@ -57,6 +57,17 @@ mkdir -p corpus/ext4_write && cp -n seeds/ext4_image/* corpus/ext4_write/
 are committed. `ext4_write` reuses `ext4_image`'s images - the same disk, read
 by one and written by the other.
 
+`virtgpu_capset` 的种子是**例外**：它不是抓下来的制品，而是按实测形状拼出来的
+——响应码是 `RESP_OK_CAPSET`，载荷长度是 `user/staging/virtgpu-probe/` 测到的两个
+capset 大小（VIRGL 308、VIRGL2 1408）。真实的是码与长度这两个事实，载荷字节本身
+是零。种子在这里的作用只是把 fuzzer 领进载荷分支：`resp_capset_payload` 要求前
+四个字节正好是那个响应码，纯字节 fuzzer 几乎撞不到。`virtgpu_capset`'s seeds are
+the exception: not a captured artefact but the measured *shape* - the response
+code, and the two cap set sizes `user/staging/virtgpu-probe/` recorded (VIRGL
+308, VIRGL2 1408). The code and the lengths are the real facts; the payload
+bytes are zeroes. All the seeds do is lead the fuzzer into the payload branch,
+which needs those first four bytes to be exactly that code.
+
 ## 目标 | Targets
 
 每个目标除了「不 panic」之外还断言一个该模块自己承诺过的性质 —— 崩溃只是最不值得
@@ -83,6 +94,7 @@ not merely that it does not panic - a crash is the least informative outcome.
 | `inotify_record` | `vfs::inotify::{pad_name, record_len, event_matches}` | 记录声明的长度与它的字节一致，且对齐 |
 | `uinput_setup` | `uinput::{parse_setup, record_count, bit_request, Device::set_bit}` | 短于 `struct uinput_setup` 的字节被拒；名字不越字段、不含 NUL；id 就是给定字节；声明的位落进 `EVIOCGBIT` 读回的那张位图 |
 | `evdev_window` | `evdev::Records` | 不满一条记录的读是 `None`（`EINVAL`）；`readable` 与紧随其后的 read 一致；抓取期间非持有者读不到；等待者只在记录属于它时才 due |
+| `virtgpu_capset` | `virtgpu_abi::resp_capset_payload` | 载荷永远是入参的子切片且不长于它；只有回复码真是 `RESP_OK_CAPSET` 时才返回；`None` 只有两种成因（短于头部，或码不对） |
 
 `support.rs` 里是共用的 `MemDev`（一个包着 `Vec<u8>` 的 `BlockDev`，越界读返回零）
 和几个钳位：设备最大 1 MiB，屏幕最大 `MAX_ROWS` 行。一个被构造出来的**长度**会让

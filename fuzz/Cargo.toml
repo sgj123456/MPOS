@@ -157,3 +157,10 @@ path = "fuzz_targets/vfs_path.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "virtgpu_capset"
+path = "fuzz_targets/virtgpu_capset.rs"
+test = false
+doc = false
+bench = false

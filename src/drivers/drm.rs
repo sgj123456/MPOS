@@ -1127,9 +1127,14 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
 /// destination is looked at, so a caller that asked for nothing hears what is
 /// wrong with the question rather than with its buffer. Measured - `GETPARAM(0)`,
 /// `(9)` and `(100)` all answer `EINVAL` on a real card.
+///
+/// The card is `NONE` until a driver publishes the one it negotiated: the
+/// answers are a statement about what this kernel can do, and a machine whose
+/// GPU has not come up can do none of it. `drm_virtgpu::Card` carries the rest
+/// of that story.
 fn virtgpu_getparam(arg: usize) -> isize {
     let param = unsafe { (arg as *const u64).read_unaligned() };
-    let Ok(value) = crate::drm_virtgpu::param(param) else {
+    let Ok(value) = crate::drm_virtgpu::param(param, &crate::drm_virtgpu::Card::NONE) else {
         return crate::err::EINVAL;
     };
     let out = unsafe { ((arg + 8) as *const u64).read_unaligned() } as *mut i32;

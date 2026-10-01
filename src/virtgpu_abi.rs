@@ -31,10 +31,19 @@
 //! A response is a fixed-size struct read out of a receive buffer the driver
 //! allocated, so `read_struct` is a bounds-checked copy rather than a parser:
 //! it answers `None` when the buffer is shorter than the struct, and the caller
-//! turns that into `EIO`. Nothing here walks a length the device supplied, which
-//! is why there is no fuzz target beside this module - the variable-length
-//! replies (`GET_CAPSET`'s blob, `RESOURCE_CREATE_BLOB`'s descriptor list) are
-//! where a parser will appear, and they land with the commands that need them.
+//! turns that into `EIO`.
+//!
+//! There is exactly one reply whose length the *device* decides rather than the
+//! driver - `RESP_OK_CAPSET`, whose struct ends in a flexible array - and
+//! [`resp_capset_payload`] is the reader that bounds it. That is the one thing
+//! here a fuzzer can usefully attack, and `fuzz/fuzz_targets/virtgpu_capset.rs`
+//! does.
+//!
+//! `SUBMIT_3D`'s command stream looks like a second one and is not: it is the
+//! *caller's* bytes, forwarded to the device verbatim. Linux hands them over
+//! with `vmemdup_user` without looking at them, this kernel does the same, and
+//! nothing here walks a length the caller supplied - so there is nothing to
+//! fuzz on that side.
 
 use virtio_drivers::config::{ReadOnly, WriteOnly};
 
@@ -122,12 +131,35 @@ pub const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 pub const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 pub const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 pub const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
+/// Ask the device to describe one of its cap sets: its id, the highest version
+/// the device can answer with, and how many bytes the set is.
+pub const CMD_GET_CAPSET_INFO: u32 = 0x0108;
+/// Ask for the cap set itself, `.capset_version` bytes of it.
+pub const CMD_GET_CAPSET: u32 = 0x0109;
+
+/// The 3D commands, which a device that negotiated no `VIRGL` answers with
+/// `RESP_ERR_*` - the family is reachable either way, which is what the
+/// measurement in `user/staging/virtgpu-probe/` shows.
+pub const CMD_CTX_CREATE: u32 = 0x0200;
+pub const CMD_CTX_DESTROY: u32 = 0x0201;
+pub const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
+pub const CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
+pub const CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
+pub const CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
+pub const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
+pub const CMD_SUBMIT_3D: u32 = 0x0207;
 
 /// The response codes. Only the ones a request can be answered with are named;
 /// `check` below turns anything else into an error, so an unnamed code is
 /// reported as itself rather than mistaken for a success.
 pub const RESP_OK_NODATA: u32 = 0x1100;
 pub const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+/// The answer to `GET_CAPSET_INFO`, which describes a set rather than carrying
+/// it.
+pub const RESP_OK_CAPSET_INFO: u32 = 0x1102;
+/// The answer to `GET_CAPSET`: a header and then the set's own bytes, with no
+/// length field of its own - see [`resp_capset_payload`].
+pub const RESP_OK_CAPSET: u32 = 0x1103;
 pub const RESP_ERR_UNSPEC: u32 = 0x1200;
 pub const RESP_ERR_OUT_OF_MEMORY: u32 = 0x1201;
 pub const RESP_ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
@@ -160,6 +192,30 @@ pub const SCANOUT_ID: u32 = 0;
 /// this same layout, which is why a dumb buffer can be copied row by row into
 /// it without a channel swizzle.
 pub const FORMAT_B8G8R8A8_UNORM: u32 = 1;
+
+/// `VIRTIO_GPU_CAPSET_VIRGL`: the cap set Mesa's virgl driver asks for, and the
+/// one a `virtio-gpu-gl-pci` device offers as its first.
+pub const CAPSET_VIRGL: u32 = 1;
+/// `VIRTIO_GPU_CAPSET_VIRGL2`: the same set with the second version's additions.
+/// Both are offered by the measured GL card - `GETPARAM(7)` answered the mask
+/// `6`, which is bit 1 and bit 2 - and the two are told apart by the *version*
+/// a caller asks for, not by two separate fetch paths.
+pub const CAPSET_VIRGL2: u32 = 2;
+
+/// `VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK`: the low byte of a context's
+/// `context_init` word is the cap set the context runs. The bits above it carry
+/// the ring count and the per-ring priorities, which this kernel leaves zero -
+/// see `drm_virtgpu::CONTEXT_INIT`'s note.
+pub const CONTEXT_INIT_CAPSET_ID_MASK: u32 = 0x0000_00ff;
+
+/// `VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP`: the resource's rows run top to bottom.
+///
+/// Mesa sets it for a rendering target, because a GL framebuffer's origin is
+/// the lower left and the flag is how the guest tells the device which way the
+/// rows it is handed are ordered. This kernel copies it through rather than
+/// interpreting it - the 2D scanout path has its own orientation and the DRM
+/// layer's transfer commands carry the box, not the flag.
+pub const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
 
 /// The control header every request and response starts with.
 ///
@@ -337,6 +393,225 @@ pub struct RespDisplayInfo {
     pub pmodes: [DisplayOne; MAX_SCANOUTS],
 }
 
+/// `struct virtio_gpu_box`: the volume a 3D transfer names.
+///
+/// A separate type from [`Rect`] rather than one with unused fields, because
+/// the two are genuinely different things on the wire: a `Rect` is two
+/// dimensions and a `Box` is three plus a layer count, and the device reads
+/// six words for one and four for the other. (`z`, `w`, `h`, `d` are the
+/// header's own names, kept even though `w`/`h` sit beside a `d` that is a
+/// depth rather than a distance.)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Box3d {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub w: u32,
+    pub h: u32,
+    pub d: u32,
+}
+
+/// `struct virtio_gpu_transfer_host_3d`: move a volume of a resource to or from
+/// the host, at one mip level.
+///
+/// One struct for both directions, because the request half is identical and
+/// only the command word differs - which is why the driver takes the direction
+/// as an argument instead of having two near-copies of a 72-byte struct.
+/// `stride` and `layer_stride` are the host's row and layer pitches; the guest
+/// side is the contiguous extent `RESOURCE_ATTACH_BACKING` named.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransferHost3d {
+    pub header: CtrlHeader,
+    /// The header calls this `box`; `box3d` because `box` is a reserved word.
+    pub box3d: Box3d,
+    /// Byte offset into the resource the volume starts at.
+    pub offset: u64,
+    pub resource_id: u32,
+    /// Which mip level of the resource.
+    pub level: u32,
+    pub stride: u32,
+    pub layer_stride: u32,
+}
+
+/// `struct virtio_gpu_resource_create_3d`: allocate a resource a 3D context can
+/// render into.
+///
+/// The 2D [`ResourceCreate2d`] plus everything a texture needs: `target` (the
+/// pipe the resource belongs to - 2 is 2D, 4 is virgl), `bind`, the mip-level
+/// count, the array size, the sample count and the flags. The measured card
+/// accepts only `target = 2` with each of those at most 1 when no `VIRGL` was
+/// negotiated, and forwards them when one was; that switch is the two branches
+/// of `drm_virtgpu::resource_create_args_ok` and its caller.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResourceCreate3d {
+    pub header: CtrlHeader,
+    pub resource_id: u32,
+    pub target: u32,
+    pub format: u32,
+    pub bind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub array_size: u32,
+    pub last_level: u32,
+    pub nr_samples: u32,
+    pub flags: u32,
+    pub padding: u32,
+}
+
+/// `struct virtio_gpu_ctx_create`: make a context, and name it.
+///
+/// `context_init` folds the DRM layer's `ctx_set_params` into one word - the
+/// cap set id under [`CONTEXT_INIT_CAPSET_ID_MASK`], and the ring count and
+/// per-ring priorities above it. This kernel sends only the cap set id and
+/// leaves the rest zero, which is the single-ring path Mesa's virgl uses; see
+/// `drm_virtgpu`'s note on `CONTEXT_INIT`.
+///
+/// `debug_name` is a fixed 64 bytes with `nlen` saying how much of it is the
+/// name. It is a name rather than a string: the bytes after `nlen` are not a
+/// terminator and are not read, which is why the field is an array and not a
+/// pair of a pointer and a length.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CtxCreate {
+    pub header: CtrlHeader,
+    /// How many bytes of `debug_name` are the name.
+    pub nlen: u32,
+    pub context_init: u32,
+    pub debug_name: [u8; 64],
+}
+
+impl Default for CtxCreate {
+    /// Written out rather than derived, and the only `Default` in this file
+    /// that is: the standard derive covers arrays up to 32 elements, and the
+    /// header's debug name is 64 bytes. A derived version would not compile,
+    /// so the choice is this or none at all - and none at all would make this
+    /// the one wire struct here that cannot be built by starting from zero.
+    fn default() -> Self {
+        CtxCreate {
+            header: CtrlHeader::default(),
+            nlen: 0,
+            context_init: 0,
+            debug_name: [0; 64],
+        }
+    }
+}
+
+/// `struct virtio_gpu_ctx_destroy`: release a context.
+///
+/// The header is the whole request - the context it names is in the header's
+/// own `ctx_id`, so there is nothing left for a body to carry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CtxDestroy {
+    pub header: CtrlHeader,
+}
+
+/// `struct virtio_gpu_ctx_resource`: attach or detach one resource from the
+/// context the header's `ctx_id` names.
+///
+/// Both directions are one struct, as with the transfers: a resource is either
+/// made reachable to the context's command stream or taken away from it, and
+/// only the command word says which.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CtxResource {
+    pub header: CtrlHeader,
+    pub resource_id: u32,
+    pub padding: u32,
+}
+
+/// `struct virtio_gpu_cmd_submit`: the head of a `SUBMIT_3D`, which is a
+/// command stream preceded by its length.
+///
+/// Only the head. On the wire it is followed by `size` bytes of the caller's
+/// stream and then the resource ids the stream refers to - a stream names its
+/// buffers by index, and the id list is how the device resolves them. That tail
+/// is why `SUBMIT_3D` is the one request here that is neither a struct nor a
+/// struct plus a fixed array, and `gpu_ctrl::submit_3d` is where its exact
+/// layout is pinned against the kernel's own `virtio_gpu_cmd_submit`.
+///
+/// **The stream is not parsed, here or by Linux.** `virtio_gpu_init_submit`
+/// hands the bytes to the device with `vmemdup_user` without looking at them,
+/// and this kernel does the same: a length the caller supplied is never walked.
+/// There is therefore no fuzz target on it, and the one this family does want
+/// is on [`resp_capset_payload`], where the device supplies the length.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CmdSubmit {
+    pub header: CtrlHeader,
+    pub size: u32,
+    pub padding: u32,
+}
+
+/// `struct virtio_gpu_get_capset_info`: which of the device's cap sets to
+/// describe.
+///
+/// By *index* rather than by id: the caller is asking what the device's nth set
+/// is, and the reply is what says. A driver that wanted a set by id would walk
+/// the indices until it found one - which is what `drm_virtgpu::capsets` does
+/// once, at bring-up, so no ioctl has to.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetCapsetInfo {
+    pub header: CtrlHeader,
+    pub capset_index: u32,
+    pub padding: u32,
+}
+
+/// `struct virtio_gpu_resp_capset_info`: the answer to the above.
+///
+/// `capset_max_version` is the highest version the device can answer with and
+/// `capset_max_size` how many bytes a fetch at that version returns. Both are
+/// what a caller needs before it can fetch anything at all: the version is what
+/// it asks for and the size is what its `GET_CAPS` buffer is measured against -
+/// which is the comparison `drm_virtgpu::caps_may_copy` makes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RespCapsetInfo {
+    pub header: CtrlHeader,
+    pub capset_id: u32,
+    pub capset_max_version: u32,
+    pub capset_max_size: u32,
+    pub padding: u32,
+}
+
+/// `struct virtio_gpu_get_capset`: fetch a cap set, at a version.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetCapset {
+    pub header: CtrlHeader,
+    pub capset_id: u32,
+    pub capset_version: u32,
+}
+
+/// The cap set inside a `RESP_OK_CAPSET`, or `None` if these bytes are not one.
+///
+/// This is the module's only *parser*, and the shape of the reply is the reason
+/// it needs one: `struct virtio_gpu_resp_capset` ends in a flexible array
+/// (`__u8 capset_data[]`), so the reply carries no length of its own and the
+/// only bound on it is the buffer the driver allocated. The driver sizes that
+/// buffer from the `capset_max_size` the device reported and then reads exactly
+/// that many bytes, so this reader's whole job is to refuse anything shorter
+/// than a header and to name the payload without ever claiming more bytes than
+/// are there.
+///
+/// A response code other than `RESP_OK_CAPSET` is `None` rather than an empty
+/// payload. A device that answered an error would otherwise have the bytes of
+/// its error struct handed to a caller as a cap set of zeroes - a capability
+/// word that reads as a real answer, which is the false-shape failure this
+/// family exists to avoid.
+pub fn resp_capset_payload(bytes: &[u8]) -> Option<&[u8]> {
+    let header = read_struct::<CtrlHeader>(bytes)?;
+    if !header.is(RESP_OK_CAPSET) {
+        return None;
+    }
+    bytes.get(size_of::<CtrlHeader>()..)
+}
+
 /// The bytes of a wire struct, for handing to a queue.
 ///
 /// The one `unsafe` this module needs, and the reason it is safe is a property
@@ -392,8 +667,20 @@ mod tests {
         assert_eq!(CMD_TRANSFER_TO_HOST_2D, 0x0105);
         assert_eq!(CMD_RESOURCE_ATTACH_BACKING, 0x0106);
         assert_eq!(CMD_RESOURCE_DETACH_BACKING, 0x0107);
+        assert_eq!(CMD_GET_CAPSET_INFO, 0x0108);
+        assert_eq!(CMD_GET_CAPSET, 0x0109);
+        assert_eq!(CMD_CTX_CREATE, 0x0200);
+        assert_eq!(CMD_CTX_DESTROY, 0x0201);
+        assert_eq!(CMD_CTX_ATTACH_RESOURCE, 0x0202);
+        assert_eq!(CMD_CTX_DETACH_RESOURCE, 0x0203);
+        assert_eq!(CMD_RESOURCE_CREATE_3D, 0x0204);
+        assert_eq!(CMD_TRANSFER_TO_HOST_3D, 0x0205);
+        assert_eq!(CMD_TRANSFER_FROM_HOST_3D, 0x0206);
+        assert_eq!(CMD_SUBMIT_3D, 0x0207);
         assert_eq!(RESP_OK_NODATA, 0x1100);
         assert_eq!(RESP_OK_DISPLAY_INFO, 0x1101);
+        assert_eq!(RESP_OK_CAPSET_INFO, 0x1102);
+        assert_eq!(RESP_OK_CAPSET, 0x1103);
         assert_eq!(RESP_ERR_UNSPEC, 0x1200);
         assert_eq!(RESP_ERR_OUT_OF_MEMORY, 0x1201);
         assert_eq!(RESP_ERR_INVALID_SCANOUT_ID, 0x1202);
@@ -421,6 +708,26 @@ mod tests {
         assert_eq!(FLAG_FENCE, 1);
     }
 
+    /// The cap set ids and the context word's mask are the header's too, and
+    /// they are the two numbers a 3D client and this driver have to agree on
+    /// without either being able to check the other: a cap set fetched under
+    /// the wrong id is a blob of the wrong shape, and a cap set id written
+    /// outside the mask is a context that will not run.
+    #[test]
+    fn the_capset_ids_and_the_context_mask_are_the_headers() {
+        assert_eq!(CAPSET_VIRGL, 1);
+        assert_eq!(CAPSET_VIRGL2, 2);
+        assert_eq!(CONTEXT_INIT_CAPSET_ID_MASK, 0x0000_00ff);
+        assert_eq!(RESOURCE_FLAG_Y_0_TOP, 1);
+        // The two offered sets are exactly the mask the measured GL card
+        // reported from `GETPARAM(7)`, which is what makes "mask 6" and "two
+        // sets, ids 1 and 2" the same statement rather than two.
+        assert_eq!((1 << CAPSET_VIRGL) | (1 << CAPSET_VIRGL2), 6);
+        // A cap set id has to survive being folded into the context word,
+        // which is the only place it is written.
+        assert_eq!(CAPSET_VIRGL2 & CONTEXT_INIT_CAPSET_ID_MASK, CAPSET_VIRGL2);
+    }
+
     /// Every size is the wire's, and a field added carelessly fails here rather
     /// than shifting every field after it on the wire.
     #[test]
@@ -437,6 +744,22 @@ mod tests {
         assert_eq!(size_of::<ResourceDetachBacking>(), 32);
         assert_eq!(size_of::<DisplayOne>(), 24);
         assert_eq!(size_of::<RespDisplayInfo>(), 24 + 16 * 24);
+        assert_eq!(size_of::<Box3d>(), 24);
+        assert_eq!(size_of::<TransferHost3d>(), 72);
+        assert_eq!(size_of::<ResourceCreate3d>(), 72);
+        assert_eq!(size_of::<CtxCreate>(), 96);
+        // A context destroy really is the header alone, which is the check that
+        // the context id is being read from the header rather than from a body
+        // this struct does not have.
+        assert_eq!(size_of::<CtxDestroy>(), size_of::<CtrlHeader>());
+        assert_eq!(size_of::<CtxResource>(), 32);
+        assert_eq!(size_of::<CmdSubmit>(), 32);
+        assert_eq!(size_of::<GetCapsetInfo>(), 32);
+        assert_eq!(size_of::<RespCapsetInfo>(), 40);
+        assert_eq!(size_of::<GetCapset>(), 32);
+        // `size` is at 24 and the stream begins at 32, which is the offset
+        // `gpu_ctrl::submit_3d` appends the caller's bytes at.
+        assert_eq!(size_of::<CmdSubmit>(), 24 + 8);
     }
 
     /// The header's fields sit where the device reads them. `ctx_id` at 16 and
@@ -458,6 +781,80 @@ mod tests {
         assert_eq!(size_of::<Config>(), 20);
         assert_eq!(core::mem::offset_of!(RespDisplayInfo, pmodes), 24);
         assert_eq!(core::mem::offset_of!(ResourceAttachBacking, nr_entries), 28);
+    }
+
+    /// The 3D structs' fields sit where the device reads them.
+    ///
+    /// Sizes alone would not catch the mistake these guard against: two `u32`s
+    /// swapped inside a struct keep its size and move both values, and the
+    /// device would read a width where a height belongs. The offsets worth
+    /// pinning are the ones a plausible rearrangement gets wrong - the 8-byte
+    /// `offset` in `TransferHost3d`, which has to land on an 8-byte boundary
+    /// after a 24-byte `Box3d`, and `CmdSubmit`'s `size`, because the caller's
+    /// stream begins the moment it ends.
+    #[test]
+    fn the_3d_structs_put_their_fields_where_the_device_reads_them() {
+        assert_eq!(core::mem::offset_of!(TransferHost3d, box3d), 24);
+        assert_eq!(core::mem::offset_of!(TransferHost3d, offset), 48);
+        assert_eq!(core::mem::offset_of!(TransferHost3d, resource_id), 56);
+        assert_eq!(core::mem::offset_of!(TransferHost3d, level), 60);
+        assert_eq!(core::mem::offset_of!(TransferHost3d, stride), 64);
+        assert_eq!(core::mem::offset_of!(TransferHost3d, layer_stride), 68);
+
+        assert_eq!(core::mem::offset_of!(ResourceCreate3d, resource_id), 24);
+        assert_eq!(core::mem::offset_of!(ResourceCreate3d, target), 28);
+        assert_eq!(core::mem::offset_of!(ResourceCreate3d, bind), 36);
+        assert_eq!(core::mem::offset_of!(ResourceCreate3d, width), 40);
+        assert_eq!(core::mem::offset_of!(ResourceCreate3d, last_level), 56);
+        assert_eq!(core::mem::offset_of!(ResourceCreate3d, nr_samples), 60);
+        assert_eq!(core::mem::offset_of!(ResourceCreate3d, flags), 64);
+
+        assert_eq!(core::mem::offset_of!(CtxCreate, nlen), 24);
+        assert_eq!(core::mem::offset_of!(CtxCreate, context_init), 28);
+        assert_eq!(core::mem::offset_of!(CtxCreate, debug_name), 32);
+
+        assert_eq!(core::mem::offset_of!(CtxResource, resource_id), 24);
+        assert_eq!(core::mem::offset_of!(CmdSubmit, size), 24);
+        assert_eq!(core::mem::offset_of!(GetCapsetInfo, capset_index), 24);
+        assert_eq!(core::mem::offset_of!(RespCapsetInfo, capset_id), 24);
+        assert_eq!(
+            core::mem::offset_of!(RespCapsetInfo, capset_max_version),
+            28
+        );
+        assert_eq!(core::mem::offset_of!(RespCapsetInfo, capset_max_size), 32);
+        assert_eq!(core::mem::offset_of!(GetCapset, capset_id), 24);
+        assert_eq!(core::mem::offset_of!(GetCapset, capset_version), 28);
+    }
+
+    /// The cap set reader bounds the payload by the buffer and by nothing else.
+    ///
+    /// The reply carries no length of its own, so the only two facts the reader
+    /// has are the buffer it was given and the response code in it. What this
+    /// pins is the second: a reply that is not a `RESP_OK_CAPSET` is refused
+    /// rather than reported as an empty set, and a payload is never longer than
+    /// the bytes it was read from.
+    #[test]
+    fn a_capset_reply_is_read_only_when_it_is_one() {
+        let mut bytes = [0u8; 24 + 308];
+        bytes[..4].copy_from_slice(&RESP_OK_CAPSET.to_le_bytes());
+        let payload = resp_capset_payload(&bytes).expect("a header and 308 bytes is a capset");
+        assert_eq!(payload.len(), 308);
+        // The payload is the reply's own bytes, not a copy with room to spare.
+        assert_eq!(payload.as_ptr(), bytes[24..].as_ptr());
+
+        // An error answer is refused. A device that declined would otherwise
+        // have its error struct's zeroes handed over as a capability word.
+        let mut declined = [0u8; 24 + 308];
+        declined[..4].copy_from_slice(&RESP_ERR_INVALID_PARAMETER.to_le_bytes());
+        assert!(resp_capset_payload(&declined).is_none());
+
+        // Short of a header is short of everything: not even the code is there.
+        assert!(resp_capset_payload(&[0u8; 23]).is_none());
+        // A header with no payload is a legal empty set, not a failure - the
+        // device may offer a set this kernel has nothing to say about.
+        let mut bare = [0u8; 24];
+        bare[..4].copy_from_slice(&RESP_OK_CAPSET.to_le_bytes());
+        assert_eq!(resp_capset_payload(&bare), Some(&[][..]));
     }
 
     /// A request round-trips through the byte view unchanged, which is what

@@ -87,32 +87,106 @@ pub const PARAM_SUPPORTED_CAPSET_IDS: u64 = 7;
 /// userspace. Gated on the same feature as `CONTEXT_INIT` on a real card.
 pub const PARAM_EXPLICIT_DEBUG_NAME: u64 = 8;
 
+/// What the device behind the transport turned out to be, as far as the
+/// requests in this module are concerned.
+///
+/// One value rather than a set of loose flags, because every answer below is a
+/// statement about the *card* and the measurement is what shows they move
+/// together: the machine that negotiated no `VIRGL` answers `0` to
+/// `3D_FEATURES`, `0` to `CONTEXT_INIT`, `0` for the cap set mask, and refuses
+/// every 3D request with the same errnos. It is built once, from the feature
+/// word the transport actually agreed, and does not change afterwards - a
+/// capability that moved under a running ioctl path would be a worse answer
+/// than a stale one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Card {
+    /// Whether `VIRGL` was **negotiated** - asked for and agreed.
+    ///
+    /// Negotiated rather than merely offered, and the difference is the whole
+    /// point of this field: a device that offered 3D in front of a driver that
+    /// never asked for it has no context and no command to make one, and it is
+    /// the driver's answer a caller is asking about. Linux's `has_virgl_3d` is
+    /// the same fact under another name.
+    pub virgl: bool,
+    /// Whether the device takes `CTX_CREATE` explicitly, so a context can be
+    /// made with its cap set named rather than implied by the first command.
+    pub context_init: bool,
+    /// The device's cap sets as the bitmask `GETPARAM(7)` reports: bit `n` set
+    /// means cap set `n` is offered. A mask rather than a list because that is
+    /// what the parameter *is*, and both questions a caller asks of it - "is
+    /// set 1 there" and "which are there" - are tests of one bit.
+    pub capset_ids: u32,
+}
+
+impl Card {
+    /// The card a machine whose GPU never came up has: no 3D, no context, no
+    /// cap sets.
+    ///
+    /// Every answer here reduces to this when there is nothing to ask, and it
+    /// is what the DRM layer passes until a driver has published a real card. A
+    /// device that failed to initialise must answer a caller the way a card
+    /// with no 3D does, not the way a card that broke does - the difference
+    /// between "there is nothing here for you" and a capability the caller
+    /// reads as real is the whole reason this module is a table.
+    pub const NONE: Card = Card {
+        virgl: false,
+        context_init: false,
+        capset_ids: 0,
+    };
+}
+
 /// The value of `GETPARAM(param)`, or the errno the request is refused with.
 ///
-/// Every value here is a property of *this* kernel, not of the device on the
-/// other side of the transport, and that is the honest thing for them to be:
-/// `3D_FEATURES` reports whether a 3D context can be run, and this kernel
-/// negotiates no `VIRGL` feature and has no command that could create one. A
-/// machine booted on the GL card therefore answers `0` here - not because the
-/// device cannot, but because this driver cannot, which is exactly the question
-/// a caller is asking and the reason `PLAN.md` §7.4's remaining work is a kernel
-/// change rather than a machine one.
+/// Every value answers a question about *this driver*, which is why most of
+/// them are not a read of the device: `3D_FEATURES` reports whether a 3D
+/// context can be run, and a device that offers 3D to a driver with no
+/// `CTX_CREATE` behind it would be answered `1` by a table that read the device
+/// and `0` here. Linux's own table says the same thing in its own terms, and
+/// the measured card is where the values below come from - on a machine with no
+/// 3D, `GETPARAM(1)`, `(6)` and `(7)` answer `0` and `(2)` answers `1`.
+///
+/// Three answers are `0` whatever the device offers, and that is deliberate
+/// rather than unfinished: `RESOURCE_BLOB`, `HOST_VISIBLE` and `CROSS_DEVICE`
+/// report blob resources, host-visible memory and cross-device sharing, and
+/// this kernel has no command for any of the three. A `1` here would advertise
+/// a path with nothing behind it. The measured card agrees (`0`, `0`, `0`) for
+/// its own reason - QEMU offers no blob feature on this machine - and
+/// `PLAN.md` §7.4 records that blobs are out of the work.
 ///
 /// A parameter outside the table is `EINVAL` (measured: `0`, `9` and `100` all
 /// answer it on a real card). `BLOB_ALIGNMENT` is 9 in newer headers and is
-/// deliberately *not* answered: this card has no blob resources to align.
-pub fn param(param: u64) -> Result<u64, isize> {
+/// deliberately *not* answered: there are no blobs here to align.
+pub fn param(param: u64, card: &Card) -> Result<u64, isize> {
     match param {
-        PARAM_3D_FEATURES => Ok(0),
+        PARAM_3D_FEATURES => Ok(card.virgl as u64),
         PARAM_CAPSET_QUERY_FIX => Ok(1),
         PARAM_RESOURCE_BLOB => Ok(0),
         PARAM_HOST_VISIBLE => Ok(0),
         PARAM_CROSS_DEVICE => Ok(0),
-        PARAM_CONTEXT_INIT => Ok(0),
-        PARAM_SUPPORTED_CAPSET_IDS => Ok(0),
-        PARAM_EXPLICIT_DEBUG_NAME => Ok(0),
+        PARAM_CONTEXT_INIT => Ok(card.context_init as u64),
+        PARAM_SUPPORTED_CAPSET_IDS => Ok(card.capset_ids as u64),
+        PARAM_EXPLICIT_DEBUG_NAME => Ok(card.context_init as u64),
         _ => Err(EINVAL),
     }
+}
+
+/// How many bytes of a cap set `GET_CAPS` may copy out, or the errno it is
+/// refused with.
+///
+/// Linux's rule, and the part of it worth naming is that a **partial copy is
+/// legal**: `size = min(args->size, host_caps_size)`, then a copy of exactly
+/// `size` bytes. A caller whose buffer is smaller than the cap set gets the
+/// front of it and a success - not a truncation error and not the whole set
+/// spilling past its allocation. A caller that asked for nothing is `EINVAL`
+/// before either side is looked at, which is the other half of the same rule.
+///
+/// `host_max_size` is what `GET_CAPSET_INFO` reported for the set being
+/// fetched, so this is the one place the two commands' answers meet.
+pub fn caps_may_copy(caller_size: u32, host_max_size: u32) -> Result<usize, isize> {
+    if caller_size == 0 {
+        return Err(EINVAL);
+    }
+    Ok(caller_size.min(host_max_size) as usize)
 }
 
 /// What `GET_CAPS` answers: `ENOSYS`, which is Linux's answer on a card whose
@@ -179,34 +253,95 @@ pub fn resource_create_args_ok(
 mod tests {
     use super::*;
 
-    /// The parameter table is the measured one, value for value.
+    /// The no-3D card's answers are the measured ones, value for value.
     ///
     /// Written against the literals the instrument printed rather than against
     /// the constants above, because a table checked against its own names agrees
     /// with any numbering at all - the mistake `drivers/drm.rs` records for the
     /// lease family.
     #[test]
-    fn the_parameter_table_is_the_measured_one() {
-        assert_eq!(param(1), Ok(0)); // 3D_FEATURES: this kernel negotiates no VIRGL
-        assert_eq!(param(2), Ok(1)); // CAPSET_QUERY_FIX: unconditional, measured
-        assert_eq!(param(3), Ok(0)); // RESOURCE_BLOB
-        assert_eq!(param(4), Ok(0)); // HOST_VISIBLE
-        assert_eq!(param(5), Ok(0)); // CROSS_DEVICE
-        assert_eq!(param(6), Ok(0)); // CONTEXT_INIT
-        assert_eq!(param(7), Ok(0)); // SUPPORTED_CAPSET_IDs: the mask, empty here
-        assert_eq!(param(8), Ok(0)); // EXPLICIT_DEBUG_NAME
+    fn a_card_without_3d_answers_the_measured_row() {
+        let card = Card {
+            virgl: false,
+            context_init: false,
+            capset_ids: 0,
+        };
+        assert_eq!(param(1, &card), Ok(0)); // 3D_FEATURES
+        assert_eq!(param(2, &card), Ok(1)); // CAPSET_QUERY_FIX: unconditional, measured
+        assert_eq!(param(3, &card), Ok(0)); // RESOURCE_BLOB
+        assert_eq!(param(4, &card), Ok(0)); // HOST_VISIBLE
+        assert_eq!(param(5, &card), Ok(0)); // CROSS_DEVICE
+        assert_eq!(param(6, &card), Ok(0)); // CONTEXT_INIT
+        assert_eq!(param(7, &card), Ok(0)); // SUPPORTED_CAPSET_IDs: the mask, empty here
+        assert_eq!(param(8, &card), Ok(0)); // EXPLICIT_DEBUG_NAME
+        // The fallback the DRM layer passes until a driver publishes a real
+        // card is this same machine, rather than something merely similar.
+        assert_eq!(Card::NONE, card);
+    }
+
+    /// The GL card's answers are the measured ones, and the three that do not
+    /// move with it are the point of the second half.
+    #[test]
+    fn a_virgl_card_answers_the_measured_row() {
+        let card = Card {
+            virgl: true,
+            context_init: true,
+            capset_ids: 6,
+        };
+        assert_eq!(param(1, &card), Ok(1)); // 3D_FEATURES
+        assert_eq!(param(2, &card), Ok(1)); // CAPSET_QUERY_FIX
+        assert_eq!(param(6, &card), Ok(1)); // CONTEXT_INIT
+        assert_eq!(param(7, &card), Ok(6)); // the mask: cap sets 1 and 2
+        assert_eq!(param(8, &card), Ok(1)); // follows CONTEXT_INIT, as Linux's does
+        // Blob resources, host-visible memory and cross-device sharing are
+        // answered `0` whatever the device offers, because the commands behind
+        // them do not exist here and a `1` would advertise a path with nothing
+        // behind it. These three are the only values in the table that do not
+        // move with the card, and that is the false-capability rule rather than
+        // an omission.
+        for blob in [3, 4, 5] {
+            assert_eq!(param(blob, &card), Ok(0), "param {blob}");
+        }
     }
 
     /// A parameter the card does not have is `EINVAL`, including the ones a
-    /// newer header adds.
+    /// newer header adds - and on either card, since the table's shape is the
+    /// card's and its extent is not.
     #[test]
     fn an_unknown_parameter_is_einval() {
-        for outside in [0, 9, 100, u64::MAX] {
-            assert_eq!(param(outside), Err(EINVAL), "param {outside}");
+        let cards = [
+            Card::NONE,
+            Card {
+                virgl: true,
+                context_init: true,
+                capset_ids: 6,
+            },
+        ];
+        for card in &cards {
+            for outside in [0, 9, 100, u64::MAX] {
+                assert_eq!(param(outside, card), Err(EINVAL), "param {outside}");
+            }
         }
         // 9 is `BLOB_ALIGNMENT` in a newer header, and it is refused because
         // this card has no blobs to align - not because the number is unknown.
         assert_eq!(PARAM_EXPLICIT_DEBUG_NAME + 1, 9);
+    }
+
+    /// The `GET_CAPS` size rule, including the half a guess gets wrong: a copy
+    /// smaller than the cap set is a **success**, not a truncation error.
+    #[test]
+    fn a_capset_copy_is_the_smaller_of_the_two_sizes() {
+        // The measured pair on the GL card: VIRGL is 308 bytes, VIRGL2 1408.
+        assert_eq!(caps_may_copy(4096, 308), Ok(308));
+        assert_eq!(caps_may_copy(4096, 1408), Ok(1408));
+        assert_eq!(caps_may_copy(100, 308), Ok(100));
+        assert_eq!(caps_may_copy(308, 308), Ok(308));
+        // A caller that asked for nothing is refused before either size is
+        // compared - Linux's order, and the reason `0` is not "copy nothing".
+        assert_eq!(caps_may_copy(0, 308), Err(EINVAL));
+        // A set the device reports as empty copies nothing and still succeeds:
+        // the `0` below is the caller's own size coming back, not an error.
+        assert_eq!(caps_may_copy(16, 0), Ok(0));
     }
 
     /// The non-virgl validation is the driver's, field by field.
