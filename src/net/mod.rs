@@ -1202,9 +1202,13 @@ pub(crate) fn adopt_socket(channel: Channel, typ: u16, opts: SockOpts) -> Result
 ///     what `t-udp` already pins.
 pub(crate) fn tcp_listen(handle: usize, backlog: i32) -> Option<isize> {
     with(handle, |stack, entry| {
-        // Negative backlogs are zero, as Linux clamps them; the ceiling is
-        // `LISTEN_POOL_MAX` in practice because that is all the pool grows to.
-        let backlog = backlog.max(0) as usize;
+        // The backlog is clamped before either family sees the call, and a
+        // negative one is `SOMAXCONN` rather than zero - the rule, and the
+        // `-1` Rust's std sends, belong to `net::unix::clamp_backlog`. The
+        // ceiling above that is `LISTEN_POOL_MAX` in practice because that is
+        // all the pool grows to, not because the queue is short: `accepted`
+        // holds `backlog + 1` completed connections.
+        let backlog = crate::net::unix::clamp_backlog(backlog);
         let (mut home, mut sock_handle, local) = match &entry.channel {
             Channel::TcpListen { id, .. } => {
                 stack.set_backlog(*id, backlog);

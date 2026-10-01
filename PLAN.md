@@ -455,6 +455,15 @@ it - so the entries say which they are:
       reaches any depth, so every `../../` link in `/sys` failed at once - the
       card's identity, the parent's node names, and the input nodes' `device`
       links with them (§7.4)
+- [x] the **socket a compositor binds** — `bind` with Rust std's short `addrlen`
+      (24 bytes, not the struct's 110) and `listen(fd, -1)`: a negative backlog is
+      Linux's `SOMAXCONN`, not `EINVAL`, and the one rule is now read by the IPv4
+      pool too, which had read `-1` as zero (`net::unix::clamp_backlog`, §4.1).
+      This was niri's third stop (`ListeningSocketSource::new_auto`,
+      `src/niri.rs:2435`), and the boot carrying the fix reaches `listening on
+      Wayland socket: wayland-1` where the previous one left a zero-byte lock
+      file and nothing else. Pinned by `t-unix` and `t-tcp-listen`, each shown red
+      against the kernel built before it (§7.4)
 - [~] the DRM surface a **wlroots pixman** compositor needs — a primary node with
       `SET_MASTER`, `DRM_CAP_DUMB_BUFFER`, `CREATE_DUMB`/`MAP_DUMB`,
       `PRIME_HANDLE_TO_FD`, `ADDFB`/`MODE_ATOMIC` — is already in place, which
@@ -1620,6 +1629,21 @@ unable to reach the daemon at all. Measured on the host: backlogs 0..=3
 admitted 1, 2, 3 and 4 connections before the next `connect` answered `EAGAIN`.
 `t-unix` pins the depth and the room an `accept` returns; the divergence that
 remains is the *unlistened* name, which is still `ECONNREFUSED`.
+
+**And a *negative* backlog is `SOMAXCONN`, not a refusal.** `clamp_backlog` used
+to answer `EINVAL` for one, which reads as the man page's rule and is not
+Linux's: `__sys_listen` compares the argument to `SOMAXCONN` as an *unsigned*
+int, so every negative value lands on the ceiling rather than being refused.
+Measured on the host before the rule was written: `listen(fd, -1)` returns 0 for
+`AF_UNIX` and `AF_INET` alike, and `ss -lx`/`ss -ltn` then report the backlog as
+4096 - `net.core.somaxconn`, not the zero a "negative means a closed queue"
+reading would leave. Nor is it a number anybody has to go looking for: `-1` is
+what Rust's std passes on Linux from `UnixListener::bind` *and*
+`TcpListener::bind`, so every Rust server and compositor asks for it on every
+bind - and the `EINVAL` it got here is where niri stopped (§7.4). The rule lives
+in one place, `net::unix::clamp_backlog`, which the IPv4 pool reads as well: that
+arm had read `-1` as **zero**, a queue one deep, which is the same defect in the
+other family's clothes. Pinned from both sides, `t-unix` and `t-tcp-listen`.
 
 ### 4.2 ICMP Improvements — **DONE**
 
@@ -3737,6 +3761,80 @@ is again read off its source rather than measured, and it is the renderer below.
 > backend, and the kernel would grow the `DRM_VIRTGPU_*` family and the 3D
 > command queue behind it. That is a feature rather than a defect - it is why it
 > is not in the fix above - but it is not blocked by the host.
+
+> **Update, measured (2026-10-01, the same boot one call further on): the stop
+> after the lock file was `listen(fd, -1)`, and this kernel answered `EINVAL`
+> where Linux answers 0.** With the `stat`/`fstat` pair agreeing, the
+> lock-and-verify loop converged, the name was taken, and niri died one line
+> later - still `src/niri.rs:2435`, now on the socket's own error:
+>
+> ```text
+> thread 'main' panicked at src/niri.rs:2435:67:
+> called `Result::unwrap()` on an `Err` value: Io(Os { code: 22, kind: InvalidInput, ... })
+> ```
+>
+> That line is `ListeningSocketSource::new_auto().unwrap()`, the `Err` is a
+> `BindError::Io`, and the failing call is inside wayland-server 0.31's
+> `ListeningSocket::bind_absolute`, which after the lock loop does exactly three
+> things: `stat` the socket path, `UnixListener::bind`, `set_nonblocking`. Rust's
+> std spells the bind as `socket(AF_UNIX, SOCK_STREAM)` + `bind(fd, addr, 2 +
+> strlen + 1)` - 24 bytes for `/run/user/0/wayland-1`, not the
+> `sizeof(sockaddr_un)` of 110 a C caller passes - and then `listen(fd, -1)`,
+> because on Linux it is the *kernel* that caps a backlog. Measured in the guest
+> with a twenty-line C probe making the same calls: `bind(..., addrlen 24)` ok,
+> `listen(..., -1)` **`EINVAL`**, `listen(..., 0)`, `(..., 128)` and `(..., 4096)`
+> all ok. So the short `addrlen` was not the problem and the negative backlog is
+> the whole of it.
+>
+> `clamp_backlog` refused a negative backlog on purpose ("negative is `EINVAL`"),
+> and that reading of the rule is wrong in the one place that matters: Linux's
+> `__sys_listen` compares the argument to `SOMAXCONN` as an *unsigned* int, so
+> every negative lands on the ceiling instead of being refused. Measured on this
+> host before writing it: `listen(fd, -1)` returns 0 for `AF_UNIX` and `AF_INET`,
+> and `ss -lx`/`ss -ltn` then report the backlog as 4096 - `net.core.somaxconn`,
+> not the zero a "negative means a closed queue" reading would leave. Nor is it a
+> corner case anyone had to go looking for: `-1` is what Rust's std passes from
+> `UnixListener::bind` *and* `TcpListener::bind`. The rule lives once now
+> (`src/net/unix.rs::clamp_backlog`) and the IPv4 pool reads it too - that arm had
+> read `-1` as **zero**, a queue one deep, the same defect in the other family's
+> clothes. §4.1 carries the rule; `t-unix` and `t-tcp-listen` pin it, each shown
+> red on the kernel built before it.
+>
+> **Where niri stops now, measured the same way.** Rebuilt and booted with the
+> fix, `ListeningSocketSource::new_auto()` returns and the two lines that were
+> never reached appear:
+>
+> ```text
+> INFO niri: listening on Wayland socket: wayland-1
+> INFO niri: IPC listening on: /run/user/0/niri.wayland-1.11.sock
+> ```
+>
+> `/run/user/0` holds `wayland-1` as a real socket (`srwxr-xr-x`, plus its lock
+> file and that IPC socket) where the boot before left a zero-byte lock and
+> nothing else. The next stop is a *different* call, one line above those in the
+> log:
+>
+> ```text
+> WARN niri::backend::tty: error adding primary node device, display-only devices
+> may not work: DRM access error: Error loading resource handles on device
+> `Some("/dev/dri/card0")` (Bad address (os error 14))
+> ```
+>
+> `EFAULT` from the primary node's resource-handle load, and niri is gone within
+> the twenty seconds the probe watched (the renderer refusal below is the rest of
+> that story). Which ioctl that is, and why a buffer the card has a count for is
+> `EFAULT`, is the next measurement rather than this fix's - the same boot's own
+> `strace /bin/true` ran to completion, so the tracer works there.
+>
+> One instrument note for whoever takes it: `strace -f niri` ended *two* earlier
+> boots in `KERNEL PANIC: #GP` from ring 0 (err `0x0`, `rip 0xffffffff8004b01f`,
+> with `0xffffffff8013aede` at `rsp+0x0c0`), while `strace /bin/true` in this
+> boot exited 0. So it is not "any ptrace on this kernel" - it is something a
+> traced compositor reaches, and it is a defect of this kernel and not of niri: a
+> user process must not be able to panic the machine. Not diagnosed here;
+> recorded with the two boots that saw it. The same boot also logs
+> `error spawning "waybar": Os { code: 12, kind: OutOfMemory }`, which is not
+> what a missing binary answers (`ENOENT`) and is worth a look of its own.
 
 niri's TTY backend is `GpuManager<GbmGlesBackend<GlesRenderer>>` and nothing
 else - there is no pixman renderer in it - and, worse for this kernel, it

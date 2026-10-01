@@ -439,6 +439,67 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::close(shallow);
     let _ = lin::unlinkat(lin::AT_FDCWD, b"/tmp/t-unix-backlog.sock", 0);
 
+    // The other end of the same rule: a *negative* backlog is Linux's "as
+    // deep as you allow", not a refusal. `__sys_listen` compares the argument
+    // to `SOMAXCONN` as an unsigned int, so `-1` lands on the ceiling - and
+    // `-1` is not a number a caller has to go looking for: Rust's std passes
+    // exactly it on Linux, from `UnixListener::bind` and `TcpListener::bind`
+    // alike ("silently capped to `/proc/sys/net/core/somaxconn`"), which is
+    // the call `wayland-server`'s `ListeningSocket::bind_absolute` makes for a
+    // compositor's socket. Answering `EINVAL` there is where niri stopped:
+    // `ListeningSocketSource::new_auto` (`src/niri.rs:2435`), on a call Linux
+    // answers 0 to. Measured on the host before this was written:
+    // `listen(fd, -1)` returns 0 for `AF_UNIX` and `AF_INET` alike, and
+    // `ss -lx` then reports the backlog as 4096 - `net.core.somaxconn`, not
+    // the zero a "negative means a closed queue" reading would leave.
+    let deep = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1, 0) as i32;
+    let (da, dl) = lin::SockAddrUn::new(b"/tmp/t-unix-negative-backlog.sock");
+    lin::check_eq(
+        &mut failed,
+        b"a listener for the negative backlog binds",
+        lin::bind_un(deep, &da, dl),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"listen(-1) opens the queue instead of refusing it",
+        lin::raw_sys2(lin::nr::LISTEN, deep as usize, (-1isize) as usize),
+        0,
+    );
+    // Two connections waiting at once is what tells the two readings of "-1"
+    // apart: on the ceiling both are admitted, where a queue of one would take
+    // the first and answer the second `EAGAIN` - the arithmetic the zero-backlog
+    // stage above has just pinned from the other side.
+    let wait1 = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1, 0) as i32;
+    let wait2 = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1, 0) as i32;
+    let _ = lin::fcntl(wait1, lin::F_SETFL, lin::O_NONBLOCK);
+    let _ = lin::fcntl(wait2, lin::F_SETFL, lin::O_NONBLOCK);
+    lin::check_eq(
+        &mut failed,
+        b"the first connection a negative backlog admits gets in",
+        lin::connect_un(wait1, &da, dl),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and so does the second, the queue being the ceiling",
+        lin::connect_un(wait2, &da, dl),
+        0,
+    );
+    let held1 = lin::accept4_un(deep, core::ptr::null_mut(), core::ptr::null_mut(), 0) as i32;
+    let held2 = lin::accept4_un(deep, core::ptr::null_mut(), core::ptr::null_mut(), 0) as i32;
+    lin::check_true(
+        &mut failed,
+        b"both queued connections are there to accept",
+        held1 >= 0 && held2 >= 0,
+    );
+    let _ = lin::close(held1);
+    let _ = lin::close(held2);
+    let _ = lin::close(wait1);
+    let _ = lin::close(wait2);
+    lin::close(deep);
+    let _ = lin::unlinkat(lin::AT_FDCWD, b"/tmp/t-unix-negative-backlog.sock", 0);
+
     // A bound socket that never listened refuses streams (the kernel's
     // documented divergence from Linux's backlog-zero rendezvous).
     let nosock = lin::raw_sys(lin::nr::SOCKET, lin::AF_UNIX, 1, 0) as i32;

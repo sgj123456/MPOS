@@ -1007,9 +1007,9 @@ fn accept_blocking_step(_sock: &UnixSock) -> AcceptStep {
     panic!("blocking accept needs the kernel scheduler; push_pending in tests");
 }
 
-/// The `listen` call: record the backlog. Linux's odd zero and negative
-/// answers are decided by [`clamp_backlog`] and the handler; the first
-/// `listen` on a socket is what makes a `connect` acceptable at all.
+/// The `listen` call: record the backlog. Linux's odd zero answer is decided
+/// by [`clamp_backlog`] and the handler; the first `listen` on a socket is
+/// what makes a `connect` acceptable at all.
 pub(crate) fn listen(sock: &UnixSock, backlog: i32) -> Result<(), isize> {
     // `listen` is the stream call: it opens an accept queue, and a
     // datagram socket has no such thing - its queue is its queue, already
@@ -1017,7 +1017,7 @@ pub(crate) fn listen(sock: &UnixSock, backlog: i32) -> Result<(), isize> {
     if sock.typ == SOCK_DGRAM {
         return Err(err::EOPNOTSUPP);
     }
-    let cap = clamp_backlog(backlog).ok_or(crate::err::EINVAL)?;
+    let cap = clamp_backlog(backlog);
     critical_section::with(|cs| {
         let mut st = sock.state.borrow(cs).borrow_mut();
         st.backlog = Some(cap);
@@ -1042,14 +1042,28 @@ fn admits_one_more(backlog: usize, pending: usize) -> bool {
     pending <= backlog
 }
 
-/// The backlog rule, pure: negative is `EINVAL`, over `SOMAXCONN` is
-/// clamped (Linux since 2.4.22), and zero is a real queue of one - see
-/// [`admits_one_more`] for the arithmetic and the measurement behind it.
-pub(crate) fn clamp_backlog(backlog: i32) -> Option<usize> {
-    if backlog < 0 {
-        return None;
-    }
-    Some((backlog as usize).min(SOMAXCONN))
+/// The backlog rule, pure, and it is `__sys_listen`'s rather than any one
+/// family's - both this module and the IPv4 pool read it. Linux compares
+/// the argument to `SOMAXCONN` as an *unsigned* int, so a negative backlog
+/// is not refused: every one of them lands on `SOMAXCONN`, and anything
+/// above the ceiling is clamped to it (Linux since 2.4.22). Zero, in
+/// between, is a real queue of one - see [`admits_one_more`] for the
+/// arithmetic and the measurement behind it.
+///
+/// The negative half is the one a caller actually sends, which is why it
+/// is spelled out: Rust's std passes `-1` on Linux, in both families
+/// (`UnixListener::bind` and `TcpListener::bind` call `listen(fd, -1)`,
+/// "silently capped to `/proc/sys/net/core/somaxconn`"), and that is the
+/// call `wayland-server`'s `ListeningSocket::bind_absolute` makes for a
+/// compositor's socket. Refusing it stopped niri at
+/// `ListeningSocketSource::new_auto` (`src/niri.rs:2435`), `EINVAL` from a
+/// call Linux answers 0 to. Measured on the host before it was written:
+/// `listen(fd, -1)` returns 0 for `AF_UNIX` and `AF_INET` alike, and
+/// `ss -lx`/`ss -ltn` then report the backlog as 4096 - this host's
+/// `net.core.somaxconn`, not the zero a "negative means empty queue"
+/// reading would leave.
+pub(crate) fn clamp_backlog(backlog: i32) -> usize {
+    (backlog as u32).min(SOMAXCONN as u32) as usize
 }
 
 // ---------------------------------------------------------------------------

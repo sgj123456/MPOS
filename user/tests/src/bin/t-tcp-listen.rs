@@ -251,6 +251,57 @@ fn main() {
     }
     drop(client2);
 
+    // A *negative* backlog is Linux's "as deep as you allow" rather than a
+    // refusal: `__sys_listen` compares the argument to `SOMAXCONN` as an
+    // unsigned int, so `-1` lands on the ceiling. It is not a number a caller
+    // has to go looking for either - Rust's std passes exactly it on Linux from
+    // `TcpListener::bind` and `UnixListener::bind` alike ("silently capped to
+    // `/proc/sys/net/core/somaxconn`"), so a server written in Rust asks for it
+    // on every bind. Read as zero it is a queue one deep, which refuses the
+    // second of two simultaneous clients that Linux would have accepted.
+    // Measured on the host first: `listen(fd, -1)` answers 0 for `AF_INET` and
+    // `AF_UNIX`, and `ss -ltn` reports the backlog column as 4096 - this host's
+    // `net.core.somaxconn`, not 0.
+    let deep = stream();
+    r.check(
+        "a listener binds for the negative backlog",
+        bind(&deep, &SocketAddrV4::new(LOOPBACK, 0)).is_ok(),
+    );
+    match listen(&deep, -1) {
+        Ok(()) => r.check("listen(-1) opens the queue instead of refusing it", true),
+        Err(err) => r.check(
+            &format!("listen(-1) opens the queue instead of refusing it (got {err})"),
+            false,
+        ),
+    }
+    let deep_addr = getsockname(&deep)
+        .ok()
+        .and_then(as_v4)
+        .expect("the deep listener's own name");
+    // Both clients connect *before* either is accepted, which is what makes the
+    // depth visible: on the ceiling both handshakes complete, where a queue of
+    // one leaves the second with nowhere to land.
+    let burst1 = stream();
+    let burst2 = stream();
+    let first_in = connect(&burst1, &deep_addr).is_ok();
+    let second_in = connect(&burst2, &deep_addr).is_ok();
+    r.check("the first of two waiting clients connects", first_in);
+    r.check("the second one finds room beside it", second_in);
+    // Accepted only when both are there: a blocking `accept` against a
+    // connection that never completed would be the test hanging rather than
+    // failing, and a hang is a worse report than a red check.
+    if first_in && second_in {
+        let taken1 = accept(&deep).is_ok();
+        let taken2 = accept(&deep).is_ok();
+        r.check(
+            "both waiting connections are there to accept",
+            taken1 && taken2,
+        );
+    }
+    drop(burst1);
+    drop(burst2);
+    drop(deep);
+
     // `accept` on a non-blocking listener with nothing waiting is `EAGAIN`,
     // which is what a server's event loop is written against. The listener is
     // made non-blocking here rather than at creation, so the flag path
