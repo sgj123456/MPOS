@@ -358,15 +358,24 @@ fn publish_card(device: &mut Gpu) {
             bytes,
         });
     }
-    crate::drivers::drm::publish_card(
-        Card {
-            virgl: features.contains(crate::virtgpu_abi::Features::VIRGL),
-            context_init: features.contains(crate::virtgpu_abi::Features::CONTEXT_INIT),
-            capset_ids: crate::drm_virtgpu::table_mask(&capsets),
-        },
-        num_capsets,
-        &capsets,
+    let card = Card {
+        virgl: features.contains(crate::virtgpu_abi::Features::VIRGL),
+        context_init: features.contains(crate::virtgpu_abi::Features::CONTEXT_INIT),
+        capset_ids: crate::drm_virtgpu::table_mask(&capsets),
+    };
+    // Said out loud, and the `cached=` count is the half worth having: a cap set
+    // whose fetch failed is skipped silently (`continue` above), so without this
+    // line a device that offered two sets and produced none looks exactly like a
+    // device that had none - and `GETPARAM(7)` answering `0` would be the only
+    // trace, indistinguishable from the honest no-3D answer.
+    crate::println!(
+        "virtio-gpu: virgl={} context_init={} capsets={num_capsets} cached={} mask={:#x}",
+        card.virgl as u8,
+        card.context_init as u8,
+        capsets.len(),
+        card.capset_ids,
     );
+    crate::drivers::drm::publish_card(card, num_capsets, &capsets);
 }
 
 /// Tell the render task the host's display changed size.

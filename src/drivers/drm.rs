@@ -1127,7 +1127,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_VIRTGPU_RESOURCE_INFO => virtgpu_resource_info(arg),
         NR_VIRTGPU_MAP => virtgpu_map(arg),
         NR_VIRTGPU_WAIT => virtgpu_wait(arg),
-        NR_VIRTGPU_TRANSFER_TO_HOST => virtgpu_transfer_to_host(arg),
+        NR_VIRTGPU_TRANSFER_TO_HOST => virtgpu_transfer_to_host(arg, ofd),
         NR_VIRTGPU_GET_CAPS => virtgpu_get_caps(arg),
         NR_VIRTGPU_EXECBUFFER => virtgpu_execbuffer(arg, ofd),
         NR_VIRTGPU_TRANSFER_FROM_HOST => virtgpu_transfer_from_host(arg, ofd),
@@ -1937,7 +1937,16 @@ fn virtgpu_wait(arg: usize) -> isize {
 /// handle. It is named in `PLAN.md` §7.4 with the divergence above rather than
 /// answered `0`, because a transfer that did nothing while reporting success is
 /// the false success this repository forbids.
-fn virtgpu_transfer_to_host(arg: usize) -> isize {
+///
+/// **Two routes, chosen by the resource rather than by this request**, because
+/// one struct carries both and cannot say which it means. A 3D resource goes
+/// through `TRANSFER_TO_HOST_3D` with the caller's box, level, offset and
+/// strides intact; a 2D one takes the path described above, where those are
+/// restricted to the single-level, single-layer shape a 2D resource has. Linux
+/// splits on the same fact - `virtio_gpu_transfer_to_host_ioctl` reads the
+/// object's own kind - and the split is why the restrictions above are not a
+/// property of the request.
+fn virtgpu_transfer_to_host(arg: usize, ofd: u64) -> isize {
     // struct drm_virtgpu_3d_transfer_to_host: bo_handle@0, then the box
     // (x@4, y@8, z@12, w@16, h@20, d@24), level@28, offset@32, stride@36,
     // layer_stride@40.
@@ -1958,14 +1967,59 @@ fn virtgpu_transfer_to_host(arg: usize) -> isize {
             .dumb
             .get(handle.wrapping_sub(1))
             .and_then(|slot| slot.as_ref())?;
-        Some(d.resource.as_ref().map(|r| (r.id, r.size)))
+        Some(d.resource.as_ref().map(|r| (r.id, r.size, r.virgl)))
     });
     let Some(res) = found else {
         return -2; // ENOENT
     };
-    let Some((id, size)) = res else {
+    let Some((id, size, virgl)) = res else {
         return libc_einval(); // a dumb buffer is not a device resource
     };
+
+    if virgl {
+        // A 3D resource goes through the 3D transfer, and Linux routes it the
+        // same way: from the resource's own *kind* rather than from the request,
+        // because the request is one struct for both directions and cannot say.
+        //
+        // The box, the level, the offset and the two strides are all the
+        // caller's here. The checks below are restrictions of the **2D** command
+        // - it has one level, no pitch of its own and no layer - and applying
+        // them to this one would refuse a box a virgl caller legitimately sends.
+        // The over-read guard is skipped for the same reason: it exists to catch
+        // a caller that allocated a single page and then pushed a whole screen
+        // through the 2D command, and a 3D resource's backing is sized by its own
+        // create call rather than by this one.
+        let ctx = match ensure_context(ofd, 0, b"mpos") {
+            Ok(id) => id,
+            Err(errno) => return errno,
+        };
+        let request = crate::virtgpu_abi::TransferHost3d {
+            header: crate::virtgpu_abi::CtrlHeader::new(
+                crate::virtgpu_abi::CMD_TRANSFER_TO_HOST_3D,
+            ),
+            box3d: crate::virtgpu_abi::Box3d {
+                x: field(4),
+                y: field(8),
+                z: field(12),
+                w: width,
+                h: height,
+                d: depth,
+            },
+            offset: offset as u64,
+            resource_id: id,
+            level,
+            stride,
+            layer_stride,
+        };
+        return crate::drivers::video::render::job(
+            crate::drivers::video::render::Job::TransferHost3d {
+                to_host: true,
+                ctx,
+                request,
+            },
+        );
+    }
+
     if width == 0
         || height == 0
         || depth > 1
