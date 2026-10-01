@@ -306,6 +306,18 @@ impl File {
         // Wrong-mode first, as for `read`: Linux answers a `write(2)` on an
         // `O_RDONLY` descriptor with `EBADF`, including for a zero-length write.
         self.check_writable()?;
+        // Then the inode's own flags, which is Linux's `rw_verify_area` and the
+        // reason the check is here rather than only at the open: an inode can
+        // become immutable between the two, and the flag is a fact about the
+        // *file*, not about the description. The two flags differ, and the
+        // difference is the whole of what they mean: an immutable file refuses
+        // the write, an append-only one refuses a write that is not going to its
+        // end.
+        crate::vfs::may_modify(&self.inode)?;
+        let status = self.status.load(Ordering::Relaxed);
+        if crate::vfs::is_append_only(&self.inode) && status & O_APPEND == 0 {
+            return Err(VfsError::NotPermitted);
+        }
         // `O_APPEND` decides the position here rather than at the open,
         // because that is what the flag promises: the end of the file *now*,
         // re-read on every write, so a description held open while somebody
@@ -313,7 +325,6 @@ impl File {
         // the only thing the flag means anything for - a pipe or a terminal
         // has no end to append at, and its offset is ignored anyway - so the
         // size is asked of the inode only for one.
-        let status = self.status.load(Ordering::Relaxed);
         let pos = if status & O_APPEND != 0 && self.inode.metadata().kind == NodeKind::File {
             self.inode.metadata().size
         } else {

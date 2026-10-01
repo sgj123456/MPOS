@@ -25,6 +25,14 @@ pub(crate) const S_IFCHR: u16 = 0x2000;
 /// not an optimisation.
 pub(crate) const FAST_SYMLINK_MAX: u32 = 60;
 
+// The three names below are the *disk format's* names for three of `i_flags`'
+// bits - e2fsprogs spells them this way, and `<linux/fs.h>` spells the same bits
+// `FS_HUGE_FILE_FL`, `FS_EXTENT_FL` and `FS_INDEX_FL`. Both names are real; the
+// driver uses the format's because these are the bits it decides the on-disk
+// layout by, while `crate::vfs`'s vocabulary is what a caller passes through
+// `FS_IOC_SETFLAGS`. A reader comparing the two lists should know they are the
+// same three bits and not six.
+
 /// `i_blocks` is counted in filesystem blocks rather than 512-byte sectors.
 /// It applies per inode, and the filesystem-wide feature is what lets Linux
 /// set the flag - a file that needs it says so on itself.

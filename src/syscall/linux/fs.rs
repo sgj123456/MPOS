@@ -243,6 +243,31 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                         let _ = crate::sched::current_fds().close(fd);
                         return err_of(e);
                     }
+                    // Then the inode's own flags, and only for an open that
+                    // means to write. `chattr(1)` is precise about both: an
+                    // immutable file "cannot be opened in write mode", and an
+                    // append-only one "can only be opened in append mode for
+                    // writing". That is why the refusal is *here*, at the open,
+                    // rather than left to the write - a caller that opens a file
+                    // it may not write to should hear so before it starts.
+                    //
+                    // The write path asks the same questions again, and that is
+                    // not redundant: a flag can be set on a file somebody is
+                    // already holding open, and the flag is a fact about the
+                    // file rather than about the description Linux's
+                    // `rw_verify_area` exists for the same reason.
+                    if want & W_OK != 0 {
+                        if crate::vfs::is_immutable(&inode) {
+                            let _ = crate::sched::current_fds().close(fd);
+                            return err::EPERM;
+                        }
+                        if crate::vfs::is_append_only(&inode)
+                            && flags & crate::vfs::file::O_APPEND as usize == 0
+                        {
+                            let _ = crate::sched::current_fds().close(fd);
+                            return err::EPERM;
+                        }
+                    }
                 }
             }
             // Where this description lives, recorded for the `st_dev` both
@@ -316,11 +341,21 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             // what a writer that reopens a name is promising: what it writes
             // now is the whole file. Without it, `wget -O page.html` over a
             // longer page leaves the new page followed by the old one's tail.
+            //
+            // A truncate that the file's own flags refuse follows the *open*
+            // out of here rather than being swallowed: `O_TRUNC` on an
+            // immutable file is `EPERM` in Linux, and a kernel that opened the
+            // file and quietly left it whole would be answering the wrong
+            // question in the only way a caller cannot see.
             if flags & O_TRUNC != 0
                 && let Ok(file) = crate::sched::current_fds().clone_at(fd)
             {
                 let inode = file.inode();
                 if inode.metadata().kind == crate::vfs::NodeKind::File {
+                    if let Err(e) = crate::vfs::may_alter(&inode) {
+                        let _ = crate::vfs::close(fd);
+                        return err_of(e);
+                    }
                     let _ = inode.truncate(0);
                 }
             }
@@ -516,6 +551,14 @@ pub(super) fn ftruncate(args: [usize; ARG_COUNT]) -> isize {
     if !file.may_write() {
         return err::EINVAL;
     }
+    // The inode's own flags, after the descriptor's: `chattr +i` on a file
+    // somebody is already holding open still refuses the truncate, and
+    // `chattr +a` refuses it too - which is the one place the two flags do not
+    // differ, because cutting a file back is the operation `a` exists to
+    // prevent.
+    if let Err(e) = crate::vfs::may_alter(&file.inode()) {
+        return err_of(e);
+    }
     match file.inode().truncate(length as u64) {
         Ok(()) => {
             crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_MODIFY, "");
@@ -543,6 +586,9 @@ pub(super) fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
     // situation: Linux asks for write permission here, and `truncate` on a
     // file the caller may only read is EACCES rather than a silent success.
     if let Err(e) = crate::vfs::may_access(&inode, crate::vfs::W_OK) {
+        return err_of(e);
+    }
+    if let Err(e) = crate::vfs::may_alter(&inode) {
         return err_of(e);
     }
     match inode.truncate(length as u64) {
@@ -1084,6 +1130,12 @@ pub(super) fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         }
     };
 
+    // The clocks are metadata, so an immutable inode refuses them - and it is
+    // asked here, at the one call all three of `utimensat`, `futimesat` and
+    // `utime` end at, rather than at each of them.
+    if let Err(e) = crate::vfs::may_modify(&inode) {
+        return err_of(e);
+    }
     match inode.set_times(atime, mtime) {
         Ok(()) => {
             crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
@@ -4233,6 +4285,12 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // hands it to a compositor.
         request if family_nr(request, b'V').is_some() => vt_ioctl(fd, request, buf, from_user),
         request if family_nr(request, b'K').is_some() => kd_ioctl(fd, request, buf, from_user),
+        // The inode attribute word: `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`,
+        // the two requests `lsattr` and `chattr` are made of. The `'f'` family,
+        // which is Linux's own for exactly these.
+        request if family_nr(request, b'f').is_some() => {
+            fs_flags_ioctl(fd, request, buf, from_user)
+        }
         // dma-buf ioctls (`'b'`-typed), on the descriptor a PRIME export
         // handed out. A dma-buf here is coherent guest RAM - the same pages
         // the exporter and every mapper share - so the CPU access bracket
@@ -4541,6 +4599,89 @@ fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 /// The command numbers are `<linux/kd.h>`'s: `KDSETMODE 0x4B3A`,
 /// `KDGETMODE 0x4B3B`, `KDGKBMODE 0x4B44`, `KDSKBMODE 0x4B45`, so the low byte of
 /// the request word after the `'K'` magic is `0x3a`, `0x3b`, `0x44` and `0x45`.
+/// `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`: the inode attribute word, which
+/// `lsattr` prints as its one-line `--------------e-------` and `chattr` writes.
+///
+/// Two requests, and the family byte is `'f'` - Linux's, from `fs.h`. Anything
+/// else in the family is `ENOTTY`, the answer every family this kernel does not
+/// speak gets: there is no third request here to refuse more precisely.
+///
+/// The argument is a `long`, so the word is read and written as eight bytes with
+/// only the low four used - which is what Linux passes and what every caller
+/// allocates. Reading four would work on a little-endian machine and be wrong
+/// everywhere else, and "works on the machine I tested" is not a reason.
+fn fs_flags_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
+    const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+    const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(f) => f,
+        Err(e) => return err_of(e),
+    };
+    let inode = file.inode();
+    match request {
+        FS_IOC_GETFLAGS => {
+            // Whether this filesystem has an attribute word at all, which is a
+            // different question from which flags it holds. `ENOTTY` is Linux's
+            // answer for a filesystem whose inode operations have no
+            // `fileattr` half - procfs, sysfs, devfs, a pipe, a socket - and it
+            // is what `lsattr` reports as "not supported" rather than as a file
+            // with no attributes.
+            let flags = match inode.flags() {
+                Ok(flags) => flags,
+                Err(_) => return err::ENOTTY,
+            };
+            if !buffer_ok(buf, 8, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut u64).write_unaligned(flags as u64) };
+            0
+        }
+        FS_IOC_SETFLAGS => {
+            // The same question as above, asked through the door that has no
+            // other way to fail, because the *next* refusal has to mean
+            // something else. A filesystem with no attribute word is `ENOTTY`
+            // here too, on both requests; once it is known to have one, a
+            // refusal is about the flags and is `EOPNOTSUPP` - "this filesystem
+            // cannot do that" - which is the answer `chattr` reports as
+            // "Operation not supported" and the one that sends a caller to its
+            // fallback rather than to a retry.
+            if inode.flags().is_err() {
+                return err::ENOTTY;
+            }
+            if !buffer_ok(buf, 8, false, from_user) {
+                return err::EFAULT;
+            }
+            let flags = (unsafe { (buf as *const u64).read_unaligned() }) as u32;
+            // The two bits Linux gates on a capability, and *only* those: a
+            // caller without `CAP_LINUX_IMMUTABLE` may still set `nodump` or
+            // `noatime`, and is refused the one change it cannot make. The test
+            // is on the change rather than on the word, so writing back the
+            // flags a file already has is always allowed - which is what every
+            // `chattr` run does, since it reads the word, edits one bit and
+            // writes the whole thing back.
+            let old = crate::vfs::flags_of(&inode);
+            let privileged = crate::vfs::FS_IMMUTABLE_FL | crate::vfs::FS_APPEND_FL;
+            if (flags ^ old) & privileged != 0
+                && !crate::sched::current_credentials()
+                    .has_effective(crate::cred::CAP_LINUX_IMMUTABLE)
+            {
+                return err::EPERM;
+            }
+            match inode.set_flags(flags) {
+                Ok(()) => {
+                    // The flags are metadata, so the watcher that asked to hear
+                    // about `chmod` hears about this too.
+                    crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
+                    0
+                }
+                Err(e) => err_of(e),
+            }
+        }
+        _ => err::ENOTTY,
+    }
+}
+
 fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     if (request >> 8) & 0xff != b'K' as u32 {
         return err::ENOTTY;
@@ -5062,6 +5203,15 @@ pub(super) fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
 /// group has no standing to grant it - which is exactly the hole a `chmod
 /// g+s` on somebody else's file would otherwise open.
 fn chmod_mode(inode: &Arc<dyn Inode>, mode: u32) -> Result<u32, isize> {
+    // The inode's own flags first, and before the caller's identity: the bits
+    // *are* the node's metadata, and `chattr +i` protects them whatever the
+    // caller's uid is - `chattr(1)`'s "most of the metadata cannot be
+    // modified". `CAP_LINUX_IMMUTABLE` is what clears the flag, not a way
+    // around it, so there is no carve-out here either. One check, in the one
+    // function all four `chmod` handlers reach.
+    if crate::vfs::is_immutable(inode) {
+        return Err(err::EPERM);
+    }
     let me = crate::sched::current_owner();
     let owner = inode.owner();
     if me.0 != 0 && me.0 != owner.0 {
@@ -5178,6 +5328,13 @@ fn chown_allowed(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> Result<(
 /// rewrite who a file belongs to *and* keep them would be choosing its own
 /// privileges, which is the whole of what the rule prevents.
 fn chown_apply(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> isize {
+    // The same refusal as `chmod`, and for the same reason: the owner is
+    // metadata, and an immutable inode's metadata is what the flag protects.
+    // One check for all four `chown` handlers, which reach this through
+    // `handle_chown`, `handle_fchown`, `handle_fchownat` and `handle_lchown`.
+    if crate::vfs::is_immutable(inode) {
+        return err::EPERM;
+    }
     let before = inode.owner();
     let (uid, gid) = match chown_allowed(inode, uid_arg, gid_arg) {
         Ok(ids) => ids,
@@ -5371,6 +5528,14 @@ pub(super) fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> i
     };
     if !same_filesystem {
         return err::EXDEV;
+    }
+    // Linux's `may_linkat`, before the link is made: a second name for an
+    // immutable or append-only inode is refused, and the caller hears it as
+    // `EPERM`. It is *this* side of the check that matters - the destination
+    // directory's own flags are `may_create_in`'s business, and it was asked
+    // above.
+    if let Err(e) = crate::vfs::may_alter(&old) {
+        return err_of(e);
     }
     match parent.link(name, &old) {
         Ok(()) => {
@@ -6578,6 +6743,12 @@ pub(super) fn handle_futimesat(
             unsafe { ((tvp + 16) as *const i64).read_unaligned() } as u64,
         )
     };
+    // The clocks are metadata, so an immutable inode refuses them - and it is
+    // asked here, at the one call all three of `utimensat`, `futimesat` and
+    // `utime` end at, rather than at each of them.
+    if let Err(e) = crate::vfs::may_modify(&inode) {
+        return err_of(e);
+    }
     match inode.set_times(atime, mtime) {
         Ok(()) => {
             crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
@@ -6636,6 +6807,12 @@ pub(super) fn handle_utime(
             unsafe { ((times + 8) as *const i64).read_unaligned() } as u64,
         )
     };
+    // The clocks are metadata, so an immutable inode refuses them - and it is
+    // asked here, at the one call all three of `utimensat`, `futimesat` and
+    // `utime` end at, rather than at each of them.
+    if let Err(e) = crate::vfs::may_modify(&inode) {
+        return err_of(e);
+    }
     match inode.set_times(atime, mtime) {
         Ok(()) => {
             crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");

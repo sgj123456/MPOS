@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
@@ -276,6 +276,44 @@ impl Chunked {
     }
 }
 
+/// A ramfs node's attribute flags: the `FS_*_FL` word `lsattr` prints and
+/// `FS_IOC_SETFLAGS` may change.
+///
+/// An atomic rather than a critical section, because it is one word that nothing
+/// else in the node shares, and because the checks that read it run on every
+/// write and every unlink: taking a lock to ask "is this file immutable?" would
+/// be a lock for a load.
+///
+/// It is carried by the nodes that keep a mode and an owner, and deliberately
+/// not by the ones that keep neither. A node with no metadata has no attributes
+/// to hold, and the trait's own refusal is the answer Linux gives a filesystem
+/// with no `fileattr` half. So `RamFile`, `RamDir` and `RamSocket` carry this,
+/// while `RamDev` (a placeholder until a devtmpfs mount covers the directory)
+/// and `RamSymlink` (which stores only its target) answer `ENOTTY` for flags
+/// exactly as they already answer "no mode" and "no owner".
+struct NodeFlags(AtomicU32);
+
+impl NodeFlags {
+    fn new() -> NodeFlags {
+        NodeFlags(AtomicU32::new(0))
+    }
+
+    fn get(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Move the flags to `flags`, refusing what a memory filesystem cannot
+    /// keep. Nothing here is *owned* by a layout: there is no on-disk extent
+    /// tree or directory index for a flag to describe, so the owned mask is
+    /// empty and every bit a caller may name is one this can hold.
+    fn set(&self, flags: u32) -> VfsResult<()> {
+        let old = self.get();
+        let stored = crate::vfs::apply_flag_change(old, flags, 0)?;
+        self.0.store(stored, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// A file: bytes with no structure of their own.
 struct RamFile {
     /// The mount these bytes are charged to. Not the filesystem's: a file
@@ -307,6 +345,9 @@ struct RamFile {
     /// too, which is the trait's stated answer for a filesystem with a single
     /// clock.
     mtime: Mutex<Cell<u64>>,
+    /// The attribute flags: `lsattr`'s word, and what makes a file immutable
+    /// or append-only.
+    flags: NodeFlags,
     data: Mutex<RefCell<Chunked>>,
 }
 
@@ -385,6 +426,14 @@ macro_rules! names_live_in_dirs {
 }
 
 impl Inode for RamFile {
+    fn flags(&self) -> VfsResult<u32> {
+        Ok(self.flags.get())
+    }
+
+    fn set_flags(&self, flags: u32) -> VfsResult<()> {
+        self.flags.set(flags)
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -564,9 +613,18 @@ struct RamSocket {
     mtime: u64,
     mode: Mutex<Cell<Option<u32>>>,
     owner: Mutex<Cell<(u32, u32)>>,
+    flags: NodeFlags,
 }
 
 impl Inode for RamSocket {
+    fn flags(&self) -> VfsResult<u32> {
+        Ok(self.flags.get())
+    }
+
+    fn set_flags(&self, flags: u32) -> VfsResult<()> {
+        self.flags.set(flags)
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -628,10 +686,22 @@ struct RamDir {
     /// Stamped when an entry is added or removed, as a directory's mtime is
     /// on every real filesystem.
     mtime: Mutex<Cell<u64>>,
+    /// The attribute flags. A directory's matter as much as a file's here: an
+    /// append-only directory takes new names and gives none up, and an
+    /// immutable one takes nothing at all.
+    flags: NodeFlags,
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
 }
 
 impl Inode for RamDir {
+    fn flags(&self) -> VfsResult<u32> {
+        Ok(self.flags.get())
+    }
+
+    fn set_flags(&self, flags: u32) -> VfsResult<()> {
+        self.flags.set(flags)
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
@@ -692,6 +762,7 @@ impl Inode for RamDir {
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
                 mtime: Mutex::new(Cell::new(at)),
+                flags: NodeFlags::new(),
                 data: Mutex::new(RefCell::new(Chunked::new())),
             }),
             NodeKind::Dir => Arc::new(RamDir {
@@ -700,6 +771,7 @@ impl Inode for RamDir {
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
                 mtime: Mutex::new(Cell::new(at)),
+                flags: NodeFlags::new(),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
             // A device node mknod made: a placeholder until a devtmpfs mount
@@ -716,6 +788,7 @@ impl Inode for RamDir {
                 mtime: now(),
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+                flags: NodeFlags::new(),
             }),
             // A link is made with `Inode::symlink`, which carries the one thing
             // a link cannot exist without: what it points at.
@@ -868,6 +941,7 @@ impl RamFs {
                 mode: Mutex::new(Cell::new(None)),
                 owner: Mutex::new(Cell::new(crate::sched::current_owner())),
                 mtime: Mutex::new(Cell::new(now())),
+                flags: NodeFlags::new(),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
         })
@@ -891,6 +965,149 @@ mod tests {
 
     use super::{CHUNK, Chunked, RamFs, Usage};
     use crate::vfs::{FileSystem, NodeKind, VfsError};
+
+    /// The flags are kept, and a caller reads back what it set.
+    ///
+    /// Which is all `lsattr` needs from a memory filesystem, and the reason
+    /// `GETFLAGS` answers *something* here rather than refusing: Linux's tmpfs
+    /// answers it too - measured on the host, where `lsattr` on a tmpfs file
+    /// prints its flags line rather than "not supported" - and the zero word a
+    /// file nobody has flagged carries is that answer.
+    #[test]
+    fn the_attribute_flags_are_kept_and_read_back() {
+        use crate::vfs::{FS_APPEND_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL};
+        let fs = RamFs::new();
+        let file = fs.root().create("f", NodeKind::File).unwrap();
+        assert_eq!(file.flags().unwrap(), 0, "nothing set on a fresh file");
+
+        file.set_flags(FS_IMMUTABLE_FL | FS_NODUMP_FL).unwrap();
+        assert_eq!(file.flags().unwrap(), FS_IMMUTABLE_FL | FS_NODUMP_FL);
+        // The caller passes the *whole* word - which is what `chattr` does,
+        // having read it first and edited one bit - so the word it passes is
+        // the word kept, and the old flags do not linger.
+        file.set_flags(FS_APPEND_FL).unwrap();
+        assert_eq!(file.flags().unwrap(), FS_APPEND_FL);
+        file.set_flags(0).unwrap();
+        assert_eq!(file.flags().unwrap(), 0);
+    }
+
+    /// A flag this cannot keep is refused *and not stored*.
+    ///
+    /// The counterfactual is the whole point of the refusal: a `SETFLAGS` that
+    /// recorded `FS_COMPR_FL` and went on writing uncompressed bytes would be a
+    /// caller told something false, and `chattr +c` succeeding while doing
+    /// nothing is how a directory someone believed was compressed fills the
+    /// disk anyway.
+    #[test]
+    fn a_flag_this_cannot_keep_is_refused_and_not_stored() {
+        use crate::vfs::{FS_COMPR_FL, FS_ENCRYPT_FL, FS_NODUMP_FL};
+        let fs = RamFs::new();
+        let file = fs.root().create("f", NodeKind::File).unwrap();
+        assert_eq!(
+            file.set_flags(FS_COMPR_FL).err(),
+            Some(VfsError::Unsupported)
+        );
+        assert_eq!(file.flags().unwrap(), 0, "and nothing was recorded");
+        // The whole word is checked, not the first bit that cannot be kept.
+        assert_eq!(
+            file.set_flags(FS_NODUMP_FL | FS_ENCRYPT_FL).err(),
+            Some(VfsError::Unsupported)
+        );
+        assert_eq!(file.flags().unwrap(), 0, "not even the part that could be");
+    }
+
+    /// An immutable file refuses the write, the metadata change and the eager
+    /// removal - and clearing the flag gives all three back.
+    ///
+    /// Each refusal is asserted at the layer that owns it rather than through a
+    /// syscall, because that is where the rule lives and the syscall layer is
+    /// machine-only: [`may_modify`] is what `write`, `chmod`, `chown` and
+    /// `utimensat` ask, [`may_alter`] what `truncate` and `linkat` ask, and
+    /// [`may_remove`] what `unlink`, `rmdir` and the copy-and-unlink that
+    /// `rename` is made of ask.
+    #[test]
+    fn an_immutable_file_refuses_everything_the_flag_promises() {
+        use crate::vfs::{FS_IMMUTABLE_FL, may_alter, may_modify, may_remove};
+        let fs = RamFs::new();
+        let dir = fs.root();
+        let file = dir.create("f", NodeKind::File).unwrap();
+        let handle = crate::vfs::file::File::new(file.clone());
+
+        // First with no flags set, so each refusal below is the flag's doing
+        // and not the fixture's.
+        assert_eq!(handle.write(b"x").unwrap(), 1);
+        may_modify(&file).unwrap();
+        may_alter(&file).unwrap();
+        may_remove(&dir, &file).unwrap();
+
+        file.set_flags(FS_IMMUTABLE_FL).unwrap();
+        assert_eq!(
+            handle.write(b"x").err(),
+            Some(VfsError::NotPermitted),
+            "a write to an immutable file"
+        );
+        assert_eq!(may_modify(&file).err(), Some(VfsError::NotPermitted));
+        assert_eq!(may_alter(&file).err(), Some(VfsError::NotPermitted));
+        assert_eq!(may_remove(&dir, &file).err(), Some(VfsError::NotPermitted));
+
+        file.set_flags(0).unwrap();
+        assert_eq!(handle.write(b"x").unwrap(), 1, "and all of it comes back");
+        may_modify(&file).unwrap();
+        may_alter(&file).unwrap();
+        may_remove(&dir, &file).unwrap();
+    }
+
+    /// An append-only file takes the writes that go to its end and refuses the
+    /// rest - including the one that *could* have been made in the middle.
+    #[test]
+    fn an_append_only_file_takes_only_appends() {
+        use crate::vfs::FS_APPEND_FL;
+        use crate::vfs::may_alter;
+        let fs = RamFs::new();
+        let file = fs.root().create("log", NodeKind::File).unwrap();
+        let handle = crate::vfs::file::File::new(file.clone());
+        file.set_flags(FS_APPEND_FL).unwrap();
+
+        // Without `O_APPEND` the write is refused, which is Linux's
+        // `rw_verify_area`: the point of the flag is that the file *grows*, and
+        // a write at a stored cursor is what it exists to prevent.
+        assert_eq!(
+            handle.write(b"x").err(),
+            Some(VfsError::NotPermitted),
+            "a write with no O_APPEND"
+        );
+        handle.set_status(crate::vfs::file::O_APPEND as u32);
+        assert_eq!(
+            handle.write(b"x").unwrap(),
+            1,
+            "an append is what it is for"
+        );
+        // And it may not be cut back, whichever way it is asked: this is the
+        // one thing the two flags agree about, because shortening a file is
+        // exactly the operation `a` exists to prevent.
+        assert_eq!(may_alter(&file).err(), Some(VfsError::NotPermitted));
+    }
+
+    /// An append-only *directory* takes new names and gives none up.
+    #[test]
+    fn an_append_only_directory_takes_names_and_gives_none_up() {
+        use crate::vfs::{FS_APPEND_FL, may_create_in, may_remove};
+        let fs = RamFs::new();
+        let dir = fs.root().create("d", NodeKind::Dir).unwrap();
+        let old = dir.create("old", NodeKind::File).unwrap();
+
+        // With no flags, both doors are open.
+        may_create_in(&dir).unwrap();
+        may_remove(&dir, &old).unwrap();
+
+        dir.set_flags(FS_APPEND_FL).unwrap();
+        may_create_in(&dir).unwrap();
+        assert_eq!(
+            may_remove(&dir, &old).err(),
+            Some(VfsError::NotPermitted),
+            "a name may be added to a directory that may only be added to, and not taken away"
+        );
+    }
 
     /// The whole point of the mount's room: a write that would take the bytes
     /// the machine does not have is refused, not attempted.

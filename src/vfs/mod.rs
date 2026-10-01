@@ -835,6 +835,30 @@ pub trait Inode: Send + Sync {
     /// before this existed.
     fn set_owner(&self, _uid: u32, _gid: u32) {}
 
+    /// The node's attribute flags: Linux's `FS_*_FL` vocabulary, the word
+    /// `FS_IOC_GETFLAGS` returns and `lsattr` prints.
+    ///
+    /// The default refuses, and the refusal is an answer rather than a gap:
+    /// Linux answers `ENOTTY` for a filesystem whose inode operations have no
+    /// `fileattr` half, which is every filesystem here that stores no such
+    /// flags - procfs, sysfs, devfs, a pipe, a socket. A caller that hears the
+    /// refusal falls back to its own answer; a caller told "no flags" would be
+    /// told something false about a file it asked a real question about.
+    fn flags(&self) -> VfsResult<u32> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Replace the node's attribute flags, on the same terms as
+    /// [`Inode::flags`] and with the same default refusal.
+    ///
+    /// An implementation refuses what it cannot *keep*: a flag stored and not
+    /// enforced is worse than a flag refused, because the caller that set it
+    /// stops looking. It also ignores nothing - a change to a flag the
+    /// filesystem owns is a refusal, not a silent no-op.
+    fn set_flags(&self, _flags: u32) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
+
     /// Set the node's access and modification clocks - what `utimensat`/`futimens`
     /// do when a caller (or `touch`) names times. The change clock moves with
     /// the metadata, so a filesystem that keeps the three stores a fresh ctime
@@ -1063,6 +1087,215 @@ const S_ISVTX: u32 = 0o1000;
 pub const S_ISUID: u32 = 0o4000;
 pub const S_ISGID: u32 = 0o2000;
 
+// ---------------------------------------------------------------------------
+// The inode attribute flags: `lsattr`'s columns, and `FS_IOC_GETFLAGS`' word.
+// ---------------------------------------------------------------------------
+
+// Linux's names and Linux's values (`<linux/fs.h>`), because the number is the
+// UAPI: a caller passes these bits through `FS_IOC_SETFLAGS` and reads them back
+// through `FS_IOC_GETFLAGS`, and `lsattr` prints them by *position*. A private
+// value would be a private dialect of a vocabulary userland already knows.
+//
+// They are grouped by what this kernel does with them, because that is what a
+// reader needs from this list: the first six are the ones a caller may change
+// and this kernel *honours*; the next three are the block layout the ext4 driver
+// owns and only reports; the rest are named so that a caller passing one is
+// refused for the right reason - `EOPNOTSUPP`, "this filesystem cannot do that"
+// - rather than by falling off the end of a mask.
+
+/// Append-only: the file may only be written at its end, and may not be
+/// removed, renamed or truncated. Honoured by [`may_truncate`] and by
+/// [`File::write`](crate::vfs::file::File).
+pub const FS_APPEND_FL: u32 = 0x0000_0020;
+/// Do not include this file in a `dump(8)` archive. Nothing in the kernel acts
+/// on it, and nothing should: the flag's whole meaning is a promise *to
+/// userland*, which reads it with `GETFLAGS` and skips the file. Honouring it
+/// is storing it.
+pub const FS_NODUMP_FL: u32 = 0x0000_0040;
+/// Do not update the file's access time. Read where the access time would
+/// otherwise move.
+pub const FS_NOATIME_FL: u32 = 0x0000_0080;
+/// Writes to this file are synchronous. Honoured by construction: this kernel's
+/// filesystems are write-through - every `write_at` reaches the device before it
+/// returns - so the promise this flag makes is one that is already kept.
+pub const FS_SYNC_FL: u32 = 0x0000_0008;
+/// Directory operations in this directory are synchronous, on the same terms as
+/// [`FS_SYNC_FL`].
+pub const FS_DIRSYNC_FL: u32 = 0x0001_0000;
+/// Immutable: the file may not be written, truncated, removed, renamed or
+/// linked, and its metadata may not be changed. Set and cleared only by a
+/// caller holding `CAP_LINUX_IMMUTABLE`.
+pub const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+
+/// The block pointers of this inode are an extent tree rather than a block map.
+/// Owned by the ext4 driver, which sets it on every file it creates: a caller
+/// may read it (it is what `lsattr` prints as `e`) and may not change it.
+pub const FS_EXTENT_FL: u32 = 0x0008_0000;
+/// This directory is indexed (has a hash tree). Owned by the driver for the same
+/// reason, and reported in the same way.
+pub const FS_INDEX_FL: u32 = 0x0000_1000;
+/// `i_blocks` counts filesystem blocks rather than 512-byte sectors. Owned by
+/// the driver, which sets it when a file outgrows what sector counting can say.
+pub const FS_HUGE_FILE_FL: u32 = 0x0004_0000;
+
+/// Secure deletion: the data is overwritten when the file is removed. Named so
+/// that a caller asking for it is refused; nothing here overwrites anything.
+pub const FS_SECRM_FL: u32 = 0x0000_0001;
+/// Undelete: the data is kept after removal. Refused - nothing here keeps it.
+pub const FS_UNRM_FL: u32 = 0x0000_0002;
+/// Transparent compression, on the HFS+/btrfs model. Refused.
+pub const FS_COMPR_FL: u32 = 0x0000_0004;
+/// Written with the dirty bit set, for a filesystem that tracks a commit point.
+/// Refused: this kernel's write-through filesystems have none.
+pub const FS_DIRTY_FL: u32 = 0x0000_0100;
+/// The head of a compressed cluster. Refused with the rest of compression.
+pub const FS_COMPRBLK_FL: u32 = 0x0000_0200;
+/// Do not compress this file. Refused with the rest of compression.
+pub const FS_NOCOMP_FL: u32 = 0x0000_0400;
+/// Encrypted inode. Refused: there is no keyring to encrypt against.
+pub const FS_ENCRYPT_FL: u32 = 0x0000_0800;
+/// Magic naming for the AFS/Solaris directory layout. Refused.
+pub const FS_IMAGIC_FL: u32 = 0x0000_2000;
+/// Journal the file's data rather than writing it through. Refused: there is no
+/// journal.
+pub const FS_JOURNAL_DATA_FL: u32 = 0x0000_4000;
+/// Partially-written blocks are not merged into a neighbouring file's tail.
+/// Refused: this kernel's allocator has no tail-merging to suppress.
+pub const FS_NOTAIL_FL: u32 = 0x0000_8000;
+/// The directory is the top of its own hierarchy. Refused: it is an allocation
+/// hint for a directory tree this kernel does not build.
+pub const FS_TOPDIR_FL: u32 = 0x0002_0000;
+/// The file is protected by fs-verity. Refused: there is no Merkle tree here.
+pub const FS_VERITY_FL: u32 = 0x0010_0000;
+/// The inode's extended attributes are shared between inodes. Refused: there is
+/// no extended-attribute storage.
+pub const FS_EA_INODE_FL: u32 = 0x0020_0000;
+/// The file's last block is known to be sparse. Refused: the driver tracks
+/// holes its own way.
+pub const FS_EOFBLOCKS_FL: u32 = 0x0040_0000;
+/// Copy-on-write is off for this file. Refused: no btrfs-style CoW to switch.
+pub const FS_NOCOW_FL: u32 = 0x0080_0000;
+/// Direct access to the storage, bypassing the page cache. Refused: there is no
+/// page cache to bypass, and no DAX device to map.
+pub const FS_DAX_FL: u32 = 0x0200_0000;
+/// The file's data is stored in its inode. Refused: no inode in this kernel has
+/// room, and the driver would have to move the data to honour it.
+pub const FS_INLINE_DATA_FL: u32 = 0x1000_0000;
+/// New children inherit this directory's project id. Refused: there are no
+/// project ids.
+pub const FS_PROJINHERIT_FL: u32 = 0x2000_0000;
+/// Names in this directory are compared case-insensitively. Refused: the
+/// directory hashing here is byte-exact, and folding it afterwards would need a
+/// second name index.
+pub const FS_CASEFOLD_FL: u32 = 0x4000_0000;
+
+/// Every flag an inode here can *report*.
+///
+/// `GETFLAGS` on a filesystem that stores flags answers with these and nothing
+/// else, and `SETFLAGS` refuses any bit outside the set outright: a flag this
+/// kernel does not know is one it cannot keep, and answering "yes" to it would
+/// leave the caller believing something false.
+pub const INODE_FL_VISIBLE: u32 = FS_IMMUTABLE_FL
+    | FS_APPEND_FL
+    | FS_NODUMP_FL
+    | FS_NOATIME_FL
+    | FS_SYNC_FL
+    | FS_DIRSYNC_FL
+    | FS_EXTENT_FL
+    | FS_INDEX_FL
+    | FS_HUGE_FILE_FL;
+
+/// The subset of [`INODE_FL_VISIBLE`] a caller may change, and the whole of what
+/// this kernel *enforces*.
+///
+/// The three the driver owns are visible and not modifiable, which is ext4's own
+/// split (`EXT4_FL_USER_VISIBLE` against `EXT4_FL_USER_MODIFIABLE`) and for the
+/// same reason: clearing `FS_EXTENT_FL` on a file whose blocks are an extent tree
+/// does not turn the tree back into a block map, it makes the file unreadable.
+/// A caller that changes one is refused rather than quietly obeyed, because a
+/// silently-ignored `chattr` is a caller that stops checking.
+pub const INODE_FL_MODIFIABLE: u32 =
+    FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL | FS_SYNC_FL | FS_DIRSYNC_FL;
+
+/// The inode's attribute flags, or zero for a filesystem that has none.
+///
+/// A filesystem with no `fileattr` half - procfs, sysfs, a pipe - refuses
+/// `GETFLAGS`, which is the honest answer, and it also has no flags for the
+/// checks below to police. This is the one place that difference is spelled.
+pub fn flags_of(inode: &Arc<dyn Inode>) -> u32 {
+    inode.flags().unwrap_or(0)
+}
+
+/// Whether `inode` is immutable.
+pub fn is_immutable(inode: &Arc<dyn Inode>) -> bool {
+    flags_of(inode) & FS_IMMUTABLE_FL != 0
+}
+
+/// Whether `inode` may only be written at its end.
+pub fn is_append_only(inode: &Arc<dyn Inode>) -> bool {
+    flags_of(inode) & FS_APPEND_FL != 0
+}
+
+/// Whether the running process may change `inode`'s contents or metadata at all.
+///
+/// One check for both, because Linux's `IMMUTABLE` covers both and a single
+/// helper is how they stay in step: `chmod` on an immutable file is refused for
+/// the same reason a write to it is, and a kernel that policed only the write
+/// would let the file's *meaning* be changed out from under the flag that
+/// protects it. There is no capability carve-out, either - `CAP_LINUX_IMMUTABLE`
+/// is what *clears the flag*, and a process that holds it has the way out
+/// anybody else would need to be given. `chattr(1)`'s own words are "most of the
+/// metadata cannot be modified", and the way to unprotect a file is to unprotect
+/// it.
+pub fn may_modify(inode: &Arc<dyn Inode>) -> VfsResult<()> {
+    if is_immutable(inode) {
+        return Err(VfsError::NotPermitted);
+    }
+    Ok(())
+}
+
+/// Whether the running process may change `inode`'s *extent*: cut it short or
+/// lengthen it, remove it, or give it another name.
+///
+/// A stricter question than [`may_modify`], and the difference between the two
+/// flags that this kernel honours. An append-only file may be added to and not
+/// cut back, may not be removed and may not be hard-linked a second time - so
+/// both flags refuse all four - while only `IMMUTABLE` reaches the metadata.
+/// That is `chattr(1)`'s own split: it says of `a` that the file "can only be
+/// opened in append mode for writing", and of `i` that "most of the metadata
+/// cannot be modified". Linux spells the same two rules as `may_delete`,
+/// `may_linkat` and the truncating half of `setattr_prepare`; this is all of
+/// them because all of them are one question.
+pub fn may_alter(inode: &Arc<dyn Inode>) -> VfsResult<()> {
+    if is_immutable(inode) || is_append_only(inode) {
+        return Err(VfsError::NotPermitted);
+    }
+    Ok(())
+}
+
+/// What a filesystem should store when a caller asks to move an inode's flags
+/// from `old` to `new`, or the refusal that stands in its place.
+///
+/// One rule for every filesystem that keeps flags, because it is Linux's and not
+/// any driver's: a bit outside what this kernel can hold is `EOPNOTSUPP` - "this
+/// filesystem cannot do that", the answer `chattr` prints and the one that sends
+/// the caller to its fallback - and a *change* to a bit the filesystem owns
+/// (`owned`: the extent tree, the directory index, the block-counting unit) is
+/// refused rather than quietly ignored, because a caller whose `chattr` appeared
+/// to work and did nothing stops checking.
+///
+/// The returned word carries the owned bits over as they stand, so a filesystem
+/// cannot lose its layout by trusting the caller's argument.
+pub fn apply_flag_change(old: u32, new: u32, owned: u32) -> VfsResult<u32> {
+    if new & !(INODE_FL_MODIFIABLE | owned) != 0 {
+        return Err(VfsError::Unsupported);
+    }
+    if (old ^ new) & owned != 0 {
+        return Err(VfsError::Unsupported);
+    }
+    Ok((old & !INODE_FL_MODIFIABLE) | (new & INODE_FL_MODIFIABLE))
+}
+
 /// Whether `mode`, owned by `owner`, lets `me` do `want` - where `want` is the
 /// same bit set `open(2)` uses: 4 read, 2 write, 1 execute.
 ///
@@ -1146,6 +1379,12 @@ pub fn may_search(dir: &Arc<dyn Inode>) -> VfsResult<()> {
 /// Whether the running process may **create or remove a name** in `dir`: an
 /// entry is a write to the directory, and finding where to put it is a search.
 pub fn may_create_in(dir: &Arc<dyn Inode>) -> VfsResult<()> {
+    // No flag check here, and that is Linux's shape rather than an omission:
+    // `may_create` asks for `MAY_WRITE | MAY_EXEC` and nothing else, so a name
+    // *may* be added to an append-only directory. What the flag forbids is
+    // giving a name up, which is [`may_remove`]'s half - an append-only
+    // directory is one that may only be added to, and both halves of that
+    // sentence are load-bearing.
     may_access(dir, W_OK | X_OK)
 }
 
@@ -1166,6 +1405,21 @@ pub fn may_create_in(dir: &Arc<dyn Inode>) -> VfsResult<()> {
 /// cannot know who is calling, and a permission check is a fact about the
 /// caller, not about the node.
 pub fn may_remove(parent: &Arc<dyn Inode>, target: &Arc<dyn Inode>) -> VfsResult<()> {
+    // The inode's own flags first, and before the directory's: Linux's
+    // `may_delete` refuses an immutable or append-only *target* whatever the
+    // directory says, which is the whole of what the `i` someone set on a file
+    // is supposed to mean. It is the same question [`may_alter`] answers, asked
+    // here rather than at each of the callers - `unlink`, `rmdir`, and the
+    // copy-and-unlink that `rename` is emulated with - so that all three refuse
+    // together.
+    may_alter(target)?;
+    // Then the directory's own flag, and *before* the permission bits because
+    // that is the order Linux's `may_delete` asks them in - an append-only
+    // directory refuses the removal whether or not the caller could otherwise
+    // write there, so the refusal is `EPERM` rather than `EACCES`.
+    if is_append_only(parent) {
+        return Err(VfsError::NotPermitted);
+    }
     let me = crate::sched::current_owner();
     // Write permission on the directory, through the same core every other
     // check uses - so root passes here as everywhere, and the kernel's own
@@ -1206,6 +1460,49 @@ pub fn rmdir_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
 
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
+    use super::*;
+
+    /// The one rule every filesystem with flags shares, and the three answers
+    /// it can give.
+    ///
+    /// It is worth a test of its own because it is where a *silent* no-op would
+    /// live: a `set_flags` that stored the word it was handed would pass every
+    /// round-trip test in the tree while quietly dropping the extent bit on a
+    /// file whose blocks are an extent tree - the exact shape of bug the
+    /// conventions call the worst thing this codebase can do.
+    #[test]
+    fn a_flag_change_is_kept_refused_or_ignored_by_rule() {
+        // A change within the modifiable set is kept, whole.
+        assert_eq!(
+            apply_flag_change(0, FS_NODUMP_FL | FS_NOATIME_FL, 0),
+            Ok(FS_NODUMP_FL | FS_NOATIME_FL)
+        );
+        // One that clears a flag clears it.
+        assert_eq!(apply_flag_change(FS_IMMUTABLE_FL, 0, 0), Ok(0));
+        // A bit this kernel cannot keep is refused, and the caller is told
+        // rather than obeyed.
+        assert_eq!(
+            apply_flag_change(0, FS_COMPR_FL, 0),
+            Err(VfsError::Unsupported)
+        );
+        // A change to a bit the filesystem owns is refused too - `owned` here
+        // standing in for ext4's extent, index and huge-file bits.
+        const OWNED: u32 = FS_EXTENT_FL | FS_INDEX_FL | FS_HUGE_FILE_FL;
+        assert_eq!(
+            apply_flag_change(FS_EXTENT_FL, 0, OWNED),
+            Err(VfsError::Unsupported),
+            "clearing the extent bit would not make the file a block map"
+        );
+        // Passing an owned bit back unchanged is not a change, and is what
+        // every `chattr` does - it reads the word, edits one bit, writes the
+        // whole word back - so it has to be allowed.
+        assert_eq!(
+            apply_flag_change(FS_EXTENT_FL, FS_EXTENT_FL | FS_NODUMP_FL, OWNED),
+            Ok(FS_EXTENT_FL | FS_NODUMP_FL),
+            "the owned bit is carried over, not dropped"
+        );
+    }
+
     use alloc::sync::Arc;
 
     use super::mount::Vfs;

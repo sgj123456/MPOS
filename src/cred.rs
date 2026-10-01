@@ -58,6 +58,10 @@ pub const CAP_FULL: u64 = if CAP_LAST_CAP == 63 {
 pub const CAP_SYS_PTRACE: u32 = 19;
 /// `CAP_SETPCAP`, which `PR_CAPBSET_DROP` requires.
 pub const CAP_SETPCAP: u32 = 8;
+/// `CAP_LINUX_IMMUTABLE`, which setting or clearing the `i` and `a` inode flags
+/// requires - `FS_IOC_SETFLAGS`' own gate, and the one `chattr(1)` names in its
+/// errors.
+pub const CAP_LINUX_IMMUTABLE: u32 = 9;
 
 /// `SUID_DUMP_DISABLE`: nobody may inspect the process without a capability.
 pub const SUID_DUMP_DISABLE: u8 = 0;

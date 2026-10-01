@@ -803,6 +803,40 @@ impl Inode for Ext4Ino {
         self.fs.write_inode(self.ino, &data);
     }
 
+    /// The inode's attribute flags: `i_flags` off the on-disk record, which is
+    /// the word `lsattr` prints and the one `FS_IOC_GETFLAGS` returns. Every
+    /// file this driver creates carries the extent bit, so `lsattr` shows the
+    /// `e` that tells a reader the blocks are a tree.
+    fn flags(&self) -> VfsResult<u32> {
+        Ok(self.fs.read_inode(self.ino).flags)
+    }
+
+    /// Move them, refusing anything this kernel cannot keep.
+    ///
+    /// The word is *persisted* rather than remembered: a flag that a remount
+    /// forgot would be a promise that lasted until the next boot, and the
+    /// on-disk inode is where Linux keeps it too. The three bits the driver
+    /// owns - the extent tree, the directory index, the block-counting unit -
+    /// are carried over untouched by
+    /// [`apply_flag_change`](crate::vfs::apply_flag_change), because they
+    /// describe a layout already chosen rather than a promise a caller can make.
+    ///
+    /// The capability the two privileged flags need is checked by the caller,
+    /// `syscall/linux/fs.rs`: it is a fact about the *caller*, and no
+    /// filesystem can know it.
+    fn set_flags(&self, flags: u32) -> VfsResult<()> {
+        // A read-only mount refuses the write, as it refuses every other one.
+        self.fs.writable()?;
+        let mut data = self.fs.read_inode(self.ino);
+        data.flags = crate::vfs::apply_flag_change(
+            data.flags,
+            flags,
+            INODE_EXTENTS_FL | INODE_INDEX_FL | INODE_HUGE_FILE_FL,
+        )?;
+        self.fs.write_inode(self.ino, &data);
+        Ok(())
+    }
+
     /// Set the access and modification clocks, `utimensat`'s whole job. The
     /// change clock moves with the metadata, so it is stamped with the current
     /// time here rather than taken from the caller - exactly what Linux does,
@@ -1151,7 +1185,14 @@ impl Inode for Ext4Ino {
         if done > 0 {
             let stamp = now();
             const DAY: u32 = 86_400;
-            if data.atime < data.ctime || data.atime + DAY < stamp {
+            // The inode's own `A` flag is asked first and it is not the same
+            // question as the mount's `noatime`: this one is a promise about
+            // *this file*, made by whoever set it, and it holds wherever the
+            // filesystem happens to be mounted. A flag nothing reads would be a
+            // flag that did nothing.
+            if data.flags & crate::vfs::FS_NOATIME_FL == 0
+                && (data.atime < data.ctime || data.atime + DAY < stamp)
+            {
                 data.atime = stamp;
                 self.fs.write_inode(self.ino, &data);
             }
@@ -3387,5 +3428,74 @@ mod tests {
             22
         );
         assert_eq!(read_all(&*hello, 64), b"CHANGED BY THE KERNEL\n".to_vec());
+    }
+
+    /// The attribute flags are the on-disk `i_flags`, and going through
+    /// `set_flags` really does write them down.
+    ///
+    /// This is the pin the guest cannot give: the gate boots a ramfs, so the
+    /// only place an ext4 inode's flags can be *persisted* and read back is an
+    /// image the host's `mke2fs` made. Three things are checked, and each is one
+    /// the other tests would not catch - that a fresh file reports the extent
+    /// bit `lsattr` prints as `e`, that a flag set through the VFS round-trips
+    /// off the disk, and that the bit the driver owns is *not* the caller's to
+    /// clear, because clearing it would not turn the extent tree back into a
+    /// block map.
+    #[test]
+    fn the_inode_flags_are_the_ones_on_the_disk() {
+        let Ok(path) = std::env::var("MPOS_EXT4_IMG") else {
+            return;
+        };
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("the image opens");
+        let sectors = file.metadata().expect("metadata").len() / 512;
+        let dev: Arc<dyn BlockDev> = Arc::new(FileDev { file, sectors });
+        let fs = mounted(dev);
+
+        let flagged = fs.root().create("flagged", NodeKind::File).expect("create");
+        let fresh = flagged.flags().expect("a file on ext4 has flags");
+        assert_eq!(
+            fresh & crate::vfs::FS_EXTENT_FL,
+            crate::vfs::FS_EXTENT_FL,
+            "every file this driver makes is extent-mapped, and that is the `e`              `lsattr` prints"
+        );
+        assert_eq!(
+            flagged.read_at(0, &mut [0u8; 8]).expect("read"),
+            0,
+            "and a fresh file has no bytes"
+        );
+
+        // The bits `chattr +A +d` set, read back off the *disk* and not out of
+        // a cache: the image is mounted a second time, from a fresh device
+        // handle and with an empty block cache, and the file is looked up
+        // there. Anything the first mount only remembered would be lost, which
+        // is exactly what a flag stored in memory rather than in `i_flags`
+        // would do - and `i_flags` is where Linux keeps it too.
+        let want = fresh | crate::vfs::FS_NOATIME_FL | crate::vfs::FS_NODUMP_FL;
+        flagged.set_flags(want).expect("an allowed change");
+        let reopened = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("the image opens again");
+        let sectors = reopened.metadata().expect("metadata").len() / 512;
+        let dev: Arc<dyn BlockDev> = Arc::new(FileDev {
+            file: reopened,
+            sectors,
+        });
+        let again = mounted(dev);
+        let on_disk = again.root().lookup("flagged").expect("the file is there");
+        assert_eq!(on_disk.flags().expect("flags"), want);
+
+        // And the driver's own bit cannot be moved, on either side of the
+        // operation.
+        assert_eq!(
+            flagged.set_flags(want & !crate::vfs::FS_EXTENT_FL).err(),
+            Some(VfsError::Unsupported)
+        );
+        assert_eq!(flagged.flags().expect("flags"), want, "and nothing changed");
     }
 }

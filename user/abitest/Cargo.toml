@@ -98,6 +98,10 @@ name = "t-ioctl"
 path = "src/bin/integration/t-ioctl.rs"
 
 [[bin]]
+name = "t-fsflags"
+path = "src/bin/integration/t-fsflags.rs"
+
+[[bin]]
 name = "t-memfd-shm"
 path = "src/bin/integration/t-memfd-shm.rs"
 
