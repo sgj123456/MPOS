@@ -510,19 +510,22 @@ it - so the entries say which they are:
       `TIMELINE`-flag behaviour to give the two flags this host's header has)
 - [~] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
       the only one that lets niri, which rejects software EGL outright, run at
-      all; virgl and venus are both built on it (§7.4). **The family's 2D half is
-      served and the machinery the 3D half needs is in**: all eleven requests are
-      dispatched, `RESOURCE_CREATE` makes a real device resource across the new
-      mailbox to the render task, and `t-virtgpu` pins the lot — the answers
-      observed on both machine shapes are in `user/staging/virtgpu-probe/`, and
-      the machine can be given a GL card (`[qemu] gpu`). **What is left is the 3D
-      half**: negotiating `VIRGL` and the commands behind it (`CTX_*`,
-      `RESOURCE_CREATE_3D`, `SUBMIT_3D`, `GET_CAPSET*`, blobs), which is what
-      turns `EXECBUFFER`'s `ENOSYS`, `GET_CAPS`'s and `3D_FEATURES`'s `0` into
-      real answers. Both forks §7.4 argued are now settled and landed — the GPU
-      driver is this kernel's rather than the crate's, and a submission reaches
-      the device through the render task's mailbox, which the resource path
-      already uses.
+      all; virgl and venus are both built on it (§7.4). **The family is served
+      now, 2D and 3D both**: all eleven requests are dispatched,
+      `RESOURCE_CREATE` makes a real device resource across the new mailbox to
+      the render task, the GL card negotiates `VIRGL` and the driver says so in
+      its own words — `virtio-gpu: virgl=1 context_init=1 capsets=2 cached=2
+      mask=0x6`, every number `user/staging/virtgpu-probe/` measured on Linux —
+      and `t-virtgpu` pins the lot, its 3D branch included, on the GL machine
+      (`[qemu] gpu` names the card). Both forks §7.4 argued are settled and
+      landed — the GPU driver is this kernel's rather than the crate's, and a
+      submission reaches the device through the render task's mailbox, which the
+      resource path already uses. **What still blocks `is_software()` is not the
+      3D queue: it is that the card has no identity a loader can read**,
+      measured in §7.4's update below — Mesa never selects the virtio driver and
+      `drmGetDevices2` finds no card at all, because the DRM device's parent
+      chain carries no bus identity. That is a device-model change, not a
+      command one, and it is the first thing on this entry now.
 - [~] the property families a compositor finds by name. **Four are built, and
       the list said seven**: `EDID` (a real 128-byte EDID 1.4 base block, and
       the connector's `mm_width`/`mm_height` are its own centimetre fields times
@@ -3963,6 +3966,63 @@ family - `GET_PARAM`, `RESOURCE_CREATE`, `RESOURCE_INFO`, `SUBMIT_3D`,
 is what virgl (and venus, for Vulkan) is built on, and it is the largest single
 item in this section.
 
+> **Update, measured (2026-10-02): that item landed, and what stops eglinfo is
+> not it.** The 3D half is answered — `VIRGL` and `CONTEXT_INIT` negotiated, the
+> `CTX_*`, `RESOURCE_CREATE_3D`, `SUBMIT_3D`, `TRANSFER_*_3D` and `GET_CAPSET*`
+> commands dispatched, the cap sets cached at bring-up, `EXECBUFFER` and
+> `TRANSFER_FROM_HOST` made real — and on the GL machine the driver states the
+> result in its own words:
+>
+> ```text
+> virtio-gpu: virgl=1 context_init=1 capsets=2 cached=2 mask=0x6
+> ```
+>
+> Every number there is the one the Linux measurement below produced, and
+> `cached=2` is the one that carries weight: it is both the `GET_CAPSET_INFO` and
+> the `GET_CAPSET` round trip completing. It is not enough to produce a renderer,
+> and the reason is a *different* hole, measured the same way on
+> `virtio-gpu-gl-pci` with `-display egl-headless,gl=on`:
+>
+> - **every EGL platform eglinfo can initialise reports software.** `eglinfo -p
+>   surfaceless` and the device and GBM platforms answer `OpenGL renderer string:
+>   llvmpipe (LLVM 23.1.2, 128 bits)` — the software rasteriser — on a card with
+>   3D behind it.
+> - **Mesa's loader says what it wanted, and did not get it.** It prints
+>   `MESA-LOADER: failed to retrieve device information` once per lookup, and the
+>   message list inside the shipped `libEGL.so.1` names the two other ways out:
+>   `MESA-LOADER: device is not located on the PCI bus`, and `failed to get
+>   driver name for fd %d` / `DRI2: failed to get driver name`.
+> - **The card's parent device answers nothing.** `/sys/dev/char/226:0/device`
+>   resolves to `/sys/devices/virtual/virtio-gpu`, and on it `vendor`, `device`,
+>   `subsystem`, `driver`, `modalias` and `uevent` are *each* `ENOENT`; the
+>   directory holds one entry, `drm/`. The chain below the node is right —
+>   `/sys/dev/char/226:0/device/drm/` lists `card0 -> ../../drm/card0` and
+>   `renderD128 -> ../../drm/renderD128`, each `dev` reading back `226:0` /
+>   `226:128`, and `drmGetNodeTypeFromFd` answers `PRIMARY` for `card0` and
+>   `RENDER` for `renderD128`. The *minor* is modelled; the *device* is not.
+> - **libdrm agrees, and this is the sharpest number.** A twenty-line `gd` probe
+>   against `libdrm.so.2` (2.134.0) answers `drmGetDevices2(0, devs, 16) = 0` —
+>   it enumerates *no* device — where Linux returns the card; `kmscube` says the
+>   same thing in words, `no drm device found!` then `could not open drm device`;
+>   and `drmGetVersion(fd)` names the driver **`mpos`**, where Linux names it
+>   `virtio_gpu`.
+>
+> **Two interpositions say what the fix is not.** Interposing `drmGetVersion` to
+> return `virtio_gpu` (confirmed applied: the probe then prints it), and
+> interposing `open`/`openat` to hand `device/vendor` and `device/device` the
+> values Linux's card reports (`0x1af4` / `0x1050`), each changed *nothing* — the
+> renderer stayed llvmpipe, and the loader kept refusing. So Mesa is not choosing
+> on the version name, and not on the PCI ids alone: it is refusing a device
+> whose parent chain has no bus identity at all — no `subsystem` link above all,
+> which is what `devices/virtual/...` literally means. The direction of the
+> remaining work is therefore the device model rather than the command queue:
+> the card has to hang off a device that says what it is, as Linux's sits three
+> levels down (`.../0000:00:01.0/virtio0/drm/card0`, with the PCI function's
+> `vendor`/`device` and the virtio device's `subsystem`). Until that exists
+> `is_software()` is true, no renderer eglinfo can report is anything but
+> llvmpipe, and this section's first bar is unreachable however complete the 3D
+> family is.
+
 #### Measured: what Linux's card answers, request by request
 
 The family is written from an observation rather than from the UAPI header,
@@ -4485,8 +4545,13 @@ Each step stands on its own, which is the only reason the order is this one:
 4. ~~**Threads** (§6.4)~~ **Landed** - not a display item, but on the critical path
    of every compositor that is not single-threaded and every Vulkan driver, so it
    is worth knowing the step is behind us before the property families.
-5. **`DRM_VIRTGPU_*`, then virgl in the image.** The largest item and the only
-   one that makes niri possible.
+5. ~~**`DRM_VIRTGPU_*`**~~ **Landed, 2D and 3D both** — the largest item, and the
+   only one that makes niri possible. **"Then virgl in the image" is the part
+   still open, and it is upstream of the 3D queue**: Mesa does not reach the
+   driver at all, because the DRM device has no identity in the device model for
+   a loader to read (§7.4's update). Fixing that is the next step, and it is a
+   device-model change — give the card a parent that names its bus — rather than
+   another command.
 6. ~~**`/proc/<pid>/maps`**~~ and the frame pool: the supporting cast, wanted by
    everything above and by nothing in particular. (`MADV_DONTNEED` was on this
    line, and §5.2 has it now; `maps` is §Remaining's, and it is written - see

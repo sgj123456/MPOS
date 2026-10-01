@@ -114,7 +114,7 @@ drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`PLAN.md` §1
 | `'V'` (0x56) | virtual consoles | `src/vfs/vtmode.rs` | Served: `VT_SETMODE`/`VT_PROCESS` negotiation, `VT_ACTIVATE` non-blocking, `VT_WAITACTIVE` sleeping, `VT_SENDSIG` → `ENOTTY` (measured) |
 | `'K'` (0x4B) | virtual consoles | `src/syscall/linux/fs.rs` `kd_ioctl` | **Refused as a closed set**: five requests served (`KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/`KDGKBTYPE`), the rest of the block `EOPNOTSUPP`, outside it `ENOTTY`. Per-device *serve* from live console state is the Phase-11 B2 move (`PLAN.md` §12.1 A2) |
 | `'b'` (0x62) | dma-buf | `src/syscall/linux/fs.rs` | Served (`SYNC` as the documented coherent-memory no-op, `SET_NAME` a debug label) |
-| `'d'` (0x64) | `/dev/dri/card0`, `renderD128` | `src/drivers/drm.rs`, `src/drm_virtgpu.rs`, `src/drm_*.rs` | Served across the compositor surface, and **the `DRM_VIRTGPU_*` family with it**: all eleven requests are dispatched, each answering as a Linux card with no 3D behind it answers (measured; instrument in `user/staging/virtgpu-probe/`). Served — `GETPARAM` (`3D_FEATURES` 0, because this kernel negotiates no `VIRGL`, whatever the device can do; `CAPSET_QUERY_FIX` 1; unknown parameter `EINVAL`; the write four bytes wide as Linux's is), `RESOURCE_CREATE` (a real device resource, made across the mailbox to the render task), and `RESOURCE_INFO`/`MAP`/`WAIT`/`TRANSFER_TO_HOST` for the handle it returns. Refused as Linux refuses them — `GET_CAPS`/`EXECBUFFER`/`TRANSFER_FROM_HOST` `ENOSYS`, `CONTEXT_INIT`/`RESOURCE_CREATE_BLOB`/a 3D `RESOURCE_CREATE` `EINVAL`. **Three named divergences**: `RESOURCE_INFO`'s `res_handle` is 0 for a plain dumb buffer (on Linux one *is* a device resource), `TRANSFER_TO_HOST` on one is `EINVAL` where Linux completes it, and a transfer whose rectangle does not fit the backing the device was given is refused where Linux would read past it. The first two have a single fix, recorded in `PLAN.md` §7.4: make `CREATE_DUMB` create a device resource too, as Linux's does. Other §7.4 gaps: timeline syncobj behaviour, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` |
+| `'d'` (0x64) | `/dev/dri/card0`, `renderD128` | `src/drivers/drm.rs`, `src/drm_virtgpu.rs`, `src/drm_*.rs` | Served across the compositor surface, and **the `DRM_VIRTGPU_*` family with it, 2D and 3D both**: all eleven requests are dispatched, and each answers per card shape, as Linux's does (measured; instrument in `user/staging/virtgpu-probe/`, and the GL card's own answers in `PLAN.md` §7.4). On a card with no 3D — `GETPARAM` (`3D_FEATURES` 0, `CAPSET_QUERY_FIX` 1, unknown parameter `EINVAL`, the write four bytes wide as Linux's is), `RESOURCE_CREATE` (a real device resource, made across the mailbox to the render task), and `RESOURCE_INFO`/`MAP`/`WAIT`/`TRANSFER_TO_HOST` for the handle it returns; `GET_CAPS`/`EXECBUFFER`/`TRANSFER_FROM_HOST` `ENOSYS`, `CONTEXT_INIT`/`RESOURCE_CREATE_BLOB`/a 3D `RESOURCE_CREATE` `EINVAL`. On a GL card the same requests answer as Linux's GL card does: `VIRGL` and `CONTEXT_INIT` are negotiated (`3D_FEATURES` 1, `SUPPORTED_CAPSET_IDs` 6), `CONTEXT_INIT` is `EEXIST` because the context is created implicitly on the first resource, a 3D `RESOURCE_CREATE`, `EXECBUFFER` and `TRANSFER_FROM_HOST` complete, and the two advertised cap sets are fetched and cached. `RESOURCE_CREATE_BLOB` stays `EINVAL` on both shapes, which is Linux's answer on both too. **Three named divergences**: `RESOURCE_INFO`'s `res_handle` is 0 for a plain dumb buffer (on Linux one *is* a device resource), `TRANSFER_TO_HOST` on one is `EINVAL` where Linux completes it, and a transfer whose rectangle does not fit the backing the device was given is refused where Linux would read past it. The first two have a single fix, recorded in `PLAN.md` §7.4: make `CREATE_DUMB` create a device resource too, as Linux's does. Other §7.4 gaps: timeline syncobj behaviour, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` |
 | `'P'` (0x50) | `/dev/dsp` | `src/drivers/virtio/sound.rs` | Served; the family's rate/channels/format belong to the writer |
 | `'t'` (0x74) + `0x8024_7009`/`0x4024_700A` | `/dev/rtc0` | `src/drivers/rtc_dev.rs` | Served (`RTC_RD_TIME`/`RTC_SET_TIME`); alarm/interrupt requests `ENOTTY` |
 | `0x12` (block) | `/dev/vda`, `/dev/sda` | `src/blk/`, `src/syscall/linux/fs.rs` | Served; the size trio's buffer direction was the sole outlier and is fixed (§5.1) |
@@ -291,23 +291,28 @@ the commit bodies), and each moved its pin in the same commit.
 - **`devfs` birth modes.** Devices are born `0666 root:root`; `devtmpfs` births `0600`
   and lets udev widen it. Needs per-class birth modes and group-name resolution, not a new
   mechanism (`PLAN.md` §3.4).
-- **The `DRM_VIRTGPU_*` family (`0x41..=0x4b`) — the 2D half is served; the 3D half is
-  what is left.** All eleven requests are dispatched and each answers as a Linux card
-  with no 3D behind it answers (`user/staging/virtgpu-probe/` is the measurement), with
-  three named divergences in the `'d'` row above. What landed to make that possible is
-  the machinery the 3D half needs too: the **mailbox** (`render::job` - an ioctl
-  describes a device command and parks, because the control queue belongs to the render
-  task) and a **device resource** behind a GEM handle (`Dumb.resource` in
-  `drivers/drm.rs`). **What remains**: `VIRTGPU_PARAM_3D_FEATURES = 1` means negotiating
-  `VIRGL`, and that means the 3D commands on the control queue - `CTX_CREATE`/`DESTROY`/
-  `ATTACH_RESOURCE`, `RESOURCE_CREATE_3D`, `TRANSFER_{TO,FROM}_HOST_3D`, `SUBMIT_3D`,
-  `GET_CAPSET_INFO`/`GET_CAPSET`, and the blob resources Mesa's newer winsys asks for -
-  with `EXECBUFFER`'s command-stream parser (a fuzz target, §4 rule 2) and a fence story
-  behind it. Then `CAPS`'s `ENOSYS` and `CONTEXT_INIT`'s `EINVAL` become real answers.
-  **And one fix the 2D half already owes**: `CREATE_DUMB` should create a device resource
-  as Linux's does, which would remove two of the three divergences above. It is not done
-  because it would make every dumb buffer eagerly backed and add a device round trip to
-  the path the console, weston and `/dev/fb0` all allocate through.
+- **The `DRM_VIRTGPU_*` family (`0x41..=0x4b`) is served, 2D and 3D both.** All eleven
+  requests are dispatched, and each answers per card shape, as Linux's does
+  (`user/staging/virtgpu-probe/` is the no-3D measurement; the GL card's own answers -
+  `virgl=1 context_init=1 capsets=2 cached=2 mask=0x6` - are in `PLAN.md` §7.4), with
+  three named divergences in the `'d'` row above. The **mailbox** (`render::job` - an
+  ioctl describes a device command and parks, because the control queue belongs to the
+  render task) and a **device resource** behind a GEM handle (`Dumb.resource` in
+  `drivers/drm.rs`) carry both halves, and the 3D commands ride the same machinery:
+  `CTX_CREATE`/`DESTROY`/`ATTACH_RESOURCE`, `RESOURCE_CREATE_3D`,
+  `TRANSFER_{TO,FROM}_HOST_3D`, `SUBMIT_3D`, `GET_CAPSET_INFO`/`GET_CAPSET`. There is no
+  command-stream parser to fuzz because there is nothing to parse - Linux forwards the
+  stream with `vmemdup_user` and never reads it (§4 rule 2's target is the
+  variable-length `GET_CAPSET` reply instead, and it is
+  `fuzz/fuzz_targets/virtgpu_capset.rs`). **What the family still does not buy is a
+  renderer, and the reason is not in this row**: Mesa never loads the virtio driver,
+  because the DRM device's parent chain carries no bus identity, so `drmGetDevices2`
+  finds no card and every EGL platform falls back to `llvmpipe` - measured, with the
+  sysfs attributes and the two interpositions that ruled other explanations out, in
+  `PLAN.md` §7.4. **And one fix the 2D half already owes**: `CREATE_DUMB` should create a
+  device resource as Linux's does, which would remove two of the three divergences above.
+  It is not done because it would make every dumb buffer eagerly backed and add a device
+  round trip to the path the console, weston and `/dev/fb0` all allocate through.
 
 ### 5.3 Needs its prerequisite named before it can be honest
 
