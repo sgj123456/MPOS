@@ -520,12 +520,14 @@ it - so the entries say which they are:
       (`[qemu] gpu` names the card). Both forks §7.4 argued are settled and
       landed — the GPU driver is this kernel's rather than the crate's, and a
       submission reaches the device through the render task's mailbox, which the
-      resource path already uses. **What still blocks `is_software()` is not the
-      3D queue: it is that the card has no identity a loader can read**,
-      measured in §7.4's update below — Mesa never selects the virtio driver and
-      `drmGetDevices2` finds no card at all, because the DRM device's parent
-      chain carries no bus identity. That is a device-model change, not a
-      command one, and it is the first thing on this entry now.
+      resource path already uses.       **What still blocks `is_software()` is not the
+      3D queue: it is that libdrm cannot describe the card**, measured in §7.4's
+      second update below — Mesa never selects the virtio driver and
+      `drmGetDevices2` finds no card at all, because `drmGetDevice2` cannot
+      describe it. Serving the sysfs identity the loader reads directly changed
+      nothing, so the next measurement is the guest's udev entry for the card
+      rather than another sysfs attribute. That, not the command family, is the
+      first thing on this entry now.
 - [~] the property families a compositor finds by name. **Four are built, and
       the list said seven**: `EDID` (a real 128-byte EDID 1.4 base block, and
       the connector's `mm_width`/`mm_height` are its own centimetre fields times
@@ -4023,6 +4025,61 @@ item in this section.
 > llvmpipe, and this section's first bar is unreachable however complete the 3D
 > family is.
 
+> **Update, measured (2026-10-02, the same day, one instrument later): the gate
+> is libdrm's device information, not the sysfs files the loader reads
+> directly.** The design the block above argued — the card needs a bus identity
+> in sysfs — was tested rather than built, by a recorder that logs every `/sys`
+> path a caller opens or resolves (`LD_PRELOAD` over `open`/`openat`/
+> `readlink`; the alternative, `strace -f`, is the instrument this file already
+> records panicking the machine). It says something narrower, and it says it
+> twice:
+>
+> - **on the guest** the loader asks exactly three questions about the render
+>   node, in this order — `open /sys/dev/char/226:128/device/vendor`,
+>   `open …/device/device`, `readlink …/device/subsystem` — and all three
+>   `ENOENT`;
+> - **on this host**, whose Mesa is the same 26.2.3 and whose libdrm is the same
+>   2.134.0, a working card (amdgpu) is asked **only for the `subsystem` link**:
+>   `readlink /sys/dev/char/226:128/device/subsystem -> ../../../../bus/pci`.
+>   The loader never reads `vendor` or `device` at all.
+>
+> So the guest is not missing a file the loader wants for its own sake; it is on
+> a *fallback* path, taken because libdrm's `drmGetDevice2` — which is where the
+> PCI id comes from on a working system — could not describe the card. That
+> reading fits the library's own imports (`libgallium` pulls `drmGetVersion`,
+> `drmGetDevice2`, `drmGetDevices2` and `drmGetNodeTypeFromFd` from libdrm; with
+> udev built in, `drmGetDevice2` answers out of the *udev* database rather than
+> by reading sysfs at run time) and fits the number this section already has:
+> **`drmGetDevices2` returns 0**.
+>
+> Serving the three questions through the same preload settles it as a test.
+> With `device/vendor` reading `0x1af4`, `device/device` `0x1050` and
+> `device/subsystem` resolving to `/sys/bus/pci`, the renderer is **still
+> llvmpipe**, and the loader asks nothing further under `/sys`. Two candidate
+> gates are therefore ruled out by measurement instead of argument: the kernel
+> driver *name* (`drmGetVersion` forced to `virtio_gpu`, confirmed applied — no
+> change) and the per-node sysfs identity (served — no change). What is left is
+> the layer underneath both: what `udev` was told about the card.
+>
+> **The design is re-opened on that, and the next measurement is named.** Dump
+> the guest's udev database entry for `c226:0` and set it beside Linux's for the
+> same card, then find the property libdrm's udev path needs and does not get.
+> `DEVTYPE=drm_minor` is absent from the node's `uevent` today (measured: it
+> carries `ACTION`, `DEVPATH`, `SUBSYSTEM`, `DEVNAME`, `MAJOR`, `MINOR` and
+> nothing else), and `ID_PATH` and the `PCI_*` keys a udev rule would add have
+> never been looked at. Nothing in the device model changes until that dump is
+> in hand: the sysfs chain the block above proposed would have been built to
+> satisfy a caller that is not the one failing.
+>
+> Two instrument notes, both machine defects, recorded because they cost this
+> measurement three reboots. The guest's console — tty1, carried over the wire
+> by the kernel's console mux, since `/etc/inittab` puts no getty on ttyS0 —
+> **stops accepting input and stops emitting output after a session of heavy
+> commands**, with the machine still running and `info status` still answering.
+> And the 9p share is exported to a bus the guest enumerates — `0000:00:09.0` is
+> there — while the boot prints `virtio-9p: no share on the bus`, so there is no
+> file channel into the guest to work around the first defect with.
+
 #### Measured: what Linux's card answers, request by request
 
 The family is written from an observation rather than from the UAPI header,
@@ -4548,10 +4605,10 @@ Each step stands on its own, which is the only reason the order is this one:
 5. ~~**`DRM_VIRTGPU_*`**~~ **Landed, 2D and 3D both** — the largest item, and the
    only one that makes niri possible. **"Then virgl in the image" is the part
    still open, and it is upstream of the 3D queue**: Mesa does not reach the
-   driver at all, because the DRM device has no identity in the device model for
-   a loader to read (§7.4's update). Fixing that is the next step, and it is a
-   device-model change — give the card a parent that names its bus — rather than
-   another command.
+   driver at all, because libdrm cannot describe the card — `drmGetDevices2`
+   returns 0 — and serving the sysfs identity the loader reads directly changes
+   nothing (§7.4's second update). The next step is a measurement of the guest's
+   udev entry for `c226:0`, and only then a shape to build.
 6. ~~**`/proc/<pid>/maps`**~~ and the frame pool: the supporting cast, wanted by
    everything above and by nothing in particular. (`MADV_DONTNEED` was on this
    line, and §5.2 has it now; `maps` is §Remaining's, and it is written - see
