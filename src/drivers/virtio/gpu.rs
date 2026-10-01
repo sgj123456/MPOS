@@ -28,13 +28,12 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use critical_section::Mutex;
-use virtio_drivers::device::gpu::VirtIOGpu;
-use virtio_drivers::transport::pci::PciTransport;
 
 use crate::mm::{self, PAGE_SIZE};
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsResult};
 
-use super::hal::{HalImpl, transport};
+use super::gpu_ctrl::Gpu;
+use super::hal::transport;
 
 /// The modern device ID; virtio-gpu never had a legacy form.
 const DEVICE_GPU: &[u16] = &[0x1050];
@@ -225,7 +224,7 @@ impl VirtioGpuDev {
     /// Returns the buffer view (which `/dev/fb0` and the page pins share) *and*
     /// the device itself, moved out - the render task is its sole owner, and
     /// the only thing that may call `flush` on it.
-    pub fn init() -> Option<(Arc<Self>, VirtIOGpu<HalImpl, PciTransport>)> {
+    pub fn init() -> Option<(Arc<Self>, Gpu)> {
         // The window the host reports its own events in, taken now because the
         // transport that could name it is consumed below. Without it the
         // display size is whatever it was at boot, for good.
@@ -233,7 +232,7 @@ impl VirtioGpuDev {
             CONFIG.store(config, Ordering::Relaxed);
         }
 
-        let mut device = VirtIOGpu::<HalImpl, _>::new(transport(DEVICE_GPU)?).ok()?;
+        let mut device = Gpu::new(transport(DEVICE_GPU)?).ok()?;
 
         let dims = match device.resolution() {
             Ok((width, height)) if width > 0 && height > 0 => (width, height),
@@ -308,7 +307,7 @@ static GLOBAL: Mutex<RefCell<Option<Arc<VirtioGpuDev>>>> = Mutex::new(RefCell::n
 
 /// Probe for the card, record the buffer view under the name userland opens,
 /// and hand back both the view and the device for the render task to own.
-pub fn init_global() -> Option<(Arc<VirtioGpuDev>, VirtIOGpu<HalImpl, PciTransport>)> {
+pub fn init_global() -> Option<(Arc<VirtioGpuDev>, Gpu)> {
     let (dev, device) = VirtioGpuDev::init()?;
     critical_section::with(|cs| {
         *GLOBAL.borrow(cs).borrow_mut() = Some(dev.clone());

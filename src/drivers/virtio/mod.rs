@@ -19,6 +19,7 @@ pub mod blk;
 pub mod console;
 pub mod fs9p;
 pub mod gpu;
+pub mod gpu_ctrl;
 pub mod hal;
 pub mod input;
 pub mod msix;

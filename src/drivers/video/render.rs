@@ -1,8 +1,8 @@
 //! The render task: the single owner of the GPU, and the only thing that
 //! flushes it.
 //!
-//! One task holds the `VirtIOGpu` so there is exactly one caller of `flush()`.
-//! That matters because the crate's flush busy-spins until the host has taken
+//! One task holds the `Gpu` so there is exactly one caller of `flush()`.
+//! That matters because the flush busy-spins until the host has taken
 //! the whole frame - a three-megabyte copy at 1024x768. Anywhere else in the
 //! kernel a spin that long with interrupts masked would starve the clock and
 //! the keyboard, which is the exact failure the serial console worked to fix.
@@ -23,12 +23,10 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use crate::drivers::virtio::gpu_ctrl::Gpu;
 use critical_section::Mutex;
-use virtio_drivers::device::gpu::VirtIOGpu;
-use virtio_drivers::transport::pci::PciTransport;
 
 use crate::drivers::virtio::gpu::VirtioGpuDev;
-use crate::drivers::virtio::hal::HalImpl;
 use crate::mm;
 use crate::sched::policy::TaskId;
 use crate::vfs::pty::VC_COUNT;
@@ -43,8 +41,7 @@ const FRAME_TICKS: u64 = 8;
 
 /// The device, parked here for the task to take at its start. After the take
 /// nothing else can reach it, which is what keeps `flush` single-caller.
-static DEVICE: Mutex<RefCell<Option<VirtIOGpu<HalImpl, PciTransport>>>> =
-    Mutex::new(RefCell::new(None));
+static DEVICE: Mutex<RefCell<Option<Gpu>>> = Mutex::new(RefCell::new(None));
 static VIEW: Mutex<RefCell<Option<Arc<VirtioGpuDev>>>> = Mutex::new(RefCell::new(None));
 static RENDER_PID: AtomicU32 = AtomicU32::new(0);
 
@@ -200,7 +197,7 @@ pub fn running() -> bool {
 /// does not decide any of it: the framebuffer console's being one of the
 /// consoles is what moves the kernel's log onto it, and a session claiming the
 /// card is what brings the grids up for a screen somebody else is driving.
-pub fn spawn(device: VirtIOGpu<HalImpl, PciTransport>, view: Arc<VirtioGpuDev>) {
+pub fn spawn(device: Gpu, view: Arc<VirtioGpuDev>) {
     critical_section::with(|cs| {
         *DEVICE.borrow(cs).borrow_mut() = Some(device);
         *VIEW.borrow(cs).borrow_mut() = Some(view);
@@ -456,7 +453,7 @@ fn task() {
 /// A zero size means no display is attached (a headless QEMU answers every query
 /// with nothing, which is not a request for an empty screen) and is ignored; so
 /// is a QEMU window *move*, which sends the event with an unchanged size.
-fn probe_display(device: &mut VirtIOGpu<HalImpl, PciTransport>, view: &Arc<VirtioGpuDev>) {
+fn probe_display(device: &mut Gpu, view: &Arc<VirtioGpuDev>) {
     let (width, height) = match device.resolution() {
         Ok((width, height)) if width > 0 && height > 0 => (width, height),
         _ => return,
@@ -486,12 +483,7 @@ fn probe_display(device: &mut VirtIOGpu<HalImpl, PciTransport>, view: &Arc<Virti
 /// Returns `true` when the scanout now drives the requested size (including the
 /// no-op case where it already did), `false` when the host refused and the
 /// screen was restored.
-fn resize_to(
-    device: &mut VirtIOGpu<HalImpl, PciTransport>,
-    view: &Arc<VirtioGpuDev>,
-    width: u32,
-    height: u32,
-) -> bool {
+fn resize_to(device: &mut Gpu, view: &Arc<VirtioGpuDev>, width: u32, height: u32) -> bool {
     let (old_w, old_h) = view.dims();
     if (width, height) == (old_w, old_h) {
         return true;

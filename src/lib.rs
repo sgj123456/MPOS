@@ -123,6 +123,14 @@ pub mod uinput;
 /// test; the task table that decides whose namespace is whose is bare metal.
 pub mod uts;
 pub mod vfs;
+/// The virtio-gpu protocol: the control commands and their shapes, as the wire
+/// spells them. Not target-gated, and it has to be: the driver beside it is
+/// never compiled off the machine, and what that driver and a real QEMU must
+/// agree on is exactly the kind of fact - a command number, a field offset, a
+/// struct size - that an agreement with itself cannot check. `drivers/drm.rs`
+/// records what happens when a number is pinned only against the caller that
+/// sends it.
+pub mod virtgpu_abi;
 
 #[cfg(target_os = "none")]
 #[macro_export]

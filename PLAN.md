@@ -3815,8 +3815,26 @@ lines the DRM layer replaces with its own synthesized blob) nor its virtio curso
 queue (the DRM cursor is a real second plane, `drm_cursor.rs`). Vendoring ~13,000
 lines to add ~400 would make every future crate bump a merge, while (b) puts the
 new ABI facts in a host-testable module, which is where §4.6 wants them. What
-(b) puts at risk is a working, pinned 2D path - and the pins (`t-fb`, `t-drm`,
+(b) puts at risk is a working, pinned 2D path - and the pins (`t-fbdev`, `t-drm`,
 the boot's own display probe) are what guard it.
+
+**(b) has landed**, as the refactor §7's rule wants landed first: the same
+commands in the same order, so the machine boots exactly as it did and the pins
+above are the evidence rather than an assertion. `src/drivers/virtio/gpu_ctrl.rs`
+owns the transport and the control queue; `src/virtgpu_abi.rs` holds the wire
+vocabulary and is host-compiled, with eight tests pinning the command numbers
+against `<linux/virtio_gpu.h>`'s literals, every struct size, the header's field
+offsets and the feature word. Three things narrowed deliberately rather than
+carried over, each because the crate accepted something it never used: `EDID` is
+no longer negotiated (the 413-line parser behind it was never called), the
+cursor queue is no longer configured (nothing sends cursor commands - the DRM
+cursor is a plane), and the feature word is now `WANTED_FEATURES` rather than
+"everything the crate listed". The gate after it: `=== SUMMARY pass=137 fail=0
+(137 built)`, QEMU exit 33 - the same line the tree printed before the change,
+which is what a behaviour-preserving refactor owes.
+
+What that leaves for the 3D work is additive: the commands, and the bits that
+gate them.
 
 **A 3D submission reaches the device through the render task.** The render task
 takes the device out of `DEVICE` at its start and is its sole owner; that is what
