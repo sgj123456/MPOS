@@ -222,6 +222,10 @@ name = "t-fchmodat2"
 path = "src/bin/syscall/t-fchmodat2.rs"
 
 [[bin]]
+name = "t-fd-list"
+path = "src/bin/syscall/t-fd-list.rs"
+
+[[bin]]
 name = "t-fcntl"
 path = "src/bin/syscall/t-fcntl.rs"
 
@@ -428,6 +432,10 @@ path = "src/bin/syscall/t-sched-getaffinity.rs"
 [[bin]]
 name = "t-seccomp"
 path = "src/bin/syscall/t-seccomp.rs"
+
+[[bin]]
+name = "t-segv"
+path = "src/bin/syscall/t-segv.rs"
 
 [[bin]]
 name = "t-set-robust-list"

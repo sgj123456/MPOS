@@ -3685,25 +3685,51 @@ is again read off its source rather than measured, and it is the renderer below.
 > (the two doors, the `O_CREAT|O_TRUNC|O_RDWR` order a lock protocol uses, and
 > both `/tmp` and `/run/user/0`).
 >
-> **Three more defects the diagnosis turned up, none of them the renderer, none
-> yet fixed.** `strace -f niri` **panics the kernel**: a user-mode
-> instruction-fetch `#PF` at a heap address is reported as `KERNEL PANIC: #PF`,
-> and the panic handler faults again - so a traced process can end the machine,
-> which is also why the full unfiltered trace this needed was never obtained (two
-> attempts, two dead guests). `/proc/<pid>/fd` readdir **skips descriptor numbers
-> 2..9** on a live process while the fds themselves work, which may or may not be
-> the same defect that makes the loop's fd numbers alternate 21/22. And the
-> non-root case is a separate thread: `niri` as `mpos` dies with libseat's "Failed
-> to open session: Function not implemented (os error 38)", so some syscall on
-> libseat's session path answers `ENOSYS`; the guest's kernel ring is too small to
-> have kept the `mpos: syscall N -> ENOSYS` line that would name it, so that wants
-> `syslogd`'s file rather than `dmesg`.
+> **The three further defects the diagnosis raised are now settled - one not a
+> defect, one fixed, one re-attributed.** First, `/proc/<pid>/fd` readdir does
+> *not* skip descriptors: built to the question, `t-fd-list` opens a contiguous
+> run of twelve descriptors and finds every one of them in the listing, along
+> with the three standard ones. The compositor's `0, 1, 17, 18` was a process
+> that had opened and closed `2..=16`, which is what a compositor's startup
+> looks like - so the listing is a pin now and the observation is withdrawn.
+> Second, the kernel panic **is** a defect and is fixed: `pf_diag` prints the
+> faulting instruction's own bytes, and it read them at `rip` *without asking
+> whether that page was mapped* - and on an instruction-fetch fault `rip` is
+> the faulting address itself, so the read faulted again from ring 0, at the
+> same `CR2` with the U/S bit now clear, and the machine died of
+> `KERNEL PANIC: #PF` while describing a *user* fault. The read is guarded by
+> the same `leaf_pte` question the rest of the diagnostic asks, and the message
+> now says when the bytes are not there to print. Measured before and after by
+> `t-segv`, which jumps into a `PROT_NONE` page: the run that used to panic now
+> prints `PFDIAG ... bytes=[] (empty: the page holding rip is the absent one)`,
+> the child dies of `SIGSEGV`, and the parent - and so the machine - runs on.
+> That program also faults the common way (a store through a null pointer), so
+> a fix that refused to read *any* instruction bytes would fail it. Third, the
+> non-root `ENOSYS` is not a kernel gap: the guest's `libseat.so.1` contains no
+> `syscall` instruction at all (every call goes through libc), and its backends
+> are `noop`, `seatd` and `logind` - there is no `builtin` - so "Function not
+> implemented" is libseat's **noop** backend, the one it falls back to when no
+> seat daemon answers. The image's own configuration is right (`seatd` is in
+> `/etc/runlevels/default`, runs `-g seat`, and `mpos` is in `seat` in
+> `/etc/group`), so the next step is to watch the daemon rather than the kernel:
+> `rc-service seatd status`, `ls -l /run/seatd.sock` and `id mpos` on a boot
+> where the non-root run fails.
 >
 > What has *not* changed is the conclusion two paragraphs below: a non-software
-> EGL device still means `virtio-gpu` 3D, and `DRM_VIRTGPU_*` is still the largest
-> single item in this section. What the fix above buys is that niri gets past its
-> socket setup to the place that check lives, instead of spinning forever before
-> it.
+> EGL device still means `virtio-gpu` 3D, and `DRM_VIRTGPU_*` is still the
+> largest single item in this section. What the fix above buys is that niri gets
+> past its socket setup to the place that check lives, instead of spinning
+> forever before it. **And that item is reachable on this host**, which was
+> worth checking before calling it out of scope: QEMU here (11.1.1) carries the
+> 3D device under a *different name* - `virtio-gpu-gl-pci`, with `virtio-vga-gl`
+> and a rutabaga/gfxstream variant beside it - and
+> `qemu-system-x86_64 -display egl-headless,gl=on -device virtio-gpu-gl-pci`
+> starts, so the host can present a virgl-capable GPU. The `virtio-gpu-pci` the
+> machine boots today has no `virgl` property at all, so 3D is a *machine* change
+> plus a kernel one: `machine.toml` would name the GL device and a GL display
+> backend, and the kernel would grow the `DRM_VIRTGPU_*` family and the 3D
+> command queue behind it. That is a feature rather than a defect - it is why it
+> is not in the fix above - but it is not blocked by the host.
 
 niri's TTY backend is `GpuManager<GbmGlesBackend<GlesRenderer>>` and nothing
 else - there is no pixman renderer in it - and, worse for this kernel, it

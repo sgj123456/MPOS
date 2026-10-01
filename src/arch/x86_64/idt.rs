@@ -484,8 +484,25 @@ fn pf_diag(addr: usize, rip: usize) {
         // page: a faulting access is usually one instruction whose operand
         // went bad, and the bytes name it - `48 89` is a store, `f4` is
         // musl's `a_crash`, an `0f` prefix says which SSE form it is.
+        //
+        // Read **only when that page is mapped**, because on an
+        // instruction-fetch fault it is not: `rip` is then the faulting
+        // address itself, and a read here faults again from ring 0 - same
+        // `CR2`, the error code's U/S bit now clear - so the machine dies of a
+        // `KERNEL PANIC: #PF` while it is trying to describe a *user* fault.
+        // Measured: `strace -f niri` jumped to a heap address that had been
+        // freed, the user fetch fault was taken, and this diagnostic turned it
+        // into a kernel panic. When the page is absent there are no bytes to
+        // print, and `rip` beside an empty list says exactly that.
         let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
-        let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
+        let mut code = [0u8; 16];
+        let code_len = if crate::arch::paging::leaf_pte(rip & !(PAGE_SIZE - 1)).is_some() {
+            let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
+            code[..room].copy_from_slice(bytes);
+            room
+        } else {
+            0
+        };
         // And how far the *mapped* pages reach around the hole. A dereference
         // of a pointer that went bad lands a page or two from something real,
         // and the run says so; an access into a mapping the kernel never
@@ -510,9 +527,14 @@ fn pf_diag(addr: usize, rip: usize) {
             }
         }
         crate::println!(
-            "PFDIAG page={page:#x} NOT MAPPED task={:?} rip={rip:#x} mapped=[{lo:#x}..{hi:#x}) bytes={:02x?}",
+            "PFDIAG page={page:#x} NOT MAPPED task={:?} rip={rip:#x} mapped=[{lo:#x}..{hi:#x}) bytes={:02x?}{}",
             crate::sched::current().0,
-            bytes
+            &code[..code_len],
+            if code_len == 0 {
+                " (empty: the page holding rip is the absent one)"
+            } else {
+                ""
+            }
         );
         return;
     };
