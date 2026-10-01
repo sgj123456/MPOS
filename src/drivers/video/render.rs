@@ -124,11 +124,12 @@ pub fn notify() {
 /// the device's control queue belongs to this task. So the ioctl does not reach
 /// the device - it describes the work here and parks.
 ///
-/// Only three kinds are here because only three are needed: a resource is made,
-/// released, or copied into. Nothing in this enum reads an answer out of the
-/// device - the resource id is the DRM layer's to choose (the device does not
-/// allocate them), and its size and handle are the layer's own bookkeeping - so
-/// [`job`] answers an errno and nothing else.
+/// Nothing in this enum reads an answer out of the device, and that is why
+/// [`job`] answers an errno and nothing else: a resource id is the DRM layer's
+/// to choose (the device does not allocate them), a size and a handle are the
+/// layer's own bookkeeping, and the one thing that *is* an answer - a cap set -
+/// is fetched once at bring-up rather than per request, which
+/// `crate::drm_virtgpu::Capset` says more about.
 pub enum Job {
     /// Create the 2D resource `id` and attach `entries` as its backing.
     Create2d {
@@ -141,6 +142,44 @@ pub enum Job {
     Unref { id: u32 },
     /// Copy `id`'s `width` x `height` pixels from guest memory into the device.
     TransferToHost { id: u32, width: u32, height: u32 },
+    /// Create the 3D resource `id`, attach `entries` as its backing, and let the
+    /// context `ctx` name it.
+    ///
+    /// Three commands and one job, for the reason the 2D pair is one: a resource
+    /// created and never backed is one the device reads from nowhere, and a 3D
+    /// resource no context has been told about is one the stream that wants it
+    /// cannot name. The attach is what carries the context - Linux's
+    /// `RESOURCE_CREATE_3D` leaves the header's `ctx_id` zero - so all three go
+    /// in that order and all three have to land.
+    Create3d {
+        ctx: u32,
+        id: u32,
+        request: crate::virtgpu_abi::ResourceCreate3d,
+        entries: Vec<(u64, u32)>,
+    },
+    /// Copy a box of the resource between guest memory and the device.
+    TransferHost3d {
+        to_host: bool,
+        ctx: u32,
+        request: crate::virtgpu_abi::TransferHost3d,
+    },
+    /// Make the context `id`, naming the cap set it runs.
+    ContextCreate {
+        id: u32,
+        context_init: u32,
+        name: Vec<u8>,
+    },
+    /// Submit `stream` to context `ctx`, under the fence id `fence`.
+    ///
+    /// The one job whose payload is a caller's bytes rather than a shape this
+    /// kernel chose, and they are forwarded untouched: `virtgpu_abi::CmdSubmit`
+    /// says why, and why that is not a parser and wants no fuzz target.
+    Submit3d {
+        ctx: u32,
+        ring_idx: u8,
+        fence: u64,
+        stream: Vec<u8>,
+    },
 }
 
 /// One queued job and how its requester learns the answer.
@@ -245,11 +284,89 @@ fn perform(device: &mut Gpu, kind: &Job) -> isize {
         Job::TransferToHost { id, width, height } => {
             device.transfer_to_host_2d(*id, *width, *height)
         }
+        Job::Create3d {
+            ctx,
+            id,
+            request,
+            entries,
+        } => device
+            .create_3d(request)
+            .and_then(|()| device.attach_backing(*id, entries))
+            .and_then(|()| device.ctx_attach_resource(*ctx, *id)),
+        Job::TransferHost3d {
+            to_host,
+            ctx,
+            request,
+        } => device.transfer_host_3d(*to_host, *ctx, request),
+        Job::ContextCreate {
+            id,
+            context_init,
+            name,
+        } => device.ctx_create(*id, *context_init, name),
+        Job::Submit3d {
+            ctx,
+            ring_idx,
+            fence,
+            stream,
+        } => device.submit_3d(*ctx, *ring_idx, *fence, stream),
     };
     match done {
         Ok(()) => 0,
         Err(_) => crate::err::EIO,
     }
+}
+
+/// Hand the DRM layer what the device negotiated, and cache the cap sets it
+/// offers.
+///
+/// Called once, at the top of the task, which is the only place the device is
+/// reachable from: the DRM layer's ioctl path cannot touch it, and none of these
+/// values changes after negotiation, so they are published rather than asked for
+/// per request. `drivers/drm.rs`'s `Published` is the other end.
+///
+/// The walk is bounded by the device's own `num_capsets` and fetches each set at
+/// the *version* `GET_CAPSET_INFO` reported - which is the version a caller asks
+/// for later, so the cache holds what will be asked for. A set whose fetch fails
+/// is skipped rather than aborting the walk: a device that offers a set it cannot
+/// then produce has still told the truth about the others, and because
+/// `GETPARAM(7)`'s mask is derived from the table that survives, the mask stays
+/// honest about what is really there.
+///
+/// This runs before anything paints, so the two control-queue round trips per set
+/// are paid once at boot rather than on a `GET_CAPS` a compositor makes on every
+/// startup.
+fn publish_card(device: &mut Gpu) {
+    use crate::drm_virtgpu::{Capset, Card};
+
+    let features = device.features();
+    let num_capsets = device.num_capsets();
+    let mut capsets = Vec::new();
+    for index in 0..num_capsets {
+        let Ok(info) = device.get_capset_info(index) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        bytes.resize(info.capset_max_size as usize, 0);
+        let Ok(len) = device.get_capset(info.capset_id, info.capset_max_version, &mut bytes) else {
+            continue;
+        };
+        bytes.truncate(len);
+        capsets.push(Capset {
+            id: info.capset_id,
+            max_version: info.capset_max_version,
+            max_size: info.capset_max_size,
+            bytes,
+        });
+    }
+    crate::drivers::drm::publish_card(
+        Card {
+            virgl: features.contains(crate::virtgpu_abi::Features::VIRGL),
+            context_init: features.contains(crate::virtgpu_abi::Features::CONTEXT_INIT),
+            capset_ids: crate::drm_virtgpu::table_mask(&capsets),
+        },
+        num_capsets,
+        &capsets,
+    );
 }
 
 /// Tell the render task the host's display changed size.
@@ -356,6 +473,9 @@ fn task() {
     let (Some(mut device), Some(view)) = (device, view) else {
         return;
     };
+    // Before anything paints: what the device negotiated, and the cap sets it
+    // offers. A compositor's first `GETPARAM` is what this answers.
+    publish_card(&mut device);
 
     let mut fb_w = view.dims().0 as usize;
     let mut fb_h = view.dims().1 as usize;

@@ -563,6 +563,13 @@ struct Resource {
     /// resource answering `size = 4096`. It is the guest backing's size, and for
     /// a 3D resource it is a placeholder while the device owns the real storage.
     size: u64,
+    /// Whether this is a 3D (virgl) resource rather than a 2D one.
+    ///
+    /// It is what decides which transfer a `TRANSFER_TO_HOST` becomes: Linux
+    /// routes a virgl resource through the 3D command and a 2D one through
+    /// `TRANSFER_TO_HOST_2D`, because a 3D resource belongs to a context and the
+    /// 2D command has none to address it in.
+    virgl: bool,
 }
 
 /// One dumb buffer: its geometry and the physical pages behind it.
@@ -607,10 +614,21 @@ impl Dumb {
     /// allocated *before* the device was told about them: the command that
     /// attaches a backing names their addresses, so a frame allocated after it
     /// would be a page the device was never told to read.
-    fn resource(width: u32, height: u32, frames: Vec<usize>, id: u32, size: u64) -> Dumb {
+    ///
+    /// `virgl` says which of the family's two create paths made it, and it is
+    /// carried here rather than re-derived at each use because the request that
+    /// would answer it is gone by then: a transfer has a handle, not a target.
+    fn resource(
+        width: u32,
+        height: u32,
+        frames: Vec<usize>,
+        id: u32,
+        size: u64,
+        virgl: bool,
+    ) -> Dumb {
         let mut buf = Dumb::new(width, height, 32);
         buf.frames = frames;
-        buf.resource = Some(Resource { id, size });
+        buf.resource = Some(Resource { id, size, virgl });
         buf
     }
 
@@ -1105,15 +1123,15 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         // `EXECBUFFER` stay refused - those are the 3D path, and the measurement
         // says a card without virgl refuses them too.
         NR_VIRTGPU_GETPARAM => virtgpu_getparam(arg),
-        NR_VIRTGPU_RESOURCE_CREATE => virtgpu_resource_create(arg),
+        NR_VIRTGPU_RESOURCE_CREATE => virtgpu_resource_create(arg, ofd),
         NR_VIRTGPU_RESOURCE_INFO => virtgpu_resource_info(arg),
         NR_VIRTGPU_MAP => virtgpu_map(arg),
         NR_VIRTGPU_WAIT => virtgpu_wait(arg),
         NR_VIRTGPU_TRANSFER_TO_HOST => virtgpu_transfer_to_host(arg),
         NR_VIRTGPU_GET_CAPS => virtgpu_get_caps(arg),
-        NR_VIRTGPU_EXECBUFFER => crate::drm_virtgpu::EXECBUFFER,
-        NR_VIRTGPU_TRANSFER_FROM_HOST => crate::drm_virtgpu::TRANSFER_FROM_HOST,
-        NR_VIRTGPU_CONTEXT_INIT => crate::drm_virtgpu::CONTEXT_INIT,
+        NR_VIRTGPU_EXECBUFFER => virtgpu_execbuffer(arg, ofd),
+        NR_VIRTGPU_TRANSFER_FROM_HOST => virtgpu_transfer_from_host(arg, ofd),
+        NR_VIRTGPU_CONTEXT_INIT => virtgpu_context_init(arg, ofd),
         NR_VIRTGPU_RESOURCE_CREATE_BLOB => crate::drm_virtgpu::RESOURCE_CREATE_BLOB,
         _ => -25, // ENOTTY
     }
@@ -1196,6 +1214,120 @@ fn capset(id: u32, version: u32) -> Option<crate::drm_virtgpu::Capset> {
     })
 }
 
+/// One open file description's 3D context.
+///
+/// Per *description* rather than per process, for the reason the master is
+/// (`MASTER_OFD`): the identity that survives a seat manager handing a card over
+/// `SCM_RIGHTS` is the description, and Linux's context hangs off
+/// `drm_file->driver_priv`, which is the same thing.
+struct Context {
+    /// The file description that made it - `crate::vfs::File::ofd`.
+    ofd: u64,
+    /// The id the device knows the context by. This card chooses it, from 1: 0 is
+    /// the protocol's "no context", which is what every 2D header carries.
+    id: u32,
+    /// Whether the *device* has been told to make it.
+    ///
+    /// Linux's `context_created`, and the whole reason `CONTEXT_INIT` can answer
+    /// `EEXIST`: the first 3D command a file makes creates the context
+    /// implicitly, so an explicit request arrives second. Only `ensure_context`
+    /// sets it.
+    created: bool,
+    /// The next fence id to hand out for this context.
+    ///
+    /// Per context because a fence id names a command within *that* context's
+    /// rings, which is why Linux allocates a `dma_fence_context` per file rather
+    /// than numbering globally. It starts at 1 so 0 keeps meaning "no fence".
+    next_fence: u64,
+}
+
+/// The contexts on the card, one per file description that needed one.
+static CONTEXTS: Mutex<RefCell<Vec<Context>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// The next context id. Never reused within a boot, so an id names one context
+/// for the life of the machine.
+static NEXT_CTX_ID: AtomicU32 = AtomicU32::new(1);
+
+/// This file's context: its id, and whether the device has been told to make it.
+///
+/// Allocating an id is bookkeeping and sends nothing - the command that *uses* a
+/// context is what has to be told, and it is `ensure_context` that does the
+/// telling.
+fn context_of(ofd: u64) -> (u32, bool) {
+    critical_section::with(|cs| {
+        let mut contexts = CONTEXTS.borrow(cs).borrow_mut();
+        if let Some(existing) = contexts.iter().find(|c| c.ofd == ofd) {
+            return (existing.id, existing.created);
+        }
+        let id = NEXT_CTX_ID.fetch_add(1, Ordering::Relaxed);
+        contexts.push(Context {
+            ofd,
+            id,
+            created: false,
+            next_fence: 1,
+        });
+        (id, false)
+    })
+}
+
+/// Make sure the device has been told to create this file's context, and answer
+/// its id.
+///
+/// The implicit creation Linux does from the first command that needs a context:
+/// `virtio_gpu_create_context` runs from resource-create, the transfers and
+/// execbuffer alike, and it is what makes an explicit `CONTEXT_INIT` afterwards
+/// answer `EEXIST`. A context whose command the device refused leaves `created`
+/// false, so the next request tries again rather than believing in a context that
+/// is not there.
+///
+/// `context_init` is the wire word, which is the cap set id and nothing else -
+/// Linux's `vfpriv->context_init` is only ever `|`-ed with a cap set id. The
+/// implicit path passes zero, which is what a device without `CONTEXT_INIT` would
+/// have got anyway.
+fn ensure_context(ofd: u64, context_init: u32, name: &[u8]) -> Result<u32, isize> {
+    let (id, created) = context_of(ofd);
+    if created {
+        return Ok(id);
+    }
+    let made =
+        crate::drivers::video::render::job(crate::drivers::video::render::Job::ContextCreate {
+            id,
+            context_init,
+            name: name.to_vec(),
+        });
+    if made != 0 {
+        return Err(made);
+    }
+    critical_section::with(|cs| {
+        if let Some(context) = CONTEXTS
+            .borrow(cs)
+            .borrow_mut()
+            .iter_mut()
+            .find(|c| c.ofd == ofd)
+        {
+            context.created = true;
+        }
+    });
+    Ok(id)
+}
+
+/// The fence id for this file's next submitted command.
+///
+/// Zero when the file has no context, which cannot happen at a call site that has
+/// just been through [`ensure_context`] - and zero is the protocol's "no fence",
+/// so a mistake there is a missing fence rather than a wrong one.
+fn take_fence(ofd: u64) -> u64 {
+    critical_section::with(|cs| {
+        let mut contexts = CONTEXTS.borrow(cs).borrow_mut();
+        let Some(context) = contexts.iter_mut().find(|c| c.ofd == ofd) else {
+            return 0;
+        };
+        let fence = context.next_fence;
+        context.next_fence = context.next_fence.wrapping_add(1);
+        fence
+    })
+}
+
 /// `DRM_VIRTGPU_GETPARAM`: `struct drm_virtgpu_getparam { u64 param; u64 value; }`
 /// where `value` is the *address* of the caller's answer rather than the answer.
 ///
@@ -1274,6 +1406,269 @@ fn virtgpu_get_caps(arg: usize) -> isize {
     0
 }
 
+/// `DRM_VIRTGPU_CONTEXT_INIT`: `struct drm_virtgpu_context_init { u32 num_params;
+/// u32 pad; u64 ctx_set_params; }`, where that pointer is `num_params` of
+/// `struct drm_virtgpu_context_set_param { u64 param; u64 value; }`.
+///
+/// Linux's order, and two of its steps are worth following exactly:
+///
+/// 1. `EINVAL` unless the device has **both** `CONTEXT_INIT` and `VIRGL`, which is
+///    why this is one of the refusals a card without 3D makes with `EINVAL` rather
+///    than `ENOSYS`.
+/// 2. `EINVAL` for more than four parameters, before the array is read at all.
+/// 3. **`EEXIST` if this file already has a context** - and that comes *before*
+///    the parameters are validated. The first 3D command made one implicitly, so a
+///    second explicit request is not a malformed request, it is a late one, and
+///    the measured card is where this shows: `CONTEXT_INIT` answers `EEXIST` on a
+///    virgl machine.
+/// 4. The parameters, each at most once. `CAPSET_ID` must be one the device
+///    offers; `DEBUG_NAME` is the caller's string; `NUM_RINGS` and
+///    `POLL_RINGS_MASK` are accepted and not acted on, because the only thing
+///    either gates is the multi-ring fence protocol, and this kernel refuses that
+///    protocol's flag in `EXECBUFFER` rather than half-driving it.
+fn virtgpu_context_init(arg: usize, ofd: u64) -> isize {
+    let num_params = unsafe { (arg as *const u32).read_unaligned() };
+    let params = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
+
+    let card = card();
+    if !card.context_init || !card.virgl {
+        return crate::drm_virtgpu::CONTEXT_INIT;
+    }
+    if num_params > 4 {
+        return libc_einval();
+    }
+    if context_of(ofd).1 {
+        return -17; // EEXIST
+    }
+    if num_params > 0 && !crate::uaccess::buffer_ok(params, num_params as usize * 16, false, true) {
+        return -14; // EFAULT
+    }
+
+    // The wire word is the cap set id and nothing else: Linux only ever `|`-es
+    // that into it, and `VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK` is the low byte
+    // for that reason.
+    let mut context_init = 0u32;
+    let mut name: Option<Vec<u8>> = None;
+    for index in 0..num_params as usize {
+        let param = unsafe { ((params + index * 16) as *const u64).read_unaligned() };
+        let value = unsafe { ((params + index * 16 + 8) as *const u64).read_unaligned() };
+        match param {
+            // VIRTGPU_CONTEXT_PARAM_CAPSET_ID
+            1 => {
+                if context_init & 0xff != 0 || value > 31 || card.capset_ids & (1u32 << value) == 0
+                {
+                    return libc_einval();
+                }
+                context_init |= value as u32;
+            }
+            // VIRTGPU_CONTEXT_PARAM_NUM_RINGS / _POLL_RINGS_MASK: accepted and
+            // not acted on. Only the ring-count fence protocol reads either, and
+            // `EXECBUFFER` refuses `VIRTGPU_EXECBUF_RING_IDX` outright, so a
+            // caller that asked for rings cannot reach the path that would use
+            // them. Refusing here instead would turn away a caller Linux serves.
+            2 | 3 => {}
+            // VIRTGPU_CONTEXT_PARAM_DEBUG_NAME
+            4 => {
+                if name.is_some() || value == 0 {
+                    return libc_einval();
+                }
+                if !crate::uaccess::buffer_ok(value as usize, 64, false, true) {
+                    return -14; // EFAULT
+                }
+                let mut bytes = [0u8; 64];
+                // SAFETY: `buffer_ok` has just checked all 64 bytes are mapped
+                // readable in the caller, and `bytes` is 64 bytes of local.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        value as *const u8,
+                        bytes.as_mut_ptr(),
+                        bytes.len(),
+                    );
+                }
+                // A name, not a string: the field is 64 bytes and the caller's is
+                // a C string, so it ends at the first NUL. `strnlen`'s job.
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                name = Some(bytes[..end].to_vec());
+            }
+            _ => return libc_einval(),
+        }
+    }
+    let name = name.unwrap_or_else(|| b"mpos".to_vec());
+    match ensure_context(ofd, context_init, &name) {
+        Ok(_) => 0,
+        Err(errno) => errno,
+    }
+}
+
+/// `DRM_VIRTGPU_EXECBUFFER`: `struct drm_virtgpu_execbuffer { u32 flags;
+/// u32 size; u64 command; u64 bo_handles; u32 num_bo_handles; s32 fence_fd;
+/// u32 ring_idx; u32 syncobj_stride; u32 num_in_syncobjs; u32 num_out_syncobjs;
+/// u64 in_syncobjs; u64 out_syncobjs; }` - 64 bytes.
+///
+/// Four things are refused rather than ignored, and each because ignoring it would
+/// be a promise:
+///
+/// - **`FENCE_FD_IN`/`FENCE_FD_OUT` and the syncobj fields.** They are explicit
+///   synchronisation, which needs `sync_file` and `drm_syncobj` - both of which
+///   this kernel refuses (`SYNCOBJ_*`), so a descriptor or a handle here names a
+///   synchronisation primitive that does not exist. `EINVAL`, not a silent
+///   accepted-and-dropped fence, which is how a caller's buffer would be read with
+///   no ordering at all while it believed otherwise.
+/// - **`VIRTGPU_EXECBUF_RING_IDX`.** One ring is driven; a submit on another would
+///   be a command nothing ever completes.
+/// - **A `bo_handle` this card never made.** Linux answers `ENOENT` there, and the
+///   handles are checked even though they do not reach the wire (see below),
+///   because that errno is what a caller branches on.
+///
+/// What is *not* checked is `size`: Linux does not check it either - it hands
+/// `size` bytes to `vmemdup_user` and forwards whatever comes back - so a
+/// zero-length stream is submitted as a zero-length stream rather than invented
+/// into an error. `buffer_ok` is what bounds it, and it bounds it by the caller's
+/// own mapping.
+///
+/// The stream is forwarded untouched. Linux's `virtio_gpu_init_submit` is
+/// `vmemdup_user(exbuf->command, exbuf->size)` and nothing more, and the
+/// `bo_handles` become a guest-side reservation list there and never a wire
+/// element - `virtgpu_abi::CmdSubmit` has the long version.
+fn virtgpu_execbuffer(arg: usize, ofd: u64) -> isize {
+    let field = |offset: usize| unsafe { ((arg + offset) as *const u32).read_unaligned() };
+    let (flags, size) = (field(0), field(4));
+    let command = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
+    let handles = unsafe { ((arg + 16) as *const u64).read_unaligned() } as usize;
+    let num_handles = field(24);
+    let ring_idx = field(32);
+    let (syncobj_stride, num_in_syncobjs, num_out_syncobjs) = (field(36), field(40), field(44));
+
+    // Every flag this kernel knows, refused by name rather than as a group: an
+    // unknown flag is a caller that expects something else to happen, and it gets
+    // `EINVAL` rather than a submit that quietly did less.
+    //
+    // The capability gate comes first, because it is the whole family's answer on
+    // a card with no 3D (measured: `ENOSYS`) and a caller that hears `EINVAL`
+    // instead would go looking for the malformed field it does not have.
+    if !card().virgl {
+        return crate::drm_virtgpu::EXECBUFFER;
+    }
+    const FENCE_FD_IN: u32 = 0x01;
+    const FENCE_FD_OUT: u32 = 0x02;
+    const RING_IDX: u32 = 0x04;
+    if flags & (FENCE_FD_IN | FENCE_FD_OUT | RING_IDX) != 0 || flags & !0x07 != 0 {
+        return libc_einval();
+    }
+    if ring_idx != 0 {
+        return libc_einval();
+    }
+    if syncobj_stride != 0 || num_in_syncobjs != 0 || num_out_syncobjs != 0 {
+        return libc_einval();
+    }
+    if size > 0 && !crate::uaccess::buffer_ok(command, size as usize, false, true) {
+        return -14; // EFAULT
+    }
+    // The handles are resolved even though they never reach the device, because
+    // Linux's answer for a handle this file does not hold is `ENOENT` and a caller
+    // acts on it before it ever looks at the fence.
+    if num_handles > 0 {
+        if !crate::uaccess::buffer_ok(handles, num_handles as usize * 4, false, true) {
+            return -14; // EFAULT
+        }
+        let known = critical_section::with(|cs| {
+            let st = STATE.borrow(cs).borrow();
+            (0..num_handles as usize).all(|index| {
+                let handle =
+                    unsafe { ((handles + index * 4) as *const u32).read_unaligned() } as usize;
+                matches!(
+                    st.dumb.get(handle.wrapping_sub(1)).and_then(|slot| slot.as_ref()),
+                    Some(d) if d.resource.is_some()
+                )
+            })
+        });
+        if !known {
+            return -2; // ENOENT
+        }
+    }
+
+    let mut stream = Vec::new();
+    stream.resize(size as usize, 0);
+    if size > 0 {
+        // SAFETY: `buffer_ok` has just checked `size` bytes at `command` are
+        // mapped readable in the caller, and `stream` is `size` bytes of local.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                command as *const u8,
+                stream.as_mut_ptr(),
+                size as usize,
+            );
+        }
+    }
+
+    let ctx = match ensure_context(ofd, 0, b"mpos") {
+        Ok(id) => id,
+        Err(errno) => return errno,
+    };
+    let fence = take_fence(ofd);
+    crate::drivers::video::render::job(crate::drivers::video::render::Job::Submit3d {
+        ctx,
+        ring_idx: 0,
+        fence,
+        stream,
+    })
+}
+
+/// `DRM_VIRTGPU_TRANSFER_FROM_HOST`: the same struct as
+/// `DRM_VIRTGPU_TRANSFER_TO_HOST`, and the other direction.
+///
+/// The asymmetry is Linux's and was the least guessable thing in the measurement:
+/// a card without 3D transfers *to* the host through the 2D command and answers
+/// this one `ENOSYS`, because the only command that reads a resource back is the
+/// 3D one. So this is `ENOSYS` without 3D and a real transfer with it, which is
+/// the opposite of a symmetric pair - and the reason both are written out.
+fn virtgpu_transfer_from_host(arg: usize, ofd: u64) -> isize {
+    let field = |offset: usize| unsafe { ((arg + offset) as *const u32).read_unaligned() };
+    let handle = field(0) as usize;
+    let box3d = crate::virtgpu_abi::Box3d {
+        x: field(4),
+        y: field(8),
+        z: field(12),
+        w: field(16),
+        h: field(20),
+        d: field(24),
+    };
+    let (level, offset, stride, layer_stride) = (field(28), field(32), field(36), field(40));
+
+    if !card().virgl {
+        return crate::drm_virtgpu::TRANSFER_FROM_HOST;
+    }
+    let found = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        st.dumb
+            .get(handle.wrapping_sub(1))
+            .and_then(|slot| slot.as_ref())
+            .and_then(|d| d.resource.as_ref())
+            .map(|r| r.id)
+    });
+    let Some(id) = found else {
+        return -2; // ENOENT
+    };
+    let ctx = match ensure_context(ofd, 0, b"mpos") {
+        Ok(id) => id,
+        Err(errno) => return errno,
+    };
+    let request = crate::virtgpu_abi::TransferHost3d {
+        header: crate::virtgpu_abi::CtrlHeader::new(crate::virtgpu_abi::CMD_TRANSFER_FROM_HOST_3D),
+        box3d,
+        offset: offset as u64,
+        resource_id: id,
+        level,
+        stride,
+        layer_stride,
+    };
+    crate::drivers::video::render::job(crate::drivers::video::render::Job::TransferHost3d {
+        to_host: false,
+        ctx,
+        request,
+    })
+}
+
 /// `DRM_VIRTGPU_RESOURCE_CREATE`: allocate a buffer and tell the device to make
 /// a resource of it.
 ///
@@ -1292,21 +1687,33 @@ fn virtgpu_get_caps(arg: usize) -> isize {
 /// The returned `bo_handle` is this card's GEM handle - the same space
 /// `CREATE_DUMB` allocates in, so `MAP`, `ADDFB` and `GEM_CLOSE` take it - and
 /// `res_handle` is the id the device knows the resource by.
-fn virtgpu_resource_create(arg: usize) -> isize {
+fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
     let field = |offset: usize| unsafe { ((arg + offset) as *const u32).read_unaligned() };
     let (target, width, height) = (field(0), field(12), field(16));
-    if let Err(errno) = crate::drm_virtgpu::resource_create_args_ok(
-        target,
-        field(20),
-        field(32),
-        field(28),
-        field(24),
-    ) {
+    let virgl = card().virgl;
+    // The validation is the *non*-virgl branch of Linux's driver, which is why a
+    // card with 3D skips it: the virgl branch forwards `target`, `depth`,
+    // `array_size`, `last_level`, `nr_samples` and `flags` rather than checking
+    // them, and the measurement is where that shows - `target 4` is `EINVAL`
+    // without 3D and a resource with it.
+    if !virgl
+        && let Err(errno) = crate::drm_virtgpu::resource_create_args_ok(
+            target,
+            field(20),
+            field(32),
+            field(28),
+            field(24),
+        )
+    {
         return errno;
     }
     if width == 0 || height == 0 {
         return libc_einval();
     }
+    // `target` is the switch, in Linux's virgl branch and here alike: 2 is the 2D
+    // pipe and 4 is virgl, and the branch above is what keeps the second out of a
+    // card that has no 3D.
+    let three_d = target == 4;
     // The object's size is the caller's, or a page when it asked for zero -
     // Linux's rule, and the reason the instrument measured 4096 for a 64x64
     // resource. See `Resource::size`.
@@ -1344,12 +1751,49 @@ fn virtgpu_resource_create(arg: usize) -> isize {
     // held and no frames borrowed, because the task that answers is the render
     // task and a caller parked while holding either would be a task waiting for
     // something it is itself preventing.
-    let made = crate::drivers::video::render::job(crate::drivers::video::render::Job::Create2d {
-        id,
-        width,
-        height,
-        entries,
-    });
+    let made = if three_d {
+        // A 3D resource belongs to a context, and the context is made here if
+        // this file has not needed one yet - Linux's implicit creation, which is
+        // what makes a later explicit `CONTEXT_INIT` answer `EEXIST`.
+        let ctx = match ensure_context(ofd, 0, b"mpos") {
+            Ok(id) => id,
+            Err(errno) => {
+                for p in frames.drain(..) {
+                    free_frames(p, 0);
+                }
+                return errno;
+            }
+        };
+        crate::drivers::video::render::job(crate::drivers::video::render::Job::Create3d {
+            ctx,
+            id,
+            request: crate::virtgpu_abi::ResourceCreate3d {
+                header: crate::virtgpu_abi::CtrlHeader::new(
+                    crate::virtgpu_abi::CMD_RESOURCE_CREATE_3D,
+                ),
+                resource_id: id,
+                target,
+                format: field(4),
+                bind: field(8),
+                width,
+                height,
+                depth: field(20),
+                array_size: field(24),
+                last_level: field(28),
+                nr_samples: field(32),
+                flags: field(36),
+                padding: 0,
+            },
+            entries,
+        })
+    } else {
+        crate::drivers::video::render::job(crate::drivers::video::render::Job::Create2d {
+            id,
+            width,
+            height,
+            entries,
+        })
+    };
     if made != 0 {
         for p in frames.drain(..) {
             free_frames(p, 0);
@@ -1370,6 +1814,7 @@ fn virtgpu_resource_create(arg: usize) -> isize {
             core::mem::take(&mut frames),
             id,
             size,
+            three_d,
         )));
         Some(idx + 1)
     });
