@@ -67,8 +67,11 @@ const FS_DIRSYNC_FL: u64 = 0x0001_0000;
 const FS_COMPR_FL: u64 = 0x0000_0004;
 const FS_ENCRYPT_FL: u64 = 0x0000_0800;
 /// A bit no filesystem here has ever heard of, to prove the check is on the
-/// whole word rather than on a list of known-bad names.
-const FS_UNKNOWN_FL: u64 = 0x0010_0000_0000;
+/// whole word rather than on a list of known-bad names. Bit 31 is the one
+/// Linux's own `FS_*` vocabulary stops short of - the highest it names is
+/// `FS_CASEFOLD_FL` at bit 30 - so this is a bit the UAPI leaves unassigned
+/// rather than one this kernel merely has not implemented.
+const FS_UNKNOWN_FL: u64 = 0x8000_0000;
 
 /// The four flags a caller may set and this kernel keeps.
 const KEPT: u64 = FS_NODUMP_FL | FS_NOATIME_FL | FS_SYNC_FL | FS_DIRSYNC_FL;
@@ -392,7 +395,16 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             lin::setresuid(-1, 1000, -1),
             0,
         );
-        lin::check_eq(&mut failed, b"now uid 1000", lin::getuid(), 1000);
+        // The *effective* id, not the real one: `-1` kept the real id at 0 so
+        // that `setresuid(0, 0, 0)` can put root back, which is the whole
+        // reason this drops the one and not the other.
+        lin::check_eq(&mut failed, b"now euid 1000", lin::geteuid(), 1000);
+        lin::check_eq(
+            &mut failed,
+            b"with the real id still root's",
+            lin::getuid(),
+            0,
+        );
         let mine = lin::openat(
             lin::AT_FDCWD,
             OWNED,
@@ -437,7 +449,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             lin::setresuid(0, 0, 0),
             0,
         );
-        lin::check_eq(&mut failed, b"as uid 0", lin::getuid(), 0);
+        lin::check_eq(&mut failed, b"as euid 0", lin::geteuid(), 0);
         lin::unlinkat(lin::AT_FDCWD, OWNED, 0);
     }
 

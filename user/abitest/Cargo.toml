@@ -102,6 +102,10 @@ name = "t-fsflags"
 path = "src/bin/integration/t-fsflags.rs"
 
 [[bin]]
+name = "t-mountinfo"
+path = "src/bin/integration/t-mountinfo.rs"
+
+[[bin]]
 name = "t-memfd-shm"
 path = "src/bin/integration/t-memfd-shm.rs"
 

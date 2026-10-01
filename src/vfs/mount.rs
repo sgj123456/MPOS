@@ -1293,7 +1293,15 @@ impl Vfs {
                 )
             });
         let mut records: Vec<MountRecord> = Vec::new();
-        if let (Some(fstype), Some(source)) = (root_fstype, root_source) {
+        if let Some(fstype) = root_fstype {
+            // The root's source, when no mount named one: Linux prints the
+            // filesystem's own *type* there, so an initramfs's `/` reads
+            // `rootfs / rootfs rw 0 0`. A root the kernel installed was never
+            // given a device or a tag to be named by, and leaving the line out
+            // - which is what requiring a source here did - tells every reader
+            // of both files that `/` is not mounted at all. `switch_root`'s own
+            // `grep` for the root in `/proc/mounts` is one of them.
+            let source = root_source.unwrap_or_else(|| fstype.clone());
             records.push(MountRecord {
                 mount_id: root_mount_id,
                 // Filled in below, with every other mount's.
@@ -2129,14 +2137,20 @@ mod tests {
         )
         .unwrap();
 
-        // The root is not among them: `/proc/mounts` reports where a filesystem
-        // *came from*, and a root that no mount has been promoted into has no
-        // source to report. (`the_root_keeps_the_device_number_of_the_mount_it
-        // _came_from` above is the promoted case, and the one where the root's
-        // own record exists at all.)
+        // The root is among them, and it is the one mount here that no
+        // `mount(2)` named: its source is its own type, which is what Linux
+        // prints for a root the kernel installed (`rootfs / rootfs rw 0 0`).
+        // Omitting the line because nothing named a source - which is what this
+        // did - tells every reader of both files that `/` is not mounted.
         let records = vfs.mount_records();
-        assert_eq!(records.len(), 1, "the one mount made here");
-        assert_eq!(records[0].path, "/mnt");
+        assert_eq!(records.len(), 2, "the root, and the one mount made here");
+        assert_eq!(records[0].path, "/");
+        assert_eq!(records[0].source, "ramfs", "its type, as Linux prints it");
+        assert_eq!(
+            records[0].parent_id, records[0].mount_id,
+            "the root is its own parent"
+        );
+        assert_eq!(records[1].path, "/mnt");
         for record in &records {
             assert_eq!(
                 record.dev,
@@ -2150,12 +2164,11 @@ mod tests {
                 "and with the descriptor door, for a mount's own root"
             );
         }
-        // And the two doors really do disagree about different filesystems, so
-        // the agreement above is not just everything being one number.
+        // And the two records really are two numbers, so the agreement above is
+        // not everything being one number.
         assert_ne!(
-            records[0].dev,
-            vfs.dev_of_path("/"),
-            "the root is the ramfs, not the device"
+            records[0].dev, records[1].dev,
+            "the root is the ramfs, and /mnt the device"
         );
     }
 
