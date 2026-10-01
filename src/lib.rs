@@ -66,6 +66,13 @@ pub mod drm_cursor;
 /// written down here with a test per rule instead of being buried in a `match`
 /// only a boot can exercise.
 pub mod drm_sync;
+/// The `DRM_VIRTGPU_*` family's answers on a card with no 3D behind it. Ungated
+/// like its three siblings, and for the same reason: what a caller hears for
+/// each request is a table of decisions about numbers, measured on a real
+/// Linux, and a table is worth a host test rather than a boot. The requests that
+/// need a resource to exist are absent here on purpose - their honest answer
+/// needs the device, and the module says so.
+pub mod drm_virtgpu;
 /// The errno table: the numbers every layer answers "no" with. Sits at the
 /// crate root precisely so that refusing in Linux's language never requires
 /// naming the `syscall` layer from below it.

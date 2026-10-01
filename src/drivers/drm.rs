@@ -288,6 +288,32 @@ const NR_SYNCOBJ_TRANSFER: u32 = 0xcc;
 const NR_SYNCOBJ_TIMELINE_SIGNAL: u32 = 0xcd;
 const NR_SYNCOBJ_EVENTFD: u32 = 0xcf;
 
+/// The `DRM_VIRTGPU_*` block: `drm.h` puts the family at `DRM_COMMAND_BASE + 1`
+/// and up (`0x41`), which is its own numbering and not this file's - the same
+/// trap the lease family's comment above records, so these are written from the
+/// header's `#define` list rather than chosen.
+///
+/// Only the requests this card can *answer* are dispatched below. The four that
+/// name a resource handle - `RESOURCE_INFO` (`0x45`), `MAP` (`0x41`),
+/// `WAIT` (`0x48`), `TRANSFER_TO_HOST` (`0x47`) - have no arm and keep the
+/// tail's `ENOTTY`; `src/drm_virtgpu.rs`'s header says why that is the honest
+/// thing until a resource can exist, rather than answering `ENOENT` for handles
+/// a Linux card would accept. They still get an `arg_shape` row, because Linux's
+/// ioctl layer copies every DRM struct in *before* the handler can refuse it, so
+/// a caller whose pointer is not its own memory must hear `EFAULT` rather than
+/// any refusal at all.
+const NR_VIRTGPU_MAP: u32 = 0x41;
+const NR_VIRTGPU_EXECBUFFER: u32 = 0x42;
+const NR_VIRTGPU_GETPARAM: u32 = 0x43;
+const NR_VIRTGPU_RESOURCE_CREATE: u32 = 0x44;
+const NR_VIRTGPU_RESOURCE_INFO: u32 = 0x45;
+const NR_VIRTGPU_TRANSFER_FROM_HOST: u32 = 0x46;
+const NR_VIRTGPU_TRANSFER_TO_HOST: u32 = 0x47;
+const NR_VIRTGPU_WAIT: u32 = 0x48;
+const NR_VIRTGPU_GET_CAPS: u32 = 0x49;
+const NR_VIRTGPU_RESOURCE_CREATE_BLOB: u32 = 0x4a;
+const NR_VIRTGPU_CONTEXT_INIT: u32 = 0x4b;
+
 /// `DRM_SYNCOBJ_CREATE_SIGNALED`: the object starts with a fence behind it.
 const SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
 /// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and its import twin: the
@@ -995,7 +1021,77 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_SYNCOBJ_EVENTFD => syncobj_eventfd(ofd, arg),
         NR_CREATE_DUMB => create_dumb(arg),
         NR_MAP_DUMB => map_dumb(arg),
+        // The `DRM_VIRTGPU_*` family. What a caller hears here is not one
+        // refusal but a table of per-request answers - a card with no 3D behind
+        // it succeeds at some of these, refuses others with `ENOSYS` and others
+        // with `EINVAL` - and `crate::drm_virtgpu` holds that table with the
+        // measurement beside every entry.
+        //
+        // The four arms that are missing are missing on purpose:
+        // `RESOURCE_INFO`, `MAP`, `WAIT` and `TRANSFER_TO_HOST` all name a
+        // resource handle, on a card that cannot allocate one, and the module
+        // says why answering `ENOENT` for every handle would be a dialect of
+        // this kernel's rather than Linux's. They keep the tail's `ENOTTY`,
+        // which is the answer they have always had.
+        NR_VIRTGPU_GETPARAM => virtgpu_getparam(arg),
+        NR_VIRTGPU_RESOURCE_CREATE => virtgpu_resource_create(arg),
+        NR_VIRTGPU_GET_CAPS => crate::drm_virtgpu::CAPS,
+        NR_VIRTGPU_EXECBUFFER => crate::drm_virtgpu::EXECBUFFER,
+        NR_VIRTGPU_TRANSFER_FROM_HOST => crate::drm_virtgpu::TRANSFER_FROM_HOST,
+        NR_VIRTGPU_CONTEXT_INIT => crate::drm_virtgpu::CONTEXT_INIT,
+        NR_VIRTGPU_RESOURCE_CREATE_BLOB => crate::drm_virtgpu::RESOURCE_CREATE_BLOB,
         _ => -25, // ENOTTY
+    }
+}
+
+/// `DRM_VIRTGPU_GETPARAM`: `struct drm_virtgpu_getparam { u64 param; u64 value; }`
+/// where `value` is the *address* of the caller's answer rather than the answer.
+///
+/// Linux writes a four-byte `int` there, not the eight the field's width
+/// suggests: the field is declared `__u64` and the copy is `sizeof(int)`, so a
+/// caller that zeroed eight bytes finds the low half changed and the high half
+/// as it left it. Writing eight would be the wrong shape in exactly the place
+/// it is invisible, which is why the width is written down here.
+///
+/// The order is Linux's: an unknown parameter is `EINVAL` *before* the
+/// destination is looked at, so a caller that asked for nothing hears what is
+/// wrong with the question rather than with its buffer. Measured - `GETPARAM(0)`,
+/// `(9)` and `(100)` all answer `EINVAL` on a real card.
+fn virtgpu_getparam(arg: usize) -> isize {
+    let param = unsafe { (arg as *const u64).read_unaligned() };
+    let Ok(value) = crate::drm_virtgpu::param(param) else {
+        return crate::err::EINVAL;
+    };
+    let out = unsafe { ((arg + 8) as *const u64).read_unaligned() } as *mut i32;
+    if out.is_null() || !crate::uaccess::buffer_ok(out as usize, 4, true, true) {
+        return crate::err::EFAULT;
+    }
+    unsafe { out.write_unaligned(value as i32) };
+    0
+}
+
+/// `DRM_VIRTGPU_RESOURCE_CREATE`: refuse, but say *which* refusal applies.
+///
+/// A card without 3D validates five fields of `struct drm_virtgpu_resource_create`
+/// and answers `EINVAL` for each one it does not like - `target != 2` (the 2D
+/// pipe), and `depth`, `nr_samples`, `last_level` and `array_size` each above 1.
+/// Checking them here before refusing is the difference between telling a caller
+/// its arguments are wrong and telling it this card cannot allocate, and those
+/// are different problems with different remedies.
+///
+/// The field offsets are the struct's: `target` at 0, `depth` at 20,
+/// `array_size` at 24, `last_level` at 28, `nr_samples` at 32.
+fn virtgpu_resource_create(arg: usize) -> isize {
+    let field = |offset: usize| unsafe { ((arg + offset) as *const u32).read_unaligned() };
+    match crate::drm_virtgpu::resource_create_args_ok(
+        field(0),
+        field(20),
+        field(32),
+        field(28),
+        field(24),
+    ) {
+        Ok(()) => crate::drm_virtgpu::RESOURCE_CREATE_UNSUPPORTED,
+        Err(errno) => errno,
     }
 }
 
@@ -1735,6 +1831,25 @@ fn arg_shape(nr: u32) -> Option<(usize, bool)> {
             NR_SYNCOBJ_TRANSFER => (32, true), // struct drm_syncobj_transfer
             _ => (24, true),                   // struct drm_syncobj_eventfd
         },
+        // The `DRM_VIRTGPU_*` family, sized from `virtgpu_drm.h`'s structs. All
+        // eleven are here, including the four with no dispatch arm: Linux's
+        // ioctl layer copies every DRM struct in *before* the handler can refuse
+        // it, so a caller whose pointer is not its own memory must hear `EFAULT`
+        // rather than a refusal - the same reason the gamma and sequence rows
+        // above are here. Two of the sizes are worth reading twice:
+        // `drm_virtgpu_execbuffer` is 64 bytes (it grew the sync-object fields),
+        // and the transfer pair is 44, not the 48 a `drm_virtgpu_3d_box` plus
+        // four words might suggest.
+        NR_VIRTGPU_MAP => (16, true),             // struct drm_virtgpu_map
+        NR_VIRTGPU_EXECBUFFER => (64, true),      // struct drm_virtgpu_execbuffer
+        NR_VIRTGPU_GETPARAM => (16, true),        // struct drm_virtgpu_getparam
+        NR_VIRTGPU_RESOURCE_CREATE => (56, true), // struct drm_virtgpu_resource_create
+        NR_VIRTGPU_RESOURCE_INFO => (16, true),   // struct drm_virtgpu_resource_info
+        NR_VIRTGPU_TRANSFER_FROM_HOST | NR_VIRTGPU_TRANSFER_TO_HOST => (44, true),
+        NR_VIRTGPU_WAIT => (8, true),     // struct drm_virtgpu_3d_wait
+        NR_VIRTGPU_GET_CAPS => (24, true), // struct drm_virtgpu_get_caps
+        NR_VIRTGPU_RESOURCE_CREATE_BLOB => (56, true), // struct drm_virtgpu_resource_create_blob
+        NR_VIRTGPU_CONTEXT_INIT => (16, true), // struct drm_virtgpu_context_init
         _ => return None,
     })
 }

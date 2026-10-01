@@ -62,6 +62,10 @@ name = "t-drm-sync"
 path = "src/bin/integration/t-drm-sync.rs"
 
 [[bin]]
+name = "t-virtgpu"
+path = "src/bin/integration/t-virtgpu.rs"
+
+[[bin]]
 name = "t-ahci"
 path = "src/bin/integration/t-ahci.rs"
 
