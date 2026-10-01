@@ -1208,6 +1208,89 @@ pub(crate) fn timespec_ticks(sec: i64, nsec: i64, hz: u64) -> Result<u64, isize>
     Ok(ticks.saturating_add((nsec as u64).div_ceil(nanos_per_tick)))
 }
 
+/// A tick count back into the `(tv_sec, tv_nsec)` a `struct timespec` carries -
+/// the inverse of [`timespec_ticks`], and the encoding `nanosleep`'s `rem`
+/// needs when a signal ends the sleep.
+///
+/// Both clocks this kernel ticks at divide a second exactly (1e9/250 and
+/// 1e9/1000), so the conversion is the multiplication and the split and
+/// nothing rounds; a rate that did not divide would lose the remainder here
+/// rather than invent a nanosecond count the caller could sleep for.
+pub(crate) fn timespec_from_ticks(ticks: u64, hz: u64) -> (i64, i64) {
+    let nanos = ticks.saturating_mul(1_000_000_000 / hz);
+    (
+        (nanos / 1_000_000_000) as i64,
+        (nanos % 1_000_000_000) as i64,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The waits a signal restarts: SA_RESTART's per-syscall set
+// ---------------------------------------------------------------------------
+
+/// Whether an interrupted call of number `nr` is one Linux runs again when the
+/// signal that interrupted it was installed with `SA_RESTART`.
+///
+/// `SA_RESTART` is not one rule but two, and this is the half that is decided
+/// per syscall rather than per disposition. Measured on Linux 7.2 (2026-10-01,
+/// a terminal read interrupted by a 100 ms `SIGALRM` whose handler had
+/// `SA_RESTART`, with the byte it was waiting for written at 400 ms):
+///
+/// | call | with `SA_RESTART` | so |
+/// |---|---|---|
+/// | `read(2)` on a terminal | the handler runs at 100 ms, the call returns the byte at 400 ms | restarted: the caller never sees `EINTR` |
+/// | `poll(2)`, `nanosleep(2)`, `epoll_wait(2)` | `-1/EINTR` at 100 ms | never restarted, whatever the disposition says |
+///
+/// The never-restarted list is `signal(7)`'s and is the reason this is an
+/// allow-list rather than "everything except those": a rewind re-executes the
+/// call with the caller's original arguments, so a call that must not be run
+/// twice - or one where a second run could not tell it was a second run - is
+/// wrong to include even if it never returns `EINTR` today.
+///
+/// Named remainder: Linux's `ioctl(2)` is restartable *per request* (an
+/// interruptible `DRM_IOCTL_SYNCOBJ_WAIT` restarts, most requests do not), and
+/// this kernel has no per-request verdict - so an interrupted DRM sync-object
+/// wait comes back `EINTR` here even under `SA_RESTART`. `wait4(2)` is
+/// restartable on Linux and not listed, because its park in this kernel is not
+/// interruptible at all (it sleeps through a catchable signal, the gap §2.5
+/// names); listing it would promise a restart of a call that never answers
+/// `EINTR`.
+pub(crate) fn restartable(nr: u64) -> bool {
+    use crate::syscall::linux::nr;
+    matches!(
+        nr,
+        // The read and write families, which is where the measurement above
+        // came from: every one of them ends a wait with `EINTR` here.
+        nr::READ
+            | nr::WRITE
+            | nr::PREAD64
+            | nr::PWRITE64
+            | nr::READV
+            | nr::WRITEV
+            | nr::PREADV
+            | nr::PWRITEV
+            | nr::PREADV2
+            | nr::PWRITEV2
+            // The socket families. Linux's one exception - a socket with
+            // `SO_RCVTIMEO`/`SO_SNDTIMEO` set is never restarted - cannot
+            // arise, because neither option changes a wait here.
+            | nr::ACCEPT
+            | nr::ACCEPT4
+            | nr::CONNECT
+            | nr::SENDTO
+            | nr::RECVFROM
+            | nr::SENDMSG
+            | nr::RECVMSG
+            | nr::SENDMMSG
+            | nr::RECVMMSG
+            // The two locking families and the futex: all three are waits a
+            // signal ends, and all three are idempotent to re-issue.
+            | nr::FUTEX
+            | nr::FCNTL
+            | nr::FLOCK
+    )
+}
+
 // ---------------------------------------------------------------------------
 // prctl(2): the option this kernel models
 // ---------------------------------------------------------------------------
@@ -1300,6 +1383,17 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     const PR_GET_SECCOMP: usize = 21;
     const PR_SET_SECCOMP: usize = 22;
     const PR_GET_NAME: usize = 16;
+    // The dumpable flag and the two capability options whose state lives in
+    // `crate::cred`. Unlike the options below, these are backed by real state
+    // that something *reads*: `ptrace_may_access` asks the dumpable flag, and
+    // `execve` re-derives the sets from the bounding one - which is what makes
+    // them honest rather than a stored value nothing consults.
+    const PR_SET_DUMPABLE: usize = 4;
+    const PR_GET_DUMPABLE: usize = 3;
+    const PR_SET_KEEPCAPS: usize = 8;
+    const PR_GET_KEEPCAPS: usize = 9;
+    const PR_CAPBSET_READ: usize = 23;
+    const PR_CAPBSET_DROP: usize = 24;
     // `TASK_COMM_LEN`: the fixed slot both name options speak of.
     const NAME_LEN: usize = 16;
     const SECCOMP_MODE_STRICT: usize = 1;
@@ -1380,15 +1474,66 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
             SECCOMP_MODE_FILTER => install_seccomp_filter(args[2], 0, true),
             _ => err::EINVAL,
         },
+        // The dumpable flag: whether a stranger may inspect this process's
+        // memory. `PTRACE_ATTACH` and `process_vm_readv`/`writev` consult it
+        // through `crate::cred::ptrace_may_access`, so setting it here changes
+        // what those calls will do - which is the difference between this
+        // option and the ones the catch-all below still refuses.
+        //
+        // Measured: Linux accepts only 0 (`SUID_DUMP_DISABLE`) and 1
+        // (`SUID_DUMP_USER`). 2 is the kernel's own `SUID_DUMP_ROOT` and is
+        // *not* settable through this door - 2, 3 and -1 are all `EINVAL`.
+        PR_SET_DUMPABLE => match args[1] {
+            0 | 1 => {
+                let value = args[1] as u8;
+                crate::sched::with_current_credentials(|c| c.dumpable = value);
+                0
+            }
+            _ => err::EINVAL,
+        },
+        PR_GET_DUMPABLE => crate::sched::current_credentials().dumpable as isize,
+        // `KEEPCAPS`: whether a full uid drop keeps the *permitted* capability
+        // set. Measured accepted values are 0 and 1; 2 is `EINVAL`. The bit is
+        // read by `Credentials::on_identity_change`, so it is not a stored
+        // no-op: dropping all three uids keeps the capabilities with it set and
+        // clears them without it.
+        PR_SET_KEEPCAPS => match args[1] {
+            0 | 1 => {
+                let on = args[1] != 0;
+                crate::sched::with_current_credentials(|c| c.keepcaps = on);
+                0
+            }
+            _ => err::EINVAL,
+        },
+        PR_GET_KEEPCAPS => crate::sched::current_credentials().keepcaps as isize,
+        // The capability bounding set. Measured: `PR_CAPBSET_READ` answers 1 or
+        // 0 for 0..=40 and `EINVAL` past that, and `PR_CAPBSET_DROP` asks the
+        // capability *before* the range - an unprivileged `DROP(100)` is
+        // `EPERM` while root's is `EINVAL`. `capbset_drop` keeps that order, so
+        // the range is not checked here; the *read* has no capability to ask,
+        // so its range check is local.
+        PR_CAPBSET_READ => {
+            if args[1] > crate::cred::CAP_LAST_CAP as usize {
+                return err::EINVAL;
+            }
+            crate::sched::current_credentials().has_bounding(args[1] as u32) as isize
+        }
+        PR_CAPBSET_DROP => {
+            match crate::sched::with_current_credentials(|c| c.capbset_drop(args[1] as u64)) {
+                Ok(()) => 0,
+                Err(crate::cred::CapErr::Perm) => err::EPERM,
+                Err(crate::cred::CapErr::Invalid) => err::EINVAL,
+            }
+        }
         // Every option not named above is refused with `EINVAL`, exactly as
         // Linux's `prctl` `default:` arm (kernel/sys.c). Returning `0` here -
         // the old catch-all - was the §4.2 "success for a thing not done" this
-        // batch exists to remove: a caller of `PR_SET_DUMPABLE`, `PR_CAPBSET_*`,
+        // batch exists to remove: a caller of `PR_SET_PDEATHSIG`,
         // `PR_SET_NO_NEW_PRIVS` and friends was told the kernel had done
         // something it had not. `EINVAL` sends it down the same fallback Linux
         // gives an option this kernel does not model; a specific option is only
-        // accepted once MPOS backs it with real state (as the name and seccomp
-        // pairs above are), never with an empty success.
+        // accepted once MPOS backs it with real state (as the name, seccomp,
+        // dumpable and bounding pairs above are), never with an empty success.
         _ => err::EINVAL,
     }
 }
@@ -1976,6 +2121,67 @@ pub(crate) fn mark_missing_futex_op(op: usize) -> bool {
     };
     let mask = 1u64 << (op % 64);
     word.fetch_or(mask, Ordering::Relaxed) & mask == 0
+}
+
+// ---------------------------------------------------------------------------
+// The entropy-pool family (`'R'`-typed requests), for `/dev/random` and
+// `/dev/urandom`
+// ---------------------------------------------------------------------------
+//
+// The words are recomputed from `linux/random.h`'s own `_IOR`/`_IOW` spellings
+// in `entropy_tests` below, because a request is only right to the *whole*
+// word: `RNDADDENTROPY` is `_IOW('R', 0x03, int [2])` = 0x4008_5203, and
+// dispatching the family on its command byte alone puts that credit in the arm
+// that answers for a drain - which is how OpenRC's seedrng came to be told
+// `EOPNOTSUPP` for the one ioctl it sends. Linux's `random_fops_ioctl` switches
+// on the full word too, measured on 7.2.7: `_IOW('R', 0x03, int)` - the same
+// command with the header's `int [2]` narrowed to `int` - is `EINVAL`, not a
+// credit, and so is `_IOWR('R', 0x03, int [2])`.
+//
+// `RNDGETPOOL` is recorded as a word and nothing else. The header still names
+// it, the kernel stopped answering it, and an unrecognised `'R'` number is
+// `EINVAL` *before* any capability question (measured, unprivileged:
+// `RNDGETPOOL` → `EINVAL` while `RNDZAPENTCNT` → `EPERM`).
+
+/// `_IOR('R', 0x00, int)`: entropy available in the pool, in bits.
+pub const RNDGETENTCNT: u32 = 0x8004_5200;
+/// `_IOW('R', 0x01, int)`: credit this many bits to the pool's count.
+pub const RNDADDTOENTCNT: u32 = 0x4004_5201;
+/// `_IOR('R', 0x02, int [2])`: the pool's contents. Removed from the kernel,
+/// so `EINVAL` here as it is there - but named, because a header a binary was
+/// compiled against is part of what that binary may ask for.
+pub const RNDGETPOOL: u32 = 0x8008_5202;
+/// `_IOW('R', 0x03, int [2])`: credit the seed bytes of a `struct
+/// rand_pool_info`. The request OpenRC's seedrng sends on every boot.
+pub const RNDADDENTROPY: u32 = 0x4008_5203;
+/// `_IO('R', 0x04)`: drop the pool's entropy count to zero.
+pub const RNDZAPENTCNT: u32 = 0x0000_5204;
+/// `_IO('R', 0x06)`: clear the pool's contents.
+pub const RNDCLEARPOOL: u32 = 0x0000_5206;
+/// `_IO('R', 0x07)`: reseed the CRNG from the input pool.
+pub const RNDRESEEDCRNG: u32 = 0x0000_5207;
+
+/// The size of the `struct rand_pool_info` header `RNDADDENTROPY` reads: the
+/// two ints its command word's size field names, ahead of the seed bytes.
+pub const RND_POOL_INFO_SIZE: usize = 2 * core::mem::size_of::<i32>();
+
+/// What a credit's `struct rand_pool_info` header answers, in Linux's order.
+///
+/// `Ok(len)` is how many seed bytes the caller declares after the two ints;
+/// the handler still has to prove that stretch is reachable, because measured
+/// on Linux 7.2.7 a declared 65536 with nothing behind the header is `EFAULT`.
+/// `Err(errno)` is the header's own refusal.
+///
+/// The order is measured rather than assumed: a negative count is `EINVAL`
+/// even when the size is *also* unusable (`{-1, -1}` and `{-1, 65536}` are both
+/// `EINVAL`), while a good count with a bad size is `EFAULT`. A credit of zero
+/// seed bytes, or of zero entropy, is accepted - and so is a 1 MiB one, so this
+/// refuses nothing for being merely large.
+pub fn rnd_pool_seed_len(count: i32, size: i32) -> Result<usize, isize> {
+    if count < 0 {
+        return Err(err::EINVAL);
+    }
+    usize::try_from(size).map_err(|_| err::EFAULT)
 }
 
 // ---------------------------------------------------------------------------
@@ -3609,5 +3815,143 @@ mod oss_tests {
         assert_eq!(oss_round_rate(10000, &[8000, 11025]), Some(11025));
         assert_eq!(oss_round_rate(0, &[8000]), Some(8000));
         assert_eq!(oss_round_rate(44100, &[]), None);
+    }
+}
+
+/// The entropy family's words, recomputed from the `_IOR`/`_IOW` spellings
+/// `linux/random.h` gives them, and the credit header's measured decisions.
+#[cfg(test)]
+mod entropy_tests {
+    use super::*;
+
+    const fn ioc(dir: u32, size: u32, type_: u8, nr: u8) -> u32 {
+        (dir << 30) | (size << 16) | ((type_ as u32) << 8) | nr as u32
+    }
+
+    #[test]
+    fn the_entropy_request_words_are_random_h_ones() {
+        assert_eq!(RNDGETENTCNT, ioc(2, 4, b'R', 0x00));
+        assert_eq!(RNDADDTOENTCNT, ioc(1, 4, b'R', 0x01));
+        assert_eq!(RNDGETPOOL, ioc(2, 8, b'R', 0x02));
+        assert_eq!(RNDADDENTROPY, ioc(1, 8, b'R', 0x03));
+        assert_eq!(RNDZAPENTCNT, ioc(0, 0, b'R', 0x04));
+        assert_eq!(RNDCLEARPOOL, ioc(0, 0, b'R', 0x06));
+        assert_eq!(RNDRESEEDCRNG, ioc(0, 0, b'R', 0x07));
+        assert_eq!(RND_POOL_INFO_SIZE, 8);
+        // The words themselves, because the dispatch is on the whole of them:
+        // 0x4008_5203 is the request OpenRC's seedrng sends, and the command
+        // byte it shares with no other 'R' number is why keying on that byte
+        // alone answered a credit as a drain.
+        assert_eq!(RNDADDENTROPY, 0x4008_5203);
+        assert_eq!(RNDGETENTCNT, 0x8004_5200);
+        assert_ne!(RNDADDENTROPY, ioc(1, 4, b'R', 0x03));
+        assert_ne!(RNDADDENTROPY, ioc(3, 8, b'R', 0x03));
+    }
+
+    #[test]
+    fn a_credit_header_is_answered_in_linux_s_order() {
+        // Every line here is the answer real Linux (7.2.7, `/dev/urandom`,
+        // root) gave; the two that pin the *order* are the ones where both
+        // ints are bad, and the count's refusal is what comes back.
+        assert_eq!(rnd_pool_seed_len(8, 8), Ok(8));
+        assert_eq!(rnd_pool_seed_len(8, 0), Ok(0));
+        assert_eq!(rnd_pool_seed_len(0, 8), Ok(8));
+        assert_eq!(rnd_pool_seed_len(2147483647, 8), Ok(8));
+        assert_eq!(rnd_pool_seed_len(8, 1 << 20), Ok(1 << 20));
+        assert_eq!(rnd_pool_seed_len(-1, -1), Err(err::EINVAL));
+        assert_eq!(rnd_pool_seed_len(-1, 65536), Err(err::EINVAL));
+        assert_eq!(rnd_pool_seed_len(8, -1), Err(err::EFAULT));
+    }
+
+    /// `SA_RESTART`'s per-syscall half: which interrupted calls Linux runs
+    /// again, and which come back `EINTR` however the disposition is set.
+    ///
+    /// The never-restarted numbers are `signal(7)`'s list, narrowed to the
+    /// calls this kernel routes; a number the kernel answers `ENOSYS` to is
+    /// not restarted either, for the plain reason that it cannot have been
+    /// interrupted in a wait. The test is a table because the failure mode
+    /// this pins is a one-word one: a call that *looks* like it belongs (a
+    /// `poll` beside a `read`, an `epoll_wait` beside an `accept`) and moves
+    /// from one side to the other.
+    #[test]
+    fn only_the_calls_linux_restarts_are_restarted() {
+        use crate::syscall::linux::nr;
+
+        // The measured pair: a `read` is restarted, and the multiplexers and
+        // sleeps that sit in the same loop are not.
+        assert!(restartable(nr::READ));
+        assert!(restartable(nr::WRITE));
+        for call in [
+            nr::PREAD64,
+            nr::PWRITE64,
+            nr::READV,
+            nr::WRITEV,
+            nr::PREADV,
+            nr::PWRITEV,
+            nr::PREADV2,
+            nr::PWRITEV2,
+            nr::ACCEPT,
+            nr::ACCEPT4,
+            nr::CONNECT,
+            nr::SENDTO,
+            nr::RECVFROM,
+            nr::SENDMSG,
+            nr::RECVMSG,
+            nr::SENDMMSG,
+            nr::RECVMMSG,
+            nr::FUTEX,
+            nr::FCNTL,
+            nr::FLOCK,
+        ] {
+            assert!(restartable(call), "call {call} is restarted on Linux");
+        }
+
+        for call in [
+            nr::POLL,
+            nr::PPOLL,
+            nr::SELECT,
+            nr::PSELECT6,
+            nr::EPOLL_WAIT,
+            nr::EPOLL_PWAIT,
+            nr::EPOLL_PWAIT2,
+            nr::NANOSLEEP,
+            nr::CLOCK_NANOSLEEP,
+            nr::PAUSE,
+            nr::RT_SIGSUSPEND,
+            nr::RT_SIGTIMEDWAIT,
+        ] {
+            assert!(
+                !restartable(call),
+                "call {call} answers EINTR under SA_RESTART too"
+            );
+        }
+
+        // The two named remainders, pinned so they cannot drift into the
+        // allow-list silently: `ioctl` needs a per-request verdict this kernel
+        // does not have, and `wait4`'s park is not interruptible yet, so a
+        // restart there would be a promise about a call that never returns
+        // EINTR (PLAN.md §2.5).
+        assert!(!restartable(nr::IOCTL));
+        assert!(!restartable(nr::WAIT4));
+    }
+
+    /// The round trip a `nanosleep`'s `rem` rides: a sleep that was ended with
+    /// 300 ms left says so, in the shape its caller will hand back.
+    #[test]
+    fn a_tick_count_encodes_back_into_a_timespec() {
+        // 250 Hz is this machine's clock and 1000 Hz the other one the
+        // conversion has to hold for; both divide a second exactly.
+        assert_eq!(timespec_from_ticks(250, 250), (1, 0));
+        assert_eq!(timespec_from_ticks(1000, 1000), (1, 0));
+        assert_eq!(timespec_from_ticks(1, 250), (0, 4_000_000));
+        assert_eq!(timespec_from_ticks(0, 250), (0, 0));
+        assert_eq!(timespec_from_ticks(376, 250), (1, 504_000_000));
+        assert_eq!(timespec_from_ticks(3, 1000), (0, 3_000_000));
+        // A tick count past what a second's worth of nanoseconds can carry
+        // saturates rather than wrapping back to a sleep a caller would take
+        // as "almost no time at all".
+        let (sec, nsec) = timespec_from_ticks(u64::MAX, 250);
+        assert!(sec > 0);
+        assert!((0..1_000_000_000).contains(&nsec));
     }
 }

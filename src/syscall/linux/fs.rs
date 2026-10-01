@@ -245,6 +245,17 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                     }
                 }
             }
+            // Where this description lives, recorded for the `st_dev` both
+            // doors report. The label is the path it was opened by, and the
+            // filesystem that serves a path is decided by the mount table, so
+            // this is the one moment the answer is free. Without it `fstat`
+            // had to guess from the inode, and an inode does not name its
+            // filesystem - see `File::dev`.
+            if let Some(path) = label.as_deref()
+                && let Ok(file) = crate::sched::current_fds().clone_at(fd)
+            {
+                file.set_dev(crate::vfs::mount::fs_of_path(&absolute(path)).0);
+            }
             // A directory description remembers the path it was opened by, so
             // a later `fchdir` can give the cwd a name `getcwd` reads back. A
             // character device remembers too: libc's `ttyname` names the tty
@@ -377,13 +388,18 @@ pub(super) fn fstat(args: [usize; ARG_COUNT]) -> isize {
         match crate::sched::current_fds().clone_at(fd) {
             Ok(file) => {
                 let inode = file.inode();
-                // The filesystem a descriptor belongs to is named by the path it
-                // was opened through - the same answer `stat` by path would give,
-                // which is what libc's `ttyname` compares the two sides of. A
-                // nameless descriptor falls back to the mount-table lookup.
-                let dev = match file.label() {
-                    Some(path) => crate::vfs::mount::fs_of_path(&path).0,
-                    None => crate::vfs::mount::fs_id_of_inode(&inode),
+                // The filesystem a descriptor belongs to is the one the path it
+                // was opened through is served by - the same answer `stat` by
+                // path gives, which is what libc's `ttyname` compares the two
+                // sides of, and what a lock-and-verify caller needs to agree. A
+                // descriptor with no path of its own falls back to the
+                // mount-table lookup, and a nameless one to the root.
+                let dev = match file.dev() {
+                    Some(dev) => dev,
+                    None => match file.label() {
+                        Some(path) => crate::vfs::mount::fs_of_path(&path).0,
+                        None => crate::vfs::mount::fs_id_of_inode(&inode),
+                    },
                 };
                 (
                     file.metadata(),
@@ -603,9 +619,12 @@ pub(super) fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
             match crate::sched::current_fds().clone_at(dirfd) {
                 Ok(file) => {
                     let inode = file.inode();
-                    let dev = match file.label() {
-                        Some(path) => crate::vfs::mount::fs_of_path(&path).0,
-                        None => crate::vfs::mount::fs_id_of_inode(&inode),
+                    let dev = match file.dev() {
+                        Some(dev) => dev,
+                        None => match file.label() {
+                            Some(path) => crate::vfs::mount::fs_of_path(&path).0,
+                            None => crate::vfs::mount::fs_id_of_inode(&inode),
+                        },
                     };
                     (
                         file.metadata(),
@@ -3268,10 +3287,19 @@ pub(super) fn handle_fchdir(args: [usize; ARG_COUNT]) -> isize {
 /// `fcntl(F_SETFL)` and `ioctl(FIONBIO)` both set the flag on the description,
 /// but a pipe's and an eventfd's blocking is the *inode's* own: the bit has to
 /// be mirrored there too, or a `fcntl(F_SETFL, O_NONBLOCK)` on a plain
-/// `pipe()` would read and write exactly as a blocking one.
+/// `pipe()` would read and write exactly as a blocking one. A terminal is the
+/// same story with two ends: the slave's bit belongs to its `Tty` and the
+/// master's to the pair, and the master is checked *first* because
+/// `PtyMaster::as_tty` answers the slave's terminal - it has to, the pair
+/// being one terminal for every termios question - so reaching the `as_tty`
+/// arm with a master's descriptor would set the wrong end's flag.
 fn sync_nonblocking(file: &crate::vfs::File, status: u32) {
     let on = status & crate::vfs::file::O_NONBLOCK != 0;
-    if let Some(pipe) = file.inode().as_pipe() {
+    if let Some(pty) = file.inode().as_pty() {
+        pty.set_master_nonblocking(on);
+    } else if let Some(tty) = file.inode().as_tty() {
+        tty.set_nonblocking(on);
+    } else if let Some(pipe) = file.inode().as_pipe() {
         pipe.set_nonblocking(on);
     } else if let Some(ev) = file.inode().as_evdev() {
         ev.set_nonblocking(on);
@@ -3585,22 +3613,31 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             let sectors = dev.capacity_sectors();
             match request {
                 // BLKGETSIZE64: u64, the size in bytes.
+                //
+                // All three of these write into the caller's buffer, so all
+                // three validate it as a destination. They used to validate it
+                // `write = false`, which accepted a read-only page and filled
+                // it: measured on a real device, a `PROT_READ` mapping is
+                // `EFAULT` for every one of them, because Linux's `put_user`
+                // faults it. No real caller (libblkid, `blockdev`, which pass a
+                // writable variable) ever saw the difference, which is why it
+                // went unnoticed; the direction is the contract regardless.
                 0x80081272 => {
-                    if !buffer_ok(buf, 8, false, from_user) {
+                    if !buffer_ok(buf, 8, true, from_user) {
                         return err::EFAULT;
                     }
                     unsafe { (buf as *mut u64).write_unaligned(sectors * 512) };
                 }
                 // BLKGETSIZE: u32, the size in 512-byte sectors.
                 0x1260 => {
-                    if !buffer_ok(buf, 4, false, from_user) {
+                    if !buffer_ok(buf, 4, true, from_user) {
                         return err::EFAULT;
                     }
                     unsafe { (buf as *mut u32).write_unaligned(sectors as u32) };
                 }
                 // BLKSSZGET: u32, the sector size itself.
                 _ => {
-                    if !buffer_ok(buf, 4, false, from_user) {
+                    if !buffer_ok(buf, 4, true, from_user) {
                         return err::EFAULT;
                     }
                     unsafe { (buf as *mut u32).write_unaligned(512) };
@@ -3926,33 +3963,55 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         }
         0x541B => {
             // FIONREAD: "how many bytes can I read before I would block".
-            // seedrng asks it of the entropy devices to size the pool, and
-            // on Linux the answer there is the readable bytes of the pool -
-            // `poolsize`/8 for a pool reported full, which is what the
-            // `RNDGETENTCNT` arm below pairs with. Other descriptors keep
-            // their own queue-length story for a later day; here a socket
-            // or pipe asking is answered the honest ENOTTY rather than a
-            // borrowed zero.
+            // The two entropy devices are the case this arm is reached for,
+            // and Linux refuses them: measured on 7.2.7 (2026-10-01), both
+            // `/dev/random` and `/dev/urandom` answer `EINVAL` - root and
+            // unprivileged, `O_RDONLY` and `O_WRONLY`, and *before* the
+            // argument is looked at (a NULL or unmapped pointer is still
+            // `EINVAL`, not `EFAULT`). The 512 this arm used to write was a
+            // divergence, and the reason it was written down for was false:
+            // OpenRC's `seedrng` never asks `FIONREAD` - the binary in this
+            // image sends one ioctl, the `RNDADDENTROPY` credit below, and
+            // takes its seed length from `/proc/sys/kernel/random/poolsize`.
+            // Other descriptors keep their own queue-length story for a later
+            // day; here a pipe or socket asking is answered the honest
+            // `ENOTTY` rather than a borrowed zero. (A regular file and a pipe
+            // *would* answer 0 with their remaining/queued bytes on Linux;
+            // that is a named divergence in `UAPI.md` §5.2, not this arm's.)
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
             };
             match file.inode().rdev() {
-                Some((1, 8)) | Some((1, 9)) => {}
-                _ => return err::ENOTTY,
+                Some((1, 8)) | Some((1, 9)) => err::EINVAL,
+                _ => err::ENOTTY,
             }
-            if !buffer_ok(buf, 4, true, from_user) {
-                return err::EFAULT;
-            }
-            unsafe { (buf as *mut i32).write_unaligned(512) };
-            0
         }
         // The entropy-pool ioctls (`'R'`-typed), answered on the two device
-        // numbers the pool's names carry. There is no pool - one always-ready
-        // ChaCha20 stream - so the reads report it full (4096 bits, the same
-        // figure `/proc/sys/kernel/random/poolsize` gives) and the credit and
-        // clear calls succeed by doing nothing, which is exactly how Linux
-        // treats a write to `/dev/urandom` here too.
+        // numbers the pool's names carry. A `'R'` word on any other descriptor
+        // is `ENOTTY`, as it is on Linux (measured on `/dev/rtc0`, `/dev/tty1`
+        // and a regular file), and that gate comes first: the device answers
+        // before the command does.
+        //
+        // There is no pool here - one always-ready ChaCha20 stream - so the
+        // read reports it full (4096 bits, the same figure
+        // `/proc/sys/kernel/random/poolsize` gives) and a privileged credit
+        // succeeds by doing nothing, which is honest: the state a credit would
+        // move, "entropy available", is already at the ceiling the read
+        // reports, so the caller that checks one after the other sees the same
+        // answer Linux gives it. What this kernel cannot do it refuses in the
+        // only language a caller reads - see the two refusals below.
+        //
+        // The family is dispatched on the *whole command word*, as Linux's
+        // `random_fops_ioctl` switch does, and the words are `abi`'s. Keying on
+        // the command byte alone is what broke the boot: OpenRC's seedrng sends
+        // `RNDADDENTROPY` = `_IOW('R', 0x03, int [2])` = 0x4008_5203 (its own
+        // only ioctl immediate, read off the binary in this image), which
+        // landed in the arm that answers for `RNDZAPENTCNT` - nr 3, not nr 4 -
+        // and got `EOPNOTSUPP` back: "seedrng: Unable to seed: Not supported".
+        // Measured on Linux 7.2.7, a wrong size or direction on a right command
+        // is `EINVAL` rather than the command, so matching the whole word is not
+        // a refinement of the old shape, it is what makes the old shape wrong.
         request if family_nr(request, b'R').is_some() => {
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
@@ -3962,49 +4021,105 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Some((1, 8)) | Some((1, 9)) => {}
                 _ => return err::ENOTTY,
             }
-            match family_nr(request, b'R') {
-                Some(0) => {
-                    // RNDGETENTCNT: entropy available, in bits.
+            // The mutating requests are gated on `CAP_SYS_ADMIN`, and the gate
+            // is asked *before* anything is read from the caller's buffer
+            // (measured: every argument shape is `EPERM` for an unprivileged
+            // caller, including one that would otherwise be `EINVAL`).
+            let privileged = crate::sched::current_identity().euid == 0;
+            match request {
+                abi::RNDGETENTCNT => {
+                    // Entropy available, in bits.
                     if !buffer_ok(buf, 4, true, from_user) {
                         return err::EFAULT;
                     }
                     unsafe { (buf as *mut i32).write_unaligned(4096) };
                     0
                 }
-                Some(1) | Some(2) => {
-                    // RNDADDTOENTCNT / RNDADDENTROPY. Measured on real Linux
-                    // these are gated on `CAP_SYS_ADMIN`: an unprivileged
-                    // caller gets `EPERM` (and gets it before any buffer copy,
-                    // which is why the capability check comes first here too).
-                    if crate::sched::current_identity().euid != 0 {
+                abi::RNDADDTOENTCNT => {
+                    if !privileged {
                         return err::EPERM;
                     }
-                    if !buffer_ok(buf, 8, false, from_user) {
+                    if !buffer_ok(buf, 4, false, from_user) {
                         return err::EFAULT;
                     }
-                    // Privileged: this kernel's random source is one always
-                    // seeded ChaCha20 stream, not a drainable accumulator, so
-                    // the pool is already as full as it gets and a credit is a
-                    // genuine no-op success - the observable state ("entropy
-                    // available", which `RNDGETENTCNT` reports) is unchanged
-                    // and true. `0` here is honest, not the §4.2 lie.
+                    // A negative credit is the `EINVAL` Linux answers; a
+                    // positive one has no count here to receive it, which the
+                    // read above already says.
+                    if unsafe { (buf as *const i32).read_unaligned() } < 0 {
+                        return err::EINVAL;
+                    }
                     0
                 }
-                Some(3) | Some(4) => {
-                    // RNDCLEARPOOL / RNDZAPENTCNT. Gated on the same capability
-                    // (measured `EPERM` unprivileged), checked first. A
-                    // privileged clear, though, has nothing to clear: this
-                    // generator holds no entropy count that a `zap` could
-                    // drain, so answering the old `0` claimed a clearing that
-                    // `RNDGETENTCNT` - still full - contradicted one moment
-                    // later. §4.4: an action this machine cannot perform is
-                    // refused (`EOPNOTSUPP`), not quietly reported done.
-                    if crate::sched::current_identity().euid != 0 {
+                abi::RNDADDENTROPY => {
+                    if !privileged {
+                        return err::EPERM;
+                    }
+                    if !buffer_ok(buf, abi::RND_POOL_INFO_SIZE, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    let (count, size) = unsafe {
+                        let header = buf as *const i32;
+                        (header.read_unaligned(), header.add(1).read_unaligned())
+                    };
+                    // `abi`'s order, which is Linux's: the count is refused
+                    // before the size is believed.
+                    let seed_len = match abi::rnd_pool_seed_len(count, size) {
+                        Ok(len) => len,
+                        Err(errno) => return errno,
+                    };
+                    // The seed bytes must be where the header says they are -
+                    // measured `EFAULT` for a declared 65536 with nothing
+                    // behind the header - and the stretch is *checked*, never
+                    // copied: this pool has no accumulator to receive them, so
+                    // the worst case a caller can steer is one page walk and
+                    // `buffer_ok`'s own `MAX_IO` bound (the worst-case rule),
+                    // not an allocation of its choosing.
+                    if seed_len != 0 {
+                        let seed = match buf.checked_add(abi::RND_POOL_INFO_SIZE) {
+                            Some(seed) => seed,
+                            None => return err::EFAULT,
+                        };
+                        if !buffer_ok(seed, seed_len, false, from_user) {
+                            return err::EFAULT;
+                        }
+                    }
+                    0
+                }
+                abi::RNDZAPENTCNT | abi::RNDCLEARPOOL => {
+                    // Gated on the same capability (measured `EPERM`
+                    // unprivileged), asked first. A privileged drain, though,
+                    // has nothing to drain: this generator holds no entropy
+                    // count that a `zap` could zero, so answering the `0` Linux
+                    // gives here claimed a clearing that `RNDGETENTCNT` - still
+                    // full - contradicted one moment later. §4.4: an action this
+                    // machine cannot perform is refused, not quietly reported
+                    // done. It would take a count to say otherwise, and that is
+                    // the named gap in `PLAN.md`.
+                    if !privileged {
                         return err::EPERM;
                     }
                     err::EOPNOTSUPP
                 }
-                _ => err::ENOTTY,
+                abi::RNDRESEEDCRNG => {
+                    // Linux asks the capability and then re-keys the CRNG from
+                    // the input pool, answering `0`; measured on 7.2.7, an
+                    // unprivileged caller gets `EPERM` and root gets `0` on
+                    // both devices. `rand::reseed` is the re-key this generator
+                    // *can* do - it has no input pool, but it has a fresh
+                    // hardware seed and the stream it has already produced, and
+                    // mixing those is the honest shape of the same promise. The
+                    // capability is asked first, before any state moves.
+                    if !privileged {
+                        return err::EPERM;
+                    }
+                    crate::rand::reseed();
+                    0
+                }
+                // An unrecognised `'R'` word - a stale `RNDGETPOOL`, a wrong
+                // size or direction, a number nobody has taken - is the
+                // `EINVAL` Linux answers, and the capability is not even asked
+                // (measured, unprivileged: `RNDGETPOOL` → `EINVAL`).
+                _ => err::EINVAL,
             }
         }
         // The RTC ioctls `hwclock(8)` speaks, answered on the clock's device

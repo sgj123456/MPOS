@@ -236,10 +236,17 @@ pub fn recv(handle: usize) -> Option<Vec<u8>> {
 }
 
 /// [`recv`](Self::recv) with a park: a dump reader with nothing queued waits
-/// here instead of spinning, and the next generated answer wakes it.
-pub fn recv_blocking(handle: usize) -> Option<Vec<u8>> {
-    crate::sched::block_until(|| ready(handle));
-    recv(handle)
+/// here instead of spinning, and the next generated answer wakes it. A
+/// catchable signal ends the wait - `Interrupted`, nothing consumed - so a
+/// program that reads its route table and also answers its own timers is not
+/// held by a queue nothing has filled yet. `Ok(None)` remains what it was:
+/// the session is gone (its descriptor closed while this task waited).
+pub fn recv_blocking(handle: usize) -> crate::vfs::VfsResult<Option<Vec<u8>>> {
+    match crate::sched::block_until_interruptible(|| ready(handle)) {
+        crate::sched::WaitEnd::Interrupted => return Err(crate::vfs::VfsError::Interrupted),
+        _ => {}
+    }
+    Ok(recv(handle))
 }
 
 /// Feed one request in: the payload of a `sendto`/`sendmsg` on a route

@@ -119,6 +119,16 @@ fn get_word(bytes: &[u8], at: usize) -> usize {
 
 /// Write the frame a handler will run on and point the task at it.
 ///
+/// `restart` is the call number to run again after the handler returns, or
+/// `None` when this delivery resumes the interrupted code instead - see
+/// [`restart_verdict`]. A restart is what `SA_RESTART` asks for, and the frame
+/// is the whole of how it happens: `rt_sigreturn` puts the registers back, so
+/// pointing the saved `rip` back at the `syscall` instruction with the number
+/// in `rax` *is* the rewind. The arguments need nothing extra - they are still
+/// in the registers this frame saves (the handler has not run yet, and it runs
+/// on its own copy of them), which is why `rt_sigreturn` hands back the
+/// caller's original arguments for free.
+///
 /// Returns `false` when the frame cannot be written - the stack is not mapped,
 /// or not writable - which leaves the caller to take the default action rather
 /// than to lose the signal.
@@ -128,6 +138,7 @@ fn build_frame(
     action: &crate::sched::signal::Action,
     info: &crate::sched::signal::SigInfo,
     ret: isize,
+    restart: Option<u64>,
 ) -> bool {
     use crate::sched::signal::{
         SA_ONSTACK, SA_RESETHAND, SA_RESTORER, SIGFRAME_BYTES, SIGFRAME_SIGINFO, SIGFRAME_UCONTEXT,
@@ -179,12 +190,25 @@ fn build_frame(
     put_word(&mut bytes, mcontext + sc::RBP, regs.rbp);
     put_word(&mut bytes, mcontext + sc::RBX, regs.rbx);
     put_word(&mut bytes, mcontext + sc::RDX, regs.rdx);
-    put_word(&mut bytes, mcontext + sc::RAX, ret as usize);
+    // The interrupted call's answer, or - for a call the disposition asked to
+    // run again - the call's number, which is what `syscall` reads when the
+    // rewound frame resumes on it.
+    put_word(
+        &mut bytes,
+        mcontext + sc::RAX,
+        restart.map_or(ret as usize, |nr| nr as usize),
+    );
     // rcx and r11 were destroyed by the `syscall` that is being interrupted:
     // the CPU puts the return address in rcx and the flags in r11 on the way
     // in, so there is nothing of the caller's left to save.
     put_word(&mut bytes, mcontext + sc::RSP, regs.user_rsp);
-    put_word(&mut bytes, mcontext + sc::RIP, regs.rcx);
+    // The `syscall` instruction is two bytes (`0f 05`), so the return address
+    // the CPU left in `rcx` is two past the instruction a restart resumes on.
+    put_word(
+        &mut bytes,
+        mcontext + sc::RIP,
+        restart.map_or(regs.rcx, |_| regs.rcx.wrapping_sub(2)),
+    );
     put_word(&mut bytes, mcontext + sc::EFLAGS, regs.r11);
 
     // `uc_stack` describes the alternate stack, as the handler will see it
@@ -237,6 +261,33 @@ fn build_frame(
     true
 }
 
+/// Whether a signal about to be delivered should run the interrupted call
+/// again after its handler returns, and the call number to run.
+///
+/// Three things have to agree, and each is measured rather than assumed:
+///
+/// * the call came back `EINTR`, which in this kernel means a blocking wait
+///   ended with nothing consumed. A call that succeeded - or failed for any
+///   other reason - is done, and re-running it would be a second call;
+/// * the disposition being delivered has `SA_RESTART`. The default harvester
+///   has already run, and what is left reaching this point is either a handler
+///   or an ignored signal, so the flags read here are the ones the handler
+///   will run under;
+/// * the call is one Linux rewinds at all ([`super::abi::restartable`]) -
+///   `poll`, `select`, `epoll_wait` and the sleeps answer `EINTR` whatever the
+///   disposition says, and rewinding them would be a handler loop that never
+///   returns.
+///
+/// What the caller sees when all three hold, measured on Linux 7.2 with a
+/// terminal read whose `SIGALRM` fired at 100 ms and whose byte arrived at
+/// 400 ms: the handler runs at 100 ms, the *read* returns the byte at 400 ms,
+/// and `EINTR` never appears. Without the flag the same call answers
+/// `-1/EINTR` at 100 ms.
+fn restart_verdict(nr: u64, ret: isize, action: &crate::sched::signal::Action) -> Option<u64> {
+    let asked = action.flags & crate::sched::signal::SA_RESTART != 0;
+    (ret == err::EINTR && asked && super::abi::restartable(nr)).then_some(nr)
+}
+
 /// Run a pending signal's handler, or take its default action.
 ///
 /// Called on the way out of every syscall, holding the register frame the task
@@ -249,7 +300,7 @@ fn build_frame(
 /// Returns `true` when a handler was entered, so the caller can report a
 /// reassuring zero to the interrupted call instead of its own return value -
 /// which is now the handler's to see when it returns.
-pub(super) fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
+pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     if regs_ptr.is_null() {
         return false;
     }
@@ -293,7 +344,14 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
             }
         }
     }
-    if !build_frame(regs_ptr, sig, &action, &info, ret) {
+    if !build_frame(
+        regs_ptr,
+        sig,
+        &action,
+        &info,
+        ret,
+        restart_verdict(nr, ret, &action),
+    ) {
         // Nothing to run, or nowhere to put the frame - and the default action
         // for every signal this kernel names is to die of it, with the number
         // in the exit code so the parent can tell which one it was.
@@ -755,6 +813,22 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // Attaching is the pair of a `TRACEME` and a `SIGSTOP`: the link is
         // written by the tracer rather than offered by the tracee, and the stop
         // that follows is what makes the new tracer's first `wait` return.
+        //
+        // The permission question comes first, because it is the one Linux asks
+        // before it writes anything: `ptrace_may_access`, whose policy is
+        // `crate::cred`. A live task that is not this caller's thread group
+        // needs a matching uid *and* a dumpable target, unless the caller holds
+        // `CAP_SYS_PTRACE` - which root does, so nothing that attached before
+        // stops attaching. What the check now honours is the process that made
+        // itself non-dumpable with `PR_SET_DUMPABLE(0)`, which is a thing a
+        // program on this machine can finally do. A pid that names no live task
+        // is still `ESRCH`, and the three-way answer keeps the two errnos
+        // apart.
+        match crate::sched::may_inspect(id) {
+            None => return err::ESRCH,
+            Some(false) => return err::EPERM,
+            Some(true) => {}
+        }
         if !crate::sched::set_tracer(id, me) {
             return err::ESRCH;
         }
@@ -1148,6 +1222,13 @@ pub(super) fn handle_process_vm_readv(args: [usize; ARG_COUNT], from_user: bool)
     let Some(root) = crate::sched::space_root_of(id) else {
         return err::ESRCH;
     };
+    // The same question `PTRACE_ATTACH` asks, because it is the same thing:
+    // Linux refuses a read of another process's memory that a ptrace attach
+    // could not get - `EPERM` for a task outside the caller's thread group with
+    // no uid in common, or one that is not dumpable.
+    if crate::sched::may_inspect(id) == Some(false) {
+        return err::EPERM;
+    }
     match transfer_iovs(
         local,
         local_count,
@@ -1182,6 +1263,11 @@ pub(super) fn handle_process_vm_writev(args: [usize; ARG_COUNT], from_user: bool
     let Some(root) = crate::sched::space_root_of(id) else {
         return err::ESRCH;
     };
+    // As in the reading half: the write is gated on the same question, so a
+    // process cannot write into memory it may not read.
+    if crate::sched::may_inspect(id) == Some(false) {
+        return err::EPERM;
+    }
     match transfer_iovs(
         local,
         local_count,
@@ -1526,7 +1612,7 @@ pub(super) fn handle_nanosleep(args: [usize; ARG_COUNT], from_user: bool) -> isi
     if req == 0 {
         return 0;
     }
-    sleep_for_timespec(req, from_user)
+    sleep_for_timespec(req, args[1], from_user)
 }
 
 /// `clock_nanosleep(clk_id, flags, req, rem)`.
@@ -1554,12 +1640,29 @@ pub(super) fn handle_clock_nanosleep(args: [usize; ARG_COUNT], from_user: bool) 
     if req == 0 {
         return 0;
     }
-    sleep_for_timespec(req, from_user)
+    // `clock_nanosleep(clk_id, flags, req, rem)` - the remainder rides in the
+    // fourth argument, one along from `nanosleep`'s.
+    sleep_for_timespec(req, args[3], from_user)
 }
 
 /// Sleep out the `struct timespec` at `req`, with Linux's validation: the
 /// pointer must be readable and `tv_nsec` must stay below a second.
-fn sleep_for_timespec(req: usize, from_user: bool) -> isize {
+///
+/// A catchable signal ends the sleep with `EINTR`, and `rem` - when the caller
+/// left one - is handed the time that was *left*, which is the whole reason the
+/// call takes a second pointer. Measured on Linux: a 5 s `nanosleep` with a
+/// `SIGALRM` at 100 ms answers `-1/EINTR` at 100 ms with `rem` holding about
+/// 4.9 s, and it does so whether or not the disposition has `SA_RESTART` -
+/// `nanosleep` is on `signal(7)`'s never-restarted list, so it is the `rem`
+/// rather than a rewind that makes a retry cheap. Missing it is visible in
+/// musl, whose `sleep()` is `nanosleep(&ts, &ts)` in a loop: without the
+/// remainder, every signal doubles the sleep the caller asked for.
+///
+/// The remaining-time write is validated at the moment it happens, not up
+/// front, which is Linux's order too: a `rem` nobody could write is not an
+/// error until there is something to put in it, and then the failing copy is
+/// what comes back (`EFAULT`).
+fn sleep_for_timespec(req: usize, rem: usize, from_user: bool) -> isize {
     if !buffer_ok(req, 16, false, from_user) {
         return err::EFAULT;
     }
@@ -1580,8 +1683,27 @@ fn sleep_for_timespec(req: usize, from_user: bool) -> isize {
         return 0;
     }
     let ticks = (total_ms * crate::arch::timer::TICK_HZ as u64 / 1000).max(1);
-    crate::sched::sleep_ticks(ticks);
-    0
+    let hz = crate::arch::timer::TICK_HZ as u64;
+    let deadline = crate::arch::timer::ticks().saturating_add(ticks);
+    match crate::sched::block_until_deadline(|| false, deadline) {
+        crate::sched::WaitEnd::Interrupted => {
+            if rem != 0 {
+                if !buffer_ok(rem, 16, true, from_user) {
+                    return err::EFAULT;
+                }
+                let left = deadline.saturating_sub(crate::arch::timer::ticks());
+                let (sec, nsec) = abi::timespec_from_ticks(left, hz);
+                unsafe {
+                    (rem as *mut i64).write_unaligned(sec);
+                    ((rem + 8) as *mut i64).write_unaligned(nsec);
+                }
+            }
+            err::EINTR
+        }
+        // The clock ran out: the condition is never true, so the only other
+        // ending is the deadline itself.
+        _ => 0,
+    }
 }
 
 /// `fork()` — duplicate the calling process.

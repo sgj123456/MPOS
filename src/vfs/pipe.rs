@@ -316,8 +316,14 @@ impl PipeEnd {
     /// unregister. Registration lives outside `block_until` because a drop -
     /// which is the event most likely to end the wait - knows the pipe's
     /// waiters, not the scheduler's sleepers.
+    ///
+    /// The wait is the interruptible one, so a catchable signal aimed at the
+    /// reader ends it with `VfsError::Interrupted` and nothing consumed. That
+    /// is what a shell's own read of a pipe needs: its child's death or its own
+    /// `SIGALRM` has to be able to bring it back to look at its loop again,
+    /// rather than being slept through until the far end writes.
     #[cfg(target_os = "none")]
-    fn wait_readable(&self) {
+    fn wait_readable(&self) -> VfsResult<()> {
         let id = crate::sched::current();
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
@@ -325,7 +331,7 @@ impl PipeEnd {
                 st.waiting_readers.push(id);
             }
         });
-        crate::sched::block_until(|| self.readable_or_ended());
+        let end = crate::sched::block_until_interruptible(|| self.readable_or_ended());
         critical_section::with(|cs| {
             self.state
                 .borrow(cs)
@@ -333,10 +339,14 @@ impl PipeEnd {
                 .waiting_readers
                 .retain(|&w| w != id);
         });
+        match end {
+            crate::sched::WaitEnd::Interrupted => Err(VfsError::Interrupted),
+            _ => Ok(()),
+        }
     }
 
     #[cfg(target_os = "none")]
-    fn wait_writable(&self, need: usize) {
+    fn wait_writable(&self, need: usize) -> VfsResult<()> {
         let id = crate::sched::current();
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
@@ -344,7 +354,7 @@ impl PipeEnd {
                 st.waiting_writers.push(id);
             }
         });
-        crate::sched::block_until(|| self.writable_or_broken(need));
+        let end = crate::sched::block_until_interruptible(|| self.writable_or_broken(need));
         critical_section::with(|cs| {
             self.state
                 .borrow(cs)
@@ -352,15 +362,19 @@ impl PipeEnd {
                 .waiting_writers
                 .retain(|&w| w != id);
         });
+        match end {
+            crate::sched::WaitEnd::Interrupted => Err(VfsError::Interrupted),
+            _ => Ok(()),
+        }
     }
 
     #[cfg(not(target_os = "none"))]
-    fn wait_readable(&self) {
+    fn wait_readable(&self) -> VfsResult<()> {
         panic!("blocking pipe reads need the kernel scheduler; test read_once instead");
     }
 
     #[cfg(not(target_os = "none"))]
-    fn wait_writable(&self, _need: usize) {
+    fn wait_writable(&self, _need: usize) -> VfsResult<()> {
         panic!("blocking pipe writes need the kernel scheduler; test write_once instead");
     }
 
@@ -561,7 +575,10 @@ impl Inode for PipeEnd {
                     if self.nonblocking.load(Ordering::Relaxed) {
                         return Err(VfsError::Again);
                     }
-                    self.wait_readable();
+                    // Everything below the flag is a wait, and this one is a
+                    // wait a catchable signal may end - with nothing consumed,
+                    // which is what `EINTR` promises on this door.
+                    self.wait_readable()?;
                 }
             }
         }
@@ -595,9 +612,20 @@ impl Inode for PipeEnd {
                     // actually accept: a record-sized write wants the whole
                     // record free (it is all-or-nothing), while a longer one
                     // only wants a single byte to make progress in pieces.
+                    //
+                    // A signal may end this wait, and the answer is then the
+                    // bytes that already landed rather than `EINTR`: a partial
+                    // write is a legal answer on this door, and it is the only
+                    // one that cannot duplicate them if the caller retries what
+                    // it was told did not land.
                     let rest = buf.len() - done;
                     let need = if rest <= PIPE_BUF { rest } else { 1 };
-                    self.wait_writable(need);
+                    if let Err(e) = self.wait_writable(need) {
+                        if done > 0 {
+                            return Ok(done);
+                        }
+                        return Err(e);
+                    }
                 }
             }
         }

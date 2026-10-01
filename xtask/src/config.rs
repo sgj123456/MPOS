@@ -20,34 +20,32 @@ use anyhow::{Context, Result};
 ///
 /// There are three of these because there are exactly two questions to answer,
 /// and the third word used to hide that: does the machine have a window, and is
-/// the framebuffer one of the guest's consoles. Every mode puts the serial line
-/// on stdio — the mode that discarded it discarded the kernel log with it, and a
+/// the framebuffer one of the guest's consoles. Every mode keeps the serial
+/// line - `gui` reads it from a log file instead of the launcher's terminal -
+/// because the mode that discarded it discarded the kernel log with it, and a
 /// log nobody can read is not a reason to have a mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
     /// Serial is the whole console, and the only one: `console=ttyS0` on the
     /// guest line, QEMU `-display none` with the serial on stdio.
     Terminal,
-    /// The whole machine: a window with every device behind it, the serial line
-    /// on stdio, and the framebuffer deliberately *not* one of the guest's
-    /// consoles — so the kernel's log never moves onto a screen somebody else is
-    /// driving.
+    /// The whole machine in the window: a window with every device behind it
+    /// and the framebuffer as the guest's *only* console (`console=tty0`), so
+    /// the text tty — boot log, virtual consoles, login prompt and shells —
+    /// all shows there, and no session has to claim the card for the screen
+    /// to say something.
     ///
-    /// The guest line is `terminal`'s, and that is the honest shape of it: what
-    /// makes this a compositor boot is a session claiming the card at runtime
-    /// (`DRM_IOCTL_SET_MASTER`, then `KDSETMODE(KD_GRAPHICS)`, arbitrated in
-    /// `src/vfs/vcmux.rs`), which is not a fact a command line can carry. Nothing
-    /// here launches the compositor — root's `./start-weston.sh` does, once the
-    /// login prompt appears — and `^A 1`..`^A 6` switches away from it anyway,
-    /// because the virtual consoles exist and are drawn the moment the session
-    /// releases the screen.
-    ///
-    /// This is what the mode called `weston` used to be, and it is the same
-    /// window with the kernel console off the framebuffer: a mode word that told
-    /// the guest nothing but which wire carries its log was not a fourth machine,
-    /// it was `terminal` plus a display.
+    /// The guest line names no wire, so the kernel's `wire_bytes` drops serial
+    /// output after the command line is read; the launcher still taps the port,
+    /// into `build/serial.log` rather than stdio, because the UEFI loader's
+    /// lines, the kernel banner that precedes the command-line parse and a
+    /// panic's `force_serial` report reach nowhere else — the host terminal
+    /// goes quiet, but it must not go deaf. A compositor is a runtime guest:
+    /// root's `./start-weston.sh` claims the card when started from a window
+    /// shell, and `^A 1`..`^A 6` (the kernel's own mux, not a QEMU escape)
+    /// switches back to the text console while it holds the keyboard.
     Gui,
-    /// The window plus a best-effort copy out the serial line, so the same
+    /// The window plus a live copy out the serial line, so the same
     /// console shows in the window and the terminal at once: `console=ttyS0
     /// console=tty0`, QEMU `-display {backend}` with the serial on stdio. This
     /// is the default.
@@ -89,25 +87,26 @@ impl RunMode {
     /// meaning: Linux gives the log to every console on the list and treats the
     /// last as the preferred one, so a wire-then-framebuffer list means the window
     /// takes the console over once the framebuffer is up while the wire keeps a
-    /// best-effort copy, and the wire alone stays authoritative and lossless.
+    /// best-effort copy, the wire alone stays authoritative and lossless, and the
+    /// framebuffer alone means the kernel never writes to the serial port at all.
     ///
-    /// Two modes therefore share one list — `terminal` and `gui` — and differ only
-    /// in whether the launcher attached a window to the machine, because the
-    /// framebuffer console and the window are two different questions.
+    /// Three words, three lists: what separates `gui` from `terminal` is not a
+    /// window the guest cannot see but which sink the guest's own console has.
     ///
     /// The serial port's name comes from the rootfs config rather than being
-    /// spelled here: it is the same name the image's getty runs on, and one
-    /// machine has one serial port.
+    /// spelled here: it is the port the launcher taps, and one machine has one
+    /// serial port. (`gui` never reads it — its console is the screen.)
     pub fn cmdline_consoles(self, serial_port: &str) -> String {
         match self {
-            Self::Terminal | Self::Gui => format!("console={serial_port}"),
+            Self::Terminal => format!("console={serial_port}"),
+            Self::Gui => "console=tty0".to_string(),
             Self::Mirror => format!("console={serial_port} console=tty0"),
         }
     }
 
     /// Whether this mode wants a QEMU window at all. Only terminal does not;
-    /// every mode watches the serial line on stdio, so there is nothing left for
-    /// a second such predicate to distinguish.
+    /// where the serial line goes on the host — stdio or a log file — is the
+    /// launcher's own business, not a second predicate.
     pub fn has_window(self) -> bool {
         !matches!(self, Self::Terminal)
     }
@@ -620,11 +619,12 @@ mod tests {
         // bakes the wrong consoles boots the machine in a mode nobody asked for.
         for (text, mode, consoles) in [
             ("terminal", RunMode::Terminal, "console=ttyS0"),
-            // Gui is terminal's list with a window attached: the framebuffer is
-            // not one of this boot's consoles precisely so that a session which
-            // claims the card at runtime finds it free, and the wire keeps the log
-            // losslessly while nothing is drawn over it.
-            ("gui", RunMode::Gui, "console=ttyS0"),
+            // Gui is the framebuffer alone: the text console — log, VTs, login,
+            // shells — lives in the window, and the guest is never told about
+            // the wire, so the kernel's wire_bytes drop it. The launcher still
+            // taps the port into build/serial.log for what cannot reach a
+            // screen: the loader's lines and the pre-cmdline banner.
+            ("gui", RunMode::Gui, "console=tty0"),
             // Mirror is two consoles with the framebuffer preferred, which is
             // what the word has always meant: Linux writes the log to every
             // console on the list and the last is the preferred one, so mirror
@@ -642,23 +642,26 @@ mod tests {
             assert_eq!(mode.name(), text);
         }
         assert_eq!(RunMode::parse("anything-else"), None);
-        // Only terminal drops the window, and no mode drops the serial line any
-        // more — so the guest's list and the launcher's wiring can never disagree
-        // about the wire again: every list names it.
         assert!(!RunMode::Terminal.has_window());
         assert!(RunMode::Gui.has_window() && RunMode::Mirror.has_window());
-        for mode in [RunMode::Terminal, RunMode::Gui, RunMode::Mirror] {
-            assert!(
-                mode.cmdline_consoles("ttyS0").contains("ttyS0"),
-                "{} leaves the wire out of the consoles it names",
-                mode.name()
-            );
-        }
-        // And the two modes that share a list differ in exactly one word: the
-        // framebuffer console, which is the only console question a mode may answer.
+        // Three words, three lists: what a mode tells the guest is its own
+        // answer, so no switch between modes can ride on an unchanged
+        // `mpos.cmdline`. Gui in particular must leave the wire out of the
+        // consoles it names — that omission is the whole of why the host
+        // terminal goes quiet — and a future "let's also name ttyS0" here is
+        // the change this pin is waiting for.
+        let lists: Vec<_> = [RunMode::Terminal, RunMode::Gui, RunMode::Mirror]
+            .iter()
+            .map(|mode| mode.cmdline_consoles("ttyS0"))
+            .collect();
         assert_eq!(
-            RunMode::Gui.cmdline_consoles("ttyS0"),
-            RunMode::Terminal.cmdline_consoles("ttyS0")
+            lists.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "two modes baked the same consoles"
+        );
+        assert!(
+            !lists[1].contains("ttyS0"),
+            "gui names the wire, so its console would go to the terminal again"
         );
     }
 
@@ -830,12 +833,12 @@ mod tests {
 
     #[test]
     fn a_mode_word_that_was_retired_is_an_error_not_a_default() {
-        // `weston` and `compositor` named a mode and now name nothing: the
-        // machine they described is `gui`. What must not happen is the leftover
-        // word in someone's `machine.toml` being *defaulted* — a defaulted load
-        // would bake `console=ttyS0 console=tty0` for a person who asked for a
-        // compositor and never notice, which is the one shape of wrong answer this
-        // file's whole `run_mode` split exists to refuse.
+        // `weston` and `compositor` named a mode and now name nothing. What must
+        // not happen is the leftover word in someone's `machine.toml` being
+        // *defaulted* — a defaulted load would bake
+        // `console=ttyS0 console=tty0` for a person who asked for a compositor
+        // and never notice, which is the one shape of wrong answer this file's
+        // whole `run_mode` split exists to refuse.
         assert_eq!(RunMode::parse("weston"), None);
         assert_eq!(RunMode::parse("compositor"), None);
         for word in ["weston", "compositor"] {

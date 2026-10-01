@@ -94,7 +94,11 @@ impl Inode for EventFd {
             if self.nonblocking.load(Ordering::Relaxed) {
                 return Err(VfsError::Again);
             }
-            self.wait_nonzero();
+            // The wait a signal may end: a `SIGALRM` or a child's death is
+            // what brings an event-loop caller back to look at its own state,
+            // and sleeping through it would leave it parked on a counter
+            // nobody has raised.
+            self.wait_nonzero()?;
         }
     }
 
@@ -135,8 +139,13 @@ impl Inode for EventFd {
 impl EventFd {
     /// Block until the counter is non-zero. Kernel-only: a host build has no
     /// scheduler to block on, and its tests read the ready path.
+    ///
+    /// Interruptible, like every other blocking wait a syscall parks in: a
+    /// catchable signal ends it with `EINTR` and the counter untouched, which
+    /// is the shape `select(2)`'s man page gives an eventfd for exactly this
+    /// reason.
     #[cfg(target_os = "none")]
-    fn wait_nonzero(&self) {
+    fn wait_nonzero(&self) -> VfsResult<()> {
         let me = crate::sched::current();
         critical_section::with(|cs| {
             let mut waiters = self.waiters.borrow(cs).borrow_mut();
@@ -144,14 +153,18 @@ impl EventFd {
                 waiters.push(me);
             }
         });
-        crate::sched::block_until(|| self.value() != 0);
+        let end = crate::sched::block_until_interruptible(|| self.value() != 0);
         critical_section::with(|cs| {
             self.waiters.borrow(cs).borrow_mut().retain(|&id| id != me);
         });
+        match end {
+            crate::sched::WaitEnd::Interrupted => Err(VfsError::Interrupted),
+            _ => Ok(()),
+        }
     }
 
     #[cfg(not(target_os = "none"))]
-    fn wait_nonzero(&self) {
+    fn wait_nonzero(&self) -> VfsResult<()> {
         panic!("blocking on an eventfd needs the kernel scheduler");
     }
 }

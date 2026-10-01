@@ -2666,18 +2666,21 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
     0
 }
 
-/// Record a property write against the connector. Only the two properties it
-/// carries are settable; anything else is the refusal Linux makes of a
-/// property the object does not have.
+/// Record a property write against the connector, by the legacy
+/// `SETPROPERTY` spelling.
+///
+/// It is the object door's own rule - [`set_object_prop`] - rather than a
+/// second list of "the properties this object has": the two doors answer for
+/// one connector, and a property settable through one and refused by the other
+/// is a client that read the property list and still cannot write what it read
+/// (`max bpc` was exactly that, and a compositor setting it in its first commit
+/// lost the whole frame on it). What stays here is only the door's shape: the
+/// locks are its own, and a number that is not one of this object's properties
+/// is still `EINVAL`.
 fn set_connector_prop(prop_id: u32, value: u64) -> isize {
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
-        match prop_id {
-            PROP_CRTC_ID => st.conn_crtc = value as u32,
-            PROP_DPMS => st.dpms = value as u32,
-            _ => return libc_einval(),
-        };
-        0
+        set_object_prop(&mut st, CONNECTOR_ID, prop_id, value)
     })
 }
 
@@ -3045,10 +3048,21 @@ impl Commit {
     fn record(&mut self, obj: u32, prop: u32, value: u64) -> Result<(), isize> {
         // Every object the card has, by the id the commit names it with: the
         // request carries ids and not types, and these four are distinct.
+        //
+        // What is listed is the *settable* half of what `OBJ_GETPROPERTIES`
+        // publishes, and the two have to agree: a property a compositor can
+        // read off an object and cannot set is a refusal it has no way to work
+        // around. `max bpc` is on the list for exactly that reason - it is a
+        // range, weston 16 sets it on every output it enables, and its
+        // one-value range is what makes the write a no-op rather than a lie -
+        // while `EDID`, `non-desktop`, `vrr_capable`, `type` and `IN_FORMATS`
+        // are `PROP_IMMUTABLE` and stay off it, which is Linux's own refusal
+        // for a property a client may only read.
         let known = matches!(
             (obj, prop),
             (CONNECTOR_ID, PROP_CRTC_ID)
                 | (CONNECTOR_ID, PROP_DPMS)
+                | (CONNECTOR_ID, PROP_MAX_BPC)
                 | (CRTC_ID, PROP_ACTIVE)
                 | (CRTC_ID, PROP_MODE_ID)
                 | (PLANE_ID, PROP_PLANE_FB_ID)

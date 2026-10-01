@@ -218,6 +218,10 @@ pub enum ReadWait {
     /// The caller compares it with its own clock and re-asks on every pass,
     /// because an arriving byte moves it.
     UntilTick(u64),
+    /// Take nothing and wait for nothing: `O_NONBLOCK` on a read whose answer
+    /// would have been a wait. The one wait it does *not* replace is
+    /// [`Self::Empty`], which never waited at all.
+    WouldBlock,
 }
 
 /// The editing state machine: input bytes in through [`receive`](Self::receive),
@@ -1168,9 +1172,29 @@ impl LineDiscipline {
     /// `entry` anchors only the `VMIN == 0` clock, and `last_byte` the other;
     /// a caller that has no clock hands 0 for both and gets a wait that can
     /// only end when input arrives, which is the host-visible half of the rule.
-    pub fn read_wait(&self, entry: u64, ticks_per_ds: u64) -> ReadWait {
+    ///
+    /// `nonblocking` is the descriptor's `O_NONBLOCK`, and it is a fourth input
+    /// to the same decision rather than a rule of its own: a read that asked not
+    /// to wait takes what is there and otherwise hears `EAGAIN`. Linux's own
+    /// table, measured on a pty slave (`O_NONBLOCK` set, nothing else done):
+    ///
+    /// | `VMIN`/`VTIME` | queued | answered |
+    /// |---|---|---|
+    /// | `0`/`0` | nothing | 0 bytes - the poll, which never waited |
+    /// | `0`/`0` | 3 bytes | those 3 bytes |
+    /// | `>0`/`0` | nothing | `EAGAIN` |
+    /// | `0`/`>0` | nothing | `EAGAIN` at 0 ms - the clock is not consulted |
+    /// | `>0`/`>0` | nothing | `EAGAIN` |
+    /// | `2`/`5` | 1 byte | that 1 byte, immediately: the minimum is a floor on a *wait*, not on a read that is not waiting |
+    /// | `5`/`0` | 2 bytes | those 2 bytes, for the same reason |
+    /// | canonical | a partial line | `EAGAIN` |
+    /// | canonical | a complete line | the line |
+    pub fn read_wait(&self, entry: u64, ticks_per_ds: u64, nonblocking: bool) -> ReadWait {
         if self.has_ready() {
             return ReadWait::Ready;
+        }
+        if nonblocking {
+            return self.nonblocking_wait();
         }
         // Canonical: a read waits for a line, and nothing else ends the wait.
         if self.tio.lflag & ICANON != 0 {
@@ -1200,6 +1224,26 @@ impl LineDiscipline {
             return ReadWait::UntilInput;
         }
         ReadWait::UntilTick(self.last_byte.saturating_add(span))
+    }
+
+    /// [`Self::read_wait`] for a descriptor that set `O_NONBLOCK`: the two
+    /// answers that are not a wait.
+    ///
+    /// What is already takeable is taken - a minimum is a floor on a wait, and
+    /// this read is not waiting (measured: `VMIN=5/VTIME=0` with two bytes
+    /// queued answered both, immediately). Canonical mode is the one place the
+    /// queue and the answer differ: its partial line lives in the editing
+    /// buffer, not in `out`, so `out` empty there means `EAGAIN` and not "hand
+    /// over half a line". And `VMIN == 0`/`VTIME == 0` keeps its zero-byte
+    /// answer, because that read was never going to wait - it is the poll.
+    fn nonblocking_wait(&self) -> ReadWait {
+        if self.tio.lflag & ICANON == 0 && !self.out.is_empty() {
+            return ReadWait::Ready;
+        }
+        if self.tio.lflag & ICANON == 0 && self.vmin() == 0 && self.vtime() == 0 {
+            return ReadWait::Empty;
+        }
+        ReadWait::WouldBlock
     }
 
     /// Whether a byte arriving must wake a reader that is still not satisfied,
@@ -1320,6 +1364,18 @@ pub struct Tty {
     /// and 25x80 until an emulator says otherwise. A virtual console stores it
     /// too but is answered from its screen instead - see [`Tty::window_size`].
     winsize: Mutex<RefCell<(u16, u16)>>,
+    /// `O_NONBLOCK` on the description that opened this terminal - the bit the
+    /// read consults before it parks. Mirrored from the description the way a
+    /// pipe's and an eventfd's is (`sync_nonblocking`), because the flag lives
+    /// on the open file description rather than on the terminal.
+    ///
+    /// One terminal, one bit, and that is the same approximation the other
+    /// node-level flags make: two descriptions of one pty slave that disagree
+    /// about `O_NONBLOCK` are decided here by whichever set it last, where
+    /// Linux would keep the two apart. What the bit has to get right is the
+    /// common shape - a reader that opened (or `fcntl`ed) its terminal
+    /// nonblocking so its event loop never parks - and that is one description.
+    nonblocking: core::sync::atomic::AtomicBool,
 }
 
 /// `KDSETMODE`/`KDGETMODE`: the console's video mode, Linux's values.
@@ -1349,7 +1405,20 @@ impl Tty {
             dev_id,
             perms: super::devfs::NodePerms::new(0o666, 0, 0),
             winsize: Mutex::new(RefCell::new((25, 80))),
+            nonblocking: core::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Mirror the opening description's `O_NONBLOCK` into the terminal, where
+    /// the read that would park consults it.
+    pub fn set_nonblocking(&self, on: bool) {
+        self.nonblocking
+            .store(on, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the description asked not to wait - see [`Tty::nonblocking`].
+    pub fn is_nonblocking(&self) -> bool {
+        self.nonblocking.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// The window a program is told it has, in `(rows, columns)` - what
@@ -1498,7 +1567,16 @@ impl Tty {
     /// feed into carriage-return-line feed, which is the difference between a
     /// terminal and a printer - see [`Termios::console_default`] for why this
     /// kernel used not to.
-    fn write_out(&self, bytes: &[u8]) {
+    ///
+    /// Answers how many of `bytes` the wire took, which is all of them except
+    /// on the one wire that can fill: a pty's master buffer, where a full
+    /// buffer ends a writer's wait - by `O_NONBLOCK` or by a signal - and the
+    /// honest answer is then the partial count the caller retries from. The
+    /// two errors a full buffer gives with nothing taken (`EAGAIN`, `EINTR`)
+    /// travel out as errors, since a write of zero bytes has no other meaning.
+    fn write_out(&self, bytes: &[u8], wire: Wire) -> VfsResult<usize> {
+        let input = bytes;
+        let input_len = input.len();
         let output = critical_section::with(|cs| *self.output.borrow(cs).borrow());
         let oflag = critical_section::with(|cs| self.ld.borrow(cs).borrow().termios().oflag);
         // The rest of the output flags - `OCRNL`, `ONOCR`, `ONLRET`, `OLCUC`,
@@ -1515,15 +1593,48 @@ impl Tty {
         let bytes: &[u8] = &processed;
         #[cfg(target_os = "none")]
         match output {
-            TtyOutput::Serial => crate::console::write_bytes(bytes),
-            TtyOutput::Pty(number) => crate::vfs::pty::master_input(number, bytes),
-            TtyOutput::Discard => {}
+            TtyOutput::Serial => {
+                crate::console::write_bytes(bytes);
+                Ok(processed.len().min(input_len))
+            }
+            // The master's buffer is the one wire here that can fill: what it
+            // hands back is how much of the *processed* bytes got in, and the
+            // caller is owed a count in its own units.
+            TtyOutput::Pty(number) => match wire {
+                Wire::Task => {
+                    let taken =
+                        crate::vfs::pty::master_input(number, bytes, self.is_nonblocking())?;
+                    if taken == processed.len() {
+                        Ok(input_len)
+                    } else {
+                        // Short by the wire's measure, so the count is re-derived
+                        // in the caller's: whole input bytes only. A boundary
+                        // that fell between an expanded `CR LF` therefore
+                        // re-offers that one input byte, whose carriage return is
+                        // written twice - which renders identically, where the
+                        // alternative (counting the byte) would lose the line
+                        // feed. `PLAN.md` §2.5 records it.
+                        Ok(input_prefix(input, taken))
+                    }
+                }
+                Wire::Interrupt => {
+                    crate::vfs::pty::master_input_interrupt(number, bytes);
+                    Ok(input_len)
+                }
+            },
+            TtyOutput::Discard => Ok(input_len),
         }
         // On the host there is no console to write to, but the pty wire is
         // plain memory - the pair tests drive it exactly as the machine does.
+        // Nothing there can fill, so the context `wire` names has no second
+        // answer to give.
         #[cfg(not(target_os = "none"))]
-        if let TtyOutput::Pty(number) = output {
-            crate::vfs::pty::master_input(number, bytes);
+        {
+            let _ = wire;
+            if let TtyOutput::Pty(number) = output {
+                crate::vfs::pty::master_input(number, bytes, false);
+            }
+            Ok(input_len)
         }
     }
 
@@ -1573,7 +1684,11 @@ impl Tty {
             let foreground = *self.foreground.borrow(cs).borrow();
             (echo, action, waiters, foreground)
         });
-        self.write_out(&echo);
+        // The echo is the discipline's own output, and it runs here - in the
+        // byte's own context, often an interrupt - so there is no wait in it to
+        // interrupt and no partial answer to report: `Wire::Interrupt` is the
+        // push that cannot park.
+        let _ = self.write_out(&echo, Wire::Interrupt);
         #[cfg(target_os = "none")]
         {
             for id in waiters {
@@ -1863,6 +1978,7 @@ impl Tty {
         let entry = crate::arch::timer::ticks();
         // One decisecond, in ticks - the unit `VTIME` is written in.
         let ticks_per_ds = crate::arch::timer::TICK_HZ as u64 / 10;
+        let nonblocking = self.is_nonblocking();
         loop {
             // Re-arm the waiter on every pass, not once. `receive_byte` wakes
             // by taking the WHOLE waiter list, so a reader that loses a line to
@@ -1893,10 +2009,16 @@ impl Tty {
                 } else {
                     None
                 };
-                (ld.read_wait(entry, ticks_per_ds), base)
+                (ld.read_wait(entry, ticks_per_ds, nonblocking), base)
             });
             let deadline = match wait {
                 ReadWait::Empty => return Ok(0),
+                // `O_NONBLOCK` on a read whose answer would have been a wait.
+                // Nothing has been consumed, and `EAGAIN` is what tells a
+                // caller with an event loop to come back - which is the whole
+                // reason it opened the terminal that way instead of parking in
+                // a read that a keystroke may never end.
+                ReadWait::WouldBlock => return Err(VfsError::Again),
                 ReadWait::Ready => {
                     if let Some(n) = self.take_now(buf) {
                         return Ok(n);
@@ -1934,6 +2056,27 @@ impl Tty {
     }
 }
 
+/// How a terminal write reaches its wire, which decides what it may do when the
+/// wire is full.
+///
+/// The one thing that separates the two is whether the caller may *sleep*, and
+/// it is the call site - not a flag read from the CPU - that knows: `IF` is
+/// clear in an interrupt handler and equally clear inside every syscall
+/// (`MSR_FMASK` masks it on `syscall` entry), so asking the CPU answered
+/// "interrupt" for every userland `write(2)` and let it past the pty's buffer
+/// bound entirely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    /// A task's own write: `write(2)`, or the terminal's answer to a cursor
+    /// query. A pty's master buffer is bounded and a full one ends the wait
+    /// with a partial count, `EAGAIN` or `EINTR`.
+    Task,
+    /// The echo of a byte that has just arrived, running in the interrupt that
+    /// carried it (or in the syscall that typed it at a master). It cannot
+    /// park, so it pushes and moves on.
+    Interrupt,
+}
+
 /// `ONLCR`: every line feed goes out as carriage return followed by line feed.
 ///
 /// The carriage return is *inserted*, not appended: it is what puts the cursor
@@ -1950,6 +2093,26 @@ fn newline_expanded(bytes: &[u8]) -> Vec<u8> {
         out.push(byte);
     }
     out
+}
+
+/// How many bytes of an `ONLCR`-expanded buffer the wire's first `written`
+/// bytes came from - the inverse of [`newline_expanded`], for the one caller
+/// that has to answer in the writer's own units: a `write(2)` to a pty whose
+/// master buffer filled part-way.
+///
+/// Whole input bytes only, so a boundary inside an expanded pair answers the
+/// byte *before* it: the caller retries that byte, its carriage return lands
+/// twice, and the line renders exactly as it would have. Counting it instead
+/// would leave the line feed in the writer's hands to lose.
+fn input_prefix(input: &[u8], written: usize) -> usize {
+    let mut out = 0;
+    for (i, &byte) in input.iter().enumerate() {
+        out += if byte == LF { 2 } else { 1 };
+        if out > written {
+            return i;
+        }
+    }
+    input.len()
 }
 
 /// The machine's own terminal: the console - `ttyS0` on COM1, where every
@@ -2274,17 +2437,25 @@ impl Inode for Tty {
         // What the discipline answered itself does not travel on: the
         // question would only be asked twice, once of a real terminal
         // whose reply has nowhere useful to go.
-        match forwarded {
-            Some(bytes) => self.write_out(&bytes),
-            None => self.write_out(buf),
-        }
+        let written = match forwarded {
+            // The discipline answered the query itself, so every byte the
+            // caller wrote was dealt with and what travelled on is the answer.
+            Some(bytes) => {
+                self.write_out(&bytes, Wire::Task)?;
+                buf.len()
+            }
+            // The caller's own bytes, and the wire's count back: a pty whose
+            // master buffer filled reports the part it took, and one that took
+            // nothing at all reports the errno that ended the wait.
+            None => self.write_out(buf, Wire::Task)?,
+        };
         #[cfg(target_os = "none")]
         for id in waiters {
             crate::sched::wake(id);
         }
         #[cfg(not(target_os = "none"))]
         drop(waiters);
-        Ok(buf.len())
+        Ok(written)
     }
 }
 
@@ -2293,7 +2464,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{Action, Attached, CR, LineDiscipline, ReadWait, Tty, TtyOutput};
+    use super::{Action, Attached, CR, LineDiscipline, ReadWait, Tty, TtyOutput, input_prefix};
     use crate::vfs::termios::{ECHO, ECHOCTL, ICANON, ICRNL, ISIG, VEOF, VERASE, VMIN, VTIME};
 
     /// The kernel is the terminal, at the size it reports: what every
@@ -2522,10 +2693,10 @@ mod tests {
         // to return 0 in 0 ms, and to return 0 even when bytes land a moment
         // later, because it is not waiting for them.
         let mut ld = raw(0, 0);
-        assert_eq!(ld.read_wait(0, DS), ReadWait::Empty);
+        assert_eq!(ld.read_wait(0, DS, false), ReadWait::Empty);
         ld.receive(b'x');
         assert_eq!(
-            ld.read_wait(0, DS),
+            ld.read_wait(0, DS, false),
             ReadWait::Ready,
             "with a byte queued, the same read takes it"
         );
@@ -2539,10 +2710,10 @@ mod tests {
         // Measured: 0 bytes after 102 ms at `VTIME=1`, and the 1 byte that
         // landed at 100 ms returned at 100 ms rather than at 300.
         let mut ld = raw(0, 1);
-        assert_eq!(ld.read_wait(1_000, DS), ReadWait::UntilTick(1_025));
+        assert_eq!(ld.read_wait(1_000, DS, false), ReadWait::UntilTick(1_025));
         ld.receive(b'\x1b');
         assert!(ld.has_ready(), "VMIN == 0 makes any byte a full answer");
-        assert_eq!(ld.read_wait(1_000, DS), ReadWait::Ready);
+        assert_eq!(ld.read_wait(1_000, DS, false), ReadWait::Ready);
     }
 
     #[test]
@@ -2553,7 +2724,7 @@ mod tests {
         // the byte that landed at 900 ms at 1300 ms, one VTIME after that one.
         let mut ld = raw(2, 5);
         assert_eq!(
-            ld.read_wait(0, DS),
+            ld.read_wait(0, DS, false),
             ReadWait::UntilInput,
             "with an empty queue there is no clock running yet, and a read must \
              not answer 0 here: that answer means end of input on this door"
@@ -2561,14 +2732,14 @@ mod tests {
         ld.receive(b'1');
         ld.note_input_tick(1_000);
         assert_eq!(
-            ld.read_wait(0, DS),
+            ld.read_wait(0, DS, false),
             ReadWait::UntilTick(1_125),
             "anchored on the byte, not on the read's entry"
         );
         ld.receive(b'2');
         ld.note_input_tick(1_300);
         assert_eq!(
-            ld.read_wait(0, DS),
+            ld.read_wait(0, DS, false),
             ReadWait::Ready,
             "VMIN is satisfied, so the read takes everything queued"
         );
@@ -2578,7 +2749,7 @@ mod tests {
         for &b in b"abcde" {
             ld.receive(b);
         }
-        assert_eq!(ld.read_wait(0, DS), ReadWait::Ready);
+        assert_eq!(ld.read_wait(0, DS, false), ReadWait::Ready);
         assert_eq!(ld.take(64), Some(b"abcde".to_vec()));
     }
 
@@ -2592,14 +2763,14 @@ mod tests {
         for &b in b"12" {
             ld.receive(b);
         }
-        assert_eq!(ld.read_wait(0, DS), ReadWait::UntilInput);
+        assert_eq!(ld.read_wait(0, DS, false), ReadWait::UntilInput);
         let mut ld = raw(5, 5);
-        assert_eq!(ld.read_wait(400, DS), ReadWait::UntilInput);
+        assert_eq!(ld.read_wait(400, DS, false), ReadWait::UntilInput);
         for &b in b"12" {
             ld.receive(b);
         }
         ld.note_input_tick(900);
-        assert_eq!(ld.read_wait(400, DS), ReadWait::UntilTick(1_025));
+        assert_eq!(ld.read_wait(400, DS, false), ReadWait::UntilTick(1_025));
     }
 
     #[test]
@@ -2616,9 +2787,88 @@ mod tests {
         for &b in b"abc" {
             ld.receive(b);
         }
-        assert_eq!(ld.read_wait(0, DS), ReadWait::UntilInput);
+        assert_eq!(ld.read_wait(0, DS, false), ReadWait::UntilInput);
         ld.receive(CR);
-        assert_eq!(ld.read_wait(0, DS), ReadWait::Ready);
+        assert_eq!(ld.read_wait(0, DS, false), ReadWait::Ready);
+    }
+
+    #[test]
+    fn a_nonblocking_read_takes_what_is_there_and_otherwise_answers_eagain() {
+        // Every line here is a measurement on Linux (2026-10-01) against a pty
+        // slave with `O_NONBLOCK` set, and the two that would be easy to get
+        // wrong by writing the rule from the blocking table are the `VMIN > 0`
+        // ones: a nonblocking read hands back what is queued *below* the
+        // minimum, because the minimum is a floor on a wait and this read is
+        // not waiting.
+        assert_eq!(
+            raw(0, 0).read_wait(0, DS, true),
+            ReadWait::Empty,
+            "VMIN=0/VTIME=0 never waited, so it keeps its 0-byte answer"
+        );
+        assert_eq!(raw(1, 0).read_wait(0, DS, true), ReadWait::WouldBlock);
+        assert_eq!(
+            raw(0, 5).read_wait(0, DS, true),
+            ReadWait::WouldBlock,
+            "and the clock is not consulted: EAGAIN at 0 ms, not in 500"
+        );
+        assert_eq!(raw(1, 2).read_wait(0, DS, true), ReadWait::WouldBlock);
+
+        let mut below_min = raw(2, 5);
+        below_min.receive(b'x');
+        below_min.note_input_tick(1_000);
+        assert_eq!(
+            below_min.read_wait(0, DS, true),
+            ReadWait::Ready,
+            "one byte under VMIN=2 is handed over, not waited for"
+        );
+        let mut floorless = raw(5, 0);
+        for &b in b"12" {
+            floorless.receive(b);
+        }
+        assert_eq!(floorless.read_wait(0, DS, true), ReadWait::Ready);
+
+        // Canonical mode consults neither `VMIN` nor `VTIME` on Linux, and
+        // `O_NONBLOCK` does not change that: what is ready is a *line*, and a
+        // half-typed one is not - even with the pair set to 0/0, where a
+        // non-canonical read would answer the zero-byte poll.
+        let mut canonical = LineDiscipline::new();
+        for &b in b"abc" {
+            canonical.receive(b);
+        }
+        assert_eq!(
+            canonical.read_wait(0, DS, true),
+            ReadWait::WouldBlock,
+            "a partial line is not a line"
+        );
+        canonical.receive(CR);
+        assert_eq!(canonical.read_wait(0, DS, true), ReadWait::Ready);
+
+        // The counterfactual, so this test cannot pass by the flag being
+        // ignored: the same states without `O_NONBLOCK` decide to wait.
+        assert_eq!(raw(1, 0).read_wait(0, DS, false), ReadWait::UntilInput);
+        assert_eq!(raw(0, 5).read_wait(0, DS, false), ReadWait::UntilTick(125));
+        let mut below_min = raw(2, 5);
+        below_min.receive(b'x');
+        below_min.note_input_tick(1_000);
+        assert_eq!(
+            below_min.read_wait(0, DS, false),
+            ReadWait::UntilTick(1_125),
+            "the same byte under the same settings is waited for, one VTIME"
+        );
+    }
+
+    #[test]
+    fn a_partial_pty_write_is_counted_in_the_writers_own_bytes() {
+        // "hi\n" leaves as "hi\r\n": four bytes on the wire, three from the
+        // caller - and a stop inside the pair answers the byte before it, so
+        // the retry re-offers the line feed rather than dropping it.
+        assert_eq!(input_prefix(b"hi\n", 4), 3);
+        assert_eq!(input_prefix(b"hi\n", 3), 2);
+        assert_eq!(input_prefix(b"hi\n", 2), 2);
+        assert_eq!(input_prefix(b"abc", 2), 2);
+        assert_eq!(input_prefix(b"abc", 0), 0);
+        assert_eq!(input_prefix(b"\n\n", 2), 1);
+        assert_eq!(input_prefix(b"", 0), 0);
     }
 
     #[test]
@@ -2627,18 +2877,18 @@ mod tests {
         // reader at the end of its input must be told so, whatever `VMIN` says.
         let mut ld = raw(3, 5);
         ld.answer(b"\x1b[41;5R");
-        assert_eq!(ld.read_wait(0, DS), ReadWait::Ready);
+        assert_eq!(ld.read_wait(0, DS, false), ReadWait::Ready);
         let mut ld = LineDiscipline::new();
         let eof = ld.termios().cc[VEOF];
         assert_eq!(ld.receive(eof), Action::None);
         assert_eq!(
-            ld.read_wait(0, DS),
+            ld.read_wait(0, DS, false),
             ReadWait::Ready,
             "the end of input is an answer, and the only one that repeats as 0"
         );
         assert_eq!(ld.take(8), Some(Vec::new()), "reported once");
         assert_eq!(
-            ld.read_wait(0, DS),
+            ld.read_wait(0, DS, false),
             ReadWait::UntilInput,
             "and then the next read blocks again, exactly as a fresh one does"
         );

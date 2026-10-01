@@ -169,10 +169,9 @@ mod tests {
         assert!(list.has_serial() && !list.has_vt() && list.prefers_serial());
         assert!(unknown.is_empty());
 
-        // The framebuffer console alone. No run mode bakes this list any more
-        // (`gui` is the wire with a window, and `mirror` is the two in order), but
-        // an `mpos.cmdline` edited by hand can still say it and the parser's job is
-        // to read what the word means, not what a mode happens to write.
+        // The framebuffer console alone - what the `gui` run mode bakes, so the
+        // text console lives in the window and the kernel writes nothing to the
+        // wire after the command line is read. `mirror` is the two in order.
         let (list, unknown) = parse("console=tty0");
         assert!(!list.has_serial() && list.has_vt() && !list.prefers_serial());
         assert!(unknown.is_empty());

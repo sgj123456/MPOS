@@ -335,8 +335,9 @@ pub fn handle_setfsgid(_args: [usize; ARG_COUNT]) -> isize {
 /// shape: version 1 is the 32-bit one, a single 12-byte record; versions
 /// 2 and 3 are the 64-bit ones, two records. Anything else is EINVAL, the
 /// refusal a kernel older than the caller's headers makes. The state
-/// reported is root's: every capability effective and permitted, none
-/// inheritable - one user, and it is allowed everything.
+/// reported is the process's own, out of `crate::cred`: a fresh process
+/// holds every capability effective and permitted with nothing inheritable,
+/// and a `capset`, a full uid drop or a `PR_CAPBSET_DROP` all move it.
 pub fn handle_capget(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const CAP_V1: u32 = 0x1998_0330;
     const CAP_V3: u32 = 0x2008_0522;
@@ -374,24 +375,31 @@ pub fn handle_capget(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if !buffer_ok(data, record_bytes, true, from_user) {
         return err::EFAULT;
     }
+    let creds = crate::sched::current_credentials();
     unsafe {
         let at = |offset: usize| (data + offset) as *mut u32;
-        // Every effective and permitted bit set, none inheritable: the
-        // state of a user that is allowed everything. Version 1 spells it
-        // in one word per field; the 64-bit versions in two.
+        // The caller's *stored* sets, split into the 32-bit words the ABI
+        // spells them in: version 1 has one word per field, the 64-bit
+        // versions two. A process on this image starts holding everything, so
+        // the usual answer is still all-ones - but it is now state that
+        // `capset` can lower, that a full uid drop clears, and that a dropped
+        // bounding capability is absent from.
         for i in 0..record_bytes / 12 {
-            at(i * 12).write_unaligned(u32::MAX); // effective
-            at(i * 12 + 4).write_unaligned(u32::MAX); // permitted
-            at(i * 12 + 8).write_unaligned(0); // inheritable
+            let shift = i * 32;
+            at(i * 12).write_unaligned((creds.effective >> shift) as u32); // effective
+            at(i * 12 + 4).write_unaligned((creds.permitted >> shift) as u32); // permitted
+            at(i * 12 + 8).write_unaligned((creds.inheritable >> shift) as u32); // inheritable
         }
     }
     0
 }
 
-/// `capset(header, data)` — set the capability state. One user, allowed
-/// everything already: the header is validated (a version the kernel does
-/// not know is EINVAL, a pid that is not a live task ESRCH), the data
-/// read, and the state reported back is the one that was.
+/// `capset(header, data)` — set the capability state. The header is
+/// validated (a version the kernel does not know is EINVAL, a pid that is
+/// not a live task EPERM), the data read, and the sets stored - which is
+/// what makes `capget` a round-trip rather than a constant. A caller that
+/// does not hold `CAP_SETPCAP` is held to Linux's subset rules and refused
+/// `EPERM`; one that does may set anything, exactly as `cap_capset` does.
 pub fn handle_capset(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const CAP_V1: u32 = 0x1998_0330;
     const CAP_V2: u32 = 0x2007_1026;
@@ -417,7 +425,27 @@ pub fn handle_capset(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if data == 0 || !buffer_ok(data, record_bytes, false, from_user) {
         return err::EFAULT;
     }
-    0
+    let mut effective = 0u64;
+    let mut permitted = 0u64;
+    let mut inheritable = 0u64;
+    unsafe {
+        let at = |offset: usize| (data + offset) as *const u32;
+        for i in 0..record_bytes / 12 {
+            let shift = i * 32;
+            effective |= (at(i * 12).read_unaligned() as u64) << shift;
+            permitted |= (at(i * 12 + 4).read_unaligned() as u64) << shift;
+            inheritable |= (at(i * 12 + 8).read_unaligned() as u64) << shift;
+        }
+    }
+    // The sets are the process's real ones now, so this call is what the
+    // stored state becomes - and what `capget`, an `execve` and a uid change
+    // will read afterwards. `crate::cred::Credentials::capset` holds the
+    // rules, including the one that matters here: Linux asks `CAP_SETPCAP`
+    // first and accepts anything from a caller that holds it.
+    match crate::sched::with_current_credentials(|c| c.capset(effective, permitted, inheritable)) {
+        Ok(()) => 0,
+        Err(()) => err::EPERM,
+    }
 }
 
 // ---------------------------------------------------------------------------

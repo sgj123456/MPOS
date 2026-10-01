@@ -418,6 +418,10 @@ name = "t-rt-sigprocmask"
 path = "src/bin/syscall/t-rt-sigprocmask.rs"
 
 [[bin]]
+name = "t-sa-restart"
+path = "src/bin/syscall/t-sa-restart.rs"
+
+[[bin]]
 name = "t-sched-getaffinity"
 path = "src/bin/syscall/t-sched-getaffinity.rs"
 
@@ -454,6 +458,10 @@ name = "t-statfs"
 path = "src/bin/syscall/t-statfs.rs"
 
 [[bin]]
+name = "t-stat-consistency"
+path = "src/bin/syscall/t-stat-consistency.rs"
+
+[[bin]]
 name = "t-statx"
 path = "src/bin/syscall/t-statx.rs"
 
@@ -480,6 +488,10 @@ path = "src/bin/syscall/t-truncate.rs"
 [[bin]]
 name = "t-tty-eintr"
 path = "src/bin/syscall/t-tty-eintr.rs"
+
+[[bin]]
+name = "t-tty-nonblock"
+path = "src/bin/syscall/t-tty-nonblock.rs"
 
 [[bin]]
 name = "t-tty-query"
@@ -532,6 +544,10 @@ path = "src/bin/syscall/t-waitid.rs"
 [[bin]]
 name = "t-write"
 path = "src/bin/syscall/t-write.rs"
+
+[[bin]]
+name = "t-wait-eintr"
+path = "src/bin/syscall/t-wait-eintr.rs"
 
 [[bin]]
 name = "t-writev"

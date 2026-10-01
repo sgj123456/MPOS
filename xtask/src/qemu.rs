@@ -31,8 +31,8 @@ pub enum Boot {
 
 /// Where the guest's serial line and framebuffer go.
 pub enum Console {
-    /// An interactive `run`, laid out per [`RunMode`]: which of the window
-    /// and the serial terminal actually show the console.
+    /// An interactive `run`, laid out per [`RunMode`]: which of the window, the
+    /// serial terminal and the serial log file actually shows the console.
     Run(RunMode),
     /// A file, which is what a test run reads its verdict out of. Always
     /// headless: no window, the whole console on the wire to the log.
@@ -62,9 +62,11 @@ fn mode_marker_path(build_dir: &Path) -> PathBuf {
 /// image has to name the framebuffer console too, so the two are different
 /// machines and the caller gets to decide what to do about it, rather than being
 /// told a mode the image does not carry. A retired word reads the same way, and
-/// costs the same one boot-file refresh: the line it rewrote is unchanged for the
-/// mode that absorbed it (`weston`'s `console=ttyS0` *is* `gui`'s), so the refresh
-/// only renames the marker.
+/// costs the same one boot-file refresh - which now genuinely rewrites
+/// `mpos.cmdline`: `weston` baked `console=ttyS0`, the line that later `gui`
+/// absorbed and that today's `gui` (`console=tty0`) replaces, so the refresh
+/// moves the guest's console onto the screen rather than only renaming the
+/// marker.
 pub fn baked_mode(build_dir: &Path) -> Option<RunMode> {
     fs::read_to_string(mode_marker_path(build_dir))
         .ok()
@@ -286,17 +288,34 @@ pub fn machine_args(
                 "none".to_string()
             };
             args.extend(["-display".into(), display]);
-            // The wire is on stdio in every mode. It used to be dropped for the
-            // one mode whose guest console list did not name it either, which made
-            // the two halves agree by losing the log; with the modes collapsed onto
-            // the consoles they actually name, there is no mode left that has a
-            // serial line it does not want to show.
-            args.extend([
-                "-chardev".into(),
-                "stdio,id=stdio0,mux=off,signal=off".into(),
-                "-serial".into(),
-                "chardev:stdio0".into(),
-            ]);
+            if mode == RunMode::Gui {
+                // The window is the console here, so the launcher's terminal
+                // goes quiet: the wire is read from a file, not stdio. The
+                // guest's own list omits ttyS0 and the kernel never writes to
+                // the port — but the UEFI loader prints to COM1 unconditionally,
+                // the kernel's banner precedes the command-line parse, and a
+                // panic's `force_serial` report reaches no screen, so the port
+                // stays tapped. Tapping it into a file keeps the witness while
+                // the terminal shows nothing; discarding it was the old `gui`,
+                // and the modes collapsed away from that precisely because a
+                // mode that dropped the wire dropped the kernel log with it.
+                //
+                // The log lives beside the share, not inside it: `share_dir`
+                // is exported over 9p, and a host-side transcript has no
+                // business appearing in the guest's `/mnt/hostshare`.
+                let log = share_dir
+                    .parent()
+                    .expect("the share lives under the build directory")
+                    .join("serial.log");
+                args.extend(["-serial".into(), format!("file:{}", log.display())]);
+            } else {
+                args.extend([
+                    "-chardev".into(),
+                    "stdio,id=stdio0,mux=off,signal=off".into(),
+                    "-serial".into(),
+                    "chardev:stdio0".into(),
+                ]);
+            }
         }
         Console::File(log) => args.extend([
             "-display".into(),
@@ -604,28 +623,21 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_the_only_wiring_a_mode_changes() {
-        // The collapse of four modes to three says exactly this: the serial line
-        // is on stdio in every mode, and `-display` is the only switch. What a mode
-        // actually decides beyond that is the guest's `console=` list
-        // (`config.rs`), which is a file inside the image and not a QEMU argument.
-        //
-        // `gui` and `mirror` therefore wire identically on purpose, and pinning
-        // that is the point: were they to differ here, the fourth mode word would
-        // have been carrying a real difference after all.
+    fn a_mode_switches_the_window_and_where_the_wire_is_read() {
+        // Two facts separate the three modes on the host side: whether there is
+        // a window, and whether the serial line is read off stdio or off a log
+        // file. `terminal` and `mirror` differ by exactly one word - the window -
+        // and pinning that equality here is what keeps a mode word from quietly
+        // acquiring a third wiring. `gui` shares mirror's window and moves the
+        // wire off the terminal, because in that mode the window *is* the
+        // console; everything else - every device - stays attached in all three.
         let cfg = config("1024", 1, &[]);
-        for mode in [RunMode::Gui, RunMode::Mirror] {
+        for mode in [RunMode::Terminal, RunMode::Mirror] {
             let args = run_args(&cfg, mode);
-            assert_eq!(
-                after(&args, "-display").as_deref(),
-                Some("sdl"),
-                "{} wants a window",
-                mode.name()
-            );
             assert_eq!(
                 after(&args, "-serial").as_deref(),
                 Some("chardev:stdio0"),
-                "{} watches the wire",
+                "{} should watch the wire on the terminal",
                 mode.name()
             );
             assert!(
@@ -635,18 +647,10 @@ mod tests {
             );
         }
 
-        // terminal: no window at all - the console is the serial line, on stdio.
         let terminal = run_args(&cfg, RunMode::Terminal);
         assert_eq!(after(&terminal, "-display").as_deref(), Some("none"));
-        assert_eq!(
-            after(&terminal, "-serial").as_deref(),
-            Some("chardev:stdio0")
-        );
-
-        // ...and that one word is the whole of what separates it from a windowed
-        // boot. Every device is attached in all three modes; only the guest's
-        // `console=` list, which lives in the image, says anything else.
-        let gui = run_args(&cfg, RunMode::Gui);
+        let mirror = run_args(&cfg, RunMode::Mirror);
+        assert_eq!(after(&mirror, "-display").as_deref(), Some("sdl"));
         let mut only_the_window_differs = terminal;
         let at = only_the_window_differs
             .iter()
@@ -655,8 +659,29 @@ mod tests {
             + 1;
         only_the_window_differs[at] = "sdl".to_string();
         assert_eq!(
-            only_the_window_differs, gui,
+            only_the_window_differs, mirror,
             "a mode switched something in QEMU besides the window"
+        );
+
+        // gui: the window shows the console, and the launcher's terminal does
+        // not - the wire rides a file under the build directory instead, so the
+        // loader's lines, the pre-cmdline banner and a panic report keep a
+        // witness while the terminal stays quiet.
+        let gui = run_args(&cfg, RunMode::Gui);
+        assert_eq!(after(&gui, "-display").as_deref(), Some("sdl"));
+        assert_eq!(
+            after(&gui, "-serial").as_deref(),
+            Some("file:/build/serial.log"),
+            "gui should tap the wire into the build directory, beside the share \
+             and not inside it"
+        );
+        assert!(
+            !gui.iter().any(|a| a.contains("stdio")),
+            "gui puts the wire back on the terminal: {gui:?}"
+        );
+        assert!(
+            !gui.iter().any(|a| a.contains("/dev/null")),
+            "gui throws the serial line away again",
         );
     }
 }

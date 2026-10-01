@@ -722,6 +722,15 @@ pub struct Mm {
     /// above; `/proc/<pid>/comm` and `PR_GET_NAME` both report it, which is the
     /// whole reason `PR_SET_NAME` is honest rather than accepted-and-dropped.
     comm_name: [core::sync::atomic::AtomicU8; 16],
+    /// The group's credentials: the four capability sets, the dumpable flag
+    /// and `KEEPCAPS`. On the group rather than the task because every consumer
+    /// here - `capget`/`capset`, the `prctl` options, the `execve` derivation
+    /// and `ptrace_may_access` - is about the process, and this kernel's
+    /// threads are one process; Linux keeps them per-thread and its libc keeps
+    /// the threads in step, so a group-wide copy is the same state without the
+    /// bookkeeping. The policy itself is [`crate::cred`], which is pure and
+    /// host-tested; this is only where it is stored.
+    credentials: Mutex<RefCell<crate::cred::Credentials>>,
     /// CPU time the group has spent with the core executing *its* tasks, in
     /// internal clock ticks (the 250 Hz tick), split user / system by the ring
     /// the timer interrupt took the core out of. On the group, not the task,
@@ -772,6 +781,7 @@ impl Mm {
             membarrier: core::sync::atomic::AtomicUsize::new(0),
             robust_head: core::sync::atomic::AtomicUsize::new(0),
             comm_name: [const { core::sync::atomic::AtomicU8::new(0) }; 16],
+            credentials: Mutex::new(RefCell::new(crate::cred::Credentials::initial())),
             cpu_utime: core::sync::atomic::AtomicU64::new(0),
             cpu_stime: core::sync::atomic::AtomicU64::new(0),
             cpu_cutime: core::sync::atomic::AtomicU64::new(0),
@@ -903,6 +913,23 @@ impl Mm {
             };
             self.comm_name[i].store(byte, core::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// The group's credentials, as a snapshot the caller can hold.
+    fn credentials(&self) -> crate::cred::Credentials {
+        critical_section::with(|cs| *self.credentials.borrow(cs).borrow())
+    }
+
+    /// Replace the group's credential state. `capget`/`capset`, the `prctl`
+    /// options and the identity rule all funnel through here.
+    fn set_credentials(&self, creds: crate::cred::Credentials) {
+        critical_section::with(|cs| *self.credentials.borrow(cs).borrow_mut() = creds);
+    }
+
+    /// Change one field of the group's credentials in place, so a caller that
+    /// only moves a bit still gets the table's lock for the read-modify-write.
+    fn with_credentials<R>(&self, f: impl FnOnce(&mut crate::cred::Credentials) -> R) -> R {
+        critical_section::with(|cs| f(&mut self.credentials.borrow(cs).borrow_mut()))
     }
 
     /// Add one clock tick of CPU time to the group, split by the ring the tick
@@ -3188,6 +3215,20 @@ pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
     }
 }
 
+/// [`block_until_deadline`] with no clock: the wait a syscall can be ended by
+/// a signal, which is Linux's `ERESTARTSYS` shape.
+///
+/// The named spelling exists because that is what a syscall means by "block
+/// until this is ready": the condition, or a catchable signal - and never a
+/// clock. Writing it as `block_until_deadline(cond, u64::MAX)` at every one of
+/// those call sites says the same thing in more words and hides which waits
+/// are interruptible from the reader looking for them. The signal is *not*
+/// consumed here: the syscall gate delivers it on the way out, which is the
+/// only place a handler's frame can be built.
+pub fn block_until_interruptible(cond: impl Fn() -> bool) -> WaitEnd {
+    block_until_deadline(cond, u64::MAX)
+}
+
 /// Whether the running task has a signal that would interrupt a blocking
 /// wait: pending, unblocked, and not discarded. The table-borrowing shape of
 /// [`has_deliverable_signal`], for a check inside `schedule`, where the table
@@ -3516,11 +3557,83 @@ pub fn current_identity() -> Identity {
     with_table(|t| t.task(t.current).identity.clone())
 }
 
+/// The six ids of an [`Identity`], as [`crate::cred`] compares them.
+fn ids_of(identity: &Identity) -> crate::cred::Ids {
+    crate::cred::Ids {
+        ruid: identity.ruid,
+        euid: identity.euid,
+        suid: identity.suid,
+        rgid: identity.rgid,
+        egid: identity.egid,
+        sgid: identity.sgid,
+    }
+}
+
+/// The running process's credentials, as a snapshot.
+pub fn current_credentials() -> crate::cred::Credentials {
+    with_table(|t| t.task(t.current).mm.credentials())
+}
+
+/// Change one field of the running process's credentials in place. The
+/// read-modify-write is the table lock's, so two of these cannot interleave.
+pub fn with_current_credentials<R>(f: impl FnOnce(&mut crate::cred::Credentials) -> R) -> R {
+    with_table(|t| t.task(t.current).mm.with_credentials(f))
+}
+
+/// Another task's credentials, or `None` when no such task is live.
+pub fn credentials_of(id: TaskId) -> Option<crate::cred::Credentials> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0).and_then(Option::as_ref)?;
+        (!task.exited).then(|| task.mm.credentials())
+    })
+}
+
+/// May the running task inspect `target` - the question `PTRACE_ATTACH` and
+/// `process_vm_readv`/`writev` both ask? The policy is
+/// [`crate::cred::ptrace_may_access`]; this gathers the two sides of it.
+///
+/// Three answers rather than two, because the callers owe different errnos:
+/// `None` when no such task is live (`ESRCH`), `Some(false)` when it is live
+/// and refused (`EPERM`), `Some(true)` when it may be inspected. A task always
+/// passes for its own thread group, so a thread reading its own memory through
+/// `process_vm_*` is unaffected.
+pub fn may_inspect(target: TaskId) -> Option<bool> {
+    with_table(|t| {
+        let me = t.current;
+        let them = t.tasks.get(target.0).and_then(Option::as_ref)?;
+        if them.exited {
+            return None;
+        }
+        let same_group = t.task(me).tgid == them.tgid;
+        Some(crate::cred::ptrace_may_access(
+            ids_of(&t.task(me).identity),
+            &t.task(me).mm.credentials(),
+            ids_of(&them.identity),
+            &them.mm.credentials(),
+            same_group,
+        ))
+    })
+}
+
 /// Store the running task's identity. The caller has validated the change;
 /// this is the table's half of the bargain.
+///
+/// It is also where the credential rules hang, because every path that moves a
+/// uid or gid - `setuid`/`setresuid`/`setreuid` and their group spellings -
+/// lands here and nowhere else. A `setgroups` also lands here, with the same
+/// six ids, which is why the rule asks whether any of them actually moved
+/// before touching a capability: Linux does not clear a capability because a
+/// process re-declared its supplementary groups.
 #[cfg(target_os = "none")]
 pub fn set_current_identity(identity: Identity) {
-    with_table(|t| t.task_mut(t.current).identity = identity);
+    with_table(|t| {
+        let id = t.current;
+        let old = t.task(id).identity.clone();
+        let mm = Arc::clone(&t.task(id).mm);
+        let (old_ids, new_ids) = (ids_of(&old), ids_of(&identity));
+        t.task_mut(id).identity = identity;
+        mm.with_credentials(|c| c.on_identity_change(old_ids, new_ids));
+    });
 }
 
 /// The running task's file-creation mask - what `umask(2)` reports, and what
@@ -7239,6 +7352,10 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
                 // either says the same thing.
                 let mm = Mm::with_eager(TaskId(slot), child_root, child_frames, parent_eager);
                 mm.set_vmas(parent_vmas);
+                // The credentials come along, as Linux's `copy_creds` shares
+                // them: a process that had dropped a bounding capability or
+                // become non-dumpable must not hand its child the full set.
+                mm.set_credentials(t.task(parent_id).mm.credentials());
                 mm
             },
             released: false,
@@ -7427,7 +7544,20 @@ pub fn exec_replace(
         // with threads running is a case Linux handles by ending them; this
         // kernel does not yet, and the threads that were there keep the old
         // group until they exit.
-        task.mm = Mm::with_eager(id, new_root, loaded.frames, loaded.ranges);
+        //
+        // The credentials cross the boundary with the process, and the exec
+        // itself re-derives them: an `euid` of 0 regains the bounding set's
+        // capabilities (measured - a root process that had lowered its
+        // permitted set gets it back), which is what makes
+        // `PR_CAPBSET_DROP` a promise that survives an `exec`. The dumpable
+        // flag is deliberately *not* reset here: Linux's `setup_new_exec`
+        // only moves it for a setuid image, and this kernel reads no file
+        // capabilities or setuid bits at exec.
+        let mut carried = task.mm.credentials();
+        carried.on_exec(task.identity.euid);
+        let next_mm = Mm::with_eager(id, new_root, loaded.frames, loaded.ranges);
+        next_mm.set_credentials(carried);
+        task.mm = next_mm;
         task.brk_base = loaded.brk;
         task.brk_pages = 0;
         task.mmap_cursor = layout.mmap_top;

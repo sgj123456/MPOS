@@ -1593,6 +1593,12 @@ pub fn capget(header: &mut CapHeader, data: *mut u8) -> isize {
     sys2(nr::CAPGET, header as *mut CapHeader as usize, data as usize)
 }
 
+/// `capset(header, data)`: store the capability state, from up to 24 bytes of
+/// `__user_cap_data_struct` records.
+pub fn capset(header: &mut CapHeader, data: *mut u8) -> isize {
+    sys2(nr::CAPSET, header as *mut CapHeader as usize, data as usize)
+}
+
 /// `getpriority(which, who)`: the raw syscall's 40..1 encoding, where the
 /// glibc wrapper's nice value is 20 minus the answer.
 pub fn getpriority(which: usize, who: usize) -> isize {
@@ -3174,6 +3180,16 @@ pub const PR_SET_NAME: usize = 15;
 pub const PR_GET_NAME: usize = 16;
 pub const PR_GET_SECCOMP: usize = 21;
 pub const PR_SET_SECCOMP: usize = 22;
+/// The dumpable flag and the capability options, the four `prctl` options
+/// whose state lives in the process's credential record.
+pub const PR_GET_DUMPABLE: usize = 3;
+pub const PR_SET_DUMPABLE: usize = 4;
+pub const PR_SET_KEEPCAPS: usize = 8;
+pub const PR_GET_KEEPCAPS: usize = 9;
+pub const PR_CAPBSET_READ: usize = 23;
+pub const PR_CAPBSET_DROP: usize = 24;
+/// `CAP_LAST_CAP` on x86_64: `CAP_CHECKPOINT_RESTORE` is the last one named.
+pub const CAP_LAST_CAP: usize = 40;
 pub const SECCOMP_MODE_STRICT: usize = 1;
 
 /// `prctl(op, a2, a3, a4, a5)`.

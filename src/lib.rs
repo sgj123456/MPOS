@@ -17,6 +17,12 @@
 
 extern crate alloc;
 
+/// The AHCI port's own answers, as bits rather than as bus cycles: what a
+/// status word means, and when waiting on one has to stop. Ungated because the
+/// decode is arithmetic on three `u32`s and the machine half -
+/// `drivers::ahci`, which reads the registers and moves the sectors - can only
+/// be tested on a machine. `pci` beside `drivers::pci` is the same split.
+pub mod ahci;
 #[cfg(target_os = "none")]
 pub mod arch;
 /// Binary formats: how the kernel decides what runs a file. Host-compiled,
@@ -26,6 +32,12 @@ pub mod blk;
 pub mod boot;
 #[cfg(target_os = "none")]
 pub mod console;
+/// The process credential model: the four capability sets, the dumpable flag
+/// and `KEEPCAPS`. Ungated and pure so the policy `capget`/`capset`, four
+/// `prctl` options and `ptrace_may_access` read can be checked on the host -
+/// the storage lives on the thread group in `sched`, and the two consumers
+/// (`execve`'s re-derivation and the ptrace/`process_vm` gate) call in here.
+pub mod cred;
 /// The civil calendar: day counts to dates and back. Not target-gated - the
 /// arithmetic is pure, and the `arch` half that writes it to hardware is
 /// compiled where its tests are not, so the sums live here where a host

@@ -39,10 +39,12 @@ pub(crate) mod posix;
 ///
 /// The register frame is what makes this possible at all - entering a handler
 /// means rewriting the task's return context wholesale - so it is handed
-/// straight through to the layer that knows the frame's shape.
+/// straight through to the layer that knows the frame's shape. `nr` is the
+/// call just completed, which is what `SA_RESTART` needs to decide whether the
+/// interrupted call is one Linux runs again (`abi::restartable`).
 #[cfg(target_os = "none")]
-pub fn deliver_signal(regs_ptr: *mut (), ret: isize) -> bool {
-    proc::deliver_signal(regs_ptr, ret)
+pub fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
+    proc::deliver_signal(regs_ptr, nr, ret)
 }
 
 #[cfg(target_os = "none")]
@@ -638,10 +640,11 @@ struct UserSigAction {
 /// its `default_action`. This used to read "no handler is ever called, because
 /// no user frame is built for one" - that stopped being true when signal
 /// delivery landed, and the handler-running path is what `t-signal-delivery`
-/// and `t-tty-eintr` now pin. What is recorded but not yet honoured is
-/// `SA_RESTART`: an interrupted call comes back `EINTR` rather than being
-/// re-run, named as a gap in `PLAN.md` §2.5. The stored `old` disposition is
-/// read back verbatim.
+/// and `t-tty-eintr` now pin. `SA_RESTART` is honoured too, in the frame rather
+/// than here: a disposition carrying it makes an interrupted call one Linux
+/// rewinds (`abi::restartable` decides *which* calls) resume on the `syscall`
+/// instruction with its own arguments still in place, so a caller that sets the
+/// flag never sees `EINTR`. The stored `old` disposition is read back verbatim.
 #[cfg(target_os = "none")]
 fn sigaction(args: [usize; 6]) -> isize {
     let (sig, act, old) = (args[0], args[1], args[2]);

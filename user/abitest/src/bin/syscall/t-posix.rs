@@ -212,15 +212,32 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::capget(&mut header, &raw mut data as *mut u8),
         0,
     );
-    lin::check_true(
+    // The 41 capabilities of x86_64 are the low 32 bits plus the nine of the
+    // high word's bottom bits: Linux reports `CapPrm`/`CapEff` as
+    // `0x000001ffffffffff`, so the high word is `0x1ff` and not all-ones. The
+    // old pin asserted all-ones in *both* words, a value no Linux kernel
+    // reports; it is corrected with the measurement (rule 1's carve-out), not
+    // weakened. The effective set is full here because the identity block
+    // above ended by raising the effective id back to root's, which restores it
+    // from the permitted set - measured, and the reason this has a value at all.
+    const CAP_HIGH: u32 = (1u32 << (lin::CAP_LAST_CAP - 31)) - 1;
+    lin::check_eq(
         &mut failed,
-        b"every capability is effective",
-        data.every(|r| r.effective, u32::MAX),
+        b"the low word is every capability",
+        data.records[0].effective as i32 as isize,
+        -1,
     );
-    lin::check_true(
+    lin::check_eq(
         &mut failed,
-        b"every capability is permitted",
-        data.every(|r| r.permitted, u32::MAX),
+        b"the high word is the nine top capabilities",
+        data.records[1].effective as isize,
+        CAP_HIGH as isize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and the permitted set matches it",
+        data.records[1].permitted as isize,
+        CAP_HIGH as isize,
     );
     lin::check_true(
         &mut failed,
@@ -233,6 +250,84 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"capget with an unknown version answers EINVAL",
         lin::capget(&mut header, &raw mut data as *mut u8),
         lin::EINVAL,
+    );
+
+    // The pair round-trips: `capset` stores and `capget` reads the *stored*
+    // sets, so the answer is no longer a constant - the counterfactual is the
+    // old `capget`, which reported all-ones whatever `capset` had been told.
+    //
+    // The sets lowered below are the *effective* one alone, with permitted left
+    // full. That is deliberate, and Linux's own arithmetic is why: a `capset`
+    // that drops `permitted` drops `CAP_SETPCAP` with it, and a caller without
+    // that capability can never raise the ceiling back (`cap_capset` asks for it
+    // first and then refuses `permitted` outside the old set). Clearing only
+    // `effective` keeps the restore inside the subset rules, so the round-trip
+    // below is one a real Linux process could make too.
+    header.version = 0x2008_0522;
+    let mut lowered = CapData {
+        records: [CapRecord {
+            effective: 0,
+            permitted: u32::MAX,
+            inheritable: 0,
+        }; 2],
+    };
+    lowered.records[1].permitted = CAP_HIGH;
+    lin::check_eq(
+        &mut failed,
+        b"capset lowering the effective set succeeds",
+        lin::capset(&mut header, &raw mut lowered as *mut u8),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"capget succeeds after the lowering",
+        lin::capget(&mut header, &raw mut data as *mut u8),
+        0,
+    );
+    lin::check_true(
+        &mut failed,
+        b"and reads the emptied effective set back",
+        data.every(|r| r.effective, 0),
+    );
+    lin::check_eq(
+        &mut failed,
+        b"while the permitted set is untouched",
+        data.records[0].permitted as i32 as isize,
+        -1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"in both words",
+        data.records[1].permitted as isize,
+        CAP_HIGH as isize,
+    );
+    // And back: an effective set inside the permitted one is always allowed.
+    let mut restored = lowered;
+    restored.records[0].effective = u32::MAX;
+    restored.records[1].effective = CAP_HIGH;
+    lin::check_eq(
+        &mut failed,
+        b"capset restores the effective set",
+        lin::capset(&mut header, &raw mut restored as *mut u8),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"capget succeeds after the restore",
+        lin::capget(&mut header, &raw mut data as *mut u8),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the low word is all capabilities again",
+        data.records[0].effective as i32 as isize,
+        -1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and the high word too",
+        data.records[1].effective as isize,
+        CAP_HIGH as isize,
     );
 
     // Priority: the raw syscall's encoding, the which validation, and the

@@ -33,12 +33,12 @@ struct Cli {
     profile: Option<String>,
 
     /// How to boot the machine (default: `[qemu] mode` in `machine.toml`, or
-    /// mirror): `terminal` (serial only, no window), `gui` (the whole machine —
-    /// a window with every device behind it, and the kernel console kept off the
-    /// framebuffer so a compositor can take the screen), or `mirror` (`gui` plus
-    /// the console drawn in the window too, so both views show the same text).
-    /// Global so `cargo xtask run --mode gui` accepts it after the
-    /// subcommand, where a plain parent flag would be rejected.
+    /// mirror): `terminal` (serial only, no window), `gui` (the whole machine in
+    /// the window — a window with every device behind it and the text console
+    /// shown there, the serial line copied to `build/serial.log` so the host
+    /// terminal stays quiet), or `mirror` (the console in the window and a live
+    /// copy on the host terminal). Global so `cargo xtask run --mode gui`
+    /// accepts it after the subcommand, where a plain parent flag would be rejected.
     #[arg(long, value_name = "MODE", global = true)]
     mode: Option<String>,
 

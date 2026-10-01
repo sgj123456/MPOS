@@ -405,7 +405,11 @@ impl Inode for InotifyInstance {
             if self.nonblocking() {
                 return Err(VfsError::Again);
             }
-            self.wait_for_news();
+            // The wait a catchable signal ends: a watcher's `SIGALRM`, or the
+            // `SIGCHLD` of the very child whose config change it was watching
+            // for, has to bring it back to its own loop. Nothing is consumed by
+            // the ending, so the event is still there for the retry.
+            self.wait_for_news()?;
         }
     }
 
@@ -449,15 +453,24 @@ impl Inode for InotifyInstance {
 impl InotifyInstance {
     /// Park until a record lands in the queue. The producer's wake is the
     /// wakeup; `poll`'s subscribers ride the same list.
+    ///
+    /// Interruptible, like every other wait a syscall parks in - `inotify` is
+    /// read by the daemons that also live on signals (`mdev`, `dbus`), and a
+    /// signal slept through here is a daemon that stopped answering its own
+    /// timers.
     #[cfg(target_os = "none")]
-    fn wait_for_news(&self) {
+    fn wait_for_news(&self) -> VfsResult<()> {
         self.poll_subscribe(crate::sched::current());
-        crate::sched::block_until(|| self.pending());
+        let end = crate::sched::block_until_interruptible(|| self.pending());
         self.poll_unsubscribe(crate::sched::current());
+        match end {
+            crate::sched::WaitEnd::Interrupted => Err(VfsError::Interrupted),
+            _ => Ok(()),
+        }
     }
 
     #[cfg(not(target_os = "none"))]
-    fn wait_for_news(&self) {
+    fn wait_for_news(&self) -> VfsResult<()> {
         panic!("blocking on an inotify fd needs the kernel scheduler; push() in tests");
     }
 }

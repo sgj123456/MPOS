@@ -88,6 +88,16 @@ struct State {
     /// `to_master` the way the readers wait for bytes in it. `take_master`
     /// creates the room and wakes them.
     write_waiters: Vec<TaskId>,
+    /// `O_NONBLOCK` on the description holding the *master*.
+    ///
+    /// The pair's two ends are one terminal and two descriptions, and Linux
+    /// keeps one `O_NONBLOCK` per description: a supervisor that opened the
+    /// master nonblocking must not thereby change what the slave's own reader
+    /// sees. So the master's bit lives here, on the pair, while the slave's
+    /// lives on its [`Tty`] - each end reachable by its own inode
+    /// (`PtyMaster::as_pty` against `PtySlave::as_tty`), which is what lets
+    /// `sync_nonblocking` put the bit where it belongs.
+    master_nonblocking: bool,
 }
 
 impl Pty {
@@ -101,6 +111,7 @@ impl Pty {
                 locked: true,
                 waiters: Vec::new(),
                 write_waiters: Vec::new(),
+                master_nonblocking: false,
             })),
         })
     }
@@ -157,18 +168,43 @@ impl Pty {
         critical_section::with(|cs| self.state.borrow(cs).borrow().to_master.len() < TO_MASTER_MAX)
     }
 
+    /// Mirror the master description's `O_NONBLOCK` onto the pair, where its
+    /// read (and a slave's write that would park) consults it.
+    pub fn set_master_nonblocking(&self, on: bool) {
+        critical_section::with(|cs| {
+            self.state.borrow(cs).borrow_mut().master_nonblocking = on;
+        });
+    }
+
+    /// Whether the master's description asked not to wait.
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    pub fn master_nonblocking(&self) -> bool {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().master_nonblocking)
+    }
+
     /// Push a slave's printed bytes, parking the writing task when the buffer
     /// is full until the master takes enough for the rest.
     ///
-    /// The task-context path: it is the back-pressure that keeps a flood from
+    /// The task-context path, and the one that holds the buffer to
+    /// [`TO_MASTER_MAX`]: it is the back-pressure that keeps a flood from
     /// running ahead of the one serial wire and out of anyone's reach. Because
-    /// it parks through `block_until`, a fatal signal ends the wait - a Ctrl-C
-    /// kills the blocked writer rather than leaving it to be killed after it
-    /// has already dumped the whole file into memory. Joining the wait list
-    /// before the first attempt mirrors the console's transmit ring: room that
-    /// appears between a failed push and the sleep must have someone to tell.
+    /// it parks through the interruptible wait, a catchable signal ends it - a
+    /// Ctrl-C kills the blocked writer rather than leaving it to be killed
+    /// after it has already dumped the whole file into memory, and a program
+    /// that installed a handler instead is told `EINTR` at its own write.
+    /// Joining the wait list before the first attempt mirrors the console's
+    /// transmit ring: room that appears between a failed push and the sleep
+    /// must have someone to tell.
+    ///
+    /// The answer is the write's own, in three shapes: everything accepted; a
+    /// *partial* count when the wait ended early (`O_NONBLOCK`, or a signal
+    /// with bytes already in), which is the answer that cannot duplicate bytes
+    /// if the caller retries; or the error that ended a wait that had accepted
+    /// nothing - `Again` for a full buffer under `O_NONBLOCK`, `Interrupted`
+    /// for a signal, the two errnos Linux gives a tty write for those two
+    /// cases.
     #[cfg(target_os = "none")]
-    fn push_master_backpressure(&self, bytes: &[u8]) {
+    fn push_master_backpressure(&self, bytes: &[u8], nonblocking: bool) -> VfsResult<usize> {
         let id = crate::sched::current();
         self.subscribe_writer(id);
         let mut at = 0;
@@ -181,9 +217,25 @@ impl Pty {
             if at == bytes.len() {
                 break;
             }
-            crate::sched::block_until(|| self.master_room());
+            let ended = if nonblocking {
+                None
+            } else {
+                match crate::sched::block_until_interruptible(|| self.master_room()) {
+                    crate::sched::WaitEnd::Interrupted => Some(VfsError::Interrupted),
+                    crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => None,
+                }
+            };
+            if let Some(error) = ended {
+                self.unsubscribe_writer(id);
+                return if at > 0 { Ok(at) } else { Err(error) };
+            }
+            if nonblocking {
+                self.unsubscribe_writer(id);
+                return if at > 0 { Ok(at) } else { Err(VfsError::Again) };
+            }
         }
         self.unsubscribe_writer(id);
+        Ok(at)
     }
 
     /// Add the running task to the writers' wait list, before it parks on room.
@@ -311,21 +363,32 @@ impl Pty {
     /// the program on the slave end does. The master has no `VMIN`/`VTIME`
     /// clock: a master read is raw, and the queue either has a frame or does
     /// not.
+    ///
+    /// A master description that set `O_NONBLOCK` - which is how a supervisor
+    /// with an event loop drives its pair, the same shape the slave side is
+    /// opened in - takes whatever is queued and answers `EAGAIN` rather than
+    /// parking. The look comes *before* the park for that reason, and it is
+    /// also the safer order for the blocking case: the park re-tests the
+    /// condition under the scheduler's lock, so a byte pushed between the look
+    /// and the sleep has someone waiting on it either way.
     #[cfg(target_os = "none")]
     fn read_master(&self, buf: &mut [u8]) -> VfsResult<usize> {
         let id = crate::sched::current();
         self.subscribe_master(id);
         let got = loop {
-            match crate::sched::block_until_deadline(|| self.master_ready(), u64::MAX) {
-                crate::sched::WaitEnd::Interrupted => break Err(VfsError::Interrupted),
-                // Woken by output, or by anything else that ends a sleep: the
-                // look below is what decides, and a lost race costs one pass.
-                crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => {}
-            }
             if let Some(bytes) = self.take_master(buf.len()) {
                 let n = bytes.len().min(buf.len());
                 buf[..n].copy_from_slice(&bytes[..n]);
                 break Ok(n);
+            }
+            if self.master_nonblocking() {
+                break Err(VfsError::Again);
+            }
+            match crate::sched::block_until_interruptible(|| self.master_ready()) {
+                crate::sched::WaitEnd::Interrupted => break Err(VfsError::Interrupted),
+                // Woken by output, or by anything else that ends a sleep: the
+                // look above is what decides, and a lost race costs one pass.
+                crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => {}
             }
             // Another reader won the race; there may be more coming.
         };
@@ -409,25 +472,53 @@ pub fn open_count() -> usize {
     pairs().len()
 }
 
-/// The slave printed something: bytes for the master to read. Called from
-/// [`Tty`]'s output path, which knows the pair only by number - the registry
-/// is how the wire finds its way back.
-pub fn master_input(number: u32, bytes: &[u8]) {
+/// A slave's printed bytes on their way to the master, from a *task*: the
+/// buffer is bounded at [`TO_MASTER_MAX`] and a full one is waited on, so the
+/// caller gets the write's own answer back - a partial count, `EAGAIN` or
+/// `EINTR` (see [`Pty::push_master_backpressure`]).
+///
+/// The context is a parameter now, because the thing this used to ask,
+/// `crate::arch::interrupts_enabled()`, is false in an interrupt handler *and*
+/// inside every syscall - `MSR_FMASK` masks `IF` on `syscall` entry - so a
+/// userland write never parked and never met the bound at all, while a kernel
+/// task's did. `t-wait-eintr` measured it: a 96 KiB write to a slave whose
+/// master nobody read returned 96 KiB and grew the buffer past its 64 KiB cap.
+/// Only the call site knows whether it may sleep, so only the call site can
+/// say.
+pub fn master_input(number: u32, bytes: &[u8], nonblocking: bool) -> VfsResult<usize> {
     let Some(pty) = lookup(number) else {
-        return;
+        // The pair is gone: the bytes go nowhere, and pretending otherwise
+        // would be a write that reports success into a closed terminal. Linux
+        // answers `EIO` once a pty's master is gone, which is this.
+        return Err(VfsError::Corrupt);
     };
-    // A task that may sleep pushes with back-pressure, so a flood stops at the
-    // buffer bound and its writer stays killable and switchable-away-from.
-    // Anything else - the echo of a keystroke from the interrupt handler, the
-    // host's pair tests - is bounded by its own making and must not park, so it
-    // goes straight onto the wire.
     #[cfg(target_os = "none")]
-    if crate::sched::started() && crate::arch::interrupts_enabled() {
-        pty.push_master_backpressure(bytes);
-        return;
+    {
+        pty.push_master_backpressure(bytes, nonblocking)
     }
+    // The host has no scheduler to park in; the pair tests drive `Pty`'s own
+    // methods and read the bytes back out of the queue. Nothing can fill
+    // there, so `O_NONBLOCK` has nothing to answer.
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = nonblocking;
+        pty.push_master(bytes);
+        pty.wake_master_waiters();
+        Ok(bytes.len())
+    }
+}
+
+/// The same push from an **interrupt context** - the echo of a byte that has
+/// just arrived, running in the handler that carried it - where nothing may
+/// park: the bytes go straight onto the wire and the bound is not consulted,
+/// because the alternative is sleeping inside an interrupt.
+pub fn master_input_interrupt(number: u32, bytes: &[u8]) -> usize {
+    let Some(pty) = lookup(number) else {
+        return bytes.len();
+    };
     pty.push_master(bytes);
     pty.wake_master_waiters();
+    bytes.len()
 }
 
 /// The `/dev/ptmx` node: one name, no fixed device. Opening it mints a pair

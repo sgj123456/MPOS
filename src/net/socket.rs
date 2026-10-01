@@ -376,12 +376,17 @@ fn dontwait(fd: i32, flags: usize) -> bool {
 /// queued answer out on the `nlmsg_pid` field, reached the empty queue - and
 /// waited forever on an answer that had already come and gone. Linux answers
 /// that loop with `EAGAIN` and an error return; so does this now.
-fn rtnl_answer(handle: usize, flags: usize, fd: i32) -> Option<Vec<u8>> {
+///
+/// The blocking half is the interruptible one, so a catchable signal comes
+/// back as `EINTR` (the error arm) rather than being slept through - a
+/// netlink reader with an event loop is the ordinary caller of this family,
+/// and `ip`'s own retry loop is one.
+fn rtnl_answer(handle: usize, flags: usize, fd: i32) -> Result<Option<Vec<u8>>, isize> {
     let dontwait = flags & MSG_DONTWAIT != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
     if dontwait && !crate::net::rtnl::ready(handle) {
-        return None;
+        return Ok(None);
     }
-    crate::net::rtnl::recv_blocking(handle)
+    crate::net::rtnl::recv_blocking(handle).map_err(crate::uaccess::err_of)
 }
 
 /// A route-netlink socket: a queue of answers to the dump requests its
@@ -1745,8 +1750,11 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         }
         // args[3] is the flags word: `MSG_DONTWAIT` here means the caller
         // wants an answer only if one is queued.
-        let Some(msg) = rtnl_answer(handle, args[3], fd) else {
-            return err::EAGAIN;
+        let msg = match rtnl_answer(handle, args[3], fd) {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return err::EAGAIN,
+            // `EINTR`: a signal ended the wait for an answer.
+            Err(e) => return e,
         };
         let n = msg.len().min(len);
         unsafe {
@@ -1783,7 +1791,13 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
                 None => return err::EAGAIN,
             }
         } else {
-            sock.recv_blocking()
+            match sock.recv_blocking() {
+                Ok(frame) => frame,
+                // A catchable signal ended the wait for a frame, having taken
+                // nothing - the shape `udhcpc`'s own retry loop is built on,
+                // and `EINTR`'s meaning on every other door.
+                Err(e) => return crate::uaccess::err_of(e),
+            }
         };
         let (payload, src, proto) = frame;
         let n = payload.len().min(len);
@@ -1949,8 +1963,10 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
         // args[2] is the flags word: `MSG_DONTWAIT` here means the caller
         // wants an answer only if one is queued.
-        let Some(msg) = rtnl_answer(handle, args[2], fd) else {
-            return err::EAGAIN;
+        let msg = match rtnl_answer(handle, args[2], fd) {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return err::EAGAIN,
+            Err(e) => return e,
         };
         let n = msg.len().min(len);
         unsafe {

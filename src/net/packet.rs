@@ -91,13 +91,21 @@ impl PacketSock {
     }
 
     /// Pop one queued frame: payload, source MAC, Ethernet type - parked
-    /// until the tap hands one over.
-    pub(crate) fn recv_blocking(&self) -> Frame {
-        crate::sched::block_until(|| self.holds());
-        critical_section::with(|cs| {
+    /// until the tap hands one over, or until a catchable signal ends the
+    /// wait. The signal's answer is `Interrupted` with nothing consumed, the
+    /// same one every other blocking door here gives: a DHCP client's retry
+    /// loop is built on it (`udhcpc` arms an `SIGALRM` and expects its blocked
+    /// receive back), and a wait that slept through the alarm would hold the
+    /// client until the reply it is waiting for happened to arrive.
+    pub(crate) fn recv_blocking(&self) -> VfsResult<Frame> {
+        match crate::sched::block_until_interruptible(|| self.holds()) {
+            crate::sched::WaitEnd::Interrupted => return Err(VfsError::Interrupted),
+            _ => {}
+        }
+        Ok(critical_section::with(|cs| {
             let mut q = self.rx.borrow(cs).borrow_mut();
             q.pop_front().unwrap_or_default()
-        })
+        }))
     }
 
     pub(crate) fn try_recv(&self) -> Option<Frame> {
@@ -159,9 +167,11 @@ impl Inode for PacketSock {
     }
 
     /// `read(2)` on the socket: the next frame's payload. A short buffer
-    /// truncates, which is what a packet socket's read means on Linux too.
+    /// truncates, which is what a packet socket's read means on Linux too -
+    /// and a signal that ends the wait is `EINTR`, the same answer the
+    /// `recvfrom` door above gives for the same wait.
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let (frame, _, _) = self.recv_blocking();
+        let (frame, _, _) = self.recv_blocking()?;
         let n = frame.len().min(buf.len());
         buf[..n].copy_from_slice(&frame[..n]);
         Ok(n)

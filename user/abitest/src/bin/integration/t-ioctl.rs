@@ -45,6 +45,10 @@ static mut WORD: i32 = -1;
 /// read that answers 0 without filling it is caught rather than believed.
 static mut KBTYPE: u8 = 0xFF;
 static mut POOLINFO: [i32; 2] = [0; 2];
+/// A `struct rand_pool_info` with room for the seed bytes that follow its two
+/// ints: the credit `RNDADDENTROPY` carries is not expressible in the bare pair
+/// `POOLINFO` is.
+static mut RNDPOOL: [i32; 16] = [0; 16];
 static mut RTCTIME: [i32; 9] = [-1; 9];
 
 // The request words, spelled in their `_IOC` form: direction, size, the
@@ -53,9 +57,26 @@ static mut RTCTIME: [i32; 9] = [-1; 9];
 // `RND*` are 'R', `RTC_*` are 't', and the size field of the RTC pair is
 // `struct rtc_time`'s 36 bytes, which is what pins the struct's shape here.
 const FIONREAD: usize = 0x541B;
-const RNDGETENTCNT: usize = 0x8004_5200;
-const RNDADDENTROPY: usize = 0x4008_5202;
-const RNDZAPENTCNT: usize = 0x5204; // _IO('R', 0x04): no arg, no direction
+// The `'R'` family spelled out in full, because the dispatch is on the whole
+// word and not on the command byte: the number this test used to call
+// `RNDADDENTROPY` - 0x4008_5202 - is `RNDGETPOOL`, a request the kernel stopped
+// answering, and the credit seedrng actually sends is 0x4008_5203. Both
+// spellings are pinned below so a dispatch on the low byte alone cannot creep
+// back in.
+const RNDGETENTCNT: usize = 0x8004_5200; // _IOR('R', 0x00, int)
+const RNDADDTOENTCNT: usize = 0x4004_5201; // _IOW('R', 0x01, int)
+const RNDGETPOOL: usize = 0x8008_5202; // _IOR('R', 0x02, int [2]): removed
+const RNDADDENTROPY: usize = 0x4008_5203; // _IOW('R', 0x03, int [2])
+const RNDZAPENTCNT: usize = 0x0000_5204; // _IO('R', 0x04): no arg, no direction
+const RNDCLEARPOOL: usize = 0x0000_5206; // _IO('R', 0x06)
+const RNDRESEEDCRNG: usize = 0x0000_5207; // _IO('R', 0x07)
+/// `_IOW('R', 0x03, int)`: the credit's command with the header's `int [2]`
+/// narrowed to an `int`. Not a credit, on either machine.
+const CREDIT_WRONG_SIZE: usize = 0x4004_5203;
+/// `_IOWR('R', 0x03, int [2])`: the same word with both direction bits.
+const CREDIT_WRONG_DIR: usize = 0xC008_5203;
+/// `_IO('R', 0x09)`: a number nobody has taken.
+const RND_UNKNOWN: usize = 0x0000_5209;
 const RTC_RD_TIME: usize = 0x8024_7409;
 const RTC_SET_TIME: usize = 0x4024_740A;
 const FBIOGET_VSCREENINFO: usize = 0x4600;
@@ -298,62 +319,287 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         4096,
     );
 
+    // FIONREAD on an entropy device is `EINVAL` on Linux - root and
+    // unprivileged, `O_RDONLY` and `O_WRONLY`, and *before* the argument is
+    // looked at (a NULL pointer is still `EINVAL`, not `EFAULT`). This kernel
+    // used to answer 512 here, and the seedrng reason written down for it was
+    // false: the binary in this image sends exactly one ioctl, the
+    // `RNDADDENTROPY` credit below, and takes its seed length from
+    // `/proc/sys/kernel/random/poolsize`. The old pin asserted the 512, so it
+    // had encoded the divergence; it is corrected with the measurement, which
+    // is rule 1's carve-out, not weakened to keep a passing shape.
     let r = lin::ioctl(urandom as i32, FIONREAD, &raw mut WORD as usize);
-    lin::check_eq(&mut failed, b"FIONREAD on the pool succeeds", r, 0);
     lin::check_eq(
         &mut failed,
-        b"FIONREAD reports the pool's bytes (4096 bits = 512)",
-        unsafe { *(&raw mut WORD as *const i32) } as isize,
-        512,
+        b"FIONREAD on the pool is EINVAL",
+        r,
+        lin::EINVAL,
+    );
+    let r = lin::ioctl(urandom as i32, FIONREAD, 0);
+    lin::check_eq(
+        &mut failed,
+        b"FIONREAD on the pool is EINVAL even with a NULL argument",
+        r,
+        lin::EINVAL,
     );
 
-    // RNDADDENTROPY credits a `struct poolinfo { int entropy; int size; }`.
-    // This kernel has no accounting to receive the credit; what is pinned is
-    // that the request is accepted rather than bounced as ENOTTY - which is
-    // what made seedrng's boot line an error.
+    // ---- RNDADDENTROPY: the credit OpenRC's seedrng sends on every boot ----
+    //
+    // This is the request whose refusal was the boot's
+    // "seedrng: Unable to seed: Not supported". The family used to be
+    // dispatched on its command byte, and nr 3 is the credit while nr 4 is the
+    // drain - so the credit was answered `EOPNOTSUPP`, and the word this test
+    // called `RNDADDENTROPY` (0x4008_5202) was `RNDGETPOOL` all along. Every
+    // shape below is the answer measured on real Linux 7.2.7 as root.
+    //
+    // A `{64 bits, 0 seed bytes}` header: the count is not negative, the
+    // declared seed is empty, and the pool this generator has is already full,
+    // so the credit is a no-op that the read above agrees with.
     unsafe {
         *(&raw mut POOLINFO as *mut [i32; 2]) = [64, 0];
     }
     let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut POOLINFO as usize);
-    lin::check_eq(&mut failed, b"RNDADDENTROPY is accepted", r, 0);
+    lin::check_eq(&mut failed, b"RNDADDENTROPY {64, 0} is accepted", r, 0);
 
-    // RNDZAPENTCNT: a privileged clear. This generator has no drainable entropy
-    // count, so it is refused EOPNOTSUPP rather than answered with the old `0`
-    // that claimed a clearing `RNDGETENTCNT` - still full - contradicted one
-    // moment later (§4.4: refuse what you cannot do, do not fake it).
-    let r = lin::ioctl(urandom as i32, RNDZAPENTCNT, 0);
+    // The shape seedrng sends: a header *and* the seed bytes it declares, so
+    // the kernel has to prove the seed is reachable before it believes the
+    // length. `RNDPOOL` holds 4096 bits' worth of header plus eight seed bytes.
+    unsafe {
+        let pool = &raw mut RNDPOOL as *mut i32;
+        pool.write(4096);
+        pool.add(1).write(8);
+    }
+    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut RNDPOOL as usize);
     lin::check_eq(
         &mut failed,
-        b"RNDZAPENTCNT is refused EOPNOTSUPP, not a fake 0",
+        b"RNDADDENTROPY with the seed bytes it declares is accepted",
         r,
-        lin::EOPNOTSUPP,
+        0,
+    );
+    // An opening mode is not part of this family's gate: measured on Linux,
+    // the credit is accepted on a descriptor open only for writing and the
+    // count is read back on one open only for reading. That is worth a pin
+    // here rather than an assumption, because this kernel *does* enforce
+    // `O_RDONLY`/`O_WRONLY` on its read and write doors - an ioctl that
+    // borrowed that predicate would refuse a caller Linux accepts, and the
+    // pool fd above is itself `O_RDONLY`.
+    let wonly = lin::openat(lin::AT_FDCWD, &URANDOM, lin::O_WRONLY, 0);
+    lin::check_true(&mut failed, b"/dev/urandom opens O_WRONLY", wonly >= 0);
+    let r = lin::ioctl(wonly as i32, RNDADDENTROPY, &raw mut POOLINFO as usize);
+    lin::check_eq(
+        &mut failed,
+        b"the credit does not care that the fd is write-only",
+        r,
+        0,
+    );
+    let r = lin::ioctl(wonly as i32, RNDGETENTCNT, &raw mut WORD as usize);
+    lin::check_eq(&mut failed, b"and neither does the count read", r, 0);
+    lin::close(wonly as i32);
+
+    // A negative count is EINVAL, and the count is looked at *before* the
+    // length is believed: measured, `{-1, -1}` and `{-1, 65536}` are both
+    // EINVAL although the second length is unusable too.
+    unsafe {
+        let pool = &raw mut RNDPOOL as *mut i32;
+        pool.write(-1);
+        pool.add(1).write(65536);
+    }
+    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut RNDPOOL as usize);
+    lin::check_eq(
+        &mut failed,
+        b"a negative credit is EINVAL even beside a bad length",
+        r,
+        lin::EINVAL,
+    );
+
+    // A length that is negative, or that reaches past any mapping, is the
+    // `EFAULT` Linux answers where its copy faults. 16 MiB is the honest shape
+    // of that pin: measured on Linux, a declared 64 KiB *succeeded*, because
+    // the heap behind an 8-byte header is mapped and the kernel only reads what
+    // the header says is there. Here the same length also crosses this
+    // kernel's `MAX_IO` bound, which is the worst-case answer the §4 rules ask
+    // for rather than a copy of the caller's choosing.
+    unsafe {
+        let pool = &raw mut RNDPOOL as *mut i32;
+        pool.write(8);
+        pool.add(1).write(-1);
+    }
+    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut RNDPOOL as usize);
+    lin::check_eq(
+        &mut failed,
+        b"a negative seed length is EFAULT",
+        r,
+        lin::EFAULT,
+    );
+    unsafe {
+        let pool = &raw mut RNDPOOL as *mut i32;
+        pool.add(1).write(16 * 1024 * 1024);
+    }
+    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut RNDPOOL as usize);
+    lin::check_eq(
+        &mut failed,
+        b"a seed length past any mapping is EFAULT",
+        r,
+        lin::EFAULT,
+    );
+    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, 0);
+    lin::check_eq(
+        &mut failed,
+        b"RNDADDENTROPY with no header at all is EFAULT",
+        r,
+        lin::EFAULT,
+    );
+
+    // ---- RNDADDTOENTCNT: the same gate, one int, no seed ----
+    unsafe { WORD = 8 };
+    let r = lin::ioctl(urandom as i32, RNDADDTOENTCNT, &raw mut WORD as usize);
+    lin::check_eq(&mut failed, b"RNDADDTOENTCNT 8 is accepted", r, 0);
+    unsafe { WORD = -1 };
+    let r = lin::ioctl(urandom as i32, RNDADDTOENTCNT, &raw mut WORD as usize);
+    lin::check_eq(
+        &mut failed,
+        b"RNDADDTOENTCNT of a negative credit is EINVAL",
+        r,
+        lin::EINVAL,
+    );
+    let r = lin::ioctl(urandom as i32, RNDADDTOENTCNT, 0);
+    lin::check_eq(
+        &mut failed,
+        b"RNDADDTOENTCNT with no int is EFAULT",
+        r,
+        lin::EFAULT,
+    );
+
+    // ---- The words that are not the requests they look like ----
+    //
+    // Same command byte, wrong size or wrong direction; and two `'R'` numbers
+    // the kernel does not answer - `RNDGETPOOL`, which the header still names,
+    // and an untaken one. All four are `EINVAL` on Linux, for root and for
+    // everyone else: the command is refused before the capability is asked, so
+    // a dispatch keyed on `request & 0xff` - the shape that broke seedrng -
+    // cannot come back unnoticed.
+    for (request, label) in [
+        (
+            CREDIT_WRONG_SIZE,
+            "the credit's command with the wrong size",
+        ),
+        (
+            CREDIT_WRONG_DIR,
+            "the credit's command with the wrong direction",
+        ),
+        (RNDGETPOOL, "RNDGETPOOL, which the kernel stopped answering"),
+        (RND_UNKNOWN, "an untaken 'R' number"),
+    ] {
+        let r = lin::ioctl(urandom as i32, request, &raw mut RNDPOOL as usize);
+        lin::check_eq(&mut failed, label.as_bytes(), r, lin::EINVAL);
+    }
+
+    // ---- The two drains this machine cannot perform, and the re-key it can ----
+    //
+    // `RNDZAPENTCNT`/`RNDCLEARPOOL` would drain a count this generator does not
+    // hold, so they stay refused `EOPNOTSUPP` rather than answered with the `0`
+    // Linux gives - a `0` would claim a change the read above contradicts one
+    // moment later (§4.4: refuse what you cannot do, do not fake it).
+    //
+    // `RNDRESEEDCRNG` is not in that class any more. This generator has a fresh
+    // hardware seed and the stream it has produced, and re-keying from both is
+    // the same promise Linux's re-key makes; Linux answers `0` for root
+    // (measured, both devices), and so does the kernel now. The counterfactual
+    // is the old `EOPNOTSUPP` this line used to assert.
+    for (request, label) in [
+        (
+            RNDZAPENTCNT,
+            "RNDZAPENTCNT is refused EOPNOTSUPP, not a fake 0",
+        ),
+        (RNDCLEARPOOL, "RNDCLEARPOOL is refused EOPNOTSUPP too"),
+    ] {
+        let r = lin::ioctl(urandom as i32, request, 0);
+        lin::check_eq(&mut failed, label.as_bytes(), r, lin::EOPNOTSUPP);
+    }
+    let r = lin::ioctl(urandom as i32, RNDRESEEDCRNG, 0);
+    lin::check_eq(
+        &mut failed,
+        b"RNDRESEEDCRNG re-keys the generator and answers 0",
+        r,
+        0,
+    );
+    // A re-key is not a drain: the count the read reports does not move across
+    // one, on Linux or here.
+    let r = lin::ioctl(urandom as i32, RNDGETENTCNT, &raw mut WORD as usize);
+    lin::check_eq(&mut failed, b"the count still reads after a re-key", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"and it is still 4096 bits - a re-key drains nothing",
+        unsafe { *(&raw mut WORD as *const i32) } as isize,
+        4096,
     );
 
     // The capability gate, measured on Linux: every mutating RND ioctl is EPERM
-    // without CAP_SYS_ADMIN (and EPERM comes *before* the buffer copy). Lower
-    // the effective user only - ruid and the saved id stay 0, so the privilege
-    // is reclaimable - and the RNDADDENTROPY that answered 0 just above now
-    // answers EPERM. That is the counterfactual: the old handler returned 0
-    // regardless of who asked.
+    // without CAP_SYS_ADMIN, and EPERM comes *before* anything is read from the
+    // caller's buffer. Lower the effective user only - ruid and the saved id
+    // stay 0, so the privilege is reclaimable - and a header that answered
+    // EINVAL for root a moment ago now answers EPERM. That is the counterfactual
+    // for the order, as the old handler's `0` for everyone is the counterfactual
+    // for the gate.
     lin::check_eq(
         &mut failed,
         b"setresuid lowers euid (ruid/saved stay 0)",
         lin::setresuid(-1, 65534, -1),
         0,
     );
-    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut POOLINFO as usize);
+    unsafe {
+        let pool = &raw mut RNDPOOL as *mut i32;
+        pool.write(-1);
+        pool.add(1).write(-1);
+    }
+    let r = lin::ioctl(urandom as i32, RNDADDENTROPY, &raw mut RNDPOOL as usize);
     lin::check_eq(
         &mut failed,
-        b"RNDADDENTROPY without CAP_SYS_ADMIN is EPERM",
+        b"RNDADDENTROPY without CAP_SYS_ADMIN is EPERM, before its EINVAL",
         r,
         lin::EPERM,
     );
-    let r = lin::ioctl(urandom as i32, RNDZAPENTCNT, 0);
+    for (request, label) in [
+        (
+            RNDADDTOENTCNT,
+            "RNDADDTOENTCNT without the capability is EPERM",
+        ),
+        (
+            RNDZAPENTCNT,
+            "and RNDZAPENTCNT without the capability is EPERM",
+        ),
+        (
+            RNDCLEARPOOL,
+            "and RNDCLEARPOOL without the capability is EPERM",
+        ),
+        (
+            RNDRESEEDCRNG,
+            "and RNDRESEEDCRNG without the capability is EPERM, not ENOTTY",
+        ),
+    ] {
+        let r = lin::ioctl(urandom as i32, request, 0);
+        lin::check_eq(&mut failed, label.as_bytes(), r, lin::EPERM);
+    }
+    // The command is refused before the capability is asked, so an
+    // unrecognised `'R'` word is still `EINVAL` for this caller - it was never
+    // a request the device could grant or withhold.
+    for (request, label) in [
+        (
+            RNDGETPOOL,
+            "RNDGETPOOL is still EINVAL without the capability",
+        ),
+        (RND_UNKNOWN, "an untaken 'R' number is still EINVAL too"),
+    ] {
+        let r = lin::ioctl(urandom as i32, request, 0);
+        lin::check_eq(&mut failed, label.as_bytes(), r, lin::EINVAL);
+    }
+    // Reading the pool needs no privilege, whatever the write side costs.
+    let r = lin::ioctl(urandom as i32, RNDGETENTCNT, &raw mut WORD as usize);
     lin::check_eq(
         &mut failed,
-        b"and RNDZAPENTCNT without the capability is EPERM",
+        b"RNDGETENTCNT is not gated on the capability",
         r,
-        lin::EPERM,
+        0,
     );
     lin::check_eq(
         &mut failed,
@@ -443,6 +689,16 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"RNDGETENTCNT on rtc0 answers ENOTTY",
+        r,
+        lin::ENOTTY,
+    );
+    // Measured on Linux, where `rtc_dev_ioctl` checks the magic byte first: a
+    // pool request of any shape is not this device's, whichever arm it would
+    // have reached.
+    let r = lin::ioctl(rtc as i32, RNDADDENTROPY, &raw mut POOLINFO as usize);
+    lin::check_eq(
+        &mut failed,
+        b"RNDADDENTROPY on rtc0 answers ENOTTY, not EPERM or EOPNOTSUPP",
         r,
         lin::ENOTTY,
     );

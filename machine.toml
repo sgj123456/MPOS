@@ -54,36 +54,31 @@ audio = true
 # `--mode <mode>`. One word picks both the QEMU wiring and the consoles the guest
 # is told to use, because the window and the guest's own console have to agree.
 # There are three of them, because there are two questions to answer — is there a
-# window, and is the framebuffer one of the guest's consoles — and every mode puts
-# the serial line on the terminal, because a mode that dropped it dropped the
-# kernel log with it:
+# window, and is the framebuffer one of the guest's consoles — and every mode
+# keeps the serial line, because a mode that dropped it dropped the kernel log
+# with it; `gui` reads that line from a log file rather than the terminal:
 #   terminal - serial only, no window. The guest is given `console=ttyS0`, so the
 #              wire is its only console and the whole boot rides it losslessly;
 #              the display device is still probed, and `/dev/fb0` still answers,
 #              but nothing is drawn on it;
-#   gui      - the whole machine: a window with every device behind it (GPU,
-#              keyboard, absolute tablet, DRM) and `console=ttyS0`, so the kernel
-#              console never moves onto a screen somebody else is driving. What
-#              makes it a compositor boot happens at runtime, not here: weston
-#              opens the card and takes `SET_MASTER`, then `KDSETMODE(KD_GRAPHICS)`
-#              is its word that the screen is its to draw, and a typed line cannot
-#              paint over it. Nothing starts the compositor - `./start-weston.sh` in
-#              root's home does, once the login prompt appears *on the serial
-#              terminal*: until some session claims the card the window is the
-#              compositor's to fill and stays blank, because a screen that shows
-#              the kernel console and is promised to a compositor is the one shape
-#              that has to lose. Switch away with `^A 1`..`^A 6`: the session is
-#              asked to release the display, its page flips start coming back
-#              EACCES, and the window shows the console you switched to. This is
-#              what the mode called `weston` was: it told the guest exactly what
-#              `terminal` tells it, so the word carried no machine of its own;
+#   gui      - the whole machine in the window: a window with every device behind
+#              it (GPU, keyboard, absolute tablet, DRM) and `console=tty0`, so the
+#              boot log, the virtual consoles, the login prompt and the shells all
+#              show *in the window*, and the host terminal shows nothing. The
+#              guest never names the wire, so the kernel's console bytes go to the
+#              screen alone; the launcher still taps the port, into
+#              `build/serial.log`, because the UEFI loader's lines, the kernel
+#              banner that precedes the command-line parse and a panic's forced
+#              serial report reach no screen. A compositor is a guest of runtime,
+#              not of this word: log in on the window's tty1 and run
+#              `./start-weston.sh`, and the session claims the card, the kernel
+#              text stops painting over it, and `^A 1`..`^A 6` — the kernel's own
+#              mux, read from the window's keyboard — switches back to the console
+#              and away again;
 #   mirror   - `console=ttyS0 console=tty0`: the window takes the console over
 #              once the framebuffer is up, and the wire keeps a best-effort copy
-#              of the same text. The copy is non-blocking, so under a flood the
-#              serial transcript may drop bytes while the window never stalls.
-#              `gui` and `mirror` are the same QEMU wiring and the same window;
-#              they differ only in whether the guest also counts the screen as a
-#              console, which is the one thing the command line can say about it.
+#              of the same text on the host terminal. Under a flood the serial
+#              transcript may drop bytes while the window never stalls.
 # Unset means mirror, which is what `run` did before the modes were split. A name
 # this xtask does not have — including the retired `weston` and `compositor` — is
 # an error at `run`, not a default: the two bake different `console=` lists, so a
@@ -94,6 +89,7 @@ audio = true
 # the one edit here that touches a build - and `run` notices the difference and
 # refreshes the *boot files* alone rather than reinstalling the root filesystem.
 # An image baked as `weston` has no marker this xtask reads, so the first `run`
-# after this change takes that one refresh to rename it; the command line inside
-# the image is already `gui`'s.
+# after this change takes that one refresh, and the refresh now genuinely rewrites
+# the command line inside the image: `weston` baked `console=ttyS0`, which today's
+# `gui` replaces with `console=tty0`.
 mode = "gui"

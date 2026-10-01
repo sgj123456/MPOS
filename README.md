@@ -319,8 +319,8 @@ cargo xtask run          # boot it; rebuilds first if anything is stale
 ```
 
 The kernel boots, brings up the initramfs, pivots into the Alpine root filesystem and drops you
-into an interactive shell — on the serial line, with a QEMU window beside it for whatever claims
-the display.
+into an interactive shell — on the serial line, in the QEMU window, or in both, depending on the
+mode below.
 
 `cargo xtask run` takes a mode that decides how the window and the serial line are wired, and
 which consoles the guest is told it has. The guest is told with Linux's own `console=` words,
@@ -330,18 +330,18 @@ console — the one whose writes wait rather than being dropped.
 | Mode | What you get | Guest `console=` |
 |------|--------------|------------------|
 | `terminal` | Serial only, no window — the lossless log; `/dev/fb0` still exists, nothing is drawn on it | `console=ttyS0` |
-| `gui` | The whole machine: a window with every device behind it, kept off the kernel console so a compositor can claim the scanout at runtime, with the log riding the serial line | `console=ttyS0` |
+| `gui` | The whole machine in the window: the text console — log, virtual consoles, login, shells — shows there, and the host terminal stays quiet with the serial line copied to `build/serial.log`; a compositor claimed it at runtime with `./start-weston.sh` | `console=tty0` |
 | `mirror` | The window plus a best-effort copy on the serial line (the default) | `console=ttyS0 console=tty0` |
 
 ```bash
 cargo xtask run --mode terminal      # watch the boot log
-cargo xtask run --mode gui           # the window for weston
+cargo xtask run --mode gui           # the machine, in the window
 ```
 
-Three modes, because there are two questions — is there a window, and is the framebuffer one of
-the guest's consoles. A fourth word (`weston`) used to answer the second one by repeating
-`terminal`'s list, which was never a fact a command line could carry: a compositor takes the
-screen at runtime, through `DRM_IOCTL_SET_MASTER` and `KDSETMODE`.
+Three modes, because the guest's consoles and the launcher's window are separate
+questions, and each mode owns an answer. What a command line can never say is
+*who is drawing the screen*: a compositor takes it at runtime, through
+`DRM_IOCTL_SET_MASTER` and `KDSETMODE`, whichever windowed mode it starts in.
 
 `xtask/README.md` documents every command, flag and environment variable, in English and
 Chinese. In short:
@@ -649,6 +649,7 @@ layers; `AGENTS.md` is the short version for anyone (or anything) about to make 
 | `ARCHITECTURE.md` | The dependency graphs, the boot and syscall sequences, per-layer ownership, the measured inter-module edges, and the layering violations |
 | `AGENTS.md` | The working guide: commands, conventions, recipes for adding a syscall or a test, known traps |
 | `PLAN.md` | The feature roadmap and status board, the measured performance work, and Phase 11 — the architecture-debt audit and its remediation plan |
+| `UAPI.md` | The userspace-visible surface as an inventory: syscalls, device ioctls, struct layouts and flag vocabularies, each with Linux's answer, this kernel's, and the pin — the working list of what is served, honestly refused, or a wrong shape |
 | `xtask/README.md` | Every build/run command, flag and environment variable (bilingual) |
 | `fuzz/README.md` | What each fuzz target feeds on |
 

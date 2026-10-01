@@ -369,15 +369,19 @@ impl UnixSock {
             #[cfg(not(target_os = "none"))]
             return Err(VfsError::Again);
             #[cfg(target_os = "none")]
-            self.wait_for_dgram();
+            self.wait_for_dgram()?;
         }
     }
 
     /// Park until a datagram stands in the queue - the accept wait's
-    /// shape: register, wait on the condition, unregister. A signal
-    /// breaks `block_until` the way it breaks every other kernel park.
+    /// shape: register, wait on the condition, unregister.
+    ///
+    /// Interruptible, so a catchable signal ends it with `EINTR` and the queue
+    /// untouched: a receiver that owns this end of a pair is usually also
+    /// waiting on signals, and a wait that swallowed them would leave it deaf
+    /// to its own alarm until the peer happened to send.
     #[cfg(target_os = "none")]
-    fn wait_for_dgram(&self) {
+    fn wait_for_dgram(&self) -> VfsResult<()> {
         let me = crate::sched::current();
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
@@ -385,7 +389,7 @@ impl UnixSock {
                 st.read_waiters.push(me);
             }
         });
-        crate::sched::block_until(|| {
+        let end = crate::sched::block_until_interruptible(|| {
             critical_section::with(|cs| {
                 let st = self.state.borrow(cs).borrow();
                 !st.recvq.is_empty()
@@ -398,6 +402,10 @@ impl UnixSock {
                 .read_waiters
                 .retain(|&w| w != me);
         });
+        match end {
+            crate::sched::WaitEnd::Interrupted => Err(VfsError::Interrupted),
+            _ => Ok(()),
+        }
     }
 
     /// The connected channel, if there is one - the downcast the file
@@ -843,10 +851,15 @@ pub(crate) fn connect(
                     return Err(ConnectRefused::Again);
                 }
                 // Room appears when an accept pops. Park on the listener
-                // the way pipe parks: register, wait on the condition (a
-                // fatal signal breaks `block_until`), unregister, retry.
+                // the way pipe parks: register, wait on the condition
+                // (a catchable signal ends it), unregister, retry.
                 #[cfg(target_os = "none")]
-                room_wait(&listener);
+                if room_wait(&listener).is_err() {
+                    // `EINTR`: nothing was connected, and whether to retry is
+                    // the caller's decision - which is the difference between
+                    // this and the `Again` above, the one the caller asked for.
+                    return Err(ConnectRefused::Interrupted);
+                }
                 #[cfg(not(target_os = "none"))]
                 return Err(ConnectRefused::Again);
             }
@@ -871,6 +884,9 @@ pub(crate) enum ConnectRefused {
     Refused,
     /// EAGAIN: backlog full and the call nonblocking.
     Again,
+    /// EINTR: a catchable signal ended the wait for room in a full backlog,
+    /// having connected nothing.
+    Interrupted,
 }
 
 enum ConnectOutcome {
@@ -882,7 +898,7 @@ enum ConnectOutcome {
 /// Why an accept queue has a connection waiting: the wake set collected
 /// under the lock, run outside it.
 #[cfg(target_os = "none")]
-fn room_wait(listener: &Arc<UnixSock>) {
+fn room_wait(listener: &Arc<UnixSock>) -> VfsResult<()> {
     let me = crate::sched::current();
     critical_section::with(|cs| {
         let mut st = listener.state.borrow(cs).borrow_mut();
@@ -890,7 +906,7 @@ fn room_wait(listener: &Arc<UnixSock>) {
             st.room_waiters.push(me);
         }
     });
-    crate::sched::block_until(|| {
+    let end = crate::sched::block_until_interruptible(|| {
         critical_section::with(|cs| {
             let st = listener.state.borrow(cs).borrow();
             match st.backlog {
@@ -907,6 +923,10 @@ fn room_wait(listener: &Arc<UnixSock>) {
             .room_waiters
             .retain(|&w| w != me);
     });
+    match end {
+        crate::sched::WaitEnd::Interrupted => Err(VfsError::Interrupted),
+        _ => Ok(()),
+    }
 }
 
 /// One `accept`'s pop. `Err(EAGAIN)` when the queue is empty and the
@@ -935,19 +955,35 @@ pub(crate) fn accept_once(
         if nonblock {
             return Err(crate::err::EAGAIN);
         }
-        if !accept_blocking_step(sock) {
-            return Err(crate::err::EAGAIN);
+        match accept_blocking_step(sock) {
+            AcceptStep::Woken => {}
+            // `EINTR`, with the queue untouched: a signal that arrives while a
+            // program is waiting for a client is the program's own news, and
+            // Linux's `accept` reports it rather than swallowing it.
+            AcceptStep::Interrupted => return Err(crate::err::EINTR),
         }
     }
 }
 
-/// Park until this listener's queue is nonempty - or until the listener
-/// itself dies (its slot upgraded to nothing), which is `block_until`'s
-/// fatal-signal condition's cousin: a dead listener must not strand its
-/// acceptors. Answers false when the socket is gone (the caller re-checks
-/// and leaves).
+/// What one park in an `accept` loop ended on.
+///
+/// The "listener is gone" case the older comment here promised is not
+/// expressible: the acceptor holds an `Arc` to the socket, so nothing can drop
+/// it under a park, and what the wait ends on is the queue it was asked about
+/// (or a signal). A name for a state that cannot happen would be a second
+/// answer to a question with one.
 #[cfg(target_os = "none")]
-fn accept_blocking_step(sock: &UnixSock) -> bool {
+enum AcceptStep {
+    /// Something may be queued now: look again.
+    Woken,
+    /// A catchable signal ended the wait, and nothing was consumed.
+    Interrupted,
+}
+
+/// Park until this listener's queue is nonempty, or until a catchable signal
+/// ends the wait. See [`AcceptStep`] for what the two answers mean.
+#[cfg(target_os = "none")]
+fn accept_blocking_step(sock: &UnixSock) -> AcceptStep {
     let me = crate::sched::current();
     critical_section::with(|cs| {
         let mut st = sock.state.borrow(cs).borrow_mut();
@@ -955,16 +991,19 @@ fn accept_blocking_step(sock: &UnixSock) -> bool {
             st.accept_waiters.push(me);
         }
     });
-    crate::sched::block_until(|| sock.pending_nonempty());
+    let end = crate::sched::block_until_interruptible(|| sock.pending_nonempty());
     critical_section::with(|cs| {
         let mut st = sock.state.borrow(cs).borrow_mut();
         st.accept_waiters.retain(|&w| w != me);
     });
-    true
+    match end {
+        crate::sched::WaitEnd::Interrupted => AcceptStep::Interrupted,
+        _ => AcceptStep::Woken,
+    }
 }
 
 #[cfg(not(target_os = "none"))]
-fn accept_blocking_step(_sock: &UnixSock) -> bool {
+fn accept_blocking_step(_sock: &UnixSock) -> AcceptStep {
     panic!("blocking accept needs the kernel scheduler; push_pending in tests");
 }
 
@@ -1212,6 +1251,7 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
         Ok(()) => 0,
         Err(ConnectRefused::Refused) => err::ECONNREFUSED,
         Err(ConnectRefused::Again) => err::EAGAIN,
+        Err(ConnectRefused::Interrupted) => err::EINTR,
     }
 }
 

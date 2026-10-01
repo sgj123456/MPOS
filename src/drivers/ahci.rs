@@ -47,8 +47,9 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 
+use crate::ahci::{PortStatus, signature_is_atapi};
 use crate::blk::BlockDev;
-use crate::mm::{PAGE_SIZE, alloc_frames, map_mmio, phys_to_virt};
+use crate::mm::{PAGE_SIZE, alloc_frames, free_frames, map_mmio, phys_to_virt};
 
 /// The driver name `lspci -k` prints, and what a device claim records.
 pub const PCI_DRIVER: &str = "ahci";
@@ -99,23 +100,9 @@ const PX_CMD_FR: u32 = 1 << 14;
 /// `PxSSTS.DET`: 3 is "device present and PHY communication established".
 const SSTS_DET_MASK: u32 = 0x0f;
 const SSTS_DET_PRESENT: u32 = 3;
-/// `PxSIG` for an ATAPI device, which speaks a different command set than this
-/// driver does.
-///
-/// The *only* signature this driver refuses, and it is deliberately not a test
-/// for the ATA one: the controller this was measured against reports
-/// `0xffffffff` on a port with a disk on it until the port has been brought up,
-/// so a driver that waited for `0x00000101` would never bring up the port that
-/// has the disk. Whether the device is an ATA disk is what `IDENTIFY` answers,
-/// and that is where the discovery belongs; `PxSSTS.DET` is the presence
-/// question, which is a different one.
-const SIG_ATAPI: u32 = 0xeb14_0101;
-
-/// `PxTFD`'s two error bits: `ERR` is an ATA error, `DF` a device fault.
-const TFD_ERR: u32 = 1 << 0;
-const TFD_DF: u32 = 1 << 5;
-/// `PxIS.TFES`: the task-file error status bit that goes with them.
-const PX_IS_TFES: u32 = 1 << 30;
+// `PxTFD`'s two error bits and `PxIS`'s task-file-error latch live in
+// [`crate::ahci`] with the decision they feed, because the decision is what was
+// wrong here and only a host build can test it.
 
 /// The ATA commands this driver issues.
 const CMD_IDENTIFY: u8 = 0xec;
@@ -131,14 +118,48 @@ const CMD_LIST_SIZE: usize = 1024;
 const CMD_TABLE_PRDT: usize = 0x80;
 /// The received-FIS area, which wants 256-byte alignment.
 const FIS_SIZE: usize = 256;
+/// A sector, which is the only amount `BlockDev` moves and so the only thing a
+/// request's length has to be a multiple of.
+const SECTOR: usize = 512;
+
+/// How many pages one command describes, which is how many the port holds: the
+/// bounce is a *list* of pages rather than one big allocation because a PRDT is a
+/// scatter-gather table - each entry points wherever it likes - and asking the
+/// buddy allocator for 32 contiguous pages would make this driver's I/O fail on
+/// a machine that has the memory but not the run.
+///
+/// The size is a bound on one command, not on a request: a longer request is more
+/// commands (see [`crate::ahci::chunks`]), so what a caller can steer is the
+/// number of commands it causes and not the memory this driver holds, which is
+/// fixed here and allocated once per port. That is the worst-case rule's shape
+/// for a device driver: the buffer is the driver's, and a user's read of any size
+/// reaches the disk through it.
+const BOUNCE_PAGES: usize = 32;
+/// One command's transfer, and so the plan's piece size.
+const MAX_TRANSFER: usize = BOUNCE_PAGES * PAGE_SIZE;
+
+// A table longer than the command page can hold would be read past its end by
+// the device, and `DBC` counts 22 bits, so a page-sized run is always codable.
+const _: () = assert!(BOUNCE_PAGES <= crate::ahci::prdt_capacity(PAGE_SIZE, CMD_TABLE_PRDT));
 
 /// How long a bring-up step may take, in reads of the register it waits on.
 ///
-/// A count of tries rather than a clock, because this runs while a device is
-/// being brought up and a controller that never answers has to end in `None`
-/// rather than in a boot that stops. The loop body is a volatile read of an MMIO
-/// register, so this is tens of milliseconds of a healthy device and a bounded
-/// wait on a dead one.
+/// A count rather than a clock, and not for the reason a first reading guesses:
+/// the same wait runs while a mounted filesystem is reading through
+/// [`BlockDev`], which holds the port inside `critical_section::with`, and an
+/// MMIO read inside a critical section happens with interrupts masked - so the
+/// 250 Hz tick counter does not advance, and a deadline in ticks would never
+/// expire. Reads advance whatever else does.
+///
+/// What a count *does* depend on is the cost of one read, and that is measured
+/// rather than assumed: 5,000,000 reads of a dead port on this machine's
+/// emulated controller is **28.3 s** of the boot (7,067 ticks at 250 Hz, so
+/// ~5.7 µs per exit). The budget stays generous because a disk that is
+/// legitimately spinning up is what it is there for - a healthy command retires
+/// at try 0 to 2, measured on a `q35` with a real device - but the number is no
+/// longer the whole of the wait's bound: [`crate::ahci::PortStatus::waiting`]
+/// stops the same wait as soon as the port reports the command failed, which is
+/// what a controller with nothing behind a "present" port actually does.
 const WAIT_TRIES: usize = 5_000_000;
 
 /// Read one device register. Volatile because the device changes its own
@@ -151,8 +172,10 @@ fn wr(base: usize, offset: usize, value: u32) {
     unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) }
 }
 
-/// Spin until `done` holds, at most [`WAIT_TRIES`] times. `false` means it
-/// never did.
+/// Spin until `done` holds, at most [`WAIT_TRIES`] reads. `false` means it never
+/// did: the budget ran out, which is a device that is not answering rather than
+/// one that has answered no - the caller still reads the status afterwards, so a
+/// refusal says which of the two it was.
 fn wait_until(mut done: impl FnMut() -> bool) -> bool {
     for _ in 0..WAIT_TRIES {
         if done() {
@@ -173,29 +196,40 @@ struct AhciPort {
     regs: usize,
     /// The command list, 32 headers of 32 bytes.
     clb: usize,
+    /// The received-FIS area. Programmed into `PxFB` and kept here only so
+    /// [`release`] can hand it back with the rest.
+    fb: usize,
     /// The command table the one header points at.
     ctba: usize,
-    /// The data page, which is both the PRDT's target and the caller's bounce.
-    bounce: usize,
+    /// The data pages, which are both the PRDT's targets and the caller's
+    /// bounce: a command fills as many of them, from the front, as its transfer
+    /// needs, and the copy to or from the caller's buffer happens here, under the
+    /// port's lock, so no second command can be building a transfer over pages
+    /// the first one still owns.
+    bounce: [usize; BOUNCE_PAGES],
 }
 
 impl AhciPort {
     /// Build and issue one command, and answer whether the *device* said it
     /// worked.
     ///
-    /// `data` is `Some((physical, bytes, write))` for a command that moves
-    /// sectors and `None` for one that does not. `bytes` is at most one page,
-    /// which is what [`BlockDev`] promises per call and what one PRDT entry
-    /// points at.
-    fn issue(
-        &self,
-        command: u8,
-        lba: u64,
-        sectors: u16,
-        data: Option<(usize, usize, bool)>,
-    ) -> bool {
+    /// `transfer` is `Some((bytes, write))` for a command that moves sectors and
+    /// `None` for one that does not. `bytes` is at most [`MAX_TRANSFER`], and it
+    /// is described by **one PRDT entry per bounce page**: the device fills the
+    /// runs in order and `PRDTL` says how many there are, so the request's length
+    /// decides the table's length. That is what a PRDT is for - the runs need not
+    /// be contiguous, and this driver's are not, because they are individually
+    /// allocated pages.
+    ///
+    /// The two fields a wrong table breaks on are both here rather than inline:
+    /// `DBC` per run (see [`crate::ahci::prdt_flags`], which says out loud that
+    /// only the *last* run carries the completion bit) and `PRDBC`, the total,
+    /// which is what the device checks its own transfer against.
+    fn issue(&self, command: u8, lba: u64, sectors: u16, transfer: Option<(usize, bool)>) -> bool {
         let header = phys_to_virt(self.clb) as *mut u32;
         let table = phys_to_virt(self.ctba);
+        let (bytes, write) = transfer.unwrap_or((0, false));
+        let entries = bytes.div_ceil(PAGE_SIZE);
 
         // The command FIS: a 20-byte register host-to-device FIS, so `CFL` is
         // five dwords.
@@ -227,112 +261,177 @@ impl AhciPort {
         fis[12] = (sectors & 0xff) as u8;
         fis[13] = ((sectors >> 8) & 0xff) as u8;
 
-        let prdt_len = match data {
-            Some((phys, bytes, _)) => {
-                let entry = (table + CMD_TABLE_PRDT) as *mut u32;
-                unsafe {
-                    entry.write_volatile(phys as u32);
-                    entry.add(1).write_volatile((phys >> 32) as u32);
-                    entry.add(2).write_volatile(0);
-                    // `DBC` is the byte count *minus one*, in 22 bits, with the
-                    // interrupt bit above it. The device moves inside this run
-                    // and no further, so a wrong count is a transfer that stops
-                    // short rather than one that runs away.
-                    entry
-                        .add(3)
-                        .write_volatile(((bytes - 1) as u32 & 0x003f_ffff) | (1 << 31));
-                }
-                1u32
+        // Loud rather than a shorter table: with a debug_assert only, a release
+        // build would write `PRDTL` for a table it had not filled, and the device
+        // would DMA against descriptors that are someone else's memory. The
+        // callers chunk every request to this bound, so arriving here means one
+        // of them stopped doing that.
+        assert!(
+            bytes <= MAX_TRANSFER,
+            "ahci: a {bytes}-byte command is longer than the port's {}-byte table",
+            MAX_TRANSFER
+        );
+        for (index, frame) in self.bounce.iter().enumerate().take(entries) {
+            let run = crate::ahci::run_bytes(bytes, index, PAGE_SIZE);
+            let flags = match crate::ahci::prdt_flags(run, index + 1 == entries) {
+                Some(flags) => flags,
+                // Unreachable while `MAX_TRANSFER` is the bound on `bytes`, and a
+                // panic rather than a skipped entry if that ever stops being
+                // true: a run whose length the table cannot say is a transfer
+                // that stops short while the command reports success.
+                None => panic!("ahci: a {run}-byte PRDT run has no encoding"),
+            };
+            let entry = (table + CMD_TABLE_PRDT) as *mut u32;
+            unsafe {
+                let entry = entry.wrapping_add(index * 4);
+                entry.write_volatile(*frame as u32);
+                entry.add(1).write_volatile((*frame >> 32) as u32);
+                entry.add(2).write_volatile(0);
+                entry.add(3).write_volatile(flags);
             }
-            None => 0,
-        };
+        }
 
         // The command header, in slot 0: `CFL` in the low five bits, the write
-        // bit next to it, `PRDTL` in the high half. The write bit is the one
-        // field that decides whether a wrong buffer becomes a wrong *disk*.
-        let write = data.is_some_and(|(_, _, write)| write);
-        let dw0 = 5 | ((write as u32) << 6) | (prdt_len << 16);
+        // bit next to it, `PRDTL` in the high half; the next word is `PRDBC`, the
+        // total. The write bit is the one field that decides whether a wrong
+        // buffer becomes a wrong *disk*.
+        let dw0 = 5 | ((write as u32) << 6) | ((entries as u32) << 16);
         unsafe {
             header.write_volatile(dw0);
-            header
-                .add(1)
-                .write_volatile(data.map_or(0, |(_, bytes, _)| bytes as u32));
+            header.add(1).write_volatile(bytes as u32);
             header.add(2).write_volatile(self.ctba as u32);
             header.add(3).write_volatile((self.ctba >> 32) as u32);
         }
 
-        // Issue, and wait for the device to retire it. Slot 0 is the only bit
-        // this driver ever sets.
+        // Issue, and wait for the port to answer. Slot 0 is the only bit this
+        // driver ever sets.
         let slot = 1u32;
         wr(self.regs, PX_CI, slot);
-        if !wait_until(|| rd(self.regs, PX_CI) & slot == 0) {
-            return false;
-        }
-        // And then ask the task file, which is the actual answer: an ATA error
-        // is reported *after* the command bit retires, so a driver that stopped
-        // at the wait above would call a failed transfer a successful one.
-        let tfd = rd(self.regs, PX_TFD);
-        if tfd & (TFD_ERR | TFD_DF) != 0 || rd(self.regs, PX_IS) & PX_IS_TFES != 0 {
-            // Clear the status, so the next command is not answered by this
-            // one's error, and report the failure.
-            wr(self.regs, PX_IS, PX_IS_TFES);
+        // "Answered" is two registers wide: the slot's retirement is the
+        // command finishing, and the task-file error latch is the device
+        // refusing it. The wait below used to watch the first alone, so a port
+        // that latches the error and never clears the slot - which is exactly
+        // what a controller's "device present" port with nothing behind it does
+        // on this machine - was polled five million times, 28.3 s of the boot,
+        // before the error that had been there from the first read was read.
+        let answered = wait_until(|| !self.status(slot).waiting());
+        let status = self.status(slot);
+        // And the task file is the actual answer either way: an ATA error is
+        // reported *after* the command bit retires, so a driver that stopped at
+        // the wait above would call a failed transfer a successful one.
+        if !answered || status.failed() {
+            // Writing the latched bits back is how `PxIS` clears them; ask for
+            // the answer again on the next command rather than reading this
+            // one's failure a second time.
+            wr(self.regs, PX_IS, status.is);
             return false;
         }
         true
     }
 
-    /// Move whole sectors from the device into `buf`.
-    fn read(&self, sector: u64, buf: &mut [u8]) {
-        let sectors = (buf.len() / 512) as u16;
-        if !self.issue(
-            CMD_READ_DMA_EXT,
-            sector,
-            sectors,
-            Some((self.bounce, buf.len(), false)),
-        ) {
-            panic!(
-                "ahci: READ DMA EXT at sector {sector} ({sectors} sectors) failed: PxTFD {:#010x}",
-                rd(self.regs, PX_TFD)
-            );
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                phys_to_virt(self.bounce) as *const u8,
-                buf.as_mut_ptr(),
-                buf.len(),
-            );
+    /// The port's three status words, read as the one question [`issue`] asks.
+    fn status(&self, slot: u32) -> PortStatus {
+        PortStatus {
+            ci: rd(self.regs, PX_CI),
+            is: rd(self.regs, PX_IS),
+            tfd: rd(self.regs, PX_TFD),
+            slot,
         }
     }
 
-    /// Move whole sectors from `buf` to the device.
-    fn write(&self, sector: u64, buf: &[u8]) {
-        // The bytes go into the bounce page, which is what the PRDT points at.
-        // The copy happens here, under the caller's lock, so no second command
-        // can be building a transfer over the same page.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                phys_to_virt(self.bounce) as *mut u8,
-                buf.len(),
-            );
+    /// Move whole sectors from the device into `buf`.
+    ///
+    /// The request is planned into commands of at most [`MAX_TRANSFER`] by
+    /// [`crate::ahci::chunks`], and each command fills the bounce and is copied
+    /// out before the next one starts - the pages are the driver's, fixed at
+    /// bring-up, so the number of commands a caller causes is the only thing a
+    /// caller steers (the worst-case rule).
+    fn read(&self, sector: u64, buf: &mut [u8]) {
+        let mut done = 0usize;
+        for take in crate::ahci::chunks(buf.len(), MAX_TRANSFER) {
+            if !self.issue(
+                CMD_READ_DMA_EXT,
+                sector + (done / SECTOR) as u64,
+                (take / SECTOR) as u16,
+                Some((take, false)),
+            ) {
+                self.refused("READ DMA EXT", sector + (done / SECTOR) as u64, take);
+            }
+            self.copy_from_bounce(done, take, buf);
+            done += take;
         }
-        let sectors = (buf.len() / 512) as u16;
-        if !self.issue(
-            CMD_WRITE_DMA_EXT,
-            sector,
-            sectors,
-            Some((self.bounce, buf.len(), true)),
-        ) {
-            panic!(
-                "ahci: WRITE DMA EXT at sector {sector} ({sectors} sectors) failed: PxTFD {:#010x}",
-                rd(self.regs, PX_TFD)
-            );
+    }
+
+    /// Move whole sectors from `buf` to the device. The mirror of
+    /// [`Self::read`], with the bytes staged into the bounce pages first, under
+    /// the caller's lock, so no second command can be building a transfer over
+    /// pages the first one still owns.
+    fn write(&self, sector: u64, buf: &[u8]) {
+        let mut done = 0usize;
+        for take in crate::ahci::chunks(buf.len(), MAX_TRANSFER) {
+            self.copy_to_bounce(done, take, buf);
+            if !self.issue(
+                CMD_WRITE_DMA_EXT,
+                sector + (done / SECTOR) as u64,
+                (take / SECTOR) as u16,
+                Some((take, true)),
+            ) {
+                self.refused("WRITE DMA EXT", sector + (done / SECTOR) as u64, take);
+            }
+            done += take;
+        }
+    }
+
+    /// The block layer's rule for a device error: a panic with something in it
+    /// worth reading, naming the command, the sector it was at and the length it
+    /// had left.
+    #[cold]
+    fn refused(&self, command: &str, sector: u64, bytes: usize) -> ! {
+        panic!(
+            "ahci: {command} at sector {sector} ({}/512 bytes) failed: PxTFD {:#010x}",
+            bytes,
+            rd(self.regs, PX_TFD)
+        )
+    }
+
+    /// Copy the first `bytes` of the bounce into `buf[at..]`, run by run: the
+    /// pages are individually allocated and so are not contiguous, which is the
+    /// whole reason the table exists.
+    fn copy_from_bounce(&self, at: usize, bytes: usize, buf: &mut [u8]) {
+        for index in 0..bytes.div_ceil(PAGE_SIZE) {
+            let run = crate::ahci::run_bytes(bytes, index, PAGE_SIZE);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(self.bounce[index]) as *const u8,
+                    buf[at + index * PAGE_SIZE..].as_mut_ptr(),
+                    run,
+                );
+            }
+        }
+    }
+
+    /// The other direction of [`Self::copy_from_bounce`].
+    fn copy_to_bounce(&self, at: usize, bytes: usize, buf: &[u8]) {
+        for index in 0..bytes.div_ceil(PAGE_SIZE) {
+            let run = crate::ahci::run_bytes(bytes, index, PAGE_SIZE);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf[at + index * PAGE_SIZE..].as_ptr(),
+                    phys_to_virt(self.bounce[index]) as *mut u8,
+                    run,
+                );
+            }
         }
     }
 
     /// `FLUSH CACHE EXT`.
     fn flush(&self) -> bool {
         self.issue(CMD_FLUSH_CACHE_EXT, 0, 0, None)
+    }
+
+    /// The answer `IDENTIFY` wrote into the first bounce page.
+    fn identify_words(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(phys_to_virt(self.bounce[0]) as *const u8, SECTOR) }
     }
 }
 
@@ -348,13 +447,23 @@ impl BlockDev for AhciDisk {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) {
-        check_span(buf.len());
-        critical_section::with(|cs| self.port.borrow(cs).borrow().read(offset / 512, buf));
+        check_span(offset, buf.len());
+        critical_section::with(|cs| {
+            self.port
+                .borrow(cs)
+                .borrow()
+                .read(offset / SECTOR as u64, buf)
+        });
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) {
-        check_span(buf.len());
-        critical_section::with(|cs| self.port.borrow(cs).borrow().write(offset / 512, buf));
+        check_span(offset, buf.len());
+        critical_section::with(|cs| {
+            self.port
+                .borrow(cs)
+                .borrow()
+                .write(offset / SECTOR as u64, buf)
+        });
     }
 
     /// `FLUSH CACHE EXT`, and `true` only when the device said it worked.
@@ -378,15 +487,68 @@ impl BlockDev for AhciDisk {
     }
 }
 
-/// `BlockDev` promises at most one page per call, which is what one PRDT entry
-/// and one bounce page can describe. More than that is the caller's contract
-/// breaking, and the block layer's rule for a device error is a panic with
-/// something in it worth reading rather than a quiet shortfall.
-fn check_span(len: usize) {
+/// What a request must be to reach this device at all: whole sectors from a
+/// sector boundary, in either direction.
+///
+/// That is the whole of it now. The length is not a limit - a request the device
+/// can hold is a longer PRDT and, past [`MAX_TRANSFER`], more commands - and the
+/// offset is checked here rather than trusted from the caller because `LBA` and
+/// `count` are the only address a DMA command carries: an offset inside a sector
+/// has no encoding, and the failure would be a transfer of the wrong length
+/// rather than a refusal. virtio-blk asserts the same pair, and the two drivers
+/// answering the same question the same way is the point.
+fn check_span(offset: u64, len: usize) {
     assert!(
-        len <= PAGE_SIZE && len.is_multiple_of(512),
-        "ahci: {len} bytes is not a whole number of sectors within one page"
+        offset.is_multiple_of(SECTOR as u64) && len.is_multiple_of(SECTOR),
+        "ahci: {len} bytes at {offset:#x} is not a whole number of sectors from a sector boundary"
     );
+}
+
+/// Give back what [`bring_up`] took, and only after the port has said it stopped.
+///
+/// `false` means the pages stay allocated and unreferenced, which is the point:
+/// a controller whose engine did not come down still holds `PxCLB` and `PxFB`,
+/// and the frame behind those is the command list and the FIS area *it is
+/// writing to*. Handing that to the allocator does not fail there - it fails
+/// whenever the buddy system gives the page to someone else, which is a corrupt
+/// page cache entry or a process's data, three subsystems and a minute away from
+/// this function. A leaked page is a smaller wrong than that, and a bounded one:
+/// one port's worth per boot, on the machine that has a "present" port with
+/// nothing behind it - which the `q35` chipset's own SATA controller does, and
+/// whose stop the measurement says *does* come down (`PxCMD` quiet, `PxCI` empty),
+/// so the leak is the branch and not the rule.
+fn release(port: &AhciPort) {
+    if stop(port.regs) {
+        for frame in [port.clb, port.fb, port.ctba]
+            .into_iter()
+            .chain(port.bounce)
+        {
+            free_frames(frame, 0);
+        }
+    }
+}
+
+/// Clear `ST` and `FRE` and wait for the command engine and the FIS receiver to
+/// say they stopped. `false` is the same answer as everywhere else in this file:
+/// the port was asked and did not comply, and the caller has nothing truer to do
+/// than move on.
+///
+/// The command engine first and the FIS engine after it, in both directions: the
+/// other order leaves the controller reading a list that is about to move.
+fn stop(regs: usize) -> bool {
+    let cmd = rd(regs, PX_CMD);
+    if cmd & PX_CMD_ST != 0 {
+        wr(regs, PX_CMD, cmd & !PX_CMD_ST);
+        if !wait_until(|| rd(regs, PX_CMD) & PX_CMD_CR == 0) {
+            return false;
+        }
+    }
+    let cmd = rd(regs, PX_CMD);
+    if cmd & PX_CMD_FRE != 0 {
+        wr(regs, PX_CMD, cmd & !PX_CMD_FRE);
+        return wait_until(|| rd(regs, PX_CMD) & PX_CMD_FR == 0);
+    }
+    true
 }
 
 /// Probe the PCI bus for a SATA controller and bring up its first disk.
@@ -463,13 +625,19 @@ fn bring_up_controller(device: &crate::pci::Device) -> Option<Arc<dyn BlockDev>>
         }
         // An ATAPI device is the one this driver cannot drive. What a *disk*
         // is, `IDENTIFY` says.
-        if rd(regs, PX_SIG) == SIG_ATAPI {
+        if signature_is_atapi(rd(regs, PX_SIG)) {
             continue;
         }
         let Some(port) = bring_up(regs) else {
             continue;
         };
         let Some(sectors) = identify(&port) else {
+            // A port that claims a device and will not identify one - which is
+            // what this machine's built-in controller's port 2 does, and used to
+            // cost 28 s of the boot before `crate::ahci` started reading the
+            // error latch. Quiet it and take the memory back before the next
+            // port, so trying every candidate costs nothing per failure.
+            release(&port);
             continue;
         };
         return Some(Arc::new(AhciDisk {
@@ -482,30 +650,43 @@ fn bring_up_controller(device: &crate::pci::Device) -> Option<Arc<dyn BlockDev>>
 
 /// Stop the port, point it at this driver's own memory, and start it again.
 fn bring_up(regs: usize) -> Option<AhciPort> {
-    // The command engine first, then the FIS engine: the other order leaves the
-    // controller reading a list that is about to move.
-    if rd(regs, PX_CMD) & PX_CMD_ST != 0 {
-        wr(regs, PX_CMD, rd(regs, PX_CMD) & !PX_CMD_ST);
-        if !wait_until(|| rd(regs, PX_CMD) & PX_CMD_CR == 0) {
-            return None;
-        }
-    }
-    if rd(regs, PX_CMD) & PX_CMD_FRE != 0 {
-        wr(regs, PX_CMD, rd(regs, PX_CMD) & !PX_CMD_FRE);
-        if !wait_until(|| rd(regs, PX_CMD) & PX_CMD_FR == 0) {
-            return None;
-        }
+    if !stop(regs) {
+        return None;
     }
 
-    // Four frames, each one page and so aligned past every alignment the
-    // controller asks for: the command list wants 1 KiB, the FIS area 256 bytes
-    // and the command table 128. The fourth is the data page, which is also what
-    // `BlockDev` promises a caller: one page, physically contiguous.
-    let clb = alloc_frames(0)?;
-    let fb = alloc_frames(0)?;
-    let ctba = alloc_frames(0)?;
-    let bounce = alloc_frames(0)?;
-    for frame in [clb, fb, ctba, bounce] {
+    // The DMA memory: a command list, a received-FIS area, one command table and
+    // the bounce - `BOUNCE_PAGES` pages, which are the runs one command's table
+    // can describe. Every one of them is a single frame, and that is the whole
+    // of the alignment story: the command list wants 1 KiB, the FIS area 256
+    // bytes and the command table 128, and a page clears all three without
+    // asking the allocator for a contiguous run it may not have. The bounce pages
+    // do not need to be contiguous with each other either, because `PRDT` is a
+    // list - see [`AhciPort::issue`].
+    let mut frames = [0usize; 3 + BOUNCE_PAGES];
+    let mut taken = 0usize;
+    for slot in frames.iter_mut() {
+        match alloc_frames(0) {
+            Some(frame) => {
+                *slot = frame;
+                taken += 1;
+            }
+            None => {
+                // Hand back what this port got before giving up on it. A machine
+                // whose controller reports a present port with nothing behind it
+                // walks this path on every boot, and a bring-up that leaves its
+                // memory behind when it fails is a boot that loses a little more
+                // each time.
+                for frame in frames[..taken].iter() {
+                    free_frames(*frame, 0);
+                }
+                return None;
+            }
+        }
+    }
+    let (clb, fb, ctba) = (frames[0], frames[1], frames[2]);
+    let mut bounce = [0usize; BOUNCE_PAGES];
+    bounce.copy_from_slice(&frames[3..]);
+    for frame in frames {
         unsafe {
             core::ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE);
         }
@@ -527,6 +708,7 @@ fn bring_up(regs: usize) -> Option<AhciPort> {
     Some(AhciPort {
         regs,
         clb,
+        fb,
         ctba,
         bounce,
     })
@@ -538,10 +720,11 @@ fn bring_up(regs: usize) -> Option<AhciPort> {
 /// itself is one this driver has nothing true to say about, so the answer is
 /// `None` rather than a disk of unknown size.
 fn identify(port: &AhciPort) -> Option<u64> {
-    if !port.issue(CMD_IDENTIFY, 0, 1, Some((port.bounce, 512, false))) {
+    // 512 bytes: the identity page, which is one run of the table.
+    if !port.issue(CMD_IDENTIFY, 0, 1, Some((SECTOR, false))) {
         return None;
     }
-    let words = unsafe { core::slice::from_raw_parts(phys_to_virt(port.bounce) as *const u8, 512) };
+    let words = port.identify_words();
     let word = |index: usize| u16::from_le_bytes([words[index * 2], words[index * 2 + 1]]);
 
     // Words 100..103 are the 48-bit capacity in sectors, little-endian by word;

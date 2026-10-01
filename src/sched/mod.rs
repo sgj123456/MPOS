@@ -21,18 +21,19 @@ pub use runtime::{
     ItimerState, MAX_TASKS, MapFacts, Redirect, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID,
     STACK_ORDER, SpawnError, Stop, TIMER_ABSTIME, TaskSnapshot, TimerNotify, WaitEnd, WaitEvent,
     acquire_controlling_tty, become_session_leader, block_until, block_until_child_event,
-    block_until_code, block_until_deadline, brk, charge_cpu, check_itimer, child_event,
-    child_event_pending, child_exited_unreaped, claim_anon_gaps, clone, continued_report_pending,
-    controlling_tty_of_current, current, current_blocked, current_comm_bytes, current_cpu_ticks,
-    current_cwd, current_cwd_path, current_disposition, current_exe, current_fds, current_groups,
-    current_identity, current_is_root, current_is_seccomp_strict, current_map_user, current_owner,
-    current_pending, current_pgid, current_real_owner, current_rlimit, current_stack_range,
-    current_tgid, current_tls, current_umask, current_uts, deliver_pending_signal,
-    descriptor_numbers, descriptors_of, detach_traced, device_not_available, discard_exit_code,
-    exec_replace, exec_trap, exit, exit_code, exit_group, fork, fork_trap, get_mmap_cursor,
-    group_members, group_stop, has_children, has_deliverable_signal, has_live_child,
-    has_seccomp_filter, has_tracer, init, insert_vma, is_child, is_stopped, itimer_snapshot,
-    itimer_swap, kernel_lazy_accessible, madvise_dontneed, map_anon, map_facts, map_frames,
+    block_until_code, block_until_deadline, block_until_interruptible, brk, charge_cpu,
+    check_itimer, child_event, child_event_pending, child_exited_unreaped, claim_anon_gaps, clone,
+    continued_report_pending, controlling_tty_of_current, credentials_of, current, current_blocked,
+    current_comm_bytes, current_cpu_ticks, current_credentials, current_cwd, current_cwd_path,
+    current_disposition, current_exe, current_fds, current_groups, current_identity,
+    current_is_root, current_is_seccomp_strict, current_map_user, current_owner, current_pending,
+    current_pgid, current_real_owner, current_rlimit, current_stack_range, current_tgid,
+    current_tls, current_umask, current_uts, deliver_pending_signal, descriptor_numbers,
+    descriptors_of, detach_traced, device_not_available, discard_exit_code, exec_replace,
+    exec_trap, exit, exit_code, exit_group, fork, fork_trap, get_mmap_cursor, group_members,
+    group_stop, has_children, has_deliverable_signal, has_live_child, has_seccomp_filter,
+    has_tracer, init, insert_vma, is_child, is_stopped, itimer_snapshot, itimer_swap,
+    kernel_lazy_accessible, madvise_dontneed, map_anon, map_facts, map_frames, may_inspect,
     membarrier_registrations, move_user_page, munmap_user, nice_of, oom_score_adj_of, parent_of,
     pause, permanent_tasks, pgid_of, poll_any_child, poll_any_child_event, populate_user_page_at,
     preempt, process_members, protect_user, protect_user_range, read_sigchld, read_user,
@@ -52,7 +53,7 @@ pub use runtime::{
     trace_fpu, trace_options, trace_regs, trace_signal_stop, trace_syscall, tracer_of,
     try_spawn_user, uid_members, unmap_user, unshare_uts, user_frame_at, user_mapped,
     user_range_free, vfork, vma_gaps, vma_prot_at, wait_any_child, wait_any_child_event,
-    wait_for_interrupt, wake, write_user, write_user_of, yield_now,
+    wait_for_interrupt, wake, with_current_credentials, write_user, write_user_of, yield_now,
 };
 
 /// A host build has no processes, so no creator: root, which is what a node
@@ -60,6 +61,32 @@ pub use runtime::{
 #[cfg(not(target_os = "none"))]
 pub fn current_owner() -> (u32, u32) {
     (0, 0)
+}
+
+/// A host build has no task table, so a process's credentials are one value -
+/// the state a fresh process starts in. That is exactly what the `prctl`,
+/// `capget`/`capset` and ptrace unit tests want to manipulate, and it reduces
+/// to the machine's behaviour when there is one process.
+#[cfg(not(target_os = "none"))]
+static HOST_CREDENTIALS: critical_section::Mutex<core::cell::RefCell<crate::cred::Credentials>> =
+    critical_section::Mutex::new(core::cell::RefCell::new(crate::cred::Credentials::initial()));
+
+#[cfg(not(target_os = "none"))]
+pub fn current_credentials() -> crate::cred::Credentials {
+    critical_section::with(|cs| *HOST_CREDENTIALS.borrow(cs).borrow())
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn with_current_credentials<R>(f: impl FnOnce(&mut crate::cred::Credentials) -> R) -> R {
+    critical_section::with(|cs| f(&mut HOST_CREDENTIALS.borrow(cs).borrow_mut()))
+}
+
+/// On the host there is one process, and it is the caller: every pid names it,
+/// so the answer is "yes, live" and the policy folds to the caller inspecting
+/// itself - which `ptrace_may_access` allows unconditionally.
+#[cfg(not(target_os = "none"))]
+pub fn may_inspect(_target: TaskId) -> Option<bool> {
+    Some(true)
 }
 
 /// The same absence for the *real* ids, which is the pair `access(2)` asks

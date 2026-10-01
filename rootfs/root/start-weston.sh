@@ -29,8 +29,9 @@
 # socket). See the notes at each step below.
 #
 # Run it from a gui boot (cargo xtask run --mode gui), at root's login prompt on
-# the serial terminal - the window stays the compositor's to fill, so it is blank
-# until this script runs weston:
+# the window's tty1 - in that mode the text console shows in the QEMU window, so
+# there is no serial terminal to log in on; the window is the screen weston takes
+# over when this script runs it:
 #     ./start-weston.sh [extra weston args...]
 
 set -eu

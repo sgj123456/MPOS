@@ -226,8 +226,10 @@ pub fn linux_dispatch(
     // see the *result* of the syscall it interrupted, and the result does not
     // exist until the call has returned. Jumping into a handler means
     // rewriting the frame the task will `sysretq` through, which is why this
-    // is also the only delivery point that can run one that needs a frame.
-    if linux::deliver_signal(regs_ptr, ret) {
+    // is also the only delivery point that can run one that needs a frame -
+    // and the only one that can rewind an interrupted call, because the frame
+    // it rewrites is the record of the call's own arguments.
+    if linux::deliver_signal(regs_ptr, nr, ret) {
         // The interrupted call's value belongs to the handler now: it is on
         // the frame, waiting for `rt_sigreturn` to put it back.
         return 0;

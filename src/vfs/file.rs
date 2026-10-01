@@ -92,7 +92,27 @@ pub struct File {
     /// is both slow and, on a path that cannot be reached from the root, has
     /// no answer at all.
     label: Mutex<RefCell<Option<alloc::string::String>>>,
+    /// The filesystem id this description lives on, recorded at open from the
+    /// same path the label keeps. `DEV_UNSET` until then.
+    ///
+    /// `st_dev` is a property of the *file*, and the two doors that report it
+    /// have to agree. `stat(path)` looks the answer up by path; a descriptor
+    /// cannot, and an inode does not name its own filesystem, so the fallback
+    /// ([`crate::vfs::mount::fs_id_of_inode`]) can only match a mount by its
+    /// *root* inode - a plain file inside a mount therefore answered 0 while
+    /// `stat` on the same path answered the mount's id. A caller that locks a
+    /// file and then verifies the name still names the inode it locked (the
+    /// standard way to close the lock-file race, and what `wayland-backend`
+    /// does on `wayland-N.lock`) compares exactly these two answers, so a
+    /// disagreement is not a wrong number but a retry that never converges.
+    /// Recording the id where the path *is* known fixes it at the source.
+    /// See `PLAN.md` §7.4.
+    dev: core::sync::atomic::AtomicU64,
 }
+
+/// `File::dev` before an open has recorded one. `u64::MAX` is not a filesystem
+/// id this mount table ever issues, so it is a safe "nobody said".
+const DEV_UNSET: u64 = u64::MAX;
 
 impl File {
     /// A fresh description positioned at the start.
@@ -104,7 +124,20 @@ impl File {
             access: AtomicU8::new(ACC_RDWR),
             status: core::sync::atomic::AtomicU32::new(0),
             label: Mutex::new(RefCell::new(None)),
+            dev: core::sync::atomic::AtomicU64::new(DEV_UNSET),
         }
+    }
+
+    /// Record the filesystem this description was opened on.
+    pub fn set_dev(&self, dev: u64) {
+        self.dev.store(dev, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The filesystem id this description was opened on, if an open recorded
+    /// one. `None` for a descriptor that no path made.
+    pub fn dev(&self) -> Option<u64> {
+        let dev = self.dev.load(core::sync::atomic::Ordering::Relaxed);
+        (dev != DEV_UNSET).then_some(dev)
     }
 
     /// Record the path this description was opened by.

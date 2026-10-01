@@ -10,6 +10,14 @@
 //! `EINVAL`, the way Linux's `prctl` default arm answers a number it does not
 //! know.
 //!
+//! The four options whose state the kernel keeps are pinned shape by shape
+//! against Linux 7.2.7: `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` (0 and 1 accepted,
+//! 2 and 3 `EINVAL`, and a refused set leaves the flag alone),
+//! `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS` (0 and 1 only), and
+//! `PR_CAPBSET_READ`/`PR_CAPBSET_DROP` (1 or 0 for 0..=40, `EINVAL` past it,
+//! and a drop visible to the next read). They used to be `EINVAL` like every
+//! other unmodelled option, which is the counterfactual here.
+//!
 //! The name round-trip is the behaviour this program exists to pin: `PR_SET_NAME`
 //! used to fall through the same `_ => 0` arm as every unmodelled option -
 //! accepted and dropped - and `PR_GET_NAME` answered sixteen zeroes, so the
@@ -102,6 +110,140 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"PR_SET_SECCOMP with the filter mode and no program answers EFAULT",
         lin::prctl(lin::PR_SET_SECCOMP, SECCOMP_MODE_FILTER, 0, 0, 0),
         lin::EFAULT,
+    );
+
+    // ---- The dumpable flag and the capability options ----
+    //
+    // These four used to fall through the same `_ => 0` arm as every other
+    // unmodelled option and be refused `EINVAL` when that arm was removed; they
+    // are answered now because the kernel keeps the state they describe. Every
+    // shape below is the one measured on Linux 7.2.7, and each is a
+    // counterfactual against the `EINVAL` this program used to get.
+    lin::check_eq(
+        &mut failed,
+        b"PR_GET_DUMPABLE starts at SUID_DUMP_USER (1)",
+        lin::prctl(lin::PR_GET_DUMPABLE, 0, 0, 0, 0),
+        1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"PR_SET_DUMPABLE(0) is accepted",
+        lin::prctl(lin::PR_SET_DUMPABLE, 0, 0, 0, 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and PR_GET_DUMPABLE reads it back",
+        lin::prctl(lin::PR_GET_DUMPABLE, 0, 0, 0, 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"PR_SET_DUMPABLE(1) is accepted",
+        lin::prctl(lin::PR_SET_DUMPABLE, 1, 0, 0, 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and reads back as SUID_DUMP_USER",
+        lin::prctl(lin::PR_GET_DUMPABLE, 0, 0, 0, 0),
+        1,
+    );
+    // 2 is the kernel's own SUID_DUMP_ROOT and is not settable through this
+    // door: measured, `PR_SET_DUMPABLE(2)`, `(3)` and `(-1)` are all `EINVAL`.
+    for (arg, label) in [
+        (
+            2usize,
+            b"PR_SET_DUMPABLE(2) is EINVAL - SUID_DUMP_ROOT is not settable".as_slice(),
+        ),
+        (3, b"PR_SET_DUMPABLE(3) is EINVAL"),
+    ] {
+        lin::check_eq(
+            &mut failed,
+            label,
+            lin::prctl(lin::PR_SET_DUMPABLE, arg, 0, 0, 0),
+            lin::EINVAL,
+        );
+    }
+    lin::check_eq(
+        &mut failed,
+        b"and a refused set left the flag alone",
+        lin::prctl(lin::PR_GET_DUMPABLE, 0, 0, 0, 0),
+        1,
+    );
+
+    // KEEPCAPS round-trips, and only 0 and 1 are values (measured: 2 is EINVAL).
+    lin::check_eq(
+        &mut failed,
+        b"PR_GET_KEEPCAPS starts clear",
+        lin::prctl(lin::PR_GET_KEEPCAPS, 0, 0, 0, 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"PR_SET_KEEPCAPS(1) is accepted",
+        lin::prctl(lin::PR_SET_KEEPCAPS, 1, 0, 0, 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and reads back set",
+        lin::prctl(lin::PR_GET_KEEPCAPS, 0, 0, 0, 0),
+        1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"PR_SET_KEEPCAPS(2) is EINVAL",
+        lin::prctl(lin::PR_SET_KEEPCAPS, 2, 0, 0, 0),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"PR_SET_KEEPCAPS(0) clears it again",
+        lin::prctl(lin::PR_SET_KEEPCAPS, 0, 0, 0, 0),
+        0,
+    );
+
+    // The bounding set: every capability is in it to start, 41.. are not
+    // capabilities at all, and a drop is visible to the next read.
+    lin::check_eq(
+        &mut failed,
+        b"PR_CAPBSET_READ(CAP_CHOWN) is 1 to start",
+        lin::prctl(lin::PR_CAPBSET_READ, 0, 0, 0, 0),
+        1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"PR_CAPBSET_READ(CAP_LAST_CAP) is 1",
+        lin::prctl(lin::PR_CAPBSET_READ, lin::CAP_LAST_CAP, 0, 0, 0),
+        1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"PR_CAPBSET_READ past the last capability is EINVAL",
+        lin::prctl(lin::PR_CAPBSET_READ, lin::CAP_LAST_CAP + 1, 0, 0, 0),
+        lin::EINVAL,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"PR_CAPBSET_DROP(CAP_CHOWN) is accepted for root",
+        lin::prctl(lin::PR_CAPBSET_DROP, 0, 0, 0, 0),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and the next read shows it gone",
+        lin::prctl(lin::PR_CAPBSET_READ, 0, 0, 0, 0),
+        0,
+    );
+    // Measured on Linux: the capability is asked *before* the number, so a
+    // number past the last one is EINVAL for root and EPERM for a caller
+    // without CAP_SETPCAP.
+    lin::check_eq(
+        &mut failed,
+        b"PR_CAPBSET_DROP past the last capability is EINVAL",
+        lin::prctl(lin::PR_CAPBSET_DROP, lin::CAP_LAST_CAP + 1, 0, 0, 0),
+        lin::EINVAL,
     );
 
     // An option the handler does not model is refused, the way Linux's `prctl`

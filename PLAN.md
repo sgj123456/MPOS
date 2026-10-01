@@ -19,8 +19,22 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         nobody trapped and nobody cares about does not (`t-tty-eintr`); the
         `VMIN`/`VTIME` pair decides what a read waits for at all
         (`t-tty-vtime`) (§2.5)
-  - [ ] `SA_RESTART` is recorded, not acted on — the interrupted call always
-        comes back `EINTR` instead of being rewound and re-run (§2.5)
+  - [x] `SA_RESTART` is acted on: an interrupted call whose disposition carries
+        it is *rewound* through the frame the handler runs on, so the caller
+        never sees the `EINTR` (`t-sa-restart`), and the calls Linux never
+        restarts — `poll`, `select`, `epoll_wait`, the sleeps — still answer it
+        (§2.5)
+  - [x] `O_NONBLOCK` on a terminal: the measured `EAGAIN`/partial-byte table,
+        through `open`, `fcntl(F_SETFL)` and `ioctl(FIONBIO)`, on the slave and
+        on the master's own read (`t-tty-nonblock`, host tests) (§2.5)
+  - [x] every other blocking wait a signal can end: pipe read/write, eventfd,
+        signalfd, inotify, unix datagram/accept/connect, the pty write
+        back-pressure, the AF_PACKET and route-netlink reads, and
+        `nanosleep`/`clock_nanosleep` with the remainder in `rem`
+        (`t-wait-eintr`, `t-sa-restart`). Named remainders: `wait4`/`waitid` and
+        the console's serial transmit wait, whose parks are still
+        fatal-signal-only, and `ioctl`'s missing per-request restart verdict
+        (§2.5)
 - [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3)
   - [x] `flock` owned by the open file description, record locks by the process
         (`t-filelock`) · read/write deliberately *not* enforced: Linux advisory
@@ -603,12 +617,17 @@ network-timing reds in the concurrent net work; a confirming run showed `pass=13
 **The sweep's *set* is now a configuration, and its default is smaller on purpose.** Every test
 is still built, but `tests.toml` at the repository root names the programs the default sweep
 leaves out, and the harness stages only what is selected: `external` (`t-dns`,
-`t-stdresolve`, `t-udp`, `t-tcp-close` — all four need something outside the machine),
+`t-rawicmp`, `t-stdresolve`, `t-udp`, `t-tcp-close` — all five need something outside the
+machine),
 `slow` (`t-fill-ramfs`, `t-forkcost`, `t-netlat`, `t-pipecost`) and `diagnostic` (`t-sh`).
 `cargo xtask test --groups <a,b>` runs an explicit list, `--all-groups` runs everything, and a
 group name the file does not define — or a name in the file that no built program answers to —
-is an error rather than a smaller sweep. The measured default is `=== SUMMARY pass=127 fail=0
-(127 built)` with `9 of 136 user tests left out by tests.toml`, QEMU exit `33`.
+is an error rather than a smaller sweep. `t-rawicmp` joined `external` when it was measured
+doing what that group is for: it pings a public address and compares the answer against what
+the host's own `ping` gets, so the internet is one of its two halves — it blocked three of four
+sweep runs while it was listed as a machine check, and the same kernel answered 3/3 from the
+run machine minutes earlier (§2.5's run). The measured default is `=== SUMMARY pass=134 fail=0
+(134 built)` with `10 of 144 user tests left out by tests.toml`, QEMU exit `33`.
 
 Two things that follows from it, both worth stating because they change what a red means:
 
@@ -688,6 +707,54 @@ Two things that follows from it, both worth stating because they change what a r
       privileged credit stays an honest `0` no-op on the always-full ChaCha stream, and a privileged
       `RNDZAPENTCNT`/`RNDCLEARPOOL` is refused `EOPNOTSUPP` rather than the old `0` that `RNDGETENTCNT`
       contradicted (`t-ioctl`: root ADD→0, root ZAP→`EOPNOTSUPP`, `setresuid`-dropped→`EPERM`)
+      **A8 corrected (the boot's `seedrng: Unable to seed: Not supported`):** that pass left the family
+      dispatched on `request & 0xff`, and the `'R'` command numbers it assigned were wrong by one — the
+      arm written as `Some(3) | Some(4)  // RNDCLEARPOOL / RNDZAPENTCNT` is `RNDADDENTROPY` (nr 3) and
+      `RNDZAPENTCNT` (nr 4), while `RNDCLEARPOOL` is nr 6 and nr 2 is the removed `RNDGETPOOL`. So the
+      credit OpenRC's seedrng sends on every boot — `RNDADDENTROPY` = `_IOW('R', 0x03, int [2])` =
+      `0x40085203`, verified as the binary's *only* ioctl immediate with `objdump` on
+      `/usr/libexec/rc/sbin/seedrng` in this image's own rootfs — fell into the drain arm and got
+      `EOPNOTSUPP` back. `t-ioctl`'s own `RNDADDENTROPY` constant was `0x40085202`, i.e. `RNDGETPOOL`,
+      which pinned the wrong word and so passed for the wrong reason: a test that cannot tell a credit
+      from a removed request agreed with a handler that could not either (§4.6, and the reason the pin
+      is now a table of whole command words). Measured on real Linux 7.2.7, root and unprivileged, on
+      `/dev/random` and `/dev/urandom`: the family switches on the **whole word** (`_IOW('R',0x03,int)`
+      and `_IOWR('R',0x03,int[2])` are `EINVAL`), an unrecognised `'R'` number is `EINVAL` *before* the
+      capability is asked (unprivileged `RNDGETPOOL` → `EINVAL`, `RNDZAPENTCNT` → `EPERM`), a credit's
+      negative entropy count is `EINVAL` even beside an unusable length (`{-1,-1}`, `{-1,65536}`), a
+      negative or unmapped length is `EFAULT` (`{8,-1}`, `{8,16MiB}`, `arg=NULL`), a zero length or zero
+      count is `0`, a 1 MiB credit whose bytes really are there is `0`, and none of it is gated on the
+      descriptor's mode (`RNDADDENTROPY` succeeds on an `O_RDONLY` fd). A `struct rand_pool_info`'s seed
+      is *checked*, never copied — this pool has no accumulator to receive it — so the worst case a
+      caller can steer is one page walk plus `buffer_ok`'s `MAX_IO` bound (the worst-case rule). Also
+      measured: `RNDADDTOENTCNT`/`RNDZAPENTCNT`/`RNDCLEARPOOL`/`RNDRESEEDCRNG` are `EPERM` unprivileged
+      and `0` for root, and an `'R'` word on `/dev/rtc0`, `/dev/tty1` or a regular file is `ENOTTY`,
+      which is why the device gate stays in front of the command. **Both gaps this left open are now
+      closed** (`UAPI.md` §5.1): (i) `RNDRESEEDCRNG` re-keys the generator for real and answers the `0`
+      Linux answers root. `rand::reseed()` re-rolls the ChaCha key from a fresh `seed()` mixed with a
+      draw from the current stream, so the state after the call is one no earlier output predicts and
+      the re-key is never a fixed point even where `seed()` is (the host test build - which is what
+      makes the key change pinnable there); an unprivileged caller still gets `EPERM`, asked first,
+      as measured. `RNDZAPENTCNT`/`RNDCLEARPOOL` deliberately stay `EOPNOTSUPP` for root: there is
+      still no drainable count, and a `0` would be the fake that `RNDGETENTCNT` contradicts one moment
+      later. (ii) `FIONREAD` on the two entropy devices answers the `EINVAL` Linux answers - measured
+      7.2.7, both devices, both users, `O_RDONLY` and `O_WRONLY`, and *before* the argument is read (a
+      NULL or unmapped pointer is still `EINVAL`, not `EFAULT`) - not the 512. The rationale comment
+      that justified the 512 was false for the reason this paragraph already gave: `seedrng` takes its
+      seed length from `/proc/sys/kernel/random/poolsize` and sends one ioctl, the credit above.
+      `handle_ioctl`'s `0x541B` arm and `t-ioctl`'s 512 pin moved together, as planned, and the pin
+      now asserts `EINVAL` with a NULL-argument line beside it (the divergence is named in `UAPI.md`
+      §5.2 for the two descriptors that *would* answer a count on Linux - a regular file and a pipe -
+      which keep the honest `ENOTTY` here for now).
+      **Gated:** host `620 passed`, guest `=== SUMMARY pass=132 fail=0 (132 built)` with QEMU exit 33,
+      and 31 `'R'`-family lines in `t-ioctl`. Two of them are the counterfactuals that matter:
+      `RNDADDENTROPY {64, 0} is accepted` and `RNDADDENTROPY with the seed bytes it declares is
+      accepted` both answered `EOPNOTSUPP` before this change, and
+      `RNDGETPOOL, which the kernel stopped answering` answered `0` — the old dispatch's `Some(2)` arm
+      took a removed request as a credit and faked the success, which is the §4.2 shape this phase is
+      about, arrived at from the other direction.
+      **Re-gated after (i) and (ii):** host `635 passed`; guest `=== SUMMARY pass=134 fail=0
+      (134 built)`, QEMU exit 33, `t-ioctl === PASS`.
       **A9 ioctl buffer-direction audit (this pass):** the whole `handle_ioctl` surface was swept for the
       one class Phase 12 is about - a request that answers success having done less than Linux. Every
       `_IOR`-style getter that fills the caller's buffer was checked against the `buffer_ok(…, write, …)`
@@ -695,13 +762,14 @@ Two things that follows from it, both worth stating because they change what a r
       `VT_GETMODE`, `RNDGETENTCNT`, `RTC_RD_TIME` and every evdev `give`/`give_state` correctly require a
       **writable** destination (Linux's `put_user` faults a read-only one with `EFAULT`), and each `_IOW`
       setter correctly requires only a readable one. The sole outlier is the block-device size trio
-      (`BLKGETSIZE64`/`BLKGETSIZE`/`BLKSSZGET`): they write the size into `buf` but validate it `write=false`,
-      so a read-only destination is accepted and filled where Linux answers `EFAULT`. It is recorded, not
-      fixed, because it is not the §4.2 category - the size is returned truthfully, so no real caller
-      (libblkid, `blockdev`, which pass a writable variable) ever sees the divergence - and it cannot be
-      pinned here: the host `user_accessible` stub answers accessible for both directions, and the selftest
-      boots **without a disk**, so no block node exists to open and reach the path. When a block node enters
-      the test image the fix is the three `false`→`true`, with a `t-ioctl` PROT_READ-buffer `EFAULT` pin.
+      (`BLKGETSIZE64`/`BLKGETSIZE`/`BLKSSZGET`): they write the size into `buf` but validated it `write=false`,
+      so a read-only destination was accepted and filled where Linux answers `EFAULT`. **Fixed in the
+      Phase-12 leftovers pass** (`UAPI.md` §5.1): the three validations read `true` now, so a `PROT_READ`
+      destination faults as Linux's `put_user` does - measured on a real device, all three are `EFAULT`
+      against a `PROT_READ` mapping. It remains **unpinned in the gate** for exactly the reason it was
+      recorded rather than fixed the first time: the host `user_accessible` stub answers accessible for both
+      directions, and the selftest boots **without a disk**, so no block node exists to open and reach the
+      path. When a block node enters the test image the pin is a `t-ioctl` `PROT_READ`-buffer `EFAULT` line.
 - [x] 12.B contract-completion batch, gated on the full run. **Landed and gated:** IPv4
       `MSG_PEEK`/`MSG_DONTWAIT` made consistent with the other families (`t-sock-flags`); access
       mode enforced after `open` - `File::read`/`write` refuse an `O_WRONLY` read / `O_RDONLY`
@@ -840,7 +908,11 @@ things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
 
 - **~229 Linux x86_64 syscalls** implemented
 - **Uniprocessor** — single core, `critical_section::Mutex<RefCell<T>>`
-- **Signals** — handlers delivered via `rt_sigframe`, mask enforcement, `sigqueue` siginfo payloads
+- **Signals** — handlers delivered via `rt_sigframe`, mask enforcement, `sigqueue` siginfo payloads, and `SA_RESTART` acted on (an interrupted call is rewound
+  through the handler's own frame); every blocking wait a catchable signal can
+  end answers `EINTR` — terminals (`O_NONBLOCK` included), pipes, eventfd,
+  signalfd, inotify, unix sockets, AF_PACKET, netlink and `nanosleep` with its
+  remainder (§2.5)
 - **Filesystems**: ramfs, ext2/ext4 (write-through), devfs, procfs, sysfs, devpts
 - **Networking**: smoltcp TCP/UDP/ICMP/ARP over virtio-net and a real loopback
   (`lo` = `127.0.0.0/8` over smoltcp's loopback device, one socket set per
@@ -883,8 +955,9 @@ behaviours below, are the whole of what is left to reach "full Linux ABI".
   watches), a directory's `IN_MOVE_SELF` waits on directory rename, and a
   rename that replaces a name reports the `IN_DELETE` this kernel's copy
   actually performs.
-- `fanotify_init` (302) / `fanotify_mark` (303) — less common (antivirus, some
-  mount monitors).
+- `fanotify_init` (300) / `fanotify_mark` (301) — less common (antivirus, some
+  mount monitors). (These two read `302`/`303` here until this line; the header's
+  numbers and the ones `t-enosys` walks are `300`/`301`.)
 - `keyctl` (250) — kernel keyring; needed by `keyutils`/some TLS/pam stacks.
 
 **POSIX timers (`timer_create` 222, `timer_settime` 223, `timer_gettime` 224,
@@ -1119,7 +1192,7 @@ until re-arm.
 
 ---
 
-## Phase 2: Signal Delivery (High Priority) — **DONE**
+## Phase 2: Signal Delivery (High Priority) — **DONE**, with three named remainders
 
 Signals are now delivered to installed handlers, not just recorded. A
 signal that a process catches builds an `rt_sigframe` on the user stack,
@@ -1174,6 +1247,14 @@ blocked terminal read with `EINTR`, the handler having run first, and the
 retried read still gets the line typed while it was not reading; the same
 timer with `SIG_IGN` does *not* interrupt it) and
 `t-tty-vtime.rs` (the `VMIN`/`VTIME` table, timing included).
+
+The rest of the family is pinned the same way, one program per half of the
+rule: `t-sa-restart.rs` (the rewind, its counterfactual, and the calls Linux
+never restarts — `poll` and `nanosleep` among them), `t-tty-nonblock.rs` (the
+`O_NONBLOCK` table, and which end of a pty pair each bit belongs to), and
+`t-wait-eintr.rs` (every other wait, each checked twice: the signal ends it with
+the handler having run, and the same call then answers normally when the thing
+it waited for arrives).
 
 ### 2.5 Interruptible waits, and `VMIN`/`VTIME` — implemented
 
@@ -1240,30 +1321,105 @@ Three consequences the previous code got wrong, all of them the same freeze:
   sleep. `vim`'s timeouts are `SIGALRM`, and a resize is `SIGWINCH`; both
   arrived, were seen, and were thrown away.
 
-Named gaps this leaves, each with the reason it is not here yet:
+Named gaps this leaves, and the three that have since closed:
 
-- **`SA_RESTART`.** Recorded in the disposition, never acted on: an interrupted
-  call always comes back `EINTR`. The rewind Linux really does — measured as
-  `rt_sigreturn({mask[]} = 0` followed by a second `read` with the caller's
-  original arguments — needs the per-syscall restartable set decided first
-  (`poll`/`ppoll`/`select` are deliberately *not* restarted here, and rewinding
-  them would be a handler loop that never returns), and a frame flag to carry
-  the verdict: `build_frame` would store `sc::RIP = regs.rcx - 2` and
-  `sc::RAX = nr` for a restartable call, and `rt_sigreturn` needs no change
-  because the frame *is* the record. What that costs a caller today: a program
-  that sets `SA_RESTART` and does not check `EINTR` treats its own wake-up as
-  an I/O error.
-- **`O_NONBLOCK` on a terminal.** Measured above: `-1/EAGAIN`, and `VTIME` is
-  not consulted. Plumbing it to `Inode::read_at_client` is the work; the pipe
-  shape is already pinned by `t-fionbio.rs`.
-- **The other bare `block_until` waits.** `pipe.rs` (read and write),
-  `eventfd.rs`, `signalfd.rs`, `inotify.rs`, `unix.rs` and the pty master's
-  write backpressure all sleep through a catchable signal today, exactly as the
-  tty did; `VfsError::Interrupted` makes each of them a one-line change with a
-  test beside it, which is why they are listed rather than half-done.
+- **`SA_RESTART` — closed.** The rewind is the frame's, in the shape this
+  section predicted: `build_frame` stores `sc::RIP = regs.rcx - 2` (the
+  `syscall` instruction is two bytes) and `sc::RAX = nr`, so `rt_sigreturn`
+  resumes *on* the call with the caller's own arguments - they are in the frame
+  the handler has not touched - and `rt_sigreturn` itself needed no change,
+  because the frame *is* the record. Three things have to agree, and each is
+  measured: the call came back `EINTR` (in this kernel: a wait ended with
+  nothing consumed), the disposition being delivered carries `SA_RESTART`, and
+  `abi::restartable(nr)` lists the call. Measured on Linux 7.2 (2026-10-01, a
+  terminal read whose `SIGALRM` fired at 100 ms and whose byte arrived at
+  400 ms): **with the flag** the handler runs at 100 ms and the *read* returns
+  the byte at 400 ms; **without it** the same call is `-1/EINTR` at 100 ms and
+  a retry gets the byte. `poll(2)`, `nanosleep(2)` and `epoll_wait(2)` answer
+  `-1/EINTR` at 100 ms *with* the flag set, which is `signal(7)`'s
+  never-restarted set and the reason `restartable` is an allow-list rather than
+  "everything but those" — a rewind re-executes the call, so one that must not
+  be run twice is wrong to include even if it never returns `EINTR` today.
+  `t-sa-restart` pins both halves.
+  - The flag is also what made `nanosleep`/`clock_nanosleep` become
+    *interruptible*: a never-restarted call that cannot be interrupted is inert,
+    and this one could not be - it slept through a signal and answered 0.
+    Linux's answer is `-1/EINTR` with the time *left* in the second pointer, and
+    that remainder is the whole reason the pointer exists: musl's `sleep()` is
+    `nanosleep(&ts, &ts)` in a loop, so without it every signal doubles the
+    sleep. Both are pinned, the remainder included.
+- **`O_NONBLOCK` on a terminal — closed**, with the table below as its spec.
+  Measured on Linux 7.2 (2026-10-01, a pty slave in raw mode with `O_NONBLOCK`
+  set):
+
+  | mode | queued | answered |
+  |---|---|---|
+  | `0`/`0` | nothing | **0 bytes** — it is the poll, and it never waited |
+  | `1`/`0`, `0`/`5`, `2`/`5` | nothing | `-1/EAGAIN` **at 0 ms** — the clock is not consulted |
+  | `2`/`5`, `5`/`0` | fewer than `VMIN` | **those bytes**, immediately: a minimum is a floor on a *wait* |
+  | canonical | a partial line | `-1/EAGAIN` |
+  | canonical | a complete line | the line |
+  | canonical `0`/`0` | a partial line | `-1/EAGAIN` — canonical consults neither |
+  The rule lives in `LineDiscipline::read_wait`, which is where the blocking
+  table already lived and where a host test can hold both columns: a fourth
+  input (`O_NONBLOCK`) and a fourth answer (`ReadWait::WouldBlock`). `Tty`
+  carries the description's bit, `sync_nonblocking` is what puts it there, and
+  the pty *master*'s bit goes to the pair rather than to the slave's terminal -
+  the order matters, because `PtyMaster::as_tty` answers the slave's terminal
+  (that is what makes `sudo`'s `TCGETS` on a master work). `t-tty-nonblock`
+  pins the table, the `open`/`F_SETFL`/`FIONBIO` routes and the two ends.
+- **The other bare `block_until` waits — closed**, and the list was longer than
+  this section knew: `pipe.rs` (read, and write as a partial count),
+  `eventfd.rs`, `signalfd.rs`, `inotify.rs`, `unix.rs` (the datagram queue, the
+  connect-room wait and the accept queue), the pty slave's write back-pressure,
+  and the AF_PACKET and route-netlink reads - the same wait behind two more
+  descriptors, which `udhcpc`'s retry loop and `ip`'s own event loop are built
+  on. `sched::block_until_interruptible` names the shape; a *write* that already
+  stored bytes reports the partial count rather than `EINTR`, which is Linux's
+  rule and the one that cannot duplicate bytes when the caller retries.
+  `t-wait-eintr` pins each wait twice: the signal ends it with the handler
+  having run, *and* the same call answers normally once the thing it waited for
+  arrives, so a kernel that broke the data path to pass the first check fails
+  the second. What is left of the family, each named rather than half-served:
+
+  - **A pty write cut inside an expanded `CR LF`** re-offers that one input
+    byte, so its carriage return lands twice. The count is in the writer's own
+    units by construction (`input_prefix`), and the alternative - counting the
+    byte - would lose the line feed; both render the same line.
+  - **`wait4(2)`/`waitid(2)`**, whose park is `block_until_child_event` and is
+    still fatal-signal-only. Measured on Linux 7.2 (a 2 s child, `SIGALRM` at
+    100 ms): with `SA_RESTART` the handler runs at 100 ms and `wait4` returns
+    the child's pid at 2000 ms; with the flag clear it is `-1/EINTR` at 100 ms.
+    So a shell whose own timeout is a signal cannot be woken out of a `wait`
+    here, and `restartable` deliberately does not list the call: a restart
+    verdict for a wait that never answers `EINTR` would be a promise about
+    nothing.
+  - **The console's serial transmit wait** (`console::write_bytes` parks on ring
+    space), the same shape on the one wire the kernel writes from its own tasks.
+  - **`ioctl(2)`'s per-request verdict.** Linux restarts an interrupted
+    `DRM_IOCTL_SYNCOBJ_WAIT` and most other requests not at all; this kernel has
+    no per-request answer, so that wait still comes back `EINTR` under
+    `SA_RESTART` rather than being rewound.
 - **Canonical mode ignores both** — `VMIN` included. That is POSIX's wording
   ("non-canonical") and the measured 4-second block above, so nothing is
   missing here; it is recorded because the pair *looks* like it applies.
+
+**And writing the pin for the pty's back-pressure found the bound unenforced.**
+The pty master's buffer is capped at `TO_MASTER_MAX` (64 KiB) and a writer that
+fills it is supposed to park - but the *guard* that chose between parking and
+pushing straight through asked `crate::arch::interrupts_enabled()`, and that
+question is false in an interrupt handler **and inside every syscall**
+(`MSR_FMASK` masks `IF` on `syscall` entry). So a userland `write(2)` to a pty
+slave never parked and never met the cap at all, while a kernel task's did:
+measured by `t-wait-eintr`, a 96 KiB write returned 96 KiB and grew the buffer
+past its 64 KiB bound — the worst-case rule (§4 item 4) unenforced on a queue a
+user program fills. The context is a parameter now, and only a call site can
+answer it: `Wire::Task` for `write(2)` and the terminal's own answers,
+`Wire::Interrupt` for the echo of a byte that has just arrived (which must not
+park - it runs in the handler that carried it). A full buffer then ends the
+write with the errnos Linux gives it: the partial count, `EAGAIN` under
+`O_NONBLOCK`, `EINTR` under a signal, and the count is in the writer's own units
+(`input_prefix` maps the wire's bytes back, since `ONLCR` makes one `LF` two).
 
 
 ---
@@ -2847,11 +3003,13 @@ marker": an image baked as `weston` costs one boot-file refresh to rename it, an
 `mpos.cmdline` it rewrites is already `gui`'s.
 
 Records elsewhere in this file that say `--mode weston` are measurements of the boot
-that name described, and are not rewritten; today they are read as `--mode gui`. The
-reverse reading is the one to watch: a record that says `--mode gui` and describes a
-console *on* the framebuffer — line 308's "with the serial line discarded", the
-`KD_TEXT` console of line 228 — was measured on the shape that word then had, and is
-today's `--mode mirror`.
+that name described, and are not rewritten. The reading of an old `--mode gui` record
+now splits by what it describes: one that says the console is *on* the framebuffer —
+line 308's "with the serial line discarded", the `KD_TEXT` console of line 228 — and
+today's `gui` agree again (see the reversal record below); one that describes the
+window left for a compositor and the log on the wire was the a0015ba interim shape,
+and its machine is today's `--mode terminal` with a window, or `--mode mirror` for
+the console-in-both-places.
 
 **The rule the design rests on, and what was not measured.** "The log goes to
 every console named, and the last is preferred" is `kernel-parameters.txt`. The
@@ -2916,6 +3074,31 @@ stopped before it too.
   currently on screen, and the list's preference decides only the write policy.
   Linux makes the last `console=` both the preferred console's device and the
   routing rule; only the second half exists here.
+
+**`gui` moved back onto the framebuffer, with the wire kept — a deliberate
+reversal, not the old `/dev/null` mistake.** The paragraph above folded `gui` onto
+`console=ttyS0` (wire-alone list, window attached) and deleted the shape that put
+the text console on the screen. A user asked for that shape back: the whole machine
+in the window — boot log, virtual consoles, login prompt and shells all rendered
+there, the host terminal quiet. So `gui` now bakes `console=tty0` (the parser always
+supported the framebuffer-alone list; the note above that "no run mode bakes this
+list any more" is reversed). What makes this *not* the discarded-and-deaf mode the
+collapse removed is where the wire goes: not stdio (the terminal stays quiet) and not
+`/dev/null` (the log survives). It is a launcher-side copy to `build/serial.log`,
+because three writers reach the port whatever the guest's console list says — the UEFI
+loader prints to COM1 before the kernel runs, the kernel banner prints before the
+`console=` parse, and a panic forces the serial wire back. The mode may silence the
+terminal; it may not make it deaf. `gui` and `mirror` therefore now differ in the
+guest's list *and* in the host wiring, so `a_mode_word...retired`'s claim that three
+words own three distinct lists holds again, and the QEMU test renamed to
+`a_mode_switches_the_window_and_where_the_wire_is_read` pins that `gui` puts the wire
+on a file and not on stdio. The retired `weston` boot-file refresh now rewrites the
+line for real (`console=ttyS0` → `console=tty0`) rather than only renaming the marker.
+**Not yet re-booted:** the `gui` and `mirror` windows were not re-driven after this
+change; the in-window-console behaviour is read off the `render.rs`/`wire_bytes`
+`vt_is_sink` gate and the getty-on-`tty1` wiring, the same caveat the a0015ba record
+carries — a manual boot of `cargo xtask run` (now defaulting to `gui`) is what closes
+it.
 
 ### 7.2 Input: virtio-input (evdev) — **DONE**
 
@@ -3227,17 +3410,152 @@ Linux has - the whole disk is numbered whatever is on it - with a host test in
 `uevent` for the empty-table case, and that is why the numbering carries the
 disk's own size rather than deriving a partition's.
 
-**Gate, quoted from its own summary**: host `618 passed`, `mpos-xtask 36 passed`,
-guest `=== SUMMARY pass=132 fail=0 (132 built)`, QEMU exit 33, with the boot
-printing both disks -
+#### The third thing the machine corrected: what the driver costs a boot
 
-    virtio-blk: vda, 1032192 sectors (504 MiB)
-    ahci: sda, 8192 sectors (4 MiB)
+`cargo xtask run` stopped printing anything after `virtio-blk: vda, ...` for
+**28.4 s** before the next line, which reads as a hang and is not one - the boot
+completes. Measured on a copy of the image with the same wiring and a
+timestamped serial log: the gap sits between `virtio-blk: vda, 4194304 sectors`
+(`main.rs:374`) and `blk: no data partition on this disk` (`main.rs:418`), which
+is `drivers::ahci::init()`'s window. Removing the device with
+`-machine q35,sata=off` makes the same two lines **2 ms** apart, so the cost is
+the SATA probe, and the QEMU monitor's `info pci` names the device: a plain
+`-machine q35` already carries an ICH9 SATA controller at `00:1f.2`
+(`8086:2922`) with nothing attached to it.
 
-- and `t-ahci` `=== PASS` over 16 checks. The 8192 sectors are `IDENTIFY`'s
-answer and the file's own size, which is the first of the two claims the program
-separates: a capacity that is *reported* and one that is *reachable* are
-different claims, and the pins check both.
+What the driver does with that controller, read out of an instrumented boot:
+
+```
+ahci-probe: 00:1f.2 bar=0x81084000/0x1000 GHC=0x80000000 CAP_PI=0x3f
+ahci-probe:   port 0 SSTS=0x0    port 1 SSTS=0x0    port 2 SSTS=0x113  <-- DET == 3
+ahci-wait: PxCI retire FAILED after 7067 ticks          = 28.3 s
+ahci-dead: TFD=0x441 CI=0x1 IS=0x40000001 SIG=0xeb140101 SSTS=0x113 CMD=0xc017
+```
+
+Port 2 answers `PxSSTS.DET == 3` - "device present, PHY up" - with no device
+behind it, the driver brings it up, issues `IDENTIFY`, and **`PxCI` never
+retires**. It did not need to be waited on: the same read shows `PxIS.TFES` set
+(bit 30 of `0x40000001`) and `PxTFD.ERR` set (bit 0 of `0x441`), i.e. the port
+answered "that command failed" on the first read and the wait was looking only at
+the retirement bit, which is what `identify`'s own error check - at
+`drivers/ahci.rs:274`, *after* the wait - would have seen immediately. The
+`PxSIG` had even become `0xeb140101`, the one signature this driver says it
+cannot drive; it is read before bring-up, when the same port still reads
+`0xffffffff`.
+
+So two faults, one of them about the number:
+
+1. **The wait asked one register a question two registers answer.** Fixed in
+   `src/ahci.rs`, a new host-compiled module (`drivers/ahci.rs` is behind
+   `#[cfg(target_os = "none")]`, so a decision inside it has no reachable test -
+   the `pci`/`drivers::pci` and `evdev`/`drivers::evdev` split again):
+   `PortStatus::waiting` stops on *either* answer, retired or refused. Five host
+   tests carry the measured words above, and one of them - the phantom port -
+   fails with the old `PxCI`-only rule.
+2. **`WAIT_TRIES = 5_000_000` was a count nobody had costed.** Its comment claimed
+   "tens of milliseconds ... on a dead one"; measured, one volatile MMIO read of
+   an emulated register under KVM is ~5.7 µs, so five million of them is 28.3 s.
+   The count shape stays, and the reason is now written beside it rather than
+   assumed: the identical wait runs while a mounted filesystem reads through
+   `BlockDev`, which holds the port inside `critical_section::with`, so
+   interrupts are masked and the 250 Hz tick counter does not advance - a
+   deadline in ticks there would never expire, while reads always do. What a
+   count buys therefore depends on what a read costs, on this machine ~1000×
+   more than on silicon, which is the honest weakness of the shape and is the
+   reason the budget is no longer the only bound.
+
+Measured after, same wiring on an independent copy of the image: **28.412 s → 0.001 s**, and
+`t-ahci === PASS` on a machine that does have a disk, where a healthy command
+retires at try 0-2 (also measured), so the patience that is left is not being
+spent. **Why no test ever caught this:** `xtask/src/qemu.rs:168` gives the
+selftest machine an `ich9-ahci` *with* a disk at a lower BDF than the chipset's
+own, and the controller loop returns the first disk it finds - so the built-in
+empty port is never probed there, while `cargo xtask run` boots a machine whose
+only SATA controller *is* the empty one. A machine shape no test machine has.
+
+**The two gaps the first version of this fix left, both closed in the same
+investigation, both measured:**
+
+- **A request longer than one page panicked the driver.** `udevd` asking a new
+  SATA disk what is on it reaches `AhciDisk::read_at` with **262144 bytes**, and
+  a 6144-byte unaligned superblock probe reaches it with **6656**; both ended the
+  machine on `check_span`'s assert, because the block node's read hands the
+  driver the *whole* covering window of the caller's request
+  (`vfs/devfs.rs::DevBlockNode::read_at`) and virtio-blk has always accepted any
+  sector-aligned length. The one-page promise was this driver's own, never
+  `BlockDev`'s, and §4.3 says whose limit it therefore is: the driver's.
+  `AhciPort::issue` now builds **one PRDT entry per bounce page** - a command
+  carries `BOUNCE_PAGES` = 32 pages, 128 KiB, and a longer request is more
+  commands, planned by `crate::ahci::chunks` - so `PRDTL` says how many runs the
+  device fills and the total goes in `PRDBC`. `check_span` keeps only what is
+  still a contract, the sector boundary on both offset and length, which is the
+  pair virtio-blk asserts too. The pin is `t-ahci`: a 16 KiB write and read
+  (four runs) and then **one `pread` of 1 MiB** - eight commands, 32 runs each -
+  checked against a pattern that is a function of the byte's *index*, because the
+  failure this exists to catch is a table whose completion bit is on every
+  rather than only the last descriptor: that one reads back perfect with three
+  quarters of the buffer unwritten, and a uniform pattern would not notice. The
+  `DBC` encoding and the plan are host-tested in `crate::ahci`, including the run
+  a 22-bit count cannot say (refused, not truncated).
+- **A bring-up that failed kept its memory.** `release()` gives back the command
+  list, the FIS area, the command table and the bounce, and it calls `stop()`
+  first: a controller still running its engine reads a list that has gone back to
+  the allocator. This is not a tidy-up on a hypothetical machine - the `q35`
+  controller at `00:1f.2` walks exactly this path on every boot of `cargo xtask
+  run`, so the phantom port used to cost 35 pages per boot, and would have cost
+  35 more for each dead port a bigger controller has.
+
+**And one claim this section made about the same scratch boots, retracted.** A
+qcow2 overlay with `build/mpos-uefi-x86_64.img` as its backing file stopped
+printing after `mpos: handing the machine to /init`, and it did so with the
+pre-fix driver and with `-machine q35,sata=off` as well, which looked like a
+userspace stall worth naming as a separate item. It is not one: **the image's own
+guest was running while the overlay read it.** The run wiring opens its disk with
+`file.locking=off`, so nothing stopped a second QEMU from taking a live
+filesystem as its backing file, and what that boot froze on was another machine
+writing underneath it. The same image copied to an independent qcow2 with
+`qemu-img convert` and booted on the same wiring with the same kernel runs the
+whole way: `Seeding 4096 bits and crediting`, `Saving 4096 bits of creditable
+seed for next boot`, `[ ok ]`, no `[ !! ]`, and no `EOPNOTSUPP` anywhere on the
+wire. Kept rather than deleted for two reasons: a scratch overlay of an image that
+is *also* booted is not a look at that machine but a fight between two of them,
+and the bisect that ruled the block layer out (`sata=off`, old driver, same
+freeze) is exactly what made the wrong conclusion look earned. A later clean
+check - `-machine q35,sata=off` on a freshly converted copy - reaches
+`mpos login:`, which is the sentence that ends it.
+
+**What the failed port is allowed to take with it.** `release()` gives a dead
+port's pages back only after `stop()` has seen the engine and the FIS receiver
+come down. That conditional is not caution for its own sake: a port whose `CR`
+never clears still holds `PxCLB` and `PxFB`, so freeing those frames hands the
+buddy system a page the *device is writing to*, and the corruption surfaces as a
+bad page-cache block or a process's altered data far from here, with no line
+pointing back. The measured case stops cleanly (`PxCMD` quiet, `PxCI` empty), so
+the leak is the branch and not the rule; the rule is that the branch must not
+free. An abandoned attempt to force the point - `SCTL.DI`, re-initialising device
+detection to make a stuck port let go - was written, measured as never needed on
+this machine, and removed again rather than kept as untested code.
+
+**Gated**: host `629 passed`, `mpos-xtask 36 passed`, guest
+`=== SUMMARY pass=132 fail=0 (132 built)` with QEMU exit 33, and `t-ahci === PASS`
+over its wide transfers. End to end, on two fresh `qemu-img convert` copies of
+the shipped image booted on the run machine's own wiring:
+
+- the shape `cargo xtask run` boots, whose only SATA controller is the empty
+  built-in one - `Seeding 4096 bits and crediting`, `Saving 4096 bits of
+  creditable seed for next boot`, `mpos login:`, no `[ !! ]` and no
+  `Unable to seed` on the wire;
+- the same with a real 64 MiB `ide-hd` on an added `ich9-ahci` - `ahci: sda`,
+  then the same seedrng lines and the same login prompt, and **no panic** where
+  `udevd`'s 262144-byte probe used to end the machine.
+
+One loose end, recorded rather than tidied: a single boot of the empty-controller
+shape stopped after `Seeding 4096 bits and crediting` and printed nothing more for
+45 s. It has not reproduced since - four later boots of that shape, and two of the
+disk-attached shape, all reached the login prompt - so it is an unreproduced
+observation and not a diagnosis, and the `release()` rule above is a safety
+measure argued from what a stuck engine owns, not a fix claimed for it. If it is
+seen again, the thing to read first is whether that port's `PxCMD.CR` came down.
 
 ---
 
@@ -3322,6 +3640,70 @@ here`) and re-derived it by searching; it now keeps it, and the search is left
 where it belongs - a `..` whose base is a cwd, whose ancestors nothing has
 walked. niri has not been booted since *that* fix either, so what it meets next
 is again read off its source rather than measured, and it is the renderer below.
+
+> **Update, measured (2026-10-01): it is not the renderer next, and the two
+> paragraphs after this one are not where it stops.** Rebooted with the sysfs
+> chain in place, niri gets past the DRM-node identity check and reaches
+> `niri::backend::tty: using as the render node: "/dev/dri/renderD128"` - and
+> stops there, *before* any EGL device is created, so no
+> `software EGL renderers are skipped` line is ever printed and the process does
+> not exit with an error. It stays alive in state `R` with **zero voluntary
+> context switches**: a tight loop, never a wait. What it loops on is the Wayland
+> display socket's lock file - the same unit forever on the same name:
+>
+> ```text
+> stat("/run/user/0/wayland-1.lock", ...) = 0
+> open("/run/user/0/wayland-1.lock", O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC, 0660) = 22
+> fcntl(22, F_SETFD, FD_CLOEXEC) = 0
+> close(21) = 0
+> flock(22, LOCK_EX|LOCK_NB) = 0
+> fstat(22, {st_mode=S_IFREG|0640, st_size=0, ...}) = 0
+> ```
+>
+> `/run/user/0` holds exactly one file, `wayland-1.lock`, zero bytes, with no
+> `wayland-2.lock` and no socket: the name never advances, so this is not a scan
+> for a free `wayland-N` but a **lock-and-verify retry that never converges**,
+> and the verify is the `fstat`/`stat` pair. Two measurements say the loop is the
+> caller's and not libwayland's: the open carries `O_TRUNC` and is followed by an
+> explicit `fcntl(F_SETFD)`, which libwayland's `wl_socket_lock` does not do
+> (checked against `wayland-server.c` 1.26.0 *and* by disassembling the guest's
+> own `libwayland-server.so.0.26.0`); and **niri links no libwayland at all** -
+> `readelf -d` lists `libinput`, `libseat`, `libgbm`, `libudev`, `libpixman`,
+> `libxkbcommon` and `libc`, and no `libwayland-*` - so it uses
+> `wayland-backend`'s pure-Rust server, which is where the loop lives.
+>
+> **The bug it was spinning on is this kernel's, and it is fixed.** `stat(path)`
+> and `fstat(fd)` disagreed about `st_dev` for one and the same file: measured by
+> `t-stat-consistency` on `/tmp/t-stat-consistency.lock`, `fstat` answered
+> `dev=0 ino=669` where `stat` answered `dev=1 ino=669`. The inode agreed; the
+> device did not. `stat` looks the filesystem up by path, and a descriptor cannot
+> - and an inode does not name its own filesystem, so the fallback
+> (`fs_id_of_inode`) can only match a mount by its *root* inode, which a plain
+> file inside the mount is not. `File` therefore records the filesystem id at
+> `open`, where the path is known, and `fstat` prefers it; both doors now answer
+> the same pair. Pinned by `user/abitest/src/bin/syscall/t-stat-consistency.rs`
+> (the two doors, the `O_CREAT|O_TRUNC|O_RDWR` order a lock protocol uses, and
+> both `/tmp` and `/run/user/0`).
+>
+> **Three more defects the diagnosis turned up, none of them the renderer, none
+> yet fixed.** `strace -f niri` **panics the kernel**: a user-mode
+> instruction-fetch `#PF` at a heap address is reported as `KERNEL PANIC: #PF`,
+> and the panic handler faults again - so a traced process can end the machine,
+> which is also why the full unfiltered trace this needed was never obtained (two
+> attempts, two dead guests). `/proc/<pid>/fd` readdir **skips descriptor numbers
+> 2..9** on a live process while the fds themselves work, which may or may not be
+> the same defect that makes the loop's fd numbers alternate 21/22. And the
+> non-root case is a separate thread: `niri` as `mpos` dies with libseat's "Failed
+> to open session: Function not implemented (os error 38)", so some syscall on
+> libseat's session path answers `ENOSYS`; the guest's kernel ring is too small to
+> have kept the `mpos: syscall N -> ENOSYS` line that would name it, so that wants
+> `syslogd`'s file rather than `dmesg`.
+>
+> What has *not* changed is the conclusion two paragraphs below: a non-software
+> EGL device still means `virtio-gpu` 3D, and `DRM_VIRTGPU_*` is still the largest
+> single item in this section. What the fix above buys is that niri gets past its
+> socket setup to the place that check lives, instead of spinning forever before
+> it.
 
 niri's TTY backend is `GpuManager<GbmGlesBackend<GlesRenderer>>` and nothing
 else - there is no pixman renderer in it - and, worse for this kernel, it
@@ -4280,6 +4662,19 @@ only the read side is being tuned.
 | Set-associative cache with victim selection | `vfs/ext4/cache.rs` | **done** |
 | Sequential readahead past the block being asked for | `vfs/ext4/` | not done |
 | virtio-blk interrupt-driven completions and multi-request pipelining | `drivers/virtio/blk.rs` | not done |
+| A SATA probe that ends in an answer instead of a budget | `drivers/ahci.rs`, `src/ahci.rs` | **done, measured** |
+
+**The probe's cost, before and after.** Not a throughput change but the same
+ledger, because it is a device wait that the boot pays: on a `q35` machine whose
+built-in SATA controller has no disk on it, the gap between `virtio-blk: vda, ...`
+and `blk: no data partition ...` in the boot log was **28.412 s** and is now
+**0.001 s**, measured on the same image copy with a timestamped serial log
+(`-machine q35,sata=off` gives the same 2 ms, which is what named the probe as the
+cost). The healthy path is unchanged and still measured - a command on a port
+that really has a device retires at try 0-2 - and `t-ahci` is the pin that says
+so. `PLAN.md` §7.3 holds the register dump, why a count of MMIO reads is still
+the shape rather than a tick deadline, and the two gaps that were left open there
+and are now closed.
 
 **The cache.** Four-way set-associative, least-recently-used within a set, over
 fast-lazily-allocated slots - and the set count kept at the 512 that the original
@@ -5013,7 +5408,7 @@ lowest-risk kind, and the most direct violation of §4. Land with a host test an
 | A5 | `proc.rs:2158` `mmap` flags | `MAP_FIXED_NOREPLACE` → `EEXIST` on collision; `MAP_HUGETLB` with no huge pages → `ENOMEM` | unknown/reserved flags ignored; `MAP_FIXED_NOREPLACE` (`0x100000`) treated as a plain hint and re-located on collision — breaks the "this address or fail" contract; `MAP_HUGETLB` silently gives a 4K page | validate the bits; `NOREPLACE` must fail with `EEXIST`; `HUGETLB` must be `ENOMEM` here. |
 | A6 | `abi.rs` `rseq` registration | registers per-thread `rseq` state; well-formed registration → `0` | (was) returned `0` for a valid call, wrote none of the `cpu_id`/`node_id`/`mm_cid` fields, no unregister | **LANDED as `ENOSYS`.** The dispatch arm is removed, so `rseq` falls through the canonical `_ => ENOSYS` (§4.2). The old arm was a §4.2 success-for-a-thing-not-done: it answered `0` while writing no field the ABI contract requires. Measured (Linux 7.2 host: `AT_RSEQ_FEATURE_SIZE` 33 / `AT_RSEQ_ALIGN` 64) that glibc registers at length 33, which the old `len != 32` arm `EINVAL`'d anyway — so the accept honoured neither real glibc nor the contract; and the libc this machine runs (musl) never calls `rseq`. `ENOSYS` is the honest "not available" a probing libc falls back from. Pinned by `t-rseq` (re-pinned to `ENOSYS`; the prior pin had encoded the false-success, so per rule 1 the test changed with the measurement). *Closing it for real* = a per-thread registration that writes `cpu_id`/`node_id`/`mm_cid`, maintains them across preemption, and honours `RSEQ_FLAG_UNREGISTER` — a sched feature, named below. |
 | A7 | `proc.rs` `PTRACE_SETSIGINFO` → `0` | stores the supplied `siginfo_t` so the tracee receives it verbatim (`si_code`/`si_addr` for a planted `SIGSEGV`) | accepted and discarded for any `pid`: `PTRACE_GETSIGINFO` synthesises a siginfo from the stop, and the tracee's delivered signal is the one the *resume* names, so the old arm read nothing and answered `0` - even for a live-but-untraced pid where Linux answers `ESRCH` | **LANDED as an honest refusal + validation + gated.** Closing it *for real* needs `siginfo_t` carried through the stop/resume (a sched+ptrace feature, its own commit) - the kernel's stop model carries signal+event, not a queued siginfo. So this pass removes the §4.2 fake rather than guessing the queue: the arm now runs Linux's own error precedence - `stop_of(id)` → `ESRCH` for a not-a-stopped-tracee, `buffer_ok(data, 128)` → `EFAULT` for an unbacked struct (Linux copies it first), then `EOPNOTSUPP` for the carry it cannot do. Pinned by `t-ptrace-attach`: `PTRACE_SETSIGINFO` on a live but untraced child is `ESRCH`, **not a silent `0`** (counterfactual - the old `=> 0` answered success for it). Gated `t-ptrace-attach === PASS`. |
-| A8 | `fs.rs` `RNDZAPENTCNT`/`RNDCLEARPOOL` (+ `RNDADDENTROPY`) → `0` | gate the mutating entropy ioctls on `CAP_SYS_ADMIN` (`EPERM` otherwise) and, for a privileged clear, do the thing or say so | returned `0` for the write requests while `RNDGETENTCNT` stayed pinned at a fixed 4096 (this kernel's random source is an always-seeded ChaCha20 stream, not a drainable accumulator) | **LANDED + gated (measured).** Probed real Linux on `/dev/urandom`: unprivileged `RNDZAPENTCNT`/`RNDCLEARPOOL`/`RNDADDENTROPY` all answer **`EPERM`** (gated on `CAP_SYS_ADMIN`), and the check precedes the buffer copy. `fs.rs` now (1) returns `EPERM` before touching the buffer when `euid != 0`, matching Linux exactly for the unprivileged path; (2) for a privileged `RNDADDENTROPY`/`RNDADDTOENTCNT` keeps `0` - honest, because the pool is already full so a credit is a genuine no-op the observable "entropy available" state does not contradict; (3) for a privileged `RNDZAPENTCNT`/`RNDCLEARPOOL` returns **`EOPNOTSUPP`** - there is no drainable count to zero, so §4.4 refuses rather than the old `0` that claimed a clearing `RNDGETENTCNT` (still full) contradicted one moment later. Pinned by `t-ioctl`: root `RNDADDENTROPY`→`0` (unchanged), root `RNDZAPENTCNT`→`EOPNOTSUPP`, and a `setresuid`-dropped `euid` making `RNDADDENTROPY`/`RNDZAPENTCNT`→`EPERM` then restored — all counterfactual (the old handler returned `0` regardless). `RNDGETENTCNT`→4096 and `FIONREAD`→512 pins unchanged. Gated `t-ioctl === PASS`. |
+| A8 | `fs.rs` `RNDZAPENTCNT`/`RNDCLEARPOOL` (+ `RNDADDENTROPY`) → `0` | gate the mutating entropy ioctls on `CAP_SYS_ADMIN` (`EPERM` otherwise) and, for a privileged clear, do the thing or say so | returned `0` for the write requests while `RNDGETENTCNT` stayed pinned at a fixed 4096 (this kernel's random source is an always-seeded ChaCha20 stream, not a drainable accumulator) | **LANDED + gated (measured).** Probed real Linux on `/dev/urandom`: unprivileged `RNDZAPENTCNT`/`RNDCLEARPOOL`/`RNDADDENTROPY` all answer **`EPERM`** (gated on `CAP_SYS_ADMIN`), and the check precedes the buffer copy. `fs.rs` now (1) returns `EPERM` before touching the buffer when `euid != 0`, matching Linux exactly for the unprivileged path; (2) for a privileged `RNDADDENTROPY`/`RNDADDTOENTCNT` keeps `0` - honest, because the pool is already full so a credit is a genuine no-op the observable "entropy available" state does not contradict; (3) for a privileged `RNDZAPENTCNT`/`RNDCLEARPOOL` returns **`EOPNOTSUPP`** - there is no drainable count to zero, so §4.4 refuses rather than the old `0` that claimed a clearing `RNDGETENTCNT` (still full) contradicted one moment later. Pinned by `t-ioctl`: root `RNDADDENTROPY`→`0` (unchanged), root `RNDZAPENTCNT`→`EOPNOTSUPP`, and a `setresuid`-dropped `euid` making `RNDADDENTROPY`/`RNDZAPENTCNT`→`EPERM` then restored — all counterfactual (the old handler returned `0` regardless). `RNDGETENTCNT`→4096 and `FIONREAD`→512 pins unchanged. Gated `t-ioctl === PASS`. **But the shape this row landed was wrong, and its wrongness is a boot failure:** the family was dispatched on the command byte, and the arms named the wrong numbers - `RNDADDENTROPY` is `_IOW('R', 0x03, int [2])` = `0x40085203` (nr 3), which this row's arm answered as the drain, and `t-ioctl`'s "RNDADDENTROPY" constant was `0x40085202`, which is `RNDGETPOOL`. The whole-word contract, the measurements behind it and the seedrng evidence are in §12.1's A8-correction bullet; the row above stands as what was measured *then*, with the `CAP_SYS_ADMIN` gate and the `EOPNOTSUPP` refusals still true. |
 
 **Landed this pass (each with its counterfactual pin, AGENTS.md checklist rule 4):**
 
@@ -5107,11 +5502,29 @@ lowest-risk kind, and the most direct violation of §4. Land with a host test an
   not a wrong-shape answer. The prior worry that this "needs a measured whitelist so a blunt refuse
   doesn't break a workload" was over-cautious: the gate that boots the whole initramfs runs the real
   programs and stays green (`pass=133 fail=2`, reds the unrelated in-flight net/audio), proving no
-  running program depended on the old `0`. `t-prctl`'s "unknown answers 0" pin was corrected to
-  "unknown → `EINVAL`" (it had encoded mpos's false-success, not Linux). Backing individual options
-  (`PR_SET_DUMPABLE`/`PR_CAPBSET_*`/`PR_SET_KEEPCAPS`/…) with real per-process state is *optional
-  future enrichment* — each would turn an `EINVAL` into a working round-trip — not required to
-  satisfy "unknown → `EINVAL`".
+  running program depended on the old `0`.   `t-prctl`'s "unknown answers 0" pin was corrected to
+  "unknown → `EINVAL`" (it had encoded mpos's false-success, not Linux).
+  **Then the four options that had real Linux behaviour behind them were given that behaviour.**
+  The prerequisite turned out to be exactly what the earlier note said it was, and it is now built:
+  `src/cred.rs` is a per-process credential model - the four capability sets, the dumpable tri-state
+  and `KEEPCAPS` - stored on the thread group beside `comm`, with the measured Linux rules inside it
+  and *consumers* rather than a stored no-op. `capget` reports the stored sets instead of a constant
+  and `capset` stores them (Linux's `cap_capset` asks `CAP_SETPCAP` first and, holding it, accepts
+  anything, which is why root's own lowering/raising round-trips); a uid/gid change re-derives the
+  sets - the effective one cleared on a drop and restored from permitted on a return to root, the
+  permitted one kept while any of the six ids is root's and cleared by a full drop unless `KEEPCAPS`
+  (all four measured on 7.2.7); `execve` gives an `euid` of 0 its bounding set back, so a dropped
+  bounding capability is the way to take one from a root program for good; and `ptrace_may_access`
+  is consulted by `PTRACE_ATTACH` **and** `process_vm_readv`/`writev`, so the dumpable flag now
+  decides something. `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE`, `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS` and
+  `PR_CAPBSET_READ`/`PR_CAPBSET_DROP` were then moved out of the catch-all and answered with the
+  measured contract (only 0/1 settable, 2 and 3 `EINVAL`; read 1/0 for `0..=40` and `EINVAL` past
+  it; `DROP` asks the capability *before* the range, so an unprivileged `100` is `EPERM` where
+  root's is `EINVAL`). Named divergences, both conservative: no file capabilities are read at
+  `exec`, so a capability Linux would grant from a binary here is simply not held; and the dumpable
+  reset uses `SUID_DUMP_DISABLE`, the sysctl's default, where the machine these were measured on had
+  it set to 2. Pinned by thirteen host tests in `cred.rs`, `t-prctl`'s option table and `t-posix`'s
+  `capset`/`capget` round-trip.
 - **A2/A3 kd + the remaining evdev writes** — paired with Phase-11 Step B2 (move each device's ioctl
   accept/refuse down to the driver). Editing the `syscall/linux/fs.rs` ioctl switchboard for them now
   would add calls along the V-2 edge the next refactor removes, against checklist rules 5 and 7 (a

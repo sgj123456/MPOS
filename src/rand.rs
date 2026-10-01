@@ -10,7 +10,8 @@
 //! from the tick counter *on every call*. Two calls inside one tick return the
 //! same bytes, so a TLS handshake's server-random and its key share could be
 //! identical - not weak randomness, repeated randomness. This replaces it with
-//! one ChaCha20 stream, seeded once from the machine and never re-keyed.
+//! one ChaCha20 stream, seeded once from the machine and re-keyed on demand by
+//! `RNDRESEEDCRNG` ([`reseed`]).
 
 use core::cell::RefCell;
 
@@ -43,6 +44,41 @@ pub fn fill(out: &mut [u8]) {
         let mut slot = RNG.borrow(cs).borrow_mut();
         let rng = slot.get_or_insert_with(|| ChaCha20Rng::from_seed(seed()));
         rng.fill_bytes(out);
+    });
+}
+
+/// Re-key the generator from fresh seed material.
+///
+/// This is what `RNDRESEEDCRNG` asks for (Linux re-keys the CRNG from its input
+/// pool). The generator has no pool to draw from, so the new key is built from
+/// the two things it does have: a fresh [`seed`] - the hardware source, the
+/// host's virtio-rng entropy and the boot instant, the same ingredients the
+/// first key came from - and a draw from the *current* stream. Mixing the
+/// current output in is what makes the re-key a real one rather than a reset:
+/// a caller who had seen the first seed would otherwise predict the state a
+/// bare `from_seed(seed())` restores, whereas the new key depends on every byte
+/// the generator has produced so far. It also means a reseed is never a fixed
+/// point even where `seed()` is (the host test build), which is what makes the
+/// behaviour testable there.
+///
+/// The re-key is not a claim of cryptographic ratcheting - one XOR draws no
+/// such conclusion - only that the state after the call is one no earlier
+/// output determines.
+pub fn reseed() {
+    critical_section::with(|cs| {
+        let mut slot = RNG.borrow(cs).borrow_mut();
+        // Draw from the current generator before replacing it. `None` (never
+        // seeded) contributes nothing and the fresh seed stands alone, which
+        // is the same state `init` would have made.
+        let mut carried = [0u8; 32];
+        if let Some(rng) = slot.as_mut() {
+            rng.fill_bytes(&mut carried);
+        }
+        let mut fresh = seed();
+        for (byte, old) in fresh.iter_mut().zip(carried) {
+            *byte ^= old;
+        }
+        *slot = Some(ChaCha20Rng::from_seed(fresh));
     });
 }
 
@@ -109,9 +145,25 @@ fn seed() -> [u8; 32] {
     *b"mpos-host-seed: not a secret, te"
 }
 
+/// A read of the generator's *future* output that does not consume it: the
+/// stream is advanced on a clone, so two calls with no `reseed` between them
+/// return the same bytes. That is what a host test needs to see a re-key
+/// without depending on how many other tests drew from the shared stream in
+/// between. Test-only: no caller in the kernel has a use for it.
+#[cfg(all(test, not(target_os = "none")))]
+pub fn fingerprint() -> [u8; 32] {
+    critical_section::with(|cs| {
+        let mut slot = RNG.borrow(cs).borrow_mut();
+        let rng = slot.get_or_insert_with(|| ChaCha20Rng::from_seed(seed()));
+        let mut out = [0u8; 32];
+        rng.clone().fill_bytes(&mut out);
+        out
+    })
+}
+
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
-    use super::fill;
+    use super::{fill, fingerprint, reseed};
 
     #[test]
     fn two_fills_do_not_repeat() {
@@ -140,5 +192,38 @@ mod tests {
         fill(&mut a);
         fill(&mut b);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_reseed_re_keys_the_generator() {
+        // `RNDRESEEDCRNG` has to leave the generator in a state no earlier
+        // output predicts. The fingerprint reads from a *clone*, so it does not
+        // advance the stream itself, and two fingerprints taken without a
+        // reseed between them are equal - which is what makes this a
+        // counterfactual for the reseed rather than for the passing of time.
+        let before = fingerprint();
+        assert_eq!(
+            before,
+            fingerprint(),
+            "a passive read must not advance the key"
+        );
+        reseed();
+        let after = fingerprint();
+        assert_ne!(before, after, "a reseed must change the key");
+        // And a second reseed from the new state changes it again: the re-key
+        // is not a reset to a fixed point.
+        reseed();
+        assert_ne!(after, fingerprint());
+    }
+
+    #[test]
+    fn a_rekeyed_generator_still_produces_bytes() {
+        reseed();
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        fill(&mut a);
+        fill(&mut b);
+        assert_ne!(a, b);
+        assert!(a.iter().chain(b.iter()).any(|&byte| byte != 0));
     }
 }

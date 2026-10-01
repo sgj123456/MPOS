@@ -34,10 +34,19 @@ default = []
 #
 #   t-dns, t-stdresolve  resolve real names through the host's resolver
 #   t-udp                sends a DNS query to 10.0.2.3 and reads the answer
+#   t-rawicmp            pings a public address (110.242.74.102) and compares
+#                        what it reads against what the host's own ping gets.
+#                        The comparison *is* the test, so the internet is one
+#                        of its two halves: when the host cannot reach that
+#                        address - filtered, rate-limited, or the path merely
+#                        slow - what fails is not the machine under test. It
+#                        blocked three of four sweep runs while this file
+#                        listed it as a machine check, and the same kernel
+#                        answered 3/3 from the run machine minutes earlier.
 #   t-tcp-close          needs a listener on the host's 127.0.0.1:4599; with
 #                        none it prints `skip:` and passes, so it is a probe
 #                        and not a gate in either state
-external = ["t-dns", "t-stdresolve", "t-tcp-close", "t-udp"]
+external = ["t-dns", "t-rawicmp", "t-stdresolve", "t-tcp-close", "t-udp"]
 
 # Slow, or a measurement rather than an assertion. `t-fill-ramfs` writes up to
 # 1024 MiB a chunk at a time; the other three are instruments whose numbers are

@@ -178,7 +178,14 @@ impl Inode for SignalFd {
             if self.nonblock.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(VfsError::Again);
             }
-            self.wait_for_signal();
+            // A wait a catchable signal ends with `EINTR` - and the signal that
+            // ends it is *not* consumed by the wait: it is delivered on the way
+            // out of the syscall, and a signal the caller had blocked (which is
+            // the only kind this descriptor can read) stays queued for the next
+            // read. That is Linux's answer for a signalfd reader whose alarm
+            // fires, and it is what keeps a loop that drains descriptors from
+            // parking on this one for ever.
+            self.wait_for_signal()?;
         }
     }
 
@@ -194,12 +201,15 @@ impl Inode for SignalFd {
 
 impl SignalFd {
     #[cfg(target_os = "none")]
-    fn wait_for_signal(&self) {
-        crate::sched::block_until(|| self.pending_any());
+    fn wait_for_signal(&self) -> VfsResult<()> {
+        match crate::sched::block_until_interruptible(|| self.pending_any()) {
+            crate::sched::WaitEnd::Interrupted => Err(VfsError::Interrupted),
+            _ => Ok(()),
+        }
     }
 
     #[cfg(not(target_os = "none"))]
-    fn wait_for_signal(&self) {
+    fn wait_for_signal(&self) -> VfsResult<()> {
         panic!("blocking on a signalfd needs the kernel scheduler");
     }
 

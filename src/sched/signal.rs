@@ -113,18 +113,17 @@ pub const SA_RESETHAND: usize = 0x8000_0000;
 /// `SA_RESTART`: the caller asked the interrupted syscall to be run again after
 /// its handler returns, rather than to come back as `EINTR`.
 ///
-/// Recorded, not acted on. The kernel's reads answer `EINTR` for every
-/// interrupted call, restarted or not, and that is the half a caller can
-/// survive: it is what breaks `vim`'s blocked read so its own loop re-issues
-/// it. The rewind that would make the restart invisible is the named gap, and
-/// its shape is on the board beside the measurement that shows what Linux
-/// really does. `strace` sees `read(...) = ? ERESTARTSYS`, then
-/// `rt_sigreturn({mask=[]}) = 0` followed by a genuine second `read` with the
-/// caller's original arguments.
-///
-/// It is spelled here because a program is already setting it: musl's `sigaction`
-/// copies the caller's flags word into the disposition, and a disposition the
-/// kernel cannot name is one it cannot report back.
+/// Honoured, and the half of it that is decided here is just the flag: the
+/// *rewind* belongs to the frame `build_frame` writes, because that frame is
+/// the record of the call's own arguments. `strace` on Linux 7.2 sees
+/// `read(...) = ? ERESTARTSYS`, then `rt_sigreturn({mask=[]}) = 0` followed by
+/// a genuine second `read` with the caller's original arguments; here the
+/// frame points its saved `rip` back at the `syscall` instruction (two bytes
+/// below the return address) with the call's number in `rax`, so `rt_sigreturn`
+/// resumes on the call rather than after it. The other half - which calls are
+/// rewound at all - is [`crate::syscall::linux::abi::restartable`], where the
+/// measured never-restarted set (`poll`, `select`, `epoll_wait`, the sleeps)
+/// lives.
 pub const SA_RESTART: usize = 0x1000_0000;
 
 /// The bytes of `struct rt_sigframe` on x86_64, which is what the kernel
