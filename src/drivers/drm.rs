@@ -536,6 +536,30 @@ const PAGES_PER_BUFFER: usize = 1 << 16;
 /// Cap on buffers and framebuffers the card will track.
 const MAX_HANDLES: usize = 64;
 
+/// The device resource a buffer backs, when it is a `DRM_VIRTGPU_*` one.
+///
+/// A dumb buffer that `CREATE_DUMB` made has none: its pixels reach the screen
+/// through this card's own scanout copy (`copy_to_scanout`), which reads the
+/// frames directly, so no device resource is involved. One that
+/// `DRM_VIRTGPU_RESOURCE_CREATE` made does, because that is what the request
+/// *is* - and the family's other three requests name it.
+struct Resource {
+    /// The id the device knows the resource by. This card chooses it (the device
+    /// does not allocate resource ids - Linux's driver takes them from an ida,
+    /// and so does this), and it starts above the scanout's own framebuffer,
+    /// which is `virtgpu_abi::RESOURCE_FB` and is not in this table.
+    id: u32,
+    /// The size the *caller* asked for, or a page when it asked for zero.
+    ///
+    /// Not `width * height * 4`, and that is Linux's shape rather than a
+    /// simplification: `virtio_gpu_resource_create_ioctl` takes `params.size`
+    /// from the request and substitutes `PAGE_SIZE` when it is zero, which is
+    /// why the instrument in `user/staging/virtgpu-probe/` measured a 64x64
+    /// resource answering `size = 4096`. It is the guest backing's size, and for
+    /// a 3D resource it is a placeholder while the device owns the real storage.
+    size: u64,
+}
+
 /// One dumb buffer: its geometry and the physical pages behind it.
 struct Dumb {
     width: u32,
@@ -544,11 +568,19 @@ struct Dumb {
     bpp: u32,
     /// One physical frame per page of the buffer, grown on the first write or
     /// map that touches it (the inode holds a reference on each; every process
-    /// that maps it takes its own via `clone_frame_ref`).
+    /// that maps it takes its own via `clone_frame_ref`). A `DRM_VIRTGPU_*`
+    /// resource has all of its pages made up front instead, because the device
+    /// was handed their addresses as its backing and cannot be handed a page
+    /// that does not exist yet.
     frames: Vec<usize>,
     // The card holds one reference per frame until DESTROY_DUMB; frames are
     // released then, and only actually recycled once no live mapping still
     // references them (each mapping took its own via clone_frame_ref).
+    /// Set when this buffer is a `DRM_VIRTGPU_*` resource rather than a plain
+    /// dumb buffer. It is what `RESOURCE_INFO` reports (and what
+    /// `TRANSFER_TO_HOST` needs), and it is also what the handle's release has
+    /// to tell the device about - see [`destroy_handle`].
+    resource: Option<Resource>,
 }
 
 impl Dumb {
@@ -560,11 +592,36 @@ impl Dumb {
             pitch,
             bpp,
             frames: Vec::new(),
+            resource: None,
         }
     }
+
+    /// A buffer that is also a device resource, with every page already made.
+    ///
+    /// The frames are passed in rather than grown here because they were
+    /// allocated *before* the device was told about them: the command that
+    /// attaches a backing names their addresses, so a frame allocated after it
+    /// would be a page the device was never told to read.
+    fn resource(width: u32, height: u32, frames: Vec<usize>, id: u32, size: u64) -> Dumb {
+        let mut buf = Dumb::new(width, height, 32);
+        buf.frames = frames;
+        buf.resource = Some(Resource { id, size });
+        buf
+    }
+
     fn size(&self) -> u64 {
         self.pitch as u64 * self.height as u64
     }
+
+    /// The size `RESOURCE_INFO` reports: the resource's when this is one, and
+    /// the buffer's own geometry otherwise.
+    fn info_size(&self) -> u64 {
+        match &self.resource {
+            Some(r) => r.size,
+            None => self.size(),
+        }
+    }
+
     /// Grow to cover page `idx`, returning its frame (0 if the cap or memory
     /// is hit). Allocates outside any borrow of the global card state? no -
     /// callers hold it; allocation itself takes no card lock.
@@ -661,6 +718,14 @@ struct PrimeRecord {
 /// fine, because exactly one compositor owns the seat.
 struct DrmState {
     dumb: Vec<Option<Dumb>>,
+    /// The next device resource id a `DRM_VIRTGPU_RESOURCE_CREATE` will take.
+    ///
+    /// This card's to hand out, not the device's: a resource id is a field the
+    /// *request* carries, so the layer that has to remember which id belongs to
+    /// which handle is the layer that chooses it. It starts above the scanout's
+    /// own framebuffer (`virtgpu_abi::RESOURCE_FB`), which was this driver's
+    /// before the family existed and is not in the handle table.
+    next_res_id: u32,
     fbs: Vec<Option<Framebuffer>>,
     /// The framebuffer currently driven to the scanout by the CRTC.
     current_fb: u32,
@@ -762,6 +827,7 @@ mod drm_event {
 
 static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     dumb: Vec::new(),
+    next_res_id: crate::virtgpu_abi::RESOURCE_FB + 1,
     fbs: Vec::new(),
     current_fb: 0,
     conn_crtc: CRTC_ID,
@@ -1027,14 +1093,18 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         // with `EINVAL` - and `crate::drm_virtgpu` holds that table with the
         // measurement beside every entry.
         //
-        // The four arms that are missing are missing on purpose:
-        // `RESOURCE_INFO`, `MAP`, `WAIT` and `TRANSFER_TO_HOST` all name a
-        // resource handle, on a card that cannot allocate one, and the module
-        // says why answering `ENOENT` for every handle would be a dialect of
-        // this kernel's rather than Linux's. They keep the tail's `ENOTTY`,
-        // which is the answer they have always had.
+        // All eleven are dispatched now. The four that name a resource handle
+        // were withheld in the previous pass and are here because a resource can
+        // exist: `RESOURCE_CREATE` makes one, and `INFO`, `MAP`, `WAIT` and
+        // `TRANSFER_TO_HOST` answer for it. `TRANSFER_FROM_HOST` and
+        // `EXECBUFFER` stay refused - those are the 3D path, and the measurement
+        // says a card without virgl refuses them too.
         NR_VIRTGPU_GETPARAM => virtgpu_getparam(arg),
         NR_VIRTGPU_RESOURCE_CREATE => virtgpu_resource_create(arg),
+        NR_VIRTGPU_RESOURCE_INFO => virtgpu_resource_info(arg),
+        NR_VIRTGPU_MAP => virtgpu_map(arg),
+        NR_VIRTGPU_WAIT => virtgpu_wait(arg),
+        NR_VIRTGPU_TRANSFER_TO_HOST => virtgpu_transfer_to_host(arg),
         NR_VIRTGPU_GET_CAPS => crate::drm_virtgpu::CAPS,
         NR_VIRTGPU_EXECBUFFER => crate::drm_virtgpu::EXECBUFFER,
         NR_VIRTGPU_TRANSFER_FROM_HOST => crate::drm_virtgpu::TRANSFER_FROM_HOST,
@@ -1070,29 +1140,279 @@ fn virtgpu_getparam(arg: usize) -> isize {
     0
 }
 
-/// `DRM_VIRTGPU_RESOURCE_CREATE`: refuse, but say *which* refusal applies.
+/// `DRM_VIRTGPU_RESOURCE_CREATE`: allocate a buffer and tell the device to make
+/// a resource of it.
 ///
-/// A card without 3D validates five fields of `struct drm_virtgpu_resource_create`
-/// and answers `EINVAL` for each one it does not like - `target != 2` (the 2D
-/// pipe), and `depth`, `nr_samples`, `last_level` and `array_size` each above 1.
-/// Checking them here before refusing is the difference between telling a caller
-/// its arguments are wrong and telling it this card cannot allocate, and those
-/// are different problems with different remedies.
+/// Two answers, and the order they are given in is the point. The five field
+/// checks a card without 3D makes come first (`src/drm_virtgpu.rs`), so a caller
+/// whose *arguments* are wrong hears what is wrong with them; a caller whose
+/// arguments are fine gets a resource, which on Linux it would have got all
+/// along. Before this the good case was `ENOSYS`, and the reason it could not be
+/// served was that telling the device is a control-queue command - so the work
+/// goes to the render task as a job and this parks.
 ///
-/// The field offsets are the struct's: `target` at 0, `depth` at 20,
-/// `array_size` at 24, `last_level` at 28, `nr_samples` at 32.
+/// The frames are made *before* the device is told about them, and that order is
+/// forced: the attach command names their addresses, so a page allocated after
+/// it would be a page the device was never told to read.
+///
+/// The returned `bo_handle` is this card's GEM handle - the same space
+/// `CREATE_DUMB` allocates in, so `MAP`, `ADDFB` and `GEM_CLOSE` take it - and
+/// `res_handle` is the id the device knows the resource by.
 fn virtgpu_resource_create(arg: usize) -> isize {
     let field = |offset: usize| unsafe { ((arg + offset) as *const u32).read_unaligned() };
-    match crate::drm_virtgpu::resource_create_args_ok(
-        field(0),
+    let (target, width, height) = (field(0), field(12), field(16));
+    if let Err(errno) = crate::drm_virtgpu::resource_create_args_ok(
+        target,
         field(20),
         field(32),
         field(28),
         field(24),
     ) {
-        Ok(()) => crate::drm_virtgpu::RESOURCE_CREATE_UNSUPPORTED,
-        Err(errno) => errno,
+        return errno;
     }
+    if width == 0 || height == 0 {
+        return libc_einval();
+    }
+    // The object's size is the caller's, or a page when it asked for zero -
+    // Linux's rule, and the reason the instrument measured 4096 for a 64x64
+    // resource. See `Resource::size`.
+    let asked = field(48) as u64;
+    let size = if asked == 0 { PAGE_SIZE as u64 } else { asked };
+    let pages = (size as usize).div_ceil(PAGE_SIZE);
+    if pages == 0 || pages > PAGES_PER_BUFFER {
+        return -28; // ENOSPC
+    }
+
+    let mut frames = Vec::with_capacity(pages);
+    let mut entries = Vec::with_capacity(pages);
+    for _ in 0..pages {
+        let Some(p) = crate::mm::alloc_frames(0) else {
+            for p in frames.drain(..) {
+                free_frames(p, 0);
+            }
+            return -12; // ENOMEM
+        };
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(p) as *mut u8, 0, PAGE_SIZE);
+        }
+        frames.push(p);
+        entries.push((p as u64, PAGE_SIZE as u32));
+    }
+
+    let id = critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let id = st.next_res_id;
+        st.next_res_id = st.next_res_id.wrapping_add(1);
+        id
+    });
+
+    // The device is told, and this parks until it has answered - with no lock
+    // held and no frames borrowed, because the task that answers is the render
+    // task and a caller parked while holding either would be a task waiting for
+    // something it is itself preventing.
+    let made = crate::drivers::video::render::job(crate::drivers::video::render::Job::Create2d {
+        id,
+        width,
+        height,
+        entries,
+    });
+    if made != 0 {
+        for p in frames.drain(..) {
+            free_frames(p, 0);
+        }
+        return made;
+    }
+
+    let mut frames = frames;
+    let pushed = critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        if st.dumb.len() >= MAX_HANDLES {
+            return None;
+        }
+        let idx = st.dumb.len();
+        st.dumb.push(Some(Dumb::resource(
+            width,
+            height,
+            core::mem::take(&mut frames),
+            id,
+            size,
+        )));
+        Some(idx + 1)
+    });
+    let Some(handle) = pushed else {
+        // No handle slot left. The device has already made the resource, so it
+        // is told to let go of it and the frames go back; neither may leak, and
+        // the order of the two does not matter.
+        let _ =
+            crate::drivers::video::render::job(crate::drivers::video::render::Job::Unref { id });
+        for p in frames.drain(..) {
+            free_frames(p, 0);
+        }
+        return -28; // ENOSPC
+    };
+
+    unsafe {
+        ((arg + 40) as *mut u32).write_unaligned(handle as u32); // bo_handle
+        ((arg + 44) as *mut u32).write_unaligned(id); // res_handle
+    }
+    0
+}
+
+/// `DRM_VIRTGPU_RESOURCE_INFO`: what a handle names.
+///
+/// The handle has to be one this card made - anything else is `ENOENT`, which is
+/// Linux's answer from `drm_gem_object_lookup` - and the size is the resource's
+/// own when the handle is one. `res_handle` is the device's id for a resource
+/// and **zero for a plain dumb buffer**, which is a difference from Linux worth
+/// naming: there, `CREATE_DUMB` goes through the same object creation as a
+/// resource and a dumb buffer *is* a device resource. Here it is not - this
+/// card's scanout copy reads the frames directly and the device is never told
+/// about a dumb buffer at all - and zero is the protocol's own spelling for "no
+/// resource" (`SET_SCANOUT` uses it the same way), so the field says what is
+/// true rather than inventing an id.
+fn virtgpu_resource_info(arg: usize) -> isize {
+    let handle = unsafe { (arg as *const u32).read_unaligned() } as usize;
+    let found = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        let d = st
+            .dumb
+            .get(handle.wrapping_sub(1))
+            .and_then(|slot| slot.as_ref())?;
+        Some((d.resource.as_ref().map(|r| r.id), d.info_size()))
+    });
+    let Some((res_id, size)) = found else {
+        return -2; // ENOENT
+    };
+    unsafe {
+        ((arg + 4) as *mut u32).write_unaligned(res_id.unwrap_or(0));
+        ((arg + 8) as *mut u32).write_unaligned(size as u32);
+        ((arg + 12) as *mut u32).write_unaligned(0); // blob_mem: no blobs here
+    }
+    0
+}
+
+/// `DRM_VIRTGPU_MAP`: the mmap offset for a handle's pages.
+///
+/// The same offset `MAP_DUMB` computes, over the same table, because a resource
+/// and a dumb buffer are the same kind of object here - both are the card's
+/// pages. What differs is the answer to a handle this card never made: Linux's
+/// `drm_gem_dumb_map_offset` looks the handle up and answers `ENOENT`, and so
+/// does this rather than handing back an offset for pages that are not there.
+fn virtgpu_map(arg: usize) -> isize {
+    // struct drm_virtgpu_map: offset@0 (u64), handle@8, pad@12.
+    let handle = unsafe { ((arg + 8) as *const u32).read_unaligned() } as usize;
+    let known = critical_section::with(|cs| {
+        STATE
+            .borrow(cs)
+            .borrow()
+            .dumb
+            .get(handle.wrapping_sub(1))
+            .is_some_and(|slot| slot.is_some())
+    });
+    if !known {
+        return -2; // ENOENT
+    }
+    let offset = (handle as u64) * (PAGES_PER_BUFFER as u64) * (PAGE_SIZE as u64);
+    unsafe { (arg as *mut u64).write_unaligned(offset) };
+    0
+}
+
+/// `DRM_VIRTGPU_WAIT`: wait for a resource's work to be done.
+///
+/// Always already done, and that is a fact rather than a shortcut: a fence here
+/// means a device command still in flight, and every command this card sends is
+/// waited for before the ioctl that sent it returns - so by the time a caller
+/// can ask, nothing is pending. `VIRTGPU_WAIT_NOWAIT` therefore answers `0` too,
+/// where a card with work in flight would answer `EBUSY`; `drm_sync.rs` records
+/// the same absence for the sync-object family, and the two are the same fact
+/// about this machine seen through two doors.
+///
+/// An unknown handle is still `ENOENT`: a caller waiting on something that does
+/// not exist has a bug, and "done" would hide it.
+fn virtgpu_wait(arg: usize) -> isize {
+    // struct drm_virtgpu_3d_wait: handle@0, flags@4.
+    let handle = unsafe { (arg as *const u32).read_unaligned() } as usize;
+    let known = critical_section::with(|cs| {
+        STATE
+            .borrow(cs)
+            .borrow()
+            .dumb
+            .get(handle.wrapping_sub(1))
+            .is_some_and(|slot| slot.is_some())
+    });
+    if known { 0 } else { -2 } // ENOENT
+}
+
+/// `DRM_VIRTGPU_TRANSFER_TO_HOST`: copy a resource's pixels into the device.
+///
+/// The one direction a card without 3D has - the reverse is `ENOSYS` at the
+/// dispatch arm, as measured. The box the caller sends is read for its width and
+/// height, and the whole rectangle is transferred from offset zero, because that
+/// is what this card's resources are: one buffer, no layers and no mip levels,
+/// so a caller asking for anything else is asking about a shape the resource
+/// does not have and is refused `EINVAL`.
+///
+/// A handle with no device resource - a plain dumb buffer - is also `EINVAL`.
+/// Linux completes that request; here there is no device-side resource to copy
+/// into, and the honest answer is that this command does not apply to that
+/// handle. It is named in `PLAN.md` §7.4 with the divergence above rather than
+/// answered `0`, because a transfer that did nothing while reporting success is
+/// the false success this repository forbids.
+fn virtgpu_transfer_to_host(arg: usize) -> isize {
+    // struct drm_virtgpu_3d_transfer_to_host: bo_handle@0, then the box
+    // (x@4, y@8, z@12, w@16, h@20, d@24), level@28, offset@32, stride@36,
+    // layer_stride@40.
+    let field = |offset: usize| unsafe { ((arg + offset) as *const u32).read_unaligned() };
+    let handle = field(0) as usize;
+    let (width, height, depth, level, offset, stride, layer_stride) = (
+        field(16),
+        field(20),
+        field(24),
+        field(28),
+        field(32),
+        field(36),
+        field(40),
+    );
+    let found = critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        let d = st
+            .dumb
+            .get(handle.wrapping_sub(1))
+            .and_then(|slot| slot.as_ref())?;
+        Some(d.resource.as_ref().map(|r| (r.id, r.size)))
+    });
+    let Some(res) = found else {
+        return -2; // ENOENT
+    };
+    let Some((id, size)) = res else {
+        return libc_einval(); // a dumb buffer is not a device resource
+    };
+    if width == 0
+        || height == 0
+        || depth > 1
+        || level != 0
+        || offset != 0
+        || stride != 0
+        || layer_stride != 0
+    {
+        return libc_einval();
+    }
+    // The transfer has to fit the backing the device was given. It reads
+    // `width * height * 4` bytes from the frames attached at create, and a
+    // resource whose caller asked for a smaller object - Linux substitutes a page
+    // for a zero size, and Mesa passes zero - would have it read past the end of
+    // them and into whatever the allocator put next. Linux makes no such check
+    // and would over-read; this refuses the request instead. It is a divergence
+    // that can only turn a broken caller's garbage into an error, which is the
+    // direction `PLAN.md` §4's worst-case rule asks for.
+    if width as u64 * height as u64 * 4 > size {
+        return libc_einval();
+    }
+    crate::drivers::video::render::job(crate::drivers::video::render::Job::TransferToHost {
+        id,
+        width,
+        height,
+    })
 }
 
 /// Which open file description holds the master, 0 for nobody.
@@ -1840,13 +2160,13 @@ fn arg_shape(nr: u32) -> Option<(usize, bool)> {
         // `drm_virtgpu_execbuffer` is 64 bytes (it grew the sync-object fields),
         // and the transfer pair is 44, not the 48 a `drm_virtgpu_3d_box` plus
         // four words might suggest.
-        NR_VIRTGPU_MAP => (16, true),             // struct drm_virtgpu_map
-        NR_VIRTGPU_EXECBUFFER => (64, true),      // struct drm_virtgpu_execbuffer
-        NR_VIRTGPU_GETPARAM => (16, true),        // struct drm_virtgpu_getparam
+        NR_VIRTGPU_MAP => (16, true),        // struct drm_virtgpu_map
+        NR_VIRTGPU_EXECBUFFER => (64, true), // struct drm_virtgpu_execbuffer
+        NR_VIRTGPU_GETPARAM => (16, true),   // struct drm_virtgpu_getparam
         NR_VIRTGPU_RESOURCE_CREATE => (56, true), // struct drm_virtgpu_resource_create
-        NR_VIRTGPU_RESOURCE_INFO => (16, true),   // struct drm_virtgpu_resource_info
+        NR_VIRTGPU_RESOURCE_INFO => (16, true), // struct drm_virtgpu_resource_info
         NR_VIRTGPU_TRANSFER_FROM_HOST | NR_VIRTGPU_TRANSFER_TO_HOST => (44, true),
-        NR_VIRTGPU_WAIT => (8, true),     // struct drm_virtgpu_3d_wait
+        NR_VIRTGPU_WAIT => (8, true),      // struct drm_virtgpu_3d_wait
         NR_VIRTGPU_GET_CAPS => (24, true), // struct drm_virtgpu_get_caps
         NR_VIRTGPU_RESOURCE_CREATE_BLOB => (56, true), // struct drm_virtgpu_resource_create_blob
         NR_VIRTGPU_CONTEXT_INIT => (16, true), // struct drm_virtgpu_context_init
@@ -2007,6 +2327,20 @@ fn get_resources(arg: usize) -> isize {
     // the request failing with `EFAULT` - what Linux's `copy_to_user` returns,
     // and the only answer a caller can act on. Writing through the second one
     // from kernel mode is a page fault instead.
+    //
+    // An *empty* array is neither of those: there is nothing to copy, so the
+    // pointer is never looked at, which is also what Linux does - its copy sits
+    // inside the count test. That distinction is load-bearing rather than
+    // pedantic, because of how the two-call enumeration is written: the second
+    // call carries the counts the first one reported beside buffers reserved at
+    // exactly those counts, so a count of zero arrives with the *dangling
+    // non-null* pointer an empty `Vec` has (address 4 for `u32`), never a null.
+    // Reading that pointer as "somewhere the caller asked me to write" answered
+    // this request `EFAULT`, and that is where niri's `DrmDevice::new` stopped
+    // loading the primary node's resources (`resource_handles()`, "Bad address
+    // (os error 14)"), measured in the guest: the card has no framebuffers
+    // before the first commit, so `count_fbs` is 0 on that card's first
+    // `GETRESOURCES` and nothing else was wrong.
     let fault = critical_section::with(|cs| {
         let st = STATE.borrow(cs).borrow();
         let mut fault = false;
@@ -2014,7 +2348,7 @@ fn get_resources(arg: usize) -> isize {
             let put_ids = |ptr_off: usize, count_off: usize, ids: &[u32], fault: &mut bool| {
                 let ptr = ((arg + ptr_off) as *const u64).read_unaligned() as *mut u32;
                 let want = ((arg + count_off) as *const u32).read_unaligned();
-                if want >= ids.len() as u32 && !ptr.is_null() {
+                if !ids.is_empty() && want >= ids.len() as u32 && !ptr.is_null() {
                     if user_array(ptr as usize, ids.len(), 4, true) {
                         for (i, id) in ids.iter().enumerate() {
                             ptr.add(i).write_unaligned(*id);
@@ -2033,7 +2367,7 @@ fn get_resources(arg: usize) -> isize {
                 .filter_map(|f| f.as_ref().map(|f| f.id))
                 .collect();
             let c = ((arg + 32) as *const u32).read_unaligned();
-            if c >= fbs.len() as u32 {
+            if !fbs.is_empty() && c >= fbs.len() as u32 {
                 let p = ((arg) as *const u64).read_unaligned() as *mut u32;
                 if !p.is_null() {
                     if user_array(p as usize, fbs.len(), 4, true) {
@@ -3967,20 +4301,41 @@ fn destroy_handle(handle: usize) -> isize {
     if handle == 0 {
         return libc_einval();
     }
-    critical_section::with(|cs| {
+    // The device resource id, read while the buffer is in the table. Taken out
+    // of the critical section rather than dropped with the rest because telling
+    // the device is a *job*, and a job parks: parking with interrupts off is
+    // sleeping while holding a lock, which this kernel forbids.
+    let found = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         st.prime.retain(|record| record.handle as usize != handle);
         match st.dumb.get_mut(handle - 1) {
             Some(slot) if slot.is_some() => {
+                let res = slot
+                    .as_ref()
+                    .and_then(|d| d.resource.as_ref())
+                    .map(|r| r.id);
                 if let Some(d) = slot.as_mut() {
                     d.release();
                 }
                 *slot = None;
-                0
+                Some(res)
             }
-            _ => libc_einval(),
+            _ => None,
         }
-    })
+    });
+    let Some(res) = found else {
+        return libc_einval();
+    };
+    // A resource the device still holds is told to let go. The answer is
+    // ignored: the caller asked for the handle to be released and it has been,
+    // and a device that refuses to unref a resource whose pages are already back
+    // in the allocator is not something this caller can act on either way. A
+    // plain dumb buffer was never a resource and skips this entirely.
+    if let Some(id) = res {
+        let _ =
+            crate::drivers::video::render::job(crate::drivers::video::render::Job::Unref { id });
+    }
+    0
 }
 
 /// `PRIME_HANDLE_TO_FD`: export a handle as a dma-buf descriptor - the door
@@ -4094,6 +4449,10 @@ fn prime_fd_to_handle(arg: usize) -> isize {
             pitch: buf.pitch(),
             bpp: 32,
             frames,
+            // An imported dma-buf is not a `DRM_VIRTGPU_*` resource: nothing told
+            // the device about it, and its pixels reach the screen through this
+            // card's own scanout copy like any other buffer's.
+            resource: None,
         }));
         let handle = st.dumb.len() as u32;
         st.prime.push(PrimeRecord {

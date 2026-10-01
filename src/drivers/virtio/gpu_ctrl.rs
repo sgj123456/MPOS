@@ -22,7 +22,6 @@
 //! 3D family needs are added on top of it, not in it - which is the whole
 //! reason the split is here.
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
@@ -112,8 +111,24 @@ pub struct Gpu {
     /// every command, because `add_notify_wait_pop` does not return until the
     /// device has consumed the first and written the second - so no two commands
     /// can be in flight over them.
-    send: Vec<u8>,
-    recv: Vec<u8>,
+    ///
+    /// Both are `Frames` - contiguous DMA blocks - rather than heap `Vec`s, and
+    /// that is not tidiness. A virtio descriptor names one *physically
+    /// contiguous* extent, and `HalImpl::share` turns a kernel pointer into an
+    /// address with `virt_to_phys`, which is only the start of the range: for a
+    /// buffer of more than one page that is not contiguous, the address the
+    /// device is given is the first page's and the length runs off the end of it.
+    /// One page of heap happens to be one frame, which is why this was invisible
+    /// while every request fitted in a page - and the backing list below is the
+    /// first request that does not.
+    send: Frames,
+    recv: Frames,
+    /// How many pages `send` currently has, so `reserve` does not reallocate a
+    /// block that is already big enough.
+    send_pages: usize,
+    /// How much of `send` the command in flight occupies. `pixels` hands back the
+    /// whole block, and only this much of it is the request.
+    flight: usize,
     /// The framebuffer's resource memory, while a scanout points at it.
     fb: Option<Frames>,
     /// The rectangle the scanout was last set to, which `flush` needs and
@@ -144,11 +159,27 @@ impl Gpu {
         Ok(Gpu {
             transport,
             control,
-            send: vec![0u8; PAGE_SIZE],
-            recv: vec![0u8; PAGE_SIZE],
+            send: Frames::new(1),
+            recv: Frames::new(1),
+            send_pages: 1,
+            flight: 0,
             fb: None,
             rect: None,
         })
+    }
+
+    /// Make sure the send block can hold `bytes`, growing it if it cannot.
+    ///
+    /// The size is a caller's to steer - it is a resource's page count times a
+    /// `MemEntry` - so it carries a bound, which is `Frames`' own: the allocator
+    /// refuses rather than overcommitting, and a resource big enough to matter
+    /// has already failed to allocate its own frames first.
+    fn reserve(&mut self, bytes: usize) {
+        let pages = bytes.div_ceil(PAGE_SIZE).max(1);
+        if pages > self.send_pages {
+            self.send = Frames::new(pages);
+            self.send_pages = pages;
+        }
     }
 
     /// Send one command and hand back the first `rsp_len` bytes of its answer.
@@ -159,10 +190,16 @@ impl Gpu {
     /// with a variable tail (`RESOURCE_ATTACH_BACKING` followed by its
     /// `MemEntry` list).
     fn submit(&mut self, parts: &[&[u8]], rsp_len: usize) -> Result<&[u8], Error> {
-        let mut at = 0;
-        for part in parts {
-            self.send[at..at + part.len()].copy_from_slice(part);
-            at += part.len();
+        let need: usize = parts.iter().map(|part| part.len()).sum();
+        self.reserve(need);
+        {
+            let buf = self.send.pixels();
+            let mut at = 0;
+            for part in parts {
+                buf[at..at + part.len()].copy_from_slice(part);
+                at += part.len();
+            }
+            self.flight = at;
         }
         // A reply longer than a header is one the driver reads fields out of, so
         // the buffer is cleared first: `add_notify_wait_pop` reports how many
@@ -172,14 +209,14 @@ impl Gpu {
         // no clear - the header is written in full or not at all - and is not
         // cleared, because `flush` is on the per-frame path.
         if rsp_len > size_of::<abi::CtrlHeader>() {
-            self.recv.fill(0);
+            self.recv.pixels().fill(0);
         }
         self.control.add_notify_wait_pop(
-            &[&self.send[..at]],
-            &mut [&mut self.recv],
+            &[&self.send.pixels()[..self.flight]],
+            &mut [self.recv.pixels()],
             &mut self.transport,
         )?;
-        Ok(&self.recv[..rsp_len])
+        Ok(&self.recv.pixels()[..rsp_len])
     }
 
     /// A command whose whole answer is its `CtrlHeader`.
@@ -316,6 +353,95 @@ impl Gpu {
             header: abi::CtrlHeader::new(abi::CMD_RESOURCE_FLUSH),
             rect,
             resource_id: abi::RESOURCE_FB,
+            padding: 0,
+        })
+    }
+
+    /// Create the 2D resource `id` at `width` x `height`.
+    ///
+    /// Separate from [`change_resolution`][Self::change_resolution], which does
+    /// the same command for the scanout's own resource: that one is the driver's
+    /// private framebuffer, this one is a resource the DRM layer owns and hands
+    /// out as a handle. Same fields, different owner, and an `id` the caller
+    /// chooses - the device does not allocate resource ids, the driver does, and
+    /// it is the DRM layer that has to record which id belongs to which handle.
+    pub fn create_2d(&mut self, id: u32, width: u32, height: u32) -> Result<(), Error> {
+        self.ok(&abi::ResourceCreate2d {
+            header: abi::CtrlHeader::new(abi::CMD_RESOURCE_CREATE_2D),
+            resource_id: id,
+            format: abi::FORMAT_B8G8R8A8_UNORM,
+            width,
+            height,
+        })
+    }
+
+    /// Attach `entries` as `id`'s backing: the guest-physical extents the device
+    /// reads and writes the resource through.
+    ///
+    /// A *list* rather than one extent, because the DRM layer's buffers are
+    /// allocated one page at a time (`drivers/drm.rs`'s `Dumb`) and a resource
+    /// built over them is as many extents as it has pages. That is why the
+    /// request is not a fixed-size struct: `RESOURCE_ATTACH_BACKING` is followed
+    /// on the wire by its `MemEntry` array, and the two go out as one buffer
+    /// because a virtio descriptor names one contiguous region - which is what
+    /// `send` being a `Frames` is for.
+    ///
+    /// The sizes are the caller's, and so is the danger in them: the device will
+    /// read whatever this names, so a caller that names an extent it does not
+    /// own has handed the device someone else's memory. Every caller here passes
+    /// frames it allocated.
+    pub fn attach_backing(&mut self, id: u32, entries: &[(u64, u32)]) -> Result<(), Error> {
+        let head = abi::ResourceAttachBacking {
+            header: abi::CtrlHeader::new(abi::CMD_RESOURCE_ATTACH_BACKING),
+            resource_id: id,
+            nr_entries: entries.len() as u32,
+        };
+        let entry_bytes = size_of::<abi::MemEntry>();
+        let mut request = Vec::with_capacity(
+            size_of::<abi::ResourceAttachBacking>() + entries.len() * entry_bytes,
+        );
+        request.extend_from_slice(abi::as_bytes(&head));
+        for &(addr, length) in entries {
+            let entry = abi::MemEntry {
+                addr,
+                length,
+                padding: 0,
+            };
+            request.extend_from_slice(abi::as_bytes(&entry));
+        }
+        let answer = self.submit(&[&request], size_of::<abi::CtrlHeader>())?;
+        let answer = abi::read_struct::<abi::CtrlHeader>(answer).ok_or(Error::IoError)?;
+        if answer.is(abi::RESP_OK_NODATA) {
+            Ok(())
+        } else {
+            Err(Error::IoError)
+        }
+    }
+
+    /// Release the resource `id`. The device forgets it; the caller's frames are
+    /// the caller's to free.
+    pub fn unref(&mut self, id: u32) -> Result<(), Error> {
+        self.ok(&abi::ResourceUnref {
+            header: abi::CtrlHeader::new(abi::CMD_RESOURCE_UNREF),
+            resource_id: id,
+            padding: 0,
+        })
+    }
+
+    /// Copy `id`'s whole `width` x `height` rectangle from guest memory into the
+    /// device.
+    ///
+    /// The 2D transfer, which is the only direction a card without 3D has (see
+    /// [`crate::drm_virtgpu::TRANSFER_FROM_HOST`]). The offset is zero and the
+    /// rectangle is the whole resource because that is what the DRM family's own
+    /// transfer names: `struct drm_virtgpu_3d_transfer_to_host` carries a box and
+    /// an offset, and the box the DRM layer sends is the resource's full extent.
+    pub fn transfer_to_host_2d(&mut self, id: u32, width: u32, height: u32) -> Result<(), Error> {
+        self.ok(&abi::TransferToHost2d {
+            header: abi::CtrlHeader::new(abi::CMD_TRANSFER_TO_HOST_2D),
+            rect: abi::Rect::whole(width, height),
+            offset: 0,
+            resource_id: id,
             padding: 0,
         })
     }

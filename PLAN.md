@@ -489,14 +489,19 @@ it - so the entries say which they are:
       `TIMELINE`-flag behaviour to give the two flags this host's header has)
 - [~] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
       the only one that lets niri, which rejects software EGL outright, run at
-      all; virgl and venus are both built on it (§7.4). **Measured and designed,
-      not yet landed**: the family's answers on both machine shapes are observed
-      (`user/staging/virtgpu-probe/`), the machine can be given a GL card
-      (`[qemu] gpu`), and the two forks are settled in §7.4 — the GPU driver
-      becomes this kernel's rather than the crate's, and a submission reaches
-      the device through the render task's mailbox. The family lands whole or
-      not at all, and §7.4 says why a refusals-only half-serve would be worse
-      than the `ENOTTY` it replaces.
+      all; virgl and venus are both built on it (§7.4). **The family's 2D half is
+      served and the machinery the 3D half needs is in**: all eleven requests are
+      dispatched, `RESOURCE_CREATE` makes a real device resource across the new
+      mailbox to the render task, and `t-virtgpu` pins the lot — the answers
+      observed on both machine shapes are in `user/staging/virtgpu-probe/`, and
+      the machine can be given a GL card (`[qemu] gpu`). **What is left is the 3D
+      half**: negotiating `VIRGL` and the commands behind it (`CTX_*`,
+      `RESOURCE_CREATE_3D`, `SUBMIT_3D`, `GET_CAPSET*`, blobs), which is what
+      turns `EXECBUFFER`'s `ENOSYS`, `GET_CAPS`'s and `3D_FEATURES`'s `0` into
+      real answers. Both forks §7.4 argued are now settled and landed — the GPU
+      driver is this kernel's rather than the crate's, and a submission reaches
+      the device through the render task's mailbox, which the resource path
+      already uses.
 - [~] the property families a compositor finds by name. **Four are built, and
       the list said seven**: `EDID` (a real 128-byte EDID 1.4 base block, and
       the connector's `mm_width`/`mm_height` are its own centimetre fields times

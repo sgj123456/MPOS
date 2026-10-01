@@ -17,11 +17,12 @@
 //! that needs the write-through promise takes the same route by handing a
 //! request to this task and parking until the frame left.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::drivers::virtio::gpu_ctrl::Gpu;
 use critical_section::Mutex;
@@ -114,6 +115,141 @@ pub fn request_re_present() {
 pub fn notify() {
     DIRTY.store(true, Ordering::Relaxed);
     wake_task();
+}
+
+/// A device command the DRM layer needs performed.
+///
+/// The DRM family's resource requests are the caller: `RESOURCE_CREATE` has to
+/// tell the *device* to make a resource and attach the caller's pages to it, and
+/// the device's control queue belongs to this task. So the ioctl does not reach
+/// the device - it describes the work here and parks.
+///
+/// Only three kinds are here because only three are needed: a resource is made,
+/// released, or copied into. Nothing in this enum reads an answer out of the
+/// device - the resource id is the DRM layer's to choose (the device does not
+/// allocate them), and its size and handle are the layer's own bookkeeping - so
+/// [`job`] answers an errno and nothing else.
+pub enum Job {
+    /// Create the 2D resource `id` and attach `entries` as its backing.
+    Create2d {
+        id: u32,
+        width: u32,
+        height: u32,
+        entries: Vec<(u64, u32)>,
+    },
+    /// Release the resource `id`.
+    Unref { id: u32 },
+    /// Copy `id`'s `width` x `height` pixels from guest memory into the device.
+    TransferToHost { id: u32, width: u32, height: u32 },
+}
+
+/// One queued job and how its requester learns the answer.
+///
+/// A `Vec` of waiters would do as well as the count, and the shape here is the
+/// same one `resize_blocking` uses: the requester's task id goes into a list
+/// *before* the wake, so a task that runs immediately still finds someone to
+/// wake, and the answer is posted before `done` is set, so a task that sees
+/// `done` sees the result. Both orderings matter and neither is decoration.
+struct Pending {
+    kind: Job,
+    done: AtomicBool,
+    result: AtomicIsize,
+}
+
+/// The jobs waiting for the render task, in the order they were posted.
+static JOBS: Mutex<RefCell<VecDeque<Arc<Pending>>>> = Mutex::new(RefCell::new(VecDeque::new()));
+static JOB_WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// Ask the render task to perform a device command, and park until it has.
+///
+/// Answers `0` or a negative errno, and the errno is `EIO` for every failure the
+/// device reports: `gpu_ctrl` collapses the device's `RESP_ERR_*` codes into one
+/// error because nothing in the DRM layer branches on which one came back. A
+/// caller that needed the code would want it routed out of `gpu_ctrl` first,
+/// with the request it answered - and there is no such caller.
+///
+/// Without a render task there is no device to command, and that is `ENOSYS`
+/// rather than a failure to allocate: a machine with no GPU has not run out of
+/// anything.
+pub fn job(kind: Job) -> isize {
+    if !running() {
+        return crate::err::ENOSYS;
+    }
+    let pending = Arc::new(Pending {
+        kind,
+        done: AtomicBool::new(false),
+        result: AtomicIsize::new(crate::err::EIO),
+    });
+    critical_section::with(|cs| {
+        JOBS.borrow(cs).borrow_mut().push_back(pending.clone());
+    });
+    let me = crate::sched::current();
+    critical_section::with(|cs| {
+        let mut waiters = JOB_WAITERS.borrow(cs).borrow_mut();
+        if !waiters.contains(&me) {
+            waiters.push(me);
+        }
+    });
+    wake_task();
+    crate::sched::block_until(|| pending.done.load(Ordering::Relaxed));
+    critical_section::with(|cs| {
+        JOB_WAITERS.borrow(cs).borrow_mut().retain(|&w| w != me);
+    });
+    pending.result.load(Ordering::Relaxed)
+}
+
+/// Whether anything is waiting for the task. Part of the loop's wake condition:
+/// a requester that posted a job and woke this task needs the task to look, and
+/// nothing else in the loop would make it.
+fn jobs_pending() -> bool {
+    critical_section::with(|cs| !JOBS.borrow(cs).borrow().is_empty())
+}
+
+/// Perform every queued job, in order, and wake whoever asked.
+fn drain_jobs(device: &mut Gpu) {
+    loop {
+        let Some(pending) = critical_section::with(|cs| JOBS.borrow(cs).borrow_mut().pop_front())
+        else {
+            return;
+        };
+        let result = perform(device, &pending.kind);
+        // The result before the flag: a requester that reads `done` true must
+        // already be able to read the answer, and this is the pair of stores the
+        // release/acquire ordering behind `block_until` is about.
+        pending.result.store(result, Ordering::Relaxed);
+        pending.done.store(true, Ordering::Relaxed);
+        let waiters =
+            critical_section::with(|cs| core::mem::take(&mut *JOB_WAITERS.borrow(cs).borrow_mut()));
+        for id in waiters {
+            crate::sched::wake(id);
+        }
+    }
+}
+
+/// Run one job on the device, answering an errno.
+///
+/// A `CREATE` is two commands and both must land, which is why they are one job
+/// rather than two: a resource created and never backed is a resource the device
+/// will read from nowhere the moment anything is transferred to it.
+fn perform(device: &mut Gpu, kind: &Job) -> isize {
+    let done = match kind {
+        Job::Create2d {
+            id,
+            width,
+            height,
+            entries,
+        } => device
+            .create_2d(*id, *width, *height)
+            .and_then(|()| device.attach_backing(*id, entries)),
+        Job::Unref { id } => device.unref(*id),
+        Job::TransferToHost { id, width, height } => {
+            device.transfer_to_host_2d(*id, *width, *height)
+        }
+    };
+    match done {
+        Ok(()) => 0,
+        Err(_) => crate::err::EIO,
+    }
 }
 
 /// Tell the render task the host's display changed size.
@@ -285,6 +421,7 @@ fn task() {
                 || pending()
                 || PROBE.load(Ordering::Relaxed)
                 || RE_PRESENT.load(Ordering::Relaxed)
+                || jobs_pending()
                 || RESIZE_TARGET.load(Ordering::Relaxed) != 0
         });
         DIRTY.store(false, Ordering::Relaxed);
@@ -295,10 +432,17 @@ fn task() {
         // at the beat would make a 4 KiB write cost a frame and a screenful
         // cost a minute - which is what a `/dev/fb0` writer would have paid.
         let now = crate::arch::timer::ticks();
-        if !pending() && now.saturating_sub(last_paint) < FRAME_TICKS {
+        if !pending() && !jobs_pending() && now.saturating_sub(last_paint) < FRAME_TICKS {
             crate::sched::sleep_ticks(FRAME_TICKS - (now - last_paint));
         }
         last_paint = crate::arch::timer::ticks();
+
+        // Whatever the DRM layer asked the device to do, before anything that
+        // paints: a caller parked in `job` is holding a system call open, and the
+        // beat above coalesces repaints - work nobody asked for - rather than
+        // requests. The jobs are resource commands and touch no scanout, so their
+        // place relative to the resize and the probe is a latency question only.
+        drain_jobs(&mut device);
 
         // The host's display changed shape, taken after the beat so a drag's
         // stream of events costs one re-query per frame. This is a *probe*: it

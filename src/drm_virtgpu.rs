@@ -26,19 +26,36 @@
 //! is §4's wrong-shape failure in its plainest form, and it is why this is a
 //! table rather than a constant.
 //!
-//! # What is *not* here, and why that is deliberate
+//! # What is served, and the one field that is not Linux's
 //!
-//! Four requests name a resource handle - `RESOURCE_INFO`, `MAP`, `WAIT` and
-//! `TRANSFER_TO_HOST` - and on a real card all four *succeed*. They are absent
-//! because their honest answer needs a resource to exist, and this card cannot
-//! make one: a resource is a device-side allocation told to the device over the
-//! control queue, and the queue belongs to the render task. Answering `ENOENT`
-//! for every handle was considered and rejected: this card's handle table holds
-//! *dumb buffers*, and on Linux a dumb buffer **is** a GEM object that
-//! `RESOURCE_INFO` answers for, so "no handle is a resource" would be a dialect
-//! of this kernel's rather than Linux's - §4 rule 3. They land with the resource
-//! path, and until then they keep the tail's `ENOTTY`, which is at least the
-//! same wrong answer they have always had rather than a new one.
+//! All eleven requests are dispatched now. `GETPARAM` and the refusals below are
+//! this module; `RESOURCE_CREATE` in `drivers/drm.rs` allocates a buffer and has
+//! the render task tell the device to make a resource of it, and `RESOURCE_INFO`,
+//! `MAP`, `WAIT` and `TRANSFER_TO_HOST` answer for the handles that come back.
+//! The measurement above is why the refusals are per-request, and it is also why
+//! `MAP` and `WAIT` *succeed* here rather than being refused with the rest: a
+//! card without 3D answers them, so refusing them would be a new wrong answer
+//! rather than the old one.
+//!
+//! Three things are this card's rather than Linux's, and each is named where it
+//! happens rather than left to be found:
+//!
+//! 1. **`TRANSFER_FROM_HOST` is `ENOSYS` here and on Linux alike** - that one is
+//!    the measurement, not a divergence: the only command that reads a resource
+//!    back is the 3D transfer.
+//! 2. **`RESOURCE_INFO`'s `res_handle` is 0 for a plain dumb buffer.** On Linux a
+//!    dumb buffer *is* a device resource and the field names it; here one is the
+//!    card's own pages and the device was never told about it, so the field says
+//!    the protocol's own "no resource" (`SET_SCANOUT` spells it the same way).
+//! 3. **`TRANSFER_TO_HOST` on a plain dumb buffer is `EINVAL`** where Linux
+//!    completes it - same reason, and answered as "this command does not apply to
+//!    that handle" rather than `0`, because a transfer that did nothing while
+//!    reporting success is the false success this repository forbids.
+//!
+//! The fix for 2 and 3 is one change and is recorded in `PLAN.md` §7.4: make
+//! `CREATE_DUMB` create a device resource too, as Linux's does. It is not here
+//! because it would make every dumb buffer eagerly backed and add a device round
+//! trip to a path the console, weston and the fbdev node all allocate through.
 //!
 //! Nothing here is `cfg`-gated, for the same reason `drm_sync.rs` and
 //! `drm_blob.rs` are not: these are decisions about numbers, and a decision
@@ -132,20 +149,6 @@ pub const CONTEXT_INIT: isize = EINVAL;
 /// without 3D does not.
 pub const RESOURCE_CREATE_BLOB: isize = EINVAL;
 
-/// The `RESOURCE_CREATE` request is refused `ENOSYS` *after* its arguments pass
-/// the validation below.
-///
-/// This is the one answer here that is not a measured Linux answer, and it is
-/// named as such rather than hidden: on a real card a valid 2D `RESOURCE_CREATE`
-/// **succeeds**, because the driver tells the device to make a resource and
-/// attaches the caller's pages to it. This card cannot: the control queue that
-/// would carry that command belongs to the render task, and reaching it from an
-/// ioctl is the mailbox `PLAN.md` §7.4 describes. `ENOSYS` - "this card does not
-/// do that" - is the honest refusal §4 asks for; a fabricated handle would be
-/// the false success that same section calls the worst thing this codebase can
-/// do, because the caller would build on it.
-pub const RESOURCE_CREATE_UNSUPPORTED: isize = ENOSYS;
-
 /// The `target` a 2D resource is created with. The only value a card without 3D
 /// accepts, and the one its own framebuffer uses.
 pub const TARGET_2D: u32 = 2;
@@ -166,12 +169,7 @@ pub fn resource_create_args_ok(
     last_level: u32,
     array_size: u32,
 ) -> Result<(), isize> {
-    if target != TARGET_2D
-        || depth > 1
-        || nr_samples > 1
-        || last_level > 1
-        || array_size > 1
-    {
+    if target != TARGET_2D || depth > 1 || nr_samples > 1 || last_level > 1 || array_size > 1 {
         return Err(EINVAL);
     }
     Ok(())
@@ -242,9 +240,10 @@ mod tests {
         assert_eq!(TRANSFER_FROM_HOST, ENOSYS);
         assert_eq!(CONTEXT_INIT, EINVAL);
         assert_eq!(RESOURCE_CREATE_BLOB, EINVAL);
-        assert_eq!(RESOURCE_CREATE_UNSUPPORTED, ENOSYS);
         // The two families of answer are genuinely different codes, which is the
-        // whole claim of the table above.
+        // whole claim of the table above. `TRANSFER_TO_HOST` and `MAP` are not
+        // here because they are *served* - a card without 3D succeeds at both,
+        // and `RESOURCE_CREATE` now does too.
         assert_ne!(CAPS, CONTEXT_INIT);
     }
 }
