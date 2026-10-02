@@ -982,23 +982,52 @@ impl Vfs {
 
     /// Walk `path` from the root, crossing mounts as they are met.
     pub fn resolve(&self, path: &str) -> VfsResult<Arc<dyn Inode>> {
-        let start = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
-            .ok_or(VfsError::NoRoot)?;
-        self.resolve_from(path, start)
+        let root = self.root_opt().ok_or(VfsError::NoRoot)?;
+        self.resolve_walk(path, root.clone(), Some(root))
+    }
+
+    /// The root inode as it stands, or `None` before a filesystem is mounted -
+    /// the graceful form every walk wants, where [`Self::root_inode`] panics for
+    /// the one caller that cannot run without a root.
+    fn root_opt(&self) -> Option<Arc<dyn Inode>> {
+        critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
     }
 
     /// Walk `path` from `start` instead of the root - which is what a
     /// relative path means, and why a process carrying a cwd needs this
     /// rather than [`resolve`](Self::resolve).
     ///
-    /// An absolute path ignores `start` entirely: `/` means the root, not
-    /// "wherever this happens to be". The mount crossing is the same walk as
-    /// ever, one node deeper in the tree.
+    /// An absolute path ignores `start` entirely and begins at the global root,
+    /// as `/` must. [`resolve_walk`](Self::resolve_walk) is the same walk with
+    /// the root it starts from, its `..` clamp, and its absolute-symlink restart
+    /// all named by one `jail` argument; this is that walk with the jail being
+    /// the machine's own root, which is what a caller with no process context -
+    /// the mount bookkeeping, a host test on a bare tree - means.
     pub fn resolve_from(&self, path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
+        self.resolve_walk(path, start, self.root_opt())
+    }
+
+    /// Walk `path` from `start`, treating `jail` as the root: the directory an
+    /// absolute path begins at, the node whose `..` is itself, and where an
+    /// absolute symlink target restarts from.
+    ///
+    /// `jail` is a *process's* root, kept apart from the machine's so a
+    /// `chroot(2)` re-homes only the calling task - see the mount-crossing note
+    /// below, which is unchanged by it. `None` is "no root is mounted": the
+    /// graceful answer is `NoRoot` wherever the walk needs a root to begin, and
+    /// a `..` with nothing to clamp against behaves as it did before a root
+    /// existed.
+    ///
+    /// The mount crossing is the same walk as ever, one node deeper in the tree.
+    fn resolve_walk(
+        &self,
+        path: &str,
+        start: Arc<dyn Inode>,
+        jail: Option<Arc<dyn Inode>>,
+    ) -> VfsResult<Arc<dyn Inode>> {
         let absolute = path.starts_with('/');
         let start = if absolute {
-            critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
-                .ok_or(VfsError::NoRoot)?
+            jail.clone().ok_or(VfsError::NoRoot)?
         } else {
             start
         };
@@ -1069,7 +1098,7 @@ impl Vfs {
                             // an ordinary walk would have said so by looking a
                             // name up in it.
                             return Err(VfsError::NotDir);
-                        } else if !self.is_root(&stack[0]) {
+                        } else if !jail.as_ref().is_some_and(|j| Arc::ptr_eq(j, &stack[0])) {
                             // A chain of one means the walk has not descended
                             // from where it started, so the parent above it is
                             // the one thing the chain cannot supply: an
@@ -1160,15 +1189,12 @@ impl Vfs {
                             next.extend(todo);
                             todo = next;
                             if target.starts_with('/') {
-                                // An absolute target names a path from the real
-                                // root, so the names after it are looked up
-                                // there and the walk to the link - and any bind
-                                // alias it came through - is behind it.
+                                // An absolute target names a path from the
+                                // walk's root, so the names after it are looked
+                                // up there and the walk to the link - and any
+                                // bind alias it came through - is behind it.
                                 stack.truncate(1);
-                                stack[0] = critical_section::with(|cs| {
-                                    self.root.borrow(cs).borrow().clone()
-                                })
-                                .ok_or(VfsError::NoRoot)?;
+                                stack[0] = jail.clone().ok_or(VfsError::NoRoot)?;
                                 bound = false;
                             }
                             met_link = true;
@@ -1347,15 +1373,6 @@ impl Vfs {
             record.parent_id = parent;
         }
         records
-    }
-
-    /// Whether `node` is the root of this tree - which answers `..` without a
-    /// search, because `/..` is `/`: the root is the one node whose parent the
-    /// walk must *not* go looking for. Nothing names the root, so the search
-    /// would spend its whole budget learning what this comparison knows.
-    fn is_root(&self, node: &Arc<dyn Inode>) -> bool {
-        critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
-            .is_some_and(|root| Arc::ptr_eq(&root, node))
     }
 
     /// The directory that names `target`, found by walking down from the root.
