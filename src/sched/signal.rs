@@ -387,8 +387,13 @@ impl SigInfo {
 /// wrong language. The ABI tests pin the *wire* half by number.
 pub type Pending = u64;
 
+/// The bit a signal occupies in the kernel's `Pending` set.
+///
+/// Canonical Linux layout: signal *n* is bit *n-1*, so signals `1..=64` fill the
+/// `u64` end to end (`_NSIG`), with no spare bit and no collision. Signal 0 has no
+/// bit (it is the `kill`-existence probe, never pending).
 pub fn bit(sig: u8) -> Pending {
-    1 << (sig % 64)
+    if sig == 0 { 0 } else { 1u64 << (sig - 1) }
 }
 
 pub fn add(set: &mut Pending, sig: u8) {
@@ -398,18 +403,19 @@ pub fn add(set: &mut Pending, sig: u8) {
 /// A libc's `sigset_t` as it arrives on the syscall boundary: signal *n* in
 /// bit *n-1*.
 ///
-/// The highest bit the wire can carry is signal 64, which no call here can
-/// name; it is dropped, and the caller that wants the whole real-time range
-/// finds the refusal in the dispositions it still cannot set.
+/// The kernel stores the pending set in that same layout (see [`bit`]), so the
+/// conversion is the identity — the wire and the internal set are one and the
+/// same shape, which is why a disposition's `sa_mask` (kept in wire form) and
+/// `blocked` (the pending shape) can be combined without a shift.
 pub fn from_wire(raw: u64) -> Pending {
-    raw << 1
+    raw
 }
 
 /// The kernel's pending set as a libc's `sigset_t`: signal *n* back into bit
 /// *n-1*, which is the shape every caller of `rt_sigprocmask`'s `oldset` and
-/// `rt_sigpending` reads.
+/// `rt_sigpending` reads. Identity for the same reason as [`from_wire`].
 pub fn to_wire(set: Pending) -> u64 {
-    set >> 1
+    set
 }
 
 /// Take the lowest-numbered pending signal out of the set, if any.
@@ -417,7 +423,7 @@ pub fn take(set: &mut Pending) -> Option<u8> {
     if *set == 0 {
         return None;
     }
-    let sig = (*set).trailing_zeros() as u8;
+    let sig = (*set).trailing_zeros() as u8 + 1;
     *set &= !bit(sig);
     Some(sig)
 }
