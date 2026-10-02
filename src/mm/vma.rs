@@ -25,7 +25,48 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::mm::vm::MapFlags;
-use crate::vfs::Inode;
+
+/// The object a frame-backed mapping aliases its pages from.
+///
+/// `mm` asks an object exactly three things, and this trait is those three and
+/// nothing else: the frame behind one of its pages (what the fault path needs),
+/// the `(device, inode)` pair `/proc/<pid>/maps` prints for a line, and whether
+/// two mappings are of the *same* object (what lets two adjacent ranges
+/// coalesce into the one line Linux prints).
+///
+/// It is deliberately **not** `vfs::Inode`. An address space is a memory
+/// concept and a file is not; naming the VFS here is what made `mm` and `vfs` a
+/// cycle (`ARCHITECTURE.md` V-13, whose own note says the file-backed mapping
+/// "needs *a* mapped-object trait; `Inode` is the wrong one to name"). The VFS
+/// answers this trait for its inodes through `crate::vfs::MappedInode`, which
+/// is where the three answers come from - and a host test of *this* file can
+/// supply a stand-in that knows nothing about files at all.
+pub trait MappedObject {
+    /// The frame holding the object's `index`-th page, or `None` if it has no
+    /// such page - which is what makes a mapping of it grow lazily rather than
+    /// being sized up front.
+    fn frame_at(&self, index: u64) -> Option<usize>;
+
+    /// The `(device, inode)` pair a mapping of this object reports. A device
+    /// node answers the device it *is*; anything else answers `(0, 0)`, which is
+    /// what this kernel's `stat` says for a filesystem and so keeps the two
+    /// readers of that fact agreeing.
+    fn identity(&self) -> ((u32, u32), u64);
+
+    /// Whether `other` is this same object.
+    ///
+    /// Defaulted to identity, which is the strongest comparison a trait object
+    /// can make without a downcast. For the four node types that are
+    /// frame-backed here - a `memfd`, a dma-buf, the framebuffer and a DRM dumb
+    /// buffer - the pair *is* unique per object, so this gives the same answer
+    /// the `Arc::ptr_eq` it replaces did, expressed as a value rather than as an
+    /// address. What the default costs is the distinction between two objects
+    /// that report one identity, which would mean two inodes of one file; what
+    /// it buys is that `mm` never sees a pointer it would have to interpret.
+    fn same_as(&self, other: &dyn MappedObject) -> bool {
+        self.identity() == other.identity()
+    }
+}
 
 /// What is behind a range's pages.
 #[derive(Clone)]
@@ -49,7 +90,7 @@ pub enum VmaKind {
     /// other: the object says what the pages *are*, this says what the caller
     /// asked for.
     Frames {
-        inode: Arc<dyn Inode>,
+        object: Arc<dyn MappedObject>,
         offset: usize,
         shared: bool,
     },
@@ -64,16 +105,16 @@ impl VmaKind {
             (VmaKind::Anon, VmaKind::Anon) => true,
             (
                 VmaKind::Frames {
-                    inode: a,
+                    object: a,
                     shared: sa,
                     ..
                 },
                 VmaKind::Frames {
-                    inode: b,
+                    object: b,
                     shared: sb,
                     ..
                 },
-            ) => Arc::ptr_eq(a, b) && sa == sb,
+            ) => a.same_as(b.as_ref()) && sa == sb,
             _ => false,
         }
     }
@@ -198,11 +239,11 @@ impl Vma {
         let kind = match &self.kind {
             VmaKind::Anon => VmaKind::Anon,
             VmaKind::Frames {
-                inode,
+                object,
                 offset,
                 shared,
             } => VmaKind::Frames {
-                inode: Arc::clone(inode),
+                object: Arc::clone(object),
                 offset: offset + (start - self.start),
                 shared: *shared,
             },
@@ -387,21 +428,25 @@ impl VmaTable {
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
-    use crate::vfs::{Metadata, NodeKind};
 
-    /// A stand-in backing object: the tests care about *identity* (which Arc is
-    /// which), which is the whole of what `Frames` merging is about.
+    /// A stand-in backing object.
+    ///
+    /// It knows nothing about files, which is the point of the seam: the tests
+    /// care about *identity* - which object a mapping is of - and identity is
+    /// now something this file defines rather than something it borrows from
+    /// the VFS. Before V-13 was closed these tests built a fake `vfs::Inode`,
+    /// which is exactly the dependency the trait exists to remove.
     struct Fake {
         ino: u64,
     }
 
-    impl Inode for Fake {
-        fn metadata(&self) -> Metadata {
-            Metadata {
-                ino: self.ino,
-                kind: NodeKind::File,
-                size: 0,
-            }
+    impl MappedObject for Fake {
+        fn frame_at(&self, _index: u64) -> Option<usize> {
+            None
+        }
+
+        fn identity(&self) -> ((u32, u32), u64) {
+            ((0, 0), self.ino)
         }
     }
 
@@ -411,7 +456,7 @@ mod tests {
 
     /// One backing object, so that two VMAs over it can be the *same* object
     /// the way two mappings of one descriptor are.
-    fn fake(ino: u64) -> Arc<dyn Inode> {
+    fn fake(ino: u64) -> Arc<dyn MappedObject> {
         Arc::new(Fake { ino })
     }
 
@@ -419,7 +464,7 @@ mod tests {
         start: usize,
         end: usize,
         prot: MapFlags,
-        inode: &Arc<dyn Inode>,
+        object: &Arc<dyn MappedObject>,
         offset: usize,
     ) -> Vma {
         Vma::new(
@@ -427,7 +472,7 @@ mod tests {
             end,
             prot,
             VmaKind::Frames {
-                inode: Arc::clone(inode),
+                object: Arc::clone(object),
                 offset,
                 shared: true,
             },
@@ -486,6 +531,30 @@ mod tests {
     }
 
     #[test]
+    fn one_object_is_recognised_across_two_handles_to_it() {
+        // The rule V-13 changed, pinned as the rule it is now: two mappings are
+        // of one object when the object *says so*, not when their `Arc`s are the
+        // same pointer. Two `Arc`s with the same identity are two handles to one
+        // thing - which is what a `memfd` reached through two descriptors looks
+        // like - and they merge; two identities do not, however equal the offsets
+        // line up. The old pointer comparison could not be asked across the trait
+        // boundary, and this is the fact it was standing in for.
+        let mut table = VmaTable::new();
+        table.insert(frames(0x1000, 0x2000, RW, &fake(7), 0));
+        table.insert(frames(0x2000, 0x3000, RW, &fake(7), 0x1000));
+        assert_eq!(
+            table.len(),
+            1,
+            "one object through two handles is one area, as Linux prints it"
+        );
+
+        let mut table = VmaTable::new();
+        table.insert(frames(0x1000, 0x2000, RW, &fake(7), 0));
+        table.insert(frames(0x2000, 0x3000, RW, &fake(8), 0x1000));
+        assert_eq!(table.len(), 2, "and two objects are two areas");
+    }
+
+    #[test]
     fn a_split_keeps_the_frame_offset_with_its_address() {
         let object = fake(7);
         let mut table = VmaTable::new();
@@ -519,7 +588,7 @@ mod tests {
             0x3000,
             RW,
             VmaKind::Frames {
-                inode: Arc::clone(&object),
+                object: Arc::clone(&object),
                 offset: 0x1000,
                 shared: false,
             },

@@ -2446,7 +2446,7 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
                 base,
                 len,
                 mf,
-                object,
+                crate::vfs::MappedInode::new(object),
                 0,
                 true,
                 Some(alloc::sync::Arc::from("/memfd: (deleted)")),
@@ -2468,7 +2468,15 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
             let name = file
                 .label()
                 .map(|path| alloc::sync::Arc::from(path.as_str()));
-            crate::sched::map_frames(base, len, mf, file.inode(), offset, shared, name);
+            crate::sched::map_frames(
+                base,
+                len,
+                mf,
+                crate::vfs::MappedInode::new(file.inode()),
+                offset,
+                shared,
+                name,
+            );
         }
         // An ordinary file: the bytes are read in now, because a mapping of a
         // file this kernel does not page is a copy of what the file held and

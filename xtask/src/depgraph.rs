@@ -26,13 +26,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 /// The number of mutual module pairs (a cycle of length two) the tree had when
-/// this ratchet was last recorded: 2026-10-02, after Phase 11 Step C.
-/// §11.0 measured 23 by text; the three removed there were comment mentions, and
-/// the twenty-first went when the scheduler stopped calling
-/// `net::socket::close_sockets_at_exit` by name - the exit-hook registry
-/// (`sched::exit`) took that edge out of `sched`, and `net → sched` alone is not
-/// a cycle. Was 20 before Step C.
-const BASELINE_MUTUAL_PAIRS: usize = 19;
+/// this ratchet was last recorded: 2026-10-02, after Phase 11 Step C and the
+/// `mm`/`vfs` seam. §11.0 measured 23 by text; the three removed there were
+/// comment mentions, the twenty-first went when the exit-hook registry took
+/// `sched → net` out, and the eighteenth when `mm` stopped naming `vfs::Inode`
+/// for a frame-backed mapping (`vfs` still names `mm`, so only one direction of
+/// that pair had to go — `ARCHITECTURE.md` V-13). Was 19 before the seam.
+const BASELINE_MUTUAL_PAIRS: usize = 18;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`. All
 /// nine are the `Inode::as_*` downcasts (V-1: `as_fb`, `as_evdev`, `as_uinput`,

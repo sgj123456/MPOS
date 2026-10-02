@@ -858,19 +858,19 @@ fn maps_of(pid: usize) -> Option<String> {
         let (offset, dev, inode, shared) = match &vma.kind {
             VmaKind::Anon => (0, (0, 0), 0, false),
             VmaKind::Frames {
-                inode,
+                object,
                 offset,
                 shared,
-            } => (
-                *offset as u64,
+            } => {
                 // A device node reports the device it is; a file reports the
                 // filesystem it is on, and this kernel's `stat` says zero for
-                // every filesystem, so the two files that read the same fact
-                // do not disagree about it.
-                inode.rdev().unwrap_or((0, 0)),
-                inode.metadata().ino,
-                *shared,
-            ),
+                // every filesystem, so the two files that read the same fact do
+                // not disagree about it. Both halves come from the object's own
+                // answer (`mm::vma::MappedObject::identity`), which is the same
+                // pair the object compares itself by.
+                let (dev, inode) = object.identity();
+                (*offset as u64, dev, inode, *shared)
+            }
         };
         let name = match &vma.name {
             Some(name) => Some(String::from(&**name)),

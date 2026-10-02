@@ -6293,12 +6293,12 @@ fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) -> bool {
             unsafe { core::ptr::write_bytes(mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
             frame
         }
-        VmaKind::Frames { inode, offset, .. } => {
+        VmaKind::Frames { object, offset, .. } => {
             // The page of the *object* this address corresponds to. The offset
             // travels with the address through every split (see `mm::vma`), so
             // this is the same page the eager loop used to map.
             let index = ((offset + (page - vma.start)) / PAGE_SIZE) as u64;
-            match inode.mmap_frame(index) {
+            match object.frame_at(index) {
                 Some(frame) => frame,
                 None => return false,
             }
@@ -6401,7 +6401,7 @@ pub fn map_frames(
     virt: usize,
     len: usize,
     flags: MapFlags,
-    inode: Arc<dyn crate::vfs::Inode>,
+    object: Arc<dyn crate::mm::vma::MappedObject>,
     offset: usize,
     shared: bool,
     name: Option<Arc<str>>,
@@ -6415,7 +6415,7 @@ pub fn map_frames(
             virt + len,
             flags,
             VmaKind::Frames {
-                inode,
+                object,
                 offset,
                 shared,
             },

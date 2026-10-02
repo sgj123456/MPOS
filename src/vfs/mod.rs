@@ -895,6 +895,48 @@ pub trait Inode: Send + Sync {
     }
 }
 
+/// An inode as `mm`'s *mapped object*: what a frame-backed mapping aliases its
+/// pages from.
+///
+/// `mm` owns the address space, and a mapping of a `memfd`, a dma-buf, the
+/// framebuffer or a DRM dumb buffer is a memory fact it has to keep - but the
+/// thing behind those pages is a VFS inode, and an address space is not a file.
+/// Before this wrapper existed, `mm` named [`Inode`] directly (`ARCHITECTURE.md`
+/// V-13), which is what made `mm` and `vfs` a cycle; now it names
+/// [`crate::mm::vma::MappedObject`] - three questions, no files - and this is where
+/// the three answers come from, since the outer layer is the one allowed to know
+/// both sides of the seam.
+///
+/// The comparison is the interesting one. `mm` merges two adjacent mappings of
+/// the same object into the one line Linux prints, and it used to decide that
+/// with `Arc::ptr_eq` on the two inode pointers. A trait object cannot be
+/// compared by pointer across a crate-ish boundary without a downcast, so the
+/// trait asks the object instead, and the default answer - equal
+/// [`identity`](crate::mm::vma::MappedObject::identity) - is the same fact as a
+/// value. For these four node types it is also unique per object: a `memfd` and
+/// a dma-buf carry their own inode number, and the framebuffer and each dumb
+/// buffer are devfs nodes that carry one too.
+pub struct MappedInode(Arc<dyn Inode>);
+
+impl MappedInode {
+    /// Wrap an inode for a frame-backed mapping. The mapping holds the inner
+    /// inode alive for as long as the VMA lives, which is what keeps a `memfd`'s
+    /// frames from being released while somebody is still drawing into them.
+    pub fn new(inode: Arc<dyn Inode>) -> Arc<dyn crate::mm::vma::MappedObject> {
+        Arc::new(MappedInode(inode))
+    }
+}
+
+impl crate::mm::vma::MappedObject for MappedInode {
+    fn frame_at(&self, index: u64) -> Option<usize> {
+        self.0.mmap_frame(index)
+    }
+
+    fn identity(&self) -> ((u32, u32), u64) {
+        (self.0.rdev().unwrap_or((0, 0)), self.0.metadata().ino)
+    }
+}
+
 /// The block/inode accounting `statfs(2)` reports, as the filesystem itself
 /// counts it: `blocks`/`bfree`/`bavail` in `bsize`-sized blocks, `files`/
 /// `ffree` in inodes.

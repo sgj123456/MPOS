@@ -650,7 +650,7 @@ it - so the entries say which they are:
 **Architectures (Phase 9 — far future)**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
-**Architecture debt (Phase 11 — audit done, Steps A/C/E/F/G landed)**
+**Architecture debt (Phase 11 — audit done, Steps A/C/E/F/G landed, V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
@@ -714,6 +714,16 @@ it - so the entries say which they are:
       and the unused host test module behind it is settled: `net/socket.rs`'s three tests were
       never compiled, and their claims are pinned by `t-sockmsg`, which boots, so the module is
       gone. `xtask/src/gates.rs` fails the gate on the shape from now on (§11.2 Step F)
+- [x] the **`mm`/`vfs` seam** (V-13, the one finding the audit left outside A–G): `mm` named
+      `vfs::Inode` for the object a frame-backed mapping aliases its pages from, which is what made
+      `mm` and `vfs` a cycle. The trait it needed is `mm::vma::MappedObject` — the frame behind a
+      page, the `(dev, ino)` pair `/proc/<pid>/maps` prints, and whether two mappings are of one
+      object — and the VFS answers it for its inodes through `vfs::MappedInode`. `mm → vfs` is now
+      0, and the pair went with it: **19 → 18**. The comparison that used to be `Arc::ptr_eq` is
+      asked of the object instead (identity), which a trait object can do and a pointer cannot
+      without a downcast; for the four frame-backed node types the pair *is* unique per object, so
+      it is the same answer as a value, and the rule is pinned by a test that two handles to one
+      object merge while two objects do not
 - [x] 11.G a depgraph ratchet, so the measured cycle count cannot grow back: `cargo xtask
       depgraph` (also a host test, so it is inside `cargo xtask test`) re-runs §11.0's extraction
       with comments stripped and holds three recorded baselines — lower layer → `syscall`,
@@ -5458,7 +5468,7 @@ latency bug that only shows under load, which is where it will be found first.
 
 ---
 
-## Phase 11: Architectural Debt — **AUDIT DONE; STEPS A, C, E, F AND G LANDED**
+## Phase 11: Architectural Debt — **AUDIT DONE; STEPS A, C, E, F, G LANDED, AND V-13 CLOSED**
 
 Everything above this phase is about *features*: what the kernel cannot yet do. This phase is
 about the *shape* of the kernel that does them, and it opens with a measurement rather than an

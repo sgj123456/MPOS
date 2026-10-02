@@ -399,11 +399,13 @@ Two notes on the table above, both of them about trusting a measured number:
 **The ratchet is the live measurement.** `cargo xtask depgraph` (`PLAN.md` §11.2 Step G) runs the
 same extraction as its own *check*, with one difference that matters: `//` comments are stripped
 before matching, so what it counts is who names whom in code rather than who writes about whom.
-Measured on this tree as steps A, C, E, F and G landed it reports **19** mutual pairs, where the
+Measured on this tree as steps A, C, E, F and G landed and the `mm`/`vfs` seam closed it reports **18** mutual pairs, where the
 same extraction matching text reports 23 — `uaccess ↔ syscall`, `evdev ↔ vfs` and `mm ↔ sched` are
 prose, not edges, which is the lesson the `arch ↔ vfs` phantom taught above, met a second time.
-Step C took one pair off in code as well: the exit-hook registry (`sched::exit`) removed
-`sched → net`, and `net → sched` alone is not a cycle. The tables in this section are the audit's
+Two came off in code as well: the exit-hook registry (`sched::exit`) removed `sched → net`,
+and `mm` stopped naming `vfs` for a frame-backed mapping (V-13). In neither case does the other
+direction go - `net → sched` is ordinary parking and `vfs → mm` is the tenant of the address
+space - because a one-way edge is not a cycle. The tables in this section are the audit's
 snapshot and are left as they were read; from here the command is what they have to agree with, and
 it fails when an edge appears that was not there when the baseline was recorded. Two further rules
 ride with it, each a ratchet at its recorded number rather than an absolute refusal, because Step B
@@ -510,7 +512,7 @@ are items this table caught and later work closed; an *Open* or *Widened* row is
 | V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | Accepted by design; document only |
 | V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs` was `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs` gated `pub mod net` on `target_os = "none"`; 3 tests never ran. **Closed by Step F**: the module was deleted (its three claims are pinned by `user/tests/src/bin/t-sockmsg.rs`, which boots), the criterion is written down (`src/lib.rs`, `AGENTS.md` §4), and `xtask/src/gates.rs::dead_host_tests` — run at the head of `cargo xtask test` — now fails on the shape | **Done** (Phase 11 F) |
 | V-12 | The tree was mid-refactor and did not build for the host | The uncommitted work renamed `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edited `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` failed to compile | **Resolved** — finished and committed; the gate is green (`PLAN.md` §11.1.12) |
-| V-13 | Memory knows about files: `mm` calls up into `vfs` | `src/mm/vma.rs:28` does `use crate::vfs::Inode;` (file-backed VMAs name an inode), committed in eb4b337 after this audit — the `AGENTS.md` boundary table says `mm` may depend on `boot` only. The file-backed mapping needs *a* mapped-object trait; `Inode` is the wrong one to name | Open — Phase 11 should fold this into the `mm`/`vfs` seam work; no new callers allowed |
+| V-13 | Memory knows about files: `mm` calls up into `vfs` | `src/mm/vma.rs` used to do `use crate::vfs::Inode;` (a frame-backed VMA named an inode), committed in eb4b337 after this audit. **Closed**: the trait it needed is `mm::vma::MappedObject` — three questions, no files — and the VFS answers it for its inodes through `vfs::MappedInode`. `mm`'s node for a mapping is now an object it can ask, and the merge rule (two adjacent mappings of one object become one maps line) is asked of the object rather than compared by `Arc` address, which a trait object cannot do without a downcast; for the four node types that are frame-backed - a `memfd`, a dma-buf, the framebuffer, a DRM dumb buffer - identity is unique per object, so it is the same answer as a value | **Done** (Phase 11, with Step C) |
 | V-14 | The uevent bus reached up into `syscall` and `sched` | Found at the AF_PACKET/sound re-audit: `uevent.rs` used `crate::syscall::err` for its refusals and a `self_cred()` that read the task table (`crate::sched::current_real_owner`/`current_tgid`) — a service naming the ABI layer violated §9's own acceptance rule, and the task-table reach made the bus untestable in isolation | **Done** — the errno table moved to the crate root (`src/err.rs`, re-exported through `syscall`), and credentials/the preferred bind port id are now assembled by the caller `net::socket::task_identity` (allowed `net→sched`) and passed in as plain values; `uevent` compiles on the host with no upward edge |
 
 **The dependency direction to aim for** (used as the acceptance criterion in Phase 11):
