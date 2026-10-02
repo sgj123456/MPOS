@@ -5518,9 +5518,10 @@ compiler never saw.
 **The same extraction runs as a check now** (§11.2 Step G, `cargo xtask depgraph`), and running it
 that way found a third correction of the same kind: this script matches *text*, so an edge it
 reports can be a doc comment. Measured with `//` comments stripped — i.e. who names whom in code —
-the tree has **20** mutual pairs, not 21: `uaccess → syscall` is a mention in a doc comment, and
-`vfs → uaccess` with it. The ratchet holds the code number, and the three baselines it records
-(re-measured 2026-10-02) are in §11.2 Step G.
+the tree had **20** mutual pairs, not 21: `uaccess → syscall` is a mention in a doc comment, and
+`vfs → uaccess` with it. The ratchet holds the code number — **19** since Step C, which took
+`sched → net` out and with it one pair — and the three baselines it records (re-measured
+2026-10-02) are in §11.2 Step G.
 
 That last row is the finding. At module granularity the kernel is one strongly connected
 component: there is no layer that can be compiled, tested or refactored on its own. Every
