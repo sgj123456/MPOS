@@ -698,8 +698,17 @@ it - so the entries say which they are:
       remains is the two crates being *named* by `drivers` and `syscall`, which is a cross-crate
       edge downward. Twelve leaf crates now, all but the input pair host-compiled and every one of
       them unable to name the kernel
-- [ ] 11.B the device seam: one handle instead of six `Inode::as_*` downcasts, each device's
-      ioctl contract moved down to its driver, user-pointer validation moved to `mm` (§11)
+- [~] 11.B the device seam. **B3 landed long ago** (`buffer_ok`/`err_of` moved to the
+      `uaccess` leaf). **B2 is now complete**: every device family this audit named states its
+      own ioctl contract next to the state it answers from - `'d'` (DRM), `'E'` (`EvdevNode::ioctl`),
+      `'K'` (`Tty::kd_ioctl`), and this session's `'U'` (`Uinput::ioctl`, with the family check
+      moved into the `mpos-uinput` crate as `nr_of`) and `'V'` (`Tty::vt_ioctl`, with the
+      caller's task/root/thread-group handed down as a `VtCaller` the way `kd_ioctl` takes
+      `owns_card`). `syscall/linux/fs.rs` lost 212 lines to the last two; the only `vcmux`
+      reference left in it is the tty family's `abandon`. **B1 is what remains**: one typed
+      handle instead of the nine `Inode::as_*` downcasts that let the boundary *find* the
+      device - the ratchet counts it as `vfs/mod.rs -> drivers|net` 9, and the plan says one
+      device per commit, fbdev first and DRM last (§11)
 - [x] 11.C per-open-file resources get a registry (`sched::exit`), so `sched` stops naming
       `net`/`vfs`/`drivers` on task exit: `sched → net` is gone (which removed the `net ↔ sched`
       mutual pair, 20 → 19), and the two `crate::drivers::` references left in `runtime.rs` are
@@ -5823,7 +5832,7 @@ reads files the compiler never saw.
 
 ---
 
-#### Step B — Give devices a seam the VFS can hold without naming them (V-1, V-2, V-5)
+#### Step B — Give devices a seam the VFS can hold without naming them (V-1, V-2, V-5) — **B3 AND B2 DONE; B1 REMAINS**
 
 The largest step, and the one that pays for the others: it removes the largest cause of the
 23-cycle count.

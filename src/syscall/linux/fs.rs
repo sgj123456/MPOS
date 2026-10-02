@@ -4404,185 +4404,31 @@ fn family_nr(request: u32, magic: u8) -> Option<u32> {
 /// wants it, rather than anything holding a `/dev/tty` fd being able to silence
 /// a compositor's `relsig`, or to answer it.
 fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
-    let size = ((request >> 16) & 0x3fff) as usize;
-    let Some(nr) = family_nr(request, b'V') else {
+    if (request >> 8) & 0xff != b'V' as u32 {
         return err::ENOTTY;
-    };
+    }
     // These name a console, so only a tty answers them.
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
         Err(e) => return err_of(e),
     };
-    let tty_inode = file.inode();
-    let Some(tty) = tty_inode.as_tty() else {
+    let inode = file.inode();
+    let Some(tty) = inode.as_tty() else {
         return err::ENOTTY;
     };
-    // `VT_OPENQRY` and `VT_GETSTATE` only ask where things are, and Linux lets
-    // any tty's descriptor read those; the rest either write a console's mode,
-    // answer for one, or move the screen.
-    let owns_it = || tty.is_foreground(crate::sched::current()) || crate::sched::current_is_root();
-    use core::mem::size_of;
-    match nr {
-        // VT_OPENQRY -> int: the next console a second session could take. The
-        // machine has six, so "there is nowhere else to put you" is not the
-        // honest answer while any of them is unclaimed; ENXIO is what Linux
-        // says when all of them are taken.
-        0x00 => {
-            let Some(free) = crate::vfs::vcmux::free_console() else {
-                return err::ENXIO;
-            };
-            if !buffer_ok(buf, 4, true, from_user) {
-                return err::EFAULT;
-            }
-            unsafe { (buf as *mut i32).write_unaligned(free as i32) };
-            0
-        }
-        // VT_GETMODE -> struct vt_mode { mode, waitv, relsig, acqsig, frsig }.
-        // Read back what `VT_SETMODE` wrote, because a seat manager asks this to
-        // find out whether the console it has is already promised to someone -
-        // and because a mode the kernel accepted and forgot is a mode nobody can
-        // rely on. `size` is the caller's `sizeof(struct vt_mode)`, so an older,
-        // shorter struct gets the prefix it sized for rather than a fault.
-        0x01 => {
-            let Some(vc) = tty.vc_number() else {
-                return err::EINVAL;
-            };
-            let out = crate::vfs::vcmux::vt_mode(vc).to_bytes();
-            let n = size.min(out.len());
-            if !buffer_ok(buf, n, true, from_user) {
-                return err::EFAULT;
-            }
-            unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, n) };
-            0
-        }
-        // VT_SETMODE <- struct vt_mode. `_IO`, so the struct is read from the
-        // request's own size rather than from a nonzero one: the eight bytes a
-        // caller that wrote `<linux/vt.h>`'s struct gives, or fewer.
-        0x02 => {
-            if !owns_it() {
-                return err::EPERM;
-            }
-            let Some(vc) = tty.vc_number() else {
-                return err::EINVAL;
-            };
-            let n = size.min(8);
-            if !buffer_ok(buf, n, false, from_user) {
-                return err::EFAULT;
-            }
-            let mut bytes = [0u8; 8];
-            unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, bytes.as_mut_ptr(), n) };
-            let mode = crate::vfs::vtmode::VtMode::from_bytes(&bytes);
-            // The promise belongs to the process writing it, and is remembered as
-            // that: `relsig`/`acqsig` are sent to this pid and to no one else,
-            // which is Linux's `vc->vt_pid` and what lets a seat manager set the
-            // mode on a console it is about to close.
-            match crate::vfs::vcmux::set_vt_mode(vc, mode, crate::sched::current_tgid().0 as u32) {
-                Ok(()) => 0,
-                // A console that is not one of ours, or a mode that is not a
-                // mode: Linux has one answer for both.
-                Err(_) => err::EINVAL,
-            }
-        }
-        0x03 => {
-            // VT_GETSTATE -> struct vt_stat { v_mode, v_num, v_state } (shorts).
-            // The console on the screen, the mode it is in, and the bit of
-            // itself: what a session reads back to know where it has landed, so
-            // it has to be the console that is actually shown rather than a
-            // constant that happens to be right until something switches.
-            if !buffer_ok(buf, size_of::<[u16; 3]>(), true, from_user) {
-                return err::EFAULT;
-            }
-            let shown = crate::vfs::vcmux::active();
-            unsafe {
-                let p = buf as *mut u16;
-                p.write_unaligned(crate::vfs::vcmux::kd_mode(shown) as u16);
-                p.add(1).write_unaligned(shown as u16);
-                p.add(2).write_unaligned(1u16 << (shown - 1).min(15));
-            }
-            0
-        }
-        // VT_SENDSIG was removed from the vt driver years ago; measured on a
-        // current console the request falls through the kernel's switch and
-        // answers `ENOTTY`, not the `0` this arm used to return for a command
-        // that does nothing anywhere.
-        0x04 => err::ENOTTY,
-        // VT_RELDISP: the answer to a `relsig`, and the third argument is the
-        // answer itself - nonzero agrees to hand the screen over, zero refuses.
-        // Only the console a release is outstanding on may answer; anything else
-        // is Linux's `EINVAL`, because a session that replies to a question
-        // nobody asked would be completing someone else's switch.
-        0x05 => {
-            if !owns_it() {
-                return err::EPERM;
-            }
-            let Some(vc) = tty.vc_number() else {
-                return err::EINVAL;
-            };
-            // Success is the *answer*, not the switch: Linux's `VT_RELDISP`
-            // returns 0 whether the session agreed or refused, and the
-            // difference is the argument it was given. `EINVAL` is reserved for
-            // the console that was never asked - which is what stops a session
-            // from completing someone else's hand-over.
-            if crate::vfs::vcmux::release_ack(vc, buf != 0) {
-                0
-            } else {
-                err::EINVAL
-            }
-        }
-        // VT_ACTIVATE -> int: ask for that console to be the one on the screen.
-        // Linux's answer is `set_console()`: record the request, schedule the
-        // console callback - which is where the releasing console's `relsig` goes
-        // out - and return 0. It does not wait for the answer, and neither does
-        // this; `vcmux::request_activate` says why a waiting version would
-        // deadlock the seat manager that owes the answer. A number that is not one
-        // of this machine's consoles is Linux's `ENXIO` (`arg == 0 || arg >
-        // MAX_NR_CONSOLES`), and a session that wants to know when the screen
-        // actually moved has `VT_WAITACTIVE`, the one console ioctl that waits.
-        0x06 => {
-            if !owns_it() {
-                return err::EPERM;
-            }
-            let to = buf as u32;
-            if to == 0 || to > crate::vfs::pty::VC_COUNT {
-                return err::ENXIO;
-            }
-            if !crate::vfs::vcmux::request_activate(to, false) {
-                return err::ENXIO;
-            }
-            0
-        }
-        // VT_WAITACTIVE -> int: park until that console is the active one,
-        // wakeable by the release that finally moves it.
-        0x07 => {
-            if !owns_it() {
-                return err::EPERM;
-            }
-            crate::vfs::vcmux::wait_active(buf as u32);
-            0
-        }
-        0x08 => 0, // VT_DISALLOCATE: nothing to free.
-        0x09 => 0, // VT_RESIZE: the window size comes from TIOCGWINSZ instead.
-        0x0a => 0, // VT_RESIZEX: same.
-        // VT_WAITUNTIL -> int: Linux's `vt_waitrelease`, and its two answers
-        // are one short: `arg == 0` means "nothing to wait for" and returns 0
-        // without looking at the screen; anything else parks in exactly
-        // `VT_WAITACTIVE`'s way, and a console this machine does not have is
-        // `ENXIO` (`vt_waitactive`'s own range check).
-        0x0c => {
-            if !owns_it() {
-                return err::EPERM;
-            }
-            if buf == 0 {
-                return 0;
-            }
-            if buf as u32 > crate::vfs::pty::VC_COUNT {
-                return err::ENXIO;
-            }
-            crate::vfs::vcmux::wait_active(buf as u32);
-            0
-        }
-        _ => err::ENOTTY,
-    }
+    // Who is asking is the one part of this family that lives above the VFS:
+    // the foreground question, the root question and the thread group a
+    // `VT_SETMODE` promise is recorded against are all answers the syscall
+    // layer holds (it may name `sched`), so they are handed down rather than
+    // reached up for. Every accept/reject decision for the `'V'` family is the
+    // console's own, in `Tty::vt_ioctl` (V-2, the same move as the `'K'` and
+    // `'E'` families).
+    let caller = crate::vfs::tty::VtCaller {
+        task: crate::sched::current(),
+        root: crate::sched::current_is_root(),
+        tgid: crate::sched::current_tgid().0 as u32,
+    };
+    tty.vt_ioctl(caller, request, buf, from_user)
 }
 
 /// The keyboard/video-mode (`'K'`-typed) ioctls that bracket a VT handover: put
