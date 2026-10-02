@@ -563,15 +563,6 @@ pub trait Inode: Send + Sync + core::any::Any {
         None
     }
 
-    /// The vsock socket this node is, if it is one - the borrow form of the
-    /// id the close paths check, for the socket syscalls that operate on
-    /// the socket's own state. Gated with the `net` module, like
-    /// [`Self::as_unix`], which this mirrors family for family.
-    #[cfg(target_os = "none")]
-    fn as_vsock(&self) -> Option<&crate::net::vsock::VsockSock> {
-        None
-    }
-
     /// The AF_UNIX socket this node is, if it is one - the same question
     /// [`Self::socket_handle`] puts to the network registry, answered with
     /// this module's own slot number. The unix syscalls hold nothing but a
@@ -584,7 +575,7 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// The AF_VSOCK socket this node is, if it is one - the id the close
     /// paths retire the socket by, numbered exactly like [`Self::unix_id`]:
     /// zero means "not a vsock socket", and the family's registry holds the
-    /// rest. See [`Self::as_vsock`] for the gated borrow form.
+    /// rest.
     fn vsock_id(&self) -> usize {
         0
     }

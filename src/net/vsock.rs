@@ -349,12 +349,6 @@ impl Inode for VsockSock {
         self.readiness()
     }
 
-    /// The vsock socket this node is - how the socket syscalls reach the
-    /// family's state, the same route `as_unix` gives the unix family.
-    fn as_vsock(&self) -> Option<&VsockSock> {
-        Some(self)
-    }
-
     fn vsock_id(&self) -> usize {
         self.id
     }

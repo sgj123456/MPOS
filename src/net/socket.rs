@@ -36,6 +36,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use super::Channel;
 use crate::err;
 use crate::net::packet::PacketSock;
+use crate::net::vsock::VsockSock;
 use crate::vfs::pipe::DuplexEnd;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError};
 
@@ -1075,7 +1076,7 @@ pub(crate) fn handle_connect(args: [usize; 6], from_user: bool) -> isize {
         // A vsock socket's connect is a CID and a port: send the request,
         // then drive the handshake through the events the service task
         // routes, unless the caller asked not to wait.
-        if let Some(sock) = file.inode().as_vsock() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>() {
             let (cid, port) =
                 match crate::net::vsock::parse_sockaddr_vm(args[1], args[2], from_user) {
                     Ok(pair) => pair,
@@ -1379,7 +1380,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // caller that names one is told so - the same answer the channel
     // above gives.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_vsock()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>()
     {
         if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
@@ -1527,7 +1528,7 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
     // The vsock form of the same: gathered bytes into the connected
     // stream, no name to name on a connected socket.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_vsock()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>()
     {
         let (name, _namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
             Ok(fields) => fields,
@@ -1885,7 +1886,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     // left one. The slot is validated before anything is consumed - a
     // message delivered and then unreportable is a message lost.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_vsock()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>()
     {
         if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
@@ -2187,7 +2188,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     // peer's address into `msg_name` when the caller left room for one,
     // and no control data - a stream carries none.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_vsock()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>()
     {
         let (name, namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
             Ok(fields) => fields,
@@ -2660,7 +2661,7 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
         // guest's own whether the caller spells it or the wildcard,
         // because the host assigned it and nothing below the device can
         // change it.
-        if let Some(sock) = file.inode().as_vsock() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>() {
             let (_cid, port) =
                 match crate::net::vsock::parse_sockaddr_vm(args[1], args[2], from_user) {
                     Ok(pair) => pair,
@@ -2871,7 +2872,7 @@ pub(crate) fn handle_listen(args: [usize; 6], _from_user: bool) -> isize {
         // A vsock listener opens the accept queue at the device: from
         // here the host's requests to the port are answered, and `accept`
         // hands out what arrived.
-        if let Some(sock) = file.inode().as_vsock() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>() {
             return crate::net::vsock::listen(sock, args[1] as i32);
         }
     }
@@ -2906,7 +2907,7 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
     // A vsock listener hands out connections the host already made - the
     // device answered each request the moment it arrived, so accept is a
     // queue drain rather than a handshake.
-    if let Some(listener) = listener_arc.inode().as_vsock() {
+    if let Some(listener) = listener_arc.inode().as_any().downcast_ref::<VsockSock>() {
         let nonblock =
             flags & SOCK_NONBLOCK_F != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
         let (sock, peer) = match crate::net::vsock::accept(listener, nonblock) {
@@ -3456,7 +3457,7 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
         // A vsock socket's name is the guest CID and the local port -
         // the address a peer would dial to reach it, zeros where nothing
         // was bound, the same shape a fresh AF_INET socket gives.
-        if let Some(sock) = file.inode().as_vsock() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>() {
             let (cid, port) = crate::net::vsock::sockname(sock);
             return crate::net::vsock::write_sockaddr_vm(addr_ptr, len_ptr, cid, port);
         }
@@ -3581,7 +3582,7 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
         // A vsock stream's peer is the CID and port the connection was
         // made with - the two numbers a connected caller can dial back
         // through, and `ENOTCONN` when no peer exists to name.
-        if let Some(sock) = file.inode().as_vsock() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>() {
             return match crate::net::vsock::peername(sock) {
                 Some((cid, port)) => {
                     crate::net::vsock::write_sockaddr_vm(addr_ptr, len_ptr, cid, port)
@@ -3691,7 +3692,7 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
     // write side sends the shutdown packet the device acknowledges, the
     // read side is a local fact the buffered bytes survive.
     if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
-        && let Some(sock) = file.inode().as_vsock()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<VsockSock>()
     {
         return crate::net::vsock::shutdown(sock, how);
     }
@@ -3836,7 +3837,7 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     // setup, accepted by name so a caller's setup never fails on a family
     // the kernel does speak.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && file.inode().as_vsock().is_some()
+        && file.inode().as_any().downcast_ref::<VsockSock>().is_some()
     {
         if level != SOL_SOCKET {
             return err::EOPNOTSUPP;
@@ -4042,7 +4043,7 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
     // buffers are - and reads back zeros for the rest, the same permissive
     // answer the INET registry gives its unmodelled options.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && file.inode().as_vsock().is_some()
+        && file.inode().as_any().downcast_ref::<VsockSock>().is_some()
     {
         if level != SOL_SOCKET {
             return err::EOPNOTSUPP;
