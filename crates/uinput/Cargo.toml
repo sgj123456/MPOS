@@ -1,0 +1,13 @@
+# `/dev/uinput`'s interface: the requests and bitmaps a program declares an input
+# device with. Pure arithmetic over ioctl words and struct layouts, so it is its
+# own leaf crate. It depends on `mpos-evdev` for one constant - the size of a
+# `struct input_event`, which is the unit both families read and write - and that
+# is the whole of the coupling: the device itself is the kernel's
+# `drivers/uinput.rs`, which is bare metal.
+[package]
+name = "mpos-uinput"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mpos-evdev = { path = "../evdev" }

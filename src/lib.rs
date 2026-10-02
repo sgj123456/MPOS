@@ -65,10 +65,11 @@ pub mod drivers;
 /// while the crate itself cannot name the kernel and so cannot reach back up.
 pub use mpos_err as err;
 /// evdev's record window and its clients: which reader sees which event, and
-/// what a grab does to the answer. Not target-gated - the driver that fills the
-/// window needs a virtio ring and a clock, but the policy over it is arithmetic,
-/// and arithmetic is worth a host test.
-pub mod evdev;
+/// what a grab does to the answer. Its own leaf crate - the driver that fills
+/// the window needs a virtio ring and a clock, but the policy over it is
+/// arithmetic, and arithmetic is worth a host test. Its waiter numbers are
+/// opaque there (`evdev::WaiterId`); the driver that can name a task converts.
+pub use mpos_evdev as evdev;
 /// The GPU's host-testable logic: the DRM blobs, cursor composition,
 /// sync-object state machine, the `DRM_VIRTGPU_*` answers, and the virtio-gpu
 /// wire ABI. Each is pure and tested on the host; the machine bodies stay in
@@ -118,9 +119,10 @@ pub mod uaccess;
 /// on the host.
 pub mod uevent;
 /// uinput's interface: the requests and bitmaps a userspace program declares an
-/// input device with. Not target-gated, for the same reason as `evdev` - the
-/// arithmetic is worth a host test, and the device that uses it is bare metal.
-pub mod uinput;
+/// input device with. Its own leaf crate, and it depends on the evdev crate for
+/// one constant - the size of a `struct input_event`, the unit both families
+/// read and write. The device that uses it is bare metal.
+pub use mpos_uinput as uinput;
 /// The UTS namespace: the two names `uname(2)` reports, as the object a task
 /// holds rather than as a pair of machine-wide strings. Its own leaf crate
 /// (*ownership* over two `String`s); the task table that decides whose

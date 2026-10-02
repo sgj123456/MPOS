@@ -1,0 +1,12 @@
+# The evdev record window and its clients: who reads which event, and what a
+# grab does to the answer. Pure - a queue of records, a sequence number per
+# client and a bit of arithmetic - so it is its own leaf crate, and the crate
+# boundary is what keeps it that way: the driver that fills the window needs a
+# virtio ring and a clock, and living beside it meant the policy over the window
+# could only be checked by booting a machine and pressing a key (PLAN.md §7.2).
+[package]
+name = "mpos-evdev"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

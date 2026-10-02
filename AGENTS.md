@@ -210,7 +210,7 @@ and an upward edge from them is a compile error. See `ARCHITECTURE.md` §1.
 | `console/` | Log ring, serial, framebuffer switch, the six virtual consoles | `arch`, `boot` (the boot-supplied console list), the `term` crate | reach into the VFS for the grid: it names the `term` crate, never `vfs::term` (V-4 half closed) |
 | `net/` | smoltcp, socket registry, AF_INET/UNIX/NETLINK/VSOCK | `drivers`, `sched`, `uevent` | validate user pointers outside the `uaccess` leaf (V-9, closed by B3) |
 | `drivers/` | virtio, DRM/KMS, render task, evdev/uinput, PCI config, serial, RTC | `mm`, `pci`, `sched` | call back into `syscall` (V-5) or parse ioctl ABI (V-2) |
-| Services — leaf crates `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu` (see `crates/`), plus `blk`, `rand`, `uevent`, `logging`, `sync`, `evdev`, `uinput`, `uaccess` | One concern each, pure logic, host-compiled where possible. The leaf crates are downward-only and cannot name the kernel. `err` is the errno table: the leaf every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
+| Services — leaf crates `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput` (see `crates/`), plus `blk`, `rand`, `uevent`, `logging`, `sync`, `uaccess` | One concern each, pure logic, host-compiled where possible. The leaf crates are downward-only and cannot name the kernel. `err` is the errno table: the leaf every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
 
 Two rules make the table usable rather than decorative:
 
@@ -260,7 +260,7 @@ Everything arch-independent lives in the library and is unit-tested on the host;
 descriptor tables, virtio rings, firmware or a real clock is gated behind `#[cfg(target_os = "none")]` (and
 `target_arch = "x86_64"` where the hardware is x86-specific). When you add code, ask which half it belongs in,
 and gate it. Pure logic (arithmetic, encodings, parsers, policies) belongs on the host side even when its only
-caller is bare metal — `src/evdev.rs` and `src/uinput.rs` exist precisely to hold input policy where a host
+caller is bare metal — `crates/evdev` and `crates/uinput` exist precisely to hold input policy where a host
 test can reach it.
 
 The gate is applied per module rather than by a rule, and the rule it is applied *by* is this

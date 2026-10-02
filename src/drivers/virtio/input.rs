@@ -378,7 +378,9 @@ impl EvdevNode {
             records.waiters_of(ofd)
         });
         for id in waiting {
-            crate::sched::wake(id);
+            // The record window hands back a number, not a task: naming one is
+            // the driver's business, since the crate cannot (`evdev::WaiterId`).
+            crate::sched::wake(crate::sched::TaskId(id));
         }
     }
 
@@ -752,18 +754,20 @@ impl EvdevNode {
             records.all_waiters()
         });
         for id in waiting {
-            crate::sched::wake(id);
+            // The record window hands back a number, not a task: naming one is
+            // the driver's business, since the crate cannot (`evdev::WaiterId`).
+            crate::sched::wake(crate::sched::TaskId(id));
         }
     }
 
     /// Park `id` on this device as the client `ofd`, and again take it off when
     /// the wait ends.
     fn subscribe(&self, ofd: u64, id: crate::sched::policy::TaskId) {
-        with_records(&self.records, |records| records.subscribe(ofd, id));
+        with_records(&self.records, |records| records.subscribe(ofd, id.0));
     }
 
     fn unsubscribe(&self, id: crate::sched::policy::TaskId) {
-        with_records(&self.records, |records| records.unsubscribe(id));
+        with_records(&self.records, |records| records.unsubscribe(id.0));
     }
 
     /// Wake the waits a new record is actually for: the readers the grab allows
@@ -775,7 +779,7 @@ impl EvdevNode {
         // lock comes to depend on another.
         let due = with_records(&self.records, |records| records.due_waiters());
         for id in due {
-            crate::sched::wake(id);
+            crate::sched::wake(crate::sched::TaskId(id));
         }
     }
 }

@@ -109,8 +109,8 @@ drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`PLAN.md` §1
 | Family | Device(s) | Owner module | Verdict |
 |---|---|---|---|
 | `'R'` (0x52) | `/dev/random`, `/dev/urandom` | `src/syscall/linux/fs.rs`, `src/rand.rs` | Served, measured: `RNDGETENTCNT`, the `RNDADDENTROPY` credit, `RNDRESEEDCRNG` (a real re-key) and `FIONREAD` (`EINVAL`, as Linux); `RNDZAPENTCNT`/`RNDCLEARPOOL` refused `EOPNOTSUPP` (no drainable count). Both former gaps closed — §5.1 |
-| `'E'` (0x45) | `/dev/input/eventN` | `src/evdev.rs` | Served, measured: `EVIOCREVOKE` one-way NULL-arg, `EVIOCGPHYS`/`UNIQ` `ENOENT` for an absent string, `EVIOCSFF`/`RMFF` `ENOSYS`, keycodes `EINVAL`, `REP` stored gated on `EV_REP`, `GKEY/LED/SND/SW` return counts |
-| `'U'` (0x55) | `/dev/uinput` | `src/uinput.rs` | Served; gaps: no `UI_ABS_SETUP`, no force feedback, no `/sys/class/input` entry (sysfs is built once at boot) |
+| `'E'` (0x45) | `/dev/input/eventN` | `crates/evdev` | Served, measured: `EVIOCREVOKE` one-way NULL-arg, `EVIOCGPHYS`/`UNIQ` `ENOENT` for an absent string, `EVIOCSFF`/`RMFF` `ENOSYS`, keycodes `EINVAL`, `REP` stored gated on `EV_REP`, `GKEY/LED/SND/SW` return counts |
+| `'U'` (0x55) | `/dev/uinput` | `crates/uinput/src/lib.rs` | Served; gaps: no `UI_ABS_SETUP`, no force feedback, no `/sys/class/input` entry (sysfs is built once at boot) |
 | `'V'` (0x56) | virtual consoles | `src/vfs/vtmode.rs` | Served: `VT_SETMODE`/`VT_PROCESS` negotiation, `VT_ACTIVATE` non-blocking, `VT_WAITACTIVE` sleeping, `VT_SENDSIG` → `ENOTTY` (measured) |
 | `'K'` (0x4B) | virtual consoles | `src/syscall/linux/fs.rs` `kd_ioctl` | **Refused as a closed set**: five requests served (`KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/`KDGKBTYPE`), the rest of the block `EOPNOTSUPP`, outside it `ENOTTY`. Per-device *serve* from live console state is the Phase-11 B2 move (`PLAN.md` §12.1 A2) |
 | `'b'` (0x62) | dma-buf | `src/syscall/linux/fs.rs` | Served (`SYNC` as the documented coherent-memory no-op, `SET_NAME` a debug label) |
@@ -353,7 +353,7 @@ grows, and each is named so it is not rediscovered as a shape.
 
 - **Host unit tests** — `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu`.
   Pure encodings, flag verdicts, struct sizes (`src/syscall/linux/abi.rs`,
-  `crates/gpu/src/blob.rs`, `src/evdev.rs`, `src/net`'s ungated halves).
+  `crates/gpu/src/blob.rs`, `crates/evdev`, `src/net`'s ungated halves).
 - **Guest conformance programs** — `cargo xtask test`. `user/abitest/src/bin/syscall/t-*.rs`
   (one syscall family) and `user/abitest/src/bin/integration/t-*.rs` (a device, the
   network, a subsystem end to end), plus the `std`/`rustix` programs in

@@ -186,6 +186,10 @@ fn run_unit_tests() -> Result<()> {
         "mpos-ahci",
         "-p",
         "mpos-gpu",
+        "-p",
+        "mpos-evdev",
+        "-p",
+        "mpos-uinput",
     ])
     .current_dir(&root);
     utils::run_status(&mut cmd, "the kernel's host unit tests")?;

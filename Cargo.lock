@@ -286,10 +286,12 @@ dependencies = [
  "mpos-cred",
  "mpos-date",
  "mpos-err",
+ "mpos-evdev",
  "mpos-gpu",
  "mpos-pci",
  "mpos-seccomp",
  "mpos-term",
+ "mpos-uinput",
  "mpos-uts",
  "rand_chacha",
  "rand_core",
@@ -329,6 +331,10 @@ name = "mpos-err"
 version = "0.1.0"
 
 [[package]]
+name = "mpos-evdev"
+version = "0.1.0"
+
+[[package]]
 name = "mpos-gpu"
 version = "0.1.0"
 dependencies = [
@@ -354,6 +360,13 @@ name = "mpos-term"
 version = "0.1.0"
 dependencies = [
  "critical-section",
+]
+
+[[package]]
+name = "mpos-uinput"
+version = "0.1.0"
+dependencies = [
+ "mpos-evdev",
 ]
 
 [[package]]

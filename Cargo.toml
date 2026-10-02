@@ -43,6 +43,12 @@ mpos-ahci = { path = "crates/ahci" }
 # sync-object state machine). Its own crate, and the one edge that kept it out of
 # one - the wake a parked sync-object waiter needs - is an injected trait now.
 mpos-gpu = { path = "crates/gpu" }
+# The input policy pair: which evdev reader sees which event (and the request
+# vocabulary a program declares a uinput device with). Both were host-compiled
+# inside `src/` already; as crates they cannot name the scheduler or a driver,
+# which is what their waiter numbers used to require.
+mpos-evdev = { path = "crates/evdev" }
+mpos-uinput = { path = "crates/uinput" }
 
 # Used by the arch-agnostic mapping plan, so deliberately not target-gated.
 # Already in the tree as a dependency of `x86_64`.

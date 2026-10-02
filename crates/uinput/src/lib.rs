@@ -1,3 +1,5 @@
+#![no_std]
+
 //! `/dev/uinput`: the ABI of an input device userland makes for itself.
 //!
 //! A program opens `/dev/uinput`, declares what its device can report
@@ -16,10 +18,12 @@
 //! build can argue with it. The device itself (the node, the ioctls' plumbing,
 //! the devfs side) is `drivers/uinput.rs`, which is bare metal.
 
+extern crate alloc;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::evdev::RECORD;
+use mpos_evdev::RECORD;
 
 /// The ioctl type byte every uinput request carries: `UINPUT_IOCTL_BASE` in the
 /// kernel's own header.

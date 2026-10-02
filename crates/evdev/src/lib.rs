@@ -1,5 +1,16 @@
+#![no_std]
+
 //! The evdev event window and the clients that read it.
 //!
+//! Its own leaf crate: everything below is arithmetic over a queue of
+//! records - which client sees which record, where its position is, what a
+//! grab hides - and the crate boundary is what stops a rule about *reading*
+//! from acquiring a dependency on a scheduler or a virtio ring. The waiter
+//! numbers are opaque here for the same reason ([`WaiterId`]): who to wake is
+//! the driver's business, which is why it hands the numbers to a caller that
+//! can name a task (`PLAN.md` §7.2, §11.1.3).
+//!
+
 //! The input driver is bare metal: it needs a virtio ring, the PCI bus and the
 //! kernel's clock, and the host build has none of them. But the part of it that
 //! decides *who reads what* is arithmetic over a queue of records, so that part
@@ -23,10 +34,18 @@
 //! arbitrate by: one description is one client, however many descriptors name
 //! it.
 
+extern crate alloc;
+
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use crate::sched::policy::TaskId;
+/// Who a parked reader is, as a number this crate never interprets.
+///
+/// The kernel's numbers are its `sched::TaskId`; this crate's job is to
+/// remember which ones are waiting on which description and to hand them back
+/// for the caller to wake, and a type that cannot be called does not need a
+/// name for one. Same shape as `gpu::sync::WaiterId`, for the same reason.
+pub type WaiterId = usize;
 
 /// One `struct input_event` on x86_64: `timeval` (two `long`s), then the type,
 /// code and value. Twenty-four bytes, in the little-endian order the ABI
@@ -152,7 +171,7 @@ pub struct Records {
     /// client is half of the entry because a wake has to be able to be
     /// *withheld*: waking a reader that would find nothing is a task switch
     /// that ends the way it started.
-    waiters: Vec<(u64, TaskId)>,
+    waiters: Vec<(u64, WaiterId)>,
     /// Whether the device behind this window has been taken away. A window whose
     /// device is gone is not an idle one: nobody may read it any more, and a
     /// reader that is waiting has to be told.
@@ -308,7 +327,7 @@ impl Records {
     /// outside the lock: a revoke must break a reader parked in `read`, the way
     /// the device going away does, not leave it asleep on records it can no
     /// longer see.
-    pub fn waiters_of(&self, ofd: u64) -> Vec<TaskId> {
+    pub fn waiters_of(&self, ofd: u64) -> Vec<WaiterId> {
         self.waiters
             .iter()
             .filter(|&&(c, _)| c == ofd)
@@ -321,7 +340,7 @@ impl Records {
     /// The device going away is the one event that is not *for* anybody in
     /// particular, so the filter [`Records::due_waiters`] applies is exactly
     /// wrong here: every waiter has to be woken to find out that it is over.
-    pub fn all_waiters(&self) -> Vec<TaskId> {
+    pub fn all_waiters(&self) -> Vec<WaiterId> {
         self.waiters.iter().map(|&(_, id)| id).collect()
     }
 
@@ -381,14 +400,14 @@ impl Records {
     }
 
     /// Park `id` on this device as the client `ofd`.
-    pub fn subscribe(&mut self, ofd: u64, id: TaskId) {
+    pub fn subscribe(&mut self, ofd: u64, id: WaiterId) {
         if !self.waiters.contains(&(ofd, id)) {
             self.waiters.push((ofd, id));
         }
     }
 
     /// Take every registration `id` has on this device back.
-    pub fn unsubscribe(&mut self, id: TaskId) {
+    pub fn unsubscribe(&mut self, id: WaiterId) {
         self.waiters.retain(|&(_, waiter)| waiter != id);
     }
 
@@ -399,7 +418,7 @@ impl Records {
     /// position can never be ahead of the end of the window, which is what
     /// `Window::has` says by construction - so the only question is who is
     /// allowed to read, and that is the grab.
-    pub fn due_waiters(&self) -> Vec<TaskId> {
+    pub fn due_waiters(&self) -> Vec<WaiterId> {
         self.waiters
             .iter()
             .filter(|&&(ofd, _)| self.may_read(ofd))
@@ -563,13 +582,13 @@ mod tests {
         let mut records = Records::new();
         records.opened(1);
         records.opened(2);
-        records.subscribe(1, TaskId(11));
-        records.subscribe(2, TaskId(22));
-        assert_eq!(records.due_waiters(), vec![TaskId(11), TaskId(22)]);
+        records.subscribe(1, 11);
+        records.subscribe(2, 22);
+        assert_eq!(records.due_waiters(), vec![11, 22]);
 
         assert!(records.set_grab(true, 1));
-        assert_eq!(records.due_waiters(), vec![TaskId(11)]);
-        records.unsubscribe(TaskId(11));
+        assert_eq!(records.due_waiters(), vec![11]);
+        records.unsubscribe(11);
         assert!(records.due_waiters().is_empty());
     }
 
@@ -581,7 +600,7 @@ mod tests {
         let mut records = Records::new();
         records.opened(1);
         records.opened(2);
-        records.subscribe(2, TaskId(22));
+        records.subscribe(2, 22);
         push(&mut records, &[1]);
         assert!(records.readable(1));
 
@@ -589,7 +608,7 @@ mod tests {
         assert!(!records.readable(1));
         assert_eq!(records.take(1, &mut [0u8; RECORD]), Some(0));
         assert_eq!(records.due_waiters(), Vec::new());
-        assert_eq!(records.all_waiters(), vec![TaskId(22)]);
+        assert_eq!(records.all_waiters(), vec![22]);
     }
 
     /// A read smaller than one record is `EINVAL`, not a zero-byte answer that
