@@ -29,6 +29,7 @@
 mod lin;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// `_IOWR('d', nr, size)` as libdrm builds it: the family byte at bits 8..15.
 const fn ioc_d(nr: usize, size: usize) -> usize {
@@ -267,6 +268,76 @@ fn atomic_one(fd: i32, prop: u32, value: u64, flags: u32) -> isize {
     put64(&mut buf, 24, props.as_mut_ptr() as u64);
     put64(&mut buf, 32, values.as_mut_ptr() as u64);
     lin::ioctl(fd, ioc_d(NR_MODE_ATOMIC, 56), buf.as_mut_ptr() as usize)
+}
+
+// ---- interrupting a blocked wait: the `SA_RESTART` rewind pin --------------
+
+/// How many times the alarm handler ran. Each is a wait a signal reached - the
+/// subject of the rewind check at the end of the file.
+static RAN: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn on_alarm(_sig: i32, _info: *mut lin::SigInfo, _ctx: *mut u8) {
+    RAN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// musl's `__restore_rt`, for a kernel with no libc.
+extern "C" fn restorer() {
+    let _ = lin::rt_sigreturn();
+}
+
+/// Install a *caught* `SIGALRM` handler, with or without `SA_RESTART`. Caught, so
+/// the alarm ends the wait rather than killing the process; the flag decides
+/// whether the kernel then rewinds the interrupted `ioctl` or lets it answer
+/// `EINTR`.
+fn install_alarm(restart: bool) {
+    let mut flags = lin::SA_SIGINFO | lin::SA_RESTORER;
+    if restart {
+        flags |= lin::SA_RESTART;
+    }
+    let act = lin::SigAction {
+        handler: on_alarm as extern "C" fn(i32, *mut lin::SigInfo, *mut u8) as usize,
+        flags,
+        restorer: restorer as extern "C" fn() as usize,
+        mask: 0,
+    };
+    lin::rt_sigaction(lin::SIGALRM, &act, core::ptr::null_mut());
+}
+
+/// Arm `ITIMER_REAL` to fire once, `ms` from now, and disarm any earlier one.
+fn alarm_once(ms: u64) {
+    let mut spent = lin::Itimerval {
+        it_interval: lin::TimeVal {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: lin::TimeVal {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    let next = lin::Itimerval {
+        it_interval: lin::TimeVal {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: lin::TimeVal {
+            tv_sec: (ms / 1000) as i64,
+            tv_usec: ((ms % 1000) as i64) * 1000,
+        },
+    };
+    lin::setitimer(lin::ITIMER_REAL, Some(&next), &mut spent);
+}
+
+/// A `SYNCOBJ_WAIT` deadline an absolute `ms` after the monotonic clock, which
+/// the header wants in nanoseconds since boot. A fixed number would be a
+/// deadline that the sweep's own elapsed boot-time has already passed.
+fn deadline_ms_ahead(ms: i64) -> i64 {
+    let mut ts = lin::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    lin::clock_gettime(lin::CLOCK_MONOTONIC, &mut ts);
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64 + ms * 1_000_000
 }
 
 #[unsafe(no_mangle)]
@@ -948,6 +1019,86 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         },
         EINVAL,
     );
+
+    // --- an interrupted wait, and whether `SA_RESTART` rewinds it ------------
+    //
+    // `ioctl(2)` is restartable per *request*: Linux's `drm_syncobj.c` returns
+    // `-ERESTARTSYS` when a signal ends a sync-object wait, so the syscall layer
+    // rewinds that request under `SA_RESTART` and answers `EINTR` otherwise -
+    // while an ordinary request's `EINTR` is never rewound. This kernel's park
+    // already answers `EINTR` for exactly these waits (`syncobj_park`), and the
+    // rewind is the per-request verdict (§2.5).
+    //
+    // One object, driven twice. A `SIGALRM` fires while the parent blocks in a
+    // `WAIT_FOR_SUBMIT` on an unfenced object, and a forked child submits a fence
+    // later. Without `SA_RESTART` the signal ends the park (`EINTR`) and the
+    // fence, arriving after, is beside the point. With it the same signal only
+    // rewinds the call - so the park rides on to the child's fence and returns 0.
+    // A kernel missing the per-request rewind gives `EINTR` in both, failing the
+    // second check.
+    {
+        let (r, esig) = create(fd, 0);
+        lin::check_eq(&mut failed, b"an object to interrupt a wait on", r, 0);
+
+        // Branch A - no `SA_RESTART`: the signal ends the wait.
+        install_alarm(false);
+        let kid = lin::fork();
+        if kid == 0 {
+            lin::sleep_ms(300);
+            let _ = array_call(fd, NR_SYNCOBJ_SIGNAL, esig);
+            lin::exit(0);
+        }
+        alarm_once(150);
+        let (r, _) = wait_one(fd, esig, deadline_ms_ahead(2000), WAIT_FOR_SUBMIT);
+        lin::check_eq(
+            &mut failed,
+            b"a SIGALRM ends a WAIT_FOR_SUBMIT with EINTR when the handler lacks SA_RESTART",
+            r,
+            lin::EINTR,
+        );
+        lin::check_true(
+            &mut failed,
+            b"and the handler ran first",
+            RAN.load(Ordering::Relaxed) >= 1,
+        );
+        // Collect the child (it signals at 300 ms), then clear the fence it left.
+        let mut status = 0i32;
+        let _ = lin::wait4(kid as usize, &mut status, 0);
+        lin::check_eq(
+            &mut failed,
+            b"and the object can be reset for the second branch",
+            array_call(fd, NR_SYNCOBJ_RESET, esig),
+            0,
+        );
+
+        // Branch B - with `SA_RESTART`: the rewind rides past the signal to the
+        // fence the child submits, so the same call answers 0, not EINTR.
+        install_alarm(true);
+        let kid2 = lin::fork();
+        if kid2 == 0 {
+            lin::sleep_ms(300);
+            let _ = array_call(fd, NR_SYNCOBJ_SIGNAL, esig);
+            lin::exit(0);
+        }
+        alarm_once(150);
+        let (r, _) = wait_one(fd, esig, deadline_ms_ahead(2000), WAIT_FOR_SUBMIT);
+        lin::check_eq(
+            &mut failed,
+            b"SA_RESTART rewinds the same WAIT_FOR_SUBMIT, so it ends on the fence",
+            r,
+            0,
+        );
+        let _ = lin::wait4(kid2 as usize, &mut status, 0);
+
+        // Restore the default disposition so nothing downstream inherits it.
+        let back = lin::SigAction {
+            handler: 0,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        lin::rt_sigaction(lin::SIGALRM, &back, core::ptr::null_mut());
+    }
 
     lin::done(failed);
 }

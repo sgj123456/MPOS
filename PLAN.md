@@ -29,12 +29,14 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         on the master's own read (`t-tty-nonblock`, host tests) (§2.5)
   - [x] every other blocking wait a signal can end: pipe read/write, eventfd,
         signalfd, inotify, unix datagram/accept/connect, the pty write
-        back-pressure, the AF_PACKET and route-netlink reads, and
-        `nanosleep`/`clock_nanosleep` with the remainder in `rem`
-        (`t-wait-eintr`, `t-sa-restart`). Named remainders: `wait4`/`waitid` and
-        the console's serial transmit wait, whose parks are still
-        fatal-signal-only, and `ioctl`'s missing per-request restart verdict
-        (§2.5)
+        back-pressure, the AF_PACKET and route-netlink reads, `wait4`/`waitid`,
+        and `nanosleep`/`clock_nanosleep` with the remainder in `rem`, each
+        rewound under `SA_RESTART` where Linux rewinds it — including
+        `ioctl`'s per-request verdict for the two DRM sync-object waits
+        (`t-wait-eintr`, `t-sa-restart`, `t-drm-sync`). Named remainders: the
+        console's serial transmit wait, whose park is still fatal-signal-only,
+        and `FBIO_WAITFORVSYNC`, which discards its `WaitEnd` so a signal cannot
+        end it at all (§2.5)
 - [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3)
   - [x] `flock` owned by the open file description, record locks by the process
         (`t-filelock`) · read/write deliberately *not* enforced: Linux advisory
@@ -1589,10 +1591,27 @@ Named gaps this leaves, and the three that have since closed:
     restart stays in `t-sa-restart`.
   - **The console's serial transmit wait** (`console::write_bytes` parks on ring
     space), the same shape on the one wire the kernel writes from its own tasks.
-  - **`ioctl(2)`'s per-request verdict.** Linux restarts an interrupted
-    `DRM_IOCTL_SYNCOBJ_WAIT` and most other requests not at all; this kernel has
-    no per-request answer, so that wait still comes back `EINTR` under
-    `SA_RESTART` rather than being rewound.
+  - **`ioctl(2)`'s per-request verdict — LANDED.** Linux rewinds an interrupted
+    request only when its driver returned `-ERESTARTSYS`, so `SA_RESTART` restarts
+    `DRM_IOCTL_SYNCOBJ_WAIT`/`..._TIMELINE_WAIT` and most other requests not at
+    all. `abi::ioctl_restartable` now names exactly those two (magic `'d'`, command
+    `0xc3`/`0xca` — the only requests this kernel's park answers `EINTR` for), and
+    `restart_verdict` reads the request word (`regs.rsi`) for `nr::IOCTL` where it
+    reads the number elsewhere; `build_frame`'s rewind re-runs the saved arguments
+    unchanged, and the wait's `timeout_ns` is an absolute deadline, so a rewind can
+    neither extend it nor lose it. Grounded in the driver's own return code (Linux
+    `drm_syncobj.c` parks the fence and returns `-ERESTARTSYS` on a signal); pinned
+    in the guest by `t-drm-sync`, which blocks a `WAIT_FOR_SUBMIT`, fires a
+    `SIGALRM` into it from a `setitimer`, and has a forked child submit the fence
+    afterwards — the wait answers `EINTR` without `SA_RESTART` and `0` with it, so
+    a kernel missing the rewind (which gives `EINTR` in both) fails the second
+    branch. The one remaining ioctl *wait* gap is `FBIO_WAITFORVSYNC`, which
+    discards its `WaitEnd` (`ioctl.rs`) and so is not signal-interruptible at all —
+    a separate §2.5 item, not a restart verdict. **Gated:** `cargo xtask test`
+    ends `=== SUMMARY pass=141 fail=0 (141 built)` with QEMU exit 33 and
+    `t-drm-sync === PASS` — the branch that proves the pin is load-bearing is B,
+    which answers `0`; a kernel without the per-request verdict answers `EINTR`
+    there too and fails it.
 - **Canonical mode ignores both** — `VMIN` included. That is POSIX's wording
   ("non-canonical") and the measured 4-second block above, so nothing is
   missing here; it is recorded because the pair *looks* like it applies.

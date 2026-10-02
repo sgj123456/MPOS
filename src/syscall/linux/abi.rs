@@ -1247,11 +1247,11 @@ pub(crate) fn timespec_from_ticks(ticks: u64, hz: u64) -> (i64, i64) {
 /// twice - or one where a second run could not tell it was a second run - is
 /// wrong to include even if it never returns `EINTR` today.
 ///
-/// Named remainder: Linux's `ioctl(2)` is restartable *per request* (an
-/// interruptible `DRM_IOCTL_SYNCOBJ_WAIT` restarts, most requests do not), and
-/// this kernel has no per-request verdict - so an interrupted DRM sync-object
-/// wait comes back `EINTR` here even under `SA_RESTART`. `wait4(2)`/`waitid(2)`
-/// are restartable on Linux (measured on 7.2.7: a caught non-`SA_RESTART` signal
+/// `ioctl(2)` is not one verdict but a verdict *per request*, so it stays out of
+/// this list entirely and is decided instead by `ioctl_restartable` below - which
+/// rewinds the requests whose Linux driver returns `-ERESTARTSYS` and lets the
+/// rest answer `EINTR`, exactly as Linux does. `wait4(2)`/`waitid(2)` are
+/// restartable on Linux (measured on 7.2.7: a caught non-`SA_RESTART` signal
 /// ends the wait with `EINTR`, and `SA_RESTART` restarts it), and this kernel now
 /// makes their child-event park interruptible (`block_until_on_interruptible`,
 /// §2.5), so they are listed.
@@ -1293,6 +1293,30 @@ pub(crate) fn restartable(nr: u64) -> bool {
             | nr::WAIT4
             | nr::WAITID
     )
+}
+
+/// Whether an interrupted `ioctl(2)` of this exact request word is one Linux
+/// runs again when the signal that ended it was installed with `SA_RESTART`.
+///
+/// `restartable` decides per syscall number, and `ioctl` is the one call whose
+/// verdict is per *request*: the driver's own return code is what decides, and
+/// `-ERESTARTSYS` - the errno the syscall layer rewinds on `SA_RESTART` and
+/// turns into `EINTR` otherwise - is what makes a request restartable. Most
+/// requests are not; the ones here are the two DRM sync-object waits, whose
+/// Linux driver (`drm_syncobj.c`) parks on the fence and returns
+/// `-ERESTARTSYS` when a signal ends the wait. This kernel's own
+/// park already answers `EINTR` for exactly these two (`syncobj_park` returns
+/// `-4` on an interrupted wait and every other blocking request is
+/// fatal-only), so the rewind decision reduces to naming the same two requests.
+///
+/// The two are `_IOW`-shaped words with the family byte `'d'` at bits 8..15 and
+/// the command number in the low byte: `DRM_IOCTL_SYNCOBJ_WAIT` is `0xc3` and
+/// `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` is `0xca` (their constants in
+/// `src/drivers/drm.rs`). The test is the same `_IOC` family filter
+/// `family_nr` applies - magic byte and command only, never the direction or
+/// size bits, which no restartability rule looks at.
+pub(crate) fn ioctl_restartable(request: u32) -> bool {
+    (request >> 8) & 0xff == b'd' as u32 && matches!(request & 0xff, 0xc3 | 0xca)
 }
 
 // ---------------------------------------------------------------------------
@@ -3930,8 +3954,8 @@ mod entropy_tests {
             );
         }
 
-        // `ioctl` needs a per-request verdict this kernel does not have, so it
-        // stays out of the allow-list.
+        // `ioctl` is decided per request, not per syscall number, so it stays
+        // out of *this* allow-list; `ioctl_restartable` is the other axis.
         assert!(!restartable(nr::IOCTL));
         // `wait4`/`waitid` moved *into* the allow-list this pass: their park is
         // now interruptible (`block_until_on_interruptible`, §2.5), and a real
@@ -3940,6 +3964,41 @@ mod entropy_tests {
         // The prior `!restartable(WAIT4)` pinned the *old* wrong shape.
         assert!(restartable(nr::WAIT4));
         assert!(restartable(nr::WAITID));
+    }
+
+    /// The per-request half of the `ioctl` restart verdict. The two DRM
+    /// sync-object waits are rewound on `SA_RESTART`; every other request - a
+    /// `'d'`-family command that is not a wait, a foreign family whose command
+    /// number happens to look like a wait, and the `EINTR`-free waits alike - is
+    /// not. The predicate reads the `_IOC` type byte and command only, so the
+    /// direction and size bits must not move the answer.
+    #[test]
+    fn only_the_ewinding_drm_waits_are_restartable_ioctls() {
+        // `_IOC(dir, type, nr, size)`; the exact bits Linux does *not* use here.
+        const fn ioc(dir: u32, ty: u8, nr: u8, size: u32) -> u32 {
+            (dir << 30) | (size << 16) | ((ty as u32) << 8) | nr as u32
+        }
+        // The two waits, spelled as the `_IOW` words libdrm actually builds.
+        assert!(
+            ioctl_restartable(ioc(1, b'd', 0xc3, 40)),
+            "SYNCOBJ_WAIT rewinds"
+        );
+        assert!(
+            ioctl_restartable(ioc(1, b'd', 0xca, 48)),
+            "SYNCOBJ_TIMELINE_WAIT rewinds"
+        );
+        // Direction and size are not part of the rule: bare words with the same
+        // type and command answer the same way.
+        assert!(ioctl_restartable((('d' as u32) << 8) | 0xc3));
+
+        // A `'d'`-family command that is not a wait (SYNCOBJ_SIGNAL) is not.
+        assert!(!ioctl_restartable(ioc(1, b'd', 0xc5, 16)));
+        // A foreign family whose command number collides with a wait's low byte:
+        // the type byte decides, exactly as the `KDSKBMODE`/evdev lesson says.
+        assert!(!ioctl_restartable(ioc(0, b'V', 0xc3, 0)));
+        assert!(!ioctl_restartable(ioc(0, b'K', 0xca, 0)));
+        // And an unrelated request of any kind is never rewound.
+        assert!(!ioctl_restartable(ioc(2, b'F', 0x21, 4)));
     }
 
     /// The round trip a `nanosleep`'s `rem` rides: a sleep that was ended with

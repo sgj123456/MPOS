@@ -273,7 +273,9 @@ fn build_frame(
 ///   has already run, and what is left reaching this point is either a handler
 ///   or an ignored signal, so the flags read here are the ones the handler
 ///   will run under;
-/// * the call is one Linux rewinds at all ([`super::abi::restartable`]) -
+/// * the call is one Linux rewinds at all - `abi::restartable` for every
+///   syscall but `ioctl`, whose verdict is per *request*
+///   (`abi::ioctl_restartable`) because the driver's own return decides it.
 ///   `poll`, `select`, `epoll_wait` and the sleeps answer `EINTR` whatever the
 ///   disposition says, and rewinding them would be a handler loop that never
 ///   returns.
@@ -283,9 +285,22 @@ fn build_frame(
 /// 400 ms: the handler runs at 100 ms, the *read* returns the byte at 400 ms,
 /// and `EINTR` never appears. Without the flag the same call answers
 /// `-1/EINTR` at 100 ms.
-fn restart_verdict(nr: u64, ret: isize, action: &crate::sched::signal::Action) -> Option<u64> {
+fn restart_verdict(
+    nr: u64,
+    request: u32,
+    ret: isize,
+    action: &crate::sched::signal::Action,
+) -> Option<u64> {
     let asked = action.flags & crate::sched::signal::SA_RESTART != 0;
-    (ret == err::EINTR && asked && super::abi::restartable(nr)).then_some(nr)
+    // `ioctl` is the one call whose verdict is per request rather than per
+    // number: `restartable(nr)` deliberately leaves `nr::IOCTL` out, and the
+    // request word (the second argument, `regs.rsi`) decides instead.
+    let restartable = if nr == nr::IOCTL {
+        abi::ioctl_restartable(request)
+    } else {
+        abi::restartable(nr)
+    };
+    (ret == err::EINTR && asked && restartable).then_some(nr)
 }
 
 /// Run a pending signal's handler, or take its default action.
@@ -344,13 +359,19 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
             }
         }
     }
+    // The second argument, which is the request word for an `ioctl` and
+    // meaningless for every other number `restart_verdict` asks about. The
+    // frame is still the syscall-entry one here: the tracer and group-stop
+    // paths above returned, and `build_frame` - which rewrites it - runs only
+    // after this reads it.
+    let request = unsafe { &*(regs_ptr as *const RegsFrame) }.rsi as u32;
     if !build_frame(
         regs_ptr,
         sig,
         &action,
         &info,
         ret,
-        restart_verdict(nr, ret, &action),
+        restart_verdict(nr, request, ret, &action),
     ) {
         // Nothing to run, or nowhere to put the frame - and the default action
         // for every signal this kernel names is to die of it, with the number

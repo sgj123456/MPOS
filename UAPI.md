@@ -83,7 +83,6 @@ contract is not. Each is tracked in its phase section; the list is here so it is
 
 | Syscall | Sub-gap | Where |
 |---|---|---|
-| `ioctl` | no per-request restart verdict: an interrupted request comes back `EINTR` even under `SA_RESTART` where Linux rewinds `DRM_IOCTL_SYNCOBJ_WAIT` and most others | `PLAN.md` §2.5 |
 | `rt_sigqueueinfo` / `sigqueue` | real-time signals `32..=64` are now fully queued (stage C: every copy delivered FIFO with its own `si_value`); the one divergence is overflow — a full per-task ring drops the extra copy silently, where Linux's per-user `RLIMIT_SIGPENDING` makes `sigqueue` return `EAGAIN` | `PLAN.md` §2.3 |
 | `mmap` | `MAP_HUGETLB` is `ENOMEM` (an honest refusal); `MAP_HUGETLB` backing is the missing half | §3 below |
 | `madvise` | `MADV_FREE` and a shared mapping's cross-process drop are deliberate no-ops | `PLAN.md` §5.2 |
