@@ -4724,17 +4724,13 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 /// already claimed answers `EBUSY`.
 /// The `'U'`-typed requests: `/dev/uinput`, where userland makes input devices.
 ///
-/// The plumbing lives here rather than in the driver because reading a caller's
-/// structure and checking its pointer is the same work for every device, and
-/// because the errno a refusal carries is the ABI's business; what the driver
-/// owns is the effect - which bit was declared, which device was made.
+/// The descriptor *is* the device, so every request here is about the one this
+/// open file description owns. Resolving it stays at this boundary - a bad fd is
+/// `EBADF` and a node that is not a uinput device is `ENOTTY`, which are the
+/// syscall layer's answers to give - and the request itself is the device's to
+/// judge (`Uinput::ioctl`, the same split the `'E'` and `'K'` families took:
+/// `PLAN.md` §11.2 Step B2).
 fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
-    use core::mem::size_of;
-    let size = ((request >> 16) & 0x3fff) as usize;
-    let dir = (request >> 30) & 0x3;
-    let Some(nr) = family_nr(request, b'U') else {
-        return err::ENOTTY;
-    };
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
         Err(e) => return err_of(e),
@@ -4743,60 +4739,7 @@ fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let Some(dev) = inode.as_uinput() else {
         return err::ENOTTY;
     };
-    let ofd = file.ofd();
-
-    // Every bit-setter carries one `int`: the bit's number.
-    if let Some(set) = crate::uinput::bit_request(nr) {
-        if size < size_of::<i32>() || !buffer_ok(buf, size_of::<i32>(), false, from_user) {
-            return err::EINVAL;
-        }
-        let code = unsafe { (buf as *const i32).read_unaligned() } as usize;
-        return if dev.set_bit(ofd, set, code) {
-            0
-        } else {
-            err::EINVAL
-        };
-    }
-    match (dir, nr) {
-        (0, crate::uinput::DEV_CREATE) => {
-            if dev.create(ofd) {
-                0
-            } else {
-                err::EINVAL
-            }
-        }
-        (0, crate::uinput::DEV_DESTROY) => {
-            dev.destroy(ofd);
-            0
-        }
-        (1, crate::uinput::DEV_SETUP) => {
-            if size < crate::uinput::SETUP_SIZE
-                || !buffer_ok(buf, crate::uinput::SETUP_SIZE, false, from_user)
-            {
-                return err::EINVAL;
-            }
-            // Read the caller's structure in one go: it is fixed-size and
-            // plain, and this is the only place its layout is depended on.
-            let bytes =
-                unsafe { core::slice::from_raw_parts(buf as *const u8, crate::uinput::SETUP_SIZE) };
-            match crate::uinput::parse_setup(bytes) {
-                Some((name, id, _effects)) => {
-                    dev.setup(ofd, name, id);
-                    0
-                }
-                None => err::EINVAL,
-            }
-        }
-        (2, crate::uinput::GET_VERSION) => {
-            let version = crate::uinput::VERSION;
-            if size < size_of::<u32>() || !buffer_ok(buf, size_of::<u32>(), true, from_user) {
-                return err::EINVAL;
-            }
-            unsafe { (buf as *mut u32).write_unaligned(version) };
-            0
-        }
-        _ => err::ENOTTY,
-    }
+    dev.ioctl(file.ofd(), request, buf, from_user)
 }
 
 fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {

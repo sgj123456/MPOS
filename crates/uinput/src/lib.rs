@@ -81,6 +81,17 @@ pub enum BitSet {
     Prop,
 }
 
+/// The request number inside an `_IOC` word that carries this family's magic,
+/// or `None` for a word that is not a uinput request at all.
+///
+/// The magic is this crate's to check - it is the `'U'` every constant above is
+/// built from - and checking it here is what lets the device's own dispatch
+/// answer `ENOTTY` for a word that is not its without the syscall layer having
+/// to know which byte a family lives in.
+pub fn nr_of(request: u32) -> Option<u32> {
+    ((request >> 8) & 0xff == IOCTL_BASE as u32).then_some(request & 0xff)
+}
+
 /// What the request number `nr` declares, or `None` for a request that is not
 /// one of the bit-setters.
 ///
@@ -340,5 +351,27 @@ mod tests {
 
         // And a short structure is no structure.
         assert!(parse_setup(&[0u8; SETUP_SIZE - 1]).is_none());
+    }
+
+    #[test]
+    fn the_family_magic_is_what_makes_a_word_a_uinput_request() {
+        // The check the device's dispatch makes before it looks at a request at
+        // all: `_IO('U', 1)` is `DEV_CREATE`, a word built from another magic is
+        // not this device's, and the *whole* 8..16 bit field has to match - a
+        // request whose magic byte differs is `None`, not a smaller request
+        // number.
+        fn ioc(dir: u32, magic: u8, nr: u32) -> u32 {
+            (dir << 30) | ((magic as u32) << 8) | nr
+        }
+        assert_eq!(nr_of(ioc(0, b'U', DEV_CREATE)), Some(DEV_CREATE));
+        assert_eq!(nr_of(ioc(0, b'U', DEV_DESTROY)), Some(DEV_DESTROY));
+        assert_eq!(nr_of(ioc(1, b'U', DEV_SETUP)), Some(DEV_SETUP));
+        assert_eq!(nr_of(ioc(2, b'U', GET_VERSION)), Some(GET_VERSION));
+        assert_eq!(
+            nr_of(ioc(0, b'K', DEV_CREATE)),
+            None,
+            "another family's word"
+        );
+        assert_eq!(nr_of(0), None, "and a word with no magic at all");
     }
 }

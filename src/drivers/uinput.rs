@@ -219,6 +219,84 @@ impl Uinput {
         });
     }
 
+    /// The `'U'`-typed requests: the whole of `/dev/uinput`'s contract.
+    ///
+    /// The *vocabulary* - the request numbers, which bit-setter names which
+    /// type, `struct uinput_setup`'s layout and its parser - is the `mpos-uinput`
+    /// crate's and stays there, host-tested. What lives here is the dispatch
+    /// over this device's own state and the errno each request owes, which is
+    /// the same split the `'E'` family took into `EvdevNode::ioctl` and the
+    /// `'K'` family into `Tty::kd_ioctl` (`PLAN.md` §11.2 Step B2). The syscall
+    /// layer still resolves the descriptor (`uinput_ioctl` in
+    /// `syscall/linux/fs.rs`): the bad-fd `EBADF` and the not-a-uinput-node
+    /// `ENOTTY` are the user boundary's to give.
+    pub fn ioctl(&self, ofd: u64, request: u32, buf: usize, from_user: bool) -> isize {
+        use core::mem::size_of;
+        let size = ((request >> 16) & 0x3fff) as usize;
+        let dir = (request >> 30) & 0x3;
+        let Some(nr) = crate::uinput::nr_of(request) else {
+            return crate::err::ENOTTY;
+        };
+
+        // Every bit-setter carries one `int`: the bit's number.
+        if let Some(set) = crate::uinput::bit_request(nr) {
+            if size < size_of::<i32>()
+                || !crate::uaccess::buffer_ok(buf, size_of::<i32>(), false, from_user)
+            {
+                return crate::err::EINVAL;
+            }
+            let code = unsafe { (buf as *const i32).read_unaligned() } as usize;
+            return if self.set_bit(ofd, set, code) {
+                0
+            } else {
+                crate::err::EINVAL
+            };
+        }
+        match (dir, nr) {
+            (0, crate::uinput::DEV_CREATE) => {
+                if self.create(ofd) {
+                    0
+                } else {
+                    crate::err::EINVAL
+                }
+            }
+            (0, crate::uinput::DEV_DESTROY) => {
+                self.destroy(ofd);
+                0
+            }
+            (1, crate::uinput::DEV_SETUP) => {
+                if size < crate::uinput::SETUP_SIZE
+                    || !crate::uaccess::buffer_ok(buf, crate::uinput::SETUP_SIZE, false, from_user)
+                {
+                    return crate::err::EINVAL;
+                }
+                // Read the caller's structure in one go: it is fixed-size and
+                // plain, and this is the only place its layout is depended on.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(buf as *const u8, crate::uinput::SETUP_SIZE)
+                };
+                match crate::uinput::parse_setup(bytes) {
+                    Some((name, id, _effects)) => {
+                        self.setup(ofd, name, id);
+                        0
+                    }
+                    None => crate::err::EINVAL,
+                }
+            }
+            (2, crate::uinput::GET_VERSION) => {
+                let version = crate::uinput::VERSION;
+                if size < size_of::<u32>()
+                    || !crate::uaccess::buffer_ok(buf, size_of::<u32>(), true, from_user)
+                {
+                    return crate::err::EINVAL;
+                }
+                unsafe { (buf as *mut u32).write_unaligned(version) };
+                0
+            }
+            _ => crate::err::ENOTTY,
+        }
+    }
+
     /// Report the records a write carried, answering how many bytes landed.
     /// `None` is a description with no device behind it yet - a write before
     /// `UI_DEV_CREATE`, which Linux also refuses.
