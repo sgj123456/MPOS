@@ -72,28 +72,33 @@ pub const SIGTTOU: u8 = 22;
 /// is why it joins `SIGCHLD` as the table's other "do nothing".
 pub const SIGWINCH: u8 = 28;
 
-/// How many signal numbers a process can hold a disposition for. `Pending` is
-/// a `u64`, so 1..=63 are the numbers this kernel can name at all; the zero
-/// slot is left in so a signal number indexes its own entry. Dispositions stop
-/// at 31 — the real-time range has no handler storage, which `rt_sigaction`
-/// says out loud with `EINVAL`.
-pub const SIGNALS: usize = 32;
+/// How many signal numbers a process can hold a disposition for: the zero slot
+/// plus `1..=64` (`_NSIG`), so a signal number indexes its own entry. `Pending`
+/// is a `u64` in the canonical layout (signal `n` at bit `n-1`), so all of
+/// `1..=64` are nameable — the standard set `1..=31` and the real-time range
+/// `SIGRTMIN..=SIGRTMAX` alike.
+pub const SIGNALS: usize = 65;
 
-/// `SIGRTMIN`, the first real-time signal and the only one this kernel ever
-/// generates itself: musl's `SIGEV_THREAD` timers target a helper thread with
-/// exactly this number, and a kernel without it is one on which every
+/// The highest signal number Linux names (`_NSIG`). Anything above it is
+/// `EINVAL`; `0` is the `kill`-existence probe, handled before this bound.
+pub const MAX_SIGNAL: u8 = 64;
+
+/// `SIGRTMIN`, the first real-time signal and the one musl's `SIGEV_THREAD`
+/// timers target: a kernel without it is one on which every
 /// `timer_create`-with-a-callback program — vim among them — fails its
 /// timeout setup and dies on the redraw path that follows the failure.
-/// Dispositions are still refused for it; a process-directed wait
-/// (`rt_sigtimedwait`, a blocked mask) is the whole surface it needs.
 pub const SIGRTMIN: u8 = 32;
 
-/// How many `siginfo_t` slots a task keeps. One per signal the kernel itself
-/// can queue, which is 1..=31 plus [`SIGRTMIN`]: the timer expiry that targets
-/// a thread is the one record `rt_sigtimedwait` must hand back complete, with
-/// `SI_TIMER` in `si_code` — musl's helper thread checks exactly that field
-/// before it calls the callback.
-pub const SIGINFO_SLOTS: usize = SIGNALS + 1;
+/// `SIGRTMAX`, the last real-time signal and the last bit the canonical
+/// `Pending` word can hold (signal `n` at bit `n-1`, so signal 64 is bit 63).
+pub const SIGRTMAX: u8 = 64;
+
+/// How many `siginfo_t` slots a task keeps: one per index `0..=64`, so every
+/// nameable signal has a record slot — the standard signals coalesce into
+/// theirs, and the timer expiry that targets a thread is handed back complete
+/// with `SI_TIMER` in `si_code`, the field musl's helper thread checks before
+/// it calls the callback.
+pub const SIGINFO_SLOTS: usize = SIGNALS;
 
 /// The two dispositions that are not a function address: take the default
 /// action, or do nothing at all.
@@ -225,7 +230,7 @@ impl Actions {
 }
 
 /// Whether `sig` can have a disposition at all: Linux refuses signal 0, the
-/// numbers above 31, and the two the kernel reserves for itself.
+/// numbers above `_NSIG` (64), and the two the kernel reserves for itself.
 pub fn catchable(sig: usize) -> bool {
     (1..SIGNALS).contains(&sig) && sig != SIGKILL as usize && sig != SIGSTOP as usize
 }
@@ -485,7 +490,12 @@ mod tests {
         assert!(!catchable(SIGKILL as usize));
         assert!(!catchable(SIGSTOP as usize));
         assert!(!catchable(0));
-        assert!(!catchable(32));
+        // The real-time range is installable from stage B on: SIGRTMIN (32) and
+        // SIGRTMAX (64) are catchable, while 0, >_NSIG, and SIGKILL/SIGSTOP are
+        // not.
+        assert!(catchable(32));
+        assert!(catchable(64));
+        assert!(!catchable(65));
         assert!(catchable(SIGTRAP as usize));
         assert!(catchable(SIGCONT as usize));
         assert!(catchable(SIGTSTP as usize));

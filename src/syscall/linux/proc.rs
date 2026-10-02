@@ -1894,7 +1894,7 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
 /// whether the target is there.
 pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
     let (id, sig) = (args[0] as isize, args[1]);
-    if sig > 31 {
+    if sig > crate::sched::signal::MAX_SIGNAL as usize {
         return err::EINVAL;
     }
     let delivered = match id {
@@ -2965,11 +2965,11 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
         if kind == SIGEV_NONE {
             (0, value, TimerNotify::None)
         } else {
-            // The range this kernel can queue: 1..=31 plus `SIGRTMIN` (32),
-            // which is the number musl's helper waits on. A disposition
-            // cannot be installed for 32 — that gap is unchanged — but a
-            // *wait* for it is what the timer machinery needs, and it has it.
-            if signo <= 0 || signo > crate::sched::signal::SIGRTMIN as i32 {
+            // The range this kernel can name: 1..=64 (`_NSIG`). musl's helper
+            // waits on `SIGRTMIN` (32), and now any real-time number in the
+            // range may be the timer's signal, with a disposition installable
+            // for it too (stage B).
+            if signo <= 0 || signo > crate::sched::signal::MAX_SIGNAL as i32 {
                 return err::EINVAL;
             }
             if kind == SIGEV_THREAD_ID {

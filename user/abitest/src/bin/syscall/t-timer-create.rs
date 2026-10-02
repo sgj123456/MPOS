@@ -149,15 +149,24 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::EINVAL,
     );
 
-    // Linux accepts 1..=64 here and this kernel stops at SIGRTMIN: the range
-    // above it is the real-time gap PLAN.md names, and a signal number with no
-    // disposition storage is refused rather than accepted and then silently
-    // undeliverable.
-    event.signo = 40; // past SIGRTMIN
+    // Linux accepts 1..=64 here; stage B opened the real-time range, so a
+    // number inside it names a valid timer signal, and only past `_NSIG` is
+    // refused — rather than a number up to 64 being accepted and then silently
+    // undeliverable for want of a disposition slot.
+    event.signo = 40; // inside SIGRTMIN..=SIGRTMAX
     let r = lin::timer_create(lin::CLOCK_MONOTONIC, &event, &mut id);
     lin::check_eq(
         &mut failed,
-        b"a signal number past SIGRTMIN is EINVAL",
+        b"a real-time signal number (40) is accepted",
+        r,
+        0,
+    );
+
+    event.signo = 65; // past _NSIG
+    let r = lin::timer_create(lin::CLOCK_MONOTONIC, &event, &mut id);
+    lin::check_eq(
+        &mut failed,
+        b"a signal number past _NSIG (64) is EINVAL",
         r,
         lin::EINVAL,
     );

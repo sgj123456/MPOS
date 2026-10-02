@@ -1390,8 +1390,11 @@ fn check_ipc() {
         unsafe { syscall(lnr::KILL, 9999, SIGTERM as usize, 0, 0, 0, 0) },
         err::ESRCH
     );
+    // The signal-refusal boundary. Stage B opened the real-time range, so
+    // `SIGRTMIN` (32) is now a valid `kill` target (as on Linux); the number
+    // that must be refused is the one past `_NSIG` (64), not 32.
     assert_eq!(
-        unsafe { syscall(lnr::KILL, 0, 32, 0, 0, 0, 0) },
+        unsafe { syscall(lnr::KILL, 0, 65, 0, 0, 0, 0) },
         err::EINVAL
     );
     println!("signals: SIGTERM, SIGKILL, and the kill(0) probe behave");

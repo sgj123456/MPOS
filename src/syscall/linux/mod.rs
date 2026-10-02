@@ -650,9 +650,10 @@ struct UserSigAction {
 #[cfg(target_os = "none")]
 fn sigaction(args: [usize; 6]) -> isize {
     let (sig, act, old) = (args[0], args[1], args[2]);
-    // Linux's refusal set: signal 0 is not a signal, 32 and up are real-time
-    // signals this kernel has no numbers for, and SIGKILL/SIGSTOP cannot be
-    // given a disposition by anyone.
+    // Linux's refusal set: signal 0 is not a signal, numbers above `_NSIG` (64)
+    // are not signals, and SIGKILL/SIGSTOP cannot be given a disposition by
+    // anyone. The real-time range `32..=64` is nameable and installable here, as
+    // on Linux (`catchable` now spans it).
     if !crate::sched::signal::catchable(sig) {
         return err::EINVAL;
     }

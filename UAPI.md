@@ -84,8 +84,7 @@ contract is not. Each is tracked in its phase section; the list is here so it is
 | Syscall | Sub-gap | Where |
 |---|---|---|
 | `ioctl` | no per-request restart verdict: an interrupted request comes back `EINTR` even under `SA_RESTART` where Linux rewinds `DRM_IOCTL_SYNCOBJ_WAIT` and most others | `PLAN.md` §2.5 |
-| `rt_sigaction` | numbers `32..=64` have no disposition storage (`EINVAL`); `SIGRTMIN` (32) alone is queueable/maskable | `PLAN.md` §2.3 |
-| `rt_sigqueueinfo` / `sigqueue` | `33..=64` have no queueable number, so only `SIGRTMIN` carries a payload | `PLAN.md` §2.3 |
+| `rt_sigqueueinfo` / `sigqueue` | real-time numbers `32..=64` are now accepted (stage B), but repeats of one number coalesce into a single record where Linux queues every `sigqueue`'d copy with its own `si_value` (multi-copy pending is stage C) | `PLAN.md` §2.3 |
 | `mmap` | `MAP_HUGETLB` is `ENOMEM` (an honest refusal); `MAP_HUGETLB` backing is the missing half | §3 below |
 | `madvise` | `MADV_FREE` and a shared mapping's cross-process drop are deliberate no-ops | `PLAN.md` §5.2 |
 | `posix_fadvise` | recognised advices are accepted as the no-ops they are (this kernel prefetches nothing) | `PLAN.md` §12.1 |

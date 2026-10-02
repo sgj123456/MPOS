@@ -1250,7 +1250,7 @@ pub fn handle_rt_sigpending(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// does not belong to.
 pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
     let (tgid, tid, sig) = (args[0] as isize, args[1] as isize, args[2]);
-    if sig > 31 {
+    if sig > crate::sched::signal::MAX_SIGNAL as usize {
         return err::EINVAL;
     }
     if tid <= 0 || tid as usize >= crate::sched::MAX_TASKS {
@@ -1279,7 +1279,7 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
 pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SIGINFO_BYTES: usize = 128;
     let (tgid, sig, uinfo) = (args[0] as isize, args[1], args[2]);
-    if sig > 31 {
+    if sig > crate::sched::signal::MAX_SIGNAL as usize {
         return err::EINVAL;
     }
     if uinfo == 0 || !buffer_ok(uinfo, SIGINFO_BYTES, false, from_user) {

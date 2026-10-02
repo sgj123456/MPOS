@@ -138,10 +138,12 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [x] inotify · [x] `memfd_create` (anon shared buffers, §7/Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
-- [~] real-time signals: `SIGRTMIN` (32) is queued, masked and waited for — the
-      number musl's `SIGEV_THREAD` helper needs, and the pending mask is 64-bit
-      now — but 33..=64 have no queueable number and 32..=64 still have no
-      disposition storage (`rt_sigaction` answers `EINVAL`) (§2.3, §Remaining)
+- [~] real-time signals — stages A+B landed: the pending mask is a canonical 64-bit
+      map, the disposition table spans `1..=64` (so `rt_sigaction` installs an RT signal
+      and `kill`/`tgkill`/`sigqueue`/`timer_create` name the range), and `SIGRTMIN` is
+      queued/masked/waited-for as musl's `SIGEV_THREAD` helper needs. The one thing left
+      is true **multi-copy** queueing (stage C): repeats of one RT number still coalesce
+      (§2.3, §Remaining)
 - [x] POSIX timers 222–226 — `vim`'s startup probe. The five calls are routed,
       the expiry scan is the scheduler's tick, and the `SIGEV_THREAD_ID` +
       `SIGRTMIN` shape musl builds for a callback timer works end to end; the
@@ -1401,9 +1403,14 @@ standard signals 1..=31 this kernel names). `kill`/`tgkill` deliver
 (`si_signo`/`si_errno`/`si_code`/`si_pid`/`si_uid`/`si_value`) instead of a
 fixed `SI_USER`.
 
-*Not done (future, real-time signals):* numbers 32..=64 and true multi-copy
-queuing of the same signal need 64-bit masks throughout; the current
-`Pending = u32` vocabulary and `SIGNALS = 32` table bound the signal set.
+*Real-time signals, stages A+B landed:* the pending set is now a canonical 64-bit
+map (signal `n` at bit `n-1`, so the libc wire set and the kernel's internal set are
+one shape), and the disposition table spans `1..=64` — `rt_sigaction` installs a
+real-time signal, and `kill`/`tgkill`/`rt_sigqueueinfo`/`timer_create` accept the range
+(only `0`, `>64`, and `SIGKILL`/`SIGSTOP` are refused, as Linux). This closes the
+"`rt_sigaction` answers `EINVAL` for `32..=64`" gap. *Still open (stage C):* true
+**multi-copy** queueing — repeats of one real-time number still coalesce into a single
+`siginfo` slot, where Linux delivers every `sigqueue`'d copy with its own `si_value`.
 
 ### 2.4 Verification
 

@@ -4117,7 +4117,7 @@ pub fn take_deliverable_siginfo() -> Option<(u8, signal::SigInfo)> {
                 continue;
             }
             task.signals &= !signal::bit(sig);
-            let slot = (sig as usize).min(signal::SIGNALS - 1);
+            let slot = (sig as usize).min(signal::SIGINFO_SLOTS - 1);
             let info = task.siginfo[slot];
             task.siginfo[slot] = signal::SigInfo::ZERO;
             return Some((sig, info));

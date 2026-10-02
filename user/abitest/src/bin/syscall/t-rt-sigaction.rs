@@ -83,9 +83,10 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let r = lin::rt_sigaction(lin::SIGBUS, &act, core::ptr::null_mut());
     lin::check_eq(&mut failed, b"installing the SIGBUS handler succeeds", r, 0);
 
-    // The refusal set the man page fixes: signal 0 is not a signal,
-    // SIGKILL/SIGSTOP cannot be given a disposition by anyone, and 32 is
-    // the first real-time number past the 0..=31 this kernel can name.
+    // The refusal set Linux fixes: signal 0 is not a signal, and SIGKILL /
+    // SIGSTOP cannot be given a disposition by anyone. The real-time range
+    // `32..=64` is now nameable (stage B), so `65` — past `_NSIG` — is the
+    // number that must be refused, not `32`.
     let r = lin::rt_sigaction(0, core::ptr::null(), core::ptr::null_mut());
     lin::check_eq(
         &mut failed,
@@ -107,12 +108,54 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         r,
         lin::EINVAL,
     );
-    let r = lin::rt_sigaction(32, core::ptr::null(), core::ptr::null_mut());
+    let r = lin::rt_sigaction(65, core::ptr::null(), core::ptr::null_mut());
     lin::check_eq(
         &mut failed,
-        b"rt_sigaction on the first unnumbered RT signal is EINVAL",
+        b"rt_sigaction past _NSIG (64) is EINVAL",
         r,
         lin::EINVAL,
+    );
+
+    // The range that stage A/B opened: SIGRTMIN (32) and SIGRTMAX (64) are
+    // installable, and a query of a never-set real-time number reports
+    // SIG_DFL with a clean mask rather than EINVAL.
+    let mut old = lin::SigAction {
+        handler: SEED as usize,
+        flags: SEED as usize,
+        restorer: SEED as usize,
+        mask: SEED,
+    };
+    let r = lin::rt_sigaction(32, core::ptr::null(), &mut old);
+    lin::check_eq(
+        &mut failed,
+        b"querying the fresh SIGRTMIN disposition succeeds",
+        r,
+        0,
+    );
+    lin::check_true(
+        &mut failed,
+        b"it reports SIG_DFL with clear flags and mask",
+        old.handler == lin::SIG_DFL && old.flags == 0 && old.mask == 0,
+    );
+    let act = lin::SigAction {
+        handler: handler_addr,
+        flags: lin::SA_SIGINFO | lin::SA_RESTORER,
+        restorer: restorer_addr,
+        mask: 0,
+    };
+    let r = lin::rt_sigaction(35, &act, core::ptr::null_mut());
+    lin::check_eq(
+        &mut failed,
+        b"installing a handler on SIGRTMIN+3 (35) succeeds",
+        r,
+        0,
+    );
+    let r = lin::rt_sigaction(64, core::ptr::null(), core::ptr::null_mut());
+    lin::check_eq(
+        &mut failed,
+        b"rt_sigaction on SIGRTMAX (64) is accepted",
+        r,
+        0,
     );
 
     // A pointer that names no mapping must be EFAULT, not a crash: the
