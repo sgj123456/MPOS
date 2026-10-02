@@ -34,10 +34,7 @@ use critical_section::Mutex;
 use super::tty::{Tty, TtyOutput};
 use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
-
-/// How many virtual consoles are minted at boot: `/dev/tty1` through
-/// `/dev/tty6`, the names a stock `inittab` respawns gettys on.
-pub const VC_COUNT: u32 = 6;
+use crate::term::vc::VC_COUNT;
 
 /// How many pairs may exist at once, as `/proc/sys/kernel/pty/max` reports.
 /// Linux's default; the number a library reads before deciding whether it is

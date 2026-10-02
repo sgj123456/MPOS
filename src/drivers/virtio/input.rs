@@ -1091,7 +1091,7 @@ pub fn service() {
             // compositor must be able to silence the console it is drawing on
             // without silencing the only wire a person can still type into.
             let keymap_on =
-                crate::vfs::vcmux::kb_mode(crate::vfs::vcmux::active()) != crate::vfs::tty::K_OFF;
+                crate::vfs::vcmux::kb_mode(crate::vfs::vcmux::active()) != crate::term::vc::K_OFF;
             // Whether the console on the screen has been put in graphics mode by
             // the session driving it - which is the compositor's own word, via
             // `KDSETMODE`, that the screen is its to draw and the text shell
@@ -1104,7 +1104,7 @@ pub fn service() {
             // text console is `KD_TEXT`, so this is false there and the shell keeps
             // its keyboard exactly as the plain-console case requires.
             let graphics = crate::vfs::vcmux::kd_mode(crate::vfs::vcmux::active())
-                == crate::vfs::tty::KD_GRAPHICS;
+                == crate::term::vc::KD_GRAPHICS;
             let console_wants = screen_live && !compositor_holds && !graphics && keymap_on;
             // Whether the mux just saw a `^A` and is waiting for the byte that
             // completes it. Read once a tick, outside the per-event loop, since

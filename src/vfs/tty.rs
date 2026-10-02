@@ -55,6 +55,9 @@ use crate::sched::policy::TaskId;
 #[cfg(target_os = "none")]
 use crate::sched::signal::{SIGINT, SIGQUIT, SIGTSTP, SIGWINCH};
 use crate::term::cursor::Cursor;
+use crate::term::vc::{
+    K_MEDIUMRAW, K_OFF, K_RAW, K_UNICODE, K_XLATE, KD_GRAPHICS, KD_TEXT, VC_COUNT,
+};
 
 const LF: u8 = b'\n';
 const CR: u8 = b'\r';
@@ -1400,23 +1403,6 @@ pub struct Tty {
     nonblocking: core::sync::atomic::AtomicBool,
 }
 
-/// `KDSETMODE`/`KDGETMODE`: the console's video mode, Linux's values.
-pub const KD_TEXT: u32 = 0x00;
-/// The console is not drawing: a session owns the screen.
-pub const KD_GRAPHICS: u32 = 0x01;
-
-/// `KDSKBMODE`/`KDGKBMODE`: the keyboard's translation mode, Linux's values.
-/// Only two are meaningful to this kernel - `K_XLATE`, the normal text console,
-/// and `K_OFF`, which stops keystrokes reaching the terminal at all. The others
-/// (`K_RAW`, `K_MEDIUMRAW`, `K_UNICODE`) change how bytes are *translated* for
-/// a tty that is reading them, and here the raw scancodes already reach their
-/// consumer through evdev rather than through a tty.
-pub const K_RAW: u32 = 0x00;
-pub const K_XLATE: u32 = 0x01;
-pub const K_MEDIUMRAW: u32 = 0x02;
-pub const K_UNICODE: u32 = 0x03;
-pub const K_OFF: u32 = 0x04;
-
 impl Tty {
     pub const fn new(dev_id: (u32, u32), output: TtyOutput) -> Tty {
         Tty {
@@ -1568,7 +1554,7 @@ impl Tty {
     /// active one rather than a console of its own.
     pub fn vc_number(&self) -> Option<u32> {
         match self.dev_id {
-            (4, n) if (1..=crate::vfs::pty::VC_COUNT).contains(&n) => Some(n),
+            (4, n) if (1..=VC_COUNT).contains(&n) => Some(n),
             // `(4, 0)` is `/dev/tty0`, "the console I am on now", and `(4, 64)`
             // is the boot console's own tty - which is what a seat manager holds
             // before it has asked for a console by number. Both mean the active
@@ -2044,7 +2030,7 @@ impl Tty {
                     return err::EPERM;
                 }
                 let to = buf as u32;
-                if to == 0 || to > crate::vfs::pty::VC_COUNT {
+                if to == 0 || to > VC_COUNT {
                     return err::ENXIO;
                 }
                 if !crate::vfs::vcmux::request_activate(to, false) {
@@ -2076,7 +2062,7 @@ impl Tty {
                 if buf == 0 {
                     return 0;
                 }
-                if buf as u32 > crate::vfs::pty::VC_COUNT {
+                if buf as u32 > VC_COUNT {
                     return err::ENXIO;
                 }
                 crate::vfs::vcmux::wait_active(buf as u32);

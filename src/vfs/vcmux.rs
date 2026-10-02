@@ -60,6 +60,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use critical_section::Mutex as CsMutex;
 
 use crate::sched::policy::TaskId;
+use crate::term::vc::{K_XLATE, KD_GRAPHICS, KD_TEXT, VC_COUNT};
 use crate::vfs::vtmode::{self, Decision, VtMode};
 
 /// The virtual console currently on the wire, 1-based.
@@ -74,15 +75,15 @@ static ACTIVE: AtomicU32 = AtomicU32::new(1);
 /// asking whether a keystroke belongs to a shell. `KDSETMODE` and `KDSKBMODE`
 /// write them, which is what makes a seat's handover mean something instead of
 /// being a request that was accepted and forgotten.
-static KD_MODE: [AtomicU32; crate::vfs::pty::VC_COUNT as usize + 1] =
-    [const { AtomicU32::new(crate::vfs::tty::KD_TEXT) }; crate::vfs::pty::VC_COUNT as usize + 1];
-static KB_MODE: [AtomicU32; crate::vfs::pty::VC_COUNT as usize + 1] =
-    [const { AtomicU32::new(crate::vfs::tty::K_XLATE) }; crate::vfs::pty::VC_COUNT as usize + 1];
+static KD_MODE: [AtomicU32; VC_COUNT as usize + 1] =
+    [const { AtomicU32::new(KD_TEXT) }; VC_COUNT as usize + 1];
+static KB_MODE: [AtomicU32; VC_COUNT as usize + 1] =
+    [const { AtomicU32::new(K_XLATE) }; VC_COUNT as usize + 1];
 
 /// The slot a console's mode lives in, or `None` for a number that is not one
 /// of the consoles this machine has.
 fn slot(vc: u32) -> Option<usize> {
-    if vc == 0 || vc > crate::vfs::pty::VC_COUNT {
+    if vc == 0 || vc > VC_COUNT {
         None
     } else {
         Some(vc as usize)
@@ -110,7 +111,7 @@ pub fn set_kd_mode(vc: u32, mode: u32) -> bool {
 pub fn kd_mode(vc: u32) -> u32 {
     match slot(vc) {
         Some(at) => KD_MODE[at].load(Ordering::Relaxed),
-        None => crate::vfs::tty::KD_TEXT,
+        None => KD_TEXT,
     }
 }
 
@@ -129,7 +130,7 @@ pub fn set_kb_mode(vc: u32, mode: u32) -> bool {
 pub fn kb_mode(vc: u32) -> u32 {
     match slot(vc) {
         Some(at) => KB_MODE[at].load(Ordering::Relaxed),
-        None => crate::vfs::tty::K_XLATE,
+        None => K_XLATE,
     }
 }
 
@@ -167,7 +168,7 @@ pub fn master_holds_screen() -> bool {
 /// the card. A session that owns the screen is the only one the compositor's
 /// frames are for; everything else belongs to the text console.
 pub fn holds_screen(vc: u32) -> bool {
-    master_vc() == Some(vc) && active() == vc && kd_mode(vc) == crate::vfs::tty::KD_GRAPHICS
+    master_vc() == Some(vc) && active() == vc && kd_mode(vc) == KD_GRAPHICS
 }
 
 /// The console a seat manager has made the DRM master's, 0 for nobody.
@@ -388,7 +389,7 @@ pub fn release_ack(vc: u32, agree: bool) -> bool {
 /// keeper writes `VT_AUTO` (`vt_close`), or `kill_pid` fails at the next handover
 /// and `reset_vc` runs - which is [`reset_console`].
 pub fn abandon(vc: u32) {
-    set_kb_mode(vc, crate::vfs::tty::K_XLATE);
+    set_kb_mode(vc, K_XLATE);
     wake_waiters();
 }
 
@@ -447,7 +448,7 @@ fn send_promise(promise: vtmode::Promise) -> bool {
 /// invisible.
 fn reset_console(vc: u32) {
     if vt_with(|t| t.reset(vc)).unwrap_or(false) {
-        set_kd_mode(vc, crate::vfs::tty::KD_TEXT);
+        set_kd_mode(vc, KD_TEXT);
         crate::drivers::video::render::notify();
         wake_waiters();
     }
@@ -587,7 +588,7 @@ fn begin_activate(to: u32) {
 /// one nobody has read from is still free for a seat manager to point a second
 /// session at.
 pub fn free_console() -> Option<u32> {
-    (1..=crate::vfs::pty::VC_COUNT).find(|vc| {
+    (1..=VC_COUNT).find(|vc| {
         crate::vfs::pty::lookup(*vc).is_none_or(|pty| pty.slave().foreground().is_none())
     })
 }
@@ -599,7 +600,7 @@ pub fn init() {
     // would have no console to write it to, because there is no console mux, no
     // pty pairs and nothing to signal.
     critical_section::with(|cs| {
-        *VT.borrow(cs).borrow_mut() = Some(vtmode::Table::new(crate::vfs::pty::VC_COUNT));
+        *VT.borrow(cs).borrow_mut() = Some(vtmode::Table::new(VC_COUNT));
     });
     let id = crate::sched::spawn_permanent(mux_task, crate::sched::Priority::NORMAL);
     MUX_TASK.store(id.0 as u32, Ordering::Relaxed);
@@ -716,7 +717,7 @@ fn forward(byte: u8) {
 }
 
 fn switch(to: u32) {
-    if to > crate::vfs::pty::VC_COUNT {
+    if to > VC_COUNT {
         return;
     }
     ACTIVE.store(to, Ordering::Relaxed);

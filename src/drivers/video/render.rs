@@ -32,8 +32,8 @@ use crate::mm;
 use crate::sched::policy::TaskId;
 use crate::term::blit;
 use crate::term::font::{CELL_H, CELL_W};
+use crate::term::vc::VC_COUNT;
 use crate::term::{self, Cell, DEFAULT_BG, DEFAULT_FG, MAX_ROWS};
-use crate::vfs::pty::VC_COUNT;
 use crate::vfs::vcmux;
 
 /// The minimum ticks between repaints (~31 Hz at 250 Hz): the ceiling that

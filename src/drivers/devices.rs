@@ -208,7 +208,7 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // the console multiplexer holds the masters - typed bytes go to the
     // active console's slave, what its shell prints comes back over the one
     // serial wire.
-    for index in 1..=crate::vfs::pty::VC_COUNT {
+    for index in 1..=crate::term::vc::VC_COUNT {
         dev.register_node(
             &alloc::format!("tty{index}"),
             crate::vfs::pty::vc(index).slave().clone(),

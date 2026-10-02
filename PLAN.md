@@ -720,12 +720,13 @@ it - so the entries say which they are:
       `net`/`vfs`/`drivers` on task exit: `sched → net` is gone (which removed the `net ↔ sched`
       mutual pair, 20 → 19), and the two `crate::drivers::` references left in `runtime.rs` are
       the *execve* `FD_CLOEXEC` pass, a different event, named rather than abstracted (§11.2 Step C)
-- [~] 11.D the terminal emulator and the console mux move out of `vfs` (§11). **Half landed**: the
-      emulator is the `mpos-term` leaf crate (so `console`, `drivers/video` and `vfs::tty` name
-      `crate::term`, and the boundary is a compile error); the console mux and the line discipline
-      stay in `vfs`, because the mux's vocabulary is the vfs's (`pty::VC_COUNT`, `tty::KD_TEXT`,
-      `vtmode`) — moving it means moving that vocabulary first. Recorded as V-4's remaining half in
-      `ARCHITECTURE.md` §9
+- [~] 11.D the terminal emulator and the console mux move out of `vfs` (§11). **Two thirds landed**:
+      the emulator is the `mpos-term` leaf crate (so `console`, `drivers/video` and `vfs::tty` name
+      `crate::term`, and the boundary is a compile error), and — D.1 — the mux's shared *vocabulary*
+      (`VC_COUNT` and the `KD_*`/`K_*` mode words) now lives in `crate::term::vc` rather than in
+      `vfs::pty`/`vfs::tty`, so the drivers stop naming `vfs` for those. What keeps the mux in `vfs`
+      is the file's own `vfs → console`/`vfs → drivers` calls and `vtmode` — D.2. Gate green after the
+      move (`pass=140 fail=0`). Recorded as V-4's remaining half in `ARCHITECTURE.md` §9
 - [x] 11.F the `target_os = "none"` gate gets a written criterion (`src/lib.rs`, `AGENTS.md` §4),
       and the unused host test module behind it is settled: `net/socket.rs`'s three tests were
       never compiled, and their claims are pinned by `t-sockmsg`, which boots, so the module is
@@ -6064,7 +6065,7 @@ gate stayed the guest's: `t-inotify`, `t-evdev`, `t-filelock` and `t-unix-scm` a
 
 ---
 
-#### Step D — Move the terminal emulator out of the VFS (V-4)
+#### Step D — Move the terminal emulator out of the VFS (V-4) — **D.1 LANDED (vocabulary → `crate::term::vc`); D.2 (the `vcmux` file) remains**
 
 Create `src/term/` (grid, keys, font, escape parsing) and `src/console/vcmux`, leaving in `vfs`
 only what is a filesystem fact: `/dev/tty*` and `/dev/pts/*` nodes, the line discipline as the
@@ -6096,15 +6097,32 @@ which is right: the line discipline and the grid must agree about the cursor (§
 finding is that they must not each keep one).
 
 **What remains is the mux, and it is not mechanical.** `vcmux.rs` looks like the same shape and is
-not: it names `vfs::pty::VC_COUNT`, `vfs::tty::{KD_TEXT, K_XLATE, KD_GRAPHICS}` and
-`vfs::vtmode::{self, Decision, VtMode}`, and it reaches *out* to `console::write_bytes`,
-`sched::{spawn_permanent, block_until_deadline, wake, send_signal_process}` and
+not: it reaches *out* to `console::write_bytes`/`vc_output`/`grids_live`, to
+`sched::{spawn_permanent, block_until_deadline, wake, send_signal_process}` and to
 `drivers::{video::render, drm::master_held}`. Moving the file to `console/` would exchange a
-`vfs → console` edge for a `console → vfs` one and leave the pair where it was; what has to move
+`vfs → console` edge for a `console → vfs` one and leave the pair where it was; what had to move
 first is the shared vocabulary — the console count and the KD mode words are console facts that
-`pty`/`tty`/`vtmode` happen to define. That is a refactor in its own commit, and until it happens
-the pair stands. Recorded in `ARCHITECTURE.md` §9 as V-4's remaining half rather than left as a
-step that looks done.
+`pty`/`tty`/`vtmode` happened to define.
+
+**D.1 — the shared vocabulary moved. LANDED (this pass, green).** `VC_COUNT` (was
+`vfs::pty::VC_COUNT`) and the `KD_TEXT`/`KD_GRAPHICS`/`K_RAW`/`K_XLATE`/`K_MEDIUMRAW`/`K_UNICODE`/
+`K_OFF` mode words (were `vfs::tty::*`) now live in `crates/term/src/vc.rs` as `crate::term::vc::*`.
+`term` is a leaf that `vfs`, `console` and the drivers already depend on, so naming it is downward
+for all of them — this is the prerequisite the paragraph above named, and it is what lets the next
+sub-commit move the `vcmux` *file* without re-creating the pair. A pure relocation: `drivers/video`,
+`drivers/devices` and `drivers/virtio/input` stop naming `vfs::pty`/`vfs::tty` for these constants;
+`vfs::{tty,pty,vcmux}` name `crate::term::vc` instead. Verified behaviour-preserving — bare-metal
+build green, host suite unchanged at `528 passed`, `cargo xtask depgraph` reports "no edge appeared
+and no count has grown" (`crate::term` stays out of the mutual-pair set, and `vfs/mod.rs →
+drivers|net` stays 0), and the full gate ends `=== SUMMARY pass=140 fail=0`, exit **33**, with
+`t-seat`/`t-tty-eintr`/`t-tty-vtime`/`t-tty-query`/`t-ioctl`/`t-drm-lease` (the programs that read
+the KD/KD-mode state through the moved path) all `=== PASS`.
+
+**Remaining (D.2).** With the vocabulary out of the way, `vcmux.rs` still forms the pair through its
+`vfs → console` *calls* and `vfs → drivers` *calls*, and through `vfs::vtmode::{self, Decision,
+VtMode}` (the handover table, whose vocabulary is the next thing to settle). That is a refactor in its
+own commit, and until it happens the pair stands. Recorded in `ARCHITECTURE.md` §9 as V-4's remaining
+half rather than left as a step that looks done.
 
 ---
 
@@ -6249,7 +6267,9 @@ shown able to go red on each of the three rules.
    share of the cluster, not the downcasts'.
 4. ~~**Step C** — the resource registry.~~ **Done** (§11.2 Step C): the exit hooks live in
    `sched::exit`, registered by `main.rs`, and the `net ↔ sched` pair is gone.
-5. **Step D** — the terminal emulator move.
+5. **Step D** — the terminal emulator move. **D.1 landed** (the shared VC vocabulary — `VC_COUNT`
+   and the KD/K mode words — moved from `vfs` to `crate::term::vc`, gate green `pass=140 fail=0`);
+   **D.2 remains** (the `vcmux` file itself and its `vfs → console`/`vfs → drivers` calls).
 6. **Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.
 7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the
    criterion is in `src/lib.rs`/`AGENTS.md`, the dead test module is deleted with its coverage
