@@ -1114,6 +1114,13 @@ struct Task {
     /// `getcwd` reports. `None` means "never left /", which is the truth for
     /// every task that has not asked to be anywhere else.
     cwd_path: Option<alloc::string::String>,
+    /// The directory this task's absolute paths begin at - the root it sees,
+    /// not the machine's. `None` is the machine root, which is where every task
+    /// starts; `chroot(2)` sets it, and `fork`/`clone` hand it on by reference so
+    /// a chrooted pid 1 re-homes the whole userspace tree by inheritance rather
+    /// than by moving the machine's root. This is what keeps an unprivileged
+    /// `chroot` inside its caller.
+    root: Option<Arc<dyn crate::vfs::Inode>>,
     /// The task that spawned this one in ring 3, if any. Its `wait` blocks on
     /// this task's exit; kernel-spawned tasks have none.
     parent: Option<TaskId>,
@@ -1432,6 +1439,7 @@ impl Task {
             fds: crate::vfs::file::kernel_fds(),
             cwd: None,
             cwd_path: None,
+            root: None,
             parent: None,
             pgid: TaskId(0),
             session: TaskId(0),
@@ -1895,6 +1903,7 @@ impl Table {
             fds: crate::vfs::file::kernel_fds(),
             cwd: None,
             cwd_path: None,
+            root: None,
             parent: None,
             pgid: TaskId(0),
             session: TaskId(0),
@@ -2335,6 +2344,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             fds: Arc::new(FdTable::with_standard(crate::vfs::tty::global())),
             cwd: None,
             cwd_path: None,
+            root: None,
             parent: None,
             // init leads the first process group, so a command started
             // before any job control exists still has a group to land in.
@@ -2486,6 +2496,7 @@ pub fn try_spawn_user(
             fds,
             cwd: t.task(parent).cwd.clone(),
             cwd_path: t.task(parent).cwd_path.clone(),
+            root: t.task(parent).root.clone(),
             parent: Some(parent),
             pgid: t.task(parent).pgid,
             session: t.task(parent).session,
@@ -2903,7 +2914,11 @@ fn interpreter_bytes(image: &Image<'_>) -> Result<Option<(Vec<u8>, String)>, Spa
     // A missing or unreadable interpreter reads as "the file was not found":
     // the program itself was fine, and what could not be followed is the path
     // it names.
-    crate::vfs::read_file(path)
+    // The loader is resolved through the *calling task's* root, not the
+    // machine's: a dynamically-linked program exec'd inside a `chroot` finds its
+    // `PT_INTERP` there. A boot spawn has no chroot, so `current_root` falls back
+    // to the machine root and the resolution is exactly as global as it was.
+    crate::vfs::read_file_opt(path, Some(current_cwd()))
         .map(|bytes| Some((bytes, String::from(path))))
         .map_err(|_| SpawnError::NoInterpreter)
 }
@@ -3351,6 +3366,24 @@ pub fn current_cwd() -> Arc<dyn crate::vfs::Inode> {
 /// caller; this only remembers.
 pub fn set_cwd(dir: Arc<dyn crate::vfs::Inode>) {
     with_table(|t| t.task_mut(t.current).cwd = Some(dir));
+}
+
+/// The directory this task's absolute paths begin at - the root `chroot(2)`
+/// gave it, or the machine's root when it never called one. The `None` fallback
+/// is what lets a task exist before the VFS is mounted, exactly as `current_cwd`
+/// does.
+pub fn current_root() -> Arc<dyn crate::vfs::Inode> {
+    with_table(|t| match &t.task(t.current).root {
+        Some(dir) => dir.clone(),
+        None => crate::vfs::global().root_inode(),
+    })
+}
+
+/// Re-home the running task: make `dir` the root its absolute paths begin at.
+/// Checked to be a directory by the caller; this only remembers. The machine's
+/// own root is left standing - this is a per-process view, not a namespace.
+pub fn set_root(dir: Arc<dyn crate::vfs::Inode>) {
+    with_table(|t| t.task_mut(t.current).root = Some(dir));
 }
 
 /// The path the running task's cwd was reached by, or "/" when it has never
@@ -7265,6 +7298,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         parent_fds,
         parent_cwd,
         parent_cwd_path,
+        parent_root,
         parent_exe,
         parent_argv,
         parent_brk_base,
@@ -7282,6 +7316,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         let parent_fds = Arc::clone(&parent.fds);
         let parent_cwd = parent.cwd.clone();
         let parent_cwd_path = parent.cwd_path.clone();
+        let parent_root = parent.root.clone();
         let parent_exe = parent.exe.clone();
         let parent_argv = alloc::sync::Arc::clone(&parent.argv);
         let parent_brk_base = parent.brk_base;
@@ -7315,6 +7350,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             parent_fds,
             parent_cwd,
             parent_cwd_path,
+            parent_root,
             parent_exe,
             parent_argv,
             parent_brk_base,
@@ -7482,6 +7518,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             fds: Arc::new(parent_fds.duplicate()),
             cwd: parent_cwd,
             cwd_path: parent_cwd_path,
+            root: parent_root,
             parent: Some(parent_id),
             pgid: t.task(parent_id).pgid,
             // A fork child is in the same session as its parent and holds the
@@ -7991,6 +8028,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let blocked = parent.blocked;
         let cwd = parent.cwd.clone();
         let cwd_path = parent.cwd_path.clone();
+        let root = parent.root.clone();
         let brk_base = parent.brk_base;
         let brk_pages = parent.brk_pages;
         let mmap_cursor = parent.mmap_cursor;
@@ -8057,6 +8095,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             fds,
             cwd,
             cwd_path,
+            root,
             // Not a child: `wait` collects processes, and a thread is not one.
             // The process becomes collectable when its leader exits.
             parent: None,

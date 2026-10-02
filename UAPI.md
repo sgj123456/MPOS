@@ -92,6 +92,7 @@ contract is not. Each is tracked in its phase section; the list is here so it is
 | `setxattr` family | arguments validated, then `EOPNOTSUPP`: no filesystem here stores xattrs | `PLAN.md` Remaining ABI |
 | `ptrace` | `PTRACE_EVENT_SECCOMP` refused (no tracer stop); `PTRACE_SETSIGINFO` validates then `EOPNOTSUPP` (no siginfo carried through a stop) | `PLAN.md` §8.2, §12.1 A7 |
 | `unshare` / `setns` | UTS served; MNT/PID/NET (and USER/IPC/CGROUP/TIME) refused `EOPNOTSUPP`; `setns` cannot name a namespace by descriptor | `PLAN.md` §6.3 |
+| `pivot_root` | `chroot(2)` is now per-process — the task carries its own root and the path walk jails to it (`t-chroot`); `pivot_root(2)` and `MS_MOVE` still act on the single global mount table, which *is* Linux's answer with one mount namespace, and only become per-process with `unshare(CLONE_NEWNS)` | `PLAN.md` §6.3 |
 | `process_vm_readv` / `writev` | served for the address transfer, and now gated by `ptrace_may_access` — a caller must share a uid with the target (or hold `CAP_SYS_PTRACE`) and the target must be dumpable. Linux's group-id comparison and its LSM hook are not modelled | §5.1 |
 | `/proc/<pid>/maps` | served; an image's and a private file mapping's line carries no `offset`/`inode`; `smaps`/`numa_maps` are not written | `PLAN.md` §7.4 |
 

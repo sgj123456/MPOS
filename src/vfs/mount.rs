@@ -509,16 +509,6 @@ impl Vfs {
         })
     }
 
-    /// Make `inode` the global root, dropping every mount. `chroot(2)`'s
-    /// shape: the caller has already decided what the root is, and this
-    /// kernel has one namespace.
-    pub fn set_global_root(&self, inode: Arc<dyn Inode>) {
-        critical_section::with(|cs| {
-            *self.root.borrow(cs).borrow_mut() = Some(inode);
-        });
-        self.refresh_mount_points();
-    }
-
     /// `mount(2)`'s MS_MOVE: the filesystem mounted at `at` becomes the root.
     /// The mount entry moves out of the table and into the root slot.
     ///
@@ -1682,17 +1672,16 @@ pub fn fs_id_of_inode(inode: &Arc<dyn Inode>) -> u64 {
     })
 }
 
-/// Make `inode` the root of the namespace, as `chroot(2)` asks. The kernel
-/// has one namespace, so this is a whole-namespace answer rather than a
-/// per-process one - which is exactly what an initramfs's `switch_root`
-/// wants, being pid 1 and alone.
-pub fn chroot(path: &str, cwd: &Arc<dyn Inode>) -> VfsResult<()> {
+/// The directory `chroot(2)` names, resolved against the caller's current root
+/// and checked to be a directory. Making it the caller's root is the handler's
+/// job (a per-process view held in `sched`); this only answers *which* inode and
+/// refuses a non-directory, so it can name nothing outside the process's tree.
+pub fn chroot_target(path: &str, cwd: &Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
     let inode = resolve_opt(path, Some(cwd.clone()))?;
     if inode.metadata().kind != NodeKind::Dir {
         return Err(VfsError::NotDir);
     }
-    STATIC.set_global_root(inode);
-    Ok(())
+    Ok(inode)
 }
 
 /// `mount(2)`'s MS_MOVE, free-function spelling: the filesystem mounted at
@@ -1706,15 +1695,34 @@ pub fn move_mount(source: &Arc<dyn Inode>, at: &Arc<dyn Inode>) -> VfsResult<()>
     STATIC.move_mount(source, at)
 }
 
-/// Resolve `path` in the kernel's tree.
+/// Resolve `path` in the kernel's (machine's) tree. The boot code, which runs
+/// before any task exists and so has no per-process root, starts every walk
+/// here; a syscall resolves against its caller's root through `resolve_at`.
 pub fn resolve(path: &str) -> VfsResult<Arc<dyn Inode>> {
     STATIC.resolve(path)
 }
 
-/// Resolve `path` starting from `start` - a process's cwd. An absolute path
-/// ignores the start and begins at the root, as `/` must.
+/// Resolve `path` starting from `start` - a process's cwd - and jailed to that
+/// process's root. An absolute path ignores the start and begins at the caller's
+/// `chroot` root (the machine's root for any task that never called one), as `/`
+/// must, and a `..` at that root stays there rather than climbing out.
 pub fn resolve_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
-    STATIC.resolve_from(path, start)
+    STATIC.resolve_walk(path, start, process_root().or_else(|| STATIC.root_opt()))
+}
+
+/// The calling task's root, jailed absolute paths begin at. `None` off the
+/// machine: the VFS compiles for the host so its tree logic is unit-testable,
+/// but the running task's root is a scheduler fact that only exists there, and no
+/// host test drives a per-process lookup - it resolves through the `Vfs` methods
+/// against an explicit tree.
+#[cfg(target_os = "none")]
+fn process_root() -> Option<Arc<dyn Inode>> {
+    Some(crate::sched::current_root())
+}
+
+#[cfg(not(target_os = "none"))]
+fn process_root() -> Option<Arc<dyn Inode>> {
+    None
 }
 
 #[cfg(all(test, not(target_os = "none")))]

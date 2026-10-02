@@ -1035,9 +1035,10 @@ things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
    (`clone(CLONE_NEWUTS)`; the six thread-group flags for a caller that has
    siblings; `setns`, which still cannot name a namespace; the sysctl files,
    which procfs does not mode-police). **MNT is next** and is the one containers
-   actually need; its prerequisite is the interesting part - a per-process root,
-   which is a divergence worth fixing on its own, since `chroot` here moves the
-   whole machine's.
+   actually need; its prerequisite — a per-process root, worth fixing on its own
+   since `chroot` here used to move the whole machine's — **has landed**: a task
+   carries its own root and the path walk jails to it (`t-chroot`). What is left
+   of MNT is moving the mount *table* onto the task and `unshare(CLONE_NEWNS)`.
    `seccomp` FILTER's plumbing - the per-task list, the two install paths and
    the gate - has landed, was then measured action by action against Linux
    (four of its answers were wrong), and is pinned by `t-seccomp`. What is left
@@ -2413,18 +2414,24 @@ is invisible to the parent. This is the one whose whole cost is the plumbing;
 it is first because it is small, and because it is the shape every other
 namespace repeats.
 
-**MNT: the one that costs the VFS.** The mount table is a single global
-(`vfs::mount::STATIC`) with a single root, and `chroot(2)` moves *the machine's*
-root (`set_global_root`'s own comment says "this kernel has one namespace").
-That last part is the prerequisite the item was deferred on, and it is a
-divergence in its own right - a `chroot` that every process sees is not
-`chroot(2)`. So the order inside this step is: the root and the mount table move
-onto the task (a `Arc<MountNamespace>` holding the root and the entry table),
-resolution asks *the caller's* namespace instead of the static, and
-`unshare(CLONE_NEWNS)` clones the tree the way `copy_mnt_ns` does - a `mount` in
-the child is then invisible to the parent, and `chroot`/`pivot_root` act on the
-namespace rather than the machine, which is what gives a container its own `/`.
-Two things stay named refusals rather than silent half-answers: **mount
+**MNT: the one that costs the VFS — the root half has landed, the table has not.**
+The per-process *root* — the prerequisite this whole item was deferred on — is
+done. A task carries its own root (`sched::Task.root`, inherited on `fork`/`clone`,
+set by `chroot(2)` through `sched::set_root`), and the one absolute-path walk
+(`Vfs::resolve_walk`) begins, clamps `..`, and restarts absolute symlinks at *the
+caller's* root rather than the machine's. A `chroot` now re-homes the calling
+process and its future children — `t-chroot` has a child chroot, confirm its jail,
+and prove the parent's view of the same `/tmp` is untouched, the `t-ns-uts` shape
+for a per-task view. `set_global_root` is gone; what the boot's `switch_root` used
+it for it now gets by inheritance (pid 1 is every process's ancestor). **The mount
+table is still a single global**, and `pivot_root(2)`/`MS_MOVE` act on it
+machine-wide — which *is* Linux's answer with one mount namespace, and stays
+named until the next step. What is left: move the table onto the task too (an
+`Arc<MountNamespace>` holding the entries, the root having already moved), have
+resolution ask *the caller's* namespace for its mounts, and let
+`unshare(CLONE_NEWNS)` clone the tree the way `copy_mnt_ns` does — a `mount` in the
+child then invisible to the parent, and `pivot_root` per-namespace, which is what
+gives a container its own `/`. Two things stay named refusals rather than silent half-answers: **mount
 propagation** (`MS_SHARED`/`MS_PRIVATE`/`MS_SLAVE` - a mount event crossing
 namespaces is a second mechanism, and ignoring the flag would silently change
 what "unshare" meant), and **`/proc/mounts`** having to render the reader's

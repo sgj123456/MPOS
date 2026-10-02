@@ -2099,23 +2099,27 @@ pub fn next_anon_ino() -> crate::vfs::Ino {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// `chroot(path)` - make `path` the root of the namespace.
+/// `chroot(path)` - make `path` the calling task's root, not the machine's.
 ///
-/// `switch_root`'s second step: it has already emptied the initramfs and
-/// moved the new root over `/`, and this call drops the process's remaining
-/// claim on the old tree. The kernel has one namespace, so the answer here is
-/// whole-namespace - which is what the caller wants, being pid 1 and alone.
+/// Linux's `chroot` re-homes the process, not the namespace: the root it moves is
+/// the caller's own view, and a `..` at that root stays there. `switch_root` uses
+/// this and still works unchanged because it is pid 1 - every process that comes
+/// after inherits the new root on `fork`, so the whole userspace tree sees it
+/// without the machine root ever moving. The kernel keeps the caller's cwd inside
+/// the new root as a convenience (Linux leaves `cwd` alone; a process with a stale
+/// cwd outside the root can still walk back to it - `t-chroot` pins that this
+/// implementation is the confined case, and a named divergence that it does not
+/// mimic Linux's unconfined one).
 pub fn handle_chroot(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let path = match cstr_arg(args[0], true) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match crate::vfs::mount::chroot(&path, cwd) {
-        Ok(()) => {
-            if let Ok(root) = crate::vfs::resolve("/") {
-                crate::sched::set_cwd(root);
-                crate::sched::set_cwd_path(alloc::string::String::from("/"));
-            }
+    match crate::vfs::mount::chroot_target(&path, cwd) {
+        Ok(inode) => {
+            crate::sched::set_root(inode.clone());
+            crate::sched::set_cwd(inode);
+            crate::sched::set_cwd_path(alloc::string::String::from("/"));
             0
         }
         Err(e) => err_of(e),

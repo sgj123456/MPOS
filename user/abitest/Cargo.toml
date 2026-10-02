@@ -354,6 +354,10 @@ name = "t-ns-uts"
 path = "src/bin/syscall/t-ns-uts.rs"
 
 [[bin]]
+name = "t-chroot"
+path = "src/bin/syscall/t-chroot.rs"
+
+[[bin]]
 name = "t-openat"
 path = "src/bin/syscall/t-openat.rs"
 

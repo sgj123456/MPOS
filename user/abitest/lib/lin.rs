@@ -1828,6 +1828,13 @@ pub fn chdir(path: &[u8]) -> isize {
     sys1(nr::CHDIR, path.as_ptr() as usize)
 }
 
+/// Make `path` the calling process's root - what absolute paths begin at and
+/// what `..` at the top clamps to. It does not move the machine's root, and it
+/// does not by itself move the cwd; the caller `chdir("/")` after it.
+pub fn chroot(path: &[u8]) -> isize {
+    sys1(nr::CHROOT, path.as_ptr() as usize)
+}
+
 /// Move to the directory the descriptor names.
 pub fn fchdir(fd: i32) -> isize {
     sys1(nr::FCHDIR, fd as usize)
