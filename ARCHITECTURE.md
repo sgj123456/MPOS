@@ -426,23 +426,35 @@ flowchart TB
     end
 ```
 
-The gate is a **per-module judgement, not a rule**, and it is applied unevenly: `vfs::epoll`
-and `vfs::pipe` are host-compiled while `vfs::memfd` is gated; `vfs::devfs` is host-compiled
-while `vfs::vcmux` is not. The intent is right — pure logic goes in the host-tested half, and
-anything needing port I/O, a virtio ring or a real clock stays out — but there is no written
-criterion, so the split depends on who wrote which module. `AGENTS.md` records the intent as
-a convention; `PLAN.md` Phase 11 (item F) is where formalising it lives.
+The gate is a **per-module judgement**, and the criterion it is made with is written down in
+`src/lib.rs`'s header and `AGENTS.md` §4 (Step F): a module is host-compiled when its logic
+touches no hardware, no port I/O, no virtio ring and no real clock — and then its dependencies
+must be host-compiled too, transitively. The *intent* was always right and the split is still
+uneven (`vfs::epoll` and `vfs::pipe` are host-compiled while `vfs::memfd` is gated; `vfs::devfs`
+is host-compiled while `vfs::vcmux` is not), but the rule behind the unevenness is no longer
+unwritten, which is what made the split depend on who wrote which module.
 
-491 `#[test]` functions live in `src/` (plus 25 in `xtask/`), concentrated in `vfs` (21 files),
-`vfs/ext4` (9) and `vfs/term` (3). The kernel is 79 095 lines across 116 `.rs` files.
+The transitive half is the one the compiler cannot check, so `cargo xtask test` opens with a
+mechanical one: `xtask/src/gates.rs::dead_host_tests` walks `src/lib.rs`'s `mod` declarations,
+carries each module's gate down to the file it resolves to, and fails on a `#[cfg(test)]` module
+inside a `target_os = "none"` one. It has its own counterfactual tests — a two-file tree of one
+gated and one ungated file, where the same annotation must be reported for the first and not the
+second — because a checker that has stopped being able to tell the two apart would report a clean
+tree.
 
-**A gate and a test annotation can disagree, and here is one that does.**
-`src/lib.rs` declares `#[cfg(target_os = "none")] pub mod net;` — the whole module is absent
-from a host build — while `src/net/socket.rs:3527` annotates its test module
-`#[cfg(all(test, not(target_os = "none")))]`, i.e. "run me on the host". The annotation is
-honoured only in a build that never includes the file, so those three tests have never run.
-This is the cost of the gate being a per-module judgement: the compiler cannot complain about
-a `cfg` that is always false.
+Measured 2026-10-02: 635 `#[test]` functions in `src/` (plus 42 in `xtask/`), 104 030 lines across
+125 `.rs` files.
+
+**V-11 is closed, and the case it was found on turned out to be a duplicate.** `src/lib.rs`
+declares `#[cfg(target_os = "none")] pub mod net;`, so the whole module is absent from a host
+build — while `src/net/socket.rs` annotated a test module `#[cfg(all(test, not(target_os =
+"none")))]`, i.e. "run me on the host". The annotation was honoured only in a build that never
+included the file, so those three tests never ran once. Settling it took reading what they pinned
+rather than wishing them alive: `send`/`recv` and the `sendmsg`/`recvmsg` shapes on a `socketpair`,
+and its refusals (`EISCONN`, `MSG_DONTWAIT`/`EAGAIN`) are pinned line for line by
+`user/tests/src/bin/t-sockmsg.rs`, a program the sweep boots. The module was deleted and the
+coverage is where it always actually was; the point of the check above is that the next one of
+these is a red gate rather than a silent three tests nobody counts.
 
 ---
 
@@ -464,7 +476,7 @@ are items this table caught and later work closed; an *Open* or *Widened* row is
 | V-8 | Cross-architecture config pointed at a missing file | `.cargo/config.toml` set `link-arg=--script=arch/aarch64/linker.ld`; only `arch/x86_64/linker.ld` exists, so the `aarch64-unknown-none` build could not link | **Done** (Phase 11 A) — the profile is gone, and `PLAN.md` §9.1 keeps what a port needs |
 | V-9 | The network layer validates user pointers with the syscall layer's helper | **Closed by B3.** `buffer_ok`/`user_accessible`/`MAX_IO`/`err_of` moved to the crate-root leaf `src/uaccess.rs`; the 99 below-`syscall` call-sites in `net/{socket,unix,packet,vsock}.rs` and `drivers/drm.rs` now name `crate::uaccess::*`, so no layer below `syscall` reaches up for a page walk or an errno mapping. `syscall` re-exports the same names for its own handlers, and the bare-metal build is green (the `cfg(target_os = "none")` split of `err_of`/`user_accessible` moved intact — V-11's lesson held) | **Done** (Phase 11 B3) |
 | V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | Accepted by design; document only |
-| V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs:3527` is `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs:48` gates `pub mod net` on `target_os = "none"`; 3 tests never run | Phase 11 F |
+| V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs` was `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs` gated `pub mod net` on `target_os = "none"`; 3 tests never ran. **Closed by Step F**: the module was deleted (its three claims are pinned by `user/tests/src/bin/t-sockmsg.rs`, which boots), the criterion is written down (`src/lib.rs`, `AGENTS.md` §4), and `xtask/src/gates.rs::dead_host_tests` — run at the head of `cargo xtask test` — now fails on the shape | **Done** (Phase 11 F) |
 | V-12 | The tree was mid-refactor and did not build for the host | The uncommitted work renamed `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edited `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` failed to compile | **Resolved** — finished and committed; the gate is green (`PLAN.md` §11.1.12) |
 | V-13 | Memory knows about files: `mm` calls up into `vfs` | `src/mm/vma.rs:28` does `use crate::vfs::Inode;` (file-backed VMAs name an inode), committed in eb4b337 after this audit — the `AGENTS.md` boundary table says `mm` may depend on `boot` only. The file-backed mapping needs *a* mapped-object trait; `Inode` is the wrong one to name | Open — Phase 11 should fold this into the `mm`/`vfs` seam work; no new callers allowed |
 | V-14 | The uevent bus reached up into `syscall` and `sched` | Found at the AF_PACKET/sound re-audit: `uevent.rs` used `crate::syscall::err` for its refusals and a `self_cred()` that read the task table (`crate::sched::current_real_owner`/`current_tgid`) — a service naming the ABI layer violated §9's own acceptance rule, and the task-table reach made the bus untestable in isolation | **Done** — the errno table moved to the crate root (`src/err.rs`, re-exported through `syscall`), and credentials/the preferred bind port id are now assembled by the caller `net::socket::task_identity` (allowed `net→sched`) and passed in as plain values; `uevent` compiles on the host with no upward edge |

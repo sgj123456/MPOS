@@ -51,6 +51,7 @@ pub struct Selection {
 }
 
 pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Result<()> {
+    check_target_gates()?;
     run_unit_tests()?;
     println!();
 
@@ -121,6 +122,33 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Resul
     let (status, log) = boot_tests(build_dir, profile, &tar)?;
 
     report(&tests, built.len(), &log, status)
+}
+
+/// The structural check that belongs ahead of the compiler: a `#[cfg(test)]`
+/// module whose file only a `target_os = "none"` build reaches has never run,
+/// and nothing else in this pipeline would ever say so (`PLAN.md` §11.2 Step F,
+/// the V-11 class). Cheap enough to run on every sweep - it reads `src/*.rs`
+/// and matches attributes - and loud when it fires, because the alternative is
+/// a test count that looks like coverage.
+fn check_target_gates() -> Result<()> {
+    println!("Target gates: every test module is one the host compiles");
+    let dead = crate::gates::dead_host_tests(&utils::project_root()?)?;
+    if dead.is_empty() {
+        return Ok(());
+    }
+    for test in &dead {
+        eprintln!(
+            "  {}:{} is inside `{}`, which no host build compiles",
+            test.file.display(),
+            test.line,
+            test.gated_by
+        );
+    }
+    bail!(
+        "{} test module(s) can never run; host-compile the file or move the pins \
+         to a program that boots (PLAN.md §11.2 Step F)",
+        dead.len()
+    );
 }
 
 /// The arch-independent kernel, tested on the host. `--target` is explicit

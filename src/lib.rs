@@ -8,6 +8,23 @@
 //! Machine-dependent code (`arch`, the console, the boot handoff) is compiled
 //! only for `target_os = "none"`, which is what keeps the host build free of
 //! port I/O, descriptor tables and firmware calls.
+//!
+//! # Which half a module belongs in
+//!
+//! The gate below is a judgement made per module, so the criterion it is made
+//! with is written down here (`PLAN.md` §11.2 Step F):
+//!
+//! > A module is host-compiled when its logic touches no hardware, no port I/O,
+//! > no virtio ring and no real clock — and then *its dependencies must be
+//! > host-compiled too, transitively*.
+//!
+//! The second half is the one that gets forgotten, and the compiler cannot
+//! notice when it is, because the failure is silent in both directions: a
+//! `#[cfg(test)]` module written behind one of these gates is dead code that
+//! reads as a passing test, and a `crate::` reference to a gated module from a
+//! host-compiled one is a build error only on the day somebody builds for the
+//! host. `xtask`'s `gates::dead_host_tests`, run by `cargo xtask test`, walks
+//! this file's `mod` declarations and fails on the first shape.
 
 #![no_std]
 #![cfg_attr(

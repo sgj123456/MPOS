@@ -7,6 +7,7 @@
 
 mod config;
 mod disk;
+mod gates;
 mod initramfs;
 mod qemu;
 mod rootfs;

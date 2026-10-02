@@ -650,7 +650,7 @@ it - so the entries say which they are:
 **Architectures (Phase 9 — far future)**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
-**Architecture debt (Phase 11 — audit done, Step A landed)**
+**Architecture debt (Phase 11 — audit done, Steps A/E/F landed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
@@ -671,8 +671,10 @@ it - so the entries say which they are:
 - [ ] 11.C per-open-file resources get a registry, so `sched` stops naming `net`/`vfs`/`drivers`
       on task exit (§11)
 - [ ] 11.D the terminal emulator and the console mux move out of `vfs` (§11)
-- [ ] 11.F the `target_os = "none"` gate gets a written criterion, and the unused host test
-      module behind it is settled (§11)
+- [x] 11.F the `target_os = "none"` gate gets a written criterion (`src/lib.rs`, `AGENTS.md` §4),
+      and the unused host test module behind it is settled: `net/socket.rs`'s three tests were
+      never compiled, and their claims are pinned by `t-sockmsg`, which boots, so the module is
+      gone. `xtask/src/gates.rs` fails the gate on the shape from now on (§11.2 Step F)
 - [ ] 11.G a depgraph ratchet, so the measured cycle count cannot grow back (§11)
 
 **ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
@@ -5414,7 +5416,7 @@ latency bug that only shows under load, which is where it will be found first.
 
 ---
 
-## Phase 11: Architectural Debt — **AUDIT DONE, NOTHING FIXED**
+## Phase 11: Architectural Debt — **AUDIT DONE; STEPS A, E AND F LANDED**
 
 Everything above this phase is about *features*: what the kernel cannot yet do. This phase is
 about the *shape* of the kernel that does them, and it opens with a measurement rather than an
@@ -5423,7 +5425,10 @@ opinion, because "bad architecture" is not a finding until something counts it.
 `ARCHITECTURE.md` is the companion document: it draws the module graph, the boot sequence and
 the syscall path, and its §9 mirrors the findings below. This section is the work list.
 
-**Nothing in this phase has been implemented.** No file was edited to produce it. It is a plan.
+**The audit itself was written without editing a file** — every finding below was read out of the
+tree, and each says where. What has landed since is marked on the finding and on the step: **A**
+(the dead modules and the leftover trace), **E** (the seven pure leaves as crates) and **F** (the
+gate's written criterion and the check for it). B, C, D and G are open.
 
 ---
 
@@ -5638,14 +5643,23 @@ port nobody has started, and this step is subtraction.
 — the loader is a UEFI application on a different target and cannot link the kernel crate — and
 it is documented on both sides. Recorded so it reads as a decision rather than an oversight.
 
-#### 11.1.10 — V-11: a host test module behind a never-host-compiled parent (severity: low)
+#### 11.1.10 — V-11: a host test module behind a never-host-compiled parent (severity: low) — **DONE**
 
-`src/lib.rs:48` gates `pub mod net` on `target_os = "none"`, so the module is absent from every
-host build — while `src/net/socket.rs:3527` annotates its test module
-`#[cfg(all(test, not(target_os = "none")))]`, i.e. "run me on the host". The annotation is only
-ever evaluated in a build that does not include the file, so those three tests have never run.
+`src/lib.rs` gates `pub mod net` on `target_os = "none"`, so the module is absent from every
+host build — while `src/net/socket.rs` annotated a test module
+`#[cfg(all(test, not(target_os = "none")))]`, i.e. "run me on the host". The annotation was only
+ever evaluated in a build that did not include the file, so those three tests had never run.
 `net`'s doc comment says its tests "are the conformance programs that run on the machine",
-which is true of the rest of `net` and false of this file.
+which is true of the rest of `net` and was false of this file.
+
+**Settled by Step F, and the reading that settled it was of what the three tests pinned rather
+than of how to make them run.** They were `send`/`recv` on a `socketpair`, the
+`sendmsg`/`recvmsg` shapes on the same channel, and its two refusals (`EISCONN` for a
+destination, `EAGAIN` for `MSG_DONTWAIT` on an empty one) — and every one of those is pinned,
+line for line and in more detail, by `user/tests/src/bin/t-sockmsg.rs`, a program the sweep
+*does* boot (its own header names the caller it exists for: sudo's monitor channel). The module
+is deleted, the pins are where they always actually were, and the criterion and its mechanical
+check are §11.2 Step F's below.
 
 #### 11.1.11 — Sizes, for the record
 
@@ -5885,7 +5899,10 @@ unchanged.
 
 ---
 
-#### Step F — Make the target gate a rule, not a habit (V-11 + the `ARCHITECTURE.md` §8 drift)
+#### Step F — Make the target gate a rule, not a habit (V-11 + the `ARCHITECTURE.md` §8 drift) — **DONE**
+
+*The one step in this phase that is pure rule-making: it changes no behaviour and removes no
+cycle, and it exists because the gate's failures are silent.*
 
 1. Settle the `net` case: either declare `pub mod net` for the host too — which means moving the
    pure parts of `net/socket.rs` out from under the gate, since `smoltcp` is gated in
@@ -5901,6 +5918,42 @@ unchanged.
 
 **Acceptance:** the check fails on today's `net/socket.rs` and passes after the fix;
 `cargo test -p mpos-xtask` covers it.
+
+**Done, and the three answers the step asked for.**
+
+*Which way `net` went, and why it is the cheap way rather than the lazy one.* The plan offered
+"host-compile it, or delete the module and say so" as if they were equivalents; they are not, and
+the tie-breaker was coverage rather than effort. Making `net` host-compilable means a device seam
+for `drivers::virtio::net::VirtioNet` and a clock seam for `arch::timer` (10 machine references
+across `net/mod.rs`, `net/socket.rs` and `net/vsock.rs`, plus `smoltcp` moved out from under the
+`target_os = "none"` dependency) — real Phase-11 B work, not Step F work. The three tests, read
+instead of assumed, turned out to be `t-sockmsg`'s subject: `user/tests/src/bin/t-sockmsg.rs`
+pins `send`/`recv` both ways, the `sendmsg`/`recvmsg` gather and its "no address, no control
+data, no flags" answer, `MSG_DONTWAIT` on an empty pair as `EAGAIN`, and a destination on a
+connected pair as `EISCONN` — the same four claims, in a program that boots. So the module is
+deleted and §11.1.10 records where its coverage lives; a comment at the end of `net/socket.rs`
+says the same to the next reader, and names the check that keeps a fourth from being written.
+
+*The criterion is written down in one place and named from the others*: `src/lib.rs`'s header
+carries it (with the transitive half spelled out and the two ways it fails silently), `AGENTS.md`
+§4 points at it and keeps its "when you gate a module, check what gates its tests" instruction,
+and `ARCHITECTURE.md` §8 states it and records V-11's closure.
+
+*The check is `xtask/src/gates.rs`, and it is pinned against itself.* `dead_host_tests` walks
+`src/lib.rs`'s `mod` declarations, resolves each to `dir/name.rs` or `dir/name/mod.rs` the way
+the compiler does, and carries the gate down — so a file under an ungated-but-gated-child module
+is caught as well as one declared gated directly. It is run at the head of `cargo xtask test`,
+so the failure is a named error rather than a test count nobody reads, and its four unit tests
+include the counterfactual this kind of checker needs: a two-file tree with the *same*
+`#[cfg(all(test, not(target_os = "none")))]` in one gated and one ungated file, where the first
+must be reported and the second must not. Two more pin the gate arithmetic — the ungated sibling,
+and the boot handoff's own `#[cfg(all(any(target_os = "none", test), target_arch = "x86_64"))]`,
+which names the host by way of `test` and so must *not* read as machine-only.
+
+*Verified, in the counterfactual order the plan asked for:* with the check in place and the module
+still present, `cargo test -p mpos-xtask` failed on exactly one violation — `src/net/socket.rs`,
+gated by `crate::net::socket`; after the deletion the same command is `42 passed`, the bare-metal
+build is green with the same single pre-existing warning, and the host kernel suite is unchanged.
 
 ---
 
@@ -5937,11 +5990,14 @@ either worsens.
 4. **Step C** — the resource registry.
 5. **Step D** — the terminal emulator move.
 6. **Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.
-7. **Step F** — the gate criterion and the check for it.
+7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the
+   criterion is in `src/lib.rs`/`AGENTS.md`, the dead test module is deleted with its coverage
+   named, and `xtask/src/gates.rs` fails the sweep on the shape.
 8. **Step G** — the ratchet.
 
-Steps A, D and F are mechanical and could be done by anyone with an afternoon; B and C need
-someone who knows the device and scheduler paths. Nothing here has to land before the feature
+Steps A, E and F are mechanical and could be done by anyone with an afternoon, and all three
+have landed; B and C need someone who knows the device and scheduler paths. Nothing here has to
+land before the feature
 work in Phases 1–10 — but every feature lands *cheaper* after B and C, which is the argument for
 doing them before the next device or the next per-open-file resource is added.
 

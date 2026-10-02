@@ -258,9 +258,14 @@ and gate it. Pure logic (arithmetic, encodings, parsers, policies) belongs on th
 caller is bare metal — `src/evdev.rs` and `src/uinput.rs` exist precisely to hold input policy where a host
 test can reach it.
 
-The gate is applied per module rather than by a rule, and it has already drifted (`ARCHITECTURE.md` V-11: a
-`#[cfg(all(test, not(target_os = "none")))]` module behind a `cfg(target_os = "none")` parent, so the tests
-never run). When you gate a module, check what gates its tests.
+The gate is applied per module rather than by a rule, and the rule it is applied *by* is this
+(`src/lib.rs`'s header is its home): **a module is host-compiled when its logic touches no
+hardware, no port I/O, no virtio ring and no real clock — and then its dependencies must be
+host-compiled too, transitively.** The transitive half is the one that gets forgotten. When you
+gate a module, check what gates its tests; when you ungated one, check that everything it names is
+ungated too. `cargo xtask test` opens with a mechanical check for the one failure the compiler
+cannot see — a `#[cfg(test)]` module sitting behind a `target_os = "none"` parent, which is dead
+code that reads as coverage (`xtask/src/gates.rs`, closing `ARCHITECTURE.md` V-11).
 
 ### Concurrency
 
