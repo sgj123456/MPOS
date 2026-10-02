@@ -425,560 +425,607 @@ impl SysFs {
         // directory under `/sys/devices` in this tree, so their class entry is
         // where they really live.
         let mut devnodes: Vec<(&'static str, String, u32, u32)> = Vec::new();
-        let text = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-        // The disk the partitions that follow belong to. `BlockEntry::of_disk`
-        // contributes a disk and then its own partitions, one disk at a time,
-        // and that order is the whole of what says which partition is whose -
-        // there is no parent to read, and a name does not say it either, since a
-        // partition is named `<disk><n>` and a disk may be called `sda1`.
-        let mut disk_home: Option<(alloc::string::String, Arc<SysDir>)> = None;
-        for entry in numbering.devices.iter() {
-            let name = &entry.name;
-            // Where this device's attributes really live: one home per file.
-            // A whole disk's home is its own class entry; a partition's is
-            // *inside* its disk's, which is where Linux puts it - the partition
-            // is a child of the disk in the device tree - and where a reader
-            // that walks a disk looking for its partitions finds it. The class
-            // entry of a partition is then a link to that one home rather than a
-            // second copy of the same three attributes.
-            let (dir, home) = if entry.whole {
-                let dir = block.add_dir(name, next);
-                next += 1;
-                block_root.add(
-                    name,
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: alloc::format!("../class/block/{name}"),
-                    }),
-                );
-                next += 1;
-                disk_home = Some((name.clone(), dir.clone()));
-                (dir, alloc::format!("class/block/{name}"))
-            } else {
-                let (disk_name, parent) = disk_home
-                    .clone()
-                    .expect("a partition is numbered after its own disk");
-                let dir = parent.add_dir(name, next);
-                next += 1;
-                block.add(
-                    name,
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: alloc::format!("{disk_name}/{name}"),
-                    }),
-                );
-                next += 1;
-                (dir, alloc::format!("class/block/{disk_name}/{name}"))
-            };
-            devnodes.push(("block", home, entry.major, entry.minor));
-            // The numbers, as `/dev` nodes are made from them.
-            dir.add(
-                "dev",
-                Arc::new(SysFile {
-                    ino: next,
-                    content: text(alloc::format!("{}:{}\n", entry.major, entry.minor)),
-                }),
-            );
-            next += 1;
-            // What the device is worth, in 512-byte sectors - the unit sysfs
-            // uses, and the one `entry.sectors` is in. A reader that wants bytes
-            // multiplies; `lsblk` prints `SIZE` from this attribute and would
-            // print a partition as empty without it.
-            dir.add(
-                "size",
-                Arc::new(SysFile {
-                    ino: next,
-                    content: text(alloc::format!("{}\n", entry.sectors)),
-                }),
-            );
-            next += 1;
-            // How a partition is told from a disk, and which partition it is.
-            // The attribute exists on partitions only - a whole disk has no
-            // `partition` file, and its *absence* is what says "disk" - and its
-            // value is the partition's number in its table, which is the number
-            // its own name ends with and the minor it was given.
-            if !entry.whole {
-                dir.add(
-                    "partition",
-                    Arc::new(SysFile {
-                        ino: next,
-                        content: text(alloc::format!("{}\n", entry.minor)),
-                    }),
-                );
-                next += 1;
-            }
-            dir.add(
-                "uevent",
-                Arc::new(SysEventAttr {
-                    ino: next,
-                    event: Event {
-                        action: "add",
-                        // The tree position comes from the disk's own driver,
-                        // so a SATA disk is filed under the SATA controller
-                        // rather than under virtio with the rest.
-                        devpath: alloc::format!("{}/{}", entry.devpath, name),
-                        subsystem: "block",
-                        devname: name.clone(),
-                        major: entry.major,
-                        minor: entry.minor,
-                        extra: &[],
-                    },
-                }),
-            );
-            next += 1;
-        }
-
-        // `/class/input`: the evdev nodes, and - under `/sys/devices` - the
-        // input devices they belong to. This is how udev and `libinput`
-        // enumerate the keyboard and the pointer without scanning `/dev` by
-        // hand, and the shape is Linux's rather than a convenient one:
-        //
-        //   /sys/devices/virtual/input/inputN/           the input device
-        //       capabilities/ev, capabilities/key, ...   what it can report
-        //       eventN/                                  the node it reports through
-        //   /sys/class/input/inputN -> that directory
-        //   /sys/class/input/eventN -> .../inputN/eventN
-        //
-        // The indirection is load-bearing. udev's `input_id` builtin decides a
-        // device *is* an input device by walking up from the node to the first
-        // parent carrying a `capabilities/ev` attribute, and libudev learns a
-        // device's subsystem from the `subsystem` link beside it - so a flat
-        // `/sys/class/input/eventN` directory is a node with no parent, no
-        // subsystem and no capability: a keyboard that nothing will ever
-        // classify as one.
+        next = build_block(&numbering, &block, &block_root, next, &mut devnodes);
         #[cfg(target_os = "none")]
         {
-            use crate::drivers::virtio::input::{CAPABILITY_BYTES, CAPABILITY_TYPES};
-
-            let input = class.add_dir("input", next);
-            next += 1;
-            let input_root = virtual_root.add_dir("input", next);
-            next += 1;
-
-            // The subsystem links point back at the class directory they hang
-            // under, which is what makes libudev call these devices "input".
-            let to_class = |depth: usize| alloc::format!("{}class/input", "../".repeat(depth));
-            let text = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-
-            for (index, node) in crate::drivers::virtio::input::nodes().iter().enumerate() {
-                let name = alloc::format!("event{index}");
-                let device_name = alloc::format!("input{index}");
-                let major = crate::drivers::virtio::input::INPUT_MAJOR;
-                let minor = crate::drivers::virtio::input::input_minor(index);
-
-                // The input device: everything that describes *what* it is.
-                let device = input_root.add_dir(&device_name, next);
-                next += 1;
-                device.add(
-                    "subsystem",
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: to_class(4),
-                    }),
-                );
-                next += 1;
-                device.add(
-                    "name",
-                    Arc::new(SysFile {
-                        ino: next,
-                        content: text(alloc::format!("{}\n", node.name())),
-                    }),
-                );
-                next += 1;
-                // Where the device sits. The rule that groups a device with
-                // its siblings matches on this being present at all.
-                device.add(
-                    "phys",
-                    Arc::new(SysFile {
-                        ino: next,
-                        content: text(alloc::format!("virtio{index}/input{index}\n")),
-                    }),
-                );
-                next += 1;
-                device.add(
-                    "properties",
-                    Arc::new(SysFile {
-                        ino: next,
-                        content: text(alloc::format!("{}\n", bitmap_attr(node.prop_bits(), 32))),
-                    }),
-                );
-                next += 1;
-
-                // Every path under `/sys/devices` needs a `uevent` file, and
-                // this one is not decoration either: `udev_device_new_from_syspath`
-                // stats `<path>/uevent` for anything under `/devices/` and gives
-                // up when it is not there. Without it the input device is not a
-                // device at all to udev - so the walk from an `eventN` node up
-                // to the thing that reports through it finds nothing, and the
-                // node is never tagged as input.
-                device.add(
-                    "uevent",
-                    Arc::new(SysEventAttr {
-                        ino: next,
-                        event: Event {
-                            action: "add",
-                            devpath: alloc::format!("/devices/virtual/input/{}", device_name),
-                            subsystem: "input",
-                            // No node of its own: the events are what the
-                            // device reports through, and they are the nodes.
-                            devname: String::new(),
-                            major: 0,
-                            minor: 0,
-                            extra: &[],
-                        },
-                    }),
-                );
-                next += 1;
-
-                let id = node.id();
-                let ids = device.add_dir("id", next);
-                next += 1;
-                for (attr, value) in [
-                    ("bustype", id[0]),
-                    ("vendor", id[1]),
-                    ("product", id[2]),
-                    ("version", id[3]),
-                ] {
-                    ids.add(
-                        attr,
-                        Arc::new(SysFile {
-                            ino: next,
-                            content: text(alloc::format!("{:04x}\n", value)),
-                        }),
-                    );
-                    next += 1;
-                }
-
-                let capabilities = device.add_dir("capabilities", next);
-                next += 1;
-                let mut scratch = [0u8; CAPABILITY_BYTES];
-                for (attr, evtype, declared) in CAPABILITY_TYPES {
-                    let len = node.eviocgbit(*evtype, &mut scratch);
-                    capabilities.add(
-                        attr,
-                        Arc::new(SysFile {
-                            ino: next,
-                            content: text(alloc::format!(
-                                "{}\n",
-                                bitmap_attr(&scratch[..len], *declared)
-                            )),
-                        }),
-                    );
-                    next += 1;
-                }
-
-                // The node itself, a child of the device it reports for.
-                let event = device.add_dir(&name, next);
-                next += 1;
-                // `device`: the link to the parent that every class device's
-                // directory carries, and the one `udev`'s `input_id` builtin
-                // follows to reach the `capabilities/*` that say *what* this
-                // node is. Without it the node classifies as nothing, so no
-                // `ID_INPUT_KEYBOARD` tag is set, `libinput` walks past every
-                // keyboard on the machine, and weston comes up saying "no input
-                // devices found" - a compositor with a screen and no keys.
-                event.add(
-                    "device",
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: alloc::string::String::from(".."),
-                    }),
-                );
-                next += 1;
-                event.add(
-                    "subsystem",
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: to_class(5),
-                    }),
-                );
-                next += 1;
-                event.add(
-                    "name",
-                    Arc::new(SysFile {
-                        ino: next,
-                        content: text(alloc::format!("{}\n", node.name())),
-                    }),
-                );
-                next += 1;
-                event.add(
-                    "dev",
-                    Arc::new(SysFile {
-                        ino: next,
-                        content: text(alloc::format!("{}:{}\n", major, minor)),
-                    }),
-                );
-                next += 1;
-                event.add(
-                    "uevent",
-                    Arc::new(SysEventAttr {
-                        ino: next,
-                        event: Event {
-                            action: "add",
-                            // The node's own path, as Linux spells it: the
-                            // event is a child of the device, so a listener
-                            // that walks up from it finds the device.
-                            devpath: alloc::format!(
-                                "/devices/virtual/input/{}/{}",
-                                device_name,
-                                name
-                            ),
-                            subsystem: "input",
-                            devname: alloc::format!("input/{}", name),
-                            major,
-                            minor,
-                            extra: &[],
-                        },
-                    }),
-                );
-                next += 1;
-
-                // The class entries, as links into the device tree above.
-                input.add(
-                    &device_name,
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: alloc::format!("../../devices/virtual/input/{}", device_name),
-                    }),
-                );
-                next += 1;
-                input.add(
-                    &name,
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: alloc::format!(
-                            "../../devices/virtual/input/{}/{}",
-                            device_name,
-                            name
-                        ),
-                    }),
-                );
-                next += 1;
-
-                devnodes.push((
-                    "input",
-                    alloc::format!("devices/virtual/input/{}/{}", device_name, name),
-                    major,
-                    minor,
-                ));
-            }
+            next = build_input(&class, &virtual_root, next, &mut devnodes);
         }
-
-        // `/class/drm`: the KMS card and its render node, announced the way
-        // the DRM class spells them - `card0` with the `dev` number
-        // 226:0 and a `DEVNAME` under `dri/`. This is how weston's DRM
-        // backend finds a device at all: it enumerates the `drm` subsystem
-        // through libudev, matching the sysname against `card[0-9]*`, and
-        // opens what answers as its primary GPU. A tree without this class
-        // is a machine with no display, however good /dev/dri is; eudev
-        // reads exactly the two attributes below.
-        //
-        // The GPU the two nodes belong to is built beside them, because in
-        // Linux a DRM node is a child of the device it drives rather than a
-        // device of its own. A reader holding nothing but an open card
-        // descriptor reaches that parent in two hops out of the node -
-        // `device`, then the parent's `drm/`, whose entries are the node
-        // *names* of one GPU - and it is an identity check, not a
-        // convenience: the Rust `drm` crate's `is_device_drm` is a `stat` of
-        // `/sys/dev/char/226:N/device/drm`, and its `dev_path` then matches
-        // the entries below by prefix (`card`, `renderD`) to find the sibling
-        // node. Without the directory, a card whose `/dev` node and `st_rdev`
-        // are both correct is refused as "the provided file descriptor does
-        // not refer to a DRM node" - which is where niri died, before it had
-        // drawn anything, with libdrm's different test (`fstat` plus a look
-        // for `/dev/dri/card*`) happily passing.
-        //
-        // Nothing here asks the hardware, so this is not gated on
-        // `target_os`: a tree the host cannot build is a tree nothing pins,
-        // and the chain above is exactly the kind of shape that rots.
-        {
-            // The PCI bus, and the devices on it. Built here rather than with
-            // the rest of the classes below, because the DRM nodes hang off
-            // the function that drives them and its directory has to exist
-            // first.
-            let pci = bus.add_dir("pci", next);
-            next += 1;
-            let (after_pci, display) = build_pci(&pci, &devices, pci_devices, next);
-            next = after_pci;
-
-            let drm = class.add_dir("drm", next);
-            next += 1;
-            let drm_root = virtual_root.add_dir("drm", next);
-            next += 1;
-            // Where the card's parent lives. In Linux a DRM node is a child of
-            // the device that drives it, and the caller that matters asks that
-            // parent three questions: `vendor`, `device`, and - resolved, not
-            // read - `subsystem`, which is how it learns *which bus* it is
-            // looking at before it parses anything else. Measured on a working
-            // card and recorded in `PLAN.md` §7.4: libdrm's device parse reads
-            // exactly those three, then the parent's `drm/` listing and its
-            // `uevent`. A card hung from `/sys/devices/virtual/virtio-gpu` - a
-            // directory with no attributes at all - answers none of them,
-            // which is why a machine with 3D behind the card still reported a
-            // software renderer and no renderer at all when GBM asked.
-            //
-            // A machine whose bus has no display function keeps the older
-            // shape: there is no parent to name, and inventing one would be a
-            // claim about a bus nothing found.
-            //
-            // The climb is three levels - `card0` to `drm`, to `virtual`, to
-            // `devices` - and the function's own path is relative to
-            // `/sys/devices`, which is the name a `PCI_SLOT_NAME` carries.
-            let (gpu, path) = match display {
-                Some((dir, path)) => (dir, path),
-                None => {
-                    let dir = virtual_root.add_dir("virtio-gpu", next);
-                    next += 1;
-                    (dir, String::from("virtual/virtio-gpu"))
-                }
-            };
-            let parent = alloc::format!("../../../{}", path);
-            // The `drm/` listing hangs under the *parent*, so the links inside
-            // it climb from there rather than from the node - one level deeper
-            // for every name in the parent's path, plus `devices` and `sys`.
-            // Getting this wrong leaves the listing's entries dangling, which
-            // is worse than an empty listing: a reader that walks `/sys` - udev
-            // does, at coldplug - follows them into nothing.
-            let listing_up = path.matches('/').count() + 2;
-            let gpu_drm = gpu.add_dir("drm", next);
-            next += 1;
-            for (name, minor, devnode) in [
-                ("card0", 0u32, "dri/card0"),
-                ("renderD128", 128, "dri/renderD128"),
-            ] {
-                // The device itself under `/sys/devices/virtual/drm`, and the
-                // class entry as a link to it - the shape Linux's driver core
-                // produces, and the shape `udev` needs: a uevent names its
-                // device by `/sys/<DEVPATH>`, so a `DEVPATH` that is only the
-                // class symlink's target *in name* is an event the daemon can
-                // resolve to nothing. It then keeps the entry it opened, writes
-                // no properties into it, and every client that reads the
-                // database - libudev, and through it weston's GPU selection -
-                // sees a card with no subsystem and no tags.
-                let dir = drm_root.add_dir(name, next);
-                next += 1;
-                devnodes.push((
-                    "drm",
-                    alloc::format!("devices/virtual/drm/{}", name),
-                    226,
-                    minor,
-                ));
-                // DRM's major, fixed as a convention since XFree86; the
-                // minors are the card index and 128 + index.
-                let numbers = alloc::format!("226:{}\n", minor);
-                let numbers: &'static str = Box::leak(numbers.into_boxed_str());
-                dir.add(
-                    "dev",
-                    Arc::new(SysFile {
-                        ino: next,
-                        content: numbers,
-                    }),
-                );
-                next += 1;
-                dir.add(
-                    "uevent",
-                    Arc::new(SysEventAttr {
-                        ino: next,
-                        event: Event {
-                            action: "add",
-                            devpath: alloc::format!("/devices/virtual/drm/{}", name),
-                            subsystem: "drm",
-                            devname: String::from(devnode),
-                            major: 226,
-                            minor,
-                            extra: &[],
-                        },
-                    }),
-                );
-                next += 1;
-                dir.add(
-                    "subsystem",
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: String::from("../../../class/drm"),
-                    }),
-                );
-                next += 1;
-                // The GPU this node belongs to. The parent is the same
-                // directory for both nodes - one card carries both names - so
-                // the link is what makes them siblings rather than two trees
-                // that agree by hand.
-                dir.add(
-                    "device",
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: parent.clone(),
-                    }),
-                );
-                next += 1;
-                // And the node under the parent's `drm/`, by name, as a link
-                // back to the node itself: that listing is the whole answer to
-                // "which other names does this GPU have", and a copy of the
-                // node here would be a second device to keep in step.
-                gpu_drm.add(
-                    name,
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: alloc::format!("{}virtual/drm/{}", "../".repeat(listing_up), name),
-                    }),
-                );
-                next += 1;
-                drm.add(
-                    name,
-                    Arc::new(SysSymlink {
-                        ino: next,
-                        target: alloc::format!("../../devices/virtual/drm/{}", name),
-                    }),
-                );
-                next += 1;
-            }
-        }
-
-        // `/sys/dev/char` and `/sys/dev/block`: the reverse index from a device
-        // *number* to the device that carries it. Linux keeps it because a
-        // number is all some callers ever have - `udevadm info
-        // --device-id-of-file=/`, which the udev cold-plug runs to learn what
-        // the root filesystem is mounted from, resolves through
-        // `/sys/dev/block`, and libdrm turns a card's file descriptor into a
-        // device the same way. A tree without it is a tree in which a device
-        // node cannot be identified at all.
-        //
-        let dev = fs.root.add_dir("dev", next);
-        next += 1;
-        let chars = dev.add_dir("char", next);
-        next += 1;
-        let blocks = dev.add_dir("block", next);
-        next += 1;
-        for (class_name, where_it_lives, major, minor) in devnodes {
-            let numbers = alloc::format!("{}:{}", major, minor);
-            let target = alloc::format!("../../{}", where_it_lives);
-            let dir = if class_name == "block" {
-                &blocks
-            } else {
-                &chars
-            };
-            dir.add(&numbers, Arc::new(SysSymlink { ino: next, target }));
-            next += 1;
-        }
-
+        next = build_drm(
+            &bus,
+            &class,
+            &devices,
+            &virtual_root,
+            pci_devices,
+            next,
+            &mut devnodes,
+        );
+        next = build_dev_index(&fs, devnodes, next);
         // The PCI bus was built above, before the DRM class: the card hangs
         // off the function that drives it, so the function's directory has to
         // exist first. A device carries many attributes and the inode numbers
         // are handed out in one sequence, but nothing but "no two nodes share
         // a number" is a contract here.
 
-        let kernel = fs.root.add_dir("kernel", next);
-        next += 1;
-        kernel.add(
-            "ostype",
-            Arc::new(SysFile {
-                ino: next,
-                content: env!("CARGO_PKG_NAME"),
-            }),
-        );
-
+        let _next = build_kernel(&fs, next);
         fs
     }
+}
+
+fn build_block(
+    numbering: &Numbering,
+    block: &Arc<SysDir>,
+    block_root: &Arc<SysDir>,
+    mut next: u64,
+    devnodes: &mut Vec<(&'static str, String, u32, u32)>,
+) -> u64 {
+    let text = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    // The disk the partitions that follow belong to. `BlockEntry::of_disk`
+    // contributes a disk and then its own partitions, one disk at a time,
+    // and that order is the whole of what says which partition is whose -
+    // there is no parent to read, and a name does not say it either, since a
+    // partition is named `<disk><n>` and a disk may be called `sda1`.
+    let mut disk_home: Option<(alloc::string::String, Arc<SysDir>)> = None;
+    for entry in numbering.devices.iter() {
+        let name = &entry.name;
+        // Where this device's attributes really live: one home per file.
+        // A whole disk's home is its own class entry; a partition's is
+        // *inside* its disk's, which is where Linux puts it - the partition
+        // is a child of the disk in the device tree - and where a reader
+        // that walks a disk looking for its partitions finds it. The class
+        // entry of a partition is then a link to that one home rather than a
+        // second copy of the same three attributes.
+        let (dir, home) = if entry.whole {
+            let dir = block.add_dir(name, next);
+            next += 1;
+            block_root.add(
+                name,
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: alloc::format!("../class/block/{name}"),
+                }),
+            );
+            next += 1;
+            disk_home = Some((name.clone(), dir.clone()));
+            (dir, alloc::format!("class/block/{name}"))
+        } else {
+            let (disk_name, parent) = disk_home
+                .clone()
+                .expect("a partition is numbered after its own disk");
+            let dir = parent.add_dir(name, next);
+            next += 1;
+            block.add(
+                name,
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: alloc::format!("{disk_name}/{name}"),
+                }),
+            );
+            next += 1;
+            (dir, alloc::format!("class/block/{disk_name}/{name}"))
+        };
+        devnodes.push(("block", home, entry.major, entry.minor));
+        // The numbers, as `/dev` nodes are made from them.
+        dir.add(
+            "dev",
+            Arc::new(SysFile {
+                ino: next,
+                content: text(alloc::format!("{}:{}\n", entry.major, entry.minor)),
+            }),
+        );
+        next += 1;
+        // What the device is worth, in 512-byte sectors - the unit sysfs
+        // uses, and the one `entry.sectors` is in. A reader that wants bytes
+        // multiplies; `lsblk` prints `SIZE` from this attribute and would
+        // print a partition as empty without it.
+        dir.add(
+            "size",
+            Arc::new(SysFile {
+                ino: next,
+                content: text(alloc::format!("{}\n", entry.sectors)),
+            }),
+        );
+        next += 1;
+        // How a partition is told from a disk, and which partition it is.
+        // The attribute exists on partitions only - a whole disk has no
+        // `partition` file, and its *absence* is what says "disk" - and its
+        // value is the partition's number in its table, which is the number
+        // its own name ends with and the minor it was given.
+        if !entry.whole {
+            dir.add(
+                "partition",
+                Arc::new(SysFile {
+                    ino: next,
+                    content: text(alloc::format!("{}\n", entry.minor)),
+                }),
+            );
+            next += 1;
+        }
+        dir.add(
+            "uevent",
+            Arc::new(SysEventAttr {
+                ino: next,
+                event: Event {
+                    action: "add",
+                    // The tree position comes from the disk's own driver,
+                    // so a SATA disk is filed under the SATA controller
+                    // rather than under virtio with the rest.
+                    devpath: alloc::format!("{}/{}", entry.devpath, name),
+                    subsystem: "block",
+                    devname: name.clone(),
+                    major: entry.major,
+                    minor: entry.minor,
+                    extra: &[],
+                },
+            }),
+        );
+        next += 1;
+    }
+    next
+}
+
+#[cfg(target_os = "none")]
+fn build_input(
+    class: &Arc<SysDir>,
+    virtual_root: &Arc<SysDir>,
+    mut next: u64,
+    devnodes: &mut Vec<(&'static str, String, u32, u32)>,
+) -> u64 {
+    // `/class/input`: the evdev nodes, and - under `/sys/devices` - the
+    // input devices they belong to. This is how udev and `libinput`
+    // enumerate the keyboard and the pointer without scanning `/dev` by
+    // hand, and the shape is Linux's rather than a convenient one:
+    //
+    //   /sys/devices/virtual/input/inputN/           the input device
+    //       capabilities/ev, capabilities/key, ...   what it can report
+    //       eventN/                                  the node it reports through
+    //   /sys/class/input/inputN -> that directory
+    //   /sys/class/input/eventN -> .../inputN/eventN
+    //
+    // The indirection is load-bearing. udev's `input_id` builtin decides a
+    // device *is* an input device by walking up from the node to the first
+    // parent carrying a `capabilities/ev` attribute, and libudev learns a
+    // device's subsystem from the `subsystem` link beside it - so a flat
+    // `/sys/class/input/eventN` directory is a node with no parent, no
+    // subsystem and no capability: a keyboard that nothing will ever
+    // classify as one.
+    #[cfg(target_os = "none")]
+    {
+        use crate::drivers::virtio::input::{CAPABILITY_BYTES, CAPABILITY_TYPES};
+
+        let input = class.add_dir("input", next);
+        next += 1;
+        let input_root = virtual_root.add_dir("input", next);
+        next += 1;
+
+        // The subsystem links point back at the class directory they hang
+        // under, which is what makes libudev call these devices "input".
+        let to_class = |depth: usize| alloc::format!("{}class/input", "../".repeat(depth));
+        let text = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+
+        for (index, node) in crate::drivers::virtio::input::nodes().iter().enumerate() {
+            let name = alloc::format!("event{index}");
+            let device_name = alloc::format!("input{index}");
+            let major = crate::drivers::virtio::input::INPUT_MAJOR;
+            let minor = crate::drivers::virtio::input::input_minor(index);
+
+            // The input device: everything that describes *what* it is.
+            let device = input_root.add_dir(&device_name, next);
+            next += 1;
+            device.add(
+                "subsystem",
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: to_class(4),
+                }),
+            );
+            next += 1;
+            device.add(
+                "name",
+                Arc::new(SysFile {
+                    ino: next,
+                    content: text(alloc::format!("{}\n", node.name())),
+                }),
+            );
+            next += 1;
+            // Where the device sits. The rule that groups a device with
+            // its siblings matches on this being present at all.
+            device.add(
+                "phys",
+                Arc::new(SysFile {
+                    ino: next,
+                    content: text(alloc::format!("virtio{index}/input{index}\n")),
+                }),
+            );
+            next += 1;
+            device.add(
+                "properties",
+                Arc::new(SysFile {
+                    ino: next,
+                    content: text(alloc::format!("{}\n", bitmap_attr(node.prop_bits(), 32))),
+                }),
+            );
+            next += 1;
+
+            // Every path under `/sys/devices` needs a `uevent` file, and
+            // this one is not decoration either: `udev_device_new_from_syspath`
+            // stats `<path>/uevent` for anything under `/devices/` and gives
+            // up when it is not there. Without it the input device is not a
+            // device at all to udev - so the walk from an `eventN` node up
+            // to the thing that reports through it finds nothing, and the
+            // node is never tagged as input.
+            device.add(
+                "uevent",
+                Arc::new(SysEventAttr {
+                    ino: next,
+                    event: Event {
+                        action: "add",
+                        devpath: alloc::format!("/devices/virtual/input/{}", device_name),
+                        subsystem: "input",
+                        // No node of its own: the events are what the
+                        // device reports through, and they are the nodes.
+                        devname: String::new(),
+                        major: 0,
+                        minor: 0,
+                        extra: &[],
+                    },
+                }),
+            );
+            next += 1;
+
+            let id = node.id();
+            let ids = device.add_dir("id", next);
+            next += 1;
+            for (attr, value) in [
+                ("bustype", id[0]),
+                ("vendor", id[1]),
+                ("product", id[2]),
+                ("version", id[3]),
+            ] {
+                ids.add(
+                    attr,
+                    Arc::new(SysFile {
+                        ino: next,
+                        content: text(alloc::format!("{:04x}\n", value)),
+                    }),
+                );
+                next += 1;
+            }
+
+            let capabilities = device.add_dir("capabilities", next);
+            next += 1;
+            let mut scratch = [0u8; CAPABILITY_BYTES];
+            for (attr, evtype, declared) in CAPABILITY_TYPES {
+                let len = node.eviocgbit(*evtype, &mut scratch);
+                capabilities.add(
+                    attr,
+                    Arc::new(SysFile {
+                        ino: next,
+                        content: text(alloc::format!(
+                            "{}\n",
+                            bitmap_attr(&scratch[..len], *declared)
+                        )),
+                    }),
+                );
+                next += 1;
+            }
+
+            // The node itself, a child of the device it reports for.
+            let event = device.add_dir(&name, next);
+            next += 1;
+            // `device`: the link to the parent that every class device's
+            // directory carries, and the one `udev`'s `input_id` builtin
+            // follows to reach the `capabilities/*` that say *what* this
+            // node is. Without it the node classifies as nothing, so no
+            // `ID_INPUT_KEYBOARD` tag is set, `libinput` walks past every
+            // keyboard on the machine, and weston comes up saying "no input
+            // devices found" - a compositor with a screen and no keys.
+            event.add(
+                "device",
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: alloc::string::String::from(".."),
+                }),
+            );
+            next += 1;
+            event.add(
+                "subsystem",
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: to_class(5),
+                }),
+            );
+            next += 1;
+            event.add(
+                "name",
+                Arc::new(SysFile {
+                    ino: next,
+                    content: text(alloc::format!("{}\n", node.name())),
+                }),
+            );
+            next += 1;
+            event.add(
+                "dev",
+                Arc::new(SysFile {
+                    ino: next,
+                    content: text(alloc::format!("{}:{}\n", major, minor)),
+                }),
+            );
+            next += 1;
+            event.add(
+                "uevent",
+                Arc::new(SysEventAttr {
+                    ino: next,
+                    event: Event {
+                        action: "add",
+                        // The node's own path, as Linux spells it: the
+                        // event is a child of the device, so a listener
+                        // that walks up from it finds the device.
+                        devpath: alloc::format!("/devices/virtual/input/{}/{}", device_name, name),
+                        subsystem: "input",
+                        devname: alloc::format!("input/{}", name),
+                        major,
+                        minor,
+                        extra: &[],
+                    },
+                }),
+            );
+            next += 1;
+
+            // The class entries, as links into the device tree above.
+            input.add(
+                &device_name,
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: alloc::format!("../../devices/virtual/input/{}", device_name),
+                }),
+            );
+            next += 1;
+            input.add(
+                &name,
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: alloc::format!("../../devices/virtual/input/{}/{}", device_name, name),
+                }),
+            );
+            next += 1;
+
+            devnodes.push((
+                "input",
+                alloc::format!("devices/virtual/input/{}/{}", device_name, name),
+                major,
+                minor,
+            ));
+        }
+    }
+    next
+}
+
+fn build_drm(
+    bus: &Arc<SysDir>,
+    class: &Arc<SysDir>,
+    devices: &Arc<SysDir>,
+    virtual_root: &Arc<SysDir>,
+    pci_devices: Vec<Device>,
+    mut next: u64,
+    devnodes: &mut Vec<(&'static str, String, u32, u32)>,
+) -> u64 {
+    // `/class/drm`: the KMS card and its render node, announced the way
+    // the DRM class spells them - `card0` with the `dev` number
+    // 226:0 and a `DEVNAME` under `dri/`. This is how weston's DRM
+    // backend finds a device at all: it enumerates the `drm` subsystem
+    // through libudev, matching the sysname against `card[0-9]*`, and
+    // opens what answers as its primary GPU. A tree without this class
+    // is a machine with no display, however good /dev/dri is; eudev
+    // reads exactly the two attributes below.
+    //
+    // The GPU the two nodes belong to is built beside them, because in
+    // Linux a DRM node is a child of the device it drives rather than a
+    // device of its own. A reader holding nothing but an open card
+    // descriptor reaches that parent in two hops out of the node -
+    // `device`, then the parent's `drm/`, whose entries are the node
+    // *names* of one GPU - and it is an identity check, not a
+    // convenience: the Rust `drm` crate's `is_device_drm` is a `stat` of
+    // `/sys/dev/char/226:N/device/drm`, and its `dev_path` then matches
+    // the entries below by prefix (`card`, `renderD`) to find the sibling
+    // node. Without the directory, a card whose `/dev` node and `st_rdev`
+    // are both correct is refused as "the provided file descriptor does
+    // not refer to a DRM node" - which is where niri died, before it had
+    // drawn anything, with libdrm's different test (`fstat` plus a look
+    // for `/dev/dri/card*`) happily passing.
+    //
+    // Nothing here asks the hardware, so this is not gated on
+    // `target_os`: a tree the host cannot build is a tree nothing pins,
+    // and the chain above is exactly the kind of shape that rots.
+    {
+        // The PCI bus, and the devices on it. Built here rather than with
+        // the rest of the classes below, because the DRM nodes hang off
+        // the function that drives them and its directory has to exist
+        // first.
+        let pci = bus.add_dir("pci", next);
+        next += 1;
+        let (after_pci, display) = build_pci(&pci, devices, pci_devices, next);
+        next = after_pci;
+
+        let drm = class.add_dir("drm", next);
+        next += 1;
+        let drm_root = virtual_root.add_dir("drm", next);
+        next += 1;
+        // Where the card's parent lives. In Linux a DRM node is a child of
+        // the device that drives it, and the caller that matters asks that
+        // parent three questions: `vendor`, `device`, and - resolved, not
+        // read - `subsystem`, which is how it learns *which bus* it is
+        // looking at before it parses anything else. Measured on a working
+        // card and recorded in `PLAN.md` §7.4: libdrm's device parse reads
+        // exactly those three, then the parent's `drm/` listing and its
+        // `uevent`. A card hung from `/sys/devices/virtual/virtio-gpu` - a
+        // directory with no attributes at all - answers none of them,
+        // which is why a machine with 3D behind the card still reported a
+        // software renderer and no renderer at all when GBM asked.
+        //
+        // A machine whose bus has no display function keeps the older
+        // shape: there is no parent to name, and inventing one would be a
+        // claim about a bus nothing found.
+        //
+        // The climb is three levels - `card0` to `drm`, to `virtual`, to
+        // `devices` - and the function's own path is relative to
+        // `/sys/devices`, which is the name a `PCI_SLOT_NAME` carries.
+        let (gpu, path) = match display {
+            Some((dir, path)) => (dir, path),
+            None => {
+                let dir = virtual_root.add_dir("virtio-gpu", next);
+                next += 1;
+                (dir, String::from("virtual/virtio-gpu"))
+            }
+        };
+        let parent = alloc::format!("../../../{}", path);
+        // The `drm/` listing hangs under the *parent*, so the links inside
+        // it climb from there rather than from the node - one level deeper
+        // for every name in the parent's path, plus `devices` and `sys`.
+        // Getting this wrong leaves the listing's entries dangling, which
+        // is worse than an empty listing: a reader that walks `/sys` - udev
+        // does, at coldplug - follows them into nothing.
+        let listing_up = path.matches('/').count() + 2;
+        let gpu_drm = gpu.add_dir("drm", next);
+        next += 1;
+        for (name, minor, devnode) in [
+            ("card0", 0u32, "dri/card0"),
+            ("renderD128", 128, "dri/renderD128"),
+        ] {
+            // The device itself under `/sys/devices/virtual/drm`, and the
+            // class entry as a link to it - the shape Linux's driver core
+            // produces, and the shape `udev` needs: a uevent names its
+            // device by `/sys/<DEVPATH>`, so a `DEVPATH` that is only the
+            // class symlink's target *in name* is an event the daemon can
+            // resolve to nothing. It then keeps the entry it opened, writes
+            // no properties into it, and every client that reads the
+            // database - libudev, and through it weston's GPU selection -
+            // sees a card with no subsystem and no tags.
+            let dir = drm_root.add_dir(name, next);
+            next += 1;
+            devnodes.push((
+                "drm",
+                alloc::format!("devices/virtual/drm/{}", name),
+                226,
+                minor,
+            ));
+            // DRM's major, fixed as a convention since XFree86; the
+            // minors are the card index and 128 + index.
+            let numbers = alloc::format!("226:{}\n", minor);
+            let numbers: &'static str = Box::leak(numbers.into_boxed_str());
+            dir.add(
+                "dev",
+                Arc::new(SysFile {
+                    ino: next,
+                    content: numbers,
+                }),
+            );
+            next += 1;
+            dir.add(
+                "uevent",
+                Arc::new(SysEventAttr {
+                    ino: next,
+                    event: Event {
+                        action: "add",
+                        devpath: alloc::format!("/devices/virtual/drm/{}", name),
+                        subsystem: "drm",
+                        devname: String::from(devnode),
+                        major: 226,
+                        minor,
+                        extra: &[],
+                    },
+                }),
+            );
+            next += 1;
+            dir.add(
+                "subsystem",
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: String::from("../../../class/drm"),
+                }),
+            );
+            next += 1;
+            // The GPU this node belongs to. The parent is the same
+            // directory for both nodes - one card carries both names - so
+            // the link is what makes them siblings rather than two trees
+            // that agree by hand.
+            dir.add(
+                "device",
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: parent.clone(),
+                }),
+            );
+            next += 1;
+            // And the node under the parent's `drm/`, by name, as a link
+            // back to the node itself: that listing is the whole answer to
+            // "which other names does this GPU have", and a copy of the
+            // node here would be a second device to keep in step.
+            gpu_drm.add(
+                name,
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: alloc::format!("{}virtual/drm/{}", "../".repeat(listing_up), name),
+                }),
+            );
+            next += 1;
+            drm.add(
+                name,
+                Arc::new(SysSymlink {
+                    ino: next,
+                    target: alloc::format!("../../devices/virtual/drm/{}", name),
+                }),
+            );
+            next += 1;
+        }
+    }
+    next
+}
+
+fn build_dev_index(
+    fs: &Arc<SysFs>,
+    devnodes: Vec<(&'static str, String, u32, u32)>,
+    mut next: u64,
+) -> u64 {
+    // `/sys/dev/char` and `/sys/dev/block`: the reverse index from a device
+    // *number* to the device that carries it. Linux keeps it because a
+    // number is all some callers ever have - `udevadm info
+    // --device-id-of-file=/`, which the udev cold-plug runs to learn what
+    // the root filesystem is mounted from, resolves through
+    // `/sys/dev/block`, and libdrm turns a card's file descriptor into a
+    // device the same way. A tree without it is a tree in which a device
+    // node cannot be identified at all.
+    //
+    let dev = fs.root.add_dir("dev", next);
+    next += 1;
+    let chars = dev.add_dir("char", next);
+    next += 1;
+    let blocks = dev.add_dir("block", next);
+    next += 1;
+    for (class_name, where_it_lives, major, minor) in devnodes {
+        let numbers = alloc::format!("{}:{}", major, minor);
+        let target = alloc::format!("../../{}", where_it_lives);
+        let dir = if class_name == "block" {
+            &blocks
+        } else {
+            &chars
+        };
+        dir.add(&numbers, Arc::new(SysSymlink { ino: next, target }));
+        next += 1;
+    }
+    next
+}
+
+fn build_kernel(fs: &Arc<SysFs>, mut next: u64) -> u64 {
+    let kernel = fs.root.add_dir("kernel", next);
+    next += 1;
+    kernel.add(
+        "ostype",
+        Arc::new(SysFile {
+            ino: next,
+            content: env!("CARGO_PKG_NAME"),
+        }),
+    );
+    next
 }
 
 /// One capability bitmap, printed the way `/sys` prints a kernel bitmap:
@@ -1075,25 +1122,21 @@ fn build_pci(
 
         next = add_pci_attributes(&dir, &drivers, device, &path, next);
 
-        // The display-class function is where a DRM node belongs - but a
-        // machine can carry more than one, and only one of them is this
-        // kernel's GPU. Measured, on the very first GL boot after this was
-        // built: q35 puts the firmware's own VGA beside the `virtio-gpu` the
-        // machine was given, class `0x03` both, and picking by class alone
-        // hung the card off the VGA. Mesa then read it and said so in its own
-        // words - `pci id for fd 3: 1234:1111, driver (null)`, the id of a
-        // display adapter it has no driver for, where the card it was holding
-        // is a virtio-gpu (`1af4:1050`).
+        // The DRM card hangs off the function the card's own driver declared,
+        // not off a class-code guess. Measured on the first GL boot: q35 puts
+        // the firmware's own VGA beside the `virtio-gpu` this machine was
+        // given - class `0x03` both - and choosing by class alone hung the card
+        // off the VGA, which Mesa read as `pci id for fd 3: 1234:1111, driver
+        // (null)`: a display adapter with no driver, where the card it was
+        // holding is a virtio-gpu (`1af4:1050`).
         //
-        // So the choice is the function a driver bound to. The firmware's VGA
-        // has none, because this kernel has no driver for it; the GPU's
-        // function carries `virtio-pci`, which is the driver that made the
-        // card. **The honest shape is the driver telling sysfs where its own
-        // device is, rather than sysfs guessing from class and driver** - and
-        // that is recorded in `PLAN.md` §7.4 as the part still to do. What
-        // this does not do is pick one of two live display drivers by
-        // enumeration order, because this kernel has only the one.
-        if device.class == PCI_CLASS_DISPLAY && device.driver.is_some() && display.is_none() {
+        // So the fact is carried, not inferred: the virtio-gpu driver marks its
+        // own function in `pci` - `crate::pci::mark_drm_card`, landed as
+        // `PLAN.md` §7.4 - and this builder reads that. The driver reaches
+        // `pci` and `vfs` reads `pci`, so neither reaches into the other: the
+        // honest shape an earlier version of this comment named as the part
+        // still to do.
+        if device.drm_card && display.is_none() {
             display = Some((dir.clone(), path.clone()));
         }
 
@@ -1103,12 +1146,6 @@ fn build_pci(
     }
     (next, display)
 }
-
-/// The base class code of a display controller - `0x03`, Linux's
-/// `PCI_CLASS_DISPLAY_VGA`/`_3D`/`_OTHER` family. The class byte is the base
-/// class and the bits below it are the subclass, so this is a comparison on
-/// the byte rather than on [`Device::class_code`].
-const PCI_CLASS_DISPLAY: u8 = 0x03;
 
 /// Hang one device's attributes in its own directory, and return the next free
 /// inode number.
@@ -1577,6 +1614,7 @@ mod tests {
         gpu.subclass = 0x00;
         gpu.prog_if = 0x00;
         gpu.driver = Some("virtio-pci");
+        gpu.drm_card = true;
 
         SysFs::with(
             Numbering {
@@ -1590,6 +1628,41 @@ mod tests {
                 }],
             },
             alloc::vec![vga, gpu],
+        )
+    }
+
+    /// Two display-class functions, *both* carrying a driver, enumerated with
+    /// the unmarked one first. This is the shape the class-and-driver guess
+    /// could not tell apart: it took the first display function that had a
+    /// driver, so it hung the card off `other`. The card's real home is the
+    /// function its own driver declared (`crate::pci::mark_drm_card`,
+    /// `PLAN.md` §7.4), and only that one carries `drm_card`.
+    fn declared_card_fs() -> Arc<SysFs> {
+        let mut other = a_function(0, 1, 0);
+        other.vendor = 0x10de;
+        other.device = 0x0000;
+        other.class = 0x03;
+        other.driver = Some("nvfb"); // a bound display function that is not the card
+
+        let mut gpu = a_function(0, 2, 0);
+        gpu.vendor = 0x1af4;
+        gpu.device = 0x1050;
+        gpu.class = 0x03;
+        gpu.driver = Some("virtio-pci");
+        gpu.drm_card = true;
+
+        SysFs::with(
+            Numbering {
+                devices: alloc::vec![BlockEntry {
+                    name: String::from("vda"),
+                    major: 254,
+                    minor: 0,
+                    whole: true,
+                    devpath: "/devices/virtio/block",
+                    sectors: 20 * 1024 * 1024,
+                }],
+            },
+            alloc::vec![other, gpu],
         )
     }
 
@@ -1971,6 +2044,30 @@ mod tests {
             resolve(&fs, "/sys/dev/char/226:128/device").metadata().ino,
             "both nodes hang from the one GPU"
         );
+    }
+
+    #[test]
+    fn the_card_hangs_off_the_function_its_driver_declared() {
+        // A second *bound* display function is enumerated first. Choosing by
+        // class-and-driver (`device.driver.is_some()`) would hang the card off
+        // it; choosing by the driver's own declaration (`drm_card`,
+        // `crate::pci::mark_drm_card`) hangs it off the virtio-gpu. This is red
+        // against the kernel that guessed - the counterfactual `PLAN.md` §7.4
+        // asked for.
+        let fs = declared_card_fs();
+        for number in ["226:0", "226:128"] {
+            let parent = resolve(&fs, &alloc::format!("/sys/dev/char/{number}/device"));
+            assert_eq!(
+                text(&parent.lookup("vendor").expect("vendor")),
+                "0x1af4\n",
+                "the card's parent is the declared function, not the first display one"
+            );
+            assert_eq!(
+                text(&parent.lookup("device").expect("device")),
+                "0x1050\n",
+                "the declared function is the GPU the driver made the card from"
+            );
+        }
     }
 
     #[test]

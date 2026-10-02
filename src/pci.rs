@@ -332,6 +332,17 @@ pub struct Device {
     /// The driver that bound this function, for `lspci -k`. `None` until
     /// something claims it - see [`claim`].
     pub driver: Option<&'static str>,
+    /// Whether the driver that bound this function has declared it to be the
+    /// home of a DRM/KMS card. `false` until [`mark_drm_card`] says so.
+    ///
+    /// This is the fact a display driver owns about *its own* device, and the
+    /// reason it is a field rather than an inference: `sysfs` hangs the card's
+    /// nodes off the function that carries the card, and the machine can put a
+    /// second display-class function - the firmware's own VGA - beside it.
+    /// Choosing by class code alone hung the card off the VGA (`PLAN.md` §7.4).
+    /// The driver names its function instead; `sysfs` reads this and stops
+    /// guessing.
+    pub drm_card: bool,
 }
 
 /// Index of the expansion ROM in [`Device::bars`]: Linux's `PCI_ROM_RESOURCE`.
@@ -533,6 +544,7 @@ impl Device {
             irq: 0x0b,
             bars: [Bar::EMPTY; 7],
             driver: None,
+            drm_card: false,
         }
     }
 }
@@ -572,6 +584,29 @@ pub fn claim(bus: u8, dev: u8, func: u8, driver: &'static str) {
             .find(|d| d.bus == bus && d.dev == dev && d.func == func)
         {
             entry.driver = Some(driver);
+        }
+    });
+}
+
+/// Declare that the function at `(bus, dev, func)` is the home of the DRM/KMS
+/// card, so the tree builder hangs the card's `card0`/`renderD128` nodes off it.
+///
+/// The honest half of `PLAN.md` §7.4, and the reason it lives here rather than
+/// as an inference in `sysfs`: a card belongs to the function whose driver made
+/// it, which is a fact only that driver owns. It reaches the tree builder
+/// through this [`Device`] record - the driver writes `pci`, `vfs::sysfs` reads
+/// `pci` - so the two never reach into each other. The dependency stays the
+/// `drivers -> pci` and `vfs -> pci` edges the architecture graph already
+/// allows; a direct `drivers -> vfs` registration would be a new back edge the
+/// graph forbids.
+pub fn mark_drm_card(bus: u8, dev: u8, func: u8) {
+    critical_section::with(|cs| {
+        let mut devices = DEVICES.borrow(cs).borrow_mut();
+        if let Some(entry) = devices
+            .iter_mut()
+            .find(|d| d.bus == bus && d.dev == dev && d.func == func)
+        {
+            entry.drm_card = true;
         }
     });
 }
@@ -639,6 +674,7 @@ mod tests {
                 Bar::EMPTY,
             ],
             driver: None,
+            drm_card: false,
         }
     }
 
@@ -663,6 +699,7 @@ mod tests {
             irq: 0x00,
             bars: [Bar::EMPTY; 7],
             driver: None,
+            drm_card: false,
         }
     }
 

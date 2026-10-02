@@ -145,6 +145,21 @@ pub fn transport_all(device_ids: &[u16]) -> alloc::vec::Vec<PciTransport> {
         .collect()
 }
 
+/// Declare the first function answering `device_ids` to be the home of a
+/// DRM/KMS card, so `sysfs` hangs the card's `card0`/`renderD128` nodes off it.
+///
+/// A display driver calls this for its own device, once the device is live: it
+/// is the driver, not the tree builder, that knows the function it bound
+/// carries the card. The fact is written into the shared `pci` record
+/// (`crate::pci::mark_drm_card`), which `vfs::sysfs` reads - the two never reach
+/// into each other, and the machine's q35 firmware VGA, which no driver marks,
+/// is not mistaken for the card (`PLAN.md` §7.4).
+pub fn claim_drm_card(device_ids: &[u16]) {
+    if let Some(func) = pci::find_any(VENDOR_VIRTIO, device_ids).into_iter().next() {
+        pci::mark_drm_card(&func);
+    }
+}
+
 /// The virtio *device configuration* window of the first device answering one
 /// of `device_ids`: the space a driver polls for events the device itself
 /// reports.

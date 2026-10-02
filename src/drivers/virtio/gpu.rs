@@ -234,6 +234,12 @@ impl VirtioGpuDev {
 
         let mut device = Gpu::new(transport(DEVICE_GPU)?).ok()?;
 
+        // The card's home is this function. Declared by the driver that made the
+        // device - not inferred by `sysfs` from the class code, which would also
+        // match the firmware's own display adapter on a q35 machine and hang the
+        // DRM nodes off the wrong function (`PLAN.md` §7.4).
+        super::hal::claim_drm_card(DEVICE_GPU);
+
         let dims = match device.resolution() {
             Ok((width, height)) if width > 0 && height > 0 => (width, height),
             _ => FALLBACK,

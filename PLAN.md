@@ -453,6 +453,22 @@ it - so the entries say which they are:
       in the kernel and the card was still refused, because the `..` inside a
       link's own target could not be resolved on a machine-sized root filesystem
       (§7.4)
+- [x] the **DRM card found by its driver's declaration, not by the class code**.
+      The sysfs builder used to hang the card off the first display-class
+      (`0x03`) function that had a driver bound; on a q35 that matched the
+      firmware's own VGA before the `virtio-gpu`, and Mesa read the card back as
+      `pci id for fd 3: 1234:1111, driver (null)` - a display adapter with no
+      driver, where the card it held is `1af4:1050`. The fact is now *carried*
+      rather than guessed: the virtio-gpu driver declares its own function in the
+      shared `pci` record (`crate::pci::mark_drm_card`, reached through
+      `crate::drivers::pci::mark_drm_card` and `virtio::hal::claim_drm_card` at
+      GPU init), and `vfs::sysfs` reads `device.drm_card`. The dependency stays
+      `drivers -> pci` and `vfs -> pci` - no new `drivers -> vfs` edge, so
+      `ARCHITECTURE.md` §2/§3 are unchanged (AGENTS.md §4 rule 5). Pinned by the
+      host test `the_card_hangs_off_the_function_its_driver_declared`, which is
+      red against the class-and-driver guess (it hangs the card off a second
+      bound display function enumerated first). Closes the "part still to do"
+      that the earlier sysfs comment named (§7.4).
 - [x] the **`..` in a symlink's target**: a relative target is spliced beside
       the link it came from, and the names walked to reach that link *are* the
       ancestors the target climbs - so the walk now keeps them instead of
