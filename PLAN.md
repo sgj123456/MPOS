@@ -650,7 +650,7 @@ it - so the entries say which they are:
 **Architectures (Phase 9 — far future)**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
-**Architecture debt (Phase 11 — audit done, Steps A/E/F landed)**
+**Architecture debt (Phase 11 — audit done, Steps A/C/E/F/G landed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
@@ -692,8 +692,10 @@ it - so the entries say which they are:
       reviewer enforces and one the compiler enforces
 - [ ] 11.B the device seam: one handle instead of six `Inode::as_*` downcasts, each device's
       ioctl contract moved down to its driver, user-pointer validation moved to `mm` (§11)
-- [ ] 11.C per-open-file resources get a registry, so `sched` stops naming `net`/`vfs`/`drivers`
-      on task exit (§11)
+- [x] 11.C per-open-file resources get a registry (`sched::exit`), so `sched` stops naming
+      `net`/`vfs`/`drivers` on task exit: `sched → net` is gone (which removed the `net ↔ sched`
+      mutual pair, 20 → 19), and the two `crate::drivers::` references left in `runtime.rs` are
+      the *execve* `FD_CLOEXEC` pass, a different event, named rather than abstracted (§11.2 Step C)
 - [~] 11.D the terminal emulator and the console mux move out of `vfs` (§11). **Half landed**: the
       emulator is the `mpos-term` leaf crate (so `console`, `drivers/video` and `vfs::tty` name
       `crate::term`, and the boundary is a compile error); the console mux and the line discipline
@@ -5448,7 +5450,7 @@ latency bug that only shows under load, which is where it will be found first.
 
 ---
 
-## Phase 11: Architectural Debt — **AUDIT DONE; STEPS A, E AND F LANDED**
+## Phase 11: Architectural Debt — **AUDIT DONE; STEPS A, C, E, F AND G LANDED**
 
 Everything above this phase is about *features*: what the kernel cannot yet do. This phase is
 about the *shape* of the kernel that does them, and it opens with a measurement rather than an
@@ -5563,7 +5565,7 @@ contract next to the code that implements it. The dispatch routing counts make t
 explicit: 135 of the 247 names are handled by `fs.rs`, 50 by `proc.rs`, 50 by `posix.rs`, 12 by
 `abi.rs`.
 
-#### 11.1.3 — V-3: the scheduler does other subsystems' cleanup (severity: high)
+#### 11.1.3 — V-3: the scheduler does other subsystems' cleanup (severity: high) — **MOSTLY CLOSED**
 
 `sched/runtime.rs` is 6 397 lines — the largest file in the tree — and on task teardown it
 reaches into four unrelated subsystems:
@@ -5886,7 +5888,7 @@ gate, and never batch two devices into one commit.
 
 ---
 
-#### Step C — Let subsystems own their per-open-file resources (V-3)
+#### Step C — Let subsystems own their per-open-file resources (V-3) — **DONE**
 
 `close_at_exit` ×4 in the scheduler becomes a **registry**: the scheduler keeps a list of hooks
 that each subsystem registers at boot, and on task exit it walks the list, naming nothing but its
@@ -5906,6 +5908,50 @@ grab and a uinput device is still cleaned up correctly (`t-inotify`, `t-evdev`, 
 **Risk:** teardown order matters — a descriptor's resource must go before the table entry. Pin
 the order with a host test on the registry itself, then keep the guest tests as the end-to-end
 gate.
+
+**Done, and it took the first mutual pair out of the graph.** The registry is
+`src/sched/exit.rs`: an append-only list of `fn(&[Arc<File>], owner: u32)` hooks, walked from
+`runtime.rs`'s exit path before the batch is parked for dropping (the reference counts still say
+which description is the last one until then, which is what `vfs::file::for_each_last` reads).
+Registration happens in `main.rs`, in the order the resources have to go, because the order the
+list is walked in *is* the registration order: locks first (a lock is keyed by `(device, inode)`
+and the inode is reached *through* a descriptor), then the state keyed by the open file
+description — the socket, the inotify watch, the evdev reader position, and the uinput device a
+program made for itself. `main.rs` is the wiring, so it is allowed to know all five; the
+scheduler knows none of them.
+
+Each subsystem's hook now takes the same two things the scheduler can offer. Two of them had to
+say so in their signature rather than being wrapped — `net::socket::close_sockets_at_exit` was
+`pub(crate)`, which a binary crate cannot see, and is `pub` now — and `vfs::locks` gained
+`release_on_process_exit`, which is the loop that used to sit in the teardown: *which of these
+descriptors names an inode this process still holds a lock on* is a locking question, and
+`vfs::mount::fs_id_of_inode` is a vfs one.
+
+**Measured, and the number that matters.** `sched → net` is **gone** (1 → 0), which is what
+removed the `net ↔ sched` pair: `net → sched` is 114 references of ordinary parking and stays,
+but a one-way edge is not a cycle. Mutual pairs 20 → **19**, and the ratchet constant moved down
+with it — a reduction is a commit that lowers the baseline, which is what makes the ratchet read
+as progress rather than as a fence. `sched → vfs` also fell 26 → 22 (locks, mount and inotify),
+and `sched → drivers` 4 → 2.
+
+**The acceptance is met on the exit path and not on the exec path, deliberately.** The two
+remaining `crate::drivers::` references in `runtime.rs` are on `execve`'s `FD_CLOEXEC` pass,
+which tells the input drivers to forget a reader position keyed by an address the new image will
+reuse. That is a *different event* with a *different* pair of subsystems to tell, and Step C's
+own text says the exec path should decide per edge rather than be abstracted for symmetry — so
+the `drivers ↔ sched` pair stands, named in `depgraph.rs` beside the rule, rather than being
+made to disappear behind a general mechanism that would run the socket, watch and lock hooks on
+an event that is not a process ending. The three `crate::vfs::(inotify|locks)` references the
+acceptance names are gone.
+
+**Pinned by the registry's own host test** (`hooks_run_in_registration_order_and_an_empty_list_is_not_a_special_case`):
+two hooks that record what they were handed, asserted to run in registration order with both the
+batch and the owner, plus the empty list being a no-op rather than a case the teardown has to ask
+about. It is one test rather than two on purpose — the registry and the recorder are both
+process-global, and the first draft's second test failed for exactly that reason. The end-to-end
+gate stayed the guest's: `t-inotify`, `t-evdev`, `t-filelock` and `t-unix-scm` all report
+`=== PASS`, and the whole sweep after these Phase-11 changes is `=== SUMMARY pass=140 fail=0
+(140 built)` with QEMU exit `33`.
 
 ---
 
@@ -6088,7 +6134,8 @@ shown able to go red on each of the three rules.
    gone, and the pair count it was measured with fell from 22 to 21.
 3. **Step B** — the device seam, one device at a time. This is where the 23 becomes a real
    number, and it is the largest single piece of work in the phase.
-4. **Step C** — the resource registry.
+4. ~~**Step C** — the resource registry.~~ **Done** (§11.2 Step C): the exit hooks live in
+   `sched::exit`, registered by `main.rs`, and the `net ↔ sched` pair is gone.
 5. **Step D** — the terminal emulator move.
 6. **Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.
 7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the

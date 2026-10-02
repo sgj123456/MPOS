@@ -943,7 +943,7 @@ impl Inode for EvdevNode {
 /// batch holds every reference to it - the same accounting `inotify`'s close
 /// events do, and for the same reason, since a `dup` is the same reader.
 #[cfg(target_os = "none")]
-pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>]) {
+pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>], _owner: u32) {
     crate::vfs::file::for_each_last(files, |file, ofd| {
         if let Some(ev) = file.inode().as_evdev() {
             ev.forget(ofd);

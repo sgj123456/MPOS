@@ -252,7 +252,7 @@ impl Uinput {
 /// [`crate::vfs::file::for_each_last`], which is the rule for which of them is
 /// really gone.
 #[cfg(target_os = "none")]
-pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>]) {
+pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>], _owner: u32) {
     crate::vfs::file::for_each_last(files, |file, ofd| {
         if let Some(dev) = file.inode().as_uinput() {
             dev.forget(ofd);

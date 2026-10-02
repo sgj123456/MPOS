@@ -199,6 +199,7 @@ fn kernel_main(info: &BootInfo) {
     init_blk();
     init_net();
     init_virtio();
+    register_exit_hooks();
 
     mpos::rand::init();
 
@@ -1487,6 +1488,30 @@ fn init_virtio() {
     // One permanent task polls the input devices and the vsock device - the
     // two whose work arrives whether or not anyone is waiting for it.
     mpos::drivers::virtio::spawn_service();
+}
+
+/// Tell the scheduler's exit path what a dying process's descriptors own.
+///
+/// Each of these is a *per-open-file resource*: state whose lifetime is exactly
+/// "some process holds this descriptor", which has to be given up at the moment
+/// the last reference goes - `do_exit`'s moment, not the reaper's. The
+/// scheduler owns tasks and none of these, so each subsystem registers here
+/// instead of being named by the teardown, and this function is the one place
+/// that says who they are (`PLAN.md` §11.1.3, V-3).
+///
+/// **The order is the order the resources have to be released in**, because the
+/// registry runs hooks in registration order: record locks first (they are keyed
+/// by `(device, inode)` and the inode is reached through a descriptor), then the
+/// state keyed by the open file description - the socket, the inotify watch, the
+/// evdev reader position, and the uinput device a program made for itself. Each
+/// hook runs before the batch is dropped, while the reference counts still say
+/// which description is really the last one.
+fn register_exit_hooks() {
+    mpos::sched::exit::register(mpos::vfs::locks::release_on_process_exit);
+    mpos::sched::exit::register(mpos::net::socket::close_sockets_at_exit);
+    mpos::sched::exit::register(mpos::vfs::inotify::close_at_exit);
+    mpos::sched::exit::register(mpos::drivers::virtio::input::close_at_exit);
+    mpos::sched::exit::register(mpos::drivers::uinput::close_at_exit);
 }
 
 /// The host share, mounted by the boot the way the data partition is: the

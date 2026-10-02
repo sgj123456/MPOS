@@ -26,10 +26,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 /// The number of mutual module pairs (a cycle of length two) the tree had when
-/// this ratchet was recorded: 2026-10-02, at Step F. §11.0 measured 23 by text;
-/// the three removed here were comment mentions, which is the difference
-/// documented in this module's header.
-const BASELINE_MUTUAL_PAIRS: usize = 20;
+/// this ratchet was last recorded: 2026-10-02, after Phase 11 Step C.
+/// §11.0 measured 23 by text; the three removed there were comment mentions, and
+/// the twenty-first went when the scheduler stopped calling
+/// `net::socket::close_sockets_at_exit` by name - the exit-hook registry
+/// (`sched::exit`) took that edge out of `sched`, and `net → sched` alone is not
+/// a cycle. Was 20 before Step C.
+const BASELINE_MUTUAL_PAIRS: usize = 19;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`. All
 /// nine are the `Inode::as_*` downcasts (V-1: `as_fb`, `as_evdev`, `as_uinput`,
@@ -62,6 +65,16 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
     // dependency is the exec/binfmt edge Step C decides about.
     ("sched", 10),
 ];
+
+/// Where `sched` stands after Step C's registry, recorded beside the rule above
+/// because that rule is about a layer naming another and not only about cycles:
+/// `sched → net` is **gone** (0 above, which is what removed the `net ↔ sched`
+/// pair), and `sched → drivers` is down from 4 to the two `close_at_exit` calls
+/// left on the *execve* `FD_CLOEXEC` path. That path is a different event from
+/// process exit with a different pair of subsystems to tell, and Step C
+/// deliberately did not abstract the two into one registry (`PLAN.md` §11.2 Step
+/// C: "the exec path decides per edge"). So the `drivers ↔ sched` pair stands
+/// until that edge is decided on its own terms.
 
 /// The measured graph: module-level edges, weighted by how many references
 /// carry them.

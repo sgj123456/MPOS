@@ -334,6 +334,25 @@ pub fn release_process(dev: u64, ino: u64, pid: u32) {
     });
 }
 
+/// The whole of a dying process's locks, as the scheduler's exit hook sees it.
+///
+/// Where [`release_process`] is the rule for one inode, this walks the batch the
+/// teardown hands over - which is why it lives here rather than in `sched`: the
+/// teardown owns *tasks*, and "which of these descriptors names an inode this
+/// process still holds a lock on" is a locking question (`PLAN.md` §11.1.3).
+/// Registered by the boot sequence, so the order it runs in among the other
+/// hooks is the registration order (`sched::exit`).
+#[cfg(target_os = "none")]
+pub fn release_on_process_exit(files: &[alloc::sync::Arc<crate::vfs::file::File>], owner: u32) {
+    for file in files {
+        release_process(
+            crate::vfs::mount::fs_id_of_inode(&file.inode()),
+            file.metadata().ino,
+            owner,
+        );
+    }
+}
+
 /// A task parked in a blocking acquire, waiting for one file to free up. Keyed
 /// by `(dev, ino)` only - the wake is a nudge to re-run the acquisition.
 #[cfg(target_os = "none")]

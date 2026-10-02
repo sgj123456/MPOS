@@ -395,16 +395,17 @@ Two notes on the table above, both of them about trusting a measured number:
 **The ratchet is the live measurement.** `cargo xtask depgraph` (`PLAN.md` §11.2 Step G) runs the
 same extraction as its own *check*, with one difference that matters: `//` comments are stripped
 before matching, so what it counts is who names whom in code rather than who writes about whom.
-Measured on the tree as steps A, E and F landed it reports **20** mutual pairs, where the same
-extraction matching text reports 23 — `uaccess ↔ syscall`, `evdev ↔ vfs` and `mm ↔ sched` are
-prose, not edges, which is the lesson the `arch ↔ vfs` phantom taught above, met a second time. The
-tables in this section are the audit's snapshot and are left as they were read; from here the
-command is what they have to agree with, and it fails when an edge appears that was not there when
-the baseline was recorded. Two further rules ride with it, each a ratchet at its recorded number
-rather than an absolute refusal, because Steps B and C are what take them to zero: no layer below
-`syscall` names `crate::syscall::` (`drivers` 1, `sched` 10 today; `arch` and `main` are exempt by
-design — the gate exists to enter the dispatcher), and `src/vfs/mod.rs` names no device (`9`, the
-nine `as_*` downcasts of V-1).
+Measured on this tree as steps A, C, E, F and G landed it reports **19** mutual pairs, where the
+same extraction matching text reports 23 — `uaccess ↔ syscall`, `evdev ↔ vfs` and `mm ↔ sched` are
+prose, not edges, which is the lesson the `arch ↔ vfs` phantom taught above, met a second time.
+Step C took one pair off in code as well: the exit-hook registry (`sched::exit`) removed
+`sched → net`, and `net → sched` alone is not a cycle. The tables in this section are the audit's
+snapshot and are left as they were read; from here the command is what they have to agree with, and
+it fails when an edge appears that was not there when the baseline was recorded. Two further rules
+ride with it, each a ratchet at its recorded number rather than an absolute refusal, because Step B
+is what takes them to zero: no layer below `syscall` names `crate::syscall::` (`drivers` 1, `sched`
+10 today; `arch` and `main` are exempt by design — the gate exists to enter the dispatcher), and
+`src/vfs/mod.rs` names no device (`9`, the nine `as_*` downcasts of V-1).
 
 ---
 
@@ -495,7 +496,7 @@ are items this table caught and later work closed; an *Open* or *Widened* row is
 |---|---|---|---|
 | V-1 | `Inode` downcasts to concrete devices and networks | `src/vfs/mod.rs:453–546` defines `as_fb`, `as_evdev`, `as_uinput`, `as_drm`, `as_vsock`, `as_unix` as default-`None` trait methods. Adding a device type means editing the VFS trait. **Widened by the in-flight AF_PACKET work: `as_packet` → `net::packet::PacketSock` joins the list** | Phase 11 B |
 | V-2 | Per-device ioctl ABI parsed in the syscall layer | `src/syscall/linux/fs.rs` switches on fbdev/RTC/uinput and TTY request numbers. **Progress (B2):** the DRM (`'d`) family already routed to `drivers::drm::drm_ioctl`; B2 moved the **evdev (`'E`) family to `drivers::virtio::input::EvdevNode::ioctl`** and the **KD (`'K`) family to `vfs::tty::Tty::kd_ioctl`** — each device now owns its accept/reject vocabulary, fd-resolution kept at the syscall boundary. For `kd` the DRM `card_grabbed_by_current()` answer is handed *down* as an `owns_card` argument, so `vfs::tty` never names `drivers` (no new upward edge). Both guest-verified `pass=136 fail=0`. **Remaining:** the `'V'` (`vt_ioctl`) and uinput families still in `fs.rs` | Phase 11 B |
-| V-3 | The scheduler performs other subsystems' per-process cleanup | `sched/runtime.rs` calls `net::socket::close_sockets_at_exit`, `vfs::inotify::close_at_exit`, `drivers::virtio::input::close_at_exit`, `drivers::uinput::close_at_exit` on task exit | Phase 11 C |
+| V-3 | The scheduler performs other subsystems' per-process cleanup | **Mostly closed by Step C**: the exit path now walks a registry (`sched::exit`) that each subsystem registers with from `main.rs`, so `runtime.rs` names none of `net::socket`, `vfs::inotify`, `vfs::locks` or `drivers::uinput` any more — `sched → net` is 0 and the `net ↔ sched` pair is gone. What remains is the *execve* `FD_CLOEXEC` pass, which still names the two input drivers: a different event with a different pair of subsystems, deliberately not abstracted into the same mechanism | Phase 11 C (exit path) |
 | V-4 | The terminal emulator and console mux live inside the VFS | **Half closed**: the emulator (grid, cursor, keys, font, blitter and the embedded `vga8x16.bin`) is the `mpos-term` leaf crate now, so `console.rs`, `drivers/video` and `vfs::tty` come *there* for a grid and the compile cannot be pointed back at `vfs` for one. What remains inside `vfs` is the console mux (`vcmux.rs`) and the line discipline (`tty.rs`, `pty.rs`) — the mux stays because its own vocabulary is the vfs's (`pty::VC_COUNT`, `tty::KD_TEXT`, `vtmode`), and moving it is a move of that vocabulary first | Phase 11 D (half) |
 | V-5 | A driver calls back into the syscall layer | `drivers/drm.rs` validated user pointers via `crate::syscall::buffer_ok`; **B3 closed that half — it now names `crate::uaccess::buffer_ok`.** The remaining edge is `drivers/virtio/sound.rs` naming `crate::syscall::linux::abi` for ioctl ABI constants (its former `crate::syscall::err::` refs already became `crate::err`); that is the device-ioctl-ABI concern (V-2), not the two helpers | Phase 11 B |
 | V-6 | A debug trace sat in the dispatch hot path | `syscall/linux/mod.rs::trace_msg`, self-labelled `TEMPORARY (udevd worker-channel hunt)`, wrote `[msgtrace]` lines from any failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` | **Done** (Phase 11 A) |

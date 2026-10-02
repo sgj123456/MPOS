@@ -989,7 +989,12 @@ pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
 /// Batch form of [`close_last_socket`] for process exit: every description
 /// of the dying process, possibly naming the same socket through several
 /// fds. A socket goes only when the batch holds *all* of its references.
-pub(crate) fn close_sockets_at_exit(files: &[Arc<crate::vfs::File>]) {
+///
+/// Registered with `sched::exit` by the boot sequence rather than called by name
+/// from the teardown, so the scheduler stops naming this module (`PLAN.md`
+/// §11.1.3). The exiting thread group is ignored: a socket belongs to the
+/// descriptor table it is in, not to an identity.
+pub fn close_sockets_at_exit(files: &[Arc<crate::vfs::File>], _owner: u32) {
     let mut closed: Vec<usize> = Vec::new();
     for file in files {
         // Unix sockets need no pass here at all: their registry slots are

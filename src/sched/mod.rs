@@ -5,6 +5,7 @@
 //! runtime below it owns the task table and the stacks, and calls into
 //! `arch::context` to move between them.
 
+pub mod exit;
 pub mod futex;
 pub mod policy;
 pub mod signal;

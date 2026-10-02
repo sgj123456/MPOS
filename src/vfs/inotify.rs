@@ -796,8 +796,14 @@ pub fn close_last(file: &Arc<crate::vfs::file::File>) {
     emit(&file.inode(), mask, "");
 }
 
-/// Batch form of [`close_last`] for process exit.
-pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>]) {
+/// Batch form of [`close_last`] for process exit, registered as a hook with
+/// `sched::exit` rather than called by name from the teardown (`PLAN.md`
+/// §11.1.3).
+///
+/// The `owner` is the exiting thread group, and a watch is not owned by one, so
+/// it is ignored - the parameter is there because every hook in the list is
+/// handed the same two things.
+pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>], _owner: u32) {
     let mut seen: Vec<*const crate::vfs::file::File> = Vec::new();
     for file in files {
         let ptr = Arc::as_ptr(file);

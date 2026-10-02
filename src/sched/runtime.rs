@@ -2005,36 +2005,23 @@ impl Table {
             if Arc::strong_count(&task.fds) == 1 {
                 let files = task.fds.take_all();
                 if !files.is_empty() {
-                    // Locks go with the process, not with the descriptor.
-                    // POSIX drops every lock a process holds when it exits,
-                    // and a lock left behind is one the next process to be
-                    // handed the same task id finds in its way: `fish` takes
-                    // `flock` on its universal-variable file to save it, so a
-                    // stale lock is a save that blocks and times out, a
-                    // `fish_variables` that never appears, and a second lost
-                    // on every run.
-                    let owner = task.tgid.0 as u32;
-                    for file in &files {
-                        let inode = file.inode();
-                        crate::vfs::locks::release_process(
-                            crate::vfs::mount::fs_id_of_inode(&inode),
-                            file.metadata().ino,
-                            owner,
-                        );
-                    }
-                    // Sockets go down with the process that held their last
-                    // reference - before the batch is parked for dropping,
-                    // while the counts still say who owns them.
-                    crate::net::socket::close_sockets_at_exit(&files);
-                    crate::vfs::inotify::close_at_exit(&files);
-                    // The evdev clients this process was reading as go with it:
-                    // a position is keyed by an address that will be reused, and
-                    // an inherited one is a reader that has read nothing it did.
-                    #[cfg(target_os = "none")]
-                    crate::drivers::virtio::input::close_at_exit(&files);
-                    // And the input devices the process had made for itself.
-                    #[cfg(target_os = "none")]
-                    crate::drivers::uinput::close_at_exit(&files);
+                    // Every per-open-file resource the process was holding is
+                    // released here, by the subsystems that own those resources
+                    // rather than by this one: each registers a hook at boot and
+                    // the list is walked in registration order, *before* the
+                    // batch is parked for dropping, while the counts still say
+                    // who owns what. Record locks come first, because a lock is
+                    // keyed by `(device, inode)` and the inode is reached
+                    // *through* a descriptor; then the socket, inotify, evdev and
+                    // uinput state keyed by the open file description. What this
+                    // function used to do instead was name `vfs::locks`,
+                    // `net::socket::close_sockets_at_exit`, `vfs::inotify`,
+                    // `drivers::virtio::input` and `drivers::uinput` one after
+                    // another, which is what made the scheduler unbuildable
+                    // without the VFS, the network and the drivers
+                    // (`PLAN.md` §11.1.3, V-3, and `sched::exit` for the rule
+                    // that the order is the registration order).
+                    crate::sched::exit::run(&files, task.tgid.0 as u32);
                     queue_release(files);
                 }
             }
@@ -7599,8 +7586,14 @@ pub fn exec_replace(
             }
             #[cfg(target_os = "none")]
             {
-                crate::drivers::virtio::input::close_at_exit(&closing);
-                crate::drivers::uinput::close_at_exit(&closing);
+                // Not the exit hooks: this is `execve`'s `FD_CLOEXEC` pass, and
+                // the process lives on. Only these two are told, because a
+                // reader's *position* is keyed by an address the new image will
+                // reuse - the socket, watch and lock paths have their own
+                // handling at close time.
+                let owner = task.tgid.0 as u32;
+                crate::drivers::virtio::input::close_at_exit(&closing, owner);
+                crate::drivers::uinput::close_at_exit(&closing, owner);
             }
             drop(closing);
         }
