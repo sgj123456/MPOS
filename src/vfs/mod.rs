@@ -572,15 +572,6 @@ pub trait Inode: Send + Sync + core::any::Any {
         None
     }
 
-    /// The AF_PACKET socket this node is, if it is one - the door the
-    /// socket syscalls use to hand a link-layer send, bind, or name query
-    /// to `crate::net::packet` without knowing the family's plumbing. Gated
-    /// with the `net` module, like [`Self::as_vsock`].
-    #[cfg(target_os = "none")]
-    fn as_packet(&self) -> Option<&crate::net::packet::PacketSock> {
-        None
-    }
-
     /// The AF_UNIX socket this node is, if it is one - the same question
     /// [`Self::socket_handle`] puts to the network registry, answered with
     /// this module's own slot number. The unix syscalls hold nothing but a

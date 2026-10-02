@@ -128,10 +128,6 @@ impl PacketSock {
 }
 
 impl Inode for PacketSock {
-    fn as_packet(&self) -> Option<&PacketSock> {
-        Some(self)
-    }
-
     fn seekable(&self) -> bool {
         false
     }

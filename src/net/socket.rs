@@ -35,6 +35,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use super::Channel;
 use crate::err;
+use crate::net::packet::PacketSock;
 use crate::vfs::pipe::DuplexEnd;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError};
 
@@ -966,7 +967,7 @@ pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
     // A packet socket retires from the tap's list on its last close; the
     // queue itself goes with the Arc, and the weak registry entry is what
     // must stop receiving frames.
-    if let Some(sock) = file.inode().as_packet() {
+    if let Some(sock) = file.inode().as_any().downcast_ref::<PacketSock>() {
         if Arc::strong_count(file) == 1 {
             crate::net::packet::retire_for(sock);
         }
@@ -1292,7 +1293,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // family promises and what `parse_sll_from_user` here makes the caller
     // name instead of writing.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_packet()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<PacketSock>()
     {
         if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
             return err::EFAULT;
@@ -1782,7 +1783,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     // `src_addr` slots - a `sockaddr_ll` naming the frame's source MAC and
     // type, which is how a DHCP client checks who answered.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_packet()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<PacketSock>()
     {
         if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
@@ -2671,7 +2672,7 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
         // One interface exists, so the record changes nothing a filter would
         // not already give - but a second, *different* bind is refused the
         // way Linux refuses rebinding.
-        if let Some(sock) = file.inode().as_packet() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<PacketSock>() {
             let sll = match crate::net::packet::parse_sll_from_user(args[1], args[2], from_user) {
                 Ok(sll) => sll,
                 Err(e) => return e,
@@ -3462,7 +3463,7 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
         // A packet socket's name is its `sockaddr_ll`: the socket's own
         // protocol number, eth0's index, and the device's MAC - the address
         // a frame it sends will carry as its source.
-        if let Some(sock) = file.inode().as_packet() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<PacketSock>() {
             return crate::net::packet::sockname(sock, addr_ptr, len_ptr);
         }
     }
@@ -3746,7 +3747,7 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     // Anything else is the family's `ENOPROTOOPT`, Linux's own answer for a
     // level a socket does not carry.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && file.inode().as_packet().is_some()
+        && file.inode().as_any().downcast_ref::<PacketSock>().is_some()
     {
         const SOL_PACKET: usize = 263;
         const PACKET_ADD_MEMBERSHIP: usize = 1;
