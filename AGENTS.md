@@ -34,7 +34,7 @@ booted in QEMU, or both.
 | `user/tests/` | `mpos-user-tests`: `std`-side tests for what is easiest to pin from a hosted language |
 | `user/staging/` | Scratch sources not wired into any build. Do not assume they are dead — but do not build them either |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**. libFuzzer targets over the kernel's parsers |
-| `arch/x86_64/linker.ld` | Kernel linker script, referenced from `.cargo/config.toml` |
+| `src/arch/x86_64/linker.ld` | Kernel linker script, referenced from `.cargo/config.toml` |
 | `rootfs/`, `rootfs.toml` | The guest image's contents: the overlay tree, and the packages, hostname and disk geometry it is built from |
 | `machine.toml` | What that image is *booted* on — memory, cpus, devices, the standing run mode. Host-side only, so editing it never reinstalls the image |
 | `tests.toml` | Which user test programs the self-test sweep runs, and which groups it leaves out by default |
@@ -189,7 +189,10 @@ last two *what* it must carry with it.
 Rule 5 says to respect the graph; this is the graph. `ARCHITECTURE.md` §2 holds the full mermaid diagram with
 every real `crate::` reference, §3 the ownership table, §9 the measured violations — this table is the working
 copy and the two files must move together. A module may call **downward only**, into what "may depend on"
-lists; everything else is a boundary violation.
+lists; everything else is a boundary violation. For the seven purest leaves — `err`, `pci`, `date`,
+`binfmt`, `cred`, `uts`, `seccomp` — that rule is no longer a convention: they are separate crates under
+`crates/` (re-exported from `src/lib.rs` as `crate::err` etc.), so a leaf physically cannot name the kernel
+and an upward edge from them is a compile error. See `ARCHITECTURE.md` §1.
 
 | Module | Owns | May depend on | Must never |
 |---|---|---|---|
@@ -202,7 +205,7 @@ lists; everything else is a boundary violation.
 | `console/` | Log ring, serial, framebuffer switch, the six virtual consoles | `arch`, `boot` (the boot-supplied console list) | reach into `vfs::term` for the grid (V-4) |
 | `net/` | smoltcp, socket registry, AF_INET/UNIX/NETLINK/VSOCK | `drivers`, `sched`, `uevent` | validate user pointers outside the `uaccess` leaf (V-9, closed by B3) |
 | `drivers/` | virtio, DRM/KMS, render task, evdev/uinput, PCI config, serial, RTC | `mm`, `pci`, `sched` | call back into `syscall` (V-5) or parse ioctl ABI (V-2) |
-| Services — `blk`, `pci`, `rand`, `uevent`, `binfmt`, `date`, `logging`, `sync`, `evdev`, `uinput`, `seccomp`, `err`, `uaccess` | One concern each, pure logic, host-compiled where possible. `err` is the errno table: the leaf every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
+| Services — leaf crates `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp` (see `crates/`), plus `blk`, `rand`, `uevent`, `logging`, `sync`, `evdev`, `uinput`, `uaccess` | One concern each, pure logic, host-compiled where possible. The leaf crates are downward-only and cannot name the kernel. `err` is the errno table: the leaf every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
 
 Two rules make the table usable rather than decorative:
 

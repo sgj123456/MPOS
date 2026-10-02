@@ -31,8 +31,8 @@ use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::{BufferDirection, Error, Hal};
 
 use crate::drivers::virtio::hal::HalImpl;
+use crate::gpu::abi;
 use crate::mm::PAGE_SIZE;
-use crate::virtgpu_abi as abi;
 
 /// The control queue: the one every command in `virtgpu_abi` travels on.
 const QUEUE_CONTROL: u16 = 0;
@@ -115,7 +115,7 @@ pub struct Gpu {
     /// behind, and the *intersection* is the truth about both. Reading
     /// `WANTED_FEATURES` back would be reading the driver's own request, which
     /// on a `virtio-gpu-pci` machine says `VIRGL` and is wrong - the device
-    /// agreed to neither 3D bit. `crate::drm_virtgpu::Card` is built from this.
+    /// agreed to neither 3D bit. `crate::gpu::virtgpu::Card` is built from this.
     agreed: abi::Features,
     /// The request being sent, and the response being read. One pair reused for
     /// every command, because `add_notify_wait_pop` does not return until the
@@ -508,7 +508,7 @@ impl Gpu {
     /// device.
     ///
     /// The 2D transfer, which is the only direction a card without 3D has (see
-    /// [`crate::drm_virtgpu::TRANSFER_FROM_HOST`]). The offset is zero and the
+    /// [`crate::gpu::virtgpu::TRANSFER_FROM_HOST`]). The offset is zero and the
     /// rectangle is the whole resource because that is what the DRM family's own
     /// transfer names: `struct drm_virtgpu_3d_transfer_to_host` carries a box and
     /// an offset, and the box the DRM layer sends is the resource's full extent.

@@ -22,7 +22,8 @@ drawn from intent. Where the code and the intended layering disagree, §8 says s
 
 ## 1. The repository as crates
 
-One Cargo workspace, five members plus one separate workspace. `default-members = ["."]`
+One Cargo workspace, five program members, a group of pure leaf crates under
+`crates/`, plus one separate workspace. `default-members = ["."]`
 in the root `Cargo.toml` means plain `cargo build` / `cargo test` / `cargo clippy` still
 mean "the kernel", exactly as the old shell scripts assumed.
 
@@ -40,6 +41,18 @@ flowchart TB
     subgraph Kernel["Kernel"]
         K["mpos<br/>(src/lib.rs + src/main.rs)<br/>x86_64-unknown-none<br/>host build for unit tests"]
     end
+
+    subgraph Leaf["Pure leaf crates (crates/) — downward-only, cannot name the kernel"]
+        ERR["mpos-err"]
+        DATE["mpos-date"]
+        BINFMT["mpos-binfmt"]
+        CRED["mpos-cred"]
+        UTS["mpos-uts"]
+        SECCOMP["mpos-seccomp"]
+        PCI["mpos-pci"]
+    end
+
+    K --> ERR & DATE & BINFMT & CRED & UTS & SECCOMP & PCI
 
     subgraph Userland["User programs"]
         U["mpos-user<br/>(user/)<br/>x86_64-unknown-linux-musl"]
@@ -63,7 +76,7 @@ flowchart TB
     UA -.->|"#[path] include of<br/>src/syscall/linux/nr.rs"| K
 ```
 
-Two edges deserve a note.
+Two notes on the graph, then the leaf crates.
 
 **`mpos-boot` does not depend on `mpos`.** They are separate compilations that agree on a
 hand-written ABI: a `#[repr(C)]` record in `RDI` at `_start`, with its magic number and the
@@ -82,6 +95,18 @@ disagree about a syscall number without one of them failing to build.
 `cargo fuzz` can pick `x86_64-unknown-linux-gnu` over the root `.cargo/config.toml`'s
 bare-metal default. It depends on `mpos` with `default-features = false`, i.e. it fuzzes
 exactly the part of the kernel that `src/lib.rs` leaves ungated.
+
+**Seven pure leaves are their own crates under `crates/`.** `err`, `date`,
+`binfmt`, `cred`, `uts`, `seccomp` and `pci` each depend on nothing in the
+kernel (only `core`/`alloc`, and `critical-section` for `pci`/`uts`), so they
+were extracted as workspace members and re-exported from `src/lib.rs` under
+their old names (`pub use mpos_err as err;`). The call sites are unchanged; what
+the crate boundary buys is enforcement, not tidiness — a leaf crate physically
+cannot write `crate::sched::…`, so the downward-only rule that `§9` keeps having
+to re-audit is now a compile error rather than a convention. They were chosen
+because they sit *outside* the module graph's one strongly-connected component
+(`§6`); anything in that component stays inside `mpos` until Phase 11 breaks the
+cycles. `fuzz/` may later depend on these directly instead of through `mpos`.
 
 ---
 
@@ -117,11 +142,11 @@ flowchart TB
         DRIVERS["drivers<br/>pci · virtio · drm · video · evdev/uinput · serial · rtc"]
         NET["net<br/>smoltcp · socket · unix · rtnl · vsock"]
         BLK["blk<br/>BlockDev · GPT/MBR"]
-        PCI["pci<br/>device model · Linux spellings"]
+        PCI["pci — mpos-pci crate<br/>device model · Linux spellings"]
         RAND["rand<br/>ChaCha20"]
         UEVENT["uevent<br/>kobject events over netlink"]
         BOOTMOD["boot<br/>handoff record"]
-        BINFMT["binfmt · date · evdev · uinput · logging · sync · err · uaccess"]
+        BINFMT["logging · sync · uaccess · evdev · uinput<br/>(err/date/binfmt/cred/uts/seccomp are leaf crates — §1)"]
     end
 
     MAIN --> SYSCALL
@@ -172,6 +197,13 @@ differences — in particular `drivers → syscall`, `sched → vfs`/`net`/`driv
 `console → vfs` and the whole `vfs ↔ sched ↔ syscall ↔ net` cluster. Those are real edges
 today; §9 explains what they are.
 
+The seven leaf crates of §1 are deliberately *not* drawn into this graph's SCC: they are the
+parts already outside it. `err`, `date`, `binfmt`, `cred`, `uts`, `seccomp` and `pci` depend
+only downward (on `core`/`alloc`, and `critical-section` for `pci`/`uts`), so the "may call"
+arrows into them are all that exist and none point back. Splitting them out changed no edge
+in this picture — it made them un-buildable-in-reverse by the compiler. `drivers → pci`
+remains (the driver finds devices, the crate describes them); it is now a cross-crate edge.
+
 ---
 
 ## 3. What each layer owns
@@ -187,7 +219,7 @@ today; §9 explains what they are.
 | Drivers | `src/drivers/` | virtio (blk, net, gpu, input, console, rng, sound, 9p, vsock, MSI-X), DRM/KMS, the render task, evdev/uinput, PCI config space, the serial console, the RTC, the QEMU debug-exit port | Parse a device's ioctl ABI (that is `syscall/linux/fs.rs` today — see V-2) |
 | Console | `src/console.rs` | Log ring, serial output, the switch to the framebuffer, the six virtual consoles | Reach into `vfs::term` for the grid (see V-4) |
 | ABI | `src/syscall/` | Numbers (`nr.rs`), pure ABI facts and argument validation (`abi.rs`), the dispatch table, and the handlers (`fs.rs`, `proc.rs`, `posix.rs`) | Grow past the point where one file is a device-ioctl switchboard (see V-2) |
-| Services | `src/blk/`, `src/pci.rs`, `src/rand.rs`, `src/uevent.rs`, `src/binfmt.rs`, `src/date.rs`, `src/logging.rs`, `src/sync/`, `src/err.rs`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
+| Services | `crates/err`, `crates/pci`, `crates/date`, `crates/binfmt`, `crates/cred`, `crates/uts`, `crates/seccomp` (leaf crates — §1); `src/blk/`, `src/rand.rs`, `src/uevent.rs`, `src/logging.rs`, `src/sync/`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. The seven leaf crates depend only downward and cannot name the kernel — the split is the enforcement. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
 
 ---
 
@@ -390,7 +422,7 @@ flowchart TB
         H2["sched (policy, signal, futex)"]
         H3["vfs (inode, mount, ramfs, ext4, procfs, sysfs, path, pipe, epoll, …)"]
         H4["syscall (nr, abi)"]
-        H5["pci, blk, binfmt, date, evdev, uinput, logging, rand"]
+        H5["pci, blk, binfmt, date, evdev, uinput, logging, rand<br/>+ err/cred/uts/seccomp as leaf crates (§1)"]
     end
 ```
 

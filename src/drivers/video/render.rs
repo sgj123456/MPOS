@@ -129,7 +129,7 @@ pub fn notify() {
 /// to choose (the device does not allocate them), a size and a handle are the
 /// layer's own bookkeeping, and the one thing that *is* an answer - a cap set -
 /// is fetched once at bring-up rather than per request, which
-/// `crate::drm_virtgpu::Capset` says more about.
+/// `crate::gpu::virtgpu::Capset` says more about.
 pub enum Job {
     /// Create the 2D resource `id` and attach `entries` as its backing.
     Create2d {
@@ -154,14 +154,14 @@ pub enum Job {
     Create3d {
         ctx: u32,
         id: u32,
-        request: crate::virtgpu_abi::ResourceCreate3d,
+        request: crate::gpu::abi::ResourceCreate3d,
         entries: Vec<(u64, u32)>,
     },
     /// Copy a box of the resource between guest memory and the device.
     TransferHost3d {
         to_host: bool,
         ctx: u32,
-        request: crate::virtgpu_abi::TransferHost3d,
+        request: crate::gpu::abi::TransferHost3d,
     },
     /// Make the context `id`, naming the cap set it runs.
     ContextCreate {
@@ -336,7 +336,7 @@ fn perform(device: &mut Gpu, kind: &Job) -> isize {
 /// are paid once at boot rather than on a `GET_CAPS` a compositor makes on every
 /// startup.
 fn publish_card(device: &mut Gpu) {
-    use crate::drm_virtgpu::{Capset, Card};
+    use crate::gpu::virtgpu::{Capset, Card};
 
     let features = device.features();
     let num_capsets = device.num_capsets();
@@ -359,9 +359,9 @@ fn publish_card(device: &mut Gpu) {
         });
     }
     let card = Card {
-        virgl: features.contains(crate::virtgpu_abi::Features::VIRGL),
-        context_init: features.contains(crate::virtgpu_abi::Features::CONTEXT_INIT),
-        capset_ids: crate::drm_virtgpu::table_mask(&capsets),
+        virgl: features.contains(crate::gpu::abi::Features::VIRGL),
+        context_init: features.contains(crate::gpu::abi::Features::CONTEXT_INIT),
+        capset_ids: crate::gpu::virtgpu::table_mask(&capsets),
     };
     // Said out loud, and the `cached=` count is the half worth having: a cap set
     // whose fetch failed is skipped silently (`continue` above), so without this

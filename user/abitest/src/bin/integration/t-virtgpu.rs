@@ -12,7 +12,7 @@
 //! **succeeds** at some of these (it makes 2D resources, maps them, waits on
 //! them, transfers into them), refuses others `ENOSYS` and others `EINVAL`. The
 //! measurement behind the expectations is `user/staging/virtgpu-probe/`, which
-//! was run on both cards, and `src/drm_virtgpu.rs` carries it into the kernel with
+//! was run on both cards, and `src/gpu/virtgpu.rs` carries it into the kernel with
 //! a comment and a reason per entry.
 //!
 //! Four things this pins that a table of constants cannot:

@@ -518,7 +518,7 @@ it - so the entries say which they are:
       (§7.4). The semantics were **measured on the real card before any of it was
       written**, and they disagree with the sources in the one place that decides
       the design: an object with no fence is refused rather than treated as
-      ready. `src/drm_sync.rs` holds the state machine with nine host tests,
+      ready. `src/gpu/sync.rs` holds the state machine with nine host tests,
       `t-drm-sync` pins 103 checks including a waiter woken by another task, and
       `IN_FENCE_FD` is now waited for rather than stored and ignored.
       `DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE` are `1`; the gaps left
@@ -564,7 +564,7 @@ it - so the entries say which they are:
       `subconnector` are absent for the same measured reason - the real eDP
       output carries neither. Pinned by `t-drm-props` (53 checks) (§7.4)
 - [x] the two blobs those properties point at, as pure encoders in
-      `src/drm_blob.rs` with 15 host tests - `drivers/drm.rs` is kernel-only, so
+      `src/gpu/blob.rs` with 15 host tests - `drivers/drm.rs` is kernel-only, so
       the bytes a real reader parses had to live somewhere a host can check
       them. Verified against `edid-decode` rather than only against the module's
       own decoder, which caught a real bug (a descriptor's first two bytes)
@@ -589,7 +589,7 @@ it - so the entries say which they are:
       second plane with `type` = Cursor that `GETPLANERESOURCES`/`GETPLANE`
       report, so a compositor drives the pointer through the kernel instead of
       drawing it into its own buffer (`t-drm`), the pointer composited by the one
-      flusher in a host-tested pure function (`src/drm_cursor.rs`, 10 host tests),
+      flusher in a host-tested pure function (`src/gpu/cursor.rs`, 10 host tests),
       and `CRTC_X`/`CRTC_Y` that steer rather than merely record (`t-drm-props`).
       `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` stays refused, which the measurement
       shows is what a real card does (§7.4)
@@ -653,6 +653,19 @@ it - so the entries say which they are:
 **Architecture debt (Phase 11 — audit done, Step A landed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
+- [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
+      `cred`, `uts`, `seccomp`) moved out of `src/` into `crates/*` as workspace members,
+      re-exported from `src/lib.rs` under their old names so no caller changed (`pub use
+      mpos_err as err;`). The point is enforcement, not tidiness: a leaf crate cannot name the
+      kernel, so the downward-only rule (AGENTS §4 rule 5, and the V-* edges this table keeps
+      re-auditing) is a compile error for those seven, not a convention. `xtask test`'s host
+      stage now names each crate with `-p` so the moved pins keep running (635 in-kernel + 50 in
+      crates = the 685 the suite ran before). `mpos-pci`'s test fixtures (`Device::fixture`,
+      `test_lock`) reach the kernel's `/sys`/`/proc` tests through a `test-helpers` feature that
+      only a dev-dependency enables, so the shipped binary carries no scaffolding. Held back for
+      the same reason Phase 11 B/C are: `gpu` and `evdev`/`uinput` take `sched::TaskId` +
+      `sched::wake` for their waiters (`src/gpu/sync.rs`, `src/evdev.rs`), and `src/gpu/*` is
+      mid-refactor; they need an injectable wake abstraction before they can leave the crate.
 - [ ] 11.B the device seam: one handle instead of six `Inode::as_*` downcasts, each device's
       ioctl contract moved down to its driver, user-pointer validation moved to `mm` (§11)
 - [ ] 11.C per-open-file resources get a registry, so `sched` stops naming `net`/`vfs`/`drivers`
@@ -2565,7 +2578,7 @@ pointer, and the measurements say so far that it is not this kernel's doing.
 Two things this phase measured are worth carrying forward, because both were
 *surprises that booting found rather than reading*: the cursor plane's composition
 is the one piece of arithmetic on the presentation path and lives in
-`src/drm_cursor.rs` with host tests, and the sync object family's semantics
+`src/gpu/cursor.rs` with host tests, and the sync object family's semantics
 disagree with the upstream sources in the one place that decides its design, which
 is why they were measured on a real card before any of it was written (§7.4). The
 third, from §7.3, is the same shape one layer down: a driver whose every line is a
@@ -4273,7 +4286,7 @@ the boot's own display probe) are what guard it.
 **(b) has landed**, as the refactor §7's rule wants landed first: the same
 commands in the same order, so the machine boots exactly as it did and the pins
 above are the evidence rather than an assertion. `src/drivers/virtio/gpu_ctrl.rs`
-owns the transport and the control queue; `src/virtgpu_abi.rs` holds the wire
+owns the transport and the control queue; `src/gpu/abi.rs` holds the wire
 vocabulary and is host-compiled, with eight tests pinning the command numbers
 against `<linux/virtio_gpu.h>`'s literals, every struct size, the header's field
 offsets and the feature word. Three things narrowed deliberately rather than
@@ -4458,7 +4471,7 @@ measure as.
 **The composition is the one thing here that is arithmetic, so it is the one thing
 in its own host-tested module.** There is no display controller to composite an
 overlay, so the cursor is blended into the scanout block by the same pass that fills
-it: `src/drm_cursor.rs` holds that blend - `ARGB8888` over `BGRA`, premultiplied,
+it: `src/gpu/cursor.rs` holds that blend - `ARGB8888` over `BGRA`, premultiplied,
 hotspot-pinned, clipped at all four edges in one intersection computed up front -
 with ten `cargo test` cases beside it, following `drm_blob.rs` and `evdev.rs`. The
 driver calls it at the end of every `copy_to_scanout`, which is what makes the two
@@ -4525,7 +4538,7 @@ publishes four of them, in `src/drivers/drm.rs`, each one true:
 
 | property | object | shape here | why |
 |---|---|---|---|
-| `EDID` | connector | immutable blob | a real 128-byte EDID 1.4 base block from `crate::drm_blob`, rebuilt when the host resizes the window - the detailed timing *is* the advertised mode |
+| `EDID` | connector | immutable blob | a real 128-byte EDID 1.4 base block from `crate::gpu::blob`, rebuilt when the host resizes the window - the detailed timing *is* the advertised mode |
 | `non-desktop` | connector | immutable range 0..1, value 0 | this is a panel, not a headset |
 | `max bpc` | connector | range 8..8, value 8 | the scanout is eight bits per channel; a range of one value means a write of 16 is `EINVAL` rather than a success that changes no pixels |
 | `vrr_capable` | connector | immutable range 0..1, value 0 | the refresh rate cannot vary, and saying so is what stops a compositor asking |
@@ -4687,7 +4700,7 @@ real card, so this card answering `1` is a statement it has to make true rather
 than a capability it can decline.
 
 **What was then built, and the one place it is deliberately narrower.** The
-twelve requests are dispatched, `src/drm_sync.rs` holds the state machine with
+twelve requests are dispatched, `src/gpu/sync.rs` holds the state machine with
 nine host tests and `t-drm-sync` pins 103 checks in the booted machine - the
 family's whole shape, the descriptor handover in both directions, a waiter woken
 by *another task* rather than merely told it would be, and the two commit fences

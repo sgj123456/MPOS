@@ -129,10 +129,31 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Resul
 fn run_unit_tests() -> Result<()> {
     let root = utils::project_root()?;
 
-    println!("Unit tests: the kernel (host)");
+    println!("Unit tests: the kernel and its leaf crates (host)");
     let mut cmd = Command::new("cargo");
-    cmd.args(["test", "--lib", "--target", "x86_64-unknown-linux-gnu"])
-        .current_dir(&root);
+    cmd.args([
+        "test",
+        "--lib",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "-p",
+        "mpos",
+        "-p",
+        "mpos-err",
+        "-p",
+        "mpos-date",
+        "-p",
+        "mpos-binfmt",
+        "-p",
+        "mpos-cred",
+        "-p",
+        "mpos-uts",
+        "-p",
+        "mpos-seccomp",
+        "-p",
+        "mpos-pci",
+    ])
+    .current_dir(&root);
     utils::run_status(&mut cmd, "the kernel's host unit tests")?;
 
     println!("Unit tests: xtask");

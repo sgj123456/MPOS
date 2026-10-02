@@ -272,7 +272,7 @@ const NR_PRIME_FD_TO_HANDLE: u32 = 0x2e;
 /// later four were added years after them - which is why a request number is
 /// never inferred from the one next to it.
 ///
-/// The whole family is decided by `crate::drm_sync`, where the rules are written
+/// The whole family is decided by `crate::gpu::sync`, where the rules are written
 /// down with a host test each; what is here is the argument marshalling and the
 /// table of objects.
 const NR_SYNCOBJ_CREATE: u32 = 0xbf;
@@ -850,7 +850,7 @@ mod drm_event {
 
 static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     dumb: Vec::new(),
-    next_res_id: crate::virtgpu_abi::RESOURCE_FB + 1,
+    next_res_id: crate::gpu::abi::RESOURCE_FB + 1,
     fbs: Vec::new(),
     current_fb: 0,
     conn_crtc: CRTC_ID,
@@ -1126,7 +1126,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         // The `DRM_VIRTGPU_*` family. What a caller hears here is not one
         // refusal but a table of per-request answers - a card with no 3D behind
         // it succeeds at some of these, refuses others with `ENOSYS` and others
-        // with `EINVAL` - and `crate::drm_virtgpu` holds that table with the
+        // with `EINVAL` - and `crate::gpu::virtgpu` holds that table with the
         // measurement beside every entry.
         //
         // All eleven are dispatched now. The four that name a resource handle
@@ -1145,7 +1145,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_VIRTGPU_EXECBUFFER => virtgpu_execbuffer(arg, ofd),
         NR_VIRTGPU_TRANSFER_FROM_HOST => virtgpu_transfer_from_host(arg, ofd),
         NR_VIRTGPU_CONTEXT_INIT => virtgpu_context_init(arg, ofd),
-        NR_VIRTGPU_RESOURCE_CREATE_BLOB => crate::drm_virtgpu::RESOURCE_CREATE_BLOB,
+        NR_VIRTGPU_RESOURCE_CREATE_BLOB => crate::gpu::virtgpu::RESOURCE_CREATE_BLOB,
         _ => -25, // ENOTTY
     }
 }
@@ -1160,7 +1160,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
 /// refused, rather than anything a caller could read as a capability.
 struct Published {
     /// The card, as `drm_virtgpu::Card` describes it.
-    card: crate::drm_virtgpu::Card,
+    card: crate::gpu::virtgpu::Card,
     /// How many cap sets the *device* said it had.
     ///
     /// Kept apart from `capsets.len()`, which can be smaller: a set whose fetch
@@ -1170,11 +1170,11 @@ struct Published {
     /// answers `EINVAL` for the other rather than `ENOSYS` for the family.
     num_capsets: u32,
     /// The sets that were fetched, in the order the device named them.
-    capsets: Vec<crate::drm_virtgpu::Capset>,
+    capsets: Vec<crate::gpu::virtgpu::Capset>,
 }
 
 static PUBLISHED: Mutex<RefCell<Published>> = Mutex::new(RefCell::new(Published {
-    card: crate::drm_virtgpu::Card::NONE,
+    card: crate::gpu::virtgpu::Card::NONE,
     num_capsets: 0,
     capsets: Vec::new(),
 }));
@@ -1185,9 +1185,9 @@ static PUBLISHED: Mutex<RefCell<Published>> = Mutex::new(RefCell::new(Published 
 /// than something the ioctl path could also reach, because there is exactly one
 /// moment at which the answer is knowable and exactly one task that knows it.
 pub fn publish_card(
-    card: crate::drm_virtgpu::Card,
+    card: crate::gpu::virtgpu::Card,
     num_capsets: u32,
-    capsets: &[crate::drm_virtgpu::Capset],
+    capsets: &[crate::gpu::virtgpu::Capset],
 ) {
     critical_section::with(|cs| {
         let mut published = PUBLISHED.borrow(cs).borrow_mut();
@@ -1199,7 +1199,7 @@ pub fn publish_card(
 }
 
 /// The card to answer a `DRM_VIRTGPU_*` request from.
-fn card() -> crate::drm_virtgpu::Card {
+fn card() -> crate::gpu::virtgpu::Card {
     critical_section::with(|cs| PUBLISHED.borrow(cs).borrow().card)
 }
 
@@ -1215,7 +1215,7 @@ fn num_capsets() -> u32 {
 /// good for rather than only the newest one it could have named. A set that is
 /// not there, or a version past what it has, is `EINVAL` - which is what `None`
 /// becomes at the one place that asks.
-fn capset(id: u32, version: u32) -> Option<crate::drm_virtgpu::Capset> {
+fn capset(id: u32, version: u32) -> Option<crate::gpu::virtgpu::Capset> {
     critical_section::with(|cs| {
         PUBLISHED
             .borrow(cs)
@@ -1361,7 +1361,7 @@ fn take_fence(ofd: u64) -> u64 {
 /// has not come up can do none of it.
 fn virtgpu_getparam(arg: usize) -> isize {
     let param = unsafe { (arg as *const u64).read_unaligned() };
-    let Ok(value) = crate::drm_virtgpu::param(param, &card()) else {
+    let Ok(value) = crate::gpu::virtgpu::param(param, &card()) else {
         return crate::err::EINVAL;
     };
     let out = unsafe { ((arg + 8) as *const u64).read_unaligned() } as *mut i32;
@@ -1395,14 +1395,14 @@ fn virtgpu_get_caps(arg: usize) -> isize {
     let size = unsafe { ((arg + 16) as *const u32).read_unaligned() };
 
     if num_capsets() == 0 {
-        return crate::drm_virtgpu::CAPS;
+        return crate::gpu::virtgpu::CAPS;
     }
     let Some(set) = capset(id, version) else {
         // Not offered, or a version past what the set has. Linux answers the
         // same `EINVAL` for both, so there is nothing to tell apart here.
         return crate::err::EINVAL;
     };
-    let Ok(copy) = crate::drm_virtgpu::caps_may_copy(size, set.max_size) else {
+    let Ok(copy) = crate::gpu::virtgpu::caps_may_copy(size, set.max_size) else {
         return crate::err::EINVAL;
     };
     if !crate::uaccess::buffer_ok(addr, copy, true, true) {
@@ -1445,7 +1445,7 @@ fn virtgpu_context_init(arg: usize, ofd: u64) -> isize {
 
     let card = card();
     if !card.context_init || !card.virgl {
-        return crate::drm_virtgpu::CONTEXT_INIT;
+        return crate::gpu::virtgpu::CONTEXT_INIT;
     }
     if num_params > 4 {
         return libc_einval();
@@ -1560,7 +1560,7 @@ fn virtgpu_execbuffer(arg: usize, ofd: u64) -> isize {
     // a card with no 3D (measured: `ENOSYS`) and a caller that hears `EINVAL`
     // instead would go looking for the malformed field it does not have.
     if !card().virgl {
-        return crate::drm_virtgpu::EXECBUFFER;
+        return crate::gpu::virtgpu::EXECBUFFER;
     }
     const FENCE_FD_IN: u32 = 0x01;
     const FENCE_FD_OUT: u32 = 0x02;
@@ -1638,7 +1638,7 @@ fn virtgpu_execbuffer(arg: usize, ofd: u64) -> isize {
 fn virtgpu_transfer_from_host(arg: usize, ofd: u64) -> isize {
     let field = |offset: usize| unsafe { ((arg + offset) as *const u32).read_unaligned() };
     let handle = field(0) as usize;
-    let box3d = crate::virtgpu_abi::Box3d {
+    let box3d = crate::gpu::abi::Box3d {
         x: field(4),
         y: field(8),
         z: field(12),
@@ -1649,7 +1649,7 @@ fn virtgpu_transfer_from_host(arg: usize, ofd: u64) -> isize {
     let (level, offset, stride, layer_stride) = (field(28), field(32), field(36), field(40));
 
     if !card().virgl {
-        return crate::drm_virtgpu::TRANSFER_FROM_HOST;
+        return crate::gpu::virtgpu::TRANSFER_FROM_HOST;
     }
     let found = critical_section::with(|cs| {
         let st = STATE.borrow(cs).borrow();
@@ -1666,8 +1666,8 @@ fn virtgpu_transfer_from_host(arg: usize, ofd: u64) -> isize {
         Ok(id) => id,
         Err(errno) => return errno,
     };
-    let request = crate::virtgpu_abi::TransferHost3d {
-        header: crate::virtgpu_abi::CtrlHeader::new(crate::virtgpu_abi::CMD_TRANSFER_FROM_HOST_3D),
+    let request = crate::gpu::abi::TransferHost3d {
+        header: crate::gpu::abi::CtrlHeader::new(crate::gpu::abi::CMD_TRANSFER_FROM_HOST_3D),
         box3d,
         offset: offset as u64,
         resource_id: id,
@@ -1710,7 +1710,7 @@ fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
     // them, and the measurement is where that shows - `target 4` is `EINVAL`
     // without 3D and a resource with it.
     if !virgl
-        && let Err(errno) = crate::drm_virtgpu::resource_create_args_ok(
+        && let Err(errno) = crate::gpu::virtgpu::resource_create_args_ok(
             target,
             field(20),
             field(32),
@@ -1790,10 +1790,8 @@ fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
         crate::drivers::video::render::job(crate::drivers::video::render::Job::Create3d {
             ctx,
             id,
-            request: crate::virtgpu_abi::ResourceCreate3d {
-                header: crate::virtgpu_abi::CtrlHeader::new(
-                    crate::virtgpu_abi::CMD_RESOURCE_CREATE_3D,
-                ),
+            request: crate::gpu::abi::ResourceCreate3d {
+                header: crate::gpu::abi::CtrlHeader::new(crate::gpu::abi::CMD_RESOURCE_CREATE_3D),
                 resource_id: id,
                 target,
                 format: field(4),
@@ -2016,11 +2014,9 @@ fn virtgpu_transfer_to_host(arg: usize, ofd: u64) -> isize {
             Ok(id) => id,
             Err(errno) => return errno,
         };
-        let request = crate::virtgpu_abi::TransferHost3d {
-            header: crate::virtgpu_abi::CtrlHeader::new(
-                crate::virtgpu_abi::CMD_TRANSFER_TO_HOST_3D,
-            ),
-            box3d: crate::virtgpu_abi::Box3d {
+        let request = crate::gpu::abi::TransferHost3d {
+            header: crate::gpu::abi::CtrlHeader::new(crate::gpu::abi::CMD_TRANSFER_TO_HOST_3D),
+            box3d: crate::gpu::abi::Box3d {
                 x: field(4),
                 y: field(8),
                 z: field(12),
@@ -3311,7 +3307,7 @@ fn paint_cursor(st: &DrmState, scanout: *mut u8, screen_w: u32, screen_h: u32) {
     let dst = unsafe {
         core::slice::from_raw_parts_mut(scanout, screen_w as usize * screen_h as usize * 4)
     };
-    let _ = crate::drm_cursor::compose(
+    let _ = crate::gpu::cursor::compose(
         dst,
         screen_w as usize * 4,
         screen_w as usize,
@@ -3495,13 +3491,13 @@ fn get_connector(arg: usize) -> isize {
         // reported as the millimetres a connector reports them in - ten times
         // the field, which is the relation the measurement found (30 cm and
         // 19 cm on a real panel gave exactly 300x190 here).
-        let (mm_w, mm_h) = crate::drm_blob::size_mm(w, h);
+        let (mm_w, mm_h) = crate::gpu::blob::size_mm(w, h);
         (p.add(64) as *mut u32).write_unaligned(mm_w);
         (p.add(68) as *mut u32).write_unaligned(mm_h);
         // Sub-pixel order: 0, the unknown value. Measured on a real connected
         // eDP connector, which also reported 0 - so this is the honest default
         // rather than an invented arrangement of a virtual display's pixels.
-        (p.add(72) as *mut u32).write_unaligned(crate::drm_blob::SUBPIXEL_UNKNOWN);
+        (p.add(72) as *mut u32).write_unaligned(crate::gpu::blob::SUBPIXEL_UNKNOWN);
     }
     0
 }
@@ -4118,7 +4114,7 @@ fn mode_atomic(arg: usize) -> isize {
         // window, and it is the one doing the flushing.
         let mut out_fence = None;
         if plan.out_fence_ptr.is_some() {
-            let fence = crate::drm_sync::Fence::armed();
+            let fence = crate::gpu::sync::Fence::armed();
             let file = Arc::new(crate::vfs::File::new(SyncFileFd::new(fence.clone())));
             let Ok(fd) = crate::sched::current_fds().install(file) else {
                 return -24; // EMFILE
@@ -4325,7 +4321,7 @@ fn edid_blob_bytes(st: &mut DrmState) -> &[u8] {
     if st.edid_bytes.is_none() || st.edid_dims != dims {
         st.edid_dims = dims;
         st.edid_bytes =
-            Some(crate::drm_blob::edid_base_block(dims.0, dims.1, MONITOR_NAME).to_vec());
+            Some(crate::gpu::blob::edid_base_block(dims.0, dims.1, MONITOR_NAME).to_vec());
     }
     st.edid_bytes.as_deref().unwrap_or(&[])
 }
@@ -4336,9 +4332,9 @@ fn edid_blob_bytes(st: &mut DrmState) -> &[u8] {
 /// change.
 fn in_formats_blob_bytes(st: &mut DrmState) -> &[u8] {
     if st.in_formats_bytes.is_none() {
-        st.in_formats_bytes = Some(crate::drm_blob::in_formats(
+        st.in_formats_bytes = Some(crate::gpu::blob::in_formats(
             &PLANE_FORMATS,
-            crate::drm_blob::FORMAT_MOD_LINEAR,
+            crate::gpu::blob::FORMAT_MOD_LINEAR,
         ));
     }
     st.in_formats_bytes.as_deref().unwrap_or(&[])
@@ -4351,9 +4347,9 @@ fn in_formats_blob_bytes(st: &mut DrmState) -> &[u8] {
 /// primary plane scans.
 fn cursor_in_formats_blob_bytes(st: &mut DrmState) -> &[u8] {
     if st.cursor_in_formats_bytes.is_none() {
-        st.cursor_in_formats_bytes = Some(crate::drm_blob::in_formats(
+        st.cursor_in_formats_bytes = Some(crate::gpu::blob::in_formats(
             &CURSOR_FORMATS,
-            crate::drm_blob::FORMAT_MOD_LINEAR,
+            crate::gpu::blob::FORMAT_MOD_LINEAR,
         ));
     }
     st.cursor_in_formats_bytes.as_deref().unwrap_or(&[])
@@ -4782,7 +4778,7 @@ fn add_fb2(arg: usize) -> isize {
     // the framebuffer was made is a fact the caller asked for and this card
     // knows.
     let modifier = if flags & FB_MODIFIERS != 0 {
-        if modifier != crate::drm_blob::FORMAT_MOD_LINEAR {
+        if modifier != crate::gpu::blob::FORMAT_MOD_LINEAR {
             return libc_einval();
         }
         modifier
@@ -5140,7 +5136,7 @@ fn prime_fd_to_handle(arg: usize) -> isize {
 }
 
 /// One sync object as *this card* keeps it: the handle a client named it by, the
-/// open file description that made it, the state machine `crate::drm_sync`
+/// open file description that made it, the state machine `crate::gpu::sync`
 /// decides with, and the eventfd registrations waiting on it.
 ///
 /// The handle is per *description* rather than per card, which is Linux's shape
@@ -5150,7 +5146,7 @@ fn prime_fd_to_handle(arg: usize) -> isize {
 struct SyncObjRec {
     owner: u64,
     handle: u32,
-    obj: Arc<crate::drm_sync::SyncObj>,
+    obj: Arc<crate::gpu::sync::SyncObj>,
     /// One entry per `SYNCOBJ_EVENTFD` call. Each fires at most once - that is
     /// what was measured, and it is what makes "register, signal, read one"
     /// composable.
@@ -5196,11 +5192,11 @@ const MAX_SYNC_WAIT: usize = 4096;
 /// rendered and the compositor that will wait.
 pub struct SyncObjFd {
     ino: u64,
-    obj: Arc<crate::drm_sync::SyncObj>,
+    obj: Arc<crate::gpu::sync::SyncObj>,
 }
 
 impl SyncObjFd {
-    fn new(obj: Arc<crate::drm_sync::SyncObj>) -> Arc<SyncObjFd> {
+    fn new(obj: Arc<crate::gpu::sync::SyncObj>) -> Arc<SyncObjFd> {
         static NEXT: AtomicU64 = AtomicU64::new(0x9200);
         Arc::new(SyncObjFd {
             ino: NEXT.fetch_add(1, Ordering::Relaxed),
@@ -5210,7 +5206,7 @@ impl SyncObjFd {
 
     /// The object behind the descriptor, for the import that installs a handle
     /// for it in another table.
-    pub fn object(&self) -> Arc<crate::drm_sync::SyncObj> {
+    pub fn object(&self) -> Arc<crate::gpu::sync::SyncObj> {
         self.obj.clone()
     }
 }
@@ -5242,11 +5238,11 @@ impl Inode for SyncObjFd {
 /// will.
 pub struct SyncFileFd {
     ino: u64,
-    fence: Arc<crate::drm_sync::Fence>,
+    fence: Arc<crate::gpu::sync::Fence>,
 }
 
 impl SyncFileFd {
-    fn new(fence: Arc<crate::drm_sync::Fence>) -> Arc<SyncFileFd> {
+    fn new(fence: Arc<crate::gpu::sync::Fence>) -> Arc<SyncFileFd> {
         static NEXT: AtomicU64 = AtomicU64::new(0x9300);
         Arc::new(SyncFileFd {
             ino: NEXT.fetch_add(1, Ordering::Relaxed),
@@ -5256,7 +5252,7 @@ impl SyncFileFd {
 
     /// The fence behind the descriptor, for `FD_TO_HANDLE` with
     /// `IMPORT_SYNC_FILE`.
-    pub fn fence(&self) -> Arc<crate::drm_sync::Fence> {
+    pub fn fence(&self) -> Arc<crate::gpu::sync::Fence> {
         self.fence.clone()
     }
 }
@@ -5288,13 +5284,17 @@ impl Inode for SyncFileFd {
 /// type can live here while the object's own type lives in the host-tested leaf
 /// module.
 ///
-/// The extra indirection is deliberate rather than accidental: `crate::drm_sync`
+/// The extra indirection is deliberate rather than accidental: `crate::gpu::sync`
 /// knows nothing about descriptors, and a `pub fn` on it that returned an `Arc`
 /// of its own type would be the same thing without the wrapper. This is the
 /// wrapper.
 ///
 /// (The alias's fields are `pub(crate)` in spirit; see `drm_sync::SyncObjectAlias`.)
-fn syncobj_lookup(st: &DrmState, owner: u64, handle: u32) -> Option<Arc<crate::drm_sync::SyncObj>> {
+fn syncobj_lookup(
+    st: &DrmState,
+    owner: u64,
+    handle: u32,
+) -> Option<Arc<crate::gpu::sync::SyncObj>> {
     st.syncobjs
         .iter()
         .flatten()
@@ -5310,7 +5310,7 @@ fn syncobj_resolve(
     st: &DrmState,
     owner: u64,
     handles: &[u32],
-) -> Result<Vec<Arc<crate::drm_sync::SyncObj>>, isize> {
+) -> Result<Vec<Arc<crate::gpu::sync::SyncObj>>, isize> {
     let mut out = Vec::with_capacity(handles.len());
     for &handle in handles {
         match syncobj_lookup(st, owner, handle) {
@@ -5365,7 +5365,7 @@ fn wait_deadline(nsec: i64) -> u64 {
 /// no way to find a sleeper it was not told about - the same lock-poll-try-unlock-
 /// park shape `vfs::eventfd` uses for its counter.
 fn syncobj_park(
-    objs: &[Arc<crate::drm_sync::SyncObj>],
+    objs: &[Arc<crate::gpu::sync::SyncObj>],
     nsec: i64,
     satisfied: impl Fn() -> bool,
 ) -> isize {
@@ -5387,7 +5387,7 @@ fn syncobj_park(
 /// Whether one handle of a wait array is satisfied. `point == 0` is a plain
 /// object's question, which is "is a fence behind it" - the measured card's
 /// reading, where a point that was never asked about is not asked about.
-fn syncobj_one_ready(obj: &crate::drm_sync::SyncObj, point: u64, for_submit: bool) -> bool {
+fn syncobj_one_ready(obj: &crate::gpu::sync::SyncObj, point: u64, for_submit: bool) -> bool {
     obj.ready((point != 0).then_some(point), for_submit)
 }
 
@@ -5395,7 +5395,7 @@ fn syncobj_one_ready(obj: &crate::drm_sync::SyncObj, point: u64, for_submit: boo
 /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL`, and otherwise *any* satisfied handle ends
 /// the wait.
 fn syncobj_any_ready(
-    objs: &[Arc<crate::drm_sync::SyncObj>],
+    objs: &[Arc<crate::gpu::sync::SyncObj>],
     points: &[u64],
     for_submit: bool,
     all: bool,
@@ -5415,7 +5415,7 @@ fn syncobj_any_ready(
 /// that is satisfied. `WAIT_ALL` has no such index to give and the measured card
 /// leaves the field alone for it, so this is only meaningful for the `any` shape.
 fn syncobj_first_ready(
-    objs: &[Arc<crate::drm_sync::SyncObj>],
+    objs: &[Arc<crate::gpu::sync::SyncObj>],
     points: &[u64],
     for_submit: bool,
 ) -> u32 {
@@ -5479,7 +5479,7 @@ fn syncobj_create(owner: u64, arg: usize) -> isize {
         st.syncobjs.push(Some(SyncObjRec {
             owner,
             handle,
-            obj: crate::drm_sync::SyncObj::new(flags & SYNCOBJ_CREATE_SIGNALED != 0),
+            obj: crate::gpu::sync::SyncObj::new(flags & SYNCOBJ_CREATE_SIGNALED != 0),
             events: Vec::new(),
         }));
         handle
@@ -5805,7 +5805,7 @@ fn syncobj_signal(owner: u64, arg: usize) -> isize {
         Err(e) => return e,
     };
     for obj in &objs {
-        obj.submit(crate::drm_sync::Fence::retired(), None);
+        obj.submit(crate::gpu::sync::Fence::retired(), None);
     }
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
@@ -5852,7 +5852,7 @@ fn syncobj_timeline_signal(owner: u64, arg: usize) -> isize {
         Err(e) => return e,
     };
     for (obj, &point) in objs.iter().zip(points.iter()) {
-        obj.submit(crate::drm_sync::Fence::retired(), Some(point));
+        obj.submit(crate::gpu::sync::Fence::retired(), Some(point));
     }
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();

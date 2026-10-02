@@ -1,0 +1,10 @@
+# A leaf of numbers: the errno table the kernel answers "no" with. Its own
+# crate so that refusing in Linux's language never requires naming the
+# `syscall` layer from below it — and so this crate physically cannot reach
+# back up into the kernel. See `ARCHITECTURE.md` §9 V-14.
+[package]
+name = "mpos-err"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

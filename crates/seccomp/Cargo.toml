@@ -1,0 +1,10 @@
+# `SECCOMP_MODE_FILTER`'s classic-BPF program: the interpreter, its validation
+# and the action ordering. Nothing here knows what a task is, so it is its own
+# leaf crate with no external dependency (only `alloc` and atomics) — and the
+# `fuzz/` targets can depend on it directly.
+[package]
+name = "mpos-seccomp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

@@ -1,3 +1,5 @@
+#![no_std]
+
 //! `SECCOMP_MODE_FILTER`: the classic-BPF program a thread can put between
 //! itself and the syscall table.
 //!
@@ -26,6 +28,8 @@
 //! Nothing here knows what a task is. The program, its validation and its
 //! evaluation are the testable half and live in this module; the task table
 //! decides who has one, and the syscall gate decides when it runs.
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};

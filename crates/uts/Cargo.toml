@@ -1,0 +1,16 @@
+# The UTS namespace: the two names uname(2) reports, as the object a task
+# holds. Pure ownership over two Strings, so it is its own leaf crate. It needs
+# critical_section for its shared-namespacer lock, gated exactly as the kernel
+# gates it: the stock std implementation on the host, the bare-metal one there.
+[package]
+name = "mpos-uts"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }

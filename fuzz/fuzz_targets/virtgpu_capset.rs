@@ -7,7 +7,7 @@
 //! capset_data[]`), so the reply carries no length of its own - the only bound
 //! on it is the buffer the driver allocated, and the driver sized that from the
 //! `capset_max_size` the device itself reported a round trip earlier.
-//! `virtgpu_abi::resp_capset_payload` is what names the payload, and what it
+//! `abi::resp_capset_payload` is what names the payload, and what it
 //! has to survive is a device that answered with fewer bytes than it owed, a
 //! header split across the end of the buffer, or an error code where a cap set
 //! belongs.
@@ -17,10 +17,10 @@
 //! protocol's other length and is deliberately **not** here - those bytes come
 //! from the caller and are forwarded to the device untouched, the way Linux
 //! hands them over with `vmemdup_user`, so nothing on this side walks a length
-//! the caller supplied. `src/virtgpu_abi.rs` says the same in its header.
+//! the caller supplied. `src/gpu/abi.rs` says the same in its header.
 
 use libfuzzer_sys::fuzz_target;
-use mpos::virtgpu_abi::{self, CtrlHeader, RESP_ERR_INVALID_PARAMETER, RESP_OK_CAPSET};
+use mpos::gpu::abi::{self, CtrlHeader, RESP_ERR_INVALID_PARAMETER, RESP_OK_CAPSET};
 
 /// The reader's contract, asserted directly and on every input.
 ///
@@ -36,7 +36,7 @@ use mpos::virtgpu_abi::{self, CtrlHeader, RESP_ERR_INVALID_PARAMETER, RESP_OK_CA
 fn control() {
     let mut reply = [0u8; 24 + 8];
     reply[..4].copy_from_slice(&RESP_OK_CAPSET.to_le_bytes());
-    let payload = virtgpu_abi::resp_capset_payload(&reply)
+    let payload = abi::resp_capset_payload(&reply)
         .expect("a well-formed cap set reply must read as one");
     assert_eq!(
         payload.len(),
@@ -47,7 +47,7 @@ fn control() {
     let mut declined = [0u8; 24 + 8];
     declined[..4].copy_from_slice(&RESP_ERR_INVALID_PARAMETER.to_le_bytes());
     assert!(
-        virtgpu_abi::resp_capset_payload(&declined).is_none(),
+        abi::resp_capset_payload(&declined).is_none(),
         "an error reply must not be handed over as a cap set"
     );
 }
@@ -55,7 +55,7 @@ fn control() {
 fuzz_target!(|data: &[u8]| {
     control();
 
-    match virtgpu_abi::resp_capset_payload(data) {
+    match abi::resp_capset_payload(data) {
         Some(payload) => {
             // The invariant that matters: the payload is a sub-slice of the
             // bytes it came from and is never longer. A reader that computed a
@@ -73,7 +73,7 @@ fuzz_target!(|data: &[u8]| {
             // And it only comes back from a reply that really is a cap set. An
             // error answer read as a payload would be a capability word of
             // zeroes a caller believes.
-            let header = virtgpu_abi::read_struct::<CtrlHeader>(data)
+            let header = abi::read_struct::<CtrlHeader>(data)
                 .expect("a payload means there was a header to read");
             assert!(
                 header.is(RESP_OK_CAPSET),
@@ -86,7 +86,7 @@ fuzz_target!(|data: &[u8]| {
             // shorter than a header, or the header names something else.
             let short = data.len() < size_of::<CtrlHeader>();
             let wrong_code = !short
-                && !virtgpu_abi::read_struct::<CtrlHeader>(data)
+                && !abi::read_struct::<CtrlHeader>(data)
                     .expect("long enough, checked above")
                     .is(RESP_OK_CAPSET);
             assert!(

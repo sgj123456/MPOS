@@ -1,3 +1,5 @@
+#![no_std]
+
 //! The UTS namespace: the two names a machine calls itself.
 //!
 //! `uname(2)`'s `nodename` and `domainname` are not facts about the hardware.
@@ -28,6 +30,8 @@
 //! `domainname` to `(none)`, and `/proc/sys/kernel/domainname` both hardcoded
 //! its read and dropped its write, so `setdomainname(2)` had no observable
 //! effect through any door at all.
+
+extern crate alloc;
 
 use alloc::string::String;
 use alloc::sync::Arc;

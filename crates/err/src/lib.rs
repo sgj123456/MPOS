@@ -1,3 +1,5 @@
+#![no_std]
+
 //! The errno values the kernel answers with, already negated for `rax`.
 //!
 //! These numbers are ABI, not policy: `EBADF` is `-9` because Linux says it

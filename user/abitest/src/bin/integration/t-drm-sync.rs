@@ -11,7 +11,7 @@
 //! rather than treated as already signaled, a timeline is something an object
 //! *becomes*, and the two descriptors the family hands out are told apart by the
 //! request that takes them back. `PLAN.md` §7.4 records the measurement this was
-//! written from, and `src/drm_sync.rs` holds the rules with a host test each.
+//! written from, and `src/gpu/sync.rs` holds the rules with a host test each.
 //!
 //! The waits are the interesting half: `WAIT_FOR_SUBMIT` is the only form that
 //! blocks, and the wake it parks on comes from *another task* - so the one check

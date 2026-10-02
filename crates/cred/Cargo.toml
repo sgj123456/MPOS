@@ -1,0 +1,9 @@
+# The process credential model: capability sets, the dumpable flag, KEEPCAPS.
+# Pure policy, so it is its own leaf crate with no dependencies. The storage
+# lives on the thread group in the kernel's `sched`; this is the rules over it.
+[package]
+name = "mpos-cred"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

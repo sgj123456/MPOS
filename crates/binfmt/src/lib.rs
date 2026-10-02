@@ -1,3 +1,5 @@
+#![no_std]
+
 //! Binary formats: the one piece of interpretation the kernel does for a
 //! program.
 //!
@@ -12,6 +14,8 @@
 //! first line of a file, with no filesystem anywhere near it. The caller -
 //! `execve` - is the part that can follow the name it produces, and it is the
 //! part that has to answer for a chain that never ends.
+
+extern crate alloc;
 
 use alloc::string::String;
 

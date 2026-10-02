@@ -1,3 +1,5 @@
+#![no_std]
+
 //! Civil-calendar arithmetic, kept out of the architecture it serves for
 //! the reason the `rand` and `logging` modules are kept out too: the sums
 //! are pure, and a date rule with an off-by-one on one side of a leap year

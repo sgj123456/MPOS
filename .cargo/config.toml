@@ -20,14 +20,14 @@ target = "x86_64-unknown-none"
 # not accept it through -Ctarget-feature.
 rustflags = [
     "-C", "relocation-model=pic",
-    "-C", "link-arg=--script=arch/x86_64/linker.ld",
+    "-C", "link-arg=--script=src/arch/x86_64/linker.ld",
     "-C", "link-arg=-pie",
     "-C", "link-arg=-ztext",
     "-C", "link-arg=-zmax-page-size=0x1000",
 ]
 
 # There is no `[target.aarch64-unknown-none]` here, and there used to be: it
-# named `arch/aarch64/linker.ld`, which has never existed, so the profile
+# named `src/arch/aarch64/linker.ld`, which has never existed, so the profile
 # described a target that could not link. The port's real prerequisites are
 # `PLAN.md` §9.1; until they are written the configuration does not claim a
 # backend it cannot build. Re-adding the block is one line, next to a script

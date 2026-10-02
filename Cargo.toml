@@ -5,7 +5,7 @@
 # without it would build the user programs for the host too, and they are
 # built for musl.
 [workspace]
-members = ["user", "user/tests", "user/abitest", "boot", "xtask"]
+members = ["user", "user/tests", "user/abitest", "boot", "xtask", "crates/*"]
 # "." is the kernel - the root package, which is a member without being
 # listed in `members`.
 default-members = ["."]
@@ -21,6 +21,20 @@ edition = "2024"
 # kernel - the frame allocator, the mapping plan, later the VFS and the
 # scheduler's policy code - testable with plain `cargo test`.
 [dependencies]
+# The errno table, its own leaf crate (see `crates/err` and `ARCHITECTURE.md` §9
+# V-14). Re-exported by `src/lib.rs` as `crate::err`, so every caller's path is
+# unchanged; the crate itself cannot name the kernel.
+mpos-err = { path = "crates/err" }
+# The other pure leaves of the same kind (see `crates/*` and `ARCHITECTURE.md`):
+# each is a downward-only leaf, re-exported by `src/lib.rs` under its old name
+# so every `crate::X` caller is unchanged.
+mpos-date = { path = "crates/date" }
+mpos-binfmt = { path = "crates/binfmt" }
+mpos-cred = { path = "crates/cred" }
+mpos-uts = { path = "crates/uts" }
+mpos-seccomp = { path = "crates/seccomp" }
+mpos-pci = { path = "crates/pci" }
+
 # Used by the arch-agnostic mapping plan, so deliberately not target-gated.
 # Already in the tree as a dependency of `x86_64`.
 bitflags = "2.13"
@@ -47,6 +61,14 @@ rand_core = { version = "0.9", default-features = false }
 # required by `tracing-core` when `std` is off, and the kernel has an
 # allocator before the first event is emitted.
 tracing = { version = "0.1", default-features = false }
+
+# Host-test-only: the kernel's `/sys` and `/proc` tests build fake PCI devices
+# and take the pci device-list lock across the crate boundary. A dev-dependency
+# unifies `test-helpers` onto mpos-pci for test builds only; a production
+# `cargo build` prunes dev-dependencies, so the fixtures stay cfg'd out of the
+# shipped kernel (edition-2024 resolver v3 keeps the two graphs separate).
+[dev-dependencies]
+mpos-pci = { path = "crates/pci", features = ["test-helpers"] }
 
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = { version = "1.2", features = ["restore-state-bool"] }

@@ -95,7 +95,7 @@ bitflags::bitflags! {
 /// the device on the other side has them: the transport hands back the
 /// *intersection*, so a machine whose GPU is `virtio-gpu-pci` agrees to neither
 /// bit and the driver is left answering exactly what it answered before. That
-/// returned word is what [`crate::drm_virtgpu::Card`] is built from, which is
+/// returned word is what [`crate::gpu::virtgpu::Card`] is built from, which is
 /// why "did we really negotiate this" and "what does the card say it can do" are
 /// the same question.
 ///

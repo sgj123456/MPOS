@@ -1,0 +1,24 @@
+# The PCI devices the machine has, and the way Linux spells them in `/sys` and
+# `/proc`. The model and every spelling are pure — the formats `lspci` parses
+# with fixed `sscanf` strings deserve a host test — so this is its own leaf
+# crate. Only the port I/O that *finds* the devices stays in the kernel's
+# `drivers`. Its device list is a `critical_section`-guarded singleton, gated
+# exactly as the kernel gates it.
+[package]
+name = "mpos-pci"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[features]
+# Exposes the test fixtures (`Device::fixture`, `test_lock`) to dependents. The
+# kernel enables this through a dev-dependency, so it is on for `cargo test` and
+# off for the production `cargo build` (dev-dependencies are pruned there).
+test-helpers = []
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }

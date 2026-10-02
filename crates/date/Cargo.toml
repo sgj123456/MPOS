@@ -1,0 +1,8 @@
+# Civil-calendar arithmetic: day counts to dates and back. Pure, so it is its
+# own leaf crate with no dependencies and a host build can argue with the sums.
+[package]
+name = "mpos-date"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

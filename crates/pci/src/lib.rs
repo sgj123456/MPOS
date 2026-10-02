@@ -1,3 +1,5 @@
+#![no_std]
+
 //! The PCI devices this machine has, and the way Linux spells them.
 //!
 //! Two things live here, and they are here rather than in the driver because
@@ -27,6 +29,8 @@
 //! The direct method needs `ioperm`, which x86_64 Linux does not implement -
 //! so on a 64-bit kernel the first two are the only ones that can work, and
 //! both are built from the devices in this module.
+
+extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -523,9 +527,9 @@ impl Device {
 /// The two filesystems that publish a device - `/sys` and `/proc` - need the
 /// same shape to hang their attributes on, and a copy of it in each would be
 /// three chances to describe three different devices.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 impl Device {
-    pub(crate) fn fixture(bus: u8, dev: u8, func: u8) -> Device {
+    pub fn fixture(bus: u8, dev: u8, func: u8) -> Device {
         Device {
             domain: 0,
             bus,
@@ -614,15 +618,15 @@ pub fn mark_drm_card(bus: u8, dev: u8, func: u8) {
 /// Taking turns on the one global device list, for tests. The crate has no
 /// `std` and the host build has no `spin`, so this is a lock made of one
 /// atomic - all a test needs to keep another test's devices out of its tree.
-#[cfg(test)]
-pub(crate) mod test_lock {
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_lock {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     static LOCK: AtomicBool = AtomicBool::new(false);
 
-    pub(crate) struct ListLock;
+    pub struct ListLock;
 
-    pub(crate) fn take() -> ListLock {
+    pub fn take() -> ListLock {
         while LOCK.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }

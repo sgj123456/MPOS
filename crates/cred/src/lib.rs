@@ -1,3 +1,5 @@
+#![no_std]
+
 //! The process credential model: capability sets, the dumpable flag and
 //! `KEEPCAPS` - the state `capget`/`capset` and four `prctl` options read and
 //! write, and the two consumers that make it real.
