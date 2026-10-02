@@ -3147,6 +3147,51 @@ fn block_until_on(cond: impl Fn(&Table) -> bool) {
     }
 }
 
+/// [`block_until_on`] for a condition a *catchable* signal may end. On the same
+/// table borrow it also checks `table_has_deliverable`, so a trapped signal
+/// wakes the caller with [`WaitEnd::Interrupted`] instead of being swallowed and
+/// re-slept - which is exactly what makes `wait4`/`waitid` interruptible the way
+/// the pipe/futex/nanosleep waits already are (`PLAN.md` §2.5; measured on a real
+/// Linux: `wait4` interrupted by a caught non-`SA_RESTART` signal returns `EINTR`,
+/// and `SA_RESTART` restarts it). The deliverable signal is left pending, not
+/// consumed, so the syscall gate can build the handler's frame on the way out.
+fn block_until_on_interruptible(cond: impl Fn(&Table) -> bool) -> WaitEnd {
+    loop {
+        // As in `block_until_on`: a fatal signal is taken before the condition,
+        // so a task that is killing itself does not first collect a child event.
+        if let Some(sig) = take_fatal_signal() {
+            exit(-(sig as isize));
+        }
+        if with_table(|t| cond(t)) {
+            return WaitEnd::Condition;
+        }
+        if with_table(|t| table_has_deliverable(t)) {
+            return WaitEnd::Interrupted;
+        }
+        schedule(|t| {
+            if cond(t) || table_has_deliverable(t) {
+                t.requeue_current();
+            } else {
+                let id = t.current;
+                let priority = t.task(id).priority;
+                t.sched.sleep(id, priority, u64::MAX);
+            }
+        });
+    }
+}
+
+/// How a blocking wait's park ended. A child event was collected (`Event`),
+/// there is no child to wait for (`NoChild`, which the caller turns into
+/// `ECHILD`), or a catchable signal ended the wait (`Interrupted`, which the
+/// caller turns into `EINTR` and the syscall gate restarts under `SA_RESTART`).
+/// Keeping `Interrupted` distinct from `NoChild` is the whole reason this is not
+/// an `Option`.
+pub enum WaitPark<T> {
+    Event(T),
+    NoChild,
+    Interrupted,
+}
+
 /// [`block_until`] with a clock on the wait: block until `cond` is true, the
 /// `deadline` - a tick deadline, as the sleep queue keeps them - passes, or a
 /// catchable signal demands the wait's attention. A wake still ends the sleep
@@ -5127,12 +5172,20 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
 
 /// Block until a child of `parent` has something to report, and collect it.
 /// The exit-only shape is `wait_any_child`, which this generalises.
-pub fn wait_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
-    block_until_on(|t| any_child_event(t, parent, stops, continues).is_some());
-    with_table(|t| {
+pub fn wait_any_child_event(parent: TaskId, stops: bool, continues: bool) -> WaitPark<WaitEvent> {
+    if matches!(
+        block_until_on_interruptible(|t| any_child_event(t, parent, stops, continues).is_some()),
+        WaitEnd::Interrupted
+    ) {
+        return WaitPark::Interrupted;
+    }
+    match with_table(|t| {
         let event = any_child_event(t, parent, stops, continues)?;
         take_event(t, event)
-    })
+    }) {
+        Some(event) => WaitPark::Event(event),
+        None => WaitPark::NoChild,
+    }
 }
 
 /// The non-blocking half: is there anything to collect right now?
@@ -5201,14 +5254,22 @@ pub fn child_event_pending(id: TaskId, stops: bool, continues: bool) -> bool {
 /// through the borrow `block_until_on` already holds for the same reason it is
 /// there: a closure taking its own critical section inside `schedule`'s would
 /// nest one inside another and hand interrupts back early.
-pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
-    block_until_on(|t| {
-        exit_code(id).is_some() || child_event_in(t, id, t.current, stops, continues).is_some()
-    });
-    if let Some(event) = take_child_event(id, stops, continues) {
-        return Some(event);
+pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> WaitPark<WaitEvent> {
+    if matches!(
+        block_until_on_interruptible(|t| {
+            exit_code(id).is_some() || child_event_in(t, id, t.current, stops, continues).is_some()
+        }),
+        WaitEnd::Interrupted
+    ) {
+        return WaitPark::Interrupted;
     }
-    take_exit_code_current(id).map(|code| WaitEvent::Exited { id, code })
+    if let Some(event) = take_child_event(id, stops, continues) {
+        return WaitPark::Event(event);
+    }
+    match take_exit_code_current(id) {
+        Some(code) => WaitPark::Event(WaitEvent::Exited { id, code }),
+        None => WaitPark::NoChild,
+    }
 }
 
 /// [`take_exit_code_for`] for the running task - the shape a `waitpid(pid)`
@@ -5658,17 +5719,25 @@ pub fn read_sigchld() -> Option<usize> {
     })
 }
 
-pub fn wait_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
+pub fn wait_any_child(parent: TaskId) -> WaitPark<(TaskId, isize)> {
     // The condition is the table itself, so it is asked through the borrow
-    // `block_until_on` already holds rather than taking one of its own.
-    block_until_on(|t| any_child_code(t, parent).is_some());
+    // `block_until_on_interruptible` already holds rather than taking one of its own.
+    if matches!(
+        block_until_on_interruptible(|t| any_child_code(t, parent).is_some()),
+        WaitEnd::Interrupted
+    ) {
+        return WaitPark::Interrupted;
+    }
     // Taken under the same borrow, not looked up again: a second lookup by pid
     // would race the slot being handed to a new task, and the record would go
     // to it instead.
-    with_table(|t| {
+    match with_table(|t| {
         any_child_code(t, parent)
             .and_then(|(id, _)| take_exit_code_for(t, id, parent).map(|code| (id, code)))
-    })
+    }) {
+        Some(found) => WaitPark::Event(found),
+        None => WaitPark::NoChild,
+    }
 }
 
 /// The pid and code of the oldest of `parent`'s children to have exited and

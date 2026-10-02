@@ -21,7 +21,7 @@ pub use runtime::{
     CloneRequest, INIT_PID, ITIMER_PROF, ITIMER_REAL, ITIMER_VIRTUAL, Identity, ItimerSnapshot,
     ItimerState, MAX_TASKS, MapFacts, Redirect, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID,
     STACK_ORDER, SpawnError, Stop, TIMER_ABSTIME, TaskSnapshot, TimerNotify, WaitEnd, WaitEvent,
-    acquire_controlling_tty, become_session_leader, block_until, block_until_child_event,
+    WaitPark, acquire_controlling_tty, become_session_leader, block_until, block_until_child_event,
     block_until_code, block_until_deadline, block_until_interruptible, brk, charge_cpu,
     check_itimer, child_event, child_event_pending, child_exited_unreaped, claim_anon_gaps, clone,
     continued_report_pending, controlling_tty_of_current, credentials_of, current, current_blocked,

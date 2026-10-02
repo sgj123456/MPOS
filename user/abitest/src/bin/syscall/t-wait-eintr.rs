@@ -5,9 +5,10 @@
 //! full-screen program's own timeout brings it back to its loop. The kernel
 //! then had that rule in exactly one place. Every other blocking node - a
 //! pipe's read *and* its write, an eventfd, a signalfd, an inotify watch, a
-//! unix socket's datagram queue and its accept queue, and a pty slave's write
-//! into a full master buffer - slept through a catchable signal instead:
-//! `block_until` woke only for a fatal one. A daemon whose whole job is to
+//! unix socket's datagram queue and its accept queue, a pty slave's write
+//! into a full master buffer, and a `wait4`/`waitid` blocked on a child that is
+//! slow to exit - slept through a catchable signal instead: their park woke only
+//! for a fatal one. A daemon whose whole job is to
 //! answer both its descriptors and its timers therefore stopped answering the
 //! timers for as long as its descriptors stayed quiet, which on an idle box is
 //! for ever.
@@ -456,6 +457,87 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::check_true(&mut failed, b"the master reads the bytes back", drained > 0);
         let _ = lin::close(slave);
         let _ = lin::close(master);
+    }
+
+    // --- a wait4 blocked on a child that is slow to exit ---
+    // The gap §2.5 named: `wait4`/`waitid` parked on the fatal-only primitive,
+    // so a caught signal woke the task and the park then swallowed the wake. A
+    // shell that traps some signal while waiting on a child must get it back as
+    // `EINTR` (and be restarted under `SA_RESTART`), exactly as on Linux - the
+    // `SA_RESTART` half is pinned in `t-sa-restart`; the `EINTR` half is here.
+    {
+        let kid = lin::fork();
+        if kid == 0 {
+            lin::sleep_ms(1200);
+            lin::exit_group(3);
+        }
+        lin::check_true(&mut failed, b"a child is forked for wait4", kid > 0);
+        if kid > 0 {
+            let before = RAN.load(Ordering::Relaxed) as isize;
+            alarm_once(200);
+            let mut status = 0i32;
+            let got = lin::wait4(kid as usize, &mut status, 0);
+            lin::check_eq(
+                &mut failed,
+                b"a blocked wait4 is ended by a catchable signal with EINTR",
+                got,
+                lin::EINTR,
+            );
+            lin::check_eq(
+                &mut failed,
+                b"and its handler ran before the return",
+                RAN.load(Ordering::Relaxed) as isize,
+                before + 1,
+            );
+            // The positive control: the retried wait4 still collects the child,
+            // so the EINTR came from the signal and not from a broken wait path.
+            let got2 = lin::wait4(kid as usize, &mut status, 0);
+            lin::check_eq(
+                &mut failed,
+                b"and the retried wait4 takes the child",
+                got2,
+                kid,
+            );
+        }
+    }
+
+    // --- a waitid blocked on a child that is slow to exit ---
+    // The same park, reached through `waitid` (`raw_sys5`, x86_64 nr 247,
+    // `P_ALL`/`WEXITED`): it shares the child-event park, so it must answer the
+    // same way. `waitid` reports success as 0 and fills the siginfo.
+    {
+        let kid = lin::fork();
+        if kid == 0 {
+            lin::sleep_ms(1200);
+            lin::exit_group(4);
+        }
+        lin::check_true(&mut failed, b"a child is forked for waitid", kid > 0);
+        if kid > 0 {
+            let mut info = [0u8; 128];
+            let before = RAN.load(Ordering::Relaxed) as isize;
+            alarm_once(200);
+            let got = lin::raw_sys5(247, 0, 0, info.as_mut_ptr() as usize, 4, 0);
+            lin::check_eq(
+                &mut failed,
+                b"a blocked waitid is ended by a catchable signal with EINTR",
+                got,
+                lin::EINTR,
+            );
+            lin::check_eq(
+                &mut failed,
+                b"and its handler ran before the return",
+                RAN.load(Ordering::Relaxed) as isize,
+                before + 1,
+            );
+            let mut info2 = [0u8; 128];
+            let got2 = lin::raw_sys5(247, 0, 0, info2.as_mut_ptr() as usize, 4, 0);
+            lin::check_eq(
+                &mut failed,
+                b"and the retried waitid still reports the child",
+                got2,
+                0,
+            );
+        }
     }
 
     let back = lin::SigAction {

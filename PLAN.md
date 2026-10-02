@@ -1559,14 +1559,19 @@ Named gaps this leaves, and the three that have since closed:
     byte, so its carriage return lands twice. The count is in the writer's own
     units by construction (`input_prefix`), and the alternative - counting the
     byte - would lose the line feed; both render the same line.
-  - **`wait4(2)`/`waitid(2)`**, whose park is `block_until_child_event` and is
-    still fatal-signal-only. Measured on Linux 7.2 (a 2 s child, `SIGALRM` at
-    100 ms): with `SA_RESTART` the handler runs at 100 ms and `wait4` returns
-    the child's pid at 2000 ms; with the flag clear it is `-1/EINTR` at 100 ms.
-    So a shell whose own timeout is a signal cannot be woken out of a `wait`
-    here, and `restartable` deliberately does not list the call: a restart
-    verdict for a wait that never answers `EINTR` would be a promise about
-    nothing.
+  - **`wait4(2)`/`waitid(2)` — LANDED.** Their park (`block_until_child_event`
+    and its siblings) was fatal-signal-only, so a caught signal woke the task and
+    the park swallowed the wake. They now park on `block_until_on_interruptible`,
+    which checks `table_has_deliverable` on the same borrow, and a catchable
+    signal ends the wait with `EINTR`; the syscall gate restarts it under
+    `SA_RESTART`, so `restartable` now lists `WAIT4`/`WAITID` — the exclusion it
+    carried was precisely because the park never answered `EINTR`. Measured on the
+    host (Linux 7.2.7: 2 s child, `SIGALRM` at 100 ms — `SA_RESTART` → the child's
+    pid at 2000 ms, flag clear → `-1/EINTR` at 100 ms) and pinned in the guest by
+    `t-wait-eintr` (a blocked `wait4` and `waitid` both end with `EINTR`, handler
+    run, then the retried call still collects the child — the counterfactual that
+    the wait path is not broken). The `SA_RESTART` rewind for the set that *does*
+    restart stays in `t-sa-restart`.
   - **The console's serial transmit wait** (`console::write_bytes` parks on ring
     space), the same shape on the one wire the kernel writes from its own tasks.
   - **`ioctl(2)`'s per-request verdict.** Linux restarts an interrupted

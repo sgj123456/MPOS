@@ -1250,11 +1250,11 @@ pub(crate) fn timespec_from_ticks(ticks: u64, hz: u64) -> (i64, i64) {
 /// Named remainder: Linux's `ioctl(2)` is restartable *per request* (an
 /// interruptible `DRM_IOCTL_SYNCOBJ_WAIT` restarts, most requests do not), and
 /// this kernel has no per-request verdict - so an interrupted DRM sync-object
-/// wait comes back `EINTR` here even under `SA_RESTART`. `wait4(2)` is
-/// restartable on Linux and not listed, because its park in this kernel is not
-/// interruptible at all (it sleeps through a catchable signal, the gap §2.5
-/// names); listing it would promise a restart of a call that never answers
-/// `EINTR`.
+/// wait comes back `EINTR` here even under `SA_RESTART`. `wait4(2)`/`waitid(2)`
+/// are restartable on Linux (measured on 7.2.7: a caught non-`SA_RESTART` signal
+/// ends the wait with `EINTR`, and `SA_RESTART` restarts it), and this kernel now
+/// makes their child-event park interruptible (`block_until_on_interruptible`,
+/// §2.5), so they are listed.
 pub(crate) fn restartable(nr: u64) -> bool {
     use crate::syscall::linux::nr;
     matches!(
@@ -1288,6 +1288,10 @@ pub(crate) fn restartable(nr: u64) -> bool {
             | nr::FUTEX
             | nr::FCNTL
             | nr::FLOCK
+            // `wait4`/`waitid`: a catchable signal now ends the child-event park
+            // with `EINTR` (§2.5), and Linux restarts both on `SA_RESTART` - measured.
+            | nr::WAIT4
+            | nr::WAITID
     )
 }
 
@@ -3926,13 +3930,16 @@ mod entropy_tests {
             );
         }
 
-        // The two named remainders, pinned so they cannot drift into the
-        // allow-list silently: `ioctl` needs a per-request verdict this kernel
-        // does not have, and `wait4`'s park is not interruptible yet, so a
-        // restart there would be a promise about a call that never returns
-        // EINTR (PLAN.md §2.5).
+        // `ioctl` needs a per-request verdict this kernel does not have, so it
+        // stays out of the allow-list.
         assert!(!restartable(nr::IOCTL));
-        assert!(!restartable(nr::WAIT4));
+        // `wait4`/`waitid` moved *into* the allow-list this pass: their park is
+        // now interruptible (`block_until_on_interruptible`, §2.5), and a real
+        // Linux restarts them on `SA_RESTART` — measured on 7.2.7 (caught
+        // non-`SA_RESTART` signal → `EINTR`; `SA_RESTART` → the wait restarts).
+        // The prior `!restartable(WAIT4)` pinned the *old* wrong shape.
+        assert!(restartable(nr::WAIT4));
+        assert!(restartable(nr::WAITID));
     }
 
     /// The round trip a `nanosleep`'s `rem` rides: a sleep that was ended with

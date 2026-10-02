@@ -524,10 +524,14 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // A caller with no children at all has nothing to wait for: Linux
         // answers ECHILD, and blocking here would sleep forever - OpenRC
         // parks exactly that way after its last helper exits.
-        let collected = if no_hang {
+        let collected: Option<crate::sched::WaitEvent> = if no_hang {
             crate::sched::poll_any_child_event(me, stops, continues)
         } else if crate::sched::has_children(me) {
-            crate::sched::wait_any_child_event(me, stops, continues)
+            match crate::sched::wait_any_child_event(me, stops, continues) {
+                crate::sched::WaitPark::Event(event) => Some(event),
+                crate::sched::WaitPark::NoChild => None,
+                crate::sched::WaitPark::Interrupted => return err::EINTR,
+            }
         } else {
             None
         };
@@ -569,8 +573,9 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
 
     match crate::sched::block_until_child_event(id, stops, continues) {
-        Some(event) => finish_wait_event(event, status, from_user),
-        None => err::ECHILD,
+        crate::sched::WaitPark::Event(event) => finish_wait_event(event, status, from_user),
+        crate::sched::WaitPark::Interrupted => err::EINTR,
+        crate::sched::WaitPark::NoChild => err::ECHILD,
     }
 }
 
@@ -3663,8 +3668,9 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
             // `poll_any_child` already reported nobody ready; park until one
             // of them finishes.
             match crate::sched::wait_any_child(me) {
-                Some(found) => found,
-                None => return err::ECHILD,
+                crate::sched::WaitPark::Event(found) => found,
+                crate::sched::WaitPark::Interrupted => return err::EINTR,
+                crate::sched::WaitPark::NoChild => return err::ECHILD,
             }
         }
     };
