@@ -15,6 +15,8 @@
 //! (`PLAN.md` §11.1.4, V-4). A behaviour-preserving relocation: these are the
 //! same `u32` values, unchanged, with the rationale that travelled with them.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 /// How many virtual consoles are minted at boot: `/dev/tty1` through
 /// `/dev/tty6`, the names a stock `inittab` respawns gettys on.
 pub const VC_COUNT: u32 = 6;
@@ -35,3 +37,22 @@ pub const K_XLATE: u32 = 0x01;
 pub const K_MEDIUMRAW: u32 = 0x02;
 pub const K_UNICODE: u32 = 0x03;
 pub const K_OFF: u32 = 0x04;
+
+/// The virtual console currently on the screen (1-based). This is a `term` fact,
+/// not a filesystem one: which console is showing is exactly what the leaf that
+/// owns the grid also owns (`crates/term/src/lib.rs`). The console mux writes it
+/// when a switch completes; `console`, the drivers and the VFS all read it, so
+/// none of them names another module for the answer (`PLAN.md` §11.2 D.2a closes
+/// the `vfs <-> console` pair by moving this one number here).
+static ACTIVE: AtomicU32 = AtomicU32::new(1);
+
+/// The console on the screen now. The shared read; no lock, one relaxed load.
+pub fn active() -> u32 {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Move the screen to console `to`. Called only by the mux, on switch completion
+/// - every other reader takes the number through [`active`].
+pub fn set_active(to: u32) {
+    ACTIVE.store(to, Ordering::Relaxed);
+}

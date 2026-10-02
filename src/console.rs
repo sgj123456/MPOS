@@ -267,7 +267,7 @@ pub fn vc_output(vc: u32, bytes: &[u8]) {
 
 /// The grid index of the console currently shown, by its `/dev/ttyN` number.
 fn active_grid() -> usize {
-    crate::vfs::vcmux::active() as usize
+    crate::term::vc::active() as usize
 }
 
 /// How far back the replayed boot log reaches. A screen is 25 rows; a few

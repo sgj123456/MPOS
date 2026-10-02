@@ -60,11 +60,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use critical_section::Mutex as CsMutex;
 
 use crate::sched::policy::TaskId;
-use crate::term::vc::{K_XLATE, KD_GRAPHICS, KD_TEXT, VC_COUNT};
+use crate::term::vc::{K_XLATE, KD_GRAPHICS, KD_TEXT, VC_COUNT, active, set_active};
 use crate::term::vtmode::{self, Decision, VtMode};
-
-/// The virtual console currently on the wire, 1-based.
-static ACTIVE: AtomicU32 = AtomicU32::new(1);
 
 /// Each console's video mode (`KD_TEXT`/`KD_GRAPHICS`) and keyboard mode
 /// (`K_XLATE`, `K_OFF`, ...), indexed 1-based like the consoles themselves.
@@ -548,10 +545,9 @@ pub fn ready() -> bool {
     MUX_TASK.load(Ordering::Relaxed) != 0
 }
 
-/// The virtual console currently on the wire, 1-based.
-pub fn active() -> u32 {
-    ACTIVE.load(Ordering::Relaxed)
-}
+// The virtual console currently on the wire is `crate::term::vc::active`/
+// `set_active` — a shared number, not mux state, so the console and the drivers
+// read it from the leaf instead of naming this module (V-4 D.2a).
 
 /// The operator's `^A <digit>`, from any context, including an interrupt.
 ///
@@ -720,7 +716,7 @@ fn switch(to: u32) {
     if to > VC_COUNT {
         return;
     }
-    ACTIVE.store(to, Ordering::Relaxed);
+    set_active(to);
     // The pump is parked on the old console's master; the switch changed what
     // it waits for, and only a wake can make it look.
     wake_task();

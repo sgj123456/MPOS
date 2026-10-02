@@ -720,14 +720,15 @@ it - so the entries say which they are:
       `net`/`vfs`/`drivers` on task exit: `sched → net` is gone (which removed the `net ↔ sched`
       mutual pair, 20 → 19), and the two `crate::drivers::` references left in `runtime.rs` are
       the *execve* `FD_CLOEXEC` pass, a different event, named rather than abstracted (§11.2 Step C)
-- [~] 11.D the terminal emulator and the console mux move out of `vfs` (§11). **Two thirds landed**:
-      the emulator is the `mpos-term` leaf crate (so `console`, `drivers/video` and `vfs::tty` name
-      `crate::term`, and the boundary is a compile error), and — D.1/D.1b — the mux's shared
-      *vocabulary* and its *handover table* (`VC_COUNT` and the `KD_*`/`K_*` mode words, plus the pure
-      `vtmode` state machine) now live in `crate::term` rather than `vfs::pty`/`vfs::tty`/`vfs::vtmode`,
-      so the drivers stop naming `vfs` for any of them. What keeps the mux in `vfs` is the file's own
-      `vfs → console`/`vfs → drivers` *calls* — D.2. Gate green after the moves (`pass=140 fail=0`).
-      Recorded as V-4's remaining half in `ARCHITECTURE.md` §9
+- [~] 11.D the terminal emulator and the console mux move out of `vfs` (§11). **The `vfs ↔ console`
+      pair is closed; the mux file still to move.** The emulator is the `mpos-term` leaf crate, and
+      (D.1/D.1b/D.2a) its vocabulary, its pure `vtmode` handover table, and the active-console number
+      all live in `crate::term` rather than `vfs` — so the drivers stop naming `vfs` for any of them
+      and `console` reads "which console is on screen" from the leaf, collapsing the mutual pair:
+      **mutual pairs 18 → 17** (the first ratchet drop since Step C; gate green `pass=140 fail=0`).
+      What remains is D.2b — relocating `vcmux.rs` itself and inverting its outbound
+      `vfs → console`/`vfs → drivers`/`pty`/`tty` calls (a design move, not a rename). Recorded in
+      `ARCHITECTURE.md` §9
 - [x] 11.F the `target_os = "none"` gate gets a written criterion (`src/lib.rs`, `AGENTS.md` §4),
       and the unused host test module behind it is settled: `net/socket.rs`'s three tests were
       never compiled, and their claims are pinned by `t-sockmsg`, which boots, so the module is
@@ -5923,7 +5924,8 @@ self-test guest: exit 33 (33 is the clean debug exit)
 
 Two of the original criteria are **not** met, deliberately: `wc -l src/syscall/linux/fs.rs` did not
 drop from B1 (it *rose*, by the imports that now name the device types — the 212-line drop was
-B2's, and a downcast is not a line count), and the mutual pair count stayed 18, because `drivers`
+B2's, and a downcast is not a line count), and the mutual pair count stayed 18 *then* (D.2a later
+took it to 17 — see Step D), because `drivers`
 and `net` still name `vfs` and `vfs` still names them from `vcmux`/`procfs`/`sysfs`/`p9`. Those
 references are V-4's and the PCI-config/9p doors' — different findings, different steps; B1 closed
 the downcast cause, which is what V-1 was.
@@ -6131,14 +6133,33 @@ the kernel's `-p mpos` run (528 → 511) into `-p mpos-term` (32 → 49), and `c
 reports no edge appeared and no count grew (`vfs/mod.rs → drivers|net` stays 0; `term` is out of the
 mutual-pair set).
 
-**Remaining (D.2).** With both the vocabulary and the handover table out of `vfs`, `vcmux.rs` now
-forms the pair only through its own *calls* — `vfs → console` (`write_bytes`/`vc_output`/`grids_live`)
-and `vfs → drivers` (`video::render`/`drm::master_held`) — which a file move cannot hide: the mux must
-either invert them (a render/grab callback handed *down* as an argument, the shape Step B2's `kd_ioctl`
-and `gpu::sync::Waker` already established) or move to a layer that may name `console` and `drivers`
-without a back-edge. That is a behaviour-preserving design move in its own commit, not a rename, and
-until it happens the pair stands. Recorded in `ARCHITECTURE.md` §9 as V-4's remaining half rather than
-left as a step that looks done.
+**D.2a — the pair is broken. LANDED (this pass, green), and the premise corrected.** The plan (and
+the paragraph above) assumed the pair stood on the mux's `vfs → console`/`vfs → drivers` *calls*. The
+measurement says otherwise: a mutual pair collapses the moment *either* direction hits zero
+(`xtask/src/depgraph.rs:104-110`), and `console → vfs` was a **single** reference — `src/console.rs`'s
+`active_grid()` reading `crate::vfs::vcmux::active()` for "which console is on screen." So the cheap
+inversion was not the mux's outbound calls at all; it was that one inbound read. The active-console
+number — a lone `AtomicU32` — moved from `vfs::vcmux` to the `term` leaf (`crate::term::vc::active`/
+`set_active`, which already declares "which of the six virtual consoles is active" its business, like
+D.1/D.1b before it). `console.rs` and the drivers now read `crate::term::vc::active`; the mux writes
+it there and reads it there too. `console → vfs` = 0, the pair collapsed to a one-way `vfs → console`,
+and **mutual pairs fell 18 → 17** — the first number Phase 11 has lowered since Step C, ratcheted by
+`BASELINE_MUTUAL_PAIRS = 17`. Behaviour-preserving: bare-metal build green, host suites unchanged
+(`511` kernel + `49` term + `47` xtask), `cargo xtask depgraph` reports `console ↔ vfs` gone and no
+new edge, and the full gate ends `=== SUMMARY pass=140 fail=0`, exit 33, with `t-seat`/`t-tty-*`/
+`t-drm`/`t-fbdev` (the programs that read and switch the active console through the moved state) all
+PASS.
+
+**Remaining (D.2b).** What is still open is the larger, genuinely-non-mechanical move: relocating the
+`vcmux.rs` *file* out of `vfs` into `console`, and inverting its outbound `vfs → console`
+(`write_bytes`/`vc_output`/`grids_live`) and `vfs → drivers` (`video::render::notify`/
+`drm::master_held`) calls — the hand-down/`Waker` shape Step B2 established (`kd_ioctl(owns_card)`,
+`gpu::sync::Waker`). It is *not* a way to break the pair (that is done): a bare move would re-create
+`console → vfs` from the mux's 7 `crate::vfs::pty`/`tty` calls (`lookup`/`pairs`/`master_ready`/
+`take_master` and `tty::global().receive_byte`), so the file can only move once those operational
+back-edges are themselves inverted — a design move in its own commit, not a rename. The one-way
+`vfs → console` edge stays legal-but-recorded until then. `ARCHITECTURE.md` §9 V-4 records the pair
+closed and this move as the remaining half.
 
 ---
 
@@ -6283,9 +6304,12 @@ shown able to go red on each of the three rules.
    share of the cluster, not the downcasts'.
 4. ~~**Step C** — the resource registry.~~ **Done** (§11.2 Step C): the exit hooks live in
    `sched::exit`, registered by `main.rs`, and the `net ↔ sched` pair is gone.
-5. **Step D** — the terminal emulator move. **D.1 + D.1b landed** (the shared VC vocabulary and the
-   pure `vtmode` handover table both moved from `vfs` to `crate::term`, gate green `pass=140 fail=0`);
-   **D.2 remains** (the `vcmux` file itself and its `vfs → console`/`vfs → drivers` calls).
+5. **Step D** — the terminal emulator move. **D.1, D.1b and D.2a landed** (the VC vocabulary and the
+   pure `vtmode` table moved to `crate::term`; then D.2a moved the active-console number to
+   `crate::term::vc`, which collapsed the `vfs ↔ console` mutual pair — **mutual pairs 18 → 17**, the
+   first ratchet drop since Step C; gate green `pass=140 fail=0`). **D.2b remains**: relocating the
+   `vcmux` *file* into `console` and inverting its `vfs → console`/`vfs → drivers`/`pty`/`tty` calls —
+   a design move, not a rename, and no longer needed to break the pair.
 6. **Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.
 7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the
    criterion is in `src/lib.rs`/`AGENTS.md`, the dead test module is deleted with its coverage

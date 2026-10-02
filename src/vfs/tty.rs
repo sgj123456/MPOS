@@ -1560,7 +1560,7 @@ impl Tty {
             // before it has asked for a console by number. Both mean the active
             // one. A host build has no console mux running to be active.
             #[cfg(target_os = "none")]
-            (4, 0) | (4, 64) => Some(crate::vfs::vcmux::active()),
+            (4, 0) | (4, 64) => Some(crate::term::vc::active()),
             _ => None,
         }
     }
@@ -1979,7 +1979,7 @@ impl Tty {
                 if !buffer_ok(buf, size_of::<[u16; 3]>(), true, from_user) {
                     return err::EFAULT;
                 }
-                let shown = crate::vfs::vcmux::active();
+                let shown = crate::term::vc::active();
                 unsafe {
                     let p = buf as *mut u16;
                     p.write_unaligned(crate::vfs::vcmux::kd_mode(shown) as u16);
@@ -2520,7 +2520,7 @@ impl Inode for Tty0 {
     /// [`ControllingTty`] gives for the same reason.
     #[cfg(target_os = "none")]
     fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
-        let shown = super::vcmux::active();
+        let shown = crate::term::vc::active();
         let tty = super::pty::lookup(shown)
             .map(|pty| pty.slave().clone())
             .unwrap_or_else(global);

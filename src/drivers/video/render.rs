@@ -34,7 +34,6 @@ use crate::term::blit;
 use crate::term::font::{CELL_H, CELL_W};
 use crate::term::vc::VC_COUNT;
 use crate::term::{self, Cell, DEFAULT_BG, DEFAULT_FG, MAX_ROWS};
-use crate::vfs::vcmux;
 
 /// The minimum ticks between repaints (~31 Hz at 250 Hz): the ceiling that
 /// coalesces a flood, while a lone keystroke still repaints immediately.
@@ -644,7 +643,7 @@ fn task() {
             last_shown = 0;
             false
         } else {
-            let shown = vcmux::active() as usize;
+            let shown = crate::term::vc::active() as usize;
             let switched = shown != last_shown;
             last_shown = shown;
             if switched {

@@ -32,7 +32,12 @@ use anyhow::{Context, Result, bail};
 /// `sched → net` out, and the eighteenth when `mm` stopped naming `vfs::Inode`
 /// for a frame-backed mapping (`vfs` still names `mm`, so only one direction of
 /// that pair had to go — `ARCHITECTURE.md` V-13). Was 19 before the seam.
-const BASELINE_MUTUAL_PAIRS: usize = 18;
+/// The seventeenth went in D.2a when the active-console number moved from
+/// `vfs::vcmux` to the `term` leaf, so the one `console → vfs` edge
+/// (`console.rs::active_grid` reading which console is on screen) became
+/// `console → term` and the `vfs <-> console` pair collapsed to a one-way edge —
+/// only one direction had to go. Was 18 before it.
+const BASELINE_MUTUAL_PAIRS: usize = 17;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.
 ///

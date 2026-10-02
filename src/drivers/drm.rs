@@ -2145,7 +2145,7 @@ fn master_request(nr: u32, minor: u32, ofd: u64) -> isize {
             if previous != 0 && previous != ofd {
                 critical_section::with(|cs| AUTH_OFD.borrow(cs).borrow_mut().clear());
             }
-            let vc = current_console().unwrap_or_else(crate::vfs::vcmux::active);
+            let vc = current_console().unwrap_or_else(crate::term::vc::active);
             MASTER_PID.store(crate::sched::current_tgid().0 as u64, Ordering::Relaxed);
             // The master is always bound to a console. A holder with no
             // controlling terminal - seatd taking the card before it hands the
