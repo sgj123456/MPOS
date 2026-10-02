@@ -243,15 +243,17 @@ Where the handlers live, and why the files are as big as they are:
 
 | Handler module | Numbers | What it answers |
 |---|---:|---|
-| `syscall/linux/fs.rs` | 135 | Everything that carries a path or drives a file descriptor: `open`/`openat`/`openat2`, `stat`/`statx`, `getdents64`, `renameat2`, `splice`, `mount`, `ioctl`, `fcntl`, pipes, `sendfile`, `fallocate`, `statfs` |
+| `syscall/linux/fs/file.rs` + `fs/ioctl.rs` | 135 | Everything that carries a path or drives a file descriptor: `open`/`openat`/`openat2`, `stat`/`statx`, `getdents64`, `renameat2`, `splice`, `mount`, `fcntl`, pipes, `sendfile`, `fallocate`, `statfs` — in `file.rs`; the device-`ioctl` entry point in `ioctl.rs`. The old single `fs.rs` split along that seam at PLAN.md §11.2 Step E |
 | `syscall/linux/proc.rs` | 50 | Memory and process machinery: `mmap`/`munmap`/`mremap`/`brk`/`mprotect`, `fork`/`clone`/`vfork`, `execve`, `exit_group`, `wait4`/`waitid`, `ptrace`, `process_vm_readv`/`writev`, `nanosleep`, `clock_gettime`, `gettimeofday` |
 | `syscall/linux/posix.rs` | 50 | The POSIX completion set: the identity family (`setreuid`, `getresuid`, `capget`…), capabilities, `sched_*`, `getpriority`/`setpriority`, memory advice (`msync`, `madvise`, `mlock`), the wall-clock setters, self-directed signals |
 | `syscall/linux/abi.rs` | 12 | Pure ABI facts — flag values, struct layouts, argument validation, encodings — host-compiled so the man-page contract is unit-testable |
 | `syscall/linux/nr.rs` | — | The numbers themselves, included by the test suite with `#[path]` so kernel and tests share one table |
 
 `ioctl` deserves a note: its request-number families for fbdev, DRM, RTC, uinput, evdev, TTY and
-block devices are currently parsed in `fs.rs`, which is exactly why that file is 6 300 lines.
-`PLAN.md` Phase 11 (Step B) is the plan to give each driver its own contract back.
+block devices are parsed in `syscall/linux/fs/ioctl.rs` — the old single `fs.rs` grew past 6 300 lines
+holding that switchboard alongside the path/file calls, so PLAN.md §11.2 Step E split the file along
+that seam (the switchboard itself is unchanged). `PLAN.md` Phase 11 (Step B) is the plan to give each
+driver its own contract back.
 
 Deliberate divergences from Linux are collected per subsystem in `PLAN.md` — for example
 `listen(2)` on IPv4 is `EOPNOTSUPP` (the stack is outbound-only), `SO_LINGER{on,0}` is left

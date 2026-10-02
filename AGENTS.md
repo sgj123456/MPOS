@@ -239,7 +239,9 @@ is still `panic!` (`PLAN.md` §8.0).
 **Add/change a Linux syscall.** (1) `src/syscall/linux/nr.rs` — the number and `pub const` (this file is
 `#[path]`-included by the test harness, so naming it there makes it addressable). (2) `src/syscall/linux/mod.rs`
 — the dispatch `match` arm (grouped arms like `nr::STAT | nr::LSTAT =>` are normal). (3) handler in
-`fs.rs` (path/file/device), `proc.rs` (memory/process/time) or `posix.rs` (identity/capabilities/scheduling/
+`fs/file.rs` (path/file/device calls) and `fs/ioctl.rs` (the device-`ioctl` entry point) — the old
+`fs.rs` split along that seam at Step E — plus `proc.rs` (memory/process/time) or `posix.rs`
+(identity/capabilities/scheduling/
 clocks); validation and contracts with the handler, pure ABI facts (flag values, layouts, encodings) in
 host-compiled `abi.rs`. (4) an unimplemented call falls to `_ => ENOSYS` (§4). (5) add a conformance program
 + its `[[bin]]` entry (next recipe). (6) update `PLAN.md` ("Remaining ABI support" + TODO board) and
