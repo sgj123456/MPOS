@@ -61,7 +61,7 @@ use critical_section::Mutex as CsMutex;
 
 use crate::sched::policy::TaskId;
 use crate::term::vc::{K_XLATE, KD_GRAPHICS, KD_TEXT, VC_COUNT};
-use crate::vfs::vtmode::{self, Decision, VtMode};
+use crate::term::vtmode::{self, Decision, VtMode};
 
 /// The virtual console currently on the wire, 1-based.
 static ACTIVE: AtomicU32 = AtomicU32::new(1);

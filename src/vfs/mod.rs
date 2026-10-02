@@ -45,7 +45,6 @@ pub mod timerfd;
 pub mod tty;
 #[cfg(target_os = "none")]
 pub mod vcmux;
-pub mod vtmode;
 
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
 pub use mount::{global, mount, mount_root, pivot_root, resolve, resolve_at, unmount};

@@ -1,8 +1,8 @@
 //! The virtual-console handover: who may switch, and what has to happen first.
 //!
-//! Like [`crate::evdev`], this module is the *policy* half of a bare-metal
+//! Like the `evdev` leaf, this module is the *policy* half of a bare-metal
 //! device lifted out so a host build can argue with it. The device half is
-//! `crate::vfs::vcmux`, which owns the clock, the tasks and the signal
+//! `vfs::vcmux`, which owns the clock, the tasks and the signal
 //! delivery; everything here is arithmetic over a table of per-console modes
 //! plus one in-flight switch. That split is what lets the interesting part -
 //! "a session that promised to answer `VT_RELDISP` must be waited for, and a
@@ -98,7 +98,7 @@ pub const MAX_SIGNAL: u8 = 31;
 /// `VT_RELDISP`, the pending switch simply sits there until the session does answer
 /// or the box is rebooted. What Linux does notice is a *dead* keeper - `kill_pid`
 /// fails and `reset_vc` runs - and that half this kernel has too, at the same
-/// moment ([`crate::vfs::vcmux`] aims the signal at the process and resets the
+/// moment (`vfs::vcmux` aims the signal at the process and resets the
 /// console when nobody is left to receive it).
 ///
 /// So the deadline is what the mux has always been for: a session that is wedged

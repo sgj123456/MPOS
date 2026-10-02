@@ -722,11 +722,12 @@ it - so the entries say which they are:
       the *execve* `FD_CLOEXEC` pass, a different event, named rather than abstracted (§11.2 Step C)
 - [~] 11.D the terminal emulator and the console mux move out of `vfs` (§11). **Two thirds landed**:
       the emulator is the `mpos-term` leaf crate (so `console`, `drivers/video` and `vfs::tty` name
-      `crate::term`, and the boundary is a compile error), and — D.1 — the mux's shared *vocabulary*
-      (`VC_COUNT` and the `KD_*`/`K_*` mode words) now lives in `crate::term::vc` rather than in
-      `vfs::pty`/`vfs::tty`, so the drivers stop naming `vfs` for those. What keeps the mux in `vfs`
-      is the file's own `vfs → console`/`vfs → drivers` calls and `vtmode` — D.2. Gate green after the
-      move (`pass=140 fail=0`). Recorded as V-4's remaining half in `ARCHITECTURE.md` §9
+      `crate::term`, and the boundary is a compile error), and — D.1/D.1b — the mux's shared
+      *vocabulary* and its *handover table* (`VC_COUNT` and the `KD_*`/`K_*` mode words, plus the pure
+      `vtmode` state machine) now live in `crate::term` rather than `vfs::pty`/`vfs::tty`/`vfs::vtmode`,
+      so the drivers stop naming `vfs` for any of them. What keeps the mux in `vfs` is the file's own
+      `vfs → console`/`vfs → drivers` *calls* — D.2. Gate green after the moves (`pass=140 fail=0`).
+      Recorded as V-4's remaining half in `ARCHITECTURE.md` §9
 - [x] 11.F the `target_os = "none"` gate gets a written criterion (`src/lib.rs`, `AGENTS.md` §4),
       and the unused host test module behind it is settled: `net/socket.rs`'s three tests were
       never compiled, and their claims are pinned by `t-sockmsg`, which boots, so the module is
@@ -6118,11 +6119,26 @@ drivers|net` stays 0), and the full gate ends `=== SUMMARY pass=140 fail=0`, exi
 `t-seat`/`t-tty-eintr`/`t-tty-vtime`/`t-tty-query`/`t-ioctl`/`t-drm-lease` (the programs that read
 the KD/KD-mode state through the moved path) all `=== PASS`.
 
-**Remaining (D.2).** With the vocabulary out of the way, `vcmux.rs` still forms the pair through its
-`vfs → console` *calls* and `vfs → drivers` *calls*, and through `vfs::vtmode::{self, Decision,
-VtMode}` (the handover table, whose vocabulary is the next thing to settle). That is a refactor in its
-own commit, and until it happens the pair stands. Recorded in `ARCHITECTURE.md` §9 as V-4's remaining
-half rather than left as a step that looks done.
+**D.1b — the handover table moved too. LANDED (this pass, green).** `vfs::vtmode` (the pure
+`VT_AUTO`/`VT_PROCESS` release/decision table — `VtMode`, `Decision`, `Ack`, `Promise`, `Signal`,
+`Release`, `Table`, `RELEASE_TIMEOUT_TICKS`) is a self-contained state machine: it named no kernel
+module at all (only `alloc::vec`), so like the `evdev`/`uinput`/`term` extractions before it it is a
+leaf lifted out so a host build can argue with it. It now lives at `crates/term/src/vtmode.rs` as
+`crate::term::vtmode` — the same leaf that holds the VC vocabulary, since `term`'s own header claims
+"which of the six virtual consoles is active" as its business. `vfs::vcmux` and `vfs::tty` name it
+there; `vfs/mod.rs` no longer declares it. Host coverage preserved: the 17 `vtmode` tests moved from
+the kernel's `-p mpos` run (528 → 511) into `-p mpos-term` (32 → 49), and `cargo xtask depgraph` still
+reports no edge appeared and no count grew (`vfs/mod.rs → drivers|net` stays 0; `term` is out of the
+mutual-pair set).
+
+**Remaining (D.2).** With both the vocabulary and the handover table out of `vfs`, `vcmux.rs` now
+forms the pair only through its own *calls* — `vfs → console` (`write_bytes`/`vc_output`/`grids_live`)
+and `vfs → drivers` (`video::render`/`drm::master_held`) — which a file move cannot hide: the mux must
+either invert them (a render/grab callback handed *down* as an argument, the shape Step B2's `kd_ioctl`
+and `gpu::sync::Waker` already established) or move to a layer that may name `console` and `drivers`
+without a back-edge. That is a behaviour-preserving design move in its own commit, not a rename, and
+until it happens the pair stands. Recorded in `ARCHITECTURE.md` §9 as V-4's remaining half rather than
+left as a step that looks done.
 
 ---
 
@@ -6267,8 +6283,8 @@ shown able to go red on each of the three rules.
    share of the cluster, not the downcasts'.
 4. ~~**Step C** — the resource registry.~~ **Done** (§11.2 Step C): the exit hooks live in
    `sched::exit`, registered by `main.rs`, and the `net ↔ sched` pair is gone.
-5. **Step D** — the terminal emulator move. **D.1 landed** (the shared VC vocabulary — `VC_COUNT`
-   and the KD/K mode words — moved from `vfs` to `crate::term::vc`, gate green `pass=140 fail=0`);
+5. **Step D** — the terminal emulator move. **D.1 + D.1b landed** (the shared VC vocabulary and the
+   pure `vtmode` handover table both moved from `vfs` to `crate::term`, gate green `pass=140 fail=0`);
    **D.2 remains** (the `vcmux` file itself and its `vfs → console`/`vfs → drivers` calls).
 6. **Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.
 7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the

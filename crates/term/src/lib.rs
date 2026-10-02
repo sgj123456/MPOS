@@ -42,6 +42,7 @@ pub mod cursor;
 pub mod font;
 pub mod keymap;
 pub mod vc;
+pub mod vtmode;
 
 use alloc::vec;
 use alloc::vec::Vec;

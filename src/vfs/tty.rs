@@ -1958,7 +1958,7 @@ impl Tty {
                 }
                 let mut bytes = [0u8; 8];
                 unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, bytes.as_mut_ptr(), n) };
-                let mode = crate::vfs::vtmode::VtMode::from_bytes(&bytes);
+                let mode = crate::term::vtmode::VtMode::from_bytes(&bytes);
                 // The promise belongs to the process writing it, and is remembered as
                 // that: `relsig`/`acqsig` are sent to this pid and to no one else,
                 // which is Linux's `vc->vt_pid` and what lets a seat manager set the
