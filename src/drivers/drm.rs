@@ -5364,12 +5364,24 @@ fn wait_deadline(nsec: i64) -> u64 {
 /// readiness changes when *another task submits a fence to it*, and that task has
 /// no way to find a sleeper it was not told about - the same lock-poll-try-unlock-
 /// park shape `vfs::eventfd` uses for its counter.
+///
+/// The waking half of that is the kernel's rather than the state machine's: a
+/// parked waiter here is a scheduler task, and `gpu::sync` deliberately cannot
+/// name one, so the *how* arrives as this implementation of the crate's `Waker`.
+struct SchedWaker;
+
+impl crate::gpu::sync::Waker for SchedWaker {
+    fn wake(&mut self, waiter: crate::gpu::sync::WaiterId) {
+        crate::sched::wake(crate::sched::TaskId(waiter));
+    }
+}
+
 fn syncobj_park(
     objs: &[Arc<crate::gpu::sync::SyncObj>],
     nsec: i64,
     satisfied: impl Fn() -> bool,
 ) -> isize {
-    let me = crate::sched::current();
+    let me = crate::sched::current().0;
     for obj in objs {
         obj.subscribe(me);
     }
@@ -5597,7 +5609,7 @@ fn syncobj_fd_to_handle(owner: u64, arg: usize) -> isize {
         let Some(sync_file) = inode.as_sync_file() else {
             return libc_einval();
         };
-        target.submit(sync_file.fence(), None);
+        target.submit(sync_file.fence(), None, &mut SchedWaker);
         critical_section::with(|cs| {
             let mut st = STATE.borrow(cs).borrow_mut();
             sync_events_left(&mut st, owner, handle);
@@ -5805,7 +5817,7 @@ fn syncobj_signal(owner: u64, arg: usize) -> isize {
         Err(e) => return e,
     };
     for obj in &objs {
-        obj.submit(crate::gpu::sync::Fence::retired(), None);
+        obj.submit(crate::gpu::sync::Fence::retired(), None, &mut SchedWaker);
     }
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
@@ -5852,7 +5864,11 @@ fn syncobj_timeline_signal(owner: u64, arg: usize) -> isize {
         Err(e) => return e,
     };
     for (obj, &point) in objs.iter().zip(points.iter()) {
-        obj.submit(crate::gpu::sync::Fence::retired(), Some(point));
+        obj.submit(
+            crate::gpu::sync::Fence::retired(),
+            Some(point),
+            &mut SchedWaker,
+        );
     }
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
@@ -5937,12 +5953,16 @@ fn syncobj_transfer(owner: u64, arg: usize) -> isize {
         return libc_einval();
     }
     match src_obj.fence() {
-        Some(fence) => dst_obj.submit(fence, (dst_point != 0).then_some(dst_point)),
+        Some(fence) => dst_obj.submit(
+            fence,
+            (dst_point != 0).then_some(dst_point),
+            &mut SchedWaker,
+        ),
         // The source carries nothing, so only the destination's own point moves;
         // its fence (the one that made this request legal) is left where it is.
         None => {
             if dst_point != 0 {
-                dst_obj.submit_point(dst_point);
+                dst_obj.submit_point(dst_point, &mut SchedWaker);
             }
         }
     }

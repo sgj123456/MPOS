@@ -70,7 +70,7 @@
 
 use alloc::vec::Vec;
 
-use crate::err::{EINVAL, ENOSYS};
+use mpos_err::{EINVAL, ENOSYS};
 
 /// `VIRTGPU_PARAM_3D_FEATURES`: whether the card can run a 3D context.
 pub const PARAM_3D_FEATURES: u64 = 1;

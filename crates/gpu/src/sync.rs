@@ -113,7 +113,26 @@ pub struct SyncObj {
     /// Tasks parked in a `WAIT_FOR_SUBMIT`. A sync object's readiness changes
     /// when *another task submits a fence to it*, so a waiter has to be named and
     /// woken - the same shape `vfs::eventfd`'s counter has, for the same reason.
-    waiters: Mutex<RefCell<Vec<crate::sched::TaskId>>>,
+    waiters: Mutex<RefCell<Vec<WaiterId>>>,
+}
+
+/// Who a parked waiter is, as a number this crate never interprets.
+///
+/// The kernel's waiter numbers are its `sched::TaskId`; this crate's job is to
+/// remember which ones parked, not to know what a task is.
+pub type WaiterId = usize;
+
+/// How to wake a waiter, injected by whoever owns the tasks.
+///
+/// The state machine knows *when* a waiter has to be woken - the moment a fence
+/// is submitted to the object it parked on - and nothing else: a `drm_syncobj`
+/// wait parks a scheduler task, and this crate cannot name a scheduler. So the
+/// *how* arrives as a parameter: `drivers::drm` injects the kernel's
+/// implementation (this crate's header has the reason), and a host test injects
+/// one that records, which is what makes the wake itself host-testable for the
+/// first time.
+pub trait Waker {
+    fn wake(&mut self, waiter: WaiterId);
 }
 
 impl SyncObj {
@@ -187,13 +206,13 @@ impl SyncObj {
     /// disagree about what "submitting a fence" means. `point` is `Some` for the
     /// two that carry one; it makes the object a timeline and moves the
     /// high-water mark forward, never back.
-    pub fn submit(&self, fence: Arc<Fence>, point: Option<u64>) {
+    pub fn submit(&self, fence: Arc<Fence>, point: Option<u64>, waker: &mut dyn Waker) {
         critical_section::with(|cs| {
             self.inner.borrow(cs).borrow_mut().fence = Some(fence);
         });
         match point {
-            Some(p) => self.submit_point(p),
-            None => self.wake_waiters(),
+            Some(p) => self.submit_point(p, waker),
+            None => self.wake_waiters(waker),
         }
     }
 
@@ -202,7 +221,7 @@ impl SyncObj {
     /// One caller: a `TRANSFER` whose source holds nothing to carry. The
     /// destination keeps its own fence - which is the fence that made the request
     /// legal in the first place - and learns the point it was told about.
-    pub fn submit_point(&self, point: u64) {
+    pub fn submit_point(&self, point: u64, waker: &mut dyn Waker) {
         critical_section::with(|cs| {
             let mut inner = self.inner.borrow(cs).borrow_mut();
             inner.timeline = true;
@@ -210,7 +229,7 @@ impl SyncObj {
                 inner.point = point;
             }
         });
-        self.wake_waiters();
+        self.wake_waiters(waker);
     }
 
     /// `SYNCOBJ_RESET`: nothing is behind this object any more.
@@ -229,7 +248,7 @@ impl SyncObj {
     }
 
     /// Register a task to be woken when a fence is submitted here.
-    pub fn subscribe(&self, id: crate::sched::TaskId) {
+    pub fn subscribe(&self, id: WaiterId) {
         critical_section::with(|cs| {
             let mut waiters = self.waiters.borrow(cs).borrow_mut();
             if !waiters.contains(&id) {
@@ -238,21 +257,23 @@ impl SyncObj {
         });
     }
 
-    pub fn unsubscribe(&self, id: crate::sched::TaskId) {
+    pub fn unsubscribe(&self, id: WaiterId) {
         critical_section::with(|cs| {
             self.waiters.borrow(cs).borrow_mut().retain(|&w| w != id);
         });
     }
 
-    /// Wake every parked waiter. On the host there is no scheduler and nothing
-    /// asleep, so the list is empty and the loop is not there at all.
-    fn wake_waiters(&self) {
-        #[cfg(target_os = "none")]
-        {
-            let waiters = critical_section::with(|cs| self.waiters.borrow(cs).borrow().clone());
-            for id in waiters {
-                crate::sched::wake(id);
-            }
+    /// Wake every parked waiter, through the caller's [`Waker`].
+    ///
+    /// The list is taken under the lock and walked outside it, so a waiter that
+    /// subscribes while a wake is in flight is registered against the state that
+    /// is already settled and will find its condition met when it re-checks -
+    /// the same reason `vfs::eventfd` wakes from a snapshot rather than from
+    /// inside `critical_section`.
+    fn wake_waiters(&self, waker: &mut dyn Waker) {
+        let waiters = critical_section::with(|cs| self.waiters.borrow(cs).borrow().clone());
+        for id in waiters {
+            waker.wake(id);
         }
     }
 }
@@ -260,6 +281,22 @@ impl SyncObj {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+
+    /// A [`Waker`] that records who it was told to wake.
+    ///
+    /// Every test that submits passes one, because the waker is a parameter now:
+    /// the crate cannot call a scheduler, so the module that used to hide a
+    /// machine-only `sched::wake` behind `#[cfg(target_os = "none")]` states who
+    /// it woke and lets the assertion be a host one.
+    #[derive(Default)]
+    struct Recorder(Vec<WaiterId>);
+
+    impl Waker for Recorder {
+        fn wake(&mut self, waiter: WaiterId) {
+            self.0.push(waiter);
+        }
+    }
 
     #[test]
     fn an_object_with_no_fence_is_refused_rather_than_ready() {
@@ -297,7 +334,7 @@ mod tests {
     #[test]
     fn a_point_is_a_high_water_mark() {
         let obj = SyncObj::new(false);
-        obj.submit(Fence::retired(), Some(4));
+        obj.submit(Fence::retired(), Some(4), &mut Recorder::default());
         assert!(obj.is_timeline());
         assert_eq!(obj.point(), 4);
         assert!(obj.ready(Some(4), false));
@@ -309,11 +346,11 @@ mod tests {
 
         // Backwards and equal are accepted and move nothing: a point that went
         // back would let a wait on a point already passed fail again.
-        obj.submit(Fence::retired(), Some(2));
+        obj.submit(Fence::retired(), Some(2), &mut Recorder::default());
         assert_eq!(obj.point(), 4);
-        obj.submit(Fence::retired(), Some(4));
+        obj.submit(Fence::retired(), Some(4), &mut Recorder::default());
         assert_eq!(obj.point(), 4);
-        obj.submit(Fence::retired(), Some(9));
+        obj.submit(Fence::retired(), Some(9), &mut Recorder::default());
         assert_eq!(obj.point(), 9);
     }
 
@@ -322,7 +359,7 @@ mod tests {
         // Measured on the real card: a `TIMELINE_WAIT` for a point it has never
         // reached answers `ok` once something is behind the object.
         let obj = SyncObj::new(true);
-        obj.submit(Fence::retired(), Some(2));
+        obj.submit(Fence::retired(), Some(2), &mut Recorder::default());
         assert!(!obj.ready(Some(9), false), "the point is not covered");
         assert!(obj.ready(Some(9), true), "but the fence is there");
     }
@@ -330,7 +367,7 @@ mod tests {
     #[test]
     fn reset_takes_the_fence_and_the_point_away_and_leaves_a_timeline() {
         let obj = SyncObj::new(false);
-        obj.submit(Fence::retired(), Some(7));
+        obj.submit(Fence::retired(), Some(7), &mut Recorder::default());
         assert!(obj.ready(Some(7), false));
 
         obj.reset();
@@ -342,7 +379,7 @@ mod tests {
 
         // And a second fence re-arms it, which is the property the point going
         // backwards would have destroyed.
-        obj.submit(Fence::retired(), Some(7));
+        obj.submit(Fence::retired(), Some(7), &mut Recorder::default());
         assert!(obj.ready(Some(7), false));
     }
 
@@ -351,7 +388,7 @@ mod tests {
         // `SIGNAL` leaves a fence behind and no point: the measured card reads
         // its point back as 0 afterwards.
         let obj = SyncObj::new(false);
-        obj.submit(Fence::retired(), None);
+        obj.submit(Fence::retired(), None, &mut Recorder::default());
         assert!(obj.has_fence());
         assert!(!obj.is_timeline());
         assert_eq!(obj.point(), 0);
@@ -365,12 +402,16 @@ mod tests {
     #[test]
     fn a_transfer_carries_the_fence_and_moves_the_destinations_point() {
         let src = SyncObj::new(false);
-        src.submit(Fence::retired(), Some(6));
+        src.submit(Fence::retired(), Some(6), &mut Recorder::default());
         let dst = SyncObj::new(false);
 
         // What `TRANSFER` does at the destination: the fence, and the point it
         // was told - which is what makes a plain object a timeline.
-        dst.submit(src.fence().expect("the source holds one"), Some(3));
+        dst.submit(
+            src.fence().expect("the source holds one"),
+            Some(3),
+            &mut Recorder::default(),
+        );
         assert!(dst.has_fence());
         assert!(dst.is_timeline());
         assert_eq!(dst.point(), 3);
@@ -395,7 +436,7 @@ mod tests {
     #[test]
     fn a_waiter_is_registered_once_and_can_leave() {
         let obj = SyncObj::new(false);
-        let me = crate::sched::TaskId(7);
+        let me: WaiterId = 7;
         obj.subscribe(me);
         obj.subscribe(me);
         let count = critical_section::with(|cs| obj.waiters.borrow(cs).borrow().len());
@@ -404,7 +445,37 @@ mod tests {
         let count = critical_section::with(|cs| obj.waiters.borrow(cs).borrow().len());
         assert_eq!(count, 0);
         // Submitting with nobody waiting is the ordinary case, not a special one.
-        obj.submit(Fence::retired(), None);
+        obj.submit(Fence::retired(), None, &mut Recorder::default());
         assert!(obj.ready(None, false));
+    }
+
+    #[test]
+    fn submitting_a_fence_wakes_every_parked_waiter_and_nobody_else() {
+        // The path the crate split made testable: before it, `wake_waiters` was
+        // `#[cfg(target_os = "none")]` and called `sched::wake` directly, so the
+        // only way to know a waiter was woken was to boot the machine and watch a
+        // task that had already been asleep. With the waker injected, the claim is
+        // a host assertion - and it is the claim `t-drm-sync` pins in the guest.
+        let obj = SyncObj::new(false);
+        obj.subscribe(3);
+        obj.subscribe(9);
+        obj.unsubscribe(9);
+
+        let mut waker = Recorder::default();
+        obj.submit(Fence::retired(), None, &mut waker);
+        assert_eq!(waker.0, vec![3], "the waiter that is still parked");
+
+        // A point-only submit wakes the same list: it is the other half of the
+        // write `SIGNAL` and `TRANSFER` both end in.
+        let mut waker = Recorder::default();
+        obj.submit_point(5, &mut waker);
+        assert_eq!(waker.0, vec![3]);
+
+        // And an object nobody waits on wakes nobody, which is every object on a
+        // card with no compositor.
+        let lonely = SyncObj::new(false);
+        let mut waker = Recorder::default();
+        lonely.submit(Fence::retired(), None, &mut waker);
+        assert!(waker.0.is_empty());
     }
 }

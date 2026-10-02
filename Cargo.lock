@@ -286,6 +286,7 @@ dependencies = [
  "mpos-cred",
  "mpos-date",
  "mpos-err",
+ "mpos-gpu",
  "mpos-pci",
  "mpos-seccomp",
  "mpos-term",
@@ -326,6 +327,16 @@ version = "0.1.0"
 [[package]]
 name = "mpos-err"
 version = "0.1.0"
+
+[[package]]
+name = "mpos-gpu"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "critical-section",
+ "mpos-err",
+ "virtio-drivers",
+]
 
 [[package]]
 name = "mpos-pci"

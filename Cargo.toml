@@ -39,6 +39,10 @@ mpos-pci = { path = "crates/pci" }
 # port decode (arithmetic on three `u32`s whose only reader is machine-only).
 mpos-term = { path = "crates/term" }
 mpos-ahci = { path = "crates/ahci" }
+# The GPU's pure half (the wire ABI, the DRM blobs, the cursor blend, the
+# sync-object state machine). Its own crate, and the one edge that kept it out of
+# one - the wake a parked sync-object waiter needs - is an injected trait now.
+mpos-gpu = { path = "crates/gpu" }
 
 # Used by the arch-agnostic mapping plan, so deliberately not target-gated.
 # Already in the tree as a dependency of `x86_64`.

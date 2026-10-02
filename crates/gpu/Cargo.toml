@@ -1,0 +1,30 @@
+# The GPU's pure half: the virtio-gpu wire ABI, the two DRM blobs a KMS driver
+# publishes as bytes, the cursor's composition, the sync-object state machine and
+# the `DRM_VIRTGPU_*` answers. Every one is a decision table or an encoder whose
+# reader is the driver - and `drivers/drm.rs` is machine-only, so none of it can
+# be checked from there. Its own crate for that reason, and for the enforcement
+# every leaf here gets: this crate cannot name the kernel, which is what keeps a
+# decision about a command number from quietly acquiring a dependency on a task
+# table (`PLAN.md` §7.4, §11 Step E).
+[package]
+name = "mpos-gpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The errno table, for the answers the `DRM_VIRTGPU_*` family gives - the same
+# leaf every other layer refuses in Linux's language with.
+mpos-err = { path = "../err" }
+# The virtio-gpu wire vocabulary is spelled with the same two crates the driver
+# uses: `abi.rs` names `virtio_drivers::config::{ReadOnly, WriteOnly}` and builds
+# its feature word with `bitflags`. Ungated here for the same reason the kernel's
+# manifest leaves them ungated - the ABI half is host-compiled and tested, and
+# the crate it agrees with has to be the one the driver sends through.
+bitflags = "2.13"
+virtio-drivers = "0.13"
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }

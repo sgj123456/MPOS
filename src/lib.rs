@@ -72,8 +72,11 @@ pub mod evdev;
 /// The GPU's host-testable logic: the DRM blobs, cursor composition,
 /// sync-object state machine, the `DRM_VIRTGPU_*` answers, and the virtio-gpu
 /// wire ABI. Each is pure and tested on the host; the machine bodies stay in
-/// `drivers`.
-pub mod gpu;
+/// `drivers`. Its own leaf crate now - the driver that reads it is machine-only,
+/// so nothing checked from *there* can be checked at all, and the one thing that
+/// was not pure (who a sync object wakes) arrives as an injected
+/// `gpu::sync::Waker`.
+pub use mpos_gpu as gpu;
 /// Kernel logging: `tracing` events, formatted onto the serial console.
 /// Ungated so the level names and the command-line parsing stay testable on
 /// the host; only the subscriber that writes to COM1 is machine-specific.

@@ -184,6 +184,8 @@ fn run_unit_tests() -> Result<()> {
         "mpos-term",
         "-p",
         "mpos-ahci",
+        "-p",
+        "mpos-gpu",
     ])
     .current_dir(&root);
     utils::run_status(&mut cmd, "the kernel's host unit tests")?;
