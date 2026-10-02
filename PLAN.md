@@ -675,7 +675,10 @@ it - so the entries say which they are:
       and the unused host test module behind it is settled: `net/socket.rs`'s three tests were
       never compiled, and their claims are pinned by `t-sockmsg`, which boots, so the module is
       gone. `xtask/src/gates.rs` fails the gate on the shape from now on (§11.2 Step F)
-- [ ] 11.G a depgraph ratchet, so the measured cycle count cannot grow back (§11)
+- [x] 11.G a depgraph ratchet, so the measured cycle count cannot grow back: `cargo xtask
+      depgraph` (also a host test, so it is inside `cargo xtask test`) re-runs §11.0's extraction
+      with comments stripped and holds three recorded baselines — lower layer → `syscall`,
+      `vfs/mod.rs` → devices, mutual pairs — under `xtask/src/depgraph.rs` (§11.2 Step G)
 
 **ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
 
@@ -5473,6 +5476,13 @@ its own script corrects two of those and the correction is worth keeping: the tr
 Step A then takes it to 21, for the reason §11.1.7 records: one of those pairs came from a file the
 compiler never saw.
 
+**The same extraction runs as a check now** (§11.2 Step G, `cargo xtask depgraph`), and running it
+that way found a third correction of the same kind: this script matches *text*, so an edge it
+reports can be a doc comment. Measured with `//` comments stripped — i.e. who names whom in code —
+the tree has **20** mutual pairs, not 21: `uaccess → syscall` is a mention in a doc comment, and
+`vfs → uaccess` with it. The ratchet holds the code number, and the three baselines it records
+(re-measured 2026-10-02) are in §11.2 Step G.
+
 That last row is the finding. At module granularity the kernel is one strongly connected
 component: there is no layer that can be compiled, tested or refactored on its own. Every
 other item below is a *cause* of that number, which is why the fixes are ordered to reduce it
@@ -5957,7 +5967,7 @@ build is green with the same single pre-existing warning, and the host kernel su
 
 ---
 
-#### Step G — Keep the graph from regressing
+#### Step G — Keep the graph from regressing — **DONE**
 
 Once A–F have landed, freeze the result. Add to `xtask` a `depgraph` subcommand (or a host test)
 that re-runs §11.0's extraction and asserts:
@@ -5973,6 +5983,41 @@ make and a regression is a failing test.
 
 **Acceptance:** `cargo xtask depgraph` reports the current edge and cycle counts and fails when
 either worsens.
+
+**Done — and one correction to the method, which is the interesting part.** The ratchet is
+`xtask/src/depgraph.rs`, reachable as `cargo xtask depgraph` and also run as a host test, so it is
+inside `cargo xtask test` rather than beside it. It measures the tree the way §11.0's script does
+— every file under `src`, each mapped to its top-level module, every `crate::<mod>` reference an
+edge — with **one deliberate difference: `//` comments are stripped before matching.** That was
+not a tidy-up; it is what makes the number mean "who names whom". §11.0 matches text, which is why
+the audit it published counted three edges that are prose: `uaccess → syscall` is a doc comment
+(and `vfs → uaccess` with it), and the third pair `arch ↔ vfs` came from a file the compiler never
+saw at all (§11.1.7's deleted `arch/x86_64/serial.rs`). Measured both ways on this tree: **23**
+mutual pairs by text, **20** in code. The ratchet holds the code number, because a rule that fires
+on a sentence is a rule people learn to word around.
+
+**The rules are ratchets rather than absolute refusals, and that is a statement about where in
+the plan this landed.** Steps A, E and F are done and B/C are not, so two of the three rules are
+*not yet* zero, and a check born red is one nobody reads. Each constant names the call sites that
+keep it non-zero and the step that removes them:
+
+| Rule | Measured 2026-10-02 | What keeps it there | Removed by |
+|---|---|---|---|
+| lower layer → `syscall` | `drivers` 1, `sched` 10, the rest 0 | `drivers/virtio/sound.rs`'s one `use crate::syscall::linux::abi` (V-5's remainder); `sched/runtime.rs`'s `crate::syscall::linux::{abi, nr}`, `MMAP_BASE` and `DEFAULT_UMASK` | B2 (the ioctl ABI), B/C (the mapping base and the umask are scheduler state) |
+| `vfs/mod.rs` → devices | 9 | the nine `Inode::as_*` downcasts (V-1) | B1 |
+| mutual pairs | 20 | the whole `vfs ↔ sched ↔ syscall ↔ net ↔ drivers` cluster | B, C, D |
+
+`arch` and `main` are deliberately **not** in the first rule: the `syscall` gate exists to enter
+the dispatcher and `main` is the wiring, so both edges are the design. A layer with a baseline of
+zero — `net`, `blk`, `pci`, `rand`, `uevent`, `vfs` — fails on its *first* reference, which is
+where the ratchet earns its name.
+
+Four unit tests pin the instrument itself, because a measurement that cannot tell two shapes apart
+agrees with whatever it is pointed at (§12.1 A8's lesson, in a different currency): a reference in
+a doc comment is not an edge; a cycle of two is reported once and a one-way edge is not a pair; a
+service naming `syscall` with no baseline fails; and the `vfs/mod.rs` rule is silent at its
+recorded number and fails one past it. The check has never been red on this tree, and it has been
+shown able to go red on each of the three rules.
 
 ---
 
@@ -5993,9 +6038,11 @@ either worsens.
 7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the
    criterion is in `src/lib.rs`/`AGENTS.md`, the dead test module is deleted with its coverage
    named, and `xtask/src/gates.rs` fails the sweep on the shape.
-8. **Step G** — the ratchet.
+8. ~~**Step G** — the ratchet.~~ **Done** (§11.2 Step G): `cargo xtask depgraph` measures the
+   graph with comments stripped and holds three recorded baselines; it is also a host test, so
+   `cargo xtask test` runs it.
 
-Steps A, E and F are mechanical and could be done by anyone with an afternoon, and all three
+Steps A, E, F and G are mechanical and could be done by anyone with an afternoon, and all four
 have landed; B and C need someone who knows the device and scheduler paths. Nothing here has to
 land before the feature
 work in Phases 1–10 — but every feature lands *cheaper* after B and C, which is the argument for

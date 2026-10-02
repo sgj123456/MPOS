@@ -71,6 +71,7 @@ Plus, for `xtask run`/`disk`/`rootfs`: `qemu-system-x86_64`, OVMF (`/usr/share/O
 | `cargo xtask run` | Boot in QEMU, rebuilding if anything is stale | when needed |
 | `cargo xtask run --mode terminal\|gui\|mirror` | Same, with the QEMU wiring and the guest's `console=` list chosen together — the window, which consoles the guest counts, and where the launcher reads the serial line (stdio, or `build/serial.log` in `gui`, whose text console shows in the window) are separate questions | when needed |
 | `cargo xtask test` | **The gate.** Host unit tests, then every user test program booted in QEMU | no |
+| `cargo xtask depgraph` | Measure the kernel's module graph and check it against the Phase-11 ratchet — it fails when an edge appears or a count grows | no |
 | `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` | Just the host unit tests | no |
 | `cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu` | xtask's own unit tests | no |
 | `cargo xtask clean` | Remove `build/` and `target/` | when needed |
@@ -189,7 +190,11 @@ last two *what* it must carry with it.
 Rule 5 says to respect the graph; this is the graph. `ARCHITECTURE.md` §2 holds the full mermaid diagram with
 every real `crate::` reference, §3 the ownership table, §9 the measured violations — this table is the working
 copy and the two files must move together. A module may call **downward only**, into what "may depend on"
-lists; everything else is a boundary violation. For the seven purest leaves — `err`, `pci`, `date`,
+lists; everything else is a boundary violation. The graph is measured, not just described: `cargo xtask
+depgraph` (a host test too, so `cargo xtask test` runs it) re-extracts every `crate::` reference, reports the
+edges and the mutual module pairs, and fails when one appears that was not there the last time somebody
+recorded the number (`PLAN.md` §11.2 Step G). Adding an edge along a violation is therefore a red gate, and
+removing one is a commit that lowers a constant. For the seven purest leaves — `err`, `pci`, `date`,
 `binfmt`, `cred`, `uts`, `seccomp` — that rule is no longer a convention: they are separate crates under
 `crates/` (re-exported from `src/lib.rs` as `crate::err` etc.), so a leaf physically cannot name the kernel
 and an upward edge from them is a compile error. See `ARCHITECTURE.md` §1.

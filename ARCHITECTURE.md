@@ -379,6 +379,20 @@ Two notes on the table above, both of them about trusting a measured number:
   an allowed edge, and `bind` takes the preferred port id as a parameter). The SCC verdict
   stands: the remaining edges still make the module graph one component at this granularity.
 
+**The ratchet is the live measurement.** `cargo xtask depgraph` (`PLAN.md` §11.2 Step G) runs the
+same extraction as its own *check*, with one difference that matters: `//` comments are stripped
+before matching, so what it counts is who names whom in code rather than who writes about whom.
+Measured on the tree as steps A, E and F landed it reports **20** mutual pairs, where the same
+extraction matching text reports 23 — `uaccess ↔ syscall`, `evdev ↔ vfs` and `mm ↔ sched` are
+prose, not edges, which is the lesson the `arch ↔ vfs` phantom taught above, met a second time. The
+tables in this section are the audit's snapshot and are left as they were read; from here the
+command is what they have to agree with, and it fails when an edge appears that was not there when
+the baseline was recorded. Two further rules ride with it, each a ratchet at its recorded number
+rather than an absolute refusal, because Steps B and C are what take them to zero: no layer below
+`syscall` names `crate::syscall::` (`drivers` 1, `sched` 10 today; `arch` and `main` are exempt by
+design — the gate exists to enter the dispatcher), and `src/vfs/mod.rs` names no device (`9`, the
+nine `as_*` downcasts of V-1).
+
 ---
 
 ## 7. Concurrency model
@@ -494,4 +508,6 @@ drivers, net, blk, pci, rand, uevent   →  may use: arch, mm, sched, sync
 ```
 
 with two hard rules: **nothing below `syscall` names `syscall`**, and **nothing outside
-`vfs` names `vfs`'s concrete device types**.
+`vfs` names `vfs`'s concrete device types**. Both are measured now rather than asserted:
+`cargo xtask depgraph` reports the counts and fails when either grows (§6, `PLAN.md` §11.2
+Step G).

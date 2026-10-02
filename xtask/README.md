@@ -92,6 +92,7 @@ cargo xtask [global flags] <command>
 | `run` | run | 在 QEMU 中启动镜像；若产物过期会先自动重建 | boot the image in QEMU, rebuilding first if stale | 视情况 when needed |
 | `all` | all | 一次做完：内核、initramfs、镜像、根文件系统 | build everything in one go | 是 yes |
 | `test` | test | 自测：宿主单元测试 + 在 QEMU 里跑 `tests.toml` 选中的用户测试程序并解析结果 | self-test sweep: host unit tests + the user test programs `tests.toml` selects, booted in QEMU | 否 no |
+| `depgraph` | depgraph | 重新测量内核模块图并对照 Phase 11 的棘轮：任何新增的向上依赖或增长的计数都会让命令失败（它同时是一个宿主测试，`cargo xtask test` 会跑到） | re-measure the kernel's module graph against the Phase-11 ratchet; fails when an upward edge appears or a count grows (also a host test, so `test` runs it) | 否 no |
 | `clean` | clean | 删除 `build/` 与 `target/` | remove the build and target directories | 视情况 when needed |
 
 ### 环境变量 | Environment variables
@@ -124,6 +125,9 @@ cargo xtask run --mode mirror     # 窗口和终端同时看到控制台 | both 
 # 跑完整自测 | full self-test
 cargo test  -p mpos --lib --target x86_64-unknown-linux-gnu   # 只跑宿主单测
 cargo xtask test        # 宿主单测 + 虚拟机内的用户测试程序
+
+# 看模块依赖有没有长回去 | check the module graph has not grown back
+cargo xtask depgraph    # 打印模块边与互指模块对，越过棘轮就失败
 
 # 发布版 | release build
 cargo xtask --profile release all

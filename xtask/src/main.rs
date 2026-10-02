@@ -6,6 +6,7 @@
 //! that user afterwards.
 
 mod config;
+mod depgraph;
 mod disk;
 mod gates;
 mod initramfs;
@@ -76,6 +77,9 @@ enum Commands {
     /// Run the self-tests: host unit tests plus the user test programs
     /// `tests.toml` selects, booted in QEMU from a test initramfs
     Test,
+    /// Measure the kernel's module graph and check it against the ratchet
+    /// (PLAN.md §11.2 Step G), so the cycle count cannot grow back
+    Depgraph,
     /// Remove the build and target directories
     Clean,
 }
@@ -90,6 +94,7 @@ impl Commands {
             Commands::Run => "run",
             Commands::All => "all",
             Commands::Test => "test",
+            Commands::Depgraph => "depgraph",
             Commands::Clean => "clean",
         }
     }
@@ -169,7 +174,7 @@ fn main() -> Result<()> {
     };
 
     let needs_root = match cli.command {
-        Commands::Build | Commands::Disk | Commands::Test => false,
+        Commands::Build | Commands::Disk | Commands::Test | Commands::Depgraph => false,
         Commands::Clean => utils::clean_needs_root(&build_dir),
         Commands::Initramfs | Commands::Rootfs | Commands::All => true,
         Commands::Run => run_needs_build,
@@ -311,6 +316,7 @@ fn dispatch(
         }
         Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build, mode),
         Commands::Test => selftest::run_tests(build_dir, profile, tests),
+        Commands::Depgraph => depgraph::run(&utils::project_root()?),
         Commands::Clean => utils::clean(build_dir),
     }
 }
