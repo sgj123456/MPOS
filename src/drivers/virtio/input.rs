@@ -929,14 +929,6 @@ impl Inode for EvdevNode {
     fn poll_unsubscribe(&self, id: crate::sched::policy::TaskId) {
         self.unsubscribe(id);
     }
-
-    /// The evdev node this is - how `EVIOCGNAME` reaches the name the host
-    /// gave the device, without the ioctl layer knowing where input nodes
-    /// live.
-    #[cfg(target_os = "none")]
-    fn as_evdev(&self) -> Option<&EvdevNode> {
-        Some(self)
-    }
 }
 
 /// Forget the read positions of the descriptions a process is taking with it.
@@ -949,7 +941,7 @@ impl Inode for EvdevNode {
 #[cfg(target_os = "none")]
 pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>], _owner: u32) {
     crate::vfs::file::for_each_last(files, |file, ofd| {
-        if let Some(ev) = file.inode().as_evdev() {
+        if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
             ev.forget(ofd);
         }
     });

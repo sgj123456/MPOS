@@ -30,6 +30,8 @@ use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X
 // modules they come from, which the host build does not compile.
 #[cfg(target_os = "none")]
 use crate::drivers::virtio::gpu::FbDev;
+#[cfg(target_os = "none")]
+use crate::drivers::virtio::input::EvdevNode;
 
 /// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
 ///
@@ -322,7 +324,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 // its own event buffer at `open`, so an event that arrives
                 // before the first read is still that client's to read.
                 #[cfg(target_os = "none")]
-                if let Some(ev) = file.inode().as_evdev() {
+                if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
                     ev.opened(file.ofd());
                 }
             }
@@ -3074,7 +3076,7 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         // which is what lets a compositor that was killed (or a test that closed
         // the device) leave the keyboard claimable instead of grabbing it from
         // beyond its own grave.
-        if let Some(ev) = file.inode().as_evdev() {
+        if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
             ev.set_grab(false, file.ofd());
         }
         let inode = file.inode();
@@ -3097,7 +3099,7 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
     // final reference forgets it.
     #[cfg(target_os = "none")]
     if Arc::strong_count(&file) == 1 {
-        if let Some(ev) = file.inode().as_evdev() {
+        if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
             ev.forget(file.ofd());
         }
         // And the device a `/dev/uinput` description made goes with it - the
@@ -3386,7 +3388,7 @@ fn sync_nonblocking(file: &crate::vfs::File, status: u32) {
         tty.set_nonblocking(on);
     } else if let Some(pipe) = file.inode().as_pipe() {
         pipe.set_nonblocking(on);
-    } else if let Some(ev) = file.inode().as_evdev() {
+    } else if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
         ev.set_nonblocking(on);
     } else if let Some(eventfd) = file.inode().as_eventfd() {
         eventfd.set_nonblocking(on);
@@ -4608,7 +4610,7 @@ fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
         Err(e) => return err_of(e),
     };
     let inode = file.inode();
-    let Some(ev) = inode.as_evdev() else {
+    let Some(ev) = inode.as_any().downcast_ref::<EvdevNode>() else {
         return err::ENOTTY;
     };
     ev.ioctl(file.ofd(), request, buf, from_user)

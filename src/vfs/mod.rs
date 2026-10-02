@@ -506,18 +506,8 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
-    /// The evdev node this is, if it is one - how `EVIOCGNAME` reaches the
-    /// device's own name for itself. A syscall arrives holding nothing but a
-    /// descriptor, so the node it opened is the only route to the device that
-    /// owns the answer.
-    #[cfg(target_os = "none")]
-    fn as_evdev(&self) -> Option<&crate::drivers::virtio::input::EvdevNode> {
-        None
-    }
-
     /// The `/dev/uinput` device this is, if it is one - how the `'U'`-typed
-    /// ioctls reach the devices userland makes. Same shape as
-    /// [`Self::as_evdev`], for the same reason.
+    /// ioctls reach the devices userland makes.
     #[cfg(target_os = "none")]
     fn as_uinput(&self) -> Option<&crate::drivers::uinput::Uinput> {
         None
