@@ -506,19 +506,10 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
-    /// The framebuffer this node is, if it is one - how `FBIOGET_*` reaches
-    /// the resolution and the buffer facts without the ioctl layer knowing
-    /// where framebuffers live. Same shape as [`Self::as_tty`], for the
-    /// same reason: the syscall layer must be able to ask the node what it
-    /// really is.
-    #[cfg(target_os = "none")]
-    fn as_fb(&self) -> Option<&crate::drivers::virtio::gpu::FbDev> {
-        None
-    }
-
     /// The evdev node this is, if it is one - how `EVIOCGNAME` reaches the
-    /// device's own name for itself. See [`Self::as_fb`] for why a syscall
-    /// that arrives holding nothing but a descriptor needs this.
+    /// device's own name for itself. A syscall arrives holding nothing but a
+    /// descriptor, so the node it opened is the only route to the device that
+    /// owns the answer.
     #[cfg(target_os = "none")]
     fn as_evdev(&self) -> Option<&crate::drivers::virtio::input::EvdevNode> {
         None

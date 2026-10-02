@@ -22,6 +22,14 @@ use super::abi::{
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
 use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X_OK};
+// The devices these handlers drive. Naming one is the *syscall* layer's job -
+// it is the layer that knows which request belongs to which device - and it is
+// exactly what the VFS stopped doing: `Inode` carries no method per device type
+// any more, so a caller asks the node for its concrete type through
+// `dyn Inode::as_any` instead (`PLAN.md` §11.2 Step B1, V-1). Gated with the
+// modules they come from, which the host build does not compile.
+#[cfg(target_os = "none")]
+use crate::drivers::virtio::gpu::FbDev;
 
 /// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
 ///
@@ -3897,11 +3905,11 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
             };
-            // The inode is bound first: `as_fb` borrows from it, and a
+            // The inode is bound first: the downcast borrows from it, and a
             // temporary `Arc` borrowed through would be gone before the
             // answer it lent was read.
             let inode = file.inode();
-            let Some(fb) = inode.as_fb() else {
+            let Some(fb) = inode.as_any().downcast_ref::<FbDev>() else {
                 return err::ENOTTY;
             };
             if !buffer_ok(buf, FB_VAR_SIZE, true, from_user) {
@@ -3942,7 +3950,7 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
             };
-            if file.inode().as_fb().is_none() {
+            if file.inode().as_any().downcast_ref::<FbDev>().is_none() {
                 return err::ENOTTY;
             }
             err::EOPNOTSUPP
@@ -3961,7 +3969,7 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // The inode is bound first, for the same lifetime reason as the
             // arm above it.
             let inode = file.inode();
-            let Some(fb) = inode.as_fb() else {
+            let Some(fb) = inode.as_any().downcast_ref::<FbDev>() else {
                 return err::ENOTTY;
             };
             if !buffer_ok(buf, FB_FIX_SIZE, true, from_user) {
@@ -3996,7 +4004,7 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
             };
-            if file.inode().as_fb().is_none() {
+            if file.inode().as_any().downcast_ref::<FbDev>().is_none() {
                 return err::ENOTTY;
             }
             // Present the pixels the caller has drawn: ask the render engine to
@@ -4025,7 +4033,7 @@ pub(super) fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
             };
-            if file.inode().as_fb().is_none() {
+            if file.inode().as_any().downcast_ref::<FbDev>().is_none() {
                 return err::ENOTTY;
             }
             let from = crate::drivers::video::render::landings();

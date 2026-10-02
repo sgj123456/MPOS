@@ -427,12 +427,4 @@ impl Inode for FbDev {
     fn frame_backed(&self) -> bool {
         true
     }
-
-    /// The framebuffer this node is - how the fbdev ioctls reach the
-    /// resolution and the buffer without the syscall layer knowing where
-    /// framebuffers live.
-    #[cfg(target_os = "none")]
-    fn as_fb(&self) -> Option<&FbDev> {
-        Some(self)
-    }
 }
