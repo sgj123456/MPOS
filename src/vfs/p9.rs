@@ -343,7 +343,7 @@ mod device {
             if resp.len() < HEADER {
                 return Err(VfsError::Corrupt);
             }
-            let size = take_u32(&resp, &mut 0).unwrap() as usize;
+            let size = take_u32(&resp, &mut 0).ok_or(VfsError::Corrupt)? as usize;
             if size < HEADER || size > resp.len() {
                 return Err(VfsError::Corrupt);
             }
