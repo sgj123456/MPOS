@@ -203,7 +203,7 @@ and an upward edge from them is a compile error. See `ARCHITECTURE.md` §1.
 |---|---|---|---|
 | `main.rs` | Boot sequence, milestone checks, panic handler | anything (it is the wiring) | hold reusable logic — that lives in the lib |
 | `syscall/` (ABI) | Numbers, `abi.rs` facts, dispatch, handlers | `vfs`, `sched`, `mm`, `drivers`, `net`, services | be a per-device ioctl switchboard (V-2) |
-| `vfs/` | `Inode`/`FileSystem`, mounts, fd table, every filesystem, pipes/epoll/timerfd/signalfd | `sched`, `mm`, `blk`, `pci` | downcast to concrete devices through the `Inode` trait (V-1); own the terminal emulator — the emulator is the `term` crate now, the console mux and the line discipline are still here (V-4 half closed) |
+| `vfs/` | `Inode`/`FileSystem`, mounts, fd table, every filesystem, pipes/epoll/timerfd/signalfd | `sched`, `mm`, `blk`, `pci` | name a device or socket type (V-1 closed: a caller asks the node for its concrete type through `dyn Inode::as_any`, so the trait names none); own the terminal emulator — the emulator is the `term` crate now, the console mux and the line discipline are still here (V-4 half closed) |
 | `sched/` | Task table, priority bands, sleep/block, signals, futex | `mm`, `arch`, `binfmt` | host another subsystem's per-process cleanup (V-3) |
 | `mm/` | Buddy frames, slab heap, mapping plans, ELF loader | `boot` | know files, tasks or devices |
 | `arch/` | GDT/IDT, PIC/LAPIC, paging, context switch, syscall gate, timer, ports | `mm` (via its own re-exports only) | be named from outside `arch::` — `arch/mod.rs` re-exports the uniform surface |

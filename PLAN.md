@@ -650,7 +650,7 @@ it - so the entries say which they are:
 **Architectures (Phase 9 — far future)**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
-**Architecture debt (Phase 11 — audit done, Steps A/C/E/F/G landed, V-13 closed)**
+**Architecture debt (Phase 11 — audit done, Steps A/B/C/E/F/G landed, V-1 and V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
@@ -698,17 +698,24 @@ it - so the entries say which they are:
       remains is the two crates being *named* by `drivers` and `syscall`, which is a cross-crate
       edge downward. Twelve leaf crates now, all but the input pair host-compiled and every one of
       them unable to name the kernel
-- [~] 11.B the device seam. **B3 landed long ago** (`buffer_ok`/`err_of` moved to the
-      `uaccess` leaf). **B2 is now complete**: every device family this audit named states its
+- [x] 11.B the device seam. **B3 landed long ago** (`buffer_ok`/`err_of` moved to the
+      `uaccess` leaf). **B2 is complete**: every device family this audit named states its
       own ioctl contract next to the state it answers from - `'d'` (DRM), `'E'` (`EvdevNode::ioctl`),
-      `'K'` (`Tty::kd_ioctl`), and this session's `'U'` (`Uinput::ioctl`, with the family check
-      moved into the `mpos-uinput` crate as `nr_of`) and `'V'` (`Tty::vt_ioctl`, with the
+      `'K'` (`Tty::kd_ioctl`), `'U'` (`Uinput::ioctl`, with the family check moved into the
+      `mpos-uinput` crate as `nr_of`) and `'V'` (`Tty::vt_ioctl`, with the
       caller's task/root/thread-group handed down as a `VtCaller` the way `kd_ioctl` takes
       `owns_card`). `syscall/linux/fs.rs` lost 212 lines to the last two; the only `vcmux`
-      reference left in it is the tty family's `abandon`. **B1 is what remains**: one typed
-      handle instead of the nine `Inode::as_*` downcasts that let the boundary *find* the
-      device - the ratchet counts it as `vfs/mod.rs -> drivers|net` 9, and the plan says one
-      device per commit, fbdev first and DRM last (§11)
+      reference left in it is the tty family's `abandon`. **B1 is done**: the nine
+      `Inode::as_*` downcasts are gone, replaced by one type-erased handle the *caller*
+      names through - `pub trait Inode: Send + Sync + core::any::Any` plus
+      `impl dyn Inode { fn as_any(&self) -> &dyn core::any::Any }`, a plain trait upcast -
+      so `src/vfs/mod.rs` names `crate::drivers::`/`crate::net::` **zero** times (the
+      ratchet constant follows, 9 -> 0). Removed one device per commit in the plan's order
+      (fbdev, evdev, uinput, AF_PACKET, AF_VSOCK, AF_UNIX, then the DRM card's three node
+      types last); the shape decision, and why the plan's `DevOps` alternative was not the
+      one taken, are in §11.2 Step B1. It does **not** remove the `drivers <-> vfs` pair -
+      the remaining `vfs -> drivers|net` references are `vcmux`, `procfs`, `sysfs` and `p9`,
+      which are V-4's half and the PCI-config/9p doors (§11.1.1)
 - [x] 11.C per-open-file resources get a registry (`sched::exit`), so `sched` stops naming
       `net`/`vfs`/`drivers` on task exit: `sched → net` is gone (which removed the `net ↔ sched`
       mutual pair, 20 → 19), and the two `crate::drivers::` references left in `runtime.rs` are
@@ -5554,9 +5561,9 @@ rather than to make any single file prettier.
 Severity is about cost-to-change, not about user-visible bugs: none of these is a defect a
 program can observe today.
 
-#### 11.1.1 — V-1: the `Inode` downcast chain (severity: high)
+#### 11.1.1 — V-1: the `Inode` downcast chain (severity: high) — **CLOSED**
 
-`src/vfs/mod.rs:453–546` gives the central VFS trait a method per concrete device and network
+`src/vfs/mod.rs:453–546` gave the central VFS trait a method per concrete device and network
 type:
 
 ```rust
@@ -5568,12 +5575,27 @@ fn as_vsock(&self) -> Option<&crate::net::vsock::VsockSock> { None }
 fn as_unix(&self) -> Option<&crate::net::unix::UnixSock> { None }
 ```
 
+(The list grew to nine while the audit was being written — `as_syncobj_fd`, `as_sync_file` and
+`as_packet` are the same shape and arrived with the DRM sync-object and AF_PACKET work.)
+
 This is the textbook abstraction leak: the VFS — which is supposed to know only that a node has
-a name, a kind, bytes and an owner — names six device drivers and two network socket types, and
-the *syscall* layer reaches through these to drive a device. Adding a seventh device type means
-editing the VFS trait, so the VFS can never be compiled without `drivers` and `net`, and
-neither can anything that depends on the VFS. It is the largest single contributor to the
+a name, a kind, bytes and an owner — names six device drivers and three network socket types,
+and the *syscall* layer reaches through these to drive a device. Adding a seventh device type
+means editing the VFS trait, so the VFS can never be compiled without `drivers` and `net`, and
+neither can anything that depends on the VFS. It was the largest single contributor to the
 23-cycle count.
+
+**Closed by Step B1 (§11.2)**: all nine are gone and `src/vfs/mod.rs` names `crate::drivers::`
+and `crate::net::` zero times. What replaced them is one type-erased handle that the *caller*
+names a type through — `core::any::Any` as a supertrait plus a single upcast — so the question
+"is this node an `FbDev`?" is asked by the layer that knows what an `FbDev` is, and the trait
+that answers it never hears the name. Adding a tenth device type now touches no VFS code.
+
+**What it deliberately did not fix**, so the next reader does not expect it: the
+`drivers ↔ vfs` mutual pair stands. `vfs` still names `drivers` 17 times and `net` 4, from
+`vcmux`'s render/drm calls, `procfs`/`sysfs`'s PCI config reads and `p9`'s virtio-9p device —
+each of which is a *different* finding (V-4's remaining half, and the PCI-config and 9p doors),
+with its own step. V-1 was the downcast cause and it is the one that is closed.
 
 #### 11.1.2 — V-2: device ioctl ABI lives in the syscall layer (severity: high)
 
@@ -5832,18 +5854,77 @@ reads files the compiler never saw.
 
 ---
 
-#### Step B — Give devices a seam the VFS can hold without naming them (V-1, V-2, V-5) — **B3 AND B2 DONE; B1 REMAINS**
+#### Step B — Give devices a seam the VFS can hold without naming them (V-1, V-2, V-5) — **DONE (B1, B2, B3)**
 
 The largest step, and the one that pays for the others: it removes the largest cause of the
 23-cycle count.
 
-**B1 — Replace the six `as_*` downcasts with one typed handle.** Introduce a `vfs::DevNode` so
-that a char-device node carries an `Arc<dyn DevOps>` whose *own* module defines the operations
-(`read`, `write`, `ioctl(cmd, arg)`). The trait lives in `vfs`; the implementations live in
-`drivers`/`net` and are *installed* at boot by the code that owns them. The syscall layer then
-calls `node.dev().ioctl(nr, arg)` instead of matching on a device type. (A single
-`as_any`/`downcast_ref` pair over `core::any::Any` is the smaller alternative; either is fine —
-the point is that `vfs` stops naming the types.)
+**B1 — Replace the nine `as_*` downcasts with one type-erased handle. — DONE.** The plan offered
+a `vfs::DevNode` carrying an `Arc<dyn DevOps>` with `read`/`write`/`ioctl(cmd, arg)`, installed at
+boot, or a single `as_any`/`downcast_ref` pair over `core::any::Any`, and said either was fine
+because "the point is that `vfs` stops naming the types". **The second shape was taken, and the
+reason is worth recording because the first reads like the better design.** `DevOps` does not fit
+the nine it had to replace. Six of them are device downcasts the syscall layer uses to reach an
+ioctl *the device already owns* (B2 gave every family its own `ioctl`), and the other three are
+`net` recovering its own `UnixSock`/`VsockSock`/`PacketSock` from an `Inode` it minted itself —
+not an ioctl question at all, so a `DevOps` covering them would have to be a god-trait. Worse,
+`dev().ioctl(...)` *reorders the dispatcher*: every device would have to answer `ENOTTY` for every
+family it does not own, instead of the dispatcher routing by family first. That is the plan's own
+named top risk, "this touches every device path at once", and it buys nothing the downcast does
+not.
+
+The shape actually taken, in `src/vfs/mod.rs`:
+
+```rust
+impl dyn Inode {
+    pub fn as_any(&self) -> &dyn core::any::Any { self }
+}
+pub trait Inode: Send + Sync + core::any::Any { ... }
+```
+
+Two properties make it nearly free. `Any` is implemented for every `'static` type already, so
+none of the tree's 52 `impl Inode for` blocks grew a method — and it could not have been a default
+body on the trait, because coercing `&Self` to a trait object needs `Self: Sized`, which a `dyn
+Inode` is not. And the body is a plain trait upcast (stable since Rust 1.86), so it is the
+vtable's own supertrait entry rather than a lookup. Call sites read
+`inode.as_any().downcast_ref::<FbDev>()`, which answers `Some` exactly where the `as_*` method it
+replaced answered `Some` — the same `TypeId` comparison the old override (`Some(self)`) and
+default (`None`) made, just moved from the trait into `core`.
+
+Migration order followed the plan — one device per commit, fbdev first and DRM last — which is
+also the order of the seven commits: fbdev, evdev, uinput, AF_PACKET, AF_VSOCK, AF_UNIX, then the
+DRM card's three node types (`as_drm`, `as_syncobj_fd`, `as_sync_file`) together, since they are
+one device. Each commit deleted its `as_*` method and its `impl` overrides, so the ratchet fell
+as it went: `vfs/mod.rs -> drivers|net` 9 → 8 → 7 → 6 → 5 → 4 → 3 → 0, and the constant in
+`xtask/src/depgraph.rs` is now 0. Every commit was verified with a bare-metal build, fmt, clippy on
+both targets, and the full gate; five of the seven have their device's conformance program in the
+default sweep (`t-fbdev`; `t-evdev`/`t-ioctl`; `t-unix`/`t-unix-dgram`/`t-unix-scm`; `t-drm`/
+`t-drm-args`/`t-drm-lease`/`t-drm-sync`; `t-prime`). Two do not: AF_PACKET's is `t-rawicmp`, which
+`tests.toml` puts in `external`, and was run by name (`--groups external`, green); AF_VSOCK has
+**no** conformance program at all — a test boot deliberately gets no host vsock bus — so its
+guarantee is the type check plus the equivalence above, and saying so is better than implying a
+test ran.
+
+**Acceptance — met.** `crate::drivers::` and `crate::net::` do not appear in `src/vfs/mod.rs`;
+`cargo xtask depgraph` prints `vfs/mod.rs -> drivers|net 0/0` and `Within the ratchet: no edge has
+appeared and no count has grown.`; and the full gate on the finished tree (2026-10-02, after all
+seven device commits) is:
+
+```
+Unit tests: the kernel and its leaf crates (host)   528 passed (kernel) + 161 in the twelve
+                                                   leaf crates + 47 xtask = 736 passed,
+                                                   0 failed
+self-test guest: === SUMMARY pass=140 fail=0 (140 built)
+self-test guest: 10 of 150 user tests left out by tests.toml
+self-test guest: exit 33 (33 is the clean debug exit)
+```
+
+Two of the original criteria are **not** met, deliberately: `wc -l src/syscall/linux/fs.rs` did not
+drop from B1 (it *rose*, by the imports that now name the device types — the 212-line drop was
+B2's, and a downcast is not a line count), and the mutual pair count stayed 18, because `drivers`
+and `net` still name `vfs` and `vfs` still names them from `vcmux`/`procfs`/`sysfs`/`p9`. Those
+references are V-4's and the PCI-config/9p doors' — different findings, different steps; B1 closed
+the downcast cause, which is what V-1 was.
 
 **B2 — Move each device's ioctl contract down to its driver.** For each family in 11.1.2
 (fbdev, DRM, RTC, uinput, tty, evdev, block), move the request-number constants, struct layouts
@@ -6131,10 +6212,10 @@ the plan this landed.** Steps A, E and F are done and B/C are not, so two of the
 *not yet* zero, and a check born red is one nobody reads. Each constant names the call sites that
 keep it non-zero and the step that removes them:
 
-| Rule | Measured 2026-10-02 | What keeps it there | Removed by |
+| Rule | Measured 2026-10-02 | What kept it there | Removed by |
 |---|---|---|---|
 | lower layer → `syscall` | `drivers` 1, `sched` 10, the rest 0 | `drivers/virtio/sound.rs`'s one `use crate::syscall::linux::abi` (V-5's remainder); `sched/runtime.rs`'s `crate::syscall::linux::{abi, nr}`, `MMAP_BASE` and `DEFAULT_UMASK` | B2 (the ioctl ABI), B/C (the mapping base and the umask are scheduler state) |
-| `vfs/mod.rs` → devices | 9 | the nine `Inode::as_*` downcasts (V-1) | B1 |
+| `vfs/mod.rs` → devices | 9 | the nine `Inode::as_*` downcasts (V-1) | **Done** (B1): 0 |
 | mutual pairs | 20 | the whole `vfs ↔ sched ↔ syscall ↔ net ↔ drivers` cluster | B, C, D |
 
 `arch` and `main` are deliberately **not** in the first rule: the `syscall` gate exists to enter
@@ -6160,8 +6241,12 @@ shown able to go red on each of the three rules.
 2. ~~**Step A** — pure subtraction, ~5 files, one commit, no behaviour change.~~ **Done**
    (§11.2 Step A): the three dead modules, the `[msgtrace]` trace and the aarch64 profile are
    gone, and the pair count it was measured with fell from 22 to 21.
-3. **Step B** — the device seam, one device at a time. This is where the 23 becomes a real
-   number, and it is the largest single piece of work in the phase.
+3. ~~**Step B** — the device seam, one device at a time.~~ **Done** (§11.2 Step B): B3 moved the
+   user-pointer helpers to the `uaccess` leaf, B2 put every device family's ioctl contract next to
+   the state it answers from, and B1 (fbdev, evdev, uinput, AF_PACKET, AF_VSOCK, AF_UNIX, then the
+   DRM family last) deleted the nine `Inode::as_*` downcasts, taking `vfs/mod.rs → drivers|net`
+   from 9 to 0. The pair count did not move with it — that is V-4's and the PCI-config/9p doors'
+   share of the cluster, not the downcasts'.
 4. ~~**Step C** — the resource registry.~~ **Done** (§11.2 Step C): the exit hooks live in
    `sched::exit`, registered by `main.rs`, and the `net ↔ sched` pair is gone.
 5. **Step D** — the terminal emulator move.
@@ -6181,8 +6266,9 @@ doing them before the next device or the next per-open-file resource is added.
 
 **Deliberately not in this plan:**
 
-- **Rewriting the `Inode` interface.** The trait itself is fine; it is the six device methods
-  hanging off it that are wrong. B1 removes them and stops there.
+- **Rewriting the `Inode` interface.** The trait itself is fine; it is the nine device and socket
+  methods that hung off it that were wrong. B1 removed them, added one type-erased handle the
+  caller names a type through, and stopped there.
 - **A message bus, an async runtime, or a generic HAL trait forest.** The kernel is uniprocessor
   and synchronous by design, and `ARCHITECTURE.md` §7's locking rules exist because that is what
   makes the design legible. This phase is about *who names whom*, not about adding indirection.
