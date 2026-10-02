@@ -518,7 +518,19 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         }
     };
     if ret == super::err::ENOSYS {
-        note_enosys(nr);
+        // `ioctl` is the one number where the *request*, not the number, is the
+        // information. `handle_ioctl` has a catch-all `ENOTTY`, so an `ENOSYS`
+        // reaching here never means "there is no ioctl call" - only a device
+        // refusing one request it was routed to (evdev's force-feedback and
+        // key-repeat probes, a missing DRM callback). The generic note keyed by
+        // number would print `syscall 16 -> ENOSYS`, which a reader takes as
+        // "the ioctl call is missing" - the opposite of what happened. Name the
+        // request, exactly as the `EOPNOTSUPP` arm below does.
+        if nr == nr::IOCTL {
+            note_enosys_ioctl(args[0] as i32, args[1] as u32);
+        } else {
+            note_enosys(nr);
+        }
     }
     if ret == super::err::EOPNOTSUPP {
         // The one case where the number is not the information: `ioctl` is a
@@ -595,6 +607,24 @@ fn note_eopnotsupp_ioctl(fd: i32, request: u32) {
     static REFUSED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
         crate::print!("mpos: ioctl({fd}) request {request:#x} -> EOPNOTSUPP\n");
+    }
+}
+
+#[cfg(target_os = "none")]
+/// The `ENOSYS` case of [`note_eopnotsupp_ioctl`] - a device answering "I cannot
+/// do that request" with `ENOSYS` rather than `EOPNOTSUPP` (evdev's
+/// force-feedback and key-repeat probes are the ones a boot actually hits).
+///
+/// Its own counter, not a shared one, for the reason [`note_enosys`] and
+/// [`note_eopnotsupp`] keep separate tables: one descriptor can refuse two
+/// different requests with the two errnos, and a single budget spent by
+/// whichever probe came first would silence the other. Bounded rather than
+/// once-per-number because the request word is the useful part and a prober in
+/// a loop would otherwise print a line per attempt.
+fn note_enosys_ioctl(fd: i32, request: u32) {
+    static REFUSED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+        crate::print!("mpos: ioctl({fd}) request {request:#x} -> ENOSYS\n");
     }
 }
 
