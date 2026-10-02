@@ -216,11 +216,39 @@ pub enum VfsError {
 
 pub type VfsResult<T> = Result<T, VfsError>;
 
+/// The concrete type behind a node, for a caller that already knows which type
+/// it is asking about.
+///
+/// A plain trait upcast - the [`core::any::Any`] supertrait on [`Inode`] is
+/// what makes it one - followed by the caller's own `downcast_ref::<T>()`.
+/// The *caller* is what names `T`, and the caller is the layer that owns `T`:
+/// `syscall/linux/fs.rs` asks for the device it is about to drive, `net` for
+/// its own socket family, a driver for its own device. Nothing in this module
+/// names any of them.
+///
+/// A node that is not a `T` answers `None`, which is the same "not this kind of
+/// node" the `as_*` method this replaced answered; the difference is that the
+/// question is typed where it is asked rather than in the trait. That is the
+/// whole of Phase 11 B1: before it, the trait carried a method per concrete
+/// device and socket type, so it could not be compiled without naming every
+/// driver, and a seventh device type meant editing the filesystem layer
+/// (`PLAN.md` §11.1.1, V-1).
+impl dyn Inode {
+    pub fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
 /// One node of one filesystem, in the only form the rest of the kernel sees.
 ///
 /// Every method has a default that fails, so each filesystem overrides exactly
 /// what its storage can do.
-pub trait Inode: Send + Sync {
+///
+/// The [`core::any::Any`] supertrait is what lets a holder of `Arc<dyn Inode>`
+/// reach the concrete type it knows is behind the node without this trait ever
+/// naming that type - see `impl dyn Inode`'s `as_any`. It costs no impl in the
+/// tree a line, because `Any` is implemented for every `'static` type already.
+pub trait Inode: Send + Sync + core::any::Any {
     fn metadata(&self) -> Metadata;
 
     /// The named child of this directory.
