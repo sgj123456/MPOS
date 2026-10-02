@@ -666,11 +666,26 @@ it - so the entries say which they are:
       the same reason Phase 11 B/C are: `gpu` and `evdev`/`uinput` take `sched::TaskId` +
       `sched::wake` for their waiters (`src/gpu/sync.rs`, `src/evdev.rs`), and `src/gpu/*` is
       mid-refactor; they need an injectable wake abstraction before they can leave the crate.
+- [x] 11.E (continued) two more leaf crates of the same kind, extracted once the seven above had
+      shown the pattern: `mpos-term` (the terminal emulator — grid, cursor, blitter, keymap, font;
+      a cell grid is not a filesystem fact, §11.1.4) and `mpos-ahci` (the AHCI port decode, whose
+      only reader is machine-only). `crate::term` and `crate::ahci` resolve through `src/lib.rs`'s
+      re-exports, and the call sites that *did* move are the ones whose edge was the point:
+      `console`, `drivers/video/render` and `drivers/virtio/input` now name the `term` crate rather
+      than `vfs::term`, which is 3 references off `console → vfs` and 5 off `drivers → vfs`. The
+      41 pins that moved with them run in their own crates (`xtask test`'s host stage names them),
+      so the host suite is unchanged in total: 594 in the kernel + 9 in `mpos-ahci` + 32 in
+      `mpos-term`
 - [ ] 11.B the device seam: one handle instead of six `Inode::as_*` downcasts, each device's
       ioctl contract moved down to its driver, user-pointer validation moved to `mm` (§11)
 - [ ] 11.C per-open-file resources get a registry, so `sched` stops naming `net`/`vfs`/`drivers`
       on task exit (§11)
-- [ ] 11.D the terminal emulator and the console mux move out of `vfs` (§11)
+- [~] 11.D the terminal emulator and the console mux move out of `vfs` (§11). **Half landed**: the
+      emulator is the `mpos-term` leaf crate (so `console`, `drivers/video` and `vfs::tty` name
+      `crate::term`, and the boundary is a compile error); the console mux and the line discipline
+      stay in `vfs`, because the mux's vocabulary is the vfs's (`pty::VC_COUNT`, `tty::KD_TEXT`,
+      `vtmode`) — moving it means moving that vocabulary first. Recorded as V-4's remaining half in
+      `ARCHITECTURE.md` §9
 - [x] 11.F the `target_os = "none"` gate gets a written criterion (`src/lib.rs`, `AGENTS.md` §4),
       and the unused host test module behind it is settled: `net/socket.rs`'s three tests were
       never compiled, and their claims are pinned by `t-sockmsg`, which boots, so the module is
@@ -2964,7 +2979,7 @@ are pty pairs too, and what distinguishes them is who reads the master:
 
 The second half of the same fix: the cursor a report answers with is now the
 cursor the screen is drawn with. Both the discipline and `term::Grid` drive one
-`src/vfs/term/cursor.rs` - the window size, the scroll region, deferred autowrap,
+`crates/term/src/cursor.rs` - the window size, the scroll region, deferred autowrap,
 line feed at the region's bottom, `DECSTBM`, save/restore (`ESC 7/8`, `CSI s/u`),
 `ESC D/E/M`, the alternate screen - and
 `vfs::tty::tests::the_report_and_the_screen_never_disagree_about_the_cursor`
@@ -3564,7 +3579,7 @@ cannot drive; it is read before bring-up, when the same port still reads
 So two faults, one of them about the number:
 
 1. **The wait asked one register a question two registers answer.** Fixed in
-   `src/ahci.rs`, a new host-compiled module (`drivers/ahci.rs` is behind
+   `crates/ahci` (the `mpos-ahci` crate; `drivers/ahci.rs` is behind
    `#[cfg(target_os = "none")]`, so a decision inside it has no reachable test -
    the `pci`/`drivers::pci` and `evdev`/`drivers::evdev` split again):
    `PortStatus::waiting` stops on *either* answer, retired or refused. Five host
@@ -4585,7 +4600,7 @@ into wrong pixels. `GETPLANE`, `IN_FORMATS` and `ADDFB2` all read the one
 `PLANE_FORMATS` array, so all three moved together.
 
 The byte order is measured, not assumed, and the instrument is this repository's
-own: `vfs::term::blit`'s `put` writes a pixel as blue, green, red, 0, and that
+own: `crate::term::blit`'s `put` writes a pixel as blue, green, red, 0, and that
 console has been showing correct colours since it was written. It agrees with
 `drivers::virtio::gpu`'s module comment ("BGRA, row-major") and with
 `B8G8R8A8_UNORM` being virtio-gpu's default scanout format. A real card lists
@@ -5276,7 +5291,7 @@ only the read side is being tuned.
 | Set-associative cache with victim selection | `vfs/ext4/cache.rs` | **done** |
 | Sequential readahead past the block being asked for | `vfs/ext4/` | not done |
 | virtio-blk interrupt-driven completions and multi-request pipelining | `drivers/virtio/blk.rs` | not done |
-| A SATA probe that ends in an answer instead of a budget | `drivers/ahci.rs`, `src/ahci.rs` | **done, measured** |
+| A SATA probe that ends in an answer instead of a budget | `drivers/ahci.rs`, `crates/ahci` | **done, measured** |
 
 **The probe's cost, before and after.** Not a throughput change but the same
 ledger, because it is a device wait that the boot pays: on a `q35` machine whose
@@ -5552,15 +5567,15 @@ path. The scheduler owns *tasks*; it should not know that inotify exists. Each n
 per-open-file resource adds a line here, and each line makes `sched` unbuildable without `net`,
 `vfs` and `drivers`.
 
-#### 11.1.4 — V-4: the terminal emulator and console live inside the VFS (severity: medium)
+#### 11.1.4 — V-4: the terminal emulator and console live inside the VFS (severity: medium) — **HALF CLOSED**
 
-`src/vfs/term/` holds the cell grid, the key handling and an embedded 4 KiB `vga8x16.bin` font.
+`crates/term/` (the `mpos-term` crate) holds the cell grid, the key handling and an embedded 4 KiB `vga8x16.bin` font.
 `src/vfs/tty.rs` (2 359 lines), `src/vfs/pty.rs`, `src/vfs/devpts.rs` and `src/vfs/vcmux.rs`
 implement the console, and `src/console.rs` — the kernel's own logging console — reaches *into*
 the filesystem layer to draw:
 
 ```rust
-crate::vfs::term::with_screen(active_grid(), |g| g.feed(bytes));
+crate::term::with_screen(active_grid(), |g| g.feed(bytes));
 crate::drivers::video::render::notify();
 ```
 
@@ -5894,6 +5909,33 @@ node's behaviour, and `termios`. `console` then depends on `term`, and `vfs` dep
 virtual consoles.
 **Risk:** `vfs/term/vga8x16.bin` is `include_bytes!`-ed — a missed path is a compile error, which
 is the good outcome.
+
+**Half of it has landed, and the half that landed is the half that was a crate.** Step E's pattern
+applied to the emulator: `src/vfs/term.rs` and `src/vfs/term/` (blit, cursor, font, keymap and the
+4 KiB `vga8x16.bin`) are `crates/term` — `mpos-term`, a leaf that cannot name the kernel — and
+`src/lib.rs` re-exports it as `crate::term`. That is the plan's `src/term/` with the enforcement
+added, and it is the acceptance criterion in the form it can be checked in: `crate::vfs::term` no
+longer exists anywhere, `vfs/` holds no font asset and no escape-sequence parser, and the three
+`vfs/term` test modules moved with the code and run in the new crate (32 pins, unchanged).
+
+The one place this differs from the plan's own sketch is *who moves*: the plan said `console`
+"then depends on `term`", and the extraction made that literal — `console.rs` (3 references),
+`drivers/video/render.rs` (3) and `drivers/virtio/input.rs` (2) now name `crate::term`, which is
+what takes 3 references off `console → vfs` (4 → 1) and 5 off the largest single edge in the tree
+(`drivers → vfs`, measured 71 by the ratchet afterwards). `vfs::tty` reaches for the same crate,
+which is right: the line discipline and the grid must agree about the cursor (§7.1b's whole
+finding is that they must not each keep one).
+
+**What remains is the mux, and it is not mechanical.** `vcmux.rs` looks like the same shape and is
+not: it names `vfs::pty::VC_COUNT`, `vfs::tty::{KD_TEXT, K_XLATE, KD_GRAPHICS}` and
+`vfs::vtmode::{self, Decision, VtMode}`, and it reaches *out* to `console::write_bytes`,
+`sched::{spawn_permanent, block_until_deadline, wake, send_signal_process}` and
+`drivers::{video::render, drm::master_held}`. Moving the file to `console/` would exchange a
+`vfs → console` edge for a `console → vfs` one and leave the pair where it was; what has to move
+first is the shared vocabulary — the console count and the KD mode words are console facts that
+`pty`/`tty`/`vtmode` happen to define. That is a refactor in its own commit, and until it happens
+the pair stands. Recorded in `ARCHITECTURE.md` §9 as V-4's remaining half rather than left as a
+step that looks done.
 
 ---
 

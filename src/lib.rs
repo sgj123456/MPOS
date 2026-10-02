@@ -35,11 +35,12 @@
 extern crate alloc;
 
 /// The AHCI port's own answers, as bits rather than as bus cycles: what a
-/// status word means, and when waiting on one has to stop. Ungated because the
-/// decode is arithmetic on three `u32`s and the machine half -
-/// `drivers::ahci`, which reads the registers and moves the sectors - can only
-/// be tested on a machine. `pci` beside `drivers::pci` is the same split.
-pub mod ahci;
+/// status word means, and when waiting on one has to stop. Its own leaf crate -
+/// the decode is arithmetic on three `u32`s and the machine half
+/// (`drivers::ahci`, which reads the registers and moves the sectors) can only
+/// be tested on a machine. `pci` beside `drivers::pci` is the same split, and
+/// `mpos-pci` is the same kind of crate.
+pub use mpos_ahci as ahci;
 #[cfg(target_os = "none")]
 pub mod arch;
 /// Binary formats: how the kernel decides what runs a file. Its own leaf crate
@@ -97,6 +98,12 @@ pub mod sched;
 pub use mpos_seccomp as seccomp;
 pub mod sync;
 pub mod syscall;
+/// The terminal emulator: the cell grid a byte stream is painted into, the
+/// cursor it moves, the blitter that turns cells into pixels and the keystroke
+/// map. Its own leaf crate - a terminal emulator is not a filesystem fact
+/// (`PLAN.md` §11.1.4) - so `console`, `drivers/video` and `vfs::tty` come here
+/// for a grid rather than reaching into `vfs` for one.
+pub use mpos_term as term;
 /// The userland-boundary primitives - validate a caller's pointer, and turn a
 /// `VfsError` into the errno userland reads. They live at the crate root so a
 /// layer *below* `syscall` (net, a driver) can reach them without naming the

@@ -1,0 +1,21 @@
+# The terminal emulator: the cell grid a byte stream is painted into, the cursor
+# it moves, the blitter that turns cells into pixels and the keystroke map. Pure
+# - `core`/`alloc`, a 4 KiB embedded font and a `critical_section` lock, no
+# hardware, no clock - so it is its own leaf crate and a host test can feed it a
+# byte stream and read the screen back. The monitor it is painted onto, the
+# line discipline that decides what to forward and the console multiplexer stay
+# in the kernel: what a cell *is* is not a filesystem fact (PLAN.md §11.1.4), and
+# separating the pure half is what stops `console` and `drivers/video` from
+# reaching into `vfs` for a grid.
+[package]
+name = "mpos-term"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }

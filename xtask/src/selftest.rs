@@ -180,6 +180,10 @@ fn run_unit_tests() -> Result<()> {
         "mpos-seccomp",
         "-p",
         "mpos-pci",
+        "-p",
+        "mpos-term",
+        "-p",
+        "mpos-ahci",
     ])
     .current_dir(&root);
     utils::run_status(&mut cmd, "the kernel's host unit tests")?;

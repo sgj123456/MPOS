@@ -1000,8 +1000,8 @@ pub fn nodes() -> Vec<Arc<EvdevNode>> {
 
 /// The keyboard's console translation state - the latched shift/ctrl/caps - kept
 /// across ticks so a `Shift` press on one event colours the letter that follows.
-static KEYMAP: Mutex<RefCell<crate::vfs::term::keymap::Keymap>> =
-    Mutex::new(RefCell::new(crate::vfs::term::keymap::Keymap::new()));
+static KEYMAP: Mutex<RefCell<crate::term::keymap::Keymap>> =
+    Mutex::new(RefCell::new(crate::term::keymap::Keymap::new()));
 
 /// `EV_KEY`, the event type a keyboard press is.
 const EV_KEY: u16 = 1;

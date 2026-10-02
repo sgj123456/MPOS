@@ -515,7 +515,7 @@ const MAX_BLOB: usize = 1 << 20;
 /// its blue belongs, silently and at full frame rate. `IN_FORMATS` is the same
 /// statement in the other direction, and `t-drm-props` pins that the two agree.
 ///
-/// The byte order is measured rather than assumed: `vfs::term::blit`'s `put`
+/// The byte order is measured rather than assumed: `crate::term::blit`'s `put`
 /// writes a pixel as blue, green, red, 0, and that is the console this machine
 /// has been showing correctly since it was written.
 ///

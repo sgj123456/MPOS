@@ -22,7 +22,7 @@
 //! and answers none of them, because the emulator holding the master has the
 //! cursor; the console driver answers the same question for a VT, because there
 //! the kernel is the one drawing it. [`Attached`] is that decision, and the
-//! discipline's cursor is the [`crate::vfs::term::cursor`] the grid paints with, so
+//! discipline's cursor is the [`crate::term::cursor`] the grid paints with, so
 //! a report cannot describe a screen that is not the one being shown.
 //!
 //! [`LineDiscipline`] is the pure state machine and runs under `cargo test` on
@@ -46,7 +46,6 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 
-use super::term::cursor::Cursor;
 use super::termios::{
     ECHO, ECHOCTL, ICANON, ICRNL, IGNCR, INLCR, ISIG, ISTRIP, IXON, ONLCR, OPOST, Termios, VEOF,
     VERASE, VINTR, VKILL, VLNEXT, VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VTIME, VWERASE,
@@ -55,6 +54,7 @@ use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
 #[cfg(target_os = "none")]
 use crate::sched::signal::{SIGINT, SIGQUIT, SIGTSTP, SIGWINCH};
+use crate::term::cursor::Cursor;
 
 const LF: u8 = b'\n';
 const CR: u8 = b'\r';
@@ -282,7 +282,7 @@ pub struct LineDiscipline {
     /// (`CSI ? 47 / 1047 / 1049 h`), which is what `less` and `vi` leave behind
     /// them. Kept apart from [`LineDiscipline::screen`] because the screen it
     /// belongs to is not the one being counted right now.
-    alt_cursor: Option<super::term::cursor::Snapshot>,
+    alt_cursor: Option<crate::term::cursor::Snapshot>,
     /// The tick the last input byte landed, kept only for a non-canonical
     /// read's `VTIME` clock - which Linux measures *between bytes*, not from
     /// the moment the read asked (measured: `VMIN=2/VTIME=5` with one byte
@@ -830,7 +830,7 @@ impl LineDiscipline {
     /// both markers answer here, as Linux's `csi_DEC` and `csi_ECMA` both do.
     ///
     /// Every arm that moves the cursor calls [`Cursor`], and
-    /// [`crate::vfs::term::Grid`] calls the same ones from the same bytes, because
+    /// [`crate::term::Grid`] calls the same ones from the same bytes, because
     /// a report that describes a cursor the screen does not have is the exact
     /// failure this function used to have.
     fn output_csi(&mut self, final_byte: u8, params: &[u8], kernel_draws: bool) -> bool {
@@ -1443,7 +1443,7 @@ impl Tty {
         // with no bookkeeping to keep in step.
         if let Some(vc) = self.vc_number()
             && let Some((rows, cols)) =
-                super::term::with_screen(vc as usize, |g| (g.rows(), g.cols()))
+                crate::term::with_screen(vc as usize, |g| (g.rows(), g.cols()))
         {
             return (rows as u16, cols as u16);
         }
@@ -1491,7 +1491,7 @@ impl Tty {
     /// "is this a virtual console". The six consoles are pty pairs like any
     /// `/dev/pts`, and what makes them different is only who reads the master:
     ///
-    /// * the console multiplexer, which hands the bytes to a [`crate::vfs::term`]
+    /// * the console multiplexer, which hands the bytes to a [`crate::term`]
     ///   grid - the kernel draws the screen, so the kernel answers, because there
     ///   is no one else who knows where that cursor is, and a shell that asks and
     ///   is refused waits forever;
@@ -1515,7 +1515,7 @@ impl Tty {
             // does not.
             TtyOutput::Serial => kernel_console_has_grids(),
             TtyOutput::Pty(_) => match self.vc_number() {
-                Some(vc) => super::term::has_screen(vc as usize),
+                Some(vc) => crate::term::has_screen(vc as usize),
                 None => false,
             },
         }
@@ -3133,7 +3133,7 @@ mod tests {
     /// bottom, a line longer than the screen.
     #[test]
     fn the_report_and_the_screen_never_disagree_about_the_cursor() {
-        use crate::vfs::term::Grid;
+        use crate::term::Grid;
         const ROWS: usize = 6;
         const COLS: usize = 10;
         let long = vec![b'q'; COLS * 3 + 4];
@@ -3421,7 +3421,7 @@ mod tests {
         // made one - keeps the shape this kernel has always answered.
         assert_eq!(console.window_size(), (25, 80));
 
-        crate::vfs::term::make_screen(6, 50, 160);
+        crate::term::make_screen(6, 50, 160);
         assert_eq!(console.window_size(), (50, 160));
 
         // A `/dev/ptmx` pair is not a console however many screens exist, so

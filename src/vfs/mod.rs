@@ -40,7 +40,6 @@ pub mod ramfs;
 pub mod signalfd;
 pub mod sysfs;
 pub mod tar;
-pub mod term;
 pub mod termios;
 pub mod timerfd;
 pub mod tty;

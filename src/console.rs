@@ -240,7 +240,7 @@ pub fn write_bytes(bytes: &[u8]) {
         // exactly as Linux prints onto the foreground VT. Once its grid exists
         // (after the render task made it) this paints; before, the ring above
         // still catches it for the replay.
-        crate::vfs::term::with_screen(active_grid(), |g| g.feed(bytes));
+        crate::term::with_screen(active_grid(), |g| g.feed(bytes));
         crate::drivers::video::render::notify();
     }
     wire_bytes(bytes);
@@ -260,7 +260,7 @@ pub fn vc_output(vc: u32, bytes: &[u8]) {
         wire_bytes(bytes);
         return;
     }
-    crate::vfs::term::with_screen(vc as usize, |g| g.feed(bytes));
+    crate::term::with_screen(vc as usize, |g| g.feed(bytes));
     crate::drivers::video::render::notify();
     wire_bytes(bytes);
 }
@@ -303,7 +303,7 @@ pub fn takeover() {
         out.extend(LOG.borrow(cs).borrow().iter().copied());
         out
     });
-    crate::vfs::term::with_screen(active_grid(), |g| {
+    crate::term::with_screen(active_grid(), |g| {
         g.reset_to_boot(&snapshot);
     });
     set_gpu();

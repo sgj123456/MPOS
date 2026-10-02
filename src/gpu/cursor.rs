@@ -22,7 +22,7 @@
 /// `"AR24"`, whose components are named most-significant first in the 32-bit
 /// word, so its low byte - the first byte in memory on this machine - is blue;
 /// and the scanout this card presents into is `B8G8R8A8`, which is the same
-/// order. `vfs::term::blit`'s `put` writes blue, green, red, 0 for the same
+/// order. `crate::term::blit`'s `put` writes blue, green, red, 0 for the same
 /// reason. The only difference between the two formats is what the fourth byte
 /// means, and the scanout's own alpha is not read by anything.
 ///

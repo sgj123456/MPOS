@@ -50,9 +50,11 @@ flowchart TB
         UTS["mpos-uts"]
         SECCOMP["mpos-seccomp"]
         PCI["mpos-pci"]
+        TERM["mpos-term"]
+        AHCI["mpos-ahci"]
     end
 
-    K --> ERR & DATE & BINFMT & CRED & UTS & SECCOMP & PCI
+    K --> ERR & DATE & BINFMT & CRED & UTS & SECCOMP & PCI & TERM & AHCI
 
     subgraph Userland["User programs"]
         U["mpos-user<br/>(user/)<br/>x86_64-unknown-linux-musl"]
@@ -96,17 +98,21 @@ disagree about a syscall number without one of them failing to build.
 bare-metal default. It depends on `mpos` with `default-features = false`, i.e. it fuzzes
 exactly the part of the kernel that `src/lib.rs` leaves ungated.
 
-**Seven pure leaves are their own crates under `crates/`.** `err`, `date`,
-`binfmt`, `cred`, `uts`, `seccomp` and `pci` each depend on nothing in the
-kernel (only `core`/`alloc`, and `critical-section` for `pci`/`uts`), so they
-were extracted as workspace members and re-exported from `src/lib.rs` under
-their old names (`pub use mpos_err as err;`). The call sites are unchanged; what
-the crate boundary buys is enforcement, not tidiness — a leaf crate physically
-cannot write `crate::sched::…`, so the downward-only rule that `§9` keeps having
-to re-audit is now a compile error rather than a convention. They were chosen
-because they sit *outside* the module graph's one strongly-connected component
-(`§6`); anything in that component stays inside `mpos` until Phase 11 breaks the
-cycles. `fuzz/` may later depend on these directly instead of through `mpos`.
+**Nine pure leaves are their own crates under `crates/`.** Each depends on
+nothing in the kernel (only `core`/`alloc`, and `critical-section` for
+`pci`/`uts`/`term`), so they were extracted as workspace members and re-exported
+from `src/lib.rs` under their old names (`pub use mpos_err as err;`). The call
+sites are unchanged; what the crate boundary buys is enforcement, not tidiness —
+a leaf crate physically cannot write `crate::sched::…`, so the downward-only rule
+that `§9` keeps having to re-audit is now a compile error rather than a
+convention. The first seven (`err`, `date`, `binfmt`, `cred`, `uts`, `seccomp`,
+`pci`) were chosen because they already sat *outside* the module graph's one
+strongly-connected component (`§6`); the last two were chosen for the same reason
+plus a placement one — `term` (the terminal emulator: a cell grid is not a
+filesystem fact, V-4) and `ahci` (the port decode: arithmetic whose only reader is
+machine-only). Anything still inside that component stays inside `mpos` until
+Phase 11 breaks the cycles; `fuzz/` may later depend on these crates directly
+instead of through `mpos`.
 
 ---
 
@@ -146,7 +152,7 @@ flowchart TB
         RAND["rand<br/>ChaCha20"]
         UEVENT["uevent<br/>kobject events over netlink"]
         BOOTMOD["boot<br/>handoff record"]
-        BINFMT["logging · sync · uaccess · evdev · uinput<br/>(err/date/binfmt/cred/uts/seccomp are leaf crates — §1)"]
+        BINFMT["logging · sync · uaccess · evdev · uinput<br/>(err/date/binfmt/cred/uts/seccomp/term/ahci are leaf crates — §1)"]
     end
 
     MAIN --> SYSCALL
@@ -217,9 +223,9 @@ remains (the driver finds devices, the crate describes them); it is now a cross-
 | VFS | `src/vfs/` | The `Inode`/`FileSystem` traits, mounts and path resolution, the fd table, every filesystem (ramfs, ext2/ext4, procfs, sysfs, devfs, devpts, p9, tmpfs), pipes, epoll, timerfd, eventfd, signalfd, inotify, locks, memfd/dmabuf | Contain the terminal emulator and the console mux (see V-4) |
 | Networking | `src/net/` | smoltcp integration, the socket registry and its handles, AF_INET/AF_UNIX/AF_NETLINK/AF_VSOCK, netlink route writes | Reach up into `syscall` to validate a user pointer (it borrows the `crate::uaccess` leaf — see V-9, closed by B3) |
 | Drivers | `src/drivers/` | virtio (blk, net, gpu, input, console, rng, sound, 9p, vsock, MSI-X), DRM/KMS, the render task, evdev/uinput, PCI config space, the serial console, the RTC, the QEMU debug-exit port | Parse a device's ioctl ABI (that is `syscall/linux/fs.rs` today — see V-2) |
-| Console | `src/console.rs` | Log ring, serial output, the switch to the framebuffer, the six virtual consoles | Reach into `vfs::term` for the grid (see V-4) |
+| Console | `src/console.rs` | Log ring, serial output, the switch to the framebuffer, the six virtual consoles | Reach into the VFS for the grid — it names the `term` *crate* now, never `vfs::term` (V-4, half closed) |
 | ABI | `src/syscall/` | Numbers (`nr.rs`), pure ABI facts and argument validation (`abi.rs`), the dispatch table, and the handlers (`fs.rs`, `proc.rs`, `posix.rs`) | Grow past the point where one file is a device-ioctl switchboard (see V-2) |
-| Services | `crates/err`, `crates/pci`, `crates/date`, `crates/binfmt`, `crates/cred`, `crates/uts`, `crates/seccomp` (leaf crates — §1); `src/blk/`, `src/rand.rs`, `src/uevent.rs`, `src/logging.rs`, `src/sync/`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. The seven leaf crates depend only downward and cannot name the kernel — the split is the enforcement. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
+| Services | `crates/err`, `crates/pci`, `crates/date`, `crates/binfmt`, `crates/cred`, `crates/uts`, `crates/seccomp`, `crates/term`, `crates/ahci` (leaf crates — §1); `src/blk/`, `src/rand.rs`, `src/uevent.rs`, `src/logging.rs`, `src/sync/`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. The nine leaf crates depend only downward and cannot name the kernel — the split is the enforcement. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
 
 ---
 
@@ -436,7 +442,7 @@ flowchart TB
         H2["sched (policy, signal, futex)"]
         H3["vfs (inode, mount, ramfs, ext4, procfs, sysfs, path, pipe, epoll, …)"]
         H4["syscall (nr, abi)"]
-        H5["pci, blk, binfmt, date, evdev, uinput, logging, rand<br/>+ err/cred/uts/seccomp as leaf crates (§1)"]
+        H5["pci, blk, binfmt, date, evdev, uinput, logging, rand<br/>+ err/cred/uts/seccomp/term/ahci as leaf crates (§1)"]
     end
 ```
 
@@ -483,7 +489,7 @@ are items this table caught and later work closed; an *Open* or *Widened* row is
 | V-1 | `Inode` downcasts to concrete devices and networks | `src/vfs/mod.rs:453–546` defines `as_fb`, `as_evdev`, `as_uinput`, `as_drm`, `as_vsock`, `as_unix` as default-`None` trait methods. Adding a device type means editing the VFS trait. **Widened by the in-flight AF_PACKET work: `as_packet` → `net::packet::PacketSock` joins the list** | Phase 11 B |
 | V-2 | Per-device ioctl ABI parsed in the syscall layer | `src/syscall/linux/fs.rs` switches on fbdev/RTC/uinput and TTY request numbers. **Progress (B2):** the DRM (`'d`) family already routed to `drivers::drm::drm_ioctl`; B2 moved the **evdev (`'E`) family to `drivers::virtio::input::EvdevNode::ioctl`** and the **KD (`'K`) family to `vfs::tty::Tty::kd_ioctl`** — each device now owns its accept/reject vocabulary, fd-resolution kept at the syscall boundary. For `kd` the DRM `card_grabbed_by_current()` answer is handed *down* as an `owns_card` argument, so `vfs::tty` never names `drivers` (no new upward edge). Both guest-verified `pass=136 fail=0`. **Remaining:** the `'V'` (`vt_ioctl`) and uinput families still in `fs.rs` | Phase 11 B |
 | V-3 | The scheduler performs other subsystems' per-process cleanup | `sched/runtime.rs` calls `net::socket::close_sockets_at_exit`, `vfs::inotify::close_at_exit`, `drivers::virtio::input::close_at_exit`, `drivers::uinput::close_at_exit` on task exit | Phase 11 C |
-| V-4 | The terminal emulator and console mux live inside the VFS | `vfs/term/` holds the cell grid, keys and an embedded `vga8x16.bin` font; `vfs/vcmux.rs`, `vfs/pty.rs`, `vfs/tty.rs` (2 359 lines) implement the console; `console.rs` reaches *into* `vfs::term::with_screen` to render | Phase 11 D |
+| V-4 | The terminal emulator and console mux live inside the VFS | **Half closed**: the emulator (grid, cursor, keys, font, blitter and the embedded `vga8x16.bin`) is the `mpos-term` leaf crate now, so `console.rs`, `drivers/video` and `vfs::tty` come *there* for a grid and the compile cannot be pointed back at `vfs` for one. What remains inside `vfs` is the console mux (`vcmux.rs`) and the line discipline (`tty.rs`, `pty.rs`) — the mux stays because its own vocabulary is the vfs's (`pty::VC_COUNT`, `tty::KD_TEXT`, `vtmode`), and moving it is a move of that vocabulary first | Phase 11 D (half) |
 | V-5 | A driver calls back into the syscall layer | `drivers/drm.rs` validated user pointers via `crate::syscall::buffer_ok`; **B3 closed that half — it now names `crate::uaccess::buffer_ok`.** The remaining edge is `drivers/virtio/sound.rs` naming `crate::syscall::linux::abi` for ioctl ABI constants (its former `crate::syscall::err::` refs already became `crate::err`); that is the device-ioctl-ABI concern (V-2), not the two helpers | Phase 11 B |
 | V-6 | A debug trace sat in the dispatch hot path | `syscall/linux/mod.rs::trace_msg`, self-labelled `TEMPORARY (udevd worker-channel hunt)`, wrote `[msgtrace]` lines from any failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` | **Done** (Phase 11 A) |
 | V-7 | Dead and duplicate machine modules | `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` were not declared in `arch/x86_64/mod.rs` at all; `qemu.rs` was byte-identical to `drivers/qemu.rs`. Three PCI modules existed (`arch/x86_64/pci.rs` was a stale earlier copy of `drivers/pci.rs`), two RTC, two serial | **Done** (Phase 11 A) — all three deleted, `drivers/rtc` renamed `drivers/rtc_dev` |

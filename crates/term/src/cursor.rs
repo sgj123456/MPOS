@@ -10,11 +10,11 @@
 //! readers of it, which is why a real console cannot tell a program a position
 //! the screen does not show.
 //!
-//! This kernel had two. [`crate::vfs::tty`]'s line discipline kept a private
+//! This kernel had two. the kernel's `vfs::tty` line discipline kept a private
 //! `Screen` - a 25x80 grid hardcoded at construction and never resized, which
 //! clamped its row at the bottom instead of scrolling, did not know the scroll
 //! region, save/restore or the alternate screen - and answered `6n` from that.
-//! [`crate::vfs::term::Grid`] moved the cursor for the same bytes and drew the
+//! [`crate::Grid`] moved the cursor for the same bytes and drew the
 //! cells a person actually looks at. The two parsers agreed only for the streams
 //! neither of them understood differently, so a report could describe a cursor
 //! that the screen did not have; measured with `fish` on the guest, the shell was

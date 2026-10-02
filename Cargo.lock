@@ -281,12 +281,14 @@ dependencies = [
  "bitflags 2.13.2",
  "critical-section",
  "elf",
+ "mpos-ahci",
  "mpos-binfmt",
  "mpos-cred",
  "mpos-date",
  "mpos-err",
  "mpos-pci",
  "mpos-seccomp",
+ "mpos-term",
  "mpos-uts",
  "rand_chacha",
  "rand_core",
@@ -297,6 +299,10 @@ dependencies = [
  "virtio-drivers",
  "x86_64",
 ]
+
+[[package]]
+name = "mpos-ahci"
+version = "0.1.0"
 
 [[package]]
 name = "mpos-binfmt"
@@ -331,6 +337,13 @@ dependencies = [
 [[package]]
 name = "mpos-seccomp"
 version = "0.1.0"
+
+[[package]]
+name = "mpos-term"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+]
 
 [[package]]
 name = "mpos-user"

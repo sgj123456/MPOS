@@ -200,7 +200,7 @@ pub fn fill_background(fb: &mut [u8], fb_w: usize, fb_h: usize, color: Rgb) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::term::Grid;
+    use crate::Grid;
     use alloc::vec;
 
     fn px(fb: &[u8], w: usize, x: usize, y: usize) -> [u8; 3] {

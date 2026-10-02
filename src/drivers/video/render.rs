@@ -30,10 +30,10 @@ use critical_section::Mutex;
 use crate::drivers::virtio::gpu::VirtioGpuDev;
 use crate::mm;
 use crate::sched::policy::TaskId;
+use crate::term::blit;
+use crate::term::font::{CELL_H, CELL_W};
+use crate::term::{self, Cell, DEFAULT_BG, DEFAULT_FG, MAX_ROWS};
 use crate::vfs::pty::VC_COUNT;
-use crate::vfs::term::blit;
-use crate::vfs::term::font::{CELL_H, CELL_W};
-use crate::vfs::term::{self, Cell, DEFAULT_BG, DEFAULT_FG, MAX_ROWS};
 use crate::vfs::vcmux;
 
 /// The minimum ticks between repaints (~31 Hz at 250 Hz): the ceiling that

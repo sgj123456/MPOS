@@ -34,6 +34,11 @@ mpos-cred = { path = "crates/cred" }
 mpos-uts = { path = "crates/uts" }
 mpos-seccomp = { path = "crates/seccomp" }
 mpos-pci = { path = "crates/pci" }
+# Two more leaves of the same kind, extracted after the seven above: the terminal
+# emulator (a cell grid is not a filesystem fact, PLAN.md §11.1.4) and the AHCI
+# port decode (arithmetic on three `u32`s whose only reader is machine-only).
+mpos-term = { path = "crates/term" }
+mpos-ahci = { path = "crates/ahci" }
 
 # Used by the arch-agnostic mapping plan, so deliberately not target-gated.
 # Already in the tree as a dependency of `x86_64`.

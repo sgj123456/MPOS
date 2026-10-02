@@ -203,14 +203,14 @@ and an upward edge from them is a compile error. See `ARCHITECTURE.md` §1.
 |---|---|---|---|
 | `main.rs` | Boot sequence, milestone checks, panic handler | anything (it is the wiring) | hold reusable logic — that lives in the lib |
 | `syscall/` (ABI) | Numbers, `abi.rs` facts, dispatch, handlers | `vfs`, `sched`, `mm`, `drivers`, `net`, services | be a per-device ioctl switchboard (V-2) |
-| `vfs/` | `Inode`/`FileSystem`, mounts, fd table, every filesystem, pipes/epoll/timerfd/signalfd | `sched`, `mm`, `blk`, `pci` | downcast to concrete devices through the `Inode` trait (V-1); own the terminal emulator (V-4) |
+| `vfs/` | `Inode`/`FileSystem`, mounts, fd table, every filesystem, pipes/epoll/timerfd/signalfd | `sched`, `mm`, `blk`, `pci` | downcast to concrete devices through the `Inode` trait (V-1); own the terminal emulator — the emulator is the `term` crate now, the console mux and the line discipline are still here (V-4 half closed) |
 | `sched/` | Task table, priority bands, sleep/block, signals, futex | `mm`, `arch`, `binfmt` | host another subsystem's per-process cleanup (V-3) |
 | `mm/` | Buddy frames, slab heap, mapping plans, ELF loader | `boot` | know files, tasks or devices |
 | `arch/` | GDT/IDT, PIC/LAPIC, paging, context switch, syscall gate, timer, ports | `mm` (via its own re-exports only) | be named from outside `arch::` — `arch/mod.rs` re-exports the uniform surface |
-| `console/` | Log ring, serial, framebuffer switch, the six virtual consoles | `arch`, `boot` (the boot-supplied console list) | reach into `vfs::term` for the grid (V-4) |
+| `console/` | Log ring, serial, framebuffer switch, the six virtual consoles | `arch`, `boot` (the boot-supplied console list), the `term` crate | reach into the VFS for the grid: it names the `term` crate, never `vfs::term` (V-4 half closed) |
 | `net/` | smoltcp, socket registry, AF_INET/UNIX/NETLINK/VSOCK | `drivers`, `sched`, `uevent` | validate user pointers outside the `uaccess` leaf (V-9, closed by B3) |
 | `drivers/` | virtio, DRM/KMS, render task, evdev/uinput, PCI config, serial, RTC | `mm`, `pci`, `sched` | call back into `syscall` (V-5) or parse ioctl ABI (V-2) |
-| Services — leaf crates `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp` (see `crates/`), plus `blk`, `rand`, `uevent`, `logging`, `sync`, `evdev`, `uinput`, `uaccess` | One concern each, pure logic, host-compiled where possible. The leaf crates are downward-only and cannot name the kernel. `err` is the errno table: the leaf every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
+| Services — leaf crates `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci` (see `crates/`), plus `blk`, `rand`, `uevent`, `logging`, `sync`, `evdev`, `uinput`, `uaccess` | One concern each, pure logic, host-compiled where possible. The leaf crates are downward-only and cannot name the kernel. `err` is the errno table: the leaf every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
 
 Two rules make the table usable rather than decorative:
 

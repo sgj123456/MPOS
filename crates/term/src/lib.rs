@@ -1,11 +1,23 @@
+#![no_std]
+
 //! The terminal emulator: a cell grid a byte-stream is painted into.
 //!
-//! The line discipline in [`super::tty`] answers the *questions* a program asks
+//! Its own crate, and the reason is the one thing this module is *not*: a
+//! filesystem fact. `vfs` owns `/dev/tty*` and `/dev/pts/*` as nodes, and the
+//! line discipline as their behaviour; how a cell is painted, which of the six
+//! virtual consoles is active and what a keystroke means are not the VFS's
+//! business (`PLAN.md` §11.1.4). Living here makes the boundary a compile error
+//! rather than a convention, too: this crate cannot name the kernel, so
+//! `console`, `drivers/video` and `vfs::tty` come *here* for a grid instead of
+//! each reaching into whichever module happened to hold one.
+//!
+//! The line discipline in the kernel's `vfs::tty` answers the *questions* a
+//! program asks
 //! its terminal (where is the cursor, what are you) - but only where the kernel is
 //! the terminal that owns the screen, which is where this grid is. Wherever a real
 //! emulator sits at the other end of a wire, the discipline forwards the question
-//! unanswered and that emulator answers it; see
-//! [`super::tty::Attached`] for the measurement that decided it.
+//! unanswered and that emulator answers it; see the kernel's `vfs::tty::Attached`
+//! for the measurement that decided it.
 //!
 //! Deliberately a second parser alongside `note_output`. The two answer to
 //! different masters - one shapes what leaves on the wire, this shapes what is
@@ -22,6 +34,8 @@
 //! it is safe to drive from the serial interrupt handler: a keystroke's echo
 //! repaints a cell without a heap under the critical section. Screens are capped
 //! at 32 rows (the dirty mask is a `u32`), which 80x25 fits with room to spare.
+
+extern crate alloc;
 
 pub mod blit;
 pub mod cursor;

@@ -1,6 +1,8 @@
+#![no_std]
+
 //! What an AHCI port's status words mean, kept apart from the bus that reads them.
 //!
-//! Why this is a separate file: `drivers::ahci` is compiled only for the
+//! Why this is its own crate: `drivers::ahci` is compiled only for the
 //! machine (`src/lib.rs` gates the whole `drivers` module on
 //! `target_os = "none"`), so a decision written inside it is a decision no host
 //! test can reach - which is how a port that reports a failure and never
@@ -8,13 +10,16 @@
 //! measured because nobody could assert on it. The three registers a command
 //! wait consults are three `u32`s, and the question "is this command still
 //! going, has it failed, or has the device said it is an ATAPI one" is
-//! arithmetic. `pci.rs` beside `drivers/pci.rs` is the same split, for the same
-//! reason.
+//! arithmetic. `mpos-pci` beside `drivers/pci` is the same split, and being a
+//! crate makes this half's downward-only-ness a compile error rather than a
+//! convention: nothing here can name the kernel it serves.
 //!
 //! Every expected value below is a measurement, not a reading of the spec: the
 //! numbers in [`tests`] are what a `q35` machine's own SATA controller at
 //! `00:1f.2` returned on a port that claims a device and has none, taken with
 //! the register printout described in `PLAN.md` §7.3.
+
+extern crate alloc;
 
 /// `PxIS.TFES`: the port latched a task-file error. The bit the driver already
 /// reads *after* it stops waiting, which is the ordering this module exists to

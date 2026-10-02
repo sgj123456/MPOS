@@ -1,0 +1,12 @@
+# What an AHCI port's status words mean, as arithmetic on three `u32`s rather
+# than as bus cycles. Pure, so it is its own leaf crate: the driver that reads
+# the registers is machine-only, and the decision it makes with them is exactly
+# the kind that has to be checkable on a host (`PLAN.md` §7.3 - a phantom port
+# that never retires its command cost 28.3 s of a boot, and nothing could assert
+# on it until the decode lived somewhere a test could reach).
+[package]
+name = "mpos-ahci"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
