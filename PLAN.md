@@ -138,12 +138,13 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [x] inotify · [x] `memfd_create` (anon shared buffers, §7/Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
-- [~] real-time signals — stages A+B landed: the pending mask is a canonical 64-bit
-      map, the disposition table spans `1..=64` (so `rt_sigaction` installs an RT signal
-      and `kill`/`tgkill`/`sigqueue`/`timer_create` name the range), and `SIGRTMIN` is
-      queued/masked/waited-for as musl's `SIGEV_THREAD` helper needs. The one thing left
-      is true **multi-copy** queueing (stage C): repeats of one RT number still coalesce
-      (§2.3, §Remaining)
+- [x] real-time signals `32..=64` (stages A+B+C) — the pending mask is a canonical 64-bit
+      map, the disposition table spans `1..=64` so `rt_sigaction` installs an RT signal and
+      `kill`/`tgkill`/`sigqueue`/`timer_create` name the range, and real-time signals are now
+      **queued** (a bounded per-task FIFO ring delivers every copy with its own `si_value`;
+      standard `1..=31` still coalesce, as Linux). Residual, named: the ring is fixed-length,
+      so a flood past `RT_QUEUE_LEN` drops silently where Linux's per-user `RLIMIT_SIGPENDING`
+      makes `sigqueue` return `EAGAIN` (§2.3; pinned by `t-rt-signal-queue` + `RtQueue` tests)
 - [x] POSIX timers 222–226 — `vim`'s startup probe. The five calls are routed,
       the expiry scan is the scheduler's tick, and the `SIGEV_THREAD_ID` +
       `SIGRTMIN` shape musl builds for a callback timer works end to end; the
@@ -1403,14 +1404,21 @@ standard signals 1..=31 this kernel names). `kill`/`tgkill` deliver
 (`si_signo`/`si_errno`/`si_code`/`si_pid`/`si_uid`/`si_value`) instead of a
 fixed `SI_USER`.
 
-*Real-time signals, stages A+B landed:* the pending set is now a canonical 64-bit
-map (signal `n` at bit `n-1`, so the libc wire set and the kernel's internal set are
-one shape), and the disposition table spans `1..=64` — `rt_sigaction` installs a
-real-time signal, and `kill`/`tgkill`/`rt_sigqueueinfo`/`timer_create` accept the range
-(only `0`, `>64`, and `SIGKILL`/`SIGSTOP` are refused, as Linux). This closes the
-"`rt_sigaction` answers `EINVAL` for `32..=64`" gap. *Still open (stage C):* true
-**multi-copy** queueing — repeats of one real-time number still coalesce into a single
-`siginfo` slot, where Linux delivers every `sigqueue`'d copy with its own `si_value`.
+*Real-time signals — landed (stages A+B+C):* the pending set is now a canonical
+64-bit map (signal `n` at bit `n-1`, so the libc wire set and the kernel's
+internal set are one shape), the disposition table spans `1..=64` so `rt_sigaction`
+installs a real-time signal and `kill`/`tgkill`/`rt_sigqueueinfo`/`timer_create`
+accept the range (only `0`, `>64`, `SIGKILL`/`SIGSTOP` refused, as Linux), and
+real-time signals are **queued** — a per-task bounded FIFO ring carries every copy
+of `SIGRTMIN..=SIGRTMAX` in order with its own `si_value`, whether raised by
+`sigqueue` or `kill`, while standard `1..=31` still coalesce. This closes the
+"`rt_sigaction` answers `EINVAL` for `32..=64`" and "`33..=64` have no queueable
+number" gaps. One bounded divergence remains and is named, not hidden: the ring is
+fixed-length per task, so a flood beyond `RT_QUEUE_LEN` drops the extra copy
+silently, where Linux's limit is a per-user `RLIMIT_SIGPENDING` and a full
+`sigqueue` returns `EAGAIN`. Pinned by `t-rt-signal-queue` (three `sigqueue`s
+drained FIFO with distinct values, two `kill`s yielding two copies, a handler run
+once per queued copy) and the `RtQueue` host unit tests.
 
 ### 2.4 Verification
 

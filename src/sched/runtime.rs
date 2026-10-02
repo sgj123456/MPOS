@@ -1082,10 +1082,16 @@ struct Task {
     tgid: TaskId,
     /// Signals sent to this task and not yet delivered.
     signals: signal::Pending,
-    /// The `siginfo_t` behind each pending signal, indexed like `signals`. A
-    /// standard signal is not queued, so one record per number is all the ABI
-    /// implies; this is what lets a `sigqueue` payload reach the handler.
+    /// The `siginfo_t` behind each *standard* pending signal, indexed like
+    /// `signals`. A standard signal is not queued, so one record per number is
+    /// all the ABI implies; this is what lets a `sigqueue` payload reach the
+    /// handler. Real-time signals are queued instead — see [`rtq`](Self::rtq).
     siginfo: [signal::SigInfo; signal::SIGINFO_SLOTS],
+    /// The pending *real-time* signals, a FIFO ring: Linux queues every copy of
+    /// `SIGRTMIN..=SIGRTMAX` (each with its own `si_value`), unlike a standard
+    /// signal which coalesces into the slot above. The matching bit in `signals`
+    /// stays set while any record for that number is still in this ring.
+    rtq: signal::RtQueue,
     /// The signals this task has blocked with `rt_sigprocmask`. A blocked
     /// signal stays pending until it is unblocked, which is what makes a
     /// critical section able to say "not now" and be obeyed.
@@ -1419,6 +1425,7 @@ impl Task {
             user_resume: None,
             signals: 0,
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
+            rtq: signal::RtQueue::new(),
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -1881,6 +1888,7 @@ impl Table {
             user_resume: None,
             signals: 0,
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
+            rtq: signal::RtQueue::new(),
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -2320,6 +2328,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             user_resume: None,
             signals: 0,
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
+            rtq: signal::RtQueue::new(),
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -2470,6 +2479,7 @@ pub fn try_spawn_user(
             user_resume: None,
             signals: 0,
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
+            rtq: signal::RtQueue::new(),
             blocked: 0,
             dispositions: signal::Actions::default(),
             alt_stack: None,
@@ -3415,9 +3425,29 @@ fn queue_signal(task: &mut Task, sig: u8, info: signal::SigInfo) {
     if discarded_when_generated(task, sig) {
         return;
     }
-    signal::add(&mut task.signals, sig);
-    if (sig as usize) < signal::SIGINFO_SLOTS {
-        task.siginfo[sig as usize] = info;
+    enqueue(task, sig, info);
+}
+
+/// Put a raised signal where its ABI says it belongs. A standard signal
+/// coalesces into `siginfo[sig]` — a second copy before the first is handled
+/// changes nothing. A real-time signal is pushed onto the per-task FIFO ring so
+/// every copy survives with its own `si_value`, and its `Pending` bit stays set
+/// while the ring still holds one of that number. A real-time push onto a full
+/// ring is dropped: the bound that keeps a `sigqueue` flood from growing memory
+/// (the worst-case rule).
+fn enqueue(task: &mut Task, sig: u8, mut info: signal::SigInfo) {
+    if signal::is_rt(sig) {
+        // Stamp the number so `RtQueue::pop`/`holds` can match it later; a
+        // user `siginfo_t` could otherwise carry an unrelated `si_signo`.
+        info.signo = sig as i32;
+        if task.rtq.push(info) {
+            signal::add(&mut task.signals, sig);
+        }
+    } else {
+        signal::add(&mut task.signals, sig);
+        if (sig as usize) < signal::SIGINFO_SLOTS {
+            task.siginfo[sig as usize] = info;
+        }
     }
 }
 
@@ -3478,10 +3508,7 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: signal::SigInfo) -> bool {
         // changed. `SIGCONT` is exempt, and the state change it carries is
         // below this: ignoring a resume does not mean "stay stopped".
         if !discarded_when_generated(task, sig) {
-            signal::add(&mut task.signals, sig);
-            if (sig as usize) < signal::SIGINFO_SLOTS {
-                task.siginfo[sig as usize] = info;
-            }
+            enqueue(task, sig, info);
         }
         // `SIGCONT` is the one signal whose effect is on the *state* of a task        // rather than on its pending set, and this is the only place a task's
         // state can be changed from outside it.
@@ -4116,10 +4143,23 @@ pub fn take_deliverable_siginfo() -> Option<(u8, signal::SigInfo)> {
             if task.dispositions.get(sig).is_ignore() {
                 continue;
             }
-            task.signals &= !signal::bit(sig);
-            let slot = (sig as usize).min(signal::SIGINFO_SLOTS - 1);
-            let info = task.siginfo[slot];
-            task.siginfo[slot] = signal::SigInfo::ZERO;
+            let info = if signal::is_rt(sig) {
+                match task.rtq.pop(sig) {
+                    Some(info) => info,
+                    None => continue,
+                }
+            } else {
+                let slot = (sig as usize).min(signal::SIGINFO_SLOTS - 1);
+                let info = task.siginfo[slot];
+                task.siginfo[slot] = signal::SigInfo::ZERO;
+                info
+            };
+            // The bit clears only when the last copy of this number has drained:
+            // a real-time signal stays pending while the ring still holds one, so
+            // every queued copy wakes a handler (and is not lost to a single clear).
+            if !task.rtq.holds(sig) {
+                task.signals &= !signal::bit(sig);
+            }
             return Some((sig, info));
         }
         None
@@ -4142,15 +4182,25 @@ pub fn take_signal_in_set(mask: signal::Pending) -> Option<(u8, signal::SigInfo)
         let mut ready = task.signals & mask;
         match signal::take(&mut ready) {
             Some(sig) => {
-                task.signals &= !signal::bit(sig);
-                // The record comes out with the bit it belongs to: the
-                // `siginfo_t` a waiter reads has to be the one the sender
-                // left, not a fresh `SI_USER` one - musl's `SIGEV_THREAD`
-                // helper checks `si_code == SI_TIMER` before running the
-                // callback a POSIX timer exists to make.
-                let slot = (sig as usize).min(signal::SIGINFO_SLOTS - 1);
-                let record = task.siginfo[slot];
-                task.siginfo[slot] = signal::SigInfo::ZERO;
+                let record = if signal::is_rt(sig) {
+                    match task.rtq.pop(sig) {
+                        Some(r) => r,
+                        None => return None,
+                    }
+                } else {
+                    // The record comes out with the bit it belongs to: the
+                    // `siginfo_t` a waiter reads has to be the one the sender
+                    // left, not a fresh `SI_USER` one - musl's `SIGEV_THREAD`
+                    // helper checks `si_code == SI_TIMER` before running the
+                    // callback a POSIX timer exists to make.
+                    let slot = (sig as usize).min(signal::SIGINFO_SLOTS - 1);
+                    let r = task.siginfo[slot];
+                    task.siginfo[slot] = signal::SigInfo::ZERO;
+                    r
+                };
+                if !task.rtq.holds(sig) {
+                    task.signals &= !signal::bit(sig);
+                }
                 Some((sig, record))
             }
             None => None,
@@ -7418,6 +7468,7 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             tgid: TaskId(slot),
             signals: 0,
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
+            rtq: signal::RtQueue::new(),
             // The mask is inherited, as POSIX says a child's is: a program
             // that blocks a signal and then forks expects the child to start
             // with it blocked too. The *dispositions* above are deliberately
@@ -7991,6 +8042,7 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             }),
             signals: 0,
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
+            rtq: signal::RtQueue::new(),
             // Inherited from the creator (see where `blocked` is read above):
             // the mask a thread starts with is the one the thread that made it
             // held, which is what makes `timer_create`'s `SIGEV_THREAD`

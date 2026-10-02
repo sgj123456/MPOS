@@ -93,6 +93,15 @@ pub const SIGRTMIN: u8 = 32;
 /// `Pending` word can hold (signal `n` at bit `n-1`, so signal 64 is bit 63).
 pub const SIGRTMAX: u8 = 64;
 
+/// Whether `sig` is a real-time signal. Standard signals `1..=31` coalesce
+/// (the ABI says a second `kill` before the first is handled changes nothing);
+/// real-time signals `32..=64` are queued — Linux delivers every `sigqueue`'d
+/// copy, in order, each with its own payload. The queue that makes that true is
+/// [`RtQueue`].
+pub fn is_rt(sig: u8) -> bool {
+    (SIGRTMIN..=SIGRTMAX).contains(&sig)
+}
+
 /// How many `siginfo_t` slots a task keeps: one per index `0..=64`, so every
 /// nameable signal has a record slot — the standard signals coalesce into
 /// theirs, and the timer expiry that targets a thread is handed back complete
@@ -379,6 +388,75 @@ impl SigInfo {
     }
 }
 
+/// How many queued real-time records one task can hold. Linux bounds this per
+/// *user* by `RLIMIT_SIGPENDING`; a per-task fixed ring is the kernel-space
+/// stand-in, chosen so ordinary use never reaches it and a flood cannot grow
+/// memory (the worst-case rule, `AGENTS.md` §4).
+pub const RT_QUEUE_LEN: usize = 16;
+
+/// A bounded FIFO of pending real-time signal records.
+///
+/// Standard signals coalesce — one [`SigInfo`] slot per number, a second
+/// `kill` before the first is handled is a no-op. Real-time signals do not:
+/// Linux queues *every* copy, whether raised by `sigqueue` (each carrying its
+/// own `si_value`) or by `kill`, and delivers them first-in-first-out. This ring
+/// is that queue, kept per task. It is deliberately pure and small so the
+/// ordering and the "clear the pending bit only when the last copy of a number
+/// has drained" rule are unit-testable here rather than only in the machine-only
+/// delivery path that embeds it.
+#[derive(Clone, Copy, Debug)]
+pub struct RtQueue {
+    q: [SigInfo; RT_QUEUE_LEN],
+    len: usize,
+}
+
+impl RtQueue {
+    pub const fn new() -> RtQueue {
+        RtQueue {
+            q: [SigInfo::ZERO; RT_QUEUE_LEN],
+            len: 0,
+        }
+    }
+
+    pub const fn empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Is at least one queued record for `sig` still pending? The caller keeps
+    /// the `Pending` bit set exactly while this is true, so a blocked wait is
+    /// woken once per copy and the bit clears when the number drains.
+    pub fn holds(&self, sig: u8) -> bool {
+        self.q[..self.len].iter().any(|e| e.signo == sig as i32)
+    }
+
+    /// Append a record. `false` when the ring is full — the copy is dropped
+    /// (Linux's limit is a per-user `RLIMIT_SIGPENDING`; a full ring here drops
+    /// silently and the caller does not report `EAGAIN`, a named divergence).
+    pub fn push(&mut self, info: SigInfo) -> bool {
+        if self.len == RT_QUEUE_LEN {
+            return false;
+        }
+        self.q[self.len] = info;
+        self.len += 1;
+        true
+    }
+
+    /// Remove and return the oldest queued record for `sig`, preserving the
+    /// order of the rest. `None` when `sig` has nothing queued.
+    pub fn pop(&mut self, sig: u8) -> Option<SigInfo> {
+        let at = self.q[..self.len]
+            .iter()
+            .position(|e| e.signo == sig as i32)?;
+        let info = self.q[at];
+        for j in at..self.len - 1 {
+            self.q[j] = self.q[j + 1];
+        }
+        self.len -= 1;
+        self.q[self.len] = SigInfo::ZERO;
+        Some(info)
+    }
+}
+
 /// A pending-signal set: one bit per signal number, with bit *n* naming
 /// signal *n*.
 ///
@@ -536,5 +614,81 @@ mod tests {
         assert_eq!(SigInfo::user(SIGTERM, 7, 0).code, SI_USER);
         assert_eq!(SigInfo::user(SIGTERM, 7, 0).value, 0);
         assert_eq!(SigInfo::timer(SIGALRM).code, SI_TIMER);
+    }
+
+    #[test]
+    fn is_rt_spans_only_the_real_time_range() {
+        assert!(!is_rt(1));
+        assert!(!is_rt(SIGRTMIN - 1));
+        assert!(is_rt(SIGRTMIN));
+        assert!(is_rt(SIGRTMAX));
+        assert!(!is_rt(SIGRTMAX + 1));
+    }
+
+    /// The whole reason `RtQueue` exists: three `sigqueue`s of one number all
+    /// come back, in the order sent, each with its own `si_value` — where a
+    /// coalescing slot would hand back one (the last) record.
+    #[test]
+    fn rt_queue_delivers_every_copy_in_fifo_order_with_its_own_value() {
+        let mut q = RtQueue::new();
+        assert!(q.push(SigInfo::queue(SIGRTMIN + 3, 7, 0, 0x101)));
+        assert!(q.push(SigInfo::queue(SIGRTMIN + 3, 7, 0, 0x102)));
+        assert!(q.push(SigInfo::queue(SIGRTMIN + 3, 7, 0, 0x103)));
+        assert!(q.holds(SIGRTMIN + 3));
+        assert_eq!(q.pop(SIGRTMIN + 3).map(|r| r.value), Some(0x101));
+        assert_eq!(q.pop(SIGRTMIN + 3).map(|r| r.value), Some(0x102));
+        assert!(
+            q.holds(SIGRTMIN + 3),
+            "one copy still queued -> still holds"
+        );
+        assert_eq!(q.pop(SIGRTMIN + 3).map(|r| r.value), Some(0x103));
+        assert!(!q.holds(SIGRTMIN + 3));
+        assert_eq!(q.pop(SIGRTMIN + 3), None);
+    }
+
+    /// A `kill` (no payload) of an RT number queues alongside a `sigqueue` of
+    /// the same number — Linux does not coalesce real-time signals however they
+    /// were raised — and popping one number leaves the other's order intact.
+    #[test]
+    fn rt_queue_keeps_numbers_independent_and_ordered() {
+        let mut q = RtQueue::new();
+        let a = SIGRTMIN; // 32
+        let b = SIGRTMIN + 1; // 33
+        assert!(q.push(SigInfo::user(a, 5, 0)));
+        assert!(q.push(SigInfo::queue(b, 5, 0, 0xBEEF)));
+        assert!(q.push(SigInfo::user(a, 6, 0)));
+        assert_eq!(
+            q.pop(a).map(|r| (r.signo, r.code, r.pid)),
+            Some((a as i32, SI_USER, 5))
+        );
+        assert_eq!(
+            q.pop(a).map(|r| (r.signo, r.code, r.pid)),
+            Some((a as i32, SI_USER, 6))
+        );
+        assert!(!q.holds(a));
+        // b untouched by a's pops, still first-in-line for b.
+        assert_eq!(q.pop(b).map(|r| r.value), Some(0xBEEF));
+    }
+
+    /// The bounded ring: `RT_QUEUE_LEN` pushes land, the next is dropped and
+    /// reports it (the caller must not grow memory on a flood).
+    #[test]
+    fn rt_queue_drops_and_reports_when_full() {
+        let mut q = RtQueue::new();
+        for i in 0..RT_QUEUE_LEN {
+            assert!(q.push(SigInfo::queue(SIGRTMIN, 1, 0, i as u64)), "push {i}");
+        }
+        assert!(!q.push(SigInfo::queue(SIGRTMIN, 1, 0, 0xffff)));
+        assert_eq!(
+            q.pop(SIGRTMIN).map(|r| r.value),
+            Some(0),
+            "FIFO survives overflow"
+        );
+    }
+
+    #[test]
+    fn rt_queue_starts_empty() {
+        assert!(RtQueue::new().empty());
+        assert!(!RtQueue::new().holds(SIGRTMIN));
     }
 }

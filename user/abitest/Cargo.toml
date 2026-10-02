@@ -430,6 +430,10 @@ name = "t-rt-sigaction"
 path = "src/bin/syscall/t-rt-sigaction.rs"
 
 [[bin]]
+name = "t-rt-signal-queue"
+path = "src/bin/syscall/t-rt-signal-queue.rs"
+
+[[bin]]
 name = "t-rt-sigprocmask"
 path = "src/bin/syscall/t-rt-sigprocmask.rs"
 
