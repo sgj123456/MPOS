@@ -22,7 +22,8 @@ use super::abi::{
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
 use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X_OK};
-// The devices these handlers drive. Naming one is the *syscall* layer's job -
+// The concrete node types these handlers drive: the devices, and the socket
+// families whose syscalls live here. Naming one is the *syscall* layer's job -
 // it is the layer that knows which request belongs to which device - and it is
 // exactly what the VFS stopped doing: `Inode` carries no method per device type
 // any more, so a caller asks the node for its concrete type through
@@ -34,6 +35,8 @@ use crate::drivers::uinput::Uinput;
 use crate::drivers::virtio::gpu::FbDev;
 #[cfg(target_os = "none")]
 use crate::drivers::virtio::input::EvdevNode;
+#[cfg(target_os = "none")]
+use crate::net::unix::UnixSock;
 
 /// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
 ///
@@ -3396,7 +3399,7 @@ fn sync_nonblocking(file: &crate::vfs::File, status: u32) {
         eventfd.set_nonblocking(on);
     } else if let Some(inotify) = file.inode().as_inotify() {
         inotify.set_nonblocking(on);
-    } else if let Some(sock) = file.inode().as_unix() {
+    } else if let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>() {
         sock.set_nonblocking(on);
     }
 }

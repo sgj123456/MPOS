@@ -591,18 +591,6 @@ pub trait Inode: Send + Sync + core::any::Any {
         None
     }
 
-    /// The AF_UNIX socket this node is, if it is one - the borrow form of
-    /// [`Self::unix_id`], for the calls that operate on the socket's own
-    /// state (bind's record, getsockname's echo) rather than its slot.
-    ///
-    /// Gated with the `net` module itself: on the host the type does not
-    /// exist, and every caller lives in the socket layer the host build
-    /// skips as well.
-    #[cfg(target_os = "none")]
-    fn as_unix(&self) -> Option<&crate::net::unix::UnixSock> {
-        None
-    }
-
     /// What this node can do without blocking, for `poll(2)`.
     ///
     /// The default is "everything": a node that never blocks - a file, a

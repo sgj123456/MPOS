@@ -468,10 +468,6 @@ impl Inode for UnixSock {
         self.end_of()
     }
 
-    fn as_unix(&self) -> Option<&UnixSock> {
-        Some(self)
-    }
-
     /// The byte doors. A stream answers through its channel - the same
     /// reads a socketpair end gives - and answers `ENOTCONN` when there is
     /// no channel, listening or fresh. A datagram socket answers through

@@ -36,6 +36,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use super::Channel;
 use crate::err;
 use crate::net::packet::PacketSock;
+use crate::net::unix::UnixSock;
 use crate::net::vsock::VsockSock;
 use crate::vfs::pipe::DuplexEnd;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError};
@@ -838,7 +839,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
             // The datagram doors park on the socket's own flag, so an
             // `O_NONBLOCK` named at creation has to reach it here - the
             // same sync `F_SETFL` and `FIONBIO` do later.
-            if let Some(sock) = file.inode().as_unix() {
+            if let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>() {
                 sock.set_nonblocking(true);
             }
         }
@@ -1061,7 +1062,7 @@ pub(crate) fn handle_connect(args: [usize; 6], from_user: bool) -> isize {
     // A unix socket's connect is a path: resolve, hand the listener's
     // queue the handshake. The whole act is `unix::connect_path`.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-        if let Some(sock) = file.inode().as_unix() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>() {
             let raw = match read_sockaddr_un(args[1], args[2], from_user) {
                 Ok(raw) => raw,
                 Err(e) => return e,
@@ -1333,7 +1334,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // is a `sockaddr_un`; when it does not, the send is aimed at the peer
     // a previous `connect` pinned, and without either it is `ENOTCONN`.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_unix()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
         && sock.carries_messages()
     {
         if !crate::uaccess::buffer_ok(buf, len, false, from_user) {
@@ -1463,7 +1464,7 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
     // carried on a datagram send here - `SCM_RIGHTS` rides the connected
     // stream, the shape every caller in this image uses it in.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_unix()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
         && sock.carries_messages()
     {
         let (name, namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
@@ -1835,7 +1836,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     // beside `read` on a socket of this shape. A buffer smaller than the
     // message truncates it, discarding the rest, as unix datagrams do.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_unix()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
         && sock.carries_messages()
     {
         if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
@@ -2000,7 +2001,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     // fits the first iovec of every caller this image has), and the
     // sender's name back through `msg_name`.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_unix()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
         && sock.carries_messages()
     {
         let (name, _namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
@@ -2157,7 +2158,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         // Pop any descriptor handover queued for this channel and decide
         // whether the peer's credentials ride along.
         let handover = on_channel(&file, |c| c.take_scm()).flatten();
-        let want_cred = match file.inode().as_unix() {
+        let want_cred = match file.inode().as_any().downcast_ref::<UnixSock>() {
             Some(sock) if sock.passcred() => sock.peer_cred(),
             _ => None,
         };
@@ -2646,7 +2647,7 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
     // AF_UNIX: the path bind. The address is a `sockaddr_un`; the socket's
     // whole namespace story - node, table, news - is `unix::bind_path`.
     if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
-        if let Some(sock) = file.inode().as_unix() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>() {
             let raw = match read_sockaddr_un(args[1], args[2], from_user) {
                 Ok(raw) => raw,
                 Err(e) => return e,
@@ -2863,7 +2864,7 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
 /// refusal for everything else.
 pub(crate) fn handle_listen(args: [usize; 6], _from_user: bool) -> isize {
     if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32) {
-        if let Some(sock) = file.inode().as_unix() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>() {
             return match crate::net::unix::listen(sock, args[1] as i32) {
                 Ok(()) => 0,
                 Err(e) => e,
@@ -2956,7 +2957,12 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
     // The borrow that asks "is this a unix socket, and which id" cannot
     // outlive the statement; the id, and the Arc the registry hands back
     // for it, can.
-    let Some(listener_id) = listener_arc.inode().as_unix().map(|sock| sock.id()) else {
+    let Some(listener_id) = listener_arc
+        .inode()
+        .as_any()
+        .downcast_ref::<UnixSock>()
+        .map(|sock| sock.id())
+    else {
         return err::EOPNOTSUPP;
     };
     drop(listener_arc);
@@ -3451,7 +3457,7 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
     // written back in `sockaddr_un` form with the in-out length the
     // man page spells.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-        if let Some(sock) = file.inode().as_unix() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>() {
             return crate::net::unix::write_name(sock, addr_ptr, len_ptr);
         }
         // A vsock socket's name is the guest CID and the local port -
@@ -3573,7 +3579,7 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
     // which is `ENOTCONN` and not an empty answer: "nobody is there" is
     // a different fact from "everybody is anonymous".
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-        if let Some(sock) = file.inode().as_unix() {
+        if let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>() {
             if sock.unix_end().is_none() {
                 return err::ENOTCONN;
             }
@@ -3787,7 +3793,7 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     // opt-in is accepted too, though this kernel fills the peer's real ids at
     // connect and does not let a sender claim another's.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
-        && let Some(sock) = file.inode().as_unix()
+        && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
     {
         if level != SOL_SOCKET {
             return err::ENOPROTOOPT;
@@ -3976,7 +3982,8 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
         .and_then(|file| {
             let inode = file.inode();
             inode
-                .as_unix()
+                .as_any()
+                .downcast_ref::<UnixSock>()
                 .map(|s| (s.peer_cred().unwrap_or_default(), s.passcred()))
                 .or_else(|| {
                     inode.as_duplex().map(|d| {
