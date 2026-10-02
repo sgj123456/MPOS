@@ -875,8 +875,20 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     syncobjs: Vec::new(),
 }));
 
-/// The `drm_version` answer: this is not a real driver, so report the KMS ABI
-/// we speak (4.0) and the name "mpos".
+/// The `drm_version` answer: the KMS ABI version this kernel speaks (4.0), and
+/// the *driver's* name - which on Linux is the hardware driver's, and for this
+/// machine's card is `virtio_gpu`.
+///
+/// The name is not decoration, and this answered `"mpos"` until that was
+/// measured. Linux's `drm_version.name` is `drm_dev->driver->name`, and Mesa
+/// maps it to a renderer: its kmsro table is keyed by the kernel driver name -
+/// `libgallium` carries the string `virtio_gpu` beside `kms_swrast` - and a
+/// card whose name is in no table gets the software rasteriser. Measured on the
+/// GL card: with the name `"mpos"`, `eglinfo`'s every platform reported
+/// `llvmpipe (LLVM 23.1.2, 128 bits)` on a card with 3D behind it, which is
+/// what a compositor refusing a *software* device acts on. A private spelling
+/// in a field a caller identifies the driver by is the shape `AGENTS.md` §4.3
+/// forbids; `virtio_gpu` is the name Linux gives the very device this card is.
 ///
 /// The strings move in the two-call shape libdrm's `drmGetVersion` drives, and
 /// one rule of that shape is load-bearing rather than tidy: the answer to the
@@ -900,7 +912,8 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
 fn fill_version(buf: usize) -> isize {
     // struct drm_version: three ints (then four bytes of padding), and a
     // length/pointer pair each for the name, the date and the description.
-    const FIELDS: [(&[u8], usize, usize); 3] = [(b"mpos", 16, 24), (b"", 32, 40), (b"", 48, 56)];
+    const FIELDS: [(&[u8], usize, usize); 3] =
+        [(b"virtio_gpu", 16, 24), (b"", 32, 40), (b"", 48, 56)];
 
     unsafe {
         let w = |off: usize, v: i32| ((buf + off) as *mut i32).write_unaligned(v);

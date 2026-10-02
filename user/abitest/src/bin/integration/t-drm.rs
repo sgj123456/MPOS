@@ -757,10 +757,14 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         b"VERSION does not outgrow the room the caller brought",
         name_len2 <= name_len,
     );
+    // The name is the *driver's*, as Linux answers it: `virtio_gpu` for the
+    // card this machine has, not a private spelling. Mesa's renderer choice is
+    // keyed on this string (`PLAN.md` §7.4), so a name no caller's table has is
+    // a card a compositor has no driver for.
     lin::check_true(
         &mut failed,
         b"VERSION wrote the name through the pointer, not over it",
-        &block[..name_len2] == &b"mpos"[..] && u64_at(&ver, 24) == block_ptr as u64,
+        &block[..name_len2] == &b"virtio_gpu"[..] && u64_at(&ver, 24) == block_ptr as u64,
     );
 
     // SET_VERSION: request the 1.4 KMS interface, read the driver's 1.1.

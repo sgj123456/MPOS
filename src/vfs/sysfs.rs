@@ -1075,10 +1075,25 @@ fn build_pci(
 
         next = add_pci_attributes(&dir, &drivers, device, &path, next);
 
-        // The display-class function is the one a DRM node belongs to. Linux's
-        // class codes put every GPU under `0x03`, and this kernel drives
-        // exactly one.
-        if device.class == PCI_CLASS_DISPLAY && display.is_none() {
+        // The display-class function is where a DRM node belongs - but a
+        // machine can carry more than one, and only one of them is this
+        // kernel's GPU. Measured, on the very first GL boot after this was
+        // built: q35 puts the firmware's own VGA beside the `virtio-gpu` the
+        // machine was given, class `0x03` both, and picking by class alone
+        // hung the card off the VGA. Mesa then read it and said so in its own
+        // words - `pci id for fd 3: 1234:1111, driver (null)`, the id of a
+        // display adapter it has no driver for, where the card it was holding
+        // is a virtio-gpu (`1af4:1050`).
+        //
+        // So the choice is the function a driver bound to. The firmware's VGA
+        // has none, because this kernel has no driver for it; the GPU's
+        // function carries `virtio-pci`, which is the driver that made the
+        // card. **The honest shape is the driver telling sysfs where its own
+        // device is, rather than sysfs guessing from class and driver** - and
+        // that is recorded in `PLAN.md` §7.4 as the part still to do. What
+        // this does not do is pick one of two live display drivers by
+        // enumeration order, because this kernel has only the one.
+        if device.class == PCI_CLASS_DISPLAY && device.driver.is_some() && display.is_none() {
             display = Some((dir.clone(), path.clone()));
         }
 
@@ -1535,11 +1550,26 @@ mod tests {
         )
     }
 
-    /// A machine with a disk and a *display* function - the shape a DRM card
-    /// hangs from, and one `pci_fs` deliberately does not have: a display
-    /// function there would change the device list that fixture's own test
-    /// asserts, so the two machines stay separate.
+    /// A machine with a disk, a *display* function, and the firmware's own
+    /// display adapter beside it - the shape a DRM card hangs from, and one
+    /// `pci_fs` deliberately does not have: display functions there would
+    /// change the device list that fixture's own test asserts, so the two
+    /// machines stay separate.
+    ///
+    /// The two display functions are both class `0x03` and the VGA comes
+    /// **first**, which is the whole point: this is a q35 machine, and the
+    /// bug this fixture exists for was hanging the card off the VGA because
+    /// it matched the class first.
     fn gpu_fs() -> Arc<SysFs> {
+        let mut vga = a_function(0, 1, 0);
+        vga.vendor = 0x1234;
+        vga.device = 0x1111;
+        vga.class = 0x03;
+        vga.subclass = 0x00;
+        vga.prog_if = 0x00;
+        // No driver: this kernel has none for it, which is what tells the two
+        // apart.
+
         let mut gpu = a_function(0, 2, 0);
         gpu.vendor = 0x1af4;
         gpu.device = 0x1050;
@@ -1559,7 +1589,7 @@ mod tests {
                     sectors: 20 * 1024 * 1024,
                 }],
             },
-            alloc::vec![gpu],
+            alloc::vec![vga, gpu],
         )
     }
 

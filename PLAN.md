@@ -4137,6 +4137,59 @@ item in this section.
 > sees it because the gate boots an initramfs and not Alpine. It is its own
 > named gap, and it is now the reason a *stock* boot reports no udev at all.
 
+> **Update, measured (2026-10-02): the card is found now, and Mesa says where it
+> still stops.** The identity chain was built and the acceptance was run - not
+> over the console, which cannot be driven (below), but from a script in
+> `/etc/local.d` that runs the probes at boot and leaves their output on the
+> disk, where the host reads it with `qemu-nbd` and a mount. That technique is
+> the instrument; the files were temporary and are not in the tree.
+>
+> With the chain in place, on `virtio-gpu-gl-pci`:
+>
+> ```text
+> devpath=/sys/devices/pci0000:00/0000:00:04.0
+> PCI_ID=1AF4:1050  PCI_SUBSYS_ID=1AF4:1100  PCI_SLOT_NAME=0000:00:04.0
+> subsys=../../../bus/pci
+> drmlist=card0 renderD128
+> ```
+>
+> - **`kmscube` no longer says `no drm device found!`.** It initialises EGL 1.5,
+>   prints its EGL and GL information, and is still running when a 25 s timeout
+>   kills it (`rc=143`). The device is found, opened and driven, so that part of
+>   Phase E's second bar moved.
+> - **The renderer is still `llvmpipe`, and Mesa names the next gap itself**:
+>   `MESA-EGL: warning: egl: failed to create dri2 screen`, then
+>   `MESA-EGL: warning: DRI2: failed to create screen`, on the GBM platform and
+>   on surfaceless. It says the same with `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`
+>   forced - so the driver *is* reached and its **screen creation** is what
+>   fails. That is the item now: not the identity, not the command family, but
+>   whatever the virtio_gpu driver's screen creation asks for and does not get.
+> - **A bug the first version of the chain had, worth the paragraph**: the card
+>   hung off the *first* display-class function, and a q35 machine has the
+>   firmware's own VGA (`1234:1111`) before the `virtio-gpu` it was given - same
+>   class, so class alone chose the VGA. Mesa read it and said so:
+>   `pci id for fd 3: 1234:1111, driver (null)`, the id of a display adapter it
+>   has no driver for. The choice is now the function a driver bound to (the VGA
+>   has none), pinned by a fixture that puts the VGA first - and **the honest
+>   shape is the driver telling sysfs where its own device is rather than sysfs
+>   guessing from class and driver**, which is owed.
+> - **`DRM_IOCTL_VERSION` now answers the driver's name, `virtio_gpu`**, where it
+>   answered `"mpos"`. Measured *not* to be the gate - with the name corrected
+>   the renderer does not move - but landed anyway: Linux's `drm_version.name`
+>   is `drm_dev->driver->name`, Mesa keys its kmsro table on it (`libgallium`
+>   carries `virtio_gpu` beside `kms_swrast`), and a private spelling in a field
+>   a caller identifies the driver by is the shape §4.3 forbids. `t-drm` carries
+>   the new expectation.
+>
+> **And the console defect, sharpened by measurement.** It is not length: after
+> the *first* command the receiver is dead. `^A 2` - the mux's own switch, which
+> narrates `[tty2]` on the wire when it works - produces nothing at all, so the
+> bytes never reach the mux; the forwarder is not stuck
+> (`poll_schedule_timeout`, its normal select); and the machine is idle, not
+> looping (`HLT=1`, `RIP` in kernel space). A machine that cannot be typed at
+> after one command cannot be measured through, which is why the boot-time
+> instrument above exists.
+
 #### Measured: what Linux's card answers, request by request
 
 The family is written from an observation rather than from the UAPI header,
