@@ -6163,7 +6163,7 @@ closed and this move as the remaining half.
 
 ---
 
-#### Step E — Split `fs.rs` along its real seams (follow-up to B2)
+#### Step E — Split `fs.rs` along its real seams (follow-up to B2) — **LANDED**
 
 After B2 the file should be much smaller. What remains is still two jobs: the path-carrying calls
 (`open`, `stat`, `getdents64`, …) and the device-ioctl entry point. Split into
@@ -6172,6 +6172,27 @@ switchboard — whichever the size says.
 
 **Acceptance:** the dispatch routing counts are unchanged, no handler changed meaning, host tests
 unchanged.
+
+**Landed.** The size said split (B2 shrank the ioctl arms but the file was still 6833 lines). It went
+to a directory module `src/syscall/linux/fs/` rather than two top-level files, because that is the
+shape that keeps `syscall/linux/mod.rs`'s ~95 `fs::<handler>` references byte-for-byte identical — the
+acceptance criterion in the form it can be checked: `fs/mod.rs` holds the module header, the one helper
+both halves call (`sync_nonblocking`), and re-exports the entry points (`pub(super) use file::*;
+pub(super) use ioctl::*;`), so the dispatch still names `fs::handle_read`, `fs::handle_ioctl`, … with no
+change upstream. `fs/file.rs` (5523 lines) is the path-carrying handlers and their private helpers
+(`Xattr`, `base_of`, `record_lock`/`lock_take` with both cfg bodies moved together, the `flock_off`
+submodule); `fs/ioctl.rs` (1281 lines) is `handle_ioctl` and the contiguous per-family routers
+(`family_nr`/`vt_ioctl`/`kd_ioctl`/`fs_flags_ioctl`/`uinput_ioctl`/`evdev_ioctl`/`ifreq_index`/
+`ifreq_flags`). The measurement showed the seam is unusually clean: the entire device-ioctl footprint is
+one contiguous region, and exactly one helper crosses it. `fs` is machine-only
+(`#[cfg(target_os = "none")] pub mod fs`), so the kernel host build never compiles it — which is why
+this is verified by the bare-metal build and the QEMU gate rather than the host suite. Pure relocation:
+`cargo build --target x86_64-unknown-none` green with clippy back to its 29-warning baseline (no new
+lint), `cargo xtask depgraph` unchanged (mutual pairs 17/17 — `fs` lives inside `syscall`, so no module
+edge moves), host suite unchanged at 511, and the full gate ends `=== SUMMARY pass=140 fail=0`, exit
+**33** — the path/file and every ioctl-family conformance program (`t-ioctl`, `t-drm`, `t-fbdev`,
+`t-tty-*`, `t-seat`, `t-hwclock`, …) pass on the relocated handlers.
+
 
 ---
 
@@ -6310,7 +6331,10 @@ shown able to go red on each of the three rules.
    first ratchet drop since Step C; gate green `pass=140 fail=0`). **D.2b remains**: relocating the
    `vcmux` *file* into `console` and inverting its `vfs → console`/`vfs → drivers`/`pty`/`tty` calls —
    a design move, not a rename, and no longer needed to break the pair.
-6. **Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.
+6. ~~**Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.~~ **Done** (§11.2 Step E):
+   the file was still 6833 lines, so it split along the path/file ↔ device-ioctl seam into
+   `src/syscall/linux/fs/{mod,file,ioctl}.rs`; `mod.rs` re-exports the entry points so `mod.rs`'s
+   `fs::<handler>` dispatch is unchanged. Gate green `pass=140 fail=0`, depgraph unchanged (17/17).
 7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the
    criterion is in `src/lib.rs`/`AGENTS.md`, the dead test module is deleted with its coverage
    named, and `xtask/src/gates.rs` fails the sweep on the shape.

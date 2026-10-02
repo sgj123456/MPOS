@@ -13,8 +13,10 @@ pub mod nr;
 /// the only place those facts are spelled.
 pub mod abi;
 
-/// The path-carrying calls, in Linux argument shapes: NUL-terminated paths
-/// and dirfd-led resolution.
+/// The path-carrying calls in Linux argument shapes (`fs::file`), and the
+/// device-`ioctl` entry point (`fs::ioctl`) — split along that seam at
+/// PLAN.md §11.2 Step E; `fs::mod` re-exports the handlers so dispatch below
+/// still names `fs::<handler>` as when it was one file.
 #[cfg(target_os = "none")]
 pub mod fs;
 
