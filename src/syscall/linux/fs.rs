@@ -29,6 +29,8 @@ use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X
 // `dyn Inode::as_any` instead (`PLAN.md` §11.2 Step B1, V-1). Gated with the
 // modules they come from, which the host build does not compile.
 #[cfg(target_os = "none")]
+use crate::drivers::uinput::Uinput;
+#[cfg(target_os = "none")]
 use crate::drivers::virtio::gpu::FbDev;
 #[cfg(target_os = "none")]
 use crate::drivers::virtio::input::EvdevNode;
@@ -3104,7 +3106,7 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         }
         // And the device a `/dev/uinput` description made goes with it - the
         // node out of `/dev/input`, its readers told the stream has ended.
-        if let Some(ui) = file.inode().as_uinput() {
+        if let Some(ui) = file.inode().as_any().downcast_ref::<Uinput>() {
             ui.forget(file.ofd());
         }
         // The DRM master belongs to the open file description, so it dies with
@@ -4592,7 +4594,7 @@ fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
         Err(e) => return err_of(e),
     };
     let inode = file.inode();
-    let Some(dev) = inode.as_uinput() else {
+    let Some(dev) = inode.as_any().downcast_ref::<Uinput>() else {
         return err::ENOTTY;
     };
     dev.ioctl(file.ofd(), request, buf, from_user)

@@ -332,7 +332,7 @@ impl Uinput {
 #[cfg(target_os = "none")]
 pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>], _owner: u32) {
     crate::vfs::file::for_each_last(files, |file, ofd| {
-        if let Some(dev) = file.inode().as_uinput() {
+        if let Some(dev) = file.inode().as_any().downcast_ref::<Uinput>() {
             dev.forget(ofd);
         }
     });
@@ -394,10 +394,5 @@ impl Inode for Uinput {
     /// There is no position in a device's event stream to seek to.
     fn seekable(&self) -> bool {
         false
-    }
-
-    #[cfg(target_os = "none")]
-    fn as_uinput(&self) -> Option<&Uinput> {
-        Some(self)
     }
 }

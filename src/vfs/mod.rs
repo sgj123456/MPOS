@@ -506,13 +506,6 @@ pub trait Inode: Send + Sync + core::any::Any {
         false
     }
 
-    /// The `/dev/uinput` device this is, if it is one - how the `'U'`-typed
-    /// ioctls reach the devices userland makes.
-    #[cfg(target_os = "none")]
-    fn as_uinput(&self) -> Option<&crate::drivers::uinput::Uinput> {
-        None
-    }
-
     /// The `memfd` this node is, if it is one - how `fcntl`'s sealing
     /// (`F_ADD_SEALS`/`F_GET_SEALS`) reaches the seal state of an anonymous
     /// shared buffer. Gated with the `memfd` module, which the host has no
