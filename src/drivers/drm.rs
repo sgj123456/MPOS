@@ -978,7 +978,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         Err(_) => return -9, // EBADF
     };
     let inode = file.inode();
-    let Some(card) = inode.as_drm() else {
+    let Some(card) = inode.as_any().downcast_ref::<DrmCard>() else {
         return -25; // ENOTTY
     };
     // Which of the card's two names this is: `card0`'s minor 0 is the one that
@@ -2468,7 +2468,7 @@ fn get_lease(arg: usize) -> isize {
     // The descriptor is looked up in the *caller's* table, so the only fd that
     // can answer is one this process holds - which is the same restriction
     // Linux imposes by walking the caller's own file-private lease list.
-    let Some(card) = inode.as_drm() else {
+    let Some(card) = inode.as_any().downcast_ref::<DrmCard>() else {
         return -22;
     };
     let Some(lease) = card.lease() else {
@@ -2543,7 +2543,11 @@ fn revoke_lease(_card: &DrmCard, caller: u64, arg: usize) -> isize {
         return -22; // EINVAL: no such descriptor to take back
     };
     let inode = file.inode();
-    let Some(leased) = inode.as_drm().and_then(|c| c.lease()) else {
+    let Some(leased) = inode
+        .as_any()
+        .downcast_ref::<DrmCard>()
+        .and_then(|c| c.lease())
+    else {
         return -22; // EINVAL: the descriptor is not a lease
     };
     leased.revoke();
@@ -3968,7 +3972,7 @@ fn mode_atomic(arg: usize) -> isize {
                 return -9; // EBADF
             };
             let inode = file.inode();
-            let Some(sync_file) = inode.as_sync_file() else {
+            let Some(sync_file) = inode.as_any().downcast_ref::<SyncFileFd>() else {
                 return libc_einval();
             };
             Some(sync_file.fence())
@@ -5222,10 +5226,6 @@ impl Inode for SyncObjFd {
             size: 0,
         }
     }
-
-    fn as_syncobj_fd(&self) -> Option<&SyncObjFd> {
-        Some(self)
-    }
 }
 
 /// The descriptor `SYNCOBJ_HANDLE_TO_FD` with `EXPORT_SYNC_FILE` answers, and
@@ -5273,10 +5273,6 @@ impl Inode for SyncFileFd {
             read: self.fence.has_retired(),
             write: false,
         }
-    }
-
-    fn as_sync_file(&self) -> Option<&SyncFileFd> {
-        Some(self)
     }
 }
 
@@ -5606,7 +5602,7 @@ fn syncobj_fd_to_handle(owner: u64, arg: usize) -> isize {
         }) else {
             return -2; // ENOENT
         };
-        let Some(sync_file) = inode.as_sync_file() else {
+        let Some(sync_file) = inode.as_any().downcast_ref::<SyncFileFd>() else {
             return libc_einval();
         };
         target.submit(sync_file.fence(), None, &mut SchedWaker);
@@ -5620,7 +5616,7 @@ fn syncobj_fd_to_handle(owner: u64, arg: usize) -> isize {
         // Without the import flag there is nothing to replace.
         return libc_einval();
     }
-    let Some(syncobj_fd) = inode.as_syncobj_fd() else {
+    let Some(syncobj_fd) = inode.as_any().downcast_ref::<SyncObjFd>() else {
         return libc_einval();
     };
     let object = syncobj_fd.object();
@@ -6478,10 +6474,6 @@ impl Inode for DrmCard {
         }
         clone_frame_ref(frame);
         Some(frame)
-    }
-
-    fn as_drm(&self) -> Option<&DrmCard> {
-        Some(self)
     }
 
     /// A dumb buffer is real memory the card scans out; its mapping must be

@@ -34,11 +34,20 @@ use anyhow::{Context, Result, bail};
 /// that pair had to go — `ARCHITECTURE.md` V-13). Was 19 before the seam.
 const BASELINE_MUTUAL_PAIRS: usize = 18;
 
-/// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`. All
-/// nine are the `Inode::as_*` downcasts (V-1: `as_fb`, `as_evdev`, `as_uinput`,
-/// `as_drm`, `as_syncobj_fd`, `as_sync_file`, `as_vsock`, `as_packet`,
-/// `as_unix`); Phase 11 B1 replaces them with one handle and this goes to zero.
-const BASELINE_VFS_DEVICE_REFERENCES: usize = 9;
+/// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.
+///
+/// **Zero, and it must stay zero.** This was 9: the `Inode::as_*` downcasts
+/// (V-1) - one method per concrete device and socket type, six under
+/// `crate::drivers::` and three under `crate::net::`, so the VFS could not be
+/// compiled without naming every driver in the kernel and a seventh device type
+/// meant editing the filesystem layer. Phase 11 B1 removed them one device at a
+/// time (fbdev, evdev, uinput, AF_PACKET, AF_VSOCK, AF_UNIX, then the DRM card's
+/// three node types) and each migration took its references with it: 9 → 8 → 7 →
+/// 6 → 5 → 4 → 3 → 0. The question they answered is now asked *of* the node by
+/// the layer that owns the type, through `dyn Inode::as_any`; the VFS never
+/// hears the answer's name. A new reference here is a new leak of the same
+/// shape, so the ratchet fails on the first one.
+const BASELINE_VFS_DEVICE_REFERENCES: usize = 0;
 
 /// The layers below `syscall` that must not name it (AGENTS.md §4's first hard
 /// rule). `arch` and `main` are deliberately absent: the `syscall` gate's whole

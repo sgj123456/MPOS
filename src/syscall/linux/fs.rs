@@ -30,6 +30,8 @@ use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X
 // `dyn Inode::as_any` instead (`PLAN.md` §11.2 Step B1, V-1). Gated with the
 // modules they come from, which the host build does not compile.
 #[cfg(target_os = "none")]
+use crate::drivers::drm::DrmCard;
+#[cfg(target_os = "none")]
 use crate::drivers::uinput::Uinput;
 #[cfg(target_os = "none")]
 use crate::drivers::virtio::gpu::FbDev;
@@ -3117,7 +3119,7 @@ pub(super) fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         // simply closes the card - must not leave the machine holding a screen
         // nobody can drive. Asked after the close, for the same reason as the
         // read position above.
-        if file.inode().as_drm().is_some() {
+        if file.inode().as_any().downcast_ref::<DrmCard>().is_some() {
             crate::drivers::drm::master_closed(file.ofd());
         }
         // The keyboard's mode goes back with the session that wrote it, so a
