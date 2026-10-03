@@ -799,6 +799,13 @@ it - so the entries say which they are:
       is** — `arch ↔ mm` out (`mm` no longer names `arch`), `hal ↔ mm` in, argued in
       `ARCHITECTURE.md` §9 as the seam's neighbour rather than a leak. Gate green:
       `pass=142 fail=0 (142 built)`, exit 33
+- [x] **11.4 stage 5's ratchet** (the closure waits for S4): `cargo xtask depgraph` gained a third
+      recorded rule — references to `crate::arch::` from a layer that is not the machine layer
+      (`sched` 17, `syscall` 4 today, both may only fall). It is what stops the door widening
+      while S4 is written; measured by the same comment-stripped extraction as the other two, so
+      the `drivers/rtc_dev.rs` doc link does not count. The design finding that reshaped S4 — the
+      `abi::uregs` conversion cannot move into `arch` without an `arch → syscall` edge, so the
+      frame must expose operations instead — is recorded in §11.4 beside the stage table
 
 **ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
 
@@ -6479,7 +6486,7 @@ the argument for having done them first.
 - **Fixing V-10.** Accepted, documented, and cheaper to live with than a shared crate across two
   targets would be.
 
-### 11.4 The HAL: a machine seam under `arch/` — **S1–S3 LANDED; S4–S5 open**
+### 11.4 The HAL: a machine seam under `arch/` — **S1–S3 LANDED, S5'S RATCHET LANDED; S4 OPEN**
 
 Phase 11 is "who names whom"; this is the largest remaining piece of it, deferred above until
 now. Goal: everything above the machine layer compiles against *capability traits* instead of
@@ -6507,13 +6514,37 @@ neutral.
 | S2 | `Interrupts` (`Line`, `unmask`/`mask`/`eoi`, `init_message_signalled`, `net_msi_vector`): `serial`, `virtio/net`, `lapic` | **landed** — pairs 15 → 14; gate `pass=142 fail=0` exit 33 |
 | S2 | `Interrupts` (`Line`, `unmask`/`eoi`/`net_irq`): `serial`, `virtio/net`, `lapic` | open |
 | S3 | `Paging` (`Space` assoc + `AddressSpaceOps`, `install`/`map_mmio`/`translate`/`user_accessible`/`is_cow_page`/`write_user_u32`/roots/switch/`phys_for_virt_of`); `PageTaken` moves to `mm::vm`; migrates `sched`, `mm`, `uaccess`, `syscall`, `main` | **landed** — pairs 14 → 14 (a swap: `arch ↔ mm` out, `hal ↔ mm` in); gate `pass=142 fail=0` exit 33 |
-| S4 | `Contexts`/`UserFrame`: `Context`/`Fpu`/`UserFrame` become assoc types; the `SegmentSelector` and register-frame leak into `sched`/`syscall` ends | open |
-| S5 | close the door: `arch::x86_64` internals `pub(crate)`, reachable only through `hal`; a depgraph rule "no `crate::arch::` outside `arch`/`hal`/`main`" at 0 | open |
+| S4 | `Contexts`/`UserFrame`: `Context`/`Fpu`/`UserFrame` become assoc types; the `SegmentSelector` and register-frame leak into `sched`/`syscall` ends | **open** — see the design finding below |
+| S5 | close the door: `arch::x86_64` internals `pub(crate)`, reachable only through `hal`; a depgraph rule "no `crate::arch::` outside `arch`/`hal`/`main`" at 0 | **ratchet landed** (`sched` 17, `syscall` 4, may only fall); the closure itself waits for S4 |
 
 S2–S4 touch the trap, page-fault and context-switch paths, so each needs the full QEMU gate,
 not host+clippy alone. S1 was pure re-routing — host tests, both clippy targets and the depgraph
 were the whole measurement, and its own reds (none) would have been a compile error, not a
 machine bug.
+
+**S4's design finding, found by measuring rather than by planning it.** The plan above said the
+register-frame knowledge would move into `arch/<arch>`. Measuring what is left showed why only
+half of it can: after S1–S3 exactly two modules still name `crate::arch::` — `sched` (17, the
+saved `Context`, `FpuState`, `UserContext` and the switch/FPU/bootstrap calls) and
+`syscall/linux/proc.rs` (4: `gdt::user_selectors` twice and the `UserContext` literal).
+
+The frame's **constructor** can move down — building a frame from the gate's trap record is a
+pure machine fact, and moving it is what removes the `SegmentSelector` from the ABI layer. But
+the frame's conversion **into** the Linux `user_regs_struct` array
+(`abi::uregs`, `context_regs`/`context_from_regs`/`capture_frame`) cannot: `arch` naming
+`crate::syscall::linux::abi` is an `arch → syscall` edge, the one direction this whole design
+forbids and the one the depgraph's first rule exists to catch. So the array conversion stays in
+the ABI layer, and the frame type must instead expose the operations that layer needs
+(`to_regs`/`from_regs` with the array as an associated `Regs` type, `ip`/`sp`/`set_result`,
+`forked`). That also means `ContextOps` has to hand out its `Fpu` (`fpu()`/`fpu_mut()`, with
+`type Context: ContextOps<Fpu = Self::Fpu>` tying the two associated types together), because
+`sched` stores `Context` and pokes its FPU half on every switch.
+
+S4's accepted shape, then: `hal::Contexts` with `Context`/`Fpu`/`UserFrame` as associated types
+behind `ContextOps`/`FpuOps`/`UserFrameOps`, the aliases and `FPU_BYTES` as crate-level consts in
+`hal` (an associated const in an array length needs `generic_const_exprs`), the frame
+*constructor* moved into `arch`, and the ABI array conversion left where the ABI is. That
+takes both remaining counts to 0 and is what lets S5 close the modules.
 
 ---
 

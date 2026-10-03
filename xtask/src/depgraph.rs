@@ -143,6 +143,31 @@ impl Graph {
     }
 }
 
+/// References to `crate::arch::` from a layer that is not the machine layer.
+///
+/// **This is the door the HAL exists to shut.** `arch` and `hal` are exempt (the
+/// machine layer may name itself) and so is `main` (the wiring, which reaches the
+/// machine before any HAL call can exist) - neither appears here because neither
+/// is counted. Every other module's count is recorded at the value the tree has
+/// today and may only fall.
+///
+/// `sched` and `syscall` are what is left, and stage 4 of `PLAN.md` §11.4 is the
+/// step that takes both to zero. The finding recorded there and worth having
+/// here: the conversion *into* the Linux `user_regs_struct` array
+/// (`abi::uregs`) **cannot** be the thing that moves into `arch`, because `arch`
+/// naming the ABI layer is an `arch → syscall` edge - the one direction the whole
+/// design forbids. So the array conversion stays in the ABI layer and the frame
+/// type has to expose enough operations for it; that is why S4 is designed
+/// around `UserFrameOps`, not around moving `capture_frame`.
+const BASELINE_ARCH_REFERENCES: &[(&str, usize)] = &[
+    // `Context`, `FpuState`, `UserContext`, the switch/FPU/bootstrap calls and
+    // `gdt::set_kernel_stack`.
+    ("sched", 17),
+    // `syscall/linux/proc.rs`: `gdt::user_selectors` twice and the `UserContext`
+    // construction - the register frame's builder.
+    ("syscall", 4),
+];
+
 /// Everything the ratchet looks at, measured once.
 pub struct Report {
     pub graph: Graph,
@@ -176,6 +201,15 @@ impl Report {
             out.push(format!(
                 "the module graph has {pairs} mutual pairs, up from the recorded {BASELINE_MUTUAL_PAIRS}"
             ));
+        }
+
+        for (module, baseline) in BASELINE_ARCH_REFERENCES {
+            let measured = self.graph.weight(module, "arch");
+            if measured > *baseline {
+                out.push(format!(
+                    "{module} names crate::arch:: {measured} times, up from the recorded {baseline}"
+                ));
+            }
         }
 
         out
@@ -250,6 +284,12 @@ pub fn run(root: &Path) -> Result<()> {
         "  mutual pairs               {}/{BASELINE_MUTUAL_PAIRS}",
         pairs.len()
     );
+    for (module, baseline) in BASELINE_ARCH_REFERENCES {
+        println!(
+            "  -> crate::arch::           {module:8} {}/{baseline}",
+            report.graph.weight(module, "arch")
+        );
+    }
 
     let violations = report.violations();
     if violations.is_empty() {

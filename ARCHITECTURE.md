@@ -590,4 +590,6 @@ The leaf crates (`err`, `date`, `binfmt`, `cred`, `uts`, `seccomp`, `pci`, `term
 with two hard rules: **nothing below `syscall` names `syscall`**, and **nothing outside
 `vfs` names `vfs`'s concrete device types**. Both are measured now rather than asserted:
 `cargo xtask depgraph` reports the counts and fails when either grows (§6, `PLAN.md` §11.2
-Step G).
+Step G). A third rule rides with them from the HAL work (`PLAN.md` §11.4): **no layer outside
+`arch`/`hal`/`main` names `crate::arch::`** — `sched` (17) and `syscall` (4) are the two that
+still do, recorded as a ceiling that may only fall, and stage 4 is the step that takes them to 0.
