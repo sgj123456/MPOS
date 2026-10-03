@@ -75,11 +75,13 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// might still be working.
 ///
 /// Stage 5b's check runs *before* the timer and the contexts, so its success
-/// marker is not a terminator and its failure marker is - which is the rule
-/// applied rather than recited: `M2_CONTEXT_OK` is still the last line the
-/// kernel prints, and the list only grew by the one entry the new check owns.
-const TERMINATORS: [&str; 8] = [
-    "M2_CONTEXT_OK",
+/// marker is not a terminator and its failure marker is - and stage 6a's runs
+/// after all of them, so it is the one that now ends the list. Applying the rule
+/// is what moved `M2_CONTEXT_OK` out: it is no longer the last line the kernel
+/// prints, and leaving it in would kill a machine that was still working.
+const TERMINATORS: [&str; 9] = [
+    "M6_EL0_OK",
+    "M6_EL0_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
@@ -128,14 +130,16 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // reach the machine's virtio transports and that the transports answer as
     // transports, `M1_TIMER_OK` says the clock still reaches the vector table
     // through them (a statement about the device window too, because the GIC is
-    // reached through it) and `M2_CONTEXT_OK` says two tasks can suspend and
-    // resume each other.
+    // reached through it), `M2_CONTEXT_OK` says two tasks can suspend and
+    // resume each other, and `M6_EL0_OK` says the kernel ran a program at EL0
+    // and answered the call it made.
     let markers = [
         ("M4_DEVICES_OK", "devices"),
         ("M3_TABLES_OK", "page tables"),
         ("M5_VIRTIO_OK", "virtio transports"),
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
+        ("M6_EL0_OK", "EL0"),
     ];
     let missing: Vec<&str> = markers
         .iter()
@@ -145,8 +149,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     if missing.is_empty() {
         println!();
         println!(
-            "aarch64 boot: M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, M1_TIMER_OK \
-             and M2_CONTEXT_OK, from the ESP under AAVMF"
+            "aarch64 boot: M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, M1_TIMER_OK, \
+             M2_CONTEXT_OK and M6_EL0_OK, from the ESP under AAVMF"
         );
         return Ok(());
     }

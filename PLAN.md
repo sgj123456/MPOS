@@ -664,14 +664,15 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stages 1a-1f, 2, 5a and 5b landed: the machine
-boots a real ESP image under AAVMF, builds its own page tables from
+**Architectures (Phase 9 — aarch64 stages 1a-1f, 2, 5a, 5b and 6a landed: the
+machine boots a real ESP image under AAVMF, builds its own page tables from
 `kernel_mappings`, switches between kernel tasks, reads the firmware's device
-tree back against its own constants, and now reaches its devices through a window
-in its *own* half — the 32 virtio-MMIO transports are found through the tree and
-read back (§9.1); next is the rest of stage 5, which is the drivers themselves —
-not stage 3, which waits on 4, 5 and 6 for the reason measured under the stage
-table)**
+tree back against its own constants, reaches its devices through a window in its
+*own* half — the 32 virtio-MMIO transports are found through the tree and read
+back — and now runs code at EL0 with an address space of its own, traps into the
+kernel and is answered (§9.1); next is the rest of stage 6, which is the ABI and
+the `AddressSpaceOps` that completes `hal` — not stage 5's drivers, which the
+same measurement puts behind `vfs` and so behind `hal` too)**
 - [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
@@ -5177,12 +5178,13 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1f, 2, 5a and 5b landed: the machine boots the way
-the x86_64 one does, the kernel owns its own address space, two kernel tasks can
-suspend and resume each other, the machine reads its own description of itself,
-and it reaches its devices through a window in its *own* half of the address
+Current status: **stages 1a-1f, 2, 5a, 5b and 6a landed: the machine boots the
+way the x86_64 one does, the kernel owns its own address space, two kernel tasks
+can suspend and resume each other, the machine reads its own description of
+itself, it reaches its devices through a window in its *own* half of the address
 space - the firmware's thirty-two virtio-MMIO transports are found through the
-tree and read back.** `cargo xtask boot-aarch64`
+tree and read back - and code now runs at EL0 with an address space of its own,
+traps into the kernel and is answered.** `cargo xtask boot-aarch64`
 builds the kernel (`aarch64-unknown-none`), the loader
 (`aarch64-unknown-uefi`), lays out an ESP with `EFI/BOOT/BOOTAA64.EFI` and boots
 it under AAVMF; the loader reads `mpos.elf` off the volume, applies its
@@ -5216,7 +5218,7 @@ devices: PL011 at 0x9000000, GIC at 0x8000000/0x8010000, timer on PPI 14 (INTID 
 devices: 32 virtio-mmio windows, all inside the 0x8000000..0xc000000 device window
 M4_DEVICES_OK
 pmm: 5 zones, 47952 frames (187 MiB of 187 MiB usable)
-interrupts: GICv2 (distributor 0xffffffff40000000), vector table at 0xffffffff80008800, timer on INTID 30
+interrupts: GICv2 (distributor 0xffffffff40000000), vector table at 0xffffffff80008000, timer on INTID 30
 page tables: 165 frames (660 KiB), TTBR0 0x434e6000, TTBR1 0x434e6000 (the kernel's own, read back from the registers)
 plan: 7 mappings, all 63622 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)
 direct map: 0xffff800043458000 -> 0x43458000, rw and it stores
@@ -5227,9 +5229,13 @@ virtio: 32 transports, every one answering virtio 1.0 through the kernel half; 1
 virtio: the first is at 0xa003e00, device 4, vendor 0x554d4551
 M5_VIRTIO_OK
 timer: CNTFRQ_EL0 62500000 Hz, tick at 250 Hz (250000 counts apart)
-M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 109485312 ns of counter
+M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 109160144 ns of counter
 contexts: two kernel tasks alternating
 ABABABABABABAM2_CONTEXT_OK: 13 hand-overs, both directions, every callee-saved register and v31 back where its task left it
+EL0: the kernel was on SP_EL1 (SPSel 1)
+EL0: root 0x4346c000 active, program at 0x200000 (40 bytes), stack at 0x210000, answers at 0x220000
+EL0: the program wrote 0xaaaa, called a number no system call has, read 0xffffffffffffffda back and left with status 7
+M6_EL0_OK
 ```
 
 The `devices:` lines are stage 5a, and they are a *check* rather than a
@@ -5265,6 +5271,38 @@ without `-device virtio-rng-device` - the two differ only in the firmware's own
 random seeds), and the device does not land in the first of them either; it
 answers at `0xa003e00`, the *last*. So a driver must read each transport, which
 is the whole reason the check reads them.
+
+Stage 6a is the last four lines of the log, and it is a change of kind rather
+than of degree: everything above this stage ran at EL1, and this is the first
+time this kernel has been *below* itself. What makes EL0 different is not the
+privilege level as such but where the address space comes from - a program's code
+and stack are in the half `TTBR0_EL1` names, the kernel's are in `TTBR1_EL1`'s,
+and the two registers are what this stage is the first to tell apart. Until now
+both pointed at the *kernel's* root, which worked only because stage 5b had left
+the low half empty; so a user space is not an arrangement imposed on the kernel,
+it is the state the kernel was already in being handed to somebody else. The
+check is built the way stage 1c's and stage 2's were - the smallest program that
+can be wrong in every way this mechanism can, and nothing that can only be wrong
+for a reason the mechanism does not have yet. That program is forty bytes: it
+puts the answer page's address in a *callee-saved* register, writes its own value
+through it, calls a number no system call has, writes the answer back through the
+same register, and leaves through `exit_group`. The verdict is read out of a page
+the *program* wrote, because a trap is only observable by the code that answers
+it and the honest way to check an answer is from the side that receives it: the
+kernel reads back `0xaaaa` (the value the program wrote before it called
+anything) and `0xffffffffffffffda` (`-ENOSYS`, the value the kernel put in `x0`
+and the program read back). Nothing on the kernel side can fake either number.
+
+**One measurement came out of that and changed the gate, and it is a difference
+between the two machines rather than a bug.** `ELR_EL1` for a Supervisor Call
+already holds the address of the instruction *after* the `svc`, so a gate that
+steps over it - which is what the x86_64 twin's shape suggests, where `SA_RESTART`
+subtracts the two bytes back - skips an instruction the program never got to run.
+The first run of this check did exactly that, and the machine said so: the `svc`
+is at `0x200010` and the trap reported `pc` `0x200014`, so the program's next
+instruction (the store of the kernel's answer) was stepped over and the page came
+back with a zero where the gate's answer should have been. The gate does not
+advance `pc` at all now, and that is written down beside it.
 
 The `plan:` line is the strongest claim either machine's boot makes about its
 own page tables: every mapping `mm::vm::kernel_mappings` names is walked page by
@@ -5303,7 +5341,13 @@ nothing could check against anything - and its `eret` sequence has no user
 address space to enter until stage 6 builds one. Writing them early would have
 produced exactly the shape this port refuses: code that looks finished and has
 never been run. What stage 2 keeps is the half that *is* checkable at this stage,
-and it is checked - the boot prints `M2_CONTEXT_OK`.
+and it is checked - the boot prints `M2_CONTEXT_OK`. **Stage 6a is where both
+arrived, and neither was written before it could be run**: the frame's field
+order is the ABI's own `user_pt_regs`, and the `eret` enters a space that the
+same stage builds and the same boot walks. The aarch64 numbers are not the
+x86_64 ones - `exit_group` is 94 here against 231 there - so a `nr.rs` written
+at stage 6a would still have been a table nothing could check against; the one
+number the gate answers is spelled beside it and named as such.
 
 | # | Stage | Verified by |
 |---|---|---|
@@ -5320,7 +5364,8 @@ and it is checked - the boot prints `M2_CONTEXT_OK`.
 | 5a | The device tree: `crates/fdt` (the reader, host-tested), `Handoff.dtb_phys`/`dtb_len` appended after `regions`, the loader copying the firmware's blob out of the UEFI configuration table, and `arch::aarch64::check_devices` holding the tree up against the machine's own constants | **landed**: `cargo xtask boot-aarch64` prints `devices: PL011 at 0x9000000, GIC at 0x8000000/0x8010000, timer on PPI 14 (INTID 30)`, `devices: 32 virtio-mmio windows, all inside the 0x8000000..0xc000000 device window` and `M4_DEVICES_OK`, and the tree's memory node is compared with every region the record calls usable |
 | 5b | The device window in the kernel half, and the tree's transports read back: `paging::DEVICE_PHYS`/`DEVICE_VIRT` split, `boot/src/vm.rs` mapping the window at both, `pl011`/`gic` compiled against the alias with their physical bases kept for the tree check, and `arch::aarch64::check_virtio` reading every `virtio,mmio` window's MagicValue/Version/DeviceID/VendorID | **landed**: `M3_TABLES_OK` now stands under `no low half: ... and so is the device window at 0x8000000 that used to live there`, and `M5_VIRTIO_OK` under `virtio: 32 transports, every one answering virtio 1.0 through the kernel half; 1 carries a device`, across three consecutive green runs |
 | 5 | Drivers: virtio-MMIO found through the tree, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up - **the discovery half of this row is 5b and is done; what remains is the drivers themselves**, whose transport is `virtio_drivers::transport::mmio` reached at `paging::device_virt(phys, len)` |
-| 6 | The aarch64 Linux ABI: `nr.rs` per arch, the `x0..x30` register file **and the user frame with its `eret` entry** (moved here from stage 2), signal frames, `svc #0`, `TPIDR_EL0` TLS, `PTRACE_GETFPREGS`'s view of `FpuState` | the `t-*` conformance programs run on aarch64 |
+| 6a | The entry to EL0: `paging::UserSpace` (a root of its own for `TTBR0_EL1`, user page mappings, the switch that installs it), `context::UserFrame` (`x0..x30`/`sp`/`pc`/`pstate`, in the ABI's own `user_pt_regs` order) with `enter_user` and `leave_for_kernel`, and the vector entry for a trap from a lower EL - which saves the whole register file and can *return*, unlike the fatal synchronous one | **landed**: `EL0: root 0x4346c000 active, program at 0x200000 (40 bytes), stack at 0x210000, answers at 0x220000`, `EL0: the program wrote 0xaaaa, called a number no system call has, read 0xffffffffffffffda back and left with status 7` and `M6_EL0_OK`, across four consecutive green runs |
+| 6 | The rest of the aarch64 Linux ABI: `nr.rs` per arch (the numbers are the machine's - `exit_group` is 94 here and 231 on x86_64), signal frames, `TPIDR_EL0` TLS, `PTRACE_GETFPREGS`'s view of `FpuState`, the remainder of `AddressSpaceOps` (`unmap`/`protect`/`walk_user_pages` and the copy-on-write half, which is what `fork` and a demand-paged `mmap` need), and the `hal` impls that half completes | the `t-*` conformance programs run on aarch64 |
 | 7 | aarch64 userspace and the image: `aarch64-unknown-linux-musl` builds, ESP layout for AAVMF, arch-aware `xtask` | `cargo xtask test` passes on aarch64 |
 | 8 | The gate: `xtask test`/`run` grow an arch selection | a green aarch64 gate quoted with its summary line and exit code |
 
@@ -5336,6 +5381,19 @@ wants for the machine - cannot compile for aarch64 until all six of its traits
 exist, which needs stage 6's `Paging` user half and a `WallClock` this machine
 has no driver for. The next work is therefore **5, not 3**, and the table's
 numbering is the plan's order rather than the order it can be done in.
+
+**And stage 5's drivers turned out to be on the same side of the knot**, which
+is stage 5b's own measurement rather than a guess: un-gating `drivers` alone is
+**190 errors** whose long tail is `crate::vfs` (eight imports, from the device
+nodes, `uinput`, `rtc_dev` and the DRM card), `crate::uaccess`, `crate::sched`
+and `mm::map_mmio`; un-gating `console` alone is **18**, and they are
+`drivers::serial`, `drivers::video::render` and `sched`, so the console cannot
+move without the drivers it writes through. The only cut in the knot is `hal`,
+and the only thing standing between `hal` and compiling is the *user* half of the
+machine - which is stage 6. That is why 6a came next rather than 5's drivers, and
+why the drivers' turn is after the rest of 6 rather than before it: the tree
+walk 5b landed is the half of "virtio-MMIO found through the tree" that does not
+need `vfs`, and the transport that opens a device is the half that does.
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
@@ -5460,17 +5518,22 @@ Named gaps the port carries rather than hides, each with its home:
   the allocator may use` out of 248 MiB of RAM, `pmm: 5 zones, 49209 frames`.
   The floor the whole thing stands on is `mm::init`, which is machine-neutral
   and simply had no aarch64 caller until 1f gave it one.
-- **`hal` is x86_64-only until its traits exist on aarch64.** The forwards at
-  the bottom of `hal/mod.rs` name all six concern traits, so the module cannot
-  compile for a machine that implements fewer. As it stands: `Clock` is
-  `timer.rs`, `Cpu`/`Interrupts` are what `vectors.rs`/`gic.rs`/`timer.rs` are
-  written over, `Contexts` is `context.rs` (minus the FPU-ownership methods,
-  which exist only for a lazy scheme this machine does not have), and `Paging`
-  has its table-building half. What is missing is the *user* half of both:
-  `AddressSpaceOps` and the `Paging` methods that need a process -
-  `active_root`, `switch_to_root`, `user_accessible`, `is_cow_page`,
-  `write_user_u32` - plus `WallClock`, which is a PL031 this machine has not
-  written a driver for. The gate goes with the last of the six.
+- **`hal` is x86_64-only, and stage 6a removed one of its three blockers.**
+  The forwards at the bottom of `hal/mod.rs` name all six concern traits, so the
+  module cannot compile for a machine that implements fewer. As it stands:
+  `Clock` is `timer.rs`, `Cpu`/`Interrupts` are what
+  `vectors.rs`/`gic.rs`/`timer.rs` are written over, `Contexts` is `context.rs`
+  (minus the FPU-ownership methods, which exist only for a lazy scheme this
+  machine does not have - and *plus* `UserFrame`, which 6a landed), and `Paging`
+  has its table-building half plus, from 6a, a user space that can be built,
+  mapped, switched to and walked. What is still missing is three things and no
+  more: the rest of `AddressSpaceOps` (`unmap`, `protect`, `walk_user_pages`,
+  `map_cow`/`map_shared`/`resolve_cow`, `set_cow_bit*`, `flush_if_active` and the
+  `Drop` that goes with them - the machinery they need is `Tables`, which exists;
+  what is missing is the operations), the `Paging` methods that need a running
+  process (`active_root`, `switch_to_root`, `user_accessible`, `is_cow_page`,
+  `write_user_u32`), and `WallClock`, which is a PL031 this machine has not
+  written a driver for. The gate goes when the last of the six does.
 - **No ACPI consumer exists to reuse.** `virt` + AAVMF passes a *device tree*,
   so device discovery is new DTB-parsing code in stage 5, not a port of an
   existing table walk.

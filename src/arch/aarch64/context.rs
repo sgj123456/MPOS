@@ -60,11 +60,14 @@
 //!   decides whether the two shapes are one.
 //! * **The *user* half** - `x0..x30`/`sp`/`pc`/`pstate`, `fork`'s register file,
 //!   and the `eret` that enters EL0. Those fields get their order and their
-//!   meaning from the ABI, so they belong with it (stage 6): writing them now
-//!   would be a struct nothing can check against `user_regs_struct` and an
-//!   entry sequence with no user address space to enter. `PLAN.md` §9.1's stage
-//!   table carries that split, which is why this file's stage number is 2 and
-//!   the register file's is 6.
+//!   meaning from the ABI, so they belong with it: writing them at stage 2 would
+//!   have been a struct nothing could check against `user_pt_regs` and an entry
+//!   sequence with no user address space to enter - the shape this port refuses.
+//!   Stage 6a is where both arrived, and it is the first moment either *could*:
+//!   `UserFrame` is `user_pt_regs` field for field, and the space `enter_user`
+//!   enters is one stage 6a also builds (`paging::UserSpace`). `PLAN.md` §9.1's
+//!   stage table carries that split, which is why this file's stage number is 2
+//!   and the register file's is 6.
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -225,6 +228,181 @@ pub unsafe fn bootstrap(
     Context {
         fpu: FpuState::reset(),
         stack_pointer: base,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The user half
+// ---------------------------------------------------------------------------
+
+/// The register state a trap from EL0 leaves behind: `x0`..`x30`, the user's
+/// own stack, the program counter and the saved status word.
+///
+/// The order is the ABI's rather than this file's choice, and that is the whole
+/// reason the plan moved this struct out of stage 2. AArch64 Linux reports a
+/// task's registers as `struct user_pt_regs`, which is exactly this - `regs[31]`
+/// then `sp`, `pc`, `pstate` - so the frame the vector saves *is* the frame
+/// `ptrace`, a signal's `sigcontext` and `/proc/<pid>/syscall` are written in,
+/// and the conversion into the ABI's field order is an identity rather than a
+/// translation. Which field a register belongs in is the one thing that differs
+/// between one machine's frame and another's, and it is the one thing that had
+/// nothing to be checked against until there was an ABI to check it against.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UserFrame {
+    /// `x0`..`x30`, in order. `x30` is the link register, which a trap saves
+    /// like any other register - the kernel's own return address is not in it.
+    pub x: [u64; 31],
+    /// `sp`: the *user's* stack, `SP_EL0`. Never the kernel's.
+    pub sp: u64,
+    /// `pc`: `ELR_EL1`, which on a trap is the instruction that trapped -
+    /// *not* the one after it, so a syscall gate has to step over its own `svc`.
+    pub pc: u64,
+    /// `pstate`: `SPSR_EL1`, the status word `eret` restores.
+    pub pstate: u64,
+}
+
+/// The offsets `__vec_el0_sync` stores at, as literals in its assembly. An
+/// assembler cannot check those against a Rust layout, so the check is here -
+/// the same shape as `CONTEXT_STACK_POINTER` above and for the same reason: the
+/// failure mode is a trap frame read from the middle of the wrong register,
+/// which looks like a corrupt syscall argument rather than like a layout bug.
+const _: () = {
+    assert!(
+        core::mem::offset_of!(UserFrame, x) == 0,
+        "the trap frame's registers moved"
+    );
+    assert!(
+        core::mem::offset_of!(UserFrame, sp) == 248,
+        "the trap frame's stack pointer moved"
+    );
+    assert!(
+        core::mem::offset_of!(UserFrame, pc) == 256,
+        "the trap frame's program counter moved"
+    );
+    assert!(
+        core::mem::offset_of!(UserFrame, pstate) == 264,
+        "the trap frame's status word moved"
+    );
+    assert!(
+        size_of::<UserFrame>() == 272,
+        "the trap frame's size is not the 34 words the vector reserves"
+    );
+};
+
+/// `SPSR_EL1` for a return to EL0: mode `EL0t`, every interrupt open.
+///
+/// Zero is not a shortcut for "don't care". `SPSR_EL1`'s mode field is `M[3:0]`,
+/// `0b0000` is EL0 running on `SP_EL0`, and the `D`/`A`/`I`/`F` bits are the
+/// ones that *mask* - so "EL0t with nothing masked" is the whole register, and
+/// writing anything else would either trap at a level this kernel has no code
+/// for or leave the program running with the clock off.
+const PSTATE_EL0T: u64 = 0;
+
+/// `SPSR_EL1` for a return to EL1 on `SP_EL1`: `EL1h`.
+///
+/// The `h` is the half that matters: `0b0100` would be `EL1t`, which returns to
+/// EL1 still using `SP_EL0` - and `SP_EL0` at that moment holds the *user's*
+/// stack, so the kernel would push its frame onto the program it just left.
+const PSTATE_EL1H: u64 = 0b0101;
+
+/// Where an EL0 program that asks to leave is resumed, and the kernel stack it
+/// is resumed on.
+///
+/// Both are set by [`enter_user`] and read by the trap gate's `exit` arm. They
+/// are statics rather than arguments because the two ends are reached through
+/// the CPU's exception machinery: the gate runs on the vector with a stack the
+/// caller never sees, so there is no calling convention to carry anything in.
+static ON_EXIT: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_SP: AtomicUsize = AtomicUsize::new(0);
+
+/// Enter EL0 at `entry` on `user_sp`, and come back to `on_exit` when the
+/// program asks to leave.
+///
+/// This never returns in the ordinary sense. The only way out is the trap gate's
+/// `exit` arm, which `eret`s to `on_exit` at EL1 with the exit status in `x0` -
+/// which is why `on_exit` must be `-> !`: there is no call frame for it to
+/// return into, only the stack this function was entered on, which
+/// [`leave_for_kernel`] restores before the `eret`.
+///
+/// # Safety
+///
+/// `entry` and `user_sp` must both be mapped in the space `TTBR0_EL1` currently
+/// names, and that space must already be the active one - this function switches
+/// nothing.
+pub unsafe fn enter_user(entry: usize, user_sp: usize, on_exit: extern "C" fn(u64) -> !) -> ! {
+    // Read rather than assumed: if this function ever grows a frame, the value
+    // recorded here is the lower one and the kernel is resumed *below* its
+    // caller's frame instead of on top of it - which is wasted stack rather than
+    // a corrupted one, and is the direction the mistake has to fall in.
+    let sp: usize;
+    // SAFETY: reading `sp` has no side effects.
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack)) };
+    KERNEL_SP.store(sp, Ordering::Relaxed);
+    ON_EXIT.store(on_exit as usize, Ordering::Relaxed);
+
+    // SAFETY: the caller's contract on the two addresses. The sequence is the
+    // architecture's entry to a lower exception level, and the only subtle part
+    // is `SPSR_EL1` - see `PSTATE_EL0T`.
+    unsafe {
+        core::arch::asm!(
+            "msr sp_el0, {sp}",
+            "msr elr_el1, {entry}",
+            "msr spsr_el1, {spsr}",
+            "isb",
+            "eret",
+            sp = in(reg) user_sp,
+            entry = in(reg) entry,
+            spsr = in(reg) PSTATE_EL0T,
+            options(noreturn),
+        );
+    }
+}
+
+/// Leave the user program for the kernel: never returns, and never returns to
+/// EL0 either.
+///
+/// This is the `exit` arm of the trap gate, and it is an `eret` like every other
+/// way out of a trap - what it changes is *where* the `eret` goes. `SPSR_EL1`'s
+/// mode field says `EL1h`, so the same instruction that would have resumed the
+/// program resumes the kernel, on the `SP_EL1` the trap landed on once the
+/// trap's own frame has been given back.
+///
+/// A real `exit` does a third thing this cannot: it picks another task to run,
+/// and gives the one that exited away. This machine has one EL0 program and no
+/// task table to hold it yet, so "the program is finished" is the whole of what
+/// leaving means here, and the task table is stage 6's next piece rather than
+/// something this pretends to have.
+///
+/// # Safety
+///
+/// Only from the trap gate, on a machine that reached it through
+/// [`enter_user`] - it resumes the function that call recorded and restores the
+/// stack that call recorded.
+pub unsafe fn leave_for_kernel(code: u64) -> ! {
+    let sp = KERNEL_SP.load(Ordering::Relaxed);
+    let target = ON_EXIT.load(Ordering::Relaxed);
+    assert!(
+        sp != 0 && target != 0,
+        "an EL0 program left for the kernel with no entry to return to: \
+         `enter_user` was not the way it was started"
+    );
+    // SAFETY: both values came from `enter_user`, which the machine reached EL0
+    // through; `EL1h` is the level this is already running at, so the `eret`
+    // neither changes exception level nor touches `SP_EL1` after the move above.
+    unsafe {
+        core::arch::asm!(
+            "mov sp, {sp}",
+            "msr elr_el1, {target}",
+            "msr spsr_el1, {spsr}",
+            "mov x0, {code}",
+            "eret",
+            sp = in(reg) sp,
+            target = in(reg) target as u64,
+            spsr = in(reg) PSTATE_EL1H,
+            code = in(reg) code,
+            options(noreturn),
+        );
     }
 }
 

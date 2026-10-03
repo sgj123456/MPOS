@@ -28,7 +28,23 @@ use core::arch::global_asm;
 
 use core::fmt::Write;
 
+use super::context::{self, UserFrame};
 use super::{gic, halt, pl011, timer};
+
+/// The `ESR_EL1` exception class for a `svc` taken from AArch64.
+///
+/// `ESR_EL1.EC`, the top six bits, and the only field whose meaning does not
+/// depend on the class itself - which is why it is what a handler reads first.
+const EC_SVC_FROM_AARCH64: u64 = 0x15;
+
+/// `exit_group`'s number on this machine, which is not the number the x86_64
+/// table gives it (231, against 94 here).
+///
+/// Spelled out rather than taken from `crate::syscall::linux::nr` because that
+/// table *is* x86_64's - the ABI's numbers are per-machine and this machine's
+/// do not exist yet. It is the one call this stage's gate answers, and it
+/// answers it because a program that has finished has to be able to say so.
+const NR_EXIT_GROUP: u64 = 94;
 
 global_asm!(
     r#"
@@ -54,8 +70,10 @@ __aarch64_vectors:
     ventry __vec_unexpected
     ventry __vec_unexpected
 
-    /* Lower EL, AArch64 - a user task's faults, once there are user tasks. */
-    ventry __vec_sync
+    /* Lower EL, AArch64 - where a user task's system call arrives, and where
+       its faults do. It is the only entry in the table that has two different
+       jobs, and the stub below is the one that tells them apart. */
+    ventry __vec_el0_sync
     ventry __vec_irq
     ventry __vec_unexpected
     ventry __vec_unexpected
@@ -99,10 +117,87 @@ __vec_irq:
     ldp x29, x30, [sp, #152]
     add sp, sp, #176
     eret
+
+    /* A trap from EL0. Unlike the IRQ stub this one has to save *everything*,
+       because the gate behind it can resume the program and a register it
+       clobbered without putting back is a register the program loses. The 34
+       words are `context::UserFrame` and nothing else: x0..x30, then the three
+       status words the trap put in `SP_EL0`, `ELR_EL1` and `SPSR_EL1`, which
+       are part of the same frame because a `fork`, a signal and `ptrace` all
+       read them there.
+
+       The gate answers whether to resume the program or to leave for the
+       kernel, and the two exits are the two `eret`s: this one is the only place
+       in the kernel where one `eret` can return to either exception level, and
+       the choice is the gate's - `SPSR_EL1`'s mode field is what it writes. */
+    .balign 16
+__vec_el0_sync:
+    sub sp, sp, #272
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
+    mrs x9, sp_el0
+    mrs x10, elr_el1
+    mrs x11, spsr_el1
+    stp x9, x10, [sp, #248]
+    str x11, [sp, #264]
+    mov x0, sp
+    bl {el0_sync}
+    cbnz x0, __vec_el0_leave
+
+    /* The status words go back first, through a scratch register the restore
+       chain below is about to overwrite from the frame - which is the only
+       window in which they can be used, and the reason this block is here and
+       not at the end. */
+    ldr x9, [sp, #248]
+    msr sp_el0, x9
+    ldr x9, [sp, #256]
+    msr elr_el1, x9
+    ldr x9, [sp, #264]
+    msr spsr_el1, x9
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #272
+    eret
+
+    /* Not asking to come back: the gate has already set `SP_EL1`, `ELR_EL1` and
+       `SPSR_EL1` for the kernel, and `x0` holds the exit status it wants
+       delivered - so the frame below is dead, and touching it would put the
+       program's registers back over a kernel that has stopped being one. */
+__vec_el0_leave:
+    eret
     "#,
     synchronous = sym synchronous,
     irq = sym irq,
     unexpected = sym unexpected,
+    el0_sync = sym el0_sync,
 );
 
 /// Point `VBAR_EL1` at the table.
@@ -190,6 +285,78 @@ extern "C" fn unexpected() -> ! {
     let _ = writeln!(out, "  ELR_EL1  {elr:#018x}");
     let _ = writeln!(out, "  SPSR_EL1 {spsr:#018x}");
     halt()
+}
+
+/// A `svc` from EL0: the gate every system call on this machine comes through.
+///
+/// What this stage's gate answers is the kernel's own default and one call that
+/// ends a program. A number nothing recognises is `-ENOSYS`, which is not a
+/// placeholder: it is the same honest refusal the x86_64 dispatch's
+/// `_ => ENOSYS` arm makes, and answering it *before* there is a table is right
+/// for the reason that rule exists - a caller told "not here" goes down its own
+/// fallback, while one told "done" stops asking.
+///
+/// `exit_group` it does answer, because a program that has finished has to be
+/// able to say so, and because leaving is the one thing a refusal cannot
+/// express. What that leaves undone is stage 6's next piece rather than
+/// something this hides: choosing the next task, and giving the exiting one
+/// away.
+///
+/// Answers zero to resume the program with the frame as the gate left it, and
+/// non-zero to leave for the kernel - in which case the frame is dead, and the
+/// value is the exit status [`context::leave_for_kernel`] has already arranged
+/// to deliver.
+extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
+    // SAFETY: the stub above passes the address of the frame it just saved, and
+    // `context.rs`'s offset asserts are what make that frame a `UserFrame`.
+    // Nothing else writes it while this runs, and the core is single.
+    let frame = unsafe { &mut *frame };
+
+    // The class is read first and everything else depends on it, because it is
+    // the one field of `ESR_EL1` whose meaning does not depend on itself. A trap
+    // from EL0 that is not an `svc` is a fault in the program - a bad address, a
+    // bad instruction - and this kernel has no way to tell a program about one
+    // yet, so it says so and stops rather than resuming into the same fault.
+    let esr = system_register("esr");
+    let class = esr >> 26;
+    if class != EC_SVC_FROM_AARCH64 {
+        let mut out = pl011::Writer;
+        let _ = writeln!(out, "\nEXCEPTION: from EL0, and not a system call");
+        let _ = writeln!(out, "  ESR_EL1  {esr:#018x} (EC {class:#04x})");
+        let _ = writeln!(out, "  pc       {:#018x}", frame.pc);
+        let _ = writeln!(out, "  pstate   {:#018x}", frame.pstate);
+        let _ = writeln!(out, "  FAR_EL1  {:#018x}", system_register("far"));
+        halt()
+    }
+
+    // `pc` is *not* moved past the `svc`, and that is the architecture's answer
+    // rather than an omission: for a Supervisor Call, `ELR_EL1` already holds the
+    // address of the instruction *after* it, so the frame the gate is handed
+    // resumes where the program meant to carry on. Measured before it was
+    // believed - the first run of this check advanced by four anyway, the trace
+    // showed the trap reporting `pc` one instruction past the `svc`, and the
+    // program's very next instruction was skipped as a result. A gate that
+    // advanced *and* a machine that did not would run the `svc` twice.
+    //
+    // This is the one place the x86_64 twin is shaped differently rather than
+    // merely spelled differently: there `rcx` holds the same "after" address and
+    // the ABI's `SA_RESTART` rewind is what subtracts the two bytes back.
+
+    // `x8` is the number and `x0`..`x5` the arguments on AArch64, where the
+    // x86_64 this kernel was written for puts the number in `rax`.
+    let number = frame.x[8];
+    if number == NR_EXIT_GROUP {
+        let code = frame.x[0];
+        // SAFETY: reached only from the EL0 vector, and only a machine that got
+        // here through `context::enter_user` can take a lower-EL trap at all.
+        unsafe { context::leave_for_kernel(code) }
+    }
+
+    // AArch64 returns a result in `x0` and an error as a negated errno, which is
+    // already what the `err` crate's constants are - so this is the value
+    // `ENOSYS` names rather than a translation of it.
+    frame.x[0] = crate::err::ENOSYS as u64;
+    0
 }
 
 /// Whether this core would take an interrupt right now: the `I` bit of `DAIF`,

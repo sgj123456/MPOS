@@ -118,10 +118,12 @@ pub use mpos_err as err;
 /// x86_64-only for now, and by construction rather than by choice: the forwards
 /// at the bottom of `hal/mod.rs` name all six traits, so the module can only be
 /// compiled for a machine that implements all six. The aarch64 impls land with
-/// their stages - `Cpu`/`Interrupts` at 1c, `Contexts` at 2, and `Paging` split:
-/// 1f gave it the table-building half (`install`, `translate`), and what is left
-/// is everything that needs a *user* address space, which stage 6 brings - and
-/// this gate goes when the last of them does.
+/// their stages - `Cpu`/`Interrupts` at 1c, `Contexts` at 2 (and its `UserFrame`
+/// at 6a), and `Paging` split: 1f gave it the table-building half (`install`,
+/// `translate`), 6a a user space that can be built, mapped, switched to and
+/// walked, and what is left is `AddressSpaceOps`' remaining operations and the
+/// `Paging` methods that need a running process - plus `WallClock`. This gate
+/// goes when the last of them does.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod hal;
 /// evdev's record window and its clients: which reader sees which event, and

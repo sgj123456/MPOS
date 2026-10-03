@@ -17,14 +17,20 @@
 //! **5b is that description becoming actionable** - the device window those
 //! devices live in moved out of the low half and into the kernel's, and the
 //! machine's virtio transports are read back through it, so the tree now leads
-//! somewhere a driver can go (`check_virtio`).
+//! somewhere a driver can go (`check_virtio`); and **6a is the machine running
+//! code below itself** - a user address space of its own in `TTBR0_EL1`, the
+//! frame a trap from EL0 leaves behind, the `eret` that enters it, and the
+//! vector entry that takes its `svc` (`check_el0`).
 //!
 //! What is still absent, and where it lands: everything above the machine layer
-//! - `sched` (3), `console`/`vfs` (4), the drivers (5) and the Linux ABI (6),
-//! which is also where the user frame and its `eret` entry went. Those reach
-//! this machine through `crate::hal`, which it implements trait by trait as the
-//! stages land - which is why `hal` itself is still x86_64-only (`src/lib.rs`'s
-//! ledger).
+//! - `sched` (3), `console`/`vfs` (4), the drivers (5) and the rest of the Linux
+//! ABI (6, of which 6a is the entry half). Those reach this machine through
+//! `crate::hal`, which it implements trait by trait as the stages land - which is
+//! why `hal` itself is still x86_64-only (`src/lib.rs`'s ledger). Nothing above
+//! `arch` un-gates before `hal` compiles, and `hal` is three things away: the
+//! rest of `AddressSpaceOps`, the `Paging` methods that need a running process,
+//! and a `WallClock`. That is measured rather than asserted - §9.1 records the
+//! error counts under its stage table.
 
 pub(crate) mod context;
 pub(crate) mod critical;
@@ -34,7 +40,9 @@ pub(crate) mod pl011;
 pub(crate) mod timer;
 pub(crate) mod vectors;
 
+use core::arch::global_asm;
 use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::boot::BootInfo;
 use crate::boot::handoff::Handoff;
@@ -175,6 +183,7 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
     check_virtio(&info);
     check_timer();
     check_context();
+    check_el0();
     halt()
 }
 
@@ -800,6 +809,290 @@ fn check_virtio(info: &BootInfo) {
         );
     }
     let _ = writeln!(out, "M5_VIRTIO_OK");
+}
+
+/// Where the EL0 check's three pages go, in the low half - the half a process
+/// owns, which until this stage mapped nothing at all.
+///
+/// Named rather than allocated from the bottom up, because there is no loader
+/// here to choose an address and a program's first page is the one address the
+/// kernel has to agree with it about. The null page is still not one of them:
+/// 2 MiB is far enough above zero that a stray pointer is a fault.
+const PROGRAM_VA: usize = 0x0020_0000;
+const STACK_VA: usize = 0x0021_0000;
+const ANSWER_VA: usize = 0x0022_0000;
+
+/// The frame the answer page is, so [`el0_returned`] can read it.
+///
+/// A static because the two halves of this check do not share a stack frame:
+/// [`check_el0`] enters EL0 and never returns, and the continuation is reached
+/// through the trap gate, with nothing of the caller's to pass anything in.
+static ANSWER_FRAME: AtomicUsize = AtomicUsize::new(0);
+
+// The program the check runs at EL0.
+//
+// It is the smallest thing that can be wrong in all the ways this stage is
+// about, and every instruction is load-bearing:
+//
+// * `mov x20` puts the answer page's address in a *callee-saved* register, so
+//   the store at the end is what proves the whole register file survived the
+//   round trip rather than just the argument registers.
+// * the first `str` writes the program's own value before it has made any call,
+//   which is the page's first word and the one no kernel code ever touches.
+// * the `svc` with `0x1234` is a number no system call has, and the `str` after
+//   it is what proves the trap *returned*: if the gate never came back, nothing
+//   would be written to the second word.
+// * `x0` is read back from that store by the kernel, so the second word is the
+//   gate's answer as the program received it - not as the kernel remembers
+//   writing it.
+// * `exit_group` ends it, because a program that finishes has to be able to say
+//   so, and because it is the one call this stage's gate answers.
+//
+// It is copied into a frame of its own rather than mapped where it is linked.
+// The kernel's text is EL1-only and read-only, and mapping *that* page into a
+// user space would hand a program the kernel's code; a loader copies bytes into
+// a fresh frame, and there is no reason for a check to do anything else.
+global_asm!(
+    ".section .rodata.el0_program, \"a\"",
+    ".balign 4",
+    ".globl __aarch64_el0_program",
+    "__aarch64_el0_program:",
+    "    mov  x20, #{answer}",
+    "    movz x0, #0xaaaa",
+    "    str  x0, [x20]",
+    "    movz x8, #0x1234",
+    "    svc  #0",
+    "    str  x0, [x20, #8]",
+    "    movz x8, #{exit_group}",
+    "    movz x0, #7",
+    "    svc  #0",
+    "1:  b 1b",
+    ".globl __aarch64_el0_program_end",
+    "__aarch64_el0_program_end:",
+    answer = const ANSWER_VA as u64,
+    exit_group = const 94u64,
+);
+
+unsafe extern "C" {
+    static __aarch64_el0_program: u8;
+    static __aarch64_el0_program_end: u8;
+}
+
+/// A fresh, zeroed frame from the frame allocator.
+///
+/// Zeroed for the reason the page tables' own frames are: a program that reads a
+/// page it never wrote should read zeroes, and a frame straight from the
+/// allocator holds whatever the last user left in it.
+fn zeroed_frame() -> Option<usize> {
+    let frame = mm::alloc_frames(0)?;
+    // SAFETY: the allocator handed this frame over and nothing else holds it,
+    // and the direct map reaches it.
+    unsafe { core::ptr::write_bytes(mm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
+    Some(frame)
+}
+
+/// Stage 6a's evidence: the kernel runs code at EL0, and answers what it asks.
+///
+/// Everything above this stage ran at EL1. What makes EL0 different is not a
+/// privilege level as such but *where the address space comes from*: a program's
+/// code and stack are in the half `TTBR0` names, the kernel's are in `TTBR1`'s,
+/// and the two registers are what this stage is the first to tell apart. So the
+/// check is built the way stage 1c's was - the smallest thing that can be wrong
+/// in all the ways the mechanism can, and nothing that can only be wrong for a
+/// reason the mechanism does not have yet.
+///
+/// The verdict is read out of a page the program wrote, in [`el0_returned`],
+/// rather than by watching the gate: a trap is only observable by the code that
+/// answers it, and the honest way to check an answer is from the side that
+/// receives it.
+fn check_el0() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M6_EL0_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    // A trap from EL0 lands on `SP_EL1` whatever `SPSel` says, so the kernel has
+    // to *be* on `SP_EL1` before a program exists: if the firmware left this core
+    // on `SP_EL0`, then `SP_EL1` holds nothing and the first trap would push a
+    // frame onto whatever was there. Measured and reported rather than assumed,
+    // because which one it is is a fact about the handoff this kernel was
+    // given - and a silent fix here would hide one the next machine has.
+    let spsel: u64;
+    // SAFETY: `SPSel` is a readable PSTATE field; reading it has no side effects.
+    unsafe { core::arch::asm!("mrs {}, spsel", out(reg) spsel, options(nomem, nostack)) };
+    if spsel & 1 == 0 {
+        let sp: usize;
+        // SAFETY: as above, and writing `SP_EL1` before selecting it is the only
+        // order that leaves `sp` valid across the switch.
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack));
+            core::arch::asm!("msr sp_el1, {}", in(reg) sp, options(nomem, nostack));
+            core::arch::asm!("msr spsel, #1", options(nomem, nostack));
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\nEL0: the kernel was on SP_EL{} (SPSel {})",
+        if spsel & 1 == 0 { "0" } else { "1" },
+        spsel & 1,
+    );
+
+    // Three frames: the program's code, its stack, and the page it answers on.
+    // Three frames, asked for one at a time rather than through a closure: a
+    // closure with `fail!` in it borrows `out` for as long as it lives, and the
+    // checks below have things of their own to say.
+    let Some(code) = zeroed_frame() else {
+        fail!("out of frames for the EL0 program's code page")
+    };
+    let Some(stack) = zeroed_frame() else {
+        fail!("out of frames for the EL0 stack")
+    };
+    let Some(answer) = zeroed_frame() else {
+        fail!("out of frames for the EL0 answer page")
+    };
+
+    // Both symbols are placed by the linker in the kernel's own image, and
+    // neither is read through - only measured, to copy the instructions between
+    // them.
+    let program = &raw const __aarch64_el0_program;
+    let program_end = &raw const __aarch64_el0_program_end;
+    let program_len = program_end as usize - program as usize;
+    if program_len > PAGE_SIZE {
+        fail!("the EL0 program is {program_len} bytes and it has one page");
+    }
+    // SAFETY: both ranges are inside the kernel's own image - the program is a
+    // `.rodata` block the linker placed - and the destination is a frame just
+    // taken from the allocator, so nothing overlaps.
+    unsafe {
+        core::ptr::copy_nonoverlapping(program, mm::phys_to_virt(code) as *mut u8, program_len);
+    }
+
+    let mut space = paging::UserSpace::new();
+    space.map(
+        PROGRAM_VA,
+        code,
+        PAGE_SIZE,
+        MapFlags::USER | MapFlags::READ | MapFlags::EXEC,
+    );
+    space.map(
+        STACK_VA,
+        stack,
+        PAGE_SIZE,
+        MapFlags::USER | MapFlags::READ | MapFlags::WRITE,
+    );
+    space.map(
+        ANSWER_VA,
+        answer,
+        PAGE_SIZE,
+        MapFlags::USER | MapFlags::READ | MapFlags::WRITE,
+    );
+
+    // The space's own tables before the machine is switched to them, because
+    // `switch` is what makes a walk report the *user* root: a mapping that never
+    // went in would otherwise be a fault at the first instruction rather than a
+    // wrong answer here, and the walk is also the only thing that can say which
+    // permissions the hardware will actually enforce.
+    for (name, virt, frame, flags) in [
+        (
+            "program",
+            PROGRAM_VA,
+            code,
+            MapFlags::USER | MapFlags::READ | MapFlags::EXEC,
+        ),
+        (
+            "stack",
+            STACK_VA,
+            stack,
+            MapFlags::USER | MapFlags::READ | MapFlags::WRITE,
+        ),
+        (
+            "answer",
+            ANSWER_VA,
+            answer,
+            MapFlags::USER | MapFlags::READ | MapFlags::WRITE,
+        ),
+    ] {
+        match space.translate(virt) {
+            Some((phys, got, Memory::Normal)) if phys == frame && got == flags => {}
+            other => fail!(
+                "the {name} page at {virt:#x} should be {frame:#x} as {flags:?} Normal, \
+                 and the space's own tables say {other:?}"
+            ),
+        }
+    }
+
+    ANSWER_FRAME.store(answer, Ordering::Relaxed);
+    space.switch();
+    let _ = writeln!(
+        out,
+        "EL0: root {:#x} active, program at {PROGRAM_VA:#x} ({program_len} bytes), \
+         stack at {STACK_VA:#x}, answers at {ANSWER_VA:#x}",
+        space.root(),
+    );
+
+    // SAFETY: all three addresses are mapped in the space that was just made
+    // active, and the stack pointer is its page's top - one past the end, which
+    // is where a stack pointer belongs.
+    unsafe { context::enter_user(PROGRAM_VA, STACK_VA + PAGE_SIZE, el0_returned) }
+}
+
+/// Where the EL0 program's `exit_group` lands: the kernel, on the stack
+/// [`check_el0`] was using, once the program has been given away.
+///
+/// `status` is what the program passed in `x0`, and it is checked because a gate
+/// that lost the argument registers would still deliver *something*.
+extern "C" fn el0_returned(status: u64) -> ! {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M6_EL0_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    let answer = ANSWER_FRAME.load(Ordering::Relaxed);
+    // SAFETY: the frame was allocated by `check_el0` and is still mapped through
+    // the direct map, which is in `TTBR1` and reaches it whatever `TTBR0` names.
+    let (own, replied) = unsafe {
+        let at = mm::phys_to_virt(answer) as *const u64;
+        (
+            core::ptr::read_volatile(at),
+            core::ptr::read_volatile(at.add(1)),
+        )
+    };
+
+    if status != 7 {
+        fail!("the program exited with {status}, and it asked for 7");
+    }
+    if own != 0xaaaa {
+        fail!(
+            "the program's own value did not survive the round trip: {own:#x}, \
+             and it wrote {:#x}",
+            0xaaaau64
+        );
+    }
+    if replied != crate::err::ENOSYS as u64 {
+        fail!(
+            "the program read {replied:#x} back from an unknown system call, and \
+             this kernel answers {:#x} (ENOSYS)",
+            crate::err::ENOSYS as u64
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "EL0: the program wrote {own:#x}, called a number no system call has, read \
+         {replied:#x} back and left with status {status}",
+    );
+    let _ = writeln!(out, "M6_EL0_OK");
+    halt()
 }
 
 /// Bring the machine's interrupts up: the vector table, then the controller,

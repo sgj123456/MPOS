@@ -3,18 +3,17 @@
 //!
 //! Four levels of 512 entries, a 4 KiB granule and two halves: `TTBR0` covers
 //! the low virtual half and `TTBR1` the high one, which is the aarch64 division
-//! of the address space. Both are pointed at the *same* root here, and that is
-//! the same arrangement the loader used. One root can serve both registers only
-//! while no entry is wanted by both, and since stage 5b that condition is trivially
-//! met on this machine: the direct map, the image *and* the device window are all
-//! in the high half, so the low half is empty and `TTBR0` resolves nothing. It
-//! stops being trivially met at stage 6, when a process gets tables of its own
-//! and the two registers are no longer the same table - which is exactly what
-//! that half is for.
+//! of the address space. Until stage 6a both were pointed at the *same* root,
+//! which is the arrangement the loader used and which is sound only while no
+//! entry is wanted by both - and since stage 5b that condition is met trivially:
+//! the direct map, the image *and* the device window are all in the high half,
+//! so the low half was empty and `TTBR0` resolved nothing. Stage 6a is where the
+//! two registers stop agreeing, which is what the low half exists for: a process
+//! gets its own root ([`UserSpace`]) and the kernel keeps the one `TTBR1` names.
 //!
-//! # Three stages of the same file
+//! # Four stages of the same file
 //!
-//! What a page-table module is for changed three times on this machine, and the
+//! What a page-table module is for changed four times on this machine, and the
 //! history is worth keeping because each version is a different answer to "who
 //! knows the layout":
 //!
@@ -30,6 +29,10 @@
 //!   sections)` is the shared, host-tested description of what the kernel maps,
 //!   and frames come from the frame allocator; the walk stayed, because the
 //!   kernel checking its own work is the point.
+//! * **Stage 6a builds one for somebody else.** The same [`Tables`] builder, on
+//!   a root that is not the kernel's and with leaves that carry `AP`'s EL0 bits:
+//!   a user space is the same four levels and the same descriptors, and the only
+//!   thing new is who the root belongs to.
 //!
 //! # Two rules that are easy to get wrong
 //!
@@ -203,8 +206,14 @@ pub enum Memory {
 // ---------------------------------------------------------------------------
 
 /// The root table `TTBR0_EL1` names, once the machine is running on tables.
+///
+/// Zero until [`install`] has run. While there is no user space this is the
+/// *same* frame as [`TTBR1`], which is why the kernel could run with one root
+/// for both registers; [`UserSpace::switch`] is what makes them differ, and
+/// after it this static follows `TTBR0_EL1` rather than the kernel.
 static TTBR0: AtomicUsize = AtomicUsize::new(0);
-/// The root table `TTBR1_EL1` names.
+/// The root table `TTBR1_EL1` names - the kernel's own, where the image, the
+/// direct map and the device window live. Nothing moves it after `install`.
 static TTBR1: AtomicUsize = AtomicUsize::new(0);
 
 /// Build the kernel's page tables from the boot record and the shared plan, and
@@ -293,6 +302,17 @@ impl Tables {
         let mut tables = Tables { root: 0, frames: 0 };
         tables.root = tables.frame();
         tables
+    }
+
+    /// A hierarchy rooted at a frame that already exists - a process's, rather
+    /// than the kernel's.
+    ///
+    /// The same builder, on purpose: a user space's tables are the same four
+    /// levels of the same descriptors, and the only difference is which root
+    /// they hang from and which `AttrIndx`/`AP` bits the leaves carry. Two
+    /// builders would be two places for the encoding to drift.
+    fn rooted(root: usize) -> Tables {
+        Tables { root, frames: 0 }
     }
 
     /// A fresh, zeroed frame, by physical address.
@@ -511,6 +531,18 @@ pub fn translate(virt: usize) -> Option<(usize, MapFlags, Memory)> {
     } else {
         TTBR0.load(Ordering::Relaxed)
     };
+    walk_from(root, virt)
+}
+
+/// [`translate`]'s walk, against a root the caller names.
+///
+/// Split out because a space that is *not* the active one has to be readable
+/// too - a signal trampoline goes into the address space of a task the kernel is
+/// not currently running, and a process asking `mincore` about its own mapping
+/// is answered from its page tables whichever of them is installed. The active
+/// walk chooses its root by the address's own top bit, the way the hardware
+/// does; this one is told.
+fn walk_from(root: usize, virt: usize) -> Option<(usize, MapFlags, Memory)> {
     if root == 0 {
         return None;
     }
@@ -574,5 +606,122 @@ fn memory_of(descriptor: u64) -> Memory {
         Memory::Device
     } else {
         Memory::Normal
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A process's address space
+// ---------------------------------------------------------------------------
+
+/// A user address space: its own root for `TTBR0_EL1`, and the mappings a
+/// process is allowed to reach.
+///
+/// The split between the two base registers is the architecture's and this type
+/// is the first thing on this machine to use it. Until stage 6a both pointed at
+/// the *kernel's* root, which worked only because the low half was empty (5b
+/// moved the last thing that lived there into the kernel half) - so "an address
+/// space" is not a new arrangement imposed on the kernel, it is the state the
+/// kernel was already in being given to somebody else.
+///
+/// What is here is what stage 6a runs: a fresh root, a page mapped into it with
+/// user permissions, the switch that installs it, and the walk that asks what an
+/// address in it maps to. What is *not* here is the rest of
+/// [`crate::hal::AddressSpaceOps`] - `unmap`, `protect`, `walk_user_pages`, and
+/// the copy-on-write half - which is what a `fork` and a demand-paged `mmap`
+/// need, and which lands with the trait impl rather than before it. The
+/// page-table machinery those need is [`Tables`], which is already built; what
+/// is missing is the operations, not the encoding.
+///
+/// The frames a space is made of are leaked rather than freed, which is honest
+/// for a machine with one user space that lives as long as the boot check does
+/// and is not honest for a running process. `Drop` lands with the trait impl
+/// too, beside `unmap`, which is the operation it is built out of.
+pub struct UserSpace {
+    root: usize,
+}
+
+impl UserSpace {
+    /// An address space with nothing in it.
+    pub fn new() -> UserSpace {
+        let root = mm::alloc_frames(0)
+            .expect("out of frames for a user address space, which cannot be recovered from");
+        // Zeroed for the reason `Tables::frame` zeroes: an empty page-table
+        // entry is an absent one, and a frame straight from the allocator holds
+        // whatever the last user left in it.
+        // SAFETY: the allocator handed over `PAGE_SIZE` bytes of RAM that
+        // nothing else holds, and the direct map reaches them.
+        unsafe { core::ptr::write_bytes(mm::phys_to_virt(root) as *mut u8, 0, PAGE_SIZE) };
+        UserSpace { root }
+    }
+
+    /// The frame `TTBR0_EL1` must name for this space to be the active one.
+    pub fn root(&self) -> usize {
+        self.root
+    }
+
+    /// Map `len` bytes of `phys` at `virt`, for EL0.
+    ///
+    /// Asserts rather than refusing a mapping without `USER`: a page the user
+    /// cannot reach is not a user mapping, and the caller that wants one has the
+    /// kernel's own [`Tables`] through `install`. It also asserts a whole number
+    /// of pages, because `Mapping`'s page-granular predicate is what the rest of
+    /// the kernel is written against and a space that quietly rounded would be a
+    /// second rule.
+    pub fn map(&mut self, virt: usize, phys: usize, len: usize, flags: MapFlags) {
+        assert!(
+            flags.contains(MapFlags::USER),
+            "a user space maps user pages: {flags:?} at {virt:#x} would be unreachable from EL0"
+        );
+        assert!(
+            virt.is_multiple_of(PAGE_SIZE)
+                && phys.is_multiple_of(PAGE_SIZE)
+                && len.is_multiple_of(PAGE_SIZE)
+                && len > 0,
+            "map({virt:#x}, {phys:#x}, {len:#x}) is not whole pages"
+        );
+        let attrs = attributes(flags);
+        let mut tables = Tables::rooted(self.root);
+        let mut offset = 0;
+        while offset < len {
+            tables.map_page(virt + offset, phys + offset, attrs);
+            offset += PAGE_SIZE;
+        }
+    }
+
+    /// Make this space the one `TTBR0_EL1` names, and this core's translations
+    /// for the low half follow it.
+    ///
+    /// The barriers are the architecture's and every one is load-bearing:
+    /// `dsb ish` so the table writes are visible to the walker, `tlbi vmalle1`
+    /// because the walker has cached the *previous* space's translations and its
+    /// failed lookups, and `isb` so the next fetch happens with the new
+    /// register. `vmalle1` rather than an ASID-tagged invalidation because this
+    /// machine does not use ASIDs yet - one space, and no tag to give it.
+    pub fn switch(&self) {
+        // SAFETY: `root` is a hierarchy this type built, and every kernel address
+        // the machine is executing from or reading is in `TTBR1`, which this
+        // does not touch.
+        unsafe {
+            core::arch::asm!(
+                "msr ttbr0_el1, {root}",
+                "dsb ish",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                root = in(reg) self.root as u64,
+            );
+        }
+        TTBR0.store(self.root, Ordering::Relaxed);
+    }
+
+    /// What `virt` maps to in this space, with the permissions the walk reports
+    /// and whether the page is cached as memory - the same three things
+    /// [`translate`] answers for the active space.
+    ///
+    /// The pair with `phys_for_virt` is the point: one asks *where* a page is and
+    /// one asks *what it is*, and a caller checking its own work wants both
+    /// without the space having to be the active one.
+    pub fn translate(&self, virt: usize) -> Option<(usize, MapFlags, Memory)> {
+        walk_from(self.root, virt)
     }
 }
