@@ -35,7 +35,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use mpos::arch::{self, interrupts, paging};
+use mpos::arch::{self, interrupts};
 use mpos::blk;
 use mpos::boot::console_list::ConsoleList;
 use mpos::boot::{self, BootInfo};
@@ -284,7 +284,7 @@ fn init_arch(info: &BootInfo) {
         (sections.data.end - sections.data.start) / 1024
     );
 
-    let tables = unsafe { arch::paging::install(info, &sections) };
+    let tables = unsafe { hal::install(info, &sections) };
     println!(
         "page tables: {} frames ({} KiB)",
         tables,
@@ -653,7 +653,7 @@ fn check_arch(info: &BootInfo) {
         ] {
             let mut virt = range.start;
             while virt < range.end {
-                let (phys, flags) = arch::paging::translate(virt)
+                let (phys, flags) = hal::translate(virt)
                     .unwrap_or_else(|| panic!("{name} at {virt:#x} is not mapped"));
                 assert_eq!(
                     flags, expect,
@@ -671,16 +671,13 @@ fn check_arch(info: &BootInfo) {
 
         // Direct map is writable; null page is unmapped.
         let frame = mm::alloc_frames(0).expect("out of frames");
-        let (back, flags) = arch::paging::translate(info.phys_to_virt(frame))
+        let (back, flags) = hal::translate(info.phys_to_virt(frame))
             .expect("the direct map is missing a frame the kernel owns");
         assert_eq!(back, frame, "the direct map translates to the wrong frame");
         assert_eq!(flags, MapFlags::READ | MapFlags::WRITE);
         mm::free_frames(frame, 0);
 
-        assert!(
-            arch::paging::translate(0).is_none(),
-            "the null page is mapped"
-        );
+        assert!(hal::translate(0).is_none(), "the null page is mapped");
         println!("direct map writable and non-executable, null page unmapped");
 
         // Kernel stack is not reclaimable.
@@ -702,7 +699,7 @@ fn check_arch(info: &BootInfo) {
         let frame = mm::alloc_frames(0).expect("out of frames");
 
         let before_mapped = mm::frame_stats().free;
-        let mut space = paging::AddressSpace::new();
+        let mut space = hal::AddressSpace::new();
         space.map(Mapping {
             virt,
             phys: frame,
@@ -712,7 +709,7 @@ fn check_arch(info: &BootInfo) {
         let mapped_cost = before_mapped - mm::frame_stats().free;
 
         let before_empty = mm::frame_stats().free;
-        let empty = paging::AddressSpace::new();
+        let empty = hal::AddressSpace::new();
         let empty_cost = before_empty - mm::frame_stats().free;
 
         assert_eq!(
@@ -734,13 +731,9 @@ fn check_arch(info: &BootInfo) {
         // records the task's new space before pointing CR3 at it.
         critical_section::with(|_| {
             space.switch();
-            assert_eq!(
-                paging::active_root(),
-                space.root(),
-                "switch() did not switch"
-            );
+            assert_eq!(hal::active_root(), space.root(), "switch() did not switch");
 
-            let (back, flags) = paging::translate(virt).expect("the user page is not mapped");
+            let (back, flags) = hal::translate(virt).expect("the user page is not mapped");
             assert_eq!(back, frame, "the user page points at the wrong frame");
             assert_eq!(flags, MapFlags::READ | MapFlags::WRITE | MapFlags::USER);
             unsafe {
@@ -760,17 +753,17 @@ fn check_arch(info: &BootInfo) {
 
             empty.switch();
             assert!(
-                paging::translate(virt).is_none(),
+                hal::translate(virt).is_none(),
                 "a user page leaked between address spaces"
             );
             let text = arch::kernel_sections().text.start;
             assert!(
-                paging::translate(text).is_some(),
+                hal::translate(text).is_some(),
                 "the kernel half was not shared with the new address space"
             );
             println!("second address space: kernel half shared, user half empty");
 
-            paging::switch_to_kernel();
+            hal::switch_to_kernel();
         });
 
         let before_teardown = mm::frame_stats().free;

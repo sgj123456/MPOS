@@ -40,6 +40,12 @@
 //! device family). This module is the kernel's machine abstraction; the two
 //! share a word and nothing else.
 
+/// The paging error the address-space contract answers with. Re-exported
+/// because it belongs to the vocabulary a caller matches on (`Err(PageTaken)`)
+/// and its home is `mm`, beside [`Mapping`].
+pub use crate::mm::vm::PageTaken;
+use crate::mm::vm::{KernelSections, MapFlags, Mapping};
+
 /// The scheduler clock: monotonic ticks, and wall-clock-free elapsed time.
 ///
 /// The tick rate is an associated const rather than a call because it is a
@@ -150,8 +156,126 @@ pub trait Interrupts {
     fn net_msi_vector() -> u8;
 }
 
+/// One process's view of memory: the page tables it runs on.
+///
+/// The type implementing this is the machine's, reached above the seam only as
+/// [`AddressSpace`]; the methods are the whole of what the kernel does with it,
+/// so a port implements these and nothing else. The vocabulary they speak -
+/// [`Mapping`], [`MapFlags`], [`PageTaken`], [`KernelSections`] - belongs to
+/// `mm`, which owns what a mapping *is*; the machine owns how one is made.
+pub trait AddressSpaceOps {
+    /// An address space with nothing in it but the shared kernel half. Asserts
+    /// if the kernel tables have not been installed yet.
+    fn new() -> Self;
+
+    /// The root frame, for callers that must say which space is which.
+    fn root(&self) -> usize;
+
+    /// Add one mapping. It need not be the active space. A collision is a bug
+    /// in the kernel's own plan, so this asserts; a caller taking a request
+    /// from a process uses [`try_map`](Self::try_map).
+    fn map(&mut self, mapping: Mapping);
+
+    /// Add one mapping, answering [`PageTaken`] where [`map`](Self::map) would
+    /// assert - the shape a process's `MAP_FIXED` needs.
+    fn try_map(&mut self, mapping: Mapping) -> Result<(), PageTaken>;
+
+    /// Remove every mapping that covers `virt..virt + len`, answering the
+    /// frames that were mapped there (the caller frees them).
+    fn unmap(&mut self, virt: usize, len: usize) -> alloc::vec::Vec<usize>;
+
+    /// Change the flags of the mappings covering `virt..virt + len`.
+    fn protect(&mut self, virt: usize, len: usize, flags: MapFlags);
+
+    /// Make this space the active one on this CPU.
+    fn switch(&self);
+
+    /// Map `phys` at `virt` as a copy-on-write page, writable for now.
+    fn map_cow(&mut self, virt: usize, phys: usize, flags: MapFlags);
+
+    /// Map `phys` at `virt` shared: the same frame in more than one space.
+    fn map_shared(&mut self, virt: usize, phys: usize, flags: MapFlags);
+
+    /// Resolve a write fault on a copy-on-write page: give this space its own
+    /// frame and answer `(old_phys, new_phys)`.
+    fn resolve_cow(&mut self, virt: usize) -> Option<(usize, usize)>;
+
+    /// Walk every mapped user page, lowest first, handing `(virt, phys, flags)`
+    /// to `f`.
+    fn walk_user_pages(&self, f: impl FnMut(usize, usize, MapFlags));
+
+    /// Mark the leaf mapping at `virt` copy-on-write in this space's own
+    /// tables (not by touching the active ones).
+    fn set_cow_bit(&self, virt: usize);
+
+    /// [`set_cow_bit`](Self::set_cow_bit) for a page that is already
+    /// copy-on-write, where a re-mark is a no-op rather than an assertion.
+    fn set_cow_bit_quietly(&self, virt: usize);
+
+    /// Invalidate this space's TLB entries if it is the active one.
+    fn flush_if_active(&self);
+
+    /// The frame mapped at `virt`, if any.
+    fn phys_for_virt(&self, virt: usize) -> Option<usize>;
+}
+
+/// The page tables: installing the kernel's, and the questions asked about the
+/// active one from outside a process's address space.
+pub trait Paging {
+    /// The address-space type this machine's page tables are.
+    type Space: AddressSpaceOps;
+
+    /// Build and install the kernel's page tables from the boot record, and
+    /// answer the kernel root's value.
+    ///
+    /// # Safety
+    /// Runs before any mapping exists beyond the loader's; the caller passes
+    /// the record the loader wrote and nothing else.
+    unsafe fn install(
+        info: &crate::boot::BootInfo,
+        sections: &crate::mm::vm::KernelSections,
+    ) -> usize;
+
+    /// Map a device's register window into the kernel half.
+    fn map_mmio(virt: usize, phys: usize, len: usize);
+
+    /// Translate a kernel-visible address in the *active* space.
+    fn translate(virt: usize) -> Option<(usize, MapFlags)>;
+
+    /// Whether `start..start + len` is mapped in the active space in a way the
+    /// caller's access (`write`) is allowed by.
+    fn user_accessible(start: usize, len: usize, write: bool) -> bool;
+
+    /// Whether the leaf mapping at `virt` is marked copy-on-write.
+    fn is_cow_page(virt: usize) -> bool;
+
+    /// Write a `u32` to a user address through `root`'s tables, answering
+    /// whether it could (used to place a signal trampoline into a space that
+    /// is not the active one).
+    fn write_user_u32(root: usize, at: usize, value: u32) -> bool;
+
+    /// The root of the address space currently active on this CPU.
+    fn active_root() -> usize;
+
+    /// The root of the kernel's own address space.
+    fn kernel_root() -> usize;
+
+    /// Make `root` the active space.
+    fn switch_to_root(root: usize);
+
+    /// Switch back to the kernel's own space.
+    fn switch_to_kernel();
+
+    /// The frame backing `virt` in the space with root `root`, if any.
+    fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize>;
+
+    /// Like [`phys_for_virt_of`](Self::phys_for_virt_of), but only for a page
+    /// the user may touch (the walk asks for `USER`).
+    fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize>;
+}
+
 /// A machine this kernel can run on. `Current` names the one being built.
-pub trait Platform: Clock + WallClock + Cpu + Interrupts + Sized + 'static {}
+pub trait Platform: Clock + WallClock + Cpu + Interrupts + Paging + Sized + 'static {}
 
 /// The platform this build targets.
 ///
@@ -271,4 +395,85 @@ pub fn init_message_signalled() {
 #[inline]
 pub fn net_msi_vector() -> u8 {
     <Current as Interrupts>::net_msi_vector()
+}
+
+/// One process's address space, as this machine's page tables.
+///
+/// Reached only through the trait, so a caller never names the machine's type
+/// and a port's type takes its place without an edit here.
+pub type AddressSpace = <Current as Paging>::Space;
+
+/// Build and install the kernel's page tables from the boot record.
+///
+/// # Safety
+/// Runs before any mapping exists beyond the loader's; see [`Paging::install`].
+#[inline]
+pub unsafe fn install(info: &crate::boot::BootInfo, sections: &KernelSections) -> usize {
+    unsafe { <Current as Paging>::install(info, sections) }
+}
+
+/// Map a device's register window into the kernel half.
+#[inline]
+pub fn map_mmio(virt: usize, phys: usize, len: usize) {
+    <Current as Paging>::map_mmio(virt, phys, len)
+}
+
+/// Translate a kernel-visible address in the active address space.
+#[inline]
+pub fn translate(virt: usize) -> Option<(usize, MapFlags)> {
+    <Current as Paging>::translate(virt)
+}
+
+/// Whether the active space maps `start..start + len` accessibly for `write`.
+#[inline]
+pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
+    <Current as Paging>::user_accessible(start, len, write)
+}
+
+/// Whether the leaf mapping at `virt` is copy-on-write.
+#[inline]
+pub fn is_cow_page(virt: usize) -> bool {
+    <Current as Paging>::is_cow_page(virt)
+}
+
+/// Write a `u32` to a user address through `root`'s tables.
+#[inline]
+pub fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
+    <Current as Paging>::write_user_u32(root, at, value)
+}
+
+/// The root of the active address space.
+#[inline]
+pub fn active_root() -> usize {
+    <Current as Paging>::active_root()
+}
+
+/// The root of the kernel's own address space.
+#[inline]
+pub fn kernel_root() -> usize {
+    <Current as Paging>::kernel_root()
+}
+
+/// Make `root` the active address space.
+#[inline]
+pub fn switch_to_root(root: usize) {
+    <Current as Paging>::switch_to_root(root)
+}
+
+/// Switch back to the kernel's own address space.
+#[inline]
+pub fn switch_to_kernel() {
+    <Current as Paging>::switch_to_kernel()
+}
+
+/// The frame backing `virt` in the space with root `root`.
+#[inline]
+pub fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+    <Current as Paging>::phys_for_virt_of(root, virt)
+}
+
+/// The frame backing `virt` in `root`, only if the user may touch it.
+#[inline]
+pub fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+    <Current as Paging>::user_phys_for_virt_of(root, virt)
 }

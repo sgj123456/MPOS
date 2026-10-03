@@ -2607,7 +2607,7 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
         }
         let frame = crate::sched::user_frame_at(page);
         let reachable = match frame {
-            Some(_) => crate::arch::paging::user_accessible(page, PAGE_SIZE, false),
+            Some(_) => crate::hal::user_accessible(page, PAGE_SIZE, false),
             // No page to read the bits from, so the VMA is what says whether
             // the address was the process's to reach.
             None => {

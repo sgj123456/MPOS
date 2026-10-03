@@ -431,7 +431,10 @@ measured count from 17 to **15**: `arch → console` and `arch → net` fell to 
 one, collapsing both pairs to one-way edges, and no pair was added in exchange (`hal`'s
 platform tag is its own type; `arch` implements the traits for it, so `arch → hal` is the
 only arrow). S2 then took it to **14**: with the interrupt controller behind `hal::Interrupts`,
-`drivers → arch` fell to zero and the `arch ↔ drivers` pair collapsed. The tables in this section are the audit's
+`drivers → arch` fell to zero and the `arch ↔ drivers` pair collapsed. S3 kept it at **14**
+while swapping which pair it is: paging behind `hal::Paging` removed `arch ↔ mm` (`mm` stopped
+naming `arch`) and created `hal ↔ mm` (the trait speaks `mm`'s mapping vocabulary; `mm` asks the
+HAL to program an MMIO window), which §9 argues is the seam's neighbour, not a leak. The tables in this section are the audit's
 snapshot and are left as they were read; from here the command is what they have to agree with, and
 it fails when an edge appears that was not there when the baseline was recorded. Two further rules
 ride with it, each a ratchet at its recorded number rather than an absolute refusal: no layer below
@@ -562,14 +565,23 @@ drivers, net, pci, rand, uevent        →  may use: hal, mm, sched, sync
         ↓
        main                            →  may use everything
 
-       hal                             →  may use nothing (arch implements its traits)
+       hal                             →  may use: mm (the mapping vocabulary its
+                                            paging trait speaks), boot (the record
+                                            `install` takes)
    arch/<arch>                         →  may use: hal, mm's mapping vocabulary
 ```
 
-The machine seam is new and still being closed (`PLAN.md` §11.4): the clock, wall clock and
-CPU-control calls already go through `hal`, while paging, context and the interrupt controller
-are still named from above and move next. Until they do, `arch` is named directly by the
-boxes that still carry those calls — which is exactly the debt the steps are for.
+`hal ↔ mm` is a deliberate cycle, not a leak: the paging trait says *what a
+mapping is* in `mm`'s words (`Mapping`/`MapFlags`/`PageTaken`/`KernelSections`,
+which `mm` owns because it owns the mapping plan), and `mm` names the HAL for the
+one call that programs a device window it handed out. Stage 3 swapped it for the
+old `arch ↔ mm` pair rather than adding to the count (`PLAN.md` §11.4).
+
+The machine seam is new and still being closed (`PLAN.md` §11.4): the clock, wall
+clock, CPU control, the interrupt controller and paging already go through `hal`,
+while contexts and the user register frame are still named from above and move
+next. Until they do, `arch` is named directly by the boxes that still carry those
+calls — which is exactly the debt the steps are for.
 
 The leaf crates (`err`, `date`, `binfmt`, `cred`, `uts`, `seccomp`, `pci`, `term`, `ahci`,
 `gpu`, `evdev`, `uinput`, `blk`) sit below all of these and may use nothing in the kernel —

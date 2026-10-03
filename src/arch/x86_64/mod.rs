@@ -209,4 +209,71 @@ fn pic_line(line: crate::hal::Line) -> u8 {
     }
 }
 
+impl crate::hal::Paging for crate::hal::Current {
+    type Space = paging::AddressSpace;
+
+    unsafe fn install(
+        info: &crate::boot::BootInfo,
+        sections: &crate::mm::vm::KernelSections,
+    ) -> usize {
+        // SAFETY: the caller's contract, passed through unchanged.
+        unsafe { paging::install(info, sections) }
+    }
+
+    #[inline]
+    fn map_mmio(virt: usize, phys: usize, len: usize) {
+        paging::map_mmio(virt, phys, len)
+    }
+
+    #[inline]
+    fn translate(virt: usize) -> Option<(usize, crate::mm::MapFlags)> {
+        paging::translate(virt)
+    }
+
+    #[inline]
+    fn user_accessible(start: usize, len: usize, write: bool) -> bool {
+        paging::user_accessible(start, len, write)
+    }
+
+    #[inline]
+    fn is_cow_page(virt: usize) -> bool {
+        paging::is_cow_page(virt)
+    }
+
+    #[inline]
+    fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
+        paging::write_user_u32(root, at, value)
+    }
+
+    #[inline]
+    fn active_root() -> usize {
+        paging::active_root()
+    }
+
+    #[inline]
+    fn kernel_root() -> usize {
+        paging::kernel_root()
+    }
+
+    #[inline]
+    fn switch_to_root(root: usize) {
+        paging::switch_to_root(root)
+    }
+
+    #[inline]
+    fn switch_to_kernel() {
+        paging::switch_to_kernel()
+    }
+
+    #[inline]
+    fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+        paging::phys_for_virt_of(root, virt)
+    }
+
+    #[inline]
+    fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+        paging::user_phys_for_virt_of(root, virt)
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}

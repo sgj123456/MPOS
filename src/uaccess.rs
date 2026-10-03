@@ -99,7 +99,7 @@ pub(crate) fn buffer_ok(buf: usize, len: usize, write: bool, from_user: bool) ->
 /// answers "accessible" and the length bound above stays the real gate.
 #[cfg(target_os = "none")]
 fn user_accessible(buf: usize, len: usize, write: bool) -> bool {
-    crate::arch::paging::user_accessible(buf, len, write)
+    crate::hal::user_accessible(buf, len, write)
 }
 
 #[cfg(not(target_os = "none"))]

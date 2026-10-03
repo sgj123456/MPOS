@@ -49,6 +49,15 @@ use anyhow::{Context, Result, bail};
 /// `crate::hal::Interrupts` took `drivers → arch` to zero, leaving only the
 /// one-way `arch → drivers`, so the `arch ↔ drivers` pair collapsed. Was 15
 /// after S1, which itself was 17 before it.
+///
+/// Stage 3 (paging behind `crate::hal::Paging`) **swapped a pair rather than
+/// removing one**, which is why the number did not move: `mm` stopped naming
+/// `arch` for `map_mmio` (so `arch ↔ mm` collapsed) and started naming `hal`,
+/// while the paging trait's signatures speak `mm`'s mapping vocabulary - so
+/// `hal ↔ mm` is a real cycle now. It is accepted and argued in
+/// `ARCHITECTURE.md` §9: the trait says *what a mapping is* in `mm`'s words,
+/// and `mm` asks the HAL to program the window it hands out. A change that
+/// lowers the count must still lower this constant.
 const BASELINE_MUTUAL_PAIRS: usize = 14;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.

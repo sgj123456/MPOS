@@ -788,6 +788,17 @@ it - so the entries say which they are:
       the net driver asks for the vector instead of naming `idt::NET_IRQ_VECTOR`. No raw IRQ or
       vector crosses the seam. `drivers → arch` fell to zero and **mutual pairs 15 → 14**; the
       full gate was green on this stage: `pass=142 fail=0 (142 built)`, exit 33
+- [x] **11.4 stage 3**: paging is a capability. `crate::hal::Paging` carries `install`,
+      `map_mmio`, `translate`, `user_accessible`, `is_cow_page`, `write_user_u32`, the roots and
+      the two `switch_to_*`, plus `type Space: AddressSpaceOps` — the address-space method set
+      (`map`/`try_map`/`unmap`/`protect`/`switch`/`map_cow`/`map_shared`/`resolve_cow`/
+      `walk_user_pages`/`set_cow_bit*`/`flush_if_active`/`phys_for_virt`), which `hal::AddressSpace`
+      aliases to. `PageTaken` moved to `mm::vm` beside `Mapping`, since it is part of what a
+      mapping *is* rather than an x86 fact. `mm`, `uaccess`, `sched`, `syscall` and `main` stopped
+      naming `arch::paging` entirely. The pair count **stayed at 14 while swapping which pair it
+      is** — `arch ↔ mm` out (`mm` no longer names `arch`), `hal ↔ mm` in, argued in
+      `ARCHITECTURE.md` §9 as the seam's neighbour rather than a leak. Gate green:
+      `pass=142 fail=0 (142 built)`, exit 33
 
 **ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
 
@@ -6468,7 +6479,7 @@ the argument for having done them first.
 - **Fixing V-10.** Accepted, documented, and cheaper to live with than a shared crate across two
   targets would be.
 
-### 11.4 The HAL: a machine seam under `arch/` — **S1+S2 LANDED; S3–S5 open**
+### 11.4 The HAL: a machine seam under `arch/` — **S1–S3 LANDED; S4–S5 open**
 
 Phase 11 is "who names whom"; this is the largest remaining piece of it, deferred above until
 now. Goal: everything above the machine layer compiles against *capability traits* instead of
@@ -6495,7 +6506,7 @@ neutral.
 | S1 | `hal` + `Clock`/`WallClock`/`Cpu`/`Current`/forwards; the `arch::timer`/`rtc`/`idle`/`halt` spread rerouted | **landed** — pairs 17 → 15 |
 | S2 | `Interrupts` (`Line`, `unmask`/`mask`/`eoi`, `init_message_signalled`, `net_msi_vector`): `serial`, `virtio/net`, `lapic` | **landed** — pairs 15 → 14; gate `pass=142 fail=0` exit 33 |
 | S2 | `Interrupts` (`Line`, `unmask`/`eoi`/`net_irq`): `serial`, `virtio/net`, `lapic` | open |
-| S3 | `Paging` (`Space` assoc, `MapFlags`/`Mapping` via `hal`, roots/switch/install/translate/`user_accessible`/`is_cow_page`/`write_user_u32`): `sched`, `mm`, `uaccess`, `main` | open |
+| S3 | `Paging` (`Space` assoc + `AddressSpaceOps`, `install`/`map_mmio`/`translate`/`user_accessible`/`is_cow_page`/`write_user_u32`/roots/switch/`phys_for_virt_of`); `PageTaken` moves to `mm::vm`; migrates `sched`, `mm`, `uaccess`, `syscall`, `main` | **landed** — pairs 14 → 14 (a swap: `arch ↔ mm` out, `hal ↔ mm` in); gate `pass=142 fail=0` exit 33 |
 | S4 | `Contexts`/`UserFrame`: `Context`/`Fpu`/`UserFrame` become assoc types; the `SegmentSelector` and register-frame leak into `sched`/`syscall` ends | open |
 | S5 | close the door: `arch::x86_64` internals `pub(crate)`, reachable only through `hal`; a depgraph rule "no `crate::arch::` outside `arch`/`hal`/`main`" at 0 | open |
 

@@ -106,6 +106,16 @@ impl fmt::Debug for Mapping {
     }
 }
 
+/// A page a syscall asked to map was already spoken for. The kernel's own plan
+/// asserts on that instead (see `AddressSpace::map`): a collision there is a bug
+/// in the plan, while one here is an ordinary request from a process.
+///
+/// It lives beside [`Mapping`]/[`MapFlags`] rather than in the machine layer
+/// because it is part of what a mapping operation *is*, so the HAL's paging
+/// trait can name the error without speaking x86.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageTaken;
+
 /// Where the linker put the kernel image, as virtual addresses. The architecture
 /// port fills this in from its linker symbols.
 #[derive(Clone, Debug)]

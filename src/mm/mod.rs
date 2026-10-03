@@ -71,7 +71,7 @@ pub fn map_mmio(phys: usize, len: usize) -> usize {
         virt + len <= MMIO_LIMIT,
         "out of room for device registers: {len} bytes at {phys:#x}"
     );
-    crate::arch::paging::map_mmio(virt, phys, len);
+    crate::hal::map_mmio(virt, phys, len);
     virt
 }
 

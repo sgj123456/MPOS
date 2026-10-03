@@ -885,11 +885,10 @@ pub fn translate(virt: usize) -> Option<(usize, MapFlags)> {
     unreachable!("a four-level walk ends in a leaf or in an absent entry")
 }
 
-/// A page a syscall asked to map was already spoken for. The kernel's own plan
-/// asserts on that instead (see [`AddressSpace::map`]): a collision there is a
-/// bug in the plan, while one here is an ordinary request from a process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageTaken;
+/// A page a syscall asked to map was already spoken for. Its home is
+/// [`crate::mm::vm`], beside the mapping vocabulary it belongs to; re-exported
+/// here so the arch module keeps answering to its own name.
+pub use crate::mm::vm::PageTaken;
 
 /// The pages that cover `virt..virt + len`, lowest first and rounded
 /// outwards: a range that starts mid-page takes that whole page with it, which
@@ -1203,5 +1202,87 @@ unsafe impl FrameAllocator<Size4KiB> for FramePool {
             PhysFrame::from_start_address(PhysAddr::new(phys as u64))
                 .expect("the frame allocator returned an unaligned frame"),
         )
+    }
+}
+
+// The machine's answer to the HAL's address-space contract. Every body
+// forwards to the inherent method above, written as `AddressSpace::<name>` for
+// that reason: the trait is deliberately *not* imported into this file's scope,
+// so that path can only resolve to the inherent impl and cannot recurse into
+// this same block.
+impl crate::hal::AddressSpaceOps for AddressSpace {
+    #[inline]
+    fn new() -> AddressSpace {
+        AddressSpace::new()
+    }
+
+    #[inline]
+    fn root(&self) -> usize {
+        AddressSpace::root(self)
+    }
+
+    #[inline]
+    fn map(&mut self, mapping: Mapping) {
+        AddressSpace::map(self, mapping)
+    }
+
+    #[inline]
+    fn try_map(&mut self, mapping: Mapping) -> Result<(), PageTaken> {
+        AddressSpace::try_map(self, mapping)
+    }
+
+    #[inline]
+    fn unmap(&mut self, virt: usize, len: usize) -> alloc::vec::Vec<usize> {
+        AddressSpace::unmap(self, virt, len)
+    }
+
+    #[inline]
+    fn protect(&mut self, virt: usize, len: usize, flags: MapFlags) {
+        AddressSpace::protect(self, virt, len, flags)
+    }
+
+    #[inline]
+    fn switch(&self) {
+        AddressSpace::switch(self)
+    }
+
+    #[inline]
+    fn map_cow(&mut self, virt: usize, phys: usize, flags: MapFlags) {
+        AddressSpace::map_cow(self, virt, phys, flags)
+    }
+
+    #[inline]
+    fn map_shared(&mut self, virt: usize, phys: usize, flags: MapFlags) {
+        AddressSpace::map_shared(self, virt, phys, flags)
+    }
+
+    #[inline]
+    fn resolve_cow(&mut self, virt: usize) -> Option<(usize, usize)> {
+        AddressSpace::resolve_cow(self, virt)
+    }
+
+    #[inline]
+    fn walk_user_pages(&self, f: impl FnMut(usize, usize, MapFlags)) {
+        AddressSpace::walk_user_pages(self, f)
+    }
+
+    #[inline]
+    fn set_cow_bit(&self, virt: usize) {
+        AddressSpace::set_cow_bit(self, virt)
+    }
+
+    #[inline]
+    fn set_cow_bit_quietly(&self, virt: usize) {
+        AddressSpace::set_cow_bit_quietly(self, virt)
+    }
+
+    #[inline]
+    fn flush_if_active(&self) {
+        AddressSpace::flush_if_active(self)
+    }
+
+    #[inline]
+    fn phys_for_virt(&self, virt: usize) -> Option<usize> {
+        AddressSpace::phys_for_virt(self, virt)
     }
 }

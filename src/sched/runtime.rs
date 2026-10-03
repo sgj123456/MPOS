@@ -34,8 +34,8 @@ use critical_section::Mutex;
 
 use crate::arch::context::{self, Context, UserContext};
 use crate::arch::gdt;
-use crate::arch::paging::{self, AddressSpace};
 use crate::hal;
+use crate::hal::AddressSpace;
 use crate::mm::elf::{self, Image};
 use crate::mm::vm::{MapFlags, Mapping};
 use crate::mm::vma::{MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
@@ -1626,9 +1626,9 @@ impl Table {
             // paging root the group remembers. A kernel task has neither, and
             // runs on the kernel's own tables.
             None if task.mm.root() != 0 => task.mm.root(),
-            None => paging::kernel_root(),
+            None => hal::kernel_root(),
         };
-        paging::switch_to_root(root);
+        hal::switch_to_root(root);
         if let Some(stack) = &task.stack {
             gdt::set_kernel_stack(stack.top());
         }
@@ -2077,10 +2077,10 @@ impl Table {
         // 0, where a fault is a panic rather than a copy, so the page is
         // brought in here, where the table is already borrowed and asking for
         // it again would be a second `&mut Table`.
-        if paging::phys_for_virt_of(root, address).is_none() {
+        if hal::phys_for_virt_of(root, address).is_none() {
             populate_in(self, root, address, true);
         }
-        crate::arch::paging::write_user_u32(root, address, 0);
+        crate::hal::write_user_u32(root, address, 0);
     }
 
     /// Which task owns the address space a group runs on. A process owns its
@@ -5389,10 +5389,10 @@ pub fn tls_of(id: TaskId) -> Option<usize> {
 /// rewritten underneath it.
 fn user_byte_address(virt: usize, write: bool) -> Option<usize> {
     let page = crate::mm::pframe::align_down(virt, crate::mm::PAGE_SIZE);
-    if write && crate::arch::paging::is_cow_page(page) && !resolve_cow_fault(page) {
+    if write && crate::hal::is_cow_page(page) && !resolve_cow_fault(page) {
         return None;
     }
-    let (phys, flags) = match crate::arch::paging::translate(virt) {
+    let (phys, flags) = match crate::hal::translate(virt) {
         Some(found) => found,
         // A page of a mapping the process has not touched yet. The walk that
         // just failed is the same walk the CPU would do, so the answer is the
@@ -5403,7 +5403,7 @@ fn user_byte_address(virt: usize, write: bool) -> Option<usize> {
             if !resolve_anon_fault(virt, write) {
                 return None;
             }
-            crate::arch::paging::translate(virt)?
+            crate::hal::translate(virt)?
         }
     };
     if !flags.contains(MapFlags::USER) {
@@ -5454,7 +5454,7 @@ pub fn write_user(virt: usize, bytes: &[u8]) -> bool {
 /// tracee's own `Mm` accounting rather than a physical address. Said plainly
 /// rather than half-done.
 ///
-/// The walk asks for `USER` - [`paging::user_phys_for_virt_of`], not the bare
+/// The walk asks for `USER` - [`hal::user_phys_for_virt_of`], not the bare
 /// translation - because the address belongs to somebody else: every space
 /// carries the kernel's own mappings above the user half, and a walk without
 /// that bit answers for them too. A same-task caller has
@@ -5520,13 +5520,13 @@ fn write_user_of_at(root: usize, virt: usize, bytes: &[u8], populate: bool) -> b
 /// tables, and a lazy page has no entry to read - so a missing page that a VMA
 /// covers is populated rather than reported as `EFAULT`.
 fn resolve_page_of(root: usize, virt: usize, write: bool, populate: bool) -> Option<usize> {
-    match paging::user_phys_for_virt_of(root, virt) {
+    match hal::user_phys_for_virt_of(root, virt) {
         Some(phys) => Some(phys),
         None if populate => {
             if !populate_user_page_at(root, virt, write) {
                 return None;
             }
-            paging::user_phys_for_virt_of(root, virt)
+            hal::user_phys_for_virt_of(root, virt)
         }
         None => None,
     }
@@ -6274,7 +6274,7 @@ pub fn current_map_user(virt: usize, frame: usize, flags: crate::mm::vm::MapFlag
                 task.mm.own(frame);
                 virt as isize
             }
-            Err(crate::arch::paging::PageTaken) => -crate::err::EEXIST,
+            Err(crate::hal::PageTaken) => -crate::err::EEXIST,
         }
     })
 }
@@ -6483,7 +6483,7 @@ fn populate_in(t: &mut Table, root: usize, virt: usize, write: bool) -> bool {
 /// word after switching the CPU to that thread's tables - and the tables the
 /// fault came through are the ones that decide what the address means.
 pub fn resolve_anon_fault(virt: usize, write: bool) -> bool {
-    let root = paging::active_root();
+    let root = hal::active_root();
     with_table(|t| populate_in(t, root, virt, write))
 }
 
@@ -6508,7 +6508,7 @@ pub fn populate_user_page_at(root: usize, virt: usize, write: bool) -> bool {
 /// is the rule the eager mapping this replaces enforced by never leaving one
 /// absent.
 pub fn kernel_lazy_accessible(virt: usize, write: bool) -> bool {
-    let root = paging::active_root();
+    let root = hal::active_root();
     with_table(|t| {
         let Some(owner) = owner_of_root(t, root) else {
             return false;
@@ -7757,7 +7757,7 @@ pub fn exec_replace(
         // program's entry point. Nothing will call `prepare` for this task
         // either: it is not being dispatched, it is simply continuing, and the
         // next thing it does is `sysretq` into the image that was just loaded.
-        paging::switch_to_root(new_root);
+        hal::switch_to_root(new_root);
 
         Ok((loaded.entry, user_rsp))
     })
@@ -7797,7 +7797,7 @@ pub fn resolve_cow_fault(virt: usize) -> bool {
 /// Give one copy-on-write page of `space` its own frame, and keep the group's
 /// books on the swap. `false` if the page was not copy-on-write, in which case
 /// nothing changes.
-fn split_cow(space: &mut crate::arch::paging::AddressSpace, mm: &Mm, virt: usize) -> bool {
+fn split_cow(space: &mut crate::hal::AddressSpace, mm: &Mm, virt: usize) -> bool {
     let Some((old_phys, new_phys)) = space.resolve_cow(virt) else {
         return false;
     };
