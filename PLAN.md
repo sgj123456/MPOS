@@ -664,7 +664,7 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stages 1a-1c landed (§9.1))**
+**Architectures (Phase 9 — aarch64 stages 1a-1d landed (§9.1))**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
@@ -5170,13 +5170,14 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1c landed**. The toolchain targets and the linker
+Current status: **stages 1a-1d landed**. The toolchain targets and the linker
 script exist, the gates are two-way, `cargo build --target aarch64-unknown-none`
 links a bootable ELF, and that ELF boots under `qemu-system-aarch64 -M virt
--kernel`, prints its banner over a PL011 at `0x0900_0000`, and takes the generic
-timer's interrupt through a GICv2 and its own vector table at 250 Hz. Nothing
-above `arch` is ported yet; `src/lib.rs`'s header carries the stage ledger, which
-is the record of which module un-gates when.
+-kernel`, prints its banner over a PL011 at `0x0900_0000`, takes the generic
+timer's interrupt through a GICv2 at 250 Hz, and builds its own four-level page
+tables and switches the MMU onto them (`M3_TABLES_OK`). Nothing above `arch` is
+ported yet; `src/lib.rs`'s header carries the stage ledger, which is the record
+of which module un-gates when.
 
 This section used to say "kernel ELF compiles but boot flow incomplete", which
 was false in both halves. Nothing compiled for aarch64 - V-8 (§11.1.8) removed
@@ -5198,7 +5199,7 @@ verified by the means named; none of them claims a green from compilation alone.
 | 1a | Build plumbing: `rust-toolchain.toml` targets, `src/arch/aarch64/linker.ld`, `[target.aarch64-unknown-none]`, the gate list and the stage ledger | `cargo build --target aarch64-unknown-none` links; the x86 gate stays green |
 | 1b | The machine body: PL011 at `0x0900_0000`, the `_start` stub, the banner | `qemu-system-aarch64 -M virt -kernel` prints the banner |
 | 1c | Exception vectors (`VBAR_EL1`), GICv2, the generic timer (`CNTPCT_EL0`/`CNTP_CVAL_EL0`) | **landed**: `M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz)`, three runs of three, and the check's failure branch names the timer's, the distributor's and the CPU interface's registers rather than hanging |
-| 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | boots on its own tables and runs the `mm` self-check |
+| 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | **landed**: `page tables: 12 frames (48 KiB)`, `M3_TABLES_OK` (image `r-x`/`r--`/`rw-` at both its addresses, direct map written and read back, null page absent), and the clock still counts to 25 with the MMU on |
 | 1e | The aarch64 loader: `boot/src/vm.rs` gains a `TTBR1` body, `BOOTAA64.EFI`, AAVMF | QEMU + AAVMF boots the real image from the ESP |
 | 2 | Contexts and user entry: `x19..x28`/`fp`/`lr`/`sp`, `q0..q31`, `eret` | a boot-time switch between two kernel tasks |
 | 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --target aarch64-unknown-none` with `sched` in |
@@ -5238,9 +5239,20 @@ Named gaps the port carries rather than hides, each with its home:
   Linux programs the same `0x7`. The check's failure branch now prints the five
   registers that separate the three causes.
 - **The machine addresses are hardcoded.** QEMU virt puts PL011 at
-  `0x0900_0000` and the GIC at `0x0800_0000`/`0x0801_0000`; the DTB the firmware
-  passes in `x0` is what a real port reads, and stage 5 is where it does. Until
-  then they are honest for one machine and named as such.
+  `0x0900_0000`, the GIC at `0x0800_0000`/`0x0801_0000`, and RAM at
+  `0x4000_0000`; the DTB the firmware passes in `x0` is what a real port reads,
+  and stage 5 is where it does. Until then they are honest for one machine and
+  named as such.
+- **Stage 1d's layout is constants, and its identity map stays.** Two halves of
+  the same missing piece: `kernel_mappings(info, sections)` needs a `BootInfo`
+  and the `-kernel` path has none (measured: `x0` is zero, so no memory map and
+  no device tree), which is also why there is no frame allocator to take page
+  tables from — they come from a 128 KiB `.bss` arena instead. And because the
+  image is still *linked* low, the low half of the identity map cannot be dropped
+  the way x86_64's loader drops its own: every absolute address in the kernel is
+  a physical one until stage 1e's loader relocates the image and jumps to the
+  higher-half alias, which is already built and checked here. The RAM window this
+  stage maps (1 GiB) is a ceiling rather than a measurement, for the same reason.
 - **`hal` is x86_64-only until its traits exist on aarch64.** The forwards at
   the bottom of `hal/mod.rs` name all six concern traits, so the module cannot
   compile for a machine that implements fewer. aarch64 gets `Cpu`/`Interrupts`

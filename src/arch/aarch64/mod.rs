@@ -16,13 +16,14 @@
 
 pub(crate) mod critical;
 pub(crate) mod gic;
+pub(crate) mod paging;
 pub(crate) mod pl011;
 pub(crate) mod timer;
 pub(crate) mod vectors;
 
 use core::fmt;
 
-use crate::mm::vm::KernelSections;
+use crate::mm::vm::{KernelSections, MapFlags};
 
 /// Where the linker script put each part of the kernel image, as virtual
 /// addresses.
@@ -100,8 +101,132 @@ pub fn boot(handoff: usize) -> ! {
     }
 
     init_interrupts();
+    // The tables go in before the clock is opened, so that the tick the check
+    // measures is one taken with the MMU on: the GIC's registers are reached
+    // through the device mapping from then on, and a window that still counts to
+    // 25 is a window where translation, attributes and interrupts all agree.
+    check_paging();
     check_timer();
     halt()
+}
+
+/// Stage 1d's evidence: the kernel builds its own tables, switches the machine
+/// onto them, and the mappings the hardware now uses are the ones the plan
+/// asked for.
+///
+/// The order of the checks is the order of the claims. That execution continued
+/// at all is the first and largest one - a table that omits the page the CPU is
+/// reading would have stopped the machine at the `msr sctlr_el1`, and this
+/// function would not be running. Everything after it is about *which* mappings
+/// exist: the image's sections with the permissions the plan gave them, at both
+/// the address the kernel is using and the higher-half alias; the direct map
+/// writable and usable; and the null page absent.
+fn check_paging() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    let sections = kernel_sections();
+    // SAFETY: the bring-up contract. This is the first thing in the kernel to
+    // touch the tables, it runs once, and the machine is executing at the
+    // physical address the image was loaded at.
+    let tables = unsafe { paging::install(&sections) };
+    let _ = writeln!(
+        out,
+        "page tables: {tables} frames ({} KiB), image at {:#x} aliased to {:#x}",
+        tables * 4096 / 1024,
+        paging::IMAGE_LOAD_BASE,
+        paging::KERNEL_VIRT_BASE,
+    );
+
+    if !paging::enabled() {
+        let _ = writeln!(out, "M3_TABLES_FAILED: SCTLR_EL1.M is clear after install");
+        halt();
+    }
+
+    // W^X across the whole image, at both addresses it is mapped at. The low
+    // one is where the kernel is *running*: an image mapped writable there is an
+    // image a stray store can rewrite, whatever the alias says.
+    for (name, range, expect) in [
+        ("text", &sections.text, MapFlags::READ | MapFlags::EXEC),
+        ("rodata", &sections.rodata, MapFlags::READ),
+        ("data", &sections.data, MapFlags::READ | MapFlags::WRITE),
+    ] {
+        // Page-aligned on both ends: `__text_start` is not a page boundary (the
+        // ELF headers share its first page), and the mapping that covers it is.
+        let first = range.start & !(4096 - 1);
+        let last = (range.end + 4095) & !(4095);
+        let mut page = first;
+        while page < last {
+            for (where_, base) in [
+                ("identity", 0usize),
+                ("alias", paging::KERNEL_VIRT_BASE - paging::IMAGE_LOAD_BASE),
+            ] {
+                let at = page + base;
+                let (phys, flags) = match paging::translate(at) {
+                    Some(answer) => answer,
+                    None => {
+                        let _ = writeln!(out, "M3_TABLES_FAILED: {name} {where_} {at:#x} unmapped");
+                        halt();
+                    }
+                };
+                if flags != expect || phys != page {
+                    let _ = writeln!(
+                        out,
+                        "M3_TABLES_FAILED: {name} {where_} at {at:#x} is {flags:?} -> {phys:#x}, \
+                         expected {expect:?} -> {page:#x}"
+                    );
+                    halt();
+                }
+            }
+            page += 4096;
+        }
+    }
+    let _ = writeln!(out, "image mapped r-x / r-- / rw- at both addresses");
+
+    // The direct map: one frame the kernel knows is RAM, written and read back
+    // through it. Chosen well above the image and well below the top of the
+    // window this stage maps, so it is neither the kernel's own memory nor
+    // something the firmware put there.
+    let scratch_phys = paging::RAM_BASE + 0x0100_0000;
+    let scratch = paging::HHDM_OFFSET + scratch_phys;
+    let (back, flags) = match paging::translate(scratch) {
+        Some(answer) => answer,
+        None => {
+            let _ = writeln!(
+                out,
+                "M3_TABLES_FAILED: the direct map has no page at {scratch:#x}"
+            );
+            halt();
+        }
+    };
+    if back != scratch_phys || flags != MapFlags::READ | MapFlags::WRITE {
+        let _ = writeln!(
+            out,
+            "M3_TABLES_FAILED: the direct map at {scratch:#x} is {flags:?} -> {back:#x}"
+        );
+        halt();
+    }
+    // SAFETY: `scratch` translates to `scratch_phys`, a frame of RAM inside the
+    // window this stage maps and outside the image; nothing else in the kernel
+    // has been given it.
+    unsafe {
+        core::ptr::write_volatile(scratch as *mut u8, 0xa5);
+        if core::ptr::read_volatile(scratch as *const u8) != 0xa5 {
+            let _ = writeln!(out, "M3_TABLES_FAILED: the direct map did not store 0xa5");
+            halt();
+        }
+    }
+    let _ = writeln!(
+        out,
+        "direct map: {scratch:#x} -> {scratch_phys:#x}, writable"
+    );
+
+    if paging::translate(0).is_some() {
+        let _ = writeln!(out, "M3_TABLES_FAILED: the null page is mapped");
+        halt();
+    }
+
+    let _ = writeln!(out, "M3_TABLES_OK");
 }
 
 /// Bring the machine's interrupts up: the vector table, then the controller,
@@ -251,7 +376,7 @@ fn banner(handoff: usize) {
     let _ = writeln!(out, "exception level: EL{}", current_el());
     let _ = writeln!(
         out,
-        "aarch64: bring-up, stage 1c (MMU off; the kernel's own tables are 1d)"
+        "aarch64: bring-up, stage 1d (the kernel's own page tables; MMU off until they go in)"
     );
 }
 
