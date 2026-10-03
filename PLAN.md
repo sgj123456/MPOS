@@ -5421,6 +5421,7 @@ number the gate answers is spelled beside it and named as such.
 | 2b | *Not a stage* - the **user** frame (`x0..x30`/`pc`/`pstate`) and its `eret` entry moved to stage 6, where the ABI that gives those fields their order and their meaning is. See the note below the table | - |
 | 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --release --target aarch64-unknown-none` with `sched` in - and see the correction below the table: this row is **not** one edit, and it waits on 4, 5 and 6 |
 | 4 | Un-gate `console` and `vfs` (serial-only console first) | a ramfs root with the initramfs untarred |
+| 4a | The first cut into the knot above `hal`: the serial console. The sink moves behind a new baseline `hal::Console` (`init`/`write_bytes`/`interrupt_driven`) with the interrupt-TX-ring behind an optional x86-only `hal::SerialRing` (`tx_space`/`tx_submit`/`tx_wait_now`/`tx_stop_waiting`), mirroring `Msi`/`FpuTrap`/`Segments`; `console.rs`'s framebuffer paint, ring-mirror and queue-and-park loop move verbatim into `#[cfg(target_arch="x86_64")]` helpers (inert elsewhere); aarch64 implements `Console` over the polled PL011 (CRLF at the sink, `interrupt_driven()`=`false` until stage 5); `console_list` recognises the aarch64 serial wire `ttyAMA0`; `console` and `print!`/`println!` un-gate to `target_os="none"` | **landed**: `cargo clippy --target aarch64-unknown-none` compiles `console` (the first subsystem above the machine layer to build for aarch64); `cargo xtask test`'s 142 user tests still exec through `console::write_bytes` and the parked/flood TX path (the behaviour-identity pin for the rewire); `cargo xtask boot-aarch64` still prints ten markers; host `console_list` tests pin `ttyAMA0` and `ttyAMA1`-unknown; depgraph holds at 12 pairs (`console -> hal` is one-way new, the `drivers`/`sched` names moved inside `#[cfg]` bodies and were already one-way) |
 | 5a | The device tree: `crates/fdt` (the reader, host-tested), `Handoff.dtb_phys`/`dtb_len` appended after `regions`, the loader copying the firmware's blob out of the UEFI configuration table, and `arch::aarch64::check_devices` holding the tree up against the machine's own constants | **landed**: `cargo xtask boot-aarch64` prints `devices: PL011 at 0x9000000, GIC at 0x8000000/0x8010000, timer on PPI 14 (INTID 30)`, `devices: 32 virtio-mmio windows, all inside the 0x8000000..0xc000000 device window` and `M4_DEVICES_OK`, and the tree's memory node is compared with every region the record calls usable |
 | 5b | The device window in the kernel half, and the tree's transports read back: `paging::DEVICE_PHYS`/`DEVICE_VIRT` split, `boot/src/vm.rs` mapping the window at both, `pl011`/`gic` compiled against the alias with their physical bases kept for the tree check, and `arch::aarch64::check_virtio` reading every `virtio,mmio` window's MagicValue/Version/DeviceID/VendorID | **landed**: `M3_TABLES_OK` now stands under `no low half: ... and so is the device window at 0x8000000 that used to live there`, and `M5_VIRTIO_OK` under `virtio: 32 transports, every one answering virtio 1.0 through the kernel half; 1 carries a device`, across three consecutive green runs |
 | 5 | Drivers: virtio-MMIO found through the tree, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up - **the discovery half of this row is 5b and is done; what remains is the drivers themselves**, whose transport is `virtio_drivers::transport::mmio` reached at `paging::device_virt(phys, len)` |
@@ -5460,6 +5461,19 @@ machine - which is stage 6. That is why 6a and 6b came next rather than 5's
 drivers, and why the drivers' turn is after the rest of 6 rather than before it:
 the tree walk 5b landed is the half of "virtio-MMIO found through the tree" that
 does not need `vfs`, and the transport that opens a device is the half that does.
+
+**That cut has since landed, and the console side of the knot is now cut too.**
+`hal` compiles for aarch64 (stage 6f), and stage 4a routed the console's sink behind
+a new `hal::Console` baseline capability (its interrupt-TX-ring behind an optional
+x86-only `hal::SerialRing`), cfg-partitioned the framebuffer/park arms, and un-gated
+`console` + `println!` to aarch64 - so the 18 errors above are gone. The framebuffer,
+ring and parking arms stay x86-only by `#[cfg]`. One thing 4a does *not* have: a
+boot-observed aarch64 console marker (`M4_CONSOLE_OK`). The aarch64 milestone checks
+live in `arch/aarch64`, and a `crate::console` line there would be an `arch -> console`
+upward edge (`AGENTS.md` §4, downward-only); the marker is deferred to stage 4b, where
+the post-machine checks move into `main`. Until then aarch64 `console` is compile-pinned
+(it builds, a module that failed to un-gate is a build error) and the list fix is
+host-pinned, but its runtime output on the wire is exercised only on x86.
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
