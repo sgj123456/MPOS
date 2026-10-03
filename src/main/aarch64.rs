@@ -62,9 +62,15 @@ fn zero_bss() {
     unsafe { core::ptr::write_bytes(start as *mut u8, 0, end - start) };
 }
 
-/// The panic path. There is no console yet (stage 1b), so it parks the core;
-/// once there is one, the message goes out before the halt.
+/// The panic path: one line on the console, then stop.
+///
+/// It prints through `arch`'s own writer rather than `mpos::println!` for the
+/// reason that macro is x86_64-only: this machine's console is a PL011, and the
+/// kernel's console mux does not exist here until stage 4. A panic that printed
+/// nothing because the mux was missing would be the worst version of the gap -
+/// the machine would stop with no word about why.
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    mpos::arch::print_args(format_args!("\nKERNEL PANIC: {info}\n"));
     mpos::arch::halt()
 }

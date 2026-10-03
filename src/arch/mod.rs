@@ -55,6 +55,14 @@ pub use x86_64::kernel_sections;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::boot;
 
+/// Put a formatted line on the machine's boot console.
+///
+/// The aarch64 counterpart of `mpos::println!`, which reaches a console mux
+/// this machine does not have until stage 4. The entry and the panic path are
+/// its two callers - both run where a HAL call cannot exist yet.
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::print_args;
+
 /// Stop the core for good. The panic path's last act, and the bring-up halt.
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::halt;

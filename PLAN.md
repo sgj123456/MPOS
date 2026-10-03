@@ -664,7 +664,7 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stage 1a landed (§9.1))**
+**Architectures (Phase 9 — aarch64 stages 1a-1b landed (§9.1))**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
@@ -5170,11 +5170,12 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stage 1a landed**. The toolchain targets exist, the linker
-script exists, the gates are two-way and `cargo build --target
-aarch64-unknown-none` links a bootable ELF. Nothing above `arch` is ported yet;
-`src/lib.rs`'s header carries the stage ledger, which is the record of which
-module un-gates when.
+Current status: **stages 1a-1b landed**. The toolchain targets and the linker
+script exist, the gates are two-way, `cargo build --target aarch64-unknown-none`
+links a bootable ELF, and that ELF boots under `qemu-system-aarch64 -M virt
+-kernel` and prints its banner over a PL011 at `0x0900_0000`. Nothing above
+`arch` is ported yet; `src/lib.rs`'s header carries the stage ledger, which is
+the record of which module un-gates when.
 
 This section used to say "kernel ELF compiles but boot flow incomplete", which
 was false in both halves. Nothing compiled for aarch64 - V-8 (§11.1.8) removed
@@ -5214,6 +5215,15 @@ Named gaps the port carries rather than hides, each with its home:
   body agree. Stage 1e deletes it and boots from the ESP through AAVMF, which is
   the promise this section makes: a second machine with the *same* boot path,
   not a shortcut past it.
+- **`-kernel` hands over no device tree, and the exception level is measured
+  rather than assumed.** QEMU 11.1.1 with `-M virt` and a bare aarch64 ELF
+  enters the image with `x0 = 0` and `sp = 0` (the banner prints `x0` and
+  `CurrentEL`, and QEMU's own `-d cpu` log agrees): this path passes no DTB
+  pointer, and it starts at **EL1**. Neither weakens anything - nothing reads
+  the register yet, and the DTB a real port wants comes from the UEFI
+  configuration table, which is stage 1e's loader and stage 5's parser. What it
+  does mean is that the EL1-vs-EL2 check below belongs to 1e, where AAVMF is the
+  thing that decides.
 - **The machine addresses are hardcoded.** QEMU virt puts PL011 at
   `0x0900_0000` and the GIC at `0x0800_0000`/`0x0801_0000`; the DTB the firmware
   passes in `x0` is what a real port reads, and stage 5 is where it does. Until
