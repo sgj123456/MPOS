@@ -345,26 +345,52 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
     // `x8` is the number and `x0`..`x5` the arguments on AArch64, where the
     // x86_64 this kernel was written for puts the number in `rax`.
     let number = frame.x[8];
-    if number == NR_EXIT_GROUP {
-        let code = frame.x[0];
-        // SAFETY: reached only from the EL0 vector, and only a machine that got
-        // here through `context::enter_user` can take a lower-EL trap at all.
-        unsafe { context::leave_for_kernel(code) }
+
+    // Two contexts share this gate, and the difference is measured, not styled:
+    // the bring-up EL0 probe (`check_el0`) enters EL0 straight from the boot code
+    // *before* `sched::init`, so there is no current task; every real program
+    // runs after the scheduler started and has one. `dispatch` opens on a
+    // scheduler read (`current_is_seccomp_strict`), so before `sched::started()`
+    // there is nothing for it to answer from - routing the probe would panic.
+    // The probe is therefore served here inline: it answers `exit_group` (leaving
+    // is the one thing a refusal cannot express, and the check's program ends on
+    // it) and refuses every other number with `ENOSYS`. That is the same honest
+    // answer the shared table's `_ => ENOSYS` gives, so `M6_EL0_OK` still reads
+    // `-ENOSYS` back for its unassigned number.
+    if !crate::sched::started() {
+        if number == NR_EXIT_GROUP {
+            let code = frame.x[0];
+            // SAFETY: reached only from the EL0 vector, and only a machine that
+            // got here through `context::enter_user` can take a lower-EL trap at
+            // all.
+            unsafe { context::leave_for_kernel(code) }
+        }
+        frame.x[0] = crate::err::ENOSYS as u64;
+        return 0;
     }
 
+    // A running task: defer to the kernel's own syscall table - the one dispatch
+    // every machine shares. On aarch64 that answers the ported core handlers
+    // (`read`/`write`/`openat`/`close`/`getpid`/`brk`/`mmap`/`exit_group`/...) and
+    // every family this stage has not ported (signals, ptrace, sockets, device
+    // ioctls, `execve`'s return-frame patch) falls to `dispatch`'s `_ => ENOSYS`.
+    // The frame pointer travels because a few handlers take it, though the ones
+    // that would *read* it as a register frame are gated off aarch64 until the
+    // signal/ptrace stage lands; a handler reachable here never looks at it.
+    let args = [
+        frame.x[0] as usize,
+        frame.x[1] as usize,
+        frame.x[2] as usize,
+        frame.x[3] as usize,
+        frame.x[4] as usize,
+        frame.x[5] as usize,
+    ];
     // AArch64 returns a result in `x0` and an error as a negated errno, which is
     // already what the `err` crate's constants are - so this is the value
-    // `ENOSYS` names rather than a translation of it.
-    //
-    // This inline refusal is deliberate and measured, not the shortcut it looks
-    // like: routing every `svc` into `syscall::dispatch` panics the boot, because
-    // `dispatch` opens on a scheduler read (`current_is_seccomp_strict`) and this
-    // EL0 check runs *before* the scheduler has a current task to read. The table
-    // itself now compiles for this machine with its own syscall numbers; the gate
-    // starts calling into it once there is a task context to answer from - the
-    // next stage's job, and a check that runs as a task rather than on the boot
-    // stack.
-    frame.x[0] = crate::err::ENOSYS as u64;
+    // `dispatch` returned rather than a translation of it.
+    frame.x[0] =
+        crate::syscall::linux_dispatch(number, args, true, core::ptr::from_mut(frame).cast::<()>())
+            as u64;
     0
 }
 

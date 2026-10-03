@@ -212,7 +212,11 @@ pub mod sync;
 /// Host-compiled like `sched`, so the exclusion is the bare-metal aarch64 build
 /// and nothing else - the ABI facts and the errno mappings it carries are
 /// pinned by host tests.
-#[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
+#[cfg(any(
+    not(target_os = "none"),
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+))]
 pub mod syscall;
 /// The terminal emulator: the cell grid a byte stream is painted into, the
 /// cursor it moves, the blitter that turns cells into pixels and the keystroke
