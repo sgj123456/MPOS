@@ -2644,6 +2644,36 @@ pub fn grant_and_resent() {
     if !master_held() {
         return;
     }
+    // The console comes back in graphics mode before anything asks whether it
+    // is, and that is the whole fix for a card this one cannot drive away from
+    // its desktop.
+    //
+    // The measurement: seatd opens the console, writes `VT_SETMODE` and closes
+    // the descriptor - and it writes the mode with **`relsig` and `acqsig` both
+    // zero**, which is what a seat manager that watches the console itself
+    // rather than waiting to be told looks like. So the handover has no keeper
+    // to signal, `release_console` takes Linux's own `reset_vc` road, and the
+    // console lands back in `KD_TEXT`. That is Linux's answer too; what Linux
+    // does not do is let the word matter afterwards, because there a master
+    // drives the screen because it is the master. Here the *veto* the text
+    // console paints under is `master_holds_screen()`, and that asks `KD_GRAPHICS`
+    // as one of its three facts - so a handover nobody answered cost the
+    // compositor its screen for good: the text grid repainted over the desktop
+    // and every `MODE_ATOMIC` was answered `EACCES` (which is what a `^A` away
+    // and back showed, with `switch to=1 master_vc=Some(1) active=1 kd=0` in
+    // the log beside it).
+    //
+    // So the master's own console is a graphics console again the moment it is
+    // the one on the screen and a live master still holds the card. Nobody
+    // else's: a master that has let go (`master_held` above), one on another
+    // console, and one whose console is not the one being shown all leave the
+    // text console its screen, which is what `^A` away from a desktop is.
+    if let Some(vc) = crate::vfs::vcmux::master_vc()
+        && crate::term::vc::active() == vc
+        && crate::vfs::vcmux::kd_mode(vc) != crate::term::vc::KD_GRAPHICS
+    {
+        crate::vfs::vcmux::set_kd_mode(vc, crate::term::vc::KD_GRAPHICS);
+    }
     // Only when the master's console is genuinely back on the screen, in graphics
     // mode - otherwise there is nothing to hand back and the text console keeps it.
     if !crate::vfs::vcmux::master_holds_screen() {
