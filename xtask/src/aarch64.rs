@@ -92,8 +92,10 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// not a terminator and `M6_SERIAL_RX_FAILED` is. Stage 6E's init handoff
 /// runs *after* `check_el0` prints `M6_EL0_OK`, so `M6_INIT_OK` is now the last
 /// marker and `M6_EL0_OK` came **out** of the list - leaving it in would stop the
-/// poll on a machine that still has init to run.
-const TERMINATORS: [&str; 15] = [
+/// poll on a machine that still has init to run. Stage 7b's console-read check
+/// (`check_console_rx`) runs inside the handoff after the EL0 probe but before the
+/// init wait, so `M6_CONSOLE_RX_FAILED` is a terminator and `M6_CONSOLE_RX_OK` is not.
+const TERMINATORS: [&str; 16] = [
     "M6_INIT_OK",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
@@ -101,6 +103,7 @@ const TERMINATORS: [&str; 15] = [
     "M6_WALL_FAILED",
     "M6_CPU_FAILED",
     "M6_SERIAL_RX_FAILED",
+    "M6_CONSOLE_RX_FAILED",
     "M6_TLS_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
@@ -183,6 +186,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ("M6_SERIAL_RX_OK", "serial receive"),
         ("M6_TLS_OK", "thread pointer"),
         ("M6_EL0_OK", "EL0"),
+        ("M6_CONSOLE_RX_OK", "console receive path"),
         ("M6_INIT_OK", "init handoff / running program"),
     ];
     let missing: Vec<&str> = markers
@@ -195,7 +199,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
              M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
-             M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK and M6_INIT_OK, from the ESP under AAVMF"
+             M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK and M6_INIT_OK, from the ESP under AAVMF"
         );
         return Ok(());
     }

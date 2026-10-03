@@ -428,6 +428,25 @@ pub trait SerialRing {
     fn tx_stop_waiting();
 }
 
+/// A machine's polled console *input* - the typed-byte source the tty reads
+/// through. This is a capability, not part of [`Console`], because the two
+/// machines get input differently: x86_64's serial receiver is interrupt-driven
+/// and its handler drains the FIFO straight into `vfs::vcmux::route_input`, so
+/// x86_64 is *not* a `ConsoleInput` at all; AArch64's `virt` PL011 is polled
+/// (the GIC RX line is a later cut), so it implements this and the read path
+/// asks the machine for a byte when it wants one. A machine with no typed input
+/// of its own implements neither and its console has no reader.
+pub trait ConsoleInput {
+    /// Take one received byte, or `None` when the receiver holds nothing yet.
+    fn poll_input() -> Option<u8>;
+
+    /// Put one byte into the receiver through the machine's own loopback, with no
+    /// terminal, so the read path can be exercised at bring-up. A *self-test hook*
+    /// only - nothing at runtime calls it - which is why it lives on the input
+    /// capability rather than being invented above the machine layer.
+    fn inject_input(byte: u8);
+}
+
 /// A machine this kernel can run on. `Current` names the one being built.
 pub trait Platform:
     Clock + WallClock + Cpu + Interrupts + Paging + Contexts + Console + Sized + 'static
@@ -945,4 +964,21 @@ pub fn serial_tx_wait_now() {
 #[inline]
 pub fn serial_tx_stop_waiting() {
     <Current as SerialRing>::tx_stop_waiting()
+}
+
+/// Poll the console receiver for one typed byte (`None` when the FIFO is empty).
+/// AArch64's polled input path; x86_64 feeds input from the serial interrupt and
+/// so is not a `ConsoleInput`, hence this forward is gated to the one machine.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn console_poll_input() -> Option<u8> {
+    <Current as ConsoleInput>::poll_input()
+}
+
+/// Put one byte into the receiver through the UART's loopback, for the bring-up
+/// read-path self-test only.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn console_inject_input(byte: u8) {
+    <Current as ConsoleInput>::inject_input(byte)
 }

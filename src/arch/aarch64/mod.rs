@@ -2535,4 +2535,16 @@ impl crate::hal::Console for crate::hal::Current {
     }
 }
 
+impl crate::hal::ConsoleInput for crate::hal::Current {
+    #[inline]
+    fn poll_input() -> Option<u8> {
+        pl011::read_byte()
+    }
+
+    #[inline]
+    fn inject_input(byte: u8) {
+        pl011::inject_via_loopback(byte)
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}

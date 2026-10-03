@@ -5598,6 +5598,22 @@ into the tty/console read so a userspace `read(0)` returns typed bytes, then put
 is installable here and Alpine aarch64 packages are fetchable, so there is no environment
 wall, only stages left to walk.
 
+**Stage 7b is DONE: the receive path is wired through the tty, not just the UART.**
+`check_serial_rx` proved `pl011::read_byte` reads the FIFO inside `arch`; this cut moves
+the read up behind the designed seam. `hal` gains an optional `ConsoleInput` capability
+(`poll_input() -> Option<u8>`, `inject_input` for the bring-up hook), implemented for aarch64's
+`Current` over `pl011` and *not* for x86_64 (its serial receiver is interrupt-driven and hands
+bytes straight to the tty, so it has no polled input to expose - refuse-don't-fake, the
+capability is simply absent). `main/aarch64.rs` runs `check_console_rx`: inject a line through
+loopback, pull each byte back through `hal::console_poll_input`, hand it to
+`vfs::tty::global().receive_byte` (the step `vcmux::route_input` does on x86_64, which is
+x86-only here), and read it back through `tty.read` - proving a userspace-visible read of
+typed input end to end, printed as `M6_CONSOLE_RX_OK`. It also spawns the production input
+*pump* task (poll the wire, feed the tty, sleep when idle) that will carry a real shell's
+`read(fd 0)`. boot-aarch64 is now **fifteen** markers. What remains for an interactive shell:
+a `/init` that reads `fd 0` in a loop instead of exiting, and a static-musl `ash` in the
+initramfs.
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64

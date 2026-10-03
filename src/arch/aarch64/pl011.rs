@@ -164,6 +164,21 @@ pub fn loopback_echoes(probe: u8) -> bool {
     echoed == Some(probe)
 }
 
+/// Put `byte` into the receive FIFO using the UART's own loopback, without a
+/// terminal, so a later [`read_byte`] drains it.
+///
+/// The same `LBE` trick as [`loopback_echoes`], but the byte is left in the FIFO
+/// for the caller to read on the *next* pass rather than consumed here. This is
+/// how the tty receive path is pinned at boot: the console has no keyboard or
+/// wire byte to hand it in a headless run, but loopback can hand it one it will
+/// then read back through the real RX registers.
+pub fn inject_via_loopback(byte: u8) {
+    let cr = read(CR);
+    write(CR, cr | CR_LBE);
+    write_byte(byte);
+    write(CR, cr & !CR_LBE);
+}
+
 /// The `core::fmt` sink, so `write!` works against this UART.
 pub struct Writer;
 impl fmt::Write for Writer {

@@ -91,6 +91,35 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     vfs::file::init_standard(vfs::tty::init());
     let root = vfs::ramfs::RamFs::new();
     vfs::mount_root(&*root);
+
+    // Stage 7b: the polled console *input* path, pinned before anything reads it.
+    // The machine can now hand a typed byte through `hal::console_poll_input` (the
+    // PL011 RX FIFO); route it into the tty the way x86_64's serial interrupt does
+    // (`vcmux::route_input`) and read it back through the tty's own `read`. A
+    // headless boot has no terminal, so the UART's own loopback injects the byte.
+    // Doing this *before* the pump task is spawned means the self-test is the only
+    // reader, so the injected bytes cannot be stolen.
+    check_console_rx();
+
+    // The production input pump: poll the wire and hand any byte to the tty, so a
+    // shell reading `fd 0` gets typed input. Aarch64 has one console tty (no
+    // multi-VC mux yet - `vcmux` is x86_64-only), so this calls the tty's own
+    // `receive_byte` directly - the step `vcmux::route_input` performs for the
+    // active VC on x86_64. Polled at the tick rate for now; the GIC-routed RX
+    // interrupt that would let it park instead of poll is a later cut.
+    sched::spawn(
+        || loop {
+            match hal::console_poll_input() {
+                Some(byte) => vfs::tty::global().receive_byte(byte),
+                None => sched::sleep_ticks(1),
+            }
+        },
+        sched::Priority::NORMAL,
+    );
+
+    // A ramfs root, then the initramfs unpacked into it. With no archive this is a
+    // diskless boot: there is nothing to hand the machine to, so stop honestly
+    // rather than invent an init.
     let Some(archive) = archive else {
         mpos::println!("initramfs: none - nothing to hand off to");
         hal::halt()
@@ -123,9 +152,54 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     // the current `sp`, already set by the context switch's `mov sp`, so that step
     // is a no-op here (see `arch::aarch64::context::set_kernel_stack`). What still
     // keeps this from parking is not the switch but that a real shell needs an
-    // interactive serial RX (`drivers`, stage 7) and a `/init` that does not exit;
-    // until then halting after a completed one-shot init is the honest end state.
+    // interactive serial RX and a `/init` that does not exit. The RX read path and
+    // the input pump are wired now (stage 7b, see `check_console_rx` and the pump
+    // spawned above); what is left for a shell is a `/init` that reads `fd 0` in a
+    // loop instead of exiting. Until then halting after a completed one-shot init
+    // is the honest end state.
     hal::halt()
+}
+
+/// Stage 7b's evidence: the polled console input reaches a reader through the
+/// `hal::ConsoleInput` capability, not just the raw UART.
+///
+/// `check_serial_rx` in `arch` already proved `pl011::read_byte` reads the FIFO
+/// (loopback). What this proves is the seam *above* the machine layer: a byte put
+/// in the receiver by [`hal::console_inject_input`] comes back out of
+/// [`hal::console_poll_input`] and, handed to the tty, is readable through the
+/// tty's own `read` - the exact moves the pump makes at runtime, driven here by
+/// loopback so a headless boot can exercise it. Runs before the pump task is
+/// spawned, so the poll here is the only consumer of the injected bytes.
+fn check_console_rx() {
+    // Feed a line: a probe byte and a newline, each injected into the receiver and
+    // pulled back out through the capability forward - the exact moves the pump
+    // makes at runtime, driven here by loopback so a headless boot can exercise it.
+    let mut typed = [0u8; 2];
+    typed.copy_from_slice(b"Z\n");
+    let tty = vfs::tty::global();
+    for &byte in &typed {
+        hal::console_inject_input(byte);
+        match hal::console_poll_input() {
+            Some(got) if got == byte => tty.receive_byte(got),
+            other => {
+                mpos::println!(
+                    "M6_CONSOLE_RX_FAILED: poll after inject gave {other:?}, not {byte:#04x}"
+                );
+                hal::halt()
+            }
+        }
+    }
+
+    // Read it back through the tty the way a shell would read `fd 0`. A canonical
+    // tty returns a whole line once the newline has landed.
+    let mut line = [0u8; 8];
+    match tty.read(&mut line) {
+        Ok(n) if &line[..n] == b"Z\n" => mpos::println!("M6_CONSOLE_RX_OK"),
+        other => {
+            mpos::println!("M6_CONSOLE_RX_FAILED: tty read gave {other:?}, expected \"Z\\n\"");
+            hal::halt()
+        }
+    }
 }
 
 /// Stage 4b's evidence: `crate::console` - un-gated for this machine one stage ago -
