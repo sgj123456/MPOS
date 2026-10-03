@@ -1635,7 +1635,7 @@ impl Table {
         // FS.base is one register for the whole CPU, so every task that wants
         // its own thread-local storage has to reinstall it here. A process with
         // none gets a cleared base, which is the state a fresh image starts in.
-        unsafe { write_msr(MSR_FS_BASE, task.tls as u64) };
+        hal::set_thread_pointer(task.tls);
     }
 
     /// Put the running task at the back of its own band. This is a yield, and it
@@ -6885,24 +6885,7 @@ pub fn set_current_tls(base: usize) {
     // Stored per task as well, because `prepare` reinstalls it on every
     // dispatch: a bare register write here would survive only until the next
     // switch.
-    unsafe { write_msr(MSR_FS_BASE, base as u64) };
-}
-
-/// `IA32_FS_BASE`: where ring 3's `%fs:` segment starts.
-const MSR_FS_BASE: u32 = 0xC000_0100;
-
-/// Write one model-specific register. The two halves go in separately because
-/// `wrmsr` takes them in `eax` and `edx`.
-unsafe fn write_msr(msr: u32, value: u64) {
-    unsafe {
-        core::arch::asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") value as u32,
-            in("edx") (value >> 32) as u32,
-            options(nostack, preserves_flags),
-        );
-    }
+    hal::set_thread_pointer(base);
 }
 
 /// How many tasks are alive, counting the two permanent ones. [`PERMANENT_TASKS`]
@@ -7586,7 +7569,7 @@ pub fn exec_replace(
         task.user_resume = None;
         task.child_tid = 0;
         task.tls = 0;
-        unsafe { write_msr(MSR_FS_BASE, 0) };
+        hal::set_thread_pointer(0);
         // And a fresh image starts with the floating-point registers reset, for
         // the reason POSIX says so and Linux does the same: the discarded image
         // must not be readable out of them, and its rounding mode must not leak

@@ -17,8 +17,9 @@
 //!
 //! The verdict is read out of the serial log, the way `cargo xtask test` reads
 //! its own: the guest prints `M4_DEVICES_OK`, `M3_TABLES_OK`, `M5_VIRTIO_OK`,
-//! `M1_TIMER_OK` and `M2_CONTEXT_OK` when it is happy, and the run stops as soon
-//! as one of those - or a failure line - appears. Nothing here claims a green
+//! `M1_TIMER_OK`, `M2_CONTEXT_OK` and the `M6_*_OK` family (address space, paging,
+//! wall clock, cpu, thread pointer, EL0) when it is happy, and the run stops as
+//! soon as one of those - or a failure line - appears. Nothing here claims a green
 //! the log does not contain.
 
 use std::fs;
@@ -84,14 +85,17 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// ended the list with still runs after it - so `M6_AS_OK` is deliberately *not*
 /// here and `M6_AS_FAILED` is. Stage 6c sits between 6b and 6a's EL0 check for the
 /// same reason: `M6_PAGING_OK` is not a terminator and `M6_PAGING_FAILED` is, and so
-/// are stages 6d and 6e (`M6_WALL_FAILED`, `M6_CPU_FAILED`).
-const TERMINATORS: [&str; 13] = [
+/// are stages 6d and 6e (`M6_WALL_FAILED`, `M6_CPU_FAILED`). Stage 6h's thread-
+/// pointer check lands between 6e's `check_cpu` and 6a's `check_el0`, so
+/// `M6_TLS_OK` is not a terminator and `M6_TLS_FAILED` is.
+const TERMINATORS: [&str; 14] = [
     "M6_EL0_OK",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
     "M6_PAGING_FAILED",
     "M6_WALL_FAILED",
     "M6_CPU_FAILED",
+    "M6_TLS_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
@@ -150,8 +154,10 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // range touchable, is a page copy-on-write, write a word through a root -
     // `M6_WALL_OK` says the machine has a persistent clock this kernel can reach
     // through the device window, `M6_CPU_OK` says user SIMD is turned on and a
-    // line can be masked and an interrupt waited on, and `M6_EL0_OK` says the
-    // kernel ran a program at EL0 and answered the call it made.
+    // line can be masked and an interrupt waited on, `M6_TLS_OK` says the
+    // scheduler's thread-pointer write reaches `TPIDR_EL0` and reads back through
+    // the `hal::Cpu` capability, and `M6_EL0_OK` says the kernel ran a program at
+    // EL0 and answered the call it made.
     let markers = [
         ("M4_CONSOLE_OK", "console service"),
         ("M4_DEVICES_OK", "devices"),
@@ -163,6 +169,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ("M6_PAGING_OK", "running-process paging"),
         ("M6_WALL_OK", "wall clock"),
         ("M6_CPU_OK", "cpu and interrupt primitives"),
+        ("M6_TLS_OK", "thread pointer"),
         ("M6_EL0_OK", "EL0"),
     ];
     let missing: Vec<&str> = markers
@@ -174,8 +181,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!();
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
-             M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK \
-             and M6_EL0_OK, from the ESP under AAVMF"
+             M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
+             M6_TLS_OK and M6_EL0_OK, from the ESP under AAVMF"
         );
         return Ok(());
     }

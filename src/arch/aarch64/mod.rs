@@ -208,6 +208,7 @@ pub unsafe fn boot(handoff: *const Handoff, milestone: fn()) -> ! {
     check_paging_ops();
     check_wallclock();
     check_cpu();
+    check_tls();
     check_el0();
     halt()
 }
@@ -1919,6 +1920,58 @@ fn check_cpu() {
     let _ = writeln!(out, "M6_CPU_OK");
 }
 
+/// Stage 6h's evidence: the scheduler's thread-pointer write reaches the
+/// machine's register and comes back, exercised through the `hal::Cpu` capability
+/// rather than a raw `msr`.
+///
+/// The register is `TPIDR_EL0`, the base an EL0 program's TLS relocations add
+/// to: x86_64's `%fs` base. `sched` used to write it with a local `wrmsr`. That
+/// made the module name an x86 machine register, which blocked the aarch64
+/// un-gate. The capability that replaces it has to be proven to move the
+/// register, or the un-gate would rest on a `set_thread_pointer` that silently
+/// did nothing.
+///
+/// The proof is the read-back, not the write. A sentinel goes in through
+/// `hal::set_thread_pointer` and `hal::thread_pointer` must hand the same value
+/// out. This runs before [`check_el0`] enters EL0, so a failure is a terminator
+/// (`halt`) and the success marker is not one, the discipline the other stage
+/// checks keep. The register is restored to zero afterward so the sentinel does
+/// not leak into the EL0 program, which starts with no thread pointer.
+fn check_tls() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M6_TLS_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    // A value that is not a plausible real pointer, so a stuck-at-zero or
+    // stuck-at-garbage register cannot accidentally match it.
+    const SENTINEL: usize = 0xdead_beef_0000_1234;
+    crate::hal::set_thread_pointer(SENTINEL);
+    let got = crate::hal::thread_pointer();
+    if got != SENTINEL {
+        fail!("set_thread_pointer({SENTINEL:#x}) then thread_pointer() read {got:#x}");
+    }
+
+    // Clear it back: a fresh EL0 image starts with no thread pointer, and this
+    // check must not hand the next stage a sentinel it never asked for.
+    crate::hal::set_thread_pointer(0);
+    if crate::hal::thread_pointer() != 0 {
+        fail!("clearing the thread pointer did not take - a stale base would follow into EL0");
+    }
+
+    let _ = writeln!(
+        out,
+        "tls: set_thread_pointer({SENTINEL:#x}) read back through thread_pointer(); \
+         cleared to 0"
+    );
+    let _ = writeln!(out, "M6_TLS_OK");
+}
+
 /// Bring the machine's interrupts up: the vector table, then the controller,
 /// then the clock.
 ///
@@ -2213,6 +2266,16 @@ impl crate::hal::Cpu for crate::hal::Current {
     #[inline]
     fn init_interrupts() {
         init_interrupts()
+    }
+
+    #[inline]
+    fn set_thread_pointer(base: usize) {
+        vectors::set_thread_pointer(base)
+    }
+
+    #[inline]
+    fn thread_pointer() -> usize {
+        vectors::thread_pointer()
     }
 }
 

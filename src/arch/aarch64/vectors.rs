@@ -441,3 +441,27 @@ pub fn enable_user_simd() {
         );
     }
 }
+
+/// `TPIDR_EL0`, read fresh - the thread pointer an EL0 program's TLS accesses
+/// resolve against, the aarch64 counterpart of x86_64's `%fs` base.
+pub fn thread_pointer() -> usize {
+    let value: usize;
+    // SAFETY: `TPIDR_EL0` is readable at EL1 with no side effects; it is the
+    // register `check_cpu`'s successor writes a sentinel into and reads back.
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) value, options(nomem, nostack));
+    }
+    value
+}
+
+/// Point the core's thread pointer at `base`, giving EL0 the base its TLS
+/// relocations add to. x86_64's twin writes `IA32_FS_BASE`; the register name is
+/// the machine's, which is why it reaches the scheduler as `hal::set_thread_pointer`
+/// rather than as a raw `msr` in `sched`.
+pub fn set_thread_pointer(base: usize) {
+    // SAFETY: a plain system-register write at EL1; `TPIDR_EL0` has no
+    // architectural side effect beyond becoming the value an `mrs` reads back.
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {base}", base = in(reg) base, options(nomem, nostack));
+    }
+}

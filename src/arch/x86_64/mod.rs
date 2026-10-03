@@ -172,6 +172,39 @@ impl crate::hal::Cpu for crate::hal::Current {
     fn init_interrupts() {
         init_interrupts()
     }
+
+    #[inline]
+    fn set_thread_pointer(base: usize) {
+        // `IA32_FS_BASE` (0xC000_0100): the base `%fs`-relative accesses resolve
+        // against. The two halves go in separately because `wrmsr` reads them from
+        // `eax`/`edx`; this is the same register the scheduler reinstalled on every
+        // dispatch, moved out of `sched` because the register name is the machine's.
+        unsafe {
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") 0xC000_0100u32,
+                in("eax") base as u32,
+                in("edx") (base >> 32) as u32,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline]
+    fn thread_pointer() -> usize {
+        let lo: u32;
+        let hi: u32;
+        unsafe {
+            core::arch::asm!(
+                "rdmsr",
+                in("ecx") 0xC000_0100u32,
+                out("eax") lo,
+                out("edx") hi,
+                options(nostack, preserves_flags),
+            );
+        }
+        ((hi as u64) << 32 | lo as u64) as usize
+    }
 }
 
 impl crate::hal::Interrupts for crate::hal::Current {

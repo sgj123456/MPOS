@@ -117,6 +117,21 @@ pub trait Cpu {
 
     /// Bring up interrupts: descriptors, the interrupt controller, the clock.
     fn init_interrupts();
+
+    /// Point this core's thread pointer at `base`. The register a `TPIDR_EL0` /
+    /// `%fs`-relative access resolves against, so it is one per core and every
+    /// task that owns thread-local storage must have the scheduler reinstall it
+    /// on dispatch - which is why it is a machine capability rather than a field
+    /// in the task table: x86_64 writes `IA32_FS_BASE`, aarch64 writes
+    /// `TPIDR_EL0`, and the register name is the machine's to know.
+    fn set_thread_pointer(base: usize);
+
+    /// The value [`set_thread_pointer`](Cpu::set_thread_pointer) last installed
+    /// on this core. A read-back only - the boot check writes a sentinel and
+    /// proves the register took it - so a port that cannot read its thread
+    /// register may return the value it most recently wrote rather than the live
+    /// register, but must never claim a write the hardware dropped.
+    fn thread_pointer() -> usize;
 }
 
 /// An interrupt line this kernel masks and unmasks by name.
@@ -638,6 +653,19 @@ pub fn enable_user_simd() {
 #[inline]
 pub fn init_interrupts() {
     <Current as Cpu>::init_interrupts()
+}
+
+/// Point this core's thread pointer at `base` (see [`Cpu::set_thread_pointer`]).
+/// The scheduler's per-dispatch reinstall and `set_tls`-style syscalls call this.
+#[inline]
+pub fn set_thread_pointer(base: usize) {
+    <Current as Cpu>::set_thread_pointer(base)
+}
+
+/// The thread pointer this core is running with (see [`Cpu::thread_pointer`]).
+#[inline]
+pub fn thread_pointer() -> usize {
+    <Current as Cpu>::thread_pointer()
 }
 
 /// Allow delivery on `line`.
