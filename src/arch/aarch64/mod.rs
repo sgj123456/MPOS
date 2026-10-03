@@ -17,6 +17,7 @@
 //! by trait as its stages land - which is also why `hal` itself is still
 //! x86_64-only (`src/lib.rs`'s ledger).
 
+pub(crate) mod context;
 pub(crate) mod critical;
 pub(crate) mod gic;
 pub(crate) mod paging;
@@ -155,7 +156,40 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
     let frames = unsafe { paging::install(&info, &sections) };
     check_paging(&info, &sections, frames);
     check_timer();
+    check_context();
     halt()
+}
+
+/// Stage 2's evidence: two kernel tasks alternate, and each one's registers are
+/// its own when it comes back.
+///
+/// It runs last, with the clock already ticking, and that is deliberate rather
+/// than convenient: a context switch is the one operation that has to be correct
+/// when it is interrupted halfway through by the very machinery it is part of.
+/// The letters [`context::boot_check`] prints alternate `ABABAB`, so a switch
+/// that returned immediately is visible in the log rather than merely
+/// survivable; the count it answers is registers that did not come back.
+fn check_context() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    let _ = writeln!(out, "\ncontexts: two kernel tasks alternating");
+    match context::boot_check() {
+        Ok(hand_overs) => {
+            let _ = writeln!(
+                out,
+                "M2_CONTEXT_OK: {hand_overs} hand-overs, both directions, every \
+                 callee-saved register and v31 back where its task left it",
+            );
+        }
+        Err(bad) => {
+            let _ = writeln!(
+                out,
+                "M2_CONTEXT_FAILED: {bad} registers did not survive a hand-over"
+            );
+            halt();
+        }
+    }
 }
 
 /// Stage 1f's evidence: the machine is running on the kernel's own tables, and

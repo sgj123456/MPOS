@@ -664,10 +664,10 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stages 1a-1f landed: the machine boots a real
-ESP image under AAVMF and builds its own page tables from `kernel_mappings`
-(§9.1); next is stage 2, contexts and user entry)**
-- [ ] 9.1 aarch64 complete boot (stages 2-8 remain) · [ ] 9.2 RISC-V support
+**Architectures (Phase 9 — aarch64 stages 1a-1f and 2 landed: the machine boots a
+real ESP image under AAVMF, builds its own page tables from `kernel_mappings`,
+and switches between kernel tasks (§9.1); next is stage 3, un-gating `sched`)**
+- [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
@@ -5172,8 +5172,9 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1f landed: the machine boots the way the x86_64 one
-does, and the kernel owns its own address space.** `cargo xtask boot-aarch64`
+Current status: **stages 1a-1f and 2 landed: the machine boots the way the
+x86_64 one does, the kernel owns its own address space, and two kernel tasks can
+suspend and resume each other.** `cargo xtask boot-aarch64`
 builds the kernel (`aarch64-unknown-none`), the loader
 (`aarch64-unknown-uefi`), lays out an ESP with `EFI/BOOT/BOOTAA64.EFI` and boots
 it under AAVMF; the loader reads `mpos.elf` off the volume, applies its
@@ -5226,6 +5227,17 @@ not.
 So the order below is the measured one. Each stage is its own commit and is
 verified by the means named; none of them claims a green from compilation alone.
 
+**Why stage 2's user-entry half is at stage 6.** The table used to put
+`UserFrame` (`x0..x30`/`pc`/`pstate`) and the `eret` that enters EL0 in stage 2
+with the kernel switch. They moved, and the reason is not tidiness: every field
+of that struct gets its order and its meaning from `user_regs_struct`, which is
+x86_64-only until stage 6, so a frame written at stage 2 would be a struct
+nothing could check against anything - and its `eret` sequence has no user
+address space to enter until stage 6 builds one. Writing them early would have
+produced exactly the shape this port refuses: code that looks finished and has
+never been run. What stage 2 keeps is the half that *is* checkable at this stage,
+and it is checked - the boot prints `M2_CONTEXT_OK`.
+
 | # | Stage | Verified by |
 |---|---|---|
 | 1a | Build plumbing: `rust-toolchain.toml` targets, `src/arch/aarch64/linker.ld`, `[target.aarch64-unknown-none]`, the gate list and the stage ledger | **landed**: `cargo build --target aarch64-unknown-none` links; the x86 gate stayed green |
@@ -5234,11 +5246,12 @@ verified by the means named; none of them claims a green from compilation alone.
 | 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | **landed**: `page tables: 12 frames (48 KiB)`, `M3_TABLES_OK` (image `r-x`/`r--`/`rw-` at both its addresses, direct map written and read back, null page absent), and the clock still counts to 25 with the MMU on |
 | 1e | The aarch64 loader: `boot/src/vm/aarch64.rs` (the descriptor format, `MAIR`/`TCR`/`SCTLR`), `boot/src/main.rs`'s aarch64 `enter` and PL011, `boot/src/elf.rs` learns `EM_AARCH64`/`R_AARCH64_RELATIVE`, the kernel relinked as a higher-half PIE, `src/arch/aarch64/paging.rs` becomes a reader of the loader's tables, `cargo xtask boot-aarch64` | **landed**: AAVMF boots the real ESP image, the kernel reaches the higher half and prints `M3_TABLES_OK` (the loader's `TTBR0`/`TTBR1`, the image's W^X, the direct map written and read back, the PL011 device) and `M1_TIMER_OK: 25 interrupts in 100 ms`; the `-kernel` instrument is deleted |
 | 1f | The kernel's own tables: `src/arch/aarch64/paging.rs` regains a builder, built from `mm::vm::kernel_mappings(info, sections)` out of frames from `mm::alloc_frames`; `mm::init` runs on aarch64; the boot switches `TTBR0_EL1`/`TTBR1_EL1` onto it | **landed**: `pmm: 5 zones, 49209 frames`, `page tables: 166 frames (664 KiB)`, `plan: 7 mappings, all 63616 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)`, `no identity map: 0x44bcf000 is unreachable, only the device window lives low`, then `M3_TABLES_OK` and `M1_TIMER_OK` |
-| 2 | Contexts and user entry: `x19..x28`/`fp`/`lr`/`sp`, `q0..q31`, `eret` | a boot-time switch between two kernel tasks |
+| 2 | Kernel contexts: `src/arch/aarch64/context.rs` - `Context` with the callee-saved `x19..x28`/`fp`/`lr` on the task's own stack, `FpuState` (`q0..q31`, `FPCR`, `FPSR`), `bootstrap` and its trampoline, `switch` | **landed**: `M2_CONTEXT_OK: 13 hand-overs, both directions, every callee-saved register and v31 back where its task left it`, and the letters above it alternate `ABABAB` |
+| 2b | *Not a stage* - the **user** frame (`x0..x30`/`pc`/`pstate`) and its `eret` entry moved to stage 6, where the ABI that gives those fields their order and their meaning is. See the note below the table | - |
 | 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --target aarch64-unknown-none` with `sched` in |
 | 4 | Un-gate `console` and `vfs` (serial-only console first) | a ramfs root with the initramfs untarred |
 | 5 | Drivers: DTB parsing, virtio-MMIO, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up |
-| 6 | The aarch64 Linux ABI: `nr.rs` per arch, the `x0..x30` register file, signal frames, `svc #0`, `TPIDR_EL0` TLS | the `t-*` conformance programs run on aarch64 |
+| 6 | The aarch64 Linux ABI: `nr.rs` per arch, the `x0..x30` register file **and the user frame with its `eret` entry** (moved here from stage 2), signal frames, `svc #0`, `TPIDR_EL0` TLS, `PTRACE_GETFPREGS`'s view of `FpuState` | the `t-*` conformance programs run on aarch64 |
 | 7 | aarch64 userspace and the image: `aarch64-unknown-linux-musl` builds, ESP layout for AAVMF, arch-aware `xtask` | `cargo xtask test` passes on aarch64 |
 | 8 | The gate: `xtask test`/`run` grow an arch selection | a green aarch64 gate quoted with its summary line and exit code |
 
@@ -5324,13 +5337,15 @@ Named gaps the port carries rather than hides, each with its home:
   and simply had no aarch64 caller until 1f gave it one.
 - **`hal` is x86_64-only until its traits exist on aarch64.** The forwards at
   the bottom of `hal/mod.rs` name all six concern traits, so the module cannot
-  compile for a machine that implements fewer. Two of `Paging`'s fifteen methods
-  exist here now (`install`, `translate`), and what is missing is not the
-  table-building part: it is `AddressSpaceOps` and everything that needs a
-  *user* address space - `active_root`, `switch_to_root`, `user_accessible`,
-  `is_cow_page`, `write_user_u32` - which arrive with stages 2 and 6. `Contexts`
-  arrives with stage 2, and `Cpu`/`Interrupts` are what `vectors.rs`/`gic.rs`/
-  `timer.rs` are written over. The gate goes with the last of the six.
+  compile for a machine that implements fewer. As it stands: `Clock` is
+  `timer.rs`, `Cpu`/`Interrupts` are what `vectors.rs`/`gic.rs`/`timer.rs` are
+  written over, `Contexts` is `context.rs` (minus the FPU-ownership methods,
+  which exist only for a lazy scheme this machine does not have), and `Paging`
+  has its table-building half. What is missing is the *user* half of both:
+  `AddressSpaceOps` and the `Paging` methods that need a process -
+  `active_root`, `switch_to_root`, `user_accessible`, `is_cow_page`,
+  `write_user_u32` - plus `WallClock`, which is a PL031 this machine has not
+  written a driver for. The gate goes with the last of the six.
 - **No ACPI consumer exists to reuse.** `virt` + AAVMF passes a *device tree*,
   so device discovery is new DTB-parsing code in stage 5, not a port of an
   existing table walk.

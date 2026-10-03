@@ -48,7 +48,7 @@
 //!     `all(target_os = "none", target_arch = "x86_64")`. `console` and
 //!     `drivers` (stage 5), `hal` (its trait impls land with 1c's
 //!     `Interrupts`/`Cpu`, stage 2's `Contexts`, and `Paging`'s user-address-
-//!     space half at 2 and 6 - 1f supplied the table-building half) and `net`
+//!     space half at stage 6 - 1f supplied the table-building half) and `net`
 //!     (stage 6) are these.
 //!   - *host-compiled modules* - `sched` (3), `vfs` (4), `syscall` (6) and
 //!     `uaccess` (6) - keep the host and x86_64 bare metal and exclude only the
@@ -118,8 +118,8 @@ pub use mpos_err as err;
 /// compiled for a machine that implements all six. The aarch64 impls land with
 /// their stages - `Cpu`/`Interrupts` at 1c, `Contexts` at 2, and `Paging` split:
 /// 1f gave it the table-building half (`install`, `translate`), and what is left
-/// is everything that needs a *user* address space, which stages 2 and 6 bring -
-/// and this gate goes when the last of them does.
+/// is everything that needs a *user* address space, which stage 6 brings - and
+/// this gate goes when the last of them does.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod hal;
 /// evdev's record window and its clients: which reader sees which event, and

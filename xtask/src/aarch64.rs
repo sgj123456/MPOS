@@ -56,12 +56,22 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// Lines that mean the machine has finished saying something. The poll below
 /// stops on the first of them, which is what keeps a run from waiting out the
 /// whole deadline on a machine that has already reported.
-const TERMINATORS: [&str; 5] = [
-    "M1_TIMER_OK",
+///
+/// The list is the *last* thing each check says, and keeping it in step with the
+/// kernel's boot order is load-bearing rather than tidiness: this used to end at
+/// `M1_TIMER_OK`, which stage 2's checks now come *after* - so the machine was
+/// killed mid-check and the log ended in the middle of a line, which reads
+/// exactly like a hang. A failure line is a terminator for the same reason:
+/// `EXCEPTION:` is the kernel's own fault dump, and waiting out the deadline for
+/// a marker that will never come is time spent pretending a stopped machine
+/// might still be working.
+const TERMINATORS: [&str; 6] = [
+    "M2_CONTEXT_OK",
+    "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
+    "EXCEPTION:",
     "KERNEL PANIC",
-    "aarch64: entered at EL",
 ];
 
 /// Where the ESP this command assembles lives. Under `build/`, so it is thrown
@@ -95,22 +105,33 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     let log = boot(build_dir, &esp)?;
     print!("{log}");
 
-    // Both markers, in the order the kernel prints them: `M3_TABLES_OK` says the
-    // loader's page tables say what the plan says, and `M1_TIMER_OK` says the
-    // clock still reaches the vector table through them - which is a statement
-    // about the device window as well, because the GIC is reached through it.
-    let tables = log.contains("M3_TABLES_OK");
-    let timer = log.contains("M1_TIMER_OK");
-    if tables && timer {
+    // Every marker the kernel prints, in the order it prints them: `M3_TABLES_OK`
+    // says the kernel's own page tables say what the plan says, `M1_TIMER_OK`
+    // says the clock still reaches the vector table through them - a statement
+    // about the device window too, because the GIC is reached through it - and
+    // `M2_CONTEXT_OK` says two tasks can suspend and resume each other.
+    let markers = [
+        ("M3_TABLES_OK", "page tables"),
+        ("M1_TIMER_OK", "timer"),
+        ("M2_CONTEXT_OK", "contexts"),
+    ];
+    let missing: Vec<&str> = markers
+        .iter()
+        .filter(|(marker, _)| !log.contains(marker))
+        .map(|(_, what)| *what)
+        .collect();
+    if missing.is_empty() {
         println!();
-        println!("aarch64 boot: M3_TABLES_OK and M1_TIMER_OK, from the ESP under AAVMF");
+        println!(
+            "aarch64 boot: M3_TABLES_OK, M1_TIMER_OK and M2_CONTEXT_OK, from the ESP \
+             under AAVMF"
+        );
         return Ok(());
     }
     bail!(
-        "the aarch64 boot did not reach both markers (page tables {}, timer {}); \
+        "the aarch64 boot did not reach every marker; nothing printed for: {}; \
          the log above and {} say where it stopped",
-        if tables { "ok" } else { "no" },
-        if timer { "ok" } else { "no" },
+        missing.join(", "),
         log_path(build_dir).display()
     )
 }
