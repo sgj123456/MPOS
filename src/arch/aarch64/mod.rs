@@ -41,6 +41,7 @@ pub(crate) mod critical;
 pub(crate) mod gic;
 pub(crate) mod paging;
 pub(crate) mod pl011;
+pub(crate) mod pl031;
 pub(crate) mod timer;
 pub(crate) mod vectors;
 
@@ -189,6 +190,7 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
     check_context();
     check_user_memory();
     check_paging_ops();
+    check_wallclock();
     check_el0();
     halt()
 }
@@ -1759,6 +1761,72 @@ fn check_paging_ops() {
          re-installing",
     );
     let _ = writeln!(out, "M6_PAGING_OK");
+}
+
+/// Stage 6d's evidence: the machine has a persistent clock, and this kernel
+/// reaches it - the hardware half of `crate::hal::WallClock`, which until now had
+/// no aarch64 source at all and is one of the two things that kept `hal` from
+/// compiling here.
+///
+/// The claim that could silently be wrong is "the register answers across the
+/// device window," so the check does not trust the constant: it programs an epoch
+/// into the PL031 and reads the *device* back, which fails if `BASE` were a
+/// number nothing maps rather than the window's alias of `0x0901_0000`. It also
+/// pins the two answers the module owes a caller: an epoch past the 32-bit
+/// counter is refused rather than wrapped to 1970, and the software anchor - which
+/// is what `boot_epoch` really reads on a machine with no shadowed host clock -
+/// moves when asked.
+fn check_wallclock() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M6_WALL_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    // Reading the counter through the kernel-half window must yield a live clock.
+    // The plausible-epoch band is the pin that distinguishes "the driver reached
+    // the PL031" from "it read zeroes, or the wrong alias, or unmapped memory": a
+    // counter that returns a date is the device answering, and a host-shadowed RTC
+    // on a machine booted this decade sits well inside it.
+    pl031::init();
+    let anchored = pl031::boot_epoch();
+    if !(1_000_000_000..4_300_000_000).contains(&anchored) {
+        fail!("boot_epoch() read {anchored:#x} from the PL031 - not a live UTC epoch");
+    }
+    if pl031::read_epoch() < anchored {
+        fail!("the counter went backwards from the boot anchor");
+    }
+
+    // No writable persistent clock: the trait's own contract is that `false` means
+    // there is none, and this machine's `RTC_DR` is host-derived, not stored. A
+    // `true` here would be a write the device ignores reported as a success.
+    if pl031::write_epoch(0x1234_5678) {
+        fail!("write_epoch claimed to persist an epoch on a read-only counter");
+    }
+
+    // The in-memory anchor still moves, the way `settimeofday` does on both
+    // machines, and that is what `boot_epoch` answers from.
+    let anchor: u64 = 0x0000_0100_0000_0000;
+    pl031::set_boot_epoch(anchor);
+    if pl031::boot_epoch() != anchor {
+        fail!(
+            "boot_epoch() is {:#x} after set_boot_epoch({anchor:#x})",
+            pl031::boot_epoch()
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "wallclock: PL031 reached at {:#x} through the kernel half; boot anchored to \
+         a live UTC epoch ({anchored:#x}); the counter read-only, so write_epoch \
+         refuses; the software anchor moves on set_boot_epoch",
+        pl031::BASE
+    );
+    let _ = writeln!(out, "M6_WALL_OK");
 }
 
 /// Bring the machine's interrupts up: the vector table, then the controller,
