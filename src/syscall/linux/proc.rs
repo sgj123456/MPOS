@@ -40,6 +40,7 @@ pub(super) use crate::syscall::MMAP_BASE;
 /// call sites is running - reads the value the kernel recorded rather than a
 /// guess.
 #[cfg(target_os = "none")]
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn user_ip(regs_ptr: *mut ()) -> u64 {
     let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
     frame.rcx as u64
@@ -132,6 +133,7 @@ fn get_word(bytes: &[u8], at: usize) -> usize {
 /// Returns `false` when the frame cannot be written - the stack is not mapped,
 /// or not writable - which leaves the caller to take the default action rather
 /// than to lose the signal.
+#[cfg(not(target_arch = "aarch64"))]
 fn build_frame(
     regs_ptr: *mut (),
     sig: u8,
@@ -285,6 +287,7 @@ fn build_frame(
 /// 400 ms: the handler runs at 100 ms, the *read* returns the byte at 400 ms,
 /// and `EINTR` never appears. Without the flag the same call answers
 /// `-1/EINTR` at 100 ms.
+#[cfg(not(target_arch = "aarch64"))]
 fn restart_verdict(
     nr: u64,
     request: u32,
@@ -315,6 +318,7 @@ fn restart_verdict(
 /// Returns `true` when a handler was entered, so the caller can report a
 /// reassuring zero to the interrupted call instead of its own return value -
 /// which is now the handler's to see when it returns.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     if regs_ptr.is_null() {
         return false;
@@ -386,6 +390,7 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
 /// The libc's `__restore_rt` is entered by the handler's `ret`, so `rsp` has
 /// already moved past the restorer word; the frame therefore starts eight
 /// bytes below where this call finds the stack pointer.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_rt_sigreturn(regs_ptr: *mut ()) -> isize {
     use crate::sched::signal::{SIGFRAME_UCONTEXT, UCONTEXT_MCONTEXT, UCONTEXT_SIGMASK};
 
@@ -658,6 +663,7 @@ fn finish_wait(id: TaskId, code: isize, status: usize, from_user: bool) -> isize
 /// holds the call's number, and at an exit it holds that *same* number, because
 /// the gate writes the result into the slot only after the dispatch has
 /// returned. The caller is the only one that knows which value belongs there.
+#[cfg(not(target_arch = "aarch64"))]
 fn capture_frame(regs_ptr: *mut (), rax: usize) -> [u64; abi::uregs::COUNT] {
     use abi::uregs::*;
 
@@ -713,6 +719,7 @@ fn capture_frame(regs_ptr: *mut (), rax: usize) -> [u64; abi::uregs::COUNT] {
 /// after this function's caller returns, so the only way a tracer's
 /// `PTRACE_SETREGS` can change what the tracee sees in `rax` is for the new
 /// value to *be* the result.
+#[cfg(not(target_arch = "aarch64"))]
 fn apply_frame(regs_ptr: *mut (), regs: &[u64; abi::uregs::COUNT]) -> usize {
     use abi::uregs::*;
 
@@ -745,6 +752,7 @@ fn apply_frame(regs_ptr: *mut (), regs: &[u64; abi::uregs::COUNT]) -> usize {
 /// the point of the exercise: a tracer that rewrote `rdi` at the stop meant to
 /// change the call, and a kernel that then made the call with the old value
 /// would be ignoring it.
+#[cfg(not(target_arch = "aarch64"))]
 pub(crate) fn syscall_entry_stop(
     regs_ptr: *mut (),
     nr: u64,
@@ -770,6 +778,7 @@ pub(crate) fn syscall_entry_stop(
 /// The tracee's half of a syscall-exit stop. The result goes in and comes back,
 /// possibly rewritten: at this stop `rax` *is* the result, and a tracer that
 /// changed it changed what the tracee sees.
+#[cfg(not(target_arch = "aarch64"))]
 pub(crate) fn syscall_exit_stop(
     regs_ptr: *mut (),
     nr: u64,
@@ -816,6 +825,7 @@ fn read_iovec(at: usize) -> Option<(usize, usize)> {
 /// on every syscall boundary and every signal in the tracee's life arrives here
 /// as a `wait(2)` event.
 #[allow(clippy::too_many_lines)]
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (request, pid, addr, data) = (args[0], args[1] as isize, args[2], args[3]);
     let me = crate::sched::current();
@@ -1229,6 +1239,7 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// argument vector. The pair of iovec arrays are in the *caller's* memory and
 /// the iovecs themselves name the two address spaces - local ones here, remote
 /// ones in the target.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_process_vm_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (pid, local, local_count, remote, remote_count, flags) = (
         args[0] as isize,
@@ -1270,6 +1281,7 @@ pub(super) fn handle_process_vm_readv(args: [usize; ARG_COUNT], from_user: bool)
 }
 
 /// The writing half: `process_vm_writev`.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_process_vm_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (pid, local, local_count, remote, remote_count, flags) = (
         args[0] as isize,
@@ -1495,6 +1507,7 @@ fn setuid_identity(inode: &Arc<dyn crate::vfs::Inode>) -> Option<crate::sched::I
 /// library is what makes `./script.sh` work where `sh script.sh` does, and it
 /// is the difference between a package's install trigger running and the
 /// install failing with `Exec format error`.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_execve(
     args: [usize; ARG_COUNT],
     cwd: &Arc<dyn crate::vfs::Inode>,
@@ -1751,6 +1764,7 @@ fn sleep_for_timespec(req: usize, rem: usize, from_user: bool) -> isize {
 /// every `vfork` user writes behaves identically. Suspending the parent is a
 /// scheduling feature for an optimisation this kernel does not make (there is no
 /// page-table sharing to avoid), so there is nothing to gain by faking it.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_fork(nr: u64, _args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     let ctx = match user_context(regs_ptr, 0) {
         Some(ctx) => ctx,
@@ -1777,6 +1791,7 @@ pub(super) fn handle_fork(nr: u64, _args: [usize; ARG_COUNT], regs_ptr: *mut ())
 /// it here also puts it in the right place in the call: `PTRACE_EVENT_CLONE`
 /// belongs inside the `clone` that caused it, and the call's ordinary exit stop
 /// still follows, exactly as it does after an exec trap.
+#[cfg(not(target_arch = "aarch64"))]
 fn tell_tracer_of_child(regs_ptr: *mut ()) {
     if regs_ptr.is_null() {
         return;
@@ -1795,6 +1810,7 @@ fn tell_tracer_of_child(regs_ptr: *mut ()) {
 ///
 /// Returns `None` when there is no frame: a call made outside the gate has no
 /// registers to name.
+#[cfg(not(target_arch = "aarch64"))]
 fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::hal::UserFrame> {
     if regs_ptr.is_null() {
         return None;
@@ -1849,10 +1865,12 @@ fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::hal::UserFrame> 
 /// an honest refusal. `CLONE_VM` without `CLONE_THREAD` is the spawn shape and is
 /// honoured - see [`crate::sched::clone`].
 #[allow(clippy::too_many_lines)]
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_clone(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     handle_clone_impl(args, regs_ptr)
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     let (flags, child_stack, parent_tid, child_tid, tls) =
         (args[0], args[1], args[2], args[3], args[4]);
@@ -2035,6 +2053,7 @@ pub(super) fn handle_getpgid(args: [usize; ARG_COUNT]) -> isize {
 /// machine: QEMU's debug exit is the closest thing to a reset this
 /// environment has, and `-no-reboot` turns it into a clean shutdown either
 /// way. Anything else is refused, as Linux refuses it.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
     // `reboot(magic, magic2, cmd, arg)`: the magic words come first and the
     // command is the third argument. Reading `args[0]` as the command reads
@@ -2069,6 +2088,7 @@ pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
 /// A NULL timeout waits forever; a zero one checks and answers `EAGAIN`.
 /// A fatal signal that arrives from *outside* the set still kills the waiter
 /// on each pass, exactly as `block_until` does for every blocking call.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     /// The bytes of `siginfo_t` on x86_64.
     const SIGINFO_BYTES: usize = 128;
