@@ -55,11 +55,15 @@ pub use x86_64::kernel_sections;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::boot;
 
-/// Put a formatted line on the machine's boot console.
+/// Put a formatted line on the machine's boot console, through the machine's own
+/// writer rather than `crate::console`.
 ///
-/// The aarch64 counterpart of `mpos::println!`, which reaches a console mux
-/// this machine does not have until stage 4. The entry and the panic path are
-/// its two callers - both run where a HAL call cannot exist yet.
+/// This is what the entry banner, the milestone checks and the panic path use, so
+/// a line reaches the wire at any point in boot - before the console service is
+/// brought up, and in a panic where its state may not be trustworthy. The service
+/// itself (`mpos::println!`) came to this machine at stage 4a and is exercised by
+/// the `milestone` `boot` runs; this low-level writer stays for the early and
+/// unwinding paths.
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::print_args;
 

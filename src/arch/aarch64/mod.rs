@@ -125,6 +125,15 @@ pub fn print_args(args: fmt::Arguments) {
 /// halfway - and after them so that the console and the clock are configured
 /// once, on the machine that will actually run.
 ///
+/// `milestone` is a function the caller (the `main` boot wiring) hands in, run
+/// once the PL011 is up so the machine's own log has reached the wire. It exists
+/// because `crate::console` is above `arch` and `arch` may not name it
+/// (`AGENTS.md` §4, downward-only) - yet the console service is exactly what
+/// stage 4a un-gated for this machine, and a milestone check for it belongs in
+/// the boot wiring, not the machine layer. So `main` supplies a `fn()` that
+/// writes through `crate::console`, and `arch` only ever invokes the pointer:
+/// the console name stays on the `main` side of the seam.
+///
 /// # Safety
 ///
 /// The caller is the loader's branch to `_start`, with `x0` holding the record
@@ -133,7 +142,7 @@ pub fn print_args(args: fmt::Arguments) {
 /// can be validated, because the magic check inside `collect` happens *after*
 /// the read: its validity is the caller's contract and not something this
 /// function can establish.
-pub unsafe fn boot(handoff: *const Handoff) -> ! {
+pub unsafe fn boot(handoff: *const Handoff, milestone: fn()) -> ! {
     pl011::init();
 
     // SAFETY: the loader's contract - `handoff` points at the record it wrote,
@@ -157,6 +166,13 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
         ));
         halt();
     }
+
+    // The console service (`crate::console`, un-gated for this machine at stage
+    // 4a) has never been on the wire yet - every line above this was the machine's
+    // own `pl011::Writer`. `main`'s `milestone` writes one through the service and
+    // reports it; `arch` only calls the pointer, so the console name stays in the
+    // wiring layer that may hold it.
+    milestone();
 
     // Stage 5a: the machine's own description of itself, held up against the
     // constants the rest of this file is compiled with. Before the allocator

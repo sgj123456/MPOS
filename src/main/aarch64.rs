@@ -44,16 +44,37 @@ pub unsafe extern "C" fn _start(handoff: *const Handoff) -> ! {
     // SAFETY: the caller's contract, restated in `arch::aarch64::boot`'s own
     // `# Safety`: the branch into this symbol carried the record the loader
     // wrote, and the checks there read it under exactly that assumption.
-    unsafe { mpos::arch::boot(handoff) }
+    // `console_milestone` is run by the machine boot once its PL011 is up; it is
+    // defined here (in the wiring, which may name `crate::console`) so that
+    // `arch` never reaches up into the console service it sits below.
+    unsafe { mpos::arch::boot(handoff, console_milestone) }
+}
+
+/// Stage 4b's evidence: `crate::console` - un-gated for this machine one stage ago -
+/// actually reaches the wire. Every boot line before this one was `arch`'s own
+/// `pl011::Writer`; this is the first through the console service (`println!` ->
+/// `print_args` -> the `hal::Console` sink -> the PL011). If the service were
+/// mis-wired on this machine the milestone line simply would not appear, and
+/// `cargo xtask boot-aarch64` asserts on its presence.
+fn console_milestone() {
+    // Bring the service's sink up (idempotent over the PL011 the boot already
+    // poked) and send one line, then the marker, through the same path a
+    // `println!` anywhere above the machine layer will use.
+    mpos::console::init();
+    mpos::println!("console: kernel log reached the PL011 through crate::console");
+    mpos::println!("M4_CONSOLE_OK");
 }
 
 /// The panic path: one line on the console, then stop.
 ///
-/// It prints through `arch`'s own writer rather than `mpos::println!` for the
-/// reason that macro is x86_64-only: this machine's console is a PL011, and the
-/// kernel's console mux does not exist here until stage 4. A panic that printed
-/// nothing because the mux was missing would be the worst version of the gap -
-/// the machine would stop with no word about why.
+/// It prints through `arch`'s own machine writer (`arch::print_args`) rather than
+/// `mpos::println!` not because the console service is missing on this machine -
+/// stage 4a un-gated it - but because a panic must reach the host at *any* point
+/// in boot, including before `crate::console` has been brought up or after its
+/// state has been corrupted, and the machine writer has no dependencies beyond the
+/// mapped device window. A panic that printed nothing because a higher layer was
+/// mid-init would be the worst version of the gap: the machine stops with no word
+/// about why.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     mpos::arch::print_args(format_args!("\nKERNEL PANIC: {info}\n"));

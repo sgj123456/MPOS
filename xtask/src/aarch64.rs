@@ -133,7 +133,9 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     print!("{log}");
 
     // Every marker the kernel prints, in the order it prints them:
-    // `M4_DEVICES_OK` says the firmware's device tree reads back as the machine
+    // `M4_CONSOLE_OK` says the boot wiring reached the wire through
+    // `crate::console` (stage 4a/4b - the console service, not `arch`'s own
+    // writer), `M4_DEVICES_OK` says the firmware's device tree reads back as the machine
     // this kernel was built for, `M3_TABLES_OK` says the kernel's own page
     // tables say what the plan says - and that the low half is empty, which is
     // where the device window used to be - `M5_VIRTIO_OK` says those tables
@@ -151,6 +153,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // line can be masked and an interrupt waited on, and `M6_EL0_OK` says the
     // kernel ran a program at EL0 and answered the call it made.
     let markers = [
+        ("M4_CONSOLE_OK", "console service"),
         ("M4_DEVICES_OK", "devices"),
         ("M3_TABLES_OK", "page tables"),
         ("M5_VIRTIO_OK", "virtio transports"),
@@ -170,9 +173,9 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     if missing.is_empty() {
         println!();
         println!(
-            "aarch64 boot: M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, M1_TIMER_OK, \
-             M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK and \
-             M6_EL0_OK, from the ESP under AAVMF"
+            "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
+             M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK \
+             and M6_EL0_OK, from the ESP under AAVMF"
         );
         return Ok(());
     }
