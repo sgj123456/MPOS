@@ -18,7 +18,7 @@
 /// The distributor: enable/disable, priority, group, target.
 pub const DIST: usize = 0x0800_0000;
 /// The CPU interface: the priority mask, acknowledge and end-of-interrupt.
-const CPU: usize = 0x0801_0000;
+pub const CPU: usize = 0x0801_0000;
 
 /// Distributor control: bit 0 enables group 0 (a FIQ), bit 1 group 1 (an IRQ).
 const GICD_CTLR: usize = 0x000;

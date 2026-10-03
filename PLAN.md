@@ -664,9 +664,11 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stages 1a-1f and 2 landed: the machine boots a
+**Architectures (Phase 9 — aarch64 stages 1a-1f, 2 and 5a landed: the machine boots a
 real ESP image under AAVMF, builds its own page tables from `kernel_mappings`,
-and switches between kernel tasks (§9.1); next is stage 3, un-gating `sched`)**
+switches between kernel tasks, and reads the firmware's device tree back against
+its own constants (§9.1); next is stage 5's drivers — not stage 3, which waits on
+4, 5 and 6 for the reason measured under the stage table)**
 - [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
@@ -5172,9 +5174,10 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1f and 2 landed: the machine boots the way the
-x86_64 one does, the kernel owns its own address space, and two kernel tasks can
-suspend and resume each other.** `cargo xtask boot-aarch64`
+Current status: **stages 1a-1f, 2 and 5a landed: the machine boots the way the
+x86_64 one does, the kernel owns its own address space, two kernel tasks can
+suspend and resume each other, and the machine reads its own description of
+itself.** `cargo xtask boot-aarch64`
 builds the kernel (`aarch64-unknown-none`), the loader
 (`aarch64-unknown-uefi`), lays out an ESP with `EFI/BOOT/BOOTAA64.EFI` and boots
 it under AAVMF; the loader reads `mpos.elf` off the volume, applies its
@@ -5185,19 +5188,35 @@ rebuilds the address space from `mm::vm::kernel_mappings`, which is the same
 plan x86_64's `install` consumes. Measured, from that run:
 
 ```
-mpos-boot: kernel: 64 KiB at phys 0x44bcf000, virt 0xffffffff80000000, entry 0xffffffff8000a5fc
+mpos-boot: kernel: 84 KiB at phys 0x44bcf000, virt 0xffffffff80000000, entry 0xffffffff8000d000
+mpos-boot: device tree: 1052672 bytes at phys 0x43eff000
 mpos-boot: page tables: 292 pages of them
-handoff: mpos-boot 0.1.0, record at 0x45a59020, image phys 0x44bcf000 -> virt 0xffffffff80000000
-memory: 14 regions, 192 MiB the allocator may use
-pmm: 5 zones, 49209 frames (192 MiB of 192 MiB usable)
-page tables: 166 frames (664 KiB), TTBR0 0x43fff000, TTBR1 0x43fff000 (the kernel's own, read back from the registers)
-plan: 7 mappings, all 63616 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)
-direct map: 0xffff800043f47000 -> 0x43f47000, rw and it stores
+handoff: mpos-boot 0.1.0, record at 0x45a65020, image phys 0x44bcf000 -> virt 0xffffffff80000000
+memory: 14 regions, 191 MiB the allocator may use
+devices: the firmware's tree, 1052672 bytes at 0xffff800043eff000
+devices: memory 0x40000000..0x50000000 (256 MiB), every region the record calls usable is inside it
+devices: PL011 at 0x9000000, GIC at 0x8000000/0x8010000, timer on PPI 14 (INTID 30)
+devices: 32 virtio-mmio windows, all inside the 0x8000000..0xc000000 device window
+M4_DEVICES_OK
+pmm: 5 zones, 48954 frames (191 MiB of 191 MiB usable)
+page tables: 166 frames (664 KiB), TTBR0 0x43efe000, TTBR1 0x43efe000 (the kernel's own, read back from the registers)
+plan: 7 mappings, all 63621 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)
+direct map: 0xffff800043e46000 -> 0x43e46000, rw and it stores
 device window: PL011 at 0x9000000 maps to itself, Device
 no identity map: 0x44bcf000 is unreachable, only the device window lives low
 M3_TABLES_OK
-M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 108479744 ns of counter
+M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 109366208 ns of counter
 ```
+
+The `devices:` lines are stage 5a, and they are a *check* rather than a
+printout: every number in them was read out of the firmware's device tree and
+compared against the constant the kernel is compiled with for that device - the
+PL011's base, both of the GIC's frames, the timer's line, and the RAM the boot
+record calls usable. A tree is not trusted to be right; it is what asks whether
+this kernel's idea of the machine still is. The `191 MiB` and the `48954 frames`
+against the last stage's `192 MiB`/`49209` are the tree's own cost, and it is
+not small: the blob QEMU writes claims a megabyte for a tree of eight kilobytes,
+and the loader copies what the tree says it is.
 
 The `plan:` line is the strongest claim either machine's boot makes about its
 own page tables: every mapping `mm::vm::kernel_mappings` names is walked page by
@@ -5248,12 +5267,33 @@ and it is checked - the boot prints `M2_CONTEXT_OK`.
 | 1f | The kernel's own tables: `src/arch/aarch64/paging.rs` regains a builder, built from `mm::vm::kernel_mappings(info, sections)` out of frames from `mm::alloc_frames`; `mm::init` runs on aarch64; the boot switches `TTBR0_EL1`/`TTBR1_EL1` onto it | **landed**: `pmm: 5 zones, 49209 frames`, `page tables: 166 frames (664 KiB)`, `plan: 7 mappings, all 63616 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)`, `no identity map: 0x44bcf000 is unreachable, only the device window lives low`, then `M3_TABLES_OK` and `M1_TIMER_OK` |
 | 2 | Kernel contexts: `src/arch/aarch64/context.rs` - `Context` with the callee-saved `x19..x28`/`fp`/`lr` on the task's own stack, `FpuState` (`q0..q31`, `FPCR`, `FPSR`), `bootstrap` and its trampoline, `switch` | **landed**: `M2_CONTEXT_OK: 13 hand-overs, both directions, every callee-saved register and v31 back where its task left it`, and the letters above it alternate `ABABAB` |
 | 2b | *Not a stage* - the **user** frame (`x0..x30`/`pc`/`pstate`) and its `eret` entry moved to stage 6, where the ABI that gives those fields their order and their meaning is. See the note below the table | - |
-| 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --target aarch64-unknown-none` with `sched` in |
+| 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --release --target aarch64-unknown-none` with `sched` in - and see the correction below the table: this row is **not** one edit, and it waits on 4, 5 and 6 |
 | 4 | Un-gate `console` and `vfs` (serial-only console first) | a ramfs root with the initramfs untarred |
-| 5 | Drivers: DTB parsing, virtio-MMIO, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up |
+| 5a | The device tree: `crates/fdt` (the reader, host-tested), `Handoff.dtb_phys`/`dtb_len` appended after `regions`, the loader copying the firmware's blob out of the UEFI configuration table, and `arch::aarch64::check_devices` holding the tree up against the machine's own constants | **landed**: `cargo xtask boot-aarch64` prints `devices: PL011 at 0x9000000, GIC at 0x8000000/0x8010000, timer on PPI 14 (INTID 30)`, `devices: 32 virtio-mmio windows, all inside the 0x8000000..0xc000000 device window` and `M4_DEVICES_OK`, and the tree's memory node is compared with every region the record calls usable |
+| 5 | Drivers: virtio-MMIO found through the tree, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up |
 | 6 | The aarch64 Linux ABI: `nr.rs` per arch, the `x0..x30` register file **and the user frame with its `eret` entry** (moved here from stage 2), signal frames, `svc #0`, `TPIDR_EL0` TLS, `PTRACE_GETFPREGS`'s view of `FpuState` | the `t-*` conformance programs run on aarch64 |
 | 7 | aarch64 userspace and the image: `aarch64-unknown-linux-musl` builds, ESP layout for AAVMF, arch-aware `xtask` | `cargo xtask test` passes on aarch64 |
 | 8 | The gate: `xtask test`/`run` grow an arch selection | a green aarch64 gate quoted with its summary line and exit code |
+
+**The order below the machine layer is not the order of the table, and that was
+measured rather than argued.** Row 3 reads as one edit - "un-gate `sched`: the
+TLS `MSR` write moves behind `hal`/`arch`" - and it is not. Widening that gate
+alone and building reports **50 errors, of which three are the `wrmsr`**; the
+rest are 23 missing `vfs`, 9 missing `syscall`, 7 missing `hal`, 2 missing
+`drivers` and a `println!`, because `sched` names all four directly. So `sched`
+cannot be un-gated before 4 (`vfs`), 5 (`drivers`) and 6 (the ABI) have landed,
+and `hal` - which `sched` wants for the TLS write and which everything else
+wants for the machine - cannot compile for aarch64 until all six of its traits
+exist, which needs stage 6's `Paging` user half and a `WallClock` this machine
+has no driver for. The next work is therefore **5, not 3**, and the table's
+numbering is the plan's order rather than the order it can be done in.
+
+**And the profile matters: the aarch64 debug build does not link.** `cargo
+build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
+cannot be used against local symbol` out of the *sysroot's* `liballoc`, which is
+not built for a PIE; only `--release` links, and `--release` is what `xtask`
+builds, so no gate has ever noticed. Row 3's verification command used to be the
+bare one; it says `--release` now, and `AGENTS.md` §3 carries the same warning.
 
 Named gaps the port carries rather than hides, each with its home:
 
@@ -5277,13 +5317,25 @@ Named gaps the port carries rather than hides, each with its home:
   as well, which is what the kernel's `CurrentEL` check now reports and what its
   EL1-only vectors and physical timer need. A machine that arrived at EL2 would
   stop with a line saying so rather than configure the wrong one.
-- **No device tree is read yet, and it does not arrive in a register.** `x0` is
-  the handoff record's register on both machines now. Under `virt` + AAVMF the
-  device tree is passed in the **UEFI configuration table**, which is firmware
-  data - it does not survive `exit_boot_services` - so a loader that wanted to
-  hand it over would have to copy it, the way it copies the initramfs. Nothing
-  needs it until stage 5, and the fixed addresses below are what stands in until
-  then.
+- **The tree is read now - and it does not arrive in a register, nor under the
+  name this section used to assume.** `x0` is the handoff record's register on
+  both machines. Under `virt` + AAVMF the tree is published in the **UEFI
+  configuration table**, which is firmware data that does not survive
+  `exit_boot_services`, so the loader reads the header's `totalsize` there and
+  copies that many bytes into frames of its own (stage 5a). Two corrections came
+  out of doing it, and both were measured rather than reasoned. First, that
+  table has **no entry for a tree at all** when QEMU builds ACPI tables, which
+  `-M virt` does by default on aarch64: the firmware advertised `ACPI2`
+  (`8868e871-e4f1-11d3-bc22-0080c73c8881`) among the nine tables the loader
+  prints, and no device-tree GUID. The boot therefore selects
+  `-machine virt,acpi=off`, which is the same machine with the other
+  description of itself, and the tree is the one this port reads. A real aarch64
+  server would hand over ACPI and no tree; reading *that* is a gap this port
+  names rather than half-does, and `check_devices` failing by name is what makes
+  it visible instead of silent. Second, the cost: `totalsize` is 1052672 bytes
+  for a tree of 7160 bytes of structure and 569 of strings, and copying what the
+  tree says it is costs one MiB of the machine - the difference between `192
+  MiB` and `191 MiB` of usable RAM in the log above.
 - **The GICv2 bring-up is three bits across two frames, and the wrong value is
   silent.** Measured on this machine, and recorded because the register values
   are load-bearing: the timer's line needs `GICD_CTLR` *and* `GICC_CTLR` bit 1
@@ -5297,16 +5349,24 @@ Named gaps the port carries rather than hides, each with its home:
   clock that looks *very fast*, and it cost a 1022/30 reading to tell apart.
   Linux programs the same `0x7`. The check's failure branch now prints the five
   registers that separate the three causes.
-- **The machine addresses are hardcoded, and now they are mapped by hand.**
-  QEMU virt puts PL011 at `0x0900_0000`, the GIC at
-  `0x0800_0000`/`0x0801_0000`, and RAM at `0x4000_0000`; the device tree is what
-  a real port reads, and stage 5 is where it does. Until then the loader maps a
-  64 MiB device window from `0x0800_0000` as Device-nGnRnE
-  (`vm::map_device_window`), because the kernel still reaches those registers at
-  their physical addresses: x86_64's `mm::map_mmio` walks a BAR, and there is no
-  aarch64 equivalent until stage 5. The window deliberately does not start at
-  zero - a null pointer that silently works is the one thing x86_64's own
-  `check_arch` asserts cannot happen.
+- **The machine addresses are hardcoded, and now they are checked at every
+  boot.** QEMU virt puts PL011 at `0x0900_0000`, the GIC at
+  `0x0800_0000`/`0x0801_0000` and RAM at `0x4000_0000`, and those are what the
+  kernel is compiled with: the tree does not yet *supply* them. What stage 5a
+  made it do is ask whether they are still right - `check_devices` reads each
+  node back and compares it with `pl011::BASE`, `gic::DIST`/`gic::CPU` and
+  `gic::TIMER_INTID`, and the boot stops with `M4_DEVICES_FAILED` on any
+  disagreement. A machine that moves a device is now a boot failure rather than
+  a driver faulting on its first register. What is still hardcoded is everything
+  with no constant to compare against, and what stage 5 owes is the direction
+  that matters for discovery: the 32 virtio-MMIO windows, whose addresses are in
+  the tree and nowhere else, are **counted and bounds-checked** (`all inside the
+  0x8000000..0xc000000 device window`) but not yet driven, and their interrupt
+  lines are not routed. The loader still maps that 64 MiB window at the
+  addresses the devices are at, in the low half, because x86_64's `mm::map_mmio`
+  walks a BAR and there is no aarch64 arm yet. The window deliberately does not
+  start at zero - a null pointer that silently works is the one thing x86_64's
+  own `check_arch` asserts cannot happen.
 - **The kernel's address space is its own now, and the window that was open
   across 1e is closed.** Two things went together and are worth keeping as one
   measurement: the loader builds its identity map and its direct map with a

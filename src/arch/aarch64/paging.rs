@@ -159,9 +159,9 @@ const SCTLR_ENABLE: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 12);
 /// It deliberately does not start at zero: the low 128 MiB of `virt` is flash
 /// and the machine's own vectors, and a null pointer that silently works is the
 /// one thing x86_64's own `check_arch` asserts cannot happen.
-const DEVICE_BASE: usize = 0x0800_0000;
+pub const DEVICE_BASE: usize = 0x0800_0000;
 /// 64 MiB, from the GIC's distributor to past the virtio-MMIO frames.
-const DEVICE_WINDOW: usize = 0x0400_0000;
+pub const DEVICE_WINDOW: usize = 0x0400_0000;
 
 /// How the page at a translated address is cached.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

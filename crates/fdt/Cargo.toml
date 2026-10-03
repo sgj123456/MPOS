@@ -1,0 +1,9 @@
+# Flattened device trees: the machine's own description, as bytes. Pure - a blob
+# in, names and numbers out - so it is its own leaf crate, and the port that
+# needs it is not the only thing that can be tested. No external dependency.
+[package]
+name = "mpos-fdt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

@@ -76,6 +76,30 @@ pub struct Handoff {
     pub boot_stack_base: u64,
     pub region_count: u64,
     pub regions: [AbiRegion; MAX_MEM_REGIONS],
+    /// The machine's own description of itself, copied out of the firmware's
+    /// configuration table, and how many bytes of it there are. Both zero on a
+    /// machine whose firmware handed none over, which is every x86_64 boot and
+    /// an aarch64 one whose firmware does not publish a tree.
+    ///
+    /// Copied rather than pointed at: under UEFI the tree lives in firmware
+    /// data, which does not survive `exit_boot_services`. The loader reads the
+    /// header's `totalsize` and takes that many bytes, because the buffer the
+    /// firmware points at has no length of its own.
+    ///
+    /// # Why these two are last
+    ///
+    /// A field added to a fixed-layout record that two separate compilations
+    /// write and read is a field an older counterpart will not have written -
+    /// and the danger is not a zero, it is a *value*: appended here, a stale
+    /// loader's bytes read as `dtb_len == 0` and the kernel says "no tree",
+    /// where inserted beside `cmdline` they would have shifted every field
+    /// after them and been read as one of those instead. This is the only
+    /// position in the record where the change is safe in both directions, and
+    /// it is why [`HANDOFF_MAGIC`] does not have to move for it: every offset a
+    /// counterpart written from an older tree uses is untouched, and the one
+    /// field it did not write reads as absent.
+    pub dtb_phys: u64,
+    pub dtb_len: u64,
 }
 
 /// Read the loader's record into a `BootInfo`.
@@ -116,6 +140,7 @@ pub unsafe fn collect(at: *const Handoff) -> BootInfo {
         region_count: raw.region_count as usize,
         cmdline: "",
         boot_stack_base: raw.boot_stack_base as usize,
+        dtb: unsafe { slice(raw.dtb_phys, raw.dtb_len, hhdm_offset) },
     };
 
     for (slot, region) in info.regions[..info.region_count]
@@ -202,6 +227,18 @@ mod tests {
         assert_eq!(offset_of!(Handoff, boot_stack_base), 64);
         assert_eq!(offset_of!(Handoff, region_count), 72);
         assert_eq!(offset_of!(Handoff, regions), 80);
+        // The two device-tree fields are last on purpose: appending them leaves
+        // every offset above this line where an older loader put it, so a record
+        // from one is read correctly as far as it goes and reports "no tree"
+        // rather than being misread. See the field's own note.
+        assert_eq!(
+            offset_of!(Handoff, dtb_phys),
+            80 + MAX_MEM_REGIONS * size_of::<AbiRegion>()
+        );
+        assert_eq!(
+            offset_of!(Handoff, dtb_len),
+            88 + MAX_MEM_REGIONS * size_of::<AbiRegion>()
+        );
 
         // The loader zero-fills one page and writes the record into it, so a
         // record that has grown past a page is a boot that cannot happen.
@@ -314,6 +351,32 @@ mod tests {
             ..zeroed()
         };
         assert_eq!(unsafe { collect(&raw) }.initramfs, None);
+    }
+
+    /// The device tree crosses the boundary as a physical address and a length,
+    /// like the initramfs, and is read back through the direct map the loader
+    /// names. A record that carries none - every x86_64 boot - reads as `None`
+    /// rather than as an empty slice, because "there is no tree here" and
+    /// "there is a tree of zero bytes" are different answers to the kernel.
+    #[test]
+    fn the_device_tree_comes_out_of_the_record_like_any_other_blob() {
+        static TREE: [u8; 8] = [0xd0, 0x0d, 0xfe, 0xed, 0, 0, 0, 0xa0];
+
+        let raw = Handoff {
+            magic: HANDOFF_MAGIC,
+            dtb_phys: TREE.as_ptr() as u64,
+            dtb_len: TREE.len() as u64,
+            ..zeroed()
+        };
+        assert_eq!(unsafe { collect(&raw) }.dtb, Some(&TREE[..]));
+
+        let raw = Handoff {
+            magic: HANDOFF_MAGIC,
+            dtb_phys: TREE.as_ptr() as u64,
+            dtb_len: 0,
+            ..zeroed()
+        };
+        assert_eq!(unsafe { collect(&raw) }.dtb, None);
     }
 
     /// The loader defaults the record to zeroes, so `Handoff` cannot carry

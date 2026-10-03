@@ -16,9 +16,10 @@
 //! branches into the higher half.
 //!
 //! The verdict is read out of the serial log, the way `cargo xtask test` reads
-//! its own: the guest prints `M3_TABLES_OK` and `M1_TIMER_OK` when it is happy,
-//! and the run stops as soon as either marker or a failure line appears. Nothing
-//! here claims a green the log does not contain.
+//! its own: the guest prints `M4_DEVICES_OK`, `M3_TABLES_OK`, `M1_TIMER_OK` and
+//! `M2_CONTEXT_OK` when it is happy, and the run stops as soon as one of those
+//! - or a failure line - appears. Nothing here claims a green the log does not
+//! contain.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,19 +58,27 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// stops on the first of them, which is what keeps a run from waiting out the
 /// whole deadline on a machine that has already reported.
 ///
-/// The list is the *last* thing each check says, and keeping it in step with the
-/// kernel's boot order is load-bearing rather than tidiness: this used to end at
-/// `M1_TIMER_OK`, which stage 2's checks now come *after* - so the machine was
-/// killed mid-check and the log ended in the middle of a line, which reads
-/// exactly like a hang. A failure line is a terminator for the same reason:
+/// The rule for this list, because getting it wrong is silent and reads as a
+/// broken machine: it holds the success marker of the **last** check and the
+/// failure marker of **every** check - never the success marker of a check that
+/// another check comes after. A terminator stops the run, so a success marker
+/// listed too early kills the machine mid-boot and the log simply ends, which is
+/// indistinguishable from a hang. Both directions of this mistake have now been
+/// made here: the list once ended at `M1_TIMER_OK`, which stage 2's checks come
+/// after, and stage 5a briefly added `M4_DEVICES_OK`, which the timer and
+/// context checks come after - measured as a boot that took 5.7 s instead of the
+/// deadline and stopped three lines into a working machine.
+///
+/// A failure line belongs here for the same reason a success line does not:
 /// `EXCEPTION:` is the kernel's own fault dump, and waiting out the deadline for
 /// a marker that will never come is time spent pretending a stopped machine
 /// might still be working.
-const TERMINATORS: [&str; 6] = [
+const TERMINATORS: [&str; 7] = [
     "M2_CONTEXT_OK",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
+    "M4_DEVICES_FAILED",
     "EXCEPTION:",
     "KERNEL PANIC",
 ];
@@ -105,12 +114,15 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     let log = boot(build_dir, &esp)?;
     print!("{log}");
 
-    // Every marker the kernel prints, in the order it prints them: `M3_TABLES_OK`
-    // says the kernel's own page tables say what the plan says, `M1_TIMER_OK`
-    // says the clock still reaches the vector table through them - a statement
-    // about the device window too, because the GIC is reached through it - and
-    // `M2_CONTEXT_OK` says two tasks can suspend and resume each other.
+    // Every marker the kernel prints, in the order it prints them:
+    // `M4_DEVICES_OK` says the firmware's device tree reads back as the machine
+    // this kernel was built for, `M3_TABLES_OK` says the kernel's own page
+    // tables say what the plan says, `M1_TIMER_OK` says the clock still reaches
+    // the vector table through them - a statement about the device window too,
+    // because the GIC is reached through it - and `M2_CONTEXT_OK` says two
+    // tasks can suspend and resume each other.
     let markers = [
+        ("M4_DEVICES_OK", "devices"),
         ("M3_TABLES_OK", "page tables"),
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
@@ -123,8 +135,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     if missing.is_empty() {
         println!();
         println!(
-            "aarch64 boot: M3_TABLES_OK, M1_TIMER_OK and M2_CONTEXT_OK, from the ESP \
-             under AAVMF"
+            "aarch64 boot: M4_DEVICES_OK, M3_TABLES_OK, M1_TIMER_OK and M2_CONTEXT_OK, \
+             from the ESP under AAVMF"
         );
         return Ok(());
     }
@@ -276,7 +288,15 @@ fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
     let _ = fs::remove_file(&log);
 
     let mut qemu = Command::new("qemu-system-aarch64");
-    qemu.args(["-machine", "virt,gic-version=2"])
+    // `acpi=off` is what makes this firmware describe the machine the way this
+    // port reads it, and it is a measured difference rather than a preference:
+    // with ACPI left on - the default - AAVMF advertises ACPI 2.0 in its
+    // configuration table and publishes **no device tree at all**, which is
+    // `PLAN.md` §9.1's assumption corrected (it said `virt` + AAVMF passes a
+    // tree). A tree and a set of ACPI tables are two ways to say the same
+    // things; this port reads the first, because that is the one an embedded
+    // machine has, and the second is named as a gap rather than half-read.
+    qemu.args(["-machine", "virt,gic-version=2,acpi=off"])
         // A named CPU rather than `max`, because the kernel's interrupt
         // controller is a GICv2 and its clock is the EL1 physical timer: both
         // are things a `max` CPU is free to configure differently, and a

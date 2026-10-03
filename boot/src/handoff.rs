@@ -52,4 +52,14 @@ pub struct Handoff {
     pub boot_stack_base: u64,
     pub region_count: u64,
     pub regions: [Region; MAX_MEM_REGIONS],
+    /// The machine's own description of itself, copied out of the firmware's
+    /// configuration table, and how many bytes there are of it. Zero on a
+    /// machine whose firmware hands none over.
+    ///
+    /// Last in the record on purpose, and the reason is in the kernel's copy of
+    /// this file: appending is the one position where a record written by a
+    /// loader built from an older tree is read correctly as far as it goes
+    /// instead of being misread at every offset after the insertion.
+    pub dtb_phys: u64,
+    pub dtb_len: u64,
 }

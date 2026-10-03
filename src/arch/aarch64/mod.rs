@@ -7,15 +7,20 @@
 //! vectors, a GICv2 and the generic timer; 1d a page-table builder for the
 //! `-kernel` bring-up; 1e replaced that bring-up with the real boot path, so a
 //! UEFI loader reads the kernel off an ESP and branches here in the higher half;
-//! and **1f is the kernel taking ownership of its own address space** - it
-//! builds its page tables from `mm::vm::kernel_mappings` out of frames the
-//! allocator hands it, instead of running on the loader's.
+//! **1f is the kernel taking ownership of its own address space** - it builds
+//! its page tables from `mm::vm::kernel_mappings` out of frames the allocator
+//! hands it, instead of running on the loader's; **2 is two kernel tasks
+//! suspending and resuming each other** (`context.rs`); and **5a is the machine
+//! reading its own description of itself** - the firmware's device tree, out of
+//! the UEFI configuration table by way of the loader, held up against the
+//! constants the rest of this file is compiled with (`check_devices`).
 //!
-//! What is still absent, and where it lands: contexts and user entry (2), then
-//! `sched` (3), `console`/`vfs` (4) and the drivers (5). Everything above the
-//! seam reaches those through `crate::hal`, which this machine implements trait
-//! by trait as its stages land - which is also why `hal` itself is still
-//! x86_64-only (`src/lib.rs`'s ledger).
+//! What is still absent, and where it lands: everything above the machine layer
+//! - `sched` (3), `console`/`vfs` (4), the drivers (5) and the Linux ABI (6),
+//! which is also where the user frame and its `eret` entry went. Those reach
+//! this machine through `crate::hal`, which it implements trait by trait as the
+//! stages land - which is why `hal` itself is still x86_64-only (`src/lib.rs`'s
+//! ledger).
 
 pub(crate) mod context;
 pub(crate) mod critical;
@@ -29,6 +34,7 @@ use core::fmt;
 
 use crate::boot::BootInfo;
 use crate::boot::handoff::Handoff;
+use crate::fdt;
 use crate::mm::vm::{self, KernelSections, MapFlags};
 use crate::mm::{self, PAGE_SIZE};
 
@@ -135,6 +141,13 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
         halt();
     }
 
+    // Stage 5a: the machine's own description of itself, held up against the
+    // constants the rest of this file is compiled with. Before the allocator
+    // and before the kernel's own tables, because it needs neither - the tree
+    // is in the loader's direct map, which is the address space the kernel is
+    // still running in.
+    check_devices(&info);
+
     // SAFETY: the record's contract, unchanged - every region it names is live
     // memory the kernel may hand out, and the loader's copy of it is the only
     // description of this machine there is.
@@ -158,6 +171,245 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
     check_timer();
     check_context();
     halt()
+}
+
+/// Stage 5a's evidence: the machine reads its own description, and what it read
+/// agrees with what this kernel has been compiled to expect.
+///
+/// Until this stage the addresses in `pl011`, `gic` and `paging` were constants
+/// with a comment saying where they came from, and the loader mapped a device
+/// window because there was no way to ask. The tree is the way to ask: the
+/// firmware publishes it, the loader copies it out of the configuration table
+/// before boot services go away, and this reads it.
+///
+/// What makes this a check rather than a printout is that every number is
+/// compared against the constant the rest of the machine *already uses*: the
+/// serial port's base, both of the interrupt controller's frames, the timer's
+/// line, and the memory the record calls usable. A tree is not trusted to be
+/// right - it is used to ask whether this kernel's idea of the machine is. That
+/// is also the only test that can catch a tree walked *wrongly*: a reader that
+/// answered a plausible address from a corrupt tree would put a device
+/// somewhere this kernel does not reach, which is exactly what a disagreement
+/// with the constants reports.
+///
+/// It runs before `mm::init`, and so before the kernel's own tables exist: the
+/// tree is in the loader's direct map, which is the address space the kernel is
+/// running in until `paging::install` returns.
+fn check_devices(info: &BootInfo) {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+
+    /// News this machine cannot act on: say which claim failed and stop. The
+    /// marker is what `xtask boot-aarch64` polls for, so a check that fails
+    /// ends the run rather than waiting out the deadline.
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M4_DEVICES_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    let Some(bytes) = info.dtb else {
+        fail!(
+            "the record carries no device tree, and this machine has no other \
+             description of itself"
+        );
+    };
+    let tree = match fdt::Fdt::new(bytes) {
+        Ok(tree) => tree,
+        Err(error) => fail!("the device tree will not walk: {error:?}"),
+    };
+    let _ = writeln!(
+        out,
+        "devices: the firmware's tree, {} bytes at {:#x}",
+        tree.total_size(),
+        bytes.as_ptr() as usize,
+    );
+
+    // The tree's memory node against the loader's memory map: two descriptions
+    // of the same RAM, written by two different parties, and a machine whose
+    // tree disagrees with the map its loader built is one whose devices are not
+    // where the tree says either.
+    let memory = match tree.find(|node| node.string_property("device_type") == Some("memory")) {
+        Ok(Some(node)) => node,
+        Ok(None) => fail!("the tree describes no memory"),
+        Err(error) => fail!("the tree will not walk: {error:?}"),
+    };
+    let Some((base, size)) = memory.reg().next() else {
+        fail!("the memory node {} has no usable reg", memory.name());
+    };
+    let (base, size) = (base as usize, size as usize);
+    for region in info
+        .regions()
+        .iter()
+        .filter(|region| region.kind.is_allocatable())
+    {
+        if region.base < base || region.base + region.length > base + size {
+            fail!(
+                "the tree's memory is {base:#x}..{:#x}, and the record calls \
+                 {:#x}..{:#x} usable",
+                base + size,
+                region.base,
+                region.base + region.length,
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "devices: memory {base:#x}..{:#x} ({} MiB), every region the record calls \
+         usable is inside it",
+        base + size,
+        size / (1024 * 1024),
+    );
+
+    // Three devices, each checked against the constant this kernel reaches it
+    // at. The lookup is a macro rather than a closure because its failure path
+    // writes to `out`: a closure would hold that borrow for as long as it
+    // lived, and the checks between its calls have things to say too.
+    macro_rules! found {
+        ($what:expr, $compatible:expr) => {
+            match tree.find_compatible($compatible) {
+                Ok(Some(node)) => node,
+                Ok(None) => fail!("the tree has no {} ({}) node", $what, $compatible),
+                Err(error) => fail!("the tree will not walk: {error:?}"),
+            }
+        };
+    }
+
+    let serial = found!("serial port", "arm,pl011");
+    let Some((serial_base, _)) = serial.reg().next() else {
+        fail!("the serial node {} has no reg", serial.name());
+    };
+    if serial_base as usize != pl011::BASE {
+        fail!(
+            "the tree puts the serial port at {serial_base:#x}, and this kernel \
+             reaches it at {:#x}",
+            pl011::BASE
+        );
+    }
+
+    // The interrupt controller is one `reg` of two windows, and the kernel has
+    // two constants because the two frames do different things - the
+    // distributor routes, the CPU interface acknowledges.
+    let intc = found!("interrupt controller", "arm,cortex-a15-gic");
+    let mut windows = intc.reg();
+    let (Some((dist, _)), Some((cpu, _))) = (windows.next(), windows.next()) else {
+        fail!(
+            "the interrupt controller node {} has one reg window, and this machine \
+             has a distributor and a CPU interface",
+            intc.name()
+        );
+    };
+    if dist as usize != gic::DIST || cpu as usize != gic::CPU {
+        fail!(
+            "the tree puts the GIC at {dist:#x}/{cpu:#x}, and this kernel reaches \
+             it at {:#x}/{:#x}",
+            gic::DIST,
+            gic::CPU
+        );
+    }
+
+    // The timer's line, decoded the way its binding says: a triple per
+    // interrupt - shared or per-CPU, the number in that space, and the trigger
+    // - whose first cell decides the offset, since an SPI counts from 32 and a
+    // PPI from 16. This kernel's clock is the EL1 physical timer, which is PPI
+    // 14 and therefore INTID 30; the whole of that sentence is what the check
+    // holds the tree to.
+    let timer = found!("timer", "arm,armv8-timer");
+    let cells = match intc.u32_property("#interrupt-cells") {
+        Some(3) => 3usize,
+        Some(other) => fail!(
+            "the tree's interrupt controller takes {other} cells per interrupt, \
+             and this kernel decodes the GIC's three"
+        ),
+        None => fail!("the tree's interrupt controller does not say how wide an interrupt is"),
+    };
+    // Read one entry at a time rather than collecting them first: this runs
+    // before `mm::init`, so the kernel has no heap yet, and a check of the
+    // machine's description should not need one.
+    let mut interrupts = timer.cells("interrupts");
+    if !interrupts.remaining().is_multiple_of(cells) {
+        fail!(
+            "the timer's interrupts are {} cells, not a whole number of {cells}-cell \
+             entries",
+            interrupts.remaining()
+        );
+    }
+    let mut timer_line = None;
+    while interrupts.remaining() >= cells {
+        let (Some(kind), Some(number)) = (interrupts.next(), interrupts.next()) else {
+            fail!("the timer's interrupts end in the middle of an entry");
+        };
+        // The rest of the entry is the trigger type and flags, which say how
+        // the line is wired rather than which line it is.
+        for _ in 2..cells {
+            let _ = interrupts.next();
+        }
+        let intid = match kind {
+            0 => number + 32,
+            1 => number + 16,
+            other => {
+                fail!("the timer's interrupts carry kind {other}, not a shared or per-CPU line")
+            }
+        };
+        if intid == gic::TIMER_INTID {
+            timer_line = Some((kind, number));
+        }
+    }
+    let Some((kind, number)) = timer_line else {
+        fail!(
+            "the tree's timer is not on INTID {}, which is the line this kernel's \
+             clock is armed on",
+            gic::TIMER_INTID
+        );
+    };
+    let _ = writeln!(
+        out,
+        "devices: PL011 at {serial_base:#x}, GIC at {dist:#x}/{cpu:#x}, timer on {} \
+         {number} (INTID {})",
+        if kind == 1 { "PPI" } else { "SPI" },
+        gic::TIMER_INTID,
+    );
+
+    // And the transports the next piece of stage 5 will drive, checked against
+    // the window the loader mapped: reachable is a property of the page tables,
+    // not of the tree, so this is the one claim here that the *tables* have to
+    // agree with rather than a constant in this file.
+    let (mut virtio, mut outside) = (0usize, None);
+    let walked = tree.each(
+        |node| node.is_compatible("virtio,mmio"),
+        |node| {
+            virtio += 1;
+            for (address, size) in node.reg() {
+                let (start, end) = (address as usize, (address + size) as usize);
+                if start < paging::DEVICE_BASE || end > paging::DEVICE_BASE + paging::DEVICE_WINDOW
+                {
+                    outside = Some((node.name(), address, size));
+                }
+            }
+            true
+        },
+    );
+    if let Err(error) = walked {
+        fail!("the tree will not walk: {error:?}");
+    }
+    if let Some((name, address, size)) = outside {
+        fail!(
+            "the tree's {name} is at {address:#x}..{:#x}, outside the loader's \
+             {:#x}..{:#x} device window",
+            address + size,
+            paging::DEVICE_BASE,
+            paging::DEVICE_BASE + paging::DEVICE_WINDOW,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "devices: {virtio} virtio-mmio windows, all inside the {:#x}..{:#x} device window",
+        paging::DEVICE_BASE,
+        paging::DEVICE_BASE + paging::DEVICE_WINDOW,
+    );
+    let _ = writeln!(out, "M4_DEVICES_OK");
 }
 
 /// Stage 2's evidence: two kernel tasks alternate, and each one's registers are

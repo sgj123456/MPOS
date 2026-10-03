@@ -66,6 +66,10 @@ use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::fs::FileSystem;
 use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
 use uefi::prelude::*;
+#[cfg(target_arch = "aarch64")]
+use uefi::system::with_config_table;
+#[cfg(target_arch = "aarch64")]
+use uefi::{Guid, guid};
 
 use elf::PAGE_SIZE;
 use handoff::{Handoff, MAGIC, MAX_MEM_REGIONS, Region};
@@ -97,6 +101,32 @@ pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     }
     n
 }
+
+/// The GUID a UEFI firmware publishes a device tree under - `EFI_DTB_TABLE_GUID`,
+/// which is the one the Linux EFI stub looks for and the one AAVMF uses.
+///
+/// A device tree is not passed in a register on this machine. Stages 1b-1d
+/// received one in `x0` because QEMU's `-kernel` puts it there, which was the
+/// bring-up instrument stage 1e deleted; a real firmware describes itself
+/// through the configuration table instead, and that is firmware data - it does
+/// not survive `exit_boot_services`, so the tree has to be copied out like the
+/// two files above.
+#[cfg(target_arch = "aarch64")]
+const DTB_GUID: Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
+
+/// The first two words of a device tree header: its magic, and the size it
+/// claims for itself.
+///
+/// Spelled out here rather than shared with the kernel's reader (`crates/fdt`)
+/// for the same reason [`MAGIC`] is: there is no crate between this loader and
+/// the kernel, and these two numbers are the whole of what a *copy* needs. The
+/// kernel parses the tree and says what it found; this reads them so it knows
+/// how many bytes to copy, and refuses a blob that is not a tree at the point
+/// where the mistake is still attributable to the firmware.
+#[cfg(target_arch = "aarch64")]
+const FDT_MAGIC: u32 = 0xd00d_feed;
+#[cfg(target_arch = "aarch64")]
+const FDT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Where the kernel and its two companions are on the boot partition. Fixed
 /// names rather than a boot entry or a config file: the layout is decided by the
@@ -160,6 +190,8 @@ const EMPTY_HANDOFF: Handoff = Handoff {
         kind: 0,
         reserved: 0,
     }; MAX_MEM_REGIONS],
+    dtb_phys: 0,
+    dtb_len: 0,
 };
 
 #[entry]
@@ -232,7 +264,15 @@ fn main() -> Status {
         };
         at
     };
-    let cmdline_mem = copy_to_frames(cmdline);
+    let cmdline_mem = copy_to_frames(cmdline, "command line");
+    // The machine's own description of itself, read and copied while the
+    // firmware still has it. On x86_64 the record carries no tree at all: that
+    // machine is described by ACPI, and this port reads none of it, so the
+    // length says "absent" rather than the kernel being handed an empty one.
+    #[cfg(target_arch = "aarch64")]
+    let (dtb_phys, dtb_len) = copy_device_tree();
+    #[cfg(not(target_arch = "aarch64"))]
+    let (dtb_phys, dtb_len) = (0u64, 0u64);
 
     unsafe { core::ptr::write_bytes(root_frame as *mut u8, 0, PAGE_SIZE as usize) };
     unsafe { kernel.load(image_mem as *mut u8, vm::KERNEL_VIRT_BASE) };
@@ -303,6 +343,8 @@ fn main() -> Status {
         cmdline_mem,
         cmdline.len(),
         stack,
+        dtb_phys,
+        dtb_len,
     );
     drop(after);
 
@@ -402,12 +444,20 @@ unsafe fn enter(record: *const Handoff, entry: u64, stack_top: u64, root: u64) -
             sctlr = lateout(reg) _,
         );
         core::arch::asm!(
+            // The record is *placed* in `x0` by the compiler rather than moved
+            // there by an instruction, and that is a correctness requirement
+            // rather than a style: an instruction writing `x0` is invisible to
+            // the register allocator, so `{entry}` may itself be allocated
+            // `x0` - and then the move of the record overwrites the branch
+            // target and `br` jumps into the handoff record. Measured, not
+            // reasoned: the first boot with a slightly larger loader did
+            // exactly that, and `Entering EL1` became a synchronous exception
+            // at the record's own address.
             "mov sp, {stack}",
-            "mov x0, {record}",
             "br {entry}",
             stack = in(reg) stack_top,
             entry = in(reg) entry,
-            record = in(reg) record,
+            in("x0") record,
             options(noreturn)
         )
     }
@@ -428,6 +478,8 @@ fn write_handoff(
     cmdline_phys: u64,
     cmdline_len: usize,
     stack_phys_base: u64,
+    dtb_phys: u64,
+    dtb_len: u64,
 ) {
     let mut record = EMPTY_HANDOFF;
     let mut count = 0usize;
@@ -469,6 +521,8 @@ fn write_handoff(
     // nothing to the kernel once it has built its own tables.
     record.boot_stack_base = vm::HHDM_OFFSET + stack_phys_base;
     record.region_count = count as u64;
+    record.dtb_phys = dtb_phys;
+    record.dtb_len = dtb_len;
 
     // The one write to the static, after everything in it is final: the kernel
     // reads this record on a machine where boot services and this function no
@@ -483,14 +537,68 @@ fn write_handoff(
 }
 
 /// Copy a byte string into frames of its own and return where they are.
-fn copy_to_frames(bytes: &[u8]) -> u64 {
+fn copy_to_frames(bytes: &[u8], what: &str) -> u64 {
     if bytes.is_empty() {
         return 0;
     }
     let pages = (bytes.len() as u64).div_ceil(PAGE_SIZE) as usize;
-    let at = allocate(pages, "command line");
+    let at = allocate(pages, what);
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
     at
+}
+
+/// The firmware's device tree, copied into frames of its own.
+///
+/// Answers the physical address and the length, or `(0, 0)` when the firmware
+/// published none - which the kernel reports by name rather than reading as an
+/// empty machine.
+///
+/// The buffer the configuration table points at has no length of its own: the
+/// only thing that says how much of it is the tree is the tree's own header, so
+/// this reads the first two words and takes `totalsize` bytes. QEMU's blob
+/// claims a megabyte around eight kilobytes of meaning, which is why the number
+/// is read rather than assumed.
+#[cfg(target_arch = "aarch64")]
+fn copy_device_tree() -> (u64, u64) {
+    let (found, published) = with_config_table(|entries| {
+        let found = entries
+            .iter()
+            .find(|entry| entry.guid == DTB_GUID)
+            .map(|entry| entry.address as u64);
+        let published: Vec<Guid> = entries.iter().map(|entry| entry.guid).collect();
+        (found, published)
+    });
+
+    let Some(at) = found else {
+        // Say what the firmware *did* publish. A machine that hands its tree
+        // over under another name is one line away from this log and an
+        // afternoon away from the words "no device tree" on their own.
+        for guid in &published {
+            log(&format!("config table: {guid}"));
+        }
+        log("the firmware published no device tree");
+        return (0, 0);
+    };
+
+    // SAFETY: the firmware named this address as its device tree, and nothing
+    // has left boot services yet, so the blob is still there and still its own.
+    let head = unsafe { core::slice::from_raw_parts(at as *const u8, 8) };
+    let magic = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+    let total = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+    assert_eq!(
+        magic, FDT_MAGIC,
+        "the firmware's device tree opens with {magic:#x}, not a device tree magic"
+    );
+    assert!(
+        total <= FDT_MAX_BYTES,
+        "the firmware's device tree claims {total} bytes, more than the kernel reads"
+    );
+    // SAFETY: as above. `total` is the size the tree states for itself, which
+    // is the only size there is.
+    let tree = unsafe { core::slice::from_raw_parts(at as *const u8, total) };
+    let mem = copy_to_frames(tree, "device tree");
+    log(&format!("device tree: {total} bytes at phys {mem:#x}"));
+    (mem, total as u64)
 }
 
 /// Allocate `pages` contiguous pages the kernel will never be handed.

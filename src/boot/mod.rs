@@ -103,6 +103,14 @@ pub struct BootInfo {
     /// The command line the bootloader was given for this kernel. `/proc/cmdline`
     /// reports it, and the initramfs's init reads it to learn `root=`.
     pub cmdline: &'static str,
+    /// The machine's own description of itself, on a machine that has one.
+    ///
+    /// A device tree is how a firmware describes a machine with no PCI and no
+    /// ACPI: which devices exist, where their registers are, which interrupt
+    /// line each is on. `None` means the firmware published none, which is
+    /// every x86_64 boot - so a caller that *needs* one asks for it by name
+    /// rather than treating the absence as an empty machine.
+    pub dtb: Option<&'static [u8]>,
     /// The lowest word of the boot stack, where the loader left its canary, or
     /// zero when the loader planted none. [`check_boot_stack`] reads it; nothing
     /// else needs it, and nothing may write through it.

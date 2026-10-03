@@ -288,6 +288,7 @@ dependencies = [
  "mpos-date",
  "mpos-err",
  "mpos-evdev",
+ "mpos-fdt",
  "mpos-gpu",
  "mpos-pci",
  "mpos-seccomp",
@@ -340,6 +341,10 @@ version = "0.1.0"
 
 [[package]]
 name = "mpos-evdev"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-fdt"
 version = "0.1.0"
 
 [[package]]

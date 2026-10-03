@@ -128,6 +128,12 @@ pub mod hal;
 /// arithmetic, and arithmetic is worth a host test. Its waiter numbers are
 /// opaque there (`evdev::WaiterId`); the driver that can name a task converts.
 pub use mpos_evdev as evdev;
+/// The device tree reader: the flattened blob a firmware hands over on a
+/// machine that describes itself, walked for the nodes and properties a driver
+/// asks about. Its own leaf crate, because every question it answers is
+/// arithmetic on a `&[u8]` and arithmetic is worth a host test; the machine
+/// half - which compatible string means the serial port - stays in `arch`.
+pub use mpos_fdt as fdt;
 /// The GPU's host-testable logic: the DRM blobs, cursor composition,
 /// sync-object state machine, the `DRM_VIRTGPU_*` answers, and the virtio-gpu
 /// wire ABI. Each is pure and tested on the host; the machine bodies stay in

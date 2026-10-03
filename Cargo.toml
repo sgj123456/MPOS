@@ -55,6 +55,11 @@ mpos-gpu = { path = "crates/gpu" }
 # which is what their waiter numbers used to require.
 mpos-evdev = { path = "crates/evdev" }
 mpos-uinput = { path = "crates/uinput" }
+# The device tree reader: the second machine's description of itself, read as
+# bytes. Pure - a blob in, names and numbers out - so the part that can be wrong
+# in a way only a boot would show is the part a host test can pin. Stage 5's
+# first piece; see `PLAN.md` §9.1.
+mpos-fdt = { path = "crates/fdt" }
 
 # Used by the arch-agnostic mapping plan, so deliberately not target-gated.
 # Already in the tree as a dependency of `x86_64`.
