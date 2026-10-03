@@ -191,6 +191,7 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
     check_user_memory();
     check_paging_ops();
     check_wallclock();
+    check_cpu();
     check_el0();
     halt()
 }
@@ -1827,6 +1828,68 @@ fn check_wallclock() {
         pl031::BASE
     );
     let _ = writeln!(out, "M6_WALL_OK");
+}
+
+/// Stage 6e's evidence: the CPU and interrupt-controller primitives `hal::Cpu`
+/// and `hal::Interrupts` need on this machine and did not have - enabling user
+/// SIMD, masking a line, and parking on an interrupt. Each is read back through
+/// the register the write moved, not assumed: FP access from `CPACR_EL1`, the
+/// distributor's own set-enable bit, and the clock's tick count across `idle`.
+fn check_cpu() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M6_CPU_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    // `enable_user_simd` must give EL0 the FPU, or a user program's first FP
+    // instruction traps. The proof is `CPACR_EL1.FPEN` reading back as full access.
+    vectors::enable_user_simd();
+    let fpen = (vectors::cpacr() >> 20) & 0b11;
+    if fpen != 0b11 {
+        fail!("enable_user_simd left CPACR_EL1.FPEN at {fpen:#b}, not 0b11");
+    }
+
+    // Masking must reach the distributor. Use the serial's line - wired but idle -
+    // so the test cannot disturb the clock: enable, read the bit set, disable,
+    // read it clear. A `disable` that silently did nothing shows up here rather
+    // than as a line that keeps interrupting a driver that asked it to stop.
+    vectors::disable_interrupts();
+    gic::enable(gic::SERIAL_INTID);
+    if !gic::is_enabled(gic::SERIAL_INTID) {
+        fail!("enable(SERIAL_INTID) did not set the distributor's enable bit");
+    }
+    gic::disable(gic::SERIAL_INTID);
+    if gic::is_enabled(gic::SERIAL_INTID) {
+        fail!("disable(SERIAL_INTID) left the distributor's enable bit set");
+    }
+
+    // `idle` must be woken by an interrupt and return with them masked - the two
+    // halves of its contract. Re-arm the clock for the next period and park on it:
+    // the tick count rising says something woke it, and `interrupts_enabled`
+    // false after says it closed the door on the way out.
+    timer::arm_next_period();
+    let before = timer::ticks();
+    vectors::idle();
+    if timer::ticks() == before {
+        fail!("idle() returned without any interrupt waking it");
+    }
+    if vectors::interrupts_enabled() {
+        fail!("idle() returned with interrupts still enabled");
+    }
+
+    let _ = writeln!(
+        out,
+        "cpu: CPACR.FPEN full access after enable_user_simd; a distributor line \
+         enabled then masked and read back; idle() woken by the clock (tick \
+         {before} -> {}) and returning with interrupts off",
+        timer::ticks()
+    );
+    let _ = writeln!(out, "M6_CPU_OK");
 }
 
 /// Bring the machine's interrupts up: the vector table, then the controller,

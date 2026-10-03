@@ -37,6 +37,11 @@ const GICD_CTLR: usize = 0x000;
 const GICD_IGROUPR: usize = 0x080;
 /// Set-enable: one bit per INTID, write-1-to-set.
 const GICD_ISENABLER: usize = 0x100;
+/// Clear-enable: one bit per INTID, write-1-to-clear. [`GICD_ISENABLER`]'s
+/// inverse, and the reason [`disable`] is a plain store rather than a
+/// read-modify-write like [`enable`]'s `set_bit`: writing the bit clears it, and
+/// the other bits in the word are unaffected.
+const GICD_ICENABLER: usize = 0x180;
 /// Priority: one byte per INTID. Lower is more urgent.
 const GICD_IPRIORITYR: usize = 0x400;
 
@@ -57,6 +62,11 @@ pub const SPURIOUS: u32 = 1023;
 
 /// The non-secure EL1 physical timer's PPI (14), as INTID 30.
 pub const TIMER_INTID: u32 = 30;
+
+/// The PL011's SPI 1, as INTID 33 - the tree's `interrupts = <0 1 4>`. It is
+/// wired but unmasked nothing yet (the console is polled until stage 4); it is
+/// named so the `Line::Serial` a driver will unmask maps to a real line here.
+pub const SERIAL_INTID: u32 = 33;
 
 fn read(base: usize, offset: usize) -> u32 {
     // SAFETY: every offset above names a register of one of the two frames, and
@@ -88,6 +98,22 @@ fn set_priority(intid: u32, priority: u8) {
 /// Let `intid` be delivered.
 pub fn enable(intid: u32) {
     set_bit(DIST, GICD_ISENABLER, intid);
+}
+
+/// Stop `intid` being delivered. [`enable`]'s inverse; a device that is about to
+/// be torn down masks its own line first so no interrupt lands on a driver that
+/// has let go of its rings.
+pub fn disable(intid: u32) {
+    let reg = GICD_ICENABLER + 4 * (intid / 32) as usize;
+    write(DIST, reg, 1 << (intid % 32));
+}
+
+/// Whether `intid` is currently enabled, as the distributor says. [`enable`] and
+/// [`disable`] set the bit; this reads it back, which is what makes a mask that
+/// silently did nothing a failure rather than a line that quietly never fires.
+pub fn is_enabled(intid: u32) -> bool {
+    let reg = GICD_ISENABLER + 4 * (intid / 32) as usize;
+    read(DIST, reg) & (1 << (intid % 32)) != 0
 }
 
 /// Bring the controller up with the timer's line enabled.

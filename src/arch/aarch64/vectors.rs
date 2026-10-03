@@ -379,3 +379,65 @@ pub fn enable_interrupts() {
         core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
     }
 }
+
+/// Block the core from taking interrupts: set `DAIF.I`.
+pub fn disable_interrupts() {
+    // SAFETY: the inverse of `enable_interrupts`'s `daifclr, #2`.
+    unsafe {
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+    }
+}
+
+/// Wait for the next interrupt and return with interrupts masked - the idle path
+/// a scheduler parks an exhausted core on.
+///
+/// The mask on the way out is the whole contract: a task woken by this must find
+/// interrupts off so it does not get preempted mid-resume, and `wfi` returning is
+/// not itself a guarantee one is masked off after. This is `enable; wfi; disable`
+/// where x86_64's is `sti; hlt; cli`.
+pub fn idle() {
+    enable_interrupts();
+    // SAFETY: `wfi` parks the core until an interrupt (or an event); it has no
+    // other side effect and is exactly what the boot's `halt` loop already uses.
+    unsafe {
+        core::arch::asm!("wfi", options(nomem, nostack));
+    }
+    disable_interrupts();
+}
+
+/// `CPACR_EL1`, read fresh - the register that decides who may use the FPU/SIMD.
+pub fn cpacr() -> u64 {
+    let value: u64;
+    // SAFETY: `CPACR_EL1` is readable at EL1 with no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cpacr_el1", out(reg) value, options(nomem, nostack));
+    }
+    value
+}
+
+/// Give EL0 access to the FPU/SIMD registers by setting `CPACR_EL1.FPEN` to
+/// `0b11` (full access at EL1 and EL0), then an `isb` so the new permissions
+/// cover the next instruction.
+///
+/// Without this an EL0 program's first FP instruction traps at EL1, and a user
+/// program that uses `neon` - which is almost every optimized one - faults before
+/// it can do anything. x86_64's twin sets `CR4.OSFXSR`/`OSXMMEXCPT` and clears
+/// `CR0.TS`; the requirement ("userland expects the kernel to have turned the FPU
+/// on") is the same, the register is not.
+pub fn enable_user_simd() {
+    const FPEN: u64 = 0b11 << 20;
+    let value = cpacr() | FPEN;
+    // SAFETY: writing `CPACR_EL1` back with only `FPEN` added is a plain system-
+    // register write at EL1; the other fields (`ZEN`, `TTA`, ...) are preserved by
+    // read-modify-write rather than clobbered. The `isb` after it is the
+    // architecture's requirement for a control-register change to take effect on
+    // the following instruction stream.
+    unsafe {
+        core::arch::asm!(
+            "msr cpacr_el1, {value}",
+            "isb",
+            value = in(reg) value,
+            options(nomem, nostack),
+        );
+    }
+}

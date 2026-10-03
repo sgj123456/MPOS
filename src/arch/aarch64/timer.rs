@@ -106,6 +106,20 @@ pub fn init() {
     enable();
 }
 
+/// Re-arm the timer to fire one period from now, leaving the tick count alone.
+///
+/// A check that needs a *guaranteed pending interrupt* without disturbing the
+/// count already taken - the idle path, which must be woken by something. The
+/// compare is a level source, so moving the deadline into the near future asserts
+/// the line once more exactly one tick later.
+pub fn arm_next_period() {
+    let now = read_cntpct();
+    let deadline = now.wrapping_add(PERIOD.load(Ordering::Relaxed));
+    NEXT.store(deadline, Ordering::Relaxed);
+    set_deadline(deadline);
+    enable();
+}
+
 /// The counter's raw value, for callers that need the machine's own units.
 pub fn counter() -> u64 {
     read_cntpct()

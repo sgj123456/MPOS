@@ -83,14 +83,15 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// Stage 6b's check is in the same position as 5b's - the EL0 check that stage 6a
 /// ended the list with still runs after it - so `M6_AS_OK` is deliberately *not*
 /// here and `M6_AS_FAILED` is. Stage 6c sits between 6b and 6a's EL0 check for the
-/// same reason: `M6_PAGING_OK` is not a terminator and `M6_PAGING_FAILED` is, and
-/// so is stage 6d's `M6_WALL_OK` / `M6_WALL_FAILED`.
-const TERMINATORS: [&str; 12] = [
+/// same reason: `M6_PAGING_OK` is not a terminator and `M6_PAGING_FAILED` is, and so
+/// are stages 6d and 6e (`M6_WALL_FAILED`, `M6_CPU_FAILED`).
+const TERMINATORS: [&str; 13] = [
     "M6_EL0_OK",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
     "M6_PAGING_FAILED",
     "M6_WALL_FAILED",
+    "M6_CPU_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
@@ -146,8 +147,9 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // process needs answered - which root is active, which is the kernel's, is a
     // range touchable, is a page copy-on-write, write a word through a root -
     // `M6_WALL_OK` says the machine has a persistent clock this kernel can reach
-    // through the device window, and `M6_EL0_OK` says the kernel ran a program at
-    // EL0 and answered the call it made.
+    // through the device window, `M6_CPU_OK` says user SIMD is turned on and a
+    // line can be masked and an interrupt waited on, and `M6_EL0_OK` says the
+    // kernel ran a program at EL0 and answered the call it made.
     let markers = [
         ("M4_DEVICES_OK", "devices"),
         ("M3_TABLES_OK", "page tables"),
@@ -157,6 +159,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ("M6_AS_OK", "user address space"),
         ("M6_PAGING_OK", "running-process paging"),
         ("M6_WALL_OK", "wall clock"),
+        ("M6_CPU_OK", "cpu and interrupt primitives"),
         ("M6_EL0_OK", "EL0"),
     ];
     let missing: Vec<&str> = markers
@@ -168,8 +171,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!();
         println!(
             "aarch64 boot: M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, M1_TIMER_OK, \
-             M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK and M6_EL0_OK, from \
-             the ESP under AAVMF"
+             M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK and \
+             M6_EL0_OK, from the ESP under AAVMF"
         );
         return Ok(());
     }
