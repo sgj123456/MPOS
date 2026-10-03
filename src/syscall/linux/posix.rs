@@ -1213,7 +1213,7 @@ pub fn handle_setdomainname(args: [usize; ARG_COUNT]) -> isize {
     let Ok(name) = core::str::from_utf8(&bytes[..len]) else {
         return err::EINVAL;
     };
-    crate::vfs::procfs::set_domainname(name);
+    crate::sched::current_uts().set_domainname(name);
     0
 }
 
