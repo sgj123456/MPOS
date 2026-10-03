@@ -44,6 +44,7 @@ use anyhow::{Context, Result, bail};
 /// so each pair collapsed to a one-way edge). No pair was added in exchange:
 /// the platform tag is `hal`'s own type and `arch` implements the traits for
 /// it, so `arch → hal` is the only arrow between the two. Was 17 before it.
+///
 /// **14 now**, after the HAL's second stage: rerouting the interrupt controller
 /// (`pic::set_masked`, `lapic::init`, `idt::NET_IRQ_VECTOR`) through
 /// `crate::hal::Interrupts` took `drivers → arch` to zero, leaving only the
@@ -58,7 +59,15 @@ use anyhow::{Context, Result, bail};
 /// `ARCHITECTURE.md` §9: the trait says *what a mapping is* in `mm`'s words,
 /// and `mm` asks the HAL to program the window it hands out. A change that
 /// lowers the count must still lower this constant.
-const BASELINE_MUTUAL_PAIRS: usize = 14;
+///
+/// **12 now**, after stage 4 of the HAL (`PLAN.md` §11.4): with the saved
+/// context, the FPU state and the user frame behind `crate::hal::Contexts`,
+/// `sched → arch` and `syscall → arch` both fell to zero and the last two
+/// `arch ↔ …` pairs went with them (`arch ↔ sched`, `arch ↔ syscall`). Was 14
+/// before it (S3, which swapped `arch ↔ mm` for `hal ↔ mm`), 15 after S2 and 17
+/// before S1 - worth having here: each number names what removed it, so a
+/// regression has a step to point at.
+const BASELINE_MUTUAL_PAIRS: usize = 12;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.
 ///
@@ -143,30 +152,20 @@ impl Graph {
     }
 }
 
-/// References to `crate::arch::` from a layer that is not the machine layer.
+/// Modules allowed to name `crate::arch::`.
 ///
-/// **This is the door the HAL exists to shut.** `arch` and `hal` are exempt (the
-/// machine layer may name itself) and so is `main` (the wiring, which reaches the
-/// machine before any HAL call can exist) - neither appears here because neither
-/// is counted. Every other module's count is recorded at the value the tree has
-/// today and may only fall.
+/// **The door the HAL exists to shut, and it is shut.** After stage 4 of
+/// `PLAN.md` §11.4 every reference to `crate::arch::` outside these three is
+/// zero - `sched` and `syscall`, the last two, went when the saved context, the
+/// FPU state and the user frame moved behind `crate::hal::Contexts`. The list is
+/// an allow-list rather than a table of ceilings so that a *new* module reaching
+/// for the machine layer fails immediately, not only a growing one.
 ///
-/// `sched` and `syscall` are what is left, and stage 4 of `PLAN.md` §11.4 is the
-/// step that takes both to zero. The finding recorded there and worth having
-/// here: the conversion *into* the Linux `user_regs_struct` array
-/// (`abi::uregs`) **cannot** be the thing that moves into `arch`, because `arch`
-/// naming the ABI layer is an `arch → syscall` edge - the one direction the whole
-/// design forbids. So the array conversion stays in the ABI layer and the frame
-/// type has to expose enough operations for it; that is why S4 is designed
-/// around `UserFrameOps`, not around moving `capture_frame`.
-const BASELINE_ARCH_REFERENCES: &[(&str, usize)] = &[
-    // `Context`, `FpuState`, `UserContext`, the switch/FPU/bootstrap calls and
-    // `gdt::set_kernel_stack`.
-    ("sched", 17),
-    // `syscall/linux/proc.rs`: `gdt::user_selectors` twice and the `UserContext`
-    // construction - the register frame's builder.
-    ("syscall", 4),
-];
+/// `arch` is the machine layer itself and `hal` implements the traits for it;
+/// `main` is the wiring, which reaches the machine before a HAL call can exist
+/// (the boot tables and the milestone checks). `lib` is the crate root, which
+/// declares the modules.
+const ARCH_EXEMPT: &[&str] = &["arch", "hal", "main", "lib"];
 
 /// Everything the ratchet looks at, measured once.
 pub struct Report {
@@ -203,11 +202,11 @@ impl Report {
             ));
         }
 
-        for (module, baseline) in BASELINE_ARCH_REFERENCES {
-            let measured = self.graph.weight(module, "arch");
-            if measured > *baseline {
+        for (from, to, weight) in self.graph.edges() {
+            if to == "arch" && !ARCH_EXEMPT.contains(&from.as_str()) {
                 out.push(format!(
-                    "{module} names crate::arch:: {measured} times, up from the recorded {baseline}"
+                    "{from} names crate::arch:: {weight} times; only {} may reach the machine layer directly",
+                    ARCH_EXEMPT.join("/")
                 ));
             }
         }
@@ -284,11 +283,10 @@ pub fn run(root: &Path) -> Result<()> {
         "  mutual pairs               {}/{BASELINE_MUTUAL_PAIRS}",
         pairs.len()
     );
-    for (module, baseline) in BASELINE_ARCH_REFERENCES {
-        println!(
-            "  -> crate::arch::           {module:8} {}/{baseline}",
-            report.graph.weight(module, "arch")
-        );
+    for (from, to, weight) in report.graph.edges() {
+        if to == "arch" && !ARCH_EXEMPT.contains(&from.as_str()) {
+            println!("  -> crate::arch::           {from:8} {weight} (NOT EXEMPT)");
+        }
     }
 
     let violations = report.violations();

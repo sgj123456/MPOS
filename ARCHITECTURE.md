@@ -434,7 +434,10 @@ only arrow). S2 then took it to **14**: with the interrupt controller behind `ha
 `drivers → arch` fell to zero and the `arch ↔ drivers` pair collapsed. S3 kept it at **14**
 while swapping which pair it is: paging behind `hal::Paging` removed `arch ↔ mm` (`mm` stopped
 naming `arch`) and created `hal ↔ mm` (the trait speaks `mm`'s mapping vocabulary; `mm` asks the
-HAL to program an MMIO window), which §9 argues is the seam's neighbour, not a leak. The tables in this section are the audit's
+HAL to program an MMIO window), which §9 argues is the seam's neighbour, not a leak. S4 took it
+to **12**: with the saved context, the FPU state and the user frame behind `hal::Contexts`,
+`sched` and `syscall` stopped naming `arch` entirely, so the last two pairs — `arch ↔ sched` and
+`arch ↔ syscall` — collapsed. The tables in this section are the audit's
 snapshot and are left as they were read; from here the command is what they have to agree with, and
 it fails when an edge appears that was not there when the baseline was recorded. Two further rules
 ride with it, each a ratchet at its recorded number rather than an absolute refusal: no layer below
@@ -591,5 +594,7 @@ with two hard rules: **nothing below `syscall` names `syscall`**, and **nothing 
 `vfs` names `vfs`'s concrete device types**. Both are measured now rather than asserted:
 `cargo xtask depgraph` reports the counts and fails when either grows (§6, `PLAN.md` §11.2
 Step G). A third rule rides with them from the HAL work (`PLAN.md` §11.4): **no layer outside
-`arch`/`hal`/`main` names `crate::arch::`** — `sched` (17) and `syscall` (4) are the two that
-still do, recorded as a ceiling that may only fall, and stage 4 is the step that takes them to 0.
+`arch`/`hal`/`main`/`lib` names `crate::arch::`** — an allow-list rather than a ceiling, and it
+is now satisfied at zero. Stages 1–4 moved the clock, wall clock, CPU control, the interrupt
+controller, paging and the task context behind `crate::hal`, which took the two last holders
+(`sched`, `syscall`) to zero and collapsed the last two `arch ↔ …` pairs.

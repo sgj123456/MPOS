@@ -276,4 +276,80 @@ impl crate::hal::Paging for crate::hal::Current {
     }
 }
 
+impl crate::hal::Contexts for crate::hal::Current {
+    type Context = context::Context;
+    type Fpu = context::FpuState;
+    type UserFrame = context::UserContext;
+
+    const FPU_BYTES: usize = context::FPU_BYTES;
+
+    #[inline]
+    fn fpu_trapped() -> bool {
+        context::fpu_trapped()
+    }
+
+    #[inline]
+    unsafe fn save_live_fpu(state: &mut Self::Fpu) {
+        // SAFETY: the caller's contract, passed through unchanged.
+        unsafe { context::save_live_fpu(state) }
+    }
+
+    #[inline]
+    unsafe fn restore_fpu(state: &Self::Fpu) {
+        // SAFETY: as above.
+        unsafe { context::restore_fpu(state) }
+    }
+
+    #[inline]
+    unsafe fn claim_live_fpu() {
+        // SAFETY: as above.
+        unsafe { context::claim_live_fpu() }
+    }
+
+    #[inline]
+    unsafe fn reset_live_fpu() {
+        // SAFETY: as above.
+        unsafe { context::reset_live_fpu() }
+    }
+
+    #[inline]
+    fn set_kernel_stack(top: usize) {
+        gdt::set_kernel_stack(top)
+    }
+
+    #[inline]
+    unsafe fn bootstrap(
+        stack_top: usize,
+        entry: extern "C" fn(usize) -> !,
+        slot: usize,
+        interruptible: bool,
+    ) -> Self::Context {
+        // SAFETY: the caller's contract, passed through unchanged.
+        unsafe { context::bootstrap(stack_top, entry, slot, interruptible) }
+    }
+
+    #[inline]
+    unsafe fn switch(from: *mut Self::Context, to: *const Self::Context) {
+        // SAFETY: as above.
+        unsafe { context::switch(from, to) }
+    }
+
+    #[inline]
+    unsafe fn resume_user(frame: *const Self::UserFrame) -> ! {
+        // SAFETY: as above.
+        unsafe { context::resume_user(frame) }
+    }
+
+    #[inline]
+    unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
+        // SAFETY: as above.
+        unsafe { context::enter_user(entry, user_rsp) }
+    }
+
+    fn user_segments() -> (usize, usize) {
+        let (code, data) = gdt::user_selectors();
+        (code.0 as usize, data.0 as usize)
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}

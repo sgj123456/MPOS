@@ -275,7 +275,174 @@ pub trait Paging {
 }
 
 /// A machine this kernel can run on. `Current` names the one being built.
-pub trait Platform: Clock + WallClock + Cpu + Interrupts + Paging + Sized + 'static {}
+pub trait Platform:
+    Clock + WallClock + Cpu + Interrupts + Paging + Contexts + Sized + 'static
+{
+}
+
+/// A task's saved machine state: what a context switch swaps.
+pub trait ContextOps {
+    /// The floating-point half, which a switch does not save wholesale - it is
+    /// saved when a task gives up the FPU and restored when it takes it back.
+    type Fpu: FpuOps;
+
+    /// A context with nothing in it: a task that has never run, whose first
+    /// switch-in falls out of the bootstrap the machine prepared for it.
+    fn empty() -> Self;
+
+    /// This context's FPU state.
+    fn fpu(&self) -> &Self::Fpu;
+
+    /// The same, to write.
+    fn fpu_mut(&mut self) -> &mut Self::Fpu;
+}
+
+/// A task's floating-point state, as an opaque value the machine can copy.
+pub trait FpuOps {
+    /// The boot-state value: no register of userland has been touched yet.
+    fn reset() -> Self;
+
+    /// The state as the bytes a debugger reads. On x86_64 `PTRACE_GETFPREGS` is
+    /// the machine's own save area, so the two shapes are one.
+    fn to_bytes(&self) -> [u8; FPU_BYTES];
+
+    /// The inverse.
+    fn from_bytes(bytes: &[u8; FPU_BYTES]) -> Self;
+}
+
+/// The register state a task resumes ring 3 with.
+///
+/// Opaque on purpose: what a caller above the seam does with it is copy it or
+/// redirect it, never name a register. The machine's register names are legal
+/// in exactly one other place, the x86_64 Linux ABI layer, because there the
+/// ABI *is* the register layout.
+pub trait UserFrameOps: Copy {
+    /// A `fork`/`clone` child's frame: the caller's registers, resuming on
+    /// `child_stack` when it is non-zero and on the caller's own stack when it
+    /// is zero. The return-value register is inherited rather than zeroed - the
+    /// callers that want a zero hand in a frame whose result slot already is.
+    fn forked(&self, child_stack: usize) -> Self;
+
+    /// Write the syscall's return value into the frame.
+    fn set_result(&mut self, value: isize);
+
+    /// The instruction pointer, for a signal handler's frame.
+    fn ip(&self) -> usize;
+
+    /// The same, to write.
+    fn set_ip(&mut self, ip: usize);
+
+    /// The stack pointer.
+    fn sp(&self) -> usize;
+
+    /// The same, to write.
+    fn set_sp(&mut self, sp: usize);
+
+    /// This frame in the Linux `user_regs_struct` field order, written into
+    /// `out` (whose length is the ABI's register count), with `tls` as the
+    /// thread pointer.
+    ///
+    /// This is the one place the machine's registers and the ABI's field order
+    /// meet, and it belongs to the machine: *which ABI field a register goes
+    /// in* is exactly what differs between one machine's frame and another's.
+    fn to_user_regs(&self, tls: usize, out: &mut [u64]);
+
+    /// The inverse: the frame a tracer's register file describes.
+    fn from_user_regs(regs: &[u64]) -> Self;
+
+    /// Hand the CPU to this frame. Never returns.
+    ///
+    /// # Safety
+    /// The frame must describe a ring-3 entry or resume point; the caller is
+    /// the scheduler, which only builds them from a task's own record.
+    unsafe fn resume(&self) -> !;
+}
+
+/// The task context: the machine's saved state, its floating-point half, and
+/// the frame a task resumes ring 3 with.
+pub trait Contexts {
+    /// The saved kernel context a switch swaps.
+    type Context: ContextOps<Fpu = Self::Fpu>;
+
+    /// The floating-point state.
+    type Fpu: FpuOps;
+
+    /// The ring-3 register state.
+    type UserFrame: UserFrameOps;
+
+    /// Bytes [`FpuOps::to_bytes`] moves, and the width of the FPU save area.
+    const FPU_BYTES: usize;
+
+    /// Whether the FPU is trapped: a task's state is live in the registers and
+    /// must be saved before anything else touches them.
+    fn fpu_trapped() -> bool;
+
+    /// Save the live FPU registers into a task's state.
+    ///
+    /// # Safety
+    /// Must be called with the FPU belonging to the task being saved.
+    unsafe fn save_live_fpu(state: &mut Self::Fpu);
+
+    /// Load a task's FPU state into the registers.
+    ///
+    /// # Safety
+    /// As above, for the task being restored.
+    unsafe fn restore_fpu(state: &Self::Fpu);
+
+    /// Take ownership of the live FPU registers for the current task.
+    ///
+    /// # Safety
+    /// Only from the context that is actually running.
+    unsafe fn claim_live_fpu();
+
+    /// Give the FPU back to "no task owns it".
+    ///
+    /// # Safety
+    /// Only from the context that actually holds it.
+    unsafe fn reset_live_fpu();
+
+    /// Point the CPU's privilege-transition stack at `top` (the TSS's ring-0
+    /// stack on x86_64), so the next trap from ring 3 lands on this task's.
+    fn set_kernel_stack(top: usize);
+
+    /// Prepare a kernel task's first context: `entry` runs on the top of the
+    /// stack, with `slot` in the register the entry point takes it in, and
+    /// `interruptible` deciding whether the task may park.
+    ///
+    /// # Safety
+    /// `stack_top` must be the top of a stack nothing else uses.
+    unsafe fn bootstrap(
+        stack_top: usize,
+        entry: extern "C" fn(usize) -> !,
+        slot: usize,
+        interruptible: bool,
+    ) -> Self::Context;
+
+    /// Switch from one saved context to another. Only ever called from the
+    /// scheduler's own switch path, holding no lock.
+    ///
+    /// # Safety
+    /// Both pointers must outlive the switch and refer to contexts of live
+    /// tasks.
+    unsafe fn switch(from: *mut Self::Context, to: *const Self::Context);
+
+    /// Enter ring 3 with `frame`. Never returns.
+    ///
+    /// # Safety
+    /// The frame must be a user task's entry or resume point.
+    unsafe fn resume_user(frame: *const Self::UserFrame) -> !;
+
+    /// Enter ring 3 for the first time, at `entry` on `user_rsp`.
+    ///
+    /// # Safety
+    /// `entry` must be a mapped user address and `user_rsp` a usable stack.
+    unsafe fn enter_user(entry: usize, user_rsp: usize) -> !;
+
+    /// The `cs`/`ss` a ring-3 frame carries on this machine, as the Linux
+    /// `user_regs_struct` reports them. Asked by the ABI layer, which fills
+    /// those two fields of a frame it builds from the syscall gate's record.
+    fn user_segments() -> (usize, usize);
+}
 
 /// The platform this build targets.
 ///
@@ -476,4 +643,103 @@ pub fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
 #[inline]
 pub fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
     <Current as Paging>::user_phys_for_virt_of(root, virt)
+}
+
+/// A task's saved kernel context.
+pub type Context = <Current as Contexts>::Context;
+
+/// A task's floating-point state.
+pub type Fpu = <Current as Contexts>::Fpu;
+
+/// A task's ring-3 register state.
+pub type UserFrame = <Current as Contexts>::UserFrame;
+
+/// Bytes of FPU state, and the width of its save area.
+///
+/// A crate-level const rather than only the trait's associated one, because it
+/// is used as an array length (`[u8; FPU_BYTES]`) and an associated const in an
+/// array length needs `generic_const_exprs`.
+pub const FPU_BYTES: usize = <Current as Contexts>::FPU_BYTES;
+
+/// Whether the FPU's state is live in the registers right now.
+#[inline]
+pub fn fpu_trapped() -> bool {
+    <Current as Contexts>::fpu_trapped()
+}
+
+/// Save the live FPU registers into a task's state.
+#[inline]
+pub unsafe fn save_live_fpu(state: &mut Fpu) {
+    unsafe { <Current as Contexts>::save_live_fpu(state) }
+}
+
+/// Load a task's FPU state into the registers.
+#[inline]
+pub unsafe fn restore_fpu(state: &Fpu) {
+    unsafe { <Current as Contexts>::restore_fpu(state) }
+}
+
+/// Take ownership of the live FPU registers for the current task.
+#[inline]
+pub unsafe fn claim_live_fpu() {
+    unsafe { <Current as Contexts>::claim_live_fpu() }
+}
+
+/// Give the FPU back to "no task owns it".
+#[inline]
+pub unsafe fn reset_live_fpu() {
+    unsafe { <Current as Contexts>::reset_live_fpu() }
+}
+
+/// Point the CPU's privilege-transition stack at `top`.
+#[inline]
+pub fn set_kernel_stack(top: usize) {
+    <Current as Contexts>::set_kernel_stack(top)
+}
+
+/// Prepare a kernel task's first context.
+///
+/// # Safety
+/// `stack_top` must be the top of a stack nothing else uses.
+#[inline]
+pub unsafe fn bootstrap(
+    stack_top: usize,
+    entry: extern "C" fn(usize) -> !,
+    slot: usize,
+    interruptible: bool,
+) -> Context {
+    unsafe { <Current as Contexts>::bootstrap(stack_top, entry, slot, interruptible) }
+}
+
+/// Switch from one saved context to another.
+///
+/// # Safety
+/// Both pointers must outlive the switch and refer to live tasks' contexts.
+#[inline]
+pub unsafe fn switch_context(from: *mut Context, to: *const Context) {
+    unsafe { <Current as Contexts>::switch(from, to) }
+}
+
+/// Enter ring 3 with `frame`. Never returns.
+///
+/// # Safety
+/// The frame must be a user task's entry or resume point.
+#[inline]
+pub unsafe fn resume_user(frame: *const UserFrame) -> ! {
+    unsafe { <Current as Contexts>::resume_user(frame) }
+}
+
+/// Enter ring 3 for the first time, at `entry` on `user_rsp`.
+///
+/// # Safety
+/// `entry` must be a mapped user address and `user_rsp` a usable stack.
+#[inline]
+pub unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
+    unsafe { <Current as Contexts>::enter_user(entry, user_rsp) }
+}
+
+/// The `cs`/`ss` a ring-3 frame carries on this machine.
+#[inline]
+pub fn user_segments() -> (usize, usize) {
+    <Current as Contexts>::user_segments()
 }

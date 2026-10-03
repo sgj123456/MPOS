@@ -662,7 +662,7 @@ fn capture_frame(regs_ptr: *mut (), rax: usize) -> [u64; abi::uregs::COUNT] {
     use abi::uregs::*;
 
     let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
-    let (code, data) = crate::arch::gdt::user_selectors();
+    let (code, data) = crate::hal::user_segments();
     let mut regs = [0u64; COUNT];
     regs[R15] = frame.r15 as u64;
     regs[R14] = frame.r14 as u64;
@@ -681,10 +681,10 @@ fn capture_frame(regs_ptr: *mut (), rax: usize) -> [u64; abi::uregs::COUNT] {
     regs[RDI] = frame.rdi as u64;
     regs[ORIG_RAX] = frame.rax as u64;
     regs[RIP] = frame.rcx as u64;
-    regs[CS] = code.0 as u64;
+    regs[CS] = code as u64;
     regs[EFLAGS] = frame.r11 as u64;
     regs[RSP] = frame.user_rsp as u64;
-    regs[SS] = data.0 as u64;
+    regs[SS] = data as u64;
     // The thread-local base is a CPU register, not a frame word: the gate
     // reinstalls it from the task on every switch, so the task is where it is
     // read from - and where a `PTRACE_SETREGS` puts it back.
@@ -1795,13 +1795,13 @@ fn tell_tracer_of_child(regs_ptr: *mut ()) {
 ///
 /// Returns `None` when there is no frame: a call made outside the gate has no
 /// registers to name.
-fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::arch::context::UserContext> {
+fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::hal::UserFrame> {
     if regs_ptr.is_null() {
         return None;
     }
     let regs = unsafe { &*(regs_ptr as *const RegsFrame) };
-    let (code, data) = crate::arch::gdt::user_selectors();
-    Some(crate::arch::context::UserContext {
+    let (code, data) = crate::hal::user_segments();
+    Some(crate::hal::UserFrame {
         // `syscall` parked the return address in rcx and the caller's flags in
         // r11; those two are what an `iretq` needs to reproduce the state the
         // instruction left behind.
@@ -1811,8 +1811,8 @@ fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::arch::context::U
         rax,
         rbx: regs.rbx,
         rbp: regs.rbp,
-        cs: code.0 as usize,
-        ss: data.0 as usize,
+        cs: code,
+        ss: data,
         r12: regs.r12,
         r13: regs.r13,
         r14: regs.r14,

@@ -32,8 +32,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use critical_section::Mutex;
 
-use crate::arch::context::{self, Context, UserContext};
-use crate::arch::gdt;
+use crate::hal::{Context, ContextOps, UserFrame, UserFrameOps};
+
 use crate::hal;
 use crate::hal::AddressSpace;
 use crate::mm::elf::{self, Image};
@@ -1067,7 +1067,7 @@ struct Task {
     /// register file at the moment of the call, with `rax` set to zero. A
     /// child resumes mid-program rather than at the entry point, so it needs
     /// a whole register file where a freshly spawned task needs one address.
-    user_resume: Option<UserContext>,
+    user_resume: Option<UserFrame>,
     /// The thread group this task runs in: the frames behind its mappings and
     /// how many threads share them. A process with no threads has a group of
     /// one, so every task has one and nothing has to ask whether it is a
@@ -1538,9 +1538,9 @@ impl Table {
             // Safe: `fpu_live` implies `CR0.TS` is clear - the only two things
             // that set the bit are this function and the switch it feeds, and
             // both clear the flag of every task they aim the bit at.
-            debug_assert!(!crate::arch::context::fpu_trapped());
+            debug_assert!(!hal::fpu_trapped());
             let task = self.task_mut(from);
-            unsafe { crate::arch::context::save_live_fpu(&mut task.context.fpu) };
+            unsafe { hal::save_live_fpu(task.context.fpu_mut()) };
             task.fpu_live = false;
         }
         self.task_mut(to).fpu_live = false;
@@ -1560,16 +1560,16 @@ impl Table {
     /// task, is also what keeps `PTRACE_GETFPREGS` honest: a running task's
     /// saved block is stale by design, and this and the switch are the only two
     /// places that make it current.
-    fn inherit_fpu(&mut self, id: TaskId) -> crate::arch::context::FpuState {
+    fn inherit_fpu(&mut self, id: TaskId) -> hal::Fpu {
         let task = self.task_mut(id);
         if task.fpu_live {
-            debug_assert!(!crate::arch::context::fpu_trapped());
+            debug_assert!(!hal::fpu_trapped());
             // Safe: `fpu_live` implies `CR0.TS` clear, by the same argument as
             // in `hand_over_fpu`.
-            unsafe { crate::arch::context::save_live_fpu(&mut task.context.fpu) };
+            unsafe { hal::save_live_fpu(task.context.fpu_mut()) };
         }
-        let bytes = task.context.fpu.to_bytes();
-        crate::arch::context::FpuState::from_bytes(&bytes)
+        let bytes = task.context.fpu().to_bytes();
+        hal::Fpu::from_bytes(&bytes)
     }
 
     /// Make `id`'s saved floating-point block current before somebody reads it.
@@ -1588,7 +1588,7 @@ impl Table {
         if live {
             let task = self.task_mut(id);
             // Safe: `fpu_live` implies `CR0.TS` clear.
-            unsafe { crate::arch::context::save_live_fpu(&mut task.context.fpu) };
+            unsafe { hal::save_live_fpu(task.context.fpu_mut()) };
         }
     }
 
@@ -1603,14 +1603,14 @@ impl Table {
     fn reclaim_fpu(&mut self) {
         // Safe: the caller is the `#NM` handler, so the bit is set - clearing
         // it is what lets the faulting instruction be re-executed.
-        unsafe { crate::arch::context::claim_live_fpu() };
+        unsafe { hal::claim_live_fpu() };
         let id = self.current;
         let task = self.task_mut(id);
         if !task.fpu_live {
             // Safe: the image is this task's own, 16-byte aligned because
             // `FpuState` is the first member of `Context`, and the registers
             // were just released to it.
-            unsafe { crate::arch::context::restore_fpu(&task.context.fpu) };
+            unsafe { hal::restore_fpu(task.context.fpu()) };
             task.fpu_live = true;
         }
     }
@@ -1630,7 +1630,7 @@ impl Table {
         };
         hal::switch_to_root(root);
         if let Some(stack) = &task.stack {
-            gdt::set_kernel_stack(stack.top());
+            hal::set_kernel_stack(stack.top());
         }
         // FS.base is one register for the whole CPU, so every task that wants
         // its own thread-local storage has to reinstall it here. A process with
@@ -1878,7 +1878,7 @@ impl Table {
         let stack = Stack::new();
         // Safety: the stack was just allocated and nothing else can reach it, so
         // the space below its top is ours to write the bootstrap state into.
-        let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, interruptible) };
+        let context = unsafe { hal::bootstrap(stack.top(), task_entry, slot, interruptible) };
 
         self.tasks[slot] = Some(Task {
             context,
@@ -2319,7 +2319,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
-        let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, true) };
+        let context = unsafe { hal::bootstrap(stack.top(), task_entry, slot, true) };
 
         t.tasks[slot] = Some(Task {
             context,
@@ -2454,7 +2454,7 @@ pub fn try_spawn_user(
 
         // Safety: as in `create`, the stack was just allocated and nothing else
         // can reach it, so the bootstrap state below its top is ours to write.
-        let context = unsafe { context::bootstrap(stack.top(), task_entry, slot, true) };
+        let context = unsafe { hal::bootstrap(stack.top(), task_entry, slot, true) };
 
         // A process's descriptors are its own from the first instruction: the
         // standard three over the console, and nothing of anyone else's - not
@@ -4415,65 +4415,23 @@ pub fn trace_regs(id: TaskId) -> Option<[u64; abi::uregs::COUNT]> {
 /// The register file a task that has never been out of the kernel would resume
 /// with, in the order `PTRACE_GETREGS` reports it.
 ///
-/// Three of the twenty-seven slots have no counterpart in [`UserContext`], and
-/// each for a reason: no syscall is in flight, so `orig_rax` is nothing; and
-/// `rcx` and `r11` are the two registers the `syscall` instruction itself
-/// clobbers, which is why the structure does not carry them - a program cannot
-/// be relying on them across a call, so there is nothing to carry. The segment
-/// registers the structure does not name are left zero, which is the value the
-/// machine reads them as. `fs_base` is not in the structure either because it
-/// is per *task*: the task table holds it, and it is handed in here.
-fn context_regs(state: &UserContext, tls: usize) -> [u64; abi::uregs::COUNT] {
-    use abi::uregs::*;
-
-    let mut regs = [0u64; COUNT];
-    regs[R15] = state.r15 as u64;
-    regs[R14] = state.r14 as u64;
-    regs[R13] = state.r13 as u64;
-    regs[R12] = state.r12 as u64;
-    regs[RBP] = state.rbp as u64;
-    regs[RBX] = state.rbx as u64;
-    regs[R10] = state.r10 as u64;
-    regs[R9] = state.r9 as u64;
-    regs[R8] = state.r8 as u64;
-    regs[RAX] = state.rax as u64;
-    regs[RDX] = state.rdx as u64;
-    regs[RSI] = state.rsi as u64;
-    regs[RDI] = state.rdi as u64;
-    regs[RIP] = state.rip as u64;
-    regs[CS] = state.cs as u64;
-    regs[EFLAGS] = state.rflags as u64;
-    regs[RSP] = state.rsp as u64;
-    regs[SS] = state.ss as u64;
-    regs[FS_BASE] = tls as u64;
+/// This is where the machine's frame meets the ABI's `user_regs_struct`, and
+/// the machine side does the translation ([`UserFrameOps::to_user_regs`]): which
+/// ABI field a register goes in is exactly what differs between one machine's
+/// frame and another's, and the three slots this kernel has nothing for - no
+/// syscall is in flight, so `orig_rax` is nothing; and `rcx`/`r11` are the two
+/// the `syscall` instruction itself clobbers - are left zero there, the value
+/// the ABI reads for a register nobody can be relying on.
+fn context_regs(state: &UserFrame, tls: usize) -> [u64; abi::uregs::COUNT] {
+    let mut regs = [0u64; abi::uregs::COUNT];
+    state.to_user_regs(tls, &mut regs);
     regs
 }
 
 /// The other direction: turn a register file a tracer may have rewritten back
 /// into the state the one-way door into ring 3 reads.
-fn context_from_regs(regs: &[u64; abi::uregs::COUNT]) -> UserContext {
-    use abi::uregs::*;
-
-    UserContext {
-        rip: regs[RIP] as usize,
-        rsp: regs[RSP] as usize,
-        rflags: regs[EFLAGS] as usize,
-        rax: regs[RAX] as usize,
-        rbx: regs[RBX] as usize,
-        rbp: regs[RBP] as usize,
-        cs: regs[CS] as usize,
-        ss: regs[SS] as usize,
-        r12: regs[R12] as usize,
-        r13: regs[R13] as usize,
-        r14: regs[R14] as usize,
-        r15: regs[R15] as usize,
-        rdi: regs[RDI] as usize,
-        rsi: regs[RSI] as usize,
-        rdx: regs[RDX] as usize,
-        r8: regs[R8] as usize,
-        r9: regs[R9] as usize,
-        r10: regs[R10] as usize,
-    }
+fn context_from_regs(regs: &[u64; abi::uregs::COUNT]) -> UserFrame {
+    UserFrame::from_user_regs(regs)
 }
 
 /// Replace the register file `id` will resume with. False when the task is
@@ -4504,22 +4462,22 @@ pub fn set_trace_regs(id: TaskId, regs: &[u64; abi::uregs::COUNT]) -> bool {
 /// A stopped task's saved block is current: every switch out of a task writes
 /// its live registers there, and a task that is stopped has been switched out at
 /// least once since it last ran.
-pub fn trace_fpu(id: TaskId) -> Option<[u8; crate::arch::context::FPU_BYTES]> {
+pub fn trace_fpu(id: TaskId) -> Option<[u8; hal::FPU_BYTES]> {
     with_table(|t| {
         t.sync_fpu(id);
         t.tasks
             .get(id.0)?
             .as_ref()
-            .map(|task| task.context.fpu.to_bytes())
+            .map(|task| task.context.fpu().to_bytes())
     })
 }
 
 /// Replace the floating-point registers `id` will resume with. The same rule as
 /// [`set_trace_regs`]: only a stopped task's state is the kernel's to rewrite.
-pub fn set_trace_fpu(id: TaskId, bytes: &[u8; crate::arch::context::FPU_BYTES]) -> bool {
+pub fn set_trace_fpu(id: TaskId, bytes: &[u8; hal::FPU_BYTES]) -> bool {
     with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
         Some(task) if !task.exited && task.trace.stop.is_some() => {
-            task.context.fpu = crate::arch::context::FpuState::from_bytes(bytes);
+            *task.context.fpu_mut() = hal::Fpu::from_bytes(bytes);
             true
         }
         _ => false,
@@ -7210,7 +7168,7 @@ fn schedule(prepare: impl FnOnce(&mut Table)) {
         // Deliberately not `with_table`: the borrow has to be dead before the
         // switch below, and a closure would hold it across.
         let (from, to) = unsafe { (*TABLE.borrow(cs).get()).hand_over(prepare) };
-        unsafe { context::switch(from, to) };
+        unsafe { hal::switch_context(from, to) };
     });
 }
 
@@ -7232,7 +7190,7 @@ fn schedule(prepare: impl FnOnce(&mut Table)) {
 /// The file descriptor table is inherited, not copied: the child gets the same
 /// `Arc<FdTable>` the parent holds, which is what a shell's `execve` after
 /// `fork` needs. A `CLONE_FILES`-style split is the job of `clone`, not `fork`.
-pub fn fork(state: &UserContext) -> isize {
+pub fn fork(state: &UserFrame) -> isize {
     spawn_copy(state, CloneRequest::default())
 }
 
@@ -7244,7 +7202,7 @@ pub fn fork(state: &UserContext) -> isize {
 /// this kernel does not reproduce - see [`clone`] for why a copy meets the
 /// contract better here than a share would - but which of the two events a
 /// tracer is waiting for is not something it can recover for itself.
-pub fn vfork(state: &UserContext) -> isize {
+pub fn vfork(state: &UserFrame) -> isize {
     spawn_copy(
         state,
         CloneRequest {
@@ -7284,7 +7242,7 @@ pub struct CloneRequest {
 /// files under the same numbers, which is what a shell's `dup2`-then-`execve`
 /// after a `fork` needs - and what it needs is for the parent's own `close` to
 /// stay on the parent's side of the fork.
-fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
+fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
     // Phase 1: Collect all parent state under one immutable borrow, then
     // release it before any mutations.
     let (
@@ -7376,13 +7334,13 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
         // parent's RFLAGS: a fork child resumes inside a syscall gate, and the
         // gate runs with IF clear. Enabling them any earlier would let the clock
         // fire on a task that has not reached user mode yet.
-        let mut context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
+        let mut context = unsafe { hal::bootstrap(stack.top(), task_entry, slot, false) };
         // The child's floating-point registers are its creator's: they are part
         // of what `fork` and a thread-creating `clone` copy, and `bootstrap`
         // would otherwise hand over the architectural reset state. `inherit_fpu`
         // reads them out of the parent - from the registers while they are still
         // the parent's, from the parent's saved block when they are no longer.
-        context.fpu = t.inherit_fpu(parent_id);
+        *context.fpu_mut() = t.inherit_fpu(parent_id);
 
         // The child's address space is not a copy of every page: a
         // *frame-backed* range - a memfd, a dma-buf, the framebuffer, or the
@@ -7474,16 +7432,10 @@ fn spawn_copy(state: &UserContext, request: CloneRequest) -> isize {
             // The child does not start at the entry point: it returns from the
             // `fork` that made it, so it carries a whole register file instead.
             user_entry: None,
-            user_resume: Some(UserContext {
-                // A thread starts on the stack `clone` handed it; a process
-                // comes back from the call on the stack its parent was using.
-                rsp: if request.child_stack != 0 {
-                    request.child_stack
-                } else {
-                    state.rsp
-                },
-                ..*state
-            }),
+            // The child does not start at the entry point: it returns from the
+            // `fork` that made it, so it carries a whole register file instead.
+            // The stack is the caller's unless `clone` named another.
+            user_resume: Some(state.forked(request.child_stack)),
             mm: {
                 // A child's address space is its parent's, so what the parent
                 // was *loaded* with is the child's report too - `/proc` on
@@ -7650,9 +7602,9 @@ pub fn exec_replace(
         // record of what follows: once the reset block is in the live registers
         // this task genuinely owns them, and saying so saves the new image a
         // pointless fault in its first `memcpy`.
-        unsafe { crate::arch::context::claim_live_fpu() };
-        unsafe { crate::arch::context::reset_live_fpu() };
-        task.context.fpu = crate::arch::context::FpuState::reset();
+        unsafe { hal::claim_live_fpu() };
+        unsafe { hal::reset_live_fpu() };
+        *task.context.fpu_mut() = hal::Fpu::reset();
         task.fpu_live = true;
 
         // --- Build new address space ---
@@ -7919,7 +7871,7 @@ fn scheduler_loop() {
             let next = unsafe { (*TABLE.borrow(cs).get()).next_turn() };
             match next {
                 Some((from, to)) => {
-                    unsafe { context::switch(from, to) };
+                    unsafe { hal::switch_context(from, to) };
                     true
                 }
                 None => false,
@@ -7963,7 +7915,7 @@ fn scheduler_loop() {
 /// the child execs; with a private copy of memory there is nothing the parent
 /// could corrupt by continuing, so suspending it would buy nothing - and every
 /// `CLONE_VFORK` caller in practice (`posix_spawn`) waits on the child itself.
-pub fn clone(state: &UserContext, request: CloneRequest) -> isize {
+pub fn clone(state: &UserFrame, request: CloneRequest) -> isize {
     if request.flags & nr::CLONE_THREAD != 0 {
         return spawn_thread(state, request);
     }
@@ -7983,7 +7935,7 @@ pub fn clone(state: &UserContext, request: CloneRequest) -> isize {
 /// and `rsp` on the stack it was given, which is how a libc's thread entry
 /// finds its way back to the function it was asked to run: it set that up on
 /// the new stack before calling in.
-fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
+fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
     // A thread with no stack of its own would run on its creator's, and the
     // first thing either of them did would corrupt the other. Linux leaves
     // this to the caller; refusing is the kinder answer.
@@ -8042,11 +7994,11 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
         let stack = Stack::new();
         // Interrupts stay off until the thread's `iretq` restores the flags it
         // was created with, exactly as a fork child's does.
-        let mut context = unsafe { context::bootstrap(stack.top(), task_entry, slot, false) };
+        let mut context = unsafe { hal::bootstrap(stack.top(), task_entry, slot, false) };
         // The child's floating-point registers are its creator's, read the same
         // way `fork`'s child reads them: from the registers if the parent still
         // holds them, from its saved block if it does not.
-        context.fpu = t.inherit_fpu(parent_id);
+        *context.fpu_mut() = t.inherit_fpu(parent_id);
 
         t.tasks[slot] = Some(Task {
             context,
@@ -8066,13 +8018,13 @@ fn spawn_thread(state: &UserContext, request: CloneRequest) -> isize {
             // one place a `ps -T` and a `Threads:` line can disagree.
             user: true,
             user_entry: None,
-            user_resume: Some(UserContext {
+            user_resume: Some({
                 // The child returns from the call with zero, and lands on the
                 // stack the caller provided - the one it pushed `func` and
                 // `arg` onto before asking for a thread.
-                rax: 0,
-                rsp: request.child_stack,
-                ..*state
+                let mut frame = state.forked(request.child_stack);
+                frame.set_result(0);
+                frame
             }),
             signals: 0,
             siginfo: [signal::SigInfo::ZERO; signal::SIGINFO_SLOTS],
@@ -8228,7 +8180,7 @@ extern "C" fn task_entry(slot: usize) -> ! {
         let resume = task
             .user_resume
             .as_ref()
-            .map_or(core::ptr::null(), |state| state as *const UserContext);
+            .map_or(core::ptr::null(), |state| state as *const UserFrame);
         (
             task.body.take(),
             task.user_entry.take(),
@@ -8250,12 +8202,12 @@ extern "C" fn task_entry(slot: usize) -> ! {
         }
         // A forked child: come back from the `fork` call its parent made, with
         // `rax` zero. One way door, exactly as below.
-        unsafe { context::resume_user(resume) };
+        unsafe { hal::resume_user(resume) };
     }
     if let Some((entry, user_rsp)) = user {
         // One way door: the kernel stack this task arrived on stays behind as
         // nothing but the trap target, and the reaper eventually frees it.
-        unsafe { context::enter_user(entry, user_rsp) };
+        unsafe { hal::enter_user(entry, user_rsp) };
     }
     panic!("task {slot} has neither a body nor a user image")
 }

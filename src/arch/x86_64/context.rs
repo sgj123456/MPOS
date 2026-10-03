@@ -557,3 +557,198 @@ global_asm!(
     // `entry` is `-> !`. If it ever returns there is nothing left to run.
     "    ud2",
 );
+
+// The machine's answers to the HAL's context contract. Every body that has an
+// inherent method to reach forwards to it as `Type::<name>`, deliberately
+// *without* the trait in scope, so the path can only resolve to the inherent
+// impl and cannot recurse into this same block.
+impl crate::hal::ContextOps for Context {
+    type Fpu = FpuState;
+
+    #[inline]
+    fn empty() -> Context {
+        Context::empty()
+    }
+
+    #[inline]
+    fn fpu(&self) -> &FpuState {
+        &self.fpu
+    }
+
+    #[inline]
+    fn fpu_mut(&mut self) -> &mut FpuState {
+        &mut self.fpu
+    }
+}
+
+impl crate::hal::FpuOps for FpuState {
+    #[inline]
+    fn reset() -> FpuState {
+        FpuState::reset()
+    }
+
+    #[inline]
+    fn to_bytes(&self) -> [u8; FPU_BYTES] {
+        FpuState::to_bytes(self)
+    }
+
+    #[inline]
+    fn from_bytes(bytes: &[u8; FPU_BYTES]) -> FpuState {
+        FpuState::from_bytes(bytes)
+    }
+}
+
+/// `RIP`/`RSP`/`CS`/`SS` in the Linux x86_64 `user_regs_struct`, and the whole
+/// of the field order [`UserContext`] is written out in.
+///
+/// From the x86_64 Linux ABI, `struct user_regs_struct` - the twin table is
+/// `crate::syscall::linux::abi::uregs`, which is where the ABI's own code reads
+/// it. The duplication is deliberate and *checked*: `main.rs`'s milestone checks
+/// assert this table against that one on every boot, so the two cannot drift
+/// silently. They cannot share a definition because this module is bare-metal
+/// only and `abi.rs` is host-compiled too - the gate is on the module, so a
+/// shared constant would have to live on one side of it or the other.
+mod uregs {
+    pub const R15: usize = 0;
+    pub const R14: usize = 1;
+    pub const R13: usize = 2;
+    pub const R12: usize = 3;
+    pub const RBP: usize = 4;
+    pub const RBX: usize = 5;
+    pub const R10: usize = 7;
+    pub const R9: usize = 8;
+    pub const R8: usize = 9;
+    pub const RAX: usize = 10;
+    pub const RDX: usize = 12;
+    pub const RSI: usize = 13;
+    pub const RDI: usize = 14;
+    pub const RIP: usize = 16;
+    pub const CS: usize = 17;
+    pub const EFLAGS: usize = 18;
+    pub const RSP: usize = 19;
+    pub const SS: usize = 20;
+    pub const FS_BASE: usize = 21;
+    pub const COUNT: usize = 27;
+}
+
+/// The field order this table and `abi::uregs` must agree on, for the boot check.
+pub const ABI_REG_INDEX: [(&str, usize); 19] = [
+    ("R15", uregs::R15),
+    ("R14", uregs::R14),
+    ("R13", uregs::R13),
+    ("R12", uregs::R12),
+    ("RBP", uregs::RBP),
+    ("RBX", uregs::RBX),
+    ("R10", uregs::R10),
+    ("R9", uregs::R9),
+    ("R8", uregs::R8),
+    ("RAX", uregs::RAX),
+    ("RDX", uregs::RDX),
+    ("RSI", uregs::RSI),
+    ("RDI", uregs::RDI),
+    ("RIP", uregs::RIP),
+    ("CS", uregs::CS),
+    ("EFLAGS", uregs::EFLAGS),
+    ("RSP", uregs::RSP),
+    ("SS", uregs::SS),
+    ("FS_BASE", uregs::FS_BASE),
+];
+
+/// The ABI's register count, from this side, for the same check.
+pub const ABI_REG_COUNT: usize = uregs::COUNT;
+
+impl crate::hal::UserFrameOps for UserContext {
+    #[inline]
+    fn forked(&self, child_stack: usize) -> UserContext {
+        let mut child = *self;
+        // A thread starts on the stack `clone` handed it; a process comes back
+        // from the call on the stack its parent was using.
+        if child_stack != 0 {
+            child.rsp = child_stack;
+        }
+        child
+    }
+
+    #[inline]
+    fn set_result(&mut self, value: isize) {
+        self.rax = value as usize;
+    }
+
+    #[inline]
+    fn ip(&self) -> usize {
+        self.rip
+    }
+
+    #[inline]
+    fn set_ip(&mut self, ip: usize) {
+        self.rip = ip;
+    }
+
+    #[inline]
+    fn sp(&self) -> usize {
+        self.rsp
+    }
+
+    #[inline]
+    fn set_sp(&mut self, sp: usize) {
+        self.rsp = sp;
+    }
+
+    fn to_user_regs(&self, tls: usize, out: &mut [u64]) {
+        use uregs::*;
+        debug_assert_eq!(out.len(), COUNT, "the ABI's register file is 27 words");
+
+        out[R15] = self.r15 as u64;
+        out[R14] = self.r14 as u64;
+        out[R13] = self.r13 as u64;
+        out[R12] = self.r12 as u64;
+        out[RBP] = self.rbp as u64;
+        out[RBX] = self.rbx as u64;
+        out[R10] = self.r10 as u64;
+        out[R9] = self.r9 as u64;
+        out[R8] = self.r8 as u64;
+        out[RAX] = self.rax as u64;
+        out[RDX] = self.rdx as u64;
+        out[RSI] = self.rsi as u64;
+        out[RDI] = self.rdi as u64;
+        out[RIP] = self.rip as u64;
+        out[CS] = self.cs as u64;
+        out[EFLAGS] = self.rflags as u64;
+        out[RSP] = self.rsp as u64;
+        out[SS] = self.ss as u64;
+        out[FS_BASE] = tls as u64;
+    }
+
+    fn from_user_regs(regs: &[u64]) -> UserContext {
+        use uregs::*;
+        // The slots this frame does not carry - `rcx`/`r11` (the two `syscall`
+        // clobbers), `orig_rax`, the segment bases but `fs` - are read past
+        // rather than stored: a task cannot be relying on them across a call.
+        UserContext {
+            rip: regs[RIP] as usize,
+            rsp: regs[RSP] as usize,
+            rflags: regs[EFLAGS] as usize,
+            rax: regs[RAX] as usize,
+            rbx: regs[RBX] as usize,
+            rbp: regs[RBP] as usize,
+            cs: regs[CS] as usize,
+            ss: regs[SS] as usize,
+            r12: regs[R12] as usize,
+            r13: regs[R13] as usize,
+            r14: regs[R14] as usize,
+            r15: regs[R15] as usize,
+            rdi: regs[RDI] as usize,
+            rsi: regs[RSI] as usize,
+            rdx: regs[RDX] as usize,
+            r8: regs[R8] as usize,
+            r9: regs[R9] as usize,
+            r10: regs[R10] as usize,
+        }
+    }
+
+    #[inline]
+    unsafe fn resume(&self) -> ! {
+        // SAFETY: the caller's contract, passed through unchanged.
+        unsafe { resume_user(self) }
+    }
+}

@@ -751,6 +751,51 @@ pub(crate) mod uregs {
     pub const BYTES: usize = COUNT * 8;
 }
 
+/// The ABI's register-file size, for the boot check that the machine's copy of
+/// the field order agrees with this one. See
+/// [`uregs_by_name`](self::uregs_by_name) for why the two are duplicated.
+pub const UREGS_COUNT: usize = uregs::COUNT;
+
+/// The index `name` occupies in `user_regs_struct`, for the boot check in
+/// `main.rs`: the machine's own copy of this table (`arch/x86_64/context.rs`)
+/// is asserted against it on every boot.
+///
+/// The two tables cannot share a definition - this one is host-compiled (its
+/// tests are host tests) and the machine's is bare-metal only - so the check is
+/// what keeps them from drifting, rather than a claim that duplication is free.
+pub fn uregs_by_name(name: &str) -> Option<usize> {
+    Some(match name {
+        "R15" => uregs::R15,
+        "R14" => uregs::R14,
+        "R13" => uregs::R13,
+        "R12" => uregs::R12,
+        "RBP" => uregs::RBP,
+        "RBX" => uregs::RBX,
+        "R11" => uregs::R11,
+        "R10" => uregs::R10,
+        "R9" => uregs::R9,
+        "R8" => uregs::R8,
+        "RAX" => uregs::RAX,
+        "RCX" => uregs::RCX,
+        "RDX" => uregs::RDX,
+        "RSI" => uregs::RSI,
+        "RDI" => uregs::RDI,
+        "ORIG_RAX" => uregs::ORIG_RAX,
+        "RIP" => uregs::RIP,
+        "CS" => uregs::CS,
+        "EFLAGS" => uregs::EFLAGS,
+        "RSP" => uregs::RSP,
+        "SS" => uregs::SS,
+        "FS_BASE" => uregs::FS_BASE,
+        "GS_BASE" => uregs::GS_BASE,
+        "DS" => uregs::DS,
+        "ES" => uregs::ES,
+        "FS" => uregs::FS,
+        "GS" => uregs::GS,
+        _ => return None,
+    })
+}
+
 /// Copy a register file out to the tracer's buffer, in `user_regs_struct`'s
 /// order. The caller has already checked the buffer is writable.
 pub(crate) fn write_user_regs(at: usize, regs: &[u64; uregs::COUNT]) {

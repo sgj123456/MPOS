@@ -628,6 +628,25 @@ fn check_arch(info: &BootInfo) {
         assert_eq!(interrupts::breakpoints_caught(), 1, "#BP was not caught");
         println!("breakpoint caught and returned from");
 
+        // The machine's copy of the Linux register-file field order must agree
+        // with the ABI's. The two tables are duplicated on purpose - one side is
+        // bare-metal only, the other is host-built, so neither can name the
+        // other's module - and this is what keeps the duplication honest rather
+        // than hoped-for (`arch/x86_64/context.rs`, `syscall/linux/abi.rs`).
+        for (name, index) in arch::context::ABI_REG_INDEX {
+            assert_eq!(
+                syscall::linux::abi::uregs_by_name(name),
+                Some(index),
+                "the machine's {name} disagrees with user_regs_struct"
+            );
+        }
+        assert_eq!(
+            syscall::linux::abi::UREGS_COUNT,
+            arch::context::ABI_REG_COUNT,
+            "the register file is a different size on the two sides"
+        );
+        println!("register file field order agrees with the ABI");
+
         println!("M1_OK");
     }
 

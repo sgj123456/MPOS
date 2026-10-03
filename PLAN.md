@@ -806,6 +806,24 @@ it - so the entries say which they are:
       the `drivers/rtc_dev.rs` doc link does not count. The design finding that reshaped S4 — the
       `abi::uregs` conversion cannot move into `arch` without an `arch → syscall` edge, so the
       frame must expose operations instead — is recorded in §11.4 beside the stage table
+- [x] **11.4 stage 4**: the task context is a capability, and the door shut behind it.
+      `crate::hal::Contexts` carries `type Context: ContextOps<Fpu = Self::Fpu>`, `type Fpu`,
+      `type UserFrame`, the FPU save/restore/claim/trap calls, `bootstrap`/`switch`/
+      `resume_user`/`enter_user`/`set_kernel_stack`, and `user_segments`. `sched` no longer names
+      `arch` at all: `task.context.fpu` is `fpu()`/`fpu_mut()`, `FpuState::reset`/`from_bytes` are
+      `hal::Fpu`, the two frame literals in `spawn_copy`/`spawn_thread` became
+      `UserFrameOps::forked` plus `set_result(0)`, and `context_regs`/`context_from_regs` are now
+      one-line calls onto `to_user_regs`/`from_user_regs` — the machine translating its own frame
+      into the ABI's field order, which is the half of the convergence that *can* live in `arch`.
+      `syscall/linux/proc.rs`'s `gdt::user_selectors` became `hal::user_segments()`. So
+      **`sched → arch` and `syscall → arch` are both 0**, `arch ↔ sched` and `arch ↔ syscall`
+      collapsed, and **mutual pairs went 14 → 12**; the depgraph's third rule became an allow-list
+      (`arch`/`hal`/`main`/`lib`) rather than a ceiling, so a *new* module reaching for the machine
+      layer fails at once. The duplication it left — the Linux register-file field order exists
+      once in `arch/x86_64/context.rs` and once in `syscall/linux/abi.rs`, because one side is
+      bare-metal and the other host-built — is *checked* on every boot in `M1` (`main.rs` asserts
+      all nineteen named indices and the count against the ABI's table), which is what makes it a
+      recorded agreement rather than a hope. Gate green: `pass=142 fail=0 (142 built)`, exit 33
 
 **ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
 
@@ -6486,7 +6504,7 @@ the argument for having done them first.
 - **Fixing V-10.** Accepted, documented, and cheaper to live with than a shared crate across two
   targets would be.
 
-### 11.4 The HAL: a machine seam under `arch/` — **S1–S3 LANDED, S5'S RATCHET LANDED; S4 OPEN**
+### 11.4 The HAL: a machine seam under `arch/` — **S1–S4 LANDED, THE DOOR IS SHUT**
 
 Phase 11 is "who names whom"; this is the largest remaining piece of it, deferred above until
 now. Goal: everything above the machine layer compiles against *capability traits* instead of
@@ -6514,8 +6532,8 @@ neutral.
 | S2 | `Interrupts` (`Line`, `unmask`/`mask`/`eoi`, `init_message_signalled`, `net_msi_vector`): `serial`, `virtio/net`, `lapic` | **landed** — pairs 15 → 14; gate `pass=142 fail=0` exit 33 |
 | S2 | `Interrupts` (`Line`, `unmask`/`eoi`/`net_irq`): `serial`, `virtio/net`, `lapic` | open |
 | S3 | `Paging` (`Space` assoc + `AddressSpaceOps`, `install`/`map_mmio`/`translate`/`user_accessible`/`is_cow_page`/`write_user_u32`/roots/switch/`phys_for_virt_of`); `PageTaken` moves to `mm::vm`; migrates `sched`, `mm`, `uaccess`, `syscall`, `main` | **landed** — pairs 14 → 14 (a swap: `arch ↔ mm` out, `hal ↔ mm` in); gate `pass=142 fail=0` exit 33 |
-| S4 | `Contexts`/`UserFrame`: `Context`/`Fpu`/`UserFrame` become assoc types; the `SegmentSelector` and register-frame leak into `sched`/`syscall` ends | **open** — see the design finding below |
-| S5 | close the door: `arch::x86_64` internals `pub(crate)`, reachable only through `hal`; a depgraph rule "no `crate::arch::` outside `arch`/`hal`/`main`" at 0 | **ratchet landed** (`sched` 17, `syscall` 4, may only fall); the closure itself waits for S4 |
+| S4 | `Contexts`: `Context`/`Fpu`/`UserFrame` as associated types behind `ContextOps`/`FpuOps`/`UserFrameOps`; `sched` and the ABI layer stop naming `arch` | **landed** — pairs 14 → 12 (`arch ↔ sched`, `arch ↔ syscall` gone); gate `pass=142 fail=0` exit 33 |
+| S5 | close the door: the depgraph rule becomes an allow-list (`arch`/`hal`/`main`/`lib`, everything else at 0), and `arch::x86_64`'s internals tighten to what the wiring still needs | **rule landed and absolute**; the visibility tightening is the remainder |
 
 S2–S4 touch the trap, page-fault and context-switch paths, so each needs the full QEMU gate,
 not host+clippy alone. S1 was pure re-routing — host tests, both clippy targets and the depgraph
