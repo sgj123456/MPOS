@@ -5582,6 +5582,22 @@ cleanly, and the boot reaches its terminal halt with no exception). An interacti
 still gated - but only on the genuine prerequisites, serial **RX** (stage 7) and a `/init`
 that does not exit one-shot - not on this switch any more.
 
+**Stage 7a's first cut is DONE: the PL011 receive half reads, pinned by a loopback
+probe.** Every marker through 6E was about *transmit* - the boot talks, it does not
+listen. `arch::aarch64::pl011` now has a non-blocking `read_byte` (polls `FR.RXFE`,
+returns `Some`/`None`) and a `loopback_echoes` that sets the UART's `CR.LBE` (which ties
+TX back to RX inside the PL011 and takes the wire output off) and checks that a written
+probe byte comes back through `DR`. `check_serial_rx` runs between `check_cpu` and
+`check_tls` and prints `M6_SERIAL_RX_OK`/`_FAILED`; `M6_SERIAL_RX_FAILED` joins the
+`TERMINATORS` list (its `_OK` is not a terminator - the TLS/EL0/init checks come after).
+Boot-aarch64 is now **fourteen** markers. Measured on QEMU's model: the loopback echoes
+synchronously, so the check is deterministic with no terminal. What this lays and what
+remains for a typed shell: the RX *primitive* exists and is proven; the next cut wires it
+into the tty/console read so a userspace `read(0)` returns typed bytes, then puts a shell
+(a static musl `ash`) into the aarch64 initramfs - the `aarch64-unknown-linux-musl` target
+is installable here and Alpine aarch64 packages are fetchable, so there is no environment
+wall, only stages left to walk.
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64

@@ -229,6 +229,7 @@ pub unsafe fn boot(handoff: *const Handoff, milestone: fn(), init: fn(*const u8,
     check_paging_ops();
     check_wallclock();
     check_cpu();
+    check_serial_rx();
     check_tls();
     check_el0();
     halt()
@@ -1967,6 +1968,32 @@ fn check_cpu() {
         timer::ticks()
     );
     let _ = writeln!(out, "M6_CPU_OK");
+}
+
+/// Stage 7's first evidence: the console's *receive* half actually reads.
+///
+/// Every marker above this one is about transmit - the boot has been talking, not
+/// listening. An interactive shell needs the other direction, and a headless boot
+/// cannot type into the wire, so the check drives the PL011's own loopback (`LBE`,
+/// which ties TX back to RX inside the UART and takes the wire output off): a
+/// written probe byte must come out of the receive FIFO. That exercises the exact
+/// registers the read path uses (`FR.RXFE` for "is there a byte", `DR` for the
+/// byte) without needing a terminal, and it would fail if RX were misread - the
+/// counterfactual a pin needs.
+fn check_serial_rx() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    let probe = b'x';
+    if !pl011::loopback_echoes(probe) {
+        let _ = writeln!(
+            out,
+            "M6_SERIAL_RX_FAILED: loopback probe {probe:#04x} did not read back through RX"
+        );
+        halt();
+    }
+    let _ = writeln!(out, "serial rx: loopback echoed the probe through RXFE/DR");
+    let _ = writeln!(out, "M6_SERIAL_RX_OK");
 }
 
 /// Stage 6h's evidence: the scheduler's thread-pointer write reaches the

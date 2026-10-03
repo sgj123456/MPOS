@@ -53,6 +53,12 @@ const ICR: usize = 0x44;
 
 /// `TXFF` - the transmit FIFO is full, so a byte written now would be lost.
 const FR_TXFF: u32 = 1 << 5;
+/// `RXFE` - the receive FIFO is empty, so there is nothing to read yet.
+const FR_RXFE: u32 = 1 << 4;
+/// `LBE` - loopback enable: the transmit line is wired back into the receiver
+/// and the wire output is disabled. This is how RX is exercised without a
+/// terminal, which the boot self-test uses (see [`loopback_echoes`]).
+const CR_LBE: u32 = 1 << 7;
 
 fn reg(offset: usize) -> *mut u32 {
     (BASE + offset) as *mut u32
@@ -116,9 +122,50 @@ pub fn write_str(text: &str) {
     }
 }
 
+/// Read one received byte, or `None` if the receive FIFO is empty right now.
+///
+/// Non-blocking by design: the interactive console this feeds has to poll the
+/// wire between other work, and a read that parks on a byte that may never come
+/// is the failure the x86 console already had to be fixed for. Turning this into
+/// a blocking read with wakeups is the interrupt path (the PL011's `RIS`/`IMSC`
+/// lines through the GIC), which is a later stage.
+pub fn read_byte() -> Option<u8> {
+    if read(FR) & FR_RXFE != 0 {
+        None
+    } else {
+        // `DR`'s low byte is the received datum; the upper bits are a framing
+        // status echo we do not surface here.
+        Some((read(DR) & 0xff) as u8)
+    }
+}
+
+/// Drive the UART's own loopback and check a written byte comes back on the
+/// receiver, without a terminal or the wire.
+///
+/// `LBE` ties transmit to receive inside the PL011 and disables the wire output,
+/// so this exercises the RX register path (`FR_RXFE`, `DR`) deterministically and
+/// silently - the boot cannot type into a headless run, but it can prove the read
+/// half of the console actually reads. Returns whether the probe byte echoed back.
+pub fn loopback_echoes(probe: u8) -> bool {
+    let cr = read(CR);
+    write(CR, cr | CR_LBE);
+    write_byte(probe);
+    // A bounded poll: in loopback the echo is internal and immediate, so an empty
+    // FIFO here means the RX path is genuinely broken, not merely slow.
+    let mut echoed = None;
+    for _ in 0..1000 {
+        if let Some(byte) = read_byte() {
+            echoed = Some(byte);
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    write(CR, cr & !CR_LBE);
+    echoed == Some(probe)
+}
+
 /// The `core::fmt` sink, so `write!` works against this UART.
 pub struct Writer;
-
 impl fmt::Write for Writer {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         write_str(text);
