@@ -107,8 +107,51 @@ pub trait Cpu {
     fn init_interrupts();
 }
 
+/// An interrupt line this kernel masks and unmasks by name.
+///
+/// Only the lines that cross the seam are named - a driver that must let
+/// delivery through says *which line it is on*, never which controller bit,
+/// because on another machine the line is not a PIC input at all. A
+/// message-signalled device (the network adapter) is not one of these: it has
+/// no line to mask, and asks [`Interrupts::net_msi_vector`] instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Line {
+    /// The programmable interval timer, the scheduler's clock.
+    Timer,
+    /// The first serial port (COM1).
+    Serial,
+}
+
+/// The interrupt controller: masking one line, acknowledging one, and the two
+/// facts a message-signalled device needs before it may arm MSI-X.
+pub trait Interrupts {
+    /// Allow delivery on `line`.
+    fn unmask(line: Line);
+
+    /// Block delivery on `line`.
+    fn mask(line: Line);
+
+    /// Acknowledge the interrupt in service on `line`, so the controller may
+    /// deliver the next one at or below its priority. Called from interrupt
+    /// context, so it must not lock, allocate or fault.
+    fn eoi(line: Line);
+
+    /// Bring up message-signalled delivery - on x86_64 the local APIC's page,
+    /// whose EOI register the handler writes last, and which must be mapped
+    /// before a device arms MSI-X. Idempotent; called by the driver that is
+    /// about to arm it, because the mapping needs a window the earliest boot
+    /// does not have.
+    fn init_message_signalled();
+
+    /// The vector an MSI-X message-table entry for the network adapter must
+    /// carry. A plain machine number rather than a neutral type because that is
+    /// exactly what the table entry holds - it is written into the device's
+    /// memory, not into the kernel's vocabulary.
+    fn net_msi_vector() -> u8;
+}
+
 /// A machine this kernel can run on. `Current` names the one being built.
-pub trait Platform: Clock + WallClock + Cpu + Sized + 'static {}
+pub trait Platform: Clock + WallClock + Cpu + Interrupts + Sized + 'static {}
 
 /// The platform this build targets.
 ///
@@ -198,4 +241,34 @@ pub fn enable_user_simd() {
 #[inline]
 pub fn init_interrupts() {
     <Current as Cpu>::init_interrupts()
+}
+
+/// Allow delivery on `line`.
+#[inline]
+pub fn unmask(line: Line) {
+    <Current as Interrupts>::unmask(line)
+}
+
+/// Block delivery on `line`.
+#[inline]
+pub fn mask(line: Line) {
+    <Current as Interrupts>::mask(line)
+}
+
+/// Acknowledge the interrupt in service on `line`.
+#[inline]
+pub fn eoi(line: Line) {
+    <Current as Interrupts>::eoi(line)
+}
+
+/// Bring up message-signalled delivery before a device arms MSI-X.
+#[inline]
+pub fn init_message_signalled() {
+    <Current as Interrupts>::init_message_signalled()
+}
+
+/// The MSI-X vector the network adapter's message-table entry must carry.
+#[inline]
+pub fn net_msi_vector() -> u8 {
+    <Current as Interrupts>::net_msi_vector()
 }

@@ -158,8 +158,8 @@ impl VirtioNet {
         // before any of this existed. The APIC's EOI register is mapped
         // first as well: the handler's last write goes there, and an unmapped
         // write from interrupt context is a panic nothing recovers from.
-        crate::arch::lapic::init();
-        if msix::enable(&func, crate::arch::idt::NET_IRQ_VECTOR) && msix::set_queue_vectors(&func) {
+        crate::hal::init_message_signalled();
+        if msix::enable(&func, crate::hal::net_msi_vector()) && msix::set_queue_vectors(&func) {
             // With the queues told whom to interrupt, the notification
             // suppression flags come off. (A no-op while `VIRTIO_F_EVENT_IDX`
             // is negotiated - the crate re-arms that way - and the honest

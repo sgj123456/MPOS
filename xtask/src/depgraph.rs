@@ -44,7 +44,12 @@ use anyhow::{Context, Result, bail};
 /// so each pair collapsed to a one-way edge). No pair was added in exchange:
 /// the platform tag is `hal`'s own type and `arch` implements the traits for
 /// it, so `arch → hal` is the only arrow between the two. Was 17 before it.
-const BASELINE_MUTUAL_PAIRS: usize = 15;
+/// **14 now**, after the HAL's second stage: rerouting the interrupt controller
+/// (`pic::set_masked`, `lapic::init`, `idt::NET_IRQ_VECTOR`) through
+/// `crate::hal::Interrupts` took `drivers → arch` to zero, leaving only the
+/// one-way `arch → drivers`, so the `arch ↔ drivers` pair collapsed. Was 15
+/// after S1, which itself was 17 before it.
+const BASELINE_MUTUAL_PAIRS: usize = 14;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.
 ///

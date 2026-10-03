@@ -139,7 +139,7 @@ impl Uart {
     /// that should be typing.
     fn enable_rx(&self) {
         self.ier_set(IER_DATA_READY, true);
-        crate::arch::pic::set_masked(4, false);
+        crate::hal::unmask(crate::hal::Line::Serial);
     }
 
     /// Set or clear one bit of the interrupt enable register.

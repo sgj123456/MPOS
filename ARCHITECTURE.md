@@ -430,7 +430,8 @@ measured count from 17 to **15**: `arch → console` and `arch → net` fell to 
 `crate::arch::timer`/`rtc`/`idle`/`halt` call above the machine layer became a `crate::hal`
 one, collapsing both pairs to one-way edges, and no pair was added in exchange (`hal`'s
 platform tag is its own type; `arch` implements the traits for it, so `arch → hal` is the
-only arrow). The tables in this section are the audit's
+only arrow). S2 then took it to **14**: with the interrupt controller behind `hal::Interrupts`,
+`drivers → arch` fell to zero and the `arch ↔ drivers` pair collapsed. The tables in this section are the audit's
 snapshot and are left as they were read; from here the command is what they have to agree with, and
 it fails when an edge appears that was not there when the baseline was recorded. Two further rules
 ride with it, each a ratchet at its recorded number rather than an absolute refusal: no layer below

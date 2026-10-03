@@ -782,6 +782,12 @@ it - so the entries say which they are:
       (`arch → hal` only) and the measured **mutual pairs fell 17 → 15** — `arch ↔ console` and
       `arch ↔ net` collapsed to one-way edges, the second ratchet drop since Step C. Stages 2–5
       (interrupts, paging, contexts, the closed door) are in §11.4
+- [x] **11.4 stage 2**: the interrupt controller is a capability. `crate::hal::Interrupts` names
+      `Line::{Timer,Serial}` and asks `unmask`/`mask`/`eoi`, `init_message_signalled` and
+      `net_msi_vector` — so the serial driver names the line it is on rather than PIC bit 4, and
+      the net driver asks for the vector instead of naming `idt::NET_IRQ_VECTOR`. No raw IRQ or
+      vector crosses the seam. `drivers → arch` fell to zero and **mutual pairs 15 → 14**; the
+      full gate was green on this stage: `pass=142 fail=0 (142 built)`, exit 33
 
 **ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
 
@@ -6462,7 +6468,7 @@ the argument for having done them first.
 - **Fixing V-10.** Accepted, documented, and cheaper to live with than a shared crate across two
   targets would be.
 
-### 11.4 The HAL: a machine seam under `arch/` — **LANDED (S1); S2–S5 open**
+### 11.4 The HAL: a machine seam under `arch/` — **S1+S2 LANDED; S3–S5 open**
 
 Phase 11 is "who names whom"; this is the largest remaining piece of it, deferred above until
 now. Goal: everything above the machine layer compiles against *capability traits* instead of
@@ -6486,7 +6492,8 @@ neutral.
 
 | Stage | Contents | Status |
 |---|---|---|
-| S1 | `hal` + `Clock`/`WallClock`/`Cpu`/`Current`/forwards; the `arch::timer`/`rtc`/`idle`/`halt` spread rerouted | **landed** |
+| S1 | `hal` + `Clock`/`WallClock`/`Cpu`/`Current`/forwards; the `arch::timer`/`rtc`/`idle`/`halt` spread rerouted | **landed** — pairs 17 → 15 |
+| S2 | `Interrupts` (`Line`, `unmask`/`mask`/`eoi`, `init_message_signalled`, `net_msi_vector`): `serial`, `virtio/net`, `lapic` | **landed** — pairs 15 → 14; gate `pass=142 fail=0` exit 33 |
 | S2 | `Interrupts` (`Line`, `unmask`/`eoi`/`net_irq`): `serial`, `virtio/net`, `lapic` | open |
 | S3 | `Paging` (`Space` assoc, `MapFlags`/`Mapping` via `hal`, roots/switch/install/translate/`user_accessible`/`is_cow_page`/`write_user_u32`): `sched`, `mm`, `uaccess`, `main` | open |
 | S4 | `Contexts`/`UserFrame`: `Context`/`Fpu`/`UserFrame` become assoc types; the `SegmentSelector` and register-frame leak into `sched`/`syscall` ends | open |

@@ -174,4 +174,39 @@ impl crate::hal::Cpu for crate::hal::Current {
     }
 }
 
+impl crate::hal::Interrupts for crate::hal::Current {
+    #[inline]
+    fn unmask(line: crate::hal::Line) {
+        pic::set_masked(pic_line(line), false)
+    }
+
+    #[inline]
+    fn mask(line: crate::hal::Line) {
+        pic::set_masked(pic_line(line), true)
+    }
+
+    #[inline]
+    fn eoi(line: crate::hal::Line) {
+        pic::end_of_interrupt(pic_line(line))
+    }
+
+    #[inline]
+    fn init_message_signalled() {
+        lapic::init()
+    }
+
+    #[inline]
+    fn net_msi_vector() -> u8 {
+        idt::NET_IRQ_VECTOR
+    }
+}
+
+/// The 8259 input a named line is wired to on this machine.
+fn pic_line(line: crate::hal::Line) -> u8 {
+    match line {
+        crate::hal::Line::Timer => 0,
+        crate::hal::Line::Serial => 4,
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}
