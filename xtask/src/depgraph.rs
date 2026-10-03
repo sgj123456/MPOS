@@ -67,7 +67,15 @@ use anyhow::{Context, Result, bail};
 /// before it (S3, which swapped `arch ↔ mm` for `hal ↔ mm`), 15 after S2 and 17
 /// before S1 - worth having here: each number names what removed it, so a
 /// regression has a step to point at.
-const BASELINE_MUTUAL_PAIRS: usize = 12;
+///
+/// **11 now**, after the `FD_CLOEXEC` registry (`PLAN.md` §9.1 stage 6h-adjacent
+/// un-gate work, closing V-3): `execve`'s cloexec pass stopped naming
+/// `drivers::{virtio::input,uinput}::close_at_exit` and walks `sched::exit`'s
+/// second list instead, so `sched → drivers` went from 2 to 0 and the
+/// `drivers ↔ sched` pair - the one Step C left standing - collapsed with it.
+/// Step C had deliberately kept the two events apart; this does not merge them,
+/// it gives the second event the same inversion the first already had.
+const BASELINE_MUTUAL_PAIRS: usize = 11;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.
 ///
@@ -110,15 +118,16 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
     ("sched", 10),
 ];
 
-/// Where `sched` stands after Step C's registry, recorded beside the rule above
+/// Where `sched` stands once V-3 is closed, recorded beside the rule above
 /// because that rule is about a layer naming another and not only about cycles:
-/// `sched → net` is **gone** (0 above, which is what removed the `net ↔ sched`
-/// pair), and `sched → drivers` is down from 4 to the two `close_at_exit` calls
-/// left on the *execve* `FD_CLOEXEC` path. That path is a different event from
-/// process exit with a different pair of subsystems to tell, and Step C
-/// deliberately did not abstract the two into one registry (`PLAN.md` §11.2 Step
-/// C: "the exec path decides per edge"). So the `drivers ↔ sched` pair stands
-/// until that edge is decided on its own terms.
+/// `sched → net` is **gone** (0 above, which removed the `net ↔ sched` pair), and
+/// so is `sched → drivers` - it went from 4 (Step C) to 2 (the `execve`
+/// `FD_CLOEXEC` path naming the two input drivers) to 0, when that path gained
+/// its own registry walk. Step C deliberately kept process exit and `execve`
+/// apart - a different event with a different pair of subsystems to tell - and
+/// this preserves that: it is a *second* list, not a merge. The `drivers ↔ sched`
+/// pair is gone with the last edge, and closing it is the precondition for
+/// un-gating `sched` for aarch64 (`PLAN.md` §9.1).
 
 /// The measured graph: module-level edges, weighted by how many references
 /// carry them.

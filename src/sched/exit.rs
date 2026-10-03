@@ -25,6 +25,15 @@
 //! description. A hook that ran after the drop would find nothing to release,
 //! which is the failure the order exists to prevent - and the reason the
 //! registry is worth a host test rather than a comment.
+//!
+//! There are two lists, not one, because closing descriptors happens on two
+//! different events. `do_exit` ends the process and tells every per-file owner;
+//! `execve` closes only the `FD_CLOEXEC` ones and the process lives on, so it tells
+//! only the two whose state is keyed by an address the fresh image reuses. One list
+//! with a "why am I being called" flag would hide that distinction in a boolean; two
+//! named lists say it in the type. The `execve` list is the inversion that lets
+//! `sched` stop naming `drivers` for the `FD_CLOEXEC` pass - the last `sched ->
+//! drivers` edge (`PLAN.md` §11.1.3, V-3).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -65,14 +74,53 @@ pub(crate) fn run(files: &[Arc<File>], owner: u32) {
     }
 }
 
-/// Empty the list, so one test's registrations cannot be seen by the next.
+/// A subsystem's release of per-open-file state on `execve`'s `FD_CLOEXEC` pass.
+///
+/// The same signature as [`ExitHook`] - the batch of descriptors and the owner -
+/// because it answers the same question ("is this the last reference?"), but it is
+/// a *separate* list, and that separation is the point. `do_exit` closes every
+/// descriptor and the process dies, so all three per-file owners are told. `execve`
+/// closes only the `FD_CLOEXEC` ones and the process *lives on*: only the two whose
+/// state is keyed by an address the new image will reuse (`drivers::virtio::input`
+/// and `drivers::uinput`) are told there, while the socket, watch and lock paths
+/// have their own close-time handling. A single list could not express "these two,
+/// not that one", so there are two.
+pub type CloexecHook = fn(files: &[Arc<File>], owner: u32);
+
+/// The registered `FD_CLOEXEC` hooks, in the order they run.
+static CLOEXEC_HOOKS: Mutex<RefCell<Vec<CloexecHook>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// Add a subsystem's `FD_CLOEXEC` hook. Boot-registered and append-only, exactly
+/// like [`register`]; the drivers that own this state say so here rather than
+/// leaving `sched` to name them, which is the edge that kept `sched` x86-only.
+pub fn register_cloexec(hook: CloexecHook) {
+    critical_section::with(|cs| {
+        CLOEXEC_HOOKS.borrow(cs).borrow_mut().push(hook);
+    });
+}
+
+/// Tell every registered subsystem that these descriptors are closing across an
+/// `execve`, without the process ending. The `run` counterpart's snapshot-then-walk
+/// discipline, for the same lock reason.
+pub(crate) fn run_cloexec(files: &[Arc<File>], owner: u32) {
+    let hooks: Vec<CloexecHook> =
+        critical_section::with(|cs| CLOEXEC_HOOKS.borrow(cs).borrow().clone());
+    for hook in hooks {
+        hook(files, owner);
+    }
+}
+
+/// Empty both lists, so one test's registrations cannot be seen by the next.
 ///
 /// Test-only, and deliberately not a way to *un*register in production: nothing
 /// in the kernel stops owning a per-open-file resource, so nothing should be
-/// able to leave the list.
+/// able to leave either list.
 #[cfg(test)]
 pub(crate) fn clear() {
-    critical_section::with(|cs| HOOKS.borrow(cs).borrow_mut().clear());
+    critical_section::with(|cs| {
+        HOOKS.borrow(cs).borrow_mut().clear();
+        CLOEXEC_HOOKS.borrow(cs).borrow_mut().clear();
+    });
 }
 
 #[cfg(test)]
@@ -131,6 +179,38 @@ mod tests {
             recorded(),
             vec![("first", 0, 42), ("second", 0, 42)],
             "registration order, with both the batch and the owner handed over"
+        );
+
+        // The two lists are separate, and that separation is the reason
+        // `execve` can tell fewer subsystems than `do_exit` without a mode flag:
+        // a hook in one list must not run on the other's pass. This stays in the
+        // one test above rather than becoming a second one, because both registries
+        // and what the hooks record are process-global - two tests over them race.
+        clear();
+        critical_section::with(|cs| SEEN.borrow(cs).borrow_mut().clear());
+
+        fn on_exit(files: &[Arc<File>], owner: u32) {
+            note("exit", files, owner);
+        }
+        fn on_cloexec(files: &[Arc<File>], owner: u32) {
+            note("cloexec", files, owner);
+        }
+        register(on_exit);
+        register_cloexec(on_cloexec);
+
+        run_cloexec(&[], 7);
+        assert_eq!(
+            recorded(),
+            vec![("cloexec", 0, 7)],
+            "the execve pass runs only the cloexec hook, never the exit one"
+        );
+
+        critical_section::with(|cs| SEEN.borrow(cs).borrow_mut().clear());
+        run(&[], 8);
+        assert_eq!(
+            recorded(),
+            vec![("exit", 0, 8)],
+            "the exit pass runs only the exit hook, never the cloexec one"
         );
     }
 }

@@ -1524,12 +1524,22 @@ fn init_virtio() {
 /// evdev reader position, and the uinput device a program made for itself. Each
 /// hook runs before the batch is dropped, while the reference counts still say
 /// which description is really the last one.
+///
+/// The `FD_CLOEXEC` registry is the `execve` counterpart, and it is deliberately
+/// shorter: only the two whose reader position is keyed by an address the fresh
+/// image reuses are told when the process *lives on*, while locks, the socket and
+/// the inotify watch have their own close-time handling and stay exit-only. Same
+/// hooks, registered into the second list, so `sched` never names `drivers` for
+/// the cloexec pass.
 fn register_exit_hooks() {
     mpos::sched::exit::register(mpos::vfs::locks::release_on_process_exit);
     mpos::sched::exit::register(mpos::net::socket::close_sockets_at_exit);
     mpos::sched::exit::register(mpos::vfs::inotify::close_at_exit);
     mpos::sched::exit::register(mpos::drivers::virtio::input::close_at_exit);
     mpos::sched::exit::register(mpos::drivers::uinput::close_at_exit);
+
+    mpos::sched::exit::register_cloexec(mpos::drivers::virtio::input::close_at_exit);
+    mpos::sched::exit::register_cloexec(mpos::drivers::uinput::close_at_exit);
 }
 
 /// The host share, mounted by the boot the way the data partition is: the

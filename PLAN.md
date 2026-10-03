@@ -6223,7 +6223,7 @@ contract next to the code that implements it. The dispatch routing counts make t
 explicit: 135 of the 247 names are handled by `fs.rs`, 50 by `proc.rs`, 50 by `posix.rs`, 12 by
 `abi.rs`.
 
-#### 11.1.3 — V-3: the scheduler does other subsystems' cleanup (severity: high) — **MOSTLY CLOSED**
+#### 11.1.3 — V-3: the scheduler does other subsystems' cleanup (severity: high) — **CLOSED**
 
 `sched/runtime.rs` is 6 397 lines — the largest file in the tree — and on task teardown it
 reaches into four unrelated subsystems:
@@ -6240,6 +6240,19 @@ plus `vfs::locks::release_process` and `vfs::mount::fs_id_of_inode` in the same 
 path. The scheduler owns *tasks*; it should not know that inotify exists. Each new
 per-open-file resource adds a line here, and each line makes `sched` unbuildable without `net`,
 `vfs` and `drivers`.
+
+**Closed.** Step C turned the exit path into a registry (`sched::exit`) each subsystem
+registers into from `main.rs`, zeroing `sched → net`/`vfs`/`drivers` on that path. The one
+edge it left standing was `execve`'s `FD_CLOEXEC` pass, which named the two input drivers
+directly. That pass now walks a *second* registry, `sched::exit`'s cloexec list, into which
+`drivers::virtio::input` and `drivers::uinput` register the same hooks (from `main.rs`); the
+two lists are deliberately not merged — `execve` tells fewer subsystems than `do_exit`
+because the process lives on — so the distinction Step C refused to flatten into a flag is
+now carried in two typed lists instead. `sched → drivers` is 0, the `drivers ↔ sched`
+mutual pair collapses, and **mutual pairs fell 12 → 11**: the last ratchet drop of Phase 11
+and the precondition for un-gating `sched` for aarch64 (§9.1 stage 6h-adjacent work). Pinned
+by a host test that an exit hook stays silent under `run_cloexec` and vice versa, and by
+`cargo xtask test`'s 142 user tests still closing CLOEXEC descriptors on `execve`.
 
 #### 11.1.4 — V-4: the terminal emulator and console live inside the VFS (severity: medium) — **CLOSED** (the `vfs ↔ console` pair is broken; emulator + VC vocabulary + `vtmode` + active-console number in the `term` leaf; see §11.2 Step D)
 

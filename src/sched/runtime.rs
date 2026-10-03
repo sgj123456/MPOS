@@ -7675,13 +7675,16 @@ pub fn exec_replace(
             #[cfg(target_os = "none")]
             {
                 // Not the exit hooks: this is `execve`'s `FD_CLOEXEC` pass, and
-                // the process lives on. Only these two are told, because a
-                // reader's *position* is keyed by an address the new image will
-                // reuse - the socket, watch and lock paths have their own
-                // handling at close time.
+                // the process lives on. The cloexec list is told, which is the
+                // two whose *reader position* is keyed by an address the new
+                // image will reuse - the socket, watch and lock paths have their
+                // own handling at close time and are exit-only. Walking the
+                // registry rather than naming `drivers::virtio::input` and
+                // `drivers::uinput` here is what severs the last `sched ->
+                // drivers` edge; a machine with neither registered (aarch64 today)
+                // walks an empty list, which is the host build's tested no-op.
                 let owner = task.tgid.0 as u32;
-                crate::drivers::virtio::input::close_at_exit(&closing, owner);
-                crate::drivers::uinput::close_at_exit(&closing, owner);
+                crate::sched::exit::run_cloexec(&closing, owner);
             }
             drop(closing);
         }
