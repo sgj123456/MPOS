@@ -43,6 +43,7 @@ pub mod font;
 pub mod keymap;
 pub mod vc;
 pub mod vtmode;
+pub mod wire;
 
 use alloc::vec;
 use alloc::vec::Vec;

@@ -324,12 +324,31 @@ pub fn takeover() {
 /// Before the transmitter interrupts - early boot, or an interrupt context that
 /// cannot reach the ring - there is nothing to hand over to, so this falls back
 /// to the bounded polled [`serial_bytes`], which never parks either.
+///
+/// What is dropped when the ring is full is decided by
+/// [`crate::term::wire::cut`]: the tail of a write may go, but never a
+/// sequence's *middle*. Dropped bytes were always the deal here; a cut that
+/// lands inside an escape sequence is not a lost repaint but a terminal left
+/// reading one, which swallows the screenful after it and drops the state
+/// changes in between - `ESC [ ? 1049h` and `ESC [ ? 25l` among them, so the
+/// host is left on an alternate screen with no cursor after the program that
+/// asked for both has exited. A cut between sequences loses content and nothing
+/// else: the emulator stays in step with the bytes it did get.
 fn serial_mirror_now(bytes: &[u8]) {
     if crate::drivers::serial::interrupt_driven() {
-        // `tx_submit` copies what fits and returns that count; the tail is
-        // dropped by design - the TX interrupt drains the rest of the ring at
-        // wire speed in the background.
-        let _ = crate::drivers::serial::tx_submit(bytes);
+        // `tx_submit` copies what fits and returns that count, so the room is
+        // asked for first and the copy is of a prefix that fits it exactly.
+        let room = crate::drivers::serial::tx_space();
+        let take = if bytes.len() <= room {
+            bytes.len()
+        } else {
+            crate::term::wire::cut(bytes, room)
+        };
+        // Zero is a sequence that does not fit at all: sending its head would
+        // be the one thing this must never do, so the chunk goes unsent.
+        if take > 0 {
+            let _ = crate::drivers::serial::tx_submit(&bytes[..take]);
+        }
         return;
     }
     serial_bytes(bytes);
