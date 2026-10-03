@@ -19,13 +19,17 @@
 //!   * a value naming a console the machine does not have is reported and
 //!     ignored, not fatal.
 //!
-//! Only two values are recognised: `ttyS0`, the serial wire, and `tty0`, the
-//! virtual console currently on the screen. `tty1`..`tty6` are deliberately
-//! *not* accepted, because Linux reads them as "pin the log to that VT" and this
-//! kernel's console always writes to the VT that is on screen. Answering the
-//! word while doing something else is the silent approximation this repository
-//! refuses; the word is reported as unknown here and recorded as a named gap in
-//! `PLAN.md` instead.
+//! Two kinds of sink are recognised, each spelled the way its machine spells it:
+//! the serial wire (`ttyS0` on x86_64, `ttyAMA0` on aarch64 - the name the psABI
+//! gives the first port of the machine's serial console), and the virtual console
+//! currently on the framebuffer (`tty0`). The additional ports - `ttyS1`..,
+//! `ttyAMA1`.. - are deliberately *not* accepted, and neither is `tty1`..`tty6`:
+//! Linux reads those as "pin the log to that device or VT", and this kernel's
+//! console always writes to the one wire and the VT that is on screen. Answering
+//! the word while doing something else is the silent approximation this repository
+//! refuses; those values are reported as unknown here and recorded as named gaps in
+//! `PLAN.md` instead. Recognising only the console the boot actually uses is the
+//! rule on both machines.
 //!
 //! The parse is allocation-free on purpose: it runs at the top of the boot task,
 //! before the heap exists, and the whole command line it walks is a fixed
@@ -34,7 +38,7 @@
 /// One sink the kernel's console bytes can go to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConsoleSink {
-    /// The serial wire: `console=ttyS0`.
+    /// The serial wire: `console=ttyS0` on x86_64, `console=ttyAMA0` on aarch64.
     Serial,
     /// The virtual console currently on the framebuffer: `console=tty0`.
     Vt,
@@ -83,7 +87,7 @@ impl ConsoleList {
                 continue;
             };
             match value {
-                "ttyS0" => {
+                "ttyS0" | "ttyAMA0" => {
                     serial = true;
                     preferred = Some(ConsoleSink::Serial);
                 }
@@ -191,5 +195,30 @@ mod tests {
         let (list, unknown) = parse("console=ttyS1");
         assert_eq!(list, ConsoleList::DEFAULT);
         assert_eq!(unknown, ["ttyS1"]);
+    }
+
+    #[test]
+    fn an_aarch64_serial_console_names_the_wire_and_is_preferred() {
+        // The aarch64 boot's command line (xtask passes `console=ttyAMA0`). Before
+        // this word was recognised it fell through to `DEFAULT` - a phantom VT sink
+        // and `prefers_serial() == false`, so the lossless wire write was not the
+        // preferred one. This test is the one that fails on that fallback.
+        let (list, unknown) = parse("console=ttyAMA0");
+        assert!(
+            list.has_serial() && !list.has_vt() && list.prefers_serial(),
+            "ttyAMA0 must be the serial wire, preferred, with no phantom VT"
+        );
+        assert!(unknown.is_empty(), "ttyAMA0 is a known console");
+    }
+
+    #[test]
+    fn an_aarch64_extra_port_is_reported_unknown_like_its_x86_twin() {
+        // Only the console the boot uses is recognised: `ttyAMA1` is the machine's
+        // second PL011, and - exactly as `ttyS1` is - accepting its name while the
+        // console always writes to the first port would be the refused
+        // approximation.
+        let (list, unknown) = parse("console=ttyAMA1");
+        assert_eq!(list, ConsoleList::DEFAULT);
+        assert_eq!(unknown, ["ttyAMA1"]);
     }
 }
