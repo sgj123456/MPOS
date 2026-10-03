@@ -355,6 +355,15 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
     // AArch64 returns a result in `x0` and an error as a negated errno, which is
     // already what the `err` crate's constants are - so this is the value
     // `ENOSYS` names rather than a translation of it.
+    //
+    // This inline refusal is deliberate and measured, not the shortcut it looks
+    // like: routing every `svc` into `syscall::dispatch` panics the boot, because
+    // `dispatch` opens on a scheduler read (`current_is_seccomp_strict`) and this
+    // EL0 check runs *before* the scheduler has a current task to read. The table
+    // itself now compiles for this machine with its own syscall numbers; the gate
+    // starts calling into it once there is a task context to answer from - the
+    // next stage's job, and a check that runs as a task rather than on the boot
+    // stack.
     frame.x[0] = crate::err::ENOSYS as u64;
     0
 }
