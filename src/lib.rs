@@ -189,8 +189,16 @@ pub mod rand;
 /// references sit behind `target_os = "none"` gates inside it), and the host
 /// unit suite is the pin for its policy. Gating it to `target_arch = "x86_64"`
 /// would drop that host coverage, which is exactly the failure this port's
-/// stage list has to avoid.
-#[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
+/// stage list has to avoid. aarch64 joins at stage 5: its x86-only machine
+/// references - the lazy-FPU trap and the ptrace/stop register snapshot - are
+/// `#[cfg]`-gated inside (that machine has neither the `#NM` trap nor ptrace
+/// yet), so the scheduler's arch-neutral policy compiles and runs where the
+/// aarch64 `svc` gate and signal-frame ABI (stage 6/7) will drive them.
+#[cfg(any(
+    not(target_os = "none"),
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+))]
 pub mod sched;
 /// `SECCOMP_MODE_FILTER`'s program: the classic-BPF interpreter, its validation
 /// and the action ordering. Its own leaf crate (nothing in it knows what a task
@@ -221,7 +229,11 @@ pub use mpos_term as term;
 /// and the pointer check asks the page tables - and both arrive with the rest of
 /// the aarch64 ABI. Host-compiled, though, because `vfs`'s own host tests call
 /// the pointer bound with `from_user = false`.
-#[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
+#[cfg(any(
+    not(target_os = "none"),
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+))]
 pub mod uaccess;
 /// Device events: what the kernel tells userland when a device
 /// appears, and the netlink socket they travel over. Not target-gated:
@@ -245,7 +257,11 @@ pub use mpos_uts as uts;
 /// Host-compiled - the ramfs, the ext4 cache and the fd table are the largest
 /// block of host-pinned logic in the kernel - so only the bare-metal aarch64
 /// build is excluded here.
-#[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
+#[cfg(any(
+    not(target_os = "none"),
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+))]
 pub mod vfs;
 
 #[cfg(target_os = "none")]

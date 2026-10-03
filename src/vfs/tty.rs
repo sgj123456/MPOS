@@ -55,9 +55,12 @@ use crate::sched::policy::TaskId;
 #[cfg(target_os = "none")]
 use crate::sched::signal::{SIGINT, SIGQUIT, SIGTSTP, SIGWINCH};
 use crate::term::cursor::Cursor;
-use crate::term::vc::{
-    K_MEDIUMRAW, K_OFF, K_RAW, K_UNICODE, K_XLATE, KD_GRAPHICS, KD_TEXT, VC_COUNT,
-};
+use crate::term::vc::VC_COUNT;
+/// The KD/K video+keyboard mode words are named only by `tty`'s `kd_ioctl` /
+/// `vt_ioctl`, which are x86_64-only (they drive `vcmux`, deferred to the aarch64
+/// display driver) - so the imports go with them.
+#[cfg(target_arch = "x86_64")]
+use crate::term::vc::{K_MEDIUMRAW, K_OFF, K_RAW, K_UNICODE, K_XLATE, KD_GRAPHICS, KD_TEXT};
 
 const LF: u8 = b'\n';
 const CR: u8 = b'\r';
