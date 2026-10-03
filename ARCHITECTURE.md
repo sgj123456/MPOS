@@ -217,14 +217,19 @@ Read it as "may call", not "calls on every path": `net` names `sched` because bl
 socket calls park in the scheduler, and `drivers` names `sched` because a driver's service
 task is a scheduler task.
 
-**`hal` is the machine seam.** `src/hal/mod.rs` declares the capability traits a machine
+**`hal` is the machine seam.** `src/hal/mod.rs` declares the capability traits every machine
 implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`, the last three with
-associated types) and the platform tag `Current`; `src/arch/x86_64/mod.rs` implements them *for*
-`Current`, so `arch → hal` is the only arrow between the two and everything above the machine
-layer calls `crate::hal`'s forwards rather than naming `arch` — which makes `src/arch/mod.rs` a
-facade of four items and its submodules `pub(crate)`. The register ABI — the `syscall` gate, the
-trap frame, `user_regs_struct` — is x86_64 *by definition* and stays in `arch/`; wrapping it in a
-neutral type would be the private dialect `AGENTS.md` §4 rule 3 forbids, so a port writes
+associated types), the platform tag `Current`, and a handful of *optional capability* traits
+(`Msi`, `FpuTrap`, `Segments`) for the ways one machine does something another has no hardware
+for — message-signalled delivery, the x87 lazy-FPU `#NM` trap protocol, segment selectors. Each
+`src/arch/<arch>/mod.rs` implements the six baseline concerns *for* `Current`, and only the
+capabilities its hardware actually has, so `arch → hal` is the only arrow between the two and
+everything above the machine layer calls `crate::hal`'s forwards rather than naming `arch` — which
+makes `src/arch/mod.rs` a facade of four items and its submodules `pub(crate)`. An absent
+capability is *absent* (the aarch64 `Current` simply is not an `Msi`/`FpuTrap`/`Segments`), not a
+method every machine must fake an answer for (`AGENTS.md` §4 rule 4). The register ABI — the
+`syscall` gate, the trap frame, `user_regs_struct` — is per-arch *by definition* and stays in
+`arch/`; wrapping it in a neutral type would be the private dialect rule 3 forbids, so a port writes
 `arch/<arch>/` and edits no shared file (`PLAN.md` §9.1).
 
 **Honest caveat:** several boxes above are *not* one-way in the code. §6 lists the measured
@@ -248,7 +253,7 @@ they are cross-crate edges.
 |---|---|---|---|
 | Entry | `src/main.rs` | The boot sequence, the `mpos.selftest` milestone checks, the panic handler, the boot-stack canary check | Contain reusable logic — everything reusable lives in the lib so the host can test it |
 | Machine | `src/arch/x86_64/` | GDT/IDT/TSS, PIC and LAPIC, 4-level paging, context switch, the `syscall`/`sysret` gate, the PIT, port I/O | Be named from outside `arch::`/`hal::` — the submodules are `pub(crate)` behind `arch/mod.rs`'s four-item facade, and the depgraph fails on any module but `arch`/`hal`/`main`/`lib` naming it. The register ABI the syscall gate and trap frame carry is per-arch by definition and stays here |
-| HAL | `src/hal/` | The capability traits a machine implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`) with their associated types, the platform tag `Current`, and the one-line forwards everything above calls | Hold machine logic: the `impl`s live in `arch/<arch>/`, so a port adds them there without editing a shared file. It is not `drivers::virtio::hal` (that is `virtio_drivers`' own `Hal`), and it is six traits for six concerns, not one per function (`PLAN.md` §11.3) |
+| HAL | `src/hal/` | The capability traits every machine implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`) with their associated types, the optional capability traits only some machines have (`Msi`, `FpuTrap`, `Segments`), the platform tag `Current`, and the one-line forwards everything above calls | Hold machine logic: the `impl`s live in `arch/<arch>/`, so a port adds them there without editing a shared file. It is not `drivers::virtio::hal` (that is `virtio_drivers`' own `Hal`), and it is six baseline traits for six concerns — not one per function — plus optional capabilities a machine implements only if its hardware has them (`PLAN.md` §11.3) |
 | Memory | `src/mm/` | Buddy frame allocator (order 0–12), slab heap (16–2048 B), mapping plans, the ELF64 loader | Know about files, tasks or devices |
 | Scheduler | `src/sched/` | The 64-slot task table, priority bands + round-robin, sleep/block deadlines, signal state, futex | Be the place where a subsystem's per-process cleanup lives (see V-3) |
 | VFS | `src/vfs/` | The `Inode`/`FileSystem` traits, mounts and path resolution, the fd table, every filesystem (ramfs, ext2/ext4, procfs, sysfs, devfs, devpts, p9, tmpfs), pipes, epoll, timerfd, eventfd, signalfd, inotify, locks, memfd/dmabuf | Contain the terminal emulator — that is the `term` leaf crate now, and the VC vocabulary/`vtmode`/active-console number moved there too (V-4 closed); the console mux stays here with the pty/tty nodes it orchestrates |

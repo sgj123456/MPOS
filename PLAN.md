@@ -5178,7 +5178,8 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1f, 2, 5a, 5b, 6a and 6b landed: the machine boots the
+Current status: **stages 1a-1f, 2, 5a, 5b, 6a, 6b, 6c, 6d, 6e landed and `hal`
+compiles for aarch64: the machine boots the
 way the x86_64 one does, the kernel owns its own address space, two kernel tasks
 can suspend and resume each other, the machine reads its own description of
 itself, it reaches its devices through a window in its *own* half of the address
@@ -5187,7 +5188,12 @@ tree and read back - code now runs at EL0 with an address space of its own,
 traps into the kernel and is answered, and that address space is a thing a
 process can live in rather than only enter: its mappings can be protected,
 shared, copied on write and taken back, and its tables are returned when it
-goes.** `cargo xtask boot-aarch64`
+goes. On top of that the kernel can now answer the questions a *running* process
+asks of a space (6c), it reads a real wall epoch off the PL031 (6d), it turns on
+user SIMD, masks a line and waits on an interrupt (6e) - and with the `hal` seam
+split into six baseline concerns plus three optional capabilities, aarch64
+implements the six it has and `crate::hal` compiles for it.**
+`cargo xtask boot-aarch64`
 builds the kernel (`aarch64-unknown-none`), the loader
 (`aarch64-unknown-uefi`), lays out an ESP with `EFI/BOOT/BOOTAA64.EFI` and boots
 it under AAVMF; the loader reads `mpos.elf` off the volume, applies its
@@ -5240,6 +5246,12 @@ ABABABABABABAM2_CONTEXT_OK: 13 hand-overs, both directions, every callee-saved r
 space: 4 pages mapped, walked in order and read back through the MMU; two protected, one copy-on-write and resolved into a frame of its own (0x43476000) with the parent's 0x4346a000 left alone; two shared between spaces and written through one of them; two unmapped and given back
 space: dropping an active space gave back all 4 frames its tables took, and the page it mapped not among them
 M6_AS_OK
+paging: active/kernel roots told apart; a named-root walk user-gated and unmapped-refused; uaccess read+write vs unmapped vs the kernel half; the copy-on-write marker the CPU cannot see; a u32 written through a space's root and read back from its frame; leaving to the kernel and re-installing
+M6_PAGING_OK
+wallclock: PL031 reached through the kernel half; boot anchored to a live UTC epoch; the counter read-only, so write_epoch refuses; the software anchor moves on set_boot_epoch
+M6_WALL_OK
+cpu: CPACR.FPEN full access after enable_user_simd; a distributor line enabled then masked and read back; idle() woken by the clock and returning with interrupts off
+M6_CPU_OK
 EL0: the kernel was on SP_EL1 (SPSel 1)
 EL0: root 0x43479000 active, program at 0x200000 (40 bytes), stack at 0x210000, answers at 0x220000
 EL0: the program wrote 0xaaaa, called a number no system call has, read 0xffffffffffffffda back and left with status 7
@@ -5414,6 +5426,10 @@ number the gate answers is spelled beside it and named as such.
 | 5 | Drivers: virtio-MMIO found through the tree, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up - **the discovery half of this row is 5b and is done; what remains is the drivers themselves**, whose transport is `virtio_drivers::transport::mmio` reached at `paging::device_virt(phys, len)` |
 | 6a | The entry to EL0: `paging::UserSpace` (a root of its own for `TTBR0_EL1`, user page mappings, the switch that installs it), `context::UserFrame` (`x0..x30`/`sp`/`pc`/`pstate`, in the ABI's own `user_pt_regs` order) with `enter_user` and `leave_for_kernel`, and the vector entry for a trap from a lower EL - which saves the whole register file and can *return*, unlike the fatal synchronous one | **landed**: `EL0: root 0x4346c000 active, program at 0x200000 (40 bytes), stack at 0x210000, answers at 0x220000`, `EL0: the program wrote 0xaaaa, called a number no system call has, read 0xffffffffffffffda back and left with status 7` and `M6_EL0_OK`, across four consecutive green runs |
 | 6b | The address-space operations, in `crate::hal::AddressSpaceOps`' shapes: `map`/`try_map`/`unmap`/`protect`/`map_cow`/`map_shared`/`resolve_cow`/`walk_user_pages`/`set_cow_bit`/`set_cow_bit_quietly`/`flush_if_active`/`phys_for_virt` and the `Drop` built out of `unmap`; the copy-on-write marker in descriptor bit 55 (software-reserved there, `RES0` to the walker) with the read-only bit the CPU enforces set beside it, and `USER_END` as `TTBR0`'s own span rather than x86_64's bit-47 split | **landed**: `M6_AS_OK` under `space: 4 pages mapped, walked in order and read back through the MMU; ...` and `space: dropping an active space gave back all 4 frames its tables took`, across three consecutive green runs - and each of the three mistakes the check exists to catch (a resolve with no copy, a `Drop` that leaks its tables, a marker set without the read-only bit) was made on purpose and stopped the boot by name |
+| 6c | The `hal::Paging` methods that need a *running* process, at module level so the `impl` is delegation: `active_root`/`kernel_root` (the `TTBR0`/`TTBR1` statics), `switch_to_root`/`switch_to_kernel` (over the private `load_root0`), `phys_for_virt_of`/`user_phys_for_virt_of` (over `walk_from`, the second gating on `USER`), `user_accessible`/`is_cow_page` (over the leaf walk + bit 55), `write_user_u32` (through a named root, no live switch), and `map_mmio` (asserts the fixed window covers the range - `virt` has no dynamic MMIO) | **landed**: `M6_PAGING_OK` under `paging: active/kernel roots told apart; ... the copy-on-write marker the CPU cannot see; a u32 written through a space's root and read back from its frame; leaving to the kernel and re-installing` - each claim read back against the hardware it names, and a kernel-half address rejected by `user_accessible` because a user pointer is a `TTBR0` address |
+| 6d | The `hal::WallClock`: a PL031 driver reached through the kernel-half window (`0x0901_0000`), `boot_epoch` anchored to a read of the counter at init, `set_boot_epoch` moving the software anchor, `write_epoch` refusing (the counter is host-shadowed and read-only on QEMU's model, so there is no persistent register) | **landed**: `M6_WALL_OK` - and the design changed by measurement: the plan said this machine had no wall source, but reading `RTC_DR` at boot gave the host's real UTC epoch (`CR=1`, already counting) and a programmatic write did not stick, so `boot_epoch` reads it like x86 reads the CMOS and `write_epoch` answers `false` rather than pretending |
+| 6e | The `hal::Cpu`/`hal::Interrupts` primitives the machine lacked: `enable_user_simd` (`CPACR_EL1.FPEN=0b11`, read-modify-write), `idle` (`daifclr;wfi;daifset`), `gic::disable` (clear `GICD_ICENABLER`) and `is_enabled`, the serial line's `SERIAL_INTID=33`, and the `Line -> INTID` mapper | **landed**: `M6_CPU_OK` - FPEN read back, the serial's distributor bit set then cleared and read back, and `idle` woken by an armed timer tick (28->29) returning with interrupts masked |
+| 6f | `hal` compiles for aarch64: the arch-neutral split moves x86's optional capabilities (`Msi`, `FpuTrap`, `Segments`) out of the baseline traits, `Current` un-gates to `target_os = "none"`, and `arch/aarch64` writes `impl {Clock,WallClock,Cpu,Interrupts,Paging,Contexts,Platform} for Current` plus `AddressSpaceOps for UserSpace`, the ops traits, and a full-register `enter_frame` that `check_el0` and the trait `enter_user`/`resume_user` share | **landed**: `cargo clippy --target aarch64-unknown-none` compiles `hal` for aarch64 (the deliverable; the debug aarch64 *build* cannot link, so clippy is the check - `AGENTS.md` §3), boot-aarch64 still prints all ten markers, and the x86 gate + depgraph ratchet are unchanged. The `to_user_regs`/`from_user_regs` `user_pt_regs` field-order pin and the COW-fault resolver wait on stage 6's ABI caller and stage 3's scheduler - named below, not stubbed |
 | 6 | The rest of the aarch64 Linux ABI: `nr.rs` per arch (the numbers are the machine's - `exit_group` is 94 here and 231 on x86_64), signal frames, `TPIDR_EL0` TLS, `PTRACE_GETFPREGS`'s view of `FpuState`, the `Paging` methods that need a running process, and the `hal` impls those two complete | the `t-*` conformance programs run on aarch64 |
 | 7 | aarch64 userspace and the image: `aarch64-unknown-linux-musl` builds, ESP layout for AAVMF, arch-aware `xtask` | `cargo xtask test` passes on aarch64 |
 | 8 | The gate: `xtask test`/`run` grow an arch selection | a green aarch64 gate quoted with its summary line and exit code |
@@ -5568,24 +5584,29 @@ Named gaps the port carries rather than hides, each with its home:
   the allocator may use` out of 248 MiB of RAM, `pmm: 5 zones, 49209 frames`.
   The floor the whole thing stands on is `mm::init`, which is machine-neutral
   and simply had no aarch64 caller until 1f gave it one.
-- **`hal` is x86_64-only, and stages 6a and 6b have taken two of its three
-  blockers.** The forwards at the bottom of `hal/mod.rs` name all six concern
-  traits, so the module cannot compile for a machine that implements fewer. As it
-  stands: `Clock` is `timer.rs`, `Cpu`/`Interrupts` are what
-  `vectors.rs`/`gic.rs`/`timer.rs` are written over, `Contexts` is `context.rs`
-  (minus the FPU-ownership methods, which exist only for a lazy scheme this
-  machine does not have - and *plus* `UserFrame`, which 6a landed), and `Paging`
-  has its table-building half plus, from 6a, a user space that can be built,
-  mapped, switched to and walked, and, from 6b, that space's whole operation set -
-  `unmap`, `protect`, `walk_user_pages`, the copy-on-write half and the `Drop`
-  built out of `unmap`. The machinery those needed was `Tables`, which already
-  existed; 6b added the operations, in the trait's own signatures so that the impl
-  is delegation and nothing else. What is still missing is **two** things and no
-  more: the `Paging` methods that need a running process (`active_root`,
-  `switch_to_root`, `user_accessible`, `is_cow_page`, `write_user_u32`,
-  `phys_for_virt_of`, `user_phys_for_virt_of`), and `WallClock`, which is a PL031
-  this machine has not written a driver for. The gate goes when the last of the
-  six does.
+- **`hal` compiles for aarch64, and the "two blockers" this note used to name were
+  an understatement.** Until stage 6f the module was x86_64-only for a *structural*
+  reason this ledger missed: `hal::Current` gated on `target_arch = "x86_64"` so the
+  module could not even be named here, and four capability groups were x86-shaped
+  *inside* the baseline traits. A caller survey found them (MSI, segment selectors,
+  the lazy-FPU trap protocol, and the first-user-entry shape) and that every one of
+  their callers lived in a module aarch64 does not compile yet. So rather than make a
+  second machine fake answers (`AGENTS.md` §4 rule 4), stage 6f split them into three
+  *optional* capability traits - `Msi`, `FpuTrap`, `Segments` - that only x86's
+  `Current` implements, un-gated `Current` to `target_os = "none"`, and had
+  `arch/aarch64` write the six baseline impls. The two things this note claimed were
+  the *last* blockers were in fact the easy half: the running-process `Paging` methods
+  (6c), the `WallClock` (6d), and `Cpu`/`Interrupts` primitives (6e) - each a real
+  body read back against the hardware it names, not a stub. `crate::hal` now compiles
+  for aarch64 under `cargo clippy --target aarch64-unknown-none`.
+  What remains is *below* the gate, not blocking it: the trait `enter_user`/`resume_user`
+  and `set_kernel_stack` share the `enter_frame` that `check_el0` now exercises, but
+  the running-process caller that schedules tasks is stage 3; `to_user_regs`/`from_user_regs`
+  write the aarch64 `user_pt_regs` order but their field-order pin against `ptrace` is
+  stage 6's ABI; the copy-on-write fault resolver (the next bullet) needs a faulting
+  task. The x86-only `Msi`/`FpuTrap`/`Segments` are *not implemented here on purpose* -
+  a `virt`+GIC machine has no MSI controller, no lazy FPU and no segments, and the
+  sched/runtime code that wants them un-gates at stage 3 with its own arch branch.
 - **A copy-on-write page can be resolved, and nothing faults into the resolver
   yet.** Stage 6b landed the operation - `resolve_cow` copies the frame, rebinds
   the descriptor and answers `(old, new)` - and the check drives it in the order a
