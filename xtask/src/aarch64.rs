@@ -16,10 +16,10 @@
 //! branches into the higher half.
 //!
 //! The verdict is read out of the serial log, the way `cargo xtask test` reads
-//! its own: the guest prints `M4_DEVICES_OK`, `M3_TABLES_OK`, `M1_TIMER_OK` and
-//! `M2_CONTEXT_OK` when it is happy, and the run stops as soon as one of those
-//! - or a failure line - appears. Nothing here claims a green the log does not
-//! contain.
+//! its own: the guest prints `M4_DEVICES_OK`, `M3_TABLES_OK`, `M5_VIRTIO_OK`,
+//! `M1_TIMER_OK` and `M2_CONTEXT_OK` when it is happy, and the run stops as soon
+//! as one of those - or a failure line - appears. Nothing here claims a green
+//! the log does not contain.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,12 +73,18 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// `EXCEPTION:` is the kernel's own fault dump, and waiting out the deadline for
 /// a marker that will never come is time spent pretending a stopped machine
 /// might still be working.
-const TERMINATORS: [&str; 7] = [
+///
+/// Stage 5b's check runs *before* the timer and the contexts, so its success
+/// marker is not a terminator and its failure marker is - which is the rule
+/// applied rather than recited: `M2_CONTEXT_OK` is still the last line the
+/// kernel prints, and the list only grew by the one entry the new check owns.
+const TERMINATORS: [&str; 8] = [
     "M2_CONTEXT_OK",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
     "M4_DEVICES_FAILED",
+    "M5_VIRTIO_FAILED",
     "EXCEPTION:",
     "KERNEL PANIC",
 ];
@@ -117,13 +123,17 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // Every marker the kernel prints, in the order it prints them:
     // `M4_DEVICES_OK` says the firmware's device tree reads back as the machine
     // this kernel was built for, `M3_TABLES_OK` says the kernel's own page
-    // tables say what the plan says, `M1_TIMER_OK` says the clock still reaches
-    // the vector table through them - a statement about the device window too,
-    // because the GIC is reached through it - and `M2_CONTEXT_OK` says two
-    // tasks can suspend and resume each other.
+    // tables say what the plan says - and that the low half is empty, which is
+    // where the device window used to be - `M5_VIRTIO_OK` says those tables
+    // reach the machine's virtio transports and that the transports answer as
+    // transports, `M1_TIMER_OK` says the clock still reaches the vector table
+    // through them (a statement about the device window too, because the GIC is
+    // reached through it) and `M2_CONTEXT_OK` says two tasks can suspend and
+    // resume each other.
     let markers = [
         ("M4_DEVICES_OK", "devices"),
         ("M3_TABLES_OK", "page tables"),
+        ("M5_VIRTIO_OK", "virtio transports"),
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
     ];
@@ -135,8 +145,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     if missing.is_empty() {
         println!();
         println!(
-            "aarch64 boot: M4_DEVICES_OK, M3_TABLES_OK, M1_TIMER_OK and M2_CONTEXT_OK, \
-             from the ESP under AAVMF"
+            "aarch64 boot: M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, M1_TIMER_OK \
+             and M2_CONTEXT_OK, from the ESP under AAVMF"
         );
         return Ok(());
     }
@@ -336,7 +346,30 @@ fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
                 esp.display()
             ),
         ])
-        .args(["-device", "virtio-blk-pci,drive=hd0"]);
+        .args(["-device", "virtio-blk-pci,drive=hd0"])
+        // One device on a virtio-**MMIO** transport, which is what stage 5b's
+        // check reads back. `virt` publishes its thirty-two `virtio,mmio` nodes
+        // whether or not anything is behind them (measured: the decompiled tree
+        // with and without this flag differs only in the firmware's own random
+        // seeds), so without a device every window answers `DeviceID` 0 and the
+        // check could only say "these look like transports". With one attached,
+        // it reads a `DeviceID` the machine did not have to be told and names it.
+        //
+        // The MMIO variant on purpose, and not `-pci`: the ESP's own disk is a
+        // `virtio-blk-pci` behind the PCIe bridge, which is a *different*
+        // discovery path (configuration space, not a fixed window), and a check
+        // that a PCI device answered would not say anything about the window the
+        // tree describes.
+        .args(["-device", "virtio-rng-device"])
+        // And the transports have to be the *modern* ones, which on this machine
+        // is a choice somebody has to make: measured, `virt`'s `virtio-mmio`
+        // transports answer `Version` 1 - the legacy register layout - unless
+        // this says otherwise, and version 2 is the only layout this kernel's
+        // driver crate reads. The alternative to selecting it is a kernel that
+        // either drives the legacy layout (a second register map, a second
+        // feature-negotiation order) or refuses devices on its own machine, and
+        // neither is what stage 5 is for.
+        .args(["-global", "virtio-mmio.force-legacy=false"]);
 
     let mut child = qemu
         .stdout(Stdio::null())

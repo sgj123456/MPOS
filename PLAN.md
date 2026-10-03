@@ -664,11 +664,14 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stages 1a-1f, 2 and 5a landed: the machine boots a
-real ESP image under AAVMF, builds its own page tables from `kernel_mappings`,
-switches between kernel tasks, and reads the firmware's device tree back against
-its own constants (§9.1); next is stage 5's drivers — not stage 3, which waits on
-4, 5 and 6 for the reason measured under the stage table)**
+**Architectures (Phase 9 — aarch64 stages 1a-1f, 2, 5a and 5b landed: the machine
+boots a real ESP image under AAVMF, builds its own page tables from
+`kernel_mappings`, switches between kernel tasks, reads the firmware's device
+tree back against its own constants, and now reaches its devices through a window
+in its *own* half — the 32 virtio-MMIO transports are found through the tree and
+read back (§9.1); next is the rest of stage 5, which is the drivers themselves —
+not stage 3, which waits on 4, 5 and 6 for the reason measured under the stage
+table)**
 - [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
@@ -5174,10 +5177,12 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1f, 2 and 5a landed: the machine boots the way the
-x86_64 one does, the kernel owns its own address space, two kernel tasks can
-suspend and resume each other, and the machine reads its own description of
-itself.** `cargo xtask boot-aarch64`
+Current status: **stages 1a-1f, 2, 5a and 5b landed: the machine boots the way
+the x86_64 one does, the kernel owns its own address space, two kernel tasks can
+suspend and resume each other, the machine reads its own description of itself,
+and it reaches its devices through a window in its *own* half of the address
+space - the firmware's thirty-two virtio-MMIO transports are found through the
+tree and read back.** `cargo xtask boot-aarch64`
 builds the kernel (`aarch64-unknown-none`), the loader
 (`aarch64-unknown-uefi`), lays out an ESP with `EFI/BOOT/BOOTAA64.EFI` and boots
 it under AAVMF; the loader reads `mpos.elf` off the volume, applies its
@@ -5185,27 +5190,46 @@ it under AAVMF; the loader reads `mpos.elf` off the volume, applies its
 tables from the firmware's own memory map and branches into the higher half at
 **EL1**; then the kernel brings the frame allocator up from the record and
 rebuilds the address space from `mm::vm::kernel_mappings`, which is the same
-plan x86_64's `install` consumes. Measured, from that run:
+plan x86_64's `install` consumes. Measured, from one of three consecutive runs
+that print every marker - the two numbers that move between runs, `47952` and
+`47954` frames, differ by one page of the firmware's own noise:
 
 ```
-mpos-boot: kernel: 84 KiB at phys 0x44bcf000, virt 0xffffffff80000000, entry 0xffffffff8000d000
-mpos-boot: device tree: 1052672 bytes at phys 0x43eff000
-mpos-boot: page tables: 292 pages of them
-handoff: mpos-boot 0.1.0, record at 0x45a65020, image phys 0x44bcf000 -> virt 0xffffffff80000000
-memory: 14 regions, 191 MiB the allocator may use
-devices: the firmware's tree, 1052672 bytes at 0xffff800043eff000
+mpos-boot: kernel image: 82 KiB
+mpos-boot: initramfs: 11360 KiB
+mpos-boot: RAM: 248 MiB
+mpos-boot: device tree: 1052672 bytes at phys 0x446a1000
+mpos-boot: kernel: 88 KiB at phys 0x447e2000, virt 0xffffffff80000000, entry 0xffffffff8000dff4
+mpos-boot: mapped 496 MiB of physical memory, identity and through the direct map at 0xffff800000000000
+mpos-boot: device window 0x8000000..0xc000000 mapped at its own address and at 0xffffffff40000000, Device and not executable
+mpos-boot: page tables: 325 pages of them
+mpos 0.1.0 (aarch64) booting
+console: PL011 at 0xffffffff41000000
+image: text 62 KiB, rodata 16 KiB, data 8 KiB (86 KiB total)
+handoff: mpos-boot 0.1.0, record at 0x456ba020, image phys 0x447e2000 -> virt 0xffffffff80000000, direct map at 0xffff800000000000
+memory: 14 regions, 187 MiB the allocator may use
+cmdline: "console=ttyAMA0"
+exception level: EL1
+devices: the firmware's tree, 1052672 bytes at 0xffff8000446a1000
 devices: memory 0x40000000..0x50000000 (256 MiB), every region the record calls usable is inside it
 devices: PL011 at 0x9000000, GIC at 0x8000000/0x8010000, timer on PPI 14 (INTID 30)
 devices: 32 virtio-mmio windows, all inside the 0x8000000..0xc000000 device window
 M4_DEVICES_OK
-pmm: 5 zones, 48954 frames (191 MiB of 191 MiB usable)
-page tables: 166 frames (664 KiB), TTBR0 0x43efe000, TTBR1 0x43efe000 (the kernel's own, read back from the registers)
-plan: 7 mappings, all 63621 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)
-direct map: 0xffff800043e46000 -> 0x43e46000, rw and it stores
-device window: PL011 at 0x9000000 maps to itself, Device
-no identity map: 0x44bcf000 is unreachable, only the device window lives low
+pmm: 5 zones, 47952 frames (187 MiB of 187 MiB usable)
+interrupts: GICv2 (distributor 0xffffffff40000000), vector table at 0xffffffff80008800, timer on INTID 30
+page tables: 165 frames (660 KiB), TTBR0 0x434e6000, TTBR1 0x434e6000 (the kernel's own, read back from the registers)
+plan: 7 mappings, all 63622 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)
+direct map: 0xffff800043458000 -> 0x43458000, rw and it stores
+device window: PL011 0xffffffff41000000 -> 0x9000000, Device, through the kernel half at 0xffffffff40000000
+no low half: 0x447e2000 is unreachable, and so is the device window at 0x8000000 that used to live there
 M3_TABLES_OK
-M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 109366208 ns of counter
+virtio: 32 transports, every one answering virtio 1.0 through the kernel half; 1 carries a device
+virtio: the first is at 0xa003e00, device 4, vendor 0x554d4551
+M5_VIRTIO_OK
+timer: CNTFRQ_EL0 62500000 Hz, tick at 250 Hz (250000 counts apart)
+M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 109485312 ns of counter
+contexts: two kernel tasks alternating
+ABABABABABABAM2_CONTEXT_OK: 13 hand-overs, both directions, every callee-saved register and v31 back where its task left it
 ```
 
 The `devices:` lines are stage 5a, and they are a *check* rather than a
@@ -5213,10 +5237,34 @@ printout: every number in them was read out of the firmware's device tree and
 compared against the constant the kernel is compiled with for that device - the
 PL011's base, both of the GIC's frames, the timer's line, and the RAM the boot
 record calls usable. A tree is not trusted to be right; it is what asks whether
-this kernel's idea of the machine still is. The `191 MiB` and the `48954 frames`
-against the last stage's `192 MiB`/`49209` are the tree's own cost, and it is
-not small: the blob QEMU writes claims a megabyte for a tree of eight kilobytes,
-and the loader copies what the tree says it is.
+this kernel's idea of the machine still is. The `187 MiB` and the `47952 frames`
+against the last stage's `191 MiB`/`48954` are 3.66 MiB of this harness's own
+device and 264 KiB of loader page tables, and both are named below rather than
+folded into "the tree costs a megabyte": the tree is 1052672 bytes for 7160 bytes
+of structure and 569 of strings, and the loader copies what the tree says it is.
+
+Stage 5b is the two lines between `M3_TABLES_OK` and `M5_VIRTIO_OK`, and it is
+the first time this machine has *used* a number the firmware gave it rather than
+checking one. The device window - PL011 and GIC included - moved out of `TTBR0`
+and into the kernel half at `0xffffffff40000000`, which is where x86_64's
+`mm::MMIO_BASE` already was, so the low half now holds nothing at all: the
+`no low half:` line is the check that says so, and it asks about the device
+window's *physical* address as well as the image's. `M5_VIRTIO_OK` then reads
+four identity registers out of each of the tree's thirty-two `virtio,mmio`
+windows through that new alias, which is what makes the tree actionable: a driver
+now has somewhere to go. Three of those four registers are load-bearing
+measurements rather than decoration. **The magic and version are checked** -
+`0x74726976` and 2, the only layout this kernel's driver crate reads - and
+**version is a choice the harness has to make**: measured, `virt`'s
+`virtio-mmio` transports answer version **1**, the legacy register map, unless
+QEMU is told `-global virtio-mmio.force-legacy=false`, which is now in the
+command line beside `acpi=off` and for the same kind of reason. And **the tree
+cannot say which window carries a device**: QEMU publishes all thirty-two nodes
+whether or not anything is attached (measured by decompiling the tree with and
+without `-device virtio-rng-device` - the two differ only in the firmware's own
+random seeds), and the device does not land in the first of them either; it
+answers at `0xa003e00`, the *last*. So a driver must read each transport, which
+is the whole reason the check reads them.
 
 The `plan:` line is the strongest claim either machine's boot makes about its
 own page tables: every mapping `mm::vm::kernel_mappings` names is walked page by
@@ -5270,7 +5318,8 @@ and it is checked - the boot prints `M2_CONTEXT_OK`.
 | 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --release --target aarch64-unknown-none` with `sched` in - and see the correction below the table: this row is **not** one edit, and it waits on 4, 5 and 6 |
 | 4 | Un-gate `console` and `vfs` (serial-only console first) | a ramfs root with the initramfs untarred |
 | 5a | The device tree: `crates/fdt` (the reader, host-tested), `Handoff.dtb_phys`/`dtb_len` appended after `regions`, the loader copying the firmware's blob out of the UEFI configuration table, and `arch::aarch64::check_devices` holding the tree up against the machine's own constants | **landed**: `cargo xtask boot-aarch64` prints `devices: PL011 at 0x9000000, GIC at 0x8000000/0x8010000, timer on PPI 14 (INTID 30)`, `devices: 32 virtio-mmio windows, all inside the 0x8000000..0xc000000 device window` and `M4_DEVICES_OK`, and the tree's memory node is compared with every region the record calls usable |
-| 5 | Drivers: virtio-MMIO found through the tree, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up |
+| 5b | The device window in the kernel half, and the tree's transports read back: `paging::DEVICE_PHYS`/`DEVICE_VIRT` split, `boot/src/vm.rs` mapping the window at both, `pl011`/`gic` compiled against the alias with their physical bases kept for the tree check, and `arch::aarch64::check_virtio` reading every `virtio,mmio` window's MagicValue/Version/DeviceID/VendorID | **landed**: `M3_TABLES_OK` now stands under `no low half: ... and so is the device window at 0x8000000 that used to live there`, and `M5_VIRTIO_OK` under `virtio: 32 transports, every one answering virtio 1.0 through the kernel half; 1 carries a device`, across three consecutive green runs |
+| 5 | Drivers: virtio-MMIO found through the tree, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up - **the discovery half of this row is 5b and is done; what remains is the drivers themselves**, whose transport is `virtio_drivers::transport::mmio` reached at `paging::device_virt(phys, len)` |
 | 6 | The aarch64 Linux ABI: `nr.rs` per arch, the `x0..x30` register file **and the user frame with its `eret` entry** (moved here from stage 2), signal frames, `svc #0`, `TPIDR_EL0` TLS, `PTRACE_GETFPREGS`'s view of `FpuState` | the `t-*` conformance programs run on aarch64 |
 | 7 | aarch64 userspace and the image: `aarch64-unknown-linux-musl` builds, ESP layout for AAVMF, arch-aware `xtask` | `cargo xtask test` passes on aarch64 |
 | 8 | The gate: `xtask test`/`run` grow an arch selection | a green aarch64 gate quoted with its summary line and exit code |
@@ -5354,19 +5403,29 @@ Named gaps the port carries rather than hides, each with its home:
   `0x0800_0000`/`0x0801_0000` and RAM at `0x4000_0000`, and those are what the
   kernel is compiled with: the tree does not yet *supply* them. What stage 5a
   made it do is ask whether they are still right - `check_devices` reads each
-  node back and compares it with `pl011::BASE`, `gic::DIST`/`gic::CPU` and
-  `gic::TIMER_INTID`, and the boot stops with `M4_DEVICES_FAILED` on any
+  node back and compares it with the *physical* bases the kernel keeps for that
+  (`pl011::PHYS`, `gic::DIST_PHYS`/`gic::CPU_PHYS`, `gic::TIMER_INTID` - the
+  addresses the kernel *reaches* those registers at are stage 5b's
+  `pl011::BASE`/`gic::DIST`/`gic::CPU`, and they are deliberately different
+  numbers now), and the boot stops with `M4_DEVICES_FAILED` on any
   disagreement. A machine that moves a device is now a boot failure rather than
   a driver faulting on its first register. What is still hardcoded is everything
-  with no constant to compare against, and what stage 5 owes is the direction
-  that matters for discovery: the 32 virtio-MMIO windows, whose addresses are in
-  the tree and nowhere else, are **counted and bounds-checked** (`all inside the
-  0x8000000..0xc000000 device window`) but not yet driven, and their interrupt
-  lines are not routed. The loader still maps that 64 MiB window at the
-  addresses the devices are at, in the low half, because x86_64's `mm::map_mmio`
-  walks a BAR and there is no aarch64 arm yet. The window deliberately does not
-  start at zero - a null pointer that silently works is the one thing x86_64's
-  own `check_arch` asserts cannot happen.
+  with no constant to compare against, and stage 5b took the direction that
+  matters for discovery: the 32 virtio-MMIO windows, whose addresses are in the
+  tree and nowhere else, were **counted and bounds-checked** and are now
+  **read** - `check_virtio` walks them, translates each into the kernel half and
+  reads the transport's own identity registers, so a window with nothing behind
+  it is a named `M5_VIRTIO_FAILED` rather than a driver that times out later. Two
+  things about that read are measurements rather than assumptions, and both are
+  recorded because a driver inherits them: the transports answer **version 1**
+  (the legacy register map) unless the machine is told
+  `-global virtio-mmio.force-legacy=false`, and the tree cannot say which window
+  has a device - all thirty-two nodes are published either way, and the attached
+  device answers from the *last* window, not the first. Still missing is the
+  routing of anyone's interrupt line: the PL011's own is SPI 1 (INTID 33) and
+  nothing decodes it, because the console is a polled writer until stage 4.
+  The window deliberately does not start at zero - a null pointer that silently
+  works is the one thing x86_64's own `check_arch` asserts cannot happen.
 - **The kernel's address space is its own now, and the window that was open
   across 1e is closed.** Two things went together and are worth keeping as one
   measurement: the loader builds its identity map and its direct map with a
@@ -5378,15 +5437,21 @@ Named gaps the port carries rather than hides, each with its home:
   loader's tables are still needed for is the length of the jump: the kernel
   cannot build its own until the frame allocator is up, and the frame allocator
   needs the direct map.
-- **The device window is in the low half, and that is a collision waiting to
-  happen.** The kernel maps 64 MiB from `0x0800_0000` - PL011 and GIC - at the
-  addresses the devices are at, in `TTBR0`, which is the half a process will
-  own. x86_64 puts its device window in the *kernel* half (`mm::MMIO_BASE`, just
-  below the image) so that a process cannot collide with it; aarch64 gets the
-  same arrangement when `mm::map_mmio` grows an arm here in stage 5. Until then
-  there is no user address space to collide with, which is why this is a named
-  gap and not a blocker - but it is the reason the low half is not simply
-  "dropped": what lives there is the machine's devices.
+- **The device window is in the kernel half now, and the low half is empty.**
+  Stage 5b closed this one, and it was closed by changing where the registers are
+  reached rather than by naming the collision better: the kernel mapped 64 MiB
+  from `0x0800_0000` - PL011 and GIC - at the addresses the devices physically
+  are, which is inside `TTBR0`, the half a process is going to own. It maps them
+  at `0xffffffff40000000` instead, the same hole x86_64's `mm::MMIO_BASE` uses,
+  and `check_paging` now asserts both halves of that: the alias translates to the
+  right frame as Device, and neither the image's physical address nor the device
+  window's is reachable any more. What is *not* closed is the mechanism: the
+  window is a fixed 64 MiB range mapped whole at boot, because `mm::map_mmio`
+  goes through `hal::Paging` and aarch64's `Paging` has no user address space yet,
+  so `hal` cannot compile for this machine and the dynamic allocator cannot exist.
+  A device outside the tree's window is refused by `paging::device_virt` rather
+  than mapped, which is the honest answer for a machine whose devices are a
+  firmware-described range - and not the general one a PCIe aarch64 server needs.
 - **Stage 1d's RAM window is gone; the map is the firmware's and the plan's.**
   The 1 GiB ceiling it mapped "because the code that would care had not arrived"
   is replaced twice over: stage 1e's loader walks the EFI memory map region by

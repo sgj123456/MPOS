@@ -8,9 +8,10 @@
 //! a named gap rather than hiding behind a stub.
 //!
 //! Where the address comes from. `0x0900_0000` is where QEMU's `virt` machine
-//! places the first PL011, and where the firmware's device tree says it is. The
-//! device tree is what a real port reads - stage 5 parses it - and until then
-//! the fixed address is honest for the one machine this stage runs on.
+//! places the first PL011, and where the firmware's device tree says it is - the
+//! tree is what `check_devices` holds that number to. The port is *reached*
+//! through the kernel half's device window rather than at that physical address,
+//! which is stage 5b's arrangement and [`BASE`]'s comment.
 //!
 //! Why there is no lock. Writes here wait for the transmit FIFO to have room
 //! and then write one byte, which is as atomic as a byte-at-a-time sink needs to
@@ -20,8 +21,20 @@
 
 use core::fmt;
 
-/// The first PL011 on QEMU's `virt` machine.
-pub const BASE: usize = 0x0900_0000;
+use super::paging;
+
+/// The physical address of the first PL011 on QEMU's `virt` machine: what the
+/// device tree names, and what the tree check compares against.
+pub const PHYS: usize = 0x0900_0000;
+
+/// The port as this kernel reaches it: the kernel half's device window, at this
+/// port's offset into it.
+///
+/// The window's own comment says why the registers are not mapped where they
+/// physically are. Spelled as the window's base plus the offset rather than as a
+/// second literal, so that a window that moves takes this with it rather than
+/// leaving a driver reading unmapped memory.
+pub const BASE: usize = paging::DEVICE_VIRT + (PHYS - paging::DEVICE_PHYS);
 
 /// Data register: what is written goes out, what is read comes in.
 const DR: usize = 0x00;

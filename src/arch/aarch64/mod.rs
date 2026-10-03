@@ -10,10 +10,14 @@
 //! **1f is the kernel taking ownership of its own address space** - it builds
 //! its page tables from `mm::vm::kernel_mappings` out of frames the allocator
 //! hands it, instead of running on the loader's; **2 is two kernel tasks
-//! suspending and resuming each other** (`context.rs`); and **5a is the machine
+//! suspending and resuming each other** (`context.rs`); **5a is the machine
 //! reading its own description of itself** - the firmware's device tree, out of
 //! the UEFI configuration table by way of the loader, held up against the
-//! constants the rest of this file is compiled with (`check_devices`).
+//! constants the rest of this file is compiled with (`check_devices`); and
+//! **5b is that description becoming actionable** - the device window those
+//! devices live in moved out of the low half and into the kernel's, and the
+//! machine's virtio transports are read back through it, so the tree now leads
+//! somewhere a driver can go (`check_virtio`).
 //!
 //! What is still absent, and where it lands: everything above the machine layer
 //! - `sched` (3), `console`/`vfs` (4), the drivers (5) and the Linux ABI (6),
@@ -168,6 +172,7 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
     // direct map over the record's regions - is in the tables this builds.
     let frames = unsafe { paging::install(&info, &sections) };
     check_paging(&info, &sections, frames);
+    check_virtio(&info);
     check_timer();
     check_context();
     halt()
@@ -281,11 +286,11 @@ fn check_devices(info: &BootInfo) {
     let Some((serial_base, _)) = serial.reg().next() else {
         fail!("the serial node {} has no reg", serial.name());
     };
-    if serial_base as usize != pl011::BASE {
+    if serial_base as usize != pl011::PHYS {
         fail!(
             "the tree puts the serial port at {serial_base:#x}, and this kernel \
              reaches it at {:#x}",
-            pl011::BASE
+            pl011::PHYS
         );
     }
 
@@ -301,12 +306,12 @@ fn check_devices(info: &BootInfo) {
             intc.name()
         );
     };
-    if dist as usize != gic::DIST || cpu as usize != gic::CPU {
+    if dist as usize != gic::DIST_PHYS || cpu as usize != gic::CPU_PHYS {
         fail!(
             "the tree puts the GIC at {dist:#x}/{cpu:#x}, and this kernel reaches \
              it at {:#x}/{:#x}",
-            gic::DIST,
-            gic::CPU
+            gic::DIST_PHYS,
+            gic::CPU_PHYS
         );
     }
 
@@ -372,10 +377,10 @@ fn check_devices(info: &BootInfo) {
         gic::TIMER_INTID,
     );
 
-    // And the transports the next piece of stage 5 will drive, checked against
-    // the window the loader mapped: reachable is a property of the page tables,
-    // not of the tree, so this is the one claim here that the *tables* have to
-    // agree with rather than a constant in this file.
+    // And the transports the rest of stage 5 will drive, checked against the
+    // range the kernel maps: a device outside it is one this kernel cannot
+    // reach, whichever address the tree gives it, so the window is what the walk
+    // below is bounded by.
     let (mut virtio, mut outside) = (0usize, None);
     let walked = tree.each(
         |node| node.is_compatible("virtio,mmio"),
@@ -383,7 +388,7 @@ fn check_devices(info: &BootInfo) {
             virtio += 1;
             for (address, size) in node.reg() {
                 let (start, end) = (address as usize, (address + size) as usize);
-                if start < paging::DEVICE_BASE || end > paging::DEVICE_BASE + paging::DEVICE_WINDOW
+                if start < paging::DEVICE_PHYS || end > paging::DEVICE_PHYS + paging::DEVICE_WINDOW
                 {
                     outside = Some((node.name(), address, size));
                 }
@@ -396,18 +401,18 @@ fn check_devices(info: &BootInfo) {
     }
     if let Some((name, address, size)) = outside {
         fail!(
-            "the tree's {name} is at {address:#x}..{:#x}, outside the loader's \
-             {:#x}..{:#x} device window",
+            "the tree's {name} is at {address:#x}..{:#x}, outside the \
+             {:#x}..{:#x} device window this kernel maps",
             address + size,
-            paging::DEVICE_BASE,
-            paging::DEVICE_BASE + paging::DEVICE_WINDOW,
+            paging::DEVICE_PHYS,
+            paging::DEVICE_PHYS + paging::DEVICE_WINDOW,
         );
     }
     let _ = writeln!(
         out,
         "devices: {virtio} virtio-mmio windows, all inside the {:#x}..{:#x} device window",
-        paging::DEVICE_BASE,
-        paging::DEVICE_BASE + paging::DEVICE_WINDOW,
+        paging::DEVICE_PHYS,
+        paging::DEVICE_PHYS + paging::DEVICE_WINDOW,
     );
     let _ = writeln!(out, "M4_DEVICES_OK");
 }
@@ -455,9 +460,12 @@ fn check_context() {
 /// against the hardware.
 ///
 /// Three claims are not in the plan and are checked by name: the device window
-/// (which the plan does not describe yet - stage 5's `map_mmio` will), the null
-/// page, and the low identity map being *gone*, which is the difference between
-/// this stage and the last one.
+/// (which the plan does not describe - it is `paging::DEVICE_VIRT`), the null
+/// page, and the low half being *empty*. That last one is the difference between
+/// this stage and the one before it, and stage 5b made it stronger: the last
+/// thing that lived down there, the device window itself, moved into the kernel
+/// half, so the claim is now about a quarter of the address space rather than
+/// about one hash-mapped pair of pages.
 fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
     use fmt::Write;
 
@@ -566,25 +574,28 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
     // rather than as memory: a PL011 mapped Normal lets the core reorder the
     // stores that are this console's characters. The check translates the
     // console's own registers, so what it proves is that the wire the banner came
-    // out of is device memory.
+    // out of is device memory - and stage 5b moved where that is, so the frame
+    // this expects and the address it asks about are two different numbers now.
     match paging::translate(pl011::BASE) {
         Some((phys, flags, Memory::Device))
-            if phys == pl011::BASE && flags == MapFlags::READ | MapFlags::WRITE => {}
+            if phys == pl011::PHYS && flags == MapFlags::READ | MapFlags::WRITE => {}
         other => {
             let _ = writeln!(
                 out,
                 "M3_TABLES_FAILED: the PL011 at {:#x} translates to {other:?}, \
                  expected {:#x} as READ|WRITE Device",
                 pl011::BASE,
-                pl011::BASE
+                pl011::PHYS
             );
             halt();
         }
     }
     let _ = writeln!(
         out,
-        "device window: PL011 at {:#x} maps to itself, Device",
-        pl011::BASE
+        "device window: PL011 {:#x} -> {:#x}, Device, through the kernel half at {:#x}",
+        pl011::BASE,
+        pl011::PHYS,
+        paging::DEVICE_VIRT,
     );
 
     if paging::translate(0).is_some() {
@@ -592,28 +603,203 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
         halt();
     }
 
-    // The low identity map is gone, and this is the check that says so: the
-    // image's own physical address is not an address the kernel can reach any
-    // more. Stage 1e ran on the loader's tables, which mapped all of RAM at its
-    // own address; the kernel's own tables map RAM through the direct map and
-    // nothing else, which is what keeps the kernel image out of the half a
-    // process will own.
+    // The low half is *empty*, and this is the check that says so: neither the
+    // image's own physical address nor a device's is an address the kernel can
+    // reach any more. Two stages got it here - 1e ran on the loader's tables,
+    // which mapped all of RAM at its own address, and 1f kept the kernel's out
+    // of it, while the device window stayed low - and stage 5b is the one that
+    // moved the last of it. `TTBR0` resolves nothing at all now, which is the
+    // strongest form the claim has before a process's own tables replace it.
     if let Some((phys, flags, _)) = paging::translate(info.kernel_phys_base) {
         let _ = writeln!(
             out,
             "M3_TABLES_FAILED: {:#x} is still mapped identity ({flags:?} -> {phys:#x}); \
-             the kernel's tables should have kept only the device window in the low half",
+             the kernel's tables should have kept the low half empty",
             info.kernel_phys_base
+        );
+        halt();
+    }
+    if let Some((phys, flags, _)) = paging::translate(pl011::PHYS) {
+        let _ = writeln!(
+            out,
+            "M3_TABLES_FAILED: the device window's own address {:#x} is still mapped \
+             ({flags:?} -> {phys:#x}); it belongs in the kernel half now",
+            pl011::PHYS
         );
         halt();
     }
     let _ = writeln!(
         out,
-        "no identity map: {:#x} is unreachable, only the device window lives low",
-        info.kernel_phys_base
+        "no low half: {:#x} is unreachable, and so is the device window at {:#x} \
+         that used to live there",
+        info.kernel_phys_base,
+        paging::DEVICE_PHYS,
     );
 
     let _ = writeln!(out, "M3_TABLES_OK");
+}
+
+/// The virtio-MMIO identity registers: the four words a transport answers before
+/// any driver has touched it.
+///
+/// They are the whole reason this machine can be asked *which* of its windows
+/// carry a device. QEMU's `virt` publishes thirty-two `virtio,mmio` nodes
+/// whether or not anything is attached to them, and that is measured rather than
+/// assumed: the tree decompiled with and without `-device virtio-rng-device`
+/// differs only in the firmware's own random seeds, byte for byte. So the tree
+/// cannot say, and the transport's own registers can.
+/// `MagicValue`: the four letters `virt` as one little-endian word.
+const VIRTIO_MMIO_MAGIC: usize = 0x000;
+/// `Version`: which register layout this transport speaks.
+const VIRTIO_MMIO_VERSION: usize = 0x004;
+/// `DeviceID`: zero when no device is attached to the transport.
+const VIRTIO_MMIO_DEVICE_ID: usize = 0x008;
+/// `VendorID`: whose device it is, which the specification leaves to the
+/// implementation.
+const VIRTIO_MMIO_VENDOR_ID: usize = 0x00c;
+/// `MagicValue`: the four ASCII letters `virt`, read as one little-endian word.
+const VIRTIO_MAGIC: u32 = 0x7472_6976;
+/// `Version`: 2 is the modern (1.0) transport, which is the only register layout
+/// the driver crate reads. Version 1 is the legacy one, whose registers are at
+/// different offsets and which has no device-feature words at all.
+const VIRTIO_VERSION_MODERN: u32 = 2;
+
+/// One 32-bit read of a device's registers, through the kernel's own tables.
+fn read_device(virt: usize, offset: usize) -> u32 {
+    // SAFETY: `virt` came from `paging::device_virt`, which only answers for a
+    // window wholly inside the range `install` mapped as Device and never
+    // executable, and every `offset` below is one of four words inside the
+    // 512-byte stride a virtio-mmio transport owns.
+    unsafe { core::ptr::read_volatile((virt + offset) as *const u32) }
+}
+
+/// Stage 5b's evidence: the kernel's own tables reach the machine's transports,
+/// and the transports answer as transports.
+///
+/// Stage 5a held the tree up against constants, and 5b's first half put the
+/// window those devices live in into the kernel half; what neither could say is
+/// whether there is really a *device* on the other side of an address. This
+/// reads four registers through the window and checks the two the specification
+/// fixes, so a window with nothing behind it - a tree naming a hole, a mapping
+/// at the wrong physical address, an attribute that turned the reads into
+/// something else entirely - ends as a named failure here rather than as a
+/// driver that times out three stages from now.
+///
+/// The two numbers it does *not* check are checked against nothing on purpose:
+/// `DeviceID` is 0 on a transport with no device behind it (which is what most
+/// of a bare `virt` machine's thirty-two windows are, and is legal), and
+/// `VendorID` is the implementation's to choose. Both are reported, because
+/// which device answers is the fact the next stage needs.
+///
+/// It runs after `check_paging`, and that is the point of it: every address
+/// below is in the kernel half, and the walk is what proves the page tables
+/// reach the window rather than that the window exists.
+fn check_virtio(info: &BootInfo) {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+
+    /// News this machine cannot act on: say which claim failed and stop, as
+    /// `check_devices` does and for the same reason - the marker is what
+    /// `xtask boot-aarch64` polls for.
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M5_VIRTIO_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    let Some(bytes) = info.dtb else {
+        fail!("the record carries no device tree, so the machine cannot say where its devices are");
+    };
+    let tree = match fdt::Fdt::new(bytes) {
+        Ok(tree) => tree,
+        Err(error) => fail!("the device tree will not walk: {error:?}"),
+    };
+
+    // What the walk collects, as numbers rather than as text: the closure
+    // `Fdt::each` calls cannot borrow `out`, so nothing can be reported from
+    // inside it and every failure has to survive until the walk is over.
+    // `check_devices` walks the same tree through the same shape.
+    let mut windows = 0usize;
+    let mut attached = 0usize;
+    let mut first: Option<(usize, u32, u32)> = None; // address, device id, vendor id
+    let mut outside: Option<(usize, usize)> = None; // address, size
+    let mut wrong_magic: Option<(usize, u32, u32)> = None; // address, what it said, version
+    let mut wrong_version: Option<(usize, u32)> = None; // address, what it said
+
+    let walked = tree.each(
+        |node| node.is_compatible("virtio,mmio"),
+        |node| {
+            windows += 1;
+            for (address, size) in node.reg() {
+                let (address, size) = (address as usize, size as usize);
+                let Some(virt) = paging::device_virt(address, size) else {
+                    outside = Some((address, size));
+                    continue;
+                };
+                let magic = read_device(virt, VIRTIO_MMIO_MAGIC);
+                let version = read_device(virt, VIRTIO_MMIO_VERSION);
+                let device = read_device(virt, VIRTIO_MMIO_DEVICE_ID);
+                let vendor = read_device(virt, VIRTIO_MMIO_VENDOR_ID);
+                if magic != VIRTIO_MAGIC {
+                    // The first offender wins, not the last: a machine with one
+                    // window in the wrong place is easier to read off a boot log
+                    // than the thirty-second one to be asked.
+                    wrong_magic.get_or_insert((address, magic, version));
+                } else if version != VIRTIO_VERSION_MODERN {
+                    wrong_version.get_or_insert((address, version));
+                } else if device != 0 {
+                    attached += 1;
+                    if first.is_none() {
+                        first = Some((address, device, vendor));
+                    }
+                }
+            }
+            true
+        },
+    );
+    if let Err(error) = walked {
+        fail!("the device tree will not walk: {error:?}");
+    }
+    if let Some((address, size)) = outside {
+        fail!(
+            "the tree's virtio window at {address:#x}..{:#x} is not inside the \
+             {:#x}..{:#x} device window this kernel maps",
+            address + size,
+            paging::DEVICE_PHYS,
+            paging::DEVICE_PHYS + paging::DEVICE_WINDOW,
+        );
+    }
+    if let Some((address, magic, version)) = wrong_magic {
+        fail!(
+            "the transport at {address:#x} answered {magic:#x} for MagicValue (with \
+             version {version}), and a virtio-mmio transport answers {VIRTIO_MAGIC:#x}"
+        );
+    }
+    if let Some((address, version)) = wrong_version {
+        fail!(
+            "the transport at {address:#x} answers version {version}, and this \
+             kernel's driver reads the modern (version {VIRTIO_VERSION_MODERN}) layout"
+        );
+    }
+    if windows == 0 {
+        fail!("the tree describes no virtio-mmio transport at all");
+    }
+
+    let _ = writeln!(
+        out,
+        "virtio: {windows} transports, every one answering virtio 1.0 through the \
+         kernel half; {attached} {} a device",
+        if attached == 1 { "carries" } else { "carry" },
+    );
+    if let Some((address, device, vendor)) = first {
+        let _ = writeln!(
+            out,
+            "virtio: the first is at {address:#x}, device {device}, vendor {vendor:#x}"
+        );
+    }
+    let _ = writeln!(out, "M5_VIRTIO_OK");
 }
 
 /// Bring the machine's interrupts up: the vector table, then the controller,

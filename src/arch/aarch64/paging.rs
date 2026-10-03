@@ -4,9 +4,13 @@
 //! Four levels of 512 entries, a 4 KiB granule and two halves: `TTBR0` covers
 //! the low virtual half and `TTBR1` the high one, which is the aarch64 division
 //! of the address space. Both are pointed at the *same* root here, and that is
-//! the same arrangement the loader used: everything the low half holds is the
-//! device window and everything the high half holds is the direct map or the
-//! image, so no entry is wanted by both registers.
+//! the same arrangement the loader used. One root can serve both registers only
+//! while no entry is wanted by both, and since stage 5b that condition is trivially
+//! met on this machine: the direct map, the image *and* the device window are all
+//! in the high half, so the low half is empty and `TTBR0` resolves nothing. It
+//! stops being trivially met at stage 6, when a process gets tables of its own
+//! and the two registers are no longer the same table - which is exactly what
+//! that half is for.
 //!
 //! # Three stages of the same file
 //!
@@ -139,29 +143,53 @@ const SCTLR_ENABLE: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 12);
 // The device window
 // ---------------------------------------------------------------------------
 
-/// Where this machine's device registers are, as a physical range the kernel
-/// maps at the *same* virtual address in the low half.
+/// Where this machine's device registers are, physically, as the firmware's
+/// device tree describes them.
 ///
 /// QEMU `virt` puts PL011 at `0x0900_0000` and the GIC at
 /// `0x0800_0000`/`0x0801_0000`; the device tree is what a real port reads, and
-/// stage 5 is where it does (`PLAN.md` §9.1).
-///
-/// It is mapped in the low half - `TTBR0`, the half a process will own - and
-/// that is a named gap rather than a choice: x86_64 puts its device window in
-/// the *kernel* half (`mm::MMIO_BASE`, just below the image) precisely so a
-/// process cannot collide with it, and aarch64 gets the same arrangement when
-/// `mm::map_mmio` grows an arm here in stage 5. Until then the kernel's console
-/// and interrupt controller are at fixed physical addresses, and a kernel-half
-/// alias would have to be spelled in `pl011`/`gic` anyway - so the honest thing
-/// is to map where they already are and name the collision that a user address
-/// space will eventually have.
+/// stage 5a is where this one does.
 ///
 /// It deliberately does not start at zero: the low 128 MiB of `virt` is flash
 /// and the machine's own vectors, and a null pointer that silently works is the
 /// one thing x86_64's own `check_arch` asserts cannot happen.
-pub const DEVICE_BASE: usize = 0x0800_0000;
+pub const DEVICE_PHYS: usize = 0x0800_0000;
 /// 64 MiB, from the GIC's distributor to past the virtio-MMIO frames.
 pub const DEVICE_WINDOW: usize = 0x0400_0000;
+
+/// Where the *kernel* half reaches those same registers.
+///
+/// The address x86_64's `mm::MMIO_BASE` uses, and for the same reason: a hole
+/// the kernel half has room for, immediately below the image at
+/// `0xffff_ffff_8000_0000`. Stage 5b moved the window here from the physical
+/// address it used to be mapped at, which lived in `TTBR0` - the half a process
+/// will own, so a process's own mapping could have landed on the console's
+/// registers. The low half holds nothing at all now, which `check_paging` says
+/// in as many words.
+///
+/// `pl011` and `gic` are compiled against addresses in this window rather than
+/// against the physical ones, and that is why the *loader* maps the alias too
+/// (`boot/src/vm.rs`) rather than only `install` below: the kernel's first
+/// instruction - the banner, and the device check that runs before the frame
+/// allocator - executes while the loader's tables are still the machine's.
+pub const DEVICE_VIRT: usize = 0xffff_ffff_4000_0000;
+
+/// The kernel-half address a device's registers are reached through, or `None`
+/// when the device is not wholly inside the window the kernel mapped.
+///
+/// The whole 64 MiB is mapped a page at a time by [`Tables::map_devices`], so
+/// reaching a device is arithmetic rather than a page-table walk - which is what
+/// this machine's `mm::map_mmio` becomes when `hal` reaches it at stage 6. A
+/// device outside the window is `None` rather than a wrapped address: the caller
+/// is a boot check reading what the firmware described, and a tree that named a
+/// device this kernel did not map is a failure it has to be able to report.
+pub fn device_virt(phys: usize, len: usize) -> Option<usize> {
+    let end = phys.checked_add(len)?;
+    if phys < DEVICE_PHYS || end > DEVICE_PHYS + DEVICE_WINDOW {
+        return None;
+    }
+    Some(DEVICE_VIRT + (phys - DEVICE_PHYS))
+}
 
 /// How the page at a translated address is cached.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -301,7 +329,8 @@ impl Tables {
         }
     }
 
-    /// Map the machine's device registers, Device and never executable.
+    /// Map the machine's device registers, Device and never executable, into the
+    /// kernel half.
     ///
     /// A page at a time, like everything else here. The window is a constant and
     /// could be a handful of 2 MiB blocks, but a block descriptor and a page
@@ -312,7 +341,7 @@ impl Tables {
         let attrs = device_attributes(MapFlags::READ | MapFlags::WRITE);
         let mut offset = 0;
         while offset < DEVICE_WINDOW {
-            self.map_page(DEVICE_BASE + offset, DEVICE_BASE + offset, attrs);
+            self.map_page(DEVICE_VIRT + offset, DEVICE_PHYS + offset, attrs);
             offset += PAGE_SIZE;
         }
     }

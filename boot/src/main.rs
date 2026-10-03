@@ -306,14 +306,18 @@ fn main() -> Status {
     // to reach them yet: x86_64's kernel walks a BAR through `mm::map_mmio`, and
     // aarch64 reads a device tree at stage 5. Until then the GIC and the PL011
     // sit at fixed addresses, and this is what keeps them reachable once the
-    // firmware's own identity map is gone.
+    // firmware's own identity map is gone. Mapped twice on purpose - at the
+    // physical address this loader's console writes to, and at the kernel-half
+    // alias the kernel is compiled against from its first instruction.
     #[cfg(target_arch = "aarch64")]
     {
         vm::map_device_window(&mut tables);
         log(&format!(
-            "device window {:#x}..{:#x} mapped, Device and not executable",
+            "device window {:#x}..{:#x} mapped at its own address and at {:#x}, \
+             Device and not executable",
             vm::DEVICE_BASE,
-            vm::DEVICE_BASE + vm::DEVICE_WINDOW
+            vm::DEVICE_BASE + vm::DEVICE_WINDOW,
+            vm::DEVICE_VIRT
         ));
     }
     vm::map_kernel_image(

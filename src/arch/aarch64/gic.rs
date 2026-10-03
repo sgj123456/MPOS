@@ -6,19 +6,30 @@
 //! distributor and the CPU interface, 64 KiB each. That is why this file is
 //! GICv2 and not GICv3: the two are different *mechanisms* (GICv3's CPU
 //! interface is system registers, not a second MMIO frame), so "which one" is
-//! the first thing to establish. Stage 5 reads this from the DTB instead of
-//! from a hardcoded address; until then the fixed pair is honest for one
-//! machine and named as such.
+//! the first thing to establish. Stage 5a reads this node out of the tree and
+//! holds it against the constants below, so the fixed pair is now a checked
+//! claim about one machine rather than an assumption about it.
 //!
 //! The two interrupt numbers this kernel uses are measured the same way: the
 //! PL011's node carries `interrupts = <0 1 4>` (SPI 1, so INTID 33) and the
 //! `arm,armv7-timer` node's second entry is PPI 14 - the non-secure EL1
 //! physical timer - so INTID 30.
 
-/// The distributor: enable/disable, priority, group, target.
-pub const DIST: usize = 0x0800_0000;
-/// The CPU interface: the priority mask, acknowledge and end-of-interrupt.
-pub const CPU: usize = 0x0801_0000;
+use super::paging;
+
+/// The distributor's physical address: what the firmware's device tree names,
+/// and what `check_devices` compares the tree against.
+pub const DIST_PHYS: usize = 0x0800_0000;
+/// The CPU interface's physical address, likewise.
+pub const CPU_PHYS: usize = 0x0801_0000;
+
+/// The distributor as this kernel reaches it: through the kernel half's device
+/// window. [`paging::DEVICE_VIRT`] says why the registers are not reached at the
+/// address they physically are; both are spelled as the window's base plus the
+/// frame's offset into it, so a window that moves takes them with it.
+pub const DIST: usize = paging::DEVICE_VIRT + (DIST_PHYS - paging::DEVICE_PHYS);
+/// The CPU interface, likewise: the second `reg` window of the same node.
+pub const CPU: usize = paging::DEVICE_VIRT + (CPU_PHYS - paging::DEVICE_PHYS);
 
 /// Distributor control: bit 0 enables group 0 (a FIQ), bit 1 group 1 (an IRQ).
 const GICD_CTLR: usize = 0x000;

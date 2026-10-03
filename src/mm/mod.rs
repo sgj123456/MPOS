@@ -42,11 +42,22 @@ static ALLOCATOR: heap::KernelHeap = heap::KernelHeap::empty();
 #[cfg(target_os = "none")]
 /// Where a device's registers get mapped.
 ///
-/// x86_64's window, and x86_64's for a concrete reason rather than an accident:
-/// the address is one the *kernel half* has room for on that machine's four
-/// levels, and a second machine's page-table format puts its own kernel half at
-/// its own base. aarch64 gets this back with its `Paging` impl in stage 5, when
-/// there is a device on the machine to map.
+/// The two machines agree about the address, and that is a hole the *kernel half*
+/// has room for in both four-level formats: immediately below the image at
+/// `0xffff_ffff_8000_0000`. What they do with it differs, and the difference is
+/// the honest part. x86_64 reaches it by walking a BAR and asking
+/// `hal::map_mmio` for one mapping per device; aarch64 maps its whole fixed
+/// device window there at boot and translates by offset
+/// (`arch::aarch64::paging::device_virt`), which is what its kernel is compiled
+/// against.
+///
+/// So the dynamic half stays x86_64's: aarch64 has no `mm::map_mmio` because
+/// that call goes through `hal::Paging`, and `hal` cannot compile for a machine
+/// whose `Paging` has no user address space yet. A window that is a constant
+/// range on one machine and a per-BAR allocator on the other is a smaller thing
+/// than it sounds - both are "the kernel half's device registers" - but it is
+/// not the same thing, and the names below are x86_64's until stage 6 brings
+/// `hal`.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub const MMIO_BASE: usize = 0xffff_ffff_4000_0000;
 /// One past the end of the window: 1 GiB of address space, which is room for

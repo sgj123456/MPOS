@@ -39,8 +39,10 @@
 //! door that lets it compile. The ledger, as it stands:
 //!
 //! - **compiled for every target the build has** - `arch` (both bodies),
-//!   `boot`, `mm` (its pure half and the heap; the MMIO window is x86_64's
-//!   until stage 5), `logging` (the level vocabulary; the subscriber writes to
+//!   `boot`, `mm` (its pure half and the heap; the *dynamic* MMIO window -
+//!   `mm::map_mmio` - is x86_64's until stage 6, because it goes through
+//!   `hal::Paging`; the fixed window aarch64's devices are reached through is
+//!   `arch::aarch64::paging::DEVICE_VIRT`, and it is not this module's), `logging` (the level vocabulary; the subscriber writes to
 //!   a console only x86_64 has), `rand`, `sync`, `uevent`, and every `crates/*`
 //!   leaf.
 //! - **not on aarch64 yet**, and the two ways a module can be that:

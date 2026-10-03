@@ -225,21 +225,46 @@ pub const DEVICE_BASE: u64 = 0x0800_0000;
 #[cfg(target_arch = "aarch64")]
 pub const DEVICE_WINDOW: u64 = 0x0400_0000;
 
-/// Map the machine's device window, Device and never executable.
+/// Where the *kernel* half reaches those registers.
+///
+/// The address x86_64's `mm::MMIO_BASE` names, and for the same reason: a hole
+/// the kernel half has room for, immediately below the image at
+/// `0xffff_ffff_8000_0000`. Until stage 5b the window was mapped only at its
+/// physical address, in `TTBR0` - the half a process will own - which is a
+/// collision waiting to happen rather than an arrangement; the kernel has a
+/// device window in its own half now, and the low half holds nothing at all.
+///
+/// The loader maps the window at **both** addresses, and that is not
+/// redundancy: this loader's own console writes to the physical one (it runs on
+/// the firmware's identity map before its own tables exist, and the firmware
+/// brought that UART up there), while the kernel is compiled against the alias
+/// from its very first instruction - which runs while the loader's tables are
+/// still the machine's. A window only `install` mapped would leave the kernel's
+/// own banner unmapped.
+#[cfg(target_arch = "aarch64")]
+pub const DEVICE_VIRT: u64 = 0xffff_ffff_4000_0000;
+
+/// Map the machine's device window, Device and never executable: at the physical
+/// address, which this loader's console is reached through, and at the
+/// kernel-half alias, which is where the kernel reaches it.
 #[cfg(target_arch = "aarch64")]
 pub fn map_device_window(tables: &mut PageTables) {
     tables.map_device(DEVICE_BASE, DEVICE_BASE, DEVICE_WINDOW);
+    tables.map_device(DEVICE_VIRT, DEVICE_BASE, DEVICE_WINDOW);
 }
 
 /// Bytes this machine's loader maps beyond RAM, so the page-table pool is sized
 /// for everything that will be mapped rather than for RAM alone.
 ///
 /// A device window costs a page table per 2 MiB whether it is RAM or not, and
-/// the pool is allocated before the first one is taken.
+/// the pool is allocated before the first one is taken - which is why the window
+/// is counted *twice* on aarch64: `map_device_window` maps it at its physical
+/// address and again at the kernel-half alias, and a pool sized for one of them
+/// runs out of frames partway through the second.
 pub fn extra_mapped_bytes() -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
-        DEVICE_WINDOW
+        2 * DEVICE_WINDOW
     }
     #[cfg(target_arch = "x86_64")]
     {
