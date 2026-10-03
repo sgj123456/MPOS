@@ -341,6 +341,171 @@ impl Grid {
         }
     }
 
+    /// The rows `CSI L` and `CSI M` may touch: the cursor's own row, cut to the
+    /// scroll region - and `None` when the cursor stands outside that region,
+    /// where a DEC terminal does nothing at all rather than editing the row
+    /// under the cursor wherever it happens to be.
+    fn edit_rows(&self) -> Option<(usize, usize, usize)> {
+        let (row, _) = self.cur.pos();
+        let (top, bottom) = self.cur.region();
+        (row >= top && row <= bottom).then_some((row, top, bottom))
+    }
+
+    /// Blank every cell of one row in the pen that is pending - what an
+    /// inserted line, a deleted one and an erased span are filled with.
+    fn blank_row(&mut self, row: usize) {
+        let cols = self.cols();
+        let fill = Cell {
+            ch: b' ',
+            fg: self.pen_fg,
+            bg: self.pen_bg,
+        };
+        let at = row * cols;
+        if let Some(line) = self.cells.get_mut(at..at + cols) {
+            line.fill(fill);
+        }
+        self.mark(row);
+    }
+
+    /// `CSI L` - `IL`: put `n` blank lines in at the cursor's row, inside the
+    /// scroll region. The lines below move down; the ones pushed past the
+    /// region's bottom are gone, exactly as a scroll would have taken them.
+    ///
+    /// The cursor does not move. That is the DEC and Linux answer (`csi_L` in
+    /// `vt.c` moves nothing), and it is the one a program can rely on: `vim`
+    /// positions the cursor itself on either side of the insert.
+    fn insert_lines(&mut self, n: usize) {
+        let Some((row, _top, bottom)) = self.edit_rows() else {
+            return;
+        };
+        let n = n.min(bottom - row + 1);
+        let cols = self.cols();
+        // [row, bottom+1-n) moves down by n rows.
+        let keep = bottom + 1 - n;
+        if keep > row {
+            let src = row * cols;
+            let dst = (row + n) * cols;
+            self.cells.copy_within(src..src + (keep - row) * cols, dst);
+        }
+        for r in row..row + n {
+            self.blank_row(r);
+        }
+        for r in row..=bottom {
+            self.mark(r);
+        }
+    }
+
+    /// `CSI M` - `DL`: take `n` lines out at the cursor's row, inside the
+    /// scroll region. The lines below move up, and as many blank lines appear
+    /// at the region's bottom as went out at the top.
+    fn delete_lines(&mut self, n: usize) {
+        let Some((row, _top, bottom)) = self.edit_rows() else {
+            return;
+        };
+        let n = n.min(bottom - row + 1);
+        let cols = self.cols();
+        // [row+n, bottom+1) moves up by n rows.
+        let from = row + n;
+        if from <= bottom {
+            let src = from * cols;
+            let dst = row * cols;
+            self.cells
+                .copy_within(src..src + (bottom + 1 - from) * cols, dst);
+        }
+        for r in bottom + 1 - n..=bottom {
+            self.blank_row(r);
+        }
+        for r in row..=bottom {
+            self.mark(r);
+        }
+    }
+
+    /// `CSI S` / `CSI T` - `SU` / `SD`: the scroll region turns over `n` times
+    /// with the cursor where it is. The same shift a line feed at the region's
+    /// edge does, asked for directly.
+    fn scroll_region(&mut self, n: usize, up: bool) {
+        for _ in 0..n.min(self.rows()) {
+            if up {
+                self.scroll_up();
+            } else {
+                self.scroll_down();
+            }
+        }
+    }
+
+    /// `CSI @` - `ICH`: `n` blanks go in at the cursor and the rest of the row
+    /// shifts right; what passes the right margin is lost.
+    fn insert_chars(&mut self, n: usize) {
+        let (row, col) = self.cur.pos();
+        let cols = self.cols();
+        if col >= cols {
+            return;
+        }
+        let n = n.min(cols - col);
+        let base = row * cols;
+        if col + n < cols {
+            let from = base + col;
+            self.cells
+                .copy_within(from..from + cols - col - n, from + n);
+        }
+        let fill = Cell {
+            ch: b' ',
+            fg: self.pen_fg,
+            bg: self.pen_bg,
+        };
+        if let Some(line) = self.cells.get_mut(base + col..base + col + n) {
+            line.fill(fill);
+        }
+        self.mark(row);
+    }
+
+    /// `CSI P` - `DCH`: `n` cells come out at the cursor, the rest of the row
+    /// slides left, and the margin end of the row goes blank.
+    fn delete_chars(&mut self, n: usize) {
+        let (row, col) = self.cur.pos();
+        let cols = self.cols();
+        if col >= cols {
+            return;
+        }
+        let n = n.min(cols - col);
+        let base = row * cols;
+        if col + n < cols {
+            let from = base + col + n;
+            self.cells.copy_within(from..base + cols, base + col);
+        }
+        let fill = Cell {
+            ch: b' ',
+            fg: self.pen_fg,
+            bg: self.pen_bg,
+        };
+        if let Some(line) = self.cells.get_mut(base + cols - n..base + cols) {
+            line.fill(fill);
+        }
+        self.mark(row);
+    }
+
+    /// `CSI X` - `ECH`: blank `n` cells from the cursor along its row. Nothing
+    /// shifts - this is an erase, not a delete, which is the whole difference
+    /// between it and [`Self::delete_chars`].
+    fn erase_chars(&mut self, n: usize) {
+        let (row, col) = self.cur.pos();
+        let cols = self.cols();
+        if col >= cols {
+            return;
+        }
+        let n = n.min(cols - col);
+        let fill = Cell {
+            ch: b' ',
+            fg: self.pen_fg,
+            bg: self.pen_bg,
+        };
+        let base = row * cols;
+        if let Some(line) = self.cells.get_mut(base + col..base + col + n) {
+            line.fill(fill);
+        }
+        self.mark(row);
+    }
+
     fn escaped(&mut self, b: u8) {
         match b {
             b'[' => {
@@ -477,6 +642,25 @@ impl Grid {
                 .move_to(self.p(0, 1) as usize, self.p(1, 1) as usize),
             b'J' => self.erase_display(self.param_at(0).unwrap_or(0)),
             b'K' => self.erase_line(self.param_at(0).unwrap_or(0)),
+            // The editing pairs - lines and characters - are how a full-screen
+            // program moves what is already on the screen instead of redrawing
+            // it, and `vi` pages that way: measured, `vim` 9.2 in a 25x80
+            // window scrolls down with `ESC [ 1;24r ESC [ 1;1H ESC [ 12M` and
+            // up with `ESC [ 1;24r ESC [ 1;1H ESC [ L`. Both went into the
+            // `_ => {}` below until now, so the screen never moved: what
+            // followed was drawn over the page that was already there, which is
+            // the whole of "paging is broken".
+            // All seven are ECMA-48's, and none of them has a private form: a
+            // `?`, `>` or `<` marker in front of one is a sequence this screen
+            // does not know, which has to stay unknown rather than be read as
+            // the public command it resembles.
+            b'L' if self.priv_marker == 0 => self.insert_lines(self.p(0, 1) as usize),
+            b'M' if self.priv_marker == 0 => self.delete_lines(self.p(0, 1) as usize),
+            b'S' if self.priv_marker == 0 => self.scroll_region(self.p(0, 1) as usize, true),
+            b'T' if self.priv_marker == 0 => self.scroll_region(self.p(0, 1) as usize, false),
+            b'@' if self.priv_marker == 0 => self.insert_chars(self.p(0, 1) as usize),
+            b'P' if self.priv_marker == 0 => self.delete_chars(self.p(0, 1) as usize),
+            b'X' if self.priv_marker == 0 => self.erase_chars(self.p(0, 1) as usize),
             b'm' => self.sgr(np),
             b'r' => {
                 // `DECSTBM`: the region, and the cursor goes to its top left -
@@ -909,6 +1093,99 @@ mod tests {
         let _ = g.take_dirty(); // clear the print's dirty bits
         g.feed(b"\x1b[D"); // left, moves the cursor but prints nothing
         assert_ne!(g.take_dirty(), 0, "the cursor's row must be redrawn");
+    }
+
+    /// The measured one. `vim` 9.2 in a 25x80 window scrolls its page *down* by
+    /// setting a region one row short of the screen, homing the cursor inside it
+    /// and deleting lines there - `ESC [ 1;24r ESC [ 1;1H ESC [ 12M` - and then
+    /// draws the twelve new lines over the blank it left. Until `CSI M` was
+    /// answered that left the old lines where they were and painted the new ones
+    /// over the middle of the page: a page that "did not turn".
+    #[test]
+    fn deleting_lines_is_how_a_page_turns_down() {
+        let mut g = Grid::new(5, 6);
+        g.feed(b"0\r\n1\r\n2\r\n3\r\n4");
+        assert_eq!(&row_text(&g, 0), "0     ");
+        // Region rows 1..4 (1-based), cursor to its top: what vim sends.
+        g.feed(b"\x1b[1;4r\x1b[1;1H\x1b[2M");
+        assert_eq!(&row_text(&g, 0), "2     ", "the region shifted up by two");
+        assert_eq!(&row_text(&g, 1), "3     ");
+        assert_eq!(&row_text(&g, 2), "      ", "and its bottom went blank");
+        assert_eq!(&row_text(&g, 3), "      ");
+        // Row 4 is below the region and must not be touched by it.
+        assert_eq!(&row_text(&g, 4), "4     ");
+    }
+
+    /// The other direction: `ESC [ L` at the top of the region opens a line and
+    /// pushes the rest down, losing the region's last row.
+    #[test]
+    fn inserting_a_line_pushes_the_rows_below_down() {
+        let mut g = Grid::new(4, 6);
+        g.feed(b"0\r\n1\r\n2\r\n3");
+        g.feed(b"\x1b[1;3r\x1b[1;1H\x1b[L");
+        assert_eq!(&row_text(&g, 0), "      ");
+        assert_eq!(&row_text(&g, 1), "0     ");
+        assert_eq!(&row_text(&g, 2), "1     ");
+        assert_eq!(&row_text(&g, 3), "3     ", "outside the region: untouched");
+    }
+
+    /// A cursor outside the scroll region is not an editing position. A DEC
+    /// terminal does nothing there, and editing the row under the cursor anyway
+    /// would move lines the program never named.
+    #[test]
+    fn an_edit_with_the_cursor_outside_the_region_edits_nothing() {
+        let mut g = Grid::new(4, 6);
+        g.feed(b"0\r\n1\r\n2\r\n3");
+        // Region rows 1..2, cursor on row 3 - outside it.
+        g.feed(b"\x1b[1;2r\x1b[3;1H\x1b[M");
+        assert_eq!(&row_text(&g, 0), "0     ");
+        assert_eq!(&row_text(&g, 1), "1     ");
+        assert_eq!(&row_text(&g, 2), "2     ");
+        assert_eq!(&row_text(&g, 3), "3     ");
+    }
+
+    /// `ICH`/`DCH` shift the rest of the row; `ECH` blanks it in place. The
+    /// three are one family and the only difference between them is whether
+    /// what follows the cursor travels.
+    #[test]
+    fn characters_are_inserted_deleted_and_erased_within_their_row() {
+        let mut g = Grid::new(2, 6);
+        g.feed(b"abcdef");
+        g.feed(b"\x1b[1;3H"); // column 3 (1-based) - on 'c'
+        g.feed(b"\x1b[2@"); // two blanks in: "ab  cd", the 'f' past the margin gone
+        assert_eq!(&row_text(&g, 0), "ab  cd");
+        g.feed(b"\x1b[2P"); // the same two out again, the row sliding left
+        assert_eq!(&row_text(&g, 0), "abcd  ");
+        g.feed(b"\x1b[1;2H\x1b[2X"); // erase two where they stand: "a  d"
+        assert_eq!(&row_text(&g, 0), "a  d  ");
+    }
+
+    /// `SU`/`SD` turn the region over without taking the cursor with them -
+    /// which is the difference between them and a line feed at the edge.
+    #[test]
+    fn scrolling_the_region_leaves_the_cursor_where_it_was() {
+        let mut g = Grid::new(3, 4);
+        g.feed(b"ab\r\ncd\r\nef");
+        g.feed(b"\x1b[2;2H");
+        g.feed(b"\x1b[1S");
+        assert_eq!(&row_text(&g, 0), "cd  ");
+        assert_eq!(&row_text(&g, 1), "ef  ");
+        assert_eq!(g.cursor(), (1, 1), "the cursor did not travel");
+        g.feed(b"\x1b[1T");
+        assert_eq!(&row_text(&g, 0), "    ");
+        assert_eq!(&row_text(&g, 1), "cd  ");
+    }
+
+    /// A private marker in front of an editing command is a sequence this
+    /// screen does not know, and reading it as the public command it looks like
+    /// would edit the screen on behalf of nobody.
+    #[test]
+    fn a_private_marker_keeps_an_editing_sequence_unknown() {
+        let mut g = Grid::new(3, 4);
+        g.feed(b"ab\r\ncd");
+        g.feed(b"\x1b[?1L");
+        assert_eq!(&row_text(&g, 0), "ab  ");
+        assert_eq!(&row_text(&g, 1), "cd  ");
     }
 
     #[test]
