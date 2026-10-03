@@ -205,26 +205,43 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::SYMLINKAT => fs::symlinkat(args, &cwd()),
 
         // --- sockets: AF_INET over the smoltcp stack ---
+        #[cfg(not(target_arch = "aarch64"))]
         nr::SOCKET => crate::net::socket::handle_socket(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::CONNECT => crate::net::socket::handle_connect(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::ACCEPT => crate::net::socket::handle_accept(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::SENDTO => crate::net::socket::handle_sendto(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::RECVFROM => crate::net::socket::handle_recvfrom(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::SENDMSG => crate::net::socket::handle_sendmsg(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::RECVMSG => crate::net::socket::handle_recvmsg(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::SHUTDOWN => crate::net::socket::handle_shutdown(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::BIND => crate::net::socket::handle_bind(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::LISTEN => crate::net::socket::handle_listen(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::GETSOCKNAME => crate::net::socket::handle_getsockname(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::GETPEERNAME => crate::net::socket::handle_getpeername(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::SOCKETPAIR => crate::net::socket::handle_socketpair(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::SETSOCKOPT => crate::net::socket::handle_setsockopt(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::GETSOCKOPT => crate::net::socket::handle_getsockopt(args, from_user),
         // The multiple-message pair and the flagged accept: `sendmsg` and
         // `recvmsg` over an array of records, and `accept` with the two
         // descriptor flags the modern spelling takes.
         nr::ACCEPT4 => crate::net::socket::handle_accept4(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::SENDMMSG => crate::net::socket::handle_sendmmsg(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::RECVMMSG => crate::net::socket::handle_recvmmsg(args, from_user),
 
         // --- process ---
