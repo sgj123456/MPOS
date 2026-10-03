@@ -116,12 +116,15 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     mpos::println!("M6_INIT_OK");
     // Bring-up end: `/init` here is a one-shot `exit_group`, so when it leaves
     // there is nothing left to run and no interactive console yet. Halt cleanly.
-    // Parking via `block_until` instead would switch to the scheduler's idle task,
-    // and that switch faults on this machine - its kernel stack is not installed the
-    // way `Table::enter` builds one (`msr SP_EL1` on a null stack, `sched::Table::enter`).
-    // That idle/park path is a named follow-on for the drivers stage, where a real
-    // shell keeps the machine runnable and the idle loop must work; refusing to park
-    // here is honest about what is built, not a hidden stub.
+    // The idle/park path is now sound: switching to the scheduler's idle task used
+    // to fault (`msr SP_EL1, Xt` is architecturally undefined while `SPSel` selects
+    // `SP_EL1`, which is how this kernel runs - `EL1h`), and `Table::enter`'s
+    // `set_kernel_stack` step was doing exactly that. On AArch64 the trap stack is
+    // the current `sp`, already set by the context switch's `mov sp`, so that step
+    // is a no-op here (see `arch::aarch64::context::set_kernel_stack`). What still
+    // keeps this from parking is not the switch but that a real shell needs an
+    // interactive serial RX (`drivers`, stage 7) and a `/init` that does not exit;
+    // until then halting after a completed one-shot init is the honest end state.
     hal::halt()
 }
 

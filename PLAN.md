@@ -5566,11 +5566,21 @@ one `aarch64_qemu` builder `boot-aarch64` uses); verified headless it streams th
 boot to `M6_INIT_OK` on the terminal. An *interactive shell* is still gated on the
 drivers stage (serial RX + the park/idle path below), not on this command.
 
-**Named follow-on (drivers stage):** after init exits the boot task must not `park` via
-`block_until` - switching to the scheduler's idle task faults in `sched::Table::enter`
-(`msr SP_EL1` on an uninstalled idle kernel stack), so the bring-up boot halts instead.
-An interactive shell that keeps the machine runnable needs that idle/park path working,
-which belongs with serial-RX/GIC delivery (stage 7).
+**The idle/park switch is now sound (fixed the stage-6 boot fault).** The old follow-on
+said parking to the idle task "faults on an uninstalled idle kernel stack." Measured, that
+was wrong about the cause: the fault is `sched::Table::enter`'s `set_kernel_stack` step
+emitting `msr SP_EL1, Xt`, which is **architecturally undefined while `SPSel` selects
+`SP_EL1`** - and that is exactly how this kernel runs (`EL1h`, `SPSel`=1, confirmed by the
+`SPSR_EL1.M` = `0b0101` the fault carried, `EC 0x00` at `ELR` inside `enter`, `far`=0). The
+dedicated `MRS/MSR SP_ELx` can only reach the *non-selected* stack, so writing the one the
+kernel is on traps as an undefined instruction. AArch64 has no separate `TSS.rsp0` to arm
+here: the trap-landing stack *is* the current `sp`, and `context::switch` already sets it to
+the incoming task's saved kernel `sp` (`mov sp, x2`) before that task is ever dropped to
+EL0, so `set_kernel_stack` is both undefined and redundant on this machine. Making it a
+no-op removes the fault (verified: the park that used to abort now switches boot→idle→boot
+cleanly, and the boot reaches its terminal halt with no exception). An interactive shell is
+still gated - but only on the genuine prerequisites, serial **RX** (stage 7) and a `/init`
+that does not exit one-shot - not on this switch any more.
 
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo

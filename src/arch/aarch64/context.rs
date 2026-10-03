@@ -448,26 +448,28 @@ pub unsafe fn enter_frame(frame: &UserFrame, on_exit: extern "C" fn(u64) -> !) -
     unsafe { mpos_enter_frame(frame) }
 }
 
-/// Point the privilege-transition stack at `top`, so the next trap from EL0 lands
-/// on this task's kernel stack - the aarch64 form of x86_64's TSS `sp0`.
+/// Nothing to do: on AArch64 the privilege-transition stack *is* the current
+/// `sp`, which the context switch already put on this task's kernel stack.
 ///
-/// On this machine that is `SP_EL1`, written directly; `SPSel` is left as the boot
-/// set it (on `SP_EL1`), so the write does not disturb the stack this code is
-/// running on. Each task gets its own here before the scheduler enters it at EL0;
-/// a trap while `SPSel` selects `SP_EL1` uses this value as the new `sp`.
+/// x86_64's `TSS.sp0` is a separate field the CPU swaps in when a trap crosses
+/// a privilege level, so the scheduler must arm it before entering a task at
+/// ring 3 - hence the shared `Contexts::set_kernel_stack` step and this slot in
+/// it. AArch64 has no such spare field here: the kernel runs at `EL1h`
+/// (`SPSel` = 1), so `sp` *is* `SP_EL1`, and a trap from EL0 lands on whatever
+/// `SP_EL1` already holds. `switch` writes it directly (`mov sp, x2` restores
+/// the incoming task's saved kernel `sp`), so by the time the scheduler drops
+/// that task to EL0 the trap stack is already the task's own. Arming it a
+/// second time is not just redundant - the dedicated `MSR SP_EL1, Xt` is
+/// architecturally *undefined* while `SPSel` selects `SP_EL1` (the form can only
+/// address the non-selected stack), so the write would fault with `EC 0x00`.
+/// Measured: exactly this, on the first switch into the idle task once `/init`
+/// had exited - which is the first time the park path ran the step at all.
 ///
 /// # Safety
 ///
-/// `top` must be the top of a stack the caller owns and that the trap could grow
-/// into. Setting it to a stack another task is using corrupts that task on its
-/// next trap - which is why it is the scheduler's per-task step, not a general one.
-pub unsafe fn set_kernel_stack(top: usize) {
-    // SAFETY: `SPSel` = 1 makes the kernel run on `SP_EL1`, so writing `SP_EL1`
-    // chooses where the *next* trap lands without moving the current `sp`.
-    unsafe {
-        core::arch::asm!("msr sp_el1, {}", in(reg) top, options(nomem, nostack));
-    }
-}
+/// No preconditions remain; `top` is the scheduler's per-task kernel-stack top,
+/// kept only so this satisfies the shared trait. It is not used.
+pub unsafe fn set_kernel_stack(_top: usize) {}
 
 global_asm!(
     // x0: the context being suspended (written). x1: the one being resumed.
