@@ -5560,7 +5560,11 @@ kernel's tables). `cargo xtask boot-aarch64` now ends
 `initramfs: 1 members unpacked` / `mpos: aarch64 machine handed to /init` / `M6_INIT_OK`
 with no exception: the kernel booted AAVMF, ran a real userspace program at EL0, routed
 its `exit_group` into the shared `syscall::dispatch` table, and reaped it. Thirteen
-markers, x86 `cargo xtask test` still 142/142.
+markers, x86 `cargo xtask test` still 142/142. The named deliverable `cargo xtask
+run --arch aarch64` now exists too (interactive serial via `mon:stdio`, reusing the
+one `aarch64_qemu` builder `boot-aarch64` uses); verified headless it streams the whole
+boot to `M6_INIT_OK` on the terminal. An *interactive shell* is still gated on the
+drivers stage (serial RX + the park/idle path below), not on this command.
 
 **Named follow-on (drivers stage):** after init exits the boot task must not `park` via
 `block_until` - switching to the scheduler's idle task faults in `sched::Table::enter`

@@ -323,21 +323,12 @@ fn firmware() -> Result<(PathBuf, PathBuf)> {
     )
 }
 
-/// Boot the ESP under AAVMF and return what the serial line said.
-fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
-    let (code, vars_src) = firmware()?;
-    let vars = vars_path(build_dir);
-    fs::copy(&vars_src, &vars).with_context(|| {
-        format!(
-            "Failed to copy {} to {}",
-            vars_src.display(),
-            vars.display()
-        )
-    })?;
-
-    let log = log_path(build_dir);
-    let _ = fs::remove_file(&log);
-
+/// The full `qemu-system-aarch64` command for this machine, with the serial line
+/// sent wherever `serial` says (`file:…` for the marker-polling boot, `mon:stdio`
+/// for an interactive `run`). Every flag here is a measured machine choice, so
+/// boot-aarch64 and `run --arch aarch64` share one definition rather than two
+/// lists that could drift into booting different machines.
+fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
     let mut qemu = Command::new("qemu-system-aarch64");
     // `acpi=off` is what makes this firmware describe the machine the way this
     // port reads it, and it is a measured difference rather than a preference:
@@ -361,7 +352,7 @@ fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
         .args(["-display", "none"])
         .args(["-monitor", "none"])
         .args(["-no-reboot"])
-        .args(["-serial", &format!("file:{}", log.display())])
+        .args(["-serial", serial])
         // Two flash banks, the way EDK2 expects to find itself: the code bank
         // read-only at the address the machine boots from, and a writable
         // variable store the firmware updates as it goes.
@@ -411,10 +402,58 @@ fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
         // feature-negotiation order) or refuses devices on its own machine, and
         // neither is what stage 5 is for.
         .args(["-global", "virtio-mmio.force-legacy=false"]);
+    qemu
+}
 
+/// Boot the aarch64 machine and hand its serial line to the terminal, staying
+/// attached until the guest exits or the user detaches. This is the interactive
+/// twin of `boot` (which captures the PL011 to a file and stops at a marker):
+/// same ESP, same firmware, same `qemu-system-aarch64`, only the serial goes to
+/// stdio and no kill follows. The machine currently boots to a one-shot `/init`
+/// that halts after `exit_group`; a persistent interactive shell needs the
+/// drivers stage (serial RX + the idle/park path, `PLAN.md` §9.1 stage 7).
+pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
+    let (kernel, loader) = build(profile)?;
+    let esp = build_esp(build_dir, &kernel, &loader)?;
+    let (code, vars_src) = firmware()?;
+    let vars = vars_path(build_dir);
+    fs::copy(&vars_src, &vars).with_context(|| {
+        format!(
+            "Failed to copy {} to {}",
+            vars_src.display(),
+            vars.display()
+        )
+    })?;
+
+    println!("booting aarch64 interactively (Ctrl-A x to exit QEMU)");
+    let mut qemu = aarch64_qemu(&esp, &code, &vars, "mon:stdio");
+    let status = qemu
+        .status()
+        .context("Failed to start qemu-system-aarch64")?;
+    if !status.success() {
+        eprintln!("qemu-system-aarch64 exited {status}");
+    }
+    Ok(())
+}
+
+/// Boot the ESP under AAVMF and return what the serial line said.
+fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
+    let (code, vars_src) = firmware()?;
+    let vars = vars_path(build_dir);
+    fs::copy(&vars_src, &vars).with_context(|| {
+        format!(
+            "Failed to copy {} to {}",
+            vars_src.display(),
+            vars.display()
+        )
+    })?;
+
+    let log = log_path(build_dir);
+    let _ = fs::remove_file(&log);
+
+    let mut qemu = aarch64_qemu(esp, &code, &vars, &format!("file:{}", log.display()));
+    qemu.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = qemu
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start qemu-system-aarch64")?;
 

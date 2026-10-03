@@ -46,6 +46,13 @@ struct Cli {
     #[arg(long, value_name = "MODE", global = true)]
     mode: Option<String>,
 
+    /// `run`: which machine to boot. `x86_64` (default) boots the disk image on
+    /// the QEMU wiring in `machine.toml`; `aarch64` builds the second machine's
+    /// kernel and UEFI loader, lays out its ESP, and boots it under AAVMF with
+    /// the serial line on the terminal. Global for the same reason `--mode` is.
+    #[arg(long, value_name = "ARCH", global = true, default_value = "x86_64")]
+    arch: String,
+
     /// `test`: groups of user tests to run in addition to the ones that are in
     /// no group (default: the `default` list in `tests.toml`, which is empty).
     /// A named group *replaces* that list rather than adding to it. Global for
@@ -111,6 +118,24 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let build_dir = utils::resolve_build_dir(cli.build_dir.as_deref())?;
     let profile = utils::resolve_profile(cli.profile.as_deref());
+
+    // The only machines this front end boots. An unrecognised `--arch` is an
+    // error, not a silent fall-through to x86_64: a sweep that quietly boots the
+    // wrong machine is the one failure this must not have.
+    if cli.arch != "x86_64" && cli.arch != "aarch64" {
+        anyhow::bail!(
+            "--arch {}: this xtask builds and boots x86_64 and aarch64 only",
+            cli.arch
+        );
+    }
+
+    // `run --arch aarch64` is the second machine's own path: `run_interactive`
+    // builds the aarch64 kernel and loader and lays out its AAVMF ESP itself, so
+    // it needs none of the x86_64 disk / rootfs / mode / sudo machinery below.
+    // Take it before any of that runs.
+    if matches!(cli.command, Commands::Run) && cli.arch == "aarch64" {
+        return aarch64::run_interactive(&build_dir, &profile);
+    }
 
     // A build from before this command knew about ownership can leave a
     // root-owned `build/` or `target/` behind, and cargo cannot write into a
