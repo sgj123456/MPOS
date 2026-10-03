@@ -3336,7 +3336,19 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // Cargo.toml (see `utils::kernel_release`). Three readers, one number.
         write_str(130, env!("CARGO_PKG_VERSION")); // release
         write_str(195, "#1 SMP PREEMPT mpos"); // version
-        write_str(260, "x86_64"); // machine
+        // `uname -m` must answer the machine the kernel is *built for*, not a
+        // constant: a configure script or a `uname -m` test that gets
+        // "x86_64" from an aarch64 kernel misdetects the host and picks the
+        // wrong binaries. `cfg!` selects at compile time, so each machine says
+        // its own true name and neither build pays a branch.
+        write_str(
+            260,
+            if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "x86_64"
+            },
+        ); // machine
         // domainname: read from the caller's namespace, the same one
         // `setdomainname(2)` writes and `/proc/sys/kernel/domainname` reports.
         // It used to be the constant `(none)` here, which made the third door
