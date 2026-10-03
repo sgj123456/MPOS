@@ -5544,17 +5544,30 @@ edge is therefore no longer a standalone 6A item; the module is live and correct
 numbered, and the gate is opened to aarch64 as part of getting a program to run.
 
 
-**The image side of 6E has begun: an aarch64 `/init` is now built and crosses the handoff.**
-`xtask/src/aarch64_init.rs` hand-encodes a static `ET_EXEC`/`EM_AARCH64` image whose
-whole program is `exit_group(0)` - four instructions, every word pinned against
-`llvm-objdump` in a host test rather than a cross-compiler run at build time (which
-would make the artifact non-hermetic and add a `clang`+`ld.lld` host prerequisite to
-the boot path) - and `build_esp` packs it ustar as `\initramfs.tar`. `cargo xtask
-boot-aarch64` now reports `mpos-boot: initramfs: 10 KiB`: a real aarch64 binary lands
-in the direct map for the kernel to consume. The kernel still halts after `check_el0`
-and does not yet mount a ramfs or spawn it - that is the init-handoff wiring (a
-`main`-supplied continuation `boot` calls after the probe, since `enter_frame` is
-terminal and control only resumes inside `el0_returned`), which is the next cut.
+**6E reached a running aarch64 program.** `xtask/src/aarch64_init.rs` hand-encodes a
+static `ET_EXEC`/`EM_AARCH64` `/init` whose whole program is `exit_group(0)` - four
+instructions, every word pinned against `llvm-objdump` in a host test rather than a
+cross-compiler at build time (which would make the artifact non-hermetic and add a
+`clang`+`ld.lld` host prerequisite to the boot path) - and `build_esp` packs it ustar
+as `\initramfs.tar`. `boot` now threads a `main`-side init handoff (`init_handoff`)
+as a continuation that `el0_returned` runs after `M6_EL0_OK`: it starts the scheduler,
+mounts a ramfs root, unpacks the archive, loads `/init` on pid 1 and runs it to
+completion. Because `enter_frame` is terminal, control only comes back to EL1 inside
+`el0_returned`, so the handoff is passed the direct-mapped initramfs pointer+length
+read out of `BootInfo` *before* the address-space switch (re-reading the loader's raw
+record pointer after `paging::install` faults - the identity address is not in the
+kernel's tables). `cargo xtask boot-aarch64` now ends
+`initramfs: 1 members unpacked` / `mpos: aarch64 machine handed to /init` / `M6_INIT_OK`
+with no exception: the kernel booted AAVMF, ran a real userspace program at EL0, routed
+its `exit_group` into the shared `syscall::dispatch` table, and reaped it. Thirteen
+markers, x86 `cargo xtask test` still 142/142.
+
+**Named follow-on (drivers stage):** after init exits the boot task must not `park` via
+`block_until` - switching to the scheduler's idle task faults in `sched::Table::enter`
+(`msr SP_EL1` on an uninstalled idle kernel stack), so the bring-up boot halts instead.
+An interactive shell that keeps the machine runnable needs that idle/park path working,
+which belongs with serial-RX/GIC delivery (stage 7).
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64

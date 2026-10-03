@@ -87,9 +87,12 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// same reason: `M6_PAGING_OK` is not a terminator and `M6_PAGING_FAILED` is, and so
 /// are stages 6d and 6e (`M6_WALL_FAILED`, `M6_CPU_FAILED`). Stage 6h's thread-
 /// pointer check lands between 6e's `check_cpu` and 6a's `check_el0`, so
-/// `M6_TLS_OK` is not a terminator and `M6_TLS_FAILED` is.
+/// `M6_TLS_OK` is not a terminator and `M6_TLS_FAILED` is. Stage 6E's init handoff
+/// runs *after* `check_el0` prints `M6_EL0_OK`, so `M6_INIT_OK` is now the last
+/// marker and `M6_EL0_OK` came **out** of the list - leaving it in would stop the
+/// poll on a machine that still has init to run.
 const TERMINATORS: [&str; 14] = [
-    "M6_EL0_OK",
+    "M6_INIT_OK",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
     "M6_PAGING_FAILED",
@@ -156,8 +159,11 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // through the device window, `M6_CPU_OK` says user SIMD is turned on and a
     // line can be masked and an interrupt waited on, `M6_TLS_OK` says the
     // scheduler's thread-pointer write reaches `TPIDR_EL0` and reads back through
-    // the `hal::Cpu` capability, and `M6_EL0_OK` says the kernel ran a program at
-    // EL0 and answered the call it made.
+    // the `hal::Cpu` capability, `M6_EL0_OK` says the kernel ran a program at
+    // EL0 and answered the call it made, and `M6_INIT_OK` says the scheduler
+    // started, the loader's aarch64 `/init` was loaded and run to completion, and
+    // its `exit_group` was routed through the shared syscall table and reaped - the
+    // first real userspace program on this machine.
     let markers = [
         ("M4_CONSOLE_OK", "console service"),
         ("M4_DEVICES_OK", "devices"),
@@ -171,6 +177,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ("M6_CPU_OK", "cpu and interrupt primitives"),
         ("M6_TLS_OK", "thread pointer"),
         ("M6_EL0_OK", "EL0"),
+        ("M6_INIT_OK", "init handoff / running program"),
     ];
     let missing: Vec<&str> = markers
         .iter()
@@ -182,7 +189,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
              M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
-             M6_TLS_OK and M6_EL0_OK, from the ESP under AAVMF"
+             M6_TLS_OK, M6_EL0_OK and M6_INIT_OK, from the ESP under AAVMF"
         );
         return Ok(());
     }

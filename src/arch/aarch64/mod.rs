@@ -142,7 +142,7 @@ pub fn print_args(args: fmt::Arguments) {
 /// can be validated, because the magic check inside `collect` happens *after*
 /// the read: its validity is the caller's contract and not something this
 /// function can establish.
-pub unsafe fn boot(handoff: *const Handoff, milestone: fn()) -> ! {
+pub unsafe fn boot(handoff: *const Handoff, milestone: fn(), init: fn(*const u8, usize) -> !) -> ! {
     pl011::init();
 
     // SAFETY: the loader's contract - `handoff` points at the record it wrote,
@@ -150,6 +150,27 @@ pub unsafe fn boot(handoff: *const Handoff, milestone: fn()) -> ! {
     // record names is reachable through the direct map it chose.
     let info = unsafe { crate::boot::handoff::collect(handoff) };
     banner(handoff as usize, &info);
+
+    // Stash the init handoff for `el0_returned` to run once the EL0 milestone probe
+    // is done. It cannot be an ordinary fall-through: `enter_frame` is `-> !` and
+    // control returns to EL1 only inside `el0_returned`, which has no caller frame
+    // to return to. What the handoff needs from the record is the initramfs archive
+    // - already a direct-mapped `'static` slice read out of `info` here - and NOT
+    // the raw record pointer: `collect` runs before `paging::install` swaps in the
+    // kernel's own tables, and the identity address the loader handed us is not in
+    // them, so re-reading the record after the probe faults. The pointer+length of
+    // the direct-mapped archive survive the switch because the direct map does.
+    match info.initramfs {
+        Some(bytes) => {
+            INITRAMFS_PTR.store(bytes.as_ptr() as usize, Ordering::Relaxed);
+            INITRAMFS_LEN.store(bytes.len(), Ordering::Relaxed);
+        }
+        None => {
+            INITRAMFS_PTR.store(0, Ordering::Relaxed);
+            INITRAMFS_LEN.store(0, Ordering::Relaxed);
+        }
+    }
+    POST_EL0.store(init as usize, Ordering::Relaxed);
 
     // The clock this machine's kernel wants is the EL1 physical timer, and the
     // vector table and GIC are configured for EL1 as well; a machine that
@@ -855,6 +876,16 @@ const ANSWER_VA: usize = 0x0022_0000;
 /// through the trap gate, with nothing of the caller's to pass anything in.
 static ANSWER_FRAME: AtomicUsize = AtomicUsize::new(0);
 
+/// The `main`-supplied init handoff, stored by `boot` as a `fn(*const u8, usize) -> !`
+/// pointer and run by `el0_returned` once the EL0 probe reports `M6_EL0_OK`. `0`
+/// means "nothing after the probe" - a halt-only bring-up boot.
+static POST_EL0: AtomicUsize = AtomicUsize::new(0);
+/// The initramfs archive to hand to `/init`, as a pointer and length read out of
+/// the direct-mapped `BootInfo` before the address-space switch, so they stay valid
+/// when `el0_returned` runs. A null pointer means a diskless boot with no archive.
+static INITRAMFS_PTR: AtomicUsize = AtomicUsize::new(0);
+static INITRAMFS_LEN: AtomicUsize = AtomicUsize::new(0);
+
 // The program the check runs at EL0.
 //
 // It is the smallest thing that can be wrong in all the ways this stage is
@@ -1129,6 +1160,24 @@ extern "C" fn el0_returned(status: u64) -> ! {
          {replied:#x} back and left with status {status}",
     );
     let _ = writeln!(out, "M6_EL0_OK");
+
+    // The init handoff runs here, on the boot stack the probe's `eret` resumed
+    // onto. It is `-> !`: it starts the scheduler, hands the machine to `/init`
+    // and parks the boot task, so control never comes back to this `halt`. With no
+    // handoff stored (a halt-only bring-up boot, or a stage before 6E) the probe
+    // still ends the boot as it always did.
+    let run = POST_EL0.load(Ordering::Relaxed);
+    if run != 0 {
+        let archive = INITRAMFS_PTR.load(Ordering::Relaxed) as *const u8;
+        let len = INITRAMFS_LEN.load(Ordering::Relaxed);
+        // SAFETY: `boot` stored a real `fn(*const u8, usize) -> !` in `POST_EL0` and
+        // the archive pointer and length it reads out of the direct-mapped
+        // `BootInfo`, both still valid here. `SPSel` selects `SP_EL1` (checked at
+        // the top of `check_el0`), so this runs on the boot stack the
+        // `leave_for_kernel` `eret` restored.
+        let run = unsafe { core::mem::transmute::<usize, fn(*const u8, usize) -> !>(run) };
+        run(archive, len);
+    }
     halt()
 }
 

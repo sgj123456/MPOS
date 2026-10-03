@@ -20,7 +20,11 @@
 
 use core::panic::PanicInfo;
 
+use alloc::string::String;
+use alloc::vec;
+
 use mpos::boot::handoff::Handoff;
+use mpos::{hal, sched, vfs};
 
 /// `mpos-boot` branches here at `KERNEL_VIRT_BASE + entry`, at EL1 with the MMU
 /// already on and the machine's own tables installed, on a boot stack the loader
@@ -47,7 +51,78 @@ pub unsafe extern "C" fn _start(handoff: *const Handoff) -> ! {
     // `console_milestone` is run by the machine boot once its PL011 is up; it is
     // defined here (in the wiring, which may name `crate::console`) so that
     // `arch` never reaches up into the console service it sits below.
-    unsafe { mpos::arch::boot(handoff, console_milestone) }
+    unsafe { mpos::arch::boot(handoff, console_milestone, init_handoff) }
+}
+
+/// The init handoff, run by the machine layer after the EL0 milestone probe - on
+/// the boot stack the probe's `eret` resumed onto, which `sched::init` then adopts
+/// as task 0. It mirrors the x86_64 `main`'s tail minus the subsystems this machine
+/// has not been given yet (no PCI/virtio-blk/net/DRM: the root is a ramfs unpacked
+/// from the loader's initramfs, exactly as the x86_64 kernel boot does before the
+/// data root is mounted by init's own `mount(2)`).
+///
+/// Starting the scheduler is what lets the syscall gate work: from here on
+/// `sched::started()` is true, a real task is current, and `/init`'s `svc` routes
+/// into the shared `syscall::dispatch` table rather than the inline refusal the
+/// pre-scheduler probe still gets. `/init` is the four-instruction `exit_group(0)`
+/// program `xtask` builds; running it to completion and reaping it proves the
+/// whole load -> enter EL0 -> trap -> dispatch -> exit round trip on this machine.
+fn init_handoff(initramfs: *const u8, len: usize) -> ! {
+    // The archive is the initramfs bytes `boot` read out of the handoff record's
+    // direct-mapped `BootInfo` *before* the address-space switch and stashed here.
+    // Re-reading the record from its raw pointer after that switch faults (the
+    // loader's identity address is not in the kernel's own tables), so the pointer
+    // and length are handed over directly. A null pointer means a diskless boot.
+    // SAFETY: `boot` passed a pointer and length naming a live direct-mapped range.
+    let archive: Option<&[u8]> = if initramfs.is_null() {
+        None
+    } else {
+        Some(unsafe { core::slice::from_raw_parts(initramfs, len) })
+    };
+
+    // The scheduler adopts the running context (the boot stack) as task 0 and
+    // installs its loop. Must come before any spawn and before the gate relies on
+    // `sched::started()`.
+    sched::init();
+
+    // A ramfs root, then the initramfs unpacked into it. With no archive this is a
+    // diskless boot: there is nothing to hand the machine to, so stop honestly
+    // rather than invent an init.
+    vfs::file::init_standard(vfs::tty::init());
+    let root = vfs::ramfs::RamFs::new();
+    vfs::mount_root(&*root);
+    let Some(archive) = archive else {
+        mpos::println!("initramfs: none - nothing to hand off to");
+        hal::halt()
+    };
+    let members =
+        vfs::tar::unpack_into(vfs::global(), archive).expect("the aarch64 initramfs was broken");
+    mpos::println!("initramfs: {members} members unpacked");
+
+    // `/init` is read from the ramfs and loaded as a task; it lands on pid 1.
+    let init = vfs::read_file("/init").expect("the initramfs carries /init");
+    let argv = vec![String::from("/init")];
+    let pid = sched::spawn_init(&init, &argv, &[]).expect("the aarch64 init image loaded");
+    assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
+    mpos::println!("mpos: aarch64 machine handed to /init");
+
+    // Run it to completion. Its `exit_group` traps, the gate routes it into the
+    // syscall table, the scheduler reaps it, and this wait ends - the marker below
+    // is the whole stage-6 proof, printed only once a real program has actually
+    // run and left on the second machine.
+    while sched::has_live_child(pid) {
+        sched::sleep_ticks(1);
+    }
+    mpos::println!("M6_INIT_OK");
+    // Bring-up end: `/init` here is a one-shot `exit_group`, so when it leaves
+    // there is nothing left to run and no interactive console yet. Halt cleanly.
+    // Parking via `block_until` instead would switch to the scheduler's idle task,
+    // and that switch faults on this machine - its kernel stack is not installed the
+    // way `Table::enter` builds one (`msr SP_EL1` on a null stack, `sched::Table::enter`).
+    // That idle/park path is a named follow-on for the drivers stage, where a real
+    // shell keeps the machine runnable and the idle loop must work; refusing to park
+    // here is honest about what is built, not a hidden stub.
+    hal::halt()
 }
 
 /// Stage 4b's evidence: `crate::console` - un-gated for this machine one stage ago -
