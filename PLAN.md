@@ -5484,6 +5484,29 @@ between `M6_CPU_OK` and `M6_EL0_OK`). `cargo xtask run`/`test` still build and b
 the next cut into the knot is a subsystem above `console` (`vfs`/`sched`/`drivers`),
 each its own measured stage.
 
+**Stage 5's decomposition has now been executed as far as it separates, and the
+terminal un-gate turns out to depend on stage 6/7, not 5.** Measured by flipping
+`sched`+`vfs`+`uaccess` to aarch64 together and reading the compiler (the knot is
+strongly connected, so only the three-at-once flip is observable). Landed, each its
+own green commit: `hal::Cpu` thread-pointer (6h), the `FD_CLOEXEC` registry closing
+V-3, the arch-neutral `abi` leaf (`umask`/`clone`/`rlimit`), `vfs`'s driver-integrated
+modules and `tty`'s KD/VT ioctls deferred to x86_64, `MMAP_BASE` moved to `mm` with a
+per-arch value, and the lazy-FPU subsystem gated to x86_64 (aarch64 does eager FP in
+`mpos_context_switch`). That took `sched -> syscall` from 10 to 1 and `sched ->
+drivers` to 0. **The one surviving reference is the whole reason the flip is not yet
+done:** `sched`'s stop machinery - `group_stop`/`exec_trap`/`fork_trap`/`park`/
+`trace_regs` - is built on the x86 flat `[u64; uregs::COUNT]` register array and is
+invoked from the x86 `#NM`/syscall trap. But core `wait`/signal-delivery/Ctrl-Z
+(which aarch64 needs, and which read the `Stop` and `task.trace` state) live in the
+same code. Gating the register-snapshot fns wholesale would remove `wait`; keeping
+them means aarch64's equivalent is the `UserFrame` stop view built on the aarch64
+syscall-trap and signal-frame ABI - precisely the "rest of the aarch64 Linux ABI:
+`nr.rs` per arch, signal frames, `PTRACE_GETFPREGS`'s view of `FpuState`" that stage
+6/7 of this table names as "the genuine aarch64 work." So the knot's final cut is not
+a `#[cfg]` exercise; it needs the aarch64 signal/stop ABI to land first. It is named
+here rather than faked: nothing was stubbed with a wrong `uregs::COUNT` or a
+fake-success aarch64 `group_stop` to force the gate open.
+
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
 cannot be used against local symbol` out of the *sysroot's* `liballoc`, which is
