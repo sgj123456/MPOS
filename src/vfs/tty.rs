@@ -1786,7 +1786,12 @@ impl Tty {
     /// This is `Tty`'s `KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/
     /// `KDGKBTYPE` serving, byte-for-byte the answers the switchboard gave, and
     /// V-4 will carry it when the console moves out of the VFS into a driver.
-    #[cfg(target_os = "none")]
+    ///
+    /// x86_64's for now: every arm but `KDGKBTYPE` reaches into `vfs::vcmux`,
+    /// which is deferred to the aarch64 display driver (`PLAN.md` §9.1). The only
+    /// caller is the gated console-ioctl dispatch in `syscall`, so aarch64 simply
+    /// has no KD family until that pair lands - a named gap, not a faked success.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     pub fn kd_ioctl(
         &self,
         vc: u32,
@@ -1912,7 +1917,11 @@ impl Tty {
     /// to answer, so it lives here on the device rather than in the syscall
     /// switchboard (`ARCHITECTURE.md` V-2, the same move the `'K'` and `'E'`
     /// families took).
-    #[cfg(target_os = "none")]
+    ///
+    /// x86_64's for now: the `VT_*` handover drives `vfs::vcmux`, deferred to the
+    /// aarch64 display driver; its only caller is the gated console-ioctl dispatch,
+    /// so aarch64 has no VT family until that pair lands (a named gap, not a fake).
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     pub fn vt_ioctl(&self, caller: VtCaller, request: u32, buf: usize, from_user: bool) -> isize {
         use crate::err;
         use crate::uaccess::buffer_ok;

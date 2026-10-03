@@ -31,19 +31,34 @@ pub mod locks;
 #[cfg(target_os = "none")]
 pub mod memfd;
 pub mod mount;
+/// 9P client. Reached only through `drivers::virtio::fs9p`, which is x86_64's
+/// until the aarch64 drivers land (`PLAN.md` §9.1), and mounted by the gated
+/// `mount -t 9p` factory in `syscall` - no core vfs module constructs it.
+#[cfg(target_arch = "x86_64")]
 pub mod p9;
 pub mod path;
 pub mod pipe;
+/// `/proc`: reads `crate::net`'s socket table and `crate::drivers::pci` config.
+/// Built by the gated `syscall`/`drivers`, never by core vfs. Deferred with them.
+#[cfg(target_arch = "x86_64")]
 pub mod procfs;
 pub mod pty;
 pub mod ramfs;
 pub mod signalfd;
+/// `/sys`: reads `crate::drivers::pci` and the virtio input registry. Same
+/// deferral as `procfs` - a driver-integration surface, not a filesystem fact.
+#[cfg(target_arch = "x86_64")]
 pub mod sysfs;
 pub mod tar;
 pub mod termios;
 pub mod timerfd;
 pub mod tty;
-#[cfg(target_os = "none")]
+/// The console multiplexer: the DRM/screen handover a seat manager drives.
+/// Names `crate::drivers::{video::render,drm}` throughout, so it is bare-metal
+/// x86_64's until the aarch64 display driver lands (`PLAN.md` §9.1); `tty`'s
+/// KD/VT ioctl arms that reach it fall to `ENOTTY` on aarch64 (refuse, not fake).
+/// Kept out of the host build as before (it has no non-driver surface to test).
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod vcmux;
 
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
