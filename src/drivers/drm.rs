@@ -720,6 +720,13 @@ struct Framebuffer {
     /// report how the framebuffer was actually made; the plane is linear either
     /// way, which is the only modifier `ADDFB2` accepts.
     modifier: u64,
+    /// The open file description this framebuffer was made through, which is
+    /// what Linux's `struct drm_file` is: a framebuffer belongs to the
+    /// descriptor that created it and is released when that description's last
+    /// descriptor closes (`drm_file_free` → `drm_fb_release`). Without the
+    /// owner this card's framebuffers outlive every session that made them,
+    /// and `GETRESOURCES` then lists ids no client can account for.
+    owner: u64,
 }
 
 /// The identity record of one dma-buf this card has been involved with: the
@@ -1084,8 +1091,8 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         // than the catch-all's. Both carry a measurement in their doc comment.
         NR_MODE_GETGAMMA | NR_MODE_SETGAMMA => gamma_refused(),
         NR_CRTC_GET_SEQUENCE | NR_CRTC_QUEUE_SEQUENCE => sequence_refused(),
-        NR_ADDFB => add_fb(arg),
-        NR_ADDFB2 => add_fb2(arg),
+        NR_ADDFB => add_fb(arg, ofd),
+        NR_ADDFB2 => add_fb2(arg, ofd),
         NR_RMFB => {
             let id = unsafe { (arg as *const u32).read_unaligned() };
             critical_section::with(|cs| {
@@ -2702,6 +2709,48 @@ pub fn master_closed(ofd: u64) {
         let mut st = STATE.borrow(cs).borrow_mut();
         st.syncobjs
             .retain(|rec| rec.as_ref().is_none_or(|rec| rec.owner != ofd));
+    });
+    release_framebuffers(ofd);
+}
+
+/// Take a description's framebuffers away with it: Linux's `drm_fb_release`,
+/// which `drm_file_free` runs for every framebuffer the closing `struct
+/// drm_file` made.
+///
+/// This is what stops a dead session's ids being *enumerated*. `GETRESOURCES`
+/// reports the framebuffers the card has, and a client that asks for one of
+/// them gets an id whose owner is long gone - smithay's `DrmDevice` reads the
+/// properties of every framebuffer it is handed on the way in, and this card
+/// answers `EINVAL` for an object that is not a connector, CRTC or plane
+/// (Linux's `!obj->properties`, which is what a framebuffer is). The whole
+/// device then fails to open: "Error reading properties on device
+/// `/dev/dri/card0` (Invalid argument)", and niri comes up with no output and
+/// no way to say why. A framebuffer nobody made is the lie underneath it.
+///
+/// A framebuffer that was being scanned out is dropped from the state that
+/// names it rather than from the pixels: the scanout keeps the last frame -
+/// which is what a compositor's exit looks like on a real card too, and what
+/// lets the text console take the screen over from here.
+fn release_framebuffers(ofd: u64) {
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let gone: Vec<u32> = st
+            .fbs
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .filter(|f| f.owner == ofd)
+            .map(|f| f.id)
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        st.fbs.retain(|f| f.as_ref().is_none_or(|f| f.owner != ofd));
+        if gone.contains(&st.current_fb) {
+            st.current_fb = 0;
+        }
+        if gone.contains(&st.cursor_fb) {
+            st.cursor_fb = 0;
+        }
     });
 }
 
@@ -4670,7 +4719,10 @@ struct FbShape {
 /// card made or imported, and the geometry must be a shape the scanout can
 /// show: 32bpp, nonzero, with a pitch wide enough for a row. `ADDFB` and
 /// `ADDFB2` differ only in how they spell those facts.
-fn insert_fb(st: &mut DrmState, handle: u32, shape: FbShape) -> Option<u32> {
+///
+/// `owner` is the description the request arrived on, recorded so that closing
+/// it can take the framebuffers it made with it - see [`Framebuffer::owner`].
+fn insert_fb(st: &mut DrmState, handle: u32, shape: FbShape, owner: u64) -> Option<u32> {
     let slot = handle as usize;
     // The handle's buffer must exist - and the geometry it comes with has to
     // be a shape the scanout can show: the handle's own bpp (the scanout is
@@ -4696,6 +4748,7 @@ fn insert_fb(st: &mut DrmState, handle: u32, shape: FbShape) -> Option<u32> {
         depth: shape.depth,
         format: shape.format,
         modifier: shape.modifier,
+        owner,
     }));
     Some(id)
 }
@@ -4718,7 +4771,7 @@ fn legacy_fb_format(bpp: u32, depth: u32) -> u32 {
     }
 }
 
-fn add_fb(arg: usize) -> isize {
+fn add_fb(arg: usize, owner: u64) -> isize {
     // struct drm_mode_fb_cmd: fb_id@0,width@4,height@8,pitch@12,bpp@16,
     // depth@20,handle@24.
     let width = unsafe { ((arg + 4) as *const u32).read_unaligned() };
@@ -4740,6 +4793,7 @@ fn add_fb(arg: usize) -> isize {
                 format: legacy_fb_format(bpp, depth),
                 modifier: 0,
             },
+            owner,
         )
     });
     match id {
@@ -4751,7 +4805,7 @@ fn add_fb(arg: usize) -> isize {
     }
 }
 
-fn add_fb2(arg: usize) -> isize {
+fn add_fb2(arg: usize, owner: u64) -> isize {
     // struct drm_mode_fb_cmd2: fb_id@0,width@4,height@8,pixel_format@12,
     // flags@16, handles[4]@20, pitches[4]@36, offsets[4]@52, modifier[4]@68.
     // The fourcc names the layout; every 32-bit spelling this scanout can
@@ -4807,6 +4861,7 @@ fn add_fb2(arg: usize) -> isize {
                 format,
                 modifier,
             },
+            owner,
         )
     });
     match id {
