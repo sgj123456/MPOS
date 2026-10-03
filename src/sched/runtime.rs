@@ -6963,6 +6963,18 @@ pub fn has_live_child(parent: TaskId) -> bool {
     with_table(|t| child_alive(t, parent))
 }
 
+/// Whether the task in `id`'s slot is still running - present and not exited.
+///
+/// The bring-up handoff needs to wait for the *init task itself* to leave, not
+/// for children under it: `spawn_init` gives the first process no parent (it is
+/// pid 1, the root of the tree), so `has_live_child(INIT_PID)` - which asks
+/// whether the init has live children - is false from the start and would let the
+/// boot task finish without ever yielding the CPU to the init. This is the
+/// question that handoff actually means: is the program I started still up.
+pub fn is_running(id: TaskId) -> bool {
+    with_table(|t| t.tasks[id.0].as_ref().is_some_and(|task| !task.exited))
+}
+
 /// [`has_live_child`] against a table the caller already holds.
 fn child_alive(t: &Table, parent: TaskId) -> bool {
     t.tasks.iter().enumerate().any(|(slot, task)| {

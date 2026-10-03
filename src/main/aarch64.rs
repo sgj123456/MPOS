@@ -135,28 +135,27 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
     mpos::println!("mpos: aarch64 machine handed to /init");
 
-    // Run it to completion. Its `exit_group` traps, the gate routes it into the
-    // syscall table, the scheduler reaps it, and this wait ends - the marker below
-    // is the whole stage-6 proof, printed only once a real program has actually
-    // run and left on the second machine.
-    while sched::has_live_child(pid) {
+    // The image is loaded and queued, but it has not run yet - it runs only once
+    // the boot task yields the CPU. `M6_INIT_OK` says the handoff put the program
+    // on pid 1; the proof it *executes* comes next, from the init's own console
+    // write (a banner) and its `exit_group`.
+    mpos::println!("M6_INIT_OK");
+
+    // Yield turns to the scheduler until the init has run and left. Waiting on
+    // `is_running(pid)` - the init's own liveness - rather than `has_live_child(pid)`
+    // (which asks about init's *children*, and is false from the start because the
+    // first process has no parent) is what actually lets the init be scheduled. The
+    // committed wait on `has_live_child` returned immediately and never ran the
+    // init at all.
+    //
+    // When the init's `exit_group` traps, the gate routes it to `sched::exit`,
+    // which for pid 1 prints `INIT_EXITED` and halts. That line, and the banner the
+    // init wrote through `write(1,...)` before it, are the bring-up proof a real
+    // userspace program ran at EL0 on this machine. The loop below is only reached
+    // if the init somehow returns without exiting.
+    while sched::is_running(pid) {
         sched::sleep_ticks(1);
     }
-    mpos::println!("M6_INIT_OK");
-    // Bring-up end: `/init` here is a one-shot `exit_group`, so when it leaves
-    // there is nothing left to run and no interactive console yet. Halt cleanly.
-    // The idle/park path is now sound: switching to the scheduler's idle task used
-    // to fault (`msr SP_EL1, Xt` is architecturally undefined while `SPSel` selects
-    // `SP_EL1`, which is how this kernel runs - `EL1h`), and `Table::enter`'s
-    // `set_kernel_stack` step was doing exactly that. On AArch64 the trap stack is
-    // the current `sp`, already set by the context switch's `mov sp`, so that step
-    // is a no-op here (see `arch::aarch64::context::set_kernel_stack`). What still
-    // keeps this from parking is not the switch but that a real shell needs an
-    // interactive serial RX and a `/init` that does not exit. The RX read path and
-    // the input pump are wired now (stage 7b, see `check_console_rx` and the pump
-    // spawned above); what is left for a shell is a `/init` that reads `fd 0` in a
-    // loop instead of exiting. Until then halting after a completed one-shot init
-    // is the honest end state.
     hal::halt()
 }
 

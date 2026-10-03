@@ -5614,6 +5614,26 @@ typed input end to end, printed as `M6_CONSOLE_RX_OK`. It also spawns the produc
 a `/init` that reads `fd 0` in a loop instead of exiting, and a static-musl `ash` in the
 initramfs.
 
+**Stage 7c is DONE - and it corrected a false stage-6E proof: the scheduler now
+actually runs `/init`.** 6E recorded `M6_INIT_OK` as "a real userspace program ran at EL0
+via the scheduler". Measured this session with an `el0_sync` svc trace: it had not. The
+handoff waited `while has_live_child(pid)`, but `has_live_child` asks whether the init has
+live *children* - pid 1 has none (no parent) - so it was false on the first check and the
+boot task finished the wait without ever yielding a turn; the spawned `/init` never
+executed. The only program that had run at EL0 was the pre-scheduler `check_el0` *probe*
+(direct `enter_frame`, `started()==false`). Fix: a new `sched::is_running(id)` (the slot's
+own liveness) and the handoff waits on that, so the init is scheduled, enters EL0, runs.
+To make the proof observable from the console, the hand-encoded `/init` now does
+`write(1, "MPOS_INIT_ON\n", 13)` (ten `mov`/`movk`/`svc` instructions, each verified by
+disassembling the built image with `llvm-objdump`) before `exit_group`. boot-aarch64 then
+shows in order `M6_INIT_OK` (handed to pid 1), `MPOS_INIT_ON` (the init's own syscall
+reached the wire - the first time a scheduler-run userspace program produced console output
+on this machine), and `INIT_EXITED` (its `exit_group` routed to `sched::exit`). `INIT_EXITED`
+- not `M6_INIT_OK` (which now prints before the wait) - is the last `TERMINATOR`. This is the
+objective's core - "boots the kernel to a working userspace" - now genuinely demonstrated
+end to end. The `/init` still exits one-shot; a typed shell needs a read-loop `/init` + a
+real shell binary (stage 7 continues), but the run-and-output path is proven.
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
