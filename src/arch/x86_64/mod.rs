@@ -189,7 +189,13 @@ impl crate::hal::Interrupts for crate::hal::Current {
     fn eoi(line: crate::hal::Line) {
         pic::end_of_interrupt(pic_line(line))
     }
+}
 
+/// x86_64 has an MSI controller - the local APIC page a PCI device's MSI-X table
+/// is mapped through, and the vector such an entry carries. This is the optional
+/// [`crate::hal::Msi`] capability, not a baseline concern, because a machine
+/// whose devices are wired to a GIC has neither.
+impl crate::hal::Msi for crate::hal::Current {
     #[inline]
     fn init_message_signalled() {
         lapic::init()
@@ -284,35 +290,6 @@ impl crate::hal::Contexts for crate::hal::Current {
     const FPU_BYTES: usize = context::FPU_BYTES;
 
     #[inline]
-    fn fpu_trapped() -> bool {
-        context::fpu_trapped()
-    }
-
-    #[inline]
-    unsafe fn save_live_fpu(state: &mut Self::Fpu) {
-        // SAFETY: the caller's contract, passed through unchanged.
-        unsafe { context::save_live_fpu(state) }
-    }
-
-    #[inline]
-    unsafe fn restore_fpu(state: &Self::Fpu) {
-        // SAFETY: as above.
-        unsafe { context::restore_fpu(state) }
-    }
-
-    #[inline]
-    unsafe fn claim_live_fpu() {
-        // SAFETY: as above.
-        unsafe { context::claim_live_fpu() }
-    }
-
-    #[inline]
-    unsafe fn reset_live_fpu() {
-        // SAFETY: as above.
-        unsafe { context::reset_live_fpu() }
-    }
-
-    #[inline]
     fn set_kernel_stack(top: usize) {
         gdt::set_kernel_stack(top)
     }
@@ -345,7 +322,48 @@ impl crate::hal::Contexts for crate::hal::Current {
         // SAFETY: as above.
         unsafe { context::enter_user(entry, user_rsp) }
     }
+}
 
+/// x86_64's lazy-FPU ownership: `CR0.TS` traps the first FP instruction and the
+/// `#NM` handler saves the previous task there, so the scheduler queries whether
+/// the registers are live and hands ownership across a switch. The optional
+/// [`crate::hal::FpuTrap`] capability - a machine that saves FP eagerly inside
+/// the switch has no trap to query.
+impl crate::hal::FpuTrap for crate::hal::Current {
+    #[inline]
+    fn fpu_trapped() -> bool {
+        context::fpu_trapped()
+    }
+
+    #[inline]
+    unsafe fn save_live_fpu(state: &mut Self::Fpu) {
+        // SAFETY: as above.
+        unsafe { context::save_live_fpu(state) }
+    }
+
+    #[inline]
+    unsafe fn restore_fpu(state: &Self::Fpu) {
+        // SAFETY: as above.
+        unsafe { context::restore_fpu(state) }
+    }
+
+    #[inline]
+    unsafe fn claim_live_fpu() {
+        // SAFETY: as above.
+        unsafe { context::claim_live_fpu() }
+    }
+
+    #[inline]
+    unsafe fn reset_live_fpu() {
+        // SAFETY: as above.
+        unsafe { context::reset_live_fpu() }
+    }
+}
+
+/// The `cs`/`ss` a ring-3 frame carries, read off the GDT - the optional
+/// [`crate::hal::Segments`] capability, which exists only on a machine that has
+/// segment selectors at all.
+impl crate::hal::Segments for crate::hal::Current {
     fn user_segments() -> (usize, usize) {
         let (code, data) = gdt::user_selectors();
         (code.0 as usize, data.0 as usize)

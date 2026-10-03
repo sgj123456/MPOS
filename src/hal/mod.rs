@@ -21,7 +21,11 @@
 //! every method would be the same leak with one import instead of six, which is
 //! the failure `PLAN.md` §11.3 warned about when it rejected a "generic HAL
 //! trait forest" - this is deliberately *six* traits for six concerns, not one
-//! trait per function.
+//! trait per function. On top of the six sit three *optional capability traits*
+//! ([`Msi`], [`FpuTrap`], [`Segments`]) for the ways one machine does something
+//! another has no hardware for; a port implements the six it must and only the
+//! capabilities it has, so an absent capability is *absent* rather than a method
+//! every machine has to fake an answer for.
 //!
 //! # What this does not abstract, and must not
 //!
@@ -118,8 +122,9 @@ pub trait Cpu {
 /// Only the lines that cross the seam are named - a driver that must let
 /// delivery through says *which line it is on*, never which controller bit,
 /// because on another machine the line is not a PIC input at all. A
-/// message-signalled device (the network adapter) is not one of these: it has
-/// no line to mask, and asks [`Interrupts::net_msi_vector`] instead.
+/// message-signalled device is not one of these: it has no line to mask, and
+/// asks [`Msi::net_msi_vector`] instead - and that capability belongs to the
+/// machines that have an MSI controller, so it is [`Msi`], not [`Interrupts`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Line {
     /// The programmable interval timer, the scheduler's clock.
@@ -128,8 +133,10 @@ pub enum Line {
     Serial,
 }
 
-/// The interrupt controller: masking one line, acknowledging one, and the two
-/// facts a message-signalled device needs before it may arm MSI-X.
+/// The interrupt controller: masking a named line, acknowledging one. The
+/// lines are [`Line`]. A machine that delivers by a message-signalled write
+/// rather than a wired line expresses that as [`Msi`], an optional capability
+/// beside this - not more of it.
 pub trait Interrupts {
     /// Allow delivery on `line`.
     fn unmask(line: Line);
@@ -141,19 +148,6 @@ pub trait Interrupts {
     /// deliver the next one at or below its priority. Called from interrupt
     /// context, so it must not lock, allocate or fault.
     fn eoi(line: Line);
-
-    /// Bring up message-signalled delivery - on x86_64 the local APIC's page,
-    /// whose EOI register the handler writes last, and which must be mapped
-    /// before a device arms MSI-X. Idempotent; called by the driver that is
-    /// about to arm it, because the mapping needs a window the earliest boot
-    /// does not have.
-    fn init_message_signalled();
-
-    /// The vector an MSI-X message-table entry for the network adapter must
-    /// carry. A plain machine number rather than a neutral type because that is
-    /// exactly what the table entry holds - it is written into the device's
-    /// memory, not into the kernel's vocabulary.
-    fn net_msi_vector() -> u8;
 }
 
 /// One process's view of memory: the page tables it runs on.
@@ -274,6 +268,100 @@ pub trait Paging {
     fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize>;
 }
 
+/// ---------------------------------------------------------------------------
+/// Optional capability traits.
+///
+/// The six baseline concerns above are what *every* machine this kernel runs on
+/// has: a clock, a wall clock, a CPU, a wired interrupt controller, page tables,
+/// and task contexts. These three are not universal - they are one machine's way
+/// of doing something another machine does differently or not at all. A port
+/// implements the baseline six and only the optional ones its hardware actually
+/// has (`AGENTS.md` §4 rule 4: refuse rather than approximate), so a capability
+/// is expressible as *absent* rather than as a method every machine must answer.
+/// `crate::Platform` names only the baseline six; these are reached through
+/// their own forwards, which are gated to the machine that implements them.
+/// ---------------------------------------------------------------------------
+
+/// Message-signalled interrupt delivery: the local APIC page a PCI device maps
+/// its MSI-X table through, and the vector such a table entry must carry.
+///
+/// This is a capability, not a concern, because it is a property of the
+/// *interrupt controller and the bus*, not of the CPU. A machine whose network
+/// transport is `virtio`-MMIO on a GIC has wired SPI lines and no MSI-X table at
+/// all, so it implements [`Interrupts`] and simply is not an `Msi`. x86_64 is.
+pub trait Msi {
+    /// Bring up message-signalled delivery - on x86_64 the local APIC's page,
+    /// whose EOI register the handler writes last, and which must be mapped
+    /// before a device arms MSI-X. Idempotent; called by the driver that is
+    /// about to arm it, because the mapping needs a window the earliest boot
+    /// does not have.
+    fn init_message_signalled();
+
+    /// The vector an MSI-X message-table entry for the network adapter must
+    /// carry. A plain machine number rather than a neutral type because that is
+    /// exactly what the table entry holds - it is written into the device's
+    /// memory, not into the kernel's vocabulary.
+    fn net_msi_vector() -> u8;
+}
+
+/// The x87 lazy-FPU ownership protocol: which task currently owns the live FP
+/// registers, and saving/restoring them around that ownership.
+///
+/// A capability, not part of [`Contexts`], because it is an answer to a specific
+/// hardware arrangement: x86_64 leaves the FPU trapped (`CR0.TS`), faults an
+/// `#NM` on the first FP instruction, and *there* saves the previous task's
+/// state - so the scheduler must ask whether the registers are live before it
+/// switches, and hand ownership over. A machine that saves FP registers eagerly
+/// inside the context switch has no trap to fault on, so there is nothing to
+/// query and nothing to hand over: it implements [`Contexts`] and is not a
+/// `FpuTrap`. (The `Fpu` *type* and [`FpuOps`] stay in the baseline - every
+/// machine that has floating point has state to save and bytes for a debugger to
+/// read; only the trap-ownership scheme is x86's.)
+pub trait FpuTrap: Contexts {
+    /// Whether the FPU is trapped: a task's state is live in the registers and
+    /// must be saved before anything else touches them.
+    fn fpu_trapped() -> bool;
+
+    /// Save the live FPU registers into a task's state.
+    ///
+    /// # Safety
+    /// Must be called with the FPU belonging to the task being saved.
+    unsafe fn save_live_fpu(state: &mut Self::Fpu);
+
+    /// Load a task's FPU state into the registers.
+    ///
+    /// # Safety
+    /// As above, for the task being restored.
+    unsafe fn restore_fpu(state: &Self::Fpu);
+
+    /// Take ownership of the live FPU registers for the current task.
+    ///
+    /// # Safety
+    /// Only from the context that is actually running.
+    unsafe fn claim_live_fpu();
+
+    /// Give the FPU back to "no task owns it".
+    ///
+    /// # Safety
+    /// Only from the context that actually holds it.
+    unsafe fn reset_live_fpu();
+}
+
+/// The segment selectors a ring-3 frame carries - a capability, not a concern,
+/// because a machine without memory segmentation has no selectors to report.
+///
+/// x86_64's `user_regs_struct` has `cs`/`ss` fields, and a tracer's register file
+/// reads them; the values come from the GDT. aarch64's `user_pt_regs` has no
+/// equivalent - its frame is `x0..x30`/`sp`/`pc`/`pstate` - so that machine is
+/// not a `Segments`, and the ABI layer that asks for `cs`/`ss` is x86-only with
+/// it.
+pub trait Segments {
+    /// The `cs`/`ss` a ring-3 frame carries on this machine, as the Linux
+    /// `user_regs_struct` reports them. Asked by the ABI layer, which fills
+    /// those two fields of a frame it builds from the syscall gate's record.
+    fn user_segments() -> (usize, usize);
+}
+
 /// A machine this kernel can run on. `Current` names the one being built.
 pub trait Platform:
     Clock + WallClock + Cpu + Interrupts + Paging + Contexts + Sized + 'static
@@ -373,34 +461,6 @@ pub trait Contexts {
     /// Bytes [`FpuOps::to_bytes`] moves, and the width of the FPU save area.
     const FPU_BYTES: usize;
 
-    /// Whether the FPU is trapped: a task's state is live in the registers and
-    /// must be saved before anything else touches them.
-    fn fpu_trapped() -> bool;
-
-    /// Save the live FPU registers into a task's state.
-    ///
-    /// # Safety
-    /// Must be called with the FPU belonging to the task being saved.
-    unsafe fn save_live_fpu(state: &mut Self::Fpu);
-
-    /// Load a task's FPU state into the registers.
-    ///
-    /// # Safety
-    /// As above, for the task being restored.
-    unsafe fn restore_fpu(state: &Self::Fpu);
-
-    /// Take ownership of the live FPU registers for the current task.
-    ///
-    /// # Safety
-    /// Only from the context that is actually running.
-    unsafe fn claim_live_fpu();
-
-    /// Give the FPU back to "no task owns it".
-    ///
-    /// # Safety
-    /// Only from the context that actually holds it.
-    unsafe fn reset_live_fpu();
-
     /// Point the CPU's privilege-transition stack at `top` (the TSS's ring-0
     /// stack on x86_64), so the next trap from ring 3 lands on this task's.
     fn set_kernel_stack(top: usize);
@@ -437,11 +497,6 @@ pub trait Contexts {
     /// # Safety
     /// `entry` must be a mapped user address and `user_rsp` a usable stack.
     unsafe fn enter_user(entry: usize, user_rsp: usize) -> !;
-
-    /// The `cs`/`ss` a ring-3 frame carries on this machine, as the Linux
-    /// `user_regs_struct` reports them. Asked by the ABI layer, which fills
-    /// those two fields of a frame it builds from the syscall gate's record.
-    fn user_segments() -> (usize, usize);
 }
 
 /// The platform this build targets.
@@ -451,7 +506,7 @@ pub trait Contexts {
 /// the only arrow between them, where a `hal`-names-`arch` alias would make the
 /// pair mutual - `cargo xtask depgraph` counts that as a cycle). Only one
 /// architecture is ever compiled, so there is exactly one set of impls.
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_os = "none")]
 pub struct Current;
 
 // ---------------------------------------------------------------------------
@@ -553,15 +608,20 @@ pub fn eoi(line: Line) {
 }
 
 /// Bring up message-signalled delivery before a device arms MSI-X.
+///
+/// Gated to the machine that has an MSI controller; a `virt`+GIC aarch64 build
+/// has none and does not emit this (`hal::Msi`).
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn init_message_signalled() {
-    <Current as Interrupts>::init_message_signalled()
+    <Current as Msi>::init_message_signalled()
 }
 
 /// The MSI-X vector the network adapter's message-table entry must carry.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn net_msi_vector() -> u8 {
-    <Current as Interrupts>::net_msi_vector()
+    <Current as Msi>::net_msi_vector()
 }
 
 /// One process's address space, as this machine's page tables.
@@ -662,33 +722,42 @@ pub type UserFrame = <Current as Contexts>::UserFrame;
 pub const FPU_BYTES: usize = <Current as Contexts>::FPU_BYTES;
 
 /// Whether the FPU's state is live in the registers right now.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn fpu_trapped() -> bool {
-    <Current as Contexts>::fpu_trapped()
+    <Current as FpuTrap>::fpu_trapped()
 }
 
 /// Save the live FPU registers into a task's state.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn save_live_fpu(state: &mut Fpu) {
-    unsafe { <Current as Contexts>::save_live_fpu(state) }
+    // SAFETY: the caller's contract, passed through unchanged.
+    unsafe { <Current as FpuTrap>::save_live_fpu(state) }
 }
 
 /// Load a task's FPU state into the registers.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn restore_fpu(state: &Fpu) {
-    unsafe { <Current as Contexts>::restore_fpu(state) }
+    // SAFETY: as above.
+    unsafe { <Current as FpuTrap>::restore_fpu(state) }
 }
 
 /// Take ownership of the live FPU registers for the current task.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn claim_live_fpu() {
-    unsafe { <Current as Contexts>::claim_live_fpu() }
+    // SAFETY: as above.
+    unsafe { <Current as FpuTrap>::claim_live_fpu() }
 }
 
 /// Give the FPU back to "no task owns it".
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn reset_live_fpu() {
-    unsafe { <Current as Contexts>::reset_live_fpu() }
+    // SAFETY: as above.
+    unsafe { <Current as FpuTrap>::reset_live_fpu() }
 }
 
 /// Point the CPU's privilege-transition stack at `top`.
@@ -739,7 +808,8 @@ pub unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
 }
 
 /// The `cs`/`ss` a ring-3 frame carries on this machine.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn user_segments() -> (usize, usize) {
-    <Current as Contexts>::user_segments()
+    <Current as Segments>::user_segments()
 }
