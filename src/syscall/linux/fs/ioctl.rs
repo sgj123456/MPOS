@@ -18,11 +18,11 @@ use crate::syscall::{ARG_COUNT, buffer_ok, err, err_of};
 // any more, so a caller asks the node for its concrete type through
 // `dyn Inode::as_any` instead (`PLAN.md` §11.2 Step B1, V-1). Gated with the
 // modules they come from, which the host build does not compile.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 use crate::drivers::uinput::Uinput;
 #[cfg(target_os = "none")]
 use crate::drivers::virtio::gpu::FbDev;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 use crate::drivers::virtio::input::EvdevNode;
 
 /// `ioctl(fd, request, arg)` — terminal settings and queries, stub the rest.
@@ -909,17 +909,21 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 _ => err::ENOTTY,
             }
         }
+        #[cfg(not(target_arch = "aarch64"))]
         request if family_nr(request, b'E').is_some() => evdev_ioctl(fd, request, buf, from_user),
         // uinput (`'U'`-typed): how a program makes an input device of its own.
         // The descriptor *is* the device, so every request here is about the one
         // this open file description owns.
         #[cfg(target_os = "none")]
+        #[cfg(not(target_arch = "aarch64"))]
         request if family_nr(request, b'U').is_some() => uinput_ioctl(fd, request, buf, from_user),
         // Console-ownership (`'V'`-typed VT_*) and keyboard/video-mode
         // (`'K'`-typed KD*) ioctls, which a seat manager drives the line
         // through when it takes a terminal away from the text console and
         // hands it to a compositor.
+        #[cfg(not(target_arch = "aarch64"))]
         request if family_nr(request, b'V').is_some() => vt_ioctl(fd, request, buf, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         request if family_nr(request, b'K').is_some() => kd_ioctl(fd, request, buf, from_user),
         // The inode attribute word: `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`,
         // the two requests `lsattr` and `chattr` are made of. The `'f'` family,
@@ -1039,6 +1043,7 @@ fn family_nr(request: u32, magic: u8) -> Option<u32> {
 /// conversation between the session that holds the screen and the one that
 /// wants it, rather than anything holding a `/dev/tty` fd being able to silence
 /// a compositor's `relsig`, or to answer it.
+#[cfg(not(target_arch = "aarch64"))]
 fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     if (request >> 8) & 0xff != b'V' as u32 {
         return err::ENOTTY;
@@ -1164,6 +1169,7 @@ fn fs_flags_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     }
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     if (request >> 8) & 0xff != b'K' as u32 {
         return err::ENOTTY;
@@ -1212,6 +1218,7 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 /// syscall layer's answers to give - and the request itself is the device's to
 /// judge (`Uinput::ioctl`, the same split the `'E'` and `'K'` families took:
 /// `PLAN.md` §11.2 Step B2).
+#[cfg(not(target_arch = "aarch64"))]
 fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
@@ -1224,6 +1231,7 @@ fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     dev.ioctl(file.ofd(), request, buf, from_user)
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     // Resolve the descriptor to its evdev node here, at the user boundary - the
     // bad-fd `EBADF` and the not-an-evdev-node `ENOTTY` are the syscall layer's
