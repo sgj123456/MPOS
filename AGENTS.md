@@ -23,7 +23,7 @@ be pinned — host unit test, a program booted in QEMU, or both.
 
 | Path | What lives there |
 |---|---|
-| `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs` (boot entry, milestone checks, panic handler) |
+| `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs`, a thin arch dispatcher over `src/main/<arch>.rs`, which holds that machine's boot entry, milestone checks and panic handler |
 | `crates/` | downward-only leaf crates (see §4): `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk` |
 | `boot/` | `mpos-boot`, the UEFI loader. Separate target (`x86_64-unknown-uefi`), no kernel dep — both agree on a hand-written handoff record |
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
