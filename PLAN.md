@@ -5467,13 +5467,18 @@ does not need `vfs`, and the transport that opens a device is the half that does
 a new `hal::Console` baseline capability (its interrupt-TX-ring behind an optional
 x86-only `hal::SerialRing`), cfg-partitioned the framebuffer/park arms, and un-gated
 `console` + `println!` to aarch64 - so the 18 errors above are gone. The framebuffer,
-ring and parking arms stay x86-only by `#[cfg]`. One thing 4a does *not* have: a
-boot-observed aarch64 console marker (`M4_CONSOLE_OK`). The aarch64 milestone checks
-live in `arch/aarch64`, and a `crate::console` line there would be an `arch -> console`
-upward edge (`AGENTS.md` §4, downward-only); the marker is deferred to stage 4b, where
-the post-machine checks move into `main`. Until then aarch64 `console` is compile-pinned
-(it builds, a module that failed to un-gate is a build error) and the list fix is
-host-pinned, but its runtime output on the wire is exercised only on x86.
+ring and parking arms stay x86-only by `#[cfg]`. **Stage 4b then closed the one pin
+4a left open** - a boot-observed `M4_CONSOLE_OK`. It did *not* need to relocate the
+milestone checks: `arch::aarch64::boot` gained a `milestone: fn()` argument it calls
+once the PL011 is up, and `main/aarch64.rs` hands in a function that writes through
+`crate::console` (`init` + two `println!`) - so `arch` only invokes a pointer and the
+`console` name stays on the `main` side of the seam (no `arch -> console` edge). It is
+the first log bytes this machine sends through the console service rather than the
+machine's own `pl011::Writer`, printed early (before `M4_DEVICES_OK`), so it is a
+required marker and not a terminator - EL0's `M6_EL0_OK` stays last. `boot-aarch64`
+now prints eleven markers. `cargo xtask run`/`test` still build and boot x86_64 only;
+the next cut into the knot is a subsystem above `console` (`vfs`/`sched`/`drivers`),
+each its own measured stage.
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
