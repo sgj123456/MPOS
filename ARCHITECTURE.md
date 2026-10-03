@@ -44,6 +44,7 @@ flowchart TB
 
     subgraph Leaf["Pure leaf crates (crates/) — downward-only, cannot name the kernel"]
         ERR["mpos-err"]
+        ABI["mpos-abi<br/>(clone flags, umask, rlimit)"]
         DATE["mpos-date"]
         BINFMT["mpos-binfmt"]
         CRED["mpos-cred"]
@@ -58,7 +59,8 @@ flowchart TB
         BLK["mpos-blk"]
     end
 
-    K --> ERR & DATE & BINFMT & CRED & UTS & SECCOMP & PCI & TERM & AHCI & GPU & EVDEV & UINPUT & BLK
+    K --> ERR & ABI & DATE & BINFMT & CRED & UTS & SECCOMP & PCI & TERM & AHCI & GPU & EVDEV & UINPUT & BLK
+    ABI --> ERR
 
     subgraph Userland["User programs"]
         U["mpos-user<br/>(user/)<br/>x86_64-unknown-linux-musl"]

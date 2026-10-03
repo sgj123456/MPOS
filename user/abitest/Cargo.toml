@@ -33,6 +33,14 @@ build = "build.rs"
 # run's output says which one is missing.
 [lints.cargo]
 
+# `lib/lin.rs` `#[path]`-includes the kernel's `src/syscall/linux/nr.rs` so the
+# tests speak the kernel's own numbers. `nr.rs` re-exports the `clone` flag bits
+# from the `abi` leaf (one table, not two), so this build must see that crate for
+# the included `pub use` to resolve - the single-source guarantee the header
+# describes, now through the leaf.
+[dependencies]
+mpos-abi = { path = "../../crates/abi" }
+
 [[bin]]
 name = "t-aslr"
 path = "src/bin/integration/t-aslr.rs"

@@ -281,6 +281,7 @@ dependencies = [
  "bitflags 2.13.2",
  "critical-section",
  "elf",
+ "mpos-abi",
  "mpos-ahci",
  "mpos-binfmt",
  "mpos-blk",
@@ -303,6 +304,13 @@ dependencies = [
  "uart_16550",
  "virtio-drivers",
  "x86_64",
+]
+
+[[package]]
+name = "mpos-abi"
+version = "0.1.0"
+dependencies = [
+ "mpos-err",
 ]
 
 [[package]]
@@ -392,6 +400,9 @@ dependencies = [
 [[package]]
 name = "mpos-user-abi"
 version = "0.1.0"
+dependencies = [
+ "mpos-abi",
+]
 
 [[package]]
 name = "mpos-user-tests"

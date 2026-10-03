@@ -40,11 +40,13 @@ pub use crate::err;
 /// How many register arguments a syscall may pass.
 pub const ARG_COUNT: usize = 6;
 
-/// The file-creation mask every process starts with, and the one a host build
-/// reports: `022`, so a file made with the usual `0666` arrives `0644` and a
-/// directory made with `0777` arrives `0755` - which is what init's own
-/// `umask 022` leaves behind.
-pub const DEFAULT_UMASK: u32 = 0o022;
+/// The file-creation mask every process starts with: `022`, so a file made with
+/// the usual `0666` arrives `0644` and a directory made with `0777` arrives
+/// `0755` - which is what init's own `umask 022` leaves behind. It lives in the
+/// `abi` leaf (the scheduler seeds a task's umask with it on a path that does not
+/// reach dispatch) and is re-exported here so `crate::syscall::DEFAULT_UMASK`
+/// stays the name callers already use.
+pub use mpos_abi::DEFAULT_UMASK;
 
 /// The last few system calls the kernel entered, for the panic handler.
 ///

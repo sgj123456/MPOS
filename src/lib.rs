@@ -71,6 +71,11 @@
 
 extern crate alloc;
 
+/// The arch-neutral Linux ABI facts: the `clone` flag bits, the default umask
+/// and the resource-limit model. Its own leaf crate so `sched` reads them on a
+/// downward edge, not up into `syscall`; `syscall::linux::{nr,abi}` re-export
+/// these instead of redefining them, so there is one table.
+pub use mpos_abi as abi;
 /// The AHCI port's own answers, as bits rather than as bus cycles: what a
 /// status word means, and when waiting on one has to stop. Its own leaf crate -
 /// the decode is arithmetic on three `u32`s and the machine half

@@ -110,12 +110,18 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
     ("rand", 0),
     ("uevent", 0),
     ("vfs", 0),
-    // `sched/runtime.rs`'s `crate::syscall::linux::{abi, nr}`, `MMAP_BASE` and
-    // `DEFAULT_UMASK` (plus `sched/mod.rs`'s umask default): constants and
-    // tables the scheduler's exec path reads out of the ABI layer. Phase 11 B/C
-    // - the umask and the mapping base are scheduler state, and the `nr`
-    // dependency is the exec/binfmt edge Step C decides about.
-    ("sched", 10),
+    // `sched/runtime.rs`'s four `crate::syscall::MMAP_BASE` reads and the one
+    // `use crate::syscall::linux::abi` for the ptrace block's x86_64 register-file
+    // shape (`abi::uregs::COUNT`) and `PTRACE_*`/`SYSCALL_TRAP`. The umask default
+    // and the `Rlimit` table that used to sit here moved to the `abi` leaf (`sched`
+    // now names `crate::abi` for them, a downward edge), and the `nr::CLONE_*`
+    // reads went with them. What is left is genuinely architecture-specific and
+    // cannot go to an arch-neutral leaf: `MMAP_BASE` follows each arch's address
+    // space (aarch64's is decided with the process-running stage, `PLAN.md` §9.1
+    // stage 6/7), and `uregs::COUNT` is the x86 `user_regs_struct` field count
+    // sizing the ptrace state - both land when ptrace is cfg-gated to x86_64 and
+    // the aarch64 ABI arrives.
+    ("sched", 5),
 ];
 
 /// Where `sched` stands once V-3 is closed, recorded beside the rule above

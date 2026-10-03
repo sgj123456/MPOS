@@ -25,6 +25,10 @@ edition = "2024"
 # V-14). Re-exported by `src/lib.rs` as `crate::err`, so every caller's path is
 # unchanged; the crate itself cannot name the kernel.
 mpos-err = { path = "crates/err" }
+# The arch-neutral Linux ABI facts (`clone` flags, default umask, the rlimit
+# model) as a leaf, so `sched` names them without an edge up into `syscall`'s
+# dispatch. `syscall`'s `nr`/`abi` re-export these rather than redefining them.
+mpos-abi = { path = "crates/abi" }
 # The other pure leaves of the same kind (see `crates/*` and `ARCHITECTURE.md`):
 # each is a downward-only leaf, re-exported by `src/lib.rs` under its old name
 # so every `crate::X` caller is unchanged.

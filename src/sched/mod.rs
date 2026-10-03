@@ -104,7 +104,7 @@ pub fn current_real_owner() -> (u32, u32) {
 /// tests read one call's answer back from the next.
 #[cfg(not(target_os = "none"))]
 static HOST_UMASK: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(crate::syscall::DEFAULT_UMASK);
+    core::sync::atomic::AtomicU32::new(crate::abi::DEFAULT_UMASK);
 
 #[cfg(not(target_os = "none"))]
 pub fn current_umask() -> u32 {

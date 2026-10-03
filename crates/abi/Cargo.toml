@@ -1,0 +1,13 @@
+# The arch-neutral Linux ABI facts the scheduler and the syscall layer both read:
+# the `clone(2)` flag bits, a process's default umask, and the resource-limit
+# (`RLIMIT_*`) model. They are a leaf crate so `sched` can name them on a path
+# that does not lead up into `syscall`'s dispatch - the dependency is on the ABI
+# *values*, which are shared across architectures, not on the x86_64 syscall
+# numbers or the register-file shape that stay with `syscall`.
+[package]
+name = "mpos-abi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mpos-err = { path = "../err" }

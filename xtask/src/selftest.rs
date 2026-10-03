@@ -169,6 +169,8 @@ fn run_unit_tests() -> Result<()> {
         "-p",
         "mpos-err",
         "-p",
+        "mpos-abi",
+        "-p",
         "mpos-date",
         "-p",
         "mpos-binfmt",

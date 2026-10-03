@@ -6254,6 +6254,21 @@ and the precondition for un-gating `sched` for aarch64 (§9.1 stage 6h-adjacent 
 by a host test that an exit hook stays silent under `run_cloexec` and vice versa, and by
 `cargo xtask test`'s 142 user tests still closing CLOEXEC descriptors on `execve`.
 
+**A related `sched → syscall` reduction (the `abi` leaf).** V-3 was about naming
+*subsystems*; the `sched → syscall` edge (Step C/F's `BASELINE_LOWER_LAYER_TO_SYSCALL`
+row, recorded at 10) was about naming *ABI values* the scheduler needs but does not
+dispatch — the default `umask`, the `clone` flag bits, and the resource-limit model.
+These are arch-neutral (asm-generic `CLONE_*` and `RLIMIT_*` carry the same number on
+x86_64 and aarch64), so they moved to a new `crates/abi` leaf that `sched` names
+downward and that `syscall::linux::{nr,abi}` re-export rather than redefine (one table,
+not two). `sched → syscall` fell 10 → 5: what remains is genuinely arch-specific and
+stays in `syscall` — the four `crate::syscall::MMAP_BASE` reads (a per-arch value,
+decided with the aarch64 process-running stage, §9.1 stage 6/7) and the ptrace block's
+`abi::uregs::COUNT` (the x86 `user_regs_struct` field count that sizes ptrace state,
+which goes when ptrace is cfg-gated to x86_64). The leaf is `#![no_std]`, host-tested
+(`clone` values pinned, the `setrlimit` soft/hard/root rule pinned), and added to the
+host-test crate list in `xtask/src/selftest.rs` and the `ARCHITECTURE.md` §1 graph.
+
 #### 11.1.4 — V-4: the terminal emulator and console live inside the VFS (severity: medium) — **CLOSED** (the `vfs ↔ console` pair is broken; emulator + VC vocabulary + `vtmode` + active-console number in the `term` leaf; see §11.2 Step D)
 
 `crates/term/` (the `mpos-term` crate) holds the cell grid, the key handling and an embedded 4 KiB `vga8x16.bin` font.

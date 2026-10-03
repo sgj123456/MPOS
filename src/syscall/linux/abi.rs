@@ -1671,53 +1671,11 @@ pub(crate) fn handle_getrandom(args: [usize; crate::syscall::ARG_COUNT], from_us
 
 /// `RLIM_NLIMITS`: the resource table's length. A number past it is
 /// `EINVAL`, the errno Linux uses for one it has no row for.
-pub const RLIM_NLIMITS: usize = 16;
-/// `RLIM_INFINITY`: what an unlimited limit reads as.
-pub const RLIM_INFINITY: u64 = u64::MAX;
-
-/// One resource limit pair: the soft ceiling a process is held to and the hard
-/// ceiling it may raise the soft one to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rlimit {
-    pub cur: u64,
-    pub max: u64,
-}
-
-/// The limits a fresh process starts with: an 8 MiB stack, a descriptor
-/// ceiling, a process count, and infinity for the rows nothing budgets. Every
-/// other resource reads these until `setrlimit` says otherwise.
-pub(crate) fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
-    let mut t = [Rlimit {
-        cur: RLIM_INFINITY,
-        max: RLIM_INFINITY,
-    }; RLIM_NLIMITS];
-    t[3] = Rlimit {
-        cur: 8 * 1024 * 1024,
-        max: 8 * 1024 * 1024,
-    }; // RLIMIT_STACK
-    t[5] = Rlimit {
-        cur: 1024,
-        max: 1_048_576,
-    }; // RLIMIT_NOFILE
-    t[7] = Rlimit {
-        cur: 4096,
-        max: 4096,
-    }; // RLIMIT_NPROC
-    t
-}
-
-/// `setrlimit`'s one rule, returned as the errno a refusal carries (or the
-/// accepted pair): the soft limit may not exceed the hard, and only root may
-/// lift the hard ceiling above where it stands.
-pub(crate) fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, isize> {
-    if new.cur > new.max {
-        return Err(err::EINVAL);
-    }
-    if !is_root && new.max > old.max {
-        return Err(err::EPERM);
-    }
-    Ok(new)
-}
+// The resource-limit model lives in the `abi` leaf, so the scheduler's exec path
+// can budget a task's rlimits without an edge up into this layer. Re-exported
+// here because the `getrlimit`/`setrlimit` handlers and `rlimit_pair` below speak
+// the same `Rlimit`/`RLIM_*` vocabulary, and one table beats two.
+pub use mpos_abi::{RLIM_INFINITY, RLIM_NLIMITS, Rlimit, default_rlimits, rlimit_admit};
 
 /// The `(rlim_cur, rlim_max)` pair a resource reports. The numbers are the
 /// defaults a static musl binary needs to start: an 8 MiB stack, a generous

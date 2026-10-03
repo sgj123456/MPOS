@@ -42,7 +42,10 @@ use crate::mm::vma::{MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{Priority, Scheduler, TaskId};
 use crate::sched::signal;
-use crate::syscall::linux::{abi, nr};
+// `abi` here is the syscall ABI module, kept only for the ptrace block's
+// x86_64 register-file shape (`abi::uregs::COUNT`) and `PTRACE_*`/`SYSCALL_TRAP`;
+// the arch-neutral `crate::abi` leaf holds the clone flags and rlimit table now.
+use crate::syscall::linux::abi;
 use crate::vfs::RawFd;
 use crate::vfs::file::{FdTable, File};
 
@@ -311,7 +314,7 @@ fn new_layout(image: &Image<'_>, interp: Option<&Image<'_>>) -> Layout {
 // The resource-limit table's type and startup values live with the syscall
 // layer (which is host-compiled and tests them); the scheduler only carries a
 // per-task copy and reads/writes it through the accessors below.
-use crate::syscall::linux::abi::{RLIM_NLIMITS, Rlimit, default_rlimits, rlimit_admit};
+use crate::abi::{RLIM_NLIMITS, Rlimit, default_rlimits, rlimit_admit};
 
 /// The current process's limit for `resource`.
 #[cfg(target_os = "none")]
@@ -1451,7 +1454,7 @@ impl Task {
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
-            umask: crate::syscall::DEFAULT_UMASK,
+            umask: crate::abi::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
             nice: 0,
@@ -1915,7 +1918,7 @@ impl Table {
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
-            umask: crate::syscall::DEFAULT_UMASK,
+            umask: crate::abi::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
             nice: 0,
@@ -2361,7 +2364,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
-            umask: crate::syscall::DEFAULT_UMASK,
+            umask: crate::abi::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
             nice: 0,
@@ -4749,9 +4752,9 @@ pub fn exec_trap(regs: &mut [u64; abi::uregs::COUNT]) {
 /// kernel as one syscall with different flags, and a tracer that asked about
 /// threads but not about processes needs to be told which one it just got.
 fn fork_event(flags: usize) -> u32 {
-    if flags & nr::CLONE_THREAD != 0 {
+    if flags & crate::abi::CLONE_THREAD != 0 {
         abi::PTRACE_EVENT_CLONE
-    } else if flags & nr::CLONE_VFORK != 0 {
+    } else if flags & crate::abi::CLONE_VFORK != 0 {
         abi::PTRACE_EVENT_VFORK
     } else {
         abi::PTRACE_EVENT_FORK
@@ -7189,7 +7192,7 @@ pub fn vfork(state: &UserFrame) -> isize {
     spawn_copy(
         state,
         CloneRequest {
-            flags: nr::CLONE_VFORK,
+            flags: crate::abi::CLONE_VFORK,
             ..CloneRequest::default()
         },
     )
@@ -7480,14 +7483,14 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             argv: parent_argv,
             // `CLONE_CHILD_SETTID` parks the child's tid where the child can
             // read it; without the flag there is nothing to record.
-            child_tid: if request.flags & nr::CLONE_CHILD_SETTID != 0 {
+            child_tid: if request.flags & crate::abi::CLONE_CHILD_SETTID != 0 {
                 request.child_tid
             } else {
                 0
             },
             // `CLONE_SETTLS` names a TLS descriptor for the child alone;
             // otherwise the child inherits the caller's.
-            tls: if request.flags & nr::CLONE_SETTLS != 0 {
+            tls: if request.flags & crate::abi::CLONE_SETTLS != 0 {
                 request.tls
             } else {
                 parent_tls
@@ -7902,7 +7905,7 @@ fn scheduler_loop() {
 /// could corrupt by continuing, so suspending it would buy nothing - and every
 /// `CLONE_VFORK` caller in practice (`posix_spawn`) waits on the child itself.
 pub fn clone(state: &UserFrame, request: CloneRequest) -> isize {
-    if request.flags & nr::CLONE_THREAD != 0 {
+    if request.flags & crate::abi::CLONE_THREAD != 0 {
         return spawn_thread(state, request);
     }
     spawn_copy(state, request)
@@ -8055,12 +8058,12 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             stack_top,
             exe,
             argv,
-            child_tid: if request.flags & nr::CLONE_CHILD_SETTID != 0 {
+            child_tid: if request.flags & crate::abi::CLONE_CHILD_SETTID != 0 {
                 request.child_tid
             } else {
                 0
             },
-            tls: if request.flags & nr::CLONE_SETTLS != 0 {
+            tls: if request.flags & crate::abi::CLONE_SETTLS != 0 {
                 request.tls
             } else {
                 parent_tls
@@ -8076,7 +8079,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             tgid,
         });
 
-        if request.flags & nr::CLONE_CHILD_CLEARTID != 0 {
+        if request.flags & crate::abi::CLONE_CHILD_CLEARTID != 0 {
             // Where a joiner sleeps. The thread clears it on the way out, and
             // wakes whoever is waiting there - which is the whole of what
             // `pthread_join` needs from the kernel.

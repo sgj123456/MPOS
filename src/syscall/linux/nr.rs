@@ -474,60 +474,18 @@ pub const ACCEPT4: u64 = 288;
 pub const SENDMMSG: u64 = 307;
 pub const RECVMMSG: u64 = 299;
 
-// `clone(2)` flag bits, as the Linux x86_64 ABI numbers them. Each one names a
-// part of the caller that the child **shares** instead of copying; a zero flag
-// word is therefore plain `fork`.
-pub const CLONE_VM: usize = 0x0000_0100;
-pub const CLONE_FS: usize = 0x0000_0200;
-pub const CLONE_FILES: usize = 0x0000_0400;
-pub const CLONE_SIGHAND: usize = 0x0000_0800;
-pub const CLONE_VFORK: usize = 0x0000_4000;
-pub const CLONE_PARENT: usize = 0x0000_8000;
-pub const CLONE_THREAD: usize = 0x0001_0000;
-pub const CLONE_SYSVSEM: usize = 0x0004_0000;
-pub const CLONE_SETTLS: usize = 0x0008_0000;
-pub const CLONE_PARENT_SETTID: usize = 0x0010_0000;
-pub const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
-/// Historical no-op. Linux removed its meaning years ago but still accepts
-/// the bit, and musl's `pthread_create` puts it in every thread's flag word -
-/// refusing it refuses every pthread in the system.
-pub const CLONE_DETACHED: usize = 0x0040_0000;
-/// Historical no-op, same treatment: accepted so a caller from a kernel that
-/// still sends it is not refused for a bit that does nothing.
-pub const CLONE_UNTRACED: usize = 0x0080_0000;
-pub const CLONE_CHILD_SETTID: usize = 0x0100_0000;
-
-// The eight namespace flags, where `clone`/`unshare` put "give me a namespace
-// of my own" in the same word as "share this part of me with the child".
-//
-// They live in `nr.rs` and not beside either handler because two calls read
-// them - `unshare(2)` and `clone(2)` - and a table copied into both would be
-// two tables. `CLONE_NEWTIME` is the one worth staring at: Linux puts it at
-// `0x80`, inside the low byte the exit signal (`CSIGNAL`, 0..=0x7f) lives in,
-// so "a `CLONE_NEW*` is a bit in the high half" is a rule the header does not
-// follow and a reader must not assume. Both of those were spelled wrong here
-// once (`CLONE_NEWNS` as `CLONE_THREAD`, `CLONE_NEWTIME` as `CLONE_SETTLS`),
-// which is this file's whole reason for existing.
-pub const CLONE_NEWTIME: usize = 0x0000_0080;
-pub const CLONE_NEWNS: usize = 0x0002_0000;
-pub const CLONE_NEWCGROUP: usize = 0x0200_0000;
-pub const CLONE_NEWUTS: usize = 0x0400_0000;
-pub const CLONE_NEWIPC: usize = 0x0800_0000;
-pub const CLONE_NEWUSER: usize = 0x1000_0000;
-pub const CLONE_NEWPID: usize = 0x2000_0000;
-pub const CLONE_NEWNET: usize = 0x4000_0000;
-
-/// All eight namespace bits at once - the mask that says "these bits are
-/// namespace requests, not sharing requests", which is the distinction both
-/// callers have to make before they can answer anything.
-pub const CLONE_NAMESPACES: usize = CLONE_NEWTIME
-    | CLONE_NEWNS
-    | CLONE_NEWCGROUP
-    | CLONE_NEWUTS
-    | CLONE_NEWIPC
-    | CLONE_NEWUSER
-    | CLONE_NEWPID
-    | CLONE_NEWNET;
+// `clone(2)` flag bits. These live in the `abi` leaf now, so the scheduler's
+// fork path can read them without an edge up into this layer; they are re-exported
+// here because the `clone`/`unshare` handlers speak them as `nr::CLONE_*`, and one
+// table (in `crates/abi`) is shared rather than copied. The values and the
+// `CLONE_NEWTIME`-is-not-high-half subtlety are documented and pinned at their
+// source.
+pub use mpos_abi::{
+    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_DETACHED, CLONE_FILES, CLONE_FS,
+    CLONE_NAMESPACES, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID,
+    CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS,
+    CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD, CLONE_UNTRACED, CLONE_VFORK, CLONE_VM,
+};
 
 // ---------------------------------------------------------------------------
 // Tests: every number against the Linux x86_64 syscall table
