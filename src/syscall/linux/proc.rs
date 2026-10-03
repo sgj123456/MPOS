@@ -3294,7 +3294,7 @@ pub(super) fn handle_sethostname(args: [usize; ARG_COUNT]) -> isize {
     let Ok(name) = core::str::from_utf8(&bytes[..len]) else {
         return err::EINVAL;
     };
-    crate::vfs::procfs::set_hostname(name);
+    crate::sched::current_uts().set_nodename(name);
     0
 }
 
@@ -3328,7 +3328,7 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // hostname` reads it. Two answers to one question, kept in one place
         // so they cannot disagree - `hostname` and `uname -n` have to say
         // the same thing or a script that checks one against the other fails.
-        write_str(65, &crate::vfs::procfs::hostname());
+        write_str(65, &crate::sched::current_uts().nodename());
         // `uname -r` must answer the version the kernel was built with - it
         // is the same `CARGO_PKG_VERSION` `/proc/sys/kernel/osrelease`
         // reports, and the name of the `/lib/modules/<release>` directory
@@ -3354,7 +3354,7 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // It used to be the constant `(none)` here, which made the third door
         // disagree with the other two: a program that set a domain and then
         // asked `uname` was told the domain it had just set was `(none)`.
-        write_str(325, &crate::vfs::procfs::domainname());
+        write_str(325, &crate::sched::current_uts().domainname());
     }
     0
 }
