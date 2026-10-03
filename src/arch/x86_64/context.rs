@@ -329,7 +329,7 @@ pub const USER_RFLAGS: usize = (1 << 1) | (1 << 9);
 /// for anything but traps from here on: entering user mode abandons this call
 /// frame permanently.
 pub unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
-    let (code, data) = crate::arch::gdt::user_selectors();
+    let (code, data) = super::gdt::user_selectors();
 
     // Push in `iretq`'s pop order reversed, one operand per push so the
     // sequence below reads as that order rather than as a list to be

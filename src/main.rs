@@ -35,7 +35,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use mpos::arch::{self, interrupts};
+use mpos::arch;
 use mpos::blk;
 use mpos::boot::console_list::ConsoleList;
 use mpos::boot::{self, BootInfo};
@@ -625,7 +625,7 @@ fn check_arch(info: &BootInfo) {
         unsafe {
             core::arch::asm!("int3")
         };
-        assert_eq!(interrupts::breakpoints_caught(), 1, "#BP was not caught");
+        assert_eq!(arch::breakpoints_caught(), 1, "#BP was not caught");
         println!("breakpoint caught and returned from");
 
         // The machine's copy of the Linux register-file field order must agree
@@ -633,7 +633,7 @@ fn check_arch(info: &BootInfo) {
         // bare-metal only, the other is host-built, so neither can name the
         // other's module - and this is what keeps the duplication honest rather
         // than hoped-for (`arch/x86_64/context.rs`, `syscall/linux/abi.rs`).
-        for (name, index) in arch::context::ABI_REG_INDEX {
+        for (name, index) in arch::ABI_REG_INDEX {
             assert_eq!(
                 syscall::linux::abi::uregs_by_name(name),
                 Some(index),
@@ -642,7 +642,7 @@ fn check_arch(info: &BootInfo) {
         }
         assert_eq!(
             syscall::linux::abi::UREGS_COUNT,
-            arch::context::ABI_REG_COUNT,
+            arch::ABI_REG_COUNT,
             "the register file is a different size on the two sides"
         );
         println!("register file field order agrees with the ABI");

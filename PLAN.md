@@ -824,6 +824,14 @@ it - so the entries say which they are:
       bare-metal and the other host-built — is *checked* on every boot in `M1` (`main.rs` asserts
       all nineteen named indices and the count against the ABI's table), which is what makes it a
       recorded agreement rather than a hope. Gate green: `pass=142 fail=0 (142 built)`, exit 33
+- [x] **11.4 stage 5, the door itself**: `src/arch/mod.rs` is now a facade of four items —
+      `kernel_sections`, `breakpoints_caught` and the two register-table constants the M1 check
+      needs — and `arch/x86_64`'s submodules are `pub(crate)`, so a layer cannot reach
+      `arch::paging` even by writing the path. Defence in depth behind the depgraph's allow-list,
+      which catches the reference; this catches the *name*. Deleting the module glob made two
+      genuinely dead helpers visible (`gdt::user_code`/`user_data`, reachable only through it) and
+      they are gone, per V-7's rule that dead machine modules are debt. Gate green:
+      `pass=142 fail=0 (142 built)`, exit 33
 
 **ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
 
@@ -6504,7 +6512,7 @@ the argument for having done them first.
 - **Fixing V-10.** Accepted, documented, and cheaper to live with than a shared crate across two
   targets would be.
 
-### 11.4 The HAL: a machine seam under `arch/` — **S1–S4 LANDED, THE DOOR IS SHUT**
+### 11.4 The HAL: a machine seam under `arch/` — **CLOSED (S1–S5 LANDED)**
 
 Phase 11 is "who names whom"; this is the largest remaining piece of it, deferred above until
 now. Goal: everything above the machine layer compiles against *capability traits* instead of
@@ -6533,7 +6541,7 @@ neutral.
 | S2 | `Interrupts` (`Line`, `unmask`/`eoi`/`net_irq`): `serial`, `virtio/net`, `lapic` | open |
 | S3 | `Paging` (`Space` assoc + `AddressSpaceOps`, `install`/`map_mmio`/`translate`/`user_accessible`/`is_cow_page`/`write_user_u32`/roots/switch/`phys_for_virt_of`); `PageTaken` moves to `mm::vm`; migrates `sched`, `mm`, `uaccess`, `syscall`, `main` | **landed** — pairs 14 → 14 (a swap: `arch ↔ mm` out, `hal ↔ mm` in); gate `pass=142 fail=0` exit 33 |
 | S4 | `Contexts`: `Context`/`Fpu`/`UserFrame` as associated types behind `ContextOps`/`FpuOps`/`UserFrameOps`; `sched` and the ABI layer stop naming `arch` | **landed** — pairs 14 → 12 (`arch ↔ sched`, `arch ↔ syscall` gone); gate `pass=142 fail=0` exit 33 |
-| S5 | close the door: the depgraph rule becomes an allow-list (`arch`/`hal`/`main`/`lib`, everything else at 0), and `arch::x86_64`'s internals tighten to what the wiring still needs | **rule landed and absolute**; the visibility tightening is the remainder |
+| S5 | close the door: the depgraph rule is an allow-list (`arch`/`hal`/`main`/`lib`, everything else at 0), and `arch/x86_64`'s submodules are `pub(crate)` behind a four-item facade | **landed** |
 
 S2–S4 touch the trap, page-fault and context-switch paths, so each needs the full QEMU gate,
 not host+clippy alone. S1 was pure re-routing — host tests, both clippy targets and the depgraph

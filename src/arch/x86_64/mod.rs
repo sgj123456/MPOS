@@ -2,16 +2,16 @@
 //!
 //! Everything in here may touch x86 specifics; nothing outside `arch::` may.
 
-pub mod context;
-pub mod critical;
-pub mod gdt;
-pub mod idt;
-pub mod lapic;
-pub mod paging;
-pub mod pic;
-pub mod rtc;
-pub mod syscall;
-pub mod timer;
+pub(crate) mod context;
+pub(crate) mod critical;
+pub(crate) mod gdt;
+pub(crate) mod idt;
+pub(crate) mod lapic;
+pub(crate) mod paging;
+pub(crate) mod pic;
+pub(crate) mod rtc;
+pub(crate) mod syscall;
+pub(crate) mod timer;
 
 use crate::mm::vm::KernelSections;
 

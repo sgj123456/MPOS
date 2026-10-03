@@ -294,15 +294,3 @@ pub fn user_code_star_base() -> u64 {
     );
     (data_base - 8) | 0b11
 }
-
-/// The user code / data selectors as plain numbers, for the exit-frame dump
-/// that checks an `iretq` frame's slots against what each one must hold. Same
-/// values `user_selectors` hands out - read through here rather than spelled as
-/// literals so a GDT reshuffle cannot leave the check asserting a stale number.
-pub fn user_code() -> u64 {
-    user_selectors().0.0 as u64
-}
-
-pub fn user_data() -> u64 {
-    user_selectors().1.0 as u64
-}

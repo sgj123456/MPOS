@@ -123,7 +123,7 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
     // own ring-3 code (`utime`), anything else means the kernel was running on
     // its behalf (`stime`). Charged before the EOI and the preempt, so the tick
     // lands on the task that actually held the core.
-    let in_user = frame.code_segment == crate::arch::gdt::user_selectors().0;
+    let in_user = frame.code_segment == super::gdt::user_selectors().0;
     crate::sched::charge_cpu(in_user);
     // EOI before preempting: once the scheduler switches away this handler does
     // not return until the task is resumed, and an unacknowledged PIC would
@@ -479,7 +479,7 @@ fn pf_diag(addr: usize, rip: usize) {
         (e & 1) | (((e >> 1) & 1) << 1) | (((e >> 2) & 1) << 2) | (((e >> 9) & 1) << 3)
     };
 
-    let Some(entry) = crate::arch::paging::leaf_pte(page) else {
+    let Some(entry) = super::paging::leaf_pte(page) else {
         // The bytes of the instruction that faulted, up to the end of its own
         // page: a faulting access is usually one instruction whose operand
         // went bad, and the bytes name it - `48 89` is a store, `f4` is
@@ -496,7 +496,7 @@ fn pf_diag(addr: usize, rip: usize) {
         // print, and `rip` beside an empty list says exactly that.
         let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
         let mut code = [0u8; 16];
-        let code_len = if crate::arch::paging::leaf_pte(rip & !(PAGE_SIZE - 1)).is_some() {
+        let code_len = if super::paging::leaf_pte(rip & !(PAGE_SIZE - 1)).is_some() {
             let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
             code[..room].copy_from_slice(bytes);
             room
@@ -512,7 +512,7 @@ fn pf_diag(addr: usize, rip: usize) {
         // space looking for it.
         let mut lo = page;
         for _ in 0..64 {
-            if lo >= page_size && crate::arch::paging::leaf_pte(lo - page_size).is_some() {
+            if lo >= page_size && super::paging::leaf_pte(lo - page_size).is_some() {
                 lo -= page_size;
             } else {
                 break;
@@ -520,7 +520,7 @@ fn pf_diag(addr: usize, rip: usize) {
         }
         let mut hi = page + page_size;
         for _ in 0..64 {
-            if hi < (1 << 47) && crate::arch::paging::leaf_pte(hi).is_some() {
+            if hi < (1 << 47) && super::paging::leaf_pte(hi).is_some() {
                 hi += page_size;
             } else {
                 break;
@@ -542,12 +542,12 @@ fn pf_diag(addr: usize, rip: usize) {
     let want = bits(entry);
     let mut lo = page;
     while lo >= page_size
-        && crate::arch::paging::leaf_pte(lo - page_size).is_some_and(|e| bits(e) == want)
+        && super::paging::leaf_pte(lo - page_size).is_some_and(|e| bits(e) == want)
     {
         lo -= page_size;
     }
     let mut hi = page + page_size;
-    while hi < (1 << 47) && crate::arch::paging::leaf_pte(hi).is_some_and(|e| bits(e) == want) {
+    while hi < (1 << 47) && super::paging::leaf_pte(hi).is_some_and(|e| bits(e) == want) {
         hi += page_size;
     }
 
@@ -567,7 +567,7 @@ fn pf_diag(addr: usize, rip: usize) {
     // along the walk, and a write on a 4 KiB page can be refused by a level
     // above it. Every level is printed, unused slots included, so the shape of
     // the walk is unambiguous.
-    for (level, e) in crate::arch::paging::entry_chain(page) {
+    for (level, e) in super::paging::entry_chain(page) {
         crate::println!(
             "PFDIAG L{level} entry={e:#x} P={} W={} U={} PS={}",
             e & 1,

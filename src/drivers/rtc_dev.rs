@@ -2,7 +2,7 @@
 //! `hwclock(8)` reaches through.
 //!
 //! This module is `rtc_dev` and not `rtc` because the clock itself is
-//! [`crate::arch::x86_64::rtc`]: the code that reads and writes the CMOS,
+//! [`crate::hal`]: the code that reads and writes the CMOS,
 //! which the kernel's own `clock_gettime` anchor comes from. What lives here
 //! is the *node* in front of it - the file, its char-device number, and the
 //! stream face - and two modules called `rtc` in one tree, one a driver and
