@@ -158,7 +158,7 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
 - [~] 7.1 Display — `/dev/fb0` (mmap + FBIOGET_* + PAN/VSYNC present) and
       `/dev/dri/card0` + `/dev/dri/renderD128` (resources, dumb buffers, addfb2,
       atomic commits, page-flip + vblank events, PRIME both ways) — which with
-      Mesa's GBM and EGL is weston-on-GL, in software — and a resized or
+      Mesa's GBM and EGL is weston-on-GL, in software — and a framebuffer belongs to the description that made it and is released with it (Linux's `drm_file_free` → `drm_fb_release`), so `GETRESOURCES` lists live framebuffers rather than ids a dead session left behind (niri could not open the card when it read the properties of one: “Error reading properties on device `/dev/dri/card0` (Invalid argument)”) — and a resized or
       fullscreened QEMU window *follows Linux's virtio-gpu semantics*: the kernel
       re-reads the host's size, advertises it as the connector's mode and fires a
       `HOTPLUG=1` uevent, then leaves the scanout alone until the KMS master (an
@@ -166,26 +166,26 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
       on the render task, drives `change_resolution`. A text console with no
       compositor to commit keeps the size it booted at, exactly as Linux's fbcon
       does. No 3D/virgl, no sync objects, no format modifiers, no EDID (§7.1, §7.4)
-  - [ ] the compositor's **mouse cursor is not painted**, and the measurements
-        say it is not this kernel's doing. What was observed, in order: the
-        desktop-shell commits a 40×40 ARGB8888 cursor buffer to a grown `wl_shm`
-        pool and sends `wl_pointer.set_cursor(surface, 5, 5)` (client-side
-        `WAYLAND_DEBUG`, no protocol error); the pointer's motion reaches the
-        compositor and is forwarded to the client with the right coordinates;
-        the compositor repaints and its frames *do* reach the scanout (the panel
-        clock ticks in a screendump 75 s later); and the cursor is absent from
-        the scanout at every pointer position (screendumps at two positions are
-        byte-identical). Both sides of the plumbing were then probed directly:
-        the Xcursor file parses as 11 images of 16..96 px with sane hotspots,
-        the pool's `ftruncate`/`posix_fallocate`/`MAP_SHARED` remap keeps its
-        bytes, and a *grown* `memfd` is coherent across two processes (a child's
-        write at +8192 is read back by the parent through its own remapping, and
-        by `pread`). With the kernel ruled out at every reachable point, what is
-        left is libweston's cursor path — and the one cursor that shows is the
-        built-in fallback arrow (no `cursor-theme`), because it is small enough
-        to be in the very first frame; a themed cursor, loaded a few hundred
-        milliseconds later, never is. Recorded so the next reader starts from
-        the measurements rather than repeating them.
+  - [~] the compositor's **mouse cursor**: the plane is now driven, and what is left is a compositor
+        that hands it an empty image. Measurements taken in one boot each on a `--mode gui` image with
+        the card instrumented:
+          * *The plane was unusable, and that was this kernel's doing.* weston builds one atomic state
+            per plane and `drm_plane_state_add_props` adds `SRC_X`/`SRC_Y`/`SRC_W`/`SRC_H` and
+            `CRTC_W`/`CRTC_H` to every one of them without asking whether the plane has them; a handle
+            of 0 reaches the card as property 0, is refused, and takes the whole commit down with it.
+            The cursor plane published only `type`, `FB_ID`, `CRTC_ID`, `CRTC_X`/`CRTC_Y` and
+            `IN_FORMATS`, so that is what happened: weston set `FB_ID` to **0** twice and never gave the
+            kernel an image — the pointer moved, clicked, and was never drawn. Publishing the four
+            rectangles (and honouring them by *being* the image: this card's cursor cannot scale or crop,
+            so the identity is the only rectangle a commit may name and anything else is `EINVAL`) is
+            the fix, and the same instrumented boot then shows weston binding `FB_ID` 100, then 101, and
+            the kernel compositing the image at the pointer (`cursor.rs`'s blend, unchanged).
+          * *What is left is a compositor that uploads nothing.* The same boot, with the contents of the
+            bound buffer counted as it is composed: with `cursor-theme`/`cursor-size` in `weston.ini` the
+            buffer is **all zero** (0 opaque pixels) on every commit, and with the theme commented out it
+            carries the built-in arrow (5 opaque pixels, white) — the small cursor this card has always
+            shown, now arriving through the hardware plane. So the kernel half is complete and measured,
+            and the themed cursor is libweston's cursor path: a named gap, not a stub.
   - [x] **which consoles the kernel has is a `console=` list**, and nothing about
         how the machine was launched reaches it: `mpos.headless` /
         `mpos.nomirror` / `mpos.mirror` / `mpos.compositor` are gone, the kernel
@@ -269,6 +269,18 @@ compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
         occupied, so `./start-weston.sh` could not be run a second time. Measured
         against `drivers/tty/vt/{vt.c,vt_ioctl.c}`; pinned by `vtmode`'s host tests
         and by `t-seat` (§7.1)
+  - [x] **and it comes back in graphics mode.** seatd opens the console, writes `VT_SETMODE` and closes
+        the descriptor — writing it with `relsig` and `acqsig` both **zero**, the shape a seat manager
+        that watches the console itself rather than waiting to be told. So the handover has no keeper to
+        signal, `release_console` takes Linux's own `reset_vc` road, and the console lands back in
+        `KD_TEXT`. What Linux does not do is let the word matter afterwards; there a master drives the
+        screen because it is the master. Here the veto the text console paints under is
+        `master_holds_screen`, and that asks `KD_GRAPHICS` as one of its three facts — so a handover
+        nobody answered cost the compositor its screen for good: the text grid repainted over the desktop
+        and every `MODE_ATOMIC` was answered `EACCES`. The master's own console is now a graphics console
+        again the moment it is the one on the screen and a live master still holds the card; a master that
+        has let go, one on another console, and one whose console is not the one being shown all leave the
+        text console its screen.
   - [x] **and `VT_ACTIVATE` does not wait**, because Linux's is `set_console()`:
         the request is recorded, the console callback runs the negotiation, and the
         ioctl returns 0. The sleeping form here was attributed to a `vt_release`
