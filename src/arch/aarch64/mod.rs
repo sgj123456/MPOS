@@ -15,7 +15,10 @@
 //! (`src/lib.rs`'s ledger).
 
 pub(crate) mod critical;
+pub(crate) mod gic;
 pub(crate) mod pl011;
+pub(crate) mod timer;
+pub(crate) mod vectors;
 
 use core::fmt;
 
@@ -79,7 +82,140 @@ pub fn print_args(args: fmt::Arguments) {
 pub fn boot(handoff: usize) -> ! {
     pl011::init();
     banner(handoff);
+
+    // The clock this machine's kernel wants is the EL1 physical timer, and the
+    // vector table and GIC are configured for EL1 as well; a machine that
+    // started this image at EL2 would fault or, worse, arm a timer nothing
+    // ever reads. Which level the entry arrives at is the firmware's decision
+    // (`PLAN.md` §9.1's risk list), so it is checked rather than assumed - and
+    // the check is here, before the machine is configured, rather than in the
+    // banner's printout alone.
+    let level = current_el();
+    if level != 1 {
+        print_args(format_args!(
+            "aarch64: entered at EL{level}, and this stage's clock and vectors are \
+             EL1's; stopping rather than configuring the wrong machine\n"
+        ));
+        halt();
+    }
+
+    init_interrupts();
+    check_timer();
     halt()
+}
+
+/// Bring the machine's interrupts up: the vector table, then the controller,
+/// then the clock.
+///
+/// The order is the x86_64 `init_interrupts`'s, and for the same reason: the
+/// vectors must exist before anything can raise one, and the controller must
+/// know about the timer's line before the timer is armed to raise it. Unmasking
+/// the CPU is the caller's separate step, because a boot path brings the
+/// machine up and *then* opens the door.
+pub fn init_interrupts() {
+    vectors::init();
+    gic::init();
+    timer::init();
+    print_args(format_args!(
+        "interrupts: GICv2 (distributor {:#x}), vector table at {:#x}, timer on INTID {}\n",
+        gic::DIST,
+        vectors::table(),
+        gic::TIMER_INTID
+    ));
+    // The GIC's and the timer's writes must have reached the devices before
+    // this core can take an interrupt at all; without the barrier the window is
+    // one instruction wide, which is exactly the kind of gap that works on a
+    // fast model and fails on a slow one.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nomem, nostack));
+    }
+}
+
+/// Whether this core would take an interrupt right now.
+pub fn interrupts_enabled() -> bool {
+    vectors::interrupts_enabled()
+}
+
+/// Let the core take interrupts.
+pub fn enable_interrupts() {
+    vectors::enable_interrupts()
+}
+
+/// Stage 1c's evidence: the generic timer's interrupt reaches the vector table,
+/// is acknowledged on the GIC, counted, retired, and returned from - at the rate
+/// the machine's own counter says it should.
+///
+/// The wait is the counter's, not the clock's, and that is the point of the
+/// check. The failure it must be able to report is "no interrupt ever arrived",
+/// and waiting on ticks - or on `wfi` - would hang on exactly that failure, with
+/// nothing printed. Spinning on `CNTPCT_EL0` gives the window an engine that
+/// does not need the thing being tested, so a broken vector table ends as a
+/// number that is wrong rather than as silence.
+fn check_timer() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    let _ = writeln!(
+        out,
+        "timer: CNTFRQ_EL0 {} Hz, tick at {} Hz ({} counts apart)",
+        timer::frequency(),
+        timer::TICK_HZ,
+        timer::period()
+    );
+
+    enable_interrupts();
+    if !interrupts_enabled() {
+        let _ = writeln!(out, "M1_TIMER_FAILED: DAIF.I is still set after enabling");
+        halt();
+    }
+
+    const WINDOW_MS: u64 = 100;
+    let expected = WINDOW_MS * timer::TICK_HZ as u64 / 1000;
+    // A window's worth of ticks is not a round number of periods - the first
+    // one lands partway through - so the check is the rate, not an equality.
+    // Two ticks of slack, against a measurement of exactly 25 in three runs of
+    // three: the slack is for the first tick's phase, not for the clock.
+    let tolerance = 2;
+
+    let before = timer::ticks();
+    timer::busy_wait_ms(WINDOW_MS);
+    let got = timer::ticks() - before;
+
+    if !(expected - tolerance..=expected + tolerance).contains(&got) {
+        // Name what the machine says, not just what went wrong: a timer that
+        // never fires has three different causes down one wire (see
+        // `gic::State`), and this is the only place they can be told apart.
+        let gic = gic::state();
+        let _ = writeln!(
+            out,
+            "M1_TIMER_FAILED: {got} interrupts in {WINDOW_MS} ms, expected ~{expected} \
+             at {} Hz",
+            timer::TICK_HZ
+        );
+        let _ = writeln!(
+            out,
+            "  timer: CTRL {:#x} (enabled {}, masked {}, fired {}), CNTPCT {}",
+            timer::control(),
+            timer::control() & 1,
+            (timer::control() >> 1) & 1,
+            (timer::control() >> 2) & 1,
+            timer::counter(),
+        );
+        let _ = writeln!(
+            out,
+            "  gic:   CTLR {:#x}, ISENABLER0 {:#x}, CPU CTLR {:#x}, PMR {:#x}, HPPIR {}",
+            gic.dist_control, gic.enabled0, gic.cpu_control, gic.priority_mask, gic.highest_pending,
+        );
+        halt();
+    }
+
+    let _ = writeln!(
+        out,
+        "M1_TIMER_OK: {got} interrupts in {WINDOW_MS} ms (~{expected} at {} Hz), \
+         {} ns of counter",
+        timer::TICK_HZ,
+        timer::since_boot_nanos()
+    );
 }
 
 /// Say who this is and what it was given, then get out of the way.
@@ -115,7 +251,7 @@ fn banner(handoff: usize) {
     let _ = writeln!(out, "exception level: EL{}", current_el());
     let _ = writeln!(
         out,
-        "aarch64: stage 1b bring-up (MMU off, no interrupts); halting"
+        "aarch64: bring-up, stage 1c (MMU off; the kernel's own tables are 1d)"
     );
 }
 
@@ -138,9 +274,12 @@ fn current_el() -> u64 {
 
 /// Stop the machine for good.
 ///
-/// `wfi` parks the core until an interrupt, and nothing here has unmasked one
-/// yet, so this is a reset-only stop - which is what a bring-up halt and a
-/// panic path both want. Stage 1c's clock is what makes it a real idle.
+/// `wfi` parks the core until an interrupt. Before stage 1c's clock there was
+/// none to wake it, so this was a reset-only stop; now it is the real idle -
+/// which is the shape the scheduler's own loop will want, where a parked core
+/// is woken by the tick rather than spinning on it. The panic path reaches here
+/// with interrupts as they were, which is what makes a panic on a machine with
+/// the clock running park rather than spin.
 pub fn halt() -> ! {
     loop {
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };

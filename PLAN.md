@@ -664,7 +664,7 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stages 1a-1b landed (§9.1))**
+**Architectures (Phase 9 — aarch64 stages 1a-1c landed (§9.1))**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
@@ -5170,12 +5170,13 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1b landed**. The toolchain targets and the linker
+Current status: **stages 1a-1c landed**. The toolchain targets and the linker
 script exist, the gates are two-way, `cargo build --target aarch64-unknown-none`
 links a bootable ELF, and that ELF boots under `qemu-system-aarch64 -M virt
--kernel` and prints its banner over a PL011 at `0x0900_0000`. Nothing above
-`arch` is ported yet; `src/lib.rs`'s header carries the stage ledger, which is
-the record of which module un-gates when.
+-kernel`, prints its banner over a PL011 at `0x0900_0000`, and takes the generic
+timer's interrupt through a GICv2 and its own vector table at 250 Hz. Nothing
+above `arch` is ported yet; `src/lib.rs`'s header carries the stage ledger, which
+is the record of which module un-gates when.
 
 This section used to say "kernel ELF compiles but boot flow incomplete", which
 was false in both halves. Nothing compiled for aarch64 - V-8 (§11.1.8) removed
@@ -5196,7 +5197,7 @@ verified by the means named; none of them claims a green from compilation alone.
 |---|---|---|
 | 1a | Build plumbing: `rust-toolchain.toml` targets, `src/arch/aarch64/linker.ld`, `[target.aarch64-unknown-none]`, the gate list and the stage ledger | `cargo build --target aarch64-unknown-none` links; the x86 gate stays green |
 | 1b | The machine body: PL011 at `0x0900_0000`, the `_start` stub, the banner | `qemu-system-aarch64 -M virt -kernel` prints the banner |
-| 1c | Exception vectors (`VBAR_EL1`), GICv2, the generic timer (`CNTPCT_EL0`/`CNTP_TVAL_EL0`) | an IRQ increments a counter printed on the tick |
+| 1c | Exception vectors (`VBAR_EL1`), GICv2, the generic timer (`CNTPCT_EL0`/`CNTP_CVAL_EL0`) | **landed**: `M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz)`, three runs of three, and the check's failure branch names the timer's, the distributor's and the CPU interface's registers rather than hanging |
 | 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | boots on its own tables and runs the `mm` self-check |
 | 1e | The aarch64 loader: `boot/src/vm.rs` gains a `TTBR1` body, `BOOTAA64.EFI`, AAVMF | QEMU + AAVMF boots the real image from the ESP |
 | 2 | Contexts and user entry: `x19..x28`/`fp`/`lr`/`sp`, `q0..q31`, `eret` | a boot-time switch between two kernel tasks |
@@ -5209,8 +5210,7 @@ verified by the means named; none of them claims a green from compilation alone.
 
 Named gaps the port carries rather than hides, each with its home:
 
-- **The `-kernel` bring-up is an instrument, not the boot path.** Stages 1b-1d
-  enter at a fixed physical address with the MMU off, because that is the
+- **The `-kernel` bring-up is an instrument, not the boot path.** Stages 1b-1d  enter at a fixed physical address with the MMU off, because that is the
   smallest thing that proves the toolchain, the linker script and the machine
   body agree. Stage 1e deletes it and boots from the ESP through AAVMF, which is
   the promise this section makes: a second machine with the *same* boot path,
@@ -5224,6 +5224,19 @@ Named gaps the port carries rather than hides, each with its home:
   configuration table, which is stage 1e's loader and stage 5's parser. What it
   does mean is that the EL1-vs-EL2 check below belongs to 1e, where AAVMF is the
   thing that decides.
+- **The GICv2 bring-up is three bits across two frames, and the wrong value is
+  silent.** Measured on this machine, and recorded because the register values
+  are load-bearing: the timer's line needs `GICD_CTLR` *and* `GICC_CTLR` bit 1
+  set - group 1 is what an IRQ *is*, so a line left in group 0 with only bit 0
+  written is pending forever and raises nothing - and `GICC_CTLR.AckCtl` (bit 2)
+  as well. Without AckCtl the acknowledge reads **1022** instead of 30, which by
+  the GICv2 specification is its answer when the pending interrupt is group 1
+  and the acknowledging access is secure; the interrupt is therefore never
+  retired, `nIRQ` stays asserted, and the vector is re-entered every few hundred
+  nanoseconds. That is not "the clock is broken" from the outside - it is a
+  clock that looks *very fast*, and it cost a 1022/30 reading to tell apart.
+  Linux programs the same `0x7`. The check's failure branch now prints the five
+  registers that separate the three causes.
 - **The machine addresses are hardcoded.** QEMU virt puts PL011 at
   `0x0900_0000` and the GIC at `0x0800_0000`/`0x0801_0000`; the DTB the firmware
   passes in `x0` is what a real port reads, and stage 5 is where it does. Until
