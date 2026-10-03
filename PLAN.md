@@ -664,8 +664,9 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stages 1a-1e landed: the machine boots a real
-ESP image under AAVMF (§9.1); next is the kernel installing its own tables)**
+**Architectures (Phase 9 — aarch64 stages 1a-1f landed: the machine boots a real
+ESP image under AAVMF and builds its own page tables from `kernel_mappings`
+(§9.1); next is stage 2, contexts and user entry)**
 - [ ] 9.1 aarch64 complete boot (stages 2-8 remain) · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
@@ -5171,28 +5172,37 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1e landed, and the machine now boots the way the
-x86_64 one does.** `cargo xtask boot-aarch64` builds the kernel
-(`aarch64-unknown-none`), the loader (`aarch64-unknown-uefi`), lays out an ESP
-with `EFI/BOOT/BOOTAA64.EFI` and boots it under AAVMF; the loader reads
-`mpos.elf` off the volume, applies its `R_AARCH64_RELATIVE` relocations against
-`KERNEL_VIRT_BASE`, builds four-level tables from the firmware's own memory map,
-maps the image, the direct map and the device window, exits boot services and
-branches into the higher half at **EL1**. Measured, from that run:
+Current status: **stages 1a-1f landed: the machine boots the way the x86_64 one
+does, and the kernel owns its own address space.** `cargo xtask boot-aarch64`
+builds the kernel (`aarch64-unknown-none`), the loader
+(`aarch64-unknown-uefi`), lays out an ESP with `EFI/BOOT/BOOTAA64.EFI` and boots
+it under AAVMF; the loader reads `mpos.elf` off the volume, applies its
+`R_AARCH64_RELATIVE` relocations against `KERNEL_VIRT_BASE`, builds four-level
+tables from the firmware's own memory map and branches into the higher half at
+**EL1**; then the kernel brings the frame allocator up from the record and
+rebuilds the address space from `mm::vm::kernel_mappings`, which is the same
+plan x86_64's `install` consumes. Measured, from that run:
 
 ```
-mpos-boot: kernel: 44 KiB at phys 0x44be2000, virt 0xffffffff80000000, entry 0xffffffff80007300
-mpos-boot: mapped 496 MiB of physical memory, identity and through the direct map at 0xffff800000000000
-mpos-boot: device window 0x8000000..0xc000000 mapped, Device and not executable
+mpos-boot: kernel: 64 KiB at phys 0x44bcf000, virt 0xffffffff80000000, entry 0xffffffff8000a5fc
 mpos-boot: page tables: 292 pages of them
-handoff: mpos-boot 0.1.0, record at 0x45a59020, image phys 0x44be2000 -> virt 0xffffffff80000000
-memory: 12 regions, 192 MiB the allocator may use
-page tables: TTBR0 0x44bed000, TTBR1 0x44bed000 (the loader's, read back)
-image mapped r-x / r-- / rw- at 0xffffffff80000000 (phys 0x44be2000)
+handoff: mpos-boot 0.1.0, record at 0x45a59020, image phys 0x44bcf000 -> virt 0xffffffff80000000
+memory: 14 regions, 192 MiB the allocator may use
+pmm: 5 zones, 49209 frames (192 MiB of 192 MiB usable)
+page tables: 166 frames (664 KiB), TTBR0 0x43fff000, TTBR1 0x43fff000 (the kernel's own, read back from the registers)
+plan: 7 mappings, all 63616 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)
+direct map: 0xffff800043f47000 -> 0x43f47000, rw and it stores
 device window: PL011 at 0x9000000 maps to itself, Device
+no identity map: 0x44bcf000 is unreachable, only the device window lives low
 M3_TABLES_OK
-M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 101588272 ns of counter
+M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 108479744 ns of counter
 ```
+
+The `plan:` line is the strongest claim either machine's boot makes about its
+own page tables: every mapping `mm::vm::kernel_mappings` names is walked page by
+page and each page is asked to translate to the frame and permissions the plan
+gave it - so a disagreement is a failure whichever side is wrong, and the direct
+map coming back `rw` is the same plan that gives x86_64's `rw`.
 
 The `-kernel` bring-up of 1b-1d is **deleted**, not left beside this: the
 `aarch64-unknown-none` block is `relocation-model=pic` + `-pie` like the x86_64
@@ -5223,6 +5233,7 @@ verified by the means named; none of them claims a green from compilation alone.
 | 1c | Exception vectors (`VBAR_EL1`), GICv2, the generic timer (`CNTPCT_EL0`/`CNTP_CVAL_EL0`) | **landed**: `M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz)`, three runs of three, and the check's failure branch names the timer's, the distributor's and the CPU interface's registers rather than hanging |
 | 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | **landed**: `page tables: 12 frames (48 KiB)`, `M3_TABLES_OK` (image `r-x`/`r--`/`rw-` at both its addresses, direct map written and read back, null page absent), and the clock still counts to 25 with the MMU on |
 | 1e | The aarch64 loader: `boot/src/vm/aarch64.rs` (the descriptor format, `MAIR`/`TCR`/`SCTLR`), `boot/src/main.rs`'s aarch64 `enter` and PL011, `boot/src/elf.rs` learns `EM_AARCH64`/`R_AARCH64_RELATIVE`, the kernel relinked as a higher-half PIE, `src/arch/aarch64/paging.rs` becomes a reader of the loader's tables, `cargo xtask boot-aarch64` | **landed**: AAVMF boots the real ESP image, the kernel reaches the higher half and prints `M3_TABLES_OK` (the loader's `TTBR0`/`TTBR1`, the image's W^X, the direct map written and read back, the PL011 device) and `M1_TIMER_OK: 25 interrupts in 100 ms`; the `-kernel` instrument is deleted |
+| 1f | The kernel's own tables: `src/arch/aarch64/paging.rs` regains a builder, built from `mm::vm::kernel_mappings(info, sections)` out of frames from `mm::alloc_frames`; `mm::init` runs on aarch64; the boot switches `TTBR0_EL1`/`TTBR1_EL1` onto it | **landed**: `pmm: 5 zones, 49209 frames`, `page tables: 166 frames (664 KiB)`, `plan: 7 mappings, all 63616 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)`, `no identity map: 0x44bcf000 is unreachable, only the device window lives low`, then `M3_TABLES_OK` and `M1_TIMER_OK` |
 | 2 | Contexts and user entry: `x19..x28`/`fp`/`lr`/`sp`, `q0..q31`, `eret` | a boot-time switch between two kernel tasks |
 | 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --target aarch64-unknown-none` with `sched` in |
 | 4 | Un-gate `console` and `vfs` (serial-only console first) | a ramfs root with the initramfs untarred |
@@ -5244,17 +5255,6 @@ Named gaps the port carries rather than hides, each with its home:
   the loader allocates, and `_start` had to stop being an assembly stub. What is
   left of the instrument is one entry in `AGENTS.md`'s trap table saying not to
   bring it back.
-- **The direct map is executable until the kernel installs its own tables.**
-  The loader builds both of its physical ranges - the identity map it is running
-  on and the direct map the kernel allocates through - with one call and one set
-  of flags, so both come out `rwx`. On x86_64 that is a window that closes the
-  moment the kernel installs its own tables, whose plan
-  (`mm::vm::kernel_mappings`) gives the direct map `READ | WRITE`. Stage 1e does
-  not close it, because the kernel does not install its own tables yet, so the
-  aarch64 check *asserts* `rwx` and says so in the log rather than asserting a
-  permission the loader did not set. The identity map has to stay executable in
-  any case: the loader is running on it until the branch. The follow-on stage
-  below is where the window closes.
 - **The exception level is measured rather than assumed, and it survived the
   move to the real boot path.** QEMU 11.1.1 with `-M virt` and a bare aarch64 ELF
   entered the `-kernel` image with `x0 = 0` and `sp = 0` (the banner printed
@@ -5294,35 +5294,43 @@ Named gaps the port carries rather than hides, each with its home:
   aarch64 equivalent until stage 5. The window deliberately does not start at
   zero - a null pointer that silently works is the one thing x86_64's own
   `check_arch` asserts cannot happen.
-- **The kernel still runs on the loader's tables.** The layout, the identity map
-  and the missing frame allocator are one piece now instead of two: stage 1e's
-  loader builds the address space from the firmware's own memory map and the
-  kernel *checks* it (`boot::handoff::collect` into a `BootInfo`,
-  `arch/aarch64/paging.rs::adopt` reading `TTBR0_EL1`/`TTBR1_EL1`,
-  `check_paging` translating the image, the direct map and the PL011). What is
-  not done is the other direction: `mm::vm::kernel_mappings(info, sections)` is
-  the shared plan and it has no aarch64 caller, because installing it needs
-  page-table frames and there is no frame allocator - `mm::init` is still
-  x86_64-only. The page-table *builder* that 1d had was deleted with the
-  `-kernel` path rather than left to rot: it is built from the plan when it
-  comes back, and its checks read the loader's tables in the meantime.
-- **Stage 1d's RAM window is gone; the map is the firmware's.** The 1 GiB
-  ceiling it mapped "because the code that would care had not arrived" is
-  replaced by the loader's region-by-region walk of the EFI memory map: this
-  boot reports `12 regions, 192 MiB the allocator may use` out of 248 MiB of
-  RAM. The identity map in `TTBR0` stays, and that is a decision rather than a
-  leftover: the device window lives in the low half, the loader's own tables and
-  stack are addressed physically while it runs, and the alias the kernel
-  executes at is in `TTBR1` - so the low half is not the kernel's to drop, it is
-  where the machine's devices are.
+- **The kernel's address space is its own now, and the window that was open
+  across 1e is closed.** Two things went together and are worth keeping as one
+  measurement: the loader builds its identity map and its direct map with a
+  single call and a single set of flags, so on the loader's tables both come out
+  `rwx` - a window x86_64 closes the moment its kernel installs its own tables
+  and stage 1e could not. Stage 1f closes it: the plan gives the direct map
+  `READ | WRITE`, the boot log prints `direct map ... rw and it stores`, and the
+  check walks every one of the 63616 pages the plan names to say so. What the
+  loader's tables are still needed for is the length of the jump: the kernel
+  cannot build its own until the frame allocator is up, and the frame allocator
+  needs the direct map.
+- **The device window is in the low half, and that is a collision waiting to
+  happen.** The kernel maps 64 MiB from `0x0800_0000` - PL011 and GIC - at the
+  addresses the devices are at, in `TTBR0`, which is the half a process will
+  own. x86_64 puts its device window in the *kernel* half (`mm::MMIO_BASE`, just
+  below the image) so that a process cannot collide with it; aarch64 gets the
+  same arrangement when `mm::map_mmio` grows an arm here in stage 5. Until then
+  there is no user address space to collide with, which is why this is a named
+  gap and not a blocker - but it is the reason the low half is not simply
+  "dropped": what lives there is the machine's devices.
+- **Stage 1d's RAM window is gone; the map is the firmware's and the plan's.**
+  The 1 GiB ceiling it mapped "because the code that would care had not arrived"
+  is replaced twice over: stage 1e's loader walks the EFI memory map region by
+  region, and stage 1f has the kernel rebuild the address space from that record
+  by way of `mm::vm::kernel_mappings`. This boot reports `14 regions, 192 MiB
+  the allocator may use` out of 248 MiB of RAM, `pmm: 5 zones, 49209 frames`.
+  The floor the whole thing stands on is `mm::init`, which is machine-neutral
+  and simply had no aarch64 caller until 1f gave it one.
 - **`hal` is x86_64-only until its traits exist on aarch64.** The forwards at
   the bottom of `hal/mod.rs` name all six concern traits, so the module cannot
-  compile for a machine that implements fewer. aarch64's `interrupts.rs` and
-  `timer.rs` are what a `Cpu`/`Interrupts` impl would be written over, and
-  `Contexts` arrives with stage 2 - but `Paging` waits for the follow-on below,
-  because the trait's `install(info, sections)` is the kernel building its own
-  tables, which is the thing that has not happened yet. The gate goes with the
-  last of the six.
+  compile for a machine that implements fewer. Two of `Paging`'s fifteen methods
+  exist here now (`install`, `translate`), and what is missing is not the
+  table-building part: it is `AddressSpaceOps` and everything that needs a
+  *user* address space - `active_root`, `switch_to_root`, `user_accessible`,
+  `is_cow_page`, `write_user_u32` - which arrive with stages 2 and 6. `Contexts`
+  arrives with stage 2, and `Cpu`/`Interrupts` are what `vectors.rs`/`gic.rs`/
+  `timer.rs` are written over. The gate goes with the last of the six.
 - **No ACPI consumer exists to reuse.** `virt` + AAVMF passes a *device tree*,
   so device discovery is new DTB-parsing code in stage 5, not a port of an
   existing table walk.
