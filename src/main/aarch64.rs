@@ -1,65 +1,50 @@
-//! The aarch64 kernel image: the bring-up entry.
+//! The aarch64 kernel image: boot entry and panic handler.
 //!
-//! The x86_64 half of this file's job is done by `mpos-boot`, which has already
-//! built page tables, mapped the image and read the kernel off the ESP by the
-//! time `_start` runs. aarch64 has no loader yet - stage 1e adds one - so this
-//! is the *bring-up* path `PLAN.md` §9.1 names: QEMU's `-kernel` places the ELF
-//! in RAM and jumps to `_start` with the MMU off and the firmware's device tree
-//! in `x0`. It is an instrument for proving the toolchain, the linker script,
-//! the gate list and the machine body agree, not the shape the port ships with;
-//! its boot stack is the linker script's rather than one the loader mapped.
+//! The x86_64 half of this file's job is done by `mpos-boot`, and since stage 1e
+//! so is this one's: the loader reads the kernel off the ESP, applies its
+//! relocations against `KERNEL_VIRT_BASE`, builds the page tables, exits boot
+//! services and branches here with the machine already running in the higher
+//! half. So there is no entry stub and no stack to set up — the one interface is
+//! the register the record arrives in, exactly as on x86_64 (`RDI` there, `x0`
+//! here), and this function's own prologue is the first thing to use the stack
+//! the loader mapped.
 //!
-//! What the two paths do share is the interface: the ELF's entry point takes
-//! its one argument in a register, and on x86_64 that register holds the
-//! handoff record. `x0` is that register here, so stage 1e changes what the
-//! register carries and nothing about this file.
+//! What this file had until stage 1e was a `global_asm!` `_start` that loaded
+//! `sp` from a `__stack_top` symbol the linker script cut out of the image, and
+//! a `.bss` walk beneath it. Both belonged to the `-kernel` bring-up: QEMU
+//! placed the ELF at a fixed physical address and jumped in with `sp = 0`, so
+//! the image had to carry its own stack and could not assume its `NOBITS` tail
+//! came back zeroed. The loader does both of those now — `vm::load` zeroes every
+//! segment's memory tail and `main.rs` allocates and maps the boot stack — which
+//! is why x86_64's entry has neither, and why this one no longer does.
 
-use core::arch::global_asm;
 use core::panic::PanicInfo;
 
-// The entry the ELF names - `ENTRY(_start)` in the linker script, and where
-// QEMU's `-kernel` jumps. Written in assembly because the one thing it must do
-// is put a stack under the frame pointer, which a Rust prologue would itself
-// need a stack for.
-//
-// `x0` carries the firmware's hand-off pointer and is deliberately untouched:
-// the branch below is a tail call, so the callee sees the register exactly as
-// the entry did.
-global_asm!(
-    ".section .text._start",
-    ".globl _start",
-    "_start:",
-    "  ldr x1, =__stack_top",
-    "  mov sp, x1",
-    "  b {entry}",
-    entry = sym rust_entry,
-);
+use mpos::boot::handoff::Handoff;
 
-/// What `_start` branches to, once there is a stack.
-extern "C" fn rust_entry(handoff: usize) -> ! {
-    zero_bss();
-    mpos::arch::boot(handoff)
-}
-
-/// Zero `.bss` before the first Rust static is read.
+/// `mpos-boot` branches here at `KERNEL_VIRT_BASE + entry`, at EL1 with the MMU
+/// already on and the machine's own tables installed, on a boot stack the loader
+/// mapped through the direct map, with `x0` holding the [`Handoff`] record it
+/// wrote.
 ///
-/// A `-kernel` boot loads the ELF's `PT_LOAD` segments; whether the `NOBITS`
-/// tail comes back zeroed is the loader's business and not something to build
-/// on, and a static that should read zero reading whatever was in RAM is a bug
-/// that only shows on the second boot. The linker script keeps the boot stack
-/// out of `.bss` precisely so that this walk cannot overwrite the frames this
-/// function is running on.
-fn zero_bss() {
-    unsafe extern "C" {
-        static __bss_start: u8;
-        static __bss_end: u8;
-    }
-    let start = &raw const __bss_start as usize;
-    let end = &raw const __bss_end as usize;
-    // SAFETY: the linker script defines these as the bounds of one `NOLOAD`
-    // section inside the image's own writable range, and nothing else in the
-    // boot touches it before this runs.
-    unsafe { core::ptr::write_bytes(start as *mut u8, 0, end - start) };
+/// The register is the whole interface, and the record has to be checked rather
+/// than trusted: nothing in the machine enforces that `x0` holds what this
+/// function was compiled to expect, so `boot::handoff::collect` asserts the
+/// magic before anything reads a field. That check is the only reason this
+/// pointer can be dereferenced at all — the same contract x86_64's `_start`
+/// carries, spelled in a different register.
+///
+/// # Safety
+///
+/// The caller is the loader's branch to this symbol, with `x0` holding the
+/// record it wrote and every address that record names mapped for as long as the
+/// kernel runs. Nothing chooses this call from Rust.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _start(handoff: *const Handoff) -> ! {
+    // SAFETY: the caller's contract, restated in `arch::aarch64::boot`'s own
+    // `# Safety`: the branch into this symbol carried the record the loader
+    // wrote, and the checks there read it under exactly that assumption.
+    unsafe { mpos::arch::boot(handoff) }
 }
 
 /// The panic path: one line on the console, then stop.

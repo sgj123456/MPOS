@@ -5,6 +5,7 @@
 //! for the steps that need it, and everything root writes is handed back to
 //! that user afterwards.
 
+mod aarch64;
 mod config;
 mod depgraph;
 mod disk;
@@ -80,6 +81,10 @@ enum Commands {
     /// Measure the kernel's module graph and check it against the ratchet
     /// (PLAN.md §11.2 Step G), so the cycle count cannot grow back
     Depgraph,
+    /// Build the aarch64 kernel and its UEFI loader, lay out an ESP and boot it
+    /// under AAVMF. The second machine's own boot path, and stage 1e's
+    /// instrument: it reads the verdict off the PL011 (`PLAN.md` §9.1)
+    BootAarch64,
     /// Remove the build and target directories
     Clean,
 }
@@ -95,6 +100,7 @@ impl Commands {
             Commands::All => "all",
             Commands::Test => "test",
             Commands::Depgraph => "depgraph",
+            Commands::BootAarch64 => "boot-aarch64",
             Commands::Clean => "clean",
         }
     }
@@ -174,7 +180,11 @@ fn main() -> Result<()> {
     };
 
     let needs_root = match cli.command {
-        Commands::Build | Commands::Disk | Commands::Test | Commands::Depgraph => false,
+        Commands::Build
+        | Commands::Disk
+        | Commands::Test
+        | Commands::Depgraph
+        | Commands::BootAarch64 => false,
         Commands::Clean => utils::clean_needs_root(&build_dir),
         Commands::Initramfs | Commands::Rootfs | Commands::All => true,
         Commands::Run => run_needs_build,
@@ -317,6 +327,10 @@ fn dispatch(
         Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build, mode),
         Commands::Test => selftest::run_tests(build_dir, profile, tests),
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
+        // Builds both binaries itself rather than through `build_kernel`: that
+        // one is the x86_64 kernel and the x86_64 loader, and this machine's
+        // pair is a different target for each.
+        Commands::BootAarch64 => aarch64::run(build_dir, profile),
         Commands::Clean => utils::clean(build_dir),
     }
 }

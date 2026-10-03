@@ -26,20 +26,23 @@ rustflags = [
     "-C", "link-arg=-zmax-page-size=0x1000",
 ]
 
+# The aarch64 kernel, built the way the x86_64 one is and for the same reason:
+# `mpos-boot` reads it as a static PIE, so `pic` and `-pie` for the relocations
+# and `-ztext` to refuse any of them landing in a read-only segment. The two
+# machine blocks differ in the script they name and in nothing else.
+#
 # There used to be a `[target.aarch64-unknown-none]` block here naming a script
 # that had never existed, so it described a target that could not link and was
-# removed (PLAN.md §9.1, V-8). It is back, next to the script it names: the
-# machine body and the gate list it plugs into are `src/arch/aarch64/`'s, and
-# `cargo build --target aarch64-unknown-none` links an ELF.
-#
-# The relocation model is `static`, not the x86_64 block's `pic`: the image is
-# linked at the fixed address the bring-up path loads it at, and only becomes
-# relocatable when stage 1e's loader places the segments itself - at which point
-# this block grows `-pie` and `-ztext` the way the x86_64 one has them.
+# removed (PLAN.md §9.1, V-8). It came back at stage 1a with the script, and at
+# stage 1e it stopped being `relocation-model=static`: that model belonged to
+# the `-kernel` bring-up, which linked the image at the fixed address QEMU
+# loaded it at. The loader places the segments itself now, so the image has to
+# be relocatable and this block matches the x86_64 one.
 [target.aarch64-unknown-none]
 rustflags = [
-    "-C", "relocation-model=static",
+    "-C", "relocation-model=pic",
     "-C", "link-arg=--script=src/arch/aarch64/linker.ld",
+    "-C", "link-arg=-pie",
     "-C", "link-arg=-ztext",
     "-C", "link-arg=-zmax-page-size=0x1000",
 ]

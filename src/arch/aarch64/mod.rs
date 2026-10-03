@@ -3,16 +3,19 @@
 //! Everything in here may touch aarch64 specifics; nothing outside `arch::` may.
 //!
 //! This is the second machine (`PLAN.md` §9.1). Stage 1a landed the build
-//! plumbing and a body that links; stage 1b is the one that *speaks* - a PL011
-//! writer and the boot banner - which is what proves the toolchain, the linker
-//! script, the gate list and QEMU's wiring all agree rather than each merely
-//! compiling.
+//! plumbing and a body that links; 1b the PL011 and the entry; 1c the exception
+//! vectors, a GICv2 and the generic timer; 1d a page-table builder for the
+//! `-kernel` bring-up; and **1e replaced that bring-up with the real boot path**:
+//! `mpos-boot` now builds the tables, relocates the image into the higher half
+//! and branches here with the handoff record in `x0`, so this module consumes
+//! that record instead of inventing a layout, and `paging.rs` walks the loader's
+//! tables instead of building its own.
 //!
-//! What is still absent, and where it lands: the exception vectors and the GIC
-//! (1c), the page tables (1d), the loader's arm (1e). Everything above the seam
-//! reaches those through `crate::hal`, which this machine implements trait by
-//! trait as its stages land - which is also why `hal` itself is still x86_64-only
-//! (`src/lib.rs`'s ledger).
+//! What is still absent, and where it lands: contexts and user entry (2), then
+//! `sched` (3), `console`/`vfs` (4) and the drivers (5). Everything above the
+//! seam reaches those through `crate::hal`, which this machine implements trait
+//! by trait as its stages land - which is also why `hal` itself is still
+//! x86_64-only (`src/lib.rs`'s ledger).
 
 pub(crate) mod critical;
 pub(crate) mod gic;
@@ -23,7 +26,11 @@ pub(crate) mod vectors;
 
 use core::fmt;
 
-use crate::mm::vm::{KernelSections, MapFlags};
+use crate::boot::BootInfo;
+use crate::boot::handoff::Handoff;
+use crate::mm::vm::{KernelSections, MapFlags, Mapping};
+
+use paging::Memory;
 
 /// Where the linker script put each part of the kernel image, as virtual
 /// addresses.
@@ -33,6 +40,13 @@ use crate::mm::vm::{KernelSections, MapFlags};
 /// anything know their names. The linker script spells these symbols
 /// deliberately name-for-name like the x86_64 one so the two bodies stay
 /// comparable.
+///
+/// The addresses that come back are the *running* ones, not the linked ones. The
+/// script has no base address - the image is linked at zero and made a static
+/// PIE - so every reference the linker emitted for one of these symbols is a
+/// self-relative fixup, and the loader applied them against `KERNEL_VIRT_BASE`
+/// before it branched here. That is what makes `text` begin at
+/// `BootInfo::kernel_virt_base` plus an offset rather than at the offset alone.
 pub fn kernel_sections() -> KernelSections {
     // These symbols are addresses, not objects - there is no `u8` behind them to
     // read, so take their address and never dereference it.
@@ -48,7 +62,7 @@ pub fn kernel_sections() -> KernelSections {
     KernelSections {
         text: (&raw const __text_start as usize)..(&raw const __text_end as usize),
         rodata: (&raw const __rodata_start as usize)..(&raw const __rodata_end as usize),
-        // Data runs to the end of the image: `.bss` and the boot stack follow it
+        // Data runs to the end of the image: `.dynamic` and `.bss` follow it
         // with no gap, and all three must be writable.
         data: (&raw const __data_start as usize)..(&raw const kernel_end as usize),
     }
@@ -65,24 +79,36 @@ pub fn print_args(args: fmt::Arguments) {
     let _ = pl011::Writer.write_fmt(args);
 }
 
-/// Run the machine from the entry stub's hand-off register. Never returns.
+/// Run the machine from the record `mpos-boot` left in `x0`. Never returns.
 ///
-/// `x0` is the register the interface is defined in: once stage 1e's loader
-/// exists it will hold the handoff record `boot/src/handoff.rs` writes, which is
-/// the same record `main.rs` receives in `RDI` on x86_64. That the *register* is
-/// the whole interface is the seam `src/boot/mod.rs` describes; which record it
-/// carries is the stage.
+/// The register is the whole interface and the record is checked rather than
+/// trusted: nothing in the machine enforces that `x0` holds what this function
+/// was compiled to expect, and [`crate::boot::handoff::collect`] asserts the
+/// magic before any field is read.
 ///
-/// On the `-kernel` bring-up path it carries zero, which is measured rather
-/// than assumed: QEMU 11.1.1 with `-M virt` and a bare aarch64 ELF starts the
-/// image with `x0 = 0` and `sp = 0` (QEMU's own `-d cpu` log and this banner
-/// agree). A device tree is not handed over on this path - AAVMF will pass one
-/// through the UEFI configuration table at stage 1e, and stage 5's parser reads
-/// it from there. Nothing here depends on the register, which is why the port is
-/// not weakened by the difference.
-pub fn boot(handoff: usize) -> ! {
+/// By the time this runs the machine is already the kernel's: the loader built
+/// the page tables from the firmware's memory map, mapped the image at
+/// `KERNEL_VIRT_BASE`, applied the relocations and switched `TTBR0_EL1` and
+/// `TTBR1_EL1` onto them. So there is no page-table step here - what is left is
+/// to check that what the loader built says what the plan says, which is what
+/// [`check_paging`] does.
+///
+/// # Safety
+///
+/// The caller is the loader's branch to `_start`, with `x0` holding the record
+/// it wrote and every address that record names mapped for as long as the kernel
+/// runs. Nothing chooses this call from Rust, and the pointer is read before it
+/// can be validated, because the magic check inside `collect` happens *after*
+/// the read: its validity is the caller's contract and not something this
+/// function can establish.
+pub unsafe fn boot(handoff: *const Handoff) -> ! {
     pl011::init();
-    banner(handoff);
+
+    // SAFETY: the loader's contract - `handoff` points at the record it wrote,
+    // still mapped at the address it put it, and every physical range that
+    // record names is reachable through the direct map it chose.
+    let info = unsafe { crate::boot::handoff::collect(handoff) };
+    banner(handoff as usize, &info);
 
     // The clock this machine's kernel wants is the EL1 physical timer, and the
     // vector table and GIC are configured for EL1 as well; a machine that
@@ -101,96 +127,159 @@ pub fn boot(handoff: usize) -> ! {
     }
 
     init_interrupts();
-    // The tables go in before the clock is opened, so that the tick the check
-    // measures is one taken with the MMU on: the GIC's registers are reached
-    // through the device mapping from then on, and a window that still counts to
-    // 25 is a window where translation, attributes and interrupts all agree.
-    check_paging();
+    // The tables are read before the clock is opened, so that the tick the check
+    // measures is one taken through tables this kernel has already looked at:
+    // the GIC's registers are reached through the device window from here on,
+    // and a window that still counts to 25 is a window where translation,
+    // attributes and interrupts all agree.
+    check_paging(&info);
     check_timer();
     halt()
 }
 
-/// Stage 1d's evidence: the kernel builds its own tables, switches the machine
-/// onto them, and the mappings the hardware now uses are the ones the plan
-/// asked for.
+/// Stage 1e's evidence: the tables the machine is running on are the loader's,
+/// and they say what the plan says.
 ///
-/// The order of the checks is the order of the claims. That execution continued
-/// at all is the first and largest one - a table that omits the page the CPU is
-/// reading would have stopped the machine at the `msr sctlr_el1`, and this
-/// function would not be running. Everything after it is about *which* mappings
-/// exist: the image's sections with the permissions the plan gave them, at both
-/// the address the kernel is using and the higher-half alias; the direct map
-/// writable and usable; and the null page absent.
-fn check_paging() {
+/// The order of the checks is the order of the claims. That this function is
+/// running at all is the first and largest one - the image's entry point was
+/// reached through the higher-half alias, so the loader's relocation, its
+/// mapping of the alias and its switch of both base registers all worked, and a
+/// failure of any of the three would have been a machine that never arrived.
+/// Everything after it is about *which* mappings exist.
+fn check_paging(info: &BootInfo) {
     use fmt::Write;
 
+    // SAFETY: the machine is running on the loader's tables - that is what
+    // reaching this function means - and it never stops running on them.
+    unsafe { paging::adopt() };
+    let (ttbr0, ttbr1) = paging::roots();
     let mut out = pl011::Writer;
-    let sections = kernel_sections();
-    // SAFETY: the bring-up contract. This is the first thing in the kernel to
-    // touch the tables, it runs once, and the machine is executing at the
-    // physical address the image was loaded at.
-    let tables = unsafe { paging::install(&sections) };
     let _ = writeln!(
         out,
-        "page tables: {tables} frames ({} KiB), image at {:#x} aliased to {:#x}",
-        tables * 4096 / 1024,
-        paging::IMAGE_LOAD_BASE,
-        paging::KERNEL_VIRT_BASE,
+        "page tables: TTBR0 {ttbr0:#x}, TTBR1 {ttbr1:#x} (the loader's, read back)"
     );
 
     if !paging::enabled() {
-        let _ = writeln!(out, "M3_TABLES_FAILED: SCTLR_EL1.M is clear after install");
+        let _ = writeln!(out, "M3_TABLES_FAILED: SCTLR_EL1.M is clear");
         halt();
     }
 
-    // W^X across the whole image, at both addresses it is mapped at. The low
-    // one is where the kernel is *running*: an image mapped writable there is an
-    // image a stray store can rewrite, whatever the alias says.
-    for (name, range, expect) in [
+    let sections = kernel_sections();
+    // What the loader added to a linked address to reach the address the kernel
+    // is running at. The loader chose both ends and put them in the record, so
+    // this is arithmetic over the record rather than a constant.
+    let offset = info.kernel_virt_base - info.kernel_phys_base;
+
+    // W^X across the whole image, at the address it is *running* at. The
+    // identity copy is not checked: the kernel does not execute there and the
+    // loader maps it writable and executable on purpose, because it has no
+    // symbols for the sections it is copying.
+    //
+    // Each section's expectation is spelled as the `Mapping` the loader built
+    // for it - the plan's own type, `mm::vm`'s - page-aligned at both ends
+    // exactly as `vm::map_kernel_image` aligns it, rather than as a hand-rolled
+    // span of page arithmetic. That is what makes the walk below a walk of a
+    // mapping instead of a guess about how one would have been built.
+    let page_down = |at: usize| at & !(4096 - 1);
+    let page_up = |at: usize| (at + 4095) & !4095;
+    for (name, range, flags) in [
         ("text", &sections.text, MapFlags::READ | MapFlags::EXEC),
         ("rodata", &sections.rodata, MapFlags::READ),
         ("data", &sections.data, MapFlags::READ | MapFlags::WRITE),
     ] {
-        // Page-aligned on both ends: `__text_start` is not a page boundary (the
-        // ELF headers share its first page), and the mapping that covers it is.
-        let first = range.start & !(4096 - 1);
-        let last = (range.end + 4095) & !(4095);
-        let mut page = first;
-        while page < last {
-            for (where_, base) in [
-                ("identity", 0usize),
-                ("alias", paging::KERNEL_VIRT_BASE - paging::IMAGE_LOAD_BASE),
-            ] {
-                let at = page + base;
-                let (phys, flags) = match paging::translate(at) {
-                    Some(answer) => answer,
-                    None => {
-                        let _ = writeln!(out, "M3_TABLES_FAILED: {name} {where_} {at:#x} unmapped");
-                        halt();
-                    }
-                };
-                if flags != expect || phys != page {
+        let start = page_down(range.start);
+        let mapping = Mapping {
+            virt: start,
+            phys: start - offset,
+            length: page_up(range.end) - start,
+            flags,
+        };
+        // The loop is page by page, which is only a description of `mapping` if
+        // the mapping is page-granular. The plan's own predicate, and the same
+        // invariant x86_64's `paging::install` asserts over its window.
+        assert!(
+            mapping.is_page_granular(),
+            "the {name} mapping is not page-granular: {mapping:?}"
+        );
+
+        let mut page = mapping.virt;
+        while page < mapping.end() {
+            let want = mapping.phys_of(page);
+            match paging::translate(page) {
+                Some((phys, got, Memory::Normal)) if got == flags && phys == want => {}
+                Some((phys, got, memory)) => {
                     let _ = writeln!(
                         out,
-                        "M3_TABLES_FAILED: {name} {where_} at {at:#x} is {flags:?} -> {phys:#x}, \
-                         expected {expect:?} -> {page:#x}"
+                        "M3_TABLES_FAILED: {name} at {page:#x} is {got:?} {memory:?} -> {phys:#x}, \
+                         expected {flags:?} Normal -> {want:#x}"
                     );
+                    halt();
+                }
+                None => {
+                    let _ = writeln!(out, "M3_TABLES_FAILED: {name} at {page:#x} is unmapped");
                     halt();
                 }
             }
             page += 4096;
         }
     }
-    let _ = writeln!(out, "image mapped r-x / r-- / rw- at both addresses");
+    let _ = writeln!(
+        out,
+        "image mapped r-x / r-- / rw- at {:#x} (phys {:#x})",
+        info.kernel_virt_base, info.kernel_phys_base
+    );
 
-    // The direct map: one frame the kernel knows is RAM, written and read back
-    // through it. Chosen well above the image and well below the top of the
-    // window this stage maps, so it is neither the kernel's own memory nor
-    // something the firmware put there.
-    let scratch_phys = paging::RAM_BASE + 0x0100_0000;
-    let scratch = paging::HHDM_OFFSET + scratch_phys;
-    let (back, flags) = match paging::translate(scratch) {
-        Some(answer) => answer,
+    // The direct map: a frame out of the record's own memory map, written and
+    // read back through it. Taken from the first region the allocator may use
+    // rather than from a constant, because the constants this stage used to
+    // carry described the bring-up machine and the record describes the real
+    // one. The top page of the region is chosen so the write is well clear of
+    // the loader's own allocations, which the map reports as reclaimable rather
+    // than usable.
+    let Some(scratch_phys) = info
+        .regions()
+        .iter()
+        .find(|r| r.kind.is_allocatable() && r.length >= 2 * 4096)
+        .map(|r| r.base + r.length - 4096)
+    else {
+        let _ = writeln!(out, "M3_TABLES_FAILED: the record names no usable RAM");
+        halt();
+    };
+    let scratch = info.phys_to_virt(scratch_phys);
+    // `READ | WRITE | EXEC`, and the `EXEC` is a named gap rather than an
+    // oversight. The loader maps both of its physical ranges - the identity map
+    // it is running on and the direct map - with one call and one set of flags
+    // (`vm::map_physical_memory`), so both come out executable; on x86_64 that
+    // is a window that closes the moment the kernel installs its own tables,
+    // whose plan (`mm::vm::kernel_mappings`) gives the direct map `READ | WRITE`
+    // and nothing else. This machine has not installed its own tables yet, so
+    // here the window is still open, and the check says so instead of asserting
+    // a permission the loader did not set. The identity map has to stay
+    // executable in any case: the loader is *running* on it until the branch.
+    // `PLAN.md` §9.1 carries this as the follow-on stage's inheritance.
+    match paging::translate(scratch) {
+        Some((phys, flags, Memory::Normal))
+            if phys == scratch_phys
+                && flags == MapFlags::READ | MapFlags::WRITE | MapFlags::EXEC =>
+        {
+            // SAFETY: `scratch` translates to `scratch_phys`, a page the record
+            // calls usable - that is, memory nothing has been given and the
+            // kernel's allocator has not started. Nothing else has it.
+            unsafe {
+                core::ptr::write_volatile(scratch as *mut u8, 0xa5);
+                if core::ptr::read_volatile(scratch as *const u8) != 0xa5 {
+                    let _ = writeln!(out, "M3_TABLES_FAILED: the direct map did not store 0xa5");
+                    halt();
+                }
+            }
+        }
+        Some((phys, flags, memory)) => {
+            let _ = writeln!(
+                out,
+                "M3_TABLES_FAILED: the direct map at {scratch:#x} is {flags:?} {memory:?} -> {phys:#x}"
+            );
+            halt();
+        }
         None => {
             let _ = writeln!(
                 out,
@@ -198,27 +287,36 @@ fn check_paging() {
             );
             halt();
         }
-    };
-    if back != scratch_phys || flags != MapFlags::READ | MapFlags::WRITE {
-        let _ = writeln!(
-            out,
-            "M3_TABLES_FAILED: the direct map at {scratch:#x} is {flags:?} -> {back:#x}"
-        );
-        halt();
     }
-    // SAFETY: `scratch` translates to `scratch_phys`, a frame of RAM inside the
-    // window this stage maps and outside the image; nothing else in the kernel
-    // has been given it.
-    unsafe {
-        core::ptr::write_volatile(scratch as *mut u8, 0xa5);
-        if core::ptr::read_volatile(scratch as *const u8) != 0xa5 {
-            let _ = writeln!(out, "M3_TABLES_FAILED: the direct map did not store 0xa5");
+    let _ = writeln!(
+        out,
+        "direct map: {scratch:#x} -> {scratch_phys:#x}, writable (rwx: the loader's \
+         window, see the check's comment)"
+    );
+
+    // The device window, which is the one range that has to be mapped as device
+    // rather than as memory: a PL011 mapped Normal lets the core reorder the
+    // stores that are this console's characters. The check translates the
+    // console's own registers rather than a constant of this file's, so what it
+    // proves is that the wire the banner came out of is device memory.
+    match paging::translate(pl011::BASE) {
+        Some((phys, flags, Memory::Device))
+            if phys == pl011::BASE && flags == MapFlags::READ | MapFlags::WRITE => {}
+        other => {
+            let _ = writeln!(
+                out,
+                "M3_TABLES_FAILED: the PL011 at {:#x} translates to {other:?}, \
+                 expected {:#x} as READ|WRITE Device",
+                pl011::BASE,
+                pl011::BASE
+            );
             halt();
         }
     }
     let _ = writeln!(
         out,
-        "direct map: {scratch:#x} -> {scratch_phys:#x}, writable"
+        "device window: PL011 at {:#x} maps to itself, Device",
+        pl011::BASE
     );
 
     if paging::translate(0).is_some() {
@@ -343,13 +441,17 @@ fn check_timer() {
     );
 }
 
-/// Say who this is and what it was given, then get out of the way.
+/// Say who this is, what it was handed, and get out of the way.
 ///
 /// Deliberately the same shape as the x86_64 banner (`src/main/x86_64.rs`), so
 /// the two machines' first lines are comparable rather than merely both
-/// present - and so that a broken linker script shows up as a wrong number here
-/// rather than as a fault somewhere later.
-fn banner(handoff: usize) {
+/// present - and so that a loader which relocated the image to the wrong base,
+/// or handed over the wrong memory map, shows up as a wrong number here rather
+/// than as a fault somewhere later. Every line below comes out of the record
+/// rather than out of a constant, which is the whole difference from stage 1d's
+/// banner: that one could only say what this file believed, and this one says
+/// what the loader did.
+fn banner(record: usize, info: &BootInfo) {
     use fmt::Write;
 
     let sections = kernel_sections();
@@ -359,7 +461,7 @@ fn banner(handoff: usize) {
     let _ = writeln!(out, "mpos {} (aarch64) booting", env!("CARGO_PKG_VERSION"));
     // The address is fixed for this one machine and named as such; the device
     // tree is what stage 5 reads instead, and it comes from the UEFI
-    // configuration table rather than from `x0` (see `boot`).
+    // configuration table.
     let _ = writeln!(out, "console: PL011 at {:#x}", pl011::BASE);
     let _ = writeln!(
         out,
@@ -369,14 +471,31 @@ fn banner(handoff: usize) {
         (sections.data.end - sections.data.start) / 1024,
         image / 1024,
     );
-    // Printed because it *is* the machine's contract with its loader, and this
-    // stage is the one that establishes what the `-kernel` path actually puts
-    // there rather than what it is supposed to.
-    let _ = writeln!(out, "x0 at entry: {handoff:#018x}");
+    let _ = writeln!(
+        out,
+        "handoff: {} {}, record at {record:#x}, image phys {:#x} -> virt {:#x}, \
+         direct map at {:#x}",
+        info.bootloader_name,
+        info.bootloader_version,
+        info.kernel_phys_base,
+        info.kernel_virt_base,
+        info.hhdm_offset,
+    );
+    let _ = writeln!(
+        out,
+        "memory: {} regions, {} MiB the allocator may use",
+        info.region_count,
+        info.allocatable_bytes() / (1024 * 1024),
+    );
+    // The command line is the one field whose bytes the loader had to read out
+    // of a file, so printing it is how a wrong one - an empty file, a truncated
+    // copy - is visible at boot rather than at the first program that parses it.
+    let _ = writeln!(out, "cmdline: {:?}", info.cmdline);
     let _ = writeln!(out, "exception level: EL{}", current_el());
     let _ = writeln!(
         out,
-        "aarch64: bring-up, stage 1d (the kernel's own page tables; MMU off until they go in)"
+        "aarch64: loaded by mpos-boot, running on its tables in the higher half \
+         (stages 1a-1e)"
     );
 }
 

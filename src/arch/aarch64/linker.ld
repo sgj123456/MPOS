@@ -1,14 +1,19 @@
 /*
- * The aarch64 kernel image.
+ * Position-independent kernel image on aarch64, as `mpos-boot` requires.
  *
- * Unlike the x86_64 script this one names an address. The bring-up path (stage
- * 1b) enters the image with the MMU off, executing at whatever address the
- * firmware or `-kernel` placed it at, so the link address has to be the load
- * address: QEMU virt's RAM starts at 0x4000_0000 and the conventional kernel
- * offset leaves the first half-megabyte to firmware. Stage 1d replaces the
- * fixed address with the higher-half layout once the kernel installs its own
- * tables (TTBR1), and stage 1e's loader places the segments itself, exactly as
- * the x86_64 loader does - at which point this base moves above the direct map.
+ * The same shape as the x86_64 script, and deliberately so: there is no
+ * absolute base address, the loader picks where the segments land, maps them at
+ * KERNEL_VIRT_BASE and applies the R_AARCH64_RELATIVE relocations before
+ * branching to `_start`. That is what makes the image's own absolute addresses
+ * - the ones a `static`'s address becomes - point into the higher half, which is
+ * the whole reason the loader can drop the low identity map afterwards.
+ *
+ * There used to be an address here (`0x4008_0000`, QEMU virt's conventional
+ * kernel offset) and a `.stack` section beside it. Both belonged to the
+ * `-kernel` bring-up of stages 1b-1d, which entered the image with the MMU off
+ * and ran on a stack the script cut out of the image. Stage 1e deletes that
+ * path: the loader builds the page tables, allocates the stack and branches
+ * here, so the image is relocatable and the stack is not the image's.
  *
  * The section symbols are the x86_64 script's, name for name. `kernel_sections`
  * in `src/arch/aarch64/mod.rs` reads them the way its x86_64 twin reads its
@@ -18,57 +23,66 @@
 
 ENTRY(_start)
 
+PHDRS
+{
+    headers PT_PHDR PHDRS;
+    text    PT_LOAD FILEHDR PHDRS;
+    rodata  PT_LOAD;
+    data    PT_LOAD;
+    dynamic PT_DYNAMIC;
+}
+
 SECTIONS
 {
-    /* Room for the ELF headers before the first section, so `__text_start` is
-       really the first byte of code and not the program header table. */
-    . = 0x40080000 + SIZEOF_HEADERS;
+    . = SIZEOF_HEADERS;
     executable_start = . - SIZEOF_HEADERS;
 
-    __text_start = .;
+    /* Section boundaries, so the kernel can map its own image with W^X once it
+       installs its own page tables. End symbols come after the page alignment,
+       which makes every range page-granular. */
+
     .text : {
+        __text_start = .;
         *(.text .text.*)
-    }
-    . = ALIGN(4096);
+    } :text
+
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
     __text_end = .;
 
-    __rodata_start = .;
     .rodata : {
+        __rodata_start = .;
         *(.rodata .rodata.*)
-    }
-    . = ALIGN(4096);
+    } :rodata
+
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
     __rodata_end = .;
 
-    __data_start = .;
     .data : {
+        __data_start = .;
         *(.data .data.*)
-    }
-    . = ALIGN(4096);
-    __bss_start = .;
+    } :data
+
+    .dynamic : {
+        *(.dynamic)
+    } :data :dynamic
+
     .bss (NOLOAD) : {
+        __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
-    }
-    . = ALIGN(4096);
-    __bss_end = .;
-
-    /* The boot stack, in a section of its own rather than in `.bss`: the entry
-       zeroes `.bss` and is already running on this stack when it does, so the
-       two ranges must not overlap. It is `.bss`-like (NOLOAD) and part of the
-       writable image the kernel maps. */
-    .stack (NOLOAD) : ALIGN(16) {
-        __stack_bottom = .;
-        . += 64 * 1024;
-        __stack_top = .;
-    }
+        __bss_end = .;
+        /* Round the image up to a whole number of pages. The kernel maps
+           __data_start..kernel_end as one range, so if kernel_end fell inside a
+           page the mapping would reach past the memory the loader reserved. */
+        . = ALIGN(CONSTANT(MAXPAGESIZE));
+    } :data
 
     kernel_end = .;
 
     /DISCARD/ : {
         *(.eh_frame*)
         *(.note .note.*)
-        *(.comment)
         *(.interp)
-        *(.dynamic)
+        *(.comment)
     }
 }

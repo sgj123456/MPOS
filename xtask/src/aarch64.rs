@@ -1,0 +1,331 @@
+//! `cargo xtask boot-aarch64`: the second machine's boot path, end to end.
+//!
+//! This is stage 1e's instrument and it is deliberately narrow. The x86_64
+//! commands build a root filesystem, an initramfs, a partitioned disk image and
+//! a test ESP; the aarch64 machine cannot use any of that yet - nothing above
+//! `arch` is ported, so the kernel halts after its own machine checks and never
+//! mounts a filesystem (`PLAN.md` §9.1's stage table). What this command does is
+//! the smallest thing that proves the *boot path*: build the two binaries, lay
+//! out the ESP a UEFI firmware expects, and boot AAVMF with it.
+//!
+//! What it must not be is a shortcut. The stages 1b-1d bring-up loaded the
+//! kernel ELF with QEMU's `-kernel`, which places the image at a fixed address
+//! and jumps in with the MMU off - a fine instrument for proving a toolchain and
+//! nothing like a boot. This boots the same way x86_64 does: firmware, ESP, a
+//! loader that reads the kernel off the volume, builds the page tables and
+//! branches into the higher half.
+//!
+//! The verdict is read out of the serial log, the way `cargo xtask test` reads
+//! its own: the guest prints `M3_TABLES_OK` and `M1_TIMER_OK` when it is happy,
+//! and the run stops as soon as either marker or a failure line appears. Nothing
+//! here claims a green the log does not contain.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+
+use crate::utils;
+
+/// The machines this command builds for. The kernel target is the same one the
+/// `-kernel` bring-up used; the loader's is stage 1e's addition, and it is the
+/// aarch64 twin of `x86_64-unknown-uefi` - a PE32+ EFI application, which is a
+/// different object format from the kernel's ELF.
+const KERNEL_TARGET: &str = "aarch64-unknown-none";
+const LOADER_TARGET: &str = "aarch64-unknown-uefi";
+
+/// The command line the loader copies into the handoff record, and the kernel
+/// prints back.
+///
+/// Nothing parses it at this stage - `boot::console_list` is shared and has no
+/// aarch64 caller yet - and it is here for two reasons that are worth the file:
+/// the loader reads three files off the volume, and a record whose command line
+/// came back empty would not tell a reader whether the file was missing or the
+/// read was broken. `ttyAMA0` is what this machine's console is called
+/// everywhere else, so the day something does parse it, the name is already
+/// right.
+const CMDLINE: &str = "console=ttyAMA0\n";
+
+/// How long the boot is given before it is called stuck. Generous: AAVMF's own
+/// startup is most of it, and the kernel's checks are milliseconds.
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// Lines that mean the machine has finished saying something. The poll below
+/// stops on the first of them, which is what keeps a run from waiting out the
+/// whole deadline on a machine that has already reported.
+const TERMINATORS: [&str; 5] = [
+    "M1_TIMER_OK",
+    "M1_TIMER_FAILED",
+    "M3_TABLES_FAILED",
+    "KERNEL PANIC",
+    "aarch64: entered at EL",
+];
+
+/// Where the ESP this command assembles lives. Under `build/`, so it is thrown
+/// away by `cargo xtask clean` and never confused with the x86_64 image.
+fn esp_dir(build_dir: &Path) -> PathBuf {
+    build_dir.join("aarch64-esp")
+}
+
+/// The PL011's output, captured to a file for the same reason the x86_64 test
+/// machine captures its own: a verdict has to be readable after the machine has
+/// stopped, and this one never exits on its own.
+fn log_path(build_dir: &Path) -> PathBuf {
+    build_dir.join("aarch64-serial.log")
+}
+
+/// The writable copy of the firmware's variable store. AAVMF writes to the
+/// second flash bank as it boots, and the system's copy belongs to the package
+/// manager.
+fn vars_path(build_dir: &Path) -> PathBuf {
+    build_dir.join("AAVMF_VARS.fd")
+}
+
+pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
+    let (kernel, loader) = build(profile)?;
+    println!("kernel: {} ({:.1} KB)", kernel.display(), kib(&kernel)?);
+    println!("loader: {} ({:.1} KB)", loader.display(), kib(&loader)?);
+
+    let esp = build_esp(build_dir, &kernel, &loader)?;
+    println!("esp:    {}", esp.display());
+
+    let log = boot(build_dir, &esp)?;
+    print!("{log}");
+
+    // Both markers, in the order the kernel prints them: `M3_TABLES_OK` says the
+    // loader's page tables say what the plan says, and `M1_TIMER_OK` says the
+    // clock still reaches the vector table through them - which is a statement
+    // about the device window as well, because the GIC is reached through it.
+    let tables = log.contains("M3_TABLES_OK");
+    let timer = log.contains("M1_TIMER_OK");
+    if tables && timer {
+        println!();
+        println!("aarch64 boot: M3_TABLES_OK and M1_TIMER_OK, from the ESP under AAVMF");
+        return Ok(());
+    }
+    bail!(
+        "the aarch64 boot did not reach both markers (page tables {}, timer {}); \
+         the log above and {} say where it stopped",
+        if tables { "ok" } else { "no" },
+        if timer { "ok" } else { "no" },
+        log_path(build_dir).display()
+    )
+}
+
+/// Build the kernel and its loader for this machine.
+fn build(profile: &str) -> Result<(PathBuf, PathBuf)> {
+    let root = utils::project_root()?;
+    let release = profile == "release";
+
+    let mut kernel = Command::new("cargo");
+    kernel
+        .arg("build")
+        .args(["-p", "mpos"])
+        .args(["--target", KERNEL_TARGET]);
+    if release {
+        kernel.arg("--release");
+    }
+    run_cargo(kernel, &root, "the aarch64 kernel")?;
+
+    // The loader's target is passed here rather than left to
+    // `boot/.cargo/config.toml`, whose `[build] target` names the x86_64 one:
+    // a config file cannot know which machine this invocation is for, and
+    // guessing there would break the plain `cargo build` inside `boot/`.
+    let mut loader = Command::new("cargo");
+    loader
+        .arg("build")
+        .args(["-p", "mpos-boot"])
+        .args(["--target", LOADER_TARGET]);
+    if release {
+        loader.arg("--release");
+    }
+    run_cargo(loader, &root, "the aarch64 loader")?;
+
+    let target = utils::target_dir()?;
+    Ok((
+        target.join(KERNEL_TARGET).join(profile).join("mpos"),
+        target
+            .join(LOADER_TARGET)
+            .join(profile)
+            .join("mpos-boot.efi"),
+    ))
+}
+
+fn run_cargo(mut command: Command, root: &Path, what: &str) -> Result<()> {
+    let status = command
+        .current_dir(root)
+        .status()
+        .with_context(|| format!("Failed to run cargo for {what}"))?;
+    if !status.success() {
+        bail!("{what} did not build");
+    }
+    Ok(())
+}
+
+/// The volume a UEFI firmware reads: the loader where the firmware looks for it
+/// by default, and the three files the loader expects beside it.
+///
+/// `\\EFI\\BOOT\\BOOTAA64.EFI` is the aarch64 name in the removable-media
+/// fallback path, the twin of the `BOOTX64.EFI` the x86_64 image carries. The
+/// three root files are the loader's `KERNEL_PATH`, `INITRAMFS_PATH` and
+/// `CMDLINE_PATH`, and they are at the volume's root rather than under `EFI/`
+/// because that is where `boot/src/main.rs` reads them.
+fn build_esp(build_dir: &Path, kernel: &Path, loader: &Path) -> Result<PathBuf> {
+    let esp = esp_dir(build_dir);
+    if esp.exists() {
+        fs::remove_dir_all(&esp).with_context(|| format!("Failed to clear {}", esp.display()))?;
+    }
+    let boot = esp.join("EFI/BOOT");
+    fs::create_dir_all(&boot).with_context(|| format!("Failed to create {}", boot.display()))?;
+
+    fs::copy(loader, boot.join("BOOTAA64.EFI"))
+        .with_context(|| format!("Failed to install {}", loader.display()))?;
+    fs::copy(kernel, esp.join("mpos.elf"))
+        .with_context(|| format!("Failed to install {}", kernel.display()))?;
+    fs::write(esp.join("mpos.cmdline"), CMDLINE)?;
+
+    // The third file is optional in the loader - a missing one reads as a
+    // zero-length range, which is what a diskless boot is - so it is copied
+    // when the x86_64 build has made one and the log says which happened. Its
+    // *contents* are the x86_64 image's Alpine archive and nothing at this
+    // stage reads them; stage 4 is where a root is unpacked from it. What it
+    // proves here is that a second file, larger than one page, crosses the
+    // firmware's file protocols and lands in the memory map's direct map.
+    let initramfs = utils::initramfs_path(build_dir);
+    if initramfs.exists() {
+        fs::copy(&initramfs, esp.join("initramfs.tar"))?;
+        println!("initramfs: {}", initramfs.display());
+    } else {
+        println!(
+            "initramfs: none built yet ({}), booting without one",
+            initramfs.display()
+        );
+    }
+    Ok(esp)
+}
+
+/// The firmware's two flash images, from whichever package the host has.
+///
+/// AAVMF is EDK2 built for `virt`. Distributions put it in one of a handful of
+/// places and name the variable store differently from the code, so both are
+/// looked up together rather than guessed from one path.
+fn firmware() -> Result<(PathBuf, PathBuf)> {
+    const PLACES: [(&str, &str); 3] = [
+        (
+            "/usr/share/AAVMF/AAVMF_CODE.fd",
+            "/usr/share/AAVMF/AAVMF_VARS.fd",
+        ),
+        (
+            "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+            "/usr/share/edk2/aarch64/QEMU_VARS.fd",
+        ),
+        (
+            "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+            "/usr/share/qemu-efi-aarch64/QEMU_VARS.fd",
+        ),
+    ];
+    for (code, vars) in PLACES {
+        let (code, vars) = (Path::new(code), Path::new(vars));
+        if code.exists() && vars.exists() {
+            return Ok((code.to_path_buf(), vars.to_path_buf()));
+        }
+    }
+    bail!(
+        "No aarch64 UEFI firmware found; looked for AAVMF_CODE.fd + AAVMF_VARS.fd in \
+         /usr/share/AAVMF, /usr/share/edk2/aarch64 and /usr/share/qemu-efi-aarch64"
+    )
+}
+
+/// Boot the ESP under AAVMF and return what the serial line said.
+fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
+    let (code, vars_src) = firmware()?;
+    let vars = vars_path(build_dir);
+    fs::copy(&vars_src, &vars).with_context(|| {
+        format!(
+            "Failed to copy {} to {}",
+            vars_src.display(),
+            vars.display()
+        )
+    })?;
+
+    let log = log_path(build_dir);
+    let _ = fs::remove_file(&log);
+
+    let mut qemu = Command::new("qemu-system-aarch64");
+    qemu.args(["-machine", "virt,gic-version=2"])
+        // A named CPU rather than `max`, because the kernel's interrupt
+        // controller is a GICv2 and its clock is the EL1 physical timer: both
+        // are things a `max` CPU is free to configure differently, and a
+        // difference there reads as a broken driver.
+        .args(["-cpu", "cortex-a57"])
+        // TCG and never KVM, on any host: `detect_accel` answers with the
+        // *host's* accelerator, and a host that is not aarch64 cannot run this
+        // machine on it. The x86_64 commands are welcome to it.
+        .args(["-accel", "tcg"])
+        .args(["-m", "256"])
+        .args(["-display", "none"])
+        .args(["-monitor", "none"])
+        .args(["-no-reboot"])
+        .args(["-serial", &format!("file:{}", log.display())])
+        // Two flash banks, the way EDK2 expects to find itself: the code bank
+        // read-only at the address the machine boots from, and a writable
+        // variable store the firmware updates as it goes.
+        .args([
+            "-drive",
+            &format!(
+                "if=pflash,format=raw,unit=0,readonly=on,file={}",
+                code.display()
+            ),
+        ])
+        .args([
+            "-drive",
+            &format!("if=pflash,format=raw,unit=1,file={}", vars.display()),
+        ])
+        // The ESP itself, as a bare FAT volume on a virtio disk rather than a
+        // partitioned image: EDK2's partition driver hands a volume with no
+        // partition table to the FAT driver as a whole, which is how a USB
+        // stick with no MBR boots. Read-only, because the loader only reads.
+        .args([
+            "-drive",
+            &format!(
+                "file=fat:{},format=raw,if=none,id=hd0,readonly=on",
+                esp.display()
+            ),
+        ])
+        .args(["-device", "virtio-blk-pci,drive=hd0"]);
+
+    let mut child = qemu
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to start qemu-system-aarch64")?;
+
+    let started = Instant::now();
+    loop {
+        if let Ok(text) = fs::read_to_string(&log)
+            && TERMINATORS.iter().any(|marker| text.contains(marker))
+        {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            eprintln!("qemu-system-aarch64 exited on its own: {status}");
+            break;
+        }
+        if started.elapsed() > DEADLINE {
+            eprintln!("qemu-system-aarch64 was still running after {DEADLINE:?}; stopping it");
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    fs::read_to_string(&log).with_context(|| format!("Failed to read {}", log.display()))
+}
+
+fn kib(path: &Path) -> Result<f64> {
+    Ok(fs::metadata(path)?.len() as f64 / 1024.0)
+}

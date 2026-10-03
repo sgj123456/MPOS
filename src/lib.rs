@@ -47,8 +47,9 @@
 //!   - *machine-only modules that were already `target_os = "none"`* move to
 //!     `all(target_os = "none", target_arch = "x86_64")`. `console` and
 //!     `drivers` (stage 5), `hal` (its trait impls land with 1c's
-//!     `Interrupts`/`Cpu`, 1d's `Paging` and stage 2's `Contexts`) and `net`
-//!     (stage 6) are these.
+//!     `Interrupts`/`Cpu`, stage 2's `Contexts`, and `Paging` when the kernel
+//!     installs its own tables - not at 1e, which runs on the loader's) and
+//!     `net` (stage 6) are these.
 //!   - *host-compiled modules* - `sched` (3), `vfs` (4), `syscall` (6) and
 //!     `uaccess` (6) - keep the host and x86_64 bare metal and exclude only the
 //!     aarch64 build, `any(not(target_os = "none"), target_arch = "x86_64")`.
@@ -115,8 +116,9 @@ pub use mpos_err as err;
 /// x86_64-only for now, and by construction rather than by choice: the forwards
 /// at the bottom of `hal/mod.rs` name all six traits, so the module can only be
 /// compiled for a machine that implements all six. The aarch64 impls land with
-/// their stages - `Cpu`/`Interrupts` at 1c, `Paging` at 1d, `Contexts` at 2 -
-/// and this gate goes when the last of them does.
+/// their stages - `Cpu`/`Interrupts` at 1c, `Contexts` at 2, and `Paging` when
+/// the kernel installs its own tables, which stage 1e did *not* do (it runs on
+/// the loader's) - and this gate goes when the last of them does.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod hal;
 /// evdev's record window and its clients: which reader sees which event, and

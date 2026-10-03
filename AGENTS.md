@@ -25,7 +25,7 @@ be pinned — host unit test, a program booted in QEMU, or both.
 |---|---|
 | `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs`, a thin arch dispatcher over `src/main/<arch>.rs`, which holds that machine's boot entry, milestone checks and panic handler |
 | `crates/` | downward-only leaf crates (see §4): `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk` |
-| `boot/` | `mpos-boot`, the UEFI loader. Separate target (`x86_64-unknown-uefi`), no kernel dep — both agree on a hand-written handoff record |
+| `boot/` | `mpos-boot`, the UEFI loader. Separate target (`x86_64-unknown-uefi` or `aarch64-unknown-uefi`), no kernel dep — both agree on a hand-written handoff record. One file per concern and one arm per machine: the file reading, the memory map and the handoff are shared, while the serial wire (`serial`), the page-table descriptor (`vm/x86_64.rs` vs `vm/aarch64.rs`) and the last instruction (`enter`) are the machine's |
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
 | `user/` | `mpos-user`: ordinary `std` programs for the image (`rustix`, static musl) |
 | `user/abitest/` | `mpos-user-abi`: the `no_std` conformance suite — `src/bin/syscall/` (one family), `src/bin/integration/` (a device, the net, a subsystem end to end) |
@@ -50,6 +50,8 @@ Prereqs: nightly toolchain with `rust-src rustfmt clippy`; targets `x86_64-unkno
 `run`/`disk`/`rootfs` also: `qemu-system-x86_64`, OVMF
 (`/usr/share/OVMF/x64/OVMF_CODE.4m.fd`), `qemu-img`/`qemu-nbd`, `sfdisk`, `partx`, `blkid`,
 `mkfs.ext4`, `mkfs.fat`, `tar`, `sudo`. `rootfs`/`initramfs` fetch Alpine packages over the network.
+For `boot-aarch64`: `qemu-system-aarch64` and AAVMF (`/usr/share/AAVMF/AAVMF_CODE.fd` +
+`AAVMF_VARS.fd`, or the `QEMU_EFI.fd`/`QEMU_VARS.fd` names under `/usr/share/edk2/aarch64`).
 
 | Command | What it does | Root? |
 |---|---|---|
@@ -58,6 +60,7 @@ Prereqs: nightly toolchain with `rust-src rustfmt clippy`; targets `x86_64-unkno
 | `cargo xtask run` [`--mode terminal\|gui\|mirror`] | boot in QEMU, rebuilding stale bits; `--mode` picks the window backend and the guest's `console=` list together | when needed |
 | `cargo xtask test` | **the gate**: host unit tests, then every user test program booted in QEMU | no |
 | `cargo xtask depgraph` | measure the module graph against the Phase-11 ratchet; fails when an edge appears or a count grows | no |
+| `cargo xtask boot-aarch64` | **the second machine**: build the aarch64 kernel and its UEFI loader, lay out an ESP, boot it under AAVMF, and read the verdict off the PL011 log (`M3_TABLES_OK`, `M1_TIMER_OK`). Stage 1e's instrument — it boots the machine layer and nothing above it | no |
 | `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` | just the host unit tests | no |
 | `cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu` | xtask's own tests | no |
 | `cargo xtask clean` | remove `build/` and `target/` | when needed |
@@ -67,6 +70,11 @@ cargo fmt --check
 cargo clippy --target x86_64-unknown-none            # kernel, bare metal
 cargo clippy --target x86_64-unknown-linux-gnu       # kernel, host
 cargo clippy -p mpos-xtask --target x86_64-unknown-linux-gnu
+# The second machine, and the reason these two are here: everything under
+# `src/arch/aarch64/` is `#[cfg]`-ed out of every x86_64 target, so nothing above
+# lints it. A `--deny`-level lint in aarch64-only code fails there and nowhere else.
+cargo clippy --target aarch64-unknown-none
+(cd boot && cargo clippy --target aarch64-unknown-uefi)   # the loader's aarch64 arm
 ```
 
 **Two build traps.** (1) **`--target` is mandatory for host work**: `.cargo/config.toml` pins
@@ -291,8 +299,8 @@ design. Change all three, and keep the loader's "allocate everything before `exi
 | A new test program silently never built | Add the `[[bin]]` block; `xtask` errors on "no binary" only for sources it finds |
 | A `src/` file nothing declares looks real | A `mod` declaration makes a file part of the build; missing ones left duplicate serial/RTC drivers for months (V-7). Check for the declared one before writing a new file |
 | A module has a host body and a machine body | **Both move, or it does not build.** The host suite was green while `--target x86_64-unknown-none` failed: `VfsError::Revoked` was mapped in the host `err_of` but the machine `#[cfg]` arm was left non-exhaustive (V-11). Run the bare-metal target on every pass |
-| `cargo xtask run` prints no milestone markers | By design — `M*_OK` checks run only under `mpos.selftest` (set by `xtask test`). Markers that exist: M0–M4, M6, M7, M8_IPC, M8 (no M5, nothing above M8). The aarch64 bring-up prints two of its own, `M1_TIMER_OK` and `M3_TABLES_OK`, which no x86 sweep produces |
-| No cross-architecture build | aarch64 now links and prints its banner under `qemu-system-aarch64 -M virt -kernel` (stages 1a-1b of `PLAN.md` §9.1). Nothing above `arch` is ported: `src/lib.rs`'s header is the stage ledger saying which module un-gates when, and `cargo xtask` still builds and boots x86_64 only |
+| `cargo xtask run` prints no milestone markers | By design — `M*_OK` checks run only under `mpos.selftest` (set by `xtask test`). Markers that exist: M0–M4, M6, M7, M8_IPC, M8 (no M5, nothing above M8). The aarch64 machine prints two of its own, `M1_TIMER_OK` and `M3_TABLES_OK`, which no x86 sweep produces — and they come from `cargo xtask boot-aarch64`, not from `run`, because the second machine has no image and no rootfs to boot yet |
+| No cross-architecture build | aarch64 boots the way x86_64 does — firmware, ESP, `mpos-boot`, higher half — through `cargo xtask boot-aarch64` (stages 1a-1e of `PLAN.md` §9.1). Nothing above `arch` is ported: `src/lib.rs`'s header is the stage ledger saying which module un-gates when, and `xtask run`/`test` still build and boot x86_64 only. The `-kernel` bring-up those stages used is **deleted** — do not bring it back as a shortcut, because the image is a higher-half PIE now and has no fixed address for QEMU to load it at |
 | `fuzz/` won't build from the root | It is its own workspace; run `cargo fuzz` from inside `fuzz/` |
 | A `net/*` host test never runs | `src/lib.rs` gates the whole `net` module on `target_os = "none"`; a host test inside it is unreachable |
 | `user/staging/` looks like a missing test | Deliberate scratch — check `user/abitest` and `user/tests` for the live version first |

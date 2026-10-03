@@ -20,14 +20,22 @@ const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
 
-/// `R_X86_64_RELATIVE`: the only relocation a static PIE against itself needs.
-/// The other types all name a symbol, and a kernel with no shared libraries has
-/// none to name.
+/// The one relocation kind a static PIE against itself needs, per machine: the
+/// image's own absolute addresses, adjusted by the load base. The other types
+/// all name a symbol, and a kernel with no shared libraries has none to name.
+///
+/// The numbers are `ELF`'s, not this project's: `R_X86_64_RELATIVE` is 8 in the
+/// x86_64 psABI and `R_AARCH64_RELATIVE` is 1027 in the aarch64 one, and the two
+/// machines disagree because the numbers were assigned by different processor
+/// supplements. Which one is expected comes from the file's own `e_machine`, so
+/// a loader built for one machine still refuses the other's image by name.
 const R_X86_64_RELATIVE: u32 = 8;
+const R_AARCH64_RELATIVE: u32 = 1027;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
 
 /// One `PT_LOAD` segment, as the loader has to place it.
 #[derive(Clone, Copy)]
@@ -57,6 +65,10 @@ pub struct Range {
 /// is never freed.
 pub struct Kernel<'a> {
     bytes: &'a [u8],
+    /// The relocation kind this image's machine uses for a self-relative fixup,
+    /// taken from `e_machine`. Held rather than looked up per entry so that the
+    /// check in [`Kernel::read_relocations`] names the machine it expected.
+    relative: u32,
     pub entry: u64,
     /// Lowest virtual address any segment uses. Zero for a normal link, since
     /// the linker script starts the first loadable segment at file offset 0.
@@ -125,12 +137,20 @@ impl<'a> Kernel<'a> {
             "mpos.elf does not begin with an ELF magic number"
         );
         assert_eq!(r.u8(4), ELFCLASS64, "mpos.elf is not a 64-bit ELF file");
-        assert_eq!(
-            r.u16(18),
-            EM_X86_64,
-            "mpos.elf was built for machine {}, not x86_64",
-            r.u16(18)
+        // Both machines this loader serves, and no other: the two are the ones
+        // a UEFI firmware can hand it, and an image built for a third would be
+        // one whose page-table format the loader below does not speak.
+        let machine = r.u16(18);
+        assert!(
+            machine == EM_X86_64 || machine == EM_AARCH64,
+            "mpos.elf was built for machine {machine}, not x86_64 ({EM_X86_64}) \
+             or aarch64 ({EM_AARCH64})"
         );
+        let relative = if machine == EM_AARCH64 {
+            R_AARCH64_RELATIVE
+        } else {
+            R_X86_64_RELATIVE
+        };
 
         let entry = r.u64(24);
         let phoff = r.u64(32);
@@ -177,6 +197,7 @@ impl<'a> Kernel<'a> {
 
         let mut kernel = Kernel {
             bytes,
+            relative,
             entry: entry - lowest,
             base: lowest,
             span: (highest - lowest).next_multiple_of(PAGE_SIZE),
@@ -239,9 +260,10 @@ impl<'a> Kernel<'a> {
             let kind = info as u32;
             let symbol = info >> 32;
             assert_eq!(
-                kind, R_X86_64_RELATIVE,
+                kind, self.relative,
                 "mpos.elf carries a relocation of type {kind} against symbol {symbol}; \
-                 only R_X86_64_RELATIVE is expected from a static PIE"
+                 only its machine's RELATIVE fixup ({}) is expected from a static PIE",
+                self.relative,
             );
             out.push(Relocation {
                 vaddr: offset,
@@ -351,7 +373,7 @@ impl<'a> Kernel<'a> {
     }
 }
 
-/// The loader's own page size, and the kernel's: both target x86_64 with the
-/// same 4 KiB granularity, and the kernel's own `install` maps the image with
-/// the same alignment.
+/// The loader's own page size, and the kernel's: 4 KiB on both machines, which
+/// is the granularity the memory map, the segments and the kernel's own
+/// `paging::install` are all aligned to.
 pub const PAGE_SIZE: u64 = 4096;

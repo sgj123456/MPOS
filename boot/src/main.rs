@@ -28,6 +28,26 @@
 //! kernel could decide itself: it does not pick a root device, parse a command
 //! line or touch a file system on the disk. It moves bytes and builds page
 //! tables, and everything above that is the kernel's business.
+//!
+//! # Two machines
+//!
+//! The list above is one list, and it is the same on x86_64 and aarch64: the
+//! `uefi` crate's file protocols, memory map and pool allocator are portable, and
+//! so is the handoff record - it carries plain data and no page-table root, no
+//! GDT and no EFI table, which is exactly the seam `src/boot/mod.rs` describes.
+//! Three things are the machine's, and each has one arm per machine and nothing
+//! in between:
+//!
+//! * **The progress lines' wire.** COM1 is a port and an address and aarch64 has
+//!   no port I/O at all, so the aarch64 arm writes a PL011 - the same UART, at
+//!   the same fixed address, that the kernel's `arch/aarch64/pl011.rs` owns
+//!   (a separate compilation with no crate between them, the same reason the
+//!   handoff record is written twice).
+//! * **The page-table descriptor.** The three ranges, the pool and the sizing
+//!   are shared in `vm.rs`; the format is `vm/x86_64.rs`'s or `vm/aarch64.rs`'s.
+//! * **The last instruction.** `mov cr3` and `jmp` against `msr ttbr0_el1` and
+//!   `br`, with the record in a different register (`RDI` against `x0`) and a
+//!   stack that has to be sixteen-byte aligned rather than one word down.
 
 #![no_std]
 #![no_main]
@@ -60,8 +80,17 @@ use handoff::{Handoff, MAGIC, MAX_MEM_REGIONS, Region};
 /// why only the release build of this crate ever linked against the name.
 /// Providing it is five lines, and the semantics are the one the idiom
 /// promises: the number of `u16`s before the first zero.
+///
+/// # Safety
+///
+/// `s` must point at a NUL-terminated run of `u16`s that is valid to read. The
+/// caller is not Rust code at all: it is the `wcslen` call LLVM emitted, whose
+/// only contract is the C one - and the loop below is the same one the compiler
+/// recognised, so anything the compiler was entitled to assume of it holds here.
+/// The function is `unsafe` for the same reason the idiom it replaces was: the
+/// bound comes from the data, and nothing in the signature can say so.
 #[unsafe(no_mangle)]
-pub extern "C" fn wcslen(s: *const u16) -> usize {
+pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     let mut n = 0;
     while unsafe { *s.add(n) } != 0 {
         n += 1;
@@ -163,8 +192,11 @@ fn main() -> Status {
     }
     log(&format!("RAM: {} MiB", ram / (1024 * 1024)));
 
-    // Everything that needs the firmware's allocator, in one place.
-    let pool_bytes = vm::pool_bytes_for(ram);
+    // Everything that needs the firmware's allocator, in one place. The pool is
+    // sized from the bytes that will be mapped, which is RAM - mapped twice,
+    // identity and through the direct map - plus, on aarch64, the device window
+    // the kernel reaches its console and interrupt controller through.
+    let pool_bytes = vm::pool_bytes_for(ram + vm::extra_mapped_bytes());
     let pool = allocate((pool_bytes / PAGE_SIZE) as usize, "page-table pool");
     let root_frame = allocate(1, "page tables");
     let image_pages = kernel.span.div_ceil(PAGE_SIZE) as usize;
@@ -230,6 +262,20 @@ fn main() -> Status {
         mapped / (1024 * 1024),
         vm::HHDM_OFFSET
     ));
+    // The machine's device registers, on the one machine that has no other way
+    // to reach them yet: x86_64's kernel walks a BAR through `mm::map_mmio`, and
+    // aarch64 reads a device tree at stage 5. Until then the GIC and the PL011
+    // sit at fixed addresses, and this is what keeps them reachable once the
+    // firmware's own identity map is gone.
+    #[cfg(target_arch = "aarch64")]
+    {
+        vm::map_device_window(&mut tables);
+        log(&format!(
+            "device window {:#x}..{:#x} mapped, Device and not executable",
+            vm::DEVICE_BASE,
+            vm::DEVICE_BASE + vm::DEVICE_WINDOW
+        ));
+    }
     vm::map_kernel_image(
         &mut tables,
         image_mem,
@@ -270,11 +316,18 @@ fn main() -> Status {
 /// # Safety
 ///
 /// `record` must point at a filled-in [`Handoff`], `entry` must be mapped
-/// executable in the page tables rooted at `cr3`, `stack_top` must be mapped
+/// executable in the page tables rooted at `root`, `stack_top` must be mapped
 /// writable in those same tables, and both must be reachable from the
 /// higher-half addresses they are given as. This is the last thing the loader
 /// does and there is no way back from it.
-unsafe fn enter(record: *const Handoff, entry: u64, stack_top: u64, cr3: u64) -> ! {
+///
+/// `root` is one frame on both machines, which is worth saying because it is not
+/// obvious on aarch64: that machine has two base registers and this loader
+/// points both at the same table, which works because the low half of the tree
+/// holds only the identity map and the high half only the direct map and the
+/// alias, and no entry is wanted by both. See `vm/aarch64.rs`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn enter(record: *const Handoff, entry: u64, stack_top: u64, root: u64) -> ! {
     unsafe {
         core::arch::asm!(
             // Interrupts off for the switch: the firmware may have left them on,
@@ -287,10 +340,74 @@ unsafe fn enter(record: *const Handoff, entry: u64, stack_top: u64, cr3: u64) ->
             "mov rsp, {stack}",
             "xor rbp, rbp",
             "jmp {entry}",
-            cr3 = in(reg) cr3,
+            cr3 = in(reg) root,
             stack = in(reg) stack_top - 8,
             entry = in(reg) entry,
             in("rdi") record,
+            options(noreturn)
+        )
+    }
+}
+
+/// The aarch64 switch, and the order of it is the architecture's:
+///
+/// * **Interrupts masked first.** The firmware may have left them on, and an
+///   interrupt between the base-register writes and the branch would be taken on
+///   the old tables and return to a different stack.
+/// * **`dsb ish` before the base registers**, so the page tables this loader just
+///   wrote are visible to the walker before anything points at them.
+/// * **`MAIR`, `TCR`, then both `TTBR`s**, because a translation can only happen
+///   once all four agree.
+/// * **`tlbi vmalle1` and another `dsb ish`**, because the walker may have cached
+///   the *failed* lookups it made while the firmware's tables were in use - the
+///   higher half was not mapped a moment ago, so those entries exist and are
+///   negative.
+/// * **`isb` after the `SCTLR_EL1` write**, so the instruction after it is
+///   fetched with the new tables. `M` is already set (the firmware runs with the
+///   MMU on, which is the only reason this loader can write a page table), and
+///   the register is read-modify-written rather than assigned for the reason
+///   `vm/aarch64.rs` gives.
+///
+/// The stack is handed over page-aligned rather than one word down the way the
+/// x86_64 arm hands it: `SP` must be sixteen-byte aligned, and with `SCTLR_EL1.A`
+/// set a misaligned one is a fault on the first `stp` of the kernel's own
+/// prologue rather than a warning.
+#[cfg(target_arch = "aarch64")]
+unsafe fn enter(record: *const Handoff, entry: u64, stack_top: u64, root: u64) -> ! {
+    // Two blocks rather than one because `options(noreturn)` forbids an asm
+    // output, and the `SCTLR_EL1` update needs a register to read the old value
+    // into. The split is where it naturally falls: everything above the last
+    // `isb` is the switch and arrives somewhere, and the three instructions
+    // after it do not.
+    unsafe {
+        core::arch::asm!(
+            "msr daifset, #0xf",
+            "dsb ish",
+            "msr mair_el1, {mair}",
+            "msr tcr_el1, {tcr}",
+            "msr ttbr0_el1, {root}",
+            "msr ttbr1_el1, {root}",
+            "dsb ish",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            "mrs {sctlr}, sctlr_el1",
+            "orr {sctlr}, {sctlr}, {bits}",
+            "msr sctlr_el1, {sctlr}",
+            "isb",
+            mair = in(reg) vm::MAIR,
+            tcr = in(reg) vm::TCR,
+            root = in(reg) root,
+            bits = in(reg) vm::SCTLR_ENABLE,
+            sctlr = lateout(reg) _,
+        );
+        core::arch::asm!(
+            "mov sp, {stack}",
+            "mov x0, {record}",
+            "br {entry}",
+            stack = in(reg) stack_top,
+            entry = in(reg) entry,
+            record = in(reg) record,
             options(noreturn)
         )
     }
@@ -442,47 +559,115 @@ use alloc::format;
 /// Diagnostics on the serial port.
 ///
 /// The firmware's console is not where a headless machine's boot is watched, and
-/// after boot services are exited there is no console at all. COM1 is a port and
-/// an address, and it works before, during and after.
+/// after boot services are exited there is no console at all. A UART is a
+/// register and an address, and it works before, during and after boot services
+/// on both machines - which is why there is no firmware-console fallback and why
+/// this module has one body per machine.
 mod serial {
-    use core::arch::asm;
+    pub use imp::{init, write};
 
-    const COM1: u16 = 0x3f8;
+    #[cfg(target_arch = "x86_64")]
+    mod imp {
+        use core::arch::asm;
 
-    fn out(port: u16, value: u8) {
-        unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
-    }
+        const COM1: u16 = 0x3f8;
 
-    fn inp(port: u16) -> u8 {
-        let value: u8;
-        unsafe { asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)) };
-        value
-    }
+        fn out(port: u16, value: u8) {
+            unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
+        }
 
-    pub fn init() {
-        out(COM1 + 1, 0x00); // no interrupts
-        out(COM1 + 3, 0x80); // divisor latch
-        out(COM1, 0x01); // 115200 baud
-        out(COM1 + 1, 0x00);
-        out(COM1 + 3, 0x03); // 8 bits, no parity, one stop
-        out(COM1 + 2, 0xc7); // FIFO on, cleared
-        out(COM1 + 4, 0x03); // ready to transmit
-    }
+        fn inp(port: u16) -> u8 {
+            let value: u8;
+            unsafe { asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)) };
+            value
+        }
 
-    pub fn write(text: &str) {
-        for byte in text.bytes() {
-            if byte == b'\n' {
-                put(b'\r');
+        pub fn init() {
+            out(COM1 + 1, 0x00); // no interrupts
+            out(COM1 + 3, 0x80); // divisor latch
+            out(COM1, 0x01); // 115200 baud
+            out(COM1 + 1, 0x00);
+            out(COM1 + 3, 0x03); // 8 bits, no parity, one stop
+            out(COM1 + 2, 0xc7); // FIFO on, cleared
+            out(COM1 + 4, 0x03); // ready to transmit
+        }
+
+        pub fn write(text: &str) {
+            for byte in text.bytes() {
+                if byte == b'\n' {
+                    put(b'\r');
+                }
+                put(byte);
             }
-            put(byte);
+        }
+
+        fn put(byte: u8) {
+            while inp(COM1 + 5) & 0x20 == 0 {
+                core::hint::spin_loop();
+            }
+            out(COM1, byte);
         }
     }
 
-    fn put(byte: u8) {
-        while inp(COM1 + 5) & 0x20 == 0 {
-            core::hint::spin_loop();
+    /// The PL011 on QEMU's `virt` machine, at the address the firmware's device
+    /// tree gives and `src/arch/aarch64/pl011.rs` also names.
+    ///
+    /// A second copy of that driver, deliberately: the loader is a separate
+    /// compilation with no crate between it and the kernel (the same reason the
+    /// handoff record is written twice), and the alternative - a shared crate -
+    /// would be the first dependency either has on the other.
+    ///
+    /// It does *not* reinitialize the UART the way the COM1 arm does. AAVMF has
+    /// already brought this one up and is using it as its own console, so
+    /// rewriting the baud divisor and line control would take the wire away from
+    /// the firmware in the middle of its own output; the enable bits are ORed in
+    /// and nothing else is touched, which is all a writer needs.
+    #[cfg(target_arch = "aarch64")]
+    mod imp {
+        const BASE: usize = 0x0900_0000;
+
+        /// Data register: what is written goes out.
+        const DR: usize = 0x00;
+        /// Flag register; bit 5 is `TXFF`, "the transmit FIFO is full".
+        const FR: usize = 0x18;
+        /// Control: the enable bits.
+        const CR: usize = 0x30;
+
+        const FR_TXFF: u32 = 1 << 5;
+        /// `UARTEN | TXE | RXE`.
+        const CR_ENABLE: u32 = 1 | (1 << 8) | (1 << 9);
+
+        fn read(offset: usize) -> u32 {
+            // SAFETY: every offset above is a register of the PL011 at `BASE`,
+            // which the firmware's identity map already covers - this runs
+            // before the loader's own tables are installed.
+            unsafe { core::ptr::read_volatile((BASE + offset) as *const u32) }
         }
-        out(COM1, byte);
+
+        fn write_reg(offset: usize, value: u32) {
+            // SAFETY: as `read`.
+            unsafe { core::ptr::write_volatile((BASE + offset) as *mut u32, value) };
+        }
+
+        pub fn init() {
+            write_reg(CR, read(CR) | CR_ENABLE);
+        }
+
+        pub fn write(text: &str) {
+            for byte in text.bytes() {
+                if byte == b'\n' {
+                    put(b'\r');
+                }
+                put(byte);
+            }
+        }
+
+        fn put(byte: u8) {
+            while read(FR) & FR_TXFF != 0 {
+                core::hint::spin_loop();
+            }
+            write_reg(DR, byte as u32);
+        }
     }
 }
 

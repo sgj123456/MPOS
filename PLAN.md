@@ -664,8 +664,9 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — aarch64 stages 1a-1d landed (§9.1))**
-- [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
+**Architectures (Phase 9 — aarch64 stages 1a-1e landed: the machine boots a real
+ESP image under AAVMF (§9.1); next is the kernel installing its own tables)**
+- [ ] 9.1 aarch64 complete boot (stages 2-8 remain) · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
@@ -5170,14 +5171,35 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1d landed**. The toolchain targets and the linker
-script exist, the gates are two-way, `cargo build --target aarch64-unknown-none`
-links a bootable ELF, and that ELF boots under `qemu-system-aarch64 -M virt
--kernel`, prints its banner over a PL011 at `0x0900_0000`, takes the generic
-timer's interrupt through a GICv2 at 250 Hz, and builds its own four-level page
-tables and switches the MMU onto them (`M3_TABLES_OK`). Nothing above `arch` is
-ported yet; `src/lib.rs`'s header carries the stage ledger, which is the record
-of which module un-gates when.
+Current status: **stages 1a-1e landed, and the machine now boots the way the
+x86_64 one does.** `cargo xtask boot-aarch64` builds the kernel
+(`aarch64-unknown-none`), the loader (`aarch64-unknown-uefi`), lays out an ESP
+with `EFI/BOOT/BOOTAA64.EFI` and boots it under AAVMF; the loader reads
+`mpos.elf` off the volume, applies its `R_AARCH64_RELATIVE` relocations against
+`KERNEL_VIRT_BASE`, builds four-level tables from the firmware's own memory map,
+maps the image, the direct map and the device window, exits boot services and
+branches into the higher half at **EL1**. Measured, from that run:
+
+```
+mpos-boot: kernel: 44 KiB at phys 0x44be2000, virt 0xffffffff80000000, entry 0xffffffff80007300
+mpos-boot: mapped 496 MiB of physical memory, identity and through the direct map at 0xffff800000000000
+mpos-boot: device window 0x8000000..0xc000000 mapped, Device and not executable
+mpos-boot: page tables: 292 pages of them
+handoff: mpos-boot 0.1.0, record at 0x45a59020, image phys 0x44be2000 -> virt 0xffffffff80000000
+memory: 12 regions, 192 MiB the allocator may use
+page tables: TTBR0 0x44bed000, TTBR1 0x44bed000 (the loader's, read back)
+image mapped r-x / r-- / rw- at 0xffffffff80000000 (phys 0x44be2000)
+device window: PL011 at 0x9000000 maps to itself, Device
+M3_TABLES_OK
+M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 101588272 ns of counter
+```
+
+The `-kernel` bring-up of 1b-1d is **deleted**, not left beside this: the
+`aarch64-unknown-none` block is `relocation-model=pic` + `-pie` like the x86_64
+one, the linker script has no base address and no `.stack`, and
+`src/main/aarch64.rs` is an `extern "C" fn _start(x0)` with no assembly stub.
+Nothing above `arch` is ported yet; `src/lib.rs`'s header carries the stage
+ledger, which is the record of which module un-gates when.
 
 This section used to say "kernel ELF compiles but boot flow incomplete", which
 was false in both halves. Nothing compiled for aarch64 - V-8 (§11.1.8) removed
@@ -5196,11 +5218,11 @@ verified by the means named; none of them claims a green from compilation alone.
 
 | # | Stage | Verified by |
 |---|---|---|
-| 1a | Build plumbing: `rust-toolchain.toml` targets, `src/arch/aarch64/linker.ld`, `[target.aarch64-unknown-none]`, the gate list and the stage ledger | `cargo build --target aarch64-unknown-none` links; the x86 gate stays green |
-| 1b | The machine body: PL011 at `0x0900_0000`, the `_start` stub, the banner | `qemu-system-aarch64 -M virt -kernel` prints the banner |
+| 1a | Build plumbing: `rust-toolchain.toml` targets, `src/arch/aarch64/linker.ld`, `[target.aarch64-unknown-none]`, the gate list and the stage ledger | **landed**: `cargo build --target aarch64-unknown-none` links; the x86 gate stayed green |
+| 1b | The machine body: PL011 at `0x0900_0000`, the `_start` stub, the banner | **landed**: `qemu-system-aarch64 -M virt -kernel` printed the banner - the bring-up instrument 1e deletes, named as such at the time |
 | 1c | Exception vectors (`VBAR_EL1`), GICv2, the generic timer (`CNTPCT_EL0`/`CNTP_CVAL_EL0`) | **landed**: `M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz)`, three runs of three, and the check's failure branch names the timer's, the distributor's and the CPU interface's registers rather than hanging |
 | 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | **landed**: `page tables: 12 frames (48 KiB)`, `M3_TABLES_OK` (image `r-x`/`r--`/`rw-` at both its addresses, direct map written and read back, null page absent), and the clock still counts to 25 with the MMU on |
-| 1e | The aarch64 loader: `boot/src/vm.rs` gains a `TTBR1` body, `BOOTAA64.EFI`, AAVMF | QEMU + AAVMF boots the real image from the ESP |
+| 1e | The aarch64 loader: `boot/src/vm/aarch64.rs` (the descriptor format, `MAIR`/`TCR`/`SCTLR`), `boot/src/main.rs`'s aarch64 `enter` and PL011, `boot/src/elf.rs` learns `EM_AARCH64`/`R_AARCH64_RELATIVE`, the kernel relinked as a higher-half PIE, `src/arch/aarch64/paging.rs` becomes a reader of the loader's tables, `cargo xtask boot-aarch64` | **landed**: AAVMF boots the real ESP image, the kernel reaches the higher half and prints `M3_TABLES_OK` (the loader's `TTBR0`/`TTBR1`, the image's W^X, the direct map written and read back, the PL011 device) and `M1_TIMER_OK: 25 interrupts in 100 ms`; the `-kernel` instrument is deleted |
 | 2 | Contexts and user entry: `x19..x28`/`fp`/`lr`/`sp`, `q0..q31`, `eret` | a boot-time switch between two kernel tasks |
 | 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --target aarch64-unknown-none` with `sched` in |
 | 4 | Un-gate `console` and `vfs` (serial-only console first) | a ramfs root with the initramfs untarred |
@@ -5211,20 +5233,44 @@ verified by the means named; none of them claims a green from compilation alone.
 
 Named gaps the port carries rather than hides, each with its home:
 
-- **The `-kernel` bring-up is an instrument, not the boot path.** Stages 1b-1d  enter at a fixed physical address with the MMU off, because that is the
+- **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
+  entered at a fixed physical address with the MMU off, because that is the
   smallest thing that proves the toolchain, the linker script and the machine
-  body agree. Stage 1e deletes it and boots from the ESP through AAVMF, which is
+  body agree. Stage 1e deleted it and boots from the ESP through AAVMF, which is
   the promise this section makes: a second machine with the *same* boot path,
-  not a shortcut past it.
-- **`-kernel` hands over no device tree, and the exception level is measured
-  rather than assumed.** QEMU 11.1.1 with `-M virt` and a bare aarch64 ELF
-  enters the image with `x0 = 0` and `sp = 0` (the banner prints `x0` and
-  `CurrentEL`, and QEMU's own `-d cpu` log agrees): this path passes no DTB
-  pointer, and it starts at **EL1**. Neither weakens anything - nothing reads
-  the register yet, and the DTB a real port wants comes from the UEFI
-  configuration table, which is stage 1e's loader and stage 5's parser. What it
-  does mean is that the EL1-vs-EL2 check below belongs to 1e, where AAVMF is the
-  thing that decides.
+  not a shortcut past it. Deleting it meant more than removing a QEMU flag -
+  the image had to become relocatable (`relocation-model=pic`, `-pie`, a script
+  with no base address), the stack had to move from the script's `.stack` to one
+  the loader allocates, and `_start` had to stop being an assembly stub. What is
+  left of the instrument is one entry in `AGENTS.md`'s trap table saying not to
+  bring it back.
+- **The direct map is executable until the kernel installs its own tables.**
+  The loader builds both of its physical ranges - the identity map it is running
+  on and the direct map the kernel allocates through - with one call and one set
+  of flags, so both come out `rwx`. On x86_64 that is a window that closes the
+  moment the kernel installs its own tables, whose plan
+  (`mm::vm::kernel_mappings`) gives the direct map `READ | WRITE`. Stage 1e does
+  not close it, because the kernel does not install its own tables yet, so the
+  aarch64 check *asserts* `rwx` and says so in the log rather than asserting a
+  permission the loader did not set. The identity map has to stay executable in
+  any case: the loader is running on it until the branch. The follow-on stage
+  below is where the window closes.
+- **The exception level is measured rather than assumed, and it survived the
+  move to the real boot path.** QEMU 11.1.1 with `-M virt` and a bare aarch64 ELF
+  entered the `-kernel` image with `x0 = 0` and `sp = 0` (the banner printed
+  `x0`, and QEMU's own `-d cpu` log agreed). The AAVMF path is a different
+  machine in every respect - a UEFI application is entered with the firmware's
+  calling convention, not a register of our choosing - and it lands at **EL1**
+  as well, which is what the kernel's `CurrentEL` check now reports and what its
+  EL1-only vectors and physical timer need. A machine that arrived at EL2 would
+  stop with a line saying so rather than configure the wrong one.
+- **No device tree is read yet, and it does not arrive in a register.** `x0` is
+  the handoff record's register on both machines now. Under `virt` + AAVMF the
+  device tree is passed in the **UEFI configuration table**, which is firmware
+  data - it does not survive `exit_boot_services` - so a loader that wanted to
+  hand it over would have to copy it, the way it copies the initramfs. Nothing
+  needs it until stage 5, and the fixed addresses below are what stands in until
+  then.
 - **The GICv2 bring-up is three bits across two frames, and the wrong value is
   silent.** Measured on this machine, and recorded because the register values
   are load-bearing: the timer's line needs `GICD_CTLR` *and* `GICC_CTLR` bit 1
@@ -5238,25 +5284,45 @@ Named gaps the port carries rather than hides, each with its home:
   clock that looks *very fast*, and it cost a 1022/30 reading to tell apart.
   Linux programs the same `0x7`. The check's failure branch now prints the five
   registers that separate the three causes.
-- **The machine addresses are hardcoded.** QEMU virt puts PL011 at
-  `0x0900_0000`, the GIC at `0x0800_0000`/`0x0801_0000`, and RAM at
-  `0x4000_0000`; the DTB the firmware passes in `x0` is what a real port reads,
-  and stage 5 is where it does. Until then they are honest for one machine and
-  named as such.
-- **Stage 1d's layout is constants, and its identity map stays.** Two halves of
-  the same missing piece: `kernel_mappings(info, sections)` needs a `BootInfo`
-  and the `-kernel` path has none (measured: `x0` is zero, so no memory map and
-  no device tree), which is also why there is no frame allocator to take page
-  tables from — they come from a 128 KiB `.bss` arena instead. And because the
-  image is still *linked* low, the low half of the identity map cannot be dropped
-  the way x86_64's loader drops its own: every absolute address in the kernel is
-  a physical one until stage 1e's loader relocates the image and jumps to the
-  higher-half alias, which is already built and checked here. The RAM window this
-  stage maps (1 GiB) is a ceiling rather than a measurement, for the same reason.
+- **The machine addresses are hardcoded, and now they are mapped by hand.**
+  QEMU virt puts PL011 at `0x0900_0000`, the GIC at
+  `0x0800_0000`/`0x0801_0000`, and RAM at `0x4000_0000`; the device tree is what
+  a real port reads, and stage 5 is where it does. Until then the loader maps a
+  64 MiB device window from `0x0800_0000` as Device-nGnRnE
+  (`vm::map_device_window`), because the kernel still reaches those registers at
+  their physical addresses: x86_64's `mm::map_mmio` walks a BAR, and there is no
+  aarch64 equivalent until stage 5. The window deliberately does not start at
+  zero - a null pointer that silently works is the one thing x86_64's own
+  `check_arch` asserts cannot happen.
+- **The kernel still runs on the loader's tables.** The layout, the identity map
+  and the missing frame allocator are one piece now instead of two: stage 1e's
+  loader builds the address space from the firmware's own memory map and the
+  kernel *checks* it (`boot::handoff::collect` into a `BootInfo`,
+  `arch/aarch64/paging.rs::adopt` reading `TTBR0_EL1`/`TTBR1_EL1`,
+  `check_paging` translating the image, the direct map and the PL011). What is
+  not done is the other direction: `mm::vm::kernel_mappings(info, sections)` is
+  the shared plan and it has no aarch64 caller, because installing it needs
+  page-table frames and there is no frame allocator - `mm::init` is still
+  x86_64-only. The page-table *builder* that 1d had was deleted with the
+  `-kernel` path rather than left to rot: it is built from the plan when it
+  comes back, and its checks read the loader's tables in the meantime.
+- **Stage 1d's RAM window is gone; the map is the firmware's.** The 1 GiB
+  ceiling it mapped "because the code that would care had not arrived" is
+  replaced by the loader's region-by-region walk of the EFI memory map: this
+  boot reports `12 regions, 192 MiB the allocator may use` out of 248 MiB of
+  RAM. The identity map in `TTBR0` stays, and that is a decision rather than a
+  leftover: the device window lives in the low half, the loader's own tables and
+  stack are addressed physically while it runs, and the alias the kernel
+  executes at is in `TTBR1` - so the low half is not the kernel's to drop, it is
+  where the machine's devices are.
 - **`hal` is x86_64-only until its traits exist on aarch64.** The forwards at
   the bottom of `hal/mod.rs` name all six concern traits, so the module cannot
-  compile for a machine that implements fewer. aarch64 gets `Cpu`/`Interrupts`
-  at 1c, `Paging` at 1d and `Contexts` at stage 2; the gate goes with the last.
+  compile for a machine that implements fewer. aarch64's `interrupts.rs` and
+  `timer.rs` are what a `Cpu`/`Interrupts` impl would be written over, and
+  `Contexts` arrives with stage 2 - but `Paging` waits for the follow-on below,
+  because the trait's `install(info, sections)` is the kernel building its own
+  tables, which is the thing that has not happened yet. The gate goes with the
+  last of the six.
 - **No ACPI consumer exists to reuse.** `virt` + AAVMF passes a *device tree*,
   so device discovery is new DTB-parsing code in stage 5, not a port of an
   existing table walk.

@@ -29,7 +29,7 @@ and then runs it.
 
 ## 前置要求 | Prerequisites
 
-**Rust 工具链 | Rust toolchain** — 四个 target 都要装上 | all four targets installed:
+**Rust 工具链 | Rust toolchain** — 六个 target | six targets:
 
 | target | 用途 | used for |
 | --- | --- | --- |
@@ -37,10 +37,15 @@ and then runs it.
 | `x86_64-unknown-uefi` | EFI loader (`mpos-boot`) | the UEFI boot loader |
 | `x86_64-unknown-linux-musl` | 静态用户程序 | the static user programs |
 | `x86_64-unknown-linux-gnu` | 宿主单元测试 + xtask 自身 | host unit tests + xtask itself |
+| `aarch64-unknown-none` | 第二台机器的内核（`boot-aarch64`） | the second machine's kernel |
+| `aarch64-unknown-uefi` | 第二台机器的 loader | its loader |
 
 ```
-rustup target add x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-musl x86_64-unknown-linux-gnu
+rustup target add x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-musl x86_64-unknown-linux-gnu aarch64-unknown-none aarch64-unknown-uefi
 ```
+
+`rust-toolchain.toml` 已经列了这六个，所以第一次用到时 rustup 会自动装。
+`rust-toolchain.toml` already names all six, so rustup installs them on first use.
 
 **系统工具 | System tools**（`run`/`test`/`rootfs` 用到 | needed by run/test/rootfs）：
 
@@ -59,8 +64,14 @@ rustup target add x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-m
   the Alpine rootfs is fetched over the network (a host `apk` is used if present,
   otherwise `apk.static` is downloaded)
 
-> `build` 和 `test` 全程**不需要** root。
-> `build` and `test` never need root.
+**第二台机器 | the second machine**（只 `boot-aarch64` 用到 | only `boot-aarch64`）：
+
+- `qemu-system-aarch64`
+- AAVMF 固件 | AAVMF firmware（`/usr/share/AAVMF/AAVMF_CODE.fd` + `AAVMF_VARS.fd`，
+  或 `/usr/share/edk2/aarch64/QEMU_EFI.fd` + `QEMU_VARS.fd`）
+
+> `build`、`test` 和 `boot-aarch64` 全程**不需要** root。
+> `build`, `test` and `boot-aarch64` never need root.
 
 ---
 
@@ -93,6 +104,7 @@ cargo xtask [global flags] <command>
 | `all` | all | 一次做完：内核、initramfs、镜像、根文件系统 | build everything in one go | 是 yes |
 | `test` | test | 自测：宿主单元测试 + 在 QEMU 里跑 `tests.toml` 选中的用户测试程序并解析结果 | self-test sweep: host unit tests + the user test programs `tests.toml` selects, booted in QEMU | 否 no |
 | `depgraph` | depgraph | 重新测量内核模块图并对照 Phase 11 的棘轮：任何新增的向上依赖或增长的计数都会让命令失败（它同时是一个宿主测试，`cargo xtask test` 会跑到） | re-measure the kernel's module graph against the Phase-11 ratchet; fails when an upward edge appears or a count grows (also a host test, so `test` runs it) | 否 no |
+| `boot-aarch64` | boot-aarch64 | **第二台机器**：编译 aarch64 内核与它的 UEFI loader，铺一个 ESP，用 AAVMF 启动，再从 PL011 日志读结论（`M3_TABLES_OK`、`M1_TIMER_OK`）。它只启动到机器层，`arch` 之上还没移植（`PLAN.md` §9.1 阶段 1e） | **the second machine**: build the aarch64 kernel and its UEFI loader, lay out an ESP, boot it under AAVMF, and read the verdict off the PL011 log. It boots the machine layer only — nothing above `arch` is ported yet (`PLAN.md` §9.1, stage 1e) | 否 no |
 | `clean` | clean | 删除 `build/` 与 `target/` | remove the build and target directories | 视情况 when needed |
 
 ### 环境变量 | Environment variables
@@ -128,6 +140,11 @@ cargo xtask test        # 宿主单测 + 虚拟机内的用户测试程序
 
 # 看模块依赖有没有长回去 | check the module graph has not grown back
 cargo xtask depgraph    # 打印模块边与互指模块对，越过棘轮就失败
+
+# 第二台机器：走的是和 x86_64 一样的启动路径（固件 → ESP → loader → 高半区）
+# the second machine, along the same boot path x86_64 takes
+cargo xtask boot-aarch64            # 日志在 build/aarch64-serial.log
+
 
 # 发布版 | release build
 cargo xtask --profile release all
@@ -364,3 +381,7 @@ as `weston` has a marker nothing reads any more; each costs the one refresh, and
 | initramfs | initramfs | `build/initramfs.tar` | |
 | OVMF 变量副本 | OVMF vars | `build/OVMF_VARS.4m.fd` | |
 | 测试串口日志 | test serial log | `build/test-serial.log`（`test` 时生成） | written by `test` |
+| aarch64 内核 | aarch64 kernel | `target/aarch64-unknown-none/<profile>/mpos`（`boot-aarch64`） | |
+| aarch64 loader | aarch64 loader | `target/aarch64-unknown-uefi/<profile>/mpos-boot.efi` | |
+| aarch64 ESP | aarch64 ESP | `build/aarch64-esp/`（`EFI/BOOT/BOOTAA64.EFI` + `mpos.elf` + `mpos.cmdline`） | |
+| aarch64 串口日志 | aarch64 serial log | `build/aarch64-serial.log`（`boot-aarch64` 时生成，结论就从这里读） | the log `boot-aarch64` reads its verdict from |

@@ -27,34 +27,59 @@
 //!
 //! Everything here runs with the firmware's identity map still active, so a page
 //! table is addressed by its physical address and written directly.
+//!
+//! # Two machines, one plan, one format each
+//!
+//! The ranges above are the *plan*, and it does not differ between x86_64 and
+//! aarch64 - both machines want a direct map, an identity window and a
+//! higher-half alias, at the same two addresses. What differs is the descriptor
+//! each machine writes to say so, and that is the whole of the split: [`Pool`],
+//! [`map_physical_memory`], [`map_kernel_image`], [`is_ram`], [`merge`] and
+//! [`pool_bytes_for`] are shared, while [`PageTables`] has one body per machine
+//! under `vm/`. The kernel's own `arch/<arch>/paging.rs` is divided the same way
+//! and for the same reason.
 
 use alloc::vec::Vec;
 
 use crate::elf::{PAGE_SIZE, Range};
 use crate::handoff::Region;
 
+#[cfg(target_arch = "aarch64")]
+#[path = "vm/aarch64.rs"]
+mod arch;
+#[cfg(target_arch = "x86_64")]
+#[path = "vm/x86_64.rs"]
+mod arch;
+
+pub use arch::PageTables;
+
+/// The registers [`enter`] programs before it branches into the higher half.
+///
+/// They live in the aarch64 arm because they are that machine's format - one
+/// `MAIR_EL1` field per `AttrIndx`, one `TCR_EL1` for both address halves - and
+/// they are re-exported here because `main.rs`'s `enter` is the one caller and
+/// it should not have to know which module wrote them.
+///
+/// [`enter`]: crate::enter
+#[cfg(target_arch = "aarch64")]
+pub use arch::{MAIR, SCTLR_ENABLE, TCR};
+
 /// Add to a physical address to reach it through the direct map.
 ///
-/// PML4 index 256, which is where the architectural split puts the kernel half:
-/// a canonical address has bits 48..=63 equal to bit 47, so bit 47 alone decides
-/// which half an address is in. The kernel uses the same constant for its own
+/// Both machines put the kernel half's split at the same place, so one constant
+/// serves both: on x86_64 a canonical address has bits 48..=63 equal to bit 47,
+/// and on aarch64 `TTBR1` takes exactly the half whose bit 47 is set for a
+/// 48-bit virtual address space. The kernel uses the same value for its own
 /// `USER_END` check.
 pub const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
 
 /// Where the kernel image is mapped.
 ///
-/// PML4 index 511, above the window the kernel reserves for device registers
-/// (`mm::MMIO_BASE`, a little under three quarters of a gigabyte below this) and
-/// far above the direct map, which grows up from `HHDM_OFFSET` and would need
-/// 64 TiB of RAM to reach here.
+/// The top of the address space on both machines - on x86_64 PML4 index 511, on
+/// aarch64 just below the end of `TTBR1`'s range - which is the one place
+/// nothing else grows into. It sits far above the direct map, which grows up
+/// from `HHDM_OFFSET` and would need 64 TiB of RAM to reach here.
 pub const KERNEL_VIRT_BASE: u64 = 0xffff_ffff_8000_0000;
-
-const PRESENT: u64 = 1 << 0;
-const WRITABLE: u64 = 1 << 1;
-const HUGE: u64 = 1 << 7;
-const NO_EXECUTE: u64 = 1 << 63;
-/// Bits 12..=51 hold the address of the next table or of the page itself.
-const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 /// Frames for page tables, taken from one contiguous allocation and never
 /// returned.
@@ -103,95 +128,6 @@ impl Pool {
     pub fn pages_taken(&self) -> u64 {
         (self.next - self.base) / PAGE_SIZE
     }
-}
-
-/// A four-level hierarchy under construction.
-pub struct PageTables {
-    root: u64,
-    pool: Pool,
-}
-
-impl PageTables {
-    /// # Safety
-    ///
-    /// `root` must be a zeroed, writable, identity-mapped frame, and `pool` must
-    /// satisfy [`Pool::new`]'s contract.
-    pub unsafe fn new(root: u64, pool: Pool) -> PageTables {
-        PageTables { root, pool }
-    }
-
-    /// The frame the CPU is pointed at to use this hierarchy.
-    pub fn root(&self) -> u64 {
-        self.root
-    }
-
-    pub fn pool(&self) -> &Pool {
-        &self.pool
-    }
-
-    /// Map `len` bytes of physical memory at `virt`, a 4 KiB page at a time.
-    ///
-    /// Small pages rather than 2 MiB ones because none of the three ranges
-    /// starts life aligned to two megabytes: the kernel image's sections are
-    /// page-aligned, and the memory map's regions are whatever the firmware
-    /// chose. A 2 MiB mapping that overshot into a neighbouring region would
-    /// describe memory as present that the caller did not ask for, which for
-    /// MMIO is the difference between a driver working and a machine rebooting.
-    ///
-    /// The cost is page tables, and it is bounded: mapping all of a 512 MiB
-    /// machine twice over takes about 2 MiB of them.
-    pub fn map(&mut self, virt: u64, phys: u64, len: u64, writable: bool, executable: bool) {
-        assert!(
-            virt.is_multiple_of(PAGE_SIZE)
-                && phys.is_multiple_of(PAGE_SIZE)
-                && len.is_multiple_of(PAGE_SIZE)
-                && len > 0,
-            "map({virt:#x}, {phys:#x}, {len:#x}) is not whole pages"
-        );
-
-        let leaf =
-            PRESENT | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE };
-
-        let mut offset = 0;
-        while offset < len {
-            let v = virt + offset;
-            let pml4 = self.root;
-            let pdpt = self.child(pml4, index(v, 3));
-            let pd = self.child(pdpt, index(v, 2));
-            let pt = self.child(pd, index(v, 1));
-            unsafe {
-                ((pt + index(v, 0) as u64 * 8) as *mut u64).write_volatile(leaf | (phys + offset));
-            }
-            offset += PAGE_SIZE;
-        }
-    }
-
-    /// The table an entry points at, creating a zeroed one when the entry is
-    /// empty.
-    ///
-    /// Every level above a leaf is made writable so that a read-only leaf can be
-    /// reached through it: on x86_64 a write is refused if *any* level withholds
-    /// `WRITABLE`, and the kernel writes its own read-only pages' tables through
-    /// the direct map long before it writes the pages themselves.
-    fn child(&mut self, table: u64, index: usize) -> u64 {
-        let slot = unsafe { &mut *((table + index as u64 * 8) as *mut u64) };
-        if *slot & PRESENT != 0 {
-            assert!(
-                *slot & HUGE == 0,
-                "a huge page at {table:#x}[{index}] is in the way of a small one"
-            );
-            return *slot & ADDRESS_MASK;
-        }
-        let frame = self.pool.frame();
-        *slot = frame | PRESENT | WRITABLE;
-        frame
-    }
-}
-
-/// Which entry of the `level`-th table from the root covers `virt`. Level 3 is
-/// the root itself.
-fn index(virt: u64, level: u32) -> usize {
-    ((virt >> (12 + 9 * level)) & 0x1ff) as usize
 }
 
 /// Whether the firmware calls this kind of memory RAM.
@@ -266,6 +202,49 @@ pub fn map_kernel_image(
     map((text_start, text_end), false, true);
     map((rodata_start, rodata_end), false, false);
     map((data_start, data_end), true, false);
+}
+
+/// The device window the aarch64 loader maps on top of RAM, or `None` on a
+/// machine that maps none.
+///
+/// x86_64's loader deliberately maps no device range: its kernel reaches MMIO
+/// through `mm::map_mmio`, which walks a BAR and a plan, and the loader has no
+/// business guessing where a device is. aarch64 has no such path yet - stage 5's
+/// device tree is what finds the PL011 and the GIC - so the kernel reaches them
+/// at the fixed addresses QEMU's `virt` machine puts them at, and they have to
+/// be mapped as Device or the first store to a register is a translation fault
+/// the moment the firmware's identity map is replaced.
+///
+/// The range starts at 0x0800_0000 and not at zero: the low 128 MiB of `virt` is
+/// flash and the machine's own vectors, and a null pointer that silently works
+/// is the one thing x86_64's own `check_arch` asserts cannot happen.
+#[cfg(target_arch = "aarch64")]
+pub const DEVICE_BASE: u64 = 0x0800_0000;
+/// See [`DEVICE_BASE`]. 64 MiB, from the GIC's distributor to past the
+/// virtio-MMIO frames: everything this stage and stage 1c touch.
+#[cfg(target_arch = "aarch64")]
+pub const DEVICE_WINDOW: u64 = 0x0400_0000;
+
+/// Map the machine's device window, Device and never executable.
+#[cfg(target_arch = "aarch64")]
+pub fn map_device_window(tables: &mut PageTables) {
+    tables.map_device(DEVICE_BASE, DEVICE_BASE, DEVICE_WINDOW);
+}
+
+/// Bytes this machine's loader maps beyond RAM, so the page-table pool is sized
+/// for everything that will be mapped rather than for RAM alone.
+///
+/// A device window costs a page table per 2 MiB whether it is RAM or not, and
+/// the pool is allocated before the first one is taken.
+pub fn extra_mapped_bytes() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        DEVICE_WINDOW
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        0
+    }
 }
 
 fn align_down(value: u64) -> u64 {
