@@ -208,6 +208,11 @@ impl Slab {
         // second bug.
         let over_aligned = layout.align() > PAGE_SIZE;
         if over_aligned && self.large_count == MAX_LARGE {
+            // The heap is the same on both machines, but its *voice* is not:
+            // `println!` goes through the console mux, which is x86_64's until
+            // aarch64 grows one (stage 4). A machine with nowhere to print says
+            // nothing here rather than saying it into a stub.
+            #[cfg(target_arch = "x86_64")]
             crate::println!(
                 "heap: large table full ({} entries), {} bytes aligned {}",
                 MAX_LARGE,
@@ -217,6 +222,7 @@ impl Slab {
             return ptr::null_mut();
         }
         let Some(block) = alloc_pages(order) else {
+            #[cfg(target_arch = "x86_64")]
             crate::println!(
                 "heap: no frames left for order {order} ({} bytes requested)",
                 layout.size()

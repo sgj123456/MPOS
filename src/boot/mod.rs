@@ -9,7 +9,16 @@
 // The kernel build is the only one that needs this, and the host cannot
 // provide the loader's record - but the layout it declares is a promise to
 // another crate, so `test` keeps it compiled where the tests can pin it.
-#[cfg(all(any(target_os = "none", test), target_arch = "x86_64"))]
+//
+// Both machines keep it compiled too, and that is the point of the record: it
+// carries plain data and no page-table root, no GDT, no EFI table, so the same
+// `boot/src/handoff.rs` serves the x86_64 loader and the aarch64 one stage 1e
+// adds. The `target_arch` half of the gate is therefore a list of the machines
+// that have a loader, not a property of the record.
+#[cfg(all(
+    any(target_os = "none", test),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub mod handoff;
 
 /// The consoles this boot writes its kernel log to, read off the command line

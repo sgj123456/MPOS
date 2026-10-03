@@ -26,12 +26,23 @@ rustflags = [
     "-C", "link-arg=-zmax-page-size=0x1000",
 ]
 
-# There is no `[target.aarch64-unknown-none]` here, and there used to be: it
-# named `src/arch/aarch64/linker.ld`, which has never existed, so the profile
-# described a target that could not link. The port's real prerequisites are
-# `PLAN.md` §9.1; until they are written the configuration does not claim a
-# backend it cannot build. Re-adding the block is one line, next to a script
-# that is actually there.
+# There used to be a `[target.aarch64-unknown-none]` block here naming a script
+# that had never existed, so it described a target that could not link and was
+# removed (PLAN.md §9.1, V-8). It is back, next to the script it names: the
+# machine body and the gate list it plugs into are `src/arch/aarch64/`'s, and
+# `cargo build --target aarch64-unknown-none` links an ELF.
+#
+# The relocation model is `static`, not the x86_64 block's `pic`: the image is
+# linked at the fixed address the bring-up path loads it at, and only becomes
+# relocatable when stage 1e's loader places the segments itself - at which point
+# this block grows `-pie` and `-ztext` the way the x86_64 one has them.
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=--script=src/arch/aarch64/linker.ld",
+    "-C", "link-arg=-ztext",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]
 
 # The user programs: ordinary Rust binaries for musl, which is the libc this
 # kernel's Linux ABI is written against. They are **statically** linked and

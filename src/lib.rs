@@ -25,6 +25,40 @@
 //! host-compiled one is a build error only on the day somebody builds for the
 //! host. `xtask`'s `gates::dead_host_tests`, run by `cargo xtask test`, walks
 //! this file's `mod` declarations and fails on the first shape.
+//!
+//! # Two machines, and which stages have un-gated what
+//!
+//! The gate above is not only "host or machine" any more. `target_os = "none"`
+//! is true for aarch64 as well as x86_64, so every module the second machine
+//! cannot yet compile needs `target_arch = "x86_64"` spelled out too - and the
+//! compiler will not say so until someone builds for aarch64, which is exactly
+//! why the list is written down here rather than discovered (`PLAN.md` §9.1).
+//!
+//! A port is not one diff: the machine layer is stage 1, and the subsystems
+//! above it un-gate one stage at a time, each landing with the trait or the
+//! door that lets it compile. The ledger, as it stands:
+//!
+//! - **compiled for every target the build has** - `arch` (both bodies),
+//!   `boot`, `mm` (its pure half and the heap; the MMIO window is x86_64's
+//!   until stage 5), `logging` (the level vocabulary; the subscriber writes to
+//!   a console only x86_64 has), `rand`, `sync`, `uevent`, and every `crates/*`
+//!   leaf.
+//! - **not on aarch64 yet**, and the two ways a module can be that:
+//!   - *machine-only modules that were already `target_os = "none"`* move to
+//!     `all(target_os = "none", target_arch = "x86_64")`. `console` and
+//!     `drivers` (stage 5), `hal` (its trait impls land with 1c's
+//!     `Interrupts`/`Cpu`, 1d's `Paging` and stage 2's `Contexts`) and `net`
+//!     (stage 6) are these.
+//!   - *host-compiled modules* - `sched` (3), `vfs` (4), `syscall` (6) and
+//!     `uaccess` (6) - keep the host and x86_64 bare metal and exclude only the
+//!     aarch64 build, `any(not(target_os = "none"), target_arch = "x86_64")`.
+//!     They are the ones the host unit suite pins, and gating them to
+//!     `target_arch = "x86_64"` would silently delete that coverage: the module
+//!     would compile, the tests just would not exist.
+//!
+//! The stage number in brackets is where each un-gates; nothing above claims a
+//! green it does not have - a module listed as x86_64-only is one the aarch64
+//! build does not compile *yet*, not one it compiles differently.
 
 #![no_std]
 #![cfg_attr(
@@ -54,7 +88,10 @@ pub use mpos_binfmt as binfmt;
 /// a convention.
 pub use mpos_blk as blk;
 pub mod boot;
-#[cfg(target_os = "none")]
+/// The log ring, serial, framebuffer switch and the six virtual consoles.
+/// x86_64's for now: it is the framebuffer and 16550 mux, and the aarch64
+/// console is a PL011 the kernel does not have outside `arch` until stage 4.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod console;
 /// The process credential model: the four capability sets, the dumpable flag
 /// and `KEEPCAPS`. Its own pure leaf crate; the storage lives on the thread
@@ -64,7 +101,7 @@ pub use mpos_cred as cred;
 /// The civil calendar: day counts to dates and back. Its own pure leaf crate;
 /// the `arch` half that writes it to hardware stays behind the target gate.
 pub use mpos_date as date;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod drivers;
 /// The errno table: the numbers every layer answers "no" with. Its own leaf
 /// crate, re-exported here so `crate::err` keeps resolving for every caller,
@@ -74,7 +111,13 @@ pub use mpos_err as err;
 /// and the forwards everything above asks it through (`src/hal/mod.rs`). Machine
 /// only, like `arch` itself - it exists so that nothing outside `arch`/`hal`
 /// names an architecture.
-#[cfg(target_os = "none")]
+///
+/// x86_64-only for now, and by construction rather than by choice: the forwards
+/// at the bottom of `hal/mod.rs` name all six traits, so the module can only be
+/// compiled for a machine that implements all six. The aarch64 impls land with
+/// their stages - `Cpu`/`Interrupts` at 1c, `Paging` at 1d, `Contexts` at 2 -
+/// and this gate goes when the last of them does.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod hal;
 /// evdev's record window and its clients: which reader sees which event, and
 /// what a grab does to the answer. Its own leaf crate - the driver that fills
@@ -96,8 +139,10 @@ pub use mpos_gpu as gpu;
 pub mod logging;
 pub mod mm;
 /// The network stack, and the socket syscalls over it. Host builds skip it:
-/// its tests are the conformance programs that run on the machine.
-#[cfg(target_os = "none")]
+/// its tests are the conformance programs that run on the machine. aarch64
+/// skips it too until stage 6 - its transport is virtio-PCI found through the
+/// legacy I/O-port config mechanism, which is x86_64's.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod net;
 /// The PCI devices the machine has, and the files `/sys` and `/proc` describe
 /// them with. Its own leaf crate: the model and every spelling are pure; only
@@ -107,12 +152,31 @@ pub use mpos_pci as pci;
 /// read. Not target-gated: it runs on the host so its tests can prove the one
 /// property that matters - that two reads are not the same bytes.
 pub mod rand;
+/// The task table, priority bands, sleep/block, signals and futex. Un-gated on
+/// aarch64 by stage 3, which is when its one machine reference - the TLS `MSR`
+/// write in `sched/runtime.rs` - moves behind `hal`/`arch`.
+///
+/// The predicate is "the host, or x86_64 bare metal", not "x86_64" alone:
+/// `sched` is host-compiled (it has no port I/O of its own - its machine
+/// references sit behind `target_os = "none"` gates inside it), and the host
+/// unit suite is the pin for its policy. Gating it to `target_arch = "x86_64"`
+/// would drop that host coverage, which is exactly the failure this port's
+/// stage list has to avoid.
+#[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
 pub mod sched;
 /// `SECCOMP_MODE_FILTER`'s program: the classic-BPF interpreter, its validation
 /// and the action ordering. Its own leaf crate (nothing in it knows what a task
 /// is); the task table and the syscall gate decide who has one and when it runs.
 pub use mpos_seccomp as seccomp;
 pub mod sync;
+/// The Linux ABI: numbers, `abi.rs` facts, dispatch and handlers. x86_64's
+/// register file and numbering until stage 6, which is where the aarch64
+/// numbers (`openat` is 56, not 257) and the `svc #0` gate land.
+///
+/// Host-compiled like `sched`, so the exclusion is the bare-metal aarch64 build
+/// and nothing else - the ABI facts and the errno mappings it carries are
+/// pinned by host tests.
+#[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
 pub mod syscall;
 /// The terminal emulator: the cell grid a byte stream is painted into, the
 /// cursor it moves, the blitter that turns cells into pixels and the keystroke
@@ -124,6 +188,12 @@ pub use mpos_term as term;
 /// `VfsError` into the errno userland reads. They live at the crate root so a
 /// layer *below* `syscall` (net, a driver) can reach them without naming the
 /// ABI layer for a page walk; `syscall` re-exports them for its own handlers.
+///
+/// x86_64's until stage 6: both halves are the ABI's - `err_of` names `VfsError`
+/// and the pointer check asks the page tables - and both arrive with the rest of
+/// the aarch64 ABI. Host-compiled, though, because `vfs`'s own host tests call
+/// the pointer bound with `from_user = false`.
+#[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
 pub mod uaccess;
 /// Device events: what the kernel tells userland when a device
 /// appears, and the netlink socket they travel over. Not target-gated:
@@ -140,15 +210,23 @@ pub use mpos_uinput as uinput;
 /// (*ownership* over two `String`s); the task table that decides whose
 /// namespace is whose is bare metal.
 pub use mpos_uts as uts;
+/// The filesystem layer: mounts, the fd table, every filesystem, pipes and the
+/// device doors. Un-gated on aarch64 by stage 4; until then it names `drivers`
+/// through `procfs`/`sysfs`/`p9`, which stage 5 brings to this machine.
+///
+/// Host-compiled - the ramfs, the ext4 cache and the fd table are the largest
+/// block of host-pinned logic in the kernel - so only the bare-metal aarch64
+/// build is excluded here.
+#[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
 pub mod vfs;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => ($crate::console::print_args(format_args!($($arg)*)));
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[macro_export]
 macro_rules! println {
     () => ($crate::print!("\n"));

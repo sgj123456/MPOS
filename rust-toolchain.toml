@@ -3,6 +3,11 @@ channel = "nightly"
 components = ["rust-src", "rustfmt", "clippy"]
 targets = [
     "x86_64-unknown-none",
+    # The other machine. `-none` is the kernel itself; `-uefi` is its loader,
+    # which has to be added the day `boot/` grows an aarch64 arm (stage 1e)
+    # rather than the day someone tries to build it.
+    "aarch64-unknown-none",
+    "aarch64-unknown-uefi",
     # The userland: statically linked musl binaries, which is the shape the
     # kernel's loader accepts.
     "x86_64-unknown-linux-musl",

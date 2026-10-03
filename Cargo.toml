@@ -91,14 +91,29 @@ tracing = { version = "0.1", default-features = false }
 [dev-dependencies]
 mpos-pci = { path = "crates/pci", features = ["test-helpers"] }
 
+# Both bare-metal machines: the interrupt-masking critical section every layer
+# below the scheduler locks with. Each `arch/<arch>/critical.rs` supplies the
+# implementation - `cli`/`sti` on x86_64, the `DAIF` mask on aarch64 - so the
+# dependency itself is shared even though the machine body is not.
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = { version = "1.2", features = ["restore-state-bool"] }
-# The TCP/IP stack: ARP, IPv4, ICMP, UDP and TCP with retransmission and
-# window management are upstream's problem now, not this kernel's. The
-# feature set is exactly what QEMU's user network needs - Ethernet framing,
-# IPv4, and the two socket types musl's resolver and apk speak - and
-# deliberately nothing else: no std, no log, no IPv6, no DNS (musl resolves
-# in userland over ordinary UDP sockets).
+
+# The host test build compiles the VFS too, which locks; `std` picks the stock
+# critical section for hosted targets.
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }
+
+# x86_64-only: mpos-boot is the x86_64 UEFI loader, the 16550 driver talks to
+# port I/O, and the IDT's one-time init is the only spin::Once user. The network
+# stack is here rather than in the shared block because `net` is x86_64's: it
+# rides a virtio-PCI device found through the legacy I/O-port config mechanism.
+[target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
+uart_16550 = "0.8"
+spin = { version = "0.12", default-features = false, features = ["once", "lazy"] }
+x86_64 = { version = "0.15", default-features = false, features = [
+    "instructions",
+    "abi_x86_interrupt",
+] }
 smoltcp = { version = "0.13", default-features = false, features = [
     "alloc",
     "medium-ethernet",
@@ -109,20 +124,13 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "auto-icmp-echo-reply",
 ] }
 
-# The host test build compiles the VFS too, which locks; `std` picks the stock
-# critical section for hosted targets.
-[target.'cfg(not(target_os = "none"))'.dependencies]
-critical-section = { version = "1.2", features = ["std"] }
-
-# x86_64-only: mpos-boot is the x86_64 UEFI loader, the 16550 driver talks to port
-# I/O, and the IDT's one-time init is the only spin::Once user.
-[target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
-uart_16550 = "0.8"
-spin = { version = "0.12", default-features = false, features = ["once", "lazy"] }
-x86_64 = { version = "0.15", default-features = false, features = [
-    "instructions",
-    "abi_x86_interrupt",
-] }
+# aarch64-only, and deliberately empty today: the console is PL011 driven
+# through `volatile` reads (no crate), the boot stack is the linker script's,
+# and the interrupt controller does not arrive until stage 1c. The table exists
+# now so that a dependency this machine needs has an obvious home beside the
+# x86_64 one, rather than being added to the shared block and quietly attaching
+# itself to both machines.
+[target.'cfg(all(target_os = "none", target_arch = "aarch64"))'.dependencies]
 
 [profile.dev]
 panic = "abort"

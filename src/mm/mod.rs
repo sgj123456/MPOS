@@ -42,28 +42,27 @@ static ALLOCATOR: heap::KernelHeap = heap::KernelHeap::empty();
 #[cfg(target_os = "none")]
 /// Where a device's registers get mapped.
 ///
-/// The bootloader's direct map covers physical memory and nothing else, and a
-/// PCI BAR is not memory: it is a range of addresses that answers to a device.
-/// Devices therefore get a window of their own, above the user half and below
-/// the kernel's own image, handed out a mapping at a time and never reused -
-/// a device's registers are reachable for as long as the machine is up, so
-/// there is nothing to recycle.
-#[cfg(target_os = "none")]
+/// x86_64's window, and x86_64's for a concrete reason rather than an accident:
+/// the address is one the *kernel half* has room for on that machine's four
+/// levels, and a second machine's page-table format puts its own kernel half at
+/// its own base. aarch64 gets this back with its `Paging` impl in stage 5, when
+/// there is a device on the machine to map.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub const MMIO_BASE: usize = 0xffff_ffff_4000_0000;
 /// One past the end of the window: 1 GiB of address space, which is room for
 /// every BAR a machine could plausibly have.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 const MMIO_LIMIT: usize = 0xffff_ffff_8000_0000;
 
 /// The next free byte in that window.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static MMIO_NEXT: AtomicUsize = AtomicUsize::new(MMIO_BASE);
 
 /// Map a device's registers into the kernel half and return the address they
 /// can be reached through.
 ///
 /// Called once per BAR, at the moment a driver decides it wants the device.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn map_mmio(phys: usize, len: usize) -> usize {
     let len = pframe::align_up(len, PAGE_SIZE);
     let virt = MMIO_NEXT.fetch_add(len, Ordering::Relaxed);

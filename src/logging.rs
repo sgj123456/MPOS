@@ -29,7 +29,7 @@ use core::fmt;
 
 use tracing::Level;
 use tracing::field::{Field, Visit};
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use tracing::{Event, Metadata};
 
 /// A rank that compares like verbosity: bigger is more verbose. `Level` itself
@@ -114,12 +114,19 @@ impl Visit for FieldCollector {
     }
 }
 /// The most verbose level that reaches the console.
-#[cfg(target_os = "none")]
+///
+/// The level vocabulary above and the collector beside it are pure and shared;
+/// the *subscriber* is x86_64's, because it writes to `crate::console` and
+/// stamps its lines from `crate::hal::ticks`, and aarch64 has neither until its
+/// console (stage 4) and clock (stage 1c) land. Until then this machine's kernel
+/// log has no sink and the gate says so, rather than a subscriber that would
+/// have to be trusted to be doing nothing.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static MAX_LEVEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(3);
 
 /// Install the console subscriber and set the level the command line asked
 /// for. Called once, from the boot task, as soon as `/proc/cmdline` exists.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn init() {
     use core::sync::atomic::Ordering;
 
@@ -133,10 +140,10 @@ pub fn init() {
     let _ = tracing::subscriber::set_global_default(ConsoleSubscriber);
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 struct ConsoleSubscriber;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl tracing::subscriber::Subscriber for ConsoleSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         use core::sync::atomic::Ordering;
@@ -168,7 +175,7 @@ impl tracing::subscriber::Subscriber for ConsoleSubscriber {
 
 /// One line, in the shape `dmesg` prints: a boot-relative timestamp, the
 /// level, the target that spoke, the message, then any structured fields.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn render(metadata: &Metadata<'_>, fields: &FieldCollector) -> String {
     let ticks = crate::hal::ticks();
     let hz = crate::hal::TICK_HZ as u64;

@@ -45,7 +45,9 @@ would build the musl user programs for the host.
 ## 3. Build, run, verify
 
 Prereqs: nightly toolchain with `rust-src rustfmt clippy`; targets `x86_64-unknown-none`,
-`-uefi`, `-linux-musl`, `-linux-gnu`. For `run`/`disk`/`rootfs` also: `qemu-system-x86_64`, OVMF
+`-uefi`, `-linux-musl`, `-linux-gnu`, and for the aarch64 side `aarch64-unknown-none`,
+`-uefi` (both named in `rust-toolchain.toml`, so rustup installs them on first use). For
+`run`/`disk`/`rootfs` also: `qemu-system-x86_64`, OVMF
 (`/usr/share/OVMF/x64/OVMF_CODE.4m.fd`), `qemu-img`/`qemu-nbd`, `sfdisk`, `partx`, `blkid`,
 `mkfs.ext4`, `mkfs.fat`, `tar`, `sudo`. `rootfs`/`initramfs` fetch Alpine packages over the network.
 

@@ -664,7 +664,7 @@ it - so the entries say which they are:
 - [x] 10.6 Serial TX ring (drained by the TX-held interrupt; the mirror drops
       rather than stalls) · [ ] 10.7 Sub-tick sleeps (LAPIC one-shot)
 
-**Architectures (Phase 9 — far future)**
+**Architectures (Phase 9 — aarch64 stage 1a landed (§9.1))**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
@@ -5170,15 +5170,75 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: kernel ELF compiles but boot flow incomplete.
+Current status: **stage 1a landed**. The toolchain targets exist, the linker
+script exists, the gates are two-way and `cargo build --target
+aarch64-unknown-none` links a bootable ELF. Nothing above `arch` is ported yet;
+`src/lib.rs`'s header carries the stage ledger, which is the record of which
+module un-gates when.
 
-**Needed**:
-- AArch64 exception vector table (`VBAR_EL1`)
-- GICv2/v3 interrupt controller driver
-- ARM virtual memory (4KB pages, 3/4-level tables via `TTBR0_EL1`/`TTBR1_EL1`)
-- PSCI for power management (reboot, shutdown)
-- Timer via `CNTP_EL0` (ARM generic timer)
-- UART via PL011 or SBSA
+This section used to say "kernel ELF compiles but boot flow incomplete", which
+was false in both halves. Nothing compiled for aarch64 - V-8 (§11.1.8) removed
+the `[target.aarch64-unknown-none]` block that named a linker script which had
+never existed - and "incomplete" hid the real shape of the work, which is not
+one boot sequence but a second ABI. Measured: the x86-specific surface is
+*concentrated* (port I/O in seven files, no ACPI consumer, no IOAPIC, no HPET,
+no i8042), but `src/syscall/linux/` is 11028 lines and `src/drivers/` 14481, and
+that is the long tail, not the machine layer. `src/` also carried only 17
+`target_arch` gates, so everything else was gated on `target_os = "none"` alone
+- true for both bare-metal targets - and tried to compile for aarch64 and could
+not.
+
+So the order below is the measured one. Each stage is its own commit and is
+verified by the means named; none of them claims a green from compilation alone.
+
+| # | Stage | Verified by |
+|---|---|---|
+| 1a | Build plumbing: `rust-toolchain.toml` targets, `src/arch/aarch64/linker.ld`, `[target.aarch64-unknown-none]`, the gate list and the stage ledger | `cargo build --target aarch64-unknown-none` links; the x86 gate stays green |
+| 1b | The machine body: PL011 at `0x0900_0000`, the `_start` stub, the banner | `qemu-system-aarch64 -M virt -kernel` prints the banner |
+| 1c | Exception vectors (`VBAR_EL1`), GICv2, the generic timer (`CNTPCT_EL0`/`CNTP_TVAL_EL0`) | an IRQ increments a counter printed on the tick |
+| 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | boots on its own tables and runs the `mm` self-check |
+| 1e | The aarch64 loader: `boot/src/vm.rs` gains a `TTBR1` body, `BOOTAA64.EFI`, AAVMF | QEMU + AAVMF boots the real image from the ESP |
+| 2 | Contexts and user entry: `x19..x28`/`fp`/`lr`/`sp`, `q0..q31`, `eret` | a boot-time switch between two kernel tasks |
+| 3 | Un-gate `sched` (the TLS `MSR` write moves behind `hal`/`arch`) | `cargo build --target aarch64-unknown-none` with `sched` in |
+| 4 | Un-gate `console` and `vfs` (serial-only console first) | a ramfs root with the initramfs untarred |
+| 5 | Drivers: DTB parsing, virtio-MMIO, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up |
+| 6 | The aarch64 Linux ABI: `nr.rs` per arch, the `x0..x30` register file, signal frames, `svc #0`, `TPIDR_EL0` TLS | the `t-*` conformance programs run on aarch64 |
+| 7 | aarch64 userspace and the image: `aarch64-unknown-linux-musl` builds, ESP layout for AAVMF, arch-aware `xtask` | `cargo xtask test` passes on aarch64 |
+| 8 | The gate: `xtask test`/`run` grow an arch selection | a green aarch64 gate quoted with its summary line and exit code |
+
+Named gaps the port carries rather than hides, each with its home:
+
+- **The `-kernel` bring-up is an instrument, not the boot path.** Stages 1b-1d
+  enter at a fixed physical address with the MMU off, because that is the
+  smallest thing that proves the toolchain, the linker script and the machine
+  body agree. Stage 1e deletes it and boots from the ESP through AAVMF, which is
+  the promise this section makes: a second machine with the *same* boot path,
+  not a shortcut past it.
+- **The machine addresses are hardcoded.** QEMU virt puts PL011 at
+  `0x0900_0000` and the GIC at `0x0800_0000`/`0x0801_0000`; the DTB the firmware
+  passes in `x0` is what a real port reads, and stage 5 is where it does. Until
+  then they are honest for one machine and named as such.
+- **`hal` is x86_64-only until its traits exist on aarch64.** The forwards at
+  the bottom of `hal/mod.rs` name all six concern traits, so the module cannot
+  compile for a machine that implements fewer. aarch64 gets `Cpu`/`Interrupts`
+  at 1c, `Paging` at 1d and `Contexts` at stage 2; the gate goes with the last.
+- **No ACPI consumer exists to reuse.** `virt` + AAVMF passes a *device tree*,
+  so device discovery is new DTB-parsing code in stage 5, not a port of an
+  existing table walk.
+- **`rand` has no aarch64 hardware source yet**, so `seed()` takes its
+  deterministic arm there; `RNDR` (where present) and the boot-epoch mix land
+  with stage 5's drivers.
+- **A host-compiled module is excluded from the aarch64 build without being
+  excluded from the host.** `sched`/`vfs`/`syscall`/`uaccess` are the host unit
+  suite's, so their gate is `any(not(target_os = "none"), target_arch =
+  "x86_64")` - "the host, or x86_64 bare metal" - not `target_arch =
+  "x86_64"`, which would have silently deleted 434 host tests while compiling
+  cleanly.
+
+**The older prerequisite list, kept for the record** (all six still stand, and
+the stage table above is where each lands): the `VBAR_EL1` exception vector
+table, a GICv2/v3 driver, 4 KiB pages through `TTBR0_EL1`/`TTBR1_EL1`, PSCI for
+reboot/shutdown, the generic timer, and a PL011 or SBSA UART.
 
 ### 9.2 RISC-V Support
 

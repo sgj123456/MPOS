@@ -23,7 +23,11 @@ extern crate alloc;
 #[path = "main/x86_64.rs"]
 mod body;
 
-#[cfg(not(any(target_arch = "x86_64")))]
+#[cfg(target_arch = "aarch64")]
+#[path = "main/aarch64.rs"]
+mod body;
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!(
     "no kernel entry for this target: add src/main/<arch>.rs and a `#[path]` arm here, \
      and see PLAN.md §9.1 for what a port needs"
