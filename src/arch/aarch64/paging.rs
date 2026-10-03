@@ -390,7 +390,8 @@ pub fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
 /// requires the `USER` bit, which is what makes `PAGE_MAP` in `/proc` refuse to
 /// leak a kernel mapping a caller named by address.
 pub fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
-    walk_from(root, virt).and_then(|(phys, flags, _)| flags.contains(MapFlags::USER).then_some(phys))
+    walk_from(root, virt)
+        .and_then(|(phys, flags, _)| flags.contains(MapFlags::USER).then_some(phys))
 }
 
 /// Whether `start..start + len` is mapped in the *active* space as a user range

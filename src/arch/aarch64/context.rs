@@ -469,8 +469,6 @@ pub unsafe fn set_kernel_stack(top: usize) {
     }
 }
 
-
-
 global_asm!(
     // x0: the context being suspended (written). x1: the one being resumed.
     ".globl mpos_context_switch",

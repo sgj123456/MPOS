@@ -722,6 +722,9 @@ mod tests {
     fn a_file_that_names_no_machine_is_refused() {
         let mut bytes = elf(0x1000, &[(PT_LOAD, 6, 0x1000, 0x100, b"x")]);
         bytes[18..20].copy_from_slice(&0u16.to_le_bytes());
-        assert!(parse(&bytes).is_none(), "e_machine 0 is not a known machine");
+        assert!(
+            parse(&bytes).is_none(),
+            "e_machine 0 is not a known machine"
+        );
     }
 }
