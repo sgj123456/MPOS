@@ -317,6 +317,144 @@ pub fn roots() -> (usize, usize) {
     (TTBR0.load(Ordering::Relaxed), TTBR1.load(Ordering::Relaxed))
 }
 
+/// The root the hardware walks `virt` through: `TTBR1` for the high half and
+/// `TTBR0` for the low, decided by the top bit of the address exactly as
+/// [`translate`] does. Shared by the operations that ask about the *active*
+/// space, so a kernel address is never answered from a process's tables.
+fn root_for(virt: usize) -> usize {
+    if virt >> (usize::BITS - 1) != 0 {
+        TTBR1.load(Ordering::Relaxed)
+    } else {
+        TTBR0.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The questions asked of an address space that is not the only one - the half
+// of `hal::Paging` that needs a running process. Stage 6b built the operations
+// a `UserSpace` performs on itself; these read the machine's state and walk a
+// root the caller names, which is what the scheduler (`active_root`,
+// `switch_to_root`) and the uaccess/signal path (`user_accessible`,
+// `write_user_u32`, `phys_for_virt_of`) will call once they un-gate here.
+// ---------------------------------------------------------------------------
+
+/// The root of the address space currently active on this CPU (`TTBR0_EL1`).
+pub fn active_root() -> usize {
+    TTBR0.load(Ordering::Relaxed)
+}
+
+/// The root of the kernel's own address space (`TTBR1_EL1`), which is also what
+/// `TTBR0_EL1` names when no process is installed.
+pub fn kernel_root() -> usize {
+    TTBR1.load(Ordering::Relaxed)
+}
+
+/// Make `root` the active low half. The kernel's high half (`TTBR1_EL1`) is not
+/// touched, so the switch is safe while this code runs from it.
+///
+/// # Safety
+///
+/// `root` must name a complete low half - the barriers `load_root0` runs flush
+/// the previous space's cached translations, so a half-way table would fault the
+/// very next instruction fetch. The scheduler installs a space only after it has
+/// mapped it.
+pub unsafe fn switch_to_root(root: usize) {
+    // SAFETY: the caller's contract, passed to `load_root0` unchanged.
+    unsafe { load_root0(root) };
+    TTBR0.store(root, Ordering::Relaxed);
+}
+
+/// Switch back to the kernel's own space by pointing `TTBR0_EL1` at its root.
+///
+/// The kernel half is empty below `USER_END`, so this is the "no process" state:
+/// a low address stops resolving entirely rather than resolving into whichever
+/// process was last installed.
+pub fn switch_to_kernel() {
+    let root = TTBR1.load(Ordering::Relaxed);
+    // SAFETY: the kernel's own root is the one value always safe to install - its
+    // low half is empty and everything the kernel runs from is in `TTBR1_EL1`.
+    unsafe { load_root0(root) };
+    TTBR0.store(root, Ordering::Relaxed);
+}
+
+/// The frame backing `virt` in the space rooted at `root`, if any.
+///
+/// A process asking `mincore` about its own mapping is answered from its page
+/// tables whichever of them is installed, so this walks the root the caller
+/// names, not the active one.
+pub fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+    walk_from(root, virt).map(|(phys, _, _)| phys)
+}
+
+/// [`phys_for_virt_of`], but only for a page the user may touch - the walk
+/// requires the `USER` bit, which is what makes `PAGE_MAP` in `/proc` refuse to
+/// leak a kernel mapping a caller named by address.
+pub fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+    walk_from(root, virt).and_then(|(phys, flags, _)| flags.contains(MapFlags::USER).then_some(phys))
+}
+
+/// Whether `start..start + len` is mapped in the *active* space as a user range
+/// the caller's access allows: every page it touches must carry `USER` and `READ`
+/// (and `WRITE` when `write` is set). A range that runs off the top of the low
+/// half into the kernel's is rejected whole, because a user pointer is a `TTBR0`
+/// address by definition.
+pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return false,
+    };
+    // Every touched page, from the page `start` lies in to the page the last byte
+    // lies in. `USER` is required throughout: a kernel mapping is never a valid
+    // uaccess target, and its permissions would answer `true` on their own.
+    let mut page = start & !(PAGE_SIZE - 1);
+    loop {
+        if page >> (usize::BITS - 1) != 0 {
+            // Walked up into `TTBR1`'s half - not a user range.
+            return false;
+        }
+        match translate(page) {
+            Some((_, flags, _))
+                if flags.contains(MapFlags::USER)
+                    && flags.contains(MapFlags::READ)
+                    && (!write || flags.contains(MapFlags::WRITE)) => {}
+            _ => return false,
+        }
+        if page + PAGE_SIZE >= end {
+            return true;
+        }
+        page += PAGE_SIZE;
+    }
+}
+
+/// Whether the leaf mapping at `virt` in the *active* space carries the
+/// copy-on-write marker. The hardware does not enforce that bit, so `translate`
+/// never reports it; this asks the descriptor directly. It is the first question
+/// a data-abort handler asks to tell a COW fault from a real one.
+pub fn is_cow_page(virt: usize) -> bool {
+    leaf_of(root_for(virt), virt).is_some_and(|(_, _, entry)| entry & COW_BIT != 0)
+}
+
+/// Write `value` to the user address `at` through the space rooted at `root`,
+/// answering whether the address was mapped. Used to place a signal trampoline
+/// and the signal frame into a task the kernel is not currently running, so it
+/// must reach through *that* task's tables and the direct map, not a live switch.
+pub fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
+    match leaf_of(root, at) {
+        Some((_, _, entry)) => {
+            let phys = (entry & ADDR_PAGE) as usize + (at & (PAGE_SIZE - 1));
+            // SAFETY: `root` names a mapping the caller asked us to write, and the
+            // direct map - active in `TTBR1` whichever low half is installed -
+            // reaches the frame `phys` is in.
+            unsafe { core::ptr::write(mm::phys_to_virt(phys) as *mut u32, value) };
+            true
+        }
+        None => false,
+    }
+}
+
 /// A hierarchy under construction, with its frames from the frame allocator.
 ///
 /// No arena and no pool: stage 1d had one because there was no allocator to draw

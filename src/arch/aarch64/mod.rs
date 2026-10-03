@@ -188,6 +188,7 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
     check_timer();
     check_context();
     check_user_memory();
+    check_paging_ops();
     check_el0();
     halt()
 }
@@ -1589,6 +1590,175 @@ fn check_user_memory() {
          and the page it mapped not among them",
     );
     let _ = writeln!(out, "M6_AS_OK");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 6c's check: the address-space questions that need a running process
+// ---------------------------------------------------------------------------
+
+/// The pages [`check_paging_ops`] walks through the machine's active-root and
+/// named-root operations, in a `TTBR0` span that collides with neither 6a's
+/// program (`0x20_0000`) nor 6b's address-space set (`0x30_0000`).
+const PG_VA_A: usize = 0x0040_0000;
+const PG_VA_B: usize = 0x0040_1000;
+/// Deliberately left unmapped, so "nothing there" is distinguishable from
+/// "there but refused".
+const PG_VA_UNMAPPED: usize = 0x0040_2000;
+
+/// Stage 6c's evidence: the half of `hal::Paging` that reads the space the CPU is
+/// running *right now*, and the half that walks a space named by its root rather
+/// than installed. Stage 6b built what a `UserSpace` does to itself; a scheduler
+/// and a signal/uaccess path (stages 3 and 6) ask different questions - which
+/// root is active, which is the kernel's, is this user range touchable, is this
+/// page copy-on-write, put a word into a task that is not running. None of those
+/// existed until now, and none is one the compiler would catch wrong: they are
+/// each answered by re-reading the hardware state they claim to report.
+fn check_paging_ops() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M6_PAGING_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    let user = MapFlags::USER | MapFlags::READ | MapFlags::WRITE;
+
+    let Some(a) = zeroed_frame() else {
+        fail!("out of frames for the running-process paging check")
+    };
+    let Some(b) = zeroed_frame() else {
+        fail!("out of frames for the running-process paging check")
+    };
+    // SAFETY: two frames the allocator just handed over and nothing else holds.
+    unsafe { core::ptr::write_bytes(mm::phys_to_virt(a) as *mut u8, 0x5a, PAGE_SIZE) };
+
+    let mut space = paging::UserSpace::new();
+    space.map(Mapping {
+        virt: PG_VA_A,
+        phys: a,
+        length: PAGE_SIZE,
+        flags: user,
+    });
+    space.map(Mapping {
+        virt: PG_VA_B,
+        phys: b,
+        length: PAGE_SIZE,
+        flags: user,
+    });
+    let root = space.root();
+    space.switch();
+
+    // The active root is the installed space's and the kernel's is a different
+    // one: the two registers this machine only learned to tell apart at stage 6a.
+    if paging::active_root() != root {
+        fail!(
+            "active_root() reports {:#x}, not the installed {root:#x}",
+            paging::active_root()
+        );
+    }
+    if paging::kernel_root() == root {
+        fail!("kernel_root() and active_root() are the same space ({root:#x})");
+    }
+
+    // Walking a root the caller names - the shape a `fork` and a signal frame are
+    // written on - user-gated and not, and the unmapped page answered as absent.
+    if paging::phys_for_virt_of(root, PG_VA_A) != Some(a) {
+        fail!(
+            "phys_for_virt_of({PG_VA_A:#x}) is {:?}, expected {a:#x}",
+            paging::phys_for_virt_of(root, PG_VA_A)
+        );
+    }
+    if paging::user_phys_for_virt_of(root, PG_VA_A) != Some(a) {
+        fail!(
+            "user_phys_for_virt_of refused a USER page: {:?}",
+            paging::user_phys_for_virt_of(root, PG_VA_A)
+        );
+    }
+    if paging::phys_for_virt_of(root, PG_VA_UNMAPPED).is_some() {
+        fail!("phys_for_virt_of named a frame at the unmapped {PG_VA_UNMAPPED:#x}");
+    }
+
+    // uaccess: a mapped page for read and for write; an unmapped page refused; and
+    // a kernel-half address refused *because* a user pointer is a TTBR0 address by
+    // definition - a check that only asked the hardware would let the direct map
+    // answer true.
+    if !paging::user_accessible(PG_VA_A, PAGE_SIZE, true) {
+        fail!("user_accessible refused a writable write on a USER|RW page");
+    }
+    if !paging::user_accessible(PG_VA_A, PAGE_SIZE, false) {
+        fail!("user_accessible refused a read on a USER|RW page");
+    }
+    if paging::user_accessible(PG_VA_UNMAPPED, PAGE_SIZE, false) {
+        fail!("user_accessible allowed an unmapped page");
+    }
+    if paging::user_accessible(mm::hhdm_offset(), PAGE_SIZE, false) {
+        fail!("user_accessible allowed a kernel-half (direct-map) address");
+    }
+
+    // The copy-on-write marker is invisible to the CPU's walk and visible to this
+    // one - and marking a page copy-on-write makes it read-only, so the same page
+    // stops being writable to uaccess at the exact moment it becomes a COW page.
+    if paging::is_cow_page(PG_VA_A) {
+        fail!("a freshly mapped page reports itself copy-on-write");
+    }
+    space.set_cow_bit(PG_VA_A);
+    if !paging::is_cow_page(PG_VA_A) {
+        fail!("a page marked copy-on-write is not reported as one");
+    }
+    if paging::user_accessible(PG_VA_A, PAGE_SIZE, true) {
+        fail!("a copy-on-write (read-only) page is still reported writable");
+    }
+    space.protect(PG_VA_A, PAGE_SIZE, user);
+    if paging::is_cow_page(PG_VA_A) {
+        fail!("protecting the page writable again left the copy-on-write marker set");
+    }
+
+    // A word written into a space through its root, not through a live switch -
+    // read back from the frame through the direct map, because that is the only
+    // door that shows the store actually landed rather than returned `true`.
+    if !paging::write_user_u32(root, PG_VA_B, 0xdead_beef) {
+        fail!("write_user_u32 refused a mapped user page");
+    }
+    // SAFETY: `b` is a frame this check owns and the direct map reaches.
+    let wrote = unsafe { core::ptr::read(mm::phys_to_virt(b) as *const u32) };
+    if wrote != 0xdead_beef {
+        fail!("write_user_u32 put {wrote:#x} in the frame, not 0xdeadbeef");
+    }
+    if paging::write_user_u32(root, PG_VA_UNMAPPED, 1) {
+        fail!("write_user_u32 wrote to an unmapped address");
+    }
+
+    // Leaving the process's space: `TTBR0` goes back to the kernel's root, the
+    // space stops being active, and its pages stop resolving from the low half -
+    // and `switch_to_root` re-installs a complete low half on the way back.
+    paging::switch_to_kernel();
+    if paging::active_root() != paging::kernel_root() {
+        fail!("switch_to_kernel left active_root != kernel_root");
+    }
+    if paging::translate(PG_VA_A).is_some() {
+        fail!("the user page {PG_VA_A:#x} still translated after switch_to_kernel");
+    }
+    // SAFETY: `root` is this space's complete, mapped low half.
+    unsafe { paging::switch_to_root(root) };
+    if paging::active_root() != root {
+        fail!("switch_to_root did not make {root:#x} the active space");
+    }
+
+    // Drop the space back on the kernel's own root, so the next check (and 6a's
+    // EL0 entry) starts from the no-process state rather than a half-built space.
+    paging::switch_to_kernel();
+    let _ = writeln!(
+        out,
+        "paging: active/kernel roots told apart; a named-root walk user-gated and \
+         unmapped-refused; uaccess read+write vs unmapped vs the kernel half; the \
+         copy-on-write marker the CPU cannot see; a u32 written through a space's \
+         root and read back from its frame {b:#x}; leaving to the kernel and \
+         re-installing",
+    );
+    let _ = writeln!(out, "M6_PAGING_OK");
 }
 
 /// Bring the machine's interrupts up: the vector table, then the controller,
