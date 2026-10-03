@@ -266,23 +266,21 @@ fn build_esp(build_dir: &Path, kernel: &Path, loader: &Path) -> Result<PathBuf> 
         .with_context(|| format!("Failed to install {}", kernel.display()))?;
     fs::write(esp.join("mpos.cmdline"), CMDLINE)?;
 
-    // The third file is optional in the loader - a missing one reads as a
-    // zero-length range, which is what a diskless boot is - so it is copied
-    // when the x86_64 build has made one and the log says which happened. Its
-    // *contents* are the x86_64 image's Alpine archive and nothing at this
-    // stage reads them; stage 4 is where a root is unpacked from it. What it
-    // proves here is that a second file, larger than one page, crosses the
-    // firmware's file protocols and lands in the memory map's direct map.
-    let initramfs = utils::initramfs_path(build_dir);
-    if initramfs.exists() {
-        fs::copy(&initramfs, esp.join("initramfs.tar"))?;
-        println!("initramfs: {}", initramfs.display());
-    } else {
-        println!(
-            "initramfs: none built yet ({}), booting without one",
-            initramfs.display()
-        );
-    }
+    // The third file is a real aarch64 `/init`, not the x86_64 image's archive.
+    // `aarch64_init` hand-encodes a static `EM_AARCH64` `ET_EXEC` whose whole
+    // program is `exit_group(0)`, and packs it ustar. The loader copies it into
+    // frames and records its address and length in the handoff, so this now
+    // proves a *second* file crosses the firmware's file protocols and lands in
+    // the direct map - the same thing the old optional x86 archive copy was only
+    // standing in for. The kernel does not read it yet: it still halts after
+    // `check_el0`, and the init handoff that mounts a ramfs and spawns this
+    // `/init` is the next cut (PLAN.md §9.1 stage 6E). It is laid down now so the
+    // image and the boot wiring can be landed and pinned independently.
+    let initramfs = build_dir.join("aarch64-initramfs.tar");
+    crate::aarch64_init::write_initramfs(build_dir, &initramfs)?;
+    fs::copy(&initramfs, esp.join("initramfs.tar"))
+        .with_context(|| format!("Failed to install {}", initramfs.display()))?;
+    println!("initramfs: aarch64 /init -> {}", initramfs.display());
     Ok(esp)
 }
 

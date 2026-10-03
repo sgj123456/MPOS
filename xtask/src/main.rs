@@ -6,6 +6,7 @@
 //! that user afterwards.
 
 mod aarch64;
+mod aarch64_init;
 mod config;
 mod depgraph;
 mod disk;

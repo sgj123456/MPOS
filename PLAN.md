@@ -5544,6 +5544,18 @@ edge is therefore no longer a standalone 6A item; the module is live and correct
 numbered, and the gate is opened to aarch64 as part of getting a program to run.
 
 
+**The image side of 6E has begun: an aarch64 `/init` is now built and crosses the handoff.**
+`xtask/src/aarch64_init.rs` hand-encodes a static `ET_EXEC`/`EM_AARCH64` image whose
+whole program is `exit_group(0)` - four instructions, every word pinned against
+`llvm-objdump` in a host test rather than a cross-compiler run at build time (which
+would make the artifact non-hermetic and add a `clang`+`ld.lld` host prerequisite to
+the boot path) - and `build_esp` packs it ustar as `\initramfs.tar`. `cargo xtask
+boot-aarch64` now reports `mpos-boot: initramfs: 10 KiB`: a real aarch64 binary lands
+in the direct map for the kernel to consume. The kernel still halts after `check_el0`
+and does not yet mount a ramfs or spawn it - that is the init-handoff wiring (a
+`main`-supplied continuation `boot` calls after the probe, since `enter_frame` is
+terminal and control only resumes inside `el0_returned`), which is the next cut.
+
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
 cannot be used against local symbol` out of the *sysroot's* `liballoc`, which is
