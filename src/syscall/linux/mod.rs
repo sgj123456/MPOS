@@ -44,7 +44,12 @@ pub(crate) mod posix;
 /// straight through to the layer that knows the frame's shape. `nr` is the
 /// call just completed, which is what `SA_RESTART` needs to decide whether the
 /// interrupted call is one Linux runs again (`abi::restartable`).
-#[cfg(target_os = "none")]
+///
+/// Deferred off aarch64: it rewrites the x86 return frame, and the aarch64
+/// signal frame (`sigcontext`, `rt_sigreturn`) is a named gap that lands with
+/// that machine's signal stage. The call site in `linux_dispatch` is gated to
+/// match, so aarch64 simply never delivers a handler on syscall exit.
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 pub fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     proc::deliver_signal(regs_ptr, nr, ret)
 }
@@ -71,6 +76,13 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
     // Every arm below was measured against this developer's Linux rather than
     // read off the man page, because three of them are not what the man page
     // sounds like; §8.2 holds the numbers and the two drafts that were wrong.
+    //
+    // Deferred off aarch64 with the rest of the return-frame machinery: building
+    // the filter's `seccomp_data` reads the instruction pointer out of the x86
+    // frame (`proc::user_ip`), and no filter can be installed here until the
+    // `seccomp(2)` handler itself is ported. STRICT mode above still runs on
+    // both machines; only BPF filtering waits for the aarch64 signal/frame stage.
+    #[cfg(not(target_arch = "aarch64"))]
     if crate::seccomp::any_installed() {
         let mut data_args = [0u64; 6];
         for (slot, arg) in data_args.iter_mut().zip(args) {
@@ -238,6 +250,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // The multiple-message pair and the flagged accept: `sendmsg` and
         // `recvmsg` over an array of records, and `accept` with the two
         // descriptor flags the modern spelling takes.
+        #[cfg(not(target_arch = "aarch64"))]
         nr::ACCEPT4 => crate::net::socket::handle_accept4(args, from_user),
         #[cfg(not(target_arch = "aarch64"))]
         nr::SENDMMSG => crate::net::socket::handle_sendmmsg(args, from_user),
@@ -245,6 +258,7 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::RECVMMSG => crate::net::socket::handle_recvmmsg(args, from_user),
 
         // --- process ---
+        #[cfg(not(target_arch = "aarch64"))]
         nr::EXECVE => proc::handle_execve(args, &cwd(), regs_ptr),
         nr::EXIT => proc::handle_exit(args),
         nr::EXIT_GROUP => proc::handle_exit_group(args),
@@ -263,10 +277,15 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // `ptrace` and its bulk-memory relatives: one task observing another.
         // They are in `proc` because everything they need - the task table, the
         // register frames, the stops - is the process machinery's.
+        #[cfg(not(target_arch = "aarch64"))]
         nr::PTRACE => proc::handle_ptrace(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::PROCESS_VM_READV => proc::handle_process_vm_readv(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::PROCESS_VM_WRITEV => proc::handle_process_vm_writev(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::RT_SIGTIMEDWAIT => proc::handle_rt_sigtimedwait(args, from_user),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::REBOOT => proc::handle_reboot(args),
         // The hostname is kept, not just accepted: `uname -n`, `hostname`
         // and `/proc/sys/kernel/hostname` all read it, and an init's
@@ -280,7 +299,9 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // `getpgrp()` takes no argument, so there is nothing to read out of
         // the register file and the caller's own group is the whole answer.
         nr::GETPGRP => proc::handle_getpgid([0; 6]),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::CLONE => proc::handle_clone(args, regs_ptr),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::FORK | nr::VFORK => proc::handle_fork(nr, args, regs_ptr),
 
         // --- memory ---
@@ -341,7 +362,9 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::INOTIFY_RM_WATCH => fs::handle_inotify_rm_watch(args),
         nr::RT_SIGACTION => sigaction(args),
         nr::RT_SIGPROCMASK => rt_sigprocmask(args),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::RT_SIGRETURN => proc::handle_rt_sigreturn(regs_ptr),
+        #[cfg(not(target_arch = "aarch64"))]
         nr::ARCH_PRCTL => handle_arch_prctl(args),
         nr::PRCTL => abi::handle_prctl(args),
         nr::GETRANDOM => abi::handle_getrandom(args, true),
@@ -895,7 +918,13 @@ fn sigaltstack(args: [usize; 6]) -> isize {
 /// undone by the next context switch. The call therefore goes through the
 /// scheduler's copy. `GS` is not used by any program that runs here yet, and it
 /// has no per-task home, so it stays a direct register access.
-#[cfg(target_os = "none")]
+///
+/// Deferred off aarch64: the `GS` half is raw `wrmsr`/`rdmsr` on an x86 model
+/// specific register, and `arch_prctl(2)` with its `ARCH_*` request words is an
+/// x86_64 syscall that has no aarch64 number at all. Its dispatch arm is gated
+/// to match; aarch64 reaches its thread pointer through `hal::Cpu`'s TLS
+/// capability instead, not a syscall.
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 fn handle_arch_prctl(args: [usize; 6]) -> isize {
     let (cmd, addr) = (args[0], args[1]);
     match cmd {

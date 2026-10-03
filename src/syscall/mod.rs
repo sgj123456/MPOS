@@ -226,8 +226,15 @@ pub fn linux_dispatch(
     // result before it is returned. Both are ordinary stops in the task table,
     // and both are no-ops - one branch on a flag - for every task no tracer has
     // touched, which is every task on a machine without a tracer running.
+    //
+    // Deferred off aarch64: ptrace reads and writes the x86 register frame, and
+    // its syscall handler is not yet ported, so there is no tracer this machine
+    // can stop. Dropping the two stops leaves the identity for every task, which
+    // is exactly their no-tracer behaviour on the machines that do have them.
+    #[cfg(not(target_arch = "aarch64"))]
     let args = linux::proc::syscall_entry_stop(regs_ptr, nr, args);
     let ret = linux::dispatch(nr, args, from_user, regs_ptr);
+    #[cfg(not(target_arch = "aarch64"))]
     let ret = linux::proc::syscall_exit_stop(regs_ptr, nr, args, ret);
     // Signals are delivered here rather than before the call: a handler has to
     // see the *result* of the syscall it interrupted, and the result does not
@@ -236,6 +243,12 @@ pub fn linux_dispatch(
     // is also the only delivery point that can run one that needs a frame -
     // and the only one that can rewind an interrupted call, because the frame
     // it rewrites is the record of the call's own arguments.
+    //
+    // Deferred off aarch64 with the signal stage: delivering a handler rewrote
+    // the x86 frame, and the aarch64 `sigcontext`/`rt_sigreturn` builder is a
+    // named gap. A first `/init` that only runs and exits needs no handler, so
+    // on this machine the call's own value is simply returned.
+    #[cfg(not(target_arch = "aarch64"))]
     if linux::deliver_signal(regs_ptr, nr, ret) {
         // The interrupted call's value belongs to the handler now: it is on
         // the frame, waiting for `rt_sigreturn` to put it back.
