@@ -370,4 +370,50 @@ impl crate::hal::Segments for crate::hal::Current {
     }
 }
 
+/// The console sink: the 16550 COM1 wire, reached through `drivers::serial`.
+/// The polled `write_bytes` and the `interrupt_driven` question live here; the
+/// queue-and-park ring is the [`crate::hal::SerialRing`] capability below.
+impl crate::hal::Console for crate::hal::Current {
+    #[inline]
+    fn init() {
+        crate::drivers::serial::init()
+    }
+
+    #[inline]
+    fn write_bytes(bytes: &[u8]) {
+        crate::drivers::serial::write_bytes(bytes)
+    }
+
+    #[inline]
+    fn interrupt_driven() -> bool {
+        crate::drivers::serial::interrupt_driven()
+    }
+}
+
+/// x86_64's 16550 has an interrupting transmitter and a ring the console parks
+/// on, so it implements the optional [`crate::hal::SerialRing`] over
+/// `drivers::serial`'s ring. A polled machine (aarch64 at stage 4a) is not a
+/// `SerialRing`; `crate::console` then never queues.
+impl crate::hal::SerialRing for crate::hal::Current {
+    #[inline]
+    fn tx_space() -> usize {
+        crate::drivers::serial::tx_space()
+    }
+
+    #[inline]
+    fn tx_submit(bytes: &[u8]) -> usize {
+        crate::drivers::serial::tx_submit(bytes)
+    }
+
+    #[inline]
+    fn tx_wait_now() {
+        crate::drivers::serial::tx_wait_now()
+    }
+
+    #[inline]
+    fn tx_stop_waiting() {
+        crate::drivers::serial::tx_stop_waiting()
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}

@@ -1,4 +1,4 @@
-//! Kernel console — architecture-agnostic formatting over `drivers::serial`.
+//! Kernel console — architecture-agnostic formatting over the `hal::Console` sink.
 //!
 //! This module is a **kernel-wide service**, not a driver or a VFS component.
 //! It wraps the raw serial driver with interrupt-safe output and provides the
@@ -128,7 +128,7 @@ pub fn force_serial() {
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        crate::drivers::serial::write_bytes(s.as_bytes());
+        crate::hal::console_write_bytes(s.as_bytes());
         Ok(())
     }
 }
@@ -148,7 +148,7 @@ impl Write for Sink {
 }
 
 pub fn init() {
-    crate::drivers::serial::init();
+    crate::hal::console_init();
 }
 
 /// The kernel log ring: what `/dev/kmsg` writers file. The serial console
@@ -235,16 +235,25 @@ pub fn write_bytes(bytes: &[u8]) {
     // brought up to a screen that already shows the boot log rather than born
     // mid-story. Fixed-size, never allocates, safe from the interrupt path.
     record(bytes);
+    paint_grids_if_live(bytes);
+    wire_bytes(bytes);
+}
+
+/// Paint the kernel console's bytes onto the foreground virtual console and tell
+/// the render task to redraw - x86_64's framebuffer path. On a machine with no
+/// framebuffer this compiles to nothing, and [`grids_live`] is never true on it
+/// anyway; the body is moved here verbatim so the console's ordering (record,
+/// paint, wire) is unchanged and the x86 behaviour is identical.
+#[cfg(target_arch = "x86_64")]
+fn paint_grids_if_live(bytes: &[u8]) {
     if grids_live() {
-        // Kernel console text lands on the virtual console currently on screen,
-        // exactly as Linux prints onto the foreground VT. Once its grid exists
-        // (after the render task made it) this paints; before, the ring above
-        // still catches it for the replay.
         crate::term::with_screen(active_grid(), |g| g.feed(bytes));
         crate::drivers::video::render::notify();
     }
-    wire_bytes(bytes);
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+fn paint_grids_if_live(_bytes: &[u8]) {}
 
 /// A virtual console's own printed bytes - what the shell on `/dev/ttyN` wrote.
 ///
@@ -260,10 +269,21 @@ pub fn vc_output(vc: u32, bytes: &[u8]) {
         wire_bytes(bytes);
         return;
     }
-    crate::term::with_screen(vc as usize, |g| g.feed(bytes));
-    crate::drivers::video::render::notify();
+    paint_vc_if_live(vc, bytes);
     wire_bytes(bytes);
 }
+
+/// Paint one virtual console's own bytes onto its grid and redraw - x86_64's
+/// framebuffer path; compiles to nothing on a machine with no framebuffer. Body
+/// moved verbatim so the x86 behaviour is identical.
+#[cfg(target_arch = "x86_64")]
+fn paint_vc_if_live(vc: u32, bytes: &[u8]) {
+    crate::term::with_screen(vc as usize, |g| g.feed(bytes));
+    crate::drivers::video::render::notify();
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn paint_vc_if_live(_vc: u32, _bytes: &[u8]) {}
 
 /// The grid index of the console currently shown, by its `/dev/ttyN` number.
 fn active_grid() -> usize {
@@ -335,23 +355,37 @@ pub fn takeover() {
 /// asked for both has exited. A cut between sequences loses content and nothing
 /// else: the emulator stays in step with the bytes it did get.
 fn serial_mirror_now(bytes: &[u8]) {
-    if crate::drivers::serial::interrupt_driven() {
-        // `tx_submit` copies what fits and returns that count, so the room is
-        // asked for first and the copy is of a prefix that fits it exactly.
-        let room = crate::drivers::serial::tx_space();
+    if mirror_into_ring(bytes) {
+        return;
+    }
+    serial_bytes(bytes);
+}
+
+/// The best-effort mirror write through the x86_64 transmit ring: ask for the
+/// room first, then copy a prefix that fits it (never the middle of an escape
+/// sequence - `term::wire::cut` decides where a partial write may end). Returns
+/// `false` when there is no live ring so the caller falls back to the polled
+/// write. Moved verbatim; a machine with no ring is not a `SerialRing`.
+#[cfg(target_arch = "x86_64")]
+fn mirror_into_ring(bytes: &[u8]) -> bool {
+    if crate::hal::console_interrupt_driven() {
+        let room = crate::hal::serial_tx_space();
         let take = if bytes.len() <= room {
             bytes.len()
         } else {
             crate::term::wire::cut(bytes, room)
         };
-        // Zero is a sequence that does not fit at all: sending its head would
-        // be the one thing this must never do, so the chunk goes unsent.
         if take > 0 {
-            let _ = crate::drivers::serial::tx_submit(&bytes[..take]);
+            let _ = crate::hal::serial_tx_submit(&bytes[..take]);
         }
-        return;
+        return true;
     }
-    serial_bytes(bytes);
+    false
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn mirror_into_ring(_bytes: &[u8]) -> bool {
+    false
 }
 
 /// Write raw bytes on the serial console - the wire, through the transmit ring.
@@ -378,16 +412,27 @@ fn serial_mirror_now(bytes: &[u8]) {
 /// by the wait, so a host that stops draining still costs only one line's
 /// worth of masked interrupts rather than the machine.
 fn serial_bytes(bytes: &[u8]) {
-    if !crate::drivers::serial::interrupt_driven() || !may_park() {
+    if !crate::hal::console_interrupt_driven() || !may_park() {
         const CHUNK: usize = 64;
         for piece in bytes.chunks(CHUNK) {
-            critical_section::with(|_| crate::drivers::serial::write_bytes(piece));
+            critical_section::with(|_| crate::hal::console_write_bytes(piece));
         }
         return;
     }
+    submit_and_park(bytes);
+}
+
+/// The queue-and-park path through the x86_64 transmit ring, moved verbatim so
+/// its re-arm-before-every-park invariant and the wake-list ordering are
+/// unchanged; only the `tx_*` calls now go through the `hal::SerialRing`
+/// forwards. Unreachable on a machine with no ring: [`serial_bytes`]'s guard
+/// (`!interrupt_driven() || !may_park()`) returns before this on such a machine,
+/// so the non-x86 arm below is never entered.
+#[cfg(target_arch = "x86_64")]
+fn submit_and_park(bytes: &[u8]) {
     let mut at = 0;
     while at < bytes.len() {
-        at += crate::drivers::serial::tx_submit(&bytes[at..]);
+        at += crate::hal::serial_tx_submit(&bytes[at..]);
         if at == bytes.len() {
             break;
         }
@@ -400,17 +445,28 @@ fn serial_bytes(bytes: &[u8]) {
         // still closes the first gap: room that appears between the failed
         // submit and the sleep is seen, because `block_until` re-checks under
         // the same critical section that would take us off it.
-        crate::drivers::serial::tx_wait_now();
-        crate::sched::block_until(|| crate::drivers::serial::tx_space() > 0);
+        crate::hal::serial_tx_wait_now();
+        crate::sched::block_until(|| crate::hal::serial_tx_space() > 0);
     }
-    crate::drivers::serial::tx_stop_waiting();
+    crate::hal::serial_tx_stop_waiting();
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+fn submit_and_park(_bytes: &[u8]) {}
 
 /// Whether this context may sleep: the scheduler is running, and interrupts
 /// are enabled to let the wake through. An interrupt handler fails the second
-/// test, and the boot code before `sched::init` fails the first.
+/// test, and the boot code before `sched::init` fails the first. On a machine
+/// with no scheduler and no ring to park on, the answer is `false` - there is
+/// nothing to park on, so the console writes polled and never blocks.
+#[cfg(target_arch = "x86_64")]
 fn may_park() -> bool {
     crate::sched::started() && crate::hal::interrupts_enabled()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn may_park() -> bool {
+    false
 }
 
 #[doc(hidden)]
@@ -425,7 +481,7 @@ pub fn print_args(args: fmt::Arguments<'_>) {
     // the memory map and the frame allocator's own tally, and a `Vec` here
     // would ask for a heap that does not exist yet. So that half of the boot
     // keeps the old shape, streaming the line under the critical section.
-    if !crate::drivers::serial::interrupt_driven() {
+    if !crate::hal::console_interrupt_driven() {
         critical_section::with(|_| {
             let _ = Console.write_fmt(args);
         });

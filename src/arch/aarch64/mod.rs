@@ -2348,4 +2348,36 @@ impl crate::hal::Contexts for crate::hal::Current {
     }
 }
 
+/// The console sink on this machine: the polled PL011 in the kernel-half device
+/// window. `crate::hal::Console`'s baseline half only - `virt`'s PL011 has an
+/// interrupting transmitter the GIC routes nowhere yet (stage 5), so this machine
+/// is *not* a [`crate::hal::SerialRing`] and `crate::console` never parks on it;
+/// every write is the polled one.
+impl crate::hal::Console for crate::hal::Current {
+    #[inline]
+    fn init() {
+        pl011::init()
+    }
+
+    fn write_bytes(bytes: &[u8]) {
+        // The polled wire expands a bare `\n` to `\r\n` - the same rule
+        // `pl011::write_str` applies to text, spelled over arbitrary bytes because
+        // a byte sink cannot assume its input is UTF-8. A kernel `println!`'s
+        // trailing newline would otherwise print a staircase.
+        for &byte in bytes {
+            if byte == b'\n' {
+                pl011::write_byte(b'\r');
+            }
+            pl011::write_byte(byte);
+        }
+    }
+
+    #[inline]
+    fn interrupt_driven() -> bool {
+        // No transmit ring and no routed TX interrupt until stage 5. The honest
+        // `false`, so the console takes the polled path and never parks.
+        false
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}

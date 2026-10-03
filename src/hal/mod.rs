@@ -18,14 +18,16 @@
 //! named by the scheduler. Grouping by the six concerns the kernel actually has
 //! is what lets each trait name the types it needs and no more, so an
 //! architecture-specific type has nowhere to cross. A single trait carrying
-//! every method would be the same leak with one import instead of six, which is
+//! every method would be the same leak with one import instead of a blob, which is
 //! the failure `PLAN.md` §11.3 warned about when it rejected a "generic HAL
-//! trait forest" - this is deliberately *six* traits for six concerns, not one
-//! trait per function. On top of the six sit three *optional capability traits*
-//! ([`Msi`], [`FpuTrap`], [`Segments`]) for the ways one machine does something
-//! another has no hardware for; a port implements the six it must and only the
-//! capabilities it has, so an absent capability is *absent* rather than a method
-//! every machine has to fake an answer for.
+//! trait forest" - this is deliberately a trait per concern, not one trait per
+//! function. The *baseline* concerns (`Clock`, `WallClock`, `Cpu`, `Interrupts`,
+//! `Paging`, `Contexts`, `Console`) are what every machine this kernel boots on
+//! has. On top of them sit the *optional capability traits* (`Msi`, `SerialRing`,
+//! `FpuTrap`, `Segments`) for the ways one machine does something another has no
+//! hardware for; a port implements the baseline it must and only the capabilities
+//! it has, so an absent capability is *absent* rather than a method every machine
+//! has to fake an answer for.
 //!
 //! # What this does not abstract, and must not
 //!
@@ -268,18 +270,43 @@ pub trait Paging {
     fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize>;
 }
 
+/// The machine's byte sink: the wire the kernel log and the `println!` go to.
+///
+/// A baseline concern, not an optional capability, because every machine this
+/// kernel boots on has exactly one - on x86_64 the 16550 at COM1, on aarch64 the
+/// PL011. What is *not* universal is how the wire is made fast: an
+/// interrupt-driven transmit ring a task can queue into and sleep on is x86_64's
+/// arrangement (and a future aarch64 one), so that is the optional [`SerialRing`]
+/// beside this, while the polled write every machine can do lives here.
+pub trait Console {
+    /// Bring the sink up. Idempotent; the boot may already have poked the wire.
+    fn init();
+
+    /// Push bytes on the wire, waiting for the hardware - the polled write. The
+    /// floor every machine can do and the only one a machine without a [`SerialRing`]
+    /// uses: a `\n` in `bytes` becomes carriage-return-then-linefeed on the wire,
+    /// because a terminal that gets only `\n` prints a staircase.
+    fn write_bytes(bytes: &[u8]);
+
+    /// Whether a [`SerialRing`] is live and `crate::console` should queue into it.
+    /// `false` means "always the polled path, never park" - the honest answer for a
+    /// machine that has no interrupting transmitter, not a lie about one it has.
+    fn interrupt_driven() -> bool;
+}
+
 /// ---------------------------------------------------------------------------
 /// Optional capability traits.
 ///
-/// The six baseline concerns above are what *every* machine this kernel runs on
+/// The baseline concerns above are what *every* machine this kernel runs on
 /// has: a clock, a wall clock, a CPU, a wired interrupt controller, page tables,
-/// and task contexts. These three are not universal - they are one machine's way
-/// of doing something another machine does differently or not at all. A port
-/// implements the baseline six and only the optional ones its hardware actually
-/// has (`AGENTS.md` §4 rule 4: refuse rather than approximate), so a capability
-/// is expressible as *absent* rather than as a method every machine must answer.
-/// `crate::Platform` names only the baseline six; these are reached through
-/// their own forwards, which are gated to the machine that implements them.
+/// task contexts, and a console sink. These four are not universal - they are one
+/// machine's way of doing something another machine does differently or not at
+/// all. A port implements the baseline and only the optional ones its hardware
+/// actually has (`AGENTS.md` §4 rule 4: refuse rather than approximate), so a
+/// capability is expressible as *absent* rather than as a method every machine
+/// must answer. `crate::Platform` names only the baseline concerns; these are
+/// reached through their own forwards, which are gated to the machine that
+/// implements them.
 /// ---------------------------------------------------------------------------
 
 /// Message-signalled interrupt delivery: the local APIC page a PCI device maps
@@ -362,9 +389,33 @@ pub trait Segments {
     fn user_segments() -> (usize, usize);
 }
 
+/// An interrupt-driven transmit ring behind the [`Console`] sink: queue bytes,
+/// sleep while the UART's own interrupt drains the wire, and wake the parked
+/// writer when room appears.
+///
+/// A capability, not part of [`Console`], because it needs a machine that (1) has
+/// an interrupting transmitter and (2) has a wired controller and scheduler to
+/// park on. `virt`'s PL011 console at stage 4a is polled only - the GIC line
+/// routing that would make it a `SerialRing` is stage 5 - so aarch64 implements
+/// [`Console`] and simply is not a `SerialRing`; the console then always takes the
+/// polled path and never parks. x86_64 is a `SerialRing`.
+pub trait SerialRing {
+    /// How many bytes fit in the ring right now.
+    fn tx_space() -> usize;
+
+    /// Copy as much of `bytes` as fits into the ring and return the count taken.
+    fn tx_submit(bytes: &[u8]) -> usize;
+
+    /// Put this task on the ring's wait list before it parks, so a drain wakes it.
+    fn tx_wait_now();
+
+    /// Take this task off the ring's wait list.
+    fn tx_stop_waiting();
+}
+
 /// A machine this kernel can run on. `Current` names the one being built.
 pub trait Platform:
-    Clock + WallClock + Cpu + Interrupts + Paging + Contexts + Sized + 'static
+    Clock + WallClock + Cpu + Interrupts + Paging + Contexts + Console + Sized + 'static
 {
 }
 
@@ -812,4 +863,58 @@ pub unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
 #[inline]
 pub fn user_segments() -> (usize, usize) {
     <Current as Segments>::user_segments()
+}
+
+// ---------------------------------------------------------------------------
+// The console sink. `Console` is baseline (both machines implement it); the
+// `SerialRing` queue-and-park path is x86_64's, gated like the other optional
+// capabilities so a polled machine never names methods it does not have.
+// ---------------------------------------------------------------------------
+
+/// Bring the console sink up.
+#[inline]
+pub fn console_init() {
+    <Current as Console>::init()
+}
+
+/// Write bytes on the console sink, polled - the `\n`-to-`\r\n` rule is the
+/// machine's, so a bare `\n` never reaches a terminal as a staircase.
+#[inline]
+pub fn console_write_bytes(bytes: &[u8]) {
+    <Current as Console>::write_bytes(bytes)
+}
+
+/// Whether the console sink has a live [`SerialRing`] to queue into (`false` on a
+/// polled-only machine, where the console never parks).
+#[inline]
+pub fn console_interrupt_driven() -> bool {
+    <Current as Console>::interrupt_driven()
+}
+
+/// How many bytes the transmit ring has room for right now.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn serial_tx_space() -> usize {
+    <Current as SerialRing>::tx_space()
+}
+
+/// Copy as much of `bytes` as the ring will take, returning the count.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn serial_tx_submit(bytes: &[u8]) -> usize {
+    <Current as SerialRing>::tx_submit(bytes)
+}
+
+/// Join this task to the ring's wait list before parking on it.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn serial_tx_wait_now() {
+    <Current as SerialRing>::tx_wait_now()
+}
+
+/// Leave the ring's wait list.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn serial_tx_stop_waiting() {
+    <Current as SerialRing>::tx_stop_waiting()
 }
