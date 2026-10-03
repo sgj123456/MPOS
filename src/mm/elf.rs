@@ -17,8 +17,8 @@
 use alloc::vec::Vec;
 use elf::ElfBytes;
 use elf::abi::{
-    DT_RELA, DT_RELAENT, DT_RELASZ, ET_DYN, ET_EXEC, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD,
-    R_X86_64_RELATIVE,
+    DT_RELA, DT_RELAENT, DT_RELASZ, EM_AARCH64, EM_X86_64, ET_DYN, ET_EXEC, PF_W, PF_X, PT_DYNAMIC,
+    PT_INTERP, PT_LOAD, R_AARCH64_RELATIVE, R_X86_64_RELATIVE,
 };
 use elf::dynamic::Dyn;
 use elf::endian::LittleEndian;
@@ -51,8 +51,16 @@ pub struct Image<'a> {
     /// `ET_DYN` load address is randomised per `exec`, an `ET_EXEC` one is not
     /// randomised at all.
     pub pie: bool,
-    /// R_X86_64_RELATIVE relocations: (virtual address, addend).
-    /// The loader must write `addend` at `offset` after mapping segments.
+    /// The machine the file's `e_machine` names (`EM_X86_64` or `EM_AARCH64` -
+    /// nothing else parses here). The parser accepts both because it is pure
+    /// bytes-in, image-out and must be testable on the host, but the kernel runs
+    /// one machine, so this is reported for the caller (`binfmt`/`execve`) to
+    /// reject an image built for the wrong ISA rather than the loader deciding.
+    pub machine: u16,
+    /// `R_*_RELATIVE` relocations for `machine`: (virtual address, addend).
+    /// The loader must write `base + addend` at `offset` after mapping segments -
+    /// the one relative-relocation kind, whose number differs per psABI but whose
+    /// meaning does not.
     pub rela: Vec<(usize, i64)>,
     /// The program interpreter this image asks to be started through, as a
     /// path: `/lib/ld-musl-x86_64.so.1` for anything linked against musl
@@ -80,6 +88,12 @@ pub struct Segment<'a> {
 /// First address past the lower half. A canonical address's bit 47 decides
 /// which half it is in, so a user image asking for anything at or above this
 /// line is asking for kernel territory, and no loader should honor it.
+///
+/// This is x86_64's bit-47 split. The aarch64 user span is `TTBR0`'s own size
+/// (`paging::USER_END`), which is narrower; taking the limit from the machine
+/// rather than a shared `1 << 47` is a named follow-on in `PLAN.md` §9.1. An
+/// aarch64 static binary places well below this line, so the guard is
+/// conservative here, not a wrong-but-passing check.
 const USER_LIMIT: usize = 1 << 47;
 
 /// The size of an `Elf64_Rela` record. The `elf` crate's table view reads
@@ -98,6 +112,23 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     if file.ehdr.class != Class::ELF64 {
         return None;
     }
+    // Which machine the file is built for decides which relative-relocation kind
+    // this loader will apply: `R_X86_64_RELATIVE` (8) and `R_AARCH64_RELATIVE`
+    // (1027) mean the same thing - store `base + addend` at the offset - but are
+    // numbered per psABI. The `elf` crate's own ident check would already have
+    // rejected a file that does not parse, but it says nothing about the machine,
+    // so an unvalidated loader would accept an image for a foreign ISA, read none
+    // of its relocations (the kind would not match the hardcoded constant), and
+    // place a broken program that faults on its first `.got` access. Refuse a
+    // machine we do not know here; whether *this* kernel should exec a file built
+    // for the other known machine is the caller's `machine` check, not the
+    // parser's - the parser is bytes-in, image-out, and host-testable for both.
+    let machine = file.ehdr.e_machine;
+    let relative = match machine {
+        EM_X86_64 => R_X86_64_RELATIVE,
+        EM_AARCH64 => R_AARCH64_RELATIVE,
+        _ => return None,
+    };
     // Accept ET_EXEC (fixed-address) and ET_DYN (position independent). Both
     // are statically parseable: the segments say what each piece is, and the
     // only difference is whether the addresses in them are destinations or
@@ -166,9 +197,10 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     }
 
     // For static-pie ET_DYN binaries the dynamic section lists RELA entries
-    // that the runtime linker would process. We only handle the simple
-    // R_X86_64_RELATIVE kind (write `addend` at `offset`).
-    let rela = extract_rela(bytes, &file, dyn_data);
+    // that the runtime linker would process. We only handle the one
+    // relative-relocation kind this machine's psABI names (write `base+addend`
+    // at `offset`), chosen by the `e_machine` gate above.
+    let rela = extract_rela(bytes, &file, dyn_data, relative);
 
     // Compute the virtual address of the program header table.  For both
     // ET_EXEC and ET_DYN the table lives inside the first PT_LOAD segment
@@ -220,6 +252,7 @@ pub fn parse(bytes: &[u8]) -> Option<Image<'_>> {
         // Only a position-independent image may be placed elsewhere: the
         // addresses an `ET_EXEC` names are the ones its own code refers to.
         pie: file.ehdr.e_type == ET_DYN,
+        machine,
         phnum: file.ehdr.e_phnum as usize,
         phent: file.ehdr.e_phentsize as usize,
         rela,
@@ -243,11 +276,15 @@ fn vaddr_to_offset(file: &ElfBytes<'_, LittleEndian>, vaddr: usize) -> Option<us
     None
 }
 
-/// Read the DYNAMIC section and extract R_X86_64_RELATIVE relocations.
+/// Read the DYNAMIC section and extract this machine's relative relocations.
+///
+/// `relative` is the `R_*_RELATIVE` number for the file's `e_machine`, chosen in
+/// `parse` - the one kind that needs nothing but a base address to apply.
 fn extract_rela(
     bytes: &[u8],
     file: &ElfBytes<'_, LittleEndian>,
     dyn_data: Option<&[u8]>,
+    relative: u32,
 ) -> Vec<(usize, i64)> {
     let Some(dyn_data) = dyn_data else {
         return Vec::new();
@@ -295,7 +332,7 @@ fn extract_rela(
     let table = ParsingTable::<LittleEndian, Rela>::new(LittleEndian, Class::ELF64, rela_bytes);
     table
         .iter()
-        .filter(|rela| rela.r_type == R_X86_64_RELATIVE)
+        .filter(|rela| rela.r_type == relative)
         .map(|rela| (rela.r_offset as usize, rela.r_addend))
         .collect()
 }
@@ -319,6 +356,10 @@ mod tests {
         out[5] = 1; // ELFDATA2LSB
         out[6] = 1; // EV_CURRENT
         out[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        // e_machine: EM_X86_64. The loader now refuses an unknown machine, so the
+        // helper's default image declares x86_64; the aarch64 and foreign-machine
+        // tests overwrite these two bytes.
+        out[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
         out[24..32].copy_from_slice(&entry.to_le_bytes());
         out[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
         out[54..56].copy_from_slice(&(phdr_size as u16).to_le_bytes());
@@ -619,5 +660,68 @@ mod tests {
             ],
         );
         assert_eq!(parse(&bytes).expect("parses").interp, None);
+    }
+
+    /// The machine the file names reports itself, for the caller's arch check.
+    #[test]
+    fn an_x86_64_image_reports_its_machine() {
+        let bytes = elf(0x1000, &[(PT_LOAD, 6, 0x1000, 0x100, b"x")]);
+        assert_eq!(parse(&bytes).expect("parses").machine, 62);
+    }
+
+    /// Aarch64's relative relocations are read, not dropped. The whole point: a
+    /// filter still pinned to x86_64's type 8 would return an empty `rela` for a
+    /// file whose relocations are type 1027, and a loader that never checked
+    /// `e_machine` would load that aarch64 image as if it were x86_64 - a broken
+    /// `.got`, not an error. This test is the one that fails on either mistake.
+    #[test]
+    fn an_aarch64_image_gets_its_relative_relocations_read() {
+        const EM_AARCH64: u16 = 183;
+        const R_AARCH64_RELATIVE: u32 = 1027;
+
+        let mut table = Vec::new();
+        table.extend_from_slice(&[0u8; 16]);
+        table.extend_from_slice(&rela(0x3010, R_AARCH64_RELATIVE, 0x1234));
+        table.extend_from_slice(&rela(0x9000, 1, 0x99)); // some other kind
+        table.extend_from_slice(&rela(0x3020, R_AARCH64_RELATIVE, -8));
+
+        let mut dynamic = Vec::new();
+        dynamic.extend_from_slice(&dyn_entry(7, 0x1000 + 16)); // DT_RELA
+        dynamic.extend_from_slice(&dyn_entry(8, 72)); // DT_RELASZ
+        dynamic.extend_from_slice(&dyn_entry(9, 24)); // DT_RELAENT
+        dynamic.extend_from_slice(&dyn_entry(0, 0)); // DT_NULL
+
+        let mut bytes = elf(
+            0x1000,
+            &[
+                (PT_LOAD, 6, 0x1000, 0x200, &table),
+                (PT_DYNAMIC, 6, 0x2000, 0x100, &dynamic),
+                (PT_LOAD, 6, 0x3000, 0x100, b"data"),
+            ],
+        );
+        bytes[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+
+        let image = parse(&bytes).expect("an aarch64 image parses");
+        assert_eq!(image.machine, EM_AARCH64);
+        assert_eq!(image.rela, vec![(0x3010, 0x1234), (0x3020, -8)]);
+    }
+
+    /// A file for a machine this kernel knows nothing about is refused, not
+    /// loaded and relocated by the wrong psABI's rules.
+    #[test]
+    fn an_image_for_an_unknown_machine_is_refused() {
+        const EM_RISCV: u16 = 243;
+        let mut bytes = elf(0x1000, &[(PT_LOAD, 6, 0x1000, 0x100, b"x")]);
+        bytes[18..20].copy_from_slice(&EM_RISCV.to_le_bytes());
+        assert!(parse(&bytes).is_none(), "an unknown machine is refused");
+    }
+
+    /// `e_machine` 0 is "no machine named", which the old accept-anything loader
+    /// would have taken. It is a malformed image for the purpose of loading.
+    #[test]
+    fn a_file_that_names_no_machine_is_refused() {
+        let mut bytes = elf(0x1000, &[(PT_LOAD, 6, 0x1000, 0x100, b"x")]);
+        bytes[18..20].copy_from_slice(&0u16.to_le_bytes());
+        assert!(parse(&bytes).is_none(), "e_machine 0 is not a known machine");
     }
 }
