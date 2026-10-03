@@ -5526,6 +5526,23 @@ aarch64 `UserFrame`, which is what makes the module *used* rather than merely bu
 the gate stays x86-only until that lands so no commit ships with `syscall` compiling
 but unreachable.
 
+The per-arch `nr.rs` **has** since landed (prep 11): `nr.rs` selects a whole table by
+`#[cfg(target_arch)]` via `include!` (so it stays the single file the `abitest` harness
+names) - x86_64 keeps its body verbatim and its one-per-name test pins, aarch64 gets the
+resolved asm-generic numbers, a different *set* rather than a renumber, with distinct
+sentinels above any real number for the calls arm64 lacks so the shared `dispatch` arm
+compiles yet can never be matched. With the gate flipped the whole module still compiles
+clean. But routing `el0_sync`'s `svc` into `syscall::dispatch` was tried and **panicked
+the boot**: `dispatch` opens on `current_is_seccomp_strict`, a scheduler read, and the
+EL0 milestone runs on the boot stack *before* the scheduler has a current task ("there is
+no task 63"). That is an ordering fact, not a defect to paper over. So the gate keeps its
+honest inline `ENOSYS` refusal - `M6_EL0_OK` still pins the trap end-to-end by reading
+`-ENOSYS` back - and the routing plus its runtime pin arrive *with* a task to answer
+from: folded into the init-handoff stage (6E), which is exactly when the first real
+userspace task exists, rather than a synthetic pre-scheduler probe. The `svc`->dispatch
+edge is therefore no longer a standalone 6A item; the module is live and correctly
+numbered, and the gate is opened to aarch64 as part of getting a program to run.
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
