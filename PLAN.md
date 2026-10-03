@@ -5178,13 +5178,16 @@ kernel's. Kernel-side stack protection is therefore complete.
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1f, 2, 5a, 5b and 6a landed: the machine boots the
+Current status: **stages 1a-1f, 2, 5a, 5b, 6a and 6b landed: the machine boots the
 way the x86_64 one does, the kernel owns its own address space, two kernel tasks
 can suspend and resume each other, the machine reads its own description of
 itself, it reaches its devices through a window in its *own* half of the address
 space - the firmware's thirty-two virtio-MMIO transports are found through the
-tree and read back - and code now runs at EL0 with an address space of its own,
-traps into the kernel and is answered.** `cargo xtask boot-aarch64`
+tree and read back - code now runs at EL0 with an address space of its own,
+traps into the kernel and is answered, and that address space is a thing a
+process can live in rather than only enter: its mappings can be protected,
+shared, copied on write and taken back, and its tables are returned when it
+goes.** `cargo xtask boot-aarch64`
 builds the kernel (`aarch64-unknown-none`), the loader
 (`aarch64-unknown-uefi`), lays out an ESP with `EFI/BOOT/BOOTAA64.EFI` and boots
 it under AAVMF; the loader reads `mpos.elf` off the volume, applies its
@@ -5193,47 +5196,52 @@ tables from the firmware's own memory map and branches into the higher half at
 **EL1**; then the kernel brings the frame allocator up from the record and
 rebuilds the address space from `mm::vm::kernel_mappings`, which is the same
 plan x86_64's `install` consumes. Measured, from one of three consecutive runs
-that print every marker - the two numbers that move between runs, `47952` and
-`47954` frames, differ by one page of the firmware's own noise:
+that print every marker - the two numbers that move between runs, `47944` and
+`47946` frames, differ by one page of the firmware's own noise, and every number
+below is identical across those runs, the two frame addresses stage 6b prints
+included:
 
 ```
-mpos-boot: kernel image: 82 KiB
+mpos-boot: kernel image: 98 KiB
 mpos-boot: initramfs: 11360 KiB
 mpos-boot: RAM: 248 MiB
-mpos-boot: device tree: 1052672 bytes at phys 0x446a1000
-mpos-boot: kernel: 88 KiB at phys 0x447e2000, virt 0xffffffff80000000, entry 0xffffffff8000dff4
+mpos-boot: device tree: 1052672 bytes at phys 0x44699000
+mpos-boot: kernel: 104 KiB at phys 0x447da000, virt 0xffffffff80000000, entry 0xffffffff80011618
 mpos-boot: mapped 496 MiB of physical memory, identity and through the direct map at 0xffff800000000000
 mpos-boot: device window 0x8000000..0xc000000 mapped at its own address and at 0xffffffff40000000, Device and not executable
 mpos-boot: page tables: 325 pages of them
 mpos 0.1.0 (aarch64) booting
 console: PL011 at 0xffffffff41000000
-image: text 62 KiB, rodata 16 KiB, data 8 KiB (86 KiB total)
-handoff: mpos-boot 0.1.0, record at 0x456ba020, image phys 0x447e2000 -> virt 0xffffffff80000000, direct map at 0xffff800000000000
+image: text 74 KiB, rodata 20 KiB, data 8 KiB (102 KiB total)
+handoff: mpos-boot 0.1.0, record at 0x456ba020, image phys 0x447da000 -> virt 0xffffffff80000000, direct map at 0xffff800000000000
 memory: 14 regions, 187 MiB the allocator may use
 cmdline: "console=ttyAMA0"
 exception level: EL1
-devices: the firmware's tree, 1052672 bytes at 0xffff8000446a1000
+devices: the firmware's tree, 1052672 bytes at 0xffff800044699000
 devices: memory 0x40000000..0x50000000 (256 MiB), every region the record calls usable is inside it
 devices: PL011 at 0x9000000, GIC at 0x8000000/0x8010000, timer on PPI 14 (INTID 30)
 devices: 32 virtio-mmio windows, all inside the 0x8000000..0xc000000 device window
 M4_DEVICES_OK
-pmm: 5 zones, 47952 frames (187 MiB of 187 MiB usable)
-interrupts: GICv2 (distributor 0xffffffff40000000), vector table at 0xffffffff80008000, timer on INTID 30
+pmm: 5 zones, 47944 frames (187 MiB of 187 MiB usable)
+interrupts: GICv2 (distributor 0xffffffff40000000), vector table at 0xffffffff8000e000, timer on INTID 30
 page tables: 165 frames (660 KiB), TTBR0 0x434e6000, TTBR1 0x434e6000 (the kernel's own, read back from the registers)
-plan: 7 mappings, all 63622 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)
+plan: 7 mappings, all 63626 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)
 direct map: 0xffff800043458000 -> 0x43458000, rw and it stores
 device window: PL011 0xffffffff41000000 -> 0x9000000, Device, through the kernel half at 0xffffffff40000000
-no low half: 0x447e2000 is unreachable, and so is the device window at 0x8000000 that used to live there
+no low half: 0x447da000 is unreachable, and so is the device window at 0x8000000 that used to live there
 M3_TABLES_OK
 virtio: 32 transports, every one answering virtio 1.0 through the kernel half; 1 carries a device
 virtio: the first is at 0xa003e00, device 4, vendor 0x554d4551
 M5_VIRTIO_OK
 timer: CNTFRQ_EL0 62500000 Hz, tick at 250 Hz (250000 counts apart)
-M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 109160144 ns of counter
+M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz), 109192656 ns of counter
 contexts: two kernel tasks alternating
 ABABABABABABAM2_CONTEXT_OK: 13 hand-overs, both directions, every callee-saved register and v31 back where its task left it
+space: 4 pages mapped, walked in order and read back through the MMU; two protected, one copy-on-write and resolved into a frame of its own (0x43476000) with the parent's 0x4346a000 left alone; two shared between spaces and written through one of them; two unmapped and given back
+space: dropping an active space gave back all 4 frames its tables took, and the page it mapped not among them
+M6_AS_OK
 EL0: the kernel was on SP_EL1 (SPSel 1)
-EL0: root 0x4346c000 active, program at 0x200000 (40 bytes), stack at 0x210000, answers at 0x220000
+EL0: root 0x43479000 active, program at 0x200000 (40 bytes), stack at 0x210000, answers at 0x220000
 EL0: the program wrote 0xaaaa, called a number no system call has, read 0xffffffffffffffda back and left with status 7
 M6_EL0_OK
 ```
@@ -5243,9 +5251,11 @@ printout: every number in them was read out of the firmware's device tree and
 compared against the constant the kernel is compiled with for that device - the
 PL011's base, both of the GIC's frames, the timer's line, and the RAM the boot
 record calls usable. A tree is not trusted to be right; it is what asks whether
-this kernel's idea of the machine still is. The `187 MiB` and the `47952 frames`
+this kernel's idea of the machine still is. The `187 MiB` and the `47944 frames`
 against the last stage's `191 MiB`/`48954` are 3.66 MiB of this harness's own
-device and 264 KiB of loader page tables, and both are named below rather than
+device, 264 KiB of loader page tables and 16 KiB of kernel that stage 6b's check
+added (text 62 -> 74 KiB, rodata 16 -> 20: the failure lines are most of it), and
+all three are named below rather than
 folded into "the tree costs a megabyte": the tree is 1052672 bytes for 7160 bytes
 of structure and 569 of strings, and the loader copies what the tree says it is.
 
@@ -5303,6 +5313,44 @@ is at `0x200010` and the trap reported `pc` `0x200014`, so the program's next
 instruction (the store of the kernel's answer) was stepped over and the page came
 back with a zero where the gate's answer should have been. The gate does not
 advance `pc` at all now, and that is written down beside it.
+
+Stage 6b is the two `space:` lines before `M6_AS_OK`, and it is the difference
+between an address space a program can be *put into* and one it can *live in*.
+What 6a did not have is any way to change a space once it existed, and that is
+most of what a `fork`, an `mmap` and a `munmap` are made of: taking a mapping
+back, changing one's permissions in place, walking what is there, and the
+copy-on-write half that lets two processes share a frame until one of them writes
+it. All of it lands in `paging.rs`'s `UserSpace`, and the encoding does not change
+at all - what changes is that the file now writes *and erases*. The signatures are
+deliberately `crate::hal::AddressSpaceOps`' rather than the type's own, because
+writing them to the trait's shapes is what will make the impl delegation when
+`hal` reaches this machine; the trait itself cannot be implemented yet, since
+`crate::hal` is x86_64-only until all six of its concern traits exist.
+
+Three things in those two lines are worth reading. The resolved frame,
+`0x43476000`, is a frame the *child* space took for itself when it first wrote a
+page it was sharing with the parent - and the parent's frame, `0x4346a000`, is
+printed beside it because "the child copied" and "the parent was left alone" are
+two claims and only one of them is about the child. Four frames is what a space's
+tables cost here (a root and three levels down to the page), and dropping an
+*active* space gives all four back and not the page it mapped: measured as an
+exact count, because both ways of getting it wrong are off by a specific number,
+and a leak would otherwise look like a machine that simply works.
+
+The check reads every answer back through three different doors, and that is
+deliberate: the space's *own* tables for what the kernel intends, a store to a
+user address with that space switched in for what the MMU enforces, and the
+frame's own bytes through the direct map for what actually happened. An address
+space is exactly the thing where the first door alone is not enough - 6a's own
+measurement, where a table the kernel had written was not the table the CPU
+walked, is the same lesson one register down. It also has to be able to *fail*,
+so all three of the mistakes it exists to catch were made on purpose before this
+stage was accepted: a `resolve_cow` with the copy removed, a `Drop` that leaked
+its tables, and a copy-on-write page marked without the read-only bit. Each one
+stopped the boot with its own `M6_AS_FAILED` line naming the claim that broke -
+and the first run of the check, on code that was correct, failed on the check's
+own arithmetic instead (three pages left where it had counted two), which is why
+the count it prints is a count rather than a list of addresses.
 
 The `plan:` line is the strongest claim either machine's boot makes about its
 own page tables: every mapping `mm::vm::kernel_mappings` names is walked page by
@@ -5365,7 +5413,8 @@ number the gate answers is spelled beside it and named as such.
 | 5b | The device window in the kernel half, and the tree's transports read back: `paging::DEVICE_PHYS`/`DEVICE_VIRT` split, `boot/src/vm.rs` mapping the window at both, `pl011`/`gic` compiled against the alias with their physical bases kept for the tree check, and `arch::aarch64::check_virtio` reading every `virtio,mmio` window's MagicValue/Version/DeviceID/VendorID | **landed**: `M3_TABLES_OK` now stands under `no low half: ... and so is the device window at 0x8000000 that used to live there`, and `M5_VIRTIO_OK` under `virtio: 32 transports, every one answering virtio 1.0 through the kernel half; 1 carries a device`, across three consecutive green runs |
 | 5 | Drivers: virtio-MMIO found through the tree, PL011 as the serial device, GIC line routing | virtio-blk and virtio-net up - **the discovery half of this row is 5b and is done; what remains is the drivers themselves**, whose transport is `virtio_drivers::transport::mmio` reached at `paging::device_virt(phys, len)` |
 | 6a | The entry to EL0: `paging::UserSpace` (a root of its own for `TTBR0_EL1`, user page mappings, the switch that installs it), `context::UserFrame` (`x0..x30`/`sp`/`pc`/`pstate`, in the ABI's own `user_pt_regs` order) with `enter_user` and `leave_for_kernel`, and the vector entry for a trap from a lower EL - which saves the whole register file and can *return*, unlike the fatal synchronous one | **landed**: `EL0: root 0x4346c000 active, program at 0x200000 (40 bytes), stack at 0x210000, answers at 0x220000`, `EL0: the program wrote 0xaaaa, called a number no system call has, read 0xffffffffffffffda back and left with status 7` and `M6_EL0_OK`, across four consecutive green runs |
-| 6 | The rest of the aarch64 Linux ABI: `nr.rs` per arch (the numbers are the machine's - `exit_group` is 94 here and 231 on x86_64), signal frames, `TPIDR_EL0` TLS, `PTRACE_GETFPREGS`'s view of `FpuState`, the remainder of `AddressSpaceOps` (`unmap`/`protect`/`walk_user_pages` and the copy-on-write half, which is what `fork` and a demand-paged `mmap` need), and the `hal` impls that half completes | the `t-*` conformance programs run on aarch64 |
+| 6b | The address-space operations, in `crate::hal::AddressSpaceOps`' shapes: `map`/`try_map`/`unmap`/`protect`/`map_cow`/`map_shared`/`resolve_cow`/`walk_user_pages`/`set_cow_bit`/`set_cow_bit_quietly`/`flush_if_active`/`phys_for_virt` and the `Drop` built out of `unmap`; the copy-on-write marker in descriptor bit 55 (software-reserved there, `RES0` to the walker) with the read-only bit the CPU enforces set beside it, and `USER_END` as `TTBR0`'s own span rather than x86_64's bit-47 split | **landed**: `M6_AS_OK` under `space: 4 pages mapped, walked in order and read back through the MMU; ...` and `space: dropping an active space gave back all 4 frames its tables took`, across three consecutive green runs - and each of the three mistakes the check exists to catch (a resolve with no copy, a `Drop` that leaks its tables, a marker set without the read-only bit) was made on purpose and stopped the boot by name |
+| 6 | The rest of the aarch64 Linux ABI: `nr.rs` per arch (the numbers are the machine's - `exit_group` is 94 here and 231 on x86_64), signal frames, `TPIDR_EL0` TLS, `PTRACE_GETFPREGS`'s view of `FpuState`, the `Paging` methods that need a running process, and the `hal` impls those two complete | the `t-*` conformance programs run on aarch64 |
 | 7 | aarch64 userspace and the image: `aarch64-unknown-linux-musl` builds, ESP layout for AAVMF, arch-aware `xtask` | `cargo xtask test` passes on aarch64 |
 | 8 | The gate: `xtask test`/`run` grow an arch selection | a green aarch64 gate quoted with its summary line and exit code |
 
@@ -5390,10 +5439,10 @@ and `mm::map_mmio`; un-gating `console` alone is **18**, and they are
 `drivers::serial`, `drivers::video::render` and `sched`, so the console cannot
 move without the drivers it writes through. The only cut in the knot is `hal`,
 and the only thing standing between `hal` and compiling is the *user* half of the
-machine - which is stage 6. That is why 6a came next rather than 5's drivers, and
-why the drivers' turn is after the rest of 6 rather than before it: the tree
-walk 5b landed is the half of "virtio-MMIO found through the tree" that does not
-need `vfs`, and the transport that opens a device is the half that does.
+machine - which is stage 6. That is why 6a and 6b came next rather than 5's
+drivers, and why the drivers' turn is after the rest of 6 rather than before it:
+the tree walk 5b landed is the half of "virtio-MMIO found through the tree" that
+does not need `vfs`, and the transport that opens a device is the half that does.
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
@@ -5505,8 +5554,9 @@ Named gaps the port carries rather than hides, each with its home:
   right frame as Device, and neither the image's physical address nor the device
   window's is reachable any more. What is *not* closed is the mechanism: the
   window is a fixed 64 MiB range mapped whole at boot, because `mm::map_mmio`
-  goes through `hal::Paging` and aarch64's `Paging` has no user address space yet,
-  so `hal` cannot compile for this machine and the dynamic allocator cannot exist.
+  goes through `hal::Paging` and `hal` cannot compile for this machine until the
+  last of its six traits exists (`Paging`'s user half and a `WallClock` are what
+  6b leaves), so the dynamic allocator cannot exist.
   A device outside the tree's window is refused by `paging::device_virt` rather
   than mapped, which is the honest answer for a machine whose devices are a
   firmware-described range - and not the general one a PCIe aarch64 server needs.
@@ -5518,22 +5568,34 @@ Named gaps the port carries rather than hides, each with its home:
   the allocator may use` out of 248 MiB of RAM, `pmm: 5 zones, 49209 frames`.
   The floor the whole thing stands on is `mm::init`, which is machine-neutral
   and simply had no aarch64 caller until 1f gave it one.
-- **`hal` is x86_64-only, and stage 6a removed one of its three blockers.**
-  The forwards at the bottom of `hal/mod.rs` name all six concern traits, so the
-  module cannot compile for a machine that implements fewer. As it stands:
-  `Clock` is `timer.rs`, `Cpu`/`Interrupts` are what
+- **`hal` is x86_64-only, and stages 6a and 6b have taken two of its three
+  blockers.** The forwards at the bottom of `hal/mod.rs` name all six concern
+  traits, so the module cannot compile for a machine that implements fewer. As it
+  stands: `Clock` is `timer.rs`, `Cpu`/`Interrupts` are what
   `vectors.rs`/`gic.rs`/`timer.rs` are written over, `Contexts` is `context.rs`
   (minus the FPU-ownership methods, which exist only for a lazy scheme this
   machine does not have - and *plus* `UserFrame`, which 6a landed), and `Paging`
   has its table-building half plus, from 6a, a user space that can be built,
-  mapped, switched to and walked. What is still missing is three things and no
-  more: the rest of `AddressSpaceOps` (`unmap`, `protect`, `walk_user_pages`,
-  `map_cow`/`map_shared`/`resolve_cow`, `set_cow_bit*`, `flush_if_active` and the
-  `Drop` that goes with them - the machinery they need is `Tables`, which exists;
-  what is missing is the operations), the `Paging` methods that need a running
-  process (`active_root`, `switch_to_root`, `user_accessible`, `is_cow_page`,
-  `write_user_u32`), and `WallClock`, which is a PL031 this machine has not
-  written a driver for. The gate goes when the last of the six does.
+  mapped, switched to and walked, and, from 6b, that space's whole operation set -
+  `unmap`, `protect`, `walk_user_pages`, the copy-on-write half and the `Drop`
+  built out of `unmap`. The machinery those needed was `Tables`, which already
+  existed; 6b added the operations, in the trait's own signatures so that the impl
+  is delegation and nothing else. What is still missing is **two** things and no
+  more: the `Paging` methods that need a running process (`active_root`,
+  `switch_to_root`, `user_accessible`, `is_cow_page`, `write_user_u32`,
+  `phys_for_virt_of`, `user_phys_for_virt_of`), and `WallClock`, which is a PL031
+  this machine has not written a driver for. The gate goes when the last of the
+  six does.
+- **A copy-on-write page can be resolved, and nothing faults into the resolver
+  yet.** Stage 6b landed the operation - `resolve_cow` copies the frame, rebinds
+  the descriptor and answers `(old, new)` - and the check drives it in the order a
+  `fork` would, but the other half is deliberately absent: a data abort from EL0
+  on a read-only page has to be recognised as a copy-on-write fault, resolved and
+  the faulting instruction retried, and today the EL0 vector treats anything that
+  is not an `svc` as fatal. That belongs with the `Paging` methods that take a
+  *running* process - `is_cow_page` is what such a handler asks first - which is
+  the other remaining `hal` blocker, so no code was written for it here and a page
+  in a user space cannot yet be shared by two processes that are both running.
 - **No ACPI consumer exists to reuse.** `virt` + AAVMF passes a *device tree*,
   so device discovery is new DTB-parsing code in stage 5, not a port of an
   existing table walk.

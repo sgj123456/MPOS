@@ -79,9 +79,14 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// after all of them, so it is the one that now ends the list. Applying the rule
 /// is what moved `M2_CONTEXT_OK` out: it is no longer the last line the kernel
 /// prints, and leaving it in would kill a machine that was still working.
-const TERMINATORS: [&str; 9] = [
+///
+/// Stage 6b's check is in the same position as 5b's - the EL0 check that stage 6a
+/// ended the list with still runs after it - so `M6_AS_OK` is deliberately *not*
+/// here and `M6_AS_FAILED` is.
+const TERMINATORS: [&str; 10] = [
     "M6_EL0_OK",
     "M6_EL0_FAILED",
+    "M6_AS_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
@@ -131,14 +136,17 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // transports, `M1_TIMER_OK` says the clock still reaches the vector table
     // through them (a statement about the device window too, because the GIC is
     // reached through it), `M2_CONTEXT_OK` says two tasks can suspend and
-    // resume each other, and `M6_EL0_OK` says the kernel ran a program at EL0
-    // and answered the call it made.
+    // resume each other, `M6_AS_OK` says a process's address space can be built,
+    // walked, protected, shared, copied on write and taken apart again, and
+    // `M6_EL0_OK` says the kernel ran a program at EL0 and answered the call it
+    // made.
     let markers = [
         ("M4_DEVICES_OK", "devices"),
         ("M3_TABLES_OK", "page tables"),
         ("M5_VIRTIO_OK", "virtio transports"),
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
+        ("M6_AS_OK", "user address space"),
         ("M6_EL0_OK", "EL0"),
     ];
     let missing: Vec<&str> = markers
@@ -150,7 +158,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!();
         println!(
             "aarch64 boot: M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, M1_TIMER_OK, \
-             M2_CONTEXT_OK and M6_EL0_OK, from the ESP under AAVMF"
+             M2_CONTEXT_OK, M6_AS_OK and M6_EL0_OK, from the ESP under AAVMF"
         );
         return Ok(());
     }

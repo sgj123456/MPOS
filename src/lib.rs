@@ -121,9 +121,12 @@ pub use mpos_err as err;
 /// their stages - `Cpu`/`Interrupts` at 1c, `Contexts` at 2 (and its `UserFrame`
 /// at 6a), and `Paging` split: 1f gave it the table-building half (`install`,
 /// `translate`), 6a a user space that can be built, mapped, switched to and
-/// walked, and what is left is `AddressSpaceOps`' remaining operations and the
-/// `Paging` methods that need a running process - plus `WallClock`. This gate
-/// goes when the last of them does.
+/// walked, and 6b that space's *operations* - `unmap`, `protect`,
+/// `walk_user_pages`, the copy-on-write half and the `Drop` built out of them,
+/// written to `AddressSpaceOps`' shapes so that the impl is delegation when
+/// `hal` reaches this machine. What is left after that is the `Paging` methods
+/// that need a running process, plus `WallClock`. This gate goes when the last of
+/// them does.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod hal;
 /// evdev's record window and its clients: which reader sees which event, and

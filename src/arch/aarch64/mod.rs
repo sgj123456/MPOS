@@ -17,20 +17,24 @@
 //! **5b is that description becoming actionable** - the device window those
 //! devices live in moved out of the low half and into the kernel's, and the
 //! machine's virtio transports are read back through it, so the tree now leads
-//! somewhere a driver can go (`check_virtio`); and **6a is the machine running
+//! somewhere a driver can go (`check_virtio`); **6a is the machine running
 //! code below itself** - a user address space of its own in `TTBR0_EL1`, the
 //! frame a trap from EL0 leaves behind, the `eret` that enters it, and the
-//! vector entry that takes its `svc` (`check_el0`).
+//! vector entry that takes its `svc` (`check_el0`); and **6b is that address
+//! space being taken apart and put back together** - permissions changed in
+//! place, mappings handed back, a walk that names what a process owns, a frame
+//! shared until one of two processes writes it, and the tables given back when
+//! the space goes (`check_user_memory`).
 //!
 //! What is still absent, and where it lands: everything above the machine layer
 //! - `sched` (3), `console`/`vfs` (4), the drivers (5) and the rest of the Linux
-//! ABI (6, of which 6a is the entry half). Those reach this machine through
-//! `crate::hal`, which it implements trait by trait as the stages land - which is
-//! why `hal` itself is still x86_64-only (`src/lib.rs`'s ledger). Nothing above
-//! `arch` un-gates before `hal` compiles, and `hal` is three things away: the
-//! rest of `AddressSpaceOps`, the `Paging` methods that need a running process,
-//! and a `WallClock`. That is measured rather than asserted - §9.1 records the
-//! error counts under its stage table.
+//! ABI (6, of which 6a is the entry half and 6b the address-space half). Those
+//! reach this machine through `crate::hal`, which it implements trait by trait as
+//! the stages land - which is why `hal` itself is still x86_64-only (`src/lib.rs`'s
+//! ledger). Nothing above `arch` un-gates before `hal` compiles, and `hal` is
+//! two things away now: the `Paging` methods that need a running process, and a
+//! `WallClock`. That is measured rather than asserted - §9.1 records the error
+//! counts under its stage table, and 6b is what made it two rather than three.
 
 pub(crate) mod context;
 pub(crate) mod critical;
@@ -47,7 +51,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::boot::BootInfo;
 use crate::boot::handoff::Handoff;
 use crate::fdt;
-use crate::mm::vm::{self, KernelSections, MapFlags};
+use crate::mm::vm::{self, KernelSections, MapFlags, Mapping};
 use crate::mm::{self, PAGE_SIZE};
 
 use paging::Memory;
@@ -183,6 +187,7 @@ pub unsafe fn boot(handoff: *const Handoff) -> ! {
     check_virtio(&info);
     check_timer();
     check_context();
+    check_user_memory();
     check_el0();
     halt()
 }
@@ -973,24 +978,24 @@ fn check_el0() {
     }
 
     let mut space = paging::UserSpace::new();
-    space.map(
-        PROGRAM_VA,
-        code,
-        PAGE_SIZE,
-        MapFlags::USER | MapFlags::READ | MapFlags::EXEC,
-    );
-    space.map(
-        STACK_VA,
-        stack,
-        PAGE_SIZE,
-        MapFlags::USER | MapFlags::READ | MapFlags::WRITE,
-    );
-    space.map(
-        ANSWER_VA,
-        answer,
-        PAGE_SIZE,
-        MapFlags::USER | MapFlags::READ | MapFlags::WRITE,
-    );
+    space.map(Mapping {
+        virt: PROGRAM_VA,
+        phys: code,
+        length: PAGE_SIZE,
+        flags: MapFlags::USER | MapFlags::READ | MapFlags::EXEC,
+    });
+    space.map(Mapping {
+        virt: STACK_VA,
+        phys: stack,
+        length: PAGE_SIZE,
+        flags: MapFlags::USER | MapFlags::READ | MapFlags::WRITE,
+    });
+    space.map(Mapping {
+        virt: ANSWER_VA,
+        phys: answer,
+        length: PAGE_SIZE,
+        flags: MapFlags::USER | MapFlags::READ | MapFlags::WRITE,
+    });
 
     // The space's own tables before the machine is switched to them, because
     // `switch` is what makes a walk report the *user* root: a mapping that never
@@ -1095,14 +1100,505 @@ extern "C" fn el0_returned(status: u64) -> ! {
     halt()
 }
 
+// ---------------------------------------------------------------------------
+// Stage 6b's check: the operations a process's address space is made of
+// ---------------------------------------------------------------------------
+
+/// Where the address-space check's pages go, in the half a process owns.
+///
+/// Five addresses inside one 2 MiB region, so the whole check walks one hierarchy
+/// of tables and a wrong descriptor shows up as a wrong answer rather than as a
+/// missing mapping. Named rather than taken from the bottom up, for the same
+/// reason [`PROGRAM_VA`] is, and 3 MiB is far enough above zero that a stray
+/// pointer is a fault rather than a page somebody else wanted.
+const AS_VA_A: usize = 0x0030_0000;
+const AS_VA_B: usize = 0x0030_1000;
+/// The pair that is mapped *shared* in two spaces, and the reason there are two
+/// addresses here rather than one: a shared mapping of one page cannot tell a
+/// space that mapped the right frame from one that mapped the wrong one.
+const AS_VA_C: usize = 0x0030_2000;
+const AS_VA_C2: usize = 0x0030_3000;
+/// The page `try_map` is asked for, first with a frame and then with no
+/// permission at all.
+const AS_VA_D: usize = 0x0030_4000;
+
+/// The pages[`check_user_memory`] maps and walks: a writable page, one that
+/// becomes copy-on-write, and the shared pair.
+const AS_PAGES: usize = 4;
+
+/// Whether every byte of `frame` is `value`.
+///
+/// The only way to see what a copy actually copied: a `translate` can only say
+/// which frame a mapping points at, and the whole question about a copy-on-write
+/// resolve is what the bytes in the new frame are.
+fn frame_is(frame: usize, value: u8) -> bool {
+    // SAFETY: `frame` is a frame this check took from the allocator and still
+    // holds; the direct map reaches it, and no one else is writing it.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(mm::phys_to_virt(frame) as *const u8, PAGE_SIZE) };
+    bytes.iter().all(|&byte| byte == value)
+}
+
+/// What [`paging::UserSpace::walk_user_pages`] reports for one page of a space,
+/// or `None` when the walk does not report that page at all.
+///
+/// The walk is the only door to the two things the hardware walk does not report:
+/// the copy-on-write marker, and a page's absence from a space nothing is
+/// translating through.
+fn walked_flags(space: &paging::UserSpace, virt: usize) -> Option<MapFlags> {
+    let mut found = None;
+    space.walk_user_pages(|at, _, flags| {
+        if at == virt {
+            found = Some(flags);
+        }
+    });
+    found
+}
+
+/// Stage 6b's evidence: the operations a process's address space is made of, run
+/// against this machine and read back.
+///
+/// Stage 6a proved the kernel can *enter* a space it built. This is what happens
+/// next, and the difference is that every operation here is destructive - a
+/// mapping taken back, a permission removed, a frame made read-only so that it
+/// can be copied later. A space that can only be filled and never changed is not
+/// one a `fork` or a demand-paged `mmap` can be written on.
+///
+/// Every operation is run and its effect is read back through three different
+/// doors, deliberately: the space's *own* tables for what the kernel intends,
+/// a store to a user address with that space switched in for what the MMU
+/// enforces, and the frame's own bytes through the direct map for what actually
+/// happened. A check that only asked the first would pass on descriptors the CPU
+/// never walked.
+///
+/// The copy-on-write half is exercised in the order a `fork` uses it: marking the
+/// parent's pages, walking them into a second space, then resolving the child's
+/// first write. That is the sequence whose mistakes matter, and it ends by
+/// reading the parent's bytes to say that the child's write did not reach them.
+fn check_user_memory() {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M6_AS_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    // The frames the pages are backed by, each filled with a byte of its own so
+    // that a copy which copied the wrong frame - or copied nothing - shows up as
+    // a wrong byte rather than as two plausible-looking frames.
+    let Some(a) = zeroed_frame() else {
+        fail!("out of frames for the address space's own check")
+    };
+    let Some(b) = zeroed_frame() else {
+        fail!("out of frames for the address space's own check")
+    };
+    // Two contiguous frames in one allocation, which is what the two-page mapping
+    // below needs: `Mapping` describes a range, and a range of frames has to be
+    // contiguous for one `phys` to describe it.
+    let Some(shared) = mm::alloc_frames(1) else {
+        fail!("out of frames for the address space's own check")
+    };
+    let Some(d) = zeroed_frame() else {
+        fail!("out of frames for the address space's own check")
+    };
+    // SAFETY: four frames the allocator has just handed over and nothing else
+    // holds; the direct map reaches all of them, including the second page of
+    // `shared`, which the order-1 allocation made contiguous with the first.
+    unsafe {
+        core::ptr::write_bytes(mm::phys_to_virt(a) as *mut u8, 0x11, PAGE_SIZE);
+        core::ptr::write_bytes(mm::phys_to_virt(b) as *mut u8, 0x22, PAGE_SIZE);
+        core::ptr::write_bytes(mm::phys_to_virt(shared) as *mut u8, 0x33, 2 * PAGE_SIZE);
+        core::ptr::write_bytes(mm::phys_to_virt(d) as *mut u8, 0x44, PAGE_SIZE);
+    }
+
+    let user = MapFlags::USER | MapFlags::READ | MapFlags::WRITE;
+
+    let mut space = paging::UserSpace::new();
+    space.map(Mapping {
+        virt: AS_VA_A,
+        phys: a,
+        length: PAGE_SIZE,
+        flags: user,
+    });
+    space.map(Mapping {
+        virt: AS_VA_B,
+        phys: b,
+        length: PAGE_SIZE,
+        flags: user,
+    });
+    // Two pages in one call: the shared pair is one `Mapping` of two pages, which
+    // is the shape the plan uses and the only way to exercise the loop that walks
+    // a mapping's length.
+    space.map(Mapping {
+        virt: AS_VA_C,
+        phys: shared,
+        length: 2 * PAGE_SIZE,
+        flags: user,
+    });
+
+    // What the kernel means, page by page, read out of the space's *own* tables -
+    // the space is not the active one yet, so this says nothing about what the
+    // CPU would do with these addresses. The store further down is that half.
+    for (virt, phys, flags) in [
+        (AS_VA_A, a, user),
+        (AS_VA_B, b, user),
+        (AS_VA_C, shared, user),
+        (AS_VA_C2, shared + PAGE_SIZE, user),
+    ] {
+        match space.translate(virt) {
+            Some((got, got_flags, Memory::Normal)) if got == phys && got_flags == flags => {}
+            other => fail!(
+                "the space's own tables put {virt:#x} at {other:?}, and it was mapped \
+                 {phys:#x} as {flags:?} Normal"
+            ),
+        }
+    }
+    if space.phys_for_virt(AS_VA_A) != Some(a) {
+        fail!(
+            "phys_for_virt({AS_VA_A:#x}) is {:?}, and the frame mapped there is {a:#x}",
+            space.phys_for_virt(AS_VA_A)
+        );
+    }
+
+    // The walk a `fork` is written on: every mapped page, lowest first. A walk
+    // that missed a page would leave the child with a hole its parent cannot see,
+    // and one that reported the pages in a different order would be a second rule
+    // where the trait describes one.
+    let mut walked = [(0usize, 0usize, MapFlags::empty()); AS_PAGES];
+    let mut total = 0usize;
+    space.walk_user_pages(|virt, phys, flags| {
+        if total < walked.len() {
+            walked[total] = (virt, phys, flags);
+        }
+        total += 1;
+    });
+    if total != AS_PAGES {
+        fail!("the walk saw {total} pages, and {AS_PAGES} are mapped");
+    }
+    for (index, want) in [
+        (AS_VA_A, a, user),
+        (AS_VA_B, b, user),
+        (AS_VA_C, shared, user),
+        (AS_VA_C2, shared + PAGE_SIZE, user),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if walked[index] != want {
+            fail!(
+                "the walk's page {index} is {:?}, and the space maps {want:?} there",
+                walked[index]
+            );
+        }
+    }
+
+    // An address that is already spoken for, answered rather than asserted: this
+    // is the shape a `MAP_FIXED` request arrives in, and the reason `try_map`
+    // exists apart from `map`.
+    if space
+        .try_map(Mapping {
+            virt: AS_VA_A,
+            phys: d,
+            length: PAGE_SIZE,
+            flags: user,
+        })
+        .is_ok()
+    {
+        fail!("try_map put a second frame over {AS_VA_A:#x}, which already had one");
+    }
+    // And a free address, with a page that has *no* permission at all - which is
+    // what `PROT_NONE` is, and which this machine expresses as a page EL1 may
+    // reach and EL0 may not. That a user space accepts such a mapping is the
+    // whole reason `map` does not require `USER`.
+    let unreachable = MapFlags::READ;
+    if space
+        .try_map(Mapping {
+            virt: AS_VA_D,
+            phys: d,
+            length: PAGE_SIZE,
+            flags: unreachable,
+        })
+        .is_err()
+    {
+        fail!("try_map refused {AS_VA_D:#x}, which nothing had mapped");
+    }
+    match space.translate(AS_VA_D) {
+        Some((got, flags, Memory::Normal)) if got == d && flags == unreachable => {}
+        other => fail!(
+            "a page with no permission at {AS_VA_D:#x} came back {other:?}, and \
+             {unreachable:?} was asked for"
+        ),
+    }
+
+    // Permissions changed in place, with the frame left where it was: a range
+    // that is protected and then unprotected keeps its bytes, which is what makes
+    // `mprotect` mean something rather than only `munmap`.
+    space.protect(AS_VA_A, PAGE_SIZE, MapFlags::USER | MapFlags::READ);
+    match space.translate(AS_VA_A) {
+        Some((got, flags, Memory::Normal))
+            if got == a && flags == MapFlags::USER | MapFlags::READ => {}
+        other => fail!(
+            "protecting {AS_VA_A:#x} read-only left it {other:?}, and the frame should \
+             still be {a:#x}"
+        ),
+    }
+    space.protect(AS_VA_A, PAGE_SIZE, user);
+
+    // The copy-on-write marker, set without a flush and then flushed once: the
+    // pair a `fork` uses, because a flush per page would ask the CPU to re-walk
+    // pages the process is about to touch anyway.
+    space.set_cow_bit_quietly(AS_VA_A);
+    space.flush_if_active();
+    match space.translate(AS_VA_A) {
+        // Read-only as far as the CPU is concerned, and that bit is load-bearing:
+        // a copy-on-write page left writable would never fault, so it would never
+        // be copied, and the two spaces would share one frame after all.
+        Some((got, flags, Memory::Normal))
+            if got == a && flags == MapFlags::USER | MapFlags::READ => {}
+        other => fail!(
+            "a copy-on-write page at {AS_VA_A:#x} reads back as {other:?} to the \
+             hardware walk, and it has to be read-only for the write to fault"
+        ),
+    }
+    match walked_flags(&space, AS_VA_A) {
+        Some(flags) if flags == MapFlags::USER | MapFlags::READ | MapFlags::COW => {}
+        other => fail!(
+            "the walk reports {other:?} for the copy-on-write page at {AS_VA_A:#x}, and \
+             a fork has to see its marker to know it is waiting to be copied"
+        ),
+    }
+    // `protect` replaces a mapping's flags rather than merging them, so the
+    // marker goes the way the caller's set says - which is also the only way to
+    // take one off again, and the reason it is checked rather than assumed.
+    space.protect(AS_VA_A, PAGE_SIZE, user);
+    if walked_flags(&space, AS_VA_A) != Some(user) {
+        fail!(
+            "protecting {AS_VA_A:#x} writable again left the walk reporting {:?}",
+            walked_flags(&space, AS_VA_A)
+        );
+    }
+    // The same marker through the form that flushes on its own, on the page the
+    // fork below is about.
+    space.set_cow_bit(AS_VA_B);
+    match walked_flags(&space, AS_VA_B) {
+        Some(flags) if flags == MapFlags::USER | MapFlags::READ | MapFlags::COW => {}
+        other => fail!("marking {AS_VA_B:#x} copy-on-write read back as {other:?}"),
+    }
+
+    // The `fork`, by hand and in the order one does it: walk the parent, map
+    // every page into the child copy-on-write, then resolve the child's first
+    // write. Every frame the two spaces share is still shared at this point, and
+    // neither space may write any of them.
+    let mut child = paging::UserSpace::new();
+    space.walk_user_pages(|virt, phys, flags| child.map_cow(virt, phys, flags));
+    match walked_flags(&child, AS_VA_B) {
+        Some(flags) if flags == MapFlags::USER | MapFlags::READ | MapFlags::COW => {}
+        other => fail!(
+            "the child's copy of {AS_VA_B:#x} came back {other:?}, and a fork has to \
+             mark what it shares"
+        ),
+    }
+    let resolved = child.resolve_cow(AS_VA_B);
+    let Some((old, new)) = resolved else {
+        fail!("resolving a write to the child's {AS_VA_B:#x} found no copy-on-write page")
+    };
+    if old != b {
+        fail!("the child's {AS_VA_B:#x} was backed by {old:#x}, and the parent maps {b:#x}");
+    }
+    if new == b {
+        fail!("resolving the write handed back {new:#x}, which is the frame it shared");
+    }
+    if !frame_is(new, 0x22) {
+        fail!("the child's own frame at {new:#x} does not hold the bytes that were copied");
+    }
+    if !frame_is(b, 0x22) {
+        fail!(
+            "the parent's frame at {b:#x} changed, and the child's write was supposed to \
+             copy rather than share"
+        );
+    }
+    match child.translate(AS_VA_B) {
+        Some((got, flags, Memory::Normal)) if got == new && flags == user => {}
+        other => fail!(
+            "after resolving, the child's {AS_VA_B:#x} reads back {other:?}, and it \
+             should be {new:#x} as {user:?} Normal"
+        ),
+    }
+    if child.resolve_cow(AS_VA_B).is_some() {
+        fail!(
+            "a second resolve of the child's {AS_VA_B:#x} copied a page that is no \
+               longer copy-on-write"
+        );
+    }
+    // The parent's mapping and the parent's bytes, both unchanged: the child's
+    // write reached neither, which is the whole of what copy-on-write promises.
+    match space.translate(AS_VA_B) {
+        Some((got, flags, Memory::Normal))
+            if got == b && flags == MapFlags::USER | MapFlags::READ => {}
+        other => fail!(
+            "the parent's {AS_VA_B:#x} reads back {other:?} after the child resolved its \
+             write, and it should still be {b:#x} and still read-only"
+        ),
+    }
+
+    // What the MMU enforces, as opposed to what the walk reports: make the space
+    // the active one and store to a user address from EL1. `AP[1]` says EL0 may
+    // reach this page, and on this machine that is also what lets EL1 reach it -
+    // so the store lands only if the descriptor the CPU is walking says writable,
+    // which no software walk can decide.
+    space.switch();
+    // SAFETY: `space` is the active address space, so `AS_VA_A` is mapped by the
+    // tables `TTBR0_EL1` names right now, and `user` leaves it writable.
+    unsafe { core::ptr::write_volatile(AS_VA_A as *mut u8, 0x5a) };
+    // SAFETY: the frame is the check's own and the direct map reaches it.
+    let stored = unsafe { core::ptr::read_volatile(mm::phys_to_virt(a) as *const u8) };
+    if stored != 0x5a {
+        fail!(
+            "a store through the active mapping of {AS_VA_A:#x} left {stored:#x} in the \
+             frame it maps, and the MMU was supposed to enforce that mapping"
+        );
+    }
+    // SAFETY: as above, and restoring the byte so the frame reads as it did.
+    unsafe { core::ptr::write_volatile(mm::phys_to_virt(a) as *mut u8, 0x11) };
+
+    // A *shared* mapping: the same two frames in a second space, writable in both
+    // and with no marker - which is the difference `MAP_SHARED` turns on, and the
+    // reason such a mapping must not be copy-on-write. Both spaces map the same
+    // frames, and neither owns them exclusively.
+    let mut other = paging::UserSpace::new();
+    other.map_shared(AS_VA_C, shared, user);
+    other.map_shared(AS_VA_C2, shared + PAGE_SIZE, user);
+    if walked_flags(&other, AS_VA_C) != Some(user) {
+        fail!(
+            "the shared page at {AS_VA_C:#x} came back {:?}, and a shared mapping is not \
+             copy-on-write",
+            walked_flags(&other, AS_VA_C)
+        );
+    }
+    match other.resolve_cow(AS_VA_C) {
+        None => {}
+        Some((old, copied)) => fail!(
+            "resolving a write to the shared page at {AS_VA_C:#x} copied {old:#x} to \
+             {copied:#x}, and a shared mapping has to be written in place"
+        ),
+    }
+    // The store is what makes it shared rather than merely equal: it goes through
+    // the *second* space's address and comes back out of the frame the *first*
+    // space maps.
+    other.switch();
+    // SAFETY: `other` is the active address space and `AS_VA_C` is mapped
+    // writable in it.
+    unsafe { core::ptr::write_volatile(AS_VA_C as *mut u8, 0x66) };
+    // SAFETY: `shared` is a frame the check owns and the direct map reaches it.
+    let seen = unsafe { core::ptr::read_volatile(mm::phys_to_virt(shared) as *const u8) };
+    if seen != 0x66 {
+        fail!(
+            "a store through the second space's mapping of {AS_VA_C:#x} left {seen:#x} \
+             in the frame the first space maps there"
+        );
+    }
+    if space.phys_for_virt(AS_VA_C2) != Some(shared + PAGE_SIZE) {
+        fail!(
+            "the two spaces map the second shared page to different frames: {:?} and \
+             {:#x}",
+            space.phys_for_virt(AS_VA_C2),
+            shared + PAGE_SIZE
+        );
+    }
+
+    // Taking a mapping back: the frames come to the caller and the address stops
+    // translating - from the walk and, because this space was the active one when
+    // the mapping went, from the machine.
+    let dropped = space.unmap(AS_VA_C, 2 * PAGE_SIZE);
+    if dropped != [shared, shared + PAGE_SIZE] {
+        fail!(
+            "unmapping the shared pair gave back {dropped:x?}, and {shared:#x} and {:#x} \
+             were mapped there",
+            shared + PAGE_SIZE
+        );
+    }
+    if space.translate(AS_VA_C).is_some() || space.translate(AS_VA_C2).is_some() {
+        fail!("the shared pair still translates after being unmapped");
+    }
+    let mut left = 0usize;
+    space.walk_user_pages(|_, _, _| left += 1);
+    // `AS_PAGES` was the four the check started with; the page `try_map` added is
+    // the fifth, and the two that were unmapped are the shared pair - so A, B and
+    // D are what a walk should still find. The arithmetic is the check's and it
+    // was wrong on the first run, which is the point of counting rather than
+    // trusting the unmapped addresses alone.
+    if left != AS_PAGES - 1 {
+        fail!(
+            "after unmapping two pages the walk sees {left}, and {} are left",
+            AS_PAGES - 1
+        );
+    }
+
+    // `Drop`, and the measurement that makes it a check rather than a claim: a
+    // space's tables go back to the allocator and the frames its leaves point at
+    // do *not*. The count is the instrument because both mistakes are off by a
+    // specific number of frames - a leak by the four this space's tables cost, a
+    // wrong free by the one page it mapped.
+    //
+    // The space is made the active one first, because that is the dangerous
+    // order: a `Drop` that freed the tables before leaving would have the CPU
+    // walking frames the allocator had already taken back. The address is
+    // `AS_VA_A` again on purpose - the same address in a different space is what
+    // an address space *is*.
+    let before = mm::frame_stats().free;
+    let tables;
+    {
+        let mut scratch = paging::UserSpace::new();
+        scratch.map(Mapping {
+            virt: AS_VA_A,
+            phys: d,
+            length: PAGE_SIZE,
+            flags: user,
+        });
+        scratch.switch();
+        // What the space's own tables take, measured while it is alive and after
+        // the page above was mapped: the mapped frame is not part of this number,
+        // which is the whole reason the number can be checked.
+        tables = before - mm::frame_stats().free;
+    }
+    let after = mm::frame_stats().free;
+    if tables == 0 {
+        fail!("a user address space's tables cost no frames, so nothing was measured");
+    }
+    if after != before {
+        fail!(
+            "dropping a space moved the free frame count from {before} to {after} \
+             ({tables} frames were its tables); its tables should come back and the \
+             page it mapped should not"
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "\nspace: {AS_PAGES} pages mapped, walked in order and read back through the \
+         MMU; two protected, one copy-on-write and resolved into a frame of its own \
+         ({new:#x}) with the parent's {b:#x} left alone; two shared between spaces and \
+         written through one of them; two unmapped and given back",
+    );
+    let _ = writeln!(
+        out,
+        "space: dropping an active space gave back all {tables} frames its tables took, \
+         and the page it mapped not among them",
+    );
+    let _ = writeln!(out, "M6_AS_OK");
+}
+
 /// Bring the machine's interrupts up: the vector table, then the controller,
 /// then the clock.
 ///
 /// The order is the x86_64 `init_interrupts`'s, and for the same reason: the
 /// vectors must exist before anything can raise one, and the controller must
 /// know about the timer's line before the timer is armed to raise it. Unmasking
-/// the CPU is the caller's separate step, because a boot path brings the
-/// machine up and *then* opens the door.
+/// the CPU is the caller's separate step, because a boot path brings the machine
+/// up and *then* opens the door.
 pub fn init_interrupts() {
     vectors::init();
     gic::init();
