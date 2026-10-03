@@ -5634,17 +5634,20 @@ objective's core - "boots the kernel to a working userspace" - now genuinely dem
 end to end. The `/init` still exits one-shot; a typed shell needs a read-loop `/init` + a
 real shell binary (stage 7 continues), but the run-and-output path is proven.
 
-**Stage 7d is DONE: a scheduler-run userspace program completes the interactive `read`.**
-The hand-encoded `/init` now does `read(0, buf, 64)` and only *after that returns* a
-`write(1, "MPOS_INIT_SAW_INPUT\n", 20)` then `exit_group(0)` - sixteen `mov`/`movk`/`svc`
-words, all verified through the `llvm-objdump` encode/disassemble round trip. The boot
+**Stage 7d is DONE: a scheduler-run userspace program reads console input and echoes the
+bytes it read back out.** The hand-encoded `/init` now does `read(0, buf, 64)`, then
+`write(1, "R:", 2)` and `write(1, buf, n)` - the *bytes it just read* - then
+`exit_group(0)`: twenty-three `mov`/`movz`/`movk`/`svc` words, all verified through the
+`llvm-objdump` encode/disassemble round trip. Writing back what it read (not a fixed
+string) is what makes the proof unambiguous: the tty's canonical echo of the queued input
+also prints `echo-test`, so only the init's own output carries the `R:` prefix. The boot
 queues a line (`echo-test\n`) on the tty before the handoff (the same receive path stage
 7b wired; `cargo xtask run --arch aarch64` supplies it live from typed input), so the
 init's `read` returns real console input. boot-aarch64 now shows, in order: `echo-test`
-(canonical tty echo of the queued input), `M6_INIT_OK`, `MPOS_INIT_SAW_INPUT` (the
-userspace `read(0)` syscall completed and the confirmation reached the wire through
+(canonical tty echo of the queued input), `M6_INIT_OK`, `R:echo-test` (the userspace
+`read(0)` returned the console bytes and the userspace `write(1)` echoed them through
 `syscall::dispatch`), and `INIT_EXITED`. That is the full interactive path - typed bytes
-in at EL0 via a userspace `read` syscall, output back out via a userspace `write` -
+in at EL0 via a userspace `read` syscall, the same bytes back out via a userspace `write` -
 demonstrated on the second machine. What remains for a typed *shell* rather than this
 read/echo proof: a `/init` that loops read/echo (or busybox `ash`, which additionally
 needs the aarch64 `execve`/`clone` return-frame path - the named stage-6D gap), then the

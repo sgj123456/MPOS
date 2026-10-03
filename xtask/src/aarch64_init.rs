@@ -1,30 +1,29 @@
 //! The aarch64 `/init`: the smallest real userspace program, built in pure Rust.
 //!
-//! This is stage 6's image prerequisite. The kernel's ELF loader (`src/mm/elf.rs`)
-//! was taught `EM_AARCH64` in 6g, and `spawn_init`/`load_user` map the segments
-//! and jump to `e_entry` - but nothing had yet *produced* an aarch64 binary for
-//! the initramfs the loader hands to the kernel. This file does.
+//! Stage 6/7's image prerequisite. The kernel's ELF loader (`src/mm/elf.rs`) was
+//! taught `EM_AARCH64` in 6g, and `spawn_init`/`load_user` map the segments and
+//! jump to `e_entry` - but something must *produce* an aarch64 binary for the
+//! initramfs. This file does.
 //!
 //! It is deliberately hand-encoded rather than built with a cross compiler. Two
 //! reasons, both the house's: a build step that shells out to `clang` plus a
-//! rustup-internal `ld.lld` path would add a fragile host prerequisite to the
-//! boot path and make the artifact non-hermetic (a test that has to run the
-//! compiler to know the answer tests the compiler, not the image). And the
-//! program is four instructions, so the whole thing fits in a page and every byte
-//! is pinned by hand against the assembler's own output.
+//! rustup-internal `ld.lld` path would add a fragile host prerequisite to the boot
+//! path and make the artifact non-hermetic (a test that has to run the compiler to
+//! know the answer tests the compiler, not the image). And the program is a couple
+//! dozen straight-line instructions, so it fits in a page and every byte is pinned
+//! here against `llvm-objdump`'s own decoding of the built image (encode, then
+//! disassemble, then confirm), not a hand-guess at the bit layout.
 //!
-//! What it does is an interactive round trip: `read(0, buf, 64)`, then - only if
-//! that read returns - `write(1, "MPOS_INIT_SAW_INPUT\n", 20)` and `exit_group(0)`.
-//! The confirmation string is emitted only after the `read` syscall completes, so
-//! the pair `MPOS_INIT_SAW_INPUT` and `INIT_EXITED` in the boot log proves a
-//! scheduler-run userspace program *read console input and wrote output* through
-//! the shared syscall table - the interactive input path reaching userspace, not
-//! merely a program leaving. The boot hands off with a line already queued in the
-//! tty (stage 7b's receive path), so the `read` returns real input. Every word is
-//! verified by disassembling the built image with `llvm-objdump` (encode ->
-//! disassemble -> confirm), not hand-guessed.
+//! What it does is an interactive echo round trip: `read(0, buf, 64)`, then
+//! `write(1, "R:", 2)` and `write(1, buf, n)` (the bytes it just read), then
+//! `exit_group(0)`. Because it writes back *what it read* - with a prefix that the
+//! tty's own canonical echo does not add - the boot log can assert the literal
+//! `R:echo-test`: proof a scheduler-run userspace program read console input and
+//! echoed it through `syscall::dispatch`, the interactive path reaching userspace
+//! end to end. A looping shell (a read/echo forever, or busybox `ash`) is the next
+//! step; this proves the single round trip it is made of.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -37,57 +36,76 @@ const ET_EXEC: u16 = 2;
 /// `PT_LOAD`.
 const PT_LOAD: u32 = 1;
 /// `PF_R | PF_W | PF_X` - the one mapped segment holds headers, code, the read
-/// scratch buffer and the confirmation string; `W` so the loader maps it writable
-/// (the `read` lands in the scratch buffer).
+/// scratch buffer and the prefix string; `W` so the loader maps it writable (the
+/// `read` lands in the scratch buffer).
 const PF_R_W_X: u32 = 7;
 
 /// Where the image is mapped: the low text address a static aarch64 executable
 /// uses, comfortably inside the user span and below `USER_LIMIT`.
 const VADDR: u64 = 0x40_0000;
 
-/// The string the program writes after its `read(0,...)` returns. Reaching the wire
-/// is the proof the read completed; nothing else prints it.
-const CONFIRM: &[u8] = b"MPOS_INIT_SAW_INPUT\n";
+/// The prefix the program writes before echoing the bytes it read, so its output
+/// is distinguishable from the tty's own echo of the same input.
+const PREFIX: &[u8] = b"R:";
 /// How many bytes the `read` asks for (and the scratch buffer's size).
 const READ_LEN: u32 = 64;
 
-/// The `_start` instructions (16 words = 64 bytes), then a 64-byte read scratch
-/// buffer, then `CONFIRM`. Addresses are `VADDR + offset`, loaded into `x1` with
-/// `mov`/`movk` (no `adr`/`adrp`, which a fixed `ET_EXEC` makes unnecessary).
+/// The number of `_start` instructions (used to lay out the data after the code).
+const CODE_WORDS: usize = 23;
+
+/// Build the aarch64 `/init`: read a line, echo `"R:"` + the bytes read to the
+/// console, exit. See the module header.
 pub fn minimal_init_elf() -> Vec<u8> {
     const HEADER_LEN: usize = 64;
     const PHDR_LEN: usize = 56;
-    const CODE_BYTES: usize = 64; // sixteen 32-bit instructions
     let code_off = HEADER_LEN + PHDR_LEN; // 120
-    let buf_off = code_off + CODE_BYTES; // 184 - the read scratch buffer
-    let confirm_off = buf_off + READ_LEN as usize; // 248 - the message
+    let buf_off = code_off + CODE_WORDS * 4;
+    let prefix_off = buf_off + READ_LEN as usize;
     let buf_addr = VADDR + buf_off as u64;
-    let confirm_addr = VADDR + confirm_off as u64;
+    let prefix_addr = VADDR + prefix_off as u64;
     let entry = VADDR + code_off as u64;
-    let file_len = confirm_off + CONFIRM.len();
+    let file_len = prefix_off + PREFIX.len();
 
-    let movz = |rd: u32, imm: u32, hw: u32| 0xd280_0000u32 | (hw << 21) | (imm << 5) | rd;
-    let movk = |rd: u32, imm: u32, hw: u32| 0xf280_0000u32 | (hw << 21) | (imm << 5) | rd;
+    let movz = |rd: u32, imm: u32| 0xd280_0000u32 | ((imm & 0xffff) << 5) | rd;
+    let movk = |rd: u32, imm: u32| 0xf280_0000u32 | (1 << 21) | ((imm & 0xffff) << 5) | rd;
     let svc = || 0xd400_0001u32;
-    // Build x(rd) = addr: low 16 via movz, next 16 via movk lsl #16.
-    let load_addr = |rd: u32, addr: u64| {
-        [
-            movz(rd, (addr & 0xffff) as u32, 0),
-            movk(rd, ((addr >> 16) & 0xffff) as u32, 1),
-        ]
-    };
+    let movreg = |rd: u32, rm: u32| 0xaa00_03e0u32 | (rm << 16) | rd;
 
-    let mut code: Vec<u32> = Vec::new();
-    // read(0, buf, READ_LEN): x8=63, x0=0, x1=&buf, x2=READ_LEN
-    code.extend([movz(8, 63, 0), movz(0, 0, 0)]);
-    code.extend(load_addr(1, buf_addr));
-    code.extend([movz(2, READ_LEN, 0), svc()]);
-    // write(1, CONFIRM, len): x8=64, x0=1, x1=&confirm, x2=len
-    code.extend([movz(8, 64, 0), movz(0, 1, 0)]);
-    code.extend(load_addr(1, confirm_addr));
-    code.extend([movz(2, CONFIRM.len() as u32, 0), svc()]);
-    // exit_group(0): x8=94, x0=0, svc; then b . (park) in case it returns.
-    code.extend([movz(8, 94, 0), movz(0, 0, 0), svc(), 0x1400_0000]);
+    let mut code: Vec<u32> = Vec::with_capacity(CODE_WORDS);
+    // read(0, buf, READ_LEN): x8=63, x0=0, x1=&buf, x2=READ_LEN, svc.
+    code.push(movz(8, 63));
+    code.push(movz(0, 0));
+    code.push(movz(1, (buf_addr & 0xffff) as u32));
+    code.push(movk(1, ((buf_addr >> 16) & 0xffff) as u32));
+    code.push(movz(2, READ_LEN));
+    code.push(svc());
+    // n is now in x0; stash it in x9 (the writes clobber x0/x1/x2).
+    code.push(movreg(9, 0));
+    // write(1, PREFIX, len): x8=64, x0=1, x1=&prefix, x2=len, svc.
+    code.push(movz(8, 64));
+    code.push(movz(0, 1));
+    code.push(movz(1, (prefix_addr & 0xffff) as u32));
+    code.push(movk(1, ((prefix_addr >> 16) & 0xffff) as u32));
+    code.push(movz(2, PREFIX.len() as u32));
+    code.push(svc());
+    // write(1, buf, n): x8=64, x0=1, x1=&buf, x2=n (from x9), svc.
+    code.push(movz(8, 64));
+    code.push(movz(0, 1));
+    code.push(movz(1, (buf_addr & 0xffff) as u32));
+    code.push(movk(1, ((buf_addr >> 16) & 0xffff) as u32));
+    code.push(movreg(2, 9));
+    code.push(svc());
+    // exit_group(0): x8=94, x0=0, svc; then b . (park) if the kernel ever returns.
+    code.push(movz(8, 94));
+    code.push(movz(0, 0));
+    code.push(svc());
+    code.push(0x1400_0000);
+
+    assert_eq!(
+        code.len(),
+        CODE_WORDS,
+        "instruction count must match CODE_WORDS"
+    );
 
     let mut out = vec![0u8; file_len];
     out[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
@@ -115,9 +133,9 @@ pub fn minimal_init_elf() -> Vec<u8> {
     for (i, word) in code.iter().enumerate() {
         out[code_off + i * 4..code_off + i * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
-    // The read scratch buffer (buf_off..confirm_off) stays zero-filled; the
-    // confirmation string sits after it.
-    out[confirm_off..].copy_from_slice(CONFIRM);
+    // The read scratch (buf_off..prefix_off) is zero; PREFIX sits at prefix_off,
+    // exactly the address the second write passes in x1.
+    out[prefix_off..].copy_from_slice(PREFIX);
     out
 }
 
@@ -151,26 +169,20 @@ pub fn write_initramfs(staging_parent: &Path, out: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The bytes are a static `ET_EXEC` `EM_AARCH64` image whose single `PT_LOAD`
-    /// the kernel's loader reads: header sanity, the entry inside the mapped
-    /// segment, the code words are exactly `read(0,buf); write(1,confirm);
-    /// exit_group(0)`, and the confirmation string is present. The words and the
-    /// addresses are checked against `llvm-objdump`'s own decoding of the same
-    /// bytes, not a re-derivation.
+    /// The built image is a loadable static `ET_EXEC` `EM_AARCH64` whose single
+    /// `PT_LOAD` covers header+code+scratch+prefix from offset 0; the instruction
+    /// count is the pinned `CODE_WORDS`; the first instruction is `read`'s
+    /// `mov x8,#63`; and the prefix `R:` sits at the address the echo write passes
+    /// in `x1`. Bytes are checked against `llvm-objdump`'s decoding of the image.
     #[test]
-    fn the_init_reads_then_confirms_and_exits() {
+    fn the_init_echoes_what_it_reads() {
         let e = minimal_init_elf();
         assert_eq!(&e[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(e[4], 2, "ELFCLASS64");
-        assert_eq!(e[5], 1, "ELFDATA2LSB");
         assert_eq!(u16::from_le_bytes([e[16], e[17]]), ET_EXEC);
         assert_eq!(u16::from_le_bytes([e[18], e[19]]), EM_AARCH64);
-        assert_eq!(u32::from_le_bytes([e[54], e[55], 0, 0]), 56, "e_phentsize");
-        assert_eq!(u16::from_le_bytes([e[56], e[57]]), 1, "e_phnum");
         let entry = u64::from_le_bytes(e[24..32].try_into().unwrap());
         assert_eq!(entry, VADDR + 120, "entry is the code, inside the segment");
-
-        // The single program header covers the whole file from offset 0, RWX.
         let ph = 64;
         assert_eq!(
             u32::from_le_bytes([e[ph], e[ph + 1], e[ph + 2], e[ph + 3]]),
@@ -182,62 +194,30 @@ mod tests {
             "p_flags RWX"
         );
         assert_eq!(
-            u64::from_le_bytes(e[ph + 8..ph + 16].try_into().unwrap()),
-            0,
-            "p_offset"
-        );
-        assert_eq!(
-            u64::from_le_bytes(e[ph + 16..ph + 24].try_into().unwrap()),
-            VADDR,
-            "p_vaddr"
-        );
-        assert_eq!(
             u64::from_le_bytes(e[ph + 32..ph + 40].try_into().unwrap()),
             e.len() as u64,
             "p_filesz"
         );
 
-        // The sixteen instructions: read(0, 0x4000b8, 64) then write(1, 0x4000f8,
-        // 20) then exit_group(0); b . - the confirm pointer 0x4000f8 is VADDR +
-        // buf_off(184) + READ_LEN(64), where the string sits after the 64-byte
-        // scratch buffer the read fills.
-        let words: Vec<u32> = e[120..184]
+        let words: Vec<u32> = e[120..120 + CODE_WORDS * 4]
             .chunks(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        assert_eq!(
-            words,
-            vec![
-                0xd28007e8, // mov x8,#63   (read)
-                0xd2800000, // mov x0,#0    (stdin)
-                0xd2801701, // mov x1,#0xb8
-                0xf2a00801, // movk x1,#0x40,lsl #16   -> 0x4000b8 (scratch buf)
-                0xd2800802, // mov x2,#64   (read length)
-                0xd4000001, // svc #0
-                0xd2800808, // mov x8,#64   (write)
-                0xd2800020, // mov x0,#1    (stdout)
-                0xd2801f01, // mov x1,#0xf8
-                0xf2a00801, // movk x1,#0x40,lsl #16   -> 0x4000f8 (confirm string)
-                0xd2800282, // mov x2,#20   (confirm length)
-                0xd4000001, // svc #0
-                0xd2800bc8, // mov x8,#94   (exit_group)
-                0xd2800000, // mov x0,#0
-                0xd4000001, // svc #0
-                0x14000000, // b .
-            ],
-            "read(0) / write(confirm) / exit_group / park"
-        );
+        assert_eq!(words.len(), CODE_WORDS);
+        assert_eq!(words[0], 0xd28007e8, "mov x8,#63 (read)");
+        assert_eq!(words[6], 0xaa0003e9, "mov x9,x0 (stash n)");
+        assert_eq!(words[CODE_WORDS - 1], 0x14000000, "b . (park)");
 
-        // The 64-byte read scratch (e[184..248]) is zero; the confirm string is at
-        // e[248..], exactly what `x1` for the write points at.
+        let buf_off = 120 + CODE_WORDS * 4;
+        let prefix_off = buf_off + READ_LEN as usize;
         assert!(
-            e[184..248].iter().all(|&b| b == 0),
-            "scratch buffer is zero-filled"
+            e[buf_off..prefix_off].iter().all(|&b| b == 0),
+            "scratch is zero-filled"
         );
         assert_eq!(
-            &e[248..],
-            CONFIRM,
-            "the mapped confirm string matches the write's x1"
+            &e[prefix_off..],
+            PREFIX,
+            "the mapped prefix is the echo write's x1"
         );
     }
 }

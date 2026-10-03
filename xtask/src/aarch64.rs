@@ -94,7 +94,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// marker and `M6_EL0_OK` came **out** of the list - leaving it in would stop the
 /// poll on a machine that still has init to run. Stage 7c's fix made the handoff
 /// actually schedule `/init` (waiting on `is_running`, not `has_live_child`), so the
-/// init now runs: its `read(0)`/`write(1)` round trip (the `MPOS_INIT_SAW_INPUT`
+/// init now runs: its `read(0)`/`write(1)` echo round trip (the `R:echo-test`
 /// confirmation) and the `INIT_EXITED` its `exit_group` reaches
 /// via the scheduler are the terminal proof, and `INIT_EXITED` (not `M6_INIT_OK`,
 /// which now prints before the wait) is the last terminator.
@@ -198,15 +198,15 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         .filter(|(marker, _)| !log.contains(marker))
         .map(|(_, what)| *what)
         .collect();
-    // The init now does a `read(0, buf, 64)` (on a line the handoff queued on the
-    // tty) and, only after that read returns, a `write(1, "MPOS_INIT_SAW_INPUT\n")` -
-    // so its appearance proves a scheduler-run userspace program completed the
-    // interactive *read* syscall and wrote output, not merely that it ran. Assert it
-    // reached the wire independently of the `M6_*` checks.
-    if !log.contains("MPOS_INIT_SAW_INPUT") {
+    // The init reads a line from `fd 0` (the handoff queued "echo-test\n" on the
+    // tty) and echoes it back prefixed with "R:" - so `R:echo-test` on the wire is
+    // the init's OWN output (the tty's canonical echo of the same line carries no
+    // "R:"). Its presence proves a scheduler-run userspace program read console
+    // input and wrote the bytes it read, through `syscall::dispatch`.
+    if !log.contains("R:echo-test") {
         bail!(
-            "the aarch64 init never completed a read/write round trip: \
-             the MPOS_INIT_SAW_INPUT confirmation is absent"
+            "the aarch64 init never echoed the input it read: the R:echo-test \
+             line is absent (read(0)/write(1) round trip did not complete)"
         );
     }
     if missing.is_empty() {
@@ -215,9 +215,9 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
              M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
-             init's read/write confirmation (MPOS_INIT_SAW_INPUT), and INIT_EXITED - a \
-             scheduler-run userspace program read console input, wrote the console and \
-             exited - from the ESP under AAVMF"
+             init's echoed input (R:echo-test), and INIT_EXITED - a scheduler-run \
+             userspace program read console input and echoed it back - from the ESP \
+             under AAVMF"
         );
         return Ok(());
     }
