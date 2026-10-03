@@ -20,7 +20,7 @@ use crate::syscall::{ARG_COUNT, buffer_ok, err, err_of};
 // modules they come from, which the host build does not compile.
 #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 use crate::drivers::uinput::Uinput;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 use crate::drivers::virtio::gpu::FbDev;
 #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 use crate::drivers::virtio::input::EvdevNode;
@@ -374,6 +374,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 None => err::ENODEV,
             }
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x8914 => {
             // SIOCSIFFLAGS: the new flags. Only `IFF_UP` carries meaning -
             // the capability bits are the link's to keep, not the setter's.
@@ -391,6 +392,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 None => err::ENODEV,
             }
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x8921 => {
             // SIOCGIFMTU: the link's current MTU - the loopback's is the
             // 64 KiB an IPv4 datagram tops out at, the NIC's is what
@@ -417,6 +419,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 None => err::ENODEV,
             }
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x8922 => {
             // SIOCSIFMTU: the new MTU, which `ip link set eth0 mtu N`
             // writes. The stack clamps it to the bounds a frame can carry.
@@ -435,6 +438,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 None => err::ENODEV,
             }
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x8923 => {
             // SIOCSIFNAME: rename. The new name rides the union half of the
             // request - the same place the flags and the MTU do.
@@ -518,6 +522,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x4600 => {
             // FBIOGET_VSCREENLINFO: the framebuffer's own description, in
             // `struct fb_var_screeninfo` - the resolution a program sizes
@@ -566,6 +571,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x4601 => {
             // FBIOPUT_VSCREENLINFO: a request to reshape the framebuffer.
             // Refused rather than faked: changing the resolution tears down
@@ -583,6 +589,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             err::EOPNOTSUPP
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x4602 => {
             // FBIOGET_FSCREENINFO: the fixed half of the pair - where the
             // pixel buffer physically is and how long a row is, the numbers
@@ -621,6 +628,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x4603 => {
             // FBIOPAN_DISPLAY: accept a page-flip request. This framebuffer
             // is a single scanout (`yres_virtual == yres`), so a compositor
@@ -642,6 +650,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             crate::drivers::video::render::request_flush_blocking();
             0
         }
+        #[cfg(not(target_arch = "aarch64"))]
         0x4622 => {
             // FBIO_WAITFORVSYNC: a frame-pacing wait, which this now genuinely
             // is - it sleeps until the next frame the render task *presents*.
@@ -956,8 +965,9 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
         }
         // DRM/KMS ioctls (`'d'`-typed), routed to the card handler with the
-        // command number already decoded out of the request word.
-        #[cfg(target_os = "none")]
+        // command number already decoded out of the request word. Deferred off
+        // aarch64 with the DRM driver itself: there is no card to reach.
+        #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
         request if family_nr(request, b'd').is_some() => match family_nr(request, b'd') {
             Some(nr) => crate::drivers::drm::drm_ioctl(fd, nr, buf),
             None => err::ENOTTY,
@@ -1263,6 +1273,17 @@ fn ifreq_index(buf: usize) -> Option<u32> {
     }
     let len = name.iter().position(|b| *b == 0)?;
     let name = core::str::from_utf8(&name[..len]).ok()?;
+    ifreq_index_named(name)
+}
+
+/// Whether a parsed interface name resolves to a link index. The loopback is
+/// the always-present index 1; the ethernet is 2, but only once the net stack
+/// knows that name. Off aarch64 the lookup reaches into `crate::net`; on it the
+/// stack is deferred (its driver stage follows), so no name resolves and the
+/// interface ioctls answer `ENODEV` - the honest answer for "there is no such
+/// link", not a fabricated index.
+#[cfg(not(target_arch = "aarch64"))]
+fn ifreq_index_named(name: &str) -> Option<u32> {
     if name == "lo" {
         return Some(1);
     }
@@ -1270,10 +1291,15 @@ fn ifreq_index(buf: usize) -> Option<u32> {
         .filter(|facts| facts.eth_name == name)
         .map(|_| 2)
 }
+#[cfg(target_arch = "aarch64")]
+fn ifreq_index_named(_name: &str) -> Option<u32> {
+    None
+}
 
 /// The flags an interface ioctl reports - the same bits the netlink link
 /// dump carries, as the `ifr_flags` halfword: the link's kind, and the
 /// up-and-running pair that rides the administrative bit.
+#[cfg(not(target_arch = "aarch64"))]
 fn ifreq_flags(index: u32) -> Option<u16> {
     let facts = crate::net::link_facts()?;
     let (up, loopback) = match index {
@@ -1286,4 +1312,10 @@ fn ifreq_flags(index: u32) -> Option<u16> {
         flags |= 0x1 | 0x40;
     }
     Some(flags)
+}
+#[cfg(target_arch = "aarch64")]
+fn ifreq_flags(_index: u32) -> Option<u16> {
+    // No net stack to report link facts on this machine yet; the interface
+    // ioctls fall to `ENODEV` rather than invent a link's state.
+    None
 }
