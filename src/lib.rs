@@ -46,7 +46,13 @@ pub mod arch;
 /// Binary formats: how the kernel decides what runs a file. Its own leaf crate
 /// (reading a `#!` line is pure); re-exported so `crate::binfmt` still resolves.
 pub use mpos_binfmt as binfmt;
-pub mod blk;
+/// The block layer seam: the `BlockDev` trait a filesystem reads its storage
+/// through, the registry that names every disk the kernel has, and the GPT/MBR
+/// decode that finds a filesystem on one. Its own leaf crate - the trait and the
+/// parser are pure and host-tested, so the crate boundary is what makes the
+/// downward-only rule (AGENTS.md §4 rule 5) a compile error for them rather than
+/// a convention.
+pub use mpos_blk as blk;
 pub mod boot;
 #[cfg(target_os = "none")]
 pub mod console;

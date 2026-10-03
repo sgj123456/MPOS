@@ -55,9 +55,10 @@ flowchart TB
         GPU["mpos-gpu"]
         EVDEV["mpos-evdev"]
         UINPUT["mpos-uinput"]
+        BLK["mpos-blk"]
     end
 
-    K --> ERR & DATE & BINFMT & CRED & UTS & SECCOMP & PCI & TERM & AHCI & GPU & EVDEV & UINPUT
+    K --> ERR & DATE & BINFMT & CRED & UTS & SECCOMP & PCI & TERM & AHCI & GPU & EVDEV & UINPUT & BLK
 
     subgraph Userland["User programs"]
         U["mpos-user<br/>(user/)<br/>x86_64-unknown-linux-musl"]
@@ -101,16 +102,16 @@ disagree about a syscall number without one of them failing to build.
 bare-metal default. It depends on `mpos` with `default-features = false`, i.e. it fuzzes
 exactly the part of the kernel that `src/lib.rs` leaves ungated.
 
-**Twelve pure leaves are their own crates under `crates/`.** Each depends on
+**Thirteen pure leaves are their own crates under `crates/`.** Each depends on
 nothing in the kernel (only `core`/`alloc`, and `critical-section` for
-`pci`/`uts`/`term`/`gpu`; `mpos-uinput` depends on `mpos-evdev` for one constant), so they were extracted as workspace members and
+`pci`/`uts`/`term`/`gpu`/`blk`; `mpos-uinput` depends on `mpos-evdev` for one constant), so they were extracted as workspace members and
 re-exported from `src/lib.rs` under their old names (`pub use mpos_err as err;`).
 The call sites are unchanged; what the crate boundary buys is enforcement, not
 tidiness — a leaf crate physically cannot write `crate::sched::…`, so the
 downward-only rule that `§9` keeps having to re-audit is now a compile error
 rather than a convention. The first seven (`err`, `date`, `binfmt`, `cred`,
 `uts`, `seccomp`, `pci`) were chosen because they already sat *outside* the
-module graph's one strongly-connected component (`§6`); the last three were
+module graph's one strongly-connected component (`§6`); the next ones were
 chosen for the same reason plus a placement one — `term` (the terminal emulator:
 a cell grid is not a filesystem fact, V-4), `ahci` (the port decode: arithmetic
 whose only reader is machine-only), `gpu` (the wire ABI, the DRM blobs, the cursor
@@ -121,6 +122,11 @@ one: it was *inside* the component by a single edge — `sync.rs` woke a parked
 waiter by calling `sched::wake` — and the split is what forced that seam to
 become a parameter (`gpu::sync::Waker`, injected by `drivers/drm` and by a
 recording test), which is also why the wake is host-testable for the first time.
+`blk` is the most recent: the `BlockDev` contract, the disk registry and the
+GPT/MBR decode were already host-tested inside `src/blk`, and extracting them
+removed the module's one upward-ish reference — `part.rs` sized its transfer
+buffer from `mm::PAGE_SIZE`, so the bound now lives with the trait that states
+it (`mpos_blk::PAGE_SIZE`), as a leaf that cannot name the kernel must.
 Anything still inside that component stays inside `mpos` until Phase 11 breaks
 the cycles; `fuzz/` may later depend on these crates directly instead of through
 `mpos`.
@@ -158,12 +164,12 @@ flowchart TB
     subgraph Services["Services (callable from anywhere)"]
         DRIVERS["drivers<br/>pci · virtio · drm · video · evdev/uinput · serial · rtc"]
         NET["net<br/>smoltcp · socket · unix · rtnl · vsock"]
-        BLK["blk<br/>BlockDev · GPT/MBR"]
+        BLK["blk — mpos-blk crate<br/>BlockDev · GPT/MBR"]
         PCI["pci — mpos-pci crate<br/>device model · Linux spellings"]
         RAND["rand<br/>ChaCha20"]
         UEVENT["uevent<br/>kobject events over netlink"]
         BOOTMOD["boot<br/>handoff record"]
-        BINFMT["logging · sync · uaccess · evdev · uinput<br/>(err/date/binfmt/cred/uts/seccomp/term/ahci/gpu/evdev/uinput are leaf crates — §1)"]
+        BINFMT["logging · sync · uaccess · evdev · uinput<br/>(err/date/binfmt/cred/uts/seccomp/term/ahci/gpu/evdev/uinput/blk are leaf crates — §1)"]
     end
 
     MAIN --> SYSCALL
@@ -214,12 +220,13 @@ differences — in particular `drivers → syscall`, `sched → vfs`/`net`/`driv
 `console → vfs` and the whole `vfs ↔ sched ↔ syscall ↔ net` cluster. Those are real edges
 today; §9 explains what they are.
 
-The seven leaf crates of §1 are deliberately *not* drawn into this graph's SCC: they are the
-parts already outside it. `err`, `date`, `binfmt`, `cred`, `uts`, `seccomp` and `pci` depend
-only downward (on `core`/`alloc`, and `critical-section` for `pci`/`uts`), so the "may call"
-arrows into them are all that exist and none point back. Splitting them out changed no edge
-in this picture — it made them un-buildable-in-reverse by the compiler. `drivers → pci`
-remains (the driver finds devices, the crate describes them); it is now a cross-crate edge.
+The leaf crates of §1 are deliberately *not* drawn into this graph's SCC: they are the
+parts already outside it. `err`, `date`, `binfmt`, `cred`, `uts`, `seccomp`, `pci` and `blk`
+depend only downward (on `core`/`alloc`, and `critical-section` for `pci`/`uts`/`blk`), so the
+"may call" arrows into them are all that exist and none point back. Splitting them out changed
+no edge in this picture — it made them un-buildable-in-reverse by the compiler. `drivers → pci`
+and `drivers`/`uevent`/`vfs → blk` remain (the driver finds devices, the crate describes them);
+they are cross-crate edges.
 
 ---
 
@@ -236,7 +243,7 @@ remains (the driver finds devices, the crate describes them); it is now a cross-
 | Drivers | `src/drivers/` | virtio (blk, net, gpu, input, console, rng, sound, 9p, vsock, MSI-X), DRM/KMS, the render task, evdev/uinput, PCI config space, the serial console, the RTC, the QEMU debug-exit port | Parse a device's ioctl ABI (that is `syscall/linux/fs/ioctl.rs` today — see V-2) |
 | Console | `src/console.rs` | Log ring, serial output, the switch to the framebuffer, the six virtual consoles | Reach into the VFS for the grid — it names the `term` *crate* now, never `vfs::term` (V-4 closed: the `vfs ↔ console` pair is broken) |
 | ABI | `src/syscall/` | Numbers (`nr.rs`), pure ABI facts and argument validation (`abi.rs`), the dispatch table, and the handlers (`fs/file.rs` + `fs/ioctl.rs`, `proc.rs`, `posix.rs`) | Grow past the point where one file is a device-ioctl switchboard (see V-2) |
-| Services | `crates/err`, `crates/pci`, `crates/date`, `crates/binfmt`, `crates/cred`, `crates/uts`, `crates/seccomp`, `crates/term`, `crates/ahci`, `crates/gpu`, `crates/evdev`, `crates/uinput` (leaf crates — §1); `src/blk/`, `src/rand.rs`, `src/uevent.rs`, `src/logging.rs`, `src/sync/`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. The twelve leaf crates depend only downward and cannot name the kernel — the split is the enforcement. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
+| Services | `crates/err`, `crates/pci`, `crates/date`, `crates/binfmt`, `crates/cred`, `crates/uts`, `crates/seccomp`, `crates/term`, `crates/ahci`, `crates/gpu`, `crates/evdev`, `crates/uinput`, `crates/blk` (leaf crates — §1); `src/rand.rs`, `src/uevent.rs`, `src/logging.rs`, `src/sync/`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. The thirteen leaf crates depend only downward and cannot name the kernel — the split is the enforcement. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
 
 ---
 
@@ -457,7 +464,7 @@ flowchart TB
         H2["sched (policy, signal, futex)"]
         H3["vfs (inode, mount, ramfs, ext4, procfs, sysfs, path, pipe, epoll, …)"]
         H4["syscall (nr, abi)"]
-        H5["pci, blk, binfmt, date, evdev, uinput, logging, rand<br/>+ err/cred/uts/seccomp/term/ahci/gpu/evdev/uinput as leaf crates (§1)"]
+        H5["pci, binfmt, date, evdev, uinput, logging, rand<br/>+ err/cred/uts/seccomp/term/ahci/gpu/evdev/uinput/blk as leaf crates (§1)"]
     end
 ```
 
@@ -527,7 +534,7 @@ Phase 11 D (**closed**; D.2b rejected) |
 **The dependency direction to aim for** (used as the acceptance criterion in Phase 11):
 
 ```
-drivers, net, blk, pci, rand, uevent   →  may use: arch, mm, sched, sync
+drivers, net, pci, rand, uevent        →  may use: arch, mm, sched, sync
         ↓
       vfs, sched                       →  may use: mm, arch, sync, blk, pci
         ↓
@@ -535,6 +542,10 @@ drivers, net, blk, pci, rand, uevent   →  may use: arch, mm, sched, sync
         ↓
        main                            →  may use everything
 ```
+
+The leaf crates (`err`, `date`, `binfmt`, `cred`, `uts`, `seccomp`, `pci`, `term`, `ahci`,
+`gpu`, `evdev`, `uinput`, `blk`) sit below all of these and may use nothing in the kernel —
+`blk` is named by `vfs`/`drivers`/`uevent` and names nothing back.
 
 with two hard rules: **nothing below `syscall` names `syscall`**, and **nothing outside
 `vfs` names `vfs`'s concrete device types**. Both are measured now rather than asserted:

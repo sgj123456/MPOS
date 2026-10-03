@@ -179,6 +179,8 @@ fn run_unit_tests() -> Result<()> {
         "-p",
         "mpos-seccomp",
         "-p",
+        "mpos-blk",
+        "-p",
         "mpos-pci",
         "-p",
         "mpos-term",

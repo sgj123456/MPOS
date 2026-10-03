@@ -34,6 +34,12 @@ mpos-cred = { path = "crates/cred" }
 mpos-uts = { path = "crates/uts" }
 mpos-seccomp = { path = "crates/seccomp" }
 mpos-pci = { path = "crates/pci" }
+# The block layer seam: the `BlockDev` trait a filesystem reads its storage
+# through, the registry that names every disk, and the GPT/MBR decode that finds
+# a filesystem on one. A pure leaf - the trait is a contract and the parser is
+# arithmetic, both host-tested - and the crate boundary is what keeps it from
+# naming the kernel it serves.
+mpos-blk = { path = "crates/blk" }
 # Two more leaves of the same kind, extracted after the seven above: the terminal
 # emulator (a cell grid is not a filesystem fact, PLAN.md §11.1.4) and the AHCI
 # port decode (arithmetic on three `u32`s whose only reader is machine-only).

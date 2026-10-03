@@ -1,0 +1,19 @@
+# The block layer seam: the `BlockDev` trait a filesystem reads its storage
+# through, the registry that names every disk the kernel has, and the GPT/MBR
+# decode that finds a filesystem on one. Its own leaf crate, because the whole
+# of it is a contract - the trait's method set, the fields a disk is named by,
+# and a partition-table parser - and a contract is worth a host test. It needs
+# `critical_section` for the disk registry's lock, gated exactly as the kernel
+# gates it: the stock std implementation on the host, the bare-metal one there.
+[package]
+name = "mpos-blk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }

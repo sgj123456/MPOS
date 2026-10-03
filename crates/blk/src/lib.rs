@@ -1,15 +1,25 @@
+#![no_std]
+
 //! The block layer seam.
 //!
-//! [`BlockDev`] is all a filesystem gets to know about its storage: read and
-//! write whole sectors at a byte offset. Everything above it - ext2 now, and
-//! whatever filesystems follow - is written against this trait and unit-tested
-//! on the host against an in-memory device; everything below it implements it
-//! over real hardware (virtio-pci on x86_64, virtio-mmio on aarch64 later).
+//! This is its own leaf crate: the whole of it is a *contract*, and a contract
+//! is worth a host test. [`BlockDev`] is all a filesystem gets to know about
+//! its storage - read and write whole sectors at a byte offset - and everything
+//! above it (ext2 now, and whatever filesystems follow) is written against the
+//! trait and unit-tested on the host against an in-memory device, while
+//! everything below it implements it over real hardware (virtio-pci on x86_64,
+//! virtio-mmio on aarch64 later). The crate also holds the two facts that sit
+//! at this seam rather than in any driver: the registry that names every disk
+//! the kernel has, and the GPT/MBR decode that finds a filesystem on one
+//! ([`part`]). As a leaf it cannot name the kernel, so the downward-only rule
+//! is a compile error rather than a convention.
 //!
 //! The contract is deliberately narrow. Calls are synchronous; sector
 //! boundaries are the caller's job; and a device error is a panic rather than
 //! a return value, because on this kernel a failing disk means the run is over
 //! - the milestone gate asserts on the panic message.
+
+extern crate alloc;
 
 pub mod part;
 
@@ -19,6 +29,17 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use critical_section::Mutex;
+
+/// The largest buffer [`BlockDev::read_at`]/[`BlockDev::write_at`] is handed in
+/// one call: the trait's contract says a driver bounces through a single
+/// page-sized, physically contiguous buffer, so this is the machine's 4 KiB
+/// page as the block layer's *own* transfer bound.
+///
+/// It is written here rather than read from `mm::PAGE_SIZE` because this crate
+/// is a leaf that cannot name the kernel - and because the bound belongs to the
+/// trait that states it, not to the frame allocator that happens to size the
+/// same hardware fact.
+pub const PAGE_SIZE: usize = 4096;
 
 /// One disk the kernel has, named the way userland will name it.
 ///

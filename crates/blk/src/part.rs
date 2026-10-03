@@ -16,7 +16,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::blk::BlockDev;
+use crate::BlockDev;
 
 /// Bytes a logical sector, which is the unit every offset here is counted in.
 const SECTOR: u64 = 512;
@@ -251,7 +251,7 @@ fn gpt_entries(dev: &dyn BlockDev) -> Vec<(u64, u64)> {
     }
 
     let mut out = Vec::new();
-    let mut page = [0u8; crate::mm::PAGE_SIZE];
+    let mut page = [0u8; crate::PAGE_SIZE];
     let mut done = 0u64;
     let total = count * stride as u64;
     while done < total {

@@ -99,7 +99,7 @@ not merely that it does not panic - a crash is the least informative outcome.
 `support.rs` 里是共用的 `MemDev`（一个包着 `Vec<u8>` 的 `BlockDev`，越界读返回零）
 和几个钳位：设备最大 1 MiB，屏幕最大 `MAX_ROWS` 行。一个被构造出来的**长度**会让
 笔记本 OOM，而那不是内核的问题，值得区分开。`support.rs` holds the shared
-[`BlockDev`](../src/blk/mod.rs) over a `Vec<u8>` - reads past the end answer
+[`BlockDev`](../crates/blk/src/lib.rs) over a `Vec<u8>` - reads past the end answer
 zeros, which is what a short read on a real disk does - and the clamps that keep
 a crafted *length* (which is the fuzzing host running out of RAM, not a kernel
 bug) apart from a crafted *value*.

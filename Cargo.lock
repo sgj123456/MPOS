@@ -283,6 +283,7 @@ dependencies = [
  "elf",
  "mpos-ahci",
  "mpos-binfmt",
+ "mpos-blk",
  "mpos-cred",
  "mpos-date",
  "mpos-err",
@@ -310,6 +311,13 @@ version = "0.1.0"
 [[package]]
 name = "mpos-binfmt"
 version = "0.1.0"
+
+[[package]]
+name = "mpos-blk"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+]
 
 [[package]]
 name = "mpos-boot"

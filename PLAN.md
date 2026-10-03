@@ -715,6 +715,15 @@ it - so the entries say which they are:
       remains is the two crates being *named* by `drivers` and `syscall`, which is a cross-crate
       edge downward. Twelve leaf crates now, all but the input pair host-compiled and every one of
       them unable to name the kernel
+- [x] **the block layer seam is the thirteenth**: `mpos-blk` — the `BlockDev` contract, the disk
+      registry and the GPT/MBR decode — moved out of `src/blk` into `crates/blk`, re-exported as
+      `pub use mpos_blk as blk;` so every `crate::blk::` caller is unchanged. It was already
+      host-compiled and host-tested (13 tests), and the module's one kernel reference — `part.rs`
+      sizing its transfer buffer from `mm::PAGE_SIZE` — is now `mpos_blk::PAGE_SIZE`, the bound
+      belonging to the trait that states it rather than the frame allocator that sizes the same
+      hardware fact. `blk` leaves the module graph as a source: `drivers`/`uevent`/`vfs` still
+      *name* it (a cross-crate edge downward), it names nothing back, and no mutual pair moved
+      (17/17)
 - [x] 11.B the device seam. **B3 landed long ago** (`buffer_ok`/`err_of` moved to the
       `uaccess` leaf). **B2 is complete**: every device family this audit named states its
       own ioctl contract next to the state it answers from - `'d'` (DRM), `'E'` (`EvdevNode::ioctl`),

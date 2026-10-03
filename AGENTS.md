@@ -24,7 +24,7 @@ be pinned — host unit test, a program booted in QEMU, or both.
 | Path | What lives there |
 |---|---|
 | `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs` (boot entry, milestone checks, panic handler) |
-| `crates/` | downward-only leaf crates (see §4): `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput` |
+| `crates/` | downward-only leaf crates (see §4): `err`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk` |
 | `boot/` | `mpos-boot`, the UEFI loader. Separate target (`x86_64-unknown-uefi`), no kernel dep — both agree on a hand-written handoff record |
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
 | `user/` | `mpos-user`: ordinary `std` programs for the image (`rustix`, static musl) |
@@ -163,7 +163,7 @@ etc.) so an upward edge from them is a **compile error**, not a convention — s
 | `console/` | log ring, serial, framebuffer switch, the six virtual consoles | `arch`, `boot` (the console list), the `term` crate | reach into the VFS for the grid: it names `crate::term` for the grid and for the active-console number, never `vfs::*` (V-4 pair closed) |
 | `net/` | smoltcp, socket registry, AF_INET/UNIX/NETLINK/VSOCK/PACKET | `drivers`, `sched`, `uevent` | validate user pointers outside the `uaccess` leaf (V-9, closed by B3) |
 | `drivers/` | virtio, DRM/KMS, render task, evdev/uinput, PCI config, serial, RTC | `mm`, `pci`, `sched` | call back into `syscall` (V-5) or parse ioctl ABI (V-2) |
-| leaves — `crates/*` + `blk`/`rand`/`uevent`/`logging`/`sync`/`uaccess` | one concern each, pure logic, host-compiled where possible; downward-only and cannot name the kernel. `err` is the errno table every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
+| leaves — `crates/*` + `rand`/`uevent`/`logging`/`sync`/`uaccess` | one concern each, pure logic, host-compiled where possible; downward-only and cannot name the kernel. `err` is the errno table every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
 
 Two rules make the table usable rather than decorative:
 
