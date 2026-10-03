@@ -455,6 +455,25 @@ pub fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
     }
 }
 
+/// Map a device's register window into the kernel half.
+///
+/// There is nothing to add on this machine: the whole 64 MiB window the tree
+/// describes is mapped at boot (stage 5b), and [`device_virt`] is the only door to
+/// it. So `map_mmio` confirms the window already covers `[phys, phys + len)` at
+/// the address the caller named and does nothing - which is correct for a machine
+/// whose devices are a firmware-described range - and panics on a window outside
+/// it. A PCIe aarch64 server that hands out BARs to map dynamically is a named
+/// gap in `PLAN.md` §9.1, not something to half-implement here.
+pub fn map_mmio(virt: usize, phys: usize, len: usize) {
+    if device_virt(phys, len) != Some(virt) {
+        panic!(
+            "aarch64 map_mmio: [{phys:#x}, {:#x}) is outside the fixed device window; \
+             this machine maps its MMIO statically and has no dynamic window yet",
+            phys + len
+        );
+    }
+}
+
 /// A hierarchy under construction, with its frames from the frame allocator.
 ///
 /// No arena and no pool: stage 1d had one because there was no allocator to draw
@@ -1270,6 +1289,81 @@ impl UserSpace {
     /// without the space having to be the active one.
     pub fn translate(&self, virt: usize) -> Option<(usize, MapFlags, Memory)> {
         walk_from(self.root, virt)
+    }
+}
+
+/// `crate::hal::AddressSpaceOps`, which stage 6b wrote the methods *for* - they
+/// take a [`Mapping`], answer the frames a range held, mark the marker in bit 55
+/// beside the read-only bit the CPU enforces. Now that the trait compiles on this
+/// machine the impl is delegation and nothing else: each method forwards to the
+/// inherent one of the same name, which Rust resolves to the inherent method (the
+/// trait method it sits in never shadows it), so this block is signatures over the
+/// code stage 6b already tested. `new` builds the root directly rather than
+/// forwarding, so the allocator's "cannot be recovered from" is written once.
+impl crate::hal::AddressSpaceOps for UserSpace {
+    fn new() -> Self {
+        let root = mm::alloc_frames(0)
+            .expect("out of frames for a user address space, which cannot be recovered from");
+        // SAFETY: a fresh frame the allocator handed over and nothing else holds,
+        // reached through the direct map; an empty entry must be an absent one.
+        unsafe { core::ptr::write_bytes(mm::phys_to_virt(root) as *mut u8, 0, PAGE_SIZE) };
+        UserSpace { root }
+    }
+
+    fn root(&self) -> usize {
+        self.root
+    }
+
+    fn map(&mut self, mapping: Mapping) {
+        self.map(mapping)
+    }
+
+    fn try_map(&mut self, mapping: Mapping) -> Result<(), PageTaken> {
+        self.try_map(mapping)
+    }
+
+    fn unmap(&mut self, virt: usize, len: usize) -> alloc::vec::Vec<usize> {
+        self.unmap(virt, len)
+    }
+
+    fn protect(&mut self, virt: usize, len: usize, flags: MapFlags) {
+        self.protect(virt, len, flags)
+    }
+
+    fn switch(&self) {
+        self.switch()
+    }
+
+    fn map_cow(&mut self, virt: usize, phys: usize, flags: MapFlags) {
+        self.map_cow(virt, phys, flags)
+    }
+
+    fn map_shared(&mut self, virt: usize, phys: usize, flags: MapFlags) {
+        self.map_shared(virt, phys, flags)
+    }
+
+    fn resolve_cow(&mut self, virt: usize) -> Option<(usize, usize)> {
+        self.resolve_cow(virt)
+    }
+
+    fn walk_user_pages(&self, f: impl FnMut(usize, usize, MapFlags)) {
+        self.walk_user_pages(f)
+    }
+
+    fn set_cow_bit(&self, virt: usize) {
+        self.set_cow_bit(virt)
+    }
+
+    fn set_cow_bit_quietly(&self, virt: usize) {
+        self.set_cow_bit_quietly(virt)
+    }
+
+    fn flush_if_active(&self) {
+        self.flush_if_active()
+    }
+
+    fn phys_for_virt(&self, virt: usize) -> Option<usize> {
+        self.phys_for_virt(virt)
     }
 }
 

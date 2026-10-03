@@ -108,6 +108,19 @@ impl FpuState {
             bytes: [0u8; FPU_BYTES],
         }
     }
+
+    /// The save area as the bytes a debugger reads: `q0..q31` then `FPCR`/`FPSR`,
+    /// the same layout [`mpos_context_switch`] writes. `FpuOps::to_bytes` delegates
+    /// here so the trait's bytes and the switch's are one shape, not two.
+    pub fn to_bytes(&self) -> [u8; FPU_BYTES] {
+        self.bytes
+    }
+
+    /// [`to_bytes`](Self::to_bytes)'s inverse: state the bytes describe, for a
+    /// restored `FPCR`/`FPSR`/`q`-register file.
+    pub fn from_bytes(bytes: &[u8; FPU_BYTES]) -> FpuState {
+        FpuState { bytes: *bytes }
+    }
 }
 
 impl Default for FpuState {
@@ -297,7 +310,7 @@ const _: () = {
 /// ones that *mask* - so "EL0t with nothing masked" is the whole register, and
 /// writing anything else would either trap at a level this kernel has no code
 /// for or leave the program running with the clock off.
-const PSTATE_EL0T: u64 = 0;
+pub const PSTATE_EL0T: u64 = 0;
 
 /// `SPSR_EL1` for a return to EL1 on `SP_EL1`: `EL1h`.
 ///
@@ -309,55 +322,12 @@ const PSTATE_EL1H: u64 = 0b0101;
 /// Where an EL0 program that asks to leave is resumed, and the kernel stack it
 /// is resumed on.
 ///
-/// Both are set by [`enter_user`] and read by the trap gate's `exit` arm. They
+/// Both are set by [`enter_frame`] and read by the trap gate's `exit` arm. They
 /// are statics rather than arguments because the two ends are reached through
 /// the CPU's exception machinery: the gate runs on the vector with a stack the
 /// caller never sees, so there is no calling convention to carry anything in.
 static ON_EXIT: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_SP: AtomicUsize = AtomicUsize::new(0);
-
-/// Enter EL0 at `entry` on `user_sp`, and come back to `on_exit` when the
-/// program asks to leave.
-///
-/// This never returns in the ordinary sense. The only way out is the trap gate's
-/// `exit` arm, which `eret`s to `on_exit` at EL1 with the exit status in `x0` -
-/// which is why `on_exit` must be `-> !`: there is no call frame for it to
-/// return into, only the stack this function was entered on, which
-/// [`leave_for_kernel`] restores before the `eret`.
-///
-/// # Safety
-///
-/// `entry` and `user_sp` must both be mapped in the space `TTBR0_EL1` currently
-/// names, and that space must already be the active one - this function switches
-/// nothing.
-pub unsafe fn enter_user(entry: usize, user_sp: usize, on_exit: extern "C" fn(u64) -> !) -> ! {
-    // Read rather than assumed: if this function ever grows a frame, the value
-    // recorded here is the lower one and the kernel is resumed *below* its
-    // caller's frame instead of on top of it - which is wasted stack rather than
-    // a corrupted one, and is the direction the mistake has to fall in.
-    let sp: usize;
-    // SAFETY: reading `sp` has no side effects.
-    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack)) };
-    KERNEL_SP.store(sp, Ordering::Relaxed);
-    ON_EXIT.store(on_exit as usize, Ordering::Relaxed);
-
-    // SAFETY: the caller's contract on the two addresses. The sequence is the
-    // architecture's entry to a lower exception level, and the only subtle part
-    // is `SPSR_EL1` - see `PSTATE_EL0T`.
-    unsafe {
-        core::arch::asm!(
-            "msr sp_el0, {sp}",
-            "msr elr_el1, {entry}",
-            "msr spsr_el1, {spsr}",
-            "isb",
-            "eret",
-            sp = in(reg) user_sp,
-            entry = in(reg) entry,
-            spsr = in(reg) PSTATE_EL0T,
-            options(noreturn),
-        );
-    }
-}
 
 /// Leave the user program for the kernel: never returns, and never returns to
 /// EL0 either.
@@ -409,7 +379,97 @@ pub unsafe fn leave_for_kernel(code: u64) -> ! {
 unsafe extern "C" {
     fn mpos_context_switch(from: *mut Context, to: *const Context);
     fn mpos_task_trampoline();
+    fn mpos_enter_frame(frame: *const UserFrame) -> !;
 }
+
+global_asm!(
+    // Restore the whole register file from a `UserFrame` and `eret` to EL0. The
+    // offsets are the same ones `__vec_el1_sync`'s sibling saves to (the compile-
+    // time asserts in `UserFrame`'s definition fix them), so this is the exact
+    // inverse of the trap's save: a frame the vector wrote is a frame this reads
+    // back, and a drift between the two would show up here, not as a corrupt
+    // register on some later resume.
+    ".globl mpos_enter_frame",
+    ".p2align 4",
+    "mpos_enter_frame:",
+    // `x1` holds the frame pointer throughout; `x0` is scratch for the three
+    // system-register loads and then takes its own restored value last.
+    "    mov x1, x0",
+    "    ldr x0, [x1, #248]",
+    "    msr sp_el0, x0",
+    "    ldr x0, [x1, #256]",
+    "    msr elr_el1, x0",
+    "    ldr x0, [x1, #264]",
+    "    msr spsr_el1, x0",
+    // `x2..x29` in pairs (offset `8*i`), then `x30` alone, then `x0` and `x1`
+    // last so the base register stays live until nothing more reads it.
+    "    ldp x2, x3,  [x1, #16]",
+    "    ldp x4, x5,  [x1, #32]",
+    "    ldp x6, x7,  [x1, #48]",
+    "    ldp x8, x9,  [x1, #64]",
+    "    ldp x10, x11, [x1, #80]",
+    "    ldp x12, x13, [x1, #96]",
+    "    ldp x14, x15, [x1, #112]",
+    "    ldp x16, x17, [x1, #128]",
+    "    ldp x18, x19, [x1, #144]",
+    "    ldp x20, x21, [x1, #160]",
+    "    ldp x22, x23, [x1, #176]",
+    "    ldp x24, x25, [x1, #192]",
+    "    ldp x26, x27, [x1, #208]",
+    "    ldp x28, x29, [x1, #224]",
+    "    ldr x30, [x1, #240]",
+    "    ldr x0,  [x1, #0]",
+    "    ldr x1,  [x1, #8]",
+    "    isb",
+    "    eret",
+);
+
+/// Resume `frame` at EL0 and come back to `on_exit` when the program asks to
+/// leave - the frame-precise twin of [`enter_user`], which starts from an entry
+/// and a stack instead of a saved register file.
+///
+/// `enter_user` and `hal::Contexts::resume_user`/`enter_user` are all this one
+/// operation: write the trap gate's two statics, then hand the CPU to a register
+/// file. It never returns in the ordinary sense; the only way out is the trap
+/// gate's `exit` arm `eret`-ing to `on_exit` at EL1, exactly as [`enter_user`].
+///
+/// # Safety
+///
+/// `frame`'s `pc`/`sp` must be mapped in the space `TTBR0_EL1` currently names,
+/// that space must already be active, and `SPSel` must select `SP_EL1` so the
+/// next trap from EL0 lands on a real kernel stack (the boot sets this once).
+pub unsafe fn enter_frame(frame: &UserFrame, on_exit: extern "C" fn(u64) -> !) -> ! {
+    let sp: usize;
+    // SAFETY: reading `sp` has no side effects.
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack)) };
+    KERNEL_SP.store(sp, Ordering::Relaxed);
+    ON_EXIT.store(on_exit as usize, Ordering::Relaxed);
+    // SAFETY: the caller's contract on the frame, passed to the restore verbatim.
+    unsafe { mpos_enter_frame(frame) }
+}
+
+/// Point the privilege-transition stack at `top`, so the next trap from EL0 lands
+/// on this task's kernel stack - the aarch64 form of x86_64's TSS `sp0`.
+///
+/// On this machine that is `SP_EL1`, written directly; `SPSel` is left as the boot
+/// set it (on `SP_EL1`), so the write does not disturb the stack this code is
+/// running on. Each task gets its own here before the scheduler enters it at EL0;
+/// a trap while `SPSel` selects `SP_EL1` uses this value as the new `sp`.
+///
+/// # Safety
+///
+/// `top` must be the top of a stack the caller owns and that the trap could grow
+/// into. Setting it to a stack another task is using corrupts that task on its
+/// next trap - which is why it is the scheduler's per-task step, not a general one.
+pub unsafe fn set_kernel_stack(top: usize) {
+    // SAFETY: `SPSel` = 1 makes the kernel run on `SP_EL1`, so writing `SP_EL1`
+    // chooses where the *next* trap lands without moving the current `sp`.
+    unsafe {
+        core::arch::asm!("msr sp_el1, {}", in(reg) top, options(nomem, nostack));
+    }
+}
+
+
 
 global_asm!(
     // x0: the context being suspended (written). x1: the one being resumed.
@@ -563,6 +623,131 @@ unsafe extern "C" {
 /// already be running.
 unsafe fn round_trip(from: *mut Context, to: *const Context, pattern: u64) -> u64 {
     unsafe { mpos_context_round_trip(from, to, pattern) }
+}
+
+/// The on-exit target for a bare `resume`: there is no task table or scheduler to
+/// return an exiting EL0 program to until stage 3, so leaving means the machine
+/// stops. A real resume hands the frame's task back to the scheduler, which is the
+/// named stage-3 half of this path rather than something to fake here.
+extern "C" fn resume_halt(_code: u64) -> ! {
+    super::halt()
+}
+
+/// The floating-point half a switch moves, and where to find it. [`Context`]'s
+/// `fpu` field is exactly [`crate::hal::ContextOps`]'s `Fpu`, so `fpu`/`fpu_mut`
+/// are field access and `empty` is the boot context.
+impl crate::hal::ContextOps for Context {
+    type Fpu = FpuState;
+
+    fn empty() -> Self {
+        Context::empty()
+    }
+
+    fn fpu(&self) -> &Self::Fpu {
+        &self.fpu
+    }
+
+    fn fpu_mut(&mut self) -> &mut Self::Fpu {
+        &mut self.fpu
+    }
+}
+
+/// The FPU save area as the bytes a debugger reads. This machine has no lazy FPU
+/// (`Contexts`' trap protocol is x86-only), but every machine with floating point
+/// has state to reset and a byte view to move, and that is what [`FpuOps`] asks.
+impl crate::hal::FpuOps for FpuState {
+    fn reset() -> Self {
+        FpuState::reset()
+    }
+
+    fn to_bytes(&self) -> [u8; crate::hal::FPU_BYTES] {
+        self.bytes
+    }
+
+    fn from_bytes(bytes: &[u8; crate::hal::FPU_BYTES]) -> Self {
+        FpuState { bytes: *bytes }
+    }
+}
+
+/// The ring-3 register state. Every method here is the field the name says, and
+/// `resume` is [`enter_frame`] under the trap gate's halt exit. The ABI marshaling
+/// (`to_user_regs`/`from_user_regs`) writes Linux's aarch64 `user_pt_regs` order -
+/// `x0..x30`, `sp`, `pc`, `pstate` - and its field order is pinned by stage 6's
+/// `ptrace`, the first caller that can check it against the ABI; there is no slot
+/// for `tls` in that struct (the thread pointer is `TPIDR_EL0`, read separately),
+/// so it is named and dropped rather than invented.
+impl crate::hal::UserFrameOps for UserFrame {
+    fn forked(&self, child_stack: usize) -> Self {
+        let mut child = *self;
+        if child_stack != 0 {
+            child.sp = child_stack as u64;
+        }
+        child
+    }
+
+    fn set_result(&mut self, value: isize) {
+        self.x[0] = value as u64;
+    }
+
+    fn ip(&self) -> usize {
+        self.pc as usize
+    }
+
+    fn set_ip(&mut self, ip: usize) {
+        self.pc = ip as u64;
+    }
+
+    fn sp(&self) -> usize {
+        self.sp as usize
+    }
+
+    fn set_sp(&mut self, sp: usize) {
+        self.sp = sp as u64;
+    }
+
+    fn to_user_regs(&self, tls: usize, out: &mut [u64]) {
+        let _ = tls;
+        let n = out.len().min(31);
+        out[..n].copy_from_slice(&self.x[..n]);
+        if out.len() > 31 {
+            out[31] = self.sp;
+        }
+        if out.len() > 32 {
+            out[32] = self.pc;
+        }
+        if out.len() > 33 {
+            out[33] = self.pstate;
+        }
+    }
+
+    fn from_user_regs(regs: &[u64]) -> Self {
+        let mut frame = UserFrame {
+            x: [0; 31],
+            sp: 0,
+            pc: 0,
+            pstate: 0,
+        };
+        let n = regs.len().min(31);
+        frame.x[..n].copy_from_slice(&regs[..n]);
+        if regs.len() > 31 {
+            frame.sp = regs[31];
+        }
+        if regs.len() > 32 {
+            frame.pc = regs[32];
+        }
+        if regs.len() > 33 {
+            frame.pstate = regs[33];
+        }
+        frame
+    }
+
+    unsafe fn resume(&self) -> ! {
+        // SAFETY: the caller (the scheduler) built this frame from a task's own
+        // record; `enter_frame`'s contract is that `pc`/`sp` are mapped in the
+        // active space and `SPSel` selects the kernel stack - both stage 6a's boot
+        // established and the scheduler maintains from stage 3.
+        unsafe { enter_frame(self, resume_halt) }
+    }
 }
 
 global_asm!(

@@ -1044,10 +1044,21 @@ fn check_el0() {
         space.root(),
     );
 
-    // SAFETY: all three addresses are mapped in the space that was just made
-    // active, and the stack pointer is its page's top - one past the end, which
-    // is where a stack pointer belongs.
-    unsafe { context::enter_user(PROGRAM_VA, STACK_VA + PAGE_SIZE, el0_returned) }
+    // Enter through `enter_frame` - the same full register-file restore the
+    // `hal::Contexts::enter_user`/`resume_user` path uses - rather than the minimal
+    // direct `enter_user`, so this check exercises the production `eret` sequence
+    // (load `x0..x30`/`sp`/`pc`/`pstate` from a `UserFrame`) as well as the answer
+    // round trip. The registers start zero because the program sets its own; the
+    // verdict below is what proves the restore put the CPU into the program.
+    let frame = context::UserFrame {
+        x: [0; 31],
+        sp: (STACK_VA + PAGE_SIZE) as u64,
+        pc: PROGRAM_VA as u64,
+        pstate: context::PSTATE_EL0T,
+    };
+    // SAFETY: `frame`'s `pc`/`sp` are mapped in the space just made active, the
+    // stack pointer is its page's top, and `SPSel` is on the kernel stack.
+    unsafe { context::enter_frame(&frame, el0_returned) }
 }
 
 /// Where the EL0 program's `exit_group` lands: the kernel, on the stack
@@ -2097,3 +2108,244 @@ pub fn halt() -> ! {
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
     }
 }
+
+// ---------------------------------------------------------------------------
+// `crate::hal`: this machine implements the six capability concerns for
+// `crate::hal::Current`. Everything here is a one-line static dispatch onto the
+// module that actually holds the body - `timer`/`pl031`/`vectors`/`gic`/`paging`/
+// `context` - so `crate::hal::ticks()` is exactly the `timer::ticks()` a caller
+// above the seam wants, monomorphised, with no architecture named above `arch`
+// (`AGENTS.md` §4, `PLAN.md` §9.1). x86_64's `mod.rs` is the shape template; the
+// three optional capabilities it has (`Msi`, `FpuTrap`, `Segments`) are absent
+// here because this machine has no MSI controller, no lazy-FPU trap, and no
+// segment selectors - so they are *not implemented*, which is the whole point of
+// splitting them out.
+// ---------------------------------------------------------------------------
+
+/// The line a caller masks/unmasks by name, as this machine's GIC INTID. The
+/// timer is the non-secure EL1 physical PPI (30) and the serial is the PL011's
+/// SPI (33); a driver never says which distributor bit.
+fn gic_line(line: crate::hal::Line) -> u32 {
+    match line {
+        crate::hal::Line::Timer => gic::TIMER_INTID,
+        crate::hal::Line::Serial => gic::SERIAL_INTID,
+    }
+}
+
+impl crate::hal::Clock for crate::hal::Current {
+    const TICK_HZ: u32 = timer::TICK_HZ;
+
+    #[inline]
+    fn ticks() -> u64 {
+        timer::ticks()
+    }
+
+    #[inline]
+    fn since_boot_nanos() -> u64 {
+        timer::since_boot_nanos()
+    }
+
+    #[inline]
+    fn busy_wait_ms(ms: u64) {
+        timer::busy_wait_ms(ms)
+    }
+}
+
+impl crate::hal::WallClock for crate::hal::Current {
+    #[inline]
+    fn boot_epoch() -> u64 {
+        pl031::boot_epoch()
+    }
+
+    #[inline]
+    fn set_boot_epoch(epoch: u64) {
+        pl031::set_boot_epoch(epoch)
+    }
+
+    #[inline]
+    fn write_epoch(epoch: u64) -> bool {
+        pl031::write_epoch(epoch)
+    }
+}
+
+impl crate::hal::Cpu for crate::hal::Current {
+    #[inline]
+    fn interrupts_enabled() -> bool {
+        interrupts_enabled()
+    }
+
+    #[inline]
+    fn enable_interrupts() {
+        enable_interrupts()
+    }
+
+    #[inline]
+    fn halt() -> ! {
+        halt()
+    }
+
+    #[inline]
+    fn idle() {
+        vectors::idle()
+    }
+
+    #[inline]
+    fn enable_user_simd() {
+        vectors::enable_user_simd()
+    }
+
+    #[inline]
+    fn init_interrupts() {
+        init_interrupts()
+    }
+}
+
+impl crate::hal::Interrupts for crate::hal::Current {
+    #[inline]
+    fn unmask(line: crate::hal::Line) {
+        gic::enable(gic_line(line))
+    }
+
+    #[inline]
+    fn mask(line: crate::hal::Line) {
+        gic::disable(gic_line(line))
+    }
+
+    #[inline]
+    fn eoi(line: crate::hal::Line) {
+        gic::end_of_interrupt(gic_line(line))
+    }
+}
+
+impl crate::hal::Paging for crate::hal::Current {
+    type Space = paging::UserSpace;
+
+    unsafe fn install(
+        info: &crate::boot::BootInfo,
+        sections: &crate::mm::vm::KernelSections,
+    ) -> usize {
+        // SAFETY: the caller's contract, passed through unchanged.
+        unsafe { paging::install(info, sections) };
+        // SAFETY: the machine is now running on the tables `install` just built,
+        // so reading the base registers reports the kernel's own root.
+        unsafe { paging::adopt() };
+        paging::kernel_root()
+    }
+
+    #[inline]
+    fn map_mmio(virt: usize, phys: usize, len: usize) {
+        paging::map_mmio(virt, phys, len)
+    }
+
+    #[inline]
+    fn translate(virt: usize) -> Option<(usize, crate::mm::MapFlags)> {
+        // The hardware walk also says whether the page is cached as memory or
+        // device; the trait's question is the frame and the permissions, so the
+        // third element is dropped here and kept only in `paging::translate`.
+        paging::translate(virt).map(|(phys, flags, _)| (phys, flags))
+    }
+
+    #[inline]
+    fn user_accessible(start: usize, len: usize, write: bool) -> bool {
+        paging::user_accessible(start, len, write)
+    }
+
+    #[inline]
+    fn is_cow_page(virt: usize) -> bool {
+        paging::is_cow_page(virt)
+    }
+
+    #[inline]
+    fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
+        paging::write_user_u32(root, at, value)
+    }
+
+    #[inline]
+    fn active_root() -> usize {
+        paging::active_root()
+    }
+
+    #[inline]
+    fn kernel_root() -> usize {
+        paging::kernel_root()
+    }
+
+    #[inline]
+    fn switch_to_root(root: usize) {
+        // SAFETY: the scheduler installs a space only after mapping it, which is
+        // `paging::switch_to_root`'s contract of a complete low half.
+        unsafe { paging::switch_to_root(root) };
+    }
+
+    #[inline]
+    fn switch_to_kernel() {
+        paging::switch_to_kernel()
+    }
+
+    #[inline]
+    fn phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+        paging::phys_for_virt_of(root, virt)
+    }
+
+    #[inline]
+    fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
+        paging::user_phys_for_virt_of(root, virt)
+    }
+}
+
+impl crate::hal::Contexts for crate::hal::Current {
+    type Context = context::Context;
+    type Fpu = context::FpuState;
+    type UserFrame = context::UserFrame;
+
+    const FPU_BYTES: usize = context::FPU_BYTES;
+
+    #[inline]
+    fn set_kernel_stack(top: usize) {
+        // SAFETY: the scheduler points a task's own kernel stack here, which is
+        // the value `context::set_kernel_stack`'s contract asks for.
+        unsafe { context::set_kernel_stack(top) };
+    }
+
+    #[inline]
+    unsafe fn bootstrap(
+        stack_top: usize,
+        entry: extern "C" fn(usize) -> !,
+        slot: usize,
+        interruptible: bool,
+    ) -> Self::Context {
+        // SAFETY: the caller's contract, passed through unchanged.
+        unsafe { context::bootstrap(stack_top, entry, slot, interruptible) }
+    }
+
+    #[inline]
+    unsafe fn switch(from: *mut Self::Context, to: *const Self::Context) {
+        // SAFETY: as above.
+        unsafe { context::switch(from, to) }
+    }
+
+    #[inline]
+    unsafe fn resume_user(frame: *const Self::UserFrame) -> ! {
+        // SAFETY: the scheduler built this frame from a task's own record; the
+        // register-file entry it calls documents the rest.
+        unsafe { <context::UserFrame as crate::hal::UserFrameOps>::resume(&*frame) }
+    }
+
+    #[inline]
+    unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
+        // A fresh task's first frame: `entry` at `pc`, `user_rsp` as `SP_EL0`,
+        // `pstate` 0 = EL0t with nothing masked, every register zero. It is then
+        // handed to the same register-file entry a resume uses.
+        let frame = context::UserFrame {
+            x: [0; 31],
+            sp: user_rsp as u64,
+            pc: entry as u64,
+            pstate: context::PSTATE_EL0T,
+        };
+        // SAFETY: the caller's `entry`/`user_rsp` are a mapped address and a
+        // usable stack in the active space, which is what `resume` requires.
+        unsafe { <context::UserFrame as crate::hal::UserFrameOps>::resume(&frame) }
+    }
+}
+
+impl crate::hal::Platform for crate::hal::Current {}

@@ -124,10 +124,14 @@ pub use mpos_err as err;
 /// walked, and 6b that space's *operations* - `unmap`, `protect`,
 /// `walk_user_pages`, the copy-on-write half and the `Drop` built out of them,
 /// written to `AddressSpaceOps`' shapes so that the impl is delegation when
-/// `hal` reaches this machine. What is left after that is the `Paging` methods
-/// that need a running process, plus `WallClock`. This gate goes when the last of
-/// them does.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// `hal` reaches this machine. Both machines now compile it: x86_64 implements the
+/// six baseline concerns plus the three optional capabilities its hardware has
+/// (`Msi`/`FpuTrap`/`Segments`), and aarch64 - which has no MSI controller, no lazy
+/// FPU trap and no segment selectors - implements only the six, which is what the
+/// split into optional capability traits exists to allow. The aarch64 impls landed
+/// with the stages that built their bodies: the `Paging` running-process methods and
+/// the PL031 `WallClock` (`PLAN.md` §9.1).
+#[cfg(target_os = "none")]
 pub mod hal;
 /// evdev's record window and its clients: which reader sees which event, and
 /// what a grab does to the answer. Its own leaf crate - the driver that fills
