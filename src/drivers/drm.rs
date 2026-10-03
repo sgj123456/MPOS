@@ -3228,6 +3228,19 @@ fn cursor_fb_ok(st: &DrmState, fb_id: u32) -> bool {
     })
 }
 
+/// The pixel size of the buffer on the cursor plane, `(0, 0)` when there is
+/// none. This is what the plane's `SRC_*` and `CRTC_W`/`CRTC_H` are, and what a
+/// commit naming them is checked against: the cursor is drawn whole, so the
+/// image's own size *is* its rectangle.
+fn cursor_image_dims(st: &DrmState, fb_id: u32) -> (u32, u32) {
+    st.fbs
+        .iter()
+        .filter_map(|f| f.as_ref())
+        .find(|f| f.id == fb_id)
+        .map(|f| (f.width, f.height))
+        .unwrap_or((0, 0))
+}
+
 fn fb_fits(st: &DrmState, fb_id: u32) -> bool {
     let (screen_w, screen_h) = programmed_mode_dims();
     fb_fits_at(st, fb_id, screen_w, screen_h)
@@ -3817,6 +3830,16 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
         (CURSOR_PLANE_ID, PROP_PLANE_CRTC_ID) => st.cursor_crtc = value as u32,
         (CURSOR_PLANE_ID, PROP_CRTC_X) => st.cursor_pos.0 = value as i32,
         (CURSOR_PLANE_ID, PROP_CRTC_Y) => st.cursor_pos.1 = value as i32,
+        // The cursor's rectangle, accepted rather than recorded: the only one
+        // this card honours is the image's own, so by the time a write reaches
+        // here the commit has already established that this is it
+        // ([`Commit::cursor_rect_ok`]) and there is no separate state to keep.
+        (CURSOR_PLANE_ID, PROP_SRC_X)
+        | (CURSOR_PLANE_ID, PROP_SRC_Y)
+        | (CURSOR_PLANE_ID, PROP_SRC_W)
+        | (CURSOR_PLANE_ID, PROP_SRC_H)
+        | (CURSOR_PLANE_ID, PROP_CRTC_W)
+        | (CURSOR_PLANE_ID, PROP_CRTC_H) => {}
         // Pre-multiplied or coverage alpha: the scanout carries the
         // compositor's finished frame, so the answer is recorded nowhere -
         // there is nothing below it to blend against.
@@ -4069,6 +4092,11 @@ fn mode_atomic(arg: usize) -> isize {
         {
             return (libc_einval(), None);
         }
+        // The cursor's rectangle, which has to be the identity for the image
+        // the commit is binding - see `Commit::cursor_rect_ok`.
+        if !plan.cursor_rect_ok(&st) {
+            return (libc_einval(), None);
+        }
         // A rehearsal is answered by the checks above and drives no resize.
         if flags & ATOMIC_TEST_ONLY != 0 {
             return (0, None);
@@ -4199,6 +4227,14 @@ struct Commit {
     order: Vec<(u32, u32, u64)>,
     mode_blob: Option<u32>,
     plane_fb: Option<u32>,
+    /// The framebuffer the commit binds to the cursor plane, and the rectangle
+    /// it puts it in. `None` for the framebuffer means the commit did not name
+    /// one, so the plane keeps whatever it had; the rectangles are the identity
+    /// unless the commit says otherwise, which is the state a cursor plane is
+    /// in when it is carrying a whole image.
+    cursor_fb: Option<u32>,
+    cursor_src: Option<(u32, u32, u32, u32)>,
+    cursor_dst: Option<(u32, u32)>,
     /// `IN_FENCE_FD`'s value: the descriptor the commit was handed, or -1 for
     /// the property's own spelling of "no fence". Kept as a number here and
     /// resolved to a fence before any lock is taken, because a descriptor number
@@ -4242,7 +4278,8 @@ impl Commit {
                 | (CURSOR_PLANE_ID, PROP_PLANE_CRTC_ID)
                 | (CURSOR_PLANE_ID, PROP_CRTC_X)
                 | (CURSOR_PLANE_ID, PROP_CRTC_Y)
-        ) || (obj == PLANE_ID && (PROP_SRC_X..=PROP_CRTC_H).contains(&prop));
+        ) || (obj == PLANE_ID && (PROP_SRC_X..=PROP_CRTC_H).contains(&prop))
+            || (obj == CURSOR_PLANE_ID && (PROP_SRC_X..=PROP_CRTC_H).contains(&prop));
         if !known {
             return Err(libc_einval());
         }
@@ -4251,6 +4288,35 @@ impl Commit {
         }
         if obj == PLANE_ID && prop == PROP_PLANE_FB_ID {
             self.plane_fb = Some(value as u32);
+        }
+        if obj == CURSOR_PLANE_ID {
+            match prop {
+                PROP_PLANE_FB_ID => self.cursor_fb = Some(value as u32),
+                // The source rectangle in 16.16 fixed point, the destination in
+                // pixels. Kept so the validation pass can refuse a crop or a
+                // scale this card cannot do rather than accept a state it would
+                // then draw differently - see [`Commit::cursor_rect_ok`].
+                PROP_SRC_X | PROP_SRC_Y | PROP_SRC_W | PROP_SRC_H => {
+                    let mut r = self.cursor_src.unwrap_or((0, 0, 0, 0));
+                    match prop {
+                        PROP_SRC_X => r.0 = value as u32 >> 16,
+                        PROP_SRC_Y => r.1 = value as u32 >> 16,
+                        PROP_SRC_W => r.2 = value as u32 >> 16,
+                        _ => r.3 = value as u32 >> 16,
+                    }
+                    self.cursor_src = Some(r);
+                }
+                PROP_CRTC_W | PROP_CRTC_H => {
+                    let mut d = self.cursor_dst.unwrap_or((0, 0));
+                    if prop == PROP_CRTC_W {
+                        d.0 = value as u32;
+                    } else {
+                        d.1 = value as u32;
+                    }
+                    self.cursor_dst = Some(d);
+                }
+                _ => {}
+            }
         }
         if obj == PLANE_ID && prop == PROP_IN_FENCE_FD {
             // Sign-extended by the caller because the property is a signed
@@ -4271,6 +4337,35 @@ impl Commit {
         }
         self.order.push((obj, prop, value));
         Ok(())
+    }
+
+    /// Whether the rectangle this commit asks for is one this card can honour:
+    /// the image drawn whole, at its own size, with no crop and no scale.
+    ///
+    /// This is the property being true rather than merely published. The cursor
+    /// plane offers `SRC_*` and `CRTC_W`/`CRTC_H` because weston will not name a
+    /// state for a plane without them; what it does *with* them is this
+    /// question. An identity rectangle (or no rectangle at all, which is the
+    /// same thing) is the state the composition in `paint_cursor` draws, so it
+    /// is accepted; anything else would be drawn differently from what the
+    /// commit said, and is `EINVAL` - the answer a real card gives a cursor
+    /// plane that cannot scale or crop.
+    fn cursor_rect_ok(&self, st: &DrmState) -> bool {
+        let fb = self.cursor_fb.unwrap_or(st.cursor_fb);
+        if fb == 0 {
+            // Nothing to show: the rectangles are not read by anything, so a
+            // commit that only parks the pointer is free to name them.
+            return true;
+        }
+        let (w, h) = cursor_image_dims(st, fb);
+        if w == 0 {
+            return false;
+        }
+        // A rectangle the commit did not name is the identity - the image whole
+        // at its own size - which is what `paint_cursor` draws, so a commit that
+        // only says "this buffer, here" is the same state said in fewer words.
+        self.cursor_src.unwrap_or((0, 0, w, h)) == (0, 0, w, h)
+            && self.cursor_dst.unwrap_or((w, h)) == (w, h)
     }
 
     /// The writes to apply, in the caller's order.
@@ -4617,59 +4712,75 @@ fn obj_get_properties(arg: usize) -> isize {
                     15usize,
                 ))
             }
-            // The cursor plane's properties, and the list is deliberately short:
-            // `type` so a compositor can find it, `FB_ID`/`CRTC_ID` so it can be
-            // bound and unbound, `CRTC_X`/`CRTC_Y` for where the pointer is, and
-            // its own `IN_FORMATS`.
+            // The cursor plane's properties: `type` so a compositor can find it,
+            // `FB_ID`/`CRTC_ID` so it can be bound and unbound, the rectangles,
+            // `CRTC_X`/`CRTC_Y` for where the pointer is, and its own
+            // `IN_FORMATS`.
             //
-            // No `SRC_*`/`CRTC_W`/`CRTC_H`, because this card's cursor has no
-            // scaler and no crop: the image is drawn whole, at its own size, with
-            // its hotspot on the pointer. A property that is published and then
-            // not honoured is the silent success `AGENTS.md` §4 forbids, so the
-            // plane offers exactly what it does - narrower than a real card, which
-            // is why `PLAN.md` §7.4 carries it as a named gap rather than as a
-            // finished list. No `pixel blend mode` either, which is the measurement
-            // rather than a choice: a real card's cursor planes carry it nowhere,
-            // because a cursor is always premultiplied.
-            (OBJECT_PLANE, CURSOR_PLANE_ID) => Some((
-                [
-                    PROP_TYPE,
-                    PROP_PLANE_FB_ID,
-                    PROP_PLANE_CRTC_ID,
-                    PROP_CRTC_X,
-                    PROP_CRTC_Y,
-                    PROP_IN_FORMATS,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-                [
-                    PLANE_TYPE_CURSOR,
-                    st.cursor_fb as u64,
-                    st.cursor_crtc as u64,
-                    st.cursor_pos.0 as i64 as u64,
-                    st.cursor_pos.1 as i64 as u64,
-                    DRIVER_BLOB_CURSOR_IN_FORMATS as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-                6usize,
-            )),
+            // The four rectangles are here, and they are the whole reason a
+            // cursor appears at all. weston's atomic state is one
+            // `drm_plane_state` for *every* plane, and
+            // `drm_plane_state_add_props` adds `SRC_X`/`SRC_Y`/`SRC_W`/`SRC_H`
+            // and `CRTC_W`/`CRTC_H` without first asking whether the plane has
+            // them: a handle of 0 reaches the card as property 0, is refused,
+            // and takes the whole commit down with it. That is what "couldn't
+            // set plane state" and "atomic: couldn't compile atomic state" were,
+            // and why the pointer moved and clicked correctly and was never
+            // seen - weston could not name a state for the plane, so the plane
+            // stayed empty.
+            //
+            // This card's cursor has no scaler and no crop - the image is drawn
+            // whole, at its own size, with its hotspot on the pointer - so the
+            // rectangles are honoured by *being* the image rather than by
+            // transforming it: `SRC_*` and `CRTC_W`/`CRTC_H` must be the
+            // identity for the buffer the commit binds, and a commit asking for
+            // anything else is refused rather than quietly ignored (see
+            // [`Commit::record`]). `CRTC_X`/`CRTC_Y` is the pointer and is acted
+            // on. No `pixel blend mode`, which is the measurement rather than a
+            // choice: a real card's cursor planes carry it nowhere, because a
+            // cursor is always premultiplied.
+            (OBJECT_PLANE, CURSOR_PLANE_ID) => {
+                let (iw, ih) = cursor_image_dims(&st, st.cursor_fb);
+                Some((
+                    [
+                        PROP_TYPE,
+                        PROP_PLANE_FB_ID,
+                        PROP_PLANE_CRTC_ID,
+                        PROP_CRTC_X,
+                        PROP_CRTC_Y,
+                        PROP_CRTC_W,
+                        PROP_CRTC_H,
+                        PROP_SRC_X,
+                        PROP_SRC_Y,
+                        PROP_SRC_W,
+                        PROP_SRC_H,
+                        PROP_IN_FORMATS,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    [
+                        PLANE_TYPE_CURSOR,
+                        st.cursor_fb as u64,
+                        st.cursor_crtc as u64,
+                        st.cursor_pos.0 as i64 as u64,
+                        st.cursor_pos.1 as i64 as u64,
+                        iw as u64,
+                        ih as u64,
+                        0,
+                        0,
+                        iw as u64,
+                        ih as u64,
+                        DRIVER_BLOB_CURSOR_IN_FORMATS as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    11usize,
+                ))
+            }
             _ => None,
         }
     }) else {

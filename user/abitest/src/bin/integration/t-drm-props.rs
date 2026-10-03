@@ -463,6 +463,48 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         ),
     }
 
+    // --- the cursor plane's rectangle --------------------------------------------------
+    // A compositor builds one atomic state per plane and adds `SRC_X`/`SRC_Y`/
+    // `SRC_W`/`SRC_H` and `CRTC_W`/`CRTC_H` to *every* one of them, whether or
+    // not the plane has them: a handle of 0 reaches the card as property 0 and
+    // takes the whole commit with it. So a cursor plane without them is a plane
+    // no compositor can put a cursor on, which is a pointer that moves and
+    // clicks and is never seen.
+    //
+    // The values are the identity for whatever image is bound: this card's
+    // cursor has no scaler and no crop, so the image is drawn whole at its own
+    // size, and that is what the rectangle says. With no image bound they are
+    // all zero, which is the same statement.
+    for name in [
+        b"SRC_X".as_slice(),
+        b"SRC_Y",
+        b"SRC_W",
+        b"SRC_H",
+        b"CRTC_W",
+        b"CRTC_H",
+    ] {
+        let found = property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, name);
+        lin::check_true(
+            &mut failed,
+            match name {
+                b"SRC_X" => b"the cursor plane has a source offset in x",
+                b"SRC_Y" => b"the cursor plane has a source offset in y",
+                b"SRC_W" => b"the cursor plane has a source width",
+                b"SRC_H" => b"the cursor plane has a source height",
+                b"CRTC_W" => b"the cursor plane has a destination width",
+                _ => b"the cursor plane has a destination height",
+            },
+            found.is_some(),
+        );
+    }
+    // `CRTC_X`/`CRTC_Y` are the pointer itself, and they are acted on rather than
+    // recorded - the same two the legacy `MODE_CURSOR` moves.
+    lin::check_true(
+        &mut failed,
+        b"the cursor plane's CRTC_X reads back where the pointer is",
+        property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, b"CRTC_X").is_some(),
+    );
+
     // --- the object-typed properties carry their one value -----------------------------
     // An `OBJECT` property's value is the *kind* of object it points at, and it
     // has exactly one of them: Linux creates the three below through
