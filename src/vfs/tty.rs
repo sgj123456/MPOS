@@ -1386,8 +1386,10 @@ pub struct Tty {
     perms: super::devfs::NodePerms,
     /// The window a program is told it has, in `(rows, columns)`, for a
     /// terminal whose size the kernel cannot know: what `TIOCSWINSZ` last set,
-    /// and 25x80 until an emulator says otherwise. A virtual console stores it
-    /// too but is answered from its screen instead - see [`Tty::window_size`].
+    /// and **`0x0`** until then - which is the one answer Linux gives for a
+    /// terminal nobody has sized, and the only honest one: see
+    /// [`Tty::window_size`]. A virtual console stores it too but is answered
+    /// from its screen instead.
     winsize: Mutex<RefCell<(u16, u16)>>,
     /// `O_NONBLOCK` on the description that opened this terminal - the bit the
     /// read consults before it parks. Mirrored from the description the way a
@@ -1412,7 +1414,7 @@ impl Tty {
             output: Mutex::new(RefCell::new(output)),
             dev_id,
             perms: super::devfs::NodePerms::new(0o666, 0, 0),
-            winsize: Mutex::new(RefCell::new((25, 80))),
+            winsize: Mutex::new(RefCell::new((0, 0))),
             nonblocking: core::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1442,9 +1444,24 @@ impl Tty {
     /// 48 rows and left the rest blank.
     ///
     /// Anything else - the serial wire, a `/dev/ptmx` pair - answers what
-    /// `TIOCSWINSZ` last set, and 25x80 until an emulator says otherwise: the
-    /// kernel has no way to know how wide a terminal on the other end of a wire
-    /// is, and Linux has no better answer for a `ttyS0` either.
+    /// `TIOCSWINSZ` last set, and `0x0` until then.
+    ///
+    /// `0x0` is not a placeholder this kernel picked, it is the measured Linux
+    /// answer, and the difference from a guessed `25x80` is the whole point: a
+    /// pty nobody has sized reports zero rows and zero columns there (Emacs'
+    /// own `getwinsize` printing `0 columns 0 rows` is the bug report that
+    /// pinned it, `debbugs.gnu.org/24608`), and a program answered `0` *knows*
+    /// it was told nothing, so it falls back in the order its own
+    /// documentation names - `LINES`/`COLUMNS`, then the terminfo `li` and
+    /// `co`, then `80x24` - or asks the terminal itself where its cursor is
+    /// and works out the size from that (`vim` does both).
+    ///
+    /// A guessed `25x80` takes those fallbacks away from a program that would
+    /// have used them and hands it a number the window it is drawing into does
+    /// not have, which is how a `vi` over the serial wire came to draw 25 of
+    /// the host's 40 rows and leave the rest of the window holding a page that
+    /// had already gone. Telling the truth about not knowing is worth more than
+    /// being nearly right.
     pub fn window_size(&self) -> (u16, u16) {
         // Asked rather than cached, so a console whose screen changed under it
         // - a different scanout, a console the mux moved - answers correctly
@@ -3614,8 +3631,10 @@ mod tests {
     fn a_console_reports_its_screens_window_and_others_do_not() {
         let console = Tty::new((4, 6), TtyOutput::Discard);
         // No screen yet - a headless machine, or before the render task has
-        // made one - keeps the shape this kernel has always answered.
-        assert_eq!(console.window_size(), (25, 80));
+        // made one - answers what Linux answers for a terminal nobody has
+        // sized: nothing. A number here would be a guess a full-screen program
+        // believes.
+        assert_eq!(console.window_size(), (0, 0));
 
         crate::term::make_screen(6, 50, 160);
         assert_eq!(console.window_size(), (50, 160));
@@ -3624,7 +3643,7 @@ mod tests {
         // what it reports is what `TIOCSWINSZ` set - which is the only way a
         // pty's size can be known at all, its emulator being in userspace.
         let pair = Tty::new((136, 3), TtyOutput::Discard);
-        assert_eq!(pair.window_size(), (25, 80));
+        assert_eq!(pair.window_size(), (0, 0));
         assert!(pair.set_window_size(30, 100), "a new size is a change");
         assert_eq!(pair.window_size(), (30, 100));
         assert!(!pair.set_window_size(30, 100), "setting it again is not");

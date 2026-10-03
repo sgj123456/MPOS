@@ -129,21 +129,29 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // The *window* is the pair's as well, and both ends read the same one:
     // this is how a terminal emulator tells the programs inside it how big
     // their window is - it sets the size on the master, they read it on the
-    // slave - and a pair nobody has sized answers the 25x80 stand-in. The
-    // virtual consoles do not go through this: their size is the screen the
-    // kernel console paints them on, so a full-screen program fills it.
+    // slave - and a pair nobody has sized answers *nothing*: zero rows and zero
+    // columns. That is the measured Linux answer (Emacs' own `getwinsize`
+    // printing `0 columns 0 rows` is the report that pinned it,
+    // `debbugs.gnu.org/24608`): a program answered `0` *knows* it was told
+    // nothing and falls back the order its own documentation names, whereas a
+    // guessed `25x80` takes that fallback away and hands it a window the real
+    // one does not have. The virtual consoles do not go through this: their
+    // size is the screen the kernel console paints them on, so a full-screen
+    // program fills it.
     let mut ws = lin::Winsize {
-        ws_row: 0,
-        ws_col: 0,
+        ws_row: 0xFFFF,
+        ws_col: 0xFFFF,
         ws_xpixel: 0xFFFF,
         ws_ypixel: 0xFFFF,
     };
     let r = lin::ioctl(slave, lin::TIOCGWINSZ, &raw mut ws as usize);
     lin::check_eq(&mut failed, b"TIOCGWINSZ on the slave succeeds", r, 0);
+    // The sentinel the fields start on is what makes this a pin: were they
+    // zeroed first, this would pass whether or not the kernel wrote them.
     lin::check_true(
         &mut failed,
-        b"an unsized pair answers the stand-in window",
-        (ws.ws_row, ws.ws_col) == (25, 80),
+        b"an unsized pair answers no window",
+        (ws.ws_row, ws.ws_col) == (0, 0),
     );
     ws.ws_row = 30;
     ws.ws_col = 100;
