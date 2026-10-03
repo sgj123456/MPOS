@@ -1516,6 +1516,7 @@ impl Table {
     fn enter(&mut self, id: TaskId) -> (*mut Context, *const Context) {
         self.prepare(id);
         let from = self.current;
+        #[cfg(target_arch = "x86_64")]
         self.hand_over_fpu(from, id);
         self.current = id;
         (self.context_of(from), self.context_of(id))
@@ -1536,6 +1537,13 @@ impl Table {
     /// registers are uncontroversially its. One consequence is worth naming: a
     /// task that is stopped or preempted always has a current `context.fpu`,
     /// which is exactly what `PTRACE_GETFPREGS` reads.
+    ///
+    /// x86_64's lazy-FPU scheme only. aarch64 has no `#NM` device-not-available
+    /// trap: `mpos_context_switch` saves and restores the floating-point half
+    /// *eagerly* into each context's `FpuState` on every switch, so there is
+    /// nothing for the scheduler to hand over and no flag to clear. On that
+    /// machine this function does not exist and `enter` does not call it.
+    #[cfg(target_arch = "x86_64")]
     fn hand_over_fpu(&mut self, from: TaskId, to: TaskId) {
         if self.task(from).fpu_live {
             // Safe: `fpu_live` implies `CR0.TS` is clear - the only two things
@@ -1565,12 +1573,16 @@ impl Table {
     /// places that make it current.
     fn inherit_fpu(&mut self, id: TaskId) -> hal::Fpu {
         let task = self.task_mut(id);
+        #[cfg(target_arch = "x86_64")]
         if task.fpu_live {
             debug_assert!(!hal::fpu_trapped());
             // Safe: `fpu_live` implies `CR0.TS` clear, by the same argument as
             // in `hand_over_fpu`.
             unsafe { hal::save_live_fpu(task.context.fpu_mut()) };
         }
+        // On x86_64 the branch above makes the saved block current first; on
+        // aarch64 the eager context switch has already written it, so the block
+        // is current unconditionally and this is just the copy.
         let bytes = task.context.fpu().to_bytes();
         hal::Fpu::from_bytes(&bytes)
     }
@@ -1582,6 +1594,12 @@ impl Table {
     /// The tracer's usual subject is a *stopped* task, so this is normally a
     /// no-op; it is here so that a caller asking about the running task gets its
     /// real state rather than whatever was last saved.
+    ///
+    /// x86_64 only: it exists to make the lazy-trap's live registers current
+    /// before `PTRACE_GETFPREGS` reads them. aarch64's eager switch keeps the
+    /// saved block current already, and its (not yet built) ptrace reads it
+    /// directly.
+    #[cfg(target_arch = "x86_64")]
     fn sync_fpu(&mut self, id: TaskId) {
         let live = self
             .tasks
@@ -1603,6 +1621,11 @@ impl Table {
     /// switch and cleared here, so a task that has already reclaimed its
     /// registers (a kernel-mode use, or a second fault for any other reason)
     /// finds `fpu_live` set and does not load the image over its own live state.
+    ///
+    /// x86_64 only: the whole `#NM`-trap reclaim scheme is the lazy-FPU design.
+    /// aarch64's `mpos_context_switch` restores the incoming task's FP eagerly,
+    /// so there is no fault to reclaim and no live-vs-saved split to reconcile.
+    #[cfg(target_arch = "x86_64")]
     fn reclaim_fpu(&mut self) {
         // Safe: the caller is the `#NM` handler, so the bit is set - clearing
         // it is what lets the faulting instruction be re-executed.
@@ -7144,6 +7167,10 @@ pub fn wait_for_interrupt() {
 /// only be raised by ring-3 code: the kernel is built `soft-float`, so nothing
 /// between the switch setting `CR0.TS` and this handler was ever holding the
 /// lock with a vector instruction in flight.
+///
+/// The `#NM` vector is x86_64's; the aarch64 IDT has no such entry, so this
+/// handler (and the lazy `reclaim_fpu` it drives) exists only on x86_64.
+#[cfg(target_arch = "x86_64")]
 pub fn device_not_available() {
     with_table(|t| t.reclaim_fpu());
 }
@@ -7588,10 +7615,16 @@ pub fn exec_replace(
         // record of what follows: once the reset block is in the live registers
         // this task genuinely owns them, and saying so saves the new image a
         // pointless fault in its first `memcpy`.
-        unsafe { hal::claim_live_fpu() };
-        unsafe { hal::reset_live_fpu() };
+        #[cfg(target_arch = "x86_64")]
+        {
+            unsafe { hal::claim_live_fpu() };
+            unsafe { hal::reset_live_fpu() };
+        }
         *task.context.fpu_mut() = hal::Fpu::reset();
-        task.fpu_live = true;
+        #[cfg(target_arch = "x86_64")]
+        {
+            task.fpu_live = true;
+        }
 
         // --- Build new address space ---
         let mut space = AddressSpace::new();
