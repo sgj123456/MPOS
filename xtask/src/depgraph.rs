@@ -110,18 +110,15 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
     ("rand", 0),
     ("uevent", 0),
     ("vfs", 0),
-    // `sched/runtime.rs`'s four `crate::syscall::MMAP_BASE` reads and the one
-    // `use crate::syscall::linux::abi` for the ptrace block's x86_64 register-file
-    // shape (`abi::uregs::COUNT`) and `PTRACE_*`/`SYSCALL_TRAP`. The umask default
-    // and the `Rlimit` table that used to sit here moved to the `abi` leaf (`sched`
-    // now names `crate::abi` for them, a downward edge), and the `nr::CLONE_*`
-    // reads went with them. What is left is genuinely architecture-specific and
-    // cannot go to an arch-neutral leaf: `MMAP_BASE` follows each arch's address
-    // space (aarch64's is decided with the process-running stage, `PLAN.md` §9.1
-    // stage 6/7), and `uregs::COUNT` is the x86 `user_regs_struct` field count
-    // sizing the ptrace state - both land when ptrace is cfg-gated to x86_64 and
-    // the aarch64 ABI arrives.
-    ("sched", 5),
+    // `sched/runtime.rs`'s one `use crate::syscall::linux::abi` - the ptrace/stop
+    // block's x86_64 register-file shape (`abi::uregs::COUNT`) and `PTRACE_*`/
+    // `SYSCALL_TRAP`. The default umask and the `Rlimit` table went to the `abi`
+    // leaf (`sched -> crate::abi`, a downward edge) and `MMAP_BASE` moved to
+    // `crate::mm` (an address-space layout fact, not a dispatch one) - together
+    // dropping this edge from its recorded 10. The last reference is the ptrace
+    // subsystem, which is x86_64's until the aarch64 syscall/ABI stage lands;
+    // gating it takes the edge to 0 (`PLAN.md` §9.1).
+    ("sched", 1),
 ];
 
 /// Where `sched` stands once V-3 is closed, recorded beside the rule above

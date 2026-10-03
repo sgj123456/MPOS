@@ -6261,13 +6261,16 @@ dispatch — the default `umask`, the `clone` flag bits, and the resource-limit 
 These are arch-neutral (asm-generic `CLONE_*` and `RLIMIT_*` carry the same number on
 x86_64 and aarch64), so they moved to a new `crates/abi` leaf that `sched` names
 downward and that `syscall::linux::{nr,abi}` re-export rather than redefine (one table,
-not two). `sched → syscall` fell 10 → 5: what remains is genuinely arch-specific and
-stays in `syscall` — the four `crate::syscall::MMAP_BASE` reads (a per-arch value,
-decided with the aarch64 process-running stage, §9.1 stage 6/7) and the ptrace block's
-`abi::uregs::COUNT` (the x86 `user_regs_struct` field count that sizes ptrace state,
-which goes when ptrace is cfg-gated to x86_64). The leaf is `#![no_std]`, host-tested
-(`clone` values pinned, the `setrlimit` soft/hard/root rule pinned), and added to the
-host-test crate list in `xtask/src/selftest.rs` and the `ARCHITECTURE.md` §1 graph.
+not two). `MMAP_BASE`, the other former `sched → syscall` read, moved to `crate::mm`
+(an address-space layout fact beside `USER_LIMIT`, not a dispatch one) with a per-arch
+value: x86_64 keeps `0x7f00_0000_0000`, aarch64 gets one derived from `paging::USER_END`
+(`1 << 48`) as *this* kernel's layout choice, to be measured against Linux's aarch64
+mmap base at stage 7 when a process runs. `sched → syscall` fell 10 → 1: the last
+reference is the ptrace/stop block's `abi::uregs::COUNT` (the x86 `user_regs_struct`
+field count sizing ptrace state), which goes when that block is cfg-gated to x86_64 —
+the aarch64 syscall/ABI stage. The leaf is `#![no_std]`, host-tested (`clone` values and
+the `setrlimit` soft/hard/root rule pinned), and added to the host-test crate list in
+`xtask/src/selftest.rs` and the `ARCHITECTURE.md` §1 graph.
 
 #### 11.1.4 — V-4: the terminal emulator and console live inside the VFS (severity: medium) — **CLOSED** (the `vfs ↔ console` pair is broken; emulator + VC vocabulary + `vtmode` + active-console number in the `term` leaf; see §11.2 Step D)
 

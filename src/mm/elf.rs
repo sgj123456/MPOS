@@ -96,6 +96,28 @@ pub struct Segment<'a> {
 /// conservative here, not a wrong-but-passing check.
 const USER_LIMIT: usize = 1 << 47;
 
+/// The ceiling of the `mmap`/image ASLR band: `sched`'s `new_layout` stacks the
+/// `mmap` region, the interpreter and the program *below* this, and leaves the
+/// region from here to the top of the address space to the stack. It is a
+/// per-architecture address-space layout fact - which is why it lives in `mm`
+/// (which owns the mapping plan and `USER_LIMIT` above) and not in `syscall`,
+/// whose dispatch it has nothing to do with; naming `crate::syscall::MMAP_BASE`
+/// from `sched` was a recorded `sched -> syscall` edge blocking the aarch64
+/// un-gate (`PLAN.md` §9.1, §11.2).
+///
+/// - x86_64: `0x7f00_0000_0000`, the classical Linux mmap base, below the
+///   `1 << 47` canonical line with a terabyte of stack headroom above it.
+/// - aarch64: the same ratio taken against `paging::USER_END` (`1 << 48`): a
+///   base near the top with the headroom above it left to the stack. This is
+///   *this* kernel's layout choice, chosen so a static-pie image places sanely;
+///   the exact base Linux aarch64 uses (top-down, `TASK_SIZE`-relative) is a
+///   stage-7 measurement against a running aarch64 process, not claimed here.
+/// - host: the x86_64 value, so the host-tested placement math matches x86.
+#[cfg(any(not(target_arch = "aarch64"), not(target_os = "none")))]
+pub const MMAP_BASE: usize = 0x0000_7f00_0000_0000;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub const MMAP_BASE: usize = 0xff00_0000_0000;
+
 /// The size of an `Elf64_Rela` record. The `elf` crate's table view reads
 /// exactly this stride, so a `DT_RELAENT` claiming anything else is a file
 /// this loader does not understand.

@@ -26,7 +26,12 @@ pub mod linux;
 /// and musl's allocator notices the difference: it sizes its regions from
 /// what the kernel hands back, and a base in the low gigabytes makes those
 /// regions collide with the break.
-pub const MMAP_BASE: usize = 0x0000_7f00_0000_0000;
+///
+/// Defined per-architecture in `crate::mm` (an address-space layout fact, not a
+/// dispatch one); re-exported here so the mmap handlers' `crate::syscall::MMAP_BASE`
+/// paths keep resolving while `sched` names `crate::mm` directly (the edge that
+/// used to run through this layer, `PLAN.md` §9.1).
+pub use crate::mm::elf::MMAP_BASE;
 
 /// The errno values [`linux::dispatch`] returns, already negated for `rax`.
 ///

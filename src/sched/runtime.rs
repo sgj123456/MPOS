@@ -280,7 +280,7 @@ fn span_of(image: &Image<'_>) -> usize {
 /// `MMAP_BASE`, so no amount of bias can walk a program's pages up into the
 /// kernel half of the address space.
 fn new_layout(image: &Image<'_>, interp: Option<&Image<'_>>) -> Layout {
-    let mmap_top = crate::syscall::MMAP_BASE - random_pages(ASLR_REGION_PAGES);
+    let mmap_top = crate::mm::elf::MMAP_BASE - random_pages(ASLR_REGION_PAGES);
     let mut ceiling = mmap_top;
     let interp_bias = match interp {
         Some(interp) => {
@@ -1460,7 +1460,7 @@ impl Task {
             nice: 0,
             brk_base: 0,
             brk_pages: 0,
-            mmap_cursor: crate::syscall::MMAP_BASE,
+            mmap_cursor: crate::mm::elf::MMAP_BASE,
             stack_top: USER_STACK_TOP,
             exe: alloc::string::String::new(),
             argv: alloc::sync::Arc::new(alloc::vec::Vec::new()),
@@ -1947,7 +1947,7 @@ impl Table {
             nice: 0,
             brk_base: 0,
             brk_pages: 0,
-            mmap_cursor: crate::syscall::MMAP_BASE,
+            mmap_cursor: crate::mm::elf::MMAP_BASE,
             stack_top: USER_STACK_TOP,
             exe: alloc::string::String::new(),
             argv: alloc::sync::Arc::new(alloc::vec::Vec::new()),
@@ -6759,7 +6759,7 @@ pub fn brk(addr: usize) -> isize {
         // The heap may not walk into the mmap region: between the two lies the
         // hole that gives the address space its Linux shape. A break that far
         // up is a runaway allocation, not a request to honor.
-        if frontier >= crate::syscall::MMAP_BASE {
+        if frontier >= crate::mm::elf::MMAP_BASE {
             return crate::err::ENOMEM;
         }
         let grown_to = task.brk_base + task.brk_pages * PAGE_SIZE;
