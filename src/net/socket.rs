@@ -1181,7 +1181,7 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
 
     // The handshake loop. A reset closes the socket (state back to Closed);
     // thirty seconds of silence is what Linux answers ETIMEDOUT for.
-    let deadline = crate::arch::timer::ticks() + 30 * crate::arch::timer::TICK_HZ as u64;
+    let deadline = crate::hal::ticks() + 30 * crate::hal::TICK_HZ as u64;
     loop {
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
@@ -3260,11 +3260,11 @@ pub(crate) fn handle_recvmmsg(args: [usize; 6], from_user: bool) -> isize {
         // the same fold `ppoll` makes. Both fields were validated above,
         // so both are non-negative and the u64 arithmetic below is the
         // whole story.
-        let hz = crate::arch::timer::TICK_HZ as u64;
+        let hz = crate::hal::TICK_HZ as u64;
         let ms = (sec as u64)
             .saturating_mul(1_000)
             .saturating_add((nsec as u64).div_ceil(1_000_000));
-        Some(crate::arch::timer::ticks().saturating_add(ms.saturating_mul(hz) / 1000))
+        Some(crate::hal::ticks().saturating_add(ms.saturating_mul(hz) / 1000))
     } else {
         None
     };
@@ -3337,7 +3337,7 @@ fn recv_one_bounded(
         }
         match deadline {
             None => break Err(err::EWOULDBLOCK),
-            Some(end) if crate::arch::timer::ticks() >= end => break Err(err::EWOULDBLOCK),
+            Some(end) if crate::hal::ticks() >= end => break Err(err::EWOULDBLOCK),
             _ => crate::sched::sleep_ticks(1),
         }
     };

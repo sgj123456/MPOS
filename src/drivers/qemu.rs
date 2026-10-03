@@ -19,5 +19,5 @@ pub fn exit(code: u32) -> ! {
         port.write(code);
     }
     // Unreachable on QEMU; on real hardware fall through to a halt.
-    crate::arch::halt()
+    crate::hal::halt()
 }

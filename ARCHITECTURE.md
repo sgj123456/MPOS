@@ -158,6 +158,7 @@ flowchart TB
 
     subgraph L1["Machine abstraction"]
         ARCH["arch/x86_64<br/>gdt · idt · paging · context · timer · syscall gate"]
+        HAL["hal — the capability traits<br/>Clock · WallClock · Cpu · Current,<br/>and the forwards above them"]
         CONSOLE["console<br/>framebuffer + serial + virtual consoles"]
     end
 
@@ -198,6 +199,7 @@ flowchart TB
 
     MM --> BOOTMOD
     ARCH --> MM
+    ARCH --> HAL
     CONSOLE --> ARCH
 
     DRIVERS --> MM
@@ -214,6 +216,16 @@ flowchart TB
 Read it as "may call", not "calls on every path": `net` names `sched` because blocking
 socket calls park in the scheduler, and `drivers` names `sched` because a driver's service
 task is a scheduler task.
+
+**`hal` is the machine seam.** `src/hal/mod.rs` declares the capability traits a machine
+implements (`Clock`, `WallClock`, `Cpu`) and the platform tag `Current`; `src/arch/x86_64/mod.rs`
+implements them *for* `Current`, so `arch → hal` is the only arrow between the two and
+everything above the machine layer calls `crate::hal`'s forwards rather than naming `arch`
+(this is what took `arch → console` and `arch → net` to zero, §6). The register ABI — the
+`syscall` gate, the trap frame, `user_regs_struct` — is x86_64 *by definition* and stays in
+`arch/`; wrapping it in a neutral type would be the private dialect `AGENTS.md` §4 rule 3
+forbids, so a port writes `arch/<arch>/` and edits no shared file (`PLAN.md` §9.1). The
+paging, context and interrupt halves of the seam are still being moved (§11.4).
 
 **Honest caveat:** several boxes above are *not* one-way in the code. §6 lists the measured
 differences — in particular `drivers → syscall`, `sched → vfs`/`net`/`drivers`,
@@ -235,7 +247,8 @@ they are cross-crate edges.
 | Layer | Module | Owns | Must not |
 |---|---|---|---|
 | Entry | `src/main.rs` | The boot sequence, the `mpos.selftest` milestone checks, the panic handler, the boot-stack canary check | Contain reusable logic — everything reusable lives in the lib so the host can test it |
-| Machine | `src/arch/x86_64/` | GDT/IDT/TSS, PIC and LAPIC, 4-level paging, context switch, the `syscall`/`sysret` gate, the PIT, port I/O | Be named from outside `arch::` — `src/arch/mod.rs` re-exports a uniform surface (`interrupts`, `timer`, `paging`, …) |
+| Machine | `src/arch/x86_64/` | GDT/IDT/TSS, PIC and LAPIC, 4-level paging, context switch, the `syscall`/`sysret` gate, the PIT, port I/O | Be named from outside `arch::`/`hal::` — every machine call above the machine layer goes through `crate::hal`; the register ABI the syscall gate and trap frame carry is per-arch by definition and stays here |
+| HAL | `src/hal/` | The capability traits a machine implements (`Clock`, `WallClock`, `Cpu`), the platform tag `Current`, and the one-line forwards everything above calls | Hold machine logic: the `impl`s live in `arch/<arch>/`, so a port adds them there without editing a shared file. It is not `drivers::virtio::hal` (that is `virtio_drivers`' own `Hal`), and it is six traits for six concerns, not one per function (`PLAN.md` §11.3) |
 | Memory | `src/mm/` | Buddy frame allocator (order 0–12), slab heap (16–2048 B), mapping plans, the ELF64 loader | Know about files, tasks or devices |
 | Scheduler | `src/sched/` | The 64-slot task table, priority bands + round-robin, sleep/block deadlines, signal state, futex | Be the place where a subsystem's per-process cleanup lives (see V-3) |
 | VFS | `src/vfs/` | The `Inode`/`FileSystem` traits, mounts and path resolution, the fd table, every filesystem (ramfs, ext2/ext4, procfs, sysfs, devfs, devpts, p9, tmpfs), pipes, epoll, timerfd, eventfd, signalfd, inotify, locks, memfd/dmabuf | Contain the terminal emulator — that is the `term` leaf crate now, and the VC vocabulary/`vtmode`/active-console number moved there too (V-4 closed); the console mux stays here with the pty/tty nodes it orchestrates |
@@ -412,7 +425,12 @@ prose, not edges, which is the lesson the `arch ↔ vfs` phantom taught above, m
 Two came off in code as well: the exit-hook registry (`sched::exit`) removed `sched → net`,
 and `mm` stopped naming `vfs` for a frame-backed mapping (V-13). In neither case does the other
 direction go - `net → sched` is ordinary parking and `vfs → mm` is the tenant of the address
-space - because a one-way edge is not a cycle. The tables in this section are the audit's
+space - because a one-way edge is not a cycle. The HAL landing (S1, §11.4) then took the
+measured count from 17 to **15**: `arch → console` and `arch → net` fell to zero when every
+`crate::arch::timer`/`rtc`/`idle`/`halt` call above the machine layer became a `crate::hal`
+one, collapsing both pairs to one-way edges, and no pair was added in exchange (`hal`'s
+platform tag is its own type; `arch` implements the traits for it, so `arch → hal` is the
+only arrow). The tables in this section are the audit's
 snapshot and are left as they were read; from here the command is what they have to agree with, and
 it fails when an edge appears that was not there when the baseline was recorded. Two further rules
 ride with it, each a ratchet at its recorded number rather than an absolute refusal: no layer below
@@ -453,6 +471,7 @@ where the hardware does), which is what makes
 flowchart TB
     subgraph Gated["#[cfg(target_os = \"none\")] — machine only"]
         A1["arch"]
+        A1b["hal (the machine traits + Current)"]
         A2["console"]
         A3["drivers"]
         A4["net"]
@@ -534,14 +553,22 @@ Phase 11 D (**closed**; D.2b rejected) |
 **The dependency direction to aim for** (used as the acceptance criterion in Phase 11):
 
 ```
-drivers, net, pci, rand, uevent        →  may use: arch, mm, sched, sync
+drivers, net, pci, rand, uevent        →  may use: hal, mm, sched, sync
         ↓
-      vfs, sched                       →  may use: mm, arch, sync, blk, pci
+      vfs, sched                       →  may use: mm, hal, sync, blk, pci
         ↓
-     syscall                           →  may use: vfs, sched, mm, net, drivers
+     syscall                           →  may use: vfs, sched, mm, net, drivers, hal
         ↓
        main                            →  may use everything
+
+       hal                             →  may use nothing (arch implements its traits)
+   arch/<arch>                         →  may use: hal, mm's mapping vocabulary
 ```
+
+The machine seam is new and still being closed (`PLAN.md` §11.4): the clock, wall clock and
+CPU-control calls already go through `hal`, while paging, context and the interrupt controller
+are still named from above and move next. Until they do, `arch` is named directly by the
+boxes that still carry those calls — which is exactly the debt the steps are for.
 
 The leaf crates (`err`, `date`, `binfmt`, `cred`, `uts`, `seccomp`, `pci`, `term`, `ahci`,
 `gpu`, `evdev`, `uinput`, `blk`) sit below all of these and may use nothing in the kernel —

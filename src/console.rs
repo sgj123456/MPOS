@@ -410,7 +410,7 @@ fn serial_bytes(bytes: &[u8]) {
 /// are enabled to let the wake through. An interrupt handler fails the second
 /// test, and the boot code before `sched::init` fails the first.
 fn may_park() -> bool {
-    crate::sched::started() && crate::arch::interrupts_enabled()
+    crate::sched::started() && crate::hal::interrupts_enabled()
 }
 
 #[doc(hidden)]

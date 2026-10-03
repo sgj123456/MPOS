@@ -51,7 +51,7 @@ impl CharDevice for RtcDev {
 /// The kernel's current wall-clock seconds: exactly what
 /// `clock_gettime(CLOCK_REALTIME)` answers with, from the same two numbers.
 pub fn now_epoch() -> u64 {
-    crate::arch::rtc::boot_epoch() + crate::arch::timer::since_boot_nanos() / 1_000_000_000
+    crate::hal::boot_epoch() + crate::hal::since_boot_nanos() / 1_000_000_000
 }
 
 /// Break a Unix second into the nine `int`s of `struct rtc_time`, in its

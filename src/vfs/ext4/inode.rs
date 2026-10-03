@@ -91,8 +91,7 @@ pub(crate) struct InodeData {
 /// it.
 #[cfg(target_os = "none")]
 pub(crate) fn now() -> u32 {
-    (crate::arch::rtc::boot_epoch()
-        + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64) as u32
+    (crate::hal::boot_epoch() + crate::hal::ticks() / crate::hal::TICK_HZ as u64) as u32
 }
 
 #[cfg(not(target_os = "none"))]

@@ -584,7 +584,7 @@ pub fn connect(sock: &VsockSock, cid: u32, port: u32, nonblock: bool) -> isize {
     // this socket, so the wait is a look at the phase per tick, with a
     // fatal signal and a deadline checked on every round - thirty seconds,
     // the same silence a TCP connect answers ETIMEDOUT for.
-    let deadline = crate::arch::timer::ticks() + 30 * crate::arch::timer::TICK_HZ as u64;
+    let deadline = crate::hal::ticks() + 30 * crate::hal::TICK_HZ as u64;
     loop {
         match sock.phase() {
             Phase::Connected => return 0,
@@ -595,7 +595,7 @@ pub fn connect(sock: &VsockSock, cid: u32, port: u32, nonblock: bool) -> isize {
         if crate::sched::has_deliverable_signal() {
             return err::EINTR;
         }
-        if crate::arch::timer::ticks() >= deadline {
+        if crate::hal::ticks() >= deadline {
             return err::ETIMEDOUT;
         }
         crate::sched::sleep_ticks(1);

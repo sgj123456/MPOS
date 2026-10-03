@@ -360,7 +360,7 @@ pub fn cancel_on_clock_set() {
 /// time to pass say which `now` they mean instead.
 #[cfg(target_os = "none")]
 fn now_ticks() -> u64 {
-    crate::arch::timer::ticks()
+    crate::hal::ticks()
 }
 
 #[cfg(not(target_os = "none"))]

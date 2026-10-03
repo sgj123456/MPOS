@@ -667,7 +667,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             let from = crate::drivers::video::render::landings();
             // 10 ticks at this kernel's 250 Hz clock: 40 ms, a frame and a half
             // at the nominal 60 Hz the connector's mode says.
-            let deadline = crate::arch::timer::ticks() + 10;
+            let deadline = crate::hal::ticks() + 10;
             crate::sched::block_until_deadline(
                 || crate::drivers::video::render::landings() != from,
                 deadline,
@@ -897,7 +897,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     }
                     match crate::drivers::rtc_dev::fields_to_epoch(&fields) {
                         Ok(epoch) => {
-                            if crate::arch::rtc::write_epoch(epoch) {
+                            if crate::hal::write_epoch(epoch) {
                                 0
                             } else {
                                 err::EINVAL

@@ -196,7 +196,7 @@ pub fn master_vc() -> Option<u32> {
 /// The clock the negotiation measures in. `vtmode` deliberately takes a tick
 /// rather than owning one, so the caller is this file.
 fn now() -> u64 {
-    crate::arch::timer::ticks()
+    crate::hal::ticks()
 }
 
 /// The handover table. `None` until [`init`] has run, which is before any

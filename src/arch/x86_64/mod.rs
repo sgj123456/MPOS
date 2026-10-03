@@ -97,3 +97,81 @@ pub fn halt() -> ! {
 pub fn idle() {
     unsafe { core::arch::asm!("sti", "hlt", "cli") };
 }
+
+/// The x86_64 machine, as the HAL sees it: this module implements the machine
+/// traits for `crate::hal::Current`, the platform tag `hal` owns.
+///
+/// The binding lives here rather than in `hal` because its bodies name this
+/// module's `timer`/`rtc`/`idt` - a new architecture adds its own impls in its
+/// own module and edits no shared file (`PLAN.md` §9.1). Everything below is a
+/// one-line static dispatch, so `crate::hal::ticks()` is exactly the
+/// `timer::ticks()` it replaced once monomorphised.
+impl crate::hal::Clock for crate::hal::Current {
+    const TICK_HZ: u32 = timer::TICK_HZ;
+
+    #[inline]
+    fn ticks() -> u64 {
+        timer::ticks()
+    }
+
+    #[inline]
+    fn since_boot_nanos() -> u64 {
+        timer::since_boot_nanos()
+    }
+
+    #[inline]
+    fn busy_wait_ms(ms: u64) {
+        timer::busy_wait_ms(ms)
+    }
+}
+
+impl crate::hal::WallClock for crate::hal::Current {
+    #[inline]
+    fn boot_epoch() -> u64 {
+        rtc::boot_epoch()
+    }
+
+    #[inline]
+    fn set_boot_epoch(epoch: u64) {
+        rtc::set_boot_epoch(epoch)
+    }
+
+    #[inline]
+    fn write_epoch(epoch: u64) -> bool {
+        rtc::write_epoch(epoch)
+    }
+}
+
+impl crate::hal::Cpu for crate::hal::Current {
+    #[inline]
+    fn interrupts_enabled() -> bool {
+        interrupts_enabled()
+    }
+
+    #[inline]
+    fn enable_interrupts() {
+        idt::enable()
+    }
+
+    #[inline]
+    fn halt() -> ! {
+        halt()
+    }
+
+    #[inline]
+    fn idle() {
+        idle()
+    }
+
+    #[inline]
+    fn enable_user_simd() {
+        enable_user_sse()
+    }
+
+    #[inline]
+    fn init_interrupts() {
+        init_interrupts()
+    }
+}
+
+impl crate::hal::Platform for crate::hal::Current {}

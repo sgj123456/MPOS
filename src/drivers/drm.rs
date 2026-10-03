@@ -2356,7 +2356,7 @@ fn master_ok(nr: u32, minor: u32, ofd: u64) -> bool {
 /// says so rather than claiming one: there is no display controller here to be
 /// in blank, only a frame that has gone and one that has not.
 fn queue_flip_event(sequence: u32, user_data: u64) {
-    let now = crate::arch::timer::since_boot_nanos();
+    let now = crate::hal::since_boot_nanos();
     critical_section::with(|cs| {
         STATE
             .borrow(cs)
@@ -5543,9 +5543,9 @@ fn wait_deadline(nsec: i64) -> u64 {
     if nsec < 0 {
         return u64::MAX;
     }
-    let per_tick = 1_000_000_000u64 / crate::arch::timer::TICK_HZ as u64;
-    let left = (nsec as u64).saturating_sub(crate::arch::timer::since_boot_nanos());
-    crate::arch::timer::ticks().saturating_add(left / per_tick.max(1))
+    let per_tick = 1_000_000_000u64 / crate::hal::TICK_HZ as u64;
+    let left = (nsec as u64).saturating_sub(crate::hal::since_boot_nanos());
+    crate::hal::ticks().saturating_add(left / per_tick.max(1))
 }
 
 /// Park until `satisfied` holds, the deadline passes, or a signal arrives, and

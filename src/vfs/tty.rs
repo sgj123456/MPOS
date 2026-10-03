@@ -1678,7 +1678,7 @@ impl Tty {
             // read decision still has to wake it. See
             // [`LineDiscipline::byte_restarts_clock`].
             #[cfg(target_os = "none")]
-            ld.note_input_tick(crate::arch::timer::ticks());
+            ld.note_input_tick(crate::hal::ticks());
             let echo = ld.take_echo();
             // Echo is output like any other: the cursor moves for the characters
             // the console shows, so the model of the screen has to follow it. A
@@ -2188,9 +2188,9 @@ impl Tty {
         // The read's own start, which is the anchor for the `VMIN == 0` clock
         // and only for that one: with `VMIN > 0` the clock runs between bytes
         // and the discipline is where that stamp lives.
-        let entry = crate::arch::timer::ticks();
+        let entry = crate::hal::ticks();
         // One decisecond, in ticks - the unit `VTIME` is written in.
-        let ticks_per_ds = crate::arch::timer::TICK_HZ as u64 / 10;
+        let ticks_per_ds = crate::hal::TICK_HZ as u64 / 10;
         let nonblocking = self.is_nonblocking();
         loop {
             // Re-arm the waiter on every pass, not once. `receive_byte` wakes
@@ -2240,7 +2240,7 @@ impl Tty {
                 }
                 ReadWait::UntilInput => u64::MAX,
                 ReadWait::UntilTick(due) => {
-                    if crate::arch::timer::ticks() >= due {
+                    if crate::hal::ticks() >= due {
                         // The clock ran out with a decision owed. Nothing here
                         // needs to know *which* clock case it is: an empty queue
                         // at this point can only be the `VMIN == 0` one, because

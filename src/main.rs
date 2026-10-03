@@ -35,11 +35,12 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use mpos::arch::{self, interrupts, paging, timer};
+use mpos::arch::{self, interrupts, paging};
 use mpos::blk;
 use mpos::boot::console_list::ConsoleList;
 use mpos::boot::{self, BootInfo};
 use mpos::drivers;
+use mpos::hal;
 use mpos::mm::{self, MapFlags, Mapping, PAGE_SIZE};
 use mpos::println;
 use mpos::sched::{self, Priority};
@@ -93,7 +94,7 @@ pub unsafe extern "C" fn _start(handoff: *const boot::handoff::Handoff) -> ! {
     mpos::console::init();
 
     // Enable SSE/AVX for user processes before anything else touches CR0/CR4.
-    arch::enable_user_sse();
+    hal::enable_user_simd();
 
     let info = unsafe { boot::handoff::collect(handoff) };
     // Hand the command line to the filesystem layer before anyone can read
@@ -119,7 +120,7 @@ pub unsafe extern "C" fn _start(handoff: *const boot::handoff::Handoff) -> ! {
     // The system never stops booting: `kernel_main` ends parked in the boot
     // task, with init and its shell running. If it ever returned, the stack
     // underneath is the loader's and there is nothing left to do.
-    arch::halt()
+    hal::halt()
 }
 
 fn banner(info: &BootInfo) {
@@ -272,8 +273,8 @@ fn init_mm() {
 }
 
 fn init_arch(info: &BootInfo) {
-    arch::init_interrupts();
-    interrupts::enable();
+    hal::init_interrupts();
+    hal::enable_interrupts();
 
     let sections = arch::kernel_sections();
     println!(
@@ -606,15 +607,15 @@ fn overlaps(a: *mut u8, a_layout: Layout, b: *mut u8, b_layout: Layout) -> bool 
 fn check_arch(info: &BootInfo) {
     // M1: clock interrupts and breakpoint exception.
     {
-        let before = timer::ticks();
-        timer::busy_wait_ms(500);
-        let elapsed = timer::ticks() - before;
-        println!("clock: {} ticks in ~500ms ({} Hz)", elapsed, timer::TICK_HZ);
+        let before = hal::ticks();
+        hal::busy_wait_ms(500);
+        let elapsed = hal::ticks() - before;
+        println!("clock: {} ticks in ~500ms ({} Hz)", elapsed, hal::TICK_HZ);
         // Expect half a second's worth of ticks, within ten percent. Written
         // against TICK_HZ, not a literal, so raising the tick rate does not
         // silently turn a working clock into a failed assertion.
-        let half = timer::TICK_HZ as u64 / 2;
-        let tol = timer::TICK_HZ as u64 / 10;
+        let half = hal::TICK_HZ as u64 / 2;
+        let tol = hal::TICK_HZ as u64 / 10;
         assert!(
             (half - tol..=half + tol).contains(&elapsed),
             "timer tick rate is wrong"
@@ -878,8 +879,8 @@ fn preempted() {
 
     sched::spawn(
         || {
-            let start = timer::ticks();
-            while timer::ticks() - start < SPIN_TICKS {
+            let start = hal::ticks();
+            while hal::ticks() - start < SPIN_TICKS {
                 core::hint::spin_loop();
             }
             record(0);
@@ -913,9 +914,9 @@ fn sleeping() {
     sched::spawn(
         || {
             record(0);
-            let start = timer::ticks();
+            let start = hal::ticks();
             sched::sleep_ticks(SLEEP_TICKS);
-            let slept = timer::ticks() - start;
+            let slept = hal::ticks() - start;
             assert!(
                 (SLEEP_TICKS..SLEEP_TICKS + 3).contains(&slept),
                 "asked for {SLEEP_TICKS} ticks and got {slept}"
@@ -970,8 +971,8 @@ fn priority_wins() {
 
     sched::spawn(
         || {
-            let start = timer::ticks();
-            while timer::ticks() - start < SPIN_TICKS {
+            let start = hal::ticks();
+            while hal::ticks() - start < SPIN_TICKS {
                 core::hint::spin_loop();
             }
             record(0);

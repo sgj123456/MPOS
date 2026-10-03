@@ -1046,8 +1046,7 @@ pub fn xattr_list_fd(args: [usize; ARG_COUNT]) -> isize {
 /// Wall-clock seconds, the value `UTIME_NOW` resolves to - the same sum
 /// `gettimeofday` reports (the boot epoch plus elapsed ticks).
 fn wall_now() -> u64 {
-    crate::arch::rtc::boot_epoch()
-        + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64
+    crate::hal::boot_epoch() + crate::hal::ticks() / crate::hal::TICK_HZ as u64
 }
 
 /// `struct timespec` as `utimensat` reads it: seconds, nanoseconds.
@@ -2488,8 +2487,8 @@ fn ppoll_deadline(tsp: usize, from_user: bool) -> Result<Option<u64>, isize> {
 
 /// `ms` from now, in ticks.
 fn deadline_in_ticks(ms: u64) -> u64 {
-    let ticks = ms.saturating_mul(crate::arch::timer::TICK_HZ as u64) / 1000;
-    crate::arch::timer::ticks().saturating_add(ticks)
+    let ticks = ms.saturating_mul(crate::hal::TICK_HZ as u64) / 1000;
+    crate::hal::ticks().saturating_add(ticks)
 }
 
 /// The wait [`poll`] and [`ppoll`] are both made of, with the timeout already
@@ -2536,7 +2535,7 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         if count > 0 {
             break count as isize;
         }
-        let expired = deadline.is_some_and(|end| crate::arch::timer::ticks() >= end);
+        let expired = deadline.is_some_and(|end| crate::hal::ticks() >= end);
         if expired {
             break 0;
         }
@@ -2561,7 +2560,7 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         // (`nlplug-findfs` parks exactly that way, with no timeout). The
         // condition is read-only: it reports, and the loop's own
         // `check_ready` above fills the caller's `revents` once.
-        let next = crate::arch::timer::ticks().saturating_add(1);
+        let next = crate::hal::ticks().saturating_add(1);
         let floor = deadline.map_or(next, |end| end.min(next));
         let any_ready = || {
             (0..nfds).any(|index| {
@@ -2828,8 +2827,8 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
             Ok(ms) => ms,
             Err(e) => return e,
         };
-        let ticks = ms * crate::arch::timer::TICK_HZ as u64 / 1000;
-        Some(crate::arch::timer::ticks() + ticks)
+        let ticks = ms * crate::hal::TICK_HZ as u64 / 1000;
+        Some(crate::hal::ticks() + ticks)
     };
 
     // Readiness as of the last check, kept beside the watches so the
@@ -2840,7 +2839,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         if count > 0 {
             break count;
         }
-        if deadline.is_some_and(|end| crate::arch::timer::ticks() >= end) {
+        if deadline.is_some_and(|end| crate::hal::ticks() >= end) {
             break 0;
         }
         // The same interruptible-wait rule as `poll`: a pending signal ends
@@ -2861,7 +2860,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         // readiness nobody can announce - netlink, signalfd, eventfd.
         // `watch_ready` only reads; the recorded readiness is refreshed from
         // it once the park ends, for the write-back below.
-        let next = crate::arch::timer::ticks().saturating_add(1);
+        let next = crate::hal::ticks().saturating_add(1);
         let floor = deadline.map_or(next, |end| end.min(next));
         let any_ready = || {
             watches
@@ -2921,11 +2920,11 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         let remaining_ms = match deadline {
             None => 0,
             Some(end) => {
-                let now = crate::arch::timer::ticks();
+                let now = crate::hal::ticks();
                 if now >= end {
                     0
                 } else {
-                    (end - now) * 1000 / crate::arch::timer::TICK_HZ as u64
+                    (end - now) * 1000 / crate::hal::TICK_HZ as u64
                 }
             }
         };
@@ -4526,12 +4525,12 @@ pub fn handle_timerfd_settime(args: [usize; ARG_COUNT], from_user: bool) -> isiz
             ),
         )
     };
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let hz = crate::hal::TICK_HZ as u64;
     let interval_ticks = match crate::vfs::timerfd::ticks_of_timespec(interval.0, interval.1, hz) {
         Ok(ticks) => ticks,
         Err(e) => return e,
     };
-    let now = crate::arch::timer::ticks();
+    let now = crate::hal::ticks();
     let deadline = if initial.0 == 0 && initial.1 == 0 {
         // The man page's disarm: a zero `it_value` is the whole spelling.
         None
@@ -4550,7 +4549,7 @@ pub fn handle_timerfd_settime(args: [usize; ARG_COUNT], from_user: bool) -> isiz
             // count, so a point named on it is that many ticks past the
             // anchor - and one already past is a deadline of zero, which
             // the state machine counts the next time it looks.
-            Some(at.saturating_sub(crate::arch::rtc::boot_epoch().saturating_mul(hz)))
+            Some(at.saturating_sub(crate::hal::boot_epoch().saturating_mul(hz)))
         } else {
             // The monotonic clock *is* the tick count: an absolute point
             // on it is already the number this state machine keeps.
@@ -4579,7 +4578,7 @@ pub fn handle_timerfd_gettime(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     if !buffer_ok(curr, crate::vfs::timerfd::ITIMERSPEC_SIZE, true, from_user) {
         return err::EFAULT;
     }
-    write_itimerspec(curr, timer.snapshot(crate::arch::timer::ticks()), from_user);
+    write_itimerspec(curr, timer.snapshot(crate::hal::ticks()), from_user);
     0
 }
 
@@ -4590,7 +4589,7 @@ fn write_itimerspec(buf: usize, snapshot: Option<(u64, u64)>, from_user: bool) {
     if !buffer_ok(buf, crate::vfs::timerfd::ITIMERSPEC_SIZE, true, from_user) {
         return;
     }
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let hz = crate::hal::TICK_HZ as u64;
     let (remaining, interval) = snapshot.unwrap_or((0, 0));
     let (rsec, rnsec) = crate::vfs::timerfd::timespec_of_ticks(remaining, hz);
     let (isec, insec) = crate::vfs::timerfd::timespec_of_ticks(interval, hz);

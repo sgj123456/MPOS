@@ -578,7 +578,7 @@ pub fn handle_sched_rr_get_interval(args: [usize; ARG_COUNT], from_user: bool) -
     if tp == 0 || !buffer_ok(tp, 16, true, from_user) {
         return err::EFAULT;
     }
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let hz = crate::hal::TICK_HZ as u64;
     unsafe {
         (tp as *mut i64).write_unaligned(0);
         ((tp + 8) as *mut i64).write_unaligned(1_000_000_000 / hz as i64);
@@ -999,9 +999,9 @@ pub fn handle_getcpu(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// counter keeps running, the epoch it is measured from moves, and the
 /// timers that asked to hear about a set are told.
 fn set_wall_clock(epoch: u64) {
-    let hz = crate::arch::timer::TICK_HZ as u64;
-    let anchor = epoch.saturating_sub(crate::arch::timer::ticks() / hz);
-    crate::arch::rtc::set_boot_epoch(anchor);
+    let hz = crate::hal::TICK_HZ as u64;
+    let anchor = epoch.saturating_sub(crate::hal::ticks() / hz);
+    crate::hal::set_boot_epoch(anchor);
     crate::vfs::timerfd::cancel_on_clock_set();
 }
 

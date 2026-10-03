@@ -667,7 +667,7 @@ it - so the entries say which they are:
 **Architectures (Phase 9 — far future)**
 - [ ] 9.1 aarch64 complete boot · [ ] 9.2 RISC-V support
 
-**Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, V-1/V-4/V-13 closed)**
+**Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
@@ -774,7 +774,14 @@ it - so the entries say which they are:
 - [x] 11.G a depgraph ratchet, so the measured cycle count cannot grow back: `cargo xtask
       depgraph` (also a host test, so it is inside `cargo xtask test`) re-runs §11.0's extraction
       with comments stripped and holds three recorded baselines — lower layer → `syscall`,
-      `vfs/mod.rs` → devices, mutual pairs — under `xtask/src/depgraph.rs` (§11.2 Step G)
+      `      vfs/mod.rs` → devices, mutual pairs — under `xtask/src/depgraph.rs` (§11.2 Step G)
+- [x] **11.4 the HAL, stage 1**: `src/hal/` declares the machine capability traits (`Clock`,
+      `WallClock`, `Cpu`) and the platform tag `Current`; `arch/x86_64` implements them for it,
+      and every `arch::timer`/`rtc`/`idle`/`halt`/`enable_user_sse` call above the machine layer
+      is now a `crate::hal` one. The tag is `hal`'s own type, so the seam adds **no** cycle
+      (`arch → hal` only) and the measured **mutual pairs fell 17 → 15** — `arch ↔ console` and
+      `arch ↔ net` collapsed to one-way edges, the second ratchet drop since Step C. Stages 2–5
+      (interrupts, paging, contexts, the closed door) are in §11.4
 
 **ABI truthfulness (Phase 12 — Group A landing, gate now runs to a summary)**
 
@@ -6440,15 +6447,55 @@ the argument for having done them first.
 - **Rewriting the `Inode` interface.** The trait itself is fine; it is the nine device and socket
   methods that hung off it that were wrong. B1 removed them, added one type-erased handle the
   caller names a type through, and stopped there.
-- **A message bus, an async runtime, or a generic HAL trait forest.** The kernel is uniprocessor
-  and synchronous by design, and `ARCHITECTURE.md` §7's locking rules exist because that is what
-  makes the design legible. This phase is about *who names whom*, not about adding indirection.
+- ~~**A generic HAL trait forest.**~~ **Reversed — see §11.4.** What this note rejected was a
+  trait per function; §11.4 lands *six* traits for the six hardware concerns the kernel has,
+  with the platform tag owned by `hal` so the seam adds no dependency cycle. The reasoning
+  against indirection still holds and is honoured: the forwards are static, there is no `dyn`
+  and no allocation, and a call monomorphises to the direct one it replaced.
+- **A message bus or an async runtime.** The kernel is uniprocessor and synchronous by design,
+  and `ARCHITECTURE.md` §7's locking rules exist because that is what makes the design legible.
+  This phase is about *who names whom*, not about adding indirection.
 - **Splitting files because they are long.** `vfs/ext4/mod.rs` (3 391 lines) stays as it is.
 - **Restructuring `src/main.rs` (1 625 lines).** The boot sequence, the milestone checks and the
   panic handler do belong in the binary; if it ever becomes worth splitting, the checks move to
   `src/main/checks.rs`, and that is a tidiness commit rather than an architecture one.
 - **Fixing V-10.** Accepted, documented, and cheaper to live with than a shared crate across two
   targets would be.
+
+### 11.4 The HAL: a machine seam under `arch/` — **LANDED (S1); S2–S5 open**
+
+Phase 11 is "who names whom"; this is the largest remaining piece of it, deferred above until
+now. Goal: everything above the machine layer compiles against *capability traits* instead of
+`arch::x86_64::*`, so a second architecture is `arch/<arch>/` and nothing else (§9.1/§9.2), and
+no architecture-specific type crosses the boundary without a compile error.
+
+**Shape** (`src/hal/mod.rs`): six traits for the six hardware concerns — `Clock`, `WallClock`,
+`Cpu` (landed), then `Interrupts`, `Paging`, `Contexts` with associated types — plus the platform
+tag `Current` and static one-line forwards. The tag is `hal`'s own type and `arch/<arch>/`
+implements the traits *for* it, so the seam is a one-way `arch → hal` arrow and adds no cycle:
+`cargo xtask depgraph` measured **17 → 15** mutual pairs on S1 (`ARCHITECTURE.md` §6).
+
+**What it does not abstract, and must not.** The Linux ABI *is* the register layout:
+`user_regs_struct`, the signal frame, the `syscall`/`iretq` gate are x86_64 by definition (on
+aarch64 the same rows are `x0..x30`/`pc`/`pstate` behind `svc`). That stays in `arch/<arch>/`;
+wrapping it would be the private dialect `AGENTS.md` §4 rule 3 forbids. "No leakage" means a
+port writes `arch/<arch>/` and touches no shared file — not that a register frame becomes
+neutral.
+
+**Stages**, each its own commit and green alone (AGENTS §4 rule 7):
+
+| Stage | Contents | Status |
+|---|---|---|
+| S1 | `hal` + `Clock`/`WallClock`/`Cpu`/`Current`/forwards; the `arch::timer`/`rtc`/`idle`/`halt` spread rerouted | **landed** |
+| S2 | `Interrupts` (`Line`, `unmask`/`eoi`/`net_irq`): `serial`, `virtio/net`, `lapic` | open |
+| S3 | `Paging` (`Space` assoc, `MapFlags`/`Mapping` via `hal`, roots/switch/install/translate/`user_accessible`/`is_cow_page`/`write_user_u32`): `sched`, `mm`, `uaccess`, `main` | open |
+| S4 | `Contexts`/`UserFrame`: `Context`/`Fpu`/`UserFrame` become assoc types; the `SegmentSelector` and register-frame leak into `sched`/`syscall` ends | open |
+| S5 | close the door: `arch::x86_64` internals `pub(crate)`, reachable only through `hal`; a depgraph rule "no `crate::arch::` outside `arch`/`hal`/`main`" at 0 | open |
+
+S2–S4 touch the trap, page-fault and context-switch paths, so each needs the full QEMU gate,
+not host+clippy alone. S1 was pure re-routing — host tests, both clippy targets and the depgraph
+were the whole measurement, and its own reds (none) would have been a compile error, not a
+machine bug.
 
 ---
 

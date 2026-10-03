@@ -126,8 +126,8 @@ fn seed() -> [u8; 32] {
 
     // The boot instant and the tick counter, mixed one byte at a time so a
     // zero-filled stretch above is not left as zeroes.
-    let epoch = crate::arch::rtc::boot_epoch();
-    let ticks = crate::arch::timer::ticks();
+    let epoch = crate::hal::boot_epoch();
+    let ticks = crate::hal::ticks();
     let stamp = epoch ^ ticks.rotate_left(32);
     for (i, byte) in seed.iter_mut().enumerate() {
         let word = if i % 2 == 0 { epoch } else { ticks ^ stamp };

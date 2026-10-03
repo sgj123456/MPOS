@@ -1872,7 +1872,7 @@ pub fn spawn_service() {
 /// at instead of snapping to whole ticks - the tick still drives *when* the
 /// stack is polled, but no longer rounds what it measures.
 fn now() -> SmolInstant {
-    SmolInstant::from_millis(crate::arch::timer::since_boot_nanos() as i64 / 1_000_000)
+    SmolInstant::from_millis(crate::hal::since_boot_nanos() as i64 / 1_000_000)
 }
 
 /// Convert a raw IP protocol number to smoltcp's `IpProtocol` enum.

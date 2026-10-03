@@ -37,7 +37,14 @@ use anyhow::{Context, Result, bail};
 /// (`console.rs::active_grid` reading which console is on screen) became
 /// `console → term` and the `vfs <-> console` pair collapsed to a one-way edge —
 /// only one direction had to go. Was 18 before it.
-const BASELINE_MUTUAL_PAIRS: usize = 17;
+///
+/// **15 now**, on the HAL landing (S1): rerouting every `crate::arch::timer`/
+/// `rtc`/`idle`/`halt` call above the machine layer through `crate::hal` took
+/// `arch → console` and `arch → net` to zero (both modules still *name* `arch`,
+/// so each pair collapsed to a one-way edge). No pair was added in exchange:
+/// the platform tag is `hal`'s own type and `arch` implements the traits for
+/// it, so `arch → hal` is the only arrow between the two. Was 17 before it.
+const BASELINE_MUTUAL_PAIRS: usize = 15;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.
 ///

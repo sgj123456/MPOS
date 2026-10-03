@@ -36,8 +36,7 @@ fn fresh_ino() -> Ino {
 /// equivalent.
 #[cfg(target_os = "none")]
 fn now() -> u64 {
-    crate::arch::rtc::boot_epoch()
-        + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64
+    crate::hal::boot_epoch() + crate::hal::ticks() / crate::hal::TICK_HZ as u64
 }
 
 #[cfg(not(target_os = "none"))]

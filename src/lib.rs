@@ -70,6 +70,12 @@ pub mod drivers;
 /// crate, re-exported here so `crate::err` keeps resolving for every caller,
 /// while the crate itself cannot name the kernel and so cannot reach back up.
 pub use mpos_err as err;
+/// The hardware abstraction layer: the capability traits a machine implements
+/// and the forwards everything above asks it through (`src/hal/mod.rs`). Machine
+/// only, like `arch` itself - it exists so that nothing outside `arch`/`hal`
+/// names an architecture.
+#[cfg(target_os = "none")]
+pub mod hal;
 /// evdev's record window and its clients: which reader sees which event, and
 /// what a grab does to the answer. Its own leaf crate - the driver that fills
 /// the window needs a virtio ring and a clock, but the policy over it is

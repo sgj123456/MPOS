@@ -692,8 +692,8 @@ impl EvdevNode {
     /// input core overwrites, because the time an event happened is not a
     /// caller's to declare.
     pub fn inject(&self, event_type: u16, code: u16, value: i32) {
-        let since_boot = crate::arch::timer::since_boot_nanos();
-        let secs = crate::arch::rtc::boot_epoch() + since_boot / 1_000_000_000;
+        let since_boot = crate::hal::since_boot_nanos();
+        let secs = crate::hal::boot_epoch() + since_boot / 1_000_000_000;
         let usecs = (since_boot % 1_000_000_000) / 1_000;
 
         let mut record = [0u8; RECORD];

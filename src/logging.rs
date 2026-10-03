@@ -170,8 +170,8 @@ impl tracing::subscriber::Subscriber for ConsoleSubscriber {
 /// level, the target that spoke, the message, then any structured fields.
 #[cfg(target_os = "none")]
 fn render(metadata: &Metadata<'_>, fields: &FieldCollector) -> String {
-    let ticks = crate::arch::timer::ticks();
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let ticks = crate::hal::ticks();
+    let hz = crate::hal::TICK_HZ as u64;
     let mut line = alloc::format!(
         "[{:>5}.{:06}] {:>5} {}: {}",
         ticks / hz,

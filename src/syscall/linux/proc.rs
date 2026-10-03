@@ -1708,16 +1708,16 @@ fn sleep_for_timespec(req: usize, rem: usize, from_user: bool) -> isize {
     if total_ms == 0 {
         return 0;
     }
-    let ticks = (total_ms * crate::arch::timer::TICK_HZ as u64 / 1000).max(1);
-    let hz = crate::arch::timer::TICK_HZ as u64;
-    let deadline = crate::arch::timer::ticks().saturating_add(ticks);
+    let ticks = (total_ms * crate::hal::TICK_HZ as u64 / 1000).max(1);
+    let hz = crate::hal::TICK_HZ as u64;
+    let deadline = crate::hal::ticks().saturating_add(ticks);
     match crate::sched::block_until_deadline(|| false, deadline) {
         crate::sched::WaitEnd::Interrupted => {
             if rem != 0 {
                 if !buffer_ok(rem, 16, true, from_user) {
                     return err::EFAULT;
                 }
-                let left = deadline.saturating_sub(crate::arch::timer::ticks());
+                let left = deadline.saturating_sub(crate::hal::ticks());
                 let (sec, nsec) = abi::timespec_from_ticks(left, hz);
                 unsafe {
                     (rem as *mut i64).write_unaligned(sec);
@@ -2103,7 +2103,7 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
             return err::EINVAL;
         }
         let ms = sec.saturating_mul(1_000) + nsec / 1_000_000;
-        Some(crate::arch::timer::ticks() + ms as u64 * crate::arch::timer::TICK_HZ as u64 / 1_000)
+        Some(crate::hal::ticks() + ms as u64 * crate::hal::TICK_HZ as u64 / 1_000)
     } else {
         None
     };
@@ -2147,7 +2147,7 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
             crate::sched::exit(-(sig as isize));
         }
         if let Some(end) = deadline
-            && crate::arch::timer::ticks() >= end
+            && crate::hal::ticks() >= end
         {
             return err::EAGAIN;
         }
@@ -2787,7 +2787,7 @@ unsafe fn write_itimerval(at: usize, snapshot: Option<crate::sched::ItimerSnapsh
         Some(s) => (s.remaining_ticks, s.interval_ticks),
         None => (0, 0),
     };
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let hz = crate::hal::TICK_HZ as u64;
     // `{ it_interval, it_value }`, the same order the reader above uses.
     let words: [u64; 4] = [interval * 1000 / hz, 0, value * 1000 / hz, 0];
     unsafe {
@@ -2835,7 +2835,7 @@ pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
             Ok(pair) => pair,
             Err(e) => return e,
         };
-        let hz = crate::arch::timer::TICK_HZ as u64;
+        let hz = crate::hal::TICK_HZ as u64;
         (value_ms * hz / 1000, interval_ms * hz / 1000)
     };
     let new = if value_ticks == 0 {
@@ -2844,7 +2844,7 @@ pub(super) fn handle_setitimer(args: [usize; ARG_COUNT]) -> isize {
     } else {
         Some(crate::sched::ItimerState {
             interval_ticks,
-            deadline: crate::arch::timer::ticks() + value_ticks.max(1),
+            deadline: crate::hal::ticks() + value_ticks.max(1),
         })
     };
     let old = crate::sched::itimer_swap(which, new);
@@ -2874,13 +2874,13 @@ pub(super) fn handle_getitimer(args: [usize; ARG_COUNT]) -> isize {
 /// it - zero when no alarm was set.
 pub(super) fn handle_alarm(args: [usize; ARG_COUNT]) -> isize {
     let seconds = args[0] as u64;
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let hz = crate::hal::TICK_HZ as u64;
     let new = if seconds == 0 {
         None
     } else {
         Some(crate::sched::ItimerState {
             interval_ticks: 0,
-            deadline: crate::arch::timer::ticks() + (seconds * hz).max(1),
+            deadline: crate::hal::ticks() + (seconds * hz).max(1),
         })
     };
     match crate::sched::itimer_swap(crate::sched::ITIMER_REAL, new) {
@@ -3048,7 +3048,7 @@ pub(super) fn handle_timer_settime(args: [usize; ARG_COUNT], from_user: bool) ->
         let word = |n: usize| (new_ptr as *const i64).add(n).read_unaligned();
         (word(0), word(1), word(2), word(3))
     };
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let hz = crate::hal::TICK_HZ as u64;
     // `struct itimerspec` is `{ it_interval, it_value }` — the interval first.
     let interval_ticks = match abi::timespec_ticks(isec, insec, hz) {
         Ok(t) => t,
@@ -3061,7 +3061,7 @@ pub(super) fn handle_timer_settime(args: [usize; ARG_COUNT], from_user: bool) ->
     let deadline = if value_ticks == 0 {
         None
     } else {
-        Some(crate::arch::timer::ticks() + value_ticks)
+        Some(crate::hal::ticks() + value_ticks)
     };
     // The old state is read and replaced under one table borrow, so a caller
     // that arms and reads back in one call cannot see a state that never
@@ -3114,7 +3114,7 @@ pub(super) fn handle_timer_delete(args: [usize; ARG_COUNT]) -> isize {
 /// # Safety
 /// `at` must be a writable user address for 32 bytes, as the callers checked.
 unsafe fn write_itimerspec(at: usize, interval_ticks: u64, remaining_ticks: u64) {
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let hz = crate::hal::TICK_HZ as u64;
     let nsec_per_tick = 1_000_000_000 / hz;
     let split = |ticks: u64| (ticks / hz, (ticks % hz) * nsec_per_tick);
     let (isec, insec) = split(interval_ticks);
@@ -3138,8 +3138,8 @@ pub(super) fn handle_sysinfo(args: [usize; ARG_COUNT]) -> isize {
     if !buffer_ok(buf, SYSINFO_SIZE, true, true) {
         return err::EFAULT;
     }
-    let hz = crate::arch::timer::TICK_HZ as u64;
-    let ticks = crate::arch::timer::ticks();
+    let hz = crate::hal::TICK_HZ as u64;
+    let ticks = crate::hal::ticks();
     let stats = crate::mm::frame_stats();
     let page = 4096u64;
     unsafe {
@@ -3201,7 +3201,7 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     // REALTIME clocks. `since_boot_nanos` interpolates within the current tick
     // via the TSC, so a fast syscall reports a true sub-millisecond delta
     // instead of snapping to the 10 ms grid the tick counter alone gives.
-    let elapsed = crate::arch::timer::since_boot_nanos();
+    let elapsed = crate::hal::since_boot_nanos();
     let monotonic = matches!(
         clk_id,
         CLOCK_MONOTONIC
@@ -3214,7 +3214,7 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     let wall = if monotonic {
         0
     } else {
-        crate::arch::rtc::boot_epoch()
+        crate::hal::boot_epoch()
     };
     let secs = wall + elapsed / 1_000_000_000;
     let nsecs = elapsed % 1_000_000_000;
@@ -3243,8 +3243,8 @@ pub(super) fn handle_gettimeofday(args: [usize; ARG_COUNT]) -> isize {
     // gettimeofday has no monotonic variant - every caller wants the wall
     // clock, so the RTC anchor rides along here unconditionally. The TSC-
     // interpolated elapsed time gives a microsecond the 10 ms tick never could.
-    let elapsed = crate::arch::timer::since_boot_nanos();
-    let secs = crate::arch::rtc::boot_epoch() + elapsed / 1_000_000_000;
+    let elapsed = crate::hal::since_boot_nanos();
+    let secs = crate::hal::boot_epoch() + elapsed / 1_000_000_000;
     let usecs = (elapsed % 1_000_000_000) / 1000;
     unsafe {
         (tv as *mut i64).write_unaligned(secs as i64);
@@ -3450,8 +3450,8 @@ fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u6
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return Err(err::EINVAL);
     }
-    let hz = crate::arch::timer::TICK_HZ as u128;
-    let now_ticks = crate::arch::timer::ticks() as u128;
+    let hz = crate::hal::TICK_HZ as u128;
+    let now_ticks = crate::hal::ticks() as u128;
     let now_ns = now_ticks * 1_000_000_000 / hz;
     let target_ns = sec as u128 * 1_000_000_000 + nsec as u128;
     let delta_ns = if relative {
@@ -3459,7 +3459,7 @@ fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u6
     } else if realtime {
         // The wall clock is the boot epoch plus the tick counter, which is
         // exactly what clock_gettime(CLOCK_REALTIME) reports.
-        let wall_ns = crate::arch::rtc::boot_epoch() as u128 * 1_000_000_000 + now_ns;
+        let wall_ns = crate::hal::boot_epoch() as u128 * 1_000_000_000 + now_ns;
         target_ns as i128 - wall_ns as i128
     } else {
         // The monotonic clock *is* the tick counter.
@@ -3489,8 +3489,7 @@ fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u6
 /// through as well as returned, which is the shape the man page specifies.
 pub(super) fn handle_time(args: [usize; ARG_COUNT]) -> isize {
     let tloc = args[0];
-    let secs = crate::arch::rtc::boot_epoch()
-        + crate::arch::timer::ticks() / crate::arch::timer::TICK_HZ as u64;
+    let secs = crate::hal::boot_epoch() + crate::hal::ticks() / crate::hal::TICK_HZ as u64;
     if tloc != 0 {
         if !buffer_ok(tloc, 8, true, true) {
             return err::EFAULT;
@@ -3508,7 +3507,7 @@ pub(super) fn handle_time(args: [usize; ARG_COUNT]) -> isize {
 /// caller converting ticks to seconds divides by 100 and must get the same unit
 /// back from the kernel - otherwise its CPU arithmetic is off by `TICK_HZ/100`.
 fn clock_ticks_to_user_hz(ticks: u64) -> u64 {
-    ticks * 100 / crate::arch::timer::TICK_HZ as u64
+    ticks * 100 / crate::hal::TICK_HZ as u64
 }
 
 /// `times(buf)` — this process's CPU time, in clock ticks.
@@ -3522,7 +3521,7 @@ fn clock_ticks_to_user_hz(ticks: u64) -> u64 {
 /// unit, so `(utime+stime)/elapsed` is unit-correct.
 pub(super) fn handle_times(args: [usize; ARG_COUNT]) -> isize {
     let buf = args[0];
-    let elapsed = clock_ticks_to_user_hz(crate::arch::timer::ticks());
+    let elapsed = clock_ticks_to_user_hz(crate::hal::ticks());
     if buf == 0 {
         return elapsed as isize;
     }
@@ -3580,7 +3579,7 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
             (cu, cs)
         }
     };
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let hz = crate::hal::TICK_HZ as u64;
     unsafe {
         let put = |off: usize, ticks: u64| {
             ((usage + off) as *mut i64).write_unaligned((ticks / hz) as i64);
@@ -3625,7 +3624,7 @@ pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
         if !buffer_ok(res, 16, true, true) {
             return err::EFAULT;
         }
-        let hz = crate::arch::timer::TICK_HZ as u64;
+        let hz = crate::hal::TICK_HZ as u64;
         unsafe {
             (res as *mut i64).write_unaligned(0);
             ((res + 8) as *mut i64).write_unaligned((1_000_000_000 / hz) as i64);

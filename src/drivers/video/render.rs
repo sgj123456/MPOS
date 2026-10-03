@@ -559,11 +559,11 @@ fn task() {
         // has a writer parked in `write(2)` until its frame leaves, so pacing it
         // at the beat would make a 4 KiB write cost a frame and a screenful
         // cost a minute - which is what a `/dev/fb0` writer would have paid.
-        let now = crate::arch::timer::ticks();
+        let now = crate::hal::ticks();
         if !pending() && !jobs_pending() && now.saturating_sub(last_paint) < FRAME_TICKS {
             crate::sched::sleep_ticks(FRAME_TICKS - (now - last_paint));
         }
-        last_paint = crate::arch::timer::ticks();
+        last_paint = crate::hal::ticks();
 
         // Whatever the DRM layer asked the device to do, before anything that
         // paints: a caller parked in `job` is holding a system call open, and the

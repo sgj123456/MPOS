@@ -35,7 +35,7 @@ use critical_section::Mutex;
 use crate::arch::context::{self, Context, UserContext};
 use crate::arch::gdt;
 use crate::arch::paging::{self, AddressSpace};
-use crate::arch::{idle, timer};
+use crate::hal;
 use crate::mm::elf::{self, Image};
 use crate::mm::vm::{MapFlags, Mapping};
 use crate::mm::vma::{MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
@@ -1674,7 +1674,7 @@ impl Table {
         if !ITIMER_ARMED.load(Ordering::Relaxed) {
             return;
         }
-        let now = timer::ticks();
+        let now = hal::ticks();
         // Recomputed rather than trusted as "set": the one thing that can
         // disarm a timer without going through `itimer_swap` is a task exiting
         // while one is armed, and a flag that stayed set forever would cost the
@@ -1732,7 +1732,7 @@ impl Table {
         if !POSIX_TIMERS_ARMED.load(Ordering::Relaxed) {
             return;
         }
-        let now = timer::ticks();
+        let now = hal::ticks();
         // Step 1: what the scan needs about every task, without holding any
         // of them mutably. A signal queued in this pass is also tracked in
         // `fresh` below, so a second timer aiming at the same thread in the
@@ -1836,7 +1836,7 @@ impl Table {
         self.check_itimers();
         self.check_posix_timers();
         self.reap();
-        self.sched.advance(timer::ticks());
+        self.sched.advance(hal::ticks());
         let picked = self.sched.pick();
         picked.map(|id| self.enter(id))
     }
@@ -3072,20 +3072,20 @@ pub fn yield_now() {
 /// is what `timeout` reports as a kill that never happened, with the sleeper
 /// still on the machine afterwards.
 pub fn sleep_ticks(ticks: u64) {
-    let deadline = timer::ticks().saturating_add(ticks);
+    let deadline = hal::ticks().saturating_add(ticks);
     loop {
         if let Some(sig) = take_fatal_signal() {
             exit(-(sig as isize));
         }
-        if timer::ticks() >= deadline {
+        if hal::ticks() >= deadline {
             return;
         }
         schedule(|t| {
             // Read the clock here rather than trusting the scheduler's last
             // turn. This task may have been running for a while since then,
             // and a deadline computed from a stale clock wakes early.
-            t.sched.advance(timer::ticks());
-            if timer::ticks() >= deadline {
+            t.sched.advance(hal::ticks());
+            if hal::ticks() >= deadline {
                 t.requeue_current();
                 return;
             }
@@ -3093,7 +3093,7 @@ pub fn sleep_ticks(ticks: u64) {
             let priority = t.task(id).priority;
             // What is *left* of the wait, so a wake that was not the deadline
             // does not start the whole sleep over.
-            let remaining = deadline.saturating_sub(timer::ticks()).max(1);
+            let remaining = deadline.saturating_sub(hal::ticks()).max(1);
             t.sched.sleep(id, priority, remaining);
         });
     }
@@ -3251,11 +3251,11 @@ pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
         if with_table(|t| table_has_deliverable(t)) {
             return WaitEnd::Interrupted;
         }
-        if timer::ticks() >= deadline {
+        if hal::ticks() >= deadline {
             return WaitEnd::Deadline;
         }
         schedule(|t| {
-            let done = cond() || table_has_deliverable(t) || timer::ticks() >= deadline;
+            let done = cond() || table_has_deliverable(t) || hal::ticks() >= deadline;
             if done {
                 t.requeue_current();
             } else {
@@ -3264,8 +3264,8 @@ pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
                 // The deadline is absolute, the sleep's is relative: what is
                 // left of the wait is what the clock should run down, and a
                 // wake may still end it before that.
-                t.sched.advance(timer::ticks());
-                let remaining = deadline.saturating_sub(timer::ticks()).max(1);
+                t.sched.advance(hal::ticks());
+                let remaining = deadline.saturating_sub(hal::ticks()).max(1);
                 t.sched.sleep(id, priority, remaining);
             }
         });
@@ -5563,7 +5563,7 @@ pub fn exit(code: isize) -> ! {
             // machine's programs, and nothing to hand orphans to. The kernel
             // has no second init to start, so it says so and stops.
             crate::println!("INIT_EXITED: the system has no init left");
-            crate::arch::halt();
+            crate::hal::halt();
         }
         t.task_mut(id).exited = true;
         record_retired(id, code, t.task(id).trace.tracer);
@@ -7022,7 +7022,7 @@ pub fn itimer_swap(which: usize, new: Option<ItimerState>) -> Option<ItimerSnaps
         task.itimers[which] = new;
         old.map(|state| ItimerSnapshot {
             interval_ticks: state.interval_ticks,
-            remaining_ticks: state.deadline.saturating_sub(timer::ticks()),
+            remaining_ticks: state.deadline.saturating_sub(hal::ticks()),
         })
     })
 }
@@ -7033,7 +7033,7 @@ pub fn itimer_snapshot(which: usize) -> Option<ItimerSnapshot> {
         let state = t.task(t.current).itimers[which].as_ref()?;
         Some(ItimerSnapshot {
             interval_ticks: state.interval_ticks,
-            remaining_ticks: state.deadline.saturating_sub(timer::ticks()),
+            remaining_ticks: state.deadline.saturating_sub(hal::ticks()),
         })
     })
 }
@@ -7101,9 +7101,7 @@ pub fn timer_arm(slot: usize, interval_ticks: u64, deadline: Option<u64>) -> Opt
         let timer = task.timers.get_mut(slot)?.as_mut()?;
         let old = (
             timer.interval_ticks,
-            timer
-                .deadline
-                .map_or(0, |d| d.saturating_sub(timer::ticks())),
+            timer.deadline.map_or(0, |d| d.saturating_sub(hal::ticks())),
         );
         timer.interval_ticks = interval_ticks;
         timer.deadline = deadline;
@@ -7119,9 +7117,7 @@ pub fn timer_state(slot: usize) -> Option<(u64, u64)> {
         let timer = t.task(t.current).timers.get(slot)?.as_ref()?;
         Some((
             timer.interval_ticks,
-            timer
-                .deadline
-                .map_or(0, |d| d.saturating_sub(timer::ticks())),
+            timer.deadline.map_or(0, |d| d.saturating_sub(hal::ticks())),
         ))
     })
 }
@@ -7192,7 +7188,7 @@ pub fn deliver_pending_signal() {
 /// For a task with nothing left to do, and for the scheduler when the ready
 /// queue is empty.
 pub fn wait_for_interrupt() {
-    idle();
+    hal::idle();
 }
 
 /// The `#NM` (device-not-available) trap: a task used a floating-point

@@ -475,7 +475,7 @@ pub fn open_count() -> usize {
 /// `EINTR` (see [`Pty::push_master_backpressure`]).
 ///
 /// The context is a parameter now, because the thing this used to ask,
-/// `crate::arch::interrupts_enabled()`, is false in an interrupt handler *and*
+/// `crate::hal::interrupts_enabled()`, is false in an interrupt handler *and*
 /// inside every syscall - `MSR_FMASK` masks `IF` on `syscall` entry - so a
 /// userland write never parked and never met the bound at all, while a kernel
 /// task's did. `t-wait-eintr` measured it: a 96 KiB write to a slave whose

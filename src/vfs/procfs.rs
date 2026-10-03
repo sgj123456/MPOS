@@ -1419,8 +1419,8 @@ impl Inode for ProcConfig {
 /// these generators are unit-tested) has no ticks, and reports zero.
 #[cfg(target_os = "none")]
 fn uptime() -> (u64, u64) {
-    let ticks = crate::arch::timer::ticks();
-    let hz = crate::arch::timer::TICK_HZ as u64;
+    let ticks = crate::hal::ticks();
+    let hz = crate::hal::TICK_HZ as u64;
     (ticks / hz, (ticks % hz) * 100 / hz)
 }
 
