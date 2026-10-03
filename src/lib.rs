@@ -42,16 +42,16 @@
 //!   `boot`, `mm` (its pure half and the heap; the *dynamic* MMIO window -
 //!   `mm::map_mmio` - is x86_64's until stage 6, because it goes through
 //!   `hal::Paging`; the fixed window aarch64's devices are reached through is
-//!   `arch::aarch64::paging::DEVICE_VIRT`, and it is not this module's), `logging` (the level vocabulary; the subscriber writes to
-//!   a console only x86_64 has), `rand`, `sync`, `uevent`, and every `crates/*`
-//!   leaf.
+//!   `arch::aarch64::paging::DEVICE_VIRT`, and it is not this module's), `logging` (the level vocabulary; the subscriber writes to the console, now present on both machines), `rand`, `sync`, `uevent`, and every `crates/*`
+//!   leaf. `hal` joined them at stage 6f (both machines implement the baseline
+//!   concerns; x86's optional `Msi`/`SerialRing`/`FpuTrap`/`Segments` are gated),
+//!   and `console` at stage 4a (the serial sink is reached through `hal::Console`,
+//!   and the framebuffer + interrupt-TX-ring + scheduler-parking arms are
+//!   `#[cfg]`-inert on aarch64, whose console is the polled PL011).
 //! - **not on aarch64 yet**, and the two ways a module can be that:
 //!   - *machine-only modules that were already `target_os = "none"`* move to
-//!     `all(target_os = "none", target_arch = "x86_64")`. `console` and
-//!     `drivers` (stage 5), `hal` (its trait impls land with 1c's
-//!     `Interrupts`/`Cpu`, stage 2's `Contexts`, and `Paging`'s user-address-
-//!     space half at stage 6 - 1f supplied the table-building half) and `net`
-//!     (stage 6) are these.
+//!     `all(target_os = "none", target_arch = "x86_64")`. `drivers` (stage 5) and
+//!     `net` (stage 6) are these.
 //!   - *host-compiled modules* - `sched` (3), `vfs` (4), `syscall` (6) and
 //!     `uaccess` (6) - keep the host and x86_64 bare metal and exclude only the
 //!     aarch64 build, `any(not(target_os = "none"), target_arch = "x86_64")`.
@@ -92,9 +92,12 @@ pub use mpos_binfmt as binfmt;
 pub use mpos_blk as blk;
 pub mod boot;
 /// The log ring, serial, framebuffer switch and the six virtual consoles.
-/// x86_64's for now: it is the framebuffer and 16550 mux, and the aarch64
-/// console is a PL011 the kernel does not have outside `arch` until stage 4.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// Now compiled for both machines (stage 4a): the sink is reached through
+/// `crate::hal::Console` - the x86_64 16550/`SerialRing` and framebuffer paths and
+/// the scheduler-parking arm are `#[cfg]`-inert on aarch64, whose console is the
+/// polled PL011. A boot-observed aarch64 console marker waits on relocating the
+/// post-machine checks into `main` (`PLAN.md` §9.1's stage 4b gap).
+#[cfg(target_os = "none")]
 pub mod console;
 /// The process credential model: the four capability sets, the dumpable flag
 /// and `KEEPCAPS`. Its own pure leaf crate; the storage lives on the thread
@@ -240,13 +243,13 @@ pub use mpos_uts as uts;
 #[cfg(any(not(target_os = "none"), target_arch = "x86_64"))]
 pub mod vfs;
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(target_os = "none")]
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => ($crate::console::print_args(format_args!($($arg)*)));
 }
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(target_os = "none")]
 #[macro_export]
 macro_rules! println {
     () => ($crate::print!("\n"));
