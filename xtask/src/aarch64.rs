@@ -94,7 +94,8 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// marker and `M6_EL0_OK` came **out** of the list - leaving it in would stop the
 /// poll on a machine that still has init to run. Stage 7c's fix made the handoff
 /// actually schedule `/init` (waiting on `is_running`, not `has_live_child`), so the
-/// init now runs: its console banner and the `INIT_EXITED` its `exit_group` reaches
+/// init now runs: its `read(0)`/`write(1)` round trip (the `MPOS_INIT_SAW_INPUT`
+/// confirmation) and the `INIT_EXITED` its `exit_group` reaches
 /// via the scheduler are the terminal proof, and `INIT_EXITED` (not `M6_INIT_OK`,
 /// which now prints before the wait) is the last terminator.
 const TERMINATORS: [&str; 16] = [
@@ -197,11 +198,16 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         .filter(|(marker, _)| !log.contains(marker))
         .map(|(_, what)| *what)
         .collect();
-    // The init now performs a real `write(1, "MPOS_INIT_ON\n", 13)` through the
-    // syscall table - so a userspace program put bytes on the console, not merely
-    // left. Assert it reached the wire independently of the `M6_*` checks.
-    if !log.contains("MPOS_INIT_ON") {
-        bail!("the aarch64 init wrote nothing to the console: the MPOS_INIT_ON banner is absent");
+    // The init now does a `read(0, buf, 64)` (on a line the handoff queued on the
+    // tty) and, only after that read returns, a `write(1, "MPOS_INIT_SAW_INPUT\n")` -
+    // so its appearance proves a scheduler-run userspace program completed the
+    // interactive *read* syscall and wrote output, not merely that it ran. Assert it
+    // reached the wire independently of the `M6_*` checks.
+    if !log.contains("MPOS_INIT_SAW_INPUT") {
+        bail!(
+            "the aarch64 init never completed a read/write round trip: \
+             the MPOS_INIT_SAW_INPUT confirmation is absent"
+        );
     }
     if missing.is_empty() {
         println!();
@@ -209,8 +215,9 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
              M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
-             init's MPOS_INIT_ON banner, and INIT_EXITED - a scheduler-run userspace \
-             program wrote to the console and exited - from the ESP under AAVMF"
+             init's read/write confirmation (MPOS_INIT_SAW_INPUT), and INIT_EXITED - a \
+             scheduler-run userspace program read console input, wrote the console and \
+             exited - from the ESP under AAVMF"
         );
         return Ok(());
     }

@@ -131,14 +131,24 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     // `/init` is read from the ramfs and loaded as a task; it lands on pid 1.
     let init = vfs::read_file("/init").expect("the initramfs carries /init");
     let argv = vec![String::from("/init")];
+
+    // Queue a line on the tty before the init starts reading, so its `read(0,...)`
+    // returns real console input instead of blocking. This stands in for a person
+    // typing (which `cargo xtask run --arch aarch64` provides live, via the stage-7b
+    // input pump); at headless bring-up it lets boot-aarch64 prove the interactive
+    // *read* path reaches a userspace program, not just the kernel.
+    for &byte in b"echo-test\n" {
+        vfs::tty::global().receive_byte(byte);
+    }
+
     let pid = sched::spawn_init(&init, &argv, &[]).expect("the aarch64 init image loaded");
     assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1");
     mpos::println!("mpos: aarch64 machine handed to /init");
 
     // The image is loaded and queued, but it has not run yet - it runs only once
     // the boot task yields the CPU. `M6_INIT_OK` says the handoff put the program
-    // on pid 1; the proof it *executes* comes next, from the init's own console
-    // write (a banner) and its `exit_group`.
+    // on pid 1; the proof it *executes* comes next, from the init's own `read(0)`
+    // returning the queued line and its confirmation write reaching the console.
     mpos::println!("M6_INIT_OK");
 
     // Yield turns to the scheduler until the init has run and left. Waiting on

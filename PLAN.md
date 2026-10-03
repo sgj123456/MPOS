@@ -5634,6 +5634,22 @@ objective's core - "boots the kernel to a working userspace" - now genuinely dem
 end to end. The `/init` still exits one-shot; a typed shell needs a read-loop `/init` + a
 real shell binary (stage 7 continues), but the run-and-output path is proven.
 
+**Stage 7d is DONE: a scheduler-run userspace program completes the interactive `read`.**
+The hand-encoded `/init` now does `read(0, buf, 64)` and only *after that returns* a
+`write(1, "MPOS_INIT_SAW_INPUT\n", 20)` then `exit_group(0)` - sixteen `mov`/`movk`/`svc`
+words, all verified through the `llvm-objdump` encode/disassemble round trip. The boot
+queues a line (`echo-test\n`) on the tty before the handoff (the same receive path stage
+7b wired; `cargo xtask run --arch aarch64` supplies it live from typed input), so the
+init's `read` returns real console input. boot-aarch64 now shows, in order: `echo-test`
+(canonical tty echo of the queued input), `M6_INIT_OK`, `MPOS_INIT_SAW_INPUT` (the
+userspace `read(0)` syscall completed and the confirmation reached the wire through
+`syscall::dispatch`), and `INIT_EXITED`. That is the full interactive path - typed bytes
+in at EL0 via a userspace `read` syscall, output back out via a userspace `write` -
+demonstrated on the second machine. What remains for a typed *shell* rather than this
+read/echo proof: a `/init` that loops read/echo (or busybox `ash`, which additionally
+needs the aarch64 `execve`/`clone` return-frame path - the named stage-6D gap), then the
+`drivers` disk root and `net`.
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
