@@ -1836,17 +1836,21 @@ fn mount_new(
             }
         }
         // The kernel's own trees, by name.
+        #[cfg(not(target_arch = "aarch64"))]
         "proc" => crate::vfs::procfs::ProcFs::new(),
+        #[cfg(not(target_arch = "aarch64"))]
         "sysfs" => crate::vfs::sysfs::SysFs::new(),
         // A host share, served over 9p: the *source* is the mount tag the
         // host exported the share under - `mount -t 9p hostshare /mnt`
         // opens the device QEMU was told `-virtfs ...,mount_tag=hostshare`
         // for. An empty source takes the only share the bus has, which is
         // the same call the boot's own mount makes.
+        #[cfg(not(target_arch = "aarch64"))]
         "9p" => match crate::vfs::p9::mount(source) {
             Ok(fs) => fs,
             Err(e) => return err_of(e),
         },
+        #[cfg(not(target_arch = "aarch64"))]
         "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
         "devpts" => crate::vfs::devpts::DevPts::new(),
         "tmpfs" | "ramfs" => {
