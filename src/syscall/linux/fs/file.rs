@@ -30,11 +30,16 @@ use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X
 // any more, so a caller asks the node for its concrete type through
 // `dyn Inode::as_any` instead (`PLAN.md` §11.2 Step B1, V-1). Gated with the
 // modules they come from, which the host build does not compile.
-#[cfg(target_os = "none")]
+// `drivers` is a machine module, and its node types exist only on the machine
+// that carries the hardware. aarch64 has not been given that hardware yet (the
+// driver stage comes after the syscall stage), so these concrete types are
+// deferred here too; every use site below is gated the same way, and the socket
+// and device side effects fall to an honest no-op rather than a fake device.
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 use crate::drivers::drm::DrmCard;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 use crate::drivers::uinput::Uinput;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
 use crate::drivers::virtio::input::EvdevNode;
 
 /// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
@@ -327,7 +332,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 // description that will do the reading: Linux hands a client
                 // its own event buffer at `open`, so an event that arrives
                 // before the first read is still that client's to read.
-                #[cfg(target_os = "none")]
+                #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
                 if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
                     ev.opened(file.ofd());
                 }
@@ -1242,6 +1247,7 @@ pub fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
                 // still-open fd may even re-... - no: it cannot rebind;
                 // only the *name* retires. `unix::unbind_node` is a
                 // no-op for every other kind.
+                #[cfg(not(target_arch = "aarch64"))]
                 if child.metadata().kind == crate::vfs::NodeKind::Socket {
                     crate::net::unix::unbind_node(&child);
                 }
@@ -2992,6 +2998,36 @@ fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> i
 // nothing more.
 // ---------------------------------------------------------------------------
 
+/// The socket leg of `read`/`readv`: `recvfrom` with empty source slots is
+/// exactly `read`'s contract on a socket. `net` is a machine module that
+/// aarch64 has not been given yet (its driver stage follows this one), so on
+/// that machine no descriptor ever reports a socket handle - the call site's
+/// `socket_handle() != 0` is an arch-neutral `Inode` method that answers `0`
+/// there - and this helper's body is never reached. `ENOTTY` is the honest
+/// answer for the unreachable case; the `crate::net` forward exists only where
+/// the stack is compiled, so the routing is identical on the machines that have
+/// it and never invents a socket on the one that does not.
+#[cfg(not(target_arch = "aarch64"))]
+fn socket_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    crate::net::socket::handle_recvfrom(args, from_user)
+}
+#[cfg(target_arch = "aarch64")]
+fn socket_read(_args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    err::ENOTTY
+}
+
+/// The socket leg of `write`/`writev`: `sendto` with no destination is exactly
+/// `write`'s contract on a connected socket. Same deferral and same honest
+/// unreachable answer as [`socket_read`].
+#[cfg(not(target_arch = "aarch64"))]
+fn socket_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    crate::net::socket::handle_sendto(args, from_user)
+}
+#[cfg(target_arch = "aarch64")]
+fn socket_write(_args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    err::ENOTTY
+}
+
 /// `read(2)` — read up to `buf.len()` bytes from `fd` into `buf`.
 pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, buf, len) = (args[0], args[1], args[2]);
@@ -3010,7 +3046,7 @@ pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         .map(|file| file.inode().socket_handle() != 0)
         .unwrap_or(false);
     if is_socket {
-        return crate::net::socket::handle_recvfrom([fd, buf, len, 0, 0, 0], from_user);
+        return socket_read([fd, buf, len, 0, 0, 0], from_user);
     }
     if len == 0 {
         return match crate::vfs::read(fd as i32, &mut []) {
@@ -3042,7 +3078,7 @@ pub fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         .map(|file| file.inode().socket_handle() != 0)
         .unwrap_or(false);
     if is_socket {
-        return crate::net::socket::handle_sendto([fd, buf, len, 0, 0, 0], from_user);
+        return socket_write([fd, buf, len, 0, 0, 0], from_user);
     }
     if len == 0 {
         return match crate::vfs::write(fd as i32, &[]) {
@@ -3078,6 +3114,7 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         // which is what lets a compositor that was killed (or a test that closed
         // the device) leave the keyboard claimable instead of grabbing it from
         // beyond its own grave.
+        #[cfg(not(target_arch = "aarch64"))]
         if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
             ev.set_grab(false, file.ofd());
         }
@@ -3093,13 +3130,14 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         Ok(()) => {}
         Err(e) => return err_of(e),
     }
+    #[cfg(not(target_arch = "aarch64"))]
     crate::net::socket::close_last_socket(&file);
     crate::vfs::inotify::close_last(&file);
     // The evdev client's read position dies with the description too - and it
     // is asked *after* the close, where "last" is knowable: a `dup` is the same
     // reader and has to keep its place, so only the descriptor that took the
     // final reference forgets it.
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
     if Arc::strong_count(&file) == 1 {
         if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
             ev.forget(file.ofd());
@@ -3408,8 +3446,7 @@ pub fn handle_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             return err::EFAULT;
         }
         if is_socket {
-            let sent =
-                crate::net::socket::handle_sendto([fd as usize, ptr, len, 0, 0, 0], from_user);
+            let sent = socket_write([fd as usize, ptr, len, 0, 0, 0], from_user);
             if sent < 0 {
                 if total > 0 {
                     return total;
@@ -3473,8 +3510,7 @@ pub fn handle_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             return err::EFAULT;
         }
         if is_socket {
-            let got =
-                crate::net::socket::handle_recvfrom([fd as usize, ptr, len, 0, 0, 0], from_user);
+            let got = socket_read([fd as usize, ptr, len, 0, 0, 0], from_user);
             if got < 0 {
                 if total > 0 {
                     return total;
