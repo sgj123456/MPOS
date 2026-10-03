@@ -63,12 +63,21 @@ const RSP0_OFFSET: usize = 4;
 
 /// Where `interrupt_stack_table` sits in that same packed struct, in bytes from
 /// its own address: `reserved_1` (4) + `privilege_stack_table` (3 x 8 = 24) +
-/// `reserved_2` (4). Seven slots, `slot 0` being the hardware `IST1`.
+/// `reserved_2` (8). Seven slots, `slot 0` being the hardware `IST1`.
+///
+/// The 8 is measured rather than assumed, and the difference matters: written
+/// as 4 this constant put the array at 32, which is four bytes short of where
+/// `x86_64`'s `TaskStateSegment` actually has it (`reserved_2` is a `u64`, not
+/// a `u32`). A debug build caught that with the assertion in [`set_ist`] - it
+/// panicked at boot - while a release build, where the assertion is compiled
+/// out, quietly wrote the `#DF` stack over the last half of `reserved_2` and
+/// the first half of `IST1`, which is a last-resort stack the CPU would then
+/// load from a word that was never filled in.
 ///
 /// Same reason as [`RSP0_OFFSET`] for spelling it as an address instead of a
 /// field: the struct is `repr(C, packed(4))`, so a reference into it is not
 /// something the compiler will hand out.
-const IST_OFFSET: usize = 32;
+const IST_OFFSET: usize = 36;
 
 /// The two words the `syscall` entry needs before it has anything else: a
 /// kernel stack to push on, and somewhere to put a register while it gets
