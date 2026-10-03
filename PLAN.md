@@ -5503,6 +5503,29 @@ real stop/signal-frame/ptrace view still arrives with stage 6/7's `svc` gate +
 signal-frame ABI - only now `sched`/`vfs`/`uaccess` build without it, so the syscall
 stage lands on a machine whose scheduler already compiles.
 
+**Stage 6A's prep cut is DONE: the whole `syscall` module now compiles for aarch64.**
+Flipping `pub mod syscall`'s gate to include `aarch64` yields a clean
+`cargo clippy --target aarch64-unknown-none` (warnings only) with the x86 gate
+byte-identical (`cargo xtask test` still 142/142, host 511, boot-aarch64 twelve
+markers, depgraph within ratchet). The 101 errors the first flip measured resolved
+through ten `#[cfg(not(target_arch = "aarch64"))]` preps, each a provable no-op on
+host (x86_64) and x86 bare metal where the predicate is simply true. What is deferred,
+and why it is refused rather than faked: the socket arms and the `'K'`/`'V'`/`'E'`/`'U'`
+and `SIOC`/`FBIO`/DRM ioctl families fall to `ENOTTY`/`ENOSYS` (no `net`/`drivers` on
+this machine yet); `execve`/`ptrace`/`process_vm_*`/`rt_sig*`/`reboot`/`clone`/`fork`
+dispatch arms fall to `_ => ENOSYS` (they rewrite the x86 return frame, which arrives
+with the aarch64 signal-frame ABI); `arch_prctl` has no aarch64 number at all; the
+seccomp *filter* path (reads the x86 RIP) and the ptrace entry/exit stops and on-exit
+signal delivery in `linux_dispatch` are gated to their no-tracer/no-signal identity;
+and `uname`'s machine field and the hostname/domainname were moved to per-arch and the
+`uts` leaf so those always-live calls answer truthfully. The remaining stage-6A work is
+the per-arch `nr.rs` (arm64 is a *different syscall set* - no `open`/`stat`/`fstat`/
+`poll`/`select`/`fork` legacy numbers, and every shared number differs from x86) plus
+routing `arch/aarch64/vectors.rs`'s `el0_sync` `svc` into `linux_dispatch` on the
+aarch64 `UserFrame`, which is what makes the module *used* rather than merely built;
+the gate stays x86-only until that lands so no commit ships with `syscall` compiling
+but unreachable.
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
