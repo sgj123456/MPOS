@@ -34,6 +34,12 @@ pub mod gpu_ctrl;
 pub mod hal;
 #[cfg(target_arch = "x86_64")]
 pub mod input;
+/// The memory-mapped virtio transport, this machine's path to its devices. Only
+/// aarch64 has its virtio behind fixed MMIO windows; x86_64 reaches the same
+/// devices over a PCI BAR, so this is gated to aarch64 and is where its first
+/// driven device (virtio-rng, `PLAN.md` §9.1 stage 7) is opened.
+#[cfg(target_arch = "aarch64")]
+pub mod mmio;
 #[cfg(target_arch = "x86_64")]
 pub mod msix;
 #[cfg(target_arch = "x86_64")]
