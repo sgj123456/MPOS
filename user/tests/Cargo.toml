@@ -18,7 +18,8 @@
 # author's memory of it.
 #
 # `libc` is here for the calls `rustix` does not bind at all - today
-# `process_vm_readv`/`writev`, which `t-process-vm-libc` drives through
+# `process_vm_readv`/`writev` and `rt_sigtimedwait`, which
+# `t-process-vm-libc`/`t-rt-sigtimedwait` drive through
 # `libc::syscall` with the number from `libc::SYS_*`. That keeps the rule
 # above: the number comes from a maintained per-arch table rather than from
 # this repository's memory of it. It is not a second interface for calls

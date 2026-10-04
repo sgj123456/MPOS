@@ -5641,17 +5641,28 @@ pub fn exit(code: isize) -> ! {
             // The real SIGCHLD, not just the wake. A parent sitting in
             // `wait(2)` needs only the wake - the code it waits for is on
             // file here - but a parent waiting any other way (a futex, a
-            // handler of its own) is ended by the signal, and without it
-            // such a caller sleeps for ever: musl's waitpid blocks on a
-            // futex and lets its SIGCHLD handler do the waking. Queued only
-            // when a handler would run: SIGCHLD's default action ignores
-            // it, and a signal the parent has ignored must never become
-            // pending - Linux discards it as it is generated.
-            if t.task(parent)
+            // handler of its own, `sigtimedwait`) is ended by the signal, and
+            // without it such a caller sleeps for ever: musl's waitpid blocks
+            // on a futex and lets its SIGCHLD handler do the waking.
+            //
+            // Queued when a handler would run, *and* when the parent has
+            // SIGCHLD blocked - Linux's `sig_ignored()` discards a generated
+            // signal only if it is unblocked and ignored, and says outright
+            // that a blocked signal is never ignored. The second case is what
+            // a blocked `sigtimedwait`/`sigwait`/`signalfd` on SIGCHLD needs;
+            // without it a handler-less waiter hangs. Measured on Linux
+            // 7.2.8: a process with no handler that blocks SIGCHLD, forks,
+            // and calls `sigtimedwait` gets the signal back (`rc=17`,
+            // `si_code=1`, `si_pid` the child), where the handler-only rule
+            // used to leave it asleep for ever.
+            let sigchld_bit = signal::bit(signal::SIGCHLD);
+            let wants_sigchld = t
+                .task(parent)
                 .dispositions
                 .get(signal::SIGCHLD)
                 .is_handler()
-            {
+                || t.task(parent).blocked & sigchld_bit != 0;
+            if wants_sigchld {
                 let child_pid = t.task(id).tgid.0 as i32;
                 queue_signal(
                     t.task_mut(parent),

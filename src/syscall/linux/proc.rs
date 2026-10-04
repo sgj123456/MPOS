@@ -2092,22 +2092,37 @@ pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
 /// A NULL timeout waits forever; a zero one checks and answers `EAGAIN`.
 /// A fatal signal that arrives from *outside* the set still kills the waiter
 /// on each pass, exactly as `block_until` does for every blocking call.
-#[cfg(not(target_arch = "aarch64"))]
+///
+/// Served on both machines. Its gate was of the same stale kind as
+/// `process_vm_*`'s: everything it touches - the pending set, the blocked
+/// mask, the tick clock, the `siginfo_t` it fills in - is either the
+/// scheduler's or the generic ABI's, and the second machine's number table has
+/// named `RT_SIGTIMEDWAIT` (137 against x86_64's 128) all along. Nothing here
+/// consults a register frame, which is what the ptrace and signal-*handler*
+/// gates beside it are actually about.
 pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    /// The bytes of `siginfo_t` on x86_64.
+    /// The bytes of `siginfo_t`: 128 on both machines, because the structure
+    /// Linux reports a queued signal in is the generic `kernel_siginfo` -
+    /// `si_signo`/`si_errno`/`si_code` at 0/4/8, `si_pid`/`si_uid` at 16/20 and
+    /// the `union sigval` at 24 - and not one architecture's spelling of it.
     const SIGINFO_BYTES: usize = 128;
 
     let (set_ptr, info, timeout, sigsetsize) = (args[0], args[1], args[2], args[3]);
     if sigsetsize != 8 {
         return err::EINVAL;
     }
-    let mut wanted = 0u64;
-    if set_ptr != 0 {
-        if !buffer_ok(set_ptr, 8, true, from_user) {
-            return err::EFAULT;
-        }
-        wanted = unsafe { (set_ptr as *const u64).read_unaligned() };
+    // The set is not optional here, which is where this call parts company with
+    // `rt_sigprocmask`: that one reads a null set as "just report the mask I
+    // already have", while a wait has nothing to wait for without one. Linux
+    // copies the set in, so a null pointer is `EFAULT` there; so it is here,
+    // rather than being quietly read as an empty set.
+    if set_ptr == 0 {
+        return err::EFAULT;
     }
+    if !buffer_ok(set_ptr, 8, true, from_user) {
+        return err::EFAULT;
+    }
+    let wanted = unsafe { (set_ptr as *const u64).read_unaligned() };
     // The wire's set, converted to the kernel's mask arithmetic — the same
     // boundary `rt_sigprocmask` works at.
     let wanted = crate::sched::signal::from_wire(wanted)
