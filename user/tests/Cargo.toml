@@ -16,6 +16,13 @@
 # hands back a `Result` whose `Errno` is the one Linux defines - so a test
 # that says "this is EAFNOSUPPORT" is a claim about the ABI, not about the
 # author's memory of it.
+#
+# `libc` is here for the calls `rustix` does not bind at all - today
+# `process_vm_readv`/`writev`, which `t-process-vm-libc` drives through
+# `libc::syscall` with the number from `libc::SYS_*`. That keeps the rule
+# above: the number comes from a maintained per-arch table rather than from
+# this repository's memory of it. It is not a second interface for calls
+# `rustix` already names.
 [package]
 name = "mpos-user-tests"
 version = "0.1.0"
@@ -26,6 +33,7 @@ rustix = { version = "1", default-features = false, features = [
     "std",
     "all-apis",
 ] }
+libc = "0.2"
 
 # The binaries are named `t-<syscall>`, one per syscall family, so the test
 # run's output says which one is missing.

@@ -1219,7 +1219,16 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// argument vector. The pair of iovec arrays are in the *caller's* memory and
 /// the iovecs themselves name the two address spaces - local ones here, remote
 /// ones in the target.
-#[cfg(not(target_arch = "aarch64"))]
+///
+/// Served on both machines, and the gate it used to carry was stale: nothing
+/// here is x86_64's. It walks the two arrays ([`transfer_iovs`], always
+/// ungated), asks the scheduler for the target's address-space root
+/// ([`crate::sched::space_root_of`]) and the permission `PTRACE_ATTACH` would
+/// ask ([`crate::sched::may_inspect`]), and hands each chunk to
+/// [`crate::sched::read_user_of`]. The `ptrace` *handler* beside it stays
+/// gated because the x86 request numbers and `user_regs_struct` really are the
+/// architecture's; this pair is not that, and the aarch64 number table has
+/// named `PROCESS_VM_READV`/`PROCESS_VM_WRITEV` all along.
 pub(super) fn handle_process_vm_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (pid, local, local_count, remote, remote_count, flags) = (
         args[0] as isize,
@@ -1260,8 +1269,8 @@ pub(super) fn handle_process_vm_readv(args: [usize; ARG_COUNT], from_user: bool)
     }
 }
 
-/// The writing half: `process_vm_writev`.
-#[cfg(not(target_arch = "aarch64"))]
+/// The writing half: `process_vm_writev`. Served wherever the reading half is,
+/// for the same reason and with the same permission check.
 pub(super) fn handle_process_vm_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (pid, local, local_count, remote, remote_count, flags) = (
         args[0] as isize,

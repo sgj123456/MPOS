@@ -290,12 +290,15 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         nr::TKILL => proc::handle_kill(args),
         // `ptrace` and its bulk-memory relatives: one task observing another.
         // They are in `proc` because everything they need - the task table, the
-        // register frames, the stops - is the process machinery's.
+        // register frames, the stops - is the process machinery's. The bulk
+        // pair runs on both machines (it reaches the target's memory through
+        // the scheduler, not through a register frame); `ptrace` itself is
+        // still the first machine's, because its request numbers and the
+        // structure `PTRACE_GETREGS` fills are x86_64's, as are
+        // `rt_sigtimedwait`'s `siginfo_t` layout and `reboot`'s debug-exit port.
         #[cfg(not(target_arch = "aarch64"))]
         nr::PTRACE => proc::handle_ptrace(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
         nr::PROCESS_VM_READV => proc::handle_process_vm_readv(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
         nr::PROCESS_VM_WRITEV => proc::handle_process_vm_writev(args, from_user),
         #[cfg(not(target_arch = "aarch64"))]
         nr::RT_SIGTIMEDWAIT => proc::handle_rt_sigtimedwait(args, from_user),

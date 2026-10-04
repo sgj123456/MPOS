@@ -408,6 +408,7 @@ dependencies = [
 name = "mpos-user-tests"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustix",
 ]
 
