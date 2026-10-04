@@ -73,22 +73,29 @@ diagnostic = ["t-sh"]
 # shrink this group is to make the call work, not to edit a list of things nobody
 # runs (`PLAN.md` §13.4/§13.5).
 #
-# The socket family used to be here - eleven names, every one of them stopping at
-# `socket(2)` with ENOSYS because this machine had no stack. §13.4's flip gave it
-# one (the MMIO adapter the boot's `check_net` opens and hands to `net::init`),
-# and the whole family now runs: `t-socket`, `t-sockmsg`, `t-sockopt`, `t-tcp`,
-# `t-tcp-listen`, `t-udp-loopback` and `t-unix-rustix` all pass on aarch64,
-# including a TCP connect/accept/read-write round trip over the stack. What is
-# left is one reason, and it is the harness's rather than the ABI's.
+# It is empty, and empty is the state to keep it in rather than a reason to delete
+# the group: the mechanism stays because the day a call cannot be served is the day
+# a name belongs here, and an empty list says "nothing is left" more plainly than
+# an absent section says anything at all.
 #
-#   t-socketpair, t-stdspawn  their subject is *other programs*. `t-stdspawn`
-#                             runs /bin/true, /bin/echo, /bin/cat, /bin/false and
-#                             /bin/sh -c; `t-socketpair` runs /bin/cat. The
-#                             x86_64 harness has those because its test root is
-#                             an initramfs with busybox in /bin; the second
-#                             machine's root is the ext4 disk rootfs and has no
-#                             /bin at all. A gap in the harness, not in the
-#                             kernel's spawn path - which every program in this
-#                             payload exercises, since the runner starts each of
-#                             them through posix_spawn (clone + execve).
-aarch64 = ["t-socketpair", "t-stdspawn"]
+# Two families left it, both by making the call work:
+#
+#   * the socket family - eleven names, every one of them stopping at `socket(2)`
+#     with ENOSYS because this machine had no stack. §13.4's flip gave it one (the
+#     MMIO adapter the boot's `check_net` opens and hands to `net::init`), and the
+#     whole family now runs: `t-socket`, `t-sockmsg`, `t-sockopt`, `t-tcp`,
+#     `t-tcp-listen`, `t-udp-loopback` and `t-unix-rustix`, including a TCP
+#     connect/accept/read-write round trip over the stack.
+#
+#   * `t-socketpair` and `t-stdspawn`, whose subject is *other programs*
+#     (`t-stdspawn` runs /bin/true, /bin/echo, /bin/cat, /bin/false and
+#     /bin/sh -c; `t-socketpair` runs /bin/cat). That was a gap in the harness
+#     rather than in the ABI - the x86_64 root is an initramfs with busybox in
+#     /bin, and the second machine's ext4 root carried no /bin at all. It carries
+#     one now, built in-tree (`xtask/src/aarch64_bin.rs`), because the toolchain
+#     was already a prerequisite of this sweep whereas installing busybox would
+#     have put a network fetch inside the gate.
+#
+# What is left outside the machine is `external` above, and its reason is the
+# internet rather than this machine.
+aarch64 = []

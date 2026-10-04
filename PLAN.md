@@ -674,7 +674,7 @@ kernel and is answered (§9.1); next is the rest of stage 6, which is the ABI an
 the `AddressSpaceOps` that completes `hal` — not stage 5's drivers, which the
 same measurement puts behind `vfs` and so behind `hal` too)**
 - [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
-- [ ] **13 Machine-seam purity + aarch64 parity — 13.1 landed, 13.2–13.5 planned (§13)**
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.6 landed, 13.2 in progress (§13)**
   - [x] 13.1 `hal` is arch-neutral: its 14 `target_arch` gates became capability flags
         (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`)
         declared per target in `.cargo/config.toml`; `src/hal` `target_arch` is now 0, both
@@ -719,7 +719,7 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         a socket node, which is what `t-unix-rustix` measured (`EOPNOTSUPP` from
         `create(name, SOCK_FILE)`) before the mount. What the `aarch64` group still names is
         harness-only: `t-stdspawn`/`t-socketpair` run another program out of a `/bin` this
-        machine's root does not have
+        machine's root does not have — and 13.6 gave it one, so the group is empty now
   - [~] 13.5 `cargo xtask test --arch aarch64`: the **silent wrong-run is closed** —
         `test --arch aarch64` refuses explicitly (`test_sweep_machine`, pinned by an
         `mpos-xtask` unit test) instead of falling through to the x86_64 sweep and reporting a
@@ -771,6 +771,31 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         verdict outright rather than letting an unprepared machine read as failing tests.
         `--groups`/`--all-groups` stay refused for this arm: the file's vocabulary also names
         the `no_std` raw-syscall suite, which has no aarch64 port
+  - [x] 13.6 aarch64 `/bin`: **the harness gap closes and the second machine's own list is
+        empty**. The gap was never the ABI — `t-stdspawn` runs
+        `/bin/{true,false,echo,cat,sh}` and `t-socketpair` runs `/bin/cat`, while the
+        machine's ext4 root carried no `/bin` at all (the payload's own programs sit flat at
+        `/`). **The tools are built in-tree, not installed**: `xtask/src/aarch64_bin.rs` is
+        five applets of one multi-call binary, compiled by the
+        `rustc`/`aarch64-unknown-linux-musl` path the sweep's runner and its musl helper
+        already require. Installing busybox — the x86 harness's answer — would have put an
+        Alpine fetch *inside the aarch64 gate*, whose failure would read as a broken kernel;
+        keeping the gate's reds about the kernel is what `tests.toml`'s groups exist for. `sh`
+        is a small shell and its own comment says exactly which subset it implements
+        (`;`/newline separation, `'`/`"`/`\` quoting, `<`/`>`/`>>`/`>&N`, the
+        `echo`/`exit`/`cd`/`pwd` builtins, external programs by path or `PATH`) — honestly *not*
+        busybox — and it moves real descriptors instead of modelling them, because
+        `t-stdspawn` asserts the child put `captured-err` on **stderr**. The staging step also
+        learned the two things this needed: a payload name may carry a directory (the kernel's
+        tar unpacker already creates missing parents on demand) and every file it lays down is
+        mode 0755, which `mkfs.ext4 -d` preserves — without that `/bin` would land 0644 and
+        `execve` would answer `EACCES`. **Measured: the aarch64 sweep is
+        `=== SUMMARY pass=12 fail=0`**, `t-stdspawn`'s `output() captured both of the child's
+        streams` and `t-socketpair`'s `read back what the pair carried` among the passes; x86
+        is unchanged (`pass=142 fail=0`, the same 10 left out). `tests.toml`'s `aarch64` group
+        is **empty** and stays as an empty group - the mechanism is what names a gap, and the
+        day a call cannot be served is the day a name goes back in. What remains outside the
+        machine is `external`, and its reason is the internet
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
@@ -8355,7 +8380,7 @@ numbering they write down, and the real thing is what the run above shows.
 
 ---
 
-## Phase 13: Machine-seam purity and aarch64 parity — **13.1/13.3/13.4/13.5 LANDED, 13.2 IN PROGRESS**
+## Phase 13: Machine-seam purity and aarch64 parity — **13.1/13.3–13.6 LANDED, 13.2 IN PROGRESS**
 
 Phase 9.1 leaves the second machine short of the first in three named places, and Phase 11.4
 closed the `hal` *seam* without closing the `hal` *file*. `crate::arch` is named by no module
@@ -8379,15 +8404,16 @@ Top holders outside `src/arch/`: `sched/runtime.rs` 30 · `syscall/linux/mod.rs`
 `syscall/linux/fs/file.rs` 15 · `hal/mod.rs` 14 · `drivers/virtio/mod.rs` 13 ·
 `drivers/devices.rs` 12 · `console.rs` 10.
 
-**aarch64's remaining gap to x86_64** (§9.1): `net`'s live path and
-`cargo xtask test --arch aarch64` (a fuller shell — `ash`/`busybox` — is the third item); the
-disk root landed in 13.3. The
-boot already runs a scheduler-driven EL0 program, `execve`s, `clone`s and `wait4`s a child, and
-runs an unmodified static-musl binary to completion; virtio over MMIO already drives rng, blk
-(read *and* write) and net's TX probe. What is missing is the layer above those probes — a socket
-stack to run on the transport, whose seam is now in place — and a gate that boots the second machine
-instead of silently running the first: `xtask/src/main.rs` branches on `--arch` only for
-`Commands::Run`, so `test --arch aarch64` today runs x86_64 and reports its result.
+**aarch64's gap to x86_64** (§9.1) was three items beyond the disk root: `net`'s live path,
+`cargo xtask test --arch aarch64`, and the fuller userspace the spawn tests run from (the x86
+harness gets `ash`/busybox in its `/bin`). All four have landed — the disk root in 13.3, the stack
+in 13.4, the gate in 13.5, the `/bin` in 13.6. What the phase found on the way is that the machine
+already ran a scheduler-driven EL0 program, `execve`d, `clone`d and `wait4`d a child, and ran an
+unmodified static-musl binary to completion, while virtio over MMIO already drove rng, blk (read
+*and* write) and net's TX probe — so what was actually missing was the layer above those probes (a
+socket stack to run on the transport, whose seam is now in place) and a gate that boots the second
+machine instead of silently running the first, since `xtask/src/main.rs` branched on `--arch` only
+for `Commands::Run` and `test --arch aarch64` ran x86_64 and reported its result.
 
 **Stages** (13.1–13.2 are the purity thread, 13.3–13.5 the parity thread; each its own commit
 and green alone — AGENTS §4 rule 7):
@@ -8399,6 +8425,7 @@ and green alone — AGENTS §4 rule 7):
 | 13.3 | aarch64 disk root: the MMIO virtio-blk already read/write-verified (`M7_BLK_OK`) and the ext4 it mounts (`M7_FS_OK`) become the machine's root; `xtask` assembles the aarch64 disk from `rootfs.toml`'s geometry and the `rootfs/` tree | a boot marker that a rootfs *file* was read, not merely that an ext4 mounted | **landed** — the ext4 is registered as `vda`; `xtask` lays the `rootfs/` overlay and the init images on it; the machine pivots its root onto the disk (`/` = ext4, ramfs at `/oldroot`), re-mounts `/dev` and runs the disk's `/init` as pid 1 (`M7_DISK_OK`, `M7_ROOT_OK`), with the init's file lifecycle now running on ext4 |
 | 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *landed* — flipping `net`'s gate had cost **24** errors (16 the missing `smoltcp` dependency, 8 the PCI NIC, the PCI vsock device and the four `/proc/net` rows), which is why the cut was the seam first: `drivers::virtio` now carries the transport-neutral contracts `NetDevice`/`VsockDevice`, `net`/`net::vsock` hold `Arc<dyn …>` and name no transport, `VSOCK_PER_CONNECTION_BUFFER` moved beside the contract, and the `/proc/net` collector took `procfs`'s own gate rather than a new capability (with the gate opened by hand that was **0 errors**, was 8). The live path then landed with it: `mmio::MmioNet` is the MMIO adapter as a persistent `NetDevice` (the ring it posts stays posted, unlike the probe helpers it replaces), `check_net` opens it once and publishes it (`mmio::init_net_global`), `main/aarch64.rs`'s `init_net` hands that handle to `net::init` + `net::spawn_service` - the same pair x86_64 boots with - and prints `M8_NET_STACK_OK`, `lib.rs`'s gate is `target_os = "none"`, and both machines declare `mpos_net`. **Measured: the aarch64 sweep passes 10/10 staged programs**, including a TCP connect/accept/read-write round trip, UDP over the loopback and an `AF_UNIX` name - the round trip pinned by real EL0 programs (this job's pin), not a kernel hook. The flip also found three stale "`net` is x86_64's" gates in shared code (`close(2)`'s `close_last_socket` - a measured port leak: `t-socket`'s 34567 still held when `t-tcp` bound it - `unlink`'s `unix::unbind_node`, and `ioctl`'s two `ifreq_*` helpers, whose aarch64 arms answered `None` and made every interface ioctl `ENODEV`), and the harness's `/tmp` had to become a tmpfs like x86_64's, because an ext4 directory cannot hold a socket node (`t-unix-rustix`'s `bind` answered `EOPNOTSUPP` until it was). RX is polled, honestly: the service task's tick drives the device and nothing routes its GIC line yet |
 | 13.5 | `cargo xtask test --arch aarch64`: the sweep boots the second machine and reads its own `=== RUN/PASS/FAIL/SUMMARY`/`END` and `M*_OK` chain with x86's verdict (summary + QEMU exit). An unsupported `--arch` is an explicit error, never a silent run of the other machine | `cargo xtask test --arch aarch64` prints a green summary; x86 unchanged; `xtask` unit tests green | *landed, with its gaps named* — the silent wrong-run is closed: `test --arch aarch64` now refuses in `test_sweep_machine` (pinned by an `mpos-xtask` unit test) instead of falling through to `selftest::run_tests` and printing an x86_64 verdict under an aarch64 banner. The aarch64 sweep itself — the user programs built for aarch64, packed with a generated `/init` that runs `/bin/t-*`, booted under AAVMF and parsed by the same `=== RUN/PASS/FAIL/SUMMARY`/`END` reader — is the next cut, and its first prerequisite has landed: the musl user programs build for aarch64 under cargo at all now (`.cargo/config.toml` names `rust-lld` for `aarch64-unknown-linux-musl`; without it the host `ld` rejects the `--fix-cortex-a53-843419` rustc passes for the target, measured — 28 programs, static `ET_EXEC`, ~5.6 MB). **And the sweep itself is wired**: `test --arch aarch64` builds the second machine, packs a musl runner (`aarch64_init::build_sweep_init`) as `/init` beside those 28 programs, boots under AAVMF and reads the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol. Its first run is **red, with the reason located**: the runner's `posix_spawn` path takes an EL0 **write** fault (ESR `0x9200004f`, level-3 permission; address `0x3fadafe0`) at `pc 0x272d90`, which is inside the runner's own R+X segment — so the fault is in musl's spawn, not in a test — and the machine then loses its init (`INIT_EXITED`), so no summary is printed. **That fault is fixed**: the handler read `WnR` from `ESR_EL1` bit 7, but a Data Abort's `WnR` is bit 6 — so every fault looked like a *read*, and `resolve_cow_fault` (guarded by `is_write`) was never reached: an EL0 write to a copy-on-write page always ended in SIGSEGV. The evidence is the run's own fault line, `ESR 0x9200004f` (`DFSC 0xF`, level-3 permission) on a page the tables call `r--u` and `is_cow_page` calls copy-on-write, 16 bytes below `sp` — a `clone` child's first write. It survived this long because the machine's own fork check has its child only *read* its marker string and let the kernel do the writing, so no child ever wrote to a shared page. With bit 6 the run passes that point and reaches the next gap: two faults in the runner — a write to `0xffffffffffffff5c` (translation fault, level 1) and a read of `0x58` (level 2) — which is where the aarch64 ABI is still short. **Both were fixed, and the run now completes.** The second was the same class of omission: `prepare` reinstalled `task.tls` on every dispatch but never captured the outgoing task's *live* value — and aarch64's musl installs its TLS base with a direct `msr tpidr_el0`, with no syscall for the kernel to see, so the record went stale and the base was reset to 0 by the first context switch after a spawn (the runner faulted at `0xffffffffffffff5c`, NULL minus musl's `errno`/canary slot). Capturing on switch-out is what arm64 Linux does; x86_64 is unaffected because its base is an MSR only the kernel writes. **Measured now: all 14 programs run, `=== SUMMARY pass=0 fail=14`, `=== END`** — the *instrument* is whole, and what is left is the ABI itself. (A harness bug came with it: cargo's `.d` dep-info files start with `t-` and were staged as programs, reporting `exit=127`; the payload now requires the ELF magic, which is why the count is 14 and not 28.) **The same class struck again in the copy**: `spawn_copy`/`spawn_thread` inherited the *record* (`Task::tls`) instead of the base the parent was running with, so the sweep's first `posix_spawn` child — its parent having set its own base after its last dispatch, the record still saying 0 — ran with `TPIDR_EL0 = 0` and faulted at the same NULL-minus-`errno` address. arm64 Linux's `copy_thread` hands the child the parent's live `tp_value` when `CLONE_SETTLS` is absent, and both sites now ask the register instead (`running_tls`); measured, `t-rename` and `t-stdspawn` — the two that faulted — reach their own code and fail on the harness's missing `/tmp` rather than on the kernel. **The classification is done and the arm is green on what this machine can serve**: 3 of the 14 std-side programs run and pass (`t-rename`, `t-rmdir`, `t-stdargs` — `=== SUMMARY pass=3 fail=0`, exit 0) and the other 11 are named in `tests.toml`'s new `aarch64` group with their reasons. The file gained the rule that makes that honest rather than a global exclusion wearing a machine's name: **a group named after a machine belongs to that machine**, invisible to the other's sweep, so all 11 still run in x86_64's default sweep (pinned by a `mpos-xtask` unit test). Ten are the socket family (`socket`/`socketpair` answer ENOSYS here — measured: syscall 198/199, §13.4's flip is what closes them) and `t-stdspawn` is a harness gap (`/bin/true|echo|cat|false|sh`; the x86 harness has them from busybox, this machine's disk root has no `/bin`, while the kernel's spawn path is exercised by the runner on every program). Reaching three needed the machine setup the x86 `/init` does with busybox — the runner makes `/tmp` and passes `t-stdargs` the argv the x86 PATH lookup passes it — and a `=== SETUP_FAIL` line now refuses the verdict instead of letting an unprepared machine read as failing tests. `--groups`/`--all-groups` remain refused for this arm: the file's vocabulary also names the `no_std` raw-syscall suite, which has no aarch64 port |
+| 13.6 | aarch64 `/bin`: the programs `t-stdspawn`/`t-socketpair` start, built **in-tree** as five applets of one multi-call binary (`xtask/src/aarch64_bin.rs`) rather than installed from a distribution | both names leave `tests.toml`'s `aarch64` group and `cargo xtask test --arch aarch64` stays green; x86 unchanged | *landed* — the gap was the harness's, not the ABI's: `t-stdspawn` runs `/bin/{true,false,echo,cat,sh}` and `t-socketpair` runs `/bin/cat`, and this machine's ext4 root carried no `/bin` (the payload's own programs sit flat at `/`). **The choice that matters is build-or-fetch**: installing busybox — the x86 harness's answer, from Alpine — would put a network fetch *inside* the aarch64 gate, so a mirror outage would read as a broken kernel; the `rustc`/`aarch64-unknown-linux-musl` path the sweep's runner and musl helper already require builds these with no new prerequisite. `sh` is a small shell whose own comment states its subset (`;`/newline separation, `'`/`"`/`\` quoting, `<`/`>`/`>>`/`>&N`, the `echo`/`exit`/`cd`/`pwd` builtins, external programs by path or `PATH`) — honestly *not* busybox — and it moves **real descriptors** rather than modelling them, because `t-stdspawn` asserts the child put `captured-err` on stderr and reads both pipes. Two staging facts came out of it: a payload name may carry a directory (the kernel's `vfs::tar::unpack_into` creates missing parents on demand, so the archive needs no directory member) and every file the staging step lays down is mode **0755**, which `mkfs.ext4 -d` preserves — without it `/bin` lands 0644 and `execve` answers `EACCES`, a failure that reads as a broken program. **Measured: `=== SUMMARY pass=12 fail=0`** (12 of the 14 aarch64-built programs staged; the two left out, `t-stdresolve` and `t-udp`, are `external` for the internet's reason rather than this machine's), `t-stdspawn`'s `output() captured both of the child's streams` and `t-socketpair`'s `read back what the pair carried` among the passes, with x86 unchanged at `pass=142 fail=0`. The `aarch64` group is **empty** and stays as an empty group: the mechanism is what names a gap, and the day a call cannot be served is the day a name goes back in |
 
 **What the remaining 169 are, and why the count stops being the metric** (measured
 2026-10-04, after §13.1 and the six §13.2 slices; per-file totals: `syscall` 82, `drivers`
@@ -8420,12 +8447,13 @@ and lives in `arch/<arch>/` (§11.4) — "no leak" means a port writes `arch/<ar
 shared file, not that a register frame becomes neutral.
 
 **Where this lands**: status in §9.1 (parity) and §11.4 (purity); `ARCHITECTURE.md` §2/§3 in the
-same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1, 13.3,
-13.4 and 13.5 have landed**, and 13.2 is in progress — the parity thread of this phase is
-complete: the second machine boots its own disk root and runs the same network stack and socket
-syscalls over its own adapter, with the sweep green on everything it can serve and the rest named.
-The board's `9.1` line above is stale where it says "stages 3-8 remain" — §9.1's own status list is
-the truth.
+same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1 and
+13.3–13.6 have landed**, and 13.2 is in progress — the parity thread of this phase is complete: the
+second machine boots its own disk root, runs the same network stack and socket syscalls over its own
+adapter, and carries the `/bin` its spawn tests need, so the sweep is green on **everything it is
+supposed to serve** and `tests.toml`'s `aarch64` group is empty. What a red aarch64 sweep means is
+now entirely the kernel's. The board's `9.1` line above is stale where it says "stages 3-8 remain" —
+§9.1's own status list is the truth.
 
 ---
 

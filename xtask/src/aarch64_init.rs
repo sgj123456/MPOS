@@ -397,6 +397,15 @@ pub fn write_initramfs_entries(
     let mut names = Vec::new();
     for (name, bytes) in entries {
         let path = stage.join(name);
+        // A name may carry a directory: the payload's own programs sit flat at
+        // the archive root, but the tools the tests run live in `/bin`, and both
+        // cross as one list. The kernel's unpacker creates missing parents on
+        // demand (`vfs::tar::unpack_into`), so the archive needs no separate
+        // directory member - only the staging tree does.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
         std::fs::write(&path, bytes)
             .with_context(|| format!("Failed to write {}/{}", stage.display(), name))?;
         // Mark it executable. The kernel's ramfs keeps the mode the archive
@@ -443,8 +452,11 @@ pub fn write_initramfs_entries(
 /// polls for, exactly as `INIT_EXITED` is for `boot-aarch64`.
 ///
 /// The tests land on an ext4 the harness builds with `mkfs.ext4 -d`, which keeps
-/// the mode the staging step wrote, so the runner makes each program executable
-/// before it runs it rather than depending on that step to.
+/// the mode the staging step wrote. That step marks every file it lays down
+/// executable (`aarch64::stage_program`) - it has to, or `/bin`'s tools would land
+/// mode 0644 and answer `EACCES` at `execve` - and the runner re-marks each
+/// `/t-*` it starts anyway, so a program that will not run fails as itself
+/// rather than as a mode bit some other step forgot.
 ///
 /// It also does the part of the x86 `/init` that is not about running tests at
 /// all: the machine setup. `/tmp` is made, because two of the programs build a

@@ -23,6 +23,7 @@
 //! the log does not contain.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
@@ -162,6 +163,30 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
                 .with_context(|| format!("Failed to copy {}", entry.path().display()))?;
         }
     }
+    Ok(())
+}
+
+/// Lay one payload file on a staging tree, creating any directory its name
+/// carries and marking it executable.
+///
+/// The name may hold a directory: the payload's own programs sit flat at the
+/// disk root, while the tools `t-stdspawn` and `t-socketpair` run live in
+/// `/bin`. And the mode is set *here* because `mkfs.ext4 -d` copies what it
+/// finds: a file written mode 0644 lands on the disk non-executable, and
+/// `/bin/true` would then answer `EACCES` at `execve` - a failure that reads as
+/// a broken program rather than a staging step that forgot. The initramfs side
+/// records the same 0755 through `tar` (`aarch64_init::write_initramfs_entries`);
+/// the runner's own chmod of the `/t-*` it starts is older than both and stays
+/// as the belt it was written as.
+fn stage_program(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let path = root.join(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, bytes).with_context(|| format!("Failed to lay {name} on the aarch64 disk"))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("Failed to chmod +x {name} on the aarch64 disk"))?;
     Ok(())
 }
 
@@ -550,8 +575,20 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
 pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
     let (kernel, loader) = build(profile)?;
     let init = crate::aarch64_init::build_sweep_init(build_dir)?;
+    // The machine's `/bin`: the programs `t-stdspawn` and `t-socketpair` start.
+    // One multi-call image, staged under each name it answers to (`aarch64_bin`
+    // says why it is built in-tree rather than installed from a distribution).
+    let tools = crate::aarch64_bin::build(build_dir)?;
+    let tool_paths: Vec<String> = crate::aarch64_bin::APPLETS
+        .iter()
+        .map(|applet| format!("bin/{applet}"))
+        .collect();
     let built = build_user_tests_for_aarch64()?;
-    println!("user tests: {} aarch64 programs built", built.len());
+    println!(
+        "user tests: {} aarch64 programs built, plus /bin/{{{}}} for the tests that start other programs",
+        built.len(),
+        crate::aarch64_bin::APPLETS.join(",")
+    );
 
     // The check below is what keeps the naming honest. A gap has to be a program
     // this machine was asked about and could not serve; a name in its group that
@@ -602,11 +639,15 @@ pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
     println!();
 
     // The runner is `/init` on the disk (which is what the boot reads and spawns
-    // as pid 1) *and* in the initramfs, and the programs sit beside it. One
+    // as pid 1) *and* in the initramfs, and the programs sit beside it - the
+    // tests flat at the root, the `/bin` tools under their own directory. One
     // payload, both places: the ramfs is where they are before the root switch
     // and the ext4 is where they are after it, and the same list is a correct
     // answer on either side of that.
     let mut entries: Vec<(&str, &[u8])> = vec![("init", init.as_slice())];
+    for path in &tool_paths {
+        entries.push((path.as_str(), tools.as_slice()));
+    }
     for (name, bytes) in &tests {
         entries.push((name.as_str(), bytes.as_slice()));
     }
@@ -628,9 +669,16 @@ fn gaps_without_programs(
     machine: crate::config::Machine,
     built: &[String],
 ) -> Vec<String> {
-    config
-        .machine_tests(machine)
-        .into_iter()
+    missing_programs(&config.machine_tests(machine), built)
+}
+
+/// The gap names among `gaps` that `built` does not carry.
+///
+/// Split from the `TestConfig` lookup so the rule can be tested without a file:
+/// the shipped file's own group is empty today, and a rule that can only be
+/// exercised by a non-empty file would have no test on the day the file is right.
+fn missing_programs(gaps: &[(&str, &str)], built: &[String]) -> Vec<String> {
+    gaps.iter()
         .filter(|(_, test)| !built.iter().any(|name| name == test))
         .map(|(_, test)| test.to_string())
         .collect()
@@ -906,8 +954,7 @@ fn build_esp(
     // `/mnt/etc/inittab` out of it and reports the length, which this command
     // checks against the file in the tree.
     for &(name, bytes) in entries {
-        fs::write(staging.join(name), bytes)
-            .with_context(|| format!("Failed to lay {name} on the aarch64 disk"))?;
+        stage_program(&staging, name, bytes)?;
     }
     copy_tree(&crate::utils::project_root()?.join("rootfs"), &staging)?;
     let ext4 = build_dir.join("aarch64-ext4.img");
@@ -1189,40 +1236,38 @@ mod tests {
     use super::*;
     use crate::config::{Machine, TestConfig};
 
-    /// The gap check, against the repository's own file.
-    ///
-    /// The group is the second machine's list of what it cannot serve, and the
-    /// one way it rots quietly is a name the payload never builds: nothing in
-    /// the sweep would notice, because there is no program to leave out, and the
-    /// entry would read as a measured gap for ever. So a real gap passes and a
-    /// gap whose program is missing is named.
+    /// A gap whose program the payload does not build is a claim nothing in the
+    /// sweep can check: there is no program to leave out, so the entry would sit
+    /// in the file looking measured for ever. The rule is exercised on a list
+    /// that *has* gaps, because the shipped file's own list is empty - the state
+    /// the harness cut left it in - and a test must not need the file to be
+    /// wrong to run.
     #[test]
     fn a_named_gap_has_to_be_a_program_the_payload_builds() {
+        let gaps = [("aarch64", "t-gone"), ("aarch64", "t-here")];
+        let built = ["t-here".to_string(), "t-openat".to_string()];
+        assert_eq!(missing_programs(&gaps, &built), vec!["t-gone".to_string()]);
+        assert!(missing_programs(&gaps, &["t-here".to_string(), "t-gone".to_string()]).is_empty());
+
+        // And the repository's own file: the group exists and every gap it names
+        // is a program the payload carries. The payload is what `cargo` builds,
+        // which a unit test does not run; what it can check is that the arm's
+        // validation is consistent with the file it reads, and empty - the
+        // healthy answer - is a state this asserts as a property, not a count.
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask sits under the repository root");
         let config = TestConfig::load(&root.join("tests.toml")).unwrap();
         let machine = Machine::Aarch64;
-
+        assert!(
+            config.group_names(machine).contains(&"aarch64"),
+            "the second machine's gap group is gone rather than empty"
+        );
         let gaps: Vec<String> = config
             .machine_tests(machine)
             .into_iter()
             .map(|(_, test)| test.to_string())
             .collect();
-        assert!(!gaps.is_empty(), "the aarch64 group names nothing");
-        // The payload the arm really builds is exactly these plus the ones that
-        // run, so every name is present and the check is silent.
         assert!(gaps_without_programs(&config, machine, &gaps).is_empty());
-
-        // And the shape a stale entry takes: the file still names one, the
-        // payload no longer carries it. The member is taken from the file rather
-        // than spelled here, so this pin does not need editing when the group
-        // shrinks - which is the direction it is supposed to move.
-        let last = gaps.len() - 1;
-        let missing_one: Vec<String> = gaps[..last].to_vec();
-        assert_eq!(
-            gaps_without_programs(&config, machine, &missing_one),
-            vec![gaps[last].clone()]
-        );
     }
 }

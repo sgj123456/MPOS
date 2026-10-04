@@ -976,14 +976,16 @@ mod tests {
         // (which is what keeps its members in the default sweep there), and
         // every name in it must really be left out on the machine it names. The
         // loop is deliberately about *whatever the file lists*: the socket
-        // family was in this group until the second machine got a stack, and a
-        // pin that named those tests would have had to be edited on the day the
-        // group shrank - which is the day it should be shrinking.
+        // family was in this group until the second machine got a stack, and the
+        // spawn family until its harness got a `/bin`, and a pin that named those
+        // tests would have had to be edited on each of those days - which is the
+        // day it should be shrinking. Empty is a legitimate state, so there is no
+        // "the group names nothing" assertion here: the group's *presence* is
+        // what this checks, and the day a call cannot be served is the day a name
+        // comes back.
         assert!(config.group_names(Machine::Aarch64).contains(&"aarch64"));
         assert!(!config.group_names(X86).contains(&"aarch64"));
-        let gaps = config.machine_tests(Machine::Aarch64);
-        assert!(!gaps.is_empty(), "the aarch64 group names nothing");
-        for (group, test) in &gaps {
+        for (group, test) in &config.machine_tests(Machine::Aarch64) {
             assert_eq!(*group, "aarch64");
             let on_x86 = config.groups_of(test, X86);
             assert!(
