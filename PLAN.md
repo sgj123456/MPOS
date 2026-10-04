@@ -5885,19 +5885,21 @@ Named gaps the port carries rather than hides, each with its home:
   back-edge, so no new mutual pair - but the disk-root check is a candidate to move
   to the `main` wiring layer, where the initramfs root is already mounted.)
 
-  **Attempted next: the aarch64 `/dev` - blocked on a measured prerequisite.**
+  **Attempted next: the aarch64 `/dev` - the ordering it needs is the real gate.**
   Splitting `drivers/devices.rs` so `standard_devfs`' generic nodes compile on
   aarch64 (its x86-only device registrations gated into a `#[cfg]` block) built
   clean on both targets and left x86's devfs byte-for-byte the same; but a boot
-  `check_dev` that built the devfs and read `/dev/urandom` through it
-  **KERNEL-PANICed in `vfs/tty.rs` `vc()`** - `standard_devfs` registers the pty
-  virtual consoles (`tty1..6`), `ptmx`, and `tty0`, which run through the
-  console-multiplexer/pty subsystem that is x86-only and *not initialised* on this
-  polled machine (the deferred `vcmux`). So the aarch64 `/dev`, and therefore a
-  real shell's `/dev/tty` + job control, is gated on bringing up that pty/vc
-  subsystem first - it is the next prerequisite, not a one-commit gate-and-read.
-  The change was reverted to keep the tree green (no shipped panic, no stubbed
-  half-`/dev`); the split itself is sound and reusable once the subsystem lands.
+  `check_dev` that built the devfs and read `/dev/urandom` **KERNEL-PANICed in
+  `vfs::tty::global()`** ("ttys exist only after `vfs::tty::init()`") - the
+  console tty is registered late, during the init handoff, not at the early boot
+  milestone `check_dev` ran from. So the lesson is not a hard pty/`vcmux` wall but
+  an ordering one: `/dev` is built from a `tty` that only exists once the console
+  is up, so it must be mounted at init time (where a real shell would open it),
+  not checked as an early milestone - which is exactly the real-init/shell work
+  that is the stage's actual goal. The devfs split itself is sound and reusable;
+  the change was reverted to keep the tree green (no shipped panic, no stubbed
+  half-`/dev`), and bringing up `/dev` lands together with the runtime init that
+  mounts it and a shell that opens it.
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the
