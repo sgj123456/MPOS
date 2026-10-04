@@ -6036,28 +6036,31 @@ Named gaps the port carries rather than hides, each with its home:
   waits on the child itself). A real vfork must *share* the address space and hold the
   parent until the child execs; here the child instead gets a private copy while the
   parent keeps running and immediately writes its now-read-protected stack just below
-  `sp`. The earlier "which of two" open question is narrowed by reading the code: the
-  COW-split *math* branch is **eliminated** - `set_cow_bit_quietly` writes
-  `COW_BIT | AP_READ_ONLY` (`paging.rs:1237`) and `resolve_cow` checks `COW_BIT`, copies
-  to a fresh frame, restores `WRITE`, flushes (`paging.rs:1159-1192`), and the hand-encoded
-  `fork` (`0x11`) child exercises exactly that path and reaches EL0, so a hardened present
-  page does split. `spawn_copy` does a plain copy-on-write fork with **no `CLONE_VM`
-  special case and no parent suspension** (`runtime.rs:7407-7434`; comment at `7994`).
-  A naive "the child's `TTBR0` switch is never reloaded for the parent" theory is *not*
-  established either - plain fork also runs the child before the parent resumes and works,
-  so resume-reload evidently functions. What remains unconfirmed is why the *vfork* child
-  faults writing its stack at `parent_sp - 16` (a hole just below the copied stack, per the
-  measured `child_stack` above `parent_sp`) while the analogous plain-fork child does not:
-  the leading candidate is now an aarch64 child-side **stack-growth** resolution gap
-  (`resolve_stack_growth`'s window for the copied child space, or the permission bits of
-  the page it maps, differing from x86 where the same shared code works). Pinning it needs
-  one instrumented boot logging, at the vfork fault, the child's `stack_top`/rlimit window
-  and `is_cow_page`/`present` for the faulting address - which was *not* done here. This
-  gap blocks running a *subcommand* (a shell's core) from `cargo xtask run --arch aarch64`.
-  The fix was deliberately **not** attempted: `spawn_copy`, `clone`, `resolve_stack_growth`
-  and the aarch64 page-mapping path are the shared fork/mm machinery the x86 142-test gate
-  covers, and a wrong change there has wide blast radius ("nearly-right is worse than
-  absent"); it is also orthogonal to the static-busybox prerequisite above.
+  `sp`. The earlier hypotheses are now eliminated with evidence. (1) COW-split *math*:
+  `set_cow_bit_quietly` ORs `COW_BIT | AP_READ_ONLY` onto a user page whose `AP` is
+  `AP_EL0_RW (0b01)`, yielding `AP_EL0_RO (0b11)` - EL0 keeps read access, only writes
+  split (`paging.rs:92-98`, `1237`); `map_cow` maps the child copy `EL0_RO | COW_BIT`
+  (`1106-1124`); the hand-encoded `fork` child exercises that and reaches EL0. (2) "parent
+  `TTBR0` never reloaded after the child's turn": plain fork also runs the child first and
+  works, so resume-reload functions. (3) a stack-growth / `stack_top` window bug: the
+  `current_stack_range` value that looked far from `sp` is just the task's *kernel* stack
+  (`runtime.rs:5958`), not the user window.
+
+  One instrumented fault dump settles the actual shape: the fatal fault is a **read**
+  (`is_write=false`, `ESR` DFSC `0x0f` = level-3 **permission**) at `sp - 16`, and
+  `resolve_stack_growth` is reached with its `try_map` reporting the page **already mapped**
+  - so it is a permission fault on a *present* page, not a missing mapping or a hole. The
+  specific reason that one copied page denies the EL0 read was **not** pinned and needs one
+  more measurement: dump the faulting leaf's raw `AP`/`PXN`/`UXN` bits in the aarch64 path.
+  What matters for the eventual fix is its blast radius: that encoding lives in
+  `arch/aarch64/paging.rs`, which x86 does not compile, so a *confirmed* aarch64 paging fix
+  carries no x86 `cargo xtask test` regression - it is verified by `boot-aarch64` alone.
+
+  The fix was **not** attempted here because the exact defect is still unpinned; a guessed
+  change to the copy/permission path would be "nearly-right," which is worse than absent and
+  would defeat `fork` isolation if wrong. This blocks running a *subcommand* (a shell's
+  core) from `cargo xtask run --arch aarch64`, and is orthogonal to the static-busybox
+  prerequisite above.
 
   Reading further confirms the COW path is not the bug: `resolve_cow`'s split leaf
   (`VALID | TABLE | attributes(flags)`, `paging.rs`) is byte-for-byte the same encoding
