@@ -557,6 +557,16 @@ pub fn build_static_musl_helper(build_dir: &Path) -> Result<Vec<u8>> {
         "    }\n",
         "    let _ = std::fs::remove_file(\"/mtrunc\");\n",
         "    if tok { println!(\"MPOS_TRUNCATE_OK\"); } else { println!(\"MPOS_TRUNCATE_FAILED\"); }\n",
+        "    // memory-handler proof: a 1 MiB heap buffer. Past musl's malloc\n",
+        "    // threshold this is served by `mmap`, so writing one byte per page and\n",
+        "    // reading the pattern back exercises the anonymous/mmap demand-paging\n",
+        "    // path a running process depends on - the same region family the\n",
+        "    // posix_spawn child stack faults in, so this pins (or locates) it.\n",
+        "    let mut b = vec![0u8; 1024 * 1024];\n",
+        "    let mut i = 0usize;\n",
+        "    while i < b.len() { b[i] = (i / 4096) as u8; i += 4096; }\n",
+        "    let memok = b[0] == 0 && b[409600] == 100 && b[1044480] == 255;\n",
+        "    if memok { println!(\"MPOS_MEMORY_OK\"); } else { println!(\"MPOS_MEMORY_FAILED\"); }\n",
         "}\n",
     );
     let src = build_dir.join("aarch64-musl-helper.rs");

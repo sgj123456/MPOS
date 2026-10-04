@@ -5977,7 +5977,11 @@ Named gaps the port carries rather than hides, each with its home:
   `ftruncate` round-trip (write ten bytes, `set_len(4)` then `set_len(0)`, each
   confirmed by the stat length) prints `MPOS_TRUNCATE_OK` (asserted) - the `: >file`
   and `truncate` length handler, so a trim that left stale bytes or a stale length
-  would fail rather than pass.
+  would fail rather than pass. A **1 MiB heap buffer** (past musl's malloc threshold, so
+  served by `mmap`) written one byte per page and read back prints `MPOS_MEMORY_OK`
+  (asserted) - the anonymous/mmap demand-paging path proven from a running process, which
+  is a *memory* handler rather than a filesystem one, closing the last facet of the
+  "core fs/memory handlers" deliverable that was still only inferred from dispatch.
   This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.
@@ -6023,6 +6027,12 @@ Named gaps the port carries rather than hides, each with its home:
   shared address space, so `resolve_anon_fault` has no VMA to back it and
   `resolve_stack_growth` - which is bounded by the leader's `stack_top`/`stack_max`
   window - rejects it too. Neither the COW split nor a page-protection bug is involved.
+  A 1 MiB `mmap`-backed heap buffer written and read back from the *same* running process
+  now prints `MPOS_MEMORY_OK`, which rules out a general `mmap`/VMA breakage: anonymous
+  demand paging works fine from userspace, so the fault is specific to the region the
+  `clone`/`vfork` path hands the child at `request.child_stack` - a stack the caller
+  expects the kernel to have made valid, which this kernel does not back the way Linux
+  does for that flag combination.
 
   So the fix is *where the child's stack region comes from*: Linux requires a
   `clone`/`vfork` caller-provided stack to be valid mapped memory (musl `mmap`s a thread

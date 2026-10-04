@@ -402,6 +402,17 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_TRUNCATE_OK line is absent (set_len / the stat length it implies failed)"
         );
     }
+    // 1 MiB heap buffer - past musl's malloc threshold this is an `mmap`, so the
+    // marker proves the anonymous/mmap demand-paging path works from a live
+    // process (a memory handler, not only fs). It is also the counter-evidence
+    // that the spawn child-stack fault is *not* a general mmap/VMA breakage.
+    if !log.contains("MPOS_MEMORY_OK") {
+        bail!(
+            "the aarch64 musl binary could not exercise a 1 MiB mmap-backed heap \
+             buffer: the MPOS_MEMORY_OK line is absent (the mmap/anon demand-paging \
+             path a large allocation reaches failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -422,7 +433,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) and \
              round-tripped getcwd/chdir (MPOS_CWD_OK) and symlink/readlink \
              (MPOS_SYMLINK_OK) and mkdir/a nested file/rmdir (MPOS_MKDIR_OK) and \
-             rename/hard link (MPOS_RENAME_LINK_OK) and ftruncate (MPOS_TRUNCATE_OK) - \
+             rename/hard link (MPOS_RENAME_LINK_OK) and ftruncate (MPOS_TRUNCATE_OK) \
+             and a 1 MiB mmap-backed heap buffer (MPOS_MEMORY_OK) - \
              from the ESP under AAVMF"
         );
         return Ok(());
