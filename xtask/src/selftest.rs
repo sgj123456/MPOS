@@ -669,3 +669,46 @@ fn report(tests: &[UserTest], built: usize, log: &Path, status: Option<i32>) -> 
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The aarch64 user programs are built by cargo (rather than by the
+    /// hand-driven `rustc` that builds `boot-aarch64`'s `/musl` helper), so the
+    /// two facts the loader insists on have to be in the root `.cargo/config.toml`
+    /// for that target, and neither shows up as a compile error when it is
+    /// missing - a static flag dropped links a program the loader refuses, and a
+    /// linker dropped fails at the link step with an option the host `ld` does not
+    /// know. The x86_64 block carries the same shape for the same reason; this
+    /// pins the aarch64 one until the sweep that builds these programs is the
+    /// thing that would notice (`PLAN.md` §13.5).
+    #[test]
+    fn the_aarch64_user_programs_are_declared_static_and_linked_by_rust_lld() {
+        const HEADER: &str = "[target.aarch64-unknown-linux-musl]";
+        let config = std::fs::read_to_string(
+            crate::utils::project_root()
+                .unwrap()
+                .join(".cargo/config.toml"),
+        )
+        .expect("the root .cargo/config.toml must be readable");
+        // The target's own table: from its header to the next table. Taking the
+        // slice rather than searching the whole file is what keeps the x86_64
+        // block's identical flags from answering for the aarch64 one.
+        let start = config
+            .find(HEADER)
+            .expect("the aarch64 musl target must be declared")
+            + HEADER.len();
+        let rest = &config[start..];
+        let block = rest.split("\n[").next().unwrap();
+
+        assert!(
+            block.contains("+crt-static"),
+            "the aarch64 user programs must be static: the loader has no \
+             PT_INTERP support.\n{block}"
+        );
+        assert!(
+            block.contains("linker=rust-lld"),
+            "the aarch64 link must name rust-lld: the host `ld` rejects the \
+             `--fix-cortex-a53-843419` rustc passes for this target.\n{block}"
+        );
+    }
+}
