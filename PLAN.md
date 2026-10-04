@@ -674,6 +674,19 @@ kernel and is answered (§9.1); next is the rest of stage 6, which is the ABI an
 the `AddressSpaceOps` that completes `hal` — not stage 5's drivers, which the
 same measurement puts behind `vfs` and so behind `hal` too)**
 - [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1 landed, 13.2–13.5 planned (§13)**
+  - [x] 13.1 `hal` is arch-neutral: its 14 `target_arch` gates became capability flags
+        (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`)
+        declared per target in `.cargo/config.toml`; `src/hal` `target_arch` is now 0, both
+        bare-metal clippy targets and the depgraph are green
+  - [ ] 13.2 callers stop spelling the architecture: `target_arch` outside `src/arch/`
+        (250 today; 17 of them `lib.rs`'s module gates, which the target-gating rule keeps)
+  - [ ] 13.3 aarch64 disk root over the already read/write-verified MMIO virtio-blk
+        (`M7_BLK_OK`) and its ext4 (`M7_FS_OK`)
+  - [ ] 13.4 aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already
+        proven (`M8_NET_OK`)
+  - [ ] 13.5 `cargo xtask test --arch aarch64` boots the second machine; an unsupported
+        `--arch` errors rather than silently running the other one
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
@@ -8222,6 +8235,64 @@ numbering they write down, and the real thing is what the run above shows.
 
 ---
 
+## Phase 13: Machine-seam purity and aarch64 parity — **PLAN, 13.1 LANDED; 13.2–13.5 PLANNED**
+
+Phase 9.1 leaves the second machine short of the first in three named places, and Phase 11.4
+closed the `hal` *seam* without closing the `hal` *file*. `crate::arch` is named by no module
+outside `arch`/`hal`/`main`/`lib` — measured 2026-10-04: **0** code references, the depgraph's
+allow-list holds — but the machine is still named by `#[cfg(target_arch = …)]` in **250** places
+outside `src/arch/`, **14** of them inside `src/hal/mod.rs` itself. The shape to aim for is that
+above the machine layer nothing knows *which* machine it is, only what capabilities it has; and
+that the second machine reaches the same runtime surface as the first. Two threads, one plan,
+because the parity work is where the leaks are measured.
+
+**Measured starting state** (this tree, 2026-10-04):
+
+| What | Where | Count |
+|---|---|---|
+| `crate::arch` named in code, outside `arch`/`hal`/`main`/`lib` | — | **0** (the depgraph rule holds) |
+| `#[cfg(target_arch = …)]` outside `src/arch/` | all `src/**` | **250** (17 are `lib.rs`'s module gates) |
+| … inside `src/hal/` | `src/hal/mod.rs` | **14 at audit time → 0** (13.1) |
+
+Top holders outside `src/arch/`: `sched/runtime.rs` 30 · `syscall/linux/mod.rs` 29 ·
+`syscall/linux/fs/ioctl.rs` 26 · `syscall/linux/proc.rs` 23 · `lib.rs` 17 ·
+`syscall/linux/fs/file.rs` 15 · `hal/mod.rs` 14 · `drivers/virtio/mod.rs` 13 ·
+`drivers/devices.rs` 12 · `console.rs` 10.
+
+**aarch64's remaining gap to x86_64** (§9.1, unchanged): the `drivers` disk root, `net`, and
+`cargo xtask test --arch aarch64` (a fuller shell — `ash`/`busybox` — is the fourth item). The
+boot already runs a scheduler-driven EL0 program, `execve`s, `clone`s and `wait4`s a child, and
+runs an unmodified static-musl binary to completion; virtio over MMIO already drives rng, blk
+(read *and* write) and net's TX probe. What is missing is the layer above those probes — a disk
+root to mount, a socket stack to run on the transport — and a gate that boots the second machine
+instead of silently running the first: `xtask/src/main.rs` branches on `--arch` only for
+`Commands::Run`, so `test --arch aarch64` today runs x86_64 and reports its result.
+
+**Stages** (13.1–13.2 are the purity thread, 13.3–13.5 the parity thread; each its own commit
+and green alone — AGENTS §4 rule 7):
+
+| Stage | Contents | Pin | Status |
+|---|---|---|---|
+| 13.1 | `hal` becomes arch-neutral: the optional-capability forwards (`Msi`, `SerialRing`, `FpuTrap`, `Segments`) and the aarch64 `ConsoleInput` forward stop being `#[cfg(target_arch)]`-gated in `src/hal/mod.rs`. The gate is a capability flag the build declares per target (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`, in `.cargo/config.toml`'s `[target.…]` blocks beside each machine's linker script, listed for `check-cfg` in `Cargo.toml`), so the file names no architecture and a machine without a capability still does not get a faked method (rule 4) | **landed** — `src/hal` `target_arch` 14 → 0; both bare-metal clippy targets clean; host lib `511 passed`; depgraph `11/11` | *landed* |
+| 13.2 | The callers stop spelling the architecture: `console.rs`, `sched/runtime.rs`, `logging.rs`, `rand.rs`, `mm/{elf,heap}.rs` and the `syscall/**` gates express the machine difference through `hal` or the ABI layer instead of `target_arch`. The per-arch register/struct ABI facts (`user_regs_struct`, `struct stat`, the signal frame) move to their `arch/<arch>/` home — the §11.4 boundary, kept, not erased | host tests + full QEMU gate (trap/fault/context paths) | *planned* |
+| 13.3 | aarch64 disk root: the MMIO virtio-blk already read/write-verified (`M7_BLK_OK`) and the ext4 it mounts (`M7_FS_OK`) become the machine's root; `xtask` assembles the aarch64 disk from `rootfs.toml`'s geometry and the `rootfs/` tree | a boot marker that a rootfs *file* was read, not merely that an ext4 mounted | *planned* |
+| 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *planned* |
+| 13.5 | `cargo xtask test --arch aarch64`: the sweep boots the second machine and reads its own `=== RUN/PASS/FAIL/SUMMARY`/`END` and `M*_OK` chain with x86's verdict (summary + QEMU exit). An unsupported `--arch` is an explicit error, never a silent run of the other machine | `cargo xtask test --arch aarch64` prints a green summary; x86 unchanged; `xtask` unit tests green | *planned* |
+
+**Acceptance** (both threads together): the aarch64 gate is quotable with a summary line and exit
+code; `src/hal` names no architecture; `src/arch/` outside `lib.rs`'s module gates names no
+architecture; `cargo xtask depgraph` stays green with the `arch`-naming allow-list at zero. One
+deliberate exception stays named and is not work: the Linux register ABI is per-arch by definition
+and lives in `arch/<arch>/` (§11.4) — "no leak" means a port writes `arch/<arch>/` and edits no
+shared file, not that a register frame becomes neutral.
+
+**Where this lands**: status in §9.1 (parity) and §11.4 (purity); `ARCHITECTURE.md` §2/§3 in the
+same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1 has
+landed** (the `hal` capability flags); 13.2–13.5 are still a plan. The board's `9.1` line above is
+stale where it says "stages 3-8 remain" — §9.1's own status list is the truth.
+
+---
+
 ## Priority Summary
 
 | Phase | Effort | Impact | Blocks |
@@ -8238,6 +8309,7 @@ numbering they write down, and the real thing is what the run above shows.
 | **P10: Performance** | 10.1 done; rest ~3 weeks | High (10.2-10.3) / Medium (rest) | Interactive latency, throughput |
 | **P11: Architectural debt** | A done; B–C ~3–5 weeks; D–G ~1 week | High (maintainability) — the number was 22 mutual module pairs, and Step A took it to 21 | Every later phase: nothing can be tested or refactored in isolation (§11) |
 | **P12: ABI truthfulness** | gate restore ~days; Group A ~2 days; Group B ~1–2 weeks | High (correctness) — nine accepted-but-false answers, none recorded until now | Programs that trust a false success (§12) |
+| **P13: Machine-seam purity + aarch64 parity** | estimate: purity 13.1–13.2 ~2–4 weeks; parity 13.3–13.5 the aarch64 ladder | High (the second machine becomes usable) / Medium (maintainability) | A third port (§9.2 RISC-V): every `target_arch` outside `arch/` is a file a port must edit (§13) |
 
 **Recommended order**: P1 -> P2 -> P3 -> P4 -> P5 -> P6 -> P7 -> P8 -> P9
 

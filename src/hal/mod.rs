@@ -27,7 +27,10 @@
 //! `FpuTrap`, `Segments`) for the ways one machine does something another has no
 //! hardware for; a port implements the baseline it must and only the capabilities
 //! it has, so an absent capability is *absent* rather than a method every machine
-//! has to fake an answer for.
+//! has to fake an answer for. Which of them a build has is a `mpos_*` flag
+//! declared per target in `.cargo/config.toml`, never an architecture name - the
+//! forwards below say `#[cfg(mpos_msi)]`, never a machine name, so this file
+//! itself knows no architecture.
 //!
 //! # What this does not abstract, and must not
 //!
@@ -337,8 +340,13 @@ pub trait Console {
 /// actually has (`AGENTS.md` §4 rule 4: refuse rather than approximate), so a
 /// capability is expressible as *absent* rather than as a method every machine
 /// must answer. `crate::Platform` names only the baseline concerns; these are
-/// reached through their own forwards, which are gated to the machine that
-/// implements them.
+/// reached through their own forwards, each gated on a `mpos_*` capability flag
+/// the build declares for the target (`mpos_msi`, `mpos_serial_ring`,
+/// `mpos_fpu_trap`, `mpos_segments`, `mpos_console_input` - the sets are in
+/// `.cargo/config.toml`'s `[target.…]` blocks, beside each machine's linker
+/// script). The gate names the capability, never the architecture, so this file
+/// contains no machine name: a port declares the set it has where it already
+/// declares its script.
 /// ---------------------------------------------------------------------------
 
 /// Message-signalled interrupt delivery: the local APIC page a PCI device maps
@@ -724,16 +732,17 @@ pub fn eoi(line: Line) {
 
 /// Bring up message-signalled delivery before a device arms MSI-X.
 ///
-/// Gated to the machine that has an MSI controller; a `virt`+GIC aarch64 build
-/// has none and does not emit this (`hal::Msi`).
-#[cfg(target_arch = "x86_64")]
+/// Present only where the build declares the [`Msi`] capability (`mpos_msi`,
+/// set per target in `.cargo/config.toml`); a `virt`+GIC machine declares none
+/// and this does not exist for it.
+#[cfg(mpos_msi)]
 #[inline]
 pub fn init_message_signalled() {
     <Current as Msi>::init_message_signalled()
 }
 
 /// The MSI-X vector the network adapter's message-table entry must carry.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_msi)]
 #[inline]
 pub fn net_msi_vector() -> u8 {
     <Current as Msi>::net_msi_vector()
@@ -844,14 +853,14 @@ pub type UserFrame = <Current as Contexts>::UserFrame;
 pub const FPU_BYTES: usize = <Current as Contexts>::FPU_BYTES;
 
 /// Whether the FPU's state is live in the registers right now.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_fpu_trap)]
 #[inline]
 pub fn fpu_trapped() -> bool {
     <Current as FpuTrap>::fpu_trapped()
 }
 
 /// Save the live FPU registers into a task's state.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_fpu_trap)]
 #[inline]
 pub unsafe fn save_live_fpu(state: &mut Fpu) {
     // SAFETY: the caller's contract, passed through unchanged.
@@ -859,7 +868,7 @@ pub unsafe fn save_live_fpu(state: &mut Fpu) {
 }
 
 /// Load a task's FPU state into the registers.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_fpu_trap)]
 #[inline]
 pub unsafe fn restore_fpu(state: &Fpu) {
     // SAFETY: as above.
@@ -867,7 +876,7 @@ pub unsafe fn restore_fpu(state: &Fpu) {
 }
 
 /// Take ownership of the live FPU registers for the current task.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_fpu_trap)]
 #[inline]
 pub unsafe fn claim_live_fpu() {
     // SAFETY: as above.
@@ -875,7 +884,7 @@ pub unsafe fn claim_live_fpu() {
 }
 
 /// Give the FPU back to "no task owns it".
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_fpu_trap)]
 #[inline]
 pub unsafe fn reset_live_fpu() {
     // SAFETY: as above.
@@ -930,7 +939,7 @@ pub unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
 }
 
 /// The `cs`/`ss` a ring-3 frame carries on this machine.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_segments)]
 #[inline]
 pub fn user_segments() -> (usize, usize) {
     <Current as Segments>::user_segments()
@@ -938,8 +947,9 @@ pub fn user_segments() -> (usize, usize) {
 
 // ---------------------------------------------------------------------------
 // The console sink. `Console` is baseline (both machines implement it); the
-// `SerialRing` queue-and-park path is x86_64's, gated like the other optional
-// capabilities so a polled machine never names methods it does not have.
+// `SerialRing` queue-and-park path and the polled `ConsoleInput` receiver are
+// optional capabilities, each forward gated on the `mpos_*` flag the build
+// declares for it, so a machine without one neither has the method nor names it.
 // ---------------------------------------------------------------------------
 
 /// Bring the console sink up.
@@ -963,37 +973,38 @@ pub fn console_interrupt_driven() -> bool {
 }
 
 /// How many bytes the transmit ring has room for right now.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_serial_ring)]
 #[inline]
 pub fn serial_tx_space() -> usize {
     <Current as SerialRing>::tx_space()
 }
 
 /// Copy as much of `bytes` as the ring will take, returning the count.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_serial_ring)]
 #[inline]
 pub fn serial_tx_submit(bytes: &[u8]) -> usize {
     <Current as SerialRing>::tx_submit(bytes)
 }
 
 /// Join this task to the ring's wait list before parking on it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_serial_ring)]
 #[inline]
 pub fn serial_tx_wait_now() {
     <Current as SerialRing>::tx_wait_now()
 }
 
 /// Leave the ring's wait list.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_serial_ring)]
 #[inline]
 pub fn serial_tx_stop_waiting() {
     <Current as SerialRing>::tx_stop_waiting()
 }
 
 /// Poll the console receiver for one typed byte (`None` when the FIFO is empty).
-/// AArch64's polled input path; x86_64 feeds input from the serial interrupt and
-/// so is not a `ConsoleInput`, hence this forward is gated to the one machine.
-#[cfg(target_arch = "aarch64")]
+/// Present only where the build declares the polled [`ConsoleInput`] capability
+/// (`mpos_console_input`); a machine that feeds input from an interrupt has no
+/// receiver to poll and this does not exist for it.
+#[cfg(mpos_console_input)]
 #[inline]
 pub fn console_poll_input() -> Option<u8> {
     <Current as ConsoleInput>::poll_input()
@@ -1001,7 +1012,7 @@ pub fn console_poll_input() -> Option<u8> {
 
 /// Put one byte into the receiver through the UART's loopback, for the bring-up
 /// read-path self-test only.
-#[cfg(target_arch = "aarch64")]
+#[cfg(mpos_console_input)]
 #[inline]
 pub fn console_inject_input(byte: u8) {
     <Current as ConsoleInput>::inject_input(byte)

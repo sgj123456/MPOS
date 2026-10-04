@@ -153,3 +153,18 @@ lto = "thin"
 # ESP. Stripping costs nothing here: a conformance test either prints its
 # verdict or it does not, and nobody debugs it through a symbol table.
 strip = true
+
+# The capability flags `crate::hal` gates its optional forwards on
+# (`src/hal/mod.rs`). Each machine declares the set it has in its own
+# `[target.…]` block in `.cargo/config.toml`, so `hal` names no architecture -
+# it asks whether the build has a capability. Declaring them here is what keeps
+# `--cfg mpos_…` from tripping the `unexpected_cfgs` lint, and it is the one
+# place the full vocabulary is listed.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(mpos_msi)",
+    "cfg(mpos_serial_ring)",
+    "cfg(mpos_fpu_trap)",
+    "cfg(mpos_segments)",
+    "cfg(mpos_console_input)",
+] }

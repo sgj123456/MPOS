@@ -18,18 +18,31 @@ target = "x86_64-unknown-none"
 # vector state in use anywhere in the kernel, and no red zone for an interrupt
 # to land on. Adding `+soft-float` here would be rejected anyway - rustc does
 # not accept it through -Ctarget-feature.
+#
+# The `mpos_*` flags are the capabilities this machine declares to `crate::hal`
+# (`src/hal/mod.rs`): the local APIC's message-signalled delivery, the 16550's
+# interrupting transmit ring, the x87 lazy-FPU trap, and segment selectors.
+# `hal` forwards each under `#[cfg(mpos_…)]` and names no architecture; the
+# machine-to-capability mapping lives here, beside the linker-script path that
+# is this file's other per-machine fact. A port declares its own set in its own
+# `[target.…]` block, which it already needs for its script.
 rustflags = [
     "-C", "relocation-model=pic",
     "-C", "link-arg=--script=src/arch/x86_64/linker.ld",
     "-C", "link-arg=-pie",
     "-C", "link-arg=-ztext",
     "-C", "link-arg=-zmax-page-size=0x1000",
+    "--cfg", "mpos_msi",
+    "--cfg", "mpos_serial_ring",
+    "--cfg", "mpos_fpu_trap",
+    "--cfg", "mpos_segments",
 ]
 
 # The aarch64 kernel, built the way the x86_64 one is and for the same reason:
 # `mpos-boot` reads it as a static PIE, so `pic` and `-pie` for the relocations
 # and `-ztext` to refuse any of them landing in a read-only segment. The two
-# machine blocks differ in the script they name and in nothing else.
+# machine blocks differ in the script and the capability flags they name, and
+# in nothing else.
 #
 # There used to be a `[target.aarch64-unknown-none]` block here naming a script
 # that had never existed, so it described a target that could not link and was
@@ -38,6 +51,11 @@ rustflags = [
 # the `-kernel` bring-up, which linked the image at the fixed address QEMU
 # loaded it at. The loader places the segments itself now, so the image has to
 # be relocatable and this block matches the x86_64 one.
+#
+# This machine's capability set is one flag: its PL011 receiver is polled (the
+# GIC RX line is a later cut), so `hal::ConsoleInput` is present here and absent
+# on x86_64. It has no MSI controller, no lazy FPU trap and no segment
+# selectors, so it declares none of the x86_64 flags.
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=pic",
@@ -45,6 +63,7 @@ rustflags = [
     "-C", "link-arg=-pie",
     "-C", "link-arg=-ztext",
     "-C", "link-arg=-zmax-page-size=0x1000",
+    "--cfg", "mpos_console_input",
 ]
 
 # The user programs: ordinary Rust binaries for musl, which is the libc this

@@ -229,7 +229,10 @@ capabilities its hardware actually has, so `arch → hal` is the only arrow betw
 everything above the machine layer calls `crate::hal`'s forwards rather than naming `arch` — which
 makes `src/arch/mod.rs` a facade of four items and its submodules `pub(crate)`. An absent
 capability is *absent* (the aarch64 `Current` simply is not an `Msi`/`FpuTrap`/`Segments`), not a
-method every machine must fake an answer for (`AGENTS.md` §4 rule 4). The register ABI — the
+method every machine must fake an answer for (`AGENTS.md` §4 rule 4). Which capabilities a build has is
+a `mpos_*` flag declared per target in `.cargo/config.toml` (beside each machine's linker script, listed
+for `check-cfg` in `Cargo.toml`), so the forwards' `#[cfg]` gates name the capability and never the
+architecture — `src/hal/mod.rs` contains no machine name at all (`PLAN.md` §13.1). The register ABI — the
 `syscall` gate, the trap frame, `user_regs_struct` — is per-arch *by definition* and stays in
 `arch/`; wrapping it in a neutral type would be the private dialect rule 3 forbids, so a port writes
 `arch/<arch>/` and edits no shared file (`PLAN.md` §9.1).
