@@ -23,6 +23,27 @@
 //!
 //! The same reason is why `SPSR_EL1` is not read: the condition flags the
 //! interrupted code left are already in it, and `eret` is what puts them back.
+//!
+//! What is saved *additionally* for a trap from EL0 - and why. The rule above
+//! is the ABI's rule for a call, and it holds only for code that agreed to be
+//! called. A program did not: it is interrupted wherever it stands, so an
+//! interrupt or a system call that lands on it has to give back everything it
+//! was using, the *caller-saved* registers included. The integer half is
+//! already there - the sync stub saves all thirty-one - but the floating-point
+//! half was not, and on this machine that is a real loss rather than a
+//! tidiness: this kernel is built for `aarch64-unknown-none`, whose baseline
+//! includes NEON, so LLVM keeps its own values in `q0..q31`. A program's SIMD
+//! state was therefore destroyed by its own `svc`, and by every timer tick that
+//! landed on it. Both EL0 stubs now carry the 528 bytes (`q0..q31`, `FPCR`,
+//! `FPSR` - the same shape `mpos_context_switch` moves) in their own frame.
+//! The kernel's entries do not pay for it, because for EL1 the call rule *is*
+//! the truth: `irq` preserves `x19..x28` itself, and its caller-saved registers
+//! are dead by definition.
+//!
+//! Saving it on the trap's own stack, rather than in the task's record, is what
+//! makes it survive a blocking call: a task parked in `read` is switched out and
+//! back while the trap is still open, and the context switch writes the *live*
+//! registers (the kernel's scratch) into the record as it goes past.
 
 use core::arch::global_asm;
 
@@ -57,6 +78,56 @@ const EC_INSTR_ABORT_EL0: u64 = 0x20;
 /// answers it because a program that has finished has to be able to say so.
 const NR_EXIT_GROUP: u64 = 94;
 
+/// Where the interrupted floating-point/SIMD state sits inside the EL0 *sync*
+/// frame: immediately after the [`UserFrame`] the gate is handed, so the
+/// register offsets `context.rs` asserts - and every reader of a `UserFrame` -
+/// are unchanged by it being there.
+///
+/// The stubs below spell these numbers as assembly literals, which an assembler
+/// cannot check against a Rust layout, so the check is here (the same shape as
+/// `UserFrame`'s own offset asserts): the failure mode is a program's registers
+/// read from the middle of a saved `q` register, which reads as a corrupt
+/// syscall argument rather than as a layout bug.
+pub const TRAP_FPU_OFFSET: usize = size_of::<UserFrame>();
+
+/// The bytes one floating-point save moves: thirty-two 16-byte `q` registers,
+/// then `FPCR` and `FPSR`, in the order `context.rs`'s `FpuState` holds them.
+pub const TRAP_FPU_BYTES: usize = 528;
+
+/// The EL0 sync frame: the `UserFrame`, then the floating-point state.
+pub const TRAP_FRAME_BYTES: usize = TRAP_FPU_OFFSET + TRAP_FPU_BYTES;
+
+/// Where the floating-point state sits inside the EL0 *interrupt* frame: after
+/// the 176 bytes the kernel's own IRQ stub saves, which is the whole of the
+/// difference between the two stubs.
+pub const TRAP_IRQ_FPU_OFFSET: usize = 176;
+
+/// The EL0 interrupt frame.
+pub const TRAP_IRQ_FRAME_BYTES: usize = TRAP_IRQ_FPU_OFFSET + TRAP_FPU_BYTES;
+
+const _: () = {
+    assert!(
+        TRAP_FPU_OFFSET == 272,
+        "the EL0 sync stub's floating-point offset moved"
+    );
+    assert!(
+        TRAP_FRAME_BYTES == 800,
+        "the EL0 sync stub's frame size moved"
+    );
+    assert!(
+        TRAP_IRQ_FPU_OFFSET == 176,
+        "the EL0 IRQ stub's floating-point offset moved"
+    );
+    assert!(
+        TRAP_IRQ_FRAME_BYTES == 704,
+        "the EL0 IRQ stub's frame size moved"
+    );
+    assert!(
+        TRAP_FPU_BYTES == 528,
+        "the trap frame's floating-point save area moved"
+    );
+};
+
 global_asm!(
     r#"
     .section .text.vectors, "ax"
@@ -83,9 +154,11 @@ __aarch64_vectors:
 
     /* Lower EL, AArch64 - where a user task's system call arrives, and where
        its faults do. It is the only entry in the table that has two different
-       jobs, and the stub below is the one that tells them apart. */
+       jobs, and the stub below is the one that tells them apart. Its IRQ entry
+       is separate from the kernel's own because an interrupt that lands on a
+       program has to give its floating-point registers back too. */
     ventry __vec_el0_sync
-    ventry __vec_irq
+    ventry __vec_el0_irq
     ventry __vec_unexpected
     ventry __vec_unexpected
 
@@ -129,6 +202,85 @@ __vec_irq:
     add sp, sp, #176
     eret
 
+    /* An interrupt that lands on a *program*. It is the stub above plus the
+       floating-point half, and it exists because the two differ in exactly
+       that: the kernel's own code has no interest in the vector registers of
+       the task it interrupted (a call may destroy the caller-saved ones, and
+       the callee-saved ones are `irq`'s to keep), while a program's registers
+       are its own across an interrupt whatever the ABI says about calls. The
+       528 bytes are `q0..q31`, `FPCR` and `FPSR` in the same order
+       `mpos_context_switch` saves them, at the offset [`TRAP_FPU_OFFSET`]
+       names; the integer half above is the same 176 bytes the sibling stub
+       uses, so the frame's first half is identical on both entries. */
+    .balign 16
+__vec_el0_irq:
+    sub sp, sp, #704
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    str x18, [sp, #144]
+    stp x29, x30, [sp, #152]
+    stp q0,  q1,  [sp, #176]
+    stp q2,  q3,  [sp, #208]
+    stp q4,  q5,  [sp, #240]
+    stp q6,  q7,  [sp, #272]
+    stp q8,  q9,  [sp, #304]
+    stp q10, q11, [sp, #336]
+    stp q12, q13, [sp, #368]
+    stp q14, q15, [sp, #400]
+    stp q16, q17, [sp, #432]
+    stp q18, q19, [sp, #464]
+    stp q20, q21, [sp, #496]
+    stp q22, q23, [sp, #528]
+    stp q24, q25, [sp, #560]
+    stp q26, q27, [sp, #592]
+    stp q28, q29, [sp, #624]
+    stp q30, q31, [sp, #656]
+    mrs x9, fpcr
+    mrs x10, fpsr
+    str x9, [sp, #688]
+    str x10, [sp, #696]
+    bl {irq}
+    ldp q0,  q1,  [sp, #176]
+    ldp q2,  q3,  [sp, #208]
+    ldp q4,  q5,  [sp, #240]
+    ldp q6,  q7,  [sp, #272]
+    ldp q8,  q9,  [sp, #304]
+    ldp q10, q11, [sp, #336]
+    ldp q12, q13, [sp, #368]
+    ldp q14, q15, [sp, #400]
+    ldp q16, q17, [sp, #432]
+    ldp q18, q19, [sp, #464]
+    ldp q20, q21, [sp, #496]
+    ldp q22, q23, [sp, #528]
+    ldp q24, q25, [sp, #560]
+    ldp q26, q27, [sp, #592]
+    ldp q28, q29, [sp, #624]
+    ldp q30, q31, [sp, #656]
+    ldr x9, [sp, #688]
+    ldr x10, [sp, #696]
+    msr fpcr, x9
+    msr fpsr, x10
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldr x18, [sp, #144]
+    ldp x29, x30, [sp, #152]
+    add sp, sp, #704
+    eret
+
     /* A trap from EL0. Unlike the IRQ stub this one has to save *everything*,
        because the gate behind it can resume the program and a register it
        clobbered without putting back is a register the program loses. The 34
@@ -143,7 +295,7 @@ __vec_irq:
        the choice is the gate's - `SPSR_EL1`'s mode field is what it writes. */
     .balign 16
 __vec_el0_sync:
-    sub sp, sp, #272
+    sub sp, sp, #800
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -165,6 +317,40 @@ __vec_el0_sync:
     mrs x11, spsr_el1
     stp x9, x10, [sp, #248]
     str x11, [sp, #264]
+
+    /* And the floating-point/SIMD state the trap interrupts, in the 528 bytes
+       after the `UserFrame` - the reason this stub reserves 800 and not 272.
+       It is not optional on this machine the way it is on x86_64: this kernel
+       is built for `aarch64-unknown-none`, whose baseline includes NEON, so
+       LLVM keeps its own values in `q0..q31` and a `svc` that reached Rust
+       without this would hand the program back the kernel's scratch. (`core`'s
+       formatting and `memcpy` do it too, which is why building this crate
+       alone with `-neon` does not help.) Saving it on the trap's own stack
+       rather than in the task's record is what makes it survive a *blocking*
+       call: the record is the one the context switch writes on its way past,
+       and a task parked inside `read` is switched out and back while it
+       waits. */
+    stp q0,  q1,  [sp, #272]
+    stp q2,  q3,  [sp, #304]
+    stp q4,  q5,  [sp, #336]
+    stp q6,  q7,  [sp, #368]
+    stp q8,  q9,  [sp, #400]
+    stp q10, q11, [sp, #432]
+    stp q12, q13, [sp, #464]
+    stp q14, q15, [sp, #496]
+    stp q16, q17, [sp, #528]
+    stp q18, q19, [sp, #560]
+    stp q20, q21, [sp, #592]
+    stp q22, q23, [sp, #624]
+    stp q24, q25, [sp, #656]
+    stp q26, q27, [sp, #688]
+    stp q28, q29, [sp, #720]
+    stp q30, q31, [sp, #752]
+    mrs x9, fpcr
+    mrs x10, fpsr
+    str x9, [sp, #784]
+    str x10, [sp, #792]
+
     mov x0, sp
     bl {el0_sync}
     cbnz x0, __vec_el0_leave
@@ -179,6 +365,35 @@ __vec_el0_sync:
     msr elr_el1, x9
     ldr x9, [sp, #264]
     msr spsr_el1, x9
+
+    /* The floating-point half, through `x9`/`x10` - which has to come *before*
+       the register restore below, because that restore gives `x9` and `x10`
+       back to the program and would otherwise hand it a `FPCR` in one of them.
+       Measured: with the two blocks the other way round, six of the sixteen
+       sweep programs took a wild pointer (`user fault at 0x19`, an `EFAULT` from
+       `recvfrom`) because a rustix asm block had kept a live value in `x9`
+       across the `svc`. */
+    ldp q0,  q1,  [sp, #272]
+    ldp q2,  q3,  [sp, #304]
+    ldp q4,  q5,  [sp, #336]
+    ldp q6,  q7,  [sp, #368]
+    ldp q8,  q9,  [sp, #400]
+    ldp q10, q11, [sp, #432]
+    ldp q12, q13, [sp, #464]
+    ldp q14, q15, [sp, #496]
+    ldp q16, q17, [sp, #528]
+    ldp q18, q19, [sp, #560]
+    ldp q20, q21, [sp, #592]
+    ldp q22, q23, [sp, #624]
+    ldp q24, q25, [sp, #656]
+    ldp q26, q27, [sp, #688]
+    ldp q28, q29, [sp, #720]
+    ldp q30, q31, [sp, #752]
+    ldr x9, [sp, #784]
+    ldr x10, [sp, #792]
+    msr fpcr, x9
+    msr fpsr, x10
+
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
@@ -195,7 +410,7 @@ __vec_el0_sync:
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
-    add sp, sp, #272
+    add sp, sp, #800
     eret
 
     /* Not asking to come back: the gate has already set `SP_EL1`, `ELR_EL1` and
