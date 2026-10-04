@@ -6011,19 +6011,32 @@ Named gaps the port carries rather than hides, each with its home:
   than theorising about it: `user fault at 0x3fe1bf80 (ESR 0x9200004f, pc 0x276350)`.
   Decoded, `ESR`'s `DFSC` is `0x0f` (a **level-3 permission fault**) with `WnR` set (a
   **write**), and `pc 0x276350` is inside the static-musl binary's own `clone`
-  trampoline - not the kernel and not a hand-encoded image. The child that faults is
-  `posix_spawn`'s exact request, the `CLONE_VM|CLONE_VFORK` clone (the comment at
-  `runtime.rs:7985` names it: libc's `posix_spawn` clones with those flags), and that
-  child shares the parent's `stack_top` (`runtime.rs:8066/8149`). So the measurement is:
-  a `CLONE_VM|CLONE_VFORK` child writes to `0x3fe1bf80` (a page the shared address space
-  maps read-only or not at all), and none of `el0_sync`'s three resolvers -
-  `resolve_cow_fault`, `resolve_anon_fault`, `resolve_stack_growth` (`vectors.rs:350-356`) -
-  claims it, so the fault falls through to the "user fault" path and the child dies. The
-  next cut is to instrument that fall-through to log whether `0x3fe1bf80` sits *above*
-  `stack_top` (a thread/TLS region musl maps with `mmap`, outside the downward-growth
-  stack VMA) or is a COW page the split path left unmarked - then teach the matching
-  resolver to service it. This blocks running a *subcommand* (a shell's core), and
-  is orthogonal to the static-busybox prerequisite above.
+  trampoline - not the kernel and not a hand-encoded image. A second throwaway re-run
+  printed, at that fall-through, `sp=0x3fd25f90  stack_range=Some((0xffff_f8xx…,
+  0xffff_f9xx…))  has_vma=false  free=false` (the exact bounds are ASLR-shifted each
+  boot, which is why the address moved from `0x3fe1bf80` to `0x3fd25f80` across runs).
+  That settles the mechanism: the fault is in the clone-*with-a-provided-stack* path -
+  the child's resume frame is `state.forked(request.child_stack)` (`runtime.rs:8105`) -
+  and the child is running at a caller-supplied stack near 1 GiB while the process's
+  reserved stack window sits at the top of the VA space. `has_vma=false` (and not a
+  clean free gap) says the child's stack region was never registered as a VMA in the
+  shared address space, so `resolve_anon_fault` has no VMA to back it and
+  `resolve_stack_growth` - which is bounded by the leader's `stack_top`/`stack_max`
+  window - rejects it too. Neither the COW split nor a page-protection bug is involved.
+
+  So the fix is *where the child's stack region comes from*: Linux requires a
+  `clone`/`vfork` caller-provided stack to be valid mapped memory (musl `mmap`s a thread
+  stack, or runs the vfork child on the parent's stack); this kernel reaches the child
+  frame at `request.child_stack` without that region ever having a backing VMA, so its
+  first push faults. The precise next cut is to make the aarch64 `clone`/`vfork` path
+  establish (or validate, per what Linux does for that flag combination) the
+  caller-provided stack region as a mapped VMA before the child resumes - **not** to
+  touch the COW primitives, which §9.1 further down shows are internally consistent.
+  This edit was deliberately *not* attempted here: fork/clone and stack-window mapping are
+  the core shared machinery the x86 `cargo xtask test` 142-test gate exercises, so a
+  wrong change has wide blast radius, and a blind fix is exactly the "nearly-right is
+  worse than absent" this repo refuses. It blocks running a *subcommand* (a shell's core),
+  and is orthogonal to the static-busybox prerequisite above.
 
   Reading further confirms the COW path is not the bug: `resolve_cow`'s split leaf
   (`VALID | TABLE | attributes(flags)`, `paging.rs`) is byte-for-byte the same encoding
