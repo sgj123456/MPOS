@@ -1055,16 +1055,8 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             // The bits this kernel understands. A request naming one it does
             // not is `EINVAL` rather than a shrug: the tracer would otherwise
             // wait for a stop that would never come, which is the worst kind of
-            // wrong answer.
-            const KNOWN: usize = abi::PTRACE_O_TRACESYSGOOD
-                | abi::PTRACE_O_TRACEFORK
-                | abi::PTRACE_O_TRACEVFORK
-                | abi::PTRACE_O_TRACECLONE
-                | abi::PTRACE_O_TRACEEXEC
-                | abi::PTRACE_O_TRACEVFORKDONE
-                | abi::PTRACE_O_TRACEEXIT
-                | abi::PTRACE_O_EXITKILL;
-            if data & !KNOWN != 0 {
+            // wrong answer. The option table is the ABI's, so its mask is too.
+            if data & !abi::PTRACE_OPTIONS_KNOWN != 0 {
                 return err::EINVAL;
             }
             if crate::sched::set_trace_options(id, data) {

@@ -447,11 +447,15 @@ naming `arch`) and created `hal ↔ mm` (the trait speaks `mm`'s mapping vocabul
 HAL to program an MMIO window), which §9 argues is the seam's neighbour, not a leak. S4 took it
 to **12**: with the saved context, the FPU state and the user frame behind `hal::Contexts`,
 `sched` and `syscall` stopped naming `arch` entirely, so the last two pairs — `arch ↔ sched` and
-`arch ↔ syscall` — collapsed. The tables in this section are the audit's
+`arch ↔ syscall` — collapsed. V-3's exit-hook and `FD_CLOEXEC` registries then took it to **10**
+(`sched → net` and `sched → drivers` both fell to zero, removing the `net ↔ sched` and
+`drivers ↔ sched` pairs), and §13.2's move of the `ptrace` protocol words to the `abi` leaf took it
+to **9**: `sched` stopped naming `syscall::linux::abi`, so `sched → syscall` is 0 and the
+`sched ↔ syscall` pair went with it. The tables in this section are the audit's
 snapshot and are left as they were read; from here the command is what they have to agree with, and
 it fails when an edge appears that was not there when the baseline was recorded. Two further rules
 ride with it, each a ratchet at its recorded number rather than an absolute refusal: no layer below
-`syscall` names `crate::syscall::` (`drivers` 1, `sched` 10 today; `arch` and `main` are exempt by
+`syscall` names `crate::syscall::` (`drivers` 1, `sched` 0 since §13.2; `arch` and `main` are exempt by
 design — the gate exists to enter the dispatcher), and `src/vfs/mod.rs` names no device — that one
 is at **0**, down from the 9 the nine `as_*` downcasts of V-1 cost, so a *single* new reference
 there fails the sweep.

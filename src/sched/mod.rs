@@ -56,15 +56,23 @@ pub use runtime::{
     wait_for_interrupt, wake, with_current_credentials, write_user, write_user_of, yield_now,
 };
 
-/// The ptrace register/stop accessors are x86_64-only (`PLAN.md` §9.1 stage
-/// 6/7): their `runtime` definitions read the x86 `user_regs_struct` shape, so
-/// aarch64 neither builds them nor re-exports them. The uregs-free helpers
-/// (tracer link, `Stop` reads) stay in the block above.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// The stop accessors and the register-file snapshot are the machine's to build
+/// (`PLAN.md` §13): their `runtime` definitions carry a register file sized by
+/// `hal::Contexts::ABI_REG_COUNT` and never look inside it - which register a
+/// value is in stays the machine's conversion. So they build on both machines;
+/// what is still x86_64's is the *syscall handler* that drives them, because
+/// that is where the x86 gate frame's shape lives. On a machine with no such
+/// handler nothing ever sets a tracer, and these answer honestly.
+///
+#[cfg(target_os = "none")]
 pub use runtime::{
-    device_not_available, exec_trap, fork_trap, group_stop, set_trace_fpu, set_trace_regs,
-    stop_at_syscall, trace_fpu, trace_regs, trace_signal_stop,
+    exec_trap, fork_trap, group_stop, set_trace_fpu, set_trace_regs, stop_at_syscall, trace_fpu,
+    trace_regs, trace_signal_stop,
 };
+
+/// The `#NM` vector's entry, named only where the machine traps a lazy FPU.
+#[cfg(mpos_fpu_trap)]
+pub use runtime::device_not_available;
 
 /// A host build has no processes, so no creator: root, which is what a node
 /// with no owner model reports anyway.

@@ -329,6 +329,7 @@ impl crate::hal::Contexts for crate::hal::Current {
     type UserFrame = context::UserContext;
 
     const FPU_BYTES: usize = context::FPU_BYTES;
+    const ABI_REG_COUNT: usize = context::ABI_REG_COUNT;
 
     #[inline]
     fn set_kernel_stack(top: usize) {

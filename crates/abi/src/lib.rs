@@ -1,22 +1,26 @@
 #![no_std]
 
-//! The arch-neutral Linux ABI facts: the `clone(2)` flag bits, a process's
-//! default umask, and the resource-limit model.
+//! The arch-neutral Linux ABI facts: the `clone(2)` flag bits, the `ptrace(2)`
+//! protocol constants, a process's default umask, and the resource-limit model.
 //!
 //! Why a leaf and not the syscall layer. `sched` reads every one of these on a
 //! path that has nothing to do with dispatching a syscall - it builds a task's
-//! initial umask, budgets its rlimits, and decodes a `clone` flag word to decide
-//! what a child shares. Naming `crate::syscall` for those values is what made
+//! initial umask, budgets its rlimits, decodes a `clone` flag word to decide
+//! what a child shares, and decides from these `PTRACE_*` bits what a traced
+//! task does at a stop. Naming `crate::syscall` for those values is what made
 //! `sched` unbuildable without the x86_64 ABI layer (`PLAN.md` §11.2, the
-//! `sched -> syscall` row). The values themselves are shared across
-//! architectures - these `CLONE_*` bits and `RLIMIT_*` rows carry the same number
-//! on x86_64 and aarch64, because both use the asm-generic definitions - so they
-//! belong below the machine-specific ABI, in a crate that a scheduler on any
-//! machine may name. What deliberately stays in `syscall` is the part that is not
-//! arch-neutral: the syscall *numbers* (`nr.rs`'s non-`CLONE` table), the
-//! x86_64 `user_regs_struct` field count, and the per-arch `MMAP_BASE`, which
-//! follows each architecture's address-space layout and is decided with the
-//! aarch64 process-running stage (`PLAN.md` §9.1's stage 6/7).
+//! `sched -> syscall` row); the ptrace protocol was the last reference to
+//! leave, and moving it here took that row to 0. The values themselves are
+//! shared across architectures - these `CLONE_*` bits, `PTRACE_*` words and
+//! `RLIMIT_*` rows carry the same number on x86_64 and aarch64, because both
+//! use the generic definitions - so they belong below the machine-specific ABI,
+//! in a crate that a scheduler on any machine may name. What deliberately stays
+//! in `syscall` is the part that is not arch-neutral: the syscall *numbers*
+//! (`nr.rs`'s non-`CLONE` table), the architecture's register-file shape (the
+//! x86_64 `user_regs_struct`, which is why `PTRACE_GETREGS` stays there too),
+//! and the per-arch `MMAP_BASE`, which follows each architecture's
+//! address-space layout and is decided with the aarch64 process-running stage
+//! (`PLAN.md` §9.1's stage 6/7).
 //!
 //! This is the single source for each fact. `syscall::linux::nr` and
 //! `syscall::linux::abi` re-export these rather than redefining them, so the
@@ -81,6 +85,81 @@ pub const CLONE_NAMESPACES: usize = CLONE_NEWTIME
     | CLONE_NEWUSER
     | CLONE_NEWPID
     | CLONE_NEWNET;
+
+// ---- the `ptrace(2)` protocol --------------------------------------------
+//
+// What a tracer and a tracee say to each other, as opposed to what they say it
+// about. These values come from Linux's `linux/ptrace.h`, which is
+// architecture-independent, so they carry the same number on x86_64 and aarch64
+// - the same reason the `CLONE_*` bits above are here. Both sides read them:
+// `sched`'s stop block decides with them what a tracee does, and `syscall`'s
+// ptrace handler decodes them, and neither should have to name the other to
+// agree on a bit.
+//
+// What deliberately does *not* live here is anything shaped by the register
+// file. `PTRACE_GETREGS` and its three siblings exist only on the x86_64 column
+// and fill the x86_64 `user_regs_struct`, so those request numbers stay in
+// `syscall::linux::abi`, where the architecture's shape belongs.
+
+/// `PTRACE_O_*`: what the tracer asked to be told about.
+///
+/// `TRACESYSGOOD` is the one that matters most in practice, and for a
+/// cosmetic-looking reason that is not cosmetic: without it a syscall stop is
+/// reported as a plain `SIGTRAP`, which a debugger cannot tell from a
+/// breakpoint or a real `SIGTRAP` arriving. With it the reported signal is
+/// `SIGTRAP | 0x80`, which cannot be anything else.
+pub const PTRACE_O_TRACESYSGOOD: usize = 0x0000_0001;
+pub const PTRACE_O_TRACEFORK: usize = 0x0000_0002;
+pub const PTRACE_O_TRACEVFORK: usize = 0x0000_0004;
+pub const PTRACE_O_TRACECLONE: usize = 0x0000_0008;
+pub const PTRACE_O_TRACEEXEC: usize = 0x0000_0010;
+pub const PTRACE_O_TRACEVFORKDONE: usize = 0x0000_0020;
+pub const PTRACE_O_TRACEEXIT: usize = 0x0000_0040;
+pub const PTRACE_O_EXITKILL: usize = 0x0010_0000;
+
+/// The bit `TRACESYSGOOD` sets in the reported stop signal.
+pub const SYSCALL_TRAP: u8 = 0x80;
+
+/// `PTRACE_EVENT_*`: the value in bits 23:16 of a `SIGTRAP` stop's status
+/// word. Zero means "an ordinary stop", which is every syscall boundary and
+/// every signal delivery.
+pub const PTRACE_EVENT_NONE: u32 = 0;
+
+/// The stop a tracee makes to announce a child it has just created.
+///
+/// Which of the three it is comes from the flags the child was asked for, not
+/// from the call: `fork`, `vfork` and a thread-creating `clone` are one syscall
+/// with different flags, and a tracer that asked about threads but not about
+/// processes needs to be told which one it got. At this stop
+/// `PTRACE_GETEVENTMSG` answers the **new child's pid**.
+pub const PTRACE_EVENT_FORK: u32 = 1;
+pub const PTRACE_EVENT_VFORK: u32 = 2;
+pub const PTRACE_EVENT_CLONE: u32 = 3;
+
+/// The exec event: raised on the far side of an `execve` that succeeded.
+/// `PTRACE_GETEVENTMSG` answers the tid the task had *before* it exec'd at this
+/// stop, which is the question a tracer that reassembles a thread group after
+/// the leader exec'd is asking.
+pub const PTRACE_EVENT_EXEC: u32 = 4;
+
+/// The events this kernel accepts a name for and does not produce.
+///
+/// `VFORK_DONE` and `EXIT` are each a separate stop a tracer can ask to be told
+/// about with the matching `PTRACE_O_*`, and mpos raises neither: an `EXIT` stop
+/// would be a second stop at the very end of a task's life, in the middle of the
+/// release path a terminating task is already inside, and `VFORK_DONE` needs a
+/// parent that is suspended for the child's benefit - which mpos's `clone`
+/// deliberately is not.
+///
+/// They are named rather than absent because `PTRACE_SETOPTIONS` refuses an
+/// option it cannot name, and a tracer that died of `EINVAL` because the kernel
+/// had never heard of `PTRACE_O_TRACEEXIT` would be worse served than one that
+/// asked and was quietly not told. The allowance lives in one module so that the
+/// set of "named but never produced" is one line to read.
+pub mod unwatched_events {
+    pub const VFORK_DONE: u32 = 5;
+    pub const EXIT: u32 = 6;
+}
 
 /// How many resource limits a process carries. The rows are indexed by the
 /// `RLIMIT_*` numbers, which are the same on x86_64 and aarch64 (asm-generic):
@@ -185,6 +264,25 @@ mod tests {
                 | CLONE_NEWPID
                 | CLONE_NEWNET
         );
+    }
+
+    #[test]
+    fn ptrace_protocol_words_are_the_generic_values() {
+        // Same reason as the clone bits above: the numbers are what a tracer's
+        // `switch` is written against, and a wrong one is a stop read as the
+        // wrong kind. They are here rather than in the x86_64 column because
+        // `linux/ptrace.h` is architecture-independent.
+        assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
+        assert_eq!(PTRACE_O_TRACEEXEC, 0x10);
+        assert_eq!(PTRACE_O_EXITKILL, 0x0010_0000);
+        assert_eq!(PTRACE_EVENT_NONE, 0);
+        assert_eq!(PTRACE_EVENT_FORK, 1);
+        assert_eq!(PTRACE_EVENT_VFORK, 2);
+        assert_eq!(PTRACE_EVENT_CLONE, 3);
+        assert_eq!(PTRACE_EVENT_EXEC, 4);
+        assert_eq!(unwatched_events::VFORK_DONE, 5);
+        assert_eq!(unwatched_events::EXIT, 6);
+        assert_eq!(SYSCALL_TRAP, 0x80);
     }
 
     #[test]

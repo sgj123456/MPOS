@@ -42,16 +42,36 @@ use crate::mm::vma::{MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
 use crate::mm::{self, PAGE_SIZE, pframe};
 use crate::sched::policy::{Priority, Scheduler, TaskId};
 use crate::sched::signal;
-// `abi` is the syscall ABI module, kept only for the ptrace block: its x86_64
-// register-file shape (`abi::uregs::COUNT`) and `PTRACE_*`/`SYSCALL_TRAP`. That
-// whole block is x86_64's until the aarch64 syscall-trap/signal-frame ABI lands
-// (`PLAN.md` §9.1 stage 6/7); on aarch64 this import and everything gated by it
-// are absent, and `sched -> syscall` is 0. The arch-neutral `crate::abi` leaf
-// holds the clone flags and rlimit table for both machines.
-#[cfg(target_arch = "x86_64")]
-use crate::syscall::linux::abi;
+// The `ptrace` stop block below speaks the architecture's register-file *shape*
+// without knowing its layout: the width comes from the machine
+// (`hal::Contexts::ABI_REG_COUNT`, through `AbiRegs`) and the machine's own
+// `to_user_regs`/`from_user_regs` decide which slot holds which register. The
+// protocol words it decides with come from the arch-neutral `crate::abi` leaf,
+// beside the clone flags - which is what keeps this block from naming the
+// syscall layer at all, and took `sched -> syscall` to 0 (`PLAN.md` §13).
+use crate::abi::{
+    PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_NONE,
+    PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK,
+    PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACEVFORK, SYSCALL_TRAP,
+};
+
 use crate::vfs::RawFd;
 use crate::vfs::file::{FdTable, File};
+
+/// The width of the machine's Linux register file
+/// (`hal::Contexts::ABI_REG_COUNT`), named once so the array sizes below read as
+/// a width rather than as a projection of the HAL's.
+const ABI_REG_COUNT: usize = <crate::hal::Current as crate::hal::Contexts>::ABI_REG_COUNT;
+
+/// A register file carried by value: a stopped task's saved registers, sized by
+/// the machine's Linux register-file width.
+///
+/// `sched` carries the file but never reads a field of it - which register a
+/// value is in is the machine's business, and the only code here that looks
+/// inside one does so through `to_user_regs`/`from_user_regs`. So the width is
+/// all this needs to know, and the same code is right on a machine whose file
+/// is 34 words as on one whose is 27.
+type AbiRegs = [u64; ABI_REG_COUNT];
 
 /// How many tasks can exist at once. A hard limit rather than a grown
 /// collection, for the reason given in the module docs.
@@ -1305,17 +1325,14 @@ struct Tracing {
     armed: bool,
     /// The user register file as of the stop.
     ///
-    /// The user register file as of the stop.
-    ///
     /// Saved rather than pointed at, twice over: the frame it came from is on
     /// the tracee's kernel stack, which nobody hands out a pointer to, and a
     /// `PTRACE_SETREGS` needs somewhere to put what it changed.
     ///
-    /// Sized by the x86_64 `user_regs_struct` field count, so it is part of the
-    /// ptrace block that is x86_64's until the aarch64 register-file view lands
-    /// (`PLAN.md` §9.1 stage 6/7); aarch64 has no ptrace and no such field.
-    #[cfg(target_arch = "x86_64")]
-    regs: Option<[u64; abi::uregs::COUNT]>,
+    /// Sized by the *machine's* register-file width ([`AbiRegs`]) rather than by
+    /// any one architecture's ABI table, so the field exists - empty and unused
+    /// - on a machine with no ptrace handler yet, and needs no gate.
+    regs: Option<AbiRegs>,
     /// The syscall the tracee stopped in the middle of. Written at the entry
     /// stop and kept for the exit stop, because `PTRACE_GET_SYSCALL_INFO`
     /// describes both ends of one call and the exit half has no arguments of
@@ -1329,9 +1346,8 @@ struct Tracing {
     /// call had returned a second time. Cleared by the next entry stop, which is
     /// the only thing that can follow a disarmed resume.
     ///
-    /// Set/read only by the x86_64 ptrace exec-trap and syscall-stop path, so it
-    /// is part of the ptrace block gated to that architecture.
-    #[cfg(target_arch = "x86_64")]
+    /// Set and read only by the exec-trap and syscall-stop path, and starts
+    /// false on a machine whose syscall handler does not raise those stops.
     at_exec_exit: bool,
     /// A `SIGCONT` ended a stop of this task and no `wait` has reported it yet.
     ///
@@ -1615,10 +1631,10 @@ impl Table {
     /// no-op; it is here so that a caller asking about the running task gets its
     /// real state rather than whatever was last saved.
     ///
-    /// x86_64 only: it exists to make the lazy-trap's live registers current
-    /// before `PTRACE_GETFPREGS` reads them. aarch64's eager switch keeps the
-    /// saved block current already, and its (not yet built) ptrace reads it
-    /// directly.
+    /// The lazy-FPU capability only: it exists to make the trap's live registers
+    /// current before `PTRACE_GETFPREGS` reads them. A machine whose switch
+    /// restores the floating-point half eagerly keeps the saved block current
+    /// already, so `trace_fpu` reads it directly and never calls this.
     #[cfg(mpos_fpu_trap)]
     fn sync_fpu(&mut self, id: TaskId) {
         let live = self
@@ -4471,8 +4487,7 @@ pub fn set_trace_options(id: TaskId, options: usize) -> bool {
 /// and that *is* its register file, not a description of one. The two cases are
 /// told apart by `regs` being empty, which for a stopped task happens exactly
 /// when nothing has parked it; [`attach_new_child`] is what creates such a task.
-#[cfg(target_arch = "x86_64")]
-pub fn trace_regs(id: TaskId) -> Option<[u64; abi::uregs::COUNT]> {
+pub fn trace_regs(id: TaskId) -> Option<AbiRegs> {
     with_table(|t| {
         let task = t.tasks.get(id.0)?.as_ref()?;
         task.trace.regs.or_else(|| {
@@ -4495,17 +4510,15 @@ pub fn trace_regs(id: TaskId) -> Option<[u64; abi::uregs::COUNT]> {
 /// syscall is in flight, so `orig_rax` is nothing; and `rcx`/`r11` are the two
 /// the `syscall` instruction itself clobbers - are left zero there, the value
 /// the ABI reads for a register nobody can be relying on.
-#[cfg(target_arch = "x86_64")]
-fn context_regs(state: &UserFrame, tls: usize) -> [u64; abi::uregs::COUNT] {
-    let mut regs = [0u64; abi::uregs::COUNT];
+fn context_regs(state: &UserFrame, tls: usize) -> AbiRegs {
+    let mut regs = [0u64; ABI_REG_COUNT];
     state.to_user_regs(tls, &mut regs);
     regs
 }
 
 /// The other direction: turn a register file a tracer may have rewritten back
 /// into the state the one-way door into ring 3 reads.
-#[cfg(target_arch = "x86_64")]
-fn context_from_regs(regs: &[u64; abi::uregs::COUNT]) -> UserFrame {
+fn context_from_regs(regs: &AbiRegs) -> UserFrame {
     UserFrame::from_user_regs(regs)
 }
 
@@ -4513,8 +4526,7 @@ fn context_from_regs(regs: &[u64; abi::uregs::COUNT]) -> UserFrame {
 /// gone, or is not stopped - a running task's registers are not the kernel's
 /// to rewrite from another task, and `PTRACE_SETREGS` on a running tracee is
 /// `ESRCH` on Linux too.
-#[cfg(target_arch = "x86_64")]
-pub fn set_trace_regs(id: TaskId, regs: &[u64; abi::uregs::COUNT]) -> bool {
+pub fn set_trace_regs(id: TaskId, regs: &AbiRegs) -> bool {
     with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
         Some(task) if !task.exited && task.trace.stop.is_some() => {
             match (task.trace.regs, task.user_resume.as_mut()) {
@@ -4538,9 +4550,12 @@ pub fn set_trace_regs(id: TaskId, regs: &[u64; abi::uregs::COUNT]) -> bool {
 /// A stopped task's saved block is current: every switch out of a task writes
 /// its live registers there, and a task that is stopped has been switched out at
 /// least once since it last ran.
-#[cfg(target_arch = "x86_64")]
 pub fn trace_fpu(id: TaskId) -> Option<[u8; hal::FPU_BYTES]> {
     with_table(|t| {
+        // Only the lazy scheme has a saved block that can be stale; on a machine
+        // that swaps the FPU eagerly the switch has already written it, so there
+        // is nothing to make current and no `sync_fpu` to call.
+        #[cfg(mpos_fpu_trap)]
         t.sync_fpu(id);
         t.tasks
             .get(id.0)?
@@ -4551,7 +4566,6 @@ pub fn trace_fpu(id: TaskId) -> Option<[u8; hal::FPU_BYTES]> {
 
 /// Replace the floating-point registers `id` will resume with. The same rule as
 /// [`set_trace_regs`]: only a stopped task's state is the kernel's to rewrite.
-#[cfg(target_arch = "x86_64")]
 pub fn set_trace_fpu(id: TaskId, bytes: &[u8; hal::FPU_BYTES]) -> bool {
     with_table(|t| match t.tasks.get_mut(id.0).and_then(Option::as_mut) {
         Some(task) if !task.exited && task.trace.stop.is_some() => {
@@ -4727,8 +4741,7 @@ fn deliverable(task: &Task) -> Option<u8> {
 /// between. For a tracer's stop only the tracer can do anything about it, and
 /// for a group stop only the parent - but the two are one test apart, and a
 /// wake delivered to a task that is not waiting is a no-op.
-#[cfg(target_arch = "x86_64")]
-fn park(regs: &mut [u64; abi::uregs::COUNT], stop: Stop) {
+fn park(regs: &mut AbiRegs, stop: Stop) {
     let id = current();
     let snapshot = *regs;
     schedule(|t| {
@@ -4775,17 +4788,16 @@ fn park(regs: &mut [u64; abi::uregs::COUNT], stop: Stop) {
 /// In both shapes the syscall record is left as the *entry* one: the record is
 /// only ever written at syscall stops, so at this stop it still describes the
 /// call in flight, which is what `PTRACE_GET_SYSCALL_INFO` should say here too.
-#[cfg(target_arch = "x86_64")]
-pub fn exec_trap(regs: &mut [u64; abi::uregs::COUNT]) {
+pub fn exec_trap(regs: &mut AbiRegs) {
     let id = current();
     let options = with_table(|t| t.task(id).trace.options);
-    if options & abi::PTRACE_O_TRACEEXEC != 0 {
+    if options & PTRACE_O_TRACEEXEC != 0 {
         let entry = with_table(|t| t.task(id).trace.syscall);
         park(
             regs,
             Stop {
                 signal: signal::SIGTRAP,
-                event: abi::PTRACE_EVENT_EXEC,
+                event: PTRACE_EVENT_EXEC,
                 traced: true,
                 reported: false,
                 // The former tid: an exec does not change the task's number
@@ -4807,7 +4819,7 @@ pub fn exec_trap(regs: &mut [u64; abi::uregs::COUNT]) {
         regs,
         Stop {
             signal: signal::SIGTRAP,
-            event: abi::PTRACE_EVENT_NONE,
+            event: PTRACE_EVENT_NONE,
             traced: true,
             reported: false,
             message: 0,
@@ -4828,14 +4840,13 @@ pub fn exec_trap(regs: &mut [u64; abi::uregs::COUNT]) {
 /// on its own: `fork`, `vfork` and a thread-creating `clone` all arrive at the
 /// kernel as one syscall with different flags, and a tracer that asked about
 /// threads but not about processes needs to be told which one it just got.
-#[cfg(target_arch = "x86_64")]
 fn fork_event(flags: usize) -> u32 {
     if flags & crate::abi::CLONE_THREAD != 0 {
-        abi::PTRACE_EVENT_CLONE
+        PTRACE_EVENT_CLONE
     } else if flags & crate::abi::CLONE_VFORK != 0 {
-        abi::PTRACE_EVENT_VFORK
+        PTRACE_EVENT_VFORK
     } else {
-        abi::PTRACE_EVENT_FORK
+        PTRACE_EVENT_FORK
     }
 }
 
@@ -4852,12 +4863,11 @@ fn fork_event(flags: usize) -> u32 {
 /// once before its tracer's first look has already made a syscall the trace
 /// will not contain, and a tracer left to guess where the thread was is worse
 /// off than one that is simply told.
-#[cfg(target_arch = "x86_64")]
 fn attach_new_child(t: &mut Table, parent: TaskId, child: TaskId, event: u32) -> bool {
     let bit = match event {
-        abi::PTRACE_EVENT_FORK => abi::PTRACE_O_TRACEFORK,
-        abi::PTRACE_EVENT_VFORK => abi::PTRACE_O_TRACEVFORK,
-        abi::PTRACE_EVENT_CLONE => abi::PTRACE_O_TRACECLONE,
+        PTRACE_EVENT_FORK => PTRACE_O_TRACEFORK,
+        PTRACE_EVENT_VFORK => PTRACE_O_TRACEVFORK,
+        PTRACE_EVENT_CLONE => PTRACE_O_TRACECLONE,
         _ => return false,
     };
     let (tracer, options) = {
@@ -4883,7 +4893,7 @@ fn attach_new_child(t: &mut Table, parent: TaskId, child: TaskId, event: u32) ->
         // `PTRACE_EVENT_STOP` instead when the tracer attached with
         // `PTRACE_SEIZE`; this kernel has no `SEIZE`, so it is the older shape.
         signal: signal::SIGSTOP,
-        event: abi::PTRACE_EVENT_NONE,
+        event: PTRACE_EVENT_NONE,
         traced: true,
         reported: false,
         message: 0,
@@ -4921,8 +4931,7 @@ pub fn take_pending_event(id: TaskId) -> Option<(u32, u64)> {
 /// a moment in the middle of a syscall, and the call's own exit stop still
 /// follows it. `message` is the child's pid, which is what
 /// `PTRACE_GETEVENTMSG` answers at this stop.
-#[cfg(target_arch = "x86_64")]
-pub fn fork_trap(regs: &mut [u64; abi::uregs::COUNT], event: u32, message: u64) {
+pub fn fork_trap(regs: &mut AbiRegs, event: u32, message: u64) {
     // The syscall record is deliberately left alone: it still describes the
     // call in flight, and a tracer that asks what this stop is a boundary of
     // should hear "the clone that has not returned yet".
@@ -4949,10 +4958,9 @@ pub fn fork_trap(regs: &mut [u64; abi::uregs::COUNT], event: u32, message: u64) 
 /// is cleared here rather than at the resume: it is the stop that consumes the
 /// tracer's request, and the tracer re-arms it, which is what makes an entry
 /// stop and an exit stop two events rather than one repeated.
-#[cfg(target_arch = "x86_64")]
 pub fn stop_at_syscall(
     entry: bool,
-    regs: &mut [u64; abi::uregs::COUNT],
+    regs: &mut AbiRegs,
     nr: u64,
     args: &[u64; 6],
     ip: u64,
@@ -5008,8 +5016,8 @@ pub fn stop_at_syscall(
     // and one it has to guess at, so it is applied where the signal is chosen
     // rather than stored anywhere.
     let signal = signal::SIGTRAP
-        | if options & abi::PTRACE_O_TRACESYSGOOD != 0 {
-            abi::SYSCALL_TRAP
+        | if options & PTRACE_O_TRACESYSGOOD != 0 {
+            SYSCALL_TRAP
         } else {
             0
         };
@@ -5017,7 +5025,7 @@ pub fn stop_at_syscall(
         regs,
         Stop {
             signal,
-            event: abi::PTRACE_EVENT_NONE,
+            event: PTRACE_EVENT_NONE,
             traced: true,
             reported: false,
             message: 0,
@@ -5037,8 +5045,7 @@ pub fn stop_at_syscall(
 /// nothing therefore drops the signal, which is the point: that is how a
 /// debugger "swallows" a signal, and how `strace` reports one without letting it
 /// through twice.
-#[cfg(target_arch = "x86_64")]
-pub fn trace_signal_stop(regs: &mut [u64; abi::uregs::COUNT]) {
+pub fn trace_signal_stop(regs: &mut AbiRegs) {
     let id = current();
     let traced = with_table(|t| t.task(id).trace.tracer.is_some());
     if !traced {
@@ -5055,7 +5062,7 @@ pub fn trace_signal_stop(regs: &mut [u64; abi::uregs::COUNT]) {
         regs,
         Stop {
             signal: sig,
-            event: abi::PTRACE_EVENT_NONE,
+            event: PTRACE_EVENT_NONE,
             traced: true,
             reported: false,
             message: 0,
@@ -5079,8 +5086,7 @@ pub fn trace_signal_stop(regs: &mut [u64; abi::uregs::COUNT]) {
 /// This is the non-ptrace half of "stopped": `kill -STOP`, and Ctrl-Z once
 /// there is a keyboard. The parent is told with `WUNTRACED`, which is the only
 /// reason `wait` has the flag at all.
-#[cfg(target_arch = "x86_64")]
-pub fn group_stop(regs: &mut [u64; abi::uregs::COUNT], sig: u8) {
+pub fn group_stop(regs: &mut AbiRegs, sig: u8) {
     let id = current();
     // A traced task's group stop is its tracer's business as well as its
     // parent's. Linux reports it to the tracer, and it has to: a group stop
@@ -5092,7 +5098,7 @@ pub fn group_stop(regs: &mut [u64; abi::uregs::COUNT], sig: u8) {
         regs,
         Stop {
             signal: sig,
-            event: abi::PTRACE_EVENT_NONE,
+            event: PTRACE_EVENT_NONE,
             traced,
             reported: false,
             message: 0,
@@ -5705,10 +5711,7 @@ pub fn exit(code: isize) -> ! {
             task.trace.tracer = None;
             task.trace.armed = false;
             task.trace.stop = None;
-            #[cfg(target_arch = "x86_64")]
-            {
-                task.trace.regs = None;
-            }
+            task.trace.regs = None;
             t.sched.wake(tracee);
         }
         // Deaths the tracer never got to collect are released with it. A
@@ -7637,14 +7640,12 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // resume is what puts it on the queue, exactly as it is for a tracee
         // stopped anywhere else.
         // A traced child is born stopped (its first syscall is a trace event the
-        // tracer must see); an untraced one goes straight ready. ptrace is
-        // x86_64's until the aarch64 trap/stop ABI lands, so on aarch64 no child
-        // is ever attached - it simply starts ready. This is not a faked ptrace:
-        // there is no tracer on that machine to fake one for.
-        #[cfg(target_arch = "x86_64")]
+        // tracer must see); an untraced one goes straight ready. This asks the
+        // question on every machine - a machine whose syscall handler has no
+        // `PTRACE_ATTACH` to write the link has no tracer, so the answer is a
+        // plain "no" and the child simply starts ready. That is not a faked
+        // ptrace: there is nothing on that machine to fake one for.
         let traced_child = attach_new_child(t, parent_id, child_id, fork_event(request.flags));
-        #[cfg(not(target_arch = "x86_64"))]
-        let traced_child = false;
         if traced_child {
             t.sched.sleep(child_id, parent_priority, u64::MAX);
         } else {
@@ -8239,11 +8240,9 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // A thread born into a tracer's hands is stopped before its first
         // instruction for the same reason a process child is - and it matters
         // more here, because a thread that has run once is a thread whose first
-        // syscalls are missing from the trace.
-        #[cfg(target_arch = "x86_64")]
-        let traced_child = attach_new_child(t, parent_id, child_id, abi::PTRACE_EVENT_CLONE);
-        #[cfg(not(target_arch = "x86_64"))]
-        let traced_child = false;
+        // syscalls are missing from the trace. As with a process child, a
+        // machine with no tracer always answers no here.
+        let traced_child = attach_new_child(t, parent_id, child_id, PTRACE_EVENT_CLONE);
         if traced_child {
             t.sched.sleep(child_id, priority, u64::MAX);
         } else {

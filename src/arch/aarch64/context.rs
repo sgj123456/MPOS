@@ -303,6 +303,17 @@ const _: () = {
     );
 };
 
+/// The width of the architecture's register file, as Linux reports it: `struct
+/// user_pt_regs` is [`UserFrame`] field for field - 31 `x` registers, `sp`,
+/// `pc` and `pstate`.
+///
+/// This is what `hal::Contexts::ABI_REG_COUNT` answers with, and it is why the
+/// conversion into the ABI's order is an identity on this machine: the trap
+/// frame the vector saves already *is* the structure, so writing it out is a
+/// copy and reading one back is a copy, with no slot left over and none
+/// invented. The size assertion above is what keeps the two in step.
+pub const ABI_REG_COUNT: usize = 34;
+
 /// `SPSR_EL1` for a return to EL0: mode `EL0t`, every interrupt open.
 ///
 /// Zero is not a shortcut for "don't care". `SPSR_EL1`'s mode field is `M[3:0]`,

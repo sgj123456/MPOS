@@ -603,9 +603,9 @@ pub trait UserFrameOps: Copy {
     /// The same, to write.
     fn set_sp(&mut self, sp: usize);
 
-    /// This frame in the Linux `user_regs_struct` field order, written into
-    /// `out` (whose length is the ABI's register count), with `tls` as the
-    /// thread pointer.
+    /// This frame in the Linux `user_regs_struct`/`user_pt_regs` field order,
+    /// written into `out` (whose length is [`Contexts::ABI_REG_COUNT`]), with
+    /// `tls` as the thread pointer.
     ///
     /// This is the one place the machine's registers and the ABI's field order
     /// meet, and it belongs to the machine: *which ABI field a register goes
@@ -637,6 +637,19 @@ pub trait Contexts {
 
     /// Bytes [`FpuOps::to_bytes`] moves, and the width of the FPU save area.
     const FPU_BYTES: usize;
+
+    /// Words [`UserFrameOps::to_user_regs`] writes: this machine's Linux
+    /// register-file field count - 27 on x86_64 (`user_regs_struct`), 34 on
+    /// aarch64 (`user_pt_regs`).
+    ///
+    /// It is the machine's because the structure is. Anything that carries a
+    /// register file *by value* - the scheduler's snapshot of a stopped task,
+    /// and the ptrace accessors that read and replace it - is sized by this
+    /// rather than by either architecture's ABI table, so it needs no
+    /// architecture of its own to be right on both. Which slot holds which
+    /// register stays the machine's secret: see
+    /// [`UserFrameOps::to_user_regs`].
+    const ABI_REG_COUNT: usize;
 
     /// Point the CPU's privilege-transition stack at `top` (the TSS's ring-0
     /// stack on x86_64), so the next trap from ring 3 lands on this task's.

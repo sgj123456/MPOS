@@ -648,66 +648,42 @@ pub(crate) const PTRACE_GETREGSET: usize = 0x4204;
 pub(crate) const PTRACE_SETREGSET: usize = 0x4205;
 pub(crate) const PTRACE_GET_SYSCALL_INFO: usize = 0x420E;
 
-/// `PTRACE_O_*`: what the tracer asked to be told about.
+// The `PTRACE_O_*`/`PTRACE_EVENT_*` protocol words and `SYSCALL_TRAP` live in
+// the arch-neutral leaf (`crate::abi`), beside the `clone` flags: they carry
+// the same number on both machines, and `sched`'s stop block reads them without
+// naming this module - which is what took the `sched -> syscall` edge to 0
+// (`PLAN.md` §13). Only the option bits are named here, because only they have
+// a reader on both machines (the mask below); the event words are read by the
+// scheduler and by the tests here.
+//
+// The *request numbers* above deliberately do not move: `PTRACE_GETREGS` and
+// its three siblings exist only on the x86_64 column and fill the x86_64
+// `user_regs_struct`, so they are architecture, not protocol.
+pub(crate) use crate::abi::{
+    PTRACE_O_EXITKILL, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEEXIT,
+    PTRACE_O_TRACEFORK, PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACEVFORK, PTRACE_O_TRACEVFORKDONE,
+};
+
+/// The `PTRACE_O_*` bits this kernel accepts in `PTRACE_SETOPTIONS`, and the
+/// mask its handler checks a request against.
 ///
-/// `TRACESYSGOOD` is the one that matters most in practice, and for a
-/// cosmetic-looking reason that is not cosmetic: without it a syscall stop is
-/// reported as a plain `SIGTRAP`, which a debugger cannot tell from a
-/// breakpoint or a real `SIGTRAP` arriving. With it the reported signal is
-/// `SIGTRAP | 0x80`, which cannot be anything else.
-pub(crate) const PTRACE_O_TRACESYSGOOD: usize = 0x0000_0001;
-pub(crate) const PTRACE_O_TRACEFORK: usize = 0x0000_0002;
-pub(crate) const PTRACE_O_TRACEVFORK: usize = 0x0000_0004;
-pub(crate) const PTRACE_O_TRACECLONE: usize = 0x0000_0008;
-pub(crate) const PTRACE_O_TRACEEXEC: usize = 0x0000_0010;
-pub(crate) const PTRACE_O_TRACEVFORKDONE: usize = 0x0000_0020;
-pub(crate) const PTRACE_O_TRACEEXIT: usize = 0x0000_0040;
-pub(crate) const PTRACE_O_EXITKILL: usize = 0x0010_0000;
-
-/// The bit `TRACESYSGOOD` sets in the reported stop signal.
-pub(crate) const SYSCALL_TRAP: u8 = 0x80;
-
-/// `PTRACE_EVENT_*`: the value in bits 23:16 of a `SIGTRAP` stop's status
-/// word. Zero means "an ordinary stop", which is every syscall boundary and
-/// every signal delivery.
-pub(crate) const PTRACE_EVENT_NONE: u32 = 0;
-
-/// The stop a tracee makes to announce a child it has just created.
+/// A request naming a bit outside this set is `EINVAL` rather than a shrug: a
+/// tracer whose option was silently dropped waits for a stop that never comes,
+/// which is the worst kind of wrong answer. `TRACEVFORKDONE` and `TRACEEXIT` are
+/// accepted and never reported - being told nothing is better than being refused
+/// (`crate::abi::unwatched_events`).
 ///
-/// Which of the three it is comes from the flags the child was asked for, not
-/// from the call: `fork`, `vfork` and a thread-creating `clone` are one syscall
-/// with different flags, and a tracer that asked about threads but not about
-/// processes needs to be told which one it got. At this stop
-/// `PTRACE_GETEVENTMSG` answers the **new child's pid**.
-pub(crate) const PTRACE_EVENT_FORK: u32 = 1;
-pub(crate) const PTRACE_EVENT_VFORK: u32 = 2;
-pub(crate) const PTRACE_EVENT_CLONE: u32 = 3;
-
-/// The exec event: raised on the far side of an `execve` that succeeded. See
-/// `sched::exec_trap`. `PTRACE_GETEVENTMSG` answers the tid the task had
-/// *before* it exec'd at this stop, which is the question a tracer that
-/// reassembles a thread group after the leader exec'd is asking.
-pub(crate) const PTRACE_EVENT_EXEC: u32 = 4;
-
-/// The events this kernel accepts a name for and does not produce.
-///
-/// `VFORK_DONE` and `EXIT` are each a separate stop a tracer can ask to be told
-/// about with the matching `PTRACE_O_*`, and this kernel raises neither: an
-/// `EXIT` stop would be a second stop at the very end of a task's life, in the
-/// middle of the release path a terminating task is already inside, and
-/// `VFORK_DONE` needs a parent that is suspended for the child's benefit - which
-/// [`crate::sched::clone`] deliberately is not.
-///
-/// They are named rather than absent because `PTRACE_SETOPTIONS` refuses an
-/// option it cannot name, and a tracer that died of `EINVAL` because this
-/// kernel had never heard of `PTRACE_O_TRACEEXIT` would be worse served than one
-/// that asked and was quietly not told. The allowance lives in one module so
-/// that the set of "named but never produced" is one line to read.
-#[allow(dead_code)]
-pub(crate) mod unwatched_events {
-    pub(crate) const VFORK_DONE: u32 = 5;
-    pub(crate) const EXIT: u32 = 6;
-}
+/// It lives here rather than inline in the handler so that the rule is
+/// host-compiled and tested, and so these eight names have a reader on every
+/// machine rather than only on the one whose `ptrace` handler is built.
+pub(crate) const PTRACE_OPTIONS_KNOWN: usize = PTRACE_O_TRACESYSGOOD
+    | PTRACE_O_TRACEFORK
+    | PTRACE_O_TRACEVFORK
+    | PTRACE_O_TRACECLONE
+    | PTRACE_O_TRACEEXEC
+    | PTRACE_O_TRACEVFORKDONE
+    | PTRACE_O_TRACEEXIT
+    | PTRACE_O_EXITKILL;
 
 /// `NT_PRSTATUS`, the register-set a `PTRACE_GETREGSET` asks for by name.
 pub(crate) const NT_PRSTATUS: usize = 1;
@@ -2322,6 +2298,12 @@ pub fn oss_round_rate(requested: u32, supported: &[u32]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The protocol words themselves are the leaf's (`crate::abi`); named here
+    // so the assertions below read them exactly as the handlers would.
+    use crate::abi::{
+        PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_NONE,
+        PTRACE_EVENT_VFORK, SYSCALL_TRAP, unwatched_events,
+    };
     use crate::vfs::NodeKind;
 
     fn meta(kind: NodeKind, ino: u64, size: u64) -> Metadata {
@@ -3683,6 +3665,11 @@ mod tests {
         assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
         assert_eq!(PTRACE_O_TRACEEXEC, 0x10);
         assert_eq!(PTRACE_O_EXITKILL, 0x0010_0000);
+        // The mask `PTRACE_SETOPTIONS` admits a request against: every option
+        // bit this kernel names, and nothing else. A bit missing here is a
+        // tracer refused an option it asked for; a bit extra is one accepted
+        // into silence - both worse than a straight answer.
+        assert_eq!(PTRACE_OPTIONS_KNOWN, 0x0010_007f);
         assert_eq!(PTRACE_EVENT_EXEC, 4);
         // The fork family, and the last two this kernel names but never raises.
         // Pinned for the same reason as the rest: a tracer's switch on these

@@ -68,14 +68,21 @@ use anyhow::{Context, Result, bail};
 /// before S1 - worth having here: each number names what removed it, so a
 /// regression has a step to point at.
 ///
-/// **11 now**, after the `FD_CLOEXEC` registry (`PLAN.md` §9.1 stage 6h-adjacent
+/// **11**, after the `FD_CLOEXEC` registry (`PLAN.md` §9.1 stage 6h-adjacent
 /// un-gate work, closing V-3): `execve`'s cloexec pass stopped naming
 /// `drivers::{virtio::input,uinput}::close_at_exit` and walks `sched::exit`'s
 /// second list instead, so `sched → drivers` went from 2 to 0 and the
 /// `drivers ↔ sched` pair - the one Step C left standing - collapsed with it.
 /// Step C had deliberately kept the two events apart; this does not merge them,
 /// it gives the second event the same inversion the first already had.
-const BASELINE_MUTUAL_PAIRS: usize = 11;
+///
+/// **9 now**, after the ptrace protocol constants moved to the `abi` leaf
+/// (`PLAN.md` §13): `sched/runtime.rs` stopped naming `syscall::linux::abi`, so
+/// `sched → syscall` is 0 and the `sched ↔ syscall` pair - the scheduler's
+/// register-file snapshot read against a table only the syscall layer had - went
+/// with it. The edge is the one the leaf crate was built to empty; this is the
+/// last reference that was keeping it.
+const BASELINE_MUTUAL_PAIRS: usize = 9;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.
 ///
@@ -110,15 +117,15 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
     ("rand", 0),
     ("uevent", 0),
     ("vfs", 0),
-    // `sched/runtime.rs`'s one `use crate::syscall::linux::abi` - the ptrace/stop
-    // block's x86_64 register-file shape (`abi::uregs::COUNT`) and `PTRACE_*`/
-    // `SYSCALL_TRAP`. The default umask and the `Rlimit` table went to the `abi`
-    // leaf (`sched -> crate::abi`, a downward edge) and `MMAP_BASE` moved to
-    // `crate::mm` (an address-space layout fact, not a dispatch one) - together
-    // dropping this edge from its recorded 10. The last reference is the ptrace
-    // subsystem, which is x86_64's until the aarch64 syscall/ABI stage lands;
-    // gating it takes the edge to 0 (`PLAN.md` §9.1).
-    ("sched", 1),
+    // Nothing, and it must stay nothing. `sched/runtime.rs`'s last reference to
+    // the syscall layer was the ptrace/stop block's protocol constants
+    // (`PTRACE_O_*`/`PTRACE_EVENT_*`/`SYSCALL_TRAP`); those now live in the
+    // arch-neutral `abi` leaf beside the clone flags, as the `Rlimit` table and
+    // the default umask went before them (and `MMAP_BASE` to `crate::mm`, an
+    // address-space layout fact rather than a dispatch one). Together those
+    // drops took this edge from its recorded 10 to 0, and with it the
+    // `sched <-> syscall` mutual pair (`PLAN.md` §13).
+    ("sched", 0),
 ];
 
 /// Where `sched` stands once V-3 is closed, recorded beside the rule above
