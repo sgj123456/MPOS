@@ -37,9 +37,10 @@
 //!   exactly why it must not be the headless verdict's image: with nobody to type,
 //!   its second `read(0)` parks (the tty wakes it only when a line lands,
 //!   `read_wait`'s canonical `UntilInput`) and `INIT_EXITED` never comes. A real
-//!   shell (busybox `ash`) is this loop plus `execve` of the shell binary once the
-//!   aarch64 static-musl image lands - the `execve`/`clone`/`wait4` return-frame
-//!   paths those images exercise are now built (stage 6D).
+//!   shell (busybox `ash`) is this loop plus `execve` of the shell binary; the
+//!   `execve`/`clone`/`wait4` paths and an unmodified static-musl ELF running at EL0
+//!   are all built and pinned by the verdict's `MPOS_MUSL_OK` (stages 6D + the
+//!   demand-paging handler).
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -242,21 +243,27 @@ const EXEC_PATH: &[u8] = b"/t\0";
 
 /// The exec target: writes `MPOS_EXEC_OK` (proving aarch64 `execve` transferred
 /// control here and ran at EL0), then forks. The child writes `MPOS_FORK_OK` and
-/// exits; the parent `wait4`s for it, then exits - so the child's line is on the
-/// wire before the machine halts. Together the two markers pin that `execve` and
-/// `clone` (aarch64's real `fork`, since the arch has no `fork` syscall) both run a
-/// program at EL0. Word layout (entry = 0); data is appended after the code:
+/// exits; the parent `wait4`s for it. The parent then `execve`s `/musl` - an
+/// *unmodified* statically-linked musl/Rust binary that prints `MPOS_MUSL_OK` - so
+/// the wire proves `execve`, `clone`/`wait4`, AND running a real musl binary at EL0
+/// (the demand-paging handler services its larger stack/anon pages). The parent's
+/// `exit_group` is only a fallback if that `execve` fails. Word layout (entry = 0):
 ///   0..5   write(1, "MPOS_EXEC_OK\n", 13)
 ///   6..12  clone(SIGCHLD, 0,0,0,0) -> x0 = child pid (parent) or 0 (child)
 ///   13     cbnz x0, 24   (parent jumps; child falls through)
 ///   14..23 child: write(1, "MPOS_FORK_OK\n", 13); exit_group(0); b .
-///   24..34 parent: wait4(0, &status, 0, NULL); exit_group(0); b .
+///   24..30 parent: wait4(0, &status, 0, NULL)
+///   31..38 parent: execve("/musl", ["/musl", NULL], [NULL])
+///   39..42 parent: exit_group(0); b .  (fallback only)
 pub fn marker_target_elf() -> Vec<u8> {
-    let n = 35usize;
+    let n = 43usize;
     let data_base = VADDR + (CODE_OFF + n * 4) as u64;
     let exec_addr = data_base;
     let fork_addr = data_base + 13;
+    let musl_path_addr = data_base + 26;
     let status_addr = data_base + 32;
+    let argv_addr = data_base + 40;
+    let envp_addr = data_base + 56;
     let load = |rd: u32, addr: u64| {
         [
             movz(rd, (addr & 0xffff) as u32),
@@ -285,18 +292,28 @@ pub fn marker_target_elf() -> Vec<u8> {
     code.extend(load(1, fork_addr));
     code.extend([movz(2, FORK_MARKER.len() as u32), svc()]); // 14..19
     code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 20..23
-    // parent: wait4(pid=0, &status, options=0, rusage=NULL); exit_group(0); b .
+    // parent: wait4(pid=0, &status, options=0, rusage=NULL).
     code.extend([movz(8, NR_WAIT4), movz(0, 0)]); // 24..25
     code.extend(load(1, status_addr)); // 26..27
     code.extend([movz(2, 0), movz(3, 0), svc()]); // 28..30
-    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 31..34
+    // parent: execve("/musl", argv=["/musl",NULL], envp=[NULL]) - the real binary.
+    code.extend([movz(8, NR_EXECVE)]); // 31
+    code.extend(load(0, musl_path_addr)); // 32..33
+    code.extend(load(1, argv_addr)); // 34..35
+    code.extend(load(2, envp_addr)); // 36..37
+    code.push(svc()); // 38
+    // Fallback if that execve failed: exit_group(0); b .
+    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 39..42
     debug_assert_eq!(code.len(), n, "fork target word count must match");
 
-    // Data: the two markers, then the 8-byte status word `wait4` writes.
-    let mut data = vec![0u8; 40];
+    // Data blob: the two markers, the "/musl" path, the wait4 status word, then the
+    // argv/envp pointer arrays.
+    let mut data = vec![0u8; 64];
     data[0..EXEC_MARKER.len()].copy_from_slice(EXEC_MARKER);
     data[13..13 + FORK_MARKER.len()].copy_from_slice(FORK_MARKER);
-    debug_assert_eq!(data_base + 32, status_addr);
+    data[26..32].copy_from_slice(b"/musl\0");
+    data[40..48].copy_from_slice(&musl_path_addr.to_le_bytes()); // argv[0] = &"/musl"
+    // argv[1], envp[0], status stay zero.
     assemble_with(&code, &data)
 }
 
@@ -408,6 +425,54 @@ pub fn write_initramfs_entries(
     Ok(())
 }
 
+/// An *unmodified* Rust `std` program - it just prints a line - compiled to a
+/// statically-linked `aarch64-unknown-linux-musl` ELF. It is deliberately a normal
+/// `main`, not hand-encoded: its job is to prove the second machine runs the real
+/// musl/Rust runtime (multi-segment `PT_LOAD`s, a `PT_TLS`, the libc prologue and a
+/// `write(1)` from inside `std`), the project's central promise. The kernel's aarch64
+/// EL0 demand-paging handler (which makes a real binary's unbacked stack/anon pages
+/// fault-and-map rather than crash) is what this exercises end to end.
+///
+/// The `aarch64-unknown-linux-musl` target and `rust-lld` are prerequisites (the
+/// x86 test path already requires the `x86_64` musl target); if the target is absent
+/// `rustc` fails and the message names the install command rather than skipping - a
+/// silent skip would be the one failure mode this must not have.
+pub fn build_static_musl_helper(build_dir: &Path) -> Result<Vec<u8>> {
+    const SRC: &str = concat!("fn main() {\n", "    println!(\"MPOS_MUSL_OK\");\n", "}\n",);
+    let src = build_dir.join("aarch64-musl-helper.rs");
+    let out = build_dir.join("aarch64-musl-helper");
+    std::fs::write(&src, SRC).with_context(|| format!("Failed to write {}", src.display()))?;
+
+    let status = Command::new("rustc")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-musl")
+        .args(["-C", "target-feature=+crt-static"])
+        .args(["-C", "linker=rust-lld"])
+        .args(["-C", "strip=symbols"])
+        .arg("-O")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .context("Failed to run rustc for the aarch64 musl helper")?;
+    if !status.success() {
+        anyhow::bail!(
+            "rustc failed building the aarch64 musl helper ({status}); the \
+             aarch64-unknown-linux-musl target must be installed: \
+             `rustup target add aarch64-unknown-linux-musl`"
+        );
+    }
+    let bytes = std::fs::read(&out).with_context(|| format!("Failed to read {}", out.display()))?;
+    // Sanity: it really is a static EM_AARCH64 ELF the loader will accept.
+    if bytes.len() < 20
+        || &bytes[0..4] != b"\x7fELF"
+        || u16::from_le_bytes([bytes[18], bytes[19]]) != EM_AARCH64
+    {
+        anyhow::bail!("the aarch64 musl helper is not an EM_AARCH64 ELF");
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,7 +481,7 @@ mod tests {
     /// also pin that the loop's backward branch spans exactly the body.
     const LOOP_WORDS: usize = 20;
     const LAUNCHER_WORDS: usize = 39;
-    const TARGET_WORDS: usize = 35;
+    const TARGET_WORDS: usize = 43;
 
     /// Shared structural checks for any assembled image: the ELF identity, the
     /// single RWX `PT_LOAD` covering the whole file from offset 0, and the entry
@@ -507,12 +572,11 @@ mod tests {
         );
     }
 
-    /// The exec target is a loadable image that writes the marker and exits: word 0
-    /// is `mov x8,#64` (write), and `MPOS_EXEC_OK` sits at the address the write
-    /// loads in `x1`.
-    /// The target writes the exec marker, forks (`clone`), and has both children's
-    /// and parent's halves: write(0), clone(6)=`mov x8,#220`, cbnz(13) to word 24
-    /// (`imm19 = 11`), and both `MPOS_EXEC_OK`/`MPOS_FORK_OK` in its data.
+    /// The target writes the exec marker, forks (`clone`), and its parent `execve`s
+    /// `/musl`: word 0 is the write, word 6 is `mov x8,#220` (clone), word 13 is the
+    /// `cbnz` to the parent at word 24 (`imm19 = 11`), word 31 is `mov x8,#221`
+    /// (execve), the last is `b .`. Its data carries `MPOS_EXEC_OK`, `MPOS_FORK_OK`,
+    /// and the `/musl` path with `argv[0]` pointing at it.
     #[test]
     fn the_target_writes_then_forks() {
         let e = marker_target_elf();
@@ -522,6 +586,7 @@ mod tests {
         assert_eq!(words[0], 0xd2800808, "mov x8,#64 (write exec marker)");
         assert_eq!(words[6], 0xd2801b88, "mov x8,#220 (clone)");
         assert_eq!(words[13], 0xb5000160, "cbnz x0 -> word 24 (parent)");
+        assert_eq!(words[31], 0xd2801ba8, "mov x8,#221 (execve /musl)");
         assert_eq!(words[TARGET_WORDS - 1], 0x14000000, "b . (parent park)");
 
         let data_file_off = CODE_OFF + TARGET_WORDS * 4;
@@ -534,6 +599,17 @@ mod tests {
             &e[data_file_off + 13..data_file_off + 13 + FORK_MARKER.len()],
             FORK_MARKER,
             "the fork marker at the child write's x1"
+        );
+        assert_eq!(
+            &e[data_file_off + 26..data_file_off + 32],
+            b"/musl\0",
+            "the execve path in the parent's tail"
+        );
+        let musl_path_addr = VADDR + (data_file_off + 26) as u64;
+        assert_eq!(
+            &e[data_file_off + 40..data_file_off + 48],
+            musl_path_addr.to_le_bytes(),
+            "argv[0] points at the /musl path"
         );
     }
 

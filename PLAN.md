@@ -5736,10 +5736,16 @@ Re-measured: the same unmodified musl binary now runs to completion and prints i
 (`MPOS_MUSL_OK`) on the second machine. Pin committed: the headless `/init` now first does
 `sub sp, #0x1000` + `str x19,[sp]` (a fault past the mapped stack) and writes `MPOS_FAULT_OK`
 only if the store survives - `boot-aarch64` asserts `MPOS_FAULT_OK` before `R:echo-test`, so the
-demand-paging handler is pinned hermetically without a cross-toolchain dependency. Remaining for
-the stage-8 static-musl *image*: build a small musl helper in `xtask` and pack it into the
-aarch64 initramfs as a permanent boot pin (the binary is proven to run; wiring it into the image
-build is the mechanical follow-on), then a real shell binary.
+demand-paging handler is pinned hermetically without a cross-toolchain dependency. **Stage 8
+static-musl image - DONE.** `xtask` now builds a *real* unmodified `aarch64-unknown-linux-musl`
+helper (`rustc -C target-feature=+crt-static -C linker=rust-lld`; the target is a listed prereq of
+`boot-aarch64`, symmetric with the x86 test path's musl prereq), packs it as `/musl`, and the exec
+target's parent `execve`s it last - so `MPOS_MUSL_OK` (that binary's own `println!`) is a permanent
+`boot-aarch64` assertion. The committed chain is now `MPOS_FAULT_OK -> R:echo-test -> MPOS_EXEC_OK
+-> MPOS_FORK_OK -> MPOS_MUSL_OK -> INIT_EXITED`: demand paging, read/write, `execve`, `clone`/
+`wait4`, and an unmodified musl/Rust ELF all run at EL0 - the project's central promise on the
+second machine. What remains is a fuller shell (`ash`), the `drivers` disk root, `net`, and
+`cargo xtask test --arch aarch64`.
 
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo

@@ -149,11 +149,20 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // then ran at EL0 (PLAN.md §9.1 stage 6D).
     let launcher = crate::aarch64_init::exec_launcher_init_elf();
     let target = crate::aarch64_init::marker_target_elf();
+    // The exec target's parent execve's `/musl`, an *unmodified* statically-linked
+    // musl/Rust binary - the project's central promise that such a binary runs. If
+    // the aarch64-musl target is not installed this errors with the install command,
+    // never a silent skip.
+    let musl = crate::aarch64_init::build_static_musl_helper(build_dir)?;
     let esp = build_esp(
         build_dir,
         &kernel,
         &loader,
-        &[("init", launcher.as_slice()), ("t", target.as_slice())],
+        &[
+            ("init", launcher.as_slice()),
+            ("t", target.as_slice()),
+            ("musl", musl.as_slice()),
+        ],
     )?;
     println!("esp:    {}", esp.display());
 
@@ -254,6 +263,16 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              the parent did not wait for it)"
         );
     }
+    // The target's parent finally execve's `/musl`, an unmodified statically-linked
+    // musl/Rust binary whose `println!` writes `MPOS_MUSL_OK`. That it prints proves
+    // the kernel runs a REAL binary at EL0 - multi-segment load, the libc/Rust prologue,
+    // and the demand-paging of its pages - the central promise, on aarch64.
+    if !log.contains("MPOS_MUSL_OK") {
+        bail!(
+            "the aarch64 target never ran the unmodified musl binary: the \
+             MPOS_MUSL_OK line is absent (execve of /musl did not run)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -261,11 +280,10 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
              demand-paged stack store (MPOS_FAULT_OK), the init's echoed input \
-             (R:echo-test), the exec target (MPOS_EXEC_OK), its fork child \
-             (MPOS_FORK_OK), and INIT_EXITED - a scheduler-run userspace program that \
-             took and survived a demand-paging fault, read console input, echoed it, \
-             execve'd a second image that ran at EL0 and cloned a third - from the ESP \
-             under AAVMF"
+             (R:echo-test), the exec target (MPOS_EXEC_OK), its fork child (MPOS_FORK_OK), \
+             the unmodified musl binary (MPOS_MUSL_OK), and INIT_EXITED - a scheduler-run \
+             program that demand-paged, read, echoed, execve'd, cloned, waited, then ran \
+             a real static-musl ELF at EL0 - from the ESP under AAVMF"
         );
         return Ok(());
     }
