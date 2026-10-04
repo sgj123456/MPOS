@@ -5961,7 +5961,9 @@ Named gaps the port carries rather than hides, each with its home:
   create/write/read/stat/unlink a shell and any init issue against the filesystem
   proper, not only against device nodes. A `getcwd`/`chdir` round-trip (`cd /dev`
   and back) prints `MPOS_CWD_OK` (also asserted) - the `pwd`/`cd` pair a shell uses
-  at startup and on every directory change.
+  at startup and on every directory change. A `symlink`/`readlink` round-trip
+  (`ln -s /dev`, read the target back, remove) prints `MPOS_SYMLINK_OK` (asserted) -
+  the SYMLINKAT/READLINK handlers a loader or shell completion performs.
   This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.

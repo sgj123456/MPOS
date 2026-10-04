@@ -502,6 +502,14 @@ pub fn build_static_musl_helper(build_dir: &Path) -> Result<Vec<u8>> {
         "        cwdok = false;\n",
         "    }\n",
         "    if cwdok { println!(\"MPOS_CWD_OK\"); } else { println!(\"MPOS_CWD_FAILED\"); }\n",
+        "    // symlink + readlink: create a link to /dev, read the target back,\n",
+        "    // remove it - SYMLINKAT/READLINK/unlink, the pair `ln -s` and the\n",
+        "    // resolution step a shell or loader uses.\n",
+        "    let link = \"/plink\";\n",
+        "    let mut sok = std::os::unix::fs::symlink(\"/dev\", link).is_ok();\n",
+        "    if sok { sok = std::fs::read_link(link).map(|t| t == std::path::PathBuf::from(\"/dev\")).unwrap_or(false); }\n",
+        "    if sok { sok = std::fs::remove_file(link).is_ok(); }\n",
+        "    if sok { println!(\"MPOS_SYMLINK_OK\"); } else { println!(\"MPOS_SYMLINK_FAILED\"); }\n",
         "}\n",
     );
     let src = build_dir.join("aarch64-musl-helper.rs");

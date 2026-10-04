@@ -362,6 +362,14 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_CWD_OK line is absent (chdir into /dev and back, or getcwd, failed)"
         );
     }
+    // symlink + readlink + unlink of a symlink - SYMLINKAT/READLINK, the pair
+    // `ln -s` and the resolution a loader or shell tab-completion performs.
+    if !log.contains("MPOS_SYMLINK_OK") {
+        bail!(
+            "the aarch64 musl binary could not round-trip symlink/readlink: the \
+             MPOS_SYMLINK_OK line is absent (symlinkat/readlink/unlink failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -380,7 +388,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              which opened the mounted /dev through libc file I/O (MPOS_DEV_URANDOM_OK, \
              MPOS_DEV_CONSOLE_OK), traversed it (MPOS_DEV_GETDENTS_OK, MPOS_DEV_STAT_OK), \
              and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) and \
-             round-tripped getcwd/chdir (MPOS_CWD_OK) - from the ESP under AAVMF"
+             round-tripped getcwd/chdir (MPOS_CWD_OK) and symlink/readlink \
+             (MPOS_SYMLINK_OK) - from the ESP under AAVMF"
         );
         return Ok(());
     }
