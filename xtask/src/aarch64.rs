@@ -307,6 +307,25 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_MUSL_OK line is absent (execve of /musl did not run)"
         );
     }
+    // The musl binary then opens the mounted `/dev` through real libc file I/O:
+    // `MPOS_DEV_URANDOM_OK` means `open("/dev/urandom")` + `read_exact` returned
+    // entropy to a userspace program, and `MPOS_DEV_CONSOLE_OK` means
+    // `open("/dev/console")` + `write` reached the console. Together they prove a
+    // running userspace program uses the device set the kernel mounts - the same
+    // open/read/write a shell does - not just that `/dev` builds or resolves
+    // kernel-side. A missing line means the userspace device path is broken.
+    if !log.contains("MPOS_DEV_URANDOM_OK") {
+        bail!(
+            "the aarch64 musl binary could not read /dev/urandom: the \
+             MPOS_DEV_URANDOM_OK line is absent (userspace open/read of the mounted /dev failed)"
+        );
+    }
+    if !log.contains("MPOS_DEV_CONSOLE_OK") {
+        bail!(
+            "the aarch64 musl binary could not write /dev/console: the \
+             MPOS_DEV_CONSOLE_OK line is absent (userspace open/write of the mounted /dev failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -322,7 +341,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              verified sector read and a written sector round-tripped, and net whose TX virtqueue accepted a frame over MMIO) and mounts an ext4 filesystem \
              over the block (the disk root), and a scheduler-run program that demand-paged, \
              read, echoed, execve'd, cloned, waited, then ran a real static-musl ELF at EL0 \
-             - from the ESP under AAVMF"
+             which opened the mounted /dev through libc file I/O (MPOS_DEV_URANDOM_OK, \
+             MPOS_DEV_CONSOLE_OK) - from the ESP under AAVMF"
         );
         return Ok(());
     }
