@@ -15,7 +15,14 @@ contract. Here that is, concretely:
 - **Device `ioctl` request words** — one word per promise, dispatched in
   `src/syscall/linux/fs.rs` and served by the device's own module.
 - **Structure layouts crossing the boundary** — `struct stat`, `rt_sigframe`, `edid`,
-  `sockaddr_ll`, `struct sched_attr`, …
+  `sockaddr_ll`, `struct sched_attr`, … `struct stat` is per-ABI: aarch64 uses Linux's
+  asm-generic field order (`st_mode` u32 at 16, `st_nlink` u32 at 20, `st_rdev` u64 at 32,
+  the `timespec` seconds at 72/88/104), which differs from x86_64's (`st_nlink` u64 at 16,
+  `st_mode` at 24). `abi::write_stat` now branches the layout on `target_arch`; emitting
+  the x86_64 order on aarch64 previously made `st_mode` read the `st_nlink` value. Pin:
+  `boot-aarch64` `MPOS_STAT_OK` (mode/type/`nlink`/`ino`/`blocks`/`size` round-trip from a
+  live musl process). `statx`'s `struct statx`, by contrast, is a fixed arch-independent
+  layout and is not affected.
 - **Flag words and closed vocabularies** — `mmap`'s `MAP_*`, `madvise`'s advices,
   `clock_gettime`'s ids, `memfd_create`'s flags, `statx`'s flags, `prctl`'s options.
 - **Wire and protocol encodings userland parses** — netlink attributes, `sockaddr_ll`,
