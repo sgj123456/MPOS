@@ -5969,6 +5969,22 @@ Named gaps the port carries rather than hides, each with its home:
   prerequisite. `/proc` is a further, separate blocker (it is gated behind the net
   and PCI subsystems - see the next note), not needed for `ash` to start.
 
+  **A shell's `spawn` is blocked on aarch64 fork-COW page backing (measured).** An
+  attempt had the running musl helper call `std::process::Command::new("/leaf").output()`
+  - the exact pipe + `dup2` + `fork` + `execve` + `waitpid` sequence a shell uses to run
+  a command. The markers printed up to the spawn (`MPOS_DEV_*_OK`, `MPOS_DEV_STAT_OK`) and
+  then the process died with a userspace **data abort** (`user fault ... ESR 0x9200004f`),
+  not a clean errno. Diagnosis: the aarch64 fault handler demand-pages the stack/anon
+  regions it knows, but the child a real `fork` (clone with COW semantics) continues to
+  run in has pages that fault without being backed - the hand-encoded `clone(SIGCHLD)`
+  milestone only proved a child *reaches EL0*, not that it keeps executing in a forked
+  address space. So the concrete prerequisite for `ash` (and any program that spawns) is
+  **fork/COW page resolution on aarch64** - the child's private copy-on-write faults must
+  be handled the way the demand-pager handles the stack. Not yet built; the change was
+  reverted (no crash line shipped in the boot log). This is a sharper, code-level gap
+  than the static-busybox prerequisite above: even with a shell binary, it cannot run a
+  subcommand until fork-COW works.
+
   **`/proc` stays honestly refused on aarch64 - and it is gated, not one line from
   serving (corrected by an attempt).** An earlier note here said `vfs::procfs`
   compiled on aarch64 and the `mount -t proc` arm was a single `#[cfg]` from opening.
