@@ -8287,6 +8287,18 @@ and green alone — AGENTS §4 rule 7):
 | 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *planned* |
 | 13.5 | `cargo xtask test --arch aarch64`: the sweep boots the second machine and reads its own `=== RUN/PASS/FAIL/SUMMARY`/`END` and `M*_OK` chain with x86's verdict (summary + QEMU exit). An unsupported `--arch` is an explicit error, never a silent run of the other machine | `cargo xtask test --arch aarch64` prints a green summary; x86 unchanged; `xtask` unit tests green | *planned* |
 
+**What the remaining 169 are, and why the count stops being the metric** (measured
+2026-10-04, after §13.1 and the six §13.2 slices; per-file totals: `syscall` 82, `drivers`
+36, `sched` 23, `vfs` 7, `logging` 6, `mm` 4, `boot` 2):
+
+| Kind | Sites | Where | What it actually needs |
+|---|---|---|---|
+| Per-arch Linux ABI and not-yet-ported handlers | ~105 | `syscall` (`ioctl` 26, `proc` 23, `mod` 11, `file` 11, `fs/mod` 4, `syscall/mod` 3, `nr` 2, `abi` 2) · `sched/runtime` 22 + `sched/mod` 1 | §11.4's S4 extended to the **syscall gate frame**: move `RegsFrame` and its conversions (`capture_frame`/`apply_frame`/`user_ip`) into `arch/x86_64/`, exposed through `hal` as the operations the ABI layer needs (`to_regs`/`from_regs`/`ip`/`sp`/`set_exec_return`). Not a flag: this *is* the ABI's shape, and the thread-pointer/TLS and ptrace arms go with it |
+| Port-progress ledger | ~43 | `drivers` 36 (the x86-only submodules, the PCI virtio transports) · `vfs` 7 (`p9`/`procfs`/`sysfs`/`vcmux`, `tty`'s KD/VT imports) | Nothing here: it disappears when aarch64 parity lands (§13.3–13.5). Renaming to `mpos_driver_*` would spell the same architecture knowledge differently and outlive the port |
+| Machine identity | 4 | `mm/elf.rs` (the `e_machine` this kernel is) · `syscall`'s `uname` machine name | Cannot go through `hal`: the host-compiled `mm`/`syscall` need the answer too and `hal` is bare-metal-only, so `cfg!`/`#[cfg]` is the right tool for an identity, not a leak |
+| Stale gates, unpinnable as they stand | 8 | `logging` 6 · `mm/heap.rs` 2 | Both reasons are void (aarch64 has a console and a clock since stages 4a/1c), but `src/` emits **no `tracing` event at all** (measured: no `info!`/`warn!`/`error!`/`debug!`/`trace!` outside `logging.rs`), so deleting the subscriber's gate produces code nothing exercises; the heap prints are on the OOM path no test reaches. A landed behaviour needs a pin (AGENTS §4 rule 6), so each is a finding with a missing prerequisite, not a rename |
+| Allow-listed by design | `lib.rs` 17 · `main` 9 · `boot/mod.rs` 1 | the target-gating ledger and the per-arch bin arms | — |
+
 **Acceptance** (both threads together): the aarch64 gate is quotable with a summary line and exit
 code; `src/hal` names no architecture; `src/arch/` outside `lib.rs`'s module gates names no
 architecture; `cargo xtask depgraph` stays green with the `arch`-naming allow-list at zero. One
