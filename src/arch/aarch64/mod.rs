@@ -2670,9 +2670,9 @@ pub fn halt() -> ! {
 // `context` - so `crate::hal::ticks()` is exactly the `timer::ticks()` a caller
 // above the seam wants, monomorphised, with no architecture named above `arch`
 // (`AGENTS.md` §4, `PLAN.md` §9.1). x86_64's `mod.rs` is the shape template; the
-// three optional capabilities it has (`Msi`, `FpuTrap`, `Segments`) are absent
+// optional capabilities it has (`Msi`, `FpuTrap`, `SignalFrame`) are absent
 // here because this machine has no MSI controller, no lazy-FPU trap, and no
-// segment selectors - so they are *not implemented*, which is the whole point of
+// `rt_sigframe` - so they are *not implemented*, which is the whole point of
 // splitting them out.
 // ---------------------------------------------------------------------------
 

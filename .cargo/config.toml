@@ -21,10 +21,10 @@ target = "x86_64-unknown-none"
 #
 # The `mpos_*` flags are the capabilities this machine declares to `crate::hal`
 # (`src/hal/mod.rs`): the local APIC's message-signalled delivery, the 16550's
-# interrupting transmit ring, the x87 lazy-FPU trap, segment selectors, the
-# `rt_sigframe` a handler runs on, a framebuffer console to paint the
-# virtual-console grids on, a per-BAR dynamic MMIO window for device registers,
-# and a compiled network stack.
+# interrupting transmit ring, the x87 lazy-FPU trap, the `rt_sigframe` a handler
+# runs on, a framebuffer console to paint the virtual-console grids on, a
+# per-BAR dynamic MMIO window for device registers, and a compiled network
+# stack.
 # `hal` forwards each under `#[cfg(mpos_…)]` and names no architecture; the
 # machine-to-capability mapping lives here, beside the linker-script path that
 # is this file's other per-machine fact. A port declares its own set in its own
@@ -38,7 +38,6 @@ rustflags = [
     "--cfg", "mpos_msi",
     "--cfg", "mpos_serial_ring",
     "--cfg", "mpos_fpu_trap",
-    "--cfg", "mpos_segments",
     "--cfg", "mpos_signal_frame",
     "--cfg", "mpos_framebuffer_console",
     "--cfg", "mpos_dynamic_mmio_window",
@@ -65,8 +64,8 @@ rustflags = [
 # first machine declares): the seam landed with §13.4's device stage, so the
 # socket syscalls route into `net` here too, and its adapter is the MMIO window
 # `check_net` opens and `main` hands to `net::init`. It has no MSI controller, no
-# lazy FPU trap, no segment selectors and no `rt_sigframe` (`sigcontext`,
-# `rt_sigreturn`), so it declares none of the other x86_64 flags.
+# lazy FPU trap and no `rt_sigframe` (`sigcontext`, `rt_sigreturn`), so it
+# declares none of the other x86_64 flags.
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=pic",

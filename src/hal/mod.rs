@@ -24,7 +24,7 @@
 //! function. The *baseline* concerns (`Clock`, `WallClock`, `Cpu`, `Interrupts`,
 //! `Paging`, `Contexts`, `Console`) are what every machine this kernel boots on
 //! has. On top of them sit the *optional capability traits* (`Msi`, `SerialRing`,
-//! `FpuTrap`, `Segments`) for the ways one machine does something another has no
+//! `FpuTrap`, `SignalFrame`) for the ways one machine does something another has no
 //! hardware for; a port implements the baseline it must and only the capabilities
 //! it has, so an absent capability is *absent* rather than a method every machine
 //! has to fake an answer for. Which of them a build has is a `mpos_*` flag
@@ -342,9 +342,9 @@ pub trait Console {
 /// must answer. `crate::Platform` names only the baseline concerns; these are
 /// reached through their own forwards, each gated on a `mpos_*` capability flag
 /// the build declares for the target (`mpos_msi`, `mpos_serial_ring`,
-/// `mpos_fpu_trap`, `mpos_segments`, `mpos_signal_frame`, `mpos_console_input` -
-/// the sets are in `.cargo/config.toml`'s `[target.…]` blocks, beside each
-/// machine's linker script). The gate names the capability, never the
+/// `mpos_fpu_trap`, `mpos_signal_frame`, `mpos_console_input` - the sets are in
+/// `.cargo/config.toml`'s `[target.…]` blocks, beside each machine's linker
+/// script). The gate names the capability, never the
 /// architecture, so this file contains no machine name: a port declares the set
 /// it has where it already declares its script.
 /// ---------------------------------------------------------------------------
@@ -412,21 +412,6 @@ pub trait FpuTrap: Contexts {
     /// # Safety
     /// Only from the context that actually holds it.
     unsafe fn reset_live_fpu();
-}
-
-/// The segment selectors a ring-3 frame carries - a capability, not a concern,
-/// because a machine without memory segmentation has no selectors to report.
-///
-/// x86_64's `user_regs_struct` has `cs`/`ss` fields, and a tracer's register file
-/// reads them; the values come from the GDT. aarch64's `user_pt_regs` has no
-/// equivalent - its frame is `x0..x30`/`sp`/`pc`/`pstate` - so that machine is
-/// not a `Segments`, and the ABI layer that asks for `cs`/`ss` is x86-only with
-/// it.
-pub trait Segments {
-    /// The `cs`/`ss` a ring-3 frame carries on this machine, as the Linux
-    /// `user_regs_struct` reports them. Asked by the ABI layer, which fills
-    /// those two fields of a frame it builds from the syscall gate's record.
-    fn user_segments() -> (usize, usize);
 }
 
 /// The `siginfo_t` fields a handler's frame carries, in the shape the ABI layer
@@ -1277,13 +1262,6 @@ pub fn enter_signal_frame(
 #[inline]
 pub fn exit_signal_frame(bytes: &[u8], regs: &mut [u64]) -> u64 {
     <Current as SignalFrame>::exit(bytes, regs)
-}
-
-/// The `cs`/`ss` a ring-3 frame carries on this machine.
-#[cfg(mpos_segments)]
-#[inline]
-pub fn user_segments() -> (usize, usize) {
-    <Current as Segments>::user_segments()
 }
 
 // ---------------------------------------------------------------------------

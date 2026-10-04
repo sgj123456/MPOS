@@ -403,16 +403,6 @@ impl crate::hal::FpuTrap for crate::hal::Current {
     }
 }
 
-/// The `cs`/`ss` a ring-3 frame carries, read off the GDT - the optional
-/// [`crate::hal::Segments`] capability, which exists only on a machine that has
-/// segment selectors at all.
-impl crate::hal::Segments for crate::hal::Current {
-    fn user_segments() -> (usize, usize) {
-        let (code, data) = gdt::user_selectors();
-        (code.0 as usize, data.0 as usize)
-    }
-}
-
 /// The console sink: the 16550 COM1 wire, reached through `drivers::serial`.
 /// The polled `write_bytes` and the `interrupt_driven` question live here; the
 /// queue-and-park ring is the [`crate::hal::SerialRing`] capability below.
