@@ -140,8 +140,17 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
         vfs::tar::unpack_into(vfs::global(), archive).expect("the aarch64 initramfs was broken");
     mpos::println!("initramfs: {members} members unpacked");
 
-    // `/init` is read from the ramfs and loaded as a task; it lands on pid 1.
-    let init = vfs::read_file("/init").expect("the initramfs carries /init");
+    // Stage 7's root switch: `/` becomes the disk, so the tree the machine runs
+    // from is the one on the block device rather than the bootstrap ramfs. The
+    // bootstrap tree stays mounted at `/oldroot` (the semantics `pivot_root`
+    // documents) rather than being dropped, which keeps it reachable until a
+    // later cut hands its memory back.
+    switch_root();
+
+    // `/init` is read from the *disk* root and loaded as a task; it lands on
+    // pid 1. The initramfs's own copy went with the old root to `/oldroot`, which
+    // is what makes this a root switch rather than a second mount.
+    let init = vfs::read_file("/init").expect("the disk root carries /init");
     let argv = vec![String::from("/init")];
 
     // Queue a line on the tty before the init starts reading, so its `read(0,...)`
@@ -305,6 +314,63 @@ fn check_disk_root() {
     mpos::println!(
         "M7_DISK_OK: /dev/vda mounted at /mnt, /mnt/etc/inittab {} bytes read through the VFS, /mnt/init present",
         inittab.len()
+    );
+}
+
+/// Stage 7's root switch: the disk `check_disk_root` mounted at `/mnt` becomes
+/// `/`, and the ramfs the boot started on moves to `/oldroot`.
+///
+/// Everything the machine runs after this resolves against the disk tree, which
+/// is what "booting a rootfs" means and the difference between a filesystem the
+/// kernel can *read* and the filesystem the system *is*. The x86_64 machine has
+/// been on an ext4 root since its initramfs's `/init` script switched to
+/// `/dev/vda2`; this is the same arrangement reached from the other side, by the
+/// kernel instead of by an init script, because the aarch64 handoff has no
+/// script to run.
+///
+/// `/dev` is re-made on the new root: the devfs the boot mounted hangs off the
+/// tree that just moved aside, and the init opens `/dev/urandom`,
+/// `/dev/console` and `/dev` itself through libc - a root with no device nodes
+/// is not one a real init can start on.
+fn switch_root() {
+    let vfs = mpos::vfs::global();
+    let mnt = match vfs::resolve("/mnt") {
+        Ok(inode) => inode,
+        Err(e) => {
+            mpos::println!("M7_ROOT_FAILED: /mnt does not resolve before the switch: {e:?}");
+            hal::halt()
+        }
+    };
+    // `pivot_root` parks the old root at a directory *inside* the new one, so the
+    // directory has to exist on the disk first.
+    let _ = mnt.create("oldroot", mpos::vfs::NodeKind::Dir);
+    if let Err(e) = vfs::pivot_root("/mnt", "/mnt/oldroot") {
+        mpos::println!("M7_ROOT_FAILED: pivot_root to the disk gave {e:?}");
+        hal::halt()
+    }
+    // The new root's own /dev, then the claim checked rather than asserted: the
+    // disk's own file and a device node both resolve on the switched tree.
+    let root = match vfs::resolve("/") {
+        Ok(inode) => inode,
+        Err(e) => {
+            mpos::println!("M7_ROOT_FAILED: the switched root does not resolve: {e:?}");
+            hal::halt()
+        }
+    };
+    let _ = root.create("dev", mpos::vfs::NodeKind::Dir);
+    let dev = mpos::drivers::devices::standard_devfs();
+    if let Err(e) = vfs::mount("/dev", &*dev) {
+        mpos::println!("M7_ROOT_FAILED: mounting devfs on the new root gave {e:?}");
+        hal::halt()
+    }
+    if vfs::resolve("/etc/inittab").is_err() || vfs::resolve("/dev/urandom").is_err() {
+        mpos::println!(
+            "M7_ROOT_FAILED: the switched root serves neither /etc/inittab nor /dev/urandom"
+        );
+        hal::halt()
+    }
+    mpos::println!(
+        "M7_ROOT_OK: / is the disk rootfs, the ramfs moved to /oldroot, /dev re-mounted, /etc/inittab and /dev/urandom resolve"
     );
 }
 

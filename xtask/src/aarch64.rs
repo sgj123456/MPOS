@@ -104,7 +104,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// check runs right after the rng one, so `M7_BLK_OK` is not a terminator and
 /// `M7_BLK_FAILED` is. Stage 8's net check runs right after the block one, so
 /// `M8_NET_OK` is not a terminator and `M8_NET_FAILED` is.
-const TERMINATORS: [&str; 23] = [
+const TERMINATORS: [&str; 24] = [
     "INIT_EXITED",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
@@ -118,6 +118,7 @@ const TERMINATORS: [&str; 23] = [
     "M7_BLK_FAILED",
     "M7_FS_FAILED",
     "M7_DISK_FAILED",
+    "M7_ROOT_FAILED",
     "M7_DEV_FAILED",
     "M8_NET_FAILED",
     "M8_INPUT_FAILED",
@@ -251,6 +252,10 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         (
             "M7_DISK_OK",
             "disk root: /dev/vda mounted at /mnt, a rootfs/ tree file read through the VFS",
+        ),
+        (
+            "M7_ROOT_OK",
+            "root switch: / is the disk rootfs, /dev re-mounted on it",
         ),
         ("M7_DEV_OK", "/dev device set builds and reads entropy"),
         (
