@@ -414,9 +414,15 @@ pub(crate) fn write_stat(
             (at(40) as *mut u64).write_unaligned(0u64); // the aarch64 pad before st_size
             (at(56) as *mut u32).write_unaligned(512u32); // st_blksize (4-byte)
             (at(64) as *mut u64).write_unaligned(blocks); // st_blocks
-            (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atime
-            (at(80) as *mut i64).write_unaligned(times.mtime as i64); // st_mtime
-            (at(88) as *mut i64).write_unaligned(times.ctime as i64); // st_ctime
+            // The three clocks are 16-byte `struct timespec`s on aarch64, so the
+            // second-halves sit at 72 / 88 / 104 with the nanosecond slots (80,
+            // 96, 112) left zero - not the folded x86_64 spacing the other branch
+            // uses. This kernel's filesystems stamp atime/mtime/ctime to the same
+            // creation second, so the helper cannot tell the three apart by value;
+            // the sec offsets here follow Linux's aarch64 `struct stat` directly.
+            (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atim.tv_sec
+            (at(88) as *mut i64).write_unaligned(times.mtime as i64); // st_mtim.tv_sec
+            (at(104) as *mut i64).write_unaligned(times.ctime as i64); // st_ctim.tv_sec
         }
     }
     0
