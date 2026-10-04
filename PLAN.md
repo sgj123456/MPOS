@@ -5747,6 +5747,24 @@ target's parent `execve`s it last - so `MPOS_MUSL_OK` (that binary's own `printl
 second machine. What remains is a fuller shell (`ash`), the `drivers` disk root, `net`, and
 `cargo xtask test --arch aarch64`.
 
+**Measured follow-on: a heap-using musl binary faults on aarch64 (loader/mmap).** The
+committed `/musl` helper prints `MPOS_MUSL_OK` and exits - a print-only real binary runs,
+which is the pinned proof. But extending it to `vec![0u8; 256*1024]` and summing the buffer
+made it take a `user fault at 0x20171e (ESR 0x92000021)` - a Data Abort (EC `0x24`) with
+`WnR`=0, i.e. a *read* - at an address inside the image's first `PT_LOAD`, before printing.
+`map_image` maps the full `align_up(memsz)` page range per segment with correct AP (it
+rounds up and zero-fills `.bss`), so the segments themselves are present; the suspect is the
+general real-`ET_EXEC` startup memory, not the segment loop: either the process's `brk`/`mmap`
+heap (`map_anon`/`brk` base for the musl allocator on aarch64), a GOT/relocation the C
+prologue dereferences that `apply_rela` (which runs only when there is no interpreter) does
+not set for this layout, or an early stack read past `USER_STACK_PAGES`. A real binary that
+allocates therefore is NOT yet proven - only print-only. This is a focused, bounded debugging
+task (dump the faulting mapping + the child's auxv/`brk` and reproduce with a `brk`-only
+helper) and a prerequisite before `ash` can run; it is named, not papered over - the
+`MPOS_MUSL_OK` pin was left at the print-only helper precisely so the committed green is a
+claim it can back.
+
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
