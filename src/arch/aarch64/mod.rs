@@ -224,6 +224,7 @@ pub unsafe fn boot(handoff: *const Handoff, milestone: fn(), init: fn(*const u8,
     check_paging(&info, &sections, frames);
     check_virtio(&info);
     check_rng(&info);
+    check_blk(&info);
     check_timer();
     check_context();
     check_user_memory();
@@ -727,6 +728,9 @@ const VIRTIO_VERSION_MODERN: u32 = 2;
 /// answers `DeviceID` 4 (vendor "QEMU"), and the driver crate's `DeviceType::Rng`
 /// is the same 4, so `VirtIORng::new` accepts the window this selects.
 const VIRTIO_ID_RNG: u32 = 4;
+/// `DeviceID` for the block device (`VIRTIO_ID_BLOCK`), the second device driven
+/// over MMIO - the disk root the drivers stage names (`PLAN.md` §9.1).
+const VIRTIO_ID_BLOCK: u32 = 2;
 
 /// One 32-bit read of a device's registers, through the kernel's own tables.
 fn read_device(virt: usize, offset: usize) -> u32 {
@@ -956,6 +960,82 @@ fn check_rng(info: &BootInfo) {
         "virtio-rng over MMIO installed, returned 32 bytes (sum {sum})"
     );
     let _ = writeln!(out, "M7_RNG_OK");
+}
+
+/// Stage 7's second driven device over MMIO: virtio-blk, verified by a read.
+///
+/// `check_rng` proved a request device answers; a block device is the one the
+/// disk root needs, and it is driven the same way - open the window whose
+/// `DeviceID` is 2 (`VIRTIO_ID_BLOCK`) as an `MmioTransport`, hand it to the
+/// crate's `VirtIOBlk`. The pin is a *verified* read, not a call that returned:
+/// the ESP's boot path lays down a raw image whose first sector is `byte[i] ==
+/// i as u8`, and this reads sector 0 and checks that pattern, so a device that
+/// answered but delivered the wrong bytes fails rather than passing. The
+/// filesystem mount over it is the later step; this is the driver working.
+fn check_blk(info: &BootInfo) {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+
+    /// Say which claim failed and stop; the marker is what `xtask boot-aarch64`
+    /// polls for.
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M7_BLK_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    let Some(bytes) = info.dtb else {
+        fail!("the record carries no device tree");
+    };
+    let tree = match fdt::Fdt::new(bytes) {
+        Ok(tree) => tree,
+        Err(error) => fail!("the device tree will not walk: {error:?}"),
+    };
+
+    let mut blk: Option<(usize, usize)> = None;
+    let walked = tree.each(
+        |node| node.is_compatible("virtio,mmio"),
+        |node| {
+            if blk.is_some() {
+                return true;
+            }
+            for (address, size) in node.reg() {
+                let (address, size) = (address as usize, size as usize);
+                let Some(virt) = paging::device_virt(address, size) else {
+                    continue;
+                };
+                if read_device(virt, VIRTIO_MMIO_MAGIC) == VIRTIO_MAGIC
+                    && read_device(virt, VIRTIO_MMIO_DEVICE_ID) == VIRTIO_ID_BLOCK
+                {
+                    blk = Some((virt, size));
+                    break;
+                }
+            }
+            true
+        },
+    );
+    if let Err(error) = walked {
+        fail!("the device tree will not walk: {error:?}");
+    }
+    let Some((virt, size)) = blk else {
+        fail!("the tree describes no virtio-blk (device {VIRTIO_ID_BLOCK}) window");
+    };
+
+    let mut buf = [0u8; crate::drivers::virtio::mmio::SECTOR];
+    if crate::drivers::virtio::mmio::read_blocks(virt, size, &mut buf).is_none() {
+        fail!("the virtio-blk at {virt:#x} did not complete a sector read");
+    }
+    // The pattern the image was written with: byte `i` is `i as u8`. A device
+    // that reads but returns the wrong bytes - a bad queue, a bogus DMA address,
+    // the wrong window - fails here, which is the whole point of a *verified*
+    // read rather than a call that returned.
+    if !buf.iter().enumerate().all(|(i, &b)| b == i as u8) {
+        fail!("the sector virtio-blk returned did not match the known pattern");
+    }
+    let _ = writeln!(out, "virtio-blk over MMIO read a verified sector");
+    let _ = writeln!(out, "M7_BLK_OK");
 }
 
 /// Where the EL0 check's three pages go, in the low half - the half a process

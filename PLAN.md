@@ -5847,9 +5847,16 @@ Named gaps the port carries rather than hides, each with its home:
   278) and `/dev/urandom` were already served on aarch64 off `rand::fill`; they now draw a
   hardware-seeded ChaCha stream. A machine with no rng window falls back to clock-only
   (still unpredictable to a process on it), the honest refusal, never a fake entropy claim.
-  What remains is `blk` (a disk root), `/dev/hwrng` over the aarch64 devfs, GIC line routing
-  to turn the polled `Console` into `SerialRing`, `net`, and then the aarch64 `ash` rootfs
-  and `cargo xtask test --arch aarch64`.
+  **Stage 7's second driven device over MMIO - virtio-blk, DONE (the block commit):**
+  `drivers::virtio::mmio::read_blocks` opens the tree's block window (`DeviceID` 2,
+  `VIRTIO_ID_BLOCK`) as an `MmioTransport` and hands it to the crate's `VirtIOBlk`; the
+  boot attaches a raw 1 MiB image whose every byte is `i as u8` over a `virtio-blk-device`
+  MMIO transport, and `check_blk` reads sector 0 and *verifies* the pattern - so `M7_BLK_OK`
+  means a real block read came back with the right bytes, not merely that a request
+  returned. The filesystem mounted over it (the disk root) is the next step; this is the
+  block driver working. What remains is mounting a rootfs over that block, `/dev/hwrng`
+  over the aarch64 devfs, GIC line routing to turn the polled `Console` into `SerialRing`,
+  `net`, and then the aarch64 `ash` rootfs and `cargo xtask test --arch aarch64`.
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the

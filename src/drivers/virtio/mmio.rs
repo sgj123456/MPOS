@@ -24,10 +24,40 @@ use core::cell::RefCell;
 use core::ptr::NonNull;
 
 use critical_section::Mutex;
+use virtio_drivers::device::blk::VirtIOBlk;
 use virtio_drivers::device::rng::VirtIORng;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use super::hal::HalImpl;
+
+/// Read the first `out.len() / 512` sectors of the virtio-blk device whose
+/// register block is mapped at `virt` (spanning `size`) into `out`.
+///
+/// `out`'s length must be a whole number of 512-byte sectors - that is the
+/// device's contract, and a caller that hands a partial sector would ask the
+/// crate to do something no block device does. `None` is an honest refusal: the
+/// block did not open as a transport, or the read failed. This is the boot
+/// milestone's probe (read a known sector back and compare), not a mounted
+/// filesystem - that is the later disk-root step - so it leaves no global behind.
+///
+/// The crate shares the caller's buffer with the device, which is why `out` must
+/// live in the direct map (a kernel stack buffer does); the caller passes that,
+/// so no bounce is needed here.
+pub fn read_blocks(virt: usize, size: usize, out: &mut [u8]) -> Option<()> {
+    // SAFETY: `virt` is an address inside the fixed device window the boot mapped
+    // whole as Device-nGnRnE and never executable (`device_virt` answers only for
+    // a range wholly inside it), `size` is the register block the tree reports,
+    // and the header is volatile device memory. `'static` is the machine's promise
+    // that the window outlives this borrow of it.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let mut blk = VirtIOBlk::<HalImpl, _>::new(transport).ok()?;
+    blk.read_blocks(0, out).ok()?;
+    Some(())
+}
+
+/// A block, as the device counts them - the sector size `virtio-blk` fixes.
+pub const SECTOR: usize = 512;
 
 /// The virtio-rng, reached over MMIO instead of a BAR.
 ///
