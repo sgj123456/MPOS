@@ -36,6 +36,11 @@ use super::{gic, halt, pl011, timer};
 /// `ESR_EL1.EC`, the top six bits, and the only field whose meaning does not
 /// depend on the class itself - which is why it is what a handler reads first.
 const EC_SVC_FROM_AARCH64: u64 = 0x15;
+/// `ESR_EL1.EC` for a Data Abort taken from a lower exception level (EL0), and an
+/// Instruction (prefetch) Abort from EL0 - the two page faults a running program
+/// takes. `WnR` (bit 7 of a Data Abort's ESR) says which way the access went.
+const EC_DATA_ABORT_EL0: u64 = 0x24;
+const EC_INSTR_ABORT_EL0: u64 = 0x20;
 
 /// `exit_group`'s number on this machine, which is not the number the x86_64
 /// table gives it (231, against 94 here).
@@ -319,7 +324,46 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
     // yet, so it says so and stops rather than resuming into the same fault.
     let esr = system_register("esr");
     let class = esr >> 26;
+    // A trap from EL0 that is not an `svc` is a fault in the program. x86's twin
+    // `page_fault` answers the three faults that are not the program's error - a
+    // copy-on-write write after a `fork`, a page of an anonymous mapping never yet
+    // touched, and a push past the end of the mapped stack - by taking the page
+    // from the allocator and letting the instruction retry. These run on aarch64
+    // through the same arch-neutral `crate::sched` resolvers, so a real program
+    // (a libc's larger stack, its thread arena, a `fork`'s COW page) can grow its
+    // memory the way the 142 x86 musl tests already do. Any fault left after them
+    // is the program's own error; Linux's answer is `SIGSEGV`, whose default action
+    // is death - delivered here as the task exiting with `-11`, which is what the
+    // aarch64 signal-frame path would end at anyway, so it is the honest answer,
+    // not a stub that resumes into the same fault forever. Before `sched::started()`
+    // (the bring-up EL0 probe) there is no task or VMA to resolve against, so those
+    // traps stay fatal.
     if class != EC_SVC_FROM_AARCH64 {
+        if crate::sched::started() {
+            let addr = system_register("far") as usize;
+            let is_write = match class {
+                EC_DATA_ABORT_EL0 => (esr >> 7) & 1 != 0,
+                EC_INSTR_ABORT_EL0 => false,
+                _ => false,
+            };
+            if class == EC_DATA_ABORT_EL0 || class == EC_INSTR_ABORT_EL0 {
+                if is_write && crate::sched::resolve_cow_fault(addr) {
+                    return 0; // The COW page split; the instruction retries.
+                }
+                if crate::sched::resolve_anon_fault(addr, is_write) {
+                    return 0; // A demand-paged anon page now backs the address.
+                }
+                if crate::sched::resolve_stack_growth(addr, frame.sp as usize) {
+                    return 0; // The stack grew over the faulting address.
+                }
+            }
+            // Not resolvable: an unhandled SIGSEGV is the task's death.
+            crate::println!("user fault at {addr:#x} (ESR {esr:#x}, pc {:#x})", frame.pc);
+            crate::sched::exit(-11);
+            // `exit` reschedules and does not return; the `return 0` below only
+            // keeps the type checker happy if it ever did (retrying would refault).
+            return 0;
+        }
         let mut out = pl011::Writer;
         let _ = writeln!(out, "\nEXCEPTION: from EL0, and not a system call");
         let _ = writeln!(out, "  ESR_EL1  {esr:#018x} (EC {class:#04x})");

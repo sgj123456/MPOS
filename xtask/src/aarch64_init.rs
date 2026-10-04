@@ -224,6 +224,16 @@ const SIGCHLD: u32 = 17;
 /// The string the exec target writes when it runs - proof aarch64 `execve`
 /// replaced the image and the new program ran at EL0. Nothing else prints it.
 const EXEC_MARKER: &[u8] = b"MPOS_EXEC_OK\n";
+/// The string the launcher writes only after its deliberately-far `str` to a
+/// never-mapped stack page survives - i.e. only if the kernel's aarch64 EL0
+/// fault handler demand-paged it. Without the handler that store is a fatal data
+/// abort and this line never appears. Nothing else prints it.
+const FAULT_MARKER: &[u8] = b"MPOS_FAULT_OK\n";
+/// `SUB SP, SP, #0x1000` and `STR X19, [SP]` - the two words that push the stack
+/// a page past what the loader mapped and touch it, to take a demand-paging fault.
+/// Verified against `llvm-objdump`'s decoding of these exact bytes.
+const SUB_SP_PAGE: u32 = 0xd140_07ff;
+const STR_X19_SP: u32 = 0xf900_03f3;
 /// The string the fork target's *child* writes - proof aarch64 `clone` (the
 /// arch's real `fork`) started a second running program. Nothing else prints it.
 const FORK_MARKER: &[u8] = b"MPOS_FORK_OK\n";
@@ -290,12 +300,14 @@ pub fn marker_target_elf() -> Vec<u8> {
     assemble_with(&code, &data)
 }
 
-/// The headless verdict's `/init`: echo the queued line (so `boot-aarch64` still
-/// shows `R:echo-test`), then `execve("/t", ["/t", NULL], [NULL])` - the last act
-/// the launcher performs. If the kernel's aarch64 `execve` works, the process
-/// image is replaced by the target and `MPOS_EXEC_OK` reaches the wire; the
-/// launcher's own `exit_group` fallback runs only if `execve` fails (honest, so a
-/// broken `execve` shows up as a missing marker rather than a hang).
+/// The headless verdict's `/init`: first it proves aarch64 EL0 demand paging by
+/// pushing `sp` a page below what the loader mapped and storing there - a fault
+/// that is fatal unless the kernel's fault handler takes the page - then writes
+/// `MPOS_FAULT_OK` only if that store survived. It then echoes the queued line (so
+/// `boot-aarch64` still shows `R:echo-test`) and `execve("/t", ...)`. If `execve`
+/// works the image becomes the target and `MPOS_EXEC_OK`/`MPOS_FORK_OK` reach the
+/// wire; the launcher's `exit_group` fallback runs only if `execve` fails - honest,
+/// so a broken `execve` is a missing marker, not a hang.
 pub fn exec_launcher_init_elf() -> Vec<u8> {
     let load = |rd: u32, addr: u64| {
         [
@@ -303,24 +315,34 @@ pub fn exec_launcher_init_elf() -> Vec<u8> {
             movk(rd, ((addr >> 16) & 0xffff) as u32),
         ]
     };
-    // 19 echo words + 8 execve words + 4 exit_group/b. fallback = 31.
+    // 8 demand-paging words (sub/str/write/svc) + 19 echo + 8 execve + 4 fallback = 39.
     let body_len = echo_body(0, 0).len();
-    let n = body_len + 8 + 4;
+    let n = 8 + body_len + 8 + 4;
     let data_base = VADDR + (CODE_OFF + n * 4) as u64;
-    // The blob the code and the pointers agree on (offsets from `data_base`):
+    // Blob offsets from `data_base`:
     //   0..64   read scratch (buf)
     //   64..66  "R:" (prefix)
     //   66..69  "/t\0" (exec path)
-    //   69..72  padding to 8 for the pointer arrays
+    //   69..72  padding to 8
     //   72..88  argv = [&"/t", NULL]
     //   88..96  envp = [NULL]
+    //   96..    "MPOS_FAULT_OK\n"
     let buf_addr = data_base;
     let prefix_addr = data_base + 64;
     let path_addr = data_base + 66;
     let argv_addr = data_base + 72;
     let envp_addr = data_base + 88;
+    let fault_addr = data_base + 96;
 
-    let mut code = echo_body(buf_addr, prefix_addr);
+    // Demand-paging probe: `sp -= 0x1000` lands one page below the mapped stack;
+    // `str x19,[sp]` faults there. If `el0_sync`'s handler demand-pages it, the
+    // store succeeds and we fall through to the write; otherwise it is SIGSEGV and
+    // `MPOS_FAULT_OK` never appears.
+    let mut code = vec![SUB_SP_PAGE, STR_X19_SP];
+    code.extend([movz(8, 64), movz(0, 1)]);
+    code.extend(load(1, fault_addr));
+    code.extend([movz(2, FAULT_MARKER.len() as u32), svc()]); // 0..7
+    code.extend(echo_body(buf_addr, prefix_addr));
     // execve(path, argv, envp): x8=221, x0=&"/t", x1=&argv, x2=&envp, svc.
     code.extend([movz(8, NR_EXECVE)]);
     code.extend(load(0, path_addr));
@@ -333,12 +355,12 @@ pub fn exec_launcher_init_elf() -> Vec<u8> {
     debug_assert_eq!(code.len(), n);
 
     // Build the data blob with the pointers written as LE u64 into it.
-    let mut data = vec![0u8; 96];
+    let mut data = vec![0u8; 96 + FAULT_MARKER.len()];
     data[64..66].copy_from_slice(PREFIX);
     data[66..66 + EXEC_PATH.len()].copy_from_slice(EXEC_PATH);
     data[72..80].copy_from_slice(&path_addr.to_le_bytes()); // argv[0] = &"/t"
     // argv[1] = NULL (0) and envp[0] = NULL (0): the zero-init already covers them.
-    debug_assert_eq!(data.len(), 96);
+    data[96..].copy_from_slice(FAULT_MARKER);
     assemble_with(&code, &data)
 }
 
@@ -393,7 +415,7 @@ mod tests {
     /// The pinned instruction counts the tests assert the built code has, which
     /// also pin that the loop's backward branch spans exactly the body.
     const LOOP_WORDS: usize = 20;
-    const LAUNCHER_WORDS: usize = 31;
+    const LAUNCHER_WORDS: usize = 39;
     const TARGET_WORDS: usize = 35;
 
     /// Shared structural checks for any assembled image: the ELF identity, the
@@ -430,38 +452,44 @@ mod tests {
             .collect()
     }
 
-    /// The exec launcher is a loadable image that echoes then calls `execve`:
-    /// word 0 is `mov x8,#63` (read), word 19 is `mov x8,#221` (execve), the last
-    /// is `b .` (after the `exit_group` fallback), and its data blob carries the
-    /// `/t\0` path plus `argv[0]` = that path's address and a NULL-terminated
-    /// `argv`/`envp`.
+    /// The exec launcher is a loadable image that first takes a demand-paging
+    /// fault (`sub sp` + `str`), writes `MPOS_FAULT_OK` if it survives, echoes,
+    /// then calls `execve`. Words: [0]=`sub sp`, [1]=`str x19,[sp]`, [2]=`mov
+    /// x8,#64` (the fault write), [8]=`mov x8,#63` (read), [14]=stash,
+    /// [27]=`mov x8,#221` (execve), [35]=`mov x8,#94` (fallback exit_group), last
+    /// `b .`. Its data blob carries the `/t\0` path, `argv[0]` = that path's
+    /// address, NULL-terminated `argv`/`envp`, then `MPOS_FAULT_OK`.
     #[test]
-    fn the_launcher_echoes_then_execs_a_target() {
+    fn the_launcher_pages_then_echoes_then_execs() {
         let e = exec_launcher_init_elf();
         assert_loadable(&e);
         let words = words_of(&e, LAUNCHER_WORDS);
         assert_eq!(words.len(), LAUNCHER_WORDS);
-        assert_eq!(words[0], 0xd28007e8, "mov x8,#63 (read)");
-        assert_eq!(words[6], 0xaa0003e9, "mov x9,x0 (stash n)");
-        assert_eq!(words[19], 0xd2801ba8, "mov x8,#221 (execve)");
-        assert_eq!(words[26], 0xd4000001, "svc (the execve)");
-        assert_eq!(words[27], 0xd2800bc8, "mov x8,#94 (exit_group fallback)");
+        assert_eq!(words[0], 0xd14007ff, "sub sp,sp,#0x1000");
+        assert_eq!(
+            words[1], 0xf90003f3,
+            "str x19,[sp] (the demand-paging fault)"
+        );
+        assert_eq!(words[2], 0xd2800808, "mov x8,#64 (fault-marker write)");
+        assert_eq!(words[8], 0xd28007e8, "mov x8,#63 (read)");
+        assert_eq!(words[14], 0xaa0003e9, "mov x9,x0 (stash n)");
+        assert_eq!(words[27], 0xd2801ba8, "mov x8,#221 (execve)");
+        assert_eq!(words[34], 0xd4000001, "svc (the execve)");
+        assert_eq!(words[35], 0xd2800bc8, "mov x8,#94 (exit_group fallback)");
         assert_eq!(words[LAUNCHER_WORDS - 1], 0x14000000, "b . (park)");
 
-        // The data section follows the 31 code words; base is VADDR + 244.
-        let data_file_off = CODE_OFF + LAUNCHER_WORDS * 4; // 244
+        let data_file_off = CODE_OFF + LAUNCHER_WORDS * 4;
         assert_eq!(
             &e[data_file_off + 66..data_file_off + 69],
             b"/t\0",
             "the exec path"
         );
-        let path_addr = VADDR + (data_file_off + 66) as u64; // 0x400136
+        let path_addr = VADDR + (data_file_off + 66) as u64;
         assert_eq!(
             &e[data_file_off + 72..data_file_off + 80],
             path_addr.to_le_bytes(),
             "argv[0] points at the /t path"
         );
-        // argv[1] and envp[0] are NULL terminators.
         assert_eq!(
             &e[data_file_off + 80..data_file_off + 88],
             &[0u8; 8],
@@ -471,6 +499,11 @@ mod tests {
             &e[data_file_off + 88..data_file_off + 96],
             &[0u8; 8],
             "envp is a lone NULL"
+        );
+        assert_eq!(
+            &e[data_file_off + 96..],
+            FAULT_MARKER,
+            "the fault marker the demand-paged store writes"
         );
     }
 

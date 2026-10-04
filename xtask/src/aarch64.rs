@@ -221,6 +221,17 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              line is absent (read(0)/write(1) round trip did not complete)"
         );
     }
+    // The launcher's very first act pushes `sp` a page below the mapped stack and
+    // stores there; that store only survives if the kernel's aarch64 EL0 fault
+    // handler demand-pages it, and `MPOS_FAULT_OK` is written immediately after.
+    // Its presence proves user page faults are serviced (the prerequisite for any
+    // real, larger program - including a static-musl binary - to run at EL0).
+    if !log.contains("MPOS_FAULT_OK") {
+        bail!(
+            "the aarch64 launcher's demand-paging store did not survive: the \
+             MPOS_FAULT_OK line is absent (el0_sync did not take the stack page)"
+        );
+    }
     // The launcher's last act is `execve("/t", ...)`. `/t` writes `MPOS_EXEC_OK`,
     // which nothing else prints - so its presence proves aarch64 `execve` replaced
     // the running image with a *second* program and that program then ran at EL0
@@ -249,10 +260,12 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
              M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
-             init's echoed input (R:echo-test), the exec target (MPOS_EXEC_OK), its fork \
-             child (MPOS_FORK_OK), and INIT_EXITED - a scheduler-run userspace program \
-             read console input, echoed it, execve'd a second image that ran at EL0 and \
-             then cloned a third - from the ESP under AAVMF"
+             demand-paged stack store (MPOS_FAULT_OK), the init's echoed input \
+             (R:echo-test), the exec target (MPOS_EXEC_OK), its fork child \
+             (MPOS_FORK_OK), and INIT_EXITED - a scheduler-run userspace program that \
+             took and survived a demand-paging fault, read console input, echoed it, \
+             execve'd a second image that ran at EL0 and cloned a third - from the ESP \
+             under AAVMF"
         );
         return Ok(());
     }

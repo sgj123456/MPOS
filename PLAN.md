@@ -5717,26 +5717,29 @@ ptrace stops remain gated as the honest `ENOSYS`/no-tracer answer. With execve+c
 served, a real shell (busybox `ash`) needs only a static-musl aarch64 `/init`/`ash` in the
 initramfs; the disk root (`drivers`), `net`, and `cargo xtask test --arch aarch64` remain.
 
-**Static-musl aarch64 image — measured gap, not yet done.** The `aarch64-unknown-linux-musl`
-target installs and `rustc -C target-feature=+crt-static -C linker=rust-lld` produces a real
-*unmodified* statically-linked `ARM aarch64` ELF (4 `PT_LOAD`s + a `PT_TLS`, entry in the text
-segment, e.g. a `println!` hello). Loading and `execve`-ing it into that image is where the
-kernel stops: it reaches EL0 and immediately takes a **data abort** - `ESR_EL1` EC `0x24`,
-`pc` inside the mapped text (`0x260160`), `FAR_EL1` a wild unmapped value (`0x0000fe2ee495d000`)
-- during the libc/Rust CRT's own startup, before `main`. The pinned `/init`/`/t` images are
-single-segment, `memsz == filesz`, and never touch libc startup, so they never exercised this
-path; the fault is therefore in the parts of userspace bring-up a real binary needs and a
-hand-encoded one does not. Candidate prerequisites, each to be confirmed by disassembling the
-musl image at the faulting `pc` and dumping the child stack, not assumed: (a) the program-header
-table `AT_PHDR` points at is not actually mapped for the aarch64 layout, so the CRT's phdr walk
-(reading `PT_TLS`/`PT_GNU_STACK`) dereferences garbage; (b) `PT_TLS` handling - copying the TLS
-image and setting the thread pointer (`TPIDR_EL0`) that `errno`/stdio read through - is done for
-x86 `fs`-base but not yet wired through the aarch64 exec path; (c) the `.bss` tail (`memsz >
-filesz`) or a segment gap is left unmapped so an early global is a garbage pointer; (d) a Rust
-startup syscall (`mmap`/`mprotect`/`sigaltstack`/`rseq`) not yet served on aarch64. This is a
-named gap with a measurement and its missing prerequisite (aarch64 userspace CRT startup: real
-multi-segment/TLS/bss loading), tracked as the stage-8 static-musl image work; it is refused,
-not faked - the kernel does not claim to run an unmodified binary it cannot.
+**Aarch64 EL0 page-fault / demand paging - DONE; the gap it explained is closed.** The
+`aarch64-unknown-linux-musl` target installs and `rustc -C target-feature=+crt-static -C
+linker=rust-lld` produces a real *unmodified* statically-linked `ARM aarch64` ELF (4 `PT_LOAD`s
++ a `PT_TLS`). First run of one: it reached EL0 and took a **data abort** (`ESR_EL1` EC `0x24`,
+`pc` in the mapped text, `FAR_EL1` a wild value) before `main`. Root cause, found by reading the
+EL0 vector rather than guessed: `el0_sync` had **no fault path at all** - any non-SVC EL0 trap
+halted with "EXCEPTION: from EL0, and not a system call". x86's `page_fault` answers the three
+non-error faults - a `fork` COW write, an untouched anon page, and a stack push past the mapped
+end - via the arch-neutral `crate::sched` resolvers (`resolve_cow_fault`/`resolve_anon_fault`/
+`resolve_stack_growth`); aarch64 never called them, so a real binary's first unbacked page was
+fatal. The pinned hand-encoded images (`memsz == filesz`, tiny stack) never touched an unbacked
+page, so this was invisible until a real libc ran. Fix: `el0_sync` now, on a data/instruction
+abort from EL0, runs the same three resolvers and returns to retry the faulting instruction; an
+unresolvable fault delivers `SIGSEGV`'s default action (the task `exit(-11)`), since aarch64
+signal-frame delivery is still the named later gap - death is the correct default, not a stub.
+Re-measured: the same unmodified musl binary now runs to completion and prints its output
+(`MPOS_MUSL_OK`) on the second machine. Pin committed: the headless `/init` now first does
+`sub sp, #0x1000` + `str x19,[sp]` (a fault past the mapped stack) and writes `MPOS_FAULT_OK`
+only if the store survives - `boot-aarch64` asserts `MPOS_FAULT_OK` before `R:echo-test`, so the
+demand-paging handler is pinned hermetically without a cross-toolchain dependency. Remaining for
+the stage-8 static-musl *image*: build a small musl helper in `xtask` and pack it into the
+aarch64 initramfs as a permanent boot pin (the binary is proven to run; wiring it into the image
+build is the mechanical follow-on), then a real shell binary.
 
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
