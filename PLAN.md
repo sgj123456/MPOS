@@ -5899,16 +5899,34 @@ Named gaps the port carries rather than hides, each with its home:
   dispatch arm in `syscall/linux/fs/file.rs` drops its `#[cfg(not(aarch64))]` - so
   a real init's `mount(2)` now builds `/dev` on this machine instead of getting
   `ENODEV`. The pin is `check_dev` moved into the **init handoff**, after
-  `vfs::tty::init()`: it builds the devfs and reads `/dev/urandom` through the trait
-  surface (`root -> lookup -> read_at`, the same moves an `open`/`read` make),
-  asserting the entropy node returns 16 bytes, and prints `M7_DEV_OK`. x86's devfs is
-  byte-for-byte unchanged (host 511, `cargo xtask test` 142/142), and `boot-aarch64`
-  now runs every marker through `INIT_EXITED` with `M7_DEV_OK` among them. The set is
-  the honest subset: no `/dev/hwrng` (this machine's entropy reaches `/dev/urandom`
-  through `rand`'s pool), no `/dev/input`/`uinput`/`fb0`/`dri` - a named gap, not a
-  stub of x86's full tree. What still has to land for a typed shell is a *userspace*
-  init that makes the `mount(2)` call this arm now serves and execs `ash`; the arm
-  serving it is this commit, the caller is the `ash`-rootfs stage.
+  `vfs::tty::init()`: it builds the devfs and reads `/dev/urandom` *and*
+  `/dev/hwrng` through the trait surface (`root -> lookup -> read_at`, the same
+  moves an `open`/`read` make), asserting both entropy nodes return their full
+  buffer - `/dev/hwrng` wraps the MMIO virtio-rng `check_rng` installed, reached
+  through the same `fill`, so it is a real host-generated stream, not a stand-in.
+  `M7_DEV_OK` is on the wire. x86's devfs is byte-for-byte unchanged (host 511,
+  `cargo xtask test` 142/142), and `boot-aarch64` runs every marker through
+  `INIT_EXITED` with `M7_DEV_OK` among them. The set is still the honest subset:
+  no `/dev/input`/`uinput` (the virtio-PCI input bus and `uinput` are x86_64's),
+  no `fb0`/`dri` (DRM is x86_64's), no `/dev/rtc` (CMOS is x86_64's) - each a named
+  gap, not a stub. What still has to land for a typed shell is a *userspace* init
+  that makes the `mount(2)` call this arm now serves and execs `ash`.
+
+  **`/proc` stays honestly refused on aarch64 - the gap is a measurement, not a
+  flag.** `vfs::procfs` already compiles on aarch64 (it is ungated in `vfs/mod.rs`)
+  and its `mount -t proc` arm carries only a `#[cfg(not(aarch64))]`, so the fs is
+  one line from being served. But `/proc/cpuinfo` is hardcoded to
+  `cpu family : x86_64 / model name : ... x86_64 processor` (`procfs.rs:1709`) - on
+  an aarch64 machine that is a wrong shape, and serving it would be the
+  "returning success for something not implemented" failure this codebase refuses.
+  The honest fix is an aarch64 `cpuinfo` backed by `MIDR_EL1` (implementer/part/
+  variant/revision read off the CPU, exposed through a `hal` capability, not
+  guessed - the `0xd08`-style constants a man page would supply are a fabrication
+  this kernel does not make). Until that exists the arm stays `ENODEV`, which is
+  the truthful answer a caller walking the type list gets. This is a real gap on
+  the init/shell path (many tools read `/proc`), named here rather than papered
+  over with a copied x86_64 string.
+
 
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
