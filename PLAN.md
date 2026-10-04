@@ -5994,7 +5994,8 @@ Named gaps the port carries rather than hides, each with its home:
   prerequisite. `/proc` is a further, separate blocker (it is gated behind the net
   and PCI subsystems - see the next note), not needed for `ash` to start.
 
-  **`std::process::Command` spawn data-aborts on aarch64 - cause not yet pinned.** An
+  **`std::process::Command` spawn data-aborts on aarch64 - cause narrowed by a
+  reproduced fault trace.** An
   attempt had the running musl helper call `std::process::Command::new("/leaf").output()`
   - the pipe + `dup2` + fork + `execve` + `waitpid` sequence a shell uses to run a
   command. The markers printed up to the spawn (`MPOS_DEV_*_OK`, `MPOS_DEV_STAT_OK`) and
@@ -6004,12 +6005,24 @@ Named gaps the port carries rather than hides, each with its home:
   the aarch64 machine already carries the full COW machinery (`sched::fork` uses
   `map_cow`/`set_cow_bit`; `arch/aarch64/paging.rs` implements `map_cow`/`resolve_cow`/
   `is_cow_page`, and `el0_sync` already calls `sched::resolve_cow_fault`). So the abort is
-  a *narrower, unresolved* fault on a specific address, not absent COW support - the
-  likeliest candidates are the `posix_spawn`/`vfork` clone flags std::process reaches for
-  (vs the plain `fork`/`clone(SIGCHLD)` the MPOS_FORK_OK milestone exercises) or a
-  particular unbacked mapping the three resolvers don't cover. Pinning it needs a fault
-  trace of the exact region + the clone request std issues; named here as an open gap,
-  not asserted as "COW unbuilt." This blocks running a *subcommand* (a shell's core), and
+  a *narrower, unresolved* fault on a specific address, not absent COW support.
+
+  A throwaway re-run captured `el0_sync`'s own fault line, which pins the region rather
+  than theorising about it: `user fault at 0x3fe1bf80 (ESR 0x9200004f, pc 0x276350)`.
+  Decoded, `ESR`'s `DFSC` is `0x0f` (a **level-3 permission fault**) with `WnR` set (a
+  **write**), and `pc 0x276350` is inside the static-musl binary's own `clone`
+  trampoline - not the kernel and not a hand-encoded image. The child that faults is
+  `posix_spawn`'s exact request, the `CLONE_VM|CLONE_VFORK` clone (the comment at
+  `runtime.rs:7985` names it: libc's `posix_spawn` clones with those flags), and that
+  child shares the parent's `stack_top` (`runtime.rs:8066/8149`). So the measurement is:
+  a `CLONE_VM|CLONE_VFORK` child writes to `0x3fe1bf80` (a page the shared address space
+  maps read-only or not at all), and none of `el0_sync`'s three resolvers -
+  `resolve_cow_fault`, `resolve_anon_fault`, `resolve_stack_growth` (`vectors.rs:350-356`) -
+  claims it, so the fault falls through to the "user fault" path and the child dies. The
+  next cut is to instrument that fall-through to log whether `0x3fe1bf80` sits *above*
+  `stack_top` (a thread/TLS region musl maps with `mmap`, outside the downward-growth
+  stack VMA) or is a COW page the split path left unmarked - then teach the matching
+  resolver to service it. This blocks running a *subcommand* (a shell's core), and
   is orthogonal to the static-busybox prerequisite above.
 
   Reading further confirms the COW path is not the bug: `resolve_cow`'s split leaf
