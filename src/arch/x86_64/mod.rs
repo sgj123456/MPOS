@@ -457,4 +457,28 @@ impl crate::hal::SerialRing for crate::hal::Current {
     }
 }
 
+/// The machine's entropy sources: `RDRAND`, when the CPU answers it, and the
+/// PCI virtio-rng device when the machine has one - both folded into the seed
+/// `crate::rand` starts from. A stretch `RDRAND` refuses to answer is left as it
+/// was rather than filled with a guess, and a machine with neither source folds
+/// in nothing: the clock mix in `crate::rand` is the floor, not a claim of
+/// entropy. Keeping the sources here is what lets `crate::rand` name no machine
+/// and no driver.
+impl crate::hal::Entropy for crate::hal::Current {
+    fn mix_into(seed: &mut [u8; 32]) {
+        if let Some(rdrand) = x86_64::instructions::random::RdRand::new() {
+            for chunk in seed.chunks_mut(8) {
+                if let Some(value) = rdrand.get_u64() {
+                    chunk.copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        if let Some(entropy) = crate::drivers::virtio::rng::entropy() {
+            for (byte, host) in seed.iter_mut().zip(entropy) {
+                *byte ^= host;
+            }
+        }
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}

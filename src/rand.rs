@@ -85,75 +85,30 @@ pub fn reseed() {
 /// A fresh seed: what the machine can be asked for, mixed with what nobody can
 /// guess about it.
 ///
-/// The hardware generator comes first when the CPU has one - on x86_64 that is
-/// `RDRAND`, which QEMU emulates as well - and the boot instant is mixed in on
-/// top of it in every case. A machine with no `RDRAND` still gets a seed that
-/// an outside caller cannot predict, because when this kernel started is not
-/// something a process on it can learn: the clock is under this kernel's
-/// control, and reads of it return as much as the kernel chooses to say.
+/// The machine's own sources come first, through `crate::hal` - `RDRAND` and the
+/// PCI virtio-rng on x86_64, the MMIO virtio-rng on aarch64, nothing at all on a
+/// machine that has neither - and the boot instant is mixed on top of them in
+/// every case. Which sources exist is the machine's to know; this function names
+/// no architecture and no driver.
+///
+/// What the clock mix buys is that a machine whose sources are absent or weak
+/// still gets a seed an outside caller cannot predict, because when this kernel
+/// started is not something a process on it can learn: the clock is under this
+/// kernel's control, and reads of it return as much as the kernel chooses to
+/// say.
 ///
 /// What this does not do is hold up boot waiting for the entropy pool to fill.
 /// A machine that boots headless has no other events to gather from, and an
 /// HTTPS client that waits forever for a better seed is worse than one that
 /// starts - the seed here is not ideal, and it is not the same twice.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(target_os = "none")]
 fn seed() -> [u8; 32] {
     let mut seed = [0u8; 32];
 
-    if let Some(rdrand) = x86_64::instructions::random::RdRand::new() {
-        for chunk in seed.chunks_mut(8) {
-            // The instruction reports "no value" rather than lying, and a
-            // refusal leaves that stretch of the seed as it was - the clock
-            // mix below still covers it.
-            if let Some(value) = rdrand.get_u64() {
-                chunk.copy_from_slice(&value.to_le_bytes());
-            }
-        }
-    }
-
-    // The host's own random source, when the machine has a virtio-rng
-    // device: bytes no software on this machine chose, which is a stronger
-    // seed than any of the three below. Mixed in rather than trusted alone -
-    // a device that answers with a weak stream still cannot make the seed
-    // worse than the machine's own sources, and XOR is what keeps that true.
-    // The boot probes the device before `init` runs, so the entropy the
-    // first caller gets is the entropy the machine had.
-    if let Some(entropy) = crate::drivers::virtio::rng::entropy() {
-        for (byte, host) in seed.iter_mut().zip(entropy) {
-            *byte ^= host;
-        }
-    }
+    crate::hal::mix_entropy(&mut seed);
 
     // The boot instant and the tick counter, mixed one byte at a time so a
     // zero-filled stretch above is not left as zeroes.
-    let epoch = crate::hal::boot_epoch();
-    let ticks = crate::hal::ticks();
-    let stamp = epoch ^ ticks.rotate_left(32);
-    for (i, byte) in seed.iter_mut().enumerate() {
-        let word = if i % 2 == 0 { epoch } else { ticks ^ stamp };
-        *byte ^= (word.rotate_left((i as u32 % 8) * 8) & 0xff) as u8;
-    }
-    seed
-}
-
-/// The aarch64 seed: the machine's MMIO virtio-rng and the boot instant. The
-/// device is installed by `check_rng` before `rand::init` runs, so the first
-/// stream is seeded from real host entropy mixed with the clock. There is no
-/// `RDRAND` here - this machine's entropy source is the device, not a CPU
-/// instruction - and a machine with no rng window falls back to the clock alone,
-/// still unpredictable to a process on it, exactly as x86_64 does when its
-/// `RDRAND` and device are both absent. The device bytes are XORed in, not
-/// trusted alone: a weak stream cannot make the seed worse than the clock.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn seed() -> [u8; 32] {
-    let mut seed = [0u8; 32];
-
-    if let Some(entropy) = crate::drivers::virtio::mmio::entropy() {
-        for (byte, host) in seed.iter_mut().zip(entropy) {
-            *byte ^= host;
-        }
-    }
-
     let epoch = crate::hal::boot_epoch();
     let ticks = crate::hal::ticks();
     let stamp = epoch ^ ticks.rotate_left(32);

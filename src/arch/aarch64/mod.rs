@@ -2965,4 +2965,20 @@ impl crate::hal::ConsoleInput for crate::hal::Current {
     }
 }
 
+/// The machine's entropy source: its MMIO virtio-rng, installed by the boot's
+/// `check_rng` before `rand::init` runs, so the first stream is seeded from
+/// bytes the host generated rather than from anything this machine chose. There
+/// is no `RDRAND` here - the device is the source - and a machine with no rng
+/// window folds in nothing, leaving the clock mix in `crate::rand` as the floor.
+/// Keeping the source here is what lets `crate::rand` name no machine.
+impl crate::hal::Entropy for crate::hal::Current {
+    fn mix_into(seed: &mut [u8; 32]) {
+        if let Some(entropy) = crate::drivers::virtio::mmio::entropy() {
+            for (byte, host) in seed.iter_mut().zip(entropy) {
+                *byte ^= host;
+            }
+        }
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}

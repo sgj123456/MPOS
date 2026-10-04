@@ -472,9 +472,25 @@ pub trait ConsoleInput {
     fn inject_input(byte: u8);
 }
 
+/// The machine's own entropy sources: a CPU instruction (`RDRAND`), a device,
+/// or - honestly - nothing.
+///
+/// A baseline concern rather than an optional capability, because the answer is
+/// always defined: a machine folds in what it has, and a machine with neither a
+/// generator instruction nor an entropy device folds in nothing, leaving the
+/// clock mix in `crate::rand` as the floor. That floor is the same on every
+/// machine and is not a claim of entropy - which sources exist, and how to read
+/// them, is the machine's to know: x86_64 reads `RDRAND` and its PCI virtio-rng,
+/// aarch64 its MMIO virtio-rng, and `crate::rand` knows none of that.
+pub trait Entropy {
+    /// Fold whatever this machine can ask for into `seed`. Bytes are XORed in,
+    /// so a weak source cannot make the seed worse than the clock alone.
+    fn mix_into(seed: &mut [u8; 32]);
+}
+
 /// A machine this kernel can run on. `Current` names the one being built.
 pub trait Platform:
-    Clock + WallClock + Cpu + Interrupts + Paging + Contexts + Console + Sized + 'static
+    Clock + WallClock + Cpu + Interrupts + Paging + Contexts + Console + Entropy + Sized + 'static
 {
 }
 
@@ -661,6 +677,12 @@ pub fn set_boot_epoch(epoch: u64) {
 #[inline]
 pub fn write_epoch(epoch: u64) -> bool {
     <Current as WallClock>::write_epoch(epoch)
+}
+
+/// Fold this machine's entropy into `seed` (see [`Entropy`]).
+#[inline]
+pub fn mix_entropy(seed: &mut [u8; 32]) {
+    <Current as Entropy>::mix_into(seed)
 }
 
 /// Whether this core would take an interrupt right now.
