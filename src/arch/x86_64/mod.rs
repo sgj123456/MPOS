@@ -265,6 +265,14 @@ impl crate::hal::Paging for crate::hal::Current {
     }
 
     #[inline]
+    fn map_mmio_window(phys: usize, len: usize) -> Option<usize> {
+        // A PCIe BAR has no fixed address, so this machine bump-allocates one
+        // kernel-half mapping per window (`crate::mm::map_mmio`); it always
+        // succeeds within the MMIO region, hence the unconditional `Some`.
+        Some(crate::mm::map_mmio(phys, len))
+    }
+
+    #[inline]
     fn translate(virt: usize) -> Option<(usize, crate::mm::MapFlags)> {
         paging::translate(virt)
     }

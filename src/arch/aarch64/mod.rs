@@ -2393,6 +2393,14 @@ impl crate::hal::Paging for crate::hal::Current {
     }
 
     #[inline]
+    fn map_mmio_window(phys: usize, len: usize) -> Option<usize> {
+        // The device window is mapped whole at boot, so a physical MMIO range
+        // inside it is already reachable: the answer is its offset into the
+        // kernel-half alias, and `None` if the range falls outside the window.
+        paging::device_virt(phys, len)
+    }
+
+    #[inline]
     fn translate(virt: usize) -> Option<(usize, crate::mm::MapFlags)> {
         // The hardware walk also says whether the page is cached as memory or
         // device; the trait's question is the frame and the permissions, so the

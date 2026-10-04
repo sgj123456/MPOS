@@ -5805,7 +5805,20 @@ Named gaps the port carries rather than hides, each with its home:
   address for this physical MMIO range" (x86 answers it with `map_mmio`, aarch64 with the
   device window) - which is a design-record change to `ARCHITECTURE.md` §2/§3 in the same
   commit, before any MMIO device is driven. That seam is the true first unit of the
-  drivers stage.
+  drivers stage. **The seam is LANDED** (the drivers-stage first commit):
+  `crate::hal::Paging::map_mmio_window(phys, len) -> Option<usize>` plus its forward, the
+  x86 body `Some(crate::mm::map_mmio(..))` (bump-allocate one mapping per BAR), the
+  aarch64 body `paging::device_virt(..)` (offset into the fixed device window); and
+  `drivers::virtio::hal::HalImpl::mmio_phys_to_virt` now answers through it instead of
+  naming `crate::mm::map_mmio` - which removes the last x86-only call from that module, so
+  the `Hal` impl the aarch64 MMIO devices will build on is machine-neutral. The `drivers →
+  hal` edge already exists (halt/ticks/`unmask`/MSI) and `hal → drivers` is zero, so this
+  adds no mutual pair and moves no depgraph constant; it is the sanctioned route, not a new
+  one. Pin: x86 `PciTransport` calls `mmio_phys_to_virt` at bring-up, so a wrong x86 body
+  fails `cargo xtask test` (every virtio device); the aarch64 body is the same
+  `device_virt` `M5_VIRTIO` already reads the transports through. What remains is the MMIO
+  *transport* over the FDT's `virtio,mmio` windows and the simplest device driven to a boot
+  marker (the next drivers commit), then `blk`/`rng`/`net` and GIC `SerialRing`.
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the

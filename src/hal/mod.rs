@@ -250,6 +250,23 @@ pub trait Paging {
     /// Map a device's register window into the kernel half.
     fn map_mmio(virt: usize, phys: usize, len: usize);
 
+    /// Map a device's MMIO window and *return* the kernel-virtual address the
+    /// caller reads its registers through - the allocation-shaped question a
+    /// driver asks, as opposed to [`map_mmio`](Self::map_mmio)'s
+    /// program-a-given-window primitive. The two machines answer it from
+    /// opposite mechanisms: x86_64 bump-allocates one fresh kernel-half mapping
+    /// per window (`crate::mm::map_mmio`), because a PCIe BAR has no fixed
+    /// address; aarch64 answers from the device window the boot maps whole, so
+    /// the range is already reachable and the answer is an offset into it
+    /// (`paging::device_virt`). `None` means this machine cannot map that
+    /// physical range - the honest refusal a caller reads, not a bogus address.
+    ///
+    /// This is the seam `PLAN.md` §9.1 names as the first unit of the aarch64
+    /// `drivers` stage: it lets `drivers::virtio` reach a device's registers
+    /// through `crate::hal` (the one machine-call route every layer above `arch`
+    /// is allowed) instead of naming `crate::mm::map_mmio`, which is x86_64-only.
+    fn map_mmio_window(phys: usize, len: usize) -> Option<usize>;
+
     /// Translate a kernel-visible address in the *active* space.
     fn translate(virt: usize) -> Option<(usize, MapFlags)>;
 
@@ -741,6 +758,13 @@ pub unsafe fn install(info: &crate::boot::BootInfo, sections: &KernelSections) -
 #[inline]
 pub fn map_mmio(virt: usize, phys: usize, len: usize) {
     <Current as Paging>::map_mmio(virt, phys, len)
+}
+
+/// Map a device's MMIO window and return the kernel-virtual address to read it
+/// through, or `None` if this machine cannot map that physical range.
+#[inline]
+pub fn map_mmio_window(phys: usize, len: usize) -> Option<usize> {
+    <Current as Paging>::map_mmio_window(phys, len)
 }
 
 /// Translate a kernel-visible address in the active address space.

@@ -50,9 +50,14 @@ unsafe impl Hal for HalImpl {
 
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
         // A BAR is not memory, so the direct map does not reach it: this is a
-        // window of the kernel half mapped on demand, one mapping per BAR.
-        NonNull::new(mm::map_mmio(paddr as usize, size) as *mut u8)
-            .expect("an MMIO window is never null")
+        // window of the kernel half mapped on demand, one mapping per BAR. The
+        // *machine* answers the kernel-virtual address through `crate::hal` -
+        // not `crate::mm::map_mmio` directly, which is x86_64-only - so this
+        // module reaches a device's registers the one way every layer above the
+        // machine layer is allowed to (`PLAN.md` §9.1's drivers-stage seam).
+        let virt = crate::hal::map_mmio_window(paddr as usize, size)
+            .expect("a mapped MMIO window is never null");
+        NonNull::new(virt as *mut u8).expect("an MMIO window is never null")
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
