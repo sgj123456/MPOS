@@ -6014,39 +6014,41 @@ Named gaps the port carries rather than hides, each with its home:
   A throwaway re-run captured `el0_sync`'s own fault line, which pins the region rather
   than theorising about it: `user fault at 0x3fe1bf80 (ESR 0x9200004f, pc 0x276350)`.
   Decoded, `ESR`'s `DFSC` is `0x0f` (a **level-3 permission fault**) with `WnR` set (a
-  **write**), and `pc 0x276350` is inside the static-musl binary's own `clone`
-  trampoline - not the kernel and not a hand-encoded image. A second throwaway re-run
-  printed, at that fall-through, `sp=0x3fd25f90  stack_range=Some((0xffff_f8xx…,
-  0xffff_f9xx…))  has_vma=false  free=false` (the exact bounds are ASLR-shifted each
-  boot, which is why the address moved from `0x3fe1bf80` to `0x3fd25f80` across runs).
-  That settles the mechanism: the fault is in the clone-*with-a-provided-stack* path -
-  the child's resume frame is `state.forked(request.child_stack)` (`runtime.rs:8105`) -
-  and the child is running at a caller-supplied stack near 1 GiB while the process's
-  reserved stack window sits at the top of the VA space. `has_vma=false` (and not a
-  clean free gap) says the child's stack region was never registered as a VMA in the
-  shared address space, so `resolve_anon_fault` has no VMA to back it and
-  `resolve_stack_growth` - which is bounded by the leader's `stack_top`/`stack_max`
-  window - rejects it too. Neither the COW split nor a page-protection bug is involved.
-  A 1 MiB `mmap`-backed heap buffer written and read back from the *same* running process
-  now prints `MPOS_MEMORY_OK`, which rules out a general `mmap`/VMA breakage: anonymous
-  demand paging works fine from userspace, so the fault is specific to the region the
-  `clone`/`vfork` path hands the child at `request.child_stack` - a stack the caller
-  expects the kernel to have made valid, which this kernel does not back the way Linux
-  does for that flag combination.
+  **write**), and `pc` is inside the static-musl binary's own `clone` trampoline.
 
-  So the fix is *where the child's stack region comes from*: Linux requires a
-  `clone`/`vfork` caller-provided stack to be valid mapped memory (musl `mmap`s a thread
-  stack, or runs the vfork child on the parent's stack); this kernel reaches the child
-  frame at `request.child_stack` without that region ever having a backing VMA, so its
-  first push faults. The precise next cut is to make the aarch64 `clone`/`vfork` path
-  establish (or validate, per what Linux does for that flag combination) the
-  caller-provided stack region as a mapped VMA before the child resumes - **not** to
-  touch the COW primitives, which §9.1 further down shows are internally consistent.
-  This edit was deliberately *not* attempted here: fork/clone and stack-window mapping are
-  the core shared machinery the x86 `cargo xtask test` 142-test gate exercises, so a
-  wrong change has wide blast radius, and a blind fix is exactly the "nearly-right is
-  worse than absent" this repo refuses. It blocks running a *subcommand* (a shell's core),
-  and is orthogonal to the static-busybox prerequisite above.
+  A third re-run instrumented `handle_clone` itself and that corrects the two earlier
+  drafts, which wrongly blamed an *unmapped* caller-supplied child stack. The request is
+  `raw_flags=0x4111` - `CLONE_VM|CLONE_VFORK|SIGCHLD`, i.e. **vfork** - with
+  `child_stack=0x3ffd05e0` *inside* the process's already-mapped stack window and
+  `parent_sp=0x3ffcef90`; the faulting address is `0x3ffcef80`, exactly `parent_sp - 16`.
+  So it is the **parent's own stack** page that faults, not the child and not an unmapped
+  region - and the `MPOS_MEMORY_OK` 1 MiB `mmap` proof from the same run had already ruled
+  out any general `mmap`/VMA breakage.
+
+  The mechanism: `clone()` routes a `CLONE_VM`-without-`CLONE_THREAD` request to
+  `spawn_copy` (the fork path), which does a full **copy-on-write** fork - it builds a
+  private child space and read-protects the *parent's* writable pages via
+  `set_cow_bit_quietly` (`runtime.rs:7480`) - and the design deliberately does **not**
+  suspend the vfork parent (the doc at `runtime.rs:7994` assumes the `posix_spawn` caller
+  waits on the child itself). A real vfork must *share* the address space and hold the
+  parent until the child execs; here the child instead gets a private copy while the
+  parent keeps running and immediately writes its now-read-protected stack just below
+  `sp`. The remaining open question for the fix is *why* that parent stack write is not
+  resolved: a hardened page should be split by `resolve_cow_fault`, so either the page
+  lacks the software `COW_BIT` (`is_cow_page` false) and `resolve_cow_fault` declines it,
+  or the stack page was not enumerated into `parent_pages` and was made read-only some
+  other way. The precise next measurement is to log `is_cow_page(parent_stack addr)` in
+  that fall-through to choose between the two.
+
+  The fix was deliberately **not** attempted here: `CLONE_VM`/`CLONE_VFORK` handling and
+  `spawn_copy` are the shared fork machinery the x86 `cargo xtask test` 142-test gate
+  exercises, so a wrong change has wide blast radius, and "nearly-right is worse than
+  absent." The two candidate corrections are both principled: either make a
+  `CLONE_VM`-without-`CLONE_THREAD` request *share* the space the way Linux vfork does, or
+  ensure every read-protected parent page carries `COW_BIT` so `resolve_cow_fault` splits
+  it on the parent's next write. This blocks running a *subcommand* (a shell's core) from
+  `cargo xtask run --arch aarch64`, and is orthogonal to the static-busybox prerequisite
+  above.
 
   Reading further confirms the COW path is not the bug: `resolve_cow`'s split leaf
   (`VALID | TABLE | attributes(flags)`, `paging.rs`) is byte-for-byte the same encoding
