@@ -31,19 +31,12 @@ use virtio_drivers::device::socket::{VsockAddr, VsockConnectionManager, VsockEve
 use virtio_drivers::transport::pci::PciTransport;
 
 use super::hal::{HalImpl, transport};
+use super::{VSOCK_PER_CONNECTION_BUFFER, VsockDevice};
 
 /// The modern device ID; virtio-vsock never had a legacy form. QEMU names
 /// the card with a guest CID on its command line, and the device reports
 /// that CID here for `getsockname` to answer with.
 const DEVICE_VSOCK: &[u16] = &[0x1053];
-
-/// How much receive room this kernel advertises per connection. The peer
-/// may not send more than this before waiting for a credit update, so the
-/// number is a window - and the manager holds a buffer of the same size
-/// per connection, so the window is one the kernel can actually honour.
-/// Public because `getsockopt(SO_SNDBUF/SO_RCVBUF)` reports it: it is the
-/// one buffer number this family really has.
-pub const PER_CONNECTION_BUFFER: u32 = 8 * 1024;
 
 pub struct VirtioVsock {
     /// The connection manager, behind a lock: every operation it offers
@@ -173,10 +166,56 @@ impl VirtioVsock {
         )?)
         .ok()?;
         let guest_cid = driver.guest_cid();
-        let manager = VsockConnectionManager::new_with_capacity(driver, PER_CONNECTION_BUFFER);
+        let manager =
+            VsockConnectionManager::new_with_capacity(driver, VSOCK_PER_CONNECTION_BUFFER);
         Some(Arc::new(VirtioVsock {
             manager: Mutex::new(RefCell::new(manager)),
             guest_cid,
         }))
+    }
+}
+
+/// The PCI transport's implementation of the seam `net/vsock.rs` holds. The
+/// family names this contract and never `virtio-pci`, so a machine reaching the
+/// same device over MMIO is a second impl of this block, not a second family.
+impl VsockDevice for VirtioVsock {
+    fn guest_cid(&self) -> u64 {
+        self.guest_cid()
+    }
+
+    fn listen(&self, port: u32) {
+        self.listen(port)
+    }
+
+    fn unlisten(&self, port: u32) {
+        self.unlisten(port)
+    }
+
+    fn connect(&self, peer: VsockAddr, port: u32) -> bool {
+        self.connect(peer, port)
+    }
+
+    fn send(&self, peer: VsockAddr, port: u32, data: &[u8]) -> bool {
+        self.send(peer, port, data)
+    }
+
+    fn recv(&self, peer: VsockAddr, port: u32, out: &mut [u8]) -> usize {
+        self.recv(peer, port, out)
+    }
+
+    fn recv_available(&self, peer: VsockAddr, port: u32) -> usize {
+        self.recv_available(peer, port)
+    }
+
+    fn poll_event(&self) -> Option<VsockEvent> {
+        self.poll_event()
+    }
+
+    fn shutdown(&self, peer: VsockAddr, port: u32) -> bool {
+        self.shutdown(peer, port)
+    }
+
+    fn force_close(&self, peer: VsockAddr, port: u32) -> bool {
+        self.force_close(peer, port)
     }
 }

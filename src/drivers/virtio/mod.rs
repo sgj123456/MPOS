@@ -21,6 +21,8 @@
 //! `net` over MMIO come as the drivers stage proceeds, so `rng` is gated to
 //! x86_64 until its MMIO path exists.
 
+use virtio_drivers::device::socket::{VsockAddr, VsockEvent};
+
 #[cfg(target_arch = "x86_64")]
 pub mod blk;
 #[cfg(target_arch = "x86_64")]
@@ -59,6 +61,105 @@ pub mod vsock;
 /// *children* of it. What a device's `driver` link names is the thing that
 /// claimed the PCI function, not the thing that claimed the disk.
 pub const PCI_DRIVER: &str = "virtio-pci";
+
+/// The network adapter, as the network stack sees it: the machine supplies one
+/// and *which transport carries it* is the machine's business.
+///
+/// The device family is the same on both machines - virtio-net - but the way it
+/// is reached is not: x86_64 takes it over a PCI BAR (`drivers::virtio::net`),
+/// while aarch64 takes it over a fixed MMIO window. `net` holds this contract and
+/// never the transport, so the stack compiles for a machine whose card is MMIO
+/// and the data path (`poll`/`transmit`/`ack_interrupt`) is the same code on
+/// both. A machine with no card has no value to hand `net::init`, which is the
+/// honest `ENETDOWN` rather than a device that pretends to answer.
+pub trait NetDevice: Send + Sync {
+    /// This adapter's hardware address - the address smoltcp's interface and
+    /// any packet socket's frames carry as their source.
+    fn mac(&self) -> [u8; 6];
+
+    /// How many frames the receive ring holds at once. The stack sizes its
+    /// advertised TCP window from this, because it is the answer to the one
+    /// question a window must not overstate: how much can arrive before
+    /// something has to be dropped.
+    fn rx_frames(&self) -> usize;
+
+    /// Take one received frame, if the device has one - `None` when the ring
+    /// is empty, never a claim of a frame that is not there.
+    fn poll(&self) -> Option<alloc::vec::Vec<u8>>;
+
+    /// Hand one frame to the device. `false` is a full or absent queue: the
+    /// frame is gone, and TCP retransmits or a datagram is lost, as on the wire.
+    fn transmit(&self, frame: &[u8]) -> bool;
+
+    /// Acknowledge the device's interrupt, if it raised one. A no-op on a
+    /// machine whose device is polled only.
+    fn ack_interrupt(&self);
+}
+
+/// The virtio socket device, as the `AF_VSOCK` family sees it.
+///
+/// The same split as [`NetDevice`] and for the same reason: the family in
+/// `src/net/vsock.rs` is protocol logic - phases, ports, the accept queue of
+/// connections the host already believes in - while the transport that carries
+/// its packets (PCI on x86_64, MMIO on aarch64) is the machine's. A machine
+/// without the device has no value to hand `net::vsock::init`, and the family
+/// answers `EAFNOSUPPORT` exactly as it does when no device probed.
+pub trait VsockDevice: Send + Sync {
+    /// The CID the hypervisor assigned this guest - the address a peer
+    /// connects *to*, and the source address everything this guest sends
+    /// carries.
+    fn guest_cid(&self) -> u64;
+
+    /// Start listening on `port`: connection requests the host sends to it are
+    /// answered by the device, and the event is handed to the family for
+    /// `accept`.
+    fn listen(&self, port: u32);
+
+    /// Stop listening: a port nobody serves has its requests refused the way a
+    /// port with no listener is refused.
+    fn unlisten(&self, port: u32);
+
+    /// Ask the host for a connection to `peer` from local `port`. The request
+    /// is sent and the call returns; the event that finishes the handshake
+    /// arrives on a later [`poll_event`](Self::poll_event).
+    fn connect(&self, peer: VsockAddr, port: u32) -> bool;
+
+    /// Send one packet. `false` when the peer's receive window is full - the
+    /// credit the protocol is named for - or the connection is gone.
+    fn send(&self, peer: VsockAddr, port: u32, data: &[u8]) -> bool;
+
+    /// Drain buffered bytes into `out`, answering the count. Zero is "nothing
+    /// yet", not end of file; the end is a disconnect event.
+    fn recv(&self, peer: VsockAddr, port: u32, out: &mut [u8]) -> usize;
+
+    /// How many bytes are buffered on the connection - what `poll(2)` reads and
+    /// a non-blocking `recv` sizes itself by.
+    fn recv_available(&self, peer: VsockAddr, port: u32) -> usize;
+
+    /// Take one event off the wire, if the host has one. The device's own
+    /// bookkeeping has already run for it, so what comes back is the family's
+    /// half of the news.
+    fn poll_event(&self) -> Option<VsockEvent>;
+
+    /// Ask the peer to stop sending and us to stop receiving - the protocol's
+    /// clean shutdown.
+    fn shutdown(&self, peer: VsockAddr, port: u32) -> bool;
+
+    /// Close the connection now, without waiting for the peer: the reset a
+    /// closing descriptor sends and a refused connection is answered with.
+    fn force_close(&self, peer: VsockAddr, port: u32) -> bool;
+}
+
+/// How much receive room this kernel advertises per vsock connection. The peer
+/// may not send more than this before waiting for a credit update, so the number
+/// is a window - and the device holds a buffer of the same size per connection,
+/// so the window is one the kernel can actually honour.
+///
+/// It lives here rather than in the PCI driver because it is the *family's* one
+/// real buffer number, not the transport's: `getsockopt(SO_SNDBUF/SO_RCVBUF)`
+/// reports it, and that answer must not depend on which machine opened the
+/// device.
+pub const VSOCK_PER_CONNECTION_BUFFER: u32 = 8 * 1024;
 
 /// The task that keeps the polled devices moving between userland calls.
 ///

@@ -25,6 +25,7 @@ use virtio_drivers::transport::pci::bus::DeviceFunction;
 
 use crate::drivers::pci;
 
+use super::NetDevice;
 use super::hal::{HalImpl, pci_root};
 use super::msix;
 
@@ -175,5 +176,31 @@ impl VirtioNet {
             device: Mutex::new(RefCell::new(device)),
             mac,
         }))
+    }
+}
+
+/// The PCI transport's implementation of the seam `net` holds. Each method is
+/// the inherent one above - this block exists so the stack can name the
+/// *contract* and never `virtio-pci`, which is what lets a machine reach the
+/// same family over MMIO without a second stack.
+impl NetDevice for VirtioNet {
+    fn mac(&self) -> [u8; 6] {
+        self.mac()
+    }
+
+    fn rx_frames(&self) -> usize {
+        self.rx_frames()
+    }
+
+    fn poll(&self) -> Option<Vec<u8>> {
+        self.poll()
+    }
+
+    fn transmit(&self, frame: &[u8]) -> bool {
+        self.transmit(frame)
+    }
+
+    fn ack_interrupt(&self) {
+        self.ack_interrupt()
     }
 }

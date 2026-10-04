@@ -698,12 +698,16 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         the disk is a bare ext4, not a partitioned image, so `rootfs.toml`'s
         `image_size`/`esp_size` geometry is still x86_64-only - a partition table buys nothing
         for a machine whose firmware boots from the ESP
-  - [~] 13.4 aarch64 `net`: **measured, not yet started** — flipping `net`'s gate costs 24
-        errors; 16 were the missing `smoltcp` dependency (declared for aarch64 now) and the
-        other 8 are the PCI NIC, the PCI vsock device and the `/proc/net` rows. The vsock
-        family is referenced from ~50 sites in `net/socket.rs`, so the honest cut is a
-        *device seam* (the machine's NIC/vsock behind a capability) before the flip, not a
-        per-site cfg
+  - [~] 13.4 aarch64 `net`: **device seam landed, gate flip pending** — `drivers::virtio` now
+        carries the transport-neutral `NetDevice`/`VsockDevice` contracts and `net`/`net::vsock`
+        hold `Arc<dyn …>`, naming no transport (the socket dispatcher still reaches vsock through
+        `net::vsock`); `VSOCK_PER_CONNECTION_BUFFER` moved beside the contract and the `/proc/net`
+        collector took `procfs`'s own gate, not a new capability name. With the gate opened by
+        hand, `cargo clippy --target aarch64-unknown-none` is **0 errors** (was 8: the PCI NIC,
+        the PCI vsock device and the four `/proc/net` rows). The flip rides with the live path —
+        `main/aarch64.rs` opening the MMIO NIC and a transmit/receive round trip — because
+        `syscall`'s socket legs are still behind `mpos_net`, so an open gate alone compiles `net`
+        with no caller and ~40 `never used` warnings
   - [ ] 13.5 `cargo xtask test --arch aarch64` boots the second machine; an unsupported
         `--arch` errors rather than silently running the other one
 
@@ -8258,7 +8262,7 @@ numbering they write down, and the real thing is what the run above shows.
 
 ---
 
-## Phase 13: Machine-seam purity and aarch64 parity — **PLAN, 13.1 LANDED; 13.2–13.5 PLANNED**
+## Phase 13: Machine-seam purity and aarch64 parity — **13.1/13.3 LANDED, 13.2 IN PROGRESS, 13.4'S DEVICE SEAM LANDED (FLIP PENDING), 13.5 PLANNED**
 
 Phase 9.1 leaves the second machine short of the first in three named places, and Phase 11.4
 closed the `hal` *seam* without closing the `hal` *file*. `crate::arch` is named by no module
@@ -8282,12 +8286,13 @@ Top holders outside `src/arch/`: `sched/runtime.rs` 30 · `syscall/linux/mod.rs`
 `syscall/linux/fs/file.rs` 15 · `hal/mod.rs` 14 · `drivers/virtio/mod.rs` 13 ·
 `drivers/devices.rs` 12 · `console.rs` 10.
 
-**aarch64's remaining gap to x86_64** (§9.1, unchanged): the `drivers` disk root, `net`, and
-`cargo xtask test --arch aarch64` (a fuller shell — `ash`/`busybox` — is the fourth item). The
+**aarch64's remaining gap to x86_64** (§9.1): `net`'s live path and
+`cargo xtask test --arch aarch64` (a fuller shell — `ash`/`busybox` — is the third item); the
+disk root landed in 13.3. The
 boot already runs a scheduler-driven EL0 program, `execve`s, `clone`s and `wait4`s a child, and
 runs an unmodified static-musl binary to completion; virtio over MMIO already drives rng, blk
-(read *and* write) and net's TX probe. What is missing is the layer above those probes — a disk
-root to mount, a socket stack to run on the transport — and a gate that boots the second machine
+(read *and* write) and net's TX probe. What is missing is the layer above those probes — a socket
+stack to run on the transport, whose seam is now in place — and a gate that boots the second machine
 instead of silently running the first: `xtask/src/main.rs` branches on `--arch` only for
 `Commands::Run`, so `test --arch aarch64` today runs x86_64 and reports its result.
 
@@ -8299,7 +8304,7 @@ and green alone — AGENTS §4 rule 7):
 | 13.1 | `hal` becomes arch-neutral: the optional-capability forwards (`Msi`, `SerialRing`, `FpuTrap`, `Segments`) and the aarch64 `ConsoleInput` forward stop being `#[cfg(target_arch)]`-gated in `src/hal/mod.rs`. The gate is a capability flag the build declares per target (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`, in `.cargo/config.toml`'s `[target.…]` blocks beside each machine's linker script, listed for `check-cfg` in `Cargo.toml`), so the file names no architecture and a machine without a capability still does not get a faked method (rule 4) | **landed** — `src/hal` `target_arch` 14 → 0; both bare-metal clippy targets clean; host lib `511 passed`; depgraph `11/11` | *landed* |
 | 13.2 | The callers stop spelling the architecture: `console.rs`, `sched/runtime.rs`, `logging.rs`, `rand.rs`, `mm/{elf,heap}.rs` and the `syscall/**` gates express the machine difference through `hal`/capability flags or the ABI layer instead of `target_arch`. The per-arch register/struct ABI facts (`user_regs_struct`, `struct stat`, the signal frame) move to their `arch/<arch>/` home — the §11.4 boundary, kept, not erased | host tests + full QEMU gate (trap/fault/context paths) | *in progress* — landed `console.rs` (10), `uevent.rs` (4), `mm/mod.rs` (4), the `sched` FPU-trap protocol (8), `syscall`'s socket legs (22) and `rand.rs` (2, via a new baseline `hal::Entropy`), on `mpos_framebuffer_console`/`mpos_serial_ring`, `mpos_net`, `mpos_dynamic_mmio_window` and `mpos_fpu_trap`; 169 sites remain outside `src/arch/` |
 | 13.3 | aarch64 disk root: the MMIO virtio-blk already read/write-verified (`M7_BLK_OK`) and the ext4 it mounts (`M7_FS_OK`) become the machine's root; `xtask` assembles the aarch64 disk from `rootfs.toml`'s geometry and the `rootfs/` tree | a boot marker that a rootfs *file* was read, not merely that an ext4 mounted | **landed** — the ext4 is registered as `vda`; `xtask` lays the `rootfs/` overlay and the init images on it; the machine pivots its root onto the disk (`/` = ext4, ramfs at `/oldroot`), re-mounts `/dev` and runs the disk's `/init` as pid 1 (`M7_DISK_OK`, `M7_ROOT_OK`), with the init's file lifecycle now running on ext4 |
-| 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *blocked on a seam, measured* — flipping `net`'s gate cost **24** errors: 16 were only the missing `smoltcp` dependency (now declared in `Cargo.toml`'s aarch64 block), and the remaining 8 are `drivers::virtio::net` (the PCI NIC), `drivers::virtio::vsock` and the four `/proc/net` rows net hands `vfs::procfs`. The vsock family is the blocker, not the work: it is referenced from **~50** sites across `net/socket.rs`'s dispatcher, so a per-site cfg would thread the machine through every socket handler *and* owe each one an aarch64 refusal. The next cut is therefore the seam first — the machine's NIC and vsock device behind a capability the MMIO transport implements — and the gate flip after it |
+| 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *blocked on a seam, measured* — flipping `net`'s gate cost **24** errors: 16 were only the missing `smoltcp` dependency (now declared in `Cargo.toml`'s aarch64 block), and the remaining 8 are `drivers::virtio::net` (the PCI NIC), `drivers::virtio::vsock` and the four `/proc/net` rows net hands `vfs::procfs`. The vsock family is the blocker, not the work: it is referenced from **~50** sites across `net/socket.rs`'s dispatcher, so a per-site cfg would thread the machine through every socket handler *and* owe each one an aarch64 refusal. **The seam is landed**: `drivers::virtio` carries the transport-neutral contracts `NetDevice`/`VsockDevice`, `net` and `net::vsock` hold the machine's adapter and device as `Arc<dyn …>` and name no transport (the socket dispatcher reaches vsock through `net::vsock` exactly as before), `VSOCK_PER_CONNECTION_BUFFER` moved beside the contract, and the `/proc/net` collector took `procfs`'s own gate rather than a new capability. With the gate opened by hand, `cargo clippy --target aarch64-unknown-none` is **0 errors** (was 8); the flip waits for the live path, because with `syscall`'s socket legs still behind `mpos_net` an open gate would compile `net` with no caller (~40 `never used` warnings). Next: the flip together with the MMIO NIC wired into `main/aarch64.rs` and a transmit/receive round trip |
 | 13.5 | `cargo xtask test --arch aarch64`: the sweep boots the second machine and reads its own `=== RUN/PASS/FAIL/SUMMARY`/`END` and `M*_OK` chain with x86's verdict (summary + QEMU exit). An unsupported `--arch` is an explicit error, never a silent run of the other machine | `cargo xtask test --arch aarch64` prints a green summary; x86 unchanged; `xtask` unit tests green | *planned* |
 
 **What the remaining 169 are, and why the count stops being the metric** (measured
@@ -8322,8 +8327,9 @@ and lives in `arch/<arch>/` (§11.4) — "no leak" means a port writes `arch/<ar
 shared file, not that a register frame becomes neutral.
 
 **Where this lands**: status in §9.1 (parity) and §11.4 (purity); `ARCHITECTURE.md` §2/§3 in the
-same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1 has
-landed** (the `hal` capability flags); 13.2–13.5 are still a plan. The board's `9.1` line above is
+same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1 and 13.3 have
+landed**, 13.2 is in progress, and 13.4's device seam has landed with its flip pending; 13.5 is
+still a plan. The board's `9.1` line above is
 stale where it says "stages 3-8 remain" — §9.1's own status list is the truth.
 
 ---

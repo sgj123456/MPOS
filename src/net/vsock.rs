@@ -32,7 +32,7 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 
-use crate::drivers::virtio::vsock::VirtioVsock;
+use crate::drivers::virtio::VsockDevice;
 use crate::err;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use virtio_drivers::device::socket::{VsockAddr, VsockEvent, VsockEventType};
@@ -66,7 +66,7 @@ const SEND_CHUNK: usize = 4096;
 
 /// The whole family's state: the device, and the sockets it serves.
 struct VsockStack {
-    dev: Arc<VirtioVsock>,
+    dev: Arc<dyn VsockDevice>,
     /// Every open socket, by id - the same registry shape the network
     /// stack and the unix family keep, so `accept` has somewhere to put
     /// the socket it mints and `close` has somewhere to retire one.
@@ -95,8 +95,10 @@ pub fn up() -> bool {
 }
 
 /// Bring the family up over a device the boot probed. Called once; the
-/// device either answered the bus or did not.
-pub fn init(dev: Arc<VirtioVsock>) {
+/// device either answered the bus or did not - and a machine that never calls
+/// this has no device, so the family stays down and `socket(AF_VSOCK)` answers
+/// the `EAFNOSUPPORT` a family the kernel does not speak gives.
+pub fn init(dev: Arc<dyn VsockDevice>) {
     critical_section::with(|cs| {
         let mut stack = STACK.borrow(cs).borrow_mut();
         if stack.is_none() {

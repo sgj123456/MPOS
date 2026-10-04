@@ -4072,7 +4072,7 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
             SO_ERROR => 0,
             // The window the device advertises per connection - the one
             // real buffer number this family has.
-            SO_SNDBUF | SO_RCVBUF => crate::drivers::virtio::vsock::PER_CONNECTION_BUFFER as i32,
+            SO_SNDBUF | SO_RCVBUF => crate::drivers::virtio::VSOCK_PER_CONNECTION_BUFFER as i32,
             _ => 0,
         };
         unsafe {

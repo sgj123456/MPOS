@@ -71,7 +71,7 @@ use smoltcp::wire::{
     Ipv4Address,
 };
 
-use crate::drivers::virtio::net::VirtioNet;
+use crate::drivers::virtio::NetDevice;
 
 /// The address QEMU's user network hands out on its virtual wire.
 pub(crate) const LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
@@ -959,8 +959,7 @@ pub(crate) fn packet_mac() -> Option<[u8; 6]> {
 /// (the Arc outlives the borrow, and the transmit is the driver's own).
 /// `ENETDOWN` with no card; a refused queue is `EIO`, not a lost silence.
 pub(crate) fn packet_transmit(frame: &[u8]) -> Result<usize, isize> {
-    let device: Option<Arc<crate::drivers::virtio::net::VirtioNet>> =
-        with_stack(|st| st.eth.device.net.clone());
+    let device: Option<Arc<dyn NetDevice>> = with_stack(|st| st.eth.device.net.clone());
     match device {
         Some(device) => {
             if device.transmit(frame) {
@@ -984,6 +983,13 @@ pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
 /// Walks every registry entry, reads the smoltcp socket behind the ones of the
 /// requested kind, and reduces each to a `NetRow` the procfs formatter prints.
 /// A stack that never came up yields nothing.
+///
+/// Gated with `procfs`'s own condition rather than a new `mpos_*` capability:
+/// the only caller is `/proc/net`, so this collector and the `NetRow` type it
+/// builds exist exactly where procfs does. procfs is still x86_64's and its port
+/// is its own cut (`PLAN.md` §13's port-progress ledger) - this reference goes
+/// with it instead of inventing a capability no other caller would declare.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> {
     use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
     let zero = || IpEndpoint {
@@ -1768,14 +1774,15 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
     polled.unwrap_or(crate::vfs::Ready::NONE)
 }
 
-/// Bring the stack up: probe the PCI bus for a virtio-net adapter, build the
-/// interface around it, and stamp in the static QEMU-user configuration.
-/// Returns `false` when no adapter answers, in which case every socket call
-/// answers `ENETDOWN` and the rest of the system runs as before.
-pub fn init() -> bool {
-    let Some(dev) = VirtioNet::init() else {
-        return false;
-    };
+/// Bring the stack up over `dev`, the machine's network adapter: build the
+/// interface around it and stamp in the static QEMU-user configuration.
+///
+/// Finding the adapter is the *machine's* step, not the stack's - a PCI probe
+/// on x86_64, an MMIO window on aarch64 - which is why it arrives as an
+/// argument through the [`NetDevice`] seam. A machine with no adapter never
+/// calls this and leaves every socket call answering `ENETDOWN`, which is where
+/// the stack already was before it came up.
+pub fn init(dev: Arc<dyn NetDevice>) {
     let mac = dev.mac();
 
     let mut device = NicDevice {
@@ -1841,7 +1848,6 @@ pub fn init() -> bool {
             eth_name: String::from("eth0"),
         });
     });
-    true
 }
 
 /// Spawn the task that keeps the interface moving between userland polls.
@@ -1896,7 +1902,7 @@ static NET: Mutex<RefCell<Option<Stack>>> = Mutex::new(RefCell::new(None));
 /// carries at most one arrived frame between `receive` calls, because the
 /// `Device` contract hands frames over one token pair at a time.
 struct NicDevice {
-    net: Arc<VirtioNet>,
+    net: Arc<dyn NetDevice>,
     /// A frame polled but not yet consumed: `receive` must return the *same*
     /// frame on a repeat call, since smoltcp may drop the token pair without
     /// reading it (a run with nothing to send, for instance).
@@ -1977,7 +1983,7 @@ impl RxToken for FrameRx {
 
 /// An outgoing frame: smoltcp fills the buffer, the driver sends it.
 struct FrameTx {
-    net: Arc<VirtioNet>,
+    net: Arc<dyn NetDevice>,
 }
 
 impl TxToken for FrameTx {

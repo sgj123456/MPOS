@@ -1430,12 +1430,17 @@ fn check_ipc() {
 /// does - it is what keeps a connection moving while its owner is blocked -
 /// which is why it is started permanent rather than by `spawn`.
 fn init_net() {
-    if mpos::net::init() {
-        mpos::net::spawn_service();
-        println!("net: virtio-net up at 10.0.2.15/24, gateway 10.0.2.2");
-    } else {
+    // The adapter is this machine's to find - the PCI bus is where x86_64's
+    // virtio-net lives - and the stack receives it through the `NetDevice`
+    // seam rather than probing for it, so a machine whose card is MMIO hands
+    // over its own device and the stack above is the same code.
+    let Some(dev) = mpos::drivers::virtio::net::VirtioNet::init() else {
         println!("net: no virtio-net device on the bus; sockets answer ENETDOWN");
-    }
+        return;
+    };
+    mpos::net::init(dev);
+    mpos::net::spawn_service();
+    println!("net: virtio-net up at 10.0.2.15/24, gateway 10.0.2.2");
 }
 
 /// Bring up the rest of the virtio devices: the entropy source, the console

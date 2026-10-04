@@ -178,16 +178,15 @@ pub mod mm;
 /// The network stack, and the socket syscalls over it. Host builds skip it:
 /// its tests are the conformance programs that run on the machine.
 ///
-/// aarch64 is not here yet, and §13.4 measured why: flipping the gate cost 24
-/// errors, 16 of them only the missing `smoltcp` dependency (now declared in
-/// `Cargo.toml`'s aarch64 block), and the remaining 8 are the two *device-backed*
-/// families - `drivers::virtio::net` (the PCI NIC) and `drivers::virtio::vsock` -
-/// plus the four `/proc/net` rows net hands `vfs::procfs`. The vsock family is
-/// the blocker: it is referenced from ~50 sites across `net/socket.rs`'s
-/// dispatcher, so gating it per site would thread a cfg through every socket
-/// handler *and* owe each one an aarch64 refusal. The honest cut is therefore a
-/// seam first - the machine's NIC and vsock device behind a capability the MMIO
-/// transport implements - and the flip after it, not a smaller diff now.
+/// The gate is still x86_64's even though the stack now *compiles* for aarch64:
+/// §13.4's measured blockers were the two device-backed families
+/// (`drivers::virtio::net`, the PCI NIC, and `drivers::virtio::vsock`) plus the
+/// four `/proc/net` rows net hands `vfs::procfs`, and the device seam for the
+/// first two has landed - `net` holds `Arc<dyn drivers::virtio::{NetDevice,
+/// VsockDevice}>` and names no transport, so with the gate opened by hand
+/// `cargo clippy --target aarch64-unknown-none` is 0 errors. The flip waits for
+/// the live path: `syscall`'s socket legs are still behind `mpos_net` (an x86
+/// capability), so an open gate alone would compile this module with no caller.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod net;
 /// The PCI devices the machine has, and the files `/sys` and `/proc` describe
