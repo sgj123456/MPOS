@@ -45,11 +45,12 @@ pub(crate) mod posix;
 /// call just completed, which is what `SA_RESTART` needs to decide whether the
 /// interrupted call is one Linux runs again (`abi::restartable`).
 ///
-/// Deferred off aarch64: it rewrites the x86 return frame, and the aarch64
-/// signal frame (`sigcontext`, `rt_sigreturn`) is a named gap that lands with
-/// that machine's signal stage. The call site in `linux_dispatch` is gated to
-/// match, so aarch64 simply never delivers a handler on syscall exit.
-#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+/// Gated on the machine declaring a signal frame (`mpos_signal_frame`): the
+/// frame's layout, and the `rt_sigreturn` that unwraps it, are the machine's
+/// ABI. A port without one is not delivered a handler at all - the call site in
+/// `linux_dispatch` is gated to match - rather than handed a frame the machine
+/// would have to guess at (`PLAN.md` §13.2).
+#[cfg(mpos_signal_frame)]
 pub fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     proc::deliver_signal(regs_ptr, nr, ret)
 }
@@ -384,7 +385,7 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         nr::INOTIFY_RM_WATCH => fs::handle_inotify_rm_watch(args),
         nr::RT_SIGACTION => sigaction(args),
         nr::RT_SIGPROCMASK => rt_sigprocmask(args),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_signal_frame)]
         nr::RT_SIGRETURN => proc::handle_rt_sigreturn(regs_ptr),
         #[cfg(not(target_arch = "aarch64"))]
         nr::ARCH_PRCTL => handle_arch_prctl(args),

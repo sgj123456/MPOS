@@ -22,7 +22,9 @@ contract. Here that is, concretely:
   the x86_64 order on aarch64 previously made `st_mode` read the `st_nlink` value. Pin:
   `boot-aarch64` `MPOS_STAT_OK` (mode/type/`nlink`/`ino`/`blocks`/`size` round-trip from a
   live musl process). `statx`'s `struct statx`, by contrast, is a fixed arch-independent
-  layout and is not affected.
+  layout and is not affected. `rt_sigframe`/`sigcontext` is per-ABI as well and lives with
+  its machine since §13.2's Stage 2 — `src/arch/x86_64/signal.rs`, behind `hal::SignalFrame`
+  — because `__restore_rt` reads the saved registers back at fixed offsets.
 - **Flag words and closed vocabularies** — `mmap`'s `MAP_*`, `madvise`'s advices,
   `clock_gettime`'s ids, `memfd_create`'s flags, `statx`'s flags, `prctl`'s options.
 - **Wire and protocol encodings userland parses** — netlink attributes, `sockaddr_ll`,

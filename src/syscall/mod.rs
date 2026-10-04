@@ -248,11 +248,11 @@ pub unsafe fn linux_dispatch(
     // and the only one that can rewind an interrupted call, because the frame
     // it rewrites is the record of the call's own arguments.
     //
-    // Deferred off aarch64 with the signal stage: delivering a handler rewrote
-    // the x86 frame, and the aarch64 `sigcontext`/`rt_sigreturn` builder is a
-    // named gap. A first `/init` that only runs and exits needs no handler, so
-    // on this machine the call's own value is simply returned.
-    #[cfg(not(target_arch = "aarch64"))]
+    // A machine that declares a signal frame (`mpos_signal_frame`) delivers a
+    // handler here; one that has not built its `sigcontext`/`rt_sigreturn` yet
+    // has no frame to rewrite, so the call's own value is simply returned.
+    // A first `/init` that only runs and exits needs no handler either way.
+    #[cfg(mpos_signal_frame)]
     if linux::deliver_signal(regs_ptr, nr, ret) {
         // The interrupted call's value belongs to the handler now: it is on
         // the frame, waiting for `rt_sigreturn` to put it back.

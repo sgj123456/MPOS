@@ -10,6 +10,7 @@ pub(crate) mod lapic;
 pub(crate) mod paging;
 pub(crate) mod pic;
 pub(crate) mod rtc;
+pub(crate) mod signal;
 pub(crate) mod syscall;
 pub(crate) mod timer;
 

@@ -342,11 +342,11 @@ pub trait Console {
 /// must answer. `crate::Platform` names only the baseline concerns; these are
 /// reached through their own forwards, each gated on a `mpos_*` capability flag
 /// the build declares for the target (`mpos_msi`, `mpos_serial_ring`,
-/// `mpos_fpu_trap`, `mpos_segments`, `mpos_console_input` - the sets are in
-/// `.cargo/config.toml`'s `[target.…]` blocks, beside each machine's linker
-/// script). The gate names the capability, never the architecture, so this file
-/// contains no machine name: a port declares the set it has where it already
-/// declares its script.
+/// `mpos_fpu_trap`, `mpos_segments`, `mpos_signal_frame`, `mpos_console_input` -
+/// the sets are in `.cargo/config.toml`'s `[target.…]` blocks, beside each
+/// machine's linker script). The gate names the capability, never the
+/// architecture, so this file contains no machine name: a port declares the set
+/// it has where it already declares its script.
 /// ---------------------------------------------------------------------------
 
 /// Message-signalled interrupt delivery: the local APIC page a PCI device maps
@@ -427,6 +427,115 @@ pub trait Segments {
     /// `user_regs_struct` reports them. Asked by the ABI layer, which fills
     /// those two fields of a frame it builds from the syscall gate's record.
     fn user_segments() -> (usize, usize);
+}
+
+/// The `siginfo_t` fields a handler's frame carries, in the shape the ABI layer
+/// holds them: the signal, the error, the code, the sender, and the `sigqueue`
+/// payload.
+///
+/// A plain struct rather than `sched`'s `SigInfo`, because `hal` names no layer
+/// above it - the caller unpacks its own type into this one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignalInfo {
+    pub signo: i32,
+    pub errno: i32,
+    pub code: i32,
+    pub pid: i32,
+    pub uid: i32,
+    /// The `union sigval` a `sigqueue` sent, or zero for a plain `kill`.
+    pub value: u64,
+}
+
+/// What the ABI layer has decided about the handler about to run: everything
+/// the machine needs to lay a frame out, beyond the register file itself.
+///
+/// The register file is passed separately because it is read *and* written -
+/// [`SignalFrame::enter`] hands back the handler's entry state through it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignalDelivery {
+    /// The handler's entry address.
+    pub handler: usize,
+    /// The restorer the disposition provides - where the handler's `ret` goes,
+    /// at the front of the frame - or `None` when it has none. Which flag says
+    /// so is the disposition's own business; what this carries is the answer,
+    /// so a machine whose ABI makes the field mandatory can refuse a frame it
+    /// could not lay out.
+    pub restorer: Option<usize>,
+    /// The call number to run again after the handler returns, or `None` to
+    /// resume the interrupted code.
+    pub restart: Option<u64>,
+    /// The mask to put back, as the wire's `sigset_t`.
+    pub blocked_wire: u64,
+    /// The signal and its sender.
+    pub info: SignalInfo,
+    /// The alternate stack's `(base, size)`, described in the frame's `uc_stack`
+    /// whether or not the handler runs on it.
+    pub alt: Option<(usize, usize)>,
+    /// Whether the handler runs *on* that stack - the disposition's
+    /// `SA_ONSTACK`.
+    pub on_alt: bool,
+}
+
+/// Where a machine put a handler's frame.
+#[derive(Clone, Copy, Debug)]
+pub struct SignalFrameEntry {
+    /// The stack pointer the handler runs on - the frame's own address.
+    pub sp: usize,
+    /// The `siginfo_t`, the handler's second argument.
+    pub siginfo: usize,
+    /// The `ucontext`, the handler's third argument.
+    pub ucontext: usize,
+}
+
+/// The signal frame a handler runs on: the structure the kernel pushes on the
+/// process's own stack, which the libc's trampoline hands back to
+/// `rt_sigreturn`.
+///
+/// A capability, not a concern. Its layout - the machine's `sigcontext` field
+/// order, the offsets of the frame's three parts, and which saved register each
+/// word holds - is the machine's ABI and not a free choice; a port that has not
+/// built its signal stage has no frame to lay out and no `rt_sigreturn` to
+/// unwrap one, so it declares no `mpos_signal_frame` and the ABI layer delivers
+/// no handler there. That is why the signal family in `syscall` is gated on
+/// this flag and not on an architecture: an absent capability is absent, not a
+/// stub (`PLAN.md` §13.2).
+///
+/// What is *not* here is policy - which stack, which mask, which restorer - and
+/// the two scheduler calls a delivery needs (writing the frame into the
+/// process's own memory, installing the handler's mask). `arch -> sched` is the
+/// one upward edge this seam exists to keep out, so those stay with the caller.
+pub trait SignalFrame {
+    /// How many bytes the frame occupies on the handler's stack.
+    const FRAME_BYTES: usize;
+
+    /// Lay the frame out, and turn the interrupted call's register file into
+    /// the handler's entry state.
+    ///
+    /// On success `out` (at least [`FRAME_BYTES`](Self::FRAME_BYTES) long) holds
+    /// the frame bytes and `regs` (`ABI_REG_COUNT` words, the file the
+    /// interrupted call was captured in) describes the handler's first
+    /// instruction: its `ip`/`sp` are the handler's, and its first three
+    /// arguments are the signal number, the frame's `siginfo_t` and its
+    /// `ucontext`. The answer names where the frame was put, so the caller can
+    /// write it into the process's memory.
+    ///
+    /// `None` when there is no frame to write at all - the disposition has no
+    /// restorer and this machine's ABI requires one.
+    fn enter(
+        regs: &mut [u64],
+        out: &mut [u8],
+        delivery: &SignalDelivery,
+    ) -> Option<SignalFrameEntry>;
+
+    /// The inverse: read a handler's frame back into the ABI register file, and
+    /// answer the mask the interrupted code had blocked, as the wire's
+    /// `sigset_t`.
+    ///
+    /// `bytes` is the frame the caller read back from user memory, whole. The
+    /// slots the frame does not carry are left as they are, so `regs` is seeded
+    /// from the running task's own file first - the thread pointer lives in a
+    /// register the frame does not save.
+    fn exit(bytes: &[u8], regs: &mut [u64]) -> u64;
 }
 
 /// An interrupt-driven transmit ring behind the [`Console`] sink: queue bytes,
@@ -1146,6 +1255,28 @@ pub unsafe fn restore_user_regs(frame: *mut (), regs: &[u64], tls: &mut usize) -
 #[inline]
 pub unsafe fn syscall_args(frame: *mut ()) -> [usize; 6] {
     unsafe { <Current as Gate>::syscall_args(frame) }
+}
+
+/// The bytes a signal frame occupies ([`SignalFrame::FRAME_BYTES`]).
+#[cfg(mpos_signal_frame)]
+pub const SIGNAL_FRAME_BYTES: usize = <Current as SignalFrame>::FRAME_BYTES;
+
+/// Lay out the frame a signal handler will run on. See [`SignalFrame::enter`].
+#[cfg(mpos_signal_frame)]
+#[inline]
+pub fn enter_signal_frame(
+    regs: &mut [u64],
+    out: &mut [u8],
+    delivery: &SignalDelivery,
+) -> Option<SignalFrameEntry> {
+    <Current as SignalFrame>::enter(regs, out, delivery)
+}
+
+/// Read a handler's frame back. See [`SignalFrame::exit`].
+#[cfg(mpos_signal_frame)]
+#[inline]
+pub fn exit_signal_frame(bytes: &[u8], regs: &mut [u64]) -> u64 {
+    <Current as SignalFrame>::exit(bytes, regs)
 }
 
 /// The `cs`/`ss` a ring-3 frame carries on this machine.

@@ -159,7 +159,7 @@ flowchart TB
     end
 
     subgraph L1["Machine abstraction"]
-        ARCH["arch/x86_64<br/>gdt · idt · paging · context · timer · syscall gate"]
+        ARCH["arch/x86_64<br/>gdt · idt · paging · context · timer · syscall gate · signal frame"]
         HAL["hal — the capability traits<br/>Clock · WallClock · Cpu · Current,<br/>and the forwards above them"]
         CONSOLE["console<br/>framebuffer + serial + virtual consoles"]
     end

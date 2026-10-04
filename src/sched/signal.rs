@@ -140,30 +140,6 @@ pub const SA_RESETHAND: usize = 0x8000_0000;
 /// lives.
 pub const SA_RESTART: usize = 0x1000_0000;
 
-/// The bytes of `struct rt_sigframe` on x86_64, which is what the kernel
-/// pushes on a handler's stack:
-///
-/// ```text
-///   0  char *pretcode      the restorer - where the handler returns to
-///   8  struct ucontext     uc_flags, uc_link, stack_t, sigcontext, sigmask
-/// 312  struct siginfo      signo, errno, code, and a lot of padding
-/// ```
-///
-/// The three parts are laid out the way the Linux ABI lays them out, because
-/// the libc's `__restore_rt` trampoline is what reads them back: it issues
-/// `rt_sigreturn` with `rsp` pointing just past `pretcode`, and the kernel
-/// finds the saved registers at a fixed offset from there.
-pub const SIGFRAME_BYTES: usize = 440;
-/// Offset of `uc_mcontext` (a `struct sigcontext`) inside the frame - that is,
-/// `sizeof(char *) + sizeof(unsigned long) + sizeof(uc_link) + sizeof(stack_t)`.
-pub const SIGFRAME_UCONTEXT: usize = 8;
-/// Offset of the `struct sigcontext` within the `ucontext`.
-pub const UCONTEXT_MCONTEXT: usize = 40;
-/// Offset of the saved signal mask within the `ucontext`.
-pub const UCONTEXT_SIGMASK: usize = 296;
-/// Offset of the `struct siginfo` within the frame.
-pub const SIGFRAME_SIGINFO: usize = 312;
-
 /// One signal's disposition, in the shape `rt_sigaction` reads and writes.
 ///
 /// The zero value is `SIG_DFL` with no flags, no restorer and an empty mask -

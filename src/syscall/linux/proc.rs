@@ -21,96 +21,14 @@ use crate::syscall::{ARG_COUNT, argv_arg, buffer_ok, cstr_arg, err, err_of};
 
 pub(super) use crate::syscall::MMAP_BASE;
 
-/// The register frame on the kernel stack, matching the layout pushed by the
-/// `syscall` entry stub in `arch/x86_64/syscall.rs`. Fields are named after
-/// the user registers they hold; offsets must match the push order exactly.
-/// [`handle_execve`] patches the return address and stack pointer through it,
-/// and [`handle_fork`] reads the whole thing to rebuild the child's register
-/// file.
-///
-/// Keep this in step with `Regs` in `arch/x86_64/syscall.rs` - the two describe
-/// one frame, and the stub's epilogue is written against those offsets. The
-/// `_filler` below is the stub's extra word, a second copy of `rax` pushed so
-/// the nine `pop`s in the epilogue stop exactly on the caller's RSP; leaving it
-/// out here would make every field above it name the word below the one it
-/// means, and a `fork` child would resume with its parent's `rdi` in `r12` and
-/// its `rsi` as the return address.
-#[repr(C)]
-struct RegsFrame {
-    rax: usize,      // [rsp+0]   return value / syscall number
-    r11: usize,      // [rsp+8]   user RFLAGS (sysretq restores from here)
-    rcx: usize,      // [rsp+16]  user RIP (sysretq restores from here)
-    r9: usize,       // [rsp+24]
-    r8: usize,       // [rsp+32]
-    r10: usize,      // [rsp+40]
-    rdx: usize,      // [rsp+48]
-    rsi: usize,      // [rsp+56]
-    rdi: usize,      // [rsp+64]
-    user_rsp: usize, // [rsp+72]  user RSP (restored from here at sysretq)
-    /// Not a register: the stub's padding word, never read back. See the
-    /// comment on `Regs`.
-    _filler: usize, // [rsp+80]
-    r12: usize,      // [rsp+88]
-    r15: usize,      // [rsp+96]
-    r14: usize,      // [rsp+104]
-    r13: usize,      // [rsp+112]
-    rbx: usize,      // [rsp+120]
-    rbp: usize,      // [rsp+128]
-}
-
 /// The ABI's register file, at the machine's width - the same type the
 /// scheduler carries a stopped task's registers in (`hal::AbiRegs`), so the two
 /// layers spell it from the machine's own count and not from each other.
 type AbiRegs = crate::hal::AbiRegs;
 
-// ---- signals: the frame a handler runs on -------------------------------
-//
-// A handler cannot be entered by a `jmp`: it has to be able to `ret` back into
-// the kernel, and the kernel has to be able to restore a register file that no
-// longer exists by then. Both halves of that are a structure written on the
-// process's own stack and read back by `rt_sigreturn`, in a layout the libc's
-// trampoline knows by heart. Everything below is that layout.
-
-/// Byte offsets of the fields of `struct sigcontext`, in the Linux x86_64
-/// order. They are not a choice: `__restore_rt` hands the structure back to
-/// `rt_sigreturn`, and this kernel reads the saved registers from exactly
-/// where the libc expects them to be.
-mod sc {
-    pub const R8: usize = 0;
-    pub const R9: usize = 8;
-    pub const R10: usize = 16;
-    pub const R12: usize = 32;
-    pub const R13: usize = 40;
-    pub const R14: usize = 48;
-    pub const R15: usize = 56;
-    pub const RDI: usize = 64;
-    pub const RSI: usize = 72;
-    pub const RBP: usize = 80;
-    pub const RBX: usize = 88;
-    pub const RDX: usize = 96;
-    pub const RAX: usize = 104;
-    pub const RSP: usize = 120;
-    pub const RIP: usize = 128;
-    pub const EFLAGS: usize = 136;
-    /// The structure is padded out to here, whatever this kernel fills in.
-    pub const BYTES: usize = 256;
-}
-
 /// `SI_USER`: the signal came from `kill`, not from the hardware. It is what a
 /// handler reads out of `si_code` to tell a deliberate signal from a fault.
 const SI_USER: i32 = 0;
-
-fn put_word(bytes: &mut [u8], at: usize, value: usize) {
-    bytes[at..at + 8].copy_from_slice(&(value as u64).to_le_bytes());
-}
-
-fn put_dword(bytes: &mut [u8], at: usize, value: i32) {
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn get_word(bytes: &[u8], at: usize) -> usize {
-    usize::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
-}
 
 /// Write the frame a handler will run on and point the task at it.
 ///
@@ -124,10 +42,15 @@ fn get_word(bytes: &[u8], at: usize) -> usize {
 /// on its own copy of them), which is why `rt_sigreturn` hands back the
 /// caller's original arguments for free.
 ///
+/// The frame's *shape* is the machine's (`hal::SignalFrame`); what stays here is
+/// the policy around it - which stack, which mask, which restorer - and the two
+/// scheduler calls a delivery needs, which the machine cannot make: writing the
+/// bytes into the process's own memory, and installing the handler's mask.
+///
 /// Returns `false` when the frame cannot be written - the stack is not mapped,
-/// or not writable - which leaves the caller to take the default action rather
-/// than to lose the signal.
-#[cfg(not(target_arch = "aarch64"))]
+/// or not writable, or the disposition has no restorer - which leaves the
+/// caller to take the default action rather than to lose the signal.
+#[cfg(mpos_signal_frame)]
 fn build_frame(
     regs_ptr: *mut (),
     sig: u8,
@@ -136,122 +59,46 @@ fn build_frame(
     ret: isize,
     restart: Option<u64>,
 ) -> bool {
-    use crate::sched::signal::{
-        SA_ONSTACK, SA_RESETHAND, SA_RESTORER, SIGFRAME_BYTES, SIGFRAME_SIGINFO, SIGFRAME_UCONTEXT,
-        UCONTEXT_MCONTEXT, UCONTEXT_SIGMASK,
-    };
-
-    let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
-
-    // A handler runs on the process's own stack, unless the disposition asked
-    // for the alternate one. Either way the frame goes just below where the
-    // stack pointer was: the interrupted code gets its memory back untouched
-    // when the handler returns.
-    let mut sp = regs.user_rsp;
     let alt = crate::sched::signal_alt_stack(crate::sched::current());
-    if action.flags & SA_ONSTACK != 0
-        && let Some(stack) = alt
-    {
-        sp = stack.sp + stack.size;
-    }
-
-    // A function is entered with its return address at `rsp % 16 == 8`; a
-    // handler is entered the same way, with the restorer standing in for the
-    // `call` that would have put it there.
-    let frame = ((sp - SIGFRAME_BYTES) & !15) - 8;
-
-    let mut bytes = [0u8; SIGFRAME_BYTES];
-    // The restorer - where the handler's `ret` goes. Without it the handler
-    // would return into whatever it found on the stack, and the process could
-    // never leave the handler at all.
-    if action.flags & SA_RESTORER == 0 || action.restorer == 0 {
-        // The ABI makes this field mandatory on x86_64; a disposition without
-        // one cannot be run.
-        return false;
-    }
-    put_word(&mut bytes, 0, action.restorer);
-
-    // The saved register file. `rax` is the value the interrupted syscall
-    // returned, which is what `rt_sigreturn` puts back.
-    let mcontext = SIGFRAME_UCONTEXT + UCONTEXT_MCONTEXT;
-    put_word(&mut bytes, mcontext + sc::R8, regs.r8);
-    put_word(&mut bytes, mcontext + sc::R9, regs.r9);
-    put_word(&mut bytes, mcontext + sc::R10, regs.r10);
-    put_word(&mut bytes, mcontext + sc::R12, regs.r12);
-    put_word(&mut bytes, mcontext + sc::R13, regs.r13);
-    put_word(&mut bytes, mcontext + sc::R14, regs.r14);
-    put_word(&mut bytes, mcontext + sc::R15, regs.r15);
-    put_word(&mut bytes, mcontext + sc::RDI, regs.rdi);
-    put_word(&mut bytes, mcontext + sc::RSI, regs.rsi);
-    put_word(&mut bytes, mcontext + sc::RBP, regs.rbp);
-    put_word(&mut bytes, mcontext + sc::RBX, regs.rbx);
-    put_word(&mut bytes, mcontext + sc::RDX, regs.rdx);
-    // The interrupted call's answer, or - for a call the disposition asked to
-    // run again - the call's number, which is what `syscall` reads when the
-    // rewound frame resumes on it.
-    put_word(
-        &mut bytes,
-        mcontext + sc::RAX,
-        restart.map_or(ret as usize, |nr| nr as usize),
-    );
-    // rcx and r11 were destroyed by the `syscall` that is being interrupted:
-    // the CPU puts the return address in rcx and the flags in r11 on the way
-    // in, so there is nothing of the caller's left to save.
-    put_word(&mut bytes, mcontext + sc::RSP, regs.user_rsp);
-    // The `syscall` instruction is two bytes (`0f 05`), so the return address
-    // the CPU left in `rcx` is two past the instruction a restart resumes on.
-    put_word(
-        &mut bytes,
-        mcontext + sc::RIP,
-        restart.map_or(regs.rcx, |_| regs.rcx.wrapping_sub(2)),
-    );
-    put_word(&mut bytes, mcontext + sc::EFLAGS, regs.r11);
-
-    // `uc_stack` describes the alternate stack, as the handler will see it
-    // through `sigaltstack(NULL, ...)`.
-    let stack_at = SIGFRAME_UCONTEXT + 16;
-    if let Some(stack) = alt {
-        put_word(&mut bytes, stack_at, stack.sp);
-        put_word(&mut bytes, stack_at + 16, stack.size);
-    }
-
-    // The mask to put back on the way out - what the process had blocked when
-    // the signal arrived. A libc reads this as the wire's `sigset_t`, so it
-    // goes out through the same conversion `rt_sigprocmask` brings its sets in
-    // through; `rt_sigreturn` converts on the way back.
     let blocked = crate::sched::current_blocked();
-    put_word(
-        &mut bytes,
-        SIGFRAME_UCONTEXT + UCONTEXT_SIGMASK,
-        crate::sched::signal::to_wire(blocked) as usize,
-    );
-
-    // A `siginfo_t`: signo, errno, code, and - for a signal that names a
-    // sender - the pid and uid, with the `sigqueue` payload in the union at
-    // offset 24. The offsets are Linux x86_64's, so a handler written against
-    // `<signal.h>` reads the right fields.
-    let si = SIGFRAME_SIGINFO;
-    bytes[si..si + 4].copy_from_slice(&info.signo.to_le_bytes());
-    bytes[si + 4..si + 8].copy_from_slice(&info.errno.to_le_bytes());
-    bytes[si + 8..si + 12].copy_from_slice(&info.code.to_le_bytes());
-    put_dword(&mut bytes, si + 16, info.pid);
-    put_dword(&mut bytes, si + 20, info.uid);
-    put_word(&mut bytes, si + 24, info.value as usize);
-
-    if !crate::sched::write_user(frame, &bytes) {
+    let delivery = crate::hal::SignalDelivery {
+        handler: action.handler,
+        // A disposition with no restorer cannot be run at all on this machine -
+        // the ABI makes the frame's `pretcode` mandatory - and `SA_RESTORER` is
+        // the disposition's own statement that it has one. `None` is what tells
+        // the machine's frame builder there is nothing to write.
+        restorer: (action.flags & crate::sched::signal::SA_RESTORER != 0 && action.restorer != 0)
+            .then_some(action.restorer),
+        restart,
+        blocked_wire: crate::sched::signal::to_wire(blocked),
+        info: crate::hal::SignalInfo {
+            signo: info.signo,
+            errno: info.errno,
+            code: info.code,
+            pid: info.pid,
+            uid: info.uid,
+            value: info.value,
+        },
+        alt: alt.map(|stack| (stack.sp, stack.size)),
+        on_alt: action.flags & crate::sched::signal::SA_ONSTACK != 0,
+    };
+    // The interrupted call's register file, with `ret` - its own answer - in the
+    // result slot. That is what the frame saves, or what the restart number
+    // replaces.
+    let mut regs = capture_frame(regs_ptr, ret as usize);
+    let mut bytes = [0u8; crate::hal::SIGNAL_FRAME_BYTES];
+    let Some(at) = crate::hal::enter_signal_frame(&mut regs, &mut bytes, &delivery) else {
+        return false;
+    };
+    if !crate::sched::write_user(at.sp, &bytes) {
         return false;
     }
-
-    // Enter the handler with the three arguments the ABI gives it: the signal
-    // number, a `siginfo_t`, and the `ucontext` to hand back.
-    regs.rcx = action.handler;
-    regs.user_rsp = frame;
-    regs.rdi = sig as usize;
-    regs.rsi = frame + SIGFRAME_SIGINFO;
-    regs.rdx = frame + SIGFRAME_UCONTEXT;
-
+    // `regs` now describes the handler's first instruction, and `apply_frame` is
+    // what puts it into the gate frame - the return address, the stack, and the
+    // three argument registers, which only the machine knows where to put.
+    apply_frame(regs_ptr, &regs);
     crate::sched::set_current_blocked(action.handler_mask(sig, blocked));
-    if action.flags & SA_RESETHAND != 0 {
+    if action.flags & crate::sched::signal::SA_RESETHAND != 0 {
         crate::sched::reset_disposition(sig);
     }
     true
@@ -281,7 +128,7 @@ fn build_frame(
 /// 400 ms: the handler runs at 100 ms, the *read* returns the byte at 400 ms,
 /// and `EINTR` never appears. Without the flag the same call answers
 /// `-1/EINTR` at 100 ms.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(mpos_signal_frame)]
 fn restart_verdict(
     nr: u64,
     request: u32,
@@ -312,7 +159,7 @@ fn restart_verdict(
 /// Returns `true` when a handler was entered, so the caller can report a
 /// reassuring zero to the interrupted call instead of its own return value -
 /// which is now the handler's to see when it returns.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(mpos_signal_frame)]
 pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     if regs_ptr.is_null() {
         return false;
@@ -362,7 +209,9 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     // frame is still the syscall-entry one here: the tracer and group-stop
     // paths above returned, and `build_frame` - which rewrites it - runs only
     // after this reads it.
-    let request = unsafe { &*(regs_ptr as *const RegsFrame) }.rsi as u32;
+    // SAFETY: `regs_ptr` is the gate's own frame for this task, which is
+    // the contract `hal::syscall_args` documents.
+    let request = unsafe { crate::hal::syscall_args(regs_ptr) }[1] as u32;
     if !build_frame(
         regs_ptr,
         sig,
@@ -383,55 +232,33 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
 ///
 /// The libc's `__restore_rt` is entered by the handler's `ret`, so `rsp` has
 /// already moved past the restorer word; the frame therefore starts eight
-/// bytes below where this call finds the stack pointer.
-#[cfg(not(target_arch = "aarch64"))]
+/// bytes below where this call finds the stack pointer. Reading that frame
+/// back and restoring the registers it saved is the machine's
+/// (`hal::SignalFrame`); the mask it puts back is the scheduler's.
+#[cfg(mpos_signal_frame)]
 pub(super) fn handle_rt_sigreturn(regs_ptr: *mut ()) -> isize {
-    use crate::sched::signal::{SIGFRAME_UCONTEXT, UCONTEXT_MCONTEXT, UCONTEXT_SIGMASK};
-
-    if regs_ptr.is_null() {
+    // A null frame is a call the kernel made on its own behalf: there is no
+    // stack pointer to find a frame below.
+    let Some(ctx) = (unsafe { crate::hal::user_context(regs_ptr, 0) }) else {
+        return err::EFAULT;
+    };
+    let frame = ctx.sp().wrapping_sub(8);
+    let mut bytes = [0u8; crate::hal::SIGNAL_FRAME_BYTES];
+    if !crate::sched::read_user(frame, &mut bytes) {
         return err::EFAULT;
     }
-    let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
-    let frame = regs.user_rsp.wrapping_sub(8);
-    let mcontext = frame + SIGFRAME_UCONTEXT + UCONTEXT_MCONTEXT;
-
-    let mut bytes = [0u8; sc::BYTES];
-    if !crate::sched::read_user(mcontext, &mut bytes) {
-        return err::EFAULT;
-    }
-
-    regs.r8 = get_word(&bytes, sc::R8);
-    regs.r9 = get_word(&bytes, sc::R9);
-    regs.r10 = get_word(&bytes, sc::R10);
-    regs.r12 = get_word(&bytes, sc::R12);
-    regs.r13 = get_word(&bytes, sc::R13);
-    regs.r14 = get_word(&bytes, sc::R14);
-    regs.r15 = get_word(&bytes, sc::R15);
-    regs.rdi = get_word(&bytes, sc::RDI);
-    regs.rsi = get_word(&bytes, sc::RSI);
-    regs.rbp = get_word(&bytes, sc::RBP);
-    regs.rbx = get_word(&bytes, sc::RBX);
-    regs.rdx = get_word(&bytes, sc::RDX);
-    // `sysretq` takes the return address from rcx and the flags from r11, and
-    // no saved value can go there: whatever the process had in them before the
-    // `syscall` was destroyed by the instruction itself.
-    regs.rcx = get_word(&bytes, sc::RIP);
-    regs.user_rsp = get_word(&bytes, sc::RSP);
-    // Interrupts have to be on when the process resumes; everything else about
-    // the flags is the process's own business.
-    regs.r11 = get_word(&bytes, sc::EFLAGS) | 0x200;
-
-    let mut mask = [0u8; 8];
-    if crate::sched::read_user(frame + SIGFRAME_UCONTEXT + UCONTEXT_SIGMASK, &mut mask) {
-        // The frame's saved mask is the wire's `sigset_t` — a libc reads it as
-        // one — so it comes back through the same conversion the install went
-        // out through.
-        crate::sched::set_current_blocked(crate::sched::signal::from_wire(u64::from_le_bytes(
-            mask,
-        )));
-    }
-
-    get_word(&bytes, sc::RAX) as isize
+    // Seeded from the running task's own register file, so the slots the frame
+    // does not carry - the thread pointer above all - come back unchanged.
+    let mut regs = capture_frame(regs_ptr, 0);
+    let mask = crate::hal::exit_signal_frame(&bytes, &mut regs);
+    // The frame's saved mask is the wire's `sigset_t` - a libc reads it as one -
+    // so it comes back through the same conversion the install went out
+    // through.
+    crate::sched::set_current_blocked(crate::sched::signal::from_wire(mask));
+    // The answer is the interrupted call's own value, which the restored file
+    // carries in `rax`: the gate writes it into the result slot and `sysretq`
+    // resumes the interrupted instruction with it.
+    apply_frame(regs_ptr, &regs) as isize
 }
 
 /// Terminate the current process.
