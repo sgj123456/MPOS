@@ -24,7 +24,7 @@ use alloc::string::String;
 use alloc::vec;
 
 use mpos::boot::handoff::Handoff;
-use mpos::{hal, sched, vfs};
+use mpos::{drivers, hal, sched, vfs};
 
 /// `mpos-boot` branches here at `KERNEL_VIRT_BASE + entry`, at EL1 with the MMU
 /// already on and the machine's own tables installed, on a boot stack the loader
@@ -128,6 +128,14 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
         },
         sched::Priority::NORMAL,
     );
+
+    // Stage 8-net: the smoltcp stack over the MMIO adapter `check_net` opened and
+    // published. The adapter is the machine's to find (a window the tree names)
+    // and the stack is not: it receives the `NetDevice` seam exactly as x86_64's
+    // does, so this is the same `net::init` + `spawn_service` pair the first
+    // machine boots with, and nothing above `drivers` names a transport.
+    init_net();
+    register_exit_hooks();
 
     // A ramfs root, then the initramfs unpacked into it. With no archive this is a
     // diskless boot: there is nothing to hand the machine to, so stop honestly
@@ -315,6 +323,68 @@ fn check_disk_root() {
         "M7_DISK_OK: /dev/vda mounted at /mnt, /mnt/etc/inittab {} bytes read through the VFS, /mnt/init present",
         inittab.len()
     );
+}
+
+/// Stage 8's live network: the shared smoltcp stack over this machine's adapter.
+///
+/// The mirror of x86_64's `init_net`, and deliberately the same two calls. The
+/// difference is only where the device comes from: there the PCI bus is probed
+/// (`drivers::virtio::net::VirtioNet::init`), here the adapter is the MMIO window
+/// `check_net` found in the device tree and *published* (`mmio::net_device`) -
+/// which is why the ring that check posted is the ring the stack's first frame
+/// arrives on, rather than a second open of the same window.
+///
+/// The marker this prints is narrow on purpose. It says the adapter was handed to
+/// `net::init`, the two interfaces were built over it (eth0 at the address the
+/// stack configures, plus smoltcp's own loopback), and the service task that polls
+/// them was spawned. It does **not** claim a round trip: traffic is proven by the
+/// programs that drive the stack - `/t-socket`, `/t-udp-loopback` and the rest on
+/// this machine's sweep - because a kernel-side self-test ping is exactly the hook
+/// this project keeps out of `net` (job 4's pin is a real EL0 program).
+///
+/// A machine with no adapter is not a failure here: the absence is printed, the
+/// stack is never initialized, and the socket syscalls answer `ENETDOWN`, which is
+/// the honest answer for a machine without a card. (`check_net` having failed is a
+/// different thing entirely, and stops the boot.)
+fn init_net() {
+    let Some(dev) = drivers::virtio::mmio::net_device() else {
+        mpos::println!("net: no virtio-net window opened; sockets answer ENETDOWN");
+        return;
+    };
+    let mac = drivers::virtio::NetDevice::mac(&*dev);
+    mpos::net::init(dev);
+    mpos::net::spawn_service();
+    mpos::println!(
+        "net: virtio-net up at 10.0.2.15/24, gateway 10.0.2.2, MAC \
+         {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+    mpos::println!("M8_NET_STACK_OK");
+}
+
+/// Tell the scheduler's exit path what a dying process's descriptors own.
+///
+/// x86_64's list is five hooks plus two `FD_CLOEXEC` ones; this machine's is one,
+/// and the difference is the rest of its port: record locks, inotify, evdev and
+/// uinput are subsystems it has not been given. The network stack's it does have,
+/// and that hook is not garnish - a socket a dying process leaves in the stack's
+/// set keeps its local port reserved for ever, so the next program to ask for that
+/// port is refused. Measured on this machine with the stack live and this not
+/// registered: `t-tcp`'s bind of 34567 answered EADDRINUSE on a machine that had
+/// just booted, and the last check of `t-tcp-listen` (a TIME-WAIT name coming back
+/// to a restart that asks for it) failed the same way - because the socket tests
+/// that ran before them had exited with their sockets still in the set.
+///
+/// Registered here rather than inside [`init_net`] because it belongs to the
+/// *descriptor*, not the device: a machine whose adapter never probed still has
+/// `AF_UNIX` and `AF_VSOCK` sockets, and they are released by this same hook.
+fn register_exit_hooks() {
+    mpos::sched::exit::register(mpos::net::socket::close_sockets_at_exit);
 }
 
 /// Stage 7's root switch: the disk `check_disk_root` mounted at `/mnt` becomes

@@ -974,32 +974,36 @@ mod tests {
         // The machine group is the second machine's. Two things have to hold or
         // it is not what it looks like: x86_64 must not see the group at all
         // (which is what keeps its members in the default sweep there), and
-        // every name in it must still be a program x86_64 *does* run - the
-        // socket tests are in no other group, so a global list would have taken
-        // them out of the x86_64 gate.
+        // every name in it must really be left out on the machine it names. The
+        // loop is deliberately about *whatever the file lists*: the socket
+        // family was in this group until the second machine got a stack, and a
+        // pin that named those tests would have had to be edited on the day the
+        // group shrank - which is the day it should be shrinking.
         assert!(config.group_names(Machine::Aarch64).contains(&"aarch64"));
         assert!(!config.group_names(X86).contains(&"aarch64"));
         let gaps = config.machine_tests(Machine::Aarch64);
         assert!(!gaps.is_empty(), "the aarch64 group names nothing");
         for (group, test) in &gaps {
             assert_eq!(*group, "aarch64");
+            let on_x86 = config.groups_of(test, X86);
             assert!(
-                !config.groups_of(test, X86).contains(&"aarch64"),
+                !on_x86.contains(&"aarch64"),
                 "{test} is named as an aarch64 gap and left out of x86_64's sweep with it"
             );
+            // A name whose *only* group is this machine's runs in x86_64's
+            // default sweep - the property a single global list would have
+            // destroyed. One that is also in `external` or `slow` is left out
+            // there for that reason instead, so the two cases are told apart
+            // rather than asserted away.
+            if on_x86.is_empty() {
+                assert!(
+                    config.runs(test, &default, X86),
+                    "{test} stopped running in x86_64's default sweep"
+                );
+            }
             assert!(
                 !config.runs(test, &default, Machine::Aarch64),
                 "{test} is named as an aarch64 gap and would still run there"
-            );
-        }
-        for test in ["t-socket", "t-tcp", "t-udp-loopback", "t-unix-rustix"] {
-            assert!(
-                config.runs(test, &default, X86),
-                "{test} stopped running in x86_64's default sweep"
-            );
-            assert!(
-                !config.runs(test, &default, Machine::Aarch64),
-                "{test} would run on aarch64"
             );
         }
     }

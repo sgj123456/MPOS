@@ -178,16 +178,17 @@ pub mod mm;
 /// The network stack, and the socket syscalls over it. Host builds skip it:
 /// its tests are the conformance programs that run on the machine.
 ///
-/// The gate is still x86_64's even though the stack now *compiles* for aarch64:
-/// §13.4's measured blockers were the two device-backed families
-/// (`drivers::virtio::net`, the PCI NIC, and `drivers::virtio::vsock`) plus the
-/// four `/proc/net` rows net hands `vfs::procfs`, and the device seam for the
-/// first two has landed - `net` holds `Arc<dyn drivers::virtio::{NetDevice,
-/// VsockDevice}>` and names no transport, so with the gate opened by hand
-/// `cargo clippy --target aarch64-unknown-none` is 0 errors. The flip waits for
-/// the live path: `syscall`'s socket legs are still behind `mpos_net` (an x86
-/// capability), so an open gate alone would compile this module with no caller.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// Ungated on both machines since §13.4's device seam landed and the second one
+/// got an adapter. `net` holds `Arc<dyn drivers::virtio::NetDevice>` and names no
+/// transport; the machine that owns the card opens it - `main/x86_64.rs` over the
+/// PCI bus, `main/aarch64.rs` over the MMIO window its `check_net` found and
+/// published - and hands it to `net::init`, so the stack above the seam is the
+/// same code on both and a machine with no card hands over nothing (the honest
+/// `ENETDOWN`, not a device that pretends to answer). The one reference still
+/// x86_64's is `collect_net_sockets`, the four `/proc/net` rows, gated with
+/// procfs's *own* condition: its only caller is procfs, which the second machine
+/// has not been given yet (`PLAN.md` §13's port-progress ledger).
+#[cfg(target_os = "none")]
 pub mod net;
 /// The PCI devices the machine has, and the files `/sys` and `/proc` describe
 /// them with. Its own leaf crate: the model and every spelling are pure; only

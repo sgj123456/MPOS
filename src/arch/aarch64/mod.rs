@@ -1153,16 +1153,25 @@ fn check_fs(info: &BootInfo) {
     let _ = writeln!(out, "M7_FS_OK");
 }
 
-/// Stage 8's transport proof: virtio-net over the memory-mapped transport.
+/// Stage 8's net device: virtio-net over the memory-mapped transport, opened as
+/// the adapter the *stack* will drive.
 ///
-/// The net adapter is the third device driven the same way - open the window the
-/// tree says carries one (`DeviceID` 1) as an `MmioTransport`, hand it to the
-/// crate's `VirtIONet`. The pin is a real config read, not a claim of traffic:
-/// the device's 6-byte MAC must be present and non-zero (a `virt` MMIO adapter
-/// always carries the MAC QEMU assigned). Constructing the device also posts its
-/// receive ring through the neutral `Hal`, re-proving DMA over MMIO for a
-/// multi-queue device. Driving the network stack over it is the later net work;
-/// this is the adapter being live on this machine.
+/// The net adapter is the third device driven the same way - find the window the
+/// tree says carries one (`DeviceID` 1), open it as an `MmioTransport`, hand it
+/// to the crate's `VirtIONet`. Two claims come out of the open, and both are about
+/// the device the network stack is then given rather than about a throwaway one:
+/// the 6-byte MAC is present and non-zero (a `virt` MMIO adapter always carries
+/// the MAC QEMU assigned), and a frame handed to the transmit queue is accepted -
+/// the rings move buffers over the mapped transport, the same class of proof the
+/// block milestone made by reading a real sector back. It still claims nothing
+/// about a packet reaching a network: that is the stack, and the programs that
+/// drive it.
+///
+/// The handle is *published* rather than dropped ([`mmio::init_net_global`]), and
+/// that is the point of this stage's change: an open posts the receive ring (64
+/// buffers through the neutral `Hal`), so a check that opened the device, read its
+/// MAC and dropped it would leave the stack to open a second one - and the ring
+/// posted here is the ring the stack's first frame arrives on.
 fn check_net(info: &BootInfo) {
     use fmt::Write;
 
@@ -1175,45 +1184,29 @@ fn check_net(info: &BootInfo) {
         }};
     }
 
-    let Some(bytes) = info.dtb else {
-        fail!("the record carries no device tree");
+    // The tree walk is the same one the block and input checks use: every window
+    // whose `DeviceID` says net, in tree order. The first that *opens* is the
+    // machine's adapter - `check_fs` picks its disk by content for the same
+    // reason, but a net device has no content to compare, so the open itself is
+    // the selection.
+    let windows = match virtio_device_windows(info, VIRTIO_ID_NET) {
+        Ok(windows) => windows,
+        Err(reason) => fail!("{reason}"),
     };
-    let tree = match fdt::Fdt::new(bytes) {
-        Ok(tree) => tree,
-        Err(error) => fail!("the device tree will not walk: {error:?}"),
-    };
-
-    let mut net: Option<(usize, usize)> = None;
-    let walked = tree.each(
-        |node| node.is_compatible("virtio,mmio"),
-        |node| {
-            if net.is_some() {
-                return true;
-            }
-            for (address, size) in node.reg() {
-                let (address, size) = (address as usize, size as usize);
-                let Some(virt) = paging::device_virt(address, size) else {
-                    continue;
-                };
-                if read_device(virt, VIRTIO_MMIO_MAGIC) == VIRTIO_MAGIC
-                    && read_device(virt, VIRTIO_MMIO_DEVICE_ID) == VIRTIO_ID_NET
-                {
-                    net = Some((virt, size));
-                    break;
-                }
-            }
-            true
-        },
-    );
-    if let Err(error) = walked {
-        fail!("the device tree will not walk: {error:?}");
-    }
-    let Some((virt, size)) = net else {
+    if windows.is_empty() {
         fail!("the tree describes no virtio-net (device {VIRTIO_ID_NET}) window");
+    }
+    let mut opened = None;
+    for &(virt, size) in &windows {
+        if let Some(dev) = crate::drivers::virtio::mmio::init_net_global(virt, size) {
+            opened = Some((virt, dev));
+            break;
+        }
+    }
+    let Some((virt, dev)) = opened else {
+        fail!("no virtio-net window opened as a transport");
     };
-    let Some(mac) = crate::drivers::virtio::mmio::read_mac(virt, size) else {
-        fail!("the window at {virt:#x} did not open as a virtio-net transport");
-    };
+    let mac = crate::drivers::virtio::NetDevice::mac(&*dev);
     if mac.iter().all(|&b| b == 0) {
         fail!("the virtio-net answered a zero MAC, which a configured adapter never has");
     }
@@ -1222,12 +1215,10 @@ fn check_net(info: &BootInfo) {
         "virtio-net over MMIO opened, MAC {:#04x}:{:#04x}:{:#04x}:{:#04x}:{:#04x}:{:#04x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-    // The data path, not just the config space: hand a frame to the transmit
-    // queue and require the device to take it. This is what makes the MMIO net
-    // milestone mean the rings move buffers over the mapped transport, the same
-    // way the block milestone means a real sector came back - and it does not
-    // claim the packet left the machine (the network stack is a later stage).
-    if !crate::drivers::virtio::mmio::tx_probe(virt, size) {
+    // The data path, not just the config space: a bare minimum Ethernet frame (60
+    // bytes) of zeros - the shape a real frame has, not its content - handed to the
+    // transmit queue, which has to take it.
+    if !crate::drivers::virtio::NetDevice::transmit(&*dev, &[0u8; 60]) {
         fail!("the virtio-net TX queue did not accept a frame over MMIO at {virt:#x}");
     }
     let _ = writeln!(out, "virtio-net TX virtqueue accepted a frame over MMIO");

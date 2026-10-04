@@ -1247,7 +1247,10 @@ pub fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
                 // still-open fd may even re-... - no: it cannot rebind;
                 // only the *name* retires. `unix::unbind_node` is a
                 // no-op for every other kind.
-                #[cfg(not(target_arch = "aarch64"))]
+                //
+                // Not machine-gated: this file is bare-metal only and `net` is
+                // compiled wherever it is, so the question is whether the name's
+                // kind is a socket, not which machine is running.
                 if child.metadata().kind == crate::vfs::NodeKind::Socket {
                     crate::net::unix::unbind_node(&child);
                 }
@@ -2998,14 +3001,11 @@ fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> i
 // ---------------------------------------------------------------------------
 
 /// The socket leg of `read`/`readv`: `recvfrom` with empty source slots is
-/// exactly `read`'s contract on a socket. `net` is a machine module that
-/// aarch64 has not been given yet (its driver stage follows this one), so on
-/// that machine no descriptor ever reports a socket handle - the call site's
-/// `socket_handle() != 0` is an arch-neutral `Inode` method that answers `0`
-/// there - and this helper's body is never reached. `ENOTTY` is the honest
-/// answer for the unreachable case; the `crate::net` forward exists only where
-/// the stack is compiled, so the routing is identical on the machines that have
-/// it and never invents a socket on the one that does not.
+/// exactly `read`'s contract on a socket. Gated on the `mpos_net` capability
+/// rather than on a machine: a build that declares no network stack has no
+/// descriptor that can report a socket handle, so this helper's body is never
+/// reached there and `ENOTTY` is the honest answer - while on a machine that
+/// *does* declare one the routing is the same as every other socket call's.
 #[cfg(mpos_net)]
 fn socket_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     crate::net::socket::handle_recvfrom(args, from_user)
@@ -3016,8 +3016,8 @@ fn socket_read(_args: [usize; ARG_COUNT], _from_user: bool) -> isize {
 }
 
 /// The socket leg of `write`/`writev`: `sendto` with no destination is exactly
-/// `write`'s contract on a connected socket. Same deferral and same honest
-/// unreachable answer as [`socket_read`].
+/// `write`'s contract on a connected socket. Same capability gate and same
+/// honest `ENOTTY` for the build that has no stack as [`socket_read`].
 #[cfg(mpos_net)]
 fn socket_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     crate::net::socket::handle_sendto(args, from_user)
@@ -3129,7 +3129,12 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         Ok(()) => {}
         Err(e) => return err_of(e),
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // A socket whose last descriptor this was comes down with it - and that is
+    // not a tidiness question on any machine: a socket left in the stack's set
+    // keeps its local port, so the *next* program to ask for that port is
+    // refused. Measured on the second machine when this was still gated to
+    // x86_64: `t-socket` bound 34567 and exited, `t-tcp`'s bind of the same port
+    // answered EADDRINUSE on a machine that had just booted.
     crate::net::socket::close_last_socket(&file);
     crate::vfs::inotify::close_last(&file);
     // The evdev client's read position dies with the description too - and it

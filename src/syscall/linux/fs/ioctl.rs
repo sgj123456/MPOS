@@ -1282,7 +1282,6 @@ fn ifreq_index(buf: usize) -> Option<u32> {
 /// stack is deferred (its driver stage follows), so no name resolves and the
 /// interface ioctls answer `ENODEV` - the honest answer for "there is no such
 /// link", not a fabricated index.
-#[cfg(not(target_arch = "aarch64"))]
 fn ifreq_index_named(name: &str) -> Option<u32> {
     if name == "lo" {
         return Some(1);
@@ -1291,15 +1290,10 @@ fn ifreq_index_named(name: &str) -> Option<u32> {
         .filter(|facts| facts.eth_name == name)
         .map(|_| 2)
 }
-#[cfg(target_arch = "aarch64")]
-fn ifreq_index_named(_name: &str) -> Option<u32> {
-    None
-}
 
 /// The flags an interface ioctl reports - the same bits the netlink link
 /// dump carries, as the `ifr_flags` halfword: the link's kind, and the
 /// up-and-running pair that rides the administrative bit.
-#[cfg(not(target_arch = "aarch64"))]
 fn ifreq_flags(index: u32) -> Option<u16> {
     let facts = crate::net::link_facts()?;
     let (up, loopback) = match index {
@@ -1312,10 +1306,4 @@ fn ifreq_flags(index: u32) -> Option<u16> {
         flags |= 0x1 | 0x40;
     }
     Some(flags)
-}
-#[cfg(target_arch = "aarch64")]
-fn ifreq_flags(_index: u32) -> Option<u16> {
-    // No net stack to report link facts on this machine yet; the interface
-    // ioctls fall to `ENODEV` rather than invent a link's state.
-    None
 }

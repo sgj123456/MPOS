@@ -455,31 +455,72 @@ pub fn build_sweep_init(build_dir: &Path) -> Result<Vec<u8>> {
     const SRC: &str = r#"use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 
+/// `mount(2)`, whose only caller is [`set_up_machine`]. Declared rather than
+/// imported because this runner is compiled by plain `rustc` against musl's
+/// headers' absence: the signature is Linux's, and the flags word is an
+/// `unsigned long`.
+unsafe extern "C" {
+    fn mount(
+        source: *const core::ffi::c_char,
+        target: *const core::ffi::c_char,
+        fstype: *const core::ffi::c_char,
+        flags: usize,
+        data: *const core::ffi::c_void,
+    ) -> i32;
+}
+
 /// The machine the x86_64 sweep's `/init` sets up with busybox, done again here,
 /// where there is no shell to do it.
 ///
 /// `/tmp` is the one thing this payload needs that the machine does not already
-/// have: t-rename and t-rmdir build their scratch tree under it, and without it
-/// both answer ENOENT before reaching anything they are about. The x86 harness
-/// *mounts a tmpfs* there; this machine has no busybox, and its root is the
-/// writable disk rootfs, so an ordinary directory is the honest version of the
-/// same thing - the subject of both tests (a name can be made, entered, listed
-/// and removed) cannot tell a directory on the disk from one on a tmpfs.
+/// have, and it is a *tmpfs* here for the same reason the first machine mounts
+/// one: the filesystem a name is created in decides what the name can be. This
+/// machine's root is ext4, and an ext4 directory cannot hold a socket node - so
+/// `t-unix-rustix`, whose subject is exactly an `AF_UNIX` name, answered
+/// EOPNOTSUPP from `create(name, SOCK_FILE)` while its `/tmp` was a directory on
+/// the disk. Backed by the same tmpfs the x86 harness uses, the name is a kind
+/// the filesystem can hold, and the test is about the socket rather than about
+/// ext4. `t-rename` and `t-rmdir` need the directory too, which is why it exists
+/// at all.
 ///
 /// A setup failure prints `=== SETUP_FAIL` rather than being left to surface as
 /// the tests' own failures: a machine that was not set up is not evidence about
 /// the kernel, and a verdict that read those ENOENTs as the tests' would be
 /// blaming them for the harness. The reader refuses to report anything else when
-/// the line is there. Nothing is mounted and no interface is brought up: this
-/// payload reaches neither /proc, /sys nor the network, and the tests a live
-/// interface is for - the socket ones - are left out on this machine until its
-/// socket ABI lands, named in tests.toml.
+/// the line is there. Nothing else is mounted and no interface is brought up:
+/// this payload reaches neither /proc, /sys nor the network, and the tests that
+/// want a live wire are the socket ones - which this sweep stages, because the
+/// stack `check_net` publishes and `main` initializes is what serves them.
 fn set_up_machine() {
+    // The mountpoint has to exist before anything hangs on it - Linux requires
+    // it and so does this kernel's `mount` (`ENOTDIR` otherwise).
     match std::fs::create_dir("/tmp") {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => println!("=== SETUP_FAIL /tmp: {e}"),
     }
+    let (source, target, fstype) = (cstr("tmpfs"), cstr("/tmp"), cstr("tmpfs"));
+    // SAFETY: three NUL-terminated strings that outlive the call, no data.
+    let answer = unsafe {
+        mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            core::ptr::null(),
+        )
+    };
+    if answer != 0 {
+        println!(
+            "=== SETUP_FAIL mount tmpfs /tmp: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// A `&str` as the C string a syscall wants.
+fn cstr(text: &str) -> std::ffi::CString {
+    std::ffi::CString::new(text).expect("a literal with no interior NUL")
 }
 
 /// The command line the x86_64 sweep's shell hands a program.

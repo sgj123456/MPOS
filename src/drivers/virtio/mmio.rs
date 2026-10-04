@@ -14,12 +14,21 @@
 //! deciding which window carries which device. The driver is handed an address,
 //! never a tree node - so it names neither `crate::boot` nor `crate::fdt`.
 //!
-//! The one device driven here today is the entropy source. It gets the same two
-//! answers the PCI driver has: a global the boot installs once ([`init_global`])
-//! so [`entropy`] can mix hardware bytes into `crate::rand`'s seed, and a
-//! `request_entropy` the check reads straight through.
+//! The devices driven here are the ones a *stack* holds rather than a check
+//! reads: the entropy source, the block device a filesystem mounts, and the
+//! network adapter the smoltcp stack sends and receives through. Each gets the
+//! same two answers its PCI counterpart has - a handle the caller owns, behind
+//! the usual kernel lock - and the checks drive them through those handles, so
+//! what a milestone proves and what the subsystem later uses are one device.
+//!
+//! The block and net devices are also published where the wiring layer can reach
+//! them ([`blockdev`] is handed to `Ext4Fs::mount` by the disk-root step,
+//! [`net_device`] is handed to `net::init`), because *which* window carries
+//! *which* device is the machine's business and the subsystem above must not
+//! probe for it.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ptr::NonNull;
 
@@ -32,6 +41,7 @@ use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use crate::blk::BlockDev;
 
+use super::NetDevice;
 use super::hal::HalImpl;
 
 /// The virtio-blk reached over MMIO, shaped as a [`BlockDev`] so the filesystem
@@ -94,63 +104,152 @@ pub fn blockdev(virt: usize, size: usize) -> Option<Arc<dyn BlockDev>> {
 
 /// Receive/transmit queue depth and buffer size the net device is opened with -
 /// the same shape the PCI driver uses, so the ring the crate posts is large
-/// enough never to be what drops a frame. A boot check reads only the MAC, but
-/// the device is constructed the way the stack would.
+/// enough never to be what drops a frame.
 const NET_QUEUE_SIZE: usize = 64;
 const NET_BUFFER_BYTES: usize = 2048;
 
-/// Read the MAC of the virtio-net device whose register block is mapped at
-/// `virt` (spanning `size`), or `None` if the window does not open as a network
-/// device. This is the drivers stage's third MMIO device, pinned the same way as
-/// the others: a real config read through the memory-mapped transport, not a
-/// claim of traffic. It allocates the device's receive ring via the neutral
-/// `Hal`, so it also re-proves DMA over MMIO for a multi-queue device.
-pub fn read_mac(virt: usize, size: usize) -> Option<[u8; 6]> {
-    // SAFETY: `virt` is an address inside the fixed device window the boot mapped
-    // as Device-nGnRnE and never executable, `size` is the register block the tree
-    // reports, and the header is volatile device memory; `'static` is the machine's
-    // promise that the window outlives this borrow of it.
-    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
-    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
-    let mut net = VirtIONet::<HalImpl, _, NET_QUEUE_SIZE>::new(transport, NET_BUFFER_BYTES).ok()?;
-    Some(net.mac_address())
+/// The virtio-net reached over MMIO, shaped as a [`NetDevice`] so the network
+/// stack drives it exactly as it drives the PCI adapter on x86_64: the same
+/// smoltcp interface above, the same `poll`/`transmit`/`ack_interrupt` seam, only
+/// a different transport underneath.
+///
+/// This is the *live* device rather than a probe, and the difference is that it
+/// stays open. Opening the transport posts the receive ring - sixty-four 2 KiB
+/// buffers, allocated through the neutral `Hal` - so a helper that opened the
+/// window, read one thing and dropped it would throw that ring away, and a stack
+/// that did so between polls would lose every frame that arrived in between. The
+/// machine therefore opens the adapter once, at the check that drives its data
+/// path ([`init_net_global`]), and hands that same handle to `net::init`.
+pub struct MmioNet {
+    device: Mutex<RefCell<VirtIONet<HalImpl, MmioTransport<'static>, NET_QUEUE_SIZE>>>,
+    mac: [u8; 6],
 }
 
-/// Drive one frame through the transmit virtqueue of the virtio-net device whose
-/// register block is mapped at `virt` (spanning `size`), and report whether the
-/// device took the buffer.
-///
-/// This is the MMIO net *data path* - build a DMA-reachable transmit buffer,
-/// place a frame in it, and kick it into the queue through the neutral `Hal` -
-/// where [`read_mac`] only touched the device's configuration space. A `true`
-/// says the multi-queue MMIO transport moved a buffer to the device over the
-/// rings, the same class of proof the block milestone made by reading a real
-/// sector back. It deliberately does **not** claim the frame reached any network
-/// (that is the stack, which this machine has not been given yet); it reports
-/// only that the device accepted the transmit. `false` is the honest refusal:
-/// the window did not open as a net device, the queue had no free TX slot, or
-/// the device rejected the buffer.
-pub fn tx_probe(virt: usize, size: usize) -> bool {
-    // SAFETY: `virt` is an address inside the fixed device window the boot mapped
-    // as Device-nGnRnE and never executable, `size` is the register block the tree
-    // reports, and the header is volatile device memory; `'static` is the machine's
-    // promise that the window outlives this borrow of it.
-    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
-    let Ok(transport) = (unsafe { MmioTransport::new(header, size) }) else {
-        return false;
-    };
-    let Ok(mut net) = (VirtIONet::<HalImpl, _, NET_QUEUE_SIZE>::new(transport, NET_BUFFER_BYTES))
-    else {
-        return false;
-    };
-    if !net.can_send() {
-        return false;
+impl MmioNet {
+    /// Open the network adapter whose register block is mapped at kernel-virtual
+    /// address `virt` and spans `size` bytes.
+    ///
+    /// `virt` is what the caller got from the MMIO-mapping capability for a
+    /// `virtio,mmio` window the tree reported, and `size` is that window's
+    /// register block. `None` is an honest refusal - a block the crate will not
+    /// accept as a transport, or a transport that is not a network device.
+    pub fn open(virt: usize, size: usize) -> Option<Arc<MmioNet>> {
+        // SAFETY: `virt` is an address inside the fixed device window the boot
+        // mapped whole as Device-nGnRnE and never executable (`device_virt` only
+        // answers for a range wholly inside it), `size` is the register block the
+        // tree reports, and the header is volatile device memory the transport
+        // reads. The `'static` is the machine's promise, not a borrow: the window
+        // outlives every use of this handle.
+        let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+        let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+        let device =
+            VirtIONet::<HalImpl, _, NET_QUEUE_SIZE>::new(transport, NET_BUFFER_BYTES).ok()?;
+        let mac = device.mac_address();
+        Some(Arc::new(MmioNet {
+            device: Mutex::new(RefCell::new(device)),
+            mac,
+        }))
     }
-    // A bare minimum Ethernet frame (60 bytes) of zeros - the shape a real frame
-    // has, not its content. The test is the queue, not the packet.
-    let mut buffer = net.new_tx_buffer(60);
-    buffer.packet_mut().copy_from_slice(&[0u8; 60]);
-    net.send(buffer).is_ok()
+}
+
+impl NetDevice for MmioNet {
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    fn rx_frames(&self) -> usize {
+        NET_QUEUE_SIZE
+    }
+
+    /// Take one frame the device has received, if there is one.
+    ///
+    /// The buffer goes straight back to the device: a buffer the driver kept is a
+    /// buffer the device cannot fill, and the queue would shrink by one every time
+    /// a frame arrived.
+    fn poll(&self) -> Option<Vec<u8>> {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            if !device.can_recv() {
+                return None;
+            }
+            match device.receive() {
+                Ok(received) => {
+                    let frame = Vec::from(received.packet());
+                    let _ = device.recycle_rx_buffer(received);
+                    Some(frame)
+                }
+                Err(_) => None,
+            }
+        })
+    }
+
+    /// Hand one frame to the transmit queue, answering whether the device took it.
+    ///
+    /// The data path, not the configuration space: building a DMA-reachable buffer,
+    /// placing a frame in it and kicking it into the queue through the neutral `Hal`
+    /// is what proves the multi-queue MMIO transport moves buffers over the rings -
+    /// the same class of proof the block milestone made by reading a real sector
+    /// back. It deliberately does **not** claim the frame reached any network (that
+    /// is the stack above, and the programs that drive it); `false` is an honest
+    /// refusal - a full or absent queue, so the frame is gone as it would be on the
+    /// wire.
+    fn transmit(&self, frame: &[u8]) -> bool {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            if !device.can_send() {
+                return false;
+            }
+            let mut buffer = device.new_tx_buffer(frame.len());
+            buffer.packet_mut().copy_from_slice(frame);
+            device.send(buffer).is_ok()
+        })
+    }
+
+    /// Read and clear the device's interrupt status.
+    ///
+    /// This machine drives the adapter by polling (the service task's tick), and
+    /// nothing routes its GIC line yet, so this is the same no-op-in-practice the
+    /// PCI driver performs when a frame arrived without an interrupt: the status
+    /// register is read and cleared so the next arrival can raise the line. It is
+    /// here rather than absent because `net` calls it on the seam, and a machine
+    /// whose device is polled only answers it honestly.
+    fn ack_interrupt(&self) {
+        critical_section::with(|cs| {
+            let _ = self.device.borrow(cs).borrow_mut().ack_interrupt();
+        });
+    }
+}
+
+/// The adapter the boot opened, if it opened one. Set once by
+/// [`init_net_global`]; read by [`net_device`], which `main`'s net wiring hands to
+/// `net::init`.
+static NET_GLOBAL: Mutex<RefCell<Option<Arc<MmioNet>>>> = Mutex::new(RefCell::new(None));
+
+/// Open the virtio-net window at `virt` (spanning `size`) as the machine's network
+/// adapter, and return it - or `None` if the window does not open as one.
+///
+/// This is the check's call, and the handle it returns is the *live* device: the
+/// same object `net::init` will be given through [`net_device`]. The boot check
+/// drives its data path (a transmit) while holding this handle, so the frame the
+/// marker reports and the frames the stack later sends go through one open ring
+/// and one device state, not two.
+///
+/// A machine whose card never probed leaves this `None`, and `net_device` answers
+/// `None` with it - which is the honest `ENETDOWN` the stack reports rather than a
+/// device that pretends to answer.
+pub fn init_net_global(virt: usize, size: usize) -> Option<Arc<MmioNet>> {
+    let dev = MmioNet::open(virt, size)?;
+    critical_section::with(|cs| {
+        *NET_GLOBAL.borrow(cs).borrow_mut() = Some(dev.clone());
+    });
+    Some(dev)
+}
+
+/// The machine's network adapter, if it has one - what `main`'s net wiring passes
+/// to `net::init`.
+pub fn net_device() -> Option<Arc<dyn NetDevice>> {
+    let dev = critical_section::with(|cs| NET_GLOBAL.borrow(cs).borrow().clone())?;
+    Some(dev)
 }
 
 /// Report whether the memory-mapped transport at `virt` (spanning `size`)

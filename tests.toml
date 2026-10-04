@@ -73,29 +73,22 @@ diagnostic = ["t-sh"]
 # shrink this group is to make the call work, not to edit a list of things nobody
 # runs (`PLAN.md` §13.4/§13.5).
 #
-#   t-socket, t-socketpair,   the socket family. aarch64's syscall table answers
-#   t-sockmsg, t-sockopt,     `socket`/`socketpair` with ENOSYS (measured: syscall
-#   t-tcp, t-tcp-listen,      198 -> ENOSYS, 199 -> ENOSYS), so each of these
-#   t-unix-rustix             stops at its first call and never reaches what it
-#                             is about. The live path (a NIC on this machine's
-#                             MMIO transport, and the socket legs that would use
-#                             it) is §13.4's device-seam flip.
-#   t-udp                     a datagram socket, same missing call. Also in
-#                             `external`: on x86_64 it is left out because it
-#                             sends a DNS query to the host, on aarch64 because
-#                             it cannot open the socket at all. Two groups,
-#                             because two different things stop it.
-#   t-stdresolve              a resolver is a datagram socket and a `sendto`, so
-#                             it fails for the same reason - measured in every
-#                             one of its 20 lookups (`Function not implemented`).
-#                             Also in `external` for the x86_64 reason.
-#   t-stdspawn                its subject is *other programs*: it runs
-#                             /bin/true, /bin/echo, /bin/cat, /bin/false and
-#                             /bin/sh -c. The x86_64 harness has those because its
-#                             test root is an initramfs with busybox in /bin; the
-#                             second machine's root is the ext4 disk rootfs and
-#                             has no /bin at all. A gap in the harness, not in
-#                             the kernel's spawn path - which every program in
-#                             this payload exercises, since the runner starts
-#                             each of them through posix_spawn (clone + execve).
-aarch64 = ["t-socket", "t-socketpair", "t-sockmsg", "t-sockopt", "t-stdresolve", "t-stdspawn", "t-tcp", "t-tcp-listen", "t-udp", "t-udp-loopback", "t-unix-rustix"]
+# The socket family used to be here - eleven names, every one of them stopping at
+# `socket(2)` with ENOSYS because this machine had no stack. §13.4's flip gave it
+# one (the MMIO adapter the boot's `check_net` opens and hands to `net::init`),
+# and the whole family now runs: `t-socket`, `t-sockmsg`, `t-sockopt`, `t-tcp`,
+# `t-tcp-listen`, `t-udp-loopback` and `t-unix-rustix` all pass on aarch64,
+# including a TCP connect/accept/read-write round trip over the stack. What is
+# left is one reason, and it is the harness's rather than the ABI's.
+#
+#   t-socketpair, t-stdspawn  their subject is *other programs*. `t-stdspawn`
+#                             runs /bin/true, /bin/echo, /bin/cat, /bin/false and
+#                             /bin/sh -c; `t-socketpair` runs /bin/cat. The
+#                             x86_64 harness has those because its test root is
+#                             an initramfs with busybox in /bin; the second
+#                             machine's root is the ext4 disk rootfs and has no
+#                             /bin at all. A gap in the harness, not in the
+#                             kernel's spawn path - which every program in this
+#                             payload exercises, since the runner starts each of
+#                             them through posix_spawn (clone + execve).
+aarch64 = ["t-socketpair", "t-stdspawn"]

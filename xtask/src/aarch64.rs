@@ -271,6 +271,11 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             "virtio-net over MMIO (TX queue accepted a frame)",
         ),
         (
+            "M8_NET_STACK_OK",
+            "the smoltcp stack initialized over that same adapter (the boot's net wiring, \
+             which `net::init` + `spawn_service` reached)",
+        ),
+        (
             "M8_INPUT_OK",
             "virtio-input over MMIO negotiated + read device identity",
         ),
@@ -494,7 +499,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!();
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
-             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M7_DEV_OK, M8_NET_OK, M8_INPUT_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
+             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M7_DEV_OK, M8_NET_OK, M8_NET_STACK_OK, M8_INPUT_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
              M6_AS_OK, \
              M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
@@ -502,7 +507,9 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              (R:echo-test), the exec target (MPOS_EXEC_OK), its fork child (MPOS_FORK_OK), \
              the unmodified musl binary (MPOS_MUSL_OK), and INIT_EXITED - the machine \
              drives three devices over the memory-mapped virtio transport (rng, blk with a \
-             verified sector read and a written sector round-tripped, and net whose TX virtqueue accepted a frame over MMIO) and mounts an ext4 filesystem \
+             verified sector read and a written sector round-tripped, and net whose TX virtqueue accepted a frame over MMIO \
+             and which the smoltcp stack is then initialized over, the same \
+             net::init + spawn_service pair the first machine boots with) and mounts an ext4 filesystem \
              over the block (the disk root), and a scheduler-run program that demand-paged, \
              read, echoed, execve'd, cloned, waited, then ran a real static-musl ELF at EL0 \
              which opened the mounted /dev through libc file I/O (MPOS_DEV_URANDOM_OK, \
@@ -1207,16 +1214,15 @@ mod tests {
         // run, so every name is present and the check is silent.
         assert!(gaps_without_programs(&config, machine, &gaps).is_empty());
 
-        // And the shape a stale entry takes: the file still names it, the
-        // payload no longer carries it.
-        let missing_socket: Vec<String> = gaps
-            .iter()
-            .filter(|name| *name != "t-socket")
-            .cloned()
-            .collect();
+        // And the shape a stale entry takes: the file still names one, the
+        // payload no longer carries it. The member is taken from the file rather
+        // than spelled here, so this pin does not need editing when the group
+        // shrinks - which is the direction it is supposed to move.
+        let last = gaps.len() - 1;
+        let missing_one: Vec<String> = gaps[..last].to_vec();
         assert_eq!(
-            gaps_without_programs(&config, machine, &missing_socket),
-            vec!["t-socket"]
+            gaps_without_programs(&config, machine, &missing_one),
+            vec![gaps[last].clone()]
         );
     }
 }
