@@ -217,44 +217,44 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::SYMLINKAT => fs::symlinkat(args, &cwd()),
 
         // --- sockets: AF_INET over the smoltcp stack ---
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::SOCKET => crate::net::socket::handle_socket(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::CONNECT => crate::net::socket::handle_connect(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::ACCEPT => crate::net::socket::handle_accept(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::SENDTO => crate::net::socket::handle_sendto(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::RECVFROM => crate::net::socket::handle_recvfrom(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::SENDMSG => crate::net::socket::handle_sendmsg(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::RECVMSG => crate::net::socket::handle_recvmsg(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::SHUTDOWN => crate::net::socket::handle_shutdown(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::BIND => crate::net::socket::handle_bind(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::LISTEN => crate::net::socket::handle_listen(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::GETSOCKNAME => crate::net::socket::handle_getsockname(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::GETPEERNAME => crate::net::socket::handle_getpeername(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::SOCKETPAIR => crate::net::socket::handle_socketpair(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::SETSOCKOPT => crate::net::socket::handle_setsockopt(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::GETSOCKOPT => crate::net::socket::handle_getsockopt(args, from_user),
         // The multiple-message pair and the flagged accept: `sendmsg` and
         // `recvmsg` over an array of records, and `accept` with the two
         // descriptor flags the modern spelling takes.
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::ACCEPT4 => crate::net::socket::handle_accept4(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::SENDMMSG => crate::net::socket::handle_sendmmsg(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(mpos_net)]
         nr::RECVMMSG => crate::net::socket::handle_recvmmsg(args, from_user),
 
         // --- process ---

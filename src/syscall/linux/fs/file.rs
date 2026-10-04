@@ -3006,11 +3006,11 @@ fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> i
 /// answer for the unreachable case; the `crate::net` forward exists only where
 /// the stack is compiled, so the routing is identical on the machines that have
 /// it and never invents a socket on the one that does not.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(mpos_net)]
 fn socket_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     crate::net::socket::handle_recvfrom(args, from_user)
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(not(mpos_net))]
 fn socket_read(_args: [usize; ARG_COUNT], _from_user: bool) -> isize {
     err::ENOTTY
 }
@@ -3018,11 +3018,11 @@ fn socket_read(_args: [usize; ARG_COUNT], _from_user: bool) -> isize {
 /// The socket leg of `write`/`writev`: `sendto` with no destination is exactly
 /// `write`'s contract on a connected socket. Same deferral and same honest
 /// unreachable answer as [`socket_read`].
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(mpos_net)]
 fn socket_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     crate::net::socket::handle_sendto(args, from_user)
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(not(mpos_net))]
 fn socket_write(_args: [usize; ARG_COUNT], _from_user: bool) -> isize {
     err::ENOTTY
 }
