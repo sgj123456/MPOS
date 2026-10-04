@@ -726,7 +726,14 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         so every fault looked like a read and the COW resolver was never reached. The run now
         passes that point and stops at the next gap — two faults in the runner (a write to
         `0xffffffffffffff5c`, translation fault L1; a read of `0x58`, L2) — where the aarch64 ABI
-        is still short. Next cut: those
+        is still short. **Both fixed**: a write fault now reaches the COW resolver (the `WnR`
+        bit), and the outgoing task's live thread pointer is captured on switch-out (musl
+        installs its base with a direct `msr`, so the record had gone stale and the base was
+        reset to 0 on the first switch after a spawn). The payload also stages only ELF files
+        now — cargo's `.d` dep-info files start with `t-` and were being run as programs
+        (`exit=127`). **The run completes**: 14 programs, `=== SUMMARY pass=0 fail=14`,
+        `=== END`. Next cut: classify which of the 14 the aarch64 ABI can serve today — named
+        in `tests.toml` with its reason, never skipped
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the

@@ -592,6 +592,13 @@ fn build_user_tests_for_aarch64() -> Result<Vec<(String, Vec<u8>)>> {
         }
         let bytes =
             fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+        // Cargo writes a `.d` dep-info file beside every binary, and its name
+        // starts with `t-` too. Staging one makes the runner exec a text file
+        // and report `exit=127`, which reads like a broken program rather than a
+        // broken payload - so the payload is the ELF magic, not the name.
+        if !bytes.starts_with(b"\x7fELF") {
+            continue;
+        }
         tests.push((name, bytes));
     }
     tests.sort_by(|a, b| a.0.cmp(&b.0));
