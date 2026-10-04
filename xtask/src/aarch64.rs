@@ -104,7 +104,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// check runs right after the rng one, so `M7_BLK_OK` is not a terminator and
 /// `M7_BLK_FAILED` is. Stage 8's net check runs right after the block one, so
 /// `M8_NET_OK` is not a terminator and `M8_NET_FAILED` is.
-const TERMINATORS: [&str; 22] = [
+const TERMINATORS: [&str; 23] = [
     "INIT_EXITED",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
@@ -117,6 +117,7 @@ const TERMINATORS: [&str; 22] = [
     "M7_RNG_FAILED",
     "M7_BLK_FAILED",
     "M7_FS_FAILED",
+    "M7_DISK_FAILED",
     "M7_DEV_FAILED",
     "M8_NET_FAILED",
     "M8_INPUT_FAILED",
@@ -226,6 +227,10 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             "virtio-blk over MMIO (read + write round trip)",
         ),
         ("M7_FS_OK", "ext4 mounted over the MMIO block"),
+        (
+            "M7_DISK_OK",
+            "disk root: /dev/vda published, mounted at /mnt, read through the VFS",
+        ),
         ("M7_DEV_OK", "/dev device set builds and reads entropy"),
         (
             "M8_NET_OK",

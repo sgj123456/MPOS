@@ -1117,9 +1117,17 @@ fn check_fs(info: &BootInfo) {
         };
         // `mount` only returns Ok for the window whose bytes are an ext4 the driver
         // can open; the raw pattern image is a clean `Err` and is skipped.
-        let Ok(fs) = crate::vfs::ext4::Ext4Fs::mount(dev) else {
+        let Ok(fs) = crate::vfs::ext4::Ext4Fs::mount(dev.clone()) else {
             continue;
         };
+        // The disk is registered with the block layer *after* the mount proved
+        // the bytes, so the raw pattern image and any non-ext4 window cannot take
+        // the name. That registration is what makes the device a kernel disk:
+        // the devfs build publishes `/dev/vda` from `blk::disks()`, and the init
+        // handoff mounts this same device through the VFS (`PLAN.md` §13.3's disk
+        // root). The major is Linux's for virtio-blk, so `/proc/partitions` and
+        // `lsblk`-shaped readers see the name they expect.
+        crate::blk::add_disk("vda", 254, "/dev/vda", dev);
         // Read the one file the image carries, back through the block driver.
         let Ok(hello) = fs.root().lookup("hello") else {
             fail!("ext4 mounted but /hello was not found through it");

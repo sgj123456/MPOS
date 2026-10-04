@@ -689,8 +689,10 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         design; still open: `syscall` ~71, `drivers` ~33, `sched` 22 (the
         ptrace/`user_regs_struct` block, which belongs in `arch/<arch>/` per §11.4 rather
         than behind a flag), `vfs` 7, `mm/{heap,elf}` 4, `logging` 6 (gate now *stale*)
-  - [ ] 13.3 aarch64 disk root over the already read/write-verified MMIO virtio-blk
-        (`M7_BLK_OK`) and its ext4 (`M7_FS_OK`)
+  - [~] 13.3 aarch64 disk root: the ext4 `check_fs` mounts is now **registered** with the
+        block layer (`vda`, major 254, `/dev/vda`) and **mounted through the VFS** by the
+        init handoff, which reads `/mnt/hello` back by path (`M7_DISK_OK`); the root
+        *switch* remains
   - [ ] 13.4 aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already
         proven (`M8_NET_OK`)
   - [ ] 13.5 `cargo xtask test --arch aarch64` boots the second machine; an unsupported
@@ -8283,7 +8285,7 @@ and green alone — AGENTS §4 rule 7):
 |---|---|---|---|
 | 13.1 | `hal` becomes arch-neutral: the optional-capability forwards (`Msi`, `SerialRing`, `FpuTrap`, `Segments`) and the aarch64 `ConsoleInput` forward stop being `#[cfg(target_arch)]`-gated in `src/hal/mod.rs`. The gate is a capability flag the build declares per target (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`, in `.cargo/config.toml`'s `[target.…]` blocks beside each machine's linker script, listed for `check-cfg` in `Cargo.toml`), so the file names no architecture and a machine without a capability still does not get a faked method (rule 4) | **landed** — `src/hal` `target_arch` 14 → 0; both bare-metal clippy targets clean; host lib `511 passed`; depgraph `11/11` | *landed* |
 | 13.2 | The callers stop spelling the architecture: `console.rs`, `sched/runtime.rs`, `logging.rs`, `rand.rs`, `mm/{elf,heap}.rs` and the `syscall/**` gates express the machine difference through `hal`/capability flags or the ABI layer instead of `target_arch`. The per-arch register/struct ABI facts (`user_regs_struct`, `struct stat`, the signal frame) move to their `arch/<arch>/` home — the §11.4 boundary, kept, not erased | host tests + full QEMU gate (trap/fault/context paths) | *in progress* — landed `console.rs` (10), `uevent.rs` (4), `mm/mod.rs` (4), the `sched` FPU-trap protocol (8), `syscall`'s socket legs (22) and `rand.rs` (2, via a new baseline `hal::Entropy`), on `mpos_framebuffer_console`/`mpos_serial_ring`, `mpos_net`, `mpos_dynamic_mmio_window` and `mpos_fpu_trap`; 169 sites remain outside `src/arch/` |
-| 13.3 | aarch64 disk root: the MMIO virtio-blk already read/write-verified (`M7_BLK_OK`) and the ext4 it mounts (`M7_FS_OK`) become the machine's root; `xtask` assembles the aarch64 disk from `rootfs.toml`'s geometry and the `rootfs/` tree | a boot marker that a rootfs *file* was read, not merely that an ext4 mounted | *planned* |
+| 13.3 | aarch64 disk root: the MMIO virtio-blk already read/write-verified (`M7_BLK_OK`) and the ext4 it mounts (`M7_FS_OK`) become the machine's root; `xtask` assembles the aarch64 disk from `rootfs.toml`'s geometry and the `rootfs/` tree | a boot marker that a rootfs *file* was read, not merely that an ext4 mounted | *in progress* — the ext4 is registered as `vda` and mounted through the VFS, `/mnt/hello` read by path (`M7_DISK_OK`); the root switch is the next cut |
 | 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *planned* |
 | 13.5 | `cargo xtask test --arch aarch64`: the sweep boots the second machine and reads its own `=== RUN/PASS/FAIL/SUMMARY`/`END` and `M*_OK` chain with x86's verdict (summary + QEMU exit). An unsupported `--arch` is an explicit error, never a silent run of the other machine | `cargo xtask test --arch aarch64` prints a green summary; x86 unchanged; `xtask` unit tests green | *planned* |
 

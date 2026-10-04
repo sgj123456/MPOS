@@ -99,6 +99,11 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     // is the ordering lesson behind the `/dev` note in `PLAN.md` §9.1.
     check_dev();
 
+    // Stage 7's disk root: the disk `check_fs` registered, mounted through the
+    // VFS and read back by path. After `check_dev` so the `/dev/vda` node it
+    // claims is the one the devfs build actually published.
+    check_disk_root();
+
     // Stage 7b: the polled console *input* path, pinned before anything reads it.
     // The machine can now hand a typed byte through `hal::console_poll_input` (the
     // PL011 RX FIFO); route it into the tty the way x86_64's serial interrupt does
@@ -241,6 +246,58 @@ fn check_dev() {
             hal::halt()
         }
     }
+}
+
+/// Stage 7's disk root on the second machine: the disk `check_fs` registered
+/// (`vda`, from the ext4 it mounted over the MMIO virtio-blk) is mounted
+/// through the *VFS* and read back by path.
+///
+/// `check_fs` proved the bytes - an ext4 mounted over a memory-mapped block
+/// device, and its file read through the driver's own handle. This proves the
+/// layer above it: the block device is a kernel disk the devfs build published
+/// as `/dev/vda`, the filesystem is reached through the mount table, and the
+/// read goes through path resolution the way a process's `open` does. The
+/// machine still boots its initramfs as the root - the disk-root *switch* is
+/// the next cut (`PLAN.md` §13.3) - so what is settled here is that the disk is
+/// a filesystem this kernel serves, not a driver-local handle.
+fn check_disk_root() {
+    let Some(dev) = mpos::blk::raw_disk() else {
+        mpos::println!("M7_DISK_FAILED: no disk was registered with the block layer");
+        hal::halt()
+    };
+    let Ok(fs) = mpos::vfs::ext4::Ext4Fs::mount(dev) else {
+        mpos::println!("M7_DISK_FAILED: the registered disk did not mount as ext4");
+        hal::halt()
+    };
+    let vfs = mpos::vfs::global();
+    // The name the marker claims, checked rather than asserted: the devfs build
+    // above publishes the disks `blk::disks()` reports, so a disk the block
+    // layer holds but `/dev` does not list is a failure here.
+    if vfs::resolve("/dev/vda").is_err() {
+        mpos::println!("M7_DISK_FAILED: /dev/vda is not in the mounted /dev");
+        hal::halt()
+    }
+    let _ = vfs.root_inode().create("mnt", mpos::vfs::NodeKind::Dir);
+    if let Err(e) = vfs::mount("/mnt", &fs) {
+        mpos::println!("M7_DISK_FAILED: mounting the disk at /mnt gave {e:?}");
+        hal::halt()
+    }
+    // Through the mount table, not the handle: `read_file` resolves every path
+    // component and reads what it lands on.
+    let Ok(bytes) = vfs::read_file("/mnt/hello") else {
+        mpos::println!("M7_DISK_FAILED: /mnt/hello did not read through the VFS");
+        hal::halt()
+    };
+    let known: &[u8] = b"mpos reads from ext4 over virtio-MMIO\n";
+    if bytes.as_slice() != known {
+        mpos::println!(
+            "M7_DISK_FAILED: /mnt/hello read {} bytes, and the image's file is {}",
+            bytes.len(),
+            known.len()
+        );
+        hal::halt()
+    }
+    mpos::println!("M7_DISK_OK: /dev/vda published, mounted at /mnt, /mnt/hello read through the VFS");
 }
 
 /// Stage 7b's evidence: the polled console input reaches a reader through the
