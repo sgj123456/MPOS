@@ -5991,6 +5991,18 @@ Named gaps the port carries rather than hides, each with its home:
   not asserted as "COW unbuilt." This blocks running a *subcommand* (a shell's core), and
   is orthogonal to the static-busybox prerequisite above.
 
+  Reading further confirms the COW path is not the bug: `resolve_cow`'s split leaf
+  (`VALID | TABLE | attributes(flags)`, `paging.rs`) is byte-for-byte the same encoding
+  `map_page` uses for a normal leaf, and `COW_BIT` is a software bit (55) the walk
+  ignores - so the aarch64 paging COW primitives are internally consistent. The notable
+  consequence is that aarch64 COW-*split* is **untested by the port itself**: the
+  hand-encoded `clone(SIGCHLD)` milestone only proves a child reaches EL0 and issues a
+  syscall; it never *writes a heap/stack page of the forked address space*, and every
+  musl fork test runs on x86. The concrete next cut is therefore a hand-encoded aarch64
+  milestone in which the fork child writes a COW page and the parent verifies isolation -
+  that both pins COW-split and, if it faults, localises the std abort to COW with a
+  traceable region instead of leaving it inferred.
+
 
   **`/proc` stays honestly refused on aarch64 - and it is gated, not one line from
   serving (corrected by an attempt).** An earlier note here said `vfs::procfs`
