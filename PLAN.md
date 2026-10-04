@@ -5895,7 +5895,10 @@ Named gaps the port carries rather than hides, each with its home:
   keyboard backend, so it presents its event queue and config headless with no
   external chardev); `check_input` finds the window by `DeviceID` 18
   (`VIRTIO_ID_INPUT`) and `mmio::probe_input` opens it as a `VirtIOInput`, requiring
-  the transport to negotiate the queues - `M8_INPUT_OK`. Like `check_net`'s MAC read
+  the transport to negotiate the queues **and read its configuration-space identity**
+  (`ids()`), so the milestone proves the MMIO transport moves config bytes for a fourth
+  device class - the same config-read step the net milestone took with its MAC.
+  `M8_INPUT_OK`. Like `check_net`'s MAC read
   this proves the *transport reaches the class*, not that events flow: the evdev
   nodes, `/dev/input` registration and the input pump stay x86_64's (`drivers::virtio::input`
   is PCI), so `/dev/input` remains absent on aarch64 (a named gap in the `/dev` set),

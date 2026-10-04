@@ -165,10 +165,18 @@ pub fn probe_input(virt: usize, size: usize) -> bool {
     // device window, `size` is the tree-reported register block, and the window
     // outlives this borrow.
     let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
-    match unsafe { MmioTransport::new(header, size) } {
-        Ok(transport) => VirtIOInput::<HalImpl, _>::new(transport).is_ok(),
-        Err(_) => false,
-    }
+    let Ok(transport) = (unsafe { MmioTransport::new(header, size) }) else {
+        return false;
+    };
+    let Ok(mut net) = (VirtIOInput::<HalImpl, _>::new(transport)) else {
+        return false;
+    };
+    // Negotiated. Now read the device's configuration-space identity (`ids()`
+    // reads the fixed-size virtio-input `bustype/vendor/product/version`). That is
+    // a data read across the mapped transport - the same class of proof the net
+    // milestone made by reading the MAC - so the milestone says the MMIO path
+    // *moves config bytes* for this device class, not merely opens it.
+    net.ids().is_ok()
 }
 
 /// Read the first `out.len() / 512` sectors of the virtio-blk device whose

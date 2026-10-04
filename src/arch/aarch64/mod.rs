@@ -1262,7 +1262,10 @@ fn check_input(info: &BootInfo) {
     if !opened {
         fail!("no virtio-input window opened and negotiated as an MMIO transport");
     }
-    let _ = writeln!(out, "virtio-input over MMIO negotiated its queues");
+    let _ = writeln!(
+        out,
+        "virtio-input over MMIO negotiated and read its device identity"
+    );
     let _ = writeln!(out, "M8_INPUT_OK");
 }
 

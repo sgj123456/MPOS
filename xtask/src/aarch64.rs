@@ -233,7 +233,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ),
         (
             "M8_INPUT_OK",
-            "virtio-input over MMIO negotiated its queues",
+            "virtio-input over MMIO negotiated + read device identity",
         ),
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
