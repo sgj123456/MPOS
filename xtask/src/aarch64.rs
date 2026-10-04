@@ -142,7 +142,12 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     println!("kernel: {} ({:.1} KB)", kernel.display(), kib(&kernel)?);
     println!("loader: {} ({:.1} KB)", loader.display(), kib(&loader)?);
 
-    let esp = build_esp(build_dir, &kernel, &loader)?;
+    let esp = build_esp(
+        build_dir,
+        &kernel,
+        &loader,
+        &crate::aarch64_init::minimal_init_elf(),
+    )?;
     println!("esp:    {}", esp.display());
 
     let log = boot(build_dir, &esp)?;
@@ -287,7 +292,7 @@ fn run_cargo(mut command: Command, root: &Path, what: &str) -> Result<()> {
 /// three root files are the loader's `KERNEL_PATH`, `INITRAMFS_PATH` and
 /// `CMDLINE_PATH`, and they are at the volume's root rather than under `EFI/`
 /// because that is where `boot/src/main.rs` reads them.
-fn build_esp(build_dir: &Path, kernel: &Path, loader: &Path) -> Result<PathBuf> {
+fn build_esp(build_dir: &Path, kernel: &Path, loader: &Path, init_elf: &[u8]) -> Result<PathBuf> {
     let esp = esp_dir(build_dir);
     if esp.exists() {
         fs::remove_dir_all(&esp).with_context(|| format!("Failed to clear {}", esp.display()))?;
@@ -301,18 +306,17 @@ fn build_esp(build_dir: &Path, kernel: &Path, loader: &Path) -> Result<PathBuf> 
         .with_context(|| format!("Failed to install {}", kernel.display()))?;
     fs::write(esp.join("mpos.cmdline"), CMDLINE)?;
 
-    // The third file is a real aarch64 `/init`, not the x86_64 image's archive.
-    // `aarch64_init` hand-encodes a static `EM_AARCH64` `ET_EXEC` whose whole
-    // program is `exit_group(0)`, and packs it ustar. The loader copies it into
-    // frames and records its address and length in the handoff, so this now
-    // proves a *second* file crosses the firmware's file protocols and lands in
-    // the direct map - the same thing the old optional x86 archive copy was only
-    // standing in for. The kernel does not read it yet: it still halts after
-    // `check_el0`, and the init handoff that mounts a ramfs and spawns this
-    // `/init` is the next cut (PLAN.md §9.1 stage 6E). It is laid down now so the
-    // image and the boot wiring can be landed and pinned independently.
+    // The third file is a real aarch64 `/init` - which one is the caller's choice,
+    // passed in as `init_elf`: the headless verdict packs the one-shot (it exits, so
+    // the marker poll can stop on `INIT_EXITED`), the interactive `run` packs the
+    // looping REPL stand-in (it never exits, so it can only run where a person is
+    // typing). `aarch64_init` hand-encodes a static `EM_AARCH64` `ET_EXEC` and packs
+    // it ustar. The loader copies it into frames and records its address and length
+    // in the handoff, so this proves a second file crosses the firmware's file
+    // protocols and lands in the direct map. The kernel unpacks it into a ramfs and
+    // runs it (PLAN.md §9.1 stages 6E/7d).
     let initramfs = build_dir.join("aarch64-initramfs.tar");
-    crate::aarch64_init::write_initramfs(build_dir, &initramfs)?;
+    crate::aarch64_init::write_initramfs_with(init_elf, build_dir, &initramfs)?;
     fs::copy(&initramfs, esp.join("initramfs.tar"))
         .with_context(|| format!("Failed to install {}", initramfs.display()))?;
     println!("initramfs: aarch64 /init -> {}", initramfs.display());
@@ -442,7 +446,12 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
 /// drivers stage (serial RX + the idle/park path, `PLAN.md` §9.1 stage 7).
 pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
     let (kernel, loader) = build(profile)?;
-    let esp = build_esp(build_dir, &kernel, &loader)?;
+    let esp = build_esp(
+        build_dir,
+        &kernel,
+        &loader,
+        &crate::aarch64_init::looping_init_elf(),
+    )?;
     let (code, vars_src) = firmware()?;
     let vars = vars_path(build_dir);
     fs::copy(&vars_src, &vars).with_context(|| {
@@ -453,7 +462,10 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
         )
     })?;
 
-    println!("booting aarch64 interactively (Ctrl-A x to exit QEMU)");
+    println!(
+        "booting aarch64 interactively: a read/echo loop on the serial console \
+         (type a line, it echoes back prefixed R:; Ctrl-A x to exit QEMU)"
+    );
     let mut qemu = aarch64_qemu(&esp, &code, &vars, "mon:stdio");
     let status = qemu
         .status()

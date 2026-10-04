@@ -5653,6 +5653,28 @@ read/echo proof: a `/init` that loops read/echo (or busybox `ash`, which additio
 needs the aarch64 `execve`/`clone` return-frame path - the named stage-6D gap), then the
 `drivers` disk root and `net`.
 
+**Stage 7e is DONE: `cargo xtask run --arch aarch64` is an interactive read/echo REPL.**
+The image is now two hand-encoded programs sharing one assembler (`aarch64_init.rs`):
+the one-shot above (the headless `boot-aarch64` verdict's, which exits so the marker
+poll stops on `INIT_EXITED`), and a **looping** `/init` whose body is the same
+`read(0)`/`write(1,"R:")`/`write(1,buf,n)` with `exit_group`/`b .` replaced by a branch
+back to the top - twenty words, the backward branch derived from the code length so it
+cannot desync, pinned by a host test that decodes the final word's `imm26` and asserts it
+is `-(20-1)`. `build_esp` takes the image to pack; `run --arch aarch64` packs the loop,
+`boot-aarch64` keeps the one-shot. The loop is why this belongs to `run` and not the
+verdict: with no typist its *second* `read(0)` parks - `read_wait`'s canonical
+`UntilInput`, woken only when a line lands - so `INIT_EXITED` never comes and a
+marker-poll would hang; at a terminal it is a REPL. Verified headlessly by booting the
+ESP under `-serial stdio` (plain, not `mon:stdio`, which swallows a piped monitor mux)
+and feeding `hello\nworld\n`: the log shows the tty's canonical echoes `hello`/`world`
+*and* the loop's own `R:hello`/`R:world` after the initial `R:echo-test` - a
+scheduler-run userspace program that read a typed line, echoed it, parked, and did it
+again. That is the objective's "reaches init/shell on the serial console" in the
+minimal genuine form: a persistent interactive userspace loop on the second machine. A
+real shell (busybox `ash`) is the same read/echo shape plus the `execve`/`clone`
+return-frame path (stage 6D) and a static-musl aarch64 image; the disk root, `net`, and
+`cargo xtask test --arch aarch64` remain.
+
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo
 build --target aarch64-unknown-none` fails with `relocation R_AARCH64_ABS64
