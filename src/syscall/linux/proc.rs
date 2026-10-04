@@ -87,7 +87,14 @@ fn build_frame(
     // replaces.
     let mut regs = capture_frame(regs_ptr, ret as usize);
     let mut bytes = [0u8; crate::hal::SIGNAL_FRAME_BYTES];
-    let Some(at) = crate::hal::enter_signal_frame(&mut regs, &mut bytes, &delivery) else {
+    // `regs_ptr` goes in as well, because a machine may keep the interrupted
+    // floating-point state in its own trap frame rather than in the task's
+    // record - aarch64 does, and the record there belongs to the context switch
+    // (`SignalFrame::enter`'s `frame` parameter).
+    // SAFETY: `regs_ptr` is the gate's own frame for this task, which is the
+    // contract `hal::enter_signal_frame` documents.
+    let at = unsafe { crate::hal::enter_signal_frame(&mut regs, &mut bytes, &delivery, regs_ptr) };
+    let Some(at) = at else {
         return false;
     };
     if !crate::sched::write_user(at.sp, &bytes) {
@@ -230,19 +237,21 @@ pub(super) fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
 
 /// `rt_sigreturn` — the trampoline's call, and the only way out of a handler.
 ///
-/// The libc's `__restore_rt` is entered by the handler's `ret`, so `rsp` has
-/// already moved past the restorer word; the frame therefore starts eight
-/// bytes below where this call finds the stack pointer. Reading that frame
-/// back and restoring the registers it saved is the machine's
-/// (`hal::SignalFrame`); the mask it puts back is the scheduler's.
+/// Where the frame starts depends on the trampoline, and that is the machine's
+/// (`SignalFrame::frame_at`): x86_64's `__restore_rt` is entered by the
+/// handler's `ret`, so the restorer word sits at `rsp` and the frame is eight
+/// bytes below it; aarch64's restorer is reached through `x30` and pushed
+/// nothing, so the frame *is* what `sp` points at. Reading that frame back and
+/// restoring the registers it saved is the machine's too; the mask it puts back
+/// is the scheduler's.
 #[cfg(mpos_signal_frame)]
 pub(super) fn handle_rt_sigreturn(regs_ptr: *mut ()) -> isize {
     // A null frame is a call the kernel made on its own behalf: there is no
-    // stack pointer to find a frame below.
+    // stack pointer to find a frame at.
     let Some(ctx) = (unsafe { crate::hal::user_context(regs_ptr, 0) }) else {
         return err::EFAULT;
     };
-    let frame = ctx.sp().wrapping_sub(8);
+    let frame = crate::hal::signal_frame_at(ctx.sp());
     let mut bytes = [0u8; crate::hal::SIGNAL_FRAME_BYTES];
     if !crate::sched::read_user(frame, &mut bytes) {
         return err::EFAULT;
@@ -250,7 +259,8 @@ pub(super) fn handle_rt_sigreturn(regs_ptr: *mut ()) -> isize {
     // Seeded from the running task's own register file, so the slots the frame
     // does not carry - the thread pointer above all - come back unchanged.
     let mut regs = capture_frame(regs_ptr, 0);
-    let mask = crate::hal::exit_signal_frame(&bytes, &mut regs);
+    // SAFETY: as `build_frame`'s, for the `rt_sigreturn` trap's own frame.
+    let mask = unsafe { crate::hal::exit_signal_frame(&bytes, &mut regs, regs_ptr) };
     // The frame's saved mask is the wire's `sigset_t` - a libc reads it as one -
     // so it comes back through the same conversion the install went out
     // through.
@@ -510,9 +520,15 @@ fn capture_frame(regs_ptr: *mut (), rax: usize) -> AbiRegs {
 /// change what the tracee sees there is for the new value to *be* the result.
 ///
 /// The thread pointer comes back separately, because installing it is the
-/// scheduler's and not the machine's.
+/// scheduler's and not the machine's - and because not every machine's register
+/// file *has* one. It is seeded with the value the task is running with, so a
+/// machine that has no such slot leaves it alone rather than answering with a
+/// zero the caller invented; x86_64's frame carries `fs_base` and overwrites it
+/// either way. Measured: with a zero seed, the first signal handler delivered on
+/// aarch64 left the task's `TPIDR_EL0` at 0 and the very next `println!` faulted
+/// reading musl's `errno` at `0x58` - NULL plus the offset the libc keeps it at.
 fn apply_frame(regs_ptr: *mut (), regs: &AbiRegs) -> usize {
-    let mut tls = 0usize;
+    let mut tls = crate::sched::current_tls();
     // SAFETY: as [`capture_frame`].
     let rax = unsafe { crate::hal::restore_user_regs(regs_ptr, regs, &mut tls) };
     if crate::sched::current_tls() != tls {

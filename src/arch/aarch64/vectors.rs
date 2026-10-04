@@ -94,8 +94,21 @@ pub const TRAP_FPU_OFFSET: usize = size_of::<UserFrame>();
 /// then `FPCR` and `FPSR`, in the order `context.rs`'s `FpuState` holds them.
 pub const TRAP_FPU_BYTES: usize = 528;
 
-/// The EL0 sync frame: the `UserFrame`, then the floating-point state.
-pub const TRAP_FRAME_BYTES: usize = TRAP_FPU_OFFSET + TRAP_FPU_BYTES;
+/// The interrupted call's first argument, kept beside the `UserFrame` because
+/// the frame's own `x0` slot stops holding it the moment the gate writes the
+/// call's *result* there.
+///
+/// This is Linux's `orig_x0`, and it sits in the same place relative to
+/// `user_pt_regs`: `struct pt_regs` on arm64 is the ABI's register file followed
+/// by the words the kernel needs and the program must not see, and this is one
+/// of them. What needs it is `SA_RESTART`: a rewound call re-executes the `svc`
+/// with the registers the frame saved, and the first of those is an argument
+/// rather than the result the call already produced.
+pub const TRAP_ORIG_X0_OFFSET: usize = TRAP_FPU_OFFSET + TRAP_FPU_BYTES;
+
+/// The EL0 sync frame: the `UserFrame`, the floating-point state, and the
+/// interrupted call's first argument.
+pub const TRAP_FRAME_BYTES: usize = TRAP_ORIG_X0_OFFSET + 16;
 
 /// Where the floating-point state sits inside the EL0 *interrupt* frame: after
 /// the 176 bytes the kernel's own IRQ stub saves, which is the whole of the
@@ -111,7 +124,11 @@ const _: () = {
         "the EL0 sync stub's floating-point offset moved"
     );
     assert!(
-        TRAP_FRAME_BYTES == 800,
+        TRAP_ORIG_X0_OFFSET == 800,
+        "the EL0 sync stub's `orig_x0` offset moved"
+    );
+    assert!(
+        TRAP_FRAME_BYTES == 816 && TRAP_FRAME_BYTES % 16 == 0,
         "the EL0 sync stub's frame size moved"
     );
     assert!(
@@ -295,7 +312,7 @@ __vec_el0_irq:
        the choice is the gate's - `SPSR_EL1`'s mode field is what it writes. */
     .balign 16
 __vec_el0_sync:
-    sub sp, sp, #800
+    sub sp, sp, #816
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -319,7 +336,7 @@ __vec_el0_sync:
     str x11, [sp, #264]
 
     /* And the floating-point/SIMD state the trap interrupts, in the 528 bytes
-       after the `UserFrame` - the reason this stub reserves 800 and not 272.
+       after the `UserFrame` - the reason this stub reserves 816 and not 272.
        It is not optional on this machine the way it is on x86_64: this kernel
        is built for `aarch64-unknown-none`, whose baseline includes NEON, so
        LLVM keeps its own values in `q0..q31` and a `svc` that reached Rust
@@ -350,6 +367,11 @@ __vec_el0_sync:
     mrs x10, fpsr
     str x9, [sp, #784]
     str x10, [sp, #792]
+
+    /* The call's first argument, before the gate overwrites `x0` with the
+       call's result - `TRAP_ORIG_X0_OFFSET`, and Linux's `orig_x0` in the same
+       place relative to `user_pt_regs`. `SA_RESTART` is what reads it. */
+    str x0, [sp, #800]
 
     mov x0, sp
     bl {el0_sync}
@@ -410,7 +432,7 @@ __vec_el0_sync:
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
-    add sp, sp, #800
+    add sp, sp, #816
     eret
 
     /* Not asking to come back: the gate has already set `SP_EL1`, `ELR_EL1` and
@@ -662,12 +684,18 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
         frame.x[5] as usize,
     ];
     // AArch64 returns a result in `x0` and an error as a negated errno, which is
-    // already what the `err` crate's constants are - so this is the value
-    // `dispatch` returned rather than a translation of it.
+    // already what the `err` crate's constants are - so no translation happens
+    // anywhere, and the *slot* is not written here either. That is the machine's
+    // answer rather than an omission: `x0` is the result slot *and* the
+    // register a handler is handed its signal number in, and the delivery at
+    // the end of this call rewrites the frame. `linux_dispatch` puts the result
+    // where it belongs (`hal::Gate::set_result`) before any handler is entered,
+    // so a write here would land on top of a handler's first argument -
+    // measured: every aarch64 handler ran with `x0 = 0` until it moved.
     // SAFETY: the frame is the one this vector just saved the trap into.
-    frame.x[0] = unsafe {
+    let _ = unsafe {
         crate::syscall::linux_dispatch(number, args, true, core::ptr::from_mut(frame).cast::<()>())
-    } as u64;
+    };
     0
 }
 

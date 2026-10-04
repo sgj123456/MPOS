@@ -240,6 +240,15 @@ pub unsafe fn linux_dispatch(
     // SAFETY: the caller's contract, passed through unchanged.
     let ret = unsafe { linux::dispatch(nr, args, from_user, regs_ptr) };
     let ret = linux::proc::syscall_exit_stop(regs_ptr, nr, args, ret);
+    // The call's result goes into the frame *now*, before the signal delivery
+    // below, and that order is the whole reason this is not the gate's own
+    // return sequence: entering a handler rewrites the frame, and on aarch64
+    // the result slot is `x0` - the handler's first argument, which is the
+    // signal number there. The gate's machines differ on whether the slot is
+    // anything else (`hal::Gate::set_result`).
+    //
+    // SAFETY: `regs_ptr` is the gate's own frame for this task, or null.
+    unsafe { crate::hal::set_result(regs_ptr, ret) };
     // Signals are delivered here rather than before the call: a handler has to
     // see the *result* of the syscall it interrupted, and the result does not
     // exist until the call has returned. Jumping into a handler means
@@ -254,9 +263,11 @@ pub unsafe fn linux_dispatch(
     // A first `/init` that only runs and exits needs no handler either way.
     #[cfg(mpos_signal_frame)]
     if linux::deliver_signal(regs_ptr, nr, ret) {
-        // The interrupted call's value belongs to the handler now: it is on
-        // the frame, waiting for `rt_sigreturn` to put it back.
-        return 0;
+        // The interrupted call's value belongs to the handler now: it is in the
+        // frame's `sigcontext`, waiting for `rt_sigreturn` to put it back.
+        // What the *handler* runs with in the result slot is the machine's
+        // business (`enter` wrote it), so nothing is written here.
+        return ret;
     }
     ret
 }

@@ -44,7 +44,8 @@
 //!   `hal::Paging`; the fixed window aarch64's devices are reached through is
 //!   `arch::aarch64::paging::DEVICE_VIRT`, and it is not this module's), `logging` (the level vocabulary; the subscriber writes to the console, now present on both machines), `rand`, `sync`, `uevent`, and every `crates/*`
 //!   leaf. `hal` joined them at stage 6f (both machines implement the baseline
-//!   concerns; x86's optional `Msi`/`SerialRing`/`FpuTrap`/`SignalFrame` are gated),
+//!   concerns; the optional `Msi`/`SerialRing`/`FpuTrap`/`SignalFrame` are gated
+//!   per capability, and both machines now declare `SignalFrame`),
 //!   and `console` at stage 4a (the serial sink is reached through `hal::Console`,
 //!   and the framebuffer + interrupt-TX-ring + scheduler-parking arms are
 //!   `#[cfg]`-inert on aarch64, whose console is the polled PL011).
@@ -143,9 +144,10 @@ pub use mpos_err as err;
 /// written to `AddressSpaceOps`' shapes so that the impl is delegation when
 /// `hal` reaches this machine. Both machines now compile it: x86_64 implements the
 /// baseline concerns plus the optional capabilities its hardware has
-/// (`Msi`/`FpuTrap`/`SignalFrame`), and aarch64 - which has no MSI controller, no lazy
-/// FPU trap and no `rt_sigframe` - implements only the baseline, which is what the
-/// split into optional capability traits exists to allow. The aarch64 impls landed
+/// (`Msi`/`FpuTrap`/`SignalFrame`), and aarch64 - which has no MSI controller and no
+/// lazy FPU trap, but has had its own `rt_sigframe` since §13.2's Stage 3b -
+/// implements the baseline plus `SignalFrame`, which is what the split into
+/// optional capability traits exists to allow. The aarch64 impls landed
 /// with the stages that built their bodies: the `Paging` running-process methods and
 /// the PL031 `WallClock` (`PLAN.md` §9.1).
 #[cfg(target_os = "none")]

@@ -339,6 +339,19 @@ impl crate::hal::Gate for crate::hal::Current {
         // fourth argument is in r10 because `syscall` clobbers rcx.
         [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]
     }
+
+    unsafe fn set_result(frame: *mut (), value: isize) {
+        if frame.is_null() {
+            return;
+        }
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &mut *(frame as *mut Regs) };
+        // The slot `sysretq` returns in, and the one the stub pops the caller's
+        // `rax` back out of. Writing it here as well as there is not a second
+        // source of truth: both write the same call's result, and this is the
+        // one that happens *before* a handler is entered.
+        frame.rax = value as usize;
+    }
 }
 
 extern "C" fn rust_syscall(regs: *mut Regs) -> usize {

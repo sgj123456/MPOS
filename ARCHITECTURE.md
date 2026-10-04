@@ -228,7 +228,8 @@ for — message-signalled delivery, the x87 lazy-FPU `#NM` trap protocol, segmen
 capabilities its hardware actually has, so `arch → hal` is the only arrow between the two and
 everything above the machine layer calls `crate::hal`'s forwards rather than naming `arch` — which
 makes `src/arch/mod.rs` a facade of four items and its submodules `pub(crate)`. An absent
-capability is *absent* (the aarch64 `Current` simply is not an `Msi`/`FpuTrap`/`SignalFrame`), not a
+capability is *absent* (the aarch64 `Current` simply is not an `Msi`/`FpuTrap`; it is a
+`SignalFrame` since §13.2's Stage 3b, with its own `rt_sigframe`), not a
 method every machine must fake an answer for (`AGENTS.md` §4 rule 4). Which capabilities a build has is
 a `mpos_*` flag declared per target in `.cargo/config.toml` (beside each machine's linker script, listed
 for `check-cfg` in `Cargo.toml`), so the forwards' `#[cfg]` gates name the capability and never the

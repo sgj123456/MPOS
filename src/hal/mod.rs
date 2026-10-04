@@ -493,6 +493,17 @@ pub trait SignalFrame {
     /// How many bytes the frame occupies on the handler's stack.
     const FRAME_BYTES: usize;
 
+    /// Where the frame begins, given the stack pointer the handler's
+    /// trampoline leaves behind when it calls `rt_sigreturn`.
+    ///
+    /// This is the one *shape* difference between the two machines' frames
+    /// rather than a layout inside one: x86_64's `__restore_rt` reaches the
+    /// kernel with the restorer word still at `rsp`, so the frame starts eight
+    /// bytes below it; aarch64's restorer is in `x30` and nothing was pushed,
+    /// so the frame *is* where `sp` points. The `rt_sigreturn` handler asks
+    /// this rather than assuming either.
+    fn frame_at(sp: usize) -> usize;
+
     /// Lay the frame out, and turn the interrupted call's register file into
     /// the handler's entry state.
     ///
@@ -504,12 +515,25 @@ pub trait SignalFrame {
     /// `ucontext`. The answer names where the frame was put, so the caller can
     /// write it into the process's memory.
     ///
+    /// `frame` is the machine's own gate frame for this task - the same opaque
+    /// pointer [`Gate`] is handed - and a machine may read from it any
+    /// interrupted state it keeps there rather than in the task's record.
+    /// aarch64's trap frame carries the interrupted floating-point/SIMD
+    /// registers, which is the only place they exist (the record belongs to the
+    /// context switch, which writes the kernel's scratch into it); x86_64's
+    /// frame carries no floating-point image at all and ignores this.
+    ///
     /// `None` when there is no frame to write at all - the disposition has no
     /// restorer and this machine's ABI requires one.
-    fn enter(
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`]: `frame` must be the gate's own frame for the
+    /// calling task, or null.
+    unsafe fn enter(
         regs: &mut [u64],
         out: &mut [u8],
         delivery: &SignalDelivery,
+        frame: *mut (),
     ) -> Option<SignalFrameEntry>;
 
     /// The inverse: read a handler's frame back into the ABI register file, and
@@ -520,7 +544,15 @@ pub trait SignalFrame {
     /// slots the frame does not carry are left as they are, so `regs` is seeded
     /// from the running task's own file first - the thread pointer lives in a
     /// register the frame does not save.
-    fn exit(bytes: &[u8], regs: &mut [u64]) -> u64;
+    ///
+    /// `frame` is [`enter`](Self::enter)'s gate frame, and is where a machine
+    /// puts state the frame carries but the register file does not - aarch64
+    /// restores the floating-point half through it, and the trap's own exit is
+    /// what loads the registers.
+    ///
+    /// # Safety
+    /// As [`SignalFrame::enter`].
+    unsafe fn exit(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> u64;
 }
 
 /// An interrupt-driven transmit ring behind the [`Console`] sink: queue bytes,
@@ -655,7 +687,13 @@ pub trait Gate {
     /// The thread pointer comes back through `tls` rather than being installed
     /// here. Installing it is the scheduler's, and `arch -> sched` is the one
     /// upward edge this seam exists to keep out; the ABI layer makes the
-    /// `sched` call with the value this hands back.
+    /// `sched` call with the value this hands back. The caller seeds `tls` with
+    /// the value the task is *running with*, because not every machine's
+    /// register file carries one: x86_64's `user_regs_struct` has `fs_base` and
+    /// this overwrites the seed, while aarch64's `user_pt_regs` is
+    /// `x0..x30`/`sp`/`pc`/`pstate` and `TPIDR_EL0` is not in it - so there the
+    /// seed is the answer, and a machine that wrote zero instead would strand
+    /// the task's TLS on its next dispatch.
     ///
     /// # Safety
     /// As [`Gate::user_ip`], and `regs` must be [`ABI_REG_COUNT`] words long.
@@ -675,6 +713,25 @@ pub trait Gate {
     /// # Safety
     /// As [`Gate::user_ip`].
     unsafe fn syscall_args(frame: *mut ()) -> [usize; 6];
+
+    /// Put a call's result in the frame's result slot.
+    ///
+    /// This is one operation rather than a write by the gate's own assembly
+    /// because the slot is not the same thing on both machines. On x86_64 it is
+    /// `rax`, a scratch register the ABI gives the call; on aarch64 it is `x0`,
+    /// which is *also* the first argument - a handler entered at the end of the
+    /// call is handed the signal number there. So the write belongs to the
+    /// layer that knows a handler is about to be entered and can do it first,
+    /// not to each gate's return sequence: measured, with the gate writing its
+    /// own return value afterwards, every aarch64 handler ran with `x0 = 0`
+    /// instead of the signal number it was delivered.
+    ///
+    /// A null frame - a call the kernel made on its own behalf - has no slot,
+    /// and this is a no-op.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`], for a frame that may be null.
+    unsafe fn set_result(frame: *mut (), value: isize);
 }
 
 /// A machine this kernel can run on. `Current` names the one being built.
@@ -1242,26 +1299,52 @@ pub unsafe fn syscall_args(frame: *mut ()) -> [usize; 6] {
     unsafe { <Current as Gate>::syscall_args(frame) }
 }
 
+/// Put a call's result in the frame's result slot. See [`Gate::set_result`].
+///
+/// # Safety
+/// As [`Gate::set_result`].
+#[inline]
+pub unsafe fn set_result(frame: *mut (), value: isize) {
+    unsafe { <Current as Gate>::set_result(frame, value) }
+}
+
 /// The bytes a signal frame occupies ([`SignalFrame::FRAME_BYTES`]).
 #[cfg(mpos_signal_frame)]
 pub const SIGNAL_FRAME_BYTES: usize = <Current as SignalFrame>::FRAME_BYTES;
 
-/// Lay out the frame a signal handler will run on. See [`SignalFrame::enter`].
+/// Where a handler's frame begins, given the trampoline's `rt_sigreturn` stack
+/// pointer. See [`SignalFrame::frame_at`].
 #[cfg(mpos_signal_frame)]
 #[inline]
-pub fn enter_signal_frame(
+pub fn signal_frame_at(sp: usize) -> usize {
+    <Current as SignalFrame>::frame_at(sp)
+}
+
+/// Lay out the frame a signal handler will run on. See [`SignalFrame::enter`].
+///
+/// # Safety
+/// As [`SignalFrame::enter`].
+#[cfg(mpos_signal_frame)]
+#[inline]
+pub unsafe fn enter_signal_frame(
     regs: &mut [u64],
     out: &mut [u8],
     delivery: &SignalDelivery,
+    frame: *mut (),
 ) -> Option<SignalFrameEntry> {
-    <Current as SignalFrame>::enter(regs, out, delivery)
+    // SAFETY: the caller's contract, passed through unchanged.
+    unsafe { <Current as SignalFrame>::enter(regs, out, delivery, frame) }
 }
 
 /// Read a handler's frame back. See [`SignalFrame::exit`].
+///
+/// # Safety
+/// As [`SignalFrame::exit`].
 #[cfg(mpos_signal_frame)]
 #[inline]
-pub fn exit_signal_frame(bytes: &[u8], regs: &mut [u64]) -> u64 {
-    <Current as SignalFrame>::exit(bytes, regs)
+pub unsafe fn exit_signal_frame(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> u64 {
+    // SAFETY: the caller's contract, passed through unchanged.
+    unsafe { <Current as SignalFrame>::exit(bytes, regs, frame) }
 }
 
 // ---------------------------------------------------------------------------

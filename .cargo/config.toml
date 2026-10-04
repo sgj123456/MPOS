@@ -58,14 +58,15 @@ rustflags = [
 # loaded it at. The loader places the segments itself now, so the image has to
 # be relocatable and this block matches the x86_64 one.
 #
-# This machine's capability set is two flags. Its PL011 receiver is polled (the
+# This machine's capability set is three flags. Its PL011 receiver is polled (the
 # GIC RX line is a later cut), so `hal::ConsoleInput` is present here and absent
-# on x86_64. And it has a compiled network stack (`mpos_net`, the same one the
-# first machine declares): the seam landed with §13.4's device stage, so the
-# socket syscalls route into `net` here too, and its adapter is the MMIO window
-# `check_net` opens and `main` hands to `net::init`. It has no MSI controller, no
-# lazy FPU trap and no `rt_sigframe` (`sigcontext`, `rt_sigreturn`), so it
-# declares none of the other x86_64 flags.
+# on x86_64. It has a compiled network stack (`mpos_net`, the same one the first
+# machine declares): the seam landed with §13.4's device stage, so the socket
+# syscalls route into `net` here too, and its adapter is the MMIO window
+# `check_net` opens and `main` hands to `net::init`. And its own `rt_sigframe`
+# (`sigcontext`, the `fpsimd_context` record, `rt_sigreturn`) since §13.2's Stage
+# 3b, so `mpos_signal_frame` is declared here too. It has no MSI controller and
+# no lazy FPU trap, so it declares none of the other x86_64 flags.
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=pic",
@@ -75,6 +76,7 @@ rustflags = [
     "-C", "link-arg=-zmax-page-size=0x1000",
     "--cfg", "mpos_console_input",
     "--cfg", "mpos_net",
+    "--cfg", "mpos_signal_frame",
 ]
 
 # The user programs: ordinary Rust binaries for musl, which is the libc this

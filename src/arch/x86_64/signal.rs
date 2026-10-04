@@ -57,6 +57,13 @@ mod sc {
 /// the libc's `__restore_rt` trampoline is what reads them back: it issues
 /// `rt_sigreturn` with `rsp` pointing just past `pretcode`, and the kernel
 /// finds the saved registers at a fixed offset from there.
+///
+/// The `pretcode` word at the front is x86_64's way of saying where a handler
+/// returns to, and the second machine says it differently rather than merely
+/// elsewhere: aarch64 has no such word, and the restorer goes in `x30`. That is
+/// why `SignalFrame::frame_at` exists - the *frame's* address is what the two
+/// disagree about (`sp - 8` here, `sp` there) - and why `enter` takes the
+/// restorer as an answer rather than as an offset.
 const SIGFRAME_BYTES: usize = 440;
 /// Offset of `struct ucontext` inside the frame - that is, `sizeof(char *)`.
 const UCONTEXT: usize = 8;
@@ -91,11 +98,25 @@ fn get(bytes: &[u8], at: usize) -> u64 {
 impl SignalFrame for Current {
     const FRAME_BYTES: usize = SIGFRAME_BYTES;
 
-    fn enter(
+    fn frame_at(sp: usize) -> usize {
+        // `__restore_rt` is reached by the handler's `ret`, which popped the
+        // restorer word, so the frame starts eight bytes below where the
+        // trampoline's `rt_sigreturn` finds the stack pointer.
+        sp.wrapping_sub(8)
+    }
+
+    unsafe fn enter(
         regs: &mut [u64],
         out: &mut [u8],
         delivery: &SignalDelivery,
+        frame: *mut (),
     ) -> Option<SignalFrameEntry> {
+        // The gate frame carries nothing this layout needs: an x86_64
+        // `sigcontext` has no floating-point image in it (its `fpregs` is a
+        // pointer this kernel does not fill), so there is no second source for
+        // any saved word and nothing here reads it. aarch64's `enter` is the
+        // one that does - see `SignalFrame::enter`'s `frame` parameter.
+        let _ = frame;
         debug_assert_eq!(
             regs.len(),
             uregs::COUNT,
@@ -220,7 +241,9 @@ impl SignalFrame for Current {
         })
     }
 
-    fn exit(bytes: &[u8], regs: &mut [u64]) -> u64 {
+    unsafe fn exit(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> u64 {
+        // As in `enter`: nothing in this frame comes from the gate frame.
+        let _ = frame;
         debug_assert_eq!(
             regs.len(),
             uregs::COUNT,

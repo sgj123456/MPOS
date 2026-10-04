@@ -42,6 +42,7 @@ pub(crate) mod gic;
 pub(crate) mod paging;
 pub(crate) mod pl011;
 pub(crate) mod pl031;
+pub(crate) mod signal;
 pub(crate) mod timer;
 pub(crate) mod vectors;
 
@@ -3052,6 +3053,18 @@ impl crate::hal::Gate for crate::hal::Current {
             frame.x[4] as usize,
             frame.x[5] as usize,
         ]
+    }
+
+    unsafe fn set_result(frame: *mut (), value: isize) {
+        if frame.is_null() {
+            return;
+        }
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &mut *(frame as *mut context::UserFrame) };
+        // `x0` is where this ABI returns a result *and* where a handler is
+        // handed its signal number, which is why the write happens before one
+        // is entered rather than in the gate's own return sequence.
+        frame.x[0] = value as u64;
     }
 }
 

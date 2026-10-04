@@ -94,6 +94,15 @@ pub struct FpuState {
 /// two are related.
 pub const FPU_BYTES: usize = 528;
 
+/// Where `FPCR` and `FPSR` sit inside the 528 bytes: after the thirty-two `q`
+/// registers, and in that order - which is *not* the order the Linux signal
+/// frame's `fpsimd_context` holds them in (`fpsr` then `fpcr`), so the two
+/// shapes are related by an explicit conversion rather than by a copy. The
+/// offsets are `mpos_context_switch`'s `str x2, [x0, #512]`/`#520`, spelled once
+/// here so the signal frame does not have to re-derive them from assembly.
+pub const FPCR_OFFSET: usize = 512;
+pub const FPSR_OFFSET: usize = 520;
+
 impl FpuState {
     /// The architectural reset state: every field zero.
     ///
@@ -170,6 +179,10 @@ const _: () = {
     assert!(
         FPU_BYTES == 528,
         "the context switch's floating-point save area moved"
+    );
+    assert!(
+        FPCR_OFFSET == 512 && FPSR_OFFSET == 520 && FPSR_OFFSET + 8 <= FPU_BYTES,
+        "the context switch's control/status register offsets moved"
     );
     assert!(
         BOOTSTRAP_BYTES == 96,
