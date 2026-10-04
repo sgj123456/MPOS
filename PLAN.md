@@ -6046,21 +6046,30 @@ Named gaps the port carries rather than hides, each with its home:
   `current_stack_range` value that looked far from `sp` is just the task's *kernel* stack
   (`runtime.rs:5958`), not the user window.
 
-  One instrumented fault dump settles the actual shape: the fatal fault is a **read**
-  (`is_write=false`, `ESR` DFSC `0x0f` = level-3 **permission**) at `sp - 16`, and
-  `resolve_stack_growth` is reached with its `try_map` reporting the page **already mapped**
-  - so it is a permission fault on a *present* page, not a missing mapping or a hole. The
-  specific reason that one copied page denies the EL0 read was **not** pinned and needs one
-  more measurement: dump the faulting leaf's raw `AP`/`PXN`/`UXN` bits in the aarch64 path.
-  What matters for the eventual fix is its blast radius: that encoding lives in
-  `arch/aarch64/paging.rs`, which x86 does not compile, so a *confirmed* aarch64 paging fix
-  carries no x86 `cargo xtask test` regression - it is verified by `boot-aarch64` alone.
+  The instrumented fault dump settles it: the fatal fault is a **read** (`is_write=false`,
+  `ESR` DFSC `0x0f` = level-3 **permission**) at `sp - 16`, and the faulting leaf descriptor
+  is `AP = 0b10` (**EL1 read-only, EL0 no access**) with `COW_BIT` set. That is a *symptom*,
+  not a paging one-liner: a page carried into the child with `AP 0b10` never had the EL0
+  (`USER`) bit, so the earlier "confirmed aarch64 paging fix" idea is wrong - the copied
+  page faithfully reflects a non-user mapping the child should never have been reading in
+  the first place. Why the vfork child touches a non-user page is the real cause: **`vfork`
+  requires `CLONE_VM` sharing** - the child runs the parent's C code against the parent's
+  live stack and pointers until it `execve`s - but `clone()` routes `CLONE_VM`-without-
+  `CLONE_THREAD` to `spawn_copy`, which gives the child a *private* COW copy and does not
+  suspend the parent (`runtime.rs:7407-7434`; comment at `7994`). Under a private copy the
+  child's parent-relative pointers resolve against the wrong tables and land on a kernel
+  page, faulting on read. So this is not a paging bug at all: it is **`CLONE_VM`/
+  `CLONE_VFORK` fork semantics that are unimplemented** - a genuine multi-step feature in
+  the shared fork/scheduler path (share the address space for `CLONE_VM`; suspend the parent
+  on `CLONE_VFORK` until the child execs/exits), which x86 does exercise (its std forks, not
+  vforks) and so the aarch64 gap is invisible there.
 
-  The fix was **not** attempted here because the exact defect is still unpinned; a guessed
-  change to the copy/permission path would be "nearly-right," which is worse than absent and
-  would defeat `fork` isolation if wrong. This blocks running a *subcommand* (a shell's
-  core) from `cargo xtask run --arch aarch64`, and is orthogonal to the static-busybox
-  prerequisite above.
+  Implementing it was **not** attempted here: it is shared fork/clone/scheduler work under
+  the x86 `cargo xtask test` 142-test gate, needs careful `CLONE_VM`-share + `VFORK`
+  suspend/resume + a child that detaches on `execve`, and a partial or guessed version would
+  either corrupt `fork` isolation or fake success. This is the named remaining blocker for
+  running a *subcommand* (a shell's core) from `cargo xtask run --arch aarch64`, and is
+  orthogonal to the static-busybox prerequisite above.
 
   Reading further confirms the COW path is not the bug: `resolve_cow`'s split leaf
   (`VALID | TABLE | attributes(flags)`, `paging.rs`) is byte-for-byte the same encoding
