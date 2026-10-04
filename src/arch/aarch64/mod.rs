@@ -1197,6 +1197,15 @@ fn check_net(info: &BootInfo) {
         "virtio-net over MMIO opened, MAC {:#04x}:{:#04x}:{:#04x}:{:#04x}:{:#04x}:{:#04x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
+    // The data path, not just the config space: hand a frame to the transmit
+    // queue and require the device to take it. This is what makes the MMIO net
+    // milestone mean the rings move buffers over the mapped transport, the same
+    // way the block milestone means a real sector came back - and it does not
+    // claim the packet left the machine (the network stack is a later stage).
+    if !crate::drivers::virtio::mmio::tx_probe(virt, size) {
+        fail!("the virtio-net TX queue did not accept a frame over MMIO at {virt:#x}");
+    }
+    let _ = writeln!(out, "virtio-net TX virtqueue accepted a frame over MMIO");
     let _ = writeln!(out, "M8_NET_OK");
 }
 

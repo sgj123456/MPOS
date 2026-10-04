@@ -5861,9 +5861,16 @@ Named gaps the port carries rather than hides, each with its home:
   commit):** `drivers::virtio::mmio::read_mac` opens the tree's net window
   (`DeviceID` 1, `VIRTIO_ID_NET`) as an `MmioTransport` and hands it to the crate's
   `VirtIONet`; xtask attaches a `virtio-net-device` on a user-mode backend and
-  `check_net` reads the adapter's 6-byte MAC and asserts it is not all-zero, so
-  `M8_NET_OK` proves the multi-queue device constructs over MMIO (its receive ring
-  allocates through the neutral `Hal`) without claiming traffic it did not send.
+  `check_net` reads the adapter's 6-byte MAC and asserts it is not all-zero, **and
+  then drives the transmit virtqueue**: `mmio::tx_probe` builds a DMA-reachable TX
+  buffer through the neutral `Hal`, places a 60-byte frame in it, and requires the
+  device to accept it (`send` returns `Ok`). `M8_NET_OK` prints only after that, so
+  it proves the multi-queue MMIO *data path* moves a buffer to the device over the
+  rings - the same class of proof the block milestone made by reading a real sector
+  back - not just a config-space MAC read. It still does not claim the frame left the
+  machine: the smoltcp stack and socket syscalls over this device are the next cut.
+  (A rejected frame reuses `M8_NET_FAILED`, already a terminator, so it aborts
+  honestly rather than printing a false `M8_NET_OK`.)
   **Stage 7's disk-root primitive - an ext4 mounted over the MMIO block - DONE (the
   fs commit):** `mmio` also implements `crate::blk::BlockDev` for the MMIO block
   (`MmioBlk`: sector read/write/flush + capacity through the neutral `Hal`), and

@@ -115,6 +115,43 @@ pub fn read_mac(virt: usize, size: usize) -> Option<[u8; 6]> {
     Some(net.mac_address())
 }
 
+/// Drive one frame through the transmit virtqueue of the virtio-net device whose
+/// register block is mapped at `virt` (spanning `size`), and report whether the
+/// device took the buffer.
+///
+/// This is the MMIO net *data path* - build a DMA-reachable transmit buffer,
+/// place a frame in it, and kick it into the queue through the neutral `Hal` -
+/// where [`read_mac`] only touched the device's configuration space. A `true`
+/// says the multi-queue MMIO transport moved a buffer to the device over the
+/// rings, the same class of proof the block milestone made by reading a real
+/// sector back. It deliberately does **not** claim the frame reached any network
+/// (that is the stack, which this machine has not been given yet); it reports
+/// only that the device accepted the transmit. `false` is the honest refusal:
+/// the window did not open as a net device, the queue had no free TX slot, or
+/// the device rejected the buffer.
+pub fn tx_probe(virt: usize, size: usize) -> bool {
+    // SAFETY: `virt` is an address inside the fixed device window the boot mapped
+    // as Device-nGnRnE and never executable, `size` is the register block the tree
+    // reports, and the header is volatile device memory; `'static` is the machine's
+    // promise that the window outlives this borrow of it.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let Ok(transport) = (unsafe { MmioTransport::new(header, size) }) else {
+        return false;
+    };
+    let Ok(mut net) = (VirtIONet::<HalImpl, _, NET_QUEUE_SIZE>::new(transport, NET_BUFFER_BYTES))
+    else {
+        return false;
+    };
+    if !net.can_send() {
+        return false;
+    }
+    // A bare minimum Ethernet frame (60 bytes) of zeros - the shape a real frame
+    // has, not its content. The test is the queue, not the packet.
+    let mut buffer = net.new_tx_buffer(60);
+    buffer.packet_mut().copy_from_slice(&[0u8; 60]);
+    net.send(buffer).is_ok()
+}
+
 /// Read the first `out.len() / 512` sectors of the virtio-blk device whose
 /// register block is mapped at `virt` (spanning `size`) into `out`.
 ///
