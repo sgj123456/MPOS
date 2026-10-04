@@ -21,7 +21,8 @@ target = "x86_64-unknown-none"
 #
 # The `mpos_*` flags are the capabilities this machine declares to `crate::hal`
 # (`src/hal/mod.rs`): the local APIC's message-signalled delivery, the 16550's
-# interrupting transmit ring, the x87 lazy-FPU trap, and segment selectors.
+# interrupting transmit ring, the x87 lazy-FPU trap, segment selectors, and a
+# framebuffer console to paint the virtual-console grids on.
 # `hal` forwards each under `#[cfg(mpos_…)]` and names no architecture; the
 # machine-to-capability mapping lives here, beside the linker-script path that
 # is this file's other per-machine fact. A port declares its own set in its own
@@ -36,6 +37,7 @@ rustflags = [
     "--cfg", "mpos_serial_ring",
     "--cfg", "mpos_fpu_trap",
     "--cfg", "mpos_segments",
+    "--cfg", "mpos_framebuffer_console",
 ]
 
 # The aarch64 kernel, built the way the x86_64 one is and for the same reason:

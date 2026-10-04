@@ -244,7 +244,7 @@ pub fn write_bytes(bytes: &[u8]) {
 /// framebuffer this compiles to nothing, and [`grids_live`] is never true on it
 /// anyway; the body is moved here verbatim so the console's ordering (record,
 /// paint, wire) is unchanged and the x86 behaviour is identical.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_framebuffer_console)]
 fn paint_grids_if_live(bytes: &[u8]) {
     if grids_live() {
         crate::term::with_screen(active_grid(), |g| g.feed(bytes));
@@ -252,7 +252,7 @@ fn paint_grids_if_live(bytes: &[u8]) {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(mpos_framebuffer_console))]
 fn paint_grids_if_live(_bytes: &[u8]) {}
 
 /// A virtual console's own printed bytes - what the shell on `/dev/ttyN` wrote.
@@ -276,13 +276,13 @@ pub fn vc_output(vc: u32, bytes: &[u8]) {
 /// Paint one virtual console's own bytes onto its grid and redraw - x86_64's
 /// framebuffer path; compiles to nothing on a machine with no framebuffer. Body
 /// moved verbatim so the x86 behaviour is identical.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_framebuffer_console)]
 fn paint_vc_if_live(vc: u32, bytes: &[u8]) {
     crate::term::with_screen(vc as usize, |g| g.feed(bytes));
     crate::drivers::video::render::notify();
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(mpos_framebuffer_console))]
 fn paint_vc_if_live(_vc: u32, _bytes: &[u8]) {}
 
 /// The grid index of the console currently shown, by its `/dev/ttyN` number.
@@ -366,7 +366,7 @@ fn serial_mirror_now(bytes: &[u8]) {
 /// sequence - `term::wire::cut` decides where a partial write may end). Returns
 /// `false` when there is no live ring so the caller falls back to the polled
 /// write. Moved verbatim; a machine with no ring is not a `SerialRing`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_serial_ring)]
 fn mirror_into_ring(bytes: &[u8]) -> bool {
     if crate::hal::console_interrupt_driven() {
         let room = crate::hal::serial_tx_space();
@@ -383,7 +383,7 @@ fn mirror_into_ring(bytes: &[u8]) -> bool {
     false
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(mpos_serial_ring))]
 fn mirror_into_ring(_bytes: &[u8]) -> bool {
     false
 }
@@ -428,7 +428,7 @@ fn serial_bytes(bytes: &[u8]) {
 /// forwards. Unreachable on a machine with no ring: [`serial_bytes`]'s guard
 /// (`!interrupt_driven() || !may_park()`) returns before this on such a machine,
 /// so the non-x86 arm below is never entered.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_serial_ring)]
 fn submit_and_park(bytes: &[u8]) {
     let mut at = 0;
     while at < bytes.len() {
@@ -451,7 +451,7 @@ fn submit_and_park(bytes: &[u8]) {
     crate::hal::serial_tx_stop_waiting();
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(mpos_serial_ring))]
 fn submit_and_park(_bytes: &[u8]) {}
 
 /// Whether this context may sleep: the scheduler is running, and interrupts
@@ -459,12 +459,12 @@ fn submit_and_park(_bytes: &[u8]) {}
 /// test, and the boot code before `sched::init` fails the first. On a machine
 /// with no scheduler and no ring to park on, the answer is `false` - there is
 /// nothing to park on, so the console writes polled and never blocks.
-#[cfg(target_arch = "x86_64")]
+#[cfg(mpos_serial_ring)]
 fn may_park() -> bool {
     crate::sched::started() && crate::hal::interrupts_enabled()
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(mpos_serial_ring))]
 fn may_park() -> bool {
     false
 }
