@@ -608,20 +608,32 @@ impl crate::hal::FpuOps for FpuState {
 /// silently. They cannot share a definition because this module is bare-metal
 /// only and `abi.rs` is host-compiled too - the gate is on the module, so a
 /// shared constant would have to live on one side of it or the other.
-mod uregs {
+///
+/// `pub(super)` because the gate's frame ops in the sibling `syscall` module
+/// read and write the same file, and this is the table that names its slots.
+pub(super) mod uregs {
     pub const R15: usize = 0;
     pub const R14: usize = 1;
     pub const R13: usize = 2;
     pub const R12: usize = 3;
     pub const RBP: usize = 4;
     pub const RBX: usize = 5;
+    /// `r11`, which `syscall` clobbers; the ABI reports the saved flags here and
+    /// in `EFLAGS`.
+    pub const R11: usize = 6;
     pub const R10: usize = 7;
     pub const R9: usize = 8;
     pub const R8: usize = 9;
     pub const RAX: usize = 10;
+    /// `rcx`, which `syscall` clobbers; the ABI reports the return address here
+    /// and in `RIP`.
+    pub const RCX: usize = 11;
     pub const RDX: usize = 12;
     pub const RSI: usize = 13;
     pub const RDI: usize = 14;
+    /// The call's number, which the gate leaves in `rax` until the dispatch
+    /// result is patched in.
+    pub const ORIG_RAX: usize = 15;
     pub const RIP: usize = 16;
     pub const CS: usize = 17;
     pub const EFLAGS: usize = 18;

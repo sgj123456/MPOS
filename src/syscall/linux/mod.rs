@@ -270,9 +270,8 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
 
         // --- process ---
         // `execve` runs on both machines: the handler is arch-neutral up to its
-        // return-frame patch, which is arch-aware (`RegsFrame` on x86, `UserFrame`
-        // on aarch64). The ptrace stop after it is the only x86-only part, gated in
-        // the handler.
+        // return-frame patch, which goes through `hal` (`set_exec_return`), and
+        // the ptrace stop after it, which is a no-op where no tracer is attached.
         nr::EXECVE => proc::handle_execve(args, &cwd(), regs_ptr),
         nr::EXIT => proc::handle_exit(args),
         nr::EXIT_GROUP => proc::handle_exit_group(args),
@@ -317,12 +316,14 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         // the register file and the caller's own group is the whole answer.
         nr::GETPGRP => proc::handle_getpgid([0; 6]),
         // `clone` runs on both machines: the handler is arch-neutral up to the
-        // child frame, which `user_context` builds per-arch. This is the real
+        // child frame, which `hal::user_context` builds per-arch. This is the real
         // aarch64 `fork` path - aarch64 has no `fork` syscall number, `fork()` is
         // `clone(SIGCHLD)` - so a shell can spawn a child here. The post-`clone`
-        // tracer announcement is x86-gated in the handler (no aarch64 ptrace yet).
+        // tracer announcement is a no-op where no tracer is attached.
         nr::CLONE => proc::handle_clone(args, regs_ptr),
-        #[cfg(not(target_arch = "aarch64"))]
+        // `fork`/`vfork` have no aarch64 number at all (the table marks them
+        // unreachable rather than absent), so the arm compiles there and can
+        // never be matched; the handler itself is arch-neutral now.
         nr::FORK | nr::VFORK => proc::handle_fork(nr, args, regs_ptr),
 
         // --- memory ---

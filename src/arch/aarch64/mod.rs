@@ -2985,8 +2985,9 @@ impl crate::hal::Entropy for crate::hal::Current {
 ///
 /// aarch64's gate frame *is* the task's user frame - `__vec_el0_sync` saves the
 /// trapped registers straight into it - so unlike x86_64 there is no second
-/// object here, and this impl is three calls and no register name. What the two
-/// machines share is the *operations*, which is the whole point of the seam.
+/// object here, and every op is a copy of it with no register named. What the
+/// two machines share is the *operations*, which is the whole point of the
+/// seam.
 impl crate::hal::Gate for crate::hal::Current {
     unsafe fn user_ip(frame: *mut ()) -> u64 {
         // SAFETY: the caller's contract - the pointer is the frame the EL0 sync
@@ -3004,6 +3005,53 @@ impl crate::hal::Gate for crate::hal::Current {
         crate::hal::UserFrameOps::set_result(frame, 0);
         crate::hal::UserFrameOps::set_ip(frame, entry);
         crate::hal::UserFrameOps::set_sp(frame, sp);
+    }
+
+    unsafe fn user_context(frame: *mut (), rax: usize) -> Option<crate::hal::UserFrame> {
+        // SAFETY: the caller's contract - the pointer is the frame the EL0 sync
+        // vector built for this task, or null.
+        if frame.is_null() {
+            return None;
+        }
+        let mut user = unsafe { *(frame as *const context::UserFrame) };
+        user.x[0] = rax as u64;
+        Some(user)
+    }
+
+    unsafe fn capture_user_regs(frame: *mut (), rax: usize, tls: usize, out: &mut [u64]) {
+        // SAFETY: as above.
+        let mut user = unsafe { *(frame as *const context::UserFrame) };
+        // `rax` belongs in the result slot, which is `x0` here, exactly as in
+        // `user_context`.
+        user.x[0] = rax as u64;
+        crate::hal::UserFrameOps::to_user_regs(&user, tls, out);
+    }
+
+    unsafe fn restore_user_regs(frame: *mut (), regs: &[u64], tls: &mut usize) -> isize {
+        let user: context::UserFrame = crate::hal::UserFrameOps::from_user_regs(regs);
+        // SAFETY: as above.
+        unsafe { *(frame as *mut context::UserFrame) = user };
+        // The thread pointer is `TPIDR_EL0`, which is not a field of
+        // `user_pt_regs` and so not a word of `regs` either: there is no value
+        // for this machine to hand back, and the caller's `tls` is left as it
+        // was. Nothing on this machine reads it back anyway - it has no tracer.
+        let _ = tls;
+        user.x[0] as isize
+    }
+
+    unsafe fn syscall_args(frame: *mut ()) -> [usize; 6] {
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &*(frame as *const context::UserFrame) };
+        // The EL0 sync vector reads the number from x8 and the arguments from
+        // x0..x5, so the frame holds them in that order already.
+        [
+            frame.x[0] as usize,
+            frame.x[1] as usize,
+            frame.x[2] as usize,
+            frame.x[3] as usize,
+            frame.x[4] as usize,
+            frame.x[5] as usize,
+        ]
     }
 }
 

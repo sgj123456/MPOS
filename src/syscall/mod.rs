@@ -233,17 +233,12 @@ pub unsafe fn linux_dispatch(
     // The two moments a tracer wants to see: the call before it is made and its
     // result before it is returned. Both are ordinary stops in the task table,
     // and both are no-ops - one branch on a flag - for every task no tracer has
-    // touched, which is every task on a machine without a tracer running.
-    //
-    // Deferred off aarch64: ptrace reads and writes the x86 register frame, and
-    // its syscall handler is not yet ported, so there is no tracer this machine
-    // can stop. Dropping the two stops leaves the identity for every task, which
-    // is exactly their no-tracer behaviour on the machines that do have them.
-    #[cfg(not(target_arch = "aarch64"))]
+    // touched, which is every task on a machine whose `ptrace` handler has not
+    // been ported: with no tracer there is no stop to take. The operations are
+    // the machine's (`hal::Gate`), so the pair runs on both machines either way.
     let args = linux::proc::syscall_entry_stop(regs_ptr, nr, args);
     // SAFETY: the caller's contract, passed through unchanged.
     let ret = unsafe { linux::dispatch(nr, args, from_user, regs_ptr) };
-    #[cfg(not(target_arch = "aarch64"))]
     let ret = linux::proc::syscall_exit_stop(regs_ptr, nr, args, ret);
     // Signals are delivered here rather than before the call: a handler has to
     // see the *result* of the syscall it interrupted, and the result does not

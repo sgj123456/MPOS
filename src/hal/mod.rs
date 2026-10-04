@@ -527,6 +527,60 @@ pub trait Gate {
     /// As [`Gate::user_ip`], and `entry`/`sp` must be addresses the task may run
     /// at, which the caller has just loaded an image onto.
     unsafe fn set_exec_return(frame: *mut (), entry: usize, sp: usize);
+
+    /// The ring-3 frame this gate frame describes, with `rax` in the result
+    /// slot: the frame a `fork`/`clone` child resumes with, and the one a
+    /// tracer reads. `None` when `frame` is null - a call the kernel made on
+    /// its own behalf has no registers to name.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`].
+    unsafe fn user_context(frame: *mut (), rax: usize) -> Option<UserFrame>;
+
+    /// The gate frame read out as the ABI's register file, `rax` in the result
+    /// slot and `tls` as the thread pointer.
+    ///
+    /// The words are the ones [`UserFrameOps::to_user_regs`] writes, but read
+    /// from the frame's own layout rather than through a [`UserFrame`] - which
+    /// is why this op exists beside [`Gate::user_context`]: a gate frame also
+    /// carries the two slots `syscall` clobbered (`rcx`/`r11`, which the ABI
+    /// reports as `rip`/`eflags`) and `orig_rax`, and a `UserFrame` has no
+    /// field for either.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`], and `out` must be [`ABI_REG_COUNT`] words long.
+    ///
+    /// [`ABI_REG_COUNT`]: Contexts::ABI_REG_COUNT
+    unsafe fn capture_user_regs(frame: *mut (), rax: usize, tls: usize, out: &mut [u64]);
+
+    /// The inverse of [`Gate::capture_user_regs`]: write a register file back
+    /// into the gate frame, and answer the value the gate should return to
+    /// ring 3 - the ABI's `rax`, which is the slot the gate fills in after the
+    /// handler returns.
+    ///
+    /// The thread pointer comes back through `tls` rather than being installed
+    /// here. Installing it is the scheduler's, and `arch -> sched` is the one
+    /// upward edge this seam exists to keep out; the ABI layer makes the
+    /// `sched` call with the value this hands back.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`], and `regs` must be [`ABI_REG_COUNT`] words long.
+    ///
+    /// [`ABI_REG_COUNT`]: Contexts::ABI_REG_COUNT
+    unsafe fn restore_user_regs(frame: *mut (), regs: &[u64], tls: &mut usize) -> isize;
+
+    /// The six syscall argument registers as the frame holds them, in the
+    /// ABI's argument order (`rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` on x86_64,
+    /// `x0`..`x5` on aarch64).
+    ///
+    /// Read *after* a tracer's stop has had its chance to rewrite the frame, so
+    /// the call is made with the arguments the tracer meant rather than the
+    /// ones it arrived with. Which register carries which argument is the
+    /// machine's - the same reason [`Gate::capture_user_regs`] exists.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`].
+    unsafe fn syscall_args(frame: *mut ()) -> [usize; 6];
 }
 
 /// A machine this kernel can run on. `Current` names the one being built.
@@ -938,6 +992,19 @@ pub type UserFrame = <Current as Contexts>::UserFrame;
 /// array length needs `generic_const_exprs`.
 pub const FPU_BYTES: usize = <Current as Contexts>::FPU_BYTES;
 
+/// Words in the ABI's register file - [`Contexts::ABI_REG_COUNT`], named at the
+/// crate level for the same reason as [`FPU_BYTES`]: it is an array length.
+pub const ABI_REG_COUNT: usize = <Current as Contexts>::ABI_REG_COUNT;
+
+/// A register file in the ABI's field order: `user_regs_struct` on x86_64,
+/// `user_pt_regs` on aarch64.
+///
+/// The one type the scheduler's snapshot of a stopped task and the syscall
+/// layer's ptrace accessors both carry, so neither has to size it from an
+/// architecture's own table. *Which* slot holds which register stays the
+/// machine's business - see [`UserFrameOps::to_user_regs`].
+pub type AbiRegs = [u64; ABI_REG_COUNT];
+
 /// Whether the FPU's state is live in the registers right now.
 #[cfg(mpos_fpu_trap)]
 #[inline]
@@ -1040,6 +1107,45 @@ pub unsafe fn user_ip(frame: *mut ()) -> u64 {
 #[inline]
 pub unsafe fn set_exec_return(frame: *mut (), entry: usize, sp: usize) {
     unsafe { <Current as Gate>::set_exec_return(frame, entry, sp) }
+}
+
+/// The ring-3 frame the gate frame describes. See [`Gate::user_context`].
+///
+/// # Safety
+/// As [`Gate::user_context`].
+#[inline]
+pub unsafe fn user_context(frame: *mut (), rax: usize) -> Option<UserFrame> {
+    unsafe { <Current as Gate>::user_context(frame, rax) }
+}
+
+/// The gate frame as the ABI's register file. See
+/// [`Gate::capture_user_regs`].
+///
+/// # Safety
+/// As [`Gate::capture_user_regs`].
+#[inline]
+pub unsafe fn capture_user_regs(frame: *mut (), rax: usize, tls: usize, out: &mut [u64]) {
+    unsafe { <Current as Gate>::capture_user_regs(frame, rax, tls, out) }
+}
+
+/// Write the ABI's register file back into the gate frame. See
+/// [`Gate::restore_user_regs`].
+///
+/// # Safety
+/// As [`Gate::restore_user_regs`].
+#[inline]
+pub unsafe fn restore_user_regs(frame: *mut (), regs: &[u64], tls: &mut usize) -> isize {
+    unsafe { <Current as Gate>::restore_user_regs(frame, regs, tls) }
+}
+
+/// The six syscall argument registers as the frame holds them. See
+/// [`Gate::syscall_args`].
+///
+/// # Safety
+/// As [`Gate::syscall_args`].
+#[inline]
+pub unsafe fn syscall_args(frame: *mut ()) -> [usize; 6] {
+    unsafe { <Current as Gate>::syscall_args(frame) }
 }
 
 /// The `cs`/`ss` a ring-3 frame carries on this machine.

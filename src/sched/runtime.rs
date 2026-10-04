@@ -58,20 +58,16 @@ use crate::abi::{
 use crate::vfs::RawFd;
 use crate::vfs::file::{FdTable, File};
 
-/// The width of the machine's Linux register file
-/// (`hal::Contexts::ABI_REG_COUNT`), named once so the array sizes below read as
-/// a width rather than as a projection of the HAL's.
-const ABI_REG_COUNT: usize = <crate::hal::Current as crate::hal::Contexts>::ABI_REG_COUNT;
-
-/// A register file carried by value: a stopped task's saved registers, sized by
-/// the machine's Linux register-file width.
-///
-/// `sched` carries the file but never reads a field of it - which register a
-/// value is in is the machine's business, and the only code here that looks
-/// inside one does so through `to_user_regs`/`from_user_regs`. So the width is
-/// all this needs to know, and the same code is right on a machine whose file
-/// is 34 words as on one whose is 27.
-type AbiRegs = [u64; ABI_REG_COUNT];
+// The machine's Linux register file, carried by value: a stopped task's saved
+// registers (`AbiRegs`) and the width the array sizes below use
+// (`ABI_REG_COUNT`). Both live in `hal` because the syscall layer's ptrace
+// accessors carry the same file, and this is the one definition of its width.
+// `sched` never reads a field of it - which register a value is in is the
+// machine's business, and the only code here that looks inside one does so
+// through `to_user_regs`/`from_user_regs`. So the width is all this needs to
+// know, and the same code is right on a machine whose file is 34 words as on
+// one whose is 27.
+use crate::hal::{ABI_REG_COUNT, AbiRegs};
 
 /// How many tasks can exist at once. A hard limit rather than a grown
 /// collection, for the reason given in the module docs.

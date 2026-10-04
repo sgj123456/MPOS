@@ -227,6 +227,118 @@ impl crate::hal::Gate for crate::hal::Current {
         regs.rcx = entry;
         regs.user_rsp = sp;
     }
+
+    unsafe fn user_context(frame: *mut (), rax: usize) -> Option<crate::hal::UserFrame> {
+        // SAFETY: the caller's contract - the pointer is the frame
+        // `rust_syscall` was handed, or null for a call the kernel made on its
+        // own behalf.
+        if frame.is_null() {
+            return None;
+        }
+        let regs = unsafe { &*(frame as *const Regs) };
+        let (code, data) = super::gdt::user_selectors();
+        Some(crate::arch::x86_64::context::UserContext {
+            // `syscall` parked the return address in rcx and the caller's flags
+            // in r11; those two are what an `iretq` needs to reproduce the
+            // state the instruction left behind.
+            rip: regs.rcx,
+            rsp: regs.user_rsp,
+            rflags: regs.r11,
+            rax,
+            rbx: regs.rbx,
+            rbp: regs.rbp,
+            cs: code.0 as usize,
+            ss: data.0 as usize,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rdi: regs.rdi,
+            rsi: regs.rsi,
+            rdx: regs.rdx,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+        })
+    }
+
+    unsafe fn capture_user_regs(frame: *mut (), rax: usize, tls: usize, out: &mut [u64]) {
+        use super::context::uregs::*;
+        // SAFETY: the caller's contract.
+        let regs = unsafe { &*(frame as *const Regs) };
+        debug_assert_eq!(out.len(), COUNT, "the ABI's register file is 27 words");
+        let (code, data) = super::gdt::user_selectors();
+        out[R15] = regs.r15 as u64;
+        out[R14] = regs.r14 as u64;
+        out[R13] = regs.r13 as u64;
+        out[R12] = regs.r12 as u64;
+        out[RBP] = regs.rbp as u64;
+        out[RBX] = regs.rbx as u64;
+        // The two slots `syscall` clobbers are reported twice: under their own
+        // names, and as the `rip`/`eflags` a tracer reads them through.
+        out[R11] = regs.r11 as u64;
+        out[R10] = regs.r10 as u64;
+        out[R9] = regs.r9 as u64;
+        out[R8] = regs.r8 as u64;
+        out[RAX] = rax as u64;
+        out[RCX] = regs.rcx as u64;
+        out[RDX] = regs.rdx as u64;
+        out[RSI] = regs.rsi as u64;
+        out[RDI] = regs.rdi as u64;
+        out[ORIG_RAX] = regs.rax as u64;
+        out[RIP] = regs.rcx as u64;
+        out[CS] = code.0 as u64;
+        out[EFLAGS] = regs.r11 as u64;
+        out[RSP] = regs.user_rsp as u64;
+        out[SS] = data.0 as u64;
+        // The thread-local base is a CPU register, not a frame word: the gate
+        // reinstalls it from the task on every switch, so the task is where it
+        // is read from - and where a `PTRACE_SETREGS` puts it back.
+        out[FS_BASE] = tls as u64;
+        // The segment registers and the user GS base are left at the zero the
+        // caller's buffer starts at: long mode ignores DS, ES, FS and GS - the
+        // contents select nothing - and nothing here ever sets a user GS base.
+        // FS *is* meaningful, and it is not a segment at all but the
+        // thread-local base above; a tracer reading this structure sees the
+        // base in `FS_BASE` and a selector it may ignore in `FS`.
+    }
+
+    unsafe fn restore_user_regs(frame: *mut (), regs: &[u64], tls: &mut usize) -> isize {
+        use super::context::uregs::*;
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &mut *(frame as *mut Regs) };
+        debug_assert_eq!(regs.len(), COUNT, "the ABI's register file is 27 words");
+        frame.r15 = regs[R15] as usize;
+        frame.r14 = regs[R14] as usize;
+        frame.r13 = regs[R13] as usize;
+        frame.r12 = regs[R12] as usize;
+        frame.rbp = regs[RBP] as usize;
+        frame.rbx = regs[RBX] as usize;
+        // `sysretq` restores the flags from r11 and the return address from
+        // rcx, so the ABI's `eflags`/`rip` slots land there. The ABI's own
+        // `r11`/`rcx` slots hold the same two values and are not read here -
+        // a tracer's write reaches the CPU through the slots it reads, not
+        // through both spellings.
+        frame.r11 = regs[EFLAGS] as usize;
+        frame.r10 = regs[R10] as usize;
+        frame.r9 = regs[R9] as usize;
+        frame.r8 = regs[R8] as usize;
+        frame.rcx = regs[RIP] as usize;
+        frame.rdx = regs[RDX] as usize;
+        frame.rsi = regs[RSI] as usize;
+        frame.rdi = regs[RDI] as usize;
+        frame.user_rsp = regs[RSP] as usize;
+        *tls = regs[FS_BASE] as usize;
+        regs[RAX] as isize
+    }
+
+    unsafe fn syscall_args(frame: *mut ()) -> [usize; 6] {
+        // SAFETY: the caller's contract.
+        let regs = unsafe { &*(frame as *const Regs) };
+        // The Linux x86_64 argument order, which is *not* the field order: the
+        // fourth argument is in r10 because `syscall` clobbers rcx.
+        [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]
+    }
 }
 
 extern "C" fn rust_syscall(regs: *mut Regs) -> usize {

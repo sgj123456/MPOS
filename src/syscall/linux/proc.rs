@@ -15,6 +15,7 @@ use alloc::sync::Arc;
 
 use super::abi;
 use super::nr;
+use crate::hal::UserFrameOps;
 use crate::sched::TaskId;
 use crate::syscall::{ARG_COUNT, argv_arg, buffer_ok, cstr_arg, err, err_of};
 
@@ -56,6 +57,11 @@ struct RegsFrame {
     rbx: usize,      // [rsp+120]
     rbp: usize,      // [rsp+128]
 }
+
+/// The ABI's register file, at the machine's width - the same type the
+/// scheduler carries a stopped task's registers in (`hal::AbiRegs`), so the two
+/// layers spell it from the machine's own count and not from each other.
+type AbiRegs = crate::hal::AbiRegs;
 
 // ---- signals: the frame a handler runs on -------------------------------
 //
@@ -638,99 +644,54 @@ fn finish_wait(id: TaskId, code: isize, status: usize, from_user: bool) -> isize
 // ptrace(2): the tracer's half
 // ---------------------------------------------------------------------------
 
-/// The tracee's user register file, in `user_regs_struct` order, as the gate's
+/// The tracee's user register file, in the ABI's field order, as the gate's
 /// frame will restore it.
 ///
-/// Two slots do not hold what their names say. `syscall` parked the caller's
-/// return address in `rcx` and its flags in `r11` - the instruction destroys
-/// both registers - so those two frame words are `RIP` and `EFLAGS` in the
-/// structure a tracer reads. Taking them at face value would hand `strace` a
-/// `rip` that is really a flags word.
+/// The file itself is the machine's to read, and this asks for it through
+/// `hal`, which is the only layer that knows which slot of the gate frame
+/// holds which register.
 ///
 /// `rax` is passed in rather than read: at a syscall entry the frame's `rax`
-/// holds the call's number, and at an exit it holds that *same* number, because
-/// the gate writes the result into the slot only after the dispatch has
-/// returned. The caller is the only one that knows which value belongs there.
-#[cfg(not(target_arch = "aarch64"))]
-fn capture_frame(regs_ptr: *mut (), rax: usize) -> [u64; abi::uregs::COUNT] {
-    use abi::uregs::*;
-
-    let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
-    let (code, data) = crate::hal::user_segments();
-    let mut regs = [0u64; COUNT];
-    regs[R15] = frame.r15 as u64;
-    regs[R14] = frame.r14 as u64;
-    regs[R13] = frame.r13 as u64;
-    regs[R12] = frame.r12 as u64;
-    regs[RBP] = frame.rbp as u64;
-    regs[RBX] = frame.rbx as u64;
-    regs[R11] = frame.r11 as u64;
-    regs[R10] = frame.r10 as u64;
-    regs[R9] = frame.r9 as u64;
-    regs[R8] = frame.r8 as u64;
-    regs[RAX] = rax as u64;
-    regs[RCX] = frame.rcx as u64;
-    regs[RDX] = frame.rdx as u64;
-    regs[RSI] = frame.rsi as u64;
-    regs[RDI] = frame.rdi as u64;
-    regs[ORIG_RAX] = frame.rax as u64;
-    regs[RIP] = frame.rcx as u64;
-    regs[CS] = code as u64;
-    regs[EFLAGS] = frame.r11 as u64;
-    regs[RSP] = frame.user_rsp as u64;
-    regs[SS] = data as u64;
-    // The thread-local base is a CPU register, not a frame word: the gate
-    // reinstalls it from the task on every switch, so the task is where it is
-    // read from - and where a `PTRACE_SETREGS` puts it back.
-    regs[FS_BASE] = crate::sched::current_tls() as u64;
-    // The segment registers and the user GS base, written out rather than left
-    // to the array's zero: long mode ignores DS, ES, FS and GS - their contents
-    // select nothing - and nothing here ever sets a user GS base, so zero is
-    // what the CPU would ignore anyway. FS *is* meaningful, and it is not a
-    // segment at all but the thread-local base above; a tracer reading this
-    // structure sees the base in `FS_BASE` and a selector it may ignore in `FS`.
-    regs[DS] = 0;
-    regs[ES] = 0;
-    regs[FS] = 0;
-    regs[GS] = 0;
-    regs[GS_BASE] = 0;
+/// slot holds the call's number, and at an exit it holds that *same* number,
+/// because the gate writes the result into the slot only after the dispatch
+/// has returned. The caller is the only one that knows which value belongs in
+/// the result slot.
+///
+/// The file is written into a zeroed buffer, so the slots the machine leaves
+/// alone - the segment registers long mode ignores, and the user GS base this
+/// kernel never sets - read as the zero the CPU would ignore anyway.
+fn capture_frame(regs_ptr: *mut (), rax: usize) -> AbiRegs {
+    let mut regs = [0u64; crate::hal::ABI_REG_COUNT];
+    // SAFETY: the caller hands the gate's own frame for this task, which is the
+    // contract `hal::capture_user_regs` documents.
+    unsafe {
+        crate::hal::capture_user_regs(regs_ptr, rax, crate::sched::current_tls(), &mut regs);
+    }
     regs
 }
 
 /// Write a register file back into the gate's frame and answer the value the
 /// gate should return to ring 3.
 ///
-/// The inverse of [`capture_frame`], including the two swapped slots: `rcx` gets
-/// `RIP` because `sysretq` takes the return address from there, and `r11` gets
-/// `EFLAGS` for the same reason. `rax` is *returned* instead of written, and
-/// that is not a shortcut: the gate stores the dispatch's result into that slot
-/// after this function's caller returns, so the only way a tracer's
-/// `PTRACE_SETREGS` can change what the tracee sees in `rax` is for the new
-/// value to *be* the result.
-#[cfg(not(target_arch = "aarch64"))]
-fn apply_frame(regs_ptr: *mut (), regs: &[u64; abi::uregs::COUNT]) -> usize {
-    use abi::uregs::*;
-
-    let frame = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
-    frame.r15 = regs[R15] as usize;
-    frame.r14 = regs[R14] as usize;
-    frame.r13 = regs[R13] as usize;
-    frame.r12 = regs[R12] as usize;
-    frame.rbp = regs[RBP] as usize;
-    frame.rbx = regs[RBX] as usize;
-    frame.r11 = regs[EFLAGS] as usize;
-    frame.r10 = regs[R10] as usize;
-    frame.r9 = regs[R9] as usize;
-    frame.r8 = regs[R8] as usize;
-    frame.rcx = regs[RIP] as usize;
-    frame.rdx = regs[RDX] as usize;
-    frame.rsi = regs[RSI] as usize;
-    frame.rdi = regs[RDI] as usize;
-    frame.user_rsp = regs[RSP] as usize;
-    if crate::sched::current_tls() != regs[FS_BASE] as usize {
-        crate::sched::set_current_tls(regs[FS_BASE] as usize);
+/// The inverse of [`capture_frame`], and likewise the machine's to perform:
+/// `hal`'s `restore_user_regs` puts each slot where its own frame needs it - on
+/// x86_64 that means `rcx`/`r11`, which is where `sysretq` takes the return
+/// address and the flags from - and answers the ABI's `rax`. That value is
+/// *returned* rather than written into the frame, and that is not a shortcut:
+/// the gate stores the dispatch's result into the `rax` slot after this
+/// function's caller returns, so the only way a tracer's `PTRACE_SETREGS` can
+/// change what the tracee sees there is for the new value to *be* the result.
+///
+/// The thread pointer comes back separately, because installing it is the
+/// scheduler's and not the machine's.
+fn apply_frame(regs_ptr: *mut (), regs: &AbiRegs) -> usize {
+    let mut tls = 0usize;
+    // SAFETY: as [`capture_frame`].
+    let rax = unsafe { crate::hal::restore_user_regs(regs_ptr, regs, &mut tls) };
+    if crate::sched::current_tls() != tls {
+        crate::sched::set_current_tls(tls);
     }
-    regs[RAX] as usize
+    rax as usize
 }
 
 /// The tracee's half of a syscall-entry stop: show the tracer the call before it
@@ -740,46 +701,46 @@ fn apply_frame(regs_ptr: *mut (), regs: &[u64; abi::uregs::COUNT]) -> usize {
 /// the point of the exercise: a tracer that rewrote `rdi` at the stop meant to
 /// change the call, and a kernel that then made the call with the old value
 /// would be ignoring it.
-#[cfg(not(target_arch = "aarch64"))]
 pub(crate) fn syscall_entry_stop(
     regs_ptr: *mut (),
     nr: u64,
     args: [usize; ARG_COUNT],
 ) -> [usize; ARG_COUNT] {
-    if regs_ptr.is_null() || !crate::sched::has_tracer(crate::sched::current()) {
+    if !crate::sched::has_tracer(crate::sched::current()) {
         return args;
     }
-    let (ip, sp) = {
-        let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
-        (frame.rcx as u64, frame.user_rsp as u64)
+    // A null frame is a call the kernel made on its own behalf: no register
+    // file exists for a tracer to have rewritten.
+    let Some(ctx) = (unsafe { crate::hal::user_context(regs_ptr, 0) }) else {
+        return args;
     };
+    let (ip, sp) = (ctx.ip() as u64, ctx.sp() as u64);
     let mut regs = capture_frame(regs_ptr, nr as usize);
     let wide = args.map(|arg| arg as u64);
     crate::sched::stop_at_syscall(true, &mut regs, nr, &wide, ip, sp);
     apply_frame(regs_ptr, &regs);
-    let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
-    [
-        frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
-    ]
+    // Re-read the arguments rather than reusing `args`: a tracer that rewrote
+    // an argument register at the stop meant to change the call.
+    // SAFETY: the same gate frame `capture_frame` was just handed.
+    unsafe { crate::hal::syscall_args(regs_ptr) }
 }
 
 /// The tracee's half of a syscall-exit stop. The result goes in and comes back,
 /// possibly rewritten: at this stop `rax` *is* the result, and a tracer that
 /// changed it changed what the tracee sees.
-#[cfg(not(target_arch = "aarch64"))]
 pub(crate) fn syscall_exit_stop(
     regs_ptr: *mut (),
     nr: u64,
     args: [usize; ARG_COUNT],
     ret: isize,
 ) -> isize {
-    if regs_ptr.is_null() || !crate::sched::has_tracer(crate::sched::current()) {
+    if !crate::sched::has_tracer(crate::sched::current()) {
         return ret;
     }
-    let (ip, sp) = {
-        let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
-        (frame.rcx as u64, frame.user_rsp as u64)
+    let Some(ctx) = (unsafe { crate::hal::user_context(regs_ptr, 0) }) else {
+        return ret;
     };
+    let (ip, sp) = (ctx.ip() as u64, ctx.sp() as u64);
     let mut regs = capture_frame(regs_ptr, ret as usize);
     let wide = args.map(|arg| arg as u64);
     crate::sched::stop_at_syscall(false, &mut regs, nr, &wide, ip, sp);
@@ -1608,8 +1569,7 @@ pub(super) fn handle_execve(
             // exec happened. It is also what a tracer is waiting for the very
             // first time - `strace`'s child calls `PTRACE_TRACEME` and then
             // `execv`s, and this stop is how the tracer learns the program
-            // started. Deferred on aarch64 (no ptrace return-frame path yet).
-            #[cfg(not(target_arch = "aarch64"))]
+            // started. A no-op for a task no tracer has touched.
             if !regs_ptr.is_null() && crate::sched::has_tracer(crate::sched::current()) {
                 let mut regs = capture_frame(regs_ptr, 0);
                 crate::sched::exec_trap(&mut regs);
@@ -1752,9 +1712,10 @@ fn sleep_for_timespec(req: usize, rem: usize, from_user: bool) -> isize {
 /// every `vfork` user writes behaves identically. Suspending the parent is a
 /// scheduling feature for an optimisation this kernel does not make (there is no
 /// page-table sharing to avoid), so there is nothing to gain by faking it.
-#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_fork(nr: u64, _args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
-    let ctx = match user_context(regs_ptr, 0) {
+    // SAFETY: the caller hands the gate's own frame for this task, which is the
+    // contract `hal::user_context` documents.
+    let ctx = match unsafe { crate::hal::user_context(regs_ptr, 0) } {
         Some(ctx) => ctx,
         None => return err::EINVAL,
     };
@@ -1779,7 +1740,6 @@ pub(super) fn handle_fork(nr: u64, _args: [usize; ARG_COUNT], regs_ptr: *mut ())
 /// it here also puts it in the right place in the call: `PTRACE_EVENT_CLONE`
 /// belongs inside the `clone` that caused it, and the call's ordinary exit stop
 /// still follows, exactly as it does after an exec trap.
-#[cfg(not(target_arch = "aarch64"))]
 fn tell_tracer_of_child(regs_ptr: *mut ()) {
     if regs_ptr.is_null() {
         return;
@@ -1790,59 +1750,6 @@ fn tell_tracer_of_child(regs_ptr: *mut ()) {
     let mut regs = capture_frame(regs_ptr, 0);
     crate::sched::fork_trap(&mut regs, event, child);
     apply_frame(regs_ptr, &regs);
-}
-
-/// Build the ring-3 register file a process would resume with, from the syscall
-/// gate's frame, with `rax` set to `rax` - zero for a fork child, and the new
-/// image's entry value for an `execve` that has nothing else to restore.
-///
-/// Returns `None` when there is no frame: a call made outside the gate has no
-/// registers to name.
-#[cfg(not(target_arch = "aarch64"))]
-fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::hal::UserFrame> {
-    if regs_ptr.is_null() {
-        return None;
-    }
-    let regs = unsafe { &*(regs_ptr as *const RegsFrame) };
-    let (code, data) = crate::hal::user_segments();
-    Some(crate::hal::UserFrame {
-        // `syscall` parked the return address in rcx and the caller's flags in
-        // r11; those two are what an `iretq` needs to reproduce the state the
-        // instruction left behind.
-        rip: regs.rcx,
-        rsp: regs.user_rsp,
-        rflags: regs.r11,
-        rax,
-        rbx: regs.rbx,
-        rbp: regs.rbp,
-        cs: code,
-        ss: data,
-        r12: regs.r12,
-        r13: regs.r13,
-        r14: regs.r14,
-        r15: regs.r15,
-        rdi: regs.rdi,
-        rsi: regs.rsi,
-        rdx: regs.rdx,
-        r8: regs.r8,
-        r9: regs.r9,
-        r10: regs.r10,
-    })
-}
-
-/// The aarch64 twin of [`user_context`]. The syscall gate's frame already *is* a
-/// `UserFrame` (`el0_sync` traps the whole register file into one), so the frame a
-/// fork/clone child resumes with is a copy of it with the result register `x0` set
-/// to `rax` - zero for a child, exactly as x86 clears `rax` - and nothing else.
-/// No segment selectors or `iretq` reconstruction, which are x86 concerns.
-#[cfg(target_arch = "aarch64")]
-fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::hal::UserFrame> {
-    if regs_ptr.is_null() {
-        return None;
-    }
-    let mut frame = unsafe { *(regs_ptr as *const crate::hal::UserFrame) };
-    frame.x[0] = rax as u64;
-    Some(frame)
 }
 
 /// `clone(flags, child_stack, parent_tid, child_tid, tls)` — create a process or
@@ -1895,7 +1802,8 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     // waiting anyway.
     let _ = exit_signal;
 
-    let ctx = match user_context(regs_ptr, 0) {
+    // SAFETY: the caller hands the gate's own frame for this task.
+    let ctx = match unsafe { crate::hal::user_context(regs_ptr, 0) } {
         Some(ctx) => ctx,
         None => return err::EINVAL,
     };
@@ -1919,9 +1827,9 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     if flags & nr::CLONE_PARENT_SETTID != 0 {
         unsafe { (parent_tid as *mut i32).write_unaligned(child as i32) };
     }
-    // The tracer announcement is x86-only until the aarch64 ptrace stop ABI lands;
-    // on aarch64 there is no tracer to announce to (refuse-don't-fake, not a gap).
-    #[cfg(not(target_arch = "aarch64"))]
+    // The tracer announcement is a no-op for a task no tracer has touched,
+    // which is every task on a machine without one: `tell_tracer_of_child`
+    // finds no pending event and returns.
     tell_tracer_of_child(regs_ptr);
     child
 }
