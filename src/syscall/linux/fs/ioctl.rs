@@ -374,7 +374,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 None => err::ENODEV,
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x8914 => {
             // SIOCSIFFLAGS: the new flags. Only `IFF_UP` carries meaning -
             // the capability bits are the link's to keep, not the setter's.
@@ -392,7 +391,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 None => err::ENODEV,
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x8921 => {
             // SIOCGIFMTU: the link's current MTU - the loopback's is the
             // 64 KiB an IPv4 datagram tops out at, the NIC's is what
@@ -419,7 +417,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 None => err::ENODEV,
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x8922 => {
             // SIOCSIFMTU: the new MTU, which `ip link set eth0 mtu N`
             // writes. The stack clamps it to the bounds a frame can carry.
@@ -438,7 +435,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 None => err::ENODEV,
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x8923 => {
             // SIOCSIFNAME: rename. The new name rides the union half of the
             // request - the same place the flags and the MTU do.
@@ -1278,10 +1274,12 @@ fn ifreq_index(buf: usize) -> Option<u32> {
 
 /// Whether a parsed interface name resolves to a link index. The loopback is
 /// the always-present index 1; the ethernet is 2, but only once the net stack
-/// knows that name. Off aarch64 the lookup reaches into `crate::net`; on it the
-/// stack is deferred (its driver stage follows), so no name resolves and the
-/// interface ioctls answer `ENODEV` - the honest answer for "there is no such
-/// link", not a fabricated index.
+/// knows that name. Both machines have a stack now (`PLAN.md` §13.4), so the
+/// lookup reaches `crate::net::link_facts` on either of them - it is the same
+/// call the already-ungated `SIOCGIFFLAGS` arm uses. A machine whose adapter
+/// never probed has no stack and answers `None`, which the interface ioctls
+/// report as `ENODEV` - the honest answer for "there is no such link", not a
+/// fabricated index.
 fn ifreq_index_named(name: &str) -> Option<u32> {
     if name == "lo" {
         return Some(1);
