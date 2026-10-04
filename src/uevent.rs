@@ -509,11 +509,11 @@ pub fn send(id: usize, dest: Option<(u32, u32)>, data: &[u8], cred: Cred) -> isi
     // handoff is exactly that. The wake list belongs to the network stack -
     // which on a quiet machine does not poll at all - so it is called here,
     // outside every borrow, the discipline `publish` documents.
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(mpos_net)]
     if queued {
         crate::net::wake_waiters();
     }
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(not(mpos_net))]
     let _ = queued;
     answer
 }
@@ -599,11 +599,11 @@ pub fn publish(event: &Event) {
     // machine does not poll at all - so the queue filled, the daemon slept
     // through it, and its database stayed empty. Woken, it reads what was
     // queued and the cold-plug completes.
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(mpos_net)]
     if queued {
         crate::net::wake_waiters();
     }
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(not(mpos_net))]
     let _ = queued;
 }
 

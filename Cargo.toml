@@ -167,5 +167,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(mpos_fpu_trap)",
     "cfg(mpos_segments)",
     "cfg(mpos_framebuffer_console)",
+    "cfg(mpos_dynamic_mmio_window)",
+    "cfg(mpos_net)",
     "cfg(mpos_console_input)",
 ] }

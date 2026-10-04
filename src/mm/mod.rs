@@ -51,29 +51,29 @@ static ALLOCATOR: heap::KernelHeap = heap::KernelHeap::empty();
 /// (`arch::aarch64::paging::device_virt`), which is what its kernel is compiled
 /// against.
 ///
-/// So the dynamic half stays x86_64's: aarch64 has no `mm::map_mmio` because
-/// that call goes through `hal::Paging`, and `hal` cannot compile for a machine
-/// whose `Paging` has no user address space yet. A window that is a constant
-/// range on one machine and a per-BAR allocator on the other is a smaller thing
-/// than it sounds - both are "the kernel half's device registers" - but it is
-/// not the same thing, and the names below are x86_64's until stage 6 brings
-/// `hal`.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// So the dynamic half is a *capability*: the build declares
+/// `mpos_dynamic_mmio_window` for a machine that reaches a device by
+/// allocating one mapping per BAR (x86_64), and does not for one whose device
+/// window is a fixed range the boot maps whole (aarch64, which translates by
+/// offset in `arch::aarch64::paging::device_virt`). A machine that declares it
+/// must also be one whose `hal::Paging::map_mmio` exists - the two are the same
+/// arrangement, and `hal` is what the call goes through.
+#[cfg(mpos_dynamic_mmio_window)]
 pub const MMIO_BASE: usize = 0xffff_ffff_4000_0000;
 /// One past the end of the window: 1 GiB of address space, which is room for
 /// every BAR a machine could plausibly have.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(mpos_dynamic_mmio_window)]
 const MMIO_LIMIT: usize = 0xffff_ffff_8000_0000;
 
 /// The next free byte in that window.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(mpos_dynamic_mmio_window)]
 static MMIO_NEXT: AtomicUsize = AtomicUsize::new(MMIO_BASE);
 
 /// Map a device's registers into the kernel half and return the address they
 /// can be reached through.
 ///
 /// Called once per BAR, at the moment a driver decides it wants the device.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(mpos_dynamic_mmio_window)]
 pub fn map_mmio(phys: usize, len: usize) -> usize {
     let len = pframe::align_up(len, PAGE_SIZE);
     let virt = MMIO_NEXT.fetch_add(len, Ordering::Relaxed);
