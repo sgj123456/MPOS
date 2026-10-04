@@ -931,8 +931,16 @@ fn check_rng(info: &BootInfo) {
         fail!("the tree describes no virtio-rng (device {VIRTIO_ID_RNG}) window");
     };
 
+    // Install the device as the machine's entropy source *before* checking it, so
+    // a successful read also leaves `crate::rand`'s seed able to mix hardware
+    // bytes (the boot calls `rand::init` next, which reads this global). A window
+    // that maps but does not open as a virtio-rng is a named failure, not a silent
+    // fall-through to a weaker seed.
+    let Some(dev) = crate::drivers::virtio::mmio::init_global(virt, size) else {
+        fail!("the window at {virt:#x} mapped but did not open as a virtio-rng transport");
+    };
     let mut buf = [0u8; 32];
-    let got = crate::drivers::virtio::mmio::fill_entropy(virt, size, &mut buf);
+    let got = dev.fill(&mut buf);
     if got != buf.len() {
         fail!(
             "the virtio-rng returned {got} of {} entropy bytes",
@@ -943,7 +951,10 @@ fn check_rng(info: &BootInfo) {
     // a buffer left zero: a request that came back empty of entropy still fills
     // nothing, and only the `got == 32` guard above would hide that.
     let sum: u32 = buf.iter().map(|&b| b as u32).sum();
-    let _ = writeln!(out, "virtio-rng over MMIO returned 32 bytes (sum {sum})");
+    let _ = writeln!(
+        out,
+        "virtio-rng over MMIO installed, returned 32 bytes (sum {sum})"
+    );
     let _ = writeln!(out, "M7_RNG_OK");
 }
 

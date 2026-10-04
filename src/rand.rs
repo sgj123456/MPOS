@@ -136,11 +136,38 @@ fn seed() -> [u8; 32] {
     seed
 }
 
-/// The seed for a build that is not the shipped kernel - the host test build,
-/// and any architecture this module has no hardware source for. Deterministic
-/// on purpose: a unit test that seeds differently every run is a unit test that
-/// fails every other time.
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+/// The aarch64 seed: the machine's MMIO virtio-rng and the boot instant. The
+/// device is installed by `check_rng` before `rand::init` runs, so the first
+/// stream is seeded from real host entropy mixed with the clock. There is no
+/// `RDRAND` here - this machine's entropy source is the device, not a CPU
+/// instruction - and a machine with no rng window falls back to the clock alone,
+/// still unpredictable to a process on it, exactly as x86_64 does when its
+/// `RDRAND` and device are both absent. The device bytes are XORed in, not
+/// trusted alone: a weak stream cannot make the seed worse than the clock.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+
+    if let Some(entropy) = crate::drivers::virtio::mmio::entropy() {
+        for (byte, host) in seed.iter_mut().zip(entropy) {
+            *byte ^= host;
+        }
+    }
+
+    let epoch = crate::hal::boot_epoch();
+    let ticks = crate::hal::ticks();
+    let stamp = epoch ^ ticks.rotate_left(32);
+    for (i, byte) in seed.iter_mut().enumerate() {
+        let word = if i % 2 == 0 { epoch } else { ticks ^ stamp };
+        *byte ^= (word.rotate_left((i as u32 % 8) * 8) & 0xff) as u8;
+    }
+    seed
+}
+
+/// The seed for a build that is not the shipped kernel - the host test build.
+/// Deterministic on purpose: a unit test that seeds differently every run is a
+/// unit test that fails every other time.
+#[cfg(not(target_os = "none"))]
 fn seed() -> [u8; 32] {
     *b"mpos-host-seed: not a secret, te"
 }
