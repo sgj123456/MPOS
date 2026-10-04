@@ -6036,22 +6036,28 @@ Named gaps the port carries rather than hides, each with its home:
   waits on the child itself). A real vfork must *share* the address space and hold the
   parent until the child execs; here the child instead gets a private copy while the
   parent keeps running and immediately writes its now-read-protected stack just below
-  `sp`. The remaining open question for the fix is *why* that parent stack write is not
-  resolved: a hardened page should be split by `resolve_cow_fault`, so either the page
-  lacks the software `COW_BIT` (`is_cow_page` false) and `resolve_cow_fault` declines it,
-  or the stack page was not enumerated into `parent_pages` and was made read-only some
-  other way. The precise next measurement is to log `is_cow_page(parent_stack addr)` in
-  that fall-through to choose between the two.
-
-  The fix was deliberately **not** attempted here: `CLONE_VM`/`CLONE_VFORK` handling and
-  `spawn_copy` are the shared fork machinery the x86 `cargo xtask test` 142-test gate
-  exercises, so a wrong change has wide blast radius, and "nearly-right is worse than
-  absent." The two candidate corrections are both principled: either make a
-  `CLONE_VM`-without-`CLONE_THREAD` request *share* the space the way Linux vfork does, or
-  ensure every read-protected parent page carries `COW_BIT` so `resolve_cow_fault` splits
-  it on the parent's next write. This blocks running a *subcommand* (a shell's core) from
-  `cargo xtask run --arch aarch64`, and is orthogonal to the static-busybox prerequisite
-  above.
+  `sp`. The earlier "which of two" open question is narrowed by reading the code: the
+  COW-split *math* branch is **eliminated** - `set_cow_bit_quietly` writes
+  `COW_BIT | AP_READ_ONLY` (`paging.rs:1237`) and `resolve_cow` checks `COW_BIT`, copies
+  to a fresh frame, restores `WRITE`, flushes (`paging.rs:1159-1192`), and the hand-encoded
+  `fork` (`0x11`) child exercises exactly that path and reaches EL0, so a hardened present
+  page does split. `spawn_copy` does a plain copy-on-write fork with **no `CLONE_VM`
+  special case and no parent suspension** (`runtime.rs:7407-7434`; comment at `7994`).
+  A naive "the child's `TTBR0` switch is never reloaded for the parent" theory is *not*
+  established either - plain fork also runs the child before the parent resumes and works,
+  so resume-reload evidently functions. What remains unconfirmed is why the *vfork* child
+  faults writing its stack at `parent_sp - 16` (a hole just below the copied stack, per the
+  measured `child_stack` above `parent_sp`) while the analogous plain-fork child does not:
+  the leading candidate is now an aarch64 child-side **stack-growth** resolution gap
+  (`resolve_stack_growth`'s window for the copied child space, or the permission bits of
+  the page it maps, differing from x86 where the same shared code works). Pinning it needs
+  one instrumented boot logging, at the vfork fault, the child's `stack_top`/rlimit window
+  and `is_cow_page`/`present` for the faulting address - which was *not* done here. This
+  gap blocks running a *subcommand* (a shell's core) from `cargo xtask run --arch aarch64`.
+  The fix was deliberately **not** attempted: `spawn_copy`, `clone`, `resolve_stack_growth`
+  and the aarch64 page-mapping path are the shared fork/mm machinery the x86 142-test gate
+  covers, and a wrong change there has wide blast radius ("nearly-right is worse than
+  absent"); it is also orthogonal to the static-busybox prerequisite above.
 
   Reading further confirms the COW path is not the bug: `resolve_cow`'s split leaf
   (`VALID | TABLE | attributes(flags)`, `paging.rs`) is byte-for-byte the same encoding
