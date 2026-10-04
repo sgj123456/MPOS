@@ -424,6 +424,18 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              the duped fd failed)"
         );
     }
+    // aarch64 struct-stat ABI: chmod's mode reads back through st_mode, the file
+    // reports is_file with the right length, and a directory reports is_dir. This
+    // pins that the kernel lays out `struct stat` at the aarch64 (asm-generic)
+    // field offsets, not x86_64's - the earlier mismatch made st_mode return
+    // st_nlink's value (1), so every stat-based type/permission read was wrong.
+    if !log.contains("MPOS_STAT_OK") {
+        bail!(
+            "the aarch64 musl binary could not read stat fields back correctly: the \
+             MPOS_STAT_OK line is absent (st_mode/is_file/len/is_dir at the aarch64 \
+             struct-stat offsets failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -446,7 +458,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              (MPOS_SYMLINK_OK) and mkdir/a nested file/rmdir (MPOS_MKDIR_OK) and \
              rename/hard link (MPOS_RENAME_LINK_OK) and ftruncate (MPOS_TRUNCATE_OK) \
              and a 1 MiB mmap-backed heap buffer (MPOS_MEMORY_OK) and fd \
-             duplication via fcntl (MPOS_DUP_OK) - \
+             duplication via fcntl (MPOS_DUP_OK) and the aarch64 struct-stat layout \
+             (MPOS_STAT_OK) - \
              from the ESP under AAVMF"
         );
         return Ok(());

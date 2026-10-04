@@ -5984,7 +5984,18 @@ Named gaps the port carries rather than hides, each with its home:
   "core fs/memory handlers" deliverable that was still only inferred from dispatch. An
   **fd-duplication** round-trip (`File::try_clone`, which is `fcntl(F_DUPFD_CLOEXEC)`,
   reading the file's bytes back through the duped descriptor) prints `MPOS_DUP_OK`
-  (asserted) - the fd-table primitive behind a shell's `>` redirection and `|` pipes.
+  (asserted) - the fd-table primitive behind a shell's `>` redirection and `|` pipes. A
+  **struct-stat ABI** check (chmod `0o640`, then `st_mode` reads back `0o640`, the file
+  reports `is_file()` with the right `len()`, and `/dev` reports `is_dir()`) prints
+  `MPOS_STAT_OK` (asserted) - pinning that `write_stat` lays the struct out at the
+  **aarch64 asm-generic offsets**, not x86_64's. This fixed a real ABI bug: the previous
+  x86-only offsets put `st_mode` where musl reads `st_nlink`, so every stat-based
+  file-type/permission read on aarch64 returned another field's value (a regular file
+  reported `st_mode == 1`) - a wrong-shape answer that no earlier marker exercised, because
+  the file-lifecycle and `/dev` proofs read only `st_size` (offset shared by both ABIs) and
+  existence. `abi.rs` `write_stat` now branches the field order on `target_arch`, x86_64
+  byte-for-byte unchanged (the host `write_stat_lays_out_struct_stat_at_the_x86_64_offsets`
+  test and the 142-suite `stat` users still cover it); aarch64 is pinned on the machine.
   This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.

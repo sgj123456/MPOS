@@ -380,25 +380,44 @@ pub(crate) fn write_stat(
         // old root, and the one `df` makes to group what it reports.
         (at(0) as *mut u64).write_unaligned(dev);
         (at(8) as *mut u64).write_unaligned(meta.ino); // st_ino
-        (at(16) as *mut u64).write_unaligned(nlink); // st_nlink
-        (at(24) as *mut u32).write_unaligned(mode_of(meta, stored)); // st_mode
-        // The owner is the node's, not the caller's: a filesystem that keeps
-        // one answers with what it holds, and a node it never stamped answers
-        // root's. st_rdev carries the node's own device number - the identity
-        // libc's `ttyname` matches a descriptor by.
-        (at(28) as *mut u32).write_unaligned(owner.0); // st_uid
-        (at(32) as *mut u32).write_unaligned(owner.1); // st_gid
-        (at(40) as *mut u64).write_unaligned(packed_rdev); // st_rdev
-        (at(48) as *mut u64).write_unaligned(size); // st_size
-        (at(56) as *mut u64).write_unaligned(512); // st_blksize
-        (at(64) as *mut u64).write_unaligned(blocks); // st_blocks
-        // The three clocks, each the value the filesystem kept for it. The
-        // nanosecond halves stay 0: ext2's on-disk inode has no sub-second
-        // field, and reporting a precise-looking zero the clock does not have
-        // would be a lie of the second kind.
-        (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atime
-        (at(80) as *mut i64).write_unaligned(times.mtime as i64); // st_mtime
-        (at(88) as *mut i64).write_unaligned(times.ctime as i64); // st_ctime
+        // The x86_64 `struct stat` and Linux's aarch64 (asm-generic) one place
+        // their fields at different offsets and widths - x86_64's `st_nlink` is
+        // an 8-byte word before a 4-byte `st_mode`, while aarch64's `st_mode`
+        // sits at 16 as a 4-byte field with a 4-byte `st_nlink` at 20, and the
+        // rest shift accordingly. Writing the x86 layout on aarch64 hands every
+        // `stat`-reading program another field's value where it looks for the
+        // file's mode/type (a regular file came back reporting `st_mode == 1`,
+        // the `st_nlink`), so the type and permission bits are read wrong. The
+        // two blocks below are the two ABIs' field orders, unchanged for x86_64.
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            (at(16) as *mut u64).write_unaligned(nlink); // st_nlink
+            (at(24) as *mut u32).write_unaligned(mode_of(meta, stored)); // st_mode
+            (at(28) as *mut u32).write_unaligned(owner.0); // st_uid
+            (at(32) as *mut u32).write_unaligned(owner.1); // st_gid
+            (at(40) as *mut u64).write_unaligned(packed_rdev); // st_rdev
+            (at(48) as *mut u64).write_unaligned(size); // st_size
+            (at(56) as *mut u64).write_unaligned(512); // st_blksize
+            (at(64) as *mut u64).write_unaligned(blocks); // st_blocks
+            (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atime
+            (at(80) as *mut i64).write_unaligned(times.mtime as i64); // st_mtime
+            (at(88) as *mut i64).write_unaligned(times.ctime as i64); // st_ctime
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            (at(16) as *mut u32).write_unaligned(mode_of(meta, stored)); // st_mode
+            (at(20) as *mut u32).write_unaligned(nlink as u32); // st_nlink (4-byte)
+            (at(24) as *mut u32).write_unaligned(owner.0); // st_uid
+            (at(28) as *mut u32).write_unaligned(owner.1); // st_gid
+            (at(32) as *mut u64).write_unaligned(packed_rdev); // st_rdev
+            (at(48) as *mut u64).write_unaligned(size); // st_size (offset shared with x86_64)
+            (at(40) as *mut u64).write_unaligned(0u64); // the aarch64 pad before st_size
+            (at(56) as *mut u32).write_unaligned(512u32); // st_blksize (4-byte)
+            (at(64) as *mut u64).write_unaligned(blocks); // st_blocks
+            (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atime
+            (at(80) as *mut i64).write_unaligned(times.mtime as i64); // st_mtime
+            (at(88) as *mut i64).write_unaligned(times.ctime as i64); // st_ctime
+        }
     }
     0
 }
