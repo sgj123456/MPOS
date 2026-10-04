@@ -488,9 +488,60 @@ pub trait Entropy {
     fn mix_into(seed: &mut [u8; 32]);
 }
 
+/// The syscall gate's trap frame: the register block the entry stub builds, as
+/// everything above the machine layer gets hold of it.
+///
+/// The ABI layer carries this frame as an opaque `*mut ()` and must not know its
+/// shape. It is deliberately *not* [`UserFrameOps`]'s frame, and that is why
+/// these are free functions over a pointer rather than methods on a type: on
+/// x86_64 the gate's frame is the entry stub's saved block on the kernel stack,
+/// on aarch64 it is the task's own user frame, and no type both machines share
+/// can be named without inventing one - which would be the leak this seam
+/// exists to remove.
+///
+/// What the ABI layer needs is small and machine-neutral in intent: read the
+/// instruction the call will return to, and send `execve` somewhere else instead
+/// of returning. Anything richer - the whole register file, the signal frame
+/// laid over it - is reached through the machine's own code, because *which*
+/// register a value lives in is exactly the machine's business.
+pub trait Gate {
+    /// The user instruction pointer of the call being dispatched: where the gate
+    /// will return to.
+    ///
+    /// # Safety
+    /// `frame` must be the gate's own frame for the calling task - the pointer
+    /// `syscall::linux_dispatch` was handed.
+    unsafe fn user_ip(frame: *mut ()) -> u64;
+
+    /// Send the frame back to userland at `entry` on `sp` - how `execve` makes a
+    /// call that never returns.
+    ///
+    /// Which registers say that is the machine's. The operation is the same one
+    /// on both, but a machine whose result slot doubles as something a tracer
+    /// reads leaves it for the gate to fill in, while a machine whose frame is
+    /// also the task's own record zeroes it here. What a caller may rely on is
+    /// the instruction that runs next, the stack it runs on, and that the call
+    /// has no return value.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`], and `entry`/`sp` must be addresses the task may run
+    /// at, which the caller has just loaded an image onto.
+    unsafe fn set_exec_return(frame: *mut (), entry: usize, sp: usize);
+}
+
 /// A machine this kernel can run on. `Current` names the one being built.
 pub trait Platform:
-    Clock + WallClock + Cpu + Interrupts + Paging + Contexts + Console + Entropy + Sized + 'static
+    Clock
+    + WallClock
+    + Cpu
+    + Interrupts
+    + Paging
+    + Contexts
+    + Console
+    + Entropy
+    + Gate
+    + Sized
+    + 'static
 {
 }
 
@@ -958,6 +1009,24 @@ pub unsafe fn resume_user(frame: *const UserFrame) -> ! {
 #[inline]
 pub unsafe fn enter_user(entry: usize, user_rsp: usize) -> ! {
     unsafe { <Current as Contexts>::enter_user(entry, user_rsp) }
+}
+
+/// The instruction the syscall gate will return to. See [`Gate::user_ip`].
+///
+/// # Safety
+/// `frame` must be the gate's own frame for the calling task.
+#[inline]
+pub unsafe fn user_ip(frame: *mut ()) -> u64 {
+    unsafe { <Current as Gate>::user_ip(frame) }
+}
+
+/// Point the gate's frame at a new program, as `execve` does.
+///
+/// # Safety
+/// As [`Gate::set_exec_return`].
+#[inline]
+pub unsafe fn set_exec_return(frame: *mut (), entry: usize, sp: usize) {
+    unsafe { <Current as Gate>::set_exec_return(frame, entry, sp) }
 }
 
 /// The `cs`/`ss` a ring-3 frame carries on this machine.

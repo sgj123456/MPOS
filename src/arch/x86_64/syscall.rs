@@ -198,6 +198,37 @@ struct Regs {
     rbp: usize,
 }
 
+/// The gate's frame, as `hal`'s seam hands it to the ABI layer.
+///
+/// x86_64's gate frame is the entry stub's saved block ([`Regs`]), not the task's
+/// user frame - which is exactly why `hal::Gate` is a set of functions over an
+/// opaque pointer: the two machines' gate frames are different objects, and this
+/// is the only place that difference lives.
+impl crate::hal::Gate for crate::hal::Current {
+    unsafe fn user_ip(frame: *mut ()) -> u64 {
+        // SAFETY: the caller's contract - the pointer is the frame
+        // `rust_syscall` was handed.
+        let regs = unsafe { &*(frame as *const Regs) };
+        // `syscall` parked the caller's return address in rcx, which is where
+        // `sysretq` takes it from again.
+        regs.rcx as u64
+    }
+
+    unsafe fn set_exec_return(frame: *mut (), entry: usize, sp: usize) {
+        // SAFETY: as above.
+        let regs = unsafe { &mut *(frame as *mut Regs) };
+        // `sysretq` restores RIP from rcx and RSP from the value the stub parked,
+        // so this is what makes `execve` "not return": the very next instruction
+        // is the new program's entry, on its own stack. The result slot is left
+        // alone deliberately - the gate writes the dispatch's result (which is
+        // zero here) into it after the handler returns, and `rax` doubles as
+        // `orig_rax` for a tracer, so pre-zeroing it would change what a
+        // `PTRACE_EVENT_EXEC` stop reports.
+        regs.rcx = entry;
+        regs.user_rsp = sp;
+    }
+}
+
 extern "C" fn rust_syscall(regs: *mut Regs) -> usize {
     let regs = unsafe { &mut *regs };
     let args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9];
@@ -205,7 +236,8 @@ extern "C" fn rust_syscall(regs: *mut Regs) -> usize {
     // ever entered from ring 3 (a `syscall` at ring 0 would load a user CS
     // and fault), so every call here is from user.
     let regs_ptr = regs as *mut Regs as *mut ();
-    syscall::linux_dispatch(regs.rax as u64, args, true, regs_ptr) as usize
+    // SAFETY: `regs_ptr` is this gate's own frame, just built by the stub.
+    unsafe { syscall::linux_dispatch(regs.rax as u64, args, true, regs_ptr) as usize }
 }
 
 global_asm!(

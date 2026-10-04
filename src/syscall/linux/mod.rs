@@ -54,8 +54,15 @@ pub fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     proc::deliver_signal(regs_ptr, nr, ret)
 }
 
+/// One Linux syscall, dispatched by number across the whole table.
+///
+/// # Safety
+/// `regs_ptr` must be null or the syscall gate's own frame for the calling
+/// task. Handlers reach it through `hal::user_ip`/`hal::set_exec_return` and
+/// through the machine's own frame code, and it is dereferenced there without
+/// further checks.
 #[cfg(target_os = "none")]
-pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -> isize {
+pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -> isize {
     // SECCOMP_MODE_STRICT is on for this thread. Only the four calls a
     // condemned process still needs survive: read, write, exit and the
     // signal-return trampoline. Anything else is fatal - the filtered call
@@ -77,18 +84,22 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
     // read off the man page, because three of them are not what the man page
     // sounds like; §8.2 holds the numbers and the two drafts that were wrong.
     //
-    // Deferred off aarch64 with the rest of the return-frame machinery: building
-    // the filter's `seccomp_data` reads the instruction pointer out of the x86
-    // frame (`proc::user_ip`), and no filter can be installed here until the
-    // `seccomp(2)` handler itself is ported. STRICT mode above still runs on
-    // both machines; only BPF filtering waits for the aarch64 signal/frame stage.
+    // Deferred off aarch64 with the rest of the `seccomp(2)` handler: no filter
+    // can be installed there until that syscall is ported. STRICT mode above
+    // still runs on both machines; only BPF filtering waits.
     #[cfg(not(target_arch = "aarch64"))]
     if crate::seccomp::any_installed() {
         let mut data_args = [0u64; 6];
         for (slot, arg) in data_args.iter_mut().zip(args) {
             *slot = arg as u64;
         }
-        let data = crate::seccomp::data_bytes(nr as i32, proc::user_ip(regs_ptr), data_args);
+        // The instruction pointer comes from the gate through `hal`, which names
+        // no machine. The filter carries it in `seccomp_data`, so a filter that
+        // checks which of its own call sites is running reads the value the
+        // kernel recorded rather than a guess.
+        // SAFETY: `regs_ptr` is the gate's own frame for this task.
+        let ip = unsafe { crate::hal::user_ip(regs_ptr) };
+        let data = crate::seccomp::data_bytes(nr as i32, ip, data_args);
         if let Some(answer) = crate::sched::run_seccomp_filters(&data) {
             use crate::sched::signal::SIGSYS;
             use crate::seccomp as sc;

@@ -2980,4 +2980,30 @@ impl crate::hal::Entropy for crate::hal::Current {
     }
 }
 
+/// The gate's frame, as `hal`'s seam hands it to the ABI layer.
+///
+/// aarch64's gate frame *is* the task's user frame - `__vec_el0_sync` saves the
+/// trapped registers straight into it - so unlike x86_64 there is no second
+/// object here, and this impl is three calls and no register name. What the two
+/// machines share is the *operations*, which is the whole point of the seam.
+impl crate::hal::Gate for crate::hal::Current {
+    unsafe fn user_ip(frame: *mut ()) -> u64 {
+        // SAFETY: the caller's contract - the pointer is the frame the EL0 sync
+        // vector built for this task.
+        let frame = unsafe { &*(frame as *const context::UserFrame) };
+        crate::hal::UserFrameOps::ip(frame) as u64
+    }
+
+    unsafe fn set_exec_return(frame: *mut (), entry: usize, sp: usize) {
+        // SAFETY: as above.
+        let frame = unsafe { &mut *(frame as *mut context::UserFrame) };
+        // `execve`'s result is never observed by its caller, so x0 is zeroed
+        // rather than left holding the call's number - and `eret` then takes pc
+        // and sp from here, which is what makes the call "not return".
+        crate::hal::UserFrameOps::set_result(frame, 0);
+        crate::hal::UserFrameOps::set_ip(frame, entry);
+        crate::hal::UserFrameOps::set_sp(frame, sp);
+    }
+}
+
 impl crate::hal::Platform for crate::hal::Current {}

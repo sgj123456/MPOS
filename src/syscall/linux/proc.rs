@@ -34,18 +34,6 @@ pub(super) use crate::syscall::MMAP_BASE;
 /// out here would make every field above it name the word below the one it
 /// means, and a `fork` child would resume with its parent's `rdi` in `r12` and
 /// its `rsi` as the return address.
-/// The user instruction pointer of the call being dispatched: the `rcx` the
-/// syscall gate saved, which is where `sysretq` will resume. `seccomp_data`
-/// carries it, and a filter that inspects it - one checking which of its own
-/// call sites is running - reads the value the kernel recorded rather than a
-/// guess.
-#[cfg(target_os = "none")]
-#[cfg(not(target_arch = "aarch64"))]
-pub(super) fn user_ip(regs_ptr: *mut ()) -> u64 {
-    let frame = unsafe { &*(regs_ptr as *const RegsFrame) };
-    frame.rcx as u64
-}
-
 #[repr(C)]
 struct RegsFrame {
     rax: usize,      // [rsp+0]   return value / syscall number
@@ -1602,24 +1590,16 @@ pub(super) fn handle_execve(
             // returns normally only as a number, so the way it takes the process
             // to the new program is to rewrite the trap frame the syscall gate
             // will `ret`/`eret` out through - the entry becomes the new program's
-            // first instruction, the stack pointer its new stack, and the return
-            // register 0 (Linux's `execve` never hands the caller a value back).
+            // first instruction, the stack pointer its new stack, and the caller
+            // sees no return value at all.
             //
-            // x86_64: sysretq takes the new RIP from `rcx` and RSP from
-            // `user_rsp` in the `RegsFrame`. aarch64: `eret` takes them from the
-            // saved `UserFrame`'s `pc`/`sp`, and the result register is `x0`.
-            #[cfg(not(target_arch = "aarch64"))]
+            // *Which* registers say that is the machine's, and each machine's
+            // `hal::Gate` knows its own, so what is left here is the one
+            // machine-neutral thing there is to say about this call: it does not
+            // return.
             if !regs_ptr.is_null() {
-                let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
-                regs.rcx = entry; // sysretq will jump here
-                regs.user_rsp = new_rsp; // new stack pointer
-            }
-            #[cfg(target_arch = "aarch64")]
-            if !regs_ptr.is_null() {
-                let frame = unsafe { &mut *(regs_ptr as *mut crate::hal::UserFrame) };
-                frame.x[0] = 0; // execve's "result" - the caller never sees it
-                frame.pc = entry as u64; // eret jumps here
-                frame.sp = new_rsp as u64; // into the new stack
+                // SAFETY: `regs_ptr` is the gate's own frame for this task.
+                unsafe { crate::hal::set_exec_return(regs_ptr, entry, new_rsp) };
             }
             // A traced task traps here, on the *new* image's first instruction:
             // by the time `execve` could otherwise "return" the old program is

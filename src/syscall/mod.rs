@@ -208,9 +208,17 @@ pub(crate) fn argv_arg(
 ///
 /// `regs_ptr` is the raw pointer to the register frame on the kernel
 /// stack, used by execve to patch the return address and stack pointer
-/// so the process enters the new image on `sysretq`.
+/// so the process enters the new image on `sysretq`, and read through
+/// `hal::user_ip` to build a seccomp filter's `seccomp_data`. It is null
+/// for a call the kernel makes on its own behalf, which has no frame.
+///
+/// # Safety
+/// `regs_ptr` must be null or the syscall gate's own frame for the calling
+/// task. Nothing checks that: the frame lives on that task's kernel stack, and
+/// several handlers dereference it. The only callers that pass a frame are the
+/// two machine gates, which have just built it.
 #[cfg(target_os = "none")]
-pub fn linux_dispatch(
+pub unsafe fn linux_dispatch(
     nr: u64,
     args: [usize; ARG_COUNT],
     from_user: bool,
@@ -233,7 +241,8 @@ pub fn linux_dispatch(
     // is exactly their no-tracer behaviour on the machines that do have them.
     #[cfg(not(target_arch = "aarch64"))]
     let args = linux::proc::syscall_entry_stop(regs_ptr, nr, args);
-    let ret = linux::dispatch(nr, args, from_user, regs_ptr);
+    // SAFETY: the caller's contract, passed through unchanged.
+    let ret = unsafe { linux::dispatch(nr, args, from_user, regs_ptr) };
     #[cfg(not(target_arch = "aarch64"))]
     let ret = linux::proc::syscall_exit_stop(regs_ptr, nr, args, ret);
     // Signals are delivered here rather than before the call: a handler has to

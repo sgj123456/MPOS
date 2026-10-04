@@ -449,9 +449,10 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
     // AArch64 returns a result in `x0` and an error as a negated errno, which is
     // already what the `err` crate's constants are - so this is the value
     // `dispatch` returned rather than a translation of it.
-    frame.x[0] =
+    // SAFETY: the frame is the one this vector just saved the trap into.
+    frame.x[0] = unsafe {
         crate::syscall::linux_dispatch(number, args, true, core::ptr::from_mut(frame).cast::<()>())
-            as u64;
+    } as u64;
     0
 }
 
