@@ -1665,6 +1665,32 @@ impl Table {
     /// CR3, its kernel stack under `RSP0` for traps from ring 3, and its TLS
     /// base under FS.
     fn prepare(&mut self, id: TaskId) {
+        // Take the outgoing task's *live* thread pointer before the incoming
+        // task's overwrites the one register the whole CPU has.
+        //
+        // A program can move its own base with no syscall for the kernel to see:
+        // aarch64's musl installs its TLS with a direct `msr tpidr_el0` at
+        // startup, so the record this kernel wrote (`arch_prctl`-style, or the
+        // cleared base a fresh image gets) stops being the truth the moment the
+        // program runs. Without this read-back the record's stale value is what
+        // the task gets handed on its next dispatch - measured: the aarch64 test
+        // sweep's runner had its base reset to 0 by the first context switch
+        // after it spawned a child, and its next TLS access faulted at
+        // `0xffffffffffffff5c` (NULL minus musl's `errno`/canary slot).
+        //
+        // x86_64 is unaffected either way: its base is an MSR only the kernel
+        // writes, so `thread_pointer` answers the recorded value and this is the
+        // same value written back. Kernel tasks are skipped - they have no TLS,
+        // and recording a user task's base into one would be a lie the
+        // read-back checks could later quote.
+        let outgoing = self.current;
+        if outgoing != SCHED_ID
+            && let Some(task) = self.tasks.get_mut(outgoing.0).and_then(Option::as_mut)
+            && (task.space.is_some() || task.mm.root() != 0)
+        {
+            task.tls = hal::thread_pointer();
+        }
+
         let task = self.task(id);
         let root = match &task.space {
             Some(space) => space.root(),
