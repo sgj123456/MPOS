@@ -5854,9 +5854,17 @@ Named gaps the port carries rather than hides, each with its home:
   MMIO transport, and `check_blk` reads sector 0 and *verifies* the pattern - so `M7_BLK_OK`
   means a real block read came back with the right bytes, not merely that a request
   returned. The filesystem mounted over it (the disk root) is the next step; this is the
-  block driver working. What remains is mounting a rootfs over that block, `/dev/hwrng`
-  over the aarch64 devfs, GIC line routing to turn the polled `Console` into `SerialRing`,
-  `net`, and then the aarch64 `ash` rootfs and `cargo xtask test --arch aarch64`.
+  block driver working. **Stage 8's net transport over MMIO - DONE (the net
+  commit):** `drivers::virtio::mmio::read_mac` opens the tree's net window
+  (`DeviceID` 1, `VIRTIO_ID_NET`) as an `MmioTransport` and hands it to the crate's
+  `VirtIONet`; xtask attaches a `virtio-net-device` on a user-mode backend and
+  `check_net` reads the adapter's 6-byte MAC and asserts it is not all-zero, so
+  `M8_NET_OK` proves the multi-queue device constructs over MMIO (its receive ring
+  allocates through the neutral `Hal`) without claiming traffic it did not send.
+  What remains is mounting a rootfs over that block, `/dev/hwrng` over the aarch64
+  devfs, GIC line routing to turn the polled `Console` into `SerialRing`, the
+  smoltcp stack over the MMIO net device and its socket syscalls, and then the
+  aarch64 `ash` rootfs and `cargo xtask test --arch aarch64`.
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the

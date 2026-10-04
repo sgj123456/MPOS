@@ -225,6 +225,7 @@ pub unsafe fn boot(handoff: *const Handoff, milestone: fn(), init: fn(*const u8,
     check_virtio(&info);
     check_rng(&info);
     check_blk(&info);
+    check_net(&info);
     check_timer();
     check_context();
     check_user_memory();
@@ -731,6 +732,9 @@ const VIRTIO_ID_RNG: u32 = 4;
 /// `DeviceID` for the block device (`VIRTIO_ID_BLOCK`), the second device driven
 /// over MMIO - the disk root the drivers stage names (`PLAN.md` §9.1).
 const VIRTIO_ID_BLOCK: u32 = 2;
+/// `DeviceID` for the network adapter (`VIRTIO_ID_NET`), the third device driven
+/// over MMIO - the `net` stage's transport proof on this machine (`PLAN.md` §9.1).
+const VIRTIO_ID_NET: u32 = 1;
 
 /// One 32-bit read of a device's registers, through the kernel's own tables.
 fn read_device(virt: usize, offset: usize) -> u32 {
@@ -1036,6 +1040,78 @@ fn check_blk(info: &BootInfo) {
     }
     let _ = writeln!(out, "virtio-blk over MMIO read a verified sector");
     let _ = writeln!(out, "M7_BLK_OK");
+}
+
+/// Stage 8's transport proof: virtio-net over the memory-mapped transport.
+///
+/// The net adapter is the third device driven the same way - open the window the
+/// tree says carries one (`DeviceID` 1) as an `MmioTransport`, hand it to the
+/// crate's `VirtIONet`. The pin is a real config read, not a claim of traffic:
+/// the device's 6-byte MAC must be present and non-zero (a `virt` MMIO adapter
+/// always carries the MAC QEMU assigned). Constructing the device also posts its
+/// receive ring through the neutral `Hal`, re-proving DMA over MMIO for a
+/// multi-queue device. Driving the network stack over it is the later net work;
+/// this is the adapter being live on this machine.
+fn check_net(info: &BootInfo) {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M8_NET_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    let Some(bytes) = info.dtb else {
+        fail!("the record carries no device tree");
+    };
+    let tree = match fdt::Fdt::new(bytes) {
+        Ok(tree) => tree,
+        Err(error) => fail!("the device tree will not walk: {error:?}"),
+    };
+
+    let mut net: Option<(usize, usize)> = None;
+    let walked = tree.each(
+        |node| node.is_compatible("virtio,mmio"),
+        |node| {
+            if net.is_some() {
+                return true;
+            }
+            for (address, size) in node.reg() {
+                let (address, size) = (address as usize, size as usize);
+                let Some(virt) = paging::device_virt(address, size) else {
+                    continue;
+                };
+                if read_device(virt, VIRTIO_MMIO_MAGIC) == VIRTIO_MAGIC
+                    && read_device(virt, VIRTIO_MMIO_DEVICE_ID) == VIRTIO_ID_NET
+                {
+                    net = Some((virt, size));
+                    break;
+                }
+            }
+            true
+        },
+    );
+    if let Err(error) = walked {
+        fail!("the device tree will not walk: {error:?}");
+    }
+    let Some((virt, size)) = net else {
+        fail!("the tree describes no virtio-net (device {VIRTIO_ID_NET}) window");
+    };
+    let Some(mac) = crate::drivers::virtio::mmio::read_mac(virt, size) else {
+        fail!("the window at {virt:#x} did not open as a virtio-net transport");
+    };
+    if mac.iter().all(|&b| b == 0) {
+        fail!("the virtio-net answered a zero MAC, which a configured adapter never has");
+    }
+    let _ = writeln!(
+        out,
+        "virtio-net over MMIO opened, MAC {:#04x}:{:#04x}:{:#04x}:{:#04x}:{:#04x}:{:#04x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    let _ = writeln!(out, "M8_NET_OK");
 }
 
 /// Where the EL0 check's three pages go, in the low half - the half a process

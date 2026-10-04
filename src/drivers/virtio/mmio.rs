@@ -25,10 +25,35 @@ use core::ptr::NonNull;
 
 use critical_section::Mutex;
 use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::device::rng::VirtIORng;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use super::hal::HalImpl;
+
+/// Receive/transmit queue depth and buffer size the net device is opened with -
+/// the same shape the PCI driver uses, so the ring the crate posts is large
+/// enough never to be what drops a frame. A boot check reads only the MAC, but
+/// the device is constructed the way the stack would.
+const NET_QUEUE_SIZE: usize = 64;
+const NET_BUFFER_BYTES: usize = 2048;
+
+/// Read the MAC of the virtio-net device whose register block is mapped at
+/// `virt` (spanning `size`), or `None` if the window does not open as a network
+/// device. This is the drivers stage's third MMIO device, pinned the same way as
+/// the others: a real config read through the memory-mapped transport, not a
+/// claim of traffic. It allocates the device's receive ring via the neutral
+/// `Hal`, so it also re-proves DMA over MMIO for a multi-queue device.
+pub fn read_mac(virt: usize, size: usize) -> Option<[u8; 6]> {
+    // SAFETY: `virt` is an address inside the fixed device window the boot mapped
+    // as Device-nGnRnE and never executable, `size` is the register block the tree
+    // reports, and the header is volatile device memory; `'static` is the machine's
+    // promise that the window outlives this borrow of it.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let mut net = VirtIONet::<HalImpl, _, NET_QUEUE_SIZE>::new(transport, NET_BUFFER_BYTES).ok()?;
+    Some(net.mac_address())
+}
 
 /// Read the first `out.len() / 512` sectors of the virtio-blk device whose
 /// register block is mapped at `virt` (spanning `size`) into `out`.
