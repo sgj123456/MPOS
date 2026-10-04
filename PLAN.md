@@ -5875,6 +5875,20 @@ Named gaps the port carries rather than hides, each with its home:
   machine: the smoltcp stack and socket syscalls over this device are the next cut.
   (A rejected frame reuses `M8_NET_FAILED`, already a terminator, so it aborts
   honestly rather than printing a false `M8_NET_OK`.)
+  **How the smoltcp stage actually has to start (measured, not assumed).** An
+  attempt to cfg-prep `net` for aarch64 (move `smoltcp` to the shared `none` dep
+  block, flip the `net` gate) left only 8 residual errors - `crate::drivers::virtio::net::VirtioNet`
+  (imported at `net/mod.rs:74`), `crate::drivers::virtio::vsock`, and four
+  `crate::vfs::procfs` references - which looks trivially gatable. It is not:
+  `VirtioNet` is not a peripheral in `net/mod.rs`, it *is* the smoltcp `Device` the
+  whole stack is built on (interface construction, the poll loop, the `Rx/TxToken`
+  impls), so gating it to x86 removes the spine and leaves nothing to compile. The
+  correct first cut is therefore not a cfg-gate but an **abstraction**: introduce a
+  device trait `net` depends on instead of the concrete PCI `VirtioNet`, give x86 the
+  PCI impl and aarch64 an MMIO impl (the `drivers::virtio::mmio::MmioBlk`-style
+  adapter, this time satisfying smoltcp's `Device`), and only then attach a device
+  and route sockets. `vsock`/`procfs`-backed nodes stay cfg-gated (absent on
+  aarch64, honest gaps). The attempt was reverted; `net` is x86_64-only as before.
   **Stage 8's input transport over MMIO - DONE (the input-transport commit):** the
   same MMIO path reaches a *fourth* device class. xtask attaches a
   `virtio-keyboard-device` (a self-contained virtio-input device with a built-in
