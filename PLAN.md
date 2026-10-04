@@ -5875,6 +5875,18 @@ Named gaps the port carries rather than hides, each with its home:
   machine: the smoltcp stack and socket syscalls over this device are the next cut.
   (A rejected frame reuses `M8_NET_FAILED`, already a terminator, so it aborts
   honestly rather than printing a false `M8_NET_OK`.)
+  **Stage 8's input transport over MMIO - DONE (the input-transport commit):** the
+  same MMIO path reaches a *fourth* device class. xtask attaches a
+  `virtio-keyboard-device` (a self-contained virtio-input device with a built-in
+  keyboard backend, so it presents its event queue and config headless with no
+  external chardev); `check_input` finds the window by `DeviceID` 18
+  (`VIRTIO_ID_INPUT`) and `mmio::probe_input` opens it as a `VirtIOInput`, requiring
+  the transport to negotiate the queues - `M8_INPUT_OK`. Like `check_net`'s MAC read
+  this proves the *transport reaches the class*, not that events flow: the evdev
+  nodes, `/dev/input` registration and the input pump stay x86_64's (`drivers::virtio::input`
+  is PCI), so `/dev/input` remains absent on aarch64 (a named gap in the `/dev` set),
+  and a rejected/unfound input device reuses `M8_INPUT_FAILED` (a terminator) to
+  abort honestly.
   **Stage 7's disk-root primitive - an ext4 mounted over the MMIO block - DONE (the
   fs commit):** `mmio` also implements `crate::blk::BlockDev` for the MMIO block
   (`MmioBlk`: sector read/write/flush + capacity through the neutral `Hal`), and

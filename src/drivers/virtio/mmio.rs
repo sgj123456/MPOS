@@ -25,6 +25,7 @@ use core::ptr::NonNull;
 
 use critical_section::Mutex;
 use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::device::input::VirtIOInput;
 use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::device::rng::VirtIORng;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
@@ -150,6 +151,24 @@ pub fn tx_probe(virt: usize, size: usize) -> bool {
     let mut buffer = net.new_tx_buffer(60);
     buffer.packet_mut().copy_from_slice(&[0u8; 60]);
     net.send(buffer).is_ok()
+}
+
+/// Report whether the memory-mapped transport at `virt` (spanning `size`)
+/// negotiates as a virtio-input device. This runs the same MMIO open + queue
+/// setup + feature negotiation the rng/blk/net milestones use against a *fourth*
+/// device class - so the aarch64 virtio transport is proven to reach input, not
+/// just the three devices already driven. It deliberately claims nothing about
+/// events arriving (that is the input stack, a later cut); `true` means only that
+/// the device answered the input probe and opened its queues over MMIO.
+pub fn probe_input(virt: usize, size: usize) -> bool {
+    // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
+    // device window, `size` is the tree-reported register block, and the window
+    // outlives this borrow.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    match unsafe { MmioTransport::new(header, size) } {
+        Ok(transport) => VirtIOInput::<HalImpl, _>::new(transport).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Read the first `out.len() / 512` sectors of the virtio-blk device whose

@@ -104,7 +104,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// check runs right after the rng one, so `M7_BLK_OK` is not a terminator and
 /// `M7_BLK_FAILED` is. Stage 8's net check runs right after the block one, so
 /// `M8_NET_OK` is not a terminator and `M8_NET_FAILED` is.
-const TERMINATORS: [&str; 21] = [
+const TERMINATORS: [&str; 22] = [
     "INIT_EXITED",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
@@ -119,6 +119,7 @@ const TERMINATORS: [&str; 21] = [
     "M7_FS_FAILED",
     "M7_DEV_FAILED",
     "M8_NET_FAILED",
+    "M8_INPUT_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
@@ -230,6 +231,10 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             "M8_NET_OK",
             "virtio-net over MMIO (TX queue accepted a frame)",
         ),
+        (
+            "M8_INPUT_OK",
+            "virtio-input over MMIO negotiated its queues",
+        ),
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
         ("M6_AS_OK", "user address space"),
@@ -306,7 +311,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!();
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
-             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M7_DEV_OK, M8_NET_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
+             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M7_DEV_OK, M8_NET_OK, M8_INPUT_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
              M6_AS_OK, \
              M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
@@ -612,6 +617,13 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
         // leaves the machine; the check reads config, it does not send traffic.
         .args(["-netdev", "user,id=n0"])
         .args(["-device", "virtio-net-device,netdev=n0"])
+        // A virtio-input device too - the fourth class the aarch64 MMIO virtio path
+        // has to reach (`check_input`, `M8_INPUT_OK`). The keyboard backend is chosen
+        // because it is a self-contained virtio-input device: it presents its event
+        // queue and config with no external chardev/socket, so the boot can open and
+        // negotiate the transport headless (the milestone is the transport reaching
+        // the class, not any event arriving).
+        .args(["-device", "virtio-keyboard-device"])
         // And the transports have to be the *modern* ones, which on this machine
         // is a choice somebody has to make: measured, `virt`'s `virtio-mmio`
         // transports answer `Version` 1 - the legacy register layout - unless

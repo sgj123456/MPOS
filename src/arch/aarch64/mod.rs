@@ -227,6 +227,7 @@ pub unsafe fn boot(handoff: *const Handoff, milestone: fn(), init: fn(*const u8,
     check_blk(&info);
     check_fs(&info);
     check_net(&info);
+    check_input(&info);
     check_timer();
     check_context();
     check_user_memory();
@@ -736,6 +737,9 @@ const VIRTIO_ID_BLOCK: u32 = 2;
 /// `DeviceID` for the network adapter (`VIRTIO_ID_NET`), the third device driven
 /// over MMIO - the `net` stage's transport proof on this machine (`PLAN.md` §9.1).
 const VIRTIO_ID_NET: u32 = 1;
+/// `DeviceID` for an input device (`VIRTIO_ID_INPUT`), the fourth transport the
+/// aarch64 MMIO virtio path is proven to reach (`PLAN.md` §9.1).
+const VIRTIO_ID_INPUT: u32 = 18;
 
 /// One 32-bit read of a device's registers, through the kernel's own tables.
 fn read_device(virt: usize, offset: usize) -> u32 {
@@ -1220,6 +1224,46 @@ fn check_net(info: &BootInfo) {
     }
     let _ = writeln!(out, "virtio-net TX virtqueue accepted a frame over MMIO");
     let _ = writeln!(out, "M8_NET_OK");
+}
+
+/// The fourth MMIO device class: the aarch64 virtio transport reaches a virtio-input
+/// device. xtask attaches a `virtio-input-device` on the tree; `check_input` finds
+/// its window by `DeviceID` and confirms the memory-mapped transport opens and
+/// negotiates it as an input device. Like `check_net`'s MAC read this proves the
+/// transport reaches the class, not that events flow - the input stack (`/dev/input`,
+/// evdev nodes, the pump) is a later cut. `M8_INPUT_OK` prints only on a successful
+/// negotiate, and a failure reuses `M8_INPUT_FAILED` (a terminator) to stop honestly.
+fn check_input(info: &BootInfo) {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M8_INPUT_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    let windows = match virtio_device_windows(info, VIRTIO_ID_INPUT) {
+        Ok(windows) => windows,
+        Err(message) => fail!("{message}"),
+    };
+    if windows.is_empty() {
+        fail!("the tree describes no virtio-input (device {VIRTIO_ID_INPUT}) window");
+    }
+    let mut opened = false;
+    for &(virt, size) in &windows {
+        if crate::drivers::virtio::mmio::probe_input(virt, size) {
+            opened = true;
+            break;
+        }
+    }
+    if !opened {
+        fail!("no virtio-input window opened and negotiated as an MMIO transport");
+    }
+    let _ = writeln!(out, "virtio-input over MMIO negotiated its queues");
+    let _ = writeln!(out, "M8_INPUT_OK");
 }
 
 /// Where the EL0 check's three pages go, in the low half - the half a process
