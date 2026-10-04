@@ -133,13 +133,21 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "auto-icmp-echo-reply",
 ] }
 
-# aarch64-only, and deliberately empty today: the console is PL011 driven
-# through `volatile` reads (no crate), the boot stack is the linker script's,
-# and the interrupt controller does not arrive until stage 1c. The table exists
-# now so that a dependency this machine needs has an obvious home beside the
-# x86_64 one, rather than being added to the shared block and quietly attaching
-# itself to both machines.
+# aarch64-only. The console is PL011 driven through `volatile` reads (no crate)
+# and the boot stack is the linker script's, but the network stack is the same
+# smoltcp integration the x86_64 machine runs: what differs under it is the wire
+# (MMIO rather than PCI), not the stack. This is the home this block was left for
+# when it was empty.
 [target.'cfg(all(target_os = "none", target_arch = "aarch64"))'.dependencies]
+smoltcp = { version = "0.13", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-udp",
+    "socket-tcp",
+    "socket-raw",
+    "auto-icmp-echo-reply",
+] }
 
 [profile.dev]
 panic = "abort"

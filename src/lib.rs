@@ -176,9 +176,18 @@ pub use mpos_gpu as gpu;
 pub mod logging;
 pub mod mm;
 /// The network stack, and the socket syscalls over it. Host builds skip it:
-/// its tests are the conformance programs that run on the machine. aarch64
-/// skips it too until stage 6 - its transport is virtio-PCI found through the
-/// legacy I/O-port config mechanism, which is x86_64's.
+/// its tests are the conformance programs that run on the machine.
+///
+/// aarch64 is not here yet, and §13.4 measured why: flipping the gate cost 24
+/// errors, 16 of them only the missing `smoltcp` dependency (now declared in
+/// `Cargo.toml`'s aarch64 block), and the remaining 8 are the two *device-backed*
+/// families - `drivers::virtio::net` (the PCI NIC) and `drivers::virtio::vsock` -
+/// plus the four `/proc/net` rows net hands `vfs::procfs`. The vsock family is
+/// the blocker: it is referenced from ~50 sites across `net/socket.rs`'s
+/// dispatcher, so gating it per site would thread a cfg through every socket
+/// handler *and* owe each one an aarch64 refusal. The honest cut is therefore a
+/// seam first - the machine's NIC and vsock device behind a capability the MMIO
+/// transport implements - and the flip after it, not a smaller diff now.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod net;
 /// The PCI devices the machine has, and the files `/sys` and `/proc` describe
