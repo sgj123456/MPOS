@@ -5771,9 +5771,17 @@ Named gaps the port carries rather than hides, each with its home:
   registers today), reusing the arch-neutral `HalImpl` (its `dma_alloc`/`mmio_phys_to_virt`/
   `share` are pure `crate::mm`), then `blk` (a disk root), `rng` (entropy), and `net` over
   the same transport, plus GIC line routing to turn the polled `Console` into `SerialRing`.
-  Each device is its own individually-green commit with a boot pin; the first is the MMIO
-  transport + the simplest device driven to a marker, mirroring how the syscall stage
-  landed numbers+routing before its handlers.
+  First commit is the MMIO
+  transport with the simplest device driven to a boot marker. The architectural
+  prerequisite found when starting it: a driver must reach a device's physical MMIO
+  window, but `crate::drivers` naming `crate::arch` is a layering violation (the rule is
+  every machine call above the machine layer goes through `crate::hal`), and aarch64's
+  device-window mapping today lives in `arch::aarch64::paging::device_virt` with no `hal`
+  seam. So the stage opens by adding a `hal` capability - "give me a kernel-virtual
+  address for this physical MMIO range" (x86 answers it with `map_mmio`, aarch64 with the
+  device window) - which is a design-record change to `ARCHITECTURE.md` §2/§3 in the same
+  commit, before any MMIO device is driven. That seam is the true first unit of the
+  drivers stage.
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the
