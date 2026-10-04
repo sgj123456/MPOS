@@ -5747,22 +5747,28 @@ target's parent `execve`s it last - so `MPOS_MUSL_OK` (that binary's own `printl
 second machine. What remains is a fuller shell (`ash`), the `drivers` disk root, `net`, and
 `cargo xtask test --arch aarch64`.
 
-**Measured follow-on: a heap-using musl binary faults on aarch64 (loader/mmap).** The
-committed `/musl` helper prints `MPOS_MUSL_OK` and exits - a print-only real binary runs,
-which is the pinned proof. But extending it to `vec![0u8; 256*1024]` and summing the buffer
-made it take a `user fault at 0x20171e (ESR 0x92000021)` - a Data Abort (EC `0x24`) with
-`WnR`=0, i.e. a *read* - at an address inside the image's first `PT_LOAD`, before printing.
-`map_image` maps the full `align_up(memsz)` page range per segment with correct AP (it
-rounds up and zero-fills `.bss`), so the segments themselves are present; the suspect is the
-general real-`ET_EXEC` startup memory, not the segment loop: either the process's `brk`/`mmap`
-heap (`map_anon`/`brk` base for the musl allocator on aarch64), a GOT/relocation the C
-prologue dereferences that `apply_rela` (which runs only when there is no interpreter) does
-not set for this layout, or an early stack read past `USER_STACK_PAGES`. A real binary that
-allocates therefore is NOT yet proven - only print-only. This is a focused, bounded debugging
-task (dump the faulting mapping + the child's auxv/`brk` and reproduce with a `brk`-only
-helper) and a prerequisite before `ash` can run; it is named, not papered over - the
-`MPOS_MUSL_OK` pin was left at the print-only helper precisely so the committed green is a
-claim it can back.
+**Measured follow-on RESOLVED: a heap-using musl binary now runs to completion - the fault
+was `SCTLR_EL1.A`, not the loader.** Extending the `/musl` helper to `vec![0u8; 256*1024]`,
+filling and summing it, then printing the checksum, made the real binary take a Data Abort
+(EC `0x24`) at `FAR 0x20171e` before printing. Two guesses written down while chasing it -
+a `PT_LOAD` the real path tears down, and a bad heap/`brk` placement - are both refuted by
+the evidence: a temporary diagnostic in `el0_sync` (since removed) that walks the faulting
+VA's page table reported the page mapped `READ` (so it is not a translation fault and not
+unmapped), and the fault's DFSC is `0x21`, an **Alignment fault**. Symbolizing the `pc` (built with symbols) put it inside musl **`memcpy`** at
+`ldp x6, x7, [x1]` - a pair load that *requires 8-byte alignment*, here reading the format
+string at `0x20171e` (low three bits `110`, not 8-aligned). Root cause: the kernel enabled
+`SCTLR_EL1.A` (alignment-check enable, bit 1), which governs EL0 too. Linux boots `A=0`, so
+real programs' unaligned accesses - which `memcpy` produces constantly - simply work; with
+`A=1` an unmodified binary faults in `memcpy`. Fix: drop `A` from `SCTLR_ENABLE` **and**
+`bic` it in `enable_mmu`'s asm - the `orr` can only *set* bits and AAVMF leaves `A` set, so
+removing it from the OR-set was measured insufficient on its own. The committed `/musl` pin
+is now that heap binary and `boot-aarch64` asserts its literal output `MPOS_MUSL_OK
+sum=33423360` (= the correct `32640 * 1024` checksum, so a wrong number or any fault fails
+the verdict - the pin is a claim the run backs, not a string that prints regardless). With a
+real binary that allocates, does an unaligned `memcpy`, formats and prints now running to
+completion, the concrete gate to a fuller shell is cleared: what remains is the Alpine
+aarch64 `ash`/`busybox` binary in the initramfs (a fetch and wiring, not an environment
+wall), the `drivers` disk root, `net`, and `cargo xtask test --arch aarch64`.
 
 
 

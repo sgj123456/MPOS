@@ -425,20 +425,30 @@ pub fn write_initramfs_entries(
     Ok(())
 }
 
-/// An *unmodified* Rust `std` program - it just prints a line - compiled to a
-/// statically-linked `aarch64-unknown-linux-musl` ELF. It is deliberately a normal
-/// `main`, not hand-encoded: its job is to prove the second machine runs the real
-/// musl/Rust runtime (multi-segment `PT_LOAD`s, a `PT_TLS`, the libc prologue and a
-/// `write(1)` from inside `std`), the project's central promise. The kernel's aarch64
-/// EL0 demand-paging handler (which makes a real binary's unbacked stack/anon pages
-/// fault-and-map rather than crash) is what this exercises end to end.
+/// An *unmodified* Rust `std` program compiled to a statically-linked
+/// `aarch64-unknown-linux-musl` ELF. Deliberately a normal `main`, not
+/// hand-encoded: it proves the second machine runs the real musl/Rust runtime end
+/// to end. It allocates and fills a 256 KiB heap buffer (musl `malloc` -> `mmap`
+/// and the demand-paging handler for the untouched pages), sums it (musl `memcpy`,
+/// which uses 8-byte-aligned `ldp`/`stp` on arbitrary pointers - the case that
+/// pinned the `SCTLR_EL1.A` alignment-check fix), and prints the checksum. A wrong
+/// number or a fault means the real-binary path is broken, so the `MPOS_MUSL_OK`
+/// pin is a claim the run can back, not a fixed string that prints no matter what.
 ///
 /// The `aarch64-unknown-linux-musl` target and `rust-lld` are prerequisites (the
 /// x86 test path already requires the `x86_64` musl target); if the target is absent
 /// `rustc` fails and the message names the install command rather than skipping - a
 /// silent skip would be the one failure mode this must not have.
 pub fn build_static_musl_helper(build_dir: &Path) -> Result<Vec<u8>> {
-    const SRC: &str = concat!("fn main() {\n", "    println!(\"MPOS_MUSL_OK\");\n", "}\n",);
+    const SRC: &str = concat!(
+        "fn main() {\n",
+        "    let n = 256 * 1024;\n",
+        "    let mut buf = vec![0u8; n];\n",
+        "    for (i, b) in buf.iter_mut().enumerate() { *b = (i & 0xff) as u8; }\n",
+        "    let sum: u64 = buf.iter().map(|&b| b as u64).sum();\n",
+        "    println!(\"MPOS_MUSL_OK sum={}\", sum);\n",
+        "}\n",
+    );
     let src = build_dir.join("aarch64-musl-helper.rs");
     let out = build_dir.join("aarch64-musl-helper");
     std::fs::write(&src, SRC).with_context(|| format!("Failed to write {}", src.display()))?;

@@ -164,12 +164,22 @@ const TCR: u64 = 16
     | (3 << 28)
     | (2 << 30);
 
-/// `SCTLR_EL1` bits the kernel ORs in: `M` (the MMU), `A` (alignment checking),
-/// `C` (data cache) and `I` (instruction cache).
+/// `SCTLR_EL1` bits the kernel ORs in: `M` (the MMU), `C` (data cache) and `I`
+/// (instruction cache) - deliberately **not** `A` (alignment checking).
+///
+/// `A=1` makes an unaligned load/store an Alignment fault, and it applies to EL0
+/// too. Linux boots with `A=0`, so an unaligned memory access simply works; real
+/// programs depend on that - glibc/musl's `memcpy` uses `ldp`/`stp`, which need
+/// 8-byte alignment, on whatever pointers callers hand it, so with `A=1` an
+/// unmodified binary faults in `memcpy` copying an odd-offset string. Measured: a
+/// print-then-`memcpy` static-musl helper took a Data Abort (DFSC `0x21`, alignment)
+/// at an unmis-aligned-but-mapped page until `A` was dropped. Clearing it matches
+/// Linux and lets real binaries' unaligned accesses through; the kernel's own data
+/// is aligned and needs the check not at all.
 ///
 /// Read-modify-written rather than assigned, because many of the register's bits
 /// are RES1 and the value the loader left there is the one being modified.
-const SCTLR_ENABLE: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 12);
+const SCTLR_ENABLE: u64 = (1 << 0) | (1 << 2) | (1 << 12);
 
 // ---------------------------------------------------------------------------
 // The device window
@@ -684,6 +694,11 @@ unsafe fn enable_mmu(root: usize) {
             "isb",
             "mrs {sctlr}, sctlr_el1",
             "orr {sctlr}, {sctlr}, {bits}",
+            // Explicitly clear `A` (bit 1, alignment-check enable): the `orr` can
+            // only set bits, and the firmware may have left `A` already set, which
+            // would fault real binaries' unaligned `memcpy`. Linux boots `A=0`;
+            // match it. (See `SCTLR_ENABLE`'s note.)
+            "bic {sctlr}, {sctlr}, #2",
             "msr sctlr_el1, {sctlr}",
             "isb",
             mair = in(reg) MAIR,
