@@ -282,22 +282,30 @@ fn check_disk_root() {
         mpos::println!("M7_DISK_FAILED: mounting the disk at /mnt gave {e:?}");
         hal::halt()
     }
-    // Through the mount table, not the handle: `read_file` resolves every path
-    // component and reads what it lands on.
-    let Ok(bytes) = vfs::read_file("/mnt/hello") else {
-        mpos::println!("M7_DISK_FAILED: /mnt/hello did not read through the VFS");
+    // Through the mount table, not a handle: `read_file` resolves every path
+    // component and reads what it lands on. The file is one the *repository*
+    // owns - `rootfs/etc/inittab`, part of the overlay `xtask` lays on the disk -
+    // so the read proves the disk serves a root tree rather than that a
+    // filesystem mounted. Its length is reported so the command can check it
+    // against the same file in the tree.
+    let Ok(inittab) = vfs::read_file("/mnt/etc/inittab") else {
+        mpos::println!("M7_DISK_FAILED: /mnt/etc/inittab did not read through the VFS");
         hal::halt()
     };
-    let known: &[u8] = b"mpos reads from ext4 over virtio-MMIO\n";
-    if bytes.as_slice() != known {
-        mpos::println!(
-            "M7_DISK_FAILED: /mnt/hello read {} bytes, and the image's file is {}",
-            bytes.len(),
-            known.len()
-        );
+    if inittab.is_empty() {
+        mpos::println!("M7_DISK_FAILED: /mnt/etc/inittab read empty");
         hal::halt()
     }
-    mpos::println!("M7_DISK_OK: /dev/vda published, mounted at /mnt, /mnt/hello read through the VFS");
+    // And the disk carries the init image the initramfs does, so the root switch
+    // - still the next cut - has a program to hand pid 1.
+    if vfs::resolve("/mnt/init").is_err() {
+        mpos::println!("M7_DISK_FAILED: the disk carries no /init for a root switch");
+        hal::halt()
+    }
+    mpos::println!(
+        "M7_DISK_OK: /dev/vda mounted at /mnt, /mnt/etc/inittab {} bytes read through the VFS, /mnt/init present",
+        inittab.len()
+    );
 }
 
 /// Stage 7b's evidence: the polled console input reaches a reader through the

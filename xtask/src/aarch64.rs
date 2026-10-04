@@ -136,6 +136,27 @@ fn esp_dir(build_dir: &Path) -> PathBuf {
     build_dir.join("aarch64-esp")
 }
 
+/// Copy `from`'s tree into `to`, making directories as it goes.
+///
+/// Deliberately small: the one caller is the aarch64 disk's staging directory,
+/// which takes the repository's `rootfs/` overlay - a handful of files. A
+/// symlink is copied as the file it names (`fs::copy` follows it), which is what
+/// laying an overlay onto a filesystem means.
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to).with_context(|| format!("Failed to create {}", to.display()))?;
+    for entry in fs::read_dir(from).with_context(|| format!("Failed to read {}", from.display()))? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)
+                .with_context(|| format!("Failed to copy {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// The PL011's output, captured to a file for the same reason the x86_64 test
 /// machine captures its own: a verdict has to be readable after the machine has
 /// stopped, and this one never exits on its own.
@@ -229,7 +250,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ("M7_FS_OK", "ext4 mounted over the MMIO block"),
         (
             "M7_DISK_OK",
-            "disk root: /dev/vda published, mounted at /mnt, read through the VFS",
+            "disk root: /dev/vda mounted at /mnt, a rootfs/ tree file read through the VFS",
         ),
         ("M7_DEV_OK", "/dev device set builds and reads entropy"),
         (
@@ -258,6 +279,19 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         .filter(|(marker, _)| !log.contains(marker))
         .map(|(_, what)| *what)
         .collect();
+    // The disk's root tree is the repository's `rootfs/` overlay, so the length
+    // the kernel reports for `/mnt/etc/inittab` is the length of the file in the
+    // tree. A copy that dropped, truncated or replaced that file cannot print the
+    // number below, which is what makes the marker a check rather than a claim.
+    let inittab = fs::read(crate::utils::project_root()?.join("rootfs/etc/inittab"))?;
+    let want = format!("{} bytes", inittab.len());
+    if !log.contains(&want) {
+        bail!(
+            "the aarch64 disk root did not serve the rootfs tree: the log has no \
+             \"{want}\" for /mnt/etc/inittab, and the file is {} bytes in rootfs/",
+            inittab.len()
+        );
+    }
     // The init reads a line from `fd 0` (the handoff queued "echo-test\n" on the
     // tty) and echoes it back prefixed with "R:" - so `R:echo-test` on the wire is
     // the init's OWN output (the tty's canonical echo of the same line carries no
@@ -601,6 +635,19 @@ fn build_esp(
         staging.join("hello"),
         b"mpos reads from ext4 over virtio-MMIO\n",
     )?;
+    // The disk carries a *root tree*, not one test file. Two things go in beside
+    // `hello`: the three member images the initramfs also carries (so the disk
+    // has an init to hand pid 1 when the root switch lands), and the in-tree
+    // `rootfs/` overlay - the files `rootfs.toml`'s packages are layered under
+    // (AGENTS.md §5). Copying the tree rather than naming files keeps the image a
+    // function of the repository: the kernel's `check_disk_root` reads
+    // `/mnt/etc/inittab` out of it and reports the length, which this command
+    // checks against the file in the tree.
+    for &(name, bytes) in entries {
+        fs::write(staging.join(name), bytes)
+            .with_context(|| format!("Failed to lay {name} on the aarch64 disk"))?;
+    }
+    copy_tree(&crate::utils::project_root()?.join("rootfs"), &staging)?;
     let ext4 = build_dir.join("aarch64-ext4.img");
     let file =
         fs::File::create(&ext4).with_context(|| format!("Failed to create {}", ext4.display()))?;
