@@ -225,6 +225,7 @@ pub unsafe fn boot(handoff: *const Handoff, milestone: fn(), init: fn(*const u8,
     check_virtio(&info);
     check_rng(&info);
     check_blk(&info);
+    check_fs(&info);
     check_net(&info);
     check_timer();
     check_context();
@@ -966,16 +967,48 @@ fn check_rng(info: &BootInfo) {
     let _ = writeln!(out, "M7_RNG_OK");
 }
 
+/// Every `virtio,mmio` window this machine maps whose `DeviceID` is `want`, as
+/// `(kernel-virtual header, size)`. QEMU assigns the MMIO slots in an order a
+/// port cannot rely on, so a caller that owns a specific image picks its window by
+/// what it contains (a sector pattern, a filesystem that mounts) rather than by
+/// position. `Err` if the record carries no tree, or the tree will not walk.
+fn virtio_device_windows(
+    info: &BootInfo,
+    want: u32,
+) -> Result<alloc::vec::Vec<(usize, usize)>, &'static str> {
+    let bytes = info.dtb.ok_or("the record carries no device tree")?;
+    let tree = fdt::Fdt::new(bytes).map_err(|_| "the device tree will not walk")?;
+    let mut windows = alloc::vec::Vec::new();
+    tree.each(
+        |node| node.is_compatible("virtio,mmio"),
+        |node| {
+            for (address, size) in node.reg() {
+                let (address, size) = (address as usize, size as usize);
+                let Some(virt) = paging::device_virt(address, size) else {
+                    continue;
+                };
+                if read_device(virt, VIRTIO_MMIO_MAGIC) == VIRTIO_MAGIC
+                    && read_device(virt, VIRTIO_MMIO_DEVICE_ID) == want
+                {
+                    windows.push((virt, size));
+                }
+            }
+            true
+        },
+    )
+    .map_err(|_| "the device tree will not walk")?;
+    Ok(windows)
+}
+
 /// Stage 7's second driven device over MMIO: virtio-blk, verified by a read.
 ///
 /// `check_rng` proved a request device answers; a block device is the one the
-/// disk root needs, and it is driven the same way - open the window whose
-/// `DeviceID` is 2 (`VIRTIO_ID_BLOCK`) as an `MmioTransport`, hand it to the
-/// crate's `VirtIOBlk`. The pin is a *verified* read, not a call that returned:
-/// the ESP's boot path lays down a raw image whose first sector is `byte[i] ==
-/// i as u8`, and this reads sector 0 and checks that pattern, so a device that
-/// answered but delivered the wrong bytes fails rather than passing. The
-/// filesystem mount over it is the later step; this is the driver working.
+/// disk root needs, and it is driven the same way - open the window as an
+/// `MmioTransport`, hand it to the crate's `VirtIOBlk`. The pin is a *verified*
+/// read: the raw image xtask lays down has a sector whose byte `i` is `i as u8`,
+/// and with two block devices attached (this one and the ext4 one `check_fs`
+/// mounts) the pattern is picked by content, not position - the window whose
+/// sector 0 matches is this image. Capacity is read too (a config-space path).
 fn check_blk(info: &BootInfo) {
     use fmt::Write;
 
@@ -990,54 +1023,31 @@ fn check_blk(info: &BootInfo) {
         }};
     }
 
-    let Some(bytes) = info.dtb else {
-        fail!("the record carries no device tree");
+    let windows = match virtio_device_windows(info, VIRTIO_ID_BLOCK) {
+        Ok(windows) => windows,
+        Err(message) => fail!("{message}"),
     };
-    let tree = match fdt::Fdt::new(bytes) {
-        Ok(tree) => tree,
-        Err(error) => fail!("the device tree will not walk: {error:?}"),
-    };
-
-    let mut blk: Option<(usize, usize)> = None;
-    let walked = tree.each(
-        |node| node.is_compatible("virtio,mmio"),
-        |node| {
-            if blk.is_some() {
-                return true;
-            }
-            for (address, size) in node.reg() {
-                let (address, size) = (address as usize, size as usize);
-                let Some(virt) = paging::device_virt(address, size) else {
-                    continue;
-                };
-                if read_device(virt, VIRTIO_MMIO_MAGIC) == VIRTIO_MAGIC
-                    && read_device(virt, VIRTIO_MMIO_DEVICE_ID) == VIRTIO_ID_BLOCK
-                {
-                    blk = Some((virt, size));
-                    break;
-                }
-            }
-            true
-        },
-    );
-    if let Err(error) = walked {
-        fail!("the device tree will not walk: {error:?}");
-    }
-    let Some((virt, size)) = blk else {
+    if windows.is_empty() {
         fail!("the tree describes no virtio-blk (device {VIRTIO_ID_BLOCK}) window");
+    }
+
+    // Pick the raw pattern image by content: read each block window's sector 0 and
+    // keep the one that carries the `i as u8` pattern. The ext4 image's sector 0 is
+    // a boot-sector of zeros, so it is not mistaken for this one.
+    let mut buf = [0u8; crate::drivers::virtio::mmio::SECTOR];
+    let mut chosen: Option<(usize, usize)> = None;
+    for &(virt, size) in &windows {
+        if crate::drivers::virtio::mmio::read_blocks(virt, size, &mut buf).is_some()
+            && buf.iter().enumerate().all(|(i, &b)| b == i as u8)
+        {
+            chosen = Some((virt, size));
+            break;
+        }
+    }
+    let Some((virt, size)) = chosen else {
+        fail!("no virtio-blk window returned the known pattern sector");
     };
 
-    let mut buf = [0u8; crate::drivers::virtio::mmio::SECTOR];
-    if crate::drivers::virtio::mmio::read_blocks(virt, size, &mut buf).is_none() {
-        fail!("the virtio-blk at {virt:#x} did not complete a sector read");
-    }
-    // The pattern the image was written with: byte `i` is `i as u8`. A device
-    // that reads but returns the wrong bytes - a bad queue, a bogus DMA address,
-    // the wrong window - fails here, which is the whole point of a *verified*
-    // read rather than a call that returned.
-    if !buf.iter().enumerate().all(|(i, &b)| b == i as u8) {
-        fail!("the sector virtio-blk returned did not match the known pattern");
-    }
     // Read the device's geometry too - a configuration-space path distinct from
     // the data read above. The raw image xtask lays down is 1 MiB = 2048 sectors,
     // so the capacity the device reports must agree; a transport that read a
@@ -1051,6 +1061,53 @@ fn check_blk(info: &BootInfo) {
         "virtio-blk over MMIO read a verified sector ({sectors} sectors)"
     );
     let _ = writeln!(out, "M7_BLK_OK");
+}
+
+/// Stage 7's disk-root primitive: a filesystem mounted over the MMIO block.
+///
+/// `check_blk` proved raw sector reads travel the memory-mapped transport; this
+/// proves the whole `block driver -> filesystem` path by mounting an ext4 over one
+/// of the block windows. With two block devices attached (the pattern image and an
+/// ext4 image xtask lays down), the ext4 one is picked by trying each: `Ext4Fs::mount`
+/// reads the superblock and group descriptors through the `BlockDev`, and only the
+/// image that is actually an ext4 mounts. A filesystem that mounts is the disk root
+/// the drivers stage names - reading a file through it and booting a root from it
+/// are the task-context follow-on (`PLAN.md` §9.1). `M7_FS_FAILED` if none mounts.
+fn check_fs(info: &BootInfo) {
+    use fmt::Write;
+
+    let mut out = pl011::Writer;
+
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, "M7_FS_FAILED: {}", format_args!($($arg)*));
+            halt();
+        }};
+    }
+
+    let windows = match virtio_device_windows(info, VIRTIO_ID_BLOCK) {
+        Ok(windows) => windows,
+        Err(message) => fail!("{message}"),
+    };
+    let mut mounted = false;
+    for &(virt, size) in &windows {
+        let Some(dev) = crate::drivers::virtio::mmio::blockdev(virt, size) else {
+            continue;
+        };
+        // `mount` takes the whole device and only returns Ok if the bytes read
+        // through it form an ext4 the driver can open - a sector that is not a
+        // superblock is a clean `Err`, so trying every window finds the real one
+        // without a panic and without a fake success.
+        if crate::vfs::ext4::Ext4Fs::mount(dev).is_ok() {
+            mounted = true;
+            break;
+        }
+    }
+    if !mounted {
+        fail!("no virtio-blk window over MMIO mounted as ext4");
+    }
+    let _ = writeln!(out, "ext4 mounted over the MMIO virtio-blk device");
+    let _ = writeln!(out, "M7_FS_OK");
 }
 
 /// Stage 8's transport proof: virtio-net over the memory-mapped transport.

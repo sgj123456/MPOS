@@ -29,7 +29,67 @@ use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::device::rng::VirtIORng;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
+use crate::blk::BlockDev;
+
 use super::hal::HalImpl;
+
+/// The virtio-blk reached over MMIO, shaped as a [`BlockDev`] so the filesystem
+/// layer can mount it exactly as it mounts the PCI block device on x86_64 - the
+/// same `Ext4Fs` driver, the same sector contract, only a different transport.
+pub struct MmioBlk {
+    device: Mutex<RefCell<VirtIOBlk<HalImpl, MmioTransport<'static>>>>,
+    sectors: u64,
+}
+
+impl BlockDev for MmioBlk {
+    fn capacity_sectors(&self) -> u64 {
+        self.sectors
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            // A read error means the transport did not complete the request and a
+            // filesystem cannot proceed without the sector; the same answer the PCI
+            // `BlockDev` gives, which is why the trait carries no Result.
+            device
+                .read_blocks((offset / SECTOR as u64) as usize, buf)
+                .expect("virtio-blk over MMIO reported a read error");
+        });
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            device
+                .write_blocks((offset / SECTOR as u64) as usize, buf)
+                .expect("virtio-blk over MMIO reported a write error");
+        });
+    }
+
+    fn flush(&self) -> bool {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            device.flush().is_ok()
+        })
+    }
+}
+
+/// Open the virtio-blk window at `virt` as a [`BlockDev`], or `None` if it is not
+/// a block device. The boot hands this to `Ext4Fs::mount` so a filesystem reads
+/// through the memory-mapped transport end to end (`PLAN.md` §9.1's disk root).
+pub fn blockdev(virt: usize, size: usize) -> Option<Arc<dyn BlockDev>> {
+    // SAFETY: `virt` is inside the mapped, non-executable device window and `size`
+    // is the tree-reported register block; the window outlives the handle.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let device = VirtIOBlk::<HalImpl, _>::new(transport).ok()?;
+    let sectors = device.capacity();
+    Some(Arc::new(MmioBlk {
+        device: Mutex::new(RefCell::new(device)),
+        sectors,
+    }))
+}
 
 /// Receive/transmit queue depth and buffer size the net device is opened with -
 /// the same shape the PCI driver uses, so the ring the crate posts is large

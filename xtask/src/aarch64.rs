@@ -104,7 +104,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// check runs right after the rng one, so `M7_BLK_OK` is not a terminator and
 /// `M7_BLK_FAILED` is. Stage 8's net check runs right after the block one, so
 /// `M8_NET_OK` is not a terminator and `M8_NET_FAILED` is.
-const TERMINATORS: [&str; 19] = [
+const TERMINATORS: [&str; 20] = [
     "INIT_EXITED",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
@@ -116,6 +116,7 @@ const TERMINATORS: [&str; 19] = [
     "M6_TLS_FAILED",
     "M7_RNG_FAILED",
     "M7_BLK_FAILED",
+    "M7_FS_FAILED",
     "M8_NET_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
@@ -218,6 +219,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ("M5_VIRTIO_OK", "virtio transports"),
         ("M7_RNG_OK", "virtio-rng over MMIO"),
         ("M7_BLK_OK", "virtio-blk over MMIO"),
+        ("M7_FS_OK", "ext4 mounted over the MMIO block"),
         ("M8_NET_OK", "virtio-net over MMIO"),
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
@@ -295,16 +297,18 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!();
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
-             M7_RNG_OK, M7_BLK_OK, M8_NET_OK, M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, \
+             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M8_NET_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
+             M6_AS_OK, \
              M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
              demand-paged stack store (MPOS_FAULT_OK), the init's echoed input \
              (R:echo-test), the exec target (MPOS_EXEC_OK), its fork child (MPOS_FORK_OK), \
              the unmodified musl binary (MPOS_MUSL_OK), and INIT_EXITED - the machine \
              drives three devices over the memory-mapped virtio transport (rng, blk with a \
-             verified sector read, and net with a read MAC), and a scheduler-run program \
-             that demand-paged, read, echoed, execve'd, cloned, waited, then ran a real \
-             static-musl ELF at EL0 - from the ESP under AAVMF"
+             verified sector read, and net with a read MAC) and mounts an ext4 filesystem \
+             over the block (the disk root), and a scheduler-run program that demand-paged, \
+             read, echoed, execve'd, cloned, waited, then ran a real static-musl ELF at EL0 \
+             - from the ESP under AAVMF"
         );
         return Ok(());
     }
@@ -421,6 +425,37 @@ fn build_esp(
     let pattern: Vec<u8> = (0..1024 * 1024u32).map(|i| i as u8).collect();
     fs::write(&blk_img, &pattern)
         .with_context(|| format!("Failed to write {}", blk_img.display()))?;
+
+    // A second block image, an ext4 filesystem carrying one file, built WITHOUT a
+    // mount: `mkfs.ext4 -d <dir>` lays the filesystem down from a directory at
+    // create time, so `boot-aarch64` still runs unprivileged (e2fsprogs is now a
+    // prereq of this command). The in-tree ext4 driver refuses `has_journal` (no
+    // journal replay lives here) and `metadata_csum` (writes would leave a checksum
+    // it cannot recompute) - the same two features the x86_64 root switches off - so
+    // `check_fs` can mount this over the memory-mapped block and prove the
+    // block-driver -> filesystem path on the second machine (`PLAN.md` §9.1).
+    let staging = build_dir.join("aarch64-ext4-staging");
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)
+        .with_context(|| format!("Failed to create {}", staging.display()))?;
+    fs::write(
+        staging.join("hello"),
+        b"mpos reads from ext4 over virtio-MMIO\n",
+    )?;
+    let ext4 = build_dir.join("aarch64-ext4.img");
+    let file =
+        fs::File::create(&ext4).with_context(|| format!("Failed to create {}", ext4.display()))?;
+    file.set_len(8 * 1024 * 1024)?;
+    drop(file);
+    utils::run_status(
+        Command::new("mkfs.ext4")
+            .args(["-F", "-q", "-d"])
+            .arg(&staging)
+            .args(["-O", "^has_journal,^metadata_csum"])
+            .args(["-b", "4096"])
+            .arg(&ext4),
+        "mkfs.ext4 the aarch64 filesystem image",
+    )?;
 
     Ok(esp)
 }
@@ -549,6 +584,19 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
             ),
         ])
         .args(["-device", "virtio-blk-device,drive=blk0"])
+        // The second block device: the ext4 image `build_esp` laid down. `check_fs`
+        // opens the block windows, tries each as an ext4, and finds this one - so a
+        // filesystem mounts over the memory-mapped transport (PLAN.md §9.1's disk
+        // root). Two virtio-blk-device instances, so the port picks the right one by
+        // content rather than by the slot QEMU happened to give it.
+        .args([
+            "-drive",
+            &format!(
+                "file={},format=raw,if=none,id=blk1",
+                esp.parent().unwrap().join("aarch64-ext4.img").display()
+            ),
+        ])
+        .args(["-device", "virtio-blk-device,drive=blk1"])
         // A third MMIO device, a network adapter on a user-mode (SLIRP) backend,
         // so `check_net` can open it the same way and read its MAC - the net
         // stage's transport proof on this machine (`PLAN.md` §9.1). No socket

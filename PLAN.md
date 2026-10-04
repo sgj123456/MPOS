@@ -5864,10 +5864,20 @@ Named gaps the port carries rather than hides, each with its home:
   `check_net` reads the adapter's 6-byte MAC and asserts it is not all-zero, so
   `M8_NET_OK` proves the multi-queue device constructs over MMIO (its receive ring
   allocates through the neutral `Hal`) without claiming traffic it did not send.
-  What remains is mounting a rootfs over that block, `/dev/hwrng` over the aarch64
-  devfs, GIC line routing to turn the polled `Console` into `SerialRing`, the
-  smoltcp stack over the MMIO net device and its socket syscalls, and then the
-  aarch64 `ash` rootfs and `cargo xtask test --arch aarch64`.
+  **Stage 7's disk-root primitive - an ext4 mounted over the MMIO block - DONE (the
+  fs commit):** `mmio` also implements `crate::blk::BlockDev` for the MMIO block
+  (`MmioBlk`: sector read/write/flush + capacity through the neutral `Hal`), and
+  `check_fs` opens every block window and takes the one `Ext4Fs::mount` accepts - so
+  `M7_FS_OK` means the whole block-driver -> filesystem path reads over MMIO. xtask
+  lays the ext4 image down with `mkfs.ext4 -d <dir>` (unprivileged, no mount) and
+  `^has_journal,^metadata_csum` - the same two features the driver refuses on the
+  x86_64 root - making e2fsprogs a `boot-aarch64` prereq. The two block devices are
+  told apart by content (a pattern sector vs a mounting filesystem), not QEMU's slot
+  order. What remains is reading a file through that mount and pivoting to it as the
+  root, `/dev/hwrng` over the aarch64 devfs, GIC line routing to turn the polled
+  `Console` into `SerialRing`, the smoltcp stack over the MMIO net device and its
+  socket syscalls, and then the aarch64 `ash` rootfs and `cargo xtask test --arch
+  aarch64`.
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the
