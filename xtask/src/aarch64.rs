@@ -393,6 +393,15 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_RENAME_LINK_OK line is absent (renameat, linkat or unlink failed)"
         );
     }
+    // ftruncate - the `: >file` / `truncate` length handler. The marker prints
+    // only if a 10-byte file trimmed to 4 then 0 reports those sizes back, so a
+    // truncate that left stale bytes or a stale length fails.
+    if !log.contains("MPOS_TRUNCATE_OK") {
+        bail!(
+            "the aarch64 musl binary could not round-trip ftruncate: the \
+             MPOS_TRUNCATE_OK line is absent (set_len / the stat length it implies failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -413,7 +422,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) and \
              round-tripped getcwd/chdir (MPOS_CWD_OK) and symlink/readlink \
              (MPOS_SYMLINK_OK) and mkdir/a nested file/rmdir (MPOS_MKDIR_OK) and \
-             rename/hard link (MPOS_RENAME_LINK_OK) - \
+             rename/hard link (MPOS_RENAME_LINK_OK) and ftruncate (MPOS_TRUNCATE_OK) - \
              from the ESP under AAVMF"
         );
         return Ok(());

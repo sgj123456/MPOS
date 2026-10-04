@@ -5973,7 +5973,11 @@ Named gaps the port carries rather than hides, each with its home:
   `/mrn_c` to `/mrn_b`, then remove `/mrn_b` and confirm the bytes still read through
   `/mrn_c`) prints `MPOS_RENAME_LINK_OK` (asserted) - the RENAMEAT/LINKAT `mv`/`ln`
   pair, and the surviving read after the first name's unlink is the counterfactual that
-  proves linkat shared one node rather than copying one (which is what rename does).
+  proves linkat shared one node rather than copying one (which is what rename does). An
+  `ftruncate` round-trip (write ten bytes, `set_len(4)` then `set_len(0)`, each
+  confirmed by the stat length) prints `MPOS_TRUNCATE_OK` (asserted) - the `: >file`
+  and `truncate` length handler, so a trim that left stale bytes or a stale length
+  would fail rather than pass.
   This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.
