@@ -425,10 +425,11 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         );
     }
     // aarch64 struct-stat ABI: chmod's mode reads back through st_mode, the file
-    // reports is_file with the right length, and a directory reports is_dir. This
-    // pins that the kernel lays out `struct stat` at the aarch64 (asm-generic)
-    // field offsets, not x86_64's - the earlier mismatch made st_mode return
-    // st_nlink's value (1), so every stat-based type/permission read was wrong.
+    // reports is_file/len, a directory reports is_dir, and st_nlink/st_ino/
+    // st_blocks/st_size read at the aarch64 offsets. This pins that the kernel
+    // lays out `struct stat` at the aarch64 (asm-generic) field offsets, not
+    // x86_64's - the earlier mismatch made st_mode return st_nlink's value (1),
+    // so every stat-based type/permission read was wrong.
     if !log.contains("MPOS_STAT_OK") {
         bail!(
             "the aarch64 musl binary could not read stat fields back correctly: the \

@@ -5986,8 +5986,8 @@ Named gaps the port carries rather than hides, each with its home:
   reading the file's bytes back through the duped descriptor) prints `MPOS_DUP_OK`
   (asserted) - the fd-table primitive behind a shell's `>` redirection and `|` pipes. A
   **struct-stat ABI** check (chmod `0o640`, then `st_mode` reads back `0o640`, the file
-  reports `is_file()` with the right `len()`, and `/dev` reports `is_dir()`) prints
-  `MPOS_STAT_OK` (asserted) - pinning that `write_stat` lays the struct out at the
+  reports `is_file()` with the right `len()`, `st_nlink`/`st_ino`/`st_blocks`/`st_size`
+  read back at the aarch64 offsets, and `/dev` reports `is_dir()`) prints `MPOS_STAT_OK` (asserted) - pinning that `write_stat` lays the struct out at the
   **aarch64 asm-generic offsets**, not x86_64's. This fixed a real ABI bug: the previous
   x86-only offsets put `st_mode` where musl reads `st_nlink`, so every stat-based
   file-type/permission read on aarch64 returned another field's value (a regular file
