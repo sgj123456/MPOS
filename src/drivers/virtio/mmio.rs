@@ -195,6 +195,37 @@ pub fn capacity(virt: usize, size: usize) -> Option<u64> {
     Some(blk.capacity())
 }
 
+/// Write `data` to sector `start`, flush, and read it back over MMIO, returning
+/// `Some(())` only if what comes back equals what went in.
+///
+/// [`read_blocks`] and [`capacity`] prove the read and geometry paths; this proves
+/// the *write* path - the request the device must copy our buffer out of memory,
+/// land it on the image, and answer a flush. Round-tripping the same sector and
+/// comparing is the honest evidence the MMIO write virtqueue moves data to the
+/// device, the way the block read milestone proved the read path. `data` and
+/// `out` must each be a whole number of sectors from the direct map (no bounce).
+pub fn write_readback(virt: usize, size: usize, start: usize, data: &[u8]) -> Option<()> {
+    // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
+    // device window, `size` is the tree-reported register block, and the window
+    // outlives this borrow.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let mut blk = VirtIOBlk::<HalImpl, _>::new(transport).ok()?;
+    blk.write_blocks(start, data).ok()?;
+    blk.flush().ok()?;
+    // A fresh open for the read is the honest read-back: it goes through the
+    // device, not a buffer we still hold.
+    drop(blk);
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let mut blk = VirtIOBlk::<HalImpl, _>::new(transport).ok()?;
+    let mut out = [0u8; SECTOR];
+    if out.len() != data.len() {
+        return None;
+    }
+    blk.read_blocks(start, &mut out).ok()?;
+    (out == data).then_some(())
+}
+
 /// The virtio-rng, reached over MMIO instead of a BAR.
 ///
 /// A request needs the crate's `&mut`, so the device sits behind the usual

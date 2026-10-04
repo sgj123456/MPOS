@@ -5856,8 +5856,12 @@ Named gaps the port carries rather than hides, each with its home:
   returned. It also reads the device's reported capacity and checks it equals the 2048
   sectors of that image, pinning the geometry path (a configuration-space read distinct from
   the data read) so a transport that read a sector but mis-sized the device would fail here.
-  The filesystem mounted over it (the disk root) is the next step; this is the
-  block driver working. **Stage 8's net transport over MMIO - DONE (the net
+  It then **drives the write path**: `mmio::write_readback` hands a distinct
+  pattern to sector 3, flushes, and reads it back through a fresh open, requiring
+  the round trip to match - so `M7_BLK_OK` attests both the read and write virtqueues
+  move data over MMIO (a mismatch reuses `M7_BLK_FAILED`, already a terminator). The
+  filesystem mounted over it (the disk root) is the next step; this is the
+  block driver working, both directions. **Stage 8's net transport over MMIO - DONE (the net
   commit):** `drivers::virtio::mmio::read_mac` opens the tree's net window
   (`DeviceID` 1, `VIRTIO_ID_NET`) as an `MmioTransport` and hands it to the crate's
   `VirtIONet`; xtask attaches a `virtio-net-device` on a user-mode backend and

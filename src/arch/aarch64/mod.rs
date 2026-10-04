@@ -1060,6 +1060,19 @@ fn check_blk(info: &BootInfo) {
         out,
         "virtio-blk over MMIO read a verified sector ({sectors} sectors)"
     );
+    // The write path, not just the read: hand a distinctive sector to the device,
+    // flush, and read it back through a fresh open. A round trip that does not
+    // match means the write virtqueue or flush did not land the buffer - the other
+    // half of the data path `read_blocks` never exercised. Sector 3 is chosen so it
+    // does not disturb the pattern sector 0 the read above already validated.
+    let mut wbuf = [0u8; crate::drivers::virtio::mmio::SECTOR];
+    for (i, b) in wbuf.iter_mut().enumerate() {
+        *b = (i ^ 0xa5) as u8;
+    }
+    if crate::drivers::virtio::mmio::write_readback(virt, size, 3, &wbuf).is_none() {
+        fail!("the virtio-blk MMIO write path did not round-trip a sector");
+    }
+    let _ = writeln!(out, "virtio-blk over MMIO wrote and read back a sector");
     let _ = writeln!(out, "M7_BLK_OK");
 }
 
