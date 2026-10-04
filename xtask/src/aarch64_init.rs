@@ -481,6 +481,17 @@ pub fn build_static_musl_helper(build_dir: &Path) -> Result<Vec<u8>> {
         "        Ok(_) => println!(\"MPOS_DEV_STAT_OK\"),\n",
         "        Err(_) => println!(\"MPOS_DEV_STAT_FAILED\"),\n",
         "    }\n",
+        "    // A real file lifecycle on the mounted root ramfs - create, write,\n",
+        "    // read back, stat, remove - the operations a shell and any init do\n",
+        "    // against the filesystem proper, not just device nodes.\n",
+        "    let probe = \"/mprobe\";\n",
+        "    let msg: &[u8] = b\"mpos-userspace-file-lifecycle\";\n",
+        "    let mut ok = std::fs::write(probe, msg).is_ok();\n",
+        "    if ok { ok = std::fs::read(probe).map(|g| g == msg).unwrap_or(false); }\n",
+        "    if ok { ok = std::fs::metadata(probe).map(|m| m.len() == msg.len() as u64).unwrap_or(false); }\n",
+        "    if ok { ok = std::fs::remove_file(probe).is_ok(); }\n",
+        "    if ok { ok = std::fs::metadata(probe).is_err(); }\n",
+        "    if ok { println!(\"MPOS_FILE_OPS_OK\"); } else { println!(\"MPOS_FILE_OPS_FAILED\"); }\n",
         "}\n",
     );
     let src = build_dir.join("aarch64-musl-helper.rs");

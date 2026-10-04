@@ -5952,8 +5952,12 @@ Named gaps the port carries rather than hides, each with its home:
   `read_exact`s `/dev/urandom` and `open`s (write) `/dev/console` through libc file
   I/O, printing `MPOS_DEV_URANDOM_OK` / `MPOS_DEV_CONSOLE_OK`, and traverses it with
   `read_dir`/`metadata` (getdents64 + fstat), printing `MPOS_DEV_GETDENTS_OK` /
-  `MPOS_DEV_STAT_OK` — all four asserted. That
-  is the same `open`/`read`/`write` a shell issues against the device set - so the
+  `MPOS_DEV_STAT_OK` — all four asserted. It then runs a full **regular-file
+  lifecycle** on the mounted root ramfs (`write` → `read` back → `metadata` →
+  `remove_file` → confirm gone), printing `MPOS_FILE_OPS_OK` (also asserted) — the
+  create/write/read/stat/unlink a shell and any init issue against the filesystem
+  proper, not only against device nodes.
+  This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.
   x86's devfs is byte-for-byte unchanged (host 511, `cargo xtask test` 142/142),

@@ -343,6 +343,16 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_DEV_STAT_OK line is absent (userspace fstat failed)"
         );
     }
+    // A real file lifecycle on the mounted root (create/write/read/stat/unlink) -
+    // the fs operations a shell and init issue against the filesystem proper, not
+    // just device nodes. getdents64/fstat covered traversal; this covers the
+    // write/create/remove path end to end from userspace.
+    if !log.contains("MPOS_FILE_OPS_OK") {
+        bail!(
+            "the aarch64 musl binary could not complete the file lifecycle on the \
+             root: MPOS_FILE_OPS_OK is absent (create/write/read/stat/unlink failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -359,7 +369,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              over the block (the disk root), and a scheduler-run program that demand-paged, \
              read, echoed, execve'd, cloned, waited, then ran a real static-musl ELF at EL0 \
              which opened the mounted /dev through libc file I/O (MPOS_DEV_URANDOM_OK, \
-             MPOS_DEV_CONSOLE_OK) and traversed it (MPOS_DEV_GETDENTS_OK, MPOS_DEV_STAT_OK) - from the ESP under AAVMF"
+             MPOS_DEV_CONSOLE_OK), traversed it (MPOS_DEV_GETDENTS_OK, MPOS_DEV_STAT_OK), \
+             and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) - from the ESP under AAVMF"
         );
         return Ok(());
     }
