@@ -913,7 +913,7 @@ pub unsafe fn reset_live_fpu() {
     unsafe { <Current as FpuTrap>::reset_live_fpu() }
 }
 
-/// Point the CPU's privilege-transition stack at `top`.
+/// Point the CPU's privilege-transition stack at `top`.mpos_fpu_trap
 #[inline]
 pub fn set_kernel_stack(top: usize) {
     <Current as Contexts>::set_kernel_stack(top)

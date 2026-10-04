@@ -38,7 +38,13 @@ use super::{gic, halt, pl011, timer};
 const EC_SVC_FROM_AARCH64: u64 = 0x15;
 /// `ESR_EL1.EC` for a Data Abort taken from a lower exception level (EL0), and an
 /// Instruction (prefetch) Abort from EL0 - the two page faults a running program
-/// takes. `WnR` (bit 7 of a Data Abort's ESR) says which way the access went.
+/// takes. `WnR`, **bit 6** of a Data Abort's ISS, says which way the access went:
+/// 1 is a write. (Bit 7 is RES0 there - AArch64's ESR does not put `WnR` where
+/// AArch32's `DFSR` does, and reading bit 7 answers "read" for every fault this
+/// kernel takes. Measured: the write fault that killed the aarch64 test sweep is
+/// `ESR 0x9200004f` - `DFSC` `0xF`, a level-3 *permission* fault on a page the
+/// tables call `r--u` and `is_cow_page` calls copy-on-write, so the access can
+/// only have been a write, and bit 6 is set while bit 7 is clear.)
 const EC_DATA_ABORT_EL0: u64 = 0x24;
 const EC_INSTR_ABORT_EL0: u64 = 0x20;
 
@@ -342,7 +348,11 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
         if crate::sched::started() {
             let addr = system_register("far") as usize;
             let is_write = match class {
-                EC_DATA_ABORT_EL0 => (esr >> 7) & 1 != 0,
+                // `WnR` is bit 6 of the Data Abort ISS. Reading bit 7 made every
+                // fault look like a read, which meant `resolve_cow_fault` was
+                // never reached: a `fork`/`clone` child's first write to a page
+                // it shares went to SIGSEGV instead of being split.
+                EC_DATA_ABORT_EL0 => (esr >> 6) & 1 != 0,
                 EC_INSTR_ABORT_EL0 => false,
                 _ => false,
             };
@@ -357,8 +367,15 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
                     return 0; // The stack grew over the faulting address.
                 }
             }
-            // Not resolvable: an unhandled SIGSEGV is the task's death.
-            crate::println!("user fault at {addr:#x} (ESR {esr:#x}, pc {:#x})", frame.pc);
+            // Not resolvable: an unhandled SIGSEGV is the task's death. `sp` is
+            // printed because a fault 16 bytes below it is a stack push and one
+            // far from it is a wild pointer, and telling those apart from the
+            // address alone is guesswork.
+            crate::println!(
+                "user fault at {addr:#x} (ESR {esr:#x}, pc {:#x}, sp {:#x})",
+                frame.pc,
+                frame.sp
+            );
             crate::sched::exit(-11);
             // `exit` reschedules and does not return; the `return 0` below only
             // keeps the type checker happy if it ever did (retrying would refault).
