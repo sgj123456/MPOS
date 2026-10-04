@@ -6076,12 +6076,29 @@ Named gaps the port carries rather than hides, each with its home:
   on `CLONE_VFORK` until the child execs/exits), which x86 does exercise (its std forks, not
   vforks) and so the aarch64 gap is invisible there.
 
-  Implementing it was **not** attempted here: it is shared fork/clone/scheduler work under
-  the x86 `cargo xtask test` 142-test gate, needs careful `CLONE_VM`-share + `VFORK`
-  suspend/resume + a child that detaches on `execve`, and a partial or guessed version would
-  either corrupt `fork` isolation or fake success. This is the named remaining blocker for
-  running a *subcommand* (a shell's core) from `cargo xtask run --arch aarch64`, and is
-  orthogonal to the static-busybox prerequisite above.
+  Concrete implementation route (worked out, not yet executed): reuse the thread
+  sharing mechanism rather than invent one - give the vfork child `space: None` and an
+  `mm` whose `leader()` is the parent, so `space_owner` (runtime.rs:2134) resolves its
+  address-space access to the parent's tables, and the parent alone owns/frees that space
+  (no double-free when the child exits, since `Task.space` is `None`). Give the child its
+  own `tgid`/pid so it stays a separate, `waitpid`-collectable process. This alone is NOT
+  sufficient and NOT safe: with `CLONE_VFORK` the parent must be *suspended* until the
+  child `execve`s or exits (otherwise both mutate the shared stack - the isolation break
+  that makes a half-fix worse than the gap), which needs the scheduler to not `push_ready`
+  the parent and a wake-parent hook in the child's `execve` and `exit`. On `execve` the
+  child must detach: `execve` already builds a fresh address space for a process exec, so
+  the child's `mm.leader` must be repointed to the child at that point (a thread never
+  execs, so today's exec path may not exercise this case - it must be verified, not
+  assumed). The gate is: a `MPOS_SPAWN_OK`-style proof from the running musl helper
+  (std::process spawn returns), plus `cargo xtask test` 142 (x86 untouched - it forks, not
+  vforks) and `boot-aarch64` green through `INIT_EXITED`. It was not attempted here only
+  because that cross-subsystem work cannot be completed *and* shown correct on both gates
+  within the budget, and a partially-correct version would break `fork` isolation or
+  double-free a shared space.
+
+  This is the named remaining blocker for running a *subcommand* (a shell's core) from
+  `cargo xtask run --arch aarch64`, and is orthogonal to the static-busybox prerequisite
+  above.
 
   Reading further confirms the COW path is not the bug: `resolve_cow`'s split leaf
   (`VALID | TABLE | attributes(flags)`, `paging.rs`) is byte-for-byte the same encoding
