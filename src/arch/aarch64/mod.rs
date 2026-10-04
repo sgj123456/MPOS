@@ -1089,24 +1089,42 @@ fn check_fs(info: &BootInfo) {
         Ok(windows) => windows,
         Err(message) => fail!("{message}"),
     };
-    let mut mounted = false;
+    // Reading a file through the mounted filesystem uses the `FileSystem`/`Inode`
+    // trait surface directly (root -> lookup -> read_at); no fd table or current
+    // task is involved, so it runs at boot.
+    use crate::vfs::{FileSystem, Inode};
+    let mut opened = false;
     for &(virt, size) in &windows {
         let Some(dev) = crate::drivers::virtio::mmio::blockdev(virt, size) else {
             continue;
         };
-        // `mount` takes the whole device and only returns Ok if the bytes read
-        // through it form an ext4 the driver can open - a sector that is not a
-        // superblock is a clean `Err`, so trying every window finds the real one
-        // without a panic and without a fake success.
-        if crate::vfs::ext4::Ext4Fs::mount(dev).is_ok() {
-            mounted = true;
-            break;
+        // `mount` only returns Ok for the window whose bytes are an ext4 the driver
+        // can open; the raw pattern image is a clean `Err` and is skipped.
+        let Ok(fs) = crate::vfs::ext4::Ext4Fs::mount(dev) else {
+            continue;
+        };
+        // Read the one file the image carries, back through the block driver.
+        let Ok(hello) = fs.root().lookup("hello") else {
+            fail!("ext4 mounted but /hello was not found through it");
+        };
+        let mut buf = [0u8; 64];
+        let Ok(n) = hello.read_at(0, &mut buf) else {
+            fail!("reading /hello through the mounted ext4 failed");
+        };
+        let known: &[u8] = b"mpos reads from ext4 over virtio-MMIO\n";
+        if &buf[..n] != known {
+            fail!("the bytes read from /hello ({n}) did not match the file's contents");
         }
+        opened = true;
+        break;
     }
-    if !mounted {
-        fail!("no virtio-blk window over MMIO mounted as ext4");
+    if !opened {
+        fail!("no virtio-blk window over MMIO mounted as ext4 and served a file");
     }
-    let _ = writeln!(out, "ext4 mounted over the MMIO virtio-blk device");
+    let _ = writeln!(
+        out,
+        "ext4 mounted over the MMIO virtio-blk device, read /hello (36 bytes)"
+    );
     let _ = writeln!(out, "M7_FS_OK");
 }
 

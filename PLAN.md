@@ -5873,11 +5873,17 @@ Named gaps the port carries rather than hides, each with its home:
   `^has_journal,^metadata_csum` - the same two features the driver refuses on the
   x86_64 root - making e2fsprogs a `boot-aarch64` prereq. The two block devices are
   told apart by content (a pattern sector vs a mounting filesystem), not QEMU's slot
-  order. What remains is reading a file through that mount and pivoting to it as the
-  root, `/dev/hwrng` over the aarch64 devfs, GIC line routing to turn the polled
-  `Console` into `SerialRing`, the smoltcp stack over the MMIO net device and its
-  socket syscalls, and then the aarch64 `ash` rootfs and `cargo xtask test --arch
-  aarch64`.
+  order. `check_fs` then reads the image's `/hello` through the mount (root ->
+  lookup -> read_at on the `FileSystem`/`Inode` traits - no fd table or task needed
+  at boot) and asserts its bytes, so `M7_FS_OK` covers the full block-driver ->
+  ext4 -> file path, not just a mount. What remains is pivoting to that filesystem
+  as the root, `/dev/hwrng` over the aarch64 devfs, GIC line routing to turn the
+  polled `Console` into `SerialRing`, the smoltcp stack over the MMIO net device and
+  its socket syscalls, and then the aarch64 `ash` rootfs and `cargo xtask test
+  --arch aarch64`. (Debt to name: this boot-time mount reaches from the machine
+  layer into `crate::vfs`; `depgraph` does not flag it - there is no `vfs -> arch`
+  back-edge, so no new mutual pair - but the disk-root check is a candidate to move
+  to the `main` wiring layer, where the initramfs root is already mounted.)
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the
