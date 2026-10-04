@@ -7314,6 +7314,32 @@ pub struct CloneRequest {
     pub tls: usize,
 }
 
+/// The thread-local storage base the **task on this CPU** is running with.
+///
+/// This is not `Task::tls`. That record is written when a task is dispatched and
+/// read back out of the register when it leaves, because a program can move its
+/// own base with no system call for this kernel to see: aarch64's musl installs
+/// its TLS with a direct `msr tpidr_el0`. Between those two points the record is
+/// stale - and a `fork`/`clone` child inherits the base its parent is *running*
+/// with, not the last one this kernel wrote down: Linux's `copy_thread` hands the
+/// child the parent's live `tp_value` when `CLONE_SETTLS` is absent, and this is
+/// that value. Measured, on the aarch64 sweep's first spawn: a child built from
+/// the stale record (the parent had set its own base after its last dispatch, so
+/// the record still said 0) ran with `TPIDR_EL0 = 0` and faulted writing musl's
+/// `errno` at `0xffffffffffffff5c` (NULL minus 164).
+///
+/// Only ever call this for `current()`. The register belongs to the CPU, not to
+/// `task`: naming any other task here would hand back the running one's base
+/// under a name it does not belong to. A kernel task has no base of its own, so
+/// there the record - zero - is the truth about it.
+fn running_tls(task: &Task) -> usize {
+    if task.space.is_some() || task.mm.root() != 0 {
+        hal::thread_pointer()
+    } else {
+        task.tls
+    }
+}
+
 /// Create a process that is a copy of the calling one, resuming from the very
 /// call that made it.
 ///
@@ -7364,7 +7390,8 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         let parent_brk_base = parent.brk_base;
         let parent_brk_pages = parent.brk_pages;
         let parent_mmap_cursor = parent.mmap_cursor;
-        let parent_tls = parent.tls;
+        // The parent's *live* base, not its record: see `running_tls`.
+        let parent_tls = running_tls(parent);
 
         // Collect the parent's user page mappings. We need to do this while
         // holding the borrow, then release it before calling into AddressSpace.
@@ -8092,7 +8119,8 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let stack_top = parent.stack_top;
         let exe = parent.exe.clone();
         let argv = alloc::sync::Arc::clone(&parent.argv);
-        let parent_tls = parent.tls;
+        // The creator's *live* base, not its record: see `running_tls`.
+        let parent_tls = running_tls(parent);
 
         let slot = t.alloc_slot();
         drop_retired(TaskId(slot));
