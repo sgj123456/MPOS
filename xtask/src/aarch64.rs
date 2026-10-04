@@ -382,6 +382,17 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              unlink or rmdir failed)"
         );
     }
+    // rename + hard link - RENAMEAT/LINKAT, the `mv`/`ln` pair. The marker only
+    // prints if rename moved the body to the new name (and dropped the old) and
+    // a hard link kept the bytes reachable through the second name after the
+    // first was removed - so it pins that linkat shares a node, not that it
+    // copies one.
+    if !log.contains("MPOS_RENAME_LINK_OK") {
+        bail!(
+            "the aarch64 musl binary could not round-trip rename/hard link: the \
+             MPOS_RENAME_LINK_OK line is absent (renameat, linkat or unlink failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -401,7 +412,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_DEV_CONSOLE_OK), traversed it (MPOS_DEV_GETDENTS_OK, MPOS_DEV_STAT_OK), \
              and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) and \
              round-tripped getcwd/chdir (MPOS_CWD_OK) and symlink/readlink \
-             (MPOS_SYMLINK_OK) and mkdir/a nested file/rmdir (MPOS_MKDIR_OK) - \
+             (MPOS_SYMLINK_OK) and mkdir/a nested file/rmdir (MPOS_MKDIR_OK) and \
+             rename/hard link (MPOS_RENAME_LINK_OK) - \
              from the ESP under AAVMF"
         );
         return Ok(());

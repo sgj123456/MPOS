@@ -5968,7 +5968,12 @@ Named gaps the port carries rather than hides, each with its home:
   inside it, remove the file, remove the directory, confirm it is gone) prints
   `MPOS_MKDIR_OK` (asserted) - the MKDIRAT/UNLINKAT(+AT_REMOVEDIR) directory half an
   init uses to set up `/tmp`, `/var`, and the empty-directory gate (rmdir refusing a
-  full one) held on this machine.
+  full one) held on this machine. A `rename`/`hard_link` round-trip (write `/mrn_a`,
+  rename to `/mrn_b`, confirm the old name is gone and the body moved; hard-link
+  `/mrn_c` to `/mrn_b`, then remove `/mrn_b` and confirm the bytes still read through
+  `/mrn_c`) prints `MPOS_RENAME_LINK_OK` (asserted) - the RENAMEAT/LINKAT `mv`/`ln`
+  pair, and the surviving read after the first name's unlink is the counterfactual that
+  proves linkat shared one node rather than copying one (which is what rename does).
   This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.
