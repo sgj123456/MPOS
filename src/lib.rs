@@ -112,7 +112,16 @@ pub use mpos_cred as cred;
 /// The civil calendar: day counts to dates and back. Its own pure leaf crate;
 /// the `arch` half that writes it to hardware stays behind the target gate.
 pub use mpos_date as date;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// Device drivers. The module is compiled for both machines now, but almost
+/// every submodule is x86_64's (port I/O, `uart_16550`, PCI, AHCI, DRM): they
+/// carry their own `#[cfg(target_arch = "x86_64")]` gates inside
+/// `src/drivers/mod.rs`, so on aarch64 only the machine-neutral virtio `Hal`
+/// and the new MMIO transport compile. This is `PLAN.md` §9.1's drivers-stage
+/// prep - the same shape stage 6A used for `syscall`.
+#[cfg(all(
+    target_os = "none",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub mod drivers;
 /// The errno table: the numbers every layer answers "no" with. Its own leaf
 /// crate, re-exported here so `crate::err` keeps resolving for every caller,

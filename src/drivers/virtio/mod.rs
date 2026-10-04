@@ -15,17 +15,34 @@
 //! step every driver starts with, so the only part that differs between
 //! them is the ID the device answers.
 
+//! Every driver here except `hal` reaches its device over PCI today, so the
+//! PCI-only ones are x86_64's. `hal` is the machine-neutral `Hal` impl the
+//! aarch64 MMIO transport builds on (`PLAN.md` §9.1); the aarch64 `rng`/`blk`/
+//! `net` over MMIO come as the drivers stage proceeds, so `rng` is gated to
+//! x86_64 until its MMIO path exists.
+
+#[cfg(target_arch = "x86_64")]
 pub mod blk;
+#[cfg(target_arch = "x86_64")]
 pub mod console;
+#[cfg(target_arch = "x86_64")]
 pub mod fs9p;
+#[cfg(target_arch = "x86_64")]
 pub mod gpu;
+#[cfg(target_arch = "x86_64")]
 pub mod gpu_ctrl;
 pub mod hal;
+#[cfg(target_arch = "x86_64")]
 pub mod input;
+#[cfg(target_arch = "x86_64")]
 pub mod msix;
+#[cfg(target_arch = "x86_64")]
 pub mod net;
+#[cfg(target_arch = "x86_64")]
 pub mod rng;
+#[cfg(target_arch = "x86_64")]
 pub mod sound;
+#[cfg(target_arch = "x86_64")]
 pub mod vsock;
 
 /// The name a virtio function's driver has in `/sys`, and the one `lspci -k`
@@ -45,6 +62,7 @@ pub const PCI_DRIVER: &str = "virtio-pci";
 /// once a tick - the same arrangement the network stack's service task
 /// keeps with its interface - because a reader blocked on either is
 /// waiting on a device nobody else is going to ask.
+#[cfg(target_arch = "x86_64")]
 pub fn spawn_service() {
     // Permanent: a listener parked in `accept` and a reader waiting on an
     // input event both depend on this task for as long as the machine runs.

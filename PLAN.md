@@ -5816,7 +5816,14 @@ Named gaps the port carries rather than hides, each with its home:
   adds no mutual pair and moves no depgraph constant; it is the sanctioned route, not a new
   one. Pin: x86 `PciTransport` calls `mmio_phys_to_virt` at bring-up, so a wrong x86 body
   fails `cargo xtask test` (every virtio device); the aarch64 body is the same
-  `device_virt` `M5_VIRTIO` already reads the transports through. What remains is the MMIO
+  `device_virt` `M5_VIRTIO` already reads the transports through. **The `drivers` gate is
+  now flipped to include aarch64 (the prep commit, landed):** every x86_64-only submodule -
+  AHCI, DRM, PCI, serial, input, video, devices, qemu, rtc and the PCI virtio drivers - is
+  `#[cfg(target_arch = "x86_64")]`-gated out there, the PCI half of `virtio::hal` moved
+  behind a gated `mod pci_transport` (re-exported so the x86 callers' paths are unchanged),
+  and `drivers::virtio::spawn_service` is gated too - so `crate::drivers` now compiles on
+  both machines and on aarch64 only the machine-neutral `virtio::hal` is live, with no
+  device driven there yet. What remains is the MMIO
   *transport* over the FDT's `virtio,mmio` windows and the simplest device driven to a boot
   marker (the next drivers commit), then `blk`/`rng`/`net` and GIC `SerialRing`.
 
