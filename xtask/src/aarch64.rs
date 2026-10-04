@@ -326,6 +326,23 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_DEV_CONSOLE_OK line is absent (userspace open/write of the mounted /dev failed)"
         );
     }
+    // Directory traversal and metadata from userspace over the mounted /dev:
+    // `readdir` (getdents64) lists the device nodes and `metadata` (fstat) reads a
+    // node's stat - the operations `ls /dev` and `test -e /dev/...` issue. Both
+    // must round-trip through libc to the mount table; a missing line means the
+    // userspace fs-metadata path is broken.
+    if !log.contains("MPOS_DEV_GETDENTS_OK") {
+        bail!(
+            "the aarch64 musl binary could not list /dev: the \
+             MPOS_DEV_GETDENTS_OK line is absent (userspace getdents64 failed)"
+        );
+    }
+    if !log.contains("MPOS_DEV_STAT_OK") {
+        bail!(
+            "the aarch64 musl binary could not stat /dev/urandom: the \
+             MPOS_DEV_STAT_OK line is absent (userspace fstat failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -342,7 +359,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              over the block (the disk root), and a scheduler-run program that demand-paged, \
              read, echoed, execve'd, cloned, waited, then ran a real static-musl ELF at EL0 \
              which opened the mounted /dev through libc file I/O (MPOS_DEV_URANDOM_OK, \
-             MPOS_DEV_CONSOLE_OK) - from the ESP under AAVMF"
+             MPOS_DEV_CONSOLE_OK) and traversed it (MPOS_DEV_GETDENTS_OK, MPOS_DEV_STAT_OK) - from the ESP under AAVMF"
         );
         return Ok(());
     }

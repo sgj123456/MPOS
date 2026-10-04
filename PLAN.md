@@ -5950,7 +5950,9 @@ Named gaps the port carries rather than hides, each with its home:
   `/dev` is then reached by *userspace*, not just the kernel: the `/musl`
   static-musl ELF that `boot-aarch64` already runs at EL0 now `open`s and
   `read_exact`s `/dev/urandom` and `open`s (write) `/dev/console` through libc file
-  I/O, printing `MPOS_DEV_URANDOM_OK` / `MPOS_DEV_CONSOLE_OK`, both asserted. That
+  I/O, printing `MPOS_DEV_URANDOM_OK` / `MPOS_DEV_CONSOLE_OK`, and traverses it with
+  `read_dir`/`metadata` (getdents64 + fstat), printing `MPOS_DEV_GETDENTS_OK` /
+  `MPOS_DEV_STAT_OK` — all four asserted. That
   is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.
