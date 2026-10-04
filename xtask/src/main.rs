@@ -114,6 +114,26 @@ impl Commands {
     }
 }
 
+/// Which machine `test` runs the user-test sweep on.
+///
+/// The sweep is x86_64's today: it builds the musl and bare-metal user programs
+/// for x86_64 and boots them in QEMU on x86_64's wiring. `--arch aarch64` must
+/// be refused here rather than falling through to it - a sweep that prints a
+/// verdict for a machine it never booted is exactly the silent wrong-run
+/// `AGENTS.md` §3 says this must not have. When the second machine's sweep lands
+/// (`PLAN.md` §13.5) this is the function that grows the second arm.
+fn test_sweep_machine(arch: &str) -> Result<()> {
+    if arch == "x86_64" {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "test --arch {arch}: the user-test sweep is x86_64's today, and there is \
+         no {arch} sweep yet - so nothing here booted {arch}, and a verdict for \
+         a machine this never booted is the one failure it must not have \
+         (PLAN.md §13.5)"
+    )
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let build_dir = utils::resolve_build_dir(cli.build_dir.as_deref())?;
@@ -254,6 +274,7 @@ fn main() -> Result<()> {
 
     let result = dispatch(
         cli.command,
+        &cli.arch,
         &build_dir,
         &profile,
         artefacts_ready,
@@ -324,6 +345,7 @@ fn needs_kernel(command: Commands, run_needs_build: bool) -> bool {
 
 fn dispatch(
     command: Commands,
+    arch: &str,
     build_dir: &Path,
     profile: &str,
     artefacts_ready: bool,
@@ -351,7 +373,10 @@ fn dispatch(
             rootfs::ensure(build_dir, profile)
         }
         Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build, mode),
-        Commands::Test => selftest::run_tests(build_dir, profile, tests),
+        Commands::Test => {
+            test_sweep_machine(arch)?;
+            selftest::run_tests(build_dir, profile, tests)
+        }
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
         // Builds both binaries itself rather than through `build_kernel`: that
         // one is the x86_64 kernel and the x86_64 loader, and this machine's
@@ -450,4 +475,26 @@ fn escalate(
 
     let err = sudo.exec();
     anyhow::bail!("Failed to re-exec under sudo: {err}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_sweep_machine;
+
+    /// The counterfactual for the silent wrong-run: `--arch aarch64` used to
+    /// reach `selftest::run_tests` unchanged and print an x86_64 verdict under an
+    /// aarch64 banner. It must refuse instead, and the refusal must name the
+    /// machine it refused.
+    #[test]
+    fn the_sweep_refuses_a_machine_it_does_not_boot() {
+        assert!(test_sweep_machine("x86_64").is_ok());
+        let refusal = test_sweep_machine("aarch64")
+            .expect_err("aarch64 has no sweep yet, so it must be refused")
+            .to_string();
+        assert!(
+            refusal.contains("aarch64") && refusal.contains("x86_64"),
+            "the refusal must name both the machine asked for and the one the \
+             sweep actually boots: {refusal}"
+        );
+    }
 }

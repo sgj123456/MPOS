@@ -708,8 +708,13 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         `main/aarch64.rs` opening the MMIO NIC and a transmit/receive round trip — because
         `syscall`'s socket legs are still behind `mpos_net`, so an open gate alone compiles `net`
         with no caller and ~40 `never used` warnings
-  - [ ] 13.5 `cargo xtask test --arch aarch64` boots the second machine; an unsupported
-        `--arch` errors rather than silently running the other one
+  - [~] 13.5 `cargo xtask test --arch aarch64`: the **silent wrong-run is closed** —
+        `test --arch aarch64` refuses explicitly (`test_sweep_machine`, pinned by an
+        `mpos-xtask` unit test) instead of falling through to the x86_64 sweep and reporting a
+        verdict for a machine it never booted. Next: the aarch64 sweep itself — build the user
+        programs for aarch64, pack them with a generated `/init` that runs `/bin/t-*`, boot
+        under AAVMF and parse the same `=== RUN/PASS/FAIL/SUMMARY`/`END`; a group that cannot
+        run on aarch64 yet is named in `tests.toml` with its reason, never silently skipped
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
@@ -8305,7 +8310,7 @@ and green alone — AGENTS §4 rule 7):
 | 13.2 | The callers stop spelling the architecture: `console.rs`, `sched/runtime.rs`, `logging.rs`, `rand.rs`, `mm/{elf,heap}.rs` and the `syscall/**` gates express the machine difference through `hal`/capability flags or the ABI layer instead of `target_arch`. The per-arch register/struct ABI facts (`user_regs_struct`, `struct stat`, the signal frame) move to their `arch/<arch>/` home — the §11.4 boundary, kept, not erased | host tests + full QEMU gate (trap/fault/context paths) | *in progress* — landed `console.rs` (10), `uevent.rs` (4), `mm/mod.rs` (4), the `sched` FPU-trap protocol (8), `syscall`'s socket legs (22) and `rand.rs` (2, via a new baseline `hal::Entropy`), on `mpos_framebuffer_console`/`mpos_serial_ring`, `mpos_net`, `mpos_dynamic_mmio_window` and `mpos_fpu_trap`; 169 sites remain outside `src/arch/` |
 | 13.3 | aarch64 disk root: the MMIO virtio-blk already read/write-verified (`M7_BLK_OK`) and the ext4 it mounts (`M7_FS_OK`) become the machine's root; `xtask` assembles the aarch64 disk from `rootfs.toml`'s geometry and the `rootfs/` tree | a boot marker that a rootfs *file* was read, not merely that an ext4 mounted | **landed** — the ext4 is registered as `vda`; `xtask` lays the `rootfs/` overlay and the init images on it; the machine pivots its root onto the disk (`/` = ext4, ramfs at `/oldroot`), re-mounts `/dev` and runs the disk's `/init` as pid 1 (`M7_DISK_OK`, `M7_ROOT_OK`), with the init's file lifecycle now running on ext4 |
 | 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *blocked on a seam, measured* — flipping `net`'s gate cost **24** errors: 16 were only the missing `smoltcp` dependency (now declared in `Cargo.toml`'s aarch64 block), and the remaining 8 are `drivers::virtio::net` (the PCI NIC), `drivers::virtio::vsock` and the four `/proc/net` rows net hands `vfs::procfs`. The vsock family is the blocker, not the work: it is referenced from **~50** sites across `net/socket.rs`'s dispatcher, so a per-site cfg would thread the machine through every socket handler *and* owe each one an aarch64 refusal. **The seam is landed**: `drivers::virtio` carries the transport-neutral contracts `NetDevice`/`VsockDevice`, `net` and `net::vsock` hold the machine's adapter and device as `Arc<dyn …>` and name no transport (the socket dispatcher reaches vsock through `net::vsock` exactly as before), `VSOCK_PER_CONNECTION_BUFFER` moved beside the contract, and the `/proc/net` collector took `procfs`'s own gate rather than a new capability. With the gate opened by hand, `cargo clippy --target aarch64-unknown-none` is **0 errors** (was 8); the flip waits for the live path, because with `syscall`'s socket legs still behind `mpos_net` an open gate would compile `net` with no caller (~40 `never used` warnings). Next: the flip together with the MMIO NIC wired into `main/aarch64.rs` and a transmit/receive round trip |
-| 13.5 | `cargo xtask test --arch aarch64`: the sweep boots the second machine and reads its own `=== RUN/PASS/FAIL/SUMMARY`/`END` and `M*_OK` chain with x86's verdict (summary + QEMU exit). An unsupported `--arch` is an explicit error, never a silent run of the other machine | `cargo xtask test --arch aarch64` prints a green summary; x86 unchanged; `xtask` unit tests green | *planned* |
+| 13.5 | `cargo xtask test --arch aarch64`: the sweep boots the second machine and reads its own `=== RUN/PASS/FAIL/SUMMARY`/`END` and `M*_OK` chain with x86's verdict (summary + QEMU exit). An unsupported `--arch` is an explicit error, never a silent run of the other machine | `cargo xtask test --arch aarch64` prints a green summary; x86 unchanged; `xtask` unit tests green | *in progress* — the silent wrong-run is closed: `test --arch aarch64` now refuses in `test_sweep_machine` (pinned by an `mpos-xtask` unit test) instead of falling through to `selftest::run_tests` and printing an x86_64 verdict under an aarch64 banner. The aarch64 sweep itself — the user programs built for aarch64, packed with a generated `/init` that runs `/bin/t-*`, booted under AAVMF and parsed by the same `=== RUN/PASS/FAIL/SUMMARY`/`END` reader — is the next cut |
 
 **What the remaining 169 are, and why the count stops being the metric** (measured
 2026-10-04, after §13.1 and the six §13.2 slices; per-file totals: `syscall` 82, `drivers`
@@ -8328,8 +8333,8 @@ shared file, not that a register frame becomes neutral.
 
 **Where this lands**: status in §9.1 (parity) and §11.4 (purity); `ARCHITECTURE.md` §2/§3 in the
 same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1 and 13.3 have
-landed**, 13.2 is in progress, and 13.4's device seam has landed with its flip pending; 13.5 is
-still a plan. The board's `9.1` line above is
+landed**, 13.2 is in progress, and 13.4's device seam has landed with its flip pending; 13.5's
+silent wrong-run is closed with its aarch64 sweep still to be written. The board's `9.1` line above is
 stale where it says "stages 3-8 remain" — §9.1's own status list is the truth.
 
 ---
