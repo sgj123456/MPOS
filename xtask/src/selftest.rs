@@ -66,9 +66,10 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Resul
     // defined, and a name in the file that no program answers to. Both would
     // otherwise show up only as a smaller number in a summary line.
     let config = crate::config::TestConfig::load(&utils::project_root()?.join("tests.toml"))?;
+    let machine = crate::config::Machine::X86_64;
     let unknown = config.unknown(&selection.groups);
     if !unknown.is_empty() {
-        let known = config.group_names();
+        let known = config.group_names(machine);
         bail!(
             "unknown test group(s) {}; tests.toml defines {}",
             unknown.join(", "),
@@ -91,12 +92,12 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Resul
     let selected = config.selection(&selection.groups, selection.all);
     let tests: Vec<UserTest> = built
         .iter()
-        .filter(|test| config.runs(&test.name, &selected))
+        .filter(|test| config.runs(&test.name, &selected, machine))
         .cloned()
         .collect();
     let skipped: Vec<&UserTest> = built
         .iter()
-        .filter(|test| !config.runs(&test.name, &selected))
+        .filter(|test| !config.runs(&test.name, &selected, machine))
         .collect();
     println!(
         "user tests: {} staged, {} left out by tests.toml",
@@ -106,10 +107,10 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Resul
     // Printed group by group rather than as a list of names, because the reason
     // is the group: a reader has to be able to see at a glance whether the tests
     // this run left out are the ones it meant to.
-    for group in config.group_names() {
+    for group in config.group_names(machine) {
         let left: Vec<&str> = skipped
             .iter()
-            .filter(|test| config.groups_of(&test.name).contains(&group))
+            .filter(|test| config.groups_of(&test.name, machine).contains(&group))
             .map(|test| test.name.as_str())
             .collect();
         if !left.is_empty() {

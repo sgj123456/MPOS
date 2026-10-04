@@ -445,11 +445,66 @@ pub fn write_initramfs_entries(
 /// The tests land on an ext4 the harness builds with `mkfs.ext4 -d`, which keeps
 /// the mode the staging step wrote, so the runner makes each program executable
 /// before it runs it rather than depending on that step to.
+///
+/// It also does the part of the x86 `/init` that is not about running tests at
+/// all: the machine setup. `/tmp` is made, because two of the programs build a
+/// scratch tree there, and the runner's `set_up_machine` says why a directory is
+/// the honest version of the tmpfs the x86 harness mounts. A `=== SETUP_FAIL`
+/// line is the one thing the harness refuses to read past.
 pub fn build_sweep_init(build_dir: &Path) -> Result<Vec<u8>> {
     const SRC: &str = r#"use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+
+/// The machine the x86_64 sweep's `/init` sets up with busybox, done again here,
+/// where there is no shell to do it.
+///
+/// `/tmp` is the one thing this payload needs that the machine does not already
+/// have: t-rename and t-rmdir build their scratch tree under it, and without it
+/// both answer ENOENT before reaching anything they are about. The x86 harness
+/// *mounts a tmpfs* there; this machine has no busybox, and its root is the
+/// writable disk rootfs, so an ordinary directory is the honest version of the
+/// same thing - the subject of both tests (a name can be made, entered, listed
+/// and removed) cannot tell a directory on the disk from one on a tmpfs.
+///
+/// A setup failure prints `=== SETUP_FAIL` rather than being left to surface as
+/// the tests' own failures: a machine that was not set up is not evidence about
+/// the kernel, and a verdict that read those ENOENTs as the tests' would be
+/// blaming them for the harness. The reader refuses to report anything else when
+/// the line is there. Nothing is mounted and no interface is brought up: this
+/// payload reaches neither /proc, /sys nor the network, and the tests a live
+/// interface is for - the socket ones - are left out on this machine until its
+/// socket ABI lands, named in tests.toml.
+fn set_up_machine() {
+    match std::fs::create_dir("/tmp") {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => println!("=== SETUP_FAIL /tmp: {e}"),
+    }
+}
+
+/// The command line the x86_64 sweep's shell hands a program.
+///
+/// The harness has exactly one per-test special case and it is copied here,
+/// because argv *is* what that test is about: t-stdargs pins that std reads back
+/// `t-stdargs one two three`, and the first word is load-bearing - a path there
+/// ("/t-stdargs", which is what a plain `Command::new("/t-stdargs")` hands over)
+/// is a different argv[0]. The x86 harness gets the bare word from a PATH
+/// lookup, so it runs `(cd /bin && PATH=/bin t-stdargs one two three)`; there is
+/// no shell here to look anything up, so the runner says the same thing
+/// directly. Every other program takes no arguments - the x86 harness runs them
+/// as they are.
+fn command(path: &str, name: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(path);
+    if name == "t-stdargs" {
+        cmd.arg0("t-stdargs");
+        cmd.args(["one", "two", "three"]);
+    }
+    cmd
+}
 
 fn main() {
     let dir = "/";
+    set_up_machine();
     let mut names: Vec<String> = Vec::new();
     match std::fs::read_dir(dir) {
         Ok(rd) => {
@@ -473,7 +528,7 @@ fn main() {
             let _ = std::fs::set_permissions(&path, perms);
         }
         println!("=== RUN {name}");
-        match std::process::Command::new(&path).status() {
+        match command(&path, name).status() {
             Ok(status) if status.success() => {
                 println!("=== PASS {name}");
                 pass += 1;

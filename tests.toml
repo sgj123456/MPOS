@@ -17,6 +17,12 @@
 # than the caller asked for is the one failure this must not have. A test may
 # appear in more than one group, and then runs when any of them is asked for.
 #
+# One group is different in kind from the rest: a group **named after a machine**
+# is that machine's list of what it cannot serve yet. Only that machine's sweep
+# sees it, so its members are ungrouped - and in a plain sweep - everywhere else.
+# An exclusion written that way can never take a test out of the other machine's
+# gate. See `aarch64` at the bottom.
+#
 # The parser is the small one `rootfs.toml` uses: `key = value`, one array per
 # key (which may be written across several lines), and section headers are for
 # the reader. Group order in the output follows the name, not the line.
@@ -58,3 +64,38 @@ slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-pipecost"]
 # and prints what it observes about where the shell stopped; it is here to be
 # run by hand when a shell problem needs looking at.
 diagnostic = ["t-sh"]
+
+# The second machine's own list: what aarch64 cannot serve yet. A group named
+# after a machine is invisible to the other machine's sweep, so every name here
+# still runs in x86_64's default sweep exactly as it did before - what this group
+# changes is the aarch64 arm, which leaves these out and prints them by name
+# rather than reporting them as failures or skipping them silently. The way to
+# shrink this group is to make the call work, not to edit a list of things nobody
+# runs (`PLAN.md` §13.4/§13.5).
+#
+#   t-socket, t-socketpair,   the socket family. aarch64's syscall table answers
+#   t-sockmsg, t-sockopt,     `socket`/`socketpair` with ENOSYS (measured: syscall
+#   t-tcp, t-tcp-listen,      198 -> ENOSYS, 199 -> ENOSYS), so each of these
+#   t-unix-rustix             stops at its first call and never reaches what it
+#                             is about. The live path (a NIC on this machine's
+#                             MMIO transport, and the socket legs that would use
+#                             it) is §13.4's device-seam flip.
+#   t-udp                     a datagram socket, same missing call. Also in
+#                             `external`: on x86_64 it is left out because it
+#                             sends a DNS query to the host, on aarch64 because
+#                             it cannot open the socket at all. Two groups,
+#                             because two different things stop it.
+#   t-stdresolve              a resolver is a datagram socket and a `sendto`, so
+#                             it fails for the same reason - measured in every
+#                             one of its 20 lookups (`Function not implemented`).
+#                             Also in `external` for the x86_64 reason.
+#   t-stdspawn                its subject is *other programs*: it runs
+#                             /bin/true, /bin/echo, /bin/cat, /bin/false and
+#                             /bin/sh -c. The x86_64 harness has those because its
+#                             test root is an initramfs with busybox in /bin; the
+#                             second machine's root is the ext4 disk rootfs and
+#                             has no /bin at all. A gap in the harness, not in
+#                             the kernel's spawn path - which every program in
+#                             this payload exercises, since the runner starts
+#                             each of them through posix_spawn (clone + execve).
+aarch64 = ["t-socket", "t-socketpair", "t-sockmsg", "t-sockopt", "t-stdresolve", "t-stdspawn", "t-tcp", "t-tcp-listen", "t-udp", "t-udp-loopback", "t-unix-rustix"]

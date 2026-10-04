@@ -534,11 +534,65 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
 /// `M7_DISK_OK`/`M7_ROOT_OK` and the rest print before `/init` does - but the
 /// verdict here is the user programs', not the marker chain's: those are
 /// `boot-aarch64`'s own instrument. `=== END` is what ends the poll.
+///
+/// Which programs *are* the payload is `tests.toml`'s answer, read for this
+/// machine (`Machine::Aarch64`): the file's `aarch64` group is this machine's own
+/// list of what it cannot serve yet, and it is the only thing that can leave a
+/// program out - an ungrouped test, or one left out for a machine-independent
+/// reason (`external`), is staged and has to pass.
 pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
     let (kernel, loader) = build(profile)?;
     let init = crate::aarch64_init::build_sweep_init(build_dir)?;
-    let tests = build_user_tests_for_aarch64()?;
-    println!("user tests: {} aarch64 programs built", tests.len());
+    let built = build_user_tests_for_aarch64()?;
+    println!("user tests: {} aarch64 programs built", built.len());
+
+    // The check below is what keeps the naming honest. A gap has to be a program
+    // this machine was asked about and could not serve; a name in its group that
+    // this payload never builds is a claim about the ABI that nothing in the
+    // sweep can check - the x86_64 arm stages the name (it builds every
+    // program), and this one has nothing to leave out - so it would sit in the
+    // file looking like a measured gap for ever.
+    let config = crate::config::TestConfig::load(&utils::project_root()?.join("tests.toml"))?;
+    let machine = crate::config::Machine::Aarch64;
+    let built_names: Vec<String> = built.iter().map(|(name, _)| name.clone()).collect();
+    let unbuilt = gaps_without_programs(&config, machine, &built_names);
+    if !unbuilt.is_empty() {
+        anyhow::bail!(
+            "tests.toml names {}, as gaps for this machine, which its payload \
+             does not build: a gap nobody can check is not a gap",
+            unbuilt.join(", ")
+        );
+    }
+
+    let selected = config.selection(&[], false);
+    let tests: Vec<(String, Vec<u8>)> = built
+        .iter()
+        .filter(|(name, _)| config.runs(name, &selected, machine))
+        .cloned()
+        .collect();
+    let skipped: Vec<&(String, Vec<u8>)> = built
+        .iter()
+        .filter(|(name, _)| !config.runs(name, &selected, machine))
+        .collect();
+    println!(
+        "user tests: {} staged, {} left out by tests.toml",
+        tests.len(),
+        skipped.len()
+    );
+    // Group by group, like the x86_64 arm's report and for the same reason: the
+    // group is the reason, and a reader has to be able to see at a glance that
+    // what this machine left out are the things it is supposed to be missing.
+    for group in config.group_names(machine) {
+        let left: Vec<&str> = skipped
+            .iter()
+            .filter(|(name, _)| config.groups_of(name, machine).contains(&group))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !left.is_empty() {
+            println!("  {group:11} {}", left.join(", "));
+        }
+    }
+    println!();
 
     // The runner is `/init` on the disk (which is what the boot reads and spawns
     // as pid 1) *and* in the initramfs, and the programs sit beside it. One
@@ -554,7 +608,25 @@ pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
 
     let log = boot(build_dir, &esp, &["=== END"])?;
     print!("{log}");
-    report_sweep(build_dir, &tests, &log)
+    let staged: Vec<&str> = tests.iter().map(|(name, _)| name.as_str()).collect();
+    report_sweep(build_dir, &staged, skipped.len(), &log)
+}
+
+/// The names in `machine`'s own `tests.toml` groups that `built` does not carry.
+///
+/// Empty is the healthy answer, and the caller refuses the run when it is not:
+/// see the comment at its call site for why a gap has to be a program.
+fn gaps_without_programs(
+    config: &crate::config::TestConfig,
+    machine: crate::config::Machine,
+    built: &[String],
+) -> Vec<String> {
+    config
+        .machine_tests(machine)
+        .into_iter()
+        .filter(|(_, test)| !built.iter().any(|name| name == test))
+        .map(|(_, test)| test.to_string())
+        .collect()
 }
 
 /// The second machine's user test programs, built by cargo for
@@ -620,7 +692,24 @@ fn build_user_tests_for_aarch64() -> Result<Vec<(String, Vec<u8>)>> {
 /// failed, and the runner's own summary line has to be there - the same shape
 /// the x86 report checks, because both are claims about a machine someone has to
 /// be able to quote.
-fn report_sweep(build_dir: &Path, tests: &[(String, Vec<u8>)], log: &str) -> Result<()> {
+///
+/// `staged` is the programs this run asked the machine about and `left_out` how
+/// many `tests.toml` named instead - the latter counted, never hidden: a green
+/// here means "every program this machine was supposed to be able to run passed",
+/// and the names and reasons of the ones it was not are in that file, printed by
+/// the caller above.
+fn report_sweep(build_dir: &Path, staged: &[&str], left_out: usize, log: &str) -> Result<()> {
+    // The runner sets the machine up before it runs anything (it makes `/tmp`),
+    // and a setup that failed makes every "failure" below a statement about the
+    // harness rather than the kernel. So this is checked first and refuses the
+    // run outright - the one line here that is not about the programs.
+    if let Some(line) = log.lines().find(|line| line.starts_with("=== SETUP_FAIL")) {
+        anyhow::bail!(
+            "the aarch64 sweep's runner could not set the machine up: {line}; \
+             nothing the programs did is evidence about the kernel until that \
+             works"
+        );
+    }
     let mut passed: Vec<&str> = Vec::new();
     let mut failed: Vec<&str> = Vec::new();
     for line in log.lines() {
@@ -638,7 +727,7 @@ fn report_sweep(build_dir: &Path, tests: &[(String, Vec<u8>)], log: &str) -> Res
         anyhow::bail!(
             "the aarch64 sweep never printed a summary: the run did not reach the \
              end of the {} staged program(s); {} says how far it got",
-            tests.len(),
+            staged.len(),
             log_path(build_dir).display()
         );
     };
@@ -656,19 +745,25 @@ fn report_sweep(build_dir: &Path, tests: &[(String, Vec<u8>)], log: &str) -> Res
         anyhow::bail!(
             "self-test (aarch64) failed: {} of {} programs did not pass: {}",
             names.len(),
-            tests.len(),
+            staged.len(),
             names.join(", ")
         );
     }
-    if passed.len() != tests.len() {
+    if passed.len() != staged.len() {
         anyhow::bail!(
             "the aarch64 sweep staged {} program(s) but the log carries {} verdict(s): \
              the payload and the run disagree, which is not a partial pass",
-            tests.len(),
+            staged.len(),
             passed.len()
         );
     }
-    println!("self-test (aarch64): all {} user tests passed", tests.len());
+    println!(
+        "self-test (aarch64): all {} staged user tests passed ({} left out by \
+         tests.toml - the groups above name every one of them, with the reason \
+         in that file)",
+        staged.len(),
+        left_out
+    );
     Ok(())
 }
 
@@ -1080,4 +1175,48 @@ fn boot(build_dir: &Path, esp: &Path, terminators: &[&str]) -> Result<String> {
 
 fn kib(path: &Path) -> Result<f64> {
     Ok(fs::metadata(path)?.len() as f64 / 1024.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Machine, TestConfig};
+
+    /// The gap check, against the repository's own file.
+    ///
+    /// The group is the second machine's list of what it cannot serve, and the
+    /// one way it rots quietly is a name the payload never builds: nothing in
+    /// the sweep would notice, because there is no program to leave out, and the
+    /// entry would read as a measured gap for ever. So a real gap passes and a
+    /// gap whose program is missing is named.
+    #[test]
+    fn a_named_gap_has_to_be_a_program_the_payload_builds() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the repository root");
+        let config = TestConfig::load(&root.join("tests.toml")).unwrap();
+        let machine = Machine::Aarch64;
+
+        let gaps: Vec<String> = config
+            .machine_tests(machine)
+            .into_iter()
+            .map(|(_, test)| test.to_string())
+            .collect();
+        assert!(!gaps.is_empty(), "the aarch64 group names nothing");
+        // The payload the arm really builds is exactly these plus the ones that
+        // run, so every name is present and the check is silent.
+        assert!(gaps_without_programs(&config, machine, &gaps).is_empty());
+
+        // And the shape a stale entry takes: the file still names it, the
+        // payload no longer carries it.
+        let missing_socket: Vec<String> = gaps
+            .iter()
+            .filter(|name| *name != "t-socket")
+            .cloned()
+            .collect();
+        assert_eq!(
+            gaps_without_programs(&config, machine, &missing_socket),
+            vec!["t-socket"]
+        );
+    }
 }

@@ -376,10 +376,18 @@ impl QemuConfig {
 /// default sweep is "everything that is a check of this machine", so leaving one
 /// out has to be a deliberate act with a reason written next to it.
 ///
-/// The selection is a pure function of the file and the flags, which is what
-/// makes it host-testable - and it is the one piece of this a mistake would make
-/// invisible, because a sweep that runs fewer tests than it should prints a
-/// smaller number and passes.
+/// One kind of group names a **machine** rather than a reason ([`MACHINE_GROUPS`]):
+/// `aarch64 = [...]` lists the tests the second machine cannot serve yet. Such a
+/// group is invisible to every other machine's sweep, so a test in it is
+/// ungrouped as far as x86_64 is concerned and stays in the default sweep there -
+/// which is the whole point of saying it this way. A list that took the socket
+/// suite out of the x86_64 gate to describe an aarch64 gap would be a gate that
+/// stopped testing the machine it boots.
+///
+/// The selection is a pure function of the file, the flags and the machine,
+/// which is what makes it host-testable - and it is the one piece of this a
+/// mistake would make invisible, because a sweep that runs fewer tests than it
+/// should prints a smaller number and passes.
 #[derive(Debug, Default, Clone)]
 pub struct TestConfig {
     /// Groups a plain run adds to the ungrouped tests.
@@ -387,6 +395,36 @@ pub struct TestConfig {
     /// `(group, tests)` by group name, so the report is stable and a run cannot
     /// depend on a hash map's iteration order.
     groups: Vec<(String, Vec<String>)>,
+}
+
+/// The machine a sweep is selecting for.
+///
+/// A group named after a machine is that machine's: the tests in it are the ones
+/// it cannot serve yet, and only its own sweep sees the group at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Machine {
+    X86_64,
+    Aarch64,
+}
+
+/// The groups that name a machine. A test in one of these runs on every machine
+/// *but* the one it names.
+const MACHINE_GROUPS: [(&str, Machine); 1] = [("aarch64", Machine::Aarch64)];
+
+impl Machine {
+    /// Whether `group` is this machine's own - a name that says "not me".
+    fn owns(self, group: &str) -> bool {
+        MACHINE_GROUPS
+            .iter()
+            .any(|(name, machine)| *name == group && *machine == self)
+    }
+}
+
+/// Whether a sweep for `machine` can see a group named `group`. A group that
+/// names no machine is a reason, and every machine sees it; a group that names
+/// one is visible only to that machine.
+fn visible(group: &str, machine: Machine) -> bool {
+    !MACHINE_GROUPS.iter().any(|(name, _)| *name == group) || machine.owns(group)
 }
 
 impl TestConfig {
@@ -443,27 +481,52 @@ impl TestConfig {
             .collect()
     }
 
-    /// Whether `test` runs under `selection`.
-    pub fn runs(&self, test: &str, selection: &[String]) -> bool {
-        let groups = self.groups_of(test);
+    /// The `(group, test)` pairs that are in a group `machine` owns - the tests
+    /// left out because *this* machine cannot serve them.
+    ///
+    /// This is what a machine's own arm validates its payload against: a name in
+    /// its group that the payload does not carry would otherwise be a test
+    /// quietly left out of both sweeps, which is the one failure this file exists
+    /// to prevent.
+    pub fn machine_tests(&self, machine: Machine) -> Vec<(&str, &str)> {
+        self.groups
+            .iter()
+            .filter(|(group, _)| machine.owns(group))
+            .flat_map(|(group, tests)| {
+                tests
+                    .iter()
+                    .map(move |test| (group.as_str(), test.as_str()))
+            })
+            .collect()
+    }
+
+    /// Whether `test` runs under `selection` on `machine`.
+    pub fn runs(&self, test: &str, selection: &[String], machine: Machine) -> bool {
+        let groups = self.groups_of(test, machine);
         groups.is_empty()
             || groups
                 .iter()
                 .any(|group| selection.iter().any(|asked| asked == group))
     }
 
-    /// The groups `test` is in, by name.
-    pub fn groups_of<'a>(&'a self, test: &str) -> Vec<&'a str> {
+    /// The groups `test` is in, by name, as `machine`'s sweep sees them.
+    pub fn groups_of<'a>(&'a self, test: &str, machine: Machine) -> Vec<&'a str> {
         self.groups
             .iter()
+            .filter(|(group, _)| visible(group, machine))
             .filter(|(_, tests)| tests.iter().any(|name| name == test))
             .map(|(group, _)| group.as_str())
             .collect()
     }
 
-    /// Every group the file defines, for a message that lists the choices.
-    pub fn group_names(&self) -> Vec<&str> {
-        self.groups.iter().map(|(name, _)| name.as_str()).collect()
+    /// Every group the file defines that `machine`'s sweep can see, for a report
+    /// that lists what was left out group by group.
+    pub fn group_names(&self, machine: Machine) -> Vec<&str> {
+        self.groups
+            .iter()
+            .filter(|(group, _)| visible(group, machine))
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 }
 
@@ -753,6 +816,10 @@ mod tests {
         assert!(image_keys.contains_key("image_size") && image_keys.contains_key("esp_size"));
     }
 
+    /// The machine a plain `cargo xtask test` boots: the one every selection
+    /// test that is not about the machine rule is about.
+    const X86: Machine = Machine::X86_64;
+
     fn groups(text: &str) -> TestConfig {
         let values = parse_simple_toml(text).unwrap();
         let mut values = values;
@@ -770,14 +837,59 @@ mod tests {
         // The whole contract in one line: being named in a group is what takes a
         // test out of the default sweep, and naming a group puts it back.
         let config = groups("default = []\nexternal = [\"t-dns\", \"t-udp\"]\n");
-        assert!(config.runs("t-openat", &config.selection(&[], false)));
-        assert!(!config.runs("t-dns", &config.selection(&[], false)));
-        assert!(config.runs("t-dns", &config.selection(&["external".into()], false)));
+        assert!(config.runs("t-openat", &config.selection(&[], false), X86));
+        assert!(!config.runs("t-dns", &config.selection(&[], false), X86));
+        assert!(config.runs("t-dns", &config.selection(&["external".into()], false), X86));
         // A test in two groups runs when *either* is asked for.
         let both = groups("external = [\"t-dns\"]\nslow = [\"t-dns\", \"t-pipecost\"]\n");
-        assert!(both.runs("t-dns", &both.selection(&["slow".into()], false)));
-        assert!(!both.runs("t-pipecost", &both.selection(&["external".into()], false)));
-        assert_eq!(both.groups_of("t-dns"), vec!["external", "slow"]);
+        assert!(both.runs("t-dns", &both.selection(&["slow".into()], false), X86));
+        assert!(!both.runs(
+            "t-pipecost",
+            &both.selection(&["external".into()], false),
+            X86
+        ));
+        assert_eq!(both.groups_of("t-dns", X86), vec!["external", "slow"]);
+    }
+
+    /// A group named after a machine says "not that machine", and says nothing
+    /// about any other one.
+    ///
+    /// This is the rule that lets the second machine's gaps be written down
+    /// without taking the tests out of the first machine's gate: the same test
+    /// has to be *left out* on aarch64 and *staged by default* on x86_64, from
+    /// one file.
+    #[test]
+    fn a_group_named_after_a_machine_is_only_that_machines() {
+        let config = groups("aarch64 = [\"t-socket\"]\nexternal = [\"t-udp\"]\n");
+        // The ungrouped test runs everywhere, as always.
+        assert!(config.runs("t-openat", &config.selection(&[], false), X86));
+        assert!(config.runs("t-openat", &config.selection(&[], false), Machine::Aarch64));
+        // The aarch64 group is invisible to x86_64, so its member is ungrouped
+        // there - in the default sweep, exactly as it was before the group
+        // existed. Visible to aarch64, which leaves it out.
+        assert!(config.runs("t-socket", &config.selection(&[], false), X86));
+        assert!(!config.runs("t-socket", &config.selection(&[], false), Machine::Aarch64));
+        assert!(config.groups_of("t-socket", X86).is_empty());
+        assert_eq!(
+            config.groups_of("t-socket", Machine::Aarch64),
+            vec!["aarch64"]
+        );
+        // A reason-group is every machine's, so the internet stays out of both.
+        assert!(!config.runs("t-udp", &config.selection(&[], false), X86));
+        assert!(!config.runs("t-udp", &config.selection(&[], false), Machine::Aarch64));
+        // The reports see different group lists, which is what makes each one's
+        // "left out" list readable.
+        assert_eq!(config.group_names(X86), vec!["external"]);
+        assert_eq!(
+            config.group_names(Machine::Aarch64),
+            vec!["aarch64", "external"]
+        );
+        // And a machine's own arm can ask what it is supposed to be missing.
+        assert_eq!(
+            config.machine_tests(Machine::Aarch64),
+            vec![("aarch64", "t-socket")]
+        );
+        assert!(config.machine_tests(X86).is_empty());
     }
 
     #[test]
@@ -785,16 +897,23 @@ mod tests {
         let config =
             groups("default = [\"slow\"]\nslow = [\"t-pipecost\"]\nexternal = [\"t-dns\"]\n");
         // No flag: the file's `default`.
-        assert!(config.runs("t-pipecost", &config.selection(&[], false)));
-        assert!(!config.runs("t-dns", &config.selection(&[], false)));
+        assert!(config.runs("t-pipecost", &config.selection(&[], false), X86));
+        assert!(!config.runs("t-dns", &config.selection(&[], false), X86));
         // A named group *replaces* it rather than adding to it - otherwise a
         // second `--groups` on the command line would be unable to narrow.
-        assert!(!config.runs("t-pipecost", &config.selection(&["external".into()], false)));
-        assert!(config.runs("t-dns", &config.selection(&["external".into()], false)));
+        assert!(!config.runs(
+            "t-pipecost",
+            &config.selection(&["external".into()], false),
+            X86
+        ));
+        assert!(config.runs("t-dns", &config.selection(&["external".into()], false), X86));
         // Every group, for the run that wants everything.
         let all = config.selection(&[], true);
-        assert!(config.runs("t-dns", &all) && config.runs("t-pipecost", &all));
-        assert!(config.runs("t-openat", &all), "the ungrouped ones run too");
+        assert!(config.runs("t-dns", &all, X86) && config.runs("t-pipecost", &all, X86));
+        assert!(
+            config.runs("t-openat", &all, X86),
+            "the ungrouped ones run too"
+        );
     }
 
     #[test]
@@ -803,8 +922,8 @@ mod tests {
         // programs because a file went missing reports success for a machine it
         // never checked.
         let config = TestConfig::load(Path::new("/nonexistent/tests.toml")).unwrap();
-        assert!(config.runs("t-openat", &config.selection(&[], false)));
-        assert!(config.group_names().is_empty());
+        assert!(config.runs("t-openat", &config.selection(&[], false), X86));
+        assert!(config.group_names(X86).is_empty());
     }
 
     #[test]
@@ -837,14 +956,51 @@ mod tests {
         );
         for test in ["t-dns", "t-stdresolve", "t-udp", "t-tcp-close"] {
             assert!(
-                config.groups_of(test).contains(&"external"),
+                config.groups_of(test, X86).contains(&"external"),
                 "{test} reaches outside the machine and is not in `external`"
             );
-            assert!(!config.runs(test, &default), "{test} would run by default");
+            assert!(
+                !config.runs(test, &default, X86),
+                "{test} would run by default"
+            );
         }
-        // The three groups are named, so a reader can ask for them.
+        // The three reason-groups are named, so a reader can ask for them.
         for group in ["diagnostic", "external", "slow"] {
-            assert!(config.group_names().contains(&group), "no `{group}` group");
+            assert!(
+                config.group_names(X86).contains(&group),
+                "no `{group}` group"
+            );
+        }
+        // The machine group is the second machine's. Two things have to hold or
+        // it is not what it looks like: x86_64 must not see the group at all
+        // (which is what keeps its members in the default sweep there), and
+        // every name in it must still be a program x86_64 *does* run - the
+        // socket tests are in no other group, so a global list would have taken
+        // them out of the x86_64 gate.
+        assert!(config.group_names(Machine::Aarch64).contains(&"aarch64"));
+        assert!(!config.group_names(X86).contains(&"aarch64"));
+        let gaps = config.machine_tests(Machine::Aarch64);
+        assert!(!gaps.is_empty(), "the aarch64 group names nothing");
+        for (group, test) in &gaps {
+            assert_eq!(*group, "aarch64");
+            assert!(
+                !config.groups_of(test, X86).contains(&"aarch64"),
+                "{test} is named as an aarch64 gap and left out of x86_64's sweep with it"
+            );
+            assert!(
+                !config.runs(test, &default, Machine::Aarch64),
+                "{test} is named as an aarch64 gap and would still run there"
+            );
+        }
+        for test in ["t-socket", "t-tcp", "t-udp-loopback", "t-unix-rustix"] {
+            assert!(
+                config.runs(test, &default, X86),
+                "{test} stopped running in x86_64's default sweep"
+            );
+            assert!(
+                !config.runs(test, &default, Machine::Aarch64),
+                "{test} would run on aarch64"
+            );
         }
     }
 
