@@ -84,6 +84,20 @@ pub fn read_blocks(virt: usize, size: usize, out: &mut [u8]) -> Option<()> {
 /// A block, as the device counts them - the sector size `virtio-blk` fixes.
 pub const SECTOR: usize = 512;
 
+/// The block count the virtio-blk device at `virt` reports, or `None` if the
+/// window does not open as a block device. This is the device's geometry - a
+/// configuration-space read, distinct from the data read in [`read_blocks`] - so
+/// asserting it against a known image proves the transport reads the device's
+/// own capacity, not just its sectors.
+pub fn capacity(virt: usize, size: usize) -> Option<u64> {
+    // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
+    // device window and `size` is the tree-reported register block.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let blk = VirtIOBlk::<HalImpl, _>::new(transport).ok()?;
+    Some(blk.capacity())
+}
+
 /// The virtio-rng, reached over MMIO instead of a BAR.
 ///
 /// A request needs the crate's `&mut`, so the device sits behind the usual

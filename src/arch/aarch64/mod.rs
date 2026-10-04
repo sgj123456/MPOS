@@ -1038,7 +1038,18 @@ fn check_blk(info: &BootInfo) {
     if !buf.iter().enumerate().all(|(i, &b)| b == i as u8) {
         fail!("the sector virtio-blk returned did not match the known pattern");
     }
-    let _ = writeln!(out, "virtio-blk over MMIO read a verified sector");
+    // Read the device's geometry too - a configuration-space path distinct from
+    // the data read above. The raw image xtask lays down is 1 MiB = 2048 sectors,
+    // so the capacity the device reports must agree; a transport that read a
+    // sector but misreports its size would mount a filesystem over the wrong span.
+    let sectors = crate::drivers::virtio::mmio::capacity(virt, size).unwrap_or(0);
+    if sectors != 2048 {
+        fail!("the virtio-blk reported capacity {sectors}, not the 2048 sectors of the image");
+    }
+    let _ = writeln!(
+        out,
+        "virtio-blk over MMIO read a verified sector ({sectors} sectors)"
+    );
     let _ = writeln!(out, "M7_BLK_OK");
 }
 

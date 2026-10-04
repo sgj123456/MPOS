@@ -5853,7 +5853,10 @@ Named gaps the port carries rather than hides, each with its home:
   boot attaches a raw 1 MiB image whose every byte is `i as u8` over a `virtio-blk-device`
   MMIO transport, and `check_blk` reads sector 0 and *verifies* the pattern - so `M7_BLK_OK`
   means a real block read came back with the right bytes, not merely that a request
-  returned. The filesystem mounted over it (the disk root) is the next step; this is the
+  returned. It also reads the device's reported capacity and checks it equals the 2048
+  sectors of that image, pinning the geometry path (a configuration-space read distinct from
+  the data read) so a transport that read a sector but mis-sized the device would fail here.
+  The filesystem mounted over it (the disk root) is the next step; this is the
   block driver working. **Stage 8's net transport over MMIO - DONE (the net
   commit):** `drivers::virtio::mmio::read_mac` opens the tree's net window
   (`DeviceID` 1, `VIRTIO_ID_NET`) as an `MmioTransport` and hands it to the crate's
