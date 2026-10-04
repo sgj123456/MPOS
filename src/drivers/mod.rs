@@ -10,9 +10,15 @@
 /// (`PLAN.md` §9.1's prep shape). `virtio` is the exception: its `Hal` impl is
 /// machine-neutral (the MMIO-mapping seam took the last x86_64-only call out of
 /// it), so it compiles on both, and the aarch64 MMIO transport is added there.
+/// `devices` is the other exception, for the same reason and by the same method:
+/// the `devfs` it builds is what `mount -t devtmpfs /dev` hands a real init, so
+/// it must exist on aarch64 - and it does, because the x86_64-only device nodes
+/// (the virtio-PCI `hwrng`/`hvc`/`dsp`/`fb0`, `/dev/input`, `uinput` and the DRM
+/// card) are `#[cfg]`-ed out inside it, leaving the generic set (the ttys,
+/// `console`, `null`/`zero`/`full`, the entropy pair, `kmsg`, the `/proc` links
+/// and the disks) that every machine has.
 #[cfg(target_arch = "x86_64")]
 pub mod ahci;
-#[cfg(target_arch = "x86_64")]
 pub mod devices;
 #[cfg(target_arch = "x86_64")]
 pub mod drm;

@@ -104,7 +104,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// check runs right after the rng one, so `M7_BLK_OK` is not a terminator and
 /// `M7_BLK_FAILED` is. Stage 8's net check runs right after the block one, so
 /// `M8_NET_OK` is not a terminator and `M8_NET_FAILED` is.
-const TERMINATORS: [&str; 20] = [
+const TERMINATORS: [&str; 21] = [
     "INIT_EXITED",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
@@ -117,6 +117,7 @@ const TERMINATORS: [&str; 20] = [
     "M7_RNG_FAILED",
     "M7_BLK_FAILED",
     "M7_FS_FAILED",
+    "M7_DEV_FAILED",
     "M8_NET_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
@@ -220,6 +221,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ("M7_RNG_OK", "virtio-rng over MMIO"),
         ("M7_BLK_OK", "virtio-blk over MMIO"),
         ("M7_FS_OK", "ext4 mounted over the MMIO block"),
+        ("M7_DEV_OK", "/dev device set builds and reads entropy"),
         ("M8_NET_OK", "virtio-net over MMIO"),
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
@@ -297,7 +299,7 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         println!();
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
-             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M8_NET_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
+             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M7_DEV_OK, M8_NET_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
              M6_AS_OK, \
              M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \

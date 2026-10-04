@@ -149,8 +149,15 @@ impl CharDevice for RandomDev {
 /// reads as end of input, which is the honest shape for a machine whose
 /// entropy source went quiet rather than a blocking wait for it. Writes
 /// vanish, as they do on Linux.
+///
+/// x86_64-only for now: it wraps the virtio-PCI rng driver, which aarch64 has
+/// not been given an MMIO path for yet (its entropy reaches `/dev/urandom`
+/// through `rand`'s pool instead). The node appears on the machine that has the
+/// device, which is what keeps `/dev` free of a door no open can walk through.
+#[cfg(target_arch = "x86_64")]
 pub struct HwrngDev(Arc<crate::drivers::virtio::rng::VirtioRng>);
 
+#[cfg(target_arch = "x86_64")]
 impl CharDevice for HwrngDev {
     fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
         // The count is the device's own answer: how many bytes the host
@@ -253,6 +260,12 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // over. The adapters wrap the driver's own handle: the device behind
     // /dev/hwrng is the entropy pipe, the one behind /dev/hvc0 is the
     // console port, /dev/dsp is the sound card's stream.
+    // driver's own handle: the device behind /dev/hwrng is the entropy pipe,
+    // the one behind /dev/hvc0 is the console port, /dev/dsp is the sound card's
+    // stream. Each of these virtio-PCI drivers is x86_64's machine; aarch64 has
+    // no MMIO path for them yet, so the nodes are gated with their drivers and
+    // `/dev` simply has fewer doors on the machine that lacks the devices.
+    #[cfg(target_arch = "x86_64")]
     if let Some(rng) = crate::drivers::virtio::rng::global() {
         dev.register("hwrng", Arc::new(HwrngDev(rng)));
     }
@@ -266,6 +279,7 @@ pub fn standard_devfs() -> Arc<DevFs> {
         dev.register_id("rtc0", Arc::new(crate::drivers::rtc_dev::RtcDev), 10, 135);
         dev.register_id("rtc", Arc::new(crate::drivers::rtc_dev::RtcDev), 10, 135);
     }
+    #[cfg(target_arch = "x86_64")]
     if let Some(hvc) = crate::drivers::virtio::console::global() {
         let device = Arc::new(crate::drivers::virtio::console::HvcDev::new(hvc));
         // The name of a hypervisor console is `hvc0`; `hvc` is the alias
@@ -274,6 +288,7 @@ pub fn standard_devfs() -> Arc<DevFs> {
         dev.register("hvc0", device.clone());
         dev.register("hvc", device);
     }
+    #[cfg(target_arch = "x86_64")]
     if let Some(snd) = crate::drivers::virtio::sound::global() {
         dev.register(
             "dsp",
@@ -283,6 +298,7 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // The framebuffer is a node with more than a stream face - `mmap` of
     // the pixels, the `FBIOGET_*` ioctls - so it registers as the inode
     // it is, through the door the tty uses for the same reason.
+    #[cfg(target_arch = "x86_64")]
     if let Some(gpu) = crate::drivers::virtio::gpu::global() {
         dev.register_node(
             "fb0",
@@ -298,53 +314,61 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // where `uinput` puts the devices userland makes, and a directory that only
     // appears when the machine happens to have a keyboard is a directory a
     // program cannot depend on.
-    let input_dir = dev.register_dir("input");
-    let evdevs = crate::drivers::virtio::input::nodes();
+    //
+    // x86_64's machine for now: it drives the virtio-PCI input bus and `uinput`,
+    // neither of which aarch64 has an MMIO path for. Aarch64's `/dev` therefore
+    // has no `/dev/input` and no `uinput` - a named gap, not a stub: the doors
+    // are absent rather than opening onto nothing.
+    #[cfg(target_arch = "x86_64")]
     {
-        for (index, node) in evdevs.iter().enumerate() {
-            let name = alloc::format!("event{index}");
-            let major = crate::drivers::virtio::input::INPUT_MAJOR;
-            let minor = crate::drivers::virtio::input::input_minor(index);
-            input_dir.insert(&name, node.clone());
-            crate::uevent::publish(&crate::uevent::Event {
-                action: "add",
-                // The event node's own path, not the input device it reports
-                // through. Linux's uevent for `/dev/input/event0` is
-                // `DEVPATH=.../input0/event0` beside `DEVNAME=input/event0`,
-                // and udev keys its database entry by the syspath the event
-                // names - so announcing the parent with the child's devnum
-                // stores an entry that neither `udevadm info` on the event node
-                // nor libinput can find. The device is then never tagged
-                // `ID_INPUT`, libinput's seat enumeration passes every one of
-                // them by, and weston comes up with a screen and "no input
-                // devices found".
-                devpath: alloc::format!("/devices/virtual/input/input{index}/{name}"),
-                subsystem: "input",
-                devname: alloc::format!("input/{name}"),
-                major,
-                minor,
-                extra: &[],
-            });
+        let input_dir = dev.register_dir("input");
+        let evdevs = crate::drivers::virtio::input::nodes();
+        {
+            for (index, node) in evdevs.iter().enumerate() {
+                let name = alloc::format!("event{index}");
+                let major = crate::drivers::virtio::input::INPUT_MAJOR;
+                let minor = crate::drivers::virtio::input::input_minor(index);
+                input_dir.insert(&name, node.clone());
+                crate::uevent::publish(&crate::uevent::Event {
+                    action: "add",
+                    // The event node's own path, not the input device it reports
+                    // through. Linux's uevent for `/dev/input/event0` is
+                    // `DEVPATH=.../input0/event0` beside `DEVNAME=input/event0`,
+                    // and udev keys its database entry by the syspath the event
+                    // names - so announcing the parent with the child's devnum
+                    // stores an entry that neither `udevadm info` on the event node
+                    // nor libinput can find. The device is then never tagged
+                    // `ID_INPUT`, libinput's seat enumeration passes every one of
+                    // them by, and weston comes up with a screen and "no input
+                    // devices found".
+                    devpath: alloc::format!("/devices/virtual/input/input{index}/{name}"),
+                    subsystem: "input",
+                    devname: alloc::format!("input/{name}"),
+                    major,
+                    minor,
+                    extra: &[],
+                });
+            }
         }
-    }
 
-    // `/dev/uinput`: the interface a program makes an input device of its own
-    // through. It hands the created devices' nodes into the same `/dev/input`,
-    // and takes the next number after the ones the bus answered with, so a
-    // synthetic device is `event2` on a machine with a keyboard and a tablet.
-    dev.register_node(
-        "uinput",
-        crate::drivers::uinput::Uinput::new(input_dir, evdevs.len()),
-    );
-    crate::uevent::publish(&crate::uevent::Event {
-        action: "add",
-        devpath: alloc::string::String::from("/devices/virtual/misc/uinput"),
-        subsystem: "misc",
-        devname: alloc::string::String::from("uinput"),
-        major: crate::uinput::MAJOR,
-        minor: crate::uinput::MINOR,
-        extra: &[],
-    });
+        // `/dev/uinput`: the interface a program makes an input device of its own
+        // through. It hands the created devices' nodes into the same `/dev/input`,
+        // and takes the next number after the ones the bus answered with, so a
+        // synthetic device is `event2` on a machine with a keyboard and a tablet.
+        dev.register_node(
+            "uinput",
+            crate::drivers::uinput::Uinput::new(input_dir, evdevs.len()),
+        );
+        crate::uevent::publish(&crate::uevent::Event {
+            action: "add",
+            devpath: alloc::string::String::from("/devices/virtual/misc/uinput"),
+            subsystem: "misc",
+            devname: alloc::string::String::from("uinput"),
+            major: crate::uinput::MAJOR,
+            minor: crate::uinput::MINOR,
+            extra: &[],
+        });
+    }
 
     // The DRM/KMS card. A compositor that drives the display through KMS (not
     // the raw framebuffer) opens `/dev/dri/card0`, makes dumb buffers, and
@@ -360,6 +384,11 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // sent to the render node is accepted the way it would be on card0
     // (a teaching kernel's honesty; the split is a naming convention here,
     // not a boundary).
+    //
+    // x86_64's machine: the DRM card is driven through the virtio-GPU PCI driver
+    // and the render task, which aarch64 has no path to yet. Its card node
+    // appears only on the machine that brought the display up.
+    #[cfg(target_arch = "x86_64")]
     {
         let dri = dev.register_dir("dri");
         dri.insert("card0", crate::drivers::drm::DrmCard::new(0x9100, 0));

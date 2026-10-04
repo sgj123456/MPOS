@@ -1856,7 +1856,6 @@ fn mount_new(
             Ok(fs) => fs,
             Err(e) => return err_of(e),
         },
-        #[cfg(not(target_arch = "aarch64"))]
         "devtmpfs" | "devfs" => crate::drivers::devices::standard_devfs(),
         "devpts" => crate::vfs::devpts::DevPts::new(),
         "tmpfs" | "ramfs" => {

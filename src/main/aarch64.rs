@@ -24,6 +24,7 @@ use alloc::string::String;
 use alloc::vec;
 
 use mpos::boot::handoff::Handoff;
+use mpos::vfs::FileSystem;
 use mpos::{hal, sched, vfs};
 
 /// `mpos-boot` branches here at `KERNEL_VIRT_BASE + entry`, at EL1 with the MMU
@@ -91,6 +92,13 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     vfs::file::init_standard(vfs::tty::init());
     let root = vfs::ramfs::RamFs::new();
     vfs::mount_root(&*root);
+
+    // Stage 7-dev: the device set a real init mounts as `/dev` builds on this
+    // machine and its entropy node reads back. It runs here, after
+    // `vfs::tty::init()` has populated the tty table (the console tty is what
+    // `standard_devfs()` is built from), not as an early boot milestone - which
+    // is the ordering lesson behind the `/dev` note in `PLAN.md` §9.1.
+    check_dev();
 
     // Stage 7b: the polled console *input* path, pinned before anything reads it.
     // The machine can now hand a typed byte through `hal::console_poll_input` (the
@@ -167,6 +175,42 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
         sched::sleep_ticks(1);
     }
     hal::halt()
+}
+
+/// Stage 7-dev's evidence: the machine builds the device set a real init mounts
+/// as `/dev` and reads a working node out of it.
+///
+/// `drivers::devices::standard_devfs()` is exactly what `mount -t devtmpfs /dev`
+/// hands back - the dispatch arm this stage opened to aarch64 - and it is built
+/// from the console tty, so it can only run once `vfs::tty::init()` has filled
+/// the tty table. That is why it is here rather than an early boot milestone: a
+/// check that reached for the tty before init registered it panicked in
+/// `tty::global()` (the measured `PLAN.md` §9.1 `/dev` finding).
+///
+/// It reads a node through the trait surface (`root -> lookup -> read_at`), the
+/// same moves an `open`/`read` make, proving the generic set is present and that
+/// `/dev/urandom` returns entropy on this machine. `/dev/input`, `uinput`, the
+/// virtio-PCI `hwrng`/`hvc`/`dsp`/`fb0` and the DRM card are gated out here (the
+/// machine has no path to them yet), so the set is the honest subset, not a stub
+/// of the full x86_64 tree.
+fn check_dev() {
+    let dev = mpos::drivers::devices::standard_devfs();
+    let root = dev.root();
+    // `/dev/urandom` is the node a busybox TLS client opens, and the one whose
+    // read fills the whole buffer (it neither blocks nor short-reads on this
+    // kernel), so a 16-byte ask must come back with 16 bytes.
+    let Ok(urandom) = root.lookup("urandom") else {
+        mpos::println!("M7_DEV_FAILED: the aarch64 /dev carries no urandom node");
+        hal::halt()
+    };
+    let mut buf = [0u8; 16];
+    match urandom.read_at(0, &mut buf) {
+        Ok(n) if n == buf.len() => mpos::println!("M7_DEV_OK"),
+        other => {
+            mpos::println!("M7_DEV_FAILED: reading /dev/urandom gave {other:?}, expected 16 bytes");
+            hal::halt()
+        }
+    }
 }
 
 /// Stage 7b's evidence: the polled console input reaches a reader through the

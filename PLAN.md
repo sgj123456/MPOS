@@ -5877,7 +5877,7 @@ Named gaps the port carries rather than hides, each with its home:
   lookup -> read_at on the `FileSystem`/`Inode` traits - no fd table or task needed
   at boot) and asserts its bytes, so `M7_FS_OK` covers the full block-driver ->
   ext4 -> file path, not just a mount. What remains is pivoting to that filesystem
-  as the root, `/dev/hwrng` over the aarch64 devfs, GIC line routing to turn the
+  as the root, GIC line routing to turn the
   polled `Console` into `SerialRing`, the smoltcp stack over the MMIO net device and
   its socket syscalls, and then the aarch64 `ash` rootfs and `cargo xtask test
   --arch aarch64`. (Debt to name: this boot-time mount reaches from the machine
@@ -5885,21 +5885,31 @@ Named gaps the port carries rather than hides, each with its home:
   back-edge, so no new mutual pair - but the disk-root check is a candidate to move
   to the `main` wiring layer, where the initramfs root is already mounted.)
 
-  **Attempted next: the aarch64 `/dev` - the ordering it needs is the real gate.**
-  Splitting `drivers/devices.rs` so `standard_devfs`' generic nodes compile on
-  aarch64 (its x86-only device registrations gated into a `#[cfg]` block) built
-  clean on both targets and left x86's devfs byte-for-byte the same; but a boot
-  `check_dev` that built the devfs and read `/dev/urandom` **KERNEL-PANICed in
-  `vfs::tty::global()`** ("ttys exist only after `vfs::tty::init()`") - the
-  console tty is registered late, during the init handoff, not at the early boot
-  milestone `check_dev` ran from. So the lesson is not a hard pty/`vcmux` wall but
-  an ordering one: `/dev` is built from a `tty` that only exists once the console
-  is up, so it must be mounted at init time (where a real shell would open it),
-  not checked as an early milestone - which is exactly the real-init/shell work
-  that is the stage's actual goal. The devfs split itself is sound and reusable;
-  the change was reverted to keep the tree green (no shipped panic, no stubbed
-  half-`/dev`), and bringing up `/dev` lands together with the runtime init that
-  mounts it and a shell that opens it.
+  **Stage 7's `/dev` - the device set a real init mounts - DONE (the devfs commit).**
+  The prior *attempt* reached for `standard_devfs()` from an early boot `check_dev`
+  and **KERNEL-PANICed in `vfs::tty::global()`** ("ttys exist only after
+  `vfs::tty::init()`") - the console tty is registered during the init handoff, not
+  at that milestone. The lesson was ordering, not a pty/`vcmux` wall: the `tty1..N`
+  and `ptmx` nodes mint ordinary pty pairs (`vfs::pty::vc`), which are
+  arch-independent, so the only x86-only references in `standard_devfs()` are the
+  virtio-PCI `hwrng`/`hvc`/`dsp`/`fb0`, `/dev/input` + `uinput` and the DRM card.
+  Those five registrations (and the `HwrngDev` adapter that wraps the PCI rng
+  handle) are gated into `#[cfg(target_arch = "x86_64")]` blocks, `pub mod devices`
+  is opened to aarch64 the way `virtio` was, and the `mount -t devtmpfs`/`devfs`
+  dispatch arm in `syscall/linux/fs/file.rs` drops its `#[cfg(not(aarch64))]` - so
+  a real init's `mount(2)` now builds `/dev` on this machine instead of getting
+  `ENODEV`. The pin is `check_dev` moved into the **init handoff**, after
+  `vfs::tty::init()`: it builds the devfs and reads `/dev/urandom` through the trait
+  surface (`root -> lookup -> read_at`, the same moves an `open`/`read` make),
+  asserting the entropy node returns 16 bytes, and prints `M7_DEV_OK`. x86's devfs is
+  byte-for-byte unchanged (host 511, `cargo xtask test` 142/142), and `boot-aarch64`
+  now runs every marker through `INIT_EXITED` with `M7_DEV_OK` among them. The set is
+  the honest subset: no `/dev/hwrng` (this machine's entropy reaches `/dev/urandom`
+  through `rand`'s pool), no `/dev/input`/`uinput`/`fb0`/`dri` - a named gap, not a
+  stub of x86's full tree. What still has to land for a typed shell is a *userspace*
+  init that makes the `mount(2)` call this arm now serves and execs `ash`; the arm
+  serving it is this commit, the caller is the `ash`-rootfs stage.
+
 
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the
