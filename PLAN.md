@@ -5757,6 +5757,24 @@ bare one; it says `--release` now, and `AGENTS.md` §3 carries the same warning.
 
 Named gaps the port carries rather than hides, each with its home:
 
+- **aarch64 `drivers` and `net` are the next full stage, with their surface measured.**
+  Flipping the `drivers` gate to include aarch64 compiles to **31 errors**, and they
+  cluster entirely into the x86-only subsystems the drivers sit on: the `x86_64` crate
+  (port I/O in `qemu.rs`/`pci.rs`/`serial.rs`), `uart_16550` (the x86 serial chip -
+  aarch64's console is the polled PL011, already wired), `crate::mm::map_mmio` (x86 BAR
+  windows), and `crate::vfs::vcmux` (the x86 virtual-console mux, deferred since stage 5),
+  reached from `ahci`/`drm`/`video`/`virtio/input`. So the port is not a flip: it is the
+  established method - gate those x86-only modules out on aarch64 (a no-op there and on
+  x86/host, the stage-6A prep shape), then ADD the aarch64 path the crate lacks: a
+  `virtio-drivers` **MMIO transport** bound over the device tree's `virtio,mmio` windows
+  the boot already reaches through `paging::device_virt` (`M5_VIRTIO` reads their identity
+  registers today), reusing the arch-neutral `HalImpl` (its `dma_alloc`/`mmio_phys_to_virt`/
+  `share` are pure `crate::mm`), then `blk` (a disk root), `rng` (entropy), and `net` over
+  the same transport, plus GIC line routing to turn the polled `Console` into `SerialRing`.
+  Each device is its own individually-green commit with a boot pin; the first is the MMIO
+  transport + the simplest device driven to a marker, mirroring how the syscall stage
+  landed numbers+routing before its handlers.
+
 - **The `-kernel` bring-up was an instrument, and it is gone.** Stages 1b-1d
   entered at a fixed physical address with the MMU off, because that is the
   smallest thing that proves the toolchain, the linker script and the machine
