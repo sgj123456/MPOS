@@ -5963,7 +5963,12 @@ Named gaps the port carries rather than hides, each with its home:
   and back) prints `MPOS_CWD_OK` (also asserted) - the `pwd`/`cd` pair a shell uses
   at startup and on every directory change. A `symlink`/`readlink` round-trip
   (`ln -s /dev`, read the target back, remove) prints `MPOS_SYMLINK_OK` (asserted) -
-  the SYMLINKAT/READLINK handlers a loader or shell completion performs.
+  the SYMLINKAT/READLINK handlers a loader or shell completion performs. A
+  `mkdir`/nested-file/`rmdir` round-trip (`create_dir /mdir`, write+read a file
+  inside it, remove the file, remove the directory, confirm it is gone) prints
+  `MPOS_MKDIR_OK` (asserted) - the MKDIRAT/UNLINKAT(+AT_REMOVEDIR) directory half an
+  init uses to set up `/tmp`, `/var`, and the empty-directory gate (rmdir refusing a
+  full one) held on this machine.
   This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.

@@ -370,6 +370,18 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_SYMLINK_OK line is absent (symlinkat/readlink/unlink failed)"
         );
     }
+    // mkdir + a file inside the new directory + rmdir - MKDIRAT/RMDIR, the
+    // directory half of the filesystem an init uses to set up /tmp, /var. The
+    // nested write/read proves the directory is traversable by name, and the
+    // rmdir only succeeding after the file is gone proves the empty-directory
+    // gate (ENOTEMPTY on a full one) held on this machine.
+    if !log.contains("MPOS_MKDIR_OK") {
+        bail!(
+            "the aarch64 musl binary could not round-trip mkdir/nested file/rmdir: \
+             the MPOS_MKDIR_OK line is absent (mkdirat, the nested write/read, \
+             unlink or rmdir failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -389,7 +401,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_DEV_CONSOLE_OK), traversed it (MPOS_DEV_GETDENTS_OK, MPOS_DEV_STAT_OK), \
              and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) and \
              round-tripped getcwd/chdir (MPOS_CWD_OK) and symlink/readlink \
-             (MPOS_SYMLINK_OK) - from the ESP under AAVMF"
+             (MPOS_SYMLINK_OK) and mkdir/a nested file/rmdir (MPOS_MKDIR_OK) - \
+             from the ESP under AAVMF"
         );
         return Ok(());
     }
