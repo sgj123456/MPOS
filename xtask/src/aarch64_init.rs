@@ -425,6 +425,106 @@ pub fn write_initramfs_entries(
     Ok(())
 }
 
+/// The aarch64 sweep's `/init`: an ordinary `std` program that runs every `/t-*`
+/// the payload staged and prints the same verdict protocol the x86 test `/init`
+/// does, so the harness parses both machines with one reader.
+///
+/// It is a *program* rather than the x86 side's `#!/bin/sh` script because the
+/// second machine has no shell to run one - the smallest honest runner is a musl
+/// binary, and one already exists in the toolchain. Each test runs through
+/// `std::process::Command`, i.e. musl's `posix_spawn`
+/// (`clone(CLONE_VM|CLONE_VFORK|SIGCHLD)` + `execve`), a flag set the kernel's own
+/// clone validation names and accepts (`syscall/linux/abi.rs`), with
+/// `clone`/`execve`/`wait4` already proven on this machine by the hand-encoded
+/// launcher (`MPOS_FORK_OK`, `MPOS_EXEC_OK`).
+///
+/// The runner does not end the machine the way the x86 one does: there is no
+/// `isa-debug-exit` on this wiring, so `=== END` is the terminator the harness
+/// polls for, exactly as `INIT_EXITED` is for `boot-aarch64`.
+///
+/// The tests land on an ext4 the harness builds with `mkfs.ext4 -d`, which keeps
+/// the mode the staging step wrote, so the runner makes each program executable
+/// before it runs it rather than depending on that step to.
+pub fn build_sweep_init(build_dir: &Path) -> Result<Vec<u8>> {
+    const SRC: &str = r#"use std::os::unix::fs::PermissionsExt;
+
+fn main() {
+    let dir = "/";
+    let mut names: Vec<String> = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("t-") {
+                    names.push(name);
+                }
+            }
+        }
+        Err(e) => println!("=== FAIL read_dir({dir}) {e}"),
+    }
+    names.sort();
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+    for name in &names {
+        let path = format!("{dir}{name}");
+        if let Ok(md) = std::fs::metadata(&path) {
+            let mut perms = md.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+        println!("=== RUN {name}");
+        match std::process::Command::new(&path).status() {
+            Ok(status) if status.success() => {
+                println!("=== PASS {name}");
+                pass += 1;
+            }
+            Ok(status) => {
+                println!("=== FAIL {name} exit={}", status.code().unwrap_or(-1));
+                fail += 1;
+            }
+            Err(e) => {
+                println!("=== FAIL {name} spawn={e}");
+                fail += 1;
+            }
+        }
+    }
+    println!("=== SUMMARY pass={pass} fail={fail}");
+    println!("=== END");
+}
+"#;
+    let src = build_dir.join("aarch64-sweep-init.rs");
+    let out = build_dir.join("aarch64-sweep-init");
+    std::fs::write(&src, SRC).with_context(|| format!("Failed to write {}", src.display()))?;
+
+    let status = Command::new("rustc")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-musl")
+        .args(["-C", "target-feature=+crt-static"])
+        .args(["-C", "linker=rust-lld"])
+        .args(["-C", "strip=symbols"])
+        .arg("-O")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .context("Failed to run rustc for the aarch64 sweep init")?;
+    if !status.success() {
+        anyhow::bail!(
+            "rustc failed building the aarch64 sweep init ({status}); the \
+             aarch64-unknown-linux-musl target must be installed: \
+             `rustup target add aarch64-unknown-linux-musl`"
+        );
+    }
+    let bytes = std::fs::read(&out).with_context(|| format!("Failed to read {}", out.display()))?;
+    if bytes.len() < 20
+        || &bytes[0..4] != b"\x7fELF"
+        || u16::from_le_bytes([bytes[18], bytes[19]]) != EM_AARCH64
+    {
+        anyhow::bail!("the aarch64 sweep init is not an EM_AARCH64 ELF");
+    }
+    Ok(bytes)
+}
+
 /// An *unmodified* Rust `std` program compiled to a statically-linked
 /// `aarch64-unknown-linux-musl` ELF. Deliberately a normal `main`, not
 /// hand-encoded: it proves the second machine runs the real musl/Rust runtime end

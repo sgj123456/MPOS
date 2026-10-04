@@ -55,6 +55,13 @@ const CMDLINE: &str = "console=ttyAMA0\n";
 /// startup is most of it, and the kernel's checks are milliseconds.
 const DEADLINE: Duration = Duration::from_secs(60);
 
+/// The ext4 image `build_esp` lays the aarch64 disk from. `boot-aarch64`'s
+/// payload is three small images plus the `rootfs/` tree; the test sweep also
+/// carries the musl test programs (~5.6 MB), so it asks for its own size rather
+/// than making every boot allocate room for the sweep.
+const DISK_BYTES: u64 = 8 * 1024 * 1024;
+const SWEEP_DISK_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Lines that mean the machine has finished saying something. The poll below
 /// stops on the first of them, which is what keeps a run from waiting out the
 /// whole deadline on a machine that has already reported.
@@ -198,10 +205,11 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             ("t", target.as_slice()),
             ("musl", musl.as_slice()),
         ],
+        DISK_BYTES,
     )?;
     println!("esp:    {}", esp.display());
 
-    let log = boot(build_dir, &esp)?;
+    let log = boot(build_dir, &esp, &TERMINATORS)?;
     print!("{log}");
 
     // Every marker the kernel prints, in the order it prints them:
@@ -518,6 +526,145 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     )
 }
 
+/// The aarch64 arm of `cargo xtask test`: boot the second machine with the musl
+/// user test programs on its disk and a runner as `/init`, and read the same
+/// `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol the x86 sweep reads.
+///
+/// The machine's own checks still run first - this is a normal aarch64 boot, so
+/// `M7_DISK_OK`/`M7_ROOT_OK` and the rest print before `/init` does - but the
+/// verdict here is the user programs', not the marker chain's: those are
+/// `boot-aarch64`'s own instrument. `=== END` is what ends the poll.
+pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
+    let (kernel, loader) = build(profile)?;
+    let init = crate::aarch64_init::build_sweep_init(build_dir)?;
+    let tests = build_user_tests_for_aarch64()?;
+    println!("user tests: {} aarch64 programs built", tests.len());
+
+    // The runner is `/init` on the disk (which is what the boot reads and spawns
+    // as pid 1) *and* in the initramfs, and the programs sit beside it. One
+    // payload, both places: the ramfs is where they are before the root switch
+    // and the ext4 is where they are after it, and the same list is a correct
+    // answer on either side of that.
+    let mut entries: Vec<(&str, &[u8])> = vec![("init", init.as_slice())];
+    for (name, bytes) in &tests {
+        entries.push((name.as_str(), bytes.as_slice()));
+    }
+    let esp = build_esp(build_dir, &kernel, &loader, &entries, SWEEP_DISK_BYTES)?;
+    println!("esp:    {}", esp.display());
+
+    let log = boot(build_dir, &esp, &["=== END"])?;
+    print!("{log}");
+    report_sweep(build_dir, &tests, &log)
+}
+
+/// The second machine's user test programs, built by cargo for
+/// `aarch64-unknown-linux-musl` and read back as bytes: this payload is an
+/// initramfs and a disk laid out by name, not a tar the guest unpacks, so the
+/// files cross as data rather than as paths.
+///
+/// Zero programs is an error, not an empty green run - a sweep that quietly runs
+/// fewer tests than asked is the one failure this must not have.
+fn build_user_tests_for_aarch64() -> Result<Vec<(String, Vec<u8>)>> {
+    let root = utils::project_root()?;
+    println!("User tests: the std-side suite for aarch64 (mpos-user-tests)");
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "--release",
+        "-p",
+        "mpos-user-tests",
+        "--target",
+        "aarch64-unknown-linux-musl",
+    ])
+    .current_dir(&root);
+    utils::run_status(&mut cmd, "the aarch64 std-side user tests")?;
+
+    let dir = utils::target_dir()?.join("aarch64-unknown-linux-musl/release");
+    let mut tests = Vec::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !name.starts_with("t-") || !path.is_file() {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+        tests.push((name, bytes));
+    }
+    tests.sort_by(|a, b| a.0.cmp(&b.0));
+    if tests.is_empty() {
+        anyhow::bail!(
+            "no aarch64 test program was built under {} - the sweep would have \
+             reported a green zero",
+            dir.display()
+        );
+    }
+    Ok(tests)
+}
+
+/// Read the sweep's verdict out of the log.
+///
+/// Three facts have to agree, and each is a different way for the run to be
+/// less than it looks: every program that was staged has to appear (a log that
+/// stops early still contains the passes it got through), no program may have
+/// failed, and the runner's own summary line has to be there - the same shape
+/// the x86 report checks, because both are claims about a machine someone has to
+/// be able to quote.
+fn report_sweep(build_dir: &Path, tests: &[(String, Vec<u8>)], log: &str) -> Result<()> {
+    let mut passed: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    for line in log.lines() {
+        let line = line.trim_end();
+        if let Some(name) = line.strip_prefix("=== PASS ") {
+            passed.push(name);
+        } else if let Some(name) = line.strip_prefix("=== FAIL ") {
+            failed.push(name);
+        }
+    }
+    let summary = log.lines().find(|line| line.starts_with("=== SUMMARY"));
+
+    println!();
+    let Some(summary) = summary else {
+        anyhow::bail!(
+            "the aarch64 sweep never printed a summary: the run did not reach the \
+             end of the {} staged program(s); {} says how far it got",
+            tests.len(),
+            log_path(build_dir).display()
+        );
+    };
+    println!("self-test (aarch64): {summary}");
+
+    if !failed.is_empty() {
+        let mut names: Vec<&str> = failed
+            .iter()
+            .map(|name| name.split_whitespace().next().unwrap_or(name))
+            .collect();
+        names.sort_unstable();
+        for name in &names {
+            println!("  FAILED {name}");
+        }
+        anyhow::bail!(
+            "self-test (aarch64) failed: {} of {} programs did not pass: {}",
+            names.len(),
+            tests.len(),
+            names.join(", ")
+        );
+    }
+    if passed.len() != tests.len() {
+        anyhow::bail!(
+            "the aarch64 sweep staged {} program(s) but the log carries {} verdict(s): \
+             the payload and the run disagree, which is not a partial pass",
+            tests.len(),
+            passed.len()
+        );
+    }
+    println!("self-test (aarch64): all {} user tests passed", tests.len());
+    Ok(())
+}
+
 /// Build the kernel and its loader for this machine.
 fn build(profile: &str) -> Result<(PathBuf, PathBuf)> {
     let root = utils::project_root()?;
@@ -581,6 +728,7 @@ fn build_esp(
     kernel: &Path,
     loader: &Path,
     entries: &[(&str, &[u8])],
+    disk_bytes: u64,
 ) -> Result<PathBuf> {
     let esp = esp_dir(build_dir);
     if esp.exists() {
@@ -656,7 +804,7 @@ fn build_esp(
     let ext4 = build_dir.join("aarch64-ext4.img");
     let file =
         fs::File::create(&ext4).with_context(|| format!("Failed to create {}", ext4.display()))?;
-    file.set_len(8 * 1024 * 1024)?;
+    file.set_len(disk_bytes)?;
     drop(file);
     utils::run_status(
         Command::new("mkfs.ext4")
@@ -848,6 +996,7 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
         &kernel,
         &loader,
         &[("init", loop_init.as_slice())],
+        DISK_BYTES,
     )?;
     let (code, vars_src) = firmware()?;
     let vars = vars_path(build_dir);
@@ -874,7 +1023,12 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
 }
 
 /// Boot the ESP under AAVMF and return what the serial line said.
-fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
+///
+/// `terminators` is what ends the poll: each of `boot-aarch64`'s `M*_OK` checks
+/// prints a marker the kernel's own handoff produces, while the test sweep's
+/// runner prints the harness protocol's `=== END` instead - the two boots end on
+/// different lines, so which one stops the read is the caller's to say.
+fn boot(build_dir: &Path, esp: &Path, terminators: &[&str]) -> Result<String> {
     let (code, vars_src) = firmware()?;
     let vars = vars_path(build_dir);
     fs::copy(&vars_src, &vars).with_context(|| {
@@ -897,7 +1051,7 @@ fn boot(build_dir: &Path, esp: &Path) -> Result<String> {
     let started = Instant::now();
     loop {
         if let Ok(text) = fs::read_to_string(&log)
-            && TERMINATORS.iter().any(|marker| text.contains(marker))
+            && terminators.iter().any(|marker| text.contains(marker))
         {
             break;
         }

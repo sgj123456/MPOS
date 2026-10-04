@@ -114,24 +114,33 @@ impl Commands {
     }
 }
 
-/// Which machine `test` runs the user-test sweep on.
+/// The machine a `test` run sweeps, named by `--arch`.
+#[derive(Debug)]
+enum Sweep {
+    X86_64,
+    Aarch64,
+}
+
+/// Which machine's sweep `test` runs.
 ///
-/// The sweep is x86_64's today: it builds the musl and bare-metal user programs
-/// for x86_64 and boots them in QEMU on x86_64's wiring. `--arch aarch64` must
-/// be refused here rather than falling through to it - a sweep that prints a
-/// verdict for a machine it never booted is exactly the silent wrong-run
-/// `AGENTS.md` §3 says this must not have. When the second machine's sweep lands
-/// (`PLAN.md` §13.5) this is the function that grows the second arm.
-fn test_sweep_machine(arch: &str) -> Result<()> {
-    if arch == "x86_64" {
-        return Ok(());
+/// The two are separate paths rather than one parameterised sweep: x86_64 boots
+/// a test initramfs on the QEMU wiring in `machine.toml` and the guest ends the
+/// machine with a debug exit, while aarch64 packs a musl runner and the test
+/// programs onto its own ESP and disk and ends on `=== END`. What they share is
+/// the verdict: the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol, read by the
+/// same shape of check. Anything that is neither is refused here rather than
+/// falling through to one of them - a sweep that prints a verdict for a machine
+/// it never booted is the one failure this must not have (`AGENTS.md` §3).
+fn test_sweep_machine(arch: &str) -> Result<Sweep> {
+    match arch {
+        "x86_64" => Ok(Sweep::X86_64),
+        "aarch64" => Ok(Sweep::Aarch64),
+        other => anyhow::bail!(
+            "test --arch {other}: this front end sweeps x86_64 and aarch64 only, \
+             and a verdict for a machine nothing booted is the one failure it \
+             must not have (PLAN.md §13.5)"
+        ),
     }
-    anyhow::bail!(
-        "test --arch {arch}: the user-test sweep is x86_64's today, and there is \
-         no {arch} sweep yet - so nothing here booted {arch}, and a verdict for \
-         a machine this never booted is the one failure it must not have \
-         (PLAN.md §13.5)"
-    )
 }
 
 fn main() -> Result<()> {
@@ -373,10 +382,25 @@ fn dispatch(
             rootfs::ensure(build_dir, profile)
         }
         Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build, mode),
-        Commands::Test => {
-            test_sweep_machine(arch)?;
-            selftest::run_tests(build_dir, profile, tests)
-        }
+        Commands::Test => match test_sweep_machine(arch)? {
+            Sweep::X86_64 => selftest::run_tests(build_dir, profile, tests),
+            Sweep::Aarch64 => {
+                // The aarch64 payload is every aarch64 program that builds; the
+                // group vocabulary in `tests.toml` names the x86_64 suites'
+                // membership (and the bare-metal conformance suite has no
+                // aarch64 port yet), so honouring `--groups` here would be a
+                // selection this arm cannot make. Refuse rather than run a
+                // different set than asked for.
+                if !tests.groups.is_empty() || tests.all {
+                    anyhow::bail!(
+                        "--groups/--all-groups select among x86_64's programs today; \
+                         the aarch64 sweep runs every aarch64 program it built \
+                         (PLAN.md §13.5)"
+                    );
+                }
+                aarch64::run_sweep(build_dir, profile)
+            }
+        },
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
         // Builds both binaries itself rather than through `build_kernel`: that
         // one is the x86_64 kernel and the x86_64 loader, and this machine's
@@ -479,22 +503,23 @@ fn escalate(
 
 #[cfg(test)]
 mod tests {
-    use super::test_sweep_machine;
+    use super::{Sweep, test_sweep_machine};
 
     /// The counterfactual for the silent wrong-run: `--arch aarch64` used to
     /// reach `selftest::run_tests` unchanged and print an x86_64 verdict under an
-    /// aarch64 banner. It must refuse instead, and the refusal must name the
-    /// machine it refused.
+    /// aarch64 banner. Each machine now gets its own arm, and a machine this
+    /// front end does not sweep is refused by name rather than run as another.
     #[test]
-    fn the_sweep_refuses_a_machine_it_does_not_boot() {
-        assert!(test_sweep_machine("x86_64").is_ok());
-        let refusal = test_sweep_machine("aarch64")
-            .expect_err("aarch64 has no sweep yet, so it must be refused")
+    fn the_sweep_never_runs_a_machine_it_was_not_asked_for() {
+        assert!(matches!(test_sweep_machine("x86_64"), Ok(Sweep::X86_64)));
+        assert!(matches!(test_sweep_machine("aarch64"), Ok(Sweep::Aarch64)));
+        let refusal = test_sweep_machine("riscv64")
+            .expect_err("a machine this front end does not sweep must be refused")
             .to_string();
         assert!(
-            refusal.contains("aarch64") && refusal.contains("x86_64"),
-            "the refusal must name both the machine asked for and the one the \
-             sweep actually boots: {refusal}"
+            refusal.contains("riscv64") && refusal.contains("x86_64"),
+            "the refusal must name the machine asked for and the ones that are \
+             swept: {refusal}"
         );
     }
 }
