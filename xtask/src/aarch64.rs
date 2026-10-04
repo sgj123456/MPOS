@@ -142,11 +142,18 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     println!("kernel: {} ({:.1} KB)", kernel.display(), kib(&kernel)?);
     println!("loader: {} ({:.1} KB)", loader.display(), kib(&loader)?);
 
+    // The headless verdict's initramfs: `/init` is the exec launcher (echo, then
+    // `execve("/t")`), `/t` the fixed-marker target. A green verdict then shows
+    // the launcher's `R:echo-test`, the target's `MPOS_EXEC_OK`, and `INIT_EXITED`
+    // - proving aarch64 `execve` replaced the running image with a second one that
+    // then ran at EL0 (PLAN.md §9.1 stage 6D).
+    let launcher = crate::aarch64_init::exec_launcher_init_elf();
+    let target = crate::aarch64_init::marker_target_elf();
     let esp = build_esp(
         build_dir,
         &kernel,
         &loader,
-        &crate::aarch64_init::minimal_init_elf(),
+        &[("init", launcher.as_slice()), ("t", target.as_slice())],
     )?;
     println!("esp:    {}", esp.display());
 
@@ -214,15 +221,26 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              line is absent (read(0)/write(1) round trip did not complete)"
         );
     }
+    // The launcher's last act is `execve("/t", ...)`. `/t` writes `MPOS_EXEC_OK`,
+    // which nothing else prints - so its presence proves aarch64 `execve` replaced
+    // the running image with a *second* program and that program then ran at EL0
+    // through the same trap/dispatch path. `INIT_EXITED` after it is `/t`'s own
+    // `exit_group`, reaped from pid 1 (execve keeps the pid).
+    if !log.contains("MPOS_EXEC_OK") {
+        bail!(
+            "the aarch64 launcher never reached its exec target: the \
+             MPOS_EXEC_OK line is absent (execve did not transfer to /t)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
              M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
-             init's echoed input (R:echo-test), and INIT_EXITED - a scheduler-run \
-             userspace program read console input and echoed it back - from the ESP \
-             under AAVMF"
+             init's echoed input (R:echo-test), the exec target (MPOS_EXEC_OK), and \
+             INIT_EXITED - a scheduler-run userspace program read console input, echoed \
+             it, then execve'd a second image that ran at EL0 - from the ESP under AAVMF"
         );
         return Ok(());
     }
@@ -292,7 +310,12 @@ fn run_cargo(mut command: Command, root: &Path, what: &str) -> Result<()> {
 /// three root files are the loader's `KERNEL_PATH`, `INITRAMFS_PATH` and
 /// `CMDLINE_PATH`, and they are at the volume's root rather than under `EFI/`
 /// because that is where `boot/src/main.rs` reads them.
-fn build_esp(build_dir: &Path, kernel: &Path, loader: &Path, init_elf: &[u8]) -> Result<PathBuf> {
+fn build_esp(
+    build_dir: &Path,
+    kernel: &Path,
+    loader: &Path,
+    entries: &[(&str, &[u8])],
+) -> Result<PathBuf> {
     let esp = esp_dir(build_dir);
     if esp.exists() {
         fs::remove_dir_all(&esp).with_context(|| format!("Failed to clear {}", esp.display()))?;
@@ -306,21 +329,32 @@ fn build_esp(build_dir: &Path, kernel: &Path, loader: &Path, init_elf: &[u8]) ->
         .with_context(|| format!("Failed to install {}", kernel.display()))?;
     fs::write(esp.join("mpos.cmdline"), CMDLINE)?;
 
-    // The third file is a real aarch64 `/init` - which one is the caller's choice,
-    // passed in as `init_elf`: the headless verdict packs the one-shot (it exits, so
-    // the marker poll can stop on `INIT_EXITED`), the interactive `run` packs the
-    // looping REPL stand-in (it never exits, so it can only run where a person is
-    // typing). `aarch64_init` hand-encodes a static `EM_AARCH64` `ET_EXEC` and packs
-    // it ustar. The loader copies it into frames and records its address and length
-    // in the handoff, so this proves a second file crosses the firmware's file
-    // protocols and lands in the direct map. The kernel unpacks it into a ramfs and
-    // runs it (PLAN.md §9.1 stages 6E/7d).
+    // The third file is a real aarch64 initramfs - which programs it holds is the
+    // caller's choice, passed as `entries` (the headless verdict packs the exec
+    // launcher as `init` plus its target as `t`, so the run reaches a *second*
+    // image via `execve`; the interactive `run` packs the looping REPL as `init`
+    // alone). `aarch64_init` hand-encodes each static `EM_AARCH64` `ET_EXEC` and
+    // tar writes them ustar. The loader copies the archive into frames and records
+    // its address and length in the handoff, so this proves a file crosses the
+    // firmware's protocols and lands in the direct map. The kernel unpacks it into
+    // a ramfs and runs `/init` (PLAN.md §9.1 stages 6D/6E/7d/7e).
     let initramfs = build_dir.join("aarch64-initramfs.tar");
-    crate::aarch64_init::write_initramfs_with(init_elf, build_dir, &initramfs)?;
+    crate::aarch64_init::write_initramfs_entries(entries, build_dir, &initramfs)?;
     fs::copy(&initramfs, esp.join("initramfs.tar"))
         .with_context(|| format!("Failed to install {}", initramfs.display()))?;
-    println!("initramfs: aarch64 /init -> {}", initramfs.display());
+    println!(
+        "initramfs: aarch64 {} -> {}",
+        names_of(entries),
+        initramfs.display()
+    );
     Ok(esp)
+}
+
+/// The ramfs names in `entries`, for the log line (so a reader sees which files
+/// the archive holds, not just that it was built).
+fn names_of(entries: &[(&str, &[u8])]) -> String {
+    let parts: Vec<String> = entries.iter().map(|(name, _)| format!("/{name}")).collect();
+    parts.join(" + ")
 }
 
 /// The firmware's two flash images, from whichever package the host has.
@@ -446,11 +480,12 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
 /// drivers stage (serial RX + the idle/park path, `PLAN.md` §9.1 stage 7).
 pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
     let (kernel, loader) = build(profile)?;
+    let loop_init = crate::aarch64_init::looping_init_elf();
     let esp = build_esp(
         build_dir,
         &kernel,
         &loader,
-        &crate::aarch64_init::looping_init_elf(),
+        &[("init", loop_init.as_slice())],
     )?;
     let (code, vars_src) = firmware()?;
     let vars = vars_path(build_dir);

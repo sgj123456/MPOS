@@ -16,21 +16,30 @@
 //!
 //! Two images, one assembler:
 //!
-//! - [`minimal_init_elf`] (the headless verdict's) reads one line and exits, so
-//!   `boot-aarch64` can stop polling on its terminal `INIT_EXITED`. It writes back
-//!   what it read prefixed with `R:` (the tty's own echo of the same line carries no
-//!   `R:`), so `R:echo-test` on the wire is unambiguous proof a scheduler-run
-//!   program read console input and echoed it through `syscall::dispatch`.
+//! - [`exec_launcher_init_elf`] (the headless verdict's `/init`) echoes the queued
+//!   line - writes back what it read prefixed with `R:` (the tty's own echo of the
+//!   same line carries no `R:`), so `R:echo-test` on the wire is unambiguous proof a
+//!   scheduler-run program read console input and echoed it through
+//!   `syscall::dispatch` - then its last act is `execve("/t", ...)`. If aarch64
+//!   `execve` works the image is replaced and the launcher's own `exit_group`
+//!   fallback (which `boot-aarch64` can stop polling on) is never reached; `/t` is
+//!   [`marker_target_elf`].
 //!
-//! - [`looping_init_elf`] (the interactive `run --arch aarch64`'s) is the same read/
-//!   echo body with the exit replaced by a branch back to the top, so it is a
-//!   read/echo *forever* - a REPL stand-in a person can type into. It never exits,
-//!   which is exactly why it must not be the headless verdict's image: with nobody to
-//!   type, its second `read(0)` parks (the tty wakes it only when a line lands,
+//! - [`marker_target_elf`] (the verdict's `/t`) writes `MPOS_EXEC_OK` then exits.
+//!   Nothing else prints that string, so its appearance after `R:echo-test` proves
+//!   `execve` transferred to a *second* image that then ran at EL0 (stage 6D).
+//!
+//! - [`looping_init_elf`] (the interactive `run --arch aarch64`'s) is the echo body
+//!   with the exit replaced by a branch back to the top, so it is a read/echo
+//!   *forever* - a REPL stand-in a person can type into. It never exits, which is
+//!   exactly why it must not be the headless verdict's image: with nobody to type,
+//!   its second `read(0)` parks (the tty wakes it only when a line lands,
 //!   `read_wait`'s canonical `UntilInput`) and `INIT_EXITED` never comes. A real
-//!   shell (busybox `ash`) is the same shape plus the aarch64 `execve`/`clone`
-//!   return-frame path (the named stage-6D gap).
+//!   shell (busybox `ash`) is this loop plus `execve` of the shell binary once the
+//!   aarch64 static-musl image lands - the `execve` return-frame path those two
+//!   images exercise is now built (stage 6D); `clone` remains the named gap.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -122,15 +131,13 @@ fn echo_body(buf_addr: u64, prefix_addr: u64) -> Vec<u32> {
     code
 }
 
-/// Assemble a hand-written instruction list into the loadable `ET_EXEC`
-/// `EM_AARCH64` image: header, one RWX `PT_LOAD` spanning the whole file from
-/// offset 0, then the code at `CODE_OFF`, then a zero `READ_LEN` scratch buffer,
-/// then `PREFIX`. The data addresses are derived from the code length, so a
-/// caller that changes the word count cannot desync the pointers the code loads.
-fn assemble(code: &[u32]) -> Vec<u8> {
-    let buf_off = CODE_OFF + code.len() * 4;
-    let prefix_off = buf_off + READ_LEN as usize;
-    let file_len = prefix_off + PREFIX.len();
+/// Assemble a hand-written instruction list plus a data blob into the loadable
+/// `ET_EXEC` `EM_AARCH64` image: header, one RWX `PT_LOAD` spanning the whole
+/// file from offset 0, the code at `CODE_OFF`, then `data` immediately after the
+/// code. The data addresses are derived from the code length, so a caller that
+/// changes the word count cannot desync the pointers its code loads into the blob.
+fn assemble_with(code: &[u32], data: &[u8]) -> Vec<u8> {
+    let file_len = CODE_OFF + code.len() * 4 + data.len();
 
     let mut out = vec![0u8; file_len];
     out[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
@@ -158,8 +165,16 @@ fn assemble(code: &[u32]) -> Vec<u8> {
     for (i, word) in code.iter().enumerate() {
         out[CODE_OFF + i * 4..CODE_OFF + i * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
-    out[prefix_off..].copy_from_slice(PREFIX);
+    let data_off = CODE_OFF + code.len() * 4;
+    out[data_off..].copy_from_slice(data);
     out
+}
+
+/// The echo body's data blob: a zero `READ_LEN` scratch buffer then `PREFIX`.
+fn assemble(code: &[u32]) -> Vec<u8> {
+    let mut data = vec![0u8; READ_LEN as usize];
+    data.extend_from_slice(PREFIX);
+    assemble_with(code, &data)
 }
 
 /// The addresses the echo body loads for a block of `n_code` instructions: the
@@ -170,24 +185,10 @@ fn data_addrs(n_code: usize) -> (u64, u64) {
     (VADDR + buf_off as u64, VADDR + prefix_off as u64)
 }
 
-/// The one-shot `/init` the headless verdict runs: echo one line, then
-/// `exit_group(0)`. See the module header.
-pub fn minimal_init_elf() -> Vec<u8> {
-    // Exit + park trail the body: exit_group(0) is x8=94, x0=0, svc; `b .` parks
-    // in the impossible case the kernel returns from exit_group.
-    let body_len = echo_body(0, 0).len();
-    let n = body_len + 4;
-    let (buf_addr, prefix_addr) = data_addrs(n);
-    let mut code = echo_body(buf_addr, prefix_addr);
-    code.extend([movz(8, 94), movz(0, 0), svc(), 0x1400_0000]);
-    debug_assert_eq!(code.len(), n);
-    assemble(&code)
-}
-
 /// The interactive `/init` `run --arch aarch64` runs: echo in a loop, forever.
-/// Same body as the one-shot, with `exit_group`/`b .` replaced by a branch back to
-/// the top, so a typed line is read and echoed, then the next is waited for. See
-/// the module header.
+/// Same body as the exec launcher's echo, with `exit_group`/`b .` replaced by a
+/// branch back to the top, so a typed line is read and echoed, then the next is
+/// waited for. See the module header.
 pub fn looping_init_elf() -> Vec<u8> {
     let body_len = echo_body(0, 0).len();
     let n = body_len + 1; // the body plus the single backward branch
@@ -198,23 +199,128 @@ pub fn looping_init_elf() -> Vec<u8> {
     assemble(&code)
 }
 
-/// Pack a given `/init` image into a ustar archive named `initramfs.tar` at `out`,
-/// the way `xtask/src/initramfs.rs` does for the x86 image: stage the file in a
-/// directory and let the system `tar --format=ustar` write it. The kernel unpacks
-/// it with `vfs::tar::unpack_into` and execs `/init` from the ramfs root it fills.
-pub fn write_initramfs_with(elf: &[u8], staging_parent: &Path, out: &Path) -> Result<()> {
+/// `aarch64` asm-generic syscall numbers used below (Linux's, from `nr.rs`'s
+/// aarch64 table): `execve` and `exit_group`. `read`/`write` (63/64) are in
+/// [`echo_body`].
+const NR_EXECVE: u32 = 221;
+const NR_EXIT_GROUP: u32 = 94;
+
+/// The string the exec target writes when it runs - proof aarch64 `execve`
+/// replaced the image and the new program ran at EL0. Nothing else prints it.
+const EXEC_MARKER: &[u8] = b"MPOS_EXEC_OK\n";
+/// The path the launcher `execve`s, and the ramfs name the target is packed as.
+const EXEC_PATH: &[u8] = b"/t\0";
+
+/// The exec target: write `MPOS_EXEC_OK\n` then `exit_group(0)`. It reads nothing
+/// and takes no arguments - the launcher's `argv`/`envp` point at it but it
+/// ignores them; its only job is to prove control transferred here and ran.
+pub fn marker_target_elf() -> Vec<u8> {
+    let load = |rd: u32, addr: u64| {
+        [
+            movz(rd, (addr & 0xffff) as u32),
+            movk(rd, ((addr >> 16) & 0xffff) as u32),
+        ]
+    };
+    // Code: write(1, marker, len) then exit_group(0), `b .`. Ten words, so the
+    // marker data lands at VADDR + CODE_OFF + 40.
+    let n = 10usize;
+    let marker_addr = VADDR + (CODE_OFF + n * 4) as u64;
+    let mut code = Vec::new();
+    code.extend([movz(8, 64), movz(0, 1)]);
+    code.extend(load(1, marker_addr));
+    code.extend([movz(2, EXEC_MARKER.len() as u32), svc()]);
+    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]);
+    debug_assert_eq!(code.len(), n);
+    assemble_with(&code, EXEC_MARKER)
+}
+
+/// The headless verdict's `/init`: echo the queued line (so `boot-aarch64` still
+/// shows `R:echo-test`), then `execve("/t", ["/t", NULL], [NULL])` - the last act
+/// the launcher performs. If the kernel's aarch64 `execve` works, the process
+/// image is replaced by the target and `MPOS_EXEC_OK` reaches the wire; the
+/// launcher's own `exit_group` fallback runs only if `execve` fails (honest, so a
+/// broken `execve` shows up as a missing marker rather than a hang).
+pub fn exec_launcher_init_elf() -> Vec<u8> {
+    let load = |rd: u32, addr: u64| {
+        [
+            movz(rd, (addr & 0xffff) as u32),
+            movk(rd, ((addr >> 16) & 0xffff) as u32),
+        ]
+    };
+    // 19 echo words + 8 execve words + 4 exit_group/b. fallback = 31.
+    let body_len = echo_body(0, 0).len();
+    let n = body_len + 8 + 4;
+    let data_base = VADDR + (CODE_OFF + n * 4) as u64;
+    // The blob the code and the pointers agree on (offsets from `data_base`):
+    //   0..64   read scratch (buf)
+    //   64..66  "R:" (prefix)
+    //   66..69  "/t\0" (exec path)
+    //   69..72  padding to 8 for the pointer arrays
+    //   72..88  argv = [&"/t", NULL]
+    //   88..96  envp = [NULL]
+    let buf_addr = data_base;
+    let prefix_addr = data_base + 64;
+    let path_addr = data_base + 66;
+    let argv_addr = data_base + 72;
+    let envp_addr = data_base + 88;
+
+    let mut code = echo_body(buf_addr, prefix_addr);
+    // execve(path, argv, envp): x8=221, x0=&"/t", x1=&argv, x2=&envp, svc.
+    code.extend([movz(8, NR_EXECVE)]);
+    code.extend(load(0, path_addr));
+    code.extend(load(1, argv_addr));
+    code.extend(load(2, envp_addr));
+    code.push(svc());
+    // Fallback if execve returns (i.e. failed): exit_group(0) so the verdict
+    // still terminates, and `b .`.
+    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]);
+    debug_assert_eq!(code.len(), n);
+
+    // Build the data blob with the pointers written as LE u64 into it.
+    let mut data = vec![0u8; 96];
+    data[64..66].copy_from_slice(PREFIX);
+    data[66..66 + EXEC_PATH.len()].copy_from_slice(EXEC_PATH);
+    data[72..80].copy_from_slice(&path_addr.to_le_bytes()); // argv[0] = &"/t"
+    // argv[1] = NULL (0) and envp[0] = NULL (0): the zero-init already covers them.
+    debug_assert_eq!(data.len(), 96);
+    assemble_with(&code, &data)
+}
+
+/// Pack a set of `(name, bytes)` files into a ustar `initramfs.tar` at `out`, the
+/// way `xtask/src/initramfs.rs` does for the x86 image. The kernel unpacks it with
+/// `vfs::tar::unpack_into` and execs `/init` from the ramfs root it fills; the
+/// exec-pin packs `/init` and `/t` together so the launcher can reach the target.
+pub fn write_initramfs_entries(
+    entries: &[(&str, &[u8])],
+    staging_parent: &Path,
+    out: &Path,
+) -> Result<()> {
     let stage = staging_parent.join("aarch64-init-stage");
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("Failed to create {}", stage.display()))?;
-    std::fs::write(stage.join("init"), elf)
-        .with_context(|| format!("Failed to write {}/init", stage.display()))?;
+    let mut names = Vec::new();
+    for (name, bytes) in entries {
+        let path = stage.join(name);
+        std::fs::write(&path, bytes)
+            .with_context(|| format!("Failed to write {}/{}", stage.display(), name))?;
+        // Mark it executable. The kernel's ramfs keeps the mode the archive
+        // records, and `execve` (and the loader's read of `/init`) reach it: even
+        // root is denied execute when no x bit is set, so a 0644 `/t` makes the
+        // launcher's `execve` fail with `EACCES` rather than transfer.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to chmod +x {}", path.display()))?;
+        names.push(name.to_string());
+    }
 
-    let status = Command::new("tar")
-        .arg("--format=ustar")
+    let mut cmd = Command::new("tar");
+    cmd.arg("--format=ustar")
         .args(["-C", &stage.display().to_string()])
-        .args(["-cf", &out.display().to_string()])
-        .arg("init")
+        .args(["-cf", &out.display().to_string()]);
+    for name in &names {
+        cmd.arg(name);
+    }
+    let status = cmd
         .status()
         .context("Failed to start tar to build the aarch64 initramfs")?;
     if !status.success() {
@@ -230,8 +336,9 @@ mod tests {
 
     /// The pinned instruction counts the tests assert the built code has, which
     /// also pin that the loop's backward branch spans exactly the body.
-    const ONE_SHOT_WORDS: usize = 23;
     const LOOP_WORDS: usize = 20;
+    const LAUNCHER_WORDS: usize = 31;
+    const TARGET_WORDS: usize = 10;
 
     /// Shared structural checks for any assembled image: the ELF identity, the
     /// single RWX `PT_LOAD` covering the whole file from offset 0, and the entry
@@ -267,41 +374,68 @@ mod tests {
             .collect()
     }
 
-    /// The one-shot is a loadable image whose code starts `mov x8,#63` (read),
-    /// stashes `n` in `x9`, and ends with `exit_group`/`b .`; its `R:` prefix sits
-    /// at the address the echo write loads in `x1`.
+    /// The exec launcher is a loadable image that echoes then calls `execve`:
+    /// word 0 is `mov x8,#63` (read), word 19 is `mov x8,#221` (execve), the last
+    /// is `b .` (after the `exit_group` fallback), and its data blob carries the
+    /// `/t\0` path plus `argv[0]` = that path's address and a NULL-terminated
+    /// `argv`/`envp`.
     #[test]
-    fn the_one_shot_reads_echoes_then_exits() {
-        let e = minimal_init_elf();
+    fn the_launcher_echoes_then_execs_a_target() {
+        let e = exec_launcher_init_elf();
         assert_loadable(&e);
-        let words = words_of(&e, ONE_SHOT_WORDS);
-        assert_eq!(words.len(), ONE_SHOT_WORDS);
+        let words = words_of(&e, LAUNCHER_WORDS);
+        assert_eq!(words.len(), LAUNCHER_WORDS);
         assert_eq!(words[0], 0xd28007e8, "mov x8,#63 (read)");
         assert_eq!(words[6], 0xaa0003e9, "mov x9,x0 (stash n)");
+        assert_eq!(words[19], 0xd2801ba8, "mov x8,#221 (execve)");
+        assert_eq!(words[26], 0xd4000001, "svc (the execve)");
+        assert_eq!(words[27], 0xd2800bc8, "mov x8,#94 (exit_group fallback)");
+        assert_eq!(words[LAUNCHER_WORDS - 1], 0x14000000, "b . (park)");
+
+        // The data section follows the 31 code words; base is VADDR + 244.
+        let data_file_off = CODE_OFF + LAUNCHER_WORDS * 4; // 244
         assert_eq!(
-            words[ONE_SHOT_WORDS - 4],
+            &e[data_file_off + 66..data_file_off + 69],
+            b"/t\0",
+            "the exec path"
+        );
+        let path_addr = VADDR + (data_file_off + 66) as u64; // 0x400136
+        assert_eq!(
+            &e[data_file_off + 72..data_file_off + 80],
+            path_addr.to_le_bytes(),
+            "argv[0] points at the /t path"
+        );
+        // argv[1] and envp[0] are NULL terminators.
+        assert_eq!(
+            &e[data_file_off + 80..data_file_off + 88],
+            &[0u8; 8],
+            "argv is NULL-terminated"
+        );
+        assert_eq!(
+            &e[data_file_off + 88..data_file_off + 96],
+            &[0u8; 8],
+            "envp is a lone NULL"
+        );
+    }
+
+    /// The exec target is a loadable image that writes the marker and exits: word 0
+    /// is `mov x8,#64` (write), and `MPOS_EXEC_OK` sits at the address the write
+    /// loads in `x1`.
+    #[test]
+    fn the_target_writes_the_marker_and_exits() {
+        let e = marker_target_elf();
+        assert_loadable(&e);
+        let words = words_of(&e, TARGET_WORDS);
+        assert_eq!(words[0], 0xd2800808, "mov x8,#64 (write)");
+        assert_eq!(
+            words[TARGET_WORDS - 4],
             0xd2800bc8,
             "mov x8,#94 (exit_group)"
         );
-        assert_eq!(words[ONE_SHOT_WORDS - 1], 0x14000000, "b . (park)");
-
-        // The data the code loads: the scratch buffer the `read` lands in, then the
-        // `R:` prefix the echo write sends. `assemble` lays both out from the code
-        // length, so this asserts where they sit for the pinned word count.
-        let (buf_addr, prefix_addr) = data_addrs(ONE_SHOT_WORDS);
-        let buf_off = CODE_OFF + ONE_SHOT_WORDS * 4;
-        let prefix_off = buf_off + READ_LEN as usize;
-        assert_eq!(VADDR + buf_off as u64, buf_addr);
-        assert_eq!(VADDR + prefix_off as u64, prefix_addr);
-        assert!(
-            e[buf_off..prefix_off].iter().all(|&b| b == 0),
-            "scratch is zero-filled"
-        );
-        assert_eq!(
-            &e[prefix_off..],
-            PREFIX,
-            "the mapped prefix is the echo write's x1"
-        );
+        assert_eq!(words[TARGET_WORDS - 1], 0x14000000, "b .");
+        // The marker string is the data after the code, at the write's x1.
+        let data_file_off = CODE_OFF + TARGET_WORDS * 4;
+        assert_eq!(&e[data_file_off..], EXEC_MARKER, "the mapped marker");
     }
 
     /// The loop image is the same body but ends in a branch back to the top, not

@@ -5512,9 +5512,12 @@ through ten `#[cfg(not(target_arch = "aarch64"))]` preps, each a provable no-op 
 host (x86_64) and x86 bare metal where the predicate is simply true. What is deferred,
 and why it is refused rather than faked: the socket arms and the `'K'`/`'V'`/`'E'`/`'U'`
 and `SIOC`/`FBIO`/DRM ioctl families fall to `ENOTTY`/`ENOSYS` (no `net`/`drivers` on
-this machine yet); `execve`/`ptrace`/`process_vm_*`/`rt_sig*`/`reboot`/`clone`/`fork`
+this machine yet); `ptrace`/`process_vm_*`/`rt_sig*`/`reboot`/`clone`/`fork`
 dispatch arms fall to `_ => ENOSYS` (they rewrite the x86 return frame, which arrives
-with the aarch64 signal-frame ABI); `arch_prctl` has no aarch64 number at all; the
+with the aarch64 signal-frame ABI); `execve` is now **served** on aarch64 (stage 6D:
+its body was already arch-neutral through `sched::exec_replace`, and the return-frame
+patch is arch-aware - `UserFrame.pc/sp/x[0]` on aarch64 instead of `RegsFrame.rcx/user_rsp`),
+so `svc 221` transfers to a new image at EL0, pinned by the `MPOS_EXEC_OK` marker; `arch_prctl` has no aarch64 number at all; the
 seccomp *filter* path (reads the x86 RIP) and the ptrace entry/exit stops and on-exit
 signal delivery in `linux_dispatch` are gated to their no-tracer/no-signal identity;
 and `uname`'s machine field and the hostname/domainname were moved to per-arch and the
@@ -5670,9 +5673,29 @@ and feeding `hello\nworld\n`: the log shows the tty's canonical echoes `hello`/`
 *and* the loop's own `R:hello`/`R:world` after the initial `R:echo-test` - a
 scheduler-run userspace program that read a typed line, echoed it, parked, and did it
 again. That is the objective's "reaches init/shell on the serial console" in the
-minimal genuine form: a persistent interactive userspace loop on the second machine. A
-real shell (busybox `ash`) is the same read/echo shape plus the `execve`/`clone`
-return-frame path (stage 6D) and a static-musl aarch64 image; the disk root, `net`, and
+minimal genuine form: a persistent interactive userspace loop on the second machine.
+
+**Stage 6D (execve) is DONE: `execve` transfers a running aarch64 program to a new
+image at EL0.** The handler's body was already arch-neutral - it reads the path and
+`argv`/`envp` through `uaccess`, checks `X_OK`, resolves any `#!` interpreter, honours
+set-uid, and calls `sched::exec_replace`, which returns `(entry, new_rsp)` exactly as
+`spawn_init`'s loader does (the same `new_layout`/`initial_stack_rsp`/`write_arg_block`
+the aarch64 boot already proves). Only the *return-frame patch* was x86: it rewrote
+`RegsFrame.rcx`/`user_rsp` for `sysretq`. That patch is now `#[cfg]`-split - x86 keeps
+`RegsFrame`, aarch64 rewrites the saved `UserFrame`'s `pc=entry`/`sp=new_rsp`/`x[0]=0`
+that `el0_sync`'s `eret` restores - and the `EXECVE` dispatch arm lost its
+`#[cfg(not(target_arch = "aarch64"))]` gate so `svc 221` reaches it. Pin: the headless
+verdict's `/init` is now an exec *launcher* that echoes the queued line (so `R:echo-test`
+still proves the read/write path) then `execve`s a second hand-encoded image `/t` that
+writes `MPOS_EXEC_OK`; `boot-aarch64` asserts the literal `MPOS_EXEC_OK` between
+`R:echo-test` and `INIT_EXITED` (`INIT_EXITED` is now `/t`'s own `exit_group`, exec
+keeping pid 1). Two bugs found and fixed while landing it, both honest failures the pin
+turned red on: the `EXECVE` dispatch arm was still gated out on aarch64 (`svc` fell to
+`ENOSYS`), and the packed initramfs files had no exec bit, so `may_access(X_OK)` denied
+even root - `boot-aarch64` now `chmod 0755` the staged files. `clone`/`fork` remain the
+named 6D gap (their child return frame needs the aarch64 signal-frame ABI). With execve
+served, a real shell (busybox `ash`) needs only a static-musl aarch64 `/init`/`ash` in
+the initramfs and a `fork`/`clone`+`wait` to run it as a child; the disk root, `net`, and
 `cargo xtask test --arch aarch64` remain.
 
 

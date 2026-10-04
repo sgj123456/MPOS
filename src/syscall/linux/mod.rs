@@ -258,7 +258,10 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         nr::RECVMMSG => crate::net::socket::handle_recvmmsg(args, from_user),
 
         // --- process ---
-        #[cfg(not(target_arch = "aarch64"))]
+        // `execve` runs on both machines: the handler is arch-neutral up to its
+        // return-frame patch, which is arch-aware (`RegsFrame` on x86, `UserFrame`
+        // on aarch64). The ptrace stop after it is the only x86-only part, gated in
+        // the handler.
         nr::EXECVE => proc::handle_execve(args, &cwd(), regs_ptr),
         nr::EXIT => proc::handle_exit(args),
         nr::EXIT_GROUP => proc::handle_exit_group(args),

@@ -1507,7 +1507,6 @@ fn setuid_identity(inode: &Arc<dyn crate::vfs::Inode>) -> Option<crate::sched::I
 /// library is what makes `./script.sh` work where `sh script.sh` does, and it
 /// is the difference between a package's install trigger running and the
 /// install failing with `Exec format error`.
-#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_execve(
     args: [usize; ARG_COUNT],
     cwd: &Arc<dyn crate::vfs::Inode>,
@@ -1599,21 +1598,28 @@ pub(super) fn handle_execve(
     }
     match outcome {
         Ok((entry, new_rsp)) => {
-            // Patch the syscall return frame: when sysretq fires, RIP = entry
-            // and RSP = new_rsp, so the process enters the new image.
+            // The old image is gone; `execve` must not *return* into it. It
+            // returns normally only as a number, so the way it takes the process
+            // to the new program is to rewrite the trap frame the syscall gate
+            // will `ret`/`eret` out through - the entry becomes the new program's
+            // first instruction, the stack pointer its new stack, and the return
+            // register 0 (Linux's `execve` never hands the caller a value back).
             //
-            // The Regs layout (from syscall.rs):
-            //   [rsp+0]  rax (return value)
-            //   [rsp+8]  r11 (user RFLAGS)
-            //   [rsp+16] rcx (user RIP)  ← patch this
-            //   ...args...
-            //   [rsp+72] user_rsp         ← patch this
-            //
-            // sysretq takes RIP from rcx and RFLAGS from r11.
+            // x86_64: sysretq takes the new RIP from `rcx` and RSP from
+            // `user_rsp` in the `RegsFrame`. aarch64: `eret` takes them from the
+            // saved `UserFrame`'s `pc`/`sp`, and the result register is `x0`.
+            #[cfg(not(target_arch = "aarch64"))]
             if !regs_ptr.is_null() {
                 let regs = unsafe { &mut *(regs_ptr as *mut RegsFrame) };
                 regs.rcx = entry; // sysretq will jump here
                 regs.user_rsp = new_rsp; // new stack pointer
+            }
+            #[cfg(target_arch = "aarch64")]
+            if !regs_ptr.is_null() {
+                let frame = unsafe { &mut *(regs_ptr as *mut crate::hal::UserFrame) };
+                frame.x[0] = 0; // execve's "result" - the caller never sees it
+                frame.pc = entry as u64; // eret jumps here
+                frame.sp = new_rsp as u64; // into the new stack
             }
             // A traced task traps here, on the *new* image's first instruction:
             // by the time `execve` could otherwise "return" the old program is
@@ -1621,7 +1627,8 @@ pub(super) fn handle_execve(
             // exec happened. It is also what a tracer is waiting for the very
             // first time - `strace`'s child calls `PTRACE_TRACEME` and then
             // `execv`s, and this stop is how the tracer learns the program
-            // started.
+            // started. Deferred on aarch64 (no ptrace return-frame path yet).
+            #[cfg(not(target_arch = "aarch64"))]
             if !regs_ptr.is_null() && crate::sched::has_tracer(crate::sched::current()) {
                 let mut regs = capture_frame(regs_ptr, 0);
                 crate::sched::exec_trap(&mut regs);
