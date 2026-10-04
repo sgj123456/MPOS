@@ -413,6 +413,17 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              path a large allocation reaches failed)"
         );
     }
+    // fd duplication via fcntl(F_DUPFD_CLOEXEC) - `File::try_clone`, the
+    // redirection/pipe primitive a shell uses to wire stdin/stdout. The duped
+    // descriptor must read back the file's bytes; an invalid or independent dup
+    // fails here.
+    if !log.contains("MPOS_DUP_OK") {
+        bail!(
+            "the aarch64 musl binary could not duplicate a file descriptor: the \
+             MPOS_DUP_OK line is absent (fcntl F_DUPFD_CLOEXEC / the read through \
+             the duped fd failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -434,7 +445,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              round-tripped getcwd/chdir (MPOS_CWD_OK) and symlink/readlink \
              (MPOS_SYMLINK_OK) and mkdir/a nested file/rmdir (MPOS_MKDIR_OK) and \
              rename/hard link (MPOS_RENAME_LINK_OK) and ftruncate (MPOS_TRUNCATE_OK) \
-             and a 1 MiB mmap-backed heap buffer (MPOS_MEMORY_OK) - \
+             and a 1 MiB mmap-backed heap buffer (MPOS_MEMORY_OK) and fd \
+             duplication via fcntl (MPOS_DUP_OK) - \
              from the ESP under AAVMF"
         );
         return Ok(());

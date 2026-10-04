@@ -5981,7 +5981,10 @@ Named gaps the port carries rather than hides, each with its home:
   served by `mmap`) written one byte per page and read back prints `MPOS_MEMORY_OK`
   (asserted) - the anonymous/mmap demand-paging path proven from a running process, which
   is a *memory* handler rather than a filesystem one, closing the last facet of the
-  "core fs/memory handlers" deliverable that was still only inferred from dispatch.
+  "core fs/memory handlers" deliverable that was still only inferred from dispatch. An
+  **fd-duplication** round-trip (`File::try_clone`, which is `fcntl(F_DUPFD_CLOEXEC)`,
+  reading the file's bytes back through the duped descriptor) prints `MPOS_DUP_OK`
+  (asserted) - the fd-table primitive behind a shell's `>` redirection and `|` pipes.
   This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.
