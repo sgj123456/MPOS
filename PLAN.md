@@ -5939,23 +5939,33 @@ Named gaps the port carries rather than hides, each with its home:
   virtio-PCI input bus and `uinput` are x86_64's), no `fb0`/`dri` (DRM is x86_64's),
   no `/dev/rtc` (CMOS is x86_64's) - each a named gap, not a stub. What still has
   to land for a typed shell is a *userspace* init that execs `ash` against the
-  `/dev` the kernel now mounts (and, once an aarch64 `cpuinfo` backed by
-  `MIDR_EL1` exists, mounts `/proc`).
+  `/dev` the kernel now mounts. That init must exec a *static* shell binary: the
+  kernel does not load a `PT_INTERP` dynamic interpreter (a measured fact -
+  nothing in the exec path acts on `interp`), so Alpine's shared-musl busybox will
+  not run; a static aarch64 busybox (cross-built or a static prebuilt) is the
+  prerequisite. `/proc` is a further, separate blocker (it is gated behind the net
+  and PCI subsystems - see the next note), not needed for `ash` to start.
 
-  **`/proc` stays honestly refused on aarch64 - the gap is a measurement, not a
-  flag.** `vfs::procfs` already compiles on aarch64 (it is ungated in `vfs/mod.rs`)
-  and its `mount -t proc` arm carries only a `#[cfg(not(aarch64))]`, so the fs is
-  one line from being served. But `/proc/cpuinfo` is hardcoded to
-  `cpu family : x86_64 / model name : ... x86_64 processor` (`procfs.rs:1709`) - on
-  an aarch64 machine that is a wrong shape, and serving it would be the
-  "returning success for something not implemented" failure this codebase refuses.
-  The honest fix is an aarch64 `cpuinfo` backed by `MIDR_EL1` (implementer/part/
-  variant/revision read off the CPU, exposed through a `hal` capability, not
-  guessed - the `0xd08`-style constants a man page would supply are a fabrication
-  this kernel does not make). Until that exists the arm stays `ENODEV`, which is
-  the truthful answer a caller walking the type list gets. This is a real gap on
-  the init/shell path (many tools read `/proc`), named here rather than papered
-  over with a copied x86_64 string.
+  **`/proc` stays honestly refused on aarch64 - and it is gated, not one line from
+  serving (corrected by an attempt).** An earlier note here said `vfs::procfs`
+  compiled on aarch64 and the `mount -t proc` arm was a single `#[cfg]` from opening.
+  Measured false: `procfs` is `#[cfg(target_arch = "x86_64")]` in `vfs/mod.rs`,
+  because it reads `crate::net`'s socket table and `crate::drivers::pci` config - two
+  x86_64-gated subsystems - so the module is absent on aarch64 entirely. Attempting to
+  route `/proc/cpuinfo` through a new `hal::Cpu::cpuinfo` capability (to avoid the
+  hardcoded `cpu family : x86_64` string, a wrong shape on ARM) hit a second wall:
+  `hal` is `#[cfg(target_os = "none")]`, so `crate::hal` is absent in the host build
+  where `procfs` *does* compile (host is x86_64-linux-gnu) - a procfs body cannot call
+  the machine capability. The change was reverted (no shipped partial-`/proc`, no
+  broken build). The real gap, now precisely named: **`/proc` on aarch64 is blocked
+  behind the `net` stack and PCI/virtio enumeration that `procfs` depends on** - i.e.
+  largely the same un-gating work as the `net` stage - not merely a `cpuinfo` fix. Once
+  `procfs` is made to compile without net/pci (cfg-gating `/proc/net` and the PCI-backed
+  nodes, the same shape as `drivers`'s prep commit), the `cpuinfo` needs a `MIDR_EL1`
+  read reached *without* naming `arch` from `vfs` (a per-arch `cpuinfo` inside procfs
+  itself, reading `MIDR_EL1` via `core::arch::asm` behind `target_arch`, or a capability
+  that also exists on host). Named, not papered over.
+
 
 
 
