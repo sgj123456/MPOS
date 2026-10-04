@@ -353,6 +353,15 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              root: MPOS_FILE_OPS_OK is absent (create/write/read/stat/unlink failed)"
         );
     }
+    // getcwd + chdir - the syscalls behind `pwd` and `cd`, which a shell needs at
+    // startup and on every directory change. The program chdir's into /dev, reads
+    // the cwd back, and returns; MPOS_CWD_OK asserts the round trip held.
+    if !log.contains("MPOS_CWD_OK") {
+        bail!(
+            "the aarch64 musl binary could not round-trip getcwd/chdir: the \
+             MPOS_CWD_OK line is absent (chdir into /dev and back, or getcwd, failed)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
@@ -370,7 +379,8 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              read, echoed, execve'd, cloned, waited, then ran a real static-musl ELF at EL0 \
              which opened the mounted /dev through libc file I/O (MPOS_DEV_URANDOM_OK, \
              MPOS_DEV_CONSOLE_OK), traversed it (MPOS_DEV_GETDENTS_OK, MPOS_DEV_STAT_OK), \
-             and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) - from the ESP under AAVMF"
+             and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) and \
+             round-tripped getcwd/chdir (MPOS_CWD_OK) - from the ESP under AAVMF"
         );
         return Ok(());
     }

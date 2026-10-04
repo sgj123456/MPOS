@@ -5959,7 +5959,9 @@ Named gaps the port carries rather than hides, each with its home:
   lifecycle** on the mounted root ramfs (`write` → `read` back → `metadata` →
   `remove_file` → confirm gone), printing `MPOS_FILE_OPS_OK` (also asserted) — the
   create/write/read/stat/unlink a shell and any init issue against the filesystem
-  proper, not only against device nodes.
+  proper, not only against device nodes. A `getcwd`/`chdir` round-trip (`cd /dev`
+  and back) prints `MPOS_CWD_OK` (also asserted) - the `pwd`/`cd` pair a shell uses
+  at startup and on every directory change.
   This is the same `open`/`read`/`write` a shell issues against the device set - so the
   mounted `/dev` is proven usable from a running program, not merely resolvable
   kernel-side.

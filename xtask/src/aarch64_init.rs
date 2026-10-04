@@ -492,6 +492,16 @@ pub fn build_static_musl_helper(build_dir: &Path) -> Result<Vec<u8>> {
         "    if ok { ok = std::fs::remove_file(probe).is_ok(); }\n",
         "    if ok { ok = std::fs::metadata(probe).is_err(); }\n",
         "    if ok { println!(\"MPOS_FILE_OPS_OK\"); } else { println!(\"MPOS_FILE_OPS_FAILED\"); }\n",
+        "    // The shell's startup + `cd`: getcwd and chdir. Move into /dev, confirm\n",
+        "    // current_dir reports it, move back - the round trip a `cd`/`pwd` makes.\n",
+        "    let mut cwdok = std::env::current_dir().is_ok();\n",
+        "    if cwdok && std::env::set_current_dir(\"/dev\").is_ok() {\n",
+        "        cwdok = std::env::current_dir().map(|p| p == std::path::PathBuf::from(\"/dev\")).unwrap_or(false);\n",
+        "        let _ = std::env::set_current_dir(\"/\");\n",
+        "    } else {\n",
+        "        cwdok = false;\n",
+        "    }\n",
+        "    if cwdok { println!(\"MPOS_CWD_OK\"); } else { println!(\"MPOS_CWD_FAILED\"); }\n",
         "}\n",
     );
     let src = build_dir.join("aarch64-musl-helper.rs");
