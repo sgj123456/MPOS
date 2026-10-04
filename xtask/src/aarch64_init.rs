@@ -25,9 +25,11 @@
 //!   fallback (which `boot-aarch64` can stop polling on) is never reached; `/t` is
 //!   [`marker_target_elf`].
 //!
-//! - [`marker_target_elf`] (the verdict's `/t`) writes `MPOS_EXEC_OK` then exits.
-//!   Nothing else prints that string, so its appearance after `R:echo-test` proves
-//!   `execve` transferred to a *second* image that then ran at EL0 (stage 6D).
+//! - [`marker_target_elf`] (the verdict's `/t`) writes `MPOS_EXEC_OK`, then forks
+//!   via `clone` and `wait4`: the child writes `MPOS_FORK_OK` and the parent waits,
+//!   so the child's line lands before the halt. Nothing else prints either string,
+//!   so their appearance proves `execve` transferred to a *second* image that ran at
+//!   EL0 and that `clone` started a *third* process (stage 6D).
 //!
 //! - [`looping_init_elf`] (the interactive `run --arch aarch64`'s) is the echo body
 //!   with the exit replaced by a branch back to the top, so it is a read/echo
@@ -36,8 +38,8 @@
 //!   its second `read(0)` parks (the tty wakes it only when a line lands,
 //!   `read_wait`'s canonical `UntilInput`) and `INIT_EXITED` never comes. A real
 //!   shell (busybox `ash`) is this loop plus `execve` of the shell binary once the
-//!   aarch64 static-musl image lands - the `execve` return-frame path those two
-//!   images exercise is now built (stage 6D); `clone` remains the named gap.
+//!   aarch64 static-musl image lands - the `execve`/`clone`/`wait4` return-frame
+//!   paths those images exercise are now built (stage 6D).
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -98,6 +100,16 @@ fn branch_to_start(n_words: usize) -> u32 {
     let back = (n_words - 1) as u32;
     let imm26 = ((1u32 << 26) - back) & 0x03ff_ffff;
     0x1400_0000u32 | imm26
+}
+
+/// `CBNZ X0, label` - branch to `label` if `x0` is non-zero, given the branch's
+/// own word index and the label's. `imm19` is the signed distance in instructions;
+/// `CBNZ` is opcode `0xB5000000` with `Rt`=0, so `0xB5000000 | (d << 5)`. The fork
+/// target uses it to split parent (`x0` = child pid) from child (`x0` = 0).
+fn cbnz_x0(from_word: usize, to_word: usize) -> u32 {
+    let d = (to_word - from_word) as i32;
+    let imm19 = (d as u32) & 0x0007_ffff;
+    0xb500_0000u32 | (imm19 << 5)
 }
 
 /// The shared body: `read(0, buf, 64)`, stash the count in `x9`, `write(1, "R:",
@@ -200,38 +212,82 @@ pub fn looping_init_elf() -> Vec<u8> {
 }
 
 /// `aarch64` asm-generic syscall numbers used below (Linux's, from `nr.rs`'s
-/// aarch64 table): `execve` and `exit_group`. `read`/`write` (63/64) are in
-/// [`echo_body`].
+/// aarch64 table): `execve`, `clone`, `wait4`, and `exit_group`. `read`/`write`
+/// (63/64) are in [`echo_body`]. `SIGCHLD` is the `clone` exit signal so the
+/// parent's `wait4` reaps the child.
 const NR_EXECVE: u32 = 221;
+const NR_CLONE: u32 = 220;
+const NR_WAIT4: u32 = 260;
 const NR_EXIT_GROUP: u32 = 94;
+const SIGCHLD: u32 = 17;
 
 /// The string the exec target writes when it runs - proof aarch64 `execve`
 /// replaced the image and the new program ran at EL0. Nothing else prints it.
 const EXEC_MARKER: &[u8] = b"MPOS_EXEC_OK\n";
+/// The string the fork target's *child* writes - proof aarch64 `clone` (the
+/// arch's real `fork`) started a second running program. Nothing else prints it.
+const FORK_MARKER: &[u8] = b"MPOS_FORK_OK\n";
 /// The path the launcher `execve`s, and the ramfs name the target is packed as.
 const EXEC_PATH: &[u8] = b"/t\0";
 
-/// The exec target: write `MPOS_EXEC_OK\n` then `exit_group(0)`. It reads nothing
-/// and takes no arguments - the launcher's `argv`/`envp` point at it but it
-/// ignores them; its only job is to prove control transferred here and ran.
+/// The exec target: writes `MPOS_EXEC_OK` (proving aarch64 `execve` transferred
+/// control here and ran at EL0), then forks. The child writes `MPOS_FORK_OK` and
+/// exits; the parent `wait4`s for it, then exits - so the child's line is on the
+/// wire before the machine halts. Together the two markers pin that `execve` and
+/// `clone` (aarch64's real `fork`, since the arch has no `fork` syscall) both run a
+/// program at EL0. Word layout (entry = 0); data is appended after the code:
+///   0..5   write(1, "MPOS_EXEC_OK\n", 13)
+///   6..12  clone(SIGCHLD, 0,0,0,0) -> x0 = child pid (parent) or 0 (child)
+///   13     cbnz x0, 24   (parent jumps; child falls through)
+///   14..23 child: write(1, "MPOS_FORK_OK\n", 13); exit_group(0); b .
+///   24..34 parent: wait4(0, &status, 0, NULL); exit_group(0); b .
 pub fn marker_target_elf() -> Vec<u8> {
+    let n = 35usize;
+    let data_base = VADDR + (CODE_OFF + n * 4) as u64;
+    let exec_addr = data_base;
+    let fork_addr = data_base + 13;
+    let status_addr = data_base + 32;
     let load = |rd: u32, addr: u64| {
         [
             movz(rd, (addr & 0xffff) as u32),
             movk(rd, ((addr >> 16) & 0xffff) as u32),
         ]
     };
-    // Code: write(1, marker, len) then exit_group(0), `b .`. Ten words, so the
-    // marker data lands at VADDR + CODE_OFF + 40.
-    let n = 10usize;
-    let marker_addr = VADDR + (CODE_OFF + n * 4) as u64;
-    let mut code = Vec::new();
+
+    let mut code: Vec<u32> = Vec::new();
+    // write(1, exec_marker, 13) - the exec confirmation, run once before forking.
     code.extend([movz(8, 64), movz(0, 1)]);
-    code.extend(load(1, marker_addr));
-    code.extend([movz(2, EXEC_MARKER.len() as u32), svc()]);
-    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]);
-    debug_assert_eq!(code.len(), n);
-    assemble_with(&code, EXEC_MARKER)
+    code.extend(load(1, exec_addr));
+    code.extend([movz(2, EXEC_MARKER.len() as u32), svc()]); // 0..5
+    // clone(SIGCHLD, child_stack=0, ptid=0, ctid=0, tls=0): the aarch64 `fork`.
+    code.extend([
+        movz(8, NR_CLONE),
+        movz(0, SIGCHLD),
+        movz(1, 0),
+        movz(2, 0),
+        movz(3, 0),
+        movz(4, 0),
+        svc(),
+    ]); // 6..12
+    code.push(cbnz_x0(13, 24)); // 13 - parent (x0 != 0) jumps to 24
+    // child: write(1, fork_marker, 13); exit_group(0); b .
+    code.extend([movz(8, 64), movz(0, 1)]);
+    code.extend(load(1, fork_addr));
+    code.extend([movz(2, FORK_MARKER.len() as u32), svc()]); // 14..19
+    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 20..23
+    // parent: wait4(pid=0, &status, options=0, rusage=NULL); exit_group(0); b .
+    code.extend([movz(8, NR_WAIT4), movz(0, 0)]); // 24..25
+    code.extend(load(1, status_addr)); // 26..27
+    code.extend([movz(2, 0), movz(3, 0), svc()]); // 28..30
+    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 31..34
+    debug_assert_eq!(code.len(), n, "fork target word count must match");
+
+    // Data: the two markers, then the 8-byte status word `wait4` writes.
+    let mut data = vec![0u8; 40];
+    data[0..EXEC_MARKER.len()].copy_from_slice(EXEC_MARKER);
+    data[13..13 + FORK_MARKER.len()].copy_from_slice(FORK_MARKER);
+    debug_assert_eq!(data_base + 32, status_addr);
+    assemble_with(&code, &data)
 }
 
 /// The headless verdict's `/init`: echo the queued line (so `boot-aarch64` still
@@ -338,7 +394,7 @@ mod tests {
     /// also pin that the loop's backward branch spans exactly the body.
     const LOOP_WORDS: usize = 20;
     const LAUNCHER_WORDS: usize = 31;
-    const TARGET_WORDS: usize = 10;
+    const TARGET_WORDS: usize = 35;
 
     /// Shared structural checks for any assembled image: the ELF identity, the
     /// single RWX `PT_LOAD` covering the whole file from offset 0, and the entry
@@ -421,21 +477,31 @@ mod tests {
     /// The exec target is a loadable image that writes the marker and exits: word 0
     /// is `mov x8,#64` (write), and `MPOS_EXEC_OK` sits at the address the write
     /// loads in `x1`.
+    /// The target writes the exec marker, forks (`clone`), and has both children's
+    /// and parent's halves: write(0), clone(6)=`mov x8,#220`, cbnz(13) to word 24
+    /// (`imm19 = 11`), and both `MPOS_EXEC_OK`/`MPOS_FORK_OK` in its data.
     #[test]
-    fn the_target_writes_the_marker_and_exits() {
+    fn the_target_writes_then_forks() {
         let e = marker_target_elf();
         assert_loadable(&e);
         let words = words_of(&e, TARGET_WORDS);
-        assert_eq!(words[0], 0xd2800808, "mov x8,#64 (write)");
-        assert_eq!(
-            words[TARGET_WORDS - 4],
-            0xd2800bc8,
-            "mov x8,#94 (exit_group)"
-        );
-        assert_eq!(words[TARGET_WORDS - 1], 0x14000000, "b .");
-        // The marker string is the data after the code, at the write's x1.
+        assert_eq!(words.len(), TARGET_WORDS);
+        assert_eq!(words[0], 0xd2800808, "mov x8,#64 (write exec marker)");
+        assert_eq!(words[6], 0xd2801b88, "mov x8,#220 (clone)");
+        assert_eq!(words[13], 0xb5000160, "cbnz x0 -> word 24 (parent)");
+        assert_eq!(words[TARGET_WORDS - 1], 0x14000000, "b . (parent park)");
+
         let data_file_off = CODE_OFF + TARGET_WORDS * 4;
-        assert_eq!(&e[data_file_off..], EXEC_MARKER, "the mapped marker");
+        assert_eq!(
+            &e[data_file_off..data_file_off + EXEC_MARKER.len()],
+            EXEC_MARKER,
+            "the exec marker at the first write's x1"
+        );
+        assert_eq!(
+            &e[data_file_off + 13..data_file_off + 13 + FORK_MARKER.len()],
+            FORK_MARKER,
+            "the fork marker at the child write's x1"
+        );
     }
 
     /// The loop image is the same body but ends in a branch back to the top, not

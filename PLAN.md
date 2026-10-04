@@ -5512,12 +5512,15 @@ through ten `#[cfg(not(target_arch = "aarch64"))]` preps, each a provable no-op 
 host (x86_64) and x86 bare metal where the predicate is simply true. What is deferred,
 and why it is refused rather than faked: the socket arms and the `'K'`/`'V'`/`'E'`/`'U'`
 and `SIOC`/`FBIO`/DRM ioctl families fall to `ENOTTY`/`ENOSYS` (no `net`/`drivers` on
-this machine yet); `ptrace`/`process_vm_*`/`rt_sig*`/`reboot`/`clone`/`fork`
+this machine yet); `ptrace`/`process_vm_*`/`rt_sig*`/`reboot`
 dispatch arms fall to `_ => ENOSYS` (they rewrite the x86 return frame, which arrives
-with the aarch64 signal-frame ABI); `execve` is now **served** on aarch64 (stage 6D:
-its body was already arch-neutral through `sched::exec_replace`, and the return-frame
-patch is arch-aware - `UserFrame.pc/sp/x[0]` on aarch64 instead of `RegsFrame.rcx/user_rsp`),
-so `svc 221` transfers to a new image at EL0, pinned by the `MPOS_EXEC_OK` marker; `arch_prctl` has no aarch64 number at all; the
+with the aarch64 signal-frame ABI; aarch64 has no `fork` number at all - a libc's
+`fork()` is `clone(SIGCHLD)`); `execve` and `clone`/`wait4` are now **served** on
+aarch64 (stage 6D: both handlers were already arch-neutral through
+`sched::exec_replace`/`sched::clone`, and only the x86 return-frame edges were split -
+`UserFrame.pc/sp/x[0]` and the aarch64 `user_context` instead of `RegsFrame`), so a
+program can `execve` a new image, `clone` a child, and `wait4` to reap it at EL0, pinned
+by the `MPOS_EXEC_OK` and `MPOS_FORK_OK` markers; `arch_prctl` has no aarch64 number at all; the
 seccomp *filter* path (reads the x86 RIP) and the ptrace entry/exit stops and on-exit
 signal delivery in `linux_dispatch` are gated to their no-tracer/no-signal identity;
 and `uname`'s machine field and the hostname/domainname were moved to per-arch and the
@@ -5692,11 +5695,27 @@ writes `MPOS_EXEC_OK`; `boot-aarch64` asserts the literal `MPOS_EXEC_OK` between
 keeping pid 1). Two bugs found and fixed while landing it, both honest failures the pin
 turned red on: the `EXECVE` dispatch arm was still gated out on aarch64 (`svc` fell to
 `ENOSYS`), and the packed initramfs files had no exec bit, so `may_access(X_OK)` denied
-even root - `boot-aarch64` now `chmod 0755` the staged files. `clone`/`fork` remain the
-named 6D gap (their child return frame needs the aarch64 signal-frame ABI). With execve
-served, a real shell (busybox `ash`) needs only a static-musl aarch64 `/init`/`ash` in
-the initramfs and a `fork`/`clone`+`wait` to run it as a child; the disk root, `net`, and
-`cargo xtask test --arch aarch64` remain.
+even root - `boot-aarch64` now `chmod 0755` the staged files.
+
+**Stage 6D (clone/wait4) is DONE: aarch64 can spawn and reap a child process.**
+aarch64 has no `fork` syscall number (`nr::FORK` is an unreachable sentinel); a libc's
+`fork()` is `clone(SIGCHLD)`, so the real path is `clone`. `handle_clone`/`handle_clone_impl`
+were already arch-neutral through `abi::validate_clone_flags` + `sched::clone`/`spawn_copy`
+(which build the child from a `UserFrame` and start it ready, with no tracer to attach), so
+only two x86 edges needed splitting: `user_context` now reads the trap `UserFrame` directly
+on aarch64 (copy it, clear `x0` for the child) instead of reconstructing one from x86
+`RegsFrame` + `user_segments`, and the post-`clone` tracer announcement is `#[cfg]`-guarded.
+The `CLONE` dispatch arm lost its gate; `wait4` was already served. Pin: the exec target
+`/t`, after writing `MPOS_EXEC_OK`, does `clone(SIGCHLD)` and a `cbnz x0` splits parent from
+child - the child writes `MPOS_FORK_OK` and exits, the parent `wait4`s so the child's line
+lands before the machine halts, then exits (`INIT_EXITED`). `boot-aarch64` asserts the
+literal `MPOS_FORK_OK` between `MPOS_EXEC_OK` and `INIT_EXITED`. So the wire now shows the
+full chain - read, echo, `execve` to a second image, `clone` to a third process, `wait4` to
+reap it - all at EL0 through `syscall::dispatch`. `CLONE_VM`-without-`CLONE_THREAD` (the
+spawn shape) and the tidptr writes are honoured; `CLONE_THREAD`/TLS-threaded `clone` and the
+ptrace stops remain gated as the honest `ENOSYS`/no-tracer answer. With execve+clone+wait
+served, a real shell (busybox `ash`) needs only a static-musl aarch64 `/init`/`ash` in the
+initramfs; the disk root (`drivers`), `net`, and `cargo xtask test --arch aarch64` remain.
 
 
 **And the profile matters: the aarch64 debug build does not link.** `cargo

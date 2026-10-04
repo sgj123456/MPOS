@@ -302,7 +302,11 @@ pub fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -
         // `getpgrp()` takes no argument, so there is nothing to read out of
         // the register file and the caller's own group is the whole answer.
         nr::GETPGRP => proc::handle_getpgid([0; 6]),
-        #[cfg(not(target_arch = "aarch64"))]
+        // `clone` runs on both machines: the handler is arch-neutral up to the
+        // child frame, which `user_context` builds per-arch. This is the real
+        // aarch64 `fork` path - aarch64 has no `fork` syscall number, `fork()` is
+        // `clone(SIGCHLD)` - so a shell can spawn a child here. The post-`clone`
+        // tracer announcement is x86-gated in the handler (no aarch64 ptrace yet).
         nr::CLONE => proc::handle_clone(args, regs_ptr),
         #[cfg(not(target_arch = "aarch64"))]
         nr::FORK | nr::VFORK => proc::handle_fork(nr, args, regs_ptr),

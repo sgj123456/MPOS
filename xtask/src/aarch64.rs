@@ -232,15 +232,27 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
              MPOS_EXEC_OK line is absent (execve did not transfer to /t)"
         );
     }
+    // `/t` then forks (aarch64 has no `fork` syscall; `clone(SIGCHLD)` is the
+    // real path). Its child writes `MPOS_FORK_OK` and the parent `wait4`s before
+    // exiting, so the child's line is on the wire. Its presence proves aarch64
+    // `clone` started a distinct running process that reached EL0 (stage 6D).
+    if !log.contains("MPOS_FORK_OK") {
+        bail!(
+            "the aarch64 exec target never forked a running child: the \
+             MPOS_FORK_OK line is absent (clone did not start the child, or \
+             the parent did not wait for it)"
+        );
+    }
     if missing.is_empty() {
         println!();
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
              M1_TIMER_OK, M2_CONTEXT_OK, M6_AS_OK, M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
-             init's echoed input (R:echo-test), the exec target (MPOS_EXEC_OK), and \
-             INIT_EXITED - a scheduler-run userspace program read console input, echoed \
-             it, then execve'd a second image that ran at EL0 - from the ESP under AAVMF"
+             init's echoed input (R:echo-test), the exec target (MPOS_EXEC_OK), its fork \
+             child (MPOS_FORK_OK), and INIT_EXITED - a scheduler-run userspace program \
+             read console input, echoed it, execve'd a second image that ran at EL0 and \
+             then cloned a third - from the ESP under AAVMF"
         );
         return Ok(());
     }

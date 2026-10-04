@@ -1849,6 +1849,21 @@ fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::hal::UserFrame> 
     })
 }
 
+/// The aarch64 twin of [`user_context`]. The syscall gate's frame already *is* a
+/// `UserFrame` (`el0_sync` traps the whole register file into one), so the frame a
+/// fork/clone child resumes with is a copy of it with the result register `x0` set
+/// to `rax` - zero for a child, exactly as x86 clears `rax` - and nothing else.
+/// No segment selectors or `iretq` reconstruction, which are x86 concerns.
+#[cfg(target_arch = "aarch64")]
+fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::hal::UserFrame> {
+    if regs_ptr.is_null() {
+        return None;
+    }
+    let mut frame = unsafe { *(regs_ptr as *const crate::hal::UserFrame) };
+    frame.x[0] = rax as u64;
+    Some(frame)
+}
+
 /// `clone(flags, child_stack, parent_tid, child_tid, tls)` — create a process or
 /// a thread.
 ///
@@ -1872,12 +1887,10 @@ fn user_context(regs_ptr: *mut (), rax: usize) -> Option<crate::hal::UserFrame> 
 /// an honest refusal. `CLONE_VM` without `CLONE_THREAD` is the spawn shape and is
 /// honoured - see [`crate::sched::clone`].
 #[allow(clippy::too_many_lines)]
-#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_clone(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     handle_clone_impl(args, regs_ptr)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
 fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     let (flags, child_stack, parent_tid, child_tid, tls) =
         (args[0], args[1], args[2], args[3], args[4]);
@@ -1925,6 +1938,9 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     if flags & nr::CLONE_PARENT_SETTID != 0 {
         unsafe { (parent_tid as *mut i32).write_unaligned(child as i32) };
     }
+    // The tracer announcement is x86-only until the aarch64 ptrace stop ABI lands;
+    // on aarch64 there is no tracer to announce to (refuse-don't-fake, not a gap).
+    #[cfg(not(target_arch = "aarch64"))]
     tell_tracer_of_child(regs_ptr);
     child
 }
