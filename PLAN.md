@@ -5969,21 +5969,24 @@ Named gaps the port carries rather than hides, each with its home:
   prerequisite. `/proc` is a further, separate blocker (it is gated behind the net
   and PCI subsystems - see the next note), not needed for `ash` to start.
 
-  **A shell's `spawn` is blocked on aarch64 fork-COW page backing (measured).** An
+  **`std::process::Command` spawn data-aborts on aarch64 - cause not yet pinned.** An
   attempt had the running musl helper call `std::process::Command::new("/leaf").output()`
-  - the exact pipe + `dup2` + `fork` + `execve` + `waitpid` sequence a shell uses to run
-  a command. The markers printed up to the spawn (`MPOS_DEV_*_OK`, `MPOS_DEV_STAT_OK`) and
+  - the pipe + `dup2` + fork + `execve` + `waitpid` sequence a shell uses to run a
+  command. The markers printed up to the spawn (`MPOS_DEV_*_OK`, `MPOS_DEV_STAT_OK`) and
   then the process died with a userspace **data abort** (`user fault ... ESR 0x9200004f`),
-  not a clean errno. Diagnosis: the aarch64 fault handler demand-pages the stack/anon
-  regions it knows, but the child a real `fork` (clone with COW semantics) continues to
-  run in has pages that fault without being backed - the hand-encoded `clone(SIGCHLD)`
-  milestone only proved a child *reaches EL0*, not that it keeps executing in a forked
-  address space. So the concrete prerequisite for `ash` (and any program that spawns) is
-  **fork/COW page resolution on aarch64** - the child's private copy-on-write faults must
-  be handled the way the demand-pager handles the stack. Not yet built; the change was
-  reverted (no crash line shipped in the boot log). This is a sharper, code-level gap
-  than the static-busybox prerequisite above: even with a shell binary, it cannot run a
-  subcommand until fork-COW works.
+  not a clean errno. The change was reverted (no crash line shipped; boot-aarch64 stays
+  clean). An earlier draft of this note blamed missing fork-COW - that was **wrong**:
+  the aarch64 machine already carries the full COW machinery (`sched::fork` uses
+  `map_cow`/`set_cow_bit`; `arch/aarch64/paging.rs` implements `map_cow`/`resolve_cow`/
+  `is_cow_page`, and `el0_sync` already calls `sched::resolve_cow_fault`). So the abort is
+  a *narrower, unresolved* fault on a specific address, not absent COW support - the
+  likeliest candidates are the `posix_spawn`/`vfork` clone flags std::process reaches for
+  (vs the plain `fork`/`clone(SIGCHLD)` the MPOS_FORK_OK milestone exercises) or a
+  particular unbacked mapping the three resolvers don't cover. Pinning it needs a fault
+  trace of the exact region + the clone request std issues; named here as an open gap,
+  not asserted as "COW unbuilt." This blocks running a *subcommand* (a shell's core), and
+  is orthogonal to the static-busybox prerequisite above.
+
 
   **`/proc` stays honestly refused on aarch64 - and it is gated, not one line from
   serving (corrected by an attempt).** An earlier note here said `vfs::procfs`
