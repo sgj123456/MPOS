@@ -99,7 +99,7 @@ const BASELINE_MUTUAL_PAIRS: usize = 9;
 /// shape, so the ratchet fails on the first one.
 const BASELINE_VFS_DEVICE_REFERENCES: usize = 0;
 
-/// The layers below `syscall` that must not name it (AGENTS.md §4's first hard
+/// The layers below `syscall` that must not name it (AGENTS.md §3's first hard
 /// rule). `arch` and `main` are deliberately absent: the `syscall` gate's whole
 /// job is to enter the dispatcher, and `main` is the wiring.
 ///

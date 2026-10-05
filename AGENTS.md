@@ -1,34 +1,26 @@
 # AGENTS.md
 
 How to work in this repository. Read this before your first edit. The other docs split the rest:
-`README.md` = what MPOS *is*; `docs/ARCHITECTURE.md` = how it is put together and where the layering is
-violated; `docs/PLAN.md` = the roadmap, the measured status of every phase, and the home of any new plan;
-`docs/UAPI.md` = the userspace-visible surface (syscalls, ioctls, layouts, flag vocabularies) as one row
-per promise. This file is only **how to work here**, and points at those rather than repeating them.
+`README.md` = what MPOS *is*; `docs/ARCHITECTURE.md` = how it is put together, the module graph and
+where the layering is violated; `docs/PLAN.md` = the roadmap, the measured status of every phase,
+the ledger of every gate run and measurement, and the home of any new plan; `docs/UAPI.md` = the
+userspace-visible surface as one row per promise. This file is only **how to work here**, and points
+at those rather than repeating them.
 
 ---
 
-## 1. What this is
-
-See `README.md` — what MPOS *is* belongs there; this file is only how to work here.
-
----
-
-## 2. Repository map
+## 1. Repository map
 
 | Path | What lives there |
 |---|---|
 | `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs`, a thin arch dispatcher over `src/main/<arch>.rs`, which holds that machine's boot entry, milestone checks and panic handler |
-| `crates/` | downward-only leaf crates (see §4): `err`/`abi`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk` |
-| `boot/` | `mpos-boot`, the UEFI loader. Separate target (`x86_64-unknown-uefi` or `aarch64-unknown-uefi`), no kernel dep — both agree on a hand-written handoff record. One file per concern and one arm per machine: the file reading, the memory map and the handoff are shared, while the serial wire (`serial`), the page-table descriptor (`vm/x86_64.rs` vs `vm/aarch64.rs`) and the last instruction (`enter`) are the machine's |
+| `crates/` | downward-only leaf crates (§3): `err`/`abi`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk` |
+| `boot/` | `mpos-boot`, the UEFI loader — separate target (`-unknown-uefi`), no kernel dep, one hand-written handoff record shared by both machines; one file per concern, one arm per machine |
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
-| `user/` | `mpos-user`: ordinary `std` programs for the image (`rustix`, static musl) |
-| `user/abitest/` | `mpos-user-abi`: the `no_std` conformance suite — `src/bin/syscall/` (one family), `src/bin/integration/` (a device, the net, a subsystem end to end) |
-| `user/tests/` | `mpos-user-tests`: `std`-side tests for what is easiest to pin from a hosted language |
-| `user/staging/` | Scratch sources, wired into no build. Don't assume dead — but don't build them |
+| `user/` | `mpos-user` (ordinary `std` programs); `user/abitest/` = the `no_std` conformance suite (`src/bin/syscall/` one family, `src/bin/integration/` end-to-end); `user/tests/` = `std`-side tests; `user/staging/` = scratch, wired into no build |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**: libFuzzer targets over the kernel's parsers |
-| `rootfs/`, `rootfs.toml` | the x86_64 guest image tree and its packages/hostname/disk geometry. `rootfs-aarch64.toml` + `rootfs-aarch64/` are the **second machine's** pair: same tiny key vocabulary, same `RootfsConfig` parser, but a different userland (no GPU/DRM/desktop packages) and a different overlay (its `/init`, which mounts the pseudo-filesystems the x86_64 initramfs script mounts). Two files rather than one per-arch key soup |
-| `initramfs/`, `initramfs.toml` | the early-userspace tree the x86_64 boot unpacks as its first root (`busybox`, `/init`) + the packages it is built from |
+| `rootfs/`, `rootfs.toml` | the x86_64 guest image tree and its packages/disk geometry; `rootfs-aarch64.toml` + `rootfs-aarch64/` are the second machine's pair — same parser, different userland and its own `/init` overlay |
+| `initramfs/`, `initramfs.toml` | the early-userspace tree the x86_64 boot unpacks as its first root, and its packages |
 | `machine.toml` | what the image is *booted* on — memory, cpus, devices, run mode. Host-side only, so editing it never reinstalls |
 | `tests.toml` | which test programs the sweep runs by default, and its groups |
 | `build/`, `target/`, `build-test/` | build output and scratch. Never edit, never commit |
@@ -38,29 +30,25 @@ would build the musl user programs for the host.
 
 ---
 
-## 3. Build, run, verify
+## 2. Build, run, verify
 
-Prereqs: nightly toolchain with `rust-src rustfmt clippy`; targets `x86_64-unknown-none`,
-`-uefi`, `-linux-musl`, `-linux-gnu`, and for the aarch64 side `aarch64-unknown-none`,
-`-uefi` (both named in `rust-toolchain.toml`, so rustup installs them on first use). For
-`run`/`disk`/`rootfs` also: `qemu-system-x86_64`, OVMF
-(`/usr/share/OVMF/x64/OVMF_CODE.4m.fd`), `qemu-img`/`qemu-nbd`, `sfdisk`, `partx`, `blkid`,
-`mkfs.ext4`, `mkfs.fat`, `tar`, `sudo`. `rootfs`/`initramfs` fetch Alpine packages over the network.
-For `boot-aarch64`: `qemu-system-aarch64` and AAVMF (`/usr/share/AAVMF/AAVMF_CODE.fd` +
-`AAVMF_VARS.fd`, or the `QEMU_EFI.fd`/`QEMU_VARS.fd` names under `/usr/share/edk2/aarch64`), and
-the `aarch64-unknown-linux-musl` target (`rustup target add aarch64-unknown-linux-musl`) so the
-verdict can build and `execve` an unmodified static-musl helper (`/musl`) alongside its
-hand-encoded images — symmetric with the x86 test path's musl prereq.
+Prereqs: nightly with `rust-src rustfmt clippy`; targets `x86_64-unknown-none`, `-uefi`,
+`-linux-musl`, `-linux-gnu`, plus `aarch64-unknown-none` and `-uefi` (both named in
+`rust-toolchain.toml`). For `run`/`disk`/`rootfs`: `qemu-system-x86_64`, OVMF, `qemu-img`/`qemu-nbd`,
+`sfdisk`, `partx`, `blkid`, `mkfs.ext4`, `mkfs.fat`, `tar`, `sudo`. For the aarch64 side:
+`qemu-system-aarch64`, AAVMF, and `aarch64-unknown-linux-musl` so the verdict can build and `execve`
+an unmodified static-musl helper. `rootfs`/`initramfs`/`alpine-aarch64` fetch Alpine packages over
+the network; `alpine-aarch64` also needs `fakeroot`.
 
 | Command | What it does | Root? |
 |---|---|---|
 | `cargo xtask build` | kernel + UEFI loader | no |
 | `cargo xtask all` | kernel, initramfs, disk image, root filesystem | yes |
-| `cargo xtask run` [`--mode terminal\|gui\|mirror`] [`--arch x86_64\|aarch64`] | boot in QEMU, rebuilding stale bits; `--mode` picks the window backend and the guest's `console=` list together; `--arch aarch64` boots the second machine to its **own shell** on the serial console — an in-tree `/init` makes `/tmp` and `execve`s `/bin/sh`, the `sh` applet of the multi-call `/bin` image `xtask/src/aarch64_bin.rs` builds — i.e. a real program reading the console through the tty at EL0, not the read/echo REPL stand-in it used to be (stage 7e's `looping_init_elf` is deleted; the default machine is `x86_64`) | when needed |
-| `cargo xtask test` | **the gate**: host unit tests, then every user test program booted in QEMU. `--arch aarch64` is the second machine's own arm — the musl programs and a runner (which also does the machine setup the x86 `/init` does with busybox, i.e. making `/tmp`) are packed onto its ESP/disk and booted under AAVMF, read with the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol. Which programs count is `tests.toml`'s answer there too: its `aarch64` group names what that machine cannot serve yet — **empty today**, the socket family having left it when the stack landed and the spawn family when its disk root got a `/bin` (built in-tree as a multi-call binary, `xtask/src/aarch64_bin.rs`, so the gate reaches no network) — and the arm prints every one by group and name — a green summary means "every program this machine was supposed to be able to run passed", never a silent skip. Neither arm can silently run the other machine | no |
+| `cargo xtask run` [`--mode terminal\|gui\|mirror`] [`--arch x86_64\|aarch64`] | boot in QEMU, rebuilding stale bits. `--mode` picks the window backend and the guest's `console=` list together. `--arch aarch64` boots the second machine to its **own shell** on the serial console — pid 1 is an in-tree `/init` that makes `/tmp` and `execve`s `/bin/sh` (the multi-call `/bin` image `xtask/src/aarch64_bin.rs` builds) | when needed |
+| `cargo xtask test` | **the gate**: host unit tests, then every user test program booted in QEMU. `--arch aarch64` is the second machine's own arm, read with the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol; its program set is `tests.toml`'s `aarch64` group's answer, and the arm prints every one by group and name — a green summary means "every program this machine was supposed to run passed", never a silent skip. Neither arm can silently run the other machine | no |
 | `cargo xtask depgraph` | measure the module graph against the Phase-11 ratchet; fails when an edge appears or a count grows | no |
-| `cargo xtask boot-aarch64` | **the second machine**: build the aarch64 kernel and its UEFI loader, lay out an ESP, boot it under AAVMF, and read the verdict off the PL011 log (`M4_CONSOLE_OK`, `M4_DEVICES_OK`, `M3_TABLES_OK`, `M5_VIRTIO_OK`, `M7_RNG_OK`, `M7_BLK_OK`, `M7_FS_OK`, `M7_DEV_OK`, `M8_NET_OK`, `M8_NET_STACK_OK`, `M8_INPUT_OK`, `M1_TIMER_OK`, `M2_CONTEXT_OK`, `M6_AS_OK`, `M6_PAGING_OK`, `M6_WALL_OK`, `M6_CPU_OK`, `M6_SERIAL_RX_OK`, `M6_TLS_OK`, `M6_EL0_OK`, `M6_CONSOLE_RX_OK`, `M5_SERIAL_TX_OK`, `M6_INIT_OK`). Through stage 4a/4b it was the machine layer, `hal`'s trait impls and the console service and nothing above; since stage 7's MMIO commit it also drives its first memory-mapped virtio device — `check_rng` opens the tree's virtio-rng window over `MmioTransport` and `M7_RNG_OK` asserts 32 host-generated bytes came back — and `check_blk` drives a virtio-blk the same way, reading and verifying a known sector from a raw MMIO disk image **and writing a sector back and reading it again** (`mmio::write_readback`, `M7_BLK_OK`), `check_fs` mounts an ext4 over the block to prove the block-driver -> filesystem path (the disk root, `M7_FS_OK`), and stage 8's `check_net` opens a virtio-net, reads its MAC, **and hands a frame to its TX virtqueue requiring the device to accept it** (`mmio::MmioNet`, `M8_NET_OK`) — proving the memory-mapped transport, queue setup and DMA move buffers on this machine through the same crate x86 uses — and then **publishes that same adapter for the network stack** (`mmio::init_net_global`): `main/aarch64.rs`'s `init_net` hands it to `net::init` + `net::spawn_service` (byte-for-byte the pair x86_64 boots with, the device being the only difference) and prints `M8_NET_STACK_OK`, a deliberately narrow claim — the adapter was handed over, both interfaces were built and the polling service was spawned — because the *round trip* is pinned by programs instead: `cargo xtask test --arch aarch64` stages 15 of the 17 std-side programs it builds and passes 15/15 — a TCP connect/accept/read-write round trip, UDP over the loopback, the two spawn tests over the `/bin` its root now carries, `t-ifreq`'s link-ioctl round trip, and `t-process-vm-libc`'s cross-process memory transfer among them (the two left out are `external`: `t-stdresolve` and `t-udp`) (`docs/PLAN.md` §13.4, §13.6; RX is polled, the GIC line routing is a later cut); `check_input` opens a fourth MMIO device class - a `virtio-input` device whose queues the transport negotiates **and whose config-space identity it reads** (`mmio::probe_input`, `M8_INPUT_OK`) - proving the path reaches input without claiming events (the evdev nodes and pump stay x86_64's, so `/dev/input` is still absent on aarch64); `check_dev` (in the init handoff, once the console tty is up) builds the `mount -t devtmpfs`/`devfs` device set the kernel now serves on aarch64, mounts it at `/dev` (the kernel-side mirror of Linux's `CONFIG_DEVTMPFS_MOUNT`), and reads `/dev/urandom` and the MMIO-rng-backed `/dev/hwrng` back *through the live mount table* (`resolve` -> `read_at`), printing `M7_DEV_OK` — the `/dev` tree a real init mounts exists on this machine, its x86-only virtio-PCI/`uinput`/DRM nodes `#[cfg]`-gated out to leave the honest generic set; since stage 6E it also starts the scheduler, unpacks the loader's initramfs into a ramfs, loads `/init` and runs it — since stage 7c the boot task actually yields a turn to the init (`sched::is_running`, not the always-false `has_live_child`), so the init truly executes at EL0: it first proves aarch64 EL0 demand paging (it pushes `sp` past the mapped stack and stores there; `MPOS_FAULT_OK` prints only if `el0_sync`'s page-fault handler took the page), then performs a `read(0)`/`write(1,...)` round trip through `syscall::dispatch` (reads the line the handoff queued on the tty, then writes the bytes it read back prefixed `R:`, so the wire shows `R:echo-test` — stage 7d), then `execve`s a second hand-encoded image (`/t`) that writes `MPOS_EXEC_OK` and then `clone`s — the child writes `MPOS_FORK_OK`, the parent `wait4`s so it lands before the halt — proving aarch64 `execve` **and** `clone`/`wait4` run programs at EL0 (stage 6D) — and the parent then `execve`s `/musl`, an *unmodified* statically-linked `aarch64-unknown-linux-musl` binary `xtask` builds (its own `println!` prints `MPOS_MUSL_OK`; the demand-paging handler services its larger stack/anon pages), whose `exit_group` reaches `sched::exit` and prints `INIT_EXITED` — a scheduler-run program that demand-paged, read, echoed, execve'd, cloned, waited, and ran a real static-musl ELF at EL0 (stage 8) which then opened the mounted `/dev` through libc file I/O (`open`/`read` `/dev/urandom` → `MPOS_DEV_URANDOM_OK`, `open`/`write` `/dev/console` → `MPOS_DEV_CONSOLE_OK`), traversed it (`read_dir` → `MPOS_DEV_GETDENTS_OK`, `metadata` → `MPOS_DEV_STAT_OK`), and ran a full regular-file lifecycle on the mounted root (`write`/`read`/`metadata`/`remove_file` → `MPOS_FILE_OPS_OK`) and a getcwd/chdir round-trip (`MPOS_CWD_OK`) and a symlink/readlink round-trip (`MPOS_SYMLINK_OK`) and a mkdir/nested-file/rmdir round-trip (`MPOS_MKDIR_OK`) and a rename/hard-link round-trip (`MPOS_RENAME_LINK_OK`) and an ftruncate round-trip (`MPOS_TRUNCATE_OK`) and a 1 MiB mmap-backed heap buffer (`MPOS_MEMORY_OK`) and fd duplication via fcntl (`MPOS_DUP_OK`) and a struct-stat ABI check (`MPOS_STAT_OK`), all asserted) — not just the `check_el0` probe | no |
-| `cargo xtask alpine-aarch64` | **the second machine's real userland**: install a genuine Alpine `aarch64` tree (`rootfs-aarch64.toml`; `apk --arch aarch64` under `fakeroot`, so the build stays unprivileged and the image keeps root ownership) into the machine's bare ext4, lay out its ESP, boot it headless under AAVMF and read the verdict off the PL011. A green run ends with Alpine's own `getty` printing `localhost login:` — busybox init reading `/etc/inittab`, openrc running its runlevels, all on this kernel. It carries **no** initramfs: the disk root is the whole userland, and the kernel's root switch is what puts it in reach. Needs the network (it fetches the Alpine `aarch64` packages) and `fakeroot`; no root | no |
+| `cargo xtask boot-aarch64` | **the second machine's boot verdict**: build the aarch64 kernel and loader, lay out an ESP, boot under AAVMF, read the marker chain off the PL011 (`M3_TABLES_OK` … `INIT_EXITED`). The chain's meaning, every stage's measurement and the terminator rule live in `docs/PLAN.md` §9.1 and §13 | no |
+| `cargo xtask alpine-aarch64` | **the second machine's real userland**: install a genuine Alpine `aarch64` tree under `fakeroot` onto its bare ext4 and boot it headless — a green run ends with Alpine's own `getty` printing `localhost login:`. No initramfs; the disk root is the whole userland. `docs/PLAN.md` §13.12 | no |
 | `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` | just the host unit tests | no |
 | `cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu` | xtask's own tests | no |
 | `cargo xtask clean` | remove `build/` and `target/` | when needed |
@@ -70,295 +58,231 @@ cargo fmt --check
 cargo clippy --target x86_64-unknown-none            # kernel, bare metal
 cargo clippy --target x86_64-unknown-linux-gnu       # kernel, host
 cargo clippy -p mpos-xtask --target x86_64-unknown-linux-gnu
-# The second machine, and the reason these two are here: everything under
-# `src/arch/aarch64/` is `#[cfg]`-ed out of every x86_64 target, so nothing above
-# lints it. A `--deny`-level lint in aarch64-only code fails there and nowhere else.
-cargo clippy --target aarch64-unknown-none
-(cd boot && cargo clippy --target aarch64-unknown-uefi)   # the loader's aarch64 arm
+cargo clippy --target aarch64-unknown-none           # everything under src/arch/aarch64/ is
+(cd boot && cargo clippy --target aarch64-unknown-uefi)   # #[cfg]-ed out of every x86 target above
 ```
 
 **Three build traps.** (1) **`--target` is mandatory for host work**: `.cargo/config.toml` pins
-`[build] target = "x86_64-unknown-none"`, so a bare `cargo test` builds for bare metal and cannot run.
-(2) **`user/abitest` uses overridden flags**: its `x86_64-unknown-none` profile uses the *kernel's*
-linker script, so the gate builds it with `RUSTFLAGS=-C relocation-model=static` from inside
-`user/abitest/`. Building it by hand without that yields binaries the loader rejects.
-(3) **The aarch64 target links in `--release` only**: `cargo build --target aarch64-unknown-none`
-fails with `relocation R_AARCH64_ABS64 cannot be used against local symbol` from the *sysroot's*
-`liballoc`, which is not built for a PIE — and no gate notices, because `xtask` builds this machine
-in release. Anything hand-verifying an aarch64 change must pass `--release` (or the failure reads as
-a broken change rather than a broken profile).
+`[build] target = "x86_64-unknown-none"`, so a bare `cargo test` builds for bare metal and cannot
+run. (2) **`user/abitest` uses overridden flags**: its profile uses the *kernel's* linker script, so
+the gate builds it with `RUSTFLAGS=-C relocation-model=static` from inside `user/abitest/`; by hand
+without that yields binaries the loader rejects. (3) **The aarch64 target links in `--release`
+only**: a debug build fails with `relocation R_AARCH64_ABS64 …` from the *sysroot's* `liballoc`, and
+no gate notices — anything hand-verifying an aarch64 change must pass `--release`.
 
-**The self-test protocol (`cargo xtask test`).** Stage 1 = host unit tests. Stage 2 = builds
-`mpos-user-tests` (musl) and `mpos-user-abi` (bare metal), packs them into a throwaway initramfs with
-a generated `/init`, and boots it headless with `mpos.selftest`. `/init` runs every `/bin/t-*`; the
-serial log is parsed for `=== RUN/PASS/FAIL t-name` / `=== SUMMARY pass=N fail=N` / `=== END`. The run
-must end with a summary **and** QEMU exit code 33 (`isa-debug-exit`). A test that hangs, crashes or
-never prints `=== PASS` counts as failed — no `#[ignore]` escape hatch; a test that cannot work is
-deleted or made to pass.
+**The self-test protocol.** Stage 1 = host unit tests. Stage 2 = builds both test suites, packs
+them into a throwaway initramfs with a generated `/init`, boots it headless with `mpos.selftest`,
+and parses the serial log for `=== RUN/PASS/FAIL t-name` / `=== SUMMARY pass=N fail=N` / `=== END`.
+The run must end with a summary **and** QEMU exit code 33 (`isa-debug-exit`). A test that hangs,
+crashes or never prints `=== PASS` counts as failed — no `#[ignore]` escape hatch; a test that
+cannot work is deleted or made to pass.
 
-**`tests.toml` picks which programs run.** All are built; grouped ones are left of the default sweep.
-A test in no group always runs, so the default = "everything that is a check of *this machine*", and a
-red one implicates the kernel, not the host. Groups: `external` (needs the host network or a listener),
-`slow` (measurement/seconds), `diagnostic` (not a check at all — `t-sh`). `--groups <a,b>` replaces the
-file's default; `--all-groups` runs everything. An undefined group name (on the CLI, or in the file
-naming a nonexistent program) is an error — a sweep that quietly runs fewer tests than asked is the one
-failure this must not have. So a new test lands with a group decision, and silence is the default.
-Stage 3 is a non-event: the test initramfs and the FAT-synthesized boot dir live under `build/`, so
-nothing a test runs can leak into the image `cargo xtask run` boots.
+**`tests.toml` picks which programs run.** All are built; grouped ones are left of the default
+sweep. Groups: `external` (needs the host network or a listener), `slow` (measurement/seconds),
+`diagnostic` (not a check at all). `--groups <a,b>` replaces the file's default; `--all-groups` runs
+everything; an undefined group name is an error — a sweep that quietly runs fewer tests than asked
+is the one failure this must not have. A new test lands with a group decision; silence is the
+default. Nothing a test runs can leak into the image `cargo xtask run` boots (test artefacts live
+under `build/`).
 
-**Reporting the gate — never from a stale run.** This file carries **no test counts**: a snapshot here
-goes stale within a commit or two, and a stale green breaks its own rule. The measured state lives in
-`docs/PLAN.md` (latest run quoted from its §12.4a summary line; every phase records what it measured). The
-rule: re-run the gate and quote the summary line + exit code — or say plainly it did not get there.
+**Reporting the gate — never from a stale run.** This file carries **no test counts**: a snapshot
+here goes stale within a commit or two. The measured state lives in `docs/PLAN.md` (its latest §12.4a
+summary line; every phase records what it measured). Re-run the gate and quote the summary line +
+exit code — or say plainly it did not get there.
 
 ---
 
-## 4. Code conventions
+## 3. Code conventions
 
 ### Every design here is Linux's behaviour — never a toy of it
 
 This governs everything below. MPOS exists so **unmodified Linux binaries run**, which makes failure
-asymmetric: a wrong *shape* sends the caller down a path it cannot recover from; an honest errno sends
-it down its own fallback. **Nearly-right is worse than absent** — "implement the common case, tighten
-later" has been paid for repeatedly, always in debugging (udevd untagging every device; a compositor
-stopping with no pointer). Concretely:
+asymmetric: a wrong *shape* sends the caller down a path it cannot recover from; an honest errno
+sends it down its own fallback. **Nearly-right is worse than absent.**
 
-1. **Measure before designing.** A behaviour a real program depends on is observed on real Linux first,
-   and the observation is written down with the number beside the claim. A design argued from a man page
-   alone is often wrong — the man page does not say which half of the rule the caller branches on.
-2. **Answer truthfully, or refuse.** When this kernel cannot do what Linux does it says so in the only
-   language a caller reads: `ENOSYS` (call absent here), `EOPNOTSUPP` (present, cannot do that),
-   `EINVAL` (argument refused), `EACCES`/`EPERM` (will not grant). The `_ => ENOSYS` arm in
-   `src/syscall/linux/mod.rs` is an honest answer and should stay crowded. **Returning success for
-   something not implemented is the single worst thing this codebase can do** — the caller believes
-   something false and stops asking.
-3. **No private dialects.** A flag, struct or protocol gets its Linux shape, not a shape this
-   implementation finds convenient. Two behaviourally-equal designs split the moment a third program reads them.
+1. **Measure before designing.** A behaviour a real program depends on is observed on real Linux
+   first, and the observation is written down with the number beside the claim. A man page does not
+   say which half of the rule the caller branches on.
+2. **Answer truthfully, or refuse.** `ENOSYS` (call absent here), `EOPNOTSUPP` (present, cannot do
+   that), `EINVAL` (argument refused), `EACCES`/`EPERM` (will not grant). The `_ => ENOSYS` arm in
+   `src/syscall/linux/mod.rs` should stay crowded. **Returning success for something not implemented
+   is the single worst thing this codebase can do.**
+3. **No private dialects.** A flag, struct or protocol gets its Linux shape, not a convenient one.
 4. **Refuse rather than approximate.** When the honest alternative to doing it properly is doing it
-   *nearly*, refuse — an unimplemented action is `EOPNOTSUPP` from its availability probe, a namespace
-   that isolates nothing is `EOPNOTSUPP` rather than a namespace.
-5. **A gap gets a name, not a stub.** Whatever cannot be built today is a named gap in `docs/PLAN.md` with
-   its measurement and missing prerequisite. A `TODO` in shipped code, a handler that does nothing and
-   returns 0, and a shape that looks finished while doing less are the same violation.
-6. **A gap gets a pin, or it is not done.** A landed behaviour is a behaviour: host test, `t-*` program,
-   or both. "Works, verified by hand once" is how this repo lost the same bug four times.
+   *nearly*, refuse.
+5. **A gap gets a name, not a stub.** Whatever cannot be built today is a named gap in
+   `docs/PLAN.md` with its measurement and missing prerequisite. A `TODO` in shipped code, a handler
+   that returns 0, and a shape that looks finished while doing less are the same violation.
+6. **A gap gets a pin, or it is not done.** Host test, `t-*` program, or both. "Works, verified by
+   hand once" is how this repo lost the same bug four times.
 
 ### Five standing checklist rules (before anything lands)
 
-1. **Kernel-space discipline.** What Linux runs in userspace (device management, fs utilities, network
-   daemons) is not this kernel's job — it provides the ABI userspace expects and nothing more.
-2. **High cohesion, low coupling.** Before adding a feature, locate the module that owns the concept.
-   A change that reaches into another module's internals is in the wrong module.
-3. **No toy or temporary designs.** Governing rule 3 + item 4, as a checklist item; never waived for convenience.
-4. **Every behaviour ships with a pin that would fail without it.** Governing rule 6, counterfactual as
-   the criterion: a test that passes with *and* without the change pins nothing.
+1. **Kernel-space discipline.** What Linux runs in userspace is not this kernel's job — it provides
+   the ABI userspace expects and nothing more.
+2. **High cohesion, low coupling.** Before adding a feature, locate the module that owns the
+   concept. A change reaching into another module's internals is in the wrong module.
+3. **No toy or temporary designs.** Governing rule 3 + 4 as a checklist item; never waived for convenience.
+4. **Every behaviour ships with a pin that would fail without it.** Counterfactual as the criterion:
+   a test that passes with *and* without the change pins nothing.
 5. **Respect the designed dependency graph.** Modules depend on each other only along the edges the
-   design allows; update the graph in `docs/ARCHITECTURE.md` before adding an edge, not after. A new upward or
-   back edge (a VFS module calling a driver's internals) is a violation even when it compiles.
+   design allows; update `docs/ARCHITECTURE.md` (§2 + §3) *before* adding an edge, not after.
 
 ### Module boundaries
 
-Rule 5 says respect the graph; this is it. `docs/ARCHITECTURE.md` §2 = the full mermaid diagram, §3 the
-ownership table, §9 the measured violations — this table is the working copy and the two files move
-together. A module may call **downward only**, into what "may depend on" lists; anything else is a
-violation. The graph is *measured*, not just described: `cargo xtask depgraph` (a host test too)
-re-extracts every `crate::` reference and fails when an edge appears that was not recorded the last time
-someone set the number. Adding an edge along a violation is a red gate; removing one lowers a constant.
-The purest leaves are separate crates under `crates/` (re-exported from `src/lib.rs` as `crate::err`
-etc.) so an upward edge from them is a **compile error**, not a convention — see `docs/ARCHITECTURE.md` §1.
-
-| Module | Owns | May depend on | Must never |
-|---|---|---|---|
-| `main.rs` | boot, milestone checks, panic handler | anything (it is the wiring) | hold reusable logic — that lives in the lib |
-| `syscall/` | numbers, `abi.rs` facts, dispatch, handlers | `vfs`, `sched`, `mm`, `drivers`, `net`, services | be a per-device ioctl switchboard (V-2) |
-| `vfs/` | `Inode`/`FileSystem`, mounts, fd table, every fs, pipes/epoll/timerfd/signalfd | `sched`, `mm`, `blk`, `pci` | name a device/socket type (V-1 closed — a caller uses `dyn Inode::as_any`; the trait names none). The terminal emulator is the `term` crate; the console mux and line discipline are still here, but the shared VC vocabulary (`VC_COUNT`, KD/K mode words in `crate::term::vc`), the pure `vtmode` handover table (`crate::term::vtmode`) and the active-console number (`crate::term::vc::active`) have moved to the `term` leaf — which collapsed the `vfs ↔ console` pair (V-4 pair closed; the mux *file* move, D.2b, remains) |
-| `sched/` | task table, priority bands, sleep/block, signals, futex | `mm`, `arch`, `binfmt` | host another subsystem's per-process cleanup (V-3) |
-| `mm/` | buddy frames, slab heap, mapping plans, ELF loader | `boot` | know files, tasks or devices |
-| `arch/` | GDT/IDT, PIC/LAPIC, paging, context switch, syscall gate, timer, ports | `mm` (via its own re-exports) | be named from outside `arch::`/`hal::` — every machine call above the machine layer goes through `crate::hal`, and the depgraph now fails on any module but `arch`/`hal`/`main`/`lib` naming it (`docs/PLAN.md` §11.4, stages 1–4 all landed) |
-| `hal/` | the capability traits a machine implements (`Clock`, `WallClock`, `Cpu`), the platform tag `Current`, and the one-line forwards everything above calls | nothing — `arch/<arch>/` implements the traits *for* `hal`'s `Current`, so `arch → hal` is the only arrow | hold machine bodies: a port adds its `impl`s in its own `arch/<arch>/`, never here |
-| `console/` | log ring, serial, framebuffer switch, the six virtual consoles | `hal` (the `Console`/`SerialRing` sink), `boot` (the console list), the `term` crate | reach into the VFS for the grid: it names `crate::term` for the grid and for the active-console number, never `vfs::*` (V-4 pair closed). The serial wire is reached through `crate::hal::Console`/`SerialRing` (stage 4a), not by naming `drivers::serial`, so the framebuffer + interrupt-ring + parking arms `#[cfg]`-inert on a polled machine |
-| `net/` | smoltcp, socket registry, AF_INET/UNIX/NETLINK/VSOCK/PACKET | `drivers`, `sched`, `uevent` | validate user pointers outside the `uaccess` leaf (V-9, closed by B3) |
-| `drivers/` | virtio, DRM/KMS, render task, evdev/uinput, PCI config, serial, RTC | `mm`, `pci`, `sched` | call back into `syscall` (V-5) or parse ioctl ABI (V-2) |
-| leaves — `crates/*` + `rand`/`uevent`/`logging`/`sync`/`uaccess` | one concern each, pure logic, host-compiled where possible; downward-only and cannot name the kernel. `err` is the errno table every layer may answer with, so nothing below `syscall` names `syscall` for a minus sign | each other and `arch` as drawn | accumulate state that makes them a layer |
-
-Two rules make the table usable rather than decorative:
-
-1. **An existing violation is not precedent.** `docs/ARCHITECTURE.md` §9's V-* are real edges being removed in
-   Phase 11. Code may not add a *new* caller along a violation edge or widen one.
-2. **A needed edge changes the design record first.** A legitimate dependency genuinely missing from §2
-   is added to `docs/ARCHITECTURE.md` (§2 + §3) *in the same commit*, with the reason — a diff that
-   contradicts the graph is the diff that is wrong.
+The table, the enforcement story and the two rules that make it usable (violation-is-not-precedent;
+a needed edge changes the design record in the same commit) are in `docs/ARCHITECTURE.md` §2/§3 —
+that file and this one move together. The working copy of the rule: a module may call **downward
+only**; `cargo xtask depgraph` re-measures every `crate::` reference and fails on an unrecorded
+edge; the purest leaves live in `crates/` so an upward edge from them is a **compile error**.
 
 ### Seven extended rules (what a change carries, what it may not touch)
 
 Each exists because of a failure this repo has actually paid for.
 
-1. **A test is a contract, not an obstacle.** When the gate goes red, the code changes, not the test.
-   Weakening a test is the same violation as faking success. Where a test's *expectation* is genuinely
-   wrong, the commit body carries the measurement proving the kernel's answer is Linux's.
+1. **A test is a contract, not an obstacle.** When the gate goes red, the code changes, not the
+   test. Where a test's *expectation* is genuinely wrong, the commit body carries the measurement
+   proving the kernel's answer is Linux's.
 2. **Every new parser gets a fuzz target.** Any place the kernel reads user- or wire-supplied bytes
-   (ioctl arg, ELF section, packet) joins the targets in `fuzz/` in the same commit, or `docs/PLAN.md` says why not.
-3. **A published ABI is append-only.** Syscall numbers, struct layouts and ioctl encodings are contracts
-   once shipped — a running musl binary reads them. Renumber/repack/reinterpret a landed shape only with
-   an explicit migration in `docs/PLAN.md`.
-4. **Worst-case rule.** The global allocator still panics on failure (`docs/PLAN.md` §8.0), so user-controlled
-   growth can end the machine. Until that closes, any new path whose allocation volume a user can steer
-   carries a bound — capped count, checked length, or `ENOMEM` at the limit. Drivers cite it by this name.
-5. **Interrupt context does none of: sleep, allocate, walk an unbounded structure.** An IRQ handler does
-   bounded work, takes no lock a preempted task may hold, and defers the rest. On one core, spinning on a
-   preempted holder is a deadlock with the machine stopped on it.
-6. **A performance change ships with before/after numbers.** `docs/PLAN.md` §10 is only true if entries are
-   measurements; an optimisation without a cost is how the idle `hlt` bug hid until it burned a tick/wake.
-7. **One intent per commit.** A refactor and a behaviour change in one diff have no single *why* for the
-   §7 body. Split: the refactor lands first, green on its own, then the change.
+   joins the targets in `fuzz/` in the same commit, or `docs/PLAN.md` says why not.
+3. **A published ABI is append-only.** Syscall numbers, struct layouts and ioctl encodings are
+   contracts once shipped. Renumber/repack/reinterpret only with an explicit migration in `docs/PLAN.md`.
+4. **Worst-case rule.** The global allocator still panics on failure (`docs/PLAN.md` §8.0), so until
+   that closes, any new path whose allocation volume a user can steer carries a bound — capped
+   count, checked length, or `ENOMEM` at the limit.
+5. **Interrupt context does none of: sleep, allocate, walk an unbounded structure.** Bounded work,
+   no lock a preempted task may hold, defer the rest. On one core, spinning on a preempted holder is
+   a deadlock with the machine stopped on it.
+6. **A performance change ships with before/after numbers.** `docs/PLAN.md` §10 is only true if
+   entries are measurements.
+7. **One intent per commit.** A refactor and a behaviour change in one diff have no single *why*.
+   Split: the refactor lands first, green on its own, then the change.
 
 ### The `no_std` split is the central convention
 
-Arch-independent logic lives in the library and is host-tested; anything touching port I/O, descriptor
-tables, virtio rings, firmware or a real clock is gated behind `#[cfg(target_os = "none")]` (and
-`target_arch = "x86_64"` where the hardware is x86-specific). Pure logic (arithmetic, encodings, parsers,
-policies) belongs host-side even when its only caller is bare metal — `crates/evdev`/`crates/uinput`
-exist to hold input policy a host test can reach.
-
-The gate is applied per module, by this rule (home: `src/lib.rs`'s header): **a module is host-compiled
-when its logic touches no hardware, no port I/O, no virtio ring and no real clock — and then its
-dependencies must be host-compiled too, transitively.** The transitive half is what gets forgotten: when
-you gate a module, check what gates its tests; when you ungate one, check everything it names is ungated
-too. `cargo xtask test` opens with a mechanical check for the one failure the compiler cannot see — a
-`#[cfg(test)]` module behind a `target_os = "none"` parent, dead code that reads as coverage
-(`xtask/src/gates.rs`, closing `docs/ARCHITECTURE.md` V-11).
+Arch-independent logic lives in the library and is host-tested; anything touching port I/O,
+descriptor tables, virtio rings, firmware or a real clock is gated behind `#[cfg(target_os = "none")]`
+(and `target_arch = "x86_64"` where the hardware is). Pure logic belongs host-side even when its
+only caller is bare metal. The per-module rule (home: `src/lib.rs`'s header): **a module is
+host-compiled when its logic touches no hardware, no port I/O, no virtio ring and no real clock —
+and then its dependencies must be host-compiled too, transitively.** The transitive half is what
+gets forgotten. `cargo xtask test` opens with a mechanical check for the failure the compiler
+cannot see — a `#[cfg(test)]` module behind a `target_os = "none"` parent (`xtask/src/gates.rs`).
 
 ### Concurrency
 
-- **Uniprocessor**: disabling interrupts *is* mutual exclusion; a critical section is the whole mechanism.
-- Shared state is `critical_section::Mutex<RefCell<T>>`. **Never `spin::Mutex`** — busy-waiting on a lock
-  held by a task this core preempted is a deadlock (`spin::Once` only for one-time `gdt`/`idt` init).
-- **Never sleep holding a lock.** The blocking pattern is *lock, poll, try, unlock, park* — see
+- **Uniprocessor**: disabling interrupts *is* mutual exclusion.
+- Shared state is `critical_section::Mutex<RefCell<T>>`. **Never `spin::Mutex`** — busy-waiting on a
+  lock held by a task this core preempted is a deadlock (`spin::Once` only for one-time `gdt`/`idt`).
+- **Never sleep holding a lock.** The pattern is *lock, poll, try, unlock, park* — see
   `src/net/mod.rs` and `docs/ARCHITECTURE.md` §7.
-- The idle halt belongs to the scheduler's loop. A task that `hlt`s while staying runnable costs a whole
-  tick on every wake — a real bug with a measured cost (`docs/PLAN.md` §10.2).
+- The idle halt belongs to the scheduler's loop; a task that `hlt`s while staying runnable costs a
+  whole tick on every wake (`docs/PLAN.md` §10.2).
 
 ### Comments, errors, panics
 
-House style is long-form prose doc comments explaining **why**, not what: `//!` headers run to paragraphs,
-and a non-obvious decision names the rejected alternative and the evidence. Match that. Don't add a
-comment that restates code; don't delete an existing rationale comment while editing around it.
-
-Panic ends the machine (`panic = "abort"` + a handler that exits QEMU). Syscall handlers return Linux
-errno constants through `err` and never unwrap user input. Known gap: the global allocator's failure path
-is still `panic!` (`docs/PLAN.md` §8.0).
+House style is long-form prose doc comments explaining **why**, not what: `//!` headers run to
+paragraphs, and a non-obvious decision names the rejected alternative and the evidence. Match that.
+Don't add a comment that restates code; don't delete an existing rationale comment while editing
+around it. Panic ends the machine (`panic = "abort"` + a handler that exits QEMU). Syscall handlers
+return Linux errno constants through `err` and never unwrap user input.
 
 ---
 
-## 5. Recipes
+## 4. Recipes
 
-**Add/change a Linux syscall.** (1) `src/syscall/linux/nr.rs` — the number and `pub const` (this file is
-`#[path]`-included by the test harness, so naming it there makes it addressable). (2) `src/syscall/linux/mod.rs`
-— the dispatch `match` arm (grouped arms like `nr::STAT | nr::LSTAT =>` are normal). (3) handler in
-`fs/file.rs` (path/file/device calls) and `fs/ioctl.rs` (the device-`ioctl` entry point) — the old
-`fs.rs` split along that seam at Step E — plus `proc.rs` (memory/process/time) or `posix.rs`
-(identity/capabilities/scheduling/
-clocks); validation and contracts with the handler, pure ABI facts (flag values, layouts, encodings) in
-host-compiled `abi.rs`. (4) an unimplemented call falls to `_ => ENOSYS` (§4). (5) add a conformance program
-+ its `[[bin]]` entry (next recipe). (6) update `docs/PLAN.md` ("Remaining ABI support" + TODO board) and
-`docs/UAPI.md` — its syscall table and work list are the same inventory; a call moving between served / refused /
-wrong-shape belongs in both.
+**Add/change a Linux syscall.** (1) `src/syscall/linux/nr.rs` — the number and `pub const` (the test
+harness `#[path]`-includes this file). (2) `src/syscall/linux/mod.rs` — the dispatch arm. (3) the
+handler in `fs/file.rs` (path/file/device calls) or `fs/ioctl.rs` (the device-`ioctl` entry point),
+plus `proc.rs` (memory/process/time) or `posix.rs` (identity/capabilities/scheduling/clocks);
+validation with the handler, pure ABI facts in host-compiled `abi.rs`. (4) an unimplemented call
+falls to `_ => ENOSYS` (§3). (5) a conformance program + its `[[bin]]` entry (next recipe).
+(6) update `docs/PLAN.md` ("Remaining ABI support" + TODO board) and `docs/UAPI.md` — a call moving
+between served / refused / wrong-shape belongs in both.
 
 **Add a user test program.** `no_std` raw-syscall → `user/abitest/src/bin/syscall/t-<name>.rs`, or
 `.../integration/t-<name>.rs` if it needs a device, the net, another process image, or is a timing
-instrument. **You must add an explicit `[[bin]]` block to `user/abitest/Cargo.toml`** — Cargo does not
-auto-discover `src/bin/<subdir>/*.rs`, and `xtask/src/selftest.rs` bails on a source with no binary.
-`std`/`rustix` → `user/tests/src/bin/t-<name>.rs` (flat, auto-discovered). Print `ok:`/`FAIL:` per check and
-a final `PASS`/`FAILED`, exit 0/nonzero. The harness + stubs are `user/abitest/lib/lin.rs`, included with
-`#[path = "../../../lib/lin.rs"]`. Keep the `t-` name (the test `/init` globs `/bin/t-*` and keys the verdict
-on it). **Decide its group in `tests.toml`** — a test that reaches outside (host network, a listener), measures,
-or takes seconds is `external`/`slow`/`diagnostic`, not silent.
+instrument. **Add an explicit `[[bin]]` block to `user/abitest/Cargo.toml`** — Cargo does not
+auto-discover `src/bin/<subdir>/*.rs`. `std`/`rustix` → `user/tests/src/bin/t-<name>.rs` (flat,
+auto-discovered). Print `ok:`/`FAIL:` per check and a final `PASS`/`FAILED`. The harness is
+`user/abitest/lib/lin.rs`. Keep the `t-` name (the test `/init` globs `/bin/t-*`). Decide its group
+in `tests.toml`.
 
-**Add a kernel unit test.** A `#[cfg(test)] mod tests` at the bottom of the file it tests, with the file's
-parent module compiled for the host (§4). Assert on the contract (value, errno, count), not a log line; prefer
-a test that would fail if the policy differed — the ext4 cache, evdev window and locking tests are the models.
+**Add a kernel unit test.** A `#[cfg(test)] mod tests` at the bottom of the file it tests, with the
+parent module compiled for the host (§3). Assert on the contract (value, errno, count), not a log
+line; prefer a test that would fail if the policy differed.
 
-**Change the guest image.** A file that must exist → the `rootfs/` (or `initramfs/`) tree — overlays apply
-*after* anything the toml writes, so a tree file wins. A package → `rootfs.toml` (`base_packages`/
-`extra_packages`) or `initramfs.toml`. Partition/fs-type/image-size/hostname/DNS → `rootfs.toml` (parser is
-deliberately tiny: `key = value` + arrays). Anything about the *machine* the image boots on (memory, cpus,
-`vsock`, `audio`, window backend, run mode, extra QEMU args) → `machine.toml`, **not** `rootfs.toml` — this
-is a cost rule: `rootfs.toml`'s mtime decides whether the Alpine tree is reinstalled, so a machine key there
-would charge a full package install for a memory size (`xtask/src/config.rs`'s
-`the_machine_and_the_image_keep_their_own_keys` fails if a machine key drifts back; `image_size`/`esp_size`
-stay in `rootfs.toml` because changing either re-makes the partitions). Boot wiring (`mpos.selftest`, the
-`console=` list) is read in `src/main.rs` via `src/boot/console_list.rs`, and the `--mode` writes the list in
-`xtask/src/config.rs`/`rootfs.rs` — the kernel is told which consoles it has and nothing about how it was launched.
+**Change the guest image.** A file that must exist → the `rootfs/` (or `initramfs/`) tree (overlays
+apply *after* anything the toml writes). A package → `rootfs.toml`/`initramfs.toml`. Partition /
+fs-type / image-size / hostname / DNS → `rootfs.toml`. Anything about the *machine* (memory, cpus,
+`vsock`, `audio`, window backend, run mode, extra QEMU args) → `machine.toml`, **never**
+`rootfs.toml` — `rootfs.toml`'s mtime decides whether the Alpine tree is reinstalled, so a machine
+key there charges a full package install for a memory size (`xtask/src/config.rs`'s
+`the_machine_and_the_image_keep_their_own_keys` fails if one drifts back). Boot wiring
+(`mpos.selftest`, the `console=` list) is read via `src/boot/console_list.rs`; the kernel is told
+which consoles it has and nothing about how it was launched.
 
-**The second machine's userland is its own pair**, and the split is a fact about the machines rather than
-tidiness: `rootfs.toml`/`rootfs/` describe an x86_64 desktop (weston, mesa, the DRM stack), which this
-machine has no hardware for, so `rootfs-aarch64.toml` names `alpine-base`/`openrc` and `rootfs-aarch64/`
-carries the `/init` that mounts `/proc`, `/sys`, `/tmp`, `/run` and `devpts` (the x86_64 side does that
-from its initramfs script; this machine pivots in the kernel, so its script lives on the disk). A package
-for the second machine goes in `rootfs-aarch64.toml`; a file, in `rootfs-aarch64/`. Both are installed by
-`cargo xtask alpine-aarch64`, which runs the same `utils` helpers as the x86_64 install under `fakeroot`
-and lays the result onto the machine's bare ext4 — note that `fakeroot` must wrap **`mkfs.ext4` too**, not
-only `apk`: `mke2fs -d` records each file's owner by stat'ing it, so an unwrapped `mkfs` writes a root
-filesystem owned by the build user.
+**The second machine's userland is its own pair** (`rootfs-aarch64.toml` + `rootfs-aarch64/`;
+`docs/PLAN.md` §13.12): a package goes in the toml, a file in the overlay, both installed by
+`cargo xtask alpine-aarch64`. One caveat worth repeating: `fakeroot` must wrap **`mkfs.ext4` too**,
+not only `apk` — `mke2fs -d` stats each file, so an unwrapped `mkfs` writes a root filesystem owned
+by the build user.
 
-**Touch the boot handoff.** The `Handoff` record is written twice — `boot/src/handoff.rs` (loader) and
-`src/boot/handoff.rs` (kernel) — plus `BOOT_STACK_CANARY` in `src/main.rs`. No shared crate between them by
-design. Change all three, and keep the loader's "allocate everything before `exit_boot_services`" ordering intact.
+**Touch the boot handoff.** The `Handoff` record is written twice — `boot/src/handoff.rs` (loader)
+and `src/boot/handoff.rs` (kernel) — plus `BOOT_STACK_CANARY` in `src/main.rs`. No shared crate by
+design. Change all three, and keep the loader's "allocate everything before `exit_boot_services`"
+ordering intact.
 
 ---
 
-## 6. Known traps
+## 5. Known traps
 
 | Trap | What to do |
 |---|---|
 | Bare `cargo test` won't link/run | Always `--target x86_64-unknown-linux-gnu` |
 | A new test program silently never built | Add the `[[bin]]` block; `xtask` errors on "no binary" only for sources it finds |
 | A `src/` file nothing declares looks real | A `mod` declaration makes a file part of the build; missing ones left duplicate serial/RTC drivers for months (V-7). Check for the declared one before writing a new file |
-| A module has a host body and a machine body | **Both move, or it does not build.** The host suite was green while `--target x86_64-unknown-none` failed: `VfsError::Revoked` was mapped in the host `err_of` but the machine `#[cfg]` arm was left non-exhaustive (V-11). Run the bare-metal target on every pass |
-| A flag or struct constant looks shared but the machines disagree | `open(2)`'s `O_DIRECTORY`/`O_NOFOLLOW`/`O_DIRECT`/`O_LARGEFILE` have **different numbers** on arm64 (its `asm/fcntl.h` overrides them before the generic header), and the overlap bites: arm64's `O_LARGEFILE` (`0x20000`) is x86_64's `O_NOFOLLOW`, so a one-table kernel answered `ELOOP` to every symlink `open()` on aarch64 - musl adds `O_LARGEFILE` to *every* open. It cost a whole session of debugging to find, because the symptom (`syslog`'s loader failing on a *versioned symlink*) reads like a filesystem bug. Before assuming a constant is shared, read **the machine's** uapi (the `musl-dev` headers unpack per architecture) and pin both machines (`user/tests/src/bin/t-open-flags.rs`). Check the same for `struct` layouts and ioctl words - `struct stat`/`statx` and the signal frame were the same class |
-| `cargo xtask run` prints no milestone markers | By design — `M*_OK` checks run only under `mpos.selftest` (set by `xtask test`). Markers that exist: M0–M4, M6, M7, M8_IPC, M8 (the x86_64 sweep prints no M5 and nothing above M8). The aarch64 machine prints its own stage markers — `M4_CONSOLE_OK`, `M4_DEVICES_OK`, `M3_TABLES_OK`, `M5_VIRTIO_OK`, `M7_RNG_OK`, `M7_BLK_OK`, `M7_FS_OK`, `M7_DISK_OK`, `M7_ROOT_OK`, `M7_DEV_OK`, `M8_NET_OK`, `M8_NET_STACK_OK`, `M8_INPUT_OK`, `M1_TIMER_OK`, `M2_CONTEXT_OK`, `M6_AS_OK`, `M6_PAGING_OK`, `M6_WALL_OK`, `M6_CPU_OK`, `M6_SERIAL_RX_OK`, `M6_TLS_OK`, `M6_EL0_OK`, `M6_CONSOLE_RX_OK`, `M5_SERIAL_TX_OK`, `M6_INIT_OK` (in that order) — which no x86 sweep produces, and they come from `cargo xtask boot-aarch64`, whose marker chain is the boot's own verdict; `cargo xtask test --arch aarch64` boots the same machine but reads the *programs'* verdict out of it instead. Since stage 7c the verdict also requires the scheduler-run `/init` to actually execute, and 7d made it a full interactive round trip: the handoff queues a line on the tty, the init does `read(0)` (returns it) then writes the bytes it read back prefixed `R:` (`write(1,"R:")` then `write(1,buf,n)`) then `exit_group`, so boot-aarch64 shows `echo-test`, `R:echo-test` and `INIT_EXITED` — proof a real userspace program read console input and echoed it back at EL0 via the scheduler, not just the pre-scheduler `check_el0` probe. The `M3_`/`M4_`/`M5_`/`M6_` on the aarch64 side are that machine's *stage* checks (console 4b, devices 5a, timer/paging/virtio/context 1c-6f, address-space/EL0 6a-6g, thread pointer 6h, init handoff 6E, serial receive 7a, console read path 7b, scheduler-run init 7c, console transmit ring §13.7), which is why several start with a stage number the x86 sweep never prints |
-| `cargo xtask test` stage 1 goes red in `rand` and nowhere else | A **flake**, not the change, and it has a measured shape. `rand::tests::a_reseed_re_keys_the_generator` asserts that two `fingerprint()`s with no `reseed()` between them are equal - the counterfactual for the re-key - but `fingerprint`, `fill` and `reseed` all act on the module's *one* global generator, so a sibling host test that draws from it in that window makes the second fingerprint differ. Reachable from `abi`'s `getrandom(2)` test as well as from `rand`'s own, which is why a lock inside that module is not enough. Measured on this tree: 2 of 3 `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` runs fail that single assertion with `511 passed; 1 failed`, and 5 of 5 runs with `-- --test-threads=1` pass - 0.28 s against 0.14 s. So the host suite is not parallel-safe over a module whose tests share a global, which is the house pattern (`static X: Mutex<RefCell<…>>`). Re-run before believing a stage-1 red, and quote the run that was green. The fix, when someone takes it, is either serialising the suite or making the generator a value with the global as one instance |
-| A recorded measurement is about the machine that made it | §4 rule 1 says measure before designing; this is the other half of it - a number already written down is not a measurement of *this* question. The aarch64 PL031 module carried "a programmatic write does not stick" and had `hal::write_epoch` answering `false`, and two decisions rested on it (`RTC_SET_TIME` unreachable on that machine, and the boot check asserting the refusal). Re-measured (§13.15): the write that had been tried was `RTC_DR`, the counter's *read* door; loading `RTC_LR` (`0x08`) moves the offset `DR` is derived from and `DR` reads the value back. The tell is a claim that made a *refusal* permanent without saying which register, which program, or which run was observed - re-measure that kind before building on it, and write what the new measurement saw |
-| An aarch64 `M*_OK` check runs in front of the machine's own `init` | The second machine's milestone checks are its **boot's verdict**, not a `mpos.selftest` extra (`cargo xtask run` trap above), so they run on every aarch64 boot — including `cargo xtask alpine-aarch64`, in front of a real distribution's `init` and of the sweep's programs. A check that changes shared state must therefore put it back, or it damages the machine it is checking. Measured: `check_wallclock` proved `set_boot_epoch` moves the anchor by setting it to `1 << 40` and never restored it, so `clock_gettime(CLOCK_REALTIME)` answered a year of 36812 for the whole boot — which killed Alpine's `syslogd` inside musl's `asctime_r` (`a_crash()` on a timestamp that will not fit 26 bytes) and is what `t-localtime` fails on. The check's own log line reports the *saved* epoch, so the boot log read correct while the clock was wrong — check the state, not the line |
-| `TERMINATORS` in `xtask/src/aarch64.rs` is a list of *last* markers | It holds the **last** check's success marker and **every** check's failure marker — never the success marker of a check that another check comes after. A terminator stops the run, so a success marker listed too early kills the machine mid-boot and the log simply ends, which is indistinguishable from a hang. Four directions of this have now been measured: the list once ended at `M1_TIMER_OK`, which stage 2's checks come after (killed mid-line); stage 5a added `M4_DEVICES_OK`, which the timer and context checks come after — a boot that finished in 5.7 s instead of the 60 s deadline and stopped three lines into a machine that was working; stage 6a is the first check to land *after* the last one, so `M2_CONTEXT_OK` had to come **out** when `M6_EL0_OK` went in; and stage 6b's check lands *before* 6a's, so its **success** marker is not a terminator and only its failure marker is — the same holds for stages 6c/6d/6e, each of which sits before 6a's EL0 check, so `M6_PAGING_FAILED`/`M6_WALL_FAILED`/`M6_CPU_FAILED` are terminators while their `_OK` markers are not — and stage 6h's thread-pointer check sits in the same slot, so `M6_TLS_FAILED` is a terminator and `M6_TLS_OK` is not — and stage 6E's init handoff runs *after* the EL0 probe, so `M6_INIT_OK` is now the last success terminator and `M6_EL0_OK` came **out** of the list (leaving it in would stop the poll on a machine that still has init to run) — and stage 7a's serial-receive check sits in the same pre-EL0 slot as 6h (between `check_cpu` and `check_tls`), so `M6_SERIAL_RX_FAILED` is a terminator and `M6_SERIAL_RX_OK` is not — and stage 7b's console-read check runs in the handoff *after* the EL0 probe but *before* the init wait, so `M6_CONSOLE_RX_FAILED` is a terminator and `M6_CONSOLE_RX_OK` is not — and stage 7c made the handoff actually run `/init` (wait on `is_running`, not `has_live_child`, which was false from the start because pid 1 has no parent), so the terminal proof is now the init's `INIT_EXITED` (its `exit_group` routed to `sched::exit`) and the `R:echo-test` echo it writes after its `read(0)` completes; `INIT_EXITED` is the last success terminator and `M6_INIT_OK` (now printed before the wait) came **out** of the list. Elapsed time is the tell: a stall is 60 s, a wrong terminator is seconds |
-| A `static` with a zero initializer and no writer lands in `.rodata` | Read-only, on a machine whose page tables enforce it. Both times this has bitten, it was a buffer something intended to write: stage 1d's 128 KiB page-table arena (which cost 128 KiB of `.rodata` and was deleted with the `-kernel` path) and stage 2's task stack, whose first `stp` took a data abort *with the fault address inside the kernel image*. The fix is not a section attribute — it is to take frames from the allocator, which is what the code wanted anyway. Add `-C link-arg=-zmax-page-size=0x1000` to the list of things that will not save you |
-| An assembly block that switches section switches it for every later block | Every `global_asm!` in a crate is emitted into **one** assembly unit, so a block that names no section is assembled into whatever `.section` directive was last in effect — and a block that *changes* the section without changing it back moves everything assembled after it, with no diagnostic. Measured (§13.16): `arch/aarch64/mod.rs`'s EL0-program block opened `.section .rodata.el0_program, "a"` and never restored, so `context.rs`'s three code blocks (`mpos_enter_frame`, `mpos_context_switch` with `mpos_task_trampoline`, `mpos_context_round_trip`) were assembled *into that data section* — visible only in the linker's map (`-C link-arg=-Map=`), where input section `.rodata.el0_program` holds the program's 0x28 bytes followed by the routines' 0x25c. `.rodata` is mapped read-only, so the first **call** to one faulted at the routine's own entry — and because a faulting fetch lands on a function prologue, the address reads as "code in `.rodata`", which is what it was. Three defences, all now in place: enter a section with `.pushsection` and leave it with `.popsection`; name the section in every *code* block (`.section .text.context, "ax"`) so placement cannot depend on emission order at all; and let `arch/aarch64/linker.ld`'s `ASSERT`s catch it — they fail the link and name the symbol, which is where the mistake was made rather than two layers later at boot. A bug that appears "when the image grows" is often this: what changed is which blocks share a unit, not the size |
-| No cross-architecture build | aarch64 boots the way x86_64 does — firmware, ESP, `mpos-boot`, higher half, its own page tables out of `mm::vm::kernel_mappings`, a switch between two kernel tasks, the firmware's device tree read back and checked against the machine's own constants, the device window in the kernel half with the tree's thirty-two virtio transports read through it, and code run at EL0 in an address space of its own (`TTBR0_EL1`) that traps into the kernel and is answered — a space whose pages can then be protected, shared, marked copy-on-write, resolved and unmapped, with its tables returned when it goes, its address space
-answerable as a running process would answer it, a real wall epoch read off the
-PL031, user SIMD turned on and a distributor line maskable and an interrupt
-waitable on, and `crate::hal`'s baseline capability concerns implemented for it —
-through `cargo xtask boot-aarch64` (stages 1a-1f, 2, 5a, 5b, 6a-6f of `docs/PLAN.md`
-§9.1). Three things about that boot are measured rather than obvious, and all
-three are choices the *command* has to make: AAVMF publishes **no device tree** while it also builds ACPI tables (which `-M virt` does by default on aarch64), so the command passes `acpi=off` to get the machine to describe itself the way this port reads; the `virtio-mmio` transports answer **version 1** — the legacy register map, which this kernel's driver crate cannot read — unless `-global virtio-mmio.force-legacy=false` is passed; and attaching a device costs the guest **3.66 MiB** of usable RAM (measured: `48954` → `48018` frames, with the flag above contributing none of it), which on top of stage 5b's doubled page-table pool (`66` frames) and stage 6b's check (16 KiB of kernel: text 62 → 74, rodata 16 → 20) is why the boot log's frame count is `47944` where stage 5a's was `48954`. The aarch64 **debug** profile does not link at all (see the build traps above). What compiles above `arch` on aarch64: `hal` itself (stage 6f — its seven baseline concerns `Clock`/`WallClock`/`Cpu`/`Interrupts`/`Paging`/`Contexts`/`Console` implemented, and the optional capabilities this machine can answer for: `SignalFrame` since §13.2's Stage 3b, with `Msi`/`SerialRing`/`FpuTrap` left out because this machine has no such hardware), and `console` (stage 4a — the serial sink reached through `hal::Console`, its framebuffer/interrupt-ring/parking arms `#[cfg]`-inert; stage 4b exercises it at boot through a `main`-supplied `milestone` fn that emits `M4_CONSOLE_OK`, so it is runtime-pinned on the wire, not just compiling). Still gated: `drivers`' x86-only submodules (the PCI transports, `net`/`vsock`'s PCI halves, the DRM/uinput/evdev classes). Now compiled and wired for aarch64: the stage-5 knot `sched`/`vfs`/`uaccess`, `syscall` (stage 6A/6E — the whole module builds on its per-arch asm-generic number table, its gate is open to aarch64, and `el0_sync` routes a running task's `svc` into `linux_dispatch`, the deferred signal/ptrace/device/`execve`-return families falling to honest `ENOSYS`/`ENOTTY`), `drivers`' MMIO half (virtio-rng, virtio-blk — the disk root and its `rootfs/` overlay — virtio-net as the stack's live adapter, and virtio-input's probe), and `net` together with the socket syscalls over it (`mpos_net` is declared by both machines; the against-machine check is `collect_net_sockets`, the four `/proc/net` rows, gated with procfs's own condition); since stage 6E the boot starts the scheduler, unpacks the initramfs, switches its root onto the disk and runs `/init` to completion, so the routing is exercised end-to-end and pinned by `M6_INIT_OK`. `cargo xtask run --arch aarch64` boots the second machine to its **own shell** on the serial console — an in-tree `/init` (`aarch64_init::build_shell_init`) makes `/tmp` and `execve`s `/bin/sh`, so pid 1 *is* the shell (`xtask/src/aarch64_bin.rs`'s `sh` applet, reading a line at a time with a prompt on a terminal); `cargo xtask test --arch aarch64` runs the program sweep on the same machine, while a *full* Alpine userland (busybox `ash`, OpenRC, a getty) remains x86_64's. The idle/park context switch now works (stage 7a fixed `set_kernel_stack`, which emitted an undefined `MSR SP_EL1` at `EL1h`), the PL011 receive path is pinned by `M6_SERIAL_RX_OK`, and stage 7b wired it through the tty: `hal::ConsoleInput::poll_input` (aarch64-only capability; x86_64 feeds input from its serial interrupt and is not a `ConsoleInput`), an input pump task that polls the wire into `vfs::tty::global().receive_byte`, and `M6_CONSOLE_RX_OK` proving an injected byte reads back through `tty.read`. The read/echo loop that stood in for a shell (`aarch64_init::looping_init_elf`, stage 7e) is **deleted** rather than left as dead code: pid 1 is handed to the machine's real shell instead (`/init` makes `/tmp` and execs `/bin/sh`, §13.8), and the two new behaviours are binary-pinned by `t-stdspawn` — which now runs `/bin/ls` and feeds `sh` a script on a pipe, on **both** machines. The full `drivers` un-gate (virtio-blk MMIO for a disk root) and `net` have both landed since (§13.3/§13.4): the second machine boots its ext4 root and runs the same smoltcp stack over its MMIO adapter. The `-kernel` bring-up those stages used is **deleted** — do not bring it back as a shortcut, because the image is a higher-half PIE now and has no fixed address for QEMU to load it at |
+| A module has a host body and a machine body | **Both move, or it does not build.** Run the bare-metal target on every pass (V-11: the host suite was green while `x86_64-unknown-none` failed on a non-exhaustive `#[cfg]` arm) |
+| A flag or struct constant looks shared but the machines disagree | It is the machine's. `open(2)`'s `O_*` words differ on arm64 and the overlap bit the session-costing `ELOOP` bug (§13.13); `struct stat`/`statx` and the signal frame were the same class. Read **the machine's** uapi and pin both machines (`t-open-flags`) |
+| `cargo xtask run` prints no milestone markers | By design — `M*_OK` checks run only under `mpos.selftest`. The aarch64 machine's own marker chain is its boot's verdict and comes from `boot-aarch64`; its full meaning is `docs/PLAN.md` §9.1 |
+| `cargo xtask test` stage 1 goes red in `rand` and nowhere else | A **flake** — re-run before believing it and quote the green run. Measurement, mechanism and fix directions: `docs/PLAN.md` §12.4a |
+| A recorded measurement is about the machine that made it | A number already written down is not a measurement of *this* question. The tell is a claim that made a refusal permanent without saying which register, program or run — re-measure before building on it (§13.15) |
+| An aarch64 `M*_OK` check runs in front of the machine's own `init` | The checks run on every aarch64 boot, including `alpine-aarch64`. A check that changes shared state must put it back or it damages the machine it is checking (§13.14: a wall-clock check left the year 36812 and killed `syslogd`) |
+| `TERMINATORS` in `xtask/src/aarch64.rs` is a list of *last* markers | It holds the last check's success marker and every check's failure marker — never the success marker of a check another check comes after. A wrong one kills the boot seconds in, indistinguishable from a hang. Full history and the elapsed-time tell: `docs/PLAN.md` §9.1 |
+| A `static` with a zero initializer and no writer lands in `.rodata` | Read-only, on a machine whose page tables enforce it — and it bites whatever intended to write it (stage 1d's arena, stage 2's task stack). The fix is frames from the allocator, not a section attribute; `-zmax-page-size` will not save you (`docs/PLAN.md` §9.1 row 1d) |
+| An assembly block that switches section switches it for every later block | Every `global_asm!` in a crate is one assembly unit; a block that changes section without restoring moves everything assembled after it, visibly only in the linker map. The symptom is a faulting fetch on a prologue that reads as "code in `.rodata`". Three defences (`.pushsection`/`.popsection`, naming the section in every code block, the linker `ASSERT`s) and the measurement: `docs/PLAN.md` §13.16 |
+| No cross-architecture build | aarch64 boots the way x86_64 does — firmware, ESP, higher half, its own tables, EL0 address spaces — and the two arms share nothing but source layout. What compiles where, the three measured boot choices (`acpi=off`, `force-legacy=false`, device RAM cost) and the port's current reach: `docs/PLAN.md` §9.1/§13 |
 | `fuzz/` won't build from the root | It is its own workspace; run `cargo fuzz` from inside `fuzz/` |
 | A `net/*` host test never runs | `src/lib.rs` gates the whole `net` module on `target_os = "none"`; a host test inside it is unreachable |
 | `user/staging/` looks like a missing test | Deliberate scratch — check `user/abitest` and `user/tests` for the live version first |
-| `build-test/` holds old scripts/logs | Scratch (gitignored as `/build*`); don't build on or commit them |
-| Two `cargo xtask test` runs in one tree report nonsense | They share `build/test-initramfs.tar`, `build/test-esp`, `build/test-serial.log`; one reads a log the other is still writing. Symptom: "115 of 136 did not pass" beside a log ending `=== SUMMARY pass=134 fail=2`. Trust the log's own summary + `=== END`, re-run alone |
-| The test machine ≠ the run machine | `xtask test` boots an initramfs on its own QEMU wiring; `xtask run` boots the disk image on `machine.toml`'s. A device only one has is a shape no test sees — this hid an empty-SATA-controller boot that cost 28 s (§7.3). Name a driver's "controller with nothing on it" behaviour on the machine that has one (`cargo xtask run`) before calling it measured |
+| Two `cargo xtask test` runs in one tree report nonsense | They share `build/test-*` artefacts and one reads a log the other is writing. Trust the log's own summary + `=== END`, re-run alone |
+| The test machine ≠ the run machine | `xtask test` boots an initramfs on its own QEMU wiring; `xtask run` boots the disk image on `machine.toml`'s. A device only one has is a shape no test sees — name a driver's "controller with nothing on it" behaviour on the machine that has one before calling it measured (§7.3's 28 s empty-controller boot) |
 
 ---
 
-## 7. Git conventions
+## 6. Git conventions
 
-Subjects follow the log: `type(scope): what changed` — types `feat`/`fix`/`docs`/`refactor`; scopes are
-subsystems (`vfs`, `sched`, `net`, `drm`, `ext4`, `syscall`, `xtask`, `console`, `input`); multi-subsystem
-commits list them. The **body carries the why**: what was observed, measured, rejected — this history *is*
-the design record, so a commit that only restates the diff is out of place. `git log` the file before you
-change it. The review question every change gets: *is that Linux's answer, or a shape that looks like it?*
-Something that cannot be Linux's today says so in its errno and takes a named `docs/PLAN.md` gap in the same
-commit (§4). Never commit `build/`, `target/`, `build-test/` or anything under `.workbuddy/`, `.qoder/`,
-`.codely-cli/` (all gitignored). Never push to a remote unless explicitly asked.
+Subjects follow the log: `type(scope): what changed` — types `feat`/`fix`/`docs`/`refactor`; scopes
+are subsystems (`vfs`, `sched`, `net`, `drm`, `ext4`, `syscall`, `xtask`, `console`, `input`);
+multi-subsystem commits list them. The **body carries the why**: what was observed, measured,
+rejected — this history *is* the design record, so a commit that only restates the diff is out of
+place. `git log` the file before you change it. The review question every change gets: *is that
+Linux's answer, or a shape that looks like it?* Something that cannot be Linux's today says so in
+its errno and takes a named `docs/PLAN.md` gap in the same commit (§3). Never commit `build/`,
+`target/`, `build-test/` or anything under `.workbuddy/`, `.qoder/`, `.codely-cli/` (all
+gitignored). Never push to a remote unless explicitly asked.
 
 ---
 
-## 8. Where the plans live
+## 7. Where the plans live
 
-- `docs/PLAN.md` — roadmap phase by phase, TODO board at the top, "Suggested next moves". Also the ledger of
-  each gate run and performance change *with its measurement*, and the home of any new plan.
-- `docs/UAPI.md` — the userspace surface as an inventory (syscalls, ioctl families, layouts, flag vocabularies),
-  each row carrying Linux's answer, this kernel's, the owning module and the pin — the working list of
-  *served* / *honestly refused* / *wrong shape* (only the third is work).
-- `docs/ARCHITECTURE.md` §9 — the debt audit, mirrored in `docs/PLAN.md` Phase 11 with an ordered remediation plan.
-- If you implement something, update `docs/PLAN.md`'s status — and `docs/UAPI.md`'s row, when a call or request moves
-  between the three verdicts — **in the same commit**. The board is only useful if it is true.
+- `docs/PLAN.md` — roadmap phase by phase, TODO board at the top, "Suggested next moves". Also the
+  ledger of each gate run and performance change *with its measurement*, and the home of any new plan.
+- `docs/UAPI.md` — the userspace surface as an inventory (syscalls, ioctl families, layouts, flag
+  vocabularies), each row carrying Linux's answer, this kernel's, the owning module and the pin —
+  the working list of *served* / *honestly refused* / *wrong shape* (only the third is work).
+- `docs/ARCHITECTURE.md` §9 — the debt audit, mirrored in `docs/PLAN.md` Phase 11 with an ordered
+  remediation plan.
+- If you implement something, update `docs/PLAN.md`'s status — and `docs/UAPI.md`'s row, when a call
+  or request moves between the three verdicts — **in the same commit**. The board is only useful if
+  it is true.

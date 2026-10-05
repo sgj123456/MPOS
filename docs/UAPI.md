@@ -5,7 +5,7 @@ measurements beside it. This file is the other view of the same truth — an **i
 one row per promise the kernel makes to a binary it did not compile, so that the review
 question every change here gets asked can be asked of the whole surface at once:
 
-> *Is that Linux's answer, or a shape that looks like it?* (`AGENTS.md` §7)
+> *Is that Linux's answer, or a shape that looks like it?* (`AGENTS.md` §6)
 
 "UAPI" is Linux's own word for this (`include/uapi/`): the part of the kernel that is a
 contract. Here that is, concretely:
@@ -62,11 +62,11 @@ count of rows:
 | Verdict | Meaning | Is it work? |
 |---|---|---|
 | **Served** | Behaves as Linux does, and a pin would fail without it | No |
-| **Refused** | `ENOSYS` / `EOPNOTSUPP` / `EINVAL` / `EPERM` — Linux's own answer for a kernel that cannot do the call (`AGENTS.md` §4.2) | No. A refusal is the honest direction to be wrong in |
-| **⚠ wrong answer** | Accepted, answers success, and does less than Linux — or an errno/shape Linux would not give. The `ENOSYS`-free §4.2 failure class | **Yes.** These are the only defects |
+| **Refused** | `ENOSYS` / `EOPNOTSUPP` / `EINVAL` / `EPERM` — Linux's own answer for a kernel that cannot do the call (`AGENTS.md` §3.2) | No. A refusal is the honest direction to be wrong in |
+| **⚠ wrong answer** | Accepted, answers success, and does less than Linux — or an errno/shape Linux would not give. The `ENOSYS`-free §3.2 failure class | **Yes.** These are the only defects |
 
 A refusal is listed rather than hidden because a board is only useful if it is true
-(`AGENTS.md` §8). A missing feature with a named prerequisite is not a defect; a
+(`AGENTS.md` §3). A missing feature with a named prerequisite is not a defect; a
 success-for-a-thing-not-done is.
 
 ---
@@ -76,7 +76,7 @@ success-for-a-thing-not-done is.
 `src/syscall/linux/nr.rs` names **252** x86_64 syscall numbers. The dispatch in
 `src/syscall/linux/mod.rs` has an explicit arm for the **~230** the kernel implements, plus
 a `_ => ENOSYS` catch-all for the rest. That catch-all is deliberately crowded and is an
-honest answer (`AGENTS.md` §4.2): a libc probes optional calls by number and reads `ENOSYS`
+honest answer (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
 as "not available here".
 
 ### 1.1 Deliberately `ENOSYS` — refused, pinned
@@ -100,7 +100,7 @@ note printed once per number (`note_enosys`):
 
 `rseq` (334) is the eighth: like the seven above it has no dispatch arm, but unlike them it
 *once had* one that returned `0` without writing any of the fields the ABI contract puts in
-the caller's block. §4.2 ranks that shape worst, so the arm was removed; the number stays
+the caller's block. §3.2 ranks that shape worst, so the arm was removed; the number stays
 named (append-only) and `t-rseq` pins `ENOSYS`. Serving it needs a per-thread registration
 whose `cpu_id`/`node_id`/`mm_cid` are maintained across preemption, plus
 `RSEQ_FLAG_UNREGISTER` — a scheduler feature (`PLAN.md` A6).
@@ -157,7 +157,7 @@ a device does not implement.
 
 ## 3. Flag words and closed vocabularies
 
-`AGENTS.md` §12.1 records a swept pass over these, one landing per vocabulary. A flag the
+`PLAN.md` §12.1 records a swept pass over these, one landing per vocabulary. A flag the
 kernel accepts and drops is a promise not kept, and a *number* it accepts and ignores is the
 same failure in a different type.
 
@@ -359,7 +359,7 @@ the commit bodies), and each moved its pin in the same commit.
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes
   remaining/queued; this kernel answers `ENOTTY` for everything that is not the entropy
   pair. The `ENOTTY` is an honest "this descriptor has no queue-length story here" rather
-  than a wrong number, so it is not a §4.2 defect — but it is a divergence a program can
+  than a wrong number, so it is not a §3.2 defect — but it is a divergence a program can
   see. Closing it needs a per-descriptor byte count (a pipe has one; a file has
   `size - offset`). Owner: `fs.rs` + the node's own `poll` story.
 - **`RNDRESEEDCRNG` provenance.** Now that the reseed is real, `RNDGETENTCNT`'s 4096 stays

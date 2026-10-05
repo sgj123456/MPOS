@@ -74,12 +74,12 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         decided by the first address it is given, because the stack now keeps
         one `Fabric` (interface + device + socket set) per wire and smoltcp has
         no way to move a socket between them (`t-udp-loopback`). Raw/ICMP
-        sockets deliberately stay on eth0's (§4.3.1)
+        sockets deliberately stay on eth0's (§3.3.1)
   - [x] `listen`/`accept` on IPv4 — a listener is a *pool* of listening sockets
         plus the queue of the ones that completed, refilled after every poll;
         the contract is Linux's, each rule measured first, and closing a
         listener `FIN`s its unaccepted queue because an unsolicited `RST` is
-        not a packet smoltcp can send (§4.3.2, `t-tcp-listen`)
+        not a packet smoltcp can send (§3.3.2, `t-tcp-listen`)
   - [x] `SO_REUSEADDR` at `bind`/`listen` — and the rule it gates is *not* "the
         new socket asked": measured on Linux, a holder that is **listening**
         keeps its name whatever either side says, while any other holder
@@ -87,9 +87,9 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
         yields it only to a caller that set the option **and** whose holder had
         set it too — which is why Linux copies the option onto an accepted
         socket, and why a restart comes back onto its own port (`t-tcp-listen`)
-        (§4.3.3)
+        (§3.3.3)
   - [ ] `SO_LINGER{on,0}`'s egress reset / buffer sizes still record-only
-        (§4.3.3)
+        (§3.3.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
 - [~] 4.5 `AF_PACKET` — the link layer is a socket: `SOCK_DGRAM` `bind`/
       `sendto`/`recvfrom`/`getsockname`, a tap at the NIC seam that feeds a client
@@ -481,7 +481,7 @@ it - so the entries say which they are:
       `crate::drivers::pci::mark_drm_card` and `virtio::hal::claim_drm_card` at
       GPU init), and `vfs::sysfs` reads `device.drm_card`. The dependency stays
       `drivers -> pci` and `vfs -> pci` - no new `drivers -> vfs` edge, so
-      `ARCHITECTURE.md` §2/§3 are unchanged (AGENTS.md §4 rule 5). Pinned by the
+      `ARCHITECTURE.md` §2/§3 are unchanged (AGENTS.md §3 rule 5). Pinned by the
       host test `the_card_hangs_off_the_function_its_driver_declared`, which is
       red against the class-and-driver guess (it hangs the card off a second
       bound display function enumerated first). Closes the "part still to do"
@@ -1037,6 +1037,15 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         no `[ !! ]`; host 512; xtask 55; depgraph 9/9 within the ratchet (`vfs/mod.rs -> drivers|net`
         fell to 0, which the ratchet allows); fmt clean; clippy 0 errors on `x86_64-unknown-none`,
         `aarch64-unknown-none` and the aarch64 loader.
+        **The general rule this bug leaves behind** - three defences, all now in place, for any
+        assembly that switches section: enter a section with `.pushsection` and leave it with
+        `.popsection`; name the section in every *code* block (`.section .text.context, "ax"`) so
+        placement cannot depend on emission order at all; and let `arch/aarch64/linker.ld`'s
+        `ASSERT`s catch it - they fail the link and name the symbol, which is where the mistake was
+        made rather than two layers later at boot. A bug that appears "when the image grows" is
+        often this one: what changed is which blocks share an assembly unit, not the size. The
+        symptom class is a faulting fetch landing on a function prologue whose address reads as
+        "code in `.rodata`" - which is exactly what it was.
   - [x] 13.17 **not a bug**: the kernel does not hand back its own boot stack, and the record was
         never offering it. Found on the way as "the loader offers the kernel the stack it is running
         on", and the first half of that is true - the record's regions *are* the frame allocator's
@@ -1083,7 +1092,7 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       `cred`, `uts`, `seccomp`) moved out of `src/` into `crates/*` as workspace members,
       re-exported from `src/lib.rs` under their old names so no caller changed (`pub use
       mpos_err as err;`). The point is enforcement, not tidiness: a leaf crate cannot name the
-      kernel, so the downward-only rule (AGENTS §4 rule 5, and the V-* edges this table keeps
+      kernel, so the downward-only rule (AGENTS §3 rule 5, and the V-* edges this table keeps
       re-auditing) is a compile error for those seven, not a convention. `xtask test`'s host
       stage now names each crate with `-p` so the moved pins keep running (635 in-kernel + 50 in
       crates = the 685 the suite ran before). `mpos-pci`'s test fixtures (`Device::fixture`,
@@ -1166,7 +1175,7 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       mux-only inversion moves no ratchet. The `vcmux` file stays in `vfs`, where its pty/tty
       orchestration coherently belongs; the surviving `drivers ↔ vfs` pair is its own finding. Recorded
       in `ARCHITECTURE.md` §9
-- [x] 11.F the `target_os = "none"` gate gets a written criterion (`src/lib.rs`, `AGENTS.md` §4),
+- [x] 11.F the `target_os = "none"` gate gets a written criterion (`src/lib.rs`, `AGENTS.md` §3),
       and the unused host test module behind it is settled: `net/socket.rs`'s three tests were
       never compiled, and their claims are pinned by `t-sockmsg`, which boots, so the module is
       gone. `xtask/src/gates.rs` fails the gate on the shape from now on (§11.2 Step F)
@@ -1502,10 +1511,10 @@ they are an errno, a link target and a node's answer to a question nothing here
 was asking before (§7.2, §1.1).
 
 What is left, in the order that keeps each step verifiable on its own. **The
-list's first two items are done**: §4.3's listener landed on top of the loopback
+list's first two items are done**: §3.3's listener landed on top of the loopback
 that had to come first, so a program inside the machine can now serve one - both
 halves measured against Linux and pinned by `t-tcp-listen`, and the section
-rewritten around them (§4.3.1-§4.3.2) - and anonymous demand paging, with the two
+rewritten around them (§3.3.1-§3.3.2) - and anonymous demand paging, with the two
 things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
 `t-mmap-shared-fork`).
 
@@ -1536,7 +1545,7 @@ things it unblocked, is §5.1/§5.2's rewrite (`t-mmap-demand`,
    members of the performance family with a plan and no number. Both are
    measurable today, and each wants a before/after figure with the disk in
    place - and the number is allowed to say "no".
-4. ~~**`SO_REUSEADDR` at `bind`/`listen`** (§4.3.3)~~ **Landed.** It was the one
+4. ~~**`SO_REUSEADDR` at `bind`/`listen`** (§3.3.3)~~ **Landed.** It was the one
    item here expected to be small, and the work was: the answer was not, because
    measuring it first showed the option does not mean what it is usually
    written up as. A holder that is *listening* never yields its name, and every
@@ -1743,7 +1752,7 @@ scans for one.
   `SO_KEEPALIVE` reach the live smoltcp socket (Nagle off; probe timer armed at
   Linux's default interval) and `getsockopt` reads back every stored option;
   `SO_REUSEADDR` is applied at `bind`/`listen` (the holder's option counts as
-  much as the caller's - §4.3.3), while buffer sizes and `SO_LINGER` are still
+  much as the caller's - §3.3.3), while buffer sizes and `SO_LINGER` are still
   record-only.
 - **4.4** both halves of netlink are written: the route half reconfigures the
   live stack (`RTM_NEWADDR`/`NEWROUTE`/`NEWLINK`, §4.4), and the uevent half now
@@ -2586,7 +2595,7 @@ so a real answer needs either a set rebuilt per requested size or a limit applie
 in the mpos read/write queue - and until one of those exists the options should
 say so rather than round-trip a number that changes nothing. `SO_REUSEADDR` used
 to be on this line and is not any more: it is applied at `bind`/`listen` now
-(§4.3.3), and the rebind allowance it gates turned out to be a rule about the
+(§3.3.3), and the rebind allowance it gates turned out to be a rule about the
 *holder's* option as much as the caller's.
 
 ### 4.4 Netlink Write Operations — **DONE**
@@ -2704,7 +2713,7 @@ The named gaps, each with what it waits on:
   a decision the kernel reserves: `RTM_NEWADDR` and now `AF_PACKET` both
   overrule it.
 * The parsers over `sockaddr_ll` and the Ethernet frame have no host-side pin.
-  `AGENTS.md` §4 asks every new parser for a fuzz target, and `net/packet.rs`
+  `AGENTS.md` §3 asks every new parser for a fuzz target, and `net/packet.rs`
   has none — not from oversight but from the §6 trap that gates the whole `net`
   module on `target_os = "none"` (`src/lib.rs:48`), so neither a host unit test
   nor a `fuzz/` target can even reach it, and `net/socket.rs`'s annotated test
@@ -4026,7 +4035,7 @@ answer is the one to copy rather than invent, because it is the answer userland
 already reads: a SCSI/SATA disk is `sda`, major **8**, minor 0, partitions at
 1.., and `/dev/vda` and `/dev/sda` are two devices no program treats as synonyms.
 A kernel that called a SATA disk `vda` would be publishing a private dialect in
-the one place §4.3 cares about most - a name.
+the one place §3.3 cares about most - a name.
 
 | | virtio-blk | AHCI |
 |---|---|---|
@@ -4217,7 +4226,7 @@ investigation, both measured:**
   driver the *whole* covering window of the caller's request
   (`vfs/devfs.rs::DevBlockNode::read_at`) and virtio-blk has always accepted any
   sector-aligned length. The one-page promise was this driver's own, never
-  `BlockDev`'s, and §4.3 says whose limit it therefore is: the driver's.
+  `BlockDev`'s, and §3.3 says whose limit it therefore is: the driver's.
   `AhciPort::issue` now builds **one PRDT entry per bounce page** - a command
   carries `BOUNCE_PAGES` = 32 pages, 128 KiB, and a longer request is more
   commands, planned by `crate::ahci::chunks` - so `PRDTL` says how many runs the
@@ -4828,7 +4837,7 @@ item in this section.
 >   the renderer does not move - but landed anyway: Linux's `drm_version.name`
 >   is `drm_dev->driver->name`, Mesa keys its kmsro table on it (`libgallium`
 >   carries `virtio_gpu` beside `kms_swrast`), and a private spelling in a field
->   a caller identifies the driver by is the shape §4.3 forbids. `t-drm` carries
+>   a caller identifies the driver by is the shape §3.3 forbids. `t-drm` carries
 >   the new expectation.
 >
 > **And the console defect, sharpened by measurement.** It is not length: after
@@ -5047,7 +5056,7 @@ sequence facility - and the same argument decides both: both requests are about 
 counts *commits* rather than periodic boundaries, so there is no truthful number
 to put in the reply. Naming the two in the dispatch `match` is what makes the
 answer this card's rather than the catch-all's; two spellings of "I cannot tell
-you about vblanks" that disagreed would be the private dialect `AGENTS.md` §4.3
+you about vblanks" that disagreed would be the private dialect `AGENTS.md` §3.3
 forbids.
 
 All four also gained the argument check that `arg_shape` exists to perform, and
@@ -5105,7 +5114,7 @@ fourcc correction above had to land first.
 **Two gaps in this area are named rather than filled.** The cursor plane publishes
 `type`, `FB_ID`, `CRTC_ID`, `CRTC_X`, `CRTC_Y` and its own `IN_FORMATS` - no
 `SRC_*`/`CRTC_W`/`CRTC_H`, because this card's cursor has no scaler and no crop and
-a published-then-ignored property is the silent success `AGENTS.md` §4 forbids. A
+a published-then-ignored property is the silent success `AGENTS.md` §3 forbids. A
 compositor that wants to crop or scale a cursor will not find the properties and
 will do it itself, which is the honest outcome but is narrower than a real card. And
 an unknown CRTC in `MODE_CURSOR` is `EINVAL`, which is what this file has always
@@ -5214,7 +5223,7 @@ absence is the measurement's rather than an omission: a real card carries
 gamma and VRR properties because its driver can honour them, carries
 `subconnector` and `panel orientation` only on connectors that have one (the
 measured eDP output has neither), and carries neither of the last two at all.
-A property whose write changes nothing is the silent success `AGENTS.md` §4
+A property whose write changes nothing is the silent success `AGENTS.md` §3
 forbids. The one thing that *is* missing without a hardware reason is
 `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`, and it belongs with the cursor plane in
 the `MODE_CURSOR` work rather than here.
@@ -5483,7 +5492,7 @@ prompt.
 (there is none to move); the stack's range is our bound, not Linux's
 memory-sized one; and the draws are 28 bits of page granularity where Linux
 gives an `ET_DYN` base rather more. Adding `listen`/`accept`-shaped inbound TCP
-(§4.3) and a `MAP_FIXED`-free `mmap` hole review would both want this layout
+(§3.3) and a `MAP_FIXED`-free `mmap` hole review would both want this layout
 re-examined, which is worth knowing before either is attempted.
 
 ### 8.2 seccomp
@@ -5830,7 +5839,7 @@ number the gate answers is spelled beside it and named as such.
 | 1a | Build plumbing: `rust-toolchain.toml` targets, `src/arch/aarch64/linker.ld`, `[target.aarch64-unknown-none]`, the gate list and the stage ledger | **landed**: `cargo build --target aarch64-unknown-none` links; the x86 gate stayed green |
 | 1b | The machine body: PL011 at `0x0900_0000`, the `_start` stub, the banner | **landed**: `qemu-system-aarch64 -M virt -kernel` printed the banner - the bring-up instrument 1e deletes, named as such at the time |
 | 1c | Exception vectors (`VBAR_EL1`), GICv2, the generic timer (`CNTPCT_EL0`/`CNTP_CVAL_EL0`) | **landed**: `M1_TIMER_OK: 25 interrupts in 100 ms (~25 at 250 Hz)`, three runs of three, and the check's failure branch names the timer's, the distributor's and the CPU interface's registers rather than hanging |
-| 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | **landed**: `page tables: 12 frames (48 KiB)`, `M3_TABLES_OK` (image `r-x`/`r--`/`rw-` at both its addresses, direct map written and read back, null page absent), and the clock still counts to 25 with the MMU on |
+| 1d | 4-level page tables, `TTBR0_EL1`/`TTBR1_EL1`, `TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` | **landed**: `page tables: 12 frames (48 KiB)`, `M3_TABLES_OK` (image `r-x`/`r--`/`rw-` at both its addresses, direct map written and read back, null page absent), and the clock still counts to 25 with the MMU on. **What this row cost first, and is now a machine-wide rule:** the bring-up carried the page-table arena as a `static` array with a zero initializer and no writer — which lands it in `.rodata`, read-only on a machine whose page tables enforce it, and cost 128 KiB of `.rodata`; it was deleted with the `-kernel` path. Stage 2's task stack was the same class twice over: its first `stp` took a data abort *with the fault address inside the kernel image*. The fix is not a section attribute — it is to take frames from the allocator, which is what the code wanted anyway. `-C link-arg=-zmax-page-size=0x1000` does not save you either; it belongs to the list of things that look like a fix for a wrongly-placed static and are not. |
 | 1e | The aarch64 loader: `boot/src/vm/aarch64.rs` (the descriptor format, `MAIR`/`TCR`/`SCTLR`), `boot/src/main.rs`'s aarch64 `enter` and PL011, `boot/src/elf.rs` learns `EM_AARCH64`/`R_AARCH64_RELATIVE`, the kernel relinked as a higher-half PIE, `src/arch/aarch64/paging.rs` becomes a reader of the loader's tables, `cargo xtask boot-aarch64` | **landed**: AAVMF boots the real ESP image, the kernel reaches the higher half and prints `M3_TABLES_OK` (the loader's `TTBR0`/`TTBR1`, the image's W^X, the direct map written and read back, the PL011 device) and `M1_TIMER_OK: 25 interrupts in 100 ms`; the `-kernel` instrument is deleted |
 | 1f | The kernel's own tables: `src/arch/aarch64/paging.rs` regains a builder, built from `mm::vm::kernel_mappings(info, sections)` out of frames from `mm::alloc_frames`; `mm::init` runs on aarch64; the boot switches `TTBR0_EL1`/`TTBR1_EL1` onto it | **landed**: `pmm: 5 zones, 49209 frames`, `page tables: 166 frames (664 KiB)`, `plan: 7 mappings, all 63616 pages translate as the plan says (image r-x / r-- / rw-, direct map rw-)`, `no identity map: 0x44bcf000 is unreachable, only the device window lives low`, then `M3_TABLES_OK` and `M1_TIMER_OK` |
 | 2 | Kernel contexts: `src/arch/aarch64/context.rs` - `Context` with the callee-saved `x19..x28`/`fp`/`lr` on the task's own stack, `FpuState` (`q0..q31`, `FPCR`, `FPSR`), `bootstrap` and its trampoline, `switch` | **landed**: `M2_CONTEXT_OK: 13 hand-overs, both directions, every callee-saved register and v31 back where its task left it`, and the letters above it alternate `ABABAB` |
@@ -6026,6 +6035,22 @@ TX back to RX inside the PL011 and takes the wire output off) and checks that a 
 probe byte comes back through `DR`. `check_serial_rx` runs between `check_cpu` and
 `check_tls` and prints `M6_SERIAL_RX_OK`/`_FAILED`; `M6_SERIAL_RX_FAILED` joins the
 `TERMINATORS` list (its `_OK` is not a terminator - the TLS/EL0/init checks come after).
+**The rule `TERMINATORS` obeys, learned four times over** (`xtask/src/aarch64.rs`): the list holds
+the *last* check's success marker and *every* check's failure marker — never the success marker of
+a check that another check comes after. A terminator stops the run, so a success marker listed too
+early kills the machine mid-boot and the log simply ends, which is indistinguishable from a hang.
+The measured history: the list once ended at `M1_TIMER_OK`, which stage 2's checks come after
+(killed mid-line); stage 5a added `M4_DEVICES_OK`, which the timer and context checks come after —
+a boot that finished in 5.7 s instead of the 60 s deadline and stopped three lines into a machine
+that was working; stage 6a is the first check to land *after* the last one, so `M2_CONTEXT_OK` had
+to come **out** when `M6_EL0_OK` went in; stages 6b/6c/6d/6e/6h each sit before 6a's EL0 check, so
+their `_FAILED` markers are terminators while their `_OK` markers are not; stage 6E's handoff runs
+after the EL0 probe, so `M6_INIT_OK` came out when it went in; stage 7a's serial-receive check sits
+in the same pre-EL0 slot as 6h; stage 7b's console-read check runs after the EL0 probe but before
+the init wait, so only its `_FAILED` is a terminator; and stage 7c made the handoff actually run
+`/init` (waiting on `is_running`, not the always-false `has_live_child` — pid 1 has no parent), so
+the terminal proof became the init's `INIT_EXITED` and `M6_INIT_OK` left the list for good. Elapsed
+time is the tell: a stall is 60 s, a wrong terminator is seconds.
 Boot-aarch64 is now **fourteen** markers. Measured on QEMU's model: the loopback echoes
 synchronously, so the check is deterministic with no terminal. What this lays and what
 remains for a typed shell: the RX *primitive* exists and is proven; the next cut wires it
@@ -6771,7 +6796,7 @@ Named gaps the port carries rather than hides, each with its home:
   *inside* the baseline traits. A caller survey found them (MSI, segment selectors,
   the lazy-FPU trap protocol, and the first-user-entry shape) and that every one of
   their callers lived in a module aarch64 does not compile yet. So rather than make a
-  second machine fake answers (`AGENTS.md` §4 rule 4), stage 6f split them into three
+  second machine fake answers (`AGENTS.md` §3 rule 4), stage 6f split them into three
   *optional* capability traits - `Msi`, `FpuTrap`, `Segments` - that only x86's
   `Current` implements, un-gated `Current` to `target_os = "none"`, and had
   `arch/aarch64` write the six baseline impls. The two things this note claimed were
@@ -7954,7 +7979,7 @@ relocating the `vcmux.rs` *file* out of `vfs` (into `console`), inverting its ou
 calls in the hand-down/`Waker` shape Step B2 established. Measuring it this pass showed no sound,
 valuable landing, so it is not done:
 
-- **The move would regress the layering.** `console` is a designed leaf — `AGENTS.md` §4 lets it name
+- **The move would regress the layering.** `console` is a designed leaf — `AGENTS.md` §3 lets it name
   only `arch`, `boot` and `term`. `vcmux` names `vfs`(`pty`/`tty`), `drivers`(`drm`/`video`) and
   `sched`; relocating it to `console` turns `console` into a mid-layer that depends on all three, the
   opposite of V-4. A bare move first *re-creates* `console → vfs` from the mux's 7 `pty`/`tty` calls
@@ -8019,7 +8044,7 @@ cycle, and it exists because the gate's failures are silent.*
    pure parts of `net/socket.rs` out from under the gate, since `smoltcp` is gated in
    `Cargo.toml` — or delete the unreachable test module and say so. Pick one; do not leave the
    annotation lying.
-2. Write the criterion down (`AGENTS.md` §4 and a header comment in `src/lib.rs`): *a module is
+2. Write the criterion down (`AGENTS.md` §3 and a header comment in `src/lib.rs`): *a module is
    host-compiled when its logic touches no hardware, no port I/O, no virtio ring and no real
    clock — and then its dependencies must be host-compiled too, transitively.* The transitive
    half is the part that gets forgotten.
@@ -8047,7 +8072,7 @@ says the same to the next reader, and names the check that keeps a fourth from b
 
 *The criterion is written down in one place and named from the others*: `src/lib.rs`'s header
 carries it (with the transitive half spelled out and the two ways it fails silently), `AGENTS.md`
-§4 points at it and keeps its "when you gate a module, check what gates its tests" instruction,
+§3 points at it and keeps its "when you gate a module, check what gates its tests" instruction,
 and `ARCHITECTURE.md` §8 states it and records V-11's closure.
 
 *The check is `xtask/src/gates.rs`, and it is pinned against itself.* `dead_host_tests` walks
@@ -8200,11 +8225,11 @@ implements the traits *for* it, so the seam is a one-way `arch → hal` arrow an
 **What it does not abstract, and must not.** The Linux ABI *is* the register layout:
 `user_regs_struct`, the signal frame, the `syscall`/`iretq` gate are x86_64 by definition (on
 aarch64 the same rows are `x0..x30`/`pc`/`pstate` behind `svc`). That stays in `arch/<arch>/`;
-wrapping it would be the private dialect `AGENTS.md` §4 rule 3 forbids. "No leakage" means a
+wrapping it would be the private dialect `AGENTS.md` §3 rule 3 forbids. "No leakage" means a
 port writes `arch/<arch>/` and touches no shared file — not that a register frame becomes
 neutral.
 
-**Stages**, each its own commit and green alone (AGENTS §4 rule 7):
+**Stages**, each its own commit and green alone (AGENTS §3 rule 7):
 
 | Stage | Contents | Status |
 |---|---|---|
@@ -8248,12 +8273,12 @@ takes both remaining counts to 0 and is what lets S5 close the modules.
 ## Phase 12: ABI truthfulness — **AUDIT DONE, NOTHING FIXED**
 
 Phase 11 is about *who names whom*: the shape of the tree, with no user-visible defect. This
-phase is the other half of the review question every change here gets asked (`AGENTS.md` §7):
+phase is the other half of the review question every change here gets asked (`AGENTS.md` §6):
 *is that Linux's answer, or a shape that looks like it?* A gap that is honestly refused
 (`ENOSYS`/`EOPNOTSUPP`/`EINVAL`) is already Linux's answer for a kernel that cannot do the call,
 so it is not a defect and takes no work here. What this phase collects is the cases that are
 **not** honestly refused — a call or an `ioctl` that is *accepted*, answers success, and then
-does less than Linux did. Those are the ones `AGENTS.md` §4 calls the single worst thing this
+does less than Linux did. Those are the ones `AGENTS.md` §3 calls the single worst thing this
 codebase can do: a program comes to believe something false and stops asking.
 
 The audit method mirrors §11.0 — reproducible, and worth re-running: grep every syscall and
@@ -8273,7 +8298,7 @@ Two hard truths the audit surfaced, before any individual line:
   again**, so restoring it is task zero, ahead of B and C.
 - **Some of these are recorded as `Done` where they are not.** `PLAN.md`'s own table lists
   `getpriority` as done; it returns a hardcoded 20 with no round-trip (B5). The board being true
-  is a standing rule (§8 of `AGENTS.md`), so correcting it is part of this phase, not a
+  is a standing rule (§7 of `AGENTS.md`), so correcting it is part of this phase, not a
   side effect.
 
 ### 12.0 The dependency direction this phase assumes
@@ -8609,6 +8634,20 @@ QEMU line still reads `-device virtio-gpu-pci`, which is the new key's *default*
 boots exactly the machine it booted before - and that is why a machine key written for an
 interactive `run` cannot silently move the gate.
 
+**A named host-suite flake — `rand::tests::a_reseed_re_keys_the_generator`.** The suite is not
+parallel-safe over a module whose tests share a global, and this is the house pattern's one known
+cost (`static X: Mutex<RefCell<…>>`). The test asserts that two `fingerprint()`s with no
+`reseed()` between them are equal — the counterfactual for the re-key — but `fingerprint`, `fill`
+and `reseed` all act on the module's *one* global generator, so a sibling host test that draws
+from it in that window makes the second fingerprint differ. Reachable from `abi`'s `getrandom(2)`
+test as well as from `rand`'s own, which is why a lock inside that module is not enough.
+Measured on this tree: 2 of 3 `cargo test -p mpos --lib --target x86_64-unknown-linux-gnu` runs
+fail that single assertion with `511 passed; 1 failed`, and 5 of 5 runs with
+`-- --test-threads=1` pass — 0.28 s against 0.14 s. So a stage-1 red in exactly that test is a
+flake, not the change: re-run before believing it, and quote the run that was green. The fix,
+when someone takes it, is either serialising the suite or making the generator a value with the
+global as one instance.
+
 ### 12.4b The machine's own tools, and the inode flag word — **DONE, gate green `pass=139 fail=0`**
 
 Reported from the shell of the running image, four commands that could not run:
@@ -8671,7 +8710,7 @@ would move, `NODUMP` because its whole meaning is a promise *to userland* that
 reads it back, `SYNC`/`DIRSYNC` because a write-through filesystem already keeps
 that promise. Everything else is `EOPNOTSUPP`, including every bit Linux's own
 `FS_*` vocabulary names and this kernel cannot keep - the list is in "Remaining
-ABI support" above, and `AGENTS.md` §4's second governing rule - "answer
+ABI support" above, and `AGENTS.md` §3's second governing rule - "answer
 truthfully, or refuse" - is why it is a refusal rather than a stored bit.
 
 **Two corrections that only the pins could produce.** Writing the enforcement test
@@ -8731,10 +8770,10 @@ numbering they write down, and the real thing is what the run above shows.
 - Anything already honestly refused. `fanotify`/`keyctl`/`userfaultfd`/namespaces and the
   `_ => ENOSYS` dispatch arm are correct answers, not gaps to close here.
 - `SO_LINGER`/buffer sizes (`record-only`) and `/proc/<pid>/smaps` (its sibling
-  `maps` is answered now) — already tracked in §4.3 / the ABI board; this phase
+  `maps` is answered now) — already tracked in §3.3 / the ABI board; this phase
   does not duplicate them.
   (`SO_REUSEADDR` was on this list and is not any more: it is applied at
-  `bind`/`listen`, §4.3.3.)
+  `bind`/`listen`, §3.3.3.)
 - Real `MSG_PEEK` over TCP/UDP, real `rseq` state, real per-task CPU accounting: named here as
   sub-gaps, planned where the prerequisite (peek-preserving delivery, the clock, the
   scheduler's own timekeeping) is scheduled.
@@ -8777,7 +8816,7 @@ machine instead of silently running the first, since `xtask/src/main.rs` branche
 for `Commands::Run` and `test --arch aarch64` ran x86_64 and reported its result.
 
 **Stages** (13.1–13.2 are the purity thread, 13.3–13.5 the parity thread; each its own commit
-and green alone — AGENTS §4 rule 7):
+and green alone — AGENTS §3 rule 7):
 
 | Stage | Contents | Pin | Status |
 |---|---|---|---|
@@ -8820,7 +8859,7 @@ layout went the same way behind `mpos_signal_frame` (`proc.rs` 7 → 3,
 | Per-arch Linux ABI and not-yet-ported handlers | ~41 | `syscall` (`ioctl` 18, `file` 9, `mod` 5, `proc` 3, `nr` 2, `fs/mod` 2, `abi` 2) — the `sched` half of this row (`runtime.rs` 22 + `mod.rs` 1) is **done** (§13.2), and so are the bulk-memory pair, `rt_sigtimedwait`, the **gate frame's register file** (Stage 1) and the **signal frame's layout** (Stage 2) | §11.4's S4 extended to the **syscall gate frame**: move `RegsFrame` and its conversions (`capture_frame`/`apply_frame`/`user_ip`) into `arch/x86_64/`, exposed through `hal` as the operations the ABI layer needs (`to_regs`/`from_regs`/`ip`/`sp`/`set_exec_return`). Not a flag: this *is* the ABI's shape, and the thread-pointer/TLS and ptrace arms go with it. The scheduler's half landed the other way and needed no `arch/<arch>/` move: it carries the register file *by value* and never reads a field, so its width became a machine fact (`hal::Contexts::ABI_REG_COUNT`) rather than a per-arch code path, and its protocol words went to the `abi` leaf. The signal frame's layout went the same way next (Stage 2): `hal::SignalFrame`'s `enter`/`exit` over a `SignalDelivery` value shape, the x86 `rt_sigframe`/`sigcontext` bytes in `src/arch/x86_64/signal.rs`, and `build_frame`/`handle_rt_sigreturn` reduced to policy plus the two scheduler calls the machine cannot make — so `RegsFrame` is gone and the class is closed. The gate frame's *register file* went the same way as the scheduler's, and needed no layout move of its own: `hal::Gate` grew `user_context`/`capture_user_regs`/`restore_user_regs`/`syscall_args`, `proc.rs`'s `capture_frame`/`apply_frame` became forwards to them, the now-neutral `syscall_entry_stop`/`syscall_exit_stop`/`tell_tracer_of_child`/exec-trap/fork/clone sites lost their gates, and the aarch64 twin of `user_context` moved into `arch/aarch64/` (Stage 1) |
 | Port-progress ledger | ~43 | `drivers` 36 (the x86-only submodules, the PCI virtio transports) · `vfs` 7 (`p9`/`procfs`/`sysfs`/`vcmux`, `tty`'s KD/VT imports) | Nothing here: it disappears when aarch64 parity lands (§13.3–13.5). Renaming to `mpos_driver_*` would spell the same architecture knowledge differently and outlive the port |
 | Machine identity | 4 | `mm/elf.rs` (the `e_machine` this kernel is) · `syscall`'s `uname` machine name | Cannot go through `hal`: the host-compiled `mm`/`syscall` need the answer too and `hal` is bare-metal-only, so `cfg!`/`#[cfg]` is the right tool for an identity, not a leak |
-| Stale gates, unpinnable as they stand | 8 | `logging` 6 · `mm/heap.rs` 2 | Both reasons are void (aarch64 has a console and a clock since stages 4a/1c), but `src/` emits **no `tracing` event at all** (measured: no `info!`/`warn!`/`error!`/`debug!`/`trace!` outside `logging.rs`), so deleting the subscriber's gate produces code nothing exercises; the heap prints are on the OOM path no test reaches. A landed behaviour needs a pin (AGENTS §4 rule 6), so each is a finding with a missing prerequisite, not a rename. **The stale-gate class is wider than this row and splits in two.** Nine more have lived in `syscall`'s `ifreq` arms, `fs/mod.rs`'s nonblocking push, the `process_vm_readv`/`writev` pair and `rt_sigtimedwait` - gated as "the first machine's" although nothing in them named it (the first six when `net` was the first machine's alone, the last three merely grouped with `ptrace`, which *is* per-arch) - and all nine *were* drivable, so they were deleted and pinned instead (`user/tests/src/bin/t-ifreq.rs`, `t-process-vm-libc.rs`, `t-rt-sigtimedwait.rs`); what makes the eight here different is that nothing can drive them yet, which is the missing prerequisite, not the gate |
+| Stale gates, unpinnable as they stand | 8 | `logging` 6 · `mm/heap.rs` 2 | Both reasons are void (aarch64 has a console and a clock since stages 4a/1c), but `src/` emits **no `tracing` event at all** (measured: no `info!`/`warn!`/`error!`/`debug!`/`trace!` outside `logging.rs`), so deleting the subscriber's gate produces code nothing exercises; the heap prints are on the OOM path no test reaches. A landed behaviour needs a pin (AGENTS §3 rule 6), so each is a finding with a missing prerequisite, not a rename. **The stale-gate class is wider than this row and splits in two.** Nine more have lived in `syscall`'s `ifreq` arms, `fs/mod.rs`'s nonblocking push, the `process_vm_readv`/`writev` pair and `rt_sigtimedwait` - gated as "the first machine's" although nothing in them named it (the first six when `net` was the first machine's alone, the last three merely grouped with `ptrace`, which *is* per-arch) - and all nine *were* drivable, so they were deleted and pinned instead (`user/tests/src/bin/t-ifreq.rs`, `t-process-vm-libc.rs`, `t-rt-sigtimedwait.rs`); what makes the eight here different is that nothing can drive them yet, which is the missing prerequisite, not the gate |
 | Allow-listed by design | `lib.rs` 17 · `main` 9 · `boot/mod.rs` 1 | the target-gating ledger and the per-arch bin arms | — |
 
 **Acceptance** (both threads together): the aarch64 gate is quotable with a summary line and exit
@@ -8831,7 +8870,7 @@ and lives in `arch/<arch>/` (§11.4) — "no leak" means a port writes `arch/<ar
 shared file, not that a register frame becomes neutral.
 
 **Where this lands**: status in §9.1 (parity) and §11.4 (purity); `ARCHITECTURE.md` §2/§3 in the
-same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1 and
+same commit as any new or moved edge (AGENTS §3 rule 5), *before* the edge, not after. **13.1 and
 13.3–13.11 have landed**, and 13.2 is in progress — the parity thread of this phase is complete: the
 second machine boots its own disk root, runs the same network stack and socket syscalls over its own
 adapter, and carries the `/bin` its spawn tests need, so the sweep is green on **everything it is

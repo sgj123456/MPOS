@@ -230,7 +230,7 @@ everything above the machine layer calls `crate::hal`'s forwards rather than nam
 makes `src/arch/mod.rs` a facade of four items and its submodules `pub(crate)`. An absent
 capability is *absent* (the aarch64 `Current` simply is not an `Msi`/`FpuTrap`; it is a
 `SignalFrame` since §13.2's Stage 3b, with its own `rt_sigframe`), not a
-method every machine must fake an answer for (`AGENTS.md` §4 rule 4). Which capabilities a build has is
+method every machine must fake an answer for (`AGENTS.md` §3 rule 4). Which capabilities a build has is
 a `mpos_*` flag declared per target in `.cargo/config.toml` (beside each machine's linker script, listed
 for `check-cfg` in `Cargo.toml`), so the forwards' `#[cfg]` gates name the capability and never the
 architecture — `src/hal/mod.rs` contains no machine name at all (`PLAN.md` §13.1). The register ABI — the
@@ -268,6 +268,17 @@ they are cross-crate edges.
 | Console | `src/console.rs` | Log ring, serial output, the switch to the framebuffer, the six virtual consoles | Reach into the VFS for the grid — it names the `term` *crate* now, never `vfs::term` (V-4 closed: the `vfs ↔ console` pair is broken). The wire and its transmit ring are reached through `crate::hal`'s `Console`/`SerialRing` forwards, not by naming `drivers::serial`; on a machine with no ring the queue-and-park and framebuffer arms are `#[cfg]`-inert, so it compiles on a polled sink. Both machines are `SerialRing`s now (§13.7) and drain *one* queue - `drivers::tx_ring`, behind a three-method `Transmitter` - so the console's decision about who parks was written once rather than once per UART |
 | ABI | `src/syscall/` | Numbers (`nr.rs`), pure ABI facts and argument validation (`abi.rs`), the dispatch table, and the handlers (`fs/file.rs` + `fs/ioctl.rs`, `proc.rs`, `posix.rs`) | Grow past the point where one file is a device-ioctl switchboard (see V-2) |
 | Services | `crates/err`, `crates/pci`, `crates/date`, `crates/binfmt`, `crates/cred`, `crates/uts`, `crates/seccomp`, `crates/term`, `crates/ahci`, `crates/gpu`, `crates/evdev`, `crates/uinput`, `crates/blk` (leaf crates — §1); `src/rand.rs`, `src/uevent.rs`, `src/logging.rs`, `src/sync/`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. The thirteen leaf crates depend only downward and cannot name the kernel — the split is the enforcement. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
+
+**How this table is enforced, not just drawn.** A module may call **downward only**, into what §2
+draws; anything else is a violation. The graph is *measured*: `cargo xtask depgraph` (a host test
+too) re-extracts every `crate::` reference and fails when an edge appears that was not recorded the
+last time someone set the number — adding an edge along a violation (§9's V-*) is a red gate, and
+removing one lowers a constant. Two rules make the table usable rather than decorative: an existing
+violation is not precedent — code may not add a *new* caller along a violation edge or widen one;
+and a needed edge changes the design record first — a legitimate dependency genuinely missing from
+§2 is added here (§2 + §3) *in the same commit*, with the reason, because a diff that contradicts
+the graph is the diff that is wrong. `AGENTS.md` carries the working copy of these rules and points
+here for the table itself; the two files move together.
 
 ---
 
@@ -510,7 +521,7 @@ flowchart TB
 ```
 
 The gate is a **per-module judgement**, and the criterion it is made with is written down in
-`src/lib.rs`'s header and `AGENTS.md` §4 (Step F): a module is host-compiled when its logic
+`src/lib.rs`'s header and `AGENTS.md` §3 (Step F): a module is host-compiled when its logic
 touches no hardware, no port I/O, no virtio ring and no real clock — and then its dependencies
 must be host-compiled too, transitively. The *intent* was always right and the split is still
 uneven (`vfs::epoll` and `vfs::pipe` are host-compiled while `vfs::memfd` is gated; `vfs::devfs`
@@ -567,7 +578,7 @@ Phase 11 D (**closed**; D.2b rejected) |
 | V-8 | Cross-architecture config pointed at a missing file | `.cargo/config.toml` set `link-arg=--script=arch/aarch64/linker.ld`; only `arch/x86_64/linker.ld` exists, so the `aarch64-unknown-none` build could not link | **Done** (Phase 11 A) — the profile is gone, and `PLAN.md` §9.1 keeps what a port needs |
 | V-9 | The network layer validates user pointers with the syscall layer's helper | **Closed by B3.** `buffer_ok`/`user_accessible`/`MAX_IO`/`err_of` moved to the crate-root leaf `src/uaccess.rs`; the 99 below-`syscall` call-sites in `net/{socket,unix,packet,vsock}.rs` and `drivers/drm.rs` now name `crate::uaccess::*`, so no layer below `syscall` reaches up for a page walk or an errno mapping. `syscall` re-exports the same names for its own handlers, and the bare-metal build is green (the `cfg(target_os = "none")` split of `err_of`/`user_accessible` moved intact — V-11's lesson held) | **Done** (Phase 11 B3) |
 | V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | Accepted by design; document only |
-| V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs` was `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs` gated `pub mod net` on `target_os = "none"`; 3 tests never ran. **Closed by Step F**: the module was deleted (its three claims are pinned by `user/tests/src/bin/t-sockmsg.rs`, which boots), the criterion is written down (`src/lib.rs`, `AGENTS.md` §4), and `xtask/src/gates.rs::dead_host_tests` — run at the head of `cargo xtask test` — now fails on the shape | **Done** (Phase 11 F) |
+| V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs` was `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs` gated `pub mod net` on `target_os = "none"`; 3 tests never ran. **Closed by Step F**: the module was deleted (its three claims are pinned by `user/tests/src/bin/t-sockmsg.rs`, which boots), the criterion is written down (`src/lib.rs`, `AGENTS.md` §3), and `xtask/src/gates.rs::dead_host_tests` — run at the head of `cargo xtask test` — now fails on the shape | **Done** (Phase 11 F) |
 | V-12 | The tree was mid-refactor and did not build for the host | The uncommitted work renamed `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edited `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` failed to compile | **Resolved** — finished and committed; the gate is green (`PLAN.md` §11.1.12) |
 | V-13 | Memory knows about files: `mm` calls up into `vfs` | `src/mm/vma.rs` used to do `use crate::vfs::Inode;` (a frame-backed VMA named an inode), committed in eb4b337 after this audit. **Closed**: the trait it needed is `mm::vma::MappedObject` — three questions, no files — and the VFS answers it for its inodes through `vfs::MappedInode`. `mm`'s node for a mapping is now an object it can ask, and the merge rule (two adjacent mappings of one object become one maps line) is asked of the object rather than compared by `Arc` address, which a trait object cannot do without a downcast; for the four node types that are frame-backed - a `memfd`, a dma-buf, the framebuffer, a DRM dumb buffer - identity is unique per object, so it is the same answer as a value | **Done** (Phase 11, with Step C) |
 | V-14 | The uevent bus reached up into `syscall` and `sched` | Found at the AF_PACKET/sound re-audit: `uevent.rs` used `crate::syscall::err` for its refusals and a `self_cred()` that read the task table (`crate::sched::current_real_owner`/`current_tgid`) — a service naming the ABI layer violated §9's own acceptance rule, and the task-table reach made the bus untestable in isolation | **Done** — the errno table moved to the crate root (`src/err.rs`, re-exported through `syscall`), and credentials/the preferred bind port id are now assembled by the caller `net::socket::task_identity` (allowed `net→sched`) and passed in as plain values; `uevent` compiles on the host with no upward edge |

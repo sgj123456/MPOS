@@ -98,7 +98,7 @@ pub use mpos_binfmt as binfmt;
 /// through, the registry that names every disk the kernel has, and the GPT/MBR
 /// decode that finds a filesystem on one. Its own leaf crate - the trait and the
 /// parser are pure and host-tested, so the crate boundary is what makes the
-/// downward-only rule (AGENTS.md §4 rule 5) a compile error for them rather than
+/// downward-only rule (AGENTS.md §3 rule 5) a compile error for them rather than
 /// a convention.
 pub use mpos_blk as blk;
 pub mod boot;
