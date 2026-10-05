@@ -327,6 +327,19 @@ the commit bodies), and each moved its pin in the same commit.
   enumerates - sit behind the `mpos_pci_config`/`mpos_input_registry` capability flags, so a
   machine without one builds the tree from the neutral model (empty on aarch64) instead of
   refusing the filesystem.
+- **`open(2)`'s flag *numbers* are the machine's, and four differ.** arm64's
+  `asm/fcntl.h` overrides `O_DIRECTORY` (`0x4000` vs x86_64's `0x10000`), `O_NOFOLLOW`
+  (`0x8000` vs `0x20000`), `O_DIRECT` (`0x10000` vs `0x4000`) and `O_LARGEFILE` (`0x20000`
+  vs `0`, i.e. absent) before including `asm-generic/fcntl.h`. `O_TMPFILE` is
+  `O_DIRECTORY`'s partner, so its composite moves with it (`0x404000` on arm64, `0x410000`
+  on x86_64) while its own bit, `__O_TMPFILE` (`0x400000`), does not. The overlap is
+  load-bearing rather than tidy: arm64's `O_LARGEFILE` is x86_64's `O_NOFOLLOW` bit, and
+  musl's `open()` adds `O_LARGEFILE` to every open - so a kernel carrying one table answered
+  `ELOOP` to every `open()` of a symbolic link on aarch64, which is what stopped `openrc`
+  starting its syslog service (the loader opening `libcap.so.2 -> libcap.so.2.78`). Pinned by
+  `user/tests/src/bin/t-open-flags.rs` on both machines. `O_LARGEFILE` is deliberately
+  undefined in the kernel: it is ignored, as Linux ignores it, and what matters is that
+  ignoring it does not mean mistaking it for another flag.
 - **The `DRM_VIRTGPU_*` family (`0x41..=0x4b`) is served, 2D and 3D both.** All eleven
   requests are dispatched, and each answers per card shape, as Linux's does
   (`user/staging/virtgpu-probe/` is the no-3D measurement; the GL card's own answers -

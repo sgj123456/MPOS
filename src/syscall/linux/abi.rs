@@ -108,9 +108,49 @@ pub(super) const O_ACCMODE: usize = 0o3;
 /// rather than testing for it.
 pub(super) const O_WRONLY: usize = 1;
 pub(super) const O_RDWR: usize = 2;
+/// **Three of the open flags have different *numbers* on the two machines**,
+/// and the numbers here are the machine's, not a shared table.
+///
+/// `arch/arm64/include/uapi/asm/fcntl.h` does not take the generic numbers for
+/// four flags - it defines `O_DIRECTORY`, `O_NOFOLLOW`, `O_DIRECT` and
+/// `O_LARGEFILE` *before* including `asm-generic/fcntl.h` (whose definitions are
+/// `#ifndef`-guarded), so arm64's values differ from x86_64's:
+///
+/// | flag | x86_64 | arm64 |
+/// |---|---|---|
+/// | `O_DIRECTORY` | `0x10000` | `0x4000` |
+/// | `O_NOFOLLOW`  | `0x20000` | `0x8000` |
+/// | `O_DIRECT`    | `0x4000`  | `0x10000` |
+/// | `O_LARGEFILE` | `0`       | `0x20000` |
+///
+/// This kernel carried one table, x86_64's, so on aarch64 it read a *different
+/// flag from the one the caller set* - and the overlap is not hypothetical: the
+/// arm64 `O_LARGEFILE` (`0x20000`) is the x86_64 `O_NOFOLLOW`, so an open that
+/// merely said "large file" was answered `ELOOP` on any symbolic link. That is
+/// what the machine's first real userland hit, and it could not have been found
+/// by reasoning: musl's `open()` adds `O_LARGEFILE` to *every* open, so the
+/// symptom was `openrc` refusing to start its syslog service with
+/// `Error loading shared library libcap.so.2: Symbolic link loop` - the loader
+/// opening a *versioned symlink* (`libcap.so.2 -> libcap.so.2.78`), which is a
+/// `stat`-visible regular file's link and nothing anyone would call a loop. The
+/// values are pinned on both machines by `user/tests/src/bin/t-open-flags.rs`,
+/// which drives `libc`'s own constants through this kernel: before this split it
+/// failed on aarch64 and passed on x86_64.
+///
+/// `O_LARGEFILE` itself is deliberately not defined: the kernel ignores it
+/// (a 64-bit `off_t` is the only one there is), which is what Linux does too -
+/// what matters is that ignoring it does not mean *mistaking* it for
+/// `O_NOFOLLOW`.
+#[cfg(target_arch = "aarch64")]
+pub(super) const O_DIRECTORY: usize = 0o40000;
+/// See [`O_DIRECTORY`] above: arm64's `asm/fcntl.h` gives this flag a different
+/// bit from the generic table.
+#[cfg(target_arch = "aarch64")]
+pub(super) const O_NOFOLLOW: usize = 0o100000;
 /// O_DIRECTORY is a demand about the name, not a hint: the name must
 /// already be a directory, and a file under it is ENOTDIR rather than a
 /// descriptor the caller will read what it believes are entries out of.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) const O_DIRECTORY: usize = 0o20_0000;
 /// The `__O_TMPFILE` half of the pair userspace spells O_TMPFILE. With
 /// O_DIRECTORY over it, the pair asks for an inode no name holds - written
@@ -119,6 +159,10 @@ pub(super) const O_DIRECTORY: usize = 0o20_0000;
 /// O_DIRECTORY alone, which is a legal flag meaning something else, and
 /// because Linux reads the pairing - the bit without the flag - as EINVAL
 /// before it reads anything else.
+///
+/// The `__O_TMPFILE` *bit* is the same on both machines (`0o20000000`); only its
+/// companion, `O_DIRECTORY`, moves, which is why the composite userspace spells
+/// `O_TMPFILE` is `0x410000` on x86_64 and `0x404000` on arm64.
 pub(super) const O_TMPFILE: usize = 0o2000_0000;
 /// `O_NOFOLLOW`: if the final path component is a symbolic link, the open
 /// fails with `ELOOP` rather than following it. Intermediate components are
@@ -128,6 +172,7 @@ pub(super) const O_TMPFILE: usize = 0o2000_0000;
 /// `open(symlink, O_NOFOLLOW)` is `ELOOP`, `open(regular, O_NOFOLLOW)`
 /// succeeds. It is an open-only bit, not a status flag: it never shows back in
 /// `F_GETFL`'s value, so it is consumed at the open and not stored.
+#[cfg(not(target_arch = "aarch64"))]
 pub(super) const O_NOFOLLOW: usize = 0o40_0000;
 
 // ---------------------------------------------------------------------------
@@ -3607,18 +3652,37 @@ mod tests {
 
     /// The flag-bit and structure constants of this module are the ABI, not
     /// a choice: each one is the value the man page or the kernel headers
-    /// spell.
+    /// spell - **this machine's** headers, because three of them differ
+    /// between the two (see `O_DIRECTORY`'s note).
     #[test]
     fn abi_flag_bits_match_the_man_pages() {
-        // open(2)
+        // open(2). The values asserted are this *build's*, so a host build
+        // checks x86_64's table and the aarch64 build would check arm64's; the
+        // per-arch arms are written out rather than compared to a constant so
+        // that a wrong number is a failing assertion and not a tautology.
         assert_eq!(O_CREAT, 0o100);
         assert_eq!(O_EXCL, 0o200);
         assert_eq!(O_TRUNC, 0o1000);
         assert_eq!(O_CLOEXEC, 0o200_0000);
         assert_eq!(O_ACCMODE, 0o3);
-        assert_eq!(O_DIRECTORY, 0o20_0000);
         assert_eq!(O_TMPFILE, 0o2000_0000);
-        assert_eq!(O_TMPFILE | O_DIRECTORY, 0x410000);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            assert_eq!(O_DIRECTORY, 0o20_0000);
+            assert_eq!(O_NOFOLLOW, 0o40_0000);
+            assert_eq!(O_TMPFILE | O_DIRECTORY, 0x410000);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(O_DIRECTORY, 0o40000);
+            assert_eq!(O_NOFOLLOW, 0o100000);
+            assert_eq!(O_TMPFILE | O_DIRECTORY, 0x404000);
+            // The overlap that made this a real bug rather than a tidy one:
+            // arm64's `O_LARGEFILE` is the generic table's `O_NOFOLLOW` bit, so
+            // reading one table on the other machine turned every large-file
+            // open under a symbolic link into `ELOOP`.
+            assert_ne!(O_NOFOLLOW, 0o20000);
+        }
         // fcntl(2)
         for (cmd, value) in [
             (F_DUPFD, 0),

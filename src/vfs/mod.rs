@@ -1655,6 +1655,34 @@ mod tests {
         );
     }
 
+    /// A *relative* symlink reached through an absolute path, in a
+    /// subdirectory - the shape a distribution's `libfoo.so.2 -> libfoo.so.2.78`
+    /// has, and the one the resolver used to get wrong.
+    ///
+    /// The existing test above only resolves a relative link as the *first*
+    /// component of its path (`resolve_from("link", here)`), where the link's
+    /// directory is the start the walk was handed. Here the link sits two
+    /// directories down an absolute path, and a relative target has to be
+    /// spliced in front of the names still to walk **without** disturbing the
+    /// directory the walk has already established - which is exactly the case
+    /// that was unpinned.
+    #[test]
+    fn a_relative_link_deep_in_an_absolute_path_resolves_to_its_target() {
+        let vfs = Vfs::new();
+        let fs = crate::vfs::ramfs::RamFs::new();
+        vfs.mount_root(&*fs);
+        let root = vfs.resolve("/").unwrap();
+        let usr = root.create("usr", NodeKind::Dir).unwrap();
+        let lib = usr.create("lib", NodeKind::Dir).unwrap();
+        let real = lib.create("libcap.so.2.78", NodeKind::File).unwrap();
+        lib.symlink("libcap.so.2", "libcap.so.2.78").unwrap();
+
+        assert!(
+            Arc::ptr_eq(&vfs.resolve("/usr/lib/libcap.so.2").unwrap(), &real),
+            "a relative target is relative to the link's own directory"
+        );
+    }
+
     #[test]
     fn a_triad_decides_who_may_do_what() {
         // Owner (uid 7, gid 7), mode 0640: the owner reads and writes, the
