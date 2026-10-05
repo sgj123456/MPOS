@@ -1333,16 +1333,19 @@ fn permitted(mode: u32, owner: (u32, u32), want: u32, me: (u32, u32), groups: &[
     bits & want == want
 }
 
-/// The root override: uid 0 reaches everything.
+/// The root override: uid 0 is checked by Linux's `CAP_DAC_OVERRIDE` shape
+/// rather than passed outright.
 ///
-/// Linux folds this into `CAP_DAC_OVERRIDE` and keeps one exception - execute
-/// on a plain file still needs an execute bit set for *someone*, so
-/// `access(X_OK)` on a `0644` file is `EACCES` even for the superuser. mpos
-/// drops that exception on purpose: on a single-user image whose root does the
-/// packaging, running and repairing, a check that can tell the superuser "you
-/// may not run this" is a footgun rather than a security boundary, and it is
-/// the fine print that made `apk` read a perfectly accessible tree back as
-/// denied.
+/// Linux folds this into `capable(CAP_DAC_OVERRIDE)` in `fs/namei.c`: read or
+/// write passes when *any* triad carries the bit, execute only when some
+/// execute bit exists at all - so `access(X_OK)` on a `0644` file is `EACCES`
+/// even for the superuser. mpos used to drop that exception, on the reasoning
+/// that a single-user image whose root does the packaging has no use for a
+/// check that can tell it "you may not run this". A distribution's tree
+/// changed what the exception costs: Alpine ships real modes everywhere, and
+/// the outright pass answers *success* where Linux answers `EACCES`, which is
+/// the one thing a caller cannot fall back around. So the exception stands,
+/// and its exact predicate lives in [`may_as`]'s root branch.
 fn root_override() -> bool {
     true
 }
@@ -1360,24 +1363,39 @@ pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
     if !inode.keeps_modes() {
         return Ok(());
     }
-    // Neither is root: uid 0 passes every check without consulting the owner
-    // or the triads.
-    let allowed = if me.0 == 0 {
-        root_override()
+    // Neither is root: uid 0 passes every check - Linux's
+    // `capable(CAP_DAC_OVERRIDE)` in `fs/namei.c`, which the old comment read
+    // as "passes outright" and which this branch now spells. The mask leaves
+    // the real triads; an unmasked check would read a node whose mode word
+    // *is* the type (`S_IFDIR | 0777` - devtmpfs' spelling) as "no execute"
+    // and deny the very nodes the boot hands out. Read/write whenever any
+    // triad carries the bit, execute only when some execute bit exists at
+    // all; asked for several kinds at once (`may_create_in`'s write+search),
+    // it passes when *each* requested kind has its somewhere. A filesystem
+    // that keeps no modes is passed through untouched above - refusing it
+    // would invent permissions nobody set.
+    let allowed = if me.0 == 0 && root_override() {
+        let mode = inode.mode() & 0o7777;
+        let any = (mode >> 6) | (mode >> 3) | mode;
+        (want & R_OK == 0 || any & 4 != 0)
+            && (want & W_OK == 0 || any & 2 != 0)
+            && (want & X_OK == 0 || any & 1 != 0)
     } else {
-        permitted(
-            inode.mode(),
-            inode.owner(),
-            want,
-            me,
-            &crate::sched::current_groups(),
-        )
+        permitted(inode.mode(), inode.owner(), want, me, &current_groups())
     };
     if allowed {
         Ok(())
     } else {
         Err(VfsError::Access)
     }
+}
+
+/// The group list permission checks consult: the running task's three saved
+/// gids, straight from `sched` - whose host build answers the empty list a
+/// kernel caller that runs as no task would. Root's override makes it moot
+/// either way.
+fn current_groups() -> [u32; 3] {
+    crate::sched::current_groups()
 }
 
 /// Whether the running process may do `want` to `node`, asked for its
@@ -1523,9 +1541,7 @@ mod tests {
     use alloc::sync::Arc;
 
     use super::mount::Vfs;
-    use super::{
-        NodeKind, R_OK, VfsError, W_OK, X_OK, may_as, permitted, root_override, split_parent,
-    };
+    use super::{NodeKind, R_OK, VfsError, W_OK, X_OK, may_as, permitted, split_parent};
 
     #[test]
     fn a_bare_name_is_a_name_beside_the_caller() {
@@ -1719,14 +1735,6 @@ mod tests {
     }
 
     #[test]
-    fn root_passes_everything_including_execute_on_a_file_nobody_made_runnable() {
-        // mpos drops Linux's one `CAP_DAC_OVERRIDE` exception: uid 0 passes
-        // every triad check outright, so even read on a `000` file and execute
-        // on a file with no execute bit at all are allowed for root.
-        assert!(root_override());
-    }
-
-    #[test]
     fn may_as_answers_for_the_node_and_the_identity_it_is_given() {
         let vfs = Vfs::new();
         let fs = crate::vfs::ramfs::RamFs::new();
@@ -1743,5 +1751,62 @@ mod tests {
         // A node the filesystem kept no mode for is not policed.
         let bare = root.create("bare", NodeKind::File).unwrap();
         assert_eq!(may_as((11, 11), &bare, R_OK | W_OK | X_OK).ok(), Some(()));
+    }
+
+    #[test]
+    fn root_passes_where_any_bit_of_the_kind_exists() {
+        // The measured Linux rule (`capable(CAP_DAC_OVERRIDE)` in
+        // `fs/namei.c`): superuser read/write passes when *any* triad carries
+        // the bit, execute only when some execute bit exists. This kernel's
+        // override used to be "uid 0 passes every check outright", and on a
+        // single-user image whose root does everything that reads the same -
+        // until a distribution's tree arrives with real modes. Alpine's `/bin`
+        // is `0755` and every component of a path root walks carries its
+        // owner-read bit, so the old shape and the new one agree there; what
+        // changed is the fine print, and the old exception-less pass made it
+        // *less* honest, not more: it answered success for an execute nobody
+        // set. The pin is the counterfactual: without the branch, `(0,0)`
+        // against these nodes is `Access` where Linux says yes, and `Ok`
+        // where Linux says no.
+        let vfs = Vfs::new();
+        let fs = crate::vfs::ramfs::RamFs::new();
+        vfs.mount_root(&*fs);
+        let root = vfs.resolve("/").unwrap();
+
+        let dir = root.create("d", NodeKind::Dir).unwrap();
+        dir.set_mode(0o644); // owner rw-, group r--, other r--: no x anywhere
+        assert_eq!(
+            may_as((0, 0), &dir, X_OK).err(),
+            Some(VfsError::Access),
+            "root gets no exception where no execute bit exists at all"
+        );
+        dir.set_mode(0o645); // other gains --x
+        assert_eq!(
+            may_as((0, 0), &dir, X_OK).ok(),
+            Some(()),
+            "one execute bit anywhere is enough for root"
+        );
+
+        let file = root.create("f", NodeKind::File).unwrap();
+        file.set_mode(0o600); // owner rw- only
+        assert_eq!(
+            may_as((0, 0), &file, R_OK).ok(),
+            Some(()),
+            "root reads what any triad can read"
+        );
+        assert_eq!(
+            may_as((0, 0), &file, W_OK).ok(),
+            Some(()),
+            "and writes what any triad can write"
+        );
+        assert_eq!(
+            may_as((0, 0), &file, X_OK).err(),
+            Some(VfsError::Access),
+            "but never invents an execute permission"
+        );
+        // A non-root caller falls through to the triads exactly as before:
+        // this is the half that must not move.
+        assert_eq!(may_as((11, 11), &file, R_OK).err(), Some(VfsError::Access));
+        assert_eq!(may_as((11, 11), &dir, X_OK).err(), Some(VfsError::Access));
     }
 }
